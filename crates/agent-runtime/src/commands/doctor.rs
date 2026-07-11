@@ -55,6 +55,7 @@ pub struct DoctorArgs {
 pub enum DoctorClassArg {
     SkillSurface,
     VersionAlignment,
+    InstalledRuntime,
 }
 
 impl From<DoctorClassArg> for DoctorClass {
@@ -62,6 +63,7 @@ impl From<DoctorClassArg> for DoctorClass {
         match value {
             DoctorClassArg::SkillSurface => DoctorClass::SkillSurface,
             DoctorClassArg::VersionAlignment => DoctorClass::VersionAlignment,
+            DoctorClassArg::InstalledRuntime => DoctorClass::InstalledRuntime,
         }
     }
 }
@@ -239,6 +241,8 @@ struct DoctorJson<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     version_alignment: Option<&'a doctor::version_alignment::VersionAlignmentReport>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    installed_runtime: Option<&'a doctor::installed_runtime::InstalledRuntimeReport>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     acceptance_boundary: Option<&'a str>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     upgrade_suggestions: Vec<String>,
@@ -264,6 +268,7 @@ fn print_json(outcome: &doctor::DoctorOutcome, suggest_upgrade: bool) -> anyhow:
         findings: &outcome.findings,
         skill_surface: outcome.skill_surface.as_ref(),
         version_alignment: outcome.version_alignment.as_ref(),
+        installed_runtime: outcome.installed_runtime.as_ref(),
         acceptance_boundary: outcome.acceptance_boundary.as_deref(),
         upgrade_suggestions,
     };

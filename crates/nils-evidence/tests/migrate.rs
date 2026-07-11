@@ -1884,9 +1884,7 @@ fn linked_evidence_type_is_scrubbed() {
 }
 
 #[test]
-fn unsupported_record_schema_is_skipped_not_normalized_to_v1() {
-    // A future/incompatible source schema must be skipped, never silently
-    // archived as a `skill-usage.rollup.v1`.
+fn mixed_v1_v2_records_normalize_with_owner_provenance() {
     let s = build_empty_scenario();
     write_record(
         &s.source_out,
@@ -1895,26 +1893,60 @@ fn unsupported_record_schema_is_skipped_not_normalized_to_v1() {
         &record_json_with_links("deliver-pr", "2026-06-14T15:00:00Z", "[]"),
     );
     let v2 = record_json_with_links("code-review", "2026-06-14T16:00:00Z", "[]")
-        .replace("skill-usage.record.v1", "skill-usage.record.v2");
+        .replace("skill-usage.record.v1", "skill-usage.record.v2")
+        .replace(
+            r#""skill": "code-review","#,
+            r#""owner": { "kind": "workflow", "id": "code-review" },"#,
+        );
     write_record(&s.source_out, "graysurf__kit", "20260614-160000", &v2);
 
     let report = migrate::prepare(&dry_run_args(&s)).expect("prepare");
-    assert_eq!(report.eligible, 1, "only the v1 record should be eligible");
-    assert!(
-        report
-            .records
-            .iter()
-            .all(|r| r.rollup.skill != "code-review"),
-        "the unsupported v2 record must not be normalized into a rollup"
+    assert_eq!(report.eligible, 2, "v1 and v2 records should be eligible");
+    let workflow = report
+        .records
+        .iter()
+        .find(|record| record.rollup.skill == "code-review")
+        .expect("v2 workflow rollup");
+    assert_eq!(workflow.rollup.owner.kind, "workflow");
+    assert_eq!(workflow.rollup.owner.id, "code-review");
+    assert!(report.blocked.is_empty());
+}
+
+#[test]
+fn mixed_usage_batch_blocks_malformed_v2_without_losing_valid_owners() {
+    let s = build_empty_scenario();
+    write_record(
+        &s.source_out,
+        "graysurf__kit",
+        "20260614-150000",
+        &record_json_with_links("deliver-pr", "2026-06-14T15:00:00Z", "[]"),
     );
-    assert_eq!(
-        report.blocked.len(),
-        1,
-        "the v2 record should be recorded as a blocked (skipped) record"
+    let intent = record_json_with_links("project-dev", "2026-06-14T16:00:00Z", "[]")
+        .replace("skill-usage.record.v1", "skill-usage.record.v2")
+        .replace(
+            r#""skill": "project-dev","#,
+            r#""owner": { "kind": "intent", "id": "project-dev" },"#,
+        );
+    write_record(&s.source_out, "graysurf__kit", "20260614-160000", &intent);
+    let malformed = intent.replace(
+        r#""owner": { "kind": "intent", "id": "project-dev" }"#,
+        r#""owner": { "kind": "intent", "id": "" }"#,
     );
-    assert!(
-        report.blocked[0].reason.contains("skill-usage.record.v2"),
-        "blocked reason should name the unsupported schema: {}",
-        report.blocked[0].reason
+    write_record(
+        &s.source_out,
+        "graysurf__kit",
+        "20260614-170000",
+        &malformed,
     );
+
+    let report = migrate::prepare(&dry_run_args(&s)).expect("mixed batch remains reportable");
+    assert_eq!(report.eligible, 2);
+    assert_eq!(report.blocked.len(), 1);
+    assert!(report.blocked[0].reason.contains("owner"));
+    let normalized = report
+        .records
+        .iter()
+        .find(|record| record.rollup.owner.kind == "intent")
+        .expect("valid intent-owned record");
+    assert_eq!(normalized.rollup.owner.id, "project-dev");
 }

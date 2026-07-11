@@ -6,6 +6,7 @@ use agent_runtime::managed_block::{CommentStyle, ManagedBlock};
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::time::{Duration, SystemTime};
 use tempfile::TempDir;
 
@@ -129,6 +130,128 @@ fn install_clean(product: &str, source_root: &Path, home: &Path, state_home: &Pa
     .unwrap();
 }
 
+fn commit_source(source_root: &Path) {
+    for args in [
+        vec!["init", "-q"],
+        vec!["config", "user.email", "fixture@example.invalid"],
+        vec!["config", "user.name", "Fixture"],
+        vec!["add", "."],
+        vec!["commit", "-qm", "fixture"],
+    ] {
+        let status = Command::new("git")
+            .arg("-C")
+            .arg(source_root)
+            .args(args)
+            .status()
+            .unwrap();
+        assert!(status.success());
+    }
+}
+
+#[test]
+fn installed_runtime_class_requires_and_verifies_portable_receipt() {
+    let tmp = TempDir::new().unwrap();
+    let home = tmp.path().join("home");
+    let state_home = tmp.path().join("state");
+    fs::create_dir_all(&home).unwrap();
+    let source_root = build_source_root(tmp.path(), "claude", &home, &state_home);
+    commit_source(&source_root);
+    let options = DoctorOptions {
+        class_filter: Some(doctor::DoctorClass::InstalledRuntime),
+        ..DoctorOptions::default()
+    };
+
+    let missing = doctor::run(
+        "claude",
+        &source_root,
+        Some(&home),
+        Some(&state_home),
+        &options,
+    )
+    .unwrap();
+    assert_eq!(missing.exit_code(), 2);
+    assert!(!missing.installed_runtime.unwrap().receipt_present);
+
+    install_clean("claude", &source_root, &home, &state_home);
+    let verified = doctor::run(
+        "claude",
+        &source_root,
+        Some(&home),
+        Some(&state_home),
+        &options,
+    )
+    .unwrap();
+    assert_eq!(verified.exit_code(), 0, "findings: {:?}", verified.findings);
+    let report = verified.installed_runtime.unwrap();
+    assert!(report.verified);
+    assert!(report.source_clean);
+    assert!(report.plan_match);
+
+    let receipt_path = state_home.join("receipts/claude.json");
+    let mut receipt: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&receipt_path).unwrap()).unwrap();
+    let keys: std::collections::BTreeSet<_> =
+        receipt.as_object().unwrap().keys().cloned().collect();
+    assert_eq!(
+        keys,
+        [
+            "install_plan_digest",
+            "managed_entries",
+            "producer_version",
+            "product",
+            "recorded_at_unix_seconds",
+            "schema",
+            "source_dirty",
+            "source_revision",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect()
+    );
+    for entry in receipt["managed_entries"].as_array().unwrap() {
+        let entry_keys: std::collections::BTreeSet<_> = entry
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(entry_keys, ["digest", "id"].into_iter().collect());
+    }
+    receipt["private_state_home"] =
+        serde_json::Value::String("/PRIVATE/HOST/ACCOUNT/STATE_HOME_SENTINEL".to_string());
+    fs::write(&receipt_path, serde_json::to_vec_pretty(&receipt).unwrap()).unwrap();
+    let tampered = doctor::run(
+        "claude",
+        &source_root,
+        Some(&home),
+        Some(&state_home),
+        &options,
+    )
+    .unwrap();
+    assert_eq!(tampered.exit_code(), 2);
+    let rendered = format!("{:?}", tampered.findings);
+    assert!(!rendered.contains("STATE_HOME_SENTINEL"));
+
+    install_clean("claude", &source_root, &home, &state_home);
+
+    let live_target = home.join("plugins/reporting/skills/daily-brief/SKILL.md");
+    fs::remove_file(&live_target).unwrap();
+    fs::write(&live_target, "# drifted\n").unwrap();
+    let drifted = doctor::run(
+        "claude",
+        &source_root,
+        Some(&home),
+        Some(&state_home),
+        &options,
+    )
+    .unwrap();
+    assert_eq!(drifted.exit_code(), 2);
+    assert!(
+        !drifted.installed_runtime.unwrap().verified,
+        "nested receipt verdict must include live managed-target acceptance"
+    );
+}
+
 fn run_doctor(
     product: &str,
     source_root: &Path,
@@ -225,7 +348,7 @@ fn unbalanced_managed_block_marker_blocks_and_exits_two() {
 }
 
 #[test]
-fn missing_state_home_warns_and_exits_one() {
+fn install_receipt_materializes_state_home_for_clean_doctor() {
     let tmp = TempDir::new().unwrap();
     let home = tmp.path().join("home");
     let state_home = tmp.path().join("state");
@@ -235,12 +358,13 @@ fn missing_state_home_warns_and_exits_one() {
     install_clean("claude", &source_root, &home, &state_home);
 
     let outcome = run_doctor("claude", &source_root, &home, &state_home);
-    assert_eq!(outcome.exit_code(), 1);
+    assert_eq!(outcome.exit_code(), 0);
     assert!(
-        outcome.findings.iter().any(|finding| {
-            finding.severity == DoctorSeverity::Warn && finding.check == "runtime-root.state_home"
-        }),
-        "expected missing state_home warning: {:#?}",
+        outcome
+            .installed_runtime
+            .as_ref()
+            .is_some_and(|report| report.receipt_present),
+        "expected installed-runtime receipt: {:#?}",
         outcome.findings
     );
 }

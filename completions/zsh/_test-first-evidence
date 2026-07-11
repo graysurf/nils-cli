@@ -75,6 +75,17 @@ _arguments "${_arguments_options[@]}" : \
 '--help[Print help]' \
 && ret=0
 ;;
+(check)
+_arguments "${_arguments_options[@]}" : \
+'--out=[Evidence artifact directory containing \`test-first-evidence.json\`]:DIR:_files -/' \
+'--format=[Output format]:FORMAT:(text json)' \
+'--phase=[Readiness phase to evaluate]:PHASE:(classified pre-edit delivery)' \
+'--project-path=[Repository root used by the pre-edit path-class contract]:DIR:_files -/' \
+'*--path=[Repository-relative path to classify. Repeat for batches]:PATH:_files' \
+'-h[Print help]' \
+'--help[Print help]' \
+&& ret=0
+;;
 (verify)
 _arguments "${_arguments_options[@]}" : \
 '--out=[Evidence artifact directory containing \`test-first-evidence.json\`]:DIR:_files -/' \
@@ -110,11 +121,17 @@ _test-first-evidence_commands() {
 'record-failing:Record a failing test or reproducible failure before the fix' \
 'record-waiver:Record an explicit waiver when failing evidence is not practical' \
 'record-final:Record final validation after the implementation' \
+'check:Query classified, pre-edit, or delivery readiness without mutating the record' \
 'verify:Verify the evidence record is complete enough for delivery' \
 'show:Print the current evidence record' \
 'completion:Print shell completion script' \
     )
     _describe -t commands 'test-first-evidence commands' commands "$@"
+}
+(( $+functions[_test-first-evidence__subcmd__check_commands] )) ||
+_test-first-evidence__subcmd__check_commands() {
+    local commands; commands=()
+    _describe -t commands 'test-first-evidence check commands' commands "$@"
 }
 (( $+functions[_test-first-evidence__subcmd__completion_commands] )) ||
 _test-first-evidence__subcmd__completion_commands() {

@@ -44,10 +44,9 @@ const BINARY: &str = "evidence";
 /// Rollup record schema id written into every `skill-usage.rollup.json`.
 pub const ROLLUP_SCHEMA: &str = "skill-usage.rollup.v1";
 /// Source `skill-usage.record.json` schema this migrator knows how to roll up.
-/// A record carrying any other schema (e.g. a future `skill-usage.record.v2`
-/// with changed semantics) is skipped with a warning rather than silently
-/// normalized to a `skill-usage.rollup.v1`.
-pub const SUPPORTED_RECORD_SCHEMA: &str = "skill-usage.record.v1";
+/// A record carrying any schema outside this compatibility set is skipped with
+/// a warning rather than silently normalized to a `skill-usage.rollup.v1`.
+pub const SUPPORTED_RECORD_SCHEMAS: &[&str] = &["skill-usage.record.v1", "skill-usage.record.v2"];
 /// Provenance sidecar schema version written into every `metadata.yaml`.
 pub const METADATA_VERSION: u32 = 1;
 /// Default tool name synthesized for pre-producer records.
@@ -127,6 +126,7 @@ pub struct RollupRecord {
     pub id: String,
     pub archived_at: String,
     pub skill: String,
+    pub owner: RollupOwner,
     pub intent: String,
     pub trigger: String,
     pub repo: RollupRepo,
@@ -141,6 +141,12 @@ pub struct RollupRecord {
     pub source_digest: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub promotion: Option<Promotion>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct RollupOwner {
+    pub kind: String,
+    pub id: String,
 }
 
 /// Provenance sidecar written next to the rollup.
@@ -398,16 +404,16 @@ pub fn prepare(args: &DispatchArgs) -> Result<DryRunReport, MigrateError> {
             }
         };
         // Schema gate FIRST: peek the `schema` discriminator and reject an
-        // unsupported source schema before attempting the v1 deserialization,
-        // so a future `skill-usage.record.v2` cannot silently corrupt the
-        // archive and is reported as unsupported (not as a v1 parse failure).
+        // unsupported source schema before full deserialization, so future
+        // formats cannot silently corrupt the archive.
         match SkillUsageRecord::peek_schema(&raw) {
-            Ok(schema) if schema == SUPPORTED_RECORD_SCHEMA => {}
+            Ok(schema) if SUPPORTED_RECORD_SCHEMAS.contains(&schema.as_str()) => {}
             Ok(schema) => {
                 blocked.push(BlockedRecord {
                     record_path: record_path.display().to_string(),
                     reason: format!(
-                        "unsupported source schema `{schema}` (expected `{SUPPORTED_RECORD_SCHEMA}`); skipped"
+                        "unsupported source schema `{schema}` (expected one of {}); skipped",
+                        SUPPORTED_RECORD_SCHEMAS.join(", ")
                     ),
                 });
                 continue;
@@ -435,8 +441,18 @@ pub fn prepare(args: &DispatchArgs) -> Result<DryRunReport, MigrateError> {
         let source_digest = format!("sha256:{}", sha256_hex(&raw));
 
         // Filters.
+        let owner = match record.normalized_owner() {
+            Ok(owner) => owner,
+            Err(reason) => {
+                blocked.push(BlockedRecord {
+                    record_path: record_path.display().to_string(),
+                    reason,
+                });
+                continue;
+            }
+        };
         if let Some(skill) = &args.skill
-            && !record.skill.contains(skill)
+            && !owner.id.contains(skill)
         {
             continue;
         }
@@ -801,7 +817,9 @@ fn build_prepared(
     // below) leaks a machine home (e.g. `/Users/<user>/…` → `users-<user>-…`).
     // Then scrub unconditionally: a bare id (no `/`) can still embed a token,
     // and scrubbing a clean id is a no-op.
-    let scrubbed_skill = scrub_collect(&scrub_skill_path(&record.skill), &mut all_matches);
+    let owner = record.normalized_owner().map_err(MigrateError::Io)?;
+    let scrubbed_owner_kind = scrub_collect(&owner.kind, &mut all_matches);
+    let scrubbed_skill = scrub_collect(&scrub_skill_path(&owner.id), &mut all_matches);
     // Scrub the promotion case link like every other archived text field so a
     // token in a heuristic-inbox URL/path never lands raw in the rollup,
     // metadata sidecar, or catalog.
@@ -822,7 +840,11 @@ fn build_prepared(
         schema: ROLLUP_SCHEMA.to_string(),
         id: id.clone(),
         archived_at: archived_at.to_string(),
-        skill: scrubbed_skill,
+        skill: scrubbed_skill.clone(),
+        owner: RollupOwner {
+            kind: scrubbed_owner_kind,
+            id: scrubbed_skill.clone(),
+        },
         intent: scrubbed_intent,
         trigger: scrubbed_trigger,
         repo: RollupRepo {
@@ -1500,6 +1522,10 @@ mod tests {
                 id: "id".into(),
                 archived_at: "2026-06-14T10:00:00Z".into(),
                 skill: skill.into(),
+                owner: RollupOwner {
+                    kind: "skill".into(),
+                    id: skill.into(),
+                },
                 intent: String::new(),
                 trigger: String::new(),
                 repo: RollupRepo {

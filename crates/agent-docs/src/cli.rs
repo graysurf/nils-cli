@@ -60,6 +60,8 @@ pub enum Command {
     List(ListArgs),
     /// Remove a `[[document]]` entry from the project catalog.
     Remove(RemoveArgs),
+    /// Manage durable selective intent activation scoped to a session, project, and product.
+    Session(SessionArgs),
     /// Generate shell completion scripts.
     Completion(CompletionArgs),
 }
@@ -212,4 +214,49 @@ pub struct RemoveArgs {
 pub struct CompletionArgs {
     #[arg(value_enum)]
     pub shell: crate::completion::CompletionShell,
+}
+
+#[derive(Debug, Args)]
+pub struct SessionArgs {
+    #[command(subcommand)]
+    pub command: SessionCommand,
+}
+
+#[derive(Debug, Subcommand)]
+#[command(rename_all = "kebab-case")]
+pub enum SessionCommand {
+    /// Strictly preflight and atomically activate one or more declared intents.
+    Activate(SessionActivateArgs),
+    /// Show active intents for the current session/project/product scope.
+    Status(SessionCommonArgs),
+    /// Re-resolve the catalog and verify required intents are active and fresh.
+    Verify(SessionVerifyArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct SessionCommonArgs {
+    #[arg(long = "session-id", value_name = "ID")]
+    pub session_id: String,
+    #[arg(long, value_enum)]
+    pub product: Product,
+    #[arg(long = "state-home", value_name = "DIR")]
+    pub state_home: PathBuf,
+    #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
+    pub format: OutputFormat,
+}
+
+#[derive(Debug, Args)]
+pub struct SessionActivateArgs {
+    #[command(flatten)]
+    pub common: SessionCommonArgs,
+    #[arg(long, value_name = "INTENT", required = true)]
+    pub intent: Vec<String>,
+}
+
+#[derive(Debug, Args)]
+pub struct SessionVerifyArgs {
+    #[command(flatten)]
+    pub common: SessionCommonArgs,
+    #[arg(long = "require-intent", value_name = "INTENT", required = true)]
+    pub require_intent: Vec<String>,
 }

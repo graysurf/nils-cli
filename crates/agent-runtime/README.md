@@ -38,6 +38,21 @@ Core runtime-kit operations:
 - `pr-body render` — render standardized feature / bug PR or MR bodies for
   `forge-cli pr create` / `forge-cli pr deliver` flows.
 
+Successful `install --apply` writes
+`<state-home>/receipts/<product>.json`. The portable receipt contains only the
+product, source revision/dirty status, normalized install-plan and managed-entry
+digests, producer version, and timestamp; it excludes source/home paths,
+remotes, accounts, and host details. Reinstalling unchanged content preserves
+the plan and entry digests. Receipt parsing rejects fields outside this
+allowlist so accidental path or account metadata cannot silently become part of
+the accepted contract.
+
+`doctor --class installed-runtime` is the focused acceptance gate for that
+receipt. It blocks on a missing receipt from an older install, dirty or mismatched source,
+plan/content drift, and live managed-target drift. Normal doctor mode reports a
+missing receipt as a warning so older installs remain diagnosable until
+they are reinstalled.
+
 ## list-skills
 
 `agent-runtime list-skills` enumerates the skills that `agent-runtime install`

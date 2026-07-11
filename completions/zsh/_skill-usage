@@ -33,7 +33,9 @@ _arguments "${_arguments_options[@]}" : \
 '--out=[Artifact directory containing \`skill-usage.record.json\`]:DIR:_files -/' \
 '--format=[Output format]:FORMAT:((text\:"Human-readable text output (default)"
 json\:"Single-record JSON envelope (snake_case)"))' \
-'--skill=[Skill path or skill id]:TEXT:_default' \
+'(--owner-kind)--skill=[Skill path or skill id]:TEXT:_default' \
+'--owner-kind=[V2 record owner kind. Requires --owner-id and is mutually exclusive with --skill]:OWNER_KIND:(skill workflow intent)' \
+'--owner-id=[V2 record owner identifier. Requires --owner-kind]:TEXT:_default' \
 '--intent=[Skill invocation intent]:TEXT:_default' \
 '--trigger=[Trigger source]:TRIGGER:(user-explicit agent-selected project-policy other)' \
 '--user-request-summary=[User request summary]:TEXT:_default' \

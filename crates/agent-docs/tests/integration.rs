@@ -14,6 +14,8 @@ mod command_surface;
 mod completion_outside_repo;
 #[path = "integration/content_validation.rs"]
 mod content_validation;
+#[path = "integration/control_plane.rs"]
+mod control_plane;
 #[path = "integration/docs_home.rs"]
 mod docs_home;
 #[path = "integration/exit_codes.rs"]

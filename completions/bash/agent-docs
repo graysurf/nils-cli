@@ -37,6 +37,18 @@ _agent-docs() {
             agent__docs,remove)
                 cmd="agent__docs__remove"
                 ;;
+            agent__docs,session)
+                cmd="agent__docs__session"
+                ;;
+            agent__docs__session,activate)
+                cmd="agent__docs__session__activate"
+                ;;
+            agent__docs__session,status)
+                cmd="agent__docs__session__status"
+                ;;
+            agent__docs__session,verify)
+                cmd="agent__docs__session__verify"
+                ;;
             *)
                 ;;
         esac
@@ -44,7 +56,7 @@ _agent-docs() {
 
     case "${cmd}" in
         agent__docs)
-            opts="-h -V --docs-home --project-path --worktree-fallback --help --version audit preflight init explain list remove completion"
+            opts="-h -V --docs-home --project-path --worktree-fallback --help --version audit preflight init explain list remove session completion"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 1 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -85,7 +97,7 @@ _agent-docs() {
                     return 0
                     ;;
                 --product)
-                    COMPREPLY=($(compgen -W "codex claude" -- "${cur}"))
+                    COMPREPLY=($(compgen -W "codex claude hermes" -- "${cur}"))
                     return 0
                     ;;
                 --docs-home)
@@ -149,7 +161,7 @@ _agent-docs() {
                     return 0
                     ;;
                 --product)
-                    COMPREPLY=($(compgen -W "codex claude" -- "${cur}"))
+                    COMPREPLY=($(compgen -W "codex claude hermes" -- "${cur}"))
                     return 0
                     ;;
                 --docs-home)
@@ -213,7 +225,7 @@ _agent-docs() {
                     return 0
                     ;;
                 --product)
-                    COMPREPLY=($(compgen -W "codex claude" -- "${cur}"))
+                    COMPREPLY=($(compgen -W "codex claude hermes" -- "${cur}"))
                     return 0
                     ;;
                 --docs-home)
@@ -251,7 +263,7 @@ _agent-docs() {
                     return 0
                     ;;
                 --product)
-                    COMPREPLY=($(compgen -W "codex claude" -- "${cur}"))
+                    COMPREPLY=($(compgen -W "codex claude hermes" -- "${cur}"))
                     return 0
                     ;;
                 --docs-home)
@@ -294,6 +306,166 @@ _agent-docs() {
                     ;;
                 --format)
                     COMPREPLY=($(compgen -W "text json" -- "${cur}"))
+                    return 0
+                    ;;
+                --docs-home)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --project-path)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --worktree-fallback)
+                    COMPREPLY=($(compgen -W "auto local-only" -- "${cur}"))
+                    return 0
+                    ;;
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        agent__docs__session)
+            opts="-h --docs-home --project-path --worktree-fallback --help activate status verify"
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                --docs-home)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --project-path)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --worktree-fallback)
+                    COMPREPLY=($(compgen -W "auto local-only" -- "${cur}"))
+                    return 0
+                    ;;
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        agent__docs__session__activate)
+            opts="-h --session-id --product --state-home --format --intent --docs-home --project-path --worktree-fallback --help"
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                --session-id)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --product)
+                    COMPREPLY=($(compgen -W "codex claude hermes" -- "${cur}"))
+                    return 0
+                    ;;
+                --state-home)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --format)
+                    COMPREPLY=($(compgen -W "text json" -- "${cur}"))
+                    return 0
+                    ;;
+                --intent)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --docs-home)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --project-path)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --worktree-fallback)
+                    COMPREPLY=($(compgen -W "auto local-only" -- "${cur}"))
+                    return 0
+                    ;;
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        agent__docs__session__status)
+            opts="-h --session-id --product --state-home --format --docs-home --project-path --worktree-fallback --help"
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                --session-id)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --product)
+                    COMPREPLY=($(compgen -W "codex claude hermes" -- "${cur}"))
+                    return 0
+                    ;;
+                --state-home)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --format)
+                    COMPREPLY=($(compgen -W "text json" -- "${cur}"))
+                    return 0
+                    ;;
+                --docs-home)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --project-path)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --worktree-fallback)
+                    COMPREPLY=($(compgen -W "auto local-only" -- "${cur}"))
+                    return 0
+                    ;;
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        agent__docs__session__verify)
+            opts="-h --session-id --product --state-home --format --require-intent --docs-home --project-path --worktree-fallback --help"
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                --session-id)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --product)
+                    COMPREPLY=($(compgen -W "codex claude hermes" -- "${cur}"))
+                    return 0
+                    ;;
+                --state-home)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --format)
+                    COMPREPLY=($(compgen -W "text json" -- "${cur}"))
+                    return 0
+                    ;;
+                --require-intent)
+                    COMPREPLY=($(compgen -f "${cur}"))
                     return 0
                     ;;
                 --docs-home)

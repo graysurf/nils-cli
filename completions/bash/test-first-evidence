@@ -16,6 +16,9 @@ _test-first-evidence() {
             ",$1")
                 cmd="test__first__evidence"
                 ;;
+            test__first__evidence,check)
+                cmd="test__first__evidence__check"
+                ;;
             test__first__evidence,completion)
                 cmd="test__first__evidence__completion"
                 ;;
@@ -44,12 +47,52 @@ _test-first-evidence() {
 
     case "${cmd}" in
         test__first__evidence)
-            opts="-h -V --help --version init record-failing record-waiver record-final verify show completion"
+            opts="-h -V --help --version init record-failing record-waiver record-final check verify show completion"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 1 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
             fi
             case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        test__first__evidence__check)
+            opts="-h --out --format --phase --project-path --path --help"
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                --out)
+                    COMPREPLY=()
+                    if [[ "${BASH_VERSINFO[0]}" -ge 4 ]]; then
+                        compopt -o plusdirs
+                    fi
+                    return 0
+                    ;;
+                --format)
+                    COMPREPLY=($(compgen -W "text json" -- "${cur}"))
+                    return 0
+                    ;;
+                --phase)
+                    COMPREPLY=($(compgen -W "classified pre-edit delivery" -- "${cur}"))
+                    return 0
+                    ;;
+                --project-path)
+                    COMPREPLY=()
+                    if [[ "${BASH_VERSINFO[0]}" -ge 4 ]]; then
+                        compopt -o plusdirs
+                    fi
+                    return 0
+                    ;;
+                --path)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
                 *)
                     COMPREPLY=()
                     ;;

@@ -22,7 +22,7 @@ Each binary supports `--version` and `completion <bash|zsh>`.
 | `agent-run` | Run project commands through the selected project environment, using `direnv` for applicable `.envrc` / `.env` files. | stdout/stderr passthrough for `exec`; stdout/JSON only for `doctor` and `env` |
 | `browser-session` | Record browser goals, steps, statuses, and evidence artifacts. | `browser-session.json` under `--out DIR` |
 | `canary-check` | Run one local command and persist a redacted pass/fail result. | `canary-check.json` under `--out DIR` |
-| `docs-impact` | Classify changed Git paths as docs or non-docs and suggest documentation review. | stdout/JSON only |
+| `docs-impact` | Scan changes and persist/verify a human documentation-impact disposition. | `docs-impact.record.json` under `--out DIR` for record flows |
 | `heuristic-inbox` | Manage curated HEURISTIC_SYSTEM inbox + operation-record case folders with redaction-enforced evidence ingestion, plus `deliver` for records-branch PR writeback. | `<inbox-dir>/<slug>/ENTRY.md` + automatic `agent-out` execution logs (`invocation.json`, `before.json`, `after.json`) for write ops |
 | `model-cross-check` | Record primary/checker model observations without owning provider calls. | `model-cross-check.json` under `--out DIR` |
 | `repo-retro` | Generate deterministic repo-local implementation retrospectives from local Git, HEURISTIC_SYSTEM records, and explicit JSONL inputs. | stdout by default; optional Markdown/raw JSON/index under `--history-dir DIR --write` |
@@ -40,13 +40,17 @@ Most record-oriented binaries use this flow:
 3. `verify --out DIR`
 4. optional `show --out DIR --format json`
 
-`canary-check` uses `run`, `verify`, and `show`. `docs-impact` uses `scan`.
+`canary-check` uses `run`, `verify`, and `show`. `docs-impact` keeps its
+read-only `scan` and adds `record`, `show`, and `verify`.
 `agent-run` uses `exec`, `doctor`, and `env`.
 
 Examples:
 
 ```bash
 docs-impact scan --repo . --include-untracked --format json
+docs-impact record --out /tmp/docs-impact --repo . --base origin/main \
+  --disposition no-docs-needed --rationale "No public behavior changed"
+docs-impact verify --out /tmp/docs-impact --repo . --format json
 agent-run exec --cwd . -- cargo test
 agent-run exec --cwd . --direnv require -- npm test
 agent-run env --cwd . --format json
@@ -59,6 +63,7 @@ review-specialists validate --input findings.jsonl --format json
 review-specialists merge --input findings.jsonl --summary-out review.md
 model-cross-check init --out /tmp/cross-check --prompt "review patch" --primary-model gpt-5.4 --checker-model gpt-5.5
 skill-usage init --out /tmp/skill --skill tools/devex/review-evidence --intent "record review" --user-request-summary "review this PR"
+skill-usage init --out /tmp/workflow --owner-kind workflow --owner-id deliver-pr --intent "deliver change" --user-request-summary "deliver this PR"
 test-first-evidence init --out /tmp/test-first --classification behavior-change --production-path src/lib.rs
 ```
 
@@ -120,7 +125,7 @@ review-specialists bundle --input findings.jsonl --out-dir target/review-special
 
 1. token-like patterns (Bearer / `sk-` / `api_key=` / `-----BEGIN ...`)
 2. body / file byte size against the `--max-bytes` (default 64 KiB) limit
-3. raw `skill-usage.record.v1` JSON shape (matches `"schema":"skill-usage.record.v1"`)
+3. raw `skill-usage.record.v1` or `.v2` JSON shape
 4. absolute `$HOME` paths (`/Users/...` or `/home/...`)
 
 Findings on the body are surfaced under the `body_violations` array and a
@@ -184,6 +189,13 @@ and `FORGE_CLI_BIN`.
 record so archived evidence always carries the producing nils-cli version,
 independent of the host's current version-pin. The field is backward compatible:
 records written before it existed deserialize with `producer` absent.
+The compatible `--skill` form creates `skill-usage.record.v1`. Mutually exclusive
+`--owner-kind <skill|workflow|intent> --owner-id <id>` creates v2 with an
+explicit owner object. Mutation, verification, archive migration, query,
+search, and pruning accept mixed v1/v2 datasets; v1 skills normalize to a
+`{kind:"skill", id:...}` owner internally. `heuristic-inbox new
+--from-skill-usage` uses the same normalization and accepts v2 `skill`,
+`workflow`, and `intent` owners.
 
 ```bash
 skill-usage init --out <dir> --skill <skill-path> \
@@ -221,7 +233,16 @@ test-first-evidence record-final \
   --command "cargo test bug_repro" \
   --status pass
 test-first-evidence verify --out "$AGENT_HOME/out/projects/acme__app/test-first" --format json
+test-first-evidence check --out "$AGENT_HOME/out/projects/acme__app/test-first" \
+  --phase pre-edit --project-path . --path src/lib.rs --format json
 ```
+
+`check` is read-only. `classified` confirms classification exists, `pre-edit`
+uses the repository's `[path_classes]` contract, and `delivery` is the
+phase-aware spelling of final completeness. `verify` remains the compatible
+delivery command. Production paths require failing evidence or a waiver;
+unknown and overlapping classes fail closed. A repository without a path-class
+contract reports `not-configured` without inventing language-specific rules.
 
 ## Output contract
 

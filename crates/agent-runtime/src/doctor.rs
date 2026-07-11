@@ -5,6 +5,7 @@
 //! product version posture.
 
 pub mod coverage;
+pub mod installed_runtime;
 pub mod probes;
 pub mod project;
 pub mod skill_surface;
@@ -48,6 +49,7 @@ impl Default for DoctorOptions {
 pub enum DoctorClass {
     SkillSurface,
     VersionAlignment,
+    InstalledRuntime,
 }
 
 #[derive(Debug, Error)]
@@ -62,6 +64,8 @@ pub enum DoctorError {
     Coverage(#[from] coverage::CoverageError),
     #[error("version-alignment: {0}")]
     VersionAlignment(#[from] version_alignment::VersionAlignmentError),
+    #[error("installed-runtime: {0}")]
+    InstalledRuntime(#[from] installed_runtime::InstalledRuntimeError),
     #[error("unknown product `{product}`; expected `codex`, `claude`, or `hermes`")]
     UnknownProduct { product: String },
 }
@@ -172,6 +176,7 @@ pub struct DoctorOutcome {
     pub project_probes: Vec<project::ProjectOverlayFinding>,
     pub skill_surface: Option<skill_surface::SkillSurfaceReport>,
     pub version_alignment: Option<version_alignment::VersionAlignmentReport>,
+    pub installed_runtime: Option<installed_runtime::InstalledRuntimeReport>,
     pub acceptance_boundary: Option<String>,
     pub ok: usize,
     pub warn: usize,
@@ -207,6 +212,15 @@ pub fn run(
     }
     if matches!(options.class_filter, Some(DoctorClass::VersionAlignment)) {
         return run_version_alignment_only(options);
+    }
+    if matches!(options.class_filter, Some(DoctorClass::InstalledRuntime)) {
+        return run_installed_runtime_only(
+            product,
+            source_root,
+            live_home_override,
+            state_home_override,
+            options,
+        );
     }
 
     let runtime_roots = load_runtime_roots(source_root)?;
@@ -271,6 +285,14 @@ pub fn run(
             }
         }
     }
+    let installed_runtime = installed_runtime::check(product, &plan, false)?;
+    if installed_runtime.verified {
+        report.ok += 1;
+    }
+    report.extend(probes::ProbeReport {
+        findings: installed_runtime.findings.clone(),
+        ok: 0,
+    });
 
     let warn = report
         .findings
@@ -291,6 +313,7 @@ pub fn run(
         project_probes,
         skill_surface: None,
         version_alignment: None,
+        installed_runtime: Some(installed_runtime),
         acceptance_boundary: None,
         ok: report.ok,
         warn,
@@ -331,6 +354,7 @@ fn run_skill_surface_only(
                 project_probes: Vec::new(),
                 skill_surface: Some(skill_surface::SkillSurfaceReport::empty(product)),
                 version_alignment: None,
+                installed_runtime: None,
                 acceptance_boundary: skill_surface::acceptance_boundary(product)
                     .map(str::to_string),
                 ok: 0,
@@ -365,6 +389,7 @@ fn run_skill_surface_only(
         project_probes: Vec::new(),
         skill_surface: Some(report),
         version_alignment: None,
+        installed_runtime: None,
         acceptance_boundary,
         ok,
         warn,
@@ -406,8 +431,74 @@ fn run_version_alignment_only(options: &DoctorOptions) -> Result<DoctorOutcome, 
         project_probes: Vec::new(),
         skill_surface: None,
         version_alignment: Some(report),
+        installed_runtime: None,
         acceptance_boundary,
         ok,
+        warn,
+        block,
+        overlay: None,
+    })
+}
+
+fn run_installed_runtime_only(
+    product: &str,
+    source_root: &Path,
+    live_home_override: Option<&Path>,
+    state_home_override: Option<&Path>,
+    options: &DoctorOptions,
+) -> Result<DoctorOutcome, DoctorError> {
+    let roots = resolve_runtime_roots_for_product(
+        product,
+        source_root,
+        live_home_override,
+        state_home_override,
+    )?;
+    let Some(link_map) = load_effective_link_map(source_root, product, options)? else {
+        return Err(LinkMapError::Missing {
+            path: source_root
+                .join("targets")
+                .join(product)
+                .join("link-map.yaml"),
+        }
+        .into());
+    };
+    let plan = InstallPlan::build(
+        product,
+        source_root,
+        &roots.live_home,
+        &roots.state_home,
+        &link_map,
+    )?;
+    let mut installed_runtime = installed_runtime::check(product, &plan, true)?;
+    let mut probe_report = probes::ProbeReport::default();
+    probe_report.extend(probes::install_plan(product, &plan));
+    let mut findings = installed_runtime.findings.clone();
+    findings.extend(probe_report.findings);
+    let warn = findings
+        .iter()
+        .filter(|finding| finding.severity == DoctorSeverity::Warn)
+        .count();
+    let block = findings
+        .iter()
+        .filter(|finding| finding.severity == DoctorSeverity::Block)
+        .count();
+    let live_ok = block == 0;
+    installed_runtime.verified = live_ok;
+    let acceptance_boundary = Some(
+        "Receipt provenance and managed-target checks are portable filesystem acceptance; product execution remains a separate live probe."
+            .to_string(),
+    );
+    Ok(DoctorOutcome {
+        product: product.to_string(),
+        findings,
+        version_probes: Vec::new(),
+        coverage_probes: Vec::new(),
+        project_probes: Vec::new(),
+        skill_surface: None,
+        version_alignment: None,
+        installed_runtime: Some(installed_runtime),
+        acceptance_boundary,
+        ok: usize::from(live_ok) + probe_report.ok,
         warn,
         block,
         overlay: None,
