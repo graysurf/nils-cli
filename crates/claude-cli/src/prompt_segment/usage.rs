@@ -360,20 +360,40 @@ fn descendant_process_ids(root: libc::pid_t) -> Vec<libc::pid_t> {
     while cursor < discovered.len() {
         let parent = discovered[cursor];
         cursor += 1;
-        let children_path = format!("/proc/{parent}/task/{parent}/children");
-        if let Ok(raw) = std::fs::read_to_string(children_path) {
-            for child in raw
-                .split_whitespace()
-                .filter_map(|value| value.parse::<libc::pid_t>().ok())
-            {
-                if !discovered.contains(&child) {
-                    discovered.push(child);
-                }
+        for child in linux_task_children(parent) {
+            if !discovered.contains(&child) {
+                discovered.push(child);
             }
         }
     }
     discovered.remove(0);
     discovered
+}
+
+#[cfg(target_os = "linux")]
+fn linux_task_children(process: libc::pid_t) -> Vec<libc::pid_t> {
+    let Ok(tasks) = std::fs::read_dir(format!("/proc/{process}/task")) else {
+        return Vec::new();
+    };
+    let mut children = Vec::new();
+    for task in tasks.flatten() {
+        let Some(task_id) = task.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        let path = format!("/proc/{process}/task/{task_id}/children");
+        let Ok(raw) = std::fs::read_to_string(path) else {
+            continue;
+        };
+        for child in raw
+            .split_whitespace()
+            .filter_map(|value| value.parse::<libc::pid_t>().ok())
+        {
+            if !children.contains(&child) {
+                children.push(child);
+            }
+        }
+    }
+    children
 }
 
 #[cfg(all(unix, not(target_os = "linux")))]
@@ -924,6 +944,35 @@ mod tests {
         assert!(
             started.elapsed() < Duration::from_millis(500),
             "descendant lookup must not wait for a PATH-provided ps"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn descendant_lookup_includes_children_spawned_by_worker_threads() {
+        use std::sync::mpsc;
+
+        let (pid_sender, pid_receiver) = mpsc::channel();
+        let (stop_sender, stop_receiver) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            let mut child = Command::new("/bin/sleep")
+                .arg("60")
+                .spawn()
+                .expect("spawn worker child");
+            pid_sender.send(child.id()).expect("send child pid");
+            let _ = stop_receiver.recv();
+            let _ = child.kill();
+            let _ = child.wait();
+        });
+        let child_pid = pid_receiver.recv().expect("worker child pid") as libc::pid_t;
+
+        let descendants = descendant_process_ids(std::process::id() as libc::pid_t);
+
+        stop_sender.send(()).expect("stop worker");
+        worker.join().expect("worker joined");
+        assert!(
+            descendants.contains(&child_pid),
+            "descendant lookup must scan children owned by every task"
         );
     }
 
