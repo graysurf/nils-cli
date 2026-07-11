@@ -35,6 +35,15 @@ polling rather than treating a degraded stream as healthy. `GET /sessions` and
 the broker use the same injected session snapshot source, keeping polling and
 stream projection aligned.
 
+Each degraded terminal `reset` receives a new sequence greater than every
+previous frame from that stream, so consumer deduplication cannot discard the
+reconciliation signal. Its `observed_at` is deliberately the anchor of the last
+successful snapshot collection represented by `sessions`, not the later time
+when degradation was detected. A subsequent successful `GET /sessions` carries
+its own post-assembly anchor and therefore outranks that cached reset. Consumers
+must not treat a reset's delivery time as evidence that its cached sessions are
+fresh.
+
 Every SSE frame uses:
 
 - `id: <stream_id>:<sequence>`
@@ -82,6 +91,14 @@ is `null` when no valid activity snapshot exists. `heartbeat` omits `sessions`
 and is emitted every 15 seconds. `stream_id` is stable for one daemon process;
 `sequence` strictly increases across snapshots and heartbeats.
 
+Nested optional `turn_state` leaves use the same omission semantics as
+`GET /sessions`: absent provider ids, progress timestamps, attention, current
+turn, and last turn are omitted rather than serialized as `null`. The
+session-level `turn_state: null` remains intentional and means no valid activity
+snapshot. The exact multi-session Rust producer fixture consumed by downstream
+contract tests is
+[`tests/fixtures/activity/activity-stream-v1-multi-session.json`](../../tests/fixtures/activity/activity-stream-v1-multi-session.json).
+
 ## Replay, gaps, and backpressure
 
 Without `Last-Event-ID`, a subscriber first receives the latest full snapshot.
@@ -94,8 +111,10 @@ hold; if any sequence needed by a cursor was evicted (including an individual
 snapshot larger than the byte budget), the subscriber receives a full reset.
 
 Consumers deduplicate by `(machine, stream_id, sequence)`. A sequence gap or a
-`reset` triggers immediate `GET /sessions` reconciliation. The regular session
-poll remains active for convergence, daemon health, and old-peer fallback.
+`reset` triggers immediate `GET /sessions` reconciliation. Degraded resets have
+unique increasing sequences even when several subscribers stop concurrently.
+The regular session poll remains active for convergence, daemon health, and
+old-peer fallback.
 
 The daemon uses a bounded 32-frame broadcast queue. Producers never await a
 subscriber. A lagged subscriber receives a full reset from the latest state.

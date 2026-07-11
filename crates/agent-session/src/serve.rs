@@ -311,7 +311,7 @@ fn sanitize_token(token: Option<String>) -> Option<String> {
 #[derive(Clone, Debug, PartialEq, Serialize)]
 struct ActivityStreamSession {
     id: String,
-    turn_state: Option<Value>,
+    turn_state: Option<crate::activity::StreamTurnState>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -350,6 +350,7 @@ struct ActivityEventState {
     history: VecDeque<Arc<ActivityStreamEvent>>,
     history_bytes: usize,
     latest_sessions: Vec<ActivityStreamSession>,
+    latest_observed_at: String,
 }
 
 struct ActivityEventLog {
@@ -374,13 +375,14 @@ impl ActivityEventLog {
         lifecycle: watch::Sender<ActivityBrokerLifecycle>,
     ) -> Arc<Self> {
         let stream_id = uuid::Uuid::new_v4().to_string();
+        let observed_at = activity_observed_at();
         let initial = Arc::new(ActivityStreamEvent {
             schema_version: ACTIVITY_STREAM_EVENT_SCHEMA_VERSION,
             kind: "snapshot",
             stream_id: stream_id.clone(),
             sequence: 1,
             machine: machine.clone(),
-            observed_at: activity_observed_at(),
+            observed_at: observed_at.clone(),
             sessions: Some(sessions.clone()),
         });
         let mut history = VecDeque::with_capacity(ACTIVITY_STREAM_REPLAY_CAPACITY);
@@ -400,6 +402,7 @@ impl ActivityEventLog {
                 history,
                 history_bytes,
                 latest_sessions: sessions,
+                latest_observed_at: observed_at,
             }),
             sender,
             lifecycle,
@@ -407,15 +410,13 @@ impl ActivityEventLog {
     }
 
     fn publish_snapshot(&self, sessions: Vec<ActivityStreamSession>) {
-        let unchanged = self
-            .state
-            .lock()
-            .expect("activity event state lock")
-            .latest_sessions
-            == sessions;
+        let mut state = self.state.lock().expect("activity event state lock");
+        let unchanged = state.latest_sessions == sessions;
         if unchanged {
+            state.latest_observed_at = activity_observed_at();
             return;
         }
+        drop(state);
         self.publish("snapshot", Some(sessions));
     }
 
@@ -437,6 +438,7 @@ impl ActivityEventLog {
         });
         if let Some(sessions) = sessions {
             state.latest_sessions = sessions;
+            state.latest_observed_at = event.observed_at.clone();
         }
         state.history_bytes = state.history_bytes.saturating_add(event.replay_bytes());
         state.history.push_back(event.clone());
@@ -516,6 +518,12 @@ impl ActivityEventLog {
         self.reset_event_locked(&state, sequence)
     }
 
+    fn degraded_reset_event(&self) -> Arc<ActivityStreamEvent> {
+        let state = self.state.lock().expect("activity event state lock");
+        let sequence = self.sequence.fetch_add(1, Ordering::SeqCst) + 1;
+        self.reset_event_locked(&state, sequence)
+    }
+
     fn reset_event_locked(
         &self,
         state: &ActivityEventState,
@@ -536,7 +544,7 @@ impl ActivityEventLog {
             stream_id: self.stream_id.clone(),
             sequence,
             machine: self.machine.clone(),
-            observed_at: activity_observed_at(),
+            observed_at: state.latest_observed_at.clone(),
             sessions: Some(state.latest_sessions.clone()),
         })
     }
@@ -558,7 +566,7 @@ impl ActivitySubscription {
             None
         } else {
             self.reconciliation_sent = true;
-            Some(self.log.reset_event())
+            Some(self.log.degraded_reset_event())
         }
     }
 
@@ -5702,6 +5710,48 @@ mod tests {
         )
     }
 
+    fn assert_degraded_reset_survives_consumer_dedupe(
+        previous: &ActivityStreamEvent,
+        reset: &ActivityStreamEvent,
+    ) {
+        let mut consumer_seen = std::collections::HashSet::new();
+        assert!(consumer_seen.insert((
+            previous.machine.clone(),
+            previous.stream_id.clone(),
+            previous.sequence,
+        )));
+        assert!(
+            consumer_seen.insert((
+                reset.machine.clone(),
+                reset.stream_id.clone(),
+                reset.sequence,
+            )),
+            "consumer dedupe discarded the degraded reset"
+        );
+        assert_eq!(reset.kind, "reset");
+        assert_eq!(reset.stream_id, previous.stream_id);
+        assert!(reset.sequence > previous.sequence);
+    }
+
+    fn test_stream_turn_state(
+        revision: u64,
+        phase_changed_at: impl Into<String>,
+    ) -> crate::activity::StreamTurnState {
+        let state: crate::activity::TurnState = serde_json::from_value(json!({
+            "schema_version":"agent-session.turn-state.v1",
+            "phase":"working",
+            "phase_changed_at":phase_changed_at.into(),
+            "revision":revision,
+            "source":{
+                "kind":"provider_hook",
+                "provider":"codex",
+                "confidence":"authoritative"
+            }
+        }))
+        .expect("test turn state");
+        crate::activity::stream_projection(&state)
+    }
+
     fn auth_headers(token: Option<&str>) -> HeaderMap {
         let mut headers = HeaderMap::new();
         if let Some(token) = token {
@@ -5860,7 +5910,7 @@ mod tests {
             .log
             .publish_snapshot(vec![ActivityStreamSession {
                 id: "cursor-session".to_string(),
-                turn_state: Some(json!({"revision":2})),
+                turn_state: Some(test_stream_turn_state(2, "2026-07-11T00:00:02Z")),
             }]);
         let retained_cursor = format!("{stream_id}:1");
         let (id, event, data) = parse_activity_sse_frame(
@@ -5944,7 +5994,7 @@ mod tests {
         }))
         .expect("forward-compatible state");
 
-        let projection = crate::activity::stream_projection(&state);
+        let projection = serde_json::to_value(crate::activity::stream_projection(&state)).unwrap();
         assert_eq!(projection["revision"], 7);
         assert_eq!(
             projection["current_turn"]["attention"]["kind"],
@@ -5969,11 +6019,73 @@ mod tests {
         }
     }
 
+    #[test]
+    fn activity_stream_multi_session_producer_matches_exact_downstream_fixture() {
+        let working: crate::activity::TurnState = serde_json::from_value(json!({
+            "schema_version":"agent-session.turn-state.v1",
+            "phase":"working",
+            "phase_changed_at":"2026-07-11T17:00:00Z",
+            "revision":11,
+            "source":{
+                "kind":"provider_hook",
+                "confidence":"authoritative"
+            },
+            "current_turn":{
+                "started_at":"2026-07-11T16:59:00Z"
+            }
+        }))
+        .expect("working fixture state");
+        let completed: crate::activity::TurnState = serde_json::from_value(json!({
+            "schema_version":"agent-session.turn-state.v1",
+            "phase":"waiting",
+            "phase_changed_at":"2026-07-11T17:01:00Z",
+            "revision":12,
+            "source":{
+                "kind":"provider_hook",
+                "provider":"codex",
+                "confidence":"authoritative"
+            },
+            "last_turn":{
+                "completed_at":"2026-07-11T17:01:00Z",
+                "outcome":"completed"
+            }
+        }))
+        .expect("completed fixture state");
+        let event = ActivityStreamEvent {
+            schema_version: ACTIVITY_STREAM_EVENT_SCHEMA_VERSION,
+            kind: "snapshot",
+            stream_id: "fixture-stream".to_string(),
+            sequence: 42,
+            machine: "fixture-machine".to_string(),
+            observed_at: "2026-07-11T17:01:01Z".to_string(),
+            sessions: Some(vec![
+                ActivityStreamSession {
+                    id: "working-minimal".to_string(),
+                    turn_state: Some(crate::activity::stream_projection(&working)),
+                },
+                ActivityStreamSession {
+                    id: "completed-minimal".to_string(),
+                    turn_state: Some(crate::activity::stream_projection(&completed)),
+                },
+                ActivityStreamSession {
+                    id: "no-activity".to_string(),
+                    turn_state: None,
+                },
+            ]),
+        };
+        let expected: Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/activity/activity-stream-v1-multi-session.json"
+        ))
+        .expect("canonical Agent Console producer fixture");
+
+        assert_eq!(serde_json::to_value(event).unwrap(), expected);
+    }
+
     #[tokio::test]
     async fn activity_stream_replays_in_order_and_resets_invalid_or_evicted_cursors() {
         let initial = vec![ActivityStreamSession {
             id: "session-1".to_string(),
-            turn_state: Some(json!({"revision":1})),
+            turn_state: Some(test_stream_turn_state(1, "2026-07-11T00:00:01Z")),
         }];
         let log = ActivityEventLog::new(MACHINE.to_string(), initial.clone());
         let mut first = log.subscribe(None);
@@ -5985,7 +6097,7 @@ mod tests {
         log.publish_heartbeat();
         log.publish_snapshot(vec![ActivityStreamSession {
             id: "session-1".to_string(),
-            turn_state: Some(json!({"revision":2})),
+            turn_state: Some(test_stream_turn_state(2, "2026-07-11T00:00:02Z")),
         }]);
         let mut replay = log.subscribe(Some(&format!("{}:1", log.stream_id)));
         assert_eq!(replay.next_event().await.unwrap().sequence, 2);
@@ -6001,7 +6113,8 @@ mod tests {
             reset.sessions.as_ref().unwrap()[0]
                 .turn_state
                 .as_ref()
-                .unwrap()["revision"],
+                .unwrap()
+                .revision,
             2
         );
 
@@ -6023,12 +6136,7 @@ mod tests {
         let sessions = (0..128)
             .map(|index| ActivityStreamSession {
                 id: format!("session-{index:03}-{}", "x".repeat(128)),
-                turn_state: Some(json!({
-                    "schema_version":"agent-session.turn-state.v1",
-                    "phase":"working",
-                    "phase_changed_at":"x".repeat(8192),
-                    "revision":index,
-                })),
+                turn_state: Some(test_stream_turn_state(index, "x".repeat(8192))),
             })
             .collect();
         log.publish_snapshot(sessions);
@@ -6100,14 +6208,8 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let broker = ActivityBroker::for_test(MACHINE);
         let mut subscription = broker.subscribe(None).expect("ready subscription");
-        assert_eq!(
-            subscription
-                .next_event()
-                .await
-                .expect("initial snapshot")
-                .kind,
-            "snapshot"
-        );
+        let initial = subscription.next_event().await.expect("initial snapshot");
+        assert_eq!(initial.kind, "snapshot");
         let sequence_before_failure = broker.log.sequence.load(Ordering::SeqCst);
         let (change_tx, _change_rx) = mpsc::channel(1);
 
@@ -6121,7 +6223,8 @@ mod tests {
             .next_event()
             .await
             .expect("degraded stream reconciliation reset");
-        assert_eq!(reset.kind, "reset");
+        assert_degraded_reset_survives_consumer_dedupe(&initial, &reset);
+        assert_eq!(reset.observed_at, initial.observed_at);
         assert!(subscription.next_event().await.is_none());
         assert!(matches!(
             broker.subscribe(None),
@@ -6133,11 +6236,22 @@ mod tests {
         ));
         assert_eq!(
             broker.log.sequence.load(Ordering::SeqCst),
-            sequence_before_failure,
+            reset.sequence,
             "a degraded broker must not emit healthy heartbeats"
         );
+        assert_eq!(reset.sequence, sequence_before_failure + 1);
 
+        tokio::time::sleep(Duration::from_millis(2)).await;
         let st = state_with_activity_broker(tmp.path(), Some(TOKEN), PathBuf::from("tmux"), broker);
+        let (poll_status, poll_body) = call(router(st.clone()), get("/sessions")).await;
+        assert_eq!(poll_status, StatusCode::OK);
+        let poll_observed_at = poll_body["data"]["observed_at"]
+            .as_str()
+            .unwrap()
+            .parse::<jiff::Timestamp>()
+            .unwrap();
+        let reset_observed_at = reset.observed_at.parse::<jiff::Timestamp>().unwrap();
+        assert!(poll_observed_at > reset_observed_at);
         let (status, body) = call(router(st), get_auth("/activity/events", Some(TOKEN))).await;
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(body["error"]["code"], "activity-stream-unavailable");
@@ -6154,7 +6268,7 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let broker = ActivityBroker::for_test(MACHINE);
         let mut subscription = broker.subscribe(None).expect("ready subscription");
-        assert!(subscription.next_event().await.is_some());
+        let initial = subscription.next_event().await.expect("initial snapshot");
         let failing_collector: SessionCollector = Arc::new(|_, _| {
             Err(CliError::runtime(
                 "activity-snapshot-failed",
@@ -6178,14 +6292,12 @@ mod tests {
             .await
         );
 
-        assert_eq!(
-            subscription
-                .next_event()
-                .await
-                .expect("collector failure reset")
-                .kind,
-            "reset"
-        );
+        let reset = subscription
+            .next_event()
+            .await
+            .expect("collector failure reset");
+        assert_degraded_reset_survives_consumer_dedupe(&initial, &reset);
+        assert_eq!(reset.observed_at, initial.observed_at);
         assert!(subscription.next_event().await.is_none());
         assert!(matches!(
             broker.subscribe(None),
@@ -6285,14 +6397,8 @@ mod tests {
         };
         let broker = ActivityBroker::for_test(MACHINE);
         let mut subscription = broker.subscribe(None).expect("ready subscription");
-        assert_eq!(
-            subscription
-                .next_event()
-                .await
-                .expect("initial snapshot")
-                .kind,
-            "snapshot"
-        );
+        let initial = subscription.next_event().await.expect("initial snapshot");
+        assert_eq!(initial.kind, "snapshot");
         let sequence_before_close = broker.log.sequence.load(Ordering::SeqCst);
         let (change_tx, change_rx) = mpsc::channel(1);
         let change_task = tokio::spawn(activity_change_loop(
@@ -6317,14 +6423,12 @@ mod tests {
             *broker.lifecycle.borrow(),
             ActivityBrokerLifecycle::Degraded
         );
-        assert_eq!(
-            subscription
-                .next_event()
-                .await
-                .expect("channel-close reconciliation")
-                .kind,
-            "reset"
-        );
+        let reset = subscription
+            .next_event()
+            .await
+            .expect("channel-close reconciliation");
+        assert_degraded_reset_survives_consumer_dedupe(&initial, &reset);
+        assert_eq!(reset.observed_at, initial.observed_at);
         assert!(subscription.next_event().await.is_none());
         tokio::time::timeout(Duration::from_millis(250), heartbeat_task)
             .await
@@ -6332,9 +6436,10 @@ mod tests {
             .expect("heartbeat loop task");
         assert_eq!(
             broker.log.sequence.load(Ordering::SeqCst),
-            sequence_before_close,
+            reset.sequence,
             "notification-channel failure must not leave a healthy heartbeat running"
         );
+        assert_eq!(reset.sequence, sequence_before_close + 1);
     }
 
     #[tokio::test]
@@ -6462,7 +6567,7 @@ mod tests {
             .iter()
             .find(|session| session.id == "streamed-session")
             .unwrap();
-        assert_eq!(session.turn_state.as_ref().unwrap()["revision"], 1);
+        assert_eq!(session.turn_state.as_ref().unwrap().revision, 1);
 
         std::fs::remove_file(tmp.path().join("sessions/streamed-session/activity.json"))
             .expect("remove activity snapshot");

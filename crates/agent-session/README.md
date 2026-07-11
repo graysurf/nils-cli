@@ -151,7 +151,9 @@ is no second state model.
   polling-fallback error. Provider hooks only update durable local activity files; a daemon filesystem watcher publishes changes
   through bounded nonblocking queues. Watcher or snapshot-source failures send existing streams one reset before closing, stop
   heartbeats, and make new stream requests return the polling-fallback error. The stream and `/sessions` share one snapshot
-  source; the existing `/sessions` read remains the old-peer and gap-reconciliation path. The exact
+  source; degraded resets use unique sequences while retaining the last successful snapshot observation anchor, and typed
+  projection omits absent nested leaves while preserving session-level `turn_state: null`. The existing `/sessions` read remains
+  the old-peer and gap-reconciliation path. The exact
   wire/privacy contract is [activity-stream-v1](docs/specs/activity-stream-v1.md).
 - `POST /sessions` (create), `PATCH /sessions/{id}` (title update), `POST /sessions/{id}/send`,
   `POST /sessions/{id}/resume`,
