@@ -150,9 +150,10 @@ is no second state model.
   and lagged consumers receive a reset. Concurrent subscribers are daemon-capped and saturation returns a stable
   polling-fallback error. Provider hooks only update durable local activity files; a daemon filesystem watcher publishes changes
   through bounded nonblocking queues. Payloads and SSE frames are serialized once and shared; an oversized snapshot emits a
-  content-free `oversized_snapshot` reset that requires immediate polling rather than entering replay or broadcast retention.
-  Notification storms converge through a trailing quiet debounce with an explicit maximum refresh cadence. Watcher or
-  snapshot-source failures send existing streams one reset before closing, stop
+  transition-only content-free `oversized_snapshot` reset that requires immediate polling rather than entering replay or
+  broadcast retention. Notification storms converge through a trailing quiet debounce and refresh starts spaced by an explicit
+  minimum cadence. Backend rescan flags force a full refresh; sessions-root loss re-arms a replacement recursive watcher or
+  degrades the stream. Watcher or snapshot-source failures send existing streams one reset before closing, stop
   heartbeats, and make new stream requests return the polling-fallback error. The stream and `/sessions` share one snapshot
   source; degraded resets use unique sequences while retaining the last successful snapshot observation anchor, and typed
   projection omits absent nested leaves while preserving session-level `turn_state: null`. The existing `/sessions` read remains

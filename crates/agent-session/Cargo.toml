@@ -40,6 +40,7 @@ notify = "8"
 nils-test-support = { version = "1.21.17", path = "../nils-test-support" }
 pretty_assertions = { workspace = true }
 tempfile = "3"
+tokio = { workspace = true, features = ["test-util"] }
 tokio-tungstenite = "0.29"
 # `tower::ServiceExt::oneshot` drives the serve Router in tests without binding a socket.
 tower = { version = "0.5", features = ["util"] }

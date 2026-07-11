@@ -494,42 +494,36 @@ impl ActivityEventLog {
         let unchanged = state.latest_sessions == sessions;
         if unchanged {
             state.latest_observed_at = activity_observed_at();
-            state.cached_snapshot = None;
-            state.cached_reset = None;
+            if !state.latest_snapshot_oversized {
+                state.cached_snapshot = None;
+                state.cached_reset = None;
+            }
             return;
         }
-        drop(state);
-        self.publish("snapshot", Some(sessions));
-    }
-
-    fn publish_heartbeat(&self) {
-        self.publish("heartbeat", None);
-    }
-
-    fn publish(&self, kind: &'static str, sessions: Option<Vec<ActivityStreamSession>>) {
-        let mut state = self.state.lock().expect("activity event state lock");
-        let sequence = self.sequence.fetch_add(1, Ordering::SeqCst) + 1;
+        let sequence = self.sequence.load(Ordering::SeqCst) + 1;
         let observed_at = activity_observed_at();
         let event = self.encoder.encode(ActivityStreamEvent {
             schema_version: ACTIVITY_STREAM_EVENT_SCHEMA_VERSION,
-            kind,
+            kind: "snapshot",
             stream_id: self.stream_id.clone(),
             sequence,
             machine: self.machine.clone(),
             observed_at: observed_at.clone(),
             reason: None,
-            sessions: sessions.clone(),
+            sessions: Some(sessions.clone()),
         });
-        if let Some(sessions) = sessions {
-            state.latest_sessions = sessions;
-            state.latest_observed_at = observed_at;
-            state.latest_snapshot_oversized =
-                event.replay_bytes() > ACTIVITY_STREAM_REPLAY_BYTE_CAPACITY;
+        let oversized = event.replay_bytes() > ACTIVITY_STREAM_REPLAY_BYTE_CAPACITY;
+        let was_oversized = state.latest_snapshot_oversized;
+        state.latest_sessions = sessions;
+        state.latest_observed_at = observed_at;
+        state.latest_snapshot_oversized = oversized;
+        if oversized && was_oversized {
+            return;
         }
+        self.sequence.store(sequence, Ordering::SeqCst);
         state.cached_snapshot = None;
         state.cached_reset = None;
-        let event = if event.replay_bytes() > ACTIVITY_STREAM_REPLAY_BYTE_CAPACITY {
-            let sequence = self.sequence.fetch_add(1, Ordering::SeqCst) + 1;
+        let event = if oversized {
             let reset = self.content_free_reset_frame(sequence, &state.latest_observed_at);
             state.cached_snapshot = Some(reset.clone());
             state.cached_reset = Some(reset.clone());
@@ -540,6 +534,24 @@ impl ActivityEventLog {
             }
             event
         };
+        self.retain_and_broadcast_locked(&mut state, event);
+    }
+
+    fn publish_heartbeat(&self) {
+        let mut state = self.state.lock().expect("activity event state lock");
+        let sequence = self.sequence.fetch_add(1, Ordering::SeqCst) + 1;
+        let event = self.encoder.encode(ActivityStreamEvent {
+            schema_version: ACTIVITY_STREAM_EVENT_SCHEMA_VERSION,
+            kind: "heartbeat",
+            stream_id: self.stream_id.clone(),
+            sequence,
+            machine: self.machine.clone(),
+            observed_at: activity_observed_at(),
+            reason: None,
+            sessions: None,
+        });
+        state.cached_snapshot = None;
+        state.cached_reset = None;
         self.retain_and_broadcast_locked(&mut state, event);
     }
 
@@ -778,11 +790,42 @@ enum ActivitySubscribeError {
     Capacity,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ActivityChange {
+    Refresh,
+    Rescan,
+    RootLost,
+}
+
+type ActivityWatchRearm = Arc<dyn Fn() -> bool + Send + Sync>;
+
+#[derive(Default)]
+struct ActivityChangeLoopControls {
+    refresh_started: Option<mpsc::UnboundedSender<tokio::time::Instant>>,
+    watch_rearm: Option<ActivityWatchRearm>,
+}
+
+fn create_activity_watcher(
+    change_tx: mpsc::Sender<ActivityChange>,
+    lifecycle: watch::Sender<ActivityBrokerLifecycle>,
+    sessions_root: PathBuf,
+) -> Option<RecommendedWatcher> {
+    let callback_root = sessions_root.clone();
+    let mut watcher = notify::recommended_watcher(move |result: notify::Result<NotifyEvent>| {
+        activity_watch_callback(result, &change_tx, &lifecycle, &callback_root);
+    })
+    .ok()?;
+    watcher
+        .watch(&sessions_root, RecursiveMode::Recursive)
+        .ok()?;
+    Some(watcher)
+}
+
 struct ActivityBroker {
     log: Arc<ActivityEventLog>,
     lifecycle: watch::Sender<ActivityBrokerLifecycle>,
     subscribers: Arc<Semaphore>,
-    _watcher: StdMutex<Option<RecommendedWatcher>>,
+    _watcher: Arc<StdMutex<Option<RecommendedWatcher>>>,
 }
 
 impl ActivityBroker {
@@ -794,23 +837,10 @@ impl ActivityBroker {
     ) -> Arc<Self> {
         let (lifecycle, _) = watch::channel(ActivityBrokerLifecycle::Starting);
         let (change_tx, change_rx) = mpsc::channel(1);
-        let callback_tx = change_tx.clone();
-        let callback_lifecycle = lifecycle.clone();
-        let mut watcher =
-            notify::recommended_watcher(move |result: notify::Result<NotifyEvent>| {
-                activity_watch_callback(result, &callback_tx, &callback_lifecycle);
-            })
-            .ok();
         let sessions_root = context.state_dir.join("sessions");
-        if std::fs::create_dir_all(&sessions_root).is_err()
-            || watcher.as_mut().is_some_and(|watcher| {
-                watcher
-                    .watch(&sessions_root, RecursiveMode::Recursive)
-                    .is_err()
-            })
-        {
-            watcher = None;
-        }
+        let watcher = std::fs::create_dir_all(&sessions_root).ok().and_then(|()| {
+            create_activity_watcher(change_tx.clone(), lifecycle.clone(), sessions_root.clone())
+        });
         if watcher.is_none() {
             eprintln!(
                 "warning: activity filesystem notifications unavailable; session polling will reconcile"
@@ -841,20 +871,43 @@ impl ActivityBroker {
         } else {
             ActivityBrokerLifecycle::Degraded
         });
+        let watcher = Arc::new(StdMutex::new(watcher));
         let broker = Arc::new(Self {
             log,
             lifecycle,
             subscribers: Arc::new(Semaphore::new(ACTIVITY_STREAM_SUBSCRIBER_CAPACITY)),
-            _watcher: StdMutex::new(watcher),
+            _watcher: watcher.clone(),
         });
         if ready {
-            tokio::spawn(activity_change_loop(
+            let rearm_watcher = watcher;
+            let rearm_tx = change_tx;
+            let rearm_lifecycle = broker.lifecycle.clone();
+            let rearm_root = sessions_root;
+            let watch_rearm: ActivityWatchRearm = Arc::new(move || {
+                if std::fs::create_dir_all(&rearm_root).is_err() {
+                    return false;
+                }
+                let Some(rearmed) = create_activity_watcher(
+                    rearm_tx.clone(),
+                    rearm_lifecycle.clone(),
+                    rearm_root.clone(),
+                ) else {
+                    return false;
+                };
+                *rearm_watcher.lock().expect("activity watcher lock") = Some(rearmed);
+                true
+            });
+            tokio::spawn(activity_change_loop_inner(
                 broker.log.clone(),
                 broker.lifecycle.clone(),
                 session_collector,
                 context,
                 tmux_bin,
                 change_rx,
+                ActivityChangeLoopControls {
+                    refresh_started: None,
+                    watch_rearm: Some(watch_rearm),
+                },
             ));
             tokio::spawn(activity_heartbeat_loop(
                 broker.log.clone(),
@@ -879,7 +932,7 @@ impl ActivityBroker {
             log,
             lifecycle,
             subscribers: Arc::new(Semaphore::new(subscriber_limit)),
-            _watcher: StdMutex::new(Some(watcher)),
+            _watcher: Arc::new(StdMutex::new(Some(watcher))),
         })
     }
 
@@ -900,7 +953,7 @@ impl ActivityBroker {
             log,
             lifecycle,
             subscribers: Arc::new(Semaphore::new(ACTIVITY_STREAM_SUBSCRIBER_CAPACITY)),
-            _watcher: StdMutex::new(Some(watcher)),
+            _watcher: Arc::new(StdMutex::new(Some(watcher))),
         })
     }
 
@@ -949,12 +1002,34 @@ fn degrade_activity_broker(lifecycle: &watch::Sender<ActivityBrokerLifecycle>, w
 
 fn activity_watch_callback(
     result: notify::Result<NotifyEvent>,
-    change_tx: &mpsc::Sender<()>,
+    change_tx: &mpsc::Sender<ActivityChange>,
     lifecycle: &watch::Sender<ActivityBrokerLifecycle>,
+    sessions_root: &Path,
 ) {
     match result {
+        Ok(event) if activity_notify_event_root_lost(&event, sessions_root) => {
+            if change_tx.try_send(ActivityChange::RootLost).is_err() {
+                degrade_activity_broker(
+                    lifecycle,
+                    "activity sessions root invalidation could not be queued; activity stream disabled",
+                );
+            }
+        }
+        Ok(event) if event.need_rescan() => match change_tx.try_send(ActivityChange::Rescan) {
+            Ok(()) | Err(mpsc::error::TrySendError::Full(_)) => {}
+            Err(mpsc::error::TrySendError::Closed(_)) => degrade_activity_broker(
+                lifecycle,
+                "activity rescan could not be queued; activity stream disabled",
+            ),
+        },
         Ok(event) if activity_notify_event_relevant(&event) => {
-            let _ = change_tx.try_send(());
+            match change_tx.try_send(ActivityChange::Refresh) {
+                Ok(()) | Err(mpsc::error::TrySendError::Full(_)) => {}
+                Err(mpsc::error::TrySendError::Closed(_)) => degrade_activity_broker(
+                    lifecycle,
+                    "activity refresh could not be queued; activity stream disabled",
+                ),
+            }
         }
         Ok(_) => {}
         Err(_) => degrade_activity_broker(
@@ -962,6 +1037,13 @@ fn activity_watch_callback(
             "activity filesystem notification failed; activity stream disabled",
         ),
     }
+}
+
+fn activity_notify_event_root_lost(event: &NotifyEvent, sessions_root: &Path) -> bool {
+    matches!(
+        event.kind,
+        EventKind::Remove(_) | EventKind::Modify(notify::event::ModifyKind::Name(_))
+    ) && event.paths.iter().any(|path| path == sessions_root)
 }
 
 fn activity_notify_event_relevant(event: &NotifyEvent) -> bool {
@@ -1027,15 +1109,38 @@ async fn activity_refresh_snapshot(
     }
 }
 
+#[cfg(test)]
 async fn activity_change_loop(
     log: Arc<ActivityEventLog>,
     lifecycle: watch::Sender<ActivityBrokerLifecycle>,
     session_collector: SessionCollector,
     context: CliContext,
     tmux_bin: PathBuf,
-    mut changes: mpsc::Receiver<()>,
+    changes: mpsc::Receiver<ActivityChange>,
+) {
+    activity_change_loop_inner(
+        log,
+        lifecycle,
+        session_collector,
+        context,
+        tmux_bin,
+        changes,
+        ActivityChangeLoopControls::default(),
+    )
+    .await;
+}
+
+async fn activity_change_loop_inner(
+    log: Arc<ActivityEventLog>,
+    lifecycle: watch::Sender<ActivityBrokerLifecycle>,
+    session_collector: SessionCollector,
+    context: CliContext,
+    tmux_bin: PathBuf,
+    mut changes: mpsc::Receiver<ActivityChange>,
+    controls: ActivityChangeLoopControls,
 ) {
     let mut lifecycle_rx = lifecycle.subscribe();
+    let mut last_refresh_started_at = None;
     loop {
         let change = tokio::select! {
             biased;
@@ -1049,15 +1154,34 @@ async fn activity_change_loop(
             }
             change = changes.recv() => change,
         };
-        if change.is_none() {
+        let Some(change) = change else {
             degrade_activity_broker(
                 &lifecycle,
                 "activity filesystem notification channel closed; activity stream disabled",
             );
             return;
+        };
+        if change == ActivityChange::RootLost
+            && !controls.watch_rearm.as_ref().is_some_and(|rearm| rearm())
+        {
+            degrade_activity_broker(
+                &lifecycle,
+                "activity sessions root watch could not be re-armed; activity stream disabled",
+            );
+            return;
         }
-        let quiet = tokio::time::sleep(ACTIVITY_STREAM_DEBOUNCE);
-        let cadence = tokio::time::sleep(ACTIVITY_STREAM_MAX_REFRESH_CADENCE);
+        let batch_started_at = tokio::time::Instant::now();
+        let minimum_start_at = last_refresh_started_at
+            .map(|started_at| started_at + ACTIVITY_STREAM_MAX_REFRESH_CADENCE)
+            .unwrap_or(batch_started_at);
+        let quiet = tokio::time::sleep_until(
+            (batch_started_at + ACTIVITY_STREAM_DEBOUNCE).max(minimum_start_at),
+        );
+        let cadence = tokio::time::sleep_until(if minimum_start_at > batch_started_at {
+            minimum_start_at
+        } else {
+            batch_started_at + ACTIVITY_STREAM_MAX_REFRESH_CADENCE
+        });
         tokio::pin!(quiet);
         tokio::pin!(cadence);
         loop {
@@ -1072,19 +1196,41 @@ async fn activity_change_loop(
                 }
                 _ = &mut cadence => break,
                 _ = &mut quiet => break,
-                change = changes.recv() => {
-                    if change.is_none() {
+                change = changes.recv() => match change {
+                    None => {
                         degrade_activity_broker(
                             &lifecycle,
                             "activity filesystem notification channel closed; activity stream disabled",
                         );
                         return;
                     }
+                    Some(change) => {
+                    if change == ActivityChange::RootLost
+                        && !controls
+                            .watch_rearm
+                            .as_ref()
+                            .is_some_and(|rearm| rearm())
+                    {
+                        degrade_activity_broker(
+                            &lifecycle,
+                            "activity sessions root watch could not be re-armed; activity stream disabled",
+                        );
+                        return;
+                    }
                     quiet
                         .as_mut()
-                        .reset(tokio::time::Instant::now() + ACTIVITY_STREAM_DEBOUNCE);
+                        .reset(
+                            (tokio::time::Instant::now() + ACTIVITY_STREAM_DEBOUNCE)
+                                .max(minimum_start_at),
+                        );
+                    }
                 }
             }
+        }
+        let started_at = tokio::time::Instant::now();
+        last_refresh_started_at = Some(started_at);
+        if let Some(observer) = &controls.refresh_started {
+            let _ = observer.send(started_at);
         }
         if !activity_refresh_snapshot(
             log.clone(),
@@ -6453,6 +6599,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn activity_stream_persistent_oversized_state_emits_one_transition_reset() {
+        let log = ActivityEventLog::new(MACHINE.to_string(), Vec::new());
+        let cursor = format!("{}:1", log.stream_id);
+        let mut subscriber = log.subscribe(Some(&cursor));
+        let oversized_sessions = |prefix: &str| {
+            (0..128)
+                .map(|index| ActivityStreamSession {
+                    id: format!("{prefix}-{index:03}-{}", "x".repeat(128)),
+                    turn_state: Some(test_stream_turn_state(index, "x".repeat(8192))),
+                })
+                .collect()
+        };
+
+        log.publish_snapshot(oversized_sessions("oversized-first"));
+        let transition = subscriber.next_event().await.expect("oversized reset");
+        assert_eq!(transition.kind, "reset");
+        assert_eq!(transition.reason, Some(ACTIVITY_STREAM_OVERSIZED_REASON));
+        let transition_sequence = transition.sequence;
+
+        log.publish_snapshot(oversized_sessions("oversized-still"));
+        assert_eq!(
+            log.sequence.load(Ordering::SeqCst),
+            transition_sequence,
+            "persistent oversized snapshots must not create hidden gaps or repeated resets"
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(25), subscriber.next_event())
+                .await
+                .is_err(),
+            "persistent oversized state amplified one transition into another poll reset"
+        );
+
+        log.publish_snapshot(vec![ActivityStreamSession {
+            id: "bounded-recovery".to_string(),
+            turn_state: None,
+        }]);
+        let recovery = subscriber.next_event().await.expect("bounded recovery");
+        assert_eq!(recovery.kind, "snapshot");
+        assert_eq!(recovery.sequence, transition_sequence + 1);
+        assert_eq!(
+            recovery.sessions.as_ref().unwrap()[0].id,
+            "bounded-recovery"
+        );
+    }
+
+    #[tokio::test]
     async fn activity_stream_rejects_subscriber_saturation_and_reclaims_permits() {
         let tmp = tempfile::TempDir::new().unwrap();
         let broker = ActivityBroker::for_test_with_subscriber_limit(MACHINE, 1);
@@ -6494,6 +6686,7 @@ mod tests {
             Err(notify::Error::generic("injected watcher failure")),
             &change_tx,
             &broker.lifecycle,
+            &tmp.path().join("sessions"),
         );
 
         let reset = subscription
@@ -6538,6 +6731,101 @@ mod tests {
                 .unwrap()
                 .contains("session polling")
         );
+    }
+
+    #[tokio::test]
+    async fn activity_broker_rescan_flag_forces_full_snapshot_refresh() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let context = CliContext {
+            state_dir: tmp.path().to_path_buf(),
+            host: None,
+        };
+        let broker = ActivityBroker::for_test(MACHINE);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed_calls = calls.clone();
+        let collector: SessionCollector = Arc::new(move |_, _| {
+            observed_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(Vec::new())
+        });
+        let (change_tx, change_rx) = mpsc::channel(1);
+        let change_task = tokio::spawn(activity_change_loop(
+            broker.log.clone(),
+            broker.lifecycle.clone(),
+            collector,
+            context,
+            PathBuf::from("tmux"),
+            change_rx,
+        ));
+        let rescan = NotifyEvent::new(EventKind::Other).set_flag(notify::event::Flag::Rescan);
+
+        activity_watch_callback(
+            Ok(rescan),
+            &change_tx,
+            &broker.lifecycle,
+            &tmp.path().join("sessions"),
+        );
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while calls.load(Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("rescan-triggered full refresh");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(*broker.lifecycle.borrow(), ActivityBrokerLifecycle::Ready);
+
+        change_task.abort();
+        let _ = change_task.await;
+    }
+
+    #[tokio::test]
+    async fn activity_broker_root_loss_rearm_failure_degrades_and_stops_stream() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let context = CliContext {
+            state_dir: tmp.path().to_path_buf(),
+            host: None,
+        };
+        let broker = ActivityBroker::for_test(MACHINE);
+        let mut subscription = broker.subscribe(None).expect("ready subscription");
+        let initial = subscription.next_event().await.expect("initial snapshot");
+        let sessions_root = tmp.path().join("sessions");
+        std::fs::create_dir_all(&sessions_root).unwrap();
+        let (change_tx, change_rx) = mpsc::channel(1);
+        let change_task = tokio::spawn(activity_change_loop_inner(
+            broker.log.clone(),
+            broker.lifecycle.clone(),
+            default_session_collector(),
+            context,
+            PathBuf::from("tmux"),
+            change_rx,
+            ActivityChangeLoopControls {
+                refresh_started: None,
+                watch_rearm: Some(Arc::new(|| false)),
+            },
+        ));
+        let removed = NotifyEvent::new(EventKind::Remove(notify::event::RemoveKind::Folder))
+            .add_path(sessions_root.clone());
+
+        activity_watch_callback(Ok(removed), &change_tx, &broker.lifecycle, &sessions_root);
+        tokio::time::timeout(Duration::from_secs(1), change_task)
+            .await
+            .expect("root-loss loop terminates")
+            .expect("root-loss task");
+        assert_eq!(
+            *broker.lifecycle.borrow(),
+            ActivityBrokerLifecycle::Degraded
+        );
+        let reset = subscription.next_event().await.expect("degraded reset");
+        assert_degraded_reset_survives_consumer_dedupe(&initial, &reset);
+        assert!(subscription.next_event().await.is_none());
+        assert!(matches!(
+            broker.subscribe(None),
+            Err(ActivitySubscribeError::Unavailable)
+        ));
+        assert!(!activity_publish_heartbeat_if_ready(
+            &broker.log,
+            &broker.lifecycle
+        ));
     }
 
     #[tokio::test]
@@ -6778,7 +7066,10 @@ mod tests {
             tmux,
             change_rx,
         ));
-        change_tx.send(()).await.expect("activity notification");
+        change_tx
+            .send(ActivityChange::Refresh)
+            .await
+            .expect("activity notification");
         let refreshed = tokio::time::timeout(Duration::from_secs(1), subscription.next_event())
             .await
             .expect("notification refresh")
@@ -6845,7 +7136,7 @@ mod tests {
 
         for revision in 1..=NOTIFICATIONS {
             source_revision.store(revision, Ordering::SeqCst);
-            let _ = change_tx.try_send(());
+            let _ = change_tx.try_send(ActivityChange::Refresh);
             tokio::time::sleep(Duration::from_millis(2)).await;
         }
         let final_snapshot = tokio::time::timeout(Duration::from_secs(2), async {
@@ -6862,13 +7153,346 @@ mod tests {
         .expect("storm converges to final revision");
         assert_eq!(final_snapshot.kind, "snapshot");
         assert!(
-            collector_calls.load(Ordering::SeqCst) <= 3,
+            collector_calls.load(Ordering::SeqCst) <= 4,
             "notification storm triggered too many full scans: {}",
             collector_calls.load(Ordering::SeqCst)
         );
 
         change_task.abort();
         let _ = change_task.await;
+    }
+
+    #[tokio::test]
+    async fn activity_broker_refresh_starts_respect_the_minimum_cadence() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let context = CliContext {
+            state_dir: tmp.path().to_path_buf(),
+            host: None,
+        };
+        let broker = ActivityBroker::for_test(MACHINE);
+        let (started_tx, mut started_rx) = mpsc::unbounded_channel();
+        let collector: SessionCollector = Arc::new(move |_, _| {
+            let _ = started_tx.send(std::time::Instant::now());
+            Ok(Vec::new())
+        });
+        let (change_tx, change_rx) = mpsc::channel(1);
+        let change_task = tokio::spawn(activity_change_loop(
+            broker.log.clone(),
+            broker.lifecycle.clone(),
+            collector,
+            context,
+            PathBuf::from("tmux"),
+            change_rx,
+        ));
+
+        change_tx
+            .send(ActivityChange::Refresh)
+            .await
+            .expect("first activity notification");
+        let first = tokio::time::timeout(Duration::from_secs(1), started_rx.recv())
+            .await
+            .expect("first refresh start")
+            .expect("first refresh timestamp");
+        change_tx
+            .send(ActivityChange::Refresh)
+            .await
+            .expect("second activity notification");
+        let second = tokio::time::timeout(Duration::from_secs(1), started_rx.recv())
+            .await
+            .expect("second refresh start")
+            .expect("second refresh timestamp");
+        assert!(
+            second.duration_since(first) >= ACTIVITY_STREAM_MAX_REFRESH_CADENCE,
+            "refreshes started too close together: {:?}",
+            second.duration_since(first)
+        );
+
+        change_task.abort();
+        let _ = change_task.await;
+    }
+
+    async fn drive_paused_activity_refresh_pattern(
+        interval: Duration,
+        notifications: usize,
+    ) -> (Vec<Duration>, Vec<usize>) {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let context = CliContext {
+            state_dir: tmp.path().to_path_buf(),
+            host: None,
+        };
+        let broker = ActivityBroker::for_test(MACHINE);
+        let source_revision = Arc::new(AtomicUsize::new(0));
+        let sampled_revisions = Arc::new(StdMutex::new(Vec::new()));
+        let observed_revision = source_revision.clone();
+        let observed_samples = sampled_revisions.clone();
+        let collector: SessionCollector = Arc::new(move |_, _| {
+            observed_samples
+                .lock()
+                .expect("sampled revision lock")
+                .push(observed_revision.load(Ordering::SeqCst));
+            Ok(Vec::new())
+        });
+        let (change_tx, change_rx) = mpsc::channel(1);
+        let (started_tx, mut started_rx) = mpsc::unbounded_channel();
+        let origin = tokio::time::Instant::now();
+        let change_task = tokio::spawn(activity_change_loop_inner(
+            broker.log.clone(),
+            broker.lifecycle.clone(),
+            collector,
+            context,
+            PathBuf::from("tmux"),
+            change_rx,
+            ActivityChangeLoopControls {
+                refresh_started: Some(started_tx),
+                watch_rearm: None,
+            },
+        ));
+
+        for revision in 1..=notifications {
+            source_revision.store(revision, Ordering::SeqCst);
+            let _ = change_tx.try_send(ActivityChange::Refresh);
+            for _ in 0..if revision == 1 { 4 } else { 1 } {
+                tokio::task::yield_now().await;
+            }
+            tokio::time::advance(interval).await;
+        }
+        for _ in 0..4 {
+            tokio::task::yield_now().await;
+        }
+        tokio::time::advance(ACTIVITY_STREAM_MAX_REFRESH_CADENCE + ACTIVITY_STREAM_DEBOUNCE).await;
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
+
+        let mut starts = Vec::new();
+        while let Ok(started_at) = started_rx.try_recv() {
+            starts.push(started_at.duration_since(origin));
+        }
+        let samples = sampled_revisions
+            .lock()
+            .expect("sampled revision lock")
+            .clone();
+        change_task.abort();
+        let _ = change_task.await;
+        (starts, samples)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn activity_refresh_manual_time_dense_and_26ms_patterns_are_rate_bounded() {
+        let (dense_starts, dense_samples) =
+            drive_paused_activity_refresh_pattern(Duration::from_millis(2), 300).await;
+        assert_eq!(dense_starts.first(), Some(&Duration::from_millis(250)));
+        assert!(dense_starts.len() <= 3, "dense refreshes: {dense_starts:?}");
+        assert_eq!(dense_samples.last(), Some(&300));
+        assert!(
+            dense_starts
+                .windows(2)
+                .all(|starts| { starts[1] - starts[0] >= ACTIVITY_STREAM_MAX_REFRESH_CADENCE })
+        );
+
+        let (periodic_starts, periodic_samples) =
+            drive_paused_activity_refresh_pattern(Duration::from_millis(26), 30).await;
+        assert!(
+            periodic_starts
+                .first()
+                .is_some_and(|start| *start >= Duration::from_millis(25)
+                    && *start <= Duration::from_millis(26)),
+            "isolated trailing quiet start: {periodic_starts:?}"
+        );
+        assert!(
+            periodic_starts.len() <= 4,
+            "26ms refreshes: {periodic_starts:?}"
+        );
+        assert_eq!(periodic_samples.last(), Some(&30));
+        assert!(
+            periodic_starts
+                .windows(2)
+                .all(|starts| { starts[1] - starts[0] >= ACTIVITY_STREAM_MAX_REFRESH_CADENCE })
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn activity_refresh_manual_time_slow_scan_retains_dirty_final_revision() {
+        const NOTIFICATIONS: usize = 100;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let context = CliContext {
+            state_dir: tmp.path().to_path_buf(),
+            host: None,
+        };
+        let tmux = minimal_tmux(tmp.path());
+        let cwd = tmp.path().join("repo");
+        std::fs::create_dir_all(&cwd).unwrap();
+        for id in ["slow-before", "slow-final"] {
+            seed_fresh_provider_session(tmp.path(), id, "codex", &format!("hs-{id}"), &cwd, None);
+        }
+        let broker = ActivityBroker::for_test(MACHINE);
+        let mut subscription = broker.subscribe(None).expect("ready subscription");
+        assert_eq!(
+            subscription.next_event().await.unwrap().sessions,
+            Some(Vec::new())
+        );
+        let source_revision = Arc::new(AtomicUsize::new(0));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed_revision = source_revision.clone();
+        let observed_calls = calls.clone();
+        let (collector_started_tx, mut collector_started_rx) = mpsc::unbounded_channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let release_rx = Arc::new(StdMutex::new(release_rx));
+        let observed_release = release_rx.clone();
+        let collector: SessionCollector = Arc::new(move |context, tmux_bin| {
+            let call = observed_calls.fetch_add(1, Ordering::SeqCst);
+            let revision = observed_revision.load(Ordering::SeqCst);
+            if call == 0 {
+                let _ = collector_started_tx.send(());
+                observed_release
+                    .lock()
+                    .expect("slow collector release lock")
+                    .recv()
+                    .expect("slow collector release");
+            }
+            let expected_id = if revision == 0 {
+                "slow-before"
+            } else {
+                "slow-final"
+            };
+            list_sessions(context, Some(tmux_bin)).map(|sessions| {
+                sessions
+                    .into_iter()
+                    .filter(|session| session.id == expected_id)
+                    .collect()
+            })
+        });
+        let (change_tx, change_rx) = mpsc::channel(1);
+        let (started_tx, mut started_rx) = mpsc::unbounded_channel();
+        let origin = tokio::time::Instant::now();
+        let change_task = tokio::spawn(activity_change_loop_inner(
+            broker.log.clone(),
+            broker.lifecycle.clone(),
+            collector,
+            context,
+            tmux,
+            change_rx,
+            ActivityChangeLoopControls {
+                refresh_started: Some(started_tx),
+                watch_rearm: None,
+            },
+        ));
+
+        change_tx
+            .send(ActivityChange::Refresh)
+            .await
+            .expect("initial activity notification");
+        for _ in 0..4 {
+            tokio::task::yield_now().await;
+        }
+        tokio::time::advance(ACTIVITY_STREAM_DEBOUNCE).await;
+        assert_eq!(
+            started_rx.recv().await.unwrap().duration_since(origin),
+            Duration::from_millis(25)
+        );
+        collector_started_rx
+            .recv()
+            .await
+            .expect("slow collector started");
+        for revision in 1..=NOTIFICATIONS {
+            source_revision.store(revision, Ordering::SeqCst);
+            let _ = change_tx.try_send(ActivityChange::Refresh);
+            tokio::time::advance(Duration::from_millis(2)).await;
+        }
+        release_tx.send(()).expect("release slow collector");
+        let before = subscription.next_event().await.expect("pre-storm snapshot");
+        assert_eq!(before.sessions.as_ref().unwrap()[0].id, "slow-before");
+        tokio::time::advance(Duration::from_millis(50)).await;
+        let second_started = started_rx.recv().await.expect("final refresh start");
+        assert_eq!(
+            second_started.duration_since(origin),
+            Duration::from_millis(275)
+        );
+        let final_snapshot = subscription.next_event().await.expect("final snapshot");
+        assert_eq!(
+            final_snapshot.sessions.as_ref().unwrap()[0].id,
+            "slow-final"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+
+        change_task.abort();
+        let _ = change_task.await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn activity_sessions_root_delete_recreate_delivers_transition_or_degrades() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let tmux = minimal_tmux(tmp.path());
+        let context = CliContext {
+            state_dir: tmp.path().to_path_buf(),
+            host: None,
+        };
+        let broker = ActivityBroker::start(
+            context.clone(),
+            MACHINE.to_string(),
+            tmux,
+            default_session_collector(),
+        )
+        .await;
+        let mut subscription = broker.subscribe(None).expect("ready activity broker");
+        let initial = subscription.next_event().await.expect("initial snapshot");
+        let sessions_root = tmp.path().join("sessions");
+        std::fs::remove_dir_all(&sessions_root).expect("remove watched sessions root");
+        let _ = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if *broker.lifecycle.borrow() == ActivityBrokerLifecycle::Degraded
+                    || sessions_root.is_dir()
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+
+        if *broker.lifecycle.borrow() == ActivityBrokerLifecycle::Degraded {
+            let reset = subscription.next_event().await.expect("root-loss reset");
+            assert_degraded_reset_survives_consumer_dedupe(&initial, &reset);
+            assert!(subscription.next_event().await.is_none());
+            assert!(matches!(
+                broker.subscribe(None),
+                Err(ActivitySubscribeError::Unavailable)
+            ));
+            assert!(!activity_publish_heartbeat_if_ready(
+                &broker.log,
+                &broker.lifecycle
+            ));
+            return;
+        }
+
+        let cwd = tmp.path().join("repo");
+        std::fs::create_dir_all(&cwd).unwrap();
+        seed_fresh_provider_session(
+            tmp.path(),
+            "root-rearmed-session",
+            "codex",
+            "hs-root-rearmed-session",
+            &cwd,
+            None,
+        );
+        let record = load_session_record(&context, "root-rearmed-session").expect("session record");
+        crate::activity::activate_runtime(&context, &record).expect("activity snapshot");
+        let delivered = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let event = subscription.next_event().await.expect("activity event");
+                if event.sessions.as_ref().is_some_and(|sessions| {
+                    sessions
+                        .iter()
+                        .any(|session| session.id == "root-rearmed-session")
+                }) {
+                    break event;
+                }
+            }
+        })
+        .await
+        .expect("re-armed root delivers later transition");
+        assert_eq!(delivered.kind, "snapshot");
+        assert_eq!(*broker.lifecycle.borrow(), ActivityBrokerLifecycle::Ready);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

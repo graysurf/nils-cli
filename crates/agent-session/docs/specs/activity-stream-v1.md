@@ -108,7 +108,11 @@ instead:
 
 Only this exact `reset` reason permits `sessions` to be omitted. It is a
 content-free invalidation, not an empty session list, and requires immediate
-`GET /sessions` reconciliation. Polling remains authoritative and available.
+`GET /sessions` reconciliation. The reset is emitted once when state crosses
+from bounded to oversized; later oversized refreshes update polling state but
+do not repeat the reset or advance the stream sequence. A later bounded
+snapshot is emitted as the recovery transition. Polling remains authoritative
+and available.
 
 Nested optional `turn_state` leaves use the same omission semantics as
 `GET /sessions`: absent provider ids, progress timestamps, attention, current
@@ -147,10 +151,20 @@ subscriber releases its permit and polling remains available throughout
 saturation.
 
 Filesystem notifications for `activity.json` and session lifecycle changes use
-a capacity-one dirty bit. Refresh waits for a trailing 25 ms quiet window but
-never waits more than the explicit 250 ms maximum cadence before starting a
-snapshot scan. Notifications arriving during a scan stay dirty and converge in
-a later bounded refresh; HTTP polling is not the transition source.
+a capacity-one dirty bit. The first isolated refresh waits for a trailing 25 ms
+quiet window. Under a continuous burst, a refresh starts by the 250 ms cadence;
+after any refresh starts, the next refresh cannot start for at least 250 ms.
+Notifications arriving during a scan stay dirty and converge in a later
+rate-bounded refresh.
+
+A notify event marked `need_rescan()` forces the same full snapshot collection
+even when it has no relevant path. Removal or rename of the watched sessions
+root first recreates the directory and replaces the recursive watcher before a
+full refresh. If that root-loss invalidation cannot be queued or the watcher
+cannot be re-armed, the broker degrades: existing streams receive their final
+reset and EOF, heartbeats stop, and new stream requests receive the polling
+fallback response. HTTP polling remains available throughout and is not the
+normal transition source.
 
 ## Privacy boundary
 
