@@ -42,7 +42,7 @@ use nils_common::provider_usage::{ProviderUsageReason, prefer_reason};
 use nils_common::usage_time::{
     epoch_seconds_from_f64, normalize_epoch_seconds, reset_epoch_seconds_from_str,
 };
-use notify::{Event as NotifyEvent, RecommendedWatcher, RecursiveMode, Watcher};
+use notify::{Event as NotifyEvent, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, broadcast, mpsc};
@@ -53,11 +53,11 @@ use crate::provider_prompt::{
     ProviderPromptSource, ProviderPromptTail,
 };
 use crate::{
-    BINARY, CliContext, CliError, ProviderResumeImportArgs, WorkdirSearchOptions, delete_session,
-    glance_session, list_sessions, load_session_record, non_empty_env, repo_remote_url_from_cwd,
-    resolve_tmux_bin, resume_session_by_id, search_workdirs, send_input, session_clipboard_buffer,
-    session_dir, session_status, short_hostname, start_provider_resume_session, start_session,
-    update_session_title, write_session_attachment,
+    BINARY, CliContext, CliError, ProviderResumeImportArgs, SessionView, WorkdirSearchOptions,
+    delete_session, glance_session, list_sessions, load_session_record, non_empty_env,
+    repo_remote_url_from_cwd, resolve_tmux_bin, resume_session_by_id, search_workdirs, send_input,
+    session_clipboard_buffer, session_dir, session_status, short_hostname,
+    start_provider_resume_session, start_session, update_session_title, write_session_attachment,
 };
 
 const ATTACH_LIVE_FIFO_NAME: &str = "attach-live.fifo";
@@ -107,6 +107,9 @@ const RESET_AT_EPOCH_KEYS: &[&str] = &[
 ];
 
 /// Shared daemon state handed to every request handler.
+type SessionCollector =
+    Arc<dyn Fn(&CliContext, &Path) -> Result<Vec<SessionView>, CliError> + Send + Sync>;
+
 struct ServeState {
     context: CliContext,
     machine: String,
@@ -115,6 +118,11 @@ struct ServeState {
     attach_brokers: AttachBrokerRegistry,
     provider_prompt_discovery: Arc<ProviderPromptDiscoveryRegistry>,
     activity_broker: Arc<ActivityBroker>,
+    session_collector: SessionCollector,
+}
+
+fn default_session_collector() -> SessionCollector {
+    Arc::new(|context, tmux_bin| list_sessions(context, Some(tmux_bin)))
 }
 
 pub fn run_serve(context: &CliContext, args: cli::ServeArgs) -> i32 {
@@ -184,6 +192,7 @@ pub fn run_serve(context: &CliContext, args: cli::ServeArgs) -> i32 {
             attach_brokers: AttachBrokerRegistry::default(),
             provider_prompt_discovery: Arc::new(ProviderPromptDiscoveryRegistry::default()),
             activity_broker,
+            session_collector: default_session_collector(),
         });
         let listener = match tokio::net::TcpListener::bind(bind).await {
             Ok(listener) => listener,
@@ -658,11 +667,21 @@ fn parse_activity_event_id(raw: &str) -> Option<(String, u64)> {
 }
 
 fn activity_notify_event_relevant(event: &NotifyEvent) -> bool {
-    event.paths.iter().any(|path| {
+    let known_snapshot_path = event.paths.iter().any(|path| {
         path.file_name()
             .and_then(|name| name.to_str())
             .is_some_and(|name| matches!(name, "activity.json" | "session.json"))
-    })
+    });
+    // Linux inotify normally names the removed file, while macOS FSEvents can
+    // coalesce a rename/removal to its watched directory. All paths delivered
+    // here are already scoped beneath the sessions root, so treat rename and
+    // remove kinds as lifecycle invalidations without broadening modify noise
+    // from terminal FIFOs or attachment writes.
+    known_snapshot_path
+        || matches!(
+            event.kind,
+            EventKind::Remove(_) | EventKind::Modify(notify::event::ModifyKind::Name(_))
+        )
 }
 
 fn collect_activity_stream_sessions(
@@ -1451,7 +1470,8 @@ async fn healthz(State(state): State<Arc<ServeState>>) -> Response {
 async fn list_handler(State(state): State<Arc<ServeState>>) -> Response {
     let context = state.context.clone();
     let tmux = state.tmux_bin.clone();
-    match tokio::task::spawn_blocking(move || list_sessions(&context, Some(&tmux))).await {
+    let collect = state.session_collector.clone();
+    match tokio::task::spawn_blocking(move || collect(&context, &tmux)).await {
         Ok(Ok(sessions)) => envelope_ok(json!({
             "machine": state.machine,
             "observed_at": activity_observed_at(),
@@ -4783,6 +4803,37 @@ mod tests {
         tmux_bin: PathBuf,
         activity_broker: Arc<ActivityBroker>,
     ) -> Arc<ServeState> {
+        state_with_dependencies(
+            state_dir,
+            token,
+            tmux_bin,
+            activity_broker,
+            default_session_collector(),
+        )
+    }
+
+    fn state_with_session_collector(
+        state_dir: &Path,
+        token: Option<&str>,
+        tmux_bin: PathBuf,
+        session_collector: SessionCollector,
+    ) -> Arc<ServeState> {
+        state_with_dependencies(
+            state_dir,
+            token,
+            tmux_bin,
+            ActivityBroker::for_test(MACHINE),
+            session_collector,
+        )
+    }
+
+    fn state_with_dependencies(
+        state_dir: &Path,
+        token: Option<&str>,
+        tmux_bin: PathBuf,
+        activity_broker: Arc<ActivityBroker>,
+        session_collector: SessionCollector,
+    ) -> Arc<ServeState> {
         Arc::new(ServeState {
             context: CliContext {
                 state_dir: state_dir.to_path_buf(),
@@ -4794,6 +4845,7 @@ mod tests {
             attach_brokers: AttachBrokerRegistry::default(),
             provider_prompt_discovery: Arc::new(ProviderPromptDiscoveryRegistry::default()),
             activity_broker,
+            session_collector,
         })
     }
 
@@ -5374,6 +5426,67 @@ mod tests {
         builder.body(Body::empty()).unwrap()
     }
 
+    fn get_activity_events(last_event_id: Option<&str>) -> Request<Body> {
+        let mut builder = Request::builder()
+            .method("GET")
+            .uri("/activity/events")
+            .header("authorization", format!("Bearer {TOKEN}"));
+        if let Some(last_event_id) = last_event_id {
+            builder = builder.header("last-event-id", last_event_id);
+        }
+        builder.body(Body::empty()).unwrap()
+    }
+
+    async fn first_activity_sse_frame(
+        state: Arc<ServeState>,
+        last_event_id: Option<&str>,
+    ) -> String {
+        let response = router(state)
+            .oneshot(get_activity_events(last_event_id))
+            .await
+            .expect("activity stream response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let mut body = response.into_body().into_data_stream();
+        let mut bytes = Vec::new();
+        for _ in 0..8 {
+            let chunk = tokio::time::timeout(Duration::from_millis(250), body.next())
+                .await
+                .expect("bounded SSE response frame")
+                .expect("SSE response data")
+                .expect("SSE response chunk");
+            bytes.extend_from_slice(&chunk);
+            assert!(bytes.len() <= 64 * 1024, "SSE frame exceeded test bound");
+            if bytes.windows(2).any(|window| window == b"\n\n") {
+                break;
+            }
+        }
+        let frame = String::from_utf8(bytes).expect("UTF-8 SSE frame");
+        assert!(frame.ends_with("\n\n"), "incomplete SSE frame: {frame:?}");
+        frame
+    }
+
+    fn parse_activity_sse_frame(frame: &str) -> (String, String, Value) {
+        let id = frame
+            .lines()
+            .find_map(|line| line.strip_prefix("id: "))
+            .expect("SSE id")
+            .to_string();
+        let event = frame
+            .lines()
+            .find_map(|line| line.strip_prefix("event: "))
+            .expect("SSE event")
+            .to_string();
+        let data = frame
+            .lines()
+            .find_map(|line| line.strip_prefix("data: "))
+            .expect("SSE data");
+        (
+            id,
+            event,
+            serde_json::from_str(data).expect("SSE JSON data"),
+        )
+    }
+
     fn auth_headers(token: Option<&str>) -> HeaderMap {
         let mut headers = HeaderMap::new();
         if let Some(token) = token {
@@ -5448,6 +5561,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn list_observed_at_is_sampled_after_delayed_assembly_and_before_receipt() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let collection_finished = Arc::new(StdMutex::new(None));
+        let finished = collection_finished.clone();
+        let collector: SessionCollector = Arc::new(move |_, _| {
+            std::thread::sleep(Duration::from_millis(50));
+            *finished.lock().expect("collection timestamp lock") = Some(jiff::Timestamp::now());
+            Ok(Vec::new())
+        });
+        let st =
+            state_with_session_collector(tmp.path(), Some(TOKEN), PathBuf::from("tmux"), collector);
+
+        let (status, body) = call(router(st), get("/sessions")).await;
+        let received_at = jiff::Timestamp::now();
+        assert_eq!(status, StatusCode::OK);
+        let observed_at = body["data"]["observed_at"]
+            .as_str()
+            .unwrap()
+            .parse::<jiff::Timestamp>()
+            .unwrap();
+        let collection_finished = collection_finished
+            .lock()
+            .expect("collection timestamp lock")
+            .expect("collection completed");
+        assert!(
+            observed_at >= collection_finished,
+            "observation preceded collection: observed={observed_at}, finished={collection_finished}"
+        );
+        assert!(
+            observed_at <= received_at,
+            "observation followed receipt: observed={observed_at}, receipt={received_at}"
+        );
+    }
+
+    #[tokio::test]
     async fn activity_stream_requires_auth_and_sets_sse_headers() {
         let tmp = tempfile::TempDir::new().unwrap();
         let st = state(tmp.path(), Some(TOKEN), PathBuf::from("tmux"));
@@ -5473,6 +5621,75 @@ mod tests {
             "no-cache, no-transform"
         );
         assert_eq!(response.headers()["x-accel-buffering"], "no");
+    }
+
+    #[tokio::test]
+    async fn activity_stream_route_frames_cover_cursor_and_reset_contract() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let st = state(tmp.path(), Some(TOKEN), PathBuf::from("tmux"));
+        let stream_id = st.activity_broker.log.stream_id.clone();
+
+        let (id, event, data) =
+            parse_activity_sse_frame(&first_activity_sse_frame(st.clone(), None).await);
+        assert_eq!(id, format!("{stream_id}:1"));
+        assert_eq!(event, "snapshot");
+        assert_eq!(data["schema_version"], ACTIVITY_STREAM_EVENT_SCHEMA_VERSION);
+        assert_eq!(data["type"], "snapshot");
+        assert_eq!(data["stream_id"], stream_id);
+        assert_eq!(data["sequence"], 1);
+        assert_eq!(data["machine"], MACHINE);
+        assert_eq!(data["sessions"], json!([]));
+
+        st.activity_broker.log.publish_heartbeat();
+        st.activity_broker
+            .log
+            .publish_snapshot(vec![ActivityStreamSession {
+                id: "cursor-session".to_string(),
+                turn_state: Some(json!({"revision":2})),
+            }]);
+        let retained_cursor = format!("{stream_id}:1");
+        let (id, event, data) = parse_activity_sse_frame(
+            &first_activity_sse_frame(st.clone(), Some(&retained_cursor)).await,
+        );
+        assert_eq!(id, format!("{stream_id}:2"));
+        assert_eq!(event, "heartbeat");
+        assert_eq!(data["type"], "heartbeat");
+        assert!(data.get("sessions").is_none());
+
+        let retained_after_heartbeat = format!("{stream_id}:2");
+        let (id, event, data) = parse_activity_sse_frame(
+            &first_activity_sse_frame(st.clone(), Some(&retained_after_heartbeat)).await,
+        );
+        assert_eq!(id, format!("{stream_id}:3"));
+        assert_eq!(event, "snapshot");
+        assert_eq!(data["type"], "snapshot");
+        assert_eq!(data["sessions"][0]["id"], "cursor-session");
+
+        for cursor in [
+            "malformed".to_string(),
+            format!("{stream_id}:999"),
+            "foreign-stream:1".to_string(),
+        ] {
+            let (id, event, data) = parse_activity_sse_frame(
+                &first_activity_sse_frame(st.clone(), Some(&cursor)).await,
+            );
+            assert_eq!(id, format!("{stream_id}:3"));
+            assert_eq!(event, "reset");
+            assert_eq!(data["type"], "reset");
+            assert_eq!(data["sequence"], 3);
+            assert_eq!(data["sessions"][0]["id"], "cursor-session");
+        }
+
+        for _ in 0..ACTIVITY_STREAM_REPLAY_CAPACITY {
+            st.activity_broker.log.publish_heartbeat();
+        }
+        let (id, event, data) = parse_activity_sse_frame(
+            &first_activity_sse_frame(st.clone(), Some(&retained_cursor)).await,
+        );
+        assert_eq!(id, format!("{stream_id}:{}", data["sequence"]));
+        assert_eq!(event, "reset");
+        assert_eq!(data["type"], "reset");
+        assert_eq!(data["sessions"][0]["id"], "cursor-session");
     }
 
     #[test]
@@ -5711,6 +5928,42 @@ mod tests {
             .find(|session| session.id == "streamed-session")
             .unwrap();
         assert_eq!(session.turn_state.as_ref().unwrap()["revision"], 1);
+
+        std::fs::remove_file(tmp.path().join("sessions/streamed-session/activity.json"))
+            .expect("remove activity snapshot");
+        let cleared = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let event = subscription.next_event().await;
+                if event.sessions.as_ref().is_some_and(|sessions| {
+                    sessions.iter().any(|session| {
+                        session.id == "streamed-session" && session.turn_state.is_none()
+                    })
+                }) {
+                    break event;
+                }
+            }
+        })
+        .await
+        .expect("activity removal transition");
+        assert_eq!(cleared.kind, "snapshot");
+
+        std::fs::remove_dir_all(tmp.path().join("sessions/streamed-session"))
+            .expect("remove session");
+        let deleted = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let event = subscription.next_event().await;
+                if event.sessions.as_ref().is_some_and(|sessions| {
+                    sessions
+                        .iter()
+                        .all(|session| session.id != "streamed-session")
+                }) {
+                    break event;
+                }
+            }
+        })
+        .await
+        .expect("session removal transition");
+        assert_eq!(deleted.kind, "snapshot");
     }
 
     #[tokio::test]
