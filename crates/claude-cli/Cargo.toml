@@ -20,6 +20,7 @@ anyhow = { workspace = true }
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 clap = { workspace = true }
 clap_complete = { workspace = true }
+libc = "0.2"
 nils-build-info = { version = "1.21.14", path = "../nils-build-info" }
 nils-common = { version = "1.21.14", path = "../nils-common", package = "nils-common" }
 nils-provider-resume = { version = "1.21.14", path = "../nils-provider-resume", package = "nils-provider-resume" }

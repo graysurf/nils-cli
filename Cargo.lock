@@ -2074,6 +2074,7 @@ dependencies = [
  "chrono",
  "clap",
  "clap_complete",
+ "libc",
  "nils-build-info",
  "nils-common",
  "nils-provider-resume",

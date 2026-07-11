@@ -103,6 +103,9 @@ normalized back into the same cache shape used by `prompt-segment`.
 ## Dependencies
 
 - macOS `security` is used for Keychain credential lookup unless an automation credential override is supplied.
+- Nested CLI probe descendants are enumerated and terminated on timeout using
+  Linux `/proc` or a time-bounded `/bin/ps` snapshot on other Unix platforms.
+  Unix `script` enables the richer PTY probe path.
 - No `curl`, `jq`, or Python runtime is required for prompt-segment rendering.
 - `claude` is required for `agent resume`.
 - `agent resume` reads local Claude Code project history under `$CLAUDE_CONFIG_DIR/projects` (default `~/.claude/projects`); the shared

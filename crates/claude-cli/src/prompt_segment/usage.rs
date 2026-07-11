@@ -260,9 +260,25 @@ fn probe_claude_cli_usage() -> anyhow::Result<String> {
         .filter(|value| *value > 0)
         .unwrap_or(DEFAULT_CLAUDE_TIMEOUT_SECONDS);
 
+    probe_claude_cli_usage_with_modes(
+        &program,
+        &select_probe_modes(&program),
+        Instant::now() + Duration::from_secs(timeout_seconds),
+    )
+}
+
+fn probe_claude_cli_usage_with_modes(
+    program: &Path,
+    modes: &[ProbeMode],
+    deadline: Instant,
+) -> anyhow::Result<String> {
     let mut last_error: Option<anyhow::Error> = None;
-    for mode in select_probe_modes(&program) {
-        match probe_claude_cli_usage_with_mode(&program, timeout_seconds, &mode) {
+    for mode in modes {
+        if Instant::now() >= deadline {
+            last_error = Some(anyhow::anyhow!("claude usage probe timed out"));
+            break;
+        }
+        match probe_claude_cli_usage_with_mode(program, deadline, mode) {
             Ok(text)
                 if parse_cli_usage_output(&text).is_some() || matches!(mode, ProbeMode::Pipe) =>
             {
@@ -284,7 +300,7 @@ fn probe_claude_cli_usage() -> anyhow::Result<String> {
 
 fn probe_claude_cli_usage_with_mode(
     program: &Path,
-    timeout_seconds: u64,
+    deadline: Instant,
     mode: &ProbeMode,
 ) -> anyhow::Result<String> {
     let mut command = mode.command(program);
@@ -293,11 +309,14 @@ fn probe_claude_cli_usage_with_mode(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()?;
-    if let Some(mut stdin) = child.stdin.take() {
-        mode.write_usage_input(&mut stdin)?;
+    if let Some(mut stdin) = child.stdin.take()
+        && let Err(error) = mode.write_usage_input(&mut stdin, deadline)
+    {
+        kill_process_tree(&mut child);
+        let _ = child.wait();
+        return Err(error);
     }
 
-    let deadline = Instant::now() + Duration::from_secs(timeout_seconds);
     loop {
         if child.try_wait()?.is_some() {
             let output = child.wait_with_output()?;
@@ -309,7 +328,7 @@ fn probe_claude_cli_usage_with_mode(
         }
 
         if Instant::now() >= deadline {
-            let _ = child.kill();
+            kill_process_tree(&mut child);
             let output = child.wait_with_output()?;
             let text = output_text(&output.stdout, &output.stderr);
             if !text.trim().is_empty() {
@@ -320,6 +339,117 @@ fn probe_claude_cli_usage_with_mode(
 
         thread::sleep(Duration::from_millis(25));
     }
+}
+
+fn kill_process_tree(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    if let Ok(root) = libc::pid_t::try_from(child.id()) {
+        for pid in descendant_process_ids(root).into_iter().rev() {
+            unsafe {
+                let _ = libc::kill(pid, libc::SIGKILL);
+            }
+        }
+    }
+    let _ = child.kill();
+}
+
+#[cfg(target_os = "linux")]
+fn descendant_process_ids(root: libc::pid_t) -> Vec<libc::pid_t> {
+    let mut discovered = vec![root];
+    let mut cursor = 0;
+    while cursor < discovered.len() {
+        let parent = discovered[cursor];
+        cursor += 1;
+        for child in linux_task_children(parent) {
+            if !discovered.contains(&child) {
+                discovered.push(child);
+            }
+        }
+    }
+    discovered.remove(0);
+    discovered
+}
+
+#[cfg(target_os = "linux")]
+fn linux_task_children(process: libc::pid_t) -> Vec<libc::pid_t> {
+    let Ok(tasks) = std::fs::read_dir(format!("/proc/{process}/task")) else {
+        return Vec::new();
+    };
+    let mut children = Vec::new();
+    for task in tasks.flatten() {
+        let Some(task_id) = task.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        let path = format!("/proc/{process}/task/{task_id}/children");
+        let Ok(raw) = std::fs::read_to_string(path) else {
+            continue;
+        };
+        for child in raw
+            .split_whitespace()
+            .filter_map(|value| value.parse::<libc::pid_t>().ok())
+        {
+            if !children.contains(&child) {
+                children.push(child);
+            }
+        }
+    }
+    children
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn descendant_process_ids(root: libc::pid_t) -> Vec<libc::pid_t> {
+    let Ok(mut child) = Command::new("/bin/ps")
+        .args(["-eo", "pid=,ppid="])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+    else {
+        return Vec::new();
+    };
+    let deadline = Instant::now() + Duration::from_millis(250);
+    let output = loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break child.wait_with_output().ok(),
+            Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(10)),
+            Ok(None) | Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                break None;
+            }
+        }
+    };
+    let Some(output) = output.filter(|output| output.status.success()) else {
+        return Vec::new();
+    };
+    descendants_from_process_rows(root, &String::from_utf8_lossy(&output.stdout))
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn descendants_from_process_rows(root: libc::pid_t, raw: &str) -> Vec<libc::pid_t> {
+    let rows = raw
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split_whitespace();
+            let pid = fields.next()?.parse::<libc::pid_t>().ok()?;
+            let parent = fields.next()?.parse::<libc::pid_t>().ok()?;
+            Some((pid, parent))
+        })
+        .collect::<Vec<_>>();
+    let mut discovered = vec![root];
+    loop {
+        let mut changed = false;
+        for (pid, parent) in &rows {
+            if discovered.contains(parent) && !discovered.contains(pid) {
+                discovered.push(*pid);
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    discovered.remove(0);
+    discovered
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -348,28 +478,49 @@ impl ProbeMode {
         }
     }
 
-    fn write_usage_input(&self, stdin: &mut dyn Write) -> anyhow::Result<()> {
+    fn write_usage_input(&self, stdin: &mut dyn Write, deadline: Instant) -> anyhow::Result<()> {
         match self {
             Self::Pty(_) => {
-                thread::sleep(Duration::from_millis(env_u64(
-                    "CLAUDE_PROMPT_SEGMENT_CLAUDE_PTY_STARTUP_DELAY_MS",
-                    DEFAULT_PTY_STARTUP_DELAY_MS,
-                )));
+                sleep_before_probe_deadline(
+                    Duration::from_millis(env_u64(
+                        "CLAUDE_PROMPT_SEGMENT_CLAUDE_PTY_STARTUP_DELAY_MS",
+                        DEFAULT_PTY_STARTUP_DELAY_MS,
+                    )),
+                    deadline,
+                )?;
                 stdin.write_all(CLI_USAGE_PTY_USAGE_STDIN)?;
                 stdin.flush()?;
-                thread::sleep(Duration::from_millis(env_u64(
-                    "CLAUDE_PROMPT_SEGMENT_CLAUDE_PTY_USAGE_DELAY_MS",
-                    DEFAULT_PTY_USAGE_DELAY_MS,
-                )));
+                sleep_before_probe_deadline(
+                    Duration::from_millis(env_u64(
+                        "CLAUDE_PROMPT_SEGMENT_CLAUDE_PTY_USAGE_DELAY_MS",
+                        DEFAULT_PTY_USAGE_DELAY_MS,
+                    )),
+                    deadline,
+                )?;
                 stdin.write_all(CLI_USAGE_PTY_EXIT_STDIN)?;
                 stdin.flush()?;
             }
             Self::Pipe => {
+                if Instant::now() >= deadline {
+                    anyhow::bail!("claude usage probe timed out");
+                }
                 stdin.write_all(CLI_USAGE_STDIN)?;
             }
         }
         Ok(())
     }
+}
+
+fn sleep_before_probe_deadline(delay: Duration, deadline: Instant) -> anyhow::Result<()> {
+    let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+        anyhow::bail!("claude usage probe timed out");
+    };
+    if delay >= remaining {
+        thread::sleep(remaining);
+        anyhow::bail!("claude usage probe timed out");
+    }
+    thread::sleep(delay);
+    Ok(())
 }
 
 fn select_probe_modes(program: &Path) -> Vec<ProbeMode> {
@@ -414,9 +565,9 @@ fn script_command_args(program: &Path, flavor: ScriptFlavor) -> Vec<OsString> {
     match flavor {
         ScriptFlavor::UtilLinux => vec![
             OsString::from("-q"),
-            OsString::from("/dev/null"),
             OsString::from("-c"),
             OsString::from(quote_posix_single(&program.to_string_lossy())),
+            OsString::from("/dev/null"),
         ],
         ScriptFlavor::Bsd => vec![
             OsString::from("-q"),
@@ -722,7 +873,7 @@ mod tests {
 
         assert_eq!(
             args,
-            vec!["-q", "/dev/null", "-c", "'/opt/bin/claude'"]
+            vec!["-q", "-c", "'/opt/bin/claude'", "/dev/null"]
                 .into_iter()
                 .map(std::ffi::OsString::from)
                 .collect::<Vec<_>>()
@@ -774,6 +925,136 @@ mod tests {
                 }),
                 ProbeMode::Pipe,
             ]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn descendant_lookup_does_not_wait_for_path_ps() {
+        use nils_test_support::{GlobalStateLock, StubBinDir, prepend_path};
+
+        let lock = GlobalStateLock::new();
+        let stubs = StubBinDir::new();
+        stubs.write_exe("ps", "#!/usr/bin/env sh\nsleep 1\n");
+        let _path = prepend_path(&lock, stubs.path());
+
+        let started = Instant::now();
+        let _ = descendant_process_ids(std::process::id() as libc::pid_t);
+
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "descendant lookup must not wait for a PATH-provided ps"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn descendant_lookup_includes_children_spawned_by_worker_threads() {
+        use std::sync::mpsc;
+
+        let (pid_sender, pid_receiver) = mpsc::channel();
+        let (stop_sender, stop_receiver) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            let mut child = Command::new("/bin/sleep")
+                .arg("60")
+                .spawn()
+                .expect("spawn worker child");
+            pid_sender.send(child.id()).expect("send child pid");
+            let _ = stop_receiver.recv();
+            let _ = child.kill();
+            let _ = child.wait();
+        });
+        let child_pid = pid_receiver.recv().expect("worker child pid") as libc::pid_t;
+
+        let descendants = descendant_process_ids(std::process::id() as libc::pid_t);
+
+        stop_sender.send(()).expect("stop worker");
+        worker.join().expect("worker joined");
+        assert!(
+            descendants.contains(&child_pid),
+            "descendant lookup must scan children owned by every task"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn probe_modes_share_one_absolute_deadline() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let program = tmp.path().join("hanging-claude");
+        let calls = tmp.path().join("calls");
+        std::fs::write(
+            &program,
+            format!(
+                "#!/usr/bin/env sh\nprintf x >> '{}'\nexec sleep 60\n",
+                calls.display()
+            ),
+        )
+        .expect("write program");
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod program");
+
+        let deadline = Instant::now() + Duration::from_millis(200);
+        let error = probe_claude_cli_usage_with_modes(
+            &program,
+            &[ProbeMode::Pipe, ProbeMode::Pipe],
+            deadline,
+        )
+        .expect_err("probe deadline");
+
+        assert!(error.to_string().contains("timed out"));
+        assert_eq!(std::fs::read_to_string(calls).expect("call count"), "x");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pty_timeout_kills_hup_ignoring_command() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let Some(script) = process::find_in_path("script") else {
+            return;
+        };
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let program = tmp.path().join("hup-ignoring-claude");
+        let pid_file = tmp.path().join("command.pid");
+        std::fs::write(
+            &program,
+            format!(
+                "#!/usr/bin/env sh\ntrap '' HUP TERM\nprintf '%s' \"$$\" > '{}'\nwhile :; do sleep 1; done\n",
+                pid_file.display()
+            ),
+        )
+        .expect("write program");
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod program");
+
+        let mode = ProbeMode::Pty(ScriptLauncher {
+            program: script,
+            flavor: platform_script_flavor(),
+        });
+        let _ = probe_claude_cli_usage_with_mode(
+            &program,
+            Instant::now() + Duration::from_secs(1),
+            &mode,
+        );
+        let pid = std::fs::read_to_string(&pid_file)
+            .expect("command pid")
+            .parse::<libc::pid_t>()
+            .expect("numeric pid");
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while unsafe { libc::kill(pid, 0) } == 0 && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(25));
+        }
+        let survived = unsafe { libc::kill(pid, 0) } == 0;
+        if survived {
+            unsafe {
+                let _ = libc::kill(pid, libc::SIGKILL);
+            }
+        }
+        assert!(
+            !survived,
+            "PTY command must not survive its launcher timeout"
         );
     }
 

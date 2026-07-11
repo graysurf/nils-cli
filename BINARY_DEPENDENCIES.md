@@ -25,6 +25,7 @@ These tools are required for common command paths. Each row is anchored to at le
 | `gemini` | `gemini-cli auth login` flow | Required for `gemini-cli` login | Install from official Gemini CLI distribution |
 | `opencode` | `opencode-cli agent *` flows | Required for `opencode-cli` runtime | Install from official OpenCode distribution |
 | `curl` | `gemini-cli` auth refresh + rate-limit client | Required for `gemini-cli` auth flows | Usually preinstalled (`brew install curl`) |
+| `/bin/ps` | `claude-cli` nested CLI usage-probe timeout cleanup on non-Linux Unix | Required for reliable descendant cleanup on macOS/BSD; Linux reads `/proc` directly | Usually preinstalled |
 | `tmux` | `agent-session` start/run/resume/attach/glance/send/delete/serve flows | Required for tmux-backed `agent-session` runtime | `brew install tmux` |
 | `sops` | `secrets pull/add/edit` encryption and decryption flows | Required for `secrets` runtime | `brew install sops` |
 | `security` | `claude-cli prompt-segment` Keychain credential lookup | Required on macOS unless `CLAUDE_PROMPT_SEGMENT_ACCESS_TOKEN` / `CLAUDE_PROMPT_SEGMENT_CREDENTIALS_JSON` is supplied | Preinstalled on macOS |

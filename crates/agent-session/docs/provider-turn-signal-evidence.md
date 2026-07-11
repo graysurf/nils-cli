@@ -93,12 +93,12 @@ signals remain uncorrelated conservative latches cleared only by a proven
 completion, a new turn, or a runtime boundary; later progress may prove work is
 continuing but never proves the request was answered.
 
-The one exception is `permission_mode: "bypassPermissions"`: in that mode Claude
-never blocks on an approval, so a permission hook is not a genuine attention
-request. Because it would otherwise become a latch that no clear event can ever
-release, the adapter drops the approval `attention_requested` for a
-`PermissionRequest` / `permission_prompt` payload carrying that mode. Other
-modes (`default`, `acceptEdits`, `plan`) still latch conservatively.
+`PermissionRequest` runs when a permission dialog is about to be shown, and a
+`permission_prompt` notification likewise reports an actual prompt. The adapter
+therefore treats either signal as authoritative over the payload's
+`permission_mode` hint. This includes `bypassPermissions`, where root/home
+deletion still has a circuit-breaker prompt. Those uncorrelated signals keep the
+same conservative latch as every other permission mode.
 
 ### Hermes
 

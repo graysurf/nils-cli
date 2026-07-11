@@ -1373,7 +1373,6 @@ fn normalize_provider_hook(
     };
     let notification = raw.get("notification_type").and_then(Value::as_str);
     let tool_name = raw.get("tool_name").and_then(Value::as_str);
-    let permission_mode = raw.get("permission_mode").and_then(Value::as_str);
     let exact_clarification = agent == AgentKind::Claude
         && tool_name == Some("AskUserQuestion")
         && matches!(
@@ -1448,17 +1447,6 @@ fn normalize_provider_hook(
         }
         _ => return Ok(None),
     };
-    // Under Claude bypass permissions no approval ever blocks the turn, so a
-    // permission hook here is not a genuine attention request. Approvals carry no
-    // correlated clear event, so latching one would pin `needs_input` (with a
-    // growing `pending_count`) until the turn ends. Suppress it; genuine approvals
-    // in other permission modes keep the documented conservative latch.
-    if agent == AgentKind::Claude
-        && attention_kind == Some("approval")
-        && permission_mode == Some("bypassPermissions")
-    {
-        return Ok(None);
-    }
     let provider_session_id = raw
         .get("session_id")
         .or_else(|| raw.get("session_key"))
@@ -3223,16 +3211,16 @@ mod tests {
     }
 
     #[test]
-    fn claude_bypass_permissions_approval_is_not_latched() {
-        // Under bypass permissions Claude never blocks on an approval prompt, so a
-        // permission hook is not a genuine attention request. Emitting one would
-        // latch `needs_input` forever, because approvals carry no correlated clear
-        // event. Suppress it while keeping genuine approvals latched in other modes.
+    fn claude_bypass_permissions_prompt_is_latched() {
+        // PermissionRequest and permission_prompt hooks mean Claude is showing a
+        // real dialog, including the root/home deletion circuit breaker that remains
+        // active in bypass mode. Preserve that attention signal.
         for payload in [
             json!({
                 "hook_event_name": "PermissionRequest",
                 "session_id": "claude-session",
                 "tool_name": "Bash",
+                "tool_input": {"command": "rm -rf /"},
                 "permission_mode": "bypassPermissions"
             }),
             json!({
@@ -3242,11 +3230,10 @@ mod tests {
             }),
         ] {
             let mapped = normalize_provider_hook(AgentKind::Claude, None, "runtime-1", &payload)
-                .expect("bypass mapping");
-            assert!(
-                mapped.is_none(),
-                "bypass-permissions approval must not create a latched attention"
-            );
+                .expect("bypass mapping")
+                .expect("bypass prompt");
+            assert_eq!(mapped.kind, TurnEventKind::AttentionRequested);
+            assert_eq!(mapped.attention_kind.as_deref(), Some("approval"));
         }
 
         // Non-bypass modes (and a missing mode) keep the conservative approval latch.
