@@ -84,6 +84,87 @@ entries:
     tmp
 }
 
+fn make_hermes_fixture() -> TempDir {
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path();
+    write_min_runtime_roots(root);
+    write(
+        &root.join("targets/hermes/link-map.yaml"),
+        r#"schema_version: 1
+entries:
+  - id: reporting.skills-tree
+    kind: symlinked-file
+    source: build/hermes/plugins/reporting/skills
+    destination: skills/reporting
+    recursive: true
+"#,
+    );
+    write(
+        &root.join("build/hermes/plugins/reporting/skills/daily-brief/SKILL.md"),
+        "# daily-brief\n",
+    );
+    write(
+        &root.join("build/hermes/plugins/reporting/skills/topic-radar/SKILL.md"),
+        "# topic-radar\n",
+    );
+    tmp
+}
+
+fn write_v2_skills_manifest(root: &Path) {
+    write(
+        &root.join("manifests/skills.yaml"),
+        r#"schema_version: 2
+migration:
+  owner: "https://github.com/graysurf/agent-runtime-kit/issues/562"
+  pending_disposition:
+    - reporting.topic-radar
+skills:
+  - id: reporting.daily-brief
+    domain: reporting
+    source: core/skills/reporting/daily-brief
+    invocation:
+      role: workflow
+      intents: [daily-brief]
+      example_request: "Prepare my daily brief"
+      admission_rationale: "Produces a direct user-requested information brief."
+    exposure:
+      profile: default
+    products: {}
+    required_clis: {}
+  - id: reporting.topic-radar
+    domain: reporting
+    source: core/skills/reporting/topic-radar
+    products: {}
+    required_clis: {}
+"#,
+    );
+}
+
+fn assert_v2_metadata(product: &str, tmp: &TempDir) {
+    write_v2_skills_manifest(tmp.path());
+    let output = run(&[
+        "list-skills",
+        "--source-root",
+        &tmp.path().to_string_lossy(),
+        "--product",
+        product,
+        "--format",
+        "json",
+    ]);
+    assert_eq!(output.code, 0, "{product} stderr={}", output.stderr_text());
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let skills = value["skills"].as_array().unwrap();
+
+    assert_eq!(skills[0]["invocation"]["role"], "workflow");
+    assert_eq!(skills[0]["invocation"]["intents"][0], "daily-brief");
+    assert_eq!(skills[0]["exposure"]["profile"], "default");
+    assert_eq!(skills[0]["pending_disposition"], false);
+
+    assert!(skills[1]["invocation"].is_null());
+    assert!(skills[1]["exposure"].is_null());
+    assert_eq!(skills[1]["pending_disposition"], true);
+}
+
 fn make_codex_warning_fixture() -> TempDir {
     let tmp = TempDir::new().unwrap();
     let root = tmp.path();
@@ -200,6 +281,24 @@ fn codex_json_output_carries_schema_and_sorted_skills() {
     assert_eq!(skills[0]["link_mode"], "directory");
     assert_eq!(skills[0]["discoverable"], true);
     assert!(skills[0]["warnings"].as_array().unwrap().is_empty());
+}
+
+#[test]
+fn codex_json_output_reports_v2_invocation_exposure_and_pending_state() {
+    let tmp = make_codex_fixture();
+    assert_v2_metadata("codex", &tmp);
+}
+
+#[test]
+fn claude_json_output_reports_v2_invocation_exposure_and_pending_state() {
+    let tmp = make_claude_fixture();
+    assert_v2_metadata("claude", &tmp);
+}
+
+#[test]
+fn hermes_json_output_reports_v2_invocation_exposure_and_pending_state() {
+    let tmp = make_hermes_fixture();
+    assert_v2_metadata("hermes", &tmp);
 }
 
 #[test]

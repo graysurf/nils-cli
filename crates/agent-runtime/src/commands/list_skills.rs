@@ -10,7 +10,7 @@
 use crate::doctor::skill_surface;
 use crate::install::link_map::LinkMap;
 use crate::install::plan::{InstallPlan, PlanAction, SymlinkLinkMode};
-use crate::render::manifest::SourceRoot;
+use crate::render::manifest::{SkillExposure, SkillInvocation, SourceRoot, load_optional_skills};
 use clap::{Args, ValueEnum};
 use serde::Serialize;
 use std::collections::BTreeMap;
@@ -67,7 +67,17 @@ pub struct SkillRecord {
     /// `None` for other products.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub discoverable: Option<bool>,
+    pub invocation: Option<SkillInvocation>,
+    pub exposure: Option<SkillExposure>,
+    pub pending_disposition: bool,
     pub warnings: Vec<SkillWarning>,
+}
+
+#[derive(Debug, Clone)]
+struct SkillMetadata {
+    invocation: Option<SkillInvocation>,
+    exposure: Option<SkillExposure>,
+    pending_disposition: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -111,6 +121,26 @@ pub fn run(args: ListSkillsArgs) -> anyhow::Result<u8> {
     }
 
     let root = SourceRoot::from_arg_or_cwd(args.source_root.as_deref())?;
+    let skills_manifest = load_optional_skills(&root)?;
+    let metadata_by_id = skills_manifest
+        .as_ref()
+        .map(|manifest| {
+            manifest
+                .skills
+                .iter()
+                .map(|skill| {
+                    (
+                        skill.id.clone(),
+                        SkillMetadata {
+                            invocation: skill.invocation.clone(),
+                            exposure: skill.exposure.clone(),
+                            pending_disposition: manifest.is_pending_disposition(&skill.id),
+                        },
+                    )
+                })
+                .collect::<BTreeMap<_, _>>()
+        })
+        .unwrap_or_default();
     let link_map = LinkMap::load(root.path(), &args.product)?;
 
     // The install plan expansion is filesystem-aware but does not mutate
@@ -194,6 +224,7 @@ pub fn run(args: ListSkillsArgs) -> anyhow::Result<u8> {
             .get(entry_id)
             .cloned()
             .unwrap_or_default();
+        let metadata = metadata_by_id.get(&id);
         by_id.insert(
             id.clone(),
             SkillRecord {
@@ -202,6 +233,9 @@ pub fn run(args: ListSkillsArgs) -> anyhow::Result<u8> {
                 destination: dest_str,
                 link_mode: (*link_mode).into(),
                 discoverable,
+                invocation: metadata.and_then(|item| item.invocation.clone()),
+                exposure: metadata.and_then(|item| item.exposure.clone()),
+                pending_disposition: metadata.is_some_and(|item| item.pending_disposition),
                 warnings,
             },
         );
@@ -445,6 +479,9 @@ entries:
                         destination: dest_rel.to_string_lossy().to_string(),
                         link_mode: SkillLinkMode::Directory,
                         discoverable: Some(true),
+                        invocation: None,
+                        exposure: None,
+                        pending_disposition: false,
                         warnings: Vec::new(),
                     },
                 );

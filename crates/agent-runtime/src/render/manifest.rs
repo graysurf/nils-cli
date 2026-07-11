@@ -5,21 +5,30 @@
 //! `inventory-target-architecture.md`).
 
 use indexmap::IndexMap;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 
 pub const SCHEMA_VERSION: u32 = 1;
+const DEFAULT_SCHEMA_VERSIONS: &[u32] = &[SCHEMA_VERSION];
+pub const SKILLS_SCHEMA_VERSIONS: &[u32] = &[1, 2];
 
 #[derive(Debug, Error)]
 pub enum ManifestError {
     #[error("missing manifest: {path} (source root: {root})")]
     Missing { path: PathBuf, root: PathBuf },
-    #[error("schema_version mismatch in {file}: expected {expected}, got {found}")]
+    #[error("schema_version mismatch in {file}: expected one of {expected:?}, got {found}")]
     SchemaVersion {
         file: PathBuf,
-        expected: u32,
+        expected: Vec<u32>,
         found: u32,
+    },
+    #[error("invalid skills manifest contract in {file}: {code}: {message}")]
+    InvalidSkillContract {
+        file: PathBuf,
+        code: &'static str,
+        message: String,
     },
     #[error("parse error in {file}: {source}")]
     Parse {
@@ -94,8 +103,8 @@ pub struct ManifestSet {
 }
 
 /// Read and validate every Phase 1 manifest under
-/// `<source_root>/manifests/`. Each manifest's `schema_version` is
-/// asserted to equal [`SCHEMA_VERSION`].
+/// `<source_root>/manifests/`. Manifest families default to
+/// [`SCHEMA_VERSION`]; skills additionally support their additive v2 contract.
 pub fn load_all(root: &SourceRoot) -> Result<ManifestSet, ManifestError> {
     let dir = root.manifests_dir();
     Ok(ManifestSet {
@@ -114,6 +123,17 @@ pub fn load_all(root: &SourceRoot) -> Result<ManifestSet, ManifestError> {
 
 trait WithSchemaVersion {
     fn schema_version(&self) -> u32;
+
+    fn supported_schema_versions() -> &'static [u32]
+    where
+        Self: Sized,
+    {
+        DEFAULT_SCHEMA_VERSIONS
+    }
+
+    fn validate_contract(&self, _file: &Path) -> Result<(), ManifestError> {
+        Ok(())
+    }
 }
 
 fn load<T>(file: &Path, root: &Path) -> Result<T, ManifestError>
@@ -134,13 +154,15 @@ where
         file: file.to_path_buf(),
         source,
     })?;
-    if parsed.schema_version() != SCHEMA_VERSION {
+    let expected = T::supported_schema_versions();
+    if !expected.contains(&parsed.schema_version()) {
         return Err(ManifestError::SchemaVersion {
             file: file.to_path_buf(),
-            expected: SCHEMA_VERSION,
+            expected: expected.to_vec(),
             found: parsed.schema_version(),
         });
     }
+    parsed.validate_contract(file)?;
     Ok(parsed)
 }
 
@@ -166,6 +188,8 @@ where
 #[serde(deny_unknown_fields)]
 pub struct SkillsManifest {
     pub schema_version: u32,
+    #[serde(default)]
+    pub migration: Option<SkillMigration>,
     pub skills: Vec<Skill>,
 }
 
@@ -173,6 +197,209 @@ impl WithSchemaVersion for SkillsManifest {
     fn schema_version(&self) -> u32 {
         self.schema_version
     }
+
+    fn supported_schema_versions() -> &'static [u32] {
+        SKILLS_SCHEMA_VERSIONS
+    }
+
+    fn validate_contract(&self, file: &Path) -> Result<(), ManifestError> {
+        self.validate(file)
+    }
+}
+
+impl SkillsManifest {
+    fn invalid(file: &Path, code: &'static str, message: impl Into<String>) -> ManifestError {
+        ManifestError::InvalidSkillContract {
+            file: file.to_path_buf(),
+            code,
+            message: message.into(),
+        }
+    }
+
+    fn validate(&self, file: &Path) -> Result<(), ManifestError> {
+        let has_v2_skill_fields = self
+            .skills
+            .iter()
+            .any(|skill| skill.invocation.is_some() || skill.exposure.is_some());
+        if self.schema_version == 1 {
+            if self.migration.is_some() || has_v2_skill_fields {
+                return Err(Self::invalid(
+                    file,
+                    "skills-v1-v2-fields",
+                    "skills schema v1 cannot contain v2 migration, invocation, or exposure fields",
+                ));
+            }
+            return Ok(());
+        }
+
+        let mut ids = BTreeSet::new();
+        for skill in &self.skills {
+            if !ids.insert(skill.id.as_str()) {
+                return Err(Self::invalid(
+                    file,
+                    "duplicate-skill-id",
+                    format!("skill id `{}` appears more than once", skill.id),
+                ));
+            }
+        }
+
+        let mut pending = BTreeSet::new();
+        if let Some(migration) = &self.migration {
+            if migration.owner.trim().is_empty() {
+                return Err(Self::invalid(
+                    file,
+                    "migration-owner-empty",
+                    "migration owner must be non-empty",
+                ));
+            }
+            for id in &migration.pending_disposition {
+                if !pending.insert(id.as_str()) {
+                    return Err(Self::invalid(
+                        file,
+                        "duplicate-pending-disposition-id",
+                        format!("pending disposition skill id `{id}` appears more than once"),
+                    ));
+                }
+                if !ids.contains(id.as_str()) {
+                    return Err(Self::invalid(
+                        file,
+                        "pending-disposition-id-missing",
+                        format!("pending disposition skill id `{id}` has no active skill entry"),
+                    ));
+                }
+            }
+        }
+
+        for skill in &self.skills {
+            let is_pending = pending.contains(skill.id.as_str());
+            match (&skill.invocation, &skill.exposure, is_pending) {
+                (None, None, true) => continue,
+                (Some(_), Some(_), true) => {
+                    return Err(Self::invalid(
+                        file,
+                        "pending-disposition-id-has-metadata",
+                        format!(
+                            "pending disposition skill `{}` must remain visibly unclassified until its owner reviews it",
+                            skill.id
+                        ),
+                    ));
+                }
+                (Some(invocation), Some(exposure), false) => {
+                    Self::validate_retained_skill(file, skill, invocation, exposure)?;
+                }
+                _ if is_pending => {
+                    return Err(Self::invalid(
+                        file,
+                        "pending-disposition-id-partial-metadata",
+                        format!(
+                            "pending disposition skill `{}` cannot carry partial invocation/exposure metadata",
+                            skill.id
+                        ),
+                    ));
+                }
+                _ => {
+                    return Err(Self::invalid(
+                        file,
+                        "retained-skill-metadata-required",
+                        format!(
+                            "retained skill `{}` requires both invocation and exposure metadata",
+                            skill.id
+                        ),
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub fn validate_for_file(&self, file: &Path) -> Result<(), ManifestError> {
+        self.validate(file)
+    }
+
+    fn validate_retained_skill(
+        file: &Path,
+        skill: &Skill,
+        invocation: &SkillInvocation,
+        exposure: &SkillExposure,
+    ) -> Result<(), ManifestError> {
+        if invocation.intents.is_empty()
+            || invocation
+                .intents
+                .iter()
+                .any(|intent| intent.trim().is_empty())
+            || invocation.example_request.trim().is_empty()
+            || invocation.admission_rationale.trim().is_empty()
+        {
+            return Err(Self::invalid(
+                file,
+                "retained-skill-admission-incomplete",
+                format!(
+                    "retained skill `{}` requires non-empty intents, example_request, and admission_rationale",
+                    skill.id
+                ),
+            ));
+        }
+
+        if invocation.role == SkillInvocationRole::Advanced {
+            return Err(Self::invalid(
+                file,
+                "advanced-exposure-unsupported",
+                "advanced skills require an opt-in exposure mechanism; default exposure is not valid",
+            ));
+        }
+
+        let has_replacement = exposure
+            .replacement
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty());
+        let has_retirement = exposure
+            .retire_after
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty());
+        if invocation.role == SkillInvocationRole::Compatibility {
+            if !has_replacement || !has_retirement {
+                return Err(Self::invalid(
+                    file,
+                    "compatibility-lifecycle-required",
+                    format!(
+                        "compatibility skill `{}` requires replacement and retire_after",
+                        skill.id
+                    ),
+                ));
+            }
+        } else if exposure.replacement.is_some() || exposure.retire_after.is_some() {
+            return Err(Self::invalid(
+                file,
+                "compatibility-metadata-forbidden",
+                format!(
+                    "non-compatibility skill `{}` cannot declare replacement or retire_after",
+                    skill.id
+                ),
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn is_pending_disposition(&self, id: &str) -> bool {
+        self.migration.as_ref().is_some_and(|migration| {
+            migration
+                .pending_disposition
+                .iter()
+                .any(|pending| pending == id)
+        })
+    }
+}
+
+pub fn load_optional_skills(root: &SourceRoot) -> Result<Option<SkillsManifest>, ManifestError> {
+    load_optional::<SkillsManifest>(&root.manifests_dir().join("skills.yaml"), root.path())
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SkillMigration {
+    pub owner: String,
+    #[serde(default)]
+    pub pending_disposition: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -181,6 +408,10 @@ pub struct Skill {
     pub id: String,
     pub domain: String,
     pub source: String,
+    #[serde(default)]
+    pub invocation: Option<SkillInvocation>,
+    #[serde(default)]
+    pub exposure: Option<SkillExposure>,
     // `products` is required per the upstream schema. The map is closed
     // to the known products (`codex`, `claude`, `hermes`) — an unknown key
     // in skills.yaml is a typo, not a silent skip.
@@ -194,6 +425,40 @@ pub struct Skill {
     pub divergent: bool,
     #[serde(default)]
     pub portability_notes: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct SkillInvocation {
+    pub role: SkillInvocationRole,
+    pub intents: Vec<String>,
+    pub example_request: String,
+    pub admission_rationale: String,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum SkillInvocationRole {
+    Workflow,
+    Maintenance,
+    Advanced,
+    Compatibility,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct SkillExposure {
+    pub profile: SkillExposureProfile,
+    #[serde(default)]
+    pub replacement: Option<String>,
+    #[serde(default)]
+    pub retire_after: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum SkillExposureProfile {
+    Default,
 }
 
 /// Per-product render config for a skill. Mirrors the upstream
@@ -702,11 +967,266 @@ formulas:
                 found,
             } => {
                 assert!(file.ends_with("plugins.yaml"));
-                assert_eq!(expected, SCHEMA_VERSION);
+                assert_eq!(expected, vec![SCHEMA_VERSION]);
                 assert_eq!(found, 2);
             }
             other => panic!("expected ManifestError::SchemaVersion, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn unsupported_skills_schema_lists_v1_and_v2() {
+        let tmp = TempDir::new().unwrap();
+        let mutated = "schema_version: 3\nskills: []\n";
+        write_fixture(tmp.path(), &[("skills.yaml", mutated)]);
+        let root = SourceRoot::from_arg_or_cwd(Some(tmp.path())).unwrap();
+        let err = load_all(&root).unwrap_err();
+        match err {
+            ManifestError::SchemaVersion {
+                file,
+                expected,
+                found,
+            } => {
+                assert!(file.ends_with("skills.yaml"));
+                assert_eq!(expected, SKILLS_SCHEMA_VERSIONS);
+                assert_eq!(found, 3);
+            }
+            other => panic!("expected ManifestError::SchemaVersion, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn skills_manifest_v2_loads_without_bumping_other_manifest_families() {
+        let tmp = TempDir::new().unwrap();
+        let skills = r#"
+schema_version: 2
+migration:
+  owner: "https://github.com/graysurf/agent-runtime-kit/issues/562"
+  pending_disposition:
+    - domain.pending
+skills:
+  - id: domain.workflow
+    domain: domain
+    source: core/skills/domain/workflow
+    invocation:
+      role: workflow
+      intents: [project-dev]
+      example_request: "Implement this change"
+      admission_rationale: "Owns a direct user outcome with a multi-step contract."
+    exposure:
+      profile: default
+    products: {}
+    required_clis: {}
+  - id: domain.pending
+    domain: domain
+    source: core/skills/domain/pending
+    products: {}
+    required_clis: {}
+"#;
+        write_fixture(tmp.path(), &[("skills.yaml", skills)]);
+        let root = SourceRoot::from_arg_or_cwd(Some(tmp.path())).unwrap();
+        let set = load_all(&root).expect("skills v2 should coexist with v1 peer manifests");
+        assert_eq!(set.skills.schema_version, 2);
+        assert_eq!(set.skills.skills.len(), 2);
+    }
+
+    #[test]
+    fn skills_manifest_v2_rejects_advanced_default_exposure() {
+        let tmp = TempDir::new().unwrap();
+        let skills = r#"
+schema_version: 2
+skills:
+  - id: domain.advanced
+    domain: domain
+    source: core/skills/domain/advanced
+    invocation:
+      role: advanced
+      intents: [project-dev]
+      example_request: "Run the advanced workflow"
+      admission_rationale: "Represents a rare direct user outcome."
+    exposure:
+      profile: default
+    products: {}
+    required_clis: {}
+"#;
+        write_fixture(tmp.path(), &[("skills.yaml", skills)]);
+        let root = SourceRoot::from_arg_or_cwd(Some(tmp.path())).unwrap();
+        let err = load_all(&root).expect_err("advanced/default must fail closed");
+        assert!(
+            err.to_string()
+                .contains("advanced skills require an opt-in exposure mechanism"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn skills_manifest_v2_rejects_invalid_admission_and_migration_shapes() {
+        let cases = [
+            (
+                "v1-v2-fields",
+                r#"
+schema_version: 1
+skills:
+  - id: domain.workflow
+    domain: domain
+    source: core/skills/domain/workflow
+    invocation:
+      role: workflow
+      intents: [project-dev]
+      example_request: "Implement this change"
+      admission_rationale: "Owns a direct user outcome."
+    exposure:
+      profile: default
+    products: {}
+    required_clis: {}
+"#,
+                "skills-v1-v2-fields",
+            ),
+            (
+                "retained-metadata-required",
+                r#"
+schema_version: 2
+skills:
+  - id: domain.workflow
+    domain: domain
+    source: core/skills/domain/workflow
+    products: {}
+    required_clis: {}
+"#,
+                "retained-skill-metadata-required",
+            ),
+            (
+                "pending-disposition-id-missing",
+                r#"
+schema_version: 2
+migration:
+  owner: "https://github.com/graysurf/agent-runtime-kit/issues/562"
+  pending_disposition: [domain.missing]
+skills: []
+"#,
+                "pending-disposition-id-missing",
+            ),
+            (
+                "pending-disposition-id-has-metadata",
+                r#"
+schema_version: 2
+migration:
+  owner: "https://github.com/graysurf/agent-runtime-kit/issues/562"
+  pending_disposition: [domain.workflow]
+skills:
+  - id: domain.workflow
+    domain: domain
+    source: core/skills/domain/workflow
+    invocation:
+      role: workflow
+      intents: [project-dev]
+      example_request: "Implement this change"
+      admission_rationale: "Owns a direct user outcome."
+    exposure:
+      profile: default
+    products: {}
+    required_clis: {}
+"#,
+                "pending-disposition-id-has-metadata",
+            ),
+            (
+                "compatibility-lifecycle-required",
+                r#"
+schema_version: 2
+skills:
+  - id: domain.compatibility
+    domain: domain
+    source: core/skills/domain/compatibility
+    invocation:
+      role: compatibility
+      intents: [project-dev]
+      example_request: "Use the former workflow name"
+      admission_rationale: "Provides a time-bounded migration alias."
+    exposure:
+      profile: default
+    products: {}
+    required_clis: {}
+"#,
+                "compatibility-lifecycle-required",
+            ),
+            (
+                "internal-role-rejected",
+                r#"
+schema_version: 2
+skills:
+  - id: domain.internal
+    domain: domain
+    source: core/skills/domain/internal
+    invocation:
+      role: internal
+      intents: [project-dev]
+      example_request: "Internal bookkeeping"
+      admission_rationale: "Should never be valid."
+    exposure:
+      profile: default
+    products: {}
+    required_clis: {}
+"#,
+                "unknown variant `internal`",
+            ),
+            (
+                "opt-in-profile-rejected",
+                r#"
+schema_version: 2
+skills:
+  - id: domain.workflow
+    domain: domain
+    source: core/skills/domain/workflow
+    invocation:
+      role: workflow
+      intents: [project-dev]
+      example_request: "Implement this change"
+      admission_rationale: "Owns a direct user outcome."
+    exposure:
+      profile: opt-in
+    products: {}
+    required_clis: {}
+"#,
+                "unknown variant `opt-in`",
+            ),
+        ];
+
+        for (name, skills, expected) in cases {
+            let tmp = TempDir::new().unwrap();
+            write_fixture(tmp.path(), &[("skills.yaml", skills)]);
+            let root = SourceRoot::from_arg_or_cwd(Some(tmp.path())).unwrap();
+            let err = load_all(&root).expect_err(name);
+            assert!(
+                err.to_string().contains(expected),
+                "{name}: expected {expected:?}, got {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn skills_manifest_v2_accepts_time_bounded_compatibility() {
+        let tmp = TempDir::new().unwrap();
+        let skills = r#"
+schema_version: 2
+skills:
+  - id: domain.compatibility
+    domain: domain
+    source: core/skills/domain/compatibility
+    invocation:
+      role: compatibility
+      intents: [project-dev]
+      example_request: "Use the former workflow name"
+      admission_rationale: "Provides a time-bounded migration alias."
+    exposure:
+      profile: default
+      replacement: domain.workflow
+      retire_after: "2026-12-31"
+    products: {}
+    required_clis: {}
+"#;
+        write_fixture(tmp.path(), &[("skills.yaml", skills)]);
+        let root = SourceRoot::from_arg_or_cwd(Some(tmp.path())).unwrap();
+        load_all(&root).expect("bounded compatibility should be valid");
     }
 
     #[test]

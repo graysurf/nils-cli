@@ -2,7 +2,9 @@
 
 use super::{DoctorFinding, DoctorSeverity};
 use crate::doctor::version::{self, Version};
-use crate::render::manifest::{CliToolsManifest, SCHEMA_VERSION, SkillsManifest};
+use crate::render::manifest::{
+    CliToolsManifest, SCHEMA_VERSION, SKILLS_SCHEMA_VERSIONS, SkillsManifest,
+};
 use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -12,10 +14,10 @@ use thiserror::Error;
 pub enum CoverageError {
     #[error("missing manifest: {path}")]
     Missing { path: PathBuf },
-    #[error("schema_version mismatch in {file}: expected {expected}, got {found}")]
+    #[error("schema_version mismatch in {file}: expected one of {expected:?}, got {found}")]
     SchemaVersion {
         file: PathBuf,
-        expected: u32,
+        expected: Vec<u32>,
         found: u32,
     },
     #[error("parse error in {file}: {source}")]
@@ -24,6 +26,8 @@ pub enum CoverageError {
         #[source]
         source: serde_yaml_ng::Error,
     },
+    #[error("invalid skills manifest contract in {file}: {message}")]
+    InvalidSkills { file: PathBuf, message: String },
     #[error("io error reading {file}: {source}")]
     Io {
         file: PathBuf,
@@ -125,7 +129,14 @@ impl CoverageFinding {
 }
 
 pub fn probe(source_root: &Path, profile: &str) -> Result<Vec<CoverageFinding>, CoverageError> {
-    let skills: SkillsManifest = load_manifest(&source_root.join("manifests").join("skills.yaml"))?;
+    let skills_file = source_root.join("manifests").join("skills.yaml");
+    let skills: SkillsManifest = load_manifest(&skills_file)?;
+    skills
+        .validate_for_file(&skills_file)
+        .map_err(|err| CoverageError::InvalidSkills {
+            file: skills_file,
+            message: err.to_string(),
+        })?;
     let cli_tools: CliToolsManifest =
         load_manifest(&source_root.join("manifests").join("cli-tools.yaml"))?;
 
@@ -174,10 +185,11 @@ where
         file: file.to_path_buf(),
         source,
     })?;
-    if parsed.schema_version() != SCHEMA_VERSION {
+    let expected = T::supported_schema_versions();
+    if !expected.contains(&parsed.schema_version()) {
         return Err(CoverageError::SchemaVersion {
             file: file.to_path_buf(),
-            expected: SCHEMA_VERSION,
+            expected: expected.to_vec(),
             found: parsed.schema_version(),
         });
     }
@@ -186,11 +198,22 @@ where
 
 trait SchemaVersion {
     fn schema_version(&self) -> u32;
+
+    fn supported_schema_versions() -> &'static [u32]
+    where
+        Self: Sized,
+    {
+        &[SCHEMA_VERSION]
+    }
 }
 
 impl SchemaVersion for SkillsManifest {
     fn schema_version(&self) -> u32 {
         self.schema_version
+    }
+
+    fn supported_schema_versions() -> &'static [u32] {
+        SKILLS_SCHEMA_VERSIONS
     }
 }
 
