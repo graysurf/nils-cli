@@ -137,13 +137,13 @@ remain valid.
 | missing/prior runtime id | reject before host timestamp or reducer |
 | corrupt snapshot | expose safe `unknown`; list/serve/delete remain available |
 
-Claude `bypassPermissions` is an adapter-level exception: in that mode no
-approval blocks the turn, and approvals carry no correlated clear event, so a
-raised approval would latch `needs_input` until the turn ends. The Claude
-adapter therefore does not emit `attention_requested` for a `PermissionRequest`
-/ `permission_prompt` hook whose payload `permission_mode` is
-`bypassPermissions`. Genuine approvals in `default`, `acceptEdits`, and `plan`
-keep the conservative latch above.
+Claude `PermissionRequest` / `permission_prompt` signals mean that a permission
+dialog is actually being shown, so they emit `attention_requested` even when
+the payload reports `permission_mode: "bypassPermissions"`. The mode hint does
+not override the observed prompt; bypass mode retains a root/home deletion
+circuit breaker. Because these approvals have no correlated clear event, they
+keep the conservative latch above until completion, a new turn, or a runtime
+boundary.
 
 Revision is monotonic for each accepted non-duplicate event and runtime
 boundary. Phase timestamps change only when the phase changes. Durations are

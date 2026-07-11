@@ -420,6 +420,7 @@ fn collect_codex_usage(timeout: Duration) -> UsageProvider {
             "json",
             "--no-refresh-auth",
         ],
+        &[],
         timeout,
     ) {
         Ok(output) => normalize_codex_usage(output),
@@ -428,9 +429,23 @@ fn collect_codex_usage(timeout: Duration) -> UsageProvider {
 }
 
 fn collect_claude_usage(timeout: Duration) -> UsageProvider {
+    let timeout_seconds = timeout
+        .as_secs()
+        .saturating_add(u64::from(timeout.subsec_nanos() > 0))
+        .max(1)
+        .to_string();
+    let timeout_envs = if non_empty_env("CLAUDE_PROMPT_SEGMENT_CLAUDE_TIMEOUT_SECONDS").is_some() {
+        Vec::new()
+    } else {
+        vec![(
+            "CLAUDE_PROMPT_SEGMENT_CLAUDE_TIMEOUT_SECONDS",
+            timeout_seconds.as_str(),
+        )]
+    };
     match run_usage_helper(
         "claude-cli",
         &["usage", "--format", "json", "--source", "auto"],
+        &timeout_envs,
         timeout,
     ) {
         Ok(output) => normalize_claude_usage(output),
@@ -441,10 +456,12 @@ fn collect_claude_usage(timeout: Duration) -> UsageProvider {
 fn run_usage_helper(
     program: &str,
     args: &[&str],
+    envs: &[(&str, &str)],
     timeout: Duration,
 ) -> Result<UsageHelperOutput, String> {
     let mut child = ProcessCommand::new(program)
         .args(args)
+        .envs(envs.iter().copied())
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
