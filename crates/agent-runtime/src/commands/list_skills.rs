@@ -216,7 +216,9 @@ pub fn run(args: ListSkillsArgs) -> anyhow::Result<u8> {
         let dest_str = dest_rel.to_string_lossy().to_string();
         let discoverable = match args.product.as_str() {
             "codex" => Some(
-                matches!(link_mode, SymlinkLinkMode::Directory) && is_skills_prefixed(dest_rel),
+                (matches!(link_mode, SymlinkLinkMode::Directory) && is_skills_prefixed(dest_rel))
+                    || (matches!(link_mode, SymlinkLinkMode::RecursiveFile)
+                        && is_plugin_skill_leaf(dest_rel)),
             ),
             _ => None,
         };
@@ -265,12 +267,9 @@ fn identify_skill(product: &str, dest_rel: &Path) -> Option<String> {
         })
         .collect();
     match product {
-        // Hermes installs skills under `~/.hermes/skills/<domain>/<skill>/`
-        // via a recursive copy, so its destination layout matches codex's
-        // `skills/<domain>/<skill>` surface exactly.
-        "codex" | "hermes" => {
+        "codex" => {
             // `skills/<domain>/<skill>` is the active discoverable skill
-            // surface; the rehearsal pins these.
+            // surface retained for backward-compatible source roots.
             if components.len() == 3 && components[0] == "skills" {
                 return Some(format!("{}.{}", components[1], components[2]));
             }
@@ -278,22 +277,55 @@ fn identify_skill(product: &str, dest_rel: &Path) -> Option<String> {
             if components.len() == 4 && components[0] == "skills" && components[3] == "SKILL.md" {
                 return Some(format!("{}.{}", components[1], components[2]));
             }
-            None
+            plugin_skill_id(&components)
         }
-        "claude" => {
-            // `plugins/<domain>/skills/<skill>/SKILL.md` is the canonical
-            // per-skill leaf produced by the claude recursive expansion.
-            if components.len() == 5
-                && components[0] == "plugins"
-                && components[2] == "skills"
-                && components[4] == "SKILL.md"
-            {
-                return Some(format!("{}.{}", components[1], components[3]));
+        // Hermes installs skills under `~/.hermes/skills/<domain>/<skill>/`
+        // via a recursive copy.
+        "hermes" => {
+            if components.len() == 3 && components[0] == "skills" {
+                return Some(format!("{}.{}", components[1], components[2]));
             }
-            None
+            if components.len() == 4 && components[0] == "skills" && components[3] == "SKILL.md" {
+                return Some(format!("{}.{}", components[1], components[2]));
+            }
+            hermes_external_skill_id(&components)
         }
+        "claude" => plugin_skill_id(&components),
         _ => None,
     }
+}
+
+fn plugin_skill_id(components: &[&str]) -> Option<String> {
+    if components.len() == 5
+        && components[0] == "plugins"
+        && components[2] == "skills"
+        && components[4] == "SKILL.md"
+    {
+        return Some(format!("{}.{}", components[1], components[3]));
+    }
+    None
+}
+
+fn hermes_external_skill_id(components: &[&str]) -> Option<String> {
+    if components.len() == 5
+        && components[0] == "external-skills"
+        && components[1] == "agent-runtime-kit"
+        && components[4] == "SKILL.md"
+    {
+        return Some(format!("{}.{}", components[2], components[3]));
+    }
+    None
+}
+
+fn is_plugin_skill_leaf(path: &Path) -> bool {
+    let components: Vec<&str> = path
+        .components()
+        .filter_map(|component| match component {
+            Component::Normal(value) => value.to_str(),
+            _ => None,
+        })
+        .collect();
+    plugin_skill_id(&components).is_some()
 }
 
 fn is_skills_prefixed(path: &Path) -> bool {
@@ -511,10 +543,30 @@ entries:
     }
 
     #[test]
+    fn identifies_codex_plugin_skill_md_leaf() {
+        let id = identify_skill(
+            "codex",
+            Path::new("plugins/reporting/skills/daily-brief/SKILL.md"),
+        )
+        .unwrap();
+        assert_eq!(id, "reporting.daily-brief");
+    }
+
+    #[test]
     fn identifies_claude_skill_md_leaf() {
         let id = identify_skill(
             "claude",
             Path::new("plugins/reporting/skills/daily-brief/SKILL.md"),
+        )
+        .unwrap();
+        assert_eq!(id, "reporting.daily-brief");
+    }
+
+    #[test]
+    fn identifies_hermes_external_skill_md_leaf() {
+        let id = identify_skill(
+            "hermes",
+            Path::new("external-skills/agent-runtime-kit/reporting/daily-brief/SKILL.md"),
         )
         .unwrap();
         assert_eq!(id, "reporting.daily-brief");

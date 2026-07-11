@@ -58,6 +58,32 @@ entries:
     tmp
 }
 
+fn make_codex_plugin_fixture() -> TempDir {
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path();
+    write_min_runtime_roots(root);
+    write(
+        &root.join("targets/codex/link-map.yaml"),
+        r#"schema_version: 1
+entries:
+  - id: reporting.skills-tree
+    kind: symlinked-file
+    source: build/codex/plugins/reporting/skills
+    destination: plugins/reporting/skills
+    recursive: true
+"#,
+    );
+    write(
+        &root.join("build/codex/plugins/reporting/skills/daily-brief/SKILL.md"),
+        "# daily-brief\n",
+    );
+    write(
+        &root.join("build/codex/plugins/reporting/skills/topic-radar/SKILL.md"),
+        "# topic-radar\n",
+    );
+    tmp
+}
+
 fn make_claude_fixture() -> TempDir {
     let tmp = TempDir::new().unwrap();
     let root = tmp.path();
@@ -95,7 +121,7 @@ entries:
   - id: reporting.skills-tree
     kind: symlinked-file
     source: build/hermes/plugins/reporting/skills
-    destination: skills/reporting
+    destination: external-skills/agent-runtime-kit/reporting
     recursive: true
 "#,
     );
@@ -287,6 +313,30 @@ fn codex_json_output_carries_schema_and_sorted_skills() {
 fn codex_json_output_reports_v2_invocation_exposure_and_pending_state() {
     let tmp = make_codex_fixture();
     assert_v2_metadata("codex", &tmp);
+}
+
+#[test]
+fn codex_plugin_layout_reports_v2_metadata_and_discoverability() {
+    let tmp = make_codex_plugin_fixture();
+    write_v2_skills_manifest(tmp.path());
+    let output = run(&[
+        "list-skills",
+        "--source-root",
+        &tmp.path().to_string_lossy(),
+        "--product",
+        "codex",
+        "--format",
+        "json",
+    ]);
+    assert_eq!(output.code, 0, "stderr={}", output.stderr_text());
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let skills = value["skills"].as_array().unwrap();
+    assert_eq!(skills.len(), 2);
+    assert_eq!(skills[0]["id"], "reporting.daily-brief");
+    assert_eq!(skills[0]["discoverable"], true);
+    assert_eq!(skills[0]["invocation"]["role"], "workflow");
+    assert_eq!(skills[1]["id"], "reporting.topic-radar");
+    assert_eq!(skills[1]["pending_disposition"], true);
 }
 
 #[test]
