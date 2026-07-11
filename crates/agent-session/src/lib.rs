@@ -9,6 +9,8 @@ use std::env;
 use std::ffi::OsString;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Read, Write};
+use std::os::fd::AsRawFd;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
 use std::thread;
@@ -44,6 +46,7 @@ use cli::{AgentKind, Cli, Command, SpecialKey};
 const SESSION_DOCUMENT_VERSION: &str = "agent-session.session.v1";
 const SESSION_RESUME_DOCUMENT_VERSION: &str = "agent-session.resume.v1";
 const SESSION_RESUME_FILE: &str = "resume.json";
+const SESSION_RECORD_LOCK_FILE: &str = ".record.lock";
 const BINARY: &str = "agent-session";
 const START_COMMAND: &str = "start";
 const RUN_COMMAND: &str = "run";
@@ -1604,7 +1607,7 @@ fn send_to_session(context: &CliContext, args: cli::SendArgs) -> Result<SendResu
             None,
         ));
     }
-    let mut record = load_session_record(context, &args.id)?;
+    let record = load_session_record(context, &args.id)?;
     let tmux_bin = resolve_tmux_bin(args.tmux_bin.as_deref());
     if live_status(&tmux_bin, &record.tmux_session) != "running" {
         return Err(CliError::runtime(
@@ -1614,7 +1617,7 @@ fn send_to_session(context: &CliContext, args: cli::SendArgs) -> Result<SendResu
         ));
     }
     send_input(context, &record, text.as_deref(), &args.keys, &tmux_bin)?;
-    touch_updated_at(context, &mut record)?;
+    let record = touch_updated_at(context, &record.id)?;
     Ok(SendResult {
         id: record.id.clone(),
         tmux_session: record.tmux_session.clone(),
@@ -1851,9 +1854,11 @@ mod codex_resume_tests {
 /// Applied on `send` (a steering action); intentionally not on `glance`, which
 /// is a high-frequency dashboard poll that would otherwise make `updated_at`
 /// track polling rather than activity.
-fn touch_updated_at(context: &CliContext, record: &mut SessionRecord) -> Result<(), CliError> {
-    record.updated_at = Zoned::now().timestamp().to_string();
-    write_session_record(context, record)
+fn touch_updated_at(context: &CliContext, id: &str) -> Result<SessionRecord, CliError> {
+    mutate_session_record(context, id, |record| {
+        record.updated_at = Zoned::now().timestamp().to_string();
+        Ok(record.clone())
+    })
 }
 
 fn update_session_title(
@@ -1862,10 +1867,13 @@ fn update_session_title(
     title: Option<String>,
     tmux_bin: &Path,
 ) -> Result<SessionView, CliError> {
-    let mut record = load_session_record(context, id)?;
-    let previous_title = record.title.clone();
-    record.title = normalize_title(title)?;
-    touch_updated_at(context, &mut record)?;
+    let normalized_title = normalize_title(title)?;
+    let (record, previous_title) = mutate_session_record(context, id, |record| {
+        let previous_title = record.title.clone();
+        record.title = normalized_title;
+        record.updated_at = Zoned::now().timestamp().to_string();
+        Ok((record.clone(), previous_title))
+    })?;
     let status = session_status(tmux_bin, &record);
     // The persisted record above is the source of truth. Claude also carries its
     // own prompt-bar display name, which we set once via `--name` at launch
@@ -2621,6 +2629,68 @@ fn validate_record_id(
         ));
     }
     Ok(())
+}
+
+struct SessionRecordLock(fs::File);
+
+impl Drop for SessionRecordLock {
+    fn drop(&mut self) {
+        // SAFETY: `flock` only observes the valid descriptor owned by this lock.
+        unsafe {
+            libc::flock(self.0.as_raw_fd(), libc::LOCK_UN);
+        }
+    }
+}
+
+fn acquire_session_record_lock(
+    context: &CliContext,
+    id: &str,
+) -> Result<SessionRecordLock, CliError> {
+    let path = session_dir(context, id).join(SESSION_RECORD_LOCK_FILE);
+    let file = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .mode(SECRET_FILE_MODE)
+        .open(&path)
+        .map_err(|err| session_io_error("session-record-lock-open-failed", &path, err))?;
+    fs::set_permissions(&path, fs::Permissions::from_mode(SECRET_FILE_MODE))
+        .map_err(|err| session_io_error("session-record-lock-permission-failed", &path, err))?;
+    // SAFETY: `flock` only observes the valid descriptor owned by `file`.
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
+        return Err(session_io_error(
+            "session-record-lock-failed",
+            &path,
+            io::Error::last_os_error(),
+        ));
+    }
+    Ok(SessionRecordLock(file))
+}
+
+fn session_io_error(code: &str, path: &Path, err: io::Error) -> CliError {
+    CliError::runtime(
+        code,
+        format!("session storage failed at {}: {err}", path.display()),
+        Some(json!({ "path": display_path(path) })),
+    )
+}
+
+pub(crate) fn mutate_session_record<T, F>(
+    context: &CliContext,
+    id: &str,
+    mutate: F,
+) -> Result<T, CliError>
+where
+    F: FnOnce(&mut SessionRecord) -> Result<T, CliError>,
+{
+    // Preserve the public not-found contract before touching the private lock
+    // file; the authoritative record is reloaded after the lock is acquired.
+    let _ = load_session_record(context, id)?;
+    let _lock = acquire_session_record_lock(context, id)?;
+    let mut record = load_session_record(context, id)?;
+    let result = mutate(&mut record)?;
+    write_session_record(context, &record)?;
+    Ok(result)
 }
 
 pub(crate) fn write_session_record(

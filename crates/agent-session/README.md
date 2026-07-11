@@ -168,8 +168,9 @@ is no second state model.
   same launch's session metadata, and opens that fresh transcript from its beginning so the first prompt is not lost.
   Codex `UserPromptSubmit` hook metadata supplies the exact runtime-bound session identity; the pending attach path never
   promotes cwd/time history scans into beginning-of-transcript authority. Transcript discovery is shared by runtime across
-  attach clients, is owned by the daemon across waiter cancellation, and uses bounded exponential backoff. Obsolete runtime
-  keys and deleted sessions are evicted, and a fixed daemon-local entry cap bounds unrelated session churn. Reconnects
+  attach clients, is owned by the daemon across waiter cancellation, uses bounded exponential backoff, and admits at most
+  four concurrent history scans. Active slots are never capacity-evicted; obsolete runtime keys and deleted sessions are
+  evicted, and a fixed daemon-local entry cap bounds unrelated session churn. Reconnects
   baseline the revalidated cached exact source at EOF. It
   replies with an `agent-session.attach.v1` `capability` text frame once resolution finishes, and only after that
   acknowledgement emits `prompt_submitted` events as bounded text frames; terminal snapshot/live output remains binary.

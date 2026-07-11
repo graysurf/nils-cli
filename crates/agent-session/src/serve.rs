@@ -79,6 +79,7 @@ const PROVIDER_PROMPT_PENDING_POLL_INTERVAL: Duration = Duration::from_millis(50
 const PROVIDER_PROMPT_PENDING_TIMEOUT: Duration = Duration::from_secs(2 * 60);
 const PROVIDER_PROMPT_DISCOVERY_MAX_BACKOFF: Duration = Duration::from_secs(30);
 const PROVIDER_PROMPT_DISCOVERY_MAX_ENTRIES: usize = 64;
+const PROVIDER_PROMPT_DISCOVERY_MAX_CONCURRENT_SCANS: usize = 4;
 const ATTACH_SCHEMA_VERSION: &str = "agent-session.attach.v1";
 const ATTACH_EVENT_SCHEMA_VERSION: &str = "agent-session.attach.event.v1";
 const RESET_AT_KEYS: &[&str] = &["reset_at", "resetAt", "resets_at", "resetsAt"];
@@ -1418,6 +1419,7 @@ struct ProviderPromptDiscoveryRegistry {
         HashMap<ProviderPromptDiscoveryKey, Arc<tokio::sync::Mutex<ProviderPromptDiscoverySlot>>>,
     >,
     resolver: Arc<ProviderPromptSourceResolver>,
+    scan_permits: Arc<tokio::sync::Semaphore>,
 }
 
 type ProviderPromptSourceResolver =
@@ -1516,6 +1518,9 @@ impl Default for ProviderPromptDiscoveryRegistry {
         Self {
             entries: tokio::sync::Mutex::new(HashMap::new()),
             resolver: Arc::new(ProviderPromptTail::resolve_source),
+            scan_permits: Arc::new(tokio::sync::Semaphore::new(
+                PROVIDER_PROMPT_DISCOVERY_MAX_CONCURRENT_SCANS,
+            )),
         }
     }
 }
@@ -1544,6 +1549,9 @@ impl ProviderPromptDiscoveryRegistry {
         Self {
             entries: tokio::sync::Mutex::new(HashMap::new()),
             resolver: Arc::new(resolver),
+            scan_permits: Arc::new(tokio::sync::Semaphore::new(
+                PROVIDER_PROMPT_DISCOVERY_MAX_CONCURRENT_SCANS,
+            )),
         }
     }
 
@@ -1552,10 +1560,13 @@ impl ProviderPromptDiscoveryRegistry {
         let slot = {
             let mut entries = self.entries.lock().await;
             entries.retain(|existing, _| existing.session_id != key.session_id || existing == &key);
-            if !entries.contains_key(&key)
-                && entries.len() >= PROVIDER_PROMPT_DISCOVERY_MAX_ENTRIES
-                && let Some(evicted) = entries.keys().find(|existing| *existing != &key).cloned()
+            if !entries.contains_key(&key) && entries.len() >= PROVIDER_PROMPT_DISCOVERY_MAX_ENTRIES
             {
+                let evicted = entries.iter().find_map(|(existing, slot)| {
+                    let state = slot.try_lock().ok()?;
+                    (!state.in_flight && existing != &key).then(|| existing.clone())
+                });
+                let evicted = evicted?;
                 entries.remove(&evicted);
             }
             entries
@@ -1587,13 +1598,17 @@ impl ProviderPromptDiscoveryRegistry {
             drop(state);
 
             let resolver = self.resolver.clone();
+            let scan_permits = self.scan_permits.clone();
             let candidate = record.clone();
             let task_slot = slot.clone();
             tokio::spawn(async move {
-                let source = tokio::task::spawn_blocking(move || resolver(&candidate))
-                    .await
-                    .ok()
-                    .flatten();
+                let source = match scan_permits.acquire_owned().await {
+                    Ok(_permit) => tokio::task::spawn_blocking(move || resolver(&candidate))
+                        .await
+                        .ok()
+                        .flatten(),
+                    Err(_) => None,
+                };
                 let mut state = task_slot.lock().await;
                 state.in_flight = false;
                 if let Some(source) = source {
@@ -1644,6 +1659,18 @@ impl ProviderPromptDiscoveryRegistry {
     #[cfg(test)]
     async fn entry_count(&self) -> usize {
         self.entries.lock().await.len()
+    }
+
+    #[cfg(test)]
+    async fn in_flight_count(&self) -> usize {
+        let slots: Vec<_> = self.entries.lock().await.values().cloned().collect();
+        let mut count = 0;
+        for slot in slots {
+            if slot.lock().await.in_flight {
+                count += 1;
+            }
+        }
+        count
     }
 }
 
@@ -3141,6 +3168,80 @@ mod tests {
         assert_eq!(
             registry.entry_count().await,
             PROVIDER_PROMPT_DISCOVERY_MAX_ENTRIES
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn provider_prompt_discovery_does_not_evict_active_slots_and_bounds_scans() {
+        let started = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let max_active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let release = Arc::new(AtomicBool::new(false));
+        let registry = Arc::new(ProviderPromptDiscoveryRegistry::with_resolver({
+            let started = started.clone();
+            let active = active.clone();
+            let max_active = max_active.clone();
+            let release = release.clone();
+            move |_| {
+                started.fetch_add(1, Ordering::SeqCst);
+                let current = active.fetch_add(1, Ordering::SeqCst) + 1;
+                max_active.fetch_max(current, Ordering::SeqCst);
+                while !release.load(Ordering::SeqCst) {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                active.fetch_sub(1, Ordering::SeqCst);
+                None
+            }
+        }));
+        let records: Vec<_> = (0..PROVIDER_PROMPT_DISCOVERY_MAX_ENTRIES)
+            .map(|index| {
+                let id = format!("active-discovery-{index}");
+                provider_discovery_record(&id, &format!("hs-{id}"), &format!("launch-{index}"), 1)
+            })
+            .collect();
+        let mut tasks = tokio::task::JoinSet::new();
+        for record in &records {
+            let registry = registry.clone();
+            let record = record.clone();
+            tasks.spawn(async move { registry.resolve_source(&record).await });
+        }
+        while registry.in_flight_count().await < PROVIDER_PROMPT_DISCOVERY_MAX_ENTRIES {
+            tokio::task::yield_now().await;
+        }
+        while started.load(Ordering::SeqCst) < PROVIDER_PROMPT_DISCOVERY_MAX_CONCURRENT_SCANS {
+            tokio::task::yield_now().await;
+        }
+        for index in 0..10 {
+            let id = format!("overflow-discovery-{index}");
+            let record = provider_discovery_record(
+                &id,
+                &format!("hs-{id}"),
+                &format!("overflow-launch-{index}"),
+                1,
+            );
+            assert!(registry.resolve_source(&record).await.is_none());
+        }
+        let duplicate = {
+            let registry = registry.clone();
+            let record = records[0].clone();
+            tokio::spawn(async move { registry.resolve_source(&record).await })
+        };
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        assert_eq!(registry.scan_attempts(&records[0]).await, 1);
+        assert_eq!(
+            max_active.load(Ordering::SeqCst),
+            PROVIDER_PROMPT_DISCOVERY_MAX_CONCURRENT_SCANS
+        );
+
+        release.store(true, Ordering::SeqCst);
+        while tasks.join_next().await.is_some() {}
+        duplicate.await.expect("duplicate waiter");
+        assert_eq!(
+            registry.entry_count().await,
+            PROVIDER_PROMPT_DISCOVERY_MAX_ENTRIES
+        );
+        assert!(
+            max_active.load(Ordering::SeqCst) <= PROVIDER_PROMPT_DISCOVERY_MAX_CONCURRENT_SCANS
         );
     }
 
