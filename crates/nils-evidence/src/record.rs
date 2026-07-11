@@ -26,7 +26,10 @@ pub struct SkillUsageRecord {
     /// Additive provenance block; absent on pre-v1.4.0 records.
     #[serde(default)]
     pub producer: Option<Producer>,
-    pub skill: String,
+    #[serde(default)]
+    pub skill: Option<String>,
+    #[serde(default)]
+    pub owner: Option<Owner>,
     pub started_at: String,
     #[serde(default)]
     pub ended_at: Option<String>,
@@ -51,6 +54,12 @@ pub struct SkillUsageRecord {
 pub struct Producer {
     pub tool: String,
     pub nils_cli_version: String,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct Owner {
+    pub kind: String,
+    pub id: String,
 }
 
 /// Free-string outcome status plus its summary. `status` is deliberately
@@ -93,6 +102,29 @@ pub struct Failure {
 }
 
 impl SkillUsageRecord {
+    /// Normalize v1 skill ownership and v2 owner objects to one shape.
+    pub fn normalized_owner(&self) -> Result<Owner, String> {
+        match self.schema.as_str() {
+            "skill-usage.record.v1" => self
+                .skill
+                .as_ref()
+                .filter(|skill| !skill.trim().is_empty())
+                .map(|skill| Owner {
+                    kind: "skill".to_string(),
+                    id: skill.clone(),
+                })
+                .ok_or_else(|| "v1 record is missing skill ownership".to_string()),
+            "skill-usage.record.v2" => self
+                .owner
+                .clone()
+                .filter(|owner| {
+                    matches!(owner.kind.as_str(), "skill" | "workflow" | "intent")
+                        && !owner.id.trim().is_empty()
+                })
+                .ok_or_else(|| "v2 record has invalid owner ownership".to_string()),
+            other => Err(format!("unsupported source schema `{other}`")),
+        }
+    }
     /// Parse a record from raw JSON bytes.
     pub fn from_json_bytes(bytes: &[u8]) -> Result<Self, String> {
         serde_json::from_slice(bytes).map_err(|e| format!("skill-usage.record.json parse: {e}"))
@@ -162,10 +194,11 @@ mod tests {
     #[test]
     fn deserializes_record_with_producer() {
         let r = SkillUsageRecord::from_json_str(WITH_PRODUCER).expect("parse");
-        let p = r.producer.expect("producer present");
+        let p = r.producer.as_ref().expect("producer present");
         assert_eq!(p.tool, "skill-usage");
         assert_eq!(p.nils_cli_version, "1.4.0");
         assert_eq!(r.outcome.status, "pass");
+        assert_eq!(r.normalized_owner().unwrap().id, "deliver-pr");
         assert_eq!(r.linked_records.len(), 1);
         assert_eq!(r.linked_records[0].record_type, "test-first-evidence");
         assert_eq!(r.validation.len(), 1);
@@ -204,5 +237,24 @@ mod tests {
         assert!(r.failures.is_empty());
         assert!(r.ended_at.is_none());
         assert_eq!(r.outcome.summary, "");
+    }
+
+    #[test]
+    fn normalizes_v2_workflow_owner() {
+        let json = r#"{
+            "schema": "skill-usage.record.v2",
+            "owner": { "kind": "workflow", "id": "deliver-pr" },
+            "started_at": "2026-06-14T10:00:00Z",
+            "outcome": { "status": "pass" }
+        }"#;
+        let record = SkillUsageRecord::from_json_str(json).expect("parse v2");
+        assert!(record.skill.is_none());
+        assert_eq!(
+            record.normalized_owner().unwrap(),
+            Owner {
+                kind: "workflow".to_string(),
+                id: "deliver-pr".to_string(),
+            }
+        );
     }
 }

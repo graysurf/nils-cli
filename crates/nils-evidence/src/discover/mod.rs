@@ -144,13 +144,27 @@ pub fn run(args: &DispatchArgs) -> Result<DiscoverReport, DiscoverError> {
                 continue;
             }
         };
+        let skill = match record.normalized_owner() {
+            Ok(owner) => owner.id,
+            Err(reason) => {
+                unknown += 1;
+                candidates.push(Candidate {
+                    source_path,
+                    classification: Classification::Unknown,
+                    skill: None,
+                    source_digest: None,
+                    reason: Some(reason),
+                });
+                continue;
+            }
+        };
         let digest = format!("sha256:{}", sha256_hex(&raw));
         if existing.contains(&digest) {
             blocked += 1;
             candidates.push(Candidate {
                 source_path,
                 classification: Classification::Blocked,
-                skill: Some(record.skill),
+                skill: Some(skill.clone()),
                 source_digest: Some(digest),
                 reason: Some("already archived (catalog)".to_string()),
             });
@@ -159,7 +173,7 @@ pub fn run(args: &DispatchArgs) -> Result<DiscoverReport, DiscoverError> {
             candidates.push(Candidate {
                 source_path,
                 classification: Classification::Eligible,
-                skill: Some(record.skill),
+                skill: Some(skill),
                 source_digest: Some(digest),
                 reason: None,
             });

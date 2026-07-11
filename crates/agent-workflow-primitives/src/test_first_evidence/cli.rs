@@ -28,6 +28,8 @@ pub enum Command {
     RecordWaiver(RecordWaiverArgs),
     /// Record final validation after the implementation.
     RecordFinal(RecordFinalArgs),
+    /// Query classified, pre-edit, or delivery readiness without mutating the record.
+    Check(CheckArgs),
     /// Verify the evidence record is complete enough for delivery.
     Verify(CommonArgs),
     /// Print the current evidence record.
@@ -138,6 +140,24 @@ pub struct CompletionArgs {
     pub shell: crate::completion::CompletionShell,
 }
 
+#[derive(Debug, Args)]
+pub struct CheckArgs {
+    #[command(flatten)]
+    pub common: CommonArgs,
+
+    /// Readiness phase to evaluate.
+    #[arg(long, value_enum)]
+    pub phase: CheckPhase,
+
+    /// Repository root used by the pre-edit path-class contract.
+    #[arg(long = "project-path", value_name = "DIR", value_hint = ValueHint::DirPath)]
+    pub project_path: Option<PathBuf>,
+
+    /// Repository-relative path to classify. Repeat for batches.
+    #[arg(long, value_name = "PATH", value_hint = ValueHint::AnyPath)]
+    pub path: Vec<PathBuf>,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 #[value(rename_all = "kebab-case")]
 pub enum OutputFormat {
@@ -150,6 +170,24 @@ pub enum OutputFormat {
 pub enum ValidationStatus {
     Pass,
     Fail,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+#[value(rename_all = "kebab-case")]
+pub enum CheckPhase {
+    Classified,
+    PreEdit,
+    Delivery,
+}
+
+impl CheckPhase {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Classified => "classified",
+            Self::PreEdit => "pre-edit",
+            Self::Delivery => "delivery",
+        }
+    }
 }
 
 impl ValidationStatus {

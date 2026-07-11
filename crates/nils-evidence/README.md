@@ -2,7 +2,10 @@
 
 The `evidence` CLI — query and migrate a durable, scrubbed **skill-usage
 evidence archive**. The sibling of `plan-archive` (plan history), for runtime
-skill-usage records. Depends on the shared `nils-scrub` crate for redaction.
+skill-usage records. Both skill-owned v1 records and generalized v2 owner
+records are accepted, so archives remain readable while workflows and intents
+adopt the shared evidence format. Depends on the shared `nils-scrub` crate for
+redaction.
 
 ## Commands
 
@@ -43,7 +46,7 @@ default `${XDG_DATA_HOME:-$HOME/.local/share}/agent-evidence-archive`.
 
 Queries declare a readable schema-version range and report (never silently
 drop) rollups outside it. Each rollup carries the producing `nils_cli_version`
-(from the `skill-usage.record.v1` `producer` block).
+(from the source record's `producer` block).
 
 ## Docs
 

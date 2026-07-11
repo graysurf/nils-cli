@@ -85,6 +85,7 @@ impl fmt::Display for Scope {
 pub enum Product {
     Codex,
     Claude,
+    Hermes,
 }
 
 impl Product {
@@ -92,17 +93,19 @@ impl Product {
         match self {
             Self::Codex => "codex",
             Self::Claude => "claude",
+            Self::Hermes => "hermes",
         }
     }
 
     pub const fn supported_values() -> &'static [&'static str] {
-        &["codex", "claude"]
+        &["codex", "claude", "hermes"]
     }
 
     pub fn from_config_value(value: &str) -> Option<Self> {
         match value {
             "codex" => Some(Self::Codex),
             "claude" => Some(Self::Claude),
+            "hermes" => Some(Self::Hermes),
             _ => None,
         }
     }
@@ -565,6 +568,9 @@ pub struct ScopeCatalog {
     pub validations: Vec<ValidationEntry>,
     /// Opt-in skill-name policy; `None` when no `[skills]` table is declared.
     pub skill_policy: Option<SkillPolicy>,
+    /// Optional repository path classification contract. Only project-scope
+    /// catalogs may declare it; consumers treat absence as `not-configured`.
+    pub path_classes: Option<crate::path_classes::PathClassContract>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Default)]

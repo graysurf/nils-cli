@@ -6,6 +6,7 @@ use agent_runtime::managed_block::{CommentStyle, ManagedBlock};
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::time::{Duration, SystemTime};
 use tempfile::TempDir;
 
@@ -129,6 +130,64 @@ fn install_clean(product: &str, source_root: &Path, home: &Path, state_home: &Pa
     .unwrap();
 }
 
+fn commit_source(source_root: &Path) {
+    for args in [
+        vec!["init", "-q"],
+        vec!["config", "user.email", "fixture@example.invalid"],
+        vec!["config", "user.name", "Fixture"],
+        vec!["add", "."],
+        vec!["commit", "-qm", "fixture"],
+    ] {
+        let status = Command::new("git")
+            .arg("-C")
+            .arg(source_root)
+            .args(args)
+            .status()
+            .unwrap();
+        assert!(status.success());
+    }
+}
+
+#[test]
+fn installed_runtime_class_requires_and_verifies_portable_receipt() {
+    let tmp = TempDir::new().unwrap();
+    let home = tmp.path().join("home");
+    let state_home = tmp.path().join("state");
+    fs::create_dir_all(&home).unwrap();
+    let source_root = build_source_root(tmp.path(), "claude", &home, &state_home);
+    commit_source(&source_root);
+    let options = DoctorOptions {
+        class_filter: Some(doctor::DoctorClass::InstalledRuntime),
+        ..DoctorOptions::default()
+    };
+
+    let missing = doctor::run(
+        "claude",
+        &source_root,
+        Some(&home),
+        Some(&state_home),
+        &options,
+    )
+    .unwrap();
+    assert_eq!(missing.exit_code(), 2);
+    assert!(!missing.installed_runtime.unwrap().receipt_present);
+
+    install_clean("claude", &source_root, &home, &state_home);
+    let verified = doctor::run(
+        "claude",
+        &source_root,
+        Some(&home),
+        Some(&state_home),
+        &options,
+    )
+    .unwrap();
+    assert_eq!(verified.exit_code(), 0, "findings: {:?}", verified.findings);
+    let report = verified.installed_runtime.unwrap();
+    assert!(report.verified);
+    assert!(report.source_clean);
+    assert!(report.plan_match);
+}
+
 fn run_doctor(
     product: &str,
     source_root: &Path,
@@ -225,7 +284,7 @@ fn unbalanced_managed_block_marker_blocks_and_exits_two() {
 }
 
 #[test]
-fn missing_state_home_warns_and_exits_one() {
+fn install_receipt_materializes_state_home_for_clean_doctor() {
     let tmp = TempDir::new().unwrap();
     let home = tmp.path().join("home");
     let state_home = tmp.path().join("state");
@@ -235,12 +294,13 @@ fn missing_state_home_warns_and_exits_one() {
     install_clean("claude", &source_root, &home, &state_home);
 
     let outcome = run_doctor("claude", &source_root, &home, &state_home);
-    assert_eq!(outcome.exit_code(), 1);
+    assert_eq!(outcome.exit_code(), 0);
     assert!(
-        outcome.findings.iter().any(|finding| {
-            finding.severity == DoctorSeverity::Warn && finding.check == "runtime-root.state_home"
-        }),
-        "expected missing state_home warning: {:#?}",
+        outcome
+            .installed_runtime
+            .as_ref()
+            .is_some_and(|report| report.receipt_present),
+        "expected installed-runtime receipt: {:#?}",
         outcome.findings
     );
 }

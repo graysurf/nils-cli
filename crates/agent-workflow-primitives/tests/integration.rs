@@ -4,6 +4,8 @@
 mod agent_run;
 #[path = "integration/cli.rs"]
 mod cli;
+#[path = "integration/control_plane.rs"]
+mod control_plane;
 #[path = "integration/exit_codes.rs"]
 mod exit_codes;
 #[path = "integration/help_snapshot.rs"]

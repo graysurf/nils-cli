@@ -8,6 +8,7 @@ use crate::model::{
     ConfigErrorLocation, ConfigLoadError, Context, DocumentEntry, LoadedCatalog, Product, Scope,
     ScopeCatalog, SkillPolicy, ValidationEntry, When,
 };
+use crate::path_classes::PathClassContract;
 use crate::predicate::parse_when;
 
 pub const CONFIG_FILE_NAME: &str = "AGENT_DOCS.toml";
@@ -76,6 +77,7 @@ pub fn load_scope_catalog(
     let documents = parse_documents(source_scope, &file_path, &parsed)?;
     let validations = parse_validations(&file_path, &parsed)?;
     let skill_policy = parse_skill_policy(&file_path, &parsed)?;
+    let path_classes = parse_path_classes(source_scope, &file_path, &parsed)?;
 
     Ok(Some(ScopeCatalog {
         source_scope,
@@ -84,7 +86,33 @@ pub fn load_scope_catalog(
         documents,
         validations,
         skill_policy,
+        path_classes,
     }))
+}
+
+fn parse_path_classes(
+    _source_scope: Scope,
+    file_path: &Path,
+    parsed: &Value,
+) -> Result<Option<PathClassContract>, ConfigLoadError> {
+    let Some(root) = parsed.as_table() else {
+        return Ok(None);
+    };
+    let Some(value) = root.get("path_classes") else {
+        return Ok(None);
+    };
+    let table = value.as_table().ok_or_else(|| {
+        ConfigLoadError::validation_root(
+            file_path.to_path_buf(),
+            "path_classes",
+            "key `path_classes` must be a [path_classes] table",
+        )
+    })?;
+    PathClassContract::from_toml(table)
+        .map(Some)
+        .map_err(|message| {
+            ConfigLoadError::validation_root(file_path.to_path_buf(), "path_classes", message)
+        })
 }
 
 fn same_config_file(docs_home: &Path, project_path: &Path) -> bool {

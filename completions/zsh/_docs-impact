@@ -39,6 +39,38 @@ json\:"Single-record JSON envelope (snake_case)"))' \
 '--help[Print help (see more with '\''--help'\'')]' \
 && ret=0
 ;;
+(record)
+_arguments "${_arguments_options[@]}" : \
+'--out=[]:DIR:_files -/' \
+'--format=[]:FORMAT:((text\:"Human-readable text output (default)"
+json\:"Single-record JSON envelope (snake_case)"))' \
+'--repo=[]:DIR:_files -/' \
+'--base=[]:REF:_default' \
+'--disposition=[]:DISPOSITION:(docs-updated no-docs-needed pending)' \
+'--rationale=[]:TEXT:_default' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+&& ret=0
+;;
+(show)
+_arguments "${_arguments_options[@]}" : \
+'--out=[]:DIR:_files -/' \
+'--format=[]:FORMAT:((text\:"Human-readable text output (default)"
+json\:"Single-record JSON envelope (snake_case)"))' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+&& ret=0
+;;
+(verify)
+_arguments "${_arguments_options[@]}" : \
+'--out=[]:DIR:_files -/' \
+'--format=[]:FORMAT:((text\:"Human-readable text output (default)"
+json\:"Single-record JSON envelope (snake_case)"))' \
+'--repo=[]:DIR:_files -/' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+&& ret=0
+;;
 (completion)
 _arguments "${_arguments_options[@]}" : \
 '-h[Print help]' \
@@ -55,6 +87,9 @@ esac
 _docs-impact_commands() {
     local commands; commands=(
 'scan:Scan changed files and classify documentation impact' \
+'record:Persist a human docs-impact disposition against the complete Git change state' \
+'show:Show a persisted docs-impact disposition' \
+'verify:Rescan and verify a persisted docs-impact disposition is current' \
 'completion:Print shell completion script' \
     )
     _describe -t commands 'docs-impact commands' commands "$@"
@@ -64,10 +99,25 @@ _docs-impact__subcmd__completion_commands() {
     local commands; commands=()
     _describe -t commands 'docs-impact completion commands' commands "$@"
 }
+(( $+functions[_docs-impact__subcmd__record_commands] )) ||
+_docs-impact__subcmd__record_commands() {
+    local commands; commands=()
+    _describe -t commands 'docs-impact record commands' commands "$@"
+}
 (( $+functions[_docs-impact__subcmd__scan_commands] )) ||
 _docs-impact__subcmd__scan_commands() {
     local commands; commands=()
     _describe -t commands 'docs-impact scan commands' commands "$@"
+}
+(( $+functions[_docs-impact__subcmd__show_commands] )) ||
+_docs-impact__subcmd__show_commands() {
+    local commands; commands=()
+    _describe -t commands 'docs-impact show commands' commands "$@"
+}
+(( $+functions[_docs-impact__subcmd__verify_commands] )) ||
+_docs-impact__subcmd__verify_commands() {
+    local commands; commands=()
+    _describe -t commands 'docs-impact verify commands' commands "$@"
 }
 
 if [ "$funcstack[1]" = "_docs-impact" ]; then

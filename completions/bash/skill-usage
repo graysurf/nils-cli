@@ -75,7 +75,7 @@ _skill-usage() {
             return 0
             ;;
         skill__usage__init)
-            opts="-h --out --format --skill --intent --trigger --user-request-summary --referenced-file --external-source --cwd --started-at --validation-waiver --force --help"
+            opts="-h --out --format --skill --owner-kind --owner-id --intent --trigger --user-request-summary --referenced-file --external-source --cwd --started-at --validation-waiver --force --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -93,6 +93,14 @@ _skill-usage() {
                     return 0
                     ;;
                 --skill)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --owner-kind)
+                    COMPREPLY=($(compgen -W "skill workflow intent" -- "${cur}"))
+                    return 0
+                    ;;
+                --owner-id)
                     COMPREPLY=($(compgen -f "${cur}"))
                     return 0
                     ;;

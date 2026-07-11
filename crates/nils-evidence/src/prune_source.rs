@@ -120,7 +120,7 @@ pub fn run(args: &PruneSourceArgs) -> Result<PruneSourceReport, PruneSourceError
         let digest = format!("sha256:{}", sha256_hex(&raw));
         let parsed_skill = SkillUsageRecord::from_json_bytes(&raw)
             .ok()
-            .map(|r| r.skill);
+            .and_then(|record| record.normalized_owner().ok().map(|owner| owner.id));
         if archived_digests.contains(&digest) {
             pruned.push(entry.into_record(
                 parsed_skill,

@@ -12,8 +12,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use cli::{
-    Cli, Command, CommonArgs, InitArgs, OutputFormat, RecordFailingArgs, RecordFinalArgs,
-    RecordWaiverArgs,
+    CheckArgs, CheckPhase, Cli, Command, CommonArgs, InitArgs, OutputFormat, RecordFailingArgs,
+    RecordFinalArgs, RecordWaiverArgs,
 };
 use nils_common::cli_contract::exit;
 use nils_common::fs::{display_path, normalize_path};
@@ -22,6 +22,7 @@ use nils_common::redact::redact_text;
 const EXIT_OK: i32 = exit::SUCCESS;
 const EXIT_RUNTIME: i32 = exit::RUNTIME;
 const EXIT_USAGE: i32 = exit::USAGE;
+const EXIT_DATA: i32 = exit::DATA;
 
 const RECORD_SCHEMA_VERSION: &str = "test-first-evidence.record.v1";
 const RECORD_FILE_NAME: &str = "test-first-evidence.json";
@@ -32,6 +33,7 @@ const RECORD_WAIVER_SCHEMA_VERSION: &str = "cli.test-first-evidence.record-waive
 const RECORD_FINAL_SCHEMA_VERSION: &str = "cli.test-first-evidence.record-final.v1";
 const VERIFY_SCHEMA_VERSION: &str = "cli.test-first-evidence.verify.v1";
 const SHOW_SCHEMA_VERSION: &str = "cli.test-first-evidence.show.v1";
+const CHECK_SCHEMA_VERSION: &str = "cli.test-first-evidence.check.v1";
 
 const INIT_COMMAND: &str = "test-first-evidence init";
 const RECORD_FAILING_COMMAND: &str = "test-first-evidence record-failing";
@@ -39,6 +41,7 @@ const RECORD_WAIVER_COMMAND: &str = "test-first-evidence record-waiver";
 const RECORD_FINAL_COMMAND: &str = "test-first-evidence record-final";
 const VERIFY_COMMAND: &str = "test-first-evidence verify";
 const SHOW_COMMAND: &str = "test-first-evidence show";
+const CHECK_COMMAND: &str = "test-first-evidence check";
 
 pub fn run() -> i32 {
     run_with_args(env::args_os())
@@ -70,10 +73,154 @@ fn dispatch(cli: Cli) -> i32 {
         Command::RecordFailing(args) => run_record_failing(args),
         Command::RecordWaiver(args) => run_record_waiver(args),
         Command::RecordFinal(args) => run_record_final(args),
+        Command::Check(args) => run_check(args),
         Command::Verify(args) => run_verify(args),
         Command::Show(args) => run_show(args),
         Command::Completion(args) => {
             crate::completion::run::<Cli>(args.shell, "test-first-evidence")
+        }
+    }
+}
+
+fn run_check(args: CheckArgs) -> i32 {
+    let format = args.common.format;
+    match check(&args) {
+        Ok(result) if result.allowed => render_check_success(format, &result),
+        Ok(result) => render_error(
+            CHECK_SCHEMA_VERSION,
+            CHECK_COMMAND,
+            format,
+            CliError::data(
+                "pre-edit-blocked",
+                "test-first readiness check blocked the requested phase",
+                Some(json!({
+                    "phase": result.phase,
+                    "path_class": result.path_class,
+                    "reason_code": result.reason_code,
+                    "paths": result.paths,
+                })),
+            ),
+        ),
+        Err(err) => render_error(CHECK_SCHEMA_VERSION, CHECK_COMMAND, format, err),
+    }
+}
+
+fn check(args: &CheckArgs) -> Result<CheckResult, CliError> {
+    let record = read_record_result(args.common.out_dir.as_path())?.record;
+    match args.phase {
+        CheckPhase::Classified => Ok(CheckResult {
+            phase: args.phase.as_str().to_string(),
+            path_class: "not-applicable".to_string(),
+            allowed: !record.change_classification.trim().is_empty(),
+            reason_code: "classification-recorded".to_string(),
+            paths: Vec::new(),
+        }),
+        CheckPhase::Delivery => {
+            let missing = missing_evidence_fields(&record);
+            Ok(CheckResult {
+                phase: args.phase.as_str().to_string(),
+                path_class: "not-applicable".to_string(),
+                allowed: missing.is_empty(),
+                reason_code: if missing.is_empty() {
+                    "delivery-complete"
+                } else {
+                    "delivery-incomplete"
+                }
+                .to_string(),
+                paths: Vec::new(),
+            })
+        }
+        CheckPhase::PreEdit => check_pre_edit(args, &record),
+    }
+}
+
+fn check_pre_edit(args: &CheckArgs, record: &EvidenceRecord) -> Result<CheckResult, CliError> {
+    let project = args.project_path.as_deref().ok_or_else(|| {
+        CliError::usage(
+            "missing-project-path",
+            "--project-path is required for --phase pre-edit",
+            Some(json!({ "flag": "--project-path" })),
+        )
+    })?;
+    if args.path.is_empty() {
+        return Err(CliError::usage(
+            "missing-path",
+            "at least one --path is required for --phase pre-edit",
+            Some(json!({ "flag": "--path" })),
+        ));
+    }
+    let project = absolute_path(project)?;
+    let catalog = agent_docs::config::load_catalog(&project, &project).map_err(|err| {
+        CliError::data(
+            "path-class-catalog-invalid",
+            err.to_string(),
+            Some(json!({ "project_path": display_path(&project) })),
+        )
+    })?;
+    let Some(contract) = agent_docs::path_classes::project_contract(&catalog) else {
+        return Ok(CheckResult {
+            phase: args.phase.as_str().to_string(),
+            path_class: "not-configured".to_string(),
+            allowed: true,
+            reason_code: "path-classes-not-configured".to_string(),
+            paths: args
+                .path
+                .iter()
+                .map(|path| path.to_string_lossy().replace('\\', "/"))
+                .collect(),
+        });
+    };
+    let mut classes = BTreeSet::new();
+    let mut paths = Vec::new();
+    for path in &args.path {
+        let classification = contract.classify(path).map_err(|message| {
+            CliError::data(
+                "invalid-pre-edit-path",
+                message,
+                Some(json!({ "path": path.to_string_lossy() })),
+            )
+        })?;
+        classes.insert(classification.path_class);
+        paths.push(classification.path);
+    }
+    let path_class = if classes.len() == 1 {
+        classes.iter().next().cloned().unwrap_or_default()
+    } else {
+        "multiple".to_string()
+    };
+    let has_before_fix = record
+        .failing_test
+        .as_ref()
+        .is_some_and(|item| item.exit_code != 0)
+        || record.waiver.is_some();
+    let (allowed, reason_code) = if classes.contains("ambiguous") {
+        (false, "ambiguous-path-class")
+    } else if classes.contains("unknown") {
+        (false, "unknown-path-class")
+    } else if classes.contains("production") && !has_before_fix {
+        (false, "missing-failing-evidence-or-waiver")
+    } else {
+        (true, "pre-edit-ready")
+    };
+    Ok(CheckResult {
+        phase: args.phase.as_str().to_string(),
+        path_class,
+        allowed,
+        reason_code: reason_code.to_string(),
+        paths,
+    })
+}
+
+fn render_check_success(format: OutputFormat, result: &CheckResult) -> i32 {
+    match format {
+        OutputFormat::Json => print_json_success(CHECK_SCHEMA_VERSION, CHECK_COMMAND, result)
+            .unwrap_or_else(render_json_failure),
+        OutputFormat::Text => {
+            println!(
+                "test-first check: phase={} path_class={} allowed={} reason={}",
+                result.phase, result.path_class, result.allowed, result.reason_code
+            );
+            EXIT_OK
         }
     }
 }
@@ -569,6 +716,15 @@ impl CliError {
             exit_code: EXIT_RUNTIME,
         }
     }
+
+    fn data(code: &'static str, message: impl Into<String>, details: Option<Value>) -> Self {
+        Self {
+            code,
+            message: message.into(),
+            details,
+            exit_code: EXIT_DATA,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -613,6 +769,15 @@ pub struct FinalValidation {
     pub summary: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub artifacts: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct CheckResult {
+    phase: String,
+    path_class: String,
+    allowed: bool,
+    reason_code: String,
+    paths: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]

@@ -1,0 +1,277 @@
+use std::fs;
+use std::path::Path;
+use std::process::Command;
+
+use nils_test_support::cmd::{CmdOutput, run_resolved_in_dir};
+
+fn run(bin: &str, dir: &Path, args: &[&str]) -> CmdOutput {
+    run_resolved_in_dir(bin, dir, args, &[], None)
+}
+
+fn init_repo(root: &Path) {
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::create_dir_all(root.join("tests")).unwrap();
+    fs::create_dir_all(root.join("docs")).unwrap();
+    fs::write(root.join("src/lib.rs"), "pub fn value() -> u8 { 1 }\n").unwrap();
+    fs::write(root.join("tests/value.rs"), "#[test] fn value() {}\n").unwrap();
+    fs::write(root.join("docs/guide.md"), "# Guide\n").unwrap();
+    fs::write(
+        root.join("AGENT_DOCS.toml"),
+        r#"[path_classes]
+production = ["src/**", "shared/**"]
+test = ["tests/**", "shared/**"]
+docs = ["docs/**", "**/*.md"]
+generated = ["build/**"]
+unmatched = "unknown"
+"#,
+    )
+    .unwrap();
+    assert!(
+        Command::new("git")
+            .arg("init")
+            .arg("-q")
+            .arg(root)
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert!(
+        Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(["config", "user.email", "fixture@example.invalid"])
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert!(
+        Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(["config", "user.name", "Fixture"])
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert!(
+        Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(["add", "."])
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert!(
+        Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(["commit", "-qm", "fixture"])
+            .status()
+            .unwrap()
+            .success()
+    );
+}
+
+#[test]
+fn test_first_check_is_phase_and_path_class_aware() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let repo = tmp.path().join("repo");
+    init_repo(&repo);
+    let out = tmp.path().join("evidence");
+    let out_arg = out.to_str().unwrap();
+    let repo_arg = repo.to_str().unwrap();
+
+    let init = run(
+        "test-first-evidence",
+        tmp.path(),
+        &[
+            "init",
+            "--out",
+            out_arg,
+            "--classification",
+            "behavior-change",
+        ],
+    );
+    assert_eq!(init.code, 0, "stderr: {}", init.stderr_text());
+
+    let test_path = run(
+        "test-first-evidence",
+        tmp.path(),
+        &[
+            "check",
+            "--out",
+            out_arg,
+            "--phase",
+            "pre-edit",
+            "--project-path",
+            repo_arg,
+            "--path",
+            "tests/value.rs",
+            "--format",
+            "json",
+        ],
+    );
+    assert_eq!(test_path.code, 0, "stderr: {}", test_path.stderr_text());
+    assert_eq!(test_path.stdout_json()["result"]["path_class"], "test");
+    assert_eq!(test_path.stdout_json()["result"]["allowed"], true);
+
+    let production = run(
+        "test-first-evidence",
+        tmp.path(),
+        &[
+            "check",
+            "--out",
+            out_arg,
+            "--phase",
+            "pre-edit",
+            "--project-path",
+            repo_arg,
+            "--path",
+            "src/lib.rs",
+            "--format",
+            "json",
+        ],
+    );
+    assert_eq!(production.code, 65);
+    assert_eq!(
+        production.stdout_json()["error"]["details"]["reason_code"],
+        "missing-failing-evidence-or-waiver"
+    );
+
+    let ambiguous = run(
+        "test-first-evidence",
+        tmp.path(),
+        &[
+            "check",
+            "--out",
+            out_arg,
+            "--phase",
+            "pre-edit",
+            "--project-path",
+            repo_arg,
+            "--path",
+            "shared/value.rs",
+            "--format",
+            "json",
+        ],
+    );
+    assert_eq!(ambiguous.code, 65);
+    assert_eq!(
+        ambiguous.stdout_json()["error"]["details"]["path_class"],
+        "ambiguous"
+    );
+}
+
+#[test]
+fn workflow_owner_uses_v2_skill_usage_record() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let out = tmp.path().join("usage");
+    let out_arg = out.to_str().unwrap();
+    let init = run(
+        "skill-usage",
+        tmp.path(),
+        &[
+            "init",
+            "--out",
+            out_arg,
+            "--owner-kind",
+            "workflow",
+            "--owner-id",
+            "deliver-pr",
+            "--intent",
+            "deliver reviewed change",
+            "--user-request-summary",
+            "deliver the change",
+        ],
+    );
+    assert_eq!(init.code, 0, "stderr: {}", init.stderr_text());
+    let validation = run(
+        "skill-usage",
+        tmp.path(),
+        &[
+            "record-validation",
+            "--out",
+            out_arg,
+            "--command",
+            "cargo test",
+            "--status",
+            "pass",
+            "--summary",
+            "passed",
+        ],
+    );
+    assert_eq!(validation.code, 0);
+    let outcome = run(
+        "skill-usage",
+        tmp.path(),
+        &[
+            "record-outcome",
+            "--out",
+            out_arg,
+            "--status",
+            "pass",
+            "--summary",
+            "complete",
+        ],
+    );
+    assert_eq!(outcome.code, 0);
+    let verify = run(
+        "skill-usage",
+        tmp.path(),
+        &["verify", "--out", out_arg, "--format", "json"],
+    );
+    assert_eq!(verify.code, 0, "stderr: {}", verify.stderr_text());
+    let json = verify.stdout_json();
+    assert_eq!(json["data"]["record"]["schema"], "skill-usage.record.v2");
+    assert_eq!(json["data"]["record"]["owner"]["kind"], "workflow");
+    assert_eq!(json["data"]["record"]["owner"]["id"], "deliver-pr");
+}
+
+#[test]
+fn docs_impact_record_detects_stale_changes() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let repo = tmp.path().join("repo");
+    init_repo(&repo);
+    fs::write(repo.join("src/lib.rs"), "pub fn value() -> u8 { 2 }\n").unwrap();
+    let out = tmp.path().join("docs-impact");
+    let out_arg = out.to_str().unwrap();
+    let repo_arg = repo.to_str().unwrap();
+
+    let record = run(
+        "docs-impact",
+        tmp.path(),
+        &[
+            "record",
+            "--out",
+            out_arg,
+            "--repo",
+            repo_arg,
+            "--disposition",
+            "no-docs-needed",
+            "--rationale",
+            "Internal implementation detail",
+            "--format",
+            "json",
+        ],
+    );
+    assert_eq!(record.code, 0, "stderr: {}", record.stderr_text());
+    let verify = run(
+        "docs-impact",
+        tmp.path(),
+        &[
+            "verify", "--out", out_arg, "--repo", repo_arg, "--format", "json",
+        ],
+    );
+    assert_eq!(verify.code, 0, "stderr: {}", verify.stderr_text());
+    fs::write(repo.join("src/new.rs"), "pub fn new_value() {}\n").unwrap();
+    let stale = run(
+        "docs-impact",
+        tmp.path(),
+        &[
+            "verify", "--out", out_arg, "--repo", repo_arg, "--format", "json",
+        ],
+    );
+    assert_eq!(stale.code, 65);
+    assert_eq!(stale.stdout_json()["error"]["code"], "stale-scan");
+}

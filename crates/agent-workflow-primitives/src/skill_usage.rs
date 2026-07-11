@@ -16,6 +16,7 @@ use crate::common::{
 use crate::completion::{self, CompletionShell};
 
 const RECORD_SCHEMA_VERSION: &str = "skill-usage.record.v1";
+const RECORD_SCHEMA_VERSION_V2: &str = "skill-usage.record.v2";
 const RECORD_FILE: &str = "skill-usage.record.json";
 const INIT_SCHEMA_VERSION: &str = "cli.skill-usage.init.v1";
 const LINK_RECORD_SCHEMA_VERSION: &str = "cli.skill-usage.link-record.v1";
@@ -219,9 +220,35 @@ fn show(args: CommonArgs) -> i32 {
 }
 
 fn init_record(args: &InitArgs) -> Result<RecordResult, CliError> {
-    ensure_non_empty("--skill", &args.skill)?;
     ensure_non_empty("--intent", &args.intent)?;
     ensure_non_empty("--user-request-summary", &args.user_request_summary)?;
+    let (schema, skill, owner) = match (&args.skill, args.owner_kind, &args.owner_id) {
+        (Some(skill), None, None) => {
+            ensure_non_empty("--skill", skill)?;
+            (RECORD_SCHEMA_VERSION, Some(redact_text(skill)), None)
+        }
+        (None, Some(kind), Some(owner_id)) => {
+            ensure_non_empty("--owner-id", owner_id)?;
+            (
+                RECORD_SCHEMA_VERSION_V2,
+                None,
+                Some(Owner {
+                    kind: kind.as_str().to_string(),
+                    id: redact_text(owner_id),
+                }),
+            )
+        }
+        _ => {
+            return Err(CliError::usage(
+                "invalid-owner",
+                "pass either --skill <id> or both --owner-kind <kind> and --owner-id <id>",
+                Some(json!({
+                    "v1": "--skill <id>",
+                    "v2": "--owner-kind <skill|workflow|intent> --owner-id <id>"
+                })),
+            ));
+        }
+    };
     let path = record_path(&args.common.out_dir, RECORD_FILE)?;
     with_record_lock(&path, || {
         if path.exists() && !args.force {
@@ -246,12 +273,13 @@ fn init_record(args: &InitArgs) -> Result<RecordResult, CliError> {
             })?,
         };
         let record = SkillUsageRecord {
-            schema: RECORD_SCHEMA_VERSION.to_string(),
+            schema: schema.to_string(),
             producer: Some(Producer {
                 tool: "skill-usage".to_string(),
                 nils_cli_version: env!("CARGO_PKG_VERSION").to_string(),
             }),
-            skill: redact_text(&args.skill),
+            skill,
+            owner,
             started_at: match &args.started_at {
                 Some(value) => redact_text(value),
                 None => now_rfc3339()?,
@@ -405,7 +433,6 @@ fn validate_record(value: &Value) -> Vec<Violation> {
 
     for key in [
         "schema",
-        "skill",
         "started_at",
         "cwd",
         "trigger",
@@ -426,15 +453,19 @@ fn validate_record(value: &Value) -> Vec<Violation> {
         }
     }
 
-    if data.get("schema").and_then(Value::as_str) != Some(RECORD_SCHEMA_VERSION) {
+    let schema = data.get("schema").and_then(Value::as_str);
+    if !matches!(
+        schema,
+        Some(RECORD_SCHEMA_VERSION | RECORD_SCHEMA_VERSION_V2)
+    ) {
         violations.push(Violation::new(
             "invalid_schema",
             "$.schema",
-            format!("must equal {RECORD_SCHEMA_VERSION:?}"),
+            format!("must equal {RECORD_SCHEMA_VERSION:?} or {RECORD_SCHEMA_VERSION_V2:?}"),
         ));
     }
 
-    for key in ["skill", "started_at", "cwd", "intent"] {
+    for key in ["started_at", "cwd", "intent"] {
         if let Some(value) = data.get(key) {
             expect_nonempty_string(
                 &mut violations,
@@ -444,6 +475,7 @@ fn validate_record(value: &Value) -> Vec<Violation> {
             );
         }
     }
+    validate_owner(&mut violations, data, schema);
 
     if let Some(trigger) = data.get("trigger").and_then(Value::as_str)
         && !["user_explicit", "agent_selected", "project_policy", "other"].contains(&trigger)
@@ -503,6 +535,62 @@ fn validate_record(value: &Value) -> Vec<Violation> {
 
     scan_secret_like_values(&mut violations, value, "$".to_string());
     violations
+}
+
+fn validate_owner(
+    violations: &mut Vec<Violation>,
+    data: &serde_json::Map<String, Value>,
+    schema: Option<&str>,
+) {
+    match schema {
+        Some(RECORD_SCHEMA_VERSION) => {
+            expect_nonempty_string(
+                violations,
+                data.get("skill").unwrap_or(&Value::Null),
+                "$.skill",
+                "invalid_skill",
+            );
+            if data.contains_key("owner") {
+                violations.push(Violation::new(
+                    "unexpected_owner",
+                    "$.owner",
+                    "v1 records use `skill`, not `owner`",
+                ));
+            }
+        }
+        Some(RECORD_SCHEMA_VERSION_V2) => {
+            if data.contains_key("skill") {
+                violations.push(Violation::new(
+                    "unexpected_skill",
+                    "$.skill",
+                    "v2 records use `owner`, not `skill`",
+                ));
+            }
+            let Some(owner) = data.get("owner").and_then(Value::as_object) else {
+                violations.push(Violation::new(
+                    "invalid_owner",
+                    "$.owner",
+                    "v2 records require an owner object",
+                ));
+                return;
+            };
+            match owner.get("kind").and_then(Value::as_str) {
+                Some("skill" | "workflow" | "intent") => {}
+                _ => violations.push(Violation::new(
+                    "invalid_owner_kind",
+                    "$.owner.kind",
+                    "must be skill, workflow, or intent",
+                )),
+            }
+            expect_nonempty_string(
+                violations,
+                owner.get("id").unwrap_or(&Value::Null),
+                "$.owner.id",
+                "invalid_owner_id",
+            );
+        }
+        _ => {}
+    }
 }
 
 fn validate_producer(violations: &mut Vec<Violation>, value: Option<&Value>) {
@@ -894,8 +982,16 @@ struct InitArgs {
     common: CommonArgs,
 
     /// Skill path or skill id.
-    #[arg(long, value_name = "TEXT")]
-    skill: String,
+    #[arg(long, value_name = "TEXT", conflicts_with = "owner_kind")]
+    skill: Option<String>,
+
+    /// V2 record owner kind. Requires --owner-id and is mutually exclusive with --skill.
+    #[arg(long = "owner-kind", value_enum, requires = "owner_id")]
+    owner_kind: Option<OwnerKind>,
+
+    /// V2 record owner identifier. Requires --owner-kind.
+    #[arg(long = "owner-id", value_name = "TEXT", requires = "owner_kind")]
+    owner_id: Option<String>,
 
     /// Skill invocation intent.
     #[arg(long, value_name = "TEXT")]
@@ -1056,6 +1152,24 @@ enum Trigger {
     Other,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+#[value(rename_all = "kebab-case")]
+enum OwnerKind {
+    Skill,
+    Workflow,
+    Intent,
+}
+
+impl OwnerKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Skill => "skill",
+            Self::Workflow => "workflow",
+            Self::Intent => "intent",
+        }
+    }
+}
+
 impl Trigger {
     fn as_str(self) -> &'static str {
         match self {
@@ -1189,7 +1303,10 @@ struct SkillUsageRecord {
     schema: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     producer: Option<Producer>,
-    skill: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    skill: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    owner: Option<Owner>,
     started_at: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     ended_at: Option<String>,
@@ -1208,6 +1325,12 @@ struct SkillUsageRecord {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     failures: Vec<Failure>,
     follow_up: Vec<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct Owner {
+    kind: String,
+    id: String,
 }
 
 /// Additive provenance block stamped at record creation so an archived record

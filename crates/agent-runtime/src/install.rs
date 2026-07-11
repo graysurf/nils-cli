@@ -23,6 +23,7 @@ pub mod executor;
 pub mod link_map;
 pub mod overlay;
 pub mod plan;
+pub mod receipt;
 
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
@@ -43,6 +44,8 @@ pub enum InstallError {
     Plan(#[from] PlanError),
     #[error("apply: {0}")]
     Apply(#[from] ApplyError),
+    #[error("receipt: {0}")]
+    Receipt(#[from] receipt::ReceiptError),
 }
 
 /// Per-run knobs threaded through to the executor. Plan 04 Sprint 1
@@ -92,6 +95,8 @@ pub struct InstallOutcome {
     /// absent; `Some(summary)` when an overlay was consumed (even if it
     /// changed zero entries — the operator still wants to know it ran).
     pub overlay: Option<OverlaySummary>,
+    /// Portable receipt written only after a successful apply.
+    pub receipt: Option<receipt::InstallReceipt>,
 }
 
 /// Execute one install cycle. Builds the plan from the link-map at
@@ -122,9 +127,15 @@ pub fn run(
     }
     let plan = InstallPlan::build(product, source_root, home, state_home, &link_map)?;
     let changes = executor::run(&plan, mode, now, options.tag.as_deref())?;
+    let receipt = if matches!(mode, Mode::Apply) {
+        Some(receipt::write(&plan, now)?)
+    } else {
+        None
+    };
     Ok(InstallOutcome {
         plan,
         changes,
         overlay: overlay_summary,
+        receipt,
     })
 }

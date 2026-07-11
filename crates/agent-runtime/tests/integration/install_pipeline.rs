@@ -6,6 +6,7 @@
 //! idempotence guarantee the Plan 04 acceptance criteria require.
 
 use agent_runtime::install::{self, AppliedChange, InstallOptions, Mode};
+use serde_json::Value;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
@@ -206,6 +207,20 @@ fn apply_writes_symlinks_and_is_byte_identical_on_second_run() {
     )
     .unwrap();
     let changes_first = __outcome.changes;
+
+    let receipt_path = state_home.join("receipts/claude.json");
+    let receipt: Value = serde_json::from_str(&fs::read_to_string(&receipt_path).unwrap()).unwrap();
+    assert_eq!(receipt["schema"], "agent-runtime.install-receipt.v1");
+    assert_eq!(receipt["product"], "claude");
+    assert!(
+        receipt["install_plan_digest"]
+            .as_str()
+            .unwrap()
+            .starts_with("sha256:")
+    );
+    let receipt_text = fs::read_to_string(&receipt_path).unwrap();
+    assert!(!receipt_text.contains(source_root.to_str().unwrap()));
+    assert!(!receipt_text.contains(home.to_str().unwrap()));
     // First apply: every action is a SymlinkCreated (fresh home).
     for c in &changes_first {
         assert!(

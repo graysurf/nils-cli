@@ -6,9 +6,11 @@ pub mod content;
 pub mod env;
 pub mod model;
 pub mod output;
+pub mod path_classes;
 pub mod paths;
 pub mod predicate;
 pub mod resolver;
+mod session;
 
 use clap::Parser;
 
@@ -249,6 +251,7 @@ fn dispatch(cli: Cli) -> i32 {
                 }
             }
         }
+        Command::Session(args) => session::run(args, overrides, fallback_mode),
         Command::Completion(args) => completion::run(args.shell),
     }
 }
