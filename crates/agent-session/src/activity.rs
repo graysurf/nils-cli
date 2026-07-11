@@ -576,6 +576,25 @@ fn event_dedupe_key(runtime_id: &str, event_id: &str) -> [u8; REPLAY_SLOT_BYTES]
     key
 }
 
+fn stable_hermes_approval_event_id(
+    runtime_id: &str,
+    kind: &TurnEventKind,
+    projected_tool_call_id: &str,
+) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"agent-session.provider-replay.v1\0");
+    digest.update(runtime_id.as_bytes());
+    digest.update(b"\0");
+    digest.update(match kind {
+        TurnEventKind::AttentionRequested => b"attention_requested".as_slice(),
+        TurnEventKind::AttentionCleared => b"attention_cleared".as_slice(),
+        _ => unreachable!("Hermes approval event kind"),
+    });
+    digest.update(b"\0");
+    digest.update(projected_tool_call_id.as_bytes());
+    format!("local:v1:{}", hex_digest(digest.finalize()))
+}
+
 fn semantic_event_key(event: &TurnEvent) -> String {
     let mut digest = Sha256::new();
     digest.update(b"agent-session.semantic-event.v1\0");
@@ -1752,9 +1771,20 @@ fn normalize_provider_hook(
         TurnEventKind::AttentionCleared => exact_attention_id,
         _ => None,
     };
+    let event_id = if exact_hermes_approval && !attention_correlation_ambiguous {
+        stable_hermes_approval_event_id(
+            runtime_id,
+            &kind,
+            attention_id
+                .as_deref()
+                .expect("exact Hermes approval correlation"),
+        )
+    } else {
+        uuid::Uuid::new_v4().to_string()
+    };
     Ok(Some(TurnEvent {
         schema_version: TURN_EVENT_VERSION.to_string(),
-        event_id: uuid::Uuid::new_v4().to_string(),
+        event_id,
         runtime_id: runtime_id.to_string(),
         provider: agent.as_str().to_string(),
         provider_session_id,
@@ -4415,6 +4445,89 @@ mod tests {
         assert!(!snapshot.contains("turn-1"));
         assert!(!journal.contains("session-1"));
         assert!(!journal.contains("turn-1"));
+    }
+
+    #[test]
+    fn exact_hermes_replay_survives_restart_and_bounded_journal_eviction() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let context = CliContext {
+            state_dir: tmp.path().join("state"),
+            host: None,
+        };
+        let cwd = tmp.path().join("repo");
+        fs::create_dir_all(&cwd).expect("repo dir");
+        let created = create_record(RecordRequest {
+            context: &context,
+            agent: AgentKind::Hermes,
+            mode: "interactive",
+            title: None,
+            explicit_id: Some("hermes-replay-horizon"),
+            cwd: &cwd,
+            prompt: None,
+            log_file_name: None,
+            provider_resume: None,
+            agent_args: Vec::new(),
+            agent_bin: None,
+        })
+        .expect("Hermes session");
+        let runtime_id = created
+            .record
+            .runtime
+            .as_ref()
+            .expect("runtime")
+            .launch_id
+            .clone();
+        let raw = json!({
+            "hook_event_name": "pre_approval_request",
+            "session_id": "",
+            "extra": {
+                "command": "discarded-command",
+                "description": "discarded-description",
+                "pattern_key": "discarded-pattern",
+                "pattern_keys": ["discarded-pattern"],
+                "session_key": "provider-session",
+                "surface": "shell",
+                "turn_id": "provider-turn",
+                "tool_call_id": "exact-tool-call"
+            }
+        });
+        let exact = normalize_provider_hook(AgentKind::Hermes, None, &runtime_id, &raw)
+            .expect("normalize exact approval")
+            .expect("exact approval event");
+        let first = ingest_event(&context, &created.record.id, exact.clone())
+            .expect("first exact approval");
+        assert_eq!(first.turn_state.phase, TurnPhase::NeedsInput);
+
+        for index in 0..=(MAX_JOURNAL_EVENTS + 20) {
+            let mut progress = exact.clone();
+            progress.event_id = format!("eviction-progress-{index}");
+            progress.kind = TurnEventKind::Progress;
+            progress.attention_id = None;
+            progress.attention_kind = None;
+            progress.provider_turn_id = Some(format!("eviction-turn-{index}"));
+            ingest_event(&context, &created.record.id, progress).expect("accepted progress");
+        }
+
+        let dir = session_dir(&context, &created.record.id);
+        let journal_path = dir.join(ACTIVITY_JOURNAL_FILE);
+        let journal_before = fs::read_to_string(&journal_path).expect("bounded journal");
+        assert!(!journal_before.contains("attention_requested"));
+        let before = activity_status(&context, &created.record.id)
+            .expect("status before replay")
+            .turn_state;
+        let restarted_replay = normalize_provider_hook(AgentKind::Hermes, None, &runtime_id, &raw)
+            .expect("normalize replay after restart")
+            .expect("replayed exact approval event");
+        assert_eq!(restarted_replay.event_id, exact.event_id);
+        let replay = ingest_event(&context, &created.record.id, restarted_replay)
+            .expect("replay after bounded eviction");
+        assert!(replay.duplicate);
+        assert_eq!(replay.turn_state.revision, before.revision);
+        assert_eq!(replay.turn_state.phase, before.phase);
+        assert_eq!(
+            fs::read_to_string(journal_path).expect("journal after replay"),
+            journal_before
+        );
     }
 
     #[test]

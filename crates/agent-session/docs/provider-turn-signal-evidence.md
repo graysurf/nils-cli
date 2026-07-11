@@ -114,7 +114,10 @@ the same non-empty `tool_call_id` on pre/post. The adapter reads only allowliste
 extra fields, falls back to non-empty `extra.session_key`, and projects the
 tool-call id as an exact runtime-scoped correlation. Identical commands with
 different tool-call ids therefore clear independently and out of order;
-replayed exact callbacks are idempotent. Missing, null, or empty tool-call ids
+the event kind and projected tool-call id also derive a stable event id in the
+runtime replay index, so exact callbacks stay idempotent across interleaving,
+elapsed time, clearing, restart, and bounded journal eviction. Missing, null,
+or empty tool-call ids
 retain the older tuple fallback over `command`, `description`, `pattern_key`,
 `pattern_keys`, `session_key`, and `surface`. That tuple is canonicalized only
 in memory and projected by SHA-256; duplicate-identical fallback concurrency
@@ -130,7 +133,8 @@ The executable fixtures cover:
   metadata-only `pending_count`;
 - the frozen Hermes 0.18.2 shell envelope with nested `extra`, empty top-level
   session id, exact tool-call replay/ordering, missing/empty-id fallback, stale
-  runtime rejection, sanitized diagnostics, and raw-field non-persistence;
+  runtime rejection, sanitized diagnostics, raw-field non-persistence, restart,
+  and bounded journal eviction;
 - exact AskUserQuestion request/success/failure correlation and independent
   clearing alongside unrelated generic attention;
 - unrelated progress while attention is pending, including monotonic

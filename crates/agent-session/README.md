@@ -114,7 +114,9 @@ envelope. A non-empty tool-call id is projected into an exact runtime-scoped
 pre/post correlation; missing or empty ids retain the conservative compatibility tuple
 fallback. Empty top-level session ids fall back to the nested session key. Raw
 approval kwargs are discarded before persistence, and malformed metadata stays
-fail-open with a sanitized diagnostic code.
+fail-open with a sanitized diagnostic code. Exact callbacks also derive a
+kind-specific stable event id from the projected tool-call id, so replay remains
+idempotent across interleaving, process restarts, and bounded journal eviction.
 
 Codex itself appends the full notification JSON to the configured command argv.
 Agent-session discards content after parsing and never prints or persists it,

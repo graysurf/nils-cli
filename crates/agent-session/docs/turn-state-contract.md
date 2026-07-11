@@ -149,8 +149,12 @@ Hermes 0.18.2 shell hooks put approval kwargs under the allowlisted `extra`
 object and may leave top-level `session_id` empty. Agent-session falls back to
 `extra.session_key`, projects non-empty `extra.tool_call_id` as the exact
 runtime-scoped pre/post correlation, and treats replayed exact callbacks
-idempotently. This lets identical command tuples with different tool-call ids
-clear independently and out of order. Missing, null, or empty tool-call ids use
+idempotently. The event kind and projected tool-call id derive a stable
+runtime-scoped event id retained by the bounded replay index, so interleaving,
+elapsed wall time, response clearing, process restart, and bounded journal
+eviction cannot reopen a delivered callback. This lets identical command tuples
+with different tool-call ids clear independently and out of order. Missing,
+null, or empty tool-call ids use
 the compatibility tuple fallback: `command`, `description`, `pattern_key`,
 sorted/deduplicated `pattern_keys`, `session_key`, and `surface` are
 canonicalized only in memory and their SHA-256 is projected. Identical fallback

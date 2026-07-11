@@ -989,6 +989,36 @@ fn hermes_shell_wire_approvals_use_exact_ids_and_compatibility_fallback() {
     let second_revision = second_state["revision"].as_u64().expect("second revision");
     assert!(second_revision > first_revision);
 
+    let journal_path = session_dir.join("activity.journal.jsonl");
+    let before_interleaved_replay =
+        fs::read_to_string(&journal_path).expect("journal before interleaved replay");
+    let interleaved_replay = hook(&fixture[0]);
+    assert_eq!(interleaved_replay.code, 0);
+    let interleaved_replay_state = state();
+    assert_eq!(interleaved_replay_state["revision"], second_revision);
+    assert_eq!(
+        interleaved_replay_state["current_turn"]["attention"]["pending_count"],
+        2
+    );
+    assert_eq!(
+        fs::read_to_string(&journal_path).expect("journal after interleaved replay"),
+        before_interleaved_replay
+    );
+
+    thread::sleep(Duration::from_millis(1_100));
+    let delayed_replay = hook(&fixture[0]);
+    assert_eq!(delayed_replay.code, 0);
+    let delayed_replay_state = state();
+    assert_eq!(delayed_replay_state["revision"], second_revision);
+    assert_eq!(
+        delayed_replay_state["current_turn"]["attention"]["pending_count"],
+        2
+    );
+    assert_eq!(
+        fs::read_to_string(&journal_path).expect("journal after delayed replay"),
+        before_interleaved_replay
+    );
+
     let post_b = hook(&fixture[2]);
     assert_eq!(post_b.code, 0, "stderr={}", post_b.stderr_text());
     let post_b_state = state();
@@ -1043,6 +1073,19 @@ fn hermes_shell_wire_approvals_use_exact_ids_and_compatibility_fallback() {
     assert_eq!(post_a_state["phase"], "working");
     assert!(post_a_state["current_turn"]["attention"].is_null());
     let cleared_revision = post_a_state["revision"].as_u64().expect("cleared revision");
+
+    let before_cleared_pre_replay =
+        fs::read_to_string(&journal_path).expect("journal before cleared pre replay");
+    let cleared_pre_replay = hook(&fixture[0]);
+    assert_eq!(cleared_pre_replay.code, 0);
+    let cleared_pre_replay_state = state();
+    assert_eq!(cleared_pre_replay_state["phase"], "working");
+    assert!(cleared_pre_replay_state["current_turn"]["attention"].is_null());
+    assert_eq!(cleared_pre_replay_state["revision"], cleared_revision);
+    assert_eq!(
+        fs::read_to_string(&journal_path).expect("journal after cleared pre replay"),
+        before_cleared_pre_replay
+    );
 
     let fallback_pending = hook(&fixture[4]);
     assert_eq!(fallback_pending.code, 0);
