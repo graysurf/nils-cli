@@ -5448,6 +5448,44 @@ mod tests {
         assert_eq!(body["error"]["code"], "session-not-found");
     }
 
+    #[tokio::test]
+    async fn unique_session_prefix_supports_title_update_and_resume() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let state_dir = tmp.path().join("state");
+        let cwd = tmp.path().join("repo");
+        std::fs::create_dir_all(&cwd).unwrap();
+        seed_resumable_session(
+            &state_dir,
+            "unique-prefix-session-long",
+            "codex",
+            "hs-unique-prefix-session-long",
+            &cwd,
+            &["resume", "resume-session-id"],
+        );
+        let st = state(&state_dir, Some(TOKEN), minimal_tmux(tmp.path()));
+
+        let (status, body) = call(
+            router(st.clone()),
+            patch_json(
+                "/sessions/unique-prefix",
+                Some(TOKEN),
+                json!({ "title": "Prefix title" }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "body={body}");
+        assert_eq!(body["data"]["session"]["id"], "unique-prefix-session-long");
+        assert_eq!(body["data"]["session"]["title"], "Prefix title");
+
+        let (status, body) = call(
+            router(st),
+            post_json("/sessions/unique-prefix/resume", Some(TOKEN), json!({})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "body={body}");
+        assert_eq!(body["data"]["session"]["id"], "unique-prefix-session-long");
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn resume_transition_serializes_concurrent_title_mutation() {
         let tmp = tempfile::TempDir::new().expect("tempdir");

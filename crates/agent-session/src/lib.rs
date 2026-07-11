@@ -1953,9 +1953,9 @@ fn resume_session_by_id(
     // Preserve not-found semantics before creating the private lock file, then
     // serialize the entire resume transition (including launch and rollback)
     // against title, hook, timestamp, and backfill writers.
-    let _ = load_session_record(context, id)?;
-    let _record_lock = acquire_session_record_lock(context, id)?;
-    let mut record = load_session_record(context, id)?;
+    let canonical_id = load_session_record(context, id)?.id;
+    let _record_lock = acquire_session_record_lock(context, &canonical_id)?;
+    let mut record = load_session_record(context, &canonical_id)?;
     match session_status(tmux_bin, &record).as_str() {
         "running" => {
             return Ok(session_view(
@@ -2735,9 +2735,9 @@ where
 {
     // Preserve the public not-found contract before touching the private lock
     // file; the authoritative record is reloaded after the lock is acquired.
-    let _ = load_session_record(context, id)?;
-    let _lock = acquire_session_record_lock(context, id)?;
-    let mut record = load_session_record(context, id)?;
+    let canonical_id = load_session_record(context, id)?.id;
+    let _lock = acquire_session_record_lock(context, &canonical_id)?;
+    let mut record = load_session_record(context, &canonical_id)?;
     let result = mutate(&mut record)?;
     write_session_record(context, &record)?;
     Ok(result)
