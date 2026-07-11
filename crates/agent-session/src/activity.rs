@@ -17,7 +17,10 @@ use sha2::{Digest, Sha256};
 use toml_edit::{Array as TomlArray, DocumentMut as TomlDocument, value as toml_value};
 
 use crate::cli::AgentKind;
-use crate::{CliContext, CliError, SessionRecord, load_session_record, session_dir};
+use crate::{
+    CliContext, CliError, ProviderResume, SessionRecord, canonical_provider_resume_args,
+    load_session_record, mutate_session_record, session_dir,
+};
 
 pub(crate) const TURN_EVENT_VERSION: &str = "agent-session.turn-event.v1";
 pub(crate) const TURN_STATE_VERSION: &str = "agent-session.turn-state.v1";
@@ -1104,8 +1107,99 @@ pub(crate) fn ingest_provider_hook(
     let Some(event) = normalize_provider_hook(agent, event_override, &runtime_id, &raw)? else {
         return Ok(false);
     };
+    let provider_resume = provider_resume_from_user_prompt_hook(
+        context,
+        &id,
+        agent,
+        &runtime_id,
+        event_override,
+        &raw,
+    );
     let _ = ingest_event(context, &id, event)?;
+    provider_resume?;
     Ok(true)
+}
+
+fn provider_resume_from_user_prompt_hook(
+    context: &CliContext,
+    id: &str,
+    agent: AgentKind,
+    runtime_id: &str,
+    event_override: Option<&str>,
+    raw: &Value,
+) -> Result<(), CliError> {
+    let event_name = event_override
+        .or_else(|| raw.get("hook_event_name").and_then(Value::as_str))
+        .or_else(|| raw.get("event").and_then(Value::as_str));
+    if agent != AgentKind::Codex || event_name != Some("UserPromptSubmit") {
+        return Ok(());
+    }
+    let Some(session_id) = raw
+        .get("session_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(());
+    };
+    mutate_session_record(context, id, |record| {
+        let runtime_matches = record
+            .runtime
+            .as_ref()
+            .is_some_and(|runtime| runtime.launch_id == runtime_id);
+        if record.agent != agent.as_str() || !runtime_matches {
+            return Err(CliError::data(
+                "provider-hook-runtime-mismatch",
+                "provider hook runtime does not match the active session runtime",
+                None,
+            ));
+        }
+        if let Some(existing) = record.provider_resume.as_ref() {
+            if existing.provider == agent.as_str() && existing.session_id == session_id {
+                let resume_args = canonical_provider_resume_args(agent, &record.cwd, session_id)
+                    .ok_or_else(|| {
+                        CliError::data(
+                            "provider-hook-session-invalid",
+                            "provider hook session identity cannot be resumed",
+                            None,
+                        )
+                    })?;
+                if existing.capture_method == "codex-user-prompt-submit-hook"
+                    && existing.resume_args == resume_args
+                {
+                    return Ok(());
+                }
+                let mut promoted = existing.clone();
+                promoted.captured_at = Zoned::now().timestamp().to_string();
+                promoted.capture_method = "codex-user-prompt-submit-hook".to_string();
+                promoted.resume_args = resume_args;
+                record.provider_resume = Some(promoted);
+                return Ok(());
+            }
+            return Err(CliError::data(
+                "provider-hook-session-mismatch",
+                "provider hook session identity conflicts with the durable session identity",
+                None,
+            ));
+        }
+        let resume_args = canonical_provider_resume_args(agent, &record.cwd, session_id)
+            .ok_or_else(|| {
+                CliError::data(
+                    "provider-hook-session-invalid",
+                    "provider hook session identity cannot be resumed",
+                    None,
+                )
+            })?;
+        record.provider_resume = Some(ProviderResume {
+            provider: agent.as_str().to_string(),
+            session_id: session_id.to_string(),
+            captured_at: Zoned::now().timestamp().to_string(),
+            capture_method: "codex-user-prompt-submit-hook".to_string(),
+            resume_args,
+            extra: BTreeMap::new(),
+        });
+        Ok(())
+    })
 }
 
 pub(crate) fn ingest_provider_hook_fail_open(
@@ -2769,6 +2863,7 @@ mod tests {
     use crate::{CliContext, ProviderResume, RecordRequest, create_record, write_session_record};
     use pretty_assertions::assert_eq;
     use std::collections::BTreeMap;
+    use std::sync::{Arc, Barrier};
 
     fn event(kind: TurnEventKind, event_id: &str) -> TurnEvent {
         TurnEvent {
@@ -2845,6 +2940,227 @@ mod tests {
         })
         .expect("test session");
         (context, created)
+    }
+
+    #[test]
+    fn codex_user_prompt_hook_persists_exact_runtime_provider_identity() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let context = CliContext {
+            state_dir: tmp.path().join("state"),
+            host: None,
+        };
+        let cwd = tmp.path().join("repo");
+        fs::create_dir_all(&cwd).expect("repo dir");
+        let created = create_record(RecordRequest {
+            context: &context,
+            agent: AgentKind::Codex,
+            mode: "interactive",
+            title: None,
+            explicit_id: Some("hook-identity"),
+            cwd: &cwd,
+            prompt: None,
+            log_file_name: None,
+            provider_resume: None,
+            agent_args: Vec::new(),
+            agent_bin: None,
+        })
+        .expect("test session");
+        let runtime_id = created
+            .record
+            .runtime
+            .as_ref()
+            .expect("runtime")
+            .launch_id
+            .clone();
+        let raw = json!({
+            "hook_event_name":"UserPromptSubmit",
+            "session_id":"exact-codex-session",
+            "turn_id":"turn-1"
+        });
+
+        provider_resume_from_user_prompt_hook(
+            &context,
+            &created.record.id,
+            AgentKind::Codex,
+            &runtime_id,
+            None,
+            &raw,
+        )
+        .expect("capture identity");
+        let record = load_session_record(&context, &created.record.id).expect("session record");
+        let resume = record.provider_resume.expect("provider resume");
+        assert_eq!(resume.provider, "codex");
+        assert_eq!(resume.session_id, "exact-codex-session");
+        assert_eq!(resume.capture_method, "codex-user-prompt-submit-hook");
+        assert_eq!(
+            &resume.resume_args[..2],
+            &["resume".to_string(), "exact-codex-session".to_string()]
+        );
+        assert!(resume.resume_args.iter().any(|arg| arg == "--cd"));
+
+        let error = provider_resume_from_user_prompt_hook(
+            &context,
+            &created.record.id,
+            AgentKind::Codex,
+            "different-runtime",
+            None,
+            &json!({
+                "hook_event_name":"UserPromptSubmit",
+                "session_id":"other-session"
+            }),
+        )
+        .expect_err("wrong runtime must fail closed");
+        assert_eq!(error.code(), "provider-hook-runtime-mismatch");
+        let record = load_session_record(&context, &created.record.id).expect("session record");
+        assert_eq!(
+            record.provider_resume.expect("provider resume").session_id,
+            "exact-codex-session"
+        );
+    }
+
+    #[test]
+    fn codex_user_prompt_hook_promotes_matching_heuristic_identity() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let context = CliContext {
+            state_dir: tmp.path().join("state"),
+            host: None,
+        };
+        let cwd = tmp.path().join("repo");
+        fs::create_dir_all(&cwd).expect("repo dir");
+        let created = create_record(RecordRequest {
+            context: &context,
+            agent: AgentKind::Codex,
+            mode: "interactive",
+            title: None,
+            explicit_id: Some("hook-promotes-heuristic"),
+            cwd: &cwd,
+            prompt: None,
+            log_file_name: None,
+            provider_resume: Some(ProviderResume {
+                provider: "codex".to_string(),
+                session_id: "exact-codex-session".to_string(),
+                captured_at: "2026-07-10T00:00:00Z".to_string(),
+                capture_method: "codex-session-meta".to_string(),
+                resume_args: Vec::new(),
+                extra: BTreeMap::new(),
+            }),
+            agent_args: Vec::new(),
+            agent_bin: None,
+        })
+        .expect("test session");
+        let runtime_id = created
+            .record
+            .runtime
+            .as_ref()
+            .expect("runtime")
+            .launch_id
+            .clone();
+
+        provider_resume_from_user_prompt_hook(
+            &context,
+            &created.record.id,
+            AgentKind::Codex,
+            &runtime_id,
+            None,
+            &json!({
+                "hook_event_name":"UserPromptSubmit",
+                "session_id":"exact-codex-session"
+            }),
+        )
+        .expect("promote matching identity");
+
+        let record = load_session_record(&context, &created.record.id).expect("session record");
+        let resume = record.provider_resume.expect("provider resume");
+        assert_eq!(resume.capture_method, "codex-user-prompt-submit-hook");
+        assert_eq!(
+            &resume.resume_args[..2],
+            &["resume".to_string(), "exact-codex-session".to_string()]
+        );
+    }
+
+    #[test]
+    fn provider_identity_and_title_updates_are_serialized_without_lost_fields() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let context = CliContext {
+            state_dir: tmp.path().join("state"),
+            host: None,
+        };
+        let cwd = tmp.path().join("repo");
+        fs::create_dir_all(&cwd).expect("repo dir");
+        let created = create_record(RecordRequest {
+            context: &context,
+            agent: AgentKind::Codex,
+            mode: "interactive",
+            title: None,
+            explicit_id: Some("concurrent-session-mutations"),
+            cwd: &cwd,
+            prompt: None,
+            log_file_name: None,
+            provider_resume: None,
+            agent_args: Vec::new(),
+            agent_bin: None,
+        })
+        .expect("test session");
+        let runtime_id = created
+            .record
+            .runtime
+            .as_ref()
+            .expect("runtime")
+            .launch_id
+            .clone();
+        let barrier = Arc::new(Barrier::new(3));
+        let hook = {
+            let context = context.clone();
+            let id = created.record.id.clone();
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                barrier.wait();
+                provider_resume_from_user_prompt_hook(
+                    &context,
+                    &id,
+                    AgentKind::Codex,
+                    &runtime_id,
+                    None,
+                    &json!({
+                        "hook_event_name":"UserPromptSubmit",
+                        "session_id":"concurrent-provider-session"
+                    }),
+                )
+            })
+        };
+        let title = {
+            let context = context.clone();
+            let id = created.record.id.clone();
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                barrier.wait();
+                crate::update_session_title(
+                    &context,
+                    &id,
+                    Some("Concurrent title".to_string()),
+                    Path::new("/bin/false"),
+                )
+            })
+        };
+        barrier.wait();
+        hook.join().expect("hook thread").expect("hook update");
+        title.join().expect("title thread").expect("title update");
+
+        let record = load_session_record(&context, &created.record.id).expect("session record");
+        assert_eq!(record.title.as_deref(), Some("Concurrent title"));
+        assert_eq!(
+            record
+                .provider_resume
+                .as_ref()
+                .expect("provider resume")
+                .session_id,
+            "concurrent-provider-session"
+        );
+        assert!(
+            session_dir(&context, &created.record.id)
+                .join(crate::SESSION_RESUME_FILE)
+                .is_file()
+        );
     }
 
     #[test]

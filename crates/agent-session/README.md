@@ -167,9 +167,22 @@ is no second state model.
   `{ "text": "...", "key": "enter", "keys": ["c-c"], "resize": { "cols": 80, "rows": 24 } }`. Token-gated; disconnect
   leaves the tmux session alive. Concurrent clients share the pane geometry; resize sequences are serialized and the
   last completed resize wins. A client may opt into authoritative Codex/Claude prompt events by sending
-  `{ "subscribe": ["provider-prompt.v1"] }`. The daemon baselines the exact provider transcript at EOF, replies with an
-  `agent-session.attach.v1` `capability` text frame, and only after that acknowledgement emits later `prompt_submitted`
-  events as bounded text frames; terminal snapshot/live output remains binary. The normative supported acknowledgement is:
+  `{ "subscribe": ["provider-prompt.v1"] }`. For a known, resumed, imported, or reconnected provider session, the daemon
+  baselines the exact provider transcript at EOF. When a generation-1 fresh Codex/Claude runtime is still establishing its
+  exact provider identity or transcript, the connection instead keeps a bounded, cancellable resolver alive, reloads the
+  same launch's session metadata, and opens that fresh transcript from its beginning so the first prompt is not lost.
+  Codex `UserPromptSubmit` hook metadata supplies the exact runtime-bound session identity; the pending attach path never
+  promotes cwd/time history scans into beginning-of-transcript authority. Transcript discovery is shared by runtime across
+  attach clients, is owned by the daemon across waiter cancellation, uses bounded exponential backoff, and admits at most
+  four concurrent history scans. Active slots are never capacity-evicted; obsolete runtime keys and deleted sessions are
+  evicted, and a fixed daemon-local entry cap bounds unrelated session churn. Reconnects
+  baseline the revalidated cached exact source at EOF. Passive list/glance reads never persist heuristic Codex history
+  into a live generation-1 runtime, and fresh Codex byte-zero recovery admits only `codex-user-prompt-submit-hook`
+  identity. Explicit stopped-session resume may recover older provider history while holding the same per-session record lock for
+  its complete resume/rollback transition. It
+  replies with an `agent-session.attach.v1` `capability` text frame once resolution finishes, and only after that
+  acknowledgement emits `prompt_submitted` events as bounded text frames; terminal snapshot/live output remains binary.
+  The normative supported acknowledgement is:
 
   ```json
   {
@@ -183,9 +196,13 @@ is no second state model.
   ```
 
   `provider` is `"codex"` or `"claude"` when supported and `null` otherwise; an unsupported provider, unresolved exact
-  transcript, unsafe transcript path, exhausted discovery budget, or session without already persisted exact provider
-  identity returns the same object with `supported:false`. Prompt subscription never uses cwd/time-window history
-  heuristics to invent provider identity; sessions without exact identity remain on the consumer's fallback path.
+  transcript, unsafe transcript path, exhausted discovery budget, or expired fresh-runtime resolution returns the same
+  object with `supported:false`. The fresh-runtime resolver is restricted to the original generation-1 launch identity:
+  Codex must have had no provider identity when the client subscribed, and Claude must carry the daemon-generated
+  `claude-explicit-session-id` capture method. Imported, resumed, replaced, and later-generation runtimes never enter the
+  beginning-of-transcript path, so reconnect retains EOF/no-history behavior. While resolution is pending, terminal bytes,
+  input, resize, and broker fanout continue independently; consumers may activate their bounded local fallback before the
+  eventual acknowledgement.
   Clients that do not subscribe receive no event text frames. The normative event is:
 
   ```json
