@@ -14,7 +14,7 @@
   `docs/plans/2026-07-12-codex-otel-auto-resume/codex-otel-auto-resume-discussion-source.md`
 - Plan document:
   `docs/plans/2026-07-12-codex-otel-auto-resume/codex-otel-auto-resume-plan.md`
-- Tracking issue: pending
+- Tracking issue: <https://github.com/sympoies/nils-cli/issues/1144>
 
 ## Task Ledger
 
