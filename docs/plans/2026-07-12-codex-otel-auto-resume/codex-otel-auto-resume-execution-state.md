@@ -3,10 +3,11 @@
 <!-- plan-issue-record:v2 role=state profile=tracking -->
 ## Execution State
 
-- Status: complete — blocked verdict
+- Status: complete
+- Outcome: blocked for the current Codex TUI runtime
 - Target scope: prove or reject a content-free OTel trigger for exact Codex TUI
   usage exhaustion.
-- Current task: complete — the quota-specific classification item failed.
+- Current task: none; the quota-specific classification item failed.
 - Next task: none until Codex exposes a structured TUI quota failure field or
   the runtime boundary moves to an app-server-owned client.
 - Last updated: 2026-07-12
