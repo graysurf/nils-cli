@@ -81,6 +81,8 @@ pub fn run_plan_issue_local_with_env(args: &[&str], env: &[(&str, &str)]) -> Cmd
 ///   of `issue view --with-comments`. Defaults to `[]`.
 /// - `FORGE_CLI_STUB_CREATE_URL`: URL returned by `issue create`.
 /// - `FORGE_CLI_STUB_COMMENT_URL`: URL returned by `issue comment`.
+/// - `FORGE_CLI_STUB_EDIT_LABELS_JSON`: provider-observed JSON label array
+///   returned by `issue edit`. Defaults to `[]`.
 /// - `FORGE_CLI_STUB_CAPTURE_BODY_FILE`: copy the `issue edit --body-file`
 ///   payload here.
 /// - `FORGE_CLI_STUB_CAPTURE_COMMENT_FILE`: copy the `issue comment
@@ -212,7 +214,8 @@ case "$group $verb" in
     if [[ -n "${FORGE_CLI_STUB_CAPTURE_BODY_FILE:-}" && -n "$body_file" ]]; then
       cp "$body_file" "$FORGE_CLI_STUB_CAPTURE_BODY_FILE"
     fi
-    emit "{\"ok\":true,\"schema_version\":\"cli.forge-cli.issue.edit.v1\",\"data\":{\"provider\":\"$provider\",\"number\":$id,\"url\":\"https://github.com/$repo/issues/$id\",\"state\":\"open\",\"title\":\"t\",\"labels\":[],\"assignees\":[]}}"
+    labels_json="${FORGE_CLI_STUB_EDIT_LABELS_JSON:-[]}"
+    emit "{\"ok\":true,\"schema_version\":\"cli.forge-cli.issue.edit.v1\",\"data\":{\"provider\":\"$provider\",\"number\":$id,\"url\":\"https://github.com/$repo/issues/$id\",\"state\":\"open\",\"title\":\"t\",\"labels\":$labels_json,\"assignees\":[]}}"
     ;;
   "issue comment")
     maybe_reject_local_path "comment"
