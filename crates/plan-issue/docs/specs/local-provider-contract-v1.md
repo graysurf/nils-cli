@@ -214,22 +214,24 @@ reading):
 ## Per-Method Contract
 
 The table is ordered to match the trait definition in
-`crates/plan-issue/src/github.rs:10`. Every signature takes `repo: &str`
+`crates/plan-issue/src/adapter.rs`. Every signature takes `repo: &str`
 (the slug) as its first argument.
 
 | # | Method | Returns | Local implementation | Kind |
 | --- | --- | --- | --- | --- |
 | 1 | `issue_body(repo, issue)` | `String` | read `issues/<n>.json` `.body` | REAL |
 | 2 | `issue_evidence(repo, issue)` | `(String, String)` = (body, comments_json) | read `.body` + serialize `.comments` into the `gh issue view --json comments` shape | REAL |
-| 3 | `list_open_tracker_issues(repo, labels)` | `Vec<u64>` | scan `issues/`, keep `state==open` AND `labels ⊇ requested` (AND semantics; an empty slice lists every open issue) | REAL |
-| 4 | `create_issue(repo, title, body_file, labels)` | `(u64, String)` = (number, url) | alloc `next_issue`, write `issues/<n>.json`, return `(n, synthetic url)` | REAL |
-| 5 | `edit_issue_body(repo, issue, body_file)` | `()` | overwrite `.body` | REAL |
-| 6 | `comment_issue(repo, issue, body_file)` | `String` = comment url | append to `.comments`, return its `local://` url | REAL |
-| 7 | `edit_issue_labels(repo, issue, add, remove)` | `()` | mutate the `.labels` set (add then remove) | REAL |
-| 8 | `close_issue(repo, issue, reason, comment)` | `()` | set `state=closed`, store `close_reason` natively, append optional close comment | REAL |
-| 9 | `pr_is_merged(repo, pr)` | `bool` | read seeded `prs/<n>.json` `.merged` | STUB |
-| 10 | `pr_merge_summary(repo, pr)` | `PrMergeSummary` | read seeded `PrRecord` into the struct | STUB |
-| 11 | `pr_comments(repo, pr)` | `Vec<Value>` (≥ `body`, `html_url`) | read seeded `.comments` | STUB |
+| 3 | `issue_labels(repo, issue)` | `Vec<String>` | read `issues/<n>.json` `.labels` | REAL |
+| 4 | `repository_labels(repo)` | `Vec<String>` | no Local repository catalog exists; `record close` branches on `Provider::Local` and must not invoke this method | UNSUPPORTED |
+| 5 | `list_open_tracker_issues(repo, labels)` | `Vec<u64>` | scan `issues/`, keep `state==open` AND `labels ⊇ requested` (AND semantics; an empty slice lists every open issue) | REAL |
+| 6 | `create_issue(repo, title, body_file, labels)` | `(u64, String)` = (number, url) | alloc `next_issue`, write `issues/<n>.json`, return `(n, synthetic url)` | REAL |
+| 7 | `edit_issue_body(repo, issue, body_file)` | `()` | overwrite `.body` | REAL |
+| 8 | `comment_issue(repo, issue, body_file)` | `String` = comment url | append to `.comments`, return its `local://` url | REAL |
+| 9 | `edit_issue_labels(repo, issue, add, remove)` | `()` | mutate the `.labels` set (add then remove) | REAL |
+| 10 | `close_issue(repo, issue, reason, comment)` | `()` | set `state=closed`, store `close_reason` natively, append optional close comment | REAL |
+| 11 | `pr_is_merged(repo, pr)` | `bool` | read seeded `prs/<n>.json` `.merged` | STUB |
+| 12 | `pr_merge_summary(repo, pr)` | `PrMergeSummary` | read seeded `PrRecord` into the struct | STUB |
+| 13 | `pr_comments(repo, pr)` | `Vec<Value>` (≥ `body`, `html_url`) | read seeded `.comments` | STUB |
 
 Notes:
 
