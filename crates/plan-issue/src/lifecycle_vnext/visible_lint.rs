@@ -12,6 +12,7 @@
 
 use crate::lifecycle_record::PayloadRole;
 use crate::lifecycle_vnext::registry::{self, RoleSpec};
+use pulldown_cmark::{Event, Options, Parser, Tag, TagEnd};
 
 /// Stable, role-specific failure codes emitted by the lint. Runtime-kit
 /// smoke and skill flows pattern-match on these strings, so each code is
@@ -383,16 +384,216 @@ fn is_table_separator(line: &str) -> bool {
 
 fn body_contains_review_disposition_row(body: &str) -> bool {
     let dispositions = ["fixed", "residual", "follow-up", "deferred", "no-action"];
-    body.lines().any(|line| {
-        let trimmed = line.trim();
-        if !trimmed.starts_with('|') {
-            return false;
+    let finding_headers = ["ID", "Severity", "Disposition", "Summary"];
+    let mut options = Options::empty();
+    options.insert(Options::ENABLE_TABLES);
+    let events = Parser::new_ext(body, options)
+        .into_offset_iter()
+        .collect::<Vec<_>>();
+    let code_ranges = events
+        .iter()
+        .filter_map(|(event, range)| {
+            matches!(event, Event::Code(_) | Event::Start(Tag::CodeBlock(_)))
+                .then_some(range.clone())
+                .or_else(|| {
+                    matches!(event, Event::Start(Tag::HtmlBlock))
+                        .then(|| {
+                            (markdown_line_is_code_indented(body, range.start)
+                                || markdown_html_block_is_raw_text_literal(body, range))
+                            .then_some(range.clone())
+                        })
+                        .flatten()
+                })
+        })
+        .collect::<Vec<_>>();
+    let html_block_ranges = events
+        .iter()
+        .filter_map(|(event, range)| {
+            matches!(event, Event::Start(Tag::HtmlBlock)).then_some(range.clone())
+        })
+        .collect::<Vec<_>>();
+    let comment_candidate_ranges = events
+        .iter()
+        .filter_map(|(event, range)| {
+            matches!(
+                event,
+                Event::Text(_) | Event::Html(_) | Event::InlineHtml(_)
+            )
+            .then_some(range.clone())
+        })
+        .collect::<Vec<_>>();
+    let comment_ranges = markdown_html_comment_ranges(
+        body,
+        &code_ranges,
+        &html_block_ranges,
+        &comment_candidate_ranges,
+    );
+
+    let mut in_table = false;
+    let mut in_table_head = false;
+    let mut in_table_cell = false;
+    let mut row = Vec::new();
+    let mut cell = String::new();
+    let mut disposition_column = None;
+
+    for (event, range) in events {
+        match event {
+            Event::Start(Tag::Table(_)) => {
+                in_table = !markdown_line_is_code_indented(body, range.start)
+                    && !comment_ranges
+                        .iter()
+                        .any(|comment| comment.contains(&range.start));
+                in_table_head = false;
+                disposition_column = None;
+                row.clear();
+            }
+            Event::Start(Tag::TableHead) if in_table => {
+                in_table_head = true;
+                row.clear();
+            }
+            Event::Start(Tag::TableRow) if in_table && !in_table_head => row.clear(),
+            Event::Start(Tag::TableCell) if in_table => {
+                in_table_cell = true;
+                cell.clear();
+            }
+            Event::Text(text) | Event::Code(text) if in_table_cell => cell.push_str(&text),
+            Event::SoftBreak | Event::HardBreak if in_table_cell => cell.push(' '),
+            Event::End(TagEnd::TableCell) if in_table_cell => {
+                in_table_cell = false;
+                row.push(cell.trim().to_owned());
+            }
+            Event::End(TagEnd::TableHead) if in_table_head => {
+                in_table_head = false;
+                if row.len() == finding_headers.len()
+                    && finding_headers
+                        .iter()
+                        .all(|header| row.iter().any(|cell| cell == header))
+                {
+                    disposition_column = row.iter().position(|cell| cell == "Disposition");
+                }
+                row.clear();
+            }
+            Event::End(TagEnd::TableRow) if in_table && !in_table_head => {
+                if let Some(index) = disposition_column
+                    && row.len() == finding_headers.len()
+                    && row
+                        .get(index)
+                        .is_some_and(|cell| dispositions.contains(&cell.as_str()))
+                {
+                    return true;
+                }
+                row.clear();
+            }
+            Event::End(TagEnd::Table) if in_table => {
+                in_table = false;
+                in_table_head = false;
+                in_table_cell = false;
+                disposition_column = None;
+                row.clear();
+            }
+            _ => {}
         }
-        if trimmed.contains("Disposition") || trimmed.contains("---") {
-            return false;
-        }
-        dispositions.iter().any(|d| trimmed.contains(d))
+    }
+
+    false
+}
+
+fn markdown_line_is_code_indented(body: &str, offset: usize) -> bool {
+    let line_start = body[..offset].rfind('\n').map_or(0, |index| index + 1);
+    let line = &body[line_start..];
+    line.starts_with('\t') || line.bytes().take_while(|byte| *byte == b' ').count() >= 4
+}
+
+fn markdown_html_block_is_raw_text_literal(body: &str, range: &std::ops::Range<usize>) -> bool {
+    let Some(source) = body.get(range.clone()) else {
+        return false;
+    };
+    let lower = source.trim_start().to_ascii_lowercase();
+    ["script", "style", "textarea", "title"].iter().any(|tag| {
+        lower.strip_prefix(&format!("<{tag}")).is_some_and(|rest| {
+            rest.bytes()
+                .next()
+                .is_some_and(|byte| byte == b'>' || byte.is_ascii_whitespace())
+        })
     })
+}
+
+fn markdown_html_comment_ranges(
+    body: &str,
+    code_ranges: &[std::ops::Range<usize>],
+    html_block_ranges: &[std::ops::Range<usize>],
+    comment_candidate_ranges: &[std::ops::Range<usize>],
+) -> Vec<std::ops::Range<usize>> {
+    let mut ranges = Vec::new();
+    let mut search_start = 0;
+
+    while let Some(relative_start) = body[search_start..].find("<!--") {
+        let start = search_start + relative_start;
+        if !comment_candidate_ranges
+            .iter()
+            .any(|range| range.contains(&start))
+            || code_ranges.iter().any(|range| range.contains(&start))
+            || is_backslash_escaped(body, start)
+            || markdown_marker_is_inside_html_tag(body, start)
+        {
+            search_start = start + 4;
+            continue;
+        }
+
+        let end = if let Some(relative_end) = body[start + 4..].find("-->") {
+            start + 4 + relative_end + 3
+        } else if html_block_ranges.iter().any(|range| range.contains(&start)) {
+            body.len()
+        } else {
+            search_start = start + 4;
+            continue;
+        };
+        ranges.push(start..end);
+        search_start = end;
+    }
+
+    ranges
+}
+
+fn markdown_marker_is_inside_html_tag(body: &str, marker_start: usize) -> bool {
+    let bytes = body.as_bytes();
+    let mut inside_tag = false;
+    let mut quote = None;
+    let mut index = 0;
+
+    while index < marker_start {
+        let byte = bytes[index];
+        if inside_tag {
+            if let Some(delimiter) = quote {
+                if byte == delimiter {
+                    quote = None;
+                }
+            } else if matches!(byte, b'\'' | b'"') {
+                quote = Some(byte);
+            } else if byte == b'>' {
+                inside_tag = false;
+            }
+        } else if byte == b'<'
+            && bytes.get(index + 1).is_some_and(|next| {
+                next.is_ascii_alphabetic() || matches!(next, b'/' | b'!' | b'?')
+            })
+        {
+            inside_tag = true;
+        }
+        index += 1;
+    }
+
+    inside_tag
+}
+
+fn is_backslash_escaped(text: &str, index: usize) -> bool {
+    text[..index]
+        .bytes()
+        .rev()
+        .take_while(|byte| *byte == b'\\')
+        .count()
+        % 2
+        == 1
 }
 
 fn body_contains_review_context(body: &str) -> bool {

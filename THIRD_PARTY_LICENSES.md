@@ -3,8 +3,8 @@
 This file documents third-party Rust crate licenses used by this workspace.
 
 - Data source: `cargo metadata --format-version 1 --locked`
-- Cargo.lock SHA256: `5f342079b3a0a0f94127ebc23b687055f62fbce250ed6d36c43760e94e4ab7a1`
-- Third-party crates (`source != null`): 465
+- Cargo.lock SHA256: `3ac6533fc901722fa796b401b7ee3fe6c0b89bf2bfeed65a4da90067771a459f`
+- Third-party crates (`source != null`): 468
 - Workspace crates (`source == null`, excluded below): 45
 
 ## Notes
@@ -17,8 +17,8 @@ This file documents third-party Rust crate licenses used by this workspace.
 
 | License Expression | Crate Count |
 | --- | ---: |
-| MIT OR Apache-2.0 | 218 |
-| MIT | 87 |
+| MIT OR Apache-2.0 | 219 |
+| MIT | 89 |
 | Apache-2.0 OR MIT | 38 |
 | Zlib OR Apache-2.0 OR MIT | 19 |
 | Unicode-3.0 | 18 |
@@ -165,6 +165,7 @@ This file documents third-party Rust crate licenses used by this workspace.
 | futures-util | 0.3.32 | MIT OR Apache-2.0 | crates.io |
 | generic-array | 0.14.7 | MIT | crates.io |
 | gethostname | 1.1.0 | Apache-2.0 | crates.io |
+| getopts | 0.2.24 | MIT OR Apache-2.0 | crates.io |
 | getrandom | 0.2.17 | MIT OR Apache-2.0 | crates.io |
 | getrandom | 0.3.4 | MIT OR Apache-2.0 | crates.io |
 | getrandom | 0.4.2 | MIT OR Apache-2.0 | crates.io |
@@ -302,6 +303,8 @@ This file documents third-party Rust crate licenses used by this workspace.
 | proc-macro-error-attr2 | 2.0.0 | MIT OR Apache-2.0 | crates.io |
 | proc-macro-error2 | 2.0.1 | MIT OR Apache-2.0 | crates.io |
 | proc-macro2 | 1.0.106 | MIT OR Apache-2.0 | crates.io |
+| pulldown-cmark | 0.13.4 | MIT | crates.io |
+| pulldown-cmark-escape | 0.11.0 | MIT | crates.io |
 | pxfm | 0.1.29 | BSD-3-Clause OR Apache-2.0 | crates.io |
 | quick-error | 2.0.1 | MIT/Apache-2.0 | crates.io |
 | quinn | 0.11.9 | MIT OR Apache-2.0 | crates.io |
