@@ -29,6 +29,12 @@ if [[ ! -f "$script" ]]; then
   exit 2
 fi
 
+verify_script="$repo_root/.agents/skills/project-verify-required-checks/scripts/project-verify-required-checks.sh"
+if [[ ! -f "$verify_script" ]]; then
+  echo "error: missing required checks script: $verify_script" >&2
+  exit 2
+fi
+
 bash_bin="$(command -v bash)"
 tmp_dir="$(mktemp -d "${TMPDIR:-/tmp}/docs-hygiene-audit-test.XXXXXX")"
 trap 'rm -rf "$tmp_dir"' EXIT
@@ -124,6 +130,72 @@ for tool in git find xargs awk sort uniq rg sed grep; do
 done
 assert_fails "missing hash command is fatal" "$clean_repo" 1 \
   "missing required hash command" "$curated_bin"
+
+# --- ripgrep is a hard prerequisite -----------------------------------------
+# Keep every other command used by the clean audit available while omitting
+# only rg. The audit must reject the missing prerequisite before any scan and
+# must never emit its success marker.
+missing_rg_bin="$tmp_dir/missing-rg-bin"
+mkdir -p "$missing_rg_bin"
+for tool in git find xargs awk sort uniq shasum sha1sum; do
+  src="$(command -v "$tool" 2>/dev/null || true)"
+  [[ -n "$src" ]] && ln -s "$src" "$missing_rg_bin/$tool"
+done
+assert_fails "missing ripgrep is fatal before scanning" "$clean_repo" 2 \
+  "missing required tool on PATH: rg" "$missing_rg_bin"
+if grep -qF "PASS: docs hygiene audit" <<<"$audit_output"; then
+  fail "missing ripgrep is fatal before scanning: unexpected PASS marker"
+fi
+
+# A present rg binary can still fail to execute a scan. Exit 1 is the normal
+# no-match result, but exit 2+ must propagate instead of being erased by the
+# probes' historical `|| true` handling.
+printf '# fixture root\n' >"$clean_repo/README.md"
+failing_rg_bin="$tmp_dir/failing-rg-bin"
+mkdir -p "$failing_rg_bin"
+for tool in git find xargs awk sort uniq shasum sha1sum; do
+  src="$(command -v "$tool" 2>/dev/null || true)"
+  [[ -n "$src" ]] && ln -s "$src" "$failing_rg_bin/$tool"
+done
+cat >"$failing_rg_bin/rg" <<'STUB'
+#!/bin/sh
+exit 2
+STUB
+chmod +x "$failing_rg_bin/rg"
+assert_fails "ripgrep runtime failure is propagated" "$clean_repo" 2 \
+  "ripgrep scan failed (exit 2)" "$failing_rg_bin"
+if grep -qF "PASS: docs hygiene audit" <<<"$audit_output"; then
+  fail "ripgrep runtime failure is propagated: unexpected PASS marker"
+fi
+
+# The docs-only aggregate caller should fail at its own prerequisite boundary
+# instead of launching an audit that is known to require rg.
+verify_missing_rg_bin="$tmp_dir/verify-missing-rg-bin"
+mkdir -p "$verify_missing_rg_bin"
+for tool in git npx; do
+  src="$(command -v "$tool" 2>/dev/null || true)"
+  [[ -n "$src" ]] && ln -s "$src" "$verify_missing_rg_bin/$tool"
+done
+
+echo "== docs-only verifier preflights ripgrep =="
+set +e
+verify_output="$(cd "$repo_root" && PATH="$verify_missing_rg_bin" \
+  "$bash_bin" "$verify_script" --docs-only 2>&1)"
+verify_status=$?
+set -e
+if [[ "$verify_status" -ne 2 ]] \
+  || ! grep -qF "missing required tool on PATH: rg" <<<"$verify_output"; then
+  echo "FAIL: docs-only verifier preflights ripgrep"
+  echo "--- verifier output ---"
+  echo "$verify_output"
+  exit 1
+fi
+if grep -qF "+ bash scripts/ci/" <<<"$verify_output"; then
+  echo "FAIL: docs-only verifier started checks before rejecting missing rg"
+  echo "$verify_output"
+  exit 1
+fi
+echo "ok"
 
 echo
 echo "PASS: docs-hygiene-audit.test.sh"

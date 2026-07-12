@@ -77,9 +77,9 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-required_cmds=(git npx)
+required_cmds=(git npx rg)
 if [[ "$docs_only" -eq 0 ]]; then
-  required_cmds+=(cargo python3 zsh rg)
+  required_cmds+=(cargo python3 zsh)
 fi
 
 for cmd in "${required_cmds[@]}"; do

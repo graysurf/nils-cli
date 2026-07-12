@@ -44,6 +44,52 @@ if [[ -z "$repo_root" || ! -d "$repo_root" ]]; then
 fi
 cd "$repo_root"
 
+if ! command -v rg >/dev/null 2>&1; then
+  echo "error: missing required tool on PATH: rg" >&2
+  exit 2
+fi
+
+# Ripgrep exit 1 means a successful scan with no matches. Any larger status is
+# an execution failure and must abort the audit instead of becoming a false
+# green through an unconditional `|| true`.
+rg_scan() {
+  local status
+  if rg "$@"; then
+    return 0
+  else
+    status=$?
+  fi
+  if [[ "$status" -eq 1 ]]; then
+    return 0
+  fi
+  echo "error: ripgrep scan failed (exit $status)" >&2
+  return "$status"
+}
+
+# Some black-box fixtures intentionally contain only a subset of repository
+# roots. Filter optional scan paths without masking failures from rg itself.
+rg_scan_existing() {
+  local -a rg_args=()
+  local -a paths=()
+  local reading_paths=0
+  local arg
+  for arg in "$@"; do
+    if [[ "$arg" == "--audit-paths" ]]; then
+      reading_paths=1
+    elif [[ "$reading_paths" -eq 1 ]]; then
+      [[ -e "$arg" ]] && paths+=("$arg")
+    else
+      rg_args+=("$arg")
+    fi
+  done
+  if [[ ${#paths[@]} -eq 0 ]]; then
+    return 0
+  fi
+  rg_scan "${rg_args[@]}" "${paths[@]}"
+}
+
+shopt -s nullglob
+
 declare -a errors=()
 declare -a warnings=()
 
@@ -101,11 +147,11 @@ done
 for path in "${removed_transient_docs[@]}"; do
   refs=""
   if [[ ${#existing_reference_roots[@]} -gt 0 ]]; then
-    refs="$(rg -n --fixed-strings "$path" "${existing_reference_roots[@]}" \
+    refs="$(rg_scan -n --fixed-strings "$path" "${existing_reference_roots[@]}" \
       -g '!**/docs/plans/**' \
       -g '!docs/specs/workspace-doc-retention-matrix-v1.md' \
       -g '!**/tests/**' \
-      -g '!**/target/**' || true)"
+      -g '!**/target/**')"
   fi
   if [[ -n "$refs" ]]; then
     record_issue error "stale reference to removed doc: $path"
@@ -116,7 +162,7 @@ for path in "${removed_transient_docs[@]}"; do
   fi
 done
 
-deep_links="$(rg -n '\.\./\.\./\.\./docs/' crates/*/docs/README.md || true)"
+deep_links="$(rg_scan_existing -n '\.\./\.\./\.\./docs/' --audit-paths crates/*/docs/README.md)"
 if [[ -n "$deep_links" ]]; then
   while IFS= read -r line; do
     [[ -n "$line" ]] || continue
@@ -134,10 +180,10 @@ elif command -v sha1sum >/dev/null 2>&1; then
   hash_cmd="sha1sum"
 fi
 
-# Unlike the ripgrep probes (which use `|| true` because a no-match exit 1 is
-# expected), a hashing failure is a real audit gap, so surface it via
-# record_issue rather than swallowing it. nullglob (scoped to the subshell)
-# keeps an unmatched `crates/*/docs` from reaching find as a literal path.
+# Like `rg_scan`, hashing distinguishes a valid empty result from an execution
+# failure. Surface failures via record_issue rather than swallowing them.
+# nullglob (scoped to the subshell) keeps an unmatched `crates/*/docs` from
+# reaching find as a literal path.
 if [[ -z "$hash_cmd" ]]; then
   record_issue error "missing required hash command: install shasum or sha1sum"
 elif ! md_hashes="$(
@@ -158,8 +204,8 @@ else
 fi
 
 # Legacy-removal guardrails (reintroduction detection)
-legacy_docs_hits="$(rg -n --hidden --glob '!.git' -S '\blegacy\b' \
-  docs/specs docs/runbooks BINARY_DEPENDENCIES.md crates/*/README.md crates/*/docs 2>/dev/null || true)"
+legacy_docs_hits="$(rg_scan_existing -n --hidden --glob '!.git' -S '\blegacy\b' --audit-paths \
+  docs/specs docs/runbooks BINARY_DEPENDENCIES.md crates/*/README.md crates/*/docs 2>/dev/null)"
 if [[ -n "$legacy_docs_hits" ]]; then
   record_issue error "legacy keyword reintroduced in active docs"
   while IFS= read -r line; do
@@ -168,7 +214,8 @@ if [[ -n "$legacy_docs_hits" ]]; then
   done <<<"$legacy_docs_hits"
 fi
 
-legacy_rs_hits="$(rg -n --hidden --glob '!.git' --glob '*.rs' -S '\blegacy\b' crates || true)"
+legacy_rs_hits="$(rg_scan_existing -n --hidden --glob '!.git' --glob '*.rs' -S '\blegacy\b' \
+  --audit-paths crates)"
 if [[ -n "$legacy_rs_hits" ]]; then
   record_issue error "legacy keyword reintroduced in Rust sources"
   while IFS= read -r line; do
@@ -177,8 +224,8 @@ if [[ -n "$legacy_rs_hits" ]]; then
   done <<<"$legacy_rs_hits"
 fi
 
-removed_redirect_hits="$(rg -n -S 'handle_legacy_redirect|"provider" \| "debug" \| "workflow" \| "automation"' \
-  crates/codex-cli/src/main.rs crates/gemini-cli/src/main.rs 2>/dev/null || true)"
+removed_redirect_hits="$(rg_scan_existing -n -S 'handle_legacy_redirect|"provider" \| "debug" \| "workflow" \| "automation"' \
+  --audit-paths crates/codex-cli/src/main.rs crates/gemini-cli/src/main.rs 2>/dev/null)"
 if [[ -n "$removed_redirect_hits" ]]; then
   record_issue error "removed codex/gemini redirect surfaces were reintroduced"
   while IFS= read -r line; do
@@ -187,8 +234,8 @@ if [[ -n "$removed_redirect_hits" ]]; then
   done <<<"$removed_redirect_hits"
 fi
 
-removed_alias_hits="$(rg -n -S 'window-name|visible_alias = "enter"|Backward-compatible aliases are still accepted' \
-  crates/macos-agent/src/cli.rs crates/macos-agent/README.md 2>/dev/null || true)"
+removed_alias_hits="$(rg_scan_existing -n -S 'window-name|visible_alias = "enter"|Backward-compatible aliases are still accepted' \
+  --audit-paths crates/macos-agent/src/cli.rs crates/macos-agent/README.md 2>/dev/null)"
 if [[ -n "$removed_alias_hits" ]]; then
   record_issue error "removed macos-agent alias surfaces were reintroduced"
   while IFS= read -r line; do
@@ -197,8 +244,8 @@ if [[ -n "$removed_alias_hits" ]]; then
   done <<<"$removed_alias_hits"
 fi
 
-removed_websocket_hits="$(rg -n -S 'top-level send|receiveTimeoutSeconds|or top-level send' \
-  crates/api-testing-core/src/websocket/schema.rs crates/api-websocket/docs/specs/websocket-request-schema-v1.md 2>/dev/null || true)"
+removed_websocket_hits="$(rg_scan_existing -n -S 'top-level send|receiveTimeoutSeconds|or top-level send' \
+  --audit-paths crates/api-testing-core/src/websocket/schema.rs crates/api-websocket/docs/specs/websocket-request-schema-v1.md 2>/dev/null)"
 if [[ -n "$removed_websocket_hits" ]]; then
   record_issue error "removed websocket fallback surfaces were reintroduced"
   while IFS= read -r line; do
@@ -207,8 +254,8 @@ if [[ -n "$removed_websocket_hits" ]]; then
   done <<<"$removed_websocket_hits"
 fi
 
-removed_image_ops_hits="$(rg -n -S 'Operation::(AutoOrient|Resize|Rotate|Crop|Pad|Flip|Flop|Optimize)|legacy transform|Legacy transform' \
-  crates/image-processing/src crates/image-processing/README.md BINARY_DEPENDENCIES.md 2>/dev/null || true)"
+removed_image_ops_hits="$(rg_scan_existing -n -S 'Operation::(AutoOrient|Resize|Rotate|Crop|Pad|Flip|Flop|Optimize)|legacy transform|Legacy transform' \
+  --audit-paths crates/image-processing/src crates/image-processing/README.md BINARY_DEPENDENCIES.md 2>/dev/null)"
 if [[ -n "$removed_image_ops_hits" ]]; then
   record_issue error "removed image-processing transform surfaces were reintroduced"
   while IFS= read -r line; do
