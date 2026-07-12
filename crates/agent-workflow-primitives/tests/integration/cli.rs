@@ -1481,6 +1481,7 @@ fn create_repo_retro_core_policies_fixture(tmp: &Path) -> std::path::PathBuf {
 mod heuristic_inbox {
     use super::*;
     use pretty_assertions::assert_eq;
+    use serde_json::json;
     use std::path::PathBuf;
 
     const ENTRY_TEMPLATE: &str = "# {title}\n\n\
@@ -1939,7 +1940,7 @@ All gates green.\n",
         write_entry(
             &inbox.join("fixture-gap-copy"),
             EntryOpts {
-                title: "Duplicate Gap",
+                title: "Different Gap",
                 raw_record: "out/projects/shared/skill-usage.record.json",
                 ..EntryOpts::default()
             },
@@ -1961,7 +1962,8 @@ All gates green.\n",
         let duplicates = payload["error"]["details"]["duplicates"]
             .as_array()
             .expect("duplicates array");
-        assert!(!duplicates.is_empty());
+        assert_eq!(duplicates.len(), 1);
+        assert_eq!(duplicates[0]["reasons"], json!(["raw_record"]));
     }
 
     #[test]
@@ -2304,6 +2306,60 @@ All gates green.\n",
         );
         assert_eq!(verify.code, 0, "stderr={}", verify.stderr_text());
         assert_eq!(verify.stdout_json()["data"]["ok"], true);
+    }
+
+    #[test]
+    fn verify_ignores_shared_manual_raw_record_placeholders() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let inbox = inbox_root(tmp.path());
+        let mut first_folder = None;
+
+        for slug in ["first-manual-gap", "second-manual-gap"] {
+            let out = run(
+                "heuristic-inbox",
+                tmp.path(),
+                &[
+                    "new",
+                    "--manual",
+                    "--slug",
+                    slug,
+                    "--out-dir",
+                    inbox.to_str().unwrap(),
+                    "--area",
+                    "cli",
+                    "--severity",
+                    "medium",
+                    "--format",
+                    "json",
+                ],
+            );
+            assert_eq!(out.code, 0, "stderr={}", out.stderr_text());
+            let entry = PathBuf::from(out.stdout_json()["data"]["path"].as_str().unwrap());
+            first_folder.get_or_insert_with(|| entry.parent().unwrap().to_path_buf());
+        }
+
+        let verify = run(
+            "heuristic-inbox",
+            tmp.path(),
+            &[
+                "verify",
+                first_folder.as_ref().unwrap().to_str().unwrap(),
+                "--inbox-dir",
+                inbox.to_str().unwrap(),
+                "--strict",
+                "--format",
+                "json",
+            ],
+        );
+        assert_eq!(verify.code, 0, "stderr={}", verify.stderr_text());
+        let payload = verify.stdout_json();
+        assert_eq!(payload["data"]["duplicates"], json!([]));
+        assert!(
+            payload["data"]["raw_records"][0]
+                .as_str()
+                .unwrap()
+                .starts_with("not captured (manual diagnosis,")
+        );
     }
 
     #[test]
