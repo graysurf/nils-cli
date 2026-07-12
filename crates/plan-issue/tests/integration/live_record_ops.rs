@@ -1257,13 +1257,17 @@ fn record_close_requires_non_empty_approval() {
 }
 
 fn build_closeout_evidence(linked_pr_ref: &str) -> Value {
+    build_closeout_evidence_for_profile(linked_pr_ref, "tracking")
+}
+
+fn build_closeout_evidence_for_profile(linked_pr_ref: &str, profile: &str) -> Value {
     json!({
         "comments": [
             {
                 "url": "https://github.com/owner/repo/issues/9#issuecomment-source",
                 "body": v2_comment_body(
                     "source",
-                    "tracking",
+                    profile,
                     json!({"path": "docs/plans/sample/sample-discussion-source.md", "commit": "src1234"}),
                 ),
                 "created_at": "2026-05-23T09:00:00Z"
@@ -1272,7 +1276,7 @@ fn build_closeout_evidence(linked_pr_ref: &str) -> Value {
                 "url": "https://github.com/owner/repo/issues/9#issuecomment-plan",
                 "body": v2_comment_body(
                     "plan",
-                    "tracking",
+                    profile,
                     json!({"path": "docs/plans/sample/sample-plan.md", "commit": "pln1234"}),
                 ),
                 "created_at": "2026-05-23T09:01:00Z"
@@ -1281,7 +1285,7 @@ fn build_closeout_evidence(linked_pr_ref: &str) -> Value {
                 "url": "https://github.com/owner/repo/issues/9#issuecomment-state",
                 "body": v2_comment_body(
                     "state",
-                    "tracking",
+                    profile,
                     json!({
                         "status": "complete",
                         "target_scope": "sample plan",
@@ -1302,7 +1306,7 @@ fn build_closeout_evidence(linked_pr_ref: &str) -> Value {
                 "url": "https://github.com/owner/repo/issues/9#issuecomment-session",
                 "body": v2_comment_body(
                     "session",
-                    "tracking",
+                    profile,
                     json!({
                         "summary": "implementation session completed",
                         "highlights": ["state, validation, and review evidence recorded"]
@@ -1314,7 +1318,7 @@ fn build_closeout_evidence(linked_pr_ref: &str) -> Value {
                 "url": "https://github.com/owner/repo/issues/9#issuecomment-validation",
                 "body": v2_comment_body(
                     "validation",
-                    "tracking",
+                    profile,
                     json!({
                         "overall": "pass",
                         "commands": [{"command": "cargo test", "status": "pass"}],
@@ -1327,7 +1331,7 @@ fn build_closeout_evidence(linked_pr_ref: &str) -> Value {
                 "url": "https://github.com/owner/repo/issues/9#issuecomment-review",
                 "body": v2_comment_body(
                     "review",
-                    "tracking",
+                    profile,
                     json!({
                         "decision": "approve",
                         "lenses": ["testing", "maintainability"],
@@ -1457,6 +1461,87 @@ fn record_close_fixture_passes_strict_gate_with_complete_v2_evidence() {
         final_dashboard.starts_with("## Final Dashboard"),
         "{final_dashboard}"
     );
+}
+
+#[test]
+fn record_close_dispatch_fixture_passes_visible_read_back() {
+    let tmp = TempDir::new().expect("tempdir");
+    let fixture = tmp.path().join("fixture");
+    fs::create_dir_all(&fixture).expect("create fixture");
+
+    write_fixture_files(
+        &fixture,
+        "## Current Dashboard\n\n- Status: in-progress\n",
+        &build_closeout_evidence_for_profile("owner/repo#1", "dispatch"),
+    );
+    write_pr_fixture(
+        &fixture,
+        "owner/repo",
+        1,
+        json!({
+            "state": "MERGED",
+            "mergeCommit": {"oid": "deadbeefcafebabe"},
+            "statusCheckRollup": {"state": "success"},
+            "url": "https://github.com/owner/repo/pull/1"
+        }),
+    );
+
+    let close = common::run_plan_issue_local(&[
+        "--format",
+        "json",
+        "record",
+        "close",
+        "--issue",
+        "9",
+        "--profile",
+        "dispatch",
+        "--linked-pr",
+        "owner/repo#1",
+        "--approval",
+        "https://github.com/owner/repo/issues/9#issuecomment-approval",
+        "--fixture",
+        fixture.to_str().expect("fixture path"),
+    ]);
+    assert_eq!(close.code, 0, "stderr: {}", close.stderr_text());
+    let closeout_body =
+        close.stdout_json()["payload"]["result"]["preview"]["closeout_comment_body"]
+            .as_str()
+            .expect("closeout body")
+            .to_string();
+    assert!(
+        closeout_body.starts_with("<!-- plan-issue-record:v2 role=closeout profile=dispatch -->"),
+        "{closeout_body}"
+    );
+
+    let comments_json = tmp.path().join("closeout-comments.json");
+    fs::write(
+        &comments_json,
+        json!({
+            "comments": [{
+                "body": closeout_body,
+                "url": "https://github.com/owner/repo/issues/9#issuecomment-closeout"
+            }]
+        })
+        .to_string(),
+    )
+    .expect("write closeout comments");
+    let audit = common::run_plan_issue_local(&[
+        "--format",
+        "json",
+        "record",
+        "audit",
+        "--comments-json",
+        comments_json.to_str().expect("comments path"),
+        "--profile",
+        "dispatch",
+        "--expect-visible",
+    ]);
+
+    assert_eq!(audit.code, 0, "stderr: {}", audit.stderr_text());
+    let envelope = audit.stdout_json();
+    let visible = &envelope["payload"]["result"]["visible"];
+    assert_eq!(visible["overall_pass"], true, "{envelope}");
+    assert_eq!(visible["codes"], json!([]), "{envelope}");
 }
 
 #[test]

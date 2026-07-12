@@ -738,7 +738,7 @@ fn dashboard_link(url: Option<&str>, label: &str) -> String {
     }
 }
 
-fn default_heading(profile: RecordProfile, kind: LifecycleCommentKind) -> &'static str {
+fn default_heading(_profile: RecordProfile, kind: LifecycleCommentKind) -> &'static str {
     match kind {
         LifecycleCommentKind::Source => "Source Snapshot",
         LifecycleCommentKind::Plan => "Plan Snapshot",
@@ -746,10 +746,9 @@ fn default_heading(profile: RecordProfile, kind: LifecycleCommentKind) -> &'stat
         LifecycleCommentKind::Session => "Execution Session",
         LifecycleCommentKind::Validation => "Validation Evidence",
         LifecycleCommentKind::Review => "Review Evidence",
-        LifecycleCommentKind::Closeout => match profile {
-            RecordProfile::Tracking => "Tracking Issue Closeout",
-            RecordProfile::Dispatch => "Dispatch Issue Closeout",
-        },
+        LifecycleCommentKind::Closeout => crate::lifecycle_vnext::registry::HEADING_CLOSEOUT
+            .strip_prefix("## ")
+            .expect("registry closeout heading uses a Markdown h2 prefix"),
     }
 }
 
