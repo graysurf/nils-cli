@@ -818,7 +818,7 @@ fn rate_limits_async_json_null_payload_is_benign() {
     assert_eq!(results.len(), 1);
     let alpha = &results[0];
     assert_eq!(alpha["ok"], true);
-    assert_eq!(alpha["status"], "no-rate-limit-window");
+    assert_eq!(alpha["status"], "ok");
     assert!(alpha["error"].is_null());
     assert!(alpha["summary"].is_null());
 }

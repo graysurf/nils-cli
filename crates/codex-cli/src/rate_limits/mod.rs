@@ -677,7 +677,7 @@ fn json_result_no_window(target_file: &Path) -> RateLimitJsonResult {
         provider: "codex".to_string(),
         name: secret_display_name(target_file),
         target_file: target_file_name(target_file),
-        status: "no-rate-limit-window".to_string(),
+        status: "ok".to_string(),
         ok: true,
         source: "network".to_string(),
         reason_code: None,
@@ -2335,25 +2335,15 @@ fn single_one_line(
 
     let usage_data = match render::parse_usage(&usage.json) {
         Some(value) => value,
+        None if render::rate_limit_has_no_windows(&usage.json) => {
+            return Ok(single_one_line_no_window(target_file));
+        }
         None => return Ok(SingleOneLineResult::default()),
     };
     let values = render::render_values(&usage_data);
     let weekly = render::weekly_values(&values);
     if weekly.weekly.is_none() && weekly.non_weekly.is_none() {
-        let line = cache::read_cache_entry_allow_stale(target_file)
-            .ok()
-            .and_then(|read| {
-                format_one_line_output(
-                    read.entry.non_weekly_label.as_deref(),
-                    read.entry.non_weekly_remaining,
-                    read.entry.weekly_remaining,
-                    read.entry.weekly_reset_epoch,
-                )
-            });
-        return Ok(SingleOneLineResult {
-            line,
-            no_window: true,
-        });
+        return Ok(single_one_line_no_window(target_file));
     }
     let fetched_at_epoch = Utc::now().timestamp();
     if fetched_at_epoch > 0 {
@@ -2371,6 +2361,23 @@ fn single_one_line(
         ),
         no_window: false,
     })
+}
+
+fn single_one_line_no_window(target_file: &Path) -> SingleOneLineResult {
+    let line = cache::read_cache_entry_allow_stale(target_file)
+        .ok()
+        .and_then(|read| {
+            format_one_line_output(
+                read.entry.non_weekly_label.as_deref(),
+                read.entry.non_weekly_remaining,
+                read.entry.weekly_remaining,
+                read.entry.weekly_reset_epoch,
+            )
+        });
+    SingleOneLineResult {
+        line,
+        no_window: true,
+    }
 }
 
 fn resolve_target(secret: Option<&str>) -> std::result::Result<PathBuf, i32> {

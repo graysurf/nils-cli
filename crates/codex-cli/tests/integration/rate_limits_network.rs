@@ -201,6 +201,10 @@ fn wham_usage_empty_windows_body() -> String {
     .to_string()
 }
 
+fn wham_usage_null_rate_limit_body() -> String {
+    r#"{"plan_type":"pro","rate_limit":null}"#.to_string()
+}
+
 fn json_contains_key(value: &Value, needle: &str) -> bool {
     match value {
         Value::Object(map) => {
@@ -866,6 +870,55 @@ fn rate_limits_all_mode_empty_windows_serves_preserved_cache() {
         "GET",
         "/wham/usage",
         HttpResponse::new(200, wham_usage_empty_windows_body()),
+    );
+
+    let output = run(
+        &["diag", "rate-limits", "--all"],
+        &[
+            ("CODEX_SECRET_DIR", &secrets),
+            ("ZSH_CACHE_DIR", &cache_root),
+        ],
+        &[
+            ("CODEX_CHATGPT_BASE_URL", &server.url()),
+            ("CODEX_RATE_LIMITS_DEFAULT_ALL_ENABLED", "false"),
+            ("TZ", "UTC"),
+            ("NO_COLOR", "1"),
+        ],
+    );
+
+    assert_exit(&output, 0);
+    let out = stdout(&output);
+    assert!(
+        out.contains("91%"),
+        "expected cached non-weekly usage:\n{out}"
+    );
+    assert!(out.contains("70%"), "expected cached weekly usage:\n{out}");
+    assert_eq!(
+        fs::read_to_string(&secret_file).expect("secret"),
+        before_secret
+    );
+    assert_eq!(fs::read_to_string(&kv_path).expect("cache"), cache);
+}
+
+#[test]
+fn rate_limits_all_mode_null_rate_limit_serves_preserved_cache() {
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let secrets = dir.path().join("secrets");
+    fs::create_dir_all(&secrets).expect("secrets dir");
+    let secret_file = write_secret(&secrets, "alpha.json", Some("tok_a"));
+    let before_secret = fs::read_to_string(&secret_file).expect("secret");
+
+    let cache_root = dir.path().join("cache_root");
+    let kv_path = cache_kv_path(&cache_root, "alpha");
+    fs::create_dir_all(kv_path.parent().expect("cache parent")).expect("cache dir");
+    let cache = "fetched_at=1\nnon_weekly_label=5h\nnon_weekly_remaining=91\nnon_weekly_reset_epoch=1700003600\nweekly_remaining=70\nweekly_reset_epoch=1700600000\n";
+    fs::write(&kv_path, cache).expect("cache");
+
+    let server = LoopbackServer::new().expect("server");
+    server.add_route(
+        "GET",
+        "/wham/usage",
+        HttpResponse::new(200, wham_usage_null_rate_limit_body()),
     );
 
     let output = run(
