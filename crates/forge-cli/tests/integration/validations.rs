@@ -87,11 +87,13 @@ fn sprint3_runtime_and_unavailable_kinds_match_spec() {
 
 #[test]
 fn test_first_evidence_kinds_match_spec() {
-    // The config-gated test-first gate adds three typed kinds (catalog entry
+    // The config-gated test-first gate adds five typed kinds (catalog entry
     // `test_first_evidence`). Pin them here so a discriminator or exit-code
     // drift fails against the spec.
     for kind in [
         "test_first_evidence_required",
+        "test_first_evidence_v1",
+        "test_first_evidence_classification",
         "test_first_evidence_incomplete",
         "test_first_evidence_unreadable",
     ] {

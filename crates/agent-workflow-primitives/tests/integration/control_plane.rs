@@ -91,6 +91,8 @@ fn test_first_check_is_phase_and_path_class_aware() {
             out_arg,
             "--classification",
             "behavior-change",
+            "--changed-behavior",
+            "production edits require durable pre-edit evidence",
         ],
     );
     assert_eq!(init.code, 0, "stderr: {}", init.stderr_text());
@@ -136,7 +138,7 @@ fn test_first_check_is_phase_and_path_class_aware() {
     assert_eq!(production.code, 65);
     assert_eq!(
         production.stdout_json()["error"]["details"]["reason_code"],
-        "missing-failing-evidence-or-waiver"
+        "missing-durable-pre-edit-evidence"
     );
 
     let ambiguous = run(
@@ -229,6 +231,69 @@ fn test_first_check_is_phase_and_path_class_aware() {
         "delivery-incomplete"
     );
 
+    let impact = run(
+        "test-first-evidence",
+        tmp.path(),
+        &[
+            "record-impact",
+            "--out",
+            out_arg,
+            "--target",
+            "tests/value.rs::regression",
+            "--disposition",
+            "add-missing",
+            "--protected-behavior",
+            "production edits require durable pre-edit evidence",
+            "--reason",
+            "the regression had no owner test",
+        ],
+    );
+    assert_eq!(impact.code, 0, "stderr: {}", impact.stderr_text());
+
+    let record_path = out.join("test-first-evidence.json");
+    let mut malformed: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&record_path).unwrap()).unwrap();
+    malformed["failing_tests"] = serde_json::json!([{
+        "command": "",
+        "exit_code": 101,
+        "summary": "",
+        "expected_failure": "new contract missing",
+        "observed_failure": "assertion mismatch"
+    }]);
+    fs::write(
+        &record_path,
+        serde_json::to_string_pretty(&malformed).unwrap(),
+    )
+    .unwrap();
+    let malformed_pre_edit = run(
+        "test-first-evidence",
+        tmp.path(),
+        &[
+            "check",
+            "--out",
+            out_arg,
+            "--phase",
+            "pre-edit",
+            "--project-path",
+            repo_arg,
+            "--path",
+            "src/lib.rs",
+            "--format",
+            "json",
+        ],
+    );
+    assert_eq!(malformed_pre_edit.code, 65);
+    assert_eq!(
+        malformed_pre_edit.stdout_json()["error"]["details"]["reason_code"],
+        "missing-durable-pre-edit-evidence"
+    );
+    malformed["failing_tests"] = serde_json::json!([]);
+    fs::write(
+        &record_path,
+        serde_json::to_string_pretty(&malformed).unwrap(),
+    )
+    .unwrap();
+
     let before_fix = run(
         "test-first-evidence",
         tmp.path(),
@@ -242,6 +307,10 @@ fn test_first_check_is_phase_and_path_class_aware() {
             "101",
             "--summary",
             "regression reproduced",
+            "--expected-failure",
+            "the new contract is not implemented",
+            "--observed-failure",
+            "the regression assertion failed",
         ],
     );
     assert_eq!(before_fix.code, 0, "stderr: {}", before_fix.stderr_text());
@@ -279,9 +348,17 @@ fn test_first_check_is_phase_and_path_class_aware() {
             "cargo test regression",
             "--status",
             "pass",
+            "--scope",
+            "focused",
         ],
     );
     assert_eq!(final_validation.code, 0);
+    let gaps = run(
+        "test-first-evidence",
+        tmp.path(),
+        &["record-gap", "--out", out_arg, "--none"],
+    );
+    assert_eq!(gaps.code, 0);
     let delivery_ready = run(
         "test-first-evidence",
         tmp.path(),

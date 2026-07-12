@@ -974,11 +974,14 @@ error — forward-compatibility for v2 fields.
 config opts in. When it resolves `true`, `pr create` and `pr deliver` (both the
 create and adopt paths, and the `--dry-run` preflight) require
 `--test-first-evidence <dir>` for `--kind feature` / `bug`. The directory must
-hold a verified `test-first-evidence` record — a failing test or an explicit
-waiver, plus a passing final validation. `docs` / `chore` / `ci` / `refactor`
-kinds are exempt. Failures surface as `test_first_evidence_required`,
-`test_first_evidence_incomplete`, or `test_first_evidence_unreadable`
-(exit `DATA`).
+hold a verified v2 `test-first-evidence` record with a testable classification,
+an actual changed/added/removed behavior, an affected-test decision, meaningful
+failing evidence or an explicit waiver, scoped passing validation, and a
+residual-gap declaration. Record v1 remains readable but cannot satisfy this
+gate. `docs` / `chore` / `ci` / `refactor` kinds are exempt. Failures
+surface as `test_first_evidence_required`, `test_first_evidence_v1`,
+`test_first_evidence_classification`, `test_first_evidence_incomplete`, or
+`test_first_evidence_unreadable` (exit `DATA`).
 
 Environment variables (read once at startup, all optional):
 

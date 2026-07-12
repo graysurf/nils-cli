@@ -161,7 +161,8 @@ pub(crate) fn find_git_toplevel(start: &Path) -> Option<PathBuf> {
 /// Test-first gate. When `required` is true (resolved from
 /// `[test_first].require`) and the PR is a feature/bug change, the
 /// `--test-first-evidence` directory must hold a verified `test-first-evidence`
-/// record — a failing test or explicit waiver plus a passing final validation.
+/// v2 record with a testable classification, durable before-fix evidence,
+/// scoped passing validation, and an explicit residual-gap declaration.
 /// Other kinds (docs, chore, ci, refactor) are exempt.
 pub(crate) fn test_first_gate(
     kind: PrKind,
@@ -177,11 +178,35 @@ pub(crate) fn test_first_gate(
             "test_first_evidence_required",
             "this repo requires test-first evidence for feature/bug PRs; pass \
              --test-first-evidence <dir> pointing at a verified test-first-evidence \
-             record (a failing test or explicit waiver plus a passing final validation)",
+             v2 record with a testable classification and complete durable evidence",
             None,
         ));
     };
     match agent_workflow_primitives::test_first_evidence::verify_dir(Path::new(dir)) {
+        Ok(result) if result.record.schema_version == "test-first-evidence.record.v1" => {
+            Err(ForgeError::validation(
+                schema_err(),
+                "test_first_evidence_v1",
+                format!(
+                    "test-first evidence at '{dir}' uses record v1; re-record the change with test-first-evidence v2"
+                ),
+                Some(format!("record_file={}", result.record_file)),
+            ))
+        }
+        Ok(result)
+            if !agent_workflow_primitives::test_first_evidence::
+                is_testable_change_classification(&result.record.change_classification) =>
+        {
+            Err(ForgeError::validation(
+                schema_err(),
+                "test_first_evidence_classification",
+                format!(
+                    "test-first evidence at '{dir}' uses non-testable or unknown classification '{}'; feature/bug delivery requires behavior-change, bug-fix, or feature",
+                    result.record.change_classification
+                ),
+                Some(format!("record_file={}", result.record_file)),
+            ))
+        }
         Ok(result) if result.complete => Ok(()),
         Ok(result) => Err(ForgeError::validation(
             schema_err(),
@@ -1019,9 +1044,23 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         write_evidence(
             dir.path(),
-            r#"{"schema_version":"test-first-evidence.record.v1","change_classification":"behavior-change","waiver":{"reason":"fixture"},"final_validation":{"command":"cargo test","status":"pass"}}"#,
+            r#"{"schema_version":"test-first-evidence.record.v2","change_classification":"behavior-change","contract_delta":{"changed_behaviors":["durable gate"]},"no_existing_tests_reason":"fixture has no existing tests","waiver":{"reason":"fixture","kind":"non-testable","why_no_red":"fixture path","substitute_validation":["cargo test"]},"final_validations":[{"command":"cargo test","status":"pass","scope":"focused"}],"no_residual_gaps":true}"#,
         );
         assert!(test_first_gate(PrKind::Feature, true, dir.path().to_str()).is_ok());
+    }
+
+    #[test]
+    fn test_first_gate_rejects_non_testable_classification() {
+        let dir = tempfile::tempdir().unwrap();
+        write_evidence(
+            dir.path(),
+            r#"{"schema_version":"test-first-evidence.record.v2","change_classification":"docs-only","waiver":{"reason":"fixture","kind":"non-testable","why_no_red":"fixture path","substitute_validation":["markdownlint"]},"final_validations":[{"command":"markdownlint","status":"pass","scope":"manual"}],"no_residual_gaps":true}"#,
+        );
+        for kind in [PrKind::Feature, PrKind::Bug] {
+            let err = test_first_gate(kind, true, dir.path().to_str())
+                .expect_err("non-testable classification");
+            assert_eq!(err.kind(), "test_first_evidence_classification");
+        }
     }
 
     #[test]
@@ -1029,11 +1068,24 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         write_evidence(
             dir.path(),
-            r#"{"schema_version":"test-first-evidence.record.v1","change_classification":"behavior-change","waiver":{"reason":"fixture"}}"#,
+            r#"{"schema_version":"test-first-evidence.record.v2","change_classification":"behavior-change","contract_delta":{"changed_behaviors":["durable gate"]},"no_existing_tests_reason":"fixture has no existing tests","waiver":{"reason":"fixture","kind":"non-testable","why_no_red":"fixture path","substitute_validation":["cargo test"]},"no_residual_gaps":true}"#,
         );
         let err =
             test_first_gate(PrKind::Feature, true, dir.path().to_str()).expect_err("incomplete");
         assert_eq!(err.kind(), "test_first_evidence_incomplete");
+    }
+
+    #[test]
+    fn test_first_gate_rejects_v1_record_with_rerecord_error() {
+        let dir = tempfile::tempdir().unwrap();
+        write_evidence(
+            dir.path(),
+            r#"{"schema_version":"test-first-evidence.record.v1","change_classification":"behavior-change","waiver":{"reason":"fixture"},"final_validation":{"command":"cargo test","status":"pass"}}"#,
+        );
+        let err =
+            test_first_gate(PrKind::Feature, true, dir.path().to_str()).expect_err("v1 record");
+        assert_eq!(err.kind(), "test_first_evidence_v1");
+        assert!(err.to_string().contains("re-record"));
     }
 
     #[test]

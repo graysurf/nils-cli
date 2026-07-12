@@ -781,7 +781,9 @@ pub struct PrCreateArgs {
     pub strict_labels: bool,
     /// Directory holding a `test-first-evidence` record. Verified by the
     /// test-first gate when `[test_first].require` resolves true for a
-    /// feature/bug PR (a failing test or explicit waiver plus a passing final).
+    /// feature/bug PR. Requires a complete v2 record with a testable
+    /// classification, durable pre-fix evidence, scoped final validation, and
+    /// a residual-gap declaration.
     #[arg(long = "test-first-evidence", value_name = "DIR")]
     pub test_first_evidence: Option<String>,
 }
@@ -911,7 +913,8 @@ pub struct PrDeliverArgs {
     pub strict_labels: bool,
     /// Directory holding a `test-first-evidence` record, forwarded to the
     /// create step and verified by the test-first gate when
-    /// `[test_first].require` resolves true for a feature/bug PR.
+    /// `[test_first].require` resolves true for a feature/bug PR. Requires a
+    /// complete v2 record with a testable classification.
     #[arg(long = "test-first-evidence", value_name = "DIR")]
     pub test_first_evidence: Option<String>,
     /// CI-wait budget before declaring `checks_timeout` (default `30m`).

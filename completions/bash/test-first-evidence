@@ -31,6 +31,12 @@ _test-first-evidence() {
             test__first__evidence,record-final)
                 cmd="test__first__evidence__record__final"
                 ;;
+            test__first__evidence,record-gap)
+                cmd="test__first__evidence__record__gap"
+                ;;
+            test__first__evidence,record-impact)
+                cmd="test__first__evidence__record__impact"
+                ;;
             test__first__evidence,record-waiver)
                 cmd="test__first__evidence__record__waiver"
                 ;;
@@ -47,7 +53,7 @@ _test-first-evidence() {
 
     case "${cmd}" in
         test__first__evidence)
-            opts="-h -V --help --version init record-failing record-waiver record-final check verify show completion"
+            opts="-h -V --help --version init record-failing record-impact record-waiver record-final record-gap check verify show completion"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 1 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -115,7 +121,7 @@ _test-first-evidence() {
             return 0
             ;;
         test__first__evidence__init)
-            opts="-h --out --format --classification --production-path --note --force --help"
+            opts="-h --out --format --classification --production-path --note --retained-behavior --changed-behavior --removed-behavior --added-behavior --invariant --force --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -133,7 +139,7 @@ _test-first-evidence() {
                     return 0
                     ;;
                 --classification)
-                    COMPREPLY=($(compgen -f "${cur}"))
+                    COMPREPLY=($(compgen -W "behavior-change bug-fix feature docs-only config-only generated-only refactor-only" -- "${cur}"))
                     return 0
                     ;;
                 --production-path)
@@ -141,6 +147,26 @@ _test-first-evidence() {
                     return 0
                     ;;
                 --note)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --retained-behavior)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --changed-behavior)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --removed-behavior)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --added-behavior)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --invariant)
                     COMPREPLY=($(compgen -f "${cur}"))
                     return 0
                     ;;
@@ -152,7 +178,7 @@ _test-first-evidence() {
             return 0
             ;;
         test__first__evidence__record__failing)
-            opts="-h --out --format --command --exit-code --summary --test-name --artifact --help"
+            opts="-h --out --format --command --exit-code --summary --expected-failure --observed-failure --test-name --artifact --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -181,6 +207,14 @@ _test-first-evidence() {
                     COMPREPLY=($(compgen -f "${cur}"))
                     return 0
                     ;;
+                --expected-failure)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --observed-failure)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
                 --test-name)
                     COMPREPLY=($(compgen -f "${cur}"))
                     return 0
@@ -197,7 +231,7 @@ _test-first-evidence() {
             return 0
             ;;
         test__first__evidence__record__final)
-            opts="-h --out --format --command --status --summary --artifact --help"
+            opts="-h --out --format --command --status --scope --summary --artifact --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -222,6 +256,10 @@ _test-first-evidence() {
                     COMPREPLY=($(compgen -W "pass fail" -- "${cur}"))
                     return 0
                     ;;
+                --scope)
+                    COMPREPLY=($(compgen -W "focused affected-suite contract-consumer full manual" -- "${cur}"))
+                    return 0
+                    ;;
                 --summary)
                     COMPREPLY=($(compgen -f "${cur}"))
                     return 0
@@ -237,8 +275,94 @@ _test-first-evidence() {
             COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
             return 0
             ;;
+        test__first__evidence__record__gap)
+            opts="-h --out --format --none --gap --reason --follow-up --help"
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                --out)
+                    COMPREPLY=()
+                    if [[ "${BASH_VERSINFO[0]}" -ge 4 ]]; then
+                        compopt -o plusdirs
+                    fi
+                    return 0
+                    ;;
+                --format)
+                    COMPREPLY=($(compgen -W "text json" -- "${cur}"))
+                    return 0
+                    ;;
+                --gap)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --reason)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --follow-up)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        test__first__evidence__record__impact)
+            opts="-h --out --format --none --target --disposition --protected-behavior --reason --owner-test --invariant-retired --validation-scope --help"
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                --out)
+                    COMPREPLY=()
+                    if [[ "${BASH_VERSINFO[0]}" -ge 4 ]]; then
+                        compopt -o plusdirs
+                    fi
+                    return 0
+                    ;;
+                --format)
+                    COMPREPLY=($(compgen -W "text json" -- "${cur}"))
+                    return 0
+                    ;;
+                --target)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --disposition)
+                    COMPREPLY=($(compgen -W "keep update-spec remove-superseded add-missing refactor-only" -- "${cur}"))
+                    return 0
+                    ;;
+                --protected-behavior)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --reason)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --owner-test)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --validation-scope)
+                    COMPREPLY=($(compgen -W "focused affected-suite contract-consumer full manual" -- "${cur}"))
+                    return 0
+                    ;;
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
         test__first__evidence__record__waiver)
-            opts="-h --out --format --reason --substitute-validation --help"
+            opts="-h --out --format --reason --waiver-kind --why-no-red --substitute-validation --follow-up --expires --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -259,7 +383,23 @@ _test-first-evidence() {
                     COMPREPLY=($(compgen -f "${cur}"))
                     return 0
                     ;;
+                --waiver-kind)
+                    COMPREPLY=($(compgen -W "non-testable deferred-debt" -- "${cur}"))
+                    return 0
+                    ;;
+                --why-no-red)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
                 --substitute-validation)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --follow-up)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --expires)
                     COMPREPLY=($(compgen -f "${cur}"))
                     return 0
                     ;;
