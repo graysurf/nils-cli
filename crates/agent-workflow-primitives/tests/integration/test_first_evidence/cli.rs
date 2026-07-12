@@ -746,7 +746,7 @@ fn strict_verify_rejects_empty_evidence_identities() {
 }
 
 #[test]
-fn final_validation_retry_replaces_failure_but_other_failures_block() {
+fn final_validation_retry_preserves_history_and_other_failures_block() {
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let out_dir = tmp.path().join("final-retry");
     let out_arg = out_arg(&out_dir);
@@ -797,7 +797,7 @@ fn final_validation_retry_replaces_failure_but_other_failures_block() {
                 "--out",
                 &out_arg,
                 "--command",
-                "cargo test contract",
+                "OPENAI_API_KEY=sk-proj-supersecret cargo test contract",
                 "--status",
                 status,
                 "--scope",
@@ -825,6 +825,14 @@ fn final_validation_retry_replaces_failure_but_other_failures_block() {
     assert_eq!(attempts[0]["attempt"], 1);
     assert_eq!(attempts[1]["status"], "pass");
     assert_eq!(attempts[1]["attempt"], 2);
+    assert_eq!(attempts[0]["command"], attempts[1]["command"]);
+    assert!(
+        attempts[0]["command"]
+            .as_str()
+            .expect("command")
+            .contains("[REDACTED]")
+    );
+    assert!(!record.to_string().contains("sk-proj-supersecret"));
 
     let failed_full = run(
         tmp.path(),
@@ -853,6 +861,41 @@ fn final_validation_retry_replaces_failure_but_other_failures_block() {
             .iter()
             .any(|item| item == "failed_final_validation")
     );
+    let show = run(tmp.path(), &["show", "--out", &out_arg]);
+    assert!(
+        show.stdout_text().contains("final validation: fail"),
+        "{}",
+        show.stdout_text()
+    );
+
+    let recovered_full = run(
+        tmp.path(),
+        &[
+            "record-final",
+            "--out",
+            &out_arg,
+            "--command",
+            "cargo test --workspace",
+            "--status",
+            "pass",
+            "--scope",
+            "full",
+        ],
+    );
+    assert_eq!(
+        recovered_full.code,
+        0,
+        "stderr={}",
+        recovered_full.stderr_text()
+    );
+    let show = run(tmp.path(), &["show", "--out", &out_arg]);
+    assert!(
+        show.stdout_text().contains("final validation: pass"),
+        "{}",
+        show.stdout_text()
+    );
+    let verify = run(tmp.path(), &["verify", "--out", &out_arg]);
+    assert_eq!(verify.code, 0, "stderr={}", verify.stderr_text());
 }
 
 #[test]

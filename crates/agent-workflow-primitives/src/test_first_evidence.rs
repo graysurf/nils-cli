@@ -491,6 +491,7 @@ fn run_record_final(args: RecordFinalArgs) -> i32 {
     let format = args.common.format;
     match update_record(args.common.out_dir.as_path(), |record| {
         let command = required_text(Some(&args.command), "--command", "missing-final-command")?;
+        let command = redact_text(command).value;
         let next_attempt = record
             .final_validations
             .iter()
@@ -507,7 +508,7 @@ fn run_record_final(args: RecordFinalArgs) -> i32 {
                 )
             })?;
         let validation = FinalValidation {
-            command: redact_text(command).value,
+            command,
             status: args.status,
             scope: Some(args.scope),
             attempt: next_attempt,
@@ -962,17 +963,7 @@ fn missing_evidence_fields(record: &EvidenceRecord) -> Vec<String> {
     {
         missing.push("final_validation_identity".to_string());
     }
-    let mut latest_validations: BTreeMap<(Option<ValidationScope>, &str), &FinalValidation> =
-        BTreeMap::new();
-    for validation in &record.final_validations {
-        let identity = (validation.scope, validation.command.trim());
-        if latest_validations
-            .get(&identity)
-            .is_none_or(|current| validation.attempt > current.attempt)
-        {
-            latest_validations.insert(identity, validation);
-        }
-    }
+    let latest_validations = effective_final_validations(record);
     if latest_validations
         .values()
         .any(|item| item.status == ValidationStatus::Fail)
@@ -1038,6 +1029,22 @@ fn missing_evidence_fields(record: &EvidenceRecord) -> Vec<String> {
 
 pub fn is_testable_change_classification(classification: &str) -> bool {
     ChangeClassification::parse(classification).is_some_and(ChangeClassification::is_testable)
+}
+
+fn effective_final_validations(
+    record: &EvidenceRecord,
+) -> BTreeMap<(Option<ValidationScope>, &str), &FinalValidation> {
+    let mut latest = BTreeMap::new();
+    for validation in &record.final_validations {
+        let identity = (validation.scope, validation.command.trim());
+        if latest
+            .get(&identity)
+            .is_none_or(|current: &&FinalValidation| validation.attempt > current.attempt)
+        {
+            latest.insert(identity, validation);
+        }
+    }
+    latest
 }
 
 fn has_durable_pre_edit_evidence(record: &EvidenceRecord) -> bool {
@@ -1187,20 +1194,33 @@ fn print_record_text(record: &EvidenceRecord, complete: bool) {
     );
     println!(
         "final validation: {}",
-        if record
-            .final_validations
-            .iter()
-            .any(|value| value.status == ValidationStatus::Pass)
-            || record
-                .final_validation
-                .as_ref()
-                .is_some_and(|value| value.status == ValidationStatus::Pass)
-        {
-            "pass"
-        } else {
-            "missing"
-        }
+        effective_final_validation_status(record)
     );
+}
+
+fn effective_final_validation_status(record: &EvidenceRecord) -> &'static str {
+    let latest = effective_final_validations(record);
+    if latest
+        .values()
+        .any(|value| value.status == ValidationStatus::Fail)
+        || record
+            .final_validation
+            .as_ref()
+            .is_some_and(|value| value.status == ValidationStatus::Fail)
+    {
+        "fail"
+    } else if latest
+        .values()
+        .any(|value| value.status == ValidationStatus::Pass)
+        || record
+            .final_validation
+            .as_ref()
+            .is_some_and(|value| value.status == ValidationStatus::Pass)
+    {
+        "pass"
+    } else {
+        "missing"
+    }
 }
 
 fn render_error(
