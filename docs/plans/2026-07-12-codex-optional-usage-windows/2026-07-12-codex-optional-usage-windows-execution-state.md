@@ -3,19 +3,16 @@
 <!-- plan-issue-record:v2 role=state profile=tracking -->
 ## Execution State
 
-- Status: complete; tracking issue closed by the closeout PR
+- Status: complete; tracking issue closed
 - Target scope: optional Codex usage windows in nils-cli, nils-cli release and
   local install, sympoies-infra reader delivery/deploy, and live Agent Console
   recovery smoke.
 - Execution window: Sprint 1 (nils-cli behavior and tests) -> Sprint 2 (nils-cli
   PR, release, install) -> Sprint 3 (reader PR, deploy, live smoke), serial.
-- Current task: none; implementation, release, reader deploy, and live recovery
-  acceptance are complete.
-- Next task: none.
-- Last updated: 2026-07-13
-- Branch/commit/PR: nils-cli implementation #1165 (merge `4024423e`), release
-  #1168 (merge `f4fd48cf`, tag `v1.21.23`), and graysurf/sympoies-infra#77
-  (merge `2aaa541c`).
+- Current task: none; tracking issue closed
+- Next task: none; tracking issue closed
+- Last updated: 2026-07-12
+- Branch/commit/PR: sympoies/nils-cli#1165 merged (<https://github.com/sympoies/nils-cli/pull/1165>); sympoies/nils-cli#1174 merged (<https://github.com/sympoies/nils-cli/pull/1174>)
 - Source document: `docs/plans/2026-07-12-codex-optional-usage-windows/2026-07-12-codex-optional-usage-windows-plan.md`
 - Implementation source: `docs/plans/2026-07-12-codex-optional-usage-windows/2026-07-12-codex-optional-usage-windows-discussion-source.md`
 - Direct source-doc execution waiver: not applicable.
@@ -88,3 +85,8 @@
 | sympoies-infra #77 validation and review | pass | Test-first red captured; 99 reader tests, 140 related tests, `make validate`, and testing/API/security follow-ups passed. | GitHub PR / test-first evidence |
 | `scripts/smoke-agent-console.sh` | pass | Host helpers, reader parity, edge, layout, cross-origin gates, loopback bind, tailnet TLS, and WebSocket attach passed. | live sympoies host |
 | Live reader, edge, and rendered Usage dialog | pass | Three fresh Weekly-only Codex entries; no 5h window, no sensitive keys, and live meters rendered instead of `—`. | live API / browser acceptance |
+
+## Handoff
+
+- Tracking issue <https://github.com/sympoies/nils-cli/issues/1162> is closed;
+  terminal execution state is synchronized. No closeout or merge action remains.
