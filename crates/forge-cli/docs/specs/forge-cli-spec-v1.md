@@ -977,10 +977,15 @@ create and adopt paths, and the `--dry-run` preflight) require
 hold a verified v2 `test-first-evidence` record with a testable classification,
 an actual changed/added/removed behavior, an affected-test decision, meaningful
 failing evidence or an explicit waiver, scoped passing validation, and a
-residual-gap declaration. Record v1 remains readable but cannot satisfy this
-gate. `docs` / `chore` / `ci` / `refactor` kinds are exempt. Failures
+residual-gap declaration. The record must also bind an immutable repository and
+pre-edit baseline plus a latest delivery head/tree/diff attestation matching
+the current checkout. Amend and rebase operations invalidate the latest
+delivery attestation until `test-first-evidence bind-delivery` appends a new
+attempt; the baseline is never replaced. Record v1 remains readable but cannot
+satisfy this gate. `docs` / `chore` / `ci` / `refactor` kinds are exempt. Failures
 surface as `test_first_evidence_required`, `test_first_evidence_v1`,
-`test_first_evidence_classification`, `test_first_evidence_incomplete`, or
+`test_first_evidence_classification`, `test_first_evidence_incomplete`,
+`test_first_evidence_unbound`, `test_first_evidence_subject_mismatch`, or
 `test_first_evidence_unreadable` (exit `DATA`).
 
 Environment variables (read once at startup, all optional):

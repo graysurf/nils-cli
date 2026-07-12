@@ -5,16 +5,18 @@ use std::env;
 use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::Command as ProcessCommand;
 
 use clap::Parser;
 use clap::error::ErrorKind;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 
 use cli::{
     ChangeClassification, CheckArgs, CheckPhase, Cli, Command, CommonArgs, InitArgs, OutputFormat,
     RecordFailingArgs, RecordFinalArgs, RecordGapArgs, RecordImpactArgs, RecordWaiverArgs,
-    TestDisposition, ValidationScope, ValidationStatus, WaiverKind,
+    SubjectArgs, TestDisposition, ValidationScope, ValidationStatus, VerifyArgs, WaiverKind,
 };
 use nils_common::cli_contract::exit;
 use nils_common::fs::{display_path, normalize_path};
@@ -35,6 +37,8 @@ const RECORD_IMPACT_SCHEMA_VERSION: &str = "cli.test-first-evidence.record-impac
 const RECORD_WAIVER_SCHEMA_VERSION: &str = "cli.test-first-evidence.record-waiver.v2";
 const RECORD_FINAL_SCHEMA_VERSION: &str = "cli.test-first-evidence.record-final.v2";
 const RECORD_GAP_SCHEMA_VERSION: &str = "cli.test-first-evidence.record-gap.v2";
+const BIND_BASELINE_SCHEMA_VERSION: &str = "cli.test-first-evidence.bind-baseline.v2";
+const BIND_DELIVERY_SCHEMA_VERSION: &str = "cli.test-first-evidence.bind-delivery.v2";
 const VERIFY_SCHEMA_VERSION: &str = "cli.test-first-evidence.verify.v2";
 const SHOW_SCHEMA_VERSION: &str = "cli.test-first-evidence.show.v2";
 const CHECK_SCHEMA_VERSION: &str = "cli.test-first-evidence.check.v2";
@@ -45,6 +49,8 @@ const RECORD_IMPACT_COMMAND: &str = "test-first-evidence record-impact";
 const RECORD_WAIVER_COMMAND: &str = "test-first-evidence record-waiver";
 const RECORD_FINAL_COMMAND: &str = "test-first-evidence record-final";
 const RECORD_GAP_COMMAND: &str = "test-first-evidence record-gap";
+const BIND_BASELINE_COMMAND: &str = "test-first-evidence bind-baseline";
+const BIND_DELIVERY_COMMAND: &str = "test-first-evidence bind-delivery";
 const VERIFY_COMMAND: &str = "test-first-evidence verify";
 const SHOW_COMMAND: &str = "test-first-evidence show";
 const CHECK_COMMAND: &str = "test-first-evidence check";
@@ -81,6 +87,8 @@ fn dispatch(cli: Cli) -> i32 {
         Command::RecordWaiver(args) => run_record_waiver(args),
         Command::RecordFinal(args) => run_record_final(args),
         Command::RecordGap(args) => run_record_gap(args),
+        Command::BindBaseline(args) => run_bind_baseline(args),
+        Command::BindDelivery(args) => run_bind_delivery(args),
         Command::Check(args) => run_check(args),
         Command::Verify(args) => run_verify(args),
         Command::Show(args) => run_show(args),
@@ -626,13 +634,117 @@ fn run_record_gap(args: RecordGapArgs) -> i32 {
     }
 }
 
-fn run_verify(args: CommonArgs) -> i32 {
-    match verify_record(&args) {
-        Ok(result) if result.missing.is_empty() => render_verify_success(args.format, &result),
-        Ok(result) => render_error(
+fn run_bind_baseline(args: SubjectArgs) -> i32 {
+    let format = args.common.format;
+    let result = update_record(args.common.out_dir.as_path(), |record| {
+        if record.subject.is_some() {
+            return Err(CliError::data(
+                "baseline-subject-already-bound",
+                "the immutable baseline subject is already bound",
+                None,
+            ));
+        }
+        record.subject = Some(capture_baseline_subject(
+            &args.project_path,
+            &args.remote,
+            args.repository_id.as_deref(),
+        )?);
+        Ok(())
+    });
+    match result {
+        Ok(result) => render_record_success(
+            BIND_BASELINE_SCHEMA_VERSION,
+            BIND_BASELINE_COMMAND,
+            format,
+            &result,
+        ),
+        Err(err) => render_error(
+            BIND_BASELINE_SCHEMA_VERSION,
+            BIND_BASELINE_COMMAND,
+            format,
+            err,
+        ),
+    }
+}
+
+fn run_bind_delivery(args: SubjectArgs) -> i32 {
+    let format = args.common.format;
+    let result = update_record(args.common.out_dir.as_path(), |record| {
+        let subject = record.subject.as_mut().ok_or_else(|| {
+            CliError::data(
+                "unbound-subject",
+                "bind the repository and pre-edit baseline before attesting delivery",
+                None,
+            )
+        })?;
+        let repository = repository_identity(
+            &args.project_path,
+            &args.remote,
+            args.repository_id.as_deref(),
+        )?;
+        if !repository_matches(
+            &repository,
+            &subject.repository,
+            args.repository_id.is_some(),
+        ) {
+            return Err(CliError::data(
+                "subject-mismatch",
+                "the current repository does not match the bound baseline repository",
+                Some(json!({ "reason_code": "repository-mismatch" })),
+            ));
+        }
+        let attempt = subject
+            .deliveries
+            .iter()
+            .map(|delivery| delivery.attempt)
+            .max()
+            .unwrap_or(0)
+            .checked_add(1)
+            .ok_or_else(|| {
+                CliError::data(
+                    "delivery-subject-attempt-overflow",
+                    "delivery subject attempt counter is exhausted",
+                    None,
+                )
+            })?;
+        let delivery =
+            capture_delivery_subject(&args.project_path, &subject.baseline.commit, attempt)?;
+        if subject.deliveries.last().is_some_and(|latest| {
+            latest.head == delivery.head
+                && latest.tree == delivery.tree
+                && latest.diff_digest == delivery.diff_digest
+        }) {
+            return Err(CliError::data(
+                "duplicate-delivery-subject",
+                "the latest delivery subject already attests this head and diff",
+                None,
+            ));
+        }
+        subject.deliveries.push(delivery);
+        Ok(())
+    });
+    match result {
+        Ok(result) => render_record_success(
+            BIND_DELIVERY_SCHEMA_VERSION,
+            BIND_DELIVERY_COMMAND,
+            format,
+            &result,
+        ),
+        Err(err) => render_error(
+            BIND_DELIVERY_SCHEMA_VERSION,
+            BIND_DELIVERY_COMMAND,
+            format,
+            err,
+        ),
+    }
+}
+
+fn run_verify(args: VerifyArgs) -> i32 {
+    match verify_record(&args.common) {
+        Ok(result) if !result.missing.is_empty() => render_error(
             VERIFY_SCHEMA_VERSION,
             VERIFY_COMMAND,
-            args.format,
+            args.common.format,
             CliError::runtime(
                 "incomplete-evidence",
                 "test-first evidence record is incomplete",
@@ -642,7 +754,50 @@ fn run_verify(args: CommonArgs) -> i32 {
                 })),
             ),
         ),
-        Err(err) => render_error(VERIFY_SCHEMA_VERSION, VERIFY_COMMAND, args.format, err),
+        Ok(result) if args.project_path.is_none() => {
+            render_verify_success(args.common.format, &result)
+        }
+        Ok(result) => {
+            let project_path = args.project_path.as_deref().expect("checked above");
+            match match_delivery_subject(
+                &result.record,
+                project_path,
+                &args.remote,
+                args.repository_id.as_deref(),
+            ) {
+                Ok(subject) if subject.matches => {
+                    render_verify_success(args.common.format, &result)
+                }
+                Ok(subject) => render_error(
+                    VERIFY_SCHEMA_VERSION,
+                    VERIFY_COMMAND,
+                    args.common.format,
+                    CliError::data(
+                        if subject.reason_code == "unbound-subject"
+                            || subject.reason_code == "delivery-subject-unbound"
+                        {
+                            "unbound-subject"
+                        } else {
+                            "subject-mismatch"
+                        },
+                        "test-first evidence subject does not match the current delivery",
+                        Some(json!({ "reason_code": subject.reason_code })),
+                    ),
+                ),
+                Err(err) => render_error(
+                    VERIFY_SCHEMA_VERSION,
+                    VERIFY_COMMAND,
+                    args.common.format,
+                    err,
+                ),
+            }
+        }
+        Err(err) => render_error(
+            VERIFY_SCHEMA_VERSION,
+            VERIFY_COMMAND,
+            args.common.format,
+            err,
+        ),
     }
 }
 
@@ -690,6 +845,7 @@ fn init_record(args: &InitArgs) -> Result<RecordResult, CliError> {
         final_validation: None,
         residual_gaps: Vec::new(),
         no_residual_gaps: false,
+        subject: None,
     };
     write_record(&record_file, &record)?;
     Ok(record_result(record_file, record))
@@ -1077,6 +1233,284 @@ fn is_post_edit_evidence_field(field: &str) -> bool {
     ) || field.ends_with("_final_validation")
 }
 
+#[derive(Debug, Serialize)]
+pub struct SubjectMatchResult {
+    pub matches: bool,
+    pub reason_code: String,
+}
+
+/// Compare a structurally valid evidence record's bound repository and latest
+/// delivery attestation with the current Git checkout.
+pub fn verify_delivery_subject(
+    out_dir: &Path,
+    project_path: &Path,
+    remote: &str,
+    repository_id: Option<&str>,
+) -> Result<SubjectMatchResult, String> {
+    let record = read_record_result(out_dir)
+        .map_err(|err| err.message)?
+        .record;
+    match_delivery_subject(&record, project_path, remote, repository_id).map_err(|err| err.message)
+}
+
+fn capture_baseline_subject(
+    project_path: &Path,
+    remote: &str,
+    repository_id: Option<&str>,
+) -> Result<EvidenceSubject, CliError> {
+    let repository = repository_identity(project_path, remote, repository_id)?;
+    let commit = git_output(
+        project_path,
+        &["rev-parse", "HEAD^{commit}"],
+        "baseline commit",
+    )?;
+    let tree = git_output(project_path, &["rev-parse", "HEAD^{tree}"], "baseline tree")?;
+    Ok(EvidenceSubject {
+        repository,
+        baseline: BaselineSubject { commit, tree },
+        deliveries: Vec::new(),
+    })
+}
+
+fn capture_delivery_subject(
+    project_path: &Path,
+    baseline: &str,
+    attempt: u32,
+) -> Result<DeliverySubject, CliError> {
+    let head = git_output(
+        project_path,
+        &["rev-parse", "HEAD^{commit}"],
+        "delivery head",
+    )?;
+    let tree = git_output(project_path, &["rev-parse", "HEAD^{tree}"], "delivery tree")?;
+    let output = ProcessCommand::new("git")
+        .current_dir(project_path)
+        .args([
+            "diff",
+            "--binary",
+            "--full-index",
+            "--no-color",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--no-renames",
+            baseline,
+            &head,
+            "--",
+        ])
+        .output()
+        .map_err(|err| {
+            CliError::runtime(
+                "subject-git-failed",
+                format!("failed to spawn git while computing delivery diff: {err}"),
+                None,
+            )
+        })?;
+    if !output.status.success() {
+        return Err(CliError::data(
+            "subject-baseline-unavailable",
+            "the bound baseline commit is unavailable in the current repository",
+            Some(json!({ "reason_code": "baseline-unavailable" })),
+        ));
+    }
+    let diff_digest = format!("sha256:{}", hex(&Sha256::digest(&output.stdout)));
+    Ok(DeliverySubject {
+        head,
+        tree,
+        diff_digest,
+        attempt,
+    })
+}
+
+fn match_delivery_subject(
+    record: &EvidenceRecord,
+    project_path: &Path,
+    remote: &str,
+    repository_id: Option<&str>,
+) -> Result<SubjectMatchResult, CliError> {
+    let Some(subject) = record.subject.as_ref() else {
+        return Ok(subject_result(false, "unbound-subject"));
+    };
+    let current_repository = repository_identity(project_path, remote, repository_id)?;
+    if !repository_matches(
+        &current_repository,
+        &subject.repository,
+        repository_id.is_some(),
+    ) {
+        return Ok(subject_result(false, "repository-mismatch"));
+    }
+    let baseline_tree = match git_output(
+        project_path,
+        &[
+            "rev-parse",
+            &format!("{}^{{tree}}", subject.baseline.commit),
+        ],
+        "bound baseline tree",
+    ) {
+        Ok(tree) => tree,
+        Err(_) => return Ok(subject_result(false, "baseline-unavailable")),
+    };
+    if baseline_tree != subject.baseline.tree {
+        return Ok(subject_result(false, "baseline-mismatch"));
+    }
+    let Some(latest) = subject.deliveries.iter().max_by_key(|item| item.attempt) else {
+        return Ok(subject_result(false, "delivery-subject-unbound"));
+    };
+    let current =
+        match capture_delivery_subject(project_path, &subject.baseline.commit, latest.attempt) {
+            Ok(current) => current,
+            Err(err) if err.code == "subject-baseline-unavailable" => {
+                return Ok(subject_result(false, "baseline-unavailable"));
+            }
+            Err(err) => return Err(err),
+        };
+    if current.head != latest.head
+        || current.tree != latest.tree
+        || current.diff_digest != latest.diff_digest
+    {
+        return Ok(subject_result(false, "delivery-subject-mismatch"));
+    }
+    Ok(subject_result(true, "subject-match"))
+}
+
+fn subject_result(matches: bool, reason_code: &str) -> SubjectMatchResult {
+    SubjectMatchResult {
+        matches,
+        reason_code: reason_code.to_string(),
+    }
+}
+
+fn repository_matches(
+    current: &RepositoryIdentity,
+    bound: &RepositoryIdentity,
+    explicit_id: bool,
+) -> bool {
+    current.id == bound.id && (explicit_id || current.kind == bound.kind)
+}
+
+fn repository_identity(
+    project_path: &Path,
+    remote: &str,
+    repository_id: Option<&str>,
+) -> Result<RepositoryIdentity, CliError> {
+    git_output(
+        project_path,
+        &["rev-parse", "--show-toplevel"],
+        "repository root",
+    )?;
+    if let Some(repository_id) = repository_id {
+        return Ok(RepositoryIdentity {
+            kind: RepositoryIdentityKind::Explicit,
+            id: normalize_repository_id(repository_id)?,
+        });
+    }
+    if let Some(url) = git_output_optional(project_path, &["remote", "get-url", remote])
+        && let Some(parsed) = nils_common::git::parse_git_remote_url(&url)
+    {
+        return Ok(RepositoryIdentity {
+            kind: RepositoryIdentityKind::Provider,
+            id: format!("{}/{}", parsed.host, parsed.path).to_ascii_lowercase(),
+        });
+    }
+    let roots = git_output(
+        project_path,
+        &["rev-list", "--max-parents=0", "HEAD"],
+        "repository history roots",
+    )?;
+    let mut roots: Vec<&str> = roots
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect();
+    roots.sort_unstable();
+    if roots.is_empty() {
+        return Err(CliError::data(
+            "subject-repository-unavailable",
+            "repository identity requires at least one commit",
+            None,
+        ));
+    }
+    let digest = Sha256::digest(roots.join("\n").as_bytes());
+    Ok(RepositoryIdentity {
+        kind: RepositoryIdentityKind::LocalHistory,
+        id: format!("sha256:{}", hex(&digest)),
+    })
+}
+
+fn normalize_repository_id(value: &str) -> Result<String, CliError> {
+    let value = value.trim();
+    let unsafe_shape = value.is_empty()
+        || value.contains("://")
+        || value.contains('@')
+        || value.starts_with('/')
+        || value.starts_with('\\')
+        || value.contains("..")
+        || value.chars().any(char::is_whitespace);
+    let redacted = redact_text(value);
+    if unsafe_shape || redacted.value != value {
+        return Err(CliError::usage(
+            "invalid-repository-id",
+            "--repository-id must be a stable path-free identifier without credentials",
+            Some(json!({ "flag": "--repository-id" })),
+        ));
+    }
+    Ok(value.to_ascii_lowercase())
+}
+
+fn git_output(project_path: &Path, args: &[&str], operation: &str) -> Result<String, CliError> {
+    let output = ProcessCommand::new("git")
+        .current_dir(project_path)
+        .args(args)
+        .output()
+        .map_err(|err| {
+            CliError::runtime(
+                "subject-git-failed",
+                format!("failed to spawn git for {operation}: {err}"),
+                None,
+            )
+        })?;
+    if !output.status.success() {
+        return Err(CliError::data(
+            "subject-git-failed",
+            format!("git could not resolve {operation}"),
+            None,
+        ));
+    }
+    let value = String::from_utf8(output.stdout).map_err(|_| {
+        CliError::data(
+            "subject-git-output-invalid",
+            format!("git returned non-UTF-8 output for {operation}"),
+            None,
+        )
+    })?;
+    let value = value.trim();
+    if value.is_empty() {
+        return Err(CliError::data(
+            "subject-git-output-empty",
+            format!("git returned empty output for {operation}"),
+            None,
+        ));
+    }
+    Ok(value.to_string())
+}
+
+fn git_output_optional(project_path: &Path, args: &[&str]) -> Option<String> {
+    let output = ProcessCommand::new("git")
+        .current_dir(project_path)
+        .args(args)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let value = String::from_utf8(output.stdout).ok()?;
+    let value = value.trim();
+    (!value.is_empty()).then(|| value.to_string())
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
 fn absolute_path(path: &Path) -> Result<PathBuf, CliError> {
     if path.is_absolute() {
         return Ok(normalize_path(path));
@@ -1354,6 +1788,44 @@ pub struct EvidenceRecord {
     pub residual_gaps: Vec<ResidualGap>,
     #[serde(default, skip_serializing_if = "is_false")]
     pub no_residual_gaps: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub subject: Option<EvidenceSubject>,
+}
+
+#[derive(Debug, Clone, Deserialize, Eq, PartialEq, Serialize)]
+pub struct EvidenceSubject {
+    pub repository: RepositoryIdentity,
+    pub baseline: BaselineSubject,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub deliveries: Vec<DeliverySubject>,
+}
+
+#[derive(Debug, Clone, Deserialize, Eq, PartialEq, Serialize)]
+pub struct RepositoryIdentity {
+    pub kind: RepositoryIdentityKind,
+    pub id: String,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RepositoryIdentityKind {
+    Provider,
+    LocalHistory,
+    Explicit,
+}
+
+#[derive(Debug, Clone, Deserialize, Eq, PartialEq, Serialize)]
+pub struct BaselineSubject {
+    pub commit: String,
+    pub tree: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Eq, PartialEq, Serialize)]
+pub struct DeliverySubject {
+    pub head: String,
+    pub tree: String,
+    pub diff_digest: String,
+    pub attempt: u32,
 }
 
 #[derive(Debug, Default, Deserialize, Serialize)]
@@ -1548,6 +2020,7 @@ mod tests {
             final_validation: None,
             residual_gaps: Vec::new(),
             no_residual_gaps: false,
+            subject: None,
         };
         assert_eq!(
             missing_evidence_fields(&record),
@@ -1614,6 +2087,7 @@ mod tests {
             final_validation: None,
             residual_gaps: Vec::new(),
             no_residual_gaps: true,
+            subject: None,
         };
         assert_eq!(
             missing_evidence_fields(&record),

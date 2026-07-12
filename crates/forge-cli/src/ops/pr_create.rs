@@ -158,16 +158,43 @@ pub(crate) fn find_git_toplevel(start: &Path) -> Option<PathBuf> {
     (!path.is_empty()).then(|| PathBuf::from(path))
 }
 
+pub(crate) fn evidence_repository_id(
+    ctx: &ProviderContext,
+    remote_url: Option<&str>,
+    explicit_repo: Option<&str>,
+) -> Option<String> {
+    if let Some(repo) = explicit_repo {
+        let host = if ctx.provider == Provider::Local {
+            "local"
+        } else {
+            &ctx.host
+        };
+        return Some(format!("{host}/{repo}").to_ascii_lowercase());
+    }
+    if ctx.provider == Provider::Local
+        && let Some(parsed) = remote_url.and_then(nils_common::git::parse_git_remote_url)
+    {
+        return Some(format!("{}/{}", parsed.host, parsed.path).to_ascii_lowercase());
+    }
+    ctx.repo
+        .as_deref()
+        .map(|repo| format!("{}/{repo}", ctx.host).to_ascii_lowercase())
+}
+
 /// Test-first gate. When `required` is true (resolved from
 /// `[test_first].require`) and the PR is a feature/bug change, the
 /// `--test-first-evidence` directory must hold a verified `test-first-evidence`
 /// v2 record with a testable classification, durable before-fix evidence,
-/// scoped passing validation, and an explicit residual-gap declaration.
+/// scoped passing validation, an explicit residual-gap declaration, and a
+/// baseline/delivery subject matching the current repository and head.
 /// Other kinds (docs, chore, ci, refactor) are exempt.
 pub(crate) fn test_first_gate(
     kind: PrKind,
     required: bool,
     evidence_dir: Option<&str>,
+    workdir: &Path,
+    remote: &str,
+    repository_id: Option<&str>,
 ) -> Result<(), ForgeError> {
     if !required || !matches!(kind, PrKind::Feature | PrKind::Bug) {
         return Ok(());
@@ -207,7 +234,45 @@ pub(crate) fn test_first_gate(
                 Some(format!("record_file={}", result.record_file)),
             ))
         }
-        Ok(result) if result.complete => Ok(()),
+        Ok(result) if result.complete => {
+            match agent_workflow_primitives::test_first_evidence::verify_delivery_subject(
+                Path::new(dir),
+                workdir,
+                remote,
+                repository_id,
+            ) {
+                Ok(subject) if subject.matches => Ok(()),
+                Ok(subject)
+                    if matches!(
+                        subject.reason_code.as_str(),
+                        "unbound-subject" | "delivery-subject-unbound"
+                    ) =>
+                {
+                    Err(ForgeError::validation(
+                        schema_err(),
+                        "test_first_evidence_unbound",
+                        format!(
+                            "test-first evidence at '{dir}' is structurally complete but is not bound to a baseline and delivery subject"
+                        ),
+                        Some(format!("reason_code={}", subject.reason_code)),
+                    ))
+                }
+                Ok(subject) => Err(ForgeError::validation(
+                    schema_err(),
+                    "test_first_evidence_subject_mismatch",
+                    format!(
+                        "test-first evidence at '{dir}' does not match the current repository and delivery"
+                    ),
+                    Some(format!("reason_code={}", subject.reason_code)),
+                )),
+                Err(message) => Err(ForgeError::validation(
+                    schema_err(),
+                    "test_first_evidence_unreadable",
+                    format!("could not verify the bound subject at '{dir}'"),
+                    Some(message),
+                )),
+            }
+        }
         Ok(result) => Err(ForgeError::validation(
             schema_err(),
             "test_first_evidence_incomplete",
@@ -282,6 +347,14 @@ pub fn run_with<R: BackendRunner>(
         kind,
         env.test_first_required,
         args.test_first_evidence.as_deref(),
+        &env.workdir,
+        &global.remote,
+        evidence_repository_id(
+            &ctx,
+            (env.remote_url)(&global.remote).as_deref(),
+            global.repo.as_deref(),
+        )
+        .as_deref(),
     )?;
 
     let draft = !args.no_draft;
@@ -362,6 +435,14 @@ pub fn compute<R: BackendRunner>(
         kind,
         env.test_first_required,
         args.test_first_evidence.as_deref(),
+        &env.workdir,
+        &global.remote,
+        evidence_repository_id(
+            &ctx,
+            (env.remote_url)(&global.remote).as_deref(),
+            global.repo.as_deref(),
+        )
+        .as_deref(),
     )?;
 
     let draft = !args.no_draft;
@@ -692,6 +773,7 @@ mod tests {
     use crate::cli::PrKindFlag;
     use crate::provider::{DetectionSource, Provider};
     use pretty_assertions::assert_eq;
+    use std::process::Command as GitCommand;
 
     fn github_ctx() -> ProviderContext {
         ProviderContext {
@@ -709,6 +791,31 @@ mod tests {
             source: DetectionSource::Flag,
             repo: None,
         }
+    }
+
+    #[test]
+    fn evidence_repository_identity_handles_local_provider_and_explicit_repo() {
+        let local = ProviderContext {
+            provider: Provider::Local,
+            host: "local".into(),
+            source: DetectionSource::Flag,
+            repo: Some("acme/widgets".into()),
+        };
+        assert_eq!(
+            evidence_repository_id(&local, Some("https://github.com/acme/widgets.git"), None,)
+                .as_deref(),
+            Some("github.com/acme/widgets")
+        );
+        assert_eq!(
+            evidence_repository_id(&local, None, Some("acme/widgets")).as_deref(),
+            Some("local/acme/widgets")
+        );
+
+        let github = github_ctx();
+        assert_eq!(
+            evidence_repository_id(&github, None, Some("other/project")).as_deref(),
+            Some("github.com/other/project")
+        );
     }
 
     #[test]
@@ -1015,16 +1122,86 @@ mod tests {
         std::fs::write(dir.join("test-first-evidence.json"), json).unwrap();
     }
 
+    fn gate(kind: PrKind, required: bool, evidence_dir: Option<&str>) -> Result<(), ForgeError> {
+        test_first_gate(kind, required, evidence_dir, Path::new("."), "origin", None)
+    }
+
+    fn git(repo: &Path, args: &[&str]) -> String {
+        let output = GitCommand::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(args)
+            .output()
+            .expect("git spawn");
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout)
+            .expect("git stdout")
+            .trim()
+            .to_string()
+    }
+
+    fn subject_repo(root: &Path, name: &str, remote: &str) -> PathBuf {
+        let repo = root.join(name);
+        std::fs::create_dir_all(&repo).unwrap();
+        git(&repo, &["init", "-q", "-b", "main"]);
+        git(&repo, &["config", "user.email", "test@example.com"]);
+        git(&repo, &["config", "user.name", "Tester"]);
+        git(&repo, &["config", "commit.gpgsign", "false"]);
+        std::fs::write(repo.join("README.md"), format!("{name}\n")).unwrap();
+        git(&repo, &["add", "README.md"]);
+        git(&repo, &["commit", "-q", "-m", "initial"]);
+        git(&repo, &["remote", "add", "origin", remote]);
+        repo
+    }
+
+    fn bind_evidence(repo: &Path, dir: &Path) {
+        write_evidence(
+            dir,
+            r#"{"schema_version":"test-first-evidence.record.v2","change_classification":"behavior-change","contract_delta":{"changed_behaviors":["durable gate"]},"no_existing_tests_reason":"fixture has no existing tests","waiver":{"reason":"fixture","kind":"non-testable","why_no_red":"fixture path","substitute_validation":["cargo test"]},"final_validations":[{"command":"cargo test","status":"pass","scope":"focused"}],"no_residual_gaps":true}"#,
+        );
+        let dir_arg = dir.to_string_lossy().to_string();
+        let repo_arg = repo.to_string_lossy().to_string();
+        assert_eq!(
+            agent_workflow_primitives::test_first_evidence::run_with_args([
+                "test-first-evidence",
+                "bind-baseline",
+                "--out",
+                &dir_arg,
+                "--project-path",
+                &repo_arg,
+            ]),
+            0
+        );
+        std::fs::write(repo.join("delivery.txt"), "delivery\n").unwrap();
+        git(repo, &["add", "delivery.txt"]);
+        git(repo, &["commit", "-q", "-m", "delivery"]);
+        assert_eq!(
+            agent_workflow_primitives::test_first_evidence::run_with_args([
+                "test-first-evidence",
+                "bind-delivery",
+                "--out",
+                &dir_arg,
+                "--project-path",
+                &repo_arg,
+            ]),
+            0
+        );
+    }
+
     #[test]
     fn test_first_gate_passes_when_not_required() {
-        assert!(test_first_gate(PrKind::Feature, false, None).is_ok());
+        assert!(gate(PrKind::Feature, false, None).is_ok());
     }
 
     #[test]
     fn test_first_gate_exempts_non_behavior_kinds() {
         for kind in [PrKind::Docs, PrKind::Chore, PrKind::Ci, PrKind::Refactor] {
             assert!(
-                test_first_gate(kind, true, None).is_ok(),
+                gate(kind, true, None).is_ok(),
                 "{kind:?} should be exempt",
                 kind = kind,
             );
@@ -1034,19 +1211,52 @@ mod tests {
     #[test]
     fn test_first_gate_requires_evidence_for_feature_and_bug() {
         for kind in [PrKind::Feature, PrKind::Bug] {
-            let err = test_first_gate(kind, true, None).expect_err("required");
+            let err = gate(kind, true, None).expect_err("required");
             assert_eq!(err.kind(), "test_first_evidence_required");
         }
     }
 
     #[test]
-    fn test_first_gate_accepts_complete_record() {
+    fn test_first_gate_rejects_structurally_complete_but_unbound_record() {
         let dir = tempfile::tempdir().unwrap();
         write_evidence(
             dir.path(),
             r#"{"schema_version":"test-first-evidence.record.v2","change_classification":"behavior-change","contract_delta":{"changed_behaviors":["durable gate"]},"no_existing_tests_reason":"fixture has no existing tests","waiver":{"reason":"fixture","kind":"non-testable","why_no_red":"fixture path","substitute_validation":["cargo test"]},"final_validations":[{"command":"cargo test","status":"pass","scope":"focused"}],"no_residual_gaps":true}"#,
         );
-        assert!(test_first_gate(PrKind::Feature, true, dir.path().to_str()).is_ok());
+        let err = gate(PrKind::Feature, true, dir.path().to_str()).expect_err("unbound evidence");
+        assert_eq!(err.kind(), "test_first_evidence_unbound");
+    }
+
+    #[test]
+    fn test_first_gate_accepts_matching_subject_and_rejects_other_repository() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo_a = subject_repo(tmp.path(), "repo-a", "https://github.com/acme/repo-a.git");
+        let repo_b = subject_repo(tmp.path(), "repo-b", "https://github.com/acme/repo-b.git");
+        let evidence = tmp.path().join("evidence");
+        std::fs::create_dir_all(&evidence).unwrap();
+        bind_evidence(&repo_a, &evidence);
+
+        assert!(
+            test_first_gate(
+                PrKind::Feature,
+                true,
+                evidence.to_str(),
+                &repo_a,
+                "origin",
+                None,
+            )
+            .is_ok()
+        );
+        let err = test_first_gate(
+            PrKind::Feature,
+            true,
+            evidence.to_str(),
+            &repo_b,
+            "origin",
+            None,
+        )
+        .expect_err("repository B must not reuse repository A evidence");
+        assert_eq!(err.kind(), "test_first_evidence_subject_mismatch");
     }
 
     #[test]
@@ -1057,8 +1267,8 @@ mod tests {
             r#"{"schema_version":"test-first-evidence.record.v2","change_classification":"docs-only","waiver":{"reason":"fixture","kind":"non-testable","why_no_red":"fixture path","substitute_validation":["markdownlint"]},"final_validations":[{"command":"markdownlint","status":"pass","scope":"manual"}],"no_residual_gaps":true}"#,
         );
         for kind in [PrKind::Feature, PrKind::Bug] {
-            let err = test_first_gate(kind, true, dir.path().to_str())
-                .expect_err("non-testable classification");
+            let err =
+                gate(kind, true, dir.path().to_str()).expect_err("non-testable classification");
             assert_eq!(err.kind(), "test_first_evidence_classification");
         }
     }
@@ -1070,8 +1280,7 @@ mod tests {
             dir.path(),
             r#"{"schema_version":"test-first-evidence.record.v2","change_classification":"behavior-change","contract_delta":{"changed_behaviors":["durable gate"]},"no_existing_tests_reason":"fixture has no existing tests","waiver":{"reason":"fixture","kind":"non-testable","why_no_red":"fixture path","substitute_validation":["cargo test"]},"no_residual_gaps":true}"#,
         );
-        let err =
-            test_first_gate(PrKind::Feature, true, dir.path().to_str()).expect_err("incomplete");
+        let err = gate(PrKind::Feature, true, dir.path().to_str()).expect_err("incomplete");
         assert_eq!(err.kind(), "test_first_evidence_incomplete");
     }
 
@@ -1082,8 +1291,7 @@ mod tests {
             dir.path(),
             r#"{"schema_version":"test-first-evidence.record.v1","change_classification":"behavior-change","waiver":{"reason":"fixture"},"final_validation":{"command":"cargo test","status":"pass"}}"#,
         );
-        let err =
-            test_first_gate(PrKind::Feature, true, dir.path().to_str()).expect_err("v1 record");
+        let err = gate(PrKind::Feature, true, dir.path().to_str()).expect_err("v1 record");
         assert_eq!(err.kind(), "test_first_evidence_v1");
         assert!(err.to_string().contains("re-record"));
     }
@@ -1091,8 +1299,7 @@ mod tests {
     #[test]
     fn test_first_gate_rejects_unreadable_record() {
         let dir = tempfile::tempdir().unwrap();
-        let err =
-            test_first_gate(PrKind::Feature, true, dir.path().to_str()).expect_err("unreadable");
+        let err = gate(PrKind::Feature, true, dir.path().to_str()).expect_err("unreadable");
         assert_eq!(err.kind(), "test_first_evidence_unreadable");
     }
 

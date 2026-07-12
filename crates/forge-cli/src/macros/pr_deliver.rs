@@ -34,7 +34,9 @@ use crate::cli::{
 };
 use crate::config::ForgeConfig;
 use crate::error::ForgeError;
-use crate::ops::pr_create::{self, Environment, find_git_toplevel, test_first_gate};
+use crate::ops::pr_create::{
+    self, Environment, evidence_repository_id, find_git_toplevel, test_first_gate,
+};
 use crate::ops::pr_view::PrViewPayload;
 use crate::ops::pr_wait_checks::{Clock, SystemClock, WaitOutcome};
 use crate::ops::{
@@ -129,9 +131,18 @@ pub fn run_with<R: BackendRunner, C: Clock>(
         global.repo.as_deref(),
         git_remote_url,
     )?;
+    let remote_url = git_remote_url(&global.remote);
+    let repository_id = evidence_repository_id(&ctx, remote_url.as_deref(), global.repo.as_deref());
 
     if global.dry_run {
-        return Ok(emit_dry_run(&ctx, &args, format, workdir));
+        return Ok(emit_dry_run(
+            &ctx,
+            &args,
+            format,
+            workdir,
+            &global.remote,
+            repository_id.as_deref(),
+        ));
     }
 
     execute_sequence(runner, clock, global, &ctx, &args, format, workdir)
@@ -224,7 +235,17 @@ fn execute_sequence<R: BackendRunner, C: Clock>(
         // be delivered in an opted-in repo).
         let cfg = ForgeConfig::load_layered(workdir, find_git_toplevel(workdir).as_deref());
         let test_first_required = cfg.resolve_test_first_required(None);
-        if let Err(err) = validate_adopted(&view, args, workdir, test_first_required) {
+        let remote_url = git_remote_url(&global.remote);
+        let repository_id =
+            evidence_repository_id(ctx, remote_url.as_deref(), global.repo.as_deref());
+        if let Err(err) = validate_adopted(
+            &view,
+            args,
+            workdir,
+            &global.remote,
+            repository_id.as_deref(),
+            test_first_required,
+        ) {
             steps.push(Step {
                 step: "adopt",
                 ok: false,
@@ -457,6 +478,8 @@ fn validate_adopted(
     view: &PrViewPayload,
     args: &PrDeliverArgs,
     workdir: &Path,
+    remote: &str,
+    repository_id: Option<&str>,
     test_first_required: bool,
 ) -> Result<(), ForgeError> {
     let prefix = branch_name(&view.head)?;
@@ -469,6 +492,9 @@ fn validate_adopted(
         args.kind.into_kind(),
         test_first_required,
         args.test_first_evidence.as_deref(),
+        workdir,
+        remote,
+        repository_id,
     )?;
     Ok(())
 }
@@ -514,7 +540,13 @@ fn resolve_preview_body(args: &PrDeliverArgs) -> String {
 /// pass/fail the real run's `test_first_gate` would produce (exempt kinds such
 /// as docs/chore pass without evidence). Kept pure so the caller injects the
 /// resolved config and tests need no environment.
-fn test_first_preflight_verdict(args: &PrDeliverArgs, required: bool) -> Option<RuleVerdict> {
+fn test_first_preflight_verdict(
+    args: &PrDeliverArgs,
+    required: bool,
+    workdir: &Path,
+    remote: &str,
+    repository_id: Option<&str>,
+) -> Option<RuleVerdict> {
     if !required {
         return None;
     }
@@ -524,6 +556,9 @@ fn test_first_preflight_verdict(args: &PrDeliverArgs, required: bool) -> Option<
             args.kind.into_kind(),
             required,
             args.test_first_evidence.as_deref(),
+            workdir,
+            remote,
+            repository_id,
         ),
     ))
 }
@@ -533,6 +568,8 @@ fn emit_dry_run(
     args: &PrDeliverArgs,
     format: OutputFormat,
     workdir: &Path,
+    remote: &str,
+    repository_id: Option<&str>,
 ) -> i32 {
     let branch = match &args.head {
         Some(head) => head.clone(),
@@ -603,8 +640,13 @@ fn emit_dry_run(
     // the same verdict here instead of predicting a success the real deliver
     // would refuse.
     let cfg = ForgeConfig::load_layered(workdir, find_git_toplevel(workdir).as_deref());
-    if let Some(verdict) = test_first_preflight_verdict(args, cfg.resolve_test_first_required(None))
-    {
+    if let Some(verdict) = test_first_preflight_verdict(
+        args,
+        cfg.resolve_test_first_required(None),
+        workdir,
+        remote,
+        repository_id,
+    ) {
         local_preflight.push(verdict);
     }
 
@@ -1059,13 +1101,17 @@ mod tests {
     fn dry_run_verdict_absent_when_gate_off() {
         // The gate is off (no repo/global opt-in) → no test_first verdict so the
         // dry-run preflight stays identical to pre-gate behaviour.
-        assert!(test_first_preflight_verdict(&args(false), false).is_none());
+        assert!(
+            test_first_preflight_verdict(&args(false), false, Path::new("."), "origin", None)
+                .is_none()
+        );
     }
 
     #[test]
     fn dry_run_verdict_fails_feature_without_evidence_when_required() {
         let a = args(false); // feature, no --test-first-evidence
-        let verdict = test_first_preflight_verdict(&a, true).expect("verdict surfaced");
+        let verdict = test_first_preflight_verdict(&a, true, Path::new("."), "origin", None)
+            .expect("verdict surfaced");
         assert_eq!(verdict.rule, "test_first");
         assert!(
             !verdict.ok,
@@ -1081,7 +1127,8 @@ mod tests {
     fn dry_run_verdict_passes_exempt_kind_when_required() {
         let mut a = args(false);
         a.kind = PrKindFlag::Docs; // exempt kind needs no evidence
-        let verdict = test_first_preflight_verdict(&a, true).expect("verdict surfaced");
+        let verdict = test_first_preflight_verdict(&a, true, Path::new("."), "origin", None)
+            .expect("verdict surfaced");
         assert!(verdict.ok, "docs is exempt from the test-first gate");
     }
 
@@ -1095,7 +1142,12 @@ mod tests {
         .unwrap();
         let mut a = args(false);
         a.test_first_evidence = Some(dir.path().to_str().unwrap().to_string());
-        let verdict = test_first_preflight_verdict(&a, true).expect("verdict surfaced");
-        assert!(verdict.ok, "complete evidence must pass: {verdict:?}");
+        let verdict = test_first_preflight_verdict(&a, true, Path::new("."), "origin", None)
+            .expect("verdict surfaced");
+        assert!(
+            !verdict.ok,
+            "structurally complete but unbound evidence must fail: {verdict:?}"
+        );
+        assert_eq!(verdict.code.as_deref(), Some("test_first_evidence_unbound"));
     }
 }

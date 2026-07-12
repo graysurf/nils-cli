@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
     about = "Record test-first evidence and waivers for agent workflows.",
     long_about = "Create and verify durable test-first evidence records that capture contract impact, meaningful failures, waivers, residual gaps, and scoped final validation.",
     disable_help_subcommand = true,
-    after_help = "EXAMPLES:\n  test-first-evidence init --out /tmp/evidence --classification behavior-change --production-path src/lib.rs --changed-behavior 'new contract'\n  test-first-evidence record-impact --out /tmp/evidence --target tests/lib.rs::contract --disposition add-missing --protected-behavior 'new contract' --reason 'no owner test exists'\n  test-first-evidence record-failing --out /tmp/evidence --command 'cargo test contract' --exit-code 101 --summary 'bug reproduced' --expected-failure 'new contract missing' --observed-failure 'assertion mismatch'\n  test-first-evidence record-final --out /tmp/evidence --command 'cargo test contract' --status pass --scope focused\n  test-first-evidence record-gap --out /tmp/evidence --none\n  test-first-evidence verify --out /tmp/evidence --format json\n  test-first-evidence completion zsh\n\nENVIRONMENT:\n  none\n\nEXIT CODES:\n  0   success\n  1   runtime error\n  64  command-line usage error\n  65  invalid input data"
+    after_help = "EXAMPLES:\n  test-first-evidence init --out /tmp/evidence --classification behavior-change --production-path src/lib.rs --changed-behavior 'new contract'\n  test-first-evidence bind-baseline --out /tmp/evidence --project-path .\n  test-first-evidence record-impact --out /tmp/evidence --target tests/lib.rs::contract --disposition add-missing --protected-behavior 'new contract' --reason 'no owner test exists'\n  test-first-evidence record-failing --out /tmp/evidence --command 'cargo test contract' --exit-code 101 --summary 'bug reproduced' --expected-failure 'new contract missing' --observed-failure 'assertion mismatch'\n  test-first-evidence record-final --out /tmp/evidence --command 'cargo test contract' --status pass --scope focused\n  test-first-evidence record-gap --out /tmp/evidence --none\n  test-first-evidence bind-delivery --out /tmp/evidence --project-path .\n  test-first-evidence verify --out /tmp/evidence --project-path . --format json\n  test-first-evidence completion zsh\n\nENVIRONMENT:\n  none\n\nEXIT CODES:\n  0   success\n  1   runtime error\n  64  command-line usage error\n  65  invalid input data"
 )]
 pub struct Cli {
     #[command(subcommand)]
@@ -33,10 +33,14 @@ pub enum Command {
     RecordFinal(RecordFinalArgs),
     /// Record one residual gap or explicitly declare that none remain.
     RecordGap(RecordGapArgs),
+    /// Bind the immutable repository and pre-edit baseline subject.
+    BindBaseline(SubjectArgs),
+    /// Append an attestation for the current delivered head and diff.
+    BindDelivery(SubjectArgs),
     /// Query classified, pre-edit, or delivery readiness without mutating the record.
     Check(CheckArgs),
     /// Verify the evidence record is complete enough for delivery.
-    Verify(CommonArgs),
+    Verify(VerifyArgs),
     /// Print the current evidence record.
     Show(CommonArgs),
     /// Print shell completion script.
@@ -52,6 +56,42 @@ pub struct CommonArgs {
     /// Output format.
     #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
     pub format: OutputFormat,
+}
+
+#[derive(Debug, Args)]
+pub struct SubjectArgs {
+    #[command(flatten)]
+    pub common: CommonArgs,
+
+    /// Git repository whose baseline or delivery subject is being bound.
+    #[arg(long = "project-path", value_name = "DIR", value_hint = ValueHint::DirPath)]
+    pub project_path: PathBuf,
+
+    /// Git remote used for provider repository identity when available.
+    #[arg(long, default_value = "origin", value_name = "NAME")]
+    pub remote: String,
+
+    /// Stable repository identity override for provider/local targets without a usable remote.
+    #[arg(long = "repository-id", value_name = "ID")]
+    pub repository_id: Option<String>,
+}
+
+#[derive(Debug, Args)]
+pub struct VerifyArgs {
+    #[command(flatten)]
+    pub common: CommonArgs,
+
+    /// Also require the latest delivery subject to match this Git repository.
+    #[arg(long = "project-path", value_name = "DIR", value_hint = ValueHint::DirPath)]
+    pub project_path: Option<PathBuf>,
+
+    /// Git remote used for provider repository identity when available.
+    #[arg(long, default_value = "origin", value_name = "NAME")]
+    pub remote: String,
+
+    /// Stable repository identity override used when checking the subject.
+    #[arg(long = "repository-id", value_name = "ID", requires = "project_path")]
+    pub repository_id: Option<String>,
 }
 
 #[derive(Debug, Args)]
