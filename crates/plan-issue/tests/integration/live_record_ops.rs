@@ -200,6 +200,51 @@ fn record_close_live_observes_confirmed_provider_labels() {
 }
 
 #[test]
+fn forge_cli_stub_preserves_repeated_label_mutations() {
+    let tmp = TempDir::new().expect("tempdir");
+    let stub = StubBinDir::new();
+    stub.write_exe("forge-cli", common::forge_cli_stub_script());
+    let labels_path = tmp.path().join("labels.txt");
+    fs::write(&labels_path, "remove::one\nRemove Label\nkeep::me\n").expect("seed labels");
+    let labels_s = labels_path.to_string_lossy().to_string();
+
+    let out = nils_test_support::cmd::run(
+        &stub.path().join("forge-cli"),
+        &[
+            "--format",
+            "json",
+            "--provider",
+            "github",
+            "--repo",
+            "sympoies/nils-cli",
+            "issue",
+            "edit",
+            "42",
+            "--remove-label",
+            "remove::one",
+            "--remove-label",
+            "Remove Label",
+            "--add-label",
+            "add::one",
+            "--add-label",
+            "Add Label",
+        ],
+        &[("FORGE_CLI_STUB_LABELS_FILE", labels_s.as_str())],
+        None,
+    );
+
+    assert_eq!(out.code, 0, "{}", out.stderr_text());
+    assert_eq!(
+        fs::read_to_string(labels_path).expect("provider labels"),
+        "keep::me\nadd::one\nAdd Label\n"
+    );
+    assert_eq!(
+        out.stdout_json()["data"]["labels"],
+        json!(["keep::me", "add::one", "Add Label"])
+    );
+}
+
+#[test]
 fn record_post_state_with_payload_file_renders_v2_marker_in_dry_run() {
     let tmp = TempDir::new().expect("tempdir");
     let payload = tmp.path().join("state.json");

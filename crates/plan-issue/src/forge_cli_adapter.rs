@@ -359,13 +359,25 @@ impl ProviderAdapter for ForgeCliAdapter {
             })
             .collect::<Result<Vec<_>, _>>()?;
 
+        // GitHub label identity is case-insensitive. Local preserves exact
+        // strings, and GitLab's label arguments/read-back retain provider
+        // spelling, so those providers must not let a case-distinct label
+        // confirm or contradict a requested mutation.
+        let labels_equal = |actual: &str, requested: &str| {
+            if self.provider == "github" {
+                actual.eq_ignore_ascii_case(requested)
+            } else {
+                actual == requested
+            }
+        };
+
         let missing_add: Vec<&str> = trimmed_add
             .iter()
             .copied()
             .filter(|requested| {
                 !observed
                     .iter()
-                    .any(|actual| actual.eq_ignore_ascii_case(requested))
+                    .any(|actual| labels_equal(actual, requested))
             })
             .collect();
         let remaining_remove: Vec<&str> = trimmed_remove
@@ -374,7 +386,7 @@ impl ProviderAdapter for ForgeCliAdapter {
             .filter(|requested| {
                 observed
                     .iter()
-                    .any(|actual| actual.eq_ignore_ascii_case(requested))
+                    .any(|actual| labels_equal(actual, requested))
             })
             .collect();
 
@@ -973,6 +985,53 @@ mod tests {
 
         assert!(err.contains("type::test"), "{err}");
         assert!(err.contains("state::stale"), "{err}");
+    }
+
+    #[test]
+    fn edit_issue_labels_local_rejects_case_distinct_addition() {
+        let (adapter, _) = adapter_with_local(vec![
+            r#"{
+            "ok": true,
+            "schema_version": "cli.forge-cli.issue.edit.v1",
+            "data": {"provider":"local","number":7,"url":"u","state":"open","title":"t","labels":["bug"],"assignees":[]}
+        }"#,
+        ]);
+
+        let err = adapter
+            .edit_issue_labels("demo", 7, &["Bug".into()], &[])
+            .expect_err("a case-distinct Local label must not confirm the requested addition");
+
+        assert!(err.contains("Bug"), "{err}");
+    }
+
+    #[test]
+    fn edit_issue_labels_local_accepts_case_distinct_remaining_label_after_removal() {
+        let (adapter, _) = adapter_with_local(vec![
+            r#"{
+            "ok": true,
+            "schema_version": "cli.forge-cli.issue.edit.v1",
+            "data": {"provider":"local","number":7,"url":"u","state":"open","title":"t","labels":["bug"],"assignees":[]}
+        }"#,
+        ]);
+
+        adapter
+            .edit_issue_labels("demo", 7, &[], &["Bug".into()])
+            .expect("removing Local label `Bug` may leave distinct label `bug`");
+    }
+
+    #[test]
+    fn edit_issue_labels_github_accepts_case_normalized_read_back() {
+        let (adapter, _) = adapter_with_github(vec![
+            r#"{
+            "ok": true,
+            "schema_version": "cli.forge-cli.issue.edit.v1",
+            "data": {"provider":"github","number":7,"url":"u","state":"open","title":"t","labels":["bug"],"assignees":[]}
+        }"#,
+        ]);
+
+        adapter
+            .edit_issue_labels("g/p", 7, &["Bug".into()], &[])
+            .expect("GitHub label read-back remains case-insensitive");
     }
 
     #[test]
