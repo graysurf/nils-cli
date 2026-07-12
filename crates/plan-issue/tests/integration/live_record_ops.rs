@@ -99,8 +99,16 @@ fn audit_single_comment_body(body: &str) -> Value {
     out.stdout_json()["payload"]["result"]["audit"].clone()
 }
 
-fn run_live_record_close_label_case(
+struct LiveCloseLabelCase<'a> {
+    initial_labels: &'a str,
+    repo_labels_json: &'a str,
     drop_label_mutations: bool,
+    dry_run: bool,
+    explicit_remove: bool,
+}
+
+fn run_live_record_close_label_case_with(
+    case: LiveCloseLabelCase<'_>,
 ) -> (i32, Value, String, String, String) {
     let tmp = TempDir::new().expect("tempdir");
     let stub = StubBinDir::new();
@@ -119,7 +127,7 @@ fn run_live_record_close_label_case(
     let issue_state_path = tmp.path().join("issue-state.txt");
     let log_path = tmp.path().join("forge-cli.log");
     let state_dir = tmp.path().join("state-dir");
-    fs::write(&labels_path, "state::needs-triage\n").expect("seed labels");
+    fs::write(&labels_path, case.initial_labels).expect("seed labels");
     fs::write(&issue_state_path, "open\n").expect("seed issue state");
     fs::create_dir_all(&state_dir).expect("state dir");
 
@@ -127,26 +135,30 @@ fn run_live_record_close_label_case(
     let issue_state_s = issue_state_path.to_string_lossy().to_string();
     let log_s = log_path.to_string_lossy().to_string();
     let state_dir_s = state_dir.to_string_lossy().to_string();
-    let drop = if drop_label_mutations { "1" } else { "0" };
+    let drop = if case.drop_label_mutations { "1" } else { "0" };
+    let mut args = vec!["--format", "json"];
+    if case.dry_run {
+        args.push("--dry-run");
+    }
+    args.extend([
+        "--repo",
+        "sympoies/agent-runtime-kit",
+        "record",
+        "close",
+        "--issue",
+        "42",
+        "--linked-pr",
+        "sympoies/agent-runtime-kit#1",
+        "--approval",
+        "https://github.com/sympoies/agent-runtime-kit/issues/42#issuecomment-approval",
+        "--add-label",
+        "state::closed",
+    ]);
+    if case.explicit_remove {
+        args.extend(["--remove-label", "state::needs-triage"]);
+    }
     let out = common::run_plan_issue_with_options(
-        &[
-            "--format",
-            "json",
-            "--repo",
-            "sympoies/agent-runtime-kit",
-            "record",
-            "close",
-            "--issue",
-            "42",
-            "--linked-pr",
-            "sympoies/agent-runtime-kit#1",
-            "--approval",
-            "https://github.com/sympoies/agent-runtime-kit/issues/42#issuecomment-approval",
-            "--add-label",
-            "state::closed",
-            "--remove-label",
-            "state::needs-triage",
-        ],
+        &args,
         live_record_options(
             stub.path(),
             &[
@@ -155,6 +167,8 @@ fn run_live_record_close_label_case(
                 ("FORGE_CLI_STUB_LABELS_FILE", &labels_s),
                 ("FORGE_CLI_STUB_ISSUE_STATE_FILE", &issue_state_s),
                 ("FORGE_CLI_STUB_DROP_LABEL_MUTATIONS", drop),
+                ("FORGE_CLI_STUB_REPO_LABELS_JSON", case.repo_labels_json),
+                ("FORGE_CLI_STUB_STRICT_REPO_LABELS", "1"),
                 ("FORGE_CLI_STUB_LOG", &log_s),
                 ("PLAN_ISSUE_HOME", &state_dir_s),
             ],
@@ -166,6 +180,18 @@ fn run_live_record_close_label_case(
     let labels = fs::read_to_string(labels_path).expect("provider labels");
     let issue_state = fs::read_to_string(issue_state_path).expect("provider issue state");
     (out.code, envelope, log, labels, issue_state)
+}
+
+fn run_live_record_close_label_case(
+    drop_label_mutations: bool,
+) -> (i32, Value, String, String, String) {
+    run_live_record_close_label_case_with(LiveCloseLabelCase {
+        initial_labels: "state::needs-triage\n",
+        repo_labels_json: r#"[{"name":"state::needs-triage","color":"000000","description":""},{"name":"state::ready","color":"000000","description":""},{"name":"state::closed","color":"000000","description":""}]"#,
+        drop_label_mutations,
+        dry_run: false,
+        explicit_remove: true,
+    })
 }
 
 #[test]
@@ -197,6 +223,114 @@ fn record_close_live_observes_confirmed_provider_labels() {
         log.contains("issue edit 42 --add-label state::closed --remove-label state::needs-triage"),
         "{log}"
     );
+    assert_eq!(
+        envelope["payload"]["result"]["labels"]["confirmed"],
+        json!(["state::closed"])
+    );
+}
+
+#[test]
+fn record_close_missing_add_label_fails_before_provider_mutations() {
+    let (dry_code, dry_envelope, dry_log, dry_labels, dry_issue_state) =
+        run_live_record_close_label_case_with(LiveCloseLabelCase {
+            initial_labels: "state::ready\n",
+            repo_labels_json: r#"[{"name":"state::ready","color":"000000","description":""}]"#,
+            drop_label_mutations: false,
+            dry_run: true,
+            explicit_remove: false,
+        });
+    assert_eq!(dry_code, 0, "{dry_envelope}");
+    let dry_plan = &dry_envelope["payload"]["result"]["preview"]["labels"];
+    assert_eq!(dry_plan["availability"]["checked"], true);
+    assert_eq!(
+        dry_plan["availability"]["missing_additions"],
+        json!(["state::closed"])
+    );
+    assert_eq!(dry_labels, "state::ready\n");
+    assert_eq!(dry_issue_state, "open\n");
+    assert!(dry_log.contains("label list"), "{dry_log}");
+    assert!(!dry_log.contains("issue comment"), "{dry_log}");
+    assert!(!dry_log.contains("issue close"), "{dry_log}");
+
+    let (code, envelope, log, labels, issue_state) =
+        run_live_record_close_label_case_with(LiveCloseLabelCase {
+            initial_labels: "state::ready\n",
+            repo_labels_json: r#"[{"name":"state::ready","color":"000000","description":""}]"#,
+            drop_label_mutations: false,
+            dry_run: false,
+            explicit_remove: false,
+        });
+
+    assert_ne!(code, 0, "{envelope}");
+    assert_eq!(
+        envelope["error"]["code"],
+        "record-close-label-preflight-failed"
+    );
+    assert_eq!(labels, "state::ready\n");
+    assert_eq!(issue_state, "open\n");
+    assert!(log.contains("label list"), "{log}");
+    assert!(!log.contains("issue comment"), "{log}");
+    assert!(!log.contains("issue close"), "{log}");
+    assert!(!log.contains("issue edit 42"), "{log}");
+}
+
+#[test]
+fn record_close_normalizes_all_existing_state_labels() {
+    let (code, envelope, log, labels, issue_state) = run_live_record_close_label_case_with(
+        LiveCloseLabelCase {
+            initial_labels: "state::ready\nstate::needs-triage\nworkflow::tracking\n",
+            repo_labels_json: r#"[{"name":"state::ready","color":"000000","description":""},{"name":"state::needs-triage","color":"000000","description":""},{"name":"state::closed","color":"000000","description":""},{"name":"workflow::tracking","color":"000000","description":""}]"#,
+            drop_label_mutations: false,
+            dry_run: false,
+            explicit_remove: false,
+        },
+    );
+
+    assert_eq!(code, 0, "{envelope}");
+    assert_eq!(labels, "workflow::tracking\nstate::closed\n");
+    assert_eq!(issue_state, "closed\n");
+    assert!(
+        log.contains("issue edit 42 --add-label state::closed --remove-label state::needs-triage --remove-label state::ready")
+            || log.contains("issue edit 42 --add-label state::closed --remove-label state::ready --remove-label state::needs-triage"),
+        "{log}"
+    );
+    assert_eq!(
+        envelope["payload"]["result"]["labels"]["confirmed"],
+        json!(["state::closed", "workflow::tracking"])
+    );
+}
+
+#[test]
+fn record_close_live_dry_run_predicts_label_availability_and_final_set() {
+    let (code, envelope, log, labels, issue_state) = run_live_record_close_label_case_with(
+        LiveCloseLabelCase {
+            initial_labels: "state::ready\nworkflow::tracking\n",
+            repo_labels_json: r#"[{"name":"state::ready","color":"000000","description":""},{"name":"state::closed","color":"000000","description":""},{"name":"workflow::tracking","color":"000000","description":""}]"#,
+            drop_label_mutations: false,
+            dry_run: true,
+            explicit_remove: false,
+        },
+    );
+
+    assert_eq!(code, 0, "{envelope}");
+    let plan = &envelope["payload"]["result"]["preview"]["labels"];
+    assert_eq!(plan["availability"]["checked"], true);
+    assert_eq!(plan["availability"]["missing_additions"], json!([]));
+    assert_eq!(
+        plan["current"],
+        json!(["state::ready", "workflow::tracking"])
+    );
+    assert_eq!(plan["add"], json!(["state::closed"]));
+    assert_eq!(plan["remove"], json!(["state::ready"]));
+    assert_eq!(
+        plan["final"],
+        json!(["state::closed", "workflow::tracking"])
+    );
+    assert_eq!(labels, "state::ready\nworkflow::tracking\n");
+    assert_eq!(issue_state, "open\n");
+    assert!(log.contains("label list"), "{log}");
+    assert!(!log.contains("issue comment"), "{log}");
+    assert!(!log.contains("issue close"), "{log}");
 }
 
 #[test]
@@ -3111,6 +3245,34 @@ fn record_close_rejects_conflicting_label_mutations() {
     assert!(
         joined.contains("record-label-mutation-conflict"),
         "expected record-label-mutation-conflict code, got: {joined}"
+    );
+}
+
+#[test]
+fn record_close_rejects_multiple_terminal_state_additions() {
+    let fixture = Path::new("tests/fixtures/lifecycle/agent-runtime-kit-closeout").to_path_buf();
+    let out = common::run_plan_issue_local(&[
+        "--format",
+        "json",
+        "record",
+        "close",
+        "--issue",
+        "42",
+        "--linked-pr",
+        "sympoies/agent-runtime-kit#1",
+        "--approval",
+        "ok",
+        "--fixture",
+        fixture.to_str().expect("fixture path"),
+        "--add-label",
+        "state::closed",
+        "--add-label",
+        "state::ready",
+    ]);
+    assert_ne!(out.code, 0, "multiple terminal states must fail");
+    assert_eq!(
+        out.stdout_json()["error"]["code"],
+        "record-close-state-label-conflict"
     );
 }
 

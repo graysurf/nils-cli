@@ -352,8 +352,9 @@ through the provider directly (for example `gh issue view --json labels`,
 `forge-cli pr view`, or an equivalent provider-native call) and treat that
 check as a separate gate in their workflow. Label mutation remains the
 responsibility of `record open`, `record post`, and `record close` via
-`--label`, `--add-label`, and `--remove-label`; those write paths are
-unaffected.
+`--label`, `--add-label`, and `--remove-label`. `record close` additionally
+preflights requested additions against the repository label catalog and reads
+the issue label set so exclusive `state::*` siblings can be normalized.
 
 ### `plan-issue record repair-dashboard`
 
@@ -380,9 +381,13 @@ Strict, single-command closeout:
    `approve` / `comments-only`).
 3. Verifies linked PR evidence through provider state: every linked PR is
    merged, with `merge_sha` and CI status recorded.
-4. Renders and posts the `closeout` comment with structured payload.
-5. Renders and edits the `## Final Dashboard` issue body.
-6. Closes the provider issue.
+4. Before any provider write, verifies requested label additions exist and
+   computes one atomic label edit that removes every current `state::*` sibling
+   when a terminal state is added.
+5. Renders and posts the `closeout` comment with structured payload.
+6. Renders and edits the `## Final Dashboard` issue body.
+7. Closes the provider issue, applies the preflighted label edit, and reads the
+   final labels back to verify the requested mutations and state exclusivity.
 
 Provider-bound validation rejects machine-local home paths (`/Users/<owner>/...`
 or `/home/<owner>/...`) in live write payloads. Diagnostics identify the unsafe
@@ -398,6 +403,8 @@ non-optional. Inputs are limited to:
 - `--approval <url-or-text>`.
 - `--bundle <dir>` (optional; used to validate that the closed plan still
   matches local plan content).
+- `--add-label <name>` and `--remove-label <name>` (repeatable). At most one
+  `state::*` addition is allowed per close.
 - `--fixture <dir>` + `--body-file` + `--comments-json` for tests.
 - `--dry-run` for non-mutating previews.
 
@@ -425,6 +432,13 @@ Failure modes that block close:
   `--allow-non-required-check-failure-reason`).
 - `approval-missing` / `approval-invalid`.
 - `dashboard-out-of-date` (recomputed dashboard differs from issue body).
+- `record-close-state-label-conflict` when more than one terminal `state::*`
+  addition is requested.
+- `record-close-label-preflight-failed` when a requested addition is absent
+  from the repository catalog. Live dry-run reports the missing additions and
+  predicted final set without mutating the provider.
+- `record-close-label-convergence-failed` when final read-back does not confirm
+  every requested add/remove or still contains conflicting `state::*` labels.
 
 Each failure returns a stable machine-readable code that maps to a single
 unblock action.
@@ -466,7 +480,25 @@ json`:
 Examples of `payload`:
 
 - `record open` -> `{ "issue": {...}, "comments": {"source": "<url>", "plan": "<url>", "state": "<url>"} }`
-- `record close` -> `{ "issue": {...}, "closeout_url": "<url>", "final_dashboard": {...}, "linked_prs": [...] }`
+- `record close` includes the normalized label plan and provider read-back:
+
+  ```json
+  {
+    "issue": {"number": 42, "url": "<url>"},
+    "closeout_url": "<url>",
+    "final_dashboard": "<markdown>",
+    "linked_prs": [],
+    "labels": {
+      "requested": {"add": [], "remove": []},
+      "add": [],
+      "remove": [],
+      "current": [],
+      "final": [],
+      "availability": {"checked": true, "missing_additions": []},
+      "confirmed": []
+    }
+  }
+  ```
 
 ## Compatibility Layer
 

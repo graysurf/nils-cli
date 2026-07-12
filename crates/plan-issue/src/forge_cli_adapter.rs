@@ -35,6 +35,7 @@ use crate::adapter::{PrMergeSummary, ProviderAdapter};
 use crate::commands::plan::CloseReason;
 
 const TRACKER_ISSUE_SCAN_LIMIT: &str = "200";
+const REPOSITORY_LABEL_SCAN_LIMIT: &str = "200";
 
 /// Runner abstraction so unit tests can inject scripted forge-cli responses.
 pub trait ForgeCliRunner {
@@ -222,6 +223,43 @@ impl ProviderAdapter for ForgeCliAdapter {
         let comments_json = serde_json::to_string(&envelope)
             .map_err(|err| format!("failed to serialize issue evidence comments: {err}"))?;
         Ok((body, comments_json))
+    }
+
+    fn issue_labels(&self, repo: &str, issue: u64) -> Result<Vec<String>, String> {
+        let issue_str = issue.to_string();
+        let mut args = self.base_args(repo);
+        args.extend(["issue", "view", &issue_str]);
+        let data = self.run_envelope(&args)?;
+        data.get("labels")
+            .and_then(Value::as_array)
+            .ok_or_else(|| "forge-cli issue view data missing `labels`".to_string())?
+            .iter()
+            .map(|label| {
+                label.as_str().map(str::to_string).ok_or_else(|| {
+                    "forge-cli issue view data contains a non-string `labels` entry".to_string()
+                })
+            })
+            .collect()
+    }
+
+    fn repository_labels(&self, repo: &str) -> Result<Vec<String>, String> {
+        let mut args = self.base_args(repo);
+        args.extend(["label", "list", "--limit", REPOSITORY_LABEL_SCAN_LIMIT]);
+        let data = self.run_envelope(&args)?;
+        data.get("labels")
+            .and_then(Value::as_array)
+            .ok_or_else(|| "forge-cli label list data missing `labels`".to_string())?
+            .iter()
+            .map(|label| {
+                label
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+                    .ok_or_else(|| {
+                        "forge-cli label list data contains a label without `name`".to_string()
+                    })
+            })
+            .collect()
     }
 
     fn list_open_tracker_issues(&self, repo: &str, labels: &[String]) -> Result<Vec<u64>, String> {
@@ -921,6 +959,37 @@ mod tests {
             arr[0].get("created_at").and_then(Value::as_str),
             Some("2025-01-01T00:00:00Z")
         );
+    }
+
+    #[test]
+    fn issue_labels_reads_provider_confirmed_strings() {
+        let (adapter, handle) = adapter_with_github(vec![
+            r#"{"ok":true,"schema_version":"cli.forge-cli.issue.view.v1","data":{"provider":"github","number":42,"url":"u","state":"open","title":"t","body":"","labels":["state::ready","workflow::tracking"],"assignees":[]}}"#,
+        ]);
+        assert_eq!(
+            adapter.issue_labels("o/r", 42).expect("issue labels"),
+            vec!["state::ready", "workflow::tracking"]
+        );
+        let argv = &handle.calls()[0];
+        assert!(
+            argv.windows(3)
+                .any(|window| window == ["issue", "view", "42"])
+        );
+    }
+
+    #[test]
+    fn repository_labels_reads_catalog_names_with_explicit_limit() {
+        let (adapter, handle) = adapter_with(vec![
+            r#"{"ok":true,"schema_version":"cli.forge-cli.label.list.v1","data":{"provider":"gitlab","labels":[{"name":"state::ready","color":"000000","description":""},{"name":"state::closed","color":"000000","description":""}]}}"#,
+        ]);
+        assert_eq!(
+            adapter.repository_labels("g/p").expect("repository labels"),
+            vec!["state::ready", "state::closed"]
+        );
+        let argv = &handle.calls()[0];
+        assert!(argv.windows(2).any(|window| window == ["label", "list"]));
+        let limit = argv.iter().position(|value| value == "--limit").unwrap();
+        assert_eq!(argv[limit + 1], REPOSITORY_LABEL_SCAN_LIMIT);
     }
 
     #[test]

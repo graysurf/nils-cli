@@ -89,6 +89,9 @@ auditable but do not satisfy gate requirements once superseded.
    merged PR with a non-empty `merge_sha`.
 7. Approval evidence (`--approval`) is present and parses as a provider
    comment URL or non-empty approval text.
+8. Every requested label addition exists in the repository catalog. When one
+   `state::*` label is added, all current state siblings are included in the
+   same label edit; final read-back must contain only that state label.
 
 When any check fails, `record close` returns exit 1, posts no mutations,
 and emits a machine-readable failure code matching the spec

@@ -22,6 +22,13 @@ pub trait ProviderAdapter {
     /// issue-view-with-comments call.
     fn issue_evidence(&self, repo: &str, issue: u64) -> Result<(String, String), String>;
 
+    /// Read the provider-confirmed labels currently attached to an issue.
+    fn issue_labels(&self, repo: &str, issue: u64) -> Result<Vec<String>, String>;
+
+    /// Read the repository label catalog used to preflight requested label
+    /// additions before an irreversible closeout mutation.
+    fn repository_labels(&self, repo: &str) -> Result<Vec<String>, String>;
+
     /// Enumerate open tracker issues to consider for `record open` resume,
     /// scoped by `labels` (AND semantics; an empty slice lists every open
     /// issue). Returns the issue numbers; the caller reads each one's
