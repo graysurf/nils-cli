@@ -883,6 +883,10 @@ macros:
       # lifecycle then resumes at wait_checks. The lookup is not a recorded step.
       - { step: adopt,              op: pr.view,   when: "open PR exists for head branch" }
       - { step: create,             op: pr.create, when: "no open PR exists for head branch" }
+      # GitHub delivery starts required-only. When that snapshot reports zero
+      # required checks but retains visible rows, the macro re-gates those rows
+      # as all-checks and polls only if pending, using the same timeout budget.
+      # An empty visible set succeeds immediately; GitLab semantics are unchanged.
       - { step: wait_checks,        op: pr.wait-checks }
       - { step: ready,              op: pr.ready,  skip_when: "--no-merge" }
       - { step: merge,              op: pr.merge,  skip_when: "--no-merge" }

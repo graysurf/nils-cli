@@ -922,7 +922,7 @@ pub struct PrDeliverArgs {
     /// baseline/delivery subject matching the current checkout.
     #[arg(long = "test-first-evidence", value_name = "DIR")]
     pub test_first_evidence: Option<String>,
-    /// CI-wait budget before declaring `checks_timeout` (default `30m`).
+    /// Cumulative CI-wait budget before declaring `checks_timeout` (default `30m`).
     #[arg(long, value_parser = parse_duration, default_value = "30m")]
     pub timeout: Duration,
     /// Stop after `pr.wait-checks` — do not promote to ready or merge.

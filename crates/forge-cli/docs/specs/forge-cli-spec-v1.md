@@ -630,7 +630,14 @@ Steps:
    inputs are ignored on adoption — the existing PR keeps its own.
 4. `pr create --draft` — atom; validates branch / title / body. Only
    runs when the lookup found nothing.
-5. `pr wait-checks` — atom; blocks until terminal.
+5. `pr wait-checks` — atom; blocks until terminal within one cumulative
+   `--timeout` budget. Delivery keeps the explicit atom's required-only
+   behavior, but on GitHub a successful required-only snapshot with zero
+   required checks and visible check rows is re-gated against all visible
+   checks. A terminal retained snapshot needs no extra provider request;
+   pending visible checks continue polling in all-check mode with only the
+   remaining timeout. Failed visible checks block delivery. A genuinely empty
+   check set completes immediately. GitLab behavior is unchanged.
 6. `pr ready` — atom; only if previous step is `success`.
 7. `pr merge` — atom; honours `--method` and repo override.
 8. Emit single envelope summarising every sub-step output under
