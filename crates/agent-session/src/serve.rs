@@ -8212,16 +8212,22 @@ mod tests {
         let lock = GlobalStateLock::new();
         let tmp = tempfile::TempDir::new().unwrap();
         let cwd = tmp.path().join("repo");
-        let runtime_dir = tmp.path().join("run");
+        let runtime_dir = tempfile::Builder::new()
+            .prefix("cx-")
+            .tempdir_in("/tmp")
+            .unwrap();
         let log = tmp.path().join("tmux.log");
         fs::create_dir(&cwd).unwrap();
-        fs::create_dir(&runtime_dir).unwrap();
         let codex = executable(
             &tmp.path().join("codex-app-server"),
             "#!/usr/bin/env sh\nif [ \"$1\" = app-server ] && [ \"$2\" = --help ]; then printf '%s\\n' '  --listen <URL>'; fi\n",
         );
         let _codex_bin = EnvGuard::set(&lock, "AGENT_SESSION_CODEX_BIN", codex.to_str().unwrap());
-        let _runtime_dir = EnvGuard::set(&lock, "XDG_RUNTIME_DIR", runtime_dir.to_str().unwrap());
+        let _runtime_dir = EnvGuard::set(
+            &lock,
+            "XDG_RUNTIME_DIR",
+            runtime_dir.path().to_str().unwrap(),
+        );
         let _runtime_mode = EnvGuard::set(&lock, "AGENT_SESSION_CODEX_RUNTIME", "app-server");
         let _capture_timeout = EnvGuard::set(&lock, "AGENT_SESSION_CODEX_CAPTURE_TIMEOUT_MS", "10");
         let st = state(tmp.path(), Some(TOKEN), logging_tmux(tmp.path(), &log));

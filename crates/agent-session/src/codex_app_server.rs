@@ -938,10 +938,15 @@ mod tests {
     #[test]
     fn explicit_cleanup_removes_only_the_derived_runtime_files() {
         let lock = GlobalStateLock::new();
-        let tmp = tempfile::TempDir::new().unwrap();
-        let runtime_dir = tmp.path().join("run");
-        fs::create_dir(&runtime_dir).unwrap();
-        let _runtime_dir = EnvGuard::set(&lock, "XDG_RUNTIME_DIR", runtime_dir.to_str().unwrap());
+        let runtime_dir = tempfile::Builder::new()
+            .prefix("cx-")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let _runtime_dir = EnvGuard::set(
+            &lock,
+            "XDG_RUNTIME_DIR",
+            runtime_dir.path().to_str().unwrap(),
+        );
         let socket = allocate_socket_path("cleanup-runtime").unwrap();
         let record = record_with_runtime("cleanup-runtime", &socket);
         for path in [
