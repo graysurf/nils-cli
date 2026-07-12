@@ -93,7 +93,7 @@ validations_catalog:
     exit: DATA
   test_first_evidence:
     rule: "when [test_first].require resolves true (repo or global config) and --kind is feature/bug, --test-first-evidence <dir> must point at a verified v2 record with a testable classification, contract delta, affected-test decision, meaningful failing evidence or explicit waiver, scoped passing validation, and residual-gap declaration; docs/chore/ci/refactor are exempt"
-    error_kind: test_first_evidence_required | test_first_evidence_legacy | test_first_evidence_classification | test_first_evidence_incomplete | test_first_evidence_unreadable
+    error_kind: test_first_evidence_required | test_first_evidence_v1 | test_first_evidence_classification | test_first_evidence_incomplete | test_first_evidence_unreadable
     exit: DATA
 
 # ---------------------------------------------------------------------------

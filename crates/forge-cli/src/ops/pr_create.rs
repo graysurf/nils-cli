@@ -186,7 +186,7 @@ pub(crate) fn test_first_gate(
         Ok(result) if result.record.schema_version == "test-first-evidence.record.v1" => {
             Err(ForgeError::validation(
                 schema_err(),
-                "test_first_evidence_legacy",
+                "test_first_evidence_v1",
                 format!(
                     "test-first evidence at '{dir}' uses record v1; re-record the change with test-first-evidence v2"
                 ),
@@ -1076,7 +1076,7 @@ mod tests {
     }
 
     #[test]
-    fn test_first_gate_rejects_legacy_record_with_rerecord_error() {
+    fn test_first_gate_rejects_v1_record_with_rerecord_error() {
         let dir = tempfile::tempdir().unwrap();
         write_evidence(
             dir.path(),
@@ -1084,7 +1084,7 @@ mod tests {
         );
         let err =
             test_first_gate(PrKind::Feature, true, dir.path().to_str()).expect_err("v1 record");
-        assert_eq!(err.kind(), "test_first_evidence_legacy");
+        assert_eq!(err.kind(), "test_first_evidence_v1");
         assert!(err.to_string().contains("re-record"));
     }
 

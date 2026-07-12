@@ -26,7 +26,7 @@ const EXIT_USAGE: i32 = exit::USAGE;
 const EXIT_DATA: i32 = exit::DATA;
 
 const RECORD_SCHEMA_VERSION: &str = "test-first-evidence.record.v2";
-const LEGACY_RECORD_SCHEMA_VERSION: &str = "test-first-evidence.record.v1";
+const V1_RECORD_SCHEMA_VERSION: &str = "test-first-evidence.record.v1";
 const RECORD_FILE_NAME: &str = "test-first-evidence.json";
 
 const INIT_SCHEMA_VERSION: &str = "cli.test-first-evidence.init.v2";
@@ -133,7 +133,7 @@ fn check(args: &CheckArgs) -> Result<CheckResult, CliError> {
             paths: Vec::new(),
         }),
         CheckPhase::Delivery => {
-            if record.schema_version == LEGACY_RECORD_SCHEMA_VERSION {
+            if record.schema_version == V1_RECORD_SCHEMA_VERSION {
                 return Err(v1_record_error(None));
             }
             let missing = missing_evidence_fields(&record);
@@ -367,13 +367,13 @@ fn run_record_impact(args: RecordImpactArgs) -> i32 {
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .map(|value| redact_text(value).value);
-        if disposition == TestDisposition::RemoveObsolete
+        if disposition == TestDisposition::RemoveSuperseded
             && owner_test.is_none()
             && !args.invariant_retired
         {
             return Err(CliError::data(
-                "remove-obsolete-owner-required",
-                "remove-obsolete requires --owner-test or --invariant-retired",
+                "remove-superseded-owner-required",
+                "remove-superseded requires --owner-test or --invariant-retired",
                 None,
             ));
         }
@@ -701,7 +701,7 @@ where
 {
     let record_file = record_file_path(out_dir)?;
     let mut record = read_record(&record_file)?;
-    if record.schema_version == LEGACY_RECORD_SCHEMA_VERSION {
+    if record.schema_version == V1_RECORD_SCHEMA_VERSION {
         return Err(v1_record_error(None));
     }
     update(&mut record)?;
@@ -711,7 +711,7 @@ where
 
 fn verify_record(args: &CommonArgs) -> Result<VerifyResult, CliError> {
     let result = read_record_result(args.out_dir.as_path())?;
-    if result.record.schema_version == LEGACY_RECORD_SCHEMA_VERSION {
+    if result.record.schema_version == V1_RECORD_SCHEMA_VERSION {
         return Err(v1_record_error(Some(result.record_file)));
     }
     let missing = missing_evidence_fields(&result.record);
@@ -729,7 +729,7 @@ fn v1_record_error(record_file: Option<String>) -> CliError {
         "v1 evidence is read-only and must be re-recorded as v2 for strict checks",
         Some(json!({
             "record_file": record_file,
-            "schema_version": LEGACY_RECORD_SCHEMA_VERSION,
+            "schema_version": V1_RECORD_SCHEMA_VERSION,
             "expected": RECORD_SCHEMA_VERSION,
         })),
     )
@@ -784,13 +784,13 @@ fn read_record(record_file: &Path) -> Result<EvidenceRecord, CliError> {
     })?;
 
     if record.schema_version != RECORD_SCHEMA_VERSION
-        && record.schema_version != LEGACY_RECORD_SCHEMA_VERSION
+        && record.schema_version != V1_RECORD_SCHEMA_VERSION
     {
         return Err(CliError::runtime(
             "unsupported-record-version",
             format!(
                 "unsupported record schema_version {}; expected {} or readable previous schema {}",
-                record.schema_version, RECORD_SCHEMA_VERSION, LEGACY_RECORD_SCHEMA_VERSION
+                record.schema_version, RECORD_SCHEMA_VERSION, V1_RECORD_SCHEMA_VERSION
             ),
             Some(json!({
                 "record_file": display_path(record_file),
@@ -845,8 +845,8 @@ fn record_result(record_file: PathBuf, record: EvidenceRecord) -> RecordResult {
 }
 
 fn missing_evidence_fields(record: &EvidenceRecord) -> Vec<String> {
-    if record.schema_version == LEGACY_RECORD_SCHEMA_VERSION {
-        return vec!["legacy_record_v1".to_string()];
+    if record.schema_version == V1_RECORD_SCHEMA_VERSION {
+        return vec!["record_v1_requires_rerecording".to_string()];
     }
 
     let mut missing = Vec::new();
@@ -882,7 +882,7 @@ fn missing_evidence_fields(record: &EvidenceRecord) -> Vec<String> {
             missing.push("test_impact_identity_and_rationale".to_string());
         }
         if record.test_impacts.iter().any(|impact| {
-            impact.disposition == TestDisposition::RemoveObsolete
+            impact.disposition == TestDisposition::RemoveSuperseded
                 && impact
                     .owner_test
                     .as_deref()

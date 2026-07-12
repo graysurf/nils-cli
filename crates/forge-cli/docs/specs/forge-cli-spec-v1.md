@@ -979,7 +979,7 @@ an actual changed/added/removed behavior, an affected-test decision, meaningful
 failing evidence or an explicit waiver, scoped passing validation, and a
 residual-gap declaration. Record v1 remains readable but cannot satisfy this
 gate. `docs` / `chore` / `ci` / `refactor` kinds are exempt. Failures
-surface as `test_first_evidence_required`, `test_first_evidence_legacy`,
+surface as `test_first_evidence_required`, `test_first_evidence_v1`,
 `test_first_evidence_classification`, `test_first_evidence_incomplete`, or
 `test_first_evidence_unreadable` (exit `DATA`).
 

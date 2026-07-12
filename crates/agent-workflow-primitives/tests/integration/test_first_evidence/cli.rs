@@ -977,7 +977,7 @@ fn invalid_maintenance_decisions_fail_with_stable_codes() {
             "--target",
             "tests::v1_behavior",
             "--disposition",
-            "remove-obsolete",
+            "remove-superseded",
             "--protected-behavior",
             "removed v1 behavior",
             "--reason",
@@ -989,7 +989,7 @@ fn invalid_maintenance_decisions_fail_with_stable_codes() {
     assert_eq!(removal.code, 65, "stderr={}", removal.stderr_text());
     assert_eq!(
         removal.stdout_json()["error"]["code"],
-        "remove-obsolete-owner-required"
+        "remove-superseded-owner-required"
     );
 
     let deferred = run(
@@ -1033,7 +1033,7 @@ fn missing_record_fails_with_json_error() {
 }
 
 #[test]
-fn legacy_v1_is_readable_but_strict_verify_requires_rerecording() {
+fn record_v1_is_readable_but_strict_verify_requires_rerecording() {
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let out_dir = tmp.path().join("v1-record");
     fs::create_dir_all(&out_dir).expect("v1 record dir");

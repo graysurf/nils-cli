@@ -292,7 +292,7 @@ pub enum ValidationStatus {
 pub enum TestDisposition {
     Keep,
     UpdateSpec,
-    RemoveObsolete,
+    RemoveSuperseded,
     AddMissing,
     RefactorOnly,
 }
@@ -392,7 +392,7 @@ impl TestDisposition {
         match self {
             Self::Keep => "keep",
             Self::UpdateSpec => "update-spec",
-            Self::RemoveObsolete => "remove-obsolete",
+            Self::RemoveSuperseded => "remove-superseded",
             Self::AddMissing => "add-missing",
             Self::RefactorOnly => "refactor-only",
         }
