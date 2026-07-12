@@ -245,11 +245,14 @@ stop the two from drifting once a tracking issue exists:
   under `execution_state_sync`. A follow-up commit of the patched bundle is
   required before the workflow continues.
 - `record close` writes the terminal state back (`- Status:` to a terminal
-  value, `- Last updated:`, `- Branch/commit/PR:`, and the issue URL) through
-  the bundle `--bundle` directory, so the in-repo file is final immediately
-  after closeout rather than transient-stale until `plan-archive migrate`. The
-  `## Task Ledger` rows are not touched here — they are owned by per-task
-  `plan-tooling ledger-update` and the `close-ready` `ledger-rows-pending` gate.
+  value, `- Current task:` and `- Next task:` to closed-state values, `- Last
+  updated:`, `- Branch/commit/PR:`, the issue URL, and a non-actionable
+  `## Handoff`) through the bundle `--bundle` directory. The fields are
+  transformed in memory and committed with one atomic file write, so the
+  in-repo file is coherent immediately after closeout rather than
+  transient-stale until `plan-archive migrate`. The `## Task Ledger` rows are
+  not touched here — they are owned by per-task `plan-tooling ledger-update`
+  and the `close-ready` `ledger-rows-pending` gate.
 - `tracking checkpoint --live` reconciles the durable `Tracking issue` bullet
   with run-state: a missing or placeholder URL is self-healed (the URL is
   derived offline from the repo slug) and a genuine issue mismatch refuses with
@@ -258,8 +261,9 @@ stop the two from drifting once a tracking issue exists:
   `execution-state-issue-missing` or `execution-state-issue-mismatch` and points
   at the repair command rather than self-healing.
 - `plan-tooling exec-state-sync` is the offline, byte-preserving repair surface
-  for existing bundles (issue exists, but the local Markdown lacks the URL or is
-  frozen mid-flight).
+  for existing bundles (issue exists, but the local Markdown lacks the URL or
+  is frozen mid-flight). Its `--current-task`, `--next-task`, and `--handoff`
+  options expose the same terminal-field writer used by `record close`.
 
 This is complementary to `plan-archive migrate`, whose archived-header rewrite
 remains the archive-time step: closeout writeback produces the

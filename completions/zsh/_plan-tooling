@@ -118,6 +118,9 @@ _arguments "${_arguments_options[@]}" : \
 '--status=[Terminal \`Status\` value]:text:_default' \
 '--last-updated=[\`Last updated\` stamp]:date:_default' \
 '--branch-commit-pr=[\`Branch/commit/PR\` value]:text:_default' \
+'--current-task=[\`Current task\` value]:text:_default' \
+'--next-task=[\`Next task\` value]:text:_default' \
+'--handoff=[Replacement body for the \`## Handoff\` section]:markdown:_default' \
 '--format=[Output format]:fmt:(text json)' \
 '--dry-run[Report the change set without writing the file]' \
 '-h[Print help]' \

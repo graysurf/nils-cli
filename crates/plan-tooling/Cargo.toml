@@ -23,6 +23,7 @@ clap_complete = { workspace = true }
 nils-build-info = { version = "1.21.22", path = "../nils-build-info" }
 serde = { workspace = true }
 serde_json = { workspace = true }
+pulldown-cmark = { workspace = true }
 
 [dev-dependencies]
 nils-test-support = { version = "1.21.22", path = "../nils-test-support" }

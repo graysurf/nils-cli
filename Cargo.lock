@@ -2517,6 +2517,7 @@ dependencies = [
  "nils-term",
  "nils-test-support",
  "pretty_assertions",
+ "pulldown-cmark",
  "serde",
  "serde_json",
  "tempfile",
