@@ -22,11 +22,11 @@
 
 | ID | Status | Task | Evidence | Notes |
 | --- | --- | --- | --- | --- |
-| 1.1 | completed | Build the isolated OTLP capture harness | `codex-otel-auto-resume-spike-evidence.md` | Loopback-only; raw fields discarded at ingestion. |
-| 1.2 | completed | Capture a non-exhausted installed-TUI turn | baseline projection | Exact resume/thread and turn ids matched. |
-| 2.1 | completed | Capture the real exhausted turn | exhausted projection | `poies` reached 100%; reset credits remained 2. |
-| 2.2 | completed | Test concurrent-session attribution | correlation model | Thread attribution passed; causal classification remained unproved. |
-| 3.1 | completed | Reconcile evidence and decide next tier | acceptance matrix | Blocked; keep Codex unsupported. |
+| 1.1 | done | Build the isolated OTLP capture harness | `codex-otel-auto-resume-spike-evidence.md` | Loopback-only; raw fields discarded at ingestion. |
+| 1.2 | done | Capture a non-exhausted installed-TUI turn | baseline projection | Exact resume/thread and turn ids matched. |
+| 2.1 | done | Capture the real exhausted turn | exhausted projection | `poies` reached 100%; reset credits remained 2. |
+| 2.2 | done | Test concurrent-session attribution | thread-attribution model | Thread attribution passed; causal classification remained unproved. |
+| 3.1 | done | Reconcile evidence and decide next tier | blocked acceptance matrix | Blocked; keep Codex unsupported. |
 
 ## Session Log
 
