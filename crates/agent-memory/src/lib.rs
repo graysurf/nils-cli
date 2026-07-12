@@ -1,4 +1,5 @@
 mod add;
+mod archive;
 mod candidate;
 mod check;
 mod cli;
@@ -99,6 +100,7 @@ fn dispatch(cli: Cli) -> Result<i32, CliError> {
         Command::Search(args) => search::run(&layout, &args),
         Command::Recall(args) => recall::run(&layout, &args),
         Command::Candidate(args) => candidate::run(&layout, &args),
+        Command::Archive(args) => archive::run(&layout, &args),
         Command::Completion(args) => Ok(completion::run(args.shell)),
         Command::Help => print_help(),
     }
@@ -181,6 +183,10 @@ impl Layout {
 
     fn candidates_dir(&self) -> PathBuf {
         self.root.join("candidates")
+    }
+
+    fn archive_dir(&self) -> PathBuf {
+        self.root.join("archive")
     }
 
     fn resolve_scope(&self, scope: Option<&str>) -> Result<PathBuf, CliError> {
