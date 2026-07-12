@@ -622,7 +622,8 @@ fn section_bounds(raw: &str, heading: &str) -> Result<Option<(usize, usize)>, &'
         let end = raw[..section.end]
             .bytes()
             .filter(|byte| *byte == b'\n')
-            .count();
+            .count()
+            + usize::from(section.end == raw.len() && !raw.ends_with('\n'));
         (start, end)
     }))
 }
@@ -984,6 +985,26 @@ mod tests {
             tracking_issue_value("## Execution State\n\n- Tracking issue: not yet opened\n")
                 .as_deref(),
             Some("not yet opened")
+        );
+    }
+
+    #[test]
+    fn reads_and_updates_last_bullet_without_trailing_newline() {
+        let raw = "## Execution State\n\n- Status: active\n- Tracking issue: not yet opened";
+        assert_eq!(tracking_issue_value(raw).as_deref(), Some("not yet opened"));
+
+        let (out, change) = set_bullet(
+            raw,
+            Path::new("x.md"),
+            TRACKING_ISSUE_LABEL,
+            "<https://github.com/o/r/issues/9>",
+        )
+        .expect("set");
+        assert_eq!(change.action, BulletAction::Patched);
+        assert_eq!(out.matches("- Tracking issue:").count(), 1);
+        assert_eq!(
+            out,
+            "## Execution State\n\n- Status: active\n- Tracking issue: <https://github.com/o/r/issues/9>"
         );
     }
 
