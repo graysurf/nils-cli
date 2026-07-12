@@ -7819,13 +7819,16 @@ mod tests {
         let broker = ActivityBroker::for_test(MACHINE);
         let source_revision = Arc::new(AtomicUsize::new(0));
         let sampled_revisions = Arc::new(StdMutex::new(Vec::new()));
+        let (sampled_tx, mut sampled_rx) = watch::channel(0_usize);
         let observed_revision = source_revision.clone();
         let observed_samples = sampled_revisions.clone();
         let collector: SessionCollector = Arc::new(move |_, _| {
+            let revision = observed_revision.load(Ordering::SeqCst);
             observed_samples
                 .lock()
                 .expect("sampled revision lock")
-                .push(observed_revision.load(Ordering::SeqCst));
+                .push(revision);
+            sampled_tx.send_replace(revision);
             Ok(Vec::new())
         });
         let (change_tx, change_rx) = mpsc::channel(1);
@@ -7856,8 +7859,21 @@ mod tests {
             tokio::task::yield_now().await;
         }
         tokio::time::advance(ACTIVITY_STREAM_MAX_REFRESH_CADENCE + ACTIVITY_STREAM_DEBOUNCE).await;
-        for _ in 0..16 {
-            tokio::task::yield_now().await;
+        let (deadline_tx, mut deadline_rx) = mpsc::unbounded_channel();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_secs(5));
+            let _ = deadline_tx.send(());
+        });
+        tokio::select! {
+            _ = async {
+                loop {
+                    if *sampled_rx.borrow_and_update() == notifications {
+                        break;
+                    }
+                    sampled_rx.changed().await.expect("sampled revision channel");
+                }
+            } => {}
+            _ = deadline_rx.recv() => panic!("activity refresh did not sample revision {notifications}"),
         }
 
         let mut starts = Vec::new();
