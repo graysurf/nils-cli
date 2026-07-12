@@ -35,6 +35,11 @@ _arguments "${_arguments_options[@]}" : \
 '--classification=[Change classification such as behavior-change, bug-fix, docs-only, or generated-only]:TEXT:_default' \
 '*--production-path=[Production path affected by the change. Repeat for multiple paths]:PATH:_files' \
 '*--note=[Optional note to keep with the record. Repeat for multiple notes]:TEXT:_default' \
+'*--retained-behavior=[Existing behavior or invariant that must remain unchanged. Repeatable]:TEXT:_default' \
+'*--changed-behavior=[Existing behavior intentionally changed by this work. Repeatable]:TEXT:_default' \
+'*--removed-behavior=[Existing behavior intentionally removed by this work. Repeatable]:TEXT:_default' \
+'*--added-behavior=[New behavior added by this work. Repeatable]:TEXT:_default' \
+'*--invariant=[Cross-change invariant that must continue to hold. Repeatable]:TEXT:_default' \
 '--force[Overwrite an existing record]' \
 '-h[Print help]' \
 '--help[Print help]' \
@@ -47,8 +52,26 @@ _arguments "${_arguments_options[@]}" : \
 '--command=[Command or manual step that produced the before-fix failure]:TEXT:_default' \
 '--exit-code=[Exit code from the failing command]:CODE:_default' \
 '--summary=[Concise failure summary]:TEXT:_default' \
+'--expected-failure=[Failure that should occur because the intended behavior is not implemented yet]:TEXT:_default' \
+'--observed-failure=[Failure actually observed in the before-fix run]:TEXT:_default' \
 '--test-name=[Optional test name or scenario identifier]:TEXT:_default' \
 '*--artifact=[Optional evidence artifact path. Repeat for multiple artifacts]:PATH:_files' \
+'-h[Print help]' \
+'--help[Print help]' \
+&& ret=0
+;;
+(record-impact)
+_arguments "${_arguments_options[@]}" : \
+'--out=[Evidence artifact directory containing \`test-first-evidence.json\`]:DIR:_files -/' \
+'--format=[Output format]:FORMAT:(text json)' \
+'--target=[Test name, path, suite, fixture family, or snapshot group]:TEXT:_default' \
+'--disposition=[Planned disposition for the affected target]:DISPOSITION:(keep update-spec remove-obsolete add-missing refactor-only)' \
+'--protected-behavior=[Behavior or risk protected by the target]:TEXT:_default' \
+'--reason=[Why this disposition is correct. Required for both target and none forms]:TEXT:_default' \
+'--owner-test=[Replacement or primary owner test when another target preserves the contract]:TEXT:_default' \
+'*--validation-scope=[Final validation scopes required by this impact. Repeatable]:VALIDATION_SCOPES:(focused affected-suite contract-consumer full manual)' \
+'--none[Declare that no existing test target is materially affected]' \
+'--invariant-retired[Confirm that a removed test'\''s protected invariant is intentionally retired]' \
 '-h[Print help]' \
 '--help[Print help]' \
 && ret=0
@@ -58,7 +81,11 @@ _arguments "${_arguments_options[@]}" : \
 '--out=[Evidence artifact directory containing \`test-first-evidence.json\`]:DIR:_files -/' \
 '--format=[Output format]:FORMAT:(text json)' \
 '--reason=[Reason failing-test evidence was not practical]:TEXT:_default' \
+'--waiver-kind=[Whether the change is permanently non-testable or carries deferred test debt]:WAIVER_KIND:(non-testable deferred-debt)' \
+'--why-no-red=[Why meaningful failing evidence cannot be captured now]:TEXT:_default' \
 '*--substitute-validation=[Substitute validation captured before editing. Repeat for multiple items]:TEXT:_default' \
+'--follow-up=[Durable follow-up issue or action for deferred test debt]:TEXT:_default' \
+'--expires=[Expiry or removal condition for deferred test debt]:TEXT:_default' \
 '-h[Print help]' \
 '--help[Print help]' \
 && ret=0
@@ -69,8 +96,21 @@ _arguments "${_arguments_options[@]}" : \
 '--format=[Output format]:FORMAT:(text json)' \
 '--command=[Final validation command or manual validation step]:TEXT:_default' \
 '--status=[Final validation status]:STATUS:(pass fail)' \
+'--scope=[Risk scope proven by this validation]:SCOPE:(focused affected-suite contract-consumer full manual)' \
 '--summary=[Optional final validation summary]:TEXT:_default' \
 '*--artifact=[Optional validation artifact path. Repeat for multiple artifacts]:PATH:_files' \
+'-h[Print help]' \
+'--help[Print help]' \
+&& ret=0
+;;
+(record-gap)
+_arguments "${_arguments_options[@]}" : \
+'--out=[Evidence artifact directory containing \`test-first-evidence.json\`]:DIR:_files -/' \
+'--format=[Output format]:FORMAT:(text json)' \
+'--gap=[Residual gap accepted for this delivery]:TEXT:_default' \
+'--reason=[Why the residual gap is acceptable now]:TEXT:_default' \
+'--follow-up=[Durable follow-up issue or action for the gap]:TEXT:_default' \
+'--none[Explicitly declare that no residual validation or coverage gaps remain]' \
 '-h[Print help]' \
 '--help[Print help]' \
 && ret=0
@@ -119,8 +159,10 @@ _test-first-evidence_commands() {
     local commands; commands=(
 'init:Create a deterministic evidence record' \
 'record-failing:Record a failing test or reproducible failure before the fix' \
+'record-impact:Record one materially affected test target or declare none exist' \
 'record-waiver:Record an explicit waiver when failing evidence is not practical' \
 'record-final:Record final validation after the implementation' \
+'record-gap:Record one residual gap or explicitly declare that none remain' \
 'check:Query classified, pre-edit, or delivery readiness without mutating the record' \
 'verify:Verify the evidence record is complete enough for delivery' \
 'show:Print the current evidence record' \
@@ -152,6 +194,16 @@ _test-first-evidence__subcmd__record-failing_commands() {
 _test-first-evidence__subcmd__record-final_commands() {
     local commands; commands=()
     _describe -t commands 'test-first-evidence record-final commands' commands "$@"
+}
+(( $+functions[_test-first-evidence__subcmd__record-gap_commands] )) ||
+_test-first-evidence__subcmd__record-gap_commands() {
+    local commands; commands=()
+    _describe -t commands 'test-first-evidence record-gap commands' commands "$@"
+}
+(( $+functions[_test-first-evidence__subcmd__record-impact_commands] )) ||
+_test-first-evidence__subcmd__record-impact_commands() {
+    local commands; commands=()
+    _describe -t commands 'test-first-evidence record-impact commands' commands "$@"
 }
 (( $+functions[_test-first-evidence__subcmd__record-waiver_commands] )) ||
 _test-first-evidence__subcmd__record-waiver_commands() {

@@ -64,7 +64,8 @@ review-specialists merge --input findings.jsonl --summary-out review.md
 model-cross-check init --out /tmp/cross-check --prompt "review patch" --primary-model gpt-5.4 --checker-model gpt-5.5
 skill-usage init --out /tmp/skill --skill tools/devex/review-evidence --intent "record review" --user-request-summary "review this PR"
 skill-usage init --out /tmp/workflow --owner-kind workflow --owner-id deliver-pr --intent "deliver change" --user-request-summary "deliver this PR"
-test-first-evidence init --out /tmp/test-first --classification behavior-change --production-path src/lib.rs
+test-first-evidence init --out /tmp/test-first --classification behavior-change \
+  --production-path src/lib.rs --changed-behavior "new contract"
 ```
 
 ## `agent-run` flow
@@ -213,25 +214,50 @@ skill-usage show --out <dir> --format json
 
 ## `test-first-evidence` flow
 
-`test-first-evidence` keeps the public binary contract that was previously
-implemented by a standalone package. It records one JSON file under the caller's
-artifact directory and preserves the schema versions
-`test-first-evidence.record.v1` and `cli.test-first-evidence.*.v1`.
+`test-first-evidence` records one JSON file under the caller's artifact
+directory. New records use `test-first-evidence.record.v2` and
+`cli.test-first-evidence.*.v2`: they carry contract delta, materially affected
+test targets, meaningful failing evidence, scoped final validation, waivers,
+and an explicit residual-gap declaration. Record v1 remains readable by
+`show`, but strict `verify` and the forge delivery gate require deliberate v2
+re-recording because the missing maintenance facts cannot be inferred safely.
 
 ```bash
 test-first-evidence init \
   --out "$AGENT_HOME/out/projects/acme__app/test-first" \
   --classification behavior-change \
-  --production-path src/lib.rs
+  --production-path src/lib.rs \
+  --changed-behavior "parser accepts the new contract" \
+  --invariant "v1 input remains readable"
+test-first-evidence record-impact \
+  --out "$AGENT_HOME/out/projects/acme__app/test-first" \
+  --target "tests/parser.rs::new_contract" \
+  --disposition update-spec \
+  --protected-behavior "parser contract" \
+  --reason "the v1 expectation represents the old specification" \
+  --owner-test "new_contract" \
+  --validation-scope affected-suite
 test-first-evidence record-failing \
   --out "$AGENT_HOME/out/projects/acme__app/test-first" \
   --command "cargo test bug_repro" \
   --exit-code 101 \
-  --summary "bug reproduced before fix"
+  --summary "bug reproduced before fix" \
+  --test-name bug_repro \
+  --expected-failure "new parser contract is not implemented" \
+  --observed-failure "assertion reported the v1 value"
 test-first-evidence record-final \
   --out "$AGENT_HOME/out/projects/acme__app/test-first" \
   --command "cargo test bug_repro" \
-  --status pass
+  --status pass \
+  --scope focused
+test-first-evidence record-final \
+  --out "$AGENT_HOME/out/projects/acme__app/test-first" \
+  --command "cargo test parser" \
+  --status pass \
+  --scope affected-suite
+test-first-evidence record-gap \
+  --out "$AGENT_HOME/out/projects/acme__app/test-first" \
+  --none
 test-first-evidence verify --out "$AGENT_HOME/out/projects/acme__app/test-first" --format json
 test-first-evidence check --out "$AGENT_HOME/out/projects/acme__app/test-first" \
   --phase pre-edit --project-path . --path src/lib.rs --format json
@@ -239,10 +265,11 @@ test-first-evidence check --out "$AGENT_HOME/out/projects/acme__app/test-first" 
 
 `check` is read-only. `classified` confirms classification exists, `pre-edit`
 uses the repository's `[path_classes]` contract, and `delivery` is the
-phase-aware spelling of final completeness. `verify` remains the compatible
-delivery command. Production paths require failing evidence or a waiver;
-unknown and overlapping classes fail closed. A repository without a path-class
-contract reports `not-configured` without inventing language-specific rules.
+phase-aware spelling of strict v2 completeness. Production paths require a
+contract delta, test-impact declaration, and meaningful failing evidence or a
+complete waiver; unknown and overlapping classes fail closed. A repository
+without a path-class contract reports `not-configured` without inventing
+language-specific rules.
 
 ## Output contract
 

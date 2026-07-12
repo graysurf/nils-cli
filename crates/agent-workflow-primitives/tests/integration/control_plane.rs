@@ -91,6 +91,8 @@ fn test_first_check_is_phase_and_path_class_aware() {
             out_arg,
             "--classification",
             "behavior-change",
+            "--changed-behavior",
+            "production edits require durable pre-edit evidence",
         ],
     );
     assert_eq!(init.code, 0, "stderr: {}", init.stderr_text());
@@ -136,7 +138,7 @@ fn test_first_check_is_phase_and_path_class_aware() {
     assert_eq!(production.code, 65);
     assert_eq!(
         production.stdout_json()["error"]["details"]["reason_code"],
-        "missing-failing-evidence-or-waiver"
+        "missing-durable-pre-edit-evidence"
     );
 
     let ambiguous = run(
@@ -229,6 +231,25 @@ fn test_first_check_is_phase_and_path_class_aware() {
         "delivery-incomplete"
     );
 
+    let impact = run(
+        "test-first-evidence",
+        tmp.path(),
+        &[
+            "record-impact",
+            "--out",
+            out_arg,
+            "--target",
+            "tests/value.rs::regression",
+            "--disposition",
+            "add-missing",
+            "--protected-behavior",
+            "production edits require durable pre-edit evidence",
+            "--reason",
+            "the regression had no owner test",
+        ],
+    );
+    assert_eq!(impact.code, 0, "stderr: {}", impact.stderr_text());
+
     let before_fix = run(
         "test-first-evidence",
         tmp.path(),
@@ -242,6 +263,10 @@ fn test_first_check_is_phase_and_path_class_aware() {
             "101",
             "--summary",
             "regression reproduced",
+            "--expected-failure",
+            "the new contract is not implemented",
+            "--observed-failure",
+            "the regression assertion failed",
         ],
     );
     assert_eq!(before_fix.code, 0, "stderr: {}", before_fix.stderr_text());
@@ -279,9 +304,17 @@ fn test_first_check_is_phase_and_path_class_aware() {
             "cargo test regression",
             "--status",
             "pass",
+            "--scope",
+            "focused",
         ],
     );
     assert_eq!(final_validation.code, 0);
+    let gaps = run(
+        "test-first-evidence",
+        tmp.path(),
+        &["record-gap", "--out", out_arg, "--none"],
+    );
+    assert_eq!(gaps.code, 0);
     let delivery_ready = run(
         "test-first-evidence",
         tmp.path(),

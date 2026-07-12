@@ -183,6 +183,16 @@ pub(crate) fn test_first_gate(
     };
     match agent_workflow_primitives::test_first_evidence::verify_dir(Path::new(dir)) {
         Ok(result) if result.complete => Ok(()),
+        Ok(result) if result.record.schema_version == "test-first-evidence.record.v1" => {
+            Err(ForgeError::validation(
+                schema_err(),
+                "test_first_evidence_legacy",
+                format!(
+                    "test-first evidence at '{dir}' uses record v1; re-record the change with test-first-evidence v2"
+                ),
+                Some(format!("record_file={}", result.record_file)),
+            ))
+        }
         Ok(result) => Err(ForgeError::validation(
             schema_err(),
             "test_first_evidence_incomplete",
@@ -1019,7 +1029,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         write_evidence(
             dir.path(),
-            r#"{"schema_version":"test-first-evidence.record.v1","change_classification":"behavior-change","waiver":{"reason":"fixture"},"final_validation":{"command":"cargo test","status":"pass"}}"#,
+            r#"{"schema_version":"test-first-evidence.record.v2","change_classification":"behavior-change","contract_delta":{"changed_behaviors":["durable gate"]},"no_existing_tests_reason":"fixture has no existing tests","waiver":{"reason":"fixture","kind":"non-testable","why_no_red":"fixture path","substitute_validation":["cargo test"]},"final_validations":[{"command":"cargo test","status":"pass","scope":"focused"}],"no_residual_gaps":true}"#,
         );
         assert!(test_first_gate(PrKind::Feature, true, dir.path().to_str()).is_ok());
     }
@@ -1029,11 +1039,24 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         write_evidence(
             dir.path(),
-            r#"{"schema_version":"test-first-evidence.record.v1","change_classification":"behavior-change","waiver":{"reason":"fixture"}}"#,
+            r#"{"schema_version":"test-first-evidence.record.v2","change_classification":"behavior-change","contract_delta":{"changed_behaviors":["durable gate"]},"no_existing_tests_reason":"fixture has no existing tests","waiver":{"reason":"fixture","kind":"non-testable","why_no_red":"fixture path","substitute_validation":["cargo test"]},"no_residual_gaps":true}"#,
         );
         let err =
             test_first_gate(PrKind::Feature, true, dir.path().to_str()).expect_err("incomplete");
         assert_eq!(err.kind(), "test_first_evidence_incomplete");
+    }
+
+    #[test]
+    fn test_first_gate_rejects_legacy_record_with_rerecord_error() {
+        let dir = tempfile::tempdir().unwrap();
+        write_evidence(
+            dir.path(),
+            r#"{"schema_version":"test-first-evidence.record.v1","change_classification":"behavior-change","waiver":{"reason":"fixture"},"final_validation":{"command":"cargo test","status":"pass"}}"#,
+        );
+        let err =
+            test_first_gate(PrKind::Feature, true, dir.path().to_str()).expect_err("v1 record");
+        assert_eq!(err.kind(), "test_first_evidence_legacy");
+        assert!(err.to_string().contains("re-record"));
     }
 
     #[test]

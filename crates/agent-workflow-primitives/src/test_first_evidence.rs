@@ -13,7 +13,7 @@ use serde_json::{Value, json};
 
 use cli::{
     CheckArgs, CheckPhase, Cli, Command, CommonArgs, InitArgs, OutputFormat, RecordFailingArgs,
-    RecordFinalArgs, RecordWaiverArgs,
+    RecordFinalArgs, RecordGapArgs, RecordImpactArgs, RecordWaiverArgs, ValidationScope,
 };
 use nils_common::cli_contract::exit;
 use nils_common::fs::{display_path, normalize_path};
@@ -24,21 +24,26 @@ const EXIT_RUNTIME: i32 = exit::RUNTIME;
 const EXIT_USAGE: i32 = exit::USAGE;
 const EXIT_DATA: i32 = exit::DATA;
 
-const RECORD_SCHEMA_VERSION: &str = "test-first-evidence.record.v1";
+const RECORD_SCHEMA_VERSION: &str = "test-first-evidence.record.v2";
+const LEGACY_RECORD_SCHEMA_VERSION: &str = "test-first-evidence.record.v1";
 const RECORD_FILE_NAME: &str = "test-first-evidence.json";
 
-const INIT_SCHEMA_VERSION: &str = "cli.test-first-evidence.init.v1";
-const RECORD_FAILING_SCHEMA_VERSION: &str = "cli.test-first-evidence.record-failing.v1";
-const RECORD_WAIVER_SCHEMA_VERSION: &str = "cli.test-first-evidence.record-waiver.v1";
-const RECORD_FINAL_SCHEMA_VERSION: &str = "cli.test-first-evidence.record-final.v1";
-const VERIFY_SCHEMA_VERSION: &str = "cli.test-first-evidence.verify.v1";
-const SHOW_SCHEMA_VERSION: &str = "cli.test-first-evidence.show.v1";
-const CHECK_SCHEMA_VERSION: &str = "cli.test-first-evidence.check.v1";
+const INIT_SCHEMA_VERSION: &str = "cli.test-first-evidence.init.v2";
+const RECORD_FAILING_SCHEMA_VERSION: &str = "cli.test-first-evidence.record-failing.v2";
+const RECORD_IMPACT_SCHEMA_VERSION: &str = "cli.test-first-evidence.record-impact.v2";
+const RECORD_WAIVER_SCHEMA_VERSION: &str = "cli.test-first-evidence.record-waiver.v2";
+const RECORD_FINAL_SCHEMA_VERSION: &str = "cli.test-first-evidence.record-final.v2";
+const RECORD_GAP_SCHEMA_VERSION: &str = "cli.test-first-evidence.record-gap.v2";
+const VERIFY_SCHEMA_VERSION: &str = "cli.test-first-evidence.verify.v2";
+const SHOW_SCHEMA_VERSION: &str = "cli.test-first-evidence.show.v2";
+const CHECK_SCHEMA_VERSION: &str = "cli.test-first-evidence.check.v2";
 
 const INIT_COMMAND: &str = "test-first-evidence init";
 const RECORD_FAILING_COMMAND: &str = "test-first-evidence record-failing";
+const RECORD_IMPACT_COMMAND: &str = "test-first-evidence record-impact";
 const RECORD_WAIVER_COMMAND: &str = "test-first-evidence record-waiver";
 const RECORD_FINAL_COMMAND: &str = "test-first-evidence record-final";
+const RECORD_GAP_COMMAND: &str = "test-first-evidence record-gap";
 const VERIFY_COMMAND: &str = "test-first-evidence verify";
 const SHOW_COMMAND: &str = "test-first-evidence show";
 const CHECK_COMMAND: &str = "test-first-evidence check";
@@ -71,8 +76,10 @@ fn dispatch(cli: Cli) -> i32 {
     match cli.command {
         Command::Init(args) => run_init(args),
         Command::RecordFailing(args) => run_record_failing(args),
+        Command::RecordImpact(args) => run_record_impact(args),
         Command::RecordWaiver(args) => run_record_waiver(args),
         Command::RecordFinal(args) => run_record_final(args),
+        Command::RecordGap(args) => run_record_gap(args),
         Command::Check(args) => run_check(args),
         Command::Verify(args) => run_verify(args),
         Command::Show(args) => run_show(args),
@@ -188,17 +195,13 @@ fn check_pre_edit(args: &CheckArgs, record: &EvidenceRecord) -> Result<CheckResu
     } else {
         "multiple".to_string()
     };
-    let has_before_fix = record
-        .failing_test
-        .as_ref()
-        .is_some_and(|item| item.exit_code != 0)
-        || record.waiver.is_some();
+    let has_before_fix = has_durable_pre_edit_evidence(record);
     let (allowed, reason_code) = if classes.contains("ambiguous") {
         (false, "ambiguous-path-class")
     } else if classes.contains("unknown") {
         (false, "unknown-path-class")
     } else if classes.contains("production") && !has_before_fix {
-        (false, "missing-failing-evidence-or-waiver")
+        (false, "missing-durable-pre-edit-evidence")
     } else {
         (true, "pre-edit-ready")
     };
@@ -236,15 +239,32 @@ fn run_init(args: InitArgs) -> i32 {
 fn run_record_failing(args: RecordFailingArgs) -> i32 {
     let format = args.common.format;
     match update_record(args.common.out_dir.as_path(), |record| {
-        record.failing_test = Some(FailingEvidence {
+        let evidence = FailingEvidence {
             command: redact_text(&args.command).value,
             exit_code: args.exit_code,
             summary: redact_text(&args.summary).value,
+            expected_failure: redact_text(&args.expected_failure).value,
+            observed_failure: redact_text(&args.observed_failure).value,
             test_name: args
                 .test_name
                 .as_deref()
                 .map(|value| redact_text(value).value),
             artifacts: normalized_paths(&args.artifact),
+        };
+        let duplicate = record
+            .failing_tests
+            .iter()
+            .any(|item| item.command == evidence.command && item.test_name == evidence.test_name);
+        if duplicate {
+            return Err(CliError::data(
+                "duplicate-failing-evidence",
+                "failing evidence with the same command and test name already exists",
+                None,
+            ));
+        }
+        record.failing_tests.push(evidence);
+        record.failing_tests.sort_by(|left, right| {
+            (&left.test_name, &left.command).cmp(&(&right.test_name, &right.command))
         });
         Ok(())
     }) {
@@ -263,12 +283,138 @@ fn run_record_failing(args: RecordFailingArgs) -> i32 {
     }
 }
 
+fn run_record_impact(args: RecordImpactArgs) -> i32 {
+    let format = args.common.format;
+    match update_record(args.common.out_dir.as_path(), |record| {
+        if args.none {
+            if args.target.is_some()
+                || args.disposition.is_some()
+                || args.protected_behavior.is_some()
+                || args.owner_test.is_some()
+                || args.invariant_retired
+                || !args.validation_scopes.is_empty()
+            {
+                return Err(CliError::usage(
+                    "impact-none-conflict",
+                    "--none cannot be combined with target impact fields",
+                    None,
+                ));
+            }
+            let reason =
+                required_text(args.reason.as_deref(), "--reason", "missing-impact-reason")?;
+            if !record.test_impacts.is_empty() {
+                return Err(CliError::data(
+                    "impact-none-after-targets",
+                    "cannot declare no existing tests after recording affected targets",
+                    None,
+                ));
+            }
+            record.no_existing_tests_reason = Some(redact_text(reason).value);
+            return Ok(());
+        }
+
+        if record.no_existing_tests_reason.is_some() {
+            return Err(CliError::data(
+                "impact-target-after-none",
+                "cannot record an affected target after declaring no existing tests",
+                None,
+            ));
+        }
+        let target = required_text(args.target.as_deref(), "--target", "missing-impact-target")?;
+        let disposition = args.disposition.ok_or_else(|| {
+            CliError::usage(
+                "missing-impact-disposition",
+                "--disposition is required unless --none is used",
+                Some(json!({ "flag": "--disposition" })),
+            )
+        })?;
+        let protected_behavior = required_text(
+            args.protected_behavior.as_deref(),
+            "--protected-behavior",
+            "missing-protected-behavior",
+        )?;
+        let reason = required_text(args.reason.as_deref(), "--reason", "missing-impact-reason")?;
+        let owner_test = args
+            .owner_test
+            .as_deref()
+            .map(|value| redact_text(value).value);
+        if disposition.as_str() == "remove-obsolete"
+            && owner_test.is_none()
+            && !args.invariant_retired
+        {
+            return Err(CliError::data(
+                "remove-obsolete-owner-required",
+                "remove-obsolete requires --owner-test or --invariant-retired",
+                None,
+            ));
+        }
+        let impact = TestImpact {
+            target: redact_text(target).value,
+            disposition: disposition.as_str().to_string(),
+            protected_behavior: redact_text(protected_behavior).value,
+            reason: redact_text(reason).value,
+            owner_test,
+            invariant_retired: args.invariant_retired,
+            validation_scopes: sorted_scopes(&args.validation_scopes),
+        };
+        let duplicate = record
+            .test_impacts
+            .iter()
+            .any(|item| item.target == impact.target && item.disposition == impact.disposition);
+        if duplicate {
+            return Err(CliError::data(
+                "duplicate-test-impact",
+                "test impact with the same target and disposition already exists",
+                None,
+            ));
+        }
+        record.test_impacts.push(impact);
+        record.test_impacts.sort_by(|left, right| {
+            (&left.target, &left.disposition).cmp(&(&right.target, &right.disposition))
+        });
+        Ok(())
+    }) {
+        Ok(result) => render_record_success(
+            RECORD_IMPACT_SCHEMA_VERSION,
+            RECORD_IMPACT_COMMAND,
+            format,
+            &result,
+        ),
+        Err(err) => render_error(
+            RECORD_IMPACT_SCHEMA_VERSION,
+            RECORD_IMPACT_COMMAND,
+            format,
+            err,
+        ),
+    }
+}
+
 fn run_record_waiver(args: RecordWaiverArgs) -> i32 {
     let format = args.common.format;
     match update_record(args.common.out_dir.as_path(), |record| {
+        if args.waiver_kind.as_str() == "deferred-debt"
+            && (args.follow_up.as_deref().is_none_or(str::is_empty)
+                || args.expires.as_deref().is_none_or(str::is_empty))
+        {
+            return Err(CliError::data(
+                "deferred-waiver-follow-up-required",
+                "deferred-debt waiver requires --follow-up and --expires",
+                None,
+            ));
+        }
         record.waiver = Some(WaiverEvidence {
             reason: redact_text(&args.reason).value,
+            kind: args.waiver_kind.as_str().to_string(),
+            why_no_red: redact_text(&args.why_no_red).value,
             substitute_validation: redacted_strings(&args.substitute_validation),
+            follow_up: args
+                .follow_up
+                .as_deref()
+                .map(|value| redact_text(value).value),
+            expires: args
+                .expires
+                .as_deref()
+                .map(|value| redact_text(value).value),
         });
         Ok(())
     }) {
@@ -290,14 +436,30 @@ fn run_record_waiver(args: RecordWaiverArgs) -> i32 {
 fn run_record_final(args: RecordFinalArgs) -> i32 {
     let format = args.common.format;
     match update_record(args.common.out_dir.as_path(), |record| {
-        record.final_validation = Some(FinalValidation {
+        let validation = FinalValidation {
             command: redact_text(&args.command).value,
             status: args.status.as_str().to_string(),
+            scope: args.scope.as_str().to_string(),
             summary: args
                 .summary
                 .as_deref()
                 .map(|value| redact_text(value).value),
             artifacts: normalized_paths(&args.artifact),
+        };
+        let duplicate = record
+            .final_validations
+            .iter()
+            .any(|item| item.command == validation.command && item.scope == validation.scope);
+        if duplicate {
+            return Err(CliError::data(
+                "duplicate-final-validation",
+                "final validation with the same command and scope already exists",
+                None,
+            ));
+        }
+        record.final_validations.push(validation);
+        record.final_validations.sort_by(|left, right| {
+            (&left.scope, &left.command).cmp(&(&right.scope, &right.command))
         });
         Ok(())
     }) {
@@ -313,6 +475,69 @@ fn run_record_final(args: RecordFinalArgs) -> i32 {
             format,
             err,
         ),
+    }
+}
+
+fn run_record_gap(args: RecordGapArgs) -> i32 {
+    let format = args.common.format;
+    match update_record(args.common.out_dir.as_path(), |record| {
+        if args.none {
+            if args.gap.is_some() || args.reason.is_some() || args.follow_up.is_some() {
+                return Err(CliError::usage(
+                    "gap-none-conflict",
+                    "--none cannot be combined with residual gap fields",
+                    None,
+                ));
+            }
+            if !record.residual_gaps.is_empty() {
+                return Err(CliError::data(
+                    "gap-none-after-gaps",
+                    "cannot declare no residual gaps after recording a gap",
+                    None,
+                ));
+            }
+            record.no_residual_gaps = true;
+            return Ok(());
+        }
+        if record.no_residual_gaps {
+            return Err(CliError::data(
+                "gap-after-none",
+                "cannot record a residual gap after declaring none",
+                None,
+            ));
+        }
+        let gap = required_text(args.gap.as_deref(), "--gap", "missing-residual-gap")?;
+        let reason = required_text(args.reason.as_deref(), "--reason", "missing-gap-reason")?;
+        let follow_up = required_text(
+            args.follow_up.as_deref(),
+            "--follow-up",
+            "missing-gap-follow-up",
+        )?;
+        let gap = ResidualGap {
+            gap: redact_text(gap).value,
+            reason: redact_text(reason).value,
+            follow_up: redact_text(follow_up).value,
+        };
+        if record.residual_gaps.iter().any(|item| item.gap == gap.gap) {
+            return Err(CliError::data(
+                "duplicate-residual-gap",
+                "residual gap with the same identity already exists",
+                None,
+            ));
+        }
+        record.residual_gaps.push(gap);
+        record
+            .residual_gaps
+            .sort_by(|left, right| left.gap.cmp(&right.gap));
+        Ok(())
+    }) {
+        Ok(result) => render_record_success(
+            RECORD_GAP_SCHEMA_VERSION,
+            RECORD_GAP_COMMAND,
+            format,
+            &result,
+        ),
+        Err(err) => render_error(RECORD_GAP_SCHEMA_VERSION, RECORD_GAP_COMMAND, format, err),
     }
 }
 
@@ -372,9 +597,22 @@ fn init_record(args: &InitArgs) -> Result<RecordResult, CliError> {
         change_classification: redact_text(&args.classification).value,
         production_paths: normalized_paths(&args.production_paths),
         notes: redacted_strings(&args.notes),
+        contract_delta: ContractDelta {
+            retained_behaviors: sorted_redacted_strings(&args.retained_behaviors),
+            changed_behaviors: sorted_redacted_strings(&args.changed_behaviors),
+            removed_behaviors: sorted_redacted_strings(&args.removed_behaviors),
+            added_behaviors: sorted_redacted_strings(&args.added_behaviors),
+            invariants: sorted_redacted_strings(&args.invariant),
+        },
+        test_impacts: Vec::new(),
+        no_existing_tests_reason: None,
+        failing_tests: Vec::new(),
         failing_test: None,
         waiver: None,
+        final_validations: Vec::new(),
         final_validation: None,
+        residual_gaps: Vec::new(),
+        no_residual_gaps: false,
     };
     write_record(&record_file, &record)?;
     Ok(record_result(record_file, record))
@@ -386,6 +624,16 @@ where
 {
     let record_file = record_file_path(out_dir)?;
     let mut record = read_record(&record_file)?;
+    if record.schema_version == LEGACY_RECORD_SCHEMA_VERSION {
+        return Err(CliError::data(
+            "v1-evidence-record",
+            "v1 evidence is read-only; re-record with init --force to create v2",
+            Some(json!({
+                "schema_version": record.schema_version,
+                "expected": RECORD_SCHEMA_VERSION,
+            })),
+        ));
+    }
     update(&mut record)?;
     write_record(&record_file, &record)?;
     Ok(record_result(record_file, record))
@@ -393,6 +641,17 @@ where
 
 fn verify_record(args: &CommonArgs) -> Result<VerifyResult, CliError> {
     let result = read_record_result(args.out_dir.as_path())?;
+    if result.record.schema_version == LEGACY_RECORD_SCHEMA_VERSION {
+        return Err(CliError::data(
+            "v1-evidence-record",
+            "v1 evidence must be re-recorded as v2 for strict verification",
+            Some(json!({
+                "record_file": result.record_file,
+                "schema_version": LEGACY_RECORD_SCHEMA_VERSION,
+                "expected": RECORD_SCHEMA_VERSION,
+            })),
+        ));
+    }
     let missing = missing_evidence_fields(&result.record);
     Ok(VerifyResult {
         record_file: result.record_file,
@@ -450,12 +709,14 @@ fn read_record(record_file: &Path) -> Result<EvidenceRecord, CliError> {
         )
     })?;
 
-    if record.schema_version != RECORD_SCHEMA_VERSION {
+    if record.schema_version != RECORD_SCHEMA_VERSION
+        && record.schema_version != LEGACY_RECORD_SCHEMA_VERSION
+    {
         return Err(CliError::runtime(
             "unsupported-record-version",
             format!(
-                "unsupported record schema_version {}; expected {}",
-                record.schema_version, RECORD_SCHEMA_VERSION
+                "unsupported record schema_version {}; expected {} or readable previous schema {}",
+                record.schema_version, RECORD_SCHEMA_VERSION, LEGACY_RECORD_SCHEMA_VERSION
             ),
             Some(json!({
                 "record_file": display_path(record_file),
@@ -510,27 +771,168 @@ fn record_result(record_file: PathBuf, record: EvidenceRecord) -> RecordResult {
 }
 
 fn missing_evidence_fields(record: &EvidenceRecord) -> Vec<String> {
+    if record.schema_version == LEGACY_RECORD_SCHEMA_VERSION {
+        return vec!["legacy_record_v1".to_string()];
+    }
+
     let mut missing = Vec::new();
-    match (record.failing_test.as_ref(), record.waiver.as_ref()) {
-        // A waiver substitutes for failing-test evidence; the failing_test's
-        // exit code is irrelevant on the waiver path.
-        (_, Some(_)) => {}
-        // A "failing" test that exited 0 never demonstrated a pre-fix failure,
-        // so it does not satisfy "a failing test or an explicit waiver".
-        (Some(failing), None) if failing.exit_code == 0 => {
-            missing.push("failing_test_nonzero_exit".to_string());
-        }
-        (Some(_), None) => {}
-        (None, None) => missing.push("failing_test_or_waiver".to_string()),
+    let testable = is_testable_classification(&record.change_classification);
+
+    if testable && record.contract_delta.is_empty() {
+        missing.push("contract_delta".to_string());
     }
-    match record.final_validation.as_ref() {
-        None => missing.push("final_validation".to_string()),
-        Some(final_validation) if final_validation.status != "pass" => {
-            missing.push("final_validation_pass".to_string());
+    if testable {
+        match (
+            record.test_impacts.is_empty(),
+            record.no_existing_tests_reason.as_deref(),
+        ) {
+            (true, None | Some("")) => missing.push("test_impacts_or_none".to_string()),
+            (false, Some(_)) => missing.push("test_impacts_none_conflict".to_string()),
+            _ => {}
         }
-        Some(_) => {}
+        if record.test_impacts.iter().any(|impact| {
+            impact.reason.trim().is_empty() || impact.protected_behavior.trim().is_empty()
+        }) {
+            missing.push("test_impact_rationale".to_string());
+        }
+        if record.test_impacts.iter().any(|impact| {
+            impact.disposition == "remove-obsolete"
+                && impact.owner_test.as_deref().is_none_or(str::is_empty)
+                && !impact.invariant_retired
+        }) {
+            missing.push("remove_obsolete_owner_or_retired_invariant".to_string());
+        }
+        let mut identities = BTreeSet::new();
+        if record
+            .test_impacts
+            .iter()
+            .any(|impact| !identities.insert((impact.target.as_str(), impact.disposition.as_str())))
+        {
+            missing.push("duplicate_test_impact".to_string());
+        }
     }
+
+    if let Some(waiver) = record.waiver.as_ref() {
+        if waiver.reason.trim().is_empty()
+            || waiver.why_no_red.trim().is_empty()
+            || waiver.substitute_validation.is_empty()
+        {
+            missing.push("complete_waiver".to_string());
+        }
+        if waiver.kind == "deferred-debt"
+            && (waiver.follow_up.as_deref().is_none_or(str::is_empty)
+                || waiver.expires.as_deref().is_none_or(str::is_empty))
+        {
+            missing.push("deferred_waiver_follow_up".to_string());
+        }
+    } else {
+        if record.failing_tests.is_empty() {
+            missing.push("failing_tests_or_waiver".to_string());
+        } else {
+            if record.failing_tests.iter().any(|item| item.exit_code == 0) {
+                missing.push("failing_tests_nonzero_exit".to_string());
+            }
+            if record.failing_tests.iter().any(|item| {
+                item.expected_failure.trim().is_empty() || item.observed_failure.trim().is_empty()
+            }) {
+                missing.push("meaningful_failure_reasons".to_string());
+            }
+            let mut identities = BTreeSet::new();
+            if record
+                .failing_tests
+                .iter()
+                .any(|item| !identities.insert((item.test_name.as_deref(), item.command.as_str())))
+            {
+                missing.push("duplicate_failing_evidence".to_string());
+            }
+        }
+    }
+
+    let passing_scopes: BTreeSet<&str> = record
+        .final_validations
+        .iter()
+        .filter(|item| item.status == "pass")
+        .map(|item| item.scope.as_str())
+        .collect();
+    if testable && !passing_scopes.contains("focused") {
+        missing.push("focused_final_validation".to_string());
+    } else if !testable && passing_scopes.is_empty() {
+        missing.push("final_validation_pass".to_string());
+    }
+    let required_scopes: BTreeSet<&str> = record
+        .test_impacts
+        .iter()
+        .flat_map(|impact| impact.validation_scopes.iter().map(String::as_str))
+        .filter(|scope| matches!(*scope, "affected-suite" | "contract-consumer"))
+        .collect();
+    for scope in required_scopes {
+        if !passing_scopes.contains(scope) {
+            missing.push(format!("{scope}_final_validation"));
+        }
+    }
+    let mut validation_identities = BTreeSet::new();
+    if record
+        .final_validations
+        .iter()
+        .any(|item| !validation_identities.insert((item.scope.as_str(), item.command.as_str())))
+    {
+        missing.push("duplicate_final_validation".to_string());
+    }
+
+    match (record.residual_gaps.is_empty(), record.no_residual_gaps) {
+        (true, false) => missing.push("residual_gaps_declaration".to_string()),
+        (false, true) => missing.push("residual_gaps_none_conflict".to_string()),
+        _ => {}
+    }
+    if record
+        .residual_gaps
+        .iter()
+        .any(|gap| gap.reason.trim().is_empty() || gap.follow_up.trim().is_empty())
+    {
+        missing.push("residual_gap_reason_and_follow_up".to_string());
+    }
+    let mut gap_identities = BTreeSet::new();
+    if record
+        .residual_gaps
+        .iter()
+        .any(|gap| !gap_identities.insert(gap.gap.as_str()))
+    {
+        missing.push("duplicate_residual_gap".to_string());
+    }
+
     missing
+}
+
+fn is_testable_classification(classification: &str) -> bool {
+    matches!(
+        classification.trim().to_ascii_lowercase().as_str(),
+        "behavior-change" | "bug-fix" | "bug" | "feature"
+    )
+}
+
+fn has_durable_pre_edit_evidence(record: &EvidenceRecord) -> bool {
+    if record.schema_version != RECORD_SCHEMA_VERSION {
+        return false;
+    }
+    let before_fix = record.waiver.as_ref().is_some_and(|waiver| {
+        !waiver.reason.trim().is_empty()
+            && !waiver.why_no_red.trim().is_empty()
+            && !waiver.substitute_validation.is_empty()
+    }) || record.failing_tests.iter().any(|item| {
+        item.exit_code != 0
+            && !item.expected_failure.trim().is_empty()
+            && !item.observed_failure.trim().is_empty()
+    });
+    if !before_fix {
+        return false;
+    }
+    !is_testable_classification(&record.change_classification)
+        || (!record.contract_delta.is_empty()
+            && (!record.test_impacts.is_empty()
+                || record
+                    .no_existing_tests_reason
+                    .as_deref()
+                    .is_some_and(|reason| !reason.trim().is_empty())))
 }
 
 fn absolute_path(path: &Path) -> Result<PathBuf, CliError> {
@@ -558,6 +960,37 @@ fn normalized_paths(paths: &[PathBuf]) -> Vec<String> {
         }
     }
     normalized.into_iter().collect()
+}
+
+fn required_text<'a>(
+    value: Option<&'a str>,
+    flag: &'static str,
+    code: &'static str,
+) -> Result<&'a str, CliError> {
+    value.filter(|text| !text.trim().is_empty()).ok_or_else(|| {
+        CliError::usage(
+            code,
+            format!("{flag} is required and must not be empty"),
+            Some(json!({ "flag": flag })),
+        )
+    })
+}
+
+fn sorted_redacted_strings(values: &[String]) -> Vec<String> {
+    let mut values = redacted_strings(values);
+    values.sort();
+    values.dedup();
+    values
+}
+
+fn sorted_scopes(scopes: &[ValidationScope]) -> Vec<String> {
+    let mut scopes: Vec<String> = scopes
+        .iter()
+        .map(|scope| scope.as_str().to_string())
+        .collect();
+    scopes.sort();
+    scopes.dedup();
+    scopes
 }
 
 fn redacted_strings(values: &[String]) -> Vec<String> {
@@ -608,7 +1041,7 @@ fn print_record_text(record: &EvidenceRecord, complete: bool) {
     }
     println!(
         "before-fix evidence: {}",
-        if record.failing_test.is_some() {
+        if !record.failing_tests.is_empty() || record.failing_test.is_some() {
             "failing-test"
         } else if record.waiver.is_some() {
             "waiver"
@@ -618,11 +1051,19 @@ fn print_record_text(record: &EvidenceRecord, complete: bool) {
     );
     println!(
         "final validation: {}",
-        record
-            .final_validation
-            .as_ref()
-            .map(|value| value.status.as_str())
-            .unwrap_or("missing")
+        if record
+            .final_validations
+            .iter()
+            .any(|value| value.status == "pass")
+            || record
+                .final_validation
+                .as_ref()
+                .is_some_and(|value| value.status == "pass")
+        {
+            "pass"
+        } else {
+            "missing"
+        }
     );
 }
 
@@ -735,12 +1176,66 @@ pub struct EvidenceRecord {
     pub production_paths: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub notes: Vec<String>,
+    #[serde(default, skip_serializing_if = "ContractDelta::is_empty")]
+    pub contract_delta: ContractDelta,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub test_impacts: Vec<TestImpact>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub no_existing_tests_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub failing_tests: Vec<FailingEvidence>,
+    // Read-only v1 compatibility field. New v2 writers never populate it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub failing_test: Option<FailingEvidence>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub waiver: Option<WaiverEvidence>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub final_validations: Vec<FinalValidation>,
+    // Read-only v1 compatibility field. New v2 writers never populate it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub final_validation: Option<FinalValidation>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub residual_gaps: Vec<ResidualGap>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub no_residual_gaps: bool,
+}
+
+#[derive(Debug, Default, Deserialize, Serialize)]
+pub struct ContractDelta {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub retained_behaviors: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub changed_behaviors: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub removed_behaviors: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub added_behaviors: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub invariants: Vec<String>,
+}
+
+impl ContractDelta {
+    fn is_empty(&self) -> bool {
+        self.retained_behaviors.is_empty()
+            && self.changed_behaviors.is_empty()
+            && self.removed_behaviors.is_empty()
+            && self.added_behaviors.is_empty()
+            && self.invariants.is_empty()
+    }
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub struct TestImpact {
+    pub target: String,
+    pub disposition: String,
+    pub protected_behavior: String,
+    pub reason: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub owner_test: Option<String>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub invariant_retired: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub validation_scopes: Vec<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -748,6 +1243,10 @@ pub struct FailingEvidence {
     pub command: String,
     pub exit_code: i32,
     pub summary: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub expected_failure: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub observed_failure: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub test_name: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -757,18 +1256,39 @@ pub struct FailingEvidence {
 #[derive(Debug, Deserialize, Serialize)]
 pub struct WaiverEvidence {
     pub reason: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub kind: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub why_no_red: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub substitute_validation: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub follow_up: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expires: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
 pub struct FinalValidation {
     pub command: String,
     pub status: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub scope: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub summary: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub artifacts: Vec<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub struct ResidualGap {
+    pub gap: String,
+    pub reason: String,
+    pub follow_up: String,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 #[derive(Debug, Serialize)]
@@ -832,68 +1352,93 @@ mod tests {
     }
 
     #[test]
-    fn complete_record_needs_before_and_final_pass() {
+    fn durable_record_reports_every_missing_structural_layer() {
         let record = super::EvidenceRecord {
             schema_version: super::RECORD_SCHEMA_VERSION.to_string(),
             change_classification: "bug-fix".to_string(),
             production_paths: Vec::new(),
             notes: Vec::new(),
+            contract_delta: super::ContractDelta::default(),
+            test_impacts: Vec::new(),
+            no_existing_tests_reason: None,
+            failing_tests: Vec::new(),
             failing_test: None,
             waiver: None,
+            final_validations: Vec::new(),
             final_validation: None,
+            residual_gaps: Vec::new(),
+            no_residual_gaps: false,
         };
         assert_eq!(
             missing_evidence_fields(&record),
             vec![
-                "failing_test_or_waiver".to_string(),
-                "final_validation".to_string()
+                "contract_delta".to_string(),
+                "test_impacts_or_none".to_string(),
+                "failing_tests_or_waiver".to_string(),
+                "focused_final_validation".to_string(),
+                "residual_gaps_declaration".to_string(),
             ]
         );
     }
 
     #[test]
-    fn zero_exit_failing_test_is_not_complete_evidence() {
-        // A `failing_test` that exited 0 never demonstrated a pre-fix failure,
-        // so without a waiver it must not satisfy the gate even alongside a
-        // passing final validation.
-        let record = super::EvidenceRecord {
+    fn complete_durable_record_needs_meaningful_red_and_scoped_green() {
+        let mut record = super::EvidenceRecord {
             schema_version: super::RECORD_SCHEMA_VERSION.to_string(),
             change_classification: "bug-fix".to_string(),
             production_paths: Vec::new(),
             notes: Vec::new(),
-            failing_test: Some(super::FailingEvidence {
+            contract_delta: super::ContractDelta {
+                changed_behaviors: vec!["durable verification".to_string()],
+                ..super::ContractDelta::default()
+            },
+            test_impacts: vec![super::TestImpact {
+                target: "tests::contract".to_string(),
+                disposition: "add-missing".to_string(),
+                protected_behavior: "durable verification".to_string(),
+                reason: "no owner exists".to_string(),
+                owner_test: None,
+                invariant_retired: false,
+                validation_scopes: vec!["affected-suite".to_string()],
+            }],
+            no_existing_tests_reason: None,
+            failing_tests: vec![super::FailingEvidence {
                 command: "cargo test".to_string(),
                 exit_code: 0,
                 summary: "all green".to_string(),
+                expected_failure: "missing v2".to_string(),
+                observed_failure: "unexpected green".to_string(),
                 test_name: None,
                 artifacts: Vec::new(),
-            }),
+            }],
+            failing_test: None,
             waiver: None,
-            final_validation: Some(super::FinalValidation {
-                command: "cargo test".to_string(),
-                status: "pass".to_string(),
-                summary: None,
-                artifacts: Vec::new(),
-            }),
+            final_validations: vec![
+                super::FinalValidation {
+                    command: "cargo test contract".to_string(),
+                    status: "pass".to_string(),
+                    scope: "focused".to_string(),
+                    summary: None,
+                    artifacts: Vec::new(),
+                },
+                super::FinalValidation {
+                    command: "cargo test suite".to_string(),
+                    status: "pass".to_string(),
+                    scope: "affected-suite".to_string(),
+                    summary: None,
+                    artifacts: Vec::new(),
+                },
+            ],
+            final_validation: None,
+            residual_gaps: Vec::new(),
+            no_residual_gaps: true,
         };
         assert_eq!(
             missing_evidence_fields(&record),
-            vec!["failing_test_nonzero_exit".to_string()],
+            vec!["failing_tests_nonzero_exit".to_string()],
         );
 
-        // A genuinely failing test (non-zero exit) is complete evidence.
-        let mut failing = record;
-        failing.failing_test.as_mut().unwrap().exit_code = 1;
-        assert!(missing_evidence_fields(&failing).is_empty());
-
-        // A waiver substitutes for failing-test evidence, so a zero-exit
-        // failing_test paired with a waiver is still complete.
-        let mut waived = failing;
-        waived.failing_test.as_mut().unwrap().exit_code = 0;
-        waived.waiver = Some(super::WaiverEvidence {
-            reason: "non-testable change".to_string(),
-            substitute_validation: Vec::new(),
-        });
-        assert!(missing_evidence_fields(&waived).is_empty());
+        record.failing_tests[0].exit_code = 101;
+        assert!(missing_evidence_fields(&record).is_empty());
     }
 }

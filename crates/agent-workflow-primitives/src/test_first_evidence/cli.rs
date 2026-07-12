@@ -8,9 +8,9 @@ use clap::{Args, Parser, Subcommand, ValueEnum, ValueHint};
     version,
     long_version = nils_build_info::long_version(env!("CARGO_PKG_VERSION")),
     about = "Record test-first evidence and waivers for agent workflows.",
-    long_about = "Create and verify test-first evidence records that capture failing tests, waivers, and final validation.",
+    long_about = "Create and verify durable test-first evidence records that capture contract impact, meaningful failures, waivers, residual gaps, and scoped final validation.",
     disable_help_subcommand = true,
-    after_help = "EXAMPLES:\n  test-first-evidence init --out /tmp/evidence --classification behavior-change --production-path src/lib.rs\n  test-first-evidence record-failing --out /tmp/evidence --command 'cargo test bug_repro' --exit-code 101 --summary 'bug reproduced'\n  test-first-evidence record-waiver --out /tmp/evidence --reason 'docs-only change'\n  test-first-evidence record-final --out /tmp/evidence --command 'cargo test bug_repro' --status pass\n  test-first-evidence verify --out /tmp/evidence --format json\n  test-first-evidence completion zsh\n\nENVIRONMENT:\n  none\n\nEXIT CODES:\n  0   success\n  1   runtime error\n  64  command-line usage error\n  65  invalid input data"
+    after_help = "EXAMPLES:\n  test-first-evidence init --out /tmp/evidence --classification behavior-change --production-path src/lib.rs --changed-behavior 'new contract'\n  test-first-evidence record-impact --out /tmp/evidence --target tests/lib.rs::contract --disposition add-missing --protected-behavior 'new contract' --reason 'no owner test exists'\n  test-first-evidence record-failing --out /tmp/evidence --command 'cargo test contract' --exit-code 101 --summary 'bug reproduced' --expected-failure 'new contract missing' --observed-failure 'assertion mismatch'\n  test-first-evidence record-final --out /tmp/evidence --command 'cargo test contract' --status pass --scope focused\n  test-first-evidence record-gap --out /tmp/evidence --none\n  test-first-evidence verify --out /tmp/evidence --format json\n  test-first-evidence completion zsh\n\nENVIRONMENT:\n  none\n\nEXIT CODES:\n  0   success\n  1   runtime error\n  64  command-line usage error\n  65  invalid input data"
 )]
 pub struct Cli {
     #[command(subcommand)]
@@ -24,10 +24,14 @@ pub enum Command {
     Init(InitArgs),
     /// Record a failing test or reproducible failure before the fix.
     RecordFailing(RecordFailingArgs),
+    /// Record one materially affected test target or declare none exist.
+    RecordImpact(RecordImpactArgs),
     /// Record an explicit waiver when failing evidence is not practical.
     RecordWaiver(RecordWaiverArgs),
     /// Record final validation after the implementation.
     RecordFinal(RecordFinalArgs),
+    /// Record one residual gap or explicitly declare that none remain.
+    RecordGap(RecordGapArgs),
     /// Query classified, pre-edit, or delivery readiness without mutating the record.
     Check(CheckArgs),
     /// Verify the evidence record is complete enough for delivery.
@@ -66,6 +70,26 @@ pub struct InitArgs {
     #[arg(long = "note", value_name = "TEXT")]
     pub notes: Vec<String>,
 
+    /// Existing behavior or invariant that must remain unchanged. Repeatable.
+    #[arg(long = "retained-behavior", value_name = "TEXT")]
+    pub retained_behaviors: Vec<String>,
+
+    /// Existing behavior intentionally changed by this work. Repeatable.
+    #[arg(long = "changed-behavior", value_name = "TEXT")]
+    pub changed_behaviors: Vec<String>,
+
+    /// Existing behavior intentionally removed by this work. Repeatable.
+    #[arg(long = "removed-behavior", value_name = "TEXT")]
+    pub removed_behaviors: Vec<String>,
+
+    /// New behavior added by this work. Repeatable.
+    #[arg(long = "added-behavior", value_name = "TEXT")]
+    pub added_behaviors: Vec<String>,
+
+    /// Cross-change invariant that must continue to hold. Repeatable.
+    #[arg(long, value_name = "TEXT")]
+    pub invariant: Vec<String>,
+
     /// Overwrite an existing record.
     #[arg(long)]
     pub force: bool,
@@ -88,6 +112,14 @@ pub struct RecordFailingArgs {
     #[arg(long, value_name = "TEXT")]
     pub summary: String,
 
+    /// Failure that should occur because the intended behavior is not implemented yet.
+    #[arg(long = "expected-failure", value_name = "TEXT")]
+    pub expected_failure: String,
+
+    /// Failure actually observed in the before-fix run.
+    #[arg(long = "observed-failure", value_name = "TEXT")]
+    pub observed_failure: String,
+
     /// Optional test name or scenario identifier.
     #[arg(long = "test-name", value_name = "TEXT")]
     pub test_name: Option<String>,
@@ -95,6 +127,44 @@ pub struct RecordFailingArgs {
     /// Optional evidence artifact path. Repeat for multiple artifacts.
     #[arg(long, value_name = "PATH", value_hint = ValueHint::AnyPath)]
     pub artifact: Vec<PathBuf>,
+}
+
+#[derive(Debug, Args)]
+pub struct RecordImpactArgs {
+    #[command(flatten)]
+    pub common: CommonArgs,
+
+    /// Declare that no existing test target is materially affected.
+    #[arg(long)]
+    pub none: bool,
+
+    /// Test name, path, suite, fixture family, or snapshot group.
+    #[arg(long, value_name = "TEXT")]
+    pub target: Option<String>,
+
+    /// Planned disposition for the affected target.
+    #[arg(long, value_enum)]
+    pub disposition: Option<TestDisposition>,
+
+    /// Behavior or risk protected by the target.
+    #[arg(long = "protected-behavior", value_name = "TEXT")]
+    pub protected_behavior: Option<String>,
+
+    /// Why this disposition is correct. Required for both target and none forms.
+    #[arg(long, value_name = "TEXT")]
+    pub reason: Option<String>,
+
+    /// Replacement or primary owner test when another target preserves the contract.
+    #[arg(long = "owner-test", value_name = "TEXT")]
+    pub owner_test: Option<String>,
+
+    /// Confirm that a removed test's protected invariant is intentionally retired.
+    #[arg(long = "invariant-retired")]
+    pub invariant_retired: bool,
+
+    /// Final validation scopes required by this impact. Repeatable.
+    #[arg(long = "validation-scope", value_enum)]
+    pub validation_scopes: Vec<ValidationScope>,
 }
 
 #[derive(Debug, Args)]
@@ -106,9 +176,25 @@ pub struct RecordWaiverArgs {
     #[arg(long, value_name = "TEXT")]
     pub reason: String,
 
+    /// Whether the change is permanently non-testable or carries deferred test debt.
+    #[arg(long = "waiver-kind", value_enum)]
+    pub waiver_kind: WaiverKind,
+
+    /// Why meaningful failing evidence cannot be captured now.
+    #[arg(long = "why-no-red", value_name = "TEXT")]
+    pub why_no_red: String,
+
     /// Substitute validation captured before editing. Repeat for multiple items.
     #[arg(long = "substitute-validation", value_name = "TEXT")]
     pub substitute_validation: Vec<String>,
+
+    /// Durable follow-up issue or action for deferred test debt.
+    #[arg(long, value_name = "TEXT")]
+    pub follow_up: Option<String>,
+
+    /// Expiry or removal condition for deferred test debt.
+    #[arg(long, value_name = "TEXT")]
+    pub expires: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -124,6 +210,10 @@ pub struct RecordFinalArgs {
     #[arg(long, value_enum)]
     pub status: ValidationStatus,
 
+    /// Risk scope proven by this validation.
+    #[arg(long, value_enum)]
+    pub scope: ValidationScope,
+
     /// Optional final validation summary.
     #[arg(long, value_name = "TEXT")]
     pub summary: Option<String>,
@@ -131,6 +221,28 @@ pub struct RecordFinalArgs {
     /// Optional validation artifact path. Repeat for multiple artifacts.
     #[arg(long, value_name = "PATH", value_hint = ValueHint::AnyPath)]
     pub artifact: Vec<PathBuf>,
+}
+
+#[derive(Debug, Args)]
+pub struct RecordGapArgs {
+    #[command(flatten)]
+    pub common: CommonArgs,
+
+    /// Explicitly declare that no residual validation or coverage gaps remain.
+    #[arg(long)]
+    pub none: bool,
+
+    /// Residual gap accepted for this delivery.
+    #[arg(long, value_name = "TEXT")]
+    pub gap: Option<String>,
+
+    /// Why the residual gap is acceptable now.
+    #[arg(long, value_name = "TEXT")]
+    pub reason: Option<String>,
+
+    /// Durable follow-up issue or action for the gap.
+    #[arg(long = "follow-up", value_name = "TEXT")]
+    pub follow_up: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -174,6 +286,33 @@ pub enum ValidationStatus {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 #[value(rename_all = "kebab-case")]
+pub enum TestDisposition {
+    Keep,
+    UpdateSpec,
+    RemoveObsolete,
+    AddMissing,
+    RefactorOnly,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, ValueEnum)]
+#[value(rename_all = "kebab-case")]
+pub enum ValidationScope {
+    Focused,
+    AffectedSuite,
+    ContractConsumer,
+    Full,
+    Manual,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+#[value(rename_all = "kebab-case")]
+pub enum WaiverKind {
+    NonTestable,
+    DeferredDebt,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+#[value(rename_all = "kebab-case")]
 pub enum CheckPhase {
     Classified,
     PreEdit,
@@ -195,6 +334,39 @@ impl ValidationStatus {
         match self {
             Self::Pass => "pass",
             Self::Fail => "fail",
+        }
+    }
+}
+
+impl TestDisposition {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Keep => "keep",
+            Self::UpdateSpec => "update-spec",
+            Self::RemoveObsolete => "remove-obsolete",
+            Self::AddMissing => "add-missing",
+            Self::RefactorOnly => "refactor-only",
+        }
+    }
+}
+
+impl ValidationScope {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Focused => "focused",
+            Self::AffectedSuite => "affected-suite",
+            Self::ContractConsumer => "contract-consumer",
+            Self::Full => "full",
+            Self::Manual => "manual",
+        }
+    }
+}
+
+impl WaiverKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::NonTestable => "non-testable",
+            Self::DeferredDebt => "deferred-debt",
         }
     }
 }
