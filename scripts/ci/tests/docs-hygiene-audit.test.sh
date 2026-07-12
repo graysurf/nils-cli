@@ -168,6 +168,31 @@ if grep -qF "PASS: docs hygiene audit" <<<"$audit_output"; then
   fail "ripgrep runtime failure is propagated: unexpected PASS marker"
 fi
 
+# A later optional-path probe must preserve the same diagnostic. These probes
+# historically redirected stderr to hide missing-path noise, but path filtering
+# now belongs to rg_scan_existing itself.
+late_failing_rg_bin="$tmp_dir/late-failing-rg-bin"
+mkdir -p "$late_failing_rg_bin"
+for tool in git find xargs awk sort uniq shasum sha1sum; do
+  src="$(command -v "$tool" 2>/dev/null || true)"
+  [[ -n "$src" ]] && ln -s "$src" "$late_failing_rg_bin/$tool"
+done
+cat >"$late_failing_rg_bin/rg" <<'STUB'
+#!/bin/sh
+case "$*" in
+  *'\blegacy\b'*) exit 2 ;;
+  *) exit 1 ;;
+esac
+STUB
+chmod +x "$late_failing_rg_bin/rg"
+mkdir -p "$clean_repo/docs/specs"
+printf '# late probe fixture\n' >"$clean_repo/docs/specs/late.md"
+assert_fails "late ripgrep failure keeps diagnostic" "$clean_repo" 2 \
+  "ripgrep scan failed (exit 2)" "$late_failing_rg_bin"
+if grep -qF "PASS: docs hygiene audit" <<<"$audit_output"; then
+  fail "late ripgrep failure keeps diagnostic: unexpected PASS marker"
+fi
+
 # The docs-only aggregate caller should fail at its own prerequisite boundary
 # instead of launching an audit that is known to require rg.
 verify_missing_rg_bin="$tmp_dir/verify-missing-rg-bin"

@@ -205,7 +205,7 @@ fi
 
 # Legacy-removal guardrails (reintroduction detection)
 legacy_docs_hits="$(rg_scan_existing -n --hidden --glob '!.git' -S '\blegacy\b' --audit-paths \
-  docs/specs docs/runbooks BINARY_DEPENDENCIES.md crates/*/README.md crates/*/docs 2>/dev/null)"
+  docs/specs docs/runbooks BINARY_DEPENDENCIES.md crates/*/README.md crates/*/docs)"
 if [[ -n "$legacy_docs_hits" ]]; then
   record_issue error "legacy keyword reintroduced in active docs"
   while IFS= read -r line; do
@@ -225,7 +225,7 @@ if [[ -n "$legacy_rs_hits" ]]; then
 fi
 
 removed_redirect_hits="$(rg_scan_existing -n -S 'handle_legacy_redirect|"provider" \| "debug" \| "workflow" \| "automation"' \
-  --audit-paths crates/codex-cli/src/main.rs crates/gemini-cli/src/main.rs 2>/dev/null)"
+  --audit-paths crates/codex-cli/src/main.rs crates/gemini-cli/src/main.rs)"
 if [[ -n "$removed_redirect_hits" ]]; then
   record_issue error "removed codex/gemini redirect surfaces were reintroduced"
   while IFS= read -r line; do
@@ -235,7 +235,7 @@ if [[ -n "$removed_redirect_hits" ]]; then
 fi
 
 removed_alias_hits="$(rg_scan_existing -n -S 'window-name|visible_alias = "enter"|Backward-compatible aliases are still accepted' \
-  --audit-paths crates/macos-agent/src/cli.rs crates/macos-agent/README.md 2>/dev/null)"
+  --audit-paths crates/macos-agent/src/cli.rs crates/macos-agent/README.md)"
 if [[ -n "$removed_alias_hits" ]]; then
   record_issue error "removed macos-agent alias surfaces were reintroduced"
   while IFS= read -r line; do
@@ -245,7 +245,7 @@ if [[ -n "$removed_alias_hits" ]]; then
 fi
 
 removed_websocket_hits="$(rg_scan_existing -n -S 'top-level send|receiveTimeoutSeconds|or top-level send' \
-  --audit-paths crates/api-testing-core/src/websocket/schema.rs crates/api-websocket/docs/specs/websocket-request-schema-v1.md 2>/dev/null)"
+  --audit-paths crates/api-testing-core/src/websocket/schema.rs crates/api-websocket/docs/specs/websocket-request-schema-v1.md)"
 if [[ -n "$removed_websocket_hits" ]]; then
   record_issue error "removed websocket fallback surfaces were reintroduced"
   while IFS= read -r line; do
@@ -255,7 +255,7 @@ if [[ -n "$removed_websocket_hits" ]]; then
 fi
 
 removed_image_ops_hits="$(rg_scan_existing -n -S 'Operation::(AutoOrient|Resize|Rotate|Crop|Pad|Flip|Flop|Optimize)|legacy transform|Legacy transform' \
-  --audit-paths crates/image-processing/src crates/image-processing/README.md BINARY_DEPENDENCIES.md 2>/dev/null)"
+  --audit-paths crates/image-processing/src crates/image-processing/README.md BINARY_DEPENDENCIES.md)"
 if [[ -n "$removed_image_ops_hits" ]]; then
   record_issue error "removed image-processing transform surfaces were reintroduced"
   while IFS= read -r line; do
