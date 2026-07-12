@@ -1298,15 +1298,62 @@ async fn fail_closed_projection(context: &CliContext, record: &SessionRecord) {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FreshBootstrap {
+    ThreadStart,
+    FirstTurn,
+    Closed,
+}
+
+impl FreshBootstrap {
+    fn for_runtime(context: &CliContext, record: &SessionRecord) -> Self {
+        let starting =
+            crate::activity::activity_status(context, &record.id).is_ok_and(|activity| {
+                activity.turn_state.phase == crate::activity::TurnPhase::Starting
+            });
+        let auto_resume_disabled = !crate::auto_resume::view_for_record(context, record).enabled;
+        if record.provider_resume.is_none()
+            && thread_attached_path(record).is_some_and(|path| !path.is_file())
+            && starting
+            && auto_resume_disabled
+        {
+            Self::ThreadStart
+        } else {
+            Self::Closed
+        }
+    }
+
+    fn bypasses_create_lock(&mut self, method: Option<&str>) -> bool {
+        match (*self, method) {
+            (Self::ThreadStart, Some("thread/start")) => {
+                *self = Self::FirstTurn;
+                true
+            }
+            (Self::FirstTurn, Some("turn/start")) => {
+                *self = Self::Closed;
+                true
+            }
+            _ => false,
+        }
+    }
+}
+
 async fn cancel_before_tui_mutation(
     context: &CliContext,
     record: &SessionRecord,
+    bootstrap: &mut FreshBootstrap,
     value: &Value,
 ) -> bool {
-    if !matches!(
-        value.get("method").and_then(Value::as_str),
-        Some("thread/start" | "turn/start")
-    ) {
+    let method = value.get("method").and_then(Value::as_str);
+    if !matches!(method, Some("thread/start" | "turn/start")) {
+        return true;
+    }
+    // A fresh Codex TUI emits `thread/start`, then the initial prompt emits
+    // `turn/start`, while the parent create path still owns the lifecycle lock.
+    // No auto-resume can be active in that exact starting state, so this local
+    // two-step gate lets creation finish without weakening later fail-closed
+    // cancellation. It closes permanently after the first turn.
+    if bootstrap.bypasses_create_lock(method) {
         return true;
     }
     let context = context.clone();
@@ -1384,6 +1431,7 @@ async fn run_proxy_session(
     .map_err(|_| "upstream app-server WebSocket handshake timed out".to_string())?
     .map_err(|err| format!("upstream app-server handshake failed: {err}"))?;
     let mut projection = ProxyProjection::new(context.clone(), record.clone());
+    let mut bootstrap = FreshBootstrap::for_runtime(&context, &record);
     loop {
         tokio::select! {
             message = tui.next() => {
@@ -1391,7 +1439,7 @@ async fn run_proxy_session(
                     .ok_or_else(|| "remote TUI closed the proxy".to_string())?
                     .map_err(|err| format!("remote TUI read failed: {err}"))?;
                 if let Some(value) = message_value(&message) {
-                    if !cancel_before_tui_mutation(&context, &record, &value).await {
+                    if !cancel_before_tui_mutation(&context, &record, &mut bootstrap, &value).await {
                         if let Some(id) = value
                             .get("id")
                             .filter(|id| json_id_key(id).is_some())
@@ -2651,6 +2699,119 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(receive_json(&mut tui).await["id"], 2);
+        server.await.unwrap();
+        proxy.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn fresh_tui_thread_start_bypasses_the_create_lifecycle_lock() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let upstream = tmp.path().join("fresh-start.sock");
+        let listener = tokio::net::UnixListener::bind(&upstream).unwrap();
+        let context = CliContext {
+            state_dir: tmp.path().join("state"),
+            host: None,
+        };
+        let record = record_with_runtime("fresh-start", &upstream);
+        fs::create_dir_all(crate::session_dir(&context, &record.id)).unwrap();
+        crate::write_session_record(&context, &record).unwrap();
+        crate::activity::activate_runtime(&context, &record).unwrap();
+        let proxy_args = crate::cli::CodexAppServerProxyArgs {
+            id: record.id.clone(),
+            upstream: upstream.clone(),
+            listen: upstream.with_extension("proxy"),
+        };
+        let proxy_context = context.clone();
+        let proxy = tokio::spawn(async move { run_proxy_session(proxy_context, proxy_args).await });
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let request = receive_json(&mut socket).await;
+            assert_eq!(request["method"], "thread/start");
+            respond(
+                &mut socket,
+                &request,
+                json!({ "thread": { "id": "fresh-thread" } }),
+            )
+            .await;
+            let request = receive_json(&mut socket).await;
+            assert_eq!(request["id"], 2);
+            assert_eq!(request["method"], "turn/start");
+            respond(
+                &mut socket,
+                &request,
+                json!({ "turn": { "id": "first-turn", "status": "inProgress" } }),
+            )
+            .await;
+            let request = receive_json(&mut socket).await;
+            assert_eq!(request["id"], 4);
+            assert_eq!(request["method"], "thread/read");
+            respond(
+                &mut socket,
+                &request,
+                json!({ "thread": { "id": "fresh-thread" } }),
+            )
+            .await;
+            socket.close(None).await.unwrap();
+        });
+        let proxy_stream = connect_socket(&upstream.with_extension("proxy"))
+            .await
+            .unwrap();
+        let (mut tui, _) = tokio_tungstenite::client_async("ws://localhost", proxy_stream)
+            .await
+            .unwrap();
+        let lock = crate::acquire_session_record_lock(&context, &record.id).unwrap();
+        tui.send(Message::Text(
+            json!({
+                "id": 1,
+                "method": "thread/start",
+                "params": { "cwd": "/repo" }
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .unwrap();
+        let response = receive_json(&mut tui).await;
+        assert_eq!(response["id"], 1);
+        assert_eq!(response["result"]["thread"]["id"], "fresh-thread");
+        tui.send(Message::Text(
+            json!({
+                "id": 2,
+                "method": "turn/start",
+                "params": { "threadId": "fresh-thread", "input": [] }
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .unwrap();
+        let response = receive_json(&mut tui).await;
+        assert_eq!(response["id"], 2);
+        assert_eq!(response["result"]["turn"]["id"], "first-turn");
+        tui.send(Message::Text(
+            json!({
+                "id": 3,
+                "method": "turn/start",
+                "params": { "threadId": "fresh-thread", "input": [] }
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .unwrap();
+        let rejected = receive_json(&mut tui).await;
+        assert_eq!(rejected["id"], 3);
+        assert_eq!(rejected["error"]["code"], -32001);
+        tui.send(Message::Text(
+            json!({ "id": 4, "method": "thread/read", "params": {} })
+                .to_string()
+                .into(),
+        ))
+        .await
+        .unwrap();
+        assert_eq!(receive_json(&mut tui).await["id"], 4);
+        drop(lock);
         server.await.unwrap();
         proxy.await.unwrap().unwrap();
     }
