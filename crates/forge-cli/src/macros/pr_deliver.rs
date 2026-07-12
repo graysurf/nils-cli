@@ -320,7 +320,25 @@ fn execute_sequence<R: BackendRunner, C: Clock>(
         interval: std::time::Duration::from_secs(20),
         required_only: true,
     };
-    match pr_wait_checks::compute(runner, clock, global, ctx, &wait_args) {
+    let wait_outcome = match pr_wait_checks::compute(runner, clock, global, ctx, &wait_args) {
+        Ok(WaitOutcome::Success(snapshot))
+            if snapshot.required_count == 0 && !snapshot.checks.is_empty() =>
+        {
+            // GitHub can expose CI while reporting no branch-protection-required
+            // checks. Delivery must still converge those visible checks before
+            // it can ready or merge the PR. Keep the explicit wait-checks atom's
+            // required-only semantics unchanged and apply this fallback only to
+            // the delivery macro. A genuinely empty check set still completes
+            // from the required-only snapshot above without a second poll.
+            let all_checks_args = PrWaitChecksArgs {
+                required_only: false,
+                ..wait_args.clone()
+            };
+            pr_wait_checks::compute(runner, clock, global, ctx, &all_checks_args)
+        }
+        outcome => outcome,
+    };
+    match wait_outcome {
         Ok(WaitOutcome::Success(snapshot)) => {
             steps.push(Step {
                 step: "wait_checks",
@@ -333,7 +351,7 @@ fn execute_sequence<R: BackendRunner, C: Clock>(
             let err = ForgeError::runtime_failure(
                 schema_version_for(BINARY, "pr.checks", 1),
                 "checks_failed",
-                "required checks did not reach success",
+                "delivery checks did not reach success",
                 None,
             );
             steps.push(Step {
@@ -355,7 +373,7 @@ fn execute_sequence<R: BackendRunner, C: Clock>(
             let err = ForgeError::unavailable(
                 schema_version_for(BINARY, "pr.checks", 1),
                 "checks_timeout",
-                "deadline reached before required checks became terminal",
+                "deadline reached before delivery checks became terminal",
                 None,
             );
             steps.push(Step {

@@ -17,6 +17,11 @@ use super::support::{CmdOutput, StubEnv, parse_envelope, run_forge_cli_in};
 
 const FIXTURE_CREATE_STDOUT: &str = include_str!("../fixtures/github/pr_create/create_stdout.txt");
 const FIXTURE_CHECKS_JSON: &str = include_str!("../fixtures/github/pr_checks/all_success.json");
+const FIXTURE_PENDING_CHECKS_JSON: &str =
+    include_str!("../fixtures/github/pr_checks/all_pending.json");
+const FIXTURE_FAILED_CHECKS_JSON: &str =
+    include_str!("../fixtures/github/pr_checks/mixed_failure_required.json");
+const FIXTURE_EMPTY_CHECKS_JSON: &str = include_str!("../fixtures/github/pr_checks/empty.json");
 
 /// Full pr.view JSON used by every step that re-fetches the PR. The fixture
 /// at `tests/fixtures/github/pr_create/view_response.json` was designed for
@@ -332,8 +337,74 @@ fn write_chain_stub(
     post_view: &str,
     merge_exits_one: bool,
 ) -> PathBuf {
+    write_chain_stub_with_checks(
+        stub,
+        pre_view,
+        post_view,
+        merge_exits_one,
+        FIXTURE_CHECKS_JSON,
+        FIXTURE_CHECKS_JSON,
+    )
+}
+
+fn write_zero_required_checks_stub(stub: &StubEnv, all_checks: &str) -> PathBuf {
+    write_chain_stub_with_checks(
+        stub,
+        FULL_PR_VIEW_JSON,
+        MERGED_PR_VIEW_JSON,
+        false,
+        all_checks,
+        "[]",
+    )
+}
+
+fn run_zero_required_delivery(
+    stub: StubEnv,
+    repo_path: &Path,
+    all_checks: &str,
+    timeout: &str,
+    no_merge: bool,
+) -> (StubEnv, CmdOutput) {
+    let gh_path = write_zero_required_checks_stub(&stub, all_checks);
+    let stub = stub.env("FORGE_CLI_GH_BIN", gh_path.to_string_lossy());
+    let mut args = vec![
+        "--provider",
+        "github",
+        "--format",
+        "json",
+        "pr",
+        "deliver",
+        "--kind",
+        "feature",
+        "--title",
+        "feat: wait for visible checks",
+        "--body",
+        "## Summary\n\nWait for visible checks.\n\n## Test plan\n\nVerified.\n",
+        "--head",
+        "feat/sample",
+        "--base",
+        "main",
+        "--timeout",
+        timeout,
+    ];
+    if no_merge {
+        args.push("--no-merge");
+    }
+    let output = run_in_repo(&stub, repo_path, &args);
+    (stub, output)
+}
+
+fn write_chain_stub_with_checks(
+    stub: &StubEnv,
+    pre_view: &str,
+    post_view: &str,
+    merge_exits_one: bool,
+    all_checks: &str,
+    required_checks: &str,
+) -> PathBuf {
     let sentinel = stub.tempdir.path().join("merge-called");
     let merge_args = stub.tempdir.path().join("merge-args");
+    let checks_calls = stub.tempdir.path().join("checks-calls");
     let merge_branch = if merge_exits_one {
         format!(
             "    echo \"$*\" > {merge_args}\n    touch {sentinel}\n    echo 'X stderr warning after merge' >&2\n    exit 1\n",
@@ -380,9 +451,19 @@ EOF
 EOF
     ;;
   "pr checks")
-    cat <<'EOF'
-{checks}
+    echo "$*" >> {checks_calls}
+    case "$*" in
+      *"--required"*)
+        cat <<'EOF'
+{required_checks}
 EOF
+        ;;
+      *)
+        cat <<'EOF'
+{all_checks}
+EOF
+        ;;
+    esac
     ;;
   "pr ready")
     :
@@ -428,7 +509,9 @@ esac
         create = FIXTURE_CREATE_STDOUT,
         pre_view = pre_view,
         post_view = post_view,
-        checks = FIXTURE_CHECKS_JSON,
+        all_checks = all_checks,
+        required_checks = required_checks,
+        checks_calls = checks_calls.display(),
         merge_branch = merge_branch,
         sentinel = sentinel.display(),
     );
@@ -739,6 +822,86 @@ fn pr_deliver_full_chain_no_merge_emits_four_steps_and_returns_success() {
     assert_eq!(envelope["data"]["pr"]["merged"], false);
     assert!(envelope["data"]["pr"]["merge_sha"].is_null());
     assert_eq!(envelope["data"]["pr"]["number"], 123);
+}
+
+#[test]
+fn pr_deliver_zero_required_pending_visible_checks_time_out_before_merge() {
+    let tempdir = make_git_repo();
+    let repo_path = tempdir.path().join("repo");
+
+    let stub = StubEnv::new();
+    let merge_sentinel = stub.tempdir.path().join("merge-called");
+    let (_stub, out) =
+        run_zero_required_delivery(stub, &repo_path, FIXTURE_PENDING_CHECKS_JSON, "0s", false);
+
+    assert_eq!(out.code, 69, "stdout={}\nstderr={}", out.stdout, out.stderr);
+    let envelope = parse_envelope(&out.stdout);
+    assert_eq!(envelope["error"]["code"], "checks_timeout");
+    assert!(
+        !merge_sentinel.exists(),
+        "pending visible checks must block merge"
+    );
+}
+
+#[test]
+fn pr_deliver_zero_required_successful_visible_checks_use_all_check_fallback() {
+    let tempdir = make_git_repo();
+    let repo_path = tempdir.path().join("repo");
+
+    let stub = StubEnv::new();
+    let checks_calls = stub.tempdir.path().join("checks-calls");
+    let (_stub, out) =
+        run_zero_required_delivery(stub, &repo_path, FIXTURE_CHECKS_JSON, "5s", true);
+
+    assert_eq!(out.code, 0, "stdout={}\nstderr={}", out.stdout, out.stderr);
+    assert_eq!(
+        fs::read_to_string(checks_calls)
+            .expect("checks call log")
+            .lines()
+            .count(),
+        3,
+        "required-only snapshot uses two backend calls and the all-check fallback uses one"
+    );
+}
+
+#[test]
+fn pr_deliver_zero_required_failed_visible_check_blocks_merge() {
+    let tempdir = make_git_repo();
+    let repo_path = tempdir.path().join("repo");
+
+    let stub = StubEnv::new();
+    let merge_sentinel = stub.tempdir.path().join("merge-called");
+    let (_stub, out) =
+        run_zero_required_delivery(stub, &repo_path, FIXTURE_FAILED_CHECKS_JSON, "5s", false);
+
+    assert_eq!(out.code, 1, "stdout={}\nstderr={}", out.stdout, out.stderr);
+    let envelope = parse_envelope(&out.stdout);
+    assert_eq!(envelope["error"]["code"], "checks_failed");
+    assert!(
+        !merge_sentinel.exists(),
+        "failed visible checks must block merge"
+    );
+}
+
+#[test]
+fn pr_deliver_zero_required_and_zero_visible_checks_complete_immediately() {
+    let tempdir = make_git_repo();
+    let repo_path = tempdir.path().join("repo");
+
+    let stub = StubEnv::new();
+    let checks_calls = stub.tempdir.path().join("checks-calls");
+    let (_stub, out) =
+        run_zero_required_delivery(stub, &repo_path, FIXTURE_EMPTY_CHECKS_JSON, "5s", true);
+
+    assert_eq!(out.code, 0, "stdout={}\nstderr={}", out.stdout, out.stderr);
+    assert_eq!(
+        fs::read_to_string(checks_calls)
+            .expect("checks call log")
+            .lines()
+            .count(),
+        2,
+        "an empty visible-check set must not add a fallback poll"
+    );
 }
 
 #[test]
