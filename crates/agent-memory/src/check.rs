@@ -16,7 +16,7 @@ use nils_common::fs::display_path;
 
 use crate::cli::CheckArgs;
 use crate::frontmatter::{self, VALID_TYPES};
-use crate::{CliError, EXIT_OK, EXIT_RUNTIME, Layout, markdown_files};
+use crate::{CliError, EXIT_OK, EXIT_RUNTIME, EXIT_USAGE, Layout, markdown_files};
 
 const SCHEMA_VERSION_COMMAND: &str = "check";
 
@@ -81,6 +81,17 @@ struct ScopeReport {
 }
 
 pub(crate) fn run(layout: &Layout, args: &CheckArgs) -> Result<i32, CliError> {
+    let json = args.json || args.format.is_json();
+    match run_inner(layout, args) {
+        Err(err) if json => {
+            print_json_error(&err);
+            Ok(err.exit_code)
+        }
+        other => other,
+    }
+}
+
+fn run_inner(layout: &Layout, args: &CheckArgs) -> Result<i32, CliError> {
     let forbidden_terms = args
         .forbid_terms_file
         .as_deref()
@@ -119,6 +130,26 @@ pub(crate) fn run(layout: &Layout, args: &CheckArgs) -> Result<i32, CliError> {
     }
 
     Ok(if failed { EXIT_RUNTIME } else { EXIT_OK })
+}
+
+fn print_json_error(err: &CliError) {
+    let code = if err.exit_code == EXIT_USAGE {
+        "usage-error"
+    } else {
+        "runtime-error"
+    };
+    let doc = json!({
+        "schema_version": schema_version_for("agent-memory", SCHEMA_VERSION_COMMAND, 1),
+        "ok": false,
+        "error": {
+            "code": code,
+            "message": err.message,
+        },
+    });
+    println!(
+        "{}",
+        serde_json::to_string(&doc).expect("check error should serialize")
+    );
 }
 
 fn count_severity(reports: &[ScopeReport], severity: Severity) -> usize {

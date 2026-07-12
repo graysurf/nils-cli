@@ -50,7 +50,7 @@ agent-memory candidate add <producer> --name <slug> \
 agent-memory candidate list [producer] [--format text|json]
 agent-memory candidate promote <producer> <slug> --type <t> \
   --description <text> [--title <text>] [--hook <text>] \
-  [--session-id <uuid>] [--apply] [--format text|json]
+  --session-id <uuid> [--apply] [--format text|json]
 agent-memory completion zsh
 ```
 
@@ -127,11 +127,20 @@ index, and candidate index in a rollback transaction: it creates a canonical
 global note, appends the curated index line, removes the candidate index line,
 and removes the source only when every replacement succeeds. Duplicate global
 slugs, traversal, symlinks, and stale transaction paths fail closed.
+Canonical description, title, hook, and required session provenance must be
+non-empty single-line values so they cannot inject YAML or index lines.
+Valid `global/` directory symlinks remain supported. Candidate directories,
+files, and indexes remain non-symlink boundaries. Rollback failures are
+reported as incomplete and preserve `.promote-backup` recovery files instead
+of claiming success.
 
 ## Output
 
 Human-readable output is the default and mirrors the original shell contract.
 Primary command output goes to stdout; errors go to stderr.
+For the new `recall`, `candidate`, and extended `check` surfaces,
+`--format json` keeps runtime failures in the command's versioned JSON envelope
+with `ok=false` and a stable `error.code`.
 
 ## Exit Codes
 

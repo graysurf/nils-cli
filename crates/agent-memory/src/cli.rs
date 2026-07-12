@@ -303,9 +303,9 @@ pub struct CandidatePromoteArgs {
     /// Global index hook (defaults to the description).
     #[arg(long, value_name = "TEXT")]
     pub hook: Option<String>,
-    /// Stamp `metadata.originSessionId` on the promoted note.
+    /// Stamp required `metadata.originSessionId` promotion provenance.
     #[arg(long, value_name = "UUID")]
-    pub session_id: Option<String>,
+    pub session_id: String,
     /// Apply the promotion. Omit for a non-mutating preview.
     #[arg(long)]
     pub apply: bool,

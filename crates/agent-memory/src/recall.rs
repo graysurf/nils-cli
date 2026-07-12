@@ -10,13 +10,27 @@ use nils_common::fs::display_path;
 use crate::cli::{
     RecallArgs, RecallCandidatesArgs, RecallCommand, RecallOnDemandArgs, RecallStartupArgs,
 };
-use crate::{CliError, EXIT_OK, EXIT_RUNTIME, Layout, markdown_files};
+use crate::{CliError, EXIT_OK, EXIT_RUNTIME, EXIT_USAGE, Layout, markdown_files};
 
 pub(crate) fn run(layout: &Layout, args: &RecallArgs) -> Result<i32, CliError> {
-    match &args.command {
+    let (json, schema_command) = match &args.command {
+        RecallCommand::Startup(args) => (args.json || args.format.is_json(), "recall-startup"),
+        RecallCommand::OnDemand(args) => (args.json || args.format.is_json(), "recall-on-demand"),
+        RecallCommand::Candidates(args) => {
+            (args.json || args.format.is_json(), "recall-candidates")
+        }
+    };
+    let result = match &args.command {
         RecallCommand::Startup(args) => startup(layout, args),
         RecallCommand::OnDemand(args) => on_demand(layout, args),
         RecallCommand::Candidates(args) => candidates(layout, args),
+    };
+    match result {
+        Err(err) if json => {
+            print_json_error(schema_command, &err);
+            Ok(err.exit_code)
+        }
+        other => other,
     }
 }
 
@@ -86,6 +100,9 @@ struct RecallHit {
 }
 
 fn on_demand(layout: &Layout, args: &RecallOnDemandArgs) -> Result<i32, CliError> {
+    if args.term.trim().is_empty() {
+        return Err(CliError::usage("on-demand recall term must not be empty"));
+    }
     let global = layout.global_dir();
     if !global.is_dir() {
         return Err(CliError::runtime(format!(
@@ -169,4 +186,24 @@ fn candidates(layout: &Layout, args: &RecallCandidatesArgs) -> Result<i32, CliEr
 
 fn output_format(format: OutputFormat, json: bool) -> OutputFormat {
     if json { OutputFormat::Json } else { format }
+}
+
+fn print_json_error(schema_command: &str, err: &CliError) {
+    let code = if err.exit_code == EXIT_USAGE {
+        "usage-error"
+    } else {
+        "runtime-error"
+    };
+    let doc = json!({
+        "schema_version": schema_version_for("agent-memory", schema_command, 1),
+        "ok": false,
+        "error": {
+            "code": code,
+            "message": err.message,
+        },
+    });
+    println!(
+        "{}",
+        serde_json::to_string(&doc).expect("recall error should serialize")
+    );
 }

@@ -13,19 +13,35 @@ use crate::cli::{
     CandidateAddArgs, CandidateArgs, CandidateCommand, CandidateListArgs, CandidatePromoteArgs,
 };
 use crate::frontmatter::{self, VALID_TYPES};
-use crate::{CliError, EXIT_OK, Layout, validate_id};
+use crate::{CliError, EXIT_OK, EXIT_USAGE, Layout, validate_id};
 
 pub(crate) fn run(layout: &Layout, args: &CandidateArgs) -> Result<i32, CliError> {
-    match &args.command {
+    let (json, schema_command) = match &args.command {
+        CandidateCommand::Add(args) => (args.json || args.format.is_json(), "candidate-add"),
+        CandidateCommand::List(args) => (args.json || args.format.is_json(), "candidate-list"),
+        CandidateCommand::Promote(args) => {
+            (args.json || args.format.is_json(), "candidate-promote")
+        }
+    };
+    let result = match &args.command {
         CandidateCommand::Add(args) => add(layout, args),
         CandidateCommand::List(args) => list(layout, args),
         CandidateCommand::Promote(args) => promote(layout, args),
+    };
+    match result {
+        Err(err) if json => {
+            print_json_error(schema_command, &err);
+            Ok(err.exit_code)
+        }
+        other => other,
     }
 }
 
 fn add(layout: &Layout, args: &CandidateAddArgs) -> Result<i32, CliError> {
     validate_id(&args.producer)?;
     validate_slug(&args.name)?;
+    validate_optional_single_line("title", args.title.as_deref())?;
+    validate_optional_single_line("hook", args.hook.as_deref())?;
     let producer_dir = ensure_producer_dir(layout, &args.producer)?;
     let index = producer_dir.join("MEMORY.md");
     ensure_regular_file(&index, "candidate index")?;
@@ -186,6 +202,10 @@ fn promote(layout: &Layout, args: &CandidatePromoteArgs) -> Result<i32, CliError
             args.r#type
         )));
     }
+    validate_single_line("description", &args.description)?;
+    validate_optional_single_line("title", args.title.as_deref())?;
+    validate_optional_single_line("hook", args.hook.as_deref())?;
+    validate_single_line("session-id", &args.session_id)?;
 
     let producer_dir = layout.candidates_dir().join(&args.producer);
     ensure_regular_dir(&producer_dir, "candidate producer directory")?;
@@ -195,7 +215,7 @@ fn promote(layout: &Layout, args: &CandidatePromoteArgs) -> Result<i32, CliError
     ensure_regular_file(&candidate_index, "candidate index")?;
 
     let global = layout.global_dir();
-    ensure_regular_dir(&global, "global directory")?;
+    ensure_supported_global_dir(&global)?;
     let global_index = global.join("MEMORY.md");
     ensure_regular_file(&global_index, "global index")?;
     let destination = global.join(format!("{}.md", args.name));
@@ -213,7 +233,7 @@ fn promote(layout: &Layout, args: &CandidatePromoteArgs) -> Result<i32, CliError
         &args.name,
         &args.description,
         &args.r#type,
-        args.session_id.as_deref(),
+        Some(&args.session_id),
         &source_body,
     );
     let title = args.title.as_deref().unwrap_or(&args.name);
@@ -225,6 +245,16 @@ fn promote(layout: &Layout, args: &CandidatePromoteArgs) -> Result<i32, CliError
             display_path(&global_index)
         ))
     })?;
+    let destination_marker = format!("]({}.md)", args.name);
+    if global_original
+        .lines()
+        .any(|line| line.contains(&destination_marker))
+    {
+        return Err(CliError::runtime(format!(
+            "global index already references {}.md",
+            args.name
+        )));
+    }
     let candidate_original = fs::read_to_string(&candidate_index).map_err(|err| {
         CliError::runtime(format!(
             "failed to read {}: {err}",
@@ -252,7 +282,7 @@ fn promote(layout: &Layout, args: &CandidatePromoteArgs) -> Result<i32, CliError
             "schema_version": schema_version_for("agent-memory", "candidate-promote", 1),
             "ok": true,
             "applied": args.apply,
-            "trust": "curated-after-explicit-apply",
+            "trust": if args.apply { "curated-after-explicit-apply" } else { "untrusted-candidate" },
             "producer": args.producer,
             "source": display_path(&source),
             "destination": display_path(&destination),
@@ -340,7 +370,7 @@ fn apply_promotion(files: PromotionFiles<'_>) -> Result<(), CliError> {
     })();
 
     if let Err(err) = result {
-        rollback_promotion(
+        let rollback_errors = rollback_promotion(
             &files,
             &source_backup,
             &global_backup,
@@ -350,6 +380,12 @@ fn apply_promotion(files: PromotionFiles<'_>) -> Result<(), CliError> {
             &candidate_tmp,
             progress,
         );
+        if !rollback_errors.is_empty() {
+            return Err(CliError::runtime(format!(
+                "promotion failed ({err}); rollback incomplete: {}. Preserve .promote-backup files for manual recovery",
+                rollback_errors.join("; ")
+            )));
+        }
         return Err(CliError::runtime(format!(
             "promotion failed and was rolled back: {err}"
         )));
@@ -379,26 +415,66 @@ fn rollback_promotion(
     global_tmp: &Path,
     candidate_tmp: &Path,
     progress: PromotionProgress,
-) {
+) -> Vec<String> {
+    let mut errors = Vec::new();
     if progress.destination_installed {
-        let _ = fs::remove_file(files.destination);
+        record_rollback_result(
+            fs::remove_file(files.destination),
+            "remove installed destination",
+            &mut errors,
+        );
     }
     if progress.global_installed {
-        let _ = fs::remove_file(files.global_index);
+        record_rollback_result(
+            fs::remove_file(files.global_index),
+            "remove installed global index",
+            &mut errors,
+        );
     }
     if progress.candidate_installed {
-        let _ = fs::remove_file(files.candidate_index);
+        record_rollback_result(
+            fs::remove_file(files.candidate_index),
+            "remove installed candidate index",
+            &mut errors,
+        );
     }
     if progress.source_backed_up {
-        let _ = fs::rename(source_backup, files.source);
+        record_rollback_result(
+            fs::rename(source_backup, files.source),
+            "restore candidate source",
+            &mut errors,
+        );
     }
     if progress.global_backed_up {
-        let _ = fs::rename(global_backup, files.global_index);
+        record_rollback_result(
+            fs::rename(global_backup, files.global_index),
+            "restore global index",
+            &mut errors,
+        );
     }
     if progress.candidate_backed_up {
-        let _ = fs::rename(candidate_backup, files.candidate_index);
+        record_rollback_result(
+            fs::rename(candidate_backup, files.candidate_index),
+            "restore candidate index",
+            &mut errors,
+        );
     }
-    cleanup(&[destination_tmp, global_tmp, candidate_tmp]);
+    for (path, action) in [
+        (destination_tmp, "remove destination temp"),
+        (global_tmp, "remove global-index temp"),
+        (candidate_tmp, "remove candidate-index temp"),
+    ] {
+        if path.exists() {
+            record_rollback_result(fs::remove_file(path), action, &mut errors);
+        }
+    }
+    errors
+}
+
+fn record_rollback_result(result: std::io::Result<()>, action: &str, errors: &mut Vec<String>) {
+    if let Err(err) = result {
+        errors.push(format!("{action}: {err}"));
+    }
 }
 
 fn producer_dirs(
@@ -482,6 +558,22 @@ fn ensure_regular_dir(path: &Path, label: &str) -> Result<(), CliError> {
     Ok(())
 }
 
+fn ensure_supported_global_dir(path: &Path) -> Result<(), CliError> {
+    let metadata = fs::symlink_metadata(path).map_err(|err| {
+        CliError::runtime(format!(
+            "global directory not found at {}: {err}",
+            display_path(path)
+        ))
+    })?;
+    if metadata.is_dir() || (metadata.file_type().is_symlink() && path.is_dir()) {
+        return Ok(());
+    }
+    Err(CliError::runtime(format!(
+        "global directory is not a directory or valid directory symlink: {}",
+        display_path(path)
+    )))
+}
+
 fn ensure_regular_file(path: &Path, label: &str) -> Result<(), CliError> {
     let metadata = fs::symlink_metadata(path).map_err(|err| {
         CliError::runtime(format!(
@@ -529,6 +621,22 @@ fn validate_slug(name: &str) -> Result<(), CliError> {
     }
 }
 
+fn validate_single_line(label: &str, value: &str) -> Result<(), CliError> {
+    if value.trim().is_empty() || value.contains(['\n', '\r']) {
+        return Err(CliError::usage(format!(
+            "{label} must be a non-empty single-line value"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_optional_single_line(label: &str, value: Option<&str>) -> Result<(), CliError> {
+    if let Some(value) = value {
+        validate_single_line(label, value)?;
+    }
+    Ok(())
+}
+
 fn append_index_line(index: &Path, line: &str) -> Result<(), CliError> {
     ensure_regular_file(index, "candidate index")?;
     let original = fs::read_to_string(index).map_err(|err| {
@@ -547,7 +655,7 @@ fn append_line(original: &str, line: &str) -> String {
 }
 
 fn remove_candidate_link(original: &str, slug: &str) -> String {
-    let marker = format!("]({slug}.md)");
+    let marker = format!("{slug}.md");
     let retained: Vec<_> = original
         .lines()
         .filter(|line| !line.contains(&marker))
@@ -610,6 +718,26 @@ fn output_format(format: OutputFormat, json: bool) -> OutputFormat {
     if json { OutputFormat::Json } else { format }
 }
 
+fn print_json_error(schema_command: &str, err: &CliError) {
+    let code = if err.exit_code == EXIT_USAGE {
+        "usage-error"
+    } else {
+        "runtime-error"
+    };
+    let doc = json!({
+        "schema_version": schema_version_for("agent-memory", schema_command, 1),
+        "ok": false,
+        "error": {
+            "code": code,
+            "message": err.message,
+        },
+    });
+    println!(
+        "{}",
+        serde_json::to_string(&doc).expect("candidate error should serialize")
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -642,7 +770,7 @@ mod tests {
             global_updated: "new global",
             candidate_updated: "new candidate",
         };
-        rollback_promotion(
+        let errors = rollback_promotion(
             &files,
             &source_backup,
             &global_backup,
@@ -655,6 +783,7 @@ mod tests {
                 ..PromotionProgress::default()
             },
         );
+        assert!(errors.is_empty(), "rollback errors: {errors:?}");
 
         assert_eq!(fs::read_to_string(&source).expect("source"), "candidate");
         assert_eq!(
@@ -696,7 +825,7 @@ mod tests {
             global_updated: "new global",
             candidate_updated: "new candidate",
         };
-        rollback_promotion(
+        let errors = rollback_promotion(
             &files,
             &source_backup,
             &global_backup,
@@ -713,6 +842,7 @@ mod tests {
                 candidate_installed: true,
             },
         );
+        assert!(errors.is_empty(), "rollback errors: {errors:?}");
 
         assert!(!destination.exists());
         assert_eq!(
@@ -727,5 +857,49 @@ mod tests {
             fs::read_to_string(&candidate_index).expect("candidate index"),
             "candidate-index-original"
         );
+    }
+
+    #[test]
+    fn rollback_reports_incomplete_restore_and_retains_backup() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let source = tmp.path().join("candidate.md");
+        let destination = tmp.path().join("destination.md");
+        let global_index = tmp.path().join("global-index.md");
+        let candidate_index = tmp.path().join("candidate-index.md");
+        let source_backup = sibling(&source, ".promote-backup");
+        let global_backup = sibling(&global_index, ".promote-backup");
+        let candidate_backup = sibling(&candidate_index, ".promote-backup");
+        let destination_tmp = sibling(&destination, ".promote-tmp");
+        let global_tmp = sibling(&global_index, ".promote-tmp");
+        let candidate_tmp = sibling(&candidate_index, ".promote-tmp");
+        fs::write(&source_backup, "candidate-original").expect("source backup");
+        fs::create_dir(&source).expect("conflicting source directory");
+
+        let files = PromotionFiles {
+            source: &source,
+            destination: &destination,
+            global_index: &global_index,
+            candidate_index: &candidate_index,
+            note: "new note",
+            global_updated: "new global",
+            candidate_updated: "new candidate",
+        };
+        let errors = rollback_promotion(
+            &files,
+            &source_backup,
+            &global_backup,
+            &candidate_backup,
+            &destination_tmp,
+            &global_tmp,
+            &candidate_tmp,
+            PromotionProgress {
+                source_backed_up: true,
+                ..PromotionProgress::default()
+            },
+        );
+
+        assert!(!errors.is_empty());
+        assert!(errors[0].contains("restore candidate source"));
+        assert!(source_backup.is_file(), "backup must remain for recovery");
     }
 }

@@ -42,7 +42,10 @@ Beyond the original shell contract, the Rust CLI adds:
   profiles.
 - `candidate add|list|promote` — isolates proposal writers by producer and
   provides an explicit dry-run/apply promotion transaction into curated
-  `global/` memory.
+  `global/` memory. Promotion requires explicit session provenance, preserves
+  supported global-directory symlinks, removes exact native-index filename
+  references, and reports incomplete rollback without deleting recovery
+  backups.
 
 Candidate files are opaque untrusted data; canonical frontmatter is required
 only at promotion. Scope IDs, producer IDs, source files, and audit inputs are
@@ -50,3 +53,4 @@ path-validated and symlink guarded.
 
 All JSON output follows the workspace CLI output contract: `--format json` is
 canonical, `--json` is a hidden alias, and records carry a `schema_version`.
+The new command families retain the same envelope for runtime errors.
