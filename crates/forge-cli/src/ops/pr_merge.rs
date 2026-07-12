@@ -182,6 +182,19 @@ fn run_lockdown_chain<R: BackendRunner>(
 
     // Rule 7 + base discovery — fetch pr.view once and reuse.
     let pr = fetch_pr_view(runner, ctx, args.id)?;
+    if let Some(expected) = args.expected_head_sha.as_deref()
+        && pr.head_sha.as_deref() != Some(expected)
+    {
+        return Err(ForgeError::validation(
+            schema_err(),
+            "test_first_evidence_provider_head_mismatch",
+            "the provider PR/MR head changed after subject verification",
+            Some(format!(
+                "attested_head={expected} provider_head={}",
+                pr.head_sha.as_deref().unwrap_or("<missing>")
+            )),
+        ));
+    }
     if pr.draft {
         return Err(ForgeError::validation(
             schema_err(),
@@ -229,7 +242,7 @@ fn run_lockdown_chain<R: BackendRunner>(
 
     // All gates clear — invoke the backend.
     let merge_call = build_live_merge_call(ctx, args.id, &pr, method, delete_branch)?;
-    invoke_merge_with_idempotency_check(runner, ctx, args.id, &merge_call)?;
+    invoke_merge_with_idempotency_check(runner, ctx, args.id, &merge_call, pr.head_sha.as_deref())?;
 
     // Post-merge re-fetch for merge_sha.
     let merge_sha = fetch_merge_sha(runner, ctx, args.id)?;
@@ -319,7 +332,12 @@ fn build_live_merge_call(
     delete_branch: bool,
 ) -> Result<BackendCall, ForgeError> {
     if !matches!(ctx.provider, Provider::GitLab) {
-        return Ok(build_merge_call(ctx, id, method, delete_branch));
+        let mut call = build_merge_call(ctx, id, method, delete_branch);
+        if let Some(sha) = pr.head_sha.as_deref().filter(|sha| !sha.is_empty()) {
+            call.argv.push(OsString::from("--match-head-commit"));
+            call.argv.push(OsString::from(sha));
+        }
+        return Ok(call);
     }
     let host = gitlab_api::host_from_url(&pr.url).unwrap_or_else(|| ctx.host.clone());
     let project = gitlab_api::project_path_from_mr_url(&pr.url)
@@ -369,7 +387,7 @@ fn fetch_pr_view<R: BackendRunner>(
     let call = pr_view_call(ctx, id);
     let output = runner.run(&call)?;
     let payload = pr_view::parse_view_output(ctx, &output)?;
-    let head_sha = extract_head_sha(ctx, &output);
+    let head_sha = payload.head_sha.clone();
     let body = extract_body(ctx, &output);
     Ok(PrView {
         number: payload.number,
@@ -395,9 +413,7 @@ fn pr_view_call(ctx: &ProviderContext, id: u64) -> BackendCall {
             // Diverges from `pr_view::GH_JSON_FIELDS` on purpose: the merge
             // chain needs `body` for the rule-13 task-list gate and fetches
             // `mergeCommit` separately post-merge via `merge_sha_call`.
-            OsString::from(
-                "number,url,state,isDraft,title,headRefName,baseRefName,mergeable,mergedAt,labels,body",
-            ),
+            OsString::from(pr_view::GH_JSON_FIELDS),
         ],
         Provider::GitLab => vec![
             OsString::from("mr"),
@@ -433,6 +449,7 @@ fn invoke_merge_with_idempotency_check<R: BackendRunner>(
     ctx: &ProviderContext,
     pr_id: u64,
     merge_call: &BackendCall,
+    expected_head_sha: Option<&str>,
 ) -> Result<(), ForgeError> {
     match runner.run(merge_call) {
         Ok(_) => Ok(()),
@@ -443,7 +460,25 @@ fn invoke_merge_with_idempotency_check<R: BackendRunner>(
                 return Err(err);
             }
             match fetch_pr_view(runner, ctx, pr_id) {
-                Ok(post) if post.state.eq_ignore_ascii_case("merged") => Ok(()),
+                Ok(post)
+                    if post.state.eq_ignore_ascii_case("merged")
+                        && expected_head_sha
+                            .is_none_or(|expected| post.head_sha.as_deref() == Some(expected)) =>
+                {
+                    Ok(())
+                }
+                Ok(post) if post.state.eq_ignore_ascii_case("merged") => {
+                    Err(ForgeError::validation(
+                        schema_err(),
+                        "test_first_evidence_provider_head_mismatch",
+                        "the provider merged a different head after the guarded merge failed",
+                        Some(format!(
+                            "expected_head={} provider_head={}",
+                            expected_head_sha.unwrap_or("<missing>"),
+                            post.head_sha.as_deref().unwrap_or("<missing>")
+                        )),
+                    ))
+                }
                 _ => Err(err),
             }
         }
@@ -510,24 +545,6 @@ fn extract_merge_sha(ctx: &ProviderContext, output: &BackendSuccess) -> Result<S
             Some(format!("stdout={:?}", output.stdout)),
         )
     })
-}
-
-fn extract_head_sha(ctx: &ProviderContext, output: &BackendSuccess) -> Option<String> {
-    if !matches!(ctx.provider, Provider::GitLab) {
-        return None;
-    }
-    let value: serde_json::Value = serde_json::from_str(output.stdout.trim()).ok()?;
-    value
-        .get("sha")
-        .and_then(|v| v.as_str())
-        .or_else(|| {
-            value
-                .get("diff_refs")
-                .and_then(|v| v.get("head_sha"))
-                .and_then(|v| v.as_str())
-        })
-        .map(str::to_string)
-        .filter(|s| !s.is_empty())
 }
 
 /// Pull the PR/MR description out of the raw view output for the rule-13
@@ -678,6 +695,29 @@ mod tests {
         let plan = call.plan_argv();
         assert!(plan.iter().any(|s| s == "--merge"));
         assert!(!plan.iter().any(|s| s == "--delete-branch"));
+    }
+
+    #[test]
+    fn live_github_merge_uses_provider_head_as_compare_and_swap() {
+        let pr = PrView {
+            number: 7,
+            url: "https://github.com/acme/widgets/pull/7".into(),
+            draft: false,
+            base: "main".into(),
+            head: "feat/subject".into(),
+            state: "open".into(),
+            head_sha: Some("abc123".into()),
+            body: String::new(),
+        };
+        let call =
+            build_live_merge_call(&ctx(Provider::GitHub), 7, &pr, MergeMethod::Squash, false)
+                .expect("merge call");
+        let plan = call.plan_argv();
+        let index = plan
+            .iter()
+            .position(|item| item == "--match-head-commit")
+            .expect("CAS flag");
+        assert_eq!(plan[index + 1], "abc123");
     }
 
     #[test]

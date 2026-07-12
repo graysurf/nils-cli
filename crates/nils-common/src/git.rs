@@ -186,6 +186,35 @@ pub struct GitRemoteUrl {
     pub path: String,
 }
 
+/// Canonicalize a Git provider host for repository identity comparisons.
+///
+/// GitHub exposes `ssh.github.com` as an SSH transport alias for
+/// `github.com`; transport-only changes must not change repository identity.
+pub fn canonical_git_host(host: &str) -> String {
+    match host.trim().to_ascii_lowercase().as_str() {
+        "ssh.github.com" => "github.com".to_string(),
+        host => host.to_string(),
+    }
+}
+
+/// Build the canonical, credential-free repository identity for a parsed
+/// provider host and repository path.
+pub fn canonical_repository_identity(host: &str, path: &str) -> String {
+    format!(
+        "{}/{}",
+        canonical_git_host(host),
+        path.trim_matches('/').trim_end_matches(".git")
+    )
+    .to_ascii_lowercase()
+}
+
+/// Parse a Git remote URL into the canonical repository identity used by
+/// delivery evidence and forge provider gates.
+pub fn repository_identity_from_remote_url(url: &str) -> Option<String> {
+    let parsed = parse_git_remote_url(url)?;
+    Some(canonical_repository_identity(&parsed.host, &parsed.path))
+}
+
 /// Parse a git remote URL into a `host`/`path` pair, accepting the four shapes
 /// git itself accepts:
 ///
@@ -882,6 +911,19 @@ mod tests {
         let r = parse_git_remote_url("http://gitlab.example.com/group/proj.git").expect("http");
         assert_eq!(r.host, "gitlab.example.com");
         assert_eq!(r.path, "group/proj");
+    }
+
+    #[test]
+    fn repository_identity_normalizes_github_ssh_transport_alias() {
+        assert_eq!(
+            repository_identity_from_remote_url("ssh://git@ssh.github.com:443/Acme/Widget.git")
+                .as_deref(),
+            Some("github.com/acme/widget")
+        );
+        assert_eq!(
+            canonical_repository_identity("GitHub.com", "Acme/Widget.git"),
+            "github.com/acme/widget"
+        );
     }
 
     #[test]

@@ -218,7 +218,8 @@ skill-usage show --out <dir> --format json
 directory. New records use `test-first-evidence.record.v2` and
 `cli.test-first-evidence.*.v2`: they carry contract delta, materially affected
 test targets, meaningful failing evidence, scoped final validation, waivers,
-and an explicit residual-gap declaration. Record v1 remains readable by
+an explicit residual-gap declaration, and optional repository/change subject
+metadata. Record v1 remains readable by
 `show`, but strict `verify` and the forge delivery gate require deliberate v2
 re-recording because the missing maintenance facts cannot be inferred safely.
 Classification is a closed set:
@@ -234,6 +235,9 @@ test-first-evidence init \
   --production-path src/lib.rs \
   --changed-behavior "parser accepts the new contract" \
   --invariant "v1 input remains readable"
+test-first-evidence bind-baseline \
+  --out "$AGENT_HOME/out/projects/acme__app/test-first" \
+  --project-path .
 test-first-evidence record-impact \
   --out "$AGENT_HOME/out/projects/acme__app/test-first" \
   --target "tests/parser.rs::new_contract" \
@@ -263,7 +267,14 @@ test-first-evidence record-final \
 test-first-evidence record-gap \
   --out "$AGENT_HOME/out/projects/acme__app/test-first" \
   --none
-test-first-evidence verify --out "$AGENT_HOME/out/projects/acme__app/test-first" --format json
+# Commit the delivered change before attesting its head and diff.
+test-first-evidence bind-delivery \
+  --out "$AGENT_HOME/out/projects/acme__app/test-first" \
+  --project-path .
+test-first-evidence verify \
+  --out "$AGENT_HOME/out/projects/acme__app/test-first" \
+  --project-path . \
+  --format json
 test-first-evidence check --out "$AGENT_HOME/out/projects/acme__app/test-first" \
   --phase pre-edit --project-path . --path src/lib.rs --format json
 ```
@@ -273,6 +284,59 @@ with the opposite status appends a monotonically numbered attempt, so failed
 evidence and artifacts remain durable while only the latest attempt determines
 that identity's effective status. An unresolved latest failure blocks strict
 verification.
+
+`bind-baseline` records an immutable repository identity plus the pre-edit
+commit and tree. Provider-backed repositories derive identity from the selected
+remote after removing userinfo; repositories without a parseable provider slug
+fall back to a path-free digest of their Git history roots. `--repository-id`
+is available for local-provider targets that need an explicit stable identity.
+`bind-delivery` appends the current head, tree, and deterministic baseline diff
+digest. After an amend or rebase, subject-aware verification fails until
+`bind-delivery` is run again; the new attempt is appended and the original
+baseline and earlier delivery attempts remain intact.
+
+```json
+{
+  "subject": {
+    "repository": {
+      "kind": "provider",
+      "id": "github.com/acme/widget"
+    },
+    "baseline": {
+      "commit": "<full lowercase Git object ID>",
+      "tree": "<full lowercase Git object ID>"
+    },
+    "deliveries": [
+      {
+        "head": "<full lowercase Git object ID>",
+        "tree": "<full lowercase Git object ID>",
+        "diff_digest": "sha256:<64 lowercase hex characters>",
+        "attempt": 1
+      }
+    ]
+  }
+}
+```
+
+`repository.kind` is `provider`, `local-history`, or `explicit`.
+Provider identity canonicalizes known transport aliases such as
+`ssh.github.com` to `github.com`. Git object IDs must match the repository's
+full SHA-1 or SHA-256 object format; symbolic and abbreviated revisions are
+rejected. Delivery attempts start at one and remain unique and contiguous.
+The diff digest is a domain-separated, length-delimited SHA-256 digest of the
+baseline and delivery tree object IDs, independent of Git diff rendering and
+configuration. The subject remains optional only so older v2 records stay
+readable; strict delivery requires it.
+
+Plain `verify` keeps structural v2 compatibility. Passing `--project-path`
+enables strict subject verification and rejects unbound records, another
+repository, a stale head, or a changed diff. The forge feature/bug delivery
+gate always enables this subject check when `[test_first].require` is true.
+Stable subject reason codes are `subject-match`, `unbound-subject`,
+`delivery-subject-unbound`, `repository-mismatch`, `baseline-unavailable`,
+`baseline-mismatch`, `delivery-subject-mismatch`,
+`invalid-subject-object-id`, `invalid-delivery-attempt`, and
+`unsupported-object-format`.
 
 `check` is read-only. `classified` confirms classification exists, `pre-edit`
 uses the repository's `[path_classes]` contract, and `delivery` is the

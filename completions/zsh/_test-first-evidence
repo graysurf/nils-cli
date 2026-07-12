@@ -115,6 +115,28 @@ _arguments "${_arguments_options[@]}" : \
 '--help[Print help]' \
 && ret=0
 ;;
+(bind-baseline)
+_arguments "${_arguments_options[@]}" : \
+'--out=[Evidence artifact directory containing \`test-first-evidence.json\`]:DIR:_files -/' \
+'--format=[Output format]:FORMAT:(text json)' \
+'--project-path=[Git repository whose baseline or delivery subject is being bound]:DIR:_files -/' \
+'--remote=[Git remote used for provider repository identity when available]:NAME:_default' \
+'--repository-id=[Stable repository identity override for provider/local targets without a usable remote]:ID:_default' \
+'-h[Print help]' \
+'--help[Print help]' \
+&& ret=0
+;;
+(bind-delivery)
+_arguments "${_arguments_options[@]}" : \
+'--out=[Evidence artifact directory containing \`test-first-evidence.json\`]:DIR:_files -/' \
+'--format=[Output format]:FORMAT:(text json)' \
+'--project-path=[Git repository whose baseline or delivery subject is being bound]:DIR:_files -/' \
+'--remote=[Git remote used for provider repository identity when available]:NAME:_default' \
+'--repository-id=[Stable repository identity override for provider/local targets without a usable remote]:ID:_default' \
+'-h[Print help]' \
+'--help[Print help]' \
+&& ret=0
+;;
 (check)
 _arguments "${_arguments_options[@]}" : \
 '--out=[Evidence artifact directory containing \`test-first-evidence.json\`]:DIR:_files -/' \
@@ -130,6 +152,9 @@ _arguments "${_arguments_options[@]}" : \
 _arguments "${_arguments_options[@]}" : \
 '--out=[Evidence artifact directory containing \`test-first-evidence.json\`]:DIR:_files -/' \
 '--format=[Output format]:FORMAT:(text json)' \
+'--project-path=[Also require the latest delivery subject to match this Git repository]:DIR:_files -/' \
+'--remote=[Git remote used for provider repository identity when available]:NAME:_default' \
+'--repository-id=[Stable repository identity override used when checking the subject]:ID:_default' \
 '-h[Print help]' \
 '--help[Print help]' \
 && ret=0
@@ -163,12 +188,24 @@ _test-first-evidence_commands() {
 'record-waiver:Record an explicit waiver when failing evidence is not practical' \
 'record-final:Record final validation after the implementation' \
 'record-gap:Record one residual gap or explicitly declare that none remain' \
+'bind-baseline:Bind the immutable repository and pre-edit baseline subject' \
+'bind-delivery:Append an attestation for the current delivered head and diff' \
 'check:Query classified, pre-edit, or delivery readiness without mutating the record' \
 'verify:Verify the evidence record is complete enough for delivery' \
 'show:Print the current evidence record' \
 'completion:Print shell completion script' \
     )
     _describe -t commands 'test-first-evidence commands' commands "$@"
+}
+(( $+functions[_test-first-evidence__subcmd__bind-baseline_commands] )) ||
+_test-first-evidence__subcmd__bind-baseline_commands() {
+    local commands; commands=()
+    _describe -t commands 'test-first-evidence bind-baseline commands' commands "$@"
+}
+(( $+functions[_test-first-evidence__subcmd__bind-delivery_commands] )) ||
+_test-first-evidence__subcmd__bind-delivery_commands() {
+    local commands; commands=()
+    _describe -t commands 'test-first-evidence bind-delivery commands' commands "$@"
 }
 (( $+functions[_test-first-evidence__subcmd__check_commands] )) ||
 _test-first-evidence__subcmd__check_commands() {

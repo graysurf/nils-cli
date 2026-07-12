@@ -204,6 +204,94 @@ fn make_git_repo() -> TempDir {
     tempdir
 }
 
+fn make_subject_bound_git_repo() -> (TempDir, PathBuf, String) {
+    let tempdir = make_git_repo();
+    let repo = tempdir.path().join("repo");
+    fs::write(
+        repo.join(".forge-cli.toml"),
+        "[test_first]\nrequire = true\n",
+    )
+    .expect("forge config");
+    git(&repo, &["add", ".forge-cli.toml"]);
+    git(&repo, &["commit", "-q", "-m", "enable test-first gate"]);
+    update_upstream_ref(&repo);
+
+    let evidence = tempdir.path().join("evidence");
+    fs::create_dir_all(&evidence).expect("evidence dir");
+    fs::write(
+        evidence.join("test-first-evidence.json"),
+        r#"{"schema_version":"test-first-evidence.record.v2","change_classification":"behavior-change","contract_delta":{"changed_behaviors":["durable gate"]},"no_existing_tests_reason":"fixture has no existing tests","waiver":{"reason":"fixture","kind":"non-testable","why_no_red":"fixture path","substitute_validation":["cargo test"]},"final_validations":[{"command":"cargo test","status":"pass","scope":"focused"}],"no_residual_gaps":true}"#,
+    )
+    .expect("evidence record");
+    let evidence_arg = evidence.to_string_lossy().to_string();
+    let repo_arg = repo.to_string_lossy().to_string();
+    assert_eq!(
+        agent_workflow_primitives::test_first_evidence::run_with_args([
+            "test-first-evidence",
+            "bind-baseline",
+            "--out",
+            &evidence_arg,
+            "--project-path",
+            &repo_arg,
+        ]),
+        0
+    );
+
+    fs::write(repo.join("delivery.txt"), "delivery\n").expect("delivery");
+    git(&repo, &["add", "delivery.txt"]);
+    git(&repo, &["commit", "-q", "-m", "delivery"]);
+    update_upstream_ref(&repo);
+    assert_eq!(
+        agent_workflow_primitives::test_first_evidence::run_with_args([
+            "test-first-evidence",
+            "bind-delivery",
+            "--out",
+            &evidence_arg,
+            "--project-path",
+            &repo_arg,
+        ]),
+        0
+    );
+    let head = git_output(&repo, &["rev-parse", "HEAD"]);
+    (tempdir, evidence, head)
+}
+
+fn update_upstream_ref(repo: &Path) {
+    let head = git_output(repo, &["rev-parse", "HEAD"]);
+    fs::write(
+        repo.join(".git/refs/remotes/origin/feat/sample"),
+        format!("{head}\n"),
+    )
+    .expect("upstream ref");
+}
+
+fn git_output(repo: &Path, args: &[&str]) -> String {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(args)
+        .output()
+        .expect("git spawn");
+    assert!(
+        output.status.success(),
+        "git {args:?} failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout)
+        .expect("git stdout")
+        .trim()
+        .to_string()
+}
+
+fn view_with_head_oid(template: &str, head: &str) -> String {
+    template.replace(
+        "\"headRefName\": \"feat/sample\",",
+        &format!(
+            "\"headRefName\": \"feat/sample\",\n  \"headRefOid\": \"{head}\",\n  \"headRepository\": {{ \"nameWithOwner\": \"sympoies/nils-cli\" }},"
+        ),
+    )
+}
+
 fn git(repo: &Path, args: &[&str]) {
     let out = Command::new("git")
         .arg("-C")
@@ -245,15 +333,18 @@ fn write_chain_stub(
     merge_exits_one: bool,
 ) -> PathBuf {
     let sentinel = stub.tempdir.path().join("merge-called");
+    let merge_args = stub.tempdir.path().join("merge-args");
     let merge_branch = if merge_exits_one {
         format!(
-            "    touch {sentinel}\n    echo 'X stderr warning after merge' >&2\n    exit 1\n",
+            "    echo \"$*\" > {merge_args}\n    touch {sentinel}\n    echo 'X stderr warning after merge' >&2\n    exit 1\n",
             sentinel = sentinel.display(),
+            merge_args = merge_args.display(),
         )
     } else {
         format!(
-            "    touch {sentinel}\n    :\n",
+            "    echo \"$*\" > {merge_args}\n    touch {sentinel}\n    :\n",
             sentinel = sentinel.display(),
+            merge_args = merge_args.display(),
         )
     };
     let body = format!(
@@ -358,6 +449,18 @@ fn write_adopt_chain_stub(stub: &StubEnv, pre_view: &str) -> PathBuf {
     let merge_sentinel = stub.tempdir.path().join("merge-called");
     let ready_sentinel = stub.tempdir.path().join("ready-called");
     let create_sentinel = stub.tempdir.path().join("create-called");
+    let merge_args = stub.tempdir.path().join("merge-args");
+    let head_sha = serde_json::from_str::<serde_json::Value>(pre_view)
+        .ok()
+        .and_then(|value| value["headRefOid"].as_str().map(str::to_string));
+    let ready_view = head_sha
+        .as_deref()
+        .map(|sha| view_with_head_oid(ADOPTED_READY_PR_VIEW_JSON, sha))
+        .unwrap_or_else(|| ADOPTED_READY_PR_VIEW_JSON.to_string());
+    let merged_view = head_sha
+        .as_deref()
+        .map(|sha| view_with_head_oid(MERGED_PR_VIEW_JSON, sha))
+        .unwrap_or_else(|| MERGED_PR_VIEW_JSON.to_string());
     let body = format!(
         r#"#!/bin/sh
 set -e
@@ -406,6 +509,7 @@ EOF
 EOF
     ;;
   "pr merge")
+    echo "$*" > {merge_args}
     touch {merge_sentinel}
     ;;
   "pr view")
@@ -440,12 +544,13 @@ esac
 "#,
         list = OPEN_PR_LIST_JSON,
         checks = FIXTURE_CHECKS_JSON,
-        merged = MERGED_PR_VIEW_JSON,
-        ready_view = ADOPTED_READY_PR_VIEW_JSON,
+        merged = merged_view,
+        ready_view = ready_view,
         pre_view = pre_view,
         create_sentinel = create_sentinel.display(),
         ready_sentinel = ready_sentinel.display(),
         merge_sentinel = merge_sentinel.display(),
+        merge_args = merge_args.display(),
     );
     let path = stub.tempdir.path().join("gh");
     fs::write(&path, body).expect("write gh stub");
@@ -773,6 +878,100 @@ fn pr_deliver_full_chain_emits_all_seven_steps_with_merge_sha() {
 }
 
 #[test]
+fn pr_deliver_gate_enabled_create_preserves_attested_head_through_merge_cas() {
+    let (tempdir, evidence, head) = make_subject_bound_git_repo();
+    let repo_path = tempdir.path().join("repo");
+    let pre_view = view_with_head_oid(FULL_PR_VIEW_JSON, &head);
+    let post_view = view_with_head_oid(MERGED_PR_VIEW_JSON, &head);
+
+    let stub = StubEnv::new();
+    let merge_args = stub.tempdir.path().join("merge-args");
+    let gh_path = write_chain_stub(&stub, &pre_view, &post_view, false);
+    let stub = stub.env("FORGE_CLI_GH_BIN", gh_path.to_string_lossy());
+    let evidence_arg = evidence.to_string_lossy().to_string();
+    let out = run_in_repo(
+        &stub,
+        &repo_path,
+        &[
+            "--provider",
+            "github",
+            "--format",
+            "json",
+            "pr",
+            "deliver",
+            "--kind",
+            "feature",
+            "--title",
+            "feat: subject-bound delivery",
+            "--body",
+            "## Summary\n\nBound.\n\n## Test plan\n\nVerified.\n",
+            "--head",
+            "feat/sample",
+            "--base",
+            "main",
+            "--test-first-evidence",
+            &evidence_arg,
+            "--timeout",
+            "5s",
+        ],
+    );
+    assert_eq!(out.code, 0, "stdout={}\nstderr={}", out.stdout, out.stderr);
+    let args = fs::read_to_string(merge_args).expect("merge args");
+    assert!(
+        args.contains(&format!("--match-head-commit {head}")),
+        "merge CAS missing attested head: {args}"
+    );
+}
+
+#[test]
+fn pr_deliver_gate_enabled_adopt_preserves_attested_head_through_merge_cas() {
+    let (tempdir, evidence, head) = make_subject_bound_git_repo();
+    let repo_path = tempdir.path().join("repo");
+    let pre_view = view_with_head_oid(ADOPTABLE_PR_VIEW_JSON, &head);
+
+    let stub = StubEnv::new();
+    let merge_args = stub.tempdir.path().join("merge-args");
+    let create_called = stub.tempdir.path().join("create-called");
+    let gh_path = write_adopt_chain_stub(&stub, &pre_view);
+    let stub = stub.env("FORGE_CLI_GH_BIN", gh_path.to_string_lossy());
+    let evidence_arg = evidence.to_string_lossy().to_string();
+    let out = run_in_repo(
+        &stub,
+        &repo_path,
+        &[
+            "--provider",
+            "github",
+            "--format",
+            "json",
+            "pr",
+            "deliver",
+            "--kind",
+            "feature",
+            "--title",
+            "feat: subject-bound delivery",
+            "--head",
+            "feat/sample",
+            "--base",
+            "main",
+            "--test-first-evidence",
+            &evidence_arg,
+            "--timeout",
+            "5s",
+        ],
+    );
+    assert_eq!(out.code, 0, "stdout={}\nstderr={}", out.stdout, out.stderr);
+    assert!(
+        !create_called.exists(),
+        "adopt path must not create another PR"
+    );
+    let args = fs::read_to_string(merge_args).expect("merge args");
+    assert!(
+        args.contains(&format!("--match-head-commit {head}")),
+        "merge CAS missing attested head: {args}"
+    );
+}
+
+#[test]
 fn pr_deliver_short_circuits_when_pr_create_validation_fails_with_data_65() {
     // Title over 70 chars trips pr.create's title_length validation. The
     // macro must surface DATA 65 (not a remapped runtime code) and omit
@@ -954,6 +1153,56 @@ fn pr_deliver_treats_gh_exit_1_after_successful_merge_as_success() {
     );
     assert_eq!(envelope["data"]["pr"]["merged"], true);
     assert_eq!(envelope["data"]["pr"]["merge_sha"], "abc123def456");
+}
+
+#[test]
+fn pr_deliver_rejects_idempotent_merge_recovery_for_a_different_head() {
+    let tempdir = make_git_repo();
+    let repo_path = tempdir.path().join("repo");
+    let pre_view = view_with_head_oid(
+        FULL_PR_VIEW_JSON,
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    );
+    let post_view = view_with_head_oid(
+        MERGED_PR_VIEW_JSON,
+        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    );
+
+    let stub = StubEnv::new();
+    let gh_path = write_chain_stub_with_merge_exit(
+        &stub, &pre_view, &post_view, /*merge_exits_one=*/ true,
+    );
+    let stub = stub.env("FORGE_CLI_GH_BIN", gh_path.to_string_lossy());
+    let out = run_in_repo(
+        &stub,
+        &repo_path,
+        &[
+            "--provider",
+            "github",
+            "--format",
+            "json",
+            "pr",
+            "deliver",
+            "--kind",
+            "feature",
+            "--title",
+            "feat: sample feature",
+            "--body",
+            "## Summary\n\nLand.\n\n## Test plan\n\nVerified.\n",
+            "--head",
+            "feat/sample",
+            "--base",
+            "main",
+            "--timeout",
+            "5s",
+        ],
+    );
+    assert_eq!(out.code, 65, "stdout={}\nstderr={}", out.stdout, out.stderr);
+    let envelope = parse_envelope(&out.stdout);
+    assert_eq!(
+        envelope["error"]["code"],
+        "test_first_evidence_provider_head_mismatch"
+    );
 }
 
 #[test]

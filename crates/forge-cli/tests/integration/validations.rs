@@ -87,7 +87,7 @@ fn sprint3_runtime_and_unavailable_kinds_match_spec() {
 
 #[test]
 fn test_first_evidence_kinds_match_spec() {
-    // The config-gated test-first gate adds five typed kinds (catalog entry
+    // The config-gated test-first gate adds nine typed kinds (catalog entry
     // `test_first_evidence`). Pin them here so a discriminator or exit-code
     // drift fails against the spec.
     for kind in [
@@ -95,6 +95,10 @@ fn test_first_evidence_kinds_match_spec() {
         "test_first_evidence_v1",
         "test_first_evidence_classification",
         "test_first_evidence_incomplete",
+        "test_first_evidence_unbound",
+        "test_first_evidence_subject_mismatch",
+        "test_first_evidence_provider_head_unavailable",
+        "test_first_evidence_provider_head_mismatch",
         "test_first_evidence_unreadable",
     ] {
         let err = ForgeError::validation("cli.forge-cli.error.v1", kind, "x", None);

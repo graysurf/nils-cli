@@ -24,7 +24,7 @@ use crate::rate_limit::default_runner;
 const SCHEMA: &str = "pr.view";
 const SCHEMA_VERSION: u32 = 1;
 
-const GH_JSON_FIELDS: &str = "number,url,state,isDraft,title,headRefName,baseRefName,mergeable,mergedAt,mergeCommit,labels,body,closingIssuesReferences";
+pub(crate) const GH_JSON_FIELDS: &str = "number,url,state,isDraft,title,headRefName,headRefOid,headRepository,baseRefName,mergeable,mergedAt,mergeCommit,labels,body,closingIssuesReferences";
 
 /// A single issue a PR/MR closes on merge via a `Closes/Fixes #N` closing
 /// keyword. GitHub surfaces these through the `closingIssuesReferences`
@@ -48,6 +48,10 @@ pub struct PrViewPayload {
     pub draft: bool,
     pub title: String,
     pub head: String,
+    /// Immutable provider commit currently at the PR/MR head.
+    pub head_sha: Option<String>,
+    /// Provider repository identity for the source head when exposed.
+    pub head_repository: Option<String>,
     pub base: String,
     pub mergeable: &'static str,
     pub merged_at: Option<String>,
@@ -246,6 +250,17 @@ fn parse_github(
             .unwrap_or(false),
         title: required_str(value, "title")?,
         head: required_str(value, "headRefName")?,
+        head_sha: value
+            .get("headRefOid")
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+            .filter(|value| !value.is_empty()),
+        head_repository: value
+            .get("headRepository")
+            .and_then(|repo| repo.get("nameWithOwner"))
+            .and_then(|v| v.as_str())
+            .map(|value| value.to_ascii_lowercase())
+            .filter(|value| !value.is_empty()),
         base: required_str(value, "baseRefName")?,
         mergeable: normalize_mergeable_github(value.get("mergeable").and_then(|v| v.as_str())),
         merged_at,
@@ -315,6 +330,11 @@ fn parse_gitlab(
         draft,
         title: required_str(value, "title")?,
         head: required_str(value, "source_branch")?,
+        head_sha: gitlab_head_sha(value),
+        head_repository: value
+            .get("source_project_id")
+            .and_then(|v| v.as_u64())
+            .map(|id| format!("gitlab-project-id:{id}")),
         base: required_str(value, "target_branch")?,
         mergeable: normalize_mergeable_gitlab(value.get("merge_status").and_then(|v| v.as_str())),
         merged_at,
@@ -328,6 +348,20 @@ fn parse_gitlab(
         // GitLab closeout is a no-op until a dedicated fetch is added.
         closing_issue_refs: Vec::new(),
     })
+}
+
+pub(crate) fn gitlab_head_sha(value: &serde_json::Value) -> Option<String> {
+    value
+        .get("sha")
+        .and_then(|item| item.as_str())
+        .or_else(|| {
+            value
+                .get("diff_refs")
+                .and_then(|refs| refs.get("head_sha"))
+                .and_then(|item| item.as_str())
+        })
+        .map(str::to_string)
+        .filter(|value| !value.is_empty())
 }
 
 fn github_label_names(value: &serde_json::Value) -> Vec<String> {
@@ -430,12 +464,14 @@ mod tests {
     #[test]
     fn parse_github_open_pr() {
         let output = BackendSuccess {
-            stdout: r#"{"number":5,"url":"u","state":"OPEN","isDraft":true,"title":"t","headRefName":"feat/x","baseRefName":"main","mergeable":"MERGEABLE","mergedAt":null,"labels":[{"name":"a"},{"name":"b"}]}"#.into(),
+            stdout: r#"{"number":5,"url":"u","state":"OPEN","isDraft":true,"title":"t","headRefName":"feat/x","headRefOid":"abc123","headRepository":{"nameWithOwner":"Acme/Widget"},"baseRefName":"main","mergeable":"MERGEABLE","mergedAt":null,"labels":[{"name":"a"},{"name":"b"}]}"#.into(),
             stderr: String::new(),
         };
         let p = parse_view_output(&ctx(Provider::GitHub), &output).unwrap();
         assert_eq!(p.state, "open");
         assert!(p.draft);
+        assert_eq!(p.head_sha.as_deref(), Some("abc123"));
+        assert_eq!(p.head_repository.as_deref(), Some("acme/widget"));
         assert_eq!(p.mergeable, "yes");
         assert_eq!(p.merged_at, None);
         assert_eq!(p.labels, vec!["a".to_string(), "b".to_string()]);
@@ -457,14 +493,26 @@ mod tests {
     #[test]
     fn parse_gitlab_opened_normalises_to_open() {
         let output = BackendSuccess {
-            stdout: r#"{"iid":7,"web_url":"u","state":"opened","draft":true,"title":"t","source_branch":"feat/x","target_branch":"main","merge_status":"can_be_merged","labels":["x","y"]}"#.into(),
+            stdout: r#"{"iid":7,"web_url":"u","state":"opened","draft":true,"title":"t","source_branch":"feat/x","sha":"def456","source_project_id":42,"target_branch":"main","merge_status":"can_be_merged","labels":["x","y"]}"#.into(),
             stderr: String::new(),
         };
         let p = parse_view_output(&ctx(Provider::GitLab), &output).unwrap();
         assert_eq!(p.state, "open");
         assert!(p.draft);
+        assert_eq!(p.head_sha.as_deref(), Some("def456"));
+        assert_eq!(p.head_repository.as_deref(), Some("gitlab-project-id:42"));
         assert_eq!(p.mergeable, "yes");
         assert_eq!(p.labels, vec!["x".to_string(), "y".to_string()]);
+    }
+
+    #[test]
+    fn parse_gitlab_head_sha_accepts_diff_refs_compatibility_shape() {
+        let output = BackendSuccess {
+            stdout: r#"{"iid":7,"web_url":"u","state":"opened","draft":false,"title":"t","source_branch":"feat/x","diff_refs":{"head_sha":"compat123"},"target_branch":"main","merge_status":"can_be_merged","labels":[]}"#.into(),
+            stderr: String::new(),
+        };
+        let payload = parse_view_output(&ctx(Provider::GitLab), &output).expect("view");
+        assert_eq!(payload.head_sha.as_deref(), Some("compat123"));
     }
 
     #[test]

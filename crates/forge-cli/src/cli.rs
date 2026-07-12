@@ -601,6 +601,9 @@ pub struct PrTasksArgs {
 pub struct PrMergeArgs {
     /// Numeric PR / MR id.
     pub id: u64,
+    /// Macro-internal compare-and-swap head. Not exposed as a CLI flag.
+    #[arg(skip)]
+    pub expected_head_sha: Option<String>,
     /// Merge method override. When omitted, falls back to
     /// `.forge-cli.toml [merge].method` then the spec default `squash`.
     #[arg(long, value_enum)]
@@ -782,8 +785,9 @@ pub struct PrCreateArgs {
     /// Directory holding a `test-first-evidence` record. Verified by the
     /// test-first gate when `[test_first].require` resolves true for a
     /// feature/bug PR. Requires a complete v2 record with a testable
-    /// classification, durable pre-fix evidence, scoped final validation, and
-    /// a residual-gap declaration.
+    /// classification, durable pre-fix evidence, scoped final validation, a
+    /// residual-gap declaration, and a bound baseline/delivery subject
+    /// matching the current checkout.
     #[arg(long = "test-first-evidence", value_name = "DIR")]
     pub test_first_evidence: Option<String>,
 }
@@ -914,7 +918,8 @@ pub struct PrDeliverArgs {
     /// Directory holding a `test-first-evidence` record, forwarded to the
     /// create step and verified by the test-first gate when
     /// `[test_first].require` resolves true for a feature/bug PR. Requires a
-    /// complete v2 record with a testable classification.
+    /// complete v2 record with a testable classification and a bound
+    /// baseline/delivery subject matching the current checkout.
     #[arg(long = "test-first-evidence", value_name = "DIR")]
     pub test_first_evidence: Option<String>,
     /// CI-wait budget before declaring `checks_timeout` (default `30m`).
