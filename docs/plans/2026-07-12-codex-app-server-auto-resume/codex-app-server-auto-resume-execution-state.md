@@ -27,7 +27,7 @@
 | 2.2 | done | Normalize app-server turn failures safely | FailureReducer and activity projection tests: exact bound failed + usageLimitExceeded only; raw identifiers projected and content discarded | No text classifier. |
 | 2.3 | done | Integrate Codex usage scheduling and continuation | Provider-scoped scheduler/control tests and real canary: authoritative reset recheck and acknowledged exactly-once same-thread continuation | Same account/thread; exactly once. |
 | 3.1 | done | Complete regression, privacy, and compatibility coverage | `cargo test -p nils-agent-session --all-targets`: 239 unit and 69 integration tests passed; docs specify supported and degraded modes | Cover every issue test-first row. |
-| 3.2 | done | Run repository validation | `bash scripts/ci/nils-cli-checks-entrypoint.sh --local-fast`: fmt, clippy, docs audits, 308 nextest tests, and doc tests passed | Local-fast plus focused tests. |
+| 3.2 | done | Run repository validation | `bash scripts/ci/nils-cli-checks-entrypoint.sh --local-fast`: workspace fmt, clippy, docs audits, 5,946 nextest tests, and doc tests passed; completion freshness checked 62 snapshots with zero failures | Local-fast plus focused tests. |
 | 4.1 | done | Run end-to-end real exhaustion acceptance canary | codex-app-server-auto-resume-canary-evidence.md: final transparent-bridge run on `sym` captured real quota failure, sibling isolation, one authorized reset, daemon restart, one visible continuation, and cleanup | Future quota/reset validation must use `sym`, never `gamania`. |
 | 4.2 | pending | Deliver, review, merge, and close | pending | Strict review and close-ready gates. |
 
@@ -49,6 +49,9 @@
   notifications are connection-local for TUI-owned turns. Replaced the passive
   monitor with a private transparent WebSocket bridge and reran the real
   exhaustion/reset/restart canary using only `sym`; one reset credit was used.
+- 2026-07-12: Final CI exposed stale generated Bash/Zsh completion snapshots
+  for the internal bridge subcommand. Regenerated both assets and passed the
+  completion suite, 62-snapshot freshness audit, and full workspace gate.
 
 ## Validation
 
@@ -59,6 +62,7 @@
 | Plan validation | pass | `plan-tooling validate --explain` accepted the complete bundle with zero errors. | local validation |
 | Test-first evidence | pass | Meaningful unsupported-Codex red captured before production edits; affected and manual validation recorded. | runtime-kit test-first evidence v2 |
 | Focused tests | pass | 239 unit, 69 integration, and doc tests passed after the final bridge repair. | `cargo test -p nils-agent-session --all-targets` |
-| Local-fast | pass | Formatting, clippy, docs/parity audits, 308 nextest tests, and doc tests passed. | `bash scripts/ci/nils-cli-checks-entrypoint.sh --local-fast` |
+| Local-fast | pass | Workspace formatting, clippy, docs/parity audits, 5,946 nextest tests, and doc tests passed. | `bash scripts/ci/nils-cli-checks-entrypoint.sh --local-fast` |
+| Completion assets | pass | Bash/Zsh syntax, Zsh completion behavior, export smoke, and 62-snapshot freshness audit passed with zero failures. | completion standard validation commands |
 | Real exhaustion canary | pass | Exact structured failure, sibling negative control, one reset, daemon reconnect, and exactly one acknowledged visible continuation. | codex-app-server-auto-resume-canary-evidence.md |
 | Required CI and specialist review | pending | Delivery gate. | pending |
