@@ -81,7 +81,7 @@ Stable (safe for strict parsing):
 - Top-level: `schema_version`, `command`, `ok`, `result|results|error`
 - Error envelope: `error.code`, `error.message`, optional `error.details`
 - Diag:
-  - `result.mode` (`single`) for single mode
+  - top-level `mode` (`single`) for single mode
   - top-level `mode` (`all` or `async`) for collection mode
   - `result.target_file`, `results[*].target_file`
   - `results[*].name`
@@ -117,9 +117,10 @@ the prompt segment reads the ChatGPT usage endpoint directly.
 
 `windows` is the authoritative usage-window collection. Each well-formed upstream
 window is emitted independently, so the collection may contain zero, one, or two
-items. The compatibility `summary` convenience fields remain present, but fields for an
-absent window are `null` (reset fields may be omitted). Consumers must not infer a
-5-hour window when only the weekly window is present.
+items. When at least one window exists, the compatibility `summary` object is present;
+fields for an absent sibling window are `null` (reset fields may be omitted). When
+`windows` is empty, `summary` is omitted. Consumers must not infer a 5-hour window when
+only the weekly window is present.
 
 Informational (do not hard-depend for schema validation):
 
@@ -153,9 +154,9 @@ the error message.
 {
   "schema_version": "codex-cli.diag.rate-limits.v1",
   "command": "diag rate-limits",
+  "mode": "single",
   "ok": true,
   "result": {
-    "mode": "single",
     "provider": "codex",
     "target_file": "alpha.json",
     "source": "network",
@@ -183,6 +184,26 @@ the error message.
     "raw_usage": {
       "rate_limit": {}
     }
+  }
+}
+```
+
+### diag rate-limits (single, no active window)
+
+```json
+{
+  "schema_version": "codex-cli.diag.rate-limits.v1",
+  "command": "diag rate-limits",
+  "mode": "single",
+  "ok": true,
+  "result": {
+    "provider": "codex",
+    "name": "alpha",
+    "target_file": "alpha.json",
+    "status": "ok",
+    "ok": true,
+    "source": "network",
+    "windows": []
   }
 }
 ```
