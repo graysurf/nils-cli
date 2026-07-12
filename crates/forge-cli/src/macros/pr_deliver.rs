@@ -309,13 +309,17 @@ fn execute_sequence<R: BackendRunner, C: Clock>(
         // pr.create
         let create_args = build_create_args(args, &repo_payload.default_branch);
         let env = Environment::production();
-        let create_result =
-            match pr_create::compute_with_subject(runner, global, &create_args, &env) {
-                Ok(result) => result,
-                Err(err) => {
-                    return Ok(emit_chain_failure(steps, args, ctx, None, &err, format));
-                }
-            };
+        let create_result = match pr_create::compute_with_subject_after_label_preflight(
+            runner,
+            global,
+            &create_args,
+            &env,
+        ) {
+            Ok(result) => result,
+            Err(err) => {
+                return Ok(emit_chain_failure(steps, args, ctx, None, &err, format));
+            }
+        };
         let create_payload = create_result.payload;
         let verified_subject = create_result.verified_subject;
         let number = create_payload.number;

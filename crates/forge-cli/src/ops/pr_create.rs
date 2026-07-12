@@ -484,6 +484,28 @@ pub(crate) fn compute_with_subject<R: BackendRunner>(
     args: &PrCreateArgs,
     env: &Environment<'_>,
 ) -> Result<PrCreateComputation, ForgeError> {
+    compute_with_subject_inner(runner, global, args, env, false)
+}
+
+/// Delivery-only create entry point after `pr deliver` has validated the
+/// provider-aware label inputs. The caller must pass the same immutable label
+/// arguments and provider context used by that preflight.
+pub(crate) fn compute_with_subject_after_label_preflight<R: BackendRunner>(
+    runner: &R,
+    global: &GlobalFlags,
+    args: &PrCreateArgs,
+    env: &Environment<'_>,
+) -> Result<PrCreateComputation, ForgeError> {
+    compute_with_subject_inner(runner, global, args, env, true)
+}
+
+fn compute_with_subject_inner<R: BackendRunner>(
+    runner: &R,
+    global: &GlobalFlags,
+    args: &PrCreateArgs,
+    env: &Environment<'_>,
+    labels_prevalidated: bool,
+) -> Result<PrCreateComputation, ForgeError> {
     let ctx = detect(
         global.provider_hint(),
         &global.remote,
@@ -506,16 +528,18 @@ pub(crate) fn compute_with_subject<R: BackendRunner>(
     no_local_path(&args.title, "title")?;
     body_sections(&body, &env.headings)?;
     no_local_path(&body, "body")?;
-    let label_target = match ctx.provider {
-        Provider::GitHub | Provider::Local => LabelTarget::Pr,
-        Provider::GitLab => LabelTarget::Mr,
-    };
-    validate_label_inputs(
-        &args.labels,
-        args.label_catalog.as_deref(),
-        args.strict_labels,
-        label_target,
-    )?;
+    if !labels_prevalidated {
+        let label_target = match ctx.provider {
+            Provider::GitHub | Provider::Local => LabelTarget::Pr,
+            Provider::GitLab => LabelTarget::Mr,
+        };
+        validate_label_inputs(
+            &args.labels,
+            args.label_catalog.as_deref(),
+            args.strict_labels,
+            label_target,
+        )?;
+    }
     worktree_clean(&env.workdir, |w| (env.git_status)(w))?;
     branch_pushed(&env.workdir, &head, |w, branch| (env.head_state)(w, branch))?;
     let gate_applies = test_first_gate_applies(kind, env.test_first_required);

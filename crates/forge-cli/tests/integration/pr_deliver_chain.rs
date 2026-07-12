@@ -316,6 +316,22 @@ fn write_full_chain_stub(stub: &StubEnv) -> PathBuf {
     write_chain_stub(stub, FULL_PR_VIEW_JSON, MERGED_PR_VIEW_JSON, false)
 }
 
+fn write_catalog_mutating_chain_stub(stub: &StubEnv, catalog: &Path) -> PathBuf {
+    let path = write_full_chain_stub(stub);
+    let inner = stub.tempdir.path().join("gh-inner");
+    fs::rename(&path, &inner).expect("rename inner gh stub");
+    let body = format!(
+        "#!/bin/sh\nset -e\nif [ \"$1 $2\" = \"pr list\" ]; then\n  rm -f -- '{}'\nfi\nexec '{}' \"$@\"\n",
+        catalog.display(),
+        inner.display(),
+    );
+    fs::write(&path, body).expect("write mutating gh wrapper");
+    let mut perm = fs::metadata(&path).expect("metadata").permissions();
+    perm.set_mode(0o755);
+    fs::set_permissions(&path, perm).expect("chmod");
+    path
+}
+
 /// Chain stub with a controllable `pr merge` failure mode used by the
 /// idempotency-on-non-zero-exit regression test. When `merge_exits_one` is
 /// true, the merge subcommand touches a sentinel file in `stub.tempdir`
@@ -939,6 +955,50 @@ fn pr_deliver_strict_labels_valid_catalog_passes_live_delivery() {
     let envelope = parse_envelope(&out.stdout);
     assert_eq!(envelope["ok"], true);
     assert_eq!(envelope["data"]["steps"][2]["step"], "create");
+}
+
+#[test]
+fn pr_deliver_strict_labels_catalog_is_not_reopened_after_provider_reads() {
+    let tempdir = make_git_repo();
+    let repo_path = tempdir.path().join("repo");
+    let (_catalog_tempdir, catalog) = write_label_catalog();
+
+    let stub = StubEnv::new();
+    let gh_path = write_catalog_mutating_chain_stub(&stub, Path::new(&catalog));
+    let stub = stub.env("FORGE_CLI_GH_BIN", gh_path.to_string_lossy());
+
+    let out = run_in_repo(
+        &stub,
+        &repo_path,
+        &[
+            "--provider",
+            "github",
+            "--format",
+            "json",
+            "pr",
+            "deliver",
+            "--kind",
+            "feature",
+            "--title",
+            "feat: sample feature",
+            "--body",
+            "## Summary\n\nLand the new feature.\n\n## Test plan\n\nVerified.\n",
+            "--head",
+            "feat/sample",
+            "--base",
+            "main",
+            "--label",
+            "type::feature",
+            "--label-catalog",
+            &catalog,
+            "--strict-labels",
+            "--timeout",
+            "5s",
+            "--no-merge",
+        ],
+    );
+
+    assert_eq!(out.code, 0, "stdout={}\nstderr={}", out.stdout, out.stderr);
 }
 
 #[test]
