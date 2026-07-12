@@ -2478,6 +2478,108 @@ pub enum ReviewCloseoutOutcome {
     Blocked { code: &'static str, detail: String },
 }
 
+/// Outcome of the shared strict validation evaluation used by both closeout
+/// surfaces. Provider-latest lifecycle evidence is authoritative: only an
+/// explicit `overall = pass` clears the gate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ValidationCloseoutOutcome {
+    Pass { detail: String },
+    Blocked { code: &'static str, detail: String },
+}
+
+pub fn evaluate_validation_closeout(
+    validation: Option<&LifecycleEvidence>,
+) -> ValidationCloseoutOutcome {
+    let Some(hit) = validation else {
+        return ValidationCloseoutOutcome::Blocked {
+            code: "validation-missing",
+            detail: "missing".to_string(),
+        };
+    };
+    match hit.status.as_deref() {
+        Some("pass") => ValidationCloseoutOutcome::Pass {
+            detail: "pass".to_string(),
+        },
+        Some(value) => ValidationCloseoutOutcome::Blocked {
+            code: "validation-failed",
+            detail: format!("latest validation overall = `{value}`"),
+        },
+        None => ValidationCloseoutOutcome::Blocked {
+            code: "validation-failed",
+            detail: "missing payload status".to_string(),
+        },
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StateCloseoutOutcome {
+    Pass { detail: String },
+    Blocked { code: &'static str, detail: String },
+}
+
+pub fn evaluate_state_closeout(state: Option<&LifecycleEvidence>) -> StateCloseoutOutcome {
+    let Some(hit) = state else {
+        return StateCloseoutOutcome::Blocked {
+            code: "state-missing",
+            detail: "missing".to_string(),
+        };
+    };
+    let parsed = hit
+        .payload
+        .as_ref()
+        .and_then(|payload| payload.parse_state().ok());
+    match hit.status.as_deref() {
+        Some(value) if value.eq_ignore_ascii_case("complete") => {
+            let tasks_incomplete = parsed
+                .as_ref()
+                .map(|data| {
+                    data.tasks
+                        .iter()
+                        .any(|task| !is_terminal_task_status(task.status))
+                })
+                .unwrap_or(false);
+            if tasks_incomplete {
+                StateCloseoutOutcome::Blocked {
+                    code: "state-tasks-incomplete",
+                    detail: "complete but tasks are not all done/deferred/waived".to_string(),
+                }
+            } else {
+                StateCloseoutOutcome::Pass {
+                    detail: "complete".to_string(),
+                }
+            }
+        }
+        Some(value) => StateCloseoutOutcome::Blocked {
+            code: "state-not-complete",
+            detail: format!("latest state status is `{value}`"),
+        },
+        None => StateCloseoutOutcome::Blocked {
+            code: "state-not-complete",
+            detail: "missing payload status".to_string(),
+        },
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ApprovalCloseoutOutcome {
+    Pass { detail: String },
+    Blocked { code: &'static str, detail: String },
+}
+
+pub fn evaluate_approval_closeout(approval: Option<&str>) -> ApprovalCloseoutOutcome {
+    let approval = approval.unwrap_or("").trim();
+    if approval.is_empty() {
+        ApprovalCloseoutOutcome::Blocked {
+            code: "approval-missing",
+            detail: "missing explicit approval".to_string(),
+        }
+    } else {
+        ApprovalCloseoutOutcome::Pass {
+            detail: approval.to_string(),
+        }
+    }
+}
+
 /// Evaluate the `review` lifecycle evidence against the strict close-out
 /// review rule. This is the single source of truth behind both close gates:
 /// a `request-changes` decision, a malformed payload, or a missing payload
@@ -2578,57 +2680,14 @@ pub fn evaluate_strict_closeout_gate(
         }
     }
 
-    match audit.evidence.get("state") {
-        Some(hit) => {
-            let status = hit.status.as_deref();
-            let parsed = hit
-                .payload
-                .as_ref()
-                .and_then(|payload| payload.parse_state().ok());
-            match status {
-                Some(value) if value.eq_ignore_ascii_case("complete") => {
-                    let tasks_incomplete = parsed
-                        .as_ref()
-                        .map(|data| {
-                            data.tasks
-                                .iter()
-                                .any(|task| !is_terminal_task_status(task.status))
-                        })
-                        .unwrap_or(false);
-                    if tasks_incomplete {
-                        push_fail(
-                            &mut checks,
-                            &mut blocked_codes,
-                            "execution state",
-                            "complete but tasks are not all done/deferred/waived".to_string(),
-                            "state-tasks-incomplete",
-                        );
-                    } else {
-                        push_pass(&mut checks, "execution state", "complete".to_string());
-                    }
-                }
-                Some(value) => push_fail(
-                    &mut checks,
-                    &mut blocked_codes,
-                    "execution state",
-                    format!("latest state status is `{value}`"),
-                    "state-not-complete",
-                ),
-                None => push_fail(
-                    &mut checks,
-                    &mut blocked_codes,
-                    "execution state",
-                    "missing payload status".to_string(),
-                    "state-not-complete",
-                ),
-            }
-        }
-        None => push_fail(
+    match evaluate_state_closeout(audit.evidence.get("state")) {
+        StateCloseoutOutcome::Pass { detail } => push_pass(&mut checks, "execution state", detail),
+        StateCloseoutOutcome::Blocked { code, detail } => push_fail(
             &mut checks,
             &mut blocked_codes,
             "execution state",
-            "missing".to_string(),
-            "state-missing",
+            detail,
+            code,
         ),
     }
 
@@ -2647,31 +2706,11 @@ pub fn evaluate_strict_closeout_gate(
         ),
     }
 
-    match audit.evidence.get("validation") {
-        Some(hit) => match hit.status.as_deref() {
-            Some("pass") => push_pass(&mut checks, "validation", "pass".to_string()),
-            Some(value) => push_fail(
-                &mut checks,
-                &mut blocked_codes,
-                "validation",
-                format!("latest validation overall = `{value}`"),
-                "validation-failed",
-            ),
-            None => push_fail(
-                &mut checks,
-                &mut blocked_codes,
-                "validation",
-                "missing payload status".to_string(),
-                "validation-failed",
-            ),
-        },
-        None => push_fail(
-            &mut checks,
-            &mut blocked_codes,
-            "validation",
-            "missing".to_string(),
-            "validation-missing",
-        ),
+    match evaluate_validation_closeout(audit.evidence.get("validation")) {
+        ValidationCloseoutOutcome::Pass { detail } => push_pass(&mut checks, "validation", detail),
+        ValidationCloseoutOutcome::Blocked { code, detail } => {
+            push_fail(&mut checks, &mut blocked_codes, "validation", detail, code)
+        }
     }
 
     // Shared strict review rule (plan-tracking-testbed#79): the identical
@@ -2684,17 +2723,17 @@ pub fn evaluate_strict_closeout_gate(
         }
     }
 
-    let approval_text = input.approval.unwrap_or("").trim();
-    if approval_text.is_empty() {
-        push_fail(
+    match evaluate_approval_closeout(input.approval) {
+        ApprovalCloseoutOutcome::Pass { detail } => {
+            push_pass(&mut checks, "close approval", detail)
+        }
+        ApprovalCloseoutOutcome::Blocked { code, detail } => push_fail(
             &mut checks,
             &mut blocked_codes,
             "close approval",
-            "missing explicit approval".to_string(),
-            "approval-missing",
-        );
-    } else {
-        push_pass(&mut checks, "close approval", approval_text.to_string());
+            detail,
+            code,
+        ),
     }
 
     if input.linked_prs.is_empty() {

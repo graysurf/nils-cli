@@ -232,12 +232,34 @@ fn tracking_close_ready_help_lists_required_args() {
 /// `tracking close-ready`) and `issue-body.md` (read by `record close`) plus a
 /// shared `comments.json`, so one directory drives both commands over
 /// identical evidence (plan-tracking-testbed#79).
-fn closeout_fixture(review: Option<(Value, &str)>) -> TempDir {
+fn closeout_fixture_with_state_and_validation(
+    review: Option<(Value, &str)>,
+    state_task_status: &str,
+    validation_overall: &str,
+) -> TempDir {
     let tmp = TempDir::new().expect("tmp");
     let body = "## Final Dashboard\n";
     fs::write(tmp.path().join("body.md"), body).expect("body");
     fs::write(tmp.path().join("issue-body.md"), body).expect("issue-body");
 
+    let validation_visible = match validation_overall {
+        "pass" => {
+            "## Validation Evidence\n\n- Profile: tracking\n- Overall: pass\n\n| Command | Status | Evidence |\n|---|---|---|\n| cargo test | pass | log |"
+        }
+        "partial" => {
+            "## Validation Evidence\n\n- Profile: tracking\n- Overall: partial\n\n| Command | Status | Evidence |\n|---|---|---|\n| cargo test | pass | log |"
+        }
+        other => panic!("unsupported validation status: {other}"),
+    };
+    let state_visible = match state_task_status {
+        "done" => {
+            "## Execution State\n\n- Profile: tracking\n- Status: complete\n\n## Task Ledger\n\n| ID | Status |\n| --- | --- |\n| 1.1 | done |"
+        }
+        "pending" => {
+            "## Execution State\n\n- Profile: tracking\n- Status: complete\n\n## Task Ledger\n\n| ID | Status |\n| --- | --- |\n| 1.1 | pending |"
+        }
+        other => panic!("unsupported state task status: {other}"),
+    };
     let mut roles: Vec<(&str, Value, &str, &str)> = vec![
         (
             "source",
@@ -256,10 +278,10 @@ fn closeout_fixture(review: Option<(Value, &str)>) -> TempDir {
             json!({
                 "status": "complete",
                 "target_scope": "x",
-                "tasks": [{"id": "1.1", "status": "done", "title": "x"}],
+                "tasks": [{"id": "1.1", "status": state_task_status, "title": "x"}],
                 "prs": [{"ref": "owner/repo#1", "url": "https://example.com/pr/1", "status": "merged"}]
             }),
-            "## Execution State\n\n- Profile: tracking\n- Status: complete\n\n## Task Ledger\n\n| ID | Status |\n| --- | --- |\n| 1.1 | done |",
+            state_visible,
             "2026-05-26T00:00:02Z",
         ),
         (
@@ -270,8 +292,8 @@ fn closeout_fixture(review: Option<(Value, &str)>) -> TempDir {
         ),
         (
             "validation",
-            json!({"overall": "pass", "commands": [{"command": "cargo test", "status": "pass"}], "waivers": []}),
-            "## Validation Evidence\n\n- Profile: tracking\n- Overall: pass\n\n| Command | Status | Evidence |\n|---|---|---|\n| cargo test | pass | log |",
+            json!({"overall": validation_overall, "commands": [{"command": "cargo test", "status": "pass"}], "waivers": []}),
+            validation_visible,
             "2026-05-26T00:00:04Z",
         ),
     ];
@@ -296,6 +318,17 @@ fn closeout_fixture(review: Option<(Value, &str)>) -> TempDir {
     )
     .expect("comments");
     tmp
+}
+
+fn closeout_fixture_with_validation(
+    review: Option<(Value, &str)>,
+    validation_overall: &str,
+) -> TempDir {
+    closeout_fixture_with_state_and_validation(review, "done", validation_overall)
+}
+
+fn closeout_fixture(review: Option<(Value, &str)>) -> TempDir {
+    closeout_fixture_with_validation(review, "pass")
 }
 
 /// An approved review body carrying a single residual finding at `severity`.
@@ -331,16 +364,22 @@ fn blocker_codes(result: &Value) -> Vec<String> {
 /// commands must now block with the same stable code.
 /// Run `tracking close-ready` over `fixture` and return the `result` payload.
 fn run_close_ready(fixture: &TempDir) -> Value {
-    let out = common::run_plan_issue(&[
+    run_close_ready_with_approval(fixture, Some("https://example.com/approval"))
+}
+
+fn run_close_ready_with_approval(fixture: &TempDir, approval: Option<&str>) -> Value {
+    let mut args = vec![
         "--format",
         "json",
         "tracking",
         "close-ready",
         "--fixture",
         fixture.path().to_str().expect("fixture"),
-        "--approval",
-        "https://example.com/approval",
-    ]);
+    ];
+    if let Some(approval) = approval {
+        args.extend(["--approval", approval]);
+    }
+    let out = common::run_plan_issue(&args);
     assert_eq!(out.code, 0, "stderr: {}", out.stderr_text());
     out.stdout_json()["payload"]["result"].clone()
 }
@@ -348,7 +387,11 @@ fn run_close_ready(fixture: &TempDir) -> Value {
 /// Run `record close` over `fixture` and return the parsed JSON envelope plus
 /// exit code.
 fn run_record_close(fixture: &TempDir) -> (i32, Value) {
-    let out = common::run_plan_issue(&[
+    run_record_close_with_approval(fixture, Some("https://example.com/approval"))
+}
+
+fn run_record_close_with_approval(fixture: &TempDir, approval: Option<&str>) -> (i32, Value) {
+    let mut args = vec![
         "--format",
         "json",
         "record",
@@ -359,9 +402,11 @@ fn run_record_close(fixture: &TempDir) -> (i32, Value) {
         "tracking",
         "--fixture",
         fixture.path().to_str().expect("fixture"),
-        "--approval",
-        "https://example.com/approval",
-    ]);
+    ];
+    if let Some(approval) = approval {
+        args.extend(["--approval", approval]);
+    }
+    let out = common::run_plan_issue(&args);
     (out.code, out.stdout_json())
 }
 
@@ -468,5 +513,145 @@ fn close_ready_and_record_close_agree_on_request_changes_review() {
     assert!(
         message.contains("review-rejected"),
         "record close must cite the same review-rejected code: {message}"
+    );
+}
+
+/// Provider-latest validation is canonical for both closeout surfaces. A
+/// retained `partial` result must block the non-mutating probe and the
+/// mutating close with the same stable code.
+#[test]
+fn close_ready_and_record_close_agree_on_partial_validation() {
+    let fixture = closeout_fixture_with_validation(
+        Some((
+            json!({"decision": "approve", "findings": [], "lenses": ["testing"]}),
+            "## Review Evidence\n\n- Profile: tracking\n- Decision: approve\n- Lenses: testing",
+        )),
+        "partial",
+    );
+
+    // Reproduce the real disagreement: local accumulated validation says
+    // `pass`, but provider-latest lifecycle evidence still says `partial`.
+    // The provider record must win.
+    let run_state = fixture.path().join("run-state.json");
+    fs::write(
+        &run_state,
+        json!({
+            "schema": "plan-issue.execution-run.v1",
+            "run_id": "run-validation-parity",
+            "repo": "owner/repo",
+            "issue": 79,
+            "profile": "tracking",
+            "phase": "ready_for_close",
+            "created_at": "2026-05-26T00:00:00Z",
+            "updated_at": "2026-05-26T01:00:00Z",
+            "validation": {"overall": "pass"}
+        })
+        .to_string(),
+    )
+    .expect("run-state");
+
+    let out = common::run_plan_issue(&[
+        "--format",
+        "json",
+        "tracking",
+        "close-ready",
+        "--fixture",
+        fixture.path().to_str().expect("fixture"),
+        "--run-state",
+        run_state.to_str().expect("run-state"),
+        "--approval",
+        "https://example.com/approval",
+    ]);
+    assert_eq!(out.code, 0, "stderr: {}", out.stderr_text());
+    let result = out.stdout_json()["payload"]["result"].clone();
+    let codes = blocker_codes(&result);
+    assert_eq!(result["ready"], false, "result={result}");
+    assert!(
+        codes.iter().any(|c| c == "validation-failed"),
+        "close-ready must block partial validation with validation-failed: {codes:?}"
+    );
+
+    let (code, err) = run_record_close(&fixture);
+    assert_eq!(
+        code, 1,
+        "record close must reject partial validation: {err}"
+    );
+    assert_eq!(err["error"]["code"], "record-close-gate-failed");
+    let message = err["error"]["message"].as_str().expect("error message");
+    assert!(
+        message.contains("validation-failed"),
+        "record close must cite the same validation-failed code: {message}"
+    );
+}
+
+/// Once provider validation is repaired to `pass`, the same complete evidence
+/// clears both closeout surfaces.
+#[test]
+fn close_ready_and_record_close_agree_on_passing_validation() {
+    let fixture = closeout_fixture(Some((
+        json!({"decision": "approve", "findings": [], "lenses": ["testing"]}),
+        "## Review Evidence\n\n- Profile: tracking\n- Decision: approve\n- Lenses: testing",
+    )));
+
+    let result = run_close_ready(&fixture);
+    assert_eq!(result["ready"], true, "result={result}");
+    assert!(blocker_codes(&result).is_empty(), "result={result}");
+
+    let (code, envelope) = run_record_close(&fixture);
+    assert_eq!(
+        code, 0,
+        "record close must accept passing validation: {envelope}"
+    );
+    assert_eq!(envelope["status"], "ok");
+}
+
+#[test]
+fn close_ready_and_record_close_agree_on_nonterminal_state_tasks() {
+    let fixture = closeout_fixture_with_state_and_validation(
+        Some((
+            json!({"decision": "approve", "findings": [], "lenses": ["testing"]}),
+            "## Review Evidence\n\n- Profile: tracking\n- Decision: approve\n- Lenses: testing",
+        )),
+        "pending",
+        "pass",
+    );
+
+    let result = run_close_ready(&fixture);
+    let codes = blocker_codes(&result);
+    assert_eq!(result["ready"], false, "result={result}");
+    assert!(
+        codes.iter().any(|c| c == "state-tasks-incomplete"),
+        "close-ready must reject nonterminal provider tasks: {codes:?}"
+    );
+
+    let (code, err) = run_record_close(&fixture);
+    assert_eq!(code, 1, "record close must reject nonterminal tasks: {err}");
+    let message = err["error"]["message"].as_str().expect("error message");
+    assert!(
+        message.contains("state-tasks-incomplete"),
+        "message={message}"
+    );
+}
+
+#[test]
+fn close_ready_and_record_close_agree_on_missing_approval_with_linked_pr() {
+    let fixture = closeout_fixture(Some((
+        json!({"decision": "approve", "findings": [], "lenses": ["testing"]}),
+        "## Review Evidence\n\n- Profile: tracking\n- Decision: approve\n- Lenses: testing",
+    )));
+
+    let result = run_close_ready_with_approval(&fixture, None);
+    let codes = blocker_codes(&result);
+    assert_eq!(result["ready"], false, "result={result}");
+    assert!(
+        codes.iter().any(|c| c == "record-close-missing-approval"),
+        "close-ready must require approval even with a linked PR: {codes:?}"
+    );
+
+    let (code, err) = run_record_close_with_approval(&fixture, None);
+    assert_eq!(code, 64, "record close must reject missing approval: {err}");
+    assert_eq!(
+        err["error"]["code"], "record-close-missing-approval",
+        "both public command surfaces must expose the same stable code"
     );
 }

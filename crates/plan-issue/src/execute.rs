@@ -3647,11 +3647,15 @@ fn run_tracking_close_ready(
             "suggested_unblock": "post the missing lifecycle evidence before close",
         }));
     }
-    if linked_prs.is_empty() && args.approval.is_none() {
+    if let lifecycle_record::ApprovalCloseoutOutcome::Blocked { detail, .. } =
+        lifecycle_record::evaluate_approval_closeout(args.approval.as_deref())
+    {
         blockers.push(json!({
-            "code": "closeout-missing-linked-pr",
-            "message": "no linked PR evidence and no `--approval` provided",
-            "suggested_unblock": "pass --linked-pr or --approval, or add the evidence to run state",
+            // Match the public `record close` input guard, which rejects a
+            // missing/blank --approval before entering the strict gate.
+            "code": "record-close-missing-approval",
+            "message": detail,
+            "suggested_unblock": "pass explicit approval evidence with --approval before close",
         }));
     }
 
@@ -3744,6 +3748,38 @@ fn run_tracking_close_ready(
                 "suggested_unblock": "fix the rendered lifecycle comments before close",
             }));
         }
+    }
+
+    // Provider state is authoritative for terminal task completion. Evaluate
+    // the same rule as `record close`; a local bundle ledger is supplemental
+    // evidence and cannot make a pending provider task disappear.
+    if let Some(audit) = audit.as_ref()
+        && let Some(state) = audit.evidence.get("state")
+        && let lifecycle_record::StateCloseoutOutcome::Blocked { code, detail } =
+            lifecycle_record::evaluate_state_closeout(Some(state))
+    {
+        blockers.push(json!({
+            "code": code,
+            "message": detail,
+            "suggested_unblock": "record a complete provider state whose task ledger contains only terminal task statuses",
+        }));
+    }
+
+    // Provider-latest validation is the canonical closeout result. Reuse the
+    // same strict evaluation as `record close` so `partial`, `fail`, and
+    // malformed evidence cannot pass this non-mutating probe. Absence is
+    // already reported by reconciliation, so evaluate only a present role to
+    // avoid a duplicate `validation-missing` blocker.
+    if let Some(audit) = audit.as_ref()
+        && let Some(validation) = audit.evidence.get("validation")
+        && let lifecycle_record::ValidationCloseoutOutcome::Blocked { code, detail } =
+            lifecycle_record::evaluate_validation_closeout(Some(validation))
+    {
+        blockers.push(json!({
+            "code": code,
+            "message": detail,
+            "suggested_unblock": "record provider validation evidence with overall=pass before close",
+        }));
     }
 
     // Strict review-finding gate (plan-tracking-testbed#79): the non-mutating
