@@ -1898,8 +1898,9 @@ fn run_record_close(
 }
 
 /// Terminal-state writeback for `record close`. Patches the bundle's
-/// execution-state header bullets (`Status`, `Last updated`, `Branch/commit/PR`,
-/// `Tracking issue`) to their final values. Returns the JSON object placed
+/// execution-state fields (`Status`, `Current task`, `Next task`, `Last
+/// updated`, `Branch/commit/PR`, `Tracking issue`, and `Handoff`) to coherent
+/// final values. Returns the JSON object placed
 /// under `execution_state_sync` in the close result. The `## Task Ledger` rows
 /// are owned by the existing per-task `ledger-update` + `close-ready`
 /// `ledger-rows-pending` gate, so this writeback never rewrites them.
@@ -1933,9 +1934,14 @@ fn close_exec_state_writeback(
     };
     let state = plan_tooling::exec_state::TerminalState {
         status: Some("complete; tracking issue closed".to_string()),
+        current_task: Some("none; tracking issue closed".to_string()),
+        next_task: Some("none; tracking issue closed".to_string()),
         last_updated: Some(chrono::Utc::now().format("%Y-%m-%d").to_string()),
         branch_commit_pr,
         tracking_issue_url: Some(issue_url.to_string()),
+        handoff: Some(format!(
+            "- Tracking issue <{issue_url}> is closed; terminal execution state is synchronized. No closeout or merge action remains."
+        )),
     };
     match plan_tooling::exec_state::writeback_terminal(&exec_state, &state, false) {
         Ok(report) => json!({
@@ -8755,7 +8761,7 @@ mod tests {
         let state = tmp.path().join("demo-execution-state.md");
         std::fs::write(
             &state,
-            "## Execution State\n\n- Status: tracking issue opened; implementation not yet started.\n- Last updated: 2026-06-01\n- Branch/commit/PR: no PR opened.\n- Tracking issue: <https://github.com/o/r/issues/738>\n\n## Task Ledger\n\n| ID | Status | Task | Evidence | Notes |\n| --- | --- | --- | --- | --- |\n| 1.1 | done | x | y | z |\n",
+            "## Execution State\n\n- Status: tracking issue opened; implementation not yet started.\n- Current task: merge PR #42 and close the tracker.\n- Next task: run record close after the merge.\n- Last updated: 2026-06-01\n- Branch/commit/PR: no PR opened.\n- Tracking issue: <https://github.com/o/r/issues/738>\n\n## Task Ledger\n\n| ID | Status | Task | Evidence | Notes |\n| --- | --- | --- | --- | --- |\n| 1.1 | done | x | y | z |\n\n## Handoff\n\n- Merge PR #42.\n- Run strict close-ready and record close.\n\n## Session Log\n\n- Preserve this unrelated section verbatim.\n",
         )
         .unwrap();
         let linked = vec![lifecycle_record::LinkedPrEvidence {
@@ -8787,8 +8793,16 @@ mod tests {
             "PR URL must not be written as a bare URL (MD034)"
         );
         assert!(written.contains("- Tracking issue: <https://github.com/o/r/issues/738>"));
+        assert!(written.contains("- Current task: none; tracking issue closed"));
+        assert!(written.contains("- Next task: none; tracking issue closed"));
+        assert!(written.contains(
+            "- Tracking issue <https://github.com/o/r/issues/738> is closed; terminal execution state is synchronized. No closeout or merge action remains."
+        ));
+        assert!(!written.contains("merge PR #42"));
+        assert!(!written.contains("run record close"));
         // Task Ledger row preserved verbatim.
         assert!(written.contains("| 1.1 | done | x | y | z |"));
+        assert!(written.contains("- Preserve this unrelated section verbatim."));
     }
 
     #[test]

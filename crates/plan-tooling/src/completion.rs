@@ -391,6 +391,24 @@ fn build_completion_command() -> Command {
                         .value_name("text"),
                 )
                 .arg(
+                    Arg::new("current-task")
+                        .long("current-task")
+                        .help("`Current task` value")
+                        .value_name("text"),
+                )
+                .arg(
+                    Arg::new("next-task")
+                        .long("next-task")
+                        .help("`Next task` value")
+                        .value_name("text"),
+                )
+                .arg(
+                    Arg::new("handoff")
+                        .long("handoff")
+                        .help("Replacement body for the `## Handoff` section")
+                        .value_name("markdown"),
+                )
+                .arg(
                     Arg::new("dry-run")
                         .long("dry-run")
                         .help("Report the change set without writing the file")
@@ -454,4 +472,25 @@ fn build_completion_command() -> Command {
                 ),
         )
         .subcommand(Command::new("help").about("Display help message"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn exec_state_sync_completion_exposes_terminal_fields() {
+        let command = build_completion_command();
+        let sync = command
+            .get_subcommands()
+            .find(|subcommand| subcommand.get_name() == "exec-state-sync")
+            .expect("exec-state-sync completion model");
+        let long_flags = sync
+            .get_arguments()
+            .filter_map(|arg| arg.get_long())
+            .collect::<Vec<_>>();
+        assert!(long_flags.contains(&"current-task"));
+        assert!(long_flags.contains(&"next-task"));
+        assert!(long_flags.contains(&"handoff"));
+    }
 }

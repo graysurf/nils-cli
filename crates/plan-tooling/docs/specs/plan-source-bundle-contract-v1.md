@@ -94,11 +94,19 @@ The waiver value must explain the reason. Empty values, `not applicable`, `n/a`,
 waive direct source-doc execution.
 
 Once a tracking issue exists, the execution-state header should carry the issue URL in its
-`- Tracking issue:` bullet, and after closeout it should read its terminal state. `plan-issue record
-open` / `record close` write these automatically, and `plan-tooling exec-state-sync` repairs existing
-bundles offline; see the Durable Execution-State Synchronization section of the issue-backed plan
-record contract. This keeps a completed bundle discoverable by `plan-archive discover`, which infers
-provider refs only from local Markdown.
+`- Tracking issue:` bullet. After closeout, `Status`, `Current task`, `Next task`, merged-PR evidence,
+and `Handoff` must all describe the terminal state; closeout or merge must not remain as future work.
+`plan-issue record open` / `record close` write these automatically, and `plan-tooling
+exec-state-sync` can repair the same fields in existing bundles offline; see the Durable
+Execution-State Synchronization section of the issue-backed plan record contract. This keeps a
+completed bundle coherent and discoverable by `plan-archive discover`, which infers provider refs
+only from local Markdown.
+
+The repair rejects multiline `Current task` / `Next task` values, a `Handoff` body containing a
+top-level structural level-two heading, duplicate top-level `Handoff` sections, and targets without
+one top-level structural `Execution State` section. Nested headings in examples remain contained.
+These checks fail before the atomic file replacement so a field cannot escape into a peer section
+or partially update the bundle.
 
 ## Validation Rules
 

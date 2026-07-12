@@ -22,7 +22,8 @@ const USAGE: &str = r#"Usage:
   plan-tooling exec-state-sync \
     (--bundle <dir> | --execution-state <path>) \
     [--issue-url <url>] [--status <text>] [--last-updated <date>] \
-    [--branch-commit-pr <text>] [--dry-run] [--format json|text]
+    [--branch-commit-pr <text>] [--current-task <text>] \
+    [--next-task <text>] [--handoff <markdown>] [--dry-run] [--format json|text]
 
 Purpose:
   Repair a plan bundle's `*-execution-state.md` by writing the tracking issue
@@ -36,6 +37,9 @@ Options:
   --status <text>           Terminal `Status` value (e.g. `complete; tracking issue closed`)
   --last-updated <date>     `Last updated` stamp (e.g. 2026-06-01)
   --branch-commit-pr <text> `Branch/commit/PR` value (e.g. merged PR ref/URL)
+  --current-task <text>     `Current task` value
+  --next-task <text>        `Next task` value
+  --handoff <markdown>      Replacement body for the `## Handoff` section
   --dry-run                 Report the change set without writing the file
   --format <fmt>            text (default) or json
   -h, --help                Show help
@@ -54,6 +58,9 @@ struct Config {
     status: Option<String>,
     last_updated: Option<String>,
     branch_commit_pr: Option<String>,
+    current_task: Option<String>,
+    next_task: Option<String>,
+    handoff: Option<String>,
     dry_run: bool,
     format: String,
 }
@@ -137,6 +144,27 @@ pub fn run(args: &[String]) -> i32 {
                 cfg.branch_commit_pr = Some(value.to_string());
                 i += 2;
             }
+            "--current-task" => {
+                let Some(value) = args.get(i + 1) else {
+                    return die("--current-task requires text");
+                };
+                cfg.current_task = Some(value.to_string());
+                i += 2;
+            }
+            "--next-task" => {
+                let Some(value) = args.get(i + 1) else {
+                    return die("--next-task requires text");
+                };
+                cfg.next_task = Some(value.to_string());
+                i += 2;
+            }
+            "--handoff" => {
+                let Some(value) = args.get(i + 1) else {
+                    return die("--handoff requires markdown");
+                };
+                cfg.handoff = Some(value.to_string());
+                i += 2;
+            }
             "--dry-run" => {
                 cfg.dry_run = true;
                 i += 1;
@@ -166,10 +194,11 @@ pub fn run(args: &[String]) -> i32 {
         && cfg.status.is_none()
         && cfg.last_updated.is_none()
         && cfg.branch_commit_pr.is_none()
+        && cfg.current_task.is_none()
+        && cfg.next_task.is_none()
+        && cfg.handoff.is_none()
     {
-        return die(
-            "nothing to sync: pass at least one of --issue-url/--status/--last-updated/--branch-commit-pr",
-        );
+        return die("nothing to sync: pass at least one terminal field option");
     }
 
     let exec_state_path = match resolve_execution_state(&cfg) {
@@ -182,6 +211,9 @@ pub fn run(args: &[String]) -> i32 {
         last_updated: cfg.last_updated.clone(),
         branch_commit_pr: cfg.branch_commit_pr.clone(),
         tracking_issue_url: cfg.issue_url.clone(),
+        current_task: cfg.current_task.clone(),
+        next_task: cfg.next_task.clone(),
+        handoff: cfg.handoff.clone(),
     };
 
     match exec_state::writeback_terminal(&exec_state_path, &state, cfg.dry_run) {
@@ -288,6 +320,13 @@ fn print_output(output: &Output, format: &str) {
                 bullet.action, bullet.label, prev, bullet.value
             );
         }
+        for section in &report.sections {
+            let prev = section.previous.as_deref().unwrap_or("<none>");
+            println!(
+                "  [{:?}] {}: {} -> {}",
+                section.action, section.heading, prev, section.value
+            );
+        }
     }
 }
 
@@ -325,6 +364,34 @@ mod tests {
         assert!(out.contains("- Status: complete; tracking issue closed"));
         // Task Ledger preserved.
         assert!(out.contains("| 1.1 | done | x | y | z |"));
+    }
+
+    #[test]
+    fn repair_writes_terminal_tasks_and_handoff() {
+        let (dir, path) = temp_bundle();
+        fs::write(
+            &path,
+            format!("{SAMPLE}\n## Handoff\n\n- Merge the PR and close the tracker.\n"),
+        )
+        .unwrap();
+        let code = run(&[
+            "--bundle".into(),
+            dir.path().to_string_lossy().into_owned(),
+            "--current-task".into(),
+            "none; tracking issue closed".into(),
+            "--next-task".into(),
+            "none; tracking issue closed".into(),
+            "--handoff".into(),
+            "- Tracking issue closed; no action remains.".into(),
+            "--format".into(),
+            "json".into(),
+        ]);
+        assert_eq!(code, 0);
+        let written = fs::read_to_string(path).unwrap();
+        assert!(written.contains("- Current task: none; tracking issue closed"));
+        assert!(written.contains("- Next task: none; tracking issue closed"));
+        assert!(written.contains("## Handoff\n\n- Tracking issue closed; no action remains."));
+        assert!(!written.contains("Merge the PR"));
     }
 
     #[test]
