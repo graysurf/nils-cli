@@ -1566,13 +1566,10 @@ async fn cancel_before_tui_mutation(
     };
     let cancellation_context = context.clone();
     let id = record.id.clone();
-    let Some(launch_id) = record
+    let launch_id = record
         .runtime
         .as_ref()
-        .map(|runtime| runtime.launch_id.clone())
-    else {
-        return None;
-    };
+        .map(|runtime| runtime.launch_id.clone())?;
     let cancellation = tokio::task::spawn_blocking(move || {
         crate::auto_resume::try_cancel_for_manual_input_for_runtime(
             &cancellation_context,
