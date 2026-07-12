@@ -872,6 +872,9 @@ macros:
       - { name: --allow-unchecked-tasks-reason, type: string,                   default: null }
       - { name: --test-first-evidence,      type: path,                         required: false } # forwarded to create and enforced on the adopt path when [test_first].require resolves true
     sequence:
+      # Before dry-run/live branching and before provider access, validate
+      # strict label inputs for the provider target. This applies equally to
+      # create and adopt delivery paths.
       - { step: auth_status,        op: auth.status }
       - { step: repo_view,          op: repo.view }
       # Head-branch lookup (pr.list --state open --head <branch>): an open

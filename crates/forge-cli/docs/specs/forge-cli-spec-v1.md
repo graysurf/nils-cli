@@ -616,6 +616,11 @@ forge-cli pr deliver \
 
 Steps:
 
+Before any step, `--strict-labels` validates `--label-catalog` and every
+selected label against the provider target. This same pure preflight runs for
+dry-run, create, and adopt delivery, so `label_catalog_missing` and related
+label errors are returned before provider access in every mode.
+
 1. `auth status` — fail-fast on missing auth.
 2. `repo view` — resolve default branch, repo slug, default merge
    method override.

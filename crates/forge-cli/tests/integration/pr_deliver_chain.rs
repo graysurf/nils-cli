@@ -13,7 +13,7 @@ use std::process::Command;
 use pretty_assertions::assert_eq;
 use tempfile::TempDir;
 
-use super::support::{CmdOutput, StubEnv, parse_envelope, run_forge_cli_in};
+use super::support::{CmdOutput, StubEnv, parse_envelope, run_forge_cli_in, write_label_catalog};
 
 const FIXTURE_CREATE_STDOUT: &str = include_str!("../fixtures/github/pr_create/create_stdout.txt");
 const FIXTURE_CHECKS_JSON: &str = include_str!("../fixtures/github/pr_checks/all_success.json");
@@ -314,6 +314,60 @@ fn git(repo: &Path, args: &[&str]) {
 
 fn write_full_chain_stub(stub: &StubEnv) -> PathBuf {
     write_chain_stub(stub, FULL_PR_VIEW_JSON, MERGED_PR_VIEW_JSON, false)
+}
+
+fn write_catalog_mutating_chain_stub(stub: &StubEnv, catalog: &Path) -> PathBuf {
+    let path = write_full_chain_stub(stub);
+    let inner = stub.tempdir.path().join("gh-inner");
+    fs::rename(&path, &inner).expect("rename inner gh stub");
+    let body = format!(
+        "#!/bin/sh\nset -e\nif [ \"$1 $2\" = \"pr list\" ]; then\n  rm -f -- '{}'\nfi\nexec '{}' \"$@\"\n",
+        catalog.display(),
+        inner.display(),
+    );
+    fs::write(&path, body).expect("write mutating gh wrapper");
+    let mut perm = fs::metadata(&path).expect("metadata").permissions();
+    perm.set_mode(0o755);
+    fs::set_permissions(&path, perm).expect("chmod");
+    path
+}
+
+fn write_provider_mutating_chain_stub(stub: &StubEnv, repo: &Path) -> PathBuf {
+    let path = write_full_chain_stub(stub);
+    let inner = stub.tempdir.path().join("gh-inner-provider-drift");
+    fs::rename(&path, &inner).expect("rename inner gh stub");
+    let body = format!(
+        "#!/bin/sh\nset -e\nif [ \"$1 $2\" = \"pr list\" ]; then\n  git -C '{}' remote set-url origin https://gitlab.com/sympoies/nils-cli.git\nfi\nexec '{}' \"$@\"\n",
+        repo.display(),
+        inner.display(),
+    );
+    fs::write(&path, body).expect("write provider-mutating gh wrapper");
+    let mut perm = fs::metadata(&path).expect("metadata").permissions();
+    perm.set_mode(0o755);
+    fs::set_permissions(&path, perm).expect("chmod");
+    path
+}
+
+fn write_pr_only_label_catalog() -> (TempDir, String) {
+    let tempdir = TempDir::new().expect("label catalog tempdir");
+    let path = tempdir.path().join("forge-labels.yaml");
+    fs::write(
+        &path,
+        r#"schema: forge-label-catalog.v1
+groups:
+  - name: type
+    prefix: "type::"
+    exclusive: true
+labels:
+  - name: "type::feature"
+    group: type
+    color: a2eeef
+    description: Feature work.
+    applies_to: [pr]
+"#,
+    )
+    .expect("write PR-only catalog");
+    (tempdir, path.to_string_lossy().into_owned())
 }
 
 /// Chain stub with a controllable `pr merge` failure mode used by the
@@ -892,6 +946,152 @@ fn pr_deliver_full_chain_no_merge_emits_four_steps_and_returns_success() {
     assert_eq!(envelope["data"]["pr"]["merged"], false);
     assert!(envelope["data"]["pr"]["merge_sha"].is_null());
     assert_eq!(envelope["data"]["pr"]["number"], 123);
+}
+
+#[test]
+fn pr_deliver_strict_labels_valid_catalog_passes_live_delivery() {
+    let tempdir = make_git_repo();
+    let repo_path = tempdir.path().join("repo");
+    let (_catalog_tempdir, catalog) = write_label_catalog();
+
+    let stub = StubEnv::new();
+    let gh_path = write_full_chain_stub(&stub);
+    let stub = stub.env("FORGE_CLI_GH_BIN", gh_path.to_string_lossy());
+
+    let out = run_in_repo(
+        &stub,
+        &repo_path,
+        &[
+            "--provider",
+            "github",
+            "--format",
+            "json",
+            "pr",
+            "deliver",
+            "--kind",
+            "feature",
+            "--title",
+            "feat: sample feature",
+            "--body",
+            "## Summary\n\nLand the new feature.\n\n## Test plan\n\nVerified.\n",
+            "--head",
+            "feat/sample",
+            "--base",
+            "main",
+            "--label",
+            "type::feature",
+            "--label-catalog",
+            &catalog,
+            "--strict-labels",
+            "--timeout",
+            "5s",
+            "--no-merge",
+        ],
+    );
+
+    assert_eq!(out.code, 0, "stdout={}\nstderr={}", out.stdout, out.stderr);
+    let envelope = parse_envelope(&out.stdout);
+    assert_eq!(envelope["ok"], true);
+    assert_eq!(envelope["data"]["steps"][2]["step"], "create");
+}
+
+#[test]
+fn pr_deliver_strict_labels_catalog_is_not_reopened_after_provider_reads() {
+    let tempdir = make_git_repo();
+    let repo_path = tempdir.path().join("repo");
+    let (_catalog_tempdir, catalog) = write_label_catalog();
+
+    let stub = StubEnv::new();
+    let gh_path = write_catalog_mutating_chain_stub(&stub, Path::new(&catalog));
+    let stub = stub.env("FORGE_CLI_GH_BIN", gh_path.to_string_lossy());
+
+    let out = run_in_repo(
+        &stub,
+        &repo_path,
+        &[
+            "--provider",
+            "github",
+            "--format",
+            "json",
+            "pr",
+            "deliver",
+            "--kind",
+            "feature",
+            "--title",
+            "feat: sample feature",
+            "--body",
+            "## Summary\n\nLand the new feature.\n\n## Test plan\n\nVerified.\n",
+            "--head",
+            "feat/sample",
+            "--base",
+            "main",
+            "--label",
+            "type::feature",
+            "--label-catalog",
+            &catalog,
+            "--strict-labels",
+            "--timeout",
+            "5s",
+            "--no-merge",
+        ],
+    );
+
+    assert_eq!(out.code, 0, "stdout={}\nstderr={}", out.stdout, out.stderr);
+    assert!(
+        !Path::new(&catalog).exists(),
+        "catalog mutation tripwire did not run"
+    );
+}
+
+#[test]
+fn pr_deliver_prevalidated_labels_keep_the_initial_provider_context() {
+    let tempdir = make_git_repo();
+    let repo_path = tempdir.path().join("repo");
+    let (_catalog_tempdir, catalog) = write_pr_only_label_catalog();
+
+    let stub = StubEnv::new();
+    let gh_path = write_provider_mutating_chain_stub(&stub, &repo_path);
+    let stub = stub
+        .env("FORGE_CLI_GH_BIN", gh_path.to_string_lossy())
+        .glab_stub("#!/bin/sh\necho 'glab must not run after GitHub preflight' >&2\nexit 97\n");
+
+    let out = run_in_repo(
+        &stub,
+        &repo_path,
+        &[
+            "--format",
+            "json",
+            "pr",
+            "deliver",
+            "--kind",
+            "feature",
+            "--title",
+            "feat: sample feature",
+            "--body",
+            "## Summary\n\nLand the new feature.\n\n## Test plan\n\nVerified.\n",
+            "--head",
+            "feat/sample",
+            "--base",
+            "main",
+            "--label",
+            "type::feature",
+            "--label-catalog",
+            &catalog,
+            "--strict-labels",
+            "--timeout",
+            "5s",
+            "--no-merge",
+        ],
+    );
+
+    assert_eq!(out.code, 0, "stdout={}\nstderr={}", out.stdout, out.stderr);
+    let envelope = parse_envelope(&out.stdout);
+    assert_eq!(envelope["data"]["provider"], "github");
+    assert_eq!(
+        git_output(&repo_path, &["remote", "get-url", "origin"]),
+        "https://gitlab.com/sympoies/nils-cli.git",
+        "provider mutation tripwire did not run"
+    );
 }
 
 #[test]

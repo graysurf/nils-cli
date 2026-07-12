@@ -34,6 +34,29 @@ pub fn forge_cli_bin() -> PathBuf {
     nils_test_support::bin::resolve("forge-cli")
 }
 
+/// Write the shared strict-label catalog fixture used by create/deliver tests.
+pub fn write_label_catalog() -> (TempDir, String) {
+    let tempdir = TempDir::new().expect("label catalog tempdir");
+    let path = tempdir.path().join("forge-labels.yaml");
+    fs::write(
+        &path,
+        r#"schema: forge-label-catalog.v1
+groups:
+  - name: type
+    prefix: "type::"
+    exclusive: true
+labels:
+  - name: "type::feature"
+    group: type
+    color: a2eeef
+    description: Feature work.
+    applies_to: [pr, mr]
+"#,
+    )
+    .expect("write catalog");
+    (tempdir, path.to_string_lossy().into_owned())
+}
+
 /// Build context for an integration call.
 pub struct StubEnv {
     pub tempdir: TempDir,
