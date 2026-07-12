@@ -47,8 +47,8 @@ created.
 
 | Provider | Audited floor | Classification | Start | Completion | Attention | Failure | Setup |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| Codex | 0.144.1 | supported | `UserPromptSubmit`, observed | matching `agent-turn-complete`, authoritative; raw `Stop` remains journal evidence only | `PermissionRequest`, observed conservative latch | runtime/fallback only | additive hooks in `~/.codex/hooks.json` plus owned or bounded direct-argv-composed notify in `~/.codex/config.toml`; unsafe/recursive values fail closed |
-| Claude Code | 2.1.206 | partial | `UserPromptSubmit`, observed | `idle_prompt`, observed; raw `Stop` is journal evidence only | exact `AskUserQuestion` request/clear; `PermissionRequest`/notification conservative latch | `StopFailure`, observed; `AskUserQuestion` tool failure clears only its clarification | additive merge into `~/.claude/settings.json` |
+| Codex | 0.144.1 | supported; usage-failure unavailable | `UserPromptSubmit`, observed | matching `agent-turn-complete`, authoritative; raw `Stop` remains journal evidence only | `PermissionRequest`, observed conservative latch | runtime/fallback only; no structured interactive usage-failure field | additive hooks in `~/.codex/hooks.json` plus owned or bounded direct-argv-composed notify in `~/.codex/config.toml`; unsafe/recursive values fail closed |
+| Claude Code | 2.1.206 | partial; usage-failure supported | `UserPromptSubmit`, observed | `idle_prompt`, observed; raw `Stop` is journal evidence only | exact `AskUserQuestion` request/clear; `PermissionRequest`/notification conservative latch | structured `StopFailure.error`, authoritative; only `rate_limit` can arm auto-resume | additive merge into `~/.claude/settings.json` |
 | Hermes | 0.18.2 | supported | `pre_llm_call`, observed | successful non-interrupted `post_llm_call`, authoritative | non-empty shell `extra.tool_call_id` projects to exact pre/post correlation; missing/empty-id tuple fallback remains conservative | runtime/fallback only | additive merge into `~/.hermes/config.yaml`; Hermes consent remains mandatory |
 
 Versions below the audited floor remain usable. `activity doctor` reports them
@@ -103,6 +103,14 @@ therefore treats either signal as authoritative over the payload's
 `permission_mode` hint. This includes `bypassPermissions`, where root/home
 deletion still has a circuit-breaker prompt. Those uncorrelated signals keep the
 same conservative latch as every other permission mode.
+
+`StopFailure` exposes a documented finite `error` enum. The adapter treats that
+enum as authoritative failure classification, maps it to the metadata-only
+`failure_reason` allowlist, and discards `error_details` and
+`last_assistant_message`. Only `error == "rate_limit"` maps to
+`usage_exhausted`; authentication, organization, billing, invalid request,
+server, max-output-token, and unknown controls remain non-resumable. The
+sanitized `auto-resume-failures.jsonl` fixture freezes this matrix.
 
 ### Hermes
 

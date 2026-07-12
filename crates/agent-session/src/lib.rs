@@ -1,4 +1,5 @@
 mod activity;
+mod auto_resume;
 mod cli;
 pub mod completion;
 mod provider_prompt;
@@ -12,7 +13,7 @@ use std::io::{self, Read, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
-use std::process::Command as ProcessCommand;
+use std::process::{Command as ProcessCommand, Stdio};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
@@ -46,7 +47,7 @@ use cli::{AgentKind, Cli, Command, SpecialKey};
 const SESSION_DOCUMENT_VERSION: &str = "agent-session.session.v1";
 const SESSION_RESUME_DOCUMENT_VERSION: &str = "agent-session.resume.v1";
 const SESSION_RESUME_FILE: &str = "resume.json";
-const SESSION_RECORD_LOCK_FILE: &str = ".record.lock";
+const SESSION_LOCKS_DIR: &str = "session-locks";
 const BINARY: &str = "agent-session";
 const START_COMMAND: &str = "start";
 const RUN_COMMAND: &str = "run";
@@ -66,6 +67,7 @@ const CODEX_RESUME_CAPTURE_TIMEOUT_MS: u64 = 1500;
 const CODEX_RESUME_CAPTURE_POLL_MS: u64 = 100;
 const CODEX_RESUME_AMBIGUITY_WINDOW_MS: u64 = 500;
 const CODEX_RESUME_BACKFILL_MAX_AGE_SECS: u64 = 10 * 60;
+const PANE_INPUT_COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub fn run() -> i32 {
     run_with_args(env::args_os())
@@ -501,6 +503,25 @@ fn same_runtime_identity(left: Option<&RuntimeInfo>, right: Option<&RuntimeInfo>
     }
 }
 
+fn ensure_same_session_identity(
+    observed: &SessionRecord,
+    current: &SessionRecord,
+) -> Result<(), CliError> {
+    if observed.id == current.id
+        && observed.agent == current.agent
+        && observed.created_at == current.created_at
+        && observed.tmux_session == current.tmux_session
+        && same_runtime_identity(observed.runtime.as_ref(), current.runtime.as_ref())
+    {
+        return Ok(());
+    }
+    Err(CliError::runtime(
+        "session-runtime-changed",
+        "session identity changed while waiting for a lifecycle operation",
+        Some(json!({ "id": observed.id })),
+    ))
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 struct DurableResumeRecord {
     schema_version: String,
@@ -541,6 +562,7 @@ struct SessionView {
     runtime_started_at: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     turn_state: Option<activity::TurnState>,
+    auto_resume: auto_resume::AutoResumeView,
 }
 
 #[derive(Debug)]
@@ -604,6 +626,7 @@ struct GlanceResult {
     runtime_started_at: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     turn_state: Option<activity::TurnState>,
+    auto_resume: auto_resume::AutoResumeView,
 }
 
 #[derive(Debug, Serialize)]
@@ -735,19 +758,12 @@ fn start_session(context: &CliContext, args: cli::StartArgs) -> Result<StartView
         && let Some(provider_resume) =
             capture_provider_resume_after_launch(args.agent, &created.record, launch_started_at)
     {
-        created.record = mutate_session_record(context, &created.record.id, |record| {
-            if record.provider_resume.is_none()
-                && same_runtime_identity(record.runtime.as_ref(), created.record.runtime.as_ref())
-                && record.agent == created.record.agent
-            {
-                record.provider_resume = Some(provider_resume);
-            }
-            Ok(record.clone())
-        })
-        .unwrap_or_else(|_| {
-            load_session_record(context, &created.record.id)
-                .unwrap_or_else(|_| created.record.clone())
-        });
+        let persisted_before_capture = created.record.clone();
+        created.record.provider_resume = Some(provider_resume);
+        if write_session_record(context, &created.record).is_err() {
+            created.record = load_session_record(context, &created.record.id)
+                .unwrap_or(persisted_before_capture);
+        }
     }
 
     let result = session_view(
@@ -891,6 +907,14 @@ struct CreatedRecord {
     record: SessionRecord,
     prompt_file: Option<PathBuf>,
     session_dir: PathBuf,
+    _lifecycle_lock: Option<SessionRecordLock>,
+}
+
+impl CreatedRecord {
+    #[cfg(test)]
+    fn release_lifecycle_lock(&mut self) {
+        self._lifecycle_lock = None;
+    }
 }
 
 struct RecordRequest<'a> {
@@ -919,6 +943,7 @@ fn create_record(request: RecordRequest<'_>) -> Result<CreatedRecord, CliError> 
         &timestamp,
         title_slug.as_deref(),
     )?;
+    let lifecycle_lock = acquire_session_record_lock(request.context, &id)?;
     let tmux_session = format!("hs-{}-{id}", request.agent.as_str());
     let session_dir = session_dir(request.context, &id);
     private_dir(&session_dir)?;
@@ -968,6 +993,7 @@ fn create_record(request: RecordRequest<'_>) -> Result<CreatedRecord, CliError> 
         record,
         prompt_file,
         session_dir,
+        _lifecycle_lock: Some(lifecycle_lock),
     })
 }
 
@@ -1616,11 +1642,9 @@ fn load_and_paste_buffer(
 }
 
 fn delete_tmux_buffer(tmux_bin: &Path, buffer_name: &str) {
-    let _ = ProcessCommand::new(tmux_bin)
-        .arg("delete-buffer")
-        .arg("-b")
-        .arg(buffer_name)
-        .status();
+    let mut command = ProcessCommand::new(tmux_bin);
+    command.arg("delete-buffer").arg("-b").arg(buffer_name);
+    let _ = run_status_with_timeout(command, "tmux delete-buffer", PANE_INPUT_COMMAND_TIMEOUT);
 }
 
 fn send_to_session(context: &CliContext, args: cli::SendArgs) -> Result<SendResult, CliError> {
@@ -1632,8 +1656,11 @@ fn send_to_session(context: &CliContext, args: cli::SendArgs) -> Result<SendResu
             None,
         ));
     }
-    let record = load_session_record(context, &args.id)?;
+    let observed = load_session_record(context, &args.id)?;
     let tmux_bin = resolve_tmux_bin(args.tmux_bin.as_deref());
+    let _record_lock = acquire_session_record_lock(context, &observed.id)?;
+    let mut record = load_session_record(context, &observed.id)?;
+    ensure_same_session_identity(&observed, &record)?;
     if live_status(&tmux_bin, &record.tmux_session) != "running" {
         return Err(CliError::runtime(
             "session-not-running",
@@ -1641,8 +1668,14 @@ fn send_to_session(context: &CliContext, args: cli::SendArgs) -> Result<SendResu
             Some(json!({ "id": record.id })),
         ));
     }
-    send_input(context, &record, text.as_deref(), &args.keys, &tmux_bin)?;
-    let record = touch_updated_at(context, &record.id)?;
+    auto_resume::cancel_for_manual_input_locked(
+        context,
+        &record.id,
+        &Timestamp::now().to_string(),
+    )?;
+    send_input_unlocked(context, &record, text.as_deref(), &args.keys, &tmux_bin)?;
+    record.updated_at = Zoned::now().timestamp().to_string();
+    write_session_record(context, &record)?;
     Ok(SendResult {
         id: record.id.clone(),
         tmux_session: record.tmux_session.clone(),
@@ -1658,7 +1691,59 @@ fn send_to_session(context: &CliContext, args: cli::SendArgs) -> Result<SendResu
 /// Push literal text (via a private buffer file, never argv/stdout) and then
 /// each special key into the live pane. `send-keys` interprets the tmux key
 /// names, so approvals like Enter/Esc/Ctrl-C/arrows work from mobile.
-fn send_input(
+fn send_input_serialized(
+    context: &CliContext,
+    record: &SessionRecord,
+    text: Option<&str>,
+    keys: &[SpecialKey],
+    tmux_bin: &Path,
+) -> Result<(), CliError> {
+    let _record_lock = acquire_session_record_lock(context, &record.id)?;
+    let current = load_session_record(context, &record.id)?;
+    ensure_same_session_identity(record, &current)?;
+    if live_status(tmux_bin, &current.tmux_session) != "running" {
+        return Err(CliError::runtime(
+            "session-not-running",
+            format!("session is not running: {}", current.id),
+            Some(json!({ "id": current.id })),
+        ));
+    }
+    auto_resume::cancel_for_manual_input_locked(
+        context,
+        &current.id,
+        &Timestamp::now().to_string(),
+    )?;
+    send_input_unlocked(context, &current, text, keys, tmux_bin)
+}
+
+/// Submit the product-owned continuation while `auto_resume::tick` holds the
+/// session record lock. Reloading here prevents a stale scheduler record from
+/// targeting a restarted or recreated runtime.
+pub(crate) fn send_auto_resume_input(
+    context: &CliContext,
+    expected: &SessionRecord,
+    text: &str,
+    tmux_bin: &Path,
+) -> Result<(), CliError> {
+    let current = load_session_record(context, &expected.id)?;
+    ensure_same_session_identity(expected, &current)?;
+    if live_status(tmux_bin, &current.tmux_session) != "running" {
+        return Err(CliError::runtime(
+            "session-not-running",
+            format!("session is not running: {}", current.id),
+            Some(json!({ "id": current.id })),
+        ));
+    }
+    send_input_unlocked(
+        context,
+        &current,
+        Some(text),
+        &[SpecialKey::Enter],
+        tmux_bin,
+    )
+}
+
+fn send_input_unlocked(
     context: &CliContext,
     record: &SessionRecord,
     text: Option<&str>,
@@ -1667,10 +1752,17 @@ fn send_input(
 ) -> Result<(), CliError> {
     let target = format!("{}:0.0", record.tmux_session);
     if let Some(text) = text {
-        let buffer_name = format!("{}-send", record.id);
-        let temp = session_dir(context, &record.id).join("send-input");
+        let nonce = uuid::Uuid::new_v4();
+        let buffer_name = format!("{}-send-{nonce}", record.id);
+        let temp = session_dir(context, &record.id).join(format!("send-input-{nonce}"));
         write_private_file(&temp, text.as_bytes())?;
-        let result = load_and_paste_buffer(tmux_bin, &buffer_name, &target, &temp);
+        let result = load_and_paste_buffer_with_timeout(
+            tmux_bin,
+            &buffer_name,
+            &target,
+            &temp,
+            PANE_INPUT_COMMAND_TIMEOUT,
+        );
         let _ = fs::remove_file(&temp);
         result?;
     }
@@ -1681,7 +1773,33 @@ fn send_input(
             .arg("-t")
             .arg(&target)
             .arg(key.tmux_key());
-        run_status(command, "tmux send-keys")?;
+        run_status_with_timeout(command, "tmux send-keys", PANE_INPUT_COMMAND_TIMEOUT)?;
+    }
+    Ok(())
+}
+
+fn load_and_paste_buffer_with_timeout(
+    tmux_bin: &Path,
+    buffer_name: &str,
+    target: &str,
+    file: &Path,
+    timeout: Duration,
+) -> Result<(), CliError> {
+    let mut load = ProcessCommand::new(tmux_bin);
+    load.arg("load-buffer").arg("-b").arg(buffer_name).arg(file);
+    run_status_with_timeout(load, "tmux load-buffer", timeout)?;
+
+    let mut paste = ProcessCommand::new(tmux_bin);
+    paste
+        .arg("paste-buffer")
+        .arg("-b")
+        .arg(buffer_name)
+        .arg("-d")
+        .arg("-t")
+        .arg(target);
+    if let Err(err) = run_status_with_timeout(paste, "tmux paste-buffer", timeout) {
+        delete_tmux_buffer(tmux_bin, buffer_name);
+        return Err(err);
     }
     Ok(())
 }
@@ -1747,6 +1865,7 @@ fn glance_session(context: &CliContext, args: cli::GlanceArgs) -> Result<GlanceR
             .as_ref()
             .map(|runtime| runtime.started_at.clone()),
         turn_state: activity::state_for_view(context, &record),
+        auto_resume: auto_resume::view_for_record(context, &record),
     })
 }
 
@@ -1878,17 +1997,6 @@ mod codex_resume_tests {
     }
 }
 
-/// Bump `updated_at` to now so `list` can order by real control-plane activity.
-/// Applied on `send` (a steering action); intentionally not on `glance`, which
-/// is a high-frequency dashboard poll that would otherwise make `updated_at`
-/// track polling rather than activity.
-fn touch_updated_at(context: &CliContext, id: &str) -> Result<SessionRecord, CliError> {
-    mutate_session_record(context, id, |record| {
-        record.updated_at = Zoned::now().timestamp().to_string();
-        Ok(record.clone())
-    })
-}
-
 fn update_session_title(
     context: &CliContext,
     id: &str,
@@ -1933,7 +2041,7 @@ fn rename_live_claude_session(
 ) -> Result<(), CliError> {
     let single_line = title.replace(['\n', '\r'], " ");
     let command = format!("/rename {single_line}");
-    send_input(
+    send_input_serialized(
         context,
         record,
         Some(&command),
@@ -1955,9 +2063,11 @@ fn resume_session_by_id(
     // Preserve not-found semantics before creating the private lock file, then
     // serialize the entire resume transition (including launch and rollback)
     // against title, hook, timestamp, and backfill writers.
-    let canonical_id = load_session_record(context, id)?.id;
+    let observed = load_session_record(context, id)?;
+    let canonical_id = observed.id.clone();
     let _record_lock = acquire_session_record_lock(context, &canonical_id)?;
     let mut record = load_session_record(context, &canonical_id)?;
+    ensure_same_session_identity(&observed, &record)?;
     match session_status(tmux_bin, &record).as_str() {
         "running" => {
             return Ok(session_view(
@@ -2698,7 +2808,10 @@ fn acquire_session_record_lock(
     context: &CliContext,
     id: &str,
 ) -> Result<SessionRecordLock, CliError> {
-    let path = session_dir(context, id).join(SESSION_RECORD_LOCK_FILE);
+    validate_id(id)?;
+    let lock_dir = context.state_dir.join(SESSION_LOCKS_DIR);
+    ensure_private_dir(&lock_dir)?;
+    let path = lock_dir.join(format!("{id}.lock"));
     let file = OpenOptions::new()
         .create(true)
         .read(true)
@@ -2737,9 +2850,11 @@ where
 {
     // Preserve the public not-found contract before touching the private lock
     // file; the authoritative record is reloaded after the lock is acquired.
-    let canonical_id = load_session_record(context, id)?.id;
+    let observed = load_session_record(context, id)?;
+    let canonical_id = observed.id.clone();
     let _lock = acquire_session_record_lock(context, &canonical_id)?;
     let mut record = load_session_record(context, &canonical_id)?;
+    ensure_same_session_identity(&observed, &record)?;
     let result = mutate(&mut record)?;
     write_session_record(context, &record)?;
     Ok(result)
@@ -2920,6 +3035,7 @@ fn session_view_from_parts(
             .as_ref()
             .map(|runtime| runtime.started_at.clone()),
         turn_state: activity::state_for_view(context, record),
+        auto_resume: auto_resume::view_for_record(context, record),
     }
 }
 
@@ -3090,8 +3206,12 @@ fn delete_session(
     id: &str,
     tmux_bin: PathBuf,
 ) -> Result<DeleteResult, CliError> {
-    let resolved = resolve_session_record_path(context, id)?;
+    let observed = load_session_record(context, id)?;
+    let canonical_id = observed.id.clone();
+    let _record_lock = acquire_session_record_lock(context, &canonical_id)?;
+    let resolved = resolve_session_record_path(context, &canonical_id)?;
     let record = read_session_record(&resolved.record_path)?;
+    ensure_same_session_identity(&observed, &record)?;
     validate_record_id(&record, &resolved.expected_id, &resolved.record_path)?;
     let session_dir = resolved.session_dir;
     let killed = kill_tmux_session(&tmux_bin, &record.tmux_session);
@@ -3112,13 +3232,13 @@ fn delete_session(
 }
 
 fn kill_tmux_session(tmux_bin: &Path, tmux_session: &str) -> bool {
-    ProcessCommand::new(tmux_bin)
-        .arg("kill-session")
-        .arg("-t")
-        .arg(tmux_session)
-        .status()
-        .map(|status| status.success())
-        .unwrap_or(false)
+    kill_tmux_session_with_timeout(tmux_bin, tmux_session, PANE_INPUT_COMMAND_TIMEOUT)
+}
+
+fn kill_tmux_session_with_timeout(tmux_bin: &Path, tmux_session: &str, timeout: Duration) -> bool {
+    let mut command = ProcessCommand::new(tmux_bin);
+    command.arg("kill-session").arg("-t").arg(tmux_session);
+    run_exit_status_with_timeout(command, timeout).is_ok_and(|status| status.success())
 }
 
 fn session_status(tmux_bin: &Path, record: &SessionRecord) -> String {
@@ -3301,12 +3421,13 @@ fn git_remote_web_url(remote: &str) -> Option<String> {
 }
 
 fn live_status(tmux_bin: &Path, tmux_session: &str) -> String {
-    match ProcessCommand::new(tmux_bin)
-        .arg("has-session")
-        .arg("-t")
-        .arg(tmux_session)
-        .status()
-    {
+    live_status_with_timeout(tmux_bin, tmux_session, PANE_INPUT_COMMAND_TIMEOUT)
+}
+
+fn live_status_with_timeout(tmux_bin: &Path, tmux_session: &str, timeout: Duration) -> String {
+    let mut command = ProcessCommand::new(tmux_bin);
+    command.arg("has-session").arg("-t").arg(tmux_session);
+    match run_exit_status_with_timeout(command, timeout) {
         Ok(status) if status.success() => "running".to_string(),
         Ok(status) if status.code() == Some(1) => "stopped".to_string(),
         Ok(_) => "unknown".to_string(),
@@ -3335,6 +3456,60 @@ fn run_status(mut command: ProcessCommand, label: &str) -> Result<(), CliError> 
         },
         None,
     ))
+}
+
+fn run_status_with_timeout(
+    command: ProcessCommand,
+    label: &str,
+    timeout: Duration,
+) -> Result<(), CliError> {
+    let status = run_exit_status_with_timeout(command, timeout).map_err(|err| {
+        let code = if err.kind() == io::ErrorKind::TimedOut {
+            "command-timeout"
+        } else {
+            "command-wait-failed"
+        };
+        CliError::runtime(code, format!("failed to run {label}: {err}"), None)
+    })?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(CliError::runtime(
+            "command-failed",
+            format!("{label} failed with status {status}"),
+            None,
+        ))
+    }
+}
+
+fn run_exit_status_with_timeout(
+    mut command: ProcessCommand,
+    timeout: Duration,
+) -> io::Result<std::process::ExitStatus> {
+    command.stdout(Stdio::null()).stderr(Stdio::null());
+    let mut child = command.spawn()?;
+    let started_at = Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return Ok(status),
+            Ok(None) if started_at.elapsed() < timeout => {
+                thread::sleep(Duration::from_millis(10));
+            }
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!("process exceeded {} ms", timeout.as_millis()),
+                ));
+            }
+            Err(err) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(err);
+            }
+        }
+    }
 }
 
 fn read_prompt(
@@ -3956,12 +4131,17 @@ fn tail_lines(text: &str, tail: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        AgentKind, CliContext, RecordRequest, create_record, resolve_session_id,
+        AgentKind, CliContext, RecordRequest, acquire_session_record_lock, create_record,
+        kill_tmux_session_with_timeout, live_status_with_timeout, resolve_session_id, session_dir,
         strip_trailing_blank_lines,
     };
     use pretty_assertions::assert_eq;
     use std::fs;
+    use std::os::unix::fs::PermissionsExt;
     use std::path::Path;
+    use std::sync::mpsc;
+    use std::thread;
+    use std::time::Duration;
 
     fn test_context(state_dir: &Path) -> CliContext {
         CliContext {
@@ -4052,6 +4232,63 @@ mod tests {
         let id = create_test_record_id(&context, AgentKind::Codex, None, Some("custom-id"));
 
         assert_eq!(id, "custom-id");
+    }
+
+    #[test]
+    fn lifecycle_lock_survives_session_delete_and_same_id_recreation() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let context = test_context(tmp.path());
+        let id = "stable-lock";
+        let dir = session_dir(&context, id);
+        fs::create_dir_all(&dir).unwrap();
+        let first = acquire_session_record_lock(&context, id).unwrap();
+
+        fs::remove_dir_all(&dir).unwrap();
+        fs::create_dir_all(&dir).unwrap();
+        let (tx, rx) = mpsc::channel();
+        let waiter_context = context.clone();
+        let waiter = thread::spawn(move || {
+            let _lock = acquire_session_record_lock(&waiter_context, id).unwrap();
+            tx.send(()).unwrap();
+        });
+        assert!(matches!(
+            rx.recv_timeout(Duration::from_millis(50)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ));
+        drop(first);
+        rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        waiter.join().unwrap();
+    }
+
+    #[test]
+    fn live_status_timeout_bounds_a_hung_tmux_probe() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let tmux = tmp.path().join("tmux");
+        fs::write(&tmux, "#!/bin/sh\nsleep 5\n").unwrap();
+        fs::set_permissions(&tmux, fs::Permissions::from_mode(0o700)).unwrap();
+        let started = std::time::Instant::now();
+
+        assert_eq!(
+            live_status_with_timeout(&tmux, "hung", Duration::from_millis(50)),
+            "unknown"
+        );
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn kill_session_timeout_bounds_a_hung_tmux_delete() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let tmux = tmp.path().join("tmux");
+        fs::write(&tmux, "#!/bin/sh\nsleep 5\n").unwrap();
+        fs::set_permissions(&tmux, fs::Permissions::from_mode(0o700)).unwrap();
+        let started = std::time::Instant::now();
+
+        assert!(!kill_tmux_session_with_timeout(
+            &tmux,
+            "hung",
+            Duration::from_millis(50)
+        ));
+        assert!(started.elapsed() < Duration::from_secs(1));
     }
 
     #[test]

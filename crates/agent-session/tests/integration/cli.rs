@@ -6151,16 +6151,17 @@ fn send_delivers_text_and_keys_without_leaking_and_bumps_updated_at() {
         "missing load-buffer call: {calls:?}"
     );
     assert!(
-        calls.iter().any(|call| call
-            == &vec![
-                "paste-buffer".to_string(),
-                "-b".to_string(),
-                "steer-send".to_string(),
-                "-d".to_string(),
-                "-t".to_string(),
-                "hs-codex-steer:0.0".to_string(),
-            ]),
-        "missing paste-buffer -d call: {calls:?}"
+        calls.iter().any(|call| {
+            call.first().is_some_and(|arg| arg == "paste-buffer")
+                && call.get(1).is_some_and(|arg| arg == "-b")
+                && call
+                    .get(2)
+                    .is_some_and(|arg| arg.starts_with("steer-send-"))
+                && call.get(3).is_some_and(|arg| arg == "-d")
+                && call.get(4).is_some_and(|arg| arg == "-t")
+                && call.get(5).is_some_and(|arg| arg == "hs-codex-steer:0.0")
+        }),
+        "missing unique paste-buffer -d call: {calls:?}"
     );
     assert!(
         calls.iter().any(|call| call
@@ -6199,8 +6200,12 @@ fn send_delivers_text_and_keys_without_leaking_and_bumps_updated_at() {
         }
     }
     assert!(
-        !session.join("send-input").exists(),
-        "send-input temp file should be cleaned up"
+        fs::read_dir(&session).unwrap().all(|entry| !entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with("send-input-")),
+        "unique send-input temp files should be cleaned up"
     );
 
     // send bumps updated_at away from the sentinel so list can sort by activity.

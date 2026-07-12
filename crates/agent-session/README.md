@@ -159,6 +159,36 @@ is no second state model.
   `subscription_inactive`, `organization_disabled`, `permission_denied`,
   `rate_limited`, `service_unavailable`, `timeout`, or `unknown`) copied only
   from the helpers' allowlisted structured field.
+- Every session view additively includes `auto_resume` using
+  `agent-session.auto-resume.v1`. `GET /sessions/{id}/auto-resume` reads that
+  status; `PUT` with `{ "enabled": true|false }` opts a supported session in or
+  out, and `DELETE` durably cancels pending work. Both mutations require the
+  bearer token. Claude Code is supported through its authoritative structured
+  `StopFailure.error == "rate_limit"` signal. Codex remains explicitly
+  unsupported until its interactive lifecycle surface exposes an equivalent
+  structured failure reason; terminal text and assistant output are never
+  treated as authority.
+  The response object is `{ schema_version, supported, enabled, state,
+  scheduled_at?, failure_reason? }`. `scheduled_at`, when present, is an
+  RFC 3339 timestamp. The v1 `state` values are `disabled`, `enabled`, `armed`,
+  `scheduled`, `checking`, `resumed`, `cancelled`, `transient_failure`, and
+  `terminal_failure`. The allowlisted `failure_reason` values are
+  `state_unavailable`, `manual_input`, `usage_unavailable`,
+  `usage_window_not_exhausted`, `exhausted_reset_unavailable`,
+  `session_state_changed`, `submission_outcome_unknown`, `provider_unsupported`,
+  and `scheduler_error`. Consumers must preserve
+  the object but render unknown future state or reason values as a safe generic
+  unavailable/failure condition; they must not infer permission to submit from
+  an unknown value. `scheduled_at` is present only while a reset wake is
+  scheduled, and `failure_reason` is present only when the latest transition
+  records a safe operational reason.
+- The daemon owns scheduling. It waits for the latest reset among all exhausted
+  windows, adds bounded deterministic jitter, re-collects usage at wake, checks
+  that the session activity revision is still eligible, and durably claims the
+  submission before sending one fixed product-owned continuation message.
+  Restart recovery scans pending records; duplicate events/ticks cannot submit
+  twice, cancellation is serialized against wake-up, and bounded retry ends in
+  an observable terminal failure.
 - `GET /workdirs?q=...&limit=N` — authenticated read; searches only the default operator roots (`$HOME/Project` and
   `$HOME/.config`) with bounded depth, count, and elapsed-time limits. Add `git_only=true&exclude_worktrees=true` for
   the curated project picker: only primary git working trees are returned, ordered by most-recent session cwd usage
@@ -179,6 +209,7 @@ is no second state model.
   wire/privacy contract is [activity-stream-v1](docs/specs/activity-stream-v1.md).
 - `POST /sessions` (create), `PATCH /sessions/{id}` (title update), `POST /sessions/{id}/send`,
   `POST /sessions/{id}/resume`,
+  `PUT /sessions/{id}/auto-resume`, `DELETE /sessions/{id}/auto-resume`,
   `POST /sessions/{id}/attachments?filename=...`, `DELETE /sessions/{id}` — writes, require a bearer token.
 - `POST /sessions` normally creates a fresh session from `agent`, optional `cwd`, `title`, `id`, `prompt`, and
   `agent_args`. When `provider_resume_id` is present (alias: `resume_id`), the daemon imports an existing Codex or
