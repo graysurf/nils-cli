@@ -1421,7 +1421,96 @@ fn archive_retire_rejects_duplicate_targets_and_symlink_roots_without_writes() {
         assert_eq!(linked.code, 1);
         assert!(linked.stderr_text().contains("must not be a symlink"));
         assert!(tmp.path().join("global/runtime-enforced.md").is_file());
+
+        let list = run(tmp.path(), &["archive", "list"]);
+        assert_eq!(list.code, 1);
+        assert!(
+            list.stderr_text()
+                .contains("regular, non-symlink directory")
+        );
+
+        let search = run(tmp.path(), &["archive", "search", "token"]);
+        assert_eq!(search.code, 1);
+        assert!(
+            search
+                .stderr_text()
+                .contains("regular, non-symlink directory")
+        );
     }
+}
+
+#[test]
+fn archive_retire_rejects_malformed_metadata_multiline_reason_and_stale_recovery() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    seed_archive_layout(tmp.path());
+    let source = tmp.path().join("global/runtime-enforced.md");
+    fs::write(
+        &source,
+        "---\nname: runtime-enforced\ndescription: missing metadata\n---\n\nBody.\n",
+    )
+    .expect("malformed note");
+    let base = [
+        "archive",
+        "retire",
+        "runtime-enforced",
+        "--reason",
+        "enforced-by-runtime",
+        "--superseded-by",
+        "nils-cli:crates/example/src/lib.rs",
+        "--archived-at",
+        "2026-07-12",
+        "--apply",
+    ];
+    let malformed = run(tmp.path(), &base);
+    assert_eq!(malformed.code, 1);
+    assert!(
+        malformed
+            .stderr_text()
+            .contains("incomplete memory frontmatter")
+    );
+
+    fs::write(
+        &source,
+        note(
+            "runtime-enforced",
+            "feedback",
+            "Restored valid source.\n\n**Why:** reason.\n\n**How to apply:** old reminder.",
+        ),
+    )
+    .expect("valid note");
+    let multiline = run(
+        tmp.path(),
+        &[
+            "archive",
+            "retire",
+            "runtime-enforced",
+            "--reason",
+            "line one\nline two",
+            "--superseded-by",
+            "nils-cli:crates/example/src/lib.rs",
+            "--archived-at",
+            "2026-07-12",
+        ],
+    );
+    assert_eq!(multiline.code, 64);
+    assert!(multiline.stderr_text().contains("single line"));
+
+    let recovery = tmp
+        .path()
+        .join("global/.runtime-enforced.md.archive-backup");
+    fs::write(&recovery, "previous recovery").expect("recovery");
+    let stale = run(tmp.path(), &base);
+    assert_eq!(stale.code, 1);
+    assert!(
+        stale
+            .stderr_text()
+            .contains("stale archive transaction path")
+    );
+    assert_eq!(
+        fs::read_to_string(recovery).expect("retained recovery"),
+        "previous recovery"
+    );
+    assert!(source.is_file());
 }
 
 // ---- strict index budget and forbidden-term audits ----------------------

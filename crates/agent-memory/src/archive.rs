@@ -44,6 +44,7 @@ struct ArchiveRow {
 }
 
 fn list(layout: &Layout, args: &ArchiveListArgs) -> Result<i32, ArchiveFailure> {
+    validate_archive_root(layout)?;
     let rows = archive_rows(layout)?;
     let format = output_format(args.format, args.json);
     if format.is_json() {
@@ -90,6 +91,7 @@ fn search(layout: &Layout, args: &ArchiveSearchArgs) -> Result<i32, ArchiveFailu
             "archive search term must not be empty",
         ));
     }
+    validate_archive_root(layout)?;
     let root = superseded_dir(layout);
     let needle = args.term.to_lowercase();
     let mut hits = Vec::new();
@@ -168,6 +170,15 @@ fn retire(layout: &Layout, args: &ArchiveRetireArgs) -> Result<i32, ArchiveFailu
     let original = read_regular_file(&source, "curated source note")?;
     let frontmatter = frontmatter::parse(&original)
         .ok_or_else(|| ArchiveFailure::runtime("curated source note has no frontmatter"))?;
+    if frontmatter.name.is_none()
+        || frontmatter.description.is_none()
+        || frontmatter.node_type.as_deref() != Some("memory")
+        || frontmatter.typ.is_none()
+    {
+        return Err(ArchiveFailure::runtime(
+            "curated source note has incomplete memory frontmatter",
+        ));
+    }
     let note_name = frontmatter.name.unwrap_or_else(|| args.name.clone());
     let description = frontmatter.description.unwrap_or_default();
 
@@ -210,6 +221,15 @@ fn retire(layout: &Layout, args: &ArchiveRetireArgs) -> Result<i32, ArchiveFailu
     } else {
         None
     };
+    if archive_index_original
+        .as_deref()
+        .is_some_and(|index| index.contains(&format!("(superseded/{}.md)", args.name)))
+    {
+        return Err(ArchiveFailure::runtime(format!(
+            "archive index already links {}.md",
+            args.name
+        )));
+    }
     let archive_index_updated = append_archive_index(
         archive_index_original.as_deref(),
         &args.name,
@@ -273,8 +293,10 @@ fn validate_retire_args(args: &ArchiveRetireArgs) -> Result<(), ArchiveFailure> 
             args.name
         )));
     }
-    if args.reason.trim().is_empty() {
-        return Err(ArchiveFailure::usage("archive reason must not be empty"));
+    if args.reason.trim().is_empty() || args.reason.contains('\n') || args.reason.contains('\r') {
+        return Err(ArchiveFailure::usage(
+            "archive reason must be a non-empty single line",
+        ));
     }
     if args
         .superseded_by
@@ -301,6 +323,18 @@ fn validate_retire_args(args: &ArchiveRetireArgs) -> Result<(), ArchiveFailure> 
 
 fn superseded_dir(layout: &Layout) -> PathBuf {
     layout.archive_dir().join("superseded")
+}
+
+fn validate_archive_root(layout: &Layout) -> Result<(), ArchiveFailure> {
+    let archive = layout.archive_dir();
+    if archive.exists() || fs::symlink_metadata(&archive).is_ok() {
+        ensure_regular_dir(&archive, "archive root")?;
+    }
+    let superseded = superseded_dir(layout);
+    if superseded.exists() || fs::symlink_metadata(&superseded).is_ok() {
+        ensure_regular_dir(&superseded, "superseded archive directory")?;
+    }
+    Ok(())
 }
 
 fn archive_rows(layout: &Layout) -> Result<Vec<ArchiveRow>, ArchiveFailure> {
@@ -524,14 +558,14 @@ fn apply_transaction(
         })
         .collect();
 
-    cleanup_paths(&[
+    ensure_paths_absent(&[
         &source_backup,
         &target_tmp,
         &archive_index_backup,
         &archive_index_tmp,
-    ]);
+    ])?;
     for (_, backup, temporary) in &index_files {
-        cleanup_paths(&[backup, temporary]);
+        ensure_paths_absent(&[backup, temporary])?;
     }
     let staging = (|| -> Result<(), ArchiveFailure> {
         write_new(&target_tmp, archived)?;
@@ -771,6 +805,18 @@ fn cleanup_paths(paths: &[&Path]) {
     for path in paths {
         let _ = fs::remove_file(path);
     }
+}
+
+fn ensure_paths_absent(paths: &[&Path]) -> Result<(), ArchiveFailure> {
+    for path in paths {
+        if fs::symlink_metadata(path).is_ok() {
+            return Err(ArchiveFailure::runtime(format!(
+                "stale archive transaction path exists: {}",
+                display_path(path)
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn collect_remove(path: &Path, label: &str, errors: &mut Vec<String>) {
