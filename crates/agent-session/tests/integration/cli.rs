@@ -463,7 +463,7 @@ fn standalone_start_keeps_codex_raw_without_a_serve_owned_control_plane() {
     let codex_bin = tmp.path().join("codex-app-server");
     write_executable(
         &codex_bin,
-        "#!/usr/bin/env sh\nif [ \"$1\" = app-server ] && [ \"$2\" = --help ]; then printf '%s\\n' '  --listen <URL>'; exit 0; fi\nexit 1\n",
+        "#!/usr/bin/env sh\nif [ \"$1\" = --version ]; then printf '%s\\n' 'codex-cli 0.144.1'; exit 0; fi\nif [ \"$1\" = app-server ] && [ \"$2\" = --help ]; then printf '%s\\n' '  --listen <URL>  unix://'; exit 0; fi\nexit 1\n",
     );
 
     let state_arg = state_dir.to_string_lossy().to_string();

@@ -57,10 +57,28 @@ pub enum Command {
     Activity(ActivityArgs),
     /// Serve the control plane (HTTP) and PTY attach (WebSocket) over loopback.
     Serve(ServeArgs),
+    /// Internal metadata-only bridge for a managed Codex remote TUI.
+    #[command(name = "codex-app-server-proxy", hide = true)]
+    CodexAppServerProxy(CodexAppServerProxyArgs),
     /// Delete session state and kill the tmux session if it is still alive.
     Delete(DeleteArgs),
     /// Print shell completion script.
     Completion(CompletionArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct CodexAppServerProxyArgs {
+    /// Managed session id whose runtime owns this bridge.
+    #[arg(long)]
+    pub id: String,
+
+    /// Private app-server Unix socket.
+    #[arg(long, value_name = "PATH", value_hint = ValueHint::FilePath)]
+    pub upstream: PathBuf,
+
+    /// Private Unix socket exposed only to the visible TUI.
+    #[arg(long, value_name = "PATH", value_hint = ValueHint::FilePath)]
+    pub listen: PathBuf,
 }
 
 #[derive(Debug, Args)]

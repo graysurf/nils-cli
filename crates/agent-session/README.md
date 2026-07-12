@@ -226,21 +226,30 @@ is no second state model.
   Claude provider conversation instead: it resolves the original cwd from local provider history, persists exact
   `provider_resume` metadata, and starts tmux with the canonical resume command. In resume-id mode, omit `cwd`, `prompt`,
   and `agent_args`; invalid, missing, ambiguous, or unsupported provider ids return structured errors.
-  For a fresh serve-managed Codex session, `agent-session` probes
-  `codex app-server --help` under a 250 ms process-group bound. A CLI that
-  advertises Unix `--listen` support is launched as a remote TUI over a private
-  short socket below `XDG_RUNTIME_DIR/agent-session`; otherwise auto mode
+  For a fresh serve-managed Codex session, `agent-session` probes bounded
+  `codex --version` and `codex app-server --help` process groups. The audited
+  floor is Codex `0.144.1`, and help must advertise Unix `--listen` support. A
+  matching CLI is launched as a remote TUI over a private short socket below an
+  owned, non-symlinked mode-`0700` `XDG_RUNTIME_DIR`; otherwise auto mode
   degrades to the existing raw TUI. `AGENT_SESSION_CODEX_RUNTIME=raw` forces
   the fallback and `AGENT_SESSION_CODEX_RUNTIME=app-server` requires both the
   same capability probe and a private Unix socket. Standalone `agent-session
   start` remains raw because no serve daemon owns its control connection.
-  For a new app-server process, the control client starts one thread and runs
-  the shell builtin `:` through `thread/shellCommand` to establish its rollout
-  without model quota, output, filesystem writes, or network access. It passes
-  the raw thread id through a mode-`0600` ephemeral handoff file; the TUI
-  consumes and removes that file before creating a private attached marker.
-  Daemon restart reconnects to the one loaded thread, while delete and launch
-  failure remove the derived socket, handoff, and marker paths.
+  The remote TUI connects through a private mode-`0600` WebSocket bridge to the
+  private app-server socket. The bridge forwards frames unchanged, observes the
+  exact TUI connection's structured lifecycle metadata through bounded
+  background projection, and discards message content after in-memory
+  reduction. Projection loss disables an existing claim without interrupting
+  the TUI transport. Direct TUI thread/turn creation is launch-fenced against
+  auto-resume before forwarding; a busy state lock rejects only that request so
+  the user can retry. The visible TUI creates the fresh thread;
+  neither the bridge nor the control client synthesizes a shell or model turn.
+  A separate daemon control connection reads usage and submits a continuation
+  on that bound thread. Only a mode-`0600` SHA-256 thread binding is persisted,
+  so reconnects fail closed on a mismatch and raw thread ids are never stored.
+  The bridge remains with the tmux runtime across daemon restarts. Runtime paths
+  are namespaced by state and launch identity; delete and launch failure
+  validate and remove the app-server socket, bridge socket, and marker paths.
 - Attachment upload uses a raw binary request body (not multipart), capped at 25 MiB. The daemon writes the file under the
   session's private `attachments/` directory with a sanitized filename and returns the remote path in the serve envelope.
   Empty or null titles clear the custom session title so clients can fall back to the session id.

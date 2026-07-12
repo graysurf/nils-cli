@@ -39,8 +39,9 @@ canary.
    closed.
 4. The existing auto-resume v1 client projection is sufficient unless tests
    prove a new client-visible state is required.
-5. Real quota acceptance may use the authorized `poies` account and at most one
-   separately justified idempotent reset credit.
+5. The initial real quota acceptance may use the authorized `poies` account.
+   The final-topology rerun and any future quota/reset validation use only the
+   authorized `sym` account, never `gamania`, with each reset credit recorded.
 
 ## Sprint 1: Prove the app-server runtime boundary
 

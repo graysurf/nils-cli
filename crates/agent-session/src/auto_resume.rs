@@ -1,5 +1,6 @@
 use std::fs;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use jiff::Timestamp;
 use nils_common::fs::{SECRET_FILE_MODE, write_atomic};
@@ -8,14 +9,16 @@ use serde_json::json;
 use sha2::{Digest, Sha256};
 
 use crate::{
-    CliContext, CliError, SessionRecord, acquire_session_record_lock, load_session_record,
-    session_dir,
+    CliContext, CliError, SessionRecord, acquire_session_record_lock,
+    acquire_session_record_lock_timed, load_session_record, session_dir,
+    try_acquire_session_record_lock,
 };
 
 const AUTO_RESUME_SCHEMA_VERSION: &str = "agent-session.auto-resume.v1";
 const AUTO_RESUME_FILE: &str = "auto-resume.json";
 const MAX_TRANSIENT_ATTEMPTS: u32 = 5;
 const RETRY_DELAYS_SECONDS: [i64; 5] = [30, 60, 120, 300, 600];
+const PROTOCOL_STATE_LOCK_TIMEOUT: Duration = Duration::from_secs(1);
 
 pub(crate) const CONTINUATION_MESSAGE: &str = "Continue the interrupted task from where you stopped. First inspect the current session and repository state, then continue toward the existing objective. Do not repeat completed work.";
 
@@ -162,6 +165,11 @@ fn view(record: &SessionRecord, state: DurableAutoResume) -> AutoResumeView {
     }
 }
 
+fn projection_unavailable(state: &DurableAutoResume) -> bool {
+    state.state == "terminal_failure"
+        && state.failure_reason.as_deref() == Some("state_unavailable")
+}
+
 pub(crate) fn view_for_record(context: &CliContext, record: &SessionRecord) -> AutoResumeView {
     let now = Timestamp::now().to_string();
     match read_state(context, &record.id, &now) {
@@ -196,6 +204,16 @@ pub(crate) fn set_enabled(
         ));
     }
     let mut state = read_state(context, &record.id, now)?;
+    if projection_unavailable(&state) {
+        if enabled {
+            return Err(CliError::data(
+                "auto-resume-state-unavailable",
+                "auto-resume projection is unavailable until this session runtime is restarted",
+                Some(json!({ "id": record.id })),
+            ));
+        }
+        return Ok(view(&record, state));
+    }
     state.enabled = enabled;
     state.state = if enabled { "enabled" } else { "disabled" }.to_string();
     state.updated_at = now.to_string();
@@ -221,6 +239,9 @@ pub(crate) fn cancel(
     let record = load_session_record(context, &canonical_id)?;
     crate::ensure_same_session_identity(&observed, &record)?;
     let mut state = read_state(context, &record.id, now)?;
+    if projection_unavailable(&state) {
+        return Ok(view(&record, state));
+    }
     if state.state == "resumed" {
         return Err(CliError::data(
             "auto-resume-already-submitted",
@@ -264,6 +285,59 @@ pub(crate) fn cancel_for_manual_input_locked(
     write_state(context, id, &state)
 }
 
+pub(crate) fn try_cancel_for_manual_input_for_runtime(
+    context: &CliContext,
+    id: &str,
+    expected_launch_id: &str,
+    now: &str,
+) -> Result<bool, CliError> {
+    let observed = load_session_record(context, id)?;
+    let canonical_id = observed.id.clone();
+    let Some(_lock) = try_acquire_session_record_lock(context, &canonical_id)? else {
+        return Ok(false);
+    };
+    let record = load_session_record(context, &canonical_id)?;
+    crate::ensure_same_session_identity(&observed, &record)?;
+    if !runtime_matches(&record, Some(expected_launch_id)) {
+        return Ok(false);
+    }
+    cancel_for_manual_input_locked(context, &record.id, now)?;
+    Ok(true)
+}
+
+pub(crate) fn fail_closed_projection_for_runtime(
+    context: &CliContext,
+    id: &str,
+    expected_launch_id: &str,
+    now: &str,
+) -> Result<(), CliError> {
+    let observed = load_session_record(context, id)?;
+    let canonical_id = observed.id.clone();
+    let _lock =
+        acquire_session_record_lock_timed(context, &canonical_id, PROTOCOL_STATE_LOCK_TIMEOUT)?;
+    let record = load_session_record(context, &canonical_id)?;
+    crate::ensure_same_session_identity(&observed, &record)?;
+    if !runtime_matches(&record, Some(expected_launch_id)) {
+        return Ok(());
+    }
+    let mut state = read_state(context, &record.id, now)?;
+    if !state.enabled
+        || !matches!(
+            state.state.as_str(),
+            "enabled" | "armed" | "scheduled" | "checking" | "transient_failure"
+        )
+    {
+        return Ok(());
+    }
+    state.enabled = false;
+    state.state = "terminal_failure".to_string();
+    state.updated_at = now.to_string();
+    state.scheduled_at = None;
+    state.next_check_at = None;
+    state.failure_reason = Some("state_unavailable".to_string());
+    write_state(context, &record.id, &state)
+}
+
 pub(crate) fn arm_usage_exhaustion(
     context: &CliContext,
     id: &str,
@@ -273,7 +347,8 @@ pub(crate) fn arm_usage_exhaustion(
 ) -> Result<bool, CliError> {
     let observed = load_session_record(context, id)?;
     let canonical_id = observed.id.clone();
-    let _lock = acquire_session_record_lock(context, &canonical_id)?;
+    let _lock =
+        acquire_session_record_lock_timed(context, &canonical_id, PROTOCOL_STATE_LOCK_TIMEOUT)?;
     let record = load_session_record(context, &canonical_id)?;
     crate::ensure_same_session_identity(&observed, &record)?;
     if !supported(&record) {
@@ -381,12 +456,36 @@ pub(crate) fn record_scheduler_error(
     now_epoch: i64,
     reason: &str,
 ) -> Result<TickOutcome, CliError> {
+    record_scheduler_error_inner(context, id, None, now_epoch, reason)
+}
+
+pub(crate) fn record_scheduler_error_for_runtime(
+    context: &CliContext,
+    id: &str,
+    expected_launch_id: &str,
+    now_epoch: i64,
+    reason: &str,
+) -> Result<TickOutcome, CliError> {
+    record_scheduler_error_inner(context, id, Some(expected_launch_id), now_epoch, reason)
+}
+
+fn record_scheduler_error_inner(
+    context: &CliContext,
+    id: &str,
+    expected_launch_id: Option<&str>,
+    now_epoch: i64,
+    reason: &str,
+) -> Result<TickOutcome, CliError> {
     let now = epoch_string(now_epoch)?;
     let observed = load_session_record(context, id)?;
     let canonical_id = observed.id.clone();
-    let _lock = acquire_session_record_lock(context, &canonical_id)?;
+    let _lock =
+        acquire_session_record_lock_timed(context, &canonical_id, PROTOCOL_STATE_LOCK_TIMEOUT)?;
     let record = load_session_record(context, &canonical_id)?;
     crate::ensure_same_session_identity(&observed, &record)?;
+    if !runtime_matches(&record, expected_launch_id) {
+        return Ok(TickOutcome::Unchanged);
+    }
     let state = read_state(context, &record.id, &now)?;
     if !state.enabled
         || !matches!(
@@ -403,17 +502,40 @@ pub(crate) fn record_scheduler_error(
 /// usage is available before the previously advertised reset epoch. This is
 /// intentionally narrower than arming: reconnects and rate-limit updates may
 /// wake an existing claim, but can never create one or revive a cancellation.
+#[cfg(test)]
 pub(crate) fn wake_scheduled_if_usage_open(
     context: &CliContext,
     id: &str,
     now_epoch: i64,
 ) -> Result<bool, CliError> {
+    wake_scheduled_if_usage_open_inner(context, id, None, now_epoch)
+}
+
+pub(crate) fn wake_scheduled_if_usage_open_for_runtime(
+    context: &CliContext,
+    id: &str,
+    expected_launch_id: &str,
+    now_epoch: i64,
+) -> Result<bool, CliError> {
+    wake_scheduled_if_usage_open_inner(context, id, Some(expected_launch_id), now_epoch)
+}
+
+fn wake_scheduled_if_usage_open_inner(
+    context: &CliContext,
+    id: &str,
+    expected_launch_id: Option<&str>,
+    now_epoch: i64,
+) -> Result<bool, CliError> {
     let now = epoch_string(now_epoch)?;
     let observed = load_session_record(context, id)?;
     let canonical_id = observed.id.clone();
-    let _lock = acquire_session_record_lock(context, &canonical_id)?;
+    let _lock =
+        acquire_session_record_lock_timed(context, &canonical_id, PROTOCOL_STATE_LOCK_TIMEOUT)?;
     let record = load_session_record(context, &canonical_id)?;
     crate::ensure_same_session_identity(&observed, &record)?;
+    if !runtime_matches(&record, expected_launch_id) {
+        return Ok(false);
+    }
     let mut state = read_state(context, &record.id, &now)?;
     if !state.enabled || state.state != "scheduled" || !state.ever_scheduled {
         return Ok(false);
@@ -437,6 +559,41 @@ pub(crate) fn tick<F>(
     id: &str,
     now_epoch: i64,
     usage: &UsageSnapshot,
+    submit: F,
+) -> Result<TickOutcome, CliError>
+where
+    F: FnMut(&SessionRecord) -> Result<(), CliError>,
+{
+    tick_inner(context, id, None, now_epoch, usage, submit)
+}
+
+pub(crate) fn tick_for_runtime<F>(
+    context: &CliContext,
+    id: &str,
+    expected_launch_id: &str,
+    now_epoch: i64,
+    usage: &UsageSnapshot,
+    submit: F,
+) -> Result<TickOutcome, CliError>
+where
+    F: FnMut(&SessionRecord) -> Result<(), CliError>,
+{
+    tick_inner(
+        context,
+        id,
+        Some(expected_launch_id),
+        now_epoch,
+        usage,
+        submit,
+    )
+}
+
+fn tick_inner<F>(
+    context: &CliContext,
+    id: &str,
+    expected_launch_id: Option<&str>,
+    now_epoch: i64,
+    usage: &UsageSnapshot,
     mut submit: F,
 ) -> Result<TickOutcome, CliError>
 where
@@ -448,6 +605,9 @@ where
     let _lock = acquire_session_record_lock(context, &canonical_id)?;
     let record = load_session_record(context, &canonical_id)?;
     crate::ensure_same_session_identity(&observed, &record)?;
+    if !runtime_matches(&record, expected_launch_id) {
+        return Ok(TickOutcome::Unchanged);
+    }
     let mut state = read_state(context, &record.id, &now)?;
     if !supported(&record) {
         state.enabled = false;
@@ -574,6 +734,15 @@ where
             Ok(TickOutcome::TerminalFailure)
         }
     }
+}
+
+fn runtime_matches(record: &SessionRecord, expected_launch_id: Option<&str>) -> bool {
+    expected_launch_id.is_none_or(|expected| {
+        record
+            .runtime
+            .as_ref()
+            .is_some_and(|runtime| runtime.launch_id == expected)
+    })
 }
 
 fn record_retry(
@@ -822,6 +991,76 @@ mod tests {
         let cancelled = read_state(&context, &record.id, "ignored").unwrap();
         assert_eq!(cancelled.state, "cancelled");
         assert!(!cancelled.enabled);
+    }
+
+    #[test]
+    fn stale_runtime_cannot_wake_or_submit_for_a_same_id_replacement() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (context, record) = seed_session(&tmp);
+        set_enabled(&context, &record.id, true, "2030-01-01T00:00:00Z").unwrap();
+        let revision = waiting_revision(&context, &record);
+        arm_usage_exhaustion(
+            &context,
+            &record.id,
+            "turn-1".to_string(),
+            revision,
+            "2030-01-01T00:00:01Z",
+        )
+        .unwrap();
+        let base = 1_893_456_000;
+        assert_eq!(
+            tick(
+                &context,
+                &record.id,
+                base,
+                &UsageSnapshot {
+                    authoritative: true,
+                    has_exhausted_windows: true,
+                    exhausted_reset_epochs: vec![base + 900],
+                },
+                |_| panic!("must not submit while exhausted"),
+            )
+            .unwrap(),
+            TickOutcome::Scheduled
+        );
+        let scheduled_before = read_state(&context, &record.id, "ignored")
+            .unwrap()
+            .scheduled_at;
+        let mut replacement = record.clone();
+        replacement.runtime.as_mut().unwrap().launch_id = "runtime-2".to_string();
+        crate::write_session_record(&context, &replacement).unwrap();
+
+        assert!(
+            !wake_scheduled_if_usage_open_for_runtime(&context, &record.id, "runtime-1", base + 1,)
+                .unwrap()
+        );
+        let mut submissions = 0;
+        assert_eq!(
+            tick_for_runtime(
+                &context,
+                &record.id,
+                "runtime-1",
+                base + 901,
+                &UsageSnapshot {
+                    authoritative: true,
+                    has_exhausted_windows: false,
+                    exhausted_reset_epochs: Vec::new(),
+                },
+                |_| {
+                    submissions += 1;
+                    Ok(())
+                },
+            )
+            .unwrap(),
+            TickOutcome::Unchanged
+        );
+        assert_eq!(submissions, 0);
+        assert_eq!(
+            read_state(&context, &record.id, "ignored")
+                .unwrap()
+                .scheduled_at,
+            scheduled_before
+        );
     }
 
     #[test]
@@ -1193,6 +1432,10 @@ mod tests {
             json!("/run/user/1000/agent-session/codex-test.sock"),
         );
         runtime.extra.insert(
+            "codex_app_server_proxy".to_string(),
+            json!("/run/user/1000/agent-session/codex-test.proxy"),
+        );
+        runtime.extra.insert(
             "codex_app_server_thread_handoff".to_string(),
             json!("/run/user/1000/agent-session/codex-test.thread"),
         );
@@ -1207,5 +1450,52 @@ mod tests {
         assert!(view.supported);
         assert!(view.enabled);
         assert_eq!(view.state, "enabled");
+    }
+
+    #[test]
+    fn projection_loss_disables_enabled_runtime_and_blocks_reenable() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (context, mut record) = seed_session(&tmp);
+        record.agent = "codex".to_string();
+        let runtime = record.runtime.as_mut().unwrap();
+        runtime.kind = "codex_app_server".to_string();
+        runtime
+            .extra
+            .insert("codex_app_server_protocol".to_string(), json!("v2"));
+        for (key, suffix) in [
+            ("codex_app_server_socket", "sock"),
+            ("codex_app_server_proxy", "proxy"),
+            ("codex_app_server_thread_handoff", "thread"),
+            ("codex_app_server_thread_attached", "attached"),
+        ] {
+            runtime.extra.insert(
+                key.to_string(),
+                json!(format!("/run/user/1000/agent-session/codex-test.{suffix}")),
+            );
+        }
+        crate::write_session_record(&context, &record).unwrap();
+        set_enabled(&context, &record.id, true, "2030-01-01T00:00:00Z").unwrap();
+
+        fail_closed_projection_for_runtime(
+            &context,
+            &record.id,
+            "runtime-1",
+            "2030-01-01T00:00:01Z",
+        )
+        .unwrap();
+        let view = view_for_record(&context, &record);
+        assert!(!view.enabled);
+        assert_eq!(view.state, "terminal_failure");
+        assert_eq!(view.failure_reason.as_deref(), Some("state_unavailable"));
+        let error = set_enabled(&context, &record.id, true, "2030-01-01T00:00:02Z").unwrap_err();
+        assert_eq!(error.code(), "auto-resume-state-unavailable");
+        let disabled = set_enabled(&context, &record.id, false, "2030-01-01T00:00:03Z").unwrap();
+        assert!(!disabled.enabled);
+        let error = set_enabled(&context, &record.id, true, "2030-01-01T00:00:04Z").unwrap_err();
+        assert_eq!(error.code(), "auto-resume-state-unavailable");
+        let cancelled = cancel(&context, &record.id, "2030-01-01T00:00:05Z").unwrap();
+        assert!(!cancelled.enabled);
+        let error = set_enabled(&context, &record.id, true, "2030-01-01T00:00:06Z").unwrap_err();
+        assert_eq!(error.code(), "auto-resume-state-unavailable");
     }
 }

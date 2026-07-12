@@ -132,6 +132,7 @@ fn dispatch(cli: Cli) -> i32 {
         Command::Resume(args) => run_resume(&context, args),
         Command::Activity(args) => run_activity(&context, args),
         Command::Serve(args) => serve::run_serve(&context, args),
+        Command::CodexAppServerProxy(args) => codex_app_server::run_proxy(&context, args),
         Command::Delete(args) => run_delete(&context, args),
         Command::Completion(_) => unreachable!("completion is handled before context resolution"),
     }
@@ -155,7 +156,10 @@ fn command_format(command: &Command) -> OutputFormat {
             cli::ActivityCommand::Setup(args) => args.format,
         },
         Command::Delete(args) => args.format,
-        Command::Attach(_) | Command::Serve(_) | Command::Completion(_) => OutputFormat::Text,
+        Command::Attach(_)
+        | Command::Serve(_)
+        | Command::CodexAppServerProxy(_)
+        | Command::Completion(_) => OutputFormat::Text,
     }
 }
 
@@ -739,7 +743,7 @@ fn start_session(context: &CliContext, args: cli::StartArgs) -> Result<StartView
         &mut created.record,
         args.app_server_managed,
     ) {
-        cleanup_created_record(&created);
+        cleanup_created_record(context, &created);
         return Err(err);
     }
 
@@ -752,7 +756,7 @@ fn start_session(context: &CliContext, args: cli::StartArgs) -> Result<StartView
         &provider_plan.launch_args,
         &args.agent_args,
     ) {
-        cleanup_created_record(&created);
+        cleanup_created_record(context, &created);
         return Err(err);
     }
     if created.prompt_file.is_some() {
@@ -761,7 +765,7 @@ fn start_session(context: &CliContext, args: cli::StartArgs) -> Result<StartView
         }
         if let Err(err) = paste_prompt(&tmux_bin, &created.record) {
             let _ = kill_tmux_session(&tmux_bin, &created.record.tmux_session);
-            cleanup_created_record(&created);
+            cleanup_created_record(context, &created);
             return Err(err);
         }
     }
@@ -828,7 +832,7 @@ fn start_run_session(context: &CliContext, args: cli::RunArgs) -> Result<StartVi
         &created.record,
         &args.agent_args,
     ) {
-        cleanup_created_record(&created);
+        cleanup_created_record(context, &created);
         return Err(err);
     }
 
@@ -897,7 +901,7 @@ pub(crate) fn start_provider_resume_session(
         &created.record,
         &provider_resume.resume_args,
     ) {
-        cleanup_created_record(&created);
+        cleanup_created_record(context, &created);
         return Err(err);
     }
 
@@ -1008,8 +1012,8 @@ fn create_record(request: RecordRequest<'_>) -> Result<CreatedRecord, CliError> 
     })
 }
 
-fn cleanup_created_record(created: &CreatedRecord) {
-    let _ = codex_app_server::cleanup_runtime_files(&created.record);
+fn cleanup_created_record(context: &CliContext, created: &CreatedRecord) {
+    let _ = codex_app_server::cleanup_runtime_files(context, &created.record);
     let _ = fs::remove_dir_all(&created.session_dir);
 }
 
@@ -1327,6 +1331,13 @@ fn start_interactive_tmux(
                 Some(json!({ "id": record.id })),
             )
         })?;
+        let proxy = codex_app_server::proxy_path(record).ok_or_else(|| {
+            CliError::data(
+                "codex-app-server-proxy-missing",
+                "Codex app-server runtime is missing its private TUI proxy",
+                Some(json!({ "id": record.id })),
+            )
+        })?;
         let handoff = codex_app_server::thread_handoff_path(record).ok_or_else(|| {
             CliError::data(
                 "codex-app-server-handoff-missing",
@@ -1341,14 +1352,25 @@ fn start_interactive_tmux(
                 Some(json!({ "id": record.id })),
             )
         })?;
+        let proxy_bin = env::current_exe().map_err(|err| {
+            CliError::runtime(
+                "codex-app-server-proxy-binary-unavailable",
+                format!("failed to resolve the agent-session proxy binary: {err}"),
+                Some(json!({ "id": record.id })),
+            )
+        })?;
         command
             .arg("sh")
             .arg("-c")
             .arg(codex_app_server::launch_script())
             .arg("agent-session-codex-app-server")
             .arg(socket)
+            .arg(proxy)
             .arg(handoff)
             .arg(attached)
+            .arg(proxy_bin)
+            .arg(state_dir)
+            .arg(&record.id)
             .arg(agent_bin)
             .arg(&record.cwd)
             .args(agent_args);
@@ -2843,7 +2865,8 @@ fn validate_record_id(
     Ok(())
 }
 
-struct SessionRecordLock(fs::File);
+#[derive(Debug)]
+pub(crate) struct SessionRecordLock(fs::File);
 
 impl Drop for SessionRecordLock {
     fn drop(&mut self) {
@@ -2858,6 +2881,51 @@ fn acquire_session_record_lock(
     context: &CliContext,
     id: &str,
 ) -> Result<SessionRecordLock, CliError> {
+    acquire_session_record_lock_with_mode(context, id, SessionRecordLockMode::Blocking)?.ok_or_else(
+        || {
+            CliError::runtime(
+                "session-record-lock-busy",
+                "session record is busy",
+                Some(json!({ "id": id })),
+            )
+        },
+    )
+}
+
+pub(crate) fn try_acquire_session_record_lock(
+    context: &CliContext,
+    id: &str,
+) -> Result<Option<SessionRecordLock>, CliError> {
+    acquire_session_record_lock_with_mode(context, id, SessionRecordLockMode::NonBlocking)
+}
+
+pub(crate) fn acquire_session_record_lock_timed(
+    context: &CliContext,
+    id: &str,
+    timeout: Duration,
+) -> Result<SessionRecordLock, CliError> {
+    acquire_session_record_lock_with_mode(context, id, SessionRecordLockMode::Timed(timeout))?
+        .ok_or_else(|| {
+            CliError::runtime(
+                "session-record-lock-timeout",
+                "timed out waiting for the session record lock",
+                Some(json!({ "id": id })),
+            )
+        })
+}
+
+#[derive(Clone, Copy)]
+enum SessionRecordLockMode {
+    Blocking,
+    NonBlocking,
+    Timed(Duration),
+}
+
+fn acquire_session_record_lock_with_mode(
+    context: &CliContext,
+    id: &str,
+    mode: SessionRecordLockMode,
+) -> Result<Option<SessionRecordLock>, CliError> {
     validate_id(id)?;
     let lock_dir = context.state_dir.join(SESSION_LOCKS_DIR);
     ensure_private_dir(&lock_dir)?;
@@ -2871,15 +2939,39 @@ fn acquire_session_record_lock(
         .map_err(|err| session_io_error("session-record-lock-open-failed", &path, err))?;
     fs::set_permissions(&path, fs::Permissions::from_mode(SECRET_FILE_MODE))
         .map_err(|err| session_io_error("session-record-lock-permission-failed", &path, err))?;
-    // SAFETY: `flock` only observes the valid descriptor owned by `file`.
-    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
-        return Err(session_io_error(
-            "session-record-lock-failed",
-            &path,
-            io::Error::last_os_error(),
-        ));
+    if matches!(mode, SessionRecordLockMode::Blocking) {
+        // SAFETY: `flock` only observes the valid descriptor owned by `file`.
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
+            return Err(session_io_error(
+                "session-record-lock-failed",
+                &path,
+                io::Error::last_os_error(),
+            ));
+        }
+        return Ok(Some(SessionRecordLock(file)));
     }
-    Ok(SessionRecordLock(file))
+    let deadline = match mode {
+        SessionRecordLockMode::Timed(timeout) => Some(Instant::now() + timeout),
+        SessionRecordLockMode::NonBlocking => None,
+        SessionRecordLockMode::Blocking => unreachable!("blocking mode returned above"),
+    };
+    loop {
+        // SAFETY: `flock` only observes the valid descriptor owned by `file`.
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+            return Ok(Some(SessionRecordLock(file)));
+        }
+        let err = io::Error::last_os_error();
+        if err.kind() != io::ErrorKind::WouldBlock {
+            return Err(session_io_error("session-record-lock-failed", &path, err));
+        }
+        let Some(deadline) = deadline else {
+            return Ok(None);
+        };
+        if Instant::now() >= deadline {
+            return Ok(None);
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
 }
 
 fn session_io_error(code: &str, path: &Path, err: io::Error) -> CliError {
@@ -3265,7 +3357,7 @@ fn delete_session(
     validate_record_id(&record, &resolved.expected_id, &resolved.record_path)?;
     let session_dir = resolved.session_dir;
     let killed = kill_tmux_session(&tmux_bin, &record.tmux_session);
-    codex_app_server::cleanup_runtime_files(&record)?;
+    codex_app_server::cleanup_runtime_files(context, &record)?;
     fs::remove_dir_all(&session_dir).map_err(|err| {
         CliError::runtime(
             "session-delete-failed",
@@ -4182,9 +4274,10 @@ fn tail_lines(text: &str, tail: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        AgentKind, CliContext, RecordRequest, acquire_session_record_lock, create_record,
-        kill_tmux_session_with_timeout, live_status_with_timeout, resolve_session_id, session_dir,
-        strip_trailing_blank_lines,
+        AgentKind, CliContext, RecordRequest, acquire_session_record_lock,
+        acquire_session_record_lock_timed, create_record, kill_tmux_session_with_timeout,
+        live_status_with_timeout, resolve_session_id, session_dir, strip_trailing_blank_lines,
+        try_acquire_session_record_lock,
     };
     use pretty_assertions::assert_eq;
     use std::fs;
@@ -4192,7 +4285,7 @@ mod tests {
     use std::path::Path;
     use std::sync::mpsc;
     use std::thread;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     fn test_context(state_dir: &Path) -> CliContext {
         CliContext {
@@ -4309,6 +4402,26 @@ mod tests {
         drop(first);
         rx.recv_timeout(Duration::from_secs(1)).unwrap();
         waiter.join().unwrap();
+    }
+
+    #[test]
+    fn session_record_try_and_timed_locks_never_wait_indefinitely() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let context = test_context(tmp.path());
+        let held = acquire_session_record_lock(&context, "bounded-lock").unwrap();
+
+        assert!(
+            try_acquire_session_record_lock(&context, "bounded-lock")
+                .unwrap()
+                .is_none()
+        );
+        let started = Instant::now();
+        let error =
+            acquire_session_record_lock_timed(&context, "bounded-lock", Duration::from_millis(50))
+                .expect_err("timed lock should fail while held");
+        assert_eq!(error.code(), "session-record-lock-timeout");
+        assert!(started.elapsed() < Duration::from_secs(1));
+        drop(held);
     }
 
     #[test]

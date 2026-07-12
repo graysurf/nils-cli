@@ -47,10 +47,11 @@ documented structured `StopFailure.error` is reduced into that allowlist. Raw
 error details, rendered provider errors, transcript paths, prompts, and
 assistant content are discarded. A raw Codex interactive notification does not
 carry an equivalent structured failure field. An agent-session-managed Codex
-app-server v2 runtime may instead emit `source_kind: "provider_protocol"` only
-after its live bound thread/turn reports terminal `failed` plus exact
-`usageLimitExceeded`; that metadata-only projection can authoritatively arm
-usage-reset auto-resume.
+app-server v2 runtime reuses the stable v1 `source_kind: "provider_hook"` wire
+value only after its live bound thread/turn reports terminal `failed` plus exact
+`usageLimitExceeded`. Within v1, `provider_hook` denotes authoritative
+provider-structured evidence from either a hook or the bound protocol; that
+metadata-only projection can authoritatively arm usage-reset auto-resume.
 
 Provider hooks and direct `activity event` callers may supply bounded raw opaque
 session or turn identifiers. Ingestion projects them to runtime-scoped SHA-256

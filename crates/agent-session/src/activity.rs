@@ -73,7 +73,6 @@ pub(crate) enum Confidence {
 pub(crate) enum SourceKind {
     #[default]
     ProviderHook,
-    ProviderProtocol,
     ConsoleObservation,
     TerminalHeuristic,
     Runtime,
@@ -289,7 +288,7 @@ pub(crate) fn ingest_codex_app_server_failure(
         projected_provider_identifier(runtime_id, AgentKind::Codex, "session", thread_id)?;
     let provider_turn_id =
         projected_provider_identifier(runtime_id, AgentKind::Codex, "turn", turn_id)?;
-    ingest_event(
+    ingest_event_retry(
         context,
         id,
         TurnEvent {
@@ -305,7 +304,9 @@ pub(crate) fn ingest_codex_app_server_failure(
             attention_kind: None,
             attention_correlation_ambiguous: false,
             confidence: Confidence::Authoritative,
-            source_kind: SourceKind::ProviderProtocol,
+            // `provider_hook` is the stable v1 wire value for authoritative,
+            // provider-structured evidence, including the app-server protocol.
+            source_kind: SourceKind::ProviderHook,
             provider_time: None,
         },
     )
@@ -757,10 +758,7 @@ fn semantic_event_is_duplicate(
     key: &str,
     received_at: &str,
 ) -> bool {
-    if !matches!(
-        event.source_kind,
-        SourceKind::ProviderHook | SourceKind::ProviderProtocol
-    ) {
+    if !matches!(event.source_kind, SourceKind::ProviderHook) {
         return false;
     }
     if event.provider == AgentKind::Hermes.as_str()
@@ -1302,10 +1300,7 @@ fn ingest_event_with_lock(
     }
     reduce(&mut document, &event, &received_at);
     document.last_event_at = Some(received_at.clone());
-    if matches!(
-        event.source_kind,
-        SourceKind::ProviderHook | SourceKind::ProviderProtocol
-    ) {
+    if matches!(event.source_kind, SourceKind::ProviderHook) {
         document.last_semantic_event = Some(semantic_key);
         document.last_semantic_event_at = Some(received_at.clone());
     }
@@ -1349,10 +1344,7 @@ fn arm_auto_resume_from_event(
     if event.kind != TurnEventKind::TurnFailed
         || event.failure_reason.as_deref() != Some("usage_exhausted")
         || event.confidence != Confidence::Authoritative
-        || !matches!(
-            event.source_kind,
-            SourceKind::ProviderHook | SourceKind::ProviderProtocol
-        )
+        || !matches!(event.source_kind, SourceKind::ProviderHook)
     {
         return Ok(());
     }

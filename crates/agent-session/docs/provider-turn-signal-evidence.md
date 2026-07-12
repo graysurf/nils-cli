@@ -79,10 +79,18 @@ turn. Duplicate completion is idempotent.
 approval. Multiple approval requests therefore use agent-session-owned opaque
 attention ids and remain latched. Unrelated progress never clears them.
 
-For fresh agent-session-managed sessions, a bounded capability probe may launch
-`codex app-server` and connect the visible TUI through its private Unix socket.
-The daemon holds a second control connection, binds only when the per-session
-server exposes exactly one loaded thread, and consumes the live stream. A
+For fresh agent-session-managed sessions, bounded version/help probes require
+the audited Codex 0.144.1 floor plus explicit Unix-listen support before
+launching `codex app-server` and connecting the visible TUI through a private
+metadata-projecting Unix WebSocket bridge. The bridge observes the exact TUI
+connection and forwards its frames unchanged; bounded background projection
+retains no message content, and any projection gap launch-fences and disables
+an existing claim without closing the TUI. Direct TUI thread/turn creation is
+serialized against manual-input cancellation before it reaches app-server.
+The visible TUI creates the thread without a synthetic shell or model turn.
+The daemon holds a second control connection for usage reads and continuation
+submission. Both paths require the same bound thread, persist only a private
+SHA-256 binding, and fail closed on mismatch. A
 matching non-retrying `error` notification followed by `turn/completed`, or a
 terminal failed Turn carrying the same structured error, maps
 `usageLimitExceeded` to `usage_exhausted`. Wrong threads, wrong turns,

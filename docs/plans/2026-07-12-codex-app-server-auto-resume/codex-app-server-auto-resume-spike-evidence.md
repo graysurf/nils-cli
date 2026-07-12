@@ -53,9 +53,16 @@ No reset credit was consumed during the spike capture.
 The app-server listened on a private short Unix socket. A real Codex TUI
 connected through `--remote unix://...`, and a second control client initialized,
 listed exactly one loaded thread, resumed that thread, and started a turn. The
-TUI rendered the control client's prompt and the quota failure, proving that a
-separate metadata-only control connection can observe and submit on the same
-thread without a transparent protocol bridge.
+TUI rendered the control client's prompt and quota failure, proving that a
+separate control connection can submit a turn on the TUI's thread and observe
+the turn that it owns.
+
+A later passive-control smoke corrected the remaining topology assumption: the
+second connection did not receive a turn initiated by the TUI connection.
+Therefore the production runtime uses a transparent private WebSocket bridge to
+project structured lifecycle metadata from the exact TUI connection, while the
+second connection remains responsible for usage reads and continuation
+submission.
 
 The live sequence was:
 
@@ -79,7 +86,8 @@ the control monitor was disconnected.
   imported sessions, and legacy resumes remain fail-closed.
 - Failure reduction requires one exact bound thread/turn and terminal failed
   structured quota evidence. Human text classification is forbidden.
-- Rate-limit reads and continuation submission use the same live connection.
+- TUI lifecycle reduction uses the exact bridged TUI connection; rate-limit
+  reads and continuation submission use one separate bound control connection.
 - Submission is successful only after `turn/start` acknowledges a turn id.
 - Any crash, timeout, or disconnect after the durable submission claim is an
   unknown outcome and is never retried automatically.
