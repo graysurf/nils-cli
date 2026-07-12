@@ -56,6 +56,137 @@ fn tracking_run_update_init_writes_run_state_and_events() {
 }
 
 #[test]
+fn tracking_run_init_dry_run_preserves_existing_state() {
+    let tmp = TempDir::new().expect("tmp");
+    let run_state_path = tmp.path().join("run-state.json");
+    let events_path = tmp.path().join("events.jsonl");
+
+    let init = common::run_plan_issue(&[
+        "--format",
+        "json",
+        "tracking",
+        "run",
+        "init",
+        "--provider-repo",
+        "owner/repo",
+        "--issue",
+        "123",
+        "--now",
+        "2026-05-26T00:00:00Z",
+        "--run-id",
+        "existing-run",
+        "--out",
+        run_state_path.to_str().expect("path"),
+    ]);
+    assert_eq!(init.code, 0, "init stderr: {}", init.stderr_text());
+
+    let update = common::run_plan_issue(&[
+        "--format",
+        "json",
+        "tracking",
+        "run",
+        "update",
+        "--run-state",
+        run_state_path.to_str().expect("path"),
+        "--phase",
+        "reviewing",
+        "--validation-overall",
+        "pass",
+        "--note",
+        "retained accumulated state",
+        "--now",
+        "2026-05-26T00:01:00Z",
+    ]);
+    assert_eq!(update.code, 0, "update stderr: {}", update.stderr_text());
+
+    let state_before = fs::read(&run_state_path).expect("state before");
+    let events_before = fs::read(&events_path).expect("events before");
+    let preview = common::run_plan_issue(&[
+        "--format",
+        "json",
+        "--dry-run",
+        "tracking",
+        "run",
+        "init",
+        "--provider-repo",
+        "owner/repo",
+        "--issue",
+        "123",
+        "--now",
+        "2026-05-26T00:02:00Z",
+        "--run-id",
+        "dry-preview",
+        "--out",
+        run_state_path.to_str().expect("path"),
+    ]);
+    assert_eq!(preview.code, 0, "preview stderr: {}", preview.stderr_text());
+
+    let envelope = preview.stdout_json();
+    assert_eq!(envelope["payload"]["dry_run"], true);
+    let result = &envelope["payload"]["result"];
+    assert_eq!(result["dry_run"], true);
+    assert_eq!(result["run_id"], "dry-preview");
+    assert_eq!(
+        result["run_state_path"],
+        run_state_path.to_str().expect("path")
+    );
+    assert_eq!(result["events_path"], events_path.to_str().expect("path"));
+    assert_eq!(
+        fs::read(&run_state_path).expect("state after"),
+        state_before,
+        "dry-run must not rewrite accumulated run state"
+    );
+    assert_eq!(
+        fs::read(&events_path).expect("events after"),
+        events_before,
+        "dry-run must not append run_started"
+    );
+}
+
+#[test]
+fn tracking_run_init_dry_run_does_not_create_missing_layout() {
+    let tmp = TempDir::new().expect("tmp");
+    let run_dir = tmp.path().join("missing-run");
+    let run_state_path = run_dir.join("run-state.json");
+    let events_path = run_dir.join("events.jsonl");
+
+    let preview = common::run_plan_issue(&[
+        "--format",
+        "json",
+        "--dry-run",
+        "tracking",
+        "run",
+        "init",
+        "--provider-repo",
+        "owner/repo",
+        "--issue",
+        "123",
+        "--now",
+        "2026-05-26T00:00:00Z",
+        "--run-id",
+        "missing-preview",
+        "--out",
+        run_state_path.to_str().expect("path"),
+    ]);
+    assert_eq!(preview.code, 0, "preview stderr: {}", preview.stderr_text());
+
+    let envelope = preview.stdout_json();
+    assert_eq!(envelope["payload"]["dry_run"], true);
+    let result = &envelope["payload"]["result"];
+    assert_eq!(result["dry_run"], true);
+    assert_eq!(result["run_id"], "missing-preview");
+    assert_eq!(
+        result["run_state_path"],
+        run_state_path.to_str().expect("path")
+    );
+    assert_eq!(result["events_path"], events_path.to_str().expect("path"));
+    assert!(
+        !run_dir.exists(),
+        "dry-run must not create its planned output directory"
+    );
+}
+
+#[test]
 fn tracking_run_init_defaults_now_to_wallclock_when_now_omitted() {
     // Regression (issue #588): omitting `--now` must not write the 1970 epoch
     // placeholder into live run-state. The safe default is the current UTC time,
