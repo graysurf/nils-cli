@@ -2,11 +2,12 @@
 
 ## Verdict
 
-Pass. Installed Codex 0.144.1 exposes enough content-free telemetry to bind a
-real rejected TUI attempt to one provider thread and turn when it is combined
-with an authoritative exhausted snapshot for that session's exact account.
-The production adapter must fail closed unless every predicate below is
-present.
+Blocked for the current Codex TUI runtime. Installed Codex 0.144.1 exposes
+enough content-free telemetry to bind a rejected attempt to one provider thread
+and turn, but it does not expose a quota-specific structured failure field.
+Combining a generic turn error with a simultaneously exhausted account cannot
+prove that quota caused the turn to fail. Codex auto-resume must therefore stay
+unsupported.
 
 ## Retained projection
 
@@ -44,19 +45,40 @@ account id, email, token, and auth payload were never retained.
   - `limit_reached=true`;
   - `rate_limit_reached_type=workspace_member_credits_depleted`;
   - five-hour usage `100%`; and
+  - reset epoch `1783875448`; and
   - reset credits unchanged at `2`.
 - The rejected non-interactive control probe exited `1`; the interactive TUI
   displayed the rejection and remained alive long enough to flush telemetry.
 
-The installed 0.144.1 source confirms that the content-free event kind is
-emitted alongside an error message for failed completed responses:
+The installed 0.144.1 source confirms that this event shape is emitted for a
+generic failed completed response, not specifically for usage exhaustion:
 <https://github.com/openai/codex/blob/rust-v0.144.1/codex-rs/otel/src/events/session_telemetry.rs>.
 The adapter does not persist or parse that message.
+
+### Structured-code control probe
+
+A second exhausted TUI attempt used an ingestion-only classifier that attempted
+to parse the complete `error.message` value as JSON and retained only JSON
+success plus allowlisted `error.type` and `error.code` values. It retained:
+
+- exact thread `019f567f-ad4b-7201-8fa2-431c160d32ba`;
+- exact turn `019f567f-c780-7c82-a0b2-dfd41129f052`;
+- `event.name=codex.sse_event`;
+- `event.kind=response.completed`;
+- `error_message_present=true`;
+- `error_message_json=false`;
+- `error.type=null`; and
+- `error.code=null`.
+
+The raw message was discarded at ingestion. This proves that installed Codex
+does not carry a quota discriminator inside a structured JSON error value that
+nils-cli could safely project.
 
 ## Correlation result
 
 A deterministic two-session model used the exhausted observation and two real
-provider thread ids known during the capture:
+provider thread ids known during the capture. Its proven scope is thread
+attribution only:
 
 - matching thread `019f565c-ab86-7d02-b818-3c227c60628a`: armed exactly once;
 - non-matching thread `019f5669-d242-7d02-896f-0ee2361e530f`: unchanged; and
@@ -68,24 +90,26 @@ Validation output:
 PASS matching=armed non-matching=unchanged account-only=unchanged
 ```
 
-## Production contract
+The model does not prove quota causality, exact-turn membership, account
+binding, freshness, or ambiguity handling. Those claims are intentionally not
+carried into the verdict.
 
-Codex auto-resume may arm only when all of the following hold:
+## Missing production contract
 
-1. the managed session has trace-safe Codex OTLP logs and traces enabled;
-2. a completed `session_task.turn` span supplies exact `thread.id` and
-   `turn.id` and the thread equals the session's provider resume id;
-3. a `codex.sse_event` with `event.kind=response.completed` and an error
-   message present is observed inside that exact turn interval;
-4. the event's thread maps to exactly one active agent-session runtime;
-5. the account bound to that runtime/turn has a fresh authoritative snapshot
-   with `allowed=false`, `limit_reached=true`, and a supported exhausted reached
-   type; and
-6. no raw error string or content-bearing attribute crosses the receiver
-   projection boundary.
+The observed content-free predicates are insufficient:
 
-Any missing or ambiguous predicate must leave the session unchanged and report
-Codex auto-resume unsupported or unavailable for that runtime.
+1. `session_task.turn` supplies exact thread and turn ids.
+2. `codex.sse_event`, `event.kind=response.completed`, and an error present
+   classify only a generic provider error.
+3. The exact isolated account is authoritatively exhausted and supplies a reset
+   epoch.
+4. Nothing content-free connects that account state causally to the generic
+   turn error.
+
+A safe adapter needs a stable provider field equivalent to app-server
+`UsageLimitExceeded`, such as an OTel `error.type` or `error.code`. Parsing the
+human error message, terminal text, or localized wording is explicitly
+rejected.
 
 ## Acceptance matrix
 
@@ -93,14 +117,20 @@ Codex auto-resume unsupported or unavailable for that runtime.
 | --- | --- | --- |
 | Exact provider thread | pass | Baseline and rejection thread equal the captured resume id. |
 | Exact provider turn | pass | Rejection has one `session_task.turn` turn id. |
-| Content-free machine classification | pass | Event kind plus error-presence boolean; no text parsing or retention. |
-| Exact exhausted account | pass | Isolated `poies` runtime and fresh authoritative reached-type snapshot. |
-| Second session remains unchanged | pass | Deterministic two-thread correlation assertion. |
+| Content-free quota classification | fail | Only generic error presence; structured type/code are absent. |
+| Exact exhausted account | pass | Isolated `poies` runtime, reached type, and reset epoch. |
+| Second session remains unchanged | limited pass | Thread-only attribution model; no quota-causality claim. |
 | Installed 0.144.1 | pass | Live runtime and matching tagged source. |
 
 ## Next tier
 
-Open an L3 dispatch plan for the nils-cli production adapter, tests, release,
-agent-console integration validation, and live enablement. The implementation
-must include account binding and a loopback-only receiver; enabling Codex by
-changing `supported()` alone would be unsafe.
+Do not open an L3 implementation plan and do not change Codex `supported()`.
+Sustainable unblocks are:
+
+1. Codex emits a stable quota-specific structured field for interactive TUI
+   failures; or
+2. agent-session replaces the external TUI ownership boundary with an
+   app-server-owned client whose documented failed turn carries
+   `UsageLimitExceeded`.
+
+Changing nils-cli alone cannot safely manufacture the missing causal field.

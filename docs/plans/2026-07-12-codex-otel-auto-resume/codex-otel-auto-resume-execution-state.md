@@ -3,11 +3,12 @@
 <!-- plan-issue-record:v2 role=state profile=tracking -->
 ## Execution State
 
-- Status: complete
+- Status: complete — blocked verdict
 - Target scope: prove or reject a content-free OTel trigger for exact Codex TUI
   usage exhaustion.
-- Current task: complete — all spike acceptance items passed.
-- Next task: open and execute the L3 production implementation plan.
+- Current task: complete — the quota-specific classification item failed.
+- Next task: none until Codex exposes a structured TUI quota failure field or
+  the runtime boundary moves to an app-server-owned client.
 - Last updated: 2026-07-12
 - Branch: `feat/codex-otel-auto-resume`
 - Source document:
@@ -23,8 +24,8 @@
 | 1.1 | completed | Build the isolated OTLP capture harness | `codex-otel-auto-resume-spike-evidence.md` | Loopback-only; raw fields discarded at ingestion. |
 | 1.2 | completed | Capture a non-exhausted installed-TUI turn | baseline projection | Exact resume/thread and turn ids matched. |
 | 2.1 | completed | Capture the real exhausted turn | exhausted projection | `poies` reached 100%; reset credits remained 2. |
-| 2.2 | completed | Test concurrent-session attribution | correlation model | Only the matching thread armed. |
-| 3.1 | completed | Reconcile evidence and decide next tier | acceptance matrix | Pass; proceed to L3 implementation. |
+| 2.2 | completed | Test concurrent-session attribution | correlation model | Thread attribution passed; causal classification remained unproved. |
+| 3.1 | completed | Reconcile evidence and decide next tier | acceptance matrix | Blocked; keep Codex unsupported. |
 
 ## Session Log
 
@@ -38,7 +39,12 @@
 - 2026-07-12: Real `poies` exhaustion produced a content-free failed-completion
   observation within the exact turn interval while the authoritative account
   snapshot reported `workspace_member_credits_depleted`.
-- 2026-07-12: Two-session negative attribution passed. The L2 verdict is pass.
+- 2026-07-12: Two-session negative attribution passed for thread attribution,
+  but independent reviews rejected the generic-error-plus-exhausted-account
+  predicate as non-causal.
+- 2026-07-12: A final ingestion-only structured-code probe found
+  `error_message_json=false` with no `error.type` or `error.code`. The L2
+  verdict is blocked for the current TUI runtime.
 
 ## Validation
 
@@ -46,7 +52,8 @@
 | --- | --- | --- | --- |
 | `agent-docs preflight --intent project-dev` | pass | Required nils-cli docs and local-fast validation contract resolved. | local preflight |
 | Plan archive searches | pass | No archived Codex OTel auto-resume plan found. | local query |
-| Synthetic projection fixture | pass | Sensitive prompt, email, account id, and raw error fields were discarded. | runtime harness |
+| Synthetic projection fixture | not retained | The temporary receiver discarded sensitive fields, but its fixture was not retained in the PR boundary. | acknowledged evidence limit |
 | Installed Codex baseline | pass | Exact resume/thread id and provider turn id correlated. | safe OTLP projection |
 | Real exhaustion capture | pass | Exact rejected turn plus exact-account exhausted snapshot; no reset used. | `codex-otel-auto-resume-spike-evidence.md` |
-| Two-session correlation | pass | Matching armed; non-matching and account-only remained unchanged. | runtime correlation model |
+| Two-session correlation | limited pass | Matching thread selected; non-matching and account-only unchanged. Exact turn/account claims were not tested by the model. | runtime correlation model |
+| Structured quota discriminator | fail | Error value was not JSON and exposed no type/code; only generic error presence remained. | `codex-otel-auto-resume-spike-evidence.md` |
