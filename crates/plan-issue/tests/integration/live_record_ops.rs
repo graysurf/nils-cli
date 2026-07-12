@@ -108,6 +108,8 @@ struct LiveCloseLabelCase<'a> {
     explicit_remove: bool,
     local_label_list_unsupported: bool,
     fail_comment: bool,
+    automation_label_after_edit: bool,
+    fail_close_after_mutation: bool,
 }
 
 fn run_live_record_close_label_case_with(
@@ -145,6 +147,18 @@ fn run_live_record_close_label_case_with(
         "0"
     };
     let fail_comment = if case.fail_comment { "1" } else { "0" };
+    let automation_marker = tmp.path().join("automation-injected");
+    let automation_marker_s = automation_marker.to_string_lossy().to_string();
+    let automation_label = if case.automation_label_after_edit {
+        "automation::complete"
+    } else {
+        ""
+    };
+    let fail_close_after_mutation = if case.fail_close_after_mutation {
+        "1"
+    } else {
+        "0"
+    };
     let strict_repo_labels = if case.repo.starts_with("local:") {
         "0"
     } else {
@@ -188,6 +202,15 @@ fn run_live_record_close_label_case_with(
                     local_label_list_unsupported,
                 ),
                 ("FORGE_CLI_STUB_FAIL_COMMENT", fail_comment),
+                (
+                    "FORGE_CLI_STUB_AUTOMATION_LABEL_AFTER_EDIT",
+                    automation_label,
+                ),
+                ("FORGE_CLI_STUB_AUTOMATION_MARKER", &automation_marker_s),
+                (
+                    "FORGE_CLI_STUB_FAIL_CLOSE_AFTER_MUTATION",
+                    fail_close_after_mutation,
+                ),
                 ("FORGE_CLI_STUB_LOG", &log_s),
                 ("PLAN_ISSUE_HOME", &state_dir_s),
             ],
@@ -213,7 +236,65 @@ fn run_live_record_close_label_case(
         explicit_remove: true,
         local_label_list_unsupported: false,
         fail_comment: false,
+        automation_label_after_edit: false,
+        fail_close_after_mutation: false,
     })
+}
+
+#[test]
+fn record_close_label_rollback_preserves_concurrent_automation_labels() {
+    let (code, envelope, log, labels, issue_state) = run_live_record_close_label_case_with(
+        LiveCloseLabelCase {
+            repo: "sympoies/agent-runtime-kit",
+            initial_labels: "state::ready\n",
+            repo_labels_json: r#"[{"name":"state::ready","color":"000000","description":""},{"name":"state::closed","color":"000000","description":""},{"name":"automation::complete","color":"000000","description":""}]"#,
+            drop_label_mutations: false,
+            dry_run: false,
+            explicit_remove: false,
+            local_label_list_unsupported: false,
+            fail_comment: true,
+            automation_label_after_edit: true,
+            fail_close_after_mutation: false,
+        },
+    );
+
+    assert_ne!(code, 0, "{envelope}");
+    assert_eq!(
+        envelope["error"]["code"],
+        "record-close-comment-post-failed"
+    );
+    assert_eq!(labels, "automation::complete\nstate::ready\n");
+    assert_eq!(issue_state, "open\n");
+    assert_eq!(log.matches("issue edit 42").count(), 2, "{log}");
+    assert!(
+        !log.contains("--remove-label automation::complete"),
+        "{log}"
+    );
+}
+
+#[test]
+fn record_close_does_not_rollback_after_close_commit_point() {
+    let (code, envelope, log, labels, issue_state) = run_live_record_close_label_case_with(
+        LiveCloseLabelCase {
+            repo: "sympoies/agent-runtime-kit",
+            initial_labels: "state::ready\n",
+            repo_labels_json: r#"[{"name":"state::ready","color":"000000","description":""},{"name":"state::closed","color":"000000","description":""}]"#,
+            drop_label_mutations: false,
+            dry_run: false,
+            explicit_remove: false,
+            local_label_list_unsupported: false,
+            fail_comment: false,
+            automation_label_after_edit: false,
+            fail_close_after_mutation: true,
+        },
+    );
+
+    assert_ne!(code, 0, "{envelope}");
+    assert_eq!(envelope["error"]["code"], "record-close-issue-close-failed");
+    assert_eq!(labels, "state::closed\n");
+    assert_eq!(issue_state, "closed\n");
+    assert_eq!(log.matches("--add-label").count(), 1, "{log}");
+    assert!(!log.contains("--add-label state::ready"), "{log}");
 }
 
 #[test]
@@ -228,6 +309,8 @@ fn record_close_rolls_back_labels_when_comment_write_fails() {
             explicit_remove: false,
             local_label_list_unsupported: false,
             fail_comment: true,
+            automation_label_after_edit: false,
+            fail_close_after_mutation: false,
         },
     );
 
@@ -301,6 +384,8 @@ fn record_close_missing_add_label_fails_before_provider_mutations() {
             explicit_remove: false,
             local_label_list_unsupported: false,
             fail_comment: false,
+            automation_label_after_edit: false,
+            fail_close_after_mutation: false,
         });
     assert_eq!(dry_code, 0, "{dry_envelope}");
     let dry_plan = &dry_envelope["payload"]["result"]["preview"]["labels"];
@@ -325,6 +410,8 @@ fn record_close_missing_add_label_fails_before_provider_mutations() {
             explicit_remove: false,
             local_label_list_unsupported: false,
             fail_comment: false,
+            automation_label_after_edit: false,
+            fail_close_after_mutation: false,
         });
 
     assert_ne!(code, 0, "{envelope}");
@@ -352,6 +439,8 @@ fn record_close_normalizes_all_existing_state_labels() {
             explicit_remove: false,
             local_label_list_unsupported: false,
             fail_comment: false,
+            automation_label_after_edit: false,
+            fail_close_after_mutation: false,
         },
     );
 
@@ -381,6 +470,8 @@ fn record_close_live_dry_run_predicts_label_availability_and_final_set() {
             explicit_remove: false,
             local_label_list_unsupported: false,
             fail_comment: false,
+            automation_label_after_edit: false,
+            fail_close_after_mutation: false,
         },
     );
 
@@ -417,6 +508,8 @@ fn record_close_local_normalizes_labels_without_a_repository_catalog() {
             explicit_remove: false,
             local_label_list_unsupported: true,
             fail_comment: false,
+            automation_label_after_edit: false,
+            fail_close_after_mutation: false,
         });
 
     assert_eq!(code, 0, "{envelope}");

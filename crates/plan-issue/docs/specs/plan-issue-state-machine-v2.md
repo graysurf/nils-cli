@@ -99,10 +99,12 @@ When checks 1–7 or the label-catalog preflight fail, `record close` returns
 exit 1 without provider writes. The label convergence gate then performs one
 reversible label edit and provider read-back before the closeout comment,
 dashboard edit, and issue close. If that gate fails, the issue remains open
-and no closeout write is posted. If a later closeout write fails, the command
-restores and verifies the original label set before returning the original
-error; rollback failure is surfaced separately. Every failure emits a
-machine-readable code matching the spec
+and no closeout write is posted. If a later pre-close write fails, the command
+reverses and verifies only its own label delta before returning the original
+error, preserving unrelated provider changes; rollback failure is surfaced
+separately. The issue-close request is the commit point, so an ambiguous close
+response never restores pre-close labels on a potentially closed issue. Every
+failure emits a machine-readable code matching the spec
 [Strict Closeout Validation](issue-backed-plan-record-contract-v2.md#strict-closeout-validation).
 
 ## Dashboard Invariants

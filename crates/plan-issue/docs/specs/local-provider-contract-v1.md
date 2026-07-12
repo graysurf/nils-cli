@@ -25,7 +25,7 @@ In scope:
   faithfully against a local file store (REAL) versus which can only return
   test-seeded values (STUB / SEED).
 - The on-disk JSON store schema (`RepoFile`, `IssueRecord`, `PrRecord`).
-- The per-method contract for the 11 `ProviderAdapter` methods, against the
+- The per-method contract for the 13 `ProviderAdapter` methods, against the
   as-built trait signatures.
 - Determinism rules for synthesized URLs, timestamps, and numbering.
 - The store layout on disk and its teardown model.

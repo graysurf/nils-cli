@@ -958,25 +958,27 @@ fn restore_close_labels_after_failure(
     repo: &str,
     issue: u64,
     provider: crate::provider::Provider,
-    original: &[String],
-    observed: &[String],
+    plan: &CloseLabelPlan,
     failure: CommandError,
 ) -> CommandError {
-    let add = original
+    let original = plan.current.as_deref().unwrap_or_default();
+    let add = plan
+        .remove
         .iter()
         .filter(|label| {
-            !observed
+            original
                 .iter()
-                .any(|current| label_matches(Some(provider), label, current))
+                .any(|previous| label_matches(Some(provider), label, previous))
         })
         .cloned()
         .collect::<Vec<_>>();
-    let remove = observed
+    let remove = plan
+        .add
         .iter()
         .filter(|label| {
             !original
                 .iter()
-                .any(|current| label_matches(Some(provider), label, current))
+                .any(|previous| label_matches(Some(provider), label, previous))
         })
         .cloned()
         .collect::<Vec<_>>();
@@ -1006,25 +1008,40 @@ fn restore_close_labels_after_failure(
             );
         }
     };
-    let original = sorted_unique_labels_for_provider(original.to_vec(), Some(provider));
-    let restored_matches = original.len() == restored.len()
-        && original.iter().all(|expected| {
-            restored
-                .iter()
-                .any(|actual| label_matches(Some(provider), expected, actual))
-        });
+    let restored_matches =
+        close_label_plan_converged_after_rollback(provider, &add, &remove, &restored);
     if !restored_matches {
+        let expected_add = sorted_unique_labels_for_provider(add, Some(provider));
+        let expected_remove = sorted_unique_labels_for_provider(remove, Some(provider));
         return CommandError::runtime(
             "record-close-label-rollback-failed",
             format!(
-                "{}; label rollback did not converge: expected {}, observed {}",
+                "{}; label rollback did not converge: expected present {}, expected absent {}, observed {}",
                 failure.message,
-                render_label_diagnostic(&original),
+                render_label_diagnostic(&expected_add),
+                render_label_diagnostic(&expected_remove),
                 render_label_diagnostic(&restored)
             ),
         );
     }
     failure
+}
+
+fn close_label_plan_converged_after_rollback(
+    provider: crate::provider::Provider,
+    expected_present: &[String],
+    expected_absent: &[String],
+    actual: &[String],
+) -> bool {
+    expected_present.iter().all(|expected| {
+        actual
+            .iter()
+            .any(|actual| label_matches(Some(provider), expected, actual))
+    }) && expected_absent.iter().all(|expected| {
+        !actual
+            .iter()
+            .any(|actual| label_matches(Some(provider), expected, actual))
+    })
 }
 
 fn run_record_open(
@@ -2186,21 +2203,14 @@ fn run_record_close(
         None
     };
     let labels_result = label_plan.preview(confirmed_labels.as_deref());
-    let rollback_labels = label_mutation_planned.then(|| {
-        (
-            label_plan.current.clone().unwrap_or_default(),
-            confirmed_labels.clone().unwrap_or_default(),
-        )
-    });
     let rollback_after_failure = |failure: CommandError| {
-        if let Some((original, observed)) = rollback_labels.as_ref() {
+        if label_mutation_planned {
             restore_close_labels_after_failure(
                 adapter.as_ref(),
                 &repo,
                 issue_number,
                 repo_info.provider,
-                original,
-                observed,
+                &label_plan,
                 failure,
             )
         } else {
@@ -2264,12 +2274,7 @@ fn run_record_close(
             crate::commands::plan::CloseReason::Completed,
             None,
         )
-        .map_err(|err| {
-            rollback_after_failure(CommandError::runtime(
-                "record-close-issue-close-failed",
-                err,
-            ))
-        })?;
+        .map_err(|err| CommandError::runtime("record-close-issue-close-failed", err))?;
 
     // Write the terminal state back into the bundle's execution-state file so
     // the in-repo copy is final immediately after closeout, not transient-stale

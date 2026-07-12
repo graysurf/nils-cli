@@ -287,6 +287,10 @@ case "$group $verb" in
         [[ -z "$label" ]] && continue
         grep -Fxq -- "$label" "$FORGE_CLI_STUB_LABELS_FILE" || printf '%s\n' "$label" >> "$FORGE_CLI_STUB_LABELS_FILE"
       done
+      if [[ -n "${FORGE_CLI_STUB_AUTOMATION_LABEL_AFTER_EDIT:-}" && -n "${FORGE_CLI_STUB_AUTOMATION_MARKER:-}" && ! -e "$FORGE_CLI_STUB_AUTOMATION_MARKER" ]]; then
+        printf '%s\n' "$FORGE_CLI_STUB_AUTOMATION_LABEL_AFTER_EDIT" >> "$FORGE_CLI_STUB_LABELS_FILE"
+        touch "$FORGE_CLI_STUB_AUTOMATION_MARKER"
+      fi
     fi
     state="$(issue_state)"
     labels_json="$(provider_labels_json)"
@@ -308,6 +312,10 @@ case "$group $verb" in
   "issue close")
     if [[ -n "${FORGE_CLI_STUB_ISSUE_STATE_FILE:-}" ]]; then
       printf 'closed\n' > "$FORGE_CLI_STUB_ISSUE_STATE_FILE"
+    fi
+    if [[ "${FORGE_CLI_STUB_FAIL_CLOSE_AFTER_MUTATION:-}" == "1" ]]; then
+      emit '{"ok":false,"schema_version":"cli.forge-cli.error.v1","error":{"code":"close-readback-failed","message":"close succeeded but follow-up view failed"}}'
+      exit 1
     fi
     emit "{\"ok\":true,\"schema_version\":\"cli.forge-cli.issue.close.v1\",\"data\":{\"provider\":\"$provider\",\"number\":$id,\"url\":\"https://github.com/$repo/issues/$id\",\"state\":\"closed\"}}"
     ;;

@@ -21,13 +21,15 @@ GitHub/GitLab replacement.
 
 ## The capability split bounds the answer
 
-The 11 `ProviderAdapter` methods cleave into two halves (see
+The 13 `ProviderAdapter` methods cleave into two implemented halves plus one
+capability seam (see
 `local-provider-contract-v1.md` §"The Capability Split"). That line is exactly
 the line a service can and cannot cross.
 
 | Half | Methods | Local today | Service-grade? |
 | --- | --- | --- | --- |
-| A — issue / timeline | `create_issue`, `issue_body`, `issue_evidence`, `list_open_tracker_issues`, `edit_issue_body`, `comment_issue`, `edit_issue_labels`, `close_issue` | REAL — the file store is the source of truth | **Yes** — the store *is* the system of record |
+| A — issue / timeline | `create_issue`, `issue_body`, `issue_evidence`, `issue_labels`, `list_open_tracker_issues`, `edit_issue_body`, `comment_issue`, `edit_issue_labels`, `close_issue` | REAL — the file store is the source of truth | **Yes** — the store *is* the system of record |
+| Seam — repository catalog | `repository_labels` | UNSUPPORTED — Local labels are free-form | **Optional** — a service may add a catalog without changing issue truth |
 | B — PR / merge / CI | `pr_is_merged`, `pr_merge_summary`, `pr_comments` | SEEDED STUB — returns what a test wrote | **No** — there is no VCS/CI behind it |
 
 A service can own Half A because the store holds the authoritative state: an
