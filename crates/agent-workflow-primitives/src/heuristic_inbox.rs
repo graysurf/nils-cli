@@ -416,6 +416,16 @@ fn extract_raw_records(evidence_section: &str) -> Vec<String> {
     records
 }
 
+fn raw_record_identity(raw_record: &str) -> Option<String> {
+    static MANUAL_PLACEHOLDER_RE: OnceLock<Regex> = OnceLock::new();
+    let manual_placeholder_re = MANUAL_PLACEHOLDER_RE.get_or_init(|| {
+        Regex::new(r"^not captured \(manual diagnosis, \d{4}-\d{2}-\d{2}\)$")
+            .expect("manual raw-record placeholder regex")
+    });
+    let normalized = normalize_text(raw_record);
+    (!normalized.is_empty() && !manual_placeholder_re.is_match(&normalized)).then_some(normalized)
+}
+
 #[derive(Debug, Clone)]
 struct ParsedEntry {
     path: PathBuf,
@@ -841,7 +851,7 @@ fn detect_duplicates(
     let raw_records: BTreeSet<String> = parsed
         .raw_records
         .iter()
-        .map(|s| normalize_text(s))
+        .filter_map(|s| raw_record_identity(s))
         .collect();
     let self_folder = case
         .folder
@@ -885,7 +895,7 @@ fn detect_duplicates(
         let other_raw: BTreeSet<String> = other_parsed
             .raw_records
             .iter()
-            .map(|s| normalize_text(s))
+            .filter_map(|s| raw_record_identity(s))
             .collect();
         if !raw_records.is_empty() && raw_records.intersection(&other_raw).next().is_some() {
             reasons.insert("raw_record".to_string());
@@ -4080,6 +4090,22 @@ mod tests {
     #[test]
     fn normalize_text_collapses_whitespace() {
         assert_eq!(normalize_text("  Hello\n\tWorld "), "hello world");
+    }
+
+    #[test]
+    fn raw_record_identity_excludes_only_generated_manual_placeholders() {
+        assert_eq!(
+            raw_record_identity("not captured (manual diagnosis, 2026-07-12)"),
+            None
+        );
+        assert_eq!(
+            raw_record_identity("not captured (manual diagnosis, ticket-123)"),
+            Some("not captured (manual diagnosis, ticket-123)".to_string())
+        );
+        assert_eq!(
+            raw_record_identity(" Evidence/Record.JSON "),
+            Some("evidence/record.json".to_string())
+        );
     }
 
     #[test]
