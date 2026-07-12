@@ -132,7 +132,7 @@ Parity matrix (v1):
 | `issue comment <id>`                        | `gh issue comment <id> --body …`                                                                                                             | `glab issue note <id> --message …`                          | exact                                                                                                                    |
 | `issue close <id>`                          | `gh issue close <id>`                                                                                                                        | `glab issue close <id>`                                     | exact                                                                                                                    |
 | `issue reopen <id>`                         | `gh issue reopen <id>`                                                                                                                       | `glab issue reopen <id>`                                    | exact                                                                                                                    |
-| `label list`                                | `gh label list --json …`                                                                                                                     | `glab label list --output json`                             | exact                                                                                                                    |
+| `label list`                                | `gh label list --json …`                                                                                                                     | paged `glab label list --output json --per-page … --page …` | exact                                                                                                                    |
 | `label audit`                               | read labels, compare with caller catalog                                                                                                     | same                                                        | exact                                                                                                                    |
 | `label ensure`                              | `gh label create/edit`                                                                                                                       | `glab label create/edit`                                    | exact (no delete/rename by default)                                                                                      |
 | `auth status`                               | `gh auth status`                                                                                                                             | `glab auth status`                                          | exact (text → typed)                                                                                                     |
@@ -301,8 +301,10 @@ Activity-local flags:
 
 Label-local flags:
 
-- `forge-cli label list --limit <n>` reads provider labels and emits
-  `cli.forge-cli.label.list.v1`.
+- `forge-cli label list --limit <n>` reads at most `<n>` provider labels and
+  emits `cli.forge-cli.label.list.v1`. The limit is a provider-neutral total;
+  GitLab advances `--page` with a maximum `--per-page 100` until the total is
+  reached or a short page proves the catalog is exhausted.
 - `forge-cli label audit --catalog <path> --limit <n>` compares provider
   labels to the caller-owned catalog and reports missing labels, color /
   description drift, and unknown shared labels.

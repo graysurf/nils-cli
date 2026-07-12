@@ -22,6 +22,7 @@ const LIST_SCHEMA: &str = "label.list";
 const AUDIT_SCHEMA: &str = "label.audit";
 const ENSURE_SCHEMA: &str = "label.ensure";
 const SCHEMA_VERSION: u32 = 1;
+const GITLAB_LABEL_PAGE_SIZE: u32 = 100;
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct ProviderLabel {
@@ -275,9 +276,43 @@ fn fetch_labels<R: BackendRunner>(
     ctx: &ProviderContext,
     limit: u32,
 ) -> Result<Vec<ProviderLabel>, ForgeError> {
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+    if ctx.provider == Provider::GitLab {
+        return fetch_gitlab_labels(runner, ctx, limit);
+    }
     let call = build_list_call(ctx, limit);
     let output = runner.run(&call)?;
     parse_list_output(ctx, &output)
+}
+
+fn fetch_gitlab_labels<R: BackendRunner>(
+    runner: &R,
+    ctx: &ProviderContext,
+    limit: u32,
+) -> Result<Vec<ProviderLabel>, ForgeError> {
+    let per_page = limit.min(GITLAB_LABEL_PAGE_SIZE);
+    let mut page = 1_u32;
+    let mut labels = Vec::new();
+    loop {
+        let call = build_gitlab_list_call(ctx, per_page, page);
+        let output = runner.run(&call)?;
+        let page_labels = parse_list_output(ctx, &output)?;
+        let page_len = page_labels.len();
+        let remaining = (limit as usize).saturating_sub(labels.len());
+        labels.extend(page_labels.into_iter().take(remaining));
+        if page_len < per_page as usize || labels.len() >= limit as usize {
+            return Ok(labels);
+        }
+        page = page.checked_add(1).ok_or_else(|| {
+            ForgeError::software(
+                schema_err(),
+                "GitLab label pagination exceeded the supported page range",
+                None,
+            )
+        })?;
+    }
 }
 
 fn build_list_call(ctx: &ProviderContext, limit: u32) -> BackendCall {
@@ -291,17 +326,27 @@ fn build_list_call(ctx: &ProviderContext, limit: u32) -> BackendCall {
             OsString::from("--json"),
             OsString::from("id,name,color,description"),
         ],
-        Provider::GitLab => vec![
-            OsString::from("label"),
-            OsString::from("list"),
-            OsString::from("--output"),
-            OsString::from("json"),
-            OsString::from("--per-page"),
-            OsString::from(limit.to_string()),
-        ],
+        Provider::GitLab => {
+            return build_gitlab_list_call(ctx, limit.min(GITLAB_LABEL_PAGE_SIZE), 1);
+        }
     };
     ctx.push_repo_override(&mut argv);
     BackendCall::new(program, argv)
+}
+
+fn build_gitlab_list_call(ctx: &ProviderContext, per_page: u32, page: u32) -> BackendCall {
+    let mut argv = vec![
+        OsString::from("label"),
+        OsString::from("list"),
+        OsString::from("--output"),
+        OsString::from("json"),
+        OsString::from("--per-page"),
+        OsString::from(per_page.to_string()),
+        OsString::from("--page"),
+        OsString::from(page.to_string()),
+    ];
+    ctx.push_repo_override(&mut argv);
+    BackendCall::new(BackendProgram::Glab, argv)
 }
 
 fn build_create_call(ctx: &ProviderContext, label: &CatalogLabel) -> BackendCall {
@@ -819,6 +864,24 @@ mod tests {
                 "#D73A4A",
                 "--description",
                 "Bug"
+            ]
+        );
+        assert_eq!(
+            argv(&build_list_call(
+                &ctx(Provider::GitLab, Some("group/project")),
+                200
+            )),
+            vec![
+                "label",
+                "list",
+                "--output",
+                "json",
+                "--per-page",
+                "100",
+                "--page",
+                "1",
+                "--repo",
+                "group/project"
             ]
         );
         assert_eq!(

@@ -130,6 +130,57 @@ esac
 }
 
 #[test]
+fn label_list_gitlab_paginates_past_the_provider_page_cap() {
+    let stub = StubEnv::new().glab_stub(
+        r##"#!/bin/sh
+set -e
+case "$*" in
+  *"--per-page 100"*"--page 1"*)
+    printf '['
+    i=1
+    separator=''
+    while [ "$i" -le 100 ]; do
+      printf '%s{"id":%s,"name":"label-%s","color":"#000000","description":""}' "$separator" "$i" "$i"
+      separator=','
+      i=$((i + 1))
+    done
+    printf ']\n'
+    ;;
+  *"--per-page 100"*"--page 2"*)
+    printf '[{"id":101,"name":"state::closed","color":"#000000","description":""}]\n'
+    ;;
+  *)
+    echo "unexpected glab args: $*" >&2
+    exit 99
+    ;;
+esac
+"##,
+    );
+
+    let out = run_forge_cli(
+        &stub,
+        &[
+            "--provider",
+            "gitlab",
+            "--repo",
+            "acme/widgets",
+            "--format",
+            "json",
+            "label",
+            "list",
+            "--limit",
+            "200",
+        ],
+    );
+
+    assert_eq!(out.code, 0, "stdout={} stderr={}", out.stdout, out.stderr);
+    let env = parse_envelope(&out.stdout);
+    let labels = env["data"]["labels"].as_array().expect("labels");
+    assert_eq!(labels.len(), 101);
+    assert_eq!(labels[100]["name"], "state::closed");
+}
+
+#[test]
 fn label_ensure_dry_run_emits_create_and_update_plans() {
     let (_tempdir, catalog) = write_catalog();
     let stub = StubEnv::new().gh_stub(
