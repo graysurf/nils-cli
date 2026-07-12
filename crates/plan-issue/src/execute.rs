@@ -106,7 +106,9 @@ pub fn execute(binary: BinaryFlavor, cli: &Cli) -> Result<Value, CommandError> {
         CliCommand::Record(args) => {
             run_record(binary, cli.dry_run, cli.force, cli.repo.as_deref(), args)
         }
-        CliCommand::Tracking(args) => run_tracking(binary, cli.force, cli.repo.as_deref(), args),
+        CliCommand::Tracking(args) => {
+            run_tracking(binary, cli.dry_run, cli.force, cli.repo.as_deref(), args)
+        }
         CliCommand::Completion(_) => Err(CommandError::usage(
             "completion-direct-output-only",
             "completion output is emitted directly; run `<binary> completion <bash|zsh>`",
@@ -2276,6 +2278,7 @@ fn run_record_restore(
 
 fn run_tracking(
     binary: BinaryFlavor,
+    dry_run: bool,
     force: bool,
     repo_override: Option<&str>,
     args: &crate::commands::tracking::TrackingArgs,
@@ -2284,7 +2287,7 @@ fn run_tracking(
     match &args.command {
         TrackingCommand::Status(status) => run_tracking_status(status),
         TrackingCommand::Run(run) => match &run.command {
-            TrackingRunCommand::Init(args) => run_tracking_run_init(repo_override, args),
+            TrackingRunCommand::Init(args) => run_tracking_run_init(repo_override, dry_run, args),
             TrackingRunCommand::Update(args) => run_tracking_run_update(args),
         },
         TrackingCommand::Checkpoint(args) => {
@@ -2306,6 +2309,7 @@ fn absolutize(path: &Path) -> PathBuf {
 
 fn run_tracking_run_init(
     _repo_override: Option<&str>,
+    dry_run: bool,
     args: &crate::commands::tracking::TrackingRunInitArgs,
 ) -> Result<Value, CommandError> {
     use crate::runtime_layout;
@@ -2317,6 +2321,9 @@ fn run_tracking_run_init(
         .run_id
         .clone()
         .unwrap_or_else(|| default_run_id(args.issue, &now));
+    let repo_slug = runtime_layout::repo_slug(&args.provider_repo);
+    let root = RunRoot::new(&repo_slug, args.issue, run_id.clone())
+        .map_err(|err| CommandError::runtime("tracking-run-init-layout-failed", err.to_string()))?;
     let mut run = ExecutionRun::new(
         run_id.clone(),
         args.provider_repo.clone(),
@@ -2357,30 +2364,33 @@ fn run_tracking_run_init(
             .unwrap_or_else(|| PathBuf::from("events.jsonl"));
         (out.clone(), events_path)
     } else {
-        let repo_slug = runtime_layout::repo_slug(&args.provider_repo);
-        let root = RunRoot::new(&repo_slug, args.issue, run_id.clone()).map_err(|err| {
-            CommandError::runtime("tracking-run-init-layout-failed", err.to_string())
-        })?;
-        root.ensure_layout().map_err(|err| {
-            CommandError::runtime("tracking-run-init-mkdir-failed", err.to_string())
-        })?;
+        if !dry_run {
+            root.ensure_layout().map_err(|err| {
+                CommandError::runtime("tracking-run-init-mkdir-failed", err.to_string())
+            })?;
+        }
         (root.run_state_path(), root.events_path())
     };
 
-    crate::tracking::run_state::write_run_state(&run_state_path, &run)
-        .map_err(|err| CommandError::runtime("tracking-run-init-write-failed", err.to_string()))?;
-    let event = ExecutionEvent::new(run_id.clone(), ExecutionEventKind::RunStarted, now.clone())
-        .with_detail(serde_json::json!({
-            "repo": args.provider_repo,
-            "issue": args.issue,
-            "profile": args.profile.as_str(),
-        }));
-    events::append_event(&events_path, &event).map_err(|err| {
-        CommandError::runtime("tracking-run-init-event-append-failed", err.to_string())
-    })?;
+    if !dry_run {
+        crate::tracking::run_state::write_run_state(&run_state_path, &run).map_err(|err| {
+            CommandError::runtime("tracking-run-init-write-failed", err.to_string())
+        })?;
+        let event =
+            ExecutionEvent::new(run_id.clone(), ExecutionEventKind::RunStarted, now.clone())
+                .with_detail(serde_json::json!({
+                    "repo": args.provider_repo,
+                    "issue": args.issue,
+                    "profile": args.profile.as_str(),
+                }));
+        events::append_event(&events_path, &event).map_err(|err| {
+            CommandError::runtime("tracking-run-init-event-append-failed", err.to_string())
+        })?;
+    }
 
     Ok(json!({
         "operation": "tracking.run.init",
+        "dry_run": dry_run,
         "run_id": run_id,
         "run_state_path": path_text(&run_state_path),
         "events_path": path_text(&events_path),

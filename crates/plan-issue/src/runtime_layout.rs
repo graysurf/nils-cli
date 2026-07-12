@@ -32,6 +32,8 @@ pub enum RuntimeLayoutError {
     InvalidRepoSlug { slug: String },
     /// Task id is empty or contains a path separator.
     InvalidTaskId { task_id: String },
+    /// Run id is not exactly one safe path component.
+    InvalidRunId { run_id: String },
 }
 
 impl fmt::Display for RuntimeLayoutError {
@@ -42,6 +44,9 @@ impl fmt::Display for RuntimeLayoutError {
             }
             Self::InvalidTaskId { task_id } => {
                 write!(f, "invalid task id `{task_id}` for runtime layout")
+            }
+            Self::InvalidRunId { run_id } => {
+                write!(f, "invalid run id `{run_id}` for runtime layout")
             }
         }
     }
@@ -78,10 +83,16 @@ impl IssueRoot {
     /// Compute `$RUNTIME_ROOT/<repo-slug>/issue-<issue_number>`.
     pub fn new(repo_slug: &str, issue_number: u64) -> Result<Self, RuntimeLayoutError> {
         let trimmed = repo_slug.trim();
+        let mut components = Path::new(trimmed).components();
+        let is_single_normal_component = matches!(
+            (components.next(), components.next()),
+            (Some(std::path::Component::Normal(_)), None)
+        );
         if trimmed.is_empty()
             || trimmed.contains('/')
             || trimmed.contains('\\')
             || trimmed.contains('\0')
+            || !is_single_normal_component
         {
             return Err(RuntimeLayoutError::InvalidRepoSlug {
                 slug: repo_slug.to_string(),
@@ -372,11 +383,24 @@ mod tests {
         let lock = GlobalStateLock::new();
         let _guard = pin_state_dir(&lock, "/tmp/plan-issue-fixture");
 
-        let err = IssueRoot::new("", 1).expect_err("empty slug must reject");
-        assert!(matches!(err, RuntimeLayoutError::InvalidRepoSlug { .. }));
-
-        let err = IssueRoot::new("owner/repo", 1).expect_err("unconverted slash must reject");
-        assert!(matches!(err, RuntimeLayoutError::InvalidRepoSlug { .. }));
+        for slug in [
+            "",
+            "   ",
+            ".",
+            "..",
+            "owner/repo",
+            "owner\\repo",
+            "/absolute",
+            "nul\0slug",
+        ] {
+            assert!(
+                matches!(
+                    IssueRoot::new(slug, 1),
+                    Err(RuntimeLayoutError::InvalidRepoSlug { .. })
+                ),
+                "unsafe repo slug accepted: {slug:?}"
+            );
+        }
     }
 
     #[test]
