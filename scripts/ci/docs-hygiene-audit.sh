@@ -94,8 +94,6 @@ rg_scan_existing() {
   rg_scan "${rg_args[@]}" "${paths[@]}"
 }
 
-shopt -s nullglob
-
 declare -a errors=()
 declare -a warnings=()
 

@@ -118,6 +118,42 @@ if grep -qF "PASS: docs hygiene audit" <<<"$audit_output"; then
 fi
 echo "ok"
 
+# An unmatched glob family is also a required production target. Populate all
+# literal targets while intentionally omitting every crates/*/docs/README.md so
+# this case isolates shell glob handling before rg_scan_existing.
+unmatched_glob_repo="$(make_repo unmatched-glob)"
+mkdir -p \
+  "$unmatched_glob_repo/docs/specs" \
+  "$unmatched_glob_repo/docs/runbooks" \
+  "$unmatched_glob_repo/crates/codex-cli/src" \
+  "$unmatched_glob_repo/crates/gemini-cli/src" \
+  "$unmatched_glob_repo/crates/macos-agent/src" \
+  "$unmatched_glob_repo/crates/api-testing-core/src/websocket" \
+  "$unmatched_glob_repo/crates/api-websocket/docs/specs" \
+  "$unmatched_glob_repo/crates/image-processing/src"
+printf '# binary dependencies\n' >"$unmatched_glob_repo/BINARY_DEPENDENCIES.md"
+printf '# macos agent\n' >"$unmatched_glob_repo/crates/macos-agent/README.md"
+printf '# image processing\n' >"$unmatched_glob_repo/crates/image-processing/README.md"
+printf '%s\n' '// codex fixture' >"$unmatched_glob_repo/crates/codex-cli/src/main.rs"
+printf '%s\n' '// gemini fixture' >"$unmatched_glob_repo/crates/gemini-cli/src/main.rs"
+printf '%s\n' '// macos fixture' >"$unmatched_glob_repo/crates/macos-agent/src/cli.rs"
+printf '%s\n' '// websocket fixture' \
+  >"$unmatched_glob_repo/crates/api-testing-core/src/websocket/schema.rs"
+printf '# websocket schema\n' \
+  >"$unmatched_glob_repo/crates/api-websocket/docs/specs/websocket-request-schema-v1.md"
+printf '%s\n' '// image fixture' >"$unmatched_glob_repo/crates/image-processing/src/lib.rs"
+
+echo "== unmatched audit glob is fatal outside test mode =="
+run_audit_without_fixture_relaxation "$unmatched_glob_repo"
+if [[ "$status" -ne 2 ]] \
+  || ! grep -qF "missing required audit path: crates/*/docs/README.md" <<<"$audit_output"; then
+  fail "unmatched audit glob is fatal outside test mode"
+fi
+if grep -qF "PASS: docs hygiene audit" <<<"$audit_output"; then
+  fail "unmatched audit glob is fatal outside test mode: unexpected PASS marker"
+fi
+echo "ok"
+
 # --- identical payloads across paths are flagged -----------------------------
 dup_repo="$(make_repo dup)"
 mkdir -p "$dup_repo/docs/nested"
