@@ -290,7 +290,12 @@ fn run_async_json_mode(args: &RateLimitsOptions, _debug_mode: bool) -> Result<i3
     let cached_mode = args.cached;
     let no_refresh_auth = args.no_refresh_auth;
     let mut results_by_secret = collect_async_items(&secret_files, jobs, None, move |path, _| {
-        collect_json_result_for_secret(&path, cached_mode, no_refresh_auth, true)
+        collect_json_result_for_secret(
+            &path,
+            cached_mode,
+            no_refresh_auth,
+            CacheFallbackPolicy::AnyFailure,
+        )
     });
     let mut results = Vec::new();
     let mut rc = 0;
@@ -344,8 +349,12 @@ fn run_all_json_mode(
     let mut results = Vec::new();
     let mut rc = 0;
     for secret_file in &secret_files {
-        let result =
-            collect_json_result_for_secret(secret_file, cached_mode, args.no_refresh_auth, false);
+        let result = collect_json_result_for_secret(
+            secret_file,
+            cached_mode,
+            args.no_refresh_auth,
+            CacheFallbackPolicy::NoWindow,
+        );
         if !cached_mode && !result.ok {
             rc = 1;
         }
@@ -473,11 +482,17 @@ fn should_writeback_usage(target_file: &Path) -> bool {
     !is_official_codex_auth_file(target_file)
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CacheFallbackPolicy {
+    NoWindow,
+    AnyFailure,
+}
+
 fn collect_json_result_for_secret(
     target_file: &Path,
     cached_mode: bool,
     no_refresh_auth: bool,
-    allow_cache_fallback: bool,
+    cache_fallback: CacheFallbackPolicy,
 ) -> RateLimitJsonResult {
     if cached_mode {
         return collect_json_from_cache(target_file, "cache", true);
@@ -553,7 +568,10 @@ fn collect_json_result_for_secret(
                     // Benign: the backend reports no active window. Prefer the
                     // last-known cached values (stale allowed), else report the
                     // empty window as a success rather than an error.
-                    if allow_cache_fallback {
+                    if matches!(
+                        cache_fallback,
+                        CacheFallbackPolicy::NoWindow | CacheFallbackPolicy::AnyFailure
+                    ) {
                         let fallback =
                             collect_json_from_cache(target_file, "cache-fallback", false);
                         if fallback.ok {
@@ -574,7 +592,7 @@ fn collect_json_result_for_secret(
             }
         }
         Err(err) => {
-            if allow_cache_fallback {
+            if cache_fallback == CacheFallbackPolicy::AnyFailure {
                 let fallback = collect_json_from_cache(target_file, "cache-fallback", false);
                 if fallback.ok {
                     return fallback;
