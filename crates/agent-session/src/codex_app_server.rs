@@ -8,6 +8,8 @@
 use std::collections::{BTreeSet, VecDeque};
 use std::env;
 use std::fs;
+use std::io::Read;
+use std::os::fd::AsRawFd;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::os::unix::process::CommandExt;
@@ -338,7 +340,7 @@ session_id=$7
 agent=$8
 cwd=$9
 shift 9
-rm -f -- "$socket" "$proxy" "$handoff" "$attached"
+rm -f -- "$socket" "$proxy" "$attached"
 "$agent" app-server --listen "unix://$socket" </dev/null >/dev/null 2>&1 &
 server=$!
 proxy_pid=
@@ -422,6 +424,142 @@ fn runtime_path<'a>(record: &'a SessionRecord, key: &str) -> Option<&'a Path> {
 pub(crate) fn thread_handoff_path(record: &SessionRecord) -> Option<&Path> {
     runtime_path(record, THREAD_HANDOFF_KEY)
 }
+
+pub(crate) struct CreateBootstrapGuard {
+    path: PathBuf,
+    file: fs::File,
+}
+
+impl Drop for CreateBootstrapGuard {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+impl CreateBootstrapGuard {
+    pub(crate) fn finish(self, release_lifecycle_lock: impl FnOnce()) {
+        if lock_bootstrap_file(&self.file) {
+            release_lifecycle_lock();
+            let _ = fs::remove_file(&self.path);
+            unlock_bootstrap_file(&self.file);
+        } else {
+            // Lock failure must sacrifice bootstrap availability, never expose
+            // a marker that can authorize arbitrary record-lock contention.
+            let _ = fs::remove_file(&self.path);
+            release_lifecycle_lock();
+        }
+    }
+}
+
+struct CreateBootstrapGate {
+    file: fs::File,
+}
+
+impl Drop for CreateBootstrapGate {
+    fn drop(&mut self) {
+        unlock_bootstrap_file(&self.file);
+    }
+}
+
+fn lock_bootstrap_file(file: &fs::File) -> bool {
+    loop {
+        // SAFETY: `flock` observes the valid descriptor borrowed for this call.
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } == 0 {
+            return true;
+        }
+        if std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
+            return false;
+        }
+    }
+}
+
+fn unlock_bootstrap_file(file: &fs::File) {
+    // SAFETY: `flock` observes the valid descriptor borrowed for this call.
+    unsafe {
+        libc::flock(file.as_raw_fd(), libc::LOCK_UN);
+    }
+}
+
+pub(crate) fn begin_create_bootstrap(
+    record: &SessionRecord,
+) -> Result<Option<CreateBootstrapGuard>, CliError> {
+    if !runtime_is_supported(record) {
+        return Ok(None);
+    }
+    let path = thread_handoff_path(record)
+        .map(PathBuf::from)
+        .ok_or_else(|| {
+            CliError::data(
+                "codex-app-server-handoff-missing",
+                "Codex app-server runtime is missing its create bootstrap marker",
+                Some(json!({ "id": record.id })),
+            )
+        })?;
+    let launch_id = record
+        .runtime
+        .as_ref()
+        .map(|runtime| runtime.launch_id.as_bytes())
+        .ok_or_else(|| {
+            CliError::data(
+                "runtime-id-missing",
+                "session runtime is missing its launch metadata",
+                Some(json!({ "id": record.id })),
+            )
+        })?;
+    write_private_file(&path, launch_id)?;
+    let file = fs::File::open(&path).map_err(|err| {
+        CliError::runtime(
+            "codex-app-server-handoff-open-failed",
+            format!("failed to open the create bootstrap marker: {err}"),
+            Some(json!({ "id": record.id })),
+        )
+    })?;
+    Ok(Some(CreateBootstrapGuard { path, file }))
+}
+
+fn create_bootstrap_is_live(record: &SessionRecord) -> bool {
+    #[cfg(test)]
+    BOOTSTRAP_LIVE_CHECKS.with(|checks| checks.set(checks.get() + 1));
+    let Some(path) = thread_handoff_path(record) else {
+        return false;
+    };
+    let Some(runtime) = record.runtime.as_ref() else {
+        return false;
+    };
+    fs::read(path).is_ok_and(|bytes| bytes == runtime.launch_id.as_bytes())
+}
+
+fn acquire_create_bootstrap_gate(record: &SessionRecord) -> Option<CreateBootstrapGate> {
+    let path = thread_handoff_path(record)?;
+    let mut file = fs::File::open(path).ok()?;
+    #[cfg(test)]
+    BOOTSTRAP_GATE_ATTEMPTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if !lock_bootstrap_file(&file) {
+        return None;
+    }
+    let own = file.metadata().ok()?;
+    let current = fs::metadata(path).ok()?;
+    if own.dev() != current.dev() || own.ino() != current.ino() {
+        return None;
+    }
+    let mut token = Vec::new();
+    file.read_to_end(&mut token).ok()?;
+    let runtime = record.runtime.as_ref()?;
+    (token == runtime.launch_id.as_bytes()).then_some(CreateBootstrapGate { file })
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static BOOTSTRAP_LIVE_CHECKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+static NORMAL_CANCELLATION_ATTEMPTS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(test)]
+static BOOTSTRAP_GATE_ATTEMPTS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
 
 pub(crate) fn thread_attached_path(record: &SessionRecord) -> Option<&Path> {
     runtime_path(record, THREAD_ATTACHED_KEY)
@@ -1298,29 +1436,143 @@ async fn fail_closed_projection(context: &CliContext, record: &SessionRecord) {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum FreshBootstrap {
+    ThreadStart,
+    ThreadResponse { request_id: String },
+    FirstTurn { thread_id: String },
+    Closed,
+}
+
+impl FreshBootstrap {
+    fn for_runtime(context: &CliContext, record: &SessionRecord) -> Self {
+        let starting =
+            crate::activity::activity_status(context, &record.id).is_ok_and(|activity| {
+                activity.turn_state.phase == crate::activity::TurnPhase::Starting
+            });
+        let auto_resume_disabled = auto_resume_is_healthy_disabled(context, record);
+        if record.provider_resume.is_none()
+            && thread_attached_path(record).is_some_and(|path| !path.is_file())
+            && starting
+            && auto_resume_disabled
+            && create_bootstrap_is_live(record)
+        {
+            Self::ThreadStart
+        } else {
+            Self::Closed
+        }
+    }
+
+    fn bypasses_create_lock(
+        &mut self,
+        context: &CliContext,
+        record: &SessionRecord,
+        value: &Value,
+    ) -> bool {
+        if matches!(self, Self::Closed) {
+            return false;
+        }
+        if !auto_resume_is_healthy_disabled(context, record) {
+            *self = Self::Closed;
+            return false;
+        }
+        match self {
+            Self::ThreadStart
+                if value.get("method").and_then(Value::as_str) == Some("thread/start") =>
+            {
+                let Some(request_id) = value.get("id").and_then(json_id_key) else {
+                    *self = Self::Closed;
+                    return false;
+                };
+                *self = Self::ThreadResponse { request_id };
+                true
+            }
+            Self::FirstTurn { thread_id }
+                if value.get("method").and_then(Value::as_str) == Some("turn/start") =>
+            {
+                let matches_bound_thread = value
+                    .pointer("/params/threadId")
+                    .and_then(Value::as_str)
+                    .is_some_and(|candidate| candidate == thread_id);
+                *self = Self::Closed;
+                matches_bound_thread
+            }
+            Self::ThreadResponse { .. } | Self::FirstTurn { .. } | Self::ThreadStart => {
+                *self = Self::Closed;
+                false
+            }
+            Self::Closed => false,
+        }
+    }
+
+    fn observe_server(&mut self, value: &Value) {
+        let Self::ThreadResponse { request_id } = self else {
+            return;
+        };
+        if value.get("id").and_then(json_id_key).as_deref() != Some(request_id.as_str()) {
+            return;
+        }
+        *self = value
+            .pointer("/result/thread/id")
+            .and_then(Value::as_str)
+            .filter(|thread_id| protocol_id_is_valid(thread_id))
+            .map(|thread_id| Self::FirstTurn {
+                thread_id: thread_id.to_string(),
+            })
+            .unwrap_or(Self::Closed);
+    }
+
+    fn close(&mut self) {
+        *self = Self::Closed;
+    }
+}
+
+struct MutationAuthorization {
+    _bootstrap_gate: Option<CreateBootstrapGate>,
+}
+
+fn auto_resume_is_healthy_disabled(context: &CliContext, record: &SessionRecord) -> bool {
+    let view = crate::auto_resume::view_for_record(context, record);
+    view.supported && !view.enabled && view.state == "disabled" && view.failure_reason.is_none()
+}
+
 async fn cancel_before_tui_mutation(
     context: &CliContext,
     record: &SessionRecord,
+    bootstrap: &mut FreshBootstrap,
     value: &Value,
-) -> bool {
-    if !matches!(
-        value.get("method").and_then(Value::as_str),
-        Some("thread/start" | "turn/start")
-    ) {
-        return true;
+) -> Option<MutationAuthorization> {
+    let method = value.get("method").and_then(Value::as_str);
+    if !matches!(method, Some("thread/start" | "turn/start")) {
+        return Some(MutationAuthorization {
+            _bootstrap_gate: None,
+        });
     }
-    let context = context.clone();
+    // A fresh Codex TUI emits `thread/start`, then the initial prompt emits
+    // `turn/start`, while the parent create path still owns the lifecycle lock.
+    // The create-owned marker and exact disabled auto-resume state are checked
+    // live for both requests. The first turn is armed only by a successful
+    // matching thread/start response and must target the returned thread id.
+    #[cfg(test)]
+    NORMAL_CANCELLATION_ATTEMPTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let bootstrap_gate = if matches!(bootstrap, FreshBootstrap::Closed) {
+        None
+    } else {
+        let gate_record = record.clone();
+        tokio::task::spawn_blocking(move || acquire_create_bootstrap_gate(&gate_record))
+            .await
+            .ok()
+            .flatten()
+    };
+    let cancellation_context = context.clone();
     let id = record.id.clone();
-    let Some(launch_id) = record
+    let launch_id = record
         .runtime
         .as_ref()
-        .map(|runtime| runtime.launch_id.clone())
-    else {
-        return false;
-    };
-    tokio::task::spawn_blocking(move || {
+        .map(|runtime| runtime.launch_id.clone())?;
+    let cancellation = tokio::task::spawn_blocking(move || {
         crate::auto_resume::try_cancel_for_manual_input_for_runtime(
-            &context,
+            &cancellation_context,
             &id,
             &launch_id,
             &Timestamp::now().to_string(),
@@ -1328,14 +1580,49 @@ async fn cancel_before_tui_mutation(
     })
     .await
     .ok()
-    .and_then(Result::ok)
-    .unwrap_or(false)
+    .and_then(Result::ok);
+    match cancellation {
+        Some(crate::auto_resume::ManualInputCancelOutcome::Ready) => {
+            bootstrap.close();
+            Some(MutationAuthorization {
+                _bootstrap_gate: bootstrap_gate,
+            })
+        }
+        Some(crate::auto_resume::ManualInputCancelOutcome::Busy)
+            if bootstrap_gate.is_some()
+                && bootstrap.bypasses_create_lock(context, record, value) =>
+        {
+            Some(MutationAuthorization {
+                _bootstrap_gate: bootstrap_gate,
+            })
+        }
+        Some(crate::auto_resume::ManualInputCancelOutcome::Busy) => None,
+        Some(crate::auto_resume::ManualInputCancelOutcome::RuntimeChanged) | None => {
+            bootstrap.close();
+            None
+        }
+    }
 }
 
 fn proxy_websocket_config() -> WebSocketConfig {
     WebSocketConfig::default()
         .max_message_size(Some(MAX_PROXY_MESSAGE_BYTES))
         .max_frame_size(Some(MAX_PROXY_FRAME_BYTES))
+}
+
+async fn send_proxy_upstream<S>(
+    upstream: &mut S,
+    message: Message,
+    timeout: Duration,
+) -> Result<(), String>
+where
+    S: futures_util::Sink<Message> + Unpin,
+    S::Error: std::fmt::Display,
+{
+    tokio::time::timeout(timeout, upstream.send(message))
+        .await
+        .map_err(|_| "upstream app-server write timed out".to_string())?
+        .map_err(|err| format!("upstream app-server write failed: {err}"))
 }
 
 async fn run_proxy_session(
@@ -1384,14 +1671,20 @@ async fn run_proxy_session(
     .map_err(|_| "upstream app-server WebSocket handshake timed out".to_string())?
     .map_err(|err| format!("upstream app-server handshake failed: {err}"))?;
     let mut projection = ProxyProjection::new(context.clone(), record.clone());
+    let mut bootstrap = FreshBootstrap::for_runtime(&context, &record);
     loop {
         tokio::select! {
             message = tui.next() => {
                 let message = message
                     .ok_or_else(|| "remote TUI closed the proxy".to_string())?
                     .map_err(|err| format!("remote TUI read failed: {err}"))?;
-                if let Some(value) = message_value(&message) {
-                    if !cancel_before_tui_mutation(&context, &record, &value).await {
+                let authorization = if let Some(value) = message_value(&message) {
+                    let Some(authorization) = cancel_before_tui_mutation(
+                        &context,
+                        &record,
+                        &mut bootstrap,
+                        &value,
+                    ).await else {
                         if let Some(id) = value
                             .get("id")
                             .filter(|id| json_id_key(id).is_some())
@@ -1411,12 +1704,15 @@ async fn run_proxy_session(
                             .map_err(|err| format!("remote TUI write failed: {err}"))?;
                         }
                         continue;
-                    }
+                    };
                     projection.observe_client(&value);
-                }
+                    authorization
+                } else {
+                    MutationAuthorization { _bootstrap_gate: None }
+                };
                 let closed = matches!(message, Message::Close(_));
-                upstream.send(message).await
-                    .map_err(|err| format!("upstream app-server write failed: {err}"))?;
+                send_proxy_upstream(&mut upstream, message, CONTROL_RESPONSE_TIMEOUT).await?;
+                drop(authorization);
                 if closed {
                     projection.finish().await;
                     return Ok(());
@@ -1428,6 +1724,9 @@ async fn run_proxy_session(
                     .map_err(|err| format!("upstream app-server read failed: {err}"))?;
                 let observed = message.clone();
                 let closed = matches!(message, Message::Close(_));
+                if let Some(value) = message_value(&observed) {
+                    bootstrap.observe_server(&value);
+                }
                 tui.send(message).await
                     .map_err(|err| format!("remote TUI write failed: {err}"))?;
                 projection.observe_server(&observed);
@@ -1632,6 +1931,37 @@ mod tests {
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
 
+    struct PendingMessageSink;
+
+    impl futures_util::Sink<Message> for PendingMessageSink {
+        type Error = std::io::Error;
+
+        fn poll_ready(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), Self::Error>> {
+            std::task::Poll::Pending
+        }
+
+        fn start_send(self: std::pin::Pin<&mut Self>, _item: Message) -> Result<(), Self::Error> {
+            unreachable!("pending sink never becomes ready")
+        }
+
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), Self::Error>> {
+            std::task::Poll::Pending
+        }
+
+        fn poll_close(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), Self::Error>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
     fn record_with_runtime(id: &str, socket: &Path) -> SessionRecord {
         SessionRecord {
             schema_version: crate::SESSION_DOCUMENT_VERSION.to_string(),
@@ -1675,6 +2005,27 @@ mod tests {
             extra: BTreeMap::new(),
             resume_sidecar_extra: BTreeMap::new(),
         }
+    }
+
+    fn write_create_bootstrap_marker(record: &SessionRecord) {
+        let runtime = record.runtime.as_ref().unwrap();
+        write_private_file(
+            thread_handoff_path(record).unwrap(),
+            runtime.launch_id.as_bytes(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn create_bootstrap_guard_owns_the_marker_lifetime() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let record = record_with_runtime("guard", &tmp.path().join("guard.sock"));
+        let marker = thread_handoff_path(&record).unwrap().to_path_buf();
+        let guard = begin_create_bootstrap(&record).unwrap().unwrap();
+        assert!(create_bootstrap_is_live(&record));
+        drop(guard);
+        assert!(!marker.exists());
+        assert!(!create_bootstrap_is_live(&record));
     }
 
     #[test]
@@ -1744,6 +2095,12 @@ mod tests {
         assert!(script.contains("\"$agent\" --remote \"unix://$proxy\""));
         assert!(!script.contains("--remote \"unix://$socket\""));
         assert!(!script.contains("thread/shellCommand"));
+        let cleanup_lines = script
+            .lines()
+            .filter(|line| line.trim_start().starts_with("rm -f --"))
+            .collect::<Vec<_>>();
+        assert!(!cleanup_lines[0].contains("$handoff"));
+        assert!(cleanup_lines[1].contains("$handoff"));
     }
 
     #[test]
@@ -2651,6 +3008,545 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(receive_json(&mut tui).await["id"], 2);
+        server.await.unwrap();
+        proxy.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn fresh_tui_thread_start_bypasses_the_create_lifecycle_lock() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let upstream = tmp.path().join("fresh-start.sock");
+        let listener = tokio::net::UnixListener::bind(&upstream).unwrap();
+        let context = CliContext {
+            state_dir: tmp.path().join("state"),
+            host: None,
+        };
+        let record = record_with_runtime("fresh-start", &upstream);
+        fs::create_dir_all(crate::session_dir(&context, &record.id)).unwrap();
+        crate::write_session_record(&context, &record).unwrap();
+        crate::activity::activate_runtime(&context, &record).unwrap();
+        write_create_bootstrap_marker(&record);
+        let proxy_args = crate::cli::CodexAppServerProxyArgs {
+            id: record.id.clone(),
+            upstream: upstream.clone(),
+            listen: upstream.with_extension("proxy"),
+        };
+        let proxy_context = context.clone();
+        let proxy = tokio::spawn(async move { run_proxy_session(proxy_context, proxy_args).await });
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let request = receive_json(&mut socket).await;
+            assert_eq!(request["method"], "thread/start");
+            respond(
+                &mut socket,
+                &request,
+                json!({ "thread": { "id": "fresh-thread" } }),
+            )
+            .await;
+            let request = receive_json(&mut socket).await;
+            assert_eq!(request["id"], 2);
+            assert_eq!(request["method"], "turn/start");
+            respond(
+                &mut socket,
+                &request,
+                json!({ "turn": { "id": "first-turn", "status": "inProgress" } }),
+            )
+            .await;
+            let request = receive_json(&mut socket).await;
+            assert_eq!(request["id"], 4);
+            assert_eq!(request["method"], "thread/read");
+            respond(
+                &mut socket,
+                &request,
+                json!({ "thread": { "id": "fresh-thread" } }),
+            )
+            .await;
+            socket.close(None).await.unwrap();
+        });
+        let proxy_stream = connect_socket(&upstream.with_extension("proxy"))
+            .await
+            .unwrap();
+        let (mut tui, _) = tokio_tungstenite::client_async("ws://localhost", proxy_stream)
+            .await
+            .unwrap();
+        let lock = crate::acquire_session_record_lock(&context, &record.id).unwrap();
+        tui.send(Message::Text(
+            json!({
+                "id": 1,
+                "method": "thread/start",
+                "params": { "cwd": "/repo" }
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .unwrap();
+        let response = receive_json(&mut tui).await;
+        assert_eq!(response["id"], 1);
+        assert_eq!(response["result"]["thread"]["id"], "fresh-thread");
+        tui.send(Message::Text(
+            json!({
+                "id": 2,
+                "method": "turn/start",
+                "params": { "threadId": "fresh-thread", "input": [] }
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .unwrap();
+        let response = receive_json(&mut tui).await;
+        assert_eq!(response["id"], 2);
+        assert_eq!(response["result"]["turn"]["id"], "first-turn");
+        tui.send(Message::Text(
+            json!({
+                "id": 3,
+                "method": "turn/start",
+                "params": { "threadId": "fresh-thread", "input": [] }
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .unwrap();
+        let rejected = receive_json(&mut tui).await;
+        assert_eq!(rejected["id"], 3);
+        assert_eq!(rejected["error"]["code"], -32001);
+        tui.send(Message::Text(
+            json!({ "id": 4, "method": "thread/read", "params": {} })
+                .to_string()
+                .into(),
+        ))
+        .await
+        .unwrap();
+        assert_eq!(receive_json(&mut tui).await["id"], 4);
+        drop(lock);
+        server.await.unwrap();
+        proxy.await.unwrap().unwrap();
+    }
+
+    #[test]
+    fn fresh_bootstrap_first_turn_must_match_the_successful_thread_start() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let socket = tmp.path().join("fresh-bound.sock");
+        let context = CliContext {
+            state_dir: tmp.path().join("state"),
+            host: None,
+        };
+        let record = record_with_runtime("fresh-bound", &socket);
+        fs::create_dir_all(crate::session_dir(&context, &record.id)).unwrap();
+        crate::write_session_record(&context, &record).unwrap();
+        crate::activity::activate_runtime(&context, &record).unwrap();
+        write_create_bootstrap_marker(&record);
+        let mut bootstrap = FreshBootstrap::for_runtime(&context, &record);
+        assert!(bootstrap.bypasses_create_lock(
+            &context,
+            &record,
+            &json!({ "id": 1, "method": "thread/start", "params": {} }),
+        ));
+        bootstrap
+            .observe_server(&json!({ "id": 1, "result": { "thread": { "id": "fresh-thread" } } }));
+        assert!(!bootstrap.bypasses_create_lock(
+            &context,
+            &record,
+            &json!({
+                "id": 2,
+                "method": "turn/start",
+                "params": { "threadId": "different-thread", "input": [] }
+            }),
+        ));
+        assert_eq!(bootstrap, FreshBootstrap::Closed);
+    }
+
+    #[test]
+    fn closed_fresh_bootstrap_skips_live_filesystem_validation() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let record = record_with_runtime("closed-bootstrap", &tmp.path().join("closed.sock"));
+        let context = CliContext {
+            state_dir: tmp.path().join("state"),
+            host: None,
+        };
+        BOOTSTRAP_LIVE_CHECKS.with(|checks| checks.set(0));
+        let mut bootstrap = FreshBootstrap::Closed;
+        assert!(!bootstrap.bypasses_create_lock(
+            &context,
+            &record,
+            &json!({ "id": 1, "method": "turn/start", "params": {} }),
+        ));
+        assert_eq!(BOOTSTRAP_LIVE_CHECKS.with(std::cell::Cell::get), 0);
+    }
+
+    #[tokio::test]
+    async fn marker_live_lock_free_turn_attempts_normal_cancellation_before_bypass() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let socket = tmp.path().join("teardown-window.sock");
+        let context = CliContext {
+            state_dir: tmp.path().join("state"),
+            host: None,
+        };
+        let record = record_with_runtime("teardown-window", &socket);
+        fs::create_dir_all(crate::session_dir(&context, &record.id)).unwrap();
+        crate::write_session_record(&context, &record).unwrap();
+        crate::activity::activate_runtime(&context, &record).unwrap();
+        write_create_bootstrap_marker(&record);
+        let mut bootstrap = FreshBootstrap::FirstTurn {
+            thread_id: "fresh-thread".to_string(),
+        };
+        NORMAL_CANCELLATION_ATTEMPTS.store(0, std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            cancel_before_tui_mutation(
+                &context,
+                &record,
+                &mut bootstrap,
+                &json!({
+                    "id": 2,
+                    "method": "turn/start",
+                    "params": { "threadId": "fresh-thread", "input": [] }
+                }),
+            )
+            .await
+            .is_some()
+        );
+        assert_eq!(
+            NORMAL_CANCELLATION_ATTEMPTS.load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+        assert_eq!(bootstrap, FreshBootstrap::Closed);
+    }
+
+    #[tokio::test]
+    async fn replacement_lock_cannot_reuse_marker_during_gated_teardown() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let socket = tmp.path().join("gated-teardown.sock");
+        let context = CliContext {
+            state_dir: tmp.path().join("state"),
+            host: None,
+        };
+        let record = record_with_runtime("gated-teardown", &socket);
+        fs::create_dir_all(crate::session_dir(&context, &record.id)).unwrap();
+        crate::write_session_record(&context, &record).unwrap();
+        crate::activity::activate_runtime(&context, &record).unwrap();
+        let create_lock = crate::acquire_session_record_lock(&context, &record.id).unwrap();
+        let bootstrap_guard = begin_create_bootstrap(&record).unwrap().unwrap();
+        assert!(lock_bootstrap_file(&bootstrap_guard.file));
+        drop(create_lock);
+        let replacement_lock = crate::acquire_session_record_lock(&context, &record.id).unwrap();
+
+        BOOTSTRAP_GATE_ATTEMPTS.store(0, std::sync::atomic::Ordering::Relaxed);
+        let task_context = context.clone();
+        let task_record = record.clone();
+        let task = tokio::spawn(async move {
+            let mut bootstrap = FreshBootstrap::FirstTurn {
+                thread_id: "fresh-thread".to_string(),
+            };
+            let authorization = cancel_before_tui_mutation(
+                &task_context,
+                &task_record,
+                &mut bootstrap,
+                &json!({
+                    "id": 2,
+                    "method": "turn/start",
+                    "params": { "threadId": "fresh-thread", "input": [] }
+                }),
+            )
+            .await;
+            (authorization.is_some(), bootstrap)
+        });
+        for _ in 0..100 {
+            if BOOTSTRAP_GATE_ATTEMPTS.load(std::sync::atomic::Ordering::Relaxed) > 0 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            BOOTSTRAP_GATE_ATTEMPTS.load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+        fs::remove_file(thread_handoff_path(&record).unwrap()).unwrap();
+        unlock_bootstrap_file(&bootstrap_guard.file);
+
+        let (authorized, _) = task.await.unwrap();
+        assert!(!authorized);
+        drop(replacement_lock);
+        drop(bootstrap_guard);
+    }
+
+    #[tokio::test]
+    async fn stalled_upstream_write_times_out_and_releases_bootstrap_gate() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let record = record_with_runtime("stalled-write", &tmp.path().join("stalled.sock"));
+        fs::create_dir_all(crate::session_dir(
+            &CliContext {
+                state_dir: tmp.path().join("state"),
+                host: None,
+            },
+            &record.id,
+        ))
+        .unwrap();
+        let context = CliContext {
+            state_dir: tmp.path().join("state"),
+            host: None,
+        };
+        crate::write_session_record(&context, &record).unwrap();
+        let lifecycle_lock = crate::acquire_session_record_lock(&context, &record.id).unwrap();
+        let bootstrap_guard = begin_create_bootstrap(&record).unwrap().unwrap();
+        let authorization = MutationAuthorization {
+            _bootstrap_gate: acquire_create_bootstrap_gate(&record),
+        };
+        assert!(authorization._bootstrap_gate.is_some());
+        let (finished_tx, finished_rx) = std::sync::mpsc::channel();
+        let teardown = std::thread::spawn(move || {
+            bootstrap_guard.finish(|| drop(lifecycle_lock));
+            finished_tx.send(()).unwrap();
+        });
+        assert!(
+            finished_rx.recv_timeout(Duration::from_millis(10)).is_err(),
+            "teardown must wait while the proxy owns the gate"
+        );
+        let mut upstream = PendingMessageSink;
+        let error = send_proxy_upstream(
+            &mut upstream,
+            Message::Text("stalled".into()),
+            Duration::from_millis(10),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error, "upstream app-server write timed out");
+        drop(authorization);
+        finished_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        teardown.join().unwrap();
+        assert!(
+            crate::try_acquire_session_record_lock(&context, &record.id)
+                .unwrap()
+                .is_some()
+        );
+        assert!(!thread_handoff_path(&record).unwrap().exists());
+    }
+
+    #[tokio::test]
+    async fn fresh_tui_first_turn_does_not_bypass_after_create_marker_is_removed() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let upstream = tmp.path().join("fresh-expired.sock");
+        let listener = tokio::net::UnixListener::bind(&upstream).unwrap();
+        let context = CliContext {
+            state_dir: tmp.path().join("state"),
+            host: None,
+        };
+        let record = record_with_runtime("fresh-expired", &upstream);
+        fs::create_dir_all(crate::session_dir(&context, &record.id)).unwrap();
+        crate::write_session_record(&context, &record).unwrap();
+        crate::activity::activate_runtime(&context, &record).unwrap();
+        write_create_bootstrap_marker(&record);
+        let proxy_args = crate::cli::CodexAppServerProxyArgs {
+            id: record.id.clone(),
+            upstream: upstream.clone(),
+            listen: upstream.with_extension("proxy"),
+        };
+        let proxy_context = context.clone();
+        let proxy = tokio::spawn(async move { run_proxy_session(proxy_context, proxy_args).await });
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let start = receive_json(&mut socket).await;
+            respond(
+                &mut socket,
+                &start,
+                json!({ "thread": { "id": "fresh-thread" } }),
+            )
+            .await;
+            loop {
+                let request = receive_json(&mut socket).await;
+                respond(&mut socket, &request, json!({ "ok": true })).await;
+                if request["id"] == 3 {
+                    break;
+                }
+            }
+            socket.close(None).await.unwrap();
+        });
+        let proxy_stream = connect_socket(&upstream.with_extension("proxy"))
+            .await
+            .unwrap();
+        let (mut tui, _) = tokio_tungstenite::client_async("ws://localhost", proxy_stream)
+            .await
+            .unwrap();
+        let lock = crate::acquire_session_record_lock(&context, &record.id).unwrap();
+        tui.send(Message::Text(
+            json!({ "id": 1, "method": "thread/start", "params": { "cwd": "/repo" } })
+                .to_string()
+                .into(),
+        ))
+        .await
+        .unwrap();
+        assert_eq!(receive_json(&mut tui).await["id"], 1);
+        fs::remove_file(thread_handoff_path(&record).unwrap()).unwrap();
+        tui.send(Message::Text(
+            json!({
+                "id": 2,
+                "method": "turn/start",
+                "params": { "threadId": "fresh-thread", "input": [] }
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .unwrap();
+        let rejected = receive_json(&mut tui).await;
+        assert_eq!(rejected["id"], 2);
+        assert_eq!(rejected["error"]["code"], -32001);
+        drop(lock);
+        tui.send(Message::Text(
+            json!({ "id": 3, "method": "thread/read", "params": {} })
+                .to_string()
+                .into(),
+        ))
+        .await
+        .unwrap();
+        assert_eq!(receive_json(&mut tui).await["id"], 3);
+        server.await.unwrap();
+        proxy.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn fresh_tui_does_not_bypass_when_auto_resume_state_is_unavailable() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let upstream = tmp.path().join("fresh-unavailable.sock");
+        let listener = tokio::net::UnixListener::bind(&upstream).unwrap();
+        let context = CliContext {
+            state_dir: tmp.path().join("state"),
+            host: None,
+        };
+        let record = record_with_runtime("fresh-unavailable", &upstream);
+        let session_dir = crate::session_dir(&context, &record.id);
+        fs::create_dir_all(&session_dir).unwrap();
+        crate::write_session_record(&context, &record).unwrap();
+        crate::activity::activate_runtime(&context, &record).unwrap();
+        write_create_bootstrap_marker(&record);
+        fs::write(session_dir.join("auto-resume.json"), b"not-json").unwrap();
+        let proxy_args = crate::cli::CodexAppServerProxyArgs {
+            id: record.id.clone(),
+            upstream: upstream.clone(),
+            listen: upstream.with_extension("proxy"),
+        };
+        let proxy_context = context.clone();
+        let proxy = tokio::spawn(async move { run_proxy_session(proxy_context, proxy_args).await });
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let request = receive_json(&mut socket).await;
+            respond(&mut socket, &request, json!({ "ok": true })).await;
+            socket.close(None).await.unwrap();
+        });
+        let proxy_stream = connect_socket(&upstream.with_extension("proxy"))
+            .await
+            .unwrap();
+        let (mut tui, _) = tokio_tungstenite::client_async("ws://localhost", proxy_stream)
+            .await
+            .unwrap();
+        let lock = crate::acquire_session_record_lock(&context, &record.id).unwrap();
+        tui.send(Message::Text(
+            json!({ "id": 1, "method": "thread/start", "params": { "cwd": "/repo" } })
+                .to_string()
+                .into(),
+        ))
+        .await
+        .unwrap();
+        let rejected = receive_json(&mut tui).await;
+        assert_eq!(rejected["id"], 1);
+        assert_eq!(rejected["error"]["code"], -32001);
+        drop(lock);
+        tui.send(Message::Text(
+            json!({ "id": 2, "method": "thread/read", "params": {} })
+                .to_string()
+                .into(),
+        ))
+        .await
+        .unwrap();
+        assert_eq!(receive_json(&mut tui).await["id"], 2);
+        server.await.unwrap();
+        proxy.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn fresh_tui_first_turn_requires_a_successful_bound_thread_start() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let upstream = tmp.path().join("fresh-correlation.sock");
+        let listener = tokio::net::UnixListener::bind(&upstream).unwrap();
+        let context = CliContext {
+            state_dir: tmp.path().join("state"),
+            host: None,
+        };
+        let record = record_with_runtime("fresh-correlation", &upstream);
+        fs::create_dir_all(crate::session_dir(&context, &record.id)).unwrap();
+        crate::write_session_record(&context, &record).unwrap();
+        crate::activity::activate_runtime(&context, &record).unwrap();
+        write_create_bootstrap_marker(&record);
+        let proxy_args = crate::cli::CodexAppServerProxyArgs {
+            id: record.id.clone(),
+            upstream: upstream.clone(),
+            listen: upstream.with_extension("proxy"),
+        };
+        let proxy_context = context.clone();
+        let proxy = tokio::spawn(async move { run_proxy_session(proxy_context, proxy_args).await });
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let start = receive_json(&mut socket).await;
+            socket
+                .send(Message::Text(
+                    json!({ "id": start["id"], "error": { "code": -32000, "message": "rejected" } })
+                        .to_string()
+                        .into(),
+                ))
+                .await
+                .unwrap();
+            loop {
+                let request = receive_json(&mut socket).await;
+                respond(&mut socket, &request, json!({ "ok": true })).await;
+                if request["id"] == 3 {
+                    break;
+                }
+            }
+            socket.close(None).await.unwrap();
+        });
+        let proxy_stream = connect_socket(&upstream.with_extension("proxy"))
+            .await
+            .unwrap();
+        let (mut tui, _) = tokio_tungstenite::client_async("ws://localhost", proxy_stream)
+            .await
+            .unwrap();
+        let lock = crate::acquire_session_record_lock(&context, &record.id).unwrap();
+        tui.send(Message::Text(
+            json!({ "id": 1, "method": "thread/start", "params": { "cwd": "/repo" } })
+                .to_string()
+                .into(),
+        ))
+        .await
+        .unwrap();
+        assert_eq!(receive_json(&mut tui).await["error"]["code"], -32000);
+        tui.send(Message::Text(
+            json!({
+                "id": 2,
+                "method": "turn/start",
+                "params": { "threadId": "unbound-thread", "input": [] }
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .unwrap();
+        let rejected = receive_json(&mut tui).await;
+        assert_eq!(rejected["id"], 2);
+        assert_eq!(rejected["error"]["code"], -32001);
+        drop(lock);
+        tui.send(Message::Text(
+            json!({ "id": 3, "method": "thread/read", "params": {} })
+                .to_string()
+                .into(),
+        ))
+        .await
+        .unwrap();
+        assert_eq!(receive_json(&mut tui).await["id"], 3);
         server.await.unwrap();
         proxy.await.unwrap().unwrap();
     }

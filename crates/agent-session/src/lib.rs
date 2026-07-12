@@ -753,6 +753,14 @@ fn start_session(context: &CliContext, args: cli::StartArgs) -> Result<StartView
         return Err(err);
     }
 
+    let create_bootstrap = match codex_app_server::begin_create_bootstrap(&created.record) {
+        Ok(guard) => guard,
+        Err(err) => {
+            cleanup_created_record(context, &created);
+            return Err(err);
+        }
+    };
+
     if let Err(err) = start_interactive_tmux(
         &tmux_bin,
         &agent_bin,
@@ -794,6 +802,14 @@ fn start_session(context: &CliContext, args: cli::StartArgs) -> Result<StartView
         Some(&tmux_bin),
     );
     record_workdir_usage(context, &cwd);
+    // Keep the app-server bootstrap marker valid for the entire create-lock
+    // lifetime. Explicit ordering avoids Rust's reverse local-drop order from
+    // removing the marker while the lifecycle lock is still held.
+    if let Some(create_bootstrap) = create_bootstrap {
+        create_bootstrap.finish(|| created.release_lifecycle_lock());
+    } else {
+        created.release_lifecycle_lock();
+    }
     Ok(StartView {
         format: args.format,
         result,
@@ -932,7 +948,6 @@ struct CreatedRecord {
 }
 
 impl CreatedRecord {
-    #[cfg(test)]
     fn release_lifecycle_lock(&mut self) {
         self._lifecycle_lock = None;
     }

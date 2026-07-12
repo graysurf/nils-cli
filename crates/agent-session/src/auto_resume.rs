@@ -285,24 +285,31 @@ pub(crate) fn cancel_for_manual_input_locked(
     write_state(context, id, &state)
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ManualInputCancelOutcome {
+    Ready,
+    Busy,
+    RuntimeChanged,
+}
+
 pub(crate) fn try_cancel_for_manual_input_for_runtime(
     context: &CliContext,
     id: &str,
     expected_launch_id: &str,
     now: &str,
-) -> Result<bool, CliError> {
+) -> Result<ManualInputCancelOutcome, CliError> {
     let observed = load_session_record(context, id)?;
     let canonical_id = observed.id.clone();
     let Some(_lock) = try_acquire_session_record_lock(context, &canonical_id)? else {
-        return Ok(false);
+        return Ok(ManualInputCancelOutcome::Busy);
     };
     let record = load_session_record(context, &canonical_id)?;
     crate::ensure_same_session_identity(&observed, &record)?;
     if !runtime_matches(&record, Some(expected_launch_id)) {
-        return Ok(false);
+        return Ok(ManualInputCancelOutcome::RuntimeChanged);
     }
     cancel_for_manual_input_locked(context, &record.id, now)?;
-    Ok(true)
+    Ok(ManualInputCancelOutcome::Ready)
 }
 
 pub(crate) fn fail_closed_projection_for_runtime(
