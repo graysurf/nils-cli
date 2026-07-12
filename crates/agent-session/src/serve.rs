@@ -52,16 +52,17 @@ use tokio::task::JoinSet;
 
 use crate::auto_resume::{self, UsageSnapshot};
 use crate::cli::{self, AgentKind, SpecialKey};
+use crate::codex_app_server::{self, ControlHandle};
 use crate::provider_prompt::{
     MAX_PROVIDER_PROMPT_BYTES, PROVIDER_PROMPT_CAPABILITY, ProviderKind, ProviderPromptEvent,
     ProviderPromptSource, ProviderPromptTail,
 };
 use crate::{
-    BINARY, CliContext, CliError, ProviderResumeImportArgs, SessionView, WorkdirSearchOptions,
-    delete_session, glance_session, list_sessions, load_session_record, non_empty_env,
-    repo_remote_url_from_cwd, resolve_tmux_bin, resume_session_by_id, search_workdirs,
-    send_auto_resume_input, send_input_serialized, session_clipboard_buffer, session_dir,
-    session_status, short_hostname, start_provider_resume_session, start_session,
+    BINARY, CliContext, CliError, ProviderResumeImportArgs, SessionRecord, SessionView,
+    WorkdirSearchOptions, delete_session, glance_session, list_sessions, load_session_record,
+    non_empty_env, repo_remote_url_from_cwd, resolve_tmux_bin, resume_session_by_id,
+    search_workdirs, send_auto_resume_input, send_input_serialized, session_clipboard_buffer,
+    session_dir, session_status, short_hostname, start_provider_resume_session, start_session,
     update_session_title, write_session_attachment,
 };
 
@@ -90,6 +91,7 @@ const PROVIDER_PROMPT_PENDING_TIMEOUT: Duration = Duration::from_secs(2 * 60);
 const PROVIDER_PROMPT_DISCOVERY_MAX_BACKOFF: Duration = Duration::from_secs(30);
 const PROVIDER_PROMPT_DISCOVERY_MAX_ENTRIES: usize = 64;
 const PROVIDER_PROMPT_DISCOVERY_MAX_CONCURRENT_SCANS: usize = 4;
+const MAX_CONCURRENT_AUTO_RESUME_TICKS: usize = 4;
 const ATTACH_SCHEMA_VERSION: &str = "agent-session.attach.v1";
 const ATTACH_EVENT_SCHEMA_VERSION: &str = "agent-session.attach.event.v1";
 const ACTIVITY_STREAM_EVENT_SCHEMA_VERSION: &str = "agent-session.activity-stream.event.v1";
@@ -125,7 +127,14 @@ struct ServeState {
     attach_brokers: AttachBrokerRegistry,
     provider_prompt_discovery: Arc<ProviderPromptDiscoveryRegistry>,
     activity_broker: Arc<ActivityBroker>,
+    codex_controls: Arc<StdMutex<HashMap<String, CodexControlEntry>>>,
     session_collector: SessionCollector,
+}
+
+#[derive(Clone)]
+struct CodexControlEntry {
+    launch_id: String,
+    handle: ControlHandle,
 }
 
 fn default_session_collector() -> SessionCollector {
@@ -205,6 +214,7 @@ pub fn run_serve(context: &CliContext, args: cli::ServeArgs) -> i32 {
             attach_brokers: AttachBrokerRegistry::default(),
             provider_prompt_discovery: Arc::new(ProviderPromptDiscoveryRegistry::default()),
             activity_broker,
+            codex_controls: Arc::new(StdMutex::new(HashMap::new())),
             session_collector,
         });
         let listener = match tokio::net::TcpListener::bind(bind).await {
@@ -219,12 +229,15 @@ pub fn run_serve(context: &CliContext, args: cli::ServeArgs) -> i32 {
             state.machine
         );
         let app = router(state.clone());
+        let codex_control_task = tokio::spawn(codex_control_loop(state.clone()));
         let auto_resume_task = tokio::spawn(auto_resume_loop(state.clone()));
         let result = axum::serve(listener, app)
             .with_graceful_shutdown(shutdown_signal())
             .await;
         auto_resume_task.abort();
         let _ = auto_resume_task.await;
+        codex_control_task.abort();
+        let _ = codex_control_task.await;
         state.attach_brokers.shutdown_all().await;
         match result {
             Ok(()) => exit::SUCCESS,
@@ -2196,6 +2209,7 @@ async fn create_handler(
         };
     }
     let args = cli::StartArgs {
+        app_server_managed: true,
         agent,
         cwd: body.cwd.map(PathBuf::from),
         title: body.title,
@@ -2360,6 +2374,15 @@ async fn auto_resume_loop(state: Arc<ServeState>) {
             .await;
         }
         if !pending.usage_ids.is_empty() {
+            let (codex_ids, claude_ids) =
+                partition_auto_resume_ids(&state, pending.usage_ids).await;
+            if !codex_ids.is_empty() {
+                process_codex_auto_resume_ids(state.clone(), codex_ids).await;
+            }
+            if claude_ids.is_empty() {
+                tokio::time::sleep(POLL_INTERVAL).await;
+                continue;
+            }
             let timeout = usage_timeout();
             let provider = tokio::task::spawn_blocking(move || collect_claude_usage(timeout))
                 .await
@@ -2377,14 +2400,249 @@ async fn auto_resume_loop(state: Arc<ServeState>) {
                     .filter_map(|window| window.reset_at_epoch)
                     .collect(),
             };
-            process_auto_resume_ids(state.clone(), pending.usage_ids, usage).await;
+            process_auto_resume_ids(state.clone(), claude_ids, usage).await;
         }
         tokio::time::sleep(POLL_INTERVAL).await;
     }
 }
 
+#[derive(Clone)]
+struct CodexAutoResumeTarget {
+    id: String,
+    launch_id: String,
+}
+
+async fn partition_auto_resume_ids(
+    state: &ServeState,
+    ids: Vec<String>,
+) -> (Vec<CodexAutoResumeTarget>, Vec<String>) {
+    let context = state.context.clone();
+    tokio::task::spawn_blocking(move || {
+        let mut codex = Vec::new();
+        let mut other = Vec::new();
+        for id in ids {
+            let target = load_session_record(&context, &id)
+                .ok()
+                .filter(codex_app_server::runtime_is_supported)
+                .and_then(|record| {
+                    record.runtime.map(|runtime| CodexAutoResumeTarget {
+                        id: record.id,
+                        launch_id: runtime.launch_id,
+                    })
+                });
+            if let Some(target) = target {
+                codex.push(target);
+            } else {
+                other.push(id);
+            }
+        }
+        (codex, other)
+    })
+    .await
+    .unwrap_or_default()
+}
+
+async fn process_codex_auto_resume_ids(
+    state: Arc<ServeState>,
+    targets: Vec<CodexAutoResumeTarget>,
+) {
+    let mut tasks = JoinSet::new();
+    for target in targets {
+        let state = state.clone();
+        tasks.spawn(async move { process_codex_auto_resume_id(state, target).await });
+        if tasks.len() >= MAX_CONCURRENT_AUTO_RESUME_TICKS {
+            report_auto_resume_join(tasks.join_next().await);
+        }
+    }
+    while !tasks.is_empty() {
+        report_auto_resume_join(tasks.join_next().await);
+    }
+}
+
+async fn process_codex_auto_resume_id(state: Arc<ServeState>, target: CodexAutoResumeTarget) {
+    let control = state
+        .codex_controls
+        .lock()
+        .ok()
+        .and_then(|controls| controls.get(&target.id).cloned());
+    let Some(control) = control else {
+        record_codex_scheduler_error_for_runtime(
+            state.context.clone(),
+            target.id,
+            target.launch_id,
+            "usage_unavailable",
+        )
+        .await;
+        return;
+    };
+    if control.launch_id != target.launch_id {
+        record_codex_scheduler_error_for_runtime(
+            state.context.clone(),
+            target.id,
+            target.launch_id,
+            "usage_unavailable",
+        )
+        .await;
+        return;
+    }
+    let usage = match control.handle.usage().await {
+        Ok(usage) => usage,
+        Err(_) => {
+            record_codex_scheduler_error_for_runtime(
+                state.context.clone(),
+                target.id,
+                target.launch_id,
+                "usage_unavailable",
+            )
+            .await;
+            return;
+        }
+    };
+    let context = state.context.clone();
+    let runtime = tokio::runtime::Handle::current();
+    let handle = control.handle.clone();
+    let expected_launch_id = target.launch_id;
+    let id = target.id;
+    tokio::task::spawn_blocking(move || {
+        let now_epoch = jiff::Timestamp::now().as_second();
+        if let Err(err) = auto_resume::tick_for_runtime(
+            &context,
+            &id,
+            &expected_launch_id,
+            now_epoch,
+            &usage,
+            |_| {
+                runtime
+                    .block_on(handle.submit(auto_resume::CONTINUATION_MESSAGE))
+                    .map(|_| ())
+                    .map_err(|_| {
+                        CliError::runtime(
+                            "codex-app-server-submit-unknown",
+                            "Codex continuation submission outcome is unknown",
+                            Some(json!({ "id": id })),
+                        )
+                    })
+            },
+        ) {
+            eprintln!("warning: Codex auto-resume tick failed: {}", err.code());
+        }
+    })
+    .await
+    .ok();
+}
+
+async fn record_codex_scheduler_error_for_runtime(
+    context: CliContext,
+    id: String,
+    expected_launch_id: String,
+    reason: &'static str,
+) {
+    tokio::task::spawn_blocking(move || {
+        let now_epoch = jiff::Timestamp::now().as_second();
+        if let Err(err) = auto_resume::record_scheduler_error_for_runtime(
+            &context,
+            &id,
+            &expected_launch_id,
+            now_epoch,
+            reason,
+        ) {
+            eprintln!(
+                "warning: Codex auto-resume failure checkpoint failed: {}",
+                err.code()
+            );
+        }
+    })
+    .await
+    .ok();
+}
+
+async fn codex_control_loop(state: Arc<ServeState>) {
+    const RECONCILE_INTERVAL: Duration = Duration::from_secs(2);
+    loop {
+        let context = state.context.clone();
+        let tmux = state.tmux_bin.clone();
+        let records = tokio::task::spawn_blocking(move || discover_codex_controls(&context, &tmux))
+            .await
+            .unwrap_or_default();
+        let live: std::collections::HashSet<(String, String)> = records
+            .iter()
+            .filter_map(|record| {
+                record
+                    .runtime
+                    .as_ref()
+                    .map(|runtime| (record.id.clone(), runtime.launch_id.clone()))
+            })
+            .collect();
+        if let Ok(mut controls) = state.codex_controls.lock() {
+            controls.retain(|id, entry| live.contains(&(id.clone(), entry.launch_id.clone())));
+        }
+        for record in records {
+            let Some(launch_id) = record
+                .runtime
+                .as_ref()
+                .map(|runtime| runtime.launch_id.clone())
+            else {
+                continue;
+            };
+            let already_running = state.codex_controls.lock().ok().is_some_and(|controls| {
+                controls
+                    .get(&record.id)
+                    .is_some_and(|entry| entry.launch_id == launch_id)
+            });
+            if already_running {
+                continue;
+            }
+            let (handle, commands) = codex_app_server::control_channel();
+            if let Ok(mut controls) = state.codex_controls.lock() {
+                controls.insert(
+                    record.id.clone(),
+                    CodexControlEntry {
+                        launch_id: launch_id.clone(),
+                        handle,
+                    },
+                );
+            }
+            let registry = state.codex_controls.clone();
+            let context = state.context.clone();
+            tokio::spawn(async move {
+                if let Err(err) =
+                    codex_app_server::run_control(context, record.clone(), commands).await
+                {
+                    eprintln!("warning: Codex app-server control ended: {err}");
+                }
+                if let Ok(mut controls) = registry.lock()
+                    && controls
+                        .get(&record.id)
+                        .is_some_and(|entry| entry.launch_id == launch_id)
+                {
+                    controls.remove(&record.id);
+                }
+            });
+        }
+        tokio::time::sleep(RECONCILE_INTERVAL).await;
+    }
+}
+
+fn discover_codex_controls(context: &CliContext, tmux: &Path) -> Vec<SessionRecord> {
+    let Some(tmux_snapshots) = crate::tmux_session_snapshots(tmux) else {
+        return Vec::new();
+    };
+    let root = context.state_dir.join("sessions");
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return Vec::new();
+    };
+    entries
+        .filter_map(Result::ok)
+        .filter_map(|entry| entry.file_name().into_string().ok())
+        .filter_map(|id| load_session_record(context, &id).ok())
+        .filter(|record| {
+            codex_app_server::runtime_is_supported(record)
+                && tmux_snapshots.contains_key(&record.tmux_session)
+        })
+        .collect()
+}
+
 async fn process_auto_resume_ids(state: Arc<ServeState>, ids: Vec<String>, usage: UsageSnapshot) {
-    const MAX_CONCURRENT_TICKS: usize = 4;
     let mut tasks = JoinSet::new();
     for id in ids {
         let context = state.context.clone();
@@ -2406,7 +2664,7 @@ async fn process_auto_resume_ids(state: Arc<ServeState>, ids: Vec<String>, usage
                 }
             }
         });
-        if tasks.len() >= MAX_CONCURRENT_TICKS {
+        if tasks.len() >= MAX_CONCURRENT_AUTO_RESUME_TICKS {
             report_auto_resume_join(tasks.join_next().await);
         }
     }
@@ -2596,6 +2854,9 @@ async fn delete_handler(
     let delete_id = id.clone();
     match tokio::task::spawn_blocking(move || delete_session(&context, &delete_id, tmux)).await {
         Ok(Ok(result)) => {
+            if let Ok(mut controls) = state.codex_controls.lock() {
+                controls.remove(&id);
+            }
             state.attach_brokers.shutdown_session(&id).await;
             state.provider_prompt_discovery.evict_session(&id).await;
             envelope_ok(json!({ "machine": state.machine, "deleted": result }))
@@ -5593,6 +5854,7 @@ mod tests {
             attach_brokers: AttachBrokerRegistry::default(),
             provider_prompt_discovery: Arc::new(ProviderPromptDiscoveryRegistry::default()),
             activity_broker,
+            codex_controls: Arc::new(StdMutex::new(HashMap::new())),
             session_collector,
         })
     }
@@ -8026,6 +8288,258 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "body={body}");
         assert_eq!(body["error"]["code"], "auto-resume-unsupported");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn codex_scheduler_does_not_serialize_independent_control_timeouts() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let st = state(tmp.path(), Some(TOKEN), minimal_tmux(tmp.path()));
+        let (slow_handle, _slow_commands) = codex_app_server::control_channel();
+        let (fast_handle, mut fast_commands) = codex_app_server::control_channel();
+        st.codex_controls.lock().unwrap().extend([
+            (
+                "slow".to_string(),
+                CodexControlEntry {
+                    launch_id: "slow-launch".to_string(),
+                    handle: slow_handle,
+                },
+            ),
+            (
+                "fast".to_string(),
+                CodexControlEntry {
+                    launch_id: "fast-launch".to_string(),
+                    handle: fast_handle,
+                },
+            ),
+        ]);
+        let (seen, observed) = tokio::sync::oneshot::channel();
+        let responder = tokio::spawn(async move {
+            let Some(codex_app_server::ControlCommand::Usage(response)) =
+                fast_commands.recv().await
+            else {
+                panic!("fast control did not receive a usage request");
+            };
+            let _ = seen.send(());
+            let _ = response.send(Ok(UsageSnapshot {
+                authoritative: false,
+                has_exhausted_windows: false,
+                exhausted_reset_epochs: Vec::new(),
+            }));
+        });
+        let scheduler = tokio::spawn(process_codex_auto_resume_ids(
+            st,
+            vec![
+                CodexAutoResumeTarget {
+                    id: "slow".to_string(),
+                    launch_id: "slow-launch".to_string(),
+                },
+                CodexAutoResumeTarget {
+                    id: "fast".to_string(),
+                    launch_id: "fast-launch".to_string(),
+                },
+            ],
+        ));
+
+        tokio::time::timeout(Duration::from_millis(1), observed)
+            .await
+            .expect("fast control waited behind the slow control")
+            .unwrap();
+        responder.await.unwrap();
+        scheduler.abort();
+        let _ = scheduler.await;
+    }
+
+    #[tokio::test]
+    async fn missing_codex_control_cannot_checkpoint_a_same_id_replacement() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let context = CliContext {
+            state_dir: tmp.path().join("state"),
+            host: None,
+        };
+        seed_session(&context.state_dir, "replacement", "codex", "hs-replacement");
+        let mut record = load_session_record(&context, "replacement").unwrap();
+        let socket = tmp.path().join("replacement.sock");
+        record.runtime = Some(crate::RuntimeInfo {
+            kind: codex_app_server::RUNTIME_KIND.to_string(),
+            tmux_session: record.tmux_session.clone(),
+            generation: 1,
+            started_at: "2030-01-01T00:00:00Z".to_string(),
+            launch_id: "launch-a".to_string(),
+            extra: std::collections::BTreeMap::from([
+                (
+                    codex_app_server::PROTOCOL_KEY.to_string(),
+                    json!(codex_app_server::PROTOCOL_VERSION),
+                ),
+                (
+                    codex_app_server::SOCKET_KEY.to_string(),
+                    json!(crate::display_path(&socket)),
+                ),
+                (
+                    codex_app_server::PROXY_KEY.to_string(),
+                    json!(crate::display_path(&socket.with_extension("proxy"))),
+                ),
+                (
+                    codex_app_server::THREAD_HANDOFF_KEY.to_string(),
+                    json!(crate::display_path(&socket.with_extension("thread"))),
+                ),
+                (
+                    codex_app_server::THREAD_ATTACHED_KEY.to_string(),
+                    json!(crate::display_path(&socket.with_extension("attached"))),
+                ),
+            ]),
+        });
+        crate::write_session_record(&context, &record).unwrap();
+        crate::activity::activate_runtime(&context, &record).unwrap();
+        auto_resume::set_enabled(&context, &record.id, true, "2030-01-01T00:00:00Z").unwrap();
+        crate::activity::ingest_codex_app_server_failure(
+            &context, &record.id, "launch-a", "thread-a", "turn-a",
+        )
+        .unwrap();
+        assert_eq!(
+            auto_resume::tick_for_runtime(
+                &context,
+                &record.id,
+                "launch-a",
+                1_893_456_000,
+                &UsageSnapshot {
+                    authoritative: true,
+                    has_exhausted_windows: true,
+                    exhausted_reset_epochs: vec![1_893_456_600],
+                },
+                |_| panic!("blocked usage must not submit"),
+            )
+            .unwrap(),
+            auto_resume::TickOutcome::Scheduled
+        );
+
+        let target = CodexAutoResumeTarget {
+            id: record.id.clone(),
+            launch_id: "launch-a".to_string(),
+        };
+        record.runtime.as_mut().unwrap().launch_id = "launch-b".to_string();
+        crate::write_session_record(&context, &record).unwrap();
+        let st = state(&context.state_dir, Some(TOKEN), minimal_tmux(tmp.path()));
+        process_codex_auto_resume_id(st, target).await;
+
+        let view = auto_resume::view_for_record(&context, &record);
+        assert_eq!(view.state, "scheduled");
+        assert!(view.failure_reason.is_none());
+    }
+
+    #[test]
+    fn codex_control_discovery_uses_one_bulk_tmux_snapshot() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let context = CliContext {
+            state_dir: tmp.path().join("state"),
+            host: None,
+        };
+        for (id, tmux_session) in [("first", "hs-first"), ("second", "hs-second")] {
+            seed_session(&context.state_dir, id, "codex", tmux_session);
+            let mut record = load_session_record(&context, id).unwrap();
+            let socket = tmp.path().join(format!("{id}.sock"));
+            record.runtime = Some(crate::RuntimeInfo {
+                kind: codex_app_server::RUNTIME_KIND.to_string(),
+                tmux_session: tmux_session.to_string(),
+                generation: 1,
+                started_at: "2030-01-01T00:00:00Z".to_string(),
+                launch_id: format!("launch-{id}"),
+                extra: std::collections::BTreeMap::from([
+                    (
+                        codex_app_server::PROTOCOL_KEY.to_string(),
+                        json!(codex_app_server::PROTOCOL_VERSION),
+                    ),
+                    (
+                        codex_app_server::SOCKET_KEY.to_string(),
+                        json!(crate::display_path(&socket)),
+                    ),
+                    (
+                        codex_app_server::PROXY_KEY.to_string(),
+                        json!(crate::display_path(&socket.with_extension("proxy"))),
+                    ),
+                    (
+                        codex_app_server::THREAD_HANDOFF_KEY.to_string(),
+                        json!(crate::display_path(&socket.with_extension("thread"))),
+                    ),
+                    (
+                        codex_app_server::THREAD_ATTACHED_KEY.to_string(),
+                        json!(crate::display_path(&socket.with_extension("attached"))),
+                    ),
+                ]),
+            });
+            crate::write_session_record(&context, &record).unwrap();
+        }
+        let calls = tmp.path().join("tmux.calls");
+        let tmux = executable(
+            &tmp.path().join("tmux-bulk"),
+            &format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> {}\nif [ \"$1\" = list-windows ]; then printf 'hs-first\\t100\\nhs-second\\t100\\n'; exit 0; fi\nexit 1\n",
+                shell_words::quote(&calls.to_string_lossy())
+            ),
+        );
+
+        let records = discover_codex_controls(&context, &tmux);
+        assert_eq!(records.len(), 2);
+        let calls = fs::read_to_string(calls).unwrap();
+        assert_eq!(calls.lines().count(), 1, "calls={calls}");
+        assert!(calls.contains("list-windows -a -F"));
+        assert!(!calls.contains("has-session"));
+    }
+
+    #[tokio::test]
+    async fn serve_created_capable_codex_session_projects_supported_app_server_runtime() {
+        let lock = GlobalStateLock::new();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cwd = tmp.path().join("repo");
+        let runtime_dir = tempfile::Builder::new()
+            .prefix("cx-")
+            .tempdir_in("/tmp")
+            .unwrap();
+        fs::set_permissions(runtime_dir.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let log = tmp.path().join("tmux.log");
+        fs::create_dir(&cwd).unwrap();
+        let codex = executable(
+            &tmp.path().join("codex-app-server"),
+            "#!/usr/bin/env sh\nif [ \"$1\" = --version ]; then printf '%s\\n' 'codex-cli 0.144.1'; exit 0; fi\nif [ \"$1\" = app-server ] && [ \"$2\" = --help ]; then printf '%s\\n' '  --listen <URL>  unix://'; exit 0; fi\nexit 1\n",
+        );
+        let _codex_bin = EnvGuard::set(&lock, "AGENT_SESSION_CODEX_BIN", codex.to_str().unwrap());
+        let _runtime_dir = EnvGuard::set(
+            &lock,
+            "XDG_RUNTIME_DIR",
+            runtime_dir.path().to_str().unwrap(),
+        );
+        let _runtime_mode = EnvGuard::set(&lock, "AGENT_SESSION_CODEX_RUNTIME", "app-server");
+        let _capture_timeout = EnvGuard::set(&lock, "AGENT_SESSION_CODEX_CAPTURE_TIMEOUT_MS", "10");
+        let st = state(tmp.path(), Some(TOKEN), logging_tmux(tmp.path(), &log));
+
+        let (status, body) = call(
+            router(st),
+            post_json(
+                "/sessions",
+                Some(TOKEN),
+                json!({
+                    "agent": "codex",
+                    "id": "managed-codex",
+                    "cwd": cwd.to_string_lossy()
+                }),
+            ),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK, "body={body}");
+        let session = &body["data"]["session"];
+        assert_eq!(session["auto_resume"]["supported"], true);
+        let record: Value = serde_json::from_slice(
+            &fs::read(tmp.path().join("sessions/managed-codex/session.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(record["runtime"]["kind"], codex_app_server::RUNTIME_KIND);
+        assert_eq!(
+            record["runtime"]["codex_app_server_protocol"],
+            codex_app_server::PROTOCOL_VERSION
+        );
+        let calls = fs::read_to_string(log).unwrap();
+        assert!(calls.contains("agent-session-codex-app-server"));
+        assert!(calls.contains("app-server --listen"));
     }
 
     // The WebSocket attach handler guards with the same `deny_unauthorized` as
