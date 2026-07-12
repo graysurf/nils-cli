@@ -136,9 +136,7 @@ fn pr_view_call(ctx: &ProviderContext, id: u64) -> BackendCall {
             OsString::from("view"),
             OsString::from(id.to_string()),
             OsString::from("--json"),
-            OsString::from(
-                "number,url,state,isDraft,title,headRefName,baseRefName,mergeable,mergedAt,labels",
-            ),
+            OsString::from(pr_view::GH_JSON_FIELDS),
         ],
         Provider::GitLab => vec![
             OsString::from("mr"),

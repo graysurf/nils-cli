@@ -563,11 +563,14 @@ backend mapping, validation rules, and output schema versions.
   - `--method squash|merge|rebase` (default `squash`, configurable
     per repo).
 - Post-merge: deletes the remote branch (default `true`, disable via
-  `--keep-branch`). GitLab performs the merge mutation through
+  `--keep-branch`). GitHub passes `--match-head-commit <head_sha>`;
+  GitLab performs the merge mutation through
   `glab api --method PUT projects/<project>/merge_requests/<iid>/merge`
   after all gates pass, including `sha=<head_sha>` when the MR view
   exposes it so the source branch HEAD cannot drift silently between
-  checks and merge.
+  checks and merge. If a backend reports failure after another actor completed
+  the merge, idempotent recovery succeeds only when the merged head still
+  equals that same OID.
 - Output schema: `cli.forge-cli.pr.merge.v1`,
   `data = { number, url, merge_sha, method, deleted_branch }`.
 
@@ -979,13 +982,18 @@ an actual changed/added/removed behavior, an affected-test decision, meaningful
 failing evidence or an explicit waiver, scoped passing validation, and a
 residual-gap declaration. The record must also bind an immutable repository and
 pre-edit baseline plus a latest delivery head/tree/diff attestation matching
-the current checkout. Amend and rebase operations invalidate the latest
+the explicitly selected delivery ref. Create and adopt compare that attested
+head with the provider's immutable PR/MR head OID; deliver re-fetches it after
+checks and after ready, and merge uses the same OID as a compare-and-swap
+condition. Amend, rebase, or post-check push operations invalidate the latest
 delivery attestation until `test-first-evidence bind-delivery` appends a new
 attempt; the baseline is never replaced. Record v1 remains readable but cannot
 satisfy this gate. `docs` / `chore` / `ci` / `refactor` kinds are exempt. Failures
 surface as `test_first_evidence_required`, `test_first_evidence_v1`,
 `test_first_evidence_classification`, `test_first_evidence_incomplete`,
-`test_first_evidence_unbound`, `test_first_evidence_subject_mismatch`, or
+`test_first_evidence_unbound`, `test_first_evidence_subject_mismatch`,
+`test_first_evidence_provider_head_unavailable`,
+`test_first_evidence_provider_head_mismatch`, or
 `test_first_evidence_unreadable` (exit `DATA`).
 
 Environment variables (read once at startup, all optional):

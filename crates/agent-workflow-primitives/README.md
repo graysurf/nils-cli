@@ -295,10 +295,48 @@ digest. After an amend or rebase, subject-aware verification fails until
 `bind-delivery` is run again; the new attempt is appended and the original
 baseline and earlier delivery attempts remain intact.
 
+```json
+{
+  "subject": {
+    "repository": {
+      "kind": "provider",
+      "id": "github.com/acme/widget"
+    },
+    "baseline": {
+      "commit": "<full lowercase Git object ID>",
+      "tree": "<full lowercase Git object ID>"
+    },
+    "deliveries": [
+      {
+        "head": "<full lowercase Git object ID>",
+        "tree": "<full lowercase Git object ID>",
+        "diff_digest": "sha256:<64 lowercase hex characters>",
+        "attempt": 1
+      }
+    ]
+  }
+}
+```
+
+`repository.kind` is `provider`, `local-history`, or `explicit`.
+Provider identity canonicalizes known transport aliases such as
+`ssh.github.com` to `github.com`. Git object IDs must match the repository's
+full SHA-1 or SHA-256 object format; symbolic and abbreviated revisions are
+rejected. Delivery attempts start at one and remain unique and contiguous.
+The diff digest is a domain-separated, length-delimited SHA-256 digest of the
+baseline and delivery tree object IDs, independent of Git diff rendering and
+configuration. The subject remains optional only so older v2 records stay
+readable; strict delivery requires it.
+
 Plain `verify` keeps structural v2 compatibility. Passing `--project-path`
 enables strict subject verification and rejects unbound records, another
 repository, a stale head, or a changed diff. The forge feature/bug delivery
 gate always enables this subject check when `[test_first].require` is true.
+Stable subject reason codes are `subject-match`, `unbound-subject`,
+`delivery-subject-unbound`, `repository-mismatch`, `baseline-unavailable`,
+`baseline-mismatch`, `delivery-subject-mismatch`,
+`invalid-subject-object-id`, `invalid-delivery-attempt`, and
+`unsupported-object-format`.
 
 `check` is read-only. `classified` confirms classification exists, `pre-edit`
 uses the repository's `[path_classes]` contract, and `delivery` is the

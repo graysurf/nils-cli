@@ -707,8 +707,12 @@ fn run_bind_delivery(args: SubjectArgs) -> i32 {
                     None,
                 )
             })?;
-        let delivery =
-            capture_delivery_subject(&args.project_path, &subject.baseline.commit, attempt)?;
+        let delivery = capture_delivery_subject(
+            &args.project_path,
+            &subject.baseline.commit,
+            attempt,
+            "HEAD",
+        )?;
         if subject.deliveries.last().is_some_and(|latest| {
             latest.head == delivery.head
                 && latest.tree == delivery.tree
@@ -764,6 +768,7 @@ fn run_verify(args: VerifyArgs) -> i32 {
                 project_path,
                 &args.remote,
                 args.repository_id.as_deref(),
+                "HEAD",
             ) {
                 Ok(subject) if subject.matches => {
                     render_verify_success(args.common.format, &result)
@@ -1246,11 +1251,28 @@ pub fn verify_delivery_subject(
     project_path: &Path,
     remote: &str,
     repository_id: Option<&str>,
+    delivery_ref: &str,
 ) -> Result<SubjectMatchResult, String> {
     let record = read_record_result(out_dir)
         .map_err(|err| err.message)?
         .record;
-    match_delivery_subject(&record, project_path, remote, repository_id).map_err(|err| err.message)
+    verify_record_delivery_subject(&record, project_path, remote, repository_id, delivery_ref)
+}
+
+/// Compare one already-parsed evidence snapshot with an explicit delivery ref.
+///
+/// Callers that also enforce structural completeness should use this function
+/// with the `VerifyResult.record` they already hold so both decisions come
+/// from the same on-disk snapshot.
+pub fn verify_record_delivery_subject(
+    record: &EvidenceRecord,
+    project_path: &Path,
+    remote: &str,
+    repository_id: Option<&str>,
+    delivery_ref: &str,
+) -> Result<SubjectMatchResult, String> {
+    match_delivery_subject(record, project_path, remote, repository_id, delivery_ref)
+        .map_err(|err| err.message)
 }
 
 fn capture_baseline_subject(
@@ -1276,43 +1298,46 @@ fn capture_delivery_subject(
     project_path: &Path,
     baseline: &str,
     attempt: u32,
+    delivery_ref: &str,
 ) -> Result<DeliverySubject, CliError> {
-    let head = git_output(
+    let baseline_tree = git_output(
         project_path,
-        &["rev-parse", "HEAD^{commit}"],
-        "delivery head",
-    )?;
-    let tree = git_output(project_path, &["rev-parse", "HEAD^{tree}"], "delivery tree")?;
-    let output = ProcessCommand::new("git")
-        .current_dir(project_path)
-        .args([
-            "diff",
-            "--binary",
-            "--full-index",
-            "--no-color",
-            "--no-ext-diff",
-            "--no-textconv",
-            "--no-renames",
-            baseline,
-            &head,
-            "--",
-        ])
-        .output()
-        .map_err(|err| {
-            CliError::runtime(
-                "subject-git-failed",
-                format!("failed to spawn git while computing delivery diff: {err}"),
-                None,
-            )
-        })?;
-    if !output.status.success() {
-        return Err(CliError::data(
+        &[
+            "rev-parse",
+            "--verify",
+            "--end-of-options",
+            &format!("{baseline}^{{tree}}"),
+        ],
+        "bound baseline tree",
+    )
+    .map_err(|_| {
+        CliError::data(
             "subject-baseline-unavailable",
             "the bound baseline commit is unavailable in the current repository",
             Some(json!({ "reason_code": "baseline-unavailable" })),
-        ));
-    }
-    let diff_digest = format!("sha256:{}", hex(&Sha256::digest(&output.stdout)));
+        )
+    })?;
+    let head = git_output(
+        project_path,
+        &[
+            "rev-parse",
+            "--verify",
+            "--end-of-options",
+            &format!("{delivery_ref}^{{commit}}"),
+        ],
+        "delivery head",
+    )?;
+    let tree = git_output(
+        project_path,
+        &[
+            "rev-parse",
+            "--verify",
+            "--end-of-options",
+            &format!("{head}^{{tree}}"),
+        ],
+        "delivery tree",
+    )?;
+    let diff_digest = delivery_diff_digest(&baseline_tree, &tree);
     Ok(DeliverySubject {
         head,
         tree,
@@ -1321,15 +1346,54 @@ fn capture_delivery_subject(
     })
 }
 
+fn delivery_diff_digest(baseline_tree: &str, delivery_tree: &str) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"test-first-evidence.delivery-diff.v1\0");
+    for value in [baseline_tree, delivery_tree] {
+        digest.update((value.len() as u64).to_be_bytes());
+        digest.update(value.as_bytes());
+    }
+    format!("sha256:{}", hex(&digest.finalize()))
+}
+
 fn match_delivery_subject(
     record: &EvidenceRecord,
     project_path: &Path,
     remote: &str,
     repository_id: Option<&str>,
+    delivery_ref: &str,
 ) -> Result<SubjectMatchResult, CliError> {
     let Some(subject) = record.subject.as_ref() else {
         return Ok(subject_result(false, "unbound-subject"));
     };
+    let object_format = git_output(
+        project_path,
+        &["rev-parse", "--show-object-format"],
+        "object format",
+    )?;
+    let oid_len = match object_format.as_str() {
+        "sha1" => 40,
+        "sha256" => 64,
+        _ => return Ok(subject_result(false, "unsupported-object-format")),
+    };
+    if !canonical_oid(&subject.baseline.commit, oid_len)
+        || !canonical_oid(&subject.baseline.tree, oid_len)
+        || subject.deliveries.iter().any(|delivery| {
+            !canonical_oid(&delivery.head, oid_len)
+                || !canonical_oid(&delivery.tree, oid_len)
+                || !canonical_sha256_digest(&delivery.diff_digest)
+        })
+    {
+        return Ok(subject_result(false, "invalid-subject-object-id"));
+    }
+    if subject
+        .deliveries
+        .iter()
+        .enumerate()
+        .any(|(index, delivery)| delivery.attempt != (index as u32).saturating_add(1))
+    {
+        return Ok(subject_result(false, "invalid-delivery-attempt"));
+    }
     let current_repository = repository_identity(project_path, remote, repository_id)?;
     if !repository_matches(
         &current_repository,
@@ -1342,6 +1406,8 @@ fn match_delivery_subject(
         project_path,
         &[
             "rev-parse",
+            "--verify",
+            "--end-of-options",
             &format!("{}^{{tree}}", subject.baseline.commit),
         ],
         "bound baseline tree",
@@ -1355,14 +1421,18 @@ fn match_delivery_subject(
     let Some(latest) = subject.deliveries.iter().max_by_key(|item| item.attempt) else {
         return Ok(subject_result(false, "delivery-subject-unbound"));
     };
-    let current =
-        match capture_delivery_subject(project_path, &subject.baseline.commit, latest.attempt) {
-            Ok(current) => current,
-            Err(err) if err.code == "subject-baseline-unavailable" => {
-                return Ok(subject_result(false, "baseline-unavailable"));
-            }
-            Err(err) => return Err(err),
-        };
+    let current = match capture_delivery_subject(
+        project_path,
+        &subject.baseline.commit,
+        latest.attempt,
+        delivery_ref,
+    ) {
+        Ok(current) => current,
+        Err(err) if err.code == "subject-baseline-unavailable" => {
+            return Ok(subject_result(false, "baseline-unavailable"));
+        }
+        Err(err) => return Err(err),
+    };
     if current.head != latest.head
         || current.tree != latest.tree
         || current.diff_digest != latest.diff_digest
@@ -1370,6 +1440,19 @@ fn match_delivery_subject(
         return Ok(subject_result(false, "delivery-subject-mismatch"));
     }
     Ok(subject_result(true, "subject-match"))
+}
+
+fn canonical_oid(value: &str, expected_len: usize) -> bool {
+    value.len() == expected_len
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+}
+
+fn canonical_sha256_digest(value: &str) -> bool {
+    value
+        .strip_prefix("sha256:")
+        .is_some_and(|hex| canonical_oid(hex, 64))
 }
 
 fn subject_result(matches: bool, reason_code: &str) -> SubjectMatchResult {
@@ -1404,11 +1487,11 @@ fn repository_identity(
         });
     }
     if let Some(url) = git_output_optional(project_path, &["remote", "get-url", remote])
-        && let Some(parsed) = nils_common::git::parse_git_remote_url(&url)
+        && let Some(id) = nils_common::git::repository_identity_from_remote_url(&url)
     {
         return Ok(RepositoryIdentity {
             kind: RepositoryIdentityKind::Provider,
-            id: format!("{}/{}", parsed.host, parsed.path).to_ascii_lowercase(),
+            id,
         });
     }
     let roots = git_output(

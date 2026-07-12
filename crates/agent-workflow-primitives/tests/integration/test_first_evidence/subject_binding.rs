@@ -181,6 +181,34 @@ fn baseline_is_immutable_and_delivery_reattestation_preserves_history() {
         first.stdout_json()["result"]["record"]["subject"]["deliveries"][0]["head"],
         first_head
     );
+    let first_digest =
+        first.stdout_json()["result"]["record"]["subject"]["deliveries"][0]["diff_digest"]
+            .as_str()
+            .expect("diff digest")
+            .to_string();
+    git(&repo, &["config", "diff.noprefix", "true"]);
+    let config_independent = run(
+        tmp.path(),
+        &[
+            "verify",
+            "--out",
+            evidence_arg.as_ref(),
+            "--project-path",
+            repo_arg.as_ref(),
+            "--format",
+            "json",
+        ],
+    );
+    assert_eq!(
+        config_independent.code,
+        0,
+        "stderr={}",
+        config_independent.stderr_text()
+    );
+    assert_eq!(
+        config_independent.stdout_json()["result"]["record"]["subject"]["deliveries"][0]["diff_digest"],
+        first_digest
+    );
 
     fs::write(repo.join("src.txt"), "amended delivery\n").expect("amended file");
     git(&repo, &["add", "src.txt"]);
@@ -291,6 +319,155 @@ fn baseline_is_immutable_and_delivery_reattestation_preserves_history() {
         ],
     );
     assert_eq!(verify.code, 0, "stderr={}", verify.stderr_text());
+}
+
+#[test]
+fn provider_transport_alias_does_not_change_repository_identity() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let repo = init_repo(
+        tmp.path(),
+        "repo",
+        Some("ssh://git@ssh.github.com:443/Acme/Widget.git"),
+    );
+    let evidence = tmp.path().join("evidence");
+    complete_record(tmp.path(), &evidence);
+    let evidence_arg = evidence.to_string_lossy();
+    let repo_arg = repo.to_string_lossy();
+
+    for command in ["bind-baseline", "bind-delivery"] {
+        if command == "bind-delivery" {
+            fs::write(repo.join("delivery.txt"), "delivery\n").expect("delivery");
+            git(&repo, &["add", "delivery.txt"]);
+            git(&repo, &["commit", "-q", "-m", "delivery"]);
+        }
+        let output = run(
+            tmp.path(),
+            &[
+                command,
+                "--out",
+                evidence_arg.as_ref(),
+                "--project-path",
+                repo_arg.as_ref(),
+            ],
+        );
+        assert_eq!(output.code, 0, "stderr={}", output.stderr_text());
+    }
+
+    git(
+        &repo,
+        &[
+            "remote",
+            "set-url",
+            "origin",
+            "https://github.com/acme/widget.git",
+        ],
+    );
+    let verify = run(
+        tmp.path(),
+        &[
+            "verify",
+            "--out",
+            evidence_arg.as_ref(),
+            "--project-path",
+            repo_arg.as_ref(),
+        ],
+    );
+    assert_eq!(verify.code, 0, "stderr={}", verify.stderr_text());
+}
+
+#[test]
+fn strict_subject_verification_rejects_symbolic_oids_and_noncanonical_attempts() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let repo = init_repo(
+        tmp.path(),
+        "repo",
+        Some("https://github.com/acme/widget.git"),
+    );
+    let evidence = tmp.path().join("evidence");
+    complete_record(tmp.path(), &evidence);
+    let evidence_arg = evidence.to_string_lossy();
+    let repo_arg = repo.to_string_lossy();
+    let record_file = evidence.join("test-first-evidence.json");
+
+    for command in ["bind-baseline", "bind-delivery"] {
+        if command == "bind-delivery" {
+            fs::write(repo.join("delivery.txt"), "delivery\n").expect("delivery");
+            git(&repo, &["add", "delivery.txt"]);
+            git(&repo, &["commit", "-q", "-m", "delivery"]);
+        }
+        assert_eq!(
+            run(
+                tmp.path(),
+                &[
+                    command,
+                    "--out",
+                    evidence_arg.as_ref(),
+                    "--project-path",
+                    repo_arg.as_ref(),
+                ],
+            )
+            .code,
+            0
+        );
+    }
+
+    let canonical = fs::read_to_string(&record_file).expect("canonical record");
+    let mut symbolic: serde_json::Value = serde_json::from_str(&canonical).expect("record json");
+    symbolic["subject"]["baseline"]["commit"] = serde_json::json!("HEAD");
+    fs::write(
+        &record_file,
+        format!(
+            "{}\n",
+            serde_json::to_string_pretty(&symbolic).expect("render symbolic")
+        ),
+    )
+    .expect("write symbolic");
+    let rejected = run(
+        tmp.path(),
+        &[
+            "verify",
+            "--out",
+            evidence_arg.as_ref(),
+            "--project-path",
+            repo_arg.as_ref(),
+            "--format",
+            "json",
+        ],
+    );
+    assert_eq!(rejected.code, 65);
+    assert_eq!(
+        rejected.stdout_json()["error"]["details"]["reason_code"],
+        "invalid-subject-object-id"
+    );
+
+    let mut invalid_attempt: serde_json::Value =
+        serde_json::from_str(&canonical).expect("record json");
+    invalid_attempt["subject"]["deliveries"][0]["attempt"] = serde_json::json!(2);
+    fs::write(
+        &record_file,
+        format!(
+            "{}\n",
+            serde_json::to_string_pretty(&invalid_attempt).expect("render attempt")
+        ),
+    )
+    .expect("write attempt");
+    let rejected = run(
+        tmp.path(),
+        &[
+            "verify",
+            "--out",
+            evidence_arg.as_ref(),
+            "--project-path",
+            repo_arg.as_ref(),
+            "--format",
+            "json",
+        ],
+    );
+    assert_eq!(rejected.code, 65);
+    assert_eq!(
+        rejected.stdout_json()["error"]["details"]["reason_code"],
+        "invalid-delivery-attempt"
+    );
 }
 
 #[test]

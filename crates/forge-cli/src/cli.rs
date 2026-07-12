@@ -601,6 +601,9 @@ pub struct PrTasksArgs {
 pub struct PrMergeArgs {
     /// Numeric PR / MR id.
     pub id: u64,
+    /// Macro-internal compare-and-swap head. Not exposed as a CLI flag.
+    #[arg(skip)]
+    pub expected_head_sha: Option<String>,
     /// Merge method override. When omitted, falls back to
     /// `.forge-cli.toml [merge].method` then the spec default `squash`.
     #[arg(long, value_enum)]

@@ -35,7 +35,8 @@ use crate::cli::{
 use crate::config::ForgeConfig;
 use crate::error::ForgeError;
 use crate::ops::pr_create::{
-    self, Environment, evidence_repository_id, find_git_toplevel, test_first_gate,
+    self, Environment, VerifiedTestFirstSubject, evidence_repository_id, find_git_toplevel,
+    test_first_gate, validate_provider_subject_head,
 };
 use crate::ops::pr_view::PrViewPayload;
 use crate::ops::pr_wait_checks::{Clock, SystemClock, WaitOutcome};
@@ -131,18 +132,9 @@ pub fn run_with<R: BackendRunner, C: Clock>(
         global.repo.as_deref(),
         git_remote_url,
     )?;
-    let remote_url = git_remote_url(&global.remote);
-    let repository_id = evidence_repository_id(&ctx, remote_url.as_deref(), global.repo.as_deref());
 
     if global.dry_run {
-        return Ok(emit_dry_run(
-            &ctx,
-            &args,
-            format,
-            workdir,
-            &global.remote,
-            repository_id.as_deref(),
-        ));
+        return Ok(emit_dry_run(&ctx, &args, format, workdir, global));
     }
 
     execute_sequence(runner, clock, global, &ctx, &args, format, workdir)
@@ -212,7 +204,7 @@ fn execute_sequence<R: BackendRunner, C: Clock>(
         }
     };
 
-    let (pr_number, pr_url) = if let Some(found) = existing {
+    let (pr_number, pr_url, verified_subject) = if let Some(found) = existing {
         // adopt
         let view = match pr_view::compute(runner, ctx, found.number) {
             Ok(v) => v,
@@ -235,10 +227,24 @@ fn execute_sequence<R: BackendRunner, C: Clock>(
         // be delivered in an opted-in repo).
         let cfg = ForgeConfig::load_layered(workdir, find_git_toplevel(workdir).as_deref());
         let test_first_required = cfg.resolve_test_first_required(None);
-        let remote_url = git_remote_url(&global.remote);
-        let repository_id =
-            evidence_repository_id(ctx, remote_url.as_deref(), global.repo.as_deref());
-        if let Err(err) = validate_adopted(
+        let gate_applies = test_first_required
+            && matches!(
+                args.kind.into_kind(),
+                nils_common::git::PrKind::Feature | nils_common::git::PrKind::Bug
+            );
+        let remote_url = if gate_applies
+            && ctx.provider == Provider::Local
+            && global.repo.is_none()
+            && ctx.repo.is_none()
+        {
+            git_remote_url(&global.remote)
+        } else {
+            None
+        };
+        let repository_id = gate_applies
+            .then(|| evidence_repository_id(ctx, remote_url.as_deref(), global.repo.as_deref()))
+            .flatten();
+        let verified_subject = match validate_adopted(
             &view,
             args,
             workdir,
@@ -246,12 +252,27 @@ fn execute_sequence<R: BackendRunner, C: Clock>(
             repository_id.as_deref(),
             test_first_required,
         ) {
-            steps.push(Step {
-                step: "adopt",
-                ok: false,
-                schema_version: schema_version_for(BINARY, "pr.view", 1),
-                payload: to_value(&view),
-            });
+            Ok(subject) => subject,
+            Err(err) => {
+                steps.push(Step {
+                    step: "adopt",
+                    ok: false,
+                    schema_version: schema_version_for(BINARY, "pr.view", 1),
+                    payload: to_value(&view),
+                });
+                return Ok(emit_chain_failure(
+                    steps,
+                    args,
+                    ctx,
+                    Some((number, url)),
+                    &err,
+                    format,
+                ));
+            }
+        };
+        if let Err(err) =
+            validate_provider_subject_head(verified_subject.as_ref(), view.head_sha.as_deref())
+        {
             return Ok(emit_chain_failure(
                 steps,
                 args,
@@ -267,17 +288,20 @@ fn execute_sequence<R: BackendRunner, C: Clock>(
             schema_version: schema_version_for(BINARY, "pr.view", 1),
             payload: to_value(&view),
         });
-        (number, url)
+        (number, url, verified_subject)
     } else {
         // pr.create
         let create_args = build_create_args(args, &repo_payload.default_branch);
         let env = Environment::production();
-        let create_payload = match pr_create::compute(runner, global, &create_args, &env) {
-            Ok(p) => p,
-            Err(err) => {
-                return Ok(emit_chain_failure(steps, args, ctx, None, &err, format));
-            }
-        };
+        let create_result =
+            match pr_create::compute_with_subject(runner, global, &create_args, &env) {
+                Ok(result) => result,
+                Err(err) => {
+                    return Ok(emit_chain_failure(steps, args, ctx, None, &err, format));
+                }
+            };
+        let create_payload = create_result.payload;
+        let verified_subject = create_result.verified_subject;
         let number = create_payload.number;
         let url = create_payload.url.clone();
         steps.push(Step {
@@ -286,7 +310,7 @@ fn execute_sequence<R: BackendRunner, C: Clock>(
             schema_version: schema_version_for(BINARY, "pr.create", 1),
             payload: to_value(&create_payload),
         });
-        (number, url)
+        (number, url, verified_subject)
     };
 
     // 4. pr.wait-checks
@@ -361,6 +385,34 @@ fn execute_sequence<R: BackendRunner, C: Clock>(
         }
     }
 
+    if let Some(subject) = verified_subject.as_ref() {
+        let current_view = match pr_view::compute(runner, ctx, pr_number) {
+            Ok(view) => view,
+            Err(err) => {
+                return Ok(emit_chain_failure(
+                    steps,
+                    args,
+                    ctx,
+                    Some((pr_number, pr_url)),
+                    &err,
+                    format,
+                ));
+            }
+        };
+        if let Err(err) =
+            validate_provider_subject_head(Some(subject), current_view.head_sha.as_deref())
+        {
+            return Ok(emit_chain_failure(
+                steps,
+                args,
+                ctx,
+                Some((pr_number, pr_url)),
+                &err,
+                format,
+            ));
+        }
+    }
+
     if args.no_merge {
         // Macro ends after wait-checks when --no-merge is set; outer exit
         // code matches `pr.wait-checks` success (0).
@@ -384,6 +436,18 @@ fn execute_sequence<R: BackendRunner, C: Clock>(
                 ));
             }
         };
+    if let Err(err) =
+        validate_provider_subject_head(verified_subject.as_ref(), ready_payload.head_sha.as_deref())
+    {
+        return Ok(emit_chain_failure(
+            steps,
+            args,
+            ctx,
+            Some((pr_number, pr_url)),
+            &err,
+            format,
+        ));
+    }
     steps.push(Step {
         step: "ready",
         ok: true,
@@ -394,6 +458,9 @@ fn execute_sequence<R: BackendRunner, C: Clock>(
     // 6. pr.merge
     let merge_args = PrMergeArgs {
         id: pr_number,
+        expected_head_sha: verified_subject
+            .as_ref()
+            .map(|subject| subject.head.clone()),
         method: Some(args.method),
         keep_branch: false,
         allow_non_default_base: args.allow_non_default_base,
@@ -481,7 +548,7 @@ fn validate_adopted(
     remote: &str,
     repository_id: Option<&str>,
     test_first_required: bool,
-) -> Result<(), ForgeError> {
+) -> Result<Option<VerifiedTestFirstSubject>, ForgeError> {
     let prefix = branch_name(&view.head)?;
     branch_kind_matches(prefix, args.kind.into_kind())?;
     let headings = BodyHeadings::default();
@@ -495,8 +562,8 @@ fn validate_adopted(
         workdir,
         remote,
         repository_id,
-    )?;
-    Ok(())
+        &view.head,
+    )
 }
 
 fn build_create_args(args: &PrDeliverArgs, default_branch: &str) -> PrCreateArgs {
@@ -546,6 +613,7 @@ fn test_first_preflight_verdict(
     workdir: &Path,
     remote: &str,
     repository_id: Option<&str>,
+    delivery_ref: &str,
 ) -> Option<RuleVerdict> {
     if !required {
         return None;
@@ -559,7 +627,9 @@ fn test_first_preflight_verdict(
             workdir,
             remote,
             repository_id,
-        ),
+            delivery_ref,
+        )
+        .map(|_| ()),
     ))
 }
 
@@ -568,8 +638,7 @@ fn emit_dry_run(
     args: &PrDeliverArgs,
     format: OutputFormat,
     workdir: &Path,
-    remote: &str,
-    repository_id: Option<&str>,
+    global: &GlobalFlags,
 ) -> i32 {
     let branch = match &args.head {
         Some(head) => head.clone(),
@@ -640,12 +709,31 @@ fn emit_dry_run(
     // the same verdict here instead of predicting a success the real deliver
     // would refuse.
     let cfg = ForgeConfig::load_layered(workdir, find_git_toplevel(workdir).as_deref());
+    let test_first_required = cfg.resolve_test_first_required(None);
+    let gate_applies = test_first_required
+        && matches!(
+            args.kind.into_kind(),
+            nils_common::git::PrKind::Feature | nils_common::git::PrKind::Bug
+        );
+    let remote_url = if gate_applies
+        && ctx.provider == Provider::Local
+        && global.repo.is_none()
+        && ctx.repo.is_none()
+    {
+        git_remote_url(&global.remote)
+    } else {
+        None
+    };
+    let repository_id = gate_applies
+        .then(|| evidence_repository_id(ctx, remote_url.as_deref(), global.repo.as_deref()))
+        .flatten();
     if let Some(verdict) = test_first_preflight_verdict(
         args,
-        cfg.resolve_test_first_required(None),
+        test_first_required,
         workdir,
-        remote,
-        repository_id,
+        &global.remote,
+        repository_id.as_deref(),
+        &branch,
     ) {
         local_preflight.push(verdict);
     }
@@ -1102,16 +1190,24 @@ mod tests {
         // The gate is off (no repo/global opt-in) → no test_first verdict so the
         // dry-run preflight stays identical to pre-gate behaviour.
         assert!(
-            test_first_preflight_verdict(&args(false), false, Path::new("."), "origin", None)
-                .is_none()
+            test_first_preflight_verdict(
+                &args(false),
+                false,
+                Path::new("."),
+                "origin",
+                None,
+                "HEAD",
+            )
+            .is_none()
         );
     }
 
     #[test]
     fn dry_run_verdict_fails_feature_without_evidence_when_required() {
         let a = args(false); // feature, no --test-first-evidence
-        let verdict = test_first_preflight_verdict(&a, true, Path::new("."), "origin", None)
-            .expect("verdict surfaced");
+        let verdict =
+            test_first_preflight_verdict(&a, true, Path::new("."), "origin", None, "HEAD")
+                .expect("verdict surfaced");
         assert_eq!(verdict.rule, "test_first");
         assert!(
             !verdict.ok,
@@ -1127,8 +1223,9 @@ mod tests {
     fn dry_run_verdict_passes_exempt_kind_when_required() {
         let mut a = args(false);
         a.kind = PrKindFlag::Docs; // exempt kind needs no evidence
-        let verdict = test_first_preflight_verdict(&a, true, Path::new("."), "origin", None)
-            .expect("verdict surfaced");
+        let verdict =
+            test_first_preflight_verdict(&a, true, Path::new("."), "origin", None, "HEAD")
+                .expect("verdict surfaced");
         assert!(verdict.ok, "docs is exempt from the test-first gate");
     }
 
@@ -1142,8 +1239,9 @@ mod tests {
         .unwrap();
         let mut a = args(false);
         a.test_first_evidence = Some(dir.path().to_str().unwrap().to_string());
-        let verdict = test_first_preflight_verdict(&a, true, Path::new("."), "origin", None)
-            .expect("verdict surfaced");
+        let verdict =
+            test_first_preflight_verdict(&a, true, Path::new("."), "origin", None, "HEAD")
+                .expect("verdict surfaced");
         assert!(
             !verdict.ok,
             "structurally complete but unbound evidence must fail: {verdict:?}"
