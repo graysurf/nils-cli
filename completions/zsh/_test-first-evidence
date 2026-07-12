@@ -32,7 +32,7 @@ _test-first-evidence() {
 _arguments "${_arguments_options[@]}" : \
 '--out=[Evidence artifact directory containing \`test-first-evidence.json\`]:DIR:_files -/' \
 '--format=[Output format]:FORMAT:(text json)' \
-'--classification=[Change classification such as behavior-change, bug-fix, docs-only, or generated-only]:TEXT:_default' \
+'--classification=[Change classification. Feature/bug delivery requires a testable classification]:CLASSIFICATION:(behavior-change bug-fix feature docs-only config-only generated-only refactor-only)' \
 '*--production-path=[Production path affected by the change. Repeat for multiple paths]:PATH:_files' \
 '*--note=[Optional note to keep with the record. Repeat for multiple notes]:TEXT:_default' \
 '*--retained-behavior=[Existing behavior or invariant that must remain unchanged. Repeatable]:TEXT:_default' \

@@ -221,6 +221,11 @@ test targets, meaningful failing evidence, scoped final validation, waivers,
 and an explicit residual-gap declaration. Record v1 remains readable by
 `show`, but strict `verify` and the forge delivery gate require deliberate v2
 re-recording because the missing maintenance facts cannot be inferred safely.
+Classification is a closed set:
+`behavior-change|bug-fix|feature|docs-only|config-only|generated-only|refactor-only`.
+The first three are testable and must declare at least one changed, added, or
+removed behavior. Feature/bug forge delivery accepts only those testable
+classifications.
 
 ```bash
 test-first-evidence init \
@@ -262,6 +267,12 @@ test-first-evidence verify --out "$AGENT_HOME/out/projects/acme__app/test-first"
 test-first-evidence check --out "$AGENT_HOME/out/projects/acme__app/test-first" \
   --phase pre-edit --project-path . --path src/lib.rs --format json
 ```
+
+Final validation identity is `command + scope`. Re-recording the same identity
+with the opposite status appends a monotonically numbered attempt, so failed
+evidence and artifacts remain durable while only the latest attempt determines
+that identity's effective status. An unresolved latest failure blocks strict
+verification.
 
 `check` is read-only. `classified` confirms classification exists, `pre-edit`
 uses the repository's `[path_classes]` contract, and `delivery` is the

@@ -139,7 +139,7 @@ _test-first-evidence() {
                     return 0
                     ;;
                 --classification)
-                    COMPREPLY=($(compgen -f "${cur}"))
+                    COMPREPLY=($(compgen -W "behavior-change bug-fix feature docs-only config-only generated-only refactor-only" -- "${cur}"))
                     return 0
                     ;;
                 --production-path)

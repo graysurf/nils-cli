@@ -331,6 +331,531 @@ fn verify_incomplete_record_returns_json_error() {
 }
 
 #[test]
+fn classification_and_contract_delta_fail_closed() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let unknown_dir = tmp.path().join("unknown");
+    let unknown_arg = out_arg(&unknown_dir);
+    let unknown = run(
+        tmp.path(),
+        &[
+            "init",
+            "--out",
+            &unknown_arg,
+            "--classification",
+            "behavior_change",
+        ],
+    );
+    assert_eq!(unknown.code, 64, "stderr={}", unknown.stderr_text());
+
+    let retained_dir = tmp.path().join("retained-only");
+    let retained_arg = out_arg(&retained_dir);
+    let init = run(
+        tmp.path(),
+        &[
+            "init",
+            "--out",
+            &retained_arg,
+            "--classification",
+            "behavior-change",
+            "--retained-behavior",
+            "existing contract",
+        ],
+    );
+    assert_eq!(init.code, 0, "stderr={}", init.stderr_text());
+    let verify = run(
+        tmp.path(),
+        &["verify", "--out", &retained_arg, "--format", "json"],
+    );
+    assert_eq!(verify.code, 1, "stderr={}", verify.stderr_text());
+    assert!(
+        verify.stdout_json()["error"]["details"]["missing"]
+            .as_array()
+            .expect("missing")
+            .iter()
+            .any(|item| item == "changed_added_or_removed_behavior")
+    );
+}
+
+#[test]
+fn strict_verify_rejects_invalid_raw_v2_fields() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let out_dir = tmp.path().join("invalid-raw");
+    fs::create_dir_all(&out_dir).expect("invalid raw dir");
+    fs::write(
+        out_dir.join("test-first-evidence.json"),
+        r#"{
+  "schema_version": "test-first-evidence.record.v2",
+  "change_classification": "unknown-kind",
+  "waiver": {
+    "reason": "fixture",
+    "kind": "non-testable",
+    "why_no_red": "fixture",
+    "substitute_validation": ["manual check"]
+  },
+  "final_validations": [
+    {"command": "manual check", "status": "pass", "scope": "manual"}
+  ],
+  "no_residual_gaps": true
+}"#,
+    )
+    .expect("unknown classification record");
+    let out_arg = out_arg(&out_dir);
+    let verify = run(
+        tmp.path(),
+        &["verify", "--out", &out_arg, "--format", "json"],
+    );
+    assert_eq!(verify.code, 1, "stderr={}", verify.stderr_text());
+    assert!(
+        verify.stdout_json()["error"]["details"]["missing"]
+            .as_array()
+            .expect("missing")
+            .iter()
+            .any(|item| item == "invalid_change_classification")
+    );
+
+    fs::write(
+        out_dir.join("test-first-evidence.json"),
+        r#"{
+  "schema_version": "test-first-evidence.record.v2",
+  "change_classification": "behavior-change",
+  "contract_delta": {"changed_behaviors": ["new behavior"]},
+  "test_impacts": [{
+    "target": "tests::contract",
+    "disposition": "invented",
+    "protected_behavior": "contract",
+    "reason": "fixture"
+  }],
+  "failing_tests": [{
+    "command": "cargo test",
+    "exit_code": 101,
+    "summary": "red",
+    "expected_failure": "missing behavior",
+    "observed_failure": "assertion mismatch"
+  }],
+  "final_validations": [
+    {"command": "cargo test", "status": "pass", "scope": "focused"}
+  ],
+  "no_residual_gaps": true
+}"#,
+    )
+    .expect("unknown enum record");
+    let verify = run(
+        tmp.path(),
+        &["verify", "--out", &out_arg, "--format", "json"],
+    );
+    assert_eq!(verify.code, 1, "stderr={}", verify.stderr_text());
+    assert_eq!(verify.stdout_json()["error"]["code"], "invalid-record-json");
+}
+
+#[test]
+fn strict_verify_rejects_blank_delta_and_padded_duplicate_identity() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let out_dir = tmp.path().join("blank-and-duplicate");
+    fs::create_dir_all(&out_dir).expect("raw record dir");
+    fs::write(
+        out_dir.join("test-first-evidence.json"),
+        r#"{
+  "schema_version": "test-first-evidence.record.v2",
+  "change_classification": "behavior-change",
+  "contract_delta": {"changed_behaviors": ["   "]},
+  "test_impacts": [
+    {
+      "target": "tests::contract",
+      "disposition": "keep",
+      "protected_behavior": "contract",
+      "reason": "fixture"
+    },
+    {
+      "target": " tests::contract ",
+      "disposition": "keep",
+      "protected_behavior": "contract",
+      "reason": "fixture"
+    }
+  ],
+  "failing_tests": [{
+    "command": "cargo test",
+    "exit_code": 101,
+    "summary": "red",
+    "expected_failure": "missing behavior",
+    "observed_failure": "assertion mismatch"
+  }],
+  "final_validations": [
+    {"command": "cargo test", "status": "pass", "scope": "focused"}
+  ],
+  "no_residual_gaps": true
+}"#,
+    )
+    .expect("raw record");
+    let out_arg = out_arg(&out_dir);
+    let verify = run(
+        tmp.path(),
+        &["verify", "--out", &out_arg, "--format", "json"],
+    );
+    assert_eq!(verify.code, 1, "stderr={}", verify.stderr_text());
+    let missing = verify.stdout_json()["error"]["details"]["missing"]
+        .as_array()
+        .expect("missing")
+        .clone();
+    for expected in [
+        "contract_delta_blank_entry",
+        "changed_added_or_removed_behavior",
+        "duplicate_test_impact",
+    ] {
+        assert!(missing.iter().any(|item| item == expected), "{expected}");
+    }
+}
+
+#[test]
+fn cli_canonicalizes_duplicate_identities() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let out_dir = tmp.path().join("canonical-identities");
+    let out_arg = out_arg(&out_dir);
+    let init = run(
+        tmp.path(),
+        &[
+            "init",
+            "--out",
+            &out_arg,
+            "--classification",
+            "behavior-change",
+            "--changed-behavior",
+            "new behavior",
+        ],
+    );
+    assert_eq!(init.code, 0, "stderr={}", init.stderr_text());
+
+    let first = run(
+        tmp.path(),
+        &[
+            "record-impact",
+            "--out",
+            &out_arg,
+            "--target",
+            "tests::contract",
+            "--disposition",
+            "keep",
+            "--protected-behavior",
+            "contract",
+            "--reason",
+            "fixture",
+            "--format",
+            "json",
+        ],
+    );
+    assert_eq!(first.code, 0);
+    let duplicate = run(
+        tmp.path(),
+        &[
+            "record-impact",
+            "--out",
+            &out_arg,
+            "--target",
+            " tests::contract ",
+            "--disposition",
+            "keep",
+            "--protected-behavior",
+            "contract",
+            "--reason",
+            "fixture",
+            "--format",
+            "json",
+        ],
+    );
+    assert_eq!(duplicate.code, 65);
+    assert_eq!(
+        duplicate.stdout_json()["error"]["code"],
+        "duplicate-test-impact"
+    );
+
+    let first = run(
+        tmp.path(),
+        &[
+            "record-failing",
+            "--out",
+            &out_arg,
+            "--command",
+            "cargo test contract",
+            "--exit-code",
+            "101",
+            "--summary",
+            "red",
+            "--expected-failure",
+            "missing behavior",
+            "--observed-failure",
+            "assertion mismatch",
+            "--test-name",
+            "contract",
+        ],
+    );
+    assert_eq!(first.code, 0);
+    let duplicate = run(
+        tmp.path(),
+        &[
+            "record-failing",
+            "--out",
+            &out_arg,
+            "--command",
+            " cargo test contract ",
+            "--exit-code",
+            "101",
+            "--summary",
+            "red",
+            "--expected-failure",
+            "missing behavior",
+            "--observed-failure",
+            "assertion mismatch",
+            "--test-name",
+            " contract ",
+            "--format",
+            "json",
+        ],
+    );
+    assert_eq!(duplicate.code, 65);
+    assert_eq!(
+        duplicate.stdout_json()["error"]["code"],
+        "duplicate-failing-evidence"
+    );
+
+    let first = run(
+        tmp.path(),
+        &[
+            "record-final",
+            "--out",
+            &out_arg,
+            "--command",
+            "cargo test contract",
+            "--status",
+            "pass",
+            "--scope",
+            "focused",
+            "--format",
+            "json",
+        ],
+    );
+    assert_eq!(first.code, 0);
+    let duplicate = run(
+        tmp.path(),
+        &[
+            "record-final",
+            "--out",
+            &out_arg,
+            "--command",
+            " cargo test contract ",
+            "--status",
+            "pass",
+            "--scope",
+            "focused",
+            "--format",
+            "json",
+        ],
+    );
+    assert_eq!(duplicate.code, 65);
+    assert_eq!(
+        duplicate.stdout_json()["error"]["code"],
+        "duplicate-final-validation"
+    );
+
+    let first = run(
+        tmp.path(),
+        &[
+            "record-gap",
+            "--out",
+            &out_arg,
+            "--gap",
+            "missing browser case",
+            "--reason",
+            "fixture",
+            "--follow-up",
+            "issue #1",
+            "--format",
+            "json",
+        ],
+    );
+    assert_eq!(first.code, 0);
+    let duplicate = run(
+        tmp.path(),
+        &[
+            "record-gap",
+            "--out",
+            &out_arg,
+            "--gap",
+            " missing browser case ",
+            "--reason",
+            "fixture",
+            "--follow-up",
+            "issue #1",
+            "--format",
+            "json",
+        ],
+    );
+    assert_eq!(duplicate.code, 65);
+    assert_eq!(
+        duplicate.stdout_json()["error"]["code"],
+        "duplicate-residual-gap"
+    );
+}
+
+#[test]
+fn strict_verify_rejects_empty_evidence_identities() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let out_dir = tmp.path().join("empty-identities");
+    fs::create_dir_all(&out_dir).expect("empty identities dir");
+    fs::write(
+        out_dir.join("test-first-evidence.json"),
+        r#"{
+  "schema_version": "test-first-evidence.record.v2",
+  "change_classification": "behavior-change",
+  "contract_delta": {"changed_behaviors": ["new behavior"]},
+  "test_impacts": [{
+    "target": "",
+    "disposition": "keep",
+    "protected_behavior": "contract",
+    "reason": "fixture"
+  }],
+  "failing_tests": [{
+    "command": "",
+    "exit_code": 101,
+    "summary": "",
+    "expected_failure": "missing behavior",
+    "observed_failure": "assertion mismatch"
+  }],
+  "final_validations": [
+    {"command": "", "status": "pass", "scope": "focused"}
+  ],
+  "no_residual_gaps": true
+}"#,
+    )
+    .expect("empty identity record");
+    let out_arg = out_arg(&out_dir);
+    let verify = run(
+        tmp.path(),
+        &["verify", "--out", &out_arg, "--format", "json"],
+    );
+    assert_eq!(verify.code, 1, "stderr={}", verify.stderr_text());
+    let missing = verify.stdout_json()["error"]["details"]["missing"]
+        .as_array()
+        .expect("missing")
+        .clone();
+    for expected in [
+        "test_impact_identity_and_rationale",
+        "meaningful_failing_evidence",
+        "final_validation_identity",
+    ] {
+        assert!(missing.iter().any(|item| item == expected), "{expected}");
+    }
+}
+
+#[test]
+fn final_validation_retry_replaces_failure_but_other_failures_block() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let out_dir = tmp.path().join("final-retry");
+    let out_arg = out_arg(&out_dir);
+    for args in [
+        vec![
+            "init",
+            "--out",
+            &out_arg,
+            "--classification",
+            "behavior-change",
+            "--changed-behavior",
+            "new behavior",
+        ],
+        vec![
+            "record-impact",
+            "--out",
+            &out_arg,
+            "--none",
+            "--reason",
+            "no existing owner test",
+        ],
+        vec![
+            "record-failing",
+            "--out",
+            &out_arg,
+            "--command",
+            "cargo test contract",
+            "--exit-code",
+            "101",
+            "--summary",
+            "red",
+            "--expected-failure",
+            "new behavior missing",
+            "--observed-failure",
+            "assertion mismatch",
+        ],
+        vec!["record-gap", "--out", &out_arg, "--none"],
+    ] {
+        let output = run(tmp.path(), &args);
+        assert_eq!(output.code, 0, "stderr={}", output.stderr_text());
+    }
+
+    for status in ["fail", "pass"] {
+        let output = run(
+            tmp.path(),
+            &[
+                "record-final",
+                "--out",
+                &out_arg,
+                "--command",
+                "cargo test contract",
+                "--status",
+                status,
+                "--scope",
+                "focused",
+            ],
+        );
+        assert_eq!(
+            output.code,
+            0,
+            "status={status} stderr={}",
+            output.stderr_text()
+        );
+    }
+    let verify = run(tmp.path(), &["verify", "--out", &out_arg]);
+    assert_eq!(verify.code, 0, "stderr={}", verify.stderr_text());
+    let record: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(out_dir.join("test-first-evidence.json")).expect("record"),
+    )
+    .expect("record json");
+    let attempts = record["final_validations"]
+        .as_array()
+        .expect("final validations");
+    assert_eq!(attempts.len(), 2);
+    assert_eq!(attempts[0]["status"], "fail");
+    assert_eq!(attempts[0]["attempt"], 1);
+    assert_eq!(attempts[1]["status"], "pass");
+    assert_eq!(attempts[1]["attempt"], 2);
+
+    let failed_full = run(
+        tmp.path(),
+        &[
+            "record-final",
+            "--out",
+            &out_arg,
+            "--command",
+            "cargo test --workspace",
+            "--status",
+            "fail",
+            "--scope",
+            "full",
+        ],
+    );
+    assert_eq!(failed_full.code, 0, "stderr={}", failed_full.stderr_text());
+    let verify = run(
+        tmp.path(),
+        &["verify", "--out", &out_arg, "--format", "json"],
+    );
+    assert_eq!(verify.code, 1, "stderr={}", verify.stderr_text());
+    assert!(
+        verify.stdout_json()["error"]["details"]["missing"]
+            .as_array()
+            .expect("missing")
+            .iter()
+            .any(|item| item == "failed_final_validation")
+    );
+}
+
+#[test]
 fn secret_like_inputs_are_redacted_in_outputs_and_record() {
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let out_dir = tmp.path().join("secret-safe");
@@ -497,6 +1022,24 @@ fn legacy_v1_is_readable_but_strict_verify_requires_rerecording() {
     assert_eq!(value["error"]["code"], "v1-evidence-record");
     assert!(
         value["error"]["message"]
+            .as_str()
+            .expect("message")
+            .contains("re-record")
+    );
+
+    let delivery = run(
+        tmp.path(),
+        &[
+            "check", "--out", &out_arg, "--phase", "delivery", "--format", "json",
+        ],
+    );
+    assert_eq!(delivery.code, 65, "stderr={}", delivery.stderr_text());
+    assert_eq!(
+        delivery.stdout_json()["error"]["code"],
+        "v1-evidence-record"
+    );
+    assert!(
+        delivery.stdout_json()["error"]["message"]
             .as_str()
             .expect("message")
             .contains("re-record")

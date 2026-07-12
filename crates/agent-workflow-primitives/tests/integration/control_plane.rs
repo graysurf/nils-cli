@@ -250,6 +250,50 @@ fn test_first_check_is_phase_and_path_class_aware() {
     );
     assert_eq!(impact.code, 0, "stderr: {}", impact.stderr_text());
 
+    let record_path = out.join("test-first-evidence.json");
+    let mut malformed: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&record_path).unwrap()).unwrap();
+    malformed["failing_tests"] = serde_json::json!([{
+        "command": "",
+        "exit_code": 101,
+        "summary": "",
+        "expected_failure": "new contract missing",
+        "observed_failure": "assertion mismatch"
+    }]);
+    fs::write(
+        &record_path,
+        serde_json::to_string_pretty(&malformed).unwrap(),
+    )
+    .unwrap();
+    let malformed_pre_edit = run(
+        "test-first-evidence",
+        tmp.path(),
+        &[
+            "check",
+            "--out",
+            out_arg,
+            "--phase",
+            "pre-edit",
+            "--project-path",
+            repo_arg,
+            "--path",
+            "src/lib.rs",
+            "--format",
+            "json",
+        ],
+    );
+    assert_eq!(malformed_pre_edit.code, 65);
+    assert_eq!(
+        malformed_pre_edit.stdout_json()["error"]["details"]["reason_code"],
+        "missing-durable-pre-edit-evidence"
+    );
+    malformed["failing_tests"] = serde_json::json!([]);
+    fs::write(
+        &record_path,
+        serde_json::to_string_pretty(&malformed).unwrap(),
+    )
+    .unwrap();
+
     let before_fix = run(
         "test-first-evidence",
         tmp.path(),

@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 
 use clap::{Args, Parser, Subcommand, ValueEnum, ValueHint};
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -58,9 +59,9 @@ pub struct InitArgs {
     #[command(flatten)]
     pub common: CommonArgs,
 
-    /// Change classification such as behavior-change, bug-fix, docs-only, or generated-only.
-    #[arg(long, value_name = "TEXT")]
-    pub classification: String,
+    /// Change classification. Feature/bug delivery requires a testable classification.
+    #[arg(long, value_enum)]
+    pub classification: ChangeClassification,
 
     /// Production path affected by the change. Repeat for multiple paths.
     #[arg(long = "production-path", value_name = "PATH", value_hint = ValueHint::AnyPath)]
@@ -277,15 +278,17 @@ pub enum OutputFormat {
     Json,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Deserialize, Serialize, ValueEnum)]
 #[value(rename_all = "kebab-case")]
+#[serde(rename_all = "kebab-case")]
 pub enum ValidationStatus {
     Pass,
     Fail,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Deserialize, Serialize, ValueEnum)]
 #[value(rename_all = "kebab-case")]
+#[serde(rename_all = "kebab-case")]
 pub enum TestDisposition {
     Keep,
     UpdateSpec,
@@ -294,8 +297,9 @@ pub enum TestDisposition {
     RefactorOnly,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, ValueEnum)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Deserialize, Serialize, ValueEnum)]
 #[value(rename_all = "kebab-case")]
+#[serde(rename_all = "kebab-case")]
 pub enum ValidationScope {
     Focused,
     AffectedSuite,
@@ -304,11 +308,25 @@ pub enum ValidationScope {
     Manual,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize, Serialize, ValueEnum)]
 #[value(rename_all = "kebab-case")]
+#[serde(rename_all = "kebab-case")]
 pub enum WaiverKind {
     NonTestable,
     DeferredDebt,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize, Serialize, ValueEnum)]
+#[value(rename_all = "kebab-case")]
+#[serde(rename_all = "kebab-case")]
+pub enum ChangeClassification {
+    BehaviorChange,
+    BugFix,
+    Feature,
+    DocsOnly,
+    ConfigOnly,
+    GeneratedOnly,
+    RefactorOnly,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
@@ -334,6 +352,37 @@ impl ValidationStatus {
         match self {
             Self::Pass => "pass",
             Self::Fail => "fail",
+        }
+    }
+}
+
+impl ChangeClassification {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::BehaviorChange => "behavior-change",
+            Self::BugFix => "bug-fix",
+            Self::Feature => "feature",
+            Self::DocsOnly => "docs-only",
+            Self::ConfigOnly => "config-only",
+            Self::GeneratedOnly => "generated-only",
+            Self::RefactorOnly => "refactor-only",
+        }
+    }
+
+    pub fn is_testable(self) -> bool {
+        matches!(self, Self::BehaviorChange | Self::BugFix | Self::Feature)
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim() {
+            "behavior-change" => Some(Self::BehaviorChange),
+            "bug-fix" => Some(Self::BugFix),
+            "feature" => Some(Self::Feature),
+            "docs-only" => Some(Self::DocsOnly),
+            "config-only" => Some(Self::ConfigOnly),
+            "generated-only" => Some(Self::GeneratedOnly),
+            "refactor-only" => Some(Self::RefactorOnly),
+            _ => None,
         }
     }
 }
