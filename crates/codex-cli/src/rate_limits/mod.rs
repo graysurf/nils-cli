@@ -52,12 +52,12 @@ fn refresh_on_401_enabled(no_refresh_auth: bool) -> bool {
 
 #[derive(Debug, Clone, Serialize)]
 struct RateLimitSummary {
-    non_weekly_label: String,
-    non_weekly_remaining: i64,
+    non_weekly_label: Option<String>,
+    non_weekly_remaining: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     non_weekly_reset_epoch: Option<i64>,
-    weekly_remaining: i64,
-    weekly_reset_epoch: i64,
+    weekly_remaining: Option<i64>,
+    weekly_reset_epoch: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     weekly_reset_local: Option<String>,
 }
@@ -290,7 +290,12 @@ fn run_async_json_mode(args: &RateLimitsOptions, _debug_mode: bool) -> Result<i3
     let cached_mode = args.cached;
     let no_refresh_auth = args.no_refresh_auth;
     let mut results_by_secret = collect_async_items(&secret_files, jobs, None, move |path, _| {
-        collect_json_result_for_secret(&path, cached_mode, no_refresh_auth, true)
+        collect_json_result_for_secret(
+            &path,
+            cached_mode,
+            no_refresh_auth,
+            CacheFallbackPolicy::AnyFailure,
+        )
     });
     let mut results = Vec::new();
     let mut rc = 0;
@@ -344,8 +349,12 @@ fn run_all_json_mode(
     let mut results = Vec::new();
     let mut rc = 0;
     for secret_file in &secret_files {
-        let result =
-            collect_json_result_for_secret(secret_file, cached_mode, args.no_refresh_auth, false);
+        let result = collect_json_result_for_secret(
+            secret_file,
+            cached_mode,
+            args.no_refresh_auth,
+            CacheFallbackPolicy::NoWindow,
+        );
         if !cached_mode && !result.ok {
             rc = 1;
         }
@@ -473,11 +482,17 @@ fn should_writeback_usage(target_file: &Path) -> bool {
     !is_official_codex_auth_file(target_file)
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CacheFallbackPolicy {
+    NoWindow,
+    AnyFailure,
+}
+
 fn collect_json_result_for_secret(
     target_file: &Path,
     cached_mode: bool,
     no_refresh_auth: bool,
-    allow_cache_fallback: bool,
+    cache_fallback: CacheFallbackPolicy,
 ) -> RateLimitJsonResult {
     if cached_mode {
         return collect_json_from_cache(target_file, "cache", true);
@@ -525,14 +540,14 @@ fn collect_json_result_for_secret(
                 Some((summary, windows)) => {
                     let fetched_at_epoch = Utc::now().timestamp();
                     if fetched_at_epoch > 0 {
+                        let usage_data = render::parse_usage(&usage.json)
+                            .expect("summary requires parsed usage");
+                        let values = render::render_values(&usage_data);
+                        let weekly = render::weekly_values(&values);
                         let _ = cache::write_prompt_segment_cache(
                             target_file,
                             fetched_at_epoch,
-                            &summary.non_weekly_label,
-                            summary.non_weekly_remaining,
-                            summary.weekly_remaining,
-                            summary.weekly_reset_epoch,
-                            summary.non_weekly_reset_epoch,
+                            &weekly,
                         );
                     }
                     RateLimitJsonResult {
@@ -545,15 +560,18 @@ fn collect_json_result_for_secret(
                         reason_code: None,
                         summary: Some(summary),
                         windows: Some(windows),
-                        raw_usage: Some(redact_sensitive_json(&usage.json)),
+                        raw_usage: Some(project_safe_usage_json(&usage.json)),
                         error: None,
                     }
                 }
-                None if render::rate_limit_is_explicit_null(&usage.json) => {
+                None if render::rate_limit_has_no_windows(&usage.json) => {
                     // Benign: the backend reports no active window. Prefer the
                     // last-known cached values (stale allowed), else report the
                     // empty window as a success rather than an error.
-                    if allow_cache_fallback {
+                    if matches!(
+                        cache_fallback,
+                        CacheFallbackPolicy::NoWindow | CacheFallbackPolicy::AnyFailure
+                    ) {
                         let fallback =
                             collect_json_from_cache(target_file, "cache-fallback", false);
                         if fallback.ok {
@@ -568,13 +586,13 @@ fn collect_json_result_for_secret(
                     "invalid-usage-payload",
                     "codex-rate-limits: invalid usage payload".to_string(),
                     Some(serde_json::json!({
-                        "raw_usage": redact_sensitive_json(&usage.json),
+                        "raw_usage": project_safe_usage_json(&usage.json),
                     })),
                 ),
             }
         }
         Err(err) => {
-            if allow_cache_fallback {
+            if cache_fallback == CacheFallbackPolicy::AnyFailure {
                 let fallback = collect_json_from_cache(target_file, "cache-fallback", false);
                 if fallback.ok {
                     return fallback;
@@ -677,7 +695,7 @@ fn json_result_no_window(target_file: &Path) -> RateLimitJsonResult {
         provider: "codex".to_string(),
         name: secret_display_name(target_file),
         target_file: target_file_name(target_file),
-        status: "no-rate-limit-window".to_string(),
+        status: "ok".to_string(),
         ok: true,
         source: "network".to_string(),
         reason_code: None,
@@ -713,38 +731,52 @@ fn summary_and_windows_from_usage(
     let usage_data = render::parse_usage(usage_json)?;
     let values = render::render_values(&usage_data);
     let weekly = render::weekly_values(&values);
-    let summary = RateLimitSummary {
-        non_weekly_label: weekly.non_weekly_label,
-        non_weekly_remaining: weekly.non_weekly_remaining,
-        non_weekly_reset_epoch: weekly.non_weekly_reset_epoch,
-        weekly_remaining: weekly.weekly_remaining,
-        weekly_reset_epoch: weekly.weekly_reset_epoch,
-        weekly_reset_local: render::format_epoch_local_datetime_with_offset(
-            weekly.weekly_reset_epoch,
-        ),
-    };
+    let summary = summary_from_weekly_values(&weekly);
     let windows = windows_from_usage_values(&usage_data, &values);
-    Some((summary, windows))
+    (!windows.is_empty()).then_some((summary, windows))
+}
+
+fn summary_from_weekly_values(weekly: &render::WeeklyValues) -> RateLimitSummary {
+    RateLimitSummary {
+        non_weekly_label: weekly
+            .non_weekly
+            .as_ref()
+            .map(|window| window.label.clone()),
+        non_weekly_remaining: weekly.non_weekly.as_ref().map(|window| window.remaining),
+        non_weekly_reset_epoch: weekly
+            .non_weekly
+            .as_ref()
+            .map(|window| window.reset_epoch)
+            .filter(|epoch| *epoch > 0),
+        weekly_remaining: weekly.weekly.as_ref().map(|window| window.remaining),
+        weekly_reset_epoch: weekly.weekly.as_ref().map(|window| window.reset_epoch),
+        weekly_reset_local: weekly
+            .weekly
+            .as_ref()
+            .and_then(|window| render::format_epoch_local_datetime_with_offset(window.reset_epoch)),
+    }
 }
 
 fn windows_from_usage_values(
     usage_data: &render::UsageData,
     values: &render::RenderValues,
 ) -> Vec<RateLimitWindow> {
-    vec![
-        RateLimitWindow {
-            label: values.primary_label.clone(),
-            used_percent: percent_i64(usage_data.primary.used_percent),
-            remaining_percent: values.primary_remaining,
-            reset_at_epoch: Some(values.primary_reset_epoch).filter(|epoch| *epoch > 0),
-        },
-        RateLimitWindow {
-            label: values.secondary_label.clone(),
-            used_percent: percent_i64(usage_data.secondary.used_percent),
-            remaining_percent: values.secondary_remaining,
-            reset_at_epoch: Some(values.secondary_reset_epoch).filter(|epoch| *epoch > 0),
-        },
+    [
+        (&usage_data.primary, &values.primary),
+        (&usage_data.secondary, &values.secondary),
     ]
+    .into_iter()
+    .filter_map(|(window, rendered)| {
+        let window = window.as_ref()?;
+        let rendered = rendered.as_ref()?;
+        Some(RateLimitWindow {
+            label: rendered.label.clone(),
+            used_percent: percent_i64(window.used_percent),
+            remaining_percent: rendered.remaining,
+            reset_at_epoch: Some(rendered.reset_epoch).filter(|epoch| *epoch > 0),
+        })
+    })
+    .collect()
 }
 
 fn summary_from_cache(entry: &cache::CacheEntry) -> RateLimitSummary {
@@ -754,27 +786,32 @@ fn summary_from_cache(entry: &cache::CacheEntry) -> RateLimitSummary {
         non_weekly_reset_epoch: entry.non_weekly_reset_epoch,
         weekly_remaining: entry.weekly_remaining,
         weekly_reset_epoch: entry.weekly_reset_epoch,
-        weekly_reset_local: render::format_epoch_local_datetime_with_offset(
-            entry.weekly_reset_epoch,
-        ),
+        weekly_reset_local: entry
+            .weekly_reset_epoch
+            .and_then(render::format_epoch_local_datetime_with_offset),
     }
 }
 
 fn windows_from_cache(entry: &cache::CacheEntry) -> Vec<RateLimitWindow> {
-    vec![
-        RateLimitWindow {
-            label: entry.non_weekly_label.clone(),
-            used_percent: remaining_to_used_percent(entry.non_weekly_remaining),
-            remaining_percent: entry.non_weekly_remaining,
+    let mut windows = Vec::new();
+    if let (Some(label), Some(remaining)) = (&entry.non_weekly_label, entry.non_weekly_remaining) {
+        windows.push(RateLimitWindow {
+            label: label.clone(),
+            used_percent: remaining_to_used_percent(remaining),
+            remaining_percent: remaining,
             reset_at_epoch: entry.non_weekly_reset_epoch,
-        },
-        RateLimitWindow {
+        });
+    }
+    if let (Some(remaining), Some(reset_epoch)) = (entry.weekly_remaining, entry.weekly_reset_epoch)
+    {
+        windows.push(RateLimitWindow {
             label: "Weekly".to_string(),
-            used_percent: remaining_to_used_percent(entry.weekly_remaining),
-            remaining_percent: entry.weekly_remaining,
-            reset_at_epoch: Some(entry.weekly_reset_epoch).filter(|epoch| *epoch > 0),
-        },
-    ]
+            used_percent: remaining_to_used_percent(remaining),
+            remaining_percent: remaining,
+            reset_at_epoch: Some(reset_epoch).filter(|epoch| *epoch > 0),
+        });
+    }
+    windows
 }
 
 fn percent_i64(percent: f64) -> i64 {
@@ -789,28 +826,73 @@ fn remaining_to_used_percent(remaining: i64) -> i64 {
     (100 - remaining).clamp(0, 100)
 }
 
-fn redact_sensitive_json(value: &Value) -> Value {
-    match value {
-        Value::Object(map) => {
-            let mut next = serde_json::Map::new();
-            for (key, val) in map {
-                if is_sensitive_key(key) {
-                    continue;
-                }
-                next.insert(key.clone(), redact_sensitive_json(val));
-            }
-            Value::Object(next)
-        }
-        Value::Array(items) => Value::Array(items.iter().map(redact_sensitive_json).collect()),
-        _ => value.clone(),
+fn project_safe_usage_json(value: &Value) -> Value {
+    let Some(source) = value.as_object() else {
+        return Value::Object(serde_json::Map::new());
+    };
+    let mut projected = serde_json::Map::new();
+    if let Some(plan_type) = source
+        .get("plan_type")
+        .and_then(Value::as_str)
+        .filter(|value| is_safe_plan_type(value))
+    {
+        projected.insert(
+            "plan_type".to_string(),
+            Value::String(plan_type.to_string()),
+        );
     }
+    for key in ["rate_limit", "code_review_rate_limit"] {
+        if let Some(rate_limit) = source.get(key)
+            && let Some(safe) = project_safe_rate_limit(rate_limit)
+        {
+            projected.insert(key.to_string(), safe);
+        }
+    }
+    Value::Object(projected)
 }
 
-fn is_sensitive_key(key: &str) -> bool {
+fn is_safe_plan_type(value: &str) -> bool {
     matches!(
-        key,
-        "access_token" | "refresh_token" | "id_token" | "authorization" | "Authorization"
+        value,
+        "free" | "go" | "plus" | "pro" | "team" | "business" | "enterprise" | "edu"
     )
+}
+
+fn project_safe_rate_limit(value: &Value) -> Option<Value> {
+    if value.is_null() {
+        return Some(Value::Null);
+    }
+    let source = value.as_object()?;
+    let mut projected = serde_json::Map::new();
+    for key in ["allowed", "limit_reached"] {
+        if let Some(value) = source.get(key).and_then(Value::as_bool) {
+            projected.insert(key.to_string(), Value::Bool(value));
+        }
+    }
+    for key in ["primary_window", "secondary_window"] {
+        if let Some(window) = source.get(key)
+            && let Some(safe) = project_safe_window(window)
+        {
+            projected.insert(key.to_string(), safe);
+        }
+    }
+    Some(Value::Object(projected))
+}
+
+fn project_safe_window(value: &Value) -> Option<Value> {
+    if value.is_null() {
+        return Some(Value::Null);
+    }
+    let source = value.as_object()?;
+    let mut projected = serde_json::Map::new();
+    for key in ["limit_window_seconds", "used_percent", "reset_at"] {
+        if let Some(value) = source.get(key)
+            && value.is_number()
+        {
+            projected.insert(key.to_string(), value.clone());
+        }
+    }
+    Some(Value::Object(projected))
 }
 
 #[derive(Default)]
@@ -1140,15 +1222,15 @@ fn collect_async_round(
             if let Some(line) = &event.line
                 && let Some(parsed) = parse_one_line_output(line)
             {
-                row.window_label = parsed.window_label.clone();
-                row.non_weekly_remaining = parsed.non_weekly_remaining;
-                row.weekly_remaining = parsed.weekly_remaining;
+                row.window_label = parsed.window_label.clone().unwrap_or_default();
+                row.non_weekly_remaining = parsed.non_weekly_remaining.unwrap_or(-1);
+                row.weekly_remaining = parsed.weekly_remaining.unwrap_or(-1);
                 row.weekly_reset_iso = parsed.weekly_reset_iso.clone();
 
                 if cached_mode {
                     if let Ok(cache_entry) = cache::read_cache_entry_for_cached_mode(secret_file) {
                         row.non_weekly_reset_epoch = cache_entry.non_weekly_reset_epoch;
-                        row.weekly_reset_epoch = Some(cache_entry.weekly_reset_epoch);
+                        row.weekly_reset_epoch = cache_entry.weekly_reset_epoch;
                     }
                 } else {
                     let values = crate::json::read_json(secret_file).ok();
@@ -1169,7 +1251,7 @@ fn collect_async_round(
                             row.non_weekly_reset_epoch = cache_entry.non_weekly_reset_epoch;
                         }
                         if row.weekly_reset_epoch.is_none() {
-                            row.weekly_reset_epoch = Some(cache_entry.weekly_reset_epoch);
+                            row.weekly_reset_epoch = cache_entry.weekly_reset_epoch;
                         }
                     }
                 }
@@ -1179,7 +1261,9 @@ fn collect_async_round(
                 } else {
                     RowState::Filled
                 };
-                window_labels.insert(row.window_label.clone());
+                if !row.window_label.is_empty() {
+                    window_labels.insert(row.window_label.clone());
+                }
                 rows.push(row);
                 continue;
             }
@@ -1523,7 +1607,7 @@ fn fetch_one_line_network(target_file: &Path, no_refresh_auth: bool) -> AsyncFet
     let usage_data = match render::parse_usage(&usage.json) {
         Some(value) => value,
         None => {
-            if render::rate_limit_is_explicit_null(&usage.json) {
+            if render::rate_limit_has_no_windows(&usage.json) {
                 return AsyncFetchResult {
                     rc: RC_NO_RATE_LIMIT_WINDOW,
                     ..Default::default()
@@ -1540,28 +1624,29 @@ fn fetch_one_line_network(target_file: &Path, no_refresh_auth: bool) -> AsyncFet
 
     let values = render::render_values(&usage_data);
     let weekly = render::weekly_values(&values);
+    if weekly.weekly.is_none() && weekly.non_weekly.is_none() {
+        return AsyncFetchResult {
+            rc: RC_NO_RATE_LIMIT_WINDOW,
+            no_window: true,
+            ..Default::default()
+        };
+    }
 
     let fetched_at_epoch = Utc::now().timestamp();
     if fetched_at_epoch > 0 {
-        let _ = cache::write_prompt_segment_cache(
-            target_file,
-            fetched_at_epoch,
-            &weekly.non_weekly_label,
-            weekly.non_weekly_remaining,
-            weekly.weekly_remaining,
-            weekly.weekly_reset_epoch,
-            weekly.non_weekly_reset_epoch,
-        );
+        let _ = cache::write_prompt_segment_cache(target_file, fetched_at_epoch, &weekly);
     }
 
     AsyncFetchResult {
-        line: Some(format_one_line_output(
-            target_file,
-            &weekly.non_weekly_label,
-            weekly.non_weekly_remaining,
-            weekly.weekly_remaining,
-            weekly.weekly_reset_epoch,
-        )),
+        line: format_one_line_output(
+            weekly
+                .non_weekly
+                .as_ref()
+                .map(|window| window.label.as_str()),
+            weekly.non_weekly.as_ref().map(|window| window.remaining),
+            weekly.weekly.as_ref().map(|window| window.remaining),
+            weekly.weekly.as_ref().map(|window| window.reset_epoch),
+        ),
         rc: 0,
         ..Default::default()
     }
@@ -1570,13 +1655,12 @@ fn fetch_one_line_network(target_file: &Path, no_refresh_auth: bool) -> AsyncFet
 fn fetch_one_line_cached(target_file: &Path) -> AsyncFetchResult {
     match cache::read_cache_entry_for_cached_mode(target_file) {
         Ok(entry) => AsyncFetchResult {
-            line: Some(format_one_line_output(
-                target_file,
-                &entry.non_weekly_label,
+            line: format_one_line_output(
+                entry.non_weekly_label.as_deref(),
                 entry.non_weekly_remaining,
                 entry.weekly_remaining,
                 entry.weekly_reset_epoch,
-            )),
+            ),
             rc: 0,
             ..Default::default()
         },
@@ -1595,13 +1679,12 @@ fn fetch_one_line_cached(target_file: &Path) -> AsyncFetchResult {
 fn fetch_one_line_cached_allow_stale(target_file: &Path) -> AsyncFetchResult {
     match cache::read_cache_entry_allow_stale(target_file) {
         Ok(read) => AsyncFetchResult {
-            line: Some(format_one_line_output(
-                target_file,
-                &read.entry.non_weekly_label,
+            line: format_one_line_output(
+                read.entry.non_weekly_label.as_deref(),
                 read.entry.non_weekly_remaining,
                 read.entry.weekly_remaining,
                 read.entry.weekly_reset_epoch,
-            )),
+            ),
             rc: 0,
             stale: read.stale,
             ..Default::default()
@@ -1616,20 +1699,24 @@ fn fetch_one_line_cached_allow_stale(target_file: &Path) -> AsyncFetchResult {
 }
 
 fn format_one_line_output(
-    target_file: &Path,
-    non_weekly_label: &str,
-    non_weekly_remaining: i64,
-    weekly_remaining: i64,
-    weekly_reset_epoch: i64,
-) -> String {
-    let _ = target_file;
-    let weekly_reset_iso =
-        render::format_epoch_local_datetime(weekly_reset_epoch).unwrap_or_else(|| "?".to_string());
-
-    format!(
-        "{}:{}% W:{}% {}",
-        non_weekly_label, non_weekly_remaining, weekly_remaining, weekly_reset_iso
-    )
+    non_weekly_label: Option<&str>,
+    non_weekly_remaining: Option<i64>,
+    weekly_remaining: Option<i64>,
+    weekly_reset_epoch: Option<i64>,
+) -> Option<String> {
+    let mut parts = Vec::new();
+    if let (Some(label), Some(remaining)) = (non_weekly_label, non_weekly_remaining) {
+        parts.push(format!("{label}:{remaining}%"));
+    }
+    if let Some(remaining) = weekly_remaining {
+        parts.push(format!("W:{remaining}%"));
+        if let Some(reset_epoch) = weekly_reset_epoch {
+            parts.push(
+                render::format_epoch_local_datetime(reset_epoch).unwrap_or_else(|| "?".to_string()),
+            );
+        }
+    }
+    (!parts.is_empty()).then(|| parts.join(" "))
 }
 
 fn normalize_one_line(line: String) -> String {
@@ -1736,15 +1823,12 @@ fn run_all_mode(args: &RateLimitsOptions, cached_mode: bool, debug_mode: bool) -
         }
 
         let mut row = Row::empty(secret_name.trim_end_matches(".json").to_string());
-        let output =
-            match single_one_line(&secret_file, cached_mode, args.no_refresh_auth, debug_mode) {
-                Ok(Some(line)) => line,
-                Ok(None) => String::new(),
-                Err(_) => String::new(),
-            };
+        let one_line = single_one_line(&secret_file, cached_mode, args.no_refresh_auth, debug_mode)
+            .unwrap_or_default();
+        let output = one_line.line.unwrap_or_default();
 
         if output.is_empty() {
-            if !cached_mode {
+            if !cached_mode && !one_line.no_window {
                 rc = 1;
             }
             rows.push(row);
@@ -1752,15 +1836,15 @@ fn run_all_mode(args: &RateLimitsOptions, cached_mode: bool, debug_mode: bool) -
         }
 
         if let Some(parsed) = parse_one_line_output(&output) {
-            row.window_label = parsed.window_label.clone();
-            row.non_weekly_remaining = parsed.non_weekly_remaining;
-            row.weekly_remaining = parsed.weekly_remaining;
+            row.window_label = parsed.window_label.clone().unwrap_or_default();
+            row.non_weekly_remaining = parsed.non_weekly_remaining.unwrap_or(-1);
+            row.weekly_remaining = parsed.weekly_remaining.unwrap_or(-1);
             row.weekly_reset_iso = parsed.weekly_reset_iso.clone();
 
             if cached_mode {
                 if let Ok(cache_entry) = cache::read_cache_entry_for_cached_mode(&secret_file) {
                     row.non_weekly_reset_epoch = cache_entry.non_weekly_reset_epoch;
-                    row.weekly_reset_epoch = Some(cache_entry.weekly_reset_epoch);
+                    row.weekly_reset_epoch = cache_entry.weekly_reset_epoch;
                 }
             } else {
                 let values = crate::json::read_json(&secret_file).ok();
@@ -1776,7 +1860,9 @@ fn run_all_mode(args: &RateLimitsOptions, cached_mode: bool, debug_mode: bool) -
                 }
             }
 
-            window_labels.insert(row.window_label.clone());
+            if !row.window_label.is_empty() {
+                window_labels.insert(row.window_label.clone());
+            }
             rows.push(row);
         } else {
             if !cached_mode {
@@ -1927,16 +2013,14 @@ fn run_single_mode(
     if cached_mode {
         match cache::read_cache_entry_for_cached_mode(&target_file) {
             Ok(entry) => {
-                let weekly_reset_iso =
-                    render::format_epoch_local_datetime(entry.weekly_reset_epoch)
-                        .unwrap_or_else(|| "?".to_string());
-                println!(
-                    "{}:{}% W:{}% {}",
-                    entry.non_weekly_label,
+                if let Some(line) = format_one_line_output(
+                    entry.non_weekly_label.as_deref(),
                     entry.non_weekly_remaining,
                     entry.weekly_remaining,
-                    weekly_reset_iso
-                );
+                    entry.weekly_reset_epoch,
+                ) {
+                    println!("{line}");
+                }
                 return Ok(0);
             }
             Err(err) => {
@@ -2046,7 +2130,7 @@ fn run_single_mode(
     let usage_data = match render::parse_usage(&usage.json) {
         Some(value) => value,
         None => {
-            if render::rate_limit_is_explicit_null(&usage.json) {
+            if render::rate_limit_has_no_windows(&usage.json) {
                 return emit_single_no_window(&target_file, output_json, one_line);
             }
             if output_json {
@@ -2057,7 +2141,7 @@ fn run_single_mode(
                     "codex-rate-limits: invalid usage payload",
                     Some(serde_json::json!({
                         "target_file": target_file.display().to_string(),
-                        "raw_usage": redact_sensitive_json(&usage.json),
+                        "raw_usage": project_safe_usage_json(&usage.json),
                     })),
                 )?;
             } else {
@@ -2069,18 +2153,13 @@ fn run_single_mode(
 
     let values = render::render_values(&usage_data);
     let weekly = render::weekly_values(&values);
+    if weekly.weekly.is_none() && weekly.non_weekly.is_none() {
+        return emit_single_no_window(&target_file, output_json, one_line);
+    }
 
     let fetched_at_epoch = Utc::now().timestamp();
     if fetched_at_epoch > 0 {
-        let _ = cache::write_prompt_segment_cache(
-            &target_file,
-            fetched_at_epoch,
-            &weekly.non_weekly_label,
-            weekly.non_weekly_remaining,
-            weekly.weekly_remaining,
-            weekly.weekly_reset_epoch,
-            weekly.non_weekly_reset_epoch,
-        );
+        let _ = cache::write_prompt_segment_cache(&target_file, fetched_at_epoch, &weekly);
     }
 
     if output_json {
@@ -2093,18 +2172,9 @@ fn run_single_mode(
             ok: true,
             source: "network".to_string(),
             reason_code: None,
-            summary: Some(RateLimitSummary {
-                non_weekly_label: weekly.non_weekly_label,
-                non_weekly_remaining: weekly.non_weekly_remaining,
-                non_weekly_reset_epoch: weekly.non_weekly_reset_epoch,
-                weekly_remaining: weekly.weekly_remaining,
-                weekly_reset_epoch: weekly.weekly_reset_epoch,
-                weekly_reset_local: render::format_epoch_local_datetime_with_offset(
-                    weekly.weekly_reset_epoch,
-                ),
-            }),
+            summary: Some(summary_from_weekly_values(&weekly)),
             windows: Some(windows),
-            raw_usage: Some(redact_sensitive_json(&usage.json)),
+            raw_usage: Some(project_safe_usage_json(&usage.json)),
             error: None,
         };
         diag_output::emit_json(&RateLimitSingleEnvelope {
@@ -2118,33 +2188,26 @@ fn run_single_mode(
     }
 
     if one_line {
-        let weekly_reset_iso = render::format_epoch_local_datetime(weekly.weekly_reset_epoch)
-            .unwrap_or_else(|| "?".to_string());
-
-        println!(
-            "{}:{}% W:{}% {}",
-            weekly.non_weekly_label,
-            weekly.non_weekly_remaining,
-            weekly.weekly_remaining,
-            weekly_reset_iso
-        );
+        if let Some(line) = format_one_line_output(
+            weekly
+                .non_weekly
+                .as_ref()
+                .map(|window| window.label.as_str()),
+            weekly.non_weekly.as_ref().map(|window| window.remaining),
+            weekly.weekly.as_ref().map(|window| window.remaining),
+            weekly.weekly.as_ref().map(|window| window.reset_epoch),
+        ) {
+            println!("{line}");
+        }
         return Ok(0);
     }
 
     println!("Rate limits remaining");
-    let primary_reset = render::format_epoch_local_datetime(values.primary_reset_epoch)
-        .unwrap_or_else(|| "?".to_string());
-    let secondary_reset = render::format_epoch_local_datetime(values.secondary_reset_epoch)
-        .unwrap_or_else(|| "?".to_string());
-
-    println!(
-        "{} {}% • {}",
-        values.primary_label, values.primary_remaining, primary_reset
-    );
-    println!(
-        "{} {}% • {}",
-        values.secondary_label, values.secondary_remaining, secondary_reset
-    );
+    for window in [&values.primary, &values.secondary].into_iter().flatten() {
+        let reset = render::format_epoch_local_datetime(window.reset_epoch)
+            .unwrap_or_else(|| "?".to_string());
+        println!("{} {}% • {}", window.label, window.remaining, reset);
+    }
 
     Ok(0)
 }
@@ -2170,31 +2233,35 @@ fn emit_single_no_window(target_file: &Path, output_json: bool, one_line: bool) 
         let entry = read.entry;
         let stale_suffix = if read.stale { " (stale)" } else { "" };
         if one_line {
-            let weekly_reset_iso = render::format_epoch_local_datetime(entry.weekly_reset_epoch)
-                .unwrap_or_else(|| "?".to_string());
-            println!(
-                "{}:{}% W:{}% {}{}",
-                entry.non_weekly_label,
+            if let Some(line) = format_one_line_output(
+                entry.non_weekly_label.as_deref(),
                 entry.non_weekly_remaining,
                 entry.weekly_remaining,
-                weekly_reset_iso,
-                stale_suffix
-            );
+                entry.weekly_reset_epoch,
+            ) {
+                println!("{line}{stale_suffix}");
+            }
             return Ok(0);
         }
 
-        let weekly_reset = render::format_epoch_local_datetime(entry.weekly_reset_epoch)
-            .unwrap_or_else(|| "?".to_string());
-        let non_weekly_reset = entry
-            .non_weekly_reset_epoch
-            .and_then(render::format_epoch_local_datetime)
-            .unwrap_or_else(|| "?".to_string());
         println!("Rate limits remaining{stale_suffix}");
-        println!(
-            "{} {}% • {}",
-            entry.non_weekly_label, entry.non_weekly_remaining, non_weekly_reset
-        );
-        println!("Weekly {}% • {}", entry.weekly_remaining, weekly_reset);
+        if let (Some(label), Some(remaining)) = (
+            entry.non_weekly_label.as_deref(),
+            entry.non_weekly_remaining,
+        ) {
+            let reset = entry
+                .non_weekly_reset_epoch
+                .and_then(render::format_epoch_local_datetime)
+                .unwrap_or_else(|| "?".to_string());
+            println!("{label} {remaining}% • {reset}");
+        }
+        if let (Some(remaining), Some(reset_epoch)) =
+            (entry.weekly_remaining, entry.weekly_reset_epoch)
+        {
+            let reset =
+                render::format_epoch_local_datetime(reset_epoch).unwrap_or_else(|| "?".to_string());
+            println!("Weekly {remaining}% • {reset}");
+        }
         return Ok(0);
     }
 
@@ -2214,38 +2281,41 @@ fn emit_single_no_window(target_file: &Path, output_json: bool, one_line: bool) 
     Ok(0)
 }
 
+#[derive(Default)]
+struct SingleOneLineResult {
+    line: Option<String>,
+    no_window: bool,
+}
+
 fn single_one_line(
     target_file: &Path,
     cached_mode: bool,
     no_refresh_auth: bool,
     debug_mode: bool,
-) -> Result<Option<String>> {
+) -> Result<SingleOneLineResult> {
     if !target_file.is_file() {
         if debug_mode {
             eprintln!("codex-rate-limits: target file not found");
         }
-        return Ok(None);
+        return Ok(SingleOneLineResult::default());
     }
 
     if cached_mode {
         return match cache::read_cache_entry_for_cached_mode(target_file) {
-            Ok(entry) => {
-                let weekly_reset_iso =
-                    render::format_epoch_local_datetime(entry.weekly_reset_epoch)
-                        .unwrap_or_else(|| "?".to_string());
-                Ok(Some(format!(
-                    "{}:{}% W:{}% {}",
-                    entry.non_weekly_label,
+            Ok(entry) => Ok(SingleOneLineResult {
+                line: format_one_line_output(
+                    entry.non_weekly_label.as_deref(),
                     entry.non_weekly_remaining,
                     entry.weekly_remaining,
-                    weekly_reset_iso
-                )))
-            }
+                    entry.weekly_reset_epoch,
+                ),
+                no_window: false,
+            }),
             Err(err) => {
                 if debug_mode {
                     eprintln!("{err}");
                 }
-                Ok(None)
+                Ok(SingleOneLineResult::default())
             }
         };
     }
@@ -2270,7 +2340,7 @@ fn single_one_line(
             if debug_mode {
                 eprintln!("{err}");
             }
-            return Ok(None);
+            return Ok(SingleOneLineResult::default());
         }
     };
 
@@ -2283,32 +2353,49 @@ fn single_one_line(
 
     let usage_data = match render::parse_usage(&usage.json) {
         Some(value) => value,
-        None => return Ok(None),
+        None if render::rate_limit_has_no_windows(&usage.json) => {
+            return Ok(single_one_line_no_window(target_file));
+        }
+        None => return Ok(SingleOneLineResult::default()),
     };
     let values = render::render_values(&usage_data);
     let weekly = render::weekly_values(&values);
+    if weekly.weekly.is_none() && weekly.non_weekly.is_none() {
+        return Ok(single_one_line_no_window(target_file));
+    }
     let fetched_at_epoch = Utc::now().timestamp();
     if fetched_at_epoch > 0 {
-        let _ = cache::write_prompt_segment_cache(
-            target_file,
-            fetched_at_epoch,
-            &weekly.non_weekly_label,
-            weekly.non_weekly_remaining,
-            weekly.weekly_remaining,
-            weekly.weekly_reset_epoch,
-            weekly.non_weekly_reset_epoch,
-        );
+        let _ = cache::write_prompt_segment_cache(target_file, fetched_at_epoch, &weekly);
     }
-    let weekly_reset_iso = render::format_epoch_local_datetime(weekly.weekly_reset_epoch)
-        .unwrap_or_else(|| "?".to_string());
+    Ok(SingleOneLineResult {
+        line: format_one_line_output(
+            weekly
+                .non_weekly
+                .as_ref()
+                .map(|window| window.label.as_str()),
+            weekly.non_weekly.as_ref().map(|window| window.remaining),
+            weekly.weekly.as_ref().map(|window| window.remaining),
+            weekly.weekly.as_ref().map(|window| window.reset_epoch),
+        ),
+        no_window: false,
+    })
+}
 
-    Ok(Some(format!(
-        "{}:{}% W:{}% {}",
-        weekly.non_weekly_label,
-        weekly.non_weekly_remaining,
-        weekly.weekly_remaining,
-        weekly_reset_iso
-    )))
+fn single_one_line_no_window(target_file: &Path) -> SingleOneLineResult {
+    let line = cache::read_cache_entry_allow_stale(target_file)
+        .ok()
+        .and_then(|read| {
+            format_one_line_output(
+                read.entry.non_weekly_label.as_deref(),
+                read.entry.non_weekly_remaining,
+                read.entry.weekly_remaining,
+                read.entry.weekly_reset_epoch,
+            )
+        });
+    SingleOneLineResult {
+        line,
+        no_window: true,
+    }
 }
 
 fn resolve_target(secret: Option<&str>) -> std::result::Result<PathBuf, i32> {
@@ -2397,63 +2484,45 @@ impl Row {
 }
 
 struct ParsedOneLine {
-    window_label: String,
-    non_weekly_remaining: i64,
-    weekly_remaining: i64,
+    window_label: Option<String>,
+    non_weekly_remaining: Option<i64>,
+    weekly_remaining: Option<i64>,
     weekly_reset_iso: String,
 }
 
 fn parse_one_line_output(line: &str) -> Option<ParsedOneLine> {
     let parts: Vec<&str> = line.split_whitespace().collect();
-    if parts.len() < 3 {
+    if parts.is_empty() {
         return None;
     }
-
-    fn parse_fields(
-        window_field: &str,
-        weekly_field: &str,
-        reset_iso: String,
-    ) -> Option<ParsedOneLine> {
-        let window_label = window_field
-            .split(':')
-            .next()?
-            .trim_matches('"')
-            .to_string();
-        let non_weekly_remaining = window_field.split(':').nth(1)?;
-        let non_weekly_remaining = non_weekly_remaining
+    let weekly_index = parts.iter().position(|part| part.starts_with("W:"));
+    let weekly_remaining = weekly_index.and_then(|index| {
+        parts[index]
+            .trim_start_matches("W:")
             .trim_end_matches('%')
             .parse::<i64>()
-            .ok()?;
-
-        let weekly_remaining = weekly_field.trim_start_matches("W:").trim_end_matches('%');
-        let weekly_remaining = weekly_remaining.parse::<i64>().ok()?;
-
-        Some(ParsedOneLine {
-            window_label,
-            non_weekly_remaining,
-            weekly_remaining,
-            weekly_reset_iso: reset_iso,
-        })
-    }
-
-    let len = parts.len();
-    let window_field = parts[len - 3];
-    let weekly_field = parts[len - 2];
-    let reset_iso = parts[len - 1].to_string();
-
-    if let Some(parsed) = parse_fields(window_field, weekly_field, reset_iso) {
-        return Some(parsed);
-    }
-
-    if len < 4 {
+            .ok()
+    });
+    let non_weekly = parts.iter().enumerate().find_map(|(index, part)| {
+        if Some(index) == weekly_index || !part.ends_with('%') || !part.contains(':') {
+            return None;
+        }
+        let (label, remaining) = part.split_once(':')?;
+        let remaining = remaining.trim_end_matches('%').parse::<i64>().ok()?;
+        Some((label.trim_matches('"').to_string(), remaining))
+    });
+    let weekly_reset_iso = weekly_index
+        .map(|index| parts[index + 1..].join(" "))
+        .unwrap_or_default();
+    if weekly_remaining.is_none() && non_weekly.is_none() {
         return None;
     }
-
-    parse_fields(
-        parts[len - 4],
-        parts[len - 3],
-        format!("{} {}", parts[len - 2], parts[len - 1]),
-    )
+    Some(ParsedOneLine {
+        window_label: non_weekly.as_ref().map(|(label, _)| label.clone()),
+        non_weekly_remaining: non_weekly.map(|(_, remaining)| remaining),
+        weekly_remaining,
+        weekly_reset_iso,
+    })
 }
 
 #[cfg(test)]
@@ -2462,7 +2531,7 @@ mod tests {
         async_fetch_one_line, cache, collect_json_from_cache, collect_secret_files,
         collect_secret_files_for_async_text, current_secret_basename, env_timeout,
         fetch_one_line_cached, is_auth_file, normalize_one_line, parse_one_line_output,
-        redact_sensitive_json, resolve_target, secret_display_name, single_one_line,
+        project_safe_usage_json, render, resolve_target, secret_display_name, single_one_line,
         sync_auth_silent, target_file_name,
     };
     use chrono::Utc;
@@ -2499,9 +2568,40 @@ mod tests {
         Utc::now().timestamp()
     }
 
+    fn complete_weekly_values(
+        non_weekly_label: &str,
+        non_weekly_remaining: i64,
+        weekly_remaining: i64,
+        weekly_reset_epoch: i64,
+        non_weekly_reset_epoch: Option<i64>,
+    ) -> render::WeeklyValues {
+        render::WeeklyValues {
+            weekly: Some(render::WindowValues {
+                label: "Weekly".to_string(),
+                remaining: weekly_remaining,
+                reset_epoch: weekly_reset_epoch,
+            }),
+            non_weekly: Some(render::WindowValues {
+                label: non_weekly_label.to_string(),
+                remaining: non_weekly_remaining,
+                reset_epoch: non_weekly_reset_epoch.unwrap_or_default(),
+            }),
+        }
+    }
+
     #[test]
-    fn redact_sensitive_json_removes_tokens_recursively() {
+    fn project_safe_usage_json_keeps_only_known_usage_fields() {
         let input = json!({
+            "plan_type": "pro",
+            "rate_limit": {
+                "allowed": true,
+                "primary_window": {
+                    "limit_window_seconds": 604800,
+                    "used_percent": 12,
+                    "reset_at": 1700600000,
+                    "email": "private@example.com"
+                }
+            },
             "tokens": {
                 "access_token": "a",
                 "refresh_token": "b",
@@ -2517,24 +2617,20 @@ mod tests {
             "safe": true
         });
 
-        let redacted = redact_sensitive_json(&input);
-        assert_eq!(redacted["tokens"]["nested"]["ok"], 1);
-        assert_eq!(redacted["safe"], true);
-        assert!(
-            redacted["tokens"].get("access_token").is_none(),
-            "access_token should be removed"
+        let projected = project_safe_usage_json(&input);
+        assert_eq!(projected["plan_type"], "pro");
+        assert_eq!(projected["rate_limit"]["allowed"], true);
+        assert_eq!(
+            projected["rate_limit"]["primary_window"]["limit_window_seconds"],
+            604800
         );
+        assert!(projected.get("tokens").is_none());
+        assert!(projected.get("items").is_none());
+        assert!(projected.get("safe").is_none());
         assert!(
-            redacted["tokens"]["nested"].get("id_token").is_none(),
-            "id_token should be removed"
-        );
-        assert!(
-            redacted["tokens"]["nested"].get("Authorization").is_none(),
-            "Authorization should be removed"
-        );
-        assert!(
-            redacted["items"][0].get("authorization").is_none(),
-            "authorization should be removed"
+            projected["rate_limit"]["primary_window"]
+                .get("email")
+                .is_none()
         );
     }
 
@@ -2672,24 +2768,17 @@ mod tests {
             secret_dir.to_str().expect("secret"),
         );
         let _cache = EnvGuard::set(&lock, "ZSH_CACHE_DIR", cache_root.to_str().expect("cache"));
-        cache::write_prompt_segment_cache(
-            &alpha,
-            fresh_fetched_at(),
-            "3h",
-            92,
-            88,
-            1_700_003_600,
-            Some(1_700_001_200),
-        )
-        .expect("write cache");
+        let values = complete_weekly_values("3h", 92, 88, 1_700_003_600, Some(1_700_001_200));
+        cache::write_prompt_segment_cache(&alpha, fresh_fetched_at(), &values)
+            .expect("write cache");
 
         let hit = collect_json_from_cache(&alpha, "cache", true);
         assert!(hit.ok);
         assert_eq!(hit.status, "ok");
         let summary = hit.summary.expect("summary");
-        assert_eq!(summary.non_weekly_label, "3h");
-        assert_eq!(summary.non_weekly_remaining, 92);
-        assert_eq!(summary.weekly_remaining, 88);
+        assert_eq!(summary.non_weekly_label.as_deref(), Some("3h"));
+        assert_eq!(summary.non_weekly_remaining, Some(92));
+        assert_eq!(summary.weekly_remaining, Some(88));
 
         let missing_target = secret_dir.join("missing.json");
         let miss = collect_json_from_cache(&missing_target, "cache", true);
@@ -2717,16 +2806,9 @@ mod tests {
             secret_dir.to_str().expect("secret"),
         );
         let _cache = EnvGuard::set(&lock, "ZSH_CACHE_DIR", cache_root.to_str().expect("cache"));
-        cache::write_prompt_segment_cache(
-            &alpha,
-            fresh_fetched_at(),
-            "3h",
-            70,
-            55,
-            1_700_003_600,
-            Some(1_700_001_200),
-        )
-        .expect("write cache");
+        let values = complete_weekly_values("3h", 70, 55, 1_700_003_600, Some(1_700_001_200));
+        cache::write_prompt_segment_cache(&alpha, fresh_fetched_at(), &values)
+            .expect("write cache");
 
         let cached = fetch_one_line_cached(&alpha);
         assert_eq!(cached.rc, 0);
@@ -2755,16 +2837,9 @@ mod tests {
             secret_dir.to_str().expect("secret"),
         );
         let _cache = EnvGuard::set(&lock, "ZSH_CACHE_DIR", cache_root.to_str().expect("cache"));
-        cache::write_prompt_segment_cache(
-            &missing,
-            fresh_fetched_at(),
-            "3h",
-            68,
-            42,
-            1_700_003_600,
-            Some(1_700_001_200),
-        )
-        .expect("write cache");
+        let values = complete_weekly_values("3h", 68, 42, 1_700_003_600, Some(1_700_001_200));
+        cache::write_prompt_segment_cache(&missing, fresh_fetched_at(), &values)
+            .expect("write cache");
 
         let result = async_fetch_one_line(&missing, false, true, "ghost");
         assert_eq!(result.rc, 0);
@@ -2793,26 +2868,19 @@ mod tests {
             secret_dir.to_str().expect("secret"),
         );
         let _cache = EnvGuard::set(&lock, "ZSH_CACHE_DIR", cache_root.to_str().expect("cache"));
-        cache::write_prompt_segment_cache(
-            &alpha,
-            fresh_fetched_at(),
-            "3h",
-            61,
-            39,
-            1_700_003_600,
-            Some(1_700_001_200),
-        )
-        .expect("write cache");
+        let values = complete_weekly_values("3h", 61, 39, 1_700_003_600, Some(1_700_001_200));
+        cache::write_prompt_segment_cache(&alpha, fresh_fetched_at(), &values)
+            .expect("write cache");
 
         let hit = single_one_line(&alpha, true, true, false).expect("single");
-        assert!(hit.expect("line").contains("3h:61%"));
+        assert!(hit.line.expect("line").contains("3h:61%"));
 
         let miss = single_one_line(&beta, true, true, true).expect("single");
-        assert!(miss.is_none());
+        assert!(miss.line.is_none());
 
         let missing =
             single_one_line(&secret_dir.join("missing.json"), true, true, true).expect("single");
-        assert!(missing.is_none());
+        assert!(missing.line.is_none());
     }
 
     #[test]
@@ -2891,9 +2959,9 @@ mod tests {
     fn rate_limits_helper_parsers_and_name_helpers_cover_fallbacks() {
         let parsed =
             parse_one_line_output("alpha 3h:90% W:80% 2025-01-20 12:00:00+00:00").expect("parsed");
-        assert_eq!(parsed.window_label, "3h");
-        assert_eq!(parsed.non_weekly_remaining, 90);
-        assert_eq!(parsed.weekly_remaining, 80);
+        assert_eq!(parsed.window_label.as_deref(), Some("3h"));
+        assert_eq!(parsed.non_weekly_remaining, Some(90));
+        assert_eq!(parsed.weekly_remaining, Some(80));
         assert_eq!(parsed.weekly_reset_iso, "2025-01-20 12:00:00+00:00");
         assert!(parse_one_line_output("bad").is_none());
 

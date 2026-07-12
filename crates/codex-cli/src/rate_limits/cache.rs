@@ -5,16 +5,17 @@ use std::path::{Path, PathBuf};
 
 use crate::auth;
 use crate::paths;
+use crate::rate_limits::render;
 use nils_common::env as shared_env;
 
 #[derive(Debug)]
 pub struct CacheEntry {
     pub fetched_at_epoch: Option<i64>,
-    pub non_weekly_label: String,
-    pub non_weekly_remaining: i64,
+    pub non_weekly_label: Option<String>,
+    pub non_weekly_remaining: Option<i64>,
     pub non_weekly_reset_epoch: Option<i64>,
-    pub weekly_remaining: i64,
-    pub weekly_reset_epoch: i64,
+    pub weekly_remaining: Option<i64>,
+    pub weekly_reset_epoch: Option<i64>,
 }
 
 const DEFAULT_CACHE_TTL_SECONDS: u64 = 180;
@@ -114,34 +115,16 @@ pub fn read_cache_entry(target_file: &Path) -> Result<CacheEntry> {
         }
     }
 
-    let non_weekly_label = match non_weekly_label {
-        Some(value) if !value.is_empty() => value,
-        _ => anyhow::bail!(
-            "codex-rate-limits: invalid cache (missing non-weekly data): {}",
+    if non_weekly_label.as_deref().is_some_and(str::is_empty)
+        || non_weekly_label.is_some() != non_weekly_remaining.is_some()
+        || weekly_remaining.is_some() != weekly_reset_epoch.is_some()
+        || (non_weekly_remaining.is_none() && weekly_remaining.is_none())
+    {
+        anyhow::bail!(
+            "codex-rate-limits: invalid cache (incomplete window data): {}",
             cache_file.display()
-        ),
-    };
-    let non_weekly_remaining = match non_weekly_remaining {
-        Some(value) => value,
-        _ => anyhow::bail!(
-            "codex-rate-limits: invalid cache (missing non-weekly data): {}",
-            cache_file.display()
-        ),
-    };
-    let weekly_remaining = match weekly_remaining {
-        Some(value) => value,
-        _ => anyhow::bail!(
-            "codex-rate-limits: invalid cache (missing weekly data): {}",
-            cache_file.display()
-        ),
-    };
-    let weekly_reset_epoch = match weekly_reset_epoch {
-        Some(value) => value,
-        _ => anyhow::bail!(
-            "codex-rate-limits: invalid cache (missing weekly data): {}",
-            cache_file.display()
-        ),
-    };
+        );
+    }
 
     Ok(CacheEntry {
         fetched_at_epoch,
@@ -197,12 +180,11 @@ fn cache_entry_is_stale(entry: &CacheEntry) -> bool {
 pub fn write_prompt_segment_cache(
     target_file: &Path,
     fetched_at_epoch: i64,
-    non_weekly_label: &str,
-    non_weekly_remaining: i64,
-    weekly_remaining: i64,
-    weekly_reset_epoch: i64,
-    non_weekly_reset_epoch: Option<i64>,
+    values: &render::WeeklyValues,
 ) -> Result<()> {
+    if values.weekly.is_none() && values.non_weekly.is_none() {
+        anyhow::bail!("codex-rate-limits: refusing to write empty window cache");
+    }
     let cache_file = cache_file_for_target(target_file)?;
     if let Some(parent) = cache_file.parent() {
         fs::create_dir_all(parent)?;
@@ -210,13 +192,17 @@ pub fn write_prompt_segment_cache(
 
     let mut lines = Vec::new();
     lines.push(format!("fetched_at={fetched_at_epoch}"));
-    lines.push(format!("non_weekly_label={non_weekly_label}"));
-    lines.push(format!("non_weekly_remaining={non_weekly_remaining}"));
-    if let Some(epoch) = non_weekly_reset_epoch {
-        lines.push(format!("non_weekly_reset_epoch={epoch}"));
+    if let Some(non_weekly) = &values.non_weekly {
+        lines.push(format!("non_weekly_label={}", non_weekly.label));
+        lines.push(format!("non_weekly_remaining={}", non_weekly.remaining));
+        if non_weekly.reset_epoch > 0 {
+            lines.push(format!("non_weekly_reset_epoch={}", non_weekly.reset_epoch));
+        }
     }
-    lines.push(format!("weekly_remaining={weekly_remaining}"));
-    lines.push(format!("weekly_reset_epoch={weekly_reset_epoch}"));
+    if let Some(weekly) = &values.weekly {
+        lines.push(format!("weekly_remaining={}", weekly.remaining));
+        lines.push(format!("weekly_reset_epoch={}", weekly.reset_epoch));
+    }
 
     let data = lines.join("\n");
     shared_fs::write_atomic(&cache_file, data.as_bytes(), shared_fs::SECRET_FILE_MODE)?;
@@ -350,6 +336,7 @@ mod tests {
         cache_file_for_target, clear_prompt_segment_cache, read_cache_entry,
         read_cache_entry_for_cached_mode, secret_name_for_target, write_prompt_segment_cache,
     };
+    use crate::rate_limits::render;
     use chrono::Utc;
     use nils_common::fs as shared_fs;
     use nils_test_support::{EnvGuard, GlobalStateLock};
@@ -395,6 +382,27 @@ mod tests {
             cache_root.to_str().expect("cache root path"),
         );
         (secret, cache)
+    }
+
+    fn complete_weekly_values(
+        non_weekly_label: &str,
+        non_weekly_remaining: i64,
+        weekly_remaining: i64,
+        weekly_reset_epoch: i64,
+        non_weekly_reset_epoch: Option<i64>,
+    ) -> render::WeeklyValues {
+        render::WeeklyValues {
+            weekly: Some(render::WindowValues {
+                label: "Weekly".to_string(),
+                remaining: weekly_remaining,
+                reset_epoch: weekly_reset_epoch,
+            }),
+            non_weekly: Some(render::WindowValues {
+                label: non_weekly_label.to_string(),
+                remaining: non_weekly_remaining,
+                reset_epoch: non_weekly_reset_epoch.unwrap_or_default(),
+            }),
+        }
     }
 
     #[test]
@@ -544,23 +552,43 @@ mod tests {
         let target = secret_dir.join("alpha.json");
         fs::write(&target, "{}").expect("write target");
 
-        write_prompt_segment_cache(
-            &target,
-            1700000000,
-            "5h",
-            91,
-            12,
-            1700600000,
-            Some(1700003600),
-        )
-        .expect("write cache");
+        let values = complete_weekly_values("5h", 91, 12, 1700600000, Some(1700003600));
+        write_prompt_segment_cache(&target, 1700000000, &values).expect("write cache");
 
         let entry = read_cache_entry(&target).expect("read cache");
-        assert_eq!(entry.non_weekly_label, "5h");
-        assert_eq!(entry.non_weekly_remaining, 91);
+        assert_eq!(entry.non_weekly_label.as_deref(), Some("5h"));
+        assert_eq!(entry.non_weekly_remaining, Some(91));
         assert_eq!(entry.non_weekly_reset_epoch, Some(1700003600));
-        assert_eq!(entry.weekly_remaining, 12);
-        assert_eq!(entry.weekly_reset_epoch, 1700600000);
+        assert_eq!(entry.weekly_remaining, Some(12));
+        assert_eq!(entry.weekly_reset_epoch, Some(1700600000));
+    }
+
+    #[test]
+    fn write_cache_rejects_empty_windows_without_replacing_existing_data() {
+        let lock = GlobalStateLock::new();
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let secret_dir = dir.path().join("secrets");
+        let cache_root = dir.path().join("cache");
+        fs::create_dir_all(&secret_dir).expect("secret dir");
+        fs::create_dir_all(&cache_root).expect("cache root");
+        let _env = set_cache_env(&lock, &secret_dir, &cache_root);
+
+        let target = secret_dir.join("alpha.json");
+        fs::write(&target, "{}").expect("write target");
+        let values = complete_weekly_values("5h", 91, 12, 1_700_600_000, None);
+        write_prompt_segment_cache(&target, 1, &values).expect("seed cache");
+        let cache_file = cache_file_for_target(&target).expect("cache path");
+        let before = fs::read_to_string(&cache_file).expect("read cache");
+
+        let empty = render::WeeklyValues {
+            weekly: None,
+            non_weekly: None,
+        };
+        let err = write_prompt_segment_cache(&target, 2, &empty)
+            .expect_err("empty windows must not replace cache");
+
+        assert!(err.to_string().contains("refusing to write empty"));
+        assert_eq!(fs::read_to_string(cache_file).expect("read cache"), before);
     }
 
     #[test]
@@ -576,20 +604,20 @@ mod tests {
         let target = secret_dir.join("alpha.json");
         fs::write(&target, "{}").expect("write target");
 
-        write_prompt_segment_cache(&target, 1700000000, "daily", 45, 9, 1700600000, None)
-            .expect("write cache");
+        let values = complete_weekly_values("daily", 45, 9, 1700600000, None);
+        write_prompt_segment_cache(&target, 1700000000, &values).expect("write cache");
 
         let cache_file = cache_file_for_target(&target).expect("cache path");
         let content = fs::read_to_string(&cache_file).expect("read cache file");
         assert!(!content.contains("non_weekly_reset_epoch="));
 
         let entry = read_cache_entry(&target).expect("read cache");
-        assert_eq!(entry.non_weekly_label, "daily");
+        assert_eq!(entry.non_weekly_label.as_deref(), Some("daily"));
         assert_eq!(entry.non_weekly_reset_epoch, None);
     }
 
     #[test]
-    fn read_cache_entry_reports_missing_weekly_data() {
+    fn read_cache_entry_reports_incomplete_weekly_data() {
         let lock = GlobalStateLock::new();
         let dir = tempfile::TempDir::new().expect("tempdir");
         let secret_dir = dir.path().join("secrets");
@@ -609,11 +637,11 @@ mod tests {
         .expect("write invalid cache");
 
         let err = read_cache_entry(&target).expect_err("missing weekly reset should fail");
-        assert!(err.to_string().contains("missing weekly data"));
+        assert!(err.to_string().contains("incomplete window data"));
     }
 
     #[test]
-    fn read_cache_entry_reports_missing_non_weekly_data() {
+    fn read_cache_entry_accepts_missing_non_weekly_data() {
         let lock = GlobalStateLock::new();
         let dir = tempfile::TempDir::new().expect("tempdir");
         let secret_dir = dir.path().join("secrets");
@@ -632,8 +660,9 @@ mod tests {
         )
         .expect("write invalid cache");
 
-        let err = read_cache_entry(&target).expect_err("missing non-weekly fields should fail");
-        assert!(err.to_string().contains("missing non-weekly data"));
+        let entry = read_cache_entry(&target).expect("weekly-only cache should load");
+        assert_eq!(entry.non_weekly_label, None);
+        assert_eq!(entry.weekly_remaining, Some(1));
     }
 
     #[test]
@@ -648,8 +677,8 @@ mod tests {
 
         let target = secret_dir.join("alpha.json");
         fs::write(&target, "{}").expect("write target");
-        write_prompt_segment_cache(&target, 1, "5h", 91, 12, 1_700_600_000, Some(1_700_003_600))
-            .expect("write cache");
+        let values = complete_weekly_values("5h", 91, 12, 1_700_600_000, Some(1_700_003_600));
+        write_prompt_segment_cache(&target, 1, &values).expect("write cache");
 
         let err = read_cache_entry_for_cached_mode(&target).expect_err("stale cache should fail");
         assert!(err.to_string().contains("cache expired"));
@@ -670,19 +699,11 @@ mod tests {
         fs::write(&target, "{}").expect("write target");
         let now = Utc::now().timestamp();
         let fetched_at = now.saturating_sub(30 * 60);
-        write_prompt_segment_cache(
-            &target,
-            fetched_at,
-            "5h",
-            91,
-            12,
-            1_700_600_000,
-            Some(1_700_003_600),
-        )
-        .expect("write cache");
+        let values = complete_weekly_values("5h", 91, 12, 1_700_600_000, Some(1_700_003_600));
+        write_prompt_segment_cache(&target, fetched_at, &values).expect("write cache");
 
         let entry = read_cache_entry_for_cached_mode(&target).expect("fresh cache");
-        assert_eq!(entry.non_weekly_label, "5h");
+        assert_eq!(entry.non_weekly_label.as_deref(), Some("5h"));
     }
 
     #[test]
@@ -698,10 +719,10 @@ mod tests {
 
         let target = secret_dir.join("alpha.json");
         fs::write(&target, "{}").expect("write target");
-        write_prompt_segment_cache(&target, 1, "5h", 91, 12, 1_700_600_000, Some(1_700_003_600))
-            .expect("write cache");
+        let values = complete_weekly_values("5h", 91, 12, 1_700_600_000, Some(1_700_003_600));
+        write_prompt_segment_cache(&target, 1, &values).expect("write cache");
 
         let entry = read_cache_entry_for_cached_mode(&target).expect("allow stale");
-        assert_eq!(entry.non_weekly_remaining, 91);
+        assert_eq!(entry.non_weekly_remaining, Some(91));
     }
 }

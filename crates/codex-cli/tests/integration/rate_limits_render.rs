@@ -17,15 +17,20 @@ fn rate_limits_render_parses_usage_and_formats_windows() {
 
     let parsed = render::parse_usage(&usage).expect("parse usage");
     let values = render::render_values(&parsed);
-    assert_eq!(values.primary_label, "5h");
-    assert_eq!(values.secondary_label, "Weekly");
-    assert_eq!(values.primary_remaining, 94);
-    assert_eq!(values.secondary_remaining, 88);
+    let primary = values.primary.as_ref().expect("primary");
+    let secondary = values.secondary.as_ref().expect("secondary");
+    assert_eq!(primary.label, "5h");
+    assert_eq!(secondary.label, "Weekly");
+    assert_eq!(primary.remaining, 94);
+    assert_eq!(secondary.remaining, 88);
 
     let weekly = render::weekly_values(&values);
-    assert_eq!(weekly.weekly_remaining, 88);
-    assert_eq!(weekly.non_weekly_label, "5h");
-    assert_eq!(weekly.non_weekly_remaining, 94);
+    assert_eq!(weekly.weekly.as_ref().expect("weekly").remaining, 88);
+    assert_eq!(weekly.non_weekly.as_ref().expect("non-weekly").label, "5h");
+    assert_eq!(
+        weekly.non_weekly.as_ref().expect("non-weekly").remaining,
+        94
+    );
 
     assert_eq!(
         render::format_window_seconds(604800).as_deref(),
@@ -84,4 +89,31 @@ fn rate_limits_render_formats_time_with_local_timezone_offset() {
 fn rate_limits_render_parse_usage_rejects_missing_fields() {
     let missing = json!({});
     assert!(render::parse_usage(&missing).is_none());
+}
+
+#[test]
+fn rate_limits_render_parse_usage_accepts_either_window_independently() {
+    let weekly_only = json!({
+        "rate_limit": {
+            "primary_window": {
+                "limit_window_seconds": 604800,
+                "used_percent": 21.0,
+                "reset_at": 1700600000
+            },
+            "secondary_window": null
+        }
+    });
+    let non_weekly_only = json!({
+        "rate_limit": {
+            "primary_window": null,
+            "secondary_window": {
+                "limit_window_seconds": 18000,
+                "used_percent": 6.0,
+                "reset_at": 1700003600
+            }
+        }
+    });
+
+    assert!(render::parse_usage(&weekly_only).is_some());
+    assert!(render::parse_usage(&non_weekly_only).is_some());
 }

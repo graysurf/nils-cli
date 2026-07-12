@@ -349,5 +349,5 @@ fn rate_limits_single_json_null_payload_is_benign() {
     assert_eq!(payload["mode"], "single");
     assert_eq!(payload["ok"], true);
     assert_eq!(payload["result"]["ok"], true);
-    assert_eq!(payload["result"]["status"], "no-rate-limit-window");
+    assert_eq!(payload["result"]["status"], "ok");
 }

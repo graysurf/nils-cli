@@ -161,6 +161,16 @@ fn wham_usage_ok_body() -> String {
     .to_string()
 }
 
+fn wham_usage_weekly_only_body() -> String {
+    r#"{
+  "rate_limit": {
+    "primary_window": { "limit_window_seconds": 604800, "used_percent": 21, "reset_at": 1700600000 },
+    "secondary_window": null
+  }
+}"#
+    .to_string()
+}
+
 #[test]
 fn prompt_segment_refresh_updates_cache_and_prints() {
     let dir = tempfile::TempDir::new().expect("tempdir");
@@ -199,6 +209,50 @@ fn prompt_segment_refresh_updates_cache_and_prints() {
     let kv = fs::read_to_string(&kv_path).expect("read cache kv");
     assert!(kv.contains("weekly_remaining=88"));
     assert!(kv.contains("non_weekly_remaining=94"));
+}
+
+#[test]
+fn prompt_segment_refresh_weekly_only_removes_stale_non_weekly_cache() {
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let (auth_file, secrets, cache_root) = write_auth_and_secret(&dir);
+    write_prompt_segment_cache_kv(
+        &cache_root,
+        "alpha",
+        "fetched_at=1\nnon_weekly_label=5h\nnon_weekly_remaining=1\nweekly_remaining=2\nweekly_reset_epoch=1700600000\n",
+    );
+
+    let server = LoopbackServer::new().expect("server");
+    server.add_route(
+        "GET",
+        "/wham/usage",
+        HttpResponse::new(200, wham_usage_weekly_only_body()),
+    );
+
+    let output = run(
+        &[
+            "prompt-segment",
+            "--refresh",
+            "--time-format",
+            "%Y-%m-%dT%H:%MZ",
+        ],
+        &[
+            ("CODEX_AUTH_FILE", &auth_file),
+            ("CODEX_SECRET_DIR", &secrets),
+            ("ZSH_CACHE_DIR", &cache_root),
+        ],
+        &[
+            ("CODEX_PROMPT_SEGMENT_ENABLED", "true"),
+            ("CODEX_CHATGPT_BASE_URL", &server.url()),
+            ("CODEX_PROMPT_SEGMENT_CURL_CONNECT_TIMEOUT_SECONDS", "1"),
+            ("CODEX_PROMPT_SEGMENT_CURL_MAX_TIME_SECONDS", "3"),
+        ],
+    );
+
+    assert_exit(&output, 0);
+    assert_eq!(stdout(&output), "alpha W:79% 2023-11-21T20:53Z\n");
+    let cache = fs::read_to_string(cache_file(&cache_root, "alpha")).expect("cache kv");
+    assert!(cache.contains("weekly_remaining=79"));
+    assert!(!cache.contains("non_weekly_"));
 }
 
 #[test]

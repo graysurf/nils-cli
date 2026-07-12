@@ -7,11 +7,11 @@ use crate::rate_limits::ansi;
 #[derive(Clone, Debug)]
 pub struct CacheEntry {
     pub fetched_at_epoch: i64,
-    pub non_weekly_label: String,
-    pub non_weekly_remaining: i64,
+    pub non_weekly_label: Option<String>,
+    pub non_weekly_remaining: Option<i64>,
     pub non_weekly_reset_epoch: Option<i64>,
-    pub weekly_remaining: i64,
-    pub weekly_reset_epoch: i64,
+    pub weekly_remaining: Option<i64>,
+    pub weekly_reset_epoch: Option<i64>,
 }
 
 pub fn read_cache_file(path: &Path) -> Option<CacheEntry> {
@@ -44,13 +44,15 @@ fn parse_cache_kv(content: &str) -> Option<CacheEntry> {
     }
 
     let fetched_at_epoch = fetched_at_epoch?;
-    let non_weekly_label = non_weekly_label?;
-    if non_weekly_label.trim().is_empty() {
+    if non_weekly_label
+        .as_deref()
+        .is_some_and(|label| label.trim().is_empty())
+        || non_weekly_label.is_some() != non_weekly_remaining.is_some()
+        || weekly_remaining.is_some() != weekly_reset_epoch.is_some()
+        || (non_weekly_remaining.is_none() && weekly_remaining.is_none())
+    {
         return None;
     }
-    let non_weekly_remaining = non_weekly_remaining?;
-    let weekly_remaining = weekly_remaining?;
-    let weekly_reset_epoch = weekly_reset_epoch?;
 
     Some(CacheEntry {
         fetched_at_epoch,
@@ -68,26 +70,30 @@ pub fn render_line(
     show_5h: bool,
     weekly_reset_time_format: &str,
 ) -> Option<String> {
-    let weekly_reset_time = format_epoch_local(entry.weekly_reset_epoch, weekly_reset_time_format)
-        .unwrap_or_else(|| "?".to_string());
-
     let color_enabled = should_color();
-    let weekly_token = ansi::format_percent_token(
-        &format!("W:{}%", entry.weekly_remaining),
-        Some(color_enabled),
-    );
-
-    if show_5h {
-        let non_weekly_token = ansi::format_percent_token(
-            &format!("{}:{}%", entry.non_weekly_label, entry.non_weekly_remaining),
-            Some(color_enabled),
-        );
-        return Some(format!(
-            "{prefix}{non_weekly_token} {weekly_token} {weekly_reset_time}"
-        ));
+    let mut tokens = Vec::new();
+    if show_5h
+        && let (Some(label), Some(remaining)) = (
+            entry.non_weekly_label.as_deref(),
+            entry.non_weekly_remaining,
+        )
+    {
+        let non_weekly_token =
+            ansi::format_percent_token(&format!("{label}:{remaining}%"), Some(color_enabled));
+        tokens.push(non_weekly_token);
     }
-
-    Some(format!("{prefix}{weekly_token} {weekly_reset_time}"))
+    if let (Some(remaining), Some(reset_epoch)) = (entry.weekly_remaining, entry.weekly_reset_epoch)
+    {
+        tokens.push(ansi::format_percent_token(
+            &format!("W:{remaining}%"),
+            Some(color_enabled),
+        ));
+        tokens.push(
+            format_epoch_local(reset_epoch, weekly_reset_time_format)
+                .unwrap_or_else(|| "?".to_string()),
+        );
+    }
+    (!tokens.is_empty()).then(|| format!("{prefix}{}", tokens.join(" ")))
 }
 
 fn format_epoch_local(epoch: i64, fmt: &str) -> Option<String> {

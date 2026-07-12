@@ -17,25 +17,28 @@ pub fn write_weekly(target_file: &Path, usage_json: &Value) -> Result<()> {
         None => return Ok(()),
     };
     let values = render::render_values(&usage);
-
-    let (weekly_reset_epoch, non_weekly_reset_epoch) = if values.primary_label == "Weekly" {
-        (
-            values.primary_reset_epoch,
-            Some(values.secondary_reset_epoch),
-        )
-    } else {
-        (
-            values.secondary_reset_epoch,
-            Some(values.primary_reset_epoch),
-        )
-    };
-
-    if weekly_reset_epoch <= 0 {
+    let weekly = render::weekly_values(&values);
+    if weekly.weekly.is_none() && weekly.non_weekly.is_none() {
         return Ok(());
     }
-
-    let weekly_reset_iso = epoch_to_iso(weekly_reset_epoch)?;
-    let non_weekly_reset_epoch = non_weekly_reset_epoch.filter(|epoch| *epoch > 0);
+    if weekly
+        .weekly
+        .as_ref()
+        .is_some_and(|window| window.reset_epoch <= 0)
+    {
+        return Ok(());
+    }
+    let weekly_reset_epoch = weekly
+        .weekly
+        .as_ref()
+        .map(|window| window.reset_epoch)
+        .filter(|epoch| *epoch > 0);
+    let non_weekly_reset_epoch = weekly
+        .non_weekly
+        .as_ref()
+        .map(|window| window.reset_epoch)
+        .filter(|epoch| *epoch > 0);
+    let weekly_reset_iso = weekly_reset_epoch.and_then(|epoch| epoch_to_iso(epoch).ok());
     let non_weekly_reset_iso = non_weekly_reset_epoch.and_then(|epoch| epoch_to_iso(epoch).ok());
 
     let fetched_at_iso = Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
@@ -51,18 +54,24 @@ pub fn write_weekly(target_file: &Path, usage_json: &Value) -> Result<()> {
         .cloned()
         .unwrap_or_else(Map::new);
 
-    codex_rate_limits.insert(
-        "weekly_reset_at".to_string(),
-        Value::String(weekly_reset_iso.clone()),
-    );
-    codex_rate_limits.insert(
-        "weekly_reset_at_epoch".to_string(),
-        Value::Number(weekly_reset_epoch.into()),
-    );
-    codex_rate_limits.insert(
-        "weekly_fetched_at".to_string(),
-        Value::String(fetched_at_iso),
-    );
+    match (weekly_reset_epoch, weekly_reset_iso) {
+        (Some(epoch), Some(iso)) => {
+            codex_rate_limits.insert("weekly_reset_at".to_string(), Value::String(iso));
+            codex_rate_limits.insert(
+                "weekly_reset_at_epoch".to_string(),
+                Value::Number(epoch.into()),
+            );
+            codex_rate_limits.insert(
+                "weekly_fetched_at".to_string(),
+                Value::String(fetched_at_iso),
+            );
+        }
+        _ => {
+            codex_rate_limits.remove("weekly_reset_at");
+            codex_rate_limits.remove("weekly_reset_at_epoch");
+            codex_rate_limits.remove("weekly_fetched_at");
+        }
+    }
 
     match (non_weekly_reset_epoch, non_weekly_reset_iso) {
         (Some(epoch), Some(iso)) => {

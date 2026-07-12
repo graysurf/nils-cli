@@ -94,27 +94,29 @@ fn fetch_and_write_cache(target_file: &Path) -> anyhow::Result<prompt_segment_re
         render::parse_usage(&usage.json).ok_or_else(|| anyhow::anyhow!("invalid usage payload"))?;
     let values = render::render_values(&usage_data);
     let weekly = render::weekly_values(&values);
+    if weekly.weekly.is_none() && weekly.non_weekly.is_none() {
+        anyhow::bail!("no active rate-limit window");
+    }
 
     let fetched_at_epoch = Utc::now().timestamp();
     if fetched_at_epoch > 0 {
-        let _ = cache::write_prompt_segment_cache(
-            target_file,
-            fetched_at_epoch,
-            &weekly.non_weekly_label,
-            weekly.non_weekly_remaining,
-            weekly.weekly_remaining,
-            weekly.weekly_reset_epoch,
-            weekly.non_weekly_reset_epoch,
-        );
+        let _ = cache::write_prompt_segment_cache(target_file, fetched_at_epoch, &weekly);
     }
 
     Ok(prompt_segment_render::CacheEntry {
         fetched_at_epoch,
-        non_weekly_label: weekly.non_weekly_label,
-        non_weekly_remaining: weekly.non_weekly_remaining,
-        non_weekly_reset_epoch: weekly.non_weekly_reset_epoch,
-        weekly_remaining: weekly.weekly_remaining,
-        weekly_reset_epoch: weekly.weekly_reset_epoch,
+        non_weekly_label: weekly
+            .non_weekly
+            .as_ref()
+            .map(|window| window.label.clone()),
+        non_weekly_remaining: weekly.non_weekly.as_ref().map(|window| window.remaining),
+        non_weekly_reset_epoch: weekly
+            .non_weekly
+            .as_ref()
+            .map(|window| window.reset_epoch)
+            .filter(|epoch| *epoch > 0),
+        weekly_remaining: weekly.weekly.as_ref().map(|window| window.remaining),
+        weekly_reset_epoch: weekly.weekly.as_ref().map(|window| window.reset_epoch),
     })
 }
 

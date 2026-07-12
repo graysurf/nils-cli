@@ -69,6 +69,10 @@ Sensitive data rule:
 - Never emit local secrets/tokens (`access_token`, `refresh_token`, raw auth headers, private keys)
   in either success or failure payloads. Status payloads may expose boolean presence
   flags such as `has_oauth_access_token`; they must not expose the token value.
+- `diag rate-limits` emits only an allowlisted usage projection in informational
+  `raw_usage`: a known plan type, safe rate-limit booleans, and numeric window
+  fields. Arbitrary upstream identity, credential, and additive fields are not
+  forwarded.
 
 ## Stable vs Informational Fields
 
@@ -77,7 +81,7 @@ Stable (safe for strict parsing):
 - Top-level: `schema_version`, `command`, `ok`, `result|results|error`
 - Error envelope: `error.code`, `error.message`, optional `error.details`
 - Diag:
-  - `result.mode` (`single`) for single mode
+  - top-level `mode` (`single`) for single mode
   - top-level `mode` (`all` or `async`) for collection mode
   - `result.target_file`, `results[*].target_file`
   - `results[*].name`
@@ -111,9 +115,16 @@ Stable (safe for strict parsing):
 `prompt_segment_authenticated` is true only when an OAuth access token is present, because
 the prompt segment reads the ChatGPT usage endpoint directly.
 
+`windows` is the authoritative usage-window collection. Each well-formed upstream
+window is emitted independently, so the collection may contain zero, one, or two
+items. When at least one window exists, the compatibility `summary` object is present;
+fields for an absent sibling window are `null` (reset fields may be omitted). When
+`windows` is empty, `summary` is omitted. Consumers must not infer a 5-hour window when
+only the weekly window is present.
+
 Informational (do not hard-depend for schema validation):
 
-- `raw_usage` (upstream payload passthrough; shape may evolve)
+- `raw_usage` (allowlisted upstream usage projection; shape may evolve)
 - Optional additive metadata (`source`, timestamps, debugging hints)
 - Human-display-oriented strings inside `error.details`
 
@@ -143,9 +154,9 @@ the error message.
 {
   "schema_version": "codex-cli.diag.rate-limits.v1",
   "command": "diag rate-limits",
+  "mode": "single",
   "ok": true,
   "result": {
-    "mode": "single",
     "provider": "codex",
     "target_file": "alpha.json",
     "source": "network",
@@ -173,6 +184,26 @@ the error message.
     "raw_usage": {
       "rate_limit": {}
     }
+  }
+}
+```
+
+### diag rate-limits (single, no active window)
+
+```json
+{
+  "schema_version": "codex-cli.diag.rate-limits.v1",
+  "command": "diag rate-limits",
+  "mode": "single",
+  "ok": true,
+  "result": {
+    "provider": "codex",
+    "name": "alpha",
+    "target_file": "alpha.json",
+    "status": "ok",
+    "ok": true,
+    "source": "network",
+    "windows": []
   }
 }
 ```

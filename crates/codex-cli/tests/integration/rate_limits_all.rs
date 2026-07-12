@@ -40,6 +40,13 @@ fn assert_exit(output: &CmdOutput, code: i32) {
     assert_eq!(output.code, code);
 }
 
+fn cache_kv_path(cache_root: &Path, key: &str) -> PathBuf {
+    cache_root
+        .join("codex")
+        .join("prompt-segment-rate-limits")
+        .join(format!("{key}.kv"))
+}
+
 #[test]
 fn rate_limits_all_missing_secret_dir() {
     let dir = tempfile::TempDir::new().expect("tempdir");
@@ -201,6 +208,55 @@ fn rate_limits_all_json_outputs_results() {
             .iter()
             .all(|entry| entry["raw_usage"]["rate_limit"].is_object())
     );
+}
+
+#[test]
+fn rate_limits_all_json_no_window_payloads_serve_preserved_cache() {
+    let responses = [
+        r#"{"plan_type":"pro","rate_limit":null}"#,
+        r#"{"plan_type":"pro","rate_limit":{"primary_window":null,"secondary_window":null}}"#,
+    ];
+
+    for response in responses {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let secrets = dir.path().join("secrets");
+        fs::create_dir_all(&secrets).expect("secret dir");
+        let secret_file = secrets.join("alpha.json");
+        let secret = r#"{"tokens":{"access_token":"tok-alpha","account_id":"acct_001"}}"#;
+        fs::write(&secret_file, secret).expect("write alpha");
+
+        let cache_root = dir.path().join("cache_root");
+        let kv_path = cache_kv_path(&cache_root, "alpha");
+        fs::create_dir_all(kv_path.parent().expect("cache parent")).expect("cache dir");
+        let cache = "fetched_at=1\nnon_weekly_label=5h\nnon_weekly_remaining=91\nnon_weekly_reset_epoch=1700003600\nweekly_remaining=70\nweekly_reset_epoch=1700600000\n";
+        fs::write(&kv_path, cache).expect("cache");
+
+        let server = LoopbackServer::new().expect("server");
+        server.add_route("GET", "/wham/usage", HttpResponse::new(200, response));
+
+        let output = run(
+            &["diag", "rate-limits", "--all", "--format", "json"],
+            &[
+                ("CODEX_SECRET_DIR", &secrets),
+                ("ZSH_CACHE_DIR", &cache_root),
+            ],
+            &[
+                ("CODEX_CHATGPT_BASE_URL", &server.url()),
+                ("CODEX_RATE_LIMITS_DEFAULT_ALL_ENABLED", "false"),
+            ],
+        );
+
+        assert_exit(&output, 0);
+        let payload: Value = serde_json::from_str(&stdout(&output)).expect("json");
+        let result = &payload["results"][0];
+        assert_eq!(result["status"], "ok");
+        assert_eq!(result["source"], "cache-fallback");
+        assert_eq!(result["summary"]["non_weekly_remaining"], 91);
+        assert_eq!(result["summary"]["weekly_remaining"], 70);
+        assert_eq!(result["windows"].as_array().expect("windows").len(), 2);
+        assert_eq!(fs::read_to_string(&secret_file).expect("secret"), secret);
+        assert_eq!(fs::read_to_string(&kv_path).expect("cache"), cache);
+    }
 }
 
 #[test]
