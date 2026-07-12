@@ -530,13 +530,41 @@ fn visible_lint_review_ignores_comments_after_literal_backticks() {
 }
 
 #[test]
+fn visible_lint_review_stops_code_span_matching_at_comment_blocks() {
+    let body = concat!(
+        "## Review Evidence\n\n",
+        "- Profile: tracking\n",
+        "- Decision: approve\n\n",
+        "` unmatched\n",
+        "<!--\n",
+        "hidden ` delimiter\n",
+        "| ID | Severity | Disposition | Summary |\n",
+        "| --- | --- | --- | --- |\n",
+        "| F1 | minor | fixed | hidden example |\n",
+        "-->\n",
+    );
+    let hints = LintHints {
+        review_has_findings: true,
+        ..LintHints::default()
+    };
+
+    let report = lint_visible(PayloadRole::Review, body, hints);
+
+    assert!(
+        report.codes().contains(&codes::REVIEW_MISSING_DISPOSITION),
+        "codes={:?}",
+        report.codes()
+    );
+}
+
+#[test]
 fn visible_lint_review_accepts_multiline_code_span_comment_token() {
     let body = concat!(
         "## Review Evidence\n\n",
         "- Profile: tracking\n",
         "- Decision: approve\n\n",
         "`code span\n",
-        "<!-- literal token\n",
+        "literal <!-- token\n",
         "ends here`\n\n",
         "| ID | Severity | Disposition | Summary |\n",
         "| --- | --- | --- | --- |\n",

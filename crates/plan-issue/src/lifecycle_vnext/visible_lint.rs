@@ -585,7 +585,10 @@ fn has_matching_code_span_delimiter(
         return true;
     }
     for line in future_lines {
-        if line.trim().is_empty() || markdown_fence_opener(line).is_some() {
+        if line.trim().is_empty()
+            || markdown_fence_opener(line).is_some()
+            || markdown_html_comment_block_opener(line)
+        {
             break;
         }
         if contains_backtick_run(line, delimiter_length) {
@@ -593,6 +596,10 @@ fn has_matching_code_span_delimiter(
         }
     }
     false
+}
+
+fn markdown_html_comment_block_opener(line: &str) -> bool {
+    markdown_after_fence_indent(line).is_some_and(|candidate| candidate.starts_with("<!--"))
 }
 
 fn contains_backtick_run(text: &str, delimiter_length: usize) -> bool {
