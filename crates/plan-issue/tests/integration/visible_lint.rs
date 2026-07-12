@@ -402,18 +402,104 @@ fn visible_lint_review_ignores_hidden_findings_tables() {
         "    | --- | --- | --- | --- |\n",
         "    | F1 | minor | fixed | hidden example |\n",
     );
+    let shorter_backtick_closer = concat!(
+        "## Review Evidence\n\n",
+        "- Profile: tracking\n",
+        "- Decision: approve\n\n",
+        "````markdown\n",
+        "```\n",
+        "| ID | Severity | Disposition | Summary |\n",
+        "| --- | --- | --- | --- |\n",
+        "| F1 | minor | fixed | hidden example |\n",
+        "````\n",
+    );
+    let shorter_tilde_closer = concat!(
+        "## Review Evidence\n\n",
+        "- Profile: tracking\n",
+        "- Decision: approve\n\n",
+        "~~~~markdown\n",
+        "~~~\n",
+        "| ID | Severity | Disposition | Summary |\n",
+        "| --- | --- | --- | --- |\n",
+        "| F1 | minor | fixed | hidden example |\n",
+        "~~~~\n",
+    );
+    let trailing_text_false_closer = concat!(
+        "## Review Evidence\n\n",
+        "- Profile: tracking\n",
+        "- Decision: approve\n\n",
+        "```markdown\n",
+        "```not a closer\n",
+        "| ID | Severity | Disposition | Summary |\n",
+        "| --- | --- | --- | --- |\n",
+        "| F1 | minor | fixed | hidden example |\n",
+        "```\n",
+    );
+    let chained_comments = concat!(
+        "## Review Evidence\n\n",
+        "- Profile: tracking\n",
+        "- Decision: approve\n\n",
+        "<!-- closed --> <!--\n",
+        "| ID | Severity | Disposition | Summary |\n",
+        "| --- | --- | --- | --- |\n",
+        "| F1 | minor | fixed | hidden example |\n",
+        "-->\n",
+    );
     let hints = LintHints {
         review_has_findings: true,
         ..LintHints::default()
     };
 
-    for body in [fenced, commented, indented] {
+    for body in [
+        fenced,
+        commented,
+        indented,
+        shorter_backtick_closer,
+        shorter_tilde_closer,
+        trailing_text_false_closer,
+        chained_comments,
+    ] {
         let report = lint_visible(PayloadRole::Review, body, hints);
         assert!(
             report.codes().contains(&codes::REVIEW_MISSING_DISPOSITION),
             "codes={:?}",
             report.codes()
         );
+    }
+}
+
+#[test]
+fn visible_lint_review_accepts_inline_comment_tokens_in_summary() {
+    let hints = LintHints {
+        review_has_findings: true,
+        ..LintHints::default()
+    };
+
+    for summary in [
+        "Handle <!-- marker --> safely",
+        "Keep the `<!--` literal visible",
+    ] {
+        let body = render_record_post_comment(
+            RecordProfile::Tracking,
+            LifecycleCommentKind::Review,
+            json!({
+                "decision": "approve",
+                "lenses": ["testing"],
+                "findings": [{
+                    "id": "F1",
+                    "severity": "minor",
+                    "disposition": "fixed",
+                    "summary": summary,
+                }],
+                "outcome_comment_url": "https://example.test/review",
+            }),
+            None,
+            Some("2026-07-12T00:00:00Z"),
+        )
+        .expect("render review body");
+
+        let report = lint_visible(PayloadRole::Review, &body, hints);
+        assert!(report.is_pass(), "{summary}: {:?}", report.findings);
     }
 }
 

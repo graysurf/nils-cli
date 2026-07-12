@@ -386,37 +386,29 @@ fn body_contains_review_disposition_row(body: &str) -> bool {
     let finding_headers = ["ID", "Severity", "Disposition", "Summary"];
     let mut pending_header = None;
     let mut disposition_column = None;
-    let mut fence_marker = None;
+    let mut fence = None;
     let mut in_html_comment = false;
 
     for line in body.lines() {
-        let trimmed = line.trim();
+        let raw_trimmed = line.trim();
+        if let Some((opening_marker, opening_length)) = fence {
+            if markdown_fence(raw_trimmed).is_some_and(|(marker, length, remainder)| {
+                marker == opening_marker && length >= opening_length && remainder.trim().is_empty()
+            }) {
+                fence = None;
+            }
+            continue;
+        }
 
-        if in_html_comment {
-            if trimmed.contains("-->") {
-                in_html_comment = false;
-            }
-            continue;
-        }
-        if let Some(marker) = fence_marker {
-            if markdown_fence_marker(trimmed) == Some(marker) {
-                fence_marker = None;
-            }
-            continue;
-        }
-        if line.starts_with("    ") || line.starts_with('\t') {
+        let visible_line = strip_html_comments(line, &mut in_html_comment);
+        let trimmed = visible_line.trim();
+        if visible_line.starts_with("    ") || visible_line.starts_with('\t') {
             pending_header = None;
             disposition_column = None;
             continue;
         }
-        if let Some((_, comment)) = trimmed.split_once("<!--") {
-            in_html_comment = !comment.contains("-->");
-            pending_header = None;
-            disposition_column = None;
-            continue;
-        }
-        if let Some(marker) = markdown_fence_marker(trimmed) {
-            fence_marker = Some(marker);
+        if let Some((marker, length, _)) = markdown_fence(trimmed) {
+            fence = Some((marker, length));
             pending_header = None;
             disposition_column = None;
             continue;
@@ -458,17 +450,62 @@ fn body_contains_review_disposition_row(body: &str) -> bool {
     false
 }
 
-fn markdown_fence_marker(line: &str) -> Option<char> {
+fn markdown_fence(line: &str) -> Option<(char, usize, &str)> {
     let marker = line.chars().next()?;
     if !matches!(marker, '`' | '~') {
         return None;
     }
-    (line
+    let length = line
         .chars()
         .take_while(|character| *character == marker)
-        .count()
-        >= 3)
-        .then_some(marker)
+        .count();
+    (length >= 3).then_some((marker, length, &line[length..]))
+}
+
+fn strip_html_comments(line: &str, in_comment: &mut bool) -> String {
+    let mut visible = String::with_capacity(line.len());
+    let mut index = 0;
+    let mut code_span_delimiter = None;
+
+    while index < line.len() {
+        let remainder = &line[index..];
+        if *in_comment {
+            if remainder.starts_with("-->") {
+                *in_comment = false;
+                index += 3;
+            } else {
+                index += remainder
+                    .chars()
+                    .next()
+                    .expect("non-empty remainder")
+                    .len_utf8();
+            }
+            continue;
+        }
+
+        if remainder.starts_with('`') {
+            let length = remainder.bytes().take_while(|byte| *byte == b'`').count();
+            visible.push_str(&remainder[..length]);
+            code_span_delimiter = match code_span_delimiter {
+                Some(opening_length) if opening_length == length => None,
+                None => Some(length),
+                current => current,
+            };
+            index += length;
+            continue;
+        }
+        if code_span_delimiter.is_none() && remainder.starts_with("<!--") {
+            *in_comment = true;
+            index += 4;
+            continue;
+        }
+
+        let character = remainder.chars().next().expect("non-empty remainder");
+        visible.push(character);
+        index += character.len_utf8();
+    }
+
+    visible
 }
 
 fn is_markdown_table_separator(cells: &[&str]) -> bool {
