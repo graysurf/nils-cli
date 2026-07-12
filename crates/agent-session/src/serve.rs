@@ -63,7 +63,7 @@ use crate::{
     non_empty_env, repo_remote_url_from_cwd, resolve_tmux_bin, resume_session_by_id,
     search_workdirs, send_auto_resume_input, send_input_serialized, session_clipboard_buffer,
     session_dir, session_status, short_hostname, start_provider_resume_session, start_session,
-    update_session_title, write_session_attachment,
+    update_session_title_if_revision, write_session_attachment,
 };
 
 const ATTACH_LIVE_FIFO_NAME: &str = "attach-live.fifo";
@@ -1332,7 +1332,7 @@ fn envelope_err(err: CliError) -> Response {
     let data = err.into_inner();
     let status = match data.code.as_str() {
         "session-not-found" => StatusCode::NOT_FOUND,
-        "session-exists" => StatusCode::CONFLICT,
+        "session-exists" | "title-revision-conflict" => StatusCode::CONFLICT,
         _ => match data.exit_code {
             exit::USAGE => StatusCode::BAD_REQUEST,
             exit::DATA => StatusCode::UNPROCESSABLE_ENTITY,
@@ -2730,10 +2730,32 @@ async fn update_session_handler(
             ));
         }
     };
+    let expected_title_revision = match object.get("expected_title_revision") {
+        Some(Value::Number(revision)) => match revision.as_u64() {
+            Some(revision) => Some(revision),
+            None => {
+                return envelope_err(CliError::usage(
+                    "invalid-title-revision",
+                    "expected_title_revision must be an unsigned integer",
+                    Some(json!({ "field": "expected_title_revision" })),
+                ));
+            }
+        },
+        Some(_) => {
+            return envelope_err(CliError::usage(
+                "invalid-title-revision",
+                "expected_title_revision must be an unsigned integer",
+                Some(json!({ "field": "expected_title_revision" })),
+            ));
+        }
+        None => None,
+    };
     let context = state.context.clone();
     let tmux = state.tmux_bin.clone();
-    match tokio::task::spawn_blocking(move || update_session_title(&context, &id, title, &tmux))
-        .await
+    match tokio::task::spawn_blocking(move || {
+        update_session_title_if_revision(&context, &id, title, expected_title_revision, &tmux)
+    })
+    .await
     {
         Ok(Ok(session)) => envelope_ok(json!({ "machine": state.machine, "session": session })),
         Ok(Err(err)) => envelope_err(err),
@@ -9189,6 +9211,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn update_session_title_rejects_stale_revision() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let tmux = minimal_tmux(tmp.path());
+        seed_session(tmp.path(), "revision", "codex", "hs-codex-revision");
+        let st = state(tmp.path(), Some(TOKEN), tmux);
+
+        let (status, body) = call(
+            router(st.clone()),
+            patch_json(
+                "/sessions/revision",
+                Some(TOKEN),
+                json!({ "title": "First title", "expected_title_revision": 0 }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "body={body}");
+        assert_eq!(body["data"]["session"]["title"], "First title");
+        assert_eq!(body["data"]["session"]["title_revision"], 1);
+
+        let (status, body) = call(
+            router(st),
+            patch_json(
+                "/sessions/revision",
+                Some(TOKEN),
+                json!({ "title": "Stale title", "expected_title_revision": 0 }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "body={body}");
+        assert_eq!(body["error"]["code"], "title-revision-conflict");
+        assert_eq!(body["error"]["details"]["expected_title_revision"], 0);
+        assert_eq!(body["error"]["details"]["actual_title_revision"], 1);
+
+        let record_path = tmp.path().join("sessions/revision/session.json");
+        let record: Value =
+            serde_json::from_str(&std::fs::read_to_string(&record_path).unwrap()).unwrap();
+        assert_eq!(record["title"], "First title");
+        assert_eq!(record["title_revision"], 1);
+    }
+
+    #[tokio::test]
     async fn unique_session_prefix_supports_title_update_and_resume() {
         let tmp = tempfile::TempDir::new().unwrap();
         let state_dir = tmp.path().join("state");
@@ -11345,6 +11408,7 @@ exit 0
             agent: "codex".to_string(),
             mode: "interactive".to_string(),
             title: None,
+            title_revision: 0,
             cwd: "/tmp".to_string(),
             tmux_session: tmux_session.to_string(),
             prompt_file: None,

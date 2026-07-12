@@ -432,6 +432,8 @@ struct SessionRecord {
     agent: String,
     mode: String,
     title: Option<String>,
+    #[serde(default)]
+    title_revision: u64,
     cwd: String,
     tmux_session: String,
     prompt_file: Option<String>,
@@ -548,6 +550,7 @@ struct SessionView {
     agent: String,
     mode: String,
     title: Option<String>,
+    title_revision: u64,
     cwd: String,
     tmux_session: String,
     status: String,
@@ -616,6 +619,7 @@ struct GlanceResult {
     id: String,
     agent: String,
     title: Option<String>,
+    title_revision: u64,
     tmux_session: String,
     status: String,
     resumable: bool,
@@ -978,6 +982,7 @@ fn create_record(request: RecordRequest<'_>) -> Result<CreatedRecord, CliError> 
         agent: request.agent.as_str().to_string(),
         mode: request.mode.to_string(),
         title: request.title.map(str::to_string),
+        title_revision: 0,
         cwd: display_path(request.cwd),
         tmux_session: tmux_session.clone(),
         prompt_file: prompt_file.as_ref().map(|path| display_path(path)),
@@ -1920,6 +1925,7 @@ fn glance_session(context: &CliContext, args: cli::GlanceArgs) -> Result<GlanceR
         id: record.id.clone(),
         agent: record.agent.clone(),
         title: record.title.clone(),
+        title_revision: record.title_revision,
         tmux_session: record.tmux_session.clone(),
         status,
         resumable: is_resumable(&record),
@@ -2069,16 +2075,47 @@ mod codex_resume_tests {
     }
 }
 
+#[cfg(test)]
 fn update_session_title(
     context: &CliContext,
     id: &str,
     title: Option<String>,
     tmux_bin: &Path,
 ) -> Result<SessionView, CliError> {
+    update_session_title_if_revision(context, id, title, None, tmux_bin)
+}
+
+fn update_session_title_if_revision(
+    context: &CliContext,
+    id: &str,
+    title: Option<String>,
+    expected_title_revision: Option<u64>,
+    tmux_bin: &Path,
+) -> Result<SessionView, CliError> {
     let normalized_title = normalize_title(title)?;
     let (record, previous_title) = mutate_session_record(context, id, |record| {
+        if let Some(expected) = expected_title_revision
+            && record.title_revision != expected
+        {
+            return Err(CliError::data(
+                "title-revision-conflict",
+                "session title changed since it was read",
+                Some(json!({
+                    "expected_title_revision": expected,
+                    "actual_title_revision": record.title_revision,
+                    "actual_title": record.title,
+                })),
+            ));
+        }
         let previous_title = record.title.clone();
         record.title = normalized_title;
+        record.title_revision = record.title_revision.checked_add(1).ok_or_else(|| {
+            CliError::data(
+                "title-revision-overflow",
+                "session title revision cannot advance",
+                Some(json!({ "actual_title_revision": record.title_revision })),
+            )
+        })?;
         record.updated_at = Zoned::now().timestamp().to_string();
         Ok((record.clone(), previous_title))
     })?;
@@ -3152,6 +3189,7 @@ fn session_view_from_parts(
         agent: record.agent.clone(),
         mode: record.mode.clone(),
         title: record.title.clone(),
+        title_revision: record.title_revision,
         cwd: record.cwd.clone(),
         tmux_session: record.tmux_session.clone(),
         status,
