@@ -87,6 +87,8 @@ pub fn run_plan_issue_local_with_env(args: &[&str], env: &[(&str, &str)]) -> Cmd
 ///   `label list`. Defaults to the three lifecycle labels used by close tests.
 /// - `FORGE_CLI_STUB_STRICT_REPO_LABELS=1`: reject `issue edit --add-label`
 ///   when the requested label is absent from the repository catalog.
+/// - `FORGE_CLI_STUB_LOCAL_LABEL_LIST_UNSUPPORTED=1`: reject `label list`
+///   for the local provider, matching its intentionally catalog-free store.
 /// - `FORGE_CLI_STUB_LABELS_FILE`: optional newline-delimited provider label
 ///   state shared across stub invocations.
 /// - `FORGE_CLI_STUB_ISSUE_STATE_FILE`: optional provider issue-state file
@@ -309,6 +311,10 @@ case "$group $verb" in
     emit "{\"ok\":true,\"schema_version\":\"cli.forge-cli.issue.list.v1\",\"data\":{\"provider\":\"$provider\",\"items\":[]}}"
     ;;
   "label list")
+    if [[ "$provider" == "local" && "${FORGE_CLI_STUB_LOCAL_LABEL_LIST_UNSUPPORTED:-}" == "1" ]]; then
+      emit '{"ok":false,"schema_version":"cli.forge-cli.error.v1","error":{"code":"provider_unsupported","message":"provider local does not model repository label catalogs"}}'
+      exit 1
+    fi
     labels_json="$(repo_labels_json)"
     emit "{\"ok\":true,\"schema_version\":\"cli.forge-cli.label.list.v1\",\"data\":{\"provider\":\"$provider\",\"labels\":$labels_json}}"
     ;;

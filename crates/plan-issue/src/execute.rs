@@ -2033,14 +2033,18 @@ fn run_record_close(
         let current = adapter
             .issue_labels(&repo_info.slug, issue_number)
             .map_err(|err| CommandError::runtime("record-close-label-state-read-failed", err))?;
-        let catalog = adapter
-            .repository_labels(&repo_info.slug)
-            .map_err(|err| CommandError::runtime("record-close-label-catalog-read-failed", err))?;
+        let catalog = if repo_info.provider == crate::provider::Provider::Local {
+            None
+        } else {
+            Some(adapter.repository_labels(&repo_info.slug).map_err(|err| {
+                CommandError::runtime("record-close-label-catalog-read-failed", err)
+            })?)
+        };
         label_plan = build_close_label_plan(
             label_plan.requested_add,
             label_plan.requested_remove,
             Some(current),
-            Some(catalog),
+            catalog,
             Some(repo_info.provider),
         )?;
     }

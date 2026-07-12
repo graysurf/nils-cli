@@ -257,6 +257,10 @@ and conformance tests are reproducible.
   per write), never the system clock.
 - **Numbering**: the `next_issue` / `next_pr` counters in `repo.json` allocate
   issue and PR numbers monotonically.
+- **Labels**: issue labels are free-form store data. Local has no repository
+  catalog command, so `record close` skips remote availability preflight but
+  still reads the current issue labels, normalizes exclusive `state::*`
+  siblings, applies one edit, and verifies the provider read-back.
 
 ## Seeding Half B (`driver-writes-JSON` v1)
 

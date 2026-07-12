@@ -385,7 +385,9 @@ Strict, single-command closeout:
    completeness, verifies requested additions exist, and computes one atomic
    label edit that removes every current `state::*` sibling when a terminal
    state is added. GitHub label identity is case-insensitive; GitLab and Local
-   label identity remains case-sensitive.
+   label identity remains case-sensitive. Local stores intentionally have no
+   repository catalog: additions are free-form, so availability remains
+   unchecked while current-label normalization and read-back still apply.
 5. Applies the preflighted label edit and reads the final labels back to verify
    the requested mutations and state exclusivity. If edit or convergence fails,
    the issue remains open and no closeout comment or dashboard write occurs.

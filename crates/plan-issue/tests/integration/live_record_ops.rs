@@ -100,11 +100,13 @@ fn audit_single_comment_body(body: &str) -> Value {
 }
 
 struct LiveCloseLabelCase<'a> {
+    repo: &'a str,
     initial_labels: &'a str,
     repo_labels_json: &'a str,
     drop_label_mutations: bool,
     dry_run: bool,
     explicit_remove: bool,
+    local_label_list_unsupported: bool,
 }
 
 fn run_live_record_close_label_case_with(
@@ -136,13 +138,23 @@ fn run_live_record_close_label_case_with(
     let log_s = log_path.to_string_lossy().to_string();
     let state_dir_s = state_dir.to_string_lossy().to_string();
     let drop = if case.drop_label_mutations { "1" } else { "0" };
+    let local_label_list_unsupported = if case.local_label_list_unsupported {
+        "1"
+    } else {
+        "0"
+    };
+    let strict_repo_labels = if case.repo.starts_with("local:") {
+        "0"
+    } else {
+        "1"
+    };
     let mut args = vec!["--format", "json"];
     if case.dry_run {
         args.push("--dry-run");
     }
     args.extend([
         "--repo",
-        "sympoies/agent-runtime-kit",
+        case.repo,
         "record",
         "close",
         "--issue",
@@ -168,7 +180,11 @@ fn run_live_record_close_label_case_with(
                 ("FORGE_CLI_STUB_ISSUE_STATE_FILE", &issue_state_s),
                 ("FORGE_CLI_STUB_DROP_LABEL_MUTATIONS", drop),
                 ("FORGE_CLI_STUB_REPO_LABELS_JSON", case.repo_labels_json),
-                ("FORGE_CLI_STUB_STRICT_REPO_LABELS", "1"),
+                ("FORGE_CLI_STUB_STRICT_REPO_LABELS", strict_repo_labels),
+                (
+                    "FORGE_CLI_STUB_LOCAL_LABEL_LIST_UNSUPPORTED",
+                    local_label_list_unsupported,
+                ),
                 ("FORGE_CLI_STUB_LOG", &log_s),
                 ("PLAN_ISSUE_HOME", &state_dir_s),
             ],
@@ -186,11 +202,13 @@ fn run_live_record_close_label_case(
     drop_label_mutations: bool,
 ) -> (i32, Value, String, String, String) {
     run_live_record_close_label_case_with(LiveCloseLabelCase {
+        repo: "sympoies/agent-runtime-kit",
         initial_labels: "state::needs-triage\n",
         repo_labels_json: r#"[{"name":"state::needs-triage","color":"000000","description":""},{"name":"state::ready","color":"000000","description":""},{"name":"state::closed","color":"000000","description":""}]"#,
         drop_label_mutations,
         dry_run: false,
         explicit_remove: true,
+        local_label_list_unsupported: false,
     })
 }
 
@@ -240,11 +258,13 @@ fn record_close_live_observes_confirmed_provider_labels() {
 fn record_close_missing_add_label_fails_before_provider_mutations() {
     let (dry_code, dry_envelope, dry_log, dry_labels, dry_issue_state) =
         run_live_record_close_label_case_with(LiveCloseLabelCase {
+            repo: "sympoies/agent-runtime-kit",
             initial_labels: "state::ready\n",
             repo_labels_json: r#"[{"name":"state::ready","color":"000000","description":""}]"#,
             drop_label_mutations: false,
             dry_run: true,
             explicit_remove: false,
+            local_label_list_unsupported: false,
         });
     assert_eq!(dry_code, 0, "{dry_envelope}");
     let dry_plan = &dry_envelope["payload"]["result"]["preview"]["labels"];
@@ -261,11 +281,13 @@ fn record_close_missing_add_label_fails_before_provider_mutations() {
 
     let (code, envelope, log, labels, issue_state) =
         run_live_record_close_label_case_with(LiveCloseLabelCase {
+            repo: "sympoies/agent-runtime-kit",
             initial_labels: "state::ready\n",
             repo_labels_json: r#"[{"name":"state::ready","color":"000000","description":""}]"#,
             drop_label_mutations: false,
             dry_run: false,
             explicit_remove: false,
+            local_label_list_unsupported: false,
         });
 
     assert_ne!(code, 0, "{envelope}");
@@ -285,11 +307,13 @@ fn record_close_missing_add_label_fails_before_provider_mutations() {
 fn record_close_normalizes_all_existing_state_labels() {
     let (code, envelope, log, labels, issue_state) = run_live_record_close_label_case_with(
         LiveCloseLabelCase {
+            repo: "sympoies/agent-runtime-kit",
             initial_labels: "state::ready\nstate::needs-triage\nworkflow::tracking\n",
             repo_labels_json: r#"[{"name":"state::ready","color":"000000","description":""},{"name":"state::needs-triage","color":"000000","description":""},{"name":"state::closed","color":"000000","description":""},{"name":"workflow::tracking","color":"000000","description":""}]"#,
             drop_label_mutations: false,
             dry_run: false,
             explicit_remove: false,
+            local_label_list_unsupported: false,
         },
     );
 
@@ -311,11 +335,13 @@ fn record_close_normalizes_all_existing_state_labels() {
 fn record_close_live_dry_run_predicts_label_availability_and_final_set() {
     let (code, envelope, log, labels, issue_state) = run_live_record_close_label_case_with(
         LiveCloseLabelCase {
+            repo: "sympoies/agent-runtime-kit",
             initial_labels: "state::ready\nworkflow::tracking\n",
             repo_labels_json: r#"[{"name":"state::ready","color":"000000","description":""},{"name":"state::closed","color":"000000","description":""},{"name":"workflow::tracking","color":"000000","description":""}]"#,
             drop_label_mutations: false,
             dry_run: true,
             explicit_remove: false,
+            local_label_list_unsupported: false,
         },
     );
 
@@ -338,6 +364,29 @@ fn record_close_live_dry_run_predicts_label_availability_and_final_set() {
     assert!(log.contains("label list"), "{log}");
     assert!(!log.contains("issue comment"), "{log}");
     assert!(!log.contains("issue close"), "{log}");
+}
+
+#[test]
+fn record_close_local_normalizes_labels_without_a_repository_catalog() {
+    let (code, envelope, log, labels, issue_state) =
+        run_live_record_close_label_case_with(LiveCloseLabelCase {
+            repo: "local:demo",
+            initial_labels: "state::ready\nworkflow::tracking\n",
+            repo_labels_json: "[]",
+            drop_label_mutations: false,
+            dry_run: false,
+            explicit_remove: false,
+            local_label_list_unsupported: true,
+        });
+
+    assert_eq!(code, 0, "{envelope}");
+    assert_eq!(labels, "workflow::tracking\nstate::closed\n");
+    assert_eq!(issue_state, "closed\n");
+    assert!(!log.contains("label list"), "{log}");
+    assert_eq!(
+        envelope["payload"]["result"]["labels"]["availability"]["checked"],
+        false
+    );
 }
 
 #[test]
