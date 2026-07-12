@@ -3,8 +3,8 @@
 This file documents third-party notice-file discovery for Rust crates used by this workspace.
 
 - Data source: `cargo metadata --format-version 1 --locked`
-- Cargo.lock SHA256: `5f342079b3a0a0f94127ebc23b687055f62fbce250ed6d36c43760e94e4ab7a1`
-- Third-party crates (`source != null`): 465
+- Cargo.lock SHA256: `3ac6533fc901722fa796b401b7ee3fe6c0b89bf2bfeed65a4da90067771a459f`
+- Third-party crates (`source != null`): 468
 
 ## Notice Extraction Policy
 
@@ -996,6 +996,15 @@ This file documents third-party notice-file discovery for Rust crates used by th
 - Notice files: No explicit NOTICE file discovered.
 - License file references:
   - `LICENSE`
+
+### getopts 0.2.24
+
+- License: `MIT OR Apache-2.0`
+- Source: `crates.io`
+- Notice files: No explicit NOTICE file discovered.
+- License file references:
+  - `LICENSE-APACHE`
+  - `LICENSE-MIT`
 
 ### getrandom 0.2.17
 
@@ -2153,6 +2162,22 @@ This file documents third-party notice-file discovery for Rust crates used by th
 - License file references:
   - `LICENSE-APACHE`
   - `LICENSE-MIT`
+
+### pulldown-cmark 0.13.4
+
+- License: `MIT`
+- Source: `crates.io`
+- Notice files: No explicit NOTICE file discovered.
+- License file references:
+  - `LICENSE`
+
+### pulldown-cmark-escape 0.11.0
+
+- License: `MIT`
+- Source: `crates.io`
+- Notice files: No explicit NOTICE file discovered.
+- License file references:
+  - `LICENSE`
 
 ### pxfm 0.1.29
 

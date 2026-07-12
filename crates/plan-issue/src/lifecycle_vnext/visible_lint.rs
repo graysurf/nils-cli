@@ -12,6 +12,7 @@
 
 use crate::lifecycle_record::PayloadRole;
 use crate::lifecycle_vnext::registry::{self, RoleSpec};
+use pulldown_cmark::{Event, Options, Parser, Tag, TagEnd};
 
 /// Stable, role-specific failure codes emitted by the lint. Runtime-kit
 /// smoke and skill flows pattern-match on these strings, so each code is
@@ -384,285 +385,126 @@ fn is_table_separator(line: &str) -> bool {
 fn body_contains_review_disposition_row(body: &str) -> bool {
     let dispositions = ["fixed", "residual", "follow-up", "deferred", "no-action"];
     let finding_headers = ["ID", "Severity", "Disposition", "Summary"];
-    let mut pending_header = None;
+    let mut options = Options::empty();
+    options.insert(Options::ENABLE_TABLES);
+    let events = Parser::new_ext(body, options)
+        .into_offset_iter()
+        .collect::<Vec<_>>();
+    let code_ranges = events
+        .iter()
+        .filter_map(|(event, range)| matches!(event, Event::Code(_)).then_some(range.clone()))
+        .collect::<Vec<_>>();
+    let comment_ranges = markdown_html_comment_ranges(body, &code_ranges);
+
+    let mut in_table = false;
+    let mut in_table_head = false;
+    let mut in_table_cell = false;
+    let mut row = Vec::new();
+    let mut cell = String::new();
     let mut disposition_column = None;
-    let mut fence = None;
-    let mut in_html_comment = false;
-    let mut code_span_delimiter = None;
-    let lines = body.lines().collect::<Vec<_>>();
 
-    for (line_index, line) in lines.iter().enumerate() {
-        if let Some((opening_marker, opening_length)) = fence {
-            if is_markdown_fence_closer(line, opening_marker, opening_length) {
-                fence = None;
-            }
-            continue;
-        }
-
-        if !in_html_comment && code_span_delimiter.is_none() {
-            if line.starts_with("    ") || line.starts_with('\t') {
-                pending_header = None;
+    for (event, range) in events {
+        match event {
+            Event::Start(Tag::Table(_)) => {
+                in_table = !markdown_table_is_indented(body, range.start)
+                    && !comment_ranges
+                        .iter()
+                        .any(|comment| comment.contains(&range.start));
+                in_table_head = false;
                 disposition_column = None;
-                continue;
+                row.clear();
             }
-            if let Some((marker, length)) = markdown_fence_opener(line) {
-                fence = Some((marker, length));
-                pending_header = None;
+            Event::Start(Tag::TableHead) if in_table => {
+                in_table_head = true;
+                row.clear();
+            }
+            Event::Start(Tag::TableRow) if in_table && !in_table_head => row.clear(),
+            Event::Start(Tag::TableCell) if in_table => {
+                in_table_cell = true;
+                cell.clear();
+            }
+            Event::Text(text) | Event::Code(text) if in_table_cell => cell.push_str(&text),
+            Event::SoftBreak | Event::HardBreak if in_table_cell => cell.push(' '),
+            Event::End(TagEnd::TableCell) if in_table_cell => {
+                in_table_cell = false;
+                row.push(cell.trim().to_owned());
+            }
+            Event::End(TagEnd::TableHead) if in_table_head => {
+                in_table_head = false;
+                if row.len() == finding_headers.len()
+                    && finding_headers
+                        .iter()
+                        .all(|header| row.iter().any(|cell| cell == header))
+                {
+                    disposition_column = row.iter().position(|cell| cell == "Disposition");
+                }
+                row.clear();
+            }
+            Event::End(TagEnd::TableRow) if in_table && !in_table_head => {
+                if let Some(index) = disposition_column
+                    && row.len() == finding_headers.len()
+                    && row
+                        .get(index)
+                        .is_some_and(|cell| dispositions.contains(&cell.as_str()))
+                {
+                    return true;
+                }
+                row.clear();
+            }
+            Event::End(TagEnd::Table) if in_table => {
+                in_table = false;
+                in_table_head = false;
+                in_table_cell = false;
                 disposition_column = None;
-                continue;
+                row.clear();
             }
-        }
-
-        let comment_was_open = in_html_comment;
-        let code_span_was_open = code_span_delimiter.is_some();
-        let visible_line = strip_html_comments(
-            line,
-            &lines[line_index + 1..],
-            &mut in_html_comment,
-            &mut code_span_delimiter,
-        );
-        if comment_was_open
-            || in_html_comment
-            || code_span_was_open
-            || code_span_delimiter.is_some()
-        {
-            pending_header = None;
-            disposition_column = None;
-            continue;
-        }
-
-        if !markdown_after_fence_indent(line).is_some_and(|candidate| candidate.starts_with('|')) {
-            pending_header = None;
-            disposition_column = None;
-            continue;
-        }
-
-        let trimmed = visible_line.trim();
-        if visible_line.starts_with("    ") || visible_line.starts_with('\t') {
-            pending_header = None;
-            disposition_column = None;
-            continue;
-        }
-
-        let Some(cells) = markdown_table_cells(trimmed) else {
-            pending_header = None;
-            disposition_column = None;
-            continue;
-        };
-
-        if let Some((index, width)) = disposition_column {
-            if cells.len() == width
-                && cells
-                    .get(index)
-                    .is_some_and(|cell| dispositions.contains(cell))
-            {
-                return true;
-            }
-            continue;
-        }
-
-        if let Some((index, width)) = pending_header.take()
-            && cells.len() == width
-            && is_markdown_table_separator(&cells)
-        {
-            disposition_column = Some((index, width));
-            continue;
-        }
-
-        if cells.len() == finding_headers.len()
-            && finding_headers.iter().all(|header| cells.contains(header))
-            && let Some(index) = cells.iter().position(|cell| *cell == "Disposition")
-        {
-            pending_header = Some((index, cells.len()));
+            _ => {}
         }
     }
 
     false
 }
 
-fn markdown_fence(line: &str) -> Option<(char, usize, &str)> {
-    let marker = line.chars().next()?;
-    if !matches!(marker, '`' | '~') {
-        return None;
-    }
-    let length = line
-        .chars()
-        .take_while(|character| *character == marker)
-        .count();
-    (length >= 3).then_some((marker, length, &line[length..]))
+fn markdown_table_is_indented(body: &str, table_start: usize) -> bool {
+    let line_start = body[..table_start].rfind('\n').map_or(0, |index| index + 1);
+    let line = &body[line_start..];
+    line.starts_with('\t') || line.bytes().take_while(|byte| *byte == b' ').count() >= 4
 }
 
-fn markdown_fence_opener(line: &str) -> Option<(char, usize)> {
-    let candidate = markdown_after_fence_indent(line)?;
-    let (marker, length, remainder) = markdown_fence(candidate)?;
-    if marker == '`' && remainder.contains('`') {
-        return None;
-    }
-    Some((marker, length))
-}
+fn markdown_html_comment_ranges(
+    body: &str,
+    code_ranges: &[std::ops::Range<usize>],
+) -> Vec<std::ops::Range<usize>> {
+    let mut ranges = Vec::new();
+    let mut search_start = 0;
 
-fn is_markdown_fence_closer(line: &str, opening_marker: char, opening_length: usize) -> bool {
-    let Some(candidate) = markdown_after_fence_indent(line) else {
-        return false;
-    };
-    markdown_fence(candidate).is_some_and(|(marker, length, remainder)| {
-        marker == opening_marker
-            && length >= opening_length
-            && remainder.bytes().all(|byte| matches!(byte, b' ' | b'\t'))
-    })
-}
-
-fn markdown_after_fence_indent(line: &str) -> Option<&str> {
-    let indentation = line.bytes().take_while(|byte| *byte == b' ').count();
-    if indentation > 3 {
-        return None;
-    }
-    let candidate = &line[indentation..];
-    (!candidate.starts_with('\t')).then_some(candidate)
-}
-
-fn strip_html_comments(
-    line: &str,
-    future_lines: &[&str],
-    in_comment: &mut bool,
-    code_span_delimiter: &mut Option<usize>,
-) -> String {
-    let mut visible = String::with_capacity(line.len());
-    let mut index = 0;
-
-    while index < line.len() {
-        let remainder = &line[index..];
-        if *in_comment {
-            if remainder.starts_with("-->") {
-                *in_comment = false;
-                index += 3;
-            } else {
-                index += remainder
-                    .chars()
-                    .next()
-                    .expect("non-empty remainder")
-                    .len_utf8();
-            }
+    while let Some(relative_start) = body[search_start..].find("<!--") {
+        let start = search_start + relative_start;
+        if code_ranges.iter().any(|range| range.contains(&start))
+            || is_backslash_escaped(body, start)
+        {
+            search_start = start + 4;
             continue;
         }
 
-        if remainder.starts_with('`') {
-            let length = remainder.bytes().take_while(|byte| *byte == b'`').count();
-            visible.push_str(&remainder[..length]);
-            if code_span_delimiter.is_some_and(|opening_length| opening_length == length) {
-                *code_span_delimiter = None;
-            } else if code_span_delimiter.is_none()
-                && !is_backslash_escaped(line, index)
-                && has_matching_code_span_delimiter(&remainder[length..], future_lines, length)
-            {
-                *code_span_delimiter = Some(length);
-            }
-            index += length;
-            continue;
-        }
-        if code_span_delimiter.is_none() && remainder.starts_with("<!--") {
-            *in_comment = true;
-            index += 4;
-            continue;
-        }
-
-        let character = remainder.chars().next().expect("non-empty remainder");
-        visible.push(character);
-        index += character.len_utf8();
+        let end = body[start + 4..]
+            .find("-->")
+            .map_or(body.len(), |relative_end| start + 4 + relative_end + 3);
+        ranges.push(start..end);
+        search_start = end;
     }
 
-    visible
+    ranges
 }
 
-fn is_backslash_escaped(line: &str, index: usize) -> bool {
-    line[..index]
+fn is_backslash_escaped(text: &str, index: usize) -> bool {
+    text[..index]
         .bytes()
         .rev()
         .take_while(|byte| *byte == b'\\')
         .count()
         % 2
         == 1
-}
-
-fn has_matching_code_span_delimiter(
-    current_remainder: &str,
-    future_lines: &[&str],
-    delimiter_length: usize,
-) -> bool {
-    if contains_backtick_run(current_remainder, delimiter_length) {
-        return true;
-    }
-    for line in future_lines {
-        if line.trim().is_empty()
-            || markdown_fence_opener(line).is_some()
-            || markdown_html_comment_block_opener(line)
-        {
-            break;
-        }
-        if contains_backtick_run(line, delimiter_length) {
-            return true;
-        }
-    }
-    false
-}
-
-fn markdown_html_comment_block_opener(line: &str) -> bool {
-    markdown_after_fence_indent(line).is_some_and(|candidate| candidate.starts_with("<!--"))
-}
-
-fn contains_backtick_run(text: &str, delimiter_length: usize) -> bool {
-    let bytes = text.as_bytes();
-    let mut index = 0;
-    while index < bytes.len() {
-        if bytes[index] != b'`' {
-            index += 1;
-            continue;
-        }
-        let start = index;
-        while index < bytes.len() && bytes[index] == b'`' {
-            index += 1;
-        }
-        if index - start == delimiter_length {
-            return true;
-        }
-    }
-    false
-}
-
-fn is_markdown_table_separator(cells: &[&str]) -> bool {
-    !cells.is_empty()
-        && cells.iter().all(|cell| {
-            let without_leading_alignment = cell.strip_prefix(':').unwrap_or(cell);
-            let hyphens = without_leading_alignment
-                .strip_suffix(':')
-                .unwrap_or(without_leading_alignment);
-            hyphens.len() >= 3 && hyphens.bytes().all(|byte| byte == b'-')
-        })
-}
-
-fn markdown_table_cells(line: &str) -> Option<Vec<&str>> {
-    let inner = line.strip_prefix('|')?.strip_suffix('|')?;
-    let mut cells = Vec::new();
-    let mut start = 0;
-    let mut preceding_backslashes = 0;
-
-    // Markdown treats a pipe as escaped only after an odd-length backslash
-    // run. The lifecycle renderer uses this form for literal pipes in IDs and
-    // summaries, so those bytes must remain inside their original cell.
-    for (index, character) in inner.char_indices() {
-        if character == '|' && preceding_backslashes % 2 == 0 {
-            cells.push(inner[start..index].trim());
-            start = index + character.len_utf8();
-            preceding_backslashes = 0;
-        } else if character == '\\' {
-            preceding_backslashes += 1;
-        } else {
-            preceding_backslashes = 0;
-        }
-    }
-    cells.push(inner[start..].trim());
-
-    Some(cells)
 }
 
 fn body_contains_review_context(body: &str) -> bool {

@@ -30,6 +30,7 @@ serde_json = { workspace = true, features = ["preserve_order"] }
 nils-common = { version = "1.21.22", path = "../nils-common", package = "nils-common" }
 nils-markdown = { version = "1.21.22", path = "../nils-markdown", package = "nils-markdown" }
 plan-tooling = { version = "1.21.22", path = "../plan-tooling", package = "nils-plan-tooling" }
+pulldown-cmark = { workspace = true }
 
 [dev-dependencies]
 nils-markdown = { version = "1.21.22", path = "../nils-markdown", package = "nils-markdown", features = ["test-support"] }

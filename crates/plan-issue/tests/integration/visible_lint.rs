@@ -348,7 +348,7 @@ fn visible_lint_review_requires_a_structural_disposition_column() {
         let report = lint_visible(PayloadRole::Review, body, hints);
         assert!(
             report.codes().contains(&codes::REVIEW_MISSING_DISPOSITION),
-            "codes={:?}",
+            "body={body:?} codes={:?}",
             report.codes()
         );
     }
@@ -486,7 +486,7 @@ fn visible_lint_review_ignores_hidden_findings_tables() {
         let report = lint_visible(PayloadRole::Review, body, hints);
         assert!(
             report.codes().contains(&codes::REVIEW_MISSING_DISPOSITION),
-            "codes={:?}",
+            "body={body:?} codes={:?}",
             report.codes()
         );
     }
@@ -494,29 +494,31 @@ fn visible_lint_review_ignores_hidden_findings_tables() {
 
 #[test]
 fn visible_lint_review_rejects_non_ascii_fence_closers() {
-    let body = concat!(
-        "## Review Evidence\n\n",
-        "- Profile: tracking\n",
-        "- Decision: approve\n\n",
-        "```markdown\n",
-        "```\u{00a0}\n",
-        "| ID | Severity | Disposition | Summary |\n",
-        "| --- | --- | --- | --- |\n",
-        "| F1 | minor | fixed | hidden example |\n",
-        "```\n",
-    );
     let hints = LintHints {
         review_has_findings: true,
         ..LintHints::default()
     };
 
-    let report = lint_visible(PayloadRole::Review, body, hints);
+    for suffix in ["\u{00a0}", "\t"] {
+        let body = format!(
+            "## Review Evidence\n\n\
+             - Profile: tracking\n\
+             - Decision: approve\n\n\
+             ```markdown\n\
+             ```{suffix}\n\
+             | ID | Severity | Disposition | Summary |\n\
+             | --- | --- | --- | --- |\n\
+             | F1 | minor | fixed | hidden example |\n\
+             ```\n"
+        );
+        let report = lint_visible(PayloadRole::Review, &body, hints);
 
-    assert!(
-        report.codes().contains(&codes::REVIEW_MISSING_DISPOSITION),
-        "codes={:?}",
-        report.codes()
-    );
+        assert!(
+            report.codes().contains(&codes::REVIEW_MISSING_DISPOSITION),
+            "suffix={suffix:?} codes={:?}",
+            report.codes()
+        );
+    }
 }
 
 #[test]
@@ -526,7 +528,7 @@ fn visible_lint_review_accepts_ascii_fence_closer_whitespace() {
         ..LintHints::default()
     };
 
-    for closer in ["```   \n", "```\t\n"] {
+    for closer in ["```\n", "```   \n"] {
         let body = format!(
             "## Review Evidence\n\n\
              - Profile: tracking\n\
@@ -541,7 +543,7 @@ fn visible_lint_review_accepts_ascii_fence_closer_whitespace() {
 
         let report = lint_visible(PayloadRole::Review, &body, hints);
 
-        assert!(report.is_pass(), "{:?}", report.findings);
+        assert!(report.is_pass(), "closer={closer:?} {:?}", report.findings);
     }
 }
 
@@ -567,6 +569,59 @@ fn visible_lint_review_rejects_comment_prefixed_table_headers() {
         "codes={:?}",
         report.codes()
     );
+}
+
+#[test]
+fn visible_lint_review_rejects_comment_synthesized_table_separators() {
+    let body = concat!(
+        "## Review Evidence\n\n",
+        "- Profile: tracking\n",
+        "- Decision: approve\n\n",
+        "| ID | Severity | Disposition | Summary |\n",
+        "| --- | <!-- hidden --> --- | --- | --- |\n",
+        "| F1 | minor | fixed | synthetic table |\n",
+    );
+    let hints = LintHints {
+        review_has_findings: true,
+        ..LintHints::default()
+    };
+
+    let report = lint_visible(PayloadRole::Review, body, hints);
+
+    assert!(
+        report.codes().contains(&codes::REVIEW_MISSING_DISPOSITION),
+        "codes={:?}",
+        report.codes()
+    );
+}
+
+#[test]
+fn visible_lint_review_ignores_raw_html_block_tables() {
+    let hints = LintHints {
+        review_has_findings: true,
+        ..LintHints::default()
+    };
+
+    for (opener, closer) in [("<pre>", "</pre>"), ("<script>", "</script>")] {
+        let body = format!(
+            "## Review Evidence\n\n\
+             - Profile: tracking\n\
+             - Decision: approve\n\n\
+             {opener}\n\
+             | ID | Severity | Disposition | Summary |\n\
+             | --- | --- | --- | --- |\n\
+             | F1 | minor | fixed | hidden example |\n\
+             {closer}\n"
+        );
+
+        let report = lint_visible(PayloadRole::Review, &body, hints);
+
+        assert!(
+            report.codes().contains(&codes::REVIEW_MISSING_DISPOSITION),
+            "opener={opener} codes={:?}",
+            report.codes()
+        );
+    }
 }
 
 #[test]
@@ -600,7 +655,7 @@ fn visible_lint_review_ignores_comments_after_literal_backticks() {
         let report = lint_visible(PayloadRole::Review, body, hints);
         assert!(
             report.codes().contains(&codes::REVIEW_MISSING_DISPOSITION),
-            "codes={:?}",
+            "body={body:?} codes={:?}",
             report.codes()
         );
     }
