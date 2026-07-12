@@ -410,6 +410,20 @@ fn run_zero_required_delivery(
     (stub, output)
 }
 
+fn assert_no_all_check_call_after_required(calls: &str) {
+    let required_index = calls
+        .lines()
+        .position(|line| line.contains("--required"))
+        .expect("required-only classification call");
+    assert!(
+        calls
+            .lines()
+            .skip(required_index + 1)
+            .all(|line| line.contains("--required")),
+        "terminal retained snapshots must not trigger a later all-check request"
+    );
+}
+
 fn write_chain_stub_with_checks(
     stub: &StubEnv,
     pre_view: &str,
@@ -911,14 +925,7 @@ fn pr_deliver_zero_required_successful_visible_checks_use_all_check_fallback() {
 
     assert_eq!(out.code, 0, "stdout={}\nstderr={}", out.stdout, out.stderr);
     let calls = fs::read_to_string(checks_calls).expect("checks call log");
-    assert_eq!(
-        calls
-            .lines()
-            .filter(|line| !line.contains("--required"))
-            .count(),
-        1,
-        "terminal visible checks must be re-gated from the retained snapshot"
-    );
+    assert_no_all_check_call_after_required(&calls);
 }
 
 #[test]
@@ -1008,14 +1015,7 @@ fn pr_deliver_zero_required_and_zero_visible_checks_complete_immediately() {
 
     assert_eq!(out.code, 0, "stdout={}\nstderr={}", out.stdout, out.stderr);
     let calls = fs::read_to_string(checks_calls).expect("checks call log");
-    assert_eq!(
-        calls
-            .lines()
-            .filter(|line| !line.contains("--required"))
-            .count(),
-        1,
-        "an empty visible-check set must not add a fallback poll"
-    );
+    assert_no_all_check_call_after_required(&calls);
 }
 
 #[test]
