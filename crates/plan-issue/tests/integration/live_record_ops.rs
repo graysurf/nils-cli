@@ -1539,9 +1539,22 @@ fn record_close_dispatch_fixture_passes_visible_read_back() {
 
     assert_eq!(audit.code, 0, "stderr: {}", audit.stderr_text());
     let envelope = audit.stdout_json();
+    assert_eq!(
+        envelope["payload"]["result"]["audit"]["recognized_count"], 1,
+        "{envelope}"
+    );
     let visible = &envelope["payload"]["result"]["visible"];
     assert_eq!(visible["overall_pass"], true, "{envelope}");
     assert_eq!(visible["codes"], json!([]), "{envelope}");
+    let closeout = visible["roles"]
+        .as_array()
+        .expect("visible roles")
+        .iter()
+        .find(|role| role["role"] == "closeout")
+        .expect("closeout role");
+    assert_eq!(closeout["present"], true, "{envelope}");
+    assert_eq!(closeout["checked"], true, "{envelope}");
+    assert_eq!(closeout["pass"], true, "{envelope}");
 }
 
 #[test]
