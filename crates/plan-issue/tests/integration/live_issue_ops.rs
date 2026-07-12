@@ -261,6 +261,7 @@ fn live_ready_plan_label_update_flag_applies_review_label() {
             &[
                 ("FORGE_CLI_STUB_LOG", &log_s),
                 ("FORGE_CLI_STUB_VIEW_BODY_JSON", &body_json),
+                ("FORGE_CLI_STUB_EDIT_LABELS_JSON", "[\"needs-review\"]"),
                 ("PLAN_ISSUE_HOME", &state_dir_s),
             ],
         ),

@@ -8,6 +8,10 @@ versioning.
 
 ### Changed
 
+- `record close` and `record post` now validate the provider-observed labels
+  returned by `forge-cli issue edit`; requested additions that remain absent or
+  removals that remain present fail the operation instead of reporting a false
+  success. ([#1161](https://github.com/sympoies/nils-cli/issues/1161))
 - `record open` now preserves the previous broad tracker-resume scan ceiling
   when routed through `forge-cli issue list`, `record close` fails closed when
   GitHub required-check state cannot be read, and `record post` / checkpoint

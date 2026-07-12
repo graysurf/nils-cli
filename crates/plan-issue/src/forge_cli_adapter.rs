@@ -344,7 +344,60 @@ impl ProviderAdapter for ForgeCliAdapter {
             args.push("--remove-label");
             args.push(label);
         }
-        self.run_envelope(&args).map(|_| ())
+        let data = self.run_envelope(&args)?;
+        let observed = data
+            .get("labels")
+            .and_then(Value::as_array)
+            .ok_or_else(|| {
+                "forge-cli issue edit data missing provider-observed `labels`".to_string()
+            })?
+            .iter()
+            .map(|label| {
+                label.as_str().ok_or_else(|| {
+                    "forge-cli issue edit data contains a non-string `labels` entry".to_string()
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
+        // GitHub label identity is case-insensitive. Local preserves exact
+        // strings, and GitLab's label arguments/read-back retain provider
+        // spelling, so those providers must not let a case-distinct label
+        // confirm or contradict a requested mutation.
+        let labels_equal = |actual: &str, requested: &str| {
+            if self.provider == "github" {
+                actual.eq_ignore_ascii_case(requested)
+            } else {
+                actual == requested
+            }
+        };
+
+        let missing_add: Vec<&str> = trimmed_add
+            .iter()
+            .copied()
+            .filter(|requested| {
+                !observed
+                    .iter()
+                    .any(|actual| labels_equal(actual, requested))
+            })
+            .collect();
+        let remaining_remove: Vec<&str> = trimmed_remove
+            .iter()
+            .copied()
+            .filter(|requested| {
+                observed
+                    .iter()
+                    .any(|actual| labels_equal(actual, requested))
+            })
+            .collect();
+
+        if !missing_add.is_empty() || !remaining_remove.is_empty() {
+            return Err(format!(
+                "forge-cli issue edit provider read-back did not confirm label mutations: missing added labels [{}]; still-present removed labels [{}]",
+                missing_add.join(", "),
+                remaining_remove.join(", ")
+            ));
+        }
+        Ok(())
     }
 
     fn close_issue(
@@ -876,7 +929,7 @@ mod tests {
             r#"{
             "ok": true,
             "schema_version": "cli.forge-cli.issue.edit.v1",
-            "data": {"provider":"gitlab","number":7,"url":"u","state":"open","title":"t","labels":[],"assignees":[]}
+            "data": {"provider":"gitlab","number":7,"url":"u","state":"open","title":"t","labels":["type::test"],"assignees":[]}
         }"#,
         ]);
         // No labels — no subprocess call.
@@ -914,6 +967,88 @@ mod tests {
             .collect();
         assert_eq!(rms.len(), 1);
         assert_eq!(argv[rms[0] + 1], "state::stale");
+    }
+
+    #[test]
+    fn edit_issue_labels_rejects_unobserved_mutations() {
+        let (adapter, _) = adapter_with_github(vec![
+            r#"{
+            "ok": true,
+            "schema_version": "cli.forge-cli.issue.edit.v1",
+            "data": {"provider":"github","number":7,"url":"u","state":"closed","title":"t","labels":["state::stale"],"assignees":[]}
+        }"#,
+        ]);
+
+        let err = adapter
+            .edit_issue_labels("g/p", 7, &["type::test".into()], &["state::stale".into()])
+            .expect_err("provider read-back must prove every requested mutation");
+
+        assert!(err.contains("type::test"), "{err}");
+        assert!(err.contains("state::stale"), "{err}");
+    }
+
+    #[test]
+    fn edit_issue_labels_local_rejects_case_distinct_addition() {
+        let (adapter, _) = adapter_with_local(vec![
+            r#"{
+            "ok": true,
+            "schema_version": "cli.forge-cli.issue.edit.v1",
+            "data": {"provider":"local","number":7,"url":"u","state":"open","title":"t","labels":["bug"],"assignees":[]}
+        }"#,
+        ]);
+
+        let err = adapter
+            .edit_issue_labels("demo", 7, &["Bug".into()], &[])
+            .expect_err("a case-distinct Local label must not confirm the requested addition");
+
+        assert!(err.contains("Bug"), "{err}");
+    }
+
+    #[test]
+    fn edit_issue_labels_local_accepts_case_distinct_remaining_label_after_removal() {
+        let (adapter, _) = adapter_with_local(vec![
+            r#"{
+            "ok": true,
+            "schema_version": "cli.forge-cli.issue.edit.v1",
+            "data": {"provider":"local","number":7,"url":"u","state":"open","title":"t","labels":["bug"],"assignees":[]}
+        }"#,
+        ]);
+
+        adapter
+            .edit_issue_labels("demo", 7, &[], &["Bug".into()])
+            .expect("removing Local label `Bug` may leave distinct label `bug`");
+    }
+
+    #[test]
+    fn edit_issue_labels_github_accepts_case_normalized_read_back() {
+        let (adapter, _) = adapter_with_github(vec![
+            r#"{
+            "ok": true,
+            "schema_version": "cli.forge-cli.issue.edit.v1",
+            "data": {"provider":"github","number":7,"url":"u","state":"open","title":"t","labels":["bug"],"assignees":[]}
+        }"#,
+        ]);
+
+        adapter
+            .edit_issue_labels("g/p", 7, &["Bug".into()], &[])
+            .expect("GitHub label read-back remains case-insensitive");
+    }
+
+    #[test]
+    fn edit_issue_labels_rejects_missing_provider_labels() {
+        let (adapter, _) = adapter_with_github(vec![
+            r#"{
+            "ok": true,
+            "schema_version": "cli.forge-cli.issue.edit.v1",
+            "data": {"provider":"github","number":7,"url":"u","state":"closed","title":"t","assignees":[]}
+        }"#,
+        ]);
+
+        let err = adapter
+            .edit_issue_labels("g/p", 7, &["type::test".into()], &[])
+            .expect_err("missing provider labels must fail closed");
+
+        assert!(err.contains("missing provider-observed `labels`"), "{err}");
     }
 
     #[test]

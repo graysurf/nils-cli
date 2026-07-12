@@ -99,6 +99,151 @@ fn audit_single_comment_body(body: &str) -> Value {
     out.stdout_json()["payload"]["result"]["audit"].clone()
 }
 
+fn run_live_record_close_label_case(
+    drop_label_mutations: bool,
+) -> (i32, Value, String, String, String) {
+    let tmp = TempDir::new().expect("tempdir");
+    let stub = StubBinDir::new();
+    stub.write_exe("forge-cli", common::forge_cli_stub_script());
+
+    let fixture = Path::new("tests/fixtures/lifecycle/agent-runtime-kit-closeout");
+    let body = fs::read_to_string(fixture.join("issue-body.md")).expect("fixture body");
+    let comments: Value = serde_json::from_str(
+        &fs::read_to_string(fixture.join("comments.json")).expect("fixture comments"),
+    )
+    .expect("comments json");
+    let body_json = json!(body).to_string();
+    let comments_json = comments["comments"].to_string();
+
+    let labels_path = tmp.path().join("labels.txt");
+    let issue_state_path = tmp.path().join("issue-state.txt");
+    let log_path = tmp.path().join("forge-cli.log");
+    let state_dir = tmp.path().join("state-dir");
+    fs::write(&labels_path, "state::needs-triage\n").expect("seed labels");
+    fs::write(&issue_state_path, "open\n").expect("seed issue state");
+    fs::create_dir_all(&state_dir).expect("state dir");
+
+    let labels_s = labels_path.to_string_lossy().to_string();
+    let issue_state_s = issue_state_path.to_string_lossy().to_string();
+    let log_s = log_path.to_string_lossy().to_string();
+    let state_dir_s = state_dir.to_string_lossy().to_string();
+    let drop = if drop_label_mutations { "1" } else { "0" };
+    let out = common::run_plan_issue_with_options(
+        &[
+            "--format",
+            "json",
+            "--repo",
+            "sympoies/agent-runtime-kit",
+            "record",
+            "close",
+            "--issue",
+            "42",
+            "--linked-pr",
+            "sympoies/agent-runtime-kit#1",
+            "--approval",
+            "https://github.com/sympoies/agent-runtime-kit/issues/42#issuecomment-approval",
+            "--add-label",
+            "state::closed",
+            "--remove-label",
+            "state::needs-triage",
+        ],
+        live_record_options(
+            stub.path(),
+            &[
+                ("FORGE_CLI_STUB_VIEW_BODY_JSON", &body_json),
+                ("FORGE_CLI_STUB_VIEW_COMMENTS_JSON", &comments_json),
+                ("FORGE_CLI_STUB_LABELS_FILE", &labels_s),
+                ("FORGE_CLI_STUB_ISSUE_STATE_FILE", &issue_state_s),
+                ("FORGE_CLI_STUB_DROP_LABEL_MUTATIONS", drop),
+                ("FORGE_CLI_STUB_LOG", &log_s),
+                ("PLAN_ISSUE_HOME", &state_dir_s),
+            ],
+        ),
+    );
+
+    let envelope = out.stdout_json();
+    let log = fs::read_to_string(log_path).expect("provider log");
+    let labels = fs::read_to_string(labels_path).expect("provider labels");
+    let issue_state = fs::read_to_string(issue_state_path).expect("provider issue state");
+    (out.code, envelope, log, labels, issue_state)
+}
+
+#[test]
+fn record_close_live_rejects_contradictory_provider_labels() {
+    let (code, envelope, log, labels, issue_state) = run_live_record_close_label_case(true);
+
+    assert_ne!(code, 0, "{envelope}");
+    assert_eq!(envelope["error"]["code"], "record-close-label-edit-failed");
+    assert_eq!(labels, "state::needs-triage\n");
+    assert_eq!(issue_state, "closed\n");
+    let close = log.find("issue close 42").expect("close call");
+    let label_edit = log
+        .find("issue edit 42 --add-label state::closed --remove-label state::needs-triage")
+        .expect("label edit call");
+    assert!(close < label_edit, "{log}");
+}
+
+#[test]
+fn record_close_live_observes_confirmed_provider_labels() {
+    let (code, envelope, log, labels, issue_state) = run_live_record_close_label_case(false);
+
+    assert_eq!(code, 0, "{envelope}");
+    assert_eq!(envelope["payload"]["result"]["operation"], "record.close");
+    assert_eq!(envelope["payload"]["result"]["mode"], "live");
+    assert_eq!(labels, "state::closed\n");
+    assert_eq!(issue_state, "closed\n");
+    assert!(log.contains("issue close 42"), "{log}");
+    assert!(
+        log.contains("issue edit 42 --add-label state::closed --remove-label state::needs-triage"),
+        "{log}"
+    );
+}
+
+#[test]
+fn forge_cli_stub_preserves_repeated_label_mutations() {
+    let tmp = TempDir::new().expect("tempdir");
+    let stub = StubBinDir::new();
+    stub.write_exe("forge-cli", common::forge_cli_stub_script());
+    let labels_path = tmp.path().join("labels.txt");
+    fs::write(&labels_path, "remove::one\nRemove Label\nkeep::me\n").expect("seed labels");
+    let labels_s = labels_path.to_string_lossy().to_string();
+
+    let out = nils_test_support::cmd::run(
+        &stub.path().join("forge-cli"),
+        &[
+            "--format",
+            "json",
+            "--provider",
+            "github",
+            "--repo",
+            "sympoies/nils-cli",
+            "issue",
+            "edit",
+            "42",
+            "--remove-label",
+            "remove::one",
+            "--remove-label",
+            "Remove Label",
+            "--add-label",
+            "add::one",
+            "--add-label",
+            "Add Label",
+        ],
+        &[("FORGE_CLI_STUB_LABELS_FILE", labels_s.as_str())],
+        None,
+    );
+
+    assert_eq!(out.code, 0, "{}", out.stderr_text());
+    assert_eq!(
+        fs::read_to_string(labels_path).expect("provider labels"),
+        "keep::me\nadd::one\nAdd Label\n"
+    );
+    assert_eq!(
+        out.stdout_json()["data"]["labels"],
+        json!(["keep::me", "add::one", "Add Label"])
+    );
+}
+
 #[test]
 fn record_post_state_with_payload_file_renders_v2_marker_in_dry_run() {
     let tmp = TempDir::new().expect("tempdir");
