@@ -390,26 +390,29 @@ fn body_contains_review_disposition_row(body: &str) -> bool {
     let events = Parser::new_ext(body, options)
         .into_offset_iter()
         .collect::<Vec<_>>();
-    let literal_ranges = events
+    let code_ranges = events
         .iter()
         .filter_map(|(event, range)| {
-            let is_literal = match event {
-                Event::Code(_) | Event::Start(Tag::CodeBlock(_)) => true,
-                Event::Start(Tag::HtmlBlock) => {
-                    markdown_line_is_code_indented(body, range.start)
-                        || body
-                            .get(range.clone())
-                            .is_some_and(|source| !source.trim_start().starts_with("<!--"))
-                }
-                Event::Html(_) | Event::InlineHtml(_) => body
-                    .get(range.clone())
-                    .is_some_and(|source| !source.trim_start().starts_with("<!--")),
-                _ => false,
-            };
-            is_literal.then_some(range.clone())
+            matches!(event, Event::Code(_) | Event::Start(Tag::CodeBlock(_)))
+                .then_some(range.clone())
+                .or_else(|| {
+                    matches!(event, Event::Start(Tag::HtmlBlock))
+                        .then(|| {
+                            (markdown_line_is_code_indented(body, range.start)
+                                || markdown_html_block_is_raw_text_literal(body, range))
+                            .then_some(range.clone())
+                        })
+                        .flatten()
+                })
         })
         .collect::<Vec<_>>();
-    let comment_ranges = markdown_html_comment_ranges(body, &literal_ranges);
+    let html_block_ranges = events
+        .iter()
+        .filter_map(|(event, range)| {
+            matches!(event, Event::Start(Tag::HtmlBlock)).then_some(range.clone())
+        })
+        .collect::<Vec<_>>();
+    let comment_ranges = markdown_html_comment_ranges(body, &code_ranges, &html_block_ranges);
 
     let mut in_table = false;
     let mut in_table_head = false;
@@ -486,30 +489,64 @@ fn markdown_line_is_code_indented(body: &str, offset: usize) -> bool {
     line.starts_with('\t') || line.bytes().take_while(|byte| *byte == b' ').count() >= 4
 }
 
+fn markdown_html_block_is_raw_text_literal(body: &str, range: &std::ops::Range<usize>) -> bool {
+    let Some(source) = body.get(range.clone()) else {
+        return false;
+    };
+    let lower = source.trim_start().to_ascii_lowercase();
+    ["script", "style", "textarea", "title"].iter().any(|tag| {
+        lower.strip_prefix(&format!("<{tag}")).is_some_and(|rest| {
+            rest.bytes()
+                .next()
+                .is_some_and(|byte| byte == b'>' || byte.is_ascii_whitespace())
+        })
+    })
+}
+
 fn markdown_html_comment_ranges(
     body: &str,
-    literal_ranges: &[std::ops::Range<usize>],
+    code_ranges: &[std::ops::Range<usize>],
+    html_block_ranges: &[std::ops::Range<usize>],
 ) -> Vec<std::ops::Range<usize>> {
     let mut ranges = Vec::new();
     let mut search_start = 0;
 
     while let Some(relative_start) = body[search_start..].find("<!--") {
         let start = search_start + relative_start;
-        if literal_ranges.iter().any(|range| range.contains(&start))
+        if code_ranges.iter().any(|range| range.contains(&start))
             || is_backslash_escaped(body, start)
+            || markdown_marker_is_inside_html_tag(body, start)
         {
             search_start = start + 4;
             continue;
         }
 
-        let end = body[start + 4..]
-            .find("-->")
-            .map_or(body.len(), |relative_end| start + 4 + relative_end + 3);
+        let end = if let Some(relative_end) = body[start + 4..].find("-->") {
+            start + 4 + relative_end + 3
+        } else if html_block_ranges.iter().any(|range| range.contains(&start)) {
+            body.len()
+        } else {
+            search_start = start + 4;
+            continue;
+        };
         ranges.push(start..end);
         search_start = end;
     }
 
     ranges
+}
+
+fn markdown_marker_is_inside_html_tag(body: &str, marker_start: usize) -> bool {
+    let line_start = body[..marker_start]
+        .rfind('\n')
+        .map_or(0, |index| index + 1);
+    let before_marker = &body[line_start..marker_start];
+    let Some(last_open) = before_marker.rfind('<') else {
+        return false;
+    };
+    before_marker
+        .rfind('>')
+        .is_none_or(|last_close| last_open > last_close)
 }
 
 fn is_backslash_escaped(text: &str, index: usize) -> bool {

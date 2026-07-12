@@ -684,6 +684,94 @@ fn visible_lint_review_accepts_comment_tokens_inside_raw_html() {
 }
 
 #[test]
+fn visible_lint_review_accepts_comment_tokens_inside_raw_text_html() {
+    let hints = LintHints {
+        review_has_findings: true,
+        ..LintHints::default()
+    };
+
+    for raw_html in [
+        "<script>const marker = \"<!--\";</script>\n\n",
+        "<style>.marker::after { content: \"<!--\"; }</style>\n\n",
+    ] {
+        let body = format!(
+            "## Review Evidence\n\n\
+             - Profile: tracking\n\
+             - Decision: approve\n\n\
+             {raw_html}\
+             | ID | Severity | Disposition | Summary |\n\
+             | --- | --- | --- | --- |\n\
+             | F1 | minor | fixed | visible finding |\n"
+        );
+
+        let report = lint_visible(PayloadRole::Review, &body, hints);
+
+        assert!(
+            report.is_pass(),
+            "raw_html={raw_html:?} findings={:?}",
+            report.findings
+        );
+    }
+}
+
+#[test]
+fn visible_lint_review_accepts_comment_tokens_inside_link_titles() {
+    let hints = LintHints {
+        review_has_findings: true,
+        ..LintHints::default()
+    };
+
+    for prefix in [
+        "[reference](https://example.test \"<!--\")\n\n",
+        "[ref]: https://example.test \"<!--\"\n\n",
+    ] {
+        let body = format!(
+            "## Review Evidence\n\n\
+             - Profile: tracking\n\
+             - Decision: approve\n\n\
+             {prefix}\
+             | ID | Severity | Disposition | Summary |\n\
+             | --- | --- | --- | --- |\n\
+             | F1 | minor | fixed | visible finding |\n"
+        );
+
+        let report = lint_visible(PayloadRole::Review, &body, hints);
+
+        assert!(
+            report.is_pass(),
+            "prefix={prefix:?} findings={:?}",
+            report.findings
+        );
+    }
+}
+
+#[test]
+fn visible_lint_review_rejects_unclosed_comments_inside_html_blocks() {
+    let body = concat!(
+        "## Review Evidence\n\n",
+        "- Profile: tracking\n",
+        "- Decision: approve\n\n",
+        "<div><!--\n",
+        "</div>\n\n",
+        "| ID | Severity | Disposition | Summary |\n",
+        "| --- | --- | --- | --- |\n",
+        "| F1 | minor | fixed | hidden finding |\n",
+    );
+    let hints = LintHints {
+        review_has_findings: true,
+        ..LintHints::default()
+    };
+
+    let report = lint_visible(PayloadRole::Review, body, hints);
+
+    assert!(
+        report.codes().contains(&codes::REVIEW_MISSING_DISPOSITION),
+        "codes={:?}",
+        report.codes()
+    );
+}
+
+#[test]
 fn visible_lint_review_ignores_comments_after_literal_backticks() {
     let unmatched = concat!(
         "## Review Evidence\n\n",
