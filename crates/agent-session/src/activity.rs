@@ -256,6 +256,8 @@ pub(crate) struct TurnEvent {
     pub(crate) provider_turn_id: Option<String>,
     pub(crate) kind: TurnEventKind,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) failure_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) attention_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) attention_kind: Option<String>,
@@ -1232,9 +1234,12 @@ fn ingest_event_with_lock(
         document.seen_event_count == 0,
         &dedupe_key,
     )? {
+        let state = document.state.clone();
+        drop(_lock);
+        arm_auto_resume_from_event(context, &record.id, &event, &state, &now())?;
         return Ok(ActivityResult {
             id: record.id,
-            turn_state: document.state,
+            turn_state: state,
             duplicate: true,
         });
     }
@@ -1249,9 +1254,12 @@ fn ingest_event_with_lock(
     let received_at = now();
     let semantic_key = semantic_event_key(&event);
     if semantic_event_is_duplicate(&document, &event, &semantic_key, &received_at) {
+        let state = document.state.clone();
+        drop(_lock);
+        arm_auto_resume_from_event(context, &record.id, &event, &state, &received_at)?;
         return Ok(ActivityResult {
             id: record.id,
-            turn_state: document.state,
+            turn_state: state,
             duplicate: true,
         });
     }
@@ -1267,7 +1275,7 @@ fn ingest_event_with_lock(
     document.seen_event_count = document.seen_event_count.saturating_add(1);
     let journal_entry = JournalEntry {
         received_at: received_at.clone(),
-        event,
+        event: event.clone(),
     };
     document.pending_journal = Some(journal_entry.clone());
     write_document(&path, &document)?;
@@ -1281,11 +1289,42 @@ fn ingest_event_with_lock(
     append_journal_entry(&journal_path, journal_entry)?;
     document.pending_journal = None;
     write_document(&path, &document)?;
+    let state = document.state;
+    drop(_lock);
+    arm_auto_resume_from_event(context, &record.id, &event, &state, &received_at)?;
     Ok(ActivityResult {
         id: record.id,
-        turn_state: document.state,
+        turn_state: state,
         duplicate: false,
     })
+}
+
+fn arm_auto_resume_from_event(
+    context: &CliContext,
+    id: &str,
+    event: &TurnEvent,
+    state: &TurnState,
+    received_at: &str,
+) -> Result<(), CliError> {
+    if event.kind != TurnEventKind::TurnFailed
+        || event.failure_reason.as_deref() != Some("usage_exhausted")
+        || event.confidence != Confidence::Authoritative
+        || event.source_kind != SourceKind::ProviderHook
+    {
+        return Ok(());
+    }
+    let blocked_turn_id = event
+        .provider_turn_id
+        .clone()
+        .unwrap_or_else(|| event.event_id.clone());
+    crate::auto_resume::arm_usage_exhaustion(
+        context,
+        id,
+        blocked_turn_id,
+        state.revision,
+        received_at,
+    )?;
+    Ok(())
 }
 
 pub(crate) fn activity_status(context: &CliContext, id: &str) -> Result<ActivityResult, CliError> {
@@ -1784,7 +1823,7 @@ fn normalize_provider_hook(
         }
         (AgentKind::Claude, "Stop", _) => (TurnEventKind::StopObserved, None, Confidence::Observed),
         (AgentKind::Claude, "StopFailure", _) => {
-            (TurnEventKind::TurnFailed, None, Confidence::Observed)
+            (TurnEventKind::TurnFailed, None, Confidence::Authoritative)
         }
         (AgentKind::Claude, "Notification", Some("idle_prompt")) => {
             (TurnEventKind::TurnCompleted, None, Confidence::Observed)
@@ -1807,6 +1846,13 @@ fn normalize_provider_hook(
         }
         _ => return Ok(None),
     };
+    let failure_reason = (agent == AgentKind::Claude && event_name == "StopFailure")
+        .then(|| {
+            raw.get("error")
+                .and_then(Value::as_str)
+                .map(normalize_claude_failure_reason)
+        })
+        .flatten();
     let mut provider_session = optional_hook_string(raw, "session_id")?;
     if provider_session.is_none() {
         provider_session = optional_hook_string(raw, "session_key")?;
@@ -1876,6 +1922,7 @@ fn normalize_provider_hook(
         provider_session_id,
         provider_turn_id,
         kind,
+        failure_reason,
         attention_id,
         attention_kind: attention_kind.map(str::to_string),
         attention_correlation_ambiguous,
@@ -1883,6 +1930,20 @@ fn normalize_provider_hook(
         source_kind: SourceKind::ProviderHook,
         provider_time: None,
     }))
+}
+
+fn normalize_claude_failure_reason(reason: &str) -> String {
+    match reason {
+        "rate_limit" => "usage_exhausted",
+        "authentication_failed" => "authentication",
+        "oauth_org_not_allowed" => "organization",
+        "billing_error" => "billing",
+        "invalid_request" => "invalid_request",
+        "server_error" => "service",
+        "max_output_tokens" => "max_output_tokens",
+        _ => "unknown",
+    }
+    .to_string()
 }
 
 fn normalize_provider_notification(
@@ -1925,6 +1986,7 @@ fn normalize_provider_notification(
         provider_session_id: Some(provider_session_id),
         provider_turn_id: Some(provider_turn_id),
         kind: TurnEventKind::TurnCompleted,
+        failure_reason: None,
         attention_id: None,
         attention_kind: None,
         attention_correlation_ambiguous: false,
@@ -3362,6 +3424,7 @@ mod tests {
             provider_session_id: Some("session-1".to_string()),
             provider_turn_id: Some("turn-1".to_string()),
             kind,
+            failure_reason: None,
             attention_id: None,
             attention_kind: None,
             attention_correlation_ambiguous: false,
@@ -3390,6 +3453,67 @@ mod tests {
     }
 
     #[test]
+    fn claude_rate_limit_failure_is_authoritative_and_content_free() {
+        let raw = json!({
+            "hook_event_name": "StopFailure",
+            "session_id": "claude-session",
+            "error": "rate_limit",
+            "error_details": "sensitive provider detail",
+            "last_assistant_message": "sensitive rendered error",
+            "transcript_path": "/private/transcript.jsonl"
+        });
+
+        let event = normalize_provider_hook(AgentKind::Claude, None, "runtime-1", &raw)
+            .expect("recognized failure")
+            .expect("normalized event");
+
+        assert_eq!(event.kind, TurnEventKind::TurnFailed);
+        assert_eq!(event.confidence, Confidence::Authoritative);
+        assert_eq!(event.failure_reason.as_deref(), Some("usage_exhausted"));
+
+        let serialized = serde_json::to_string(&event).expect("serialize event");
+        for forbidden in [
+            "sensitive provider detail",
+            "sensitive rendered error",
+            "/private/transcript.jsonl",
+            "error_details",
+            "last_assistant_message",
+            "transcript_path",
+        ] {
+            assert!(!serialized.contains(forbidden), "leaked {forbidden}");
+        }
+    }
+
+    #[test]
+    fn auto_resume_failure_fixture_arms_only_authoritative_usage_exhaustion() {
+        for line in include_str!("../tests/fixtures/activity/auto-resume-failures.jsonl").lines() {
+            let mut raw: Value = serde_json::from_str(line).expect("failure fixture");
+            let provider = raw
+                .get("provider")
+                .and_then(Value::as_str)
+                .and_then(AgentKind::from_name)
+                .expect("fixture provider");
+            let expected = raw
+                .get("expected")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            let arms = raw.get("arms").and_then(Value::as_bool).unwrap_or(false);
+            raw.as_object_mut().unwrap().remove("provider");
+            raw.as_object_mut().unwrap().remove("expected");
+            raw.as_object_mut().unwrap().remove("arms");
+            let event = normalize_provider_hook(provider, None, "runtime-1", &raw)
+                .expect("fixture normalization")
+                .expect("recognized fixture");
+            assert_eq!(event.failure_reason, expected);
+            assert_eq!(
+                event.failure_reason.as_deref() == Some("usage_exhausted")
+                    && event.confidence == Confidence::Authoritative,
+                arms
+            );
+        }
+    }
+
+    #[test]
     fn timed_activity_lock_wait_is_bounded() {
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let _held = acquire_lock(tmp.path()).expect("held lock");
@@ -3407,7 +3531,7 @@ mod tests {
         };
         let cwd = tmp.path().join("repo");
         fs::create_dir_all(&cwd).expect("repo dir");
-        let created = create_record(RecordRequest {
+        let mut created = create_record(RecordRequest {
             context: &context,
             agent: AgentKind::Codex,
             mode: "interactive",
@@ -3428,6 +3552,7 @@ mod tests {
             agent_bin: None,
         })
         .expect("test session");
+        created.release_lifecycle_lock();
         (context, created)
     }
 
@@ -3440,7 +3565,7 @@ mod tests {
         };
         let cwd = tmp.path().join("repo");
         fs::create_dir_all(&cwd).expect("repo dir");
-        let created = create_record(RecordRequest {
+        let mut created = create_record(RecordRequest {
             context: &context,
             agent: AgentKind::Codex,
             mode: "interactive",
@@ -3454,6 +3579,7 @@ mod tests {
             agent_bin: None,
         })
         .expect("test session");
+        created.release_lifecycle_lock();
         let runtime_id = created
             .record
             .runtime
@@ -3516,7 +3642,7 @@ mod tests {
         };
         let cwd = tmp.path().join("repo");
         fs::create_dir_all(&cwd).expect("repo dir");
-        let created = create_record(RecordRequest {
+        let mut created = create_record(RecordRequest {
             context: &context,
             agent: AgentKind::Codex,
             mode: "interactive",
@@ -3537,6 +3663,7 @@ mod tests {
             agent_bin: None,
         })
         .expect("test session");
+        created.release_lifecycle_lock();
         let runtime_id = created
             .record
             .runtime
@@ -3576,7 +3703,7 @@ mod tests {
         };
         let cwd = tmp.path().join("repo");
         fs::create_dir_all(&cwd).expect("repo dir");
-        let created = create_record(RecordRequest {
+        let mut created = create_record(RecordRequest {
             context: &context,
             agent: AgentKind::Codex,
             mode: "interactive",
@@ -3590,6 +3717,7 @@ mod tests {
             agent_bin: None,
         })
         .expect("test session");
+        created.release_lifecycle_lock();
         let runtime_id = created
             .record
             .runtime
@@ -5252,6 +5380,27 @@ fn validate_event(event: &TurnEvent) -> Result<(), CliError> {
         return Err(CliError::data(
             "activity-attention-kind-invalid",
             "attention kind must be approval, clarification, authentication, or other",
+            None,
+        ));
+    }
+    if let Some(reason) = event.failure_reason.as_deref()
+        && (event.kind != TurnEventKind::TurnFailed
+            || event.confidence != Confidence::Authoritative
+            || !matches!(
+                reason,
+                "usage_exhausted"
+                    | "authentication"
+                    | "organization"
+                    | "billing"
+                    | "invalid_request"
+                    | "service"
+                    | "max_output_tokens"
+                    | "unknown"
+            ))
+    {
+        return Err(CliError::data(
+            "activity-failure-reason-invalid",
+            "failure_reason requires an authoritative turn_failed event and an allowlisted value",
             None,
         ));
     }

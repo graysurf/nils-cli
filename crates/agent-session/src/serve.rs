@@ -31,6 +31,7 @@ use std::time::{Duration, Instant};
 use axum::Json;
 use axum::Router;
 use axum::body::{Body, Bytes, to_bytes};
+use axum::extract::rejection::JsonRejection;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path as AxPath, Query, State};
 use axum::http::header::{AUTHORIZATION, CONTENT_TYPE};
@@ -47,7 +48,9 @@ use notify::{Event as NotifyEvent, EventKind, RecommendedWatcher, RecursiveMode,
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, broadcast, mpsc, watch};
+use tokio::task::JoinSet;
 
+use crate::auto_resume::{self, UsageSnapshot};
 use crate::cli::{self, AgentKind, SpecialKey};
 use crate::provider_prompt::{
     MAX_PROVIDER_PROMPT_BYTES, PROVIDER_PROMPT_CAPABILITY, ProviderKind, ProviderPromptEvent,
@@ -56,9 +59,10 @@ use crate::provider_prompt::{
 use crate::{
     BINARY, CliContext, CliError, ProviderResumeImportArgs, SessionView, WorkdirSearchOptions,
     delete_session, glance_session, list_sessions, load_session_record, non_empty_env,
-    repo_remote_url_from_cwd, resolve_tmux_bin, resume_session_by_id, search_workdirs, send_input,
-    session_clipboard_buffer, session_dir, session_status, short_hostname,
-    start_provider_resume_session, start_session, update_session_title, write_session_attachment,
+    repo_remote_url_from_cwd, resolve_tmux_bin, resume_session_by_id, search_workdirs,
+    send_auto_resume_input, send_input_serialized, session_clipboard_buffer, session_dir,
+    session_status, short_hostname, start_provider_resume_session, start_session,
+    update_session_title, write_session_attachment,
 };
 
 const ATTACH_LIVE_FIFO_NAME: &str = "attach-live.fifo";
@@ -215,9 +219,12 @@ pub fn run_serve(context: &CliContext, args: cli::ServeArgs) -> i32 {
             state.machine
         );
         let app = router(state.clone());
+        let auto_resume_task = tokio::spawn(auto_resume_loop(state.clone()));
         let result = axum::serve(listener, app)
             .with_graceful_shutdown(shutdown_signal())
             .await;
+        auto_resume_task.abort();
+        let _ = auto_resume_task.await;
         state.attach_brokers.shutdown_all().await;
         match result {
             Ok(()) => exit::SUCCESS,
@@ -241,6 +248,12 @@ fn router(state: Arc<ServeState>) -> Router {
         .route("/sessions/{id}/buffer", get(buffer_handler))
         .route("/sessions/{id}/send", post(send_handler))
         .route("/sessions/{id}/resume", post(resume_handler))
+        .route(
+            "/sessions/{id}/auto-resume",
+            get(auto_resume_status_handler)
+                .put(auto_resume_set_handler)
+                .delete(auto_resume_cancel_handler),
+        )
         .route(
             "/sessions/{id}/attachments",
             post(upload_attachment_handler),
@@ -1370,6 +1383,8 @@ struct UsageProvider {
     windows: Vec<UsageWindow>,
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<UsageProviderError>,
+    #[serde(skip)]
+    fresh_authoritative: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -1588,6 +1603,7 @@ fn normalize_codex_usage(output: UsageHelperOutput) -> UsageProvider {
             reason_code,
             windows,
             error: None,
+            fresh_authoritative: false,
         };
     }
 
@@ -1620,6 +1636,14 @@ fn normalize_claude_usage(output: UsageHelperOutput) -> UsageProvider {
 
     let result = value.get("result").unwrap_or(&value);
     let reason_code = reason_from_helper_json(&value);
+    let fresh_authoritative = output.status_code == Some(0)
+        && value.get("ok").and_then(Value::as_bool) == Some(true)
+        && result
+            .get("source")
+            .and_then(Value::as_str)
+            .is_some_and(|source| matches!(source, "oauth" | "cli"))
+        && result.get("stale").and_then(Value::as_bool) == Some(false)
+        && reason_code.is_none();
     let reference_epoch = i64_field(result, &["updated_at", "updatedAt"]);
     let windows = windows_from_value(result, reference_epoch);
     if !windows.is_empty() {
@@ -1631,6 +1655,7 @@ fn normalize_claude_usage(output: UsageHelperOutput) -> UsageProvider {
             reason_code,
             windows,
             error: None,
+            fresh_authoritative,
         };
     }
 
@@ -1873,6 +1898,7 @@ fn provider_error_with_reason(
             code: code.to_string(),
             message: sanitize_helper_message(&message),
         }),
+        fresh_authoritative: false,
     }
 }
 
@@ -1983,6 +2009,11 @@ struct SendBody {
     text: Option<String>,
     #[serde(default)]
     keys: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AutoResumeBody {
+    enabled: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2220,6 +2251,173 @@ async fn send_handler(
         Ok(Ok(sent)) => envelope_ok(json!({ "machine": state.machine, "sent": sent })),
         Ok(Err(err)) => envelope_err(err),
         Err(_) => join_err(),
+    }
+}
+
+async fn auto_resume_status_handler(
+    State(state): State<Arc<ServeState>>,
+    AxPath(id): AxPath<String>,
+) -> Response {
+    let context = state.context.clone();
+    match tokio::task::spawn_blocking(move || {
+        let record = load_session_record(&context, &id)?;
+        Ok::<_, CliError>(auto_resume::view_for_record(&context, &record))
+    })
+    .await
+    {
+        Ok(Ok(view)) => envelope_ok(json!({ "machine": state.machine, "auto_resume": view })),
+        Ok(Err(err)) => envelope_err(err),
+        Err(_) => join_err(),
+    }
+}
+
+async fn auto_resume_set_handler(
+    State(state): State<Arc<ServeState>>,
+    headers: HeaderMap,
+    AxPath(id): AxPath<String>,
+    body: Result<Json<AutoResumeBody>, JsonRejection>,
+) -> Response {
+    if let Some(response) = deny_unauthorized(&state, &headers) {
+        return response;
+    }
+    let Json(body) = match body {
+        Ok(body) => body,
+        Err(_) => {
+            return envelope_err(CliError::usage(
+                "invalid-json-body",
+                "request body must be JSON with a boolean enabled field",
+                None,
+            ));
+        }
+    };
+    let context = state.context.clone();
+    let now = jiff::Timestamp::now().to_string();
+    match tokio::task::spawn_blocking(move || {
+        auto_resume::set_enabled(&context, &id, body.enabled, &now)
+    })
+    .await
+    {
+        Ok(Ok(view)) => envelope_ok(json!({ "machine": state.machine, "auto_resume": view })),
+        Ok(Err(err)) => envelope_err(err),
+        Err(_) => join_err(),
+    }
+}
+
+async fn auto_resume_cancel_handler(
+    State(state): State<Arc<ServeState>>,
+    headers: HeaderMap,
+    AxPath(id): AxPath<String>,
+) -> Response {
+    if let Some(response) = deny_unauthorized(&state, &headers) {
+        return response;
+    }
+    let context = state.context.clone();
+    let now = jiff::Timestamp::now().to_string();
+    match tokio::task::spawn_blocking(move || auto_resume::cancel(&context, &id, &now)).await {
+        Ok(Ok(view)) => envelope_ok(json!({ "machine": state.machine, "auto_resume": view })),
+        Ok(Err(err)) => envelope_err(err),
+        Err(_) => join_err(),
+    }
+}
+
+async fn auto_resume_loop(state: Arc<ServeState>) {
+    const POLL_INTERVAL: Duration = Duration::from_secs(15);
+    loop {
+        let now_epoch = jiff::Timestamp::now().as_second();
+        let context = state.context.clone();
+        let pending = match tokio::task::spawn_blocking(move || {
+            auto_resume::pending_sessions(&context, now_epoch)
+        })
+        .await
+        {
+            Ok(Ok(pending)) => pending,
+            Ok(Err(err)) => {
+                eprintln!("warning: auto-resume discovery failed: {}", err.code());
+                tokio::time::sleep(POLL_INTERVAL).await;
+                continue;
+            }
+            Err(_) => {
+                eprintln!("warning: auto-resume discovery worker failed");
+                tokio::time::sleep(POLL_INTERVAL).await;
+                continue;
+            }
+        };
+
+        for code in &pending.error_codes {
+            eprintln!("warning: auto-resume session state skipped: {code}");
+        }
+
+        if !pending.recovery_ids.is_empty() {
+            process_auto_resume_ids(
+                state.clone(),
+                pending.recovery_ids,
+                UsageSnapshot {
+                    authoritative: false,
+                    has_exhausted_windows: false,
+                    exhausted_reset_epochs: Vec::new(),
+                },
+            )
+            .await;
+        }
+        if !pending.usage_ids.is_empty() {
+            let timeout = usage_timeout();
+            let provider = tokio::task::spawn_blocking(move || collect_claude_usage(timeout))
+                .await
+                .unwrap_or_else(|_| provider_internal_error("claude", "Claude"));
+            let usage = UsageSnapshot {
+                authoritative: provider.fresh_authoritative,
+                has_exhausted_windows: provider
+                    .windows
+                    .iter()
+                    .any(|window| window.used_percent >= 100),
+                exhausted_reset_epochs: provider
+                    .windows
+                    .iter()
+                    .filter(|window| window.used_percent >= 100)
+                    .filter_map(|window| window.reset_at_epoch)
+                    .collect(),
+            };
+            process_auto_resume_ids(state.clone(), pending.usage_ids, usage).await;
+        }
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
+}
+
+async fn process_auto_resume_ids(state: Arc<ServeState>, ids: Vec<String>, usage: UsageSnapshot) {
+    const MAX_CONCURRENT_TICKS: usize = 4;
+    let mut tasks = JoinSet::new();
+    for id in ids {
+        let context = state.context.clone();
+        let tmux = state.tmux_bin.clone();
+        let usage = usage.clone();
+        tasks.spawn_blocking(move || {
+            let now_epoch = jiff::Timestamp::now().as_second();
+            if let Err(err) = auto_resume::tick(&context, &id, now_epoch, &usage, |record| {
+                send_auto_resume_input(&context, record, auto_resume::CONTINUATION_MESSAGE, &tmux)
+            }) {
+                eprintln!("warning: auto-resume tick failed: {}", err.code());
+                if let Err(record_err) =
+                    auto_resume::record_scheduler_error(&context, &id, now_epoch, "scheduler_error")
+                {
+                    eprintln!(
+                        "warning: auto-resume failure checkpoint failed: {}",
+                        record_err.code()
+                    );
+                }
+            }
+        });
+        if tasks.len() >= MAX_CONCURRENT_TICKS {
+            report_auto_resume_join(tasks.join_next().await);
+        }
+    }
+    while !tasks.is_empty() {
+        report_auto_resume_join(tasks.join_next().await);
+    }
+}
+
+fn report_auto_resume_join(result: Option<Result<(), tokio::task::JoinError>>) {
+    if result.is_some_and(|result| result.is_err()) {
+        eprintln!("warning: auto-resume worker failed");
     }
 }
 
@@ -3971,7 +4169,7 @@ async fn handle_input(
     let tmux = tmux.to_path_buf();
     let record = record.clone();
     let _ = tokio::task::spawn_blocking(move || {
-        send_input(&context, &record, text.as_deref(), &keys, &tmux)
+        send_input_serialized(&context, &record, text.as_deref(), &keys, &tmux)
     })
     .await;
 }
@@ -5656,6 +5854,8 @@ mod tests {
   "command": "usage",
   "ok": true,
   "result": {
+    "source": "cli",
+    "stale": false,
     "updated_at": 1783666800,
     "windows": [
       { "label": "5h", "used_percent": 3, "remaining_percent": 97, "resets_at": "2030-01-01T00:00:00Z" },
@@ -5672,6 +5872,7 @@ mod tests {
             timed_out: false,
         });
 
+        assert!(provider.fresh_authoritative);
         let value = serde_json::to_value(provider).unwrap();
         assert_eq!(value["ok"], true);
         assert_eq!(value["windows"][0]["reset_at"], "2030-01-01T00:00:00Z");
@@ -5739,6 +5940,29 @@ mod tests {
         assert_eq!(value["ok"], true);
         assert_eq!(value["windows"][0]["used_percent"], 20);
         assert_eq!(value["reason_code"], "organization_disabled");
+    }
+
+    #[test]
+    fn normalize_claude_usage_never_authorizes_stale_cached_windows() {
+        let provider = normalize_claude_usage(UsageHelperOutput {
+            status_code: Some(0),
+            stdout: br#"{
+  "schema_version": "claude-cli.usage.v1",
+  "command": "usage",
+  "ok": false,
+  "result": {
+    "source": "cache",
+    "stale": true,
+    "windows": [{"label": "5h", "used_percent": 20, "remaining_percent": 80}]
+  }
+}"#
+            .to_vec(),
+            stderr: Vec::new(),
+            timed_out: false,
+        });
+
+        assert!(!provider.fresh_authoritative);
+        assert_eq!(provider.windows.len(), 1);
     }
 
     #[test]
@@ -6103,6 +6327,19 @@ mod tests {
     fn patch_json(uri: &str, token: Option<&str>, body: Value) -> Request<Body> {
         let mut builder = Request::builder()
             .method("PATCH")
+            .uri(uri)
+            .header("content-type", "application/json");
+        if let Some(token) = token {
+            builder = builder.header("authorization", format!("Bearer {token}"));
+        }
+        builder
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap()
+    }
+
+    fn put_json(uri: &str, token: Option<&str>, body: Value) -> Request<Body> {
+        let mut builder = Request::builder()
+            .method("PUT")
             .uri(uri)
             .header("content-type", "application/json");
         if let Some(token) = token {
@@ -7662,6 +7899,133 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn auto_resume_control_is_authenticated_durable_and_projected() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        seed_session(tmp.path(), "claude-reset", "claude", "hs-claude-reset");
+        let st = state(tmp.path(), Some(TOKEN), minimal_tmux(tmp.path()));
+
+        let (status, body) = call(
+            router(st.clone()),
+            put_json(
+                "/sessions/claude-reset/auto-resume",
+                None,
+                json!({"enabled": true}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "body={body}");
+
+        let (status, body) = call(
+            router(st.clone()),
+            put_json(
+                "/sessions/claude-reset/auto-resume",
+                Some(TOKEN),
+                json!({"enabled": true}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "body={body}");
+        assert_eq!(body["data"]["auto_resume"]["enabled"], true);
+        assert_eq!(body["data"]["auto_resume"]["state"], "enabled");
+        assert_eq!(body["data"]["auto_resume"]["supported"], true);
+
+        let (status, body) = call(router(st.clone()), get("/sessions")).await;
+        assert_eq!(status, StatusCode::OK, "body={body}");
+        let projected = &body["data"]["sessions"][0]["auto_resume"];
+        assert_eq!(projected["enabled"], true);
+        assert_eq!(projected["state"], "enabled");
+        assert!(projected.get("blocked_turn_id").is_none());
+
+        let request = Request::builder()
+            .method("DELETE")
+            .uri("/sessions/claude-reset/auto-resume")
+            .header("authorization", format!("Bearer {TOKEN}"))
+            .body(Body::empty())
+            .unwrap();
+        let (status, body) = call(router(st.clone()), request).await;
+        assert_eq!(status, StatusCode::OK, "body={body}");
+        assert_eq!(body["data"]["auto_resume"]["enabled"], false);
+        assert_eq!(body["data"]["auto_resume"]["state"], "cancelled");
+
+        let persisted =
+            fs::read_to_string(tmp.path().join("sessions/claude-reset/auto-resume.json"))
+                .expect("durable auto-resume state");
+        assert!(!persisted.contains("prompt"));
+        assert!(!persisted.contains("transcript"));
+    }
+
+    #[tokio::test]
+    async fn auto_resume_put_authenticates_before_returning_stable_body_errors() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        seed_session(tmp.path(), "claude-reset", "claude", "hs-claude-reset");
+        let st = state(tmp.path(), Some(TOKEN), minimal_tmux(tmp.path()));
+        let uri = "/sessions/claude-reset/auto-resume";
+
+        let unauthenticated = Request::builder()
+            .method("PUT")
+            .uri(uri)
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from("{"))
+            .unwrap();
+        let (status, body) = call(router(st.clone()), unauthenticated).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "body={body}");
+        assert_eq!(body["error"]["code"], "unauthorized");
+
+        for (content_type, body_text) in [
+            (Some("application/json"), "{"),
+            (None, r#"{"enabled":true}"#),
+            (Some("application/json"), "{}"),
+            (Some("application/json"), r#"{"enabled":"yes"}"#),
+        ] {
+            let mut request = Request::builder()
+                .method("PUT")
+                .uri(uri)
+                .header(AUTHORIZATION, format!("Bearer {TOKEN}"));
+            if let Some(content_type) = content_type {
+                request = request.header(CONTENT_TYPE, content_type);
+            }
+            let (status, body) = call(
+                router(st.clone()),
+                request.body(Body::from(body_text)).unwrap(),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "body={body}");
+            assert_eq!(body["schema_version"], "cli.agent-session.serve.v1");
+            assert_eq!(body["error"]["code"], "invalid-json-body");
+        }
+
+        let unconfigured = state(tmp.path(), None, PathBuf::from("tmux"));
+        let request = Request::builder()
+            .method("PUT")
+            .uri(uri)
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from("{"))
+            .unwrap();
+        let (status, body) = call(router(unconfigured), request).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "body={body}");
+        assert_eq!(body["error"]["code"], "token-not-configured");
+    }
+
+    #[tokio::test]
+    async fn codex_auto_resume_fails_closed_without_authoritative_failure_signal() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        seed_session(tmp.path(), "codex-reset", "codex", "hs-codex-reset");
+        let st = state(tmp.path(), Some(TOKEN), minimal_tmux(tmp.path()));
+
+        let (status, body) = call(
+            router(st),
+            put_json(
+                "/sessions/codex-reset/auto-resume",
+                Some(TOKEN),
+                json!({"enabled": true}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "body={body}");
+        assert_eq!(body["error"]["code"], "auto-resume-unsupported");
     }
 
     // The WebSocket attach handler guards with the same `deny_unauthorized` as

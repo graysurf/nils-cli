@@ -33,11 +33,21 @@ Required fields:
 | `confidence` | `authoritative`, `observed`, or `inferred` |
 
 Optional allowlisted fields are `provider_session_id`, `provider_turn_id`,
-`attention_id`, `attention_kind`, `source_kind`, and `provider_time`. Unknown
+`failure_reason`, `attention_id`, `attention_kind`, `source_kind`, and
+`provider_time`. Unknown
 keys fail parsing. Identifiers are bounded, non-empty, and control-free.
 `attention_requested` requires an opaque correlation id and one of `approval`,
 `clarification`, `authentication`, or `other`; `attention_cleared` requires the
 matching id.
+
+`failure_reason` is valid only on an authoritative `turn_failed` event and is
+limited to `usage_exhausted`, `authentication`, `organization`, `billing`,
+`invalid_request`, `service`, `max_output_tokens`, or `unknown`. Claude Code's
+documented structured `StopFailure.error` is reduced into that allowlist. Raw
+error details, rendered provider errors, transcript paths, prompts, and
+assistant content are discarded. The current Codex interactive notification
+does not carry an equivalent structured failure field, so it cannot
+authoritatively arm usage-reset auto-resume.
 
 Provider hooks and direct `activity event` callers may supply bounded raw opaque
 session or turn identifiers. Ingestion projects them to runtime-scoped SHA-256

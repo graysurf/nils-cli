@@ -1,0 +1,9 @@
+{"provider":"claude","hook_event_name":"StopFailure","session_id":"claude-session","error":"rate_limit","expected":"usage_exhausted","arms":true}
+{"provider":"claude","hook_event_name":"StopFailure","session_id":"claude-session","error":"authentication_failed","expected":"authentication","arms":false}
+{"provider":"claude","hook_event_name":"StopFailure","session_id":"claude-session","error":"oauth_org_not_allowed","expected":"organization","arms":false}
+{"provider":"claude","hook_event_name":"StopFailure","session_id":"claude-session","error":"billing_error","expected":"billing","arms":false}
+{"provider":"claude","hook_event_name":"StopFailure","session_id":"claude-session","error":"server_error","expected":"service","arms":false}
+{"provider":"claude","hook_event_name":"StopFailure","session_id":"claude-session","error":"invalid_request","expected":"invalid_request","arms":false}
+{"provider":"claude","hook_event_name":"StopFailure","session_id":"claude-session","error":"max_output_tokens","expected":"max_output_tokens","arms":false}
+{"provider":"claude","hook_event_name":"StopFailure","session_id":"claude-session","error":"unknown","expected":"unknown","arms":false}
+{"provider":"codex","hook_event_name":"Stop","session_id":"codex-session","turn_id":"codex-turn","expected":null,"arms":false}
