@@ -327,6 +327,54 @@ fn tracking_run_init_rejects_unsafe_run_id_before_writes() {
 }
 
 #[test]
+fn tracking_run_init_rejects_unsafe_provider_repo_before_writes() {
+    let tmp = TempDir::new().expect("tmp");
+    let state_home = tmp.path().join("missing-state-home");
+    let escaped_issue_root = state_home.join("out/issue-123");
+    let options = common::plan_issue_cmd_options().with_env(
+        "PLAN_ISSUE_HOME",
+        state_home.to_str().expect("state home path"),
+    );
+
+    let out = common::run_plan_issue_with_options(
+        &[
+            "--format",
+            "json",
+            "tracking",
+            "run",
+            "init",
+            "--provider-repo",
+            "..",
+            "--issue",
+            "123",
+            "--now",
+            "2026-05-26T00:00:00Z",
+            "--run-id",
+            "safe-run",
+        ],
+        options,
+    );
+    assert_eq!(out.code, 1, "stdout: {}", out.stdout_text());
+    let envelope = out.stdout_json();
+    assert_eq!(envelope["error"]["code"], "tracking-run-init-layout-failed");
+    assert!(
+        envelope["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("invalid repo slug")),
+        "{}",
+        out.stdout_text()
+    );
+    assert!(
+        !state_home.exists(),
+        "unsafe provider repo must fail before creating the state root"
+    );
+    assert!(
+        !escaped_issue_root.exists(),
+        "unsafe provider repo must fail before creating an escaped issue root"
+    );
+}
+
+#[test]
 fn tracking_run_init_defaults_now_to_wallclock_when_now_omitted() {
     // Regression (issue #588): omitting `--now` must not write the 1970 epoch
     // placeholder into live run-state. The safe default is the current UTC time,
