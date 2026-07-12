@@ -29,6 +29,12 @@ if [[ ! -f "$script" ]]; then
   exit 2
 fi
 
+verify_script="$repo_root/.agents/skills/project-verify-required-checks/scripts/project-verify-required-checks.sh"
+if [[ ! -f "$verify_script" ]]; then
+  echo "error: missing required checks script: $verify_script" >&2
+  exit 2
+fi
+
 bash_bin="$(command -v bash)"
 tmp_dir="$(mktemp -d "${TMPDIR:-/tmp}/docs-hygiene-audit-test.XXXXXX")"
 trap 'rm -rf "$tmp_dir"' EXIT
@@ -49,10 +55,29 @@ run_audit() {
   local dir="$1" path_override="${2:-}"
   set +e
   if [[ -n "$path_override" ]]; then
-    audit_output="$(cd "$dir" && PATH="$path_override" "$bash_bin" "$script" --strict 2>&1)"
+    audit_output="$(cd "$dir" && DOCS_HYGIENE_TEST_ALLOW_MISSING_TARGETS=1 \
+      PATH="$path_override" "$bash_bin" "$script" --strict 2>&1)"
   else
-    audit_output="$(cd "$dir" && bash "$script" --strict 2>&1)"
+    audit_output="$(cd "$dir" && DOCS_HYGIENE_TEST_ALLOW_MISSING_TARGETS=1 \
+      bash "$script" --strict 2>&1)"
   fi
+  status=$?
+  set -e
+}
+
+run_audit_without_fixture_relaxation() {
+  local dir="$1"
+  set +e
+  audit_output="$(cd "$dir" && bash "$script" --strict 2>&1)"
+  status=$?
+  set -e
+}
+
+run_audit_with_inherited_nullglob() {
+  local dir="$1"
+  set +e
+  audit_output="$(cd "$dir" && env BASHOPTS=nullglob \
+    "$bash_bin" "$script" --strict 2>&1)"
   status=$?
   set -e
 }
@@ -89,6 +114,66 @@ printf '# alpha\n\nUnique payload one.\n' >"$clean_repo/docs/alpha.md"
 printf '# beta\n\nUnique payload two.\n' >"$clean_repo/docs/beta.md"
 assert_passes "distinct payloads pass" "$clean_repo"
 
+# Missing production scan targets must not inherit the partial-fixture
+# relaxation used by this black-box suite.
+echo "== missing audit target is fatal outside test mode =="
+run_audit_without_fixture_relaxation "$clean_repo"
+if [[ "$status" -ne 2 ]] \
+  || ! grep -qF "missing required audit path:" <<<"$audit_output"; then
+  fail "missing audit target is fatal outside test mode"
+fi
+if grep -qF "PASS: docs hygiene audit" <<<"$audit_output"; then
+  fail "missing audit target is fatal outside test mode: unexpected PASS marker"
+fi
+echo "ok"
+
+# An unmatched glob family is also a required production target. Populate all
+# literal targets while intentionally omitting every crates/*/docs/README.md so
+# this case isolates shell glob handling before rg_scan_existing.
+unmatched_glob_repo="$(make_repo unmatched-glob)"
+mkdir -p \
+  "$unmatched_glob_repo/docs/specs" \
+  "$unmatched_glob_repo/docs/runbooks" \
+  "$unmatched_glob_repo/crates/codex-cli/src" \
+  "$unmatched_glob_repo/crates/gemini-cli/src" \
+  "$unmatched_glob_repo/crates/macos-agent/src" \
+  "$unmatched_glob_repo/crates/api-testing-core/src/websocket" \
+  "$unmatched_glob_repo/crates/api-websocket/docs/specs" \
+  "$unmatched_glob_repo/crates/image-processing/src"
+printf '# binary dependencies\n' >"$unmatched_glob_repo/BINARY_DEPENDENCIES.md"
+printf '# macos agent\n' >"$unmatched_glob_repo/crates/macos-agent/README.md"
+printf '# image processing\n' >"$unmatched_glob_repo/crates/image-processing/README.md"
+printf '%s\n' '// codex fixture' >"$unmatched_glob_repo/crates/codex-cli/src/main.rs"
+printf '%s\n' '// gemini fixture' >"$unmatched_glob_repo/crates/gemini-cli/src/main.rs"
+printf '%s\n' '// macos fixture' >"$unmatched_glob_repo/crates/macos-agent/src/cli.rs"
+printf '%s\n' '// websocket fixture' \
+  >"$unmatched_glob_repo/crates/api-testing-core/src/websocket/schema.rs"
+printf '# websocket schema\n' \
+  >"$unmatched_glob_repo/crates/api-websocket/docs/specs/websocket-request-schema-v1.md"
+printf '%s\n' '// image fixture' >"$unmatched_glob_repo/crates/image-processing/src/lib.rs"
+
+echo "== unmatched audit glob is fatal outside test mode =="
+run_audit_without_fixture_relaxation "$unmatched_glob_repo"
+if [[ "$status" -ne 2 ]] \
+  || ! grep -qF "missing required audit path: crates/*/docs/README.md" <<<"$audit_output"; then
+  fail "unmatched audit glob is fatal outside test mode"
+fi
+if grep -qF "PASS: docs hygiene audit" <<<"$audit_output"; then
+  fail "unmatched audit glob is fatal outside test mode: unexpected PASS marker"
+fi
+echo "ok"
+
+echo "== inherited nullglob cannot erase required audit glob =="
+run_audit_with_inherited_nullglob "$unmatched_glob_repo"
+if [[ "$status" -ne 2 ]] \
+  || ! grep -qF "missing required audit path: crates/*/docs/README.md" <<<"$audit_output"; then
+  fail "inherited nullglob cannot erase required audit glob"
+fi
+if grep -qF "PASS: docs hygiene audit" <<<"$audit_output"; then
+  fail "inherited nullglob cannot erase required audit glob: unexpected PASS marker"
+fi
+echo "ok"
+
 # --- identical payloads across paths are flagged -----------------------------
 dup_repo="$(make_repo dup)"
 mkdir -p "$dup_repo/docs/nested"
@@ -124,6 +209,97 @@ for tool in git find xargs awk sort uniq rg sed grep; do
 done
 assert_fails "missing hash command is fatal" "$clean_repo" 1 \
   "missing required hash command" "$curated_bin"
+
+# --- ripgrep is a hard prerequisite -----------------------------------------
+# Keep every other command used by the clean audit available while omitting
+# only rg. The audit must reject the missing prerequisite before any scan and
+# must never emit its success marker.
+missing_rg_bin="$tmp_dir/missing-rg-bin"
+mkdir -p "$missing_rg_bin"
+for tool in git find xargs awk sort uniq shasum sha1sum; do
+  src="$(command -v "$tool" 2>/dev/null || true)"
+  [[ -n "$src" ]] && ln -s "$src" "$missing_rg_bin/$tool"
+done
+assert_fails "missing ripgrep is fatal before scanning" "$clean_repo" 2 \
+  "missing required tool on PATH: rg" "$missing_rg_bin"
+if grep -qF "PASS: docs hygiene audit" <<<"$audit_output"; then
+  fail "missing ripgrep is fatal before scanning: unexpected PASS marker"
+fi
+
+# A present rg binary can still fail to execute a scan. Exit 1 is the normal
+# no-match result, but exit 2+ must propagate instead of being erased by the
+# probes' historical `|| true` handling.
+printf '# fixture root\n' >"$clean_repo/README.md"
+failing_rg_bin="$tmp_dir/failing-rg-bin"
+mkdir -p "$failing_rg_bin"
+for tool in git find xargs awk sort uniq shasum sha1sum; do
+  src="$(command -v "$tool" 2>/dev/null || true)"
+  [[ -n "$src" ]] && ln -s "$src" "$failing_rg_bin/$tool"
+done
+cat >"$failing_rg_bin/rg" <<'STUB'
+#!/bin/sh
+exit 2
+STUB
+chmod +x "$failing_rg_bin/rg"
+assert_fails "ripgrep runtime failure is propagated" "$clean_repo" 2 \
+  "ripgrep scan failed (exit 2)" "$failing_rg_bin"
+if grep -qF "PASS: docs hygiene audit" <<<"$audit_output"; then
+  fail "ripgrep runtime failure is propagated: unexpected PASS marker"
+fi
+
+# A later optional-path probe must preserve the same diagnostic. These probes
+# historically redirected stderr to hide missing-path noise, but path filtering
+# now belongs to rg_scan_existing itself.
+late_failing_rg_bin="$tmp_dir/late-failing-rg-bin"
+mkdir -p "$late_failing_rg_bin"
+for tool in git find xargs awk sort uniq shasum sha1sum; do
+  src="$(command -v "$tool" 2>/dev/null || true)"
+  [[ -n "$src" ]] && ln -s "$src" "$late_failing_rg_bin/$tool"
+done
+cat >"$late_failing_rg_bin/rg" <<'STUB'
+#!/bin/sh
+case "$*" in
+  *'\blegacy\b'*) exit 2 ;;
+  *) exit 1 ;;
+esac
+STUB
+chmod +x "$late_failing_rg_bin/rg"
+mkdir -p "$clean_repo/docs/specs"
+printf '# late probe fixture\n' >"$clean_repo/docs/specs/late.md"
+assert_fails "late ripgrep failure keeps diagnostic" "$clean_repo" 2 \
+  "ripgrep scan failed (exit 2)" "$late_failing_rg_bin"
+if grep -qF "PASS: docs hygiene audit" <<<"$audit_output"; then
+  fail "late ripgrep failure keeps diagnostic: unexpected PASS marker"
+fi
+
+# The docs-only aggregate caller should fail at its own prerequisite boundary
+# instead of launching an audit that is known to require rg.
+verify_missing_rg_bin="$tmp_dir/verify-missing-rg-bin"
+mkdir -p "$verify_missing_rg_bin"
+for tool in git npx; do
+  src="$(command -v "$tool" 2>/dev/null || true)"
+  [[ -n "$src" ]] && ln -s "$src" "$verify_missing_rg_bin/$tool"
+done
+
+echo "== docs-only verifier preflights ripgrep =="
+set +e
+verify_output="$(cd "$repo_root" && PATH="$verify_missing_rg_bin" \
+  "$bash_bin" "$verify_script" --docs-only 2>&1)"
+verify_status=$?
+set -e
+if [[ "$verify_status" -ne 2 ]] \
+  || ! grep -qF "missing required tool on PATH: rg" <<<"$verify_output"; then
+  echo "FAIL: docs-only verifier preflights ripgrep"
+  echo "--- verifier output ---"
+  echo "$verify_output"
+  exit 1
+fi
+if grep -qF "+ bash scripts/ci/" <<<"$verify_output"; then
+  echo "FAIL: docs-only verifier started checks before rejecting missing rg"
+  echo "$verify_output"
+  exit 1
+fi
+echo "ok"
 
 echo
 echo "PASS: docs-hygiene-audit.test.sh"
