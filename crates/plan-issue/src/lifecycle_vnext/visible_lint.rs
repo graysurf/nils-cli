@@ -388,27 +388,51 @@ fn body_contains_review_disposition_row(body: &str) -> bool {
     let mut disposition_column = None;
     let mut fence = None;
     let mut in_html_comment = false;
+    let mut code_span_delimiter = None;
+    let lines = body.lines().collect::<Vec<_>>();
 
-    for line in body.lines() {
-        let raw_trimmed = line.trim();
+    for (line_index, line) in lines.iter().enumerate() {
         if let Some((opening_marker, opening_length)) = fence {
-            if markdown_fence(raw_trimmed).is_some_and(|(marker, length, remainder)| {
-                marker == opening_marker && length >= opening_length && remainder.trim().is_empty()
-            }) {
+            if is_markdown_fence_closer(line, opening_marker, opening_length) {
                 fence = None;
             }
             continue;
         }
 
-        let visible_line = strip_html_comments(line, &mut in_html_comment);
-        let trimmed = visible_line.trim();
-        if visible_line.starts_with("    ") || visible_line.starts_with('\t') {
+        if !in_html_comment && code_span_delimiter.is_none() {
+            if line.starts_with("    ") || line.starts_with('\t') {
+                pending_header = None;
+                disposition_column = None;
+                continue;
+            }
+            if let Some((marker, length)) = markdown_fence_opener(line) {
+                fence = Some((marker, length));
+                pending_header = None;
+                disposition_column = None;
+                continue;
+            }
+        }
+
+        let comment_was_open = in_html_comment;
+        let code_span_was_open = code_span_delimiter.is_some();
+        let visible_line = strip_html_comments(
+            line,
+            &lines[line_index + 1..],
+            &mut in_html_comment,
+            &mut code_span_delimiter,
+        );
+        if comment_was_open
+            || in_html_comment
+            || code_span_was_open
+            || code_span_delimiter.is_some()
+        {
             pending_header = None;
             disposition_column = None;
             continue;
         }
-        if let Some((marker, length, _)) = markdown_fence(trimmed) {
-            fence = Some((marker, length));
+
+        let trimmed = visible_line.trim();
+        if visible_line.starts_with("    ") || visible_line.starts_with('\t') {
             pending_header = None;
             disposition_column = None;
             continue;
@@ -462,10 +486,41 @@ fn markdown_fence(line: &str) -> Option<(char, usize, &str)> {
     (length >= 3).then_some((marker, length, &line[length..]))
 }
 
-fn strip_html_comments(line: &str, in_comment: &mut bool) -> String {
+fn markdown_fence_opener(line: &str) -> Option<(char, usize)> {
+    let candidate = markdown_after_fence_indent(line)?;
+    let (marker, length, remainder) = markdown_fence(candidate)?;
+    if marker == '`' && remainder.contains('`') {
+        return None;
+    }
+    Some((marker, length))
+}
+
+fn is_markdown_fence_closer(line: &str, opening_marker: char, opening_length: usize) -> bool {
+    let Some(candidate) = markdown_after_fence_indent(line) else {
+        return false;
+    };
+    markdown_fence(candidate).is_some_and(|(marker, length, remainder)| {
+        marker == opening_marker && length >= opening_length && remainder.trim().is_empty()
+    })
+}
+
+fn markdown_after_fence_indent(line: &str) -> Option<&str> {
+    let indentation = line.bytes().take_while(|byte| *byte == b' ').count();
+    if indentation > 3 {
+        return None;
+    }
+    let candidate = &line[indentation..];
+    (!candidate.starts_with('\t')).then_some(candidate)
+}
+
+fn strip_html_comments(
+    line: &str,
+    future_lines: &[&str],
+    in_comment: &mut bool,
+    code_span_delimiter: &mut Option<usize>,
+) -> String {
     let mut visible = String::with_capacity(line.len());
     let mut index = 0;
-    let mut code_span_delimiter = None;
 
     while index < line.len() {
         let remainder = &line[index..];
@@ -486,11 +541,14 @@ fn strip_html_comments(line: &str, in_comment: &mut bool) -> String {
         if remainder.starts_with('`') {
             let length = remainder.bytes().take_while(|byte| *byte == b'`').count();
             visible.push_str(&remainder[..length]);
-            code_span_delimiter = match code_span_delimiter {
-                Some(opening_length) if opening_length == length => None,
-                None => Some(length),
-                current => current,
-            };
+            if code_span_delimiter.is_some_and(|opening_length| opening_length == length) {
+                *code_span_delimiter = None;
+            } else if code_span_delimiter.is_none()
+                && !is_backslash_escaped(line, index)
+                && has_matching_code_span_delimiter(&remainder[length..], future_lines, length)
+            {
+                *code_span_delimiter = Some(length);
+            }
             index += length;
             continue;
         }
@@ -506,6 +564,54 @@ fn strip_html_comments(line: &str, in_comment: &mut bool) -> String {
     }
 
     visible
+}
+
+fn is_backslash_escaped(line: &str, index: usize) -> bool {
+    line[..index]
+        .bytes()
+        .rev()
+        .take_while(|byte| *byte == b'\\')
+        .count()
+        % 2
+        == 1
+}
+
+fn has_matching_code_span_delimiter(
+    current_remainder: &str,
+    future_lines: &[&str],
+    delimiter_length: usize,
+) -> bool {
+    if contains_backtick_run(current_remainder, delimiter_length) {
+        return true;
+    }
+    for line in future_lines {
+        if line.trim().is_empty() || markdown_fence_opener(line).is_some() {
+            break;
+        }
+        if contains_backtick_run(line, delimiter_length) {
+            return true;
+        }
+    }
+    false
+}
+
+fn contains_backtick_run(text: &str, delimiter_length: usize) -> bool {
+    let bytes = text.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] != b'`' {
+            index += 1;
+            continue;
+        }
+        let start = index;
+        while index < bytes.len() && bytes[index] == b'`' {
+            index += 1;
+        }
+        if index - start == delimiter_length {
+            return true;
+        }
+    }
+    false
 }
 
 fn is_markdown_table_separator(cells: &[&str]) -> bool {
