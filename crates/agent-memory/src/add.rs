@@ -29,7 +29,7 @@ pub(crate) fn run(layout: &Layout, args: &AddArgs) -> Result<i32, CliError> {
     }
 
     let scope = args.scope.as_deref().unwrap_or("global");
-    let dir = layout.resolve_scope(Some(scope));
+    let dir = layout.resolve_scope(Some(scope))?;
     if !dir.is_dir() {
         return Err(CliError::runtime(format!(
             "not found: {}",

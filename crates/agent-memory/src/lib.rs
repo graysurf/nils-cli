@@ -1,8 +1,10 @@
 mod add;
+mod candidate;
 mod check;
 mod cli;
 mod completion;
 mod frontmatter;
+mod recall;
 mod search;
 
 use std::env;
@@ -76,7 +78,7 @@ fn dispatch(cli: Cli) -> Result<i32, CliError> {
         Command::Path(args) => {
             println!(
                 "{}",
-                display_path(&layout.resolve_scope(args.scope.as_deref()))
+                display_path(&layout.resolve_scope(args.scope.as_deref())?)
             );
             Ok(EXIT_OK)
         }
@@ -95,6 +97,8 @@ fn dispatch(cli: Cli) -> Result<i32, CliError> {
         Command::Check(args) => check::run(&layout, &args),
         Command::Add(args) => add::run(&layout, &args),
         Command::Search(args) => search::run(&layout, &args),
+        Command::Recall(args) => recall::run(&layout, &args),
+        Command::Candidate(args) => candidate::run(&layout, &args),
         Command::Completion(args) => Ok(completion::run(args.shell)),
         Command::Help => print_help(),
     }
@@ -171,14 +175,33 @@ impl Layout {
         self.root.join("personas")
     }
 
-    fn resolve_scope(&self, scope: Option<&str>) -> PathBuf {
-        match scope.unwrap_or("root") {
-            "" | "root" => self.root.clone(),
-            "global" => self.global_dir(),
-            value if value.starts_with("agents/") || value.starts_with("personas/") => {
-                self.root.join(value)
+    fn profiles_dir(&self) -> PathBuf {
+        self.root.join("profiles")
+    }
+
+    fn candidates_dir(&self) -> PathBuf {
+        self.root.join("candidates")
+    }
+
+    fn resolve_scope(&self, scope: Option<&str>) -> Result<PathBuf, CliError> {
+        let value = scope.unwrap_or("root");
+        match value {
+            "" | "root" => Ok(self.root.clone()),
+            "global" => Ok(self.global_dir()),
+            value if value.contains('/') => {
+                let Some((prefix, id)) = value.split_once('/') else {
+                    return Err(CliError::usage(format!("invalid scope: '{value}'")));
+                };
+                if !matches!(prefix, "agents" | "personas" | "profiles" | "candidates") {
+                    return Err(CliError::usage(format!("invalid scope prefix: '{prefix}'")));
+                }
+                validate_id(id)?;
+                Ok(self.root.join(prefix).join(id))
             }
-            value => self.agents_dir().join(value),
+            value => {
+                validate_id(value)?;
+                Ok(self.agents_dir().join(value))
+            }
         }
     }
 }
@@ -200,8 +223,8 @@ fn file_mtime_secs(path: &Path) -> Option<u64> {
         .map(|d| d.as_secs())
 }
 
-/// Enumerate every memory scope that holds notes: global, each agent, and each
-/// persona's `memory/` directory. Shared by `check --all` and `search --all`.
+/// Enumerate curated/profile memory scopes. Candidate roots are deliberately
+/// excluded because they contain opaque, untrusted proposal data.
 pub(crate) fn memory_scopes(layout: &Layout) -> Result<Vec<(String, PathBuf)>, CliError> {
     let mut scopes = Vec::new();
 
@@ -231,13 +254,21 @@ pub(crate) fn memory_scopes(layout: &Layout) -> Result<Vec<(String, PathBuf)>, C
         }
     }
 
+    let profiles = layout.profiles_dir();
+    if profiles.is_dir() {
+        for dir in child_dirs(&profiles)? {
+            if let Some(name) = dir_name(&dir) {
+                scopes.push((format!("profiles/{name}"), dir));
+            }
+        }
+    }
+
     Ok(scopes)
 }
 
 /// Enumerate the memory scopes a user can pass as a `SCOPE` argument, for shell
 /// completion: the two well-known roots (`root`, `global`) followed by each
-/// registered `agents/<id>` and `personas/<id>`. Reuses the same store layout
-/// and `child_dirs` enumeration the `agents`/`personas` subcommands rely on.
+/// registered agent, persona, profile, and candidate producer scopes.
 ///
 /// This runs at TAB time inside the dynamic completer, so it must never panic
 /// or block: any resolution or I/O failure yields the well-known roots (or an
@@ -252,6 +283,8 @@ pub(crate) fn scope_completion_values() -> Vec<String> {
     for (dir, prefix) in [
         (layout.agents_dir(), "agents"),
         (layout.personas_dir(), "personas"),
+        (layout.profiles_dir(), "profiles"),
+        (layout.candidates_dir(), "candidates"),
     ] {
         if !dir.is_dir() {
             continue;
@@ -271,7 +304,7 @@ pub(crate) fn scope_completion_values() -> Vec<String> {
 
 fn list_scope(layout: &Layout, args: &ListArgs) -> Result<i32, CliError> {
     let scope = args.scope.as_deref().unwrap_or("global");
-    let path = layout.resolve_scope(Some(scope));
+    let path = layout.resolve_scope(Some(scope))?;
     require_dir(&path)?;
 
     let format = if args.json {
@@ -333,7 +366,7 @@ fn list_scope(layout: &Layout, args: &ListArgs) -> Result<i32, CliError> {
 }
 
 fn index_scope(layout: &Layout, args: &ScopeArgs) -> Result<i32, CliError> {
-    let path = layout.resolve_scope(args.scope.as_deref().or(Some("global")));
+    let path = layout.resolve_scope(args.scope.as_deref().or(Some("global")))?;
     require_dir(&path)?;
 
     let index = path.join("MEMORY.md");
@@ -472,6 +505,14 @@ fn print_env(layout: &Layout) {
         "export AGENT_MEMORY_PERSONAS={}",
         shell_escape(&display_path(&layout.personas_dir()))
     );
+    println!(
+        "export AGENT_MEMORY_PROFILES={}",
+        shell_escape(&display_path(&layout.profiles_dir()))
+    );
+    println!(
+        "export AGENT_MEMORY_CANDIDATES={}",
+        shell_escape(&display_path(&layout.candidates_dir()))
+    );
 }
 
 fn doctor(layout: &Layout) -> Result<i32, CliError> {
@@ -509,6 +550,8 @@ fn doctor(layout: &Layout) -> Result<i32, CliError> {
 
     print_dir_count("agents/", &layout.agents_dir())?;
     print_dir_count("personas/", &layout.personas_dir())?;
+    print_dir_count("profiles/", &layout.profiles_dir())?;
+    print_dir_count("candidates/", &layout.candidates_dir())?;
 
     if failed {
         Ok(EXIT_RUNTIME)
@@ -544,14 +587,14 @@ fn require_dir(path: &Path) -> Result<(), CliError> {
     }
 }
 
-fn validate_id(id: &str) -> Result<(), CliError> {
-    if id.is_empty() || id.contains('/') || id == "." || id == ".." {
+pub(crate) fn validate_id(id: &str) -> Result<(), CliError> {
+    if id.is_empty() || id == "." || id == ".." || id.contains(['/', '\\']) {
         return Err(CliError::usage(format!("invalid id: '{id}'")));
     }
     Ok(())
 }
 
-fn markdown_files(path: &Path) -> Result<Vec<PathBuf>, CliError> {
+pub(crate) fn markdown_files(path: &Path) -> Result<Vec<PathBuf>, CliError> {
     let mut files = Vec::new();
     for entry in fs::read_dir(path)
         .map_err(|err| CliError::runtime(format!("failed to read {}: {err}", display_path(path))))?
@@ -559,7 +602,10 @@ fn markdown_files(path: &Path) -> Result<Vec<PathBuf>, CliError> {
         let entry =
             entry.map_err(|err| CliError::runtime(format!("failed to read entry: {err}")))?;
         let path = entry.path();
-        if path.is_file() && path.extension().is_some_and(|ext| ext == "md") {
+        let metadata = fs::symlink_metadata(&path).map_err(|err| {
+            CliError::runtime(format!("failed to inspect {}: {err}", display_path(&path)))
+        })?;
+        if metadata.is_file() && path.extension().is_some_and(|ext| ext == "md") {
             files.push(path);
         }
     }

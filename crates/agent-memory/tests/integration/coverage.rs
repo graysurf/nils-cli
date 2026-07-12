@@ -330,6 +330,8 @@ fn dynamic_completion_enumerates_live_scopes() {
     fs::create_dir_all(tmp.path().join("agents/alpha")).expect("agent alpha");
     fs::create_dir_all(tmp.path().join("agents/beta")).expect("agent beta");
     fs::create_dir_all(tmp.path().join("personas/reviewer/memory")).expect("persona reviewer");
+    fs::create_dir_all(tmp.path().join("profiles/startup")).expect("startup profile");
+    fs::create_dir_all(tmp.path().join("candidates/codex")).expect("codex candidates");
 
     // Drive the clap_complete `CompleteEnv` runtime completer directly: with
     // `COMPLETE=zsh` set and the cursor on the `SCOPE` positional, the binary
@@ -358,6 +360,8 @@ fn dynamic_completion_enumerates_live_scopes() {
         "agents/alpha",
         "agents/beta",
         "personas/reviewer",
+        "profiles/startup",
+        "candidates/codex",
     ] {
         assert!(
             stdout.lines().any(|line| line == expected),

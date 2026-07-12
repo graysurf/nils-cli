@@ -14,6 +14,8 @@ ${AGENT_MEMORY_HOME:-${XDG_CONFIG_HOME:-$HOME/.config}/agent-memory}
 ```text
 agent-memory/
 |-- global/
+|-- profiles/<id>/
+|-- candidates/<producer>/
 |-- agents/<id>/
 `-- personas/<id>/
 ```
@@ -31,17 +33,31 @@ agent-memory init-persona <id>
 agent-memory resolve <id>
 agent-memory env
 agent-memory doctor
-agent-memory check [SCOPE] [--all] [--strict] [--format text|json]
+agent-memory check [SCOPE] [--all] [--strict] \
+  [--max-index-bytes <bytes>] [--forbid-terms-file <path>] \
+  [--format text|json]
 agent-memory add [SCOPE] --name <slug> --type <t> --description <text> \
   [--title <text>] [--hook <text>] [--body <text>|-] [--body-file <path>] \
   [--session-id <uuid>] [--format text|json]
 agent-memory list [SCOPE] [--type <t>] [--format text|json]
 agent-memory search <term> [SCOPE] [--all] [--format text|json]
+agent-memory recall startup [--max-bytes <bytes>] [--format text|json]
+agent-memory recall on-demand <term> [--format text|json]
+agent-memory recall candidates [producer] [--format text|json]
+agent-memory candidate add <producer> --name <slug> \
+  [--title <text>] [--hook <text>] [--body <text>|-] \
+  [--body-file <path>] [--format text|json]
+agent-memory candidate list [producer] [--format text|json]
+agent-memory candidate promote <producer> <slug> --type <t> \
+  --description <text> [--title <text>] [--hook <text>] \
+  [--session-id <uuid>] [--apply] [--format text|json]
 agent-memory completion zsh
 ```
 
-`SCOPE` accepts `root`, `global`, `<id>`, `agents/<id>`, or `personas/<id>`.
-Bare IDs resolve to `agents/<id>`.
+`SCOPE` accepts `root`, `global`, `<id>`, `agents/<id>`, `personas/<id>`,
+`profiles/<id>`, or `candidates/<producer>`. Bare IDs resolve to
+`agents/<id>`. IDs must remain one path component; traversal separators and
+unknown prefixes are rejected.
 
 ## Structural check
 
@@ -54,6 +70,11 @@ integrity* (default scope `global`, `--all` to sweep every scope):
 - note frontmatter schema — `name`, `description`, and `metadata.type` (one of
   `user | feedback | project | reference`) are required; `metadata.node_type`
   and `metadata.originSessionId` are expected (warn).
+- optional index byte budget (`--max-index-bytes`) — reports actual and maximum
+  bytes as an error when `MEMORY.md` is too large;
+- optional exact forbidden-term audit (`--forbid-terms-file`) — reads one term
+  per line from a regular, non-symlink file and reports scope, file, line, and
+  matching term. Blank lines and `#` comments are ignored.
 
 `--format json` emits machine-readable findings (each carrying `{scope, kind,
 file, detail, severity}`, under a `schema_version` envelope; `--json` is a
@@ -80,6 +101,33 @@ filenames, including `MEMORY.md`) is unchanged.
 `--all` scopes, printing `scope/file:line: text`. It exits `0` when there are
 matches and `1` when there are none.
 
+## Recall profiles
+
+`recall startup` reads only `profiles/startup/MEMORY.md`, treats the payload as
+untrusted memory data, and fails closed when the file exceeds 3,072 bytes by
+default. `--max-bytes` can set a stricter or explicitly configured boundary.
+It never falls back to `global/MEMORY.md`.
+
+`recall on-demand <term>` searches curated `global/*.md` notes only and does
+not emit the full global index. `recall candidates [producer]` lists opaque
+proposal files under producer-isolated candidate roots and labels the result
+untrusted.
+
+## Candidate lifecycle
+
+`candidate add` creates or reuses `candidates/<producer>/`, writes one opaque
+proposal file, and updates its candidate index. Candidate bodies do not need
+canonical frontmatter because provider-native memory may use its own format.
+Candidate roots, indexes, source files, and body-file inputs reject symlinks.
+
+`candidate promote` is non-mutating unless `--apply` is present. The preview
+validates the producer, source, destination, canonical type, and both indexes,
+then reports the planned move. Apply wraps the source, destination, global
+index, and candidate index in a rollback transaction: it creates a canonical
+global note, appends the curated index line, removes the candidate index line,
+and removes the source only when every replacement succeeds. Duplicate global
+slugs, traversal, symlinks, and stale transaction paths fail closed.
+
 ## Output
 
 Human-readable output is the default and mirrors the original shell contract.
@@ -89,6 +137,7 @@ Primary command output goes to stdout; errors go to stderr.
 
 - `0`: success
 - `1`: runtime failure, missing scope, missing `MEMORY.md`, or failed doctor
+  (also no match for on-demand recall)
 - `64`: command-line usage error
 
 ## Docs

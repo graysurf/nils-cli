@@ -81,6 +81,12 @@ struct ScopeReport {
 }
 
 pub(crate) fn run(layout: &Layout, args: &CheckArgs) -> Result<i32, CliError> {
+    let forbidden_terms = args
+        .forbid_terms_file
+        .as_deref()
+        .map(read_forbidden_terms)
+        .transpose()?
+        .unwrap_or_default();
     let targets = if args.all {
         crate::memory_scopes(layout)?
     } else {
@@ -90,7 +96,7 @@ pub(crate) fn run(layout: &Layout, args: &CheckArgs) -> Result<i32, CliError> {
 
     let mut reports = Vec::new();
     for (label, dir) in targets {
-        let findings = check_scope(&label, &dir)?;
+        let findings = check_scope(&label, &dir, args.max_index_bytes, &forbidden_terms)?;
         reports.push(ScopeReport {
             scope: label,
             findings,
@@ -125,7 +131,7 @@ fn count_severity(reports: &[ScopeReport], severity: Severity) -> usize {
 
 /// Resolve a single scope to the directory that holds its `MEMORY.md`.
 fn resolve_target(layout: &Layout, scope: &str) -> Result<(String, PathBuf), CliError> {
-    let dir = layout.resolve_scope(Some(scope));
+    let dir = layout.resolve_scope(Some(scope))?;
     if !dir.is_dir() {
         return Err(CliError::runtime(format!(
             "not found: {}",
@@ -144,12 +150,51 @@ fn dir_name(path: &Path) -> Option<String> {
         .map(|name| name.to_string_lossy().into_owned())
 }
 
-fn check_scope(scope: &str, dir: &Path) -> Result<Vec<Finding>, CliError> {
+fn check_scope(
+    scope: &str,
+    dir: &Path,
+    max_index_bytes: Option<usize>,
+    forbidden_terms: &[String],
+) -> Result<Vec<Finding>, CliError> {
     let mut findings = Vec::new();
 
     let index_path = dir.join("MEMORY.md");
-    let index_links: BTreeSet<String> = if index_path.is_file() {
-        extract_index_links(&read_file(&index_path)?)
+    let index_metadata = fs::symlink_metadata(&index_path).ok();
+    let index_links: BTreeSet<String> = if index_metadata
+        .as_ref()
+        .is_some_and(|metadata| metadata.is_file() && !metadata.file_type().is_symlink())
+    {
+        let contents = read_file(&index_path)?;
+        if let Some(maximum) = max_index_bytes {
+            let actual = contents.len();
+            if actual > maximum {
+                findings.push(Finding::error(
+                    scope,
+                    "index-byte-budget-exceeded",
+                    "MEMORY.md",
+                    format!("index is {actual} bytes; maximum is {maximum} bytes"),
+                ));
+            }
+        }
+        check_forbidden_terms(
+            scope,
+            "MEMORY.md",
+            &contents,
+            forbidden_terms,
+            &mut findings,
+        );
+        extract_index_links(&contents)
+    } else if index_metadata
+        .as_ref()
+        .is_some_and(|metadata| metadata.file_type().is_symlink())
+    {
+        findings.push(Finding::error(
+            scope,
+            "index-symlink",
+            "MEMORY.md",
+            format!("MEMORY.md must not be a symlink in {}", display_path(dir)),
+        ));
+        BTreeSet::new()
     } else {
         findings.push(Finding::error(
             scope,
@@ -178,7 +223,22 @@ fn check_scope(scope: &str, dir: &Path) -> Result<Vec<Finding>, CliError> {
         }
     }
     for link in &index_links {
-        if !dir.join(link).is_file() {
+        let linked_path = dir.join(link);
+        let linked_metadata = fs::symlink_metadata(&linked_path).ok();
+        if linked_metadata
+            .as_ref()
+            .is_some_and(|metadata| metadata.file_type().is_symlink())
+        {
+            findings.push(Finding::error(
+                scope,
+                "index-unsafe-link",
+                link.clone(),
+                "MEMORY.md link resolves to a symlink",
+            ));
+        } else if !linked_metadata
+            .as_ref()
+            .is_some_and(|metadata| metadata.is_file())
+        {
             findings.push(Finding::error(
                 scope,
                 "index-broken-link",
@@ -193,6 +253,7 @@ fn check_scope(scope: &str, dir: &Path) -> Result<Vec<Finding>, CliError> {
         let name = dir_name(note_path).unwrap_or_default();
         let contents = read_file(note_path)?;
         check_frontmatter(scope, &name, &contents, &mut findings);
+        check_forbidden_terms(scope, &name, &contents, forbidden_terms, &mut findings);
         for target in extract_wikilinks(&contents) {
             if !dir.join(format!("{target}.md")).is_file() {
                 findings.push(Finding::warn(
@@ -206,6 +267,62 @@ fn check_scope(scope: &str, dir: &Path) -> Result<Vec<Finding>, CliError> {
     }
 
     Ok(findings)
+}
+
+fn read_forbidden_terms(path: &str) -> Result<Vec<String>, CliError> {
+    let path = Path::new(path);
+    let metadata = fs::symlink_metadata(path).map_err(|err| {
+        CliError::runtime(format!(
+            "failed to inspect forbidden terms file {}: {err}",
+            display_path(path)
+        ))
+    })?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(CliError::runtime(format!(
+            "forbidden terms file must be a regular, non-symlink file: {}",
+            display_path(path)
+        )));
+    }
+    let contents = fs::read_to_string(path).map_err(|err| {
+        CliError::runtime(format!(
+            "failed to read forbidden terms file {}: {err}",
+            display_path(path)
+        ))
+    })?;
+    let terms: Vec<String> = contents
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .map(ToOwned::to_owned)
+        .collect();
+    if terms.is_empty() {
+        return Err(CliError::usage(format!(
+            "forbidden terms file contains no terms: {}",
+            display_path(path)
+        )));
+    }
+    Ok(terms)
+}
+
+fn check_forbidden_terms(
+    scope: &str,
+    file: &str,
+    contents: &str,
+    terms: &[String],
+    findings: &mut Vec<Finding>,
+) {
+    for (line_index, line) in contents.lines().enumerate() {
+        for term in terms {
+            if line.contains(term) {
+                findings.push(Finding::error(
+                    scope,
+                    "forbidden-term",
+                    file,
+                    format!("line {} contains forbidden term '{term}'", line_index + 1),
+                ));
+            }
+        }
+    }
 }
 
 fn read_file(path: &Path) -> Result<String, CliError> {
