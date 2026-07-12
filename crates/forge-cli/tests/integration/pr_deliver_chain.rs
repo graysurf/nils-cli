@@ -1087,6 +1087,11 @@ fn pr_deliver_prevalidated_labels_keep_the_initial_provider_context() {
     assert_eq!(out.code, 0, "stdout={}\nstderr={}", out.stdout, out.stderr);
     let envelope = parse_envelope(&out.stdout);
     assert_eq!(envelope["data"]["provider"], "github");
+    assert_eq!(
+        git_output(&repo_path, &["remote", "get-url", "origin"]),
+        "https://gitlab.com/sympoies/nils-cli.git",
+        "provider mutation tripwire did not run"
+    );
 }
 
 #[test]
