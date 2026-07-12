@@ -338,11 +338,22 @@ impl RunRoot {
         issue_number: u64,
         run_id: impl Into<String>,
     ) -> Result<Self, runtime_layout::RuntimeLayoutError> {
+        let run_id = run_id.into();
+        let mut components = Path::new(&run_id).components();
+        let is_single_normal_component = matches!(
+            (components.next(), components.next()),
+            (Some(std::path::Component::Normal(_)), None)
+        );
+        if run_id.trim().is_empty()
+            || run_id.contains('/')
+            || run_id.contains('\\')
+            || run_id.contains('\0')
+            || !is_single_normal_component
+        {
+            return Err(runtime_layout::RuntimeLayoutError::InvalidRunId { run_id });
+        }
         let issue_root = IssueRoot::new(repo_slug, issue_number)?;
-        Ok(Self {
-            issue_root,
-            run_id: run_id.into(),
-        })
+        Ok(Self { issue_root, run_id })
     }
 
     pub fn issue_root(&self) -> &IssueRoot {
@@ -504,5 +515,28 @@ mod tests {
                 .to_string_lossy()
                 .ends_with("runs/20260526-run-1/events.jsonl")
         );
+    }
+
+    #[test]
+    fn tracking_run_state_runroot_rejects_unsafe_run_id_segments() {
+        for run_id in [
+            "",
+            "   ",
+            ".",
+            "..",
+            "../escape",
+            "nested/run",
+            "nested\\run",
+            "/absolute",
+            "nul\0segment",
+        ] {
+            assert!(
+                matches!(
+                    RunRoot::new("owner__repo", 123, run_id),
+                    Err(runtime_layout::RuntimeLayoutError::InvalidRunId { .. })
+                ),
+                "unsafe run id accepted: {run_id:?}"
+            );
+        }
     }
 }

@@ -2321,6 +2321,9 @@ fn run_tracking_run_init(
         .run_id
         .clone()
         .unwrap_or_else(|| default_run_id(args.issue, &now));
+    let repo_slug = runtime_layout::repo_slug(&args.provider_repo);
+    let root = RunRoot::new(&repo_slug, args.issue, run_id.clone())
+        .map_err(|err| CommandError::runtime("tracking-run-init-layout-failed", err.to_string()))?;
     let mut run = ExecutionRun::new(
         run_id.clone(),
         args.provider_repo.clone(),
@@ -2361,10 +2364,6 @@ fn run_tracking_run_init(
             .unwrap_or_else(|| PathBuf::from("events.jsonl"));
         (out.clone(), events_path)
     } else {
-        let repo_slug = runtime_layout::repo_slug(&args.provider_repo);
-        let root = RunRoot::new(&repo_slug, args.issue, run_id.clone()).map_err(|err| {
-            CommandError::runtime("tracking-run-init-layout-failed", err.to_string())
-        })?;
         if !dry_run {
             root.ensure_layout().map_err(|err| {
                 CommandError::runtime("tracking-run-init-mkdir-failed", err.to_string())

@@ -187,6 +187,146 @@ fn tracking_run_init_dry_run_does_not_create_missing_layout() {
 }
 
 #[test]
+fn tracking_run_init_dry_run_does_not_create_canonical_layout() {
+    let tmp = TempDir::new().expect("tmp");
+    let state_home = tmp.path().join("missing-state-home");
+    let options = common::plan_issue_cmd_options().with_env(
+        "PLAN_ISSUE_HOME",
+        state_home.to_str().expect("state home path"),
+    );
+
+    let preview = common::run_plan_issue_with_options(
+        &[
+            "--format",
+            "json",
+            "--dry-run",
+            "tracking",
+            "run",
+            "init",
+            "--provider-repo",
+            "owner/repo",
+            "--issue",
+            "123",
+            "--now",
+            "2026-05-26T00:00:00Z",
+            "--run-id",
+            "canonical-preview",
+        ],
+        options,
+    );
+    assert_eq!(preview.code, 0, "preview stderr: {}", preview.stderr_text());
+
+    let envelope = preview.stdout_json();
+    assert_eq!(envelope["payload"]["dry_run"], true);
+    let result = &envelope["payload"]["result"];
+    assert_eq!(result["dry_run"], true);
+    assert_eq!(result["run_id"], "canonical-preview");
+    let run_state_path =
+        std::path::PathBuf::from(result["run_state_path"].as_str().expect("run_state_path"));
+    let events_path =
+        std::path::PathBuf::from(result["events_path"].as_str().expect("events_path"));
+    let run_root = run_state_path.parent().expect("run root");
+    assert_eq!(events_path.parent(), Some(run_root));
+    assert_eq!(
+        run_state_path.file_name().and_then(|v| v.to_str()),
+        Some("run-state.json")
+    );
+    assert_eq!(
+        events_path.file_name().and_then(|v| v.to_str()),
+        Some("events.jsonl")
+    );
+    assert!(run_state_path.starts_with(&state_home));
+    assert!(
+        !state_home.exists(),
+        "dry-run must not create the canonical state root"
+    );
+    for child in ["inputs", "rendered", "artifacts"] {
+        assert!(
+            !run_root.join(child).exists(),
+            "dry-run must not create canonical {child} directory"
+        );
+    }
+}
+
+#[test]
+fn tracking_run_init_rejects_unsafe_run_id_before_writes() {
+    let tmp = TempDir::new().expect("tmp");
+    let state_home = tmp.path().join("missing-state-home");
+    let escaped_run = tmp.path().join("escaped-run");
+    let options = common::plan_issue_cmd_options().with_env(
+        "PLAN_ISSUE_HOME",
+        state_home.to_str().expect("state home path"),
+    );
+
+    let out = common::run_plan_issue_with_options(
+        &[
+            "--format",
+            "json",
+            "tracking",
+            "run",
+            "init",
+            "--provider-repo",
+            "owner/repo",
+            "--issue",
+            "123",
+            "--now",
+            "2026-05-26T00:00:00Z",
+            "--run-id",
+            escaped_run.to_str().expect("escaped run path"),
+        ],
+        options,
+    );
+    assert_eq!(out.code, 1, "stdout: {}", out.stdout_text());
+    let envelope = out.stdout_json();
+    assert_eq!(envelope["error"]["code"], "tracking-run-init-layout-failed");
+    assert!(
+        envelope["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("invalid run id")),
+        "{}",
+        out.stdout_text()
+    );
+    assert!(
+        !state_home.exists(),
+        "unsafe run id must fail before creating the canonical state root"
+    );
+    assert!(
+        !escaped_run.exists(),
+        "unsafe run id must fail before creating an escaped run root"
+    );
+
+    let explicit_out = tmp.path().join("explicit-output/run-state.json");
+    let explicit = common::run_plan_issue_with_options(
+        &[
+            "--format",
+            "json",
+            "tracking",
+            "run",
+            "init",
+            "--provider-repo",
+            "owner/repo",
+            "--issue",
+            "123",
+            "--now",
+            "2026-05-26T00:00:00Z",
+            "--run-id",
+            "../escape",
+            "--out",
+            explicit_out.to_str().expect("explicit out path"),
+        ],
+        common::plan_issue_cmd_options().with_env(
+            "PLAN_ISSUE_HOME",
+            state_home.to_str().expect("state home path"),
+        ),
+    );
+    assert_eq!(explicit.code, 1, "stdout: {}", explicit.stdout_text());
+    assert!(
+        !explicit_out.parent().expect("explicit parent").exists(),
+        "unsafe run id must be rejected even when --out supplies the output path"
+    );
+}
+
+#[test]
 fn tracking_run_init_defaults_now_to_wallclock_when_now_omitted() {
     // Regression (issue #588): omitting `--now` must not write the 1970 epoch
     // placeholder into live run-state. The safe default is the current UTC time,

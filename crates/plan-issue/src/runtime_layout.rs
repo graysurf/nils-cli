@@ -32,6 +32,8 @@ pub enum RuntimeLayoutError {
     InvalidRepoSlug { slug: String },
     /// Task id is empty or contains a path separator.
     InvalidTaskId { task_id: String },
+    /// Run id is not exactly one safe path component.
+    InvalidRunId { run_id: String },
 }
 
 impl fmt::Display for RuntimeLayoutError {
@@ -42,6 +44,9 @@ impl fmt::Display for RuntimeLayoutError {
             }
             Self::InvalidTaskId { task_id } => {
                 write!(f, "invalid task id `{task_id}` for runtime layout")
+            }
+            Self::InvalidRunId { run_id } => {
+                write!(f, "invalid run id `{run_id}` for runtime layout")
             }
         }
     }
