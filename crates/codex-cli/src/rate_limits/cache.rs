@@ -182,6 +182,9 @@ pub fn write_prompt_segment_cache(
     fetched_at_epoch: i64,
     values: &render::WeeklyValues,
 ) -> Result<()> {
+    if values.weekly.is_none() && values.non_weekly.is_none() {
+        anyhow::bail!("codex-rate-limits: refusing to write empty window cache");
+    }
     let cache_file = cache_file_for_target(target_file)?;
     if let Some(parent) = cache_file.parent() {
         fs::create_dir_all(parent)?;
@@ -558,6 +561,34 @@ mod tests {
         assert_eq!(entry.non_weekly_reset_epoch, Some(1700003600));
         assert_eq!(entry.weekly_remaining, Some(12));
         assert_eq!(entry.weekly_reset_epoch, Some(1700600000));
+    }
+
+    #[test]
+    fn write_cache_rejects_empty_windows_without_replacing_existing_data() {
+        let lock = GlobalStateLock::new();
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let secret_dir = dir.path().join("secrets");
+        let cache_root = dir.path().join("cache");
+        fs::create_dir_all(&secret_dir).expect("secret dir");
+        fs::create_dir_all(&cache_root).expect("cache root");
+        let _env = set_cache_env(&lock, &secret_dir, &cache_root);
+
+        let target = secret_dir.join("alpha.json");
+        fs::write(&target, "{}").expect("write target");
+        let values = complete_weekly_values("5h", 91, 12, 1_700_600_000, None);
+        write_prompt_segment_cache(&target, 1, &values).expect("seed cache");
+        let cache_file = cache_file_for_target(&target).expect("cache path");
+        let before = fs::read_to_string(&cache_file).expect("read cache");
+
+        let empty = render::WeeklyValues {
+            weekly: None,
+            non_weekly: None,
+        };
+        let err = write_prompt_segment_cache(&target, 2, &empty)
+            .expect_err("empty windows must not replace cache");
+
+        assert!(err.to_string().contains("refusing to write empty"));
+        assert_eq!(fs::read_to_string(cache_file).expect("read cache"), before);
     }
 
     #[test]

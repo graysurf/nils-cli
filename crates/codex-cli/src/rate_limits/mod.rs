@@ -545,7 +545,7 @@ fn collect_json_result_for_secret(
                         reason_code: None,
                         summary: Some(summary),
                         windows: Some(windows),
-                        raw_usage: Some(redact_sensitive_json(&usage.json)),
+                        raw_usage: Some(project_safe_usage_json(&usage.json)),
                         error: None,
                     }
                 }
@@ -568,7 +568,7 @@ fn collect_json_result_for_secret(
                     "invalid-usage-payload",
                     "codex-rate-limits: invalid usage payload".to_string(),
                     Some(serde_json::json!({
-                        "raw_usage": redact_sensitive_json(&usage.json),
+                        "raw_usage": project_safe_usage_json(&usage.json),
                     })),
                 ),
             }
@@ -808,35 +808,73 @@ fn remaining_to_used_percent(remaining: i64) -> i64 {
     (100 - remaining).clamp(0, 100)
 }
 
-fn redact_sensitive_json(value: &Value) -> Value {
-    match value {
-        Value::Object(map) => {
-            let mut next = serde_json::Map::new();
-            for (key, val) in map {
-                if is_sensitive_key(key) {
-                    continue;
-                }
-                next.insert(key.clone(), redact_sensitive_json(val));
-            }
-            Value::Object(next)
-        }
-        Value::Array(items) => Value::Array(items.iter().map(redact_sensitive_json).collect()),
-        _ => value.clone(),
+fn project_safe_usage_json(value: &Value) -> Value {
+    let Some(source) = value.as_object() else {
+        return Value::Object(serde_json::Map::new());
+    };
+    let mut projected = serde_json::Map::new();
+    if let Some(plan_type) = source
+        .get("plan_type")
+        .and_then(Value::as_str)
+        .filter(|value| is_safe_plan_type(value))
+    {
+        projected.insert(
+            "plan_type".to_string(),
+            Value::String(plan_type.to_string()),
+        );
     }
+    for key in ["rate_limit", "code_review_rate_limit"] {
+        if let Some(rate_limit) = source.get(key)
+            && let Some(safe) = project_safe_rate_limit(rate_limit)
+        {
+            projected.insert(key.to_string(), safe);
+        }
+    }
+    Value::Object(projected)
 }
 
-fn is_sensitive_key(key: &str) -> bool {
+fn is_safe_plan_type(value: &str) -> bool {
     matches!(
-        key,
-        "access_token"
-            | "refresh_token"
-            | "id_token"
-            | "authorization"
-            | "Authorization"
-            | "user_id"
-            | "account_id"
-            | "email"
+        value,
+        "free" | "go" | "plus" | "pro" | "team" | "business" | "enterprise" | "edu"
     )
+}
+
+fn project_safe_rate_limit(value: &Value) -> Option<Value> {
+    if value.is_null() {
+        return Some(Value::Null);
+    }
+    let source = value.as_object()?;
+    let mut projected = serde_json::Map::new();
+    for key in ["allowed", "limit_reached"] {
+        if let Some(value) = source.get(key).and_then(Value::as_bool) {
+            projected.insert(key.to_string(), Value::Bool(value));
+        }
+    }
+    for key in ["primary_window", "secondary_window"] {
+        if let Some(window) = source.get(key)
+            && let Some(safe) = project_safe_window(window)
+        {
+            projected.insert(key.to_string(), safe);
+        }
+    }
+    Some(Value::Object(projected))
+}
+
+fn project_safe_window(value: &Value) -> Option<Value> {
+    if value.is_null() {
+        return Some(Value::Null);
+    }
+    let source = value.as_object()?;
+    let mut projected = serde_json::Map::new();
+    for key in ["limit_window_seconds", "used_percent", "reset_at"] {
+        if let Some(value) = source.get(key)
+            && value.is_number()
+        {
+            projected.insert(key.to_string(), value.clone());
+        }
+    }
+    Some(Value::Object(projected))
 }
 
 #[derive(Default)]
@@ -1767,15 +1805,12 @@ fn run_all_mode(args: &RateLimitsOptions, cached_mode: bool, debug_mode: bool) -
         }
 
         let mut row = Row::empty(secret_name.trim_end_matches(".json").to_string());
-        let output =
-            match single_one_line(&secret_file, cached_mode, args.no_refresh_auth, debug_mode) {
-                Ok(Some(line)) => line,
-                Ok(None) => String::new(),
-                Err(_) => String::new(),
-            };
+        let one_line = single_one_line(&secret_file, cached_mode, args.no_refresh_auth, debug_mode)
+            .unwrap_or_default();
+        let output = one_line.line.unwrap_or_default();
 
         if output.is_empty() {
-            if !cached_mode {
+            if !cached_mode && !one_line.no_window {
                 rc = 1;
             }
             rows.push(row);
@@ -2088,7 +2123,7 @@ fn run_single_mode(
                     "codex-rate-limits: invalid usage payload",
                     Some(serde_json::json!({
                         "target_file": target_file.display().to_string(),
-                        "raw_usage": redact_sensitive_json(&usage.json),
+                        "raw_usage": project_safe_usage_json(&usage.json),
                     })),
                 )?;
             } else {
@@ -2121,7 +2156,7 @@ fn run_single_mode(
             reason_code: None,
             summary: Some(summary_from_weekly_values(&weekly)),
             windows: Some(windows),
-            raw_usage: Some(redact_sensitive_json(&usage.json)),
+            raw_usage: Some(project_safe_usage_json(&usage.json)),
             error: None,
         };
         diag_output::emit_json(&RateLimitSingleEnvelope {
@@ -2228,32 +2263,41 @@ fn emit_single_no_window(target_file: &Path, output_json: bool, one_line: bool) 
     Ok(0)
 }
 
+#[derive(Default)]
+struct SingleOneLineResult {
+    line: Option<String>,
+    no_window: bool,
+}
+
 fn single_one_line(
     target_file: &Path,
     cached_mode: bool,
     no_refresh_auth: bool,
     debug_mode: bool,
-) -> Result<Option<String>> {
+) -> Result<SingleOneLineResult> {
     if !target_file.is_file() {
         if debug_mode {
             eprintln!("codex-rate-limits: target file not found");
         }
-        return Ok(None);
+        return Ok(SingleOneLineResult::default());
     }
 
     if cached_mode {
         return match cache::read_cache_entry_for_cached_mode(target_file) {
-            Ok(entry) => Ok(format_one_line_output(
-                entry.non_weekly_label.as_deref(),
-                entry.non_weekly_remaining,
-                entry.weekly_remaining,
-                entry.weekly_reset_epoch,
-            )),
+            Ok(entry) => Ok(SingleOneLineResult {
+                line: format_one_line_output(
+                    entry.non_weekly_label.as_deref(),
+                    entry.non_weekly_remaining,
+                    entry.weekly_remaining,
+                    entry.weekly_reset_epoch,
+                ),
+                no_window: false,
+            }),
             Err(err) => {
                 if debug_mode {
                     eprintln!("{err}");
                 }
-                Ok(None)
+                Ok(SingleOneLineResult::default())
             }
         };
     }
@@ -2278,7 +2322,7 @@ fn single_one_line(
             if debug_mode {
                 eprintln!("{err}");
             }
-            return Ok(None);
+            return Ok(SingleOneLineResult::default());
         }
     };
 
@@ -2291,23 +2335,42 @@ fn single_one_line(
 
     let usage_data = match render::parse_usage(&usage.json) {
         Some(value) => value,
-        None => return Ok(None),
+        None => return Ok(SingleOneLineResult::default()),
     };
     let values = render::render_values(&usage_data);
     let weekly = render::weekly_values(&values);
+    if weekly.weekly.is_none() && weekly.non_weekly.is_none() {
+        let line = cache::read_cache_entry_allow_stale(target_file)
+            .ok()
+            .and_then(|read| {
+                format_one_line_output(
+                    read.entry.non_weekly_label.as_deref(),
+                    read.entry.non_weekly_remaining,
+                    read.entry.weekly_remaining,
+                    read.entry.weekly_reset_epoch,
+                )
+            });
+        return Ok(SingleOneLineResult {
+            line,
+            no_window: true,
+        });
+    }
     let fetched_at_epoch = Utc::now().timestamp();
     if fetched_at_epoch > 0 {
         let _ = cache::write_prompt_segment_cache(target_file, fetched_at_epoch, &weekly);
     }
-    Ok(format_one_line_output(
-        weekly
-            .non_weekly
-            .as_ref()
-            .map(|window| window.label.as_str()),
-        weekly.non_weekly.as_ref().map(|window| window.remaining),
-        weekly.weekly.as_ref().map(|window| window.remaining),
-        weekly.weekly.as_ref().map(|window| window.reset_epoch),
-    ))
+    Ok(SingleOneLineResult {
+        line: format_one_line_output(
+            weekly
+                .non_weekly
+                .as_ref()
+                .map(|window| window.label.as_str()),
+            weekly.non_weekly.as_ref().map(|window| window.remaining),
+            weekly.weekly.as_ref().map(|window| window.remaining),
+            weekly.weekly.as_ref().map(|window| window.reset_epoch),
+        ),
+        no_window: false,
+    })
 }
 
 fn resolve_target(secret: Option<&str>) -> std::result::Result<PathBuf, i32> {
@@ -2443,7 +2506,7 @@ mod tests {
         async_fetch_one_line, cache, collect_json_from_cache, collect_secret_files,
         collect_secret_files_for_async_text, current_secret_basename, env_timeout,
         fetch_one_line_cached, is_auth_file, normalize_one_line, parse_one_line_output,
-        redact_sensitive_json, render, resolve_target, secret_display_name, single_one_line,
+        project_safe_usage_json, render, resolve_target, secret_display_name, single_one_line,
         sync_auth_silent, target_file_name,
     };
     use chrono::Utc;
@@ -2502,8 +2565,18 @@ mod tests {
     }
 
     #[test]
-    fn redact_sensitive_json_removes_tokens_recursively() {
+    fn project_safe_usage_json_keeps_only_known_usage_fields() {
         let input = json!({
+            "plan_type": "pro",
+            "rate_limit": {
+                "allowed": true,
+                "primary_window": {
+                    "limit_window_seconds": 604800,
+                    "used_percent": 12,
+                    "reset_at": 1700600000,
+                    "email": "private@example.com"
+                }
+            },
             "tokens": {
                 "access_token": "a",
                 "refresh_token": "b",
@@ -2519,24 +2592,20 @@ mod tests {
             "safe": true
         });
 
-        let redacted = redact_sensitive_json(&input);
-        assert_eq!(redacted["tokens"]["nested"]["ok"], 1);
-        assert_eq!(redacted["safe"], true);
-        assert!(
-            redacted["tokens"].get("access_token").is_none(),
-            "access_token should be removed"
+        let projected = project_safe_usage_json(&input);
+        assert_eq!(projected["plan_type"], "pro");
+        assert_eq!(projected["rate_limit"]["allowed"], true);
+        assert_eq!(
+            projected["rate_limit"]["primary_window"]["limit_window_seconds"],
+            604800
         );
+        assert!(projected.get("tokens").is_none());
+        assert!(projected.get("items").is_none());
+        assert!(projected.get("safe").is_none());
         assert!(
-            redacted["tokens"]["nested"].get("id_token").is_none(),
-            "id_token should be removed"
-        );
-        assert!(
-            redacted["tokens"]["nested"].get("Authorization").is_none(),
-            "Authorization should be removed"
-        );
-        assert!(
-            redacted["items"][0].get("authorization").is_none(),
-            "authorization should be removed"
+            projected["rate_limit"]["primary_window"]
+                .get("email")
+                .is_none()
         );
     }
 
@@ -2779,14 +2848,14 @@ mod tests {
             .expect("write cache");
 
         let hit = single_one_line(&alpha, true, true, false).expect("single");
-        assert!(hit.expect("line").contains("3h:61%"));
+        assert!(hit.line.expect("line").contains("3h:61%"));
 
         let miss = single_one_line(&beta, true, true, true).expect("single");
-        assert!(miss.is_none());
+        assert!(miss.line.is_none());
 
         let missing =
             single_one_line(&secret_dir.join("missing.json"), true, true, true).expect("single");
-        assert!(missing.is_none());
+        assert!(missing.line.is_none());
     }
 
     #[test]

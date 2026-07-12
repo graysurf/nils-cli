@@ -18,6 +18,9 @@ pub fn write_weekly(target_file: &Path, usage_json: &Value) -> Result<()> {
     };
     let values = render::render_values(&usage);
     let weekly = render::weekly_values(&values);
+    if weekly.weekly.is_none() && weekly.non_weekly.is_none() {
+        return Ok(());
+    }
     if weekly
         .weekly
         .as_ref()

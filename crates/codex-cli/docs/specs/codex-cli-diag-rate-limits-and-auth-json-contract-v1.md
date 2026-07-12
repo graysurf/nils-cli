@@ -69,8 +69,10 @@ Sensitive data rule:
 - Never emit local secrets/tokens (`access_token`, `refresh_token`, raw auth headers, private keys)
   in either success or failure payloads. Status payloads may expose boolean presence
   flags such as `has_oauth_access_token`; they must not expose the token value.
-- `diag rate-limits` also removes upstream identity fields (`email`, `user_id`, and
-  `account_id`) from informational `raw_usage` before serializing the response.
+- `diag rate-limits` emits only an allowlisted usage projection in informational
+  `raw_usage`: a known plan type, safe rate-limit booleans, and numeric window
+  fields. Arbitrary upstream identity, credential, and additive fields are not
+  forwarded.
 
 ## Stable vs Informational Fields
 
@@ -121,7 +123,7 @@ absent window are `null` (reset fields may be omitted). Consumers must not infer
 
 Informational (do not hard-depend for schema validation):
 
-- `raw_usage` (upstream payload passthrough; shape may evolve)
+- `raw_usage` (allowlisted upstream usage projection; shape may evolve)
 - Optional additive metadata (`source`, timestamps, debugging hints)
 - Human-display-oriented strings inside `error.details`
 

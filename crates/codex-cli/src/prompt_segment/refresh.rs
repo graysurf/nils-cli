@@ -94,6 +94,9 @@ fn fetch_and_write_cache(target_file: &Path) -> anyhow::Result<prompt_segment_re
         render::parse_usage(&usage.json).ok_or_else(|| anyhow::anyhow!("invalid usage payload"))?;
     let values = render::render_values(&usage_data);
     let weekly = render::weekly_values(&values);
+    if weekly.weekly.is_none() && weekly.non_weekly.is_none() {
+        anyhow::bail!("no active rate-limit window");
+    }
 
     let fetched_at_epoch = Utc::now().timestamp();
     if fetched_at_epoch > 0 {

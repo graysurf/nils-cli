@@ -606,6 +606,75 @@ const NULL_RATE_LIMIT_BODY: &str = r#"{
   "additional_rate_limits": null
 }"#;
 
+const EMPTY_RATE_LIMIT_OBJECT_BODY: &str = r#"{
+  "plan_type": "pro",
+  "rate_limit": {
+    "primary_window": null,
+    "secondary_window": null
+  }
+}"#;
+
+#[test]
+fn rate_limits_async_empty_window_object_preserves_fallback_cache_and_metadata() {
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let secret_dir = dir.path().join("secrets");
+    fs::create_dir_all(&secret_dir).expect("secret dir");
+    let secret_file = secret_dir.join("alpha.json");
+    let secret_json = r#"{
+  "tokens": {"access_token":"tok-alpha","account_id":"acct_001"},
+  "codex_rate_limits": {
+    "weekly_reset_at_epoch": 1700600000,
+    "weekly_reset_at": "2023-11-21T20:53:20Z",
+    "weekly_fetched_at": "2023-11-14T22:13:20Z",
+    "non_weekly_reset_at_epoch": 1700003600,
+    "non_weekly_reset_at": "2023-11-14T23:13:20Z"
+  }
+}"#;
+    fs::write(&secret_file, secret_json).expect("write alpha");
+
+    let cache_root = dir.path().join("cache_root");
+    let kv_path = cache_kv_path(&cache_root, "alpha");
+    fs::create_dir_all(kv_path.parent().expect("cache parent")).expect("cache dir");
+    let cache = "fetched_at=1700000000\nnon_weekly_label=5h\nnon_weekly_remaining=91\nnon_weekly_reset_epoch=1700003600\nweekly_remaining=70\nweekly_reset_epoch=1700600000\n";
+    fs::write(&kv_path, cache).expect("write alpha cache");
+
+    let server = LoopbackServer::new().expect("server");
+    server.add_route(
+        "GET",
+        "/wham/usage",
+        HttpResponse::new(200, EMPTY_RATE_LIMIT_OBJECT_BODY),
+    );
+
+    let output = run(
+        &["diag", "rate-limits", "--async"],
+        &[
+            ("CODEX_SECRET_DIR", &secret_dir),
+            ("ZSH_CACHE_DIR", &cache_root),
+        ],
+        &[
+            ("CODEX_CHATGPT_BASE_URL", &server.url()),
+            ("CODEX_RATE_LIMITS_DEFAULT_ALL_ENABLED", "false"),
+        ],
+    );
+
+    assert_exit(&output, 0);
+    let out = stdout(&output);
+    assert!(out.contains("91%"), "expected cached 5h value, got:\n{out}");
+    assert!(
+        out.contains("70%"),
+        "expected cached weekly value, got:\n{out}"
+    );
+    assert!(
+        out.contains("(stale)"),
+        "expected stale marker, got:\n{out}"
+    );
+    assert_eq!(
+        fs::read_to_string(&secret_file).expect("read alpha"),
+        secret_json
+    );
+    assert_eq!(fs::read_to_string(&kv_path).expect("read cache"), cache);
+}
+
 #[test]
 fn rate_limits_async_text_null_payload_serves_stale_cache() {
     let dir = tempfile::TempDir::new().expect("tempdir");

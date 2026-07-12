@@ -163,6 +163,9 @@ fn wham_usage_weekly_only_body() -> String {
   "user_id": "user-private",
   "account_id": "account-private",
   "email": "private@example.com",
+  "EMAIL": "private-alias@example.com",
+  "api_key": "private-api-key",
+  "nested": { "organization_id": "private-org" },
   "plan_type": "pro",
   "rate_limit": {
     "allowed": true,
@@ -172,6 +175,40 @@ fn wham_usage_weekly_only_body() -> String {
   }
 }"#
     .to_string()
+}
+
+fn wham_usage_non_weekly_only_body() -> String {
+    r#"{
+  "plan_type": "pro",
+  "rate_limit": {
+    "allowed": true,
+    "limit_reached": false,
+    "primary_window": null,
+    "secondary_window": { "limit_window_seconds": 18000, "used_percent": 9, "reset_at": 1700003600 }
+  }
+}"#
+    .to_string()
+}
+
+fn wham_usage_empty_windows_body() -> String {
+    r#"{
+  "plan_type": "pro",
+  "rate_limit": {
+    "primary_window": null,
+    "secondary_window": null
+  }
+}"#
+    .to_string()
+}
+
+fn json_contains_key(value: &Value, needle: &str) -> bool {
+    match value {
+        Value::Object(map) => {
+            map.contains_key(needle) || map.values().any(|value| json_contains_key(value, needle))
+        }
+        Value::Array(items) => items.iter().any(|value| json_contains_key(value, needle)),
+        _ => false,
+    }
 }
 
 fn cache_kv_path(cache_root: &Path, key: &str) -> PathBuf {
@@ -441,7 +478,78 @@ fn rate_limits_single_json_accepts_weekly_only_and_redacts_identity() {
             "diagnostic output leaked private identity: {private}"
         );
     }
+    for sensitive_key in [
+        "user_id",
+        "account_id",
+        "email",
+        "EMAIL",
+        "api_key",
+        "organization_id",
+    ] {
+        assert!(
+            !json_contains_key(&result["raw_usage"], sensitive_key),
+            "diagnostic output retained sensitive key: {sensitive_key}"
+        );
+    }
     assert_eq!(result["raw_usage"]["plan_type"], "pro");
+}
+
+#[test]
+fn rate_limits_single_json_accepts_non_weekly_only_and_clears_weekly_cache() {
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let secrets = dir.path().join("secrets");
+    fs::create_dir_all(&secrets).expect("secrets dir");
+    write_secret(&secrets, "alpha.json", Some("tok"));
+
+    let cache_root = dir.path().join("cache_root");
+    let kv_path = cache_kv_path(&cache_root, "alpha");
+    fs::create_dir_all(kv_path.parent().expect("cache parent")).expect("cache dir");
+    fs::write(
+        &kv_path,
+        "fetched_at=1\nnon_weekly_label=5h\nnon_weekly_remaining=1\nweekly_remaining=2\nweekly_reset_epoch=1700600000\n",
+    )
+    .expect("stale cache");
+
+    let server = LoopbackServer::new().expect("server");
+    server.add_route(
+        "GET",
+        "/wham/usage",
+        HttpResponse::new(200, wham_usage_non_weekly_only_body()),
+    );
+
+    let output = run(
+        &["diag", "rate-limits", "--json", "alpha.json"],
+        &[
+            ("CODEX_SECRET_DIR", &secrets),
+            ("ZSH_CACHE_DIR", &cache_root),
+        ],
+        &[
+            ("CODEX_CHATGPT_BASE_URL", &server.url()),
+            ("CODEX_RATE_LIMITS_DEFAULT_ALL_ENABLED", "false"),
+        ],
+    );
+
+    assert_exit(&output, 0);
+    let payload: Value = serde_json::from_str(&stdout(&output)).expect("json");
+    let result = &payload["result"];
+    assert_eq!(result["windows"].as_array().expect("windows").len(), 1);
+    assert_eq!(result["windows"][0]["label"], "5h");
+    assert_eq!(result["windows"][0]["remaining_percent"], 91);
+    assert_eq!(result["summary"]["non_weekly_remaining"], 91);
+    assert!(result["summary"]["weekly_remaining"].is_null());
+
+    let cache = fs::read_to_string(&kv_path).expect("cache");
+    assert!(cache.contains("non_weekly_remaining=91"));
+    assert!(
+        !cache
+            .lines()
+            .any(|line| line.starts_with("weekly_remaining="))
+    );
+    assert!(
+        !cache
+            .lines()
+            .any(|line| line.starts_with("weekly_reset_epoch="))
+    );
 }
 
 #[test]
@@ -695,6 +803,97 @@ fn rate_limits_all_mode_renders_table() {
     assert!(out.contains("alpha"));
     assert!(out.contains("beta"));
     assert!(out.contains("+00:00"));
+}
+
+#[test]
+fn rate_limits_all_mode_renders_weekly_only_without_stale_non_weekly_data() {
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let secrets = dir.path().join("secrets");
+    fs::create_dir_all(&secrets).expect("secrets dir");
+    write_secret(&secrets, "alpha.json", Some("tok_a"));
+    write_secret(&secrets, "beta.json", Some("tok_b"));
+
+    let cache_root = dir.path().join("cache_root");
+    fs::create_dir_all(&cache_root).expect("cache root");
+
+    let server = LoopbackServer::new().expect("server");
+    server.add_route(
+        "GET",
+        "/wham/usage",
+        HttpResponse::new(200, wham_usage_weekly_only_body()),
+    );
+
+    let output = run(
+        &["diag", "rate-limits", "--all"],
+        &[
+            ("CODEX_SECRET_DIR", &secrets),
+            ("ZSH_CACHE_DIR", &cache_root),
+        ],
+        &[
+            ("CODEX_CHATGPT_BASE_URL", &server.url()),
+            ("CODEX_RATE_LIMITS_DEFAULT_ALL_ENABLED", "false"),
+            ("TZ", "UTC"),
+            ("NO_COLOR", "1"),
+        ],
+    );
+
+    assert_exit(&output, 0);
+    let out = stdout(&output);
+    assert!(out.contains("alpha"));
+    assert!(out.contains("beta"));
+    assert!(out.contains("Weekly"));
+    assert!(out.contains("79%"), "expected weekly usage, got:\n{out}");
+    assert!(!out.contains("5h"), "unexpected non-weekly usage:\n{out}");
+    assert!(!out.contains("stale"), "unexpected stale marker:\n{out}");
+}
+
+#[test]
+fn rate_limits_all_mode_empty_windows_serves_preserved_cache() {
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let secrets = dir.path().join("secrets");
+    fs::create_dir_all(&secrets).expect("secrets dir");
+    let secret_file = write_secret(&secrets, "alpha.json", Some("tok_a"));
+    let before_secret = fs::read_to_string(&secret_file).expect("secret");
+
+    let cache_root = dir.path().join("cache_root");
+    let kv_path = cache_kv_path(&cache_root, "alpha");
+    fs::create_dir_all(kv_path.parent().expect("cache parent")).expect("cache dir");
+    let cache = "fetched_at=1\nnon_weekly_label=5h\nnon_weekly_remaining=91\nnon_weekly_reset_epoch=1700003600\nweekly_remaining=70\nweekly_reset_epoch=1700600000\n";
+    fs::write(&kv_path, cache).expect("cache");
+
+    let server = LoopbackServer::new().expect("server");
+    server.add_route(
+        "GET",
+        "/wham/usage",
+        HttpResponse::new(200, wham_usage_empty_windows_body()),
+    );
+
+    let output = run(
+        &["diag", "rate-limits", "--all"],
+        &[
+            ("CODEX_SECRET_DIR", &secrets),
+            ("ZSH_CACHE_DIR", &cache_root),
+        ],
+        &[
+            ("CODEX_CHATGPT_BASE_URL", &server.url()),
+            ("CODEX_RATE_LIMITS_DEFAULT_ALL_ENABLED", "false"),
+            ("TZ", "UTC"),
+            ("NO_COLOR", "1"),
+        ],
+    );
+
+    assert_exit(&output, 0);
+    let out = stdout(&output);
+    assert!(
+        out.contains("91%"),
+        "expected cached non-weekly usage:\n{out}"
+    );
+    assert!(out.contains("70%"), "expected cached weekly usage:\n{out}");
+    assert_eq!(
+        fs::read_to_string(&secret_file).expect("secret"),
+        before_secret
+    );
+    assert_eq!(fs::read_to_string(&kv_path).expect("cache"), cache);
 }
 
 #[test]
