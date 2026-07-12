@@ -8,6 +8,8 @@
 use std::collections::{BTreeSet, VecDeque};
 use std::env;
 use std::fs;
+use std::io::Read;
+use std::os::fd::AsRawFd;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::os::unix::process::CommandExt;
@@ -425,11 +427,56 @@ pub(crate) fn thread_handoff_path(record: &SessionRecord) -> Option<&Path> {
 
 pub(crate) struct CreateBootstrapGuard {
     path: PathBuf,
+    file: fs::File,
 }
 
 impl Drop for CreateBootstrapGuard {
     fn drop(&mut self) {
         let _ = fs::remove_file(&self.path);
+    }
+}
+
+impl CreateBootstrapGuard {
+    pub(crate) fn finish(self, release_lifecycle_lock: impl FnOnce()) {
+        if lock_bootstrap_file(&self.file) {
+            release_lifecycle_lock();
+            let _ = fs::remove_file(&self.path);
+            unlock_bootstrap_file(&self.file);
+        } else {
+            // Lock failure must sacrifice bootstrap availability, never expose
+            // a marker that can authorize arbitrary record-lock contention.
+            let _ = fs::remove_file(&self.path);
+            release_lifecycle_lock();
+        }
+    }
+}
+
+struct CreateBootstrapGate {
+    file: fs::File,
+}
+
+impl Drop for CreateBootstrapGate {
+    fn drop(&mut self) {
+        unlock_bootstrap_file(&self.file);
+    }
+}
+
+fn lock_bootstrap_file(file: &fs::File) -> bool {
+    loop {
+        // SAFETY: `flock` observes the valid descriptor borrowed for this call.
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } == 0 {
+            return true;
+        }
+        if std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
+            return false;
+        }
+    }
+}
+
+fn unlock_bootstrap_file(file: &fs::File) {
+    // SAFETY: `flock` observes the valid descriptor borrowed for this call.
+    unsafe {
+        libc::flock(file.as_raw_fd(), libc::LOCK_UN);
     }
 }
 
@@ -460,7 +507,14 @@ pub(crate) fn begin_create_bootstrap(
             )
         })?;
     write_private_file(&path, launch_id)?;
-    Ok(Some(CreateBootstrapGuard { path }))
+    let file = fs::File::open(&path).map_err(|err| {
+        CliError::runtime(
+            "codex-app-server-handoff-open-failed",
+            format!("failed to open the create bootstrap marker: {err}"),
+            Some(json!({ "id": record.id })),
+        )
+    })?;
+    Ok(Some(CreateBootstrapGuard { path, file }))
 }
 
 fn create_bootstrap_is_live(record: &SessionRecord) -> bool {
@@ -475,6 +529,25 @@ fn create_bootstrap_is_live(record: &SessionRecord) -> bool {
     fs::read(path).is_ok_and(|bytes| bytes == runtime.launch_id.as_bytes())
 }
 
+fn acquire_create_bootstrap_gate(record: &SessionRecord) -> Option<CreateBootstrapGate> {
+    let path = thread_handoff_path(record)?;
+    let mut file = fs::File::open(path).ok()?;
+    #[cfg(test)]
+    BOOTSTRAP_GATE_ATTEMPTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if !lock_bootstrap_file(&file) {
+        return None;
+    }
+    let own = file.metadata().ok()?;
+    let current = fs::metadata(path).ok()?;
+    if own.dev() != current.dev() || own.ino() != current.ino() {
+        return None;
+    }
+    let mut token = Vec::new();
+    file.read_to_end(&mut token).ok()?;
+    let runtime = record.runtime.as_ref()?;
+    (token == runtime.launch_id.as_bytes()).then_some(CreateBootstrapGate { file })
+}
+
 #[cfg(test)]
 std::thread_local! {
     static BOOTSTRAP_LIVE_CHECKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
@@ -482,6 +555,10 @@ std::thread_local! {
 
 #[cfg(test)]
 static NORMAL_CANCELLATION_ATTEMPTS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(test)]
+static BOOTSTRAP_GATE_ATTEMPTS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
 pub(crate) fn thread_attached_path(record: &SessionRecord) -> Option<&Path> {
@@ -1395,7 +1472,7 @@ impl FreshBootstrap {
         if matches!(self, Self::Closed) {
             return false;
         }
-        if !create_bootstrap_is_live(record) || !auto_resume_is_healthy_disabled(context, record) {
+        if !auto_resume_is_healthy_disabled(context, record) {
             *self = Self::Closed;
             return false;
         }
@@ -1450,6 +1527,10 @@ impl FreshBootstrap {
     }
 }
 
+struct MutationAuthorization {
+    _bootstrap_gate: Option<CreateBootstrapGate>,
+}
+
 fn auto_resume_is_healthy_disabled(context: &CliContext, record: &SessionRecord) -> bool {
     let view = crate::auto_resume::view_for_record(context, record);
     view.supported && !view.enabled && view.state == "disabled" && view.failure_reason.is_none()
@@ -1460,10 +1541,12 @@ async fn cancel_before_tui_mutation(
     record: &SessionRecord,
     bootstrap: &mut FreshBootstrap,
     value: &Value,
-) -> bool {
+) -> Option<MutationAuthorization> {
     let method = value.get("method").and_then(Value::as_str);
     if !matches!(method, Some("thread/start" | "turn/start")) {
-        return true;
+        return Some(MutationAuthorization {
+            _bootstrap_gate: None,
+        });
     }
     // A fresh Codex TUI emits `thread/start`, then the initial prompt emits
     // `turn/start`, while the parent create path still owns the lifecycle lock.
@@ -1472,6 +1555,15 @@ async fn cancel_before_tui_mutation(
     // matching thread/start response and must target the returned thread id.
     #[cfg(test)]
     NORMAL_CANCELLATION_ATTEMPTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let bootstrap_gate = if matches!(bootstrap, FreshBootstrap::Closed) {
+        None
+    } else {
+        let gate_record = record.clone();
+        tokio::task::spawn_blocking(move || acquire_create_bootstrap_gate(&gate_record))
+            .await
+            .ok()
+            .flatten()
+    };
     let cancellation_context = context.clone();
     let id = record.id.clone();
     let Some(launch_id) = record
@@ -1479,7 +1571,7 @@ async fn cancel_before_tui_mutation(
         .as_ref()
         .map(|runtime| runtime.launch_id.clone())
     else {
-        return false;
+        return None;
     };
     let cancellation = tokio::task::spawn_blocking(move || {
         crate::auto_resume::try_cancel_for_manual_input_for_runtime(
@@ -1495,14 +1587,22 @@ async fn cancel_before_tui_mutation(
     match cancellation {
         Some(crate::auto_resume::ManualInputCancelOutcome::Ready) => {
             bootstrap.close();
-            true
+            Some(MutationAuthorization {
+                _bootstrap_gate: bootstrap_gate,
+            })
         }
-        Some(crate::auto_resume::ManualInputCancelOutcome::Busy) => {
-            bootstrap.bypasses_create_lock(context, record, value)
+        Some(crate::auto_resume::ManualInputCancelOutcome::Busy)
+            if bootstrap_gate.is_some()
+                && bootstrap.bypasses_create_lock(context, record, value) =>
+        {
+            Some(MutationAuthorization {
+                _bootstrap_gate: bootstrap_gate,
+            })
         }
+        Some(crate::auto_resume::ManualInputCancelOutcome::Busy) => None,
         Some(crate::auto_resume::ManualInputCancelOutcome::RuntimeChanged) | None => {
             bootstrap.close();
-            false
+            None
         }
     }
 }
@@ -1566,8 +1666,13 @@ async fn run_proxy_session(
                 let message = message
                     .ok_or_else(|| "remote TUI closed the proxy".to_string())?
                     .map_err(|err| format!("remote TUI read failed: {err}"))?;
-                if let Some(value) = message_value(&message) {
-                    if !cancel_before_tui_mutation(&context, &record, &mut bootstrap, &value).await {
+                let authorization = if let Some(value) = message_value(&message) {
+                    let Some(authorization) = cancel_before_tui_mutation(
+                        &context,
+                        &record,
+                        &mut bootstrap,
+                        &value,
+                    ).await else {
                         if let Some(id) = value
                             .get("id")
                             .filter(|id| json_id_key(id).is_some())
@@ -1587,12 +1692,16 @@ async fn run_proxy_session(
                             .map_err(|err| format!("remote TUI write failed: {err}"))?;
                         }
                         continue;
-                    }
+                    };
                     projection.observe_client(&value);
-                }
+                    authorization
+                } else {
+                    MutationAuthorization { _bootstrap_gate: None }
+                };
                 let closed = matches!(message, Message::Close(_));
                 upstream.send(message).await
                     .map_err(|err| format!("upstream app-server write failed: {err}"))?;
+                drop(authorization);
                 if closed {
                     projection.finish().await;
                     return Ok(());
@@ -3055,12 +3164,70 @@ mod tests {
                 }),
             )
             .await
+            .is_some()
         );
         assert_eq!(
             NORMAL_CANCELLATION_ATTEMPTS.load(std::sync::atomic::Ordering::Relaxed),
             1
         );
         assert_eq!(bootstrap, FreshBootstrap::Closed);
+    }
+
+    #[tokio::test]
+    async fn replacement_lock_cannot_reuse_marker_during_gated_teardown() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let socket = tmp.path().join("gated-teardown.sock");
+        let context = CliContext {
+            state_dir: tmp.path().join("state"),
+            host: None,
+        };
+        let record = record_with_runtime("gated-teardown", &socket);
+        fs::create_dir_all(crate::session_dir(&context, &record.id)).unwrap();
+        crate::write_session_record(&context, &record).unwrap();
+        crate::activity::activate_runtime(&context, &record).unwrap();
+        let create_lock = crate::acquire_session_record_lock(&context, &record.id).unwrap();
+        let bootstrap_guard = begin_create_bootstrap(&record).unwrap().unwrap();
+        assert!(lock_bootstrap_file(&bootstrap_guard.file));
+        drop(create_lock);
+        let replacement_lock = crate::acquire_session_record_lock(&context, &record.id).unwrap();
+
+        BOOTSTRAP_GATE_ATTEMPTS.store(0, std::sync::atomic::Ordering::Relaxed);
+        let task_context = context.clone();
+        let task_record = record.clone();
+        let task = tokio::spawn(async move {
+            let mut bootstrap = FreshBootstrap::FirstTurn {
+                thread_id: "fresh-thread".to_string(),
+            };
+            let authorization = cancel_before_tui_mutation(
+                &task_context,
+                &task_record,
+                &mut bootstrap,
+                &json!({
+                    "id": 2,
+                    "method": "turn/start",
+                    "params": { "threadId": "fresh-thread", "input": [] }
+                }),
+            )
+            .await;
+            (authorization.is_some(), bootstrap)
+        });
+        for _ in 0..100 {
+            if BOOTSTRAP_GATE_ATTEMPTS.load(std::sync::atomic::Ordering::Relaxed) > 0 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            BOOTSTRAP_GATE_ATTEMPTS.load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+        fs::remove_file(thread_handoff_path(&record).unwrap()).unwrap();
+        unlock_bootstrap_file(&bootstrap_guard.file);
+
+        let (authorized, _) = task.await.unwrap();
+        assert!(!authorized);
+        drop(replacement_lock);
+        drop(bootstrap_guard);
     }
 
     #[tokio::test]

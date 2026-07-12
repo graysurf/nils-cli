@@ -805,8 +805,11 @@ fn start_session(context: &CliContext, args: cli::StartArgs) -> Result<StartView
     // Keep the app-server bootstrap marker valid for the entire create-lock
     // lifetime. Explicit ordering avoids Rust's reverse local-drop order from
     // removing the marker while the lifecycle lock is still held.
-    created.release_lifecycle_lock();
-    drop(create_bootstrap);
+    if let Some(create_bootstrap) = create_bootstrap {
+        create_bootstrap.finish(|| created.release_lifecycle_lock());
+    } else {
+        created.release_lifecycle_lock();
+    }
     Ok(StartView {
         format: args.format,
         result,
