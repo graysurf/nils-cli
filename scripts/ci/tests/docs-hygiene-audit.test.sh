@@ -55,10 +55,20 @@ run_audit() {
   local dir="$1" path_override="${2:-}"
   set +e
   if [[ -n "$path_override" ]]; then
-    audit_output="$(cd "$dir" && PATH="$path_override" "$bash_bin" "$script" --strict 2>&1)"
+    audit_output="$(cd "$dir" && DOCS_HYGIENE_TEST_ALLOW_MISSING_TARGETS=1 \
+      PATH="$path_override" "$bash_bin" "$script" --strict 2>&1)"
   else
-    audit_output="$(cd "$dir" && bash "$script" --strict 2>&1)"
+    audit_output="$(cd "$dir" && DOCS_HYGIENE_TEST_ALLOW_MISSING_TARGETS=1 \
+      bash "$script" --strict 2>&1)"
   fi
+  status=$?
+  set -e
+}
+
+run_audit_without_fixture_relaxation() {
+  local dir="$1"
+  set +e
+  audit_output="$(cd "$dir" && bash "$script" --strict 2>&1)"
   status=$?
   set -e
 }
@@ -94,6 +104,19 @@ clean_repo="$(make_repo clean)"
 printf '# alpha\n\nUnique payload one.\n' >"$clean_repo/docs/alpha.md"
 printf '# beta\n\nUnique payload two.\n' >"$clean_repo/docs/beta.md"
 assert_passes "distinct payloads pass" "$clean_repo"
+
+# Missing production scan targets must not inherit the partial-fixture
+# relaxation used by this black-box suite.
+echo "== missing audit target is fatal outside test mode =="
+run_audit_without_fixture_relaxation "$clean_repo"
+if [[ "$status" -ne 2 ]] \
+  || ! grep -qF "missing required audit path:" <<<"$audit_output"; then
+  fail "missing audit target is fatal outside test mode"
+fi
+if grep -qF "PASS: docs hygiene audit" <<<"$audit_output"; then
+  fail "missing audit target is fatal outside test mode: unexpected PASS marker"
+fi
+echo "ok"
 
 # --- identical payloads across paths are flagged -----------------------------
 dup_repo="$(make_repo dup)"

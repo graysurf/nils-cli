@@ -66,8 +66,9 @@ rg_scan() {
   return "$status"
 }
 
-# Some black-box fixtures intentionally contain only a subset of repository
-# roots. Filter optional scan paths without masking failures from rg itself.
+# Production audits fail closed when an explicit scan target is missing.
+# Black-box tests that intentionally build partial repositories must opt in to
+# the narrowly named fixture relaxation.
 rg_scan_existing() {
   local -a rg_args=()
   local -a paths=()
@@ -77,7 +78,12 @@ rg_scan_existing() {
     if [[ "$arg" == "--audit-paths" ]]; then
       reading_paths=1
     elif [[ "$reading_paths" -eq 1 ]]; then
-      [[ -e "$arg" ]] && paths+=("$arg")
+      if [[ -e "$arg" ]]; then
+        paths+=("$arg")
+      elif [[ "${DOCS_HYGIENE_TEST_ALLOW_MISSING_TARGETS:-0}" != "1" ]]; then
+        echo "error: missing required audit path: $arg" >&2
+        return 2
+      fi
     else
       rg_args+=("$arg")
     fi
