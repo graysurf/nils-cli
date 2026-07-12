@@ -10,8 +10,8 @@ use crate::completion::scope_candidates;
     version,
     long_version = nils_build_info::long_version(env!("CARGO_PKG_VERSION")),
     about = "Resolve and manage local agent memory directories.",
-    long_about = "Resolve and manage the git-backed local agent memory store used by Claude Code personas and per-agent memory scopes.",
-    after_help = "SCOPE VALUES:\n  root          AGENT_MEMORY_HOME itself\n  global        shared memory store\n  <id>          shorthand for agents/<id>\n  agents/<id>   per-agent memory store\n  personas/<id> persona launchpad directory\n\nENVIRONMENT:\n  AGENT_MEMORY_HOME  Override memory-store root.\n  XDG_CONFIG_HOME    Parent for the default agent-memory root.\n  HOME               Fallback parent when XDG_CONFIG_HOME is unset.\n\nEXIT CODES:\n  0   success\n  1   runtime error\n  64  command-line usage error",
+    long_about = "Resolve and manage a git-backed local agent memory store with curated notes, bounded recall profiles, producer candidates, personas, and per-agent scopes.",
+    after_help = "SCOPE VALUES:\n  root             AGENT_MEMORY_HOME itself\n  global           curated shared memory store\n  <id>             shorthand for agents/<id>\n  agents/<id>      per-agent memory store\n  personas/<id>    persona launchpad directory\n  profiles/<id>    bounded recall profile\n  candidates/<id>  untrusted producer candidate store\n\nENVIRONMENT:\n  AGENT_MEMORY_HOME  Override memory-store root.\n  XDG_CONFIG_HOME    Parent for the default agent-memory root.\n  HOME               Fallback parent when XDG_CONFIG_HOME is unset.\n\nEXIT CODES:\n  0   success\n  1   runtime error or no recall match\n  64  command-line usage error",
     arg_required_else_help = true,
     disable_help_subcommand = true
 )]
@@ -50,6 +50,10 @@ pub enum Command {
     Add(AddArgs),
     /// Search note bodies and descriptions in a scope.
     Search(SearchArgs),
+    /// Recall bounded startup, curated on-demand, or candidate memory.
+    Recall(RecallArgs),
+    /// Add, list, or promote untrusted memory candidates.
+    Candidate(CandidateArgs),
     /// Print shell completion script.
     Completion(CompletionArgs),
     /// Print help.
@@ -75,12 +79,18 @@ pub struct CheckArgs {
     /// Scope to check (default: global).
     #[arg(value_name = "SCOPE", value_hint = ValueHint::DirPath, add = ArgValueCandidates::new(scope_candidates))]
     pub scope: Option<String>,
-    /// Check every memory scope (global, agents, personas).
+    /// Check every curated/profile scope (global, agents, personas, profiles).
     #[arg(long)]
     pub all: bool,
     /// Promote warn-level findings to failures.
     #[arg(long)]
     pub strict: bool,
+    /// Fail when MEMORY.md exceeds this many bytes.
+    #[arg(long, value_name = "BYTES")]
+    pub max_index_bytes: Option<usize>,
+    /// Fail on exact terms listed one per line in a regular, non-symlink file.
+    #[arg(long, value_name = "PATH", value_hint = ValueHint::FilePath)]
+    pub forbid_terms_file: Option<String>,
     /// Output format.
     #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
     pub format: OutputFormat,
@@ -150,13 +160,159 @@ pub struct SearchArgs {
     /// Scope to search (default: global).
     #[arg(value_name = "SCOPE", value_hint = ValueHint::DirPath, add = ArgValueCandidates::new(scope_candidates))]
     pub scope: Option<String>,
-    /// Search every memory scope (global, agents, personas).
+    /// Search every curated/profile scope (global, agents, personas, profiles).
     #[arg(long)]
     pub all: bool,
     /// Output format.
     #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
     pub format: OutputFormat,
     /// Hidden alias for `--format json` (kept for convenience).
+    #[arg(long, hide = true, conflicts_with = "format")]
+    pub json: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct RecallArgs {
+    #[command(subcommand)]
+    pub command: RecallCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum RecallCommand {
+    /// Print the bounded profiles/startup index.
+    Startup(RecallStartupArgs),
+    /// Search curated global notes only.
+    OnDemand(RecallOnDemandArgs),
+    /// List untrusted candidate notes, optionally for one producer.
+    Candidates(RecallCandidatesArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct RecallStartupArgs {
+    /// Maximum allowed startup index size.
+    #[arg(long, value_name = "BYTES", default_value_t = 3072)]
+    pub max_bytes: usize,
+    /// Output format.
+    #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
+    pub format: OutputFormat,
+    /// Hidden alias for `--format json`.
+    #[arg(long, hide = true, conflicts_with = "format")]
+    pub json: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct RecallOnDemandArgs {
+    /// Term to find in curated global note content.
+    #[arg(value_name = "TERM")]
+    pub term: String,
+    /// Output format.
+    #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
+    pub format: OutputFormat,
+    /// Hidden alias for `--format json`.
+    #[arg(long, hide = true, conflicts_with = "format")]
+    pub json: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct RecallCandidatesArgs {
+    /// Producer ID (for example claude, codex, or hermes).
+    #[arg(value_name = "PRODUCER")]
+    pub producer: Option<String>,
+    /// Output format.
+    #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
+    pub format: OutputFormat,
+    /// Hidden alias for `--format json`.
+    #[arg(long, hide = true, conflicts_with = "format")]
+    pub json: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct CandidateArgs {
+    #[command(subcommand)]
+    pub command: CandidateCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum CandidateCommand {
+    /// Add one untrusted proposal under a producer root.
+    Add(CandidateAddArgs),
+    /// List untrusted proposals, optionally for one producer.
+    List(CandidateListArgs),
+    /// Preview or apply promotion into curated global memory.
+    Promote(CandidatePromoteArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct CandidateAddArgs {
+    /// Producer ID (for example claude, codex, or hermes).
+    #[arg(value_name = "PRODUCER")]
+    pub producer: String,
+    /// Candidate slug (becomes `<slug>.md`).
+    #[arg(long, value_name = "SLUG")]
+    pub name: String,
+    /// Index title (defaults to the slug).
+    #[arg(long, value_name = "TEXT")]
+    pub title: Option<String>,
+    /// Index hook text (defaults to `untrusted candidate`).
+    #[arg(long, value_name = "TEXT")]
+    pub hook: Option<String>,
+    /// Read candidate body from a file.
+    #[arg(long, value_name = "PATH", value_hint = ValueHint::FilePath, conflicts_with = "body")]
+    pub body_file: Option<String>,
+    /// Candidate body text, or `-` to read stdin.
+    #[arg(long, value_name = "TEXT")]
+    pub body: Option<String>,
+    /// Output format.
+    #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
+    pub format: OutputFormat,
+    /// Hidden alias for `--format json`.
+    #[arg(long, hide = true, conflicts_with = "format")]
+    pub json: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct CandidateListArgs {
+    /// Producer ID (for example claude, codex, or hermes).
+    #[arg(value_name = "PRODUCER")]
+    pub producer: Option<String>,
+    /// Output format.
+    #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
+    pub format: OutputFormat,
+    /// Hidden alias for `--format json`.
+    #[arg(long, hide = true, conflicts_with = "format")]
+    pub json: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct CandidatePromoteArgs {
+    /// Producer ID containing the candidate.
+    #[arg(value_name = "PRODUCER")]
+    pub producer: String,
+    /// Candidate slug without `.md`.
+    #[arg(value_name = "SLUG")]
+    pub name: String,
+    /// Canonical note type (user|feedback|project|reference).
+    #[arg(long, value_name = "TYPE")]
+    pub r#type: String,
+    /// Canonical one-line description.
+    #[arg(long, value_name = "TEXT")]
+    pub description: String,
+    /// Global index title (defaults to the slug).
+    #[arg(long, value_name = "TEXT")]
+    pub title: Option<String>,
+    /// Global index hook (defaults to the description).
+    #[arg(long, value_name = "TEXT")]
+    pub hook: Option<String>,
+    /// Stamp required `metadata.originSessionId` promotion provenance.
+    #[arg(long, value_name = "UUID")]
+    pub session_id: String,
+    /// Apply the promotion. Omit for a non-mutating preview.
+    #[arg(long)]
+    pub apply: bool,
+    /// Output format.
+    #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
+    pub format: OutputFormat,
+    /// Hidden alias for `--format json`.
     #[arg(long, hide = true, conflicts_with = "format")]
     pub json: bool,
 }

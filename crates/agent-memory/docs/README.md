@@ -26,6 +26,9 @@ Beyond the original shell contract, the Rust CLI adds:
   frontmatter schema). This is the content-level companion to the layout-only
   `doctor`, and is the deterministic core the `review-global-memory` skill is
   intended to call instead of reimplementing the checks in bash.
+  Optional `--max-index-bytes` and `--forbid-terms-file` checks enforce bounded
+  indexes and caller-owned retired-reference lists without embedding policy in
+  the CLI.
 - `add [SCOPE] --name --type --description [...]` — the single guarded writer
   that creates a note and its `MEMORY.md` index line atomically, so the two
   never drift. Refuses duplicate slugs and validates the type enum.
@@ -34,6 +37,20 @@ Beyond the original shell contract, the Rust CLI adds:
   the default text output is unchanged.
 - `search <term> [SCOPE] [--all]` — case-insensitive substring search over note
   frontmatter and bodies, returning `scope/file:line: text`.
+- `recall startup|on-demand|candidates` — exposes bounded startup routing,
+  curated term recall, and explicitly untrusted proposal listing as separate
+  profiles.
+- `candidate add|list|promote` — isolates proposal writers by producer and
+  provides an explicit dry-run/apply promotion transaction into curated
+  `global/` memory. Promotion requires explicit session provenance, preserves
+  supported global-directory symlinks, removes exact native-index filename
+  references, and reports incomplete rollback without deleting recovery
+  backups.
+
+Candidate files are opaque untrusted data; canonical frontmatter is required
+only at promotion. Scope IDs, producer IDs, source files, and audit inputs are
+path-validated and symlink guarded.
 
 All JSON output follows the workspace CLI output contract: `--format json` is
 canonical, `--json` is a hidden alias, and records carry a `schema_version`.
+The new command families retain the same envelope for runtime errors.

@@ -725,3 +725,592 @@ fn search_all_covers_agent_scopes() {
         out.stdout_text()
     );
 }
+
+// ---- recall profiles and candidate lifecycle ----------------------------
+
+fn seed_recall_layout(root: &Path) {
+    seed_writable_global(root);
+    fs::create_dir_all(root.join("profiles/startup")).expect("startup profile");
+    fs::create_dir_all(root.join("candidates/claude")).expect("claude candidates");
+    fs::create_dir_all(root.join("candidates/codex")).expect("codex candidates");
+    fs::create_dir_all(root.join("candidates/hermes")).expect("hermes candidates");
+    fs::write(
+        root.join("profiles/startup/MEMORY.md"),
+        "# Startup\n\n- [Routing](../../global/routing.md) — route\n",
+    )
+    .expect("startup index");
+    fs::write(
+        root.join("global/routing.md"),
+        note_with("routing", "reference", "routing description", "route body"),
+    )
+    .expect("routing note");
+    fs::write(
+        root.join("global/MEMORY.md"),
+        "# Memory index\n\n- [Routing](routing.md) — route\n",
+    )
+    .expect("global index");
+    for producer in ["claude", "codex", "hermes"] {
+        fs::write(
+            root.join(format!("candidates/{producer}/MEMORY.md")),
+            format!("# {producer} candidates\n\n"),
+        )
+        .expect("candidate index");
+    }
+}
+
+#[test]
+fn recall_startup_is_bounded_and_has_json_contract() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    seed_recall_layout(tmp.path());
+
+    let text = run(tmp.path(), &["recall", "startup"]);
+    assert_eq!(text.code, 0, "stderr={}", text.stderr_text());
+    assert!(text.stdout_text().contains("# Startup"));
+    assert!(!text.stdout_text().contains("# Memory index"));
+
+    let json = run(tmp.path(), &["recall", "startup", "--format", "json"]);
+    assert_eq!(json.code, 0, "stderr={}", json.stderr_text());
+    assert!(
+        json.stdout_text()
+            .contains("\"schema_version\":\"cli.agent-memory.recall-startup.v1\"")
+    );
+    assert!(json.stdout_text().contains("\"trust\":\"untrusted\""));
+
+    let too_small = run(tmp.path(), &["recall", "startup", "--max-bytes", "8"]);
+    assert_eq!(too_small.code, 1);
+    assert!(too_small.stderr_text().contains("exceeds 8 bytes"));
+}
+
+#[cfg(unix)]
+#[test]
+fn recall_startup_rejects_symlink_profile_directory() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    seed_recall_layout(tmp.path());
+    fs::remove_dir_all(tmp.path().join("profiles/startup")).expect("remove startup");
+    std::os::unix::fs::symlink(
+        tmp.path().join("global"),
+        tmp.path().join("profiles/startup"),
+    )
+    .expect("profile symlink");
+
+    let out = run(tmp.path(), &["recall", "startup"]);
+    assert_eq!(out.code, 1);
+    assert!(out.stderr_text().contains("non-symlink directory"));
+}
+
+#[test]
+fn recall_on_demand_searches_curated_global_only() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    seed_recall_layout(tmp.path());
+    fs::write(
+        tmp.path().join("candidates/codex/secret.md"),
+        "candidate_only_token",
+    )
+    .expect("candidate");
+
+    let hit = run(tmp.path(), &["recall", "on-demand", "route body"]);
+    assert_eq!(hit.code, 0, "stderr={}", hit.stderr_text());
+    assert!(hit.stdout_text().contains("global/routing.md"));
+
+    let no_candidate = run(tmp.path(), &["recall", "on-demand", "candidate_only_token"]);
+    assert_eq!(no_candidate.code, 1);
+    assert!(no_candidate.stdout_text().is_empty());
+}
+
+#[test]
+fn candidate_add_and_recall_are_producer_isolated() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    seed_writable_global(tmp.path());
+
+    let added = run(
+        tmp.path(),
+        &[
+            "candidate",
+            "add",
+            "codex",
+            "--name",
+            "stable-preference",
+            "--body",
+            "Prefer bounded startup recall.",
+            "--format",
+            "json",
+        ],
+    );
+    assert_eq!(added.code, 0, "stderr={}", added.stderr_text());
+    assert!(added.stdout_text().contains("candidate-add.v1"));
+    assert!(
+        tmp.path()
+            .join("candidates/codex/stable-preference.md")
+            .is_file()
+    );
+
+    let recalled = run(
+        tmp.path(),
+        &["recall", "candidates", "codex", "--format", "json"],
+    );
+    assert_eq!(recalled.code, 0, "stderr={}", recalled.stderr_text());
+    let stdout = recalled.stdout_text();
+    assert!(stdout.contains("recall-candidates.v1"), "{stdout}");
+    assert!(stdout.contains("\"trust\":\"untrusted\""), "{stdout}");
+    assert!(stdout.contains("stable-preference.md"), "{stdout}");
+    assert!(!stdout.contains("candidates/claude"), "{stdout}");
+}
+
+#[test]
+fn candidate_promotion_is_dry_run_first_then_atomic_apply() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    seed_recall_layout(tmp.path());
+    let source = tmp.path().join("candidates/codex/preference.md");
+    fs::write(&source, "Prefer explicit promotion.\n").expect("candidate");
+    fs::write(
+        tmp.path().join("candidates/codex/MEMORY.md"),
+        "# Codex candidates\n\n- [Preference](preference.md) — review\n",
+    )
+    .expect("candidate index");
+
+    let args = [
+        "candidate",
+        "promote",
+        "codex",
+        "preference",
+        "--type",
+        "feedback",
+        "--description",
+        "Use explicit memory promotion",
+        "--title",
+        "Explicit promotion",
+        "--hook",
+        "review candidates before global",
+        "--session-id",
+        "00000000-0000-0000-0000-000000000000",
+        "--format",
+        "json",
+    ];
+    let dry_run = run(tmp.path(), &args);
+    assert_eq!(dry_run.code, 0, "stderr={}", dry_run.stderr_text());
+    assert!(dry_run.stdout_text().contains("\"applied\":false"));
+    assert!(
+        dry_run
+            .stdout_text()
+            .contains("\"trust\":\"untrusted-candidate\"")
+    );
+    assert!(source.is_file(), "dry-run must retain source");
+    assert!(!tmp.path().join("global/preference.md").exists());
+
+    let mut apply_args = args.to_vec();
+    apply_args.push("--apply");
+    let applied = run(tmp.path(), &apply_args);
+    assert_eq!(applied.code, 0, "stderr={}", applied.stderr_text());
+    assert!(applied.stdout_text().contains("\"applied\":true"));
+    assert!(
+        applied
+            .stdout_text()
+            .contains("\"trust\":\"curated-after-explicit-apply\"")
+    );
+    assert!(!source.exists(), "applied promotion removes source");
+
+    let promoted =
+        fs::read_to_string(tmp.path().join("global/preference.md")).expect("promoted note");
+    assert!(promoted.contains("name: preference"), "{promoted}");
+    assert!(promoted.contains("type: feedback"), "{promoted}");
+    assert!(
+        promoted.contains("Prefer explicit promotion."),
+        "{promoted}"
+    );
+    let global_index =
+        fs::read_to_string(tmp.path().join("global/MEMORY.md")).expect("global index");
+    assert!(global_index.contains("[Explicit promotion](preference.md)"));
+    let candidate_index =
+        fs::read_to_string(tmp.path().join("candidates/codex/MEMORY.md")).expect("candidate index");
+    assert!(!candidate_index.contains("preference.md"));
+
+    let check = run(tmp.path(), &["check", "global", "--strict"]);
+    assert_eq!(check.code, 0, "stderr={}", check.stderr_text());
+}
+
+#[cfg(unix)]
+#[test]
+fn candidate_promotion_supports_valid_global_symlink_layout() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    seed_recall_layout(tmp.path());
+    let global_real = tmp.path().join("global-real");
+    fs::rename(tmp.path().join("global"), &global_real).expect("move global");
+    std::os::unix::fs::symlink(&global_real, tmp.path().join("global")).expect("global symlink");
+    fs::write(
+        tmp.path().join("candidates/codex/symlink-compatible.md"),
+        "Compatible body.\n",
+    )
+    .expect("candidate");
+
+    let out = run(
+        tmp.path(),
+        &[
+            "candidate",
+            "promote",
+            "codex",
+            "symlink-compatible",
+            "--type",
+            "reference",
+            "--description",
+            "Preserve supported global symlinks",
+            "--session-id",
+            "00000000-0000-0000-0000-000000000000",
+            "--apply",
+        ],
+    );
+    assert_eq!(out.code, 0, "stderr={}", out.stderr_text());
+    assert!(global_real.join("symlink-compatible.md").is_file());
+    assert!(
+        fs::read_to_string(global_real.join("MEMORY.md"))
+            .expect("global index")
+            .contains("symlink-compatible.md")
+    );
+}
+
+#[test]
+fn candidate_promotion_removes_native_index_filename_reference() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    seed_recall_layout(tmp.path());
+    fs::write(
+        tmp.path().join("candidates/codex/native.md"),
+        "Native candidate body.\n",
+    )
+    .expect("candidate");
+    fs::write(
+        tmp.path().join("candidates/codex/MEMORY.md"),
+        "# Native index\n\nRemember native.md as a proposed topic.\n",
+    )
+    .expect("native index");
+
+    let out = run(
+        tmp.path(),
+        &[
+            "candidate",
+            "promote",
+            "codex",
+            "native",
+            "--type",
+            "reference",
+            "--description",
+            "Native candidate",
+            "--session-id",
+            "00000000-0000-0000-0000-000000000000",
+            "--apply",
+        ],
+    );
+    assert_eq!(out.code, 0, "stderr={}", out.stderr_text());
+    let index =
+        fs::read_to_string(tmp.path().join("candidates/codex/MEMORY.md")).expect("candidate index");
+    assert!(!index.contains("native.md"), "{index}");
+}
+
+#[test]
+fn candidate_promotion_rejects_multiline_metadata_without_writes() {
+    for (label, extra) in [
+        (
+            "description",
+            vec!["--description", "bad\nmetadata: injected"],
+        ),
+        (
+            "title",
+            vec!["--description", "valid", "--title", "bad\n- injected"],
+        ),
+        (
+            "hook",
+            vec!["--description", "valid", "--hook", "bad\n- injected"],
+        ),
+        (
+            "session",
+            vec![
+                "--description",
+                "valid",
+                "--session-id",
+                "bad\nmetadata: injected",
+            ],
+        ),
+    ] {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        seed_recall_layout(tmp.path());
+        let source = tmp.path().join("candidates/codex/reject.md");
+        fs::write(&source, "Candidate body.\n").expect("candidate");
+        let mut args = vec![
+            "candidate",
+            "promote",
+            "codex",
+            "reject",
+            "--type",
+            "reference",
+        ];
+        args.extend(extra);
+        if label != "session" {
+            args.extend(["--session-id", "00000000-0000-0000-0000-000000000000"]);
+        }
+        args.push("--apply");
+
+        let out = run(tmp.path(), &args);
+        assert_eq!(out.code, 64, "{label}: stderr={}", out.stderr_text());
+        assert!(
+            out.stderr_text().contains("single-line"),
+            "{label}: {}",
+            out.stderr_text()
+        );
+        assert!(source.is_file(), "{label}: source must remain");
+        assert!(
+            !tmp.path().join("global/reject.md").exists(),
+            "{label}: destination must not exist"
+        );
+    }
+}
+
+#[test]
+fn candidate_promotion_requires_session_provenance() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    seed_recall_layout(tmp.path());
+    fs::write(
+        tmp.path().join("candidates/codex/no-session.md"),
+        "Candidate body.\n",
+    )
+    .expect("candidate");
+
+    let out = run(
+        tmp.path(),
+        &[
+            "candidate",
+            "promote",
+            "codex",
+            "no-session",
+            "--type",
+            "reference",
+            "--description",
+            "Missing provenance",
+            "--apply",
+        ],
+    );
+    assert_eq!(out.code, 64);
+    assert!(out.stderr_text().contains("--session-id"));
+    assert!(!tmp.path().join("global/no-session.md").exists());
+}
+
+#[test]
+fn new_json_commands_emit_structured_runtime_errors() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    seed_recall_layout(tmp.path());
+
+    let startup = run(
+        tmp.path(),
+        &["recall", "startup", "--max-bytes", "8", "--format", "json"],
+    );
+    assert_eq!(startup.code, 1);
+    assert!(startup.stderr_text().is_empty());
+    let startup_json: serde_json::Value =
+        serde_json::from_str(startup.stdout_text().trim()).expect("startup error json");
+    assert_eq!(startup_json["ok"], false);
+    assert_eq!(startup_json["error"]["code"], "runtime-error");
+
+    let promote = run(
+        tmp.path(),
+        &[
+            "candidate",
+            "promote",
+            "codex",
+            "missing",
+            "--type",
+            "reference",
+            "--description",
+            "Missing source",
+            "--session-id",
+            "00000000-0000-0000-0000-000000000000",
+            "--format",
+            "json",
+        ],
+    );
+    assert_eq!(promote.code, 1);
+    assert!(promote.stderr_text().is_empty());
+    let promote_json: serde_json::Value =
+        serde_json::from_str(promote.stdout_text().trim()).expect("promote error json");
+    assert_eq!(promote_json["ok"], false);
+    assert_eq!(promote_json["error"]["code"], "runtime-error");
+}
+
+#[test]
+fn candidate_commands_reject_traversal_and_symlink_sources() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    seed_recall_layout(tmp.path());
+
+    let traversal = run(
+        tmp.path(),
+        &[
+            "candidate",
+            "add",
+            "../escape",
+            "--name",
+            "bad",
+            "--body",
+            "no",
+        ],
+    );
+    assert_eq!(traversal.code, 64);
+    assert!(!tmp.path().join("escape/bad.md").exists());
+
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(
+            tmp.path().join("global/routing.md"),
+            tmp.path().join("candidates/codex/link.md"),
+        )
+        .expect("symlink");
+        let linked = run(
+            tmp.path(),
+            &[
+                "candidate",
+                "promote",
+                "codex",
+                "link",
+                "--type",
+                "reference",
+                "--description",
+                "must reject symlink",
+                "--session-id",
+                "00000000-0000-0000-0000-000000000000",
+                "--apply",
+            ],
+        );
+        assert_eq!(linked.code, 1);
+        assert!(linked.stderr_text().contains("symlink"));
+        assert!(!tmp.path().join("global/link.md").exists());
+    }
+}
+
+#[test]
+fn explicit_profile_and_candidate_scopes_resolve_without_escape() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    seed_recall_layout(tmp.path());
+
+    let profile = run(tmp.path(), &["path", "profiles/startup"]);
+    assert_eq!(profile.code, 0, "stderr={}", profile.stderr_text());
+    assert_eq!(
+        profile.stdout_text(),
+        format!("{}/profiles/startup\n", tmp.path().display())
+    );
+    let candidate = run(tmp.path(), &["path", "candidates/codex"]);
+    assert_eq!(candidate.code, 0, "stderr={}", candidate.stderr_text());
+    assert_eq!(
+        candidate.stdout_text(),
+        format!("{}/candidates/codex\n", tmp.path().display())
+    );
+
+    let escape = run(tmp.path(), &["path", "profiles/../../outside"]);
+    assert_eq!(escape.code, 64);
+}
+
+// ---- strict index budget and forbidden-term audits ----------------------
+
+#[test]
+fn check_enforces_index_byte_budget_in_text_and_json() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    seed_check_scope(tmp.path());
+
+    let text = run(tmp.path(), &["check", "global", "--max-index-bytes", "8"]);
+    assert_eq!(text.code, 1);
+    assert!(text.stdout_text().contains("index-byte-budget-exceeded"));
+    assert!(text.stdout_text().contains("maximum is 8 bytes"));
+
+    let json = run(
+        tmp.path(),
+        &[
+            "check",
+            "global",
+            "--max-index-bytes",
+            "8",
+            "--format",
+            "json",
+        ],
+    );
+    assert_eq!(json.code, 1);
+    assert!(json.stdout_text().contains("index-byte-budget-exceeded"));
+}
+
+#[test]
+fn check_reports_forbidden_terms_with_file_line_and_term() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    seed_check_scope(tmp.path());
+    let terms = tmp.path().join("retired-terms.txt");
+    fs::write(&terms, "retired.skill\ncore/skills/retired/path\n").expect("terms");
+    fs::write(
+        tmp.path().join("global/alpha.md"),
+        note("alpha-note", "user", "Uses retired.skill by mistake."),
+    )
+    .expect("alpha");
+
+    let out = run(
+        tmp.path(),
+        &[
+            "check",
+            "global",
+            "--forbid-terms-file",
+            &terms.to_string_lossy(),
+            "--format",
+            "json",
+        ],
+    );
+    assert_eq!(out.code, 1, "stderr={}", out.stderr_text());
+    let stdout = out.stdout_text();
+    assert!(stdout.contains("\"kind\":\"forbidden-term\""), "{stdout}");
+    assert!(stdout.contains("\"file\":\"alpha.md\""), "{stdout}");
+    assert!(stdout.contains("retired.skill"), "{stdout}");
+    assert!(stdout.contains("line 10"), "{stdout}");
+}
+
+#[test]
+fn check_rejects_empty_or_symlink_forbidden_term_files() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    seed_check_scope(tmp.path());
+    let empty = tmp.path().join("empty.txt");
+    fs::write(&empty, "# comments only\n\n").expect("empty terms");
+
+    let empty_out = run(
+        tmp.path(),
+        &[
+            "check",
+            "global",
+            "--forbid-terms-file",
+            &empty.to_string_lossy(),
+        ],
+    );
+    assert_eq!(empty_out.code, 64);
+    assert!(empty_out.stderr_text().contains("contains no terms"));
+
+    #[cfg(unix)]
+    {
+        let linked = tmp.path().join("linked.txt");
+        std::os::unix::fs::symlink(&empty, &linked).expect("terms symlink");
+        let linked_out = run(
+            tmp.path(),
+            &[
+                "check",
+                "global",
+                "--forbid-terms-file",
+                &linked.to_string_lossy(),
+            ],
+        );
+        assert_eq!(linked_out.code, 1);
+        assert!(linked_out.stderr_text().contains("symlink"));
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn check_rejects_indexed_note_symlinks() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    seed_check_scope(tmp.path());
+    fs::remove_file(tmp.path().join("global/alpha.md")).expect("remove alpha");
+    std::os::unix::fs::symlink(
+        tmp.path().join("global/beta.md"),
+        tmp.path().join("global/alpha.md"),
+    )
+    .expect("note symlink");
+
+    let out = run(tmp.path(), &["check", "global"]);
+    assert_eq!(out.code, 1);
+    assert!(out.stdout_text().contains("index-unsafe-link"));
+}
