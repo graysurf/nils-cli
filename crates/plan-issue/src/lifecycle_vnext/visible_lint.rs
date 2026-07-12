@@ -412,7 +412,22 @@ fn body_contains_review_disposition_row(body: &str) -> bool {
             matches!(event, Event::Start(Tag::HtmlBlock)).then_some(range.clone())
         })
         .collect::<Vec<_>>();
-    let comment_ranges = markdown_html_comment_ranges(body, &code_ranges, &html_block_ranges);
+    let comment_candidate_ranges = events
+        .iter()
+        .filter_map(|(event, range)| {
+            matches!(
+                event,
+                Event::Text(_) | Event::Html(_) | Event::InlineHtml(_)
+            )
+            .then_some(range.clone())
+        })
+        .collect::<Vec<_>>();
+    let comment_ranges = markdown_html_comment_ranges(
+        body,
+        &code_ranges,
+        &html_block_ranges,
+        &comment_candidate_ranges,
+    );
 
     let mut in_table = false;
     let mut in_table_head = false;
@@ -507,13 +522,17 @@ fn markdown_html_comment_ranges(
     body: &str,
     code_ranges: &[std::ops::Range<usize>],
     html_block_ranges: &[std::ops::Range<usize>],
+    comment_candidate_ranges: &[std::ops::Range<usize>],
 ) -> Vec<std::ops::Range<usize>> {
     let mut ranges = Vec::new();
     let mut search_start = 0;
 
     while let Some(relative_start) = body[search_start..].find("<!--") {
         let start = search_start + relative_start;
-        if code_ranges.iter().any(|range| range.contains(&start))
+        if !comment_candidate_ranges
+            .iter()
+            .any(|range| range.contains(&start))
+            || code_ranges.iter().any(|range| range.contains(&start))
             || is_backslash_escaped(body, start)
             || markdown_marker_is_inside_html_tag(body, start)
         {
@@ -537,16 +556,34 @@ fn markdown_html_comment_ranges(
 }
 
 fn markdown_marker_is_inside_html_tag(body: &str, marker_start: usize) -> bool {
-    let line_start = body[..marker_start]
-        .rfind('\n')
-        .map_or(0, |index| index + 1);
-    let before_marker = &body[line_start..marker_start];
-    let Some(last_open) = before_marker.rfind('<') else {
-        return false;
-    };
-    before_marker
-        .rfind('>')
-        .is_none_or(|last_close| last_open > last_close)
+    let bytes = body.as_bytes();
+    let mut inside_tag = false;
+    let mut quote = None;
+    let mut index = 0;
+
+    while index < marker_start {
+        let byte = bytes[index];
+        if inside_tag {
+            if let Some(delimiter) = quote {
+                if byte == delimiter {
+                    quote = None;
+                }
+            } else if matches!(byte, b'\'' | b'"') {
+                quote = Some(byte);
+            } else if byte == b'>' {
+                inside_tag = false;
+            }
+        } else if byte == b'<'
+            && bytes.get(index + 1).is_some_and(|next| {
+                next.is_ascii_alphabetic() || matches!(next, b'/' | b'!' | b'?')
+            })
+        {
+            inside_tag = true;
+        }
+        index += 1;
+    }
+
+    inside_tag
 }
 
 fn is_backslash_escaped(text: &str, index: usize) -> bool {

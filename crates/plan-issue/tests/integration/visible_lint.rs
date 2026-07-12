@@ -684,6 +684,37 @@ fn visible_lint_review_accepts_comment_tokens_inside_raw_html() {
 }
 
 #[test]
+fn visible_lint_review_accepts_comment_tokens_after_quoted_html_angles() {
+    let hints = LintHints {
+        review_has_findings: true,
+        ..LintHints::default()
+    };
+
+    for raw_html in [
+        "<div title=\"value > <!--\">metadata</div>\n\n",
+        "<div title='value > <!--'>metadata</div>\n\n",
+    ] {
+        let body = format!(
+            "## Review Evidence\n\n\
+             - Profile: tracking\n\
+             - Decision: approve\n\n\
+             {raw_html}\
+             | ID | Severity | Disposition | Summary |\n\
+             | --- | --- | --- | --- |\n\
+             | F1 | minor | fixed | visible finding |\n"
+        );
+
+        let report = lint_visible(PayloadRole::Review, &body, hints);
+
+        assert!(
+            report.is_pass(),
+            "raw_html={raw_html:?} findings={:?}",
+            report.findings
+        );
+    }
+}
+
+#[test]
 fn visible_lint_review_accepts_comment_tokens_inside_raw_text_html() {
     let hints = LintHints {
         review_has_findings: true,
@@ -733,6 +764,38 @@ fn visible_lint_review_accepts_comment_tokens_inside_link_titles() {
              | ID | Severity | Disposition | Summary |\n\
              | --- | --- | --- | --- |\n\
              | F1 | minor | fixed | visible finding |\n"
+        );
+
+        let report = lint_visible(PayloadRole::Review, &body, hints);
+
+        assert!(
+            report.is_pass(),
+            "prefix={prefix:?} findings={:?}",
+            report.findings
+        );
+    }
+}
+
+#[test]
+fn visible_lint_review_accepts_unrelated_comment_closers_after_link_titles() {
+    let hints = LintHints {
+        review_has_findings: true,
+        ..LintHints::default()
+    };
+
+    for prefix in [
+        "[reference](https://example.test \"<!--\")\n\n",
+        "[ref]: https://example.test \"<!--\"\n\n",
+    ] {
+        let body = format!(
+            "## Review Evidence\n\n\
+             - Profile: tracking\n\
+             - Decision: approve\n\n\
+             {prefix}\
+             | ID | Severity | Disposition | Summary |\n\
+             | --- | --- | --- | --- |\n\
+             | F1 | minor | fixed | visible finding |\n\n\
+             literal --> suffix\n"
         );
 
         let report = lint_visible(PayloadRole::Review, &body, hints);
