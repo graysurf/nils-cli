@@ -295,6 +295,10 @@ case "$group $verb" in
   "issue comment")
     maybe_reject_local_path "comment"
     maybe_reject_escaped_control
+    if [[ "${FORGE_CLI_STUB_FAIL_COMMENT:-}" == "1" ]]; then
+      emit '{"ok":false,"schema_version":"cli.forge-cli.error.v1","error":{"code":"comment-failed","message":"simulated comment failure"}}'
+      exit 1
+    fi
     if [[ -n "${FORGE_CLI_STUB_CAPTURE_COMMENT_FILE:-}" && -n "$body_file" ]]; then
       cp "$body_file" "$FORGE_CLI_STUB_CAPTURE_COMMENT_FILE"
     fi

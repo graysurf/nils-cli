@@ -953,6 +953,80 @@ fn close_label_plan_converged(
     additions_present && removals_absent && state_exclusive
 }
 
+fn restore_close_labels_after_failure(
+    adapter: &dyn ProviderAdapter,
+    repo: &str,
+    issue: u64,
+    provider: crate::provider::Provider,
+    original: &[String],
+    observed: &[String],
+    failure: CommandError,
+) -> CommandError {
+    let add = original
+        .iter()
+        .filter(|label| {
+            !observed
+                .iter()
+                .any(|current| label_matches(Some(provider), label, current))
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    let remove = observed
+        .iter()
+        .filter(|label| {
+            !original
+                .iter()
+                .any(|current| label_matches(Some(provider), label, current))
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+
+    if add.is_empty() && remove.is_empty() {
+        return failure;
+    }
+
+    if let Err(rollback_error) = adapter.edit_issue_labels(repo, issue, &add, &remove) {
+        return CommandError::runtime(
+            "record-close-label-rollback-failed",
+            format!(
+                "{}; additionally failed to restore the original labels: {rollback_error}",
+                failure.message
+            ),
+        );
+    }
+    let restored = match adapter.issue_labels(repo, issue) {
+        Ok(labels) => sorted_unique_labels_for_provider(labels, Some(provider)),
+        Err(rollback_error) => {
+            return CommandError::runtime(
+                "record-close-label-rollback-failed",
+                format!(
+                    "{}; label rollback was sent but its read-back failed: {rollback_error}",
+                    failure.message
+                ),
+            );
+        }
+    };
+    let original = sorted_unique_labels_for_provider(original.to_vec(), Some(provider));
+    let restored_matches = original.len() == restored.len()
+        && original.iter().all(|expected| {
+            restored
+                .iter()
+                .any(|actual| label_matches(Some(provider), expected, actual))
+        });
+    if !restored_matches {
+        return CommandError::runtime(
+            "record-close-label-rollback-failed",
+            format!(
+                "{}; label rollback did not converge: expected {}, observed {}",
+                failure.message,
+                render_label_diagnostic(&original),
+                render_label_diagnostic(&restored)
+            ),
+        );
+    }
+    failure
+}
+
 fn run_record_open(
     binary: BinaryFlavor,
     dry_run: bool,
@@ -2112,27 +2186,77 @@ fn run_record_close(
         None
     };
     let labels_result = label_plan.preview(confirmed_labels.as_deref());
+    let rollback_labels = label_mutation_planned.then(|| {
+        (
+            label_plan.current.clone().unwrap_or_default(),
+            confirmed_labels.clone().unwrap_or_default(),
+        )
+    });
+    let rollback_after_failure = |failure: CommandError| {
+        if let Some((original, observed)) = rollback_labels.as_ref() {
+            restore_close_labels_after_failure(
+                adapter.as_ref(),
+                &repo,
+                issue_number,
+                repo_info.provider,
+                original,
+                observed,
+                failure,
+            )
+        } else {
+            failure
+        }
+    };
 
-    let closeout_path = write_temp_markdown("record-close-comment", &closeout_body)
-        .map_err(|err| CommandError::runtime("record-close-comment-write-failed", err))?;
+    let closeout_path =
+        write_temp_markdown("record-close-comment", &closeout_body).map_err(|err| {
+            rollback_after_failure(CommandError::runtime(
+                "record-close-comment-write-failed",
+                err,
+            ))
+        })?;
     let closeout_url = adapter
         .comment_issue(&repo, issue_number, &closeout_path)
-        .map_err(|err| CommandError::runtime("record-close-comment-post-failed", err))?;
+        .map_err(|err| {
+            rollback_after_failure(CommandError::runtime(
+                "record-close-comment-post-failed",
+                err,
+            ))
+        })?;
 
     // Re-audit so the final dashboard includes the closeout URL.
-    let (body_after, comments_after) = adapter
-        .issue_evidence(&repo, issue_number)
-        .map_err(|err| CommandError::runtime("record-close-evidence-reread-failed", err))?;
+    let (body_after, comments_after) =
+        adapter.issue_evidence(&repo, issue_number).map_err(|err| {
+            rollback_after_failure(CommandError::runtime(
+                "record-close-evidence-reread-failed",
+                err,
+            ))
+        })?;
     let audit_after =
         lifecycle_record::audit_record(Some(&body_after), &comments_after, Some(args.profile))
-            .map_err(|err| CommandError::runtime("record-close-audit-reread-failed", err))?;
+            .map_err(|err| {
+                rollback_after_failure(CommandError::runtime(
+                    "record-close-audit-reread-failed",
+                    err,
+                ))
+            })?;
     let final_dashboard =
         lifecycle_record::render_dashboard_from_audit(&audit_after, None, Some(&issue_url));
-    let dashboard_path = write_temp_markdown("record-close-dashboard", &final_dashboard)
-        .map_err(|err| CommandError::runtime("record-close-dashboard-write-failed", err))?;
+    let dashboard_path =
+        write_temp_markdown("record-close-dashboard", &final_dashboard).map_err(|err| {
+            rollback_after_failure(CommandError::runtime(
+                "record-close-dashboard-write-failed",
+                err,
+            ))
+        })?;
     adapter
         .edit_issue_body(&repo, issue_number, &dashboard_path)
-        .map_err(|err| CommandError::runtime("record-close-dashboard-edit-failed", err))?;
+        .map_err(|err| {
+            rollback_after_failure(CommandError::runtime(
+                "record-close-dashboard-edit-failed",
+                err,
+            ))
+        })?;
     adapter
         .close_issue(
             &repo,
@@ -2140,7 +2264,12 @@ fn run_record_close(
             crate::commands::plan::CloseReason::Completed,
             None,
         )
-        .map_err(|err| CommandError::runtime("record-close-issue-close-failed", err))?;
+        .map_err(|err| {
+            rollback_after_failure(CommandError::runtime(
+                "record-close-issue-close-failed",
+                err,
+            ))
+        })?;
 
     // Write the terminal state back into the bundle's execution-state file so
     // the in-repo copy is final immediately after closeout, not transient-stale

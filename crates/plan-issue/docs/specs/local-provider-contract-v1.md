@@ -52,7 +52,7 @@ earlier design draft. The authoritative code locations are:
 
 | What | Where |
 | --- | --- |
-| `ProviderAdapter` trait (11 methods, `repo: &str`) | `crates/plan-issue/src/adapter.rs` (re-exported from `crates/plan-issue/src/provider.rs:24`) |
+| `ProviderAdapter` trait (13 methods, `repo: &str`) | `crates/plan-issue/src/adapter.rs` (re-exported from `crates/plan-issue/src/provider.rs:24`) |
 | `PrMergeSummary` struct | `crates/plan-issue/src/adapter.rs` |
 | `CloseReason` enum (`Completed` \| `NotPlanned`) | `crates/plan-issue/src/commands/plan.rs:9` |
 | `Provider` / `Repo` / `select_adapter` / `resolve_repo` | `crates/plan-issue/src/provider.rs` |
@@ -65,18 +65,27 @@ this shape alongside this spec.
 
 ## The Capability Split
 
-The 11 `ProviderAdapter` methods cleave into two halves. This split is the
-single decision that bounds how faithful a local backend (and any future
-networked service derived from it) can be.
+The 13 `ProviderAdapter` methods cleave into two implemented halves plus one
+intentional capability seam. This split is the single decision that bounds how
+faithful a local backend (and any future networked service derived from it) can
+be.
 
-### Half A — issue / timeline (8 methods): REAL locally
+### Half A — issue / timeline (9 methods): REAL locally
 
 For these methods the local store *is* the source of truth, so the backend can
 implement them faithfully. A future plan/issue-tracking service is literally
 "this store, networked and persisted".
 
-`create_issue` · `issue_body` · `issue_evidence` · `list_open_tracker_issues`
-· `edit_issue_body` · `comment_issue` · `edit_issue_labels` · `close_issue`
+`create_issue` · `issue_body` · `issue_evidence` · `issue_labels`
+· `list_open_tracker_issues` · `edit_issue_body` · `comment_issue`
+· `edit_issue_labels` · `close_issue`
+
+### Capability seam — repository catalog (1 method): UNSUPPORTED locally
+
+`repository_labels` has no Local implementation because the file-backed store
+accepts free-form labels and intentionally does not model a repository-wide
+catalog. Callers must branch on provider capability instead of treating an
+empty catalog as authoritative.
 
 ### Half B — PR / merge / CI (3 methods): STUB / SEED only
 

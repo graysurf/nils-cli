@@ -391,6 +391,8 @@ Strict, single-command closeout:
 5. Applies the preflighted label edit and reads the final labels back to verify
    the requested mutations and state exclusivity. If edit or convergence fails,
    the issue remains open and no closeout comment or dashboard write occurs.
+   If a later closeout write fails, restores the provider-confirmed original
+   label set and verifies rollback before returning the original failure.
 6. Renders and posts the `closeout` comment with structured payload.
 7. Renders and edits the `## Final Dashboard` issue body, then closes the
    provider issue.
@@ -445,6 +447,8 @@ Failure modes that block close:
   predicted final set without mutating the provider.
 - `record-close-label-convergence-failed` when final read-back does not confirm
   every requested add/remove or still contains conflicting `state::*` labels.
+- `record-close-label-rollback-failed` when a downstream closeout write fails
+  and the original provider label set cannot be restored and confirmed.
 
 Each failure returns a stable machine-readable code that maps to a single
 unblock action.
