@@ -3,12 +3,11 @@
 <!-- plan-issue-record:v2 role=state profile=tracking -->
 ## Execution State
 
-- Status: active
+- Status: complete; tracking issue closed
 - Target scope: complete nils-cli issue #1151 through implementation, real
   provider acceptance, PR delivery, merge, and strict closeout.
-- Current task: 4.2 deliver, review, merge, and close.
-- Next task: commit and push the final review repairs, resolve the PR review
-  threads, then merge after required checks pass.
+- Current task: complete.
+- Next task: none.
 - Last updated: 2026-07-12
 - Branch: `feat/1151-codex-app-server-auto-resume`
 - Source document:
@@ -16,6 +15,8 @@
 - Plan document:
   `docs/plans/2026-07-12-codex-app-server-auto-resume/codex-app-server-auto-resume-plan.md`
 - Tracking issue: <https://github.com/sympoies/nils-cli/issues/1151>
+- Branch/commit/PR: sympoies/nils-cli#1154 merged
+  (<https://github.com/sympoies/nils-cli/pull/1154>)
 
 ## Task Ledger
 
@@ -29,7 +30,7 @@
 | 3.1 | done | Complete regression, privacy, and compatibility coverage | `cargo test -p nils-agent-session --all-targets`: 239 unit and 69 integration tests passed; docs specify supported and degraded modes | Cover every issue test-first row. |
 | 3.2 | done | Run repository validation | `bash scripts/ci/nils-cli-checks-entrypoint.sh --local-fast`: workspace fmt, clippy, docs audits, 5,946 nextest tests, and doc tests passed; completion freshness checked 62 snapshots with zero failures | Local-fast plus focused tests. |
 | 4.1 | done | Run end-to-end real exhaustion acceptance canary | codex-app-server-auto-resume-canary-evidence.md: final transparent-bridge run on `sym` captured real quota failure, sibling isolation, one authorized reset, daemon restart, one visible continuation, and cleanup | Future quota/reset validation must use `sym`, never `gamania`. |
-| 4.2 | pending | Deliver, review, merge, and close | pending | Strict review and close-ready gates. |
+| 4.2 | done | Deliver, review, merge, and close | PR #1154 squash-merged as `8b0c5491`; 18 review threads resolved; all Linux, macOS, coverage, CodeQL, and specialist review gates passed; #1151 closed | Strict review and close-ready gates. |
 
 ## Session Log
 
@@ -65,4 +66,4 @@
 | Local-fast | pass | Workspace formatting, clippy, docs/parity audits, 5,946 nextest tests, and doc tests passed. | `bash scripts/ci/nils-cli-checks-entrypoint.sh --local-fast` |
 | Completion assets | pass | Bash/Zsh syntax, Zsh completion behavior, export smoke, and 62-snapshot freshness audit passed with zero failures. | completion standard validation commands |
 | Real exhaustion canary | pass | Exact structured failure, sibling negative control, one reset, daemon reconnect, and exactly one acknowledged visible continuation. | codex-app-server-auto-resume-canary-evidence.md |
-| Required CI and specialist review | pending | Delivery gate. | pending |
+| Required CI and specialist review | pass | PR #1154 merged after all Linux, macOS, coverage, CodeQL, cargo-deny, JUnit, and specialist review gates passed. | provider read-back |
