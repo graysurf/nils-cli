@@ -383,16 +383,49 @@ fn is_table_separator(line: &str) -> bool {
 
 fn body_contains_review_disposition_row(body: &str) -> bool {
     let dispositions = ["fixed", "residual", "follow-up", "deferred", "no-action"];
-    body.lines().any(|line| {
+    let mut pending_header = None;
+    let mut disposition_column = None;
+
+    for line in body.lines() {
         let trimmed = line.trim();
-        if !trimmed.starts_with('|') {
-            return false;
+        let Some(cells) = markdown_table_cells(trimmed) else {
+            pending_header = None;
+            disposition_column = None;
+            continue;
+        };
+
+        if let Some((index, width)) = disposition_column {
+            if cells.len() == width
+                && cells
+                    .get(index)
+                    .is_some_and(|cell| dispositions.contains(cell))
+            {
+                return true;
+            }
+            continue;
         }
-        if trimmed.contains("Disposition") || trimmed.contains("---") {
-            return false;
+
+        if let Some((index, width)) = pending_header.take()
+            && cells.len() == width
+            && is_table_separator(trimmed)
+        {
+            disposition_column = Some((index, width));
+            continue;
         }
-        dispositions.iter().any(|d| trimmed.contains(d))
-    })
+
+        if !is_table_separator(trimmed)
+            && let Some(index) = cells.iter().position(|cell| *cell == "Disposition")
+        {
+            pending_header = Some((index, cells.len()));
+        }
+    }
+
+    false
+}
+
+fn markdown_table_cells(line: &str) -> Option<Vec<&str>> {
+    let inner = line.strip_prefix('|')?.strip_suffix('|')?;
+    Some(inner.split('|').map(str::trim).collect())
 }
 
 fn body_contains_review_context(body: &str) -> bool {

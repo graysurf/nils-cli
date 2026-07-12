@@ -276,6 +276,75 @@ fn visible_lint_review_decision_and_disposition() {
 }
 
 #[test]
+fn visible_lint_review_accepts_disposition_word_in_summary() {
+    let body = "## Review Evidence\n\n\
+        - Profile: tracking\n\
+        - Decision: approve\n\n\
+        | ID | Severity | Disposition | Summary |\n\
+        | --- | --- | --- | --- |\n\
+        | F1 | minor | fixed | Disposition schema is documented |\n";
+    let hints = LintHints {
+        review_has_findings: true,
+        ..LintHints::default()
+    };
+
+    let report = lint_visible(PayloadRole::Review, body, hints);
+
+    assert!(report.is_pass(), "{:?}", report.findings);
+}
+
+#[test]
+fn visible_lint_review_requires_a_structural_disposition_column() {
+    let missing_column = "## Review Evidence\n\n\
+        - Profile: tracking\n\
+        - Decision: approve\n\n\
+        | ID | Severity | Summary |\n\
+        | --- | --- | --- |\n\
+        | F1 | minor | fixed wording in summary |\n";
+    let invalid_value = "## Review Evidence\n\n\
+        - Profile: tracking\n\
+        - Decision: approve\n\n\
+        | ID | Severity | Disposition | Summary |\n\
+        | --- | --- | --- | --- |\n\
+        | F1 | minor | TBD | fixed wording in summary |\n";
+    let hints = LintHints {
+        review_has_findings: true,
+        ..LintHints::default()
+    };
+
+    for body in [missing_column, invalid_value] {
+        let report = lint_visible(PayloadRole::Review, body, hints);
+        assert!(
+            report.codes().contains(&codes::REVIEW_MISSING_DISPOSITION),
+            "codes={:?}",
+            report.codes()
+        );
+    }
+}
+
+#[test]
+fn visible_lint_review_accepts_all_supported_disposition_values() {
+    let hints = LintHints {
+        review_has_findings: true,
+        ..LintHints::default()
+    };
+
+    for disposition in ["fixed", "residual", "follow-up", "deferred", "no-action"] {
+        let body = format!(
+            "## Review Evidence\n\n\
+             - Profile: tracking\n\
+             - Decision: approve\n\n\
+             | ID | Severity | Disposition | Summary |\n\
+             | --- | --- | --- | --- |\n\
+             | F1 | minor | {disposition} | ordinary summary |\n"
+        );
+
+        let report = lint_visible(PayloadRole::Review, &body, hints);
+        assert!(report.is_pass(), "{disposition}: {:?}", report.findings);
+    }
+}
+
+#[test]
 fn visible_lint_closeout_requires_approval_and_linked_pr() {
     let pass = "## Tracking Issue Closeout\n\n\
         - Profile: tracking\n\
