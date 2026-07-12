@@ -83,6 +83,12 @@ pub fn run_plan_issue_local_with_env(args: &[&str], env: &[(&str, &str)]) -> Cmd
 /// - `FORGE_CLI_STUB_COMMENT_URL`: URL returned by `issue comment`.
 /// - `FORGE_CLI_STUB_EDIT_LABELS_JSON`: provider-observed JSON label array
 ///   returned by `issue edit`. Defaults to `[]`.
+/// - `FORGE_CLI_STUB_LABELS_FILE`: optional newline-delimited provider label
+///   state shared across stub invocations.
+/// - `FORGE_CLI_STUB_ISSUE_STATE_FILE`: optional provider issue-state file
+///   shared across stub invocations.
+/// - `FORGE_CLI_STUB_DROP_LABEL_MUTATIONS=1`: report successful label edits
+///   without changing `FORGE_CLI_STUB_LABELS_FILE`.
 /// - `FORGE_CLI_STUB_CAPTURE_BODY_FILE`: copy the `issue edit --body-file`
 ///   payload here.
 /// - `FORGE_CLI_STUB_CAPTURE_COMMENT_FILE`: copy the `issue comment
@@ -107,6 +113,8 @@ set -euo pipefail
 provider="github"
 repo=""
 body_file=""
+add_labels=()
+remove_labels=()
 positionals=()
 logged=()
 prev=""
@@ -116,6 +124,8 @@ for arg in "$@"; do
     --provider) provider="$arg" ;;
     --repo) repo="$arg" ;;
     --body-file) body_file="$arg" ;;
+    --add-label) add_labels+=("$arg") ;;
+    --remove-label) remove_labels+=("$arg") ;;
   esac
   # Build the logged argv: drop `--format json` and `--provider <p>` entirely,
   # keep everything else (including `--repo <slug>`).
@@ -147,6 +157,30 @@ verb="${positionals[1]:-}"
 id="${positionals[2]:-0}"
 
 emit() { printf '%s\n' "$1"; }
+
+issue_state() {
+  if [[ -n "${FORGE_CLI_STUB_ISSUE_STATE_FILE:-}" && -f "$FORGE_CLI_STUB_ISSUE_STATE_FILE" ]]; then
+    cat "$FORGE_CLI_STUB_ISSUE_STATE_FILE"
+  else
+    printf 'open'
+  fi
+}
+
+provider_labels_json() {
+  if [[ -z "${FORGE_CLI_STUB_LABELS_FILE:-}" ]]; then
+    printf '%s' "${FORGE_CLI_STUB_EDIT_LABELS_JSON:-[]}"
+    return
+  fi
+  local json='[' separator='' label escaped
+  while IFS= read -r label || [[ -n "$label" ]]; do
+    [[ -z "$label" ]] && continue
+    escaped="${label//\\/\\\\}"
+    escaped="${escaped//\"/\\\"}"
+    json+="${separator}\"${escaped}\""
+    separator=','
+  done < "$FORGE_CLI_STUB_LABELS_FILE"
+  printf '%s]' "$json"
+}
 
 emit_escaped_control_error() {
   # Mirror forge-cli's `markdown_escaped_control` validation error envelope so
@@ -201,7 +235,9 @@ case "$group $verb" in
   "issue view")
     body_json="${FORGE_CLI_STUB_VIEW_BODY_JSON:-\"\"}"
     comments_json="${FORGE_CLI_STUB_VIEW_COMMENTS_JSON:-[]}"
-    emit "{\"ok\":true,\"schema_version\":\"cli.forge-cli.issue.view.v1\",\"data\":{\"provider\":\"$provider\",\"number\":$id,\"url\":\"https://github.com/$repo/issues/$id\",\"state\":\"open\",\"title\":\"t\",\"body\":$body_json,\"labels\":[],\"assignees\":[],\"comments\":$comments_json}}"
+    state="$(issue_state)"
+    labels_json="$(provider_labels_json)"
+    emit "{\"ok\":true,\"schema_version\":\"cli.forge-cli.issue.view.v1\",\"data\":{\"provider\":\"$provider\",\"number\":$id,\"url\":\"https://github.com/$repo/issues/$id\",\"state\":\"$state\",\"title\":\"t\",\"body\":$body_json,\"labels\":$labels_json,\"assignees\":[],\"comments\":$comments_json}}"
     ;;
   "issue create")
     url="${FORGE_CLI_STUB_CREATE_URL:-https://github.com/sympoies/nils-cli/issues/999}"
@@ -214,8 +250,19 @@ case "$group $verb" in
     if [[ -n "${FORGE_CLI_STUB_CAPTURE_BODY_FILE:-}" && -n "$body_file" ]]; then
       cp "$body_file" "$FORGE_CLI_STUB_CAPTURE_BODY_FILE"
     fi
-    labels_json="${FORGE_CLI_STUB_EDIT_LABELS_JSON:-[]}"
-    emit "{\"ok\":true,\"schema_version\":\"cli.forge-cli.issue.edit.v1\",\"data\":{\"provider\":\"$provider\",\"number\":$id,\"url\":\"https://github.com/$repo/issues/$id\",\"state\":\"open\",\"title\":\"t\",\"labels\":$labels_json,\"assignees\":[]}}"
+    if [[ -n "${FORGE_CLI_STUB_LABELS_FILE:-}" && "${FORGE_CLI_STUB_DROP_LABEL_MUTATIONS:-}" != "1" ]]; then
+      touch "$FORGE_CLI_STUB_LABELS_FILE"
+      for label in "${remove_labels[@]}"; do
+        grep -Fvx -- "$label" "$FORGE_CLI_STUB_LABELS_FILE" > "${FORGE_CLI_STUB_LABELS_FILE}.tmp" || true
+        mv "${FORGE_CLI_STUB_LABELS_FILE}.tmp" "$FORGE_CLI_STUB_LABELS_FILE"
+      done
+      for label in "${add_labels[@]}"; do
+        grep -Fxq -- "$label" "$FORGE_CLI_STUB_LABELS_FILE" || printf '%s\n' "$label" >> "$FORGE_CLI_STUB_LABELS_FILE"
+      done
+    fi
+    state="$(issue_state)"
+    labels_json="$(provider_labels_json)"
+    emit "{\"ok\":true,\"schema_version\":\"cli.forge-cli.issue.edit.v1\",\"data\":{\"provider\":\"$provider\",\"number\":$id,\"url\":\"https://github.com/$repo/issues/$id\",\"state\":\"$state\",\"title\":\"t\",\"labels\":$labels_json,\"assignees\":[]}}"
     ;;
   "issue comment")
     maybe_reject_local_path "comment"
@@ -227,6 +274,9 @@ case "$group $verb" in
     emit "{\"ok\":true,\"schema_version\":\"cli.forge-cli.issue.comment.v1\",\"data\":{\"provider\":\"$provider\",\"number\":$id,\"url\":\"$url\"}}"
     ;;
   "issue close")
+    if [[ -n "${FORGE_CLI_STUB_ISSUE_STATE_FILE:-}" ]]; then
+      printf 'closed\n' > "$FORGE_CLI_STUB_ISSUE_STATE_FILE"
+    fi
     emit "{\"ok\":true,\"schema_version\":\"cli.forge-cli.issue.close.v1\",\"data\":{\"provider\":\"$provider\",\"number\":$id,\"url\":\"https://github.com/$repo/issues/$id\",\"state\":\"closed\"}}"
     ;;
   "issue list")
