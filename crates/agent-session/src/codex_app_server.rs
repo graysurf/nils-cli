@@ -1610,6 +1610,21 @@ fn proxy_websocket_config() -> WebSocketConfig {
         .max_frame_size(Some(MAX_PROXY_FRAME_BYTES))
 }
 
+async fn send_proxy_upstream<S>(
+    upstream: &mut S,
+    message: Message,
+    timeout: Duration,
+) -> Result<(), String>
+where
+    S: futures_util::Sink<Message> + Unpin,
+    S::Error: std::fmt::Display,
+{
+    tokio::time::timeout(timeout, upstream.send(message))
+        .await
+        .map_err(|_| "upstream app-server write timed out".to_string())?
+        .map_err(|err| format!("upstream app-server write failed: {err}"))
+}
+
 async fn run_proxy_session(
     context: CliContext,
     args: crate::cli::CodexAppServerProxyArgs,
@@ -1696,8 +1711,7 @@ async fn run_proxy_session(
                     MutationAuthorization { _bootstrap_gate: None }
                 };
                 let closed = matches!(message, Message::Close(_));
-                upstream.send(message).await
-                    .map_err(|err| format!("upstream app-server write failed: {err}"))?;
+                send_proxy_upstream(&mut upstream, message, CONTROL_RESPONSE_TIMEOUT).await?;
                 drop(authorization);
                 if closed {
                     projection.finish().await;
@@ -1916,6 +1930,37 @@ mod tests {
     use std::collections::BTreeMap;
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
+
+    struct PendingMessageSink;
+
+    impl futures_util::Sink<Message> for PendingMessageSink {
+        type Error = std::io::Error;
+
+        fn poll_ready(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), Self::Error>> {
+            std::task::Poll::Pending
+        }
+
+        fn start_send(self: std::pin::Pin<&mut Self>, _item: Message) -> Result<(), Self::Error> {
+            unreachable!("pending sink never becomes ready")
+        }
+
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), Self::Error>> {
+            std::task::Poll::Pending
+        }
+
+        fn poll_close(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), Self::Error>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
 
     fn record_with_runtime(id: &str, socket: &Path) -> SessionRecord {
         SessionRecord {
@@ -3225,6 +3270,58 @@ mod tests {
         assert!(!authorized);
         drop(replacement_lock);
         drop(bootstrap_guard);
+    }
+
+    #[tokio::test]
+    async fn stalled_upstream_write_times_out_and_releases_bootstrap_gate() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let record = record_with_runtime("stalled-write", &tmp.path().join("stalled.sock"));
+        fs::create_dir_all(crate::session_dir(
+            &CliContext {
+                state_dir: tmp.path().join("state"),
+                host: None,
+            },
+            &record.id,
+        ))
+        .unwrap();
+        let context = CliContext {
+            state_dir: tmp.path().join("state"),
+            host: None,
+        };
+        crate::write_session_record(&context, &record).unwrap();
+        let lifecycle_lock = crate::acquire_session_record_lock(&context, &record.id).unwrap();
+        let bootstrap_guard = begin_create_bootstrap(&record).unwrap().unwrap();
+        let authorization = MutationAuthorization {
+            _bootstrap_gate: acquire_create_bootstrap_gate(&record),
+        };
+        assert!(authorization._bootstrap_gate.is_some());
+        let (finished_tx, finished_rx) = std::sync::mpsc::channel();
+        let teardown = std::thread::spawn(move || {
+            bootstrap_guard.finish(|| drop(lifecycle_lock));
+            finished_tx.send(()).unwrap();
+        });
+        assert!(
+            finished_rx.recv_timeout(Duration::from_millis(10)).is_err(),
+            "teardown must wait while the proxy owns the gate"
+        );
+        let mut upstream = PendingMessageSink;
+        let error = send_proxy_upstream(
+            &mut upstream,
+            Message::Text("stalled".into()),
+            Duration::from_millis(10),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error, "upstream app-server write timed out");
+        drop(authorization);
+        finished_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        teardown.join().unwrap();
+        assert!(
+            crate::try_acquire_session_record_lock(&context, &record.id)
+                .unwrap()
+                .is_some()
+        );
+        assert!(!thread_handoff_path(&record).unwrap().exists());
     }
 
     #[tokio::test]
