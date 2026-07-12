@@ -3,7 +3,7 @@
 <!-- plan-issue-record:v2 role=state profile=tracking -->
 ## Execution State
 
-- Status: complete
+- Status: complete; tracking issue closed
 - Outcome: blocked for the current Codex TUI runtime
 - Target scope: prove or reject a content-free OTel trigger for exact Codex TUI
   usage exhaustion.
@@ -17,6 +17,7 @@
 - Plan document:
   `docs/plans/2026-07-12-codex-otel-auto-resume/codex-otel-auto-resume-plan.md`
 - Tracking issue: <https://github.com/sympoies/nils-cli/issues/1144>
+- Branch/commit/PR: sympoies/nils-cli#1147 merged (<https://github.com/sympoies/nils-cli/pull/1147>)
 
 ## Task Ledger
 
