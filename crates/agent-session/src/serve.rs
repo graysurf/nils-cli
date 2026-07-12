@@ -63,7 +63,7 @@ use crate::{
     non_empty_env, repo_remote_url_from_cwd, resolve_tmux_bin, resume_session_by_id,
     search_workdirs, send_auto_resume_input, send_input_serialized, session_clipboard_buffer,
     session_dir, session_status, short_hostname, start_provider_resume_session, start_session,
-    update_session_title, write_session_attachment,
+    update_session_title_if_revision, write_session_attachment,
 };
 
 const ATTACH_LIVE_FIFO_NAME: &str = "attach-live.fifo";
@@ -1332,7 +1332,10 @@ fn envelope_err(err: CliError) -> Response {
     let data = err.into_inner();
     let status = match data.code.as_str() {
         "session-not-found" => StatusCode::NOT_FOUND,
-        "session-exists" => StatusCode::CONFLICT,
+        "session-exists"
+        | "title-revision-conflict"
+        | "title-state-conflict"
+        | "session-incarnation-conflict" => StatusCode::CONFLICT,
         _ => match data.exit_code {
             exit::USAGE => StatusCode::BAD_REQUEST,
             exit::DATA => StatusCode::UNPROCESSABLE_ENTITY,
@@ -2730,10 +2733,88 @@ async fn update_session_handler(
             ));
         }
     };
+    let expected_title_revision = match object.get("expected_title_revision") {
+        Some(Value::Number(revision)) => match revision.as_u64() {
+            Some(revision) => Some(revision),
+            None => {
+                return envelope_err(CliError::usage(
+                    "invalid-title-revision",
+                    "expected_title_revision must be an unsigned integer",
+                    Some(json!({ "field": "expected_title_revision" })),
+                ));
+            }
+        },
+        Some(_) => {
+            return envelope_err(CliError::usage(
+                "invalid-title-revision",
+                "expected_title_revision must be an unsigned integer",
+                Some(json!({ "field": "expected_title_revision" })),
+            ));
+        }
+        None => None,
+    };
+    let expected_session_created_at = match object.get("expected_session_created_at") {
+        Some(Value::String(created_at))
+            if !created_at.trim().is_empty() && created_at.len() <= 128 =>
+        {
+            Some(created_at.clone())
+        }
+        Some(_) => {
+            return envelope_err(CliError::usage(
+                "invalid-session-incarnation",
+                "expected_session_created_at must be a non-empty string",
+                Some(json!({ "field": "expected_session_created_at" })),
+            ));
+        }
+        None => None,
+    };
+    let expected_session_incarnation = match object.get("expected_session_incarnation") {
+        Some(Value::String(incarnation))
+            if !incarnation.trim().is_empty() && incarnation.len() <= 128 =>
+        {
+            Some(incarnation.clone())
+        }
+        Some(_) => {
+            return envelope_err(CliError::usage(
+                "invalid-session-incarnation",
+                "expected_session_incarnation must be a non-empty string",
+                Some(json!({ "field": "expected_session_incarnation" })),
+            ));
+        }
+        None => None,
+    };
+    let expected_session_title = match object.get("expected_session_title") {
+        // This is observed state, not a proposed title. Older clients could persist
+        // raw prompt titles beyond the current normalized-title limit, and upgraded
+        // writers must still be able to replace those values safely.
+        Some(Value::String(title)) => Some(Some(title.clone())),
+        Some(Value::Null) => Some(None),
+        Some(_) => {
+            return envelope_err(CliError::usage(
+                "invalid-expected-session-title",
+                "expected_session_title must be a string or null",
+                Some(json!({ "field": "expected_session_title" })),
+            ));
+        }
+        None => None,
+    };
     let context = state.context.clone();
     let tmux = state.tmux_bin.clone();
-    match tokio::task::spawn_blocking(move || update_session_title(&context, &id, title, &tmux))
-        .await
+    match tokio::task::spawn_blocking(move || {
+        update_session_title_if_revision(
+            &context,
+            &id,
+            title,
+            crate::TitleUpdatePreconditions {
+                title_revision: expected_title_revision,
+                session_created_at: expected_session_created_at,
+                session_incarnation: expected_session_incarnation,
+                session_title: expected_session_title,
+            },
+            &tmux,
+        )
+    })
+    .await
     {
         Ok(Ok(session)) => envelope_ok(json!({ "machine": state.machine, "session": session })),
         Ok(Err(err)) => envelope_err(err),
@@ -5884,6 +5965,21 @@ mod tests {
         .unwrap();
     }
 
+    fn seed_session_with_runtime(state_dir: &Path, id: &str, agent: &str, tmux_session: &str) {
+        seed_session(state_dir, id, agent, tmux_session);
+        let record_path = state_dir.join("sessions").join(id).join("session.json");
+        let mut record: Value =
+            serde_json::from_str(&std::fs::read_to_string(&record_path).unwrap()).unwrap();
+        record["runtime"] = json!({
+            "kind": "tmux",
+            "tmux_session": tmux_session,
+            "generation": 1,
+            "started_at": "2000-01-01T00:00:00Z",
+            "launch_id": format!("launch-{id}")
+        });
+        std::fs::write(record_path, serde_json::to_vec_pretty(&record).unwrap()).unwrap();
+    }
+
     fn seed_resumable_session(
         state_dir: &Path,
         id: &str,
@@ -8278,7 +8374,7 @@ mod tests {
         let st = state(tmp.path(), Some(TOKEN), minimal_tmux(tmp.path()));
 
         let (status, body) = call(
-            router(st),
+            router(st.clone()),
             put_json(
                 "/sessions/codex-reset/auto-resume",
                 Some(TOKEN),
@@ -9189,6 +9285,473 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn expected_session_title_uses_the_unicode_title_limit() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let tmux = minimal_tmux(tmp.path());
+        seed_session_with_runtime(
+            tmp.path(),
+            "unicode-title",
+            "codex",
+            "hs-codex-unicode-title",
+        );
+        let st = state(tmp.path(), Some(TOKEN), tmux);
+        let observed_title = "標".repeat(120);
+
+        let (status, body) = call(
+            router(st.clone()),
+            patch_json(
+                "/sessions/unicode-title",
+                Some(TOKEN),
+                json!({ "title": observed_title }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "body={body}");
+
+        let (status, body) = call(
+            router(st),
+            patch_json(
+                "/sessions/unicode-title",
+                Some(TOKEN),
+                json!({
+                    "title": "精簡中文標題",
+                    "expected_title_revision": 1,
+                    "expected_session_created_at": "2000-01-01T00:00:00Z",
+                    "expected_session_incarnation": "launch-unicode-title",
+                    "expected_session_title": observed_title
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "body={body}");
+        assert_eq!(body["data"]["session"]["title"], "精簡中文標題");
+        assert_eq!(body["data"]["session"]["title_revision"], 2);
+    }
+
+    #[tokio::test]
+    async fn expected_session_title_repairs_a_long_existing_title() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let tmux = minimal_tmux(tmp.path());
+        seed_session_with_runtime(tmp.path(), "long-title", "codex", "hs-codex-long-title");
+        let record_path = tmp.path().join("sessions/long-title/session.json");
+        let long_existing_title = "previous raw prompt ".repeat(20);
+        let mut record: Value =
+            serde_json::from_str(&std::fs::read_to_string(&record_path).unwrap()).unwrap();
+        record["title"] = json!(long_existing_title);
+        std::fs::write(&record_path, serde_json::to_vec_pretty(&record).unwrap()).unwrap();
+        let st = state(tmp.path(), Some(TOKEN), tmux);
+
+        let (status, body) = call(
+            router(st),
+            patch_json(
+                "/sessions/long-title",
+                Some(TOKEN),
+                json!({
+                    "title": "Concise repaired title",
+                    "expected_title_revision": 0,
+                    "expected_session_created_at": "2000-01-01T00:00:00Z",
+                    "expected_session_incarnation": "launch-long-title",
+                    "expected_session_title": long_existing_title
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "body={body}");
+        assert_eq!(body["data"]["session"]["title"], "Concise repaired title");
+        assert_eq!(body["data"]["session"]["title_revision"], 1);
+    }
+
+    #[tokio::test]
+    async fn update_session_title_rejects_stale_revision() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let tmux = minimal_tmux(tmp.path());
+        seed_session_with_runtime(tmp.path(), "revision", "codex", "hs-codex-revision");
+        let st = state(tmp.path(), Some(TOKEN), tmux);
+
+        let (status, body) = call(
+            router(st.clone()),
+            patch_json(
+                "/sessions/revision",
+                Some(TOKEN),
+                json!({
+                    "title": "First title",
+                    "expected_title_revision": 0,
+                    "expected_session_created_at": "2000-01-01T00:00:00Z",
+                    "expected_session_incarnation": "launch-revision",
+                    "expected_session_title": null
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "body={body}");
+        assert_eq!(body["data"]["session"]["title"], "First title");
+        assert_eq!(body["data"]["session"]["title_revision"], 1);
+
+        let (status, body) = call(
+            router(st.clone()),
+            patch_json(
+                "/sessions/revision",
+                Some(TOKEN),
+                json!({
+                    "title": "Stale title",
+                    "expected_title_revision": 0,
+                    "expected_session_created_at": "2000-01-01T00:00:00Z"
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "body={body}");
+        assert_eq!(body["error"]["code"], "title-revision-conflict");
+        assert_eq!(body["error"]["details"]["expected_title_revision"], 0);
+        assert_eq!(body["error"]["details"]["actual_title_revision"], 1);
+
+        let (status, body) = call(
+            router(st.clone()),
+            patch_json(
+                "/sessions/revision",
+                Some(TOKEN),
+                json!({
+                    "title": "Second title",
+                    "expected_title_revision": 1,
+                    "expected_session_created_at": "2000-01-01T00:00:00Z"
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "body={body}");
+        assert_eq!(body["data"]["session"]["title"], "Second title");
+        assert_eq!(body["data"]["session"]["title_revision"], 2);
+
+        let (status, body) = call(
+            router(st),
+            patch_json(
+                "/sessions/revision",
+                Some(TOKEN),
+                json!({
+                    "title": "Second title",
+                    "expected_title_revision": 1,
+                    "expected_session_created_at": "2000-01-01T00:00:00Z"
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "body={body}");
+        assert_eq!(body["error"]["code"], "title-revision-conflict");
+        assert_eq!(body["error"]["details"]["actual_title_revision"], 2);
+
+        let record_path = tmp.path().join("sessions/revision/session.json");
+        let record: Value =
+            serde_json::from_str(&std::fs::read_to_string(&record_path).unwrap()).unwrap();
+        assert_eq!(record["title"], "Second title");
+        assert_eq!(record["title_revision"], 2);
+    }
+
+    #[tokio::test]
+    async fn update_session_title_allows_one_concurrent_writer_per_revision() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let tmux = minimal_tmux(tmp.path());
+        seed_session(
+            tmp.path(),
+            "concurrent-revision",
+            "codex",
+            "hs-codex-concurrent-revision",
+        );
+        let st = state(tmp.path(), Some(TOKEN), tmux);
+        let barrier = Arc::new(tokio::sync::Barrier::new(3));
+
+        let spawn_writer = |title: &'static str| {
+            let st = st.clone();
+            let barrier = barrier.clone();
+            tokio::spawn(async move {
+                barrier.wait().await;
+                call(
+                    router(st),
+                    patch_json(
+                        "/sessions/concurrent-revision",
+                        Some(TOKEN),
+                        json!({ "title": title, "expected_title_revision": 0 }),
+                    ),
+                )
+                .await
+            })
+        };
+        let first = spawn_writer("First contender");
+        let second = spawn_writer("Second contender");
+        barrier.wait().await;
+        let (first, second) = tokio::join!(first, second);
+        let responses = [first.expect("first writer"), second.expect("second writer")];
+        let successes = responses
+            .iter()
+            .filter(|(status, _)| *status == StatusCode::OK)
+            .count();
+        let conflicts = responses
+            .iter()
+            .filter(|(status, body)| {
+                *status == StatusCode::CONFLICT
+                    && body["error"]["code"] == "title-revision-conflict"
+            })
+            .count();
+        assert_eq!(successes, 1, "responses={responses:?}");
+        assert_eq!(conflicts, 1, "responses={responses:?}");
+
+        let record_path = tmp.path().join("sessions/concurrent-revision/session.json");
+        let record: Value =
+            serde_json::from_str(&std::fs::read_to_string(&record_path).unwrap()).unwrap();
+        assert!(record["title"] == "First contender" || record["title"] == "Second contender");
+        assert_eq!(record["title_revision"], 1);
+    }
+
+    #[tokio::test]
+    async fn update_session_title_rejects_a_replaced_session_incarnation() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let tmux = minimal_tmux(tmp.path());
+        seed_session_with_runtime(tmp.path(), "recreated", "codex", "hs-codex-recreated");
+        std::fs::remove_dir_all(tmp.path().join("sessions/recreated")).unwrap();
+        seed_session_with_runtime(tmp.path(), "recreated", "codex", "hs-codex-recreated");
+        let record_path = tmp.path().join("sessions/recreated/session.json");
+        let mut replacement: Value =
+            serde_json::from_str(&std::fs::read_to_string(&record_path).unwrap()).unwrap();
+        replacement["runtime"]["launch_id"] = json!("launch-recreated-v2");
+        std::fs::write(
+            &record_path,
+            serde_json::to_vec_pretty(&replacement).unwrap(),
+        )
+        .unwrap();
+        let st = state(tmp.path(), Some(TOKEN), tmux);
+
+        let (status, body) = call(
+            router(st),
+            patch_json(
+                "/sessions/recreated",
+                Some(TOKEN),
+                json!({
+                    "title": "Stale incarnation title",
+                    "expected_title_revision": 0,
+                    "expected_session_created_at": "2000-01-01T00:00:00Z",
+                    "expected_session_incarnation": "launch-recreated",
+                    "expected_session_title": null
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "body={body}");
+        assert_eq!(body["error"]["code"], "session-incarnation-conflict");
+        assert_eq!(
+            body["error"]["details"]["actual_session_incarnation"],
+            "launch-recreated-v2"
+        );
+        let persisted: Value =
+            serde_json::from_str(&std::fs::read_to_string(&record_path).unwrap()).unwrap();
+        assert_eq!(persisted["title"], Value::Null);
+        assert_eq!(persisted["title_revision"], Value::Null);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn update_session_title_maps_a_runtime_replaced_while_waiting_to_conflict() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let tmux = minimal_tmux(tmp.path());
+        seed_session_with_runtime(
+            tmp.path(),
+            "waiting-replace",
+            "codex",
+            "hs-codex-waiting-replace",
+        );
+        let context = crate::CliContext {
+            state_dir: tmp.path().to_path_buf(),
+            host: None,
+        };
+        let lock = crate::acquire_session_record_lock(&context, "waiting-replace").unwrap();
+        let st = state(tmp.path(), Some(TOKEN), tmux);
+        let request = tokio::spawn(async move {
+            call(
+                router(st),
+                patch_json(
+                    "/sessions/waiting-replace",
+                    Some(TOKEN),
+                    json!({
+                        "title": "Must not cross runtime replacement",
+                        "expected_title_revision": 0,
+                        "expected_session_incarnation": "launch-waiting-replace",
+                        "expected_session_title": null
+                    }),
+                ),
+            )
+            .await
+        });
+
+        std::thread::sleep(Duration::from_millis(50));
+        let record_path = tmp.path().join("sessions/waiting-replace/session.json");
+        let mut replacement: Value =
+            serde_json::from_str(&std::fs::read_to_string(&record_path).unwrap()).unwrap();
+        replacement["runtime"]["launch_id"] = json!("launch-waiting-replace-v2");
+        std::fs::write(
+            &record_path,
+            serde_json::to_vec_pretty(&replacement).unwrap(),
+        )
+        .unwrap();
+        drop(lock);
+
+        let (status, body) = request.await.unwrap();
+        assert_eq!(status, StatusCode::CONFLICT, "body={body}");
+        assert_eq!(body["error"]["code"], "session-incarnation-conflict");
+        assert_eq!(
+            body["error"]["details"]["actual_session_incarnation"],
+            "launch-waiting-replace-v2"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn update_session_title_maps_a_record_recreated_while_waiting_to_conflict() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let tmux = minimal_tmux(tmp.path());
+        seed_session_with_runtime(
+            tmp.path(),
+            "waiting-recreate",
+            "codex",
+            "hs-codex-waiting-recreate",
+        );
+        let context = crate::CliContext {
+            state_dir: tmp.path().to_path_buf(),
+            host: None,
+        };
+        let lock = crate::acquire_session_record_lock(&context, "waiting-recreate").unwrap();
+        let st = state(tmp.path(), Some(TOKEN), tmux);
+        let request = tokio::spawn(async move {
+            call(
+                router(st),
+                patch_json(
+                    "/sessions/waiting-recreate",
+                    Some(TOKEN),
+                    json!({
+                        "title": "Must not cross record recreation",
+                        "expected_title_revision": 0,
+                        "expected_session_created_at": "2000-01-01T00:00:00Z",
+                        "expected_session_title": null
+                    }),
+                ),
+            )
+            .await
+        });
+
+        std::thread::sleep(Duration::from_millis(50));
+        let record_path = tmp.path().join("sessions/waiting-recreate/session.json");
+        let mut replacement: Value =
+            serde_json::from_str(&std::fs::read_to_string(&record_path).unwrap()).unwrap();
+        replacement["created_at"] = json!("2001-01-01T00:00:00Z");
+        replacement["runtime"]["launch_id"] = json!("launch-waiting-recreate-v2");
+        std::fs::write(
+            &record_path,
+            serde_json::to_vec_pretty(&replacement).unwrap(),
+        )
+        .unwrap();
+        drop(lock);
+
+        let (status, body) = request.await.unwrap();
+        assert_eq!(status, StatusCode::CONFLICT, "body={body}");
+        assert_eq!(body["error"]["code"], "session-incarnation-conflict");
+        assert_eq!(
+            body["error"]["details"]["actual_session_created_at"],
+            "2001-01-01T00:00:00Z"
+        );
+    }
+
+    #[tokio::test]
+    async fn expected_title_detects_repeated_legacy_writer_changes() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let tmux = minimal_tmux(tmp.path());
+        seed_session_with_runtime(tmp.path(), "rollback", "codex", "hs-codex-rollback");
+        let st = state(tmp.path(), Some(TOKEN), tmux);
+        let record_path = tmp.path().join("sessions/rollback/session.json");
+
+        let (status, body) = call(router(st.clone()), get("/sessions")).await;
+        assert_eq!(status, StatusCode::OK, "body={body}");
+        assert_eq!(body["data"]["sessions"][0]["title"], Value::Null);
+        assert_eq!(body["data"]["sessions"][0]["title_revision"], 0);
+        assert_eq!(
+            body["data"]["sessions"][0]["session_incarnation"],
+            "launch-rollback"
+        );
+
+        // Simulate an origin/main binary updating an untouched pre-revision record:
+        // it mutates only title and preserves unknown revision fields.
+        let mut rolled_back: Value =
+            serde_json::from_str(&std::fs::read_to_string(&record_path).unwrap()).unwrap();
+        rolled_back["title"] = json!("First old daemon title");
+        std::fs::write(
+            &record_path,
+            serde_json::to_vec_pretty(&rolled_back).unwrap(),
+        )
+        .unwrap();
+
+        let (status, body) = call(
+            router(st.clone()),
+            patch_json(
+                "/sessions/rollback",
+                Some(TOKEN),
+                json!({
+                    "title": "Stale upgraded title",
+                    "expected_title_revision": 0,
+                    "expected_session_created_at": "2000-01-01T00:00:00Z",
+                    "expected_session_title": null
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "body={body}");
+        assert_eq!(body["error"]["code"], "title-state-conflict");
+        assert_eq!(
+            body["error"]["details"]["actual_session_title"],
+            "First old daemon title"
+        );
+
+        // A second old-daemon mutation must also invalidate a client that read
+        // the first old-daemon title while the numeric revision stayed at zero.
+        let mut rolled_back: Value =
+            serde_json::from_str(&std::fs::read_to_string(&record_path).unwrap()).unwrap();
+        rolled_back["title"] = json!("Second old daemon title");
+        std::fs::write(
+            &record_path,
+            serde_json::to_vec_pretty(&rolled_back).unwrap(),
+        )
+        .unwrap();
+
+        let (status, body) = call(
+            router(st.clone()),
+            patch_json(
+                "/sessions/rollback",
+                Some(TOKEN),
+                json!({
+                    "title": "Still stale upgraded title",
+                    "expected_title_revision": 0,
+                    "expected_session_created_at": "2000-01-01T00:00:00Z",
+                    "expected_session_title": "First old daemon title"
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "body={body}");
+        assert_eq!(body["error"]["code"], "title-state-conflict");
+
+        let (status, body) = call(
+            router(st),
+            patch_json(
+                "/sessions/rollback",
+                Some(TOKEN),
+                json!({
+                    "title": "Recovered upgraded title",
+                    "expected_title_revision": 0,
+                    "expected_session_created_at": "2000-01-01T00:00:00Z",
+                    "expected_session_title": "Second old daemon title"
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "body={body}");
+        assert_eq!(body["data"]["session"]["title"], "Recovered upgraded title");
+        assert_eq!(body["data"]["session"]["title_revision"], 1);
+    }
+
+    #[tokio::test]
     async fn unique_session_prefix_supports_title_update_and_resume() {
         let tmp = tempfile::TempDir::new().unwrap();
         let state_dir = tmp.path().join("state");
@@ -9384,6 +9947,41 @@ mod tests {
             "/rename Cleaned up title",
             "the pasted rename command must carry the new title: {pasted:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn live_claude_rename_skips_a_stale_title_revision() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let calls_log = tmp.path().join("tmux-calls.log");
+        let pasted_log = tmp.path().join("tmux-pasted.log");
+        let tmux = rename_probe_tmux(tmp.path(), &calls_log, &pasted_log, true);
+        seed_session(
+            tmp.path(),
+            "stale-rename",
+            "claude",
+            "hs-claude-stale-rename",
+        );
+        let st = state(tmp.path(), Some(TOKEN), tmux.clone());
+        let context = st.context.clone();
+        let mut stale = crate::load_session_record(&context, "stale-rename").unwrap();
+        stale.title = Some("Older title".to_string());
+        stale.title_revision = 1;
+        let current = crate::mutate_session_record(&context, "stale-rename", |record| {
+            record.title = Some("Newer title".to_string());
+            record.title_revision = 2;
+            Ok(record.clone())
+        })
+        .unwrap();
+
+        crate::rename_live_claude_session(&context, &stale, "Older title", &tmux).unwrap();
+        assert!(
+            !pasted_log.exists(),
+            "a stale title revision must not reach the live Claude pane"
+        );
+
+        crate::rename_live_claude_session(&context, &current, "Newer title", &tmux).unwrap();
+        let pasted = std::fs::read_to_string(&pasted_log).unwrap();
+        assert_eq!(pasted.trim_end(), "/rename Newer title");
     }
 
     #[tokio::test]
@@ -11345,6 +11943,7 @@ exit 0
             agent: "codex".to_string(),
             mode: "interactive".to_string(),
             title: None,
+            title_revision: 0,
             cwd: "/tmp".to_string(),
             tmux_session: tmux_session.to_string(),
             prompt_file: None,

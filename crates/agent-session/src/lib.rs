@@ -432,6 +432,8 @@ struct SessionRecord {
     agent: String,
     mode: String,
     title: Option<String>,
+    #[serde(default)]
+    title_revision: u64,
     cwd: String,
     tmux_session: String,
     prompt_file: Option<String>,
@@ -548,6 +550,9 @@ struct SessionView {
     agent: String,
     mode: String,
     title: Option<String>,
+    title_revision: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    session_incarnation: Option<String>,
     cwd: String,
     tmux_session: String,
     status: String,
@@ -616,6 +621,7 @@ struct GlanceResult {
     id: String,
     agent: String,
     title: Option<String>,
+    title_revision: u64,
     tmux_session: String,
     status: String,
     resumable: bool,
@@ -978,6 +984,7 @@ fn create_record(request: RecordRequest<'_>) -> Result<CreatedRecord, CliError> 
         agent: request.agent.as_str().to_string(),
         mode: request.mode.to_string(),
         title: request.title.map(str::to_string),
+        title_revision: 0,
         cwd: display_path(request.cwd),
         tmux_session: tmux_session.clone(),
         prompt_file: prompt_file.as_ref().map(|path| display_path(path)),
@@ -1765,14 +1772,44 @@ fn send_to_session(context: &CliContext, args: cli::SendArgs) -> Result<SendResu
 /// names, so approvals like Enter/Esc/Ctrl-C/arrows work from mobile.
 fn send_input_serialized(
     context: &CliContext,
-    record: &SessionRecord,
+    expected: &SessionRecord,
     text: Option<&str>,
     keys: &[SpecialKey],
     tmux_bin: &Path,
 ) -> Result<(), CliError> {
-    let _record_lock = acquire_session_record_lock(context, &record.id)?;
-    let current = load_session_record(context, &record.id)?;
-    ensure_same_session_identity(record, &current)?;
+    send_input_serialized_with_title_guard(context, expected, text, keys, tmux_bin, false)
+}
+
+fn send_title_rename_serialized(
+    context: &CliContext,
+    expected: &SessionRecord,
+    text: Option<&str>,
+    keys: &[SpecialKey],
+    tmux_bin: &Path,
+) -> Result<(), CliError> {
+    send_input_serialized_with_title_guard(context, expected, text, keys, tmux_bin, true)
+}
+
+fn send_input_serialized_with_title_guard(
+    context: &CliContext,
+    expected: &SessionRecord,
+    text: Option<&str>,
+    keys: &[SpecialKey],
+    tmux_bin: &Path,
+    require_current_title: bool,
+) -> Result<(), CliError> {
+    let _record_lock = acquire_session_record_lock(context, &expected.id)?;
+    let current = load_session_record(context, &expected.id)?;
+    ensure_same_session_identity(expected, &current)?;
+    // Title persistence completes before this best-effort Claude prompt-bar
+    // projection. A newer title may win while this caller is waiting to regain
+    // the session lock, so suppress the stale side effect instead of sending an
+    // older `/rename` after the newer revision.
+    if require_current_title
+        && (current.title_revision != expected.title_revision || current.title != expected.title)
+    {
+        return Ok(());
+    }
     if live_status(tmux_bin, &current.tmux_session) != "running" {
         return Err(CliError::runtime(
             "session-not-running",
@@ -1920,6 +1957,7 @@ fn glance_session(context: &CliContext, args: cli::GlanceArgs) -> Result<GlanceR
         id: record.id.clone(),
         agent: record.agent.clone(),
         title: record.title.clone(),
+        title_revision: record.title_revision,
         tmux_session: record.tmux_session.clone(),
         status,
         resumable: is_resumable(&record),
@@ -2069,19 +2107,85 @@ mod codex_resume_tests {
     }
 }
 
+#[cfg(test)]
 fn update_session_title(
     context: &CliContext,
     id: &str,
     title: Option<String>,
     tmux_bin: &Path,
 ) -> Result<SessionView, CliError> {
+    update_session_title_if_revision(
+        context,
+        id,
+        title,
+        TitleUpdatePreconditions::default(),
+        tmux_bin,
+    )
+}
+
+#[derive(Default)]
+struct TitleUpdatePreconditions {
+    title_revision: Option<u64>,
+    session_created_at: Option<String>,
+    session_incarnation: Option<String>,
+    session_title: Option<Option<String>>,
+}
+
+fn update_session_title_if_revision(
+    context: &CliContext,
+    id: &str,
+    title: Option<String>,
+    expected: TitleUpdatePreconditions,
+    tmux_bin: &Path,
+) -> Result<SessionView, CliError> {
     let normalized_title = normalize_title(title)?;
-    let (record, previous_title) = mutate_session_record(context, id, |record| {
-        let previous_title = record.title.clone();
-        record.title = normalized_title;
-        record.updated_at = Zoned::now().timestamp().to_string();
-        Ok((record.clone(), previous_title))
-    })?;
+    let (record, previous_title) = mutate_session_record_for_title(
+        context,
+        id,
+        expected.session_created_at.as_deref(),
+        expected.session_incarnation.as_deref(),
+        |record| {
+            if let Some(expected) = expected.session_title.as_ref()
+                && &record.title != expected
+            {
+                return Err(CliError::data(
+                    "title-state-conflict",
+                    "session title changed since it was read",
+                    Some(json!({
+                        "expected_session_title": expected,
+                        "actual_session_title": record.title,
+                        "actual_title_revision": record.title_revision,
+                    })),
+                ));
+            }
+            let actual_title_revision = record.title_revision;
+            if let Some(expected) = expected.title_revision
+                && actual_title_revision != expected
+            {
+                return Err(CliError::data(
+                    "title-revision-conflict",
+                    "session title changed since it was read",
+                    Some(json!({
+                        "expected_title_revision": expected,
+                        "actual_title_revision": actual_title_revision,
+                        "actual_title": record.title,
+                    })),
+                ));
+            }
+            let previous_title = record.title.clone();
+            record.title_revision = actual_title_revision;
+            record.title = normalized_title;
+            record.title_revision = actual_title_revision.checked_add(1).ok_or_else(|| {
+                CliError::data(
+                    "title-revision-overflow",
+                    "session title revision cannot advance",
+                    Some(json!({ "actual_title_revision": record.title_revision })),
+                )
+            })?;
+            record.updated_at = Zoned::now().timestamp().to_string();
+            Ok((record.clone(), previous_title))
+        },
+    )?;
     let status = session_status(tmux_bin, &record);
     // The persisted record above is the source of truth. Claude also carries its
     // own prompt-bar display name, which we set once via `--name` at launch
@@ -2113,7 +2217,7 @@ fn rename_live_claude_session(
 ) -> Result<(), CliError> {
     let single_line = title.replace(['\n', '\r'], " ");
     let command = format!("/rename {single_line}");
-    send_input_serialized(
+    send_title_rename_serialized(
         context,
         record,
         Some(&command),
@@ -3002,6 +3106,55 @@ where
     Ok(result)
 }
 
+fn mutate_session_record_for_title<T, F>(
+    context: &CliContext,
+    id: &str,
+    expected_session_created_at: Option<&str>,
+    expected_session_incarnation: Option<&str>,
+    mutate: F,
+) -> Result<T, CliError>
+where
+    F: FnOnce(&mut SessionRecord) -> Result<T, CliError>,
+{
+    let observed = load_session_record(context, id)?;
+    let canonical_id = observed.id.clone();
+    let _lock = acquire_session_record_lock(context, &canonical_id)?;
+    let mut record = load_session_record(context, &canonical_id)?;
+    if let Some(expected) = expected_session_created_at
+        && record.created_at != expected
+    {
+        return Err(CliError::data(
+            "session-incarnation-conflict",
+            "session was replaced since it was read",
+            Some(json!({
+                "expected_session_created_at": expected,
+                "actual_session_created_at": record.created_at,
+            })),
+        ));
+    }
+    if let Some(expected) = expected_session_incarnation {
+        let actual = record
+            .runtime
+            .as_ref()
+            .map(|runtime| runtime.launch_id.as_str())
+            .filter(|launch_id| !launch_id.is_empty());
+        if actual != Some(expected) {
+            return Err(CliError::data(
+                "session-incarnation-conflict",
+                "session runtime was replaced since it was read",
+                Some(json!({
+                    "expected_session_incarnation": expected,
+                    "actual_session_incarnation": actual,
+                })),
+            ));
+        }
+    }
+    ensure_same_session_identity(&observed, &record)?;
+    let result = mutate(&mut record)?;
+    write_session_record(context, &record)?;
+    Ok(result)
+}
+
 pub(crate) fn write_session_record(
     context: &CliContext,
     record: &SessionRecord,
@@ -3152,6 +3305,12 @@ fn session_view_from_parts(
         agent: record.agent.clone(),
         mode: record.mode.clone(),
         title: record.title.clone(),
+        title_revision: record.title_revision,
+        session_incarnation: record
+            .runtime
+            .as_ref()
+            .map(|runtime| runtime.launch_id.clone())
+            .filter(|launch_id| !launch_id.is_empty()),
         cwd: record.cwd.clone(),
         tmux_session: record.tmux_session.clone(),
         status,

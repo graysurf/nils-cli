@@ -250,6 +250,14 @@ is no second state model.
   The bridge remains with the tmux runtime across daemon restarts. Runtime paths
   are namespaced by state and launch identity; delete and launch failure
   validate and remove the app-server socket, bridge socket, and marker paths.
+- Session reads include a monotonic `title_revision`. `PATCH /sessions/{id}` may include
+  `expected_title_revision`; a stale value returns `409 title-revision-conflict` without changing the title.
+  Upgraded clients also send the runtime's random `session_incarnation` as `expected_session_incarnation` and the
+  observed title as `expected_session_title`. A different runtime UUID rejects delayed requests aimed at a
+  deleted-and-recreated or resumed session with `409 session-incarnation-conflict`; exact title comparison rejects
+  changes made by older daemons that do not advance the revision with `409 title-state-conflict`.
+  `expected_session_created_at` remains accepted for transitional clients. Omitting these fields preserves
+  unconditional updates for backward-compatible clients.
 - Attachment upload uses a raw binary request body (not multipart), capped at 25 MiB. The daemon writes the file under the
   session's private `attachments/` directory with a sanitized filename and returns the remote path in the serve envelope.
   Empty or null titles clear the custom session title so clients can fall back to the session id.
