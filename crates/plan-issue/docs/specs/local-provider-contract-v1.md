@@ -163,7 +163,7 @@ Field semantics:
 
 ### `PrRecord` (`prs/<n>.json`) — Half B, all fields seeded
 
-`PrRecord` mirrors `PrMergeSummary` (`crates/plan-issue/src/github.rs:69`)
+`PrRecord` mirrors `PrMergeSummary` (`crates/plan-issue/src/adapter.rs`)
 plus a comment stream. Because Half B is a stub, **every field here is seeded
 by the test, never derived** from real VCS/CI state.
 
@@ -235,12 +235,12 @@ The table is ordered to match the trait definition in
 
 Notes:
 
-- Method 2 (`issue_evidence`) must produce `comments_json` in the same shape the
+- `issue_evidence` must produce `comments_json` in the same shape the
   GitHub adapter gets from `gh issue view --json comments`, because the
   `record audit` fixture parser consumes that shape unchanged across providers.
-- Method 4 (`create_issue`) returns the number first because callers store the
+- `create_issue` returns the number first because callers store the
   returned number as the issue identity for the rest of the lifecycle.
-- Method 8 (`close_issue`) takes a `CloseReason` and an optional close comment;
+- `close_issue` takes a `CloseReason` and an optional close comment;
   the local backend persists the reason in `close_reason` rather than encoding
   it in a comment.
 
