@@ -69,6 +69,8 @@ Sensitive data rule:
 - Never emit local secrets/tokens (`access_token`, `refresh_token`, raw auth headers, private keys)
   in either success or failure payloads. Status payloads may expose boolean presence
   flags such as `has_oauth_access_token`; they must not expose the token value.
+- `diag rate-limits` also removes upstream identity fields (`email`, `user_id`, and
+  `account_id`) from informational `raw_usage` before serializing the response.
 
 ## Stable vs Informational Fields
 
@@ -110,6 +112,12 @@ Stable (safe for strict parsing):
 
 `prompt_segment_authenticated` is true only when an OAuth access token is present, because
 the prompt segment reads the ChatGPT usage endpoint directly.
+
+`windows` is the authoritative usage-window collection. Each well-formed upstream
+window is emitted independently, so the collection may contain zero, one, or two
+items. The compatibility `summary` convenience fields remain present, but fields for an
+absent window are `null` (reset fields may be omitted). Consumers must not infer a
+5-hour window when only the weekly window is present.
 
 Informational (do not hard-depend for schema validation):
 

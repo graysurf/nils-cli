@@ -198,7 +198,7 @@ fn serve_usage_returns_partial_provider_results_from_helpers() {
         &fake_bin.join("codex-cli"),
         r#"#!/usr/bin/env sh
 cat <<'JSON'
-{"schema_version":"codex-cli.diag.rate-limits.v1","command":"diag rate-limits","mode":"all","ok":true,"results":[{"provider":"codex","name":"auth","target_file":"auth.json","status":"ok","ok":true,"source":"network","windows":[{"label":"5h","used_percent":15,"remaining_percent":85,"reset_at_epoch":1780000000},{"label":"Weekly","used_percent":25,"remaining_percent":75,"reset_at_epoch":1780600000}]}]}
+{"schema_version":"codex-cli.diag.rate-limits.v1","command":"diag rate-limits","mode":"all","ok":true,"results":[{"provider":"codex","name":"auth","target_file":"auth.json","status":"ok","ok":true,"source":"network","windows":[{"label":"Weekly","used_percent":25,"remaining_percent":75,"reset_at_epoch":1780600000}]}]}
 JSON
 "#,
     );
@@ -252,8 +252,9 @@ exit 1
         .expect("codex provider");
     assert_eq!(codex["ok"], true);
     assert_eq!(codex["source"], "codex-cli");
-    assert_eq!(codex["windows"][0]["label"], "5h");
-    assert_eq!(codex["windows"][0]["remaining_percent"], 85);
+    assert_eq!(codex["windows"].as_array().expect("windows").len(), 1);
+    assert_eq!(codex["windows"][0]["label"], "Weekly");
+    assert_eq!(codex["windows"][0]["remaining_percent"], 75);
 
     let claude = providers
         .iter()

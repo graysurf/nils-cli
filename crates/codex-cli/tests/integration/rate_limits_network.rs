@@ -158,6 +158,22 @@ fn wham_usage_ok_body() -> String {
     .to_string()
 }
 
+fn wham_usage_weekly_only_body() -> String {
+    r#"{
+  "user_id": "user-private",
+  "account_id": "account-private",
+  "email": "private@example.com",
+  "plan_type": "pro",
+  "rate_limit": {
+    "allowed": true,
+    "limit_reached": false,
+    "primary_window": { "limit_window_seconds": 604800, "used_percent": 21, "reset_at": 1700600000 },
+    "secondary_window": null
+  }
+}"#
+    .to_string()
+}
+
 fn cache_kv_path(cache_root: &Path, key: &str) -> PathBuf {
     cache_root
         .join("codex")
@@ -375,6 +391,103 @@ fn rate_limits_single_json_outputs_body() {
     assert_eq!(payload["ok"], true);
     assert!(payload["result"]["raw_usage"]["rate_limit"].is_object());
     assert!(payload["result"]["summary"]["non_weekly_label"].is_string());
+}
+
+#[test]
+fn rate_limits_single_json_accepts_weekly_only_and_redacts_identity() {
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let secrets = dir.path().join("secrets");
+    fs::create_dir_all(&secrets).expect("secrets dir");
+    write_secret(&secrets, "alpha.json", Some("tok"));
+
+    let cache_root = dir.path().join("cache_root");
+    fs::create_dir_all(&cache_root).expect("cache root");
+
+    let server = LoopbackServer::new().expect("server");
+    server.add_route(
+        "GET",
+        "/wham/usage",
+        HttpResponse::new(200, wham_usage_weekly_only_body()),
+    );
+
+    let output = run(
+        &["diag", "rate-limits", "--json", "alpha.json"],
+        &[
+            ("CODEX_SECRET_DIR", &secrets),
+            ("ZSH_CACHE_DIR", &cache_root),
+        ],
+        &[
+            ("CODEX_CHATGPT_BASE_URL", &server.url()),
+            ("CODEX_RATE_LIMITS_DEFAULT_ALL_ENABLED", "false"),
+            ("CODEX_RATE_LIMITS_CURL_CONNECT_TIMEOUT_SECONDS", "1"),
+            ("CODEX_RATE_LIMITS_CURL_MAX_TIME_SECONDS", "3"),
+        ],
+    );
+
+    assert_exit(&output, 0);
+    let payload: Value = serde_json::from_str(&stdout(&output)).expect("json");
+    let result = &payload["result"];
+    let windows = result["windows"].as_array().expect("windows");
+    assert_eq!(windows.len(), 1);
+    assert_eq!(windows[0]["label"], "Weekly");
+    assert_eq!(windows[0]["used_percent"], 21);
+    assert_eq!(windows[0]["remaining_percent"], 79);
+    assert_eq!(result["summary"]["weekly_remaining"], 79);
+    assert!(result["summary"]["non_weekly_remaining"].is_null());
+    let output_json = stdout(&output);
+    for private in ["user-private", "account-private", "private@example.com"] {
+        assert!(
+            !output_json.contains(private),
+            "diagnostic output leaked private identity: {private}"
+        );
+    }
+    assert_eq!(result["raw_usage"]["plan_type"], "pro");
+}
+
+#[test]
+fn rate_limits_single_one_line_weekly_only_replaces_non_weekly_cache() {
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let secrets = dir.path().join("secrets");
+    fs::create_dir_all(&secrets).expect("secrets dir");
+    write_secret(&secrets, "alpha.json", Some("tok"));
+
+    let cache_root = dir.path().join("cache_root");
+    let kv_path = cache_kv_path(&cache_root, "alpha");
+    fs::create_dir_all(kv_path.parent().expect("cache parent")).expect("cache dir");
+    fs::write(
+        &kv_path,
+        "fetched_at=1\nnon_weekly_label=5h\nnon_weekly_remaining=1\nnon_weekly_reset_epoch=1700003600\nweekly_remaining=2\nweekly_reset_epoch=1700600000\n",
+    )
+    .expect("stale cache");
+
+    let server = LoopbackServer::new().expect("server");
+    server.add_route(
+        "GET",
+        "/wham/usage",
+        HttpResponse::new(200, wham_usage_weekly_only_body()),
+    );
+
+    let output = run(
+        &["diag", "rate-limits", "--one-line", "alpha.json"],
+        &[
+            ("CODEX_SECRET_DIR", &secrets),
+            ("ZSH_CACHE_DIR", &cache_root),
+        ],
+        &[
+            ("CODEX_CHATGPT_BASE_URL", &server.url()),
+            ("CODEX_RATE_LIMITS_DEFAULT_ALL_ENABLED", "false"),
+            ("CODEX_RATE_LIMITS_CURL_CONNECT_TIMEOUT_SECONDS", "1"),
+            ("CODEX_RATE_LIMITS_CURL_MAX_TIME_SECONDS", "3"),
+            ("TZ", "UTC"),
+            ("NO_COLOR", "1"),
+        ],
+    );
+
+    assert_exit(&output, 0);
+    assert_eq!(stdout(&output), "W:79% 11-21 20:53\n");
+    let cache = fs::read_to_string(&kv_path).expect("refreshed cache");
+    assert!(cache.contains("weekly_remaining=79"));
+    assert!(!cache.contains("non_weekly_"));
 }
 
 #[test]

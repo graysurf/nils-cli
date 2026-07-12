@@ -97,24 +97,23 @@ fn fetch_and_write_cache(target_file: &Path) -> anyhow::Result<prompt_segment_re
 
     let fetched_at_epoch = Utc::now().timestamp();
     if fetched_at_epoch > 0 {
-        let _ = cache::write_prompt_segment_cache(
-            target_file,
-            fetched_at_epoch,
-            &weekly.non_weekly_label,
-            weekly.non_weekly_remaining,
-            weekly.weekly_remaining,
-            weekly.weekly_reset_epoch,
-            weekly.non_weekly_reset_epoch,
-        );
+        let _ = cache::write_prompt_segment_cache(target_file, fetched_at_epoch, &weekly);
     }
 
     Ok(prompt_segment_render::CacheEntry {
         fetched_at_epoch,
-        non_weekly_label: weekly.non_weekly_label,
-        non_weekly_remaining: weekly.non_weekly_remaining,
-        non_weekly_reset_epoch: weekly.non_weekly_reset_epoch,
-        weekly_remaining: weekly.weekly_remaining,
-        weekly_reset_epoch: weekly.weekly_reset_epoch,
+        non_weekly_label: weekly
+            .non_weekly
+            .as_ref()
+            .map(|window| window.label.clone()),
+        non_weekly_remaining: weekly.non_weekly.as_ref().map(|window| window.remaining),
+        non_weekly_reset_epoch: weekly
+            .non_weekly
+            .as_ref()
+            .map(|window| window.reset_epoch)
+            .filter(|epoch| *epoch > 0),
+        weekly_remaining: weekly.weekly.as_ref().map(|window| window.remaining),
+        weekly_reset_epoch: weekly.weekly.as_ref().map(|window| window.reset_epoch),
     })
 }
 

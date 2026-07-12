@@ -2,8 +2,8 @@ use chrono::{Local, TimeZone};
 use serde_json::Value;
 
 pub struct UsageData {
-    pub primary: Window,
-    pub secondary: Window,
+    pub primary: Option<Window>,
+    pub secondary: Option<Window>,
 }
 
 pub struct Window {
@@ -12,28 +12,35 @@ pub struct Window {
     pub reset_at: i64,
 }
 
+#[derive(Clone, Debug)]
+pub struct WindowValues {
+    pub label: String,
+    pub remaining: i64,
+    pub reset_epoch: i64,
+}
+
 pub struct RenderValues {
-    pub primary_label: String,
-    pub secondary_label: String,
-    pub primary_remaining: i64,
-    pub secondary_remaining: i64,
-    pub primary_reset_epoch: i64,
-    pub secondary_reset_epoch: i64,
+    pub primary: Option<WindowValues>,
+    pub secondary: Option<WindowValues>,
 }
 
 pub struct WeeklyValues {
-    pub weekly_remaining: i64,
-    pub weekly_reset_epoch: i64,
-    pub non_weekly_label: String,
-    pub non_weekly_remaining: i64,
-    pub non_weekly_reset_epoch: Option<i64>,
+    pub weekly: Option<WindowValues>,
+    pub non_weekly: Option<WindowValues>,
 }
 
 pub fn parse_usage(json: &Value) -> Option<UsageData> {
-    let rate_limit = json.get("rate_limit")?;
-    let primary = parse_window(rate_limit.get("primary_window")?)?;
-    let secondary = parse_window(rate_limit.get("secondary_window")?)?;
+    let rate_limit = json.get("rate_limit")?.as_object()?;
+    let primary = parse_optional_window(rate_limit.get("primary_window"))?;
+    let secondary = parse_optional_window(rate_limit.get("secondary_window"))?;
     Some(UsageData { primary, secondary })
+}
+
+fn parse_optional_window(value: Option<&Value>) -> Option<Option<Window>> {
+    match value {
+        None | Some(Value::Null) => Some(None),
+        Some(value) => parse_window(value).map(Some),
+    }
 }
 
 /// True when the usage payload is a valid response that explicitly reports no
@@ -45,8 +52,14 @@ pub fn parse_usage(json: &Value) -> Option<UsageData> {
 /// payload, so callers should degrade gracefully (serve cache / show n/a)
 /// rather than reporting an error. This mirrors the official codex client,
 /// which maps a null `rate_limit` to empty windows instead of failing.
-pub fn rate_limit_is_explicit_null(json: &Value) -> bool {
-    matches!(json.get("rate_limit"), Some(Value::Null))
+pub fn rate_limit_has_no_windows(json: &Value) -> bool {
+    match json.get("rate_limit") {
+        Some(Value::Null) => true,
+        Some(Value::Object(rate_limit)) => ["primary_window", "secondary_window"]
+            .into_iter()
+            .all(|key| matches!(rate_limit.get(key), None | Some(Value::Null))),
+        _ => false,
+    }
 }
 
 fn parse_window(value: &Value) -> Option<Window> {
@@ -64,56 +77,38 @@ fn parse_window(value: &Value) -> Option<Window> {
 }
 
 pub fn render_values(data: &UsageData) -> RenderValues {
-    let primary_label = format_window_seconds(data.primary.limit_window_seconds)
-        .unwrap_or_else(|| "Primary".to_string());
-    let secondary_label = format_window_seconds(data.secondary.limit_window_seconds)
-        .unwrap_or_else(|| "Secondary".to_string());
-
-    let primary_remaining = remaining_percent(data.primary.used_percent);
-    let secondary_remaining = remaining_percent(data.secondary.used_percent);
-
     RenderValues {
-        primary_label,
-        secondary_label,
-        primary_remaining,
-        secondary_remaining,
-        primary_reset_epoch: data.primary.reset_at,
-        secondary_reset_epoch: data.secondary.reset_at,
+        primary: data
+            .primary
+            .as_ref()
+            .map(|window| render_window_values(window, "Primary")),
+        secondary: data
+            .secondary
+            .as_ref()
+            .map(|window| render_window_values(window, "Secondary")),
+    }
+}
+
+fn render_window_values(window: &Window, fallback_label: &str) -> WindowValues {
+    WindowValues {
+        label: format_window_seconds(window.limit_window_seconds)
+            .unwrap_or_else(|| fallback_label.to_string()),
+        remaining: remaining_percent(window.used_percent),
+        reset_epoch: window.reset_at,
     }
 }
 
 pub fn weekly_values(values: &RenderValues) -> WeeklyValues {
-    let (
-        weekly_remaining,
-        weekly_reset_epoch,
-        non_weekly_label,
-        non_weekly_remaining,
-        non_weekly_reset_epoch,
-    ) = if values.primary_label == "Weekly" {
-        (
-            values.primary_remaining,
-            values.primary_reset_epoch,
-            values.secondary_label.clone(),
-            values.secondary_remaining,
-            Some(values.secondary_reset_epoch),
-        )
-    } else {
-        (
-            values.secondary_remaining,
-            values.secondary_reset_epoch,
-            values.primary_label.clone(),
-            values.primary_remaining,
-            Some(values.primary_reset_epoch),
-        )
-    };
-
-    WeeklyValues {
-        weekly_remaining,
-        weekly_reset_epoch,
-        non_weekly_label,
-        non_weekly_remaining,
-        non_weekly_reset_epoch,
+    let mut weekly = None;
+    let mut non_weekly = None;
+    for window in [&values.primary, &values.secondary].into_iter().flatten() {
+        if window.label == "Weekly" {
+            weekly = Some(window.clone());
+        } else if non_weekly.is_none() {
+            non_weekly = Some(window.clone());
+        }
     }
+    WeeklyValues { weekly, non_weekly }
 }
 
 pub fn format_window_seconds(raw: i64) -> Option<String> {
