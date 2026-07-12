@@ -390,11 +390,26 @@ fn body_contains_review_disposition_row(body: &str) -> bool {
     let events = Parser::new_ext(body, options)
         .into_offset_iter()
         .collect::<Vec<_>>();
-    let code_ranges = events
+    let literal_ranges = events
         .iter()
-        .filter_map(|(event, range)| matches!(event, Event::Code(_)).then_some(range.clone()))
+        .filter_map(|(event, range)| {
+            let is_literal = match event {
+                Event::Code(_) | Event::Start(Tag::CodeBlock(_)) => true,
+                Event::Start(Tag::HtmlBlock) => {
+                    markdown_line_is_code_indented(body, range.start)
+                        || body
+                            .get(range.clone())
+                            .is_some_and(|source| !source.trim_start().starts_with("<!--"))
+                }
+                Event::Html(_) | Event::InlineHtml(_) => body
+                    .get(range.clone())
+                    .is_some_and(|source| !source.trim_start().starts_with("<!--")),
+                _ => false,
+            };
+            is_literal.then_some(range.clone())
+        })
         .collect::<Vec<_>>();
-    let comment_ranges = markdown_html_comment_ranges(body, &code_ranges);
+    let comment_ranges = markdown_html_comment_ranges(body, &literal_ranges);
 
     let mut in_table = false;
     let mut in_table_head = false;
@@ -406,7 +421,7 @@ fn body_contains_review_disposition_row(body: &str) -> bool {
     for (event, range) in events {
         match event {
             Event::Start(Tag::Table(_)) => {
-                in_table = !markdown_table_is_indented(body, range.start)
+                in_table = !markdown_line_is_code_indented(body, range.start)
                     && !comment_ranges
                         .iter()
                         .any(|comment| comment.contains(&range.start));
@@ -465,22 +480,22 @@ fn body_contains_review_disposition_row(body: &str) -> bool {
     false
 }
 
-fn markdown_table_is_indented(body: &str, table_start: usize) -> bool {
-    let line_start = body[..table_start].rfind('\n').map_or(0, |index| index + 1);
+fn markdown_line_is_code_indented(body: &str, offset: usize) -> bool {
+    let line_start = body[..offset].rfind('\n').map_or(0, |index| index + 1);
     let line = &body[line_start..];
     line.starts_with('\t') || line.bytes().take_while(|byte| *byte == b' ').count() >= 4
 }
 
 fn markdown_html_comment_ranges(
     body: &str,
-    code_ranges: &[std::ops::Range<usize>],
+    literal_ranges: &[std::ops::Range<usize>],
 ) -> Vec<std::ops::Range<usize>> {
     let mut ranges = Vec::new();
     let mut search_start = 0;
 
     while let Some(relative_start) = body[search_start..].find("<!--") {
         let start = search_start + relative_start;
-        if code_ranges.iter().any(|range| range.contains(&start))
+        if literal_ranges.iter().any(|range| range.contains(&start))
             || is_backslash_escaped(body, start)
         {
             search_start = start + 4;

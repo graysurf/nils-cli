@@ -625,6 +625,65 @@ fn visible_lint_review_ignores_raw_html_block_tables() {
 }
 
 #[test]
+fn visible_lint_review_accepts_comment_tokens_inside_code_blocks() {
+    let fenced = concat!(
+        "## Review Evidence\n\n",
+        "- Profile: tracking\n",
+        "- Decision: approve\n\n",
+        "```text\n",
+        "<!-- literal example\n",
+        "```\n\n",
+        "| ID | Severity | Disposition | Summary |\n",
+        "| --- | --- | --- | --- |\n",
+        "| F1 | minor | fixed | visible finding |\n",
+    );
+    let indented = concat!(
+        "## Review Evidence\n\n",
+        "- Profile: tracking\n",
+        "- Decision: approve\n\n",
+        "    <!-- literal example\n\n",
+        "| ID | Severity | Disposition | Summary |\n",
+        "| --- | --- | --- | --- |\n",
+        "| F1 | minor | fixed | visible finding |\n",
+    );
+    let hints = LintHints {
+        review_has_findings: true,
+        ..LintHints::default()
+    };
+
+    for body in [fenced, indented] {
+        let report = lint_visible(PayloadRole::Review, body, hints);
+
+        assert!(
+            report.is_pass(),
+            "body={body:?} findings={:?}",
+            report.findings
+        );
+    }
+}
+
+#[test]
+fn visible_lint_review_accepts_comment_tokens_inside_raw_html() {
+    let body = concat!(
+        "## Review Evidence\n\n",
+        "- Profile: tracking\n",
+        "- Decision: approve\n\n",
+        "<div title=\"<!--\">metadata</div>\n\n",
+        "| ID | Severity | Disposition | Summary |\n",
+        "| --- | --- | --- | --- |\n",
+        "| F1 | minor | fixed | visible finding |\n",
+    );
+    let hints = LintHints {
+        review_has_findings: true,
+        ..LintHints::default()
+    };
+
+    let report = lint_visible(PayloadRole::Review, body, hints);
+
+    assert!(report.is_pass(), "{:?}", report.findings);
+}
+
+#[test]
 fn visible_lint_review_ignores_comments_after_literal_backticks() {
     let unmatched = concat!(
         "## Review Evidence\n\n",
