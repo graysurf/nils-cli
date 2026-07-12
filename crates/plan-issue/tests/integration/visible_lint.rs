@@ -6,8 +6,10 @@
 //!
 //! Source: `docs/source/plan-issue-redesign/plan-tracking-issue-comment-taxonomy-v1.md`.
 
-use plan_issue::lifecycle_record::PayloadRole;
+use plan_issue::commands::record::{LifecycleCommentKind, RecordProfile};
+use plan_issue::lifecycle_record::{PayloadRole, render_record_post_comment};
 use plan_issue::lifecycle_vnext::visible_lint::{LintHints, codes, lint_visible};
+use serde_json::json;
 
 fn body_pass_state_non_final() -> String {
     "<!-- plan-issue-record:v2 role=state profile=tracking -->\n\n\
@@ -294,6 +296,36 @@ fn visible_lint_review_accepts_disposition_word_in_summary() {
 }
 
 #[test]
+fn visible_lint_review_accepts_escaped_pipes_in_cells() {
+    let body = render_record_post_comment(
+        RecordProfile::Tracking,
+        LifecycleCommentKind::Review,
+        json!({
+            "decision": "approve",
+            "lenses": ["testing"],
+            "findings": [{
+                "id": "F|1",
+                "severity": "minor",
+                "disposition": "fixed",
+                "summary": "API | CLI Disposition schema",
+            }],
+            "outcome_comment_url": "https://example.test/review",
+        }),
+        None,
+        Some("2026-07-12T00:00:00Z"),
+    )
+    .expect("render review body");
+    let hints = LintHints {
+        review_has_findings: true,
+        ..LintHints::default()
+    };
+
+    let report = lint_visible(PayloadRole::Review, &body, hints);
+
+    assert!(report.is_pass(), "{:?}", report.findings);
+}
+
+#[test]
 fn visible_lint_review_requires_a_structural_disposition_column() {
     let missing_column = "## Review Evidence\n\n\
         - Profile: tracking\n\
@@ -320,6 +352,91 @@ fn visible_lint_review_requires_a_structural_disposition_column() {
             report.codes()
         );
     }
+}
+
+#[test]
+fn visible_lint_review_rejects_malformed_findings_separator() {
+    let body = "## Review Evidence\n\n\
+        - Profile: tracking\n\
+        - Decision: approve\n\n\
+        | ID | Severity | Disposition | Summary |\n\
+        | --- | | | |\n\
+        | F1 | minor | fixed | ordinary summary |\n";
+    let hints = LintHints {
+        review_has_findings: true,
+        ..LintHints::default()
+    };
+
+    let report = lint_visible(PayloadRole::Review, body, hints);
+
+    assert!(
+        report.codes().contains(&codes::REVIEW_MISSING_DISPOSITION),
+        "codes={:?}",
+        report.codes()
+    );
+}
+
+#[test]
+fn visible_lint_review_ignores_hidden_findings_tables() {
+    let fenced = "## Review Evidence\n\n\
+        - Profile: tracking\n\
+        - Decision: approve\n\n\
+        ```markdown\n\
+        | ID | Severity | Disposition | Summary |\n\
+        | --- | --- | --- | --- |\n\
+        | F1 | minor | fixed | hidden example |\n\
+        ```\n";
+    let commented = "## Review Evidence\n\n\
+        - Profile: tracking\n\
+        - Decision: approve\n\n\
+        <!--\n\
+        | ID | Severity | Disposition | Summary |\n\
+        | --- | --- | --- | --- |\n\
+        | F1 | minor | fixed | hidden example |\n\
+        -->\n";
+    let indented = concat!(
+        "## Review Evidence\n\n",
+        "- Profile: tracking\n",
+        "- Decision: approve\n\n",
+        "    | ID | Severity | Disposition | Summary |\n",
+        "    | --- | --- | --- | --- |\n",
+        "    | F1 | minor | fixed | hidden example |\n",
+    );
+    let hints = LintHints {
+        review_has_findings: true,
+        ..LintHints::default()
+    };
+
+    for body in [fenced, commented, indented] {
+        let report = lint_visible(PayloadRole::Review, body, hints);
+        assert!(
+            report.codes().contains(&codes::REVIEW_MISSING_DISPOSITION),
+            "codes={:?}",
+            report.codes()
+        );
+    }
+}
+
+#[test]
+fn visible_lint_review_rejects_unrelated_disposition_table() {
+    let body = "## Review Evidence\n\n\
+        - Profile: tracking\n\
+        - Decision: approve\n\n\
+        | Component | Disposition | Notes |\n\
+        | --- | --- | --- |\n\
+        | parser | fixed | unrelated status |\n";
+    let hints = LintHints {
+        review_has_findings: true,
+        ..LintHints::default()
+    };
+
+    let report = lint_visible(PayloadRole::Review, body, hints);
+
+    assert!(
+        report.codes().contains(&codes::REVIEW_MISSING_DISPOSITION),
+        "codes={:?}",
+        report.codes()
+    );
 }
 
 #[test]

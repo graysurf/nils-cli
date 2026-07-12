@@ -383,11 +383,45 @@ fn is_table_separator(line: &str) -> bool {
 
 fn body_contains_review_disposition_row(body: &str) -> bool {
     let dispositions = ["fixed", "residual", "follow-up", "deferred", "no-action"];
+    let finding_headers = ["ID", "Severity", "Disposition", "Summary"];
     let mut pending_header = None;
     let mut disposition_column = None;
+    let mut fence_marker = None;
+    let mut in_html_comment = false;
 
     for line in body.lines() {
         let trimmed = line.trim();
+
+        if in_html_comment {
+            if trimmed.contains("-->") {
+                in_html_comment = false;
+            }
+            continue;
+        }
+        if let Some(marker) = fence_marker {
+            if markdown_fence_marker(trimmed) == Some(marker) {
+                fence_marker = None;
+            }
+            continue;
+        }
+        if line.starts_with("    ") || line.starts_with('\t') {
+            pending_header = None;
+            disposition_column = None;
+            continue;
+        }
+        if let Some((_, comment)) = trimmed.split_once("<!--") {
+            in_html_comment = !comment.contains("-->");
+            pending_header = None;
+            disposition_column = None;
+            continue;
+        }
+        if let Some(marker) = markdown_fence_marker(trimmed) {
+            fence_marker = Some(marker);
+            pending_header = None;
+            disposition_column = None;
+            continue;
+        }
+
         let Some(cells) = markdown_table_cells(trimmed) else {
             pending_header = None;
             disposition_column = None;
@@ -407,13 +441,14 @@ fn body_contains_review_disposition_row(body: &str) -> bool {
 
         if let Some((index, width)) = pending_header.take()
             && cells.len() == width
-            && is_table_separator(trimmed)
+            && is_markdown_table_separator(&cells)
         {
             disposition_column = Some((index, width));
             continue;
         }
 
-        if !is_table_separator(trimmed)
+        if cells.len() == finding_headers.len()
+            && finding_headers.iter().all(|header| cells.contains(header))
             && let Some(index) = cells.iter().position(|cell| *cell == "Disposition")
         {
             pending_header = Some((index, cells.len()));
@@ -423,9 +458,53 @@ fn body_contains_review_disposition_row(body: &str) -> bool {
     false
 }
 
+fn markdown_fence_marker(line: &str) -> Option<char> {
+    let marker = line.chars().next()?;
+    if !matches!(marker, '`' | '~') {
+        return None;
+    }
+    (line
+        .chars()
+        .take_while(|character| *character == marker)
+        .count()
+        >= 3)
+        .then_some(marker)
+}
+
+fn is_markdown_table_separator(cells: &[&str]) -> bool {
+    !cells.is_empty()
+        && cells.iter().all(|cell| {
+            let without_leading_alignment = cell.strip_prefix(':').unwrap_or(cell);
+            let hyphens = without_leading_alignment
+                .strip_suffix(':')
+                .unwrap_or(without_leading_alignment);
+            hyphens.len() >= 3 && hyphens.bytes().all(|byte| byte == b'-')
+        })
+}
+
 fn markdown_table_cells(line: &str) -> Option<Vec<&str>> {
     let inner = line.strip_prefix('|')?.strip_suffix('|')?;
-    Some(inner.split('|').map(str::trim).collect())
+    let mut cells = Vec::new();
+    let mut start = 0;
+    let mut preceding_backslashes = 0;
+
+    // Markdown treats a pipe as escaped only after an odd-length backslash
+    // run. The lifecycle renderer uses this form for literal pipes in IDs and
+    // summaries, so those bytes must remain inside their original cell.
+    for (index, character) in inner.char_indices() {
+        if character == '|' && preceding_backslashes % 2 == 0 {
+            cells.push(inner[start..index].trim());
+            start = index + character.len_utf8();
+            preceding_backslashes = 0;
+        } else if character == '\\' {
+            preceding_backslashes += 1;
+        } else {
+            preceding_backslashes = 0;
+        }
+    }
+    cells.push(inner[start..].trim());
+
+    Some(cells)
 }
 
 fn body_contains_review_context(body: &str) -> bool {
