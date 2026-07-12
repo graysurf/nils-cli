@@ -73,6 +73,7 @@ pub(crate) enum Confidence {
 pub(crate) enum SourceKind {
     #[default]
     ProviderHook,
+    ProviderProtocol,
     ConsoleObservation,
     TerminalHeuristic,
     Runtime,
@@ -275,6 +276,39 @@ pub(crate) struct ActivityResult {
     pub(crate) id: String,
     pub(crate) turn_state: TurnState,
     pub(crate) duplicate: bool,
+}
+
+pub(crate) fn ingest_codex_app_server_failure(
+    context: &CliContext,
+    id: &str,
+    runtime_id: &str,
+    thread_id: &str,
+    turn_id: &str,
+) -> Result<ActivityResult, CliError> {
+    let provider_session_id =
+        projected_provider_identifier(runtime_id, AgentKind::Codex, "session", thread_id)?;
+    let provider_turn_id =
+        projected_provider_identifier(runtime_id, AgentKind::Codex, "turn", turn_id)?;
+    ingest_event(
+        context,
+        id,
+        TurnEvent {
+            schema_version: TURN_EVENT_VERSION.to_string(),
+            event_id: format!("codex-app-server-failure:{provider_turn_id}"),
+            runtime_id: runtime_id.to_string(),
+            provider: AgentKind::Codex.as_str().to_string(),
+            provider_session_id: Some(provider_session_id),
+            provider_turn_id: Some(provider_turn_id),
+            kind: TurnEventKind::TurnFailed,
+            failure_reason: Some("usage_exhausted".to_string()),
+            attention_id: None,
+            attention_kind: None,
+            attention_correlation_ambiguous: false,
+            confidence: Confidence::Authoritative,
+            source_kind: SourceKind::ProviderProtocol,
+            provider_time: None,
+        },
+    )
 }
 
 /// Project durable activity state onto the explicitly allowlisted stream
@@ -723,7 +757,10 @@ fn semantic_event_is_duplicate(
     key: &str,
     received_at: &str,
 ) -> bool {
-    if event.source_kind != SourceKind::ProviderHook {
+    if !matches!(
+        event.source_kind,
+        SourceKind::ProviderHook | SourceKind::ProviderProtocol
+    ) {
         return false;
     }
     if event.provider == AgentKind::Hermes.as_str()
@@ -1265,7 +1302,10 @@ fn ingest_event_with_lock(
     }
     reduce(&mut document, &event, &received_at);
     document.last_event_at = Some(received_at.clone());
-    if event.source_kind == SourceKind::ProviderHook {
+    if matches!(
+        event.source_kind,
+        SourceKind::ProviderHook | SourceKind::ProviderProtocol
+    ) {
         document.last_semantic_event = Some(semantic_key);
         document.last_semantic_event_at = Some(received_at.clone());
     }
@@ -1309,7 +1349,10 @@ fn arm_auto_resume_from_event(
     if event.kind != TurnEventKind::TurnFailed
         || event.failure_reason.as_deref() != Some("usage_exhausted")
         || event.confidence != Confidence::Authoritative
-        || event.source_kind != SourceKind::ProviderHook
+        || !matches!(
+            event.source_kind,
+            SourceKind::ProviderHook | SourceKind::ProviderProtocol
+        )
     {
         return Ok(());
     }

@@ -78,9 +78,10 @@ pub(crate) enum TickOutcome {
 
 fn supported(record: &SessionRecord) -> bool {
     // Claude Code StopFailure exposes an official structured `error=rate_limit`
-    // signal. Codex's current interactive notification surface does not expose
-    // an authoritative structured failure reason, so it stays fail-closed.
-    record.agent == "claude"
+    // signal. Codex is supported only when this exact runtime was launched
+    // through the app-server v2 protocol; the standalone TUI notification
+    // surface remains fail-closed because it has no structured failure reason.
+    record.agent == "claude" || crate::codex_app_server::runtime_is_supported(record)
 }
 
 fn default_state(now: &str) -> DurableAutoResume {
@@ -396,6 +397,39 @@ pub(crate) fn record_scheduler_error(
         return Ok(TickOutcome::Unchanged);
     }
     record_retry(context, &record, state, now_epoch, reason)
+}
+
+/// Advance an already-scheduled claim when the bound provider reports that
+/// usage is available before the previously advertised reset epoch. This is
+/// intentionally narrower than arming: reconnects and rate-limit updates may
+/// wake an existing claim, but can never create one or revive a cancellation.
+pub(crate) fn wake_scheduled_if_usage_open(
+    context: &CliContext,
+    id: &str,
+    now_epoch: i64,
+) -> Result<bool, CliError> {
+    let now = epoch_string(now_epoch)?;
+    let observed = load_session_record(context, id)?;
+    let canonical_id = observed.id.clone();
+    let _lock = acquire_session_record_lock(context, &canonical_id)?;
+    let record = load_session_record(context, &canonical_id)?;
+    crate::ensure_same_session_identity(&observed, &record)?;
+    let mut state = read_state(context, &record.id, &now)?;
+    if !state.enabled || state.state != "scheduled" || !state.ever_scheduled {
+        return Ok(false);
+    }
+    let due = state
+        .scheduled_at
+        .as_deref()
+        .and_then(epoch_from_string)
+        .is_none_or(|due| due <= now_epoch);
+    if due {
+        return Ok(false);
+    }
+    state.updated_at = now.clone();
+    state.scheduled_at = Some(now);
+    write_state(context, &record.id, &state)?;
+    Ok(true)
 }
 
 pub(crate) fn tick<F>(
@@ -743,6 +777,51 @@ mod tests {
         .unwrap();
         assert_eq!(duplicate, TickOutcome::Unchanged);
         assert_eq!(submissions, 1);
+    }
+
+    #[test]
+    fn authoritative_open_usage_advances_only_an_existing_scheduled_claim() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (context, record) = seed_session(&tmp);
+        set_enabled(&context, &record.id, true, "2030-01-01T00:00:00Z").unwrap();
+        let revision = waiting_revision(&context, &record);
+        arm_usage_exhaustion(
+            &context,
+            &record.id,
+            "turn-1".to_string(),
+            revision,
+            "2030-01-01T00:00:01Z",
+        )
+        .unwrap();
+        let base = 1_893_456_000;
+        tick(
+            &context,
+            &record.id,
+            base,
+            &UsageSnapshot {
+                authoritative: true,
+                has_exhausted_windows: true,
+                exhausted_reset_epochs: vec![base + 900],
+            },
+            |_| panic!("must not submit while blocked"),
+        )
+        .unwrap();
+
+        assert!(wake_scheduled_if_usage_open(&context, &record.id, base + 1).unwrap());
+        assert_eq!(
+            read_state(&context, &record.id, "ignored")
+                .unwrap()
+                .scheduled_at
+                .as_deref()
+                .and_then(epoch_from_string),
+            Some(base + 1)
+        );
+
+        cancel_for_manual_input_locked(&context, &record.id, "2030-01-01T00:00:02Z").unwrap();
+        assert!(!wake_scheduled_if_usage_open(&context, &record.id, base + 2).unwrap());
+        let cancelled = read_state(&context, &record.id, "ignored").unwrap();
+        assert_eq!(cancelled.state, "cancelled");
+        assert!(!cancelled.enabled);
     }
 
     #[test]
@@ -1097,5 +1176,36 @@ mod tests {
             state.failure_reason.as_deref(),
             Some("submission_outcome_unknown")
         );
+    }
+
+    #[test]
+    fn app_server_backed_codex_can_enable_auto_resume() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (context, mut record) = seed_session(&tmp);
+        record.agent = "codex".to_string();
+        let runtime = record.runtime.as_mut().unwrap();
+        runtime.kind = "codex_app_server".to_string();
+        runtime
+            .extra
+            .insert("codex_app_server_protocol".to_string(), json!("v2"));
+        runtime.extra.insert(
+            "codex_app_server_socket".to_string(),
+            json!("/run/user/1000/agent-session/codex-test.sock"),
+        );
+        runtime.extra.insert(
+            "codex_app_server_thread_handoff".to_string(),
+            json!("/run/user/1000/agent-session/codex-test.thread"),
+        );
+        runtime.extra.insert(
+            "codex_app_server_thread_attached".to_string(),
+            json!("/run/user/1000/agent-session/codex-test.attached"),
+        );
+        crate::write_session_record(&context, &record).unwrap();
+
+        let view = set_enabled(&context, &record.id, true, "2030-01-01T00:00:00Z")
+            .expect("a capability-probed app-server Codex runtime should be supported");
+        assert!(view.supported);
+        assert!(view.enabled);
+        assert_eq!(view.state, "enabled");
     }
 }

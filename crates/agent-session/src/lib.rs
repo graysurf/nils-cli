@@ -1,6 +1,7 @@
 mod activity;
 mod auto_resume;
 mod cli;
+mod codex_app_server;
 pub mod completion;
 mod provider_prompt;
 mod serve;
@@ -732,6 +733,16 @@ fn start_session(context: &CliContext, args: cli::StartArgs) -> Result<StartView
         agent_bin: Some(display_path(&agent_bin)),
     })?;
 
+    if let Err(err) = codex_app_server::configure_runtime(
+        context,
+        &agent_bin,
+        &mut created.record,
+        args.app_server_managed,
+    ) {
+        cleanup_created_record(&created);
+        return Err(err);
+    }
+
     if let Err(err) = start_interactive_tmux(
         &tmux_bin,
         &agent_bin,
@@ -998,6 +1009,7 @@ fn create_record(request: RecordRequest<'_>) -> Result<CreatedRecord, CliError> 
 }
 
 fn cleanup_created_record(created: &CreatedRecord) {
+    let _ = codex_app_server::cleanup_runtime_files(&created.record);
     let _ = fs::remove_dir_all(&created.session_dir);
 }
 
@@ -1305,7 +1317,45 @@ fn start_interactive_tmux(
         .arg("-c")
         .arg(&record.cwd);
     add_runtime_tmux_environment(&mut command, state_dir, record)?;
-    command.arg("--").arg(agent_bin);
+    command.arg("--");
+
+    if agent == AgentKind::Codex && codex_app_server::runtime_is_supported(record) {
+        let socket = codex_app_server::socket_path(record).ok_or_else(|| {
+            CliError::data(
+                "codex-app-server-socket-missing",
+                "Codex app-server runtime is missing its private socket",
+                Some(json!({ "id": record.id })),
+            )
+        })?;
+        let handoff = codex_app_server::thread_handoff_path(record).ok_or_else(|| {
+            CliError::data(
+                "codex-app-server-handoff-missing",
+                "Codex app-server runtime is missing its thread handoff path",
+                Some(json!({ "id": record.id })),
+            )
+        })?;
+        let attached = codex_app_server::thread_attached_path(record).ok_or_else(|| {
+            CliError::data(
+                "codex-app-server-attached-marker-missing",
+                "Codex app-server runtime is missing its attached marker path",
+                Some(json!({ "id": record.id })),
+            )
+        })?;
+        command
+            .arg("sh")
+            .arg("-c")
+            .arg(codex_app_server::launch_script())
+            .arg("agent-session-codex-app-server")
+            .arg(socket)
+            .arg(handoff)
+            .arg(attached)
+            .arg(agent_bin)
+            .arg(&record.cwd)
+            .args(agent_args);
+        return run_status(command, "tmux new-session");
+    }
+
+    command.arg(agent_bin);
 
     match agent {
         AgentKind::Codex => {
@@ -3215,6 +3265,7 @@ fn delete_session(
     validate_record_id(&record, &resolved.expected_id, &resolved.record_path)?;
     let session_dir = resolved.session_dir;
     let killed = kill_tmux_session(&tmux_bin, &record.tmux_session);
+    codex_app_server::cleanup_runtime_files(&record)?;
     fs::remove_dir_all(&session_dir).map_err(|err| {
         CliError::runtime(
             "session-delete-failed",

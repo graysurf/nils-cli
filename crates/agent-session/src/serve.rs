@@ -52,16 +52,17 @@ use tokio::task::JoinSet;
 
 use crate::auto_resume::{self, UsageSnapshot};
 use crate::cli::{self, AgentKind, SpecialKey};
+use crate::codex_app_server::{self, ControlHandle};
 use crate::provider_prompt::{
     MAX_PROVIDER_PROMPT_BYTES, PROVIDER_PROMPT_CAPABILITY, ProviderKind, ProviderPromptEvent,
     ProviderPromptSource, ProviderPromptTail,
 };
 use crate::{
-    BINARY, CliContext, CliError, ProviderResumeImportArgs, SessionView, WorkdirSearchOptions,
-    delete_session, glance_session, list_sessions, load_session_record, non_empty_env,
-    repo_remote_url_from_cwd, resolve_tmux_bin, resume_session_by_id, search_workdirs,
-    send_auto_resume_input, send_input_serialized, session_clipboard_buffer, session_dir,
-    session_status, short_hostname, start_provider_resume_session, start_session,
+    BINARY, CliContext, CliError, ProviderResumeImportArgs, SessionRecord, SessionView,
+    WorkdirSearchOptions, delete_session, glance_session, list_sessions, load_session_record,
+    non_empty_env, repo_remote_url_from_cwd, resolve_tmux_bin, resume_session_by_id,
+    search_workdirs, send_auto_resume_input, send_input_serialized, session_clipboard_buffer,
+    session_dir, session_status, short_hostname, start_provider_resume_session, start_session,
     update_session_title, write_session_attachment,
 };
 
@@ -125,7 +126,14 @@ struct ServeState {
     attach_brokers: AttachBrokerRegistry,
     provider_prompt_discovery: Arc<ProviderPromptDiscoveryRegistry>,
     activity_broker: Arc<ActivityBroker>,
+    codex_controls: Arc<StdMutex<HashMap<String, CodexControlEntry>>>,
     session_collector: SessionCollector,
+}
+
+#[derive(Clone)]
+struct CodexControlEntry {
+    launch_id: String,
+    handle: ControlHandle,
 }
 
 fn default_session_collector() -> SessionCollector {
@@ -205,6 +213,7 @@ pub fn run_serve(context: &CliContext, args: cli::ServeArgs) -> i32 {
             attach_brokers: AttachBrokerRegistry::default(),
             provider_prompt_discovery: Arc::new(ProviderPromptDiscoveryRegistry::default()),
             activity_broker,
+            codex_controls: Arc::new(StdMutex::new(HashMap::new())),
             session_collector,
         });
         let listener = match tokio::net::TcpListener::bind(bind).await {
@@ -219,12 +228,15 @@ pub fn run_serve(context: &CliContext, args: cli::ServeArgs) -> i32 {
             state.machine
         );
         let app = router(state.clone());
+        let codex_control_task = tokio::spawn(codex_control_loop(state.clone()));
         let auto_resume_task = tokio::spawn(auto_resume_loop(state.clone()));
         let result = axum::serve(listener, app)
             .with_graceful_shutdown(shutdown_signal())
             .await;
         auto_resume_task.abort();
         let _ = auto_resume_task.await;
+        codex_control_task.abort();
+        let _ = codex_control_task.await;
         state.attach_brokers.shutdown_all().await;
         match result {
             Ok(()) => exit::SUCCESS,
@@ -2196,6 +2208,7 @@ async fn create_handler(
         };
     }
     let args = cli::StartArgs {
+        app_server_managed: true,
         agent,
         cwd: body.cwd.map(PathBuf::from),
         title: body.title,
@@ -2360,6 +2373,15 @@ async fn auto_resume_loop(state: Arc<ServeState>) {
             .await;
         }
         if !pending.usage_ids.is_empty() {
+            let (codex_ids, claude_ids) =
+                partition_auto_resume_ids(&state, pending.usage_ids).await;
+            if !codex_ids.is_empty() {
+                process_codex_auto_resume_ids(state.clone(), codex_ids).await;
+            }
+            if claude_ids.is_empty() {
+                tokio::time::sleep(POLL_INTERVAL).await;
+                continue;
+            }
             let timeout = usage_timeout();
             let provider = tokio::task::spawn_blocking(move || collect_claude_usage(timeout))
                 .await
@@ -2377,10 +2399,166 @@ async fn auto_resume_loop(state: Arc<ServeState>) {
                     .filter_map(|window| window.reset_at_epoch)
                     .collect(),
             };
-            process_auto_resume_ids(state.clone(), pending.usage_ids, usage).await;
+            process_auto_resume_ids(state.clone(), claude_ids, usage).await;
         }
         tokio::time::sleep(POLL_INTERVAL).await;
     }
+}
+
+async fn partition_auto_resume_ids(
+    state: &ServeState,
+    ids: Vec<String>,
+) -> (Vec<String>, Vec<String>) {
+    let context = state.context.clone();
+    tokio::task::spawn_blocking(move || {
+        ids.into_iter().partition(|id| {
+            load_session_record(&context, id)
+                .ok()
+                .is_some_and(|record| codex_app_server::runtime_is_supported(&record))
+        })
+    })
+    .await
+    .unwrap_or_default()
+}
+
+async fn process_codex_auto_resume_ids(state: Arc<ServeState>, ids: Vec<String>) {
+    for id in ids {
+        let control = state
+            .codex_controls
+            .lock()
+            .ok()
+            .and_then(|controls| controls.get(&id).cloned());
+        let Some(control) = control else {
+            record_codex_scheduler_error(state.context.clone(), id, "usage_unavailable").await;
+            continue;
+        };
+        let usage = match control.handle.usage().await {
+            Ok(usage) => usage,
+            Err(_) => {
+                record_codex_scheduler_error(state.context.clone(), id, "usage_unavailable").await;
+                continue;
+            }
+        };
+        let context = state.context.clone();
+        let runtime = tokio::runtime::Handle::current();
+        let handle = control.handle.clone();
+        tokio::task::spawn_blocking(move || {
+            let now_epoch = jiff::Timestamp::now().as_second();
+            if let Err(err) = auto_resume::tick(&context, &id, now_epoch, &usage, |_| {
+                runtime
+                    .block_on(handle.submit(auto_resume::CONTINUATION_MESSAGE))
+                    .map(|_| ())
+                    .map_err(|_| {
+                        CliError::runtime(
+                            "codex-app-server-submit-unknown",
+                            "Codex continuation submission outcome is unknown",
+                            Some(json!({ "id": id })),
+                        )
+                    })
+            }) {
+                eprintln!("warning: Codex auto-resume tick failed: {}", err.code());
+            }
+        })
+        .await
+        .ok();
+    }
+}
+
+async fn record_codex_scheduler_error(context: CliContext, id: String, reason: &'static str) {
+    tokio::task::spawn_blocking(move || {
+        let now_epoch = jiff::Timestamp::now().as_second();
+        if let Err(err) = auto_resume::record_scheduler_error(&context, &id, now_epoch, reason) {
+            eprintln!(
+                "warning: Codex auto-resume failure checkpoint failed: {}",
+                err.code()
+            );
+        }
+    })
+    .await
+    .ok();
+}
+
+async fn codex_control_loop(state: Arc<ServeState>) {
+    const RECONCILE_INTERVAL: Duration = Duration::from_secs(2);
+    loop {
+        let context = state.context.clone();
+        let tmux = state.tmux_bin.clone();
+        let records = tokio::task::spawn_blocking(move || discover_codex_controls(&context, &tmux))
+            .await
+            .unwrap_or_default();
+        let live: std::collections::HashSet<(String, String)> = records
+            .iter()
+            .filter_map(|record| {
+                record
+                    .runtime
+                    .as_ref()
+                    .map(|runtime| (record.id.clone(), runtime.launch_id.clone()))
+            })
+            .collect();
+        if let Ok(mut controls) = state.codex_controls.lock() {
+            controls.retain(|id, entry| live.contains(&(id.clone(), entry.launch_id.clone())));
+        }
+        for record in records {
+            let Some(launch_id) = record
+                .runtime
+                .as_ref()
+                .map(|runtime| runtime.launch_id.clone())
+            else {
+                continue;
+            };
+            let already_running = state.codex_controls.lock().ok().is_some_and(|controls| {
+                controls
+                    .get(&record.id)
+                    .is_some_and(|entry| entry.launch_id == launch_id)
+            });
+            if already_running {
+                continue;
+            }
+            let (handle, commands) = codex_app_server::control_channel();
+            if let Ok(mut controls) = state.codex_controls.lock() {
+                controls.insert(
+                    record.id.clone(),
+                    CodexControlEntry {
+                        launch_id: launch_id.clone(),
+                        handle,
+                    },
+                );
+            }
+            let registry = state.codex_controls.clone();
+            let context = state.context.clone();
+            tokio::spawn(async move {
+                if let Err(err) =
+                    codex_app_server::run_control(context, record.clone(), commands).await
+                {
+                    eprintln!("warning: Codex app-server control ended: {err}");
+                }
+                if let Ok(mut controls) = registry.lock()
+                    && controls
+                        .get(&record.id)
+                        .is_some_and(|entry| entry.launch_id == launch_id)
+                {
+                    controls.remove(&record.id);
+                }
+            });
+        }
+        tokio::time::sleep(RECONCILE_INTERVAL).await;
+    }
+}
+
+fn discover_codex_controls(context: &CliContext, tmux: &Path) -> Vec<SessionRecord> {
+    let root = context.state_dir.join("sessions");
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return Vec::new();
+    };
+    entries
+        .filter_map(Result::ok)
+        .filter_map(|entry| entry.file_name().into_string().ok())
+        .filter_map(|id| load_session_record(context, &id).ok())
+        .filter(|record| {
+            codex_app_server::runtime_is_supported(record)
+                && session_status(tmux, record) == "running"
+        })
+        .collect()
 }
 
 async fn process_auto_resume_ids(state: Arc<ServeState>, ids: Vec<String>, usage: UsageSnapshot) {
@@ -5593,6 +5771,7 @@ mod tests {
             attach_brokers: AttachBrokerRegistry::default(),
             provider_prompt_discovery: Arc::new(ProviderPromptDiscoveryRegistry::default()),
             activity_broker,
+            codex_controls: Arc::new(StdMutex::new(HashMap::new())),
             session_collector,
         })
     }
@@ -8026,6 +8205,56 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "body={body}");
         assert_eq!(body["error"]["code"], "auto-resume-unsupported");
+    }
+
+    #[tokio::test]
+    async fn serve_created_capable_codex_session_projects_supported_app_server_runtime() {
+        let lock = GlobalStateLock::new();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cwd = tmp.path().join("repo");
+        let runtime_dir = tmp.path().join("run");
+        let log = tmp.path().join("tmux.log");
+        fs::create_dir(&cwd).unwrap();
+        fs::create_dir(&runtime_dir).unwrap();
+        let codex = executable(
+            &tmp.path().join("codex-app-server"),
+            "#!/usr/bin/env sh\nif [ \"$1\" = app-server ] && [ \"$2\" = --help ]; then printf '%s\\n' '  --listen <URL>'; fi\n",
+        );
+        let _codex_bin = EnvGuard::set(&lock, "AGENT_SESSION_CODEX_BIN", codex.to_str().unwrap());
+        let _runtime_dir = EnvGuard::set(&lock, "XDG_RUNTIME_DIR", runtime_dir.to_str().unwrap());
+        let _runtime_mode = EnvGuard::set(&lock, "AGENT_SESSION_CODEX_RUNTIME", "app-server");
+        let _capture_timeout = EnvGuard::set(&lock, "AGENT_SESSION_CODEX_CAPTURE_TIMEOUT_MS", "10");
+        let st = state(tmp.path(), Some(TOKEN), logging_tmux(tmp.path(), &log));
+
+        let (status, body) = call(
+            router(st),
+            post_json(
+                "/sessions",
+                Some(TOKEN),
+                json!({
+                    "agent": "codex",
+                    "id": "managed-codex",
+                    "cwd": cwd.to_string_lossy()
+                }),
+            ),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK, "body={body}");
+        let session = &body["data"]["session"];
+        assert_eq!(session["auto_resume"]["supported"], true);
+        let record: Value = serde_json::from_slice(
+            &fs::read(tmp.path().join("sessions/managed-codex/session.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(record["runtime"]["kind"], codex_app_server::RUNTIME_KIND);
+        assert_eq!(
+            record["runtime"]["codex_app_server_protocol"],
+            codex_app_server::PROTOCOL_VERSION
+        );
+        let calls = fs::read_to_string(log).unwrap();
+        assert!(calls.contains("agent-session-codex-app-server"));
+        assert!(calls.contains("app-server --listen"));
     }
 
     // The WebSocket attach handler guards with the same `deny_unauthorized` as

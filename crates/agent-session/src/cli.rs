@@ -65,6 +65,10 @@ pub enum Command {
 
 #[derive(Debug, Args)]
 pub struct StartArgs {
+    /// Internal: the serve daemon owns the Codex app-server control connection.
+    #[arg(skip)]
+    pub app_server_managed: bool,
+
     /// Agent to run.
     #[arg(long, value_enum)]
     pub agent: AgentKind,

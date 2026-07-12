@@ -164,10 +164,15 @@ is no second state model.
   status; `PUT` with `{ "enabled": true|false }` opts a supported session in or
   out, and `DELETE` durably cancels pending work. Both mutations require the
   bearer token. Claude Code is supported through its authoritative structured
-  `StopFailure.error == "rate_limit"` signal. Codex remains explicitly
-  unsupported until its interactive lifecycle surface exposes an equivalent
-  structured failure reason; terminal text and assistant output are never
-  treated as authority.
+  `StopFailure.error == "rate_limit"` signal. Fresh interactive Codex sessions
+  created through the serve API are also supported when the installed CLI
+  capability probe selects the app-server v2 runtime. The daemon consumes the
+  live metadata-only protocol
+  and requires an exact bound thread/turn with terminal `status == "failed"`
+  plus `codexErrorInfo == "usageLimitExceeded"`. Standalone/raw Codex TUI,
+  imported Codex conversations, and resumed pre-app-server Codex sessions remain
+  unsupported. Terminal text and assistant output are never treated as
+  authority.
   The response object is `{ schema_version, supported, enabled, state,
   scheduled_at?, failure_reason? }`. `scheduled_at`, when present, is an
   RFC 3339 timestamp. The v1 `state` values are `disabled`, `enabled`, `armed`,
@@ -189,6 +194,11 @@ is no second state model.
   Restart recovery scans pending records; duplicate events/ticks cannot submit
   twice, cancellation is serialized against wake-up, and bounded retry ends in
   an observable terminal failure.
+  Claude usage checks use the existing provider helper. Codex app-server
+  sessions use `account/rateLimits/read` on their bound control connection and
+  submit the continuation with `turn/start`; only a response carrying the
+  acknowledged turn id counts as success. A timeout or disconnect after the
+  durable claim is terminal `submission_outcome_unknown` and is never replayed.
 - `GET /workdirs?q=...&limit=N` — authenticated read; searches only the default operator roots (`$HOME/Project` and
   `$HOME/.config`) with bounded depth, count, and elapsed-time limits. Add `git_only=true&exclude_worktrees=true` for
   the curated project picker: only primary git working trees are returned, ordered by most-recent session cwd usage
@@ -216,6 +226,21 @@ is no second state model.
   Claude provider conversation instead: it resolves the original cwd from local provider history, persists exact
   `provider_resume` metadata, and starts tmux with the canonical resume command. In resume-id mode, omit `cwd`, `prompt`,
   and `agent_args`; invalid, missing, ambiguous, or unsupported provider ids return structured errors.
+  For a fresh serve-managed Codex session, `agent-session` probes
+  `codex app-server --help` under a 250 ms process-group bound. A CLI that
+  advertises Unix `--listen` support is launched as a remote TUI over a private
+  short socket below `XDG_RUNTIME_DIR/agent-session`; otherwise auto mode
+  degrades to the existing raw TUI. `AGENT_SESSION_CODEX_RUNTIME=raw` forces
+  the fallback and `AGENT_SESSION_CODEX_RUNTIME=app-server` requires both the
+  same capability probe and a private Unix socket. Standalone `agent-session
+  start` remains raw because no serve daemon owns its control connection.
+  For a new app-server process, the control client starts one thread and runs
+  the shell builtin `:` through `thread/shellCommand` to establish its rollout
+  without model quota, output, filesystem writes, or network access. It passes
+  the raw thread id through a mode-`0600` ephemeral handoff file; the TUI
+  consumes and removes that file before creating a private attached marker.
+  Daemon restart reconnects to the one loaded thread, while delete and launch
+  failure remove the derived socket, handoff, and marker paths.
 - Attachment upload uses a raw binary request body (not multipart), capped at 25 MiB. The daemon writes the file under the
   session's private `attachments/` directory with a sanitized filename and returns the remote path in the serve envelope.
   Empty or null titles clear the custom session title so clients can fall back to the session id.

@@ -33,6 +33,10 @@ created.
   and block automatic setup. Codex appends its full notification JSON to that
   argv; agent-session discards content after parsing and never persists it, but
   the provider-supplied argv is transiently visible to same-host process inspection.
+- [Codex app-server errors](https://learn.chatgpt.com/docs/app-server#errors)
+  documents structured turn failures. The audited 0.144.1 schema and live Unix
+  WebSocket probe expose `Turn.status`, `Turn.error.codexErrorInfo`, the
+  `error` notification, `account/rateLimits/read`, and `turn/start`.
 - [Claude Code hooks](https://code.claude.com/docs/en/hooks) documents parallel
   matching hooks, exact `AskUserQuestion` matching, shared `tool_use_id` on
   `PreToolUse`/`PostToolUse`/`PostToolUseFailure`, `PermissionRequest` without
@@ -47,7 +51,7 @@ created.
 
 | Provider | Audited floor | Classification | Start | Completion | Attention | Failure | Setup |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| Codex | 0.144.1 | supported; usage-failure unavailable | `UserPromptSubmit`, observed | matching `agent-turn-complete`, authoritative; raw `Stop` remains journal evidence only | `PermissionRequest`, observed conservative latch | runtime/fallback only; no structured interactive usage-failure field | additive hooks in `~/.codex/hooks.json` plus owned or bounded direct-argv-composed notify in `~/.codex/config.toml`; unsafe/recursive values fail closed |
+| Codex | 0.144.1 | supported; usage-failure supported only for agent-session app-server v2 runtimes | `UserPromptSubmit`, observed | matching `agent-turn-complete`, authoritative; raw `Stop` remains journal evidence only | `PermissionRequest`, observed conservative latch | live app-server `failed` + `usageLimitExceeded`, authoritative; raw TUI remains unavailable | additive hooks/notify plus capability-probed private Unix app-server runtime for fresh sessions |
 | Claude Code | 2.1.206 | partial; usage-failure supported | `UserPromptSubmit`, observed | `idle_prompt`, observed; raw `Stop` is journal evidence only | exact `AskUserQuestion` request/clear; `PermissionRequest`/notification conservative latch | structured `StopFailure.error`, authoritative; only `rate_limit` can arm auto-resume | additive merge into `~/.claude/settings.json` |
 | Hermes | 0.18.2 | supported | `pre_llm_call`, observed | successful non-interrupted `post_llm_call`, authoritative | non-empty shell `extra.tool_call_id` projects to exact pre/post correlation; missing/empty-id tuple fallback remains conservative | runtime/fallback only | additive merge into `~/.hermes/config.yaml`; Hermes consent remains mandatory |
 
@@ -74,6 +78,24 @@ turn. Duplicate completion is idempotent.
 `PostToolUse`; `PostToolUse.tool_use_id` cannot be correlated to the preceding
 approval. Multiple approval requests therefore use agent-session-owned opaque
 attention ids and remain latched. Unrelated progress never clears them.
+
+For fresh agent-session-managed sessions, a bounded capability probe may launch
+`codex app-server` and connect the visible TUI through its private Unix socket.
+The daemon holds a second control connection, binds only when the per-session
+server exposes exactly one loaded thread, and consumes the live stream. A
+matching non-retrying `error` notification followed by `turn/completed`, or a
+terminal failed Turn carrying the same structured error, maps
+`usageLimitExceeded` to `usage_exhausted`. Wrong threads, wrong turns,
+non-terminal statuses, retrying errors, reordered partial envelopes, unknown
+values, malformed usage snapshots, and monitor gaps cannot arm or submit. Raw
+thread/turn ids are runtime-scoped SHA-256 projections before persistence;
+human error text, prompts, output, and auth/account payloads are discarded.
+
+The persisted rollout history is not used to recover failures because the live
+probe demonstrated that a failed quota turn can later appear as completed with
+no error. Continuation therefore uses the same bound live connection and is
+successful only after `turn/start` acknowledges a new turn id. Unknown outcomes
+are terminal and never replayed.
 
 ### Claude Code
 

@@ -451,6 +451,75 @@ fn activity_setup_repair_preview_is_codex_only_in_matrix_help_and_completion() {
 }
 
 #[test]
+fn standalone_start_keeps_codex_raw_without_a_serve_owned_control_plane() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let state_dir = tmp.path().join("state");
+    let runtime_dir = tmp.path().join("run");
+    let codex_home = tmp.path().join("codex-home");
+    let cwd = tmp.path().join("repo");
+    fs::create_dir_all(runtime_dir.join("agent-session")).expect("shared runtime dir");
+    fs::create_dir_all(&cwd).expect("repo dir");
+    let (tmux_bin, tmux_log) = fake_tmux(tmp.path());
+    let codex_bin = tmp.path().join("codex-app-server");
+    write_executable(
+        &codex_bin,
+        "#!/usr/bin/env sh\nif [ \"$1\" = app-server ] && [ \"$2\" = --help ]; then printf '%s\\n' '  --listen <URL>'; exit 0; fi\nexit 1\n",
+    );
+
+    let state_arg = state_dir.to_string_lossy().to_string();
+    let cwd_arg = cwd.to_string_lossy().to_string();
+    let tmux_arg = tmux_bin.to_string_lossy().to_string();
+    let codex_arg = codex_bin.to_string_lossy().to_string();
+    let tmux_log_arg = tmux_log.to_string_lossy().to_string();
+    let runtime_arg = runtime_dir.to_string_lossy().to_string();
+    let codex_home_arg = codex_home.to_string_lossy().to_string();
+    let output = run(
+        tmp.path(),
+        &[
+            "--state-dir",
+            &state_arg,
+            "start",
+            "--agent",
+            "codex",
+            "--cwd",
+            &cwd_arg,
+            "--tmux-bin",
+            &tmux_arg,
+            "--agent-bin",
+            &codex_arg,
+            "--paste-delay-ms",
+            "0",
+            "--format",
+            "json",
+        ],
+        &[
+            ("AGENT_SESSION_FAKE_TMUX_LOG", &tmux_log_arg),
+            ("AGENT_SESSION_CODEX_CAPTURE_TIMEOUT_MS", "10"),
+            ("XDG_RUNTIME_DIR", &runtime_arg),
+            ("CODEX_HOME", &codex_home_arg),
+        ],
+    );
+    assert_eq!(output.code, 0, "stderr={}", output.stderr_text());
+    let id = data(&output.stdout_json())["id"]
+        .as_str()
+        .expect("session id")
+        .to_string();
+    let record: Value = serde_json::from_str(
+        &fs::read_to_string(state_dir.join("sessions").join(id).join("session.json"))
+            .expect("session record"),
+    )
+    .expect("record json");
+    assert_eq!(record["runtime"]["kind"], "tmux");
+    assert!(record["runtime"].get("codex_app_server_protocol").is_none());
+    let launch = tmux_calls(&tmux_log)
+        .into_iter()
+        .find(|call| call.first().is_some_and(|arg| arg == "new-session"))
+        .expect("new-session call");
+    assert!(launch.iter().any(|arg| arg == &codex_arg));
+    assert!(!launch.iter().any(|arg| arg.contains("app-server --listen")));
+}
+
+#[test]
 fn activity_events_are_runtime_bound_private_and_deterministic() {
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let state_dir = tmp.path().join("state");
