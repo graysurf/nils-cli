@@ -335,7 +335,7 @@ _test-first-evidence() {
                     return 0
                     ;;
                 --disposition)
-                    COMPREPLY=($(compgen -W "keep update-spec remove-obsolete add-missing refactor-only" -- "${cur}"))
+                    COMPREPLY=($(compgen -W "keep update-spec remove-superseded add-missing refactor-only" -- "${cur}"))
                     return 0
                     ;;
                 --protected-behavior)

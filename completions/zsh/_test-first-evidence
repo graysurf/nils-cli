@@ -65,7 +65,7 @@ _arguments "${_arguments_options[@]}" : \
 '--out=[Evidence artifact directory containing \`test-first-evidence.json\`]:DIR:_files -/' \
 '--format=[Output format]:FORMAT:(text json)' \
 '--target=[Test name, path, suite, fixture family, or snapshot group]:TEXT:_default' \
-'--disposition=[Planned disposition for the affected target]:DISPOSITION:(keep update-spec remove-obsolete add-missing refactor-only)' \
+'--disposition=[Planned disposition for the affected target]:DISPOSITION:(keep update-spec remove-superseded add-missing refactor-only)' \
 '--protected-behavior=[Behavior or risk protected by the target]:TEXT:_default' \
 '--reason=[Why this disposition is correct. Required for both target and none forms]:TEXT:_default' \
 '--owner-test=[Replacement or primary owner test when another target preserves the contract]:TEXT:_default' \
