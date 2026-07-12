@@ -17,7 +17,8 @@ agent-memory/
 |-- profiles/<id>/
 |-- candidates/<producer>/
 |-- agents/<id>/
-`-- personas/<id>/
+|-- personas/<id>/
+`-- archive/superseded/
 ```
 
 ## Commands
@@ -51,6 +52,11 @@ agent-memory candidate list [producer] [--format text|json]
 agent-memory candidate promote <producer> <slug> --type <t> \
   --description <text> [--title <text>] [--hook <text>] \
   --session-id <uuid> [--apply] [--format text|json]
+agent-memory archive list [--format text|json]
+agent-memory archive search <term> [--format text|json]
+agent-memory archive retire <slug> --reason <text> \
+  --superseded-by <owner> --archived-at <YYYY-MM-DD> \
+  [--apply] [--format text|json]
 agent-memory completion zsh
 ```
 
@@ -134,11 +140,31 @@ files, and indexes remain non-symlink boundaries. Rollback failures are
 reported as incomplete and preserve `.promote-backup` recovery files instead
 of claiming success.
 
+## Inactive history
+
+`archive/superseded/` preserves provenance for curated global notes whose
+operational reminder has been replaced by a current policy, hook, CLI, config,
+test, or other deterministic owner. It is deliberately not a normal memory
+scope: startup recall, on-demand recall, active `search --all`, `check --all`,
+and scope completion never enumerate archive contents.
+
+`archive retire` is non-mutating unless `--apply` is present. The preview
+validates the source, reports every active index it would update, rejects
+unresolved active note references, and refuses unsafe links or duplicate
+archive targets. Apply moves the note, adds lifecycle/provenance metadata,
+removes active index links, and updates `archive/MEMORY.md` as one rollback-safe
+transaction. Repeat `--superseded-by` when more than one current owner applies.
+
+Candidate selection is intentionally outside the CLI: a reviewer must establish
+semantic equivalence and approve the presented set before apply. Use `archive
+list` or `archive search` only when historical context is explicitly needed;
+these commands do not make archived content active memory.
+
 ## Output
 
 Human-readable output is the default and mirrors the original shell contract.
 Primary command output goes to stdout; errors go to stderr.
-For the new `recall`, `candidate`, and extended `check` surfaces,
+For the `recall`, `candidate`, `archive`, and extended `check` surfaces,
 `--format json` keeps runtime failures in the command's versioned JSON envelope
 with `ok=false` and a stable `error.code`.
 

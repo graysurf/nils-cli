@@ -10,7 +10,7 @@ use crate::completion::scope_candidates;
     version,
     long_version = nils_build_info::long_version(env!("CARGO_PKG_VERSION")),
     about = "Resolve and manage local agent memory directories.",
-    long_about = "Resolve and manage a git-backed local agent memory store with curated notes, bounded recall profiles, producer candidates, personas, and per-agent scopes.",
+    long_about = "Resolve and manage a git-backed local agent memory store with curated notes, bounded recall profiles, producer candidates, explicit inactive history, personas, and per-agent scopes.",
     after_help = "SCOPE VALUES:\n  root             AGENT_MEMORY_HOME itself\n  global           curated shared memory store\n  <id>             shorthand for agents/<id>\n  agents/<id>      per-agent memory store\n  personas/<id>    persona launchpad directory\n  profiles/<id>    bounded recall profile\n  candidates/<id>  untrusted producer candidate store\n\nENVIRONMENT:\n  AGENT_MEMORY_HOME  Override memory-store root.\n  XDG_CONFIG_HOME    Parent for the default agent-memory root.\n  HOME               Fallback parent when XDG_CONFIG_HOME is unset.\n\nEXIT CODES:\n  0   success\n  1   runtime error or no recall match\n  64  command-line usage error",
     arg_required_else_help = true,
     disable_help_subcommand = true
@@ -54,6 +54,8 @@ pub enum Command {
     Recall(RecallArgs),
     /// Add, list, or promote untrusted memory candidates.
     Candidate(CandidateArgs),
+    /// Inspect or retire superseded memory outside active recall.
+    Archive(ArchiveArgs),
     /// Print shell completion script.
     Completion(CompletionArgs),
     /// Print help.
@@ -307,6 +309,70 @@ pub struct CandidatePromoteArgs {
     #[arg(long, value_name = "UUID")]
     pub session_id: String,
     /// Apply the promotion. Omit for a non-mutating preview.
+    #[arg(long)]
+    pub apply: bool,
+    /// Output format.
+    #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
+    pub format: OutputFormat,
+    /// Hidden alias for `--format json`.
+    #[arg(long, hide = true, conflicts_with = "format")]
+    pub json: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct ArchiveArgs {
+    #[command(subcommand)]
+    pub command: ArchiveCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ArchiveCommand {
+    /// List superseded historical notes.
+    List(ArchiveListArgs),
+    /// Search superseded historical notes explicitly.
+    Search(ArchiveSearchArgs),
+    /// Preview or apply retirement of one curated global note.
+    Retire(ArchiveRetireArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct ArchiveListArgs {
+    /// Output format.
+    #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
+    pub format: OutputFormat,
+    /// Hidden alias for `--format json`.
+    #[arg(long, hide = true, conflicts_with = "format")]
+    pub json: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct ArchiveSearchArgs {
+    /// Term to find in superseded historical notes.
+    #[arg(value_name = "TERM")]
+    pub term: String,
+    /// Output format.
+    #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
+    pub format: OutputFormat,
+    /// Hidden alias for `--format json`.
+    #[arg(long, hide = true, conflicts_with = "format")]
+    pub json: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct ArchiveRetireArgs {
+    /// Curated global note slug without `.md`.
+    #[arg(value_name = "SLUG")]
+    pub name: String,
+    /// Stable reason the reminder no longer belongs in active recall.
+    #[arg(long, value_name = "TEXT")]
+    pub reason: String,
+    /// Current policy, hook, CLI, config, test, or documentation owner.
+    #[arg(long, value_name = "OWNER", required = true)]
+    pub superseded_by: Vec<String>,
+    /// Archive date in YYYY-MM-DD form.
+    #[arg(long, value_name = "YYYY-MM-DD")]
+    pub archived_at: String,
+    /// Apply the retirement. Omit for a non-mutating preview.
     #[arg(long)]
     pub apply: bool,
     /// Output format.

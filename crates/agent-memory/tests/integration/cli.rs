@@ -1203,6 +1203,227 @@ fn explicit_profile_and_candidate_scopes_resolve_without_escape() {
     assert_eq!(escape.code, 64);
 }
 
+// ---- inactive archive lifecycle ----------------------------------------
+
+fn seed_archive_layout(root: &Path) {
+    seed_recall_layout(root);
+    fs::write(
+        root.join("global/runtime-enforced.md"),
+        note(
+            "runtime-enforced",
+            "feedback",
+            "Archive-only historical token.\n\n**Why:** original correction.\n\n**How to apply:** old reminder.",
+        ),
+    )
+    .expect("retirement source");
+    fs::write(
+        root.join("global/MEMORY.md"),
+        "# Memory index\n\n- [Routing](routing.md) — active routing\n- [Runtime enforced](runtime-enforced.md) — obsolete reminder\n",
+    )
+    .expect("global index");
+    fs::write(
+        root.join("profiles/startup/MEMORY.md"),
+        "# Startup\n\n- [Runtime enforced](../../global/runtime-enforced.md) — obsolete reminder\n",
+    )
+    .expect("startup index");
+}
+
+#[test]
+fn archive_retire_is_dry_run_first_then_moves_note_out_of_active_recall() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    seed_archive_layout(tmp.path());
+    let args = [
+        "archive",
+        "retire",
+        "runtime-enforced",
+        "--reason",
+        "enforced-by-runtime",
+        "--superseded-by",
+        "nils-cli:crates/example/src/lib.rs",
+        "--archived-at",
+        "2026-07-12",
+        "--format",
+        "json",
+    ];
+
+    let preview = run(tmp.path(), &args);
+    assert_eq!(preview.code, 0, "stderr={}", preview.stderr_text());
+    let preview_json: serde_json::Value =
+        serde_json::from_str(preview.stdout_text().trim()).expect("archive preview json");
+    assert_eq!(
+        preview_json["schema_version"],
+        "cli.agent-memory.archive-retire.v1"
+    );
+    assert_eq!(preview_json["mode"], "dry-run");
+    assert_eq!(
+        preview_json["active_index_updates"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+    assert!(tmp.path().join("global/runtime-enforced.md").is_file());
+    assert!(
+        !tmp.path()
+            .join("archive/superseded/runtime-enforced.md")
+            .exists()
+    );
+
+    let mut apply_args = args.to_vec();
+    apply_args.push("--apply");
+    let applied = run(tmp.path(), &apply_args);
+    assert_eq!(applied.code, 0, "stderr={}", applied.stderr_text());
+    assert!(!tmp.path().join("global/runtime-enforced.md").exists());
+    let archived = fs::read_to_string(tmp.path().join("archive/superseded/runtime-enforced.md"))
+        .expect("archived note");
+    assert!(archived.contains("lifecycleStatus: archived"), "{archived}");
+    assert!(
+        archived.contains("archiveReason: \"enforced-by-runtime\""),
+        "{archived}"
+    );
+    assert!(
+        archived.contains("nils-cli:crates/example/src/lib.rs"),
+        "{archived}"
+    );
+    assert!(
+        !fs::read_to_string(tmp.path().join("global/MEMORY.md"))
+            .expect("global index")
+            .contains("runtime-enforced.md")
+    );
+    assert!(
+        !fs::read_to_string(tmp.path().join("profiles/startup/MEMORY.md"))
+            .expect("startup index")
+            .contains("runtime-enforced.md")
+    );
+
+    let active = run(
+        tmp.path(),
+        &["recall", "on-demand", "Archive-only historical token"],
+    );
+    assert_eq!(active.code, 1);
+    let active_all = run(
+        tmp.path(),
+        &["search", "Archive-only historical token", "--all"],
+    );
+    assert_eq!(active_all.code, 1);
+    let archive_list = run(tmp.path(), &["archive", "list", "--format", "json"]);
+    assert_eq!(
+        archive_list.code,
+        0,
+        "stderr={}",
+        archive_list.stderr_text()
+    );
+    let list_json: serde_json::Value =
+        serde_json::from_str(archive_list.stdout_text().trim()).expect("archive list json");
+    assert_eq!(list_json["count"], 1);
+    assert_eq!(list_json["notes"][0]["file"], "runtime-enforced.md");
+    let historical = run(
+        tmp.path(),
+        &["archive", "search", "Archive-only historical token"],
+    );
+    assert_eq!(historical.code, 0, "stderr={}", historical.stderr_text());
+    assert!(historical.stdout_text().contains("runtime-enforced.md"));
+}
+
+#[test]
+fn archive_retire_reports_active_inbound_references_without_writes() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    seed_archive_layout(tmp.path());
+    fs::write(
+        tmp.path().join("global/routing.md"),
+        note(
+            "routing",
+            "reference",
+            "Still points at [[runtime-enforced]].",
+        ),
+    )
+    .expect("inbound note");
+
+    let out = run(
+        tmp.path(),
+        &[
+            "archive",
+            "retire",
+            "runtime-enforced",
+            "--reason",
+            "enforced-by-runtime",
+            "--superseded-by",
+            "agent-runtime-kit:core/policies/example.md",
+            "--archived-at",
+            "2026-07-12",
+            "--apply",
+            "--format",
+            "json",
+        ],
+    );
+    assert_eq!(out.code, 1);
+    assert!(out.stderr_text().is_empty());
+    let doc: serde_json::Value =
+        serde_json::from_str(out.stdout_text().trim()).expect("archive blocker json");
+    assert_eq!(doc["error"]["code"], "active-reference-blocked");
+    assert_eq!(doc["blockers"][0]["file"], "global/routing.md");
+    assert!(tmp.path().join("global/runtime-enforced.md").is_file());
+    assert!(
+        !tmp.path()
+            .join("archive/superseded/runtime-enforced.md")
+            .exists()
+    );
+}
+
+#[test]
+fn archive_is_explicit_history_not_a_normal_memory_scope() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    seed_archive_layout(tmp.path());
+
+    let scope = run(tmp.path(), &["path", "archive/superseded"]);
+    assert_eq!(scope.code, 64);
+
+    let list_before = run(tmp.path(), &["archive", "list", "--format", "json"]);
+    assert_eq!(list_before.code, 0, "stderr={}", list_before.stderr_text());
+    let before: serde_json::Value =
+        serde_json::from_str(list_before.stdout_text().trim()).expect("archive list json");
+    assert_eq!(before["count"], 0);
+}
+
+#[test]
+fn archive_retire_rejects_duplicate_targets_and_symlink_roots_without_writes() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    seed_archive_layout(tmp.path());
+    fs::create_dir_all(tmp.path().join("archive/superseded")).expect("archive");
+    fs::write(
+        tmp.path().join("archive/superseded/runtime-enforced.md"),
+        "existing history",
+    )
+    .expect("existing archive");
+    let base = [
+        "archive",
+        "retire",
+        "runtime-enforced",
+        "--reason",
+        "enforced-by-runtime",
+        "--superseded-by",
+        "nils-cli:crates/example/src/lib.rs",
+        "--archived-at",
+        "2026-07-12",
+        "--apply",
+    ];
+    let duplicate = run(tmp.path(), &base);
+    assert_eq!(duplicate.code, 1);
+    assert!(duplicate.stderr_text().contains("already exists"));
+    assert!(tmp.path().join("global/runtime-enforced.md").is_file());
+
+    #[cfg(unix)]
+    {
+        fs::remove_dir_all(tmp.path().join("archive")).expect("remove archive");
+        std::os::unix::fs::symlink(tmp.path().join("global"), tmp.path().join("archive"))
+            .expect("archive symlink");
+        let linked = run(tmp.path(), &base);
+        assert_eq!(linked.code, 1);
+        assert!(linked.stderr_text().contains("must not be a symlink"));
+        assert!(tmp.path().join("global/runtime-enforced.md").is_file());
+    }
+}
+
 // ---- strict index budget and forbidden-term audits ----------------------
 
 #[test]

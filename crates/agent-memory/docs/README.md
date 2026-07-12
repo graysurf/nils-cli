@@ -24,8 +24,8 @@ Beyond the original shell contract, the Rust CLI adds:
 - `check [SCOPE] [--all] [--strict] [--format text|json]` — validates a scope's
   structural integrity (index/file parity, dangling `[[links]]`, and note
   frontmatter schema). This is the content-level companion to the layout-only
-  `doctor`, and is the deterministic core the `review-global-memory` skill is
-  intended to call instead of reimplementing the checks in bash.
+  `doctor`, and is the deterministic core the project global-memory review
+  skill calls instead of reimplementing the checks in bash.
   Optional `--max-index-bytes` and `--forbid-terms-file` checks enforce bounded
   indexes and caller-owned retired-reference lists without embedding policy in
   the CLI.
@@ -46,10 +46,19 @@ Beyond the original shell contract, the Rust CLI adds:
   supported global-directory symlinks, removes exact native-index filename
   references, and reports incomplete rollback without deleting recovery
   backups.
+- `archive list|search` — explicitly queries historical superseded notes that
+  are structurally excluded from active recall, search, checks, and completion.
+- `archive retire <slug> ... [--apply]` — dry-run-first, rollback-safe movement
+  from curated global memory to `archive/superseded/`; it blocks on unresolved
+  active references and records reason/current-owner provenance.
 
 Candidate files are opaque untrusted data; canonical frontmatter is required
 only at promotion. Scope IDs, producer IDs, source files, and audit inputs are
 path-validated and symlink guarded.
+
+Archive commands are storage primitives, not semantic candidate detectors. A
+project workflow verifies that runtime behavior actually supersedes the
+reminder and obtains approval before invoking `archive retire --apply`.
 
 All JSON output follows the workspace CLI output contract: `--format json` is
 canonical, `--json` is a hidden alias, and records carry a `schema_version`.
