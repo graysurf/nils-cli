@@ -390,7 +390,8 @@ Strict, single-command closeout:
    unchecked while current-label normalization and read-back still apply.
 5. Applies the preflighted label edit and reads the final labels back to verify
    the requested mutations and state exclusivity. If edit or convergence fails,
-   the issue remains open and no closeout comment or dashboard write occurs.
+   reverses and verifies this command's owned label delta; the issue remains
+   open and no closeout comment or dashboard write occurs.
    If a later pre-close write fails, reverses and verifies only this command's
    owned label delta before returning the original failure, preserving
    unrelated concurrent provider labels. The issue-close request is the commit
@@ -450,8 +451,9 @@ Failure modes that block close:
   predicted final set without mutating the provider.
 - `record-close-label-convergence-failed` when final read-back does not confirm
   every requested add/remove or still contains conflicting `state::*` labels.
-- `record-close-label-rollback-failed` when a downstream pre-close write fails
-  and this command's owned label delta cannot be reversed and confirmed.
+- `record-close-label-rollback-failed` when the label gate or a downstream
+  pre-close write fails and this command's owned label delta cannot be reversed
+  and confirmed.
 
 Each failure returns a stable machine-readable code that maps to a single
 unblock action.

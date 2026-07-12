@@ -2179,30 +2179,6 @@ fn run_record_close(
     let adapter = crate::provider::select_adapter(&repo_info, force);
     let repo = repo_info.slug.clone();
     let issue_url = repo_info.issue_url(issue_number);
-    let confirmed_labels = if label_mutation_planned {
-        adapter
-            .edit_issue_labels(&repo, issue_number, &add_labels, &remove_labels)
-            .map_err(|err| CommandError::runtime("record-close-label-edit-failed", err))?;
-        let observed = adapter
-            .issue_labels(&repo, issue_number)
-            .map_err(|err| CommandError::runtime("record-close-label-readback-failed", err))?;
-        let observed = sorted_unique_labels_for_provider(observed, Some(repo_info.provider));
-        if !close_label_plan_converged(repo_info.provider, &label_plan, &observed) {
-            let expected = label_plan.final_labels.as_deref().unwrap_or_default();
-            return Err(CommandError::runtime(
-                "record-close-label-convergence-failed",
-                format!(
-                    "provider label read-back differs from the preflighted final set; expected {}, observed {}",
-                    render_label_diagnostic(expected),
-                    render_label_diagnostic(&observed)
-                ),
-            ));
-        }
-        Some(observed)
-    } else {
-        None
-    };
-    let labels_result = label_plan.preview(confirmed_labels.as_deref());
     let rollback_after_failure = |failure: CommandError| {
         if label_mutation_planned {
             restore_close_labels_after_failure(
@@ -2217,6 +2193,35 @@ fn run_record_close(
             failure
         }
     };
+    let confirmed_labels = if label_mutation_planned {
+        adapter
+            .edit_issue_labels(&repo, issue_number, &add_labels, &remove_labels)
+            .map_err(|err| {
+                rollback_after_failure(CommandError::runtime("record-close-label-edit-failed", err))
+            })?;
+        let observed = adapter.issue_labels(&repo, issue_number).map_err(|err| {
+            rollback_after_failure(CommandError::runtime(
+                "record-close-label-readback-failed",
+                err,
+            ))
+        })?;
+        let observed = sorted_unique_labels_for_provider(observed, Some(repo_info.provider));
+        if !close_label_plan_converged(repo_info.provider, &label_plan, &observed) {
+            let expected = label_plan.final_labels.as_deref().unwrap_or_default();
+            return Err(rollback_after_failure(CommandError::runtime(
+                "record-close-label-convergence-failed",
+                format!(
+                    "provider label read-back differs from the preflighted final set; expected {}, observed {}",
+                    render_label_diagnostic(expected),
+                    render_label_diagnostic(&observed)
+                ),
+            )));
+        }
+        Some(observed)
+    } else {
+        None
+    };
+    let labels_result = label_plan.preview(confirmed_labels.as_deref());
 
     let closeout_path =
         write_temp_markdown("record-close-comment", &closeout_body).map_err(|err| {

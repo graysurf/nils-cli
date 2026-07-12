@@ -276,10 +276,16 @@ case "$group $verb" in
     fi
     if [[ -n "${FORGE_CLI_STUB_LABELS_FILE:-}" && "${FORGE_CLI_STUB_DROP_LABEL_MUTATIONS:-}" != "1" ]]; then
       touch "$FORGE_CLI_STUB_LABELS_FILE"
+      partial_label_edit=0
+      if [[ "${FORGE_CLI_STUB_PARTIAL_LABEL_EDIT_ONCE:-}" == "1" && -n "${FORGE_CLI_STUB_PARTIAL_LABEL_EDIT_MARKER:-}" && ! -e "$FORGE_CLI_STUB_PARTIAL_LABEL_EDIT_MARKER" ]]; then
+        partial_label_edit=1
+        touch "$FORGE_CLI_STUB_PARTIAL_LABEL_EDIT_MARKER"
+      fi
       # Bash 3.2 treats an empty array as unset under `set -u`; the `-`
       # fallback keeps body-only edits portable while preserving array items.
       for label in "${remove_labels[@]-}"; do
         [[ -z "$label" ]] && continue
+        [[ "$partial_label_edit" == "1" ]] && continue
         grep -Fvx -- "$label" "$FORGE_CLI_STUB_LABELS_FILE" > "${FORGE_CLI_STUB_LABELS_FILE}.tmp" || true
         mv "${FORGE_CLI_STUB_LABELS_FILE}.tmp" "$FORGE_CLI_STUB_LABELS_FILE"
       done
