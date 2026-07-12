@@ -14,7 +14,7 @@ use std::process::Command;
 use pretty_assertions::assert_eq;
 use tempfile::TempDir;
 
-use super::support::{CmdOutput, StubEnv, parse_envelope, run_forge_cli_in};
+use super::support::{CmdOutput, StubEnv, parse_envelope, run_forge_cli_in, write_label_catalog};
 
 const FIXTURE_GH_CREATE_STDOUT: &str =
     include_str!("../fixtures/github/pr_create/create_stdout.txt");
@@ -99,28 +99,6 @@ fn git(repo: &Path, args: &[&str]) {
 
 fn well_formed_body() -> &'static str {
     "## Summary\n\nLand the new feature.\n\n## Test plan\n\nVerified via cargo test.\n"
-}
-
-fn write_label_catalog() -> (TempDir, String) {
-    let tempdir = TempDir::new().expect("label catalog tempdir");
-    let path = tempdir.path().join("forge-labels.yaml");
-    fs::write(
-        &path,
-        r#"schema: forge-label-catalog.v1
-groups:
-  - name: type
-    prefix: "type::"
-    exclusive: true
-labels:
-  - name: "type::feature"
-    group: type
-    color: a2eeef
-    description: Feature work.
-    applies_to: [pr, mr]
-"#,
-    )
-    .expect("write catalog");
-    (tempdir, path.to_string_lossy().into_owned())
 }
 
 #[test]

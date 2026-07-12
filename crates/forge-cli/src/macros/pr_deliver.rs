@@ -34,6 +34,7 @@ use crate::cli::{
 };
 use crate::config::ForgeConfig;
 use crate::error::ForgeError;
+use crate::ops::label::{LabelTarget, validate_label_inputs};
 use crate::ops::pr_create::{
     self, Environment, VerifiedTestFirstSubject, evidence_repository_id, find_git_toplevel,
     test_first_gate, validate_provider_subject_head,
@@ -131,6 +132,21 @@ pub fn run_with<R: BackendRunner, C: Clock>(
         &global.remote,
         global.repo.as_deref(),
         git_remote_url,
+    )?;
+
+    // Label arguments are a provider-aware input contract, not a create-step
+    // side effect. Validate them before the dry-run/live split so previews,
+    // create delivery, and adopt delivery make the same decision without
+    // touching the provider first.
+    let label_target = match ctx.provider {
+        Provider::GitHub | Provider::Local => LabelTarget::Pr,
+        Provider::GitLab => LabelTarget::Mr,
+    };
+    validate_label_inputs(
+        &args.labels,
+        args.label_catalog.as_deref(),
+        args.strict_labels,
+        label_target,
     )?;
 
     if global.dry_run {

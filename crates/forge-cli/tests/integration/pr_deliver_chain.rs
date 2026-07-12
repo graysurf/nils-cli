@@ -13,7 +13,7 @@ use std::process::Command;
 use pretty_assertions::assert_eq;
 use tempfile::TempDir;
 
-use super::support::{CmdOutput, StubEnv, parse_envelope, run_forge_cli_in};
+use super::support::{CmdOutput, StubEnv, parse_envelope, run_forge_cli_in, write_label_catalog};
 
 const FIXTURE_CREATE_STDOUT: &str = include_str!("../fixtures/github/pr_create/create_stdout.txt");
 const FIXTURE_CHECKS_JSON: &str = include_str!("../fixtures/github/pr_checks/all_success.json");
@@ -892,6 +892,53 @@ fn pr_deliver_full_chain_no_merge_emits_four_steps_and_returns_success() {
     assert_eq!(envelope["data"]["pr"]["merged"], false);
     assert!(envelope["data"]["pr"]["merge_sha"].is_null());
     assert_eq!(envelope["data"]["pr"]["number"], 123);
+}
+
+#[test]
+fn pr_deliver_strict_labels_valid_catalog_passes_live_delivery() {
+    let tempdir = make_git_repo();
+    let repo_path = tempdir.path().join("repo");
+    let (_catalog_tempdir, catalog) = write_label_catalog();
+
+    let stub = StubEnv::new();
+    let gh_path = write_full_chain_stub(&stub);
+    let stub = stub.env("FORGE_CLI_GH_BIN", gh_path.to_string_lossy());
+
+    let out = run_in_repo(
+        &stub,
+        &repo_path,
+        &[
+            "--provider",
+            "github",
+            "--format",
+            "json",
+            "pr",
+            "deliver",
+            "--kind",
+            "feature",
+            "--title",
+            "feat: sample feature",
+            "--body",
+            "## Summary\n\nLand the new feature.\n\n## Test plan\n\nVerified.\n",
+            "--head",
+            "feat/sample",
+            "--base",
+            "main",
+            "--label",
+            "type::feature",
+            "--label-catalog",
+            &catalog,
+            "--strict-labels",
+            "--timeout",
+            "5s",
+            "--no-merge",
+        ],
+    );
+
+    assert_eq!(out.code, 0, "stdout={}\nstderr={}", out.stdout, out.stderr);
+    let envelope = parse_envelope(&out.stdout);
+    assert_eq!(envelope["ok"], true);
+    assert_eq!(envelope["data"]["steps"][2]["step"], "create");
 }
 
 #[test]

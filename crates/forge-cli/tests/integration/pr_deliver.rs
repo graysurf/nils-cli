@@ -6,9 +6,106 @@
 
 use pretty_assertions::assert_eq;
 
-use super::support::{StubEnv, parse_envelope, run_forge_cli};
+use super::support::{StubEnv, parse_envelope, run_forge_cli, write_label_catalog};
 
 const FORBIDDEN_STUB: &str = "#!/bin/sh\necho 'should not run during dry-run' >&2\nexit 99\n";
+
+#[test]
+fn pr_deliver_strict_labels_dry_run_rejects_missing_catalog_before_provider() {
+    let stub = StubEnv::new().gh_stub(FORBIDDEN_STUB);
+    let out = run_forge_cli(
+        &stub,
+        &[
+            "--provider",
+            "github",
+            "--dry-run",
+            "--format",
+            "json",
+            "pr",
+            "deliver",
+            "--kind",
+            "feature",
+            "--title",
+            "demo",
+            "--body",
+            "## Summary\nx\n\n## Test plan\ny\n",
+            "--label",
+            "type::feature",
+            "--strict-labels",
+        ],
+    );
+
+    assert_eq!(out.code, 65, "stdout={}\nstderr={}", out.stdout, out.stderr);
+    let env = parse_envelope(&out.stdout);
+    assert_eq!(env["error"]["code"], "label_catalog_missing");
+}
+
+#[test]
+fn pr_deliver_strict_labels_live_rejects_missing_catalog_before_provider() {
+    let stub = StubEnv::new().gh_stub(FORBIDDEN_STUB);
+    let out = run_forge_cli(
+        &stub,
+        &[
+            "--provider",
+            "github",
+            "--format",
+            "json",
+            "pr",
+            "deliver",
+            "--kind",
+            "feature",
+            "--title",
+            "demo",
+            "--body",
+            "## Summary\nx\n\n## Test plan\ny\n",
+            "--label",
+            "type::feature",
+            "--strict-labels",
+        ],
+    );
+
+    assert_eq!(out.code, 65, "stdout={}\nstderr={}", out.stdout, out.stderr);
+    let env = parse_envelope(&out.stdout);
+    assert_eq!(env["error"]["code"], "label_catalog_missing");
+}
+
+#[test]
+fn pr_deliver_strict_labels_valid_catalog_passes_dry_run_for_supported_providers() {
+    let (_catalog_tempdir, catalog) = write_label_catalog();
+
+    for provider in ["github", "gitlab"] {
+        let stub = StubEnv::new().gh_stub(FORBIDDEN_STUB);
+        let out = run_forge_cli(
+            &stub,
+            &[
+                "--provider",
+                provider,
+                "--dry-run",
+                "--format",
+                "json",
+                "pr",
+                "deliver",
+                "--kind",
+                "feature",
+                "--title",
+                "demo",
+                "--body",
+                "## Summary\nx\n\n## Test plan\ny\n",
+                "--label",
+                "type::feature",
+                "--label-catalog",
+                &catalog,
+                "--strict-labels",
+            ],
+        );
+
+        assert_eq!(
+            out.code, 0,
+            "provider={provider} stdout={} stderr={}",
+            out.stdout, out.stderr
+        );
+    }
+}
 
 #[test]
 fn pr_deliver_dry_run_lists_all_eight_steps_in_order() {
