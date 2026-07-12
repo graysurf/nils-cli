@@ -615,15 +615,17 @@ fn section_bounds(raw: &str, heading: &str) -> Result<Option<(usize, usize)>, &'
         return Err("duplicate section");
     }
     Ok(matches.first().map(|section| {
+        let unterminated_eof = section.end == raw.len() && !raw.ends_with('\n');
         let start = raw[..section.body_start]
             .bytes()
             .filter(|byte| *byte == b'\n')
-            .count();
+            .count()
+            + usize::from(unterminated_eof && section.body_start == section.end);
         let end = raw[..section.end]
             .bytes()
             .filter(|byte| *byte == b'\n')
             .count()
-            + usize::from(section.end == raw.len() && !raw.ends_with('\n'));
+            + usize::from(unterminated_eof);
         (start, end)
     }))
 }
@@ -1006,6 +1008,25 @@ mod tests {
             out,
             "## Execution State\n\n- Status: active\n- Tracking issue: <https://github.com/o/r/issues/9>"
         );
+    }
+
+    #[test]
+    fn inserts_after_heading_only_section_without_trailing_newline() {
+        let raw = "## Execution State";
+        let value = "<https://github.com/o/r/issues/9>";
+        let (once, change) =
+            set_bullet(raw, Path::new("x.md"), TRACKING_ISSUE_LABEL, value).expect("set");
+        assert_eq!(change.action, BulletAction::Inserted);
+        assert_eq!(
+            once,
+            "## Execution State\n- Tracking issue: <https://github.com/o/r/issues/9>"
+        );
+
+        let (twice, change) =
+            set_bullet(&once, Path::new("x.md"), TRACKING_ISSUE_LABEL, value).expect("set");
+        assert_eq!(change.action, BulletAction::Unchanged);
+        assert_eq!(twice, once);
+        assert_eq!(twice.matches("- Tracking issue:").count(), 1);
     }
 
     #[test]
