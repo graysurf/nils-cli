@@ -1511,6 +1511,7 @@ fn archive_retire_rejects_malformed_metadata_multiline_reason_and_stale_recovery
         "previous recovery"
     );
     assert!(source.is_file());
+    assert!(!tmp.path().join("archive").exists());
 }
 
 // ---- strict index budget and forbidden-term audits ----------------------

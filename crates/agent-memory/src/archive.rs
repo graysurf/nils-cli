@@ -540,8 +540,6 @@ fn apply_transaction(
         .parent()
         .ok_or_else(|| ArchiveFailure::runtime("archive directory has no parent"))?;
     let archive_root_existed = archive_root.exists();
-    create_regular_dir(archive_root, "archive root")?;
-    create_regular_dir(target_dir, "superseded archive directory")?;
 
     let source_backup = sibling(source, ".archive-backup");
     let target_tmp = sibling(target, ".archive-tmp");
@@ -567,6 +565,8 @@ fn apply_transaction(
     for (_, backup, temporary) in &index_files {
         ensure_paths_absent(&[backup, temporary])?;
     }
+    create_regular_dir(archive_root, "archive root")?;
+    create_regular_dir(target_dir, "superseded archive directory")?;
     let staging = (|| -> Result<(), ArchiveFailure> {
         write_new(&target_tmp, archived)?;
         write_new(&archive_index_tmp, archive_index_updated)?;
