@@ -480,6 +480,10 @@ std::thread_local! {
     static BOOTSTRAP_LIVE_CHECKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
+#[cfg(test)]
+static NORMAL_CANCELLATION_ATTEMPTS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
 pub(crate) fn thread_attached_path(record: &SessionRecord) -> Option<&Path> {
     runtime_path(record, THREAD_ATTACHED_KEY)
 }
@@ -1440,6 +1444,10 @@ impl FreshBootstrap {
             })
             .unwrap_or(Self::Closed);
     }
+
+    fn close(&mut self) {
+        *self = Self::Closed;
+    }
 }
 
 fn auto_resume_is_healthy_disabled(context: &CliContext, record: &SessionRecord) -> bool {
@@ -1462,10 +1470,9 @@ async fn cancel_before_tui_mutation(
     // The create-owned marker and exact disabled auto-resume state are checked
     // live for both requests. The first turn is armed only by a successful
     // matching thread/start response and must target the returned thread id.
-    if bootstrap.bypasses_create_lock(context, record, value) {
-        return true;
-    }
-    let context = context.clone();
+    #[cfg(test)]
+    NORMAL_CANCELLATION_ATTEMPTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let cancellation_context = context.clone();
     let id = record.id.clone();
     let Some(launch_id) = record
         .runtime
@@ -1474,9 +1481,9 @@ async fn cancel_before_tui_mutation(
     else {
         return false;
     };
-    tokio::task::spawn_blocking(move || {
+    let cancellation = tokio::task::spawn_blocking(move || {
         crate::auto_resume::try_cancel_for_manual_input_for_runtime(
-            &context,
+            &cancellation_context,
             &id,
             &launch_id,
             &Timestamp::now().to_string(),
@@ -1484,8 +1491,20 @@ async fn cancel_before_tui_mutation(
     })
     .await
     .ok()
-    .and_then(Result::ok)
-    .unwrap_or(false)
+    .and_then(Result::ok);
+    match cancellation {
+        Some(crate::auto_resume::ManualInputCancelOutcome::Ready) => {
+            bootstrap.close();
+            true
+        }
+        Some(crate::auto_resume::ManualInputCancelOutcome::Busy) => {
+            bootstrap.bypasses_create_lock(context, record, value)
+        }
+        Some(crate::auto_resume::ManualInputCancelOutcome::RuntimeChanged) | None => {
+            bootstrap.close();
+            false
+        }
+    }
 }
 
 fn proxy_websocket_config() -> WebSocketConfig {
@@ -3005,6 +3024,43 @@ mod tests {
             &json!({ "id": 1, "method": "turn/start", "params": {} }),
         ));
         assert_eq!(BOOTSTRAP_LIVE_CHECKS.with(std::cell::Cell::get), 0);
+    }
+
+    #[tokio::test]
+    async fn marker_live_lock_free_turn_attempts_normal_cancellation_before_bypass() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let socket = tmp.path().join("teardown-window.sock");
+        let context = CliContext {
+            state_dir: tmp.path().join("state"),
+            host: None,
+        };
+        let record = record_with_runtime("teardown-window", &socket);
+        fs::create_dir_all(crate::session_dir(&context, &record.id)).unwrap();
+        crate::write_session_record(&context, &record).unwrap();
+        crate::activity::activate_runtime(&context, &record).unwrap();
+        write_create_bootstrap_marker(&record);
+        let mut bootstrap = FreshBootstrap::FirstTurn {
+            thread_id: "fresh-thread".to_string(),
+        };
+        NORMAL_CANCELLATION_ATTEMPTS.store(0, std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            cancel_before_tui_mutation(
+                &context,
+                &record,
+                &mut bootstrap,
+                &json!({
+                    "id": 2,
+                    "method": "turn/start",
+                    "params": { "threadId": "fresh-thread", "input": [] }
+                }),
+            )
+            .await
+        );
+        assert_eq!(
+            NORMAL_CANCELLATION_ATTEMPTS.load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+        assert_eq!(bootstrap, FreshBootstrap::Closed);
     }
 
     #[tokio::test]
