@@ -431,6 +431,12 @@ fn body_contains_review_disposition_row(body: &str) -> bool {
             continue;
         }
 
+        if !markdown_after_fence_indent(line).is_some_and(|candidate| candidate.starts_with('|')) {
+            pending_header = None;
+            disposition_column = None;
+            continue;
+        }
+
         let trimmed = visible_line.trim();
         if visible_line.starts_with("    ") || visible_line.starts_with('\t') {
             pending_header = None;
@@ -500,7 +506,9 @@ fn is_markdown_fence_closer(line: &str, opening_marker: char, opening_length: us
         return false;
     };
     markdown_fence(candidate).is_some_and(|(marker, length, remainder)| {
-        marker == opening_marker && length >= opening_length && remainder.trim().is_empty()
+        marker == opening_marker
+            && length >= opening_length
+            && remainder.bytes().all(|byte| matches!(byte, b' ' | b'\t'))
     })
 }
 
