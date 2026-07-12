@@ -381,13 +381,17 @@ Strict, single-command closeout:
    `approve` / `comments-only`).
 3. Verifies linked PR evidence through provider state: every linked PR is
    merged, with `merge_sha` and CI status recorded.
-4. Before any provider write, verifies requested label additions exist and
-   computes one atomic label edit that removes every current `state::*` sibling
-   when a terminal state is added.
-5. Renders and posts the `closeout` comment with structured payload.
-6. Renders and edits the `## Final Dashboard` issue body.
-7. Closes the provider issue, applies the preflighted label edit, and reads the
-   final labels back to verify the requested mutations and state exclusivity.
+4. Before any provider write, scans the repository label catalog to proven
+   completeness, verifies requested additions exist, and computes one atomic
+   label edit that removes every current `state::*` sibling when a terminal
+   state is added. GitHub label identity is case-insensitive; GitLab and Local
+   label identity remains case-sensitive.
+5. Applies the preflighted label edit and reads the final labels back to verify
+   the requested mutations and state exclusivity. If edit or convergence fails,
+   the issue remains open and no closeout comment or dashboard write occurs.
+6. Renders and posts the `closeout` comment with structured payload.
+7. Renders and edits the `## Final Dashboard` issue body, then closes the
+   provider issue.
 
 Provider-bound validation rejects machine-local home paths (`/Users/<owner>/...`
 or `/home/<owner>/...`) in live write payloads. Diagnostics identify the unsafe
@@ -489,13 +493,13 @@ Examples of `payload`:
     "final_dashboard": "<markdown>",
     "linked_prs": [],
     "labels": {
-      "requested": {"add": [], "remove": []},
-      "add": [],
-      "remove": [],
-      "current": [],
-      "final": [],
+      "requested": {"add": ["state::closed"], "remove": []},
+      "add": ["state::closed"],
+      "remove": ["state::ready"],
+      "current": ["state::ready", "workflow::tracking"],
+      "final": ["state::closed", "workflow::tracking"],
       "availability": {"checked": true, "missing_additions": []},
-      "confirmed": []
+      "confirmed": ["state::closed", "workflow::tracking"]
     }
   }
   ```

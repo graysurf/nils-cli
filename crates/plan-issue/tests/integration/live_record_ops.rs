@@ -201,12 +201,13 @@ fn record_close_live_rejects_contradictory_provider_labels() {
     assert_ne!(code, 0, "{envelope}");
     assert_eq!(envelope["error"]["code"], "record-close-label-edit-failed");
     assert_eq!(labels, "state::needs-triage\n");
-    assert_eq!(issue_state, "closed\n");
-    let close = log.find("issue close 42").expect("close call");
+    assert_eq!(issue_state, "open\n");
     let label_edit = log
         .find("issue edit 42 --add-label state::closed --remove-label state::needs-triage")
         .expect("label edit call");
-    assert!(close < label_edit, "{log}");
+    assert!(label_edit < log.len(), "{log}");
+    assert!(!log.contains("issue comment"), "{log}");
+    assert!(!log.contains("issue close"), "{log}");
 }
 
 #[test]
@@ -223,6 +224,12 @@ fn record_close_live_observes_confirmed_provider_labels() {
         log.contains("issue edit 42 --add-label state::closed --remove-label state::needs-triage"),
         "{log}"
     );
+    let label_edit = log
+        .find("issue edit 42 --add-label state::closed --remove-label state::needs-triage")
+        .expect("label edit call");
+    let comment = log.find("issue comment 42").expect("comment call");
+    let close = log.find("issue close 42").expect("close call");
+    assert!(label_edit < comment && comment < close, "{log}");
     assert_eq!(
         envelope["payload"]["result"]["labels"]["confirmed"],
         json!(["state::closed"])

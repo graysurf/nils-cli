@@ -773,12 +773,29 @@ impl CloseLabelPlan {
     }
 }
 
-fn sorted_unique_labels(labels: impl IntoIterator<Item = String>) -> Vec<String> {
-    labels
-        .into_iter()
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect()
+fn sorted_unique_labels_for_provider(
+    labels: impl IntoIterator<Item = String>,
+    provider: Option<crate::provider::Provider>,
+) -> Vec<String> {
+    let mut unique: Vec<String> = Vec::new();
+    for label in labels {
+        if !unique
+            .iter()
+            .any(|existing| label_matches(provider, existing, &label))
+        {
+            unique.push(label);
+        }
+    }
+    if provider == Some(crate::provider::Provider::GitHub) {
+        unique.sort_by(|left, right| {
+            left.to_ascii_lowercase()
+                .cmp(&right.to_ascii_lowercase())
+                .then_with(|| left.cmp(right))
+        });
+    } else {
+        unique.sort();
+    }
+    unique
 }
 
 fn label_matches(provider: Option<crate::provider::Provider>, left: &str, right: &str) -> bool {
@@ -789,6 +806,15 @@ fn label_matches(provider: Option<crate::provider::Provider>, left: &str, right:
     }
 }
 
+fn render_label_diagnostic(labels: &[String]) -> String {
+    let quoted = labels
+        .iter()
+        .map(|label| serde_json::to_string(label).unwrap_or_else(|_| "\"<invalid>\"".to_string()))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("[{quoted}]")
+}
+
 fn build_close_label_plan(
     requested_add: Vec<String>,
     requested_remove: Vec<String>,
@@ -796,8 +822,26 @@ fn build_close_label_plan(
     catalog: Option<Vec<String>>,
     provider: Option<crate::provider::Provider>,
 ) -> Result<CloseLabelPlan, CommandError> {
-    let requested_add = sorted_unique_labels(requested_add);
-    let requested_remove = sorted_unique_labels(requested_remove);
+    let requested_add = sorted_unique_labels_for_provider(requested_add, provider);
+    let requested_remove = sorted_unique_labels_for_provider(requested_remove, provider);
+    let conflicts = requested_add
+        .iter()
+        .filter(|added| {
+            requested_remove
+                .iter()
+                .any(|removed| label_matches(provider, added, removed))
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    if !conflicts.is_empty() {
+        return Err(CommandError::usage(
+            "record-label-mutation-conflict",
+            format!(
+                "record-close: label(s) appear in both --add-label and --remove-label: {}",
+                render_label_diagnostic(&conflicts)
+            ),
+        ));
+    }
     let state_additions: Vec<&str> = requested_add
         .iter()
         .map(String::as_str)
@@ -808,13 +852,18 @@ fn build_close_label_plan(
             "record-close-state-label-conflict",
             format!(
                 "record-close: multiple mutually exclusive state labels requested: {}",
-                state_additions.join(", ")
+                render_label_diagnostic(
+                    &state_additions
+                        .iter()
+                        .map(|label| (*label).to_string())
+                        .collect::<Vec<_>>()
+                )
             ),
         ));
     }
 
-    let current = current.map(sorted_unique_labels);
-    let catalog = catalog.map(sorted_unique_labels);
+    let current = current.map(|labels| sorted_unique_labels_for_provider(labels, provider));
+    let catalog = catalog.map(|labels| sorted_unique_labels_for_provider(labels, provider));
     let mut remove = requested_remove.clone();
     if let (Some(target), Some(current_labels)) = (state_additions.first(), current.as_ref()) {
         remove.extend(
@@ -825,7 +874,7 @@ fn build_close_label_plan(
                 .cloned(),
         );
     }
-    let remove = sorted_unique_labels(remove);
+    let remove = sorted_unique_labels_for_provider(remove, provider);
 
     let missing_additions = catalog
         .as_ref()
@@ -860,7 +909,7 @@ fn build_close_label_plan(
                 final_labels.push(added.clone());
             }
         }
-        sorted_unique_labels(final_labels)
+        sorted_unique_labels_for_provider(final_labels, provider)
     });
 
     Ok(CloseLabelPlan {
@@ -2026,7 +2075,7 @@ fn run_record_close(
             "record-close-label-preflight-failed",
             format!(
                 "requested label additions are unavailable in the repository: {}",
-                label_plan.missing_additions.join(", ")
+                render_label_diagnostic(&label_plan.missing_additions)
             ),
         ));
     }
@@ -2035,6 +2084,31 @@ fn run_record_close(
     let adapter = crate::provider::select_adapter(&repo_info, force);
     let repo = repo_info.slug.clone();
     let issue_url = repo_info.issue_url(issue_number);
+    let confirmed_labels = if label_mutation_planned {
+        adapter
+            .edit_issue_labels(&repo, issue_number, &add_labels, &remove_labels)
+            .map_err(|err| CommandError::runtime("record-close-label-edit-failed", err))?;
+        let observed = adapter
+            .issue_labels(&repo, issue_number)
+            .map_err(|err| CommandError::runtime("record-close-label-readback-failed", err))?;
+        let observed = sorted_unique_labels_for_provider(observed, Some(repo_info.provider));
+        if !close_label_plan_converged(repo_info.provider, &label_plan, &observed) {
+            let expected = label_plan.final_labels.as_deref().unwrap_or_default();
+            return Err(CommandError::runtime(
+                "record-close-label-convergence-failed",
+                format!(
+                    "provider label read-back differs from the preflighted final set; expected {}, observed {}",
+                    render_label_diagnostic(expected),
+                    render_label_diagnostic(&observed)
+                ),
+            ));
+        }
+        Some(observed)
+    } else {
+        None
+    };
+    let labels_result = label_plan.preview(confirmed_labels.as_deref());
+
     let closeout_path = write_temp_markdown("record-close-comment", &closeout_body)
         .map_err(|err| CommandError::runtime("record-close-comment-write-failed", err))?;
     let closeout_url = adapter
@@ -2063,31 +2137,6 @@ fn run_record_close(
             None,
         )
         .map_err(|err| CommandError::runtime("record-close-issue-close-failed", err))?;
-
-    let confirmed_labels = if label_mutation_planned {
-        adapter
-            .edit_issue_labels(&repo, issue_number, &add_labels, &remove_labels)
-            .map_err(|err| CommandError::runtime("record-close-label-edit-failed", err))?;
-        let observed = adapter
-            .issue_labels(&repo, issue_number)
-            .map_err(|err| CommandError::runtime("record-close-label-readback-failed", err))?;
-        let observed = sorted_unique_labels(observed);
-        if !close_label_plan_converged(repo_info.provider, &label_plan, &observed) {
-            let expected = label_plan.final_labels.as_deref().unwrap_or_default();
-            return Err(CommandError::runtime(
-                "record-close-label-convergence-failed",
-                format!(
-                    "provider label read-back differs from the preflighted final set; expected [{}], observed [{}]",
-                    expected.join(", "),
-                    observed.join(", ")
-                ),
-            ));
-        }
-        Some(observed)
-    } else {
-        None
-    };
-    let labels_result = label_plan.preview(confirmed_labels.as_deref());
 
     // Write the terminal state back into the bundle's execution-state file so
     // the in-repo copy is final immediately after closeout, not transient-stale
@@ -9079,6 +9128,65 @@ mod tests {
                 "workflow::tracking".into(),
             ]
         ));
+    }
+
+    #[test]
+    fn github_close_label_plan_rejects_case_equivalent_add_remove_conflicts() {
+        let error = build_close_label_plan(
+            vec!["state::closed".into()],
+            vec!["State::Closed".into()],
+            Some(vec!["state::ready".into()]),
+            Some(vec!["state::ready".into(), "state::closed".into()]),
+            Some(crate::provider::Provider::GitHub),
+        )
+        .expect_err("GitHub labels are case-insensitive");
+        assert_eq!(error.code, "record-label-mutation-conflict");
+    }
+
+    #[test]
+    fn close_label_plan_deduplicates_with_provider_identity_rules() {
+        let github = build_close_label_plan(
+            vec!["Bug".into(), "bug".into()],
+            vec![],
+            Some(vec![]),
+            Some(vec!["bug".into()]),
+            Some(crate::provider::Provider::GitHub),
+        )
+        .expect("GitHub semantic duplicate");
+        assert_eq!(github.add, vec!["Bug"]);
+
+        let gitlab = build_close_label_plan(
+            vec!["Bug".into(), "bug".into()],
+            vec!["State::Closed".into()],
+            Some(vec![]),
+            Some(vec!["Bug".into(), "bug".into()]),
+            Some(crate::provider::Provider::GitLab),
+        )
+        .expect("GitLab labels are case-sensitive");
+        assert_eq!(gitlab.add, vec!["Bug", "bug"]);
+        assert_eq!(gitlab.remove, vec!["State::Closed"]);
+
+        let gitlab_case_distinct = build_close_label_plan(
+            vec!["state::closed".into()],
+            vec!["State::Closed".into()],
+            Some(vec![]),
+            Some(vec!["state::closed".into()]),
+            Some(crate::provider::Provider::GitLab),
+        )
+        .expect("GitLab case-distinct add and remove are not contradictory");
+        assert_eq!(gitlab_case_distinct.add, vec!["state::closed"]);
+        assert_eq!(gitlab_case_distinct.remove, vec!["State::Closed"]);
+    }
+
+    #[test]
+    fn label_diagnostics_escape_provider_control_characters() {
+        let rendered =
+            render_label_diagnostic(&["safe".into(), "bad\n\u{1b}]8;;https://x\u{7}".into()]);
+
+        assert_eq!(rendered, r#"["safe", "bad\n\u001b]8;;https://x\u0007"]"#);
+        assert!(!rendered.contains('\n'));
+        assert!(!rendered.contains('\u{1b}'));
+        assert!(!rendered.contains('\u{7}'));
     }
 
     #[test]

@@ -55,9 +55,9 @@ Shell wrapper scripts are deprecated for this crate path. Use `plan-issue` / `pl
 - `record post`: append a canonical state, session, validation, or review lifecycle comment after validating the role-specific payload schema.
 - `record audit`: inspect issue body Markdown plus provider comments JSON for recognized lifecycle markers and reject malformed typed payloads.
 - `record repair-dashboard`: recompute and update the mutable dashboard from valid audit evidence.
-- `record close`: run strict closeout, preflight and normalize lifecycle
-  labels, post closeout evidence, repair the final dashboard, close the issue,
-  and verify provider truth.
+- `record close`: run strict closeout, preflight, apply, and verify lifecycle
+  labels, then post closeout evidence, repair the final dashboard, and close
+  the issue.
 
 ## Global flags
 
