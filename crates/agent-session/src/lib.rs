@@ -753,6 +753,14 @@ fn start_session(context: &CliContext, args: cli::StartArgs) -> Result<StartView
         return Err(err);
     }
 
+    let _create_bootstrap = match codex_app_server::begin_create_bootstrap(&created.record) {
+        Ok(guard) => guard,
+        Err(err) => {
+            cleanup_created_record(context, &created);
+            return Err(err);
+        }
+    };
+
     if let Err(err) = start_interactive_tmux(
         &tmux_bin,
         &agent_bin,

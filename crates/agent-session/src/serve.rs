@@ -8649,6 +8649,10 @@ mod tests {
             record["runtime"]["codex_app_server_protocol"],
             codex_app_server::PROTOCOL_VERSION
         );
+        let handoff = record["runtime"][codex_app_server::THREAD_HANDOFF_KEY]
+            .as_str()
+            .unwrap();
+        assert!(!Path::new(handoff).exists());
         let calls = fs::read_to_string(log).unwrap();
         assert!(calls.contains("agent-session-codex-app-server"));
         assert!(calls.contains("app-server --listen"));
