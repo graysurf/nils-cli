@@ -312,6 +312,7 @@ fn execute_sequence<R: BackendRunner, C: Clock>(
         let create_result = match pr_create::compute_with_subject_after_label_preflight(
             runner,
             global,
+            ctx,
             &create_args,
             &env,
         ) {

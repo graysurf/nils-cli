@@ -484,19 +484,20 @@ pub(crate) fn compute_with_subject<R: BackendRunner>(
     args: &PrCreateArgs,
     env: &Environment<'_>,
 ) -> Result<PrCreateComputation, ForgeError> {
-    compute_with_subject_inner(runner, global, args, env, false)
+    compute_with_subject_inner(runner, global, args, env, None)
 }
 
 /// Delivery-only create entry point after `pr deliver` has validated the
-/// provider-aware label inputs. The caller must pass the same immutable label
-/// arguments and provider context used by that preflight.
+/// provider-aware label inputs. The authoritative context is carried into the
+/// create computation so a later remote change cannot retarget those inputs.
 pub(crate) fn compute_with_subject_after_label_preflight<R: BackendRunner>(
     runner: &R,
     global: &GlobalFlags,
+    prevalidated_ctx: &ProviderContext,
     args: &PrCreateArgs,
     env: &Environment<'_>,
 ) -> Result<PrCreateComputation, ForgeError> {
-    compute_with_subject_inner(runner, global, args, env, true)
+    compute_with_subject_inner(runner, global, args, env, Some(prevalidated_ctx))
 }
 
 fn compute_with_subject_inner<R: BackendRunner>(
@@ -504,14 +505,17 @@ fn compute_with_subject_inner<R: BackendRunner>(
     global: &GlobalFlags,
     args: &PrCreateArgs,
     env: &Environment<'_>,
-    labels_prevalidated: bool,
+    prevalidated_ctx: Option<&ProviderContext>,
 ) -> Result<PrCreateComputation, ForgeError> {
-    let ctx = detect(
-        global.provider_hint(),
-        &global.remote,
-        global.repo.as_deref(),
-        |r| (env.remote_url)(r),
-    )?;
+    let ctx = match prevalidated_ctx {
+        Some(ctx) => ctx.clone(),
+        None => detect(
+            global.provider_hint(),
+            &global.remote,
+            global.repo.as_deref(),
+            |r| (env.remote_url)(r),
+        )?,
+    };
     let head = match args.head.clone() {
         Some(h) => h,
         None => (env.current_branch)()?,
@@ -528,7 +532,7 @@ fn compute_with_subject_inner<R: BackendRunner>(
     no_local_path(&args.title, "title")?;
     body_sections(&body, &env.headings)?;
     no_local_path(&body, "body")?;
-    if !labels_prevalidated {
+    if prevalidated_ctx.is_none() {
         let label_target = match ctx.provider {
             Provider::GitHub | Provider::Local => LabelTarget::Pr,
             Provider::GitLab => LabelTarget::Mr,
