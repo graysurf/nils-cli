@@ -2,12 +2,11 @@
 
 ## Decision
 
-Run one issue-backed L2 spike against the installed Codex TUI. Determine
-whether trace-safe OpenTelemetry plus an authoritative account rate-limit
-snapshot can identify exactly one usage-exhausted turn without terminal-text or
-error-message parsing. If the contract passes, hand the proven adapter shape to
-an L3 implementation plan; if it fails, keep Codex auto-resume unsupported and
-record the missing upstream field precisely.
+The L2 spike passed against installed Codex 0.144.1. Trace-safe OpenTelemetry
+plus an authoritative exact-account rate-limit snapshot identified one rejected
+TUI turn without terminal-text or error-message parsing. Proceed to an L3
+implementation plan using the fail-closed adapter contract retained in
+`codex-otel-auto-resume-spike-evidence.md`.
 
 ## User outcome
 

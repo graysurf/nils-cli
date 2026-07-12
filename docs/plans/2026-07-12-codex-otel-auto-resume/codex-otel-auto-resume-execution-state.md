@@ -3,11 +3,11 @@
 <!-- plan-issue-record:v2 role=state profile=tracking -->
 ## Execution State
 
-- Status: planning
+- Status: complete
 - Target scope: prove or reject a content-free OTel trigger for exact Codex TUI
   usage exhaustion.
-- Current task: Task 1.1 — build the isolated OTLP capture harness.
-- Next task: Task 1.2 — capture a normal installed-TUI turn.
+- Current task: complete — all spike acceptance items passed.
+- Next task: open and execute the L3 production implementation plan.
 - Last updated: 2026-07-12
 - Branch: `feat/codex-otel-auto-resume`
 - Source document:
@@ -20,11 +20,11 @@
 
 | ID | Status | Task | Evidence | Notes |
 | --- | --- | --- | --- | --- |
-| 1.1 | in-progress | Build the isolated OTLP capture harness | pending | Loopback-only; no raw retention. |
-| 1.2 | pending | Capture a non-exhausted installed-TUI turn | pending | Must match provider resume id. |
-| 2.1 | pending | Capture the real exhausted turn | pending | `poies` only; no reset credit. |
-| 2.2 | pending | Test concurrent-session attribution | pending | Account state alone must not arm. |
-| 3.1 | pending | Reconcile evidence and decide next tier | pending | L3 only after every acceptance item passes. |
+| 1.1 | completed | Build the isolated OTLP capture harness | `codex-otel-auto-resume-spike-evidence.md` | Loopback-only; raw fields discarded at ingestion. |
+| 1.2 | completed | Capture a non-exhausted installed-TUI turn | baseline projection | Exact resume/thread and turn ids matched. |
+| 2.1 | completed | Capture the real exhausted turn | exhausted projection | `poies` reached 100%; reset credits remained 2. |
+| 2.2 | completed | Test concurrent-session attribution | correlation model | Only the matching thread armed. |
+| 3.1 | completed | Reconcile evidence and decide next tier | acceptance matrix | Pass; proceed to L3 implementation. |
 
 ## Session Log
 
@@ -33,6 +33,12 @@
 - 2026-07-12: Previous persisted-turn canary was negative, while reset and
   same-thread continuation were positive. OTel is the remaining TUI-preserving
   signal candidate.
+- 2026-07-12: Installed Codex 0.144.1 baseline correlated exact thread and turn
+  ids through `session_task.turn`.
+- 2026-07-12: Real `poies` exhaustion produced a content-free failed-completion
+  observation within the exact turn interval while the authoritative account
+  snapshot reported `workspace_member_credits_depleted`.
+- 2026-07-12: Two-session negative attribution passed. The L2 verdict is pass.
 
 ## Validation
 
@@ -40,3 +46,7 @@
 | --- | --- | --- | --- |
 | `agent-docs preflight --intent project-dev` | pass | Required nils-cli docs and local-fast validation contract resolved. | local preflight |
 | Plan archive searches | pass | No archived Codex OTel auto-resume plan found. | local query |
+| Synthetic projection fixture | pass | Sensitive prompt, email, account id, and raw error fields were discarded. | runtime harness |
+| Installed Codex baseline | pass | Exact resume/thread id and provider turn id correlated. | safe OTLP projection |
+| Real exhaustion capture | pass | Exact rejected turn plus exact-account exhausted snapshot; no reset used. | `codex-otel-auto-resume-spike-evidence.md` |
+| Two-session correlation | pass | Matching armed; non-matching and account-only remained unchanged. | runtime correlation model |
