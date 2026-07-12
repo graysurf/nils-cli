@@ -73,6 +73,15 @@ run_audit_without_fixture_relaxation() {
   set -e
 }
 
+run_audit_with_inherited_nullglob() {
+  local dir="$1"
+  set +e
+  audit_output="$(cd "$dir" && env BASHOPTS=nullglob \
+    "$bash_bin" "$script" --strict 2>&1)"
+  status=$?
+  set -e
+}
+
 fail() {
   echo "FAIL: $1"
   echo "--- audit output ---"
@@ -151,6 +160,17 @@ if [[ "$status" -ne 2 ]] \
 fi
 if grep -qF "PASS: docs hygiene audit" <<<"$audit_output"; then
   fail "unmatched audit glob is fatal outside test mode: unexpected PASS marker"
+fi
+echo "ok"
+
+echo "== inherited nullglob cannot erase required audit glob =="
+run_audit_with_inherited_nullglob "$unmatched_glob_repo"
+if [[ "$status" -ne 2 ]] \
+  || ! grep -qF "missing required audit path: crates/*/docs/README.md" <<<"$audit_output"; then
+  fail "inherited nullglob cannot erase required audit glob"
+fi
+if grep -qF "PASS: docs hygiene audit" <<<"$audit_output"; then
+  fail "inherited nullglob cannot erase required audit glob: unexpected PASS marker"
 fi
 echo "ok"
 

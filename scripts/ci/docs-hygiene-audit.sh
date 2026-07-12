@@ -94,6 +94,10 @@ rg_scan_existing() {
   rg_scan "${rg_args[@]}" "${paths[@]}"
 }
 
+# Required audit globs must remain literal when unmatched so the helper can
+# reject them. Do not inherit nullglob through an exported BASHOPTS value.
+shopt -u nullglob
+
 declare -a errors=()
 declare -a warnings=()
 
