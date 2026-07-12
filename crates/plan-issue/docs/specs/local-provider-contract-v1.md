@@ -25,7 +25,7 @@ In scope:
   faithfully against a local file store (REAL) versus which can only return
   test-seeded values (STUB / SEED).
 - The on-disk JSON store schema (`RepoFile`, `IssueRecord`, `PrRecord`).
-- The per-method contract for the 11 `ProviderAdapter` methods, against the
+- The per-method contract for the 13 `ProviderAdapter` methods, against the
   as-built trait signatures.
 - Determinism rules for synthesized URLs, timestamps, and numbering.
 - The store layout on disk and its teardown model.
@@ -52,7 +52,7 @@ earlier design draft. The authoritative code locations are:
 
 | What | Where |
 | --- | --- |
-| `ProviderAdapter` trait (11 methods, `repo: &str`) | `crates/plan-issue/src/adapter.rs` (re-exported from `crates/plan-issue/src/provider.rs:24`) |
+| `ProviderAdapter` trait (13 methods, `repo: &str`) | `crates/plan-issue/src/adapter.rs` (re-exported from `crates/plan-issue/src/provider.rs:24`) |
 | `PrMergeSummary` struct | `crates/plan-issue/src/adapter.rs` |
 | `CloseReason` enum (`Completed` \| `NotPlanned`) | `crates/plan-issue/src/commands/plan.rs:9` |
 | `Provider` / `Repo` / `select_adapter` / `resolve_repo` | `crates/plan-issue/src/provider.rs` |
@@ -65,18 +65,27 @@ this shape alongside this spec.
 
 ## The Capability Split
 
-The 11 `ProviderAdapter` methods cleave into two halves. This split is the
-single decision that bounds how faithful a local backend (and any future
-networked service derived from it) can be.
+The 13 `ProviderAdapter` methods cleave into two implemented halves plus one
+intentional capability seam. This split is the single decision that bounds how
+faithful a local backend (and any future networked service derived from it) can
+be.
 
-### Half A — issue / timeline (8 methods): REAL locally
+### Half A — issue / timeline (9 methods): REAL locally
 
 For these methods the local store *is* the source of truth, so the backend can
 implement them faithfully. A future plan/issue-tracking service is literally
 "this store, networked and persisted".
 
-`create_issue` · `issue_body` · `issue_evidence` · `list_open_tracker_issues`
-· `edit_issue_body` · `comment_issue` · `edit_issue_labels` · `close_issue`
+`create_issue` · `issue_body` · `issue_evidence` · `issue_labels`
+· `list_open_tracker_issues` · `edit_issue_body` · `comment_issue`
+· `edit_issue_labels` · `close_issue`
+
+### Capability seam — repository catalog (1 method): UNSUPPORTED locally
+
+`repository_labels` has no Local implementation because the file-backed store
+accepts free-form labels and intentionally does not model a repository-wide
+catalog. Callers must branch on provider capability instead of treating an
+empty catalog as authoritative.
 
 ### Half B — PR / merge / CI (3 methods): STUB / SEED only
 
@@ -163,7 +172,7 @@ Field semantics:
 
 ### `PrRecord` (`prs/<n>.json`) — Half B, all fields seeded
 
-`PrRecord` mirrors `PrMergeSummary` (`crates/plan-issue/src/github.rs:69`)
+`PrRecord` mirrors `PrMergeSummary` (`crates/plan-issue/src/adapter.rs`)
 plus a comment stream. Because Half B is a stub, **every field here is seeded
 by the test, never derived** from real VCS/CI state.
 
@@ -214,31 +223,33 @@ reading):
 ## Per-Method Contract
 
 The table is ordered to match the trait definition in
-`crates/plan-issue/src/github.rs:10`. Every signature takes `repo: &str`
+`crates/plan-issue/src/adapter.rs`. Every signature takes `repo: &str`
 (the slug) as its first argument.
 
 | # | Method | Returns | Local implementation | Kind |
 | --- | --- | --- | --- | --- |
 | 1 | `issue_body(repo, issue)` | `String` | read `issues/<n>.json` `.body` | REAL |
 | 2 | `issue_evidence(repo, issue)` | `(String, String)` = (body, comments_json) | read `.body` + serialize `.comments` into the `gh issue view --json comments` shape | REAL |
-| 3 | `list_open_tracker_issues(repo, labels)` | `Vec<u64>` | scan `issues/`, keep `state==open` AND `labels ⊇ requested` (AND semantics; an empty slice lists every open issue) | REAL |
-| 4 | `create_issue(repo, title, body_file, labels)` | `(u64, String)` = (number, url) | alloc `next_issue`, write `issues/<n>.json`, return `(n, synthetic url)` | REAL |
-| 5 | `edit_issue_body(repo, issue, body_file)` | `()` | overwrite `.body` | REAL |
-| 6 | `comment_issue(repo, issue, body_file)` | `String` = comment url | append to `.comments`, return its `local://` url | REAL |
-| 7 | `edit_issue_labels(repo, issue, add, remove)` | `()` | mutate the `.labels` set (add then remove) | REAL |
-| 8 | `close_issue(repo, issue, reason, comment)` | `()` | set `state=closed`, store `close_reason` natively, append optional close comment | REAL |
-| 9 | `pr_is_merged(repo, pr)` | `bool` | read seeded `prs/<n>.json` `.merged` | STUB |
-| 10 | `pr_merge_summary(repo, pr)` | `PrMergeSummary` | read seeded `PrRecord` into the struct | STUB |
-| 11 | `pr_comments(repo, pr)` | `Vec<Value>` (≥ `body`, `html_url`) | read seeded `.comments` | STUB |
+| 3 | `issue_labels(repo, issue)` | `Vec<String>` | read `issues/<n>.json` `.labels` | REAL |
+| 4 | `repository_labels(repo)` | `Vec<String>` | no Local repository catalog exists; `record close` branches on `Provider::Local` and must not invoke this method | UNSUPPORTED |
+| 5 | `list_open_tracker_issues(repo, labels)` | `Vec<u64>` | scan `issues/`, keep `state==open` AND `labels ⊇ requested` (AND semantics; an empty slice lists every open issue) | REAL |
+| 6 | `create_issue(repo, title, body_file, labels)` | `(u64, String)` = (number, url) | alloc `next_issue`, write `issues/<n>.json`, return `(n, synthetic url)` | REAL |
+| 7 | `edit_issue_body(repo, issue, body_file)` | `()` | overwrite `.body` | REAL |
+| 8 | `comment_issue(repo, issue, body_file)` | `String` = comment url | append to `.comments`, return its `local://` url | REAL |
+| 9 | `edit_issue_labels(repo, issue, add, remove)` | `()` | mutate the `.labels` set (add then remove) | REAL |
+| 10 | `close_issue(repo, issue, reason, comment)` | `()` | set `state=closed`, store `close_reason` natively, append optional close comment | REAL |
+| 11 | `pr_is_merged(repo, pr)` | `bool` | read seeded `prs/<n>.json` `.merged` | STUB |
+| 12 | `pr_merge_summary(repo, pr)` | `PrMergeSummary` | read seeded `PrRecord` into the struct | STUB |
+| 13 | `pr_comments(repo, pr)` | `Vec<Value>` (≥ `body`, `html_url`) | read seeded `.comments` | STUB |
 
 Notes:
 
-- Method 2 (`issue_evidence`) must produce `comments_json` in the same shape the
+- `issue_evidence` must produce `comments_json` in the same shape the
   GitHub adapter gets from `gh issue view --json comments`, because the
   `record audit` fixture parser consumes that shape unchanged across providers.
-- Method 4 (`create_issue`) returns the number first because callers store the
+- `create_issue` returns the number first because callers store the
   returned number as the issue identity for the rest of the lifecycle.
-- Method 8 (`close_issue`) takes a `CloseReason` and an optional close comment;
+- `close_issue` takes a `CloseReason` and an optional close comment;
   the local backend persists the reason in `close_reason` rather than encoding
   it in a comment.
 
@@ -257,6 +268,10 @@ and conformance tests are reproducible.
   per write), never the system clock.
 - **Numbering**: the `next_issue` / `next_pr` counters in `repo.json` allocate
   issue and PR numbers monotonically.
+- **Labels**: issue labels are free-form store data. Local has no repository
+  catalog command, so `record close` skips remote availability preflight but
+  still reads the current issue labels, normalizes exclusive `state::*`
+  siblings, applies one edit, and verifies the provider read-back.
 
 ## Seeding Half B (`driver-writes-JSON` v1)
 

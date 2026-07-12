@@ -741,6 +741,309 @@ fn normalize_label_mutations(
     Ok((add_clean, remove_clean))
 }
 
+#[derive(Debug, Clone)]
+struct CloseLabelPlan {
+    requested_add: Vec<String>,
+    requested_remove: Vec<String>,
+    add: Vec<String>,
+    remove: Vec<String>,
+    current: Option<Vec<String>>,
+    final_labels: Option<Vec<String>>,
+    catalog_checked: bool,
+    missing_additions: Vec<String>,
+}
+
+impl CloseLabelPlan {
+    fn preview(&self, confirmed: Option<&[String]>) -> Value {
+        json!({
+            "requested": {
+                "add": self.requested_add,
+                "remove": self.requested_remove,
+            },
+            "add": self.add,
+            "remove": self.remove,
+            "current": self.current,
+            "final": self.final_labels,
+            "availability": {
+                "checked": self.catalog_checked,
+                "missing_additions": self.missing_additions,
+            },
+            "confirmed": confirmed,
+        })
+    }
+}
+
+fn sorted_unique_labels_for_provider(
+    labels: impl IntoIterator<Item = String>,
+    provider: Option<crate::provider::Provider>,
+) -> Vec<String> {
+    let mut unique: Vec<String> = Vec::new();
+    for label in labels {
+        if !unique
+            .iter()
+            .any(|existing| label_matches(provider, existing, &label))
+        {
+            unique.push(label);
+        }
+    }
+    if provider == Some(crate::provider::Provider::GitHub) {
+        unique.sort_by(|left, right| {
+            left.to_ascii_lowercase()
+                .cmp(&right.to_ascii_lowercase())
+                .then_with(|| left.cmp(right))
+        });
+    } else {
+        unique.sort();
+    }
+    unique
+}
+
+fn label_matches(provider: Option<crate::provider::Provider>, left: &str, right: &str) -> bool {
+    if provider == Some(crate::provider::Provider::GitHub) {
+        left.eq_ignore_ascii_case(right)
+    } else {
+        left == right
+    }
+}
+
+fn render_label_diagnostic(labels: &[String]) -> String {
+    let quoted = labels
+        .iter()
+        .map(|label| serde_json::to_string(label).unwrap_or_else(|_| "\"<invalid>\"".to_string()))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("[{quoted}]")
+}
+
+fn build_close_label_plan(
+    requested_add: Vec<String>,
+    requested_remove: Vec<String>,
+    current: Option<Vec<String>>,
+    catalog: Option<Vec<String>>,
+    provider: Option<crate::provider::Provider>,
+) -> Result<CloseLabelPlan, CommandError> {
+    let requested_add = sorted_unique_labels_for_provider(requested_add, provider);
+    let requested_remove = sorted_unique_labels_for_provider(requested_remove, provider);
+    let conflicts = requested_add
+        .iter()
+        .filter(|added| {
+            requested_remove
+                .iter()
+                .any(|removed| label_matches(provider, added, removed))
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    if !conflicts.is_empty() {
+        return Err(CommandError::usage(
+            "record-label-mutation-conflict",
+            format!(
+                "record-close: label(s) appear in both --add-label and --remove-label: {}",
+                render_label_diagnostic(&conflicts)
+            ),
+        ));
+    }
+    let state_additions: Vec<&str> = requested_add
+        .iter()
+        .map(String::as_str)
+        .filter(|label| label.to_ascii_lowercase().starts_with("state::"))
+        .collect();
+    if state_additions.len() > 1 {
+        return Err(CommandError::usage(
+            "record-close-state-label-conflict",
+            format!(
+                "record-close: multiple mutually exclusive state labels requested: {}",
+                render_label_diagnostic(
+                    &state_additions
+                        .iter()
+                        .map(|label| (*label).to_string())
+                        .collect::<Vec<_>>()
+                )
+            ),
+        ));
+    }
+
+    let current = current.map(|labels| sorted_unique_labels_for_provider(labels, provider));
+    let catalog = catalog.map(|labels| sorted_unique_labels_for_provider(labels, provider));
+    let mut remove = requested_remove.clone();
+    if let (Some(target), Some(current_labels)) = (state_additions.first(), current.as_ref()) {
+        remove.extend(
+            current_labels
+                .iter()
+                .filter(|label| label.to_ascii_lowercase().starts_with("state::"))
+                .filter(|label| !label_matches(provider, label, target))
+                .cloned(),
+        );
+    }
+    let remove = sorted_unique_labels_for_provider(remove, provider);
+
+    let missing_additions = catalog
+        .as_ref()
+        .map(|available| {
+            requested_add
+                .iter()
+                .filter(|requested| {
+                    !available
+                        .iter()
+                        .any(|actual| label_matches(provider, actual, requested))
+                })
+                .cloned()
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+
+    let final_labels = current.as_ref().map(|current_labels| {
+        let mut final_labels: Vec<String> = current_labels
+            .iter()
+            .filter(|label| {
+                !remove
+                    .iter()
+                    .any(|removed| label_matches(provider, label, removed))
+            })
+            .cloned()
+            .collect();
+        for added in &requested_add {
+            if !final_labels
+                .iter()
+                .any(|current| label_matches(provider, current, added))
+            {
+                final_labels.push(added.clone());
+            }
+        }
+        sorted_unique_labels_for_provider(final_labels, provider)
+    });
+
+    Ok(CloseLabelPlan {
+        requested_add: requested_add.clone(),
+        requested_remove,
+        add: requested_add,
+        remove,
+        current,
+        final_labels,
+        catalog_checked: catalog.is_some(),
+        missing_additions,
+    })
+}
+
+fn close_label_plan_converged(
+    provider: crate::provider::Provider,
+    plan: &CloseLabelPlan,
+    actual: &[String],
+) -> bool {
+    let additions_present = plan.add.iter().all(|expected_label| {
+        actual
+            .iter()
+            .any(|actual_label| label_matches(Some(provider), expected_label, actual_label))
+    });
+    let removals_absent = plan.remove.iter().all(|removed_label| {
+        !actual
+            .iter()
+            .any(|actual_label| label_matches(Some(provider), removed_label, actual_label))
+    });
+    let state_target = plan
+        .add
+        .iter()
+        .find(|label| label.to_ascii_lowercase().starts_with("state::"));
+    let state_exclusive = state_target.is_none_or(|target| {
+        let actual_states: Vec<&String> = actual
+            .iter()
+            .filter(|label| label.to_ascii_lowercase().starts_with("state::"))
+            .collect();
+        actual_states.len() == 1 && label_matches(Some(provider), actual_states[0], target)
+    });
+    additions_present && removals_absent && state_exclusive
+}
+
+fn restore_close_labels_after_failure(
+    adapter: &dyn ProviderAdapter,
+    repo: &str,
+    issue: u64,
+    provider: crate::provider::Provider,
+    plan: &CloseLabelPlan,
+    failure: CommandError,
+) -> CommandError {
+    let original = plan.current.as_deref().unwrap_or_default();
+    let add = plan
+        .remove
+        .iter()
+        .filter(|label| {
+            original
+                .iter()
+                .any(|previous| label_matches(Some(provider), label, previous))
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    let remove = plan
+        .add
+        .iter()
+        .filter(|label| {
+            !original
+                .iter()
+                .any(|previous| label_matches(Some(provider), label, previous))
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+
+    if add.is_empty() && remove.is_empty() {
+        return failure;
+    }
+
+    if let Err(rollback_error) = adapter.edit_issue_labels(repo, issue, &add, &remove) {
+        return CommandError::runtime(
+            "record-close-label-rollback-failed",
+            format!(
+                "{}; additionally failed to restore the original labels: {rollback_error}",
+                failure.message
+            ),
+        );
+    }
+    let restored = match adapter.issue_labels(repo, issue) {
+        Ok(labels) => sorted_unique_labels_for_provider(labels, Some(provider)),
+        Err(rollback_error) => {
+            return CommandError::runtime(
+                "record-close-label-rollback-failed",
+                format!(
+                    "{}; label rollback was sent but its read-back failed: {rollback_error}",
+                    failure.message
+                ),
+            );
+        }
+    };
+    let restored_matches =
+        close_label_plan_converged_after_rollback(provider, &add, &remove, &restored);
+    if !restored_matches {
+        let expected_add = sorted_unique_labels_for_provider(add, Some(provider));
+        let expected_remove = sorted_unique_labels_for_provider(remove, Some(provider));
+        return CommandError::runtime(
+            "record-close-label-rollback-failed",
+            format!(
+                "{}; label rollback did not converge: expected present {}, expected absent {}, observed {}",
+                failure.message,
+                render_label_diagnostic(&expected_add),
+                render_label_diagnostic(&expected_remove),
+                render_label_diagnostic(&restored)
+            ),
+        );
+    }
+    failure
+}
+
+fn close_label_plan_converged_after_rollback(
+    provider: crate::provider::Provider,
+    expected_present: &[String],
+    expected_absent: &[String],
+    actual: &[String],
+) -> bool {
+    expected_present.iter().all(|expected| {
+        actual
+            .iter()
+            .any(|actual| label_matches(Some(provider), expected, actual))
+    }) && expected_absent.iter().all(|expected| {
+        !actual
+            .iter()
+            .any(|actual| label_matches(Some(provider), expected, actual))
+    })
+}
+
 fn run_record_open(
     binary: BinaryFlavor,
     dry_run: bool,
@@ -1805,13 +2108,41 @@ fn run_record_close(
     )
     .map_err(|err| CommandError::runtime("record-close-render-failed", err))?;
 
-    let (add_labels, remove_labels) =
+    let (requested_add_labels, requested_remove_labels) =
         normalize_label_mutations(&args.add_labels, &args.remove_labels, "record-close")?;
+    let label_mutation_requested =
+        !requested_add_labels.is_empty() || !requested_remove_labels.is_empty();
+    let mut label_plan = build_close_label_plan(
+        requested_add_labels,
+        requested_remove_labels,
+        None,
+        None,
+        repo_for_provider.as_ref().map(|repo| repo.provider),
+    )?;
+    if label_mutation_requested && let Some(repo_info) = repo_for_provider.as_ref() {
+        let adapter = crate::provider::select_adapter(repo_info, force);
+        let current = adapter
+            .issue_labels(&repo_info.slug, issue_number)
+            .map_err(|err| CommandError::runtime("record-close-label-state-read-failed", err))?;
+        let catalog = if repo_info.provider == crate::provider::Provider::Local {
+            None
+        } else {
+            Some(adapter.repository_labels(&repo_info.slug).map_err(|err| {
+                CommandError::runtime("record-close-label-catalog-read-failed", err)
+            })?)
+        };
+        label_plan = build_close_label_plan(
+            label_plan.requested_add,
+            label_plan.requested_remove,
+            Some(current),
+            catalog,
+            Some(repo_info.provider),
+        )?;
+    }
+    let add_labels = label_plan.add.clone();
+    let remove_labels = label_plan.remove.clone();
     let label_mutation_planned = !add_labels.is_empty() || !remove_labels.is_empty();
-    let labels_preview = json!({
-        "add": add_labels.clone(),
-        "remove": remove_labels.clone(),
-    });
+    let labels_preview = label_plan.preview(None);
 
     // Bundle preview for dry-run and fixture modes.
     let preview = json!({
@@ -1834,30 +2165,113 @@ fn run_record_close(
         }));
     }
 
+    if !label_plan.missing_additions.is_empty() {
+        return Err(CommandError::runtime(
+            "record-close-label-preflight-failed",
+            format!(
+                "requested label additions are unavailable in the repository: {}",
+                render_label_diagnostic(&label_plan.missing_additions)
+            ),
+        ));
+    }
+
     let repo_info = repo_for_provider.expect("live mode has repo");
     let adapter = crate::provider::select_adapter(&repo_info, force);
     let repo = repo_info.slug.clone();
     let issue_url = repo_info.issue_url(issue_number);
-    let closeout_path = write_temp_markdown("record-close-comment", &closeout_body)
-        .map_err(|err| CommandError::runtime("record-close-comment-write-failed", err))?;
+    let rollback_after_failure = |failure: CommandError| {
+        if label_mutation_planned {
+            restore_close_labels_after_failure(
+                adapter.as_ref(),
+                &repo,
+                issue_number,
+                repo_info.provider,
+                &label_plan,
+                failure,
+            )
+        } else {
+            failure
+        }
+    };
+    let confirmed_labels = if label_mutation_planned {
+        adapter
+            .edit_issue_labels(&repo, issue_number, &add_labels, &remove_labels)
+            .map_err(|err| {
+                rollback_after_failure(CommandError::runtime("record-close-label-edit-failed", err))
+            })?;
+        let observed = adapter.issue_labels(&repo, issue_number).map_err(|err| {
+            rollback_after_failure(CommandError::runtime(
+                "record-close-label-readback-failed",
+                err,
+            ))
+        })?;
+        let observed = sorted_unique_labels_for_provider(observed, Some(repo_info.provider));
+        if !close_label_plan_converged(repo_info.provider, &label_plan, &observed) {
+            let expected = label_plan.final_labels.as_deref().unwrap_or_default();
+            return Err(rollback_after_failure(CommandError::runtime(
+                "record-close-label-convergence-failed",
+                format!(
+                    "provider label read-back differs from the preflighted final set; expected {}, observed {}",
+                    render_label_diagnostic(expected),
+                    render_label_diagnostic(&observed)
+                ),
+            )));
+        }
+        Some(observed)
+    } else {
+        None
+    };
+    let labels_result = label_plan.preview(confirmed_labels.as_deref());
+
+    let closeout_path =
+        write_temp_markdown("record-close-comment", &closeout_body).map_err(|err| {
+            rollback_after_failure(CommandError::runtime(
+                "record-close-comment-write-failed",
+                err,
+            ))
+        })?;
     let closeout_url = adapter
         .comment_issue(&repo, issue_number, &closeout_path)
-        .map_err(|err| CommandError::runtime("record-close-comment-post-failed", err))?;
+        .map_err(|err| {
+            rollback_after_failure(CommandError::runtime(
+                "record-close-comment-post-failed",
+                err,
+            ))
+        })?;
 
     // Re-audit so the final dashboard includes the closeout URL.
-    let (body_after, comments_after) = adapter
-        .issue_evidence(&repo, issue_number)
-        .map_err(|err| CommandError::runtime("record-close-evidence-reread-failed", err))?;
+    let (body_after, comments_after) =
+        adapter.issue_evidence(&repo, issue_number).map_err(|err| {
+            rollback_after_failure(CommandError::runtime(
+                "record-close-evidence-reread-failed",
+                err,
+            ))
+        })?;
     let audit_after =
         lifecycle_record::audit_record(Some(&body_after), &comments_after, Some(args.profile))
-            .map_err(|err| CommandError::runtime("record-close-audit-reread-failed", err))?;
+            .map_err(|err| {
+                rollback_after_failure(CommandError::runtime(
+                    "record-close-audit-reread-failed",
+                    err,
+                ))
+            })?;
     let final_dashboard =
         lifecycle_record::render_dashboard_from_audit(&audit_after, None, Some(&issue_url));
-    let dashboard_path = write_temp_markdown("record-close-dashboard", &final_dashboard)
-        .map_err(|err| CommandError::runtime("record-close-dashboard-write-failed", err))?;
+    let dashboard_path =
+        write_temp_markdown("record-close-dashboard", &final_dashboard).map_err(|err| {
+            rollback_after_failure(CommandError::runtime(
+                "record-close-dashboard-write-failed",
+                err,
+            ))
+        })?;
     adapter
         .edit_issue_body(&repo, issue_number, &dashboard_path)
-        .map_err(|err| CommandError::runtime("record-close-dashboard-edit-failed", err))?;
+        .map_err(|err| {
+            rollback_after_failure(CommandError::runtime(
+                "record-close-dashboard-edit-failed",
+                err,
+            ))
+        })?;
     adapter
         .close_issue(
             &repo,
@@ -1866,12 +2280,6 @@ fn run_record_close(
             None,
         )
         .map_err(|err| CommandError::runtime("record-close-issue-close-failed", err))?;
-
-    if label_mutation_planned {
-        adapter
-            .edit_issue_labels(&repo, issue_number, &add_labels, &remove_labels)
-            .map_err(|err| CommandError::runtime("record-close-label-edit-failed", err))?;
-    }
 
     // Write the terminal state back into the bundle's execution-state file so
     // the in-repo copy is final immediately after closeout, not transient-stale
@@ -1892,7 +2300,7 @@ fn run_record_close(
         "closeout_url": closeout_url,
         "linked_prs": linked_evidence,
         "final_dashboard": final_dashboard,
-        "labels": labels_preview,
+        "labels": labels_result,
         "execution_state_sync": execution_state_sync,
     }))
 }
@@ -7075,6 +7483,14 @@ mod tests {
             unreachable!("issue_evidence is not needed in this test")
         }
 
+        fn issue_labels(&self, _repo: &str, _issue: u64) -> Result<Vec<String>, String> {
+            unreachable!("issue_labels is not needed in this test")
+        }
+
+        fn repository_labels(&self, _repo: &str) -> Result<Vec<String>, String> {
+            unreachable!("repository_labels is not needed in this test")
+        }
+
         fn list_open_tracker_issues(
             &self,
             _repo: &str,
@@ -7172,6 +7588,14 @@ mod tests {
 
         fn issue_evidence(&self, _repo: &str, _issue: u64) -> Result<(String, String), String> {
             unreachable!("issue_evidence is not needed in this test")
+        }
+
+        fn issue_labels(&self, _repo: &str, _issue: u64) -> Result<Vec<String>, String> {
+            unreachable!("issue_labels is not needed in this test")
+        }
+
+        fn repository_labels(&self, _repo: &str) -> Result<Vec<String>, String> {
+            unreachable!("repository_labels is not needed in this test")
         }
 
         fn list_open_tracker_issues(
@@ -7323,6 +7747,14 @@ mod tests {
                 .get(&issue)
                 .cloned()
                 .ok_or_else(|| format!("no scripted evidence for issue {issue}"))
+        }
+
+        fn issue_labels(&self, _repo: &str, _issue: u64) -> Result<Vec<String>, String> {
+            unreachable!("issue_labels is not needed in this test")
+        }
+
+        fn repository_labels(&self, _repo: &str) -> Result<Vec<String>, String> {
+            unreachable!("repository_labels is not needed in this test")
         }
 
         fn list_open_tracker_issues(
@@ -8809,6 +9241,95 @@ mod tests {
     fn close_exec_state_writeback_skips_without_bundle() {
         let out = close_exec_state_writeback(None, "https://x/issues/1", &[]);
         assert_eq!(out.get("skipped").and_then(|v| v.as_bool()), Some(true));
+    }
+
+    #[test]
+    fn close_label_convergence_allows_unrelated_automation_labels() {
+        let plan = build_close_label_plan(
+            vec!["state::closed".into()],
+            vec![],
+            Some(vec!["state::ready".into(), "workflow::tracking".into()]),
+            Some(vec!["state::ready".into(), "state::closed".into()]),
+            Some(crate::provider::Provider::GitHub),
+        )
+        .expect("label plan");
+        assert!(close_label_plan_converged(
+            crate::provider::Provider::GitHub,
+            &plan,
+            &[
+                "automation::complete".into(),
+                "State::Closed".into(),
+                "workflow::tracking".into(),
+            ]
+        ));
+        assert!(!close_label_plan_converged(
+            crate::provider::Provider::GitHub,
+            &plan,
+            &[
+                "state::closed".into(),
+                "state::ready".into(),
+                "workflow::tracking".into(),
+            ]
+        ));
+    }
+
+    #[test]
+    fn github_close_label_plan_rejects_case_equivalent_add_remove_conflicts() {
+        let error = build_close_label_plan(
+            vec!["state::closed".into()],
+            vec!["State::Closed".into()],
+            Some(vec!["state::ready".into()]),
+            Some(vec!["state::ready".into(), "state::closed".into()]),
+            Some(crate::provider::Provider::GitHub),
+        )
+        .expect_err("GitHub labels are case-insensitive");
+        assert_eq!(error.code, "record-label-mutation-conflict");
+    }
+
+    #[test]
+    fn close_label_plan_deduplicates_with_provider_identity_rules() {
+        let github = build_close_label_plan(
+            vec!["Bug".into(), "bug".into()],
+            vec![],
+            Some(vec![]),
+            Some(vec!["bug".into()]),
+            Some(crate::provider::Provider::GitHub),
+        )
+        .expect("GitHub semantic duplicate");
+        assert_eq!(github.add, vec!["Bug"]);
+
+        let gitlab = build_close_label_plan(
+            vec!["Bug".into(), "bug".into()],
+            vec!["State::Closed".into()],
+            Some(vec![]),
+            Some(vec!["Bug".into(), "bug".into()]),
+            Some(crate::provider::Provider::GitLab),
+        )
+        .expect("GitLab labels are case-sensitive");
+        assert_eq!(gitlab.add, vec!["Bug", "bug"]);
+        assert_eq!(gitlab.remove, vec!["State::Closed"]);
+
+        let gitlab_case_distinct = build_close_label_plan(
+            vec!["state::closed".into()],
+            vec!["State::Closed".into()],
+            Some(vec![]),
+            Some(vec!["state::closed".into()]),
+            Some(crate::provider::Provider::GitLab),
+        )
+        .expect("GitLab case-distinct add and remove are not contradictory");
+        assert_eq!(gitlab_case_distinct.add, vec!["state::closed"]);
+        assert_eq!(gitlab_case_distinct.remove, vec!["State::Closed"]);
+    }
+
+    #[test]
+    fn label_diagnostics_escape_provider_control_characters() {
+        let rendered =
+            render_label_diagnostic(&["safe".into(), "bad\n\u{1b}]8;;https://x\u{7}".into()]);
+
+        assert_eq!(rendered, r#"["safe", "bad\n\u001b]8;;https://x\u0007"]"#);
+        assert!(!rendered.contains('\n'));
+        assert!(!rendered.contains('\u{1b}'));
+        assert!(!rendered.contains('\u{7}'));
     }
 
     #[test]

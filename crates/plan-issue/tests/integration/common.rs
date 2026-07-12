@@ -83,6 +83,12 @@ pub fn run_plan_issue_local_with_env(args: &[&str], env: &[(&str, &str)]) -> Cmd
 /// - `FORGE_CLI_STUB_COMMENT_URL`: URL returned by `issue comment`.
 /// - `FORGE_CLI_STUB_EDIT_LABELS_JSON`: provider-observed JSON label array
 ///   returned by `issue edit`. Defaults to `[]`.
+/// - `FORGE_CLI_STUB_REPO_LABELS_JSON`: repository label catalog returned by
+///   `label list`. Defaults to the three lifecycle labels used by close tests.
+/// - `FORGE_CLI_STUB_STRICT_REPO_LABELS=1`: reject `issue edit --add-label`
+///   when the requested label is absent from the repository catalog.
+/// - `FORGE_CLI_STUB_LOCAL_LABEL_LIST_UNSUPPORTED=1`: reject `label list`
+///   for the local provider, matching its intentionally catalog-free store.
 /// - `FORGE_CLI_STUB_LABELS_FILE`: optional newline-delimited provider label
 ///   state shared across stub invocations.
 /// - `FORGE_CLI_STUB_ISSUE_STATE_FILE`: optional provider issue-state file
@@ -182,6 +188,14 @@ provider_labels_json() {
   printf '%s]' "$json"
 }
 
+repo_labels_json() {
+  if [[ -n "${FORGE_CLI_STUB_REPO_LABELS_JSON:-}" ]]; then
+    printf '%s' "$FORGE_CLI_STUB_REPO_LABELS_JSON"
+  else
+    printf '%s' '[{"name":"state::needs-triage","color":"000000","description":""},{"name":"state::ready","color":"000000","description":""},{"name":"state::closed","color":"000000","description":""}]'
+  fi
+}
+
 emit_escaped_control_error() {
   # Mirror forge-cli's `markdown_escaped_control` validation error envelope so
   # the post-consolidation GitHub write path (which now relies on forge-cli's
@@ -250,12 +264,28 @@ case "$group $verb" in
     if [[ -n "${FORGE_CLI_STUB_CAPTURE_BODY_FILE:-}" && -n "$body_file" ]]; then
       cp "$body_file" "$FORGE_CLI_STUB_CAPTURE_BODY_FILE"
     fi
+    if [[ "${FORGE_CLI_STUB_STRICT_REPO_LABELS:-}" == "1" ]]; then
+      catalog="$(repo_labels_json)"
+      for label in "${add_labels[@]-}"; do
+        [[ -z "$label" ]] && continue
+        if ! printf '%s' "$catalog" | grep -Fq "\"$label\""; then
+          emit "{\"ok\":false,\"schema_version\":\"cli.forge-cli.error.v1\",\"error\":{\"code\":\"label-not-found\",\"message\":\"label \\\"$label\\\" not found\"}}"
+          exit 1
+        fi
+      done
+    fi
     if [[ -n "${FORGE_CLI_STUB_LABELS_FILE:-}" && "${FORGE_CLI_STUB_DROP_LABEL_MUTATIONS:-}" != "1" ]]; then
       touch "$FORGE_CLI_STUB_LABELS_FILE"
+      partial_label_edit=0
+      if [[ "${FORGE_CLI_STUB_PARTIAL_LABEL_EDIT_ONCE:-}" == "1" && -n "${FORGE_CLI_STUB_PARTIAL_LABEL_EDIT_MARKER:-}" && ! -e "$FORGE_CLI_STUB_PARTIAL_LABEL_EDIT_MARKER" ]]; then
+        partial_label_edit=1
+        touch "$FORGE_CLI_STUB_PARTIAL_LABEL_EDIT_MARKER"
+      fi
       # Bash 3.2 treats an empty array as unset under `set -u`; the `-`
       # fallback keeps body-only edits portable while preserving array items.
       for label in "${remove_labels[@]-}"; do
         [[ -z "$label" ]] && continue
+        [[ "$partial_label_edit" == "1" ]] && continue
         grep -Fvx -- "$label" "$FORGE_CLI_STUB_LABELS_FILE" > "${FORGE_CLI_STUB_LABELS_FILE}.tmp" || true
         mv "${FORGE_CLI_STUB_LABELS_FILE}.tmp" "$FORGE_CLI_STUB_LABELS_FILE"
       done
@@ -263,6 +293,10 @@ case "$group $verb" in
         [[ -z "$label" ]] && continue
         grep -Fxq -- "$label" "$FORGE_CLI_STUB_LABELS_FILE" || printf '%s\n' "$label" >> "$FORGE_CLI_STUB_LABELS_FILE"
       done
+      if [[ -n "${FORGE_CLI_STUB_AUTOMATION_LABEL_AFTER_EDIT:-}" && -n "${FORGE_CLI_STUB_AUTOMATION_MARKER:-}" && ! -e "$FORGE_CLI_STUB_AUTOMATION_MARKER" ]]; then
+        printf '%s\n' "$FORGE_CLI_STUB_AUTOMATION_LABEL_AFTER_EDIT" >> "$FORGE_CLI_STUB_LABELS_FILE"
+        touch "$FORGE_CLI_STUB_AUTOMATION_MARKER"
+      fi
     fi
     state="$(issue_state)"
     labels_json="$(provider_labels_json)"
@@ -271,6 +305,10 @@ case "$group $verb" in
   "issue comment")
     maybe_reject_local_path "comment"
     maybe_reject_escaped_control
+    if [[ "${FORGE_CLI_STUB_FAIL_COMMENT:-}" == "1" ]]; then
+      emit '{"ok":false,"schema_version":"cli.forge-cli.error.v1","error":{"code":"comment-failed","message":"simulated comment failure"}}'
+      exit 1
+    fi
     if [[ -n "${FORGE_CLI_STUB_CAPTURE_COMMENT_FILE:-}" && -n "$body_file" ]]; then
       cp "$body_file" "$FORGE_CLI_STUB_CAPTURE_COMMENT_FILE"
     fi
@@ -281,10 +319,22 @@ case "$group $verb" in
     if [[ -n "${FORGE_CLI_STUB_ISSUE_STATE_FILE:-}" ]]; then
       printf 'closed\n' > "$FORGE_CLI_STUB_ISSUE_STATE_FILE"
     fi
+    if [[ "${FORGE_CLI_STUB_FAIL_CLOSE_AFTER_MUTATION:-}" == "1" ]]; then
+      emit '{"ok":false,"schema_version":"cli.forge-cli.error.v1","error":{"code":"close-readback-failed","message":"close succeeded but follow-up view failed"}}'
+      exit 1
+    fi
     emit "{\"ok\":true,\"schema_version\":\"cli.forge-cli.issue.close.v1\",\"data\":{\"provider\":\"$provider\",\"number\":$id,\"url\":\"https://github.com/$repo/issues/$id\",\"state\":\"closed\"}}"
     ;;
   "issue list")
     emit "{\"ok\":true,\"schema_version\":\"cli.forge-cli.issue.list.v1\",\"data\":{\"provider\":\"$provider\",\"items\":[]}}"
+    ;;
+  "label list")
+    if [[ "$provider" == "local" && "${FORGE_CLI_STUB_LOCAL_LABEL_LIST_UNSUPPORTED:-}" == "1" ]]; then
+      emit '{"ok":false,"schema_version":"cli.forge-cli.error.v1","error":{"code":"provider_unsupported","message":"provider local does not model repository label catalogs"}}'
+      exit 1
+    fi
+    labels_json="$(repo_labels_json)"
+    emit "{\"ok\":true,\"schema_version\":\"cli.forge-cli.label.list.v1\",\"data\":{\"provider\":\"$provider\",\"labels\":$labels_json}}"
     ;;
   "pr view")
     if [[ ",${FORGE_CLI_STUB_UNMERGED_PRS:-}," == *",${id},"* ]]; then

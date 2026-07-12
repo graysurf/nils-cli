@@ -71,7 +71,7 @@ auditable but do not satisfy gate requirements once superseded.
 
 ## Closeout Gate Invariants
 
-`plan-issue record close` evaluates the following before any mutation:
+`plan-issue record close` evaluates the following before closeout writes:
 
 1. `source` and `plan` markers exist with structured payloads. `commit`
    matches a known commit in the local repo when `--bundle` is provided.
@@ -89,9 +89,23 @@ auditable but do not satisfy gate requirements once superseded.
    merged PR with a non-empty `merge_sha`.
 7. Approval evidence (`--approval`) is present and parses as a provider
    comment URL or non-empty approval text.
+8. Every requested remote-provider label addition exists in the repository
+   catalog. Local stores have no catalog and keep free-form additions. For all
+   providers, when one `state::*` label is added, all current state siblings
+   are included in the same label edit; final read-back must contain only that
+   state label.
 
-When any check fails, `record close` returns exit 1, posts no mutations,
-and emits a machine-readable failure code matching the spec
+When checks 1–7 or the label-catalog preflight fail, `record close` returns
+exit 1 without provider writes. The label convergence gate then performs one
+reversible label edit and provider read-back before the closeout comment,
+dashboard edit, and issue close. If that gate fails, the issue remains open
+and no closeout write is posted; a partially applied edit is compensated by
+reversing and verifying only this command's label delta. The same compensation
+runs if a later pre-close write fails, preserving unrelated provider changes;
+rollback failure is surfaced separately. The issue-close request is the commit
+point, so an ambiguous close response never restores pre-close labels on a
+potentially closed issue. Every failure emits a machine-readable code matching
+the spec
 [Strict Closeout Validation](issue-backed-plan-record-contract-v2.md#strict-closeout-validation).
 
 ## Dashboard Invariants
