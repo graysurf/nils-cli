@@ -16,7 +16,7 @@
 - Source document: `docs/plans/2026-07-12-codex-optional-usage-windows/2026-07-12-codex-optional-usage-windows-plan.md`
 - Implementation source: `docs/plans/2026-07-12-codex-optional-usage-windows/2026-07-12-codex-optional-usage-windows-discussion-source.md`
 - Direct source-doc execution waiver: not applicable.
-- Tracking issue: pending
+- Tracking issue: <https://github.com/sympoies/nils-cli/issues/1162>
 
 ## Validation Plan
 
