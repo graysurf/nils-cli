@@ -464,6 +464,8 @@ pub(crate) fn begin_create_bootstrap(
 }
 
 fn create_bootstrap_is_live(record: &SessionRecord) -> bool {
+    #[cfg(test)]
+    BOOTSTRAP_LIVE_CHECKS.with(|checks| checks.set(checks.get() + 1));
     let Some(path) = thread_handoff_path(record) else {
         return false;
     };
@@ -471,6 +473,11 @@ fn create_bootstrap_is_live(record: &SessionRecord) -> bool {
         return false;
     };
     fs::read(path).is_ok_and(|bytes| bytes == runtime.launch_id.as_bytes())
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static BOOTSTRAP_LIVE_CHECKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 pub(crate) fn thread_attached_path(record: &SessionRecord) -> Option<&Path> {
@@ -1381,6 +1388,9 @@ impl FreshBootstrap {
         record: &SessionRecord,
         value: &Value,
     ) -> bool {
+        if matches!(self, Self::Closed) {
+            return false;
+        }
         if !create_bootstrap_is_live(record) || !auto_resume_is_healthy_disabled(context, record) {
             *self = Self::Closed;
             return false;
@@ -2977,6 +2987,24 @@ mod tests {
             }),
         ));
         assert_eq!(bootstrap, FreshBootstrap::Closed);
+    }
+
+    #[test]
+    fn closed_fresh_bootstrap_skips_live_filesystem_validation() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let record = record_with_runtime("closed-bootstrap", &tmp.path().join("closed.sock"));
+        let context = CliContext {
+            state_dir: tmp.path().join("state"),
+            host: None,
+        };
+        BOOTSTRAP_LIVE_CHECKS.with(|checks| checks.set(0));
+        let mut bootstrap = FreshBootstrap::Closed;
+        assert!(!bootstrap.bypasses_create_lock(
+            &context,
+            &record,
+            &json!({ "id": 1, "method": "turn/start", "params": {} }),
+        ));
+        assert_eq!(BOOTSTRAP_LIVE_CHECKS.with(std::cell::Cell::get), 0);
     }
 
     #[tokio::test]
