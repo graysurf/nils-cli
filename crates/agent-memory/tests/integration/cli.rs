@@ -1218,12 +1218,12 @@ fn seed_archive_layout(root: &Path) {
     .expect("retirement source");
     fs::write(
         root.join("global/MEMORY.md"),
-        "# Memory index\n\n- [Routing](routing.md) — active routing\n- [Runtime enforced](runtime-enforced.md) — obsolete reminder\n",
+        "# Memory index\n\n- [Routing](routing.md) — active routing\n- [Runtime enforced](runtime-enforced.md) — superseded reminder\n",
     )
     .expect("global index");
     fs::write(
         root.join("profiles/startup/MEMORY.md"),
-        "# Startup\n\n- [Runtime enforced](../../global/runtime-enforced.md) — obsolete reminder\n",
+        "# Startup\n\n- [Runtime enforced](../../global/runtime-enforced.md) — superseded reminder\n",
     )
     .expect("startup index");
 }
