@@ -36,7 +36,8 @@ agent-session delete <id>
 ```
 
 `send` pushes input to a live session: literal text (`--text` / `--text-stdin`) and/or repeatable named keys
-(`--key enter|escape|c-c|up|down|left|right|tab`), so codex/claude approval prompts are answerable from a phone.
+(`--key enter|escape|backspace|c-c|up|down|left|right|tab`), so codex/claude approval prompts and terminal editing
+remain usable from a phone.
 `glance` returns the recent pane tail plus live status as a JSON contract for dashboard tiles (cheaper than a full attach).
 `resume` recreates a missing tmux runtime only when the session has exact provider resume metadata; it never resumes the
 latest provider conversation implicitly. Runtime metadata is persisted before launch so hooks see the new generation;
