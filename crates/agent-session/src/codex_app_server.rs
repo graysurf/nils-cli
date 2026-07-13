@@ -2537,6 +2537,14 @@ mod tests {
     use std::collections::BTreeMap;
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
+    use std::sync::{Mutex, MutexGuard, OnceLock};
+
+    fn capability_probe_test_guard() -> MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
 
     struct PendingMessageSink;
 
@@ -2678,6 +2686,7 @@ mod tests {
 
     #[test]
     fn forced_runtime_still_requires_the_installed_capability() {
+        let _probe_guard = capability_probe_test_guard();
         let lock = GlobalStateLock::new();
         let tmp = tempfile::TempDir::new().unwrap();
         let runtime_dir = tmp.path().join("run");
@@ -2702,6 +2711,7 @@ mod tests {
 
     #[test]
     fn capability_probe_requires_the_audited_version_and_unix_transport() {
+        let _probe_guard = capability_probe_test_guard();
         let tmp = tempfile::TempDir::new().unwrap();
         for (name, version, help, expected) in [
             (
@@ -2738,6 +2748,7 @@ mod tests {
 
     #[test]
     fn capability_probe_tolerates_cold_start_latency() {
+        let _probe_guard = capability_probe_test_guard();
         let tmp = tempfile::TempDir::new().unwrap();
         let path = tmp.path().join("cold-codex");
         fs::write(
@@ -2763,6 +2774,7 @@ exit 1
 
     #[test]
     fn capability_probe_timeout_kills_and_reaps_the_process_group() {
+        let _probe_guard = capability_probe_test_guard();
         let tmp = tempfile::TempDir::new().unwrap();
         let path = tmp.path().join("hung-codex");
         let pid_file = tmp.path().join("descendant.pid");
@@ -2803,6 +2815,7 @@ exit 1
 
     #[test]
     fn capability_probe_timeout_kills_descendant_after_leader_exits() {
+        let _probe_guard = capability_probe_test_guard();
         let tmp = tempfile::TempDir::new().unwrap();
         let path = tmp.path().join("exited-codex");
         let pid_file = tmp.path().join("descendant.pid");
