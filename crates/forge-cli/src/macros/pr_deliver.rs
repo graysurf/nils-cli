@@ -1124,8 +1124,8 @@ mod tests {
     use crate::cli::{MergeMethodFlag, PrKindFlag};
     use crate::ops::pr_checks::{CheckItem, PrChecksPayload};
     use crate::provider::DetectionSource;
+    use nils_test_support::fixtures::SubjectBoundEvidenceFixture;
     use pretty_assertions::assert_eq;
-    use std::process::Command as GitCommand;
 
     fn ctx() -> ProviderContext {
         ProviderContext {
@@ -1229,83 +1229,26 @@ mod tests {
         }
     }
 
-    fn bound_evidence_fixture() -> (tempfile::TempDir, PathBuf) {
-        let tmp = tempfile::tempdir().unwrap();
-        let repo = tmp.path().join("repo");
-        std::fs::create_dir_all(&repo).unwrap();
-        let git = |args: &[&str]| {
-            let output = GitCommand::new("git")
-                .arg("-C")
-                .arg(&repo)
-                .args(args)
-                .output()
-                .expect("git spawn");
-            assert!(
-                output.status.success(),
-                "git {args:?} failed: {}",
-                String::from_utf8_lossy(&output.stderr)
-            );
-        };
-        git(&["init", "-q", "-b", "main"]);
-        git(&["config", "user.email", "test@example.com"]);
-        git(&["config", "user.name", "Tester"]);
-        git(&["config", "commit.gpgsign", "false"]);
-        std::fs::write(repo.join("README.md"), "fixture\n").unwrap();
-        std::fs::write(
-            repo.join(".forge-cli.toml"),
-            "[test_first]\nrequire = true\n",
-        )
-        .unwrap();
-        git(&["add", "README.md", ".forge-cli.toml"]);
-        git(&["commit", "-q", "-m", "baseline"]);
-        git(&[
-            "remote",
-            "add",
-            "origin",
-            "https://github.com/sympoies/nils-cli.git",
-        ]);
-
-        let evidence = tmp.path().join("evidence");
-        std::fs::create_dir_all(&evidence).unwrap();
-        std::fs::write(
-            evidence.join("test-first-evidence.json"),
-            r#"{"schema_version":"test-first-evidence.record.v2","change_classification":"behavior-change","contract_delta":{"changed_behaviors":["durable gate"]},"no_existing_tests_reason":"fixture has no existing tests","waiver":{"reason":"fixture","kind":"non-testable","why_no_red":"fixture path","substitute_validation":["cargo test"]},"final_validations":[{"command":"cargo test","status":"pass","scope":"focused"}],"no_residual_gaps":true}"#,
-        )
-        .unwrap();
+    fn bind_test_first_phase(phase: &str, repo: &Path, evidence: &Path) -> i32 {
         let evidence_arg = evidence.to_string_lossy().to_string();
         let repo_arg = repo.to_string_lossy().to_string();
-        assert_eq!(
-            agent_workflow_primitives::test_first_evidence::run_with_args([
-                "test-first-evidence",
-                "bind-baseline",
-                "--out",
-                &evidence_arg,
-                "--project-path",
-                &repo_arg,
-            ]),
-            0
-        );
-        std::fs::write(repo.join("delivery.txt"), "delivery\n").unwrap();
-        git(&["add", "delivery.txt"]);
-        git(&["commit", "-q", "-m", "delivery"]);
-        assert_eq!(
-            agent_workflow_primitives::test_first_evidence::run_with_args([
-                "test-first-evidence",
-                "bind-delivery",
-                "--out",
-                &evidence_arg,
-                "--project-path",
-                &repo_arg,
-            ]),
-            0
-        );
-        (tmp, evidence)
+        agent_workflow_primitives::test_first_evidence::run_with_args([
+            "test-first-evidence",
+            phase,
+            "--out",
+            &evidence_arg,
+            "--project-path",
+            &repo_arg,
+        ])
     }
 
     #[test]
     fn local_dry_run_uses_remote_identity_for_bound_evidence() {
-        let (tmp, evidence) = bound_evidence_fixture();
-        let repo = tmp.path().join("repo");
+        let fixture = SubjectBoundEvidenceFixture::new(
+            "https://github.com/sympoies/nils-cli.git",
+            &[(".forge-cli.toml", "[test_first]\nrequire = true\n")],
+            bind_test_first_phase,
+        );
         let context = ProviderContext {
             provider: Provider::Local,
             host: "local".into(),
@@ -1322,9 +1265,9 @@ mod tests {
         };
         let mut deliver = args(true);
         deliver.head = Some("main".into());
-        deliver.test_first_evidence = Some(evidence.to_string_lossy().to_string());
+        deliver.test_first_evidence = Some(fixture.evidence.to_string_lossy().to_string());
 
-        let payload = build_dry_run_payload(&context, &deliver, &repo, &global, |_| {
+        let payload = build_dry_run_payload(&context, &deliver, &fixture.repo, &global, |_| {
             Some("https://github.com/sympoies/nils-cli.git".into())
         });
         let verdict = payload

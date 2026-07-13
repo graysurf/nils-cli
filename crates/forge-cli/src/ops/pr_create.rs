@@ -917,6 +917,7 @@ mod tests {
     use super::*;
     use crate::cli::{PrKindFlag, ProviderFlag};
     use crate::provider::{DetectionSource, Provider};
+    use nils_test_support::fixtures::{bind_complete_test_first_evidence, init_subject_repo};
     use pretty_assertions::assert_eq;
     use std::process::Command as GitCommand;
 
@@ -1301,51 +1302,22 @@ mod tests {
     }
 
     fn subject_repo(root: &Path, name: &str, remote: &str) -> PathBuf {
-        let repo = root.join(name);
-        std::fs::create_dir_all(&repo).unwrap();
-        git(&repo, &["init", "-q", "-b", "main"]);
-        git(&repo, &["config", "user.email", "test@example.com"]);
-        git(&repo, &["config", "user.name", "Tester"]);
-        git(&repo, &["config", "commit.gpgsign", "false"]);
-        std::fs::write(repo.join("README.md"), format!("{name}\n")).unwrap();
-        git(&repo, &["add", "README.md"]);
-        git(&repo, &["commit", "-q", "-m", "initial"]);
-        git(&repo, &["remote", "add", "origin", remote]);
-        repo
+        init_subject_repo(root, name, remote)
     }
 
     fn bind_evidence(repo: &Path, dir: &Path) {
-        write_evidence(
-            dir,
-            r#"{"schema_version":"test-first-evidence.record.v2","change_classification":"behavior-change","contract_delta":{"changed_behaviors":["durable gate"]},"no_existing_tests_reason":"fixture has no existing tests","waiver":{"reason":"fixture","kind":"non-testable","why_no_red":"fixture path","substitute_validation":["cargo test"]},"final_validations":[{"command":"cargo test","status":"pass","scope":"focused"}],"no_residual_gaps":true}"#,
-        );
-        let dir_arg = dir.to_string_lossy().to_string();
-        let repo_arg = repo.to_string_lossy().to_string();
-        assert_eq!(
+        bind_complete_test_first_evidence(repo, dir, |phase, repo, dir| {
+            let dir_arg = dir.to_string_lossy().to_string();
+            let repo_arg = repo.to_string_lossy().to_string();
             agent_workflow_primitives::test_first_evidence::run_with_args([
                 "test-first-evidence",
-                "bind-baseline",
+                phase,
                 "--out",
                 &dir_arg,
                 "--project-path",
                 &repo_arg,
-            ]),
-            0
-        );
-        std::fs::write(repo.join("delivery.txt"), "delivery\n").unwrap();
-        git(repo, &["add", "delivery.txt"]);
-        git(repo, &["commit", "-q", "-m", "delivery"]);
-        assert_eq!(
-            agent_workflow_primitives::test_first_evidence::run_with_args([
-                "test-first-evidence",
-                "bind-delivery",
-                "--out",
-                &dir_arg,
-                "--project-path",
-                &repo_arg,
-            ]),
-            0
-        );
+            ])
+        });
     }
 
     #[test]
