@@ -146,7 +146,8 @@ is no second state model.
   create, list, and glance responses. Its state is `starting`, `ready`, or
   `failed`; its bounded stage is `record`, `tmux`, `runtime`, `app_server`,
   `proxy`, `provider_client`, or `initial_connection`. Failed projections add
-  an RFC 3339 `occurred_at`, boolean `retry_safe`, one reviewed message, and one
+  an RFC 3339 `occurred_at` captured from the private failure marker, boolean
+  `retry_safe`, one reviewed message, and one
   allowlisted code: `runtime-helper-unavailable`, `agent-binary-unavailable`,
   `working-directory-unavailable`, `terminal-runtime-create-failed`,
   `app-server-start-failed`, `proxy-start-failed`, `provider-client-exited`,

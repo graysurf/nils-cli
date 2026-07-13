@@ -8858,11 +8858,20 @@ mod tests {
             "started_at": "2000-01-01T00:00:00Z"
         });
         std::fs::write(&record_path, serde_json::to_vec_pretty(&record).unwrap()).unwrap();
-        std::fs::write(
-            session_dir.join(".startup-failure"),
-            "runtime-helper-unavailable\n",
-        )
-        .unwrap();
+        let failure_path = session_dir.join(".startup-failure");
+        std::fs::write(&failure_path, "runtime-helper-unavailable\n").unwrap();
+        let failure_epoch: i64 = std::fs::metadata(&failure_path)
+            .unwrap()
+            .modified()
+            .unwrap()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            .try_into()
+            .unwrap();
+        let expected_occurred_at = jiff::Timestamp::from_second(failure_epoch)
+            .unwrap()
+            .to_string();
         let stopped_tmux = executable(
             &tmp.path().join("tmux-stopped"),
             "#!/usr/bin/env sh\n[ \"$1\" = has-session ] && exit 1\nexit 0\n",
@@ -8881,7 +8890,7 @@ mod tests {
             "Session runtime helper is unavailable after an upgrade."
         );
         assert_eq!(startup["retry_safe"], true);
-        assert!(startup["occurred_at"].is_string());
+        assert_eq!(startup["occurred_at"], expected_occurred_at);
 
         std::fs::remove_file(session_dir.join(".startup-failure")).unwrap();
         let persisted: Value =

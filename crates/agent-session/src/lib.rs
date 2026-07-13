@@ -16,7 +16,7 @@ use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, Stdio};
 use std::thread;
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use clap::Parser;
 use clap::error::ErrorKind;
@@ -680,7 +680,12 @@ fn ready_projection(started_at: &str) -> StartupProjection {
     }
 }
 
-fn failed_projection(started_at: &str, code: &str, observed_stage: &str) -> StartupProjection {
+fn failed_projection(
+    started_at: &str,
+    code: &str,
+    observed_stage: &str,
+    occurred_at: Option<&str>,
+) -> StartupProjection {
     let (effective_code, (stage, message, retry_safe)) =
         startup_failure_details(code, observed_stage)
             .map(|details| (code, details))
@@ -698,7 +703,11 @@ fn failed_projection(started_at: &str, code: &str, observed_stage: &str) -> Star
         started_at: started_at.to_string(),
         failure_code: Some(effective_code.to_string()),
         message: Some(message.to_string()),
-        occurred_at: Some(Zoned::now().timestamp().to_string()),
+        occurred_at: Some(
+            occurred_at
+                .map(ToOwned::to_owned)
+                .unwrap_or_else(|| Zoned::now().timestamp().to_string()),
+        ),
         retry_safe: Some(retry_safe),
     }
 }
@@ -720,10 +729,24 @@ fn startup_stage_marker(context: &CliContext, record: &SessionRecord) -> Option<
     startup_stage_is_allowed(&stage).then_some(stage)
 }
 
-fn startup_failure_marker(context: &CliContext, record: &SessionRecord) -> Option<String> {
-    let code =
-        read_bounded_startup_marker(&session_dir(context, &record.id).join(STARTUP_FAILURE_FILE))?;
-    startup_failure_details(&code, "runtime").map(|_| code)
+fn startup_failure_marker(
+    context: &CliContext,
+    record: &SessionRecord,
+) -> Option<(String, String)> {
+    let path = session_dir(context, &record.id).join(STARTUP_FAILURE_FILE);
+    let code = read_bounded_startup_marker(&path)?;
+    startup_failure_details(&code, "runtime")?;
+    let seconds = fs::metadata(path)
+        .ok()?
+        .modified()
+        .ok()?
+        .duration_since(UNIX_EPOCH)
+        .ok()?
+        .as_secs()
+        .try_into()
+        .ok()?;
+    let occurred_at = Timestamp::from_second(seconds).ok()?.to_string();
+    Some((code, occurred_at))
 }
 
 fn stopped_startup_failure_code(stage: &str) -> &'static str {
@@ -747,11 +770,12 @@ fn desired_startup_projection(
     }
     let observed_stage =
         startup_stage_marker(context, record).unwrap_or_else(|| current.stage.clone());
-    if let Some(code) = startup_failure_marker(context, record) {
+    if let Some((code, occurred_at)) = startup_failure_marker(context, record) {
         return Some(failed_projection(
             &current.started_at,
             &code,
             &observed_stage,
+            Some(&occurred_at),
         ));
     }
     if status == "stopped" {
@@ -763,6 +787,7 @@ fn desired_startup_projection(
             &current.started_at,
             code,
             &observed_stage,
+            None,
         ));
     }
     if status == "running" {
@@ -1132,7 +1157,7 @@ fn start_session(context: &CliContext, args: cli::StartArgs) -> Result<StartView
         } else {
             "terminal-runtime-create-failed"
         };
-        let failed = failed_projection(&started_at, code, "tmux");
+        let failed = failed_projection(&started_at, code, "tmux", None);
         store_startup_projection(&mut created.record, &failed);
         created.record.updated_at = Zoned::now().timestamp().to_string();
         if let Err(write_err) = write_session_record(context, &created.record) {
