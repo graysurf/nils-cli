@@ -14,6 +14,13 @@ struct CacheEnvelope {
     index: DefIndex,
 }
 
+#[derive(Debug, Serialize)]
+struct CacheEnvelopeRef<'a> {
+    version: u8,
+    source_roots: &'a [String],
+    index: &'a DefIndex,
+}
+
 pub fn load_or_build() -> Result<DefIndex> {
     if !util::env_is_true("FZF_DEF_DOC_CACHE_ENABLED") {
         return super::index::build_index();
@@ -57,10 +64,10 @@ fn write_cache(
     now: i64,
 ) -> Result<()> {
     let _ = fs::create_dir_all(cache_dir);
-    let data = serde_json::to_string(&CacheEnvelope {
+    let data = serde_json::to_string(&CacheEnvelopeRef {
         version: CACHE_FORMAT_VERSION,
-        source_roots: source_roots.to_vec(),
-        index: index.clone(),
+        source_roots,
+        index,
     })
     .context("serialize def index")?;
     let _ = fs::write(data_file, data);
@@ -219,6 +226,62 @@ mod tests {
             let index = load_or_build().expect("rebuild from changed roots");
             assert!(index.aliases.iter().any(|alias| alias.name == "extra-b"));
             assert!(!index.aliases.iter().any(|alias| alias.name == "extra-a"));
+        }
+    }
+
+    #[test]
+    fn cache_rebuilds_when_logical_root_path_changes() {
+        let lock = GlobalStateLock::new();
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().join("zsh");
+        let extra = temp.path().join("extra");
+        let extra_link = temp.path().join("extra-link");
+        let cache_dir = temp.path().join("cache");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&cache_dir).unwrap();
+        write(&root.join(".zshrc"), "alias base='echo base'\n");
+        write(&extra.join("private.zsh"), "alias private='echo private'\n");
+        std::os::unix::fs::symlink(&extra, &extra_link).expect("symlink");
+
+        let _guard_cache = EnvGuard::set(&lock, "FZF_DEF_DOC_CACHE_ENABLED", "1");
+        let _guard_ttl = EnvGuard::set(&lock, "FZF_DEF_DOC_CACHE_EXPIRE_MINUTES", "10");
+        let _guard_cache_dir =
+            EnvGuard::set(&lock, "ZSH_CACHE_DIR", cache_dir.to_string_lossy().as_ref());
+        let _guard_zdot = EnvGuard::set(&lock, "ZDOTDIR", root.to_string_lossy().as_ref());
+
+        {
+            let _guard_extra = EnvGuard::set(
+                &lock,
+                "FZF_DEF_EXTRA_ROOTS",
+                extra_link.to_string_lossy().as_ref(),
+            );
+            let index = load_or_build().expect("build through logical root");
+            let source = &index
+                .aliases
+                .iter()
+                .find(|alias| alias.name == "private")
+                .expect("private alias")
+                .source_file;
+            assert!(source.starts_with(extra_link.to_string_lossy().as_ref()));
+        }
+
+        std::fs::remove_file(&extra_link).expect("remove symlink");
+
+        {
+            let _guard_extra = EnvGuard::set(
+                &lock,
+                "FZF_DEF_EXTRA_ROOTS",
+                extra.to_string_lossy().as_ref(),
+            );
+            let index = load_or_build().expect("rebuild through physical root");
+            let source = &index
+                .aliases
+                .iter()
+                .find(|alias| alias.name == "private")
+                .expect("private alias")
+                .source_file;
+            assert!(source.starts_with(extra.to_string_lossy().as_ref()));
+            assert!(std::path::Path::new(source).exists());
         }
     }
 }

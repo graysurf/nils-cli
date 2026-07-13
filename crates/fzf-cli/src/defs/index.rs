@@ -63,7 +63,7 @@ pub fn build_index() -> Result<DefIndex> {
     Ok(index)
 }
 
-fn list_first_party_files(root: &Path, spinner: &Progress) -> Result<Vec<PathBuf>> {
+fn first_party_file_map(root: &Path, spinner: &Progress) -> Result<BTreeMap<PathBuf, PathBuf>> {
     let mut files = BTreeMap::new();
 
     let zshrc = root.join(".zshrc");
@@ -80,41 +80,74 @@ fn list_first_party_files(root: &Path, spinner: &Progress) -> Result<Vec<PathBuf
         if !d.is_dir() {
             continue;
         }
-        scan_zsh_dir(&d, spinner, true, &mut files);
+        scan_zsh_dir(&d, spinner, true, &[], &mut files);
     }
+
+    Ok(files)
+}
+
+#[cfg(test)]
+fn list_first_party_files(root: &Path, spinner: &Progress) -> Result<Vec<PathBuf>> {
+    Ok(first_party_file_map(root, spinner)?.into_values().collect())
+}
+
+fn list_definition_files(root: &Path, spinner: &Progress) -> Result<Vec<PathBuf>> {
+    let mut files = first_party_file_map(root, spinner)?;
+    add_extra_roots(extra_roots(), spinner, &mut files);
 
     Ok(files.into_values().collect())
 }
 
-fn list_definition_files(root: &Path, spinner: &Progress) -> Result<Vec<PathBuf>> {
-    let mut files = BTreeMap::new();
-    for path in list_first_party_files(root, spinner)? {
-        insert_canonical(&mut files, path);
-    }
-
-    for extra_root in extra_roots() {
+fn add_extra_roots(
+    roots: Vec<PathBuf>,
+    spinner: &Progress,
+    files: &mut BTreeMap<PathBuf, PathBuf>,
+) -> usize {
+    let mut scanned_dirs = Vec::new();
+    let mut visited_files = 0;
+    for extra_root in roots {
         if extra_root.is_file() {
             if is_zsh_file(&extra_root) {
-                insert_canonical(&mut files, extra_root);
+                let canonical = canonical_or_original(extra_root.clone());
+                if !is_below_git_dir(&canonical) {
+                    files.entry(canonical).or_insert(extra_root);
+                }
             }
             continue;
         }
         if extra_root.is_dir() {
-            scan_zsh_dir(&extra_root, spinner, false, &mut files);
+            let canonical_root = canonical_or_original(extra_root.clone());
+            if scanned_dirs
+                .iter()
+                .any(|scanned: &PathBuf| canonical_root.starts_with(scanned))
+            {
+                continue;
+            }
+            let excluded_dirs = scanned_dirs
+                .iter()
+                .filter(|scanned| scanned.starts_with(&canonical_root))
+                .cloned()
+                .collect::<Vec<_>>();
+            visited_files += scan_zsh_dir(&extra_root, spinner, false, &excluded_dirs, files);
+            scanned_dirs.push(canonical_root);
         }
     }
-
-    Ok(files.into_values().collect())
+    visited_files
 }
 
 pub(crate) fn source_roots_identity() -> Result<Vec<String>> {
-    let mut roots = vec![canonical_or_original(util::zsh_root()?)]
+    let roots = vec![util::zsh_root()?]
         .into_iter()
-        .chain(extra_roots().into_iter().map(canonical_or_original))
-        .map(|path| path.to_string_lossy().to_string())
-        .collect::<Vec<_>>();
-    roots.sort();
-    roots.dedup();
+        .chain(extra_roots())
+        .map(|logical| {
+            let canonical = canonical_or_original(logical.clone());
+            format!(
+                "{}\u{1f}{}",
+                logical.to_string_lossy(),
+                canonical.to_string_lossy()
+            )
+        })
+        .collect();
     Ok(roots)
 }
 
@@ -132,13 +165,30 @@ fn scan_zsh_dir(
     dir: &Path,
     spinner: &Progress,
     skip_plugins: bool,
+    excluded_dirs: &[PathBuf],
     files: &mut BTreeMap<PathBuf, PathBuf>,
-) {
+) -> usize {
     let mut scanned: usize = 0;
+    let mut visited_files: usize = 0;
     let entries = WalkDir::new(dir)
         .follow_links(true)
         .into_iter()
-        .filter_entry(|entry| entry.file_name() != ".git");
+        .filter_entry(|entry| {
+            if entry.file_name() == ".git" {
+                return false;
+            }
+            if entry.path_is_symlink() && entry.path().is_dir() {
+                let canonical = canonical_or_original(entry.path().to_path_buf());
+                if is_below_git_dir(&canonical) {
+                    return false;
+                }
+            }
+            if excluded_dirs.is_empty() || entry.depth() == 0 || !entry.path().is_dir() {
+                return true;
+            }
+            let canonical = canonical_or_original(entry.path().to_path_buf());
+            !excluded_dirs.contains(&canonical)
+        });
     for entry in entries {
         scanned = scanned.saturating_add(1);
         if scanned.is_multiple_of(64) {
@@ -151,20 +201,31 @@ fn scan_zsh_dir(
         if !entry.file_type().is_file() || !is_zsh_file(entry.path()) {
             continue;
         }
+        let path = entry.into_path();
+        let canonical = canonical_or_original(path.clone());
+        if is_below_git_dir(&canonical) {
+            continue;
+        }
+        visited_files = visited_files.saturating_add(1);
         if skip_plugins
-            && entry
-                .path()
+            && path
                 .components()
                 .any(|component| component.as_os_str() == "plugins")
         {
             continue;
         }
-        insert_canonical(files, entry.into_path());
+        files.entry(canonical).or_insert(path);
     }
+    visited_files
 }
 
 fn is_zsh_file(path: &Path) -> bool {
     path.extension().and_then(|extension| extension.to_str()) == Some("zsh")
+}
+
+fn is_below_git_dir(path: &Path) -> bool {
+    path.components()
+        .any(|component| component.as_os_str() == ".git")
 }
 
 fn insert_canonical(files: &mut BTreeMap<PathBuf, PathBuf>, path: PathBuf) {
@@ -393,6 +454,7 @@ world() {
         let zsh_root = tmp.path().join("zsh");
         let private_root = tmp.path().join("private");
         let private_link = tmp.path().join("private-link");
+        let visible_hook = tmp.path().join("visible-hook.zsh");
         let standalone = tmp.path().join("standalone.zsh");
 
         write(&zsh_root.join(".zshrc"), "alias base='echo base'\n");
@@ -404,11 +466,16 @@ world() {
             &private_root.join(".git/hooks/skip.zsh"),
             "should-not-index() { echo no }\n",
         );
+        std::os::unix::fs::symlink(private_root.join(".git"), private_root.join("visible-git"))
+            .expect("git alias symlink");
+        std::os::unix::fs::symlink(private_root.join(".git/hooks/skip.zsh"), &visible_hook)
+            .expect("git file alias symlink");
         write(&standalone, "alias private-standalone='echo standalone'\n");
         std::os::unix::fs::symlink(&private_root, &private_link).expect("symlink");
 
         let extra_roots =
-            std::env::join_paths([&private_root, &private_link, &standalone]).expect("join paths");
+            std::env::join_paths([&private_root, &private_link, &standalone, &visible_hook])
+                .expect("join paths");
         let _guard_zdot = EnvGuard::set(&lock, "ZDOTDIR", zsh_root.to_string_lossy().as_ref());
         let _guard_cache = EnvGuard::set(&lock, "FZF_DEF_DOC_CACHE_ENABLED", "0");
         let _guard_extra = EnvGuard::set(
@@ -438,5 +505,31 @@ world() {
                 .iter()
                 .any(|function| function.name == "should-not-index")
         );
+    }
+
+    #[test]
+    fn extra_root_scan_skips_duplicate_and_overlapping_physical_trees() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("private");
+        let child = root.join("child");
+        let root_link = tmp.path().join("private-link");
+        write(&child.join("child.zsh"), "child-fn() { echo child }\n");
+        write(&root.join("sibling.zsh"), "sibling-fn() { echo sibling }\n");
+        std::os::unix::fs::symlink(&root, &root_link).expect("symlink");
+
+        let spinner = Progress::spinner(
+            ProgressOptions::default().with_enabled(nils_term::progress::ProgressEnabled::Off),
+        );
+        let mut files = BTreeMap::new();
+        let visited = add_extra_roots(
+            vec![child.clone(), root.clone(), root_link],
+            &spinner,
+            &mut files,
+        );
+
+        assert_eq!(visited, 2);
+        assert_eq!(files.len(), 2);
+        assert!(files.values().any(|path| path.starts_with(&child)));
+        assert!(files.values().any(|path| path == &root.join("sibling.zsh")));
     }
 }
