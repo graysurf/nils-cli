@@ -143,11 +143,8 @@ pub fn resolve_resume_source_in(
     session_id: &str,
 ) -> Result<ResolvedResume, ResumeResolveError> {
     if provider == ResumeProvider::Codex {
-        return resolve_codex_resume_source_in_with_budget(
-            root,
-            session_id,
-            CodexResumeScanBudget::from_env(),
-        );
+        let mut budget = CodexResumeScanBudget::from_env();
+        return resolve_codex_resume_source_in_with_budget(root, session_id, &mut budget);
     }
 
     let mut matches = BTreeSet::new();
@@ -162,11 +159,11 @@ pub fn resolve_resume_source_in(
 fn resolve_codex_resume_source_in_with_budget(
     root: &Path,
     session_id: &str,
-    mut budget: CodexResumeScanBudget,
+    budget: &mut CodexResumeScanBudget,
 ) -> Result<ResolvedResume, ResumeResolveError> {
     let mut matches = BTreeSet::new();
     if let Some(day) = codex_uuid_v7_session_day(root, session_id) {
-        collect_codex_canonical_day_matches(&day, session_id, &mut matches, &mut budget);
+        collect_codex_canonical_day_matches(&day, session_id, &mut matches, budget);
         if budget.truncated {
             return Err(ResumeResolveError::Truncated);
         }
@@ -175,7 +172,7 @@ fn resolve_codex_resume_source_in_with_budget(
         }
     }
 
-    collect_codex_provider_resume_matches(root, 0, session_id, &mut matches, &mut budget);
+    collect_codex_provider_resume_matches(root, 0, session_id, &mut matches, budget);
     if budget.truncated {
         return Err(ResumeResolveError::Truncated);
     }
@@ -776,7 +773,7 @@ mod tests {
         )
         .unwrap();
 
-        let one_entry_budget = CodexResumeScanBudget {
+        let mut one_entry_budget = CodexResumeScanBudget {
             visited: 0,
             max_entries: 1,
             deadline: Instant::now() + Duration::from_secs(60),
@@ -785,7 +782,7 @@ mod tests {
         let resolved = resolve_codex_resume_source_in_with_budget(
             &tmp.path().join("sessions"),
             session_id,
-            one_entry_budget,
+            &mut one_entry_budget,
         )
         .unwrap();
 
@@ -868,7 +865,7 @@ mod tests {
         )
         .unwrap();
 
-        let one_entry_budget = CodexResumeScanBudget {
+        let mut one_entry_budget = CodexResumeScanBudget {
             visited: 0,
             max_entries: 1,
             deadline: Instant::now() + Duration::from_secs(60),
@@ -878,10 +875,12 @@ mod tests {
             resolve_codex_resume_source_in_with_budget(
                 &tmp.path().join("sessions"),
                 session_id,
-                one_entry_budget,
+                &mut one_entry_budget,
             ),
             Err(ResumeResolveError::Truncated)
         );
+        assert_eq!(one_entry_budget.visited, 1);
+        assert!(one_entry_budget.truncated);
     }
 
     #[test]
