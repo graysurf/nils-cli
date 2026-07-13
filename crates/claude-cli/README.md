@@ -59,6 +59,12 @@ The cache remains compatible with the former shell script:
 ~/Library/Caches/claude-prompt-segment/usage.json
 ```
 
+Cached quota values are display-eligible only while the cache mtime is less
+than 600 seconds old. A cache mtime up to 5 seconds in the future is tolerated
+for clock skew; a timestamp further ahead fails closed. Expired cache files are
+retained for refresh/retry diagnostics but contribute no percentages or usage
+windows to prompt or `usage` output.
+
 ### usage
 
 - `usage [--format text|json] [--source auto|oauth|cli|cache]`: Read Claude

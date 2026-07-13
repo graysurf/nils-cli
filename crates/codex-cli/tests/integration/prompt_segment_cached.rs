@@ -466,6 +466,111 @@ fn prompt_segment_stale_cache_appends_suffix() {
 }
 
 #[test]
+fn prompt_segment_does_not_render_cache_at_max_stale_age() {
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let (auth_file, secrets, cache_root) = write_auth_and_secret(&dir);
+
+    let fetched_at = now_epoch().saturating_sub(600).max(1);
+    let cache_file = write_prompt_segment_cache_kv(
+        &cache_root,
+        "alpha",
+        &format!(
+            "fetched_at={fetched_at}\nnon_weekly_label=5h\nnon_weekly_remaining=1\nweekly_remaining=2\nweekly_reset_epoch=1700600000\n"
+        ),
+    );
+
+    let output = run(
+        &["prompt-segment", "--ttl", "1h"],
+        &[
+            ("CODEX_AUTH_FILE", &auth_file),
+            ("CODEX_SECRET_DIR", &secrets),
+            ("ZSH_CACHE_DIR", &cache_root),
+        ],
+        &[
+            ("CODEX_PROMPT_SEGMENT_ENABLED", "true"),
+            ("CODEX_CHATGPT_BASE_URL", "http://127.0.0.1:9"),
+            ("CODEX_PROMPT_SEGMENT_CURL_CONNECT_TIMEOUT_SECONDS", "1"),
+            ("CODEX_PROMPT_SEGMENT_CURL_MAX_TIME_SECONDS", "1"),
+        ],
+    );
+
+    assert_exit(&output, 0);
+    assert!(stdout(&output).trim().is_empty());
+    assert!(
+        cache_file.is_file(),
+        "max-stale handling must not delete cache"
+    );
+}
+
+#[test]
+fn prompt_segment_status_reports_expired_cache_without_rendering() {
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let (auth_file, secrets, cache_root) = write_auth_and_secret(&dir);
+
+    let fetched_at = now_epoch().saturating_sub(600).max(1);
+    let cache_file = write_prompt_segment_cache_kv(
+        &cache_root,
+        "alpha",
+        &format!(
+            "fetched_at={fetched_at}\nnon_weekly_label=5h\nnon_weekly_remaining=1\nweekly_remaining=2\nweekly_reset_epoch=1700600000\n"
+        ),
+    );
+
+    let output = run(
+        &["prompt-segment", "status", "--format", "json"],
+        &[
+            ("CODEX_AUTH_FILE", &auth_file),
+            ("CODEX_SECRET_DIR", &secrets),
+            ("ZSH_CACHE_DIR", &cache_root),
+        ],
+        &[("CODEX_PROMPT_SEGMENT_ENABLED", "true")],
+    );
+
+    assert_exit(&output, 0);
+    let payload: Value = serde_json::from_str(&stdout(&output)).expect("json");
+    assert_eq!(payload["result"]["cache_exists"], true);
+    assert_eq!(payload["result"]["cache_stale"], true);
+    assert_eq!(payload["result"]["would_render"], false);
+    assert_eq!(payload["result"]["reason"], "cache-expired");
+    assert!(cache_file.is_file(), "status must not delete expired cache");
+}
+
+#[test]
+fn prompt_segment_status_reports_bounded_stale_cache() {
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let (auth_file, secrets, cache_root) = write_auth_and_secret(&dir);
+
+    let fetched_at = now_epoch().saturating_sub(10).max(1);
+    write_prompt_segment_cache_kv(
+        &cache_root,
+        "alpha",
+        &format!(
+            "fetched_at={fetched_at}\nnon_weekly_label=5h\nnon_weekly_remaining=1\nweekly_remaining=2\nweekly_reset_epoch=1700600000\n"
+        ),
+    );
+
+    let output = run(
+        &["prompt-segment", "status", "--format", "json"],
+        &[
+            ("CODEX_AUTH_FILE", &auth_file),
+            ("CODEX_SECRET_DIR", &secrets),
+            ("ZSH_CACHE_DIR", &cache_root),
+        ],
+        &[
+            ("CODEX_PROMPT_SEGMENT_ENABLED", "true"),
+            ("CODEX_PROMPT_SEGMENT_TTL", "1s"),
+        ],
+    );
+
+    assert_exit(&output, 0);
+    let payload: Value = serde_json::from_str(&stdout(&output)).expect("json");
+    assert_eq!(payload["result"]["cache_exists"], true);
+    assert_eq!(payload["result"]["cache_stale"], true);
+    assert_eq!(payload["result"]["would_render"], true);
+    assert_eq!(payload["result"]["reason"], "cache-stale");
+}
+
+#[test]
 fn prompt_segment_name_source_email_uses_email_not_secret_name() {
     let dir = tempfile::TempDir::new().expect("tempdir");
     let (auth_file, secrets, cache_root) = write_auth_and_secret(&dir);

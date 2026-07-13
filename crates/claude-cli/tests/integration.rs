@@ -7,6 +7,8 @@ use std::fs::OpenOptions;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Barrier};
+use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 fn claude_cli_bin() -> PathBuf {
@@ -404,18 +406,17 @@ fn usage_auto_ignores_older_error_after_newer_success_in_another_transcript() {
 }
 
 #[test]
-fn usage_cache_source_outputs_epoch_for_human_reset_times() {
+fn usage_cache_source_outputs_epoch_for_rfc3339_reset_times() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let cache_file = write_cache(
         tmp.path(),
-        &usage_json_with_resets(
-            21.0,
-            10.0,
-            "3:20pm(Asia/Taipei)",
-            "Jul 12, 9pm (Asia/Taipei)",
-        ),
+        &usage_json_with_resets(21.0, 10.0, "2026-07-14T07:20:00Z", "2026-07-18T13:00:00Z"),
     );
-    set_modified(&cache_file, UNIX_EPOCH + Duration::from_secs(1_783_666_800));
+    let updated_at = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time")
+        .as_secs();
+    set_modified(&cache_file, UNIX_EPOCH + Duration::from_secs(updated_at));
 
     let output = run(
         &["usage", "--format", "json", "--source", "cache"],
@@ -427,22 +428,22 @@ fn usage_cache_source_outputs_epoch_for_human_reset_times() {
     assert_eq!(payload["schema_version"], "claude-cli.usage.v1");
     assert_eq!(payload["command"], "usage");
     assert_eq!(payload["ok"], true);
-    assert_eq!(payload["result"]["updated_at"], 1_783_666_800);
+    assert_eq!(payload["result"]["updated_at"], updated_at);
     assert_eq!(
         payload["result"]["windows"][0]["resets_at"],
-        "3:20pm(Asia/Taipei)"
+        "2026-07-14T07:20:00Z"
     );
     assert_eq!(
         payload["result"]["windows"][0]["resets_at_epoch"],
-        1_783_668_000
+        1_784_013_600
     );
     assert_eq!(
         payload["result"]["windows"][1]["resets_at"],
-        "Jul 12, 9pm (Asia/Taipei)"
+        "2026-07-18T13:00:00Z"
     );
     assert_eq!(
         payload["result"]["windows"][1]["resets_at_epoch"],
-        1_783_861_200
+        1_784_379_600
     );
 }
 
@@ -565,6 +566,199 @@ fn prompt_segment_stale_cache_fallback_suppresses_fetch_errors() {
     assert_exit(&output, 0);
     assert_eq!(stdout(&output), "5h:75% W:50% 2026-01-03 (stale)\n");
     assert_eq!(stderr(&output), "");
+}
+
+#[test]
+fn prompt_segment_does_not_render_cache_older_than_max_stale_age() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let cache_file = write_cache(tmp.path(), &usage_json(25.0, 50.0));
+    set_modified(&cache_file, SystemTime::now() - Duration::from_secs(601));
+
+    let output = run(
+        &["prompt-segment", "--ttl", "1h", "--time-format", "%Y-%m-%d"],
+        &base_options(tmp.path()).with_env("NO_COLOR", "1"),
+    );
+
+    assert_exit(&output, 0);
+    assert_eq!(stdout(&output), "");
+    assert!(
+        cache_file.is_file(),
+        "max-stale handling must not delete cache"
+    );
+}
+
+#[test]
+fn prompt_segment_expired_cache_failed_refresh_observes_cooldown() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let cache_file = write_cache(tmp.path(), &usage_json(25.0, 50.0));
+    set_modified(&cache_file, SystemTime::now() - Duration::from_secs(601));
+
+    let server = LoopbackServer::new().expect("server");
+    server.add_route("GET", "/usage", HttpResponse::new(500, "upstream exploded"));
+    let options = base_options(tmp.path())
+        .with_env(
+            "CLAUDE_PROMPT_SEGMENT_ACCESS_TOKEN",
+            "secret-token-cooldown",
+        )
+        .with_env(
+            "CLAUDE_PROMPT_SEGMENT_ENDPOINT",
+            &format!("{}/usage", server.url()),
+        );
+
+    for _ in 0..2 {
+        let output = run(&["prompt-segment", "--ttl", "1h"], &options);
+        assert_exit(&output, 0);
+        assert_eq!(stdout(&output), "");
+        assert_eq!(stderr(&output), "");
+    }
+
+    assert_eq!(server.take_requests().len(), 1);
+}
+
+#[test]
+fn prompt_segment_expired_cache_concurrent_refreshes_are_coalesced() {
+    const WORKERS: usize = 6;
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let cache_file = write_cache(tmp.path(), &usage_json(25.0, 50.0));
+    set_modified(&cache_file, SystemTime::now() - Duration::from_secs(601));
+
+    let server = LoopbackServer::new().expect("server");
+    server.add_route("GET", "/usage", HttpResponse::new(500, "upstream exploded"));
+    let options = base_options(tmp.path())
+        .with_env(
+            "CLAUDE_PROMPT_SEGMENT_ACCESS_TOKEN",
+            "secret-token-coalesced",
+        )
+        .with_env(
+            "CLAUDE_PROMPT_SEGMENT_ENDPOINT",
+            &format!("{}/usage", server.url()),
+        );
+    let barrier = Arc::new(Barrier::new(WORKERS));
+
+    let handles = (0..WORKERS)
+        .map(|_| {
+            let options = options.clone();
+            let barrier = Arc::clone(&barrier);
+            thread::spawn(move || {
+                barrier.wait();
+                run(&["prompt-segment", "--ttl", "1h"], &options)
+            })
+        })
+        .collect::<Vec<_>>();
+
+    for handle in handles {
+        let output = handle.join().expect("prompt worker");
+        assert_exit(&output, 0);
+        assert_eq!(stdout(&output), "");
+        assert_eq!(stderr(&output), "");
+    }
+
+    assert_eq!(server.take_requests().len(), 1);
+}
+
+#[test]
+fn prompt_segment_explicit_refresh_bypasses_expired_cache_cooldown() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let cache_file = write_cache(tmp.path(), &usage_json(25.0, 50.0));
+    set_modified(&cache_file, SystemTime::now() - Duration::from_secs(601));
+
+    let server = LoopbackServer::new().expect("server");
+    server.add_route("GET", "/usage", HttpResponse::new(500, "upstream exploded"));
+    let options = base_options(tmp.path())
+        .with_env(
+            "CLAUDE_PROMPT_SEGMENT_ACCESS_TOKEN",
+            "secret-token-explicit",
+        )
+        .with_env(
+            "CLAUDE_PROMPT_SEGMENT_ENDPOINT",
+            &format!("{}/usage", server.url()),
+        );
+
+    for _ in 0..2 {
+        let output = run(&["prompt-segment", "--refresh"], &options);
+        assert_exit(&output, 0);
+        assert_eq!(stdout(&output), "");
+        assert_eq!(stderr(&output), "");
+    }
+
+    assert_eq!(server.take_requests().len(), 2);
+}
+
+#[test]
+fn prompt_segment_status_reports_expired_cache_without_rendering() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let cache_file = write_cache(tmp.path(), &usage_json(25.0, 50.0));
+    set_modified(&cache_file, SystemTime::now() - Duration::from_secs(601));
+
+    let output = run(
+        &["prompt-segment", "status", "--format", "json"],
+        &base_options(tmp.path())
+            .with_env("CLAUDE_PROMPT_SEGMENT_ACCESS_TOKEN", "secret-token-status"),
+    );
+
+    assert_exit(&output, 0);
+    let payload: Value = serde_json::from_str(&stdout(&output)).expect("json");
+    assert_eq!(payload["result"]["cache_exists"], true);
+    assert_eq!(payload["result"]["cache_stale"], true);
+    assert_eq!(payload["result"]["would_render"], false);
+    assert_eq!(payload["result"]["reason"], "cache-expired");
+    assert!(cache_file.is_file(), "status must not delete expired cache");
+}
+
+#[test]
+fn usage_cache_source_omits_windows_older_than_max_stale_age() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let cache_file = write_cache(tmp.path(), &usage_json(25.0, 50.0));
+    set_modified(&cache_file, SystemTime::now() - Duration::from_secs(601));
+
+    let output = run(
+        &["usage", "--format", "json", "--source", "cache"],
+        &base_options(tmp.path()),
+    );
+
+    assert_exit(&output, 0);
+    let payload: Value = serde_json::from_str(&stdout(&output)).expect("json");
+    assert_eq!(payload["result"]["windows"], serde_json::json!([]));
+    assert!(
+        cache_file.is_file(),
+        "max-stale handling must not delete cache"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn usage_auto_keeps_live_rate_limit_reason_when_expired_cache_is_omitted() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let cache_file = write_cache(tmp.path(), &usage_json(25.0, 50.0));
+    set_modified(&cache_file, SystemTime::now() - Duration::from_secs(601));
+    let bin_dir = write_fake_claude(
+        tmp.path(),
+        "#!/usr/bin/env sh\ncat >/dev/null\nprintf '%s\\n' 'usage unavailable'\n",
+    );
+    let server = LoopbackServer::new().expect("server");
+    server.add_route("GET", "/usage", HttpResponse::new(429, "rate limited"));
+
+    let output = run(
+        &["usage", "--format", "json", "--source", "auto"],
+        &base_options(tmp.path())
+            .with_path_prepend(&bin_dir)
+            .with_env("CLAUDE_PROMPT_SEGMENT_ACCESS_TOKEN", "secret-token")
+            .with_env(
+                "CLAUDE_PROMPT_SEGMENT_ENDPOINT",
+                &format!("{}/usage", server.url()),
+            )
+            .with_env("CLAUDE_PROMPT_SEGMENT_CLAUDE_PTY_DISABLED", "1"),
+    );
+
+    assert_exit(&output, 0);
+    let payload: Value = serde_json::from_str(&stdout(&output)).expect("json");
+    assert_eq!(payload["result"]["windows"], serde_json::json!([]));
+    assert_eq!(payload["result"]["reason_code"], "rate_limited");
+    assert!(
+        cache_file.is_file(),
+        "max-stale handling must not delete cache"
+    );
 }
 
 #[test]

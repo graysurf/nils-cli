@@ -313,6 +313,73 @@ fn prompt_segment_stale_cache_triggers_background_refresh() {
     );
 }
 
+#[test]
+fn prompt_segment_expired_cache_refreshes_in_background_before_next_render() {
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let (auth_file, secrets, cache_root) = write_auth_and_secret(&dir);
+
+    let server = LoopbackServer::new().expect("server");
+    server.add_route(
+        "GET",
+        "/wham/usage",
+        HttpResponse::new(200, wham_usage_ok_body()),
+    );
+
+    let fetched_at = now_epoch().saturating_sub(600).max(1);
+    let kv_path = write_prompt_segment_cache_kv(
+        &cache_root,
+        "alpha",
+        &format!(
+            "fetched_at={fetched_at}\nnon_weekly_label=5h\nnon_weekly_remaining=1\nweekly_remaining=2\nweekly_reset_epoch=1700600000\n"
+        ),
+    );
+    let envs = [
+        ("CODEX_AUTH_FILE", auth_file.as_path()),
+        ("CODEX_SECRET_DIR", secrets.as_path()),
+        ("ZSH_CACHE_DIR", cache_root.as_path()),
+    ];
+    let server_url = server.url();
+    let vars = [
+        ("CODEX_PROMPT_SEGMENT_ENABLED", "true"),
+        ("CODEX_CHATGPT_BASE_URL", server_url.as_str()),
+        ("CODEX_PROMPT_SEGMENT_REFRESH_MIN_SECONDS", "0"),
+        ("CODEX_PROMPT_SEGMENT_CURL_CONNECT_TIMEOUT_SECONDS", "1"),
+        ("CODEX_PROMPT_SEGMENT_CURL_MAX_TIME_SECONDS", "3"),
+    ];
+
+    let first = run(
+        &[
+            "prompt-segment",
+            "--ttl",
+            "1h",
+            "--time-format",
+            "%Y-%m-%dT%H:%MZ",
+        ],
+        &envs,
+        &vars,
+    );
+    assert_exit(&first, 0);
+    assert!(stdout(&first).trim().is_empty());
+    assert!(
+        wait_for_file_contains(&kv_path, "weekly_remaining=88", Duration::from_secs(3)),
+        "expected background refresh to replace expired cache"
+    );
+
+    let second = run(
+        &[
+            "prompt-segment",
+            "--ttl",
+            "1h",
+            "--time-format",
+            "%Y-%m-%dT%H:%MZ",
+        ],
+        &envs,
+        &vars,
+    );
+    assert_exit(&second, 0);
+    assert_eq!(stdout(&second), "alpha 5h:94% W:88% 2023-11-21T20:53Z\n");
+}
+
 #[cfg(unix)]
 #[test]
 fn prompt_segment_background_refresh_survives_prompt_shell_hup() {

@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use nils_common::fs as shared_fs;
+use nils_common::usage_cache_policy;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -138,6 +139,7 @@ pub fn read_cache_entry(target_file: &Path) -> Result<CacheEntry> {
 
 pub fn read_cache_entry_for_cached_mode(target_file: &Path) -> Result<CacheEntry> {
     let entry = read_cache_entry(target_file)?;
+    ensure_cache_within_display_age(target_file, &entry)?;
     if cache_allow_stale() {
         return Ok(entry);
     }
@@ -151,17 +153,29 @@ pub struct StaleCacheRead {
     pub stale: bool,
 }
 
-/// Reads the cached entry without rejecting stale data, reporting whether it is
-/// past the freshness TTL.
+/// Reads a cached entry within the fixed display ceiling, reporting whether it
+/// is past the freshness TTL.
 ///
 /// Unlike [`read_cache_entry_for_cached_mode`] (which enforces the TTL for the
-/// explicit `--cached` mode), this serves the last-known values regardless of
-/// age so the diag command can degrade gracefully when a live fetch yields no
-/// usable window. Callers surface the `stale` flag to the user.
+/// explicit `--cached` mode), this permits stale values only until the fixed
+/// maximum display age so the diag command can degrade briefly without showing
+/// indefinitely old quotas. Callers surface the `stale` flag to the user.
 pub fn read_cache_entry_allow_stale(target_file: &Path) -> Result<StaleCacheRead> {
     let entry = read_cache_entry(target_file)?;
+    ensure_cache_within_display_age(target_file, &entry)?;
     let stale = cache_entry_is_stale(&entry);
     Ok(StaleCacheRead { entry, stale })
+}
+
+pub fn cache_fetched_at_within_display_age(fetched_at_epoch: Option<i64>) -> bool {
+    cache_fetched_at_within_display_age_at(fetched_at_epoch, chrono::Utc::now().timestamp())
+}
+
+fn cache_fetched_at_within_display_age_at(fetched_at_epoch: Option<i64>, now_epoch: i64) -> bool {
+    let age_seconds = fetched_at_epoch
+        .filter(|value| *value > 0 && now_epoch > 0)
+        .map(|value| now_epoch.saturating_sub(value));
+    usage_cache_policy::classify_display_age_seconds(age_seconds).is_display_eligible()
 }
 
 fn cache_entry_is_stale(entry: &CacheEntry) -> bool {
@@ -253,6 +267,18 @@ fn ensure_cache_fresh(target_file: &Path, entry: &CacheEntry) -> Result<()> {
     Ok(())
 }
 
+fn ensure_cache_within_display_age(target_file: &Path, entry: &CacheEntry) -> Result<()> {
+    if cache_fetched_at_within_display_age(entry.fetched_at_epoch) {
+        return Ok(());
+    }
+    let cache_file = cache_file_for_target(target_file)?;
+    anyhow::bail!(
+        "codex-rate-limits: cache exceeds maximum display age (max={}s): {}",
+        usage_cache_policy::MAX_DISPLAY_AGE_SECONDS,
+        cache_file.display()
+    )
+}
+
 fn cache_ttl_seconds() -> u64 {
     if let Ok(raw) = std::env::var("CODEX_RATE_LIMITS_CACHE_TTL")
         && let Some(value) = shared_env::parse_duration_seconds(&raw)
@@ -333,8 +359,9 @@ fn cache_key(name: &str) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        cache_file_for_target, clear_prompt_segment_cache, read_cache_entry,
-        read_cache_entry_for_cached_mode, secret_name_for_target, write_prompt_segment_cache,
+        cache_fetched_at_within_display_age_at, cache_file_for_target, clear_prompt_segment_cache,
+        read_cache_entry, read_cache_entry_allow_stale, read_cache_entry_for_cached_mode,
+        secret_name_for_target, write_prompt_segment_cache,
     };
     use crate::rate_limits::render;
     use chrono::Utc;
@@ -678,7 +705,8 @@ mod tests {
         let target = secret_dir.join("alpha.json");
         fs::write(&target, "{}").expect("write target");
         let values = complete_weekly_values("5h", 91, 12, 1_700_600_000, Some(1_700_003_600));
-        write_prompt_segment_cache(&target, 1, &values).expect("write cache");
+        let fetched_at = Utc::now().timestamp().saturating_sub(300);
+        write_prompt_segment_cache(&target, fetched_at, &values).expect("write cache");
 
         let err = read_cache_entry_for_cached_mode(&target).expect_err("stale cache should fail");
         assert!(err.to_string().contains("cache expired"));
@@ -698,7 +726,7 @@ mod tests {
         let target = secret_dir.join("alpha.json");
         fs::write(&target, "{}").expect("write target");
         let now = Utc::now().timestamp();
-        let fetched_at = now.saturating_sub(30 * 60);
+        let fetched_at = now.saturating_sub(5 * 60);
         let values = complete_weekly_values("5h", 91, 12, 1_700_600_000, Some(1_700_003_600));
         write_prompt_segment_cache(&target, fetched_at, &values).expect("write cache");
 
@@ -720,9 +748,79 @@ mod tests {
         let target = secret_dir.join("alpha.json");
         fs::write(&target, "{}").expect("write target");
         let values = complete_weekly_values("5h", 91, 12, 1_700_600_000, Some(1_700_003_600));
-        write_prompt_segment_cache(&target, 1, &values).expect("write cache");
+        let fetched_at = Utc::now().timestamp().saturating_sub(300);
+        write_prompt_segment_cache(&target, fetched_at, &values).expect("write cache");
 
         let entry = read_cache_entry_for_cached_mode(&target).expect("allow stale");
         assert_eq!(entry.non_weekly_remaining, Some(91));
+    }
+
+    #[test]
+    fn cache_display_age_boundary_is_600_seconds() {
+        assert!(cache_fetched_at_within_display_age_at(Some(1_000), 1_599));
+        assert!(!cache_fetched_at_within_display_age_at(Some(1_000), 1_600));
+    }
+
+    #[test]
+    fn cache_display_future_clock_tolerance_ends_after_5_seconds() {
+        assert!(cache_fetched_at_within_display_age_at(Some(1_005), 1_000));
+        assert!(!cache_fetched_at_within_display_age_at(Some(1_006), 1_000));
+    }
+
+    #[test]
+    fn cache_display_rejects_missing_or_invalid_timestamps() {
+        assert!(!cache_fetched_at_within_display_age_at(None, 1_000));
+        assert!(!cache_fetched_at_within_display_age_at(Some(0), 1_000));
+        assert!(!cache_fetched_at_within_display_age_at(Some(1_000), 0));
+    }
+
+    #[test]
+    fn cached_mode_allow_stale_does_not_bypass_max_display_age() {
+        let lock = GlobalStateLock::new();
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let secret_dir = dir.path().join("secrets");
+        let cache_root = dir.path().join("cache");
+        fs::create_dir_all(&secret_dir).expect("secret dir");
+        fs::create_dir_all(&cache_root).expect("cache root");
+        let _env = set_cache_env(&lock, &secret_dir, &cache_root);
+        let _allow_stale = EnvGuard::set(&lock, "CODEX_RATE_LIMITS_CACHE_ALLOW_STALE", "true");
+
+        let target = secret_dir.join("alpha.json");
+        fs::write(&target, "{}").expect("write target");
+        let values = complete_weekly_values("5h", 91, 12, 1_700_600_000, Some(1_700_003_600));
+        let fetched_at = Utc::now().timestamp().saturating_sub(600);
+        write_prompt_segment_cache(&target, fetched_at, &values).expect("write cache");
+
+        let error = read_cache_entry_for_cached_mode(&target)
+            .expect_err("allow-stale must not bypass max display age");
+        assert!(error.to_string().contains("maximum display age"));
+    }
+
+    #[test]
+    fn stale_fallback_rejects_cache_older_than_max_display_age() {
+        let lock = GlobalStateLock::new();
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let secret_dir = dir.path().join("secrets");
+        let cache_root = dir.path().join("cache");
+        fs::create_dir_all(&secret_dir).expect("secret dir");
+        fs::create_dir_all(&cache_root).expect("cache root");
+        let _env = set_cache_env(&lock, &secret_dir, &cache_root);
+
+        let target = secret_dir.join("alpha.json");
+        fs::write(&target, "{}").expect("write target");
+        let values = complete_weekly_values("5h", 91, 12, 1_700_600_000, Some(1_700_003_600));
+        let fetched_at = Utc::now().timestamp().saturating_sub(601);
+        write_prompt_segment_cache(&target, fetched_at, &values).expect("write cache");
+
+        let error = match read_cache_entry_allow_stale(&target) {
+            Ok(_) => panic!("cache older than max display age must be rejected"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("maximum display age"));
+        assert!(
+            cache_file_for_target(&target)
+                .expect("cache path")
+                .is_file()
+        );
     }
 }

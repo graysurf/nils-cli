@@ -177,6 +177,10 @@ fn read_cached_entry(target_file: &Path, ttl_seconds: u64) -> (Option<CacheEntry
         return (None, false);
     };
 
+    if !cache::cache_fetched_at_within_display_age(Some(entry.fetched_at_epoch)) {
+        return (None, true);
+    }
+
     let now_epoch = chrono::Utc::now().timestamp();
     if now_epoch <= 0 || entry.fetched_at_epoch <= 0 {
         return (Some(entry), true);
@@ -291,10 +295,14 @@ impl PromptSegmentStatusResult {
             "access-token-missing"
         } else if !auth_status.prompt_segment_authenticated {
             auth_status.reason.as_str()
+        } else if would_render && cache_stale {
+            "cache-stale"
         } else if would_render {
             "ready"
         } else if !cache_exists {
             "cache-missing"
+        } else if cache_stale {
+            "cache-expired"
         } else {
             "cache-empty-or-invalid"
         };

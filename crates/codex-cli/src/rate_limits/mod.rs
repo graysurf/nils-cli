@@ -624,7 +624,7 @@ fn collect_json_from_cache(
     let cache_entry = if enforce_ttl {
         cache::read_cache_entry_for_cached_mode(target_file)
     } else {
-        cache::read_cache_entry(target_file)
+        cache::read_cache_entry_allow_stale(target_file).map(|read| read.entry)
     };
 
     match cache_entry {
@@ -1245,8 +1245,9 @@ fn collect_async_round(
                         );
                     }
                     if (row.non_weekly_reset_epoch.is_none() || row.weekly_reset_epoch.is_none())
-                        && let Ok(cache_entry) = cache::read_cache_entry(secret_file)
+                        && let Ok(cache_read) = cache::read_cache_entry_allow_stale(secret_file)
                     {
+                        let cache_entry = cache_read.entry;
                         if row.non_weekly_reset_epoch.is_none() {
                             row.non_weekly_reset_epoch = cache_entry.non_weekly_reset_epoch;
                         }
