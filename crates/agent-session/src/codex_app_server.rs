@@ -517,7 +517,7 @@ fn manual_input_gate_path(context: &CliContext, record: &SessionRecord) -> PathB
 }
 
 fn manual_input_ack_path(record: &SessionRecord) -> Option<PathBuf> {
-    proxy_path(record).map(|path| path.with_extension("input-ack"))
+    proxy_path(record).map(|path| path.with_extension("ack"))
 }
 
 fn proxy_capability_path(context: &CliContext, record: &SessionRecord) -> PathBuf {
