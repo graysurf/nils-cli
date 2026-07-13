@@ -536,8 +536,9 @@ fn wake_scheduled_if_usage_open_inner(
     let now = epoch_string(now_epoch)?;
     let observed = load_session_record(context, id)?;
     let canonical_id = observed.id.clone();
-    let _lock =
-        acquire_session_record_lock_timed(context, &canonical_id, PROTOCOL_STATE_LOCK_TIMEOUT)?;
+    let Some(_lock) = try_acquire_session_record_lock(context, &canonical_id)? else {
+        return Ok(false);
+    };
     let record = load_session_record(context, &canonical_id)?;
     crate::ensure_same_session_identity(&observed, &record)?;
     if !runtime_matches(&record, expected_launch_id) {

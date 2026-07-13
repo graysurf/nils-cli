@@ -46,7 +46,6 @@ const MAX_PROTOCOL_ID_BYTES: usize = 256;
 const MAX_REDUCER_PENDING_TURNS: usize = 64;
 const MAX_PROXY_OBSERVATIONS: usize = 16;
 const MAX_PROXY_OBSERVATION_BYTES: usize = 64 * 1024;
-const MAX_PROXY_RAW_OBSERVATION_BYTES: usize = 256 * 1024;
 const MAX_PROXY_MESSAGE_BYTES: usize = 16 * 1024 * 1024;
 const MAX_PROXY_FRAME_BYTES: usize = 4 * 1024 * 1024;
 const CONTROL_RESPONSE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -1672,17 +1671,16 @@ fn message_value(message: &Message) -> Option<Value> {
     }
 }
 
-fn message_payload_len(message: &Message) -> usize {
-    match message {
-        Message::Text(text) => text.len(),
-        Message::Binary(bytes) | Message::Ping(bytes) | Message::Pong(bytes) => bytes.len(),
-        Message::Close(_) | Message::Frame(_) => 0,
-    }
-}
-
 enum ProxyObservation {
     Client(Value),
-    Server(Message),
+    Server(Value),
+}
+
+enum ServerProjection {
+    Irrelevant,
+    Repeatable(Value),
+    Unique(Value),
+    RejectedUnique,
 }
 
 struct ProxyProjection {
@@ -1704,18 +1702,14 @@ impl ProxyProjection {
                     ProxyObservation::Client(value) => {
                         observer.observe_client(&worker_record, &value)
                     }
-                    ProxyObservation::Server(message) => {
-                        match message_value(&message).and_then(|value| server_observation(&value)) {
-                            Some(value) => {
-                                observer
-                                    .observe_server(&worker_context, &worker_record, &value)
-                                    .await
-                            }
-                            None => Ok(()),
-                        }
+                    ProxyObservation::Server(value) => {
+                        observer
+                            .observe_server(&worker_context, &worker_record, &value)
+                            .await
                     }
                 };
-                if result.is_err() {
+                if let Err(error) = result {
+                    eprintln!("warning: Codex projection disabled: {error}");
                     fail_closed_projection(&worker_context, &worker_record).await;
                     break;
                 }
@@ -1735,11 +1729,16 @@ impl ProxyProjection {
         }
     }
 
-    fn observe_server(&mut self, message: &Message) {
-        if message_payload_len(message) <= MAX_PROXY_RAW_OBSERVATION_BYTES {
-            self.enqueue(ProxyObservation::Server(message.clone()));
-        } else {
-            self.disable();
+    fn observe_server(&mut self, value: &Value) {
+        match server_observation(value) {
+            ServerProjection::Irrelevant => {}
+            ServerProjection::Repeatable(value) | ServerProjection::Unique(value) => {
+                self.enqueue(ProxyObservation::Server(value));
+            }
+            ServerProjection::RejectedUnique => {
+                eprintln!("warning: Codex projection disabled: unique observation was invalid");
+                self.disable();
+            }
         }
     }
 
@@ -1747,8 +1746,20 @@ impl ProxyProjection {
         let Some(sender) = self.sender.as_ref() else {
             return;
         };
-        if sender.try_send(observation).is_err() {
-            self.disable();
+        match sender.try_send(observation) {
+            Ok(()) => {}
+            Err(mpsc::error::TrySendError::Full(ProxyObservation::Server(value)))
+                if value.get("method").and_then(Value::as_str)
+                    == Some("account/rateLimits/updated") =>
+            {
+                // Rate-limit updates are advisory and repeatable. The
+                // scheduler rechecks scheduled claims, so a saturated queue
+                // may coalesce this update without losing a unique event.
+            }
+            Err(_) => {
+                eprintln!("warning: Codex projection disabled: observation queue unavailable");
+                self.disable();
+            }
         }
     }
 
@@ -1804,24 +1815,34 @@ fn client_observation(value: &Value) -> Option<Value> {
     bounded_observation(observation)
 }
 
-fn server_observation(value: &Value) -> Option<Value> {
+fn server_observation(value: &Value) -> ServerProjection {
     if let (Some(id), Some(thread_id)) = (value.get("id"), value.pointer("/result/thread/id")) {
-        json_id_key(id)?;
-        let thread_id = thread_id.as_str()?;
-        if !protocol_id_is_valid(thread_id) {
-            return None;
+        let Some(thread_id) = thread_id.as_str() else {
+            return ServerProjection::RejectedUnique;
+        };
+        if json_id_key(id).is_none() || !protocol_id_is_valid(thread_id) {
+            return ServerProjection::RejectedUnique;
         }
         return bounded_observation(json!({
             "id": id,
             "result": { "thread": { "id": thread_id } }
-        }));
+        }))
+        .map(ServerProjection::Unique)
+        .unwrap_or(ServerProjection::RejectedUnique);
     }
-    let observation = match value.get("method").and_then(Value::as_str)? {
+    let Some(method) = value.get("method").and_then(Value::as_str) else {
+        return ServerProjection::Irrelevant;
+    };
+    let observation = match method {
         "error" => {
-            let thread_id = value.pointer("/params/threadId")?.as_str()?;
-            let turn_id = value.pointer("/params/turnId")?.as_str()?;
+            let (Some(thread_id), Some(turn_id)) = (
+                value.pointer("/params/threadId").and_then(Value::as_str),
+                value.pointer("/params/turnId").and_then(Value::as_str),
+            ) else {
+                return ServerProjection::RejectedUnique;
+            };
             if !protocol_id_is_valid(thread_id) || !protocol_id_is_valid(turn_id) {
-                return None;
+                return ServerProjection::RejectedUnique;
             }
             json!({
                 "method": "error",
@@ -1836,10 +1857,14 @@ fn server_observation(value: &Value) -> Option<Value> {
             })
         }
         "turn/completed" => {
-            let thread_id = value.pointer("/params/threadId")?.as_str()?;
-            let turn_id = value.pointer("/params/turn/id")?.as_str()?;
+            let (Some(thread_id), Some(turn_id)) = (
+                value.pointer("/params/threadId").and_then(Value::as_str),
+                value.pointer("/params/turn/id").and_then(Value::as_str),
+            ) else {
+                return ServerProjection::RejectedUnique;
+            };
             if !protocol_id_is_valid(thread_id) || !protocol_id_is_valid(turn_id) {
-                return None;
+                return ServerProjection::RejectedUnique;
             }
             json!({
                 "method": "turn/completed",
@@ -1862,9 +1887,16 @@ fn server_observation(value: &Value) -> Option<Value> {
                 "rateLimitsByLimitId": value.pointer("/params/rateLimitsByLimitId")
             }
         }),
-        _ => return None,
+        _ => return ServerProjection::Irrelevant,
     };
-    bounded_observation(observation)
+    match bounded_observation(observation) {
+        Some(observation) if method == "account/rateLimits/updated" => {
+            ServerProjection::Repeatable(observation)
+        }
+        Some(observation) => ServerProjection::Unique(observation),
+        None if method == "account/rateLimits/updated" => ServerProjection::Irrelevant,
+        None => ServerProjection::RejectedUnique,
+    }
 }
 
 fn bounded_observation(value: Value) -> Option<Value> {
@@ -2247,10 +2279,10 @@ async fn run_proxy_session(
                 let closed = matches!(message, Message::Close(_));
                 if let Some(value) = message_value(&observed) {
                     bootstrap.observe_server(&value);
+                    projection.observe_server(&value);
                 }
                 tui.send(message).await
                     .map_err(|err| format!("remote TUI write failed: {err}"))?;
-                projection.observe_server(&observed);
                 if closed {
                     projection.finish().await;
                     return Ok(());
@@ -2430,7 +2462,7 @@ async fn wake_from_open_usage(
         .as_ref()
         .map(|runtime| runtime.launch_id.clone())
         .ok_or_else(|| "Codex runtime identity is missing".to_string())?;
-    tokio::task::spawn_blocking(move || {
+    let wake = tokio::task::spawn_blocking(move || {
         crate::auto_resume::wake_scheduled_if_usage_open_for_runtime(
             &context,
             &id,
@@ -2439,9 +2471,9 @@ async fn wake_from_open_usage(
         )
     })
     .await
-    .map_err(|_| "Codex usage wake worker failed".to_string())?
-    .map(|_| ())
-    .map_err(|err| format!("Codex usage wake failed: {}", err.code()))
+    .map_err(|_| "Codex usage wake worker failed".to_string())?;
+    wake.map(|_| ())
+        .map_err(|err| format!("Codex usage wake failed: {}", err.code()))
 }
 
 #[cfg(test)]
@@ -3034,7 +3066,7 @@ mod tests {
             }))
             .is_none()
         );
-        assert!(
+        assert!(matches!(
             server_observation(&json!({
                 "method": "account/rateLimits/updated",
                 "params": {
@@ -3045,13 +3077,13 @@ mod tests {
                         }
                     }
                 }
-            }))
-            .is_none()
-        );
+            })),
+            ServerProjection::Irrelevant
+        ));
     }
 
     #[tokio::test]
-    async fn oversized_server_message_fails_closed_with_method_after_padding() {
+    async fn oversized_server_message_projects_only_bounded_fields() {
         let tmp = tempfile::TempDir::new().unwrap();
         let context = CliContext {
             state_dir: tmp.path().join("state"),
@@ -3064,12 +3096,53 @@ mod tests {
         crate::auto_resume::set_enabled(&context, &record.id, true, "2030-01-01T00:00:00Z")
             .unwrap();
         let mut projection = ProxyProjection::new(context.clone(), record.clone());
-        let raw = format!(
-            "{{\"padding\":\"{}\",\"method\":\"turn/completed\"}}",
-            "x".repeat(MAX_PROXY_RAW_OBSERVATION_BYTES)
-        );
+        let value = json!({
+            "padding": "x".repeat(MAX_PROXY_OBSERVATION_BYTES * 5),
+            "method": "turn/completed",
+            "params": {
+                "threadId": "thread-a",
+                "turn": { "id": "turn-a", "status": "completed" }
+            }
+        });
 
-        projection.observe_server(&Message::Text(raw.into()));
+        projection.observe_server(&value);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        projection.finish().await;
+
+        let view = crate::auto_resume::view_for_record(&context, &record);
+        assert!(view.enabled);
+        assert_eq!(view.state, "enabled");
+        assert_eq!(view.failure_reason, None);
+    }
+
+    #[tokio::test]
+    async fn oversized_selected_unique_observation_fails_closed() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let context = CliContext {
+            state_dir: tmp.path().join("state"),
+            host: None,
+        };
+        let record = record_with_runtime("oversized-unique", &tmp.path().join("server.sock"));
+        fs::create_dir_all(crate::session_dir(&context, &record.id)).unwrap();
+        crate::write_session_record(&context, &record).unwrap();
+        crate::activity::activate_runtime(&context, &record).unwrap();
+        crate::auto_resume::set_enabled(&context, &record.id, true, "2030-01-01T00:00:00Z")
+            .unwrap();
+        let mut projection = ProxyProjection::new(context.clone(), record.clone());
+
+        projection.observe_server(&json!({
+            "method": "turn/completed",
+            "params": {
+                "threadId": "thread-a",
+                "turn": {
+                    "id": "turn-a",
+                    "status": "failed",
+                    "error": {
+                        "codexErrorInfo": "x".repeat(MAX_PROXY_OBSERVATION_BYTES)
+                    }
+                }
+            }
+        }));
         for _ in 0..20 {
             let view = crate::auto_resume::view_for_record(&context, &record);
             if view.state == "terminal_failure" {
@@ -3079,7 +3152,76 @@ mod tests {
             }
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
-        panic!("oversized projection did not fail closed");
+        panic!("oversized selected unique observation did not fail closed");
+    }
+
+    #[tokio::test]
+    async fn saturated_projection_coalesces_repeatable_usage_updates() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let context = CliContext {
+            state_dir: tmp.path().join("state"),
+            host: None,
+        };
+        let record = record_with_runtime("usage-coalesce", &tmp.path().join("server.sock"));
+        fs::create_dir_all(crate::session_dir(&context, &record.id)).unwrap();
+        crate::write_session_record(&context, &record).unwrap();
+        crate::activity::activate_runtime(&context, &record).unwrap();
+        crate::auto_resume::set_enabled(&context, &record.id, true, "2030-01-01T00:00:00Z")
+            .unwrap();
+        let mut projection = ProxyProjection::new(context.clone(), record.clone());
+
+        for _ in 0..(MAX_PROXY_OBSERVATIONS + 4) {
+            projection.observe_server(&json!({
+                "method": "account/rateLimits/updated",
+                "params": {
+                    "rateLimits": {
+                        "primary": { "usedPercent": 42.0, "resetsAt": 1_900_000_000_i64 }
+                    }
+                }
+            }));
+        }
+        projection.finish().await;
+
+        let view = crate::auto_resume::view_for_record(&context, &record);
+        assert!(view.enabled);
+        assert_eq!(view.state, "enabled");
+        assert_eq!(view.failure_reason, None);
+    }
+
+    #[tokio::test]
+    async fn saturated_projection_still_fails_closed_for_unique_events() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let context = CliContext {
+            state_dir: tmp.path().join("state"),
+            host: None,
+        };
+        let record = record_with_runtime("unique-overflow", &tmp.path().join("server.sock"));
+        fs::create_dir_all(crate::session_dir(&context, &record.id)).unwrap();
+        crate::write_session_record(&context, &record).unwrap();
+        crate::activity::activate_runtime(&context, &record).unwrap();
+        crate::auto_resume::set_enabled(&context, &record.id, true, "2030-01-01T00:00:00Z")
+            .unwrap();
+        let mut projection = ProxyProjection::new(context.clone(), record.clone());
+
+        for index in 0..(MAX_PROXY_OBSERVATIONS + 4) {
+            projection.observe_server(&json!({
+                "method": "turn/completed",
+                "params": {
+                    "threadId": "thread-a",
+                    "turn": { "id": format!("turn-{index}"), "status": "completed" }
+                }
+            }));
+        }
+        for _ in 0..20 {
+            let view = crate::auto_resume::view_for_record(&context, &record);
+            if view.state == "terminal_failure" {
+                assert!(!view.enabled);
+                assert_eq!(view.failure_reason.as_deref(), Some("state_unavailable"));
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        panic!("unique projection overflow did not fail closed");
     }
 
     #[tokio::test]
@@ -3112,6 +3254,96 @@ mod tests {
         assert!(!view.enabled);
         assert_eq!(view.state, "terminal_failure");
         assert_eq!(view.failure_reason.as_deref(), Some("state_unavailable"));
+    }
+
+    #[tokio::test]
+    async fn open_usage_lock_contention_is_retryable_without_disabling_projection() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let context = CliContext {
+            state_dir: tmp.path().join("state"),
+            host: None,
+        };
+        let record = record_with_runtime("usage-wake-busy", &tmp.path().join("server.sock"));
+        fs::create_dir_all(crate::session_dir(&context, &record.id)).unwrap();
+        crate::write_session_record(&context, &record).unwrap();
+        crate::activity::activate_runtime(&context, &record).unwrap();
+        crate::auto_resume::set_enabled(&context, &record.id, true, "2030-01-01T00:00:00Z")
+            .unwrap();
+        let lock = crate::acquire_session_record_lock(&context, &record.id).unwrap();
+
+        wake_from_open_usage(
+            &context,
+            &record,
+            &UsageSnapshot {
+                authoritative: true,
+                has_exhausted_windows: false,
+                exhausted_reset_epochs: Vec::new(),
+            },
+        )
+        .await
+        .expect("advisory open-usage wake should defer while the lifecycle lock is busy");
+        drop(lock);
+
+        let view = crate::auto_resume::view_for_record(&context, &record);
+        assert!(view.enabled);
+        assert_eq!(view.state, "enabled");
+        assert_eq!(view.failure_reason, None);
+    }
+
+    #[tokio::test]
+    async fn open_usage_burst_during_lifecycle_lock_keeps_projection_enabled() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let context = CliContext {
+            state_dir: tmp.path().join("state"),
+            host: None,
+        };
+        let record = record_with_runtime("usage-wake-burst", &tmp.path().join("server.sock"));
+        fs::create_dir_all(crate::session_dir(&context, &record.id)).unwrap();
+        crate::write_session_record(&context, &record).unwrap();
+        crate::activity::activate_runtime(&context, &record).unwrap();
+        crate::auto_resume::set_enabled(&context, &record.id, true, "2030-01-01T00:00:00Z")
+            .unwrap();
+        let mut projection = ProxyProjection::new(context.clone(), record.clone());
+        projection.observe_client(&json!({
+            "method": "turn/start",
+            "params": { "threadId": "thread-a" }
+        }));
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        let lock = crate::acquire_session_record_lock(&context, &record.id).unwrap();
+        projection.observe_server(&json!({
+            "method": "account/rateLimits/updated",
+            "params": {
+                "rateLimits": {
+                    "primary": {
+                        "usedPercent": 42.0,
+                        "resetsAt": 1_900_000_000_i64
+                    }
+                }
+            }
+        }));
+        tokio::time::sleep(Duration::from_millis(25)).await;
+
+        for index in 0..(MAX_PROXY_OBSERVATIONS + 4) {
+            projection.observe_server(&json!({
+                "method": "turn/completed",
+                "params": {
+                    "threadId": "thread-a",
+                    "turn": {
+                        "id": format!("turn-{index}"),
+                        "status": "completed"
+                    }
+                }
+            }));
+            tokio::task::yield_now().await;
+        }
+        drop(lock);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        projection.finish().await;
+
+        let view = crate::auto_resume::view_for_record(&context, &record);
+        assert!(view.enabled);
+        assert_eq!(view.state, "enabled");
+        assert_eq!(view.failure_reason, None);
     }
 
     #[tokio::test]
