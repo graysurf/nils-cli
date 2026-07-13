@@ -1377,6 +1377,10 @@ pub(crate) struct ControlHandle {
 
 pub(crate) enum ControlCommand {
     Usage(oneshot::Sender<Result<UsageSnapshot, String>>),
+    Prompt {
+        message: String,
+        response: oneshot::Sender<Result<String, String>>,
+    },
     Continue {
         message: String,
         response: oneshot::Sender<Result<String, String>>,
@@ -1404,6 +1408,24 @@ impl ControlHandle {
         tokio::time::timeout(CONTROL_SUBMIT_TOTAL_TIMEOUT, async {
             self.sender
                 .send(ControlCommand::Continue {
+                    message: message.to_string(),
+                    response,
+                })
+                .await
+                .map_err(|_| "codex control connection unavailable".to_string())?;
+            receive
+                .await
+                .map_err(|_| "codex control connection closed".to_string())?
+        })
+        .await
+        .map_err(|_| "codex turn submission timed out".to_string())?
+    }
+
+    pub(crate) async fn submit_prompt(&self, message: &str) -> Result<String, String> {
+        let (response, receive) = oneshot::channel();
+        tokio::time::timeout(CONTROL_SUBMIT_TOTAL_TIMEOUT, async {
+            self.sender
+                .send(ControlCommand::Prompt {
                     message: message.to_string(),
                     response,
                 })
@@ -1530,6 +1552,28 @@ pub(crate) async fn run_control(
                             CONTROL_RESPONSE_TIMEOUT,
                         ).await;
                         let _ = response.send(result.map(|value| usage_snapshot(&value)));
+                    }
+                    ControlCommand::Prompt { message, response } => {
+                        request_id = request_id.saturating_add(1);
+                        if let Err(err) = send_json(
+                            &mut websocket,
+                            continuation_request(request_id, &thread_id, &message),
+                        ).await {
+                            let _ = response.send(Err(err));
+                            return Err("Codex prompt request write failed".to_string());
+                        }
+                        let result = receive_response_with_timeout(
+                            &mut websocket,
+                            request_id,
+                            Some((&context, &record, &mut reducer)),
+                            CONTROL_SUBMISSION_TIMEOUT,
+                        ).await.and_then(|value| {
+                            value.pointer("/turn/id")
+                                .and_then(Value::as_str)
+                                .map(str::to_string)
+                                .ok_or_else(|| "Codex turn/start response omitted the acknowledged turn id".to_string())
+                        });
+                        let _ = response.send(result);
                     }
                     ControlCommand::Continue { message, response } => {
                         if !thread_resumed {

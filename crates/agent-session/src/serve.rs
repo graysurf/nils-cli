@@ -88,6 +88,8 @@ const ATTACH_HANDOFF_MAX_RECAPTURES: usize = 1;
 const PROVIDER_PROMPT_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const PROVIDER_PROMPT_PENDING_POLL_INTERVAL: Duration = Duration::from_millis(500);
 const PROVIDER_PROMPT_PENDING_TIMEOUT: Duration = Duration::from_secs(2 * 60);
+const STRUCTURED_PROMPT_CONTROL_WAIT: Duration = Duration::from_secs(3);
+const STRUCTURED_PROMPT_CONTROL_POLL: Duration = Duration::from_millis(50);
 const PROVIDER_PROMPT_DISCOVERY_MAX_BACKOFF: Duration = Duration::from_secs(30);
 const PROVIDER_PROMPT_DISCOVERY_MAX_ENTRIES: usize = 64;
 const PROVIDER_PROMPT_DISCOVERY_MAX_CONCURRENT_SCANS: usize = 4;
@@ -260,6 +262,7 @@ fn router(state: Arc<ServeState>) -> Router {
         .route("/sessions/{id}/glance", get(glance_handler))
         .route("/sessions/{id}/buffer", get(buffer_handler))
         .route("/sessions/{id}/send", post(send_handler))
+        .route("/sessions/{id}/prompt", post(structured_prompt_handler))
         .route("/sessions/{id}/resume", post(resume_handler))
         .route(
             "/sessions/{id}/auto-resume",
@@ -2028,6 +2031,11 @@ struct SendBody {
 }
 
 #[derive(Debug, Deserialize)]
+struct StructuredPromptBody {
+    text: String,
+}
+
+#[derive(Debug, Deserialize)]
 struct AutoResumeBody {
     enabled: bool,
 }
@@ -2066,7 +2074,6 @@ async fn list_handler(State(state): State<Arc<ServeState>>) -> Response {
         Ok(Ok(sessions)) => envelope_ok(json!({
             "machine": state.machine,
             "observed_at": activity_observed_at(),
-            "capabilities": { "atomic_multiline_input": true },
             "sessions": sessions,
         })),
         Ok(Err(err)) => envelope_err(err),
@@ -2270,6 +2277,103 @@ async fn send_handler(
         Ok(Err(err)) => envelope_err(err),
         Err(_) => join_err(),
     }
+}
+
+async fn structured_prompt_handler(
+    State(state): State<Arc<ServeState>>,
+    headers: HeaderMap,
+    AxPath(id): AxPath<String>,
+    Json(body): Json<StructuredPromptBody>,
+) -> Response {
+    if let Some(resp) = deny_unauthorized(&state, &headers) {
+        return resp;
+    }
+    if body.text.trim().is_empty() {
+        return status_json(
+            StatusCode::BAD_REQUEST,
+            "empty-prompt",
+            "structured prompt text must not be blank",
+        );
+    }
+    if body.text.len() > MAX_PROVIDER_PROMPT_BYTES {
+        return status_json(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "prompt-too-large",
+            "structured prompt exceeds the maximum supported size",
+        );
+    }
+    if structured_prompt_has_unsafe_control(&body.text) {
+        return status_json(
+            StatusCode::BAD_REQUEST,
+            "unsafe-prompt-control",
+            "structured prompt contains an unsupported control character",
+        );
+    }
+
+    let context = state.context.clone();
+    let load_id = id.clone();
+    let record =
+        match tokio::task::spawn_blocking(move || load_session_record(&context, &load_id)).await {
+            Ok(Ok(record)) => record,
+            Ok(Err(err)) => return envelope_err(err),
+            Err(_) => return join_err(),
+        };
+    if !codex_app_server::runtime_is_supported(&record) {
+        return status_json(
+            StatusCode::CONFLICT,
+            "structured-prompt-unsupported",
+            "this session does not provide structured prompt submission",
+        );
+    }
+    let Some(launch_id) = record
+        .runtime
+        .as_ref()
+        .map(|runtime| runtime.launch_id.clone())
+    else {
+        return status_json(
+            StatusCode::CONFLICT,
+            "structured-prompt-unsupported",
+            "this session does not provide structured prompt submission",
+        );
+    };
+
+    let deadline = Instant::now() + STRUCTURED_PROMPT_CONTROL_WAIT;
+    let handle = loop {
+        let handle = state.codex_controls.lock().ok().and_then(|controls| {
+            controls
+                .get(&id)
+                .filter(|entry| entry.launch_id == launch_id)
+                .map(|entry| entry.handle.clone())
+        });
+        if handle.is_some() || Instant::now() >= deadline {
+            break handle;
+        }
+        tokio::time::sleep(STRUCTURED_PROMPT_CONTROL_POLL).await;
+    };
+    let Some(handle) = handle else {
+        return status_json(
+            StatusCode::CONFLICT,
+            "structured-prompt-unavailable",
+            "structured prompt control is not ready for this session",
+        );
+    };
+
+    match handle.submit_prompt(&body.text).await {
+        Ok(_) => envelope_ok(json!({ "machine": state.machine, "submitted": true })),
+        Err(_) => status_json(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "structured-prompt-outcome-unknown",
+            "structured prompt submission outcome is unknown",
+        ),
+    }
+}
+
+fn structured_prompt_has_unsafe_control(text: &str) -> bool {
+    text.chars().any(|character| {
+        character <= '\u{0009}'
+            || ('\u{000b}'..='\u{001f}').contains(&character)
+            || character == '\u{007f}'
+    })
 }
 
 async fn auto_resume_status_handler(
@@ -5997,6 +6101,27 @@ mod tests {
         std::fs::write(record_path, serde_json::to_vec_pretty(&record).unwrap()).unwrap();
     }
 
+    fn seed_codex_app_server_session(state_dir: &Path, id: &str) -> String {
+        seed_session_with_runtime(state_dir, id, "codex", &format!("hs-codex-{id}"));
+        let record_path = state_dir.join("sessions").join(id).join("session.json");
+        let mut record: Value =
+            serde_json::from_str(&std::fs::read_to_string(&record_path).unwrap()).unwrap();
+        let launch_id = format!("launch-{id}");
+        record["runtime"]["kind"] = json!(codex_app_server::RUNTIME_KIND);
+        record["runtime"][codex_app_server::PROTOCOL_KEY] =
+            json!(codex_app_server::PROTOCOL_VERSION);
+        for (key, suffix) in [
+            (codex_app_server::SOCKET_KEY, "sock"),
+            (codex_app_server::PROXY_KEY, "proxy"),
+            (codex_app_server::THREAD_HANDOFF_KEY, "thread"),
+            (codex_app_server::THREAD_ATTACHED_KEY, "attached"),
+        ] {
+            record["runtime"][key] = json!(state_dir.join(format!("{id}.{suffix}")));
+        }
+        std::fs::write(record_path, serde_json::to_vec_pretty(&record).unwrap()).unwrap();
+        launch_id
+    }
+
     fn seed_resumable_session(
         state_dir: &Path,
         id: &str,
@@ -6761,7 +6886,6 @@ mod tests {
         observed_at
             .parse::<jiff::Timestamp>()
             .expect("RFC3339 daemon observation anchor");
-        assert_eq!(body["data"]["capabilities"]["atomic_multiline_input"], true);
         assert_eq!(body["data"]["sessions"].as_array().unwrap().len(), 0);
     }
 
@@ -9174,6 +9298,106 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn structured_prompt_submits_exact_multiline_without_terminal_paste() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let launch_id = seed_codex_app_server_session(tmp.path(), "structured");
+        let st = state(
+            tmp.path(),
+            Some(TOKEN),
+            PathBuf::from("/terminal-transport-must-not-run"),
+        );
+        let (handle, mut commands) = codex_app_server::control_channel();
+        st.codex_controls.lock().unwrap().insert(
+            "structured".to_string(),
+            CodexControlEntry { launch_id, handle },
+        );
+        let prompt = "inspect first line\nthen second line";
+        let responder = tokio::spawn(async move {
+            let Some(codex_app_server::ControlCommand::Prompt { message, response }) =
+                commands.recv().await
+            else {
+                panic!("structured prompt did not reach the Codex control plane");
+            };
+            assert_eq!(message, prompt);
+            response.send(Ok("turn-structured".to_string())).unwrap();
+        });
+
+        let (status, body) = call(
+            router(st.clone()),
+            post_json(
+                "/sessions/structured/prompt",
+                None,
+                json!({ "text": prompt }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "body={body}");
+
+        let (status, body) = call(
+            router(st),
+            post_json(
+                "/sessions/structured/prompt",
+                Some(TOKEN),
+                json!({ "text": prompt }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "body={body}");
+        assert_eq!(body["data"]["submitted"], true);
+        assert!(body.pointer("/data/turn_id").is_none());
+        responder.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn structured_prompt_rejects_unsupported_sessions_before_terminal_input() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        seed_session(tmp.path(), "claude", "claude", "hs-claude-structured");
+        let st = state(
+            tmp.path(),
+            Some(TOKEN),
+            PathBuf::from("/terminal-transport-must-not-run"),
+        );
+
+        let (status, body) = call(
+            router(st),
+            post_json(
+                "/sessions/claude/prompt",
+                Some(TOKEN),
+                json!({ "text": "first\nsecond" }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "body={body}");
+        assert_eq!(body["error"]["code"], "structured-prompt-unsupported");
+    }
+
+    #[tokio::test]
+    async fn structured_prompt_rejects_terminal_controls() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let launch_id = seed_codex_app_server_session(tmp.path(), "controls");
+        let st = state(tmp.path(), Some(TOKEN), minimal_tmux(tmp.path()));
+        let (handle, _commands) = codex_app_server::control_channel();
+        st.codex_controls.lock().unwrap().insert(
+            "controls".to_string(),
+            CodexControlEntry { launch_id, handle },
+        );
+
+        for text in ["carriage\rreturn", "tab\tkey", "escape\u{1b}sequence"] {
+            let (status, body) = call(
+                router(st.clone()),
+                post_json(
+                    "/sessions/controls/prompt",
+                    Some(TOKEN),
+                    json!({ "text": text }),
+                ),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "body={body}");
+            assert_eq!(body["error"]["code"], "unsafe-prompt-control");
+        }
+    }
+
+    #[tokio::test]
     async fn resume_recreates_missing_runtime_with_token() {
         let lock = GlobalStateLock::new();
         let tmp = tempfile::TempDir::new().unwrap();
@@ -9972,7 +10196,7 @@ mod tests {
 
         let calls = std::fs::read_to_string(&calls_log).unwrap();
         assert!(
-            calls.contains("paste-buffer -p -r -b steer-send"),
+            calls.contains("paste-buffer -b steer-send"),
             "a live Claude rename must paste into the pane: {calls:?}"
         );
         assert!(

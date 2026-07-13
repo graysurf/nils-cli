@@ -1709,11 +1709,8 @@ fn paste_prompt(tmux_bin: &Path, record: &SessionRecord) -> Result<(), CliError>
 }
 
 /// Load `file` into a named tmux buffer and paste it into `target`, deleting the
-/// buffer after paste (`-d`) or on failure. Raw mode (`-r`) preserves linefeeds
-/// and paste mode (`-p`) applies bracketed-paste framing when the application
-/// requested it, so multiline text cannot degrade into intermediate Enter keys.
-/// Shared by `paste_prompt` (initial prompt) and `send` (steering text) so the
-/// transport and buffer lifecycle live in one place.
+/// buffer after paste (`-d`) or on failure. Shared by `paste_prompt` (initial
+/// prompt) and `send` (steering text) so the buffer lifecycle lives in one place.
 fn load_and_paste_buffer(
     tmux_bin: &Path,
     buffer_name: &str,
@@ -1724,7 +1721,14 @@ fn load_and_paste_buffer(
     load.arg("load-buffer").arg("-b").arg(buffer_name).arg(file);
     run_status(load, "tmux load-buffer")?;
 
-    let paste = paste_buffer_command(tmux_bin, buffer_name, target);
+    let mut paste = ProcessCommand::new(tmux_bin);
+    paste
+        .arg("paste-buffer")
+        .arg("-b")
+        .arg(buffer_name)
+        .arg("-d")
+        .arg("-t")
+        .arg(target);
     if let Err(err) = run_status(paste, "tmux paste-buffer") {
         delete_tmux_buffer(tmux_bin, buffer_name);
         return Err(err);
@@ -1985,26 +1989,19 @@ fn load_and_paste_buffer_with_timeout(
     load.arg("load-buffer").arg("-b").arg(buffer_name).arg(file);
     run_status_with_timeout(load, "tmux load-buffer", timeout)?;
 
-    let paste = paste_buffer_command(tmux_bin, buffer_name, target);
-    if let Err(err) = run_status_with_timeout(paste, "tmux paste-buffer", timeout) {
-        delete_tmux_buffer(tmux_bin, buffer_name);
-        return Err(err);
-    }
-    Ok(())
-}
-
-fn paste_buffer_command(tmux_bin: &Path, buffer_name: &str, target: &str) -> ProcessCommand {
     let mut paste = ProcessCommand::new(tmux_bin);
     paste
         .arg("paste-buffer")
-        .arg("-p")
-        .arg("-r")
         .arg("-b")
         .arg(buffer_name)
         .arg("-d")
         .arg("-t")
         .arg(target);
-    paste
+    if let Err(err) = run_status_with_timeout(paste, "tmux paste-buffer", timeout) {
+        delete_tmux_buffer(tmux_bin, buffer_name);
+        return Err(err);
+    }
+    Ok(())
 }
 
 fn read_send_text(text: &Option<String>, text_stdin: bool) -> Result<Option<String>, CliError> {
