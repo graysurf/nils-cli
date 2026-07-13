@@ -36,11 +36,19 @@ pub fn run(options: &PromptSegmentOptions) -> i32 {
     };
 
     let force_refresh = options.refresh || ttl_seconds == 0;
-    let display_expired = cache_file.is_file() && cache::cache_display_expired(&cache_file);
+    let mut cache_snapshot = cache::snapshot(&cache_file);
+    let display_expired = cache_snapshot.exists() && cache_snapshot.display_expired();
+    let _refresh_guard = if display_expired && !force_refresh {
+        cache::begin_expired_refresh(&cache_file)
+    } else {
+        None
+    };
     let needs_refresh = force_refresh
-        || !cache_file.is_file()
-        || cache::cache_stale(&cache_file, ttl_seconds)
-        || display_expired;
+        || if display_expired {
+            _refresh_guard.is_some()
+        } else {
+            !cache_snapshot.exists() || cache_snapshot.stale(ttl_seconds)
+        };
     let mut stale = false;
 
     if needs_refresh {
@@ -51,6 +59,8 @@ pub fn run(options: &PromptSegmentOptions) -> i32 {
             Ok(Some(body)) => {
                 if cache::write_cache_file(&cache_file, &body).is_err() {
                     stale = true;
+                } else {
+                    cache_snapshot = cache::snapshot(&cache_file);
                 }
             }
             _ => {
@@ -59,7 +69,7 @@ pub fn run(options: &PromptSegmentOptions) -> i32 {
         }
     }
 
-    if cache::cache_display_expired(&cache_file) {
+    if cache_snapshot.display_expired() {
         return exit::SUCCESS;
     }
 
@@ -197,12 +207,13 @@ fn inspect_cache(cache_file: Option<&PathBuf>, ttl_seconds: u64) -> (bool, bool,
     let Some(cache_file) = cache_file else {
         return (false, false, false, false);
     };
-    if !cache_file.is_file() {
+    let cache_snapshot = cache::snapshot(cache_file);
+    if !cache_snapshot.exists() {
         return (false, false, false, false);
     }
 
-    let cache_expired = cache::cache_display_expired(cache_file);
-    let cache_stale = cache_expired || cache::cache_stale(cache_file, ttl_seconds);
+    let cache_expired = cache_snapshot.display_expired();
+    let cache_stale = cache_expired || cache_snapshot.stale(ttl_seconds);
     let would_render = !cache_expired
         && cache::read_cache_file(cache_file)
             .as_deref()

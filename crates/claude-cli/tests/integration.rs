@@ -7,6 +7,8 @@ use std::fs::OpenOptions;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Barrier};
+use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 fn claude_cli_bin() -> PathBuf {
@@ -583,6 +585,104 @@ fn prompt_segment_does_not_render_cache_older_than_max_stale_age() {
         cache_file.is_file(),
         "max-stale handling must not delete cache"
     );
+}
+
+#[test]
+fn prompt_segment_expired_cache_failed_refresh_observes_cooldown() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let cache_file = write_cache(tmp.path(), &usage_json(25.0, 50.0));
+    set_modified(&cache_file, SystemTime::now() - Duration::from_secs(601));
+
+    let server = LoopbackServer::new().expect("server");
+    server.add_route("GET", "/usage", HttpResponse::new(500, "upstream exploded"));
+    let options = base_options(tmp.path())
+        .with_env(
+            "CLAUDE_PROMPT_SEGMENT_ACCESS_TOKEN",
+            "secret-token-cooldown",
+        )
+        .with_env(
+            "CLAUDE_PROMPT_SEGMENT_ENDPOINT",
+            &format!("{}/usage", server.url()),
+        );
+
+    for _ in 0..2 {
+        let output = run(&["prompt-segment", "--ttl", "1h"], &options);
+        assert_exit(&output, 0);
+        assert_eq!(stdout(&output), "");
+        assert_eq!(stderr(&output), "");
+    }
+
+    assert_eq!(server.take_requests().len(), 1);
+}
+
+#[test]
+fn prompt_segment_expired_cache_concurrent_refreshes_are_coalesced() {
+    const WORKERS: usize = 6;
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let cache_file = write_cache(tmp.path(), &usage_json(25.0, 50.0));
+    set_modified(&cache_file, SystemTime::now() - Duration::from_secs(601));
+
+    let server = LoopbackServer::new().expect("server");
+    server.add_route("GET", "/usage", HttpResponse::new(500, "upstream exploded"));
+    let options = base_options(tmp.path())
+        .with_env(
+            "CLAUDE_PROMPT_SEGMENT_ACCESS_TOKEN",
+            "secret-token-coalesced",
+        )
+        .with_env(
+            "CLAUDE_PROMPT_SEGMENT_ENDPOINT",
+            &format!("{}/usage", server.url()),
+        );
+    let barrier = Arc::new(Barrier::new(WORKERS));
+
+    let handles = (0..WORKERS)
+        .map(|_| {
+            let options = options.clone();
+            let barrier = Arc::clone(&barrier);
+            thread::spawn(move || {
+                barrier.wait();
+                run(&["prompt-segment", "--ttl", "1h"], &options)
+            })
+        })
+        .collect::<Vec<_>>();
+
+    for handle in handles {
+        let output = handle.join().expect("prompt worker");
+        assert_exit(&output, 0);
+        assert_eq!(stdout(&output), "");
+        assert_eq!(stderr(&output), "");
+    }
+
+    assert_eq!(server.take_requests().len(), 1);
+}
+
+#[test]
+fn prompt_segment_explicit_refresh_bypasses_expired_cache_cooldown() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let cache_file = write_cache(tmp.path(), &usage_json(25.0, 50.0));
+    set_modified(&cache_file, SystemTime::now() - Duration::from_secs(601));
+
+    let server = LoopbackServer::new().expect("server");
+    server.add_route("GET", "/usage", HttpResponse::new(500, "upstream exploded"));
+    let options = base_options(tmp.path())
+        .with_env(
+            "CLAUDE_PROMPT_SEGMENT_ACCESS_TOKEN",
+            "secret-token-explicit",
+        )
+        .with_env(
+            "CLAUDE_PROMPT_SEGMENT_ENDPOINT",
+            &format!("{}/usage", server.url()),
+        );
+
+    for _ in 0..2 {
+        let output = run(&["prompt-segment", "--refresh"], &options);
+        assert_exit(&output, 0);
+        assert_eq!(stdout(&output), "");
+        assert_eq!(stderr(&output), "");
+    }
+
+    assert_eq!(server.take_requests().len(), 2);
 }
 
 #[test]

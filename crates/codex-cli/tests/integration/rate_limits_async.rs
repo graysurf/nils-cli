@@ -4,6 +4,8 @@ use nils_test_support::http::{HttpResponse, LoopbackServer, TestServer};
 use pretty_assertions::assert_eq;
 use serde_json::Value;
 use std::fs;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -68,6 +70,93 @@ fn now_epoch() -> i64 {
         .ok()
         .and_then(|duration| i64::try_from(duration.as_secs()).ok())
         .unwrap_or(0)
+}
+
+#[cfg(unix)]
+fn assert_partial_live_ignores_invalid_reset_cache(fetched_at: i64) {
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let secret_dir = dir.path().join("secrets");
+    fs::create_dir_all(&secret_dir).expect("secret dir");
+    fs::write(
+        secret_dir.join("alpha.json"),
+        r#"{"tokens":{"access_token":"tok-alpha","account_id":"acct_001"}}"#,
+    )
+    .expect("write alpha");
+
+    let cache_root = dir.path().join("cache_root");
+    let kv_path = cache_kv_path(&cache_root, "alpha");
+    let cache_dir = kv_path.parent().expect("cache parent");
+    fs::create_dir_all(cache_dir).expect("cache dir");
+    let reset_epoch = now_epoch().saturating_add(900_000);
+    fs::write(
+        &kv_path,
+        format!(
+            "fetched_at={fetched_at}\nnon_weekly_label=5h\nnon_weekly_remaining=91\nnon_weekly_reset_epoch={reset_epoch}\n"
+        ),
+    )
+    .expect("write cache");
+
+    // Keep the invalid entry readable while preventing the successful live
+    // request from replacing it before collect_async_round performs reset
+    // metadata backfill.
+    let mut read_only = fs::metadata(cache_dir)
+        .expect("cache metadata")
+        .permissions();
+    read_only.set_mode(0o555);
+    fs::set_permissions(cache_dir, read_only).expect("make cache read-only");
+
+    let server = LoopbackServer::new().expect("server");
+    server.add_route(
+        "GET",
+        "/wham/usage",
+        HttpResponse::new(
+            200,
+            r#"{
+  "rate_limit": {
+    "primary_window": { "limit_window_seconds": 18000, "used_percent": 6, "reset_at": 0 },
+    "secondary_window": null
+  }
+}"#,
+        ),
+    );
+
+    let output = run(
+        &["diag", "rate-limits", "--async"],
+        &[
+            ("CODEX_SECRET_DIR", &secret_dir),
+            ("ZSH_CACHE_DIR", &cache_root),
+        ],
+        &[
+            ("CODEX_CHATGPT_BASE_URL", &server.url()),
+            ("CODEX_RATE_LIMITS_DEFAULT_ALL_ENABLED", "false"),
+        ],
+    );
+
+    let mut writable = fs::metadata(cache_dir)
+        .expect("cache metadata")
+        .permissions();
+    writable.set_mode(0o700);
+    fs::set_permissions(cache_dir, writable).expect("restore cache permissions");
+
+    assert_exit(&output, 0);
+    let out = stdout(&output);
+    assert!(out.contains("94%"), "expected live 5h value, got:\n{out}");
+    assert!(
+        !out.contains("10d"),
+        "invalid cached reset metadata leaked into live row:\n{out}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn rate_limits_async_partial_live_does_not_backfill_expired_cache_reset() {
+    assert_partial_live_ignores_invalid_reset_cache(now_epoch().saturating_sub(600));
+}
+
+#[cfg(unix)]
+#[test]
+fn rate_limits_async_partial_live_does_not_backfill_future_invalid_cache_reset() {
+    assert_partial_live_ignores_invalid_reset_cache(now_epoch().saturating_add(30));
 }
 
 #[test]
