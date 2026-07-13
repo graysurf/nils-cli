@@ -141,6 +141,9 @@ Help:
   a command/path; default: `auto`).
 - `FZF_DEF_DELIM` and `FZF_DEF_DELIM_END`: Required delimiters for `env`, `alias`, `function`,
   `def`.
+- `FZF_DEF_EXTRA_ROOTS`: Platform path-list of additional `.zsh` files or directories to index.
+  Directories are scanned recursively with symlinks followed; duplicate physical files and files
+  below `.git` directories are ignored.
 - `FZF_DEF_DOC_CACHE_ENABLED`: Enable definition doc caching.
 - `FZF_DEF_DOC_CACHE_EXPIRE_MINUTES`: Cache TTL in minutes (default: `10`).
 - `FZF_DEF_DOC_SEPARATOR_PAD`: Padding lines between definition docs (default: `2`).
