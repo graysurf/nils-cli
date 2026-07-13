@@ -87,10 +87,10 @@ fn list_first_party_files(root: &Path, spinner: &Progress) -> Result<Vec<PathBuf
 }
 
 fn list_definition_files(root: &Path, spinner: &Progress) -> Result<Vec<PathBuf>> {
-    let mut files = list_first_party_files(root, spinner)?
-        .into_iter()
-        .map(|path| (path.clone(), path))
-        .collect::<BTreeMap<_, _>>();
+    let mut files = BTreeMap::new();
+    for path in list_first_party_files(root, spinner)? {
+        insert_canonical(&mut files, path);
+    }
 
     for extra_root in extra_roots() {
         if extra_root.is_file() {
@@ -168,8 +168,8 @@ fn is_zsh_file(path: &Path) -> bool {
 }
 
 fn insert_canonical(files: &mut BTreeMap<PathBuf, PathBuf>, path: PathBuf) {
-    let canonical = canonical_or_original(path);
-    files.entry(canonical.clone()).or_insert(canonical);
+    let canonical = canonical_or_original(path.clone());
+    files.entry(canonical).or_insert(path);
 }
 
 fn canonical_or_original(path: PathBuf) -> PathBuf {
