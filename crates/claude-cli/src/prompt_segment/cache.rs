@@ -6,6 +6,9 @@ use std::time::{Duration, SystemTime};
 
 const CACHE_FILE_NAME: &str = "usage.json";
 const MAX_CACHE_DISPLAY_AGE_SECONDS: u64 = 600;
+// Tolerate only small filesystem/server clock skew. A materially future mtime
+// must fail closed or it could keep old quota values eligible indefinitely.
+const MAX_FUTURE_CLOCK_SKEW: Duration = Duration::from_secs(5);
 
 pub fn cache_file() -> Option<PathBuf> {
     let dir = cache_dir()?;
@@ -45,6 +48,9 @@ fn cache_display_expired_at(path: &Path, now: SystemTime) -> bool {
         Ok(value) => value,
         Err(_) => return true,
     };
+    if let Ok(ahead) = modified.duration_since(now) {
+        return ahead > MAX_FUTURE_CLOCK_SKEW;
+    }
     let age = now.duration_since(modified).unwrap_or_default();
     age.as_secs() >= MAX_CACHE_DISPLAY_AGE_SECONDS
 }
@@ -112,5 +118,22 @@ mod tests {
             &path,
             modified + Duration::from_secs(600)
         ));
+    }
+
+    #[test]
+    fn cache_display_future_clock_tolerance_ends_after_5_seconds() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("usage.json");
+        std::fs::write(&path, "{}").expect("write");
+        let now = UNIX_EPOCH + Duration::from_secs(1_000);
+        let file = File::options().write(true).open(&path).expect("open");
+
+        file.set_modified(now + Duration::from_secs(5))
+            .expect("set modified within tolerance");
+        assert!(!cache_display_expired_at(&path, now));
+
+        file.set_modified(now + Duration::from_secs(6))
+            .expect("set modified beyond tolerance");
+        assert!(cache_display_expired_at(&path, now));
     }
 }

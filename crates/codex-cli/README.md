@@ -99,6 +99,12 @@ Auth examples:
   `--no-refresh-auth`, `--format <text|json>`, `--json`, `--one-line`, `--all`, `--async`, `--watch`, `--jobs <n>`.
 - `--cached` reads cache only. Freshness is controlled by `CODEX_RATE_LIMITS_CACHE_TTL` (default `3m`); stale cache is rejected unless
   `CODEX_RATE_LIMITS_CACHE_ALLOW_STALE=true`.
+- Cached quota values have a fixed display ceiling independent of the freshness
+  TTL: values are eligible through 599 seconds and omitted at 600 seconds.
+  `CODEX_RATE_LIMITS_CACHE_ALLOW_STALE=true` never bypasses this ceiling. A
+  `fetched_at` timestamp up to 5 seconds in the future is tolerated for clock
+  skew; a timestamp further ahead fails closed. Cache/auth files are retained,
+  and prompt refresh/retry continues without rendering expired percentages.
 - `--watch` refreshes output every 60 seconds until interrupted and requires `--async`.
 
 ### config

@@ -20,6 +20,9 @@ pub struct CacheEntry {
 
 const DEFAULT_CACHE_TTL_SECONDS: u64 = 180;
 const MAX_CACHE_DISPLAY_AGE_SECONDS: i64 = 600;
+// Tolerate only small provider/local clock skew. A materially future fetched_at
+// must fail closed or it could keep old quota values eligible indefinitely.
+const MAX_FUTURE_CLOCK_SKEW_SECONDS: i64 = 5;
 const CACHE_MISS_HINT: &str =
     "rerun without --cached to refresh, or set CODEX_RATE_LIMITS_CACHE_ALLOW_STALE=true";
 
@@ -175,8 +178,11 @@ fn cache_fetched_at_within_display_age_at(fetched_at_epoch: Option<i64>, now_epo
     let Some(fetched_at_epoch) = fetched_at_epoch.filter(|value| *value > 0) else {
         return false;
     };
-    if now_epoch <= 0 || fetched_at_epoch > now_epoch {
-        return true;
+    if now_epoch <= 0 {
+        return false;
+    }
+    if fetched_at_epoch > now_epoch {
+        return fetched_at_epoch.saturating_sub(now_epoch) <= MAX_FUTURE_CLOCK_SKEW_SECONDS;
     }
     now_epoch.saturating_sub(fetched_at_epoch) < MAX_CACHE_DISPLAY_AGE_SECONDS
 }
@@ -762,6 +768,34 @@ mod tests {
     fn cache_display_age_boundary_is_600_seconds() {
         assert!(cache_fetched_at_within_display_age_at(Some(1_000), 1_599));
         assert!(!cache_fetched_at_within_display_age_at(Some(1_000), 1_600));
+    }
+
+    #[test]
+    fn cache_display_future_clock_tolerance_ends_after_5_seconds() {
+        assert!(cache_fetched_at_within_display_age_at(Some(1_005), 1_000));
+        assert!(!cache_fetched_at_within_display_age_at(Some(1_006), 1_000));
+    }
+
+    #[test]
+    fn cached_mode_allow_stale_does_not_bypass_max_display_age() {
+        let lock = GlobalStateLock::new();
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let secret_dir = dir.path().join("secrets");
+        let cache_root = dir.path().join("cache");
+        fs::create_dir_all(&secret_dir).expect("secret dir");
+        fs::create_dir_all(&cache_root).expect("cache root");
+        let _env = set_cache_env(&lock, &secret_dir, &cache_root);
+        let _allow_stale = EnvGuard::set(&lock, "CODEX_RATE_LIMITS_CACHE_ALLOW_STALE", "true");
+
+        let target = secret_dir.join("alpha.json");
+        fs::write(&target, "{}").expect("write target");
+        let values = complete_weekly_values("5h", 91, 12, 1_700_600_000, Some(1_700_003_600));
+        let fetched_at = Utc::now().timestamp().saturating_sub(600);
+        write_prompt_segment_cache(&target, fetched_at, &values).expect("write cache");
+
+        let error = read_cache_entry_for_cached_mode(&target)
+            .expect_err("allow-stale must not bypass max display age");
+        assert!(error.to_string().contains("maximum display age"));
     }
 
     #[test]

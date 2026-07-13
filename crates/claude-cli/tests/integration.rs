@@ -586,6 +586,27 @@ fn prompt_segment_does_not_render_cache_older_than_max_stale_age() {
 }
 
 #[test]
+fn prompt_segment_status_reports_expired_cache_without_rendering() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let cache_file = write_cache(tmp.path(), &usage_json(25.0, 50.0));
+    set_modified(&cache_file, SystemTime::now() - Duration::from_secs(601));
+
+    let output = run(
+        &["prompt-segment", "status", "--format", "json"],
+        &base_options(tmp.path())
+            .with_env("CLAUDE_PROMPT_SEGMENT_ACCESS_TOKEN", "secret-token-status"),
+    );
+
+    assert_exit(&output, 0);
+    let payload: Value = serde_json::from_str(&stdout(&output)).expect("json");
+    assert_eq!(payload["result"]["cache_exists"], true);
+    assert_eq!(payload["result"]["cache_stale"], true);
+    assert_eq!(payload["result"]["would_render"], false);
+    assert_eq!(payload["result"]["reason"], "cache-expired");
+    assert!(cache_file.is_file(), "status must not delete expired cache");
+}
+
+#[test]
 fn usage_cache_source_omits_windows_older_than_max_stale_age() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let cache_file = write_cache(tmp.path(), &usage_json(25.0, 50.0));
