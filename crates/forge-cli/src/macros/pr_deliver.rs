@@ -36,8 +36,8 @@ use crate::config::ForgeConfig;
 use crate::error::ForgeError;
 use crate::ops::label::{LabelTarget, validate_label_inputs};
 use crate::ops::pr_create::{
-    self, Environment, VerifiedTestFirstSubject, evidence_repository_id, find_git_toplevel,
-    test_first_gate, validate_provider_subject_head,
+    self, Environment, VerifiedTestFirstSubject, evidence_remote_url, evidence_repository_id,
+    find_git_toplevel, test_first_gate, validate_provider_subject_head,
 };
 use crate::ops::pr_view::PrViewPayload;
 use crate::ops::pr_wait_checks::{Clock, SystemClock, WaitOutcome};
@@ -248,15 +248,13 @@ fn execute_sequence<R: BackendRunner, C: Clock>(
                 args.kind.into_kind(),
                 nils_common::git::PrKind::Feature | nils_common::git::PrKind::Bug
             );
-        let remote_url = if gate_applies
-            && ctx.provider == Provider::Local
-            && global.repo.is_none()
-            && ctx.repo.is_none()
-        {
-            git_remote_url(&global.remote)
-        } else {
-            None
-        };
+        let remote_url = evidence_remote_url(
+            gate_applies,
+            ctx,
+            global.repo.as_deref(),
+            &global.remote,
+            git_remote_url,
+        );
         let repository_id = gate_applies
             .then(|| evidence_repository_id(ctx, remote_url.as_deref(), global.repo.as_deref()))
             .flatten();
@@ -813,15 +811,13 @@ fn emit_dry_run(
             args.kind.into_kind(),
             nils_common::git::PrKind::Feature | nils_common::git::PrKind::Bug
         );
-    let remote_url = if gate_applies
-        && ctx.provider == Provider::Local
-        && global.repo.is_none()
-        && ctx.repo.is_none()
-    {
-        git_remote_url(&global.remote)
-    } else {
-        None
-    };
+    let remote_url = evidence_remote_url(
+        gate_applies,
+        ctx,
+        global.repo.as_deref(),
+        &global.remote,
+        git_remote_url,
+    );
     let repository_id = gate_applies
         .then(|| evidence_repository_id(ctx, remote_url.as_deref(), global.repo.as_deref()))
         .flatten();

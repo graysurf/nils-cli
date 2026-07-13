@@ -24,6 +24,36 @@ fn rate_limits_client_read_tokens_supports_root_account_id() {
 }
 
 #[test]
+fn rate_limits_client_distinguishes_token_source_failures_from_missing_tokens() {
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let malformed = write_target(&dir, "not-json");
+    let missing = dir.path().join("missing.json");
+    let no_token = dir.path().join("no-token.json");
+    fs::write(&no_token, "{}").expect("write tokenless target");
+
+    for (target_file, expected) in [
+        (malformed, ProviderUsageReason::Unknown),
+        (missing, ProviderUsageReason::Unknown),
+        (no_token, ProviderUsageReason::AuthRequired),
+    ] {
+        let request = UsageRequest {
+            target_file,
+            refresh_on_401: false,
+            suppress_auth_refresh_output: false,
+            base_url: "http://127.0.0.1:9".to_string(),
+            connect_timeout_seconds: 1,
+            max_time_seconds: 1,
+        };
+
+        let err = match fetch_usage(&request) {
+            Ok(_) => panic!("invalid token source must fail before fetch"),
+            Err(err) => err,
+        };
+        assert_eq!(err.reason(), expected);
+    }
+}
+
+#[test]
 fn rate_limits_client_fetch_usage_errors_are_classified_without_body_preview() {
     let server = LoopbackServer::new().expect("server");
     server.add_route(

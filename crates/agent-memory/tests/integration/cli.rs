@@ -1005,6 +1005,42 @@ fn candidate_promotion_removes_native_index_filename_reference() {
 }
 
 #[test]
+fn candidate_promotion_preserves_unrelated_suffix_filename_reference() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    seed_recall_layout(tmp.path());
+    let producer = tmp.path().join("candidates/codex");
+    fs::write(producer.join("foo.md"), "Target candidate.\n").expect("target candidate");
+    fs::write(producer.join("myfoo.md"), "Unrelated candidate.\n").expect("unrelated candidate");
+    fs::write(
+        producer.join("MEMORY.md"),
+        "# Native index\n\nRemember foo.md as the target.\nRemember myfoo.md as unrelated.\n",
+    )
+    .expect("native index");
+
+    let out = run(
+        tmp.path(),
+        &[
+            "candidate",
+            "promote",
+            "codex",
+            "foo",
+            "--type",
+            "reference",
+            "--description",
+            "Target candidate",
+            "--session-id",
+            "00000000-0000-0000-0000-000000000000",
+            "--apply",
+        ],
+    );
+    assert_eq!(out.code, 0, "stderr={}", out.stderr_text());
+    let index = fs::read_to_string(producer.join("MEMORY.md")).expect("candidate index");
+    assert!(!index.contains("Remember foo.md as the target."), "{index}");
+    assert!(index.contains("Remember myfoo.md as unrelated."), "{index}");
+    assert!(producer.join("myfoo.md").is_file());
+}
+
+#[test]
 fn candidate_promotion_rejects_multiline_metadata_without_writes() {
     for (label, extra) in [
         (
