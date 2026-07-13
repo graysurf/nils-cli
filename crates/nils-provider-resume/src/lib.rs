@@ -406,9 +406,10 @@ pub struct CodexSessionMeta {
 
 /// Read the leading `session_meta` record from a Codex rollout file.
 ///
-/// Returns `None` unless the first line is a CLI-origin `session_meta` record
-/// with a non-empty id, a cwd, and a parseable timestamp. The first line is
-/// size-bounded so a pathological file cannot exhaust memory.
+/// Returns `None` unless the first line is an interactive `session_meta` record
+/// labeled with Codex's `cli` or `vscode` source, with a non-empty id, a cwd,
+/// and a parseable timestamp. The first line is size-bounded so a pathological
+/// file cannot exhaust memory.
 pub fn read_codex_session_meta(path: &Path) -> Option<CodexSessionMeta> {
     let file = fs::File::open(path).ok()?;
     let mut reader = io::BufReader::new(file).take(CODEX_SESSION_META_MAX_LINE_BYTES + 1);
@@ -430,7 +431,10 @@ pub fn read_codex_session_meta(path: &Path) -> Option<CodexSessionMeta> {
     }
     let payload = value.get("payload")?;
     let cwd = payload.get("cwd").and_then(Value::as_str)?.to_string();
-    if payload.get("source").and_then(Value::as_str)? != "cli" {
+    if !matches!(
+        payload.get("source").and_then(Value::as_str)?,
+        "cli" | "vscode"
+    ) {
         return None;
     }
     let session_id = payload
@@ -554,17 +558,29 @@ mod tests {
     use super::*;
 
     #[test]
-    fn codex_session_meta_reader_matches_only_cli_source_and_cwd() {
+    fn codex_session_meta_reader_accepts_resumable_interactive_sources() {
         let tmp = tempfile::TempDir::new().unwrap();
         let path = tmp.path().join("rollout.jsonl");
+
+        for source in ["cli", "vscode"] {
+            fs::write(
+                &path,
+                format!(
+                    r#"{{"timestamp":"2099-01-01T00:00:00Z","type":"session_meta","payload":{{"id":"codex-id","session_id":"codex-id","cwd":"/repo","source":"{source}","originator":"codex-tui","timestamp":"2099-01-01T00:00:00Z"}}}}"#,
+                ),
+            )
+            .unwrap();
+            let meta = read_codex_session_meta(&path).expect("resumable session meta");
+            assert_eq!(meta.session_id, "codex-id");
+            assert_eq!(meta.cwd, "/repo");
+        }
+
         fs::write(
             &path,
-            r#"{"timestamp":"2099-01-01T00:00:00Z","type":"session_meta","payload":{"id":"codex-id","session_id":"codex-id","cwd":"/repo","source":"cli","timestamp":"2099-01-01T00:00:00Z"}}"#,
+            r#"{"timestamp":"2099-01-01T00:00:00Z","type":"session_meta","payload":{"id":"exec-id","cwd":"/repo","source":"exec","originator":"codex_exec","timestamp":"2099-01-01T00:00:00Z"}}"#,
         )
         .unwrap();
-        let meta = read_codex_session_meta(&path).expect("session meta");
-        assert_eq!(meta.session_id, "codex-id");
-        assert_eq!(meta.cwd, "/repo");
+        assert_eq!(read_codex_session_meta(&path), None);
 
         fs::write(
             &path,
@@ -614,7 +630,7 @@ mod tests {
         fs::create_dir_all(&sessions).unwrap();
         fs::write(
             sessions.join("rollout.jsonl"),
-            r#"{"timestamp":"2099-01-01T00:00:00Z","type":"session_meta","payload":{"id":"target-id","session_id":"target-id","cwd":"/repo/one","source":"cli","timestamp":"2099-01-01T00:00:00Z"}}"#,
+            r#"{"timestamp":"2099-01-01T00:00:00Z","type":"session_meta","payload":{"id":"target-id","session_id":"target-id","cwd":"/repo/one","source":"vscode","originator":"codex-tui","timestamp":"2099-01-01T00:00:00Z"}}"#,
         )
         .unwrap();
 
