@@ -13,6 +13,14 @@ use std::process::Command;
 use pretty_assertions::assert_eq;
 use tempfile::TempDir;
 
+use forge_cli::backend::{BackendCall, BackendRunner, BackendSuccess};
+use forge_cli::cli::{GlobalFlags, MergeMethodFlag, PrDeliverArgs, PrKindFlag, ProviderFlag};
+use forge_cli::error::ForgeError;
+use forge_cli::macros::pr_deliver;
+use forge_cli::ops::pr_wait_checks::SystemClock;
+use nils_common::cli_contract::OutputFormat;
+use nils_test_support::fixtures::SubjectBoundEvidenceFixture;
+
 use super::support::{CmdOutput, StubEnv, parse_envelope, run_forge_cli_in, write_label_catalog};
 
 const FIXTURE_CREATE_STDOUT: &str = include_str!("../fixtures/github/pr_create/create_stdout.txt");
@@ -209,65 +217,47 @@ fn make_git_repo() -> TempDir {
     tempdir
 }
 
-fn make_subject_bound_git_repo() -> (TempDir, PathBuf, String) {
-    let tempdir = make_git_repo();
-    let repo = tempdir.path().join("repo");
-    fs::write(
-        repo.join(".forge-cli.toml"),
-        "[test_first]\nrequire = true\n",
-    )
-    .expect("forge config");
-    git(&repo, &["add", ".forge-cli.toml"]);
-    git(&repo, &["commit", "-q", "-m", "enable test-first gate"]);
-    update_upstream_ref(&repo);
-
-    let evidence = tempdir.path().join("evidence");
-    fs::create_dir_all(&evidence).expect("evidence dir");
-    fs::write(
-        evidence.join("test-first-evidence.json"),
-        r#"{"schema_version":"test-first-evidence.record.v2","change_classification":"behavior-change","contract_delta":{"changed_behaviors":["durable gate"]},"no_existing_tests_reason":"fixture has no existing tests","waiver":{"reason":"fixture","kind":"non-testable","why_no_red":"fixture path","substitute_validation":["cargo test"]},"final_validations":[{"command":"cargo test","status":"pass","scope":"focused"}],"no_residual_gaps":true}"#,
-    )
-    .expect("evidence record");
+fn bind_test_first_phase(phase: &str, repo: &Path, evidence: &Path) -> i32 {
     let evidence_arg = evidence.to_string_lossy().to_string();
     let repo_arg = repo.to_string_lossy().to_string();
-    assert_eq!(
-        agent_workflow_primitives::test_first_evidence::run_with_args([
-            "test-first-evidence",
-            "bind-baseline",
-            "--out",
-            &evidence_arg,
-            "--project-path",
-            &repo_arg,
-        ]),
-        0
-    );
+    agent_workflow_primitives::test_first_evidence::run_with_args([
+        "test-first-evidence",
+        phase,
+        "--out",
+        &evidence_arg,
+        "--project-path",
+        &repo_arg,
+    ])
+}
 
-    fs::write(repo.join("delivery.txt"), "delivery\n").expect("delivery");
-    git(&repo, &["add", "delivery.txt"]);
-    git(&repo, &["commit", "-q", "-m", "delivery"]);
-    update_upstream_ref(&repo);
-    assert_eq!(
-        agent_workflow_primitives::test_first_evidence::run_with_args([
-            "test-first-evidence",
-            "bind-delivery",
-            "--out",
-            &evidence_arg,
-            "--project-path",
-            &repo_arg,
-        ]),
-        0
+fn make_subject_bound_git_repo() -> (SubjectBoundEvidenceFixture, PathBuf, String) {
+    let fixture = SubjectBoundEvidenceFixture::new(
+        "https://github.com/sympoies/nils-cli.git",
+        &[(".forge-cli.toml", "[test_first]\nrequire = true\n")],
+        bind_test_first_phase,
     );
-    let head = git_output(&repo, &["rev-parse", "HEAD"]);
-    (tempdir, evidence, head)
+    git(&fixture.repo, &["checkout", "-q", "-b", "feat/sample"]);
+    update_upstream_ref(&fixture.repo);
+    let head = git_output(&fixture.repo, &["rev-parse", "HEAD"]);
+    let evidence = fixture.evidence.clone();
+    (fixture, evidence, head)
 }
 
 fn update_upstream_ref(repo: &Path) {
     let head = git_output(repo, &["rev-parse", "HEAD"]);
-    fs::write(
-        repo.join(".git/refs/remotes/origin/feat/sample"),
-        format!("{head}\n"),
-    )
-    .expect("upstream ref");
+    let upstream = repo.join(".git/refs/remotes/origin/feat/sample");
+    fs::create_dir_all(upstream.parent().expect("upstream parent"))
+        .expect("create upstream ref parent");
+    fs::write(upstream, format!("{head}\n")).expect("upstream ref");
+    git(
+        repo,
+        &[
+            "branch",
+            "-q",
+            "--set-upstream-to=origin/feat/sample",
+            "feat/sample",
+        ],
+    );
 }
 
 fn git_output(repo: &Path, args: &[&str]) -> String {
@@ -1356,8 +1346,8 @@ fn pr_deliver_full_chain_emits_all_seven_steps_with_merge_sha() {
 
 #[test]
 fn pr_deliver_gate_enabled_create_preserves_attested_head_through_merge_cas() {
-    let (tempdir, evidence, head) = make_subject_bound_git_repo();
-    let repo_path = tempdir.path().join("repo");
+    let (fixture, evidence, head) = make_subject_bound_git_repo();
+    let repo_path = fixture.repo.clone();
     let pre_view = view_with_head_oid(FULL_PR_VIEW_JSON, &head);
     let post_view = view_with_head_oid(MERGED_PR_VIEW_JSON, &head);
 
@@ -1402,8 +1392,8 @@ fn pr_deliver_gate_enabled_create_preserves_attested_head_through_merge_cas() {
 
 #[test]
 fn pr_deliver_gate_enabled_adopt_preserves_attested_head_through_merge_cas() {
-    let (tempdir, evidence, head) = make_subject_bound_git_repo();
-    let repo_path = tempdir.path().join("repo");
+    let (fixture, evidence, head) = make_subject_bound_git_repo();
+    let repo_path = fixture.repo.clone();
     let pre_view = view_with_head_oid(ADOPTABLE_PR_VIEW_JSON, &head);
 
     let stub = StubEnv::new();
@@ -1446,6 +1436,130 @@ fn pr_deliver_gate_enabled_adopt_preserves_attested_head_through_merge_cas() {
         args.contains(&format!("--match-head-commit {head}")),
         "merge CAS missing attested head: {args}"
     );
+}
+
+struct LocalAdoptRunner {
+    head: String,
+}
+
+fn local_deliver_args(evidence: &Path) -> PrDeliverArgs {
+    PrDeliverArgs {
+        kind: PrKindFlag::Feature,
+        title: "feat: subject-bound local delivery".into(),
+        body: Some("## Summary\n\nBound.\n\n## Test plan\n\nVerified.\n".into()),
+        body_file: None,
+        head: Some("feat/sample".into()),
+        base: Some("main".into()),
+        method: MergeMethodFlag::Squash,
+        reviewers: Vec::new(),
+        labels: Vec::new(),
+        label_catalog: None,
+        strict_labels: false,
+        test_first_evidence: Some(evidence.to_string_lossy().to_string()),
+        timeout: std::time::Duration::from_secs(5),
+        no_merge: true,
+        no_issue_closeout: false,
+        allow_non_default_base: false,
+        allow_unresolved_threads: false,
+        allow_unchecked_tasks: false,
+        allow_unchecked_tasks_reason: None,
+    }
+}
+
+impl BackendRunner for LocalAdoptRunner {
+    fn run(&self, call: &BackendCall) -> Result<BackendSuccess, ForgeError> {
+        let argv: Vec<String> = call
+            .argv
+            .iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        let (stdout, stderr) = match (
+            argv.first().map(String::as_str),
+            argv.get(1).map(String::as_str),
+        ) {
+            (Some("auth"), Some("status")) => (
+                String::new(),
+                "local\n  ✓ Logged in to local account tester (test)\n".to_string(),
+            ),
+            (Some("repo"), Some("view")) => (
+                serde_json::json!({
+                    "name": "nils-cli",
+                    "owner": {"login": "sympoies"},
+                    "defaultBranchRef": {"name": "main"},
+                    "mergeCommitAllowed": true,
+                    "squashMergeAllowed": true,
+                    "rebaseMergeAllowed": true,
+                    "url": "https://github.com/sympoies/nils-cli"
+                })
+                .to_string(),
+                String::new(),
+            ),
+            (Some("pr"), Some("list")) => (
+                serde_json::json!([{
+                    "number": 123,
+                    "url": "local://sympoies/nils-cli/pull/123",
+                    "state": "OPEN",
+                    "title": "feat: subject-bound local delivery",
+                    "headRefName": "feat/sample",
+                    "author": {"login": "tester"}
+                }])
+                .to_string(),
+                String::new(),
+            ),
+            (Some("pr"), Some("view")) => (
+                serde_json::json!({
+                    "number": 123,
+                    "url": "local://sympoies/nils-cli/pull/123",
+                    "state": "OPEN",
+                    "isDraft": true,
+                    "title": "feat: subject-bound local delivery",
+                    "headRefName": "feat/sample",
+                    "headRefOid": self.head,
+                    "baseRefName": "main",
+                    "mergeable": "MERGEABLE",
+                    "mergedAt": null,
+                    "labels": [],
+                    "body": "## Summary\n\nBound.\n\n## Test plan\n\nVerified.\n"
+                })
+                .to_string(),
+                String::new(),
+            ),
+            _ => panic!("unexpected local adopt backend call: {argv:?}"),
+        };
+        Ok(BackendSuccess { stdout, stderr })
+    }
+}
+
+#[test]
+fn pr_deliver_local_adopt_uses_remote_identity_for_bound_evidence() {
+    let (fixture, evidence, head) = make_subject_bound_git_repo();
+    let repo_path = fixture.repo.clone();
+    let store = fixture.root.join("store");
+    fs::create_dir_all(store.join("prs")).unwrap();
+    fs::write(
+        store.join("prs/123.json"),
+        r#"{"number":123,"state":"OPEN","merged":false,"merge_sha":null,"checks":"success","required_state":"success","required_count":1,"non_required_failures":[]}"#,
+    )
+    .unwrap();
+
+    let global = GlobalFlags {
+        format: Some(OutputFormat::Json),
+        remote: "origin".into(),
+        provider: Some(ProviderFlag::Local),
+        repo: None,
+        store_root: Some(store),
+        dry_run: false,
+    };
+    let code = pr_deliver::run_with(
+        &LocalAdoptRunner { head },
+        &SystemClock,
+        &global,
+        local_deliver_args(&evidence),
+        OutputFormat::Json,
+        &repo_path,
+    )
+    .expect("remote-bound evidence should pass the local adopt path");
+    assert_eq!(code, nils_common::cli_contract::exit::SUCCESS);
 }
 
 #[test]

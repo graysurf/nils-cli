@@ -2,7 +2,7 @@ use std::fs;
 use std::path::Path;
 
 use nils_test_support::fixtures::{
-    GraphqlSetupFixture, RestSetupFixture, SuiteFixture, write_text,
+    GraphqlSetupFixture, RestSetupFixture, SubjectBoundEvidenceFixture, SuiteFixture, write_text,
 };
 
 #[test]
@@ -84,4 +84,26 @@ fn write_text_creates_parent_dirs() {
     let path = temp.path().join("nested/dir/file.txt");
     let written = write_text(&path, "hello\n");
     assert_eq!(fs::read_to_string(written).unwrap(), "hello\n");
+}
+
+#[test]
+fn subject_bound_evidence_fixture_owns_setup_and_binding_order() {
+    let phases = std::cell::RefCell::new(Vec::new());
+    let fixture = SubjectBoundEvidenceFixture::new(
+        "https://github.com/acme/widgets.git",
+        &[(".forge-cli.toml", "[test_first]\nrequire = true\n")],
+        |phase, repo, evidence| {
+            phases.borrow_mut().push(phase.to_string());
+            assert!(repo.join(".git").is_dir());
+            assert!(evidence.join("test-first-evidence.json").is_file());
+            0
+        },
+    );
+
+    assert_eq!(phases.into_inner(), vec!["bind-baseline", "bind-delivery"]);
+    assert!(fixture.repo.join("delivery.txt").is_file());
+    assert_eq!(
+        fs::read_to_string(fixture.repo.join(".forge-cli.toml")).unwrap(),
+        "[test_first]\nrequire = true\n"
+    );
 }

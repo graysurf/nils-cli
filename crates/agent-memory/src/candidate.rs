@@ -658,13 +658,26 @@ fn remove_candidate_link(original: &str, slug: &str) -> String {
     let marker = format!("{slug}.md");
     let retained: Vec<_> = original
         .lines()
-        .filter(|line| !line.contains(&marker))
+        .filter(|line| !line_references_candidate(line, &marker))
         .collect();
     let mut updated = retained.join("\n");
     if original.ends_with('\n') {
         updated.push('\n');
     }
     updated
+}
+
+fn line_references_candidate(line: &str, filename: &str) -> bool {
+    line.match_indices(filename).any(|(start, matched)| {
+        let previous = line[..start].bytes().next_back();
+        let next = line[start + matched.len()..].bytes().next();
+        previous.is_none_or(|byte| !is_filename_byte(byte))
+            && next.is_none_or(|byte| !is_filename_byte(byte))
+    })
+}
+
+fn is_filename_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_')
 }
 
 fn write_atomic(path: &Path, contents: &str) -> Result<(), CliError> {

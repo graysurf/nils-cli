@@ -53,7 +53,7 @@ impl std::error::Error for UsageFetchError {}
 
 pub fn fetch_usage(request: &UsageRequest) -> Result<UsageResponse, UsageFetchError> {
     let (access_token, account_id) = read_tokens(&request.target_file)
-        .map_err(|_| UsageFetchError::new(ProviderUsageReason::AuthRequired))?;
+        .map_err(|error| UsageFetchError::new(token_read_failure_reason(&error)))?;
     let mut response = send_request(request, &access_token, account_id.as_deref())?;
 
     if response.status == 401 && request.refresh_on_401 {
@@ -79,6 +79,16 @@ pub fn fetch_usage(request: &UsageRequest) -> Result<UsageResponse, UsageFetchEr
         body: response.body,
         json,
     })
+}
+
+fn token_read_failure_reason(error: &anyhow::Error) -> ProviderUsageReason {
+    if error.downcast_ref::<std::io::Error>().is_some()
+        || error.downcast_ref::<serde_json::Error>().is_some()
+    {
+        ProviderUsageReason::Unknown
+    } else {
+        ProviderUsageReason::AuthRequired
+    }
 }
 
 pub fn read_tokens(target_file: &Path) -> Result<(String, Option<String>)> {

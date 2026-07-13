@@ -36,8 +36,8 @@ use crate::config::ForgeConfig;
 use crate::error::ForgeError;
 use crate::ops::label::{LabelTarget, validate_label_inputs};
 use crate::ops::pr_create::{
-    self, Environment, VerifiedTestFirstSubject, evidence_repository_id, find_git_toplevel,
-    test_first_gate, validate_provider_subject_head,
+    self, Environment, VerifiedTestFirstSubject, evidence_remote_url, evidence_repository_id,
+    find_git_toplevel, test_first_gate, validate_provider_subject_head,
 };
 use crate::ops::pr_view::PrViewPayload;
 use crate::ops::pr_wait_checks::{Clock, SystemClock, WaitOutcome};
@@ -248,15 +248,13 @@ fn execute_sequence<R: BackendRunner, C: Clock>(
                 args.kind.into_kind(),
                 nils_common::git::PrKind::Feature | nils_common::git::PrKind::Bug
             );
-        let remote_url = if gate_applies
-            && ctx.provider == Provider::Local
-            && global.repo.is_none()
-            && ctx.repo.is_none()
-        {
-            git_remote_url(&global.remote)
-        } else {
-            None
-        };
+        let remote_url = evidence_remote_url(
+            gate_applies,
+            ctx,
+            global.repo.as_deref(),
+            &global.remote,
+            git_remote_url,
+        );
         let repository_id = gate_applies
             .then(|| evidence_repository_id(ctx, remote_url.as_deref(), global.repo.as_deref()))
             .flatten();
@@ -738,6 +736,19 @@ fn emit_dry_run(
     workdir: &Path,
     global: &GlobalFlags,
 ) -> i32 {
+    let payload = build_dry_run_payload(ctx, args, workdir, global, git_remote_url);
+    let envelope = Envelope::success(schema_version_for(BINARY, SCHEMA, SCHEMA_VERSION), payload);
+    write_envelope(&envelope, format);
+    nils_common::cli_contract::exit::SUCCESS
+}
+
+fn build_dry_run_payload(
+    ctx: &ProviderContext,
+    args: &PrDeliverArgs,
+    workdir: &Path,
+    global: &GlobalFlags,
+    remote_url_lookup: impl FnOnce(&str) -> Option<String>,
+) -> PrDeliverDryRun {
     let branch = match &args.head {
         Some(head) => head.clone(),
         None => git_current_branch(workdir).unwrap_or_default(),
@@ -813,15 +824,13 @@ fn emit_dry_run(
             args.kind.into_kind(),
             nils_common::git::PrKind::Feature | nils_common::git::PrKind::Bug
         );
-    let remote_url = if gate_applies
-        && ctx.provider == Provider::Local
-        && global.repo.is_none()
-        && ctx.repo.is_none()
-    {
-        git_remote_url(&global.remote)
-    } else {
-        None
-    };
+    let remote_url = evidence_remote_url(
+        gate_applies,
+        ctx,
+        global.repo.as_deref(),
+        &global.remote,
+        remote_url_lookup,
+    );
     let repository_id = gate_applies
         .then(|| evidence_repository_id(ctx, remote_url.as_deref(), global.repo.as_deref()))
         .flatten();
@@ -836,16 +845,13 @@ fn emit_dry_run(
         local_preflight.push(verdict);
     }
 
-    let payload = PrDeliverDryRun {
+    PrDeliverDryRun {
         provider: ctx.provider.as_str(),
         kind: args.kind.as_str(),
         plan_steps,
         no_merge: args.no_merge,
         local_preflight,
-    };
-    let envelope = Envelope::success(schema_version_for(BINARY, SCHEMA, SCHEMA_VERSION), payload);
-    write_envelope(&envelope, format);
-    nils_common::cli_contract::exit::SUCCESS
+    }
 }
 
 fn pr_lookup_dry_plan(ctx: &ProviderContext, head: &str) -> Vec<String> {
@@ -1118,6 +1124,7 @@ mod tests {
     use crate::cli::{MergeMethodFlag, PrKindFlag};
     use crate::ops::pr_checks::{CheckItem, PrChecksPayload};
     use crate::provider::DetectionSource;
+    use nils_test_support::fixtures::SubjectBoundEvidenceFixture;
     use pretty_assertions::assert_eq;
 
     fn ctx() -> ProviderContext {
@@ -1220,6 +1227,55 @@ mod tests {
             allow_unchecked_tasks: false,
             allow_unchecked_tasks_reason: None,
         }
+    }
+
+    fn bind_test_first_phase(phase: &str, repo: &Path, evidence: &Path) -> i32 {
+        let evidence_arg = evidence.to_string_lossy().to_string();
+        let repo_arg = repo.to_string_lossy().to_string();
+        agent_workflow_primitives::test_first_evidence::run_with_args([
+            "test-first-evidence",
+            phase,
+            "--out",
+            &evidence_arg,
+            "--project-path",
+            &repo_arg,
+        ])
+    }
+
+    #[test]
+    fn local_dry_run_uses_remote_identity_for_bound_evidence() {
+        let fixture = SubjectBoundEvidenceFixture::new(
+            "https://github.com/sympoies/nils-cli.git",
+            &[(".forge-cli.toml", "[test_first]\nrequire = true\n")],
+            bind_test_first_phase,
+        );
+        let context = ProviderContext {
+            provider: Provider::Local,
+            host: "local".into(),
+            source: DetectionSource::Flag,
+            repo: Some("sympoies/nils-cli".into()),
+        };
+        let global = GlobalFlags {
+            format: Some(OutputFormat::Json),
+            remote: "origin".into(),
+            provider: Some(crate::cli::ProviderFlag::Local),
+            repo: None,
+            store_root: None,
+            dry_run: true,
+        };
+        let mut deliver = args(true);
+        deliver.head = Some("main".into());
+        deliver.test_first_evidence = Some(fixture.evidence.to_string_lossy().to_string());
+
+        let payload = build_dry_run_payload(&context, &deliver, &fixture.repo, &global, |_| {
+            Some("https://github.com/sympoies/nils-cli.git".into())
+        });
+        let verdict = payload
+            .local_preflight
+            .iter()
+            .find(|item| item.rule == "test_first")
+            .expect("test-first verdict");
+        assert!(verdict.ok, "verdict={verdict:?}");
     }
 
     #[test]

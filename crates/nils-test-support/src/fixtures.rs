@@ -1,5 +1,76 @@
 use std::path::{Path, PathBuf};
 
+use crate::git::{InitRepoOptions, commit_file, git, init_repo_at_with};
+
+const COMPLETE_TEST_FIRST_EVIDENCE: &str = r#"{"schema_version":"test-first-evidence.record.v2","change_classification":"behavior-change","contract_delta":{"changed_behaviors":["durable gate"]},"no_existing_tests_reason":"fixture has no existing tests","waiver":{"reason":"fixture","kind":"non-testable","why_no_red":"fixture path","substitute_validation":["cargo test"]},"final_validations":[{"command":"cargo test","status":"pass","scope":"focused"}],"no_residual_gaps":true}"#;
+
+pub struct SubjectBoundEvidenceFixture {
+    _temp: tempfile::TempDir,
+    pub root: PathBuf,
+    pub repo: PathBuf,
+    pub evidence: PathBuf,
+}
+
+impl SubjectBoundEvidenceFixture {
+    /// Creates a git repository plus a complete evidence record and delegates
+    /// the baseline/delivery subject binding to the consuming crate.
+    pub fn new(
+        remote: &str,
+        baseline_files: &[(&str, &str)],
+        bind: impl FnMut(&str, &Path, &Path) -> i32,
+    ) -> Self {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let root = temp.path().to_path_buf();
+        let repo = init_subject_repo(&root, "repo", remote);
+        for (path, contents) in baseline_files {
+            write_text(&repo.join(path), contents);
+        }
+        if !baseline_files.is_empty() {
+            git(&repo, &["add", "."]);
+            git(&repo, &["commit", "-m", "configure baseline"]);
+        }
+        let evidence = root.join("evidence");
+        bind_complete_test_first_evidence(&repo, &evidence, bind);
+        Self {
+            _temp: temp,
+            root,
+            repo,
+            evidence,
+        }
+    }
+}
+
+/// Creates a deterministic git repository with one initial commit and remote.
+pub fn init_subject_repo(root: &Path, name: &str, remote: &str) -> PathBuf {
+    let repo = root.join(name);
+    std::fs::create_dir_all(&repo).expect("create subject repo");
+    init_repo_at_with(
+        &repo,
+        InitRepoOptions::new()
+            .with_branch("main")
+            .with_initial_commit(),
+    );
+    git(&repo, &["remote", "add", "origin", remote]);
+    repo
+}
+
+/// Owns the canonical complete evidence fixture and its baseline/delivery
+/// lifecycle while the caller supplies the product-specific binding command.
+pub fn bind_complete_test_first_evidence(
+    repo: &Path,
+    evidence: &Path,
+    mut bind: impl FnMut(&str, &Path, &Path) -> i32,
+) {
+    std::fs::create_dir_all(evidence).expect("create evidence dir");
+    write_text(
+        &evidence.join("test-first-evidence.json"),
+        COMPLETE_TEST_FIRST_EVIDENCE,
+    );
+    assert_eq!(bind("bind-baseline", repo, evidence), 0);
+    commit_file(repo, "delivery.txt", "delivery\n", "delivery");
+    assert_eq!(bind("bind-delivery", repo, evidence), 0);
+}
+
 pub struct RestSetupFixture {
     _temp: tempfile::TempDir,
     pub root: PathBuf,

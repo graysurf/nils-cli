@@ -193,6 +193,20 @@ pub(crate) fn evidence_repository_id(
         .map(|repo| nils_common::git::canonical_repository_identity(&ctx.host, repo))
 }
 
+pub(crate) fn evidence_remote_url(
+    gate_applies: bool,
+    ctx: &ProviderContext,
+    explicit_repo: Option<&str>,
+    remote: &str,
+    lookup: impl FnOnce(&str) -> Option<String>,
+) -> Option<String> {
+    if gate_applies && ctx.provider == Provider::Local && explicit_repo.is_none() {
+        lookup(remote)
+    } else {
+        None
+    }
+}
+
 fn test_first_gate_applies(kind: PrKind, required: bool) -> bool {
     required && matches!(kind, PrKind::Feature | PrKind::Bug)
 }
@@ -410,15 +424,13 @@ pub fn run_with<R: BackendRunner>(
     worktree_clean(&env.workdir, |w| (env.git_status)(w))?;
     branch_pushed(&env.workdir, &head, |w, branch| (env.head_state)(w, branch))?;
     let gate_applies = test_first_gate_applies(kind, env.test_first_required);
-    let remote_url = if gate_applies
-        && ctx.provider == Provider::Local
-        && global.repo.is_none()
-        && ctx.repo.is_none()
-    {
-        (env.remote_url)(&global.remote)
-    } else {
-        None
-    };
+    let remote_url = evidence_remote_url(
+        gate_applies,
+        &ctx,
+        global.repo.as_deref(),
+        &global.remote,
+        |remote| (env.remote_url)(remote),
+    );
     let repository_id = gate_applies
         .then(|| evidence_repository_id(&ctx, remote_url.as_deref(), global.repo.as_deref()))
         .flatten();
@@ -547,15 +559,13 @@ fn compute_with_subject_inner<R: BackendRunner>(
     worktree_clean(&env.workdir, |w| (env.git_status)(w))?;
     branch_pushed(&env.workdir, &head, |w, branch| (env.head_state)(w, branch))?;
     let gate_applies = test_first_gate_applies(kind, env.test_first_required);
-    let remote_url = if gate_applies
-        && ctx.provider == Provider::Local
-        && global.repo.is_none()
-        && ctx.repo.is_none()
-    {
-        (env.remote_url)(&global.remote)
-    } else {
-        None
-    };
+    let remote_url = evidence_remote_url(
+        gate_applies,
+        &ctx,
+        global.repo.as_deref(),
+        &global.remote,
+        |remote| (env.remote_url)(remote),
+    );
     let repository_id = gate_applies
         .then(|| evidence_repository_id(&ctx, remote_url.as_deref(), global.repo.as_deref()))
         .flatten();
@@ -905,8 +915,9 @@ fn gitlab_is_draft(value: &serde_json::Value) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cli::PrKindFlag;
+    use crate::cli::{PrKindFlag, ProviderFlag};
     use crate::provider::{DetectionSource, Provider};
+    use nils_test_support::fixtures::{bind_complete_test_first_evidence, init_subject_repo};
     use pretty_assertions::assert_eq;
     use std::process::Command as GitCommand;
 
@@ -1291,51 +1302,22 @@ mod tests {
     }
 
     fn subject_repo(root: &Path, name: &str, remote: &str) -> PathBuf {
-        let repo = root.join(name);
-        std::fs::create_dir_all(&repo).unwrap();
-        git(&repo, &["init", "-q", "-b", "main"]);
-        git(&repo, &["config", "user.email", "test@example.com"]);
-        git(&repo, &["config", "user.name", "Tester"]);
-        git(&repo, &["config", "commit.gpgsign", "false"]);
-        std::fs::write(repo.join("README.md"), format!("{name}\n")).unwrap();
-        git(&repo, &["add", "README.md"]);
-        git(&repo, &["commit", "-q", "-m", "initial"]);
-        git(&repo, &["remote", "add", "origin", remote]);
-        repo
+        init_subject_repo(root, name, remote)
     }
 
     fn bind_evidence(repo: &Path, dir: &Path) {
-        write_evidence(
-            dir,
-            r#"{"schema_version":"test-first-evidence.record.v2","change_classification":"behavior-change","contract_delta":{"changed_behaviors":["durable gate"]},"no_existing_tests_reason":"fixture has no existing tests","waiver":{"reason":"fixture","kind":"non-testable","why_no_red":"fixture path","substitute_validation":["cargo test"]},"final_validations":[{"command":"cargo test","status":"pass","scope":"focused"}],"no_residual_gaps":true}"#,
-        );
-        let dir_arg = dir.to_string_lossy().to_string();
-        let repo_arg = repo.to_string_lossy().to_string();
-        assert_eq!(
+        bind_complete_test_first_evidence(repo, dir, |phase, repo, dir| {
+            let dir_arg = dir.to_string_lossy().to_string();
+            let repo_arg = repo.to_string_lossy().to_string();
             agent_workflow_primitives::test_first_evidence::run_with_args([
                 "test-first-evidence",
-                "bind-baseline",
+                phase,
                 "--out",
                 &dir_arg,
                 "--project-path",
                 &repo_arg,
-            ]),
-            0
-        );
-        std::fs::write(repo.join("delivery.txt"), "delivery\n").unwrap();
-        git(repo, &["add", "delivery.txt"]);
-        git(repo, &["commit", "-q", "-m", "delivery"]);
-        assert_eq!(
-            agent_workflow_primitives::test_first_evidence::run_with_args([
-                "test-first-evidence",
-                "bind-delivery",
-                "--out",
-                &dir_arg,
-                "--project-path",
-                &repo_arg,
-            ]),
-            0
-        );
+            ])
+        });
     }
 
     #[test]
@@ -1508,6 +1490,38 @@ mod tests {
         )
         .expect_err("another local history must not match");
         assert_eq!(err.kind(), "test_first_evidence_subject_mismatch");
+    }
+
+    #[test]
+    fn run_with_local_provider_uses_remote_identity_for_bound_evidence() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = subject_repo(tmp.path(), "repo", "git@github.com:o/r.git");
+        let evidence = tmp.path().join("evidence");
+        std::fs::create_dir_all(&evidence).unwrap();
+        bind_evidence(&repo, &evidence);
+        git(&repo, &["branch", "fix/local-evidence"]);
+
+        let env = Environment {
+            test_first_required: true,
+            workdir: repo,
+            ..passthrough_env()
+        };
+        let global = GlobalFlags {
+            format: Some(OutputFormat::Json),
+            remote: "origin".into(),
+            provider: Some(ProviderFlag::Local),
+            repo: None,
+            store_root: None,
+            dry_run: true,
+        };
+        let body = "## Summary\n\nyes.\n\n## Test plan\n\nverified.\n";
+        let mut create = args("fix: local evidence", PrKindFlag::Bug, Some(body));
+        create.head = Some("fix/local-evidence".into());
+        create.test_first_evidence = Some(evidence.to_string_lossy().to_string());
+
+        let code = run_with(&StubRunner, &global, create, OutputFormat::Json, &env)
+            .expect("remote-bound evidence should pass for local provider");
+        assert_eq!(code, nils_common::cli_contract::exit::SUCCESS);
     }
 
     #[test]
