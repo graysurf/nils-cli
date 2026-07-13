@@ -242,7 +242,21 @@ is no second state model.
   reduction. Projection loss disables an existing claim without interrupting
   the TUI transport. Direct TUI thread/turn creation is launch-fenced against
   auto-resume before forwarding; a busy state lock rejects only that request so
-  the user can retry. The visible TUI creates the fresh thread;
+  the user can retry. Control-plane Enter injection (either a named Enter key
+  or the raw CR/LF frame emitted by an attached terminal) already performs the
+  same cancellation while holding the lifecycle lock. A live proxy advertises
+  this coordination capability with a private, launch-bound, file-locked
+  marker; older live proxies reject HTTP submission, while attached input
+  disconnects without mutating auto-resume and requires session recreation.
+  Immediately before the submitting tmux operation, the sender opens a bounded
+  manual-input section. If ordinary
+  proxy cancellation reports Busy, only a valid `turn/start` for the exact
+  bound thread may hold that section's gate while it is forwarded. Gate teardown
+  completes before the sender releases the lifecycle lock and removes the
+  marker, preventing stale authorization of another lock holder. These markers
+  store no prompt, terminal content, or raw thread id; malformed, expired,
+  dead-process, and replacement-runtime state fails closed. The visible TUI
+  creates the fresh thread;
   neither the bridge nor the control client synthesizes a shell or model turn.
   A separate daemon control connection reads usage and submits a continuation
   on that bound thread. Only a mode-`0600` SHA-256 thread binding is persisted,

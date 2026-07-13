@@ -7,20 +7,21 @@
 
 use std::collections::{BTreeSet, VecDeque};
 use std::env;
-use std::fs;
-use std::io::Read;
+use std::fs::{self, OpenOptions};
+use std::io::{Read, Seek, SeekFrom};
 use std::os::fd::AsRawFd;
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::net::UnixDatagram;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
-use std::time::Duration;
-use std::time::Instant;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use futures_util::{SinkExt, StreamExt};
 use jiff::Timestamp;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use tokio::net::{UnixListener, UnixStream};
@@ -52,6 +53,16 @@ const CONTROL_RESPONSE_TIMEOUT: Duration = Duration::from_secs(10);
 const CONTROL_SUBMISSION_TIMEOUT: Duration = Duration::from_secs(15);
 const CONTROL_SUBMIT_TOTAL_TIMEOUT: Duration = Duration::from_secs(30);
 const MINIMUM_AUDITED_CODEX_VERSION: (u64, u64, u64) = (0, 144, 1);
+const MANUAL_INPUT_SECTION_FILE: &str = ".codex-app-server-manual-input";
+const MANUAL_INPUT_GATE_FILE: &str = ".codex-app-server-manual-input-gate";
+const MANUAL_INPUT_SECTION_VERSION: &str = "agent-session.codex-manual-input.v1";
+const MANUAL_INPUT_SECTION_TTL: Duration = Duration::from_secs(30);
+const MANUAL_INPUT_GATE_TIMEOUT: Duration = Duration::from_secs(12);
+const MANUAL_INPUT_ACK_TIMEOUT: Duration = Duration::from_millis(250);
+const PROXY_CAPABILITY_FILE: &str = ".codex-app-server-proxy-capability";
+const PROXY_CAPABILITY_VERSION: &str = "agent-session.codex-manual-input-proxy.v1";
+const PROXY_CAPABILITY_TTL: Duration = Duration::from_secs(365 * 24 * 60 * 60);
+const PROXY_CAPABILITY_READY_TIMEOUT: Duration = Duration::from_secs(2);
 
 pub(crate) fn configure_runtime(
     context: &CliContext,
@@ -408,6 +419,477 @@ pub(crate) fn runtime_is_supported(record: &SessionRecord) -> bool {
                     .and_then(Value::as_str)
                     .is_some_and(|path| Path::new(path).is_absolute())
         })
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct RuntimeProcessMarker {
+    schema_version: String,
+    launch_id: String,
+    token: String,
+    owner_pid: u32,
+    expires_at_epoch_ms: u64,
+}
+
+#[derive(Debug)]
+pub(crate) struct ManualInputMarker {
+    path: PathBuf,
+    token: String,
+    _owner_file: fs::File,
+    gate_path: Option<PathBuf>,
+    ack_path: Option<PathBuf>,
+    ack_socket: Option<UnixDatagram>,
+    cleanup_on_drop: bool,
+}
+
+impl ManualInputMarker {
+    pub(crate) fn finish(mut self, release_lifecycle_lock: impl FnOnce()) {
+        self.finish_with_timeout(release_lifecycle_lock, MANUAL_INPUT_GATE_TIMEOUT);
+    }
+
+    fn finish_with_timeout(&mut self, release_lifecycle_lock: impl FnOnce(), timeout: Duration) {
+        if let Some(socket) = self.ack_socket.as_ref() {
+            let mut ack = [0_u8; 1];
+            let _ = socket.recv(&mut ack);
+        }
+        let gate = self
+            .gate_path
+            .as_deref()
+            .and_then(open_manual_input_gate_file)
+            .filter(|file| lock_file_timed(file, timeout));
+        if let Some(gate) = gate {
+            self.remove_if_owned();
+            self.remove_ack_path();
+            release_lifecycle_lock();
+            unlock_bootstrap_file(&gate);
+        } else {
+            // Invalidate before releasing lifecycle state. Even if unlink
+            // fails, dropping this marker releases the continuously held owner
+            // lease, so stale bytes cannot authorize a future Busy result.
+            self.remove_if_owned();
+            self.remove_ack_path();
+            release_lifecycle_lock();
+        }
+        self.cleanup_on_drop = false;
+    }
+
+    fn remove_ack_path(&mut self) {
+        if let Some(path) = self.ack_path.take() {
+            let _ = fs::remove_file(path);
+        }
+    }
+
+    fn remove_if_owned(&mut self) {
+        let owned =
+            read_runtime_process_marker(&self.path).is_some_and(|owner| owner.token == self.token);
+        if owned {
+            let _ = fs::remove_file(&self.path);
+        }
+    }
+}
+
+impl Drop for ManualInputMarker {
+    fn drop(&mut self) {
+        if self.cleanup_on_drop {
+            self.remove_if_owned();
+        }
+        self.remove_ack_path();
+    }
+}
+
+struct ProxyCapabilityGuard {
+    _marker: ManualInputMarker,
+}
+
+fn epoch_millis() -> Option<u64> {
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()?
+        .as_millis();
+    u64::try_from(millis).ok()
+}
+
+fn manual_input_section_path(context: &CliContext, record: &SessionRecord) -> PathBuf {
+    crate::session_dir(context, &record.id).join(MANUAL_INPUT_SECTION_FILE)
+}
+
+fn manual_input_gate_path(context: &CliContext, record: &SessionRecord) -> PathBuf {
+    crate::session_dir(context, &record.id).join(MANUAL_INPUT_GATE_FILE)
+}
+
+fn manual_input_ack_path(record: &SessionRecord) -> Option<PathBuf> {
+    proxy_path(record).map(|path| path.with_extension("ack"))
+}
+
+fn proxy_capability_path(context: &CliContext, record: &SessionRecord) -> PathBuf {
+    crate::session_dir(context, &record.id).join(PROXY_CAPABILITY_FILE)
+}
+
+fn read_runtime_process_marker(path: &Path) -> Option<RuntimeProcessMarker> {
+    let metadata = fs::symlink_metadata(path).ok()?;
+    if !metadata.file_type().is_file() || metadata.len() > 1024 {
+        return None;
+    }
+    serde_json::from_slice(&fs::read(path).ok()?).ok()
+}
+
+fn read_runtime_process_marker_file(file: &mut fs::File) -> Option<RuntimeProcessMarker> {
+    let metadata = file.metadata().ok()?;
+    if !metadata.file_type().is_file() || metadata.len() > 1024 {
+        return None;
+    }
+    file.seek(SeekFrom::Start(0)).ok()?;
+    let mut bytes = Vec::with_capacity(usize::try_from(metadata.len()).ok()?);
+    file.read_to_end(&mut bytes).ok()?;
+    serde_json::from_slice(&bytes).ok()
+}
+
+fn process_is_live(pid: u32) -> bool {
+    if pid == 0 {
+        return false;
+    }
+    let Ok(pid) = libc::pid_t::try_from(pid) else {
+        return false;
+    };
+    // SAFETY: signal 0 probes process existence without delivering a signal.
+    unsafe { libc::kill(pid, 0) == 0 }
+}
+
+fn valid_runtime_process_marker(
+    marker: &RuntimeProcessMarker,
+    record: &SessionRecord,
+    schema_version: &str,
+    ttl: Duration,
+) -> bool {
+    let Some(runtime) = record.runtime.as_ref() else {
+        return false;
+    };
+    let Some(now) = epoch_millis() else {
+        return false;
+    };
+    let ttl_ms = u64::try_from(ttl.as_millis()).unwrap_or(u64::MAX);
+    marker.schema_version == schema_version
+        && marker.launch_id == runtime.launch_id
+        && uuid::Uuid::parse_str(&marker.token).is_ok()
+        && process_is_live(marker.owner_pid)
+        && marker.expires_at_epoch_ms >= now
+        && marker.expires_at_epoch_ms <= now.saturating_add(ttl_ms)
+}
+
+fn write_runtime_process_marker(
+    path: PathBuf,
+    record: &SessionRecord,
+    schema_version: &str,
+    ttl: Duration,
+) -> Result<ManualInputMarker, CliError> {
+    let launch_id = record
+        .runtime
+        .as_ref()
+        .map(|runtime| runtime.launch_id.clone())
+        .ok_or_else(|| {
+            CliError::data(
+                "runtime-id-missing",
+                "session runtime is missing its launch metadata",
+                Some(json!({ "id": record.id })),
+            )
+        })?;
+    let now = epoch_millis().ok_or_else(|| {
+        CliError::runtime(
+            "codex-input-section-time-unavailable",
+            "system time is unavailable for Codex manual input",
+            Some(json!({ "id": record.id })),
+        )
+    })?;
+    let ttl_ms = u64::try_from(ttl.as_millis()).unwrap_or(u64::MAX);
+    let token = uuid::Uuid::new_v4().to_string();
+    let marker = RuntimeProcessMarker {
+        schema_version: schema_version.to_string(),
+        launch_id,
+        token: token.clone(),
+        owner_pid: std::process::id(),
+        expires_at_epoch_ms: now.saturating_add(ttl_ms),
+    };
+    let bytes = serde_json::to_vec(&marker).map_err(|err| {
+        CliError::runtime(
+            "codex-input-section-encode-failed",
+            format!("failed to encode Codex manual input state: {err}"),
+            Some(json!({ "id": record.id })),
+        )
+    })?;
+    write_private_file(&path, &bytes)?;
+    let file = fs::File::open(&path).map_err(|err| {
+        CliError::runtime(
+            "codex-input-section-open-failed",
+            format!("failed to open Codex manual input state: {err}"),
+            Some(json!({ "id": record.id })),
+        )
+    })?;
+    // The marker inode is also an owner lease. A proxy authorizes Busy only
+    // while this shared lock is continuously held by the serialized sender.
+    // SAFETY: `flock` observes the valid descriptor borrowed for this call.
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_SH) } != 0 {
+        return Err(CliError::runtime(
+            "codex-input-section-lease-failed",
+            "failed to lock Codex manual input state",
+            Some(json!({ "id": record.id })),
+        ));
+    }
+    Ok(ManualInputMarker {
+        path,
+        token,
+        _owner_file: file,
+        gate_path: None,
+        ack_path: None,
+        ack_socket: None,
+        cleanup_on_drop: true,
+    })
+}
+
+pub(crate) fn input_contains_submission(
+    text: Option<&str>,
+    keys: &[crate::cli::SpecialKey],
+) -> bool {
+    text.is_some_and(|text| matches!(text, "\r" | "\n" | "\r\n"))
+        || keys.contains(&crate::cli::SpecialKey::Enter)
+}
+
+pub(crate) fn ensure_manual_input_capability(
+    context: &CliContext,
+    record: &SessionRecord,
+) -> Result<(), CliError> {
+    if !runtime_is_supported(record) {
+        return Ok(());
+    }
+    let deadline = Instant::now() + PROXY_CAPABILITY_READY_TIMEOUT;
+    loop {
+        if live_proxy_capability(context, record) {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            break;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    Err(CliError::runtime(
+        "codex-input-section-unavailable",
+        "the Codex proxy did not advertise serialized input support; retry, then recreate the session if it persists",
+        Some(json!({ "id": record.id, "retryable": true })),
+    ))
+}
+
+fn live_proxy_capability(context: &CliContext, record: &SessionRecord) -> bool {
+    let path = proxy_capability_path(context, record);
+    let Ok(mut file) = fs::File::open(&path) else {
+        return false;
+    };
+    let (Ok(own), Ok(current)) = (file.metadata(), fs::metadata(&path)) else {
+        return false;
+    };
+    if own.dev() != current.dev() || own.ino() != current.ino() {
+        return false;
+    }
+    // A live proxy holds a shared lock for its complete advertised lifetime.
+    // Acquiring an exclusive lock therefore identifies an unlocked stale file.
+    // SAFETY: `flock` observes the valid descriptor borrowed for this call.
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+        unlock_bootstrap_file(&file);
+        return false;
+    }
+    if std::io::Error::last_os_error().kind() != std::io::ErrorKind::WouldBlock {
+        return false;
+    }
+    read_runtime_process_marker_file(&mut file).is_some_and(|marker| {
+        valid_runtime_process_marker(
+            &marker,
+            record,
+            PROXY_CAPABILITY_VERSION,
+            PROXY_CAPABILITY_TTL,
+        )
+    })
+}
+
+pub(crate) fn begin_manual_input_section(
+    context: &CliContext,
+    record: &SessionRecord,
+) -> Result<Option<ManualInputMarker>, CliError> {
+    if !runtime_is_supported(record) {
+        return Ok(None);
+    }
+    ensure_manual_input_capability(context, record)?;
+    let mut marker = write_runtime_process_marker(
+        manual_input_section_path(context, record),
+        record,
+        MANUAL_INPUT_SECTION_VERSION,
+        MANUAL_INPUT_SECTION_TTL,
+    )?;
+    let gate_path = manual_input_gate_path(context, record);
+    open_manual_input_gate_file(&gate_path).ok_or_else(|| {
+        CliError::runtime(
+            "codex-input-gate-open-failed",
+            "failed to open the Codex manual input gate",
+            Some(json!({ "id": record.id })),
+        )
+    })?;
+    marker.gate_path = Some(gate_path);
+    let ack_path = manual_input_ack_path(record).ok_or_else(|| {
+        CliError::data(
+            "codex-input-ack-path-missing",
+            "Codex runtime is missing its private input acknowledgement path",
+            Some(json!({ "id": record.id })),
+        )
+    })?;
+    let _ = fs::remove_file(&ack_path);
+    let ack_socket = UnixDatagram::bind(&ack_path).map_err(|err| {
+        CliError::runtime(
+            "codex-input-ack-bind-failed",
+            format!("failed to bind the Codex manual input acknowledgement: {err}"),
+            Some(json!({ "id": record.id })),
+        )
+    })?;
+    ack_socket
+        .set_read_timeout(Some(MANUAL_INPUT_ACK_TIMEOUT))
+        .map_err(|err| {
+            CliError::runtime(
+                "codex-input-ack-timeout-failed",
+                format!("failed to bound the Codex manual input acknowledgement: {err}"),
+                Some(json!({ "id": record.id })),
+            )
+        })?;
+    marker.ack_path = Some(ack_path);
+    marker.ack_socket = Some(ack_socket);
+    Ok(Some(marker))
+}
+
+fn manual_input_request_matches_bound_thread(
+    context: &CliContext,
+    record: &SessionRecord,
+    value: &Value,
+) -> bool {
+    if value.get("method").and_then(Value::as_str) != Some("turn/start")
+        || value.get("id").and_then(json_id_key).is_none()
+        || !value.pointer("/params/input").is_some_and(Value::is_array)
+    {
+        return false;
+    }
+    let Some(thread_id) = value.pointer("/params/threadId").and_then(Value::as_str) else {
+        return false;
+    };
+    if !protocol_id_is_valid(thread_id) {
+        return false;
+    }
+    let Some(attached) = thread_attached_path(record) else {
+        return false;
+    };
+    if fs::read_to_string(attached).ok().as_deref() != Some(&projected_thread_binding(thread_id)) {
+        return false;
+    }
+    let _ = context;
+    true
+}
+
+struct ManualInputGate {
+    gate_file: fs::File,
+    _owner_file: fs::File,
+}
+
+impl Drop for ManualInputGate {
+    fn drop(&mut self) {
+        unlock_bootstrap_file(&self.gate_file);
+    }
+}
+
+fn open_manual_input_gate_file(path: &Path) -> Option<fs::File> {
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(path)
+        .ok()
+}
+
+fn lock_file_timed(file: &fs::File, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    loop {
+        // SAFETY: `flock` observes the valid descriptor borrowed for this call.
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+            return true;
+        }
+        let error = std::io::Error::last_os_error();
+        if error.kind() != std::io::ErrorKind::WouldBlock || Instant::now() >= deadline {
+            return false;
+        }
+        thread::sleep(Duration::from_millis(5));
+    }
+}
+
+fn marker_has_live_shared_lock(file: &fs::File) -> bool {
+    // SAFETY: `flock` observes the valid descriptor borrowed for this call.
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+        unlock_bootstrap_file(file);
+        return false;
+    }
+    std::io::Error::last_os_error().kind() == std::io::ErrorKind::WouldBlock
+}
+
+fn acquire_manual_input_gate(
+    context: &CliContext,
+    record: &SessionRecord,
+    value: &Value,
+) -> Option<ManualInputGate> {
+    if !manual_input_request_matches_bound_thread(context, record, value) {
+        return None;
+    }
+    let path = manual_input_section_path(context, record);
+    let mut owner_file = fs::File::open(&path).ok()?;
+    if !marker_has_live_shared_lock(&owner_file) {
+        return None;
+    }
+    let gate_file = open_manual_input_gate_file(&manual_input_gate_path(context, record))?;
+    if !lock_file_timed(&gate_file, MANUAL_INPUT_GATE_TIMEOUT) {
+        return None;
+    }
+    let own = owner_file.metadata().ok()?;
+    let current = fs::metadata(&path).ok()?;
+    if own.dev() != current.dev() || own.ino() != current.ino() {
+        return None;
+    }
+    if !marker_has_live_shared_lock(&owner_file) {
+        return None;
+    }
+    let marker = read_runtime_process_marker_file(&mut owner_file)?;
+    if !valid_runtime_process_marker(
+        &marker,
+        record,
+        MANUAL_INPUT_SECTION_VERSION,
+        MANUAL_INPUT_SECTION_TTL,
+    ) {
+        return None;
+    }
+    UnixDatagram::unbound()
+        .ok()?
+        .send_to(&[1], manual_input_ack_path(record)?)
+        .ok()?;
+    Some(ManualInputGate {
+        gate_file,
+        _owner_file: owner_file,
+    })
+}
+
+fn begin_proxy_capability(
+    context: &CliContext,
+    record: &SessionRecord,
+) -> Result<ProxyCapabilityGuard, CliError> {
+    let mut marker = write_runtime_process_marker(
+        proxy_capability_path(context, record),
+        record,
+        PROXY_CAPABILITY_VERSION,
+        PROXY_CAPABILITY_TTL,
+    )?;
+    // An unlocked capability file is harmless stale state and may be replaced
+    // by the next proxy. Avoid racy pathname cleanup across proxy generations.
+    marker.cleanup_on_drop = false;
+    Ok(ProxyCapabilityGuard { _marker: marker })
 }
 
 fn runtime_path<'a>(record: &'a SessionRecord, key: &str) -> Option<&'a Path> {
@@ -1529,6 +2011,7 @@ impl FreshBootstrap {
 
 struct MutationAuthorization {
     _bootstrap_gate: Option<CreateBootstrapGate>,
+    _manual_input_gate: Option<ManualInputGate>,
 }
 
 fn auto_resume_is_healthy_disabled(context: &CliContext, record: &SessionRecord) -> bool {
@@ -1546,6 +2029,7 @@ async fn cancel_before_tui_mutation(
     if !matches!(method, Some("thread/start" | "turn/start")) {
         return Some(MutationAuthorization {
             _bootstrap_gate: None,
+            _manual_input_gate: None,
         });
     }
     // A fresh Codex TUI emits `thread/start`, then the initial prompt emits
@@ -1563,6 +2047,19 @@ async fn cancel_before_tui_mutation(
             .await
             .ok()
             .flatten()
+    };
+    let manual_input_gate = if method == Some("turn/start") {
+        let gate_context = context.clone();
+        let gate_record = record.clone();
+        let gate_value = value.clone();
+        tokio::task::spawn_blocking(move || {
+            acquire_manual_input_gate(&gate_context, &gate_record, &gate_value)
+        })
+        .await
+        .ok()
+        .flatten()
+    } else {
+        None
     };
     let cancellation_context = context.clone();
     let id = record.id.clone();
@@ -1586,6 +2083,7 @@ async fn cancel_before_tui_mutation(
             bootstrap.close();
             Some(MutationAuthorization {
                 _bootstrap_gate: bootstrap_gate,
+                _manual_input_gate: manual_input_gate,
             })
         }
         Some(crate::auto_resume::ManualInputCancelOutcome::Busy)
@@ -1594,6 +2092,14 @@ async fn cancel_before_tui_mutation(
         {
             Some(MutationAuthorization {
                 _bootstrap_gate: bootstrap_gate,
+                _manual_input_gate: manual_input_gate,
+            })
+        }
+        Some(crate::auto_resume::ManualInputCancelOutcome::Busy) if manual_input_gate.is_some() => {
+            bootstrap.close();
+            Some(MutationAuthorization {
+                _bootstrap_gate: bootstrap_gate,
+                _manual_input_gate: manual_input_gate,
             })
         }
         Some(crate::auto_resume::ManualInputCancelOutcome::Busy) => None,
@@ -1670,6 +2176,8 @@ async fn run_proxy_session(
     .await
     .map_err(|_| "upstream app-server WebSocket handshake timed out".to_string())?
     .map_err(|err| format!("upstream app-server handshake failed: {err}"))?;
+    let _capability = begin_proxy_capability(&context, &record)
+        .map_err(|err| format!("failed to advertise proxy capability: {}", err.code()))?;
     let mut projection = ProxyProjection::new(context.clone(), record.clone());
     let mut bootstrap = FreshBootstrap::for_runtime(&context, &record);
     loop {
@@ -1708,7 +2216,10 @@ async fn run_proxy_session(
                     projection.observe_client(&value);
                     authorization
                 } else {
-                    MutationAuthorization { _bootstrap_gate: None }
+                    MutationAuthorization {
+                        _bootstrap_gate: None,
+                        _manual_input_gate: None,
+                    }
                 };
                 let closed = matches!(message, Message::Close(_));
                 send_proxy_upstream(&mut upstream, message, CONTROL_RESPONSE_TIMEOUT).await?;
@@ -2014,6 +2525,47 @@ mod tests {
             runtime.launch_id.as_bytes(),
         )
         .unwrap();
+    }
+
+    fn write_manual_input_marker(
+        context: &CliContext,
+        record: &SessionRecord,
+        launch_id: &str,
+        expires_at_epoch_ms: u64,
+    ) -> ManualInputMarker {
+        let path = manual_input_section_path(context, record);
+        let token = uuid::Uuid::new_v4().to_string();
+        write_private_file(
+            &path,
+            &serde_json::to_vec(&RuntimeProcessMarker {
+                schema_version: MANUAL_INPUT_SECTION_VERSION.to_string(),
+                launch_id: launch_id.to_string(),
+                token: token.clone(),
+                owner_pid: std::process::id(),
+                expires_at_epoch_ms,
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        let file = fs::File::open(&path).unwrap();
+        // SAFETY: test owns this valid descriptor.
+        assert_eq!(unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_SH) }, 0);
+        open_manual_input_gate_file(&manual_input_gate_path(context, record)).unwrap();
+        let ack_path = manual_input_ack_path(record).unwrap();
+        let _ = fs::remove_file(&ack_path);
+        let ack_socket = UnixDatagram::bind(&ack_path).unwrap();
+        ack_socket
+            .set_read_timeout(Some(MANUAL_INPUT_ACK_TIMEOUT))
+            .unwrap();
+        ManualInputMarker {
+            path,
+            token,
+            _owner_file: file,
+            gate_path: Some(manual_input_gate_path(context, record)),
+            ack_path: Some(ack_path),
+            ack_socket: Some(ack_socket),
+            cleanup_on_drop: true,
+        }
     }
 
     #[test]
@@ -3013,6 +3565,384 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn manual_input_section_bypasses_reentrant_lock_until_sender_cleanup() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let upstream = tmp.path().join("owned-input.sock");
+        let listener = tokio::net::UnixListener::bind(&upstream).unwrap();
+        let context = CliContext {
+            state_dir: tmp.path().join("state"),
+            host: None,
+        };
+        let record = record_with_runtime("owned-input", &upstream);
+        fs::create_dir_all(crate::session_dir(&context, &record.id)).unwrap();
+        crate::write_session_record(&context, &record).unwrap();
+        bind_thread(&record, "thread-a").unwrap();
+        let proxy_args = crate::cli::CodexAppServerProxyArgs {
+            id: record.id.clone(),
+            upstream: upstream.clone(),
+            listen: upstream.with_extension("proxy"),
+        };
+        let proxy_context = context.clone();
+        let proxy = tokio::spawn(async move { run_proxy_session(proxy_context, proxy_args).await });
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let request = receive_json(&mut socket).await;
+            assert_eq!(request["method"], "turn/start");
+            respond(
+                &mut socket,
+                &request,
+                json!({ "turn": { "id": "owned-turn", "status": "inProgress" } }),
+            )
+            .await;
+            let request = receive_json(&mut socket).await;
+            assert_eq!(request["id"], 3);
+            assert_eq!(request["method"], "thread/read");
+            respond(&mut socket, &request, json!({ "ok": true })).await;
+            socket.close(None).await.unwrap();
+        });
+        let proxy_stream = connect_socket(&upstream.with_extension("proxy"))
+            .await
+            .unwrap();
+        let (mut tui, _) = tokio_tungstenite::client_async("ws://localhost", proxy_stream)
+            .await
+            .unwrap();
+        let lock = crate::acquire_session_record_lock(&context, &record.id).unwrap();
+        for _ in 0..100 {
+            if live_proxy_capability(&context, &record) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        let marker = begin_manual_input_section(&context, &record)
+            .unwrap()
+            .unwrap();
+        tui.send(Message::Text(
+            json!({
+                "id": 1,
+                "method": "turn/start",
+                "params": { "threadId": "thread-a", "input": [] }
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .unwrap();
+        let response = receive_json(&mut tui).await;
+        assert_eq!(response["result"]["turn"]["id"], "owned-turn");
+        assert!(
+            manual_input_section_path(&context, &record).exists(),
+            "manual input section remains live until the sender releases its lock"
+        );
+        marker.finish(|| drop(lock));
+        let unrelated_lock = crate::acquire_session_record_lock(&context, &record.id).unwrap();
+        tui.send(Message::Text(
+            json!({
+                "id": 2,
+                "method": "turn/start",
+                "params": { "threadId": "thread-a", "input": [] }
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .unwrap();
+        let rejected = receive_json(&mut tui).await;
+        assert_eq!(rejected["id"], 2);
+        assert_eq!(rejected["error"]["code"], -32001);
+        drop(unrelated_lock);
+        tui.send(Message::Text(
+            json!({ "id": 3, "method": "thread/read", "params": {} })
+                .to_string()
+                .into(),
+        ))
+        .await
+        .unwrap();
+        assert_eq!(receive_json(&mut tui).await["id"], 3);
+        server.await.unwrap();
+        proxy.await.unwrap().unwrap();
+    }
+
+    #[test]
+    fn local_input_ownership_rejects_expiry_and_runtime_replacement() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let context = CliContext {
+            state_dir: tmp.path().join("state"),
+            host: None,
+        };
+        let record = record_with_runtime("owned-negative", &tmp.path().join("negative.sock"));
+        fs::create_dir_all(crate::session_dir(&context, &record.id)).unwrap();
+        crate::write_session_record(&context, &record).unwrap();
+        bind_thread(&record, "thread-a").unwrap();
+        let turn = json!({
+            "id": 1,
+            "method": "turn/start",
+            "params": { "threadId": "thread-a", "input": [] }
+        });
+
+        let expired = write_manual_input_marker(
+            &context,
+            &record,
+            &record.runtime.as_ref().unwrap().launch_id,
+            epoch_millis().unwrap().saturating_sub(1),
+        );
+        assert!(acquire_manual_input_gate(&context, &record, &turn).is_none());
+        drop(expired);
+
+        let replacement = write_manual_input_marker(
+            &context,
+            &record,
+            "replacement-runtime",
+            epoch_millis()
+                .unwrap()
+                .saturating_add(u64::try_from(MANUAL_INPUT_SECTION_TTL.as_millis()).unwrap()),
+        );
+        assert!(acquire_manual_input_gate(&context, &record, &turn).is_none());
+        drop(replacement);
+
+        let valid = write_manual_input_marker(
+            &context,
+            &record,
+            &record.runtime.as_ref().unwrap().launch_id,
+            epoch_millis()
+                .unwrap()
+                .saturating_add(u64::try_from(MANUAL_INPUT_SECTION_TTL.as_millis()).unwrap()),
+        );
+        let wrong_thread = json!({
+            "id": 2,
+            "method": "turn/start",
+            "params": { "threadId": "thread-b", "input": [] }
+        });
+        assert!(acquire_manual_input_gate(&context, &record, &wrong_thread).is_none());
+        assert!(manual_input_section_path(&context, &record).exists());
+        let malformed = json!({
+            "id": 3,
+            "method": "turn/start",
+            "params": { "threadId": "thread-a" }
+        });
+        assert!(acquire_manual_input_gate(&context, &record, &malformed).is_none());
+        assert!(manual_input_section_path(&context, &record).exists());
+        drop(acquire_manual_input_gate(&context, &record, &turn).unwrap());
+        drop(valid);
+    }
+
+    #[test]
+    fn manual_input_submission_detection_excludes_ordinary_text_and_keys() {
+        for key in [
+            crate::cli::SpecialKey::Escape,
+            crate::cli::SpecialKey::CtrlC,
+            crate::cli::SpecialKey::Up,
+            crate::cli::SpecialKey::Down,
+            crate::cli::SpecialKey::Left,
+            crate::cli::SpecialKey::Right,
+            crate::cli::SpecialKey::Tab,
+        ] {
+            assert!(
+                !input_contains_submission(None, &[key]),
+                "non-submitting key must not open a manual section: {key:?}"
+            );
+        }
+        assert!(input_contains_submission(
+            None,
+            &[crate::cli::SpecialKey::Enter]
+        ));
+        for text in ["\r", "\n", "\r\n"] {
+            assert!(
+                input_contains_submission(Some(text), &[]),
+                "terminal submit must open a manual section: {text:?}"
+            );
+        }
+        for text in [
+            "",
+            "hi",
+            "line one\nline two",
+            "\u{1b}[200~pasted\ntext\u{1b}[201~",
+        ] {
+            assert!(
+                !input_contains_submission(Some(text), &[]),
+                "ordinary text and multiline paste must not open a manual section: {text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn manual_input_section_requires_live_proxy_capability_and_cleans_up() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let context = CliContext {
+            state_dir: tmp.path().join("state"),
+            host: None,
+        };
+        let record = record_with_runtime("owned-capability", &tmp.path().join("capability.sock"));
+        fs::create_dir_all(crate::session_dir(&context, &record.id)).unwrap();
+        crate::write_session_record(&context, &record).unwrap();
+
+        let error = begin_manual_input_section(&context, &record).unwrap_err();
+        assert_eq!(error.code(), "codex-input-section-unavailable");
+
+        let capability = begin_proxy_capability(&context, &record).unwrap();
+        let marker = begin_manual_input_section(&context, &record)
+            .unwrap()
+            .unwrap();
+        assert!(manual_input_section_path(&context, &record).exists());
+        drop(marker);
+        assert!(!manual_input_section_path(&context, &record).exists());
+        drop(capability);
+        assert!(proxy_capability_path(&context, &record).exists());
+        assert!(!live_proxy_capability(&context, &record));
+    }
+
+    #[test]
+    fn manual_input_gate_finishes_before_lifecycle_unlock_and_marker_cleanup() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let context = CliContext {
+            state_dir: tmp.path().join("state"),
+            host: None,
+        };
+        let record = record_with_runtime("owned-gate", &tmp.path().join("gate.sock"));
+        fs::create_dir_all(crate::session_dir(&context, &record.id)).unwrap();
+        crate::write_session_record(&context, &record).unwrap();
+        bind_thread(&record, "thread-a").unwrap();
+        let _capability = begin_proxy_capability(&context, &record).unwrap();
+        let lifecycle_lock = crate::acquire_session_record_lock(&context, &record.id).unwrap();
+        let marker = begin_manual_input_section(&context, &record)
+            .unwrap()
+            .unwrap();
+        let turn = json!({
+            "id": 1,
+            "method": "turn/start",
+            "params": { "threadId": "thread-a", "input": [] }
+        });
+        let gate = acquire_manual_input_gate(&context, &record, &turn).unwrap();
+        let (finished_tx, finished_rx) = std::sync::mpsc::channel();
+        let teardown = std::thread::spawn(move || {
+            marker.finish(|| drop(lifecycle_lock));
+            finished_tx.send(()).unwrap();
+        });
+
+        assert!(finished_rx.recv_timeout(Duration::from_millis(10)).is_err());
+        assert!(
+            crate::try_acquire_session_record_lock(&context, &record.id)
+                .unwrap()
+                .is_none(),
+            "lifecycle lock stays held while the proxy forwards through the gate"
+        );
+        drop(gate);
+        finished_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        teardown.join().unwrap();
+        assert!(!manual_input_section_path(&context, &record).exists());
+        assert!(
+            crate::try_acquire_session_record_lock(&context, &record.id)
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn manual_input_gate_timeout_releases_lifecycle_and_invalidates_marker() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let context = CliContext {
+            state_dir: tmp.path().join("state"),
+            host: None,
+        };
+        let record = record_with_runtime("owned-timeout", &tmp.path().join("timeout.sock"));
+        fs::create_dir_all(crate::session_dir(&context, &record.id)).unwrap();
+        crate::write_session_record(&context, &record).unwrap();
+        let _capability = begin_proxy_capability(&context, &record).unwrap();
+        let lifecycle_lock = crate::acquire_session_record_lock(&context, &record.id).unwrap();
+        let mut marker = begin_manual_input_section(&context, &record)
+            .unwrap()
+            .unwrap();
+        let held_gate =
+            open_manual_input_gate_file(&manual_input_gate_path(&context, &record)).unwrap();
+        assert!(lock_file_timed(&held_gate, Duration::from_millis(10)));
+        let (finished_tx, finished_rx) = std::sync::mpsc::channel();
+        let teardown = std::thread::spawn(move || {
+            marker.finish_with_timeout(|| drop(lifecycle_lock), Duration::from_millis(20));
+            finished_tx.send(()).unwrap();
+        });
+
+        finished_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        teardown.join().unwrap();
+        assert!(!manual_input_section_path(&context, &record).exists());
+        assert!(
+            crate::try_acquire_session_record_lock(&context, &record.id)
+                .unwrap()
+                .is_some()
+        );
+        unlock_bootstrap_file(&held_gate);
+    }
+
+    #[test]
+    fn delayed_proxy_claim_acknowledges_before_sender_retires_section() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let context = CliContext {
+            state_dir: tmp.path().join("state"),
+            host: None,
+        };
+        let record = record_with_runtime("owned-delayed", &tmp.path().join("delayed.sock"));
+        fs::create_dir_all(crate::session_dir(&context, &record.id)).unwrap();
+        crate::write_session_record(&context, &record).unwrap();
+        bind_thread(&record, "thread-a").unwrap();
+        let _capability = begin_proxy_capability(&context, &record).unwrap();
+        let lifecycle_lock = crate::acquire_session_record_lock(&context, &record.id).unwrap();
+        let marker = begin_manual_input_section(&context, &record)
+            .unwrap()
+            .unwrap();
+        let (finished_tx, finished_rx) = std::sync::mpsc::channel();
+        let teardown = std::thread::spawn(move || {
+            marker.finish(|| drop(lifecycle_lock));
+            finished_tx.send(()).unwrap();
+        });
+        std::thread::sleep(Duration::from_millis(25));
+        let turn = json!({
+            "id": 1,
+            "method": "turn/start",
+            "params": { "threadId": "thread-a", "input": [] }
+        });
+        let gate = acquire_manual_input_gate(&context, &record, &turn).unwrap();
+        assert!(finished_rx.recv_timeout(Duration::from_millis(10)).is_err());
+        assert!(
+            crate::try_acquire_session_record_lock(&context, &record.id)
+                .unwrap()
+                .is_none()
+        );
+        drop(gate);
+        finished_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        teardown.join().unwrap();
+    }
+
+    #[test]
+    fn stale_manual_marker_without_owner_lease_cannot_authorize_busy() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let context = CliContext {
+            state_dir: tmp.path().join("state"),
+            host: None,
+        };
+        let record = record_with_runtime("owned-stale", &tmp.path().join("stale.sock"));
+        let session_dir = crate::session_dir(&context, &record.id);
+        fs::create_dir_all(&session_dir).unwrap();
+        crate::write_session_record(&context, &record).unwrap();
+        bind_thread(&record, "thread-a").unwrap();
+        let _capability = begin_proxy_capability(&context, &record).unwrap();
+        let lifecycle_lock = crate::acquire_session_record_lock(&context, &record.id).unwrap();
+        let marker = begin_manual_input_section(&context, &record)
+            .unwrap()
+            .unwrap();
+        fs::set_permissions(&session_dir, fs::Permissions::from_mode(0o500)).unwrap();
+        marker.finish(|| drop(lifecycle_lock));
+        fs::set_permissions(&session_dir, fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(manual_input_section_path(&context, &record).exists());
+        let unrelated_lock = crate::acquire_session_record_lock(&context, &record.id).unwrap();
+        let turn = json!({
+            "id": 1,
+            "method": "turn/start",
+            "params": { "threadId": "thread-a", "input": [] }
+        });
+        assert!(acquire_manual_input_gate(&context, &record, &turn).is_none());
+        drop(unrelated_lock);
+    }
+
+    #[tokio::test]
     async fn fresh_tui_thread_start_bypasses_the_create_lifecycle_lock() {
         let tmp = tempfile::TempDir::new().unwrap();
         let upstream = tmp.path().join("fresh-start.sock");
@@ -3293,6 +4223,7 @@ mod tests {
         let bootstrap_guard = begin_create_bootstrap(&record).unwrap().unwrap();
         let authorization = MutationAuthorization {
             _bootstrap_gate: acquire_create_bootstrap_gate(&record),
+            _manual_input_gate: None,
         };
         assert!(authorization._bootstrap_gate.is_some());
         let (finished_tx, finished_rx) = std::sync::mpsc::channel();

@@ -4059,7 +4059,7 @@ async fn attach_socket(
                             }
                             continue;
                         }
-                        handle_input(
+                        if let Err(err) = handle_input(
                             &state.context,
                             &state.tmux_bin,
                             &record,
@@ -4068,7 +4068,15 @@ async fn attach_socket(
                             &mut initial_repaint_pending,
                             &resize_lock,
                         )
-                        .await;
+                        .await
+                        {
+                            eprintln!(
+                                "warning: terminal input failed for {}: {}",
+                                record.id,
+                                err.code()
+                            );
+                            break;
+                        }
                     }
                     Message::Close(_) => break,
                     _ => {}
@@ -4463,9 +4471,9 @@ async fn handle_input(
     frame: &str,
     initial_repaint_pending: &mut bool,
     resize_lock: &tokio::sync::Mutex<()>,
-) {
+) -> Result<(), CliError> {
     let Ok(value) = serde_json::from_str::<Value>(frame) else {
-        return;
+        return Ok(());
     };
 
     if let Some(resize) = value.get("resize") {
@@ -4478,7 +4486,7 @@ async fn handle_input(
             let _guard = resize_lock.lock().await;
             resize_pane(tmux, target, cols, rows, force_repaint).await;
         }
-        return;
+        return Ok(());
     }
 
     let text = value
@@ -4504,16 +4512,24 @@ async fn handle_input(
         keys.push(key);
     }
     if text.is_none() && keys.is_empty() {
-        return;
+        return Ok(());
     }
 
     let context = context.clone();
     let tmux = tmux.to_path_buf();
     let record = record.clone();
-    let _ = tokio::task::spawn_blocking(move || {
+    let id = record.id.clone();
+    tokio::task::spawn_blocking(move || {
         send_input_serialized(&context, &record, text.as_deref(), &keys, &tmux)
     })
-    .await;
+    .await
+    .map_err(|_| {
+        CliError::runtime(
+            "attach-input-worker-failed",
+            "the terminal input worker failed",
+            Some(json!({ "id": id })),
+        )
+    })?
 }
 
 #[cfg(test)]
@@ -10684,7 +10700,8 @@ mod tests {
             &mut pending,
             &resize_lock,
         )
-        .await;
+        .await
+        .unwrap();
         handle_input(
             &ctx,
             &tmux,
@@ -10694,7 +10711,8 @@ mod tests {
             &mut pending,
             &resize_lock,
         )
-        .await;
+        .await
+        .unwrap();
         let after_noops = std::fs::read_to_string(&log).unwrap_or_default();
         assert!(
             after_noops.trim().is_empty(),
@@ -10712,7 +10730,8 @@ mod tests {
             &mut pending,
             &resize_lock,
         )
-        .await;
+        .await
+        .unwrap();
         let calls = std::fs::read_to_string(&log).unwrap_or_default();
         let resizes: Vec<&str> = calls
             .lines()
@@ -10727,6 +10746,96 @@ mod tests {
             resizes[0].contains("123") && resizes[0].contains("45"),
             "resize frame must invoke resize-window with the requested size: {calls:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn incompatible_proxy_input_is_reported_before_auto_resume_mutation() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let log = tmp.path().join("calls.log");
+        let tmux = logging_tmux(tmp.path(), &log);
+        let context = CliContext {
+            state_dir: tmp.path().join("state"),
+            host: None,
+        };
+        let mut record = test_record("old-proxy", "hs-codex-old-proxy");
+        let socket = tmp.path().join("old-proxy.sock");
+        record.runtime = Some(crate::RuntimeInfo {
+            kind: codex_app_server::RUNTIME_KIND.to_string(),
+            tmux_session: record.tmux_session.clone(),
+            generation: 1,
+            started_at: "2030-01-01T00:00:00Z".to_string(),
+            launch_id: "old-proxy-launch".to_string(),
+            extra: std::collections::BTreeMap::from([
+                (
+                    codex_app_server::PROTOCOL_KEY.to_string(),
+                    json!(codex_app_server::PROTOCOL_VERSION),
+                ),
+                (
+                    codex_app_server::SOCKET_KEY.to_string(),
+                    json!(crate::display_path(&socket)),
+                ),
+                (
+                    codex_app_server::PROXY_KEY.to_string(),
+                    json!(crate::display_path(&socket.with_extension("proxy"))),
+                ),
+                (
+                    codex_app_server::THREAD_HANDOFF_KEY.to_string(),
+                    json!(crate::display_path(&socket.with_extension("thread"))),
+                ),
+                (
+                    codex_app_server::THREAD_ATTACHED_KEY.to_string(),
+                    json!(crate::display_path(&socket.with_extension("attached"))),
+                ),
+            ]),
+        });
+        crate::write_session_record(&context, &record).unwrap();
+        crate::activity::activate_runtime(&context, &record).unwrap();
+        auto_resume::set_enabled(&context, &record.id, true, "2030-01-01T00:00:00Z").unwrap();
+
+        let mut repaint = false;
+        let error = handle_input(
+            &context,
+            &tmux,
+            &record,
+            "hs-codex-old-proxy:0.0",
+            r#"{"text":"\r"}"#,
+            &mut repaint,
+            &tokio::sync::Mutex::new(()),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.code(), "codex-input-section-unavailable");
+        assert!(auto_resume::view_for_record(&context, &record).enabled);
+    }
+
+    #[tokio::test]
+    async fn raw_terminal_carriage_return_is_delivered_as_enter_not_paste() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let log = tmp.path().join("calls.log");
+        let tmux = logging_tmux(tmp.path(), &log);
+        let context = CliContext {
+            state_dir: tmp.path().join("state"),
+            host: None,
+        };
+        let record = test_record("raw-enter", "hs-codex-raw-enter");
+        crate::write_session_record(&context, &record).unwrap();
+        let mut repaint = false;
+
+        handle_input(
+            &context,
+            &tmux,
+            &record,
+            "hs-codex-raw-enter:0.0",
+            r#"{"text":"\r"}"#,
+            &mut repaint,
+            &tokio::sync::Mutex::new(()),
+        )
+        .await
+        .unwrap();
+        let calls = std::fs::read_to_string(&log).unwrap();
+        assert!(calls.contains("send-keys -t hs-codex-raw-enter:0.0 Enter"));
+        assert!(!calls.contains("load-buffer"));
+        assert!(!calls.contains("paste-buffer"));
     }
 
     #[tokio::test]
@@ -10755,7 +10864,8 @@ mod tests {
             &mut pending,
             &resize_lock,
         )
-        .await;
+        .await
+        .unwrap();
         let calls = std::fs::read_to_string(&log).unwrap_or_default();
         let resizes: Vec<&str> = calls
             .lines()
@@ -10792,7 +10902,8 @@ mod tests {
             &mut pending,
             &resize_lock,
         )
-        .await;
+        .await
+        .unwrap();
         let calls = std::fs::read_to_string(&log).unwrap_or_default();
         let resizes: Vec<&str> = calls
             .lines()
@@ -10821,7 +10932,7 @@ mod tests {
         let mut first_pending = true;
         let mut second_pending = true;
 
-        tokio::join!(
+        let (first, second) = tokio::join!(
             handle_input(
                 &ctx,
                 &tmux,
@@ -10841,6 +10952,8 @@ mod tests {
                 &resize_lock,
             ),
         );
+        first.unwrap();
+        second.unwrap();
 
         let calls = std::fs::read_to_string(&log).unwrap();
         let rows: Vec<&str> = calls
