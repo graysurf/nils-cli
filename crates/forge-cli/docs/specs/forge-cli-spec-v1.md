@@ -985,14 +985,14 @@ without exception:
 `nils_common::cli_contract::exit`. Discriminators go in
 `data.error.kind`, not in numeric exit codes.
 
-| Constant      | Value | `forge-cli` triggers                                                                                                                                |
-| ------------- | ----- | --------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `SUCCESS`     | `0`   | Op completed; required state achieved.                                                                                                              |
-| `RUNTIME`     | `1`   | Remote semantic failure: required checks failed, merge conflict, draft already ready.                                                               |
-| `USAGE`       | `64`  | Bad CLI syntax, unknown subcommand, unsupported provider.                                                                                           |
-| `DATA`        | `65`  | Lock-down policy violation (any rule above); body parse failure; invalid VPN config.                                                                |
-| `UNAVAILABLE` | `69`  | `gh`/`glab` missing, auth required, remote 5xx/network error, wait-checks or review-convergence timeout, GitLab VPN probe failure, backend timeout. |
-| `SOFTWARE`    | `70`  | Internal invariant violation (backend JSON did not match expected shape).                                                                           |
+| Constant      | Value | `forge-cli` triggers                                                                                                                                                                |
+| ------------- | ----- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `SUCCESS`     | `0`   | Op completed; required state achieved.                                                                                                                                              |
+| `RUNTIME`     | `1`   | Remote semantic failure: required checks failed, merge conflict, draft already ready.                                                                                               |
+| `USAGE`       | `64`  | Bad CLI syntax, unknown subcommand, unsupported provider.                                                                                                                           |
+| `DATA`        | `65`  | Lock-down policy violation (any rule above); body parse failure; invalid VPN config.                                                                                                |
+| `UNAVAILABLE` | `69`  | `gh`/`glab` missing, auth required, remote 5xx/network error, wait-checks or review-convergence timeout, GitLab VPN probe failure, backend timeout or backend output-limit failure. |
+| `SOFTWARE`    | `70`  | Internal invariant violation (backend JSON did not match expected shape).                                                                                                           |
 
 Callers (agent-runtime-kit skills, CI scripts) MUST branch on `error.kind`
 when finer granularity is needed. Numeric exit codes alone are

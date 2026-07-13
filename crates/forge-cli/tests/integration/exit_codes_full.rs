@@ -138,6 +138,28 @@ fn review_convergence_timeout_maps_to_unavailable_69() {
 }
 
 #[test]
+fn backend_output_limit_maps_to_unavailable_69_and_is_documented() {
+    let err = ForgeError::unavailable(
+        SCHEMA,
+        "backend_output_limit",
+        "capture limit exceeded",
+        None,
+    );
+    assert_eq!(err.exit_code(), exit::UNAVAILABLE);
+    assert_eq!(err.kind(), "backend_output_limit");
+
+    let spec = include_str!("../../docs/specs/forge-cli-spec-v1.md");
+    let row = spec
+        .lines()
+        .find(|line| line.starts_with("| `UNAVAILABLE`"))
+        .expect("UNAVAILABLE exit-code map row");
+    assert!(
+        row.contains("backend output-limit failure"),
+        "canonical exit-code map must name backend output-limit failures"
+    );
+}
+
+#[test]
 fn glab_version_unsupported_maps_to_unavailable_69() {
     let err = ForgeError::unavailable(SCHEMA, "glab_version_unsupported", "upgrade", None);
     assert_eq!(err.exit_code(), exit::UNAVAILABLE);
