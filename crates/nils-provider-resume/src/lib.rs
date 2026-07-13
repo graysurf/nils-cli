@@ -290,7 +290,7 @@ pub fn collect_codex_provider_resume_matches(
         {
             continue;
         }
-        if let Some(meta) = read_codex_session_meta(&path)
+        if let Some(meta) = read_codex_resumable_session_meta(&path)
             && meta.session_id == session_id
         {
             matches.insert(ProviderHistoryMatch {
@@ -410,6 +410,21 @@ pub struct CodexSessionMeta {
 /// with a non-empty id, a cwd, and a parseable timestamp. The first line is
 /// size-bounded so a pathological file cannot exhaust memory.
 pub fn read_codex_session_meta(path: &Path) -> Option<CodexSessionMeta> {
+    read_codex_session_meta_from_sources(path, &["cli"])
+}
+
+/// Read Codex session metadata eligible for explicit provider-ID resume.
+///
+/// Unlike [`read_codex_session_meta`], this accepts both the `cli` and
+/// `vscode` scalar source labels used by resumable interactive histories.
+pub fn read_codex_resumable_session_meta(path: &Path) -> Option<CodexSessionMeta> {
+    read_codex_session_meta_from_sources(path, &["cli", "vscode"])
+}
+
+fn read_codex_session_meta_from_sources(
+    path: &Path,
+    accepted_sources: &[&str],
+) -> Option<CodexSessionMeta> {
     let file = fs::File::open(path).ok()?;
     let mut reader = io::BufReader::new(file).take(CODEX_SESSION_META_MAX_LINE_BYTES + 1);
     let mut first_line = Vec::new();
@@ -430,7 +445,8 @@ pub fn read_codex_session_meta(path: &Path) -> Option<CodexSessionMeta> {
     }
     let payload = value.get("payload")?;
     let cwd = payload.get("cwd").and_then(Value::as_str)?.to_string();
-    if payload.get("source").and_then(Value::as_str)? != "cli" {
+    let source = payload.get("source").and_then(Value::as_str)?;
+    if !accepted_sources.contains(&source) {
         return None;
     }
     let session_id = payload
@@ -554,23 +570,48 @@ mod tests {
     use super::*;
 
     #[test]
-    fn codex_session_meta_reader_matches_only_cli_source_and_cwd() {
+    fn codex_session_meta_reader_accepts_resumable_interactive_sources() {
         let tmp = tempfile::TempDir::new().unwrap();
         let path = tmp.path().join("rollout.jsonl");
+
+        for source in ["cli", "vscode"] {
+            fs::write(
+                &path,
+                format!(
+                    r#"{{"timestamp":"2099-01-01T00:00:00Z","type":"session_meta","payload":{{"id":"codex-id","session_id":"codex-id","cwd":"/repo","source":"{source}","originator":"codex-tui","timestamp":"2099-01-01T00:00:00Z"}}}}"#,
+                ),
+            )
+            .unwrap();
+            let meta = read_codex_resumable_session_meta(&path).expect("resumable session meta");
+            assert_eq!(meta.session_id, "codex-id");
+            assert_eq!(meta.cwd, "/repo");
+        }
+
         fs::write(
             &path,
-            r#"{"timestamp":"2099-01-01T00:00:00Z","type":"session_meta","payload":{"id":"codex-id","session_id":"codex-id","cwd":"/repo","source":"cli","timestamp":"2099-01-01T00:00:00Z"}}"#,
+            r#"{"timestamp":"2099-01-01T00:00:00Z","type":"session_meta","payload":{"id":"exec-id","cwd":"/repo","source":"exec","originator":"codex_exec","timestamp":"2099-01-01T00:00:00Z"}}"#,
         )
         .unwrap();
-        let meta = read_codex_session_meta(&path).expect("session meta");
-        assert_eq!(meta.session_id, "codex-id");
-        assert_eq!(meta.cwd, "/repo");
+        assert_eq!(read_codex_resumable_session_meta(&path), None);
 
         fs::write(
             &path,
             r#"{"timestamp":"2099-01-01T00:00:00Z","type":"session_meta","payload":{"id":"subagent-id","cwd":"/repo","source":{"subagent":{}},"timestamp":"2099-01-01T00:00:00Z"}}"#,
         )
         .unwrap();
+        assert_eq!(read_codex_resumable_session_meta(&path), None);
+    }
+
+    #[test]
+    fn codex_capture_session_meta_reader_remains_cli_only() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("rollout.jsonl");
+        fs::write(
+            &path,
+            r#"{"timestamp":"2099-01-01T00:00:00Z","type":"session_meta","payload":{"id":"app-server-id","session_id":"app-server-id","cwd":"/repo","source":"vscode","originator":"agent-session","timestamp":"2099-01-01T00:00:00Z"}}"#,
+        )
+        .unwrap();
+
         assert_eq!(read_codex_session_meta(&path), None);
     }
 
@@ -614,7 +655,7 @@ mod tests {
         fs::create_dir_all(&sessions).unwrap();
         fs::write(
             sessions.join("rollout.jsonl"),
-            r#"{"timestamp":"2099-01-01T00:00:00Z","type":"session_meta","payload":{"id":"target-id","session_id":"target-id","cwd":"/repo/one","source":"cli","timestamp":"2099-01-01T00:00:00Z"}}"#,
+            r#"{"timestamp":"2099-01-01T00:00:00Z","type":"session_meta","payload":{"id":"target-id","session_id":"target-id","cwd":"/repo/one","source":"vscode","originator":"codex-tui","timestamp":"2099-01-01T00:00:00Z"}}"#,
         )
         .unwrap();
 
