@@ -55,7 +55,6 @@ const CONTROL_SUBMIT_TOTAL_TIMEOUT: Duration = Duration::from_secs(30);
 const MINIMUM_AUDITED_CODEX_VERSION: (u64, u64, u64) = (0, 144, 1);
 const MANUAL_INPUT_SECTION_FILE: &str = ".codex-app-server-manual-input";
 const MANUAL_INPUT_GATE_FILE: &str = ".codex-app-server-manual-input-gate";
-const MANUAL_INPUT_ACK_FILE: &str = ".codex-app-server-manual-input-ack";
 const MANUAL_INPUT_SECTION_VERSION: &str = "agent-session.codex-manual-input.v1";
 const MANUAL_INPUT_SECTION_TTL: Duration = Duration::from_secs(30);
 const MANUAL_INPUT_GATE_TIMEOUT: Duration = Duration::from_secs(12);
@@ -517,8 +516,8 @@ fn manual_input_gate_path(context: &CliContext, record: &SessionRecord) -> PathB
     crate::session_dir(context, &record.id).join(MANUAL_INPUT_GATE_FILE)
 }
 
-fn manual_input_ack_path(context: &CliContext, record: &SessionRecord) -> PathBuf {
-    crate::session_dir(context, &record.id).join(MANUAL_INPUT_ACK_FILE)
+fn manual_input_ack_path(record: &SessionRecord) -> Option<PathBuf> {
+    proxy_path(record).map(|path| path.with_extension("input-ack"))
 }
 
 fn proxy_capability_path(context: &CliContext, record: &SessionRecord) -> PathBuf {
@@ -731,7 +730,13 @@ pub(crate) fn begin_manual_input_section(
         )
     })?;
     marker.gate_path = Some(gate_path);
-    let ack_path = manual_input_ack_path(context, record);
+    let ack_path = manual_input_ack_path(record).ok_or_else(|| {
+        CliError::data(
+            "codex-input-ack-path-missing",
+            "Codex runtime is missing its private input acknowledgement path",
+            Some(json!({ "id": record.id })),
+        )
+    })?;
     let _ = fs::remove_file(&ack_path);
     let ack_socket = UnixDatagram::bind(&ack_path).map_err(|err| {
         CliError::runtime(
@@ -863,7 +868,7 @@ fn acquire_manual_input_gate(
     }
     UnixDatagram::unbound()
         .ok()?
-        .send_to(&[1], manual_input_ack_path(context, record))
+        .send_to(&[1], manual_input_ack_path(record)?)
         .ok()?;
     Some(ManualInputGate {
         gate_file,
@@ -2546,7 +2551,7 @@ mod tests {
         // SAFETY: test owns this valid descriptor.
         assert_eq!(unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_SH) }, 0);
         open_manual_input_gate_file(&manual_input_gate_path(context, record)).unwrap();
-        let ack_path = manual_input_ack_path(context, record);
+        let ack_path = manual_input_ack_path(record).unwrap();
         let _ = fs::remove_file(&ack_path);
         let ack_socket = UnixDatagram::bind(&ack_path).unwrap();
         ack_socket
