@@ -2025,6 +2025,8 @@ struct SendBody {
     text: Option<String>,
     #[serde(default)]
     keys: Vec<String>,
+    #[serde(default)]
+    bracketed_paste: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2260,6 +2262,7 @@ async fn send_handler(
         id,
         text: body.text,
         text_stdin: false,
+        bracketed_paste: body.bracketed_paste,
         keys,
         tmux_bin: Some(state.tmux_bin.clone()),
         format: nils_common::cli_contract::OutputFormat::Json,
@@ -4493,6 +4496,10 @@ async fn handle_input(
         .get("text")
         .and_then(Value::as_str)
         .map(str::to_string);
+    let bracketed_paste = value
+        .get("bracketed_paste")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
     let mut keys: Vec<SpecialKey> = value
         .get("keys")
         .and_then(Value::as_array)
@@ -4520,7 +4527,14 @@ async fn handle_input(
     let record = record.clone();
     let id = record.id.clone();
     tokio::task::spawn_blocking(move || {
-        send_input_serialized(&context, &record, text.as_deref(), &keys, &tmux)
+        send_input_serialized(
+            &context,
+            &record,
+            text.as_deref(),
+            &keys,
+            &tmux,
+            bracketed_paste,
+        )
     })
     .await
     .map_err(|_| {

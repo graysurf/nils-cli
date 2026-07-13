@@ -52,6 +52,7 @@ const CONTROL_RESPONSE_TIMEOUT: Duration = Duration::from_secs(10);
 const CONTROL_SUBMISSION_TIMEOUT: Duration = Duration::from_secs(15);
 const CONTROL_SUBMIT_TOTAL_TIMEOUT: Duration = Duration::from_secs(30);
 const MINIMUM_AUDITED_CODEX_VERSION: (u64, u64, u64) = (0, 144, 1);
+const APP_SERVER_CAPABILITY_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 const MANUAL_INPUT_SECTION_FILE: &str = ".codex-app-server-manual-input";
 const MANUAL_INPUT_GATE_FILE: &str = ".codex-app-server-manual-input-gate";
 const MANUAL_INPUT_SECTION_VERSION: &str = "agent-session.codex-manual-input.v1";
@@ -155,7 +156,7 @@ fn bounded_command_output(agent_bin: &Path, args: &[&str]) -> Option<std::proces
     loop {
         match child.try_wait() {
             Ok(Some(_)) => break,
-            Ok(None) if started.elapsed() < Duration::from_millis(250) => {
+            Ok(None) if started.elapsed() < APP_SERVER_CAPABILITY_PROBE_TIMEOUT => {
                 thread::sleep(Duration::from_millis(10));
             }
             Ok(None) | Err(_) => {
@@ -2680,6 +2681,31 @@ mod tests {
             fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
             assert_eq!(app_server_capability_available(&path), expected, "{name}");
         }
+    }
+
+    #[test]
+    fn capability_probe_tolerates_cold_start_latency() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("cold-codex");
+        fs::write(
+            &path,
+            r#"#!/bin/sh
+sleep 0.35
+if [ "$1" = --version ]; then
+  printf '%s\n' 'codex-cli 0.144.1'
+  exit 0
+fi
+if [ "$1" = app-server ] && [ "$2" = --help ]; then
+  printf '%s\n' '  --listen <URL>  Supported values: stdio://, unix://PATH'
+  exit 0
+fi
+exit 1
+"#,
+        )
+        .unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+
+        assert!(app_server_capability_available(&path));
     }
 
     #[test]

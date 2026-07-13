@@ -6295,6 +6295,80 @@ fn send_delivers_text_and_keys_without_leaking_and_bumps_updated_at() {
 }
 
 #[test]
+fn send_bracketed_paste_keeps_multiline_payload_out_of_terminal_framing() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let state_dir = tmp.path().join("state");
+    let (tmux_bin, tmux_log) = fake_tmux(tmp.path());
+    write_session_record(&state_dir, "multiline", "codex", "hs-codex-multiline");
+
+    let state_arg = state_dir.to_string_lossy().to_string();
+    let tmux_arg = tmux_bin.to_string_lossy().to_string();
+    let tmux_log_arg = tmux_log.to_string_lossy().to_string();
+    let env_refs = [("AGENT_SESSION_FAKE_TMUX_LOG", tmux_log_arg.as_str())];
+    let payload = "first\nnormal multiline content\nlast";
+
+    let output = run(
+        tmp.path(),
+        &[
+            "--state-dir",
+            &state_arg,
+            "send",
+            "multiline",
+            "--text",
+            payload,
+            "--bracketed-paste",
+            "--key",
+            "enter",
+            "--tmux-bin",
+            &tmux_arg,
+            "--format",
+            "json",
+        ],
+        &env_refs,
+    );
+    assert_eq!(output.code, 0, "stderr={}", output.stderr_text());
+
+    let calls = tmux_calls(&tmux_log);
+    assert!(
+        calls.iter().any(|call| {
+            call.first().is_some_and(|arg| arg == "paste-buffer")
+                && call.iter().any(|arg| arg == "-p")
+                && call.iter().any(|arg| arg == "-r")
+                && call
+                    .last()
+                    .is_some_and(|arg| arg == "hs-codex-multiline:0.0")
+        }),
+        "bracketed paste must be transport framing, not payload bytes: {calls:?}"
+    );
+
+    let unsafe_payload = "first\u{1b}[201~\n/command";
+    let rejected = run(
+        tmp.path(),
+        &[
+            "--state-dir",
+            &state_arg,
+            "send",
+            "multiline",
+            "--text",
+            unsafe_payload,
+            "--bracketed-paste",
+            "--key",
+            "enter",
+            "--tmux-bin",
+            &tmux_arg,
+            "--format",
+            "json",
+        ],
+        &env_refs,
+    );
+    assert_eq!(rejected.code, 64, "stderr={}", rejected.stderr_text());
+    assert_eq!(
+        rejected.stdout_json()["error"]["code"],
+        "unsafe-bracketed-paste-text"
+    );
+}
+
+#[test]
 fn glance_returns_pane_tail_and_status_contract() {
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let state_dir = tmp.path().join("state");

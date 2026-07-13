@@ -246,6 +246,11 @@ pub struct SendArgs {
     #[arg(long = "text-stdin")]
     pub text_stdin: bool,
 
+    /// Paste text as one bracketed terminal edit. Preserves embedded newlines
+    /// and keeps framing outside the payload bytes.
+    #[arg(long = "bracketed-paste")]
+    pub bracketed_paste: bool,
+
     /// Special key to press (repeatable), applied in order after any text.
     #[arg(long = "key", value_enum, value_name = "KEY")]
     pub keys: Vec<SpecialKey>,

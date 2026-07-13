@@ -1744,6 +1744,7 @@ fn delete_tmux_buffer(tmux_bin: &Path, buffer_name: &str) {
 
 fn send_to_session(context: &CliContext, args: cli::SendArgs) -> Result<SendResult, CliError> {
     let text = read_send_text(&args.text, args.text_stdin)?;
+    validate_bracketed_paste_text(text.as_deref(), args.bracketed_paste)?;
     if text.is_none() && args.keys.is_empty() {
         return Err(CliError::usage(
             "empty-send",
@@ -1778,6 +1779,7 @@ fn send_to_session(context: &CliContext, args: cli::SendArgs) -> Result<SendResu
         text.as_deref(),
         &args.keys,
         &tmux_bin,
+        args.bracketed_paste,
         Some(&mut manual_input),
     )?;
     record.updated_at = Zoned::now().timestamp().to_string();
@@ -1803,8 +1805,38 @@ fn send_input_serialized(
     text: Option<&str>,
     keys: &[SpecialKey],
     tmux_bin: &Path,
+    bracketed_paste: bool,
 ) -> Result<(), CliError> {
-    send_input_serialized_with_title_guard(context, expected, text, keys, tmux_bin, false)
+    validate_bracketed_paste_text(text, bracketed_paste)?;
+    send_input_serialized_with_title_guard(
+        context,
+        expected,
+        text,
+        keys,
+        tmux_bin,
+        bracketed_paste,
+        false,
+    )
+}
+
+fn validate_bracketed_paste_text(
+    text: Option<&str>,
+    bracketed_paste: bool,
+) -> Result<(), CliError> {
+    let has_unsafe_control = bracketed_paste
+        && text.is_some_and(|value| {
+            value
+                .chars()
+                .any(|ch| ch.is_control() && !matches!(ch, '\n' | '\r' | '\t'))
+        });
+    if has_unsafe_control {
+        return Err(CliError::usage(
+            "unsafe-bracketed-paste-text",
+            "bracketed paste text may contain newlines and tabs, but not terminal control characters",
+            None,
+        ));
+    }
+    Ok(())
 }
 
 fn send_title_rename_serialized(
@@ -1814,7 +1846,7 @@ fn send_title_rename_serialized(
     keys: &[SpecialKey],
     tmux_bin: &Path,
 ) -> Result<(), CliError> {
-    send_input_serialized_with_title_guard(context, expected, text, keys, tmux_bin, true)
+    send_input_serialized_with_title_guard(context, expected, text, keys, tmux_bin, false, true)
 }
 
 fn send_input_serialized_with_title_guard(
@@ -1823,6 +1855,7 @@ fn send_input_serialized_with_title_guard(
     text: Option<&str>,
     keys: &[SpecialKey],
     tmux_bin: &Path,
+    bracketed_paste: bool,
     require_current_title: bool,
 ) -> Result<(), CliError> {
     let record_lock = acquire_session_record_lock(context, &expected.id)?;
@@ -1859,6 +1892,7 @@ fn send_input_serialized_with_title_guard(
         text,
         keys,
         tmux_bin,
+        bracketed_paste,
         Some(&mut manual_input),
     )
 }
@@ -1887,6 +1921,7 @@ pub(crate) fn send_auto_resume_input(
         Some(text),
         &[SpecialKey::Enter],
         tmux_bin,
+        false,
         None,
     )
 }
@@ -1932,6 +1967,7 @@ fn send_input_unlocked(
     text: Option<&str>,
     keys: &[SpecialKey],
     tmux_bin: &Path,
+    bracketed_paste: bool,
     mut manual_input: Option<&mut ManualInputSection>,
 ) -> Result<(), CliError> {
     let target = format!("{}:0.0", record.tmux_session);
@@ -1952,6 +1988,7 @@ fn send_input_unlocked(
                 &target,
                 &temp,
                 PANE_INPUT_COMMAND_TIMEOUT,
+                bracketed_paste,
             );
             let _ = fs::remove_file(&temp);
             result?;
@@ -1984,6 +2021,7 @@ fn load_and_paste_buffer_with_timeout(
     target: &str,
     file: &Path,
     timeout: Duration,
+    bracketed_paste: bool,
 ) -> Result<(), CliError> {
     let mut load = ProcessCommand::new(tmux_bin);
     load.arg("load-buffer").arg("-b").arg(buffer_name).arg(file);
@@ -1994,9 +2032,11 @@ fn load_and_paste_buffer_with_timeout(
         .arg("paste-buffer")
         .arg("-b")
         .arg(buffer_name)
-        .arg("-d")
-        .arg("-t")
-        .arg(target);
+        .arg("-d");
+    if bracketed_paste {
+        paste.arg("-p").arg("-r");
+    }
+    paste.arg("-t").arg(target);
     if let Err(err) = run_status_with_timeout(paste, "tmux paste-buffer", timeout) {
         delete_tmux_buffer(tmux_bin, buffer_name);
         return Err(err);
