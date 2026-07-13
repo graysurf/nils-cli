@@ -167,10 +167,20 @@ pub fn build_report(snapshot: ProbeSnapshot, strict: bool) -> PreflightReport {
 }
 
 pub fn build_report_with_probes(
-    snapshot: ProbeSnapshot,
+    mut snapshot: ProbeSnapshot,
     strict: bool,
     mut probe_checks: Vec<CheckReport>,
 ) -> PreflightReport {
+    let screenshot_probe_succeeded = probe_checks
+        .iter()
+        .any(|check| check.id == "probe_screenshot" && check.status == CheckStatus::Ok);
+    if snapshot.screen_recording_signal.state == PermissionState::Unknown
+        && screenshot_probe_succeeded
+    {
+        snapshot.screen_recording_signal =
+            PermissionSignal::ready("Screenshot probe confirmed Screen Recording access.");
+    }
+
     let permissions = permission_status_from_snapshot(&snapshot);
 
     let checks = vec![

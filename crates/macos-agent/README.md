@@ -202,6 +202,11 @@ Preflight permission contract (`macos-agent --format json preflight`):
 }
 ```
 
+When `--include-probes` is set, a successful screenshot probe promotes an
+otherwise `unknown` Screen Recording state to `ready` for that preflight run.
+This reconciliation happens before `--strict` evaluates warnings, so confirmed
+capture access does not produce a false `not_ready` result.
+
 Mutating action commands (`window activate`, `input click`, `input move`, `input drag`, `input scroll`, `input type`, `input key`,
 `input hotkey`, `ax click`, `ax type`) always include
 `result.policy` in JSON output so agent-side retry and timeout policy can be parsed without guessing defaults. These action results also
