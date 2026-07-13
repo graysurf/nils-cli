@@ -142,6 +142,14 @@ fn app_server_capability_available(agent_bin: &Path) -> bool {
 }
 
 fn bounded_command_output(agent_bin: &Path, args: &[&str]) -> Option<std::process::Output> {
+    bounded_command_output_with_timeout(agent_bin, args, APP_SERVER_CAPABILITY_PROBE_TIMEOUT)
+}
+
+fn bounded_command_output_with_timeout(
+    agent_bin: &Path,
+    args: &[&str],
+    timeout: Duration,
+) -> Option<std::process::Output> {
     let Ok(mut child) = Command::new(agent_bin)
         .args(args)
         .stdin(Stdio::null())
@@ -156,7 +164,7 @@ fn bounded_command_output(agent_bin: &Path, args: &[&str]) -> Option<std::proces
     loop {
         match child.try_wait() {
             Ok(Some(_)) => break,
-            Ok(None) if started.elapsed() < APP_SERVER_CAPABILITY_PROBE_TIMEOUT => {
+            Ok(None) if started.elapsed() < timeout => {
                 thread::sleep(Duration::from_millis(10));
             }
             Ok(None) | Err(_) => {
@@ -2706,6 +2714,46 @@ exit 1
         fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
 
         assert!(app_server_capability_available(&path));
+    }
+
+    #[test]
+    fn capability_probe_timeout_kills_and_reaps_the_process_group() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("hung-codex");
+        let pid_file = tmp.path().join("descendant.pid");
+        fs::write(
+            &path,
+            format!(
+                "#!/bin/sh\nsleep 60 &\nprintf '%s' \"$!\" > {}\nwait\n",
+                shell_words::quote(&pid_file.to_string_lossy())
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+
+        let started = Instant::now();
+        assert!(
+            bounded_command_output_with_timeout(&path, &["--version"], Duration::from_millis(100))
+                .is_none()
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "injected probe timeout must remain bounded"
+        );
+
+        let pid = fs::read_to_string(&pid_file)
+            .unwrap()
+            .parse::<libc::pid_t>()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while unsafe { libc::kill(pid, 0) } == 0 && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(25));
+        }
+        assert_eq!(unsafe { libc::kill(pid, 0) }, -1);
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ESRCH)
+        );
     }
 
     #[test]
