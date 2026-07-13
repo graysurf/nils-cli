@@ -53,6 +53,7 @@ const CONTROL_SUBMISSION_TIMEOUT: Duration = Duration::from_secs(15);
 const CONTROL_SUBMIT_TOTAL_TIMEOUT: Duration = Duration::from_secs(30);
 const MINIMUM_AUDITED_CODEX_VERSION: (u64, u64, u64) = (0, 144, 1);
 const APP_SERVER_CAPABILITY_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+const APP_SERVER_CAPABILITY_PROBE_MAX_OUTPUT_BYTES: u64 = 64 * 1024;
 const MANUAL_INPUT_SECTION_FILE: &str = ".codex-app-server-manual-input";
 const MANUAL_INPUT_GATE_FILE: &str = ".codex-app-server-manual-input-gate";
 const MANUAL_INPUT_SECTION_VERSION: &str = "agent-session.codex-manual-input.v1";
@@ -160,28 +161,72 @@ fn bounded_command_output_with_timeout(
     else {
         return None;
     };
-    let started = Instant::now();
+    let mut stdout_pipe = child.stdout.take()?;
+    let mut stderr_pipe = child.stderr.take()?;
+    let (output_tx, output_rx) = std::sync::mpsc::channel();
+    let stdout_tx = output_tx.clone();
+    thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let _ = stdout_pipe
+            .by_ref()
+            .take(APP_SERVER_CAPABILITY_PROBE_MAX_OUTPUT_BYTES)
+            .read_to_end(&mut bytes);
+        let _ = stdout_tx.send((true, bytes));
+    });
+    thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let _ = stderr_pipe
+            .by_ref()
+            .take(APP_SERVER_CAPABILITY_PROBE_MAX_OUTPUT_BYTES)
+            .read_to_end(&mut bytes);
+        let _ = output_tx.send((false, bytes));
+    });
+
+    let deadline = Instant::now() + timeout;
+    let mut status = None;
+    let mut stdout = None;
+    let mut stderr = None;
     loop {
-        match child.try_wait() {
-            Ok(Some(_)) => break,
-            Ok(None) if started.elapsed() < timeout => {
-                thread::sleep(Duration::from_millis(10));
-            }
-            Ok(None) | Err(_) => {
-                let pid = child.id();
-                unsafe {
-                    libc::kill(-(pid as i32), libc::SIGKILL);
+        if status.is_none() {
+            match child.try_wait() {
+                Ok(Some(exit)) if exit.success() => status = Some(exit),
+                Ok(Some(_)) | Err(_) => {
+                    terminate_probe_process_group(&mut child);
+                    return None;
                 }
-                let _ = child.wait();
-                return None;
+                Ok(None) => {}
             }
         }
+        while let Ok((is_stdout, bytes)) = output_rx.try_recv() {
+            if is_stdout {
+                stdout = Some(bytes);
+            } else {
+                stderr = Some(bytes);
+            }
+        }
+        if status.is_some() && stdout.is_some() && stderr.is_some() {
+            return Some(std::process::Output {
+                status: status.take().expect("checked probe status"),
+                stdout: stdout.take().expect("checked probe stdout"),
+                stderr: stderr.take().expect("checked probe stderr"),
+            });
+        }
+        if Instant::now() >= deadline {
+            terminate_probe_process_group(&mut child);
+            return None;
+        }
+        thread::sleep(Duration::from_millis(10));
     }
-    let output = child.wait_with_output().ok()?;
-    if !output.status.success() {
-        return None;
+}
+
+fn terminate_probe_process_group(child: &mut std::process::Child) {
+    let pid = child.id();
+    // SAFETY: the probe is launched as the leader of a fresh process group.
+    unsafe {
+        libc::kill(-(pid as i32), libc::SIGKILL);
     }
-    Some(output)
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 fn parse_version_triplet(raw: &str) -> Option<(u64, u64, u64)> {
@@ -2733,12 +2778,52 @@ exit 1
 
         let started = Instant::now();
         assert!(
-            bounded_command_output_with_timeout(&path, &["--version"], Duration::from_millis(100))
+            bounded_command_output_with_timeout(&path, &["--version"], Duration::from_millis(500))
                 .is_none()
         );
         assert!(
-            started.elapsed() < Duration::from_secs(1),
+            started.elapsed() < Duration::from_secs(2),
             "injected probe timeout must remain bounded"
+        );
+
+        let pid = fs::read_to_string(&pid_file)
+            .unwrap()
+            .parse::<libc::pid_t>()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while unsafe { libc::kill(pid, 0) } == 0 && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(25));
+        }
+        assert_eq!(unsafe { libc::kill(pid, 0) }, -1);
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ESRCH)
+        );
+    }
+
+    #[test]
+    fn capability_probe_timeout_kills_descendant_after_leader_exits() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("exited-codex");
+        let pid_file = tmp.path().join("descendant.pid");
+        fs::write(
+            &path,
+            format!(
+                "#!/bin/sh\nsleep 60 &\nprintf '%s' \"$!\" > {}\nexit 0\n",
+                shell_words::quote(&pid_file.to_string_lossy())
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+
+        let started = Instant::now();
+        assert!(
+            bounded_command_output_with_timeout(&path, &["--version"], Duration::from_millis(500))
+                .is_none()
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "output collection must remain under the injected probe timeout"
         );
 
         let pid = fs::read_to_string(&pid_file)
