@@ -246,9 +246,10 @@ is no second state model.
   or the raw CR/LF frame emitted by an attached terminal) already performs the
   same cancellation while holding the lifecycle lock. A live proxy advertises
   this coordination capability with a private, launch-bound, file-locked
-  marker; older live proxies reject submitting control-plane input and attach
-  reports a versioned `input_error` event. Immediately before the submitting
-  tmux operation, the sender opens a bounded manual-input section. If ordinary
+  marker; older live proxies reject HTTP submission, while attached input
+  disconnects without mutating auto-resume and requires session recreation.
+  Immediately before the submitting tmux operation, the sender opens a bounded
+  manual-input section. If ordinary
   proxy cancellation reports Busy, only a valid `turn/start` for the exact
   bound thread may hold that section's gate while it is forwarded. Gate teardown
   completes before the sender releases the lifecycle lock and removes the

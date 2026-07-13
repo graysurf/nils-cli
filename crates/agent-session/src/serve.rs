@@ -4069,11 +4069,12 @@ async fn attach_socket(
                             &resize_lock,
                         )
                         .await
-                            && control_tx
-                                .send(Message::Text(attach_input_error_frame(err).into()))
-                                .await
-                                .is_err()
                         {
+                            eprintln!(
+                                "warning: terminal input failed for {}: {}",
+                                record.id,
+                                err.code()
+                            );
                             break;
                         }
                     }
@@ -4529,20 +4530,6 @@ async fn handle_input(
             Some(json!({ "id": id })),
         )
     })?
-}
-
-fn attach_input_error_frame(err: CliError) -> String {
-    let err = err.into_inner();
-    json!({
-        "schema_version": ATTACH_EVENT_SCHEMA_VERSION,
-        "type": "input_error",
-        "error": {
-            "code": err.code,
-            "message": err.message,
-            "details": err.details,
-        }
-    })
-    .to_string()
 }
 
 #[cfg(test)]
@@ -10819,10 +10806,6 @@ mod tests {
         .unwrap_err();
         assert_eq!(error.code(), "codex-input-section-unavailable");
         assert!(auto_resume::view_for_record(&context, &record).enabled);
-        let frame: Value = serde_json::from_str(&attach_input_error_frame(error)).unwrap();
-        assert_eq!(frame["schema_version"], ATTACH_EVENT_SCHEMA_VERSION);
-        assert_eq!(frame["type"], "input_error");
-        assert_eq!(frame["error"]["code"], "codex-input-section-unavailable");
     }
 
     #[tokio::test]
