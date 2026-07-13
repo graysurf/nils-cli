@@ -17,6 +17,12 @@ It deliberately lives outside `nils-common`: the bounded scan needs monotonic
 time (`Instant::now`) to cap its wall-clock cost, which the `nils-common`
 render-path determinism gate forbids.
 
+For canonical Codex UUIDv7 ids, resolution first derives the UTC
+`sessions/YYYY/MM/DD` directory from the id timestamp and checks only matching
+rollout filenames there. If that fast path finds no valid metadata, resolution
+falls back to the bounded full-history scan so non-UUIDv7 ids and non-canonical
+history layouts remain supported.
+
 ## Surface
 
 - `resolve_resume_source(provider, session_id) -> Result<ResolvedResume, ResumeResolveError>`

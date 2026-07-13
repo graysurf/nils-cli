@@ -140,23 +140,122 @@ pub fn resolve_resume_source_in(
     root: &Path,
     session_id: &str,
 ) -> Result<ResolvedResume, ResumeResolveError> {
+    if provider == ResumeProvider::Codex {
+        return resolve_codex_resume_source_in_with_budget_factory(
+            root,
+            session_id,
+            CodexResumeScanBudget::from_env(),
+            CodexResumeScanBudget::from_env,
+        );
+    }
+
     let mut matches = BTreeSet::new();
-    let truncated = match provider {
-        ResumeProvider::Codex => {
-            let mut budget = CodexResumeScanBudget::from_env();
-            collect_codex_provider_resume_matches(root, 0, session_id, &mut matches, &mut budget);
-            budget.truncated
-        }
-        ResumeProvider::Claude => {
-            let mut budget = ClaudeResumeScanBudget::from_env();
-            collect_claude_provider_resume_matches(root, session_id, &mut matches, &mut budget);
-            budget.truncated
-        }
-    };
-    if truncated {
+    let mut budget = ClaudeResumeScanBudget::from_env();
+    collect_claude_provider_resume_matches(root, session_id, &mut matches, &mut budget);
+    if budget.truncated {
         return Err(ResumeResolveError::Truncated);
     }
     resolved_from_matches(matches, provider.capture_method())
+}
+
+fn resolve_codex_resume_source_in_with_budget_factory<F>(
+    root: &Path,
+    session_id: &str,
+    mut canonical_budget: CodexResumeScanBudget,
+    fallback_budget: F,
+) -> Result<ResolvedResume, ResumeResolveError>
+where
+    F: FnOnce() -> CodexResumeScanBudget,
+{
+    let mut matches = BTreeSet::new();
+    if let Some(day) = codex_uuid_v7_session_day(root, session_id) {
+        collect_codex_canonical_day_matches(&day, session_id, &mut matches, &mut canonical_budget);
+        if canonical_budget.truncated {
+            return Err(ResumeResolveError::Truncated);
+        }
+        if !matches.is_empty() {
+            return resolved_from_matches(matches, ResumeProvider::Codex.capture_method());
+        }
+    }
+
+    let mut fallback_budget = fallback_budget();
+    collect_codex_provider_resume_matches(root, 0, session_id, &mut matches, &mut fallback_budget);
+    if fallback_budget.truncated {
+        return Err(ResumeResolveError::Truncated);
+    }
+    resolved_from_matches(matches, ResumeProvider::Codex.capture_method())
+}
+
+fn codex_uuid_v7_session_day(root: &Path, session_id: &str) -> Option<PathBuf> {
+    let compact: String = session_id
+        .chars()
+        .filter(|character| *character != '-')
+        .collect();
+    if compact.len() != 32
+        || !compact.bytes().all(|byte| byte.is_ascii_hexdigit())
+        || compact.as_bytes()[12] != b'7'
+        || !matches!(
+            compact.as_bytes()[16],
+            b'8' | b'9' | b'a' | b'b' | b'A' | b'B'
+        )
+    {
+        return None;
+    }
+    let milliseconds = i64::try_from(u64::from_str_radix(&compact[..12], 16).ok()?).ok()?;
+    let utc = Timestamp::from_millisecond(milliseconds)
+        .ok()?
+        .in_tz("UTC")
+        .ok()?;
+    Some(
+        root.join(format!("{:04}", utc.year()))
+            .join(format!("{:02}", utc.month()))
+            .join(format!("{:02}", utc.day())),
+    )
+}
+
+fn collect_codex_canonical_day_matches(
+    day: &Path,
+    session_id: &str,
+    matches: &mut BTreeSet<ProviderHistoryMatch>,
+    budget: &mut CodexResumeScanBudget,
+) {
+    let Ok(entries) = fs::read_dir(day) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if !budget.visit_entry() {
+            return;
+        }
+        let file_name = entry.file_name();
+        let Some(file_name) = file_name.to_str() else {
+            continue;
+        };
+        let Some(stem) = file_name.strip_suffix(".jsonl") else {
+            continue;
+        };
+        if stem != session_id
+            && !stem
+                .strip_suffix(session_id)
+                .is_some_and(|prefix| prefix.ends_with('-'))
+        {
+            continue;
+        }
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if !file_type.is_file() {
+            continue;
+        }
+        let path = entry.path();
+        if let Some(meta) = read_codex_resumable_session_meta(&path)
+            && meta.session_id == session_id
+        {
+            matches.insert(ProviderHistoryMatch {
+                path,
+                cwd: meta.cwd,
+            });
+        }
+    }
 }
 
 fn resolved_from_matches(
@@ -662,6 +761,65 @@ mod tests {
         let resolved =
             resolve_resume_source_in(ResumeProvider::Codex, &sessions, "target-id").unwrap();
         assert_eq!(resolved.cwd, PathBuf::from("/repo/one"));
+        assert_eq!(resolved.capture_method, "codex-session-meta-import");
+    }
+
+    #[test]
+    fn resolve_canonical_codex_resume_source_before_broad_scan_budget() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let session_id = "019f5c96-65c0-7140-8657-0ce2ecb45aa5";
+        let day = tmp.path().join("sessions/2026/07/13");
+        fs::create_dir_all(&day).unwrap();
+        fs::write(
+            day.join(format!(
+                "rollout-2026-07-13T17-46-28-{session_id}.jsonl"
+            )),
+            format!(
+                r#"{{"timestamp":"2026-07-13T17:46:28.216Z","type":"session_meta","payload":{{"id":"{session_id}","session_id":"{session_id}","cwd":"/repo/exact","source":"cli","timestamp":"2026-07-13T17:46:28.216Z"}}}}"#
+            ),
+        )
+        .unwrap();
+
+        let one_entry_budget = || CodexResumeScanBudget {
+            visited: 0,
+            max_entries: 1,
+            deadline: Instant::now() + Duration::from_secs(60),
+            truncated: false,
+        };
+        let resolved = resolve_codex_resume_source_in_with_budget_factory(
+            &tmp.path().join("sessions"),
+            session_id,
+            one_entry_budget(),
+            one_entry_budget,
+        )
+        .unwrap();
+
+        assert_eq!(resolved.cwd, PathBuf::from("/repo/exact"));
+        assert_eq!(resolved.capture_method, "codex-session-meta-import");
+    }
+
+    #[test]
+    fn resolve_uuid_v7_codex_resume_source_falls_back_for_noncanonical_history() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let session_id = "019f5c96-65c0-7140-8657-0ce2ecb45aa5";
+        let fallback_layout = tmp.path().join("sessions/history");
+        fs::create_dir_all(&fallback_layout).unwrap();
+        fs::write(
+            fallback_layout.join("rollout.jsonl"),
+            format!(
+                r#"{{"timestamp":"2026-07-13T17:46:28.216Z","type":"session_meta","payload":{{"id":"{session_id}","session_id":"{session_id}","cwd":"/repo/fallback","source":"cli","timestamp":"2026-07-13T17:46:28.216Z"}}}}"#
+            ),
+        )
+        .unwrap();
+
+        let resolved = resolve_resume_source_in(
+            ResumeProvider::Codex,
+            &tmp.path().join("sessions"),
+            session_id,
+        )
+        .unwrap();
+
+        assert_eq!(resolved.cwd, PathBuf::from("/repo/fallback"));
         assert_eq!(resolved.capture_method, "codex-session-meta-import");
     }
 
