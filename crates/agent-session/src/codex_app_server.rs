@@ -1676,6 +1676,13 @@ enum ProxyObservation {
     Server(Value),
 }
 
+enum ServerProjection {
+    Irrelevant,
+    Repeatable(Value),
+    Unique(Value),
+    RejectedUnique,
+}
+
 struct ProxyProjection {
     sender: Option<mpsc::Sender<ProxyObservation>>,
     task: Option<tokio::task::JoinHandle<()>>,
@@ -1723,8 +1730,15 @@ impl ProxyProjection {
     }
 
     fn observe_server(&mut self, value: &Value) {
-        if let Some(value) = server_observation(value) {
-            self.enqueue(ProxyObservation::Server(value));
+        match server_observation(value) {
+            ServerProjection::Irrelevant => {}
+            ServerProjection::Repeatable(value) | ServerProjection::Unique(value) => {
+                self.enqueue(ProxyObservation::Server(value));
+            }
+            ServerProjection::RejectedUnique => {
+                eprintln!("warning: Codex projection disabled: unique observation was invalid");
+                self.disable();
+            }
         }
     }
 
@@ -1801,24 +1815,34 @@ fn client_observation(value: &Value) -> Option<Value> {
     bounded_observation(observation)
 }
 
-fn server_observation(value: &Value) -> Option<Value> {
+fn server_observation(value: &Value) -> ServerProjection {
     if let (Some(id), Some(thread_id)) = (value.get("id"), value.pointer("/result/thread/id")) {
-        json_id_key(id)?;
-        let thread_id = thread_id.as_str()?;
-        if !protocol_id_is_valid(thread_id) {
-            return None;
+        let Some(thread_id) = thread_id.as_str() else {
+            return ServerProjection::RejectedUnique;
+        };
+        if json_id_key(id).is_none() || !protocol_id_is_valid(thread_id) {
+            return ServerProjection::RejectedUnique;
         }
         return bounded_observation(json!({
             "id": id,
             "result": { "thread": { "id": thread_id } }
-        }));
+        }))
+        .map(ServerProjection::Unique)
+        .unwrap_or(ServerProjection::RejectedUnique);
     }
-    let observation = match value.get("method").and_then(Value::as_str)? {
+    let Some(method) = value.get("method").and_then(Value::as_str) else {
+        return ServerProjection::Irrelevant;
+    };
+    let observation = match method {
         "error" => {
-            let thread_id = value.pointer("/params/threadId")?.as_str()?;
-            let turn_id = value.pointer("/params/turnId")?.as_str()?;
+            let (Some(thread_id), Some(turn_id)) = (
+                value.pointer("/params/threadId").and_then(Value::as_str),
+                value.pointer("/params/turnId").and_then(Value::as_str),
+            ) else {
+                return ServerProjection::RejectedUnique;
+            };
             if !protocol_id_is_valid(thread_id) || !protocol_id_is_valid(turn_id) {
-                return None;
+                return ServerProjection::RejectedUnique;
             }
             json!({
                 "method": "error",
@@ -1833,10 +1857,14 @@ fn server_observation(value: &Value) -> Option<Value> {
             })
         }
         "turn/completed" => {
-            let thread_id = value.pointer("/params/threadId")?.as_str()?;
-            let turn_id = value.pointer("/params/turn/id")?.as_str()?;
+            let (Some(thread_id), Some(turn_id)) = (
+                value.pointer("/params/threadId").and_then(Value::as_str),
+                value.pointer("/params/turn/id").and_then(Value::as_str),
+            ) else {
+                return ServerProjection::RejectedUnique;
+            };
             if !protocol_id_is_valid(thread_id) || !protocol_id_is_valid(turn_id) {
-                return None;
+                return ServerProjection::RejectedUnique;
             }
             json!({
                 "method": "turn/completed",
@@ -1859,9 +1887,16 @@ fn server_observation(value: &Value) -> Option<Value> {
                 "rateLimitsByLimitId": value.pointer("/params/rateLimitsByLimitId")
             }
         }),
-        _ => return None,
+        _ => return ServerProjection::Irrelevant,
     };
-    bounded_observation(observation)
+    match bounded_observation(observation) {
+        Some(observation) if method == "account/rateLimits/updated" => {
+            ServerProjection::Repeatable(observation)
+        }
+        Some(observation) => ServerProjection::Unique(observation),
+        None if method == "account/rateLimits/updated" => ServerProjection::Irrelevant,
+        None => ServerProjection::RejectedUnique,
+    }
 }
 
 fn bounded_observation(value: Value) -> Option<Value> {
@@ -3031,7 +3066,7 @@ mod tests {
             }))
             .is_none()
         );
-        assert!(
+        assert!(matches!(
             server_observation(&json!({
                 "method": "account/rateLimits/updated",
                 "params": {
@@ -3042,9 +3077,9 @@ mod tests {
                         }
                     }
                 }
-            }))
-            .is_none()
-        );
+            })),
+            ServerProjection::Irrelevant
+        ));
     }
 
     #[tokio::test]
@@ -3078,6 +3113,46 @@ mod tests {
         assert!(view.enabled);
         assert_eq!(view.state, "enabled");
         assert_eq!(view.failure_reason, None);
+    }
+
+    #[tokio::test]
+    async fn oversized_selected_unique_observation_fails_closed() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let context = CliContext {
+            state_dir: tmp.path().join("state"),
+            host: None,
+        };
+        let record = record_with_runtime("oversized-unique", &tmp.path().join("server.sock"));
+        fs::create_dir_all(crate::session_dir(&context, &record.id)).unwrap();
+        crate::write_session_record(&context, &record).unwrap();
+        crate::activity::activate_runtime(&context, &record).unwrap();
+        crate::auto_resume::set_enabled(&context, &record.id, true, "2030-01-01T00:00:00Z")
+            .unwrap();
+        let mut projection = ProxyProjection::new(context.clone(), record.clone());
+
+        projection.observe_server(&json!({
+            "method": "turn/completed",
+            "params": {
+                "threadId": "thread-a",
+                "turn": {
+                    "id": "turn-a",
+                    "status": "failed",
+                    "error": {
+                        "codexErrorInfo": "x".repeat(MAX_PROXY_OBSERVATION_BYTES)
+                    }
+                }
+            }
+        }));
+        for _ in 0..20 {
+            let view = crate::auto_resume::view_for_record(&context, &record);
+            if view.state == "terminal_failure" {
+                assert!(!view.enabled);
+                assert_eq!(view.failure_reason.as_deref(), Some("state_unavailable"));
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        panic!("oversized selected unique observation did not fail closed");
     }
 
     #[tokio::test]
