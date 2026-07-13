@@ -2358,14 +2358,40 @@ async fn structured_prompt_handler(
         );
     };
 
-    match handle.submit_prompt(&body.text).await {
+    // Serialize this provider mutation with replacement, terminal input, and
+    // auto-resume ticks. Cancellation intentionally leaves the healthy idle
+    // `enabled` state intact for a fresh session, while disarming any
+    // continuation that was already armed or scheduled before this request.
+    let lock_context = state.context.clone();
+    let expected = record.clone();
+    let record_lock = match tokio::task::spawn_blocking(move || {
+        let record_lock = crate::acquire_session_record_lock(&lock_context, &expected.id)?;
+        let current = load_session_record(&lock_context, &expected.id)?;
+        crate::ensure_same_session_identity(&expected, &current)?;
+        auto_resume::cancel_for_manual_input_locked(
+            &lock_context,
+            &current.id,
+            &jiff::Timestamp::now().to_string(),
+        )?;
+        Ok::<_, CliError>(record_lock)
+    })
+    .await
+    {
+        Ok(Ok(record_lock)) => record_lock,
+        Ok(Err(err)) => return envelope_err(err),
+        Err(_) => return join_err(),
+    };
+
+    let response = match handle.submit_prompt(&body.text).await {
         Ok(_) => envelope_ok(json!({ "machine": state.machine, "submitted": true })),
         Err(_) => status_json(
             StatusCode::INTERNAL_SERVER_ERROR,
             "structured-prompt-outcome-unknown",
             "structured prompt submission outcome is unknown",
         ),
-    }
+    };
+    drop(record_lock);
+    response
 }
 
 fn structured_prompt_has_unsafe_control(text: &str) -> bool {
@@ -9306,12 +9332,17 @@ mod tests {
             Some(TOKEN),
             PathBuf::from("/terminal-transport-must-not-run"),
         );
+        let record = load_session_record(&st.context, "structured").unwrap();
+        crate::activity::activate_runtime(&st.context, &record).unwrap();
+        auto_resume::set_enabled(&st.context, &record.id, true, "2030-01-01T00:00:00Z").unwrap();
         let (handle, mut commands) = codex_app_server::control_channel();
         st.codex_controls.lock().unwrap().insert(
             "structured".to_string(),
             CodexControlEntry { launch_id, handle },
         );
         let prompt = "inspect first line\nthen second line";
+        let responder_context = st.context.clone();
+        let responder_record = record.clone();
         let responder = tokio::spawn(async move {
             let Some(codex_app_server::ControlCommand::Prompt { message, response }) =
                 commands.recv().await
@@ -9319,6 +9350,9 @@ mod tests {
                 panic!("structured prompt did not reach the Codex control plane");
             };
             assert_eq!(message, prompt);
+            let view = auto_resume::view_for_record(&responder_context, &responder_record);
+            assert!(view.enabled);
+            assert_eq!(view.state, "enabled");
             response.send(Ok("turn-structured".to_string())).unwrap();
         });
 
@@ -9345,6 +9379,62 @@ mod tests {
         assert_eq!(status, StatusCode::OK, "body={body}");
         assert_eq!(body["data"]["submitted"], true);
         assert!(body.pointer("/data/turn_id").is_none());
+        responder.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn structured_prompt_cancels_armed_auto_resume_before_provider_control() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let launch_id = seed_codex_app_server_session(tmp.path(), "structured-armed");
+        let st = state(tmp.path(), Some(TOKEN), minimal_tmux(tmp.path()));
+        let record = load_session_record(&st.context, "structured-armed").unwrap();
+        crate::activity::activate_runtime(&st.context, &record).unwrap();
+        auto_resume::set_enabled(&st.context, &record.id, true, "2030-01-01T00:00:00Z").unwrap();
+        crate::activity::ingest_codex_app_server_failure(
+            &st.context,
+            &record.id,
+            &launch_id,
+            "thread-armed",
+            "turn-armed",
+        )
+        .unwrap();
+        assert_eq!(
+            auto_resume::view_for_record(&st.context, &record).state,
+            "armed"
+        );
+
+        let (handle, mut commands) = codex_app_server::control_channel();
+        st.codex_controls
+            .lock()
+            .unwrap()
+            .insert(record.id.clone(), CodexControlEntry { launch_id, handle });
+        let responder_context = st.context.clone();
+        let responder_record = record.clone();
+        let responder = tokio::spawn(async move {
+            let Some(codex_app_server::ControlCommand::Prompt { response, .. }) =
+                commands.recv().await
+            else {
+                panic!("structured prompt did not reach the Codex control plane");
+            };
+            let view = auto_resume::view_for_record(&responder_context, &responder_record);
+            assert!(!view.enabled);
+            assert_eq!(view.state, "cancelled");
+            assert_eq!(view.failure_reason.as_deref(), Some("manual_input"));
+            response
+                .send(Ok("turn-armed-cancelled".to_string()))
+                .unwrap();
+        });
+
+        let (status, body) = call(
+            router(st),
+            post_json(
+                "/sessions/structured-armed/prompt",
+                Some(TOKEN),
+                json!({ "text": "new\nmanual task" }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "body={body}");
         responder.await.unwrap();
     }
 
