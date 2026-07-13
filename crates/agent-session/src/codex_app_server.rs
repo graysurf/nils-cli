@@ -12,6 +12,7 @@ use std::io::{Read, Seek, SeekFrom};
 use std::os::fd::AsRawFd;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::net::UnixDatagram;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -54,12 +55,15 @@ const CONTROL_SUBMIT_TOTAL_TIMEOUT: Duration = Duration::from_secs(30);
 const MINIMUM_AUDITED_CODEX_VERSION: (u64, u64, u64) = (0, 144, 1);
 const MANUAL_INPUT_SECTION_FILE: &str = ".codex-app-server-manual-input";
 const MANUAL_INPUT_GATE_FILE: &str = ".codex-app-server-manual-input-gate";
+const MANUAL_INPUT_ACK_FILE: &str = ".codex-app-server-manual-input-ack";
 const MANUAL_INPUT_SECTION_VERSION: &str = "agent-session.codex-manual-input.v1";
 const MANUAL_INPUT_SECTION_TTL: Duration = Duration::from_secs(30);
 const MANUAL_INPUT_GATE_TIMEOUT: Duration = Duration::from_secs(12);
+const MANUAL_INPUT_ACK_TIMEOUT: Duration = Duration::from_millis(250);
 const PROXY_CAPABILITY_FILE: &str = ".codex-app-server-proxy-capability";
 const PROXY_CAPABILITY_VERSION: &str = "agent-session.codex-manual-input-proxy.v1";
 const PROXY_CAPABILITY_TTL: Duration = Duration::from_secs(365 * 24 * 60 * 60);
+const PROXY_CAPABILITY_READY_TIMEOUT: Duration = Duration::from_secs(2);
 
 pub(crate) fn configure_runtime(
     context: &CliContext,
@@ -433,6 +437,8 @@ pub(crate) struct ManualInputMarker {
     token: String,
     _owner_file: fs::File,
     gate_path: Option<PathBuf>,
+    ack_path: Option<PathBuf>,
+    ack_socket: Option<UnixDatagram>,
     cleanup_on_drop: bool,
 }
 
@@ -442,6 +448,10 @@ impl ManualInputMarker {
     }
 
     fn finish_with_timeout(&mut self, release_lifecycle_lock: impl FnOnce(), timeout: Duration) {
+        if let Some(socket) = self.ack_socket.as_ref() {
+            let mut ack = [0_u8; 1];
+            let _ = socket.recv(&mut ack);
+        }
         let gate = self
             .gate_path
             .as_deref()
@@ -457,6 +467,9 @@ impl ManualInputMarker {
             // lease, so stale bytes cannot authorize a future Busy result.
             self.remove_if_owned();
             release_lifecycle_lock();
+        }
+        if let Some(path) = self.ack_path.take() {
+            let _ = fs::remove_file(path);
         }
         self.cleanup_on_drop = false;
     }
@@ -474,6 +487,9 @@ impl Drop for ManualInputMarker {
     fn drop(&mut self) {
         if self.cleanup_on_drop {
             self.remove_if_owned();
+        }
+        if let Some(path) = self.ack_path.take() {
+            let _ = fs::remove_file(path);
         }
     }
 }
@@ -496,6 +512,10 @@ fn manual_input_section_path(context: &CliContext, record: &SessionRecord) -> Pa
 
 fn manual_input_gate_path(context: &CliContext, record: &SessionRecord) -> PathBuf {
     crate::session_dir(context, &record.id).join(MANUAL_INPUT_GATE_FILE)
+}
+
+fn manual_input_ack_path(context: &CliContext, record: &SessionRecord) -> PathBuf {
+    crate::session_dir(context, &record.id).join(MANUAL_INPUT_ACK_FILE)
 }
 
 fn proxy_capability_path(context: &CliContext, record: &SessionRecord) -> PathBuf {
@@ -616,6 +636,8 @@ fn write_runtime_process_marker(
         token,
         _owner_file: file,
         gate_path: None,
+        ack_path: None,
+        ack_socket: None,
         cleanup_on_drop: true,
     })
 }
@@ -635,13 +657,20 @@ pub(crate) fn ensure_manual_input_capability(
     if !runtime_is_supported(record) {
         return Ok(());
     }
-    if live_proxy_capability(context, record) {
-        return Ok(());
+    let deadline = Instant::now() + PROXY_CAPABILITY_READY_TIMEOUT;
+    loop {
+        if live_proxy_capability(context, record) {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            break;
+        }
+        thread::sleep(Duration::from_millis(10));
     }
     Err(CliError::runtime(
         "codex-input-section-unavailable",
-        "the live Codex proxy predates serialized manual input support; recreate the session",
-        Some(json!({ "id": record.id })),
+        "the Codex proxy did not advertise serialized input support; retry, then recreate the session if it persists",
+        Some(json!({ "id": record.id, "retryable": true })),
     ))
 }
 
@@ -699,6 +728,26 @@ pub(crate) fn begin_manual_input_section(
         )
     })?;
     marker.gate_path = Some(gate_path);
+    let ack_path = manual_input_ack_path(context, record);
+    let _ = fs::remove_file(&ack_path);
+    let ack_socket = UnixDatagram::bind(&ack_path).map_err(|err| {
+        CliError::runtime(
+            "codex-input-ack-bind-failed",
+            format!("failed to bind the Codex manual input acknowledgement: {err}"),
+            Some(json!({ "id": record.id })),
+        )
+    })?;
+    ack_socket
+        .set_read_timeout(Some(MANUAL_INPUT_ACK_TIMEOUT))
+        .map_err(|err| {
+            CliError::runtime(
+                "codex-input-ack-timeout-failed",
+                format!("failed to bound the Codex manual input acknowledgement: {err}"),
+                Some(json!({ "id": record.id })),
+            )
+        })?;
+    marker.ack_path = Some(ack_path);
+    marker.ack_socket = Some(ack_socket);
     Ok(Some(marker))
 }
 
@@ -801,13 +850,19 @@ fn acquire_manual_input_gate(
         return None;
     }
     let marker = read_runtime_process_marker_file(&mut owner_file)?;
-    valid_runtime_process_marker(
+    if !valid_runtime_process_marker(
         &marker,
         record,
         MANUAL_INPUT_SECTION_VERSION,
         MANUAL_INPUT_SECTION_TTL,
-    )
-    .then_some(ManualInputGate {
+    ) {
+        return None;
+    }
+    UnixDatagram::unbound()
+        .ok()?
+        .send_to(&[1], manual_input_ack_path(context, record))
+        .ok()?;
+    Some(ManualInputGate {
         gate_file,
         _owner_file: owner_file,
     })
@@ -2488,11 +2543,19 @@ mod tests {
         // SAFETY: test owns this valid descriptor.
         assert_eq!(unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_SH) }, 0);
         open_manual_input_gate_file(&manual_input_gate_path(context, record)).unwrap();
+        let ack_path = manual_input_ack_path(context, record);
+        let _ = fs::remove_file(&ack_path);
+        let ack_socket = UnixDatagram::bind(&ack_path).unwrap();
+        ack_socket
+            .set_read_timeout(Some(MANUAL_INPUT_ACK_TIMEOUT))
+            .unwrap();
         ManualInputMarker {
             path,
             token,
             _owner_file: file,
             gate_path: Some(manual_input_gate_path(context, record)),
+            ack_path: Some(ack_path),
+            ack_socket: Some(ack_socket),
             cleanup_on_drop: true,
         }
     }
@@ -3799,6 +3862,45 @@ mod tests {
                 .is_some()
         );
         unlock_bootstrap_file(&held_gate);
+    }
+
+    #[test]
+    fn delayed_proxy_claim_acknowledges_before_sender_retires_section() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let context = CliContext {
+            state_dir: tmp.path().join("state"),
+            host: None,
+        };
+        let record = record_with_runtime("owned-delayed", &tmp.path().join("delayed.sock"));
+        fs::create_dir_all(crate::session_dir(&context, &record.id)).unwrap();
+        crate::write_session_record(&context, &record).unwrap();
+        bind_thread(&record, "thread-a").unwrap();
+        let _capability = begin_proxy_capability(&context, &record).unwrap();
+        let lifecycle_lock = crate::acquire_session_record_lock(&context, &record.id).unwrap();
+        let marker = begin_manual_input_section(&context, &record)
+            .unwrap()
+            .unwrap();
+        let (finished_tx, finished_rx) = std::sync::mpsc::channel();
+        let teardown = std::thread::spawn(move || {
+            marker.finish(|| drop(lifecycle_lock));
+            finished_tx.send(()).unwrap();
+        });
+        std::thread::sleep(Duration::from_millis(25));
+        let turn = json!({
+            "id": 1,
+            "method": "turn/start",
+            "params": { "threadId": "thread-a", "input": [] }
+        });
+        let gate = acquire_manual_input_gate(&context, &record, &turn).unwrap();
+        assert!(finished_rx.recv_timeout(Duration::from_millis(10)).is_err());
+        assert!(
+            crate::try_acquire_session_record_lock(&context, &record.id)
+                .unwrap()
+                .is_none()
+        );
+        drop(gate);
+        finished_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        teardown.join().unwrap();
     }
 
     #[test]
