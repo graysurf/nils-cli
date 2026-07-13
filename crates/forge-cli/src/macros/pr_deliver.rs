@@ -736,6 +736,23 @@ fn emit_dry_run(
     workdir: &Path,
     global: &GlobalFlags,
 ) -> i32 {
+    let payload = build_dry_run_payload(ctx, args, workdir, global, git_remote_url);
+    let envelope = Envelope::success(schema_version_for(BINARY, SCHEMA, SCHEMA_VERSION), payload);
+    write_envelope(&envelope, format);
+    nils_common::cli_contract::exit::SUCCESS
+}
+
+/// Compute the provider plan and faithful local preflight without emitting.
+///
+/// The CLI-facing dry-run path serializes this payload; tests inject remote
+/// lookup so repository-bound evidence can be exercised hermetically.
+pub fn build_dry_run_payload(
+    ctx: &ProviderContext,
+    args: &PrDeliverArgs,
+    workdir: &Path,
+    global: &GlobalFlags,
+    remote_url_lookup: impl FnOnce(&str) -> Option<String>,
+) -> PrDeliverDryRun {
     let branch = match &args.head {
         Some(head) => head.clone(),
         None => git_current_branch(workdir).unwrap_or_default(),
@@ -816,7 +833,7 @@ fn emit_dry_run(
         ctx,
         global.repo.as_deref(),
         &global.remote,
-        git_remote_url,
+        remote_url_lookup,
     );
     let repository_id = gate_applies
         .then(|| evidence_repository_id(ctx, remote_url.as_deref(), global.repo.as_deref()))
@@ -832,16 +849,13 @@ fn emit_dry_run(
         local_preflight.push(verdict);
     }
 
-    let payload = PrDeliverDryRun {
+    PrDeliverDryRun {
         provider: ctx.provider.as_str(),
         kind: args.kind.as_str(),
         plan_steps,
         no_merge: args.no_merge,
         local_preflight,
-    };
-    let envelope = Envelope::success(schema_version_for(BINARY, SCHEMA, SCHEMA_VERSION), payload);
-    write_envelope(&envelope, format);
-    nils_common::cli_contract::exit::SUCCESS
+    }
 }
 
 fn pr_lookup_dry_plan(ctx: &ProviderContext, head: &str) -> Vec<String> {

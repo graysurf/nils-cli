@@ -13,6 +13,14 @@ use std::process::Command;
 use pretty_assertions::assert_eq;
 use tempfile::TempDir;
 
+use forge_cli::backend::{BackendCall, BackendRunner, BackendSuccess};
+use forge_cli::cli::{GlobalFlags, MergeMethodFlag, PrDeliverArgs, PrKindFlag, ProviderFlag};
+use forge_cli::error::ForgeError;
+use forge_cli::macros::pr_deliver;
+use forge_cli::ops::pr_wait_checks::SystemClock;
+use forge_cli::provider::{DetectionSource, Provider, ProviderContext};
+use nils_common::cli_contract::OutputFormat;
+
 use super::support::{CmdOutput, StubEnv, parse_envelope, run_forge_cli_in, write_label_catalog};
 
 const FIXTURE_CREATE_STDOUT: &str = include_str!("../fixtures/github/pr_create/create_stdout.txt");
@@ -1446,6 +1454,164 @@ fn pr_deliver_gate_enabled_adopt_preserves_attested_head_through_merge_cas() {
         args.contains(&format!("--match-head-commit {head}")),
         "merge CAS missing attested head: {args}"
     );
+}
+
+struct LocalAdoptRunner {
+    head: String,
+}
+
+fn local_deliver_args(evidence: &Path) -> PrDeliverArgs {
+    PrDeliverArgs {
+        kind: PrKindFlag::Feature,
+        title: "feat: subject-bound local delivery".into(),
+        body: Some("## Summary\n\nBound.\n\n## Test plan\n\nVerified.\n".into()),
+        body_file: None,
+        head: Some("feat/sample".into()),
+        base: Some("main".into()),
+        method: MergeMethodFlag::Squash,
+        reviewers: Vec::new(),
+        labels: Vec::new(),
+        label_catalog: None,
+        strict_labels: false,
+        test_first_evidence: Some(evidence.to_string_lossy().to_string()),
+        timeout: std::time::Duration::from_secs(5),
+        no_merge: true,
+        no_issue_closeout: false,
+        allow_non_default_base: false,
+        allow_unresolved_threads: false,
+        allow_unchecked_tasks: false,
+        allow_unchecked_tasks_reason: None,
+    }
+}
+
+#[test]
+fn pr_deliver_local_dry_run_uses_remote_identity_for_bound_evidence() {
+    let (tempdir, evidence, _) = make_subject_bound_git_repo();
+    let repo_path = tempdir.path().join("repo");
+    let context = ProviderContext {
+        provider: Provider::Local,
+        host: "local".into(),
+        source: DetectionSource::Flag,
+        repo: Some("sympoies/nils-cli".into()),
+    };
+    let global = GlobalFlags {
+        format: Some(OutputFormat::Json),
+        remote: "origin".into(),
+        provider: Some(ProviderFlag::Local),
+        repo: None,
+        store_root: None,
+        dry_run: true,
+    };
+
+    let payload = pr_deliver::build_dry_run_payload(
+        &context,
+        &local_deliver_args(&evidence),
+        &repo_path,
+        &global,
+        |_| Some("https://github.com/sympoies/nils-cli.git".into()),
+    );
+    let verdict = payload
+        .local_preflight
+        .iter()
+        .find(|item| item.rule == "test_first")
+        .expect("test-first verdict");
+    assert!(verdict.ok, "verdict={verdict:?}");
+}
+
+impl BackendRunner for LocalAdoptRunner {
+    fn run(&self, call: &BackendCall) -> Result<BackendSuccess, ForgeError> {
+        let argv: Vec<String> = call
+            .argv
+            .iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        let (stdout, stderr) = match (
+            argv.first().map(String::as_str),
+            argv.get(1).map(String::as_str),
+        ) {
+            (Some("auth"), Some("status")) => (
+                String::new(),
+                "local\n  ✓ Logged in to local account tester (test)\n".to_string(),
+            ),
+            (Some("repo"), Some("view")) => (
+                serde_json::json!({
+                    "name": "nils-cli",
+                    "owner": {"login": "sympoies"},
+                    "defaultBranchRef": {"name": "main"},
+                    "mergeCommitAllowed": true,
+                    "squashMergeAllowed": true,
+                    "rebaseMergeAllowed": true,
+                    "url": "https://github.com/sympoies/nils-cli"
+                })
+                .to_string(),
+                String::new(),
+            ),
+            (Some("pr"), Some("list")) => (
+                serde_json::json!([{
+                    "number": 123,
+                    "url": "local://sympoies/nils-cli/pull/123",
+                    "state": "OPEN",
+                    "title": "feat: subject-bound local delivery",
+                    "headRefName": "feat/sample",
+                    "author": {"login": "tester"}
+                }])
+                .to_string(),
+                String::new(),
+            ),
+            (Some("pr"), Some("view")) => (
+                serde_json::json!({
+                    "number": 123,
+                    "url": "local://sympoies/nils-cli/pull/123",
+                    "state": "OPEN",
+                    "isDraft": true,
+                    "title": "feat: subject-bound local delivery",
+                    "headRefName": "feat/sample",
+                    "headRefOid": self.head,
+                    "baseRefName": "main",
+                    "mergeable": "MERGEABLE",
+                    "mergedAt": null,
+                    "labels": [],
+                    "body": "## Summary\n\nBound.\n\n## Test plan\n\nVerified.\n"
+                })
+                .to_string(),
+                String::new(),
+            ),
+            _ => panic!("unexpected local adopt backend call: {argv:?}"),
+        };
+        Ok(BackendSuccess { stdout, stderr })
+    }
+}
+
+#[test]
+fn pr_deliver_local_adopt_uses_remote_identity_for_bound_evidence() {
+    let (tempdir, evidence, head) = make_subject_bound_git_repo();
+    let repo_path = tempdir.path().join("repo");
+    let store = tempdir.path().join("store");
+    fs::create_dir_all(store.join("prs")).unwrap();
+    fs::write(
+        store.join("prs/123.json"),
+        r#"{"number":123,"state":"OPEN","merged":false,"merge_sha":null,"checks":"success","required_state":"success","required_count":1,"non_required_failures":[]}"#,
+    )
+    .unwrap();
+
+    let global = GlobalFlags {
+        format: Some(OutputFormat::Json),
+        remote: "origin".into(),
+        provider: Some(ProviderFlag::Local),
+        repo: None,
+        store_root: Some(store),
+        dry_run: false,
+    };
+    let code = pr_deliver::run_with(
+        &LocalAdoptRunner { head },
+        &SystemClock,
+        &global,
+        local_deliver_args(&evidence),
+        OutputFormat::Json,
+        &repo_path,
+    )
+    .expect("remote-bound evidence should pass the local adopt path");
+    assert_eq!(code, nils_common::cli_contract::exit::SUCCESS);
 }
 
 #[test]
