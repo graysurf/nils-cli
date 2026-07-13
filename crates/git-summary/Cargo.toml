@@ -1,6 +1,6 @@
 [package]
 name = "nils-git-summary"
-version = "1.21.32"
+version = "1.21.33"
 edition.workspace = true
 license.workspace = true
 
@@ -15,11 +15,11 @@ anyhow = { workspace = true }
 chrono = { version = "0.4", features = ["clock"] }
 clap = { workspace = true }
 clap_complete = { workspace = true }
-nils-build-info = { version = "1.21.32", path = "../nils-build-info" }
-nils-term = { version = "1.21.32", path = "../nils-term", package = "nils-term" }
-nils-common = { version = "1.21.32", path = "../nils-common", package = "nils-common" }
+nils-build-info = { version = "1.21.33", path = "../nils-build-info" }
+nils-term = { version = "1.21.33", path = "../nils-term", package = "nils-term" }
+nils-common = { version = "1.21.33", path = "../nils-common", package = "nils-common" }
 
 [dev-dependencies]
-nils-test-support = { version = "1.21.32", path = "../nils-test-support" }
+nils-test-support = { version = "1.21.33", path = "../nils-test-support" }
 pretty_assertions = { workspace = true }
 tempfile = "3"
