@@ -1752,7 +1752,8 @@ fn send_to_session(context: &CliContext, args: cli::SendArgs) -> Result<SendResu
     }
     let observed = load_session_record(context, &args.id)?;
     let tmux_bin = resolve_tmux_bin(args.tmux_bin.as_deref());
-    let _record_lock = acquire_session_record_lock(context, &observed.id)?;
+    let record_lock = acquire_session_record_lock(context, &observed.id)?;
+    let mut manual_input = ManualInputSection::new(record_lock);
     let mut record = load_session_record(context, &observed.id)?;
     ensure_same_session_identity(&observed, &record)?;
     if live_status(&tmux_bin, &record.tmux_session) != "running" {
@@ -1762,12 +1763,22 @@ fn send_to_session(context: &CliContext, args: cli::SendArgs) -> Result<SendResu
             Some(json!({ "id": record.id })),
         ));
     }
+    if codex_app_server::input_contains_submission(text.as_deref(), &args.keys) {
+        codex_app_server::ensure_manual_input_capability(context, &record)?;
+    }
     auto_resume::cancel_for_manual_input_locked(
         context,
         &record.id,
         &Timestamp::now().to_string(),
     )?;
-    send_input_unlocked(context, &record, text.as_deref(), &args.keys, &tmux_bin)?;
+    send_input_unlocked(
+        context,
+        &record,
+        text.as_deref(),
+        &args.keys,
+        &tmux_bin,
+        Some(&mut manual_input),
+    )?;
     record.updated_at = Zoned::now().timestamp().to_string();
     write_session_record(context, &record)?;
     Ok(SendResult {
@@ -1813,7 +1824,8 @@ fn send_input_serialized_with_title_guard(
     tmux_bin: &Path,
     require_current_title: bool,
 ) -> Result<(), CliError> {
-    let _record_lock = acquire_session_record_lock(context, &expected.id)?;
+    let record_lock = acquire_session_record_lock(context, &expected.id)?;
+    let mut manual_input = ManualInputSection::new(record_lock);
     let current = load_session_record(context, &expected.id)?;
     ensure_same_session_identity(expected, &current)?;
     // Title persistence completes before this best-effort Claude prompt-bar
@@ -1832,12 +1844,22 @@ fn send_input_serialized_with_title_guard(
             Some(json!({ "id": current.id })),
         ));
     }
+    if codex_app_server::input_contains_submission(text, keys) {
+        codex_app_server::ensure_manual_input_capability(context, &current)?;
+    }
     auto_resume::cancel_for_manual_input_locked(
         context,
         &current.id,
         &Timestamp::now().to_string(),
     )?;
-    send_input_unlocked(context, &current, text, keys, tmux_bin)
+    send_input_unlocked(
+        context,
+        &current,
+        text,
+        keys,
+        tmux_bin,
+        Some(&mut manual_input),
+    )
 }
 
 /// Submit the product-owned continuation while `auto_resume::tick` holds the
@@ -1864,7 +1886,43 @@ pub(crate) fn send_auto_resume_input(
         Some(text),
         &[SpecialKey::Enter],
         tmux_bin,
+        None,
     )
+}
+
+struct ManualInputSection {
+    record_lock: Option<SessionRecordLock>,
+    marker: Option<codex_app_server::ManualInputMarker>,
+}
+
+impl ManualInputSection {
+    fn new(record_lock: SessionRecordLock) -> Self {
+        Self {
+            record_lock: Some(record_lock),
+            marker: None,
+        }
+    }
+
+    fn arm(&mut self, context: &CliContext, record: &SessionRecord) -> Result<(), CliError> {
+        if self.marker.is_none() {
+            self.marker = codex_app_server::begin_manual_input_section(context, record)?;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for ManualInputSection {
+    fn drop(&mut self) {
+        let record_lock = self.record_lock.take();
+        if let Some(marker) = self.marker.take() {
+            // The proxy holds the marker lock while forwarding a Busy-bypassed
+            // turn. Marker teardown therefore cannot race a new lifecycle lock
+            // holder or remove authority before the forwarded request lands.
+            marker.finish(|| drop(record_lock));
+        } else {
+            drop(record_lock);
+        }
+    }
 }
 
 fn send_input_unlocked(
@@ -1873,33 +1931,50 @@ fn send_input_unlocked(
     text: Option<&str>,
     keys: &[SpecialKey],
     tmux_bin: &Path,
+    mut manual_input: Option<&mut ManualInputSection>,
 ) -> Result<(), CliError> {
     let target = format!("{}:0.0", record.tmux_session);
     if let Some(text) = text {
-        let nonce = uuid::Uuid::new_v4();
-        let buffer_name = format!("{}-send-{nonce}", record.id);
-        let temp = session_dir(context, &record.id).join(format!("send-input-{nonce}"));
-        write_private_file(&temp, text.as_bytes())?;
-        let result = load_and_paste_buffer_with_timeout(
-            tmux_bin,
-            &buffer_name,
-            &target,
-            &temp,
-            PANE_INPUT_COMMAND_TIMEOUT,
-        );
-        let _ = fs::remove_file(&temp);
-        result?;
+        if matches!(text, "\r" | "\n" | "\r\n") {
+            if let Some(section) = manual_input.as_deref_mut() {
+                section.arm(context, record)?;
+            }
+            send_tmux_key(tmux_bin, &target, SpecialKey::Enter)?;
+        } else {
+            let nonce = uuid::Uuid::new_v4();
+            let buffer_name = format!("{}-send-{nonce}", record.id);
+            let temp = session_dir(context, &record.id).join(format!("send-input-{nonce}"));
+            write_private_file(&temp, text.as_bytes())?;
+            let result = load_and_paste_buffer_with_timeout(
+                tmux_bin,
+                &buffer_name,
+                &target,
+                &temp,
+                PANE_INPUT_COMMAND_TIMEOUT,
+            );
+            let _ = fs::remove_file(&temp);
+            result?;
+        }
     }
     for key in keys {
-        let mut command = ProcessCommand::new(tmux_bin);
-        command
-            .arg("send-keys")
-            .arg("-t")
-            .arg(&target)
-            .arg(key.tmux_key());
-        run_status_with_timeout(command, "tmux send-keys", PANE_INPUT_COMMAND_TIMEOUT)?;
+        if *key == SpecialKey::Enter
+            && let Some(section) = manual_input.as_deref_mut()
+        {
+            section.arm(context, record)?;
+        }
+        send_tmux_key(tmux_bin, &target, *key)?;
     }
     Ok(())
+}
+
+fn send_tmux_key(tmux_bin: &Path, target: &str, key: SpecialKey) -> Result<(), CliError> {
+    let mut command = ProcessCommand::new(tmux_bin);
+    command
+        .arg("send-keys")
+        .arg("-t")
+        .arg(target)
+        .arg(key.tmux_key());
+    run_status_with_timeout(command, "tmux send-keys", PANE_INPUT_COMMAND_TIMEOUT)
 }
 
 fn load_and_paste_buffer_with_timeout(
