@@ -4101,6 +4101,115 @@ mod tests {
     }
 
     #[test]
+    fn fresh_bootstrap_accepts_only_healthy_idle_auto_resume_states() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let context = CliContext {
+            state_dir: tmp.path().join("state"),
+            host: None,
+        };
+        let record = record_with_runtime("fresh-matrix", &tmp.path().join("matrix.sock"));
+        let session_dir = crate::session_dir(&context, &record.id);
+        fs::create_dir_all(&session_dir).unwrap();
+        crate::write_session_record(&context, &record).unwrap();
+        crate::activity::activate_runtime(&context, &record).unwrap();
+        write_create_bootstrap_marker(&record);
+
+        for (name, enabled, state, scheduled_at, failure_reason, accepted) in [
+            ("healthy-disabled", false, "disabled", None, None, true),
+            ("healthy-enabled", true, "enabled", None, None, true),
+            (
+                "disabled-flag-mismatch",
+                true,
+                "disabled",
+                None,
+                None,
+                false,
+            ),
+            ("enabled-flag-mismatch", false, "enabled", None, None, false),
+            ("armed", true, "armed", None, None, false),
+            (
+                "scheduled",
+                true,
+                "scheduled",
+                Some("2030-01-01T01:00:00Z"),
+                None,
+                false,
+            ),
+            ("checking", true, "checking", None, None, false),
+            (
+                "transient-failure",
+                true,
+                "transient_failure",
+                None,
+                Some("usage_unavailable"),
+                false,
+            ),
+            (
+                "terminal-failure",
+                false,
+                "terminal_failure",
+                None,
+                Some("state_unavailable"),
+                false,
+            ),
+            (
+                "enabled-with-schedule",
+                true,
+                "enabled",
+                Some("2030-01-01T01:00:00Z"),
+                None,
+                false,
+            ),
+            (
+                "enabled-with-failure",
+                true,
+                "enabled",
+                None,
+                Some("usage_unavailable"),
+                false,
+            ),
+            (
+                "disabled-with-schedule",
+                false,
+                "disabled",
+                Some("2030-01-01T01:00:00Z"),
+                None,
+                false,
+            ),
+            (
+                "disabled-with-failure",
+                false,
+                "disabled",
+                None,
+                Some("state_unavailable"),
+                false,
+            ),
+        ] {
+            fs::write(
+                session_dir.join("auto-resume.json"),
+                serde_json::to_vec(&json!({
+                    "schema_version": "agent-session.auto-resume.v1",
+                    "enabled": enabled,
+                    "state": state,
+                    "updated_at": "2030-01-01T00:00:00Z",
+                    "scheduled_at": scheduled_at,
+                    "failure_reason": failure_reason,
+                    "attempt": 0,
+                    "ever_scheduled": false,
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+
+            assert_eq!(
+                FreshBootstrap::for_runtime(&context, &record) == FreshBootstrap::ThreadStart,
+                accepted,
+                "unexpected bootstrap decision for {name}",
+            );
+        }
+    }
+
+    #[test]
     fn fresh_bootstrap_rejects_pre_armed_auto_resume() {
         let tmp = tempfile::TempDir::new().unwrap();
         let context = CliContext {
