@@ -3697,10 +3697,12 @@ fn failure_paths_return_json_without_leaking_prompt_and_classify_durable_startup
             tmux_log.to_string_lossy().to_string(),
         ),
         ("AGENT_SESSION_FAKE_TMUX_FAIL", "new-session".to_string()),
+        ("AGENT_SESSION_TMUX_BIN", tmux_arg.clone()),
     ];
     let env_refs = [
         (envs[0].0, envs[0].1.as_str()),
         (envs[1].0, envs[1].1.as_str()),
+        (envs[2].0, envs[2].1.as_str()),
     ];
 
     let output = run(
@@ -3726,22 +3728,36 @@ fn failure_paths_return_json_without_leaking_prompt_and_classify_durable_startup
         ],
         &env_refs,
     );
-    assert_eq!(output.code, 0, "stderr={}", output.stderr_text());
+    assert_eq!(output.code, 1, "stderr={}", output.stderr_text());
     assert_no_secret(&output, secret);
     let value = output.stdout_json();
     assert_eq!(value["schema_version"], "cli.agent-session.start.v1");
-    assert_eq!(value["ok"], true);
-    let failed = data(&value);
-    assert_eq!(failed["status"], "stopped");
-    assert_eq!(failed["startup"]["state"], "failed");
-    assert_eq!(failed["startup"]["stage"], "tmux");
-    assert_eq!(
-        failed["startup"]["failure_code"],
-        "terminal-runtime-create-failed"
-    );
+    assert_eq!(value["ok"], false);
+    assert_eq!(value["error"]["code"], "command-failed");
     assert!(
         state_dir.join("sessions").join("fail-start").exists(),
         "post-record tmux failure should remain a durable stopped session"
+    );
+    let list_env_refs = [
+        env_refs[0],
+        env_refs[1],
+        env_refs[2],
+        ("AGENT_SESSION_FAKE_TMUX_HAS_SESSION", "0"),
+    ];
+    let list = run(
+        tmp.path(),
+        &["--state-dir", &state_arg, "list", "--format", "json"],
+        &list_env_refs,
+    );
+    assert_eq!(list.code, 0, "stderr={}", list.stderr_text());
+    let list_value = list.stdout_json();
+    let listed = &data(&list_value)[0];
+    assert_eq!(listed["status"], "stopped");
+    assert_eq!(listed["startup"]["state"], "failed");
+    assert_eq!(listed["startup"]["stage"], "tmux");
+    assert_eq!(
+        listed["startup"]["failure_code"],
+        "terminal-runtime-create-failed"
     );
 
     let envs = [

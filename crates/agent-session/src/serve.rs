@@ -59,11 +59,12 @@ use crate::provider_prompt::{
 };
 use crate::{
     BINARY, CliContext, CliError, ProviderResumeImportArgs, SessionRecord, SessionView,
-    WorkdirSearchOptions, delete_session, glance_session, list_sessions, load_session_record,
-    non_empty_env, repo_remote_url_from_cwd, resolve_tmux_bin, resume_session_by_id,
-    search_workdirs, send_auto_resume_input, send_input_serialized, session_clipboard_buffer,
-    session_dir, session_status, short_hostname, start_provider_resume_session, start_session,
-    update_session_title_if_revision, write_session_attachment,
+    StartFailureDisposition, WorkdirSearchOptions, delete_session, glance_session, list_sessions,
+    load_session_record, non_empty_env, repo_remote_url_from_cwd, resolve_tmux_bin,
+    resume_session_by_id, search_workdirs, send_auto_resume_input, send_input_serialized,
+    session_clipboard_buffer, session_dir, session_status, short_hostname,
+    start_provider_resume_session, start_session, update_session_title_if_revision,
+    write_session_attachment,
 };
 
 const ATTACH_LIVE_FIFO_NAME: &str = "attach-live.fifo";
@@ -2234,7 +2235,11 @@ async fn create_handler(
         paste_delay_ms: cli::DEFAULT_PASTE_DELAY_MS,
         format: nils_common::cli_contract::OutputFormat::Json,
     };
-    match tokio::task::spawn_blocking(move || start_session(&context, args)).await {
+    match tokio::task::spawn_blocking(move || {
+        start_session(&context, args, StartFailureDisposition::ReturnSession)
+    })
+    .await
+    {
         Ok(Ok(view)) => envelope_ok(json!({ "machine": state.machine, "session": view.result })),
         Ok(Err(err)) => envelope_err(err),
         Err(_) => join_err(),

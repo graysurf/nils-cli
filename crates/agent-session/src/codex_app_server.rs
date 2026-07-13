@@ -394,8 +394,36 @@ fn persisted_runtime_paths(
     Ok([socket, proxy, handoff, attached])
 }
 
-pub(crate) fn launch_script() -> &'static str {
-    r#"socket=$1
+const STARTUP_DIAGNOSTIC_COLLECTOR_SCRIPT: &str = r#"collect_startup_diagnostic() {
+  LC_ALL=C awk -v cap=16384 -v stage="$startup_stage" -v output="$startup_diagnostic" '
+    function current_stage(value) {
+      value = ""
+      if ((getline value < stage) < 0) value = ""
+      close(stage)
+      return value
+    }
+    {
+      if (current_stage() == "initial_connection") {
+        retained = ""
+        next
+      }
+      retained = retained $0 ORS
+      if (length(retained) > cap) {
+        retained = substr(retained, length(retained) - cap + 1)
+      }
+    }
+    END {
+      if (current_stage() != "initial_connection" && length(retained) > 0) {
+        printf "%s", retained > output
+        close(output)
+      }
+    }
+  '
+}"#;
+
+pub(crate) fn launch_script() -> String {
+    [
+        r#"socket=$1
 proxy=$2
 handoff=$3
 attached=$4
@@ -409,30 +437,30 @@ startup_dir="$state_dir/sessions/$session_id"
 startup_stage="$startup_dir/.startup-stage"
 startup_failure="$startup_dir/.startup-failure"
 startup_diagnostic="$startup_dir/.startup-diagnostic.log"
+startup_diagnostic_pipe="$startup_dir/.startup-diagnostic.pipe"
+provider_stderr_pipe="$startup_dir/.provider-stderr.pipe"
+"#,
+        STARTUP_DIAGNOSTIC_COLLECTOR_SCRIPT,
+        r#"
 write_startup_marker() {
   (umask 077; printf '%s\n' "$2" > "$1") 2>/dev/null || true
 }
-bound_startup_diagnostic() {
-  if [ -f "$startup_diagnostic" ]; then
-    bounded="$startup_diagnostic.tmp"
-    if (umask 077; tail -c 16384 "$startup_diagnostic" > "$bounded") 2>/dev/null; then
-      mv -f "$bounded" "$startup_diagnostic" 2>/dev/null || true
-    else
-      rm -f "$bounded"
-    fi
-  fi
-}
 record_startup_failure() {
   write_startup_marker "$startup_failure" "$1"
-  bound_startup_diagnostic
 }
-rm -f -- "$startup_failure" "$startup_diagnostic" "$startup_diagnostic.tmp"
-(umask 077; : > "$startup_diagnostic")
+rm -f -- "$startup_failure" "$startup_diagnostic" "$startup_diagnostic_pipe" "$provider_stderr_pipe"
 write_startup_marker "$startup_stage" app_server
+if ! (umask 077; mkfifo "$startup_diagnostic_pipe"); then
+  record_startup_failure startup-exited
+  exit 1
+fi
+(umask 077; collect_startup_diagnostic < "$startup_diagnostic_pipe") &
+diagnostic_pid=$!
 rm -f -- "$socket" "$proxy" "$attached"
-"$agent" app-server --listen "unix://$socket" </dev/null >/dev/null 2>>"$startup_diagnostic" &
+"$agent" app-server --listen "unix://$socket" </dev/null >/dev/null 2>"$startup_diagnostic_pipe" &
 server=$!
 proxy_pid=
+provider_stderr_pid=
 cleanup() {
   if [ -n "$proxy_pid" ]; then
     kill "$proxy_pid" 2>/dev/null || true
@@ -440,10 +468,12 @@ cleanup() {
   fi
   kill "$server" 2>/dev/null || true
   wait "$server" 2>/dev/null || true
-  if [ -f "$startup_failure" ]; then
-    bound_startup_diagnostic
+  if [ -n "$provider_stderr_pid" ]; then
+    kill "$provider_stderr_pid" 2>/dev/null || true
+    wait "$provider_stderr_pid" 2>/dev/null || true
   fi
-  rm -f -- "$socket" "$proxy" "$handoff" "$attached"
+  wait "$diagnostic_pid" 2>/dev/null || true
+  rm -f -- "$socket" "$proxy" "$handoff" "$attached" "$startup_diagnostic_pipe" "$provider_stderr_pipe"
 }
 trap cleanup EXIT HUP INT TERM
 i=0
@@ -460,7 +490,7 @@ while [ ! -S "$socket" ]; do
   sleep 0.05
 done
 write_startup_marker "$startup_stage" proxy
-(umask 077; "$proxy_bin" --state-dir "$state_dir" codex-app-server-proxy --id "$session_id" --upstream "$socket" --listen "$proxy" </dev/null >/dev/null 2>>"$startup_diagnostic") &
+(umask 077; "$proxy_bin" --state-dir "$state_dir" codex-app-server-proxy --id "$session_id" --upstream "$socket" --listen "$proxy" </dev/null >/dev/null 2>"$startup_diagnostic_pipe") &
 proxy_pid=$!
 i=0
 while [ ! -S "$proxy" ]; do
@@ -480,13 +510,24 @@ while [ ! -S "$proxy" ]; do
   sleep 0.05
 done
 write_startup_marker "$startup_stage" provider_client
-"$agent" --remote "unix://$proxy" --cd "$cwd" --no-alt-screen "$@"
+if ! (umask 077; mkfifo "$provider_stderr_pipe"); then
+  record_startup_failure startup-exited
+  exit 1
+fi
+tee "$startup_diagnostic_pipe" < "$provider_stderr_pipe" >&2 &
+provider_stderr_pid=$!
+"$agent" --remote "unix://$proxy" --cd "$cwd" --no-alt-screen "$@" 2>"$provider_stderr_pipe"
 status=$?
+wait "$provider_stderr_pid" 2>/dev/null || true
+provider_stderr_pid=
+rm -f -- "$provider_stderr_pipe"
 if [ "$(cat "$startup_stage" 2>/dev/null)" != initial_connection ]; then
   record_startup_failure provider-client-exited
 fi
 exit "$status"
-"#
+"#,
+    ]
+    .concat()
 }
 
 pub(crate) fn runtime_is_supported(record: &SessionRecord) -> bool {
@@ -3198,14 +3239,68 @@ exit 1
         assert!(script.contains("runtime-helper-unavailable"));
         assert!(script.contains("provider-client-exited"));
         assert!(script.contains("!= initial_connection"));
-        assert!(script.contains("tail -c 16384"));
-        assert!(script.contains(">/dev/null 2>>\"$startup_diagnostic\""));
+        assert!(script.contains("collect_startup_diagnostic"));
+        assert!(script.contains("mkfifo \"$startup_diagnostic_pipe\""));
+        assert!(script.contains("tee \"$startup_diagnostic_pipe\""));
+        assert!(!script.contains(">>\"$startup_diagnostic\""));
         let cleanup_lines = script
             .lines()
             .filter(|line| line.trim_start().starts_with("rm -f --") && line.contains("$socket"))
             .collect::<Vec<_>>();
         assert!(!cleanup_lines[0].contains("$handoff"));
         assert!(cleanup_lines[1].contains("$handoff"));
+    }
+
+    #[test]
+    fn startup_diagnostic_collector_caps_private_failure_output_and_discards_ready_output() {
+        use std::io::Write;
+        use std::process::{Command, Stdio};
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let stage = tmp.path().join("stage");
+        let diagnostic = tmp.path().join("diagnostic.log");
+        fs::write(&stage, "provider_client\n").unwrap();
+        let command = format!(
+            "startup_stage={}; startup_diagnostic={}; {}; (umask 077; collect_startup_diagnostic)",
+            shell_words::quote(&stage.to_string_lossy()),
+            shell_words::quote(&diagnostic.to_string_lossy()),
+            STARTUP_DIAGNOSTIC_COLLECTOR_SCRIPT,
+        );
+        let mut child = Command::new("/bin/sh")
+            .arg("-c")
+            .arg(&command)
+            .stdin(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut input = vec![b'x'; 32 * 1024];
+        input.extend_from_slice(b"failure-sentinel\n");
+        child.stdin.take().unwrap().write_all(&input).unwrap();
+        assert!(child.wait().unwrap().success());
+
+        let retained = fs::read(&diagnostic).unwrap();
+        assert!(retained.len() <= 16 * 1024);
+        assert!(retained.ends_with(b"failure-sentinel\n"));
+        assert_eq!(
+            fs::metadata(&diagnostic).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+
+        fs::remove_file(&diagnostic).unwrap();
+        fs::write(&stage, "initial_connection\n").unwrap();
+        let mut child = Command::new("/bin/sh")
+            .arg("-c")
+            .arg(command)
+            .stdin(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(b"ready output must not persist\n")
+            .unwrap();
+        assert!(child.wait().unwrap().success());
+        assert!(!diagnostic.exists());
     }
 
     #[test]
