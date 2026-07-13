@@ -408,13 +408,26 @@ shift 9
 startup_dir="$state_dir/sessions/$session_id"
 startup_stage="$startup_dir/.startup-stage"
 startup_failure="$startup_dir/.startup-failure"
+startup_diagnostic="$startup_dir/.startup-diagnostic.log"
 write_startup_marker() {
   (umask 077; printf '%s\n' "$2" > "$1") 2>/dev/null || true
 }
-rm -f -- "$startup_failure"
+record_startup_failure() {
+  write_startup_marker "$startup_failure" "$1"
+  if [ -f "$startup_diagnostic" ]; then
+    bounded="$startup_diagnostic.tmp"
+    if (umask 077; tail -c 16384 "$startup_diagnostic" > "$bounded") 2>/dev/null; then
+      mv -f "$bounded" "$startup_diagnostic" 2>/dev/null || true
+    else
+      rm -f "$bounded"
+    fi
+  fi
+}
+rm -f -- "$startup_failure" "$startup_diagnostic" "$startup_diagnostic.tmp"
+(umask 077; : > "$startup_diagnostic")
 write_startup_marker "$startup_stage" app_server
 rm -f -- "$socket" "$proxy" "$attached"
-"$agent" app-server --listen "unix://$socket" </dev/null >/dev/null 2>&1 &
+"$agent" app-server --listen "unix://$socket" </dev/null >/dev/null 2>>"$startup_diagnostic" &
 server=$!
 proxy_pid=
 cleanup() {
@@ -430,32 +443,32 @@ trap cleanup EXIT HUP INT TERM
 i=0
 while [ ! -S "$socket" ]; do
   if ! kill -0 "$server" 2>/dev/null; then
-    write_startup_marker "$startup_failure" app-server-start-failed
+    record_startup_failure app-server-start-failed
     exit 1
   fi
   i=$((i + 1))
   if [ "$i" -ge 100 ]; then
-    write_startup_marker "$startup_failure" startup-timeout
+    record_startup_failure startup-timeout
     exit 1
   fi
   sleep 0.05
 done
 write_startup_marker "$startup_stage" proxy
-(umask 077; "$proxy_bin" --state-dir "$state_dir" codex-app-server-proxy --id "$session_id" --upstream "$socket" --listen "$proxy" </dev/null >/dev/null 2>&1) &
+(umask 077; "$proxy_bin" --state-dir "$state_dir" codex-app-server-proxy --id "$session_id" --upstream "$socket" --listen "$proxy" </dev/null >/dev/null 2>>"$startup_diagnostic") &
 proxy_pid=$!
 i=0
 while [ ! -S "$proxy" ]; do
   if ! kill -0 "$proxy_pid" 2>/dev/null; then
     if [ ! -x "$proxy_bin" ]; then
-      write_startup_marker "$startup_failure" runtime-helper-unavailable
+      record_startup_failure runtime-helper-unavailable
     else
-      write_startup_marker "$startup_failure" proxy-start-failed
+      record_startup_failure proxy-start-failed
     fi
     exit 1
   fi
   i=$((i + 1))
   if [ "$i" -ge 100 ]; then
-    write_startup_marker "$startup_failure" startup-timeout
+    record_startup_failure startup-timeout
     exit 1
   fi
   sleep 0.05
@@ -464,7 +477,7 @@ write_startup_marker "$startup_stage" provider_client
 "$agent" --remote "unix://$proxy" --cd "$cwd" --no-alt-screen "$@"
 status=$?
 if [ "$(cat "$startup_stage" 2>/dev/null)" != initial_connection ]; then
-  write_startup_marker "$startup_failure" provider-client-exited
+  record_startup_failure provider-client-exited
 fi
 exit "$status"
 "#
@@ -2576,6 +2589,9 @@ async fn run_proxy_session(
         &crate::session_dir(&context, &record.id).join(crate::STARTUP_STAGE_FILE),
         b"initial_connection\n",
     );
+    let _ = fs::remove_file(
+        crate::session_dir(&context, &record.id).join(crate::STARTUP_DIAGNOSTIC_FILE),
+    );
     let mut projection = ProxyProjection::new(context.clone(), record.clone());
     let mut bootstrap = FreshBootstrap::for_runtime(&context, &record);
     let result = async {
@@ -3172,10 +3188,12 @@ exit 1
         assert!(!script.contains("thread/shellCommand"));
         assert!(script.contains(".startup-stage"));
         assert!(script.contains(".startup-failure"));
+        assert!(script.contains(".startup-diagnostic.log"));
         assert!(script.contains("runtime-helper-unavailable"));
         assert!(script.contains("provider-client-exited"));
         assert!(script.contains("!= initial_connection"));
-        assert!(script.contains(">/dev/null 2>&1"));
+        assert!(script.contains("tail -c 16384"));
+        assert!(script.contains(">/dev/null 2>>\"$startup_diagnostic\""));
         let cleanup_lines = script
             .lines()
             .filter(|line| line.trim_start().starts_with("rm -f --") && line.contains("$socket"))
@@ -4637,7 +4655,13 @@ exit 1
             host: None,
         };
         let id = "proxy-control";
-        fs::create_dir_all(crate::session_dir(&context, id)).unwrap();
+        let session_dir = crate::session_dir(&context, id);
+        fs::create_dir_all(&session_dir).unwrap();
+        crate::write_private_file(
+            &session_dir.join(crate::STARTUP_DIAGNOSTIC_FILE),
+            b"local-only startup detail\n",
+        )
+        .unwrap();
         let record = record_with_runtime(id, &upstream);
         crate::write_session_record(&context, &record).unwrap();
         crate::activity::activate_runtime(&context, &record).unwrap();
@@ -4711,7 +4735,11 @@ exit 1
         server.await.unwrap();
         proxy.await.unwrap().unwrap();
 
-        let session_dir = crate::session_dir(&context, id);
+        assert_eq!(
+            fs::read_to_string(session_dir.join(crate::STARTUP_STAGE_FILE)).unwrap(),
+            "initial_connection\n"
+        );
+        assert!(!session_dir.join(crate::STARTUP_DIAGNOSTIC_FILE).exists());
         let activity = format!(
             "{}\n{}",
             fs::read_to_string(session_dir.join("activity.json")).unwrap(),

@@ -152,9 +152,11 @@ is no second state model.
   `working-directory-unavailable`, `terminal-runtime-create-failed`,
   `app-server-start-failed`, `proxy-start-failed`, `provider-client-exited`,
   `provider-configuration-rejected`, `startup-timeout`, or `startup-exited`.
-  Managed launchers retain only bounded stage/failure markers; raw argv,
-  environment, provider responses, stderr, prompts, and filesystem paths are
-  never copied into the projection. A record that reached `ready` keeps that
+  Managed launchers retain only bounded stage/failure markers in the record and
+  keep startup stderr in a private, tail-capped local diagnostic file only until
+  the initial connection succeeds; raw argv, environment, provider responses,
+  stderr, prompts, and filesystem paths are never copied into the projection. A
+  record that reached `ready` keeps that
   state after an ordinary later stop, so consumers must not relabel normal
   session termination as startup failure.
 - `GET /usage` — read-only provider usage report, open on loopback. The serve

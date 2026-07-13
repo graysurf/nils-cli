@@ -52,6 +52,7 @@ const STARTUP_PROJECTION_VERSION: &str = "agent-session.startup.v1";
 const STARTUP_EXTRA_KEY: &str = "startup";
 const STARTUP_STAGE_FILE: &str = ".startup-stage";
 const STARTUP_FAILURE_FILE: &str = ".startup-failure";
+const STARTUP_DIAGNOSTIC_FILE: &str = ".startup-diagnostic.log";
 const SESSION_RESUME_FILE: &str = "resume.json";
 const SESSION_LOCKS_DIR: &str = "session-locks";
 const BINARY: &str = "agent-session";
