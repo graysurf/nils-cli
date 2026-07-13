@@ -316,6 +316,54 @@ fn pr_merge_dry_run_renders_squash_plan_with_delete_branch() {
 }
 
 #[test]
+fn pr_merge_github_dry_run_exposes_enabled_review_convergence() {
+    let stub = StubEnv::new().gh_stub(FORBIDDEN_STUB);
+    let out = run_forge_cli_in(
+        &stub,
+        &[
+            "--provider",
+            "github",
+            "--dry-run",
+            "--format",
+            "json",
+            "pr",
+            "merge",
+            "42",
+            "--review-convergence",
+        ],
+        None,
+    );
+    assert_eq!(out.code, 0, "stdout={}\nstderr={}", out.stdout, out.stderr);
+    let env = parse_envelope(&out.stdout);
+    assert_eq!(env["data"]["review_convergence"]["require"], true);
+}
+
+#[test]
+fn pr_merge_gitlab_dry_run_rejects_enabled_review_convergence() {
+    let tempdir = make_gitlab_repo();
+    let repo_path = tempdir.path().join("repo");
+    let stub = StubEnv::new().glab_stub(FORBIDDEN_STUB);
+    let out = run_forge_cli_in(
+        &stub,
+        &[
+            "--provider",
+            "gitlab",
+            "--dry-run",
+            "--format",
+            "json",
+            "pr",
+            "merge",
+            "7",
+            "--review-convergence",
+        ],
+        Some(&repo_path),
+    );
+    assert_eq!(out.code, 64, "stdout={}\nstderr={}", out.stdout, out.stderr);
+    let env = parse_envelope(&out.stdout);
+    assert_eq!(env["error"]["code"], "provider_unsupported");
+}
+
+#[test]
 fn pr_merge_dry_run_method_override_uses_merge_flag() {
     let stub = StubEnv::new().gh_stub(FORBIDDEN_STUB);
     let out = run_forge_cli_in(
@@ -498,6 +546,48 @@ mode = "observed"
         serde_json::json!([])
     );
     assert_eq!(env["data"]["review_convergence"]["unresolved_threads"], 0);
+}
+
+#[test]
+fn pr_merge_enabled_review_convergence_requires_an_initial_provider_head() {
+    let config = r#"[review_convergence]
+require = true
+quiet_period = "0s"
+timeout = "20m"
+"#;
+    let tempdir = make_github_repo(Some(config));
+    let repo_path = tempdir.path().join("repo");
+    let stub = StubEnv::new();
+    let body = github_merge_stub(&stub, "", "", false)
+        .replace("\"headRefOid\":\"head123\",\"title\"", "\"title\"");
+    let stub = stub.gh_stub(&body);
+
+    let out = run_forge_cli_in(
+        &stub,
+        &[
+            "--provider",
+            "github",
+            "--repo",
+            "acme/widgets",
+            "--format",
+            "json",
+            "pr",
+            "merge",
+            "7",
+        ],
+        Some(&repo_path),
+    );
+    assert_eq!(out.code, 65, "stdout={}\nstderr={}", out.stdout, out.stderr);
+    let env = parse_envelope(&out.stdout);
+    assert_eq!(env["error"]["code"], "review_convergence_head_missing");
+    assert!(
+        !stub.tempdir.path().join("review-calls").exists(),
+        "convergence must bind the initial provider head before reading reviews"
+    );
+    assert!(
+        !stub.tempdir.path().join("github-merged").exists(),
+        "missing merge CAS head must fail closed"
+    );
 }
 
 #[test]

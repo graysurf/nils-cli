@@ -98,6 +98,7 @@ fn sprint3_runtime_and_unavailable_kinds_match_spec() {
 fn review_convergence_validation_kinds_match_spec() {
     for kind in [
         "review_changes_requested",
+        "review_convergence_head_missing",
         "review_convergence_head_changed",
         "review_convergence_activity_changed",
         "review_snapshot_incomplete",

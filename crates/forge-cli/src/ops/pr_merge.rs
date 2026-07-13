@@ -30,7 +30,7 @@ use serde::Serialize;
 
 use crate::backend::{BackendCall, BackendProgram, BackendRunner, BackendSuccess, DryRunPayload};
 use crate::cli::{BINARY, GlobalFlags, PrMergeArgs};
-use crate::config::{ForgeConfig, MergeMethod};
+use crate::config::{ForgeConfig, MergeMethod, ReviewConvergencePolicy};
 use crate::envelope::emit_success;
 use crate::error::ForgeError;
 use crate::ops::gitlab_api;
@@ -113,10 +113,11 @@ pub fn run_with<R: BackendRunner, F: Fn(&str) -> Option<String>>(
     enforce_keep_branch_conflict(args.keep_branch, repo_delete_branch)?;
     let delete_branch = if args.keep_branch { false } else { cfg_delete };
     let policy = resolve_review_convergence_policy(&cfg, args.review_convergence)?;
+    ensure_review_convergence_provider(ctx.provider, &policy)?;
 
     if global.dry_run {
         let call = build_dry_run_merge_call(&ctx, args.id, method, delete_branch);
-        let payload = DryRunPayload::new(ctx.provider, &call);
+        let payload = DryRunPayload::new(ctx.provider, &call).with_review_convergence(&policy);
         return Ok(emit_success(
             schema_version_for(BINARY, SCHEMA, SCHEMA_VERSION),
             payload,
@@ -182,6 +183,7 @@ pub fn compute_with_clock<R: BackendRunner, C: Clock>(
     enforce_keep_branch_conflict(args.keep_branch, repo_delete_branch)?;
     let delete_branch = if args.keep_branch { false } else { cfg_delete };
     let policy = resolve_review_convergence_policy(&cfg, args.review_convergence)?;
+    ensure_review_convergence_provider(ctx.provider, &policy)?;
     run_lockdown_chain(
         runner,
         clock,
@@ -218,9 +220,12 @@ fn load_merge_config(workdir: &std::path::Path) -> (ForgeConfig, Option<bool>) {
 pub(crate) fn resolve_review_convergence_for_workdir(
     workdir: &std::path::Path,
     explicit_required: Option<bool>,
+    provider: Provider,
 ) -> Result<crate::config::ReviewConvergencePolicy, ForgeError> {
     let (cfg, _) = load_merge_config(workdir);
-    resolve_review_convergence_policy(&cfg, explicit_required)
+    let policy = resolve_review_convergence_policy(&cfg, explicit_required)?;
+    ensure_review_convergence_provider(provider, &policy)?;
+    Ok(policy)
 }
 
 fn resolve_review_convergence_policy(
@@ -245,6 +250,23 @@ fn ensure_review_convergence_config_valid(
         "invalid_review_convergence_config",
         "enabled review convergence has invalid configuration",
         Some(invalid.join(",")),
+    ))
+}
+
+fn ensure_review_convergence_provider(
+    provider: Provider,
+    policy: &ReviewConvergencePolicy,
+) -> Result<(), ForgeError> {
+    if !policy.require || matches!(provider, Provider::GitHub) {
+        return Ok(());
+    }
+    Err(ForgeError::provider_unsupported(
+        schema_err(),
+        format!(
+            "review convergence is GitHub-only in v1 (provider: {})",
+            provider.as_str()
+        ),
+        None,
     ))
 }
 
@@ -281,6 +303,23 @@ fn run_lockdown_chain<R: BackendRunner, C: Clock>(
             )),
         ));
     }
+    let convergence_head = if settings.review_policy.require {
+        Some(
+            pr.head_sha
+                .as_deref()
+                .filter(|head| !head.is_empty())
+                .ok_or_else(|| {
+                    ForgeError::validation(
+                        schema_err(),
+                        "review_convergence_head_missing",
+                        "enabled review convergence requires a non-empty initial provider head",
+                        Some(format!("pr={}; url={}", pr.number, pr.url)),
+                    )
+                })?,
+        )
+    } else {
+        pr.head_sha.as_deref()
+    };
     if pr.draft {
         return Err(ForgeError::validation(
             schema_err(),
@@ -322,7 +361,7 @@ fn run_lockdown_chain<R: BackendRunner, C: Clock>(
             ctx,
             args.id,
             &pr.url,
-            pr.head_sha.as_deref(),
+            convergence_head,
             settings.review_policy,
         )?)
     } else {
@@ -360,7 +399,7 @@ fn run_lockdown_chain<R: BackendRunner, C: Clock>(
             ctx,
             args.id,
             &pr.url,
-            pr.head_sha.as_deref(),
+            convergence_head,
             settings.review_policy,
             previous,
         )?;

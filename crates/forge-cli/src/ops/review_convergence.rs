@@ -118,6 +118,7 @@ pub fn recheck_before_merge<R: BackendRunner>(
     let reviews = compute_for_pr_with_timeout(runner, ctx, number, pr_url, Some(policy.timeout))
         .map_err(|err| map_provider_timeout(err, policy, expected_head_sha))?;
     ensure_expected_head(expected_head_sha, &reviews)?;
+    ensure_expected_head(Some(&previous.head_sha), &reviews)?;
     let mut snapshot = build_snapshot(policy, reviews, previous.waited_ms);
     if !snapshot.changes_requested_by.is_empty() {
         return Err(changes_requested_error(&snapshot));

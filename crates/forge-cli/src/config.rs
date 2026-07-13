@@ -1321,6 +1321,32 @@ timeout = "86401s"
     }
 
     #[test]
+    fn overflowing_review_convergence_durations_are_rejected_without_panicking() {
+        let value: Value = toml::from_str(
+            r#"
+[review_convergence]
+require = true
+quiet_period = "1152921504606846976h"
+timeout = "1152921504606846976h"
+"#,
+        )
+        .expect("valid TOML");
+        let cfg = parse_value(&value);
+        assert_eq!(cfg.review_convergence_quiet_period, None);
+        assert_eq!(cfg.review_convergence_timeout, None);
+        assert!(
+            cfg.warnings
+                .iter()
+                .any(|warning| warning.contains("quiet_period"))
+        );
+        assert!(
+            cfg.warnings
+                .iter()
+                .any(|warning| warning.contains("timeout"))
+        );
+    }
+
+    #[test]
     fn bad_scalar_type_yields_invalid_warning_not_panic() {
         let tmp = TempDir::new().unwrap();
         write(

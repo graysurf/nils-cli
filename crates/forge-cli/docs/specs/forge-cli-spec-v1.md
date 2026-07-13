@@ -580,7 +580,9 @@ backend mapping, validation rules, and output schema versions.
     via `--allow-non-default-base`;
   - when resolved review convergence is enabled, no current-head native
     `CHANGES_REQUESTED`, and any already-observed configured bot activity has
-    stayed quiet for the resolved quiet period;
+    stayed quiet for the resolved quiet period; the initial provider view must
+    also expose a non-empty head OID or the merge fails closed with
+    `review_convergence_head_missing`;
   - no unresolved review threads OR explicitly bypassed via
     `--allow-unresolved-threads`;
   - no unchecked task-list items in the description OR explicitly
@@ -594,6 +596,11 @@ backend mapping, validation rules, and output schema versions.
   more after the thread/task gates and immediately before the provider merge.
   A late request blocks; any other observed activity change returns
   `review_convergence_activity_changed` so the caller can rerun convergence.
+- `--dry-run` validates the same enabled-policy provider contract as live
+  merge and includes the resolved policy in `data.review_convergence`. GitLab
+  therefore returns `provider_unsupported` before either path touches the
+  provider. `pr deliver --no-merge` remains exempt because it has no merge
+  convergence phase.
 - Post-merge: deletes the remote branch (default `true`, disable via
   `--keep-branch`). GitHub passes `--match-head-commit <head_sha>`;
   GitLab performs the merge mutation through
@@ -763,7 +770,9 @@ backend implementations cannot diverge.
     `review_changes_requested`; `COMMENTED`
     prose is never parsed as a verdict. Older-head reviews are returned as
     stale evidence. A head change during an active wait fails closed with
-    `review_convergence_head_changed`. The complete paginated snapshot is read
+    `review_convergence_head_changed`; a missing initial provider head fails
+    with `review_convergence_head_missing` before review collection. The
+    complete paginated snapshot is read
     again immediately before merge; late activity fails with
     `review_convergence_activity_changed`, and incomplete or unknown provider
     data fails with `review_snapshot_incomplete`. For each reviewer, a later
@@ -813,6 +822,7 @@ Violations map to `DATA 65` with one of these `data.error.kind` values:
 | `keep_branch_conflict`                | 10                |
 | `local_path_present`                  | 11                |
 | `review_changes_requested`            | 12                |
+| `review_convergence_head_missing`     | 12                |
 | `review_convergence_head_changed`     | 12                |
 | `review_convergence_activity_changed` | 12                |
 | `review_snapshot_incomplete`          | 12                |
@@ -1093,7 +1103,8 @@ surface as `test_first_evidence_required`, `test_first_evidence_v1`,
 
 `require` defaults to `false`, `quiet_period` to `2m`, and `timeout` to `20m`.
 `quiet_period` is limited to `1h`; `timeout` is limited to `24h`. Invalid
-values are warnings while the feature is disabled, but fail an enabled merge
+or arithmetically overflowing values are warnings while the feature is
+disabled, but fail an enabled merge
 with `invalid_review_convergence_config` instead of silently falling back.
 Normally `bots` is a whole-list override: a repo list replaces the global list.
 When global `require = true`, repo bots are unioned with global bots as part of
@@ -1110,6 +1121,9 @@ disables a repo/global opt-in. Precedence is explicit flag > repo config >
 global config > default, subject to the enabled-global safety exception.
 Disabling this feature never disables the existing unresolved-thread gate.
 `pr close` has no convergence flag and remains unchanged.
+For `pr merge --dry-run` and the merge-capable `pr deliver --dry-run`, the
+resolved policy is additive output under `data.review_convergence`; the same
+GitHub-only provider check runs before the dry/live split.
 
 Environment variables (read once at startup, all optional):
 

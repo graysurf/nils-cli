@@ -244,9 +244,10 @@ impl<R: BackendRunner, C: Clock> RateLimitedRunner<R, C> {
         parse_graphql_remaining(&output.stdout)
     }
 
-    /// A GraphQL-remaining reading, reusing the cached probe when it is younger
-    /// than `poll_interval` and otherwise re-probing (and refreshing the
-    /// cache). An unreadable probe is not cached, so the next call re-probes.
+    /// A GraphQL-remaining reading, reusing the locally reserved cache when it
+    /// is younger than `poll_interval` and otherwise re-probing (and
+    /// refreshing the cache). An unreadable probe is not cached, so the next
+    /// call re-probes.
     fn cached_remaining(&self, timeout: Option<Duration>) -> Option<u64> {
         // Copy the small reading out and release the lock before probing — the
         // probe issues a backend call and must never run under the lock.
@@ -260,6 +261,23 @@ impl<R: BackendRunner, C: Clock> RateLimitedRunner<R, C> {
         *self.probe_cache.lock().unwrap_or_else(|e| e.into_inner()) =
             Some((self.clock.now(), remaining));
         Some(remaining)
+    }
+
+    /// Atomically reserve one cached GraphQL point before a real call. This
+    /// keeps sequential and concurrent paginated calls from all trusting one
+    /// stale just-above-threshold reading.
+    fn reserve_cached_budget(&self) -> bool {
+        let mut cached = self.probe_cache.lock().unwrap_or_else(|e| e.into_inner());
+        let Some((taken_at, remaining)) = cached.as_mut() else {
+            return false;
+        };
+        if self.clock.now().saturating_duration_since(*taken_at) >= self.config.poll_interval
+            || *remaining <= self.config.min_remaining
+        {
+            return false;
+        }
+        *remaining = remaining.saturating_sub(1);
+        true
     }
 
     /// Drop the cached probe reading. Called after a `backend_rate_limited`
@@ -283,7 +301,11 @@ impl<R: BackendRunner, C: Clock> RateLimitedRunner<R, C> {
                 // Cannot read the budget — do not block; proceed and let the
                 // real call (and its reactive retry) handle any throttling.
                 None => return,
-                Some(remaining) if remaining > self.config.min_remaining => return,
+                Some(remaining) if remaining > self.config.min_remaining => {
+                    if self.reserve_cached_budget() {
+                        return;
+                    }
+                }
                 Some(_) => {
                     let elapsed = self.clock.now().saturating_duration_since(start);
                     let mut budget_left = self.config.max_wait.saturating_sub(elapsed);
@@ -631,6 +653,24 @@ mod tests {
         assert_eq!(runner.probe_count(), 1, "one preflight probe");
         assert_eq!(runner.real_count(), 1, "the real call ran once");
         assert_eq!(clock.sleep_count(), 0, "healthy budget never sleeps");
+    }
+
+    #[test]
+    fn successful_graphql_calls_reserve_cached_budget_before_the_next_call() {
+        let runner = FakeRunner::new(vec![51, 500]);
+        let clock = FakeClock::new();
+        let gate = RateLimitedRunner::new(&runner, &clock, cfg());
+
+        gate.run(&pr_ready_call()).expect("first call");
+        gate.run(&pr_ready_call()).expect("second call");
+
+        assert_eq!(runner.real_count(), 2);
+        assert_eq!(
+            runner.probe_count(),
+            2,
+            "second call re-probes at the floor"
+        );
+        assert_eq!(clock.sleep_count(), 1, "cached 51 is spent down to 50");
     }
 
     #[test]

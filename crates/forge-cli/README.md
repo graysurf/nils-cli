@@ -45,9 +45,13 @@ current-head review activity exists, it waits for the configured quiet period,
 reports bounded native review summaries, and blocks native
 `CHANGES_REQUESTED`. The complete paginated review snapshot is read again
 immediately before merge; partial provider data or late review activity fails
-closed. Existing unresolved-thread enforcement remains an independent merge
-gate. See the contract for config precedence, duration bounds, and the JSON
-snapshot.
+closed, and the initial non-empty provider head is bound through the final
+merge compare-and-swap. GitHub is the only supported provider in v1; enabled
+GitLab dry-runs fail with the same `provider_unsupported` result as live runs.
+Merge and deliver dry-run envelopes expose the resolved policy under
+`data.review_convergence`. Existing unresolved-thread enforcement remains an
+independent merge gate. See the contract for config precedence, duration
+bounds, and the JSON snapshot.
 
 ## Inbox discovery
 

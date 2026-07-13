@@ -91,6 +91,7 @@ const LOCKDOWN_DATA_KINDS: &[&str] = &[
     "unchecked_task_items",
     "review_thread_pr_mismatch",
     "review_changes_requested",
+    "review_convergence_head_missing",
     "review_convergence_head_changed",
     "review_convergence_activity_changed",
     "review_snapshot_incomplete",

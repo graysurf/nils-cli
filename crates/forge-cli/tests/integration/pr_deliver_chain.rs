@@ -1367,7 +1367,9 @@ fn pr_deliver_enforces_review_convergence_and_preserves_error_detail() {
         r#"{"data":{"repository":{"pullRequest":{"headRefOid":"head123","reviews":{"nodes":[{"id":"PRR_blocking","databaseId":9,"url":"https://github.com/sympoies/nils-cli/pull/123#pullrequestreview-9","author":{"login":"blocking-reviewer"},"state":"CHANGES_REQUESTED","commit":{"oid":"head123"},"submittedAt":"2026-07-14T04:00:00Z","body":"changes requested"}],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}}}"#,
     )
     .expect("review response");
-    let gh_path = write_chain_stub(&stub, FULL_PR_VIEW_JSON, MERGED_PR_VIEW_JSON, false);
+    let pre_view = view_with_head_oid(FULL_PR_VIEW_JSON, "head123");
+    let post_view = view_with_head_oid(MERGED_PR_VIEW_JSON, "head123");
+    let gh_path = write_chain_stub(&stub, &pre_view, &post_view, false);
     let stub = stub.env("FORGE_CLI_GH_BIN", gh_path.to_string_lossy());
     let out = run_in_repo(
         &stub,

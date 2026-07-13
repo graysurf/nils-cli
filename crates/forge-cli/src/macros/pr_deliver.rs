@@ -96,6 +96,8 @@ pub struct PrDeliverDryRun {
     pub kind: &'static str,
     pub plan_steps: Vec<DryRunStep>,
     pub no_merge: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub review_convergence: Option<crate::config::ReviewConvergencePolicy>,
     /// Per-rule verdicts from the non-mutating local preflight (Rules 1a, 1b,
     /// 3, 2a, 2b, 4, 5). Additive: consumers that predate this field ignore
     /// it. The dry-run path never invokes a provider backend to compute it.
@@ -152,12 +154,25 @@ pub fn run_with<R: BackendRunner, C: Clock>(
     // The merge phase owns review convergence, but configuration validity is
     // part of the macro input contract. Validate before the dry-run/live split
     // so previews cannot report a deliverable plan that live delivery rejects.
-    if !args.no_merge {
-        let _ = pr_merge::resolve_review_convergence_for_workdir(workdir, args.review_convergence)?;
-    }
+    let review_policy = if args.no_merge {
+        None
+    } else {
+        Some(pr_merge::resolve_review_convergence_for_workdir(
+            workdir,
+            args.review_convergence,
+            ctx.provider,
+        )?)
+    };
 
     if global.dry_run {
-        return Ok(emit_dry_run(&ctx, &args, format, workdir, global));
+        return Ok(emit_dry_run(
+            &ctx,
+            &args,
+            format,
+            workdir,
+            global,
+            review_policy.as_ref(),
+        ));
     }
 
     execute_sequence(runner, clock, global, &ctx, &args, format, workdir)
@@ -756,8 +771,9 @@ fn emit_dry_run(
     format: OutputFormat,
     workdir: &Path,
     global: &GlobalFlags,
+    review_policy: Option<&crate::config::ReviewConvergencePolicy>,
 ) -> i32 {
-    let payload = build_dry_run_payload(ctx, args, workdir, global, git_remote_url);
+    let payload = build_dry_run_payload(ctx, args, workdir, global, review_policy, git_remote_url);
     let envelope = Envelope::success(schema_version_for(BINARY, SCHEMA, SCHEMA_VERSION), payload);
     write_envelope(&envelope, format);
     nils_common::cli_contract::exit::SUCCESS
@@ -768,6 +784,7 @@ fn build_dry_run_payload(
     args: &PrDeliverArgs,
     workdir: &Path,
     global: &GlobalFlags,
+    review_policy: Option<&crate::config::ReviewConvergencePolicy>,
     remote_url_lookup: impl FnOnce(&str) -> Option<String>,
 ) -> PrDeliverDryRun {
     let branch = match &args.head {
@@ -871,6 +888,7 @@ fn build_dry_run_payload(
         kind: args.kind.as_str(),
         plan_steps,
         no_merge: args.no_merge,
+        review_convergence: review_policy.cloned(),
         local_preflight,
     }
 }
@@ -1304,9 +1322,10 @@ mod tests {
         deliver.head = Some("main".into());
         deliver.test_first_evidence = Some(fixture.evidence.to_string_lossy().to_string());
 
-        let payload = build_dry_run_payload(&context, &deliver, &fixture.repo, &global, |_| {
-            Some("https://github.com/sympoies/nils-cli.git".into())
-        });
+        let payload =
+            build_dry_run_payload(&context, &deliver, &fixture.repo, &global, None, |_| {
+                Some("https://github.com/sympoies/nils-cli.git".into())
+            });
         let verdict = payload
             .local_preflight
             .iter()

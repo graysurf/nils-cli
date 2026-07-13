@@ -737,8 +737,16 @@ pub(crate) fn parse_duration(s: &str) -> Result<Duration, String> {
     let dur = match unit {
         "" | "s" => Duration::from_secs(value),
         "ms" => Duration::from_millis(value),
-        "m" => Duration::from_secs(value * 60),
-        "h" => Duration::from_secs(value * 3600),
+        "m" => Duration::from_secs(
+            value
+                .checked_mul(60)
+                .ok_or_else(|| format!("duration overflows in {s:?}"))?,
+        ),
+        "h" => Duration::from_secs(
+            value
+                .checked_mul(3600)
+                .ok_or_else(|| format!("duration overflows in {s:?}"))?,
+        ),
         other => return Err(format!("unknown duration unit {other:?} in {s:?}")),
     };
     Ok(dur)

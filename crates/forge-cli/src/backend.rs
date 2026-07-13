@@ -6,8 +6,9 @@
 //! subprocess is spawned.
 
 use std::ffi::{OsStr, OsString};
-use std::io;
-use std::process::{Child, Command, Stdio};
+use std::io::{self, Read};
+use std::process::{Child, Command, ExitStatus, Stdio};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 #[cfg(unix)]
@@ -329,18 +330,60 @@ fn output_with_timeout(
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
     configure_child_group(cmd);
     let mut child = cmd.spawn().map_err(ProcessOutputError::Io)?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| ProcessOutputError::Io(io::Error::other("child stdout was not piped")))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| ProcessOutputError::Io(io::Error::other("child stderr was not piped")))?;
+    let stdout_reader = spawn_output_reader(stdout);
+    let stderr_reader = spawn_output_reader(stderr);
     let started = Instant::now();
     loop {
-        if child.try_wait().map_err(ProcessOutputError::Io)?.is_some() {
-            return child.wait_with_output().map_err(ProcessOutputError::Io);
+        if let Some(status) = child.try_wait().map_err(ProcessOutputError::Io)? {
+            return collect_child_output(status, stdout_reader, stderr_reader)
+                .map_err(ProcessOutputError::Io);
         }
         if started.elapsed() >= timeout {
             kill_child_group(&mut child);
-            let output = child.wait_with_output().map_err(ProcessOutputError::Io)?;
+            let status = child.wait().map_err(ProcessOutputError::Io)?;
+            let output = collect_child_output(status, stdout_reader, stderr_reader)
+                .map_err(ProcessOutputError::Io)?;
             return Err(ProcessOutputError::Timeout { timeout, output });
         }
         std::thread::sleep(Duration::from_millis(10));
     }
+}
+
+fn spawn_output_reader<R>(mut reader: R) -> JoinHandle<io::Result<Vec<u8>>>
+where
+    R: Read + Send + 'static,
+{
+    std::thread::spawn(move || {
+        let mut output = Vec::new();
+        reader.read_to_end(&mut output)?;
+        Ok(output)
+    })
+}
+
+fn collect_child_output(
+    status: ExitStatus,
+    stdout_reader: JoinHandle<io::Result<Vec<u8>>>,
+    stderr_reader: JoinHandle<io::Result<Vec<u8>>>,
+) -> io::Result<std::process::Output> {
+    let stdout = stdout_reader
+        .join()
+        .map_err(|_| io::Error::other("child stdout reader panicked"))??;
+    let stderr = stderr_reader
+        .join()
+        .map_err(|_| io::Error::other("child stderr reader panicked"))??;
+    Ok(std::process::Output {
+        status,
+        stdout,
+        stderr,
+    })
 }
 
 enum ProcessOutputError {
@@ -400,6 +443,8 @@ impl BackendRunner for DryRunRunner {
 pub struct DryRunPayload {
     pub provider: &'static str,
     pub plan: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub review_convergence: Option<crate::config::ReviewConvergencePolicy>,
 }
 
 impl DryRunPayload {
@@ -407,7 +452,16 @@ impl DryRunPayload {
         Self {
             provider: provider.as_str(),
             plan: call.plan_argv(),
+            review_convergence: None,
         }
+    }
+
+    pub fn with_review_convergence(
+        mut self,
+        policy: &crate::config::ReviewConvergencePolicy,
+    ) -> Self {
+        self.review_convergence = Some(policy.clone());
+        self
     }
 }
 
@@ -654,6 +708,32 @@ mod tests {
             started.elapsed() < Duration::from_secs(1),
             "timeout should kill the child promptly"
         );
+    }
+
+    #[test]
+    fn process_runner_timed_call_drains_large_stdout_without_deadlock() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _guard = ENV_GH_BIN_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let stub = dir.path().join("gh");
+        std::fs::write(&stub, "#!/bin/sh\nyes 0123456789 | head -c 2097152\n").expect("write stub");
+        let mut perms = std::fs::metadata(&stub).expect("metadata").permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&stub, perms).expect("chmod");
+
+        let runner = ProcessRunner;
+        unsafe {
+            std::env::set_var(ENV_GH_BIN, &stub);
+        }
+        let call = BackendCall::new(BackendProgram::Gh, ["api", "graphql"]);
+        let output = runner
+            .run_with_timeout(&call, Some(Duration::from_secs(2)))
+            .expect("large output completes before timeout");
+        unsafe {
+            std::env::remove_var(ENV_GH_BIN);
+        }
+        assert_eq!(output.stdout.len(), 2 * 1024 * 1024);
     }
 
     #[test]

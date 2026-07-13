@@ -220,6 +220,101 @@ fn pr_deliver_dry_run_rejects_invalid_enabled_review_convergence_config() {
 }
 
 #[test]
+fn pr_deliver_github_dry_run_exposes_enabled_review_convergence() {
+    let repo = TempDir::new().expect("tempdir");
+    let stub = StubEnv::new().gh_stub(FORBIDDEN_STUB);
+
+    let out = run_forge_cli_in(
+        &stub,
+        &[
+            "--provider",
+            "github",
+            "--dry-run",
+            "--format",
+            "json",
+            "pr",
+            "deliver",
+            "--kind",
+            "feature",
+            "--title",
+            "demo",
+            "--body",
+            "## Summary\nx\n\n## Test plan\ny\n",
+            "--review-convergence",
+        ],
+        Some(repo.path()),
+    );
+
+    assert_eq!(out.code, 0, "stdout={}\nstderr={}", out.stdout, out.stderr);
+    let env = parse_envelope(&out.stdout);
+    assert_eq!(env["data"]["review_convergence"]["require"], true);
+}
+
+#[test]
+fn pr_deliver_gitlab_dry_run_rejects_enabled_review_convergence() {
+    let repo = TempDir::new().expect("tempdir");
+    let stub = StubEnv::new().glab_stub(FORBIDDEN_STUB);
+
+    let out = run_forge_cli_in(
+        &stub,
+        &[
+            "--provider",
+            "gitlab",
+            "--dry-run",
+            "--format",
+            "json",
+            "pr",
+            "deliver",
+            "--kind",
+            "feature",
+            "--title",
+            "demo",
+            "--body",
+            "## Summary\nx\n\n## Test plan\ny\n",
+            "--review-convergence",
+        ],
+        Some(repo.path()),
+    );
+
+    assert_eq!(out.code, 64, "stdout={}\nstderr={}", out.stdout, out.stderr);
+    let env = parse_envelope(&out.stdout);
+    assert_eq!(env["error"]["code"], "provider_unsupported");
+}
+
+#[test]
+fn pr_deliver_gitlab_dry_run_no_merge_exempts_review_convergence() {
+    let repo = TempDir::new().expect("tempdir");
+    let stub = StubEnv::new().glab_stub(FORBIDDEN_STUB);
+
+    let out = run_forge_cli_in(
+        &stub,
+        &[
+            "--provider",
+            "gitlab",
+            "--dry-run",
+            "--format",
+            "json",
+            "pr",
+            "deliver",
+            "--kind",
+            "feature",
+            "--title",
+            "demo",
+            "--body",
+            "## Summary\nx\n\n## Test plan\ny\n",
+            "--review-convergence",
+            "--no-merge",
+        ],
+        Some(repo.path()),
+    );
+
+    assert_eq!(out.code, 0, "stdout={}\nstderr={}", out.stdout, out.stderr);
+    let env = parse_envelope(&out.stdout);
+    assert_eq!(env["data"]["no_merge"], true);
+    assert!(env["data"].get("review_convergence").is_none());
+}
+
+#[test]
 fn pr_deliver_dry_run_no_merge_ignores_review_convergence_config() {
     let repo = TempDir::new().expect("tempdir");
     fs::write(

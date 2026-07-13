@@ -76,8 +76,8 @@ validations_catalog:
     error_kind: unresolved_review_threads
     exit: DATA
   review_convergence:
-    rule: "when enabled, a complete paginated current-head native-review snapshot has no effective CHANGES_REQUESTED, already-observed configured bot activity stays quiet for the resolved quiet_period, and a final pre-merge snapshot has not changed; absent observed bots never wait"
-    error_kind: review_changes_requested | review_convergence_head_changed | review_convergence_activity_changed | review_snapshot_incomplete | invalid_review_convergence_config | review_convergence_timeout | provider_unsupported
+    rule: "when enabled, the initial provider head is non-empty, a complete paginated current-head native-review snapshot has no effective CHANGES_REQUESTED, already-observed configured bot activity stays quiet for the resolved quiet_period, and a final pre-merge snapshot has not changed; absent observed bots never wait"
+    error_kind: review_changes_requested | review_convergence_head_missing | review_convergence_head_changed | review_convergence_activity_changed | review_snapshot_incomplete | invalid_review_convergence_config | review_convergence_timeout | provider_unsupported
     exit: DATA | UNAVAILABLE | USAGE
   tasklist_complete:
     rule: "no unchecked task-list items in the PR/MR description at merge time unless --allow-unchecked-tasks (with --allow-unchecked-tasks-reason) is set"
@@ -486,7 +486,7 @@ operations:
       - required_checks_green   # TTL-zero re-check
       - merge_method_supported
       - keep_branch_conflict
-      - review_convergence # only when explicit/repo/global require resolves true; GitHub-only in v1; final complete snapshot is re-read immediately before provider merge
+      - review_convergence # only when explicit/repo/global require resolves true; requires a non-empty initial provider head; GitHub-only in v1; dry-run and live validate provider parity; final complete snapshot is re-read immediately before provider merge
       - review_threads_resolved
       - tasklist_complete
     backends:
@@ -500,6 +500,8 @@ operations:
         method: enum<squash|merge|rebase>
         deleted_branch: bool
         review_convergence: optional<{required, head_sha, observed_reviews, stale_reviews, unresolved_threads, changes_requested_by, missing_reviewers, latest_activity_at?, quiet_until?, quiet_period_ms, timeout_ms, waited_ms, bots}>
+      dry_run_data:
+        review_convergence: resolved<{require, quiet_period, timeout, bots}>
 
   - id: pr.close
     schema_version: cli.forge-cli.pr.close.v1
@@ -935,6 +937,7 @@ macros:
       data:
         kind: enum<feature|bug>
         provider: enum<github|gitlab>
+        review_convergence: optional<resolved<{require, quiet_period, timeout, bots}>> # dry-run merge phase only; absent with --no-merge
         pr:
           number: integer
           url: string
