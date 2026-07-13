@@ -360,6 +360,20 @@ esac
     ;;
 esac
 ;;
+(reviews)
+_arguments "${_arguments_options[@]}" : \
+'--format=[Output format (defaults to text)]:FORMAT:((text\:"Human-readable text output (default)"
+json\:"Single-record JSON envelope (snake_case)"))' \
+'--remote=[Git remote whose URL feeds provider detection (default\: \`origin\`)]:REMOTE:_default' \
+'--provider=[Override auto-detected provider]:PROVIDER:(github gitlab local)' \
+'--repo=[Override the repo slug (\`owner/name\`). When absent it is derived from the remote URL]:owner/name:_default' \
+'--store-root=[Root directory of the file-backed store used by \`--provider local\`. Overrides the \`FORGE_CLI_LOCAL_STORE\` env var]:path:_files' \
+'--dry-run[Render the backend command that would run, without invoking it. The envelope'\''s \`data.plan\` carries the exact argv]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+':id -- Numeric pull request id:_default' \
+&& ret=0
+;;
 (tasks)
 _arguments "${_arguments_options[@]}" : \
 '--format=[Output format (defaults to text)]:FORMAT:((text\:"Human-readable text output (default)"
@@ -377,6 +391,7 @@ json\:"Single-record JSON envelope (snake_case)"))' \
 (merge)
 _arguments "${_arguments_options[@]}" : \
 '--method=[Merge method override. When omitted, falls back to \`.forge-cli.toml \[merge\].method\` then the spec default \`squash\`]:METHOD:(squash merge rebase)' \
+'--review-convergence=[Override \`\[review_convergence\].require\`. Passing the flag without a value enables it; use \`--review-convergence=false\` to disable a repo or user-global opt-in for this invocation]::REVIEW_CONVERGENCE:(true false)' \
 '--allow-unchecked-tasks-reason=[Required when \`--allow-unchecked-tasks\` is set. Non-empty free-form text describing why the unchecked items are safe to merge past; the reason is recorded in the merge envelope payload]:TEXT:_default' \
 '--format=[Output format (defaults to text)]:FORMAT:((text\:"Human-readable text output (default)"
 json\:"Single-record JSON envelope (snake_case)"))' \
@@ -454,6 +469,7 @@ _arguments "${_arguments_options[@]}" : \
 '--label-catalog=[Validate labels against this catalog when \`--strict-labels\` is set]:PATH:_default' \
 '--test-first-evidence=[Directory holding a \`test-first-evidence\` record, forwarded to the create step and verified by the test-first gate when \`\[test_first\].require\` resolves true for a feature/bug PR. Requires a complete v2 record with a testable classification and a bound baseline/delivery subject matching the current checkout]:DIR:_default' \
 '--timeout=[Cumulative CI-wait budget before declaring \`checks_timeout\` (default \`30m\`)]:TIMEOUT:_default' \
+'--review-convergence=[Override \`\[review_convergence\].require\` for the merge phase. Passing the flag without a value enables it; \`--review-convergence=false\` disables a configured opt-in for this invocation]::REVIEW_CONVERGENCE:(true false)' \
 '--allow-unchecked-tasks-reason=[Required when \`--allow-unchecked-tasks\` is set. Non-empty free-form text describing why the unchecked items are safe to merge past; the reason is recorded in the merge-step payload]:TEXT:_default' \
 '--format=[Output format (defaults to text)]:FORMAT:((text\:"Human-readable text output (default)"
 json\:"Single-record JSON envelope (snake_case)"))' \
@@ -559,6 +575,10 @@ _arguments "${_arguments_options[@]}" : \
         esac
     ;;
 esac
+;;
+(reviews)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
 ;;
 (tasks)
 _arguments "${_arguments_options[@]}" : \
@@ -1500,6 +1520,10 @@ _arguments "${_arguments_options[@]}" : \
     ;;
 esac
 ;;
+(reviews)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
 (tasks)
 _arguments "${_arguments_options[@]}" : \
 && ret=0
@@ -2040,6 +2064,7 @@ _forge-cli__subcmd__help__subcmd__pr_commands() {
 'comments:List the issue-style comment stream attached to a PR / MR' \
 'ready:Promote a draft PR / MR to ready-for-review' \
 'review-threads:List review threads attached to a PR / MR with their resolved state' \
+'reviews:List native review summaries, classified against the current head' \
 'tasks:List GFM task-list items in the PR / MR description with their state' \
 'merge:Merge a ready PR / MR' \
 'close:Close a PR / MR without merging' \
@@ -2134,6 +2159,11 @@ _forge-cli__subcmd__help__subcmd__pr__subcmd__review-threads__subcmd__reply_comm
 _forge-cli__subcmd__help__subcmd__pr__subcmd__review-threads__subcmd__resolve_commands() {
     local commands; commands=()
     _describe -t commands 'forge-cli help pr review-threads resolve commands' commands "$@"
+}
+(( $+functions[_forge-cli__subcmd__help__subcmd__pr__subcmd__reviews_commands] )) ||
+_forge-cli__subcmd__help__subcmd__pr__subcmd__reviews_commands() {
+    local commands; commands=()
+    _describe -t commands 'forge-cli help pr reviews commands' commands "$@"
 }
 (( $+functions[_forge-cli__subcmd__help__subcmd__pr__subcmd__tasks_commands] )) ||
 _forge-cli__subcmd__help__subcmd__pr__subcmd__tasks_commands() {
@@ -2411,6 +2441,7 @@ _forge-cli__subcmd__pr_commands() {
 'comments:List the issue-style comment stream attached to a PR / MR' \
 'ready:Promote a draft PR / MR to ready-for-review' \
 'review-threads:List review threads attached to a PR / MR with their resolved state' \
+'reviews:List native review summaries, classified against the current head' \
 'tasks:List GFM task-list items in the PR / MR description with their state' \
 'merge:Merge a ready PR / MR' \
 'close:Close a PR / MR without merging' \
@@ -2468,6 +2499,7 @@ _forge-cli__subcmd__pr__subcmd__help_commands() {
 'comments:List the issue-style comment stream attached to a PR / MR' \
 'ready:Promote a draft PR / MR to ready-for-review' \
 'review-threads:List review threads attached to a PR / MR with their resolved state' \
+'reviews:List native review summaries, classified against the current head' \
 'tasks:List GFM task-list items in the PR / MR description with their state' \
 'merge:Merge a ready PR / MR' \
 'close:Close a PR / MR without merging' \
@@ -2568,6 +2600,11 @@ _forge-cli__subcmd__pr__subcmd__help__subcmd__review-threads__subcmd__reply_comm
 _forge-cli__subcmd__pr__subcmd__help__subcmd__review-threads__subcmd__resolve_commands() {
     local commands; commands=()
     _describe -t commands 'forge-cli pr help review-threads resolve commands' commands "$@"
+}
+(( $+functions[_forge-cli__subcmd__pr__subcmd__help__subcmd__reviews_commands] )) ||
+_forge-cli__subcmd__pr__subcmd__help__subcmd__reviews_commands() {
+    local commands; commands=()
+    _describe -t commands 'forge-cli pr help reviews commands' commands "$@"
 }
 (( $+functions[_forge-cli__subcmd__pr__subcmd__help__subcmd__tasks_commands] )) ||
 _forge-cli__subcmd__pr__subcmd__help__subcmd__tasks_commands() {
@@ -2684,6 +2721,11 @@ _forge-cli__subcmd__pr__subcmd__review-threads__subcmd__reply_commands() {
 _forge-cli__subcmd__pr__subcmd__review-threads__subcmd__resolve_commands() {
     local commands; commands=()
     _describe -t commands 'forge-cli pr review-threads resolve commands' commands "$@"
+}
+(( $+functions[_forge-cli__subcmd__pr__subcmd__reviews_commands] )) ||
+_forge-cli__subcmd__pr__subcmd__reviews_commands() {
+    local commands; commands=()
+    _describe -t commands 'forge-cli pr reviews commands' commands "$@"
 }
 (( $+functions[_forge-cli__subcmd__pr__subcmd__tasks_commands] )) ||
 _forge-cli__subcmd__pr__subcmd__tasks_commands() {

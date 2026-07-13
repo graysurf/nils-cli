@@ -6,7 +6,7 @@
 //! discussions on GitLab. Issue-style comments stay on `pr comments`.
 //!
 //! Also hosts [`ensure_review_threads_resolved`], the `pr merge` lock-down
-//! rule (rule 12): merging while unresolved threads exist fails closed with
+//! rule (rule 13): merging while unresolved threads exist fails closed with
 //! `unresolved_review_threads` unless `--allow-unresolved-threads` is passed.
 //! Bot reviewers post threads asynchronously after PR creation, so the gate
 //! runs at merge time — the last action — rather than at creation.
@@ -164,7 +164,7 @@ pub fn run_with<R: BackendRunner, F: Fn(&str) -> Option<String>>(
     ))
 }
 
-/// `pr merge` lock-down rule 12. Fetches review threads for the PR/MR and
+/// `pr merge` lock-down rule 13. Fetches review threads for the PR/MR and
 /// fails closed with `unresolved_review_threads` (DATA 65) when any thread is
 /// unresolved. The local provider passes trivially (no thread model). Callers
 /// bypass via `--allow-unresolved-threads`, which skips this call entirely.
@@ -174,13 +174,50 @@ pub fn ensure_review_threads_resolved<R: BackendRunner>(
     pr_url: &str,
     number: u64,
 ) -> Result<(), ForgeError> {
+    let payload = compute_for_pr(runner, ctx, pr_url, number)?;
+    ensure_payload_resolved(&payload)
+}
+
+/// Fetch the thread snapshot for a known PR URL without emitting an envelope.
+/// Review convergence uses this immediately before merge so its structured
+/// snapshot and the existing independent rule-12 gate share one provider read.
+pub fn compute_for_pr<R: BackendRunner>(
+    runner: &R,
+    ctx: &ProviderContext,
+    pr_url: &str,
+    number: u64,
+) -> Result<PrReviewThreadsPayload, ForgeError> {
     if matches!(ctx.provider, Provider::Local) {
-        return Ok(());
+        return Ok(PrReviewThreadsPayload {
+            provider: ctx.provider.as_str(),
+            number,
+            url: pr_url.to_string(),
+            total: 0,
+            unresolved: 0,
+            threads: Vec::new(),
+        });
     }
     let call = build_threads_call(ctx, pr_url, number)?;
     let output = runner.run(&call)?;
     let threads = parse_threads(ctx, &output, pr_url)?;
-    let unresolved: Vec<&PrReviewThreadSummary> = threads.iter().filter(|t| !t.resolved).collect();
+    let unresolved = threads.iter().filter(|thread| !thread.resolved).count();
+    Ok(PrReviewThreadsPayload {
+        provider: ctx.provider.as_str(),
+        number,
+        url: pr_url.to_string(),
+        total: threads.len(),
+        unresolved,
+        threads,
+    })
+}
+
+/// Apply the existing unresolved-thread rule to an already-fetched snapshot.
+pub fn ensure_payload_resolved(payload: &PrReviewThreadsPayload) -> Result<(), ForgeError> {
+    let unresolved: Vec<&PrReviewThreadSummary> = payload
+        .threads
+        .iter()
+        .filter(|thread| !thread.resolved)
+        .collect();
     if unresolved.is_empty() {
         return Ok(());
     }

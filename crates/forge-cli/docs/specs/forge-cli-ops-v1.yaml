@@ -75,6 +75,10 @@ validations_catalog:
     rule: "no unresolved review threads at merge time unless --allow-unresolved-threads is set"
     error_kind: unresolved_review_threads
     exit: DATA
+  review_convergence:
+    rule: "when enabled, a complete paginated current-head native-review snapshot has no effective CHANGES_REQUESTED, already-observed configured bot activity stays quiet for the resolved quiet_period, and a final pre-merge snapshot has not changed; absent observed bots never wait"
+    error_kind: review_changes_requested | review_convergence_head_changed | review_convergence_activity_changed | review_snapshot_incomplete | invalid_review_convergence_config | review_convergence_timeout | provider_unsupported
+    exit: DATA | UNAVAILABLE | USAGE
   tasklist_complete:
     rule: "no unchecked task-list items in the PR/MR description at merge time unless --allow-unchecked-tasks (with --allow-unchecked-tasks-reason) is set"
     error_kind: unchecked_task_items
@@ -424,6 +428,28 @@ operations:
         thread_id: string
         comment_url: string
 
+  - id: pr.reviews
+    schema_version: cli.forge-cli.pr.reviews.v1
+    summary: Read bounded provider-native GitHub review summaries classified against the current PR head.
+    inputs:
+      - { name: <id>, type: integer, required: true }
+    dry_run:
+      offline: true
+      repo_resolution: "--repo owner/name or recognised forge remote"
+    backends:
+      github: { program: gh, argv: [api, graphql, "--hostname <host when host != github.com>", -f, "query=<headRefOid and paginated reviews query>", -f, "owner={owner}", -f, "name={name}", -F, "pr={id}", "-f after={cursor}?"] }
+      gitlab: unsupported # provider_unsupported (USAGE 64)
+      local: unsupported  # provider_unsupported (USAGE 64)
+    output:
+      data:
+        provider: enum<github>
+        number: integer
+        url: string
+        head_sha: string
+        current_head_reviews: list<{id, database_id?, url, author, state, commit_sha?, submitted_at, summary, summary_truncated}>
+        stale_reviews: list<{id, database_id?, url, author, state, commit_sha?, submitted_at, summary, summary_truncated}>
+    notes: "all review pages are read (100 nodes/page, max 100 pages); partial GraphQL data, missing required fields, unknown states, head drift, or unsafe pagination return review_snapshot_incomplete. summary is bounded to 4096 UTF-8 bytes and is never parsed as a machine verdict; commit_sha != head_sha is stale/informational."
+
   - id: pr.tasks
     schema_version: cli.forge-cli.pr.tasks.v1
     summary: List GFM task-list items in the PR/MR description with their state.
@@ -450,6 +476,7 @@ operations:
       - { name: --keep-branch,              type: bool,                          default: false }
       - { name: --allow-non-default-base,   type: bool,                          default: false }
       - { name: --allow-unresolved-threads, type: bool,                          default: false }
+      - { name: --review-convergence,        type: optional<bool>,               default: resolved-config }
       - { name: --allow-unchecked-tasks,    type: bool,                          default: false }
       - { name: --allow-unchecked-tasks-reason, type: string,                    default: null }
     validations:
@@ -459,6 +486,7 @@ operations:
       - required_checks_green   # TTL-zero re-check
       - merge_method_supported
       - keep_branch_conflict
+      - review_convergence # only when explicit/repo/global require resolves true; GitHub-only in v1; final complete snapshot is re-read immediately before provider merge
       - review_threads_resolved
       - tasklist_complete
     backends:
@@ -471,6 +499,7 @@ operations:
         merge_sha: string
         method: enum<squash|merge|rebase>
         deleted_branch: bool
+        review_convergence: optional<{required, head_sha, observed_reviews, stale_reviews, unresolved_threads, changes_requested_by, missing_reviewers, latest_activity_at?, quiet_until?, quiet_period_ms, timeout_ms, waited_ms, bots}>
 
   - id: pr.close
     schema_version: cli.forge-cli.pr.close.v1
@@ -868,6 +897,7 @@ macros:
       - { name: --no-issue-closeout,        type: bool,                         default: false } # skip the post-merge deterministic linked-issue closeout
       - { name: --allow-non-default-base,   type: bool,                         default: false }
       - { name: --allow-unresolved-threads, type: bool,                         default: false }
+      - { name: --review-convergence,        type: optional<bool>,              default: resolved-config }
       - { name: --allow-unchecked-tasks,    type: bool,                         default: false }
       - { name: --allow-unchecked-tasks-reason, type: string,                   default: null }
       - { name: --test-first-evidence,      type: path,                         required: false } # forwarded to create and enforced on the adopt path when [test_first].require resolves true

@@ -9,7 +9,7 @@
 //! and are skipped.
 //!
 //! Also hosts [`ensure_tasklist_complete`], the `pr merge` lock-down rule
-//! (rule 13): merging while the description still contains unchecked task
+//! (rule 14): merging while the description still contains unchecked task
 //! items fails closed with `unchecked_task_items` unless
 //! `--allow-unchecked-tasks` (paired with a recorded
 //! `--allow-unchecked-tasks-reason`) is passed. `- [x]` / `- [X]` count as
@@ -115,7 +115,7 @@ pub fn run_with<R: BackendRunner, F: Fn(&str) -> Option<String>>(
     ))
 }
 
-/// `pr merge` lock-down rule 13. Parses the PR/MR description and fails
+/// `pr merge` lock-down rule 14. Parses the PR/MR description and fails
 /// closed with `unchecked_task_items` (DATA 65) when any GFM task-list item
 /// is still unchecked. Bodyless providers (local) pass trivially via the
 /// empty string. Callers bypass via `--allow-unchecked-tasks`, which skips
