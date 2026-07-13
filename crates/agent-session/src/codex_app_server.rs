@@ -16,6 +16,7 @@ use std::os::unix::net::UnixDatagram;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -1696,15 +1697,7 @@ impl ProxyObserver {
     fn observe_client(&mut self, record: &SessionRecord, value: &Value) -> Result<(), String> {
         match value.get("method").and_then(Value::as_str) {
             Some("thread/start") => {
-                if let Some(key) = value.get("id").and_then(json_id_key) {
-                    if self.pending_thread_starts.len() >= MAX_REDUCER_PENDING_TURNS
-                        && !self.pending_thread_starts.contains(&key)
-                        && let Some(oldest) = self.pending_thread_starts.iter().next().cloned()
-                    {
-                        self.pending_thread_starts.remove(&oldest);
-                    }
-                    self.pending_thread_starts.insert(key);
-                }
+                track_thread_start(&mut self.pending_thread_starts, value);
             }
             Some("turn/start") => {
                 if let Some(thread_id) = value
@@ -1725,15 +1718,20 @@ impl ProxyObserver {
         context: &CliContext,
         record: &SessionRecord,
         value: &Value,
+        persisted_thread: Option<&str>,
     ) -> Result<(), String> {
-        if let Some(key) = value.get("id").and_then(json_id_key)
-            && self.pending_thread_starts.remove(&key)
-            && let Some(thread_id) = value
-                .pointer("/result/thread/id")
-                .and_then(Value::as_str)
-                .filter(|id| protocol_id_is_valid(id))
-        {
-            self.bind(record, thread_id)?;
+        match (
+            completed_thread_start(&mut self.pending_thread_starts, value),
+            persisted_thread,
+        ) {
+            (Some(thread_id), Some(persisted_thread)) if thread_id == persisted_thread => {
+                self.bind_persisted(thread_id)?;
+            }
+            (Some(thread_id), None) => self.bind(record, thread_id)?,
+            (None, None) => {}
+            _ => {
+                return Err("Codex persisted thread binding did not match the response".to_string());
+            }
         }
         if let Some(reducer) = self.reducer.as_mut() {
             process_live_message(context, record, reducer, value).await?;
@@ -1742,15 +1740,46 @@ impl ProxyObserver {
     }
 
     fn bind(&mut self, record: &SessionRecord, thread_id: &str) -> Result<(), String> {
+        if self.reducer.is_some() {
+            return self.bind_persisted(thread_id);
+        }
+        bind_thread(record, thread_id)?;
+        self.bind_persisted(thread_id)
+    }
+
+    fn bind_persisted(&mut self, thread_id: &str) -> Result<(), String> {
         if let Some(reducer) = self.reducer.as_ref() {
             return (reducer.thread_id == thread_id)
                 .then_some(())
                 .ok_or_else(|| "Codex TUI proxy switched to a different thread".to_string());
         }
-        bind_thread(record, thread_id)?;
         self.reducer = Some(FailureReducer::new(thread_id));
         Ok(())
     }
+}
+
+fn track_thread_start(pending: &mut BTreeSet<String>, value: &Value) {
+    let Some(key) = value.get("id").and_then(json_id_key) else {
+        return;
+    };
+    if pending.len() >= MAX_REDUCER_PENDING_TURNS
+        && !pending.contains(&key)
+        && let Some(oldest) = pending.iter().next().cloned()
+    {
+        pending.remove(&oldest);
+    }
+    pending.insert(key);
+}
+
+fn completed_thread_start<'a>(pending: &mut BTreeSet<String>, value: &'a Value) -> Option<&'a str> {
+    let key = value.get("id").and_then(json_id_key)?;
+    if !pending.remove(&key) {
+        return None;
+    }
+    value
+        .pointer("/result/thread/id")
+        .and_then(Value::as_str)
+        .filter(|id| protocol_id_is_valid(id))
 }
 
 fn json_id_key(value: &Value) -> Option<String> {
@@ -1771,7 +1800,11 @@ fn message_value(message: &Message) -> Option<Value> {
 
 enum ProxyObservation {
     Client(Value),
-    Server(Value),
+    Server {
+        value: Value,
+        persisted_thread: Option<String>,
+        binding_ack: Option<oneshot::Sender<Result<(), String>>>,
+    },
 }
 
 enum ServerProjection {
@@ -1781,9 +1814,25 @@ enum ServerProjection {
     RejectedUnique,
 }
 
+type SharedFailCloseTask = Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>;
+
+fn start_fail_close_task(task: &SharedFailCloseTask, context: &CliContext, record: &SessionRecord) {
+    let mut task = task.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    if task.is_none() {
+        let context = context.clone();
+        let record = record.clone();
+        *task = Some(tokio::spawn(async move {
+            fail_closed_projection(&context, &record).await;
+        }));
+    }
+}
+
 struct ProxyProjection {
     sender: Option<mpsc::Sender<ProxyObservation>>,
     task: Option<tokio::task::JoinHandle<()>>,
+    fail_close_task: SharedFailCloseTask,
+    pending_thread_starts: BTreeSet<String>,
+    requires_thread_binding: bool,
     context: CliContext,
     record: SessionRecord,
 }
@@ -1793,22 +1842,37 @@ impl ProxyProjection {
         let (sender, mut receiver) = mpsc::channel(MAX_PROXY_OBSERVATIONS);
         let worker_context = context.clone();
         let worker_record = record.clone();
+        let fail_close_task = Arc::new(Mutex::new(None));
+        let worker_fail_close_task = fail_close_task.clone();
         let task = tokio::spawn(async move {
             let mut observer = ProxyObserver::new();
             while let Some(observation) = receiver.recv().await {
-                let result = match observation {
+                let (result, binding_ack) = match observation {
                     ProxyObservation::Client(value) => {
-                        observer.observe_client(&worker_record, &value)
+                        (observer.observe_client(&worker_record, &value), None)
                     }
-                    ProxyObservation::Server(value) => {
+                    ProxyObservation::Server {
+                        value,
+                        persisted_thread,
+                        binding_ack,
+                    } => (
                         observer
-                            .observe_server(&worker_context, &worker_record, &value)
-                            .await
-                    }
+                            .observe_server(
+                                &worker_context,
+                                &worker_record,
+                                &value,
+                                persisted_thread.as_deref(),
+                            )
+                            .await,
+                        binding_ack,
+                    ),
                 };
+                if let Some(binding_ack) = binding_ack {
+                    let _ = binding_ack.send(result.clone());
+                }
                 if let Err(error) = result {
                     eprintln!("warning: Codex projection disabled: {error}");
-                    fail_closed_projection(&worker_context, &worker_record).await;
+                    start_fail_close_task(&worker_fail_close_task, &worker_context, &worker_record);
                     break;
                 }
             }
@@ -1816,22 +1880,37 @@ impl ProxyProjection {
         Self {
             sender: Some(sender),
             task: Some(task),
+            fail_close_task,
+            pending_thread_starts: BTreeSet::new(),
+            requires_thread_binding: thread_attached_path(&record)
+                .is_some_and(|path| !path.is_file()),
             context,
             record,
         }
     }
 
     fn observe_client(&mut self, value: &Value) {
+        if !self.is_active() {
+            return;
+        }
         if let Some(value) = client_observation(value) {
+            if value.get("method").and_then(Value::as_str) == Some("thread/start") {
+                track_thread_start(&mut self.pending_thread_starts, &value);
+            }
             self.enqueue(ProxyObservation::Client(value));
         }
     }
 
+    #[cfg(test)]
     fn observe_server(&mut self, value: &Value) {
         match server_observation(value) {
             ServerProjection::Irrelevant => {}
             ServerProjection::Repeatable(value) | ServerProjection::Unique(value) => {
-                self.enqueue(ProxyObservation::Server(value));
+                self.enqueue(ProxyObservation::Server {
+                    value,
+                    persisted_thread: None,
+                    binding_ack: None,
+                });
             }
             ServerProjection::RejectedUnique => {
                 eprintln!("warning: Codex projection disabled: unique observation was invalid");
@@ -1840,38 +1919,187 @@ impl ProxyProjection {
         }
     }
 
-    fn enqueue(&mut self, observation: ProxyObservation) {
+    async fn observe_server_before_forward(&mut self, value: &Value) -> Result<(), String> {
+        if !self.is_active() {
+            if self.requires_thread_binding {
+                self.disable();
+                return Err("Codex projection binding queue unavailable".to_string());
+            }
+            return Ok(());
+        }
+        match server_observation(value) {
+            ServerProjection::Irrelevant => {}
+            ServerProjection::Repeatable(value) => {
+                self.enqueue(ProxyObservation::Server {
+                    value,
+                    persisted_thread: None,
+                    binding_ack: None,
+                });
+            }
+            ServerProjection::Unique(value) => {
+                // A fresh TUI may submit its first turn as soon as it receives
+                // the thread/start response. First require the projection
+                // worker to accept the bound identity, then publish the marker
+                // before forwarding the response. No new observation can make
+                // the acknowledged worker fail while this proxy branch waits.
+                let persisted_thread =
+                    completed_thread_start(&mut self.pending_thread_starts, &value)
+                        .map(str::to_string);
+                let Some(persisted_thread) = persisted_thread else {
+                    self.enqueue(ProxyObservation::Server {
+                        value,
+                        persisted_thread: None,
+                        binding_ack: None,
+                    });
+                    return Ok(());
+                };
+                if !self.requires_thread_binding {
+                    self.enqueue(ProxyObservation::Server {
+                        value,
+                        persisted_thread: None,
+                        binding_ack: None,
+                    });
+                    return Ok(());
+                }
+                let (binding_ack, receive_ack) = oneshot::channel();
+                let queued = self
+                    .enqueue_binding(ProxyObservation::Server {
+                        value,
+                        persisted_thread: Some(persisted_thread.clone()),
+                        binding_ack: Some(binding_ack),
+                    })
+                    .await;
+                if let Err(error) = queued {
+                    eprintln!("warning: Codex projection disabled: {error}");
+                    self.disable();
+                    return Err(error);
+                }
+                let acknowledged = tokio::time::timeout(CONTROL_RESPONSE_TIMEOUT, receive_ack)
+                    .await
+                    .map_err(|_| "Codex projection binding acknowledgement timed out".to_string())
+                    .and_then(|result| {
+                        result.map_err(|_| {
+                            "Codex projection binding acknowledgement was unavailable".to_string()
+                        })
+                    })
+                    .and_then(|result| result);
+                if let Err(error) = acknowledged {
+                    eprintln!("warning: Codex projection disabled: {error}");
+                    self.disable();
+                    return Err(error);
+                }
+                let record = self.record.clone();
+                let worker_thread = persisted_thread;
+                let result =
+                    tokio::task::spawn_blocking(move || bind_thread(&record, &worker_thread))
+                        .await
+                        .map_err(|error| format!("Codex thread binding worker failed: {error}"))
+                        .and_then(|result| result);
+                if let Err(error) = result {
+                    eprintln!("warning: Codex projection disabled: {error}");
+                    self.disable();
+                    return Err(error);
+                }
+                self.requires_thread_binding = false;
+            }
+            ServerProjection::RejectedUnique => {
+                eprintln!("warning: Codex projection disabled: unique observation was invalid");
+                let required_binding_rejected = self.requires_thread_binding;
+                self.disable();
+                if required_binding_rejected {
+                    return Err("Codex projection required thread binding was invalid".to_string());
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn is_active(&mut self) -> bool {
+        match self.sender.as_ref() {
+            Some(sender) if !sender.is_closed() => true,
+            Some(_) => {
+                self.disable();
+                false
+            }
+            None => false,
+        }
+    }
+
+    fn enqueue(&mut self, observation: ProxyObservation) -> bool {
         let Some(sender) = self.sender.as_ref() else {
-            return;
+            return false;
         };
         match sender.try_send(observation) {
-            Ok(()) => {}
-            Err(mpsc::error::TrySendError::Full(ProxyObservation::Server(value)))
-                if value.get("method").and_then(Value::as_str)
-                    == Some("account/rateLimits/updated") =>
+            Ok(()) => true,
+            Err(mpsc::error::TrySendError::Full(ProxyObservation::Server {
+                value,
+                persisted_thread: _,
+                binding_ack: None,
+            })) if value.get("method").and_then(Value::as_str)
+                == Some("account/rateLimits/updated") =>
             {
                 // Rate-limit updates are advisory and repeatable. The
                 // scheduler rechecks scheduled claims, so a saturated queue
                 // may coalesce this update without losing a unique event.
+                true
             }
             Err(_) => {
                 eprintln!("warning: Codex projection disabled: observation queue unavailable");
                 self.disable();
+                false
             }
         }
     }
 
+    async fn enqueue_binding(&mut self, observation: ProxyObservation) -> Result<(), String> {
+        let sender = self
+            .sender
+            .as_ref()
+            .cloned()
+            .ok_or_else(|| "Codex projection binding queue unavailable".to_string())?;
+        tokio::time::timeout(CONTROL_RESPONSE_TIMEOUT, sender.send(observation))
+            .await
+            .map_err(|_| "Codex projection binding queue timed out".to_string())?
+            .map_err(|_| "Codex projection binding queue unavailable".to_string())
+    }
+
     fn disable(&mut self) {
         self.sender = None;
+        self.pending_thread_starts.clear();
         if let Some(task) = self.task.take() {
             task.abort();
         }
-        let context = self.context.clone();
-        let record = self.record.clone();
-        tokio::spawn(async move { fail_closed_projection(&context, &record).await });
+        start_fail_close_task(&self.fail_close_task, &self.context, &self.record);
+    }
+
+    fn has_fail_close_task(&self) -> bool {
+        self.fail_close_task
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_some()
+    }
+
+    fn take_fail_close_task(&self) -> Option<tokio::task::JoinHandle<()>> {
+        self.fail_close_task
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+    }
+
+    async fn finish_fail_close(&mut self) {
+        self.disable();
+        if let Some(task) = self.take_fail_close_task()
+            && task.await.is_err()
+        {
+            fail_closed_projection(&self.context, &self.record).await;
+        }
     }
 
     async fn finish(&mut self) {
+        if self.has_fail_close_task() {
+            self.finish_fail_close().await;
+            return;
+        }
         self.sender = None;
         if let Some(mut task) = self.task.take()
             && tokio::time::timeout(CONTROL_RESPONSE_TIMEOUT, &mut task)
@@ -1879,6 +2107,9 @@ impl ProxyProjection {
                 .is_err()
         {
             task.abort();
+        }
+        if self.has_fail_close_task() {
+            self.finish_fail_close().await;
         }
     }
 }
@@ -2320,8 +2551,9 @@ async fn run_proxy_session(
         .map_err(|err| format!("failed to advertise proxy capability: {}", err.code()))?;
     let mut projection = ProxyProjection::new(context.clone(), record.clone());
     let mut bootstrap = FreshBootstrap::for_runtime(&context, &record);
-    loop {
-        tokio::select! {
+    let result = async {
+        loop {
+            tokio::select! {
             message = tui.next() => {
                 let message = message
                     .ok_or_else(|| "remote TUI closed the proxy".to_string())?
@@ -2365,7 +2597,6 @@ async fn run_proxy_session(
                 send_proxy_upstream(&mut upstream, message, CONTROL_RESPONSE_TIMEOUT).await?;
                 drop(authorization);
                 if closed {
-                    projection.finish().await;
                     return Ok(());
                 }
             }
@@ -2377,17 +2608,24 @@ async fn run_proxy_session(
                 let closed = matches!(message, Message::Close(_));
                 if let Some(value) = message_value(&observed) {
                     bootstrap.observe_server(&value);
-                    projection.observe_server(&value);
+                    projection.observe_server_before_forward(&value).await?;
                 }
                 tui.send(message).await
                     .map_err(|err| format!("remote TUI write failed: {err}"))?;
                 if closed {
-                    projection.finish().await;
                     return Ok(());
                 }
             }
         }
+        }
     }
+    .await;
+    drop(listener);
+    drop(_guard);
+    drop(upstream);
+    drop(tui);
+    projection.finish().await;
+    result
 }
 
 async fn connect_socket(path: &Path) -> Result<UnixStream, String> {
@@ -3296,6 +3534,592 @@ exit 1
             })),
             ServerProjection::Irrelevant
         ));
+    }
+
+    #[tokio::test]
+    async fn persisted_thread_observation_skips_duplicate_marker_io() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let context = CliContext {
+            state_dir: tmp.path().join("state"),
+            host: None,
+        };
+        let record = record_with_runtime("persisted-binding", &tmp.path().join("server.sock"));
+        let mut observer = ProxyObserver::new();
+        observer
+            .observe_client(
+                &record,
+                &json!({ "id": 1, "method": "thread/start", "params": {} }),
+            )
+            .unwrap();
+
+        observer
+            .observe_server(
+                &context,
+                &record,
+                &json!({ "id": 1, "result": { "thread": { "id": "fresh-thread" } } }),
+                Some("fresh-thread"),
+            )
+            .await
+            .expect("the projection worker should trust the pre-forward persisted binding");
+
+        assert_eq!(
+            observer
+                .reducer
+                .as_ref()
+                .map(|reducer| reducer.thread_id.as_str()),
+            Some("fresh-thread")
+        );
+        assert!(
+            !thread_attached_path(&record).unwrap().exists(),
+            "the projection worker must not repeat marker persistence or validation"
+        );
+    }
+
+    #[tokio::test]
+    async fn fresh_thread_binding_precedes_first_turn_authorization() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let context = CliContext {
+            state_dir: tmp.path().join("state"),
+            host: None,
+        };
+        let record = record_with_runtime("binding-barrier", &tmp.path().join("server.sock"));
+        fs::create_dir_all(crate::session_dir(&context, &record.id)).unwrap();
+        crate::write_session_record(&context, &record).unwrap();
+        let mut projection = ProxyProjection::new(context, record.clone());
+
+        projection.observe_client(&json!({
+            "id": 1,
+            "method": "thread/start",
+            "params": { "cwd": "/repo" }
+        }));
+        projection
+            .observe_server_before_forward(&json!({
+                "id": 1,
+                "result": { "thread": { "id": "fresh-thread" } }
+            }))
+            .await
+            .unwrap();
+
+        let attached = thread_attached_path(&record).unwrap();
+        assert_eq!(
+            fs::read_to_string(attached).unwrap(),
+            projected_thread_binding("fresh-thread"),
+            "the proxy must publish the bound thread before forwarding the response that enables the first turn"
+        );
+
+        let _capability = begin_proxy_capability(&projection.context, &record).unwrap();
+        let lifecycle_lock =
+            crate::acquire_session_record_lock(&projection.context, &record.id).unwrap();
+        let marker = begin_manual_input_section(&projection.context, &record)
+            .unwrap()
+            .unwrap();
+        let first_turn = json!({
+            "id": 2,
+            "method": "turn/start",
+            "params": { "threadId": "fresh-thread", "input": [] }
+        });
+        let gate = acquire_manual_input_gate(&projection.context, &record, &first_turn)
+            .expect("the serialized first turn must recognize the synchronously bound thread");
+        drop(gate);
+        marker.finish(|| drop(lifecycle_lock));
+        projection.finish().await;
+    }
+
+    #[tokio::test]
+    async fn saturated_projection_preserves_fresh_thread_binding_barrier() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let context = CliContext {
+            state_dir: tmp.path().join("state"),
+            host: None,
+        };
+        let record = record_with_runtime("binding-overflow", &tmp.path().join("server.sock"));
+        let mut projection = ProxyProjection::new(context, record.clone());
+
+        projection.task.take().unwrap().abort();
+        let (sender, mut blocked_receiver) = mpsc::channel(MAX_PROXY_OBSERVATIONS);
+        projection.sender = Some(sender);
+        projection.observe_client(&json!({ "id": 1, "method": "thread/start" }));
+        for _ in 1..MAX_PROXY_OBSERVATIONS {
+            projection.observe_server(&json!({
+                "method": "account/rateLimits/updated",
+                "params": {
+                    "rateLimits": {
+                        "primary": { "usedPercent": 42.0, "resetsAt": 1_900_000_000_i64 }
+                    }
+                }
+            }));
+        }
+
+        let (release_worker, wait_for_release) = oneshot::channel();
+        let worker = tokio::spawn(async move {
+            wait_for_release.await.unwrap();
+            while let Some(observation) = blocked_receiver.recv().await {
+                if let ProxyObservation::Server {
+                    persisted_thread: Some(thread_id),
+                    binding_ack: Some(binding_ack),
+                    ..
+                } = observation
+                {
+                    assert_eq!(thread_id, "fresh-thread");
+                    binding_ack.send(Ok(())).unwrap();
+                    return;
+                }
+            }
+            panic!("the saturated queue never admitted the critical binding observation");
+        });
+        let response_value = json!({
+            "id": 1,
+            "result": { "thread": { "id": "fresh-thread" } }
+        });
+        let response = projection.observe_server_before_forward(&response_value);
+        tokio::pin!(response);
+        assert!(
+            futures_util::poll!(&mut response).is_pending(),
+            "the critical binding send must wait while every queue slot remains occupied"
+        );
+        release_worker.send(()).unwrap();
+        response.await.unwrap();
+        worker.await.unwrap();
+
+        assert_eq!(
+            fs::read_to_string(thread_attached_path(&record).unwrap()).unwrap(),
+            projected_thread_binding("fresh-thread"),
+            "a saturated projection queue must not bypass the pre-forward binding barrier"
+        );
+    }
+
+    #[tokio::test]
+    async fn disabled_projection_never_persists_thread_binding() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        for disable_before_request in [true, false] {
+            let context = CliContext {
+                state_dir: tmp.path().join(format!("state-{disable_before_request}")),
+                host: None,
+            };
+            let record = record_with_runtime(
+                &format!("disabled-{disable_before_request}"),
+                &tmp.path()
+                    .join(format!("server-{disable_before_request}.sock")),
+            );
+            let mut projection = ProxyProjection::new(context, record.clone());
+            if disable_before_request {
+                projection.disable();
+            }
+            projection.observe_client(&json!({ "id": 1, "method": "thread/start" }));
+            if !disable_before_request {
+                projection.disable();
+            }
+            let result = projection
+                .observe_server_before_forward(&json!({
+                    "id": 1,
+                    "result": { "thread": { "id": "fresh-thread" } }
+                }))
+                .await;
+            assert!(result.is_err());
+            assert!(!thread_attached_path(&record).unwrap().exists());
+        }
+
+        let context = CliContext {
+            state_dir: tmp.path().join("state-worker-close"),
+            host: None,
+        };
+        let record = record_with_runtime("worker-close", &tmp.path().join("worker-close.sock"));
+        let mut projection = ProxyProjection::new(context, record.clone());
+        projection.observe_client(&json!({ "id": 1, "method": "thread/start" }));
+        projection.task.take().unwrap().abort();
+        let result = projection
+            .observe_server_before_forward(&json!({
+                "id": 1,
+                "result": { "thread": { "id": "fresh-thread" } }
+            }))
+            .await;
+        assert!(result.is_err());
+        assert!(
+            !thread_attached_path(&record).unwrap().exists(),
+            "a worker closing after the active check must prevent marker publication"
+        );
+    }
+
+    #[tokio::test]
+    async fn rejected_fresh_thread_binding_is_critical() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let context = CliContext {
+            state_dir: tmp.path().join("state"),
+            host: None,
+        };
+        let record = record_with_runtime("rejected-binding", &tmp.path().join("server.sock"));
+        fs::create_dir_all(crate::session_dir(&context, &record.id)).unwrap();
+        crate::write_session_record(&context, &record).unwrap();
+        crate::activity::activate_runtime(&context, &record).unwrap();
+        crate::auto_resume::set_enabled(&context, &record.id, true, "2030-01-01T00:00:00Z")
+            .unwrap();
+
+        let mut projection = ProxyProjection::new(context, record);
+        projection.observe_client(&json!({ "id": 1, "method": "thread/start" }));
+        let result = projection
+            .observe_server_before_forward(&json!({
+                "id": 1,
+                "result": { "thread": { "id": "" } }
+            }))
+            .await;
+
+        assert!(
+            result.is_err(),
+            "an invalid response for the required fresh binding must stop forwarding"
+        );
+        assert!(
+            projection.has_fail_close_task(),
+            "the critical rejection must retain durable fail-close"
+        );
+        projection.finish_fail_close().await;
+    }
+
+    #[test]
+    fn critical_binding_failure_completes_fail_close_before_runtime_shutdown() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let context = CliContext {
+            state_dir: tmp.path().join("state"),
+            host: None,
+        };
+        let record = record_with_runtime("binding-fail-close", &tmp.path().join("server.sock"));
+        fs::create_dir_all(crate::session_dir(&context, &record.id)).unwrap();
+        crate::write_session_record(&context, &record).unwrap();
+        crate::activity::activate_runtime(&context, &record).unwrap();
+        crate::auto_resume::set_enabled(&context, &record.id, true, "2030-01-01T00:00:00Z")
+            .unwrap();
+
+        let runtime_context = context.clone();
+        let runtime_record = record.clone();
+        std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(async move {
+                let mut projection = ProxyProjection::new(runtime_context, runtime_record.clone());
+                projection.observe_client(&json!({ "id": 1, "method": "thread/start" }));
+                let (closed_sender, closed_receiver) = mpsc::channel(1);
+                drop(closed_receiver);
+                projection.sender = Some(closed_sender);
+
+                let result = projection
+                    .observe_server_before_forward(&json!({
+                        "id": 1,
+                        "result": { "thread": { "id": "fresh-thread" } }
+                    }))
+                    .await;
+                assert!(result.is_err());
+                projection.finish_fail_close().await;
+            });
+        })
+        .join()
+        .unwrap();
+
+        let view = crate::auto_resume::view_for_record(&context, &record);
+        assert!(!view.enabled);
+        assert_eq!(view.state, "terminal_failure");
+        assert_eq!(view.failure_reason.as_deref(), Some("state_unavailable"));
+    }
+
+    #[test]
+    fn critical_binding_failure_returns_before_fail_close_lock_retry() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let context = CliContext {
+            state_dir: tmp.path().join("state"),
+            host: None,
+        };
+        let record = record_with_runtime("binding-retry", &tmp.path().join("server.sock"));
+        fs::create_dir_all(crate::session_dir(&context, &record.id)).unwrap();
+        crate::write_session_record(&context, &record).unwrap();
+        crate::activity::activate_runtime(&context, &record).unwrap();
+        crate::auto_resume::set_enabled(&context, &record.id, true, "2030-01-01T00:00:00Z")
+            .unwrap();
+
+        let runtime_context = context.clone();
+        let runtime_record = record.clone();
+        std::thread::spawn(move || {
+            let record_lock =
+                crate::acquire_session_record_lock(&runtime_context, &runtime_record.id).unwrap();
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(async move {
+                let mut projection = ProxyProjection::new(runtime_context, runtime_record.clone());
+                projection.observe_client(&json!({ "id": 1, "method": "thread/start" }));
+                let (closed_sender, closed_receiver) = mpsc::channel(1);
+                drop(closed_receiver);
+                projection.sender = Some(closed_sender);
+
+                let observed = tokio::time::timeout(
+                    Duration::from_millis(100),
+                    projection.observe_server_before_forward(&json!({
+                        "id": 1,
+                        "result": { "thread": { "id": "fresh-thread" } }
+                    })),
+                )
+                .await;
+                assert!(
+                    observed.is_ok(),
+                    "critical binding failure must return promptly"
+                );
+                assert!(observed.unwrap().is_err());
+                let fail_close = projection.finish_fail_close();
+                tokio::pin!(fail_close);
+                assert!(
+                    tokio::time::timeout(Duration::from_millis(50), &mut fail_close)
+                        .await
+                        .is_err(),
+                    "durable fail-close should remain pending while the record lock is held"
+                );
+                drop(record_lock);
+                fail_close.await;
+            });
+        })
+        .join()
+        .unwrap();
+
+        let view = crate::auto_resume::view_for_record(&context, &record);
+        assert!(!view.enabled);
+        assert_eq!(view.state, "terminal_failure");
+        assert_eq!(view.failure_reason.as_deref(), Some("state_unavailable"));
+    }
+
+    #[test]
+    fn disabled_fresh_projection_finish_waits_for_durable_fail_close() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let context = CliContext {
+            state_dir: tmp.path().join("state"),
+            host: None,
+        };
+        let record = record_with_runtime("disabled-finish", &tmp.path().join("server.sock"));
+        fs::create_dir_all(crate::session_dir(&context, &record.id)).unwrap();
+        crate::write_session_record(&context, &record).unwrap();
+        crate::activity::activate_runtime(&context, &record).unwrap();
+        crate::auto_resume::set_enabled(&context, &record.id, true, "2030-01-01T00:00:00Z")
+            .unwrap();
+
+        let runtime_context = context.clone();
+        let runtime_record = record.clone();
+        std::thread::spawn(move || {
+            let record_lock =
+                crate::acquire_session_record_lock(&runtime_context, &runtime_record.id).unwrap();
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(async move {
+                let mut projection = ProxyProjection::new(runtime_context, runtime_record);
+                projection.disable();
+                let finish = projection.finish();
+                tokio::pin!(finish);
+                assert!(
+                    tokio::time::timeout(Duration::from_millis(50), &mut finish)
+                        .await
+                        .is_err(),
+                    "fresh disabled projection finalization must retain the fail-close retry"
+                );
+                drop(record_lock);
+                finish.await;
+            });
+        })
+        .join()
+        .unwrap();
+
+        let view = crate::auto_resume::view_for_record(&context, &record);
+        assert!(!view.enabled);
+        assert_eq!(view.state, "terminal_failure");
+        assert_eq!(view.failure_reason.as_deref(), Some("state_unavailable"));
+    }
+
+    #[test]
+    fn disabled_bound_projection_finish_waits_for_durable_fail_close() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let context = CliContext {
+            state_dir: tmp.path().join("state"),
+            host: None,
+        };
+        let record = record_with_runtime("disabled-bound-finish", &tmp.path().join("server.sock"));
+        fs::create_dir_all(crate::session_dir(&context, &record.id)).unwrap();
+        crate::write_session_record(&context, &record).unwrap();
+        crate::activity::activate_runtime(&context, &record).unwrap();
+        crate::auto_resume::set_enabled(&context, &record.id, true, "2030-01-01T00:00:00Z")
+            .unwrap();
+        bind_thread(&record, "bound-thread").unwrap();
+
+        let runtime_context = context.clone();
+        let runtime_record = record.clone();
+        std::thread::spawn(move || {
+            let record_lock =
+                crate::acquire_session_record_lock(&runtime_context, &runtime_record.id).unwrap();
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(async move {
+                let mut projection = ProxyProjection::new(runtime_context, runtime_record);
+                projection.disable();
+                let finish = projection.finish();
+                tokio::pin!(finish);
+                assert!(
+                    tokio::time::timeout(Duration::from_millis(50), &mut finish)
+                        .await
+                        .is_err(),
+                    "bound disabled projection finalization must retain the fail-close retry"
+                );
+                drop(record_lock);
+                finish.await;
+            });
+        })
+        .join()
+        .unwrap();
+
+        let view = crate::auto_resume::view_for_record(&context, &record);
+        assert!(!view.enabled);
+        assert_eq!(view.state, "terminal_failure");
+        assert_eq!(view.failure_reason.as_deref(), Some("state_unavailable"));
+    }
+
+    #[tokio::test]
+    async fn worker_failure_finish_waits_for_durable_fail_close() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let context = CliContext {
+            state_dir: tmp.path().join("state"),
+            host: None,
+        };
+        let record = record_with_runtime("worker-fail-close", &tmp.path().join("server.sock"));
+        fs::create_dir_all(crate::session_dir(&context, &record.id)).unwrap();
+        crate::write_session_record(&context, &record).unwrap();
+        crate::activity::activate_runtime(&context, &record).unwrap();
+        crate::auto_resume::set_enabled(&context, &record.id, true, "2030-01-01T00:00:00Z")
+            .unwrap();
+        bind_thread(&record, "thread-a").unwrap();
+        let record_lock = crate::acquire_session_record_lock(&context, &record.id).unwrap();
+
+        let mut projection = ProxyProjection::new(context.clone(), record.clone());
+        projection.observe_client(&json!({
+            "method": "turn/start",
+            "params": { "threadId": "thread-a" }
+        }));
+        projection.observe_client(&json!({
+            "method": "turn/start",
+            "params": { "threadId": "thread-b" }
+        }));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let release_lock = tokio::spawn(async move {
+            tokio::time::sleep(CONTROL_RESPONSE_TIMEOUT + Duration::from_millis(200)).await;
+            drop(record_lock);
+        });
+
+        projection.finish().await;
+        let view = crate::auto_resume::view_for_record(&context, &record);
+        assert!(!view.enabled);
+        assert_eq!(view.state, "terminal_failure");
+        assert_eq!(view.failure_reason.as_deref(), Some("state_unavailable"));
+        release_lock.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn critical_binding_failure_closes_listener_before_fail_close_retry() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let upstream = tmp.path().join("critical-listener.sock");
+        let upstream_listener = tokio::net::UnixListener::bind(&upstream).unwrap();
+        let context = CliContext {
+            state_dir: tmp.path().join("state"),
+            host: None,
+        };
+        let record = record_with_runtime("critical-listener", &upstream);
+        fs::create_dir_all(crate::session_dir(&context, &record.id)).unwrap();
+        crate::write_session_record(&context, &record).unwrap();
+        crate::activity::activate_runtime(&context, &record).unwrap();
+        crate::auto_resume::set_enabled(&context, &record.id, true, "2030-01-01T00:00:00Z")
+            .unwrap();
+        write_create_bootstrap_marker(&record);
+
+        let listen = upstream.with_extension("proxy");
+        let proxy_args = crate::cli::CodexAppServerProxyArgs {
+            id: record.id.clone(),
+            upstream: upstream.clone(),
+            listen: listen.clone(),
+        };
+        let proxy_context = context.clone();
+        let mut proxy =
+            tokio::spawn(async move { run_proxy_session(proxy_context, proxy_args).await });
+        let server_record = record.clone();
+        let server = tokio::spawn(async move {
+            let (stream, _) = upstream_listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let request = receive_json(&mut socket).await;
+            assert_eq!(request["method"], "thread/start");
+            bind_thread(&server_record, "conflicting-thread").unwrap();
+            respond(
+                &mut socket,
+                &request,
+                json!({ "thread": { "id": "fresh-thread" } }),
+            )
+            .await;
+            let closed = tokio::time::timeout(Duration::from_secs(1), socket.next())
+                .await
+                .expect("the upstream connection must close promptly");
+            assert!(
+                closed.is_none() || closed.is_some_and(|message| message.is_err()),
+                "critical binding failure must close the upstream connection"
+            );
+        });
+        let proxy_stream = connect_socket(&listen).await.unwrap();
+        let (mut tui, _) = tokio_tungstenite::client_async("ws://localhost", proxy_stream)
+            .await
+            .unwrap();
+        let record_lock = crate::acquire_session_record_lock(&context, &record.id).unwrap();
+        tui.send(Message::Text(
+            json!({
+                "id": 1,
+                "method": "thread/start",
+                "params": { "cwd": "/repo" }
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .unwrap();
+        let closed = tokio::time::timeout(Duration::from_secs(1), tui.next())
+            .await
+            .expect("the TUI connection must close promptly");
+        assert!(
+            closed.is_none() || closed.is_some_and(|message| message.is_err()),
+            "critical binding failure must not forward the successful response"
+        );
+
+        let reconnect = tokio::time::timeout(
+            Duration::from_millis(100),
+            tokio::net::UnixStream::connect(&listen),
+        )
+        .await
+        .expect("a retrying client must fail promptly");
+        assert!(
+            reconnect.is_err(),
+            "the proxy listener must stop accepting while durable fail-close retries"
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut proxy)
+                .await
+                .is_err(),
+            "durable fail-close must remain pending while the record lock is held"
+        );
+
+        drop(record_lock);
+        assert!(
+            tokio::time::timeout(Duration::from_secs(3), &mut proxy)
+                .await
+                .expect("the proxy must finish after fail-close acquires the record lock")
+                .unwrap()
+                .is_err()
+        );
+        server.await.unwrap();
+        let view = crate::auto_resume::view_for_record(&context, &record);
+        assert!(!view.enabled);
+        assert_eq!(view.state, "terminal_failure");
+        assert_eq!(view.failure_reason.as_deref(), Some("state_unavailable"));
     }
 
     #[tokio::test]
@@ -4816,12 +5640,16 @@ exit 1
             .await;
             (authorization.is_some(), bootstrap)
         });
-        for _ in 0..100 {
-            if BOOTSTRAP_GATE_ATTEMPTS.load(std::sync::atomic::Ordering::Relaxed) > 0 {
-                break;
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if BOOTSTRAP_GATE_ATTEMPTS.load(std::sync::atomic::Ordering::Relaxed) > 0 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(1)).await;
             }
-            tokio::task::yield_now().await;
-        }
+        })
+        .await
+        .expect("the blocking bootstrap gate attempt should start within the test deadline");
         assert_eq!(
             BOOTSTRAP_GATE_ATTEMPTS.load(std::sync::atomic::Ordering::Relaxed),
             1
