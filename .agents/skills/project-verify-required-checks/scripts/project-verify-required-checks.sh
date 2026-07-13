@@ -20,6 +20,7 @@ Runs the full CI/parity checks from DEVELOPMENT.md:
   - bash scripts/ci/tests/shared-helper-adoption-audit.test.sh
   - bash scripts/ci/tests/publish-order-audit.test.sh
   - bash scripts/ci/tests/docs-hygiene-audit.test.sh
+  - bash scripts/ci/tests/prepare-private-release-workflow.test.sh
   - bash scripts/ci/skill-shell-suites.sh
   - bash scripts/ci/test-stale-audit.sh --strict
   - bash scripts/ci/workspace-version-lockstep.sh --strict
@@ -145,6 +146,7 @@ run bash scripts/ci/tests/detect-docs-only.test.sh
 run bash scripts/ci/tests/shared-helper-adoption-audit.test.sh
 run bash scripts/ci/tests/publish-order-audit.test.sh
 run bash scripts/ci/tests/docs-hygiene-audit.test.sh
+run bash scripts/ci/tests/prepare-private-release-workflow.test.sh
 run bash scripts/ci/skill-shell-suites.sh
 run bash scripts/ci/test-stale-audit.sh --strict
 run bash scripts/ci/workspace-version-lockstep.sh --strict
