@@ -290,7 +290,7 @@ pub fn collect_codex_provider_resume_matches(
         {
             continue;
         }
-        if let Some(meta) = read_codex_session_meta(&path)
+        if let Some(meta) = read_codex_provider_resume_meta(&path)
             && meta.session_id == session_id
         {
             matches.insert(ProviderHistoryMatch {
@@ -406,11 +406,21 @@ pub struct CodexSessionMeta {
 
 /// Read the leading `session_meta` record from a Codex rollout file.
 ///
-/// Returns `None` unless the first line is an interactive `session_meta` record
-/// labeled with Codex's `cli` or `vscode` source, with a non-empty id, a cwd,
-/// and a parseable timestamp. The first line is size-bounded so a pathological
-/// file cannot exhaust memory.
+/// Returns `None` unless the first line is a CLI-origin `session_meta` record
+/// with a non-empty id, a cwd, and a parseable timestamp. The first line is
+/// size-bounded so a pathological file cannot exhaust memory.
 pub fn read_codex_session_meta(path: &Path) -> Option<CodexSessionMeta> {
+    read_codex_session_meta_from_sources(path, &["cli"])
+}
+
+fn read_codex_provider_resume_meta(path: &Path) -> Option<CodexSessionMeta> {
+    read_codex_session_meta_from_sources(path, &["cli", "vscode"])
+}
+
+fn read_codex_session_meta_from_sources(
+    path: &Path,
+    accepted_sources: &[&str],
+) -> Option<CodexSessionMeta> {
     let file = fs::File::open(path).ok()?;
     let mut reader = io::BufReader::new(file).take(CODEX_SESSION_META_MAX_LINE_BYTES + 1);
     let mut first_line = Vec::new();
@@ -431,10 +441,8 @@ pub fn read_codex_session_meta(path: &Path) -> Option<CodexSessionMeta> {
     }
     let payload = value.get("payload")?;
     let cwd = payload.get("cwd").and_then(Value::as_str)?.to_string();
-    if !matches!(
-        payload.get("source").and_then(Value::as_str)?,
-        "cli" | "vscode"
-    ) {
+    let source = payload.get("source").and_then(Value::as_str)?;
+    if !accepted_sources.contains(&source) {
         return None;
     }
     let session_id = payload
@@ -570,7 +578,7 @@ mod tests {
                 ),
             )
             .unwrap();
-            let meta = read_codex_session_meta(&path).expect("resumable session meta");
+            let meta = read_codex_provider_resume_meta(&path).expect("resumable session meta");
             assert_eq!(meta.session_id, "codex-id");
             assert_eq!(meta.cwd, "/repo");
         }
@@ -580,13 +588,26 @@ mod tests {
             r#"{"timestamp":"2099-01-01T00:00:00Z","type":"session_meta","payload":{"id":"exec-id","cwd":"/repo","source":"exec","originator":"codex_exec","timestamp":"2099-01-01T00:00:00Z"}}"#,
         )
         .unwrap();
-        assert_eq!(read_codex_session_meta(&path), None);
+        assert_eq!(read_codex_provider_resume_meta(&path), None);
 
         fs::write(
             &path,
             r#"{"timestamp":"2099-01-01T00:00:00Z","type":"session_meta","payload":{"id":"subagent-id","cwd":"/repo","source":{"subagent":{}},"timestamp":"2099-01-01T00:00:00Z"}}"#,
         )
         .unwrap();
+        assert_eq!(read_codex_provider_resume_meta(&path), None);
+    }
+
+    #[test]
+    fn codex_capture_session_meta_reader_remains_cli_only() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("rollout.jsonl");
+        fs::write(
+            &path,
+            r#"{"timestamp":"2099-01-01T00:00:00Z","type":"session_meta","payload":{"id":"app-server-id","session_id":"app-server-id","cwd":"/repo","source":"vscode","originator":"agent-session","timestamp":"2099-01-01T00:00:00Z"}}"#,
+        )
+        .unwrap();
+
         assert_eq!(read_codex_session_meta(&path), None);
     }
 
