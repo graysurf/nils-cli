@@ -77,7 +77,7 @@ validations_catalog:
     exit: DATA
   review_convergence:
     rule: "when enabled, the initial provider head and every review commit OID are non-empty, a complete paginated current-head native-review snapshot has no effective CHANGES_REQUESTED, already-observed configured bot activity stays quiet for the resolved quiet_period, and a final pre-merge snapshot has not changed; absent observed bots never wait"
-    error_kind: review_changes_requested | review_convergence_head_missing | review_convergence_head_changed | review_convergence_activity_changed | review_snapshot_incomplete | invalid_review_convergence_config | review_convergence_timeout | provider_unsupported
+    error_kind: review_changes_requested | review_convergence_head_missing | review_convergence_head_changed | review_convergence_activity_changed | review_snapshot_incomplete | invalid_review_convergence_config | review_convergence_timeout | backend_output_limit | provider_unsupported
     exit: DATA | UNAVAILABLE | USAGE
   tasklist_complete:
     rule: "no unchecked task-list items in the PR/MR description at merge time unless --allow-unchecked-tasks (with --allow-unchecked-tasks-reason) is set"
@@ -446,8 +446,8 @@ operations:
         number: integer
         url: string
         head_sha: string
-        current_head_reviews: list<{id, database_id?, url, author, state, commit_sha?, submitted_at, summary, summary_truncated}>
-        stale_reviews: list<{id, database_id?, url, author, state, commit_sha?, submitted_at, summary, summary_truncated}>
+        current_head_reviews: list<{id, database_id?, url, author, state, commit_sha, submitted_at, summary, summary_truncated}>
+        stale_reviews: list<{id, database_id?, url, author, state, commit_sha, submitted_at, summary, summary_truncated}>
     notes: "all review pages are read (100 nodes/page, max 100 pages); partial GraphQL data, missing required fields, unknown states, head drift, or unsafe pagination return review_snapshot_incomplete. summary is bounded to 4096 UTF-8 bytes and is never parsed as a machine verdict; commit_sha != head_sha is stale/informational."
 
   - id: pr.tasks

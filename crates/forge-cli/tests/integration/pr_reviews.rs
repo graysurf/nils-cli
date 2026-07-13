@@ -5,6 +5,24 @@ use pretty_assertions::assert_eq;
 use super::support::{StubEnv, parse_envelope, run_forge_cli};
 
 #[test]
+fn pr_reviews_catalog_requires_commit_sha() {
+    let catalog = include_str!("../../docs/specs/forge-cli-ops-v1.yaml");
+    let reviews = catalog
+        .split_once("  - id: pr.reviews\n")
+        .expect("pr.reviews catalog entry")
+        .1
+        .split_once("  - id: pr.tasks\n")
+        .expect("pr.tasks follows pr.reviews")
+        .0;
+
+    assert_eq!(reviews.matches("commit_sha").count(), 3);
+    assert!(
+        !reviews.contains("commit_sha?"),
+        "successful review entries require commit_sha"
+    );
+}
+
+#[test]
 fn pr_reviews_classifies_current_head_and_stale_native_reviews() {
     let stub = StubEnv::new().gh_stub(
         r#"#!/bin/sh

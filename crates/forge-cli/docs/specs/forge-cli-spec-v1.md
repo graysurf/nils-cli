@@ -1115,7 +1115,9 @@ absence-tolerant. If no configured bot review exists against the current head,
 merge continues immediately and `missing_reviewers` remains empty. If relevant
 activity exists, each new native review resets the quiet window. The active
 wait polls no more often than every 10 seconds. Timeout anywhere in that
-end-to-end wait returns `review_convergence_timeout` (`UNAVAILABLE 69`).
+end-to-end wait returns `review_convergence_timeout` (`UNAVAILABLE 69`). Timed
+backend subprocesses retain at most 8 MiB per output stream; overflow kills the
+process group and returns `backend_output_limit` (`UNAVAILABLE 69`).
 
 The positive flag form `--review-convergence` enables the resolved policy for
 one `pr merge` or `pr deliver`; `--review-convergence=false` explicitly

@@ -40,7 +40,7 @@ pub struct NativeReviewSummary {
     pub url: String,
     pub author: String,
     pub state: String,
-    pub commit_sha: Option<String>,
+    pub commit_sha: String,
     pub submitted_at: String,
     pub summary: String,
     pub summary_truncated: bool,
@@ -165,7 +165,7 @@ pub fn compute_for_pr_with_timeout<R: BackendRunner>(
         }
         let head_sha = expected_head.get_or_insert(page.head_sha);
         for review in page.reviews {
-            if review.commit_sha.as_deref() == Some(head_sha.as_str()) {
+            if review.commit_sha == head_sha.as_str() {
                 current_head_reviews.push(review);
             } else {
                 stale_reviews.push(review);
@@ -299,7 +299,7 @@ fn parse_github_review_page(output: &BackendSuccess) -> Result<ReviewPage, Forge
             url: required_string(node, "/url", "review.url")?,
             author: string_at(node, "/author/login"),
             state: required_review_state(node)?,
-            commit_sha: Some(required_string(node, "/commit/oid", "review.commit.oid")?),
+            commit_sha: required_string(node, "/commit/oid", "review.commit.oid")?,
             submitted_at: required_string(node, "/submittedAt", "review.submittedAt")?,
             summary,
             summary_truncated,
