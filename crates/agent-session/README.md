@@ -219,9 +219,12 @@ is no second state model.
   the old-peer and gap-reconciliation path. The exact
   wire/privacy contract is [activity-stream-v1](docs/specs/activity-stream-v1.md).
 - `POST /sessions` (create), `PATCH /sessions/{id}` (title update), `POST /sessions/{id}/send`,
+  `POST /sessions/{id}/prompt`,
   `POST /sessions/{id}/resume`,
   `PUT /sessions/{id}/auto-resume`, `DELETE /sessions/{id}/auto-resume`,
   `POST /sessions/{id}/attachments?filename=...`, `DELETE /sessions/{id}` — writes, require a bearer token.
+- `POST /sessions/{id}/prompt` submits exact prompt text through a supported provider control plane. This versioned mutation never
+  sends multiline text through terminal keys; unsupported or not-yet-ready sessions fail closed.
 - `POST /sessions` normally creates a fresh session from `agent`, optional `cwd`, `title`, `id`, `prompt`, and
   `agent_args`. When `provider_resume_id` is present (alias: `resume_id`), the daemon imports an existing Codex or
   Claude provider conversation instead: it resolves the original cwd from local provider history, persists exact
