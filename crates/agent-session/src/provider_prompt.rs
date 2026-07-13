@@ -9,7 +9,7 @@ use uuid::Uuid;
 
 use crate::{
     AgentKind, SessionRecord, claude_projects_root, codex_sessions_root, read_claude_session_cwd,
-    read_codex_session_meta, resolve_provider_transcript_path_from_roots,
+    read_codex_resumable_session_meta, resolve_provider_transcript_path_from_roots,
 };
 
 pub(crate) const PROVIDER_PROMPT_CAPABILITY: &str = "provider-prompt.v1";
@@ -530,7 +530,7 @@ fn update_continuity(continuity: &mut Vec<u8>, appended: &[u8]) {
 
 fn source_still_matches(source: &ProviderPromptSource) -> bool {
     match source.provider {
-        ProviderKind::Codex => read_codex_session_meta(&source.path)
+        ProviderKind::Codex => read_codex_resumable_session_meta(&source.path)
             .is_some_and(|metadata| metadata.session_id == source.session_id),
         ProviderKind::Claude => read_claude_session_cwd(&source.path, &source.session_id).is_some(),
     }
@@ -931,6 +931,38 @@ mod tests {
             )
             .is_none()
         );
+    }
+
+    #[test]
+    fn vscode_codex_prompt_source_opens_after_resolution() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let codex_root = tmp.path().join("codex");
+        let codex_file = codex_root.join("2026/07/session.jsonl");
+        fs::create_dir_all(codex_file.parent().expect("parent")).expect("codex dirs");
+        fs::write(
+            &codex_file,
+            format!(
+                "{}\n",
+                json!({
+                    "timestamp":"2099-01-01T00:00:00Z",
+                    "type":"session_meta",
+                    "payload":{
+                        "id":"codex-id",
+                        "session_id":"codex-id",
+                        "cwd":"/repo",
+                        "source":"vscode",
+                        "originator":"codex-tui",
+                        "timestamp":"2099-01-01T00:00:00Z"
+                    }
+                })
+            ),
+        )
+        .expect("codex transcript");
+        let record = record("codex", "codex-id");
+        let source = resolve_provider_prompt_source_from_roots(&record, Some(&codex_root), None)
+            .expect("vscode prompt source");
+
+        assert!(ProviderPromptTail::open_new_runtime_source(source).is_some());
     }
 
     #[cfg(unix)]

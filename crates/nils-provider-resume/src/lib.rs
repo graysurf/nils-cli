@@ -290,7 +290,7 @@ pub fn collect_codex_provider_resume_matches(
         {
             continue;
         }
-        if let Some(meta) = read_codex_provider_resume_meta(&path)
+        if let Some(meta) = read_codex_resumable_session_meta(&path)
             && meta.session_id == session_id
         {
             matches.insert(ProviderHistoryMatch {
@@ -413,7 +413,11 @@ pub fn read_codex_session_meta(path: &Path) -> Option<CodexSessionMeta> {
     read_codex_session_meta_from_sources(path, &["cli"])
 }
 
-fn read_codex_provider_resume_meta(path: &Path) -> Option<CodexSessionMeta> {
+/// Read Codex session metadata eligible for explicit provider-ID resume.
+///
+/// Unlike [`read_codex_session_meta`], this accepts both the `cli` and
+/// `vscode` scalar source labels used by resumable interactive histories.
+pub fn read_codex_resumable_session_meta(path: &Path) -> Option<CodexSessionMeta> {
     read_codex_session_meta_from_sources(path, &["cli", "vscode"])
 }
 
@@ -578,7 +582,7 @@ mod tests {
                 ),
             )
             .unwrap();
-            let meta = read_codex_provider_resume_meta(&path).expect("resumable session meta");
+            let meta = read_codex_resumable_session_meta(&path).expect("resumable session meta");
             assert_eq!(meta.session_id, "codex-id");
             assert_eq!(meta.cwd, "/repo");
         }
@@ -588,14 +592,14 @@ mod tests {
             r#"{"timestamp":"2099-01-01T00:00:00Z","type":"session_meta","payload":{"id":"exec-id","cwd":"/repo","source":"exec","originator":"codex_exec","timestamp":"2099-01-01T00:00:00Z"}}"#,
         )
         .unwrap();
-        assert_eq!(read_codex_provider_resume_meta(&path), None);
+        assert_eq!(read_codex_resumable_session_meta(&path), None);
 
         fs::write(
             &path,
             r#"{"timestamp":"2099-01-01T00:00:00Z","type":"session_meta","payload":{"id":"subagent-id","cwd":"/repo","source":{"subagent":{}},"timestamp":"2099-01-01T00:00:00Z"}}"#,
         )
         .unwrap();
-        assert_eq!(read_codex_provider_resume_meta(&path), None);
+        assert_eq!(read_codex_resumable_session_meta(&path), None);
     }
 
     #[test]

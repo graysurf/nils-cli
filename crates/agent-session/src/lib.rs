@@ -38,7 +38,8 @@ use nils_provider_resume::{
     collect_codex_provider_resume_matches, normalize_resume_id, resolve_resume_source,
 };
 pub(crate) use nils_provider_resume::{
-    claude_projects_root, codex_sessions_root, read_claude_session_cwd, read_codex_session_meta,
+    claude_projects_root, codex_sessions_root, read_claude_session_cwd,
+    read_codex_resumable_session_meta, read_codex_session_meta,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
