@@ -395,30 +395,17 @@ fn persisted_runtime_paths(
 }
 
 const STARTUP_DIAGNOSTIC_COLLECTOR_SCRIPT: &str = r#"collect_startup_diagnostic() {
-  LC_ALL=C awk -v cap=16384 -v stage="$startup_stage" -v output="$startup_diagnostic" '
-    function current_stage(value) {
-      value = ""
-      if ((getline value < stage) < 0) value = ""
-      close(stage)
-      return value
-    }
-    {
-      if (current_stage() == "initial_connection") {
-        retained = ""
-        next
-      }
-      retained = retained $0 ORS
-      if (length(retained) > cap) {
-        retained = substr(retained, length(retained) - cap + 1)
-      }
-    }
-    END {
-      if (current_stage() != "initial_connection" && length(retained) > 0) {
-        printf "%s", retained > output
-        close(output)
-      }
-    }
-  '
+  if (umask 077; tail -c 16384 > "$startup_diagnostic_buffer"); then
+    if [ "$(cat "$startup_stage" 2>/dev/null)" != initial_connection ] &&
+       [ -s "$startup_diagnostic_buffer" ]; then
+      mv -f "$startup_diagnostic_buffer" "$startup_diagnostic" 2>/dev/null ||
+        rm -f -- "$startup_diagnostic_buffer"
+    else
+      rm -f -- "$startup_diagnostic_buffer"
+    fi
+  else
+    rm -f -- "$startup_diagnostic_buffer"
+  fi
 }"#;
 
 pub(crate) fn launch_script() -> String {
@@ -437,6 +424,7 @@ startup_dir="$state_dir/sessions/$session_id"
 startup_stage="$startup_dir/.startup-stage"
 startup_failure="$startup_dir/.startup-failure"
 startup_diagnostic="$startup_dir/.startup-diagnostic.log"
+startup_diagnostic_buffer="$startup_dir/.startup-diagnostic.buffer"
 startup_diagnostic_pipe="$startup_dir/.startup-diagnostic.pipe"
 provider_stderr_pipe="$startup_dir/.provider-stderr.pipe"
 "#,
@@ -448,7 +436,7 @@ write_startup_marker() {
 record_startup_failure() {
   write_startup_marker "$startup_failure" "$1"
 }
-rm -f -- "$startup_failure" "$startup_diagnostic" "$startup_diagnostic_pipe" "$provider_stderr_pipe"
+rm -f -- "$startup_failure" "$startup_diagnostic" "$startup_diagnostic_buffer" "$startup_diagnostic_pipe" "$provider_stderr_pipe"
 write_startup_marker "$startup_stage" app_server
 if ! (umask 077; mkfifo "$startup_diagnostic_pipe"); then
   record_startup_failure startup-exited
@@ -473,7 +461,7 @@ cleanup() {
     wait "$provider_stderr_pid" 2>/dev/null || true
   fi
   wait "$diagnostic_pid" 2>/dev/null || true
-  rm -f -- "$socket" "$proxy" "$handoff" "$attached" "$startup_diagnostic_pipe" "$provider_stderr_pipe"
+  rm -f -- "$socket" "$proxy" "$handoff" "$attached" "$startup_diagnostic_buffer" "$startup_diagnostic_pipe" "$provider_stderr_pipe"
 }
 trap cleanup EXIT HUP INT TERM
 i=0
@@ -3240,6 +3228,7 @@ exit 1
         assert!(script.contains("provider-client-exited"));
         assert!(script.contains("!= initial_connection"));
         assert!(script.contains("collect_startup_diagnostic"));
+        assert!(script.contains("tail -c 16384"));
         assert!(script.contains("mkfifo \"$startup_diagnostic_pipe\""));
         assert!(script.contains("tee \"$startup_diagnostic_pipe\""));
         assert!(!script.contains(">>\"$startup_diagnostic\""));
@@ -3260,10 +3249,12 @@ exit 1
         let stage = tmp.path().join("stage");
         let diagnostic = tmp.path().join("diagnostic.log");
         fs::write(&stage, "provider_client\n").unwrap();
+        let buffer = tmp.path().join("diagnostic.buffer");
         let command = format!(
-            "startup_stage={}; startup_diagnostic={}; {}; (umask 077; collect_startup_diagnostic)",
+            "startup_stage={}; startup_diagnostic={}; startup_diagnostic_buffer={}; {}; collect_startup_diagnostic",
             shell_words::quote(&stage.to_string_lossy()),
             shell_words::quote(&diagnostic.to_string_lossy()),
+            shell_words::quote(&buffer.to_string_lossy()),
             STARTUP_DIAGNOSTIC_COLLECTOR_SCRIPT,
         );
         let mut child = Command::new("/bin/sh")
@@ -3272,14 +3263,14 @@ exit 1
             .stdin(Stdio::piped())
             .spawn()
             .unwrap();
-        let mut input = vec![b'x'; 32 * 1024];
-        input.extend_from_slice(b"failure-sentinel\n");
+        let mut input = vec![b'x'; 2 * 1024 * 1024];
+        input.extend_from_slice(b"failure-sentinel");
         child.stdin.take().unwrap().write_all(&input).unwrap();
         assert!(child.wait().unwrap().success());
 
         let retained = fs::read(&diagnostic).unwrap();
         assert!(retained.len() <= 16 * 1024);
-        assert!(retained.ends_with(b"failure-sentinel\n"));
+        assert!(retained.ends_with(b"failure-sentinel"));
         assert_eq!(
             fs::metadata(&diagnostic).unwrap().permissions().mode() & 0o777,
             0o600
@@ -3297,10 +3288,11 @@ exit 1
             .stdin
             .take()
             .unwrap()
-            .write_all(b"ready output must not persist\n")
+            .write_all(&vec![b'y'; 2 * 1024 * 1024])
             .unwrap();
         assert!(child.wait().unwrap().success());
         assert!(!diagnostic.exists());
+        assert!(!buffer.exists());
     }
 
     #[test]
