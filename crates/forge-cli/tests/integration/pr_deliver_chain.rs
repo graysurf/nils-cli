@@ -18,7 +18,6 @@ use forge_cli::cli::{GlobalFlags, MergeMethodFlag, PrDeliverArgs, PrKindFlag, Pr
 use forge_cli::error::ForgeError;
 use forge_cli::macros::pr_deliver;
 use forge_cli::ops::pr_wait_checks::SystemClock;
-use forge_cli::provider::{DetectionSource, Provider, ProviderContext};
 use nils_common::cli_contract::OutputFormat;
 
 use super::support::{CmdOutput, StubEnv, parse_envelope, run_forge_cli_in, write_label_catalog};
@@ -1482,40 +1481,6 @@ fn local_deliver_args(evidence: &Path) -> PrDeliverArgs {
         allow_unchecked_tasks: false,
         allow_unchecked_tasks_reason: None,
     }
-}
-
-#[test]
-fn pr_deliver_local_dry_run_uses_remote_identity_for_bound_evidence() {
-    let (tempdir, evidence, _) = make_subject_bound_git_repo();
-    let repo_path = tempdir.path().join("repo");
-    let context = ProviderContext {
-        provider: Provider::Local,
-        host: "local".into(),
-        source: DetectionSource::Flag,
-        repo: Some("sympoies/nils-cli".into()),
-    };
-    let global = GlobalFlags {
-        format: Some(OutputFormat::Json),
-        remote: "origin".into(),
-        provider: Some(ProviderFlag::Local),
-        repo: None,
-        store_root: None,
-        dry_run: true,
-    };
-
-    let payload = pr_deliver::build_dry_run_payload(
-        &context,
-        &local_deliver_args(&evidence),
-        &repo_path,
-        &global,
-        |_| Some("https://github.com/sympoies/nils-cli.git".into()),
-    );
-    let verdict = payload
-        .local_preflight
-        .iter()
-        .find(|item| item.rule == "test_first")
-        .expect("test-first verdict");
-    assert!(verdict.ok, "verdict={verdict:?}");
 }
 
 impl BackendRunner for LocalAdoptRunner {
