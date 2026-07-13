@@ -112,8 +112,7 @@ pub fn run_with<R: BackendRunner, F: Fn(&str) -> Option<String>>(
     // [merge].delete_branch = true config in the same repo.
     enforce_keep_branch_conflict(args.keep_branch, repo_delete_branch)?;
     let delete_branch = if args.keep_branch { false } else { cfg_delete };
-    let policy = cfg.resolve_review_convergence(args.review_convergence);
-    ensure_review_convergence_config_valid(&cfg, &policy)?;
+    let policy = resolve_review_convergence_policy(&cfg, args.review_convergence)?;
 
     if global.dry_run {
         let call = build_dry_run_merge_call(&ctx, args.id, method, delete_branch);
@@ -182,8 +181,7 @@ pub fn compute_with_clock<R: BackendRunner, C: Clock>(
     let cfg_delete = cfg.resolve_delete_branch(None);
     enforce_keep_branch_conflict(args.keep_branch, repo_delete_branch)?;
     let delete_branch = if args.keep_branch { false } else { cfg_delete };
-    let policy = cfg.resolve_review_convergence(args.review_convergence);
-    ensure_review_convergence_config_valid(&cfg, &policy)?;
+    let policy = resolve_review_convergence_policy(&cfg, args.review_convergence)?;
     run_lockdown_chain(
         runner,
         clock,
@@ -215,6 +213,23 @@ fn load_merge_config(workdir: &std::path::Path) -> (ForgeConfig, Option<bool>) {
         ForgeConfig::load_global().overlaid_by(repo),
         repo_delete_branch,
     )
+}
+
+pub(crate) fn resolve_review_convergence_for_workdir(
+    workdir: &std::path::Path,
+    explicit_required: Option<bool>,
+) -> Result<crate::config::ReviewConvergencePolicy, ForgeError> {
+    let (cfg, _) = load_merge_config(workdir);
+    resolve_review_convergence_policy(&cfg, explicit_required)
+}
+
+fn resolve_review_convergence_policy(
+    cfg: &ForgeConfig,
+    explicit_required: Option<bool>,
+) -> Result<crate::config::ReviewConvergencePolicy, ForgeError> {
+    let policy = cfg.resolve_review_convergence(explicit_required);
+    ensure_review_convergence_config_valid(cfg, &policy)?;
+    Ok(policy)
 }
 
 fn ensure_review_convergence_config_valid(
@@ -526,7 +541,7 @@ fn pr_view_call(ctx: &ProviderContext, id: u64) -> BackendCall {
             OsString::from(id_str),
             OsString::from("--json"),
             // Diverges from `pr_view::GH_JSON_FIELDS` on purpose: the merge
-            // chain needs `body` for the rule-13 task-list gate and fetches
+            // chain needs `body` for the rule-14 task-list gate and fetches
             // `mergeCommit` separately post-merge via `merge_sha_call`.
             OsString::from(pr_view::GH_JSON_FIELDS),
         ],
@@ -662,7 +677,7 @@ fn extract_merge_sha(ctx: &ProviderContext, output: &BackendSuccess) -> Result<S
     })
 }
 
-/// Pull the PR/MR description out of the raw view output for the rule-13
+/// Pull the PR/MR description out of the raw view output for the rule-14
 /// task-list gate: `body` on GitHub, `description` on GitLab. Providers
 /// without a body model (local) yield the empty string, which passes the
 /// gate trivially.
@@ -764,7 +779,7 @@ struct PrView {
     head: String,
     state: String,
     head_sha: Option<String>,
-    /// PR/MR description used by the rule-13 task-list gate; empty when the
+    /// PR/MR description used by the rule-14 task-list gate; empty when the
     /// provider has no body model.
     body: String,
 }

@@ -422,6 +422,7 @@ mod tests {
         fail_remaining: RefCell<usize>,
         fail_kind: &'static str,
         calls: RefCell<Vec<Vec<String>>>,
+        timed_calls: RefCell<Vec<(bool, Option<Duration>)>>,
     }
 
     impl FakeRunner {
@@ -431,6 +432,7 @@ mod tests {
                 fail_remaining: RefCell::new(0),
                 fail_kind: RATE_LIMITED_KIND,
                 calls: RefCell::new(Vec::new()),
+                timed_calls: RefCell::new(Vec::new()),
             }
         }
 
@@ -468,6 +470,14 @@ mod tests {
 
         fn real_count(&self) -> usize {
             self.calls.borrow().len() - self.probe_count()
+        }
+
+        fn real_timeouts(&self) -> Vec<Option<Duration>> {
+            self.timed_calls
+                .borrow()
+                .iter()
+                .filter_map(|(probe, timeout)| (!probe).then_some(*timeout))
+                .collect()
         }
     }
 
@@ -507,6 +517,17 @@ mod tests {
                 stdout: "ok".into(),
                 stderr: String::new(),
             })
+        }
+
+        fn run_with_timeout(
+            &self,
+            call: &BackendCall,
+            timeout: Option<Duration>,
+        ) -> Result<BackendSuccess, ForgeError> {
+            self.timed_calls
+                .borrow_mut()
+                .push((Self::is_probe(call), timeout));
+            self.run(call)
         }
     }
 
@@ -716,6 +737,23 @@ mod tests {
     }
 
     #[test]
+    fn run_with_timeout_reuses_one_budget_across_rate_limited_retry() {
+        let runner = FakeRunner::with_fail_once(vec![4821, 4821]);
+        let clock = FakeClock::new();
+        let gate = RateLimitedRunner::new(&runner, &clock, cfg());
+
+        gate.run_with_timeout(&pr_ready_call(), Some(Duration::from_secs(60)))
+            .expect("retry succeeds");
+        assert_eq!(runner.real_count(), 2);
+        assert_eq!(clock.total_slept(), Duration::from_secs(15));
+        assert_eq!(
+            runner.real_timeouts(),
+            vec![Some(Duration::from_secs(60)), Some(Duration::from_secs(45)),],
+            "the retry receives only the shared budget left after backoff"
+        );
+    }
+
+    #[test]
     fn run_with_timeout_is_gated_like_run() {
         // The run_with_timeout path (used by inbox's threaded fan-out) must
         // preflight identically to run/run_raw — its outer wrapper is otherwise
@@ -730,6 +768,11 @@ mod tests {
         assert_eq!(runner.probe_count(), 2, "re-probed after sleeping");
         assert_eq!(clock.sleep_count(), 1);
         assert_eq!(runner.real_count(), 1);
+        assert_eq!(
+            runner.real_timeouts(),
+            vec![Some(Duration::from_secs(45))],
+            "the provider call receives only the budget left after preflight"
+        );
     }
 
     #[test]

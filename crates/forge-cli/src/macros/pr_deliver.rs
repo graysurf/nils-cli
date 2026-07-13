@@ -149,6 +149,13 @@ pub fn run_with<R: BackendRunner, C: Clock>(
         label_target,
     )?;
 
+    // The merge phase owns review convergence, but configuration validity is
+    // part of the macro input contract. Validate before the dry-run/live split
+    // so previews cannot report a deliverable plan that live delivery rejects.
+    if !args.no_merge {
+        let _ = pr_merge::resolve_review_convergence_for_workdir(workdir, args.review_convergence)?;
+    }
+
     if global.dry_run {
         return Ok(emit_dry_run(&ctx, &args, format, workdir, global));
     }

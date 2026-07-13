@@ -649,6 +649,70 @@ timeout = "20m"
 }
 
 #[test]
+fn pr_merge_explicit_review_convergence_rejects_non_table_section() {
+    let tempdir = make_github_repo(Some("review_convergence = \"not-a-table\"\n"));
+    let repo_path = tempdir.path().join("repo");
+    let stub = StubEnv::new().gh_stub(FORBIDDEN_STUB);
+
+    let out = run_forge_cli_in(
+        &stub,
+        &[
+            "--provider",
+            "github",
+            "--dry-run",
+            "--format",
+            "json",
+            "pr",
+            "merge",
+            "7",
+            "--review-convergence",
+        ],
+        Some(&repo_path),
+    );
+    assert_eq!(out.code, 65, "stdout={}\nstderr={}", out.stdout, out.stderr);
+    let env = parse_envelope(&out.stdout);
+    assert_eq!(env["error"]["code"], "invalid_review_convergence_config");
+    assert!(
+        env["error"]["details"]["detail"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("review_convergence:not_a_table")
+    );
+}
+
+#[test]
+fn pr_merge_explicit_review_convergence_rejects_malformed_config_file() {
+    let tempdir = make_github_repo(Some("[review_convergence\nrequire = true\n"));
+    let repo_path = tempdir.path().join("repo");
+    let stub = StubEnv::new().gh_stub(FORBIDDEN_STUB);
+
+    let out = run_forge_cli_in(
+        &stub,
+        &[
+            "--provider",
+            "github",
+            "--dry-run",
+            "--format",
+            "json",
+            "pr",
+            "merge",
+            "7",
+            "--review-convergence",
+        ],
+        Some(&repo_path),
+    );
+    assert_eq!(out.code, 65, "stdout={}\nstderr={}", out.stdout, out.stderr);
+    let env = parse_envelope(&out.stdout);
+    assert_eq!(env["error"]["code"], "invalid_review_convergence_config");
+    assert!(
+        env["error"]["details"]["detail"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("parse_error")
+    );
+}
+
+#[test]
 fn pr_merge_stale_changes_requested_is_informational() {
     let config = r#"[review_convergence]
 require = true
@@ -782,6 +846,53 @@ mode = "observed"
     assert!(
         !stub.tempdir.path().join("github-merged").exists(),
         "late review must prevent provider merge"
+    );
+}
+
+#[test]
+fn pr_merge_restarts_after_late_observed_bot_activity_before_merge() {
+    let config = r#"[review_convergence]
+require = true
+quiet_period = "0s"
+timeout = "20m"
+
+[[review_convergence.bots]]
+login = "example-review-bot"
+mode = "observed"
+"#;
+    let tempdir = make_github_repo(Some(config));
+    let repo_path = tempdir.path().join("repo");
+    let initial = r#"{"id":"PRR_comment","databaseId":3,"url":"https://github.com/acme/widgets/pull/7#pullrequestreview-3","author":{"login":"example-review-bot[bot]"},"state":"COMMENTED","commit":{"oid":"head123"},"submittedAt":"2026-07-14T04:00:00Z","body":"initial"}"#;
+    let stub = StubEnv::new();
+    fs::write(
+        stub.tempdir.path().join("second-review-response.json"),
+        r#"{"data":{"repository":{"pullRequest":{"headRefOid":"head123","reviews":{"nodes":[{"id":"PRR_comment","databaseId":3,"url":"https://github.com/acme/widgets/pull/7#pullrequestreview-3","author":{"login":"example-review-bot[bot]"},"state":"COMMENTED","commit":{"oid":"head123"},"submittedAt":"2026-07-14T04:00:00Z","body":"initial"},{"id":"PRR_followup","databaseId":4,"url":"https://github.com/acme/widgets/pull/7#pullrequestreview-4","author":{"login":"example-review-bot[bot]"},"state":"COMMENTED","commit":{"oid":"head123"},"submittedAt":"2026-07-14T04:01:00Z","body":"late follow-up"}],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}}}"#,
+    )
+    .expect("second review response");
+    let body = github_merge_stub(&stub, initial, "", false);
+    let stub = stub.gh_stub(&body);
+
+    let out = run_forge_cli_in(
+        &stub,
+        &[
+            "--provider",
+            "github",
+            "--repo",
+            "acme/widgets",
+            "--format",
+            "json",
+            "pr",
+            "merge",
+            "7",
+        ],
+        Some(&repo_path),
+    );
+    assert_eq!(out.code, 65, "stdout={}\nstderr={}", out.stdout, out.stderr);
+    let env = parse_envelope(&out.stdout);
+    assert_eq!(env["error"]["code"], "review_convergence_activity_changed");
+    assert!(
+        !stub.tempdir.path().join("github-merged").exists(),
+        "late observed activity must restart convergence before provider merge"
     );
 }
 

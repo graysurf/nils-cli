@@ -180,7 +180,7 @@ pub fn ensure_review_threads_resolved<R: BackendRunner>(
 
 /// Fetch the thread snapshot for a known PR URL without emitting an envelope.
 /// Review convergence uses this immediately before merge so its structured
-/// snapshot and the existing independent rule-12 gate share one provider read.
+/// snapshot and the existing independent rule-13 gate share one provider read.
 pub fn compute_for_pr<R: BackendRunner>(
     runner: &R,
     ctx: &ProviderContext,

@@ -191,7 +191,8 @@ pub struct ForgeConfig {
     pub review_convergence_quiet_period: Option<Duration>,
     pub review_convergence_timeout: Option<Duration>,
     /// Whole-list override. `Some([])` intentionally clears a lower-precedence
-    /// global bot list; `None` inherits it.
+    /// global bot list unless that global layer enables the monotonic safety
+    /// gate; `None` inherits it.
     pub review_convergence_bots: Option<Vec<ReviewConvergenceBot>>,
     /// Forward-compat warnings collected while parsing (unknown keys, bad
     /// scalar types). Each entry is prefixed `unknown-config-key:` or
@@ -465,7 +466,18 @@ impl ForgeConfig {
         self.warnings
             .iter()
             .map(String::as_str)
-            .filter(|warning| warning.starts_with("invalid-config-value:review_convergence."))
+            .filter(|warning| {
+                warning.starts_with("invalid-config-value:review_convergence")
+                    || [
+                        "invalid-config-value:read_error:",
+                        "invalid-config-value:parse_error:",
+                        "invalid-config-value:global_read_error:",
+                        "invalid-config-value:global_parse_error:",
+                        "invalid-config-value:root_not_table",
+                    ]
+                    .iter()
+                    .any(|prefix| warning.starts_with(prefix))
+            })
             .collect()
     }
 }

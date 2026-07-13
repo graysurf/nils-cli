@@ -4,9 +4,14 @@
 //! is exercised in Sprint 7's parity harness, where the fixture corpus
 //! handles real-shaped responses for every atom.
 
-use pretty_assertions::assert_eq;
+use std::fs;
 
-use super::support::{StubEnv, parse_envelope, run_forge_cli, write_label_catalog};
+use pretty_assertions::assert_eq;
+use tempfile::TempDir;
+
+use super::support::{
+    StubEnv, parse_envelope, run_forge_cli, run_forge_cli_in, write_label_catalog,
+};
 
 const FORBIDDEN_STUB: &str = "#!/bin/sh\necho 'should not run during dry-run' >&2\nexit 99\n";
 
@@ -177,6 +182,77 @@ fn pr_deliver_dry_run_lists_all_eight_steps_in_order() {
         !wait_plan[json_idx + 1].contains("isRequired"),
         "{wait_plan:?}"
     );
+}
+
+#[test]
+fn pr_deliver_dry_run_rejects_invalid_enabled_review_convergence_config() {
+    let repo = TempDir::new().expect("tempdir");
+    fs::write(
+        repo.path().join(".forge-cli.toml"),
+        "[review_convergence]\nrequire = true\nquiet_period = \"3601s\"\n",
+    )
+    .expect("write config");
+    let stub = StubEnv::new().gh_stub(FORBIDDEN_STUB);
+
+    let out = run_forge_cli_in(
+        &stub,
+        &[
+            "--provider",
+            "github",
+            "--dry-run",
+            "--format",
+            "json",
+            "pr",
+            "deliver",
+            "--kind",
+            "feature",
+            "--title",
+            "demo",
+            "--body",
+            "## Summary\nx\n\n## Test plan\ny\n",
+        ],
+        Some(repo.path()),
+    );
+
+    assert_eq!(out.code, 65, "stdout={}\nstderr={}", out.stdout, out.stderr);
+    let env = parse_envelope(&out.stdout);
+    assert_eq!(env["error"]["code"], "invalid_review_convergence_config");
+}
+
+#[test]
+fn pr_deliver_dry_run_no_merge_ignores_review_convergence_config() {
+    let repo = TempDir::new().expect("tempdir");
+    fs::write(
+        repo.path().join(".forge-cli.toml"),
+        "[review_convergence]\nrequire = true\nquiet_period = \"3601s\"\n",
+    )
+    .expect("write config");
+    let stub = StubEnv::new().gh_stub(FORBIDDEN_STUB);
+
+    let out = run_forge_cli_in(
+        &stub,
+        &[
+            "--provider",
+            "github",
+            "--dry-run",
+            "--format",
+            "json",
+            "pr",
+            "deliver",
+            "--kind",
+            "feature",
+            "--title",
+            "demo",
+            "--body",
+            "## Summary\nx\n\n## Test plan\ny\n",
+            "--no-merge",
+        ],
+        Some(repo.path()),
+    );
+
+    assert_eq!(out.code, 0, "stdout={}\nstderr={}", out.stdout, out.stderr);
+    let env = parse_envelope(&out.stdout);
+    assert_eq!(env["data"]["no_merge"], true);
 }
 
 #[test]
