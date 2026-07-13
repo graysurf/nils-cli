@@ -775,7 +775,9 @@ backend implementations cannot diverge.
     complete paginated snapshot is read
     again immediately before merge; late activity fails with
     `review_convergence_activity_changed`, and incomplete or unknown provider
-    data fails with `review_snapshot_incomplete`. For each reviewer, a later
+    data fails with `review_snapshot_incomplete`. Every review must carry a
+    non-empty `commit.oid` before current-head/stale classification. For each
+    reviewer, a later
     native `APPROVED` or `DISMISSED` supersedes an earlier request on the same head;
     `COMMENTED` does not alter that opinionated state. GitHub is the only
     supported provider in v1; an enabled policy elsewhere returns

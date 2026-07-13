@@ -299,11 +299,7 @@ fn parse_github_review_page(output: &BackendSuccess) -> Result<ReviewPage, Forge
             url: required_string(node, "/url", "review.url")?,
             author: string_at(node, "/author/login"),
             state: required_review_state(node)?,
-            commit_sha: node
-                .pointer("/commit/oid")
-                .and_then(|item| item.as_str())
-                .filter(|item| !item.is_empty())
-                .map(str::to_string),
+            commit_sha: Some(required_string(node, "/commit/oid", "review.commit.oid")?),
             submitted_at: required_string(node, "/submittedAt", "review.submittedAt")?,
             summary,
             summary_truncated,

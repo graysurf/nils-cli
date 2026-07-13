@@ -76,7 +76,7 @@ validations_catalog:
     error_kind: unresolved_review_threads
     exit: DATA
   review_convergence:
-    rule: "when enabled, the initial provider head is non-empty, a complete paginated current-head native-review snapshot has no effective CHANGES_REQUESTED, already-observed configured bot activity stays quiet for the resolved quiet_period, and a final pre-merge snapshot has not changed; absent observed bots never wait"
+    rule: "when enabled, the initial provider head and every review commit OID are non-empty, a complete paginated current-head native-review snapshot has no effective CHANGES_REQUESTED, already-observed configured bot activity stays quiet for the resolved quiet_period, and a final pre-merge snapshot has not changed; absent observed bots never wait"
     error_kind: review_changes_requested | review_convergence_head_missing | review_convergence_head_changed | review_convergence_activity_changed | review_snapshot_incomplete | invalid_review_convergence_config | review_convergence_timeout | provider_unsupported
     exit: DATA | UNAVAILABLE | USAGE
   tasklist_complete:

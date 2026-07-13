@@ -661,6 +661,45 @@ fn pr_merge_blocks_current_head_native_changes_requested() {
 }
 
 #[test]
+fn pr_merge_rejects_a_native_review_without_commit_oid() {
+    let tempdir = make_github_repo(None);
+    let repo_path = tempdir.path().join("repo");
+    let review = r#"{"id":"PRR_missing_commit","databaseId":8,"url":"https://github.com/acme/widgets/pull/7#pullrequestreview-8","author":{"login":"reviewer"},"state":"CHANGES_REQUESTED","commit":null,"submittedAt":"2026-07-14T04:00:00Z","body":"must fail closed"}"#;
+    let stub = StubEnv::new();
+    let body = github_merge_stub(&stub, review, "", false);
+    let stub = stub.gh_stub(&body);
+
+    let out = run_forge_cli_in(
+        &stub,
+        &[
+            "--provider",
+            "github",
+            "--repo",
+            "acme/widgets",
+            "--format",
+            "json",
+            "pr",
+            "merge",
+            "7",
+            "--review-convergence",
+        ],
+        Some(&repo_path),
+    );
+    assert_eq!(out.code, 65, "stdout={}\nstderr={}", out.stdout, out.stderr);
+    let env = parse_envelope(&out.stdout);
+    assert_eq!(env["error"]["code"], "review_snapshot_incomplete");
+    assert!(
+        env["error"]["details"]["detail"]
+            .as_str()
+            .is_some_and(|detail| detail.contains("review.commit.oid"))
+    );
+    assert!(
+        !stub.tempdir.path().join("github-merged").exists(),
+        "malformed review data must prevent provider merge"
+    );
+}
+
+#[test]
 fn pr_merge_global_config_enables_review_convergence() {
     let tempdir = make_github_repo(None);
     let repo_path = tempdir.path().join("repo");

@@ -44,7 +44,8 @@ never waits for a bot that has not submitted a review. Once relevant
 current-head review activity exists, it waits for the configured quiet period,
 reports bounded native review summaries, and blocks native
 `CHANGES_REQUESTED`. The complete paginated review snapshot is read again
-immediately before merge; partial provider data or late review activity fails
+immediately before merge; partial provider data (including a review without a
+commit OID) or late review activity fails
 closed, and the initial non-empty provider head is bound through the final
 merge compare-and-swap. GitHub is the only supported provider in v1; enabled
 GitLab dry-runs fail with the same `provider_unsupported` result as live runs.

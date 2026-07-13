@@ -104,6 +104,50 @@ esac
 }
 
 #[test]
+fn pr_reviews_rejects_a_review_without_commit_oid() {
+    let stub = StubEnv::new().gh_stub(
+        r#"#!/bin/sh
+set -eu
+case "$1 $2" in
+  "pr view")
+    printf '%s\n' '{"number":42,"url":"https://github.com/acme/widgets/pull/42","state":"OPEN","isDraft":false,"baseRefName":"main","headRefName":"feat/reviews","headRefOid":"head-new","title":"feat: reviews","body":""}'
+    ;;
+  "api graphql")
+    printf '%s\n' '{"data":{"repository":{"pullRequest":{"headRefOid":"head-new","reviews":{"nodes":[{"id":"PRR_missing_commit","databaseId":8,"url":"https://github.com/acme/widgets/pull/42#pullrequestreview-8","author":{"login":"reviewer"},"state":"COMMENTED","commit":null,"submittedAt":"2026-07-14T04:00:00Z","body":"observed activity"}],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}}}'
+    ;;
+  *)
+    echo "unexpected gh args: $*" >&2
+    exit 99
+    ;;
+esac
+"#,
+    );
+
+    let out = run_forge_cli(
+        &stub,
+        &[
+            "--provider",
+            "github",
+            "--repo",
+            "acme/widgets",
+            "--format",
+            "json",
+            "pr",
+            "reviews",
+            "42",
+        ],
+    );
+    assert_eq!(out.code, 65, "stdout={}\nstderr={}", out.stdout, out.stderr);
+    let env = parse_envelope(&out.stdout);
+    assert_eq!(env["error"]["code"], "review_snapshot_incomplete");
+    assert!(
+        env["error"]["details"]["detail"]
+            .as_str()
+            .is_some_and(|detail| detail.contains("review.commit.oid"))
+    );
+}
+
+#[test]
 fn pr_reviews_fails_explicitly_for_gitlab() {
     let stub = StubEnv::new();
     let out = run_forge_cli(
