@@ -2430,7 +2430,7 @@ async fn wake_from_open_usage(
         .as_ref()
         .map(|runtime| runtime.launch_id.clone())
         .ok_or_else(|| "Codex runtime identity is missing".to_string())?;
-    tokio::task::spawn_blocking(move || {
+    let wake = tokio::task::spawn_blocking(move || {
         crate::auto_resume::wake_scheduled_if_usage_open_for_runtime(
             &context,
             &id,
@@ -2439,9 +2439,15 @@ async fn wake_from_open_usage(
         )
     })
     .await
-    .map_err(|_| "Codex usage wake worker failed".to_string())?
-    .map(|_| ())
-    .map_err(|err| format!("Codex usage wake failed: {}", err.code()))
+    .map_err(|_| "Codex usage wake worker failed".to_string())?;
+    match wake {
+        Ok(_) => Ok(()),
+        // Open-usage notifications are advisory and repeatable. The scheduler
+        // also rechecks scheduled claims, so lifecycle-lock contention should
+        // defer this observation instead of disabling the whole projection.
+        Err(err) if err.code() == "session-record-lock-timeout" => Ok(()),
+        Err(err) => Err(format!("Codex usage wake failed: {}", err.code())),
+    }
 }
 
 #[cfg(test)]
@@ -3112,6 +3118,40 @@ mod tests {
         assert!(!view.enabled);
         assert_eq!(view.state, "terminal_failure");
         assert_eq!(view.failure_reason.as_deref(), Some("state_unavailable"));
+    }
+
+    #[tokio::test]
+    async fn open_usage_lock_contention_is_retryable_without_disabling_projection() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let context = CliContext {
+            state_dir: tmp.path().join("state"),
+            host: None,
+        };
+        let record = record_with_runtime("usage-wake-busy", &tmp.path().join("server.sock"));
+        fs::create_dir_all(crate::session_dir(&context, &record.id)).unwrap();
+        crate::write_session_record(&context, &record).unwrap();
+        crate::activity::activate_runtime(&context, &record).unwrap();
+        crate::auto_resume::set_enabled(&context, &record.id, true, "2030-01-01T00:00:00Z")
+            .unwrap();
+        let lock = crate::acquire_session_record_lock(&context, &record.id).unwrap();
+
+        wake_from_open_usage(
+            &context,
+            &record,
+            &UsageSnapshot {
+                authoritative: true,
+                has_exhausted_windows: false,
+                exhausted_reset_epochs: Vec::new(),
+            },
+        )
+        .await
+        .expect("advisory open-usage wake should defer while the lifecycle lock is busy");
+        drop(lock);
+
+        let view = crate::auto_resume::view_for_record(&context, &record);
+        assert!(view.enabled);
+        assert_eq!(view.state, "enabled");
+        assert_eq!(view.failure_reason, None);
     }
 
     #[tokio::test]
