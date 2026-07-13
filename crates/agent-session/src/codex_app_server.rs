@@ -412,8 +412,7 @@ startup_diagnostic="$startup_dir/.startup-diagnostic.log"
 write_startup_marker() {
   (umask 077; printf '%s\n' "$2" > "$1") 2>/dev/null || true
 }
-record_startup_failure() {
-  write_startup_marker "$startup_failure" "$1"
+bound_startup_diagnostic() {
   if [ -f "$startup_diagnostic" ]; then
     bounded="$startup_diagnostic.tmp"
     if (umask 077; tail -c 16384 "$startup_diagnostic" > "$bounded") 2>/dev/null; then
@@ -422,6 +421,10 @@ record_startup_failure() {
       rm -f "$bounded"
     fi
   fi
+}
+record_startup_failure() {
+  write_startup_marker "$startup_failure" "$1"
+  bound_startup_diagnostic
 }
 rm -f -- "$startup_failure" "$startup_diagnostic" "$startup_diagnostic.tmp"
 (umask 077; : > "$startup_diagnostic")
@@ -437,6 +440,9 @@ cleanup() {
   fi
   kill "$server" 2>/dev/null || true
   wait "$server" 2>/dev/null || true
+  if [ -f "$startup_failure" ]; then
+    bound_startup_diagnostic
+  fi
   rm -f -- "$socket" "$proxy" "$handoff" "$attached"
 }
 trap cleanup EXIT HUP INT TERM
