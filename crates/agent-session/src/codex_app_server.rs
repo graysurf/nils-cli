@@ -1932,11 +1932,11 @@ impl FreshBootstrap {
             crate::activity::activity_status(context, &record.id).is_ok_and(|activity| {
                 activity.turn_state.phase == crate::activity::TurnPhase::Starting
             });
-        let auto_resume_disabled = auto_resume_is_healthy_disabled(context, record);
+        let auto_resume_idle = auto_resume_is_healthy_idle(context, record);
         if record.provider_resume.is_none()
             && thread_attached_path(record).is_some_and(|path| !path.is_file())
             && starting
-            && auto_resume_disabled
+            && auto_resume_idle
             && create_bootstrap_is_live(record)
         {
             Self::ThreadStart
@@ -1954,7 +1954,7 @@ impl FreshBootstrap {
         if matches!(self, Self::Closed) {
             return false;
         }
-        if !auto_resume_is_healthy_disabled(context, record) {
+        if !auto_resume_is_healthy_idle(context, record) {
             *self = Self::Closed;
             return false;
         }
@@ -2014,9 +2014,17 @@ struct MutationAuthorization {
     _manual_input_gate: Option<ManualInputGate>,
 }
 
-fn auto_resume_is_healthy_disabled(context: &CliContext, record: &SessionRecord) -> bool {
+fn auto_resume_is_healthy_idle(context: &CliContext, record: &SessionRecord) -> bool {
     let view = crate::auto_resume::view_for_record(context, record);
-    view.supported && !view.enabled && view.state == "disabled" && view.failure_reason.is_none()
+    let idle_state_matches_enablement = match view.state.as_str() {
+        "disabled" => !view.enabled,
+        "enabled" => view.enabled,
+        _ => false,
+    };
+    view.supported
+        && idle_state_matches_enablement
+        && view.scheduled_at.is_none()
+        && view.failure_reason.is_none()
 }
 
 async fn cancel_before_tui_mutation(
@@ -2034,8 +2042,10 @@ async fn cancel_before_tui_mutation(
     }
     // A fresh Codex TUI emits `thread/start`, then the initial prompt emits
     // `turn/start`, while the parent create path still owns the lifecycle lock.
-    // The create-owned marker and exact disabled auto-resume state are checked
-    // live for both requests. The first turn is armed only by a successful
+    // The create-owned marker and exact healthy idle auto-resume state are
+    // checked live for both requests. A per-device default may opt in before
+    // the TUI creates its thread, but armed or failed continuation state must
+    // still fail closed. The first turn is authorized only by a successful
     // matching thread/start response and must target the returned thread id.
     #[cfg(test)]
     NORMAL_CANCELLATION_ATTEMPTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -4054,6 +4064,180 @@ mod tests {
         drop(lock);
         server.await.unwrap();
         proxy.await.unwrap().unwrap();
+    }
+
+    #[test]
+    fn fresh_bootstrap_allows_pre_enabled_auto_resume() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let context = CliContext {
+            state_dir: tmp.path().join("state"),
+            host: None,
+        };
+        let record = record_with_runtime("fresh-enabled", &tmp.path().join("enabled.sock"));
+        fs::create_dir_all(crate::session_dir(&context, &record.id)).unwrap();
+        crate::write_session_record(&context, &record).unwrap();
+        crate::activity::activate_runtime(&context, &record).unwrap();
+        write_create_bootstrap_marker(&record);
+        crate::auto_resume::set_enabled(&context, &record.id, true, "2030-01-01T00:00:00Z")
+            .unwrap();
+
+        let mut bootstrap = FreshBootstrap::for_runtime(&context, &record);
+        assert!(bootstrap.bypasses_create_lock(
+            &context,
+            &record,
+            &json!({ "id": 1, "method": "thread/start", "params": {} }),
+        ));
+        bootstrap
+            .observe_server(&json!({ "id": 1, "result": { "thread": { "id": "fresh-thread" } } }));
+        assert!(bootstrap.bypasses_create_lock(
+            &context,
+            &record,
+            &json!({
+                "id": 2,
+                "method": "turn/start",
+                "params": { "threadId": "fresh-thread", "input": [] }
+            }),
+        ));
+    }
+
+    #[test]
+    fn fresh_bootstrap_accepts_only_healthy_idle_auto_resume_states() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let context = CliContext {
+            state_dir: tmp.path().join("state"),
+            host: None,
+        };
+        let record = record_with_runtime("fresh-matrix", &tmp.path().join("matrix.sock"));
+        let session_dir = crate::session_dir(&context, &record.id);
+        fs::create_dir_all(&session_dir).unwrap();
+        crate::write_session_record(&context, &record).unwrap();
+        crate::activity::activate_runtime(&context, &record).unwrap();
+        write_create_bootstrap_marker(&record);
+
+        for (name, enabled, state, scheduled_at, failure_reason, accepted) in [
+            ("healthy-disabled", false, "disabled", None, None, true),
+            ("healthy-enabled", true, "enabled", None, None, true),
+            (
+                "disabled-flag-mismatch",
+                true,
+                "disabled",
+                None,
+                None,
+                false,
+            ),
+            ("enabled-flag-mismatch", false, "enabled", None, None, false),
+            ("armed", true, "armed", None, None, false),
+            (
+                "scheduled",
+                true,
+                "scheduled",
+                Some("2030-01-01T01:00:00Z"),
+                None,
+                false,
+            ),
+            ("checking", true, "checking", None, None, false),
+            (
+                "transient-failure",
+                true,
+                "transient_failure",
+                None,
+                Some("usage_unavailable"),
+                false,
+            ),
+            (
+                "terminal-failure",
+                false,
+                "terminal_failure",
+                None,
+                Some("state_unavailable"),
+                false,
+            ),
+            (
+                "enabled-with-schedule",
+                true,
+                "enabled",
+                Some("2030-01-01T01:00:00Z"),
+                None,
+                false,
+            ),
+            (
+                "enabled-with-failure",
+                true,
+                "enabled",
+                None,
+                Some("usage_unavailable"),
+                false,
+            ),
+            (
+                "disabled-with-schedule",
+                false,
+                "disabled",
+                Some("2030-01-01T01:00:00Z"),
+                None,
+                false,
+            ),
+            (
+                "disabled-with-failure",
+                false,
+                "disabled",
+                None,
+                Some("state_unavailable"),
+                false,
+            ),
+        ] {
+            fs::write(
+                session_dir.join("auto-resume.json"),
+                serde_json::to_vec(&json!({
+                    "schema_version": "agent-session.auto-resume.v1",
+                    "enabled": enabled,
+                    "state": state,
+                    "updated_at": "2030-01-01T00:00:00Z",
+                    "scheduled_at": scheduled_at,
+                    "failure_reason": failure_reason,
+                    "attempt": 0,
+                    "ever_scheduled": false,
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+
+            assert_eq!(
+                FreshBootstrap::for_runtime(&context, &record) == FreshBootstrap::ThreadStart,
+                accepted,
+                "unexpected bootstrap decision for {name}",
+            );
+        }
+    }
+
+    #[test]
+    fn fresh_bootstrap_rejects_pre_armed_auto_resume() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let context = CliContext {
+            state_dir: tmp.path().join("state"),
+            host: None,
+        };
+        let record = record_with_runtime("fresh-armed", &tmp.path().join("armed.sock"));
+        fs::create_dir_all(crate::session_dir(&context, &record.id)).unwrap();
+        crate::write_session_record(&context, &record).unwrap();
+        crate::activity::activate_runtime(&context, &record).unwrap();
+        write_create_bootstrap_marker(&record);
+        crate::auto_resume::set_enabled(&context, &record.id, true, "2030-01-01T00:00:00Z")
+            .unwrap();
+        assert!(
+            crate::auto_resume::arm_usage_exhaustion(
+                &context,
+                &record.id,
+                "blocked-turn".to_string(),
+                1,
+                "2030-01-01T00:00:01Z",
+            )
+            .unwrap()
+        );
+
+        assert_eq!(
+            FreshBootstrap::for_runtime(&context, &record),
+            FreshBootstrap::Closed
+        );
     }
 
     #[test]
