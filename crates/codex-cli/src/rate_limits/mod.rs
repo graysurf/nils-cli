@@ -624,7 +624,7 @@ fn collect_json_from_cache(
     let cache_entry = if enforce_ttl {
         cache::read_cache_entry_for_cached_mode(target_file)
     } else {
-        cache::read_cache_entry(target_file)
+        cache::read_cache_entry_allow_stale(target_file).map(|read| read.entry)
     };
 
     match cache_entry {

@@ -36,8 +36,11 @@ pub fn run(options: &PromptSegmentOptions) -> i32 {
     };
 
     let force_refresh = options.refresh || ttl_seconds == 0;
-    let needs_refresh =
-        force_refresh || !cache_file.is_file() || cache::cache_stale(&cache_file, ttl_seconds);
+    let display_expired = cache_file.is_file() && cache::cache_display_expired(&cache_file);
+    let needs_refresh = force_refresh
+        || !cache_file.is_file()
+        || cache::cache_stale(&cache_file, ttl_seconds)
+        || display_expired;
     let mut stale = false;
 
     if needs_refresh {
@@ -54,6 +57,10 @@ pub fn run(options: &PromptSegmentOptions) -> i32 {
                 stale = true;
             }
         }
+    }
+
+    if cache::cache_display_expired(&cache_file) {
+        return exit::SUCCESS;
     }
 
     let Some(raw_cache) = cache::read_cache_file(&cache_file) else {
@@ -152,7 +159,7 @@ impl PromptSegmentStatusResult {
         let token = auth::resolve_access_token();
         let cache_file = cache::cache_file();
         let ttl_seconds = resolve_ttl_seconds(None).unwrap_or(DEFAULT_TTL_SECONDS);
-        let (cache_exists, cache_stale, would_render) =
+        let (cache_exists, cache_stale, cache_expired, would_render) =
             inspect_cache(cache_file.as_ref(), ttl_seconds);
 
         let authenticated = token.is_some();
@@ -164,6 +171,8 @@ impl PromptSegmentStatusResult {
             "access-token-missing"
         } else if !cache_exists {
             "cache-missing"
+        } else if cache_expired {
+            "cache-expired"
         } else {
             "cache-empty-or-invalid"
         };
@@ -184,22 +193,24 @@ impl PromptSegmentStatusResult {
     }
 }
 
-fn inspect_cache(cache_file: Option<&PathBuf>, ttl_seconds: u64) -> (bool, bool, bool) {
+fn inspect_cache(cache_file: Option<&PathBuf>, ttl_seconds: u64) -> (bool, bool, bool, bool) {
     let Some(cache_file) = cache_file else {
-        return (false, false, false);
+        return (false, false, false, false);
     };
     if !cache_file.is_file() {
-        return (false, false, false);
+        return (false, false, false, false);
     }
 
-    let cache_stale = cache::cache_stale(cache_file, ttl_seconds);
-    let would_render = cache::read_cache_file(cache_file)
-        .as_deref()
-        .and_then(|raw| render::render_usage_json(raw, DEFAULT_TIME_FORMAT, false, ""))
-        .map(|line| !line.trim().is_empty())
-        .unwrap_or(false);
+    let cache_expired = cache::cache_display_expired(cache_file);
+    let cache_stale = cache_expired || cache::cache_stale(cache_file, ttl_seconds);
+    let would_render = !cache_expired
+        && cache::read_cache_file(cache_file)
+            .as_deref()
+            .and_then(|raw| render::render_usage_json(raw, DEFAULT_TIME_FORMAT, false, ""))
+            .map(|line| !line.trim().is_empty())
+            .unwrap_or(false);
 
-    (true, cache_stale, would_render)
+    (true, cache_stale, cache_expired, would_render)
 }
 
 fn display_path(path: PathBuf) -> String {

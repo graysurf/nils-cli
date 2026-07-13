@@ -133,9 +133,11 @@ fn resolve_usage(source: UsageSource) -> UsageResult {
         UsageSource::Cli => try_claude_cli(cache_file.as_ref()).unwrap_or_else(|reason| {
             empty_result(cache_file, "claude cli usage unavailable", reason)
         }),
-        UsageSource::Cache => read_cache(cache_file.as_ref()).unwrap_or_else(|| {
-            empty_result(cache_file, "cache missing", ProviderUsageReason::Unknown)
-        }),
+        UsageSource::Cache => {
+            let note = cache_unavailable_note(cache_file.as_ref());
+            read_cache(cache_file.as_ref())
+                .unwrap_or_else(|| empty_result(cache_file, note, ProviderUsageReason::Unknown))
+        }
     }
 }
 
@@ -176,6 +178,9 @@ fn try_claude_cli(cache_file: Option<&PathBuf>) -> Result<UsageResult, ProviderU
 
 fn read_cache(cache_file: Option<&PathBuf>) -> Option<UsageResult> {
     let cache_file = cache_file?;
+    if cache::cache_display_expired(cache_file) {
+        return None;
+    }
     let raw = cache::read_cache_file(cache_file)?;
     let value: Value = serde_json::from_str(&raw).ok()?;
     let usage = render::parse_usage_value(&value)?;
@@ -187,6 +192,14 @@ fn read_cache(cache_file: Option<&PathBuf>) -> Option<UsageResult> {
         &usage,
         Some("serving last cached usage".to_string()),
     ))
+}
+
+fn cache_unavailable_note(cache_file: Option<&PathBuf>) -> &'static str {
+    if cache_file.is_some_and(|path| path.is_file() && cache::cache_display_expired(path)) {
+        "cache expired"
+    } else {
+        "cache missing"
+    }
 }
 
 fn empty_result(

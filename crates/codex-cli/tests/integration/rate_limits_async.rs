@@ -6,7 +6,7 @@ use serde_json::Value;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 fn codex_cli_bin() -> PathBuf {
     bin::resolve("codex-cli")
@@ -60,6 +60,14 @@ fn cache_kv_path(cache_root: &Path, key: &str) -> PathBuf {
         .join("codex")
         .join("prompt-segment-rate-limits")
         .join(format!("{key}.kv"))
+}
+
+fn now_epoch() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .and_then(|duration| i64::try_from(duration.as_secs()).ok())
+        .unwrap_or(0)
 }
 
 #[test]
@@ -456,9 +464,12 @@ fn rate_limits_async_json_falls_back_to_cache_for_missing_access_token() {
     let cache_root = dir.path().join("cache_root");
     let kv_path = cache_kv_path(&cache_root, "beta");
     fs::create_dir_all(kv_path.parent().expect("cache parent")).expect("cache dir");
+    let fetched_at = now_epoch().saturating_sub(300);
     fs::write(
         &kv_path,
-        "fetched_at=1700000000\nnon_weekly_label=5h\nnon_weekly_remaining=91\nweekly_remaining=70\nweekly_reset_epoch=1700600000\n",
+        format!(
+            "fetched_at={fetched_at}\nnon_weekly_label=5h\nnon_weekly_remaining=91\nweekly_remaining=70\nweekly_reset_epoch=1700600000\n"
+        ),
     )
     .expect("write beta cache");
 
@@ -635,8 +646,11 @@ fn rate_limits_async_empty_window_object_preserves_fallback_cache_and_metadata()
     let cache_root = dir.path().join("cache_root");
     let kv_path = cache_kv_path(&cache_root, "alpha");
     fs::create_dir_all(kv_path.parent().expect("cache parent")).expect("cache dir");
-    let cache = "fetched_at=1700000000\nnon_weekly_label=5h\nnon_weekly_remaining=91\nnon_weekly_reset_epoch=1700003600\nweekly_remaining=70\nweekly_reset_epoch=1700600000\n";
-    fs::write(&kv_path, cache).expect("write alpha cache");
+    let fetched_at = now_epoch().saturating_sub(300);
+    let cache = format!(
+        "fetched_at={fetched_at}\nnon_weekly_label=5h\nnon_weekly_remaining=91\nnon_weekly_reset_epoch=1700003600\nweekly_remaining=70\nweekly_reset_epoch=1700600000\n"
+    );
+    fs::write(&kv_path, &cache).expect("write alpha cache");
 
     let server = LoopbackServer::new().expect("server");
     server.add_route(
@@ -690,9 +704,12 @@ fn rate_limits_async_text_null_payload_serves_stale_cache() {
     let cache_root = dir.path().join("cache_root");
     let kv_path = cache_kv_path(&cache_root, "alpha");
     fs::create_dir_all(kv_path.parent().expect("cache parent")).expect("cache dir");
+    let fetched_at = now_epoch().saturating_sub(300);
     fs::write(
         &kv_path,
-        "fetched_at=1700000000\nnon_weekly_label=5h\nnon_weekly_remaining=91\nnon_weekly_reset_epoch=1700003600\nweekly_remaining=70\nweekly_reset_epoch=1700600000\n",
+        format!(
+            "fetched_at={fetched_at}\nnon_weekly_label=5h\nnon_weekly_remaining=91\nnon_weekly_reset_epoch=1700003600\nweekly_remaining=70\nweekly_reset_epoch=1700600000\n"
+        ),
     )
     .expect("write alpha cache");
 
@@ -837,9 +854,12 @@ fn rate_limits_async_json_null_payload_serves_stale_cache() {
     let cache_root = dir.path().join("cache_root");
     let kv_path = cache_kv_path(&cache_root, "alpha");
     fs::create_dir_all(kv_path.parent().expect("cache parent")).expect("cache dir");
+    let fetched_at = now_epoch().saturating_sub(300);
     fs::write(
         &kv_path,
-        "fetched_at=1700000000\nnon_weekly_label=5h\nnon_weekly_remaining=91\nweekly_remaining=70\nweekly_reset_epoch=1700600000\n",
+        format!(
+            "fetched_at={fetched_at}\nnon_weekly_label=5h\nnon_weekly_remaining=91\nweekly_remaining=70\nweekly_reset_epoch=1700600000\n"
+        ),
     )
     .expect("write alpha cache");
 

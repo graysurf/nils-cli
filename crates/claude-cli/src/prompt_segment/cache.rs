@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 const CACHE_FILE_NAME: &str = "usage.json";
+const MAX_CACHE_DISPLAY_AGE_SECONDS: u64 = 600;
 
 pub fn cache_file() -> Option<PathBuf> {
     let dir = cache_dir()?;
@@ -35,6 +36,19 @@ pub fn cache_stale(path: &Path, ttl_seconds: u64) -> bool {
     age.as_secs() >= ttl_seconds
 }
 
+pub fn cache_display_expired(path: &Path) -> bool {
+    cache_display_expired_at(path, SystemTime::now())
+}
+
+fn cache_display_expired_at(path: &Path, now: SystemTime) -> bool {
+    let modified = match std::fs::metadata(path).and_then(|meta| meta.modified()) {
+        Ok(value) => value,
+        Err(_) => return true,
+    };
+    let age = now.duration_since(modified).unwrap_or_default();
+    age.as_secs() >= MAX_CACHE_DISPLAY_AGE_SECONDS
+}
+
 fn cache_dir() -> Option<PathBuf> {
     if let Some(value) = shared_env::env_non_empty("CLAUDE_PROMPT_SEGMENT_CACHE_DIR") {
         return Some(PathBuf::from(value));
@@ -56,9 +70,9 @@ fn cache_dir() -> Option<PathBuf> {
 
 #[cfg(test)]
 mod tests {
-    use super::cache_stale;
+    use super::{cache_display_expired_at, cache_stale};
     use std::fs::File;
-    use std::time::{Duration, SystemTime};
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     #[test]
     fn cache_stale_treats_zero_ttl_as_stale() {
@@ -79,5 +93,24 @@ mod tests {
 
         assert!(cache_stale(&path, 60));
         assert!(!cache_stale(&path, 180));
+    }
+
+    #[test]
+    fn cache_display_expiry_starts_at_600_seconds() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("usage.json");
+        std::fs::write(&path, "{}").expect("write");
+        let modified = UNIX_EPOCH + Duration::from_secs(1_000);
+        let file = File::options().write(true).open(&path).expect("open");
+        file.set_modified(modified).expect("set modified");
+
+        assert!(!cache_display_expired_at(
+            &path,
+            modified + Duration::from_secs(599)
+        ));
+        assert!(cache_display_expired_at(
+            &path,
+            modified + Duration::from_secs(600)
+        ));
     }
 }

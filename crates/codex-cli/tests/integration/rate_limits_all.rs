@@ -1,3 +1,4 @@
+use chrono::Utc;
 use nils_test_support::bin;
 use nils_test_support::cmd::{self, CmdOptions, CmdOutput};
 use nils_test_support::http::{HttpResponse, LoopbackServer};
@@ -228,8 +229,11 @@ fn rate_limits_all_json_no_window_payloads_serve_preserved_cache() {
         let cache_root = dir.path().join("cache_root");
         let kv_path = cache_kv_path(&cache_root, "alpha");
         fs::create_dir_all(kv_path.parent().expect("cache parent")).expect("cache dir");
-        let cache = "fetched_at=1\nnon_weekly_label=5h\nnon_weekly_remaining=91\nnon_weekly_reset_epoch=1700003600\nweekly_remaining=70\nweekly_reset_epoch=1700600000\n";
-        fs::write(&kv_path, cache).expect("cache");
+        let fetched_at = Utc::now().timestamp().saturating_sub(300);
+        let cache = format!(
+            "fetched_at={fetched_at}\nnon_weekly_label=5h\nnon_weekly_remaining=91\nnon_weekly_reset_epoch=1700003600\nweekly_remaining=70\nweekly_reset_epoch=1700600000\n"
+        );
+        fs::write(&kv_path, &cache).expect("cache");
 
         let server = LoopbackServer::new().expect("server");
         server.add_route("GET", "/wham/usage", HttpResponse::new(200, response));
@@ -257,6 +261,60 @@ fn rate_limits_all_json_no_window_payloads_serve_preserved_cache() {
         assert_eq!(fs::read_to_string(&secret_file).expect("secret"), secret);
         assert_eq!(fs::read_to_string(&kv_path).expect("cache"), cache);
     }
+}
+
+#[test]
+fn rate_limits_all_json_no_window_payload_omits_cache_at_max_stale_age() {
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let secrets = dir.path().join("secrets");
+    fs::create_dir_all(&secrets).expect("secret dir");
+    fs::write(
+        secrets.join("alpha.json"),
+        r#"{"tokens":{"access_token":"tok-alpha","account_id":"acct_001"}}"#,
+    )
+    .expect("write alpha");
+
+    let cache_root = dir.path().join("cache_root");
+    let kv_path = cache_kv_path(&cache_root, "alpha");
+    fs::create_dir_all(kv_path.parent().expect("cache parent")).expect("cache dir");
+    let fetched_at = Utc::now().timestamp().saturating_sub(600);
+    fs::write(
+        &kv_path,
+        format!(
+            "fetched_at={fetched_at}\nnon_weekly_label=5h\nnon_weekly_remaining=91\nweekly_remaining=70\nweekly_reset_epoch=1700600000\n"
+        ),
+    )
+    .expect("cache");
+
+    let server = LoopbackServer::new().expect("server");
+    server.add_route(
+        "GET",
+        "/wham/usage",
+        HttpResponse::new(200, r#"{"plan_type":"pro","rate_limit":null}"#),
+    );
+
+    let output = run(
+        &["diag", "rate-limits", "--all", "--format", "json"],
+        &[
+            ("CODEX_SECRET_DIR", &secrets),
+            ("ZSH_CACHE_DIR", &cache_root),
+        ],
+        &[
+            ("CODEX_CHATGPT_BASE_URL", &server.url()),
+            ("CODEX_RATE_LIMITS_DEFAULT_ALL_ENABLED", "false"),
+        ],
+    );
+
+    assert_exit(&output, 0);
+    let payload: Value = serde_json::from_str(&stdout(&output)).expect("json");
+    let result = &payload["results"][0];
+    assert_eq!(result["source"], "network");
+    assert_eq!(result["windows"], serde_json::json!([]));
+    assert!(result["summary"].is_null());
+    assert!(
+        kv_path.is_file(),
+        "max-stale handling must not delete cache"
+    );
 }
 
 #[test]

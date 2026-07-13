@@ -862,8 +862,11 @@ fn rate_limits_all_mode_empty_windows_serves_preserved_cache() {
     let cache_root = dir.path().join("cache_root");
     let kv_path = cache_kv_path(&cache_root, "alpha");
     fs::create_dir_all(kv_path.parent().expect("cache parent")).expect("cache dir");
-    let cache = "fetched_at=1\nnon_weekly_label=5h\nnon_weekly_remaining=91\nnon_weekly_reset_epoch=1700003600\nweekly_remaining=70\nweekly_reset_epoch=1700600000\n";
-    fs::write(&kv_path, cache).expect("cache");
+    let fetched_at = now_epoch().saturating_sub(300);
+    let cache = format!(
+        "fetched_at={fetched_at}\nnon_weekly_label=5h\nnon_weekly_remaining=91\nnon_weekly_reset_epoch=1700003600\nweekly_remaining=70\nweekly_reset_epoch=1700600000\n"
+    );
+    fs::write(&kv_path, &cache).expect("cache");
 
     let server = LoopbackServer::new().expect("server");
     server.add_route(
@@ -911,8 +914,11 @@ fn rate_limits_all_mode_null_rate_limit_serves_preserved_cache() {
     let cache_root = dir.path().join("cache_root");
     let kv_path = cache_kv_path(&cache_root, "alpha");
     fs::create_dir_all(kv_path.parent().expect("cache parent")).expect("cache dir");
-    let cache = "fetched_at=1\nnon_weekly_label=5h\nnon_weekly_remaining=91\nnon_weekly_reset_epoch=1700003600\nweekly_remaining=70\nweekly_reset_epoch=1700600000\n";
-    fs::write(&kv_path, cache).expect("cache");
+    let fetched_at = now_epoch().saturating_sub(300);
+    let cache = format!(
+        "fetched_at={fetched_at}\nnon_weekly_label=5h\nnon_weekly_remaining=91\nnon_weekly_reset_epoch=1700003600\nweekly_remaining=70\nweekly_reset_epoch=1700600000\n"
+    );
+    fs::write(&kv_path, &cache).expect("cache");
 
     let server = LoopbackServer::new().expect("server");
     server.add_route(
