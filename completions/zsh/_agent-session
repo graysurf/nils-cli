@@ -118,7 +118,7 @@ json\:"Single-record JSON envelope (snake_case)"))' \
 (send)
 _arguments "${_arguments_options[@]}" : \
 '--text=[Literal text to type into the session. Applied before any --key. Prefer --text-stdin for secrets (--text is visible in this process'\''s arguments)]:TEXT:_default' \
-'*--key=[Special key to press (repeatable), applied in order after any text]:KEY:(enter escape c-c up down left right tab)' \
+'*--key=[Special key to press (repeatable), applied in order after any text]:KEY:(enter escape backspace c-c up down left right tab)' \
 '--tmux-bin=[tmux binary override]:PATH:_files' \
 '--format=[Output format]:FORMAT:((text\:"Human-readable text output (default)"
 json\:"Single-record JSON envelope (snake_case)"))' \

@@ -10839,6 +10839,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn attach_backspace_is_delivered_as_named_tmux_key() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let log = tmp.path().join("calls.log");
+        let tmux = logging_tmux(tmp.path(), &log);
+        let context = CliContext {
+            state_dir: tmp.path().join("state"),
+            host: None,
+        };
+        let record = test_record("backspace", "hs-codex-backspace");
+        crate::write_session_record(&context, &record).unwrap();
+        let mut repaint = false;
+
+        handle_input(
+            &context,
+            &tmux,
+            &record,
+            "hs-codex-backspace:0.0",
+            r#"{"keys":["backspace"]}"#,
+            &mut repaint,
+            &tokio::sync::Mutex::new(()),
+        )
+        .await
+        .unwrap();
+
+        let calls = std::fs::read_to_string(&log).unwrap_or_default();
+        assert!(
+            calls.contains("send-keys -t hs-codex-backspace:0.0 BSpace"),
+            "Backspace must use a named tmux key: {calls:?}"
+        );
+        assert!(!calls.contains("load-buffer"));
+        assert!(!calls.contains("paste-buffer"));
+    }
+
+    #[tokio::test]
     async fn first_resize_forces_a_repaint_nudge_then_plain_resizes() {
         let tmp = tempfile::TempDir::new().unwrap();
         let log = tmp.path().join("calls.log");
@@ -11045,6 +11079,26 @@ exit 0
             assert_eq!(SpecialKey::from_name(key.as_str()), Some(*key));
         }
         assert_eq!(SpecialKey::from_name("f13"), None);
+    }
+
+    #[test]
+    fn backspace_key_round_trips_cli_and_tmux() {
+        use clap::Parser;
+
+        let cli = crate::cli::Cli::try_parse_from([
+            "agent-session",
+            "send",
+            "session-id",
+            "--key",
+            "backspace",
+        ])
+        .expect("Backspace must be accepted by --key");
+        let crate::cli::Command::Send(args) = cli.command else {
+            panic!("expected send command");
+        };
+        assert_eq!(args.keys.len(), 1);
+        assert_eq!(args.keys[0].as_str(), "backspace");
+        assert_eq!(args.keys[0].tmux_key(), "BSpace");
     }
 
     #[test]

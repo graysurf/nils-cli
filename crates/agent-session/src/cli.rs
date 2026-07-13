@@ -513,6 +513,7 @@ impl AgentKind {
 pub enum SpecialKey {
     Enter,
     Escape,
+    Backspace,
     #[value(name = "c-c")]
     CtrlC,
     Up,
@@ -528,6 +529,7 @@ impl SpecialKey {
         match self {
             Self::Enter => "enter",
             Self::Escape => "escape",
+            Self::Backspace => "backspace",
             Self::CtrlC => "c-c",
             Self::Up => "up",
             Self::Down => "down",
@@ -543,6 +545,7 @@ impl SpecialKey {
         match name {
             "enter" => Some(Self::Enter),
             "escape" => Some(Self::Escape),
+            "backspace" => Some(Self::Backspace),
             "c-c" => Some(Self::CtrlC),
             "up" => Some(Self::Up),
             "down" => Some(Self::Down),
@@ -558,6 +561,7 @@ impl SpecialKey {
         match self {
             Self::Enter => "Enter",
             Self::Escape => "Escape",
+            Self::Backspace => "BSpace",
             Self::CtrlC => "C-c",
             Self::Up => "Up",
             Self::Down => "Down",
