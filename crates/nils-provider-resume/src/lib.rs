@@ -116,7 +116,9 @@ pub fn normalize_resume_id(session_id: &str) -> Result<String, ResumeIdError> {
 /// The default root honors `CODEX_HOME` / `CLAUDE_CONFIG_DIR` and falls back to
 /// the standard `$HOME` locations. Returns [`ResumeResolveError`] when the id is
 /// missing, matches more than one distinct cwd, or the bounded scan was
-/// truncated before it could decide.
+/// truncated before it could decide. A canonical Codex UUIDv7 match in its
+/// timestamp-derived history day is authoritative; non-canonical layouts are
+/// scanned only when that day contains no valid match.
 pub fn resolve_resume_source(
     provider: ResumeProvider,
     session_id: &str,
@@ -141,11 +143,10 @@ pub fn resolve_resume_source_in(
     session_id: &str,
 ) -> Result<ResolvedResume, ResumeResolveError> {
     if provider == ResumeProvider::Codex {
-        return resolve_codex_resume_source_in_with_budget_factory(
+        return resolve_codex_resume_source_in_with_budget(
             root,
             session_id,
             CodexResumeScanBudget::from_env(),
-            CodexResumeScanBudget::from_env,
         );
     }
 
@@ -158,19 +159,15 @@ pub fn resolve_resume_source_in(
     resolved_from_matches(matches, provider.capture_method())
 }
 
-fn resolve_codex_resume_source_in_with_budget_factory<F>(
+fn resolve_codex_resume_source_in_with_budget(
     root: &Path,
     session_id: &str,
-    mut canonical_budget: CodexResumeScanBudget,
-    fallback_budget: F,
-) -> Result<ResolvedResume, ResumeResolveError>
-where
-    F: FnOnce() -> CodexResumeScanBudget,
-{
+    mut budget: CodexResumeScanBudget,
+) -> Result<ResolvedResume, ResumeResolveError> {
     let mut matches = BTreeSet::new();
     if let Some(day) = codex_uuid_v7_session_day(root, session_id) {
-        collect_codex_canonical_day_matches(&day, session_id, &mut matches, &mut canonical_budget);
-        if canonical_budget.truncated {
+        collect_codex_canonical_day_matches(&day, session_id, &mut matches, &mut budget);
+        if budget.truncated {
             return Err(ResumeResolveError::Truncated);
         }
         if !matches.is_empty() {
@@ -178,9 +175,8 @@ where
         }
     }
 
-    let mut fallback_budget = fallback_budget();
-    collect_codex_provider_resume_matches(root, 0, session_id, &mut matches, &mut fallback_budget);
-    if fallback_budget.truncated {
+    collect_codex_provider_resume_matches(root, 0, session_id, &mut matches, &mut budget);
+    if budget.truncated {
         return Err(ResumeResolveError::Truncated);
     }
     resolved_from_matches(matches, ResumeProvider::Codex.capture_method())
@@ -780,16 +776,15 @@ mod tests {
         )
         .unwrap();
 
-        let one_entry_budget = || CodexResumeScanBudget {
+        let one_entry_budget = CodexResumeScanBudget {
             visited: 0,
             max_entries: 1,
             deadline: Instant::now() + Duration::from_secs(60),
             truncated: false,
         };
-        let resolved = resolve_codex_resume_source_in_with_budget_factory(
+        let resolved = resolve_codex_resume_source_in_with_budget(
             &tmp.path().join("sessions"),
             session_id,
-            one_entry_budget(),
             one_entry_budget,
         )
         .unwrap();
@@ -821,6 +816,72 @@ mod tests {
 
         assert_eq!(resolved.cwd, PathBuf::from("/repo/fallback"));
         assert_eq!(resolved.capture_method, "codex-session-meta-import");
+    }
+
+    #[test]
+    fn resolve_uuid_v7_codex_resume_source_prefers_canonical_history() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let session_id = "019f5c96-65c0-7140-8657-0ce2ecb45aa5";
+        let day = tmp.path().join("sessions/2026/07/13");
+        let other_layout = tmp.path().join("sessions/history");
+        fs::create_dir_all(&day).unwrap();
+        fs::create_dir_all(&other_layout).unwrap();
+        fs::write(
+            day.join(format!("rollout-{session_id}.jsonl")),
+            format!(
+                r#"{{"timestamp":"2026-07-13T17:46:28.216Z","type":"session_meta","payload":{{"id":"{session_id}","session_id":"{session_id}","cwd":"/repo/canonical","source":"cli","timestamp":"2026-07-13T17:46:28.216Z"}}}}"#
+            ),
+        )
+        .unwrap();
+        fs::write(
+            other_layout.join("rollout.jsonl"),
+            format!(
+                r#"{{"timestamp":"2026-07-13T17:46:28.216Z","type":"session_meta","payload":{{"id":"{session_id}","session_id":"{session_id}","cwd":"/repo/other","source":"cli","timestamp":"2026-07-13T17:46:28.216Z"}}}}"#
+            ),
+        )
+        .unwrap();
+
+        let resolved = resolve_resume_source_in(
+            ResumeProvider::Codex,
+            &tmp.path().join("sessions"),
+            session_id,
+        )
+        .unwrap();
+
+        assert_eq!(resolved.cwd, PathBuf::from("/repo/canonical"));
+    }
+
+    #[test]
+    fn resolve_uuid_v7_codex_resume_source_shares_fast_and_fallback_budget() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let session_id = "019f5c96-65c0-7140-8657-0ce2ecb45aa5";
+        let day = tmp.path().join("sessions/2026/07/13");
+        let fallback_layout = tmp.path().join("sessions/history");
+        fs::create_dir_all(&day).unwrap();
+        fs::create_dir_all(&fallback_layout).unwrap();
+        fs::write(day.join("unrelated.jsonl"), "{}\n").unwrap();
+        fs::write(
+            fallback_layout.join("rollout.jsonl"),
+            format!(
+                r#"{{"timestamp":"2026-07-13T17:46:28.216Z","type":"session_meta","payload":{{"id":"{session_id}","session_id":"{session_id}","cwd":"/repo/fallback","source":"cli","timestamp":"2026-07-13T17:46:28.216Z"}}}}"#
+            ),
+        )
+        .unwrap();
+
+        let one_entry_budget = CodexResumeScanBudget {
+            visited: 0,
+            max_entries: 1,
+            deadline: Instant::now() + Duration::from_secs(60),
+            truncated: false,
+        };
+        assert_eq!(
+            resolve_codex_resume_source_in_with_budget(
+                &tmp.path().join("sessions"),
+                session_id,
+                one_entry_budget,
+            ),
+            Err(ResumeResolveError::Truncated)
+        );
     }
 
     #[test]

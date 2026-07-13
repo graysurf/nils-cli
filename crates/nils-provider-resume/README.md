@@ -21,7 +21,9 @@ For canonical Codex UUIDv7 ids, resolution first derives the UTC
 `sessions/YYYY/MM/DD` directory from the id timestamp and checks only matching
 rollout filenames there. If that fast path finds no valid metadata, resolution
 falls back to the bounded full-history scan so non-UUIDv7 ids and non-canonical
-history layouts remain supported.
+history layouts remain supported. A valid canonical-day match is authoritative;
+the fallback does not override it. Both phases share one aggregate entry and
+deadline budget.
 
 ## Surface
 
