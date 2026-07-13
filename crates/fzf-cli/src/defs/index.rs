@@ -2,9 +2,13 @@ use crate::util;
 use anyhow::Result;
 use nils_term::progress::{Progress, ProgressFinish, ProgressOptions};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
+use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
+
+const EXTRA_ROOTS_ENV: &str = "FZF_DEF_EXTRA_ROOTS";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AliasDef {
@@ -38,7 +42,7 @@ pub fn build_index() -> Result<DefIndex> {
     spinner.tick();
 
     let root = util::zsh_root()?;
-    let files = list_first_party_files(&root, &spinner)?;
+    let files = list_definition_files(&root, &spinner)?;
     let mut index = DefIndex::default();
 
     for (i, file) in files.into_iter().enumerate() {
@@ -60,15 +64,15 @@ pub fn build_index() -> Result<DefIndex> {
 }
 
 fn list_first_party_files(root: &Path, spinner: &Progress) -> Result<Vec<PathBuf>> {
-    let mut files: Vec<PathBuf> = Vec::new();
+    let mut files = BTreeMap::new();
 
     let zshrc = root.join(".zshrc");
     if zshrc.is_file() {
-        files.push(zshrc);
+        insert_canonical(&mut files, zshrc);
     }
     let zprofile = root.join(".zprofile");
     if zprofile.is_file() {
-        files.push(zprofile);
+        insert_canonical(&mut files, zprofile);
     }
 
     for dir in ["scripts", "bootstrap", "tools"] {
@@ -76,32 +80,100 @@ fn list_first_party_files(root: &Path, spinner: &Progress) -> Result<Vec<PathBuf
         if !d.is_dir() {
             continue;
         }
-        let mut scanned: usize = 0;
-        for entry in WalkDir::new(&d).follow_links(true) {
-            scanned = scanned.saturating_add(1);
-            if scanned.is_multiple_of(64) {
-                spinner.tick();
+        scan_zsh_dir(&d, spinner, true, &mut files);
+    }
+
+    Ok(files.into_values().collect())
+}
+
+fn list_definition_files(root: &Path, spinner: &Progress) -> Result<Vec<PathBuf>> {
+    let mut files = list_first_party_files(root, spinner)?
+        .into_iter()
+        .map(|path| (path.clone(), path))
+        .collect::<BTreeMap<_, _>>();
+
+    for extra_root in extra_roots() {
+        if extra_root.is_file() {
+            if is_zsh_file(&extra_root) {
+                insert_canonical(&mut files, extra_root);
             }
-            let entry = match entry {
-                Ok(v) => v,
-                Err(_) => continue,
-            };
-            if !entry.file_type().is_file() {
-                continue;
-            }
-            let path = entry.path();
-            if path.extension().and_then(|s| s.to_str()) != Some("zsh") {
-                continue;
-            }
-            if path.components().any(|c| c.as_os_str() == "plugins") {
-                continue;
-            }
-            files.push(path.to_path_buf());
+            continue;
+        }
+        if extra_root.is_dir() {
+            scan_zsh_dir(&extra_root, spinner, false, &mut files);
         }
     }
 
-    files.sort();
-    Ok(files)
+    Ok(files.into_values().collect())
+}
+
+pub(crate) fn source_roots_identity() -> Result<Vec<String>> {
+    let mut roots = vec![canonical_or_original(util::zsh_root()?)]
+        .into_iter()
+        .chain(extra_roots().into_iter().map(canonical_or_original))
+        .map(|path| path.to_string_lossy().to_string())
+        .collect::<Vec<_>>();
+    roots.sort();
+    roots.dedup();
+    Ok(roots)
+}
+
+fn extra_roots() -> Vec<PathBuf> {
+    env::var_os(EXTRA_ROOTS_ENV)
+        .map(|value| {
+            env::split_paths(&value)
+                .filter(|path| !path.as_os_str().is_empty())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn scan_zsh_dir(
+    dir: &Path,
+    spinner: &Progress,
+    skip_plugins: bool,
+    files: &mut BTreeMap<PathBuf, PathBuf>,
+) {
+    let mut scanned: usize = 0;
+    let entries = WalkDir::new(dir)
+        .follow_links(true)
+        .into_iter()
+        .filter_entry(|entry| entry.file_name() != ".git");
+    for entry in entries {
+        scanned = scanned.saturating_add(1);
+        if scanned.is_multiple_of(64) {
+            spinner.tick();
+        }
+        let entry = match entry {
+            Ok(value) => value,
+            Err(_) => continue,
+        };
+        if !entry.file_type().is_file() || !is_zsh_file(entry.path()) {
+            continue;
+        }
+        if skip_plugins
+            && entry
+                .path()
+                .components()
+                .any(|component| component.as_os_str() == "plugins")
+        {
+            continue;
+        }
+        insert_canonical(files, entry.into_path());
+    }
+}
+
+fn is_zsh_file(path: &Path) -> bool {
+    path.extension().and_then(|extension| extension.to_str()) == Some("zsh")
+}
+
+fn insert_canonical(files: &mut BTreeMap<PathBuf, PathBuf>, path: PathBuf) {
+    let canonical = canonical_or_original(path);
+    files.entry(canonical.clone()).or_insert(canonical);
+}
+
+fn canonical_or_original(path: PathBuf) -> PathBuf {
+    fs::canonicalize(&path).unwrap_or(path)
 }
 
 fn index_file(path: &Path, content: &str, out: &mut DefIndex) -> Result<()> {
@@ -241,6 +313,7 @@ fn brace_delta(line: &str) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use nils_test_support::{EnvGuard, GlobalStateLock};
     use pretty_assertions::assert_eq;
     use tempfile::TempDir;
 
@@ -311,5 +384,59 @@ world() {
         assert!(func_hello.source.contains("function hello"));
         let func_world = index.functions.iter().find(|f| f.name == "world").unwrap();
         assert!(func_world.source.contains("world()"));
+    }
+
+    #[test]
+    fn defs_index_reads_extra_file_and_directory_roots_once() {
+        let lock = GlobalStateLock::new();
+        let tmp = TempDir::new().unwrap();
+        let zsh_root = tmp.path().join("zsh");
+        let private_root = tmp.path().join("private");
+        let private_link = tmp.path().join("private-link");
+        let standalone = tmp.path().join("standalone.zsh");
+
+        write(&zsh_root.join(".zshrc"), "alias base='echo base'\n");
+        write(
+            &private_root.join("_lib/codex.zsh"),
+            "codex-offline() { echo offline }\n",
+        );
+        write(
+            &private_root.join(".git/hooks/skip.zsh"),
+            "should-not-index() { echo no }\n",
+        );
+        write(&standalone, "alias private-standalone='echo standalone'\n");
+        std::os::unix::fs::symlink(&private_root, &private_link).expect("symlink");
+
+        let extra_roots =
+            std::env::join_paths([&private_root, &private_link, &standalone]).expect("join paths");
+        let _guard_zdot = EnvGuard::set(&lock, "ZDOTDIR", zsh_root.to_string_lossy().as_ref());
+        let _guard_cache = EnvGuard::set(&lock, "FZF_DEF_DOC_CACHE_ENABLED", "0");
+        let _guard_extra = EnvGuard::set(
+            &lock,
+            "FZF_DEF_EXTRA_ROOTS",
+            extra_roots.to_string_lossy().as_ref(),
+        );
+
+        let index = build_index().expect("build index");
+        assert_eq!(
+            index
+                .functions
+                .iter()
+                .filter(|function| function.name == "codex-offline")
+                .count(),
+            1
+        );
+        assert!(
+            index
+                .aliases
+                .iter()
+                .any(|alias| alias.name == "private-standalone")
+        );
+        assert!(
+            !index
+                .functions
+                .iter()
+                .any(|function| function.name == "should-not-index")
+        );
     }
 }
