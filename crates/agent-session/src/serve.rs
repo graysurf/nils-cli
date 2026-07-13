@@ -2066,6 +2066,7 @@ async fn list_handler(State(state): State<Arc<ServeState>>) -> Response {
         Ok(Ok(sessions)) => envelope_ok(json!({
             "machine": state.machine,
             "observed_at": activity_observed_at(),
+            "capabilities": { "atomic_multiline_input": true },
             "sessions": sessions,
         })),
         Ok(Err(err)) => envelope_err(err),
@@ -6760,6 +6761,7 @@ mod tests {
         observed_at
             .parse::<jiff::Timestamp>()
             .expect("RFC3339 daemon observation anchor");
+        assert_eq!(body["data"]["capabilities"]["atomic_multiline_input"], true);
         assert_eq!(body["data"]["sessions"].as_array().unwrap().len(), 0);
     }
 
@@ -9970,7 +9972,7 @@ mod tests {
 
         let calls = std::fs::read_to_string(&calls_log).unwrap();
         assert!(
-            calls.contains("paste-buffer -b steer-send"),
+            calls.contains("paste-buffer -p -r -b steer-send"),
             "a live Claude rename must paste into the pane: {calls:?}"
         );
         assert!(

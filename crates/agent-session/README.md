@@ -138,7 +138,8 @@ web console). It builds its own tokio runtime and reuses the synchronous lifecyc
 is no second state model.
 
 - `GET /healthz`, `GET /sessions`, `GET /sessions/{id}/glance?tail=N` — reads, open on loopback. `GET /sessions`
-  additively reports `data.observed_at`, sampled from daemon time after the returned session state is assembled. Sessions report
+  additively reports `data.observed_at`, sampled from daemon time after the returned session state is assembled, and advertises
+  `data.capabilities.atomic_multiline_input: true` when text sends preserve LF and request bracketed-paste framing. Sessions report
   `running`, `stopped`, or `unknown` live status plus a boolean `resumable` field and best-effort `repo_name` derived from
   the recorded `cwd`. New records also expose optional `runtime_started_at` and
   `turn_state`; old records omit them.
@@ -379,8 +380,9 @@ JSON output uses the workspace envelope: `schema_version`, `ok`, `data`, optiona
 
 Prompts are stored under the local agent-session state directory and are not printed in command output. For sensitive prompts, prefer
 interactive `start`; one-shot `run` may need to pass the prompt through the underlying agent process command line depending on that agent's
-CLI capabilities. `send` routes literal text through a private (0600) buffer file loaded into tmux, so it never appears in the tmux
-command line or command output; the JSON contract reports only `sent_text` (a boolean) and the special-key names, never the text itself.
+CLI capabilities. `send` routes literal text through a private (0600) buffer file loaded into tmux, then uses raw (`paste-buffer -r`)
+bracketed-paste-aware (`-p`) delivery so multiline LF bytes are not converted into intermediate Enter keys. The text never appears in
+the tmux command line or command output; the JSON contract reports only `sent_text` (a boolean) and the special-key names, never the text itself.
 Values passed with `--agent-arg` are persisted in the private session record so durable resume can recreate the same provider invocation.
 Do not put secrets in provider arguments. For Claude sessions, provider identity/resume flags such as `--session-id`, `--resume`/`-r`,
 `--continue`/`-c`, `--fork-session`, and `--from-pr` are reserved for agent-session so the stored resume identity stays exact.

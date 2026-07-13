@@ -3157,13 +3157,15 @@ fn start_creates_session_state_without_printing_prompt() {
         calls.iter().any(|call| call
             == &vec![
                 "paste-buffer".to_string(),
+                "-p".to_string(),
+                "-r".to_string(),
                 "-b".to_string(),
                 format!("{id}-prompt"),
                 "-d".to_string(),
                 "-t".to_string(),
                 format!("{}:0.0", result["tmux_session"].as_str().unwrap()),
             ]),
-        "missing paste-buffer -d call: {calls:?}"
+        "missing raw bracketed paste-buffer call: {calls:?}"
     );
 }
 
@@ -6223,15 +6225,17 @@ fn send_delivers_text_and_keys_without_leaking_and_bumps_updated_at() {
     assert!(
         calls.iter().any(|call| {
             call.first().is_some_and(|arg| arg == "paste-buffer")
-                && call.get(1).is_some_and(|arg| arg == "-b")
+                && call.get(1).is_some_and(|arg| arg == "-p")
+                && call.get(2).is_some_and(|arg| arg == "-r")
+                && call.get(3).is_some_and(|arg| arg == "-b")
                 && call
-                    .get(2)
+                    .get(4)
                     .is_some_and(|arg| arg.starts_with("steer-send-"))
-                && call.get(3).is_some_and(|arg| arg == "-d")
-                && call.get(4).is_some_and(|arg| arg == "-t")
-                && call.get(5).is_some_and(|arg| arg == "hs-codex-steer:0.0")
+                && call.get(5).is_some_and(|arg| arg == "-d")
+                && call.get(6).is_some_and(|arg| arg == "-t")
+                && call.get(7).is_some_and(|arg| arg == "hs-codex-steer:0.0")
         }),
-        "missing unique paste-buffer -d call: {calls:?}"
+        "missing raw bracketed unique paste-buffer call: {calls:?}"
     );
     assert!(
         calls.iter().any(|call| call
