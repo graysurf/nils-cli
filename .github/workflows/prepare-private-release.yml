@@ -57,7 +57,7 @@ jobs:
           set -euo pipefail
           base_sha="$GITHUB_SHA"
 
-          cargo build --locked -p semantic-commit -p nils-git-scope
+          cargo build --locked -p nils-semantic-commit -p nils-git-scope
           export PATH="$PWD/target/debug:$PATH"
           git config user.name "release-preparation[bot]"
           git config user.email "release-preparation[bot]@users.noreply.github.com"
