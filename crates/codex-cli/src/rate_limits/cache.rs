@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use nils_common::fs as shared_fs;
+use nils_common::usage_cache_policy;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -19,10 +20,6 @@ pub struct CacheEntry {
 }
 
 const DEFAULT_CACHE_TTL_SECONDS: u64 = 180;
-const MAX_CACHE_DISPLAY_AGE_SECONDS: i64 = 600;
-// Tolerate only small provider/local clock skew. A materially future fetched_at
-// must fail closed or it could keep old quota values eligible indefinitely.
-const MAX_FUTURE_CLOCK_SKEW_SECONDS: i64 = 5;
 const CACHE_MISS_HINT: &str =
     "rerun without --cached to refresh, or set CODEX_RATE_LIMITS_CACHE_ALLOW_STALE=true";
 
@@ -175,16 +172,10 @@ pub fn cache_fetched_at_within_display_age(fetched_at_epoch: Option<i64>) -> boo
 }
 
 fn cache_fetched_at_within_display_age_at(fetched_at_epoch: Option<i64>, now_epoch: i64) -> bool {
-    let Some(fetched_at_epoch) = fetched_at_epoch.filter(|value| *value > 0) else {
-        return false;
-    };
-    if now_epoch <= 0 {
-        return false;
-    }
-    if fetched_at_epoch > now_epoch {
-        return fetched_at_epoch.saturating_sub(now_epoch) <= MAX_FUTURE_CLOCK_SKEW_SECONDS;
-    }
-    now_epoch.saturating_sub(fetched_at_epoch) < MAX_CACHE_DISPLAY_AGE_SECONDS
+    let age_seconds = fetched_at_epoch
+        .filter(|value| *value > 0 && now_epoch > 0)
+        .map(|value| now_epoch.saturating_sub(value));
+    usage_cache_policy::classify_display_age_seconds(age_seconds).is_display_eligible()
 }
 
 fn cache_entry_is_stale(entry: &CacheEntry) -> bool {
@@ -283,7 +274,7 @@ fn ensure_cache_within_display_age(target_file: &Path, entry: &CacheEntry) -> Re
     let cache_file = cache_file_for_target(target_file)?;
     anyhow::bail!(
         "codex-rate-limits: cache exceeds maximum display age (max={}s): {}",
-        MAX_CACHE_DISPLAY_AGE_SECONDS,
+        usage_cache_policy::MAX_DISPLAY_AGE_SECONDS,
         cache_file.display()
     )
 }
@@ -774,6 +765,13 @@ mod tests {
     fn cache_display_future_clock_tolerance_ends_after_5_seconds() {
         assert!(cache_fetched_at_within_display_age_at(Some(1_005), 1_000));
         assert!(!cache_fetched_at_within_display_age_at(Some(1_006), 1_000));
+    }
+
+    #[test]
+    fn cache_display_rejects_missing_or_invalid_timestamps() {
+        assert!(!cache_fetched_at_within_display_age_at(None, 1_000));
+        assert!(!cache_fetched_at_within_display_age_at(Some(0), 1_000));
+        assert!(!cache_fetched_at_within_display_age_at(Some(1_000), 0));
     }
 
     #[test]

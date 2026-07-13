@@ -295,6 +295,8 @@ impl PromptSegmentStatusResult {
             "access-token-missing"
         } else if !auth_status.prompt_segment_authenticated {
             auth_status.reason.as_str()
+        } else if would_render && cache_stale {
+            "cache-stale"
         } else if would_render {
             "ready"
         } else if !cache_exists {

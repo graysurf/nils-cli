@@ -1,14 +1,11 @@
 use anyhow::{Context, Result};
 use nils_common::env as shared_env;
 use nils_common::fs as shared_fs;
+use nils_common::usage_cache_policy;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 const CACHE_FILE_NAME: &str = "usage.json";
-const MAX_CACHE_DISPLAY_AGE_SECONDS: u64 = 600;
-// Tolerate only small filesystem/server clock skew. A materially future mtime
-// must fail closed or it could keep old quota values eligible indefinitely.
-const MAX_FUTURE_CLOCK_SKEW: Duration = Duration::from_secs(5);
 
 pub fn cache_file() -> Option<PathBuf> {
     let dir = cache_dir()?;
@@ -48,11 +45,20 @@ fn cache_display_expired_at(path: &Path, now: SystemTime) -> bool {
         Ok(value) => value,
         Err(_) => return true,
     };
-    if let Ok(ahead) = modified.duration_since(now) {
-        return ahead > MAX_FUTURE_CLOCK_SKEW;
+    !usage_cache_policy::classify_display_age_seconds(signed_age_seconds(now, modified))
+        .is_display_eligible()
+}
+
+fn signed_age_seconds(now: SystemTime, modified: SystemTime) -> Option<i64> {
+    match now.duration_since(modified) {
+        Ok(age) => i64::try_from(age.as_secs()).ok(),
+        Err(_) => {
+            let ahead = modified.duration_since(now).ok()?;
+            let whole_seconds = i64::try_from(ahead.as_secs()).ok()?;
+            let rounded_seconds = whole_seconds.checked_add(i64::from(ahead.subsec_nanos() > 0))?;
+            rounded_seconds.checked_neg()
+        }
     }
-    let age = now.duration_since(modified).unwrap_or_default();
-    age.as_secs() >= MAX_CACHE_DISPLAY_AGE_SECONDS
 }
 
 fn cache_dir() -> Option<PathBuf> {
@@ -76,7 +82,8 @@ fn cache_dir() -> Option<PathBuf> {
 
 #[cfg(test)]
 mod tests {
-    use super::{cache_display_expired_at, cache_stale};
+    use super::{cache_display_expired_at, cache_stale, signed_age_seconds};
+    use pretty_assertions::assert_eq;
     use std::fs::File;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -135,5 +142,19 @@ mod tests {
         file.set_modified(now + Duration::from_secs(6))
             .expect("set modified beyond tolerance");
         assert!(cache_display_expired_at(&path, now));
+    }
+
+    #[test]
+    fn cache_display_future_age_conversion_rounds_away_from_zero() {
+        let now = UNIX_EPOCH + Duration::from_secs(1_000);
+
+        assert_eq!(
+            signed_age_seconds(now, now + Duration::from_secs(5)),
+            Some(-5)
+        );
+        assert_eq!(
+            signed_age_seconds(now, now + Duration::from_secs(5) + Duration::from_nanos(1)),
+            Some(-6)
+        );
     }
 }
