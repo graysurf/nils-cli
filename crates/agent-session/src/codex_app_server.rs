@@ -459,6 +459,7 @@ impl ManualInputMarker {
             .filter(|file| lock_file_timed(file, timeout));
         if let Some(gate) = gate {
             self.remove_if_owned();
+            self.remove_ack_path();
             release_lifecycle_lock();
             unlock_bootstrap_file(&gate);
         } else {
@@ -466,12 +467,16 @@ impl ManualInputMarker {
             // fails, dropping this marker releases the continuously held owner
             // lease, so stale bytes cannot authorize a future Busy result.
             self.remove_if_owned();
+            self.remove_ack_path();
             release_lifecycle_lock();
         }
+        self.cleanup_on_drop = false;
+    }
+
+    fn remove_ack_path(&mut self) {
         if let Some(path) = self.ack_path.take() {
             let _ = fs::remove_file(path);
         }
-        self.cleanup_on_drop = false;
     }
 
     fn remove_if_owned(&mut self) {
@@ -488,9 +493,7 @@ impl Drop for ManualInputMarker {
         if self.cleanup_on_drop {
             self.remove_if_owned();
         }
-        if let Some(path) = self.ack_path.take() {
-            let _ = fs::remove_file(path);
-        }
+        self.remove_ack_path();
     }
 }
 
