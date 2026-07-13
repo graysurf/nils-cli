@@ -405,6 +405,14 @@ session_id=$7
 agent=$8
 cwd=$9
 shift 9
+startup_dir="$state_dir/sessions/$session_id"
+startup_stage="$startup_dir/.startup-stage"
+startup_failure="$startup_dir/.startup-failure"
+write_startup_marker() {
+  (umask 077; printf '%s\n' "$2" > "$1") 2>/dev/null || true
+}
+rm -f -- "$startup_failure"
+write_startup_marker "$startup_stage" app_server
 rm -f -- "$socket" "$proxy" "$attached"
 "$agent" app-server --listen "unix://$socket" </dev/null >/dev/null 2>&1 &
 server=$!
@@ -422,28 +430,43 @@ trap cleanup EXIT HUP INT TERM
 i=0
 while [ ! -S "$socket" ]; do
   if ! kill -0 "$server" 2>/dev/null; then
+    write_startup_marker "$startup_failure" app-server-start-failed
     exit 1
   fi
   i=$((i + 1))
   if [ "$i" -ge 100 ]; then
+    write_startup_marker "$startup_failure" startup-timeout
     exit 1
   fi
   sleep 0.05
 done
+write_startup_marker "$startup_stage" proxy
 (umask 077; "$proxy_bin" --state-dir "$state_dir" codex-app-server-proxy --id "$session_id" --upstream "$socket" --listen "$proxy" </dev/null >/dev/null 2>&1) &
 proxy_pid=$!
 i=0
 while [ ! -S "$proxy" ]; do
   if ! kill -0 "$proxy_pid" 2>/dev/null; then
+    if [ ! -x "$proxy_bin" ]; then
+      write_startup_marker "$startup_failure" runtime-helper-unavailable
+    else
+      write_startup_marker "$startup_failure" proxy-start-failed
+    fi
     exit 1
   fi
   i=$((i + 1))
   if [ "$i" -ge 100 ]; then
+    write_startup_marker "$startup_failure" startup-timeout
     exit 1
   fi
   sleep 0.05
 done
+write_startup_marker "$startup_stage" provider_client
 "$agent" --remote "unix://$proxy" --cd "$cwd" --no-alt-screen "$@"
+status=$?
+if [ "$(cat "$startup_stage" 2>/dev/null)" != initial_connection ]; then
+  write_startup_marker "$startup_failure" provider-client-exited
+fi
+exit "$status"
 "#
 }
 
@@ -2549,6 +2572,10 @@ async fn run_proxy_session(
     .map_err(|err| format!("upstream app-server handshake failed: {err}"))?;
     let _capability = begin_proxy_capability(&context, &record)
         .map_err(|err| format!("failed to advertise proxy capability: {}", err.code()))?;
+    let _ = crate::write_private_file(
+        &crate::session_dir(&context, &record.id).join(crate::STARTUP_STAGE_FILE),
+        b"initial_connection\n",
+    );
     let mut projection = ProxyProjection::new(context.clone(), record.clone());
     let mut bootstrap = FreshBootstrap::for_runtime(&context, &record);
     let result = async {
@@ -3143,9 +3170,15 @@ exit 1
         assert!(script.contains("\"$agent\" --remote \"unix://$proxy\""));
         assert!(!script.contains("--remote \"unix://$socket\""));
         assert!(!script.contains("thread/shellCommand"));
+        assert!(script.contains(".startup-stage"));
+        assert!(script.contains(".startup-failure"));
+        assert!(script.contains("runtime-helper-unavailable"));
+        assert!(script.contains("provider-client-exited"));
+        assert!(script.contains("!= initial_connection"));
+        assert!(script.contains(">/dev/null 2>&1"));
         let cleanup_lines = script
             .lines()
-            .filter(|line| line.trim_start().starts_with("rm -f --"))
+            .filter(|line| line.trim_start().starts_with("rm -f --") && line.contains("$socket"))
             .collect::<Vec<_>>();
         assert!(!cleanup_lines[0].contains("$handoff"));
         assert!(cleanup_lines[1].contains("$handoff"));

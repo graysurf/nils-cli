@@ -3678,7 +3678,7 @@ fn run_and_logs_cover_json_contract_and_file_fallback() {
 }
 
 #[test]
-fn failure_paths_return_json_without_leaking_prompt_or_orphaning_state() {
+fn failure_paths_return_json_without_leaking_prompt_and_classify_durable_startup() {
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let state_dir = tmp.path().join("state");
     let cwd = tmp.path().join("repo");
@@ -3726,15 +3726,22 @@ fn failure_paths_return_json_without_leaking_prompt_or_orphaning_state() {
         ],
         &env_refs,
     );
-    assert_eq!(output.code, 1, "stderr={}", output.stderr_text());
+    assert_eq!(output.code, 0, "stderr={}", output.stderr_text());
     assert_no_secret(&output, secret);
     let value = output.stdout_json();
     assert_eq!(value["schema_version"], "cli.agent-session.start.v1");
-    assert_eq!(value["ok"], false);
-    assert_eq!(value["error"]["code"], "command-failed");
+    assert_eq!(value["ok"], true);
+    let failed = data(&value);
+    assert_eq!(failed["status"], "stopped");
+    assert_eq!(failed["startup"]["state"], "failed");
+    assert_eq!(failed["startup"]["stage"], "tmux");
+    assert_eq!(
+        failed["startup"]["failure_code"],
+        "terminal-runtime-create-failed"
+    );
     assert!(
-        !state_dir.join("sessions").join("fail-start").exists(),
-        "failed tmux startup should not leave session state"
+        state_dir.join("sessions").join("fail-start").exists(),
+        "post-record tmux failure should remain a durable stopped session"
     );
 
     let envs = [

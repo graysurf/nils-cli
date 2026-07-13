@@ -8766,6 +8766,206 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn deleted_runtime_helper_returns_a_durable_safe_startup_failure() {
+        let lock = GlobalStateLock::new();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cwd = tmp.path().join("repo");
+        let runtime_dir = tempfile::Builder::new()
+            .prefix("cx-")
+            .tempdir_in("/tmp")
+            .unwrap();
+        fs::set_permissions(runtime_dir.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        fs::create_dir(&cwd).unwrap();
+        let codex = executable(
+            &tmp.path().join("codex-app-server"),
+            "#!/usr/bin/env sh\nif [ \"$1\" = --version ]; then printf '%s\\n' 'codex-cli 0.144.1'; exit 0; fi\nif [ \"$1\" = app-server ] && [ \"$2\" = --help ]; then printf '%s\\n' '  --listen <URL>  unix://'; exit 0; fi\nexit 1\n",
+        );
+        let missing_helper = tmp.path().join("token-secret-deleted-agent-session");
+        let _codex_bin = EnvGuard::set(&lock, "AGENT_SESSION_CODEX_BIN", codex.to_str().unwrap());
+        let _runtime_dir = EnvGuard::set(
+            &lock,
+            "XDG_RUNTIME_DIR",
+            runtime_dir.path().to_str().unwrap(),
+        );
+        let _runtime_mode = EnvGuard::set(&lock, "AGENT_SESSION_CODEX_RUNTIME", "app-server");
+        let _runtime_helper = EnvGuard::set(
+            &lock,
+            "AGENT_SESSION_TEST_RUNTIME_HELPER",
+            missing_helper.to_str().unwrap(),
+        );
+        let _capture_timeout = EnvGuard::set(&lock, "AGENT_SESSION_CODEX_CAPTURE_TIMEOUT_MS", "10");
+        let log = tmp.path().join("tmux.log");
+        let st = state(tmp.path(), Some(TOKEN), logging_tmux(tmp.path(), &log));
+
+        let (create_status, create_body) = call(
+            router(st.clone()),
+            post_json(
+                "/sessions",
+                Some(TOKEN),
+                json!({
+                    "agent": "codex",
+                    "id": "deleted-helper",
+                    "cwd": cwd.to_string_lossy()
+                }),
+            ),
+        )
+        .await;
+
+        assert_eq!(create_status, StatusCode::OK, "body={create_body}");
+        let session = &create_body["data"]["session"];
+        assert_eq!(session["status"], "stopped");
+        assert_eq!(session["startup"]["state"], "failed");
+        assert_eq!(session["startup"]["stage"], "proxy");
+        assert_eq!(
+            session["startup"]["failure_code"],
+            "runtime-helper-unavailable"
+        );
+        assert_eq!(
+            session["startup"]["message"],
+            "Session runtime helper is unavailable after an upgrade."
+        );
+        assert!(!create_body.to_string().contains("token-secret"));
+        assert!(!log.exists() || fs::read_to_string(&log).unwrap().is_empty());
+
+        let record_path = tmp.path().join("sessions/deleted-helper/session.json");
+        let record: Value = serde_json::from_slice(&fs::read(&record_path).unwrap()).unwrap();
+        assert_eq!(record["startup"], session["startup"]);
+        let (list_status, list_body) = call(router(st.clone()), get("/sessions")).await;
+        assert_eq!(list_status, StatusCode::OK, "body={list_body}");
+        assert_eq!(
+            list_body["data"]["sessions"][0]["startup"],
+            session["startup"]
+        );
+        let (glance_status, glance_body) =
+            call(router(st), get("/sessions/deleted-helper/glance")).await;
+        assert_eq!(glance_status, StatusCode::OK, "body={glance_body}");
+        assert_eq!(glance_body["data"]["glance"]["startup"], session["startup"]);
+    }
+
+    #[tokio::test]
+    async fn stale_proxy_helper_failure_is_durable_in_list_and_glance() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let id = "stale-helper";
+        seed_codex_app_server_session(tmp.path(), id);
+        let session_dir = tmp.path().join("sessions").join(id);
+        let record_path = session_dir.join("session.json");
+        let mut record: Value =
+            serde_json::from_slice(&std::fs::read(&record_path).unwrap()).unwrap();
+        record["startup"] = json!({
+            "schema_version": "agent-session.startup.v1",
+            "state": "starting",
+            "stage": "proxy",
+            "started_at": "2000-01-01T00:00:00Z"
+        });
+        std::fs::write(&record_path, serde_json::to_vec_pretty(&record).unwrap()).unwrap();
+        std::fs::write(
+            session_dir.join(".startup-failure"),
+            "runtime-helper-unavailable\n",
+        )
+        .unwrap();
+        let stopped_tmux = executable(
+            &tmp.path().join("tmux-stopped"),
+            "#!/usr/bin/env sh\n[ \"$1\" = has-session ] && exit 1\nexit 0\n",
+        );
+        let st = state(tmp.path(), Some(TOKEN), stopped_tmux);
+
+        let (list_status, list_body) = call(router(st.clone()), get("/sessions")).await;
+        assert_eq!(list_status, StatusCode::OK, "body={list_body}");
+        let startup = &list_body["data"]["sessions"][0]["startup"];
+        assert_eq!(startup["schema_version"], "agent-session.startup.v1");
+        assert_eq!(startup["state"], "failed");
+        assert_eq!(startup["stage"], "proxy");
+        assert_eq!(startup["failure_code"], "runtime-helper-unavailable");
+        assert_eq!(
+            startup["message"],
+            "Session runtime helper is unavailable after an upgrade."
+        );
+        assert_eq!(startup["retry_safe"], true);
+        assert!(startup["occurred_at"].is_string());
+
+        std::fs::remove_file(session_dir.join(".startup-failure")).unwrap();
+        let persisted: Value =
+            serde_json::from_slice(&std::fs::read(&record_path).unwrap()).unwrap();
+        assert_eq!(persisted["startup"], *startup);
+
+        let (glance_status, glance_body) =
+            call(router(st), get("/sessions/stale-helper/glance")).await;
+        assert_eq!(glance_status, StatusCode::OK, "body={glance_body}");
+        assert_eq!(glance_body["data"]["glance"]["startup"], *startup);
+    }
+
+    #[tokio::test]
+    async fn running_session_startup_becomes_ready_and_stays_ready_after_stop() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let id = "startup-ready";
+        seed_session_with_runtime(tmp.path(), id, "claude", "hs-claude-startup-ready");
+        let record_path = tmp.path().join("sessions/startup-ready/session.json");
+        let mut record: Value =
+            serde_json::from_slice(&std::fs::read(&record_path).unwrap()).unwrap();
+        record["startup"] = json!({
+            "schema_version": "agent-session.startup.v1",
+            "state": "starting",
+            "stage": "runtime",
+            "started_at": "2000-01-01T00:00:00Z"
+        });
+        std::fs::write(&record_path, serde_json::to_vec_pretty(&record).unwrap()).unwrap();
+        let running_tmux = executable(
+            &tmp.path().join("tmux-running-startup"),
+            "#!/usr/bin/env sh\ncase \"$1\" in\n  list-windows) printf 'hs-claude-startup-ready\\t100\\n'; exit 0 ;;\n  has-session) exit 0 ;;\n  capture-pane) printf 'pane\\n'; exit 0 ;;\n  *) exit 0 ;;\nesac\n",
+        );
+        let running = state(tmp.path(), Some(TOKEN), running_tmux);
+
+        let (list_status, list_body) = call(router(running), get("/sessions")).await;
+        assert_eq!(list_status, StatusCode::OK, "body={list_body}");
+        let startup = &list_body["data"]["sessions"][0]["startup"];
+        assert_eq!(startup["state"], "ready");
+        assert_eq!(startup["stage"], "initial_connection");
+        assert!(startup.get("failure_code").is_none());
+
+        let stopped_tmux = executable(
+            &tmp.path().join("tmux-stopped-after-ready"),
+            "#!/usr/bin/env sh\n[ \"$1\" = has-session ] && exit 1\nexit 0\n",
+        );
+        let stopped = state(tmp.path(), Some(TOKEN), stopped_tmux);
+        let (glance_status, glance_body) =
+            call(router(stopped), get("/sessions/startup-ready/glance")).await;
+        assert_eq!(glance_status, StatusCode::OK, "body={glance_body}");
+        assert_eq!(glance_body["data"]["glance"]["status"], "stopped");
+        assert_eq!(glance_body["data"]["glance"]["startup"], *startup);
+    }
+
+    #[tokio::test]
+    async fn established_connection_is_ready_without_an_intermediate_observer() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let id = "startup-ready-before-poll";
+        seed_codex_app_server_session(tmp.path(), id);
+        let session_dir = tmp.path().join("sessions").join(id);
+        let record_path = session_dir.join("session.json");
+        let mut record: Value =
+            serde_json::from_slice(&std::fs::read(&record_path).unwrap()).unwrap();
+        record["startup"] = json!({
+            "schema_version": "agent-session.startup.v1",
+            "state": "starting",
+            "stage": "provider_client",
+            "started_at": "2000-01-01T00:00:00Z"
+        });
+        std::fs::write(&record_path, serde_json::to_vec_pretty(&record).unwrap()).unwrap();
+        std::fs::write(session_dir.join(".startup-stage"), "initial_connection\n").unwrap();
+        let stopped_tmux = executable(
+            &tmp.path().join("tmux-stopped-after-connect"),
+            "#!/usr/bin/env sh\n[ \"$1\" = has-session ] && exit 1\nexit 0\n",
+        );
+        let st = state(tmp.path(), Some(TOKEN), stopped_tmux);
+
+        let (list_status, list_body) = call(router(st), get("/sessions")).await;
+        assert_eq!(list_status, StatusCode::OK, "body={list_body}");
+        let startup = &list_body["data"]["sessions"][0]["startup"];
+        assert_eq!(startup["state"], "ready");
+        assert_eq!(startup["stage"], "initial_connection");
+        assert!(startup.get("failure_code").is_none());
+    }
+
+    #[tokio::test]
     async fn serve_created_capable_codex_session_projects_supported_app_server_runtime() {
         let lock = GlobalStateLock::new();
         let tmp = tempfile::TempDir::new().unwrap();
@@ -8808,10 +9008,18 @@ mod tests {
         assert_eq!(status, StatusCode::OK, "body={body}");
         let session = &body["data"]["session"];
         assert_eq!(session["auto_resume"]["supported"], true);
+        assert_eq!(
+            session["startup"]["schema_version"],
+            "agent-session.startup.v1"
+        );
+        assert_eq!(session["startup"]["state"], "starting");
+        assert_eq!(session["startup"]["stage"], "runtime");
+        assert!(session["startup"]["started_at"].is_string());
         let record: Value = serde_json::from_slice(
             &fs::read(tmp.path().join("sessions/managed-codex/session.json")).unwrap(),
         )
         .unwrap();
+        assert_eq!(record["startup"], session["startup"]);
         assert_eq!(record["runtime"]["kind"], codex_app_server::RUNTIME_KIND);
         assert_eq!(
             record["runtime"]["codex_app_server_protocol"],
@@ -10903,6 +11111,7 @@ mod tests {
         assert_eq!(body["schema_version"], "cli.agent-session.serve.v1");
         assert_eq!(body["data"]["machine"], MACHINE);
         assert!(body["data"]["glance"].is_object());
+        assert!(body["data"]["glance"].get("startup").is_none());
     }
 
     #[tokio::test]
