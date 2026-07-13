@@ -51,7 +51,7 @@ const FULL_PR_VIEW_JSON: &str = r#"{
 
 /// Same as [`FULL_PR_VIEW_JSON`] plus a `body` whose description still
 /// carries an unchecked GFM task-list item, used to exercise merge
-/// lock-down rule 13 on the GitHub path (`extract_body` reads `body`).
+/// lock-down rule 14 on the GitHub path (`extract_body` reads `body`).
 const UNCHECKED_TASKS_PR_VIEW_JSON: &str = r###"{
   "number": 123,
   "url": "https://github.com/sympoies/nils-cli/pull/123",
@@ -499,6 +499,7 @@ fn write_chain_stub_with_check_transition(
     let sentinel = stub.tempdir.path().join("merge-called");
     let merge_args = stub.tempdir.path().join("merge-args");
     let checks_calls = stub.tempdir.path().join("checks-calls");
+    let review_response = stub.tempdir.path().join("review-response.json");
     let merge_branch = if merge_exits_one {
         format!(
             "    echo \"$*\" > {merge_args}\n    touch {sentinel}\n    echo 'X stderr warning after merge' >&2\n    exit 1\n",
@@ -583,10 +584,21 @@ EOF
     :
     ;;
   "api graphql")
-    # Merge lock-down rule 12 — review-thread sweep; all resolved.
-    cat <<'EOF'
+    case "$*" in
+      *"reviews(first:"*)
+        if [ ! -f {review_response} ]; then
+          echo "stub: unexpected native-review query" >&2
+          exit 99
+        fi
+        cat {review_response}
+        ;;
+      *)
+        # Merge lock-down review-thread sweep; all resolved.
+        cat <<'EOF'
 {{ "data": {{ "repository": {{ "pullRequest": {{ "reviewThreads": {{ "nodes": [] }} }} }} }} }}
 EOF
+        ;;
+    esac
     ;;
   "pr merge")
 {merge_branch}
@@ -626,6 +638,7 @@ esac
         all_checks_branch = all_checks_branch,
         required_checks = required_checks,
         checks_calls = checks_calls.display(),
+        review_response = review_response.display(),
         merge_branch = merge_branch,
         sentinel = sentinel.display(),
     );
@@ -1345,6 +1358,60 @@ fn pr_deliver_full_chain_emits_all_seven_steps_with_merge_sha() {
 }
 
 #[test]
+fn pr_deliver_enforces_review_convergence_and_preserves_error_detail() {
+    let repo_tmp = make_git_repo();
+    let repo_path = repo_tmp.path().join("repo");
+    let stub = StubEnv::new();
+    fs::write(
+        stub.tempdir.path().join("review-response.json"),
+        r#"{"data":{"repository":{"pullRequest":{"headRefOid":"head123","reviews":{"nodes":[{"id":"PRR_blocking","databaseId":9,"url":"https://github.com/sympoies/nils-cli/pull/123#pullrequestreview-9","author":{"login":"blocking-reviewer"},"state":"CHANGES_REQUESTED","commit":{"oid":"head123"},"submittedAt":"2026-07-14T04:00:00Z","body":"changes requested"}],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}}}"#,
+    )
+    .expect("review response");
+    let pre_view = view_with_head_oid(FULL_PR_VIEW_JSON, "head123");
+    let post_view = view_with_head_oid(MERGED_PR_VIEW_JSON, "head123");
+    let gh_path = write_chain_stub(&stub, &pre_view, &post_view, false);
+    let stub = stub.env("FORGE_CLI_GH_BIN", gh_path.to_string_lossy());
+    let out = run_in_repo(
+        &stub,
+        &repo_path,
+        &[
+            "--provider",
+            "github",
+            "--format",
+            "json",
+            "pr",
+            "deliver",
+            "--kind",
+            "feature",
+            "--title",
+            "feat: review convergence",
+            "--body",
+            "## Summary\n\nReview.\n\n## Test plan\n\nVerified.\n",
+            "--head",
+            "feat/sample",
+            "--base",
+            "main",
+            "--review-convergence",
+            "--timeout",
+            "5s",
+        ],
+    );
+
+    assert_eq!(out.code, 65, "stdout={}\nstderr={}", out.stdout, out.stderr);
+    let envelope = parse_envelope(&out.stdout);
+    assert_eq!(envelope["error"]["code"], "review_changes_requested");
+    assert!(
+        envelope["error"]["details"]["detail"]
+            .as_str()
+            .is_some_and(|detail| detail.contains("blocking-reviewer"))
+    );
+    assert!(
+        !stub.tempdir.path().join("merge-called").exists(),
+        "blocking review must prevent provider merge"
+    );
+}
+
+#[test]
 fn pr_deliver_gate_enabled_create_preserves_attested_head_through_merge_cas() {
     let (fixture, evidence, head) = make_subject_bound_git_repo();
     let repo_path = fixture.repo.clone();
@@ -1461,6 +1528,7 @@ fn local_deliver_args(evidence: &Path) -> PrDeliverArgs {
         no_issue_closeout: false,
         allow_non_default_base: false,
         allow_unresolved_threads: false,
+        review_convergence: None,
         allow_unchecked_tasks: false,
         allow_unchecked_tasks_reason: None,
     }
@@ -1617,7 +1685,7 @@ fn pr_deliver_short_circuits_when_pr_create_validation_fails_with_data_65() {
 
 #[test]
 fn pr_deliver_github_merge_step_blocks_on_unchecked_task_items() {
-    // Merge lock-down rule 13 on the GitHub path: the merge step parses the
+    // Merge lock-down rule 14 on the GitHub path: the merge step parses the
     // PR body fetched via `pr view --json …,body` and must fail closed with
     // unchecked_task_items before the backend `pr merge` call runs.
     let tempdir = make_git_repo();

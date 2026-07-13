@@ -621,6 +621,16 @@ pub struct PrMergeArgs {
     /// unresolved thread (bot or human) triggers `unresolved_review_threads`.
     #[arg(long = "allow-unresolved-threads", action = ArgAction::SetTrue)]
     pub allow_unresolved_threads: bool,
+    /// Override `[review_convergence].require`. Passing the flag without a
+    /// value enables it; use `--review-convergence=false` to disable a repo or
+    /// user-global opt-in for this invocation.
+    #[arg(
+        long = "review-convergence",
+        action = ArgAction::Set,
+        num_args = 0..=1,
+        default_missing_value = "true"
+    )]
+    pub review_convergence: Option<bool>,
     /// Merge despite unchecked task-list items in the PR/MR description.
     /// Without this flag, any unchecked `- [ ]` item triggers
     /// `unchecked_task_items`. Requires `--allow-unchecked-tasks-reason`.
@@ -640,6 +650,13 @@ pub struct PrMergeArgs {
         value_parser = clap::builder::NonEmptyStringValueParser::new()
     )]
     pub allow_unchecked_tasks_reason: Option<String>,
+}
+
+/// Native provider review summaries for one pull request.
+#[derive(Args, Debug, Clone)]
+pub struct PrReviewsArgs {
+    /// Numeric pull request id.
+    pub id: u64,
 }
 
 /// CLI-facing merge method enum so clap can render `--method squash|merge|rebase`
@@ -720,8 +737,16 @@ pub(crate) fn parse_duration(s: &str) -> Result<Duration, String> {
     let dur = match unit {
         "" | "s" => Duration::from_secs(value),
         "ms" => Duration::from_millis(value),
-        "m" => Duration::from_secs(value * 60),
-        "h" => Duration::from_secs(value * 3600),
+        "m" => Duration::from_secs(
+            value
+                .checked_mul(60)
+                .ok_or_else(|| format!("duration overflows in {s:?}"))?,
+        ),
+        "h" => Duration::from_secs(
+            value
+                .checked_mul(3600)
+                .ok_or_else(|| format!("duration overflows in {s:?}"))?,
+        ),
         other => return Err(format!("unknown duration unit {other:?} in {s:?}")),
     };
     Ok(dur)
@@ -816,6 +841,8 @@ pub enum PrCommand {
     Ready(PrReadyArgs),
     /// List review threads attached to a PR / MR with their resolved state.
     ReviewThreads(PrReviewThreadsArgs),
+    /// List native review summaries, classified against the current head.
+    Reviews(PrReviewsArgs),
     /// List GFM task-list items in the PR / MR description with their state.
     Tasks(PrTasksArgs),
     /// Merge a ready PR / MR.
@@ -945,6 +972,16 @@ pub struct PrDeliverArgs {
     /// at the merge step.
     #[arg(long = "allow-unresolved-threads", action = ArgAction::SetTrue)]
     pub allow_unresolved_threads: bool,
+    /// Override `[review_convergence].require` for the merge phase. Passing
+    /// the flag without a value enables it; `--review-convergence=false`
+    /// disables a configured opt-in for this invocation.
+    #[arg(
+        long = "review-convergence",
+        action = ArgAction::Set,
+        num_args = 0..=1,
+        default_missing_value = "true"
+    )]
+    pub review_convergence: Option<bool>,
     /// Merge despite unchecked task-list items in the PR/MR description.
     /// Without this flag, any unchecked `- [ ]` item triggers
     /// `unchecked_task_items` at the merge step. Requires
@@ -1436,6 +1473,9 @@ pub fn dispatch(args: Vec<OsString>) -> i32 {
                 ops::pr_review_threads::run(&global, PrReviewThreadsListArgs { id }, format)
             }
         },
+        Some(Command::Pr(PrArgs {
+            command: Some(PrCommand::Reviews(args)),
+        })) => ops::pr_reviews::run(&global, args, format),
         Some(Command::Pr(PrArgs {
             command: Some(PrCommand::Tasks(args)),
         })) => ops::pr_tasks::run(&global, args, format),

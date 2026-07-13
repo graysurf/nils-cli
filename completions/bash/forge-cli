@@ -208,6 +208,9 @@ _forge-cli() {
             forge__cli__help__pr,review-threads)
                 cmd="forge__cli__help__pr__review__threads"
                 ;;
+            forge__cli__help__pr,reviews)
+                cmd="forge__cli__help__pr__reviews"
+                ;;
             forge__cli__help__pr,tasks)
                 cmd="forge__cli__help__pr__tasks"
                 ;;
@@ -376,6 +379,9 @@ _forge-cli() {
             forge__cli__pr,review-threads)
                 cmd="forge__cli__pr__review__threads"
                 ;;
+            forge__cli__pr,reviews)
+                cmd="forge__cli__pr__reviews"
+                ;;
             forge__cli__pr,tasks)
                 cmd="forge__cli__pr__tasks"
                 ;;
@@ -423,6 +429,9 @@ _forge-cli() {
                 ;;
             forge__cli__pr__help,review-threads)
                 cmd="forge__cli__pr__help__review__threads"
+                ;;
+            forge__cli__pr__help,reviews)
+                cmd="forge__cli__pr__help__reviews"
                 ;;
             forge__cli__pr__help,tasks)
                 cmd="forge__cli__pr__help__tasks"
@@ -1360,7 +1369,7 @@ _forge-cli() {
             return 0
             ;;
         forge__cli__help__pr)
-            opts="create view list edit comment review comments ready review-threads tasks merge close checks wait-checks deliver"
+            opts="create view list edit comment review comments ready review-threads reviews tasks merge close checks wait-checks deliver"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -1586,6 +1595,20 @@ _forge-cli() {
         forge__cli__help__pr__review__validate)
             opts=""
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 5 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        forge__cli__help__pr__reviews)
+            opts=""
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
             fi
@@ -2750,7 +2773,7 @@ _forge-cli() {
             return 0
             ;;
         forge__cli__pr)
-            opts="-h --format --remote --provider --repo --store-root --dry-run --help create view list edit comment review comments ready review-threads tasks merge close checks wait-checks deliver help"
+            opts="-h --format --remote --provider --repo --store-root --dry-run --help create view list edit comment review comments ready review-threads reviews tasks merge close checks wait-checks deliver help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -3006,7 +3029,7 @@ _forge-cli() {
             return 0
             ;;
         forge__cli__pr__deliver)
-            opts="-h --kind --title --body --body-file --head --base --method --reviewer --label --label-catalog --strict-labels --test-first-evidence --timeout --no-merge --no-issue-closeout --allow-non-default-base --allow-unresolved-threads --allow-unchecked-tasks --allow-unchecked-tasks-reason --format --remote --provider --repo --store-root --dry-run --help"
+            opts="-h --kind --title --body --body-file --head --base --method --reviewer --label --label-catalog --strict-labels --test-first-evidence --timeout --no-merge --no-issue-closeout --allow-non-default-base --allow-unresolved-threads --review-convergence --allow-unchecked-tasks --allow-unchecked-tasks-reason --format --remote --provider --repo --store-root --dry-run --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -3058,6 +3081,10 @@ _forge-cli() {
                     ;;
                 --timeout)
                     COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --review-convergence)
+                    COMPREPLY=($(compgen -W "true false" -- "${cur}"))
                     return 0
                     ;;
                 --allow-unchecked-tasks-reason)
@@ -3154,7 +3181,7 @@ _forge-cli() {
             return 0
             ;;
         forge__cli__pr__help)
-            opts="create view list edit comment review comments ready review-threads tasks merge close checks wait-checks deliver help"
+            opts="create view list edit comment review comments ready review-threads reviews tasks merge close checks wait-checks deliver help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -3405,6 +3432,20 @@ _forge-cli() {
             COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
             return 0
             ;;
+        forge__cli__pr__help__reviews)
+            opts=""
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
         forge__cli__pr__help__tasks)
             opts=""
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
@@ -3498,7 +3539,7 @@ _forge-cli() {
             return 0
             ;;
         forge__cli__pr__merge)
-            opts="-h --method --keep-branch --allow-non-default-base --allow-unresolved-threads --allow-unchecked-tasks --allow-unchecked-tasks-reason --format --remote --provider --repo --store-root --dry-run --help"
+            opts="-h --method --keep-branch --allow-non-default-base --allow-unresolved-threads --review-convergence --allow-unchecked-tasks --allow-unchecked-tasks-reason --format --remote --provider --repo --store-root --dry-run --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -3506,6 +3547,10 @@ _forge-cli() {
             case "${prev}" in
                 --method)
                     COMPREPLY=($(compgen -W "squash merge rebase" -- "${cur}"))
+                    return 0
+                    ;;
+                --review-convergence)
+                    COMPREPLY=($(compgen -W "true false" -- "${cur}"))
                     return 0
                     ;;
                 --allow-unchecked-tasks-reason)
@@ -3922,6 +3967,40 @@ _forge-cli() {
                     COMPREPLY=($(compgen -f "${cur}"))
                     return 0
                     ;;
+                --format)
+                    COMPREPLY=($(compgen -W "text json" -- "${cur}"))
+                    return 0
+                    ;;
+                --remote)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --provider)
+                    COMPREPLY=($(compgen -W "github gitlab local" -- "${cur}"))
+                    return 0
+                    ;;
+                --repo)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --store-root)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        forge__cli__pr__reviews)
+            opts="-h --format --remote --provider --repo --store-root --dry-run --help"
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
                 --format)
                     COMPREPLY=($(compgen -W "text json" -- "${cur}"))
                     return 0

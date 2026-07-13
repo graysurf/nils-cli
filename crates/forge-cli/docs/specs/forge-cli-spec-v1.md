@@ -54,7 +54,7 @@ In scope (v1):
   GitLab. It normalizes commit and repository/project event surfaces while
   preserving provider-specific event vocabulary.
 - PR/MR lifecycle: `create`, `view`, `list`, `edit`, `comment`, `review`,
-  `ready`, `merge`, `close`.
+  native `reviews` read, `ready`, `merge`, `close`.
 - PR/MR checks: `pr checks` (one-shot snapshot) and `pr wait-checks`
   (blocking poll until terminal).
 - Issue lifecycle: `issue create`, `view`, `edit`, `comment`, `close`,
@@ -121,6 +121,7 @@ Parity matrix (v1):
 | `pr review-threads list <id>`               | `gh api graphql` (`reviewThreads` connection)                                                                                                | `glab api …/merge_requests/<iid>/discussions`               | normalized thread state                                                                                                  |
 | `pr review-threads resolve <id> --thread …` | `gh api graphql` (`addPullRequestReviewThreadReply` then `resolveReviewThread`)                                                              | unsupported in v1                                           | GitHub-only seam                                                                                                         |
 | `pr review-threads reply <id> --thread …`   | `gh api graphql` (`addPullRequestReviewThreadReply`)                                                                                         | unsupported in v1                                           | GitHub-only seam                                                                                                         |
+| `pr reviews <id>`                           | `gh api graphql` (native `reviews` connection plus `headRefOid`)                                                                             | unsupported in v1                                           | GitHub-only normalized current-head/stale review snapshot                                                                |
 | `pr tasks <id>`                             | `gh pr view <id> --json number,url,body`                                                                                                     | `glab mr view <id> -F json` (`description`)                 | normalized task-list state                                                                                               |
 | `pr merge <id>`                             | `gh pr merge <id> --squash --delete-branch`                                                                                                  | `glab api --method PUT .../merge` after gates               | exact (method honoured per repo cfg)                                                                                     |
 | `pr close <id>`                             | `gh pr close <id>`                                                                                                                           | `glab mr close <id>`                                        | exact                                                                                                                    |
@@ -188,6 +189,7 @@ forge-cli
 │   │   ├── list
 │   │   ├── resolve
 │   │   └── reply
+│   ├── reviews
 │   ├── ready
 │   ├── merge
 │   ├── close
@@ -395,6 +397,28 @@ backend mapping, validation rules, and output schema versions.
   preliminary PR/MR view lookup or touching the provider network. It resolves
   the repo/project from `--repo` or the configured remote URL.
 
+### `pr reviews` (read)
+
+- `pr reviews <id>` emits `cli.forge-cli.pr.reviews.v1` and is GitHub-only in
+  v1. GitLab and local return `provider_unsupported` (`USAGE 64`) rather than
+  claiming an empty snapshot.
+- The operation reads the PR's `headRefOid` and all pages of native review
+  objects (100 nodes per page, with a 100-page safety limit), then
+  returns `data = { provider, number, url, head_sha, current_head_reviews,
+  stale_reviews }`. Each review includes `id`, `database_id`, `url`, `author`,
+  native `state`, `commit_sha`, `submitted_at`, `summary`, and
+  `summary_truncated`.
+- `summary` is evidence only and is bounded to 4096 UTF-8 bytes. The operation
+  does not parse natural-language review prose to derive a verdict. Reviews
+  whose `commit_sha` differs from `head_sha` remain visible under
+  `stale_reviews` but do not satisfy current-head policy.
+- `--dry-run` emits the planned GraphQL call. Repository resolution uses
+  `--repo owner/name` or a recognized forge remote.
+- GraphQL partial errors, missing required review/page fields, unknown native
+  states, cursor loops, a head change between pages, or the page safety limit
+  return `review_snapshot_incomplete` (`DATA 65`). The gate never treats a
+  partial native-review snapshot as empty.
+
 ### `pr review`
 
 - The `pr review <id>` posting surface emits
@@ -554,9 +578,13 @@ backend mapping, validation rules, and output schema versions.
     succeeded earlier — TTL-zero gate);
   - target branch is the repo default branch OR explicitly approved
     via `--allow-non-default-base`;
+  - when resolved review convergence is enabled, no current-head native
+    `CHANGES_REQUESTED`, and any already-observed configured bot activity has
+    stayed quiet for the resolved quiet period; the initial provider view must
+    also expose a non-empty head OID or the merge fails closed with
+    `review_convergence_head_missing`;
   - no unresolved review threads OR explicitly bypassed via
-    `--allow-unresolved-threads` (bot reviewers post asynchronously, so
-    this is re-checked at merge time — the last action);
+    `--allow-unresolved-threads`;
   - no unchecked task-list items in the description OR explicitly
     bypassed via `--allow-unchecked-tasks` with a recorded
     `--allow-unchecked-tasks-reason` (the description is the delivery
@@ -564,6 +592,15 @@ backend mapping, validation rules, and output schema versions.
     dispositioned before merge);
   - `--method squash|merge|rebase` (default `squash`, configurable
     per repo).
+- With convergence enabled, a complete native-review snapshot is fetched once
+  more after the thread/task gates and immediately before the provider merge.
+  A late request blocks; any other observed activity change returns
+  `review_convergence_activity_changed` so the caller can rerun convergence.
+- `--dry-run` validates the same enabled-policy provider contract as live
+  merge and includes the resolved policy in `data.review_convergence`. GitLab
+  therefore returns `provider_unsupported` before either path touches the
+  provider. `pr deliver --no-merge` remains exempt because it has no merge
+  convergence phase.
 - Post-merge: deletes the remote branch (default `true`, disable via
   `--keep-branch`). GitHub passes `--match-head-commit <head_sha>`;
   GitLab performs the merge mutation through
@@ -574,7 +611,12 @@ backend mapping, validation rules, and output schema versions.
   the merge, idempotent recovery succeeds only when the merged head still
   equals that same OID.
 - Output schema: `cli.forge-cli.pr.merge.v1`,
-  `data = { number, url, merge_sha, method, deleted_branch }`.
+  `data = { number, url, merge_sha, method, deleted_branch,
+  review_convergence? }`. The additive convergence snapshot contains
+  `required`, `head_sha`, `observed_reviews`, `stale_reviews`,
+  `unresolved_threads`, `changes_requested_by`, `missing_reviewers`,
+  `latest_activity_at`, `quiet_until`, `quiet_period_ms`, `timeout_ms`,
+  `waited_ms`, and the resolved `bots`. It is absent while the feature is off.
 
 ### `label audit` / `label ensure`
 
@@ -613,6 +655,7 @@ forge-cli pr deliver \
   [--label <name>...] \
   [--label-catalog <path> --strict-labels] \
   [--timeout <duration>] \
+  [--review-convergence[=<true|false>]] \
   [--no-merge]        # stop after wait-checks; useful in CI
 ```
 
@@ -646,7 +689,9 @@ label errors are returned before provider access in every mode.
    remaining timeout. Failed visible checks block delivery. A genuinely empty
    check set completes immediately. GitLab behavior is unchanged.
 6. `pr ready` — atom; only if previous step is `success`.
-7. `pr merge` — atom; honours `--method` and repo override.
+7. `pr merge` — atom; honours `--method`, repo override, and the same resolved
+   review-convergence policy as a direct merge. `--no-merge` performs no
+   convergence wait because the merge phase is skipped.
 8. Emit single envelope summarising every sub-step output under
    `data.steps[]` (`create` and `adopt` are mutually exclusive). The
    macro's own schema is `cli.forge-cli.pr.deliver.v1`.
@@ -714,14 +759,37 @@ backend implementations cannot diverge.
     `FORGE_CLI_ALLOW_LOCAL_PATH=1` to bypass a verified false positive. Enforced
     by `pr create`, `pr edit`, `issue create`, `issue edit`, `pr comment`,
     `pr review`, and `issue comment`.
-12. **Review-thread gating.** `pr merge` (and the `pr deliver` merge
-    step) fetches review threads immediately before invoking the
-    backend and refuses to merge while any thread is unresolved
+12. **Opt-in native-review convergence.** `pr merge` and the merge step of
+    `pr deliver` resolve `--review-convergence[=true|false]` over repo and
+    global config. The default is off. In v1, configured bots use `observed`:
+    an absent bot never waits or fails, while already-observed current-head
+    activity must stay quiet for `quiet_period`. New activity restarts that
+    window; `timeout` bounds the complete active wait, including provider
+    calls and rate-limit waits. Polling occurs at most once every 10 seconds.
+    Current-head native `CHANGES_REQUESTED` fails with
+    `review_changes_requested`; `COMMENTED`
+    prose is never parsed as a verdict. Older-head reviews are returned as
+    stale evidence. A head change during an active wait fails closed with
+    `review_convergence_head_changed`; a missing initial provider head fails
+    with `review_convergence_head_missing` before review collection. The
+    complete paginated snapshot is read
+    again immediately before merge; late activity fails with
+    `review_convergence_activity_changed`, and incomplete or unknown provider
+    data fails with `review_snapshot_incomplete`. Every review must carry a
+    non-empty `commit.oid` before current-head/stale classification. For each
+    reviewer, a later
+    native `APPROVED` or `DISMISSED` supersedes an earlier request on the same head;
+    `COMMENTED` does not alter that opinionated state. GitHub is the only
+    supported provider in v1; an enabled policy elsewhere returns
+    `provider_unsupported`.
+13. **Review-thread gating.** `pr merge` (and the `pr deliver` merge
+    step) fetches review threads during the final merge gates and refuses to
+    merge while any thread is unresolved
     (GitHub `reviewThreads`, GitLab resolvable discussions). Bypass
     with `--allow-unresolved-threads`. The local provider has no
     thread model and passes trivially. The error `detail` lists each
     unresolved thread (author, file anchor, first line).
-13. **Task-list gating.** `pr merge` (and the `pr deliver` merge step)
+14. **Task-list gating.** `pr merge` (and the `pr deliver` merge step)
     parses GFM task-list items out of the PR/MR description fetched at
     merge time and refuses to merge while any `- [ ]` item is
     unchecked (`- [x]` / `- [X]` count as done, GitLab's `- [~]` as
@@ -731,7 +799,7 @@ backend implementations cannot diverge.
     payload as `unchecked_tasks_override_reason`. Providers without a
     body model (local) pass trivially. The error `detail` lists each
     unchecked item (line number, text).
-14. **Review-thread write ownership.** `pr review-threads reply` and
+15. **Review-thread write ownership.** `pr review-threads reply` and
     `pr review-threads resolve` verify live GitHub writes by fetching the
     positional PR's review threads and confirming `--thread <id>` is present
     before posting a reply or resolving. `--dry-run` remains offline and skips
@@ -739,25 +807,31 @@ backend implementations cannot diverge.
 
 Violations map to `DATA 65` with one of these `data.error.kind` values:
 
-| `error.kind`                | Triggered by rule |
-| --------------------------- | ----------------- |
-| `branch_name_invalid`       | 1                 |
-| `branch_kind_mismatch`      | 1                 |
-| `body_missing_summary`      | 2                 |
-| `body_missing_test_plan`    | 2                 |
-| `title_too_long`            | 3                 |
-| `dirty_worktree`            | 4                 |
-| `head_not_pushed`           | 5                 |
-| `default_branch_protected`  | 6                 |
-| `draft_merge_refused`       | 7                 |
-| `checks_pending`            | 8                 |
-| `checks_failed`             | 8 (`RUNTIME 1`)   |
-| `merge_method_unsupported`  | 9                 |
-| `keep_branch_conflict`      | 10                |
-| `local_path_present`        | 11                |
-| `unresolved_review_threads` | 12                |
-| `unchecked_task_items`      | 13                |
-| `review_thread_pr_mismatch` | 14                |
+| `error.kind`                          | Triggered by rule |
+| ------------------------------------- | ----------------- |
+| `branch_name_invalid`                 | 1                 |
+| `branch_kind_mismatch`                | 1                 |
+| `body_missing_summary`                | 2                 |
+| `body_missing_test_plan`              | 2                 |
+| `title_too_long`                      | 3                 |
+| `dirty_worktree`                      | 4                 |
+| `head_not_pushed`                     | 5                 |
+| `default_branch_protected`            | 6                 |
+| `draft_merge_refused`                 | 7                 |
+| `checks_pending`                      | 8                 |
+| `checks_failed`                       | 8 (`RUNTIME 1`)   |
+| `merge_method_unsupported`            | 9                 |
+| `keep_branch_conflict`                | 10                |
+| `local_path_present`                  | 11                |
+| `review_changes_requested`            | 12                |
+| `review_convergence_head_missing`     | 12                |
+| `review_convergence_head_changed`     | 12                |
+| `review_convergence_activity_changed` | 12                |
+| `review_snapshot_incomplete`          | 12                |
+| `invalid_review_convergence_config`   | 12                |
+| `unresolved_review_threads`           | 13                |
+| `unchecked_task_items`                | 14                |
+| `review_thread_pr_mismatch`           | 15                |
 
 ## Activity output contract
 
@@ -911,14 +985,14 @@ without exception:
 `nils_common::cli_contract::exit`. Discriminators go in
 `data.error.kind`, not in numeric exit codes.
 
-| Constant      | Value | `forge-cli` triggers                                                                                                          |
-| ------------- | ----- | ----------------------------------------------------------------------------------------------------------------------------- |
-| `SUCCESS`     | `0`   | Op completed; required state achieved.                                                                                        |
-| `RUNTIME`     | `1`   | Remote semantic failure: required checks failed, merge conflict, draft already ready.                                         |
-| `USAGE`       | `64`  | Bad CLI syntax, unknown subcommand, unsupported provider.                                                                     |
-| `DATA`        | `65`  | Lock-down policy violation (any rule above); body parse failure; invalid VPN config.                                          |
-| `UNAVAILABLE` | `69`  | `gh`/`glab` missing, auth required, remote 5xx/network error, wait-checks timeout, GitLab VPN probe failure, backend timeout. |
-| `SOFTWARE`    | `70`  | Internal invariant violation (backend JSON did not match expected shape).                                                     |
+| Constant      | Value | `forge-cli` triggers                                                                                                                                                                |
+| ------------- | ----- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `SUCCESS`     | `0`   | Op completed; required state achieved.                                                                                                                                              |
+| `RUNTIME`     | `1`   | Remote semantic failure: required checks failed, merge conflict, draft already ready.                                                                                               |
+| `USAGE`       | `64`  | Bad CLI syntax, unknown subcommand, unsupported provider.                                                                                                                           |
+| `DATA`        | `65`  | Lock-down policy violation (any rule above); body parse failure; invalid VPN config.                                                                                                |
+| `UNAVAILABLE` | `69`  | `gh`/`glab` missing, auth required, remote 5xx/network error, wait-checks or review-convergence timeout, GitLab VPN probe failure, backend timeout or backend output-limit failure. |
+| `SOFTWARE`    | `70`  | Internal invariant violation (backend JSON did not match expected shape).                                                                                                           |
 
 Callers (agent-runtime-kit skills, CI scripts) MUST branch on `error.kind`
 when finer granularity is needed. Numeric exit codes alone are
@@ -964,6 +1038,15 @@ no_cache = false
 require = false                       # when true, pr create / pr deliver for
                                       # feature/bug kinds must carry verified
                                       # test-first evidence (see below)
+
+[review_convergence]
+require = false                       # compatibility default
+quiet_period = "2m"                  # after relevant activity is observed
+timeout = "20m"                      # bounds an active convergence wait
+
+[[review_convergence.bots]]
+login = "example-review-bot"
+mode = "observed"                    # absence never waits or fails
 ```
 
 ### Global config layer
@@ -974,7 +1057,8 @@ beneath the per-repo `.forge-cli.toml`, so a setting (e.g. `[test_first]
 require = true` or `[merge] method = "rebase"`) applies across every repo
 without duplicating it into each checkout. A missing global file is not an
 error. The global layer feeds the sections forge-cli actually consumes from
-config today — `[merge]`, `[inbox]`, and `[test_first]`. The `[checks]`,
+config today — `[merge]`, `[inbox]`, `[test_first]`, and
+`[review_convergence]`. The `[checks]`,
 `[body]`, and `[branch]` keys are parsed (and validated) for
 forward-compatibility but are not yet wired into the corresponding command
 paths at either layer, so values placed there are accepted but currently
@@ -984,6 +1068,13 @@ Resolution order for any setting: explicit flag > repo `.forge-cli.toml` >
 global `config.toml` > spec default. Inbox env vars sit between explicit flags
 and `.forge-cli.toml`. Unknown keys produce a `warnings[]` entry, not an
 error — forward-compatibility for v2 fields.
+
+Review convergence has one safety-preserving exception: once global
+`[review_convergence].require = true`, repo config may add bots, lengthen the
+global/default quiet period, or override the failure timeout, but cannot disable
+the gate, remove global bots, or shorten the quiet period. The explicit
+`--review-convergence=false` flag remains the intentional per-invocation
+override.
 
 ### `[test_first]` — test-first evidence gate
 
@@ -1009,6 +1100,34 @@ surface as `test_first_evidence_required`, `test_first_evidence_v1`,
 `test_first_evidence_provider_head_unavailable`,
 `test_first_evidence_provider_head_mismatch`, or
 `test_first_evidence_unreadable` (exit `DATA`).
+
+### `[review_convergence]` — observed native review gate
+
+`require` defaults to `false`, `quiet_period` to `2m`, and `timeout` to `20m`.
+`quiet_period` is limited to `1h`; `timeout` is limited to `24h`. Invalid
+or arithmetically overflowing values are warnings while the feature is
+disabled, but fail an enabled merge
+with `invalid_review_convergence_config` instead of silently falling back.
+Normally `bots` is a whole-list override: a repo list replaces the global list.
+When global `require = true`, repo bots are unioned with global bots as part of
+the safety exception above. The v1 `observed` mode is intentionally
+absence-tolerant. If no configured bot review exists against the current head,
+merge continues immediately and `missing_reviewers` remains empty. If relevant
+activity exists, each new native review resets the quiet window. The active
+wait polls no more often than every 10 seconds. Timeout anywhere in that
+end-to-end wait returns `review_convergence_timeout` (`UNAVAILABLE 69`). Timed
+backend subprocesses retain at most 8 MiB per output stream; overflow kills the
+process group and returns `backend_output_limit` (`UNAVAILABLE 69`).
+
+The positive flag form `--review-convergence` enables the resolved policy for
+one `pr merge` or `pr deliver`; `--review-convergence=false` explicitly
+disables a repo/global opt-in. Precedence is explicit flag > repo config >
+global config > default, subject to the enabled-global safety exception.
+Disabling this feature never disables the existing unresolved-thread gate.
+`pr close` has no convergence flag and remains unchanged.
+For `pr merge --dry-run` and the merge-capable `pr deliver --dry-run`, the
+resolved policy is additive output under `data.review_convergence`; the same
+GitHub-only provider check runs before the dry/live split.
 
 Environment variables (read once at startup, all optional):
 

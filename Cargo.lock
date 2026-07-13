@@ -2248,6 +2248,7 @@ dependencies = [
  "chrono",
  "clap",
  "clap_complete",
+ "jiff",
  "libc",
  "nils-agent-workflow-primitives",
  "nils-build-info",

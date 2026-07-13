@@ -6,8 +6,10 @@
 //! subprocess is spawned.
 
 use std::ffi::{OsStr, OsString};
-use std::io;
-use std::process::{Child, Command, Stdio};
+use std::io::{self, Read};
+use std::process::{Child, Command, ExitStatus, Stdio};
+use std::sync::mpsc;
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 #[cfg(unix)]
@@ -26,6 +28,8 @@ pub const ENV_GLAB_BIN: &str = "FORGE_CLI_GLAB_BIN";
 
 /// Stderr tail length captured before token redaction. Spec: ≤ 2 KiB.
 pub const STDERR_TAIL_BYTES: usize = 2 * 1024;
+/// Maximum bytes retained from each stream of a timed backend subprocess.
+const BACKEND_CAPTURE_LIMIT_BYTES: usize = 8 * 1024 * 1024;
 
 /// Backend program selector. Each variant maps to one external binary.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -266,6 +270,24 @@ impl BackendRunner for ProcessRunner {
                     (!stderr.is_empty()).then_some(stderr),
                 ));
             }
+            Err(ProcessOutputError::OutputLimit {
+                stream,
+                limit,
+                output,
+            }) => {
+                let stderr_full = String::from_utf8_lossy(&output.stderr).into_owned();
+                let stderr = redact_and_tail(&stderr_full);
+                return Err(ForgeError::unavailable(
+                    schema(),
+                    "backend_output_limit",
+                    format!(
+                        "{exe} {stream} exceeded the {limit}-byte capture limit",
+                        exe = exe.to_string_lossy(),
+                        stream = stream.as_str(),
+                    ),
+                    (!stderr.is_empty()).then_some(stderr),
+                ));
+            }
         };
 
         let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
@@ -329,17 +351,143 @@ fn output_with_timeout(
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
     configure_child_group(cmd);
     let mut child = cmd.spawn().map_err(ProcessOutputError::Io)?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| ProcessOutputError::Io(io::Error::other("child stdout was not piped")))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| ProcessOutputError::Io(io::Error::other("child stderr was not piped")))?;
+    let (limit_tx, limit_rx) = mpsc::channel();
+    let stdout_reader = spawn_output_reader(stdout, OutputStream::Stdout, limit_tx.clone());
+    let stderr_reader = spawn_output_reader(stderr, OutputStream::Stderr, limit_tx);
     let started = Instant::now();
     loop {
-        if child.try_wait().map_err(ProcessOutputError::Io)?.is_some() {
-            return child.wait_with_output().map_err(ProcessOutputError::Io);
+        if let Ok(stream) = limit_rx.try_recv() {
+            kill_child_group(&mut child);
+            let status = child.wait().map_err(ProcessOutputError::Io)?;
+            let collected = collect_child_output(status, stdout_reader, stderr_reader)
+                .map_err(ProcessOutputError::Io)?;
+            return Err(ProcessOutputError::OutputLimit {
+                stream: collected.limit_exceeded.unwrap_or(stream),
+                limit: BACKEND_CAPTURE_LIMIT_BYTES,
+                output: collected.output,
+            });
+        }
+        if let Some(status) = child.try_wait().map_err(ProcessOutputError::Io)? {
+            let collected = collect_child_output(status, stdout_reader, stderr_reader)
+                .map_err(ProcessOutputError::Io)?;
+            if let Some(stream) = collected.limit_exceeded {
+                return Err(ProcessOutputError::OutputLimit {
+                    stream,
+                    limit: BACKEND_CAPTURE_LIMIT_BYTES,
+                    output: collected.output,
+                });
+            }
+            return Ok(collected.output);
         }
         if started.elapsed() >= timeout {
             kill_child_group(&mut child);
-            let output = child.wait_with_output().map_err(ProcessOutputError::Io)?;
-            return Err(ProcessOutputError::Timeout { timeout, output });
+            let status = child.wait().map_err(ProcessOutputError::Io)?;
+            let collected = collect_child_output(status, stdout_reader, stderr_reader)
+                .map_err(ProcessOutputError::Io)?;
+            if let Some(stream) = collected.limit_exceeded {
+                return Err(ProcessOutputError::OutputLimit {
+                    stream,
+                    limit: BACKEND_CAPTURE_LIMIT_BYTES,
+                    output: collected.output,
+                });
+            }
+            return Err(ProcessOutputError::Timeout {
+                timeout,
+                output: collected.output,
+            });
         }
         std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn spawn_output_reader<R>(
+    mut reader: R,
+    stream: OutputStream,
+    limit_tx: mpsc::Sender<OutputStream>,
+) -> JoinHandle<io::Result<CapturedStream>>
+where
+    R: Read + Send + 'static,
+{
+    std::thread::spawn(move || {
+        let mut output = Vec::new();
+        let mut chunk = [0_u8; 8192];
+        loop {
+            let read = reader.read(&mut chunk)?;
+            if read == 0 {
+                return Ok(CapturedStream {
+                    output,
+                    limit_exceeded: false,
+                });
+            }
+            let remaining = BACKEND_CAPTURE_LIMIT_BYTES.saturating_sub(output.len());
+            if read > remaining {
+                output.extend_from_slice(&chunk[..remaining]);
+                let _ = limit_tx.send(stream);
+                return Ok(CapturedStream {
+                    output,
+                    limit_exceeded: true,
+                });
+            }
+            output.extend_from_slice(&chunk[..read]);
+        }
+    })
+}
+
+fn collect_child_output(
+    status: ExitStatus,
+    stdout_reader: JoinHandle<io::Result<CapturedStream>>,
+    stderr_reader: JoinHandle<io::Result<CapturedStream>>,
+) -> io::Result<CollectedOutput> {
+    let stdout = stdout_reader
+        .join()
+        .map_err(|_| io::Error::other("child stdout reader panicked"))??;
+    let stderr = stderr_reader
+        .join()
+        .map_err(|_| io::Error::other("child stderr reader panicked"))??;
+    let limit_exceeded = stdout
+        .limit_exceeded
+        .then_some(OutputStream::Stdout)
+        .or_else(|| stderr.limit_exceeded.then_some(OutputStream::Stderr));
+    Ok(CollectedOutput {
+        output: std::process::Output {
+            status,
+            stdout: stdout.output,
+            stderr: stderr.output,
+        },
+        limit_exceeded,
+    })
+}
+
+struct CapturedStream {
+    output: Vec<u8>,
+    limit_exceeded: bool,
+}
+
+struct CollectedOutput {
+    output: std::process::Output,
+    limit_exceeded: Option<OutputStream>,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum OutputStream {
+    Stdout,
+    Stderr,
+}
+
+impl OutputStream {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Stdout => "stdout",
+            Self::Stderr => "stderr",
+        }
     }
 }
 
@@ -347,6 +495,11 @@ enum ProcessOutputError {
     Io(io::Error),
     Timeout {
         timeout: Duration,
+        output: std::process::Output,
+    },
+    OutputLimit {
+        stream: OutputStream,
+        limit: usize,
         output: std::process::Output,
     },
 }
@@ -400,6 +553,8 @@ impl BackendRunner for DryRunRunner {
 pub struct DryRunPayload {
     pub provider: &'static str,
     pub plan: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub review_convergence: Option<crate::config::ReviewConvergencePolicy>,
 }
 
 impl DryRunPayload {
@@ -407,7 +562,16 @@ impl DryRunPayload {
         Self {
             provider: provider.as_str(),
             plan: call.plan_argv(),
+            review_convergence: None,
         }
+    }
+
+    pub fn with_review_convergence(
+        mut self,
+        policy: &crate::config::ReviewConvergencePolicy,
+    ) -> Self {
+        self.review_convergence = Some(policy.clone());
+        self
     }
 }
 
@@ -653,6 +817,69 @@ mod tests {
         assert!(
             started.elapsed() < Duration::from_secs(1),
             "timeout should kill the child promptly"
+        );
+    }
+
+    #[test]
+    fn process_runner_timed_call_drains_large_stdout_without_deadlock() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _guard = ENV_GH_BIN_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let stub = dir.path().join("gh");
+        std::fs::write(&stub, "#!/bin/sh\nyes 0123456789 | head -c 2097152\n").expect("write stub");
+        let mut perms = std::fs::metadata(&stub).expect("metadata").permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&stub, perms).expect("chmod");
+
+        let runner = ProcessRunner;
+        unsafe {
+            std::env::set_var(ENV_GH_BIN, &stub);
+        }
+        let call = BackendCall::new(BackendProgram::Gh, ["api", "graphql"]);
+        let output = runner
+            .run_with_timeout(&call, Some(Duration::from_secs(2)))
+            .expect("large output completes before timeout");
+        unsafe {
+            std::env::remove_var(ENV_GH_BIN);
+        }
+        assert_eq!(output.stdout.len(), 2 * 1024 * 1024);
+    }
+
+    #[test]
+    fn process_runner_timed_call_rejects_output_above_capture_limit() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _guard = ENV_GH_BIN_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let stub = dir.path().join("gh");
+        std::fs::write(
+            &stub,
+            format!(
+                "#!/bin/sh\nyes 0123456789 | head -c {}\n",
+                BACKEND_CAPTURE_LIMIT_BYTES + 1
+            ),
+        )
+        .expect("write stub");
+        let mut perms = std::fs::metadata(&stub).expect("metadata").permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&stub, perms).expect("chmod");
+
+        let runner = ProcessRunner;
+        unsafe {
+            std::env::set_var(ENV_GH_BIN, &stub);
+        }
+        let call = BackendCall::new(BackendProgram::Gh, ["api", "graphql"]);
+        let started = std::time::Instant::now();
+        let result = runner.run_with_timeout(&call, Some(Duration::from_secs(2)));
+        unsafe {
+            std::env::remove_var(ENV_GH_BIN);
+        }
+        let err = result.expect_err("output above the capture limit must fail");
+        assert_eq!(err.kind(), "backend_output_limit");
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "overflow should terminate the child promptly"
         );
     }
 
