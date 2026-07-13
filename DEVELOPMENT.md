@@ -218,6 +218,7 @@ NILS_CLI_COVERAGE_FAIL_UNDER_LINES=90 bash scripts/ci/nils-cli-checks-entrypoint
 - `bash scripts/ci/tests/shared-helper-adoption-audit.test.sh`
 - `bash scripts/ci/tests/publish-order-audit.test.sh`
 - `bash scripts/ci/tests/docs-hygiene-audit.test.sh`
+- `bash scripts/ci/tests/prepare-private-release-workflow.test.sh`
 - `bash scripts/ci/skill-shell-suites.sh` (runs every
   `.agents/skills/*/tests/test_*.sh` smoke suite)
 - `bash scripts/ci/test-stale-audit.sh --strict`
@@ -335,6 +336,15 @@ and local Homebrew verification flow:
 ```bash
 .agents/skills/project-bump-version-tag-release/scripts/project-bump-version-tag-release.sh --version X.Y.Z
 ```
+
+`.github/workflows/prepare-private-release.yml` is a narrower preparation-only
+entrypoint for the private infrastructure orchestrator. It runs the same
+canonical version preparation and locked workspace check on a GitHub-hosted
+runner, but uses `--skip-push` and uploads only a patch plus a checksum-bound
+manifest. It has read-only repository permissions, accepts no credentials, and
+does not create a branch, PR, tag, or release. The private orchestrator must
+bind the artifact to the workflow run's immutable `headSha`, independently
+validate the patch semantics, and own all delivery mutations.
 
 ### 9.3 crates.io publishing
 
