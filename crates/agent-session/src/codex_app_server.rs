@@ -3740,6 +3740,7 @@ mod tests {
     fn manual_input_submission_detection_excludes_ordinary_text_and_keys() {
         for key in [
             crate::cli::SpecialKey::Escape,
+            crate::cli::SpecialKey::Backspace,
             crate::cli::SpecialKey::CtrlC,
             crate::cli::SpecialKey::Up,
             crate::cli::SpecialKey::Down,
