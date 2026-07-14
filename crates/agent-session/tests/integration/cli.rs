@@ -4491,7 +4491,13 @@ exit 0
     assert_eq!(output.code, 1, "stdout={}", output.stdout_text());
     let error = output.stdout_json();
     assert_eq!(error["error"]["code"], "session-termination-failed");
-    assert_eq!(error["error"]["details"]["reason"], "process-still-running");
+    assert!(
+        matches!(
+            error["error"]["details"]["reason"].as_str(),
+            Some("process-still-running" | "verification-failed")
+        ),
+        "unexpected bounded verification result: {error}"
+    );
     assert_eq!(error["error"]["details"]["retryable"], true);
     assert_eq!(error["error"]["details"]["action"], "retry-delete");
     assert!(
@@ -4582,7 +4588,7 @@ exit 0
 }
 
 #[test]
-fn delete_recaptures_and_terminates_a_bounded_replacement_pane() {
+fn delete_recaptures_a_bounded_replacement_and_fails_closed_without_a_control_group() {
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let state_dir = tmp.path().join("state");
     let tmux_bin = tmp.path().join("tmux-kill-time-respawn");
@@ -4688,14 +4694,17 @@ exit 0
         &[],
     );
 
-    assert_eq!(output.code, 0, "stdout={}", output.stdout_text());
-    assert_eq!(data(&output.stdout_json())["deleted"], true);
+    assert_eq!(output.code, 1, "stdout={}", output.stdout_text());
+    assert_eq!(
+        output.stdout_json()["error"]["details"]["reason"],
+        "process-still-running"
+    );
     assert!(
-        !session_dir.exists(),
-        "completed delete must remove metadata"
+        session_dir.exists(),
+        "failed-closed delete must retain metadata"
     );
     assert!(!captured_pane.is_running());
-    assert!(!replacement_pane.is_running());
+    assert!(replacement_pane.is_running());
     let calls = fs::read_to_string(&tmux_log).unwrap();
     assert!(calls.contains("if-shell -F -t %78"), "{calls}");
     assert!(
@@ -5023,7 +5032,7 @@ exit 0
 }
 
 #[test]
-fn delete_handles_the_exact_pane_process_group_after_tmux_stops() {
+fn delete_fails_closed_when_a_pane_survives_without_a_control_group() {
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let state_dir = tmp.path().join("state");
     let pane = spawn_test_process_group();
@@ -5084,26 +5093,13 @@ exit 42
         &[],
     );
 
-    #[cfg(target_os = "linux")]
-    {
-        assert_eq!(output.code, 0, "stdout={}", output.stdout_text());
-        assert_eq!(data(&output.stdout_json())["deleted"], true);
-        assert!(
-            !session_dir.exists(),
-            "completed delete must remove metadata"
-        );
-        assert!(!pane.is_running());
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        assert_eq!(output.code, 1, "stdout={}", output.stdout_text());
-        assert_eq!(
-            output.stdout_json()["error"]["details"]["reason"],
-            "process-still-running"
-        );
-        assert!(session_dir.exists());
-        assert!(pane.is_running());
-    }
+    assert_eq!(output.code, 1, "stdout={}", output.stdout_text());
+    assert_eq!(
+        output.stdout_json()["error"]["details"]["reason"],
+        "process-still-running"
+    );
+    assert!(session_dir.exists());
+    assert!(pane.is_running());
 }
 
 #[test]

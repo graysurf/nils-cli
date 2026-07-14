@@ -55,9 +55,12 @@ ids and process boundary, validates the runtime's `AGENT_SESSION_*` ownership ma
 uses one tmux-server conditional command to kill only if the captured session, pane, and pane PID still match.
 If the managed pane is replaced, it durably retains every unresolved observed process identity before proceeding. It then
 targets only the captured tmux session id. On Linux it snapshots each verified process-session member by PID and start time,
-rejects unknown members after tmux stops, and signals only matching identities through PID file descriptors with bounded
-TERM/KILL escalation; other Unix platforms retain verify-only handling for the pane process-group boundary. Cleanup requires
-tmux and every retained process boundary to be gone. A retry can
+pins those identities through PID file descriptors, and, when tmux placed the pane in a distinct cgroup-v2
+`tmux-spawn-*.scope`, pins that cgroup before the tmux mutation. Surviving processes receive bounded TERM escalation followed
+by `cgroup.kill`, so descendants that fork or change process session remain contained. Without that distinct cgroup, Linux
+deletion succeeds only when tmux itself stops the verified runtime and otherwise fails closed; other Unix platforms retain
+verify-only handling for the pane process-group boundary. Cleanup requires tmux and every retained process boundary to be
+gone. A retry can
 finish cleanup without another kill only when all persisted identities verify stopped. Live records created by an older
 version can be upgraded from their ownership markers. A stopped pre-upgrade record without a provable launch identity remains
 retained and returns `runtime-identity-unavailable`, `retryable: false`, and
