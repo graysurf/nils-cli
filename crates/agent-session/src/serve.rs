@@ -3380,6 +3380,7 @@ async fn update_session_handler(
         },
         None => None,
     };
+    let title_supplied = title_input.is_some();
     let (title, title_state) = match title_state_input {
         Some(Some(state)) => (title_input.flatten(), Some(state)),
         Some(None) => (title_input.flatten(), None),
@@ -3466,6 +3467,7 @@ async fn update_session_handler(
             &context,
             &id,
             title,
+            title_supplied,
             title_state,
             crate::TitleUpdatePreconditions {
                 title_revision: expected_title_revision,
@@ -10753,6 +10755,24 @@ mod tests {
             "references": ["#317"],
             "activity": "Implement daemon contract"
         });
+        let (status, body) = call(
+            router(st.clone()),
+            patch_json(
+                "/sessions/structured-title",
+                Some(TOKEN),
+                json!({
+                    "title": null,
+                    "title_state": user_state,
+                    "expected_title_revision": 0,
+                    "expected_session_incarnation": "launch-structured-title",
+                    "expected_session_title": null
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "body={body}");
+        assert_eq!(body["error"]["code"], "title-state-mismatch");
+
         let (status, body) = call(
             router(st.clone()),
             patch_json(

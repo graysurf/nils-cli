@@ -1527,8 +1527,14 @@ fn create_record(request: RecordRequest<'_>) -> Result<CreatedRecord, CliError> 
     let now = Zoned::now();
     let timestamp = now.strftime("%Y%m%d-%H%M%S").to_string();
     let iso = now.timestamp().to_string();
-    let (title, title_state) =
-        canonicalize_session_title_pair(request.title.map(str::to_string), request.title_state)?;
+    let title_supplied = request.title.is_some();
+    let title = request.title.map(str::to_string);
+    let (title, title_state) = match request.title_state {
+        Some(title_state) => {
+            canonicalize_structured_title_pair(title, title_supplied, title_state)?
+        }
+        None => (title, None),
+    };
     let title_slug = title.as_deref().map(slugify);
     let id = resolve_session_id(
         request.context,
@@ -2805,6 +2811,7 @@ fn update_session_title(
         context,
         id,
         title,
+        true,
         None,
         TitleUpdatePreconditions::default(),
         tmux_bin,
@@ -2823,12 +2830,17 @@ fn update_session_title_if_revision(
     context: &CliContext,
     id: &str,
     title: Option<String>,
+    title_supplied: bool,
     title_state: Option<SessionTitleState>,
     expected: TitleUpdatePreconditions,
     tmux_bin: &Path,
 ) -> Result<SessionView, CliError> {
-    let (normalized_title, normalized_title_state) =
-        canonicalize_session_title_pair(title, title_state)?;
+    let (normalized_title, normalized_title_state) = match title_state {
+        Some(title_state) => {
+            canonicalize_structured_title_pair(title, title_supplied, title_state)?
+        }
+        None => (normalize_title(title)?, None),
+    };
     let (record, previous_title) = mutate_session_record_for_title(
         context,
         id,
@@ -3224,16 +3236,13 @@ fn normalize_title(title: Option<String>) -> Result<Option<String>, CliError> {
     Ok(Some(title))
 }
 
-fn canonicalize_session_title_pair(
+fn canonicalize_structured_title_pair(
     title: Option<String>,
-    title_state: Option<SessionTitleState>,
+    title_supplied: bool,
+    title_state: SessionTitleState,
 ) -> Result<(Option<String>, Option<SessionTitleState>), CliError> {
-    let title_supplied = title.is_some();
-    let normalized_title = normalize_title(title)?;
-    let normalized_title_state = title_state.map(normalize_title_state).transpose()?;
-    let Some(state) = normalized_title_state else {
-        return Ok((normalized_title, None));
-    };
+    let normalized_title = normalize_structured_compatibility_title(title)?;
+    let state = normalize_title_state(title_state)?;
     let rendered = render_session_title_state(&state)?;
     if title_supplied && normalized_title != rendered {
         return Err(CliError::usage(
@@ -3243,6 +3252,26 @@ fn canonicalize_session_title_pair(
         ));
     }
     Ok((rendered, Some(state)))
+}
+
+fn normalize_structured_compatibility_title(
+    title: Option<String>,
+) -> Result<Option<String>, CliError> {
+    let Some(title) = title else {
+        return Ok(None);
+    };
+    let title = title.trim_matches(is_javascript_whitespace).to_string();
+    if title.is_empty() {
+        return Ok(None);
+    }
+    if title.chars().count() > SESSION_TITLE_MAX_CHARS {
+        return Err(CliError::usage(
+            "title-too-long",
+            "session title must be 120 characters or fewer",
+            Some(json!({ "max_chars": SESSION_TITLE_MAX_CHARS })),
+        ));
+    }
+    Ok(Some(title))
 }
 
 const SESSION_TITLE_MAX_CHARS: usize = 120;
@@ -5567,6 +5596,25 @@ mod tests {
     }
 
     #[test]
+    fn structured_title_pair_preserves_edge_u0085_like_javascript() {
+        let edge_title = "\u{0085}Alpha\u{0085}";
+        let result = super::canonicalize_structured_title_pair(
+            Some(edge_title.to_string()),
+            true,
+            super::SessionTitleState {
+                topic: Some(edge_title.to_string()),
+                topic_source: super::SessionTitleTopicSource::User,
+                references: Vec::new(),
+                activity: None,
+                extra: std::collections::BTreeMap::new(),
+            },
+        );
+
+        let (title, _) = result.expect("JavaScript-compatible edge whitespace should match");
+        assert_eq!(title.as_deref(), Some(edge_title));
+    }
+
+    #[test]
     fn create_record_rejects_a_mismatched_structured_title_pair() {
         let tmp = tempfile::TempDir::new().unwrap();
         let context = test_context(tmp.path());
@@ -5597,6 +5645,50 @@ mod tests {
         };
         assert_eq!(err.0.code, "title-state-mismatch");
         assert!(!super::session_dir(&context, "mismatched-title-state").exists());
+    }
+
+    #[test]
+    fn create_record_preserves_title_only_input_contract() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let context = test_context(tmp.path());
+        let padded = create_record(RecordRequest {
+            context: &context,
+            agent: AgentKind::Codex,
+            mode: "interactive",
+            title: Some("  padded title-only input  "),
+            title_state: None,
+            explicit_id: Some("padded-title-only"),
+            cwd: Path::new("/repo"),
+            prompt: None,
+            log_file_name: None,
+            provider_resume: None,
+            agent_args: Vec::new(),
+            agent_bin: None,
+        })
+        .unwrap();
+        assert_eq!(
+            padded.record.title.as_deref(),
+            Some("  padded title-only input  ")
+        );
+        drop(padded);
+
+        let long_title = "x".repeat(121);
+        let long = create_record(RecordRequest {
+            context: &context,
+            agent: AgentKind::Codex,
+            mode: "interactive",
+            title: Some(&long_title),
+            title_state: None,
+            explicit_id: Some("long-title-only"),
+            cwd: Path::new("/repo"),
+            prompt: None,
+            log_file_name: None,
+            provider_resume: None,
+            agent_args: Vec::new(),
+            agent_bin: None,
+        })
+        .unwrap();
+        assert_eq!(long.record.title.as_deref(), Some(long_title.as_str()));
     }
 
     #[test]
