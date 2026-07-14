@@ -3927,72 +3927,75 @@ fn resume_refuses_unprovable_pre_upgrade_codex_and_claude_runtimes() {
     let tmux_log_arg = tmux_log.to_string_lossy().to_string();
 
     for agent in ["codex", "claude"] {
-        let id = format!("unprovable-resume-{agent}");
-        let tmux_session = format!("hs-{agent}-unprovable-resume");
-        let resume_args = match agent {
-            "codex" => vec![
-                "resume",
-                "resume-session-id",
-                "--cd",
-                cwd.to_str().unwrap(),
-                "--no-alt-screen",
-            ],
-            "claude" => vec!["--resume", "resume-session-id"],
-            _ => unreachable!(),
-        };
-        let session_dir = write_resumable_session_record(
-            &state_dir,
-            &id,
-            agent,
-            &tmux_session,
-            &cwd,
-            &resume_args,
-        );
-        let record_path = session_dir.join("session.json");
-        let mut record: Value =
-            serde_json::from_slice(&fs::read(&record_path).expect("session record")).unwrap();
-        record.as_object_mut().unwrap().remove("startup");
-        record
-            .as_object_mut()
-            .unwrap()
-            .remove("tmux_runtime_never_launched");
-        fs::write(&record_path, serde_json::to_vec_pretty(&record).unwrap()).unwrap();
-        let before = fs::read(&record_path).expect("session record");
-        let output = run(
-            tmp.path(),
-            &[
-                "--state-dir",
-                &state_arg,
-                "resume",
+        for runtime_shape in ["identity-free", "omitted"] {
+            let id = format!("unprovable-resume-{agent}-{runtime_shape}");
+            let tmux_session = format!("hs-{agent}-unprovable-resume-{runtime_shape}");
+            let resume_args = match agent {
+                "codex" => vec![
+                    "resume",
+                    "resume-session-id",
+                    "--cd",
+                    cwd.to_str().unwrap(),
+                    "--no-alt-screen",
+                ],
+                "claude" => vec!["--resume", "resume-session-id"],
+                _ => unreachable!(),
+            };
+            let session_dir = write_resumable_session_record(
+                &state_dir,
                 &id,
-                "--tmux-bin",
-                &tmux_arg,
-                "--format",
-                "json",
-            ],
-            &[
-                ("AGENT_SESSION_FAKE_TMUX_LOG", &tmux_log_arg),
-                ("AGENT_SESSION_FAKE_TMUX_ABSENT", "1"),
-            ],
-        );
+                agent,
+                &tmux_session,
+                &cwd,
+                &resume_args,
+            );
+            let record_path = session_dir.join("session.json");
+            let mut record: Value =
+                serde_json::from_slice(&fs::read(&record_path).expect("session record")).unwrap();
+            let record = record.as_object_mut().unwrap();
+            record.remove("startup");
+            record.remove("tmux_runtime_never_launched");
+            if runtime_shape == "omitted" {
+                record.remove("runtime");
+            }
+            fs::write(&record_path, serde_json::to_vec_pretty(&record).unwrap()).unwrap();
+            let before = fs::read(&record_path).expect("session record");
+            let output = run(
+                tmp.path(),
+                &[
+                    "--state-dir",
+                    &state_arg,
+                    "resume",
+                    &id,
+                    "--tmux-bin",
+                    &tmux_arg,
+                    "--format",
+                    "json",
+                ],
+                &[
+                    ("AGENT_SESSION_FAKE_TMUX_LOG", &tmux_log_arg),
+                    ("AGENT_SESSION_FAKE_TMUX_ABSENT", "1"),
+                ],
+            );
 
-        assert_eq!(output.code, 1, "stdout={}", output.stdout_text());
-        let error = output.stdout_json();
-        assert_eq!(error["error"]["code"], "session-termination-failed");
-        assert_eq!(
-            error["error"]["details"]["reason"],
-            "runtime-identity-unavailable"
-        );
-        assert_eq!(error["error"]["details"]["retryable"], false);
-        assert_eq!(
-            error["error"]["details"]["action"],
-            "manual-runtime-verification-required"
-        );
-        assert_eq!(
-            fs::read(&record_path).expect("retained session record"),
-            before,
-            "resume must preserve the unprovable {agent} generation"
-        );
+            assert_eq!(output.code, 1, "stdout={}", output.stdout_text());
+            let error = output.stdout_json();
+            assert_eq!(error["error"]["code"], "session-termination-failed");
+            assert_eq!(
+                error["error"]["details"]["reason"],
+                "runtime-identity-unavailable"
+            );
+            assert_eq!(error["error"]["details"]["retryable"], false);
+            assert_eq!(
+                error["error"]["details"]["action"],
+                "manual-runtime-verification-required"
+            );
+            assert_eq!(
+                fs::read(&record_path).expect("retained session record"),
+                before,
+                "resume must preserve the unprovable {agent} {runtime_shape} record"
+            );
+        }
     }
 
     assert!(
@@ -5931,7 +5934,6 @@ fn start_fails_closed_when_launch_identity_cannot_be_persisted() {
         &[
             ("CODEX_HOME", &codex_home_arg),
             ("AGENT_SESSION_FAKE_TMUX_LOG", &tmux_log_arg),
-            ("AGENT_SESSION_FAKE_TMUX_FAIL", "kill-session"),
             ("AGENT_SESSION_FAKE_CODEX_SESSION_FILE", &codex_session_arg),
             ("AGENT_SESSION_FAKE_CODEX_SESSION_ID", "codex-write-fail-id"),
             ("AGENT_SESSION_FAKE_CODEX_CWD", &cwd_arg),
@@ -5941,8 +5943,7 @@ fn start_fails_closed_when_launch_identity_cannot_be_persisted() {
 
     assert_eq!(output.code, 1, "stdout={}", output.stdout_text());
     let value = output.stdout_json();
-    assert_eq!(value["error"]["code"], "session-termination-failed");
-    assert_eq!(value["error"]["details"]["reason"], "kill-failed");
+    assert_eq!(value["error"]["code"], "file-write-failed");
     let _ = fs::set_permissions(&chmod_dir, fs::Permissions::from_mode(0o700));
     let record_path = chmod_dir.join("session.json");
     let record: Value =
@@ -5953,13 +5954,10 @@ fn start_fails_closed_when_launch_identity_cannot_be_persisted() {
     assert!(!record_path.with_file_name("resume.json").exists());
     let calls = tmux_calls(&tmux_log);
     assert!(
-        calls.iter().any(|call| call
-            == &vec![
-                "kill-session".to_string(),
-                "-t".to_string(),
-                "$77".to_string(),
-            ]),
-        "failed identity persistence must attempt exact shutdown: {calls:?}"
+        calls
+            .iter()
+            .all(|call| call.first().is_none_or(|arg| arg != "kill-session")),
+        "a launch must remain queryable until its recovery identity is durable: {calls:?}"
     );
 }
 
@@ -5980,7 +5978,6 @@ fn start_retains_state_when_process_group_survives_post_launch_cleanup() {
     let tmux_arg = tmux_bin.to_string_lossy().to_string();
     let claude_arg = claude_bin.to_string_lossy().to_string();
     let tmux_log_arg = tmux_log.to_string_lossy().to_string();
-    let session_arg = session_dir.to_string_lossy().to_string();
     let output = run(
         tmp.path(),
         &[
@@ -5997,6 +5994,8 @@ fn start_retains_state_when_process_group_survives_post_launch_cleanup() {
             &tmux_arg,
             "--agent-bin",
             &claude_arg,
+            "--prompt",
+            "fixture prompt",
             "--paste-delay-ms",
             "0",
             "--format",
@@ -6007,7 +6006,7 @@ fn start_retains_state_when_process_group_survives_post_launch_cleanup() {
             ("AGENT_SESSION_FAKE_TMUX_PANE_PID", &pane_pid),
             ("AGENT_SESSION_FAKE_TMUX_PROCESS_GROUP_ID", &pane_pid),
             ("AGENT_SESSION_FAKE_TMUX_KEEP_PROCESS_GROUP", "1"),
-            ("AGENT_SESSION_FAKE_CHMOD_AFTER_NEW_SESSION", &session_arg),
+            ("AGENT_SESSION_FAKE_TMUX_FAIL", "paste-buffer"),
         ],
     );
 
@@ -6015,7 +6014,6 @@ fn start_retains_state_when_process_group_survives_post_launch_cleanup() {
     let error = output.stdout_json();
     assert_eq!(error["error"]["code"], "session-termination-failed");
     assert_eq!(error["error"]["details"]["reason"], "process-still-running");
-    let _ = fs::set_permissions(&session_dir, fs::Permissions::from_mode(0o700));
     assert!(
         session_dir.exists(),
         "surviving process state must remain discoverable"
@@ -6024,7 +6022,38 @@ fn start_retains_state_when_process_group_survives_post_launch_cleanup() {
         pane_process.is_running(),
         "the fixture process group must prove kill success alone is insufficient"
     );
+    let record: Value = serde_json::from_slice(
+        &fs::read(session_dir.join("session.json")).expect("retained session record"),
+    )
+    .unwrap();
+    assert_eq!(
+        record["delete_tmux_identity"]["process_group_id"],
+        pane_process.pid()
+    );
     pane_process.stop();
+
+    let retry = run(
+        tmp.path(),
+        &[
+            "--state-dir",
+            &state_arg,
+            "delete",
+            "process-survivor",
+            "--tmux-bin",
+            &tmux_arg,
+            "--format",
+            "json",
+        ],
+        &[
+            ("AGENT_SESSION_FAKE_TMUX_LOG", &tmux_log_arg),
+            ("AGENT_SESSION_FAKE_TMUX_ABSENT", "1"),
+        ],
+    );
+    assert_eq!(retry.code, 0, "stdout={}", retry.stdout_text());
+    assert!(
+        !session_dir.exists(),
+        "retry must use the durable process identity"
+    );
 }
 
 #[test]
@@ -6641,15 +6670,13 @@ fn resume_retains_new_generation_when_identity_persistence_and_shutdown_fail() {
         &[
             ("AGENT_SESSION_FAKE_TMUX_LOG", &tmux_log_arg),
             ("AGENT_SESSION_FAKE_TMUX_ABSENT_BEFORE_LAUNCH", "1"),
-            ("AGENT_SESSION_FAKE_TMUX_FAIL", "kill-session"),
             ("AGENT_SESSION_FAKE_CHMOD_AFTER_NEW_SESSION", &session_arg),
         ],
     );
 
     assert_eq!(output.code, 1, "stdout={}", output.stdout_text());
     let error = output.stdout_json();
-    assert_eq!(error["error"]["code"], "session-termination-failed");
-    assert_eq!(error["error"]["details"]["reason"], "kill-failed");
+    assert_eq!(error["error"]["code"], "file-write-failed");
     let _ = fs::set_permissions(&session, fs::Permissions::from_mode(0o700));
     let retained: Value = serde_json::from_slice(&fs::read(&record_path).unwrap()).unwrap();
     assert_eq!(retained["runtime"]["generation"], 2);
@@ -6660,6 +6687,12 @@ fn resume_retains_new_generation_when_identity_persistence_and_shutdown_fail() {
     assert!(
         session.exists(),
         "the current generation must remain discoverable"
+    );
+    assert!(
+        tmux_calls(&tmux_log)
+            .iter()
+            .all(|call| call.first().is_none_or(|arg| arg != "kill-session")),
+        "resume must keep the replacement queryable until its identity is durable"
     );
 }
 

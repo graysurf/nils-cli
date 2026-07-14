@@ -687,19 +687,19 @@ fn startup_projection_for_view(record: &SessionRecord) -> Option<StartupProjecti
 }
 
 fn runtime_is_proven_never_launched(record: &SessionRecord) -> bool {
-    if record.runtime.is_none() {
-        return true;
-    }
-    let current_launch_id = record
+    let Some(current_launch_id) = record
         .runtime
         .as_ref()
         .map(|runtime| runtime.launch_id.as_str())
-        .filter(|launch_id| !launch_id.is_empty());
+        .filter(|launch_id| !launch_id.is_empty())
+    else {
+        return false;
+    };
     record
         .extra
         .get(TMUX_RUNTIME_NEVER_LAUNCHED_KEY)
         .and_then(Value::as_str)
-        == current_launch_id
+        .is_some_and(|marker| marker == current_launch_id)
 }
 
 fn mark_tmux_runtime_never_launched(record: &mut SessionRecord) {
@@ -2195,7 +2195,7 @@ fn run_tmux_new_session(
 fn tmux_launch_may_have_created_runtime(err: &CliError) -> bool {
     matches!(
         err.code(),
-        "command-timeout" | "tmux-runtime-identity-invalid"
+        "command-timeout" | "command-wait-failed" | "tmux-runtime-identity-invalid"
     )
 }
 
@@ -4682,7 +4682,7 @@ fn recover_failed_tmux_launch(
 
     persist_tmux_runtime_identity(record, &identity)
         .map_err(|reason| session_termination_error(record, reason))?;
-    let _ = write_session_record(context, record);
+    write_session_record(context, record)?;
     terminate_known_tmux_runtime(
         tmux_bin,
         &identity,
@@ -6088,8 +6088,8 @@ mod tests {
         acquire_session_record_lock, acquire_session_record_lock_timed, create_record,
         delete_session_with_timeouts, kill_tmux_session_with_timeout, live_status_with_timeout,
         load_session_record, persist_tmux_runtime_identity, render_delete_text, resolve_session_id,
-        session_dir, strip_trailing_blank_lines, try_acquire_session_record_lock,
-        write_session_record,
+        session_dir, strip_trailing_blank_lines, tmux_launch_may_have_created_runtime,
+        try_acquire_session_record_lock, write_session_record,
     };
     use pretty_assertions::assert_eq;
     use std::fs;
@@ -6911,6 +6911,17 @@ fi
             render_delete_text(&result),
             "deleted stopped-session (tmux stopped: yes)\n"
         );
+    }
+
+    #[test]
+    fn tmux_post_spawn_wait_failure_requires_ambiguous_launch_recovery() {
+        let error = super::CliError::runtime(
+            "command-wait-failed",
+            "tmux new-session failed after spawn",
+            None,
+        );
+
+        assert!(tmux_launch_may_have_created_runtime(&error));
     }
 
     #[test]
