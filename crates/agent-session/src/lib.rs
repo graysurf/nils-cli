@@ -9214,6 +9214,7 @@ mod tests {
                 "AGENT_SESSION_TEST_CGROUP_DESCENDANT_PID",
                 &descendant_pid_path,
             )
+            .process_group(0)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         let mut scope_anchor = scope_anchor.spawn().unwrap();
@@ -9252,16 +9253,31 @@ mod tests {
             );
             thread::sleep(Duration::from_millis(10));
         };
-        let mut retained_identity = match super::capture_tmux_runtime_identity(
-            &context,
-            &record,
-            &wrapper,
-            Duration::from_secs(1),
-        )
-        .unwrap()
-        {
-            super::TmuxRuntimeProbe::Running(identity) => *identity,
-            super::TmuxRuntimeProbe::Stopped => panic!("tmux runtime must still be running"),
+        let capture_started_at = Instant::now();
+        let mut retained_identity = loop {
+            match super::capture_tmux_runtime_identity(
+                &context,
+                &record,
+                &wrapper,
+                Duration::from_secs(1),
+            ) {
+                Ok(super::TmuxRuntimeProbe::Running(identity)) => break *identity,
+                Ok(super::TmuxRuntimeProbe::Stopped) => {
+                    panic!("tmux runtime must still be running")
+                }
+                Err(error)
+                    if matches!(
+                        error,
+                        super::SessionTerminationFailure::RuntimeIdentityUnavailable
+                            | super::SessionTerminationFailure::VerificationFailed
+                    ) && capture_started_at.elapsed() < Duration::from_secs(2) =>
+                {
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => panic!(
+                    "tmux runtime identity did not stabilize within the fixture timeout: {error:?}"
+                ),
+            }
         };
         assert_eq!(retained_identity.session_id, tmux_session_id);
         assert_eq!(retained_identity.pane_id, tmux_pane_id);
