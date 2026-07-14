@@ -2300,14 +2300,6 @@ fn run_tmux_new_session(
         })?,
         None => None,
     };
-    let process_session_members =
-        process_session_members(process_session_id, pane_pid).map_err(|_| {
-            CliError::runtime(
-                "tmux-runtime-identity-invalid",
-                "tmux new-session returned an unverifiable pane process session",
-                Some(json!({ "id": record.id })),
-            )
-        })?;
     Ok(TmuxRuntimeIdentity {
         launch_id,
         session_id: session_id.to_string(),
@@ -2315,7 +2307,7 @@ fn run_tmux_new_session(
         pane_pid,
         process_group_id,
         process_session_id,
-        process_session_members,
+        process_session_members: Vec::new(),
     })
 }
 
@@ -5272,6 +5264,11 @@ fn terminate_tmux_session_with_timeouts(
         if identity_changes >= DELETE_TERMINATION_IDENTITY_RETRY_LIMIT {
             return Err(SessionTerminationFailure::RuntimeIdentityChanged);
         }
+        let pinned_runtime = if terminate_process_group {
+            Some(pin_process_runtime(&identity)?)
+        } else {
+            None
+        };
         set_tmux_termination_state(record, TmuxTerminationState::Pending)?;
         write_session_record(context, record)
             .map_err(|_| SessionTerminationFailure::RuntimeIdentityUnavailable)?;
@@ -5285,7 +5282,13 @@ fn terminate_tmux_session_with_timeouts(
                     .map_err(|_| SessionTerminationFailure::RuntimeIdentityUnavailable)?;
                 let verification_started = Instant::now();
                 if terminate_process_group {
-                    terminate_captured_process_runtime(&identity, verify_timeout)?;
+                    terminate_captured_process_runtime(
+                        &identity,
+                        pinned_runtime
+                            .as_ref()
+                            .ok_or(SessionTerminationFailure::VerificationFailed)?,
+                        verify_timeout,
+                    )?;
                 }
                 let remaining = verify_timeout.saturating_sub(verification_started.elapsed());
                 if remaining.is_zero() {
@@ -5725,8 +5728,10 @@ fn process_group_status(process_group_id: libc::pid_t) -> ProcessGroupStatus {
 
 fn process_runtime_status(identity: &TmuxRuntimeIdentity) -> ProcessGroupStatus {
     #[cfg(target_os = "linux")]
-    if let Some(process_session_id) = identity.process_session_id {
-        return linux_process_session_status(process_session_id);
+    if let Some(process_session_id) = identity.process_session_id
+        && !identity.process_session_members.is_empty()
+    {
+        return linux_process_runtime_status(identity, process_session_id);
     }
     identity
         .process_group_id
@@ -5745,10 +5750,10 @@ fn verify_stopped_process_runtime(
             ProcessGroupStatus::Running if started_at.elapsed() >= verify_timeout => {
                 return Err(SessionTerminationFailure::ProcessStillRunning);
             }
-            ProcessGroupStatus::Unknown if started_at.elapsed() >= verify_timeout => {
+            ProcessGroupStatus::Unknown => {
                 return Err(SessionTerminationFailure::VerificationFailed);
             }
-            ProcessGroupStatus::Running | ProcessGroupStatus::Unknown => {}
+            ProcessGroupStatus::Running => {}
         }
         thread::sleep(
             DELETE_TERMINATION_VERIFY_POLL_INTERVAL
@@ -5759,64 +5764,88 @@ fn verify_stopped_process_runtime(
 
 fn terminate_captured_process_runtime(
     identity: &TmuxRuntimeIdentity,
+    pinned_runtime: &PinnedProcessRuntime,
     verify_timeout: Duration,
 ) -> Result<(), SessionTerminationFailure> {
-    let process_group_id = identity
-        .process_group_id
-        .ok_or(SessionTerminationFailure::RuntimeIdentityUnavailable)?;
-    if process_group_id <= 1 || process_group_id == unsafe { libc::getpgrp() } {
-        return Err(SessionTerminationFailure::RuntimeIdentityUnavailable);
-    }
     #[cfg(target_os = "linux")]
-    if let Some(process_session_id) = identity.process_session_id
-        && (process_session_id <= 1 || process_session_id == unsafe { libc::getsid(0) })
     {
-        return Err(SessionTerminationFailure::RuntimeIdentityUnavailable);
+        let process_session_id = identity
+            .process_session_id
+            .ok_or(SessionTerminationFailure::RuntimeIdentityUnavailable)?;
+        if process_session_id <= 1 || process_session_id == unsafe { libc::getsid(0) } {
+            return Err(SessionTerminationFailure::RuntimeIdentityUnavailable);
+        }
+        match process_runtime_status(identity) {
+            ProcessGroupStatus::Stopped => return Ok(()),
+            ProcessGroupStatus::Unknown => {
+                return Err(SessionTerminationFailure::VerificationFailed);
+            }
+            ProcessGroupStatus::Running => {}
+        }
+
+        signal_pinned_process_runtime(pinned_runtime, libc::SIGTERM)?;
+        let term_grace = verify_timeout / 2;
+        match verify_stopped_process_runtime(identity, term_grace) {
+            Ok(()) => return Ok(()),
+            Err(SessionTerminationFailure::ProcessStillRunning) => {}
+            Err(reason) => return Err(reason),
+        }
+
+        signal_pinned_process_runtime(pinned_runtime, libc::SIGKILL)?;
+        verify_stopped_process_runtime(identity, verify_timeout.saturating_sub(term_grace))
     }
-    match process_runtime_status(identity) {
-        ProcessGroupStatus::Stopped => return Ok(()),
-        ProcessGroupStatus::Unknown => {
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = pinned_runtime;
+        verify_stopped_process_runtime(identity, verify_timeout)
+    }
+}
+
+#[derive(Debug)]
+struct PinnedProcessRuntime {
+    #[cfg(target_os = "linux")]
+    processes: Vec<PinnedLinuxProcess>,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug)]
+struct PinnedLinuxProcess {
+    identity: TmuxProcessIdentity,
+    pidfd: OwnedFd,
+}
+
+fn pin_process_runtime(
+    identity: &TmuxRuntimeIdentity,
+) -> Result<PinnedProcessRuntime, SessionTerminationFailure> {
+    #[cfg(target_os = "linux")]
+    {
+        let process_session_id = identity
+            .process_session_id
+            .filter(|session_id| *session_id > 1 && *session_id != unsafe { libc::getsid(0) })
+            .ok_or(SessionTerminationFailure::RuntimeIdentityUnavailable)?;
+        if identity.process_session_members.is_empty() {
+            return Err(SessionTerminationFailure::RuntimeIdentityUnavailable);
+        }
+        let current_members = linux_process_session_members(process_session_id)?;
+        if current_members.len() != identity.process_session_members.len()
+            || current_members.iter().any(|current| {
+                !identity.process_session_members.iter().any(|captured| {
+                    captured.pid == current.pid && captured.start_time == current.start_time
+                })
+            })
+        {
             return Err(SessionTerminationFailure::VerificationFailed);
         }
-        ProcessGroupStatus::Running => {}
+        let mut processes = Vec::with_capacity(identity.process_session_members.len());
+        for captured in &identity.process_session_members {
+            processes.push(pin_linux_process(captured, process_session_id)?);
+        }
+        Ok(PinnedProcessRuntime { processes })
     }
-
-    signal_process_runtime(identity, libc::SIGTERM)?;
-    let term_grace = verify_timeout / 2;
-    match verify_stopped_process_runtime(identity, term_grace) {
-        Ok(()) => return Ok(()),
-        Err(SessionTerminationFailure::ProcessStillRunning) => {}
-        Err(reason) => return Err(reason),
-    }
-
-    signal_process_runtime(identity, libc::SIGKILL)?;
-    verify_stopped_process_runtime(identity, verify_timeout.saturating_sub(term_grace))
-}
-
-fn signal_process_runtime(
-    identity: &TmuxRuntimeIdentity,
-    signal: libc::c_int,
-) -> Result<(), SessionTerminationFailure> {
-    #[cfg(target_os = "linux")]
-    if let Some(process_session_id) = identity.process_session_id {
-        return signal_linux_process_session(identity, process_session_id, signal);
-    }
-    let process_group_id = identity
-        .process_group_id
-        .ok_or(SessionTerminationFailure::RuntimeIdentityUnavailable)?;
-    signal_process_group(process_group_id, signal)
-}
-
-fn signal_process_group(
-    process_group_id: libc::pid_t,
-    signal: libc::c_int,
-) -> Result<(), SessionTerminationFailure> {
-    if unsafe { libc::kill(-process_group_id, signal) } == 0 {
-        return Ok(());
-    }
-    match io::Error::last_os_error().raw_os_error() {
-        Some(libc::ESRCH) => Ok(()),
-        _ => Err(SessionTerminationFailure::VerificationFailed),
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = identity;
+        Ok(PinnedProcessRuntime {})
     }
 }
 
@@ -5888,62 +5917,78 @@ fn linux_process_session_members(
 }
 
 #[cfg(target_os = "linux")]
-fn linux_process_session_status(process_session_id: libc::pid_t) -> ProcessGroupStatus {
+fn linux_process_runtime_status(
+    identity: &TmuxRuntimeIdentity,
+    process_session_id: libc::pid_t,
+) -> ProcessGroupStatus {
+    for captured in &identity.process_session_members {
+        match read_linux_process_identity(captured.pid) {
+            Ok(Some(current)) if current.start_time == captured.start_time && !current.zombie => {
+                return ProcessGroupStatus::Running;
+            }
+            Ok(Some(_)) | Ok(None) => {}
+            Err(_) => return ProcessGroupStatus::Unknown,
+        }
+    }
     match linux_process_session_members(process_session_id) {
         Ok(members) if members.is_empty() => ProcessGroupStatus::Stopped,
-        Ok(_) => ProcessGroupStatus::Running,
-        Err(_) => ProcessGroupStatus::Unknown,
+        Ok(_) | Err(_) => ProcessGroupStatus::Unknown,
     }
 }
 
 #[cfg(target_os = "linux")]
-fn signal_linux_process_session(
-    identity: &TmuxRuntimeIdentity,
+fn pin_linux_process(
+    captured: &TmuxProcessIdentity,
     process_session_id: libc::pid_t,
-    signal: libc::c_int,
-) -> Result<(), SessionTerminationFailure> {
-    if process_session_id <= 1 || process_session_id == unsafe { libc::getsid(0) } {
+) -> Result<PinnedLinuxProcess, SessionTerminationFailure> {
+    if captured.pid <= 1 || captured.pid == unsafe { libc::getpid() } {
         return Err(SessionTerminationFailure::RuntimeIdentityUnavailable);
     }
-    if identity.process_session_members.is_empty() {
-        return Err(SessionTerminationFailure::RuntimeIdentityUnavailable);
-    }
-    let current_members = linux_process_session_members(process_session_id)?;
-    if current_members.iter().any(|current| {
-        !identity.process_session_members.iter().any(|captured| {
-            captured.pid == current.pid && captured.start_time == current.start_time
-        })
-    }) {
+    let raw_fd = unsafe { libc::syscall(libc::SYS_pidfd_open, captured.pid, 0) };
+    if raw_fd < 0 {
         return Err(SessionTerminationFailure::VerificationFailed);
     }
-    for current in current_members {
-        signal_linux_process(&current, signal)?;
+    let pidfd = unsafe { OwnedFd::from_raw_fd(raw_fd as libc::c_int) };
+    let current = read_linux_process_identity(captured.pid)?
+        .filter(|current| {
+            current.session_id == process_session_id
+                && current.start_time == captured.start_time
+                && !current.zombie
+        })
+        .ok_or(SessionTerminationFailure::VerificationFailed)?;
+    if current.pid != captured.pid {
+        return Err(SessionTerminationFailure::VerificationFailed);
+    }
+    pidfd_send_signal(&pidfd, 0, false)?;
+    Ok(PinnedLinuxProcess {
+        identity: captured.clone(),
+        pidfd,
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn signal_pinned_process_runtime(
+    pinned_runtime: &PinnedProcessRuntime,
+    signal: libc::c_int,
+) -> Result<(), SessionTerminationFailure> {
+    if pinned_runtime.processes.is_empty() {
+        return Err(SessionTerminationFailure::RuntimeIdentityUnavailable);
+    }
+    for process in &pinned_runtime.processes {
+        if process.identity.pid <= 1 {
+            return Err(SessionTerminationFailure::RuntimeIdentityUnavailable);
+        }
+        pidfd_send_signal(&process.pidfd, signal, true)?;
     }
     Ok(())
 }
 
 #[cfg(target_os = "linux")]
-fn signal_linux_process(
-    expected: &LinuxProcessIdentity,
+fn pidfd_send_signal(
+    pidfd: &OwnedFd,
     signal: libc::c_int,
+    allow_exited: bool,
 ) -> Result<(), SessionTerminationFailure> {
-    if expected.pid <= 1 || expected.pid == unsafe { libc::getpid() } {
-        return Err(SessionTerminationFailure::RuntimeIdentityUnavailable);
-    }
-    let raw_fd = unsafe { libc::syscall(libc::SYS_pidfd_open, expected.pid, 0) };
-    if raw_fd < 0 {
-        return match io::Error::last_os_error().raw_os_error() {
-            Some(libc::ESRCH) => Ok(()),
-            _ => Err(SessionTerminationFailure::VerificationFailed),
-        };
-    }
-    let pidfd = unsafe { OwnedFd::from_raw_fd(raw_fd as libc::c_int) };
-    let Some(current) = read_linux_process_identity(expected.pid)? else {
-        return Ok(());
-    };
-    if current.session_id != expected.session_id || current.start_time != expected.start_time {
-        return Err(SessionTerminationFailure::VerificationFailed);
-    }
     let result = unsafe {
         libc::syscall(
             libc::SYS_pidfd_send_signal,
@@ -5957,7 +6002,7 @@ fn signal_linux_process(
         return Ok(());
     }
     match io::Error::last_os_error().raw_os_error() {
-        Some(libc::ESRCH) => Ok(()),
+        Some(libc::ESRCH) if allow_exited => Ok(()),
         _ => Err(SessionTerminationFailure::VerificationFailed),
     }
 }
@@ -7119,15 +7164,21 @@ mod tests {
         write_session_record,
     };
     use pretty_assertions::assert_eq;
+    #[cfg(target_os = "linux")]
+    use std::env;
+    use std::fs;
     use std::io;
     use std::os::unix::fs::PermissionsExt;
     use std::os::unix::process::CommandExt;
     use std::path::Path;
-    use std::process::{Child, Command, Stdio};
+    #[cfg(target_os = "linux")]
+    use std::path::PathBuf;
+    #[cfg(target_os = "linux")]
+    use std::process::Stdio;
+    use std::process::{Child, Command};
     use std::sync::mpsc;
     use std::thread;
     use std::time::{Duration, Instant};
-    use std::{env, fs};
 
     fn test_context(state_dir: &Path) -> CliContext {
         CliContext {
@@ -7442,7 +7493,26 @@ mod tests {
             Self::from_child(child)
         }
 
+        #[cfg(target_os = "linux")]
         fn spawn_tree(descendant_pid: &Path) -> Self {
+            Self::spawn_session_helper(descendant_pid, None, None)
+        }
+
+        #[cfg(target_os = "linux")]
+        fn spawn_escaping_tree(
+            descendant_pid: &Path,
+            escape_trigger: &Path,
+            escaped_marker: &Path,
+        ) -> Self {
+            Self::spawn_session_helper(descendant_pid, Some(escape_trigger), Some(escaped_marker))
+        }
+
+        #[cfg(target_os = "linux")]
+        fn spawn_session_helper(
+            descendant_pid: &Path,
+            escape_trigger: Option<&Path>,
+            escaped_marker: Option<&Path>,
+        ) -> Self {
             let mut command = Command::new(env::current_exe().expect("test executable"));
             command
                 .arg("--exact")
@@ -7451,6 +7521,12 @@ mod tests {
                 .env("AGENT_SESSION_TEST_DESCENDANT_PID", descendant_pid)
                 .stdout(Stdio::null())
                 .stderr(Stdio::null());
+            if let Some(escape_trigger) = escape_trigger {
+                command.env("AGENT_SESSION_TEST_ESCAPE_TRIGGER", escape_trigger);
+            }
+            if let Some(escaped_marker) = escaped_marker {
+                command.env("AGENT_SESSION_TEST_ESCAPED_MARKER", escaped_marker);
+            }
             // SAFETY: this test-only child must own a dedicated process session.
             unsafe {
                 command.pre_exec(|| {
@@ -7514,13 +7590,25 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn process_session_descendant_helper() {
         let Some(descendant_pid_path) = env::var_os("AGENT_SESSION_TEST_DESCENDANT_PID") else {
             return;
         };
-        let mut command = Command::new("sleep");
-        command.arg("30").process_group(0);
+        let escape = env::var_os("AGENT_SESSION_TEST_ESCAPE_TRIGGER");
+        let mut command = if escape.is_some() {
+            let mut command = Command::new(env::current_exe().expect("test executable"));
+            command
+                .arg("--exact")
+                .arg("tests::process_session_escape_helper")
+                .arg("--nocapture");
+            command
+        } else {
+            let mut command = Command::new("sleep");
+            command.arg("30").process_group(0);
+            command
+        };
         // SAFETY: the helper deliberately models an independently grouped descendant.
         unsafe {
             command.pre_exec(|| {
@@ -7536,15 +7624,55 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn linux_process_signal_rejects_a_reused_numeric_pid_identity() {
+    fn process_session_escape_helper() {
+        let (Some(trigger), Some(marker)) = (
+            env::var_os("AGENT_SESSION_TEST_ESCAPE_TRIGGER"),
+            env::var_os("AGENT_SESSION_TEST_ESCAPED_MARKER"),
+        ) else {
+            return;
+        };
+        // SAFETY: this test helper models a captured descendant escaping its original session.
+        unsafe {
+            libc::signal(libc::SIGTERM, libc::SIG_IGN);
+            libc::signal(libc::SIGHUP, libc::SIG_IGN);
+        }
+        let trigger = PathBuf::from(trigger);
+        let started_at = Instant::now();
+        while !trigger.is_file() && started_at.elapsed() < Duration::from_secs(5) {
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(trigger.is_file(), "escape trigger must arrive");
+        assert!(
+            unsafe { libc::setsid() } > 1,
+            "descendant must escape its session"
+        );
+        fs::write(marker, "escaped").unwrap();
+        thread::sleep(Duration::from_secs(30));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_process_pin_rejects_a_reused_numeric_pid_identity() {
         let pane = TestProcessGroup::spawn();
         let mut expected = super::read_linux_process_identity(pane.pid() as libc::pid_t)
             .unwrap()
             .expect("live process identity");
         expected.start_time = expected.start_time.saturating_add(1);
+        let identity = TmuxRuntimeIdentity {
+            launch_id: Some("launch-reused-pid".to_string()),
+            session_id: "$91".to_string(),
+            pane_id: "%91".to_string(),
+            pane_pid: pane.pid() as libc::pid_t,
+            process_group_id: Some(pane.process_group_id),
+            process_session_id: Some(expected.session_id),
+            process_session_members: vec![TmuxProcessIdentity {
+                pid: expected.pid,
+                start_time: expected.start_time,
+            }],
+        };
 
         assert_eq!(
-            super::signal_linux_process(&expected, libc::SIGTERM).unwrap_err(),
+            super::pin_process_runtime(&identity).unwrap_err(),
             super::SessionTerminationFailure::VerificationFailed
         );
         assert_eq!(unsafe { libc::kill(pane.pid() as libc::pid_t, 0) }, 0);
@@ -7552,7 +7680,7 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn linux_process_session_signal_rejects_an_uncaptured_member() {
+    fn linux_process_session_pin_rejects_an_uncaptured_member() {
         let tmp = tempfile::TempDir::new().unwrap();
         let descendant_pid_path = tmp.path().join("uncaptured-descendant.pid");
         let pane = ReapedTestProcessGroup::spawn_tree(&descendant_pid_path);
@@ -7578,8 +7706,7 @@ mod tests {
         };
 
         assert_eq!(
-            super::signal_linux_process_session(&identity, leader.session_id, libc::SIGTERM)
-                .unwrap_err(),
+            super::pin_process_runtime(&identity).unwrap_err(),
             super::SessionTerminationFailure::VerificationFailed
         );
         assert_eq!(unsafe { libc::kill(leader.pid, 0) }, 0);
@@ -8263,6 +8390,7 @@ fi
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn delete_terminates_verified_runtime_session_descendants_with_sigkill_escalation() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -8323,6 +8451,81 @@ fi
         assert!(
             stopped,
             "the verified runtime process tree must not survive deletion"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn delete_terminates_a_captured_member_after_it_escapes_the_process_session() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let context = test_context(tmp.path());
+        let id = create_test_record_id(
+            &context,
+            AgentKind::Codex,
+            None,
+            Some("delete-runtime-session-escape"),
+        );
+        let record = load_session_record(&context, &id).unwrap();
+        let descendant_pid_path = tmp.path().join("escaping-descendant.pid");
+        let escape_trigger = tmp.path().join("escape.trigger");
+        let escaped_marker = tmp.path().join("escaped.marker");
+        let pane = ReapedTestProcessGroup::spawn_escaping_tree(
+            &descendant_pid_path,
+            &escape_trigger,
+            &escaped_marker,
+        );
+        let descendant_pid: libc::pid_t = fs::read_to_string(&descendant_pid_path)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        assert_eq!(
+            unsafe { libc::getsid(descendant_pid) },
+            pane.pid() as libc::pid_t
+        );
+        let tmux = tmp.path().join("tmux-runtime-session-escape");
+        let killed = tmp.path().join("tmux-killed");
+        fs::write(
+            &tmux,
+            format!(
+                "#!/bin/sh\n{identity}if [ \"$1\" = has-session ]; then\n  if [ -f {killed} ]; then printf \"%s\\n\" \"can't find session: $91\" >&2; exit 1; fi\n  exit 0\nfi\nif [ \"$1\" = if-shell ]; then\n  : > {escape_trigger}\n  while [ ! -f {escaped_marker} ]; do sleep 0.01; done\n  : > {killed}\n  exit 0\nfi\nexit 42\n",
+                identity = deletion_identity_script(&context, &record, pane.pid()),
+                killed = killed.display(),
+                escape_trigger = escape_trigger.display(),
+                escaped_marker = escaped_marker.display(),
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&tmux, fs::Permissions::from_mode(0o700)).unwrap();
+
+        let result = delete_session_with_timeouts(
+            &context,
+            &id,
+            tmux,
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+        )
+        .unwrap();
+
+        assert!(
+            escaped_marker.is_file(),
+            "descendant must escape after pinning"
+        );
+        assert!(result.deleted);
+        assert!(!session_dir(&context, &id).exists());
+        let started_at = Instant::now();
+        let stopped = loop {
+            if unsafe { libc::kill(descendant_pid, 0) } < 0 {
+                break io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH);
+            }
+            if started_at.elapsed() >= Duration::from_secs(2) {
+                break false;
+            }
+            thread::sleep(Duration::from_millis(10));
+        };
+        assert!(
+            stopped,
+            "the pinned escaped process must not survive deletion"
         );
     }
 

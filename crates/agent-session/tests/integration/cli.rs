@@ -5023,7 +5023,7 @@ exit 0
 }
 
 #[test]
-fn delete_terminates_the_exact_pane_process_group_after_tmux_stops() {
+fn delete_handles_the_exact_pane_process_group_after_tmux_stops() {
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let state_dir = tmp.path().join("state");
     let pane = spawn_test_process_group();
@@ -5084,13 +5084,26 @@ exit 42
         &[],
     );
 
-    assert_eq!(output.code, 0, "stdout={}", output.stdout_text());
-    assert_eq!(data(&output.stdout_json())["deleted"], true);
-    assert!(
-        !session_dir.exists(),
-        "completed delete must remove metadata"
-    );
-    assert!(!pane.is_running());
+    #[cfg(target_os = "linux")]
+    {
+        assert_eq!(output.code, 0, "stdout={}", output.stdout_text());
+        assert_eq!(data(&output.stdout_json())["deleted"], true);
+        assert!(
+            !session_dir.exists(),
+            "completed delete must remove metadata"
+        );
+        assert!(!pane.is_running());
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        assert_eq!(output.code, 1, "stdout={}", output.stdout_text());
+        assert_eq!(
+            output.stdout_json()["error"]["details"]["reason"],
+            "process-still-running"
+        );
+        assert!(session_dir.exists());
+        assert!(pane.is_running());
+    }
 }
 
 #[test]
