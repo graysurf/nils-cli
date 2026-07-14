@@ -2574,9 +2574,21 @@ async fn codex_account_handler(
             "expected_session_incarnation is required",
         );
     };
-    let _switch_guard = state.codex_account_switches.lock(&id).await;
+    let resolve_context = state.context.clone();
+    let requested_id = id.clone();
+    let resolved_record = match tokio::task::spawn_blocking(move || {
+        load_session_record(&resolve_context, &requested_id)
+    })
+    .await
+    {
+        Ok(Ok(record)) => record,
+        Ok(Err(err)) => return envelope_err(err),
+        Err(_) => return join_err(),
+    };
+    let canonical_id = resolved_record.id;
+    let _switch_guard = state.codex_account_switches.lock(&canonical_id).await;
     let context = state.context.clone();
-    let load_id = id.clone();
+    let load_id = canonical_id.clone();
     let record =
         match tokio::task::spawn_blocking(move || load_session_record(&context, &load_id)).await {
             Ok(Ok(record)) => record,
@@ -2608,7 +2620,7 @@ async fn codex_account_handler(
             "session was replaced before its Codex account switch was applied",
         );
     }
-    let Some(handle) = wait_for_codex_control(&state, &id, &launch_id).await else {
+    let Some(handle) = wait_for_codex_control(&state, &canonical_id, &launch_id).await else {
         return status_json(
             StatusCode::CONFLICT,
             "codex-account-control-unavailable",
@@ -2616,7 +2628,7 @@ async fn codex_account_handler(
         );
     };
     let begin_context = state.context.clone();
-    let begin_id = id.clone();
+    let begin_id = canonical_id.clone();
     let begin_launch_id = launch_id.clone();
     let begin_account = body.account.clone();
     let revision = match tokio::task::spawn_blocking(move || {
@@ -2637,7 +2649,7 @@ async fn codex_account_handler(
         Ok(view) => envelope_ok(json!({ "machine": state.machine, "codex_account": view })),
         Err(_) => {
             let finish_context = state.context.clone();
-            let finish_id = id.clone();
+            let finish_id = canonical_id.clone();
             let finish_launch_id = launch_id.clone();
             let finish_account = body.account.clone();
             let _ = tokio::task::spawn_blocking(move || {
@@ -9936,7 +9948,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn codex_account_switch_serializes_the_complete_same_session_transaction() {
+    async fn codex_account_switch_serializes_full_id_and_prefix_as_one_transaction() {
         let lock = GlobalStateLock::new();
         let tmp = tempfile::TempDir::new().unwrap();
         let _broker = EnvGuard::set(
@@ -10002,7 +10014,7 @@ mod tests {
         let second = tokio::spawn(call(
             router(st.clone()),
             put_json(
-                "/sessions/account-switch-serialized/account",
+                "/sessions/account-switch-ser/account",
                 Some(TOKEN),
                 json!({
                     "account": "sym",
