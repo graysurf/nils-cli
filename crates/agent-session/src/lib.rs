@@ -3333,24 +3333,46 @@ fn normalize_title_state_component(
     let Some(value) = value else {
         return Ok(None);
     };
-    let value = value
-        .split(is_javascript_whitespace)
-        .filter(|component| !component.is_empty())
-        .collect::<Vec<_>>()
-        .join(" ");
-    if value.is_empty() {
-        return Ok(None);
+    normalize_title_state_component_chars(value.chars(), field)
+}
+
+fn normalize_title_state_component_chars(
+    characters: impl IntoIterator<Item = char>,
+    field: &str,
+) -> Result<Option<String>, CliError> {
+    let mut normalized = String::with_capacity(SESSION_TITLE_MAX_CHARS);
+    let mut character_count = 0usize;
+    let mut pending_space = false;
+    for character in characters {
+        if is_javascript_whitespace(character) {
+            pending_space = !normalized.is_empty();
+            continue;
+        }
+        if pending_space {
+            if character_count == SESSION_TITLE_MAX_CHARS {
+                return Err(title_state_component_too_long(field));
+            }
+            normalized.push(' ');
+            character_count += 1;
+            pending_space = false;
+        }
+        if character_count == SESSION_TITLE_MAX_CHARS {
+            return Err(title_state_component_too_long(field));
+        }
+        normalized.push(character);
+        character_count += 1;
     }
-    if value.chars().count() > SESSION_TITLE_MAX_CHARS {
-        return Err(CliError::usage(
-            "invalid-title-state",
-            format!("title_state {field} must be {SESSION_TITLE_MAX_CHARS} characters or fewer"),
-            Some(
-                json!({ "field": format!("title_state.{field}"), "max_chars": SESSION_TITLE_MAX_CHARS }),
-            ),
-        ));
-    }
-    Ok(Some(value))
+    Ok((!normalized.is_empty()).then_some(normalized))
+}
+
+fn title_state_component_too_long(field: &str) -> CliError {
+    CliError::usage(
+        "invalid-title-state",
+        format!("title_state {field} must be {SESSION_TITLE_MAX_CHARS} characters or fewer"),
+        Some(
+            json!({ "field": format!("title_state.{field}"), "max_chars": SESSION_TITLE_MAX_CHARS }),
+        ),
+    )
 }
 
 fn is_javascript_whitespace(character: char) -> bool {
@@ -5593,6 +5615,19 @@ mod tests {
         .unwrap();
 
         assert_eq!(title, "Alpha\u{0085}Beta Gamma");
+    }
+
+    #[test]
+    fn structured_title_normalization_stops_at_the_character_limit() {
+        let consumed = std::cell::Cell::new(0usize);
+        let input = std::iter::repeat_n('x', 1_000_000).inspect(|_| {
+            consumed.set(consumed.get() + 1);
+        });
+
+        let err = super::normalize_title_state_component_chars(input, "topic").unwrap_err();
+
+        assert_eq!(err.0.code, "invalid-title-state");
+        assert_eq!(consumed.get(), super::SESSION_TITLE_MAX_CHARS + 1);
     }
 
     #[test]
