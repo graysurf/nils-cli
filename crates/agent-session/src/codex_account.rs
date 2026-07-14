@@ -908,6 +908,7 @@ mod tests {
             agent: "codex".to_string(),
             mode: "interactive".to_string(),
             title: None,
+            title_state: None,
             title_revision: 0,
             cwd: "/repo".to_string(),
             tmux_session: "hs-binding-fixture".to_string(),

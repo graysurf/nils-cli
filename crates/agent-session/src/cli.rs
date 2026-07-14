@@ -1,5 +1,7 @@
 use std::path::PathBuf;
 
+use crate::SessionTitleState;
+
 use clap::{Args, Parser, Subcommand, ValueEnum, ValueHint};
 use nils_common::cli_contract::OutputFormat;
 
@@ -90,6 +92,10 @@ pub struct StartArgs {
     /// Internal: account nickname selected by the serve daemon.
     #[arg(skip)]
     pub initial_codex_account: Option<String>,
+
+    /// Internal: structured title provenance supplied by the serve daemon.
+    #[arg(skip)]
+    pub initial_title_state: Option<SessionTitleState>,
 
     /// Agent to run.
     #[arg(long, value_enum)]

@@ -45,7 +45,7 @@ use nils_common::usage_time::{
     epoch_seconds_from_f64, normalize_epoch_seconds, reset_epoch_seconds_from_str,
 };
 use notify::{Event as NotifyEvent, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Value, json};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, broadcast, mpsc, watch};
 use tokio::task::JoinSet;
@@ -58,8 +58,9 @@ use crate::provider_prompt::{
     ProviderPromptSource, ProviderPromptTail,
 };
 use crate::{
-    BINARY, CliContext, CliError, ProviderResumeImportArgs, SessionRecord, SessionView,
-    StartFailureDisposition, WorkdirSearchOptions, delete_session, glance_session, list_sessions,
+    BINARY, CliContext, CliError, ProviderResumeImportArgs, SessionRecord, SessionTitleState,
+    SessionTitleStateInput, SessionView, StartFailureDisposition, WorkdirSearchOptions,
+    canonicalize_structured_title_pair, delete_session, glance_session, list_sessions,
     load_session_record, non_empty_env, repo_remote_url_from_cwd, resolve_tmux_bin,
     resume_session_by_id, search_workdirs, send_auto_resume_input, send_input_serialized,
     session_clipboard_buffer, session_dir, session_status, short_hostname,
@@ -2055,7 +2056,9 @@ struct GlanceQuery {
 struct CreateBody {
     agent: String,
     cwd: Option<String>,
-    title: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_create_title")]
+    title: CreateTitleInput,
+    title_state: Option<SessionTitleStateInput>,
     id: Option<String>,
     prompt: Option<String>,
     #[serde(default, alias = "resume_id")]
@@ -2064,6 +2067,37 @@ struct CreateBody {
     agent_args: Vec<String>,
     #[serde(default)]
     codex_account: Option<String>,
+}
+
+#[derive(Debug, Default)]
+enum CreateTitleInput {
+    #[default]
+    Missing,
+    Null,
+    Value(String),
+}
+
+impl CreateTitleInput {
+    fn is_supplied(&self) -> bool {
+        !matches!(self, Self::Missing)
+    }
+
+    fn into_value(self) -> Option<String> {
+        match self {
+            Self::Missing | Self::Null => None,
+            Self::Value(value) => Some(value),
+        }
+    }
+}
+
+fn deserialize_create_title<'de, D>(deserializer: D) -> Result<CreateTitleInput, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Ok(match Option::<String>::deserialize(deserializer)? {
+        Some(value) => CreateTitleInput::Value(value),
+        None => CreateTitleInput::Null,
+    })
 }
 
 #[derive(Debug, Deserialize)]
@@ -2245,6 +2279,18 @@ async fn create_handler(
         ));
     };
     let context = state.context.clone();
+    let title_supplied = body.title.is_supplied();
+    let title = body.title.into_value();
+    let title_state = body.title_state.map(SessionTitleState::from);
+    let (title, title_state) = match title_state {
+        Some(title_state) => {
+            match canonicalize_structured_title_pair(title, title_supplied, title_state) {
+                Ok(pair) => pair,
+                Err(err) => return envelope_err(err),
+            }
+        }
+        None => (title, None),
+    };
     if body.codex_account.is_some() && agent != AgentKind::Codex {
         return envelope_err(CliError::usage(
             "codex-account-agent-conflict",
@@ -2277,7 +2323,8 @@ async fn create_handler(
         let args = ProviderResumeImportArgs {
             agent,
             provider_resume_id,
-            title: body.title,
+            title,
+            title_state,
             id: body.id,
             tmux_bin: Some(state.tmux_bin.clone()),
             agent_bin: None,
@@ -2306,9 +2353,10 @@ async fn create_handler(
     let args = cli::StartArgs {
         app_server_managed: true,
         initial_codex_account: selected_account.clone(),
+        initial_title_state: title_state,
         agent,
         cwd: body.cwd.map(PathBuf::from),
-        title: body.title,
+        title,
         id: body.id,
         prompt: if selected_account.is_some() {
             None
@@ -3349,9 +3397,9 @@ async fn update_session_handler(
             None,
         ));
     };
-    let title = match object.get("title") {
-        Some(Value::String(title)) => Some(title.clone()),
-        Some(Value::Null) => None,
+    let title_input = match object.get("title") {
+        Some(Value::String(title)) => Some(Some(title.clone())),
+        Some(Value::Null) => Some(None),
         Some(_) => {
             return envelope_err(CliError::usage(
                 "invalid-title",
@@ -3359,13 +3407,36 @@ async fn update_session_handler(
                 Some(json!({ "field": "title" })),
             ));
         }
-        None => {
-            return envelope_err(CliError::usage(
-                "missing-title",
-                "session update requires a title field",
-                Some(json!({ "field": "title" })),
-            ));
-        }
+        None => None,
+    };
+    let title_state_input = match object.get("title_state") {
+        Some(Value::Null) => Some(None),
+        Some(value) => match serde_json::from_value::<SessionTitleStateInput>(value.clone()) {
+            Ok(state) => Some(Some(SessionTitleState::from(state))),
+            Err(_) => {
+                return envelope_err(CliError::usage(
+                    "invalid-title-state",
+                    "title_state must be a valid structured title object or null",
+                    Some(json!({ "field": "title_state" })),
+                ));
+            }
+        },
+        None => None,
+    };
+    let title_supplied = title_input.is_some();
+    let (title, title_state) = match title_state_input {
+        Some(Some(state)) => (title_input.flatten(), Some(state)),
+        Some(None) => (title_input.flatten(), None),
+        None => match title_input {
+            Some(title) => (title, None),
+            None => {
+                return envelope_err(CliError::usage(
+                    "missing-title",
+                    "session update requires a title or title_state field",
+                    Some(json!({ "field": "title" })),
+                ));
+            }
+        },
     };
     let expected_title_revision = match object.get("expected_title_revision") {
         Some(Value::Number(revision)) => match revision.as_u64() {
@@ -3439,6 +3510,8 @@ async fn update_session_handler(
             &context,
             &id,
             title,
+            title_supplied,
+            title_state,
             crate::TitleUpdatePreconditions {
                 title_revision: expected_title_revision,
                 session_created_at: expected_session_created_at,
@@ -9590,7 +9663,7 @@ esac
         let st = state(tmp.path(), Some(TOKEN), logging_tmux(tmp.path(), &log));
 
         let (status, body) = call(
-            router(st),
+            router(st.clone()),
             post_json(
                 "/sessions",
                 Some(TOKEN),
@@ -9722,7 +9795,12 @@ esac
                     "agent": "codex",
                     "id": "imported-codex",
                     "provider_resume_id": "external-codex-id",
-                    "title": "Imported Codex"
+                    "title_state": {
+                        "topic": "Imported Codex",
+                        "topic_source": "user",
+                        "references": ["#317"],
+                        "activity": null
+                    }
                 }),
             ),
         )
@@ -9731,6 +9809,10 @@ esac
         let session = &body["data"]["session"];
         assert_eq!(session["id"], "imported-codex");
         assert_eq!(session["agent"], "codex");
+        assert_eq!(session["title"], "Imported Codex #317");
+        assert_eq!(session["title_state"]["topic"], "Imported Codex");
+        assert_eq!(session["title_state"]["topic_source"], "user");
+        assert_eq!(session["title_state"]["references"], json!(["#317"]));
         assert_eq!(session["cwd"], cwd.to_string_lossy().as_ref());
         assert_eq!(session["status"], "running");
         assert_eq!(session["resumable"], true);
@@ -10174,7 +10256,7 @@ esac
         assert_eq!(status, StatusCode::UNAUTHORIZED, "body={body}");
 
         let (status, body) = call(
-            router(st),
+            router(st.clone()),
             post_json(
                 "/sessions/structured/prompt",
                 Some(TOKEN),
@@ -10966,6 +11048,154 @@ esac
     }
 
     #[tokio::test]
+    async fn update_session_title_state_renders_and_persists_without_delimiter_inference() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let tmux = minimal_tmux(tmp.path());
+        seed_session_with_runtime(
+            tmp.path(),
+            "structured-title",
+            "codex",
+            "hs-codex-structured-title",
+        );
+        let st = state(tmp.path(), Some(TOKEN), tmux);
+
+        let user_state = json!({
+            "topic": "Retitle #317 rules",
+            "topic_source": "user",
+            "references": ["#317"],
+            "activity": "Implement daemon contract"
+        });
+        let (status, body) = call(
+            router(st.clone()),
+            patch_json(
+                "/sessions/structured-title",
+                Some(TOKEN),
+                json!({
+                    "title": null,
+                    "title_state": user_state,
+                    "expected_title_revision": 0,
+                    "expected_session_incarnation": "launch-structured-title",
+                    "expected_session_title": null
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "body={body}");
+        assert_eq!(body["error"]["code"], "title-state-mismatch");
+
+        let (status, body) = call(
+            router(st.clone()),
+            patch_json(
+                "/sessions/structured-title",
+                Some(TOKEN),
+                json!({
+                    "title_state": user_state,
+                    "expected_title_revision": 0,
+                    "expected_session_incarnation": "launch-structured-title",
+                    "expected_session_title": null
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "body={body}");
+        assert_eq!(
+            body["data"]["session"]["title"],
+            "Retitle #317 rules - Implement daemon contract"
+        );
+        assert_eq!(body["data"]["session"]["title_state"], user_state);
+        assert_eq!(body["data"]["session"]["title_state_supported"], true);
+        assert_eq!(body["data"]["session"]["title_revision"], 1);
+
+        let activity_only_state = json!({
+            "topic": null,
+            "topic_source": "none",
+            "references": [],
+            "activity": "中文說明"
+        });
+        let (status, body) = call(
+            router(st.clone()),
+            patch_json(
+                "/sessions/structured-title",
+                Some(TOKEN),
+                json!({
+                    "title_state": activity_only_state,
+                    "expected_title_revision": 1,
+                    "expected_session_incarnation": "launch-structured-title",
+                    "expected_session_title": "Retitle #317 rules - Implement daemon contract"
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "body={body}");
+        assert_eq!(body["data"]["session"]["title"], "中文說明");
+        assert_eq!(body["data"]["session"]["title_state"], activity_only_state);
+        assert_eq!(body["data"]["session"]["title_revision"], 2);
+
+        let (status, body) = call(
+            router(st),
+            patch_json(
+                "/sessions/structured-title",
+                Some(TOKEN),
+                json!({
+                    "title": "Direct rewrite",
+                    "expected_title_revision": 2,
+                    "expected_session_incarnation": "launch-structured-title",
+                    "expected_session_title": "中文說明"
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "body={body}");
+        assert_eq!(body["data"]["session"]["title"], "Direct rewrite");
+        assert!(body["data"]["session"].get("title_state").is_none());
+        assert_eq!(body["data"]["session"]["title_revision"], 3);
+
+        let record_path = tmp.path().join("sessions/structured-title/session.json");
+        let record: Value =
+            serde_json::from_str(&std::fs::read_to_string(&record_path).unwrap()).unwrap();
+        assert_eq!(record["title"], "Direct rewrite");
+        assert!(record.get("title_state").is_none());
+        assert_eq!(record["title_revision"], 3);
+    }
+
+    #[tokio::test]
+    async fn create_rejects_explicit_null_with_nonempty_title_state_in_both_modes() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let st = state(tmp.path(), Some(TOKEN), minimal_tmux(tmp.path()));
+        let title_state = json!({
+            "topic": "Explicit topic",
+            "topic_source": "user",
+            "references": [],
+            "activity": null
+        });
+        let cases = [
+            json!({
+                "agent": "codex",
+                "id": "null-title-fresh",
+                "title": null,
+                "title_state": title_state
+            }),
+            json!({
+                "agent": "codex",
+                "id": "null-title-provider-resume",
+                "provider_resume_id": "missing-provider-session",
+                "title": null,
+                "title_state": title_state
+            }),
+        ];
+
+        for body in cases {
+            let (status, body) = call(
+                router(st.clone()),
+                post_json("/sessions", Some(TOKEN), body),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "body={body}");
+            assert_eq!(body["error"]["code"], "title-state-mismatch");
+        }
+    }
+
+    #[tokio::test]
     async fn expected_session_title_uses_the_unicode_title_limit() {
         let tmp = tempfile::TempDir::new().unwrap();
         let tmux = minimal_tmux(tmp.path());
@@ -11140,7 +11370,7 @@ esac
         let st = state(tmp.path(), Some(TOKEN), tmux);
         let barrier = Arc::new(tokio::sync::Barrier::new(3));
 
-        let spawn_writer = |title: &'static str| {
+        let spawn_writer = |topic: &'static str, activity: &'static str| {
             let st = st.clone();
             let barrier = barrier.clone();
             tokio::spawn(async move {
@@ -11150,14 +11380,22 @@ esac
                     patch_json(
                         "/sessions/concurrent-revision",
                         Some(TOKEN),
-                        json!({ "title": title, "expected_title_revision": 0 }),
+                        json!({
+                            "title_state": {
+                                "topic": topic,
+                                "topic_source": "auto",
+                                "references": [],
+                                "activity": activity
+                            },
+                            "expected_title_revision": 0
+                        }),
                     ),
                 )
                 .await
             })
         };
-        let first = spawn_writer("First contender");
-        let second = spawn_writer("Second contender");
+        let first = spawn_writer("First topic", "First contender");
+        let second = spawn_writer("Second topic", "Second contender");
         barrier.wait().await;
         let (first, second) = tokio::join!(first, second);
         let responses = [first.expect("first writer"), second.expect("second writer")];
@@ -11178,7 +11416,25 @@ esac
         let record_path = tmp.path().join("sessions/concurrent-revision/session.json");
         let record: Value =
             serde_json::from_str(&std::fs::read_to_string(&record_path).unwrap()).unwrap();
-        assert!(record["title"] == "First contender" || record["title"] == "Second contender");
+        let first_state = json!({
+            "topic": "First topic",
+            "topic_source": "auto",
+            "references": [],
+            "activity": "First contender"
+        });
+        let second_state = json!({
+            "topic": "Second topic",
+            "topic_source": "auto",
+            "references": [],
+            "activity": "Second contender"
+        });
+        assert!(
+            (record["title"] == "First topic - First contender"
+                && record["title_state"] == first_state)
+                || (record["title"] == "Second topic - Second contender"
+                    && record["title_state"] == second_state),
+            "record={record:?}"
+        );
         assert_eq!(record["title_revision"], 1);
     }
 
@@ -13978,6 +14234,7 @@ exit 0
             agent: "codex".to_string(),
             mode: "interactive".to_string(),
             title: None,
+            title_state: None,
             title_revision: 0,
             cwd: "/tmp".to_string(),
             tmux_session: tmux_session.to_string(),

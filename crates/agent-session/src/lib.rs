@@ -455,6 +455,8 @@ struct SessionRecord {
     agent: String,
     mode: String,
     title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    title_state: Option<SessionTitleState>,
     #[serde(default)]
     title_revision: u64,
     cwd: String,
@@ -475,6 +477,66 @@ struct SessionRecord {
     extra: BTreeMap<String, Value>,
     #[serde(skip)]
     resume_sidecar_extra: BTreeMap<String, Value>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum SessionTitleTopicSource {
+    None,
+    Auto,
+    User,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+struct SessionTitleState {
+    topic: Option<String>,
+    topic_source: SessionTitleTopicSource,
+    #[serde(default)]
+    references: Vec<String>,
+    activity: Option<String>,
+    #[serde(default, flatten, skip_serializing_if = "BTreeMap::is_empty")]
+    extra: BTreeMap<String, Value>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SessionTitleStateInput {
+    topic: Option<String>,
+    topic_source: SessionTitleTopicSource,
+    #[serde(default)]
+    references: Vec<String>,
+    activity: Option<String>,
+}
+
+impl From<SessionTitleStateInput> for SessionTitleState {
+    fn from(input: SessionTitleStateInput) -> Self {
+        Self {
+            topic: input.topic,
+            topic_source: input.topic_source,
+            references: input.references,
+            activity: input.activity,
+            extra: BTreeMap::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct SessionTitleStateView {
+    topic: Option<String>,
+    topic_source: SessionTitleTopicSource,
+    references: Vec<String>,
+    activity: Option<String>,
+}
+
+impl From<&SessionTitleState> for SessionTitleStateView {
+    fn from(state: &SessionTitleState) -> Self {
+        Self {
+            topic: state.topic.clone(),
+            topic_source: state.topic_source.clone(),
+            references: state.references.clone(),
+            activity: state.activity.clone(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -1012,6 +1074,9 @@ struct SessionView {
     agent: String,
     mode: String,
     title: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    title_state: Option<SessionTitleStateView>,
+    title_state_supported: bool,
     title_revision: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     session_incarnation: Option<String>,
@@ -1050,6 +1115,7 @@ pub(crate) struct ProviderResumeImportArgs {
     pub(crate) agent: AgentKind,
     pub(crate) provider_resume_id: String,
     pub(crate) title: Option<String>,
+    pub(crate) title_state: Option<SessionTitleState>,
     pub(crate) id: Option<String>,
     pub(crate) tmux_bin: Option<PathBuf>,
     pub(crate) agent_bin: Option<PathBuf>,
@@ -1086,6 +1152,9 @@ struct GlanceResult {
     id: String,
     agent: String,
     title: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    title_state: Option<SessionTitleStateView>,
+    title_state_supported: bool,
     title_revision: u64,
     tmux_session: String,
     status: String,
@@ -1211,6 +1280,7 @@ fn start_session(
         agent: args.agent,
         mode: "interactive",
         title: args.title.as_deref(),
+        title_state: args.initial_title_state,
         explicit_id: args.id.as_deref(),
         cwd: &cwd,
         prompt: prompt.as_deref(),
@@ -1393,6 +1463,7 @@ fn start_run_session(context: &CliContext, args: cli::RunArgs) -> Result<StartVi
         agent: args.agent,
         mode: "run",
         title: args.title.as_deref(),
+        title_state: None,
         explicit_id: args.id.as_deref(),
         cwd: &cwd,
         prompt: Some(&prompt),
@@ -1491,6 +1562,7 @@ pub(crate) fn start_provider_resume_session(
         agent: args.agent,
         mode: "interactive",
         title: args.title.as_deref(),
+        title_state: args.title_state,
         explicit_id: args.id.as_deref(),
         cwd: &cwd,
         prompt: None,
@@ -1568,6 +1640,7 @@ struct RecordRequest<'a> {
     agent: AgentKind,
     mode: &'a str,
     title: Option<&'a str>,
+    title_state: Option<SessionTitleState>,
     explicit_id: Option<&'a str>,
     cwd: &'a Path,
     prompt: Option<&'a str>,
@@ -1581,7 +1654,15 @@ fn create_record(request: RecordRequest<'_>) -> Result<CreatedRecord, CliError> 
     let now = Zoned::now();
     let timestamp = now.strftime("%Y%m%d-%H%M%S").to_string();
     let iso = now.timestamp().to_string();
-    let title_slug = request.title.map(slugify);
+    let title_supplied = request.title.is_some();
+    let title = request.title.map(str::to_string);
+    let (title, title_state) = match request.title_state {
+        Some(title_state) => {
+            canonicalize_structured_title_pair(title, title_supplied, title_state)?
+        }
+        None => (title, None),
+    };
+    let title_slug = title.as_deref().map(slugify);
     let id = resolve_session_id(
         request.context,
         request.explicit_id,
@@ -1608,7 +1689,8 @@ fn create_record(request: RecordRequest<'_>) -> Result<CreatedRecord, CliError> 
         id,
         agent: request.agent.as_str().to_string(),
         mode: request.mode.to_string(),
-        title: request.title.map(str::to_string),
+        title,
+        title_state,
         title_revision: 0,
         cwd: display_path(request.cwd),
         tmux_session: tmux_session.clone(),
@@ -2790,6 +2872,8 @@ fn glance_session(context: &CliContext, args: cli::GlanceArgs) -> Result<GlanceR
         id: record.id.clone(),
         agent: record.agent.clone(),
         title: record.title.clone(),
+        title_state: effective_session_title_state(&record),
+        title_state_supported: true,
         title_revision: record.title_revision,
         tmux_session: record.tmux_session.clone(),
         status,
@@ -2952,6 +3036,8 @@ fn update_session_title(
         context,
         id,
         title,
+        true,
+        None,
         TitleUpdatePreconditions::default(),
         tmux_bin,
     )
@@ -2969,10 +3055,17 @@ fn update_session_title_if_revision(
     context: &CliContext,
     id: &str,
     title: Option<String>,
+    title_supplied: bool,
+    title_state: Option<SessionTitleState>,
     expected: TitleUpdatePreconditions,
     tmux_bin: &Path,
 ) -> Result<SessionView, CliError> {
-    let normalized_title = normalize_title(title)?;
+    let (normalized_title, normalized_title_state) = match title_state {
+        Some(title_state) => {
+            canonicalize_structured_title_pair(title, title_supplied, title_state)?
+        }
+        None => (normalize_title(title)?, None),
+    };
     let (record, previous_title) = mutate_session_record_for_title(
         context,
         id,
@@ -3009,6 +3102,7 @@ fn update_session_title_if_revision(
             let previous_title = record.title.clone();
             record.title_revision = actual_title_revision;
             record.title = normalized_title;
+            record.title_state = normalized_title_state;
             record.title_revision = actual_title_revision.checked_add(1).ok_or_else(|| {
                 CliError::data(
                     "title-revision-overflow",
@@ -3462,6 +3556,270 @@ fn normalize_title(title: Option<String>) -> Result<Option<String>, CliError> {
         ));
     }
     Ok(Some(title))
+}
+
+pub(crate) fn canonicalize_structured_title_pair(
+    title: Option<String>,
+    title_supplied: bool,
+    title_state: SessionTitleState,
+) -> Result<(Option<String>, Option<SessionTitleState>), CliError> {
+    let normalized_title = normalize_structured_compatibility_title(title)?;
+    let state = normalize_title_state(title_state)?;
+    let rendered = render_session_title_state(&state)?;
+    if title_supplied && normalized_title != rendered {
+        return Err(CliError::usage(
+            "title-state-mismatch",
+            "session title must match the canonical title_state rendering",
+            Some(json!({ "field": "title_state" })),
+        ));
+    }
+    Ok((rendered, Some(state)))
+}
+
+fn normalize_structured_compatibility_title(
+    title: Option<String>,
+) -> Result<Option<String>, CliError> {
+    let Some(title) = title else {
+        return Ok(None);
+    };
+    let title = title.trim_matches(is_javascript_whitespace).to_string();
+    if title.is_empty() {
+        return Ok(None);
+    }
+    if title.chars().count() > SESSION_TITLE_MAX_CHARS {
+        return Err(CliError::usage(
+            "title-too-long",
+            "session title must be 120 characters or fewer",
+            Some(json!({ "max_chars": SESSION_TITLE_MAX_CHARS })),
+        ));
+    }
+    Ok(Some(title))
+}
+
+const SESSION_TITLE_MAX_CHARS: usize = 120;
+const SESSION_TITLE_SEPARATOR: &str = " - ";
+const SESSION_TITLE_MIN_ACTIVITY_CHARS: usize = 32;
+const SESSION_TITLE_MAX_REFERENCES: usize = 2;
+
+fn normalize_title_state(mut state: SessionTitleState) -> Result<SessionTitleState, CliError> {
+    state.topic = normalize_title_state_component(state.topic, "topic")?;
+    state.activity = normalize_title_state_component(state.activity, "activity")?;
+    match (&state.topic_source, &state.topic) {
+        (SessionTitleTopicSource::None, None)
+        | (SessionTitleTopicSource::Auto, Some(_))
+        | (SessionTitleTopicSource::User, Some(_)) => {}
+        _ => {
+            return Err(CliError::usage(
+                "invalid-title-state",
+                "topic_source must be none without a topic, or auto/user with a topic",
+                Some(json!({ "field": "title_state.topic_source" })),
+            ));
+        }
+    }
+    if state.references.len() > SESSION_TITLE_MAX_REFERENCES {
+        return Err(CliError::usage(
+            "invalid-title-state",
+            format!(
+                "title_state supports at most {SESSION_TITLE_MAX_REFERENCES} work-item references"
+            ),
+            Some(json!({ "field": "title_state.references" })),
+        ));
+    }
+    let mut normalized_references = Vec::with_capacity(state.references.len());
+    for reference in state.references {
+        let reference = reference.trim_matches(is_javascript_whitespace).to_string();
+        let number = reference.strip_prefix('#').unwrap_or_default();
+        if number.is_empty()
+            || number.starts_with('0')
+            || number.len() > 10
+            || !number.chars().all(|character| character.is_ascii_digit())
+        {
+            return Err(CliError::usage(
+                "invalid-title-state",
+                "title_state references must use #<positive-number>",
+                Some(json!({ "field": "title_state.references" })),
+            ));
+        }
+        if !normalized_references.contains(&reference) {
+            normalized_references.push(reference);
+        }
+    }
+    state.references = normalized_references;
+    Ok(state)
+}
+
+fn normalize_title_state_component(
+    value: Option<String>,
+    field: &str,
+) -> Result<Option<String>, CliError> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    normalize_title_state_component_chars(value.chars(), field)
+}
+
+fn normalize_title_state_component_chars(
+    characters: impl IntoIterator<Item = char>,
+    field: &str,
+) -> Result<Option<String>, CliError> {
+    let mut normalized = String::with_capacity(SESSION_TITLE_MAX_CHARS);
+    let mut character_count = 0usize;
+    let mut pending_space = false;
+    for character in characters {
+        if is_javascript_whitespace(character) {
+            pending_space = !normalized.is_empty();
+            continue;
+        }
+        if pending_space {
+            if character_count == SESSION_TITLE_MAX_CHARS {
+                return Err(title_state_component_too_long(field));
+            }
+            normalized.push(' ');
+            character_count += 1;
+            pending_space = false;
+        }
+        if character_count == SESSION_TITLE_MAX_CHARS {
+            return Err(title_state_component_too_long(field));
+        }
+        normalized.push(character);
+        character_count += 1;
+    }
+    Ok((!normalized.is_empty()).then_some(normalized))
+}
+
+fn title_state_component_too_long(field: &str) -> CliError {
+    CliError::usage(
+        "invalid-title-state",
+        format!("title_state {field} must be {SESSION_TITLE_MAX_CHARS} characters or fewer"),
+        Some(
+            json!({ "field": format!("title_state.{field}"), "max_chars": SESSION_TITLE_MAX_CHARS }),
+        ),
+    )
+}
+
+fn is_javascript_whitespace(character: char) -> bool {
+    matches!(
+        character,
+        '\u{0009}'..='\u{000d}'
+            | '\u{0020}'
+            | '\u{00a0}'
+            | '\u{1680}'
+            | '\u{2000}'..='\u{200a}'
+            | '\u{2028}'
+            | '\u{2029}'
+            | '\u{202f}'
+            | '\u{205f}'
+            | '\u{3000}'
+            | '\u{feff}'
+    )
+}
+
+fn truncate_title_component(value: &str, max_chars: usize) -> String {
+    let chars = value.chars().collect::<Vec<_>>();
+    if chars.len() <= max_chars {
+        return value.to_string();
+    }
+    if max_chars <= 3 {
+        return chars.into_iter().take(max_chars).collect();
+    }
+    format!(
+        "{}...",
+        chars
+            .into_iter()
+            .take(max_chars.saturating_sub(3))
+            .collect::<String>()
+    )
+}
+
+fn title_contains_reference(title: &str, reference: &str) -> bool {
+    title.match_indices(reference).any(|(index, _)| {
+        title[index + reference.len()..]
+            .chars()
+            .next()
+            .is_none_or(|character| !character.is_ascii_digit())
+    })
+}
+
+fn render_session_title_state(state: &SessionTitleState) -> Result<Option<String>, CliError> {
+    let state = normalize_title_state(state.clone())?;
+    let max_anchor_chars = if state.activity.is_some() {
+        SESSION_TITLE_MAX_CHARS
+            .saturating_sub(SESSION_TITLE_SEPARATOR.chars().count())
+            .saturating_sub(SESSION_TITLE_MIN_ACTIVITY_CHARS)
+    } else {
+        SESSION_TITLE_MAX_CHARS
+    };
+    let topic = state.topic.as_deref().filter(|value| !value.is_empty());
+    let mut visible_topic = topic.map(|value| truncate_title_component(value, max_anchor_chars));
+    let mut references = String::new();
+    if let Some(topic) = topic {
+        for _ in 0..=state.references.len() {
+            references = state
+                .references
+                .iter()
+                .filter(|reference| {
+                    visible_topic
+                        .as_deref()
+                        .is_none_or(|value| !title_contains_reference(value, reference))
+                })
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(" ");
+            let topic_chars = if references.is_empty() {
+                max_anchor_chars
+            } else {
+                max_anchor_chars.saturating_sub(references.chars().count() + 1)
+            };
+            let next_visible_topic = truncate_title_component(topic, topic_chars);
+            if visible_topic.as_deref() == Some(next_visible_topic.as_str()) {
+                break;
+            }
+            visible_topic = Some(next_visible_topic);
+        }
+    } else {
+        references = state.references.join(" ");
+    }
+    let anchor = match (
+        visible_topic.as_deref().filter(|value| !value.is_empty()),
+        references.is_empty(),
+    ) {
+        (None, true) => None,
+        (None, false) => Some(truncate_title_component(&references, max_anchor_chars)),
+        (Some(topic), true) => Some(topic.to_string()),
+        (Some(topic), false) => Some(if topic.is_empty() {
+            truncate_title_component(&references, max_anchor_chars)
+        } else {
+            format!("{topic} {references}")
+        }),
+    };
+    match (anchor, state.activity.as_deref()) {
+        (None, None) => Ok(None),
+        (Some(anchor), None) => Ok(Some(truncate_title_component(
+            &anchor,
+            SESSION_TITLE_MAX_CHARS,
+        ))),
+        (None, Some(activity)) => Ok(Some(truncate_title_component(
+            activity,
+            SESSION_TITLE_MAX_CHARS,
+        ))),
+        (Some(anchor), Some(activity)) => {
+            let activity_chars = SESSION_TITLE_MAX_CHARS
+                .saturating_sub(anchor.chars().count())
+                .saturating_sub(SESSION_TITLE_SEPARATOR.chars().count());
+            Ok(Some(format!(
+                "{anchor}{SESSION_TITLE_SEPARATOR}{}",
+                truncate_title_component(activity, activity_chars)
+            )))
+        }
+    }
+}
+
+fn effective_session_title_state(record: &SessionRecord) -> Option<SessionTitleStateView> {
+    let state = record.title_state.as_ref()?;
+    match render_session_title_state(state) {
+        Ok(rendered) if rendered == record.title => Some(SessionTitleStateView::from(state)),
+        _ => None,
+    }
 }
 
 fn write_session_attachment(
@@ -4386,6 +4744,8 @@ fn session_view_from_parts(
         agent: record.agent.clone(),
         mode: record.mode.clone(),
         title: record.title.clone(),
+        title_state: effective_session_title_state(record),
+        title_state_supported: true,
         title_revision: record.title_revision,
         session_incarnation: record
             .runtime
@@ -6450,6 +6810,214 @@ mod tests {
         }
     }
 
+    #[test]
+    fn structured_title_renderer_keeps_references_visible_after_topic_truncation() {
+        let title = super::render_session_title_state(&super::SessionTitleState {
+            topic: Some(format!("{} #317", "x".repeat(100))),
+            topic_source: super::SessionTitleTopicSource::Auto,
+            references: vec!["#317".to_string()],
+            activity: Some("Implement contract".to_string()),
+            extra: std::collections::BTreeMap::new(),
+        })
+        .unwrap()
+        .unwrap();
+
+        assert!(title.contains("#317 - Implement contract"));
+    }
+
+    #[test]
+    fn structured_title_normalization_matches_javascript_whitespace_contract() {
+        let title = super::render_session_title_state(&super::SessionTitleState {
+            topic: Some("Alpha\u{0085}Beta\u{00a0}Gamma".to_string()),
+            topic_source: super::SessionTitleTopicSource::User,
+            references: Vec::new(),
+            activity: None,
+            extra: std::collections::BTreeMap::new(),
+        })
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(title, "Alpha\u{0085}Beta Gamma");
+    }
+
+    #[test]
+    fn structured_title_normalization_stops_at_the_character_limit() {
+        let consumed = std::cell::Cell::new(0usize);
+        let input = std::iter::repeat_n('x', 1_000_000).inspect(|_| {
+            consumed.set(consumed.get() + 1);
+        });
+
+        let err = super::normalize_title_state_component_chars(input, "topic").unwrap_err();
+
+        assert_eq!(err.0.code, "invalid-title-state");
+        assert_eq!(consumed.get(), super::SESSION_TITLE_MAX_CHARS + 1);
+    }
+
+    #[test]
+    fn structured_title_references_use_javascript_edge_whitespace() {
+        let make_state = |reference: &str| super::SessionTitleState {
+            topic: None,
+            topic_source: super::SessionTitleTopicSource::None,
+            references: vec![reference.to_string()],
+            activity: None,
+            extra: std::collections::BTreeMap::new(),
+        };
+
+        let err = super::normalize_title_state(make_state("\u{0085}#317\u{0085}"))
+            .expect_err("JavaScript preserves U+0085, so the strict reference grammar rejects it");
+        assert_eq!(err.0.code, "invalid-title-state");
+
+        let normalized = super::normalize_title_state(make_state("\u{00a0}#317\u{00a0}"))
+            .expect("JavaScript trims non-breaking space");
+        assert_eq!(normalized.references, vec!["#317"]);
+    }
+
+    #[test]
+    fn structured_title_pair_preserves_edge_u0085_like_javascript() {
+        let edge_title = "\u{0085}Alpha\u{0085}";
+        let result = super::canonicalize_structured_title_pair(
+            Some(edge_title.to_string()),
+            true,
+            super::SessionTitleState {
+                topic: Some(edge_title.to_string()),
+                topic_source: super::SessionTitleTopicSource::User,
+                references: Vec::new(),
+                activity: None,
+                extra: std::collections::BTreeMap::new(),
+            },
+        );
+
+        let (title, _) = result.expect("JavaScript-compatible edge whitespace should match");
+        assert_eq!(title.as_deref(), Some(edge_title));
+    }
+
+    #[test]
+    fn create_record_rejects_a_mismatched_structured_title_pair() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let context = test_context(tmp.path());
+        let result = create_record(RecordRequest {
+            context: &context,
+            agent: AgentKind::Codex,
+            mode: "interactive",
+            title: Some("Unrelated title"),
+            title_state: Some(super::SessionTitleState {
+                topic: Some("Canonical topic".to_string()),
+                topic_source: super::SessionTitleTopicSource::User,
+                references: Vec::new(),
+                activity: None,
+                extra: std::collections::BTreeMap::new(),
+            }),
+            explicit_id: Some("mismatched-title-state"),
+            cwd: Path::new("/repo"),
+            prompt: None,
+            log_file_name: None,
+            provider_resume: None,
+            agent_args: Vec::new(),
+            agent_bin: None,
+        });
+
+        let err = match result {
+            Ok(_) => panic!("mismatched structured title must be rejected"),
+            Err(err) => err,
+        };
+        assert_eq!(err.0.code, "title-state-mismatch");
+        assert!(!super::session_dir(&context, "mismatched-title-state").exists());
+    }
+
+    #[test]
+    fn create_record_preserves_title_only_input_contract() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let context = test_context(tmp.path());
+        let padded = create_record(RecordRequest {
+            context: &context,
+            agent: AgentKind::Codex,
+            mode: "interactive",
+            title: Some("  padded title-only input  "),
+            title_state: None,
+            explicit_id: Some("padded-title-only"),
+            cwd: Path::new("/repo"),
+            prompt: None,
+            log_file_name: None,
+            provider_resume: None,
+            agent_args: Vec::new(),
+            agent_bin: None,
+        })
+        .unwrap();
+        assert_eq!(
+            padded.record.title.as_deref(),
+            Some("  padded title-only input  ")
+        );
+        drop(padded);
+
+        let long_title = "x".repeat(121);
+        let long = create_record(RecordRequest {
+            context: &context,
+            agent: AgentKind::Codex,
+            mode: "interactive",
+            title: Some(&long_title),
+            title_state: None,
+            explicit_id: Some("long-title-only"),
+            cwd: Path::new("/repo"),
+            prompt: None,
+            log_file_name: None,
+            provider_resume: None,
+            agent_args: Vec::new(),
+            agent_bin: None,
+        })
+        .unwrap();
+        assert_eq!(long.record.title.as_deref(), Some(long_title.as_str()));
+    }
+
+    #[test]
+    fn durable_title_state_preserves_future_fields_across_rewrites() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let context = test_context(tmp.path());
+        let created = create_record(RecordRequest {
+            context: &context,
+            agent: AgentKind::Codex,
+            mode: "interactive",
+            title: Some("Topic"),
+            title_state: Some(super::SessionTitleState {
+                topic: Some("Topic".to_string()),
+                topic_source: super::SessionTitleTopicSource::User,
+                references: Vec::new(),
+                activity: None,
+                extra: std::collections::BTreeMap::new(),
+            }),
+            explicit_id: Some("future-title-state"),
+            cwd: Path::new("/repo"),
+            prompt: None,
+            log_file_name: None,
+            provider_resume: None,
+            agent_args: Vec::new(),
+            agent_bin: None,
+        })
+        .unwrap();
+        drop(created);
+
+        let record_path = super::session_dir(&context, "future-title-state").join("session.json");
+        let mut raw: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&record_path).unwrap()).unwrap();
+        raw["title_state"]["future_field"] = serde_json::json!({ "enabled": true });
+        fs::write(&record_path, serde_json::to_vec_pretty(&raw).unwrap()).unwrap();
+
+        let mut record = super::load_session_record(&context, "future-title-state").unwrap();
+        let projected = serde_json::to_value(
+            super::effective_session_title_state(&record).expect("known title state projects"),
+        )
+        .unwrap();
+        assert!(projected.get("future_field").is_none());
+        record.updated_at = "2099-01-01T00:00:00Z".to_string();
+        super::write_session_record(&context, &record).unwrap();
+
+        let rewritten: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&record_path).unwrap()).unwrap();
+        assert_eq!(
+            rewritten["title_state"]["future_field"],
+            serde_json::json!({ "enabled": true })
+        );
+    }
+
     fn create_test_record_id(
         context: &CliContext,
         agent: AgentKind,
@@ -6461,6 +7029,7 @@ mod tests {
             agent,
             mode: "interactive",
             title,
+            title_state: None,
             explicit_id,
             cwd: Path::new("/repo"),
             prompt: None,
@@ -6608,6 +7177,7 @@ fi
             agent: AgentKind::Codex,
             mode: "interactive",
             title: None,
+            title_state: None,
             explicit_id: Some("malformed-startup"),
             cwd: Path::new("/repo"),
             prompt: None,
@@ -6669,6 +7239,7 @@ fi
             agent: AgentKind::Codex,
             mode: "interactive",
             title: None,
+            title_state: None,
             explicit_id: Some("provider-stage"),
             cwd: Path::new("/repo"),
             prompt: None,
@@ -6715,6 +7286,7 @@ fi
             agent: AgentKind::Codex,
             mode: "interactive",
             title: None,
+            title_state: None,
             explicit_id: Some("reconcile-race"),
             cwd: Path::new("/repo"),
             prompt: None,
@@ -6805,6 +7377,7 @@ fi
             agent: AgentKind::Codex,
             mode: "interactive",
             title: None,
+            title_state: None,
             explicit_id: Some("startup-future-fields"),
             cwd: Path::new("/repo"),
             prompt: None,
@@ -6857,6 +7430,7 @@ fi
                 agent: AgentKind::Codex,
                 mode: "interactive",
                 title: None,
+                title_state: None,
                 explicit_id: Some(id),
                 cwd: Path::new("/repo"),
                 prompt: None,
