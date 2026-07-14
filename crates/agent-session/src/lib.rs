@@ -53,6 +53,11 @@ const STARTUP_EXTRA_KEY: &str = "startup";
 const STARTUP_STAGE_FILE: &str = ".startup-stage";
 const STARTUP_FAILURE_FILE: &str = ".startup-failure";
 const STARTUP_DIAGNOSTIC_FILE: &str = ".startup-diagnostic.log";
+const STARTUP_ARTIFACT_FILES: [&str; 3] = [
+    STARTUP_STAGE_FILE,
+    STARTUP_FAILURE_FILE,
+    STARTUP_DIAGNOSTIC_FILE,
+];
 const SESSION_RESUME_FILE: &str = "resume.json";
 const SESSION_LOCKS_DIR: &str = "session-locks";
 const BINARY: &str = "agent-session";
@@ -2825,11 +2830,7 @@ impl StartupArtifactBackup {
         record: &SessionRecord,
     ) -> Result<(), CliError> {
         let dir = session_dir(context, &record.id);
-        for name in [
-            STARTUP_STAGE_FILE,
-            STARTUP_FAILURE_FILE,
-            STARTUP_DIAGNOSTIC_FILE,
-        ] {
+        for name in STARTUP_ARTIFACT_FILES {
             let staged = dir.join(format!("{name}.resume-backup"));
             match fs::metadata(&staged) {
                 Ok(_) => {
@@ -2859,11 +2860,7 @@ impl StartupArtifactBackup {
             entries: Vec::new(),
             finalized: false,
         };
-        for name in [
-            STARTUP_STAGE_FILE,
-            STARTUP_FAILURE_FILE,
-            STARTUP_DIAGNOSTIC_FILE,
-        ] {
+        for name in STARTUP_ARTIFACT_FILES {
             let current = dir.join(name);
             let staged = dir.join(format!("{name}.resume-backup"));
             match fs::rename(&current, &staged) {
