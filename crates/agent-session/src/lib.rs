@@ -4788,18 +4788,7 @@ fn terminate_tmux_session_with_timeouts(
                     return Err(SessionTerminationFailure::RuntimeIdentityMismatch);
                 }
                 if !persisted.same_process_identity(&identity) {
-                    let verification_started = Instant::now();
-                    terminate_known_tmux_runtime(
-                        tmux_bin,
-                        &identity,
-                        kill_timeout,
-                        verify_timeout,
-                    )?;
-                    let remaining = verify_timeout.saturating_sub(verification_started.elapsed());
-                    if remaining.is_zero() {
-                        return Err(SessionTerminationFailure::VerificationFailed);
-                    }
-                    return verify_stopped_tmux_runtime(tmux_bin, &persisted, remaining);
+                    verify_stopped_process_group(&persisted, verify_timeout)?;
                 }
             }
             persist_tmux_runtime_identity(record, &identity)?;
@@ -5050,6 +5039,32 @@ fn process_group_status(process_group_id: libc::pid_t) -> ProcessGroupStatus {
         Some(libc::ESRCH) => ProcessGroupStatus::Stopped,
         Some(libc::EPERM) => ProcessGroupStatus::Running,
         _ => ProcessGroupStatus::Unknown,
+    }
+}
+
+fn verify_stopped_process_group(
+    identity: &TmuxRuntimeIdentity,
+    verify_timeout: Duration,
+) -> Result<(), SessionTerminationFailure> {
+    let process_group_id = identity
+        .process_group_id
+        .ok_or(SessionTerminationFailure::RuntimeIdentityUnavailable)?;
+    let started_at = Instant::now();
+    loop {
+        match process_group_status(process_group_id) {
+            ProcessGroupStatus::Stopped => return Ok(()),
+            ProcessGroupStatus::Running if started_at.elapsed() >= verify_timeout => {
+                return Err(SessionTerminationFailure::ProcessStillRunning);
+            }
+            ProcessGroupStatus::Unknown if started_at.elapsed() >= verify_timeout => {
+                return Err(SessionTerminationFailure::VerificationFailed);
+            }
+            ProcessGroupStatus::Running | ProcessGroupStatus::Unknown => {}
+        }
+        thread::sleep(
+            DELETE_TERMINATION_VERIFY_POLL_INTERVAL
+                .min(verify_timeout.saturating_sub(started_at.elapsed())),
+        );
     }
 }
 
