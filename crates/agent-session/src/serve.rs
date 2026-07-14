@@ -6604,6 +6604,19 @@ mod tests {
         bin
     }
 
+    fn failing_delete_tmux(dir: &Path) -> PathBuf {
+        let bin = dir.join("failing-delete-tmux");
+        std::fs::write(
+            &bin,
+            "#!/usr/bin/env sh\ncase \"$1\" in\n  kill-session) exit 42 ;;\n  has-session) exit 0 ;;\n  *) exit 0 ;;\nesac\n",
+        )
+        .unwrap();
+        let mut perms = std::fs::metadata(&bin).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&bin, perms).unwrap();
+        bin
+    }
+
     fn seed_session(state_dir: &Path, id: &str, agent: &str, tmux_session: &str) {
         let dir = state_dir.join("sessions").join(id);
         std::fs::create_dir_all(&dir).unwrap();
@@ -12096,6 +12109,43 @@ printf '%s\n' '{"schema_version":"agent-session.codex-auth-broker.v1","accounts"
         let (status, body) = call(router(st.clone()), del).await;
         assert_eq!(status, StatusCode::NOT_FOUND);
         assert_eq!(body["error"]["code"], "session-not-found");
+    }
+
+    #[tokio::test]
+    async fn delete_kill_failure_returns_structured_error_and_retains_state() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let tmux = failing_delete_tmux(tmp.path());
+
+        for agent in ["codex", "claude"] {
+            let id = format!("failed-delete-{agent}");
+            let tmux_session = format!("hs-{agent}-failed-delete");
+            seed_session_with_runtime(tmp.path(), &id, agent, &tmux_session);
+            let session_dir = tmp.path().join("sessions").join(&id);
+            let runtime_metadata = session_dir.join("provider-runtime.json");
+            std::fs::write(&runtime_metadata, format!("runtime metadata for {agent}")).unwrap();
+            let st = state(tmp.path(), Some(TOKEN), tmux.clone());
+            let request = Request::builder()
+                .method("DELETE")
+                .uri(format!("/sessions/{id}"))
+                .header("authorization", format!("Bearer {TOKEN}"))
+                .body(Body::empty())
+                .unwrap();
+
+            let (status, body) = call(router(st), request).await;
+
+            assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "body={body}");
+            assert_eq!(body["schema_version"], "cli.agent-session.serve.v1");
+            assert_eq!(body["ok"], false);
+            assert_eq!(body["error"]["code"], "session-termination-failed");
+            assert_eq!(body["error"]["details"]["id"], id);
+            assert_eq!(body["error"]["details"]["tmux_session"], tmux_session);
+            assert_eq!(body["error"]["details"]["reason"], "kill-failed");
+            assert!(session_dir.exists(), "{agent} state must remain retryable");
+            assert!(
+                runtime_metadata.exists(),
+                "{agent} runtime metadata must remain"
+            );
+        }
     }
 
     #[tokio::test]

@@ -43,6 +43,9 @@ remain usable from a phone.
 latest provider conversation implicitly. Runtime metadata is persisted before launch so hooks see the new generation;
 if tmux launch fails, the prior runtime and activity snapshot are restored. `send` bumps `updated_at`, so `list` orders
 by real control-plane activity.
+`delete` removes provider runtime files and session metadata only after `tmux kill-session` succeeds and a bounded check
+verifies that the recorded tmux session is stopped. Kill or verification failures retain the session state so callers can
+surface the structured error and retry safely.
 `--agent hermes` launches `hermes chat` interactively (one-shot `run` mode is codex/claude only).
 
 ## Durable turn state

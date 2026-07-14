@@ -81,6 +81,9 @@ const CODEX_RESUME_CAPTURE_POLL_MS: u64 = 100;
 const CODEX_RESUME_AMBIGUITY_WINDOW_MS: u64 = 500;
 const CODEX_RESUME_BACKFILL_MAX_AGE_SECS: u64 = 10 * 60;
 const PANE_INPUT_COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
+const DELETE_TERMINATION_VERIFY_TIMEOUT: Duration = Duration::from_secs(1);
+const DELETE_TERMINATION_VERIFY_POLL_INTERVAL: Duration = Duration::from_millis(25);
+const DELETE_TERMINATION_PROBE_TIMEOUT: Duration = Duration::from_millis(100);
 
 pub fn run() -> i32 {
     run_with_args(env::args_os())
@@ -4281,6 +4284,22 @@ fn delete_session(
     id: &str,
     tmux_bin: PathBuf,
 ) -> Result<DeleteResult, CliError> {
+    delete_session_with_timeouts(
+        context,
+        id,
+        tmux_bin,
+        PANE_INPUT_COMMAND_TIMEOUT,
+        DELETE_TERMINATION_VERIFY_TIMEOUT,
+    )
+}
+
+fn delete_session_with_timeouts(
+    context: &CliContext,
+    id: &str,
+    tmux_bin: PathBuf,
+    kill_timeout: Duration,
+    verify_timeout: Duration,
+) -> Result<DeleteResult, CliError> {
     let observed = load_session_record(context, id)?;
     let canonical_id = observed.id.clone();
     let _record_lock = acquire_session_record_lock(context, &canonical_id)?;
@@ -4289,7 +4308,13 @@ fn delete_session(
     ensure_same_session_identity(&observed, &record)?;
     validate_record_id(&record, &resolved.expected_id, &resolved.record_path)?;
     let session_dir = resolved.session_dir;
-    let killed = kill_tmux_session(&tmux_bin, &record.tmux_session);
+    terminate_tmux_session_with_timeouts(
+        &tmux_bin,
+        &record.tmux_session,
+        kill_timeout,
+        verify_timeout,
+    )
+    .map_err(|reason| session_termination_error(&record, reason))?;
     codex_app_server::cleanup_runtime_files(context, &record)?;
     fs::remove_dir_all(&session_dir).map_err(|err| {
         CliError::runtime(
@@ -4301,10 +4326,107 @@ fn delete_session(
     Ok(DeleteResult {
         id: record.id,
         tmux_session: record.tmux_session,
-        killed,
+        killed: true,
         deleted: true,
         session_dir: display_path(&session_dir),
     })
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SessionTerminationFailure {
+    KillFailed,
+    KillTimeout,
+    KillError,
+    StillRunning,
+    VerificationFailed,
+}
+
+impl SessionTerminationFailure {
+    fn reason(self) -> &'static str {
+        match self {
+            Self::KillFailed => "kill-failed",
+            Self::KillTimeout => "kill-timeout",
+            Self::KillError => "kill-error",
+            Self::StillRunning => "session-still-running",
+            Self::VerificationFailed => "verification-failed",
+        }
+    }
+
+    fn message(self) -> &'static str {
+        match self {
+            Self::KillFailed => "tmux kill-session failed",
+            Self::KillTimeout => "tmux kill-session timed out",
+            Self::KillError => "tmux kill-session could not be executed",
+            Self::StillRunning => "tmux session remained live after kill-session",
+            Self::VerificationFailed => "tmux session termination could not be verified",
+        }
+    }
+}
+
+fn session_termination_error(
+    record: &SessionRecord,
+    reason: SessionTerminationFailure,
+) -> CliError {
+    CliError::runtime(
+        "session-termination-failed",
+        format!("{}; session metadata was retained", reason.message()),
+        Some(json!({
+            "id": record.id,
+            "tmux_session": record.tmux_session,
+            "reason": reason.reason(),
+            "retryable": true,
+        })),
+    )
+}
+
+fn terminate_tmux_session_with_timeouts(
+    tmux_bin: &Path,
+    tmux_session: &str,
+    kill_timeout: Duration,
+    verify_timeout: Duration,
+) -> Result<(), SessionTerminationFailure> {
+    match tmux_kill_status_with_timeout(tmux_bin, tmux_session, kill_timeout) {
+        Ok(status) if status.success() => {}
+        Ok(_) => return Err(SessionTerminationFailure::KillFailed),
+        Err(err) if err.kind() == io::ErrorKind::TimedOut => {
+            return Err(SessionTerminationFailure::KillTimeout);
+        }
+        Err(_) => return Err(SessionTerminationFailure::KillError),
+    }
+
+    let started_at = Instant::now();
+    let mut observed_running = false;
+    loop {
+        let remaining = verify_timeout.saturating_sub(started_at.elapsed());
+        if remaining.is_zero() {
+            return Err(if observed_running {
+                SessionTerminationFailure::StillRunning
+            } else {
+                SessionTerminationFailure::VerificationFailed
+            });
+        }
+        let status = live_status_with_timeout(
+            tmux_bin,
+            tmux_session,
+            remaining.min(DELETE_TERMINATION_PROBE_TIMEOUT),
+        );
+        match status.as_str() {
+            "stopped" => return Ok(()),
+            "running" => observed_running = true,
+            _ => {}
+        }
+        if started_at.elapsed() >= verify_timeout {
+            return Err(if observed_running {
+                SessionTerminationFailure::StillRunning
+            } else {
+                SessionTerminationFailure::VerificationFailed
+            });
+        }
+        thread::sleep(
+            DELETE_TERMINATION_VERIFY_POLL_INTERVAL
+                .min(verify_timeout.saturating_sub(started_at.elapsed())),
+        );
+    }
 }
 
 fn kill_tmux_session(tmux_bin: &Path, tmux_session: &str) -> bool {
@@ -4312,9 +4434,18 @@ fn kill_tmux_session(tmux_bin: &Path, tmux_session: &str) -> bool {
 }
 
 fn kill_tmux_session_with_timeout(tmux_bin: &Path, tmux_session: &str, timeout: Duration) -> bool {
+    tmux_kill_status_with_timeout(tmux_bin, tmux_session, timeout)
+        .is_ok_and(|status| status.success())
+}
+
+fn tmux_kill_status_with_timeout(
+    tmux_bin: &Path,
+    tmux_session: &str,
+    timeout: Duration,
+) -> io::Result<std::process::ExitStatus> {
     let mut command = ProcessCommand::new(tmux_bin);
     command.arg("kill-session").arg("-t").arg(tmux_session);
-    run_exit_status_with_timeout(command, timeout).is_ok_and(|status| status.success())
+    run_exit_status_with_timeout(command, timeout)
 }
 
 fn session_status(tmux_bin: &Path, record: &SessionRecord) -> String {
@@ -5208,8 +5339,9 @@ fn tail_lines(text: &str, tail: usize) -> String {
 mod tests {
     use super::{
         AgentKind, CliContext, RecordRequest, acquire_session_record_lock,
-        acquire_session_record_lock_timed, create_record, kill_tmux_session_with_timeout,
-        live_status_with_timeout, resolve_session_id, session_dir, strip_trailing_blank_lines,
+        acquire_session_record_lock_timed, create_record, delete_session_with_timeouts,
+        kill_tmux_session_with_timeout, live_status_with_timeout, load_session_record,
+        resolve_session_id, session_dir, strip_trailing_blank_lines,
         try_acquire_session_record_lock,
     };
     use pretty_assertions::assert_eq;
@@ -5674,6 +5806,92 @@ mod tests {
             Duration::from_millis(50)
         ));
         assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn delete_timeout_returns_structured_failure_and_retains_state() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let context = test_context(tmp.path());
+        let id = create_test_record_id(&context, AgentKind::Codex, None, Some("delete-timeout"));
+        let record = load_session_record(&context, &id).unwrap();
+        let tmux = tmp.path().join("tmux-timeout");
+        fs::write(
+            &tmux,
+            "#!/bin/sh\nif [ \"$1\" = kill-session ]; then exec sleep 5; fi\nexit 0\n",
+        )
+        .unwrap();
+        fs::set_permissions(&tmux, fs::Permissions::from_mode(0o700)).unwrap();
+
+        let error = delete_session_with_timeouts(
+            &context,
+            &id,
+            tmux,
+            Duration::from_millis(50),
+            Duration::from_millis(75),
+        )
+        .unwrap_err()
+        .into_inner();
+
+        assert_eq!(error.code, "session-termination-failed");
+        assert_eq!(error.details.unwrap()["reason"], "kill-timeout");
+        assert!(session_dir(&context, &id).exists());
+        assert_eq!(
+            load_session_record(&context, &id).unwrap().tmux_session,
+            record.tmux_session
+        );
+    }
+
+    #[test]
+    fn delete_rejects_a_still_live_tmux_postcondition_and_retains_state() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let context = test_context(tmp.path());
+        let id =
+            create_test_record_id(&context, AgentKind::Claude, None, Some("delete-still-live"));
+        let tmux = tmp.path().join("tmux-still-live");
+        fs::write(&tmux, "#!/bin/sh\nexit 0\n").unwrap();
+        fs::set_permissions(&tmux, fs::Permissions::from_mode(0o700)).unwrap();
+
+        let error = delete_session_with_timeouts(
+            &context,
+            &id,
+            tmux,
+            Duration::from_millis(50),
+            Duration::from_millis(75),
+        )
+        .unwrap_err()
+        .into_inner();
+
+        assert_eq!(error.code, "session-termination-failed");
+        assert_eq!(error.details.unwrap()["reason"], "session-still-running");
+        assert!(session_dir(&context, &id).exists());
+    }
+
+    #[test]
+    fn delete_rejects_an_indeterminate_tmux_postcondition_and_retains_state() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let context = test_context(tmp.path());
+        let id = create_test_record_id(&context, AgentKind::Codex, None, Some("delete-unverified"));
+        let tmux = tmp.path().join("tmux-unverified");
+        fs::write(
+            &tmux,
+            "#!/bin/sh\nif [ \"$1\" = kill-session ]; then exit 0; fi\nexit 42\n",
+        )
+        .unwrap();
+        fs::set_permissions(&tmux, fs::Permissions::from_mode(0o700)).unwrap();
+
+        let error = delete_session_with_timeouts(
+            &context,
+            &id,
+            tmux,
+            Duration::from_millis(50),
+            Duration::from_millis(75),
+        )
+        .unwrap_err()
+        .into_inner();
+
+        assert_eq!(error.code, "session-termination-failed");
+        assert_eq!(error.details.unwrap()["reason"], "verification-failed");
+        assert!(session_dir(&context, &id).exists());
     }
 
     #[test]
