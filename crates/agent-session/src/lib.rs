@@ -5264,7 +5264,7 @@ fn render_setup_text(result: &activity::SetupResult) -> String {
 
 fn render_delete_text(result: &DeleteResult) -> String {
     format!(
-        "deleted {} (tmux killed: {})\n",
+        "deleted {} (tmux stopped: {})\n",
         result.id,
         if result.killed { "yes" } else { "no" }
     )
@@ -5360,10 +5360,10 @@ fn tail_lines(text: &str, tail: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        AgentKind, CliContext, RecordRequest, acquire_session_record_lock,
+        AgentKind, CliContext, DeleteResult, RecordRequest, acquire_session_record_lock,
         acquire_session_record_lock_timed, create_record, delete_session_with_timeouts,
         kill_tmux_session_with_timeout, live_status_with_timeout, load_session_record,
-        resolve_session_id, session_dir, strip_trailing_blank_lines,
+        render_delete_text, resolve_session_id, session_dir, strip_trailing_blank_lines,
         try_acquire_session_record_lock,
     };
     use pretty_assertions::assert_eq;
@@ -6017,6 +6017,22 @@ mod tests {
             "a longer prefix match must never be killed"
         );
         assert!(!session_dir(&context, &id).exists());
+    }
+
+    #[test]
+    fn delete_text_describes_verified_stop_instead_of_a_kill_command() {
+        let result = DeleteResult {
+            id: "stopped-session".to_string(),
+            tmux_session: "hs-codex-stopped-session".to_string(),
+            killed: true,
+            deleted: true,
+            session_dir: "/state/sessions/stopped-session".to_string(),
+        };
+
+        assert_eq!(
+            render_delete_text(&result),
+            "deleted stopped-session (tmux stopped: yes)\n"
+        );
     }
 
     #[test]
