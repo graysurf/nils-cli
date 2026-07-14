@@ -1,6 +1,6 @@
 [package]
 name = "nils-api-rest"
-version = "1.21.34"
+version = "1.21.35"
 edition.workspace = true
 license.workspace = true
 
@@ -11,15 +11,15 @@ repository = "https://github.com/sympoies/nils-cli"
 name = "api-rest"
 path = "src/main.rs"
 [dependencies]
-api-testing-core = { version = "1.21.34", path = "../api-testing-core", package = "nils-api-testing-core" }
+api-testing-core = { version = "1.21.35", path = "../api-testing-core", package = "nils-api-testing-core" }
 clap = { workspace = true }
 clap_complete = { workspace = true }
-nils-build-info = { version = "1.21.34", path = "../nils-build-info" }
-nils-term = { version = "1.21.34", path = "../nils-term", package = "nils-term" }
+nils-build-info = { version = "1.21.35", path = "../nils-build-info" }
+nils-term = { version = "1.21.35", path = "../nils-term", package = "nils-term" }
 serde_json = { workspace = true }
 
 [dev-dependencies]
 base64 = "0.22"
-nils-test-support = { version = "1.21.34", path = "../nils-test-support" }
+nils-test-support = { version = "1.21.35", path = "../nils-test-support" }
 pretty_assertions = { workspace = true }
 tempfile = "3"

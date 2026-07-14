@@ -1,6 +1,6 @@
 [package]
 name = "nils-build-info"
-version = "1.21.34"
+version = "1.21.35"
 edition.workspace = true
 license.workspace = true
 
