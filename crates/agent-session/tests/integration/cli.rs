@@ -4763,7 +4763,7 @@ exit 0
 }
 
 #[test]
-fn delete_transition_markers_retain_uncertainty_and_recover_confirmed_shutdown() {
+fn delete_transition_markers_converge_after_verified_shutdown() {
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let state_dir = tmp.path().join("state");
     let tmux_bin = tmp.path().join("tmux-stopped-transition");
@@ -4779,7 +4779,7 @@ esac
 "#,
     );
 
-    for (state, deletes) in [("pending", false), ("kill-confirmed", true)] {
+    for state in ["pending", "kill-confirmed"] {
         let id = format!("delete-transition-{state}");
         let tmux_session = format!("hs-codex-delete-transition-{state}");
         let session_dir = write_session_record(&state_dir, &id, "codex", &tmux_session);
@@ -4830,72 +4830,15 @@ esac
             &[],
         );
 
-        if deletes {
-            assert_eq!(delete.code, 0, "stdout={}", delete.stdout_text());
-            assert!(
-                !session_dir.exists(),
-                "confirmed stopped state must clean up"
-            );
-            assert!(
-                runtime_files.iter().all(|path| !path.exists()),
-                "confirmed stopped runtime files must be removed"
-            );
-            continue;
-        }
-
-        assert_eq!(delete.code, 1, "stdout={}", delete.stdout_text());
-        let error = delete.stdout_json();
-        assert_eq!(
-            error["error"]["details"]["reason"],
-            "runtime-identity-unavailable"
-        );
-        assert_eq!(error["error"]["details"]["retryable"], false);
-        assert_eq!(
-            error["error"]["details"]["action"],
-            "manual-runtime-verification-required"
-        );
+        assert_eq!(delete.code, 0, "stdout={}", delete.stdout_text());
         assert!(
-            session_dir.exists(),
-            "uncertain state must remain discoverable"
+            !session_dir.exists(),
+            "a fully verified stopped runtime must converge from {state}"
         );
-        assert!(runtime_files.iter().all(|path| path.exists()));
-        let retained: Value =
-            serde_json::from_slice(&fs::read(&record_path).expect("retained record")).unwrap();
         assert_eq!(
-            retained["delete_tmux_termination_state"]["state"],
-            "pending"
-        );
-
-        let resume = run(
-            tmp.path(),
-            &[
-                "--state-dir",
-                &state_dir.to_string_lossy(),
-                "resume",
-                &id,
-                "--tmux-bin",
-                &tmux_bin.to_string_lossy(),
-                "--format",
-                "json",
-            ],
-            &[],
-        );
-        assert_eq!(resume.code, 1, "stdout={}", resume.stdout_text());
-        let error = resume.stdout_json();
-        assert_eq!(
-            error["error"]["details"]["reason"],
-            "runtime-identity-unavailable"
-        );
-        assert_eq!(error["error"]["details"]["retryable"], false);
-        assert_eq!(
-            error["error"]["details"]["action"],
-            "manual-runtime-verification-required"
-        );
-        let after_resume: Value =
-            serde_json::from_slice(&fs::read(&record_path).expect("record after resume")).unwrap();
-        assert_eq!(
-            after_resume, retained,
-            "resume must preserve pending evidence"
+            runtime_files.iter().filter(|path| path.exists()).count(),
+            0,
+            "verified stopped runtime files must be removed"
         );
     }
 }

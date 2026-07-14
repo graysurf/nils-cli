@@ -80,13 +80,32 @@ jobs:
         with:
           node-version: "20"
 
-      - name: Install zsh + xvfb + ripgrep
-        run: sudo apt-get update && sudo apt-get install -y zsh xvfb xauth ripgrep
+      - name: Install zsh + xvfb + ripgrep + tmux
+        run: sudo apt-get update && sudo apt-get install -y zsh xvfb xauth ripgrep tmux
 
       - name: Install cargo-nextest
         uses: taiki-e/install-action@v2
         with:
           tool: cargo-nextest
+
+      - name: Provision systemd user scopes
+        if: needs.changes.outputs.docs_only != 'true'
+        run: |
+          uid="$(id -u)"
+          sudo loginctl enable-linger "${USER}"
+          sudo systemctl start "user@${uid}.service"
+          echo "XDG_RUNTIME_DIR=/run/user/${uid}" >> "$GITHUB_ENV"
+          echo "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/${uid}/bus" >> "$GITHUB_ENV"
+          test -S "/run/user/${uid}/systemd/private"
+
+      - name: Require agent-session cgroup containment
+        if: needs.changes.outputs.docs_only != 'true'
+        env:
+          AGENT_SESSION_TEST_REQUIRE_CGROUP: "1"
+        run: |
+          cargo test -p nils-agent-session --lib \
+            tests::delete_kills_a_detached_descendant_inside_a_pinned_tmux_control_group \
+            -- --exact --nocapture
 
       - name: Nils CLI checks (includes third-party-artifacts-audit, completion audits, docs-hygiene-audit, test-stale-audit)
         env:

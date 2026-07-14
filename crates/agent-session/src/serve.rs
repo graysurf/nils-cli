@@ -227,6 +227,13 @@ pub fn run_serve(context: &CliContext, args: cli::ServeArgs) -> i32 {
     };
 
     runtime.block_on(async move {
+        if let Err(err) = crate::recover_interrupted_tmux_terminations(context) {
+            eprintln!(
+                "error: failed to recover interrupted session termination: {}",
+                err.code()
+            );
+            return exit::RUNTIME;
+        }
         if let Err(err) = fence_codex_controls_before_listen(context, &tmux_bin) {
             eprintln!(
                 "error: failed to fence Codex account controls: {}",
