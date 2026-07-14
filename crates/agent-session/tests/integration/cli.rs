@@ -42,8 +42,12 @@ for arg in "$@"; do
 done
 printf '\036' >> "$AGENT_SESSION_FAKE_TMUX_LOG"
 
-if [ "${AGENT_SESSION_FAKE_TMUX_FAIL:-}" = "$1" ]; then
-  echo "fake tmux failed at $1" >&2
+operation="$1"
+if [ "$operation" = "if-shell" ]; then
+  operation="kill-session"
+fi
+if [ "${AGENT_SESSION_FAKE_TMUX_FAIL:-}" = "$operation" ]; then
+  echo "fake tmux failed at $operation" >&2
   exit 42
 fi
 
@@ -69,6 +73,21 @@ done
 
 if [ "$1" = "kill-session" ]; then
   printf '%s\n' "$target" >> "$AGENT_SESSION_FAKE_TMUX_LOG.killed"
+  if [ -n "${AGENT_SESSION_FAKE_TMUX_PROCESS_GROUP_ID:-}" ] && [ "${AGENT_SESSION_FAKE_TMUX_KEEP_PROCESS_GROUP:-0}" != "1" ]; then
+    kill -TERM "-${AGENT_SESSION_FAKE_TMUX_PROCESS_GROUP_ID}" 2>/dev/null || true
+  fi
+  exit 0
+fi
+
+if [ "$1" = "if-shell" ]; then
+  kill_target=""
+  for arg in "$@"; do
+    case "$arg" in
+      'kill-session -t '*) kill_target="${arg#kill-session -t }" ;;
+    esac
+  done
+  [ -n "$kill_target" ] || exit 42
+  printf '%s\n' "$kill_target" >> "$AGENT_SESSION_FAKE_TMUX_LOG.killed"
   if [ -n "${AGENT_SESSION_FAKE_TMUX_PROCESS_GROUP_ID:-}" ] && [ "${AGENT_SESSION_FAKE_TMUX_KEEP_PROCESS_GROUP:-0}" != "1" ]; then
     kill -TERM "-${AGENT_SESSION_FAKE_TMUX_PROCESS_GROUP_ID}" 2>/dev/null || true
   fi
@@ -3633,12 +3652,11 @@ fn list_command_and_delete_manage_existing_session() {
     assert_eq!(data(&delete_json)["deleted"], true);
     let delete_calls = tmux_calls(&tmux_log);
     assert!(
-        delete_calls.iter().any(|call| call
-            == &vec![
-                "kill-session".to_string(),
-                "-t".to_string(),
-                "$77".to_string(),
-            ]),
+        delete_calls.iter().any(|call| {
+            call.first().is_some_and(|arg| arg == "if-shell")
+                && call.get(3).is_some_and(|arg| arg == "%77")
+                && call.get(5).is_some_and(|arg| arg == "kill-session -t $77")
+        }),
         "delete must target only the recorded tmux session: {delete_calls:?}"
     );
     assert!(
@@ -4254,12 +4272,11 @@ fn successful_delete_removes_codex_and_claude_runtime_state() {
     let calls = tmux_calls(&tmux_log);
     for agent in ["codex", "claude"] {
         assert!(
-            calls.iter().any(|call| call
-                == &vec![
-                    "kill-session".to_string(),
-                    "-t".to_string(),
-                    "$77".to_string()
-                ]),
+            calls.iter().any(|call| {
+                call.first().is_some_and(|arg| arg == "if-shell")
+                    && call.get(3).is_some_and(|arg| arg == "%77")
+                    && call.get(5).is_some_and(|arg| arg == "kill-session -t $77")
+            }),
             "successful delete must kill each captured immutable target ({agent}): {calls:?}"
         );
     }
@@ -4339,7 +4356,7 @@ fn delete_runtime_identity_mismatch_never_kills_the_exact_name_reuse() {
       AGENT_SESSION_RUNTIME_ID) printf 'AGENT_SESSION_RUNTIME_ID=unrelated-runtime\\n' ;;
     esac\n    exit 0 ;;
   has-session) [ -f {} ] && exit 1; exit 0 ;;
-  kill-session) : > {}; exit 0 ;;
+  if-shell) : > {}; exit 0 ;;
 esac\nexit 42\n",
             state_dir.display(),
             killed.display(),
@@ -4555,6 +4572,139 @@ exit 0
 }
 
 #[test]
+fn delete_fails_closed_when_the_managed_pane_respawns_at_kill_time() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let state_dir = tmp.path().join("state");
+    let tmux_bin = tmp.path().join("tmux-kill-time-respawn");
+    let tmux_log = tmp.path().join("tmux-kill-time-respawn.log");
+    let tmux_switched = tmp.path().join("tmux-kill-time-respawn.switched");
+    let tmux_stopped = tmp.path().join("tmux-kill-time-respawn.stopped");
+    let id = "kill-time-respawn";
+    let tmux_session = "hs-codex-kill-time-respawn";
+    let session_dir = write_session_record(&state_dir, id, "codex", tmux_session);
+    attach_provider_runtime(
+        tmp.path(),
+        &state_dir,
+        &session_dir,
+        id,
+        "codex",
+        tmux_session,
+    );
+    let record_path = session_dir.join("session.json");
+    let mut captured_pane = spawn_test_process_group();
+    let mut replacement_pane = spawn_test_process_group();
+    let mut record: Value = serde_json::from_slice(&fs::read(&record_path).unwrap()).unwrap();
+    let launch_id = record["runtime"]["launch_id"].as_str().unwrap().to_string();
+    record["delete_tmux_identity"] = json!({
+        "launch_id": launch_id,
+        "session_id": "$78",
+        "pane_id": "%78",
+        "pane_pid": captured_pane.pid(),
+        "process_group_id": captured_pane.pid(),
+    });
+    fs::write(&record_path, serde_json::to_vec_pretty(&record).unwrap()).unwrap();
+
+    write_executable(
+        &tmux_bin,
+        &format!(
+            r#"#!/usr/bin/env sh
+printf '%s\n' "$*" >> {tmux_log}
+case "$1" in
+  display-message)
+    if [ -f {tmux_stopped} ]; then
+      printf "%s\n" "can't find session: {tmux_session}" >&2
+      exit 1
+    fi
+    if [ -f {tmux_switched} ]; then
+      printf '$78\t%%78\t{replacement_pid}\n'
+    else
+      printf '$78\t%%78\t{captured_pid}\n'
+    fi
+    ;;
+  show-environment)
+    case "$4" in
+      AGENT_SESSION_ID) printf 'AGENT_SESSION_ID=%s\n' {id} ;;
+      AGENT_SESSION_STATE_DIR) printf 'AGENT_SESSION_STATE_DIR=%s\n' {state_dir} ;;
+      AGENT_SESSION_RUNTIME_ID) printf 'AGENT_SESSION_RUNTIME_ID=%s\n' {launch_id} ;;
+    esac
+    ;;
+  kill-session)
+    /bin/kill -TERM -- -{captured_pid} 2>/dev/null || true
+    : > {tmux_switched}
+    : > {tmux_stopped}
+    ;;
+  if-shell)
+    if [ ! -f {tmux_switched} ]; then
+      /bin/kill -TERM -- -{captured_pid} 2>/dev/null || true
+      : > {tmux_switched}
+      printf 'agent-session-runtime-identity-changed\n'
+    else
+      : > {tmux_stopped}
+    fi
+    ;;
+  has-session)
+    if [ -f {tmux_stopped} ]; then
+      printf "%s\n" "can't find session: $78" >&2
+      exit 1
+    fi
+    ;;
+  *) exit 42 ;;
+esac
+exit 0
+"#,
+            tmux_log = shell_words::quote(&tmux_log.to_string_lossy()),
+            tmux_switched = shell_words::quote(&tmux_switched.to_string_lossy()),
+            tmux_stopped = shell_words::quote(&tmux_stopped.to_string_lossy()),
+            captured_pid = captured_pane.pid(),
+            replacement_pid = replacement_pane.pid(),
+            id = shell_words::quote(id),
+            state_dir = shell_words::quote(&state_dir.to_string_lossy()),
+            launch_id = shell_words::quote(&launch_id),
+        ),
+    );
+
+    let output = run(
+        tmp.path(),
+        &[
+            "--state-dir",
+            &state_dir.to_string_lossy(),
+            "delete",
+            id,
+            "--tmux-bin",
+            &tmux_bin.to_string_lossy(),
+            "--format",
+            "json",
+        ],
+        &[],
+    );
+
+    assert_eq!(output.code, 1, "stdout={}", output.stdout_text());
+    let error = output.stdout_json();
+    assert_eq!(error["error"]["code"], "session-termination-failed");
+    assert_eq!(error["error"]["details"]["reason"], "process-still-running");
+    assert_eq!(error["error"]["details"]["retryable"], true);
+    assert_eq!(error["error"]["details"]["action"], "retry-delete");
+    assert!(session_dir.exists(), "replacement evidence must remain");
+    assert!(replacement_pane.is_running());
+    let retained: Value = serde_json::from_slice(&fs::read(&record_path).unwrap()).unwrap();
+    assert_eq!(
+        retained["delete_tmux_identity"]["process_group_id"],
+        replacement_pane.pid()
+    );
+    let calls = fs::read_to_string(&tmux_log).unwrap();
+    assert!(calls.contains("if-shell -F -t %78"), "{calls}");
+    assert!(
+        tmux_calls(&tmux_log)
+            .iter()
+            .all(|call| call.first().is_none_or(|arg| arg != "kill-session")),
+        "{calls}"
+    );
+
+    captured_pane.stop();
+    replacement_pane.stop();
+}
+
+#[test]
 fn delete_retains_state_while_the_exact_pane_process_group_survives() {
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let state_dir = tmp.path().join("state");
@@ -4592,7 +4742,7 @@ case "$1" in
     esac
     exit 0 ;;
   has-session) if [ -f {} ]; then printf "%s\n" "can't find session: \$92" >&2; exit 1; fi; exit 0 ;;
-  kill-session) : > {}; exit 0 ;;
+  if-shell) : > {}; exit 0 ;;
 esac
 exit 42
 "#,
@@ -4999,12 +5149,11 @@ fn failure_paths_return_json_without_leaking_prompt_and_classify_durable_startup
     );
     let calls = tmux_calls(&tmux_log);
     assert!(
-        calls.iter().any(|call| call
-            == &vec![
-                "kill-session".to_string(),
-                "-t".to_string(),
-                "$77".to_string(),
-            ]),
+        calls.iter().any(|call| {
+            call.first().is_some_and(|arg| arg == "if-shell")
+                && call.get(3).is_some_and(|arg| arg == "%77")
+                && call.get(5).is_some_and(|arg| arg == "kill-session -t $77")
+        }),
         "failed prompt paste should kill the orphaned tmux session: {calls:?}"
     );
 

@@ -51,7 +51,8 @@ unverified replacement remains the current discoverable generation. `send` bumps
 control-plane activity.
 `delete` removes provider runtime files and session metadata only after bounded checks verify the recorded runtime is
 stopped. Before killing a live runtime, it inspects only the managed `0.0` pane, captures its immutable tmux session/pane
-ids and process group, validates the runtime's `AGENT_SESSION_*` ownership markers, and persists that identity for retry.
+ids and process group, validates the runtime's `AGENT_SESSION_*` ownership markers, persists that identity for retry, and
+uses one tmux-server conditional command to kill only if the captured session, pane, and pane PID still match.
 If the managed pane is replaced, it durably retains every unresolved observed process identity before proceeding. It then
 targets only the captured tmux session id and requires tmux and every retained process group to be gone. A retry can
 finish cleanup without another kill only when all persisted identities verify stopped. Live records created by an older
