@@ -9278,9 +9278,33 @@ mod tests {
                 {
                     thread::sleep(Duration::from_millis(10));
                 }
-                Err(error) => panic!(
-                    "tmux runtime identity did not stabilize within the fixture timeout: {error:?}"
-                ),
+                Err(error) => {
+                    let pane_session_id = unsafe { libc::getsid(pane_pid) };
+                    let pane_session_members =
+                        super::linux_process_session_members(pane_session_id).map(|members| {
+                            members
+                                .iter()
+                                .map(|member| {
+                                    (
+                                        member.pid,
+                                        member.session_id,
+                                        member.start_time,
+                                        member.zombie,
+                                    )
+                                })
+                                .collect::<Vec<_>>()
+                        });
+                    panic!(
+                        "tmux runtime identity did not stabilize within the fixture timeout: {error:?}; caller_pid={}; caller_pgid={}; caller_sid={}; pane_pid={pane_pid}; pane_pgid={:?}; pane_sid={pane_session_id}; pane_members={pane_session_members:?}; pane_cgroup={:?}; pane_stat={:?}; calls={}",
+                        unsafe { libc::getpid() },
+                        unsafe { libc::getpgrp() },
+                        unsafe { libc::getsid(0) },
+                        super::process_group_id(pane_pid),
+                        super::linux_process_control_group(pane_pid),
+                        fs::read_to_string(format!("/proc/{pane_pid}/stat")),
+                        fs::read_to_string(&wrapper_calls).unwrap_or_default(),
+                    );
+                }
             }
         };
         assert_eq!(retained_identity.session_id, tmux_session_id);
