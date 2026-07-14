@@ -131,6 +131,7 @@ struct ServeState {
     provider_prompt_discovery: Arc<ProviderPromptDiscoveryRegistry>,
     activity_broker: Arc<ActivityBroker>,
     codex_controls: Arc<StdMutex<HashMap<String, CodexControlEntry>>>,
+    codex_account_switches: CodexAccountSwitchRegistry,
     session_collector: SessionCollector,
 }
 
@@ -138,6 +139,28 @@ struct ServeState {
 struct CodexControlEntry {
     launch_id: String,
     handle: ControlHandle,
+}
+
+#[derive(Clone, Default)]
+struct CodexAccountSwitchRegistry {
+    entries: Arc<tokio::sync::Mutex<HashMap<String, std::sync::Weak<tokio::sync::Mutex<()>>>>>,
+}
+
+impl CodexAccountSwitchRegistry {
+    async fn lock(&self, session_id: &str) -> tokio::sync::OwnedMutexGuard<()> {
+        let slot = {
+            let mut entries = self.entries.lock().await;
+            entries.retain(|_, entry| entry.strong_count() > 0);
+            if let Some(slot) = entries.get(session_id).and_then(std::sync::Weak::upgrade) {
+                slot
+            } else {
+                let slot = Arc::new(tokio::sync::Mutex::new(()));
+                entries.insert(session_id.to_string(), Arc::downgrade(&slot));
+                slot
+            }
+        };
+        slot.lock_owned().await
+    }
 }
 
 fn default_session_collector() -> SessionCollector {
@@ -225,6 +248,7 @@ pub fn run_serve(context: &CliContext, args: cli::ServeArgs) -> i32 {
             provider_prompt_discovery: Arc::new(ProviderPromptDiscoveryRegistry::default()),
             activity_broker,
             codex_controls: Arc::new(StdMutex::new(HashMap::new())),
+            codex_account_switches: CodexAccountSwitchRegistry::default(),
             session_collector,
         });
         let listener = match tokio::net::TcpListener::bind(bind).await {
@@ -2550,6 +2574,7 @@ async fn codex_account_handler(
             "expected_session_incarnation is required",
         );
     };
+    let _switch_guard = state.codex_account_switches.lock(&id).await;
     let context = state.context.clone();
     let load_id = id.clone();
     let record =
@@ -6529,6 +6554,7 @@ mod tests {
             provider_prompt_discovery: Arc::new(ProviderPromptDiscoveryRegistry::default()),
             activity_broker,
             codex_controls: Arc::new(StdMutex::new(HashMap::new())),
+            codex_account_switches: CodexAccountSwitchRegistry::default(),
             session_collector,
         })
     }
@@ -9907,6 +9933,127 @@ mod tests {
         assert_eq!(body["data"]["codex_account"]["selected_account"], "gamania");
         assert_eq!(body["data"]["codex_account"]["revision"], 1);
         responder.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn codex_account_switch_serializes_the_complete_same_session_transaction() {
+        let lock = GlobalStateLock::new();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let _broker = EnvGuard::set(
+            &lock,
+            "AGENT_SESSION_CODEX_ACCOUNT_BROKER",
+            r#"["/bin/false"]"#,
+        );
+        let launch_id = seed_codex_app_server_session(tmp.path(), "account-switch-serialized");
+        let st = state(tmp.path(), Some(TOKEN), minimal_tmux(tmp.path()));
+        let record = load_session_record(&st.context, "account-switch-serialized").unwrap();
+        crate::activity::activate_runtime(&st.context, &record).unwrap();
+        for (event_id, kind) in [
+            ("turn-start", "turn_started"),
+            ("turn-done", "turn_completed"),
+        ] {
+            let event = serde_json::from_value(json!({
+                "schema_version": crate::activity::TURN_EVENT_VERSION,
+                "event_id": event_id,
+                "runtime_id": launch_id,
+                "provider": "codex",
+                "provider_turn_id": "turn-account-switch-serialized",
+                "kind": kind,
+                "confidence": "authoritative"
+            }))
+            .unwrap();
+            crate::activity::ingest_event(&st.context, &record.id, event).unwrap();
+        }
+        let (handle, mut commands) = codex_app_server::control_channel();
+        st.codex_controls.lock().unwrap().insert(
+            record.id.clone(),
+            CodexControlEntry {
+                launch_id: launch_id.clone(),
+                handle,
+            },
+        );
+
+        let first_launch_id = launch_id.clone();
+        let first = tokio::spawn(call(
+            router(st.clone()),
+            put_json(
+                "/sessions/account-switch-serialized/account",
+                Some(TOKEN),
+                json!({
+                    "account": "gamania",
+                    "expected_session_incarnation": first_launch_id
+                }),
+            ),
+        ));
+        let Some(codex_app_server::ControlCommand::BindAccount {
+            account: first_account,
+            revision: first_revision,
+            response: first_response,
+        }) = tokio::time::timeout(Duration::from_secs(1), commands.recv())
+            .await
+            .expect("first switch must reach the control plane")
+        else {
+            panic!("first switch sent an unexpected control command");
+        };
+        assert_eq!(first_account, "gamania");
+        assert_eq!(first_revision, 1);
+
+        let second_launch_id = launch_id.clone();
+        let second = tokio::spawn(call(
+            router(st.clone()),
+            put_json(
+                "/sessions/account-switch-serialized/account",
+                Some(TOKEN),
+                json!({
+                    "account": "sym",
+                    "expected_session_incarnation": second_launch_id
+                }),
+            ),
+        ));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), commands.recv())
+                .await
+                .is_err(),
+            "the second same-session switch must not enter the control plane before the first finishes"
+        );
+
+        first_response
+            .send(Ok(crate::codex_account::CodexAccountView {
+                schema_version: crate::codex_account::VIEW_SCHEMA_VERSION,
+                supported: true,
+                state: "bound",
+                selected_account: Some(first_account),
+                revision: first_revision,
+                applied_runtime_id: Some(launch_id.clone()),
+                failure_reason: None,
+            }))
+            .unwrap();
+        assert_eq!(first.await.unwrap().0, StatusCode::OK);
+
+        let Some(codex_app_server::ControlCommand::BindAccount {
+            account: second_account,
+            revision: second_revision,
+            response: second_response,
+        }) = tokio::time::timeout(Duration::from_secs(1), commands.recv())
+            .await
+            .expect("second switch must reach the control plane after the first finishes")
+        else {
+            panic!("second switch sent an unexpected control command");
+        };
+        assert_eq!(second_account, "sym");
+        assert_eq!(second_revision, 2);
+        second_response
+            .send(Ok(crate::codex_account::CodexAccountView {
+                schema_version: crate::codex_account::VIEW_SCHEMA_VERSION,
+                supported: true,
+                state: "bound",
+                selected_account: Some(second_account),
+                revision: second_revision,
+                applied_runtime_id: Some(launch_id),
+                failure_reason: None,
+            }))
+            .unwrap();
+        assert_eq!(second.await.unwrap().0, StatusCode::OK);
     }
 
     #[tokio::test]

@@ -2783,6 +2783,16 @@ async fn cancel_before_tui_mutation(
     value: &Value,
 ) -> Option<MutationAuthorization> {
     let method = value.get("method").and_then(Value::as_str);
+    if (crate::codex_account::binding_is_present(record)
+        || crate::codex_account::view_for_record(record).supported)
+        && matches!(
+            method,
+            Some("account/login/start" | "account/login/cancel" | "account/logout")
+        )
+    {
+        bootstrap.close();
+        return None;
+    }
     if !matches!(method, Some("thread/start" | "turn/start")) {
         return Some(MutationAuthorization {
             _bootstrap_gate: None,
@@ -6649,6 +6659,43 @@ printf '%s\n' '{"schema_version":"agent-session.codex-auth-broker.v1","account":
             1
         );
         assert_eq!(bootstrap, FreshBootstrap::Closed);
+    }
+
+    #[tokio::test]
+    async fn broker_bound_tui_rejects_account_auth_mutations() {
+        let lock = GlobalStateLock::new();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let _broker = EnvGuard::set(
+            &lock,
+            "AGENT_SESSION_CODEX_ACCOUNT_BROKER",
+            r#"["/configured/broker"]"#,
+        );
+        let socket = tmp.path().join("broker-bound-auth.sock");
+        let context = CliContext {
+            state_dir: tmp.path().join("state"),
+            host: None,
+        };
+        let mut record = record_with_runtime("broker-bound-auth", &socket);
+        crate::codex_account::set_initial_binding(&mut record, Some("gamania")).unwrap();
+
+        for method in [
+            "account/login/start",
+            "account/login/cancel",
+            "account/logout",
+        ] {
+            let mut bootstrap = FreshBootstrap::Closed;
+            assert!(
+                cancel_before_tui_mutation(
+                    &context,
+                    &record,
+                    &mut bootstrap,
+                    &json!({ "id": 1, "method": method, "params": {} }),
+                )
+                .await
+                .is_none(),
+                "broker-bound TUI mutation {method} must be rejected"
+            );
+        }
     }
 
     #[tokio::test]
