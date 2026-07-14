@@ -42,7 +42,8 @@ remain usable from a phone.
 `resume` recreates a missing tmux runtime only when the session has exact provider resume metadata; it never resumes the
 latest provider conversation implicitly. Runtime metadata is persisted before launch so hooks see the new generation,
 and the immutable tmux session/pane identity is persisted before a successful start or resume returns. Resume first
-proves the prior launch identity stopped, so a surviving provider process cannot be hidden by a new runtime generation.
+proves the current and every retained prior launch identity stopped, so a surviving provider process cannot be hidden by
+a new runtime generation.
 An older stopped record without that proof returns the same non-retryable manual-verification action as deletion; only
 a generation durably marked as never launched can resume without a runtime identity. If tmux launch fails, the prior
 runtime and activity snapshot are restored only after any possibly launched replacement is verified stopped. An

@@ -3206,16 +3206,43 @@ fn resume_session_by_id(
         write_session_record(context, &record)?;
     }
     let (provider_resume, agent) = validate_resume_metadata(&record)?;
+    let resume_args = provider_resume.resume_args.clone();
+    let prior_identities = persisted_prior_tmux_runtime_identities(&record).map_err(|reason| {
+        session_termination_error(&record, reason, SessionTerminationOperation::Resume)
+    })?;
     match persisted_tmux_runtime_identity(&record).map_err(|reason| {
         session_termination_error(&record, reason, SessionTerminationOperation::Resume)
     })? {
         Some(identity) => {
-            verify_stopped_tmux_runtime(tmux_bin, &identity, DELETE_TERMINATION_VERIFY_TIMEOUT)
+            if prior_identities
+                .iter()
+                .any(|prior| !prior.same_runtime_target(&identity))
+            {
+                return Err(session_termination_error(
+                    &record,
+                    SessionTerminationFailure::RuntimeIdentityMismatch,
+                    SessionTerminationOperation::Resume,
+                ));
+            }
+            let verification_started = Instant::now();
+            verify_stopped_process_groups(&prior_identities, DELETE_TERMINATION_VERIFY_TIMEOUT)
                 .map_err(|reason| {
                     session_termination_error(&record, reason, SessionTerminationOperation::Resume)
                 })?;
+            let remaining =
+                DELETE_TERMINATION_VERIFY_TIMEOUT.saturating_sub(verification_started.elapsed());
+            if remaining.is_zero() {
+                return Err(session_termination_error(
+                    &record,
+                    SessionTerminationFailure::VerificationFailed,
+                    SessionTerminationOperation::Resume,
+                ));
+            }
+            verify_stopped_tmux_runtime(tmux_bin, &identity, remaining).map_err(|reason| {
+                session_termination_error(&record, reason, SessionTerminationOperation::Resume)
+            })?;
         }
-        None if runtime_is_proven_never_launched(&record) => {}
+        None if runtime_is_proven_never_launched(&record) && prior_identities.is_empty() => {}
         None => {
             return Err(session_termination_error(
                 &record,
@@ -3224,13 +3251,13 @@ fn resume_session_by_id(
             ));
         }
     }
+    record.extra.remove(DELETE_TMUX_PRIOR_IDENTITIES_KEY);
     let previous_record = record.clone();
     let app_server_managed = agent == AgentKind::Codex
         && (codex_app_server::runtime_is_supported(&previous_record)
             || codex_account::binding_is_present(&previous_record));
     let previous_activity = activity::capture_snapshot(context, &record.id)?;
     let mut startup_artifacts = StartupArtifactBackup::stage(context, &record)?;
-    let resume_args = provider_resume.resume_args.clone();
     let agent_bin = record
         .agent_bin
         .as_deref()

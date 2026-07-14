@@ -3847,7 +3847,7 @@ fn delete_uses_launch_identity_after_runtime_stops_before_first_delete() {
 }
 
 #[test]
-fn resume_refuses_to_replace_a_surviving_launch_identity() {
+fn resume_refuses_to_replace_a_surviving_prior_launch_identity() {
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let state_dir = tmp.path().join("state");
     let cwd = tmp.path().join("repo");
@@ -3877,9 +3877,16 @@ fn resume_refuses_to_replace_a_surviving_launch_identity() {
         "launch_id": "prior-launch",
         "session_id": "$66",
         "pane_id": "%66",
+        "pane_pid": 99999999,
+        "process_group_id": 99999999,
+    });
+    record["delete_tmux_prior_identities"] = json!([{
+        "launch_id": "prior-launch",
+        "session_id": "$66",
+        "pane_id": "%66",
         "pane_pid": prior_process.pid(),
         "process_group_id": prior_process.pid(),
-    });
+    }]);
     fs::write(&record_path, serde_json::to_vec_pretty(&record).unwrap()).unwrap();
 
     let state_arg = state_dir.to_string_lossy().to_string();
@@ -3912,6 +3919,10 @@ fn resume_refuses_to_replace_a_surviving_launch_identity() {
     let retained: Value = serde_json::from_slice(&fs::read(&record_path).unwrap()).unwrap();
     assert_eq!(retained["runtime"]["launch_id"], "prior-launch");
     assert_eq!(retained["delete_tmux_identity"]["session_id"], "$66");
+    assert_eq!(
+        retained["delete_tmux_prior_identities"][0]["process_group_id"],
+        prior_process.pid()
+    );
     assert!(
         tmux_calls(&tmux_log)
             .iter()
@@ -3929,6 +3940,7 @@ fn resume_refuses_to_replace_a_surviving_launch_identity() {
         replaced["runtime"]["launch_id"]
     );
     assert_eq!(replaced["delete_tmux_identity"]["session_id"], "$77");
+    assert!(replaced.get("delete_tmux_prior_identities").is_none());
 }
 
 #[test]

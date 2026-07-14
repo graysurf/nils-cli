@@ -10808,6 +10808,71 @@ esac
     }
 
     #[tokio::test]
+    async fn resume_api_reports_retry_resume_for_a_surviving_prior_runtime() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cwd = tmp.path().join("repo");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let id = "resume-surviving-prior-runtime";
+        seed_resumable_session(
+            tmp.path(),
+            id,
+            "codex",
+            "hs-codex-resume-surviving-prior-runtime",
+            &cwd,
+            &[
+                "resume",
+                "resume-session-id",
+                "--cd",
+                cwd.to_str().unwrap(),
+                "--no-alt-screen",
+            ],
+        );
+        let record_path = tmp.path().join("sessions").join(id).join("session.json");
+        let mut record: Value =
+            serde_json::from_slice(&std::fs::read(&record_path).unwrap()).unwrap();
+        record["runtime"]["launch_id"] = json!("surviving-prior-launch");
+        let prior_pane = TestProcessGroup::spawn();
+        record["delete_tmux_identity"] = json!({
+            "launch_id": "surviving-prior-launch",
+            "session_id": "$98",
+            "pane_id": "%98",
+            "pane_pid": 99999999,
+            "process_group_id": 99999999,
+        });
+        record["delete_tmux_prior_identities"] = json!([{
+            "launch_id": "surviving-prior-launch",
+            "session_id": "$98",
+            "pane_id": "%98",
+            "pane_pid": prior_pane.pid(),
+            "process_group_id": prior_pane.pid(),
+        }]);
+        std::fs::write(&record_path, serde_json::to_vec_pretty(&record).unwrap()).unwrap();
+        let tmux = executable(
+            &tmp.path().join("stopped-prior-runtime-tmux"),
+            "#!/usr/bin/env sh\nprintf '%s\\n' \"can't find session: stopped\" >&2\nexit 1\n",
+        );
+        let st = state(tmp.path(), Some(TOKEN), tmux);
+
+        let (status, body) = call(
+            router(st),
+            post_json(&format!("/sessions/{id}/resume"), Some(TOKEN), json!({})),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "body={body}");
+        assert_eq!(body["error"]["code"], "session-termination-failed");
+        assert_eq!(body["error"]["details"]["reason"], "process-still-running");
+        assert_eq!(body["error"]["details"]["retryable"], true);
+        assert_eq!(body["error"]["details"]["action"], "retry-resume");
+        let retained: Value =
+            serde_json::from_slice(&std::fs::read(&record_path).unwrap()).unwrap();
+        assert_eq!(
+            retained["delete_tmux_prior_identities"][0]["process_group_id"],
+            prior_pane.pid()
+        );
+    }
+
+    #[tokio::test]
     async fn resume_refuses_non_resumable_session_with_token() {
         let tmp = tempfile::TempDir::new().unwrap();
         let log = tmp.path().join("tmux.log");
