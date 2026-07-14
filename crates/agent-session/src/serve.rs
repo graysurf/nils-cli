@@ -227,6 +227,13 @@ pub fn run_serve(context: &CliContext, args: cli::ServeArgs) -> i32 {
     };
 
     runtime.block_on(async move {
+        if let Err(err) = crate::recover_interrupted_tmux_terminations(context) {
+            eprintln!(
+                "error: failed to recover interrupted session termination: {}",
+                err.code()
+            );
+            return exit::RUNTIME;
+        }
         if let Err(err) = fence_codex_controls_before_listen(context, &tmux_bin) {
             eprintln!(
                 "error: failed to fence Codex account controls: {}",
@@ -5263,11 +5270,19 @@ mod tests {
 
     impl TestProcessGroup {
         fn spawn() -> Self {
-            let child = std::process::Command::new("sleep")
-                .arg("30")
-                .process_group(0)
-                .spawn()
-                .expect("spawn test process group");
+            let mut command = std::process::Command::new("sleep");
+            command.arg("30");
+            // SAFETY: this test-only child must own a dedicated process session.
+            unsafe {
+                command.pre_exec(|| {
+                    if libc::setsid() < 0 {
+                        Err(io::Error::last_os_error())
+                    } else {
+                        Ok(())
+                    }
+                });
+            }
+            let child = command.spawn().expect("spawn test process session");
             let process_group_id = child.id() as libc::pid_t;
             Self {
                 child: Some(child),
@@ -6715,12 +6730,19 @@ mod tests {
         bin
     }
 
-    fn failing_delete_tmux(dir: &Path, state_dir: &Path, id: &str, pane_pid: u32) -> PathBuf {
+    fn failing_delete_tmux(
+        dir: &Path,
+        state_dir: &Path,
+        id: &str,
+        pane_pid: u32,
+        calls: &Path,
+    ) -> PathBuf {
         let bin = dir.join("failing-delete-tmux");
         std::fs::write(
             &bin,
             format!(
                 r#"#!/usr/bin/env sh
+printf '%s\n' "$*" >> {calls}
 case "$1" in
   display-message) printf '$88\t%%88\t{pane_pid}\n'; exit 0 ;;
   show-environment)
@@ -6738,6 +6760,7 @@ esac
                 id = shell_words::quote(id),
                 state_dir = shell_words::quote(&state_dir.to_string_lossy()),
                 runtime_id = shell_words::quote(&format!("launch-{id}")),
+                calls = shell_words::quote(&calls.to_string_lossy()),
             ),
         )
         .unwrap();
@@ -12630,7 +12653,8 @@ printf '%s\n' '{"schema_version":"agent-session.codex-auth-broker.v1","accounts"
             let tmux_session = format!("hs-{agent}-failed-delete");
             seed_session_with_runtime(tmp.path(), &id, agent, &tmux_session);
             let pane = TestProcessGroup::spawn();
-            let tmux = failing_delete_tmux(tmp.path(), tmp.path(), &id, pane.pid());
+            let calls = tmp.path().join(format!("failed-delete-{agent}.calls"));
+            let tmux = failing_delete_tmux(tmp.path(), tmp.path(), &id, pane.pid(), &calls);
             let session_dir = tmp.path().join("sessions").join(&id);
             let runtime_metadata = session_dir.join("provider-runtime.json");
             std::fs::write(&runtime_metadata, format!("runtime metadata for {agent}")).unwrap();
@@ -12650,8 +12674,29 @@ printf '%s\n' '{"schema_version":"agent-session.codex-auth-broker.v1","accounts"
             assert_eq!(body["error"]["code"], "session-termination-failed");
             assert_eq!(body["error"]["details"]["id"], id);
             assert_eq!(body["error"]["details"]["tmux_session"], tmux_session);
-            assert_eq!(body["error"]["details"]["reason"], "kill-failed");
-            assert_eq!(body["error"]["details"]["action"], "retry-delete");
+            #[cfg(target_os = "linux")]
+            {
+                assert_eq!(
+                    body["error"]["details"]["reason"],
+                    "runtime-identity-unavailable"
+                );
+                assert_eq!(
+                    body["error"]["details"]["action"],
+                    "manual-runtime-verification-required"
+                );
+                assert!(
+                    !std::fs::read_to_string(&calls)
+                        .unwrap_or_default()
+                        .lines()
+                        .any(|line| line.starts_with("if-shell")),
+                    "Linux deletion must not mutate tmux before pinning a dedicated cgroup"
+                );
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                assert_eq!(body["error"]["details"]["reason"], "kill-failed");
+                assert_eq!(body["error"]["details"]["action"], "retry-delete");
+            }
             assert!(session_dir.exists(), "{agent} state must remain retryable");
             assert!(
                 runtime_metadata.exists(),

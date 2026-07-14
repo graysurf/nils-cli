@@ -13,6 +13,10 @@ use std::ffi::OsString;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Read, Write};
 use std::os::fd::AsRawFd;
+#[cfg(target_os = "linux")]
+use std::os::fd::{FromRawFd, OwnedFd};
+#[cfg(target_os = "linux")]
+use std::os::unix::fs::MetadataExt;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -2288,12 +2292,33 @@ fn run_tmux_new_session(
         .as_ref()
         .map(|runtime| runtime.launch_id.clone())
         .filter(|launch_id| !launch_id.is_empty());
+    let process_session_id = match process_group_id {
+        Some(_) => process_session_id(pane_pid).map_err(|_| {
+            CliError::runtime(
+                "tmux-runtime-identity-invalid",
+                "tmux new-session returned an unverifiable pane process session",
+                Some(json!({ "id": record.id })),
+            )
+        })?,
+        None => None,
+    };
+    let control_group = linux_process_control_group(pane_pid).map_err(|_| {
+        CliError::runtime(
+            "tmux-runtime-identity-invalid",
+            "tmux new-session returned an unverifiable pane control group",
+            Some(json!({ "id": record.id })),
+        )
+    })?;
     Ok(TmuxRuntimeIdentity {
         launch_id,
         session_id: session_id.to_string(),
         pane_id: pane_id.to_string(),
         pane_pid,
         process_group_id,
+        process_session_id,
+        process_session_members: Vec::new(),
+        control_group_members: Vec::new(),
+        control_group,
     })
 }
 
@@ -3325,10 +3350,10 @@ fn resume_session_by_id(
                 ));
             }
             let verification_started = Instant::now();
-            verify_stopped_process_groups(&prior_identities, DELETE_TERMINATION_VERIFY_TIMEOUT)
+            verify_stopped_process_runtimes(&prior_identities, DELETE_TERMINATION_VERIFY_TIMEOUT)
                 .map_err(|reason| {
-                    session_termination_error(&record, reason, SessionTerminationOperation::Resume)
-                })?;
+                session_termination_error(&record, reason, SessionTerminationOperation::Resume)
+            })?;
             let remaining =
                 DELETE_TERMINATION_VERIFY_TIMEOUT.saturating_sub(verification_started.elapsed());
             if remaining.is_zero() {
@@ -3351,7 +3376,10 @@ fn resume_session_by_id(
             ));
         }
     }
-    if termination_state == Some(TmuxTerminationState::Pending) {
+    if matches!(
+        termination_state,
+        Some(TmuxTerminationState::Pending { .. })
+    ) {
         return Err(session_termination_error(
             &record,
             SessionTerminationFailure::RuntimeIdentityUnavailable,
@@ -5026,6 +5054,7 @@ fn delete_session_with_timeouts(
         None,
         kill_timeout,
         verify_timeout,
+        true,
     )
     .map_err(|reason| {
         session_termination_error(&record, reason, SessionTerminationOperation::Delete)
@@ -5098,7 +5127,7 @@ impl SessionTerminationFailure {
             Self::KillError => "tmux kill-session could not be executed",
             Self::StillRunning => "tmux session remained live after kill-session",
             Self::ProcessStillRunning => {
-                "the recorded tmux pane process group remained live after kill-session"
+                "the recorded tmux runtime process boundary remained live after kill-session"
             }
             Self::RuntimeIdentityChanged => {
                 "the managed tmux pane identity changed before kill-session"
@@ -5164,7 +5193,7 @@ fn recover_failed_tmux_launch(
         )
         .map_err(|reason| session_termination_error(record, reason, operation))?
         {
-            TmuxRuntimeProbe::Running(identity) => identity,
+            TmuxRuntimeProbe::Running(identity) => *identity,
             TmuxRuntimeProbe::Stopped => {
                 return Err(session_termination_error(
                     record,
@@ -5185,6 +5214,7 @@ fn recover_failed_tmux_launch(
         Some(identity),
         PANE_INPUT_COMMAND_TIMEOUT,
         DELETE_TERMINATION_VERIFY_TIMEOUT,
+        false,
     )
     .map_err(|reason| session_termination_error(record, reason, operation))
 }
@@ -5196,12 +5226,14 @@ fn terminate_tmux_session_with_timeouts(
     initial_identity: Option<TmuxRuntimeIdentity>,
     kill_timeout: Duration,
     verify_timeout: Duration,
+    terminate_process_group: bool,
 ) -> Result<(), SessionTerminationFailure> {
+    recover_interrupted_tmux_termination_locked(context, record)?;
     let mut identity_changes = 0;
     let mut initial_identity = initial_identity;
     loop {
         let runtime_probe = match initial_identity.take() {
-            Some(identity) => TmuxRuntimeProbe::Running(identity),
+            Some(identity) => TmuxRuntimeProbe::Running(Box::new(identity)),
             None => capture_tmux_runtime_identity(
                 context,
                 record,
@@ -5209,8 +5241,9 @@ fn terminate_tmux_session_with_timeouts(
                 verify_timeout.min(DELETE_TERMINATION_PROBE_TIMEOUT),
             )?,
         };
-        let identity = match runtime_probe {
+        let mut identity = match runtime_probe {
             TmuxRuntimeProbe::Running(identity) => {
+                let mut identity = *identity;
                 let mut prior_identities = persisted_prior_tmux_runtime_identities(record)?;
                 if prior_identities
                     .iter()
@@ -5222,10 +5255,11 @@ fn terminate_tmux_session_with_timeouts(
                     if !persisted.same_runtime_target(&identity) {
                         return Err(SessionTerminationFailure::RuntimeIdentityMismatch);
                     }
-                    if !persisted.same_process_identity(&identity)
-                        && !prior_identities
-                            .iter()
-                            .any(|prior| prior.same_process_identity(&persisted))
+                    if persisted.same_process_identity(&identity) {
+                        identity.merge_process_evidence_from(&persisted);
+                    } else if !prior_identities
+                        .iter()
+                        .any(|prior| prior.same_process_identity(&persisted))
                     {
                         prior_identities.push(persisted);
                     }
@@ -5233,7 +5267,7 @@ fn terminate_tmux_session_with_timeouts(
                 persist_tmux_runtime_identities(record, &identity, &prior_identities)?;
                 write_session_record(context, record)
                     .map_err(|_| SessionTerminationFailure::RuntimeIdentityUnavailable)?;
-                verify_stopped_process_groups(&prior_identities, verify_timeout)?;
+                verify_stopped_process_runtimes(&prior_identities, verify_timeout)?;
                 if !prior_identities.is_empty() {
                     persist_tmux_runtime_identities(record, &identity, &[])?;
                     write_session_record(context, record)
@@ -5255,17 +5289,18 @@ fn terminate_tmux_session_with_timeouts(
                     return Err(SessionTerminationFailure::RuntimeIdentityMismatch);
                 }
                 let verification_started = Instant::now();
-                verify_stopped_process_groups(&prior_identities, verify_timeout)?;
+                verify_stopped_process_runtimes(&prior_identities, verify_timeout)?;
                 let remaining = verify_timeout.saturating_sub(verification_started.elapsed());
                 if remaining.is_zero() {
                     return Err(SessionTerminationFailure::VerificationFailed);
                 }
                 verify_stopped_tmux_runtime(tmux_bin, &identity, remaining)?;
                 match persisted_tmux_termination_state(record)? {
-                    Some(TmuxTerminationState::Pending) => {
+                    Some(TmuxTerminationState::FreezePending { .. }) => {
                         return Err(SessionTerminationFailure::RuntimeIdentityUnavailable);
                     }
-                    Some(TmuxTerminationState::KillConfirmed) => {
+                    Some(TmuxTerminationState::Pending { .. })
+                    | Some(TmuxTerminationState::KillConfirmed { .. }) => {
                         record.extra.remove(DELETE_TMUX_TERMINATION_STATE_KEY);
                         write_session_record(context, record)
                             .map_err(|_| SessionTerminationFailure::RuntimeIdentityUnavailable)?;
@@ -5279,18 +5314,80 @@ fn terminate_tmux_session_with_timeouts(
         if identity_changes >= DELETE_TERMINATION_IDENTITY_RETRY_LIMIT {
             return Err(SessionTerminationFailure::RuntimeIdentityChanged);
         }
-        set_tmux_termination_state(record, TmuxTerminationState::Pending)?;
-        write_session_record(context, record)
-            .map_err(|_| SessionTerminationFailure::RuntimeIdentityUnavailable)?;
+        let mut pinned_runtime = if terminate_process_group {
+            Some(prepare_process_runtime(&identity)?)
+        } else {
+            None
+        };
+        if let Some(runtime) = pinned_runtime.as_mut() {
+            refresh_process_runtime_freeze_ownership(runtime)?;
+        }
+        let mut thaw_on_recovery = pinned_runtime
+            .as_ref()
+            .is_some_and(process_runtime_thaw_on_recovery);
+        if let Some(runtime) = pinned_runtime.as_mut() {
+            set_tmux_termination_state(
+                record,
+                TmuxTerminationState::FreezePending { thaw_on_recovery },
+            )?;
+            write_session_record(context, record)
+                .map_err(|_| SessionTerminationFailure::RuntimeIdentityUnavailable)?;
+            if let Err(reason) = freeze_and_pin_process_runtime(&identity, runtime) {
+                thaw_owned_process_runtime(runtime)?;
+                release_process_runtime(pinned_runtime.take());
+                record.extra.remove(DELETE_TMUX_TERMINATION_STATE_KEY);
+                let _ = write_session_record(context, record);
+                return Err(reason);
+            }
+            thaw_on_recovery = process_runtime_thaw_on_recovery(runtime);
+            identity.control_group_members = process_runtime_identities(runtime);
+            let prior_identities = persisted_prior_tmux_runtime_identities(record)?;
+            persist_tmux_runtime_identities(record, &identity, &prior_identities)?;
+            set_tmux_termination_state(record, TmuxTerminationState::Pending { thaw_on_recovery })?;
+            write_session_record(context, record)
+                .map_err(|_| SessionTerminationFailure::RuntimeIdentityUnavailable)?;
+        } else {
+            set_tmux_termination_state(record, TmuxTerminationState::Pending { thaw_on_recovery })?;
+            write_session_record(context, record)
+                .map_err(|_| SessionTerminationFailure::RuntimeIdentityUnavailable)?;
+        }
+        if let Some(runtime) = pinned_runtime.as_ref() {
+            verify_process_runtime_frozen(runtime)?;
+        }
         match tmux_kill_identity_with_timeout(tmux_bin, &identity, kill_timeout)? {
             TmuxIdentityKillOutcome::IdentityChanged => {
+                if let Some(runtime) = pinned_runtime.as_mut() {
+                    thaw_owned_process_runtime(runtime)?;
+                }
+                release_process_runtime(pinned_runtime);
+                record.extra.remove(DELETE_TMUX_TERMINATION_STATE_KEY);
+                write_session_record(context, record)
+                    .map_err(|_| SessionTerminationFailure::RuntimeIdentityUnavailable)?;
                 identity_changes += 1;
             }
             TmuxIdentityKillOutcome::KillConfirmed => {
-                set_tmux_termination_state(record, TmuxTerminationState::KillConfirmed)?;
+                set_tmux_termination_state(
+                    record,
+                    TmuxTerminationState::KillConfirmed { thaw_on_recovery },
+                )?;
                 write_session_record(context, record)
                     .map_err(|_| SessionTerminationFailure::RuntimeIdentityUnavailable)?;
-                verify_stopped_tmux_runtime(tmux_bin, &identity, verify_timeout)?;
+                let verification_started = Instant::now();
+                if terminate_process_group {
+                    terminate_captured_process_runtime(
+                        &identity,
+                        pinned_runtime
+                            .as_mut()
+                            .ok_or(SessionTerminationFailure::VerificationFailed)?,
+                        verify_timeout,
+                    )?;
+                }
+                release_process_runtime(pinned_runtime);
+                let remaining = verify_timeout.saturating_sub(verification_started.elapsed());
+                if remaining.is_zero() {
+                    return Err(SessionTerminationFailure::VerificationFailed);
+                }
+                verify_stopped_tmux_runtime(tmux_bin, &identity, remaining)?;
                 record.extra.remove(DELETE_TMUX_TERMINATION_STATE_KEY);
                 write_session_record(context, record)
                     .map_err(|_| SessionTerminationFailure::RuntimeIdentityUnavailable)?;
@@ -5309,6 +5406,29 @@ struct TmuxRuntimeIdentity {
     pane_pid: libc::pid_t,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     process_group_id: Option<libc::pid_t>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    process_session_id: Option<libc::pid_t>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    process_session_members: Vec<TmuxProcessIdentity>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    control_group_members: Vec<TmuxProcessIdentity>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    control_group: Option<TmuxControlGroupIdentity>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+struct TmuxProcessIdentity {
+    pid: libc::pid_t,
+    start_time: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+struct TmuxControlGroupIdentity {
+    path: String,
+    device: u64,
+    inode: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    boot_id: Option<String>,
 }
 
 impl TmuxRuntimeIdentity {
@@ -5319,12 +5439,45 @@ impl TmuxRuntimeIdentity {
     }
 
     fn same_process_identity(&self, other: &Self) -> bool {
-        self.pane_pid == other.pane_pid && self.process_group_id == other.process_group_id
+        self.pane_pid == other.pane_pid
+            && self.process_group_id == other.process_group_id
+            && (self.process_session_id == other.process_session_id
+                || self.process_session_id.is_none()
+                || other.process_session_id.is_none())
+            && match (&self.control_group, &other.control_group) {
+                (Some(left), Some(right)) => left.same_runtime_identity(right),
+                _ => true,
+            }
+    }
+
+    fn merge_process_evidence_from(&mut self, other: &Self) {
+        merge_process_identities(
+            &mut self.control_group_members,
+            &other.control_group_members,
+        );
+    }
+}
+
+fn merge_process_identities(
+    identities: &mut Vec<TmuxProcessIdentity>,
+    additional: &[TmuxProcessIdentity],
+) {
+    identities.extend_from_slice(additional);
+    identities.sort_unstable_by_key(|identity| (identity.pid, identity.start_time));
+    identities.dedup();
+}
+
+impl TmuxControlGroupIdentity {
+    fn same_runtime_identity(&self, other: &Self) -> bool {
+        self.path == other.path
+            && self.device == other.device
+            && self.inode == other.inode
+            && (self.boot_id == other.boot_id || self.boot_id.is_none() || other.boot_id.is_none())
     }
 }
 
 enum TmuxRuntimeProbe {
-    Running(TmuxRuntimeIdentity),
+    Running(Box<TmuxRuntimeIdentity>),
     Stopped,
 }
 
@@ -5336,8 +5489,27 @@ enum TmuxIdentityKillOutcome {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum TmuxTerminationState {
-    Pending,
-    KillConfirmed,
+    FreezePending { thaw_on_recovery: bool },
+    Pending { thaw_on_recovery: bool },
+    KillConfirmed { thaw_on_recovery: bool },
+}
+
+impl TmuxTerminationState {
+    fn thaw_on_recovery(self) -> bool {
+        match self {
+            Self::FreezePending { thaw_on_recovery }
+            | Self::Pending { thaw_on_recovery }
+            | Self::KillConfirmed { thaw_on_recovery } => thaw_on_recovery,
+        }
+    }
+
+    fn with_thaw_on_recovery(self, thaw_on_recovery: bool) -> Self {
+        match self {
+            Self::FreezePending { .. } => Self::FreezePending { thaw_on_recovery },
+            Self::Pending { .. } => Self::Pending { thaw_on_recovery },
+            Self::KillConfirmed { .. } => Self::KillConfirmed { thaw_on_recovery },
+        }
+    }
 }
 
 fn capture_tmux_runtime_identity(
@@ -5359,7 +5531,7 @@ fn capture_tmux_runtime_identity(
         .arg("-p")
         .arg("-t")
         .arg(managed_tmux_pane_target(&record.tmux_session))
-        .arg("#{session_id}\t#{pane_id}\t#{pane_pid}");
+        .arg("#{session_id} #{pane_id} #{pane_pid}");
     let output = run_output_with_timeout(command, timeout)
         .map_err(|_| SessionTerminationFailure::VerificationFailed)?;
     if !output.status.success() {
@@ -5371,7 +5543,7 @@ fn capture_tmux_runtime_identity(
     }
     let output = String::from_utf8(output.stdout)
         .map_err(|_| SessionTerminationFailure::RuntimeIdentityUnavailable)?;
-    let mut fields = output.trim().split('\t');
+    let mut fields = output.split_whitespace();
     let session_id = fields
         .next()
         .ok_or(SessionTerminationFailure::RuntimeIdentityUnavailable)?;
@@ -5413,14 +5585,21 @@ fn capture_tmux_runtime_identity(
     if process_group_id <= 1 || process_group_id == unsafe { libc::getpgrp() } {
         return Err(SessionTerminationFailure::RuntimeIdentityUnavailable);
     }
+    let process_session_id = process_session_id(pane_pid)?;
+    let process_session_members = process_session_members(process_session_id, pane_pid)?;
+    let control_group = linux_process_control_group(pane_pid)?;
 
-    Ok(TmuxRuntimeProbe::Running(TmuxRuntimeIdentity {
+    Ok(TmuxRuntimeProbe::Running(Box::new(TmuxRuntimeIdentity {
         launch_id,
         session_id: session_id.to_string(),
         pane_id: pane_id.to_string(),
         pane_pid,
         process_group_id: Some(process_group_id),
-    }))
+        process_session_id,
+        process_session_members,
+        control_group_members: Vec::new(),
+        control_group,
+    })))
 }
 
 fn tmux_environment_value(
@@ -5458,6 +5637,193 @@ fn process_group_id(pane_pid: libc::pid_t) -> Result<libc::pid_t, SessionTermina
     } else {
         Ok(process_group_id)
     }
+}
+
+fn process_session_id(
+    pane_pid: libc::pid_t,
+) -> Result<Option<libc::pid_t>, SessionTerminationFailure> {
+    #[cfg(target_os = "linux")]
+    {
+        let process_session_id = unsafe { libc::getsid(pane_pid) };
+        let caller_session_id = unsafe { libc::getsid(0) };
+        if process_session_id <= 1 || caller_session_id <= 1 {
+            return Err(SessionTerminationFailure::RuntimeIdentityUnavailable);
+        }
+        if process_session_id == caller_session_id {
+            return Ok(None);
+        }
+        Ok(Some(process_session_id))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = pane_pid;
+        Ok(None)
+    }
+}
+
+fn process_session_members(
+    process_session_id: Option<libc::pid_t>,
+    pane_pid: libc::pid_t,
+) -> Result<Vec<TmuxProcessIdentity>, SessionTerminationFailure> {
+    #[cfg(target_os = "linux")]
+    {
+        let Some(process_session_id) = process_session_id else {
+            return Ok(Vec::new());
+        };
+        let members = linux_process_session_members(process_session_id)?;
+        if !members.iter().any(|identity| identity.pid == pane_pid) {
+            return Err(SessionTerminationFailure::RuntimeIdentityUnavailable);
+        }
+        Ok(members
+            .into_iter()
+            .map(|identity| TmuxProcessIdentity {
+                pid: identity.pid,
+                start_time: identity.start_time,
+            })
+            .collect())
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (process_session_id, pane_pid);
+        Ok(Vec::new())
+    }
+}
+
+fn linux_process_control_group(
+    pane_pid: libc::pid_t,
+) -> Result<Option<TmuxControlGroupIdentity>, SessionTerminationFailure> {
+    #[cfg(target_os = "linux")]
+    {
+        let Some(path) = linux_process_control_group_path(pane_pid)? else {
+            return Ok(None);
+        };
+        if linux_process_control_group_path(unsafe { libc::getpid() })?.as_deref()
+            == Some(path.as_path())
+        {
+            return Ok(None);
+        }
+        if !valid_tmux_spawn_control_group_path(&path) {
+            return Ok(None);
+        }
+        let full_path = linux_control_group_full_path(&path)?;
+        let metadata =
+            fs::metadata(&full_path).map_err(|_| SessionTerminationFailure::VerificationFailed)?;
+        if !metadata.is_dir()
+            || !full_path.join("cgroup.kill").is_file()
+            || !full_path.join("cgroup.freeze").is_file()
+            || !full_path.join("cgroup.events").is_file()
+        {
+            return Ok(None);
+        }
+        Ok(Some(TmuxControlGroupIdentity {
+            path: display_path(&path),
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            boot_id: Some(linux_boot_id()?),
+        }))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = pane_pid;
+        Ok(None)
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn linux_boot_id() -> Result<String, SessionTerminationFailure> {
+    let boot_id = fs::read_to_string("/proc/sys/kernel/random/boot_id")
+        .map_err(|_| SessionTerminationFailure::VerificationFailed)?;
+    let boot_id = boot_id.trim();
+    let parsed = uuid::Uuid::parse_str(boot_id)
+        .map_err(|_| SessionTerminationFailure::VerificationFailed)?;
+    if parsed.to_string() != boot_id {
+        return Err(SessionTerminationFailure::VerificationFailed);
+    }
+    Ok(boot_id.to_string())
+}
+
+fn valid_linux_boot_id(boot_id: &str) -> bool {
+    uuid::Uuid::parse_str(boot_id).is_ok_and(|parsed| parsed.to_string() == boot_id)
+}
+
+#[cfg(target_os = "linux")]
+fn linux_process_control_group_path(
+    pid: libc::pid_t,
+) -> Result<Option<PathBuf>, SessionTerminationFailure> {
+    let text = match fs::read_to_string(format!("/proc/{pid}/cgroup")) {
+        Ok(text) => text,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => return Err(SessionTerminationFailure::VerificationFailed),
+    };
+    let mut unified = text.lines().filter_map(|line| {
+        let (hierarchy, rest) = line.split_once(':')?;
+        let (controllers, path) = rest.split_once(':')?;
+        (hierarchy == "0" && controllers.is_empty()).then_some(path)
+    });
+    let Some(path) = unified.next() else {
+        return Ok(None);
+    };
+    if unified.next().is_some() {
+        return Err(SessionTerminationFailure::VerificationFailed);
+    }
+    let path = PathBuf::from(path);
+    if !path.is_absolute()
+        || path.components().any(|component| {
+            matches!(
+                component,
+                std::path::Component::ParentDir | std::path::Component::CurDir
+            )
+        })
+    {
+        return Err(SessionTerminationFailure::VerificationFailed);
+    }
+    Ok(Some(path))
+}
+
+fn valid_tmux_spawn_control_group_path(path: &Path) -> bool {
+    if !path.is_absolute()
+        || path.components().any(|component| {
+            matches!(
+                component,
+                std::path::Component::ParentDir | std::path::Component::CurDir
+            )
+        })
+    {
+        return false;
+    }
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    let Some(uuid) = name
+        .strip_prefix("tmux-spawn-")
+        .and_then(|name| name.strip_suffix(".scope"))
+    else {
+        return false;
+    };
+    uuid.len() == 36
+        && uuid.bytes().enumerate().all(|(index, byte)| {
+            if matches!(index, 8 | 13 | 18 | 23) {
+                byte == b'-'
+            } else {
+                byte.is_ascii_hexdigit()
+            }
+        })
+}
+
+#[cfg(target_os = "linux")]
+fn linux_control_group_full_path(path: &Path) -> Result<PathBuf, SessionTerminationFailure> {
+    linux_control_group_full_path_at_root(path, Path::new("/sys/fs/cgroup"))
+}
+
+#[cfg(target_os = "linux")]
+fn linux_control_group_full_path_at_root(
+    path: &Path,
+    root: &Path,
+) -> Result<PathBuf, SessionTerminationFailure> {
+    let relative = path
+        .strip_prefix("/")
+        .map_err(|_| SessionTerminationFailure::VerificationFailed)?;
+    Ok(root.join(relative))
 }
 
 fn persist_tmux_runtime_identity(
@@ -5529,6 +5895,29 @@ fn persisted_tmux_runtime_identity(
         || identity
             .process_group_id
             .is_some_and(|process_group_id| process_group_id <= 1)
+        || identity
+            .process_session_id
+            .is_some_and(|process_session_id| process_session_id <= 1)
+        || identity
+            .process_session_members
+            .iter()
+            .any(|member| member.pid <= 1 || member.start_time == 0)
+        || identity
+            .control_group_members
+            .iter()
+            .any(|member| member.pid <= 1 || member.start_time == 0)
+        || identity
+            .control_group
+            .as_ref()
+            .is_some_and(|control_group| {
+                control_group.device == 0
+                    || control_group.inode == 0
+                    || control_group
+                        .boot_id
+                        .as_deref()
+                        .is_some_and(|boot_id| !valid_linux_boot_id(boot_id))
+                    || !valid_tmux_spawn_control_group_path(Path::new(&control_group.path))
+            })
     {
         return Err(SessionTerminationFailure::RuntimeIdentityUnavailable);
     }
@@ -5556,6 +5945,29 @@ fn persisted_prior_tmux_runtime_identities(
             || identity
                 .process_group_id
                 .is_none_or(|process_group_id| process_group_id <= 1)
+            || identity
+                .process_session_id
+                .is_some_and(|process_session_id| process_session_id <= 1)
+            || identity
+                .process_session_members
+                .iter()
+                .any(|member| member.pid <= 1 || member.start_time == 0)
+            || identity
+                .control_group_members
+                .iter()
+                .any(|member| member.pid <= 1 || member.start_time == 0)
+            || identity
+                .control_group
+                .as_ref()
+                .is_some_and(|control_group| {
+                    control_group.device == 0
+                        || control_group.inode == 0
+                        || control_group
+                            .boot_id
+                            .as_deref()
+                            .is_some_and(|boot_id| !valid_linux_boot_id(boot_id))
+                        || !valid_tmux_spawn_control_group_path(Path::new(&control_group.path))
+                })
     }) {
         return Err(SessionTerminationFailure::RuntimeIdentityUnavailable);
     }
@@ -5576,9 +5988,11 @@ fn set_tmux_termination_state(
         json!({
             "launch_id": launch_id,
             "state": match state {
-                TmuxTerminationState::Pending => "pending",
-                TmuxTerminationState::KillConfirmed => "kill-confirmed",
+                TmuxTerminationState::FreezePending { .. } => "freeze-pending",
+                TmuxTerminationState::Pending { .. } => "pending",
+                TmuxTerminationState::KillConfirmed { .. } => "kill-confirmed",
             },
+            "thaw_on_recovery": state.thaw_on_recovery(),
         }),
     );
     Ok(())
@@ -5603,11 +6017,195 @@ fn persisted_tmux_termination_state(
     if launch_id != current_launch_id {
         return Err(SessionTerminationFailure::RuntimeIdentityUnavailable);
     }
+    let thaw_on_recovery = value
+        .get("thaw_on_recovery")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
     match value.get("state").and_then(Value::as_str) {
-        Some("pending") => Ok(Some(TmuxTerminationState::Pending)),
-        Some("kill-confirmed") => Ok(Some(TmuxTerminationState::KillConfirmed)),
+        Some("freeze-pending") => Ok(Some(TmuxTerminationState::FreezePending {
+            thaw_on_recovery,
+        })),
+        Some("pending") => Ok(Some(TmuxTerminationState::Pending { thaw_on_recovery })),
+        Some("kill-confirmed") => Ok(Some(TmuxTerminationState::KillConfirmed {
+            thaw_on_recovery,
+        })),
         _ => Err(SessionTerminationFailure::RuntimeIdentityUnavailable),
     }
+}
+
+fn recover_interrupted_tmux_termination_locked(
+    context: &CliContext,
+    record: &mut SessionRecord,
+) -> Result<(), SessionTerminationFailure> {
+    recover_interrupted_tmux_termination_locked_at_cgroup_root(
+        context,
+        record,
+        Path::new("/sys/fs/cgroup"),
+    )
+}
+
+fn recover_interrupted_tmux_termination_locked_at_cgroup_root(
+    context: &CliContext,
+    record: &mut SessionRecord,
+    cgroup_root: &Path,
+) -> Result<(), SessionTerminationFailure> {
+    let Some(state) = persisted_tmux_termination_state(record)? else {
+        return Ok(());
+    };
+    #[cfg(target_os = "linux")]
+    let different_boot = {
+        let identity = persisted_tmux_runtime_identity(record)?
+            .ok_or(SessionTerminationFailure::RuntimeIdentityUnavailable)?;
+        if let Some(control_group) = identity.control_group.as_ref() {
+            matches!(
+                recover_persisted_linux_control_group_at_root(
+                    control_group,
+                    &identity.control_group_members,
+                    state,
+                    cgroup_root,
+                )?,
+                LinuxControlGroupRecovery::DifferentBoot
+            )
+        } else if state.thaw_on_recovery() {
+            return Err(SessionTerminationFailure::RuntimeIdentityUnavailable);
+        } else {
+            false
+        }
+    };
+    #[cfg(not(target_os = "linux"))]
+    let different_boot = {
+        let _ = cgroup_root;
+        false
+    };
+    match state {
+        TmuxTerminationState::FreezePending { .. } => {
+            record.extra.remove(DELETE_TMUX_TERMINATION_STATE_KEY);
+        }
+        TmuxTerminationState::Pending { .. } if different_boot => {
+            set_tmux_termination_state(
+                record,
+                TmuxTerminationState::KillConfirmed {
+                    thaw_on_recovery: false,
+                },
+            )?;
+        }
+        TmuxTerminationState::Pending { .. } | TmuxTerminationState::KillConfirmed { .. } => {
+            set_tmux_termination_state(record, state.with_thaw_on_recovery(false))?;
+        }
+    }
+    write_session_record(context, record)
+        .map_err(|_| SessionTerminationFailure::RuntimeIdentityUnavailable)
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LinuxControlGroupRecovery {
+    CurrentBoot,
+    DifferentBoot,
+}
+
+#[cfg(target_os = "linux")]
+fn recover_persisted_linux_control_group_at_root(
+    control_group: &TmuxControlGroupIdentity,
+    control_group_members: &[TmuxProcessIdentity],
+    state: TmuxTerminationState,
+    root: &Path,
+) -> Result<LinuxControlGroupRecovery, SessionTerminationFailure> {
+    let full_path = linux_control_group_full_path_at_root(Path::new(&control_group.path), root)?;
+    let current_boot_id = linux_boot_id()?;
+    match control_group.boot_id.as_deref() {
+        Some(boot_id) if boot_id == current_boot_id => {}
+        Some(_) => return Ok(LinuxControlGroupRecovery::DifferentBoot),
+        None if !full_path.exists() => return Ok(LinuxControlGroupRecovery::CurrentBoot),
+        None => return Err(SessionTerminationFailure::RuntimeIdentityUnavailable),
+    }
+    let mut pinned_control_group = match fs::metadata(&full_path) {
+        Ok(_) => Some(open_pinned_linux_control_group(control_group, &full_path)?),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => None,
+        Err(_) => return Err(SessionTerminationFailure::VerificationFailed),
+    };
+    let pinned_processes = if matches!(state, TmuxTerminationState::KillConfirmed { .. }) {
+        control_group_members
+            .iter()
+            .map(pin_matching_linux_process)
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+    if matches!(state, TmuxTerminationState::KillConfirmed { .. }) {
+        if let Some(pinned) = pinned_control_group.as_ref() {
+            write_control_group_file(&pinned.kill_fd, b"1")?;
+        }
+        for process in &pinned_processes {
+            pidfd_send_signal(&process.pidfd, libc::SIGKILL, true)?;
+        }
+    }
+    if state.thaw_on_recovery()
+        && let Some(pinned) = pinned_control_group.as_mut()
+    {
+        pinned.thaw_on_drop = true;
+        if !thaw_pinned_control_group(pinned) {
+            return Err(SessionTerminationFailure::VerificationFailed);
+        }
+        pinned.thaw_on_drop = false;
+    }
+    Ok(LinuxControlGroupRecovery::CurrentBoot)
+}
+
+pub(crate) fn recover_interrupted_tmux_terminations(context: &CliContext) -> Result<(), CliError> {
+    recover_interrupted_tmux_terminations_at_cgroup_root(context, Path::new("/sys/fs/cgroup"))
+}
+
+fn recover_interrupted_tmux_terminations_at_cgroup_root(
+    context: &CliContext,
+    cgroup_root: &Path,
+) -> Result<(), CliError> {
+    let sessions_root = context.state_dir.join("sessions");
+    if !sessions_root.exists() {
+        return Ok(());
+    }
+    for entry in fs::read_dir(&sessions_root)
+        .map_err(|err| session_io_error("session-recovery-list-failed", &sessions_root, err))?
+    {
+        let entry = entry
+            .map_err(|err| session_io_error("session-recovery-list-failed", &sessions_root, err))?;
+        let record_path = entry.path().join("session.json");
+        if !entry.path().is_dir() || !record_path.is_file() {
+            continue;
+        }
+        let serialized = fs::read(&record_path).map_err(|err| {
+            session_io_error("session-recovery-record-read-failed", &record_path, err)
+        })?;
+        let has_termination_marker = serde_json::from_slice::<Value>(&serialized)
+            .ok()
+            .and_then(|value| {
+                value
+                    .as_object()
+                    .map(|object| object.contains_key(DELETE_TMUX_TERMINATION_STATE_KEY))
+            })
+            .unwrap_or(false);
+        if !has_termination_marker {
+            continue;
+        }
+        let id = entry.file_name().to_string_lossy().into_owned();
+        let record = load_session_record(context, &id)?;
+        let Some(_lock) = try_acquire_session_record_lock(context, &record.id)? else {
+            continue;
+        };
+        let mut record = load_session_record(context, &record.id)?;
+        recover_interrupted_tmux_termination_locked_at_cgroup_root(
+            context,
+            &mut record,
+            cgroup_root,
+        )
+        .map_err(|reason| {
+            session_termination_error(&record, reason, SessionTerminationOperation::Delete)
+        })?;
+    }
+    Ok(())
 }
 
 fn valid_tmux_session_id(value: &str) -> bool {
@@ -5640,24 +6238,38 @@ fn process_group_status(process_group_id: libc::pid_t) -> ProcessGroupStatus {
     }
 }
 
-fn verify_stopped_process_group(
+fn process_runtime_status(identity: &TmuxRuntimeIdentity) -> ProcessGroupStatus {
+    #[cfg(target_os = "linux")]
+    if let Some(control_group) = identity.control_group.as_ref() {
+        return linux_control_group_runtime_status(identity, control_group);
+    }
+    #[cfg(target_os = "linux")]
+    if let Some(process_session_id) = identity.process_session_id
+        && !identity.process_session_members.is_empty()
+    {
+        return linux_process_runtime_status(identity, process_session_id);
+    }
+    identity
+        .process_group_id
+        .map(process_group_status)
+        .unwrap_or(ProcessGroupStatus::Stopped)
+}
+
+fn verify_stopped_process_runtime(
     identity: &TmuxRuntimeIdentity,
     verify_timeout: Duration,
 ) -> Result<(), SessionTerminationFailure> {
-    let process_group_id = identity
-        .process_group_id
-        .ok_or(SessionTerminationFailure::RuntimeIdentityUnavailable)?;
     let started_at = Instant::now();
     loop {
-        match process_group_status(process_group_id) {
+        match process_runtime_status(identity) {
             ProcessGroupStatus::Stopped => return Ok(()),
             ProcessGroupStatus::Running if started_at.elapsed() >= verify_timeout => {
                 return Err(SessionTerminationFailure::ProcessStillRunning);
             }
-            ProcessGroupStatus::Unknown if started_at.elapsed() >= verify_timeout => {
+            ProcessGroupStatus::Unknown => {
                 return Err(SessionTerminationFailure::VerificationFailed);
             }
-            ProcessGroupStatus::Running | ProcessGroupStatus::Unknown => {}
+            ProcessGroupStatus::Running => {}
         }
         thread::sleep(
             DELETE_TERMINATION_VERIFY_POLL_INTERVAL
@@ -5666,7 +6278,1153 @@ fn verify_stopped_process_group(
     }
 }
 
-fn verify_stopped_process_groups(
+fn terminate_captured_process_runtime(
+    identity: &TmuxRuntimeIdentity,
+    pinned_runtime: &mut PinnedProcessRuntime,
+    verify_timeout: Duration,
+) -> Result<(), SessionTerminationFailure> {
+    #[cfg(target_os = "linux")]
+    {
+        let process_session_id = identity
+            .process_session_id
+            .ok_or(SessionTerminationFailure::RuntimeIdentityUnavailable)?;
+        if process_session_id <= 1 || process_session_id == unsafe { libc::getsid(0) } {
+            return Err(SessionTerminationFailure::RuntimeIdentityUnavailable);
+        }
+        let thaw_after_kill = pinned_runtime
+            .control_group
+            .as_mut()
+            .is_some_and(|control_group| {
+                let thaw_after_kill = control_group.thaw_on_drop;
+                control_group.thaw_on_drop = false;
+                thaw_after_kill
+            });
+        kill_pinned_control_group(pinned_runtime)?;
+        signal_pinned_process_runtime(pinned_runtime, libc::SIGKILL)?;
+        if thaw_after_kill {
+            let control_group = pinned_runtime
+                .control_group
+                .as_ref()
+                .ok_or(SessionTerminationFailure::RuntimeIdentityUnavailable)?;
+            if !thaw_pinned_control_group(control_group) {
+                return Err(SessionTerminationFailure::VerificationFailed);
+            }
+            signal_pinned_process_runtime(pinned_runtime, libc::SIGKILL)?;
+        }
+        verify_stopped_pinned_process_runtime(pinned_runtime, verify_timeout)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = pinned_runtime;
+        verify_stopped_process_runtime(identity, verify_timeout)
+    }
+}
+
+#[derive(Debug)]
+struct PinnedProcessRuntime {
+    #[cfg(target_os = "linux")]
+    processes: Vec<PinnedLinuxProcess>,
+    #[cfg(target_os = "linux")]
+    control_group: Option<PinnedLinuxControlGroup>,
+}
+
+fn release_process_runtime(pinned_runtime: Option<PinnedProcessRuntime>) {
+    #[cfg(target_os = "linux")]
+    drop(pinned_runtime);
+    #[cfg(not(target_os = "linux"))]
+    let _ = pinned_runtime;
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug)]
+struct PinnedLinuxProcess {
+    identity: TmuxProcessIdentity,
+    pidfd: OwnedFd,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug)]
+struct PinnedLinuxControlGroup {
+    kill_fd: OwnedFd,
+    freeze_fd: OwnedFd,
+    freeze_state_fd: OwnedFd,
+    thaw_fd: OwnedFd,
+    events_fd: OwnedFd,
+    procs_fd: OwnedFd,
+    directory_fd: OwnedFd,
+    initially_frozen: bool,
+    thaw_on_drop: bool,
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for PinnedLinuxControlGroup {
+    fn drop(&mut self) {
+        if self.thaw_on_drop {
+            thaw_pinned_control_group(self);
+        }
+    }
+}
+
+fn prepare_process_runtime(
+    identity: &TmuxRuntimeIdentity,
+) -> Result<PinnedProcessRuntime, SessionTerminationFailure> {
+    #[cfg(target_os = "linux")]
+    {
+        identity
+            .process_session_id
+            .filter(|session_id| *session_id > 1 && *session_id != unsafe { libc::getsid(0) })
+            .ok_or(SessionTerminationFailure::RuntimeIdentityUnavailable)?;
+        if identity.process_session_members.is_empty() {
+            return Err(SessionTerminationFailure::RuntimeIdentityUnavailable);
+        }
+        let control_group_identity = identity
+            .control_group
+            .as_ref()
+            .ok_or(SessionTerminationFailure::RuntimeIdentityUnavailable)?;
+        let control_group = identity
+            .control_group
+            .as_ref()
+            .map(|control_group| {
+                open_verified_linux_control_group(
+                    control_group,
+                    identity.pane_pid,
+                    &identity.process_session_members,
+                )
+            })
+            .transpose()?
+            .ok_or(SessionTerminationFailure::RuntimeIdentityUnavailable)?;
+        let mut processes = pin_linux_control_group_processes(
+            &control_group,
+            control_group_identity,
+            identity.pane_pid,
+            &identity.process_session_members,
+            false,
+            DELETE_TERMINATION_VERIFY_TIMEOUT,
+        )?;
+        for captured in &identity.control_group_members {
+            if processes.iter().any(|process| {
+                process.identity.pid == captured.pid
+                    && process.identity.start_time == captured.start_time
+            }) {
+                continue;
+            }
+            if let Some(process) = pin_matching_linux_process(captured)? {
+                processes.push(process);
+            }
+        }
+        Ok(PinnedProcessRuntime {
+            processes,
+            control_group: Some(control_group),
+        })
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = identity;
+        Ok(PinnedProcessRuntime {})
+    }
+}
+
+fn freeze_and_pin_process_runtime(
+    identity: &TmuxRuntimeIdentity,
+    pinned_runtime: &mut PinnedProcessRuntime,
+) -> Result<(), SessionTerminationFailure> {
+    #[cfg(target_os = "linux")]
+    {
+        let process_session_id = identity
+            .process_session_id
+            .filter(|session_id| *session_id > 1 && *session_id != unsafe { libc::getsid(0) })
+            .ok_or(SessionTerminationFailure::RuntimeIdentityUnavailable)?;
+        let control_group_identity = identity
+            .control_group
+            .as_ref()
+            .ok_or(SessionTerminationFailure::RuntimeIdentityUnavailable)?;
+        let control_group = pinned_runtime
+            .control_group
+            .as_mut()
+            .ok_or(SessionTerminationFailure::RuntimeIdentityUnavailable)?;
+        freeze_and_revalidate_linux_control_group(
+            control_group,
+            control_group_identity,
+            identity.pane_pid,
+            &identity.process_session_members,
+        )?;
+        verify_captured_linux_process_session(
+            process_session_id,
+            &identity.process_session_members,
+        )?;
+        let frozen_processes = pin_linux_control_group_processes(
+            control_group,
+            control_group_identity,
+            identity.pane_pid,
+            &identity.process_session_members,
+            true,
+            DELETE_TERMINATION_VERIFY_TIMEOUT,
+        )?;
+        for process in frozen_processes {
+            if !pinned_runtime.processes.iter().any(|pinned| {
+                pinned.identity.pid == process.identity.pid
+                    && pinned.identity.start_time == process.identity.start_time
+            }) {
+                pinned_runtime.processes.push(process);
+            }
+        }
+        Ok(())
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (identity, pinned_runtime);
+        Ok(())
+    }
+}
+
+fn process_runtime_thaw_on_recovery(pinned_runtime: &PinnedProcessRuntime) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        pinned_runtime
+            .control_group
+            .as_ref()
+            .is_some_and(|control_group| !control_group.initially_frozen)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = pinned_runtime;
+        false
+    }
+}
+
+fn refresh_process_runtime_freeze_ownership(
+    pinned_runtime: &mut PinnedProcessRuntime,
+) -> Result<(), SessionTerminationFailure> {
+    #[cfg(target_os = "linux")]
+    {
+        let control_group = pinned_runtime
+            .control_group
+            .as_mut()
+            .ok_or(SessionTerminationFailure::RuntimeIdentityUnavailable)?;
+        refresh_pinned_control_group_freeze_ownership(control_group)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = pinned_runtime;
+        Ok(())
+    }
+}
+
+fn verify_process_runtime_frozen(
+    pinned_runtime: &PinnedProcessRuntime,
+) -> Result<(), SessionTerminationFailure> {
+    #[cfg(target_os = "linux")]
+    {
+        let control_group = pinned_runtime
+            .control_group
+            .as_ref()
+            .ok_or(SessionTerminationFailure::RuntimeIdentityUnavailable)?;
+        let leaf_frozen = read_control_group_value(&control_group.freeze_state_fd)?
+            .trim()
+            .eq("1");
+        let events = read_control_group_events(&control_group.events_fd)?;
+        if leaf_frozen && control_group_event(&events, "frozen") == Some("1") {
+            Ok(())
+        } else {
+            Err(SessionTerminationFailure::VerificationFailed)
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = pinned_runtime;
+        Ok(())
+    }
+}
+
+fn process_runtime_identities(pinned_runtime: &PinnedProcessRuntime) -> Vec<TmuxProcessIdentity> {
+    #[cfg(target_os = "linux")]
+    {
+        let mut identities = pinned_runtime
+            .processes
+            .iter()
+            .map(|process| process.identity.clone())
+            .collect::<Vec<_>>();
+        identities.sort_unstable_by_key(|identity| (identity.pid, identity.start_time));
+        identities.dedup();
+        identities
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = pinned_runtime;
+        Vec::new()
+    }
+}
+
+fn thaw_owned_process_runtime(
+    pinned_runtime: &mut PinnedProcessRuntime,
+) -> Result<(), SessionTerminationFailure> {
+    #[cfg(target_os = "linux")]
+    if let Some(control_group) = pinned_runtime.control_group.as_mut()
+        && control_group.thaw_on_drop
+    {
+        if !thaw_pinned_control_group(control_group) {
+            return Err(SessionTerminationFailure::VerificationFailed);
+        }
+        control_group.thaw_on_drop = false;
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = pinned_runtime;
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy)]
+struct LinuxProcessIdentity {
+    pid: libc::pid_t,
+    session_id: libc::pid_t,
+    start_time: u64,
+    zombie: bool,
+}
+
+#[cfg(target_os = "linux")]
+fn read_linux_process_identity(
+    pid: libc::pid_t,
+) -> Result<Option<LinuxProcessIdentity>, SessionTerminationFailure> {
+    let stat = match fs::read_to_string(format!("/proc/{pid}/stat")) {
+        Ok(stat) => stat,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => return Err(SessionTerminationFailure::VerificationFailed),
+    };
+    let fields: Vec<&str> = stat
+        .rsplit_once(") ")
+        .map(|(_, fields)| fields.split_whitespace().collect())
+        .ok_or(SessionTerminationFailure::VerificationFailed)?;
+    if fields.len() <= 19 {
+        return Err(SessionTerminationFailure::VerificationFailed);
+    }
+    let session_id = fields[3]
+        .parse()
+        .map_err(|_| SessionTerminationFailure::VerificationFailed)?;
+    let start_time = fields[19]
+        .parse()
+        .map_err(|_| SessionTerminationFailure::VerificationFailed)?;
+    Ok(Some(LinuxProcessIdentity {
+        pid,
+        session_id,
+        start_time,
+        zombie: fields[0] == "Z",
+    }))
+}
+
+#[cfg(target_os = "linux")]
+fn linux_process_session_members(
+    process_session_id: libc::pid_t,
+) -> Result<Vec<LinuxProcessIdentity>, SessionTerminationFailure> {
+    let mut members = Vec::new();
+    let entries =
+        fs::read_dir("/proc").map_err(|_| SessionTerminationFailure::VerificationFailed)?;
+    for entry in entries {
+        let entry = entry.map_err(|_| SessionTerminationFailure::VerificationFailed)?;
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<libc::pid_t>().ok())
+            .filter(|pid| *pid > 1)
+        else {
+            continue;
+        };
+        if let Some(identity) = read_linux_process_identity(pid)?
+            && identity.session_id == process_session_id
+            && !identity.zombie
+        {
+            members.push(identity);
+        }
+    }
+    members.sort_unstable_by_key(|identity| identity.pid);
+    Ok(members)
+}
+
+#[cfg(target_os = "linux")]
+fn verify_captured_linux_process_session(
+    process_session_id: libc::pid_t,
+    captured_members: &[TmuxProcessIdentity],
+) -> Result<(), SessionTerminationFailure> {
+    let current_members = linux_process_session_members(process_session_id)?;
+    if current_members.len() != captured_members.len()
+        || current_members.iter().any(|current| {
+            !captured_members.iter().any(|captured| {
+                captured.pid == current.pid && captured.start_time == current.start_time
+            })
+        })
+    {
+        return Err(SessionTerminationFailure::VerificationFailed);
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn linux_process_runtime_status(
+    identity: &TmuxRuntimeIdentity,
+    process_session_id: libc::pid_t,
+) -> ProcessGroupStatus {
+    for captured in &identity.process_session_members {
+        match read_linux_process_identity(captured.pid) {
+            Ok(Some(current)) if current.start_time == captured.start_time && !current.zombie => {
+                return ProcessGroupStatus::Running;
+            }
+            Ok(Some(_)) | Ok(None) => {}
+            Err(_) => return ProcessGroupStatus::Unknown,
+        }
+    }
+    match linux_process_session_members(process_session_id) {
+        Ok(members) if members.is_empty() => ProcessGroupStatus::Stopped,
+        Ok(_) | Err(_) => ProcessGroupStatus::Unknown,
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn linux_control_group_runtime_status(
+    identity: &TmuxRuntimeIdentity,
+    control_group: &TmuxControlGroupIdentity,
+) -> ProcessGroupStatus {
+    linux_control_group_runtime_status_at_root(identity, control_group, Path::new("/sys/fs/cgroup"))
+}
+
+#[cfg(target_os = "linux")]
+fn linux_control_group_runtime_status_at_root(
+    identity: &TmuxRuntimeIdentity,
+    control_group: &TmuxControlGroupIdentity,
+    root: &Path,
+) -> ProcessGroupStatus {
+    if let Some(boot_id) = control_group.boot_id.as_deref() {
+        match linux_boot_id() {
+            Ok(current_boot_id) if current_boot_id == boot_id => {}
+            Ok(_) => return ProcessGroupStatus::Stopped,
+            Err(_) => return ProcessGroupStatus::Unknown,
+        }
+    }
+    for captured in identity
+        .process_session_members
+        .iter()
+        .chain(&identity.control_group_members)
+    {
+        match read_linux_process_identity(captured.pid) {
+            Ok(Some(current)) if current.start_time == captured.start_time && !current.zombie => {
+                return ProcessGroupStatus::Running;
+            }
+            Ok(Some(_)) | Ok(None) => {}
+            Err(_) => return ProcessGroupStatus::Unknown,
+        }
+    }
+    let full_path =
+        match linux_control_group_full_path_at_root(Path::new(&control_group.path), root) {
+            Ok(path) => path,
+            Err(_) => return ProcessGroupStatus::Unknown,
+        };
+    let metadata = match fs::metadata(&full_path) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return ProcessGroupStatus::Stopped,
+        Err(_) => return ProcessGroupStatus::Unknown,
+    };
+    if !metadata.is_dir() {
+        return ProcessGroupStatus::Unknown;
+    }
+    if metadata.dev() != control_group.device || metadata.ino() != control_group.inode {
+        return ProcessGroupStatus::Unknown;
+    }
+    let events = match fs::read_to_string(full_path.join("cgroup.events")) {
+        Ok(events) => events,
+        Err(_) => return ProcessGroupStatus::Unknown,
+    };
+    match events.lines().find_map(|line| {
+        let (name, value) = line.split_once(' ')?;
+        (name == "populated").then_some(value)
+    }) {
+        Some("0") => ProcessGroupStatus::Stopped,
+        Some("1") => ProcessGroupStatus::Running,
+        _ => ProcessGroupStatus::Unknown,
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn open_verified_linux_control_group(
+    control_group: &TmuxControlGroupIdentity,
+    pane_pid: libc::pid_t,
+    captured_members: &[TmuxProcessIdentity],
+) -> Result<PinnedLinuxControlGroup, SessionTerminationFailure> {
+    let path = Path::new(&control_group.path);
+    if !valid_tmux_spawn_control_group_path(path) {
+        return Err(SessionTerminationFailure::RuntimeIdentityUnavailable);
+    }
+    if linux_process_control_group_path(unsafe { libc::getpid() })?.as_deref() == Some(path) {
+        return Err(SessionTerminationFailure::RuntimeIdentityUnavailable);
+    }
+    if linux_process_control_group(pane_pid)?.as_ref() != Some(control_group) {
+        return Err(SessionTerminationFailure::VerificationFailed);
+    }
+    for member in captured_members {
+        if linux_process_control_group(member.pid)?.as_ref() != Some(control_group) {
+            return Err(SessionTerminationFailure::VerificationFailed);
+        }
+    }
+
+    let full_path = linux_control_group_full_path(path)?;
+    open_pinned_linux_control_group(control_group, &full_path)
+}
+
+#[cfg(target_os = "linux")]
+fn freeze_and_revalidate_linux_control_group(
+    pinned: &mut PinnedLinuxControlGroup,
+    control_group: &TmuxControlGroupIdentity,
+    pane_pid: libc::pid_t,
+    captured_members: &[TmuxProcessIdentity],
+) -> Result<(), SessionTerminationFailure> {
+    freeze_pinned_control_group(pinned, DELETE_TERMINATION_VERIFY_TIMEOUT)?;
+    if linux_process_control_group(pane_pid)?.as_ref() != Some(control_group) {
+        return Err(SessionTerminationFailure::VerificationFailed);
+    }
+    for member in captured_members {
+        if linux_process_control_group(member.pid)?.as_ref() != Some(control_group) {
+            return Err(SessionTerminationFailure::VerificationFailed);
+        }
+    }
+    ensure_linux_control_group_is_leaf(&pinned.directory_fd)?;
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn open_pinned_linux_control_group(
+    control_group: &TmuxControlGroupIdentity,
+    full_path: &Path,
+) -> Result<PinnedLinuxControlGroup, SessionTerminationFailure> {
+    let directory =
+        fs::File::open(full_path).map_err(|_| SessionTerminationFailure::VerificationFailed)?;
+    let metadata = directory
+        .metadata()
+        .map_err(|_| SessionTerminationFailure::VerificationFailed)?;
+    if !metadata.is_dir()
+        || metadata.dev() != control_group.device
+        || metadata.ino() != control_group.inode
+    {
+        return Err(SessionTerminationFailure::VerificationFailed);
+    }
+    let raw_kill_fd = unsafe {
+        libc::openat(
+            directory.as_raw_fd(),
+            c"cgroup.kill".as_ptr(),
+            libc::O_WRONLY | libc::O_CLOEXEC,
+        )
+    };
+    if raw_kill_fd < 0 {
+        return Err(SessionTerminationFailure::RuntimeIdentityUnavailable);
+    }
+    let kill_fd = unsafe { OwnedFd::from_raw_fd(raw_kill_fd) };
+    let raw_freeze_fd = unsafe {
+        libc::openat(
+            directory.as_raw_fd(),
+            c"cgroup.freeze".as_ptr(),
+            libc::O_WRONLY | libc::O_CLOEXEC,
+        )
+    };
+    if raw_freeze_fd < 0 {
+        return Err(SessionTerminationFailure::RuntimeIdentityUnavailable);
+    }
+    let freeze_fd = unsafe { OwnedFd::from_raw_fd(raw_freeze_fd) };
+    let raw_freeze_state_fd = unsafe {
+        libc::openat(
+            directory.as_raw_fd(),
+            c"cgroup.freeze".as_ptr(),
+            libc::O_RDONLY | libc::O_CLOEXEC,
+        )
+    };
+    if raw_freeze_state_fd < 0 {
+        return Err(SessionTerminationFailure::RuntimeIdentityUnavailable);
+    }
+    let freeze_state_fd = unsafe { OwnedFd::from_raw_fd(raw_freeze_state_fd) };
+    let raw_thaw_fd = unsafe {
+        libc::openat(
+            directory.as_raw_fd(),
+            c"cgroup.freeze".as_ptr(),
+            libc::O_WRONLY | libc::O_CLOEXEC,
+        )
+    };
+    if raw_thaw_fd < 0 {
+        return Err(SessionTerminationFailure::RuntimeIdentityUnavailable);
+    }
+    let thaw_fd = unsafe { OwnedFd::from_raw_fd(raw_thaw_fd) };
+    let raw_events_fd = unsafe {
+        libc::openat(
+            directory.as_raw_fd(),
+            c"cgroup.events".as_ptr(),
+            libc::O_RDONLY | libc::O_CLOEXEC,
+        )
+    };
+    if raw_events_fd < 0 {
+        return Err(SessionTerminationFailure::RuntimeIdentityUnavailable);
+    }
+    let events_fd = unsafe { OwnedFd::from_raw_fd(raw_events_fd) };
+    let raw_procs_fd = unsafe {
+        libc::openat(
+            directory.as_raw_fd(),
+            c"cgroup.procs".as_ptr(),
+            libc::O_RDONLY | libc::O_CLOEXEC,
+        )
+    };
+    if raw_procs_fd < 0 {
+        return Err(SessionTerminationFailure::RuntimeIdentityUnavailable);
+    }
+    let procs_fd = unsafe { OwnedFd::from_raw_fd(raw_procs_fd) };
+    let initially_frozen = match read_control_group_value(&freeze_state_fd)?.trim() {
+        "0" => false,
+        "1" => true,
+        _ => return Err(SessionTerminationFailure::VerificationFailed),
+    };
+    let pinned = PinnedLinuxControlGroup {
+        kill_fd,
+        freeze_fd,
+        freeze_state_fd,
+        thaw_fd,
+        events_fd,
+        procs_fd,
+        directory_fd: directory.into(),
+        initially_frozen,
+        thaw_on_drop: false,
+    };
+    Ok(pinned)
+}
+
+#[cfg(target_os = "linux")]
+fn ensure_linux_control_group_is_leaf(
+    directory_fd: &OwnedFd,
+) -> Result<(), SessionTerminationFailure> {
+    let pinned_path = PathBuf::from(format!("/proc/self/fd/{}", directory_fd.as_raw_fd()));
+    for entry in
+        fs::read_dir(pinned_path).map_err(|_| SessionTerminationFailure::VerificationFailed)?
+    {
+        let entry = entry.map_err(|_| SessionTerminationFailure::VerificationFailed)?;
+        if entry
+            .file_type()
+            .map_err(|_| SessionTerminationFailure::VerificationFailed)?
+            .is_dir()
+        {
+            return Err(SessionTerminationFailure::RuntimeIdentityUnavailable);
+        }
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn read_linux_control_group_pids(
+    procs_fd: &OwnedFd,
+) -> Result<Vec<libc::pid_t>, SessionTerminationFailure> {
+    if unsafe { libc::lseek(procs_fd.as_raw_fd(), 0, libc::SEEK_SET) } < 0 {
+        return Err(SessionTerminationFailure::VerificationFailed);
+    }
+    let mut contents = Vec::new();
+    loop {
+        let mut buffer = [0_u8; 4096];
+        let length = unsafe {
+            libc::read(
+                procs_fd.as_raw_fd(),
+                buffer.as_mut_ptr().cast(),
+                buffer.len(),
+            )
+        };
+        if length < 0 {
+            return Err(SessionTerminationFailure::VerificationFailed);
+        }
+        if length == 0 {
+            break;
+        }
+        contents.extend_from_slice(&buffer[..length as usize]);
+        if contents.len() > 1024 * 1024 {
+            return Err(SessionTerminationFailure::VerificationFailed);
+        }
+    }
+    let contents = std::str::from_utf8(&contents)
+        .map_err(|_| SessionTerminationFailure::VerificationFailed)?;
+    let mut pids = contents
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(|line| {
+            line.parse::<libc::pid_t>()
+                .map_err(|_| SessionTerminationFailure::VerificationFailed)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if pids
+        .iter()
+        .any(|pid| *pid <= 1 || *pid == unsafe { libc::getpid() })
+    {
+        return Err(SessionTerminationFailure::RuntimeIdentityUnavailable);
+    }
+    pids.sort_unstable();
+    pids.dedup();
+    Ok(pids)
+}
+
+#[cfg(target_os = "linux")]
+fn pin_linux_control_group_processes(
+    pinned: &PinnedLinuxControlGroup,
+    control_group: &TmuxControlGroupIdentity,
+    pane_pid: libc::pid_t,
+    captured_members: &[TmuxProcessIdentity],
+    stabilize_membership: bool,
+    timeout: Duration,
+) -> Result<Vec<PinnedLinuxProcess>, SessionTerminationFailure> {
+    let deadline = Instant::now() + timeout;
+    // The user manager can move descendants while the scope is being collected, so
+    // cgroup.procs alone is not a stable membership snapshot. Scan /proc before and
+    // after pidfd pinning, with one shared deadline to bound the frozen interval.
+    let mut pids = linux_control_group_snapshot_pids(pinned, control_group, deadline)?;
+    if stabilize_membership {
+        pids = stabilize_linux_control_group_pids(
+            pids,
+            DELETE_TERMINATION_PROBE_TIMEOUT,
+            DELETE_TERMINATION_VERIFY_POLL_INTERVAL,
+            deadline,
+            |snapshot_deadline| {
+                linux_control_group_snapshot_pids(pinned, control_group, snapshot_deadline)
+            },
+        )?;
+    }
+    pids.sort_unstable();
+    pids.dedup();
+    if pids.is_empty()
+        || !pids.contains(&pane_pid)
+        || captured_members
+            .iter()
+            .any(|member| !pids.contains(&member.pid))
+    {
+        return Err(SessionTerminationFailure::VerificationFailed);
+    }
+    let processes = pids
+        .into_iter()
+        .map(|pid| pin_linux_control_group_process(pid, control_group))
+        .collect::<Result<Vec<_>, _>>()?;
+    let revalidated = linux_control_group_member_pids(control_group, deadline)?;
+    if revalidated
+        .iter()
+        .any(|pid| !processes.iter().any(|process| process.identity.pid == *pid))
+    {
+        return Err(SessionTerminationFailure::VerificationFailed);
+    }
+    Ok(processes)
+}
+
+#[cfg(target_os = "linux")]
+fn stabilize_linux_control_group_pids<F>(
+    mut pids: Vec<libc::pid_t>,
+    observation_duration: Duration,
+    poll_interval: Duration,
+    deadline: Instant,
+    mut snapshot: F,
+) -> Result<Vec<libc::pid_t>, SessionTerminationFailure>
+where
+    F: FnMut(Instant) -> Result<Vec<libc::pid_t>, SessionTerminationFailure>,
+{
+    let observation_started = Instant::now();
+    loop {
+        if Instant::now() >= deadline {
+            return Err(SessionTerminationFailure::VerificationFailed);
+        }
+        thread::sleep(poll_interval.min(deadline.saturating_duration_since(Instant::now())));
+        pids.extend(snapshot(deadline)?);
+        pids.sort_unstable();
+        pids.dedup();
+        if observation_started.elapsed() >= observation_duration {
+            return Ok(pids);
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn linux_control_group_snapshot_pids(
+    pinned: &PinnedLinuxControlGroup,
+    control_group: &TmuxControlGroupIdentity,
+    deadline: Instant,
+) -> Result<Vec<libc::pid_t>, SessionTerminationFailure> {
+    let mut pids = read_linux_control_group_pids(&pinned.procs_fd)?;
+    pids.extend(linux_control_group_member_pids(control_group, deadline)?);
+    pids.sort_unstable();
+    pids.dedup();
+    Ok(pids)
+}
+
+#[cfg(target_os = "linux")]
+fn linux_control_group_member_pids(
+    control_group: &TmuxControlGroupIdentity,
+    deadline: Instant,
+) -> Result<Vec<libc::pid_t>, SessionTerminationFailure> {
+    let mut pids = Vec::new();
+    for entry in fs::read_dir("/proc").map_err(|_| SessionTerminationFailure::VerificationFailed)? {
+        if Instant::now() >= deadline {
+            return Err(SessionTerminationFailure::VerificationFailed);
+        }
+        let entry = entry.map_err(|_| SessionTerminationFailure::VerificationFailed)?;
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<libc::pid_t>().ok())
+            .filter(|pid| *pid > 1 && *pid != unsafe { libc::getpid() })
+        else {
+            continue;
+        };
+        let Some(identity) = read_linux_process_identity(pid)? else {
+            continue;
+        };
+        if identity.zombie
+            || linux_process_control_group_path(pid)?.as_deref()
+                != Some(Path::new(&control_group.path))
+        {
+            continue;
+        }
+        if linux_process_control_group(pid)?.as_ref() != Some(control_group) {
+            return Err(SessionTerminationFailure::VerificationFailed);
+        }
+        pids.push(pid);
+    }
+    pids.sort_unstable();
+    pids.dedup();
+    Ok(pids)
+}
+
+#[cfg(target_os = "linux")]
+fn pin_linux_control_group_process(
+    pid: libc::pid_t,
+    control_group: &TmuxControlGroupIdentity,
+) -> Result<PinnedLinuxProcess, SessionTerminationFailure> {
+    let current = read_linux_process_identity(pid)?
+        .filter(|current| !current.zombie)
+        .ok_or(SessionTerminationFailure::VerificationFailed)?;
+    if linux_process_control_group(pid)?.as_ref() != Some(control_group) {
+        return Err(SessionTerminationFailure::VerificationFailed);
+    }
+    let raw_fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
+    if raw_fd < 0 {
+        return Err(SessionTerminationFailure::VerificationFailed);
+    }
+    let pidfd = unsafe { OwnedFd::from_raw_fd(raw_fd as libc::c_int) };
+    let revalidated = read_linux_process_identity(pid)?
+        .filter(|identity| identity.start_time == current.start_time && !identity.zombie)
+        .ok_or(SessionTerminationFailure::VerificationFailed)?;
+    if revalidated.pid != pid || linux_process_control_group(pid)?.as_ref() != Some(control_group) {
+        return Err(SessionTerminationFailure::VerificationFailed);
+    }
+    pidfd_send_signal(&pidfd, 0, false)?;
+    Ok(PinnedLinuxProcess {
+        identity: TmuxProcessIdentity {
+            pid,
+            start_time: current.start_time,
+        },
+        pidfd,
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn pin_matching_linux_process(
+    captured: &TmuxProcessIdentity,
+) -> Result<Option<PinnedLinuxProcess>, SessionTerminationFailure> {
+    if captured.pid <= 1 || captured.pid == unsafe { libc::getpid() } || captured.start_time == 0 {
+        return Err(SessionTerminationFailure::RuntimeIdentityUnavailable);
+    }
+    let Some(current) = read_linux_process_identity(captured.pid)? else {
+        return Ok(None);
+    };
+    if current.start_time != captured.start_time || current.zombie {
+        return Ok(None);
+    }
+    let raw_fd = unsafe { libc::syscall(libc::SYS_pidfd_open, captured.pid, 0) };
+    if raw_fd < 0 {
+        return match io::Error::last_os_error().raw_os_error() {
+            Some(libc::ESRCH) => Ok(None),
+            _ => Err(SessionTerminationFailure::VerificationFailed),
+        };
+    }
+    let pidfd = unsafe { OwnedFd::from_raw_fd(raw_fd as libc::c_int) };
+    let Some(revalidated) = read_linux_process_identity(captured.pid)? else {
+        return Ok(None);
+    };
+    if revalidated.start_time != captured.start_time || revalidated.zombie {
+        return Ok(None);
+    }
+    match pidfd_send_signal(&pidfd, 0, true) {
+        Ok(()) => Ok(Some(PinnedLinuxProcess {
+            identity: captured.clone(),
+            pidfd,
+        })),
+        Err(reason) => Err(reason),
+    }
+}
+
+#[cfg(all(target_os = "linux", test))]
+fn pin_linux_process(
+    captured: &TmuxProcessIdentity,
+    process_session_id: libc::pid_t,
+) -> Result<PinnedLinuxProcess, SessionTerminationFailure> {
+    if captured.pid <= 1 || captured.pid == unsafe { libc::getpid() } {
+        return Err(SessionTerminationFailure::RuntimeIdentityUnavailable);
+    }
+    let raw_fd = unsafe { libc::syscall(libc::SYS_pidfd_open, captured.pid, 0) };
+    if raw_fd < 0 {
+        return Err(SessionTerminationFailure::VerificationFailed);
+    }
+    let pidfd = unsafe { OwnedFd::from_raw_fd(raw_fd as libc::c_int) };
+    let current = read_linux_process_identity(captured.pid)?
+        .filter(|current| {
+            current.session_id == process_session_id
+                && current.start_time == captured.start_time
+                && !current.zombie
+        })
+        .ok_or(SessionTerminationFailure::VerificationFailed)?;
+    if current.pid != captured.pid {
+        return Err(SessionTerminationFailure::VerificationFailed);
+    }
+    pidfd_send_signal(&pidfd, 0, false)?;
+    Ok(PinnedLinuxProcess {
+        identity: captured.clone(),
+        pidfd,
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn signal_pinned_process_runtime(
+    pinned_runtime: &PinnedProcessRuntime,
+    signal: libc::c_int,
+) -> Result<(), SessionTerminationFailure> {
+    if pinned_runtime.processes.is_empty() {
+        return Err(SessionTerminationFailure::RuntimeIdentityUnavailable);
+    }
+    for process in &pinned_runtime.processes {
+        if process.identity.pid <= 1 {
+            return Err(SessionTerminationFailure::RuntimeIdentityUnavailable);
+        }
+        pidfd_send_signal(&process.pidfd, signal, true)?;
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn verify_stopped_pinned_process_runtime(
+    pinned_runtime: &PinnedProcessRuntime,
+    timeout: Duration,
+) -> Result<(), SessionTerminationFailure> {
+    let control_group = pinned_runtime
+        .control_group
+        .as_ref()
+        .ok_or(SessionTerminationFailure::RuntimeIdentityUnavailable)?;
+    let started_at = Instant::now();
+    loop {
+        let mut any_running = false;
+        for process in &pinned_runtime.processes {
+            let mut poll_fd = libc::pollfd {
+                fd: process.pidfd.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            let poll_result = unsafe { libc::poll(&mut poll_fd, 1, 0) };
+            if poll_result < 0 {
+                return Err(SessionTerminationFailure::VerificationFailed);
+            }
+            if poll_result == 1 && poll_fd.revents & libc::POLLIN != 0 {
+                continue;
+            }
+            let result = unsafe {
+                libc::syscall(
+                    libc::SYS_pidfd_send_signal,
+                    process.pidfd.as_raw_fd(),
+                    0,
+                    std::ptr::null::<libc::siginfo_t>(),
+                    0,
+                )
+            };
+            if result == 0 {
+                any_running = true;
+            } else if io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH) {
+                return Err(SessionTerminationFailure::VerificationFailed);
+            }
+        }
+        let populated = match read_control_group_events(&control_group.events_fd) {
+            Ok(events) => control_group_event(&events, "populated")
+                .filter(|value| matches!(*value, "0" | "1"))
+                .map(ToOwned::to_owned),
+            Err(_)
+                if pinned_control_group_was_removed(&control_group.directory_fd)
+                    .unwrap_or(false) =>
+            {
+                Some("0".to_string())
+            }
+            Err(_) => None,
+        };
+        if !any_running && populated.as_deref() == Some("0") {
+            return Ok(());
+        }
+        if started_at.elapsed() >= timeout {
+            return Err(if any_running || populated.as_deref() == Some("1") {
+                SessionTerminationFailure::ProcessStillRunning
+            } else {
+                SessionTerminationFailure::VerificationFailed
+            });
+        }
+        thread::sleep(
+            DELETE_TERMINATION_VERIFY_POLL_INTERVAL
+                .min(timeout.saturating_sub(started_at.elapsed())),
+        );
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn pinned_control_group_was_removed(
+    directory_fd: &OwnedFd,
+) -> Result<bool, SessionTerminationFailure> {
+    let pinned_path = PathBuf::from(format!("/proc/self/fd/{}", directory_fd.as_raw_fd()));
+    let target =
+        fs::read_link(&pinned_path).map_err(|_| SessionTerminationFailure::VerificationFailed)?;
+    if target.to_string_lossy().ends_with(" (deleted)") {
+        return Ok(true);
+    }
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+    if unsafe { libc::fstat(directory_fd.as_raw_fd(), stat.as_mut_ptr()) } != 0 {
+        return Err(SessionTerminationFailure::VerificationFailed);
+    }
+    let stat = unsafe { stat.assume_init() };
+    Ok(stat.st_nlink == 0)
+}
+
+#[cfg(target_os = "linux")]
+fn thaw_pinned_control_group(control_group: &PinnedLinuxControlGroup) -> bool {
+    let started_at = Instant::now();
+    loop {
+        let _ = write_control_group_file(&control_group.thaw_fd, b"0");
+        let thawed = read_control_group_events(&control_group.events_fd)
+            .ok()
+            .and_then(|events| control_group_event(&events, "frozen").map(ToOwned::to_owned))
+            .as_deref()
+            == Some("0");
+        if thawed {
+            return true;
+        }
+        if pinned_control_group_was_removed(&control_group.directory_fd).unwrap_or(false)
+            || started_at.elapsed() >= DELETE_TERMINATION_VERIFY_TIMEOUT
+        {
+            return pinned_control_group_was_removed(&control_group.directory_fd).unwrap_or(false);
+        }
+        thread::sleep(DELETE_TERMINATION_VERIFY_POLL_INTERVAL);
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn kill_pinned_control_group(
+    pinned_runtime: &PinnedProcessRuntime,
+) -> Result<(), SessionTerminationFailure> {
+    let Some(control_group) = pinned_runtime.control_group.as_ref() else {
+        return Err(SessionTerminationFailure::RuntimeIdentityUnavailable);
+    };
+    write_control_group_file(&control_group.kill_fd, b"1")
+}
+
+#[cfg(target_os = "linux")]
+fn freeze_pinned_control_group(
+    control_group: &mut PinnedLinuxControlGroup,
+    timeout: Duration,
+) -> Result<(), SessionTerminationFailure> {
+    if !control_group.initially_frozen {
+        control_group.thaw_on_drop = true;
+    }
+    write_control_group_file(&control_group.freeze_fd, b"1")?;
+    let started_at = Instant::now();
+    loop {
+        let events = read_control_group_events(&control_group.events_fd)?;
+        if control_group_event(&events, "frozen") == Some("1") {
+            return Ok(());
+        }
+        if started_at.elapsed() >= timeout {
+            return Err(SessionTerminationFailure::VerificationFailed);
+        }
+        thread::sleep(
+            DELETE_TERMINATION_VERIFY_POLL_INTERVAL
+                .min(timeout.saturating_sub(started_at.elapsed())),
+        );
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn refresh_pinned_control_group_freeze_ownership(
+    control_group: &mut PinnedLinuxControlGroup,
+) -> Result<(), SessionTerminationFailure> {
+    control_group.initially_frozen =
+        match read_control_group_value(&control_group.freeze_state_fd)?.trim() {
+            "0" => false,
+            "1" => true,
+            _ => return Err(SessionTerminationFailure::VerificationFailed),
+        };
+    if control_group.initially_frozen {
+        control_group.thaw_on_drop = false;
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn write_control_group_file(fd: &OwnedFd, value: &[u8]) -> Result<(), SessionTerminationFailure> {
+    if unsafe { libc::lseek(fd.as_raw_fd(), 0, libc::SEEK_SET) } < 0 {
+        return Err(SessionTerminationFailure::VerificationFailed);
+    }
+    let written = unsafe { libc::write(fd.as_raw_fd(), value.as_ptr().cast(), value.len()) };
+    if written == value.len() as isize {
+        Ok(())
+    } else {
+        Err(SessionTerminationFailure::VerificationFailed)
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn read_control_group_events(fd: &OwnedFd) -> Result<String, SessionTerminationFailure> {
+    read_control_group_value(fd)
+}
+
+#[cfg(target_os = "linux")]
+fn read_control_group_value(fd: &OwnedFd) -> Result<String, SessionTerminationFailure> {
+    if unsafe { libc::lseek(fd.as_raw_fd(), 0, libc::SEEK_SET) } < 0 {
+        return Err(SessionTerminationFailure::VerificationFailed);
+    }
+    let mut buffer = [0_u8; 256];
+    let length = unsafe { libc::read(fd.as_raw_fd(), buffer.as_mut_ptr().cast(), buffer.len()) };
+    if length < 0 {
+        return Err(SessionTerminationFailure::VerificationFailed);
+    }
+    std::str::from_utf8(&buffer[..length as usize])
+        .map(ToOwned::to_owned)
+        .map_err(|_| SessionTerminationFailure::VerificationFailed)
+}
+
+#[cfg(target_os = "linux")]
+fn control_group_event<'a>(events: &'a str, name: &str) -> Option<&'a str> {
+    events.lines().find_map(|line| {
+        let (event_name, value) = line.split_once(' ')?;
+        (event_name == name).then_some(value)
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn pidfd_send_signal(
+    pidfd: &OwnedFd,
+    signal: libc::c_int,
+    allow_exited: bool,
+) -> Result<(), SessionTerminationFailure> {
+    let result = unsafe {
+        libc::syscall(
+            libc::SYS_pidfd_send_signal,
+            pidfd.as_raw_fd(),
+            signal,
+            std::ptr::null::<libc::siginfo_t>(),
+            0,
+        )
+    };
+    if result == 0 {
+        return Ok(());
+    }
+    match io::Error::last_os_error().raw_os_error() {
+        Some(libc::ESRCH) if allow_exited => Ok(()),
+        _ => Err(SessionTerminationFailure::VerificationFailed),
+    }
+}
+
+fn verify_stopped_process_runtimes(
     identities: &[TmuxRuntimeIdentity],
     verify_timeout: Duration,
 ) -> Result<(), SessionTerminationFailure> {
@@ -5676,7 +7434,7 @@ fn verify_stopped_process_groups(
         if remaining.is_zero() {
             return Err(SessionTerminationFailure::VerificationFailed);
         }
-        verify_stopped_process_group(identity, remaining)?;
+        verify_stopped_process_runtime(identity, remaining)?;
     }
     Ok(())
 }
@@ -5706,10 +7464,7 @@ fn verify_stopped_tmux_runtime(
             &identity.session_id,
             remaining.min(DELETE_TERMINATION_PROBE_TIMEOUT),
         );
-        let process_status = identity
-            .process_group_id
-            .map(process_group_status)
-            .unwrap_or(ProcessGroupStatus::Stopped);
+        let process_status = process_runtime_status(identity);
         if tmux_status == "stopped" && process_status == ProcessGroupStatus::Stopped {
             return Ok(());
         }
@@ -6817,19 +8572,30 @@ fn tail_lines(text: &str, tail: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        AgentKind, CliContext, DeleteResult, RecordRequest, TmuxRuntimeIdentity,
-        acquire_session_record_lock, acquire_session_record_lock_timed, create_record,
-        delete_session_with_timeouts, kill_tmux_session_with_timeout, live_status_with_timeout,
-        load_session_record, persist_tmux_runtime_identity, render_delete_text, resolve_session_id,
-        session_dir, strip_trailing_blank_lines, tmux_launch_may_have_created_runtime,
-        try_acquire_session_record_lock, write_session_record,
+        AgentKind, CliContext, DeleteResult, RecordRequest, TmuxProcessIdentity,
+        TmuxRuntimeIdentity, acquire_session_record_lock, acquire_session_record_lock_timed,
+        create_record, delete_session_with_timeouts, kill_tmux_session_with_timeout,
+        live_status_with_timeout, load_session_record, persist_tmux_runtime_identity,
+        render_delete_text, resolve_session_id, session_dir, strip_trailing_blank_lines,
+        tmux_launch_may_have_created_runtime, try_acquire_session_record_lock,
+        write_session_record,
     };
     use pretty_assertions::assert_eq;
+    #[cfg(target_os = "linux")]
+    use std::env;
     use std::fs;
     use std::io;
+    #[cfg(target_os = "linux")]
+    use std::io::BufRead as _;
+    #[cfg(target_os = "linux")]
+    use std::os::unix::fs::MetadataExt;
     use std::os::unix::fs::PermissionsExt;
     use std::os::unix::process::CommandExt;
     use std::path::Path;
+    #[cfg(target_os = "linux")]
+    use std::path::PathBuf;
+    #[cfg(target_os = "linux")]
+    use std::process::Stdio;
     use std::process::{Child, Command};
     use std::sync::mpsc;
     use std::thread;
@@ -7194,11 +8960,18 @@ mod tests {
     impl TestProcessGroup {
         fn spawn() -> Self {
             let mut command = Command::new("sleep");
-            let child = command
-                .arg("30")
-                .process_group(0)
-                .spawn()
-                .expect("spawn test process group");
+            command.arg("30");
+            // SAFETY: this test-only child must own a dedicated process session.
+            unsafe {
+                command.pre_exec(|| {
+                    if libc::setsid() < 0 {
+                        Err(io::Error::last_os_error())
+                    } else {
+                        Ok(())
+                    }
+                });
+            }
+            let child = command.spawn().expect("spawn test process session");
             let process_group_id = child.id() as libc::pid_t;
             Self {
                 child: Some(child),
@@ -7228,6 +9001,1625 @@ mod tests {
         }
     }
 
+    struct ReapedTestProcessGroup {
+        process_group_id: libc::pid_t,
+        descendant_process_group_id: Option<libc::pid_t>,
+        reaper: Option<thread::JoinHandle<()>>,
+    }
+
+    impl ReapedTestProcessGroup {
+        fn spawn() -> Self {
+            let mut command = Command::new("sleep");
+            command.arg("30");
+            // SAFETY: this test-only child must own a dedicated process session.
+            unsafe {
+                command.pre_exec(|| {
+                    if libc::setsid() < 0 {
+                        Err(io::Error::last_os_error())
+                    } else {
+                        Ok(())
+                    }
+                });
+            }
+            let child = command.spawn().expect("spawn reaped test process session");
+            Self::from_child(child)
+        }
+
+        #[cfg(target_os = "linux")]
+        fn spawn_tree(descendant_pid: &Path) -> Self {
+            Self::spawn_session_helper(descendant_pid, None, None)
+        }
+
+        #[cfg(target_os = "linux")]
+        fn spawn_escaping_tree(
+            descendant_pid: &Path,
+            escape_trigger: &Path,
+            escaped_marker: &Path,
+        ) -> Self {
+            Self::spawn_session_helper(descendant_pid, Some(escape_trigger), Some(escaped_marker))
+        }
+
+        #[cfg(target_os = "linux")]
+        fn spawn_session_helper(
+            descendant_pid: &Path,
+            escape_trigger: Option<&Path>,
+            escaped_marker: Option<&Path>,
+        ) -> Self {
+            let mut command = Command::new(env::current_exe().expect("test executable"));
+            command
+                .arg("--exact")
+                .arg("tests::process_session_descendant_helper")
+                .arg("--nocapture")
+                .env("AGENT_SESSION_TEST_DESCENDANT_PID", descendant_pid)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+            if let Some(escape_trigger) = escape_trigger {
+                command.env("AGENT_SESSION_TEST_ESCAPE_TRIGGER", escape_trigger);
+            }
+            if let Some(escaped_marker) = escaped_marker {
+                command.env("AGENT_SESSION_TEST_ESCAPED_MARKER", escaped_marker);
+            }
+            // SAFETY: this test-only child must own a dedicated process session.
+            unsafe {
+                command.pre_exec(|| {
+                    if libc::setsid() < 0 {
+                        Err(io::Error::last_os_error())
+                    } else {
+                        Ok(())
+                    }
+                });
+            }
+            let child = command.spawn().expect("spawn reaped test process session");
+            let mut process_group = Self::from_child(child);
+            let started_at = Instant::now();
+            while !descendant_pid.is_file() && started_at.elapsed() < Duration::from_secs(1) {
+                thread::sleep(Duration::from_millis(10));
+            }
+            assert!(descendant_pid.is_file(), "descendant pid must be recorded");
+            process_group.descendant_process_group_id = Some(
+                fs::read_to_string(descendant_pid)
+                    .unwrap()
+                    .trim()
+                    .parse()
+                    .unwrap(),
+            );
+            process_group
+        }
+
+        fn from_child(mut child: Child) -> Self {
+            let process_group_id = child.id() as libc::pid_t;
+            let reaper = thread::spawn(move || {
+                let _ = child.wait();
+            });
+            Self {
+                process_group_id,
+                descendant_process_group_id: None,
+                reaper: Some(reaper),
+            }
+        }
+
+        fn pid(&self) -> u32 {
+            self.process_group_id as u32
+        }
+
+        fn stop(&mut self) {
+            // SAFETY: the helper is the leader of a dedicated test-only process group.
+            unsafe {
+                libc::kill(-self.process_group_id, libc::SIGKILL);
+                if let Some(descendant_process_group_id) = self.descendant_process_group_id {
+                    libc::kill(-descendant_process_group_id, libc::SIGKILL);
+                }
+            }
+            if let Some(reaper) = self.reaper.take() {
+                let _ = reaper.join();
+            }
+        }
+    }
+
+    impl Drop for ReapedTestProcessGroup {
+        fn drop(&mut self) {
+            self.stop();
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    struct TestTmuxServer {
+        bin: PathBuf,
+    }
+
+    #[cfg(target_os = "linux")]
+    impl Drop for TestTmuxServer {
+        fn drop(&mut self) {
+            let _ = Command::new(&self.bin)
+                .arg("kill-server")
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    struct TestPidGuard(libc::pid_t);
+
+    #[cfg(target_os = "linux")]
+    impl Drop for TestPidGuard {
+        fn drop(&mut self) {
+            if self.0 > 1 {
+                // SAFETY: the PID belongs to this test's dedicated detached child.
+                unsafe {
+                    libc::kill(self.0, libc::SIGKILL);
+                }
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn process_session_descendant_helper() {
+        let Some(descendant_pid_path) = env::var_os("AGENT_SESSION_TEST_DESCENDANT_PID") else {
+            return;
+        };
+        let escape = env::var_os("AGENT_SESSION_TEST_ESCAPE_TRIGGER");
+        let mut command = if escape.is_some() {
+            let mut command = Command::new(env::current_exe().expect("test executable"));
+            command
+                .arg("--exact")
+                .arg("tests::process_session_escape_helper")
+                .arg("--nocapture");
+            command
+        } else {
+            let mut command = Command::new("sleep");
+            command.arg("30").process_group(0);
+            command
+        };
+        // SAFETY: the helper deliberately models an independently grouped descendant.
+        unsafe {
+            command.pre_exec(|| {
+                libc::signal(libc::SIGTERM, libc::SIG_IGN);
+                libc::signal(libc::SIGHUP, libc::SIG_IGN);
+                Ok(())
+            });
+        }
+        let mut descendant = command.spawn().expect("spawn process-session descendant");
+        fs::write(descendant_pid_path, descendant.id().to_string()).expect("write descendant pid");
+        let _ = descendant.wait();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn process_session_escape_helper() {
+        let (Some(trigger), Some(marker)) = (
+            env::var_os("AGENT_SESSION_TEST_ESCAPE_TRIGGER"),
+            env::var_os("AGENT_SESSION_TEST_ESCAPED_MARKER"),
+        ) else {
+            return;
+        };
+        // SAFETY: this test helper models a captured descendant escaping its original session.
+        unsafe {
+            libc::signal(libc::SIGTERM, libc::SIG_IGN);
+            libc::signal(libc::SIGHUP, libc::SIG_IGN);
+        }
+        let trigger = PathBuf::from(trigger);
+        let started_at = Instant::now();
+        while !trigger.is_file() && started_at.elapsed() < Duration::from_secs(5) {
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(trigger.is_file(), "escape trigger must arrive");
+        assert!(
+            unsafe { libc::setsid() } > 1,
+            "descendant must escape its session"
+        );
+        fs::write(marker, "escaped").unwrap();
+        thread::sleep(Duration::from_secs(30));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn control_group_detached_descendant_helper() {
+        let (Some(descendant_trigger_path), Some(descendant_pid_path)) = (
+            env::var_os("AGENT_SESSION_TEST_CGROUP_DESCENDANT_TRIGGER"),
+            env::var_os("AGENT_SESSION_TEST_CGROUP_DESCENDANT_PID"),
+        ) else {
+            return;
+        };
+        let descendant_trigger_path = PathBuf::from(descendant_trigger_path);
+        let started_at = Instant::now();
+        while !descendant_trigger_path.is_file() && started_at.elapsed() < Duration::from_secs(5) {
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            descendant_trigger_path.is_file(),
+            "descendant trigger must arrive after pane cgroup containment"
+        );
+        let mut command = Command::new("sleep");
+        command.arg("30");
+        // SAFETY: this helper models a descendant that leaves the pane's process session
+        // while remaining inside the pane's dedicated cgroup.
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setsid() < 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                libc::signal(libc::SIGTERM, libc::SIG_IGN);
+                libc::signal(libc::SIGHUP, libc::SIG_IGN);
+                Ok(())
+            });
+        }
+        let mut descendant = command.spawn().expect("spawn detached descendant");
+        fs::write(descendant_pid_path, descendant.id().to_string())
+            .expect("record detached descendant pid");
+        let _ = descendant.wait();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn delete_kills_a_detached_descendant_inside_a_pinned_tmux_control_group() {
+        let require_cgroup = env::var_os("AGENT_SESSION_TEST_REQUIRE_CGROUP").is_some();
+        if !require_cgroup {
+            eprintln!(
+                "SKIP: the Linux cgroup integration test runs in its dedicated required CI step"
+            );
+            return;
+        }
+        assert!(
+            unsafe { libc::getsid(0) } > 1,
+            "required cgroup test must run in an isolated POSIX session; prefix the command with `setsid --wait`"
+        );
+        let Some(tmux) = super::binary_on_path("tmux") else {
+            eprintln!("SKIP: tmux is unavailable for the Linux cgroup integration test");
+            assert!(!require_cgroup, "required cgroup test must provide tmux");
+            return;
+        };
+        let Some(systemd_run) = super::binary_on_path("systemd-run") else {
+            eprintln!("SKIP: systemd-run is unavailable for the Linux cgroup integration test");
+            assert!(
+                !require_cgroup,
+                "required cgroup test must provide systemd-run"
+            );
+            return;
+        };
+        let user_manager_ready = env::var_os("XDG_RUNTIME_DIR")
+            .map(PathBuf::from)
+            .is_some_and(|runtime_dir| runtime_dir.join("systemd/private").exists());
+        if !user_manager_ready {
+            eprintln!("SKIP: no reachable systemd user manager for the Linux cgroup test");
+            assert!(
+                !require_cgroup,
+                "required cgroup test must provide a reachable systemd user manager"
+            );
+            return;
+        };
+        let tmp = tempfile::TempDir::new().unwrap();
+        let context = test_context(tmp.path());
+        let id = create_test_record_id(
+            &context,
+            AgentKind::Codex,
+            None,
+            Some("delete-cgroup-detached-descendant"),
+        );
+        let record = load_session_record(&context, &id).unwrap();
+        let socket = format!("nils-delete-cgroup-{}", unsafe { libc::getpid() });
+        let scope = format!("tmux-spawn-6302a262-c059-4ec9-9b93-{:012x}", unsafe {
+            libc::getpid()
+        });
+        let wrapper = tmp.path().join("tmux-cgroup-wrapper");
+        let wrapper_calls = tmp.path().join("wrapper-calls");
+        fs::write(
+            &wrapper,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> {}\nif [ \"$1\" = new-session ]; then exec {} --user --scope --quiet --collect --unit {} -- {} -f /dev/null -L {} \"$@\"; fi\nexec {} -f /dev/null -L {} \"$@\"\n",
+                shell_words::quote(&super::display_path(&wrapper_calls)),
+                shell_words::quote(&super::display_path(&systemd_run)),
+                shell_words::quote(&scope),
+                shell_words::quote(&super::display_path(&tmux)),
+                shell_words::quote(&socket),
+                shell_words::quote(&super::display_path(&tmux)),
+                shell_words::quote(&socket),
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o700)).unwrap();
+        let _tmux_server = TestTmuxServer {
+            bin: wrapper.clone(),
+        };
+        let descendant_trigger_path = tmp.path().join("detached-descendant.trigger");
+        let descendant_pid_path = tmp.path().join("detached-descendant.pid");
+        let runtime_id = &record.runtime.as_ref().unwrap().launch_id;
+        let scope_anchor_channel =
+            format!("nils-delete-cgroup-anchor-{}", unsafe { libc::getpid() });
+        let mut scope_anchor = Command::new(&wrapper);
+        scope_anchor
+            .arg("new-session")
+            .arg("-d")
+            .arg("-P")
+            .arg("-F")
+            .arg("#{session_id}\t#{pane_id}\t#{pane_pid}")
+            .arg("-s")
+            .arg(&record.tmux_session)
+            .arg("-e")
+            .arg(format!("AGENT_SESSION_ID={}", record.id))
+            .arg("-e")
+            .arg(format!(
+                "AGENT_SESSION_STATE_DIR={}",
+                super::display_path(&context.state_dir)
+            ))
+            .arg("-e")
+            .arg(format!("AGENT_SESSION_RUNTIME_ID={runtime_id}"))
+            .arg("--")
+            .arg(env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("tests::control_group_detached_descendant_helper")
+            .arg("--nocapture")
+            .arg(";")
+            .arg("wait-for")
+            .arg(&scope_anchor_channel)
+            .env(
+                "AGENT_SESSION_TEST_CGROUP_DESCENDANT_TRIGGER",
+                &descendant_trigger_path,
+            )
+            .env(
+                "AGENT_SESSION_TEST_CGROUP_DESCENDANT_PID",
+                &descendant_pid_path,
+            )
+            .process_group(0)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut scope_anchor = scope_anchor.spawn().unwrap();
+        let mut output = String::new();
+        let output_length = io::BufReader::new(scope_anchor.stdout.take().unwrap())
+            .read_line(&mut output)
+            .unwrap();
+        assert!(
+            output_length > 0,
+            "tmux scope anchor exited before publishing pane identity: status={:?}",
+            scope_anchor.try_wait()
+        );
+        let mut output_fields = output.trim().split('\t');
+        let tmux_session_id = output_fields.next().unwrap().to_string();
+        let tmux_pane_id = output_fields.next().unwrap().to_string();
+        let pane_pid: libc::pid_t = output_fields.next().unwrap().parse().unwrap();
+        let containment_started_at = Instant::now();
+        let mut observed_control_group = None;
+        let mut observed_since = Instant::now();
+        let control_group = loop {
+            let current = super::linux_process_control_group(pane_pid).unwrap();
+            if current != observed_control_group {
+                observed_control_group = current;
+                observed_since = Instant::now();
+            } else if observed_since.elapsed() >= Duration::from_millis(500) {
+                let Some(control_group) = observed_control_group else {
+                    scope_anchor.kill().unwrap();
+                    scope_anchor.wait().unwrap();
+                    panic!("required cgroup test must exercise a dedicated tmux cgroup path");
+                };
+                break control_group;
+            }
+            assert!(
+                containment_started_at.elapsed() < Duration::from_secs(3),
+                "tmux pane never reached stable cgroup containment: {observed_control_group:?}"
+            );
+            thread::sleep(Duration::from_millis(10));
+        };
+        let capture_started_at = Instant::now();
+        let mut retained_identity = loop {
+            match super::capture_tmux_runtime_identity(
+                &context,
+                &record,
+                &wrapper,
+                Duration::from_secs(1),
+            ) {
+                Ok(super::TmuxRuntimeProbe::Running(identity)) => break *identity,
+                Ok(super::TmuxRuntimeProbe::Stopped) => {
+                    panic!("tmux runtime must still be running")
+                }
+                Err(error)
+                    if matches!(
+                        error,
+                        super::SessionTerminationFailure::RuntimeIdentityUnavailable
+                            | super::SessionTerminationFailure::VerificationFailed
+                    ) && capture_started_at.elapsed() < Duration::from_secs(2) =>
+                {
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => {
+                    let pane_session_id = unsafe { libc::getsid(pane_pid) };
+                    let raw_tmux_identity = Command::new(&wrapper)
+                        .env("LC_ALL", "C")
+                        .arg("display-message")
+                        .arg("-p")
+                        .arg("-t")
+                        .arg(super::managed_tmux_pane_target(&record.tmux_session))
+                        .arg("#{session_id} #{pane_id} #{pane_pid}")
+                        .output()
+                        .map(|output| {
+                            (
+                                output.status,
+                                String::from_utf8_lossy(&output.stdout).into_owned(),
+                                String::from_utf8_lossy(&output.stderr).into_owned(),
+                            )
+                        });
+                    let pane_session_members =
+                        super::linux_process_session_members(pane_session_id).map(|members| {
+                            members
+                                .iter()
+                                .map(|member| {
+                                    (
+                                        member.pid,
+                                        member.session_id,
+                                        member.start_time,
+                                        member.zombie,
+                                    )
+                                })
+                                .collect::<Vec<_>>()
+                        });
+                    panic!(
+                        "tmux runtime identity did not stabilize within the fixture timeout: {error:?}; initial_tmux_session={tmux_session_id:?}; initial_tmux_pane={tmux_pane_id:?}; raw_tmux_identity={raw_tmux_identity:?}; caller_pid={}; caller_pgid={}; caller_sid={}; pane_pid={pane_pid}; pane_pgid={:?}; pane_sid={pane_session_id}; pane_members={pane_session_members:?}; pane_cgroup={:?}; pane_stat={:?}; calls={}",
+                        unsafe { libc::getpid() },
+                        unsafe { libc::getpgrp() },
+                        unsafe { libc::getsid(0) },
+                        super::process_group_id(pane_pid),
+                        super::linux_process_control_group(pane_pid),
+                        fs::read_to_string(format!("/proc/{pane_pid}/stat")),
+                        fs::read_to_string(&wrapper_calls).unwrap_or_default(),
+                    );
+                }
+            }
+        };
+        assert_eq!(retained_identity.session_id, tmux_session_id);
+        assert_eq!(retained_identity.pane_id, tmux_pane_id);
+        assert_eq!(
+            retained_identity.control_group.as_ref(),
+            Some(&control_group),
+            "captured runtime identity must retain the stabilized pane cgroup"
+        );
+        fs::write(&descendant_trigger_path, "spawn").unwrap();
+        let started_at = Instant::now();
+        let descendant_pid: libc::pid_t = loop {
+            if let Some(pid) = fs::read_to_string(&descendant_pid_path)
+                .ok()
+                .and_then(|pid| pid.trim().parse().ok())
+            {
+                break pid;
+            }
+            assert!(
+                started_at.elapsed() < Duration::from_secs(2),
+                "detached descendant PID was not published"
+            );
+            thread::sleep(Duration::from_millis(10));
+        };
+        let descendant_start_time = super::read_linux_process_identity(descendant_pid)
+            .unwrap()
+            .expect("detached descendant process identity")
+            .start_time;
+        let _descendant = TestPidGuard(descendant_pid);
+        assert_ne!(
+            unsafe { libc::getsid(descendant_pid) },
+            unsafe { libc::getsid(pane_pid) },
+            "the descendant must leave the pane's process session"
+        );
+        let membership_started = Instant::now();
+        loop {
+            if super::linux_process_control_group(descendant_pid)
+                .unwrap()
+                .as_ref()
+                == Some(&control_group)
+            {
+                break;
+            }
+            assert!(
+                membership_started.elapsed() < Duration::from_secs(2),
+                "detached descendant never entered the pane's dedicated cgroup: pane={control_group:?}, descendant={:?}",
+                super::linux_process_control_group(descendant_pid),
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+        let events_path = super::linux_control_group_full_path(Path::new(&control_group.path))
+            .unwrap()
+            .join("cgroup.events");
+
+        let mut escaped_member = TestProcessGroup::spawn();
+        let escaped_pid = escaped_member.pid() as libc::pid_t;
+        let escaped_identity = super::read_linux_process_identity(escaped_pid)
+            .unwrap()
+            .expect("live escaped member");
+        assert_ne!(
+            super::linux_process_control_group(escaped_pid).unwrap(),
+            Some(control_group.clone()),
+            "the retained member must model a process that already left the pane cgroup"
+        );
+        let mut retained = load_session_record(&context, &id).unwrap();
+        retained_identity.control_group_members = vec![
+            TmuxProcessIdentity {
+                pid: descendant_pid,
+                start_time: descendant_start_time,
+            },
+            TmuxProcessIdentity {
+                pid: escaped_pid,
+                start_time: escaped_identity.start_time,
+            },
+        ];
+        persist_tmux_runtime_identity(&mut retained, &retained_identity).unwrap();
+        super::set_tmux_termination_state(
+            &mut retained,
+            super::TmuxTerminationState::Pending {
+                thaw_on_recovery: false,
+            },
+        )
+        .unwrap();
+        write_session_record(&context, &retained).unwrap();
+
+        let delete_once = || {
+            delete_session_with_timeouts(
+                &context,
+                &id,
+                wrapper.clone(),
+                Duration::from_secs(1),
+                Duration::from_secs(2),
+            )
+        };
+        let result = delete_once().or_else(|_| delete_once()).unwrap_or_else(|error| {
+            let retained = load_session_record(&context, &id).unwrap();
+            panic!(
+                "delete failed: {error:?}; state={:?}; cgroup_events={:?}; escaped={:?}; calls={} ",
+                retained.extra.get(super::DELETE_TMUX_TERMINATION_STATE_KEY),
+                fs::read_to_string(&events_path),
+                fs::read_to_string(format!("/proc/{escaped_pid}/stat")),
+                fs::read_to_string(&wrapper_calls).unwrap_or_default(),
+            )
+        });
+
+        assert!(result.deleted);
+        assert!(!session_dir(&context, &id).exists());
+        let started_at = Instant::now();
+        let stopped = loop {
+            match super::read_linux_process_identity(descendant_pid) {
+                Ok(None) => break true,
+                Ok(Some(identity)) if identity.start_time != descendant_start_time => break true,
+                Ok(Some(identity)) if identity.zombie => break true,
+                Ok(Some(_)) => {}
+                Err(_) => break false,
+            }
+            if started_at.elapsed() >= Duration::from_secs(2) {
+                break false;
+            }
+            thread::sleep(Duration::from_millis(10));
+        };
+        assert!(
+            stopped,
+            "the cgroup-pinned detached child must not survive: stat={:?}, cgroup={:?}, events={:?}, calls={}",
+            fs::read_to_string(format!("/proc/{descendant_pid}/stat")),
+            super::linux_process_control_group_path(descendant_pid),
+            fs::read_to_string(&events_path),
+            fs::read_to_string(&wrapper_calls).unwrap_or_default(),
+        );
+        let escaped_started_at = Instant::now();
+        let escaped_stopped = loop {
+            match super::read_linux_process_identity(escaped_pid) {
+                Ok(None) => break true,
+                Ok(Some(identity)) if identity.start_time != escaped_identity.start_time => {
+                    break true;
+                }
+                Ok(Some(identity)) if identity.zombie => break true,
+                Ok(Some(_)) => {}
+                Err(_) => break false,
+            }
+            if escaped_started_at.elapsed() >= Duration::from_secs(2) {
+                break false;
+            }
+            thread::sleep(Duration::from_millis(10));
+        };
+        assert!(
+            escaped_stopped,
+            "a same-boot Pending retry must kill a retained member outside the cgroup"
+        );
+        escaped_member.stop();
+        let _ = Command::new(&wrapper)
+            .arg("wait-for")
+            .arg("-S")
+            .arg(&scope_anchor_channel)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+        let anchor_started_at = Instant::now();
+        loop {
+            if scope_anchor.try_wait().unwrap().is_some() {
+                break;
+            }
+            if anchor_started_at.elapsed() >= Duration::from_secs(2) {
+                scope_anchor.kill().unwrap();
+                scope_anchor.wait().unwrap();
+                panic!("the cgroup scope anchor did not exit after deletion cleanup");
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn tmux_control_group_path_requires_a_dedicated_spawn_scope() {
+        assert!(super::valid_tmux_spawn_control_group_path(Path::new(
+            "/user.slice/user-1000.slice/user@1000.service/app.slice/tmux-spawn-6302a262-c059-4ec9-9b93-1318f3b50a3f.scope"
+        )));
+        assert!(!super::valid_tmux_spawn_control_group_path(Path::new(
+            "/user.slice/user-1000.slice/user@1000.service/app.slice/tmux.service"
+        )));
+        assert!(!super::valid_tmux_spawn_control_group_path(Path::new(
+            "/user.slice/user-1000.slice/user@1000.service/app.slice/tmux-spawn-not-a-uuid.scope"
+        )));
+        assert!(!super::valid_tmux_spawn_control_group_path(Path::new(
+            "/user.slice/../tmp/tmux-spawn-6302a262-c059-4ec9-9b93-1318f3b50a3f.scope"
+        )));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pinned_control_group_uses_verified_files_for_freeze_kill_and_status() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = Path::new(
+            "/user.slice/user-1000.slice/user@1000.service/app.slice/tmux-spawn-6302a262-c059-4ec9-9b93-1318f3b50a3f.scope",
+        );
+        let full_path = super::linux_control_group_full_path_at_root(path, tmp.path()).unwrap();
+        fs::create_dir_all(&full_path).unwrap();
+        fs::write(full_path.join("cgroup.kill"), "0\n").unwrap();
+        fs::write(full_path.join("cgroup.freeze"), "0\n").unwrap();
+        fs::write(full_path.join("cgroup.events"), "populated 1\nfrozen 0\n").unwrap();
+        fs::write(full_path.join("cgroup.procs"), "").unwrap();
+        let metadata = fs::metadata(&full_path).unwrap();
+        let control_group = super::TmuxControlGroupIdentity {
+            path: path.to_string_lossy().into_owned(),
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            boot_id: Some(super::linux_boot_id().unwrap()),
+        };
+        let identity = TmuxRuntimeIdentity {
+            launch_id: Some("launch-cgroup-fixture".to_string()),
+            session_id: "$91".to_string(),
+            pane_id: "%91".to_string(),
+            pane_pid: 91,
+            process_group_id: Some(91),
+            process_session_id: Some(91),
+            process_session_members: Vec::new(),
+            control_group_members: Vec::new(),
+            control_group: Some(control_group.clone()),
+        };
+
+        assert_eq!(
+            super::linux_control_group_runtime_status_at_root(
+                &identity,
+                &control_group,
+                tmp.path(),
+            ),
+            super::ProcessGroupStatus::Running
+        );
+        let mut pinned =
+            super::open_pinned_linux_control_group(&control_group, &full_path).unwrap();
+        let events_path = full_path.join("cgroup.events");
+        let freeze_path = full_path.join("cgroup.freeze");
+        let events_updater = thread::spawn(move || {
+            let started_at = Instant::now();
+            while started_at.elapsed() < Duration::from_secs(1) {
+                if fs::read_to_string(&freeze_path).is_ok_and(|value| value.starts_with('1')) {
+                    fs::write(&events_path, "populated 1\nfrozen 1\n").unwrap();
+                    return;
+                }
+                thread::sleep(Duration::from_millis(1));
+            }
+            panic!("fixture never observed freeze request");
+        });
+        super::freeze_pinned_control_group(&mut pinned, Duration::from_secs(1)).unwrap();
+        events_updater.join().unwrap();
+        assert!(
+            fs::read_to_string(full_path.join("cgroup.freeze"))
+                .unwrap()
+                .starts_with('1')
+        );
+        super::write_control_group_file(&pinned.kill_fd, b"1").unwrap();
+        assert!(
+            fs::read_to_string(full_path.join("cgroup.kill"))
+                .unwrap()
+                .starts_with('1')
+        );
+
+        fs::write(full_path.join("cgroup.events"), "populated 0\nfrozen 1\n").unwrap();
+        assert_eq!(
+            super::linux_control_group_runtime_status_at_root(
+                &identity,
+                &control_group,
+                tmp.path(),
+            ),
+            super::ProcessGroupStatus::Stopped
+        );
+        let events_path = full_path.join("cgroup.events");
+        let freeze_path = full_path.join("cgroup.freeze");
+        let thaw_updater = thread::spawn(move || {
+            let started_at = Instant::now();
+            while started_at.elapsed() < Duration::from_secs(1) {
+                if fs::read_to_string(&freeze_path).is_ok_and(|value| value.starts_with('0')) {
+                    fs::write(events_path, "populated 0\nfrozen 0\n").unwrap();
+                    return;
+                }
+                thread::sleep(Duration::from_millis(1));
+            }
+            panic!("fixture never observed thaw request");
+        });
+        drop(pinned);
+        thaw_updater.join().unwrap();
+        assert!(
+            fs::read_to_string(full_path.join("cgroup.freeze"))
+                .unwrap()
+                .starts_with('0')
+        );
+
+        let replaced_path = full_path.with_extension("replaced");
+        fs::rename(&full_path, &replaced_path).unwrap();
+        fs::create_dir_all(&full_path).unwrap();
+        fs::write(full_path.join("cgroup.events"), "populated 1\nfrozen 0\n").unwrap();
+        assert_eq!(
+            super::linux_control_group_runtime_status_at_root(
+                &identity,
+                &control_group,
+                tmp.path(),
+            ),
+            super::ProcessGroupStatus::Unknown,
+            "a replacement path with a different inode must fail closed"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pinned_control_group_preserves_a_preexisting_frozen_state() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = Path::new(
+            "/user.slice/user-1000.slice/user@1000.service/app.slice/tmux-spawn-6302a262-c059-4ec9-9b93-1318f3b50a3f.scope",
+        );
+        let full_path = super::linux_control_group_full_path_at_root(path, tmp.path()).unwrap();
+        fs::create_dir_all(&full_path).unwrap();
+        fs::write(full_path.join("cgroup.kill"), "0\n").unwrap();
+        fs::write(full_path.join("cgroup.freeze"), "1\n").unwrap();
+        fs::write(full_path.join("cgroup.events"), "populated 1\nfrozen 1\n").unwrap();
+        fs::write(full_path.join("cgroup.procs"), "").unwrap();
+        let metadata = fs::metadata(&full_path).unwrap();
+        let identity = super::TmuxControlGroupIdentity {
+            path: path.to_string_lossy().into_owned(),
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            boot_id: Some(super::linux_boot_id().unwrap()),
+        };
+
+        let mut pinned = super::open_pinned_linux_control_group(&identity, &full_path).unwrap();
+        super::freeze_pinned_control_group(&mut pinned, Duration::from_millis(10)).unwrap();
+        drop(pinned);
+
+        assert!(
+            fs::read_to_string(full_path.join("cgroup.freeze"))
+                .unwrap()
+                .starts_with('1'),
+            "delete must not thaw a scope that was already frozen"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pinned_control_group_resamples_freeze_ownership_before_freezing() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = Path::new(
+            "/user.slice/user-1000.slice/user@1000.service/app.slice/tmux-spawn-6302a262-c059-4ec9-9b93-1318f3b50a3f.scope",
+        );
+        let full_path = super::linux_control_group_full_path_at_root(path, tmp.path()).unwrap();
+        fs::create_dir_all(&full_path).unwrap();
+        fs::write(full_path.join("cgroup.kill"), "0\n").unwrap();
+        fs::write(full_path.join("cgroup.freeze"), "0\n").unwrap();
+        fs::write(full_path.join("cgroup.events"), "populated 1\nfrozen 0\n").unwrap();
+        fs::write(full_path.join("cgroup.procs"), "").unwrap();
+        let metadata = fs::metadata(&full_path).unwrap();
+        let identity = super::TmuxControlGroupIdentity {
+            path: path.to_string_lossy().into_owned(),
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            boot_id: Some(super::linux_boot_id().unwrap()),
+        };
+
+        let mut pinned = super::open_pinned_linux_control_group(&identity, &full_path).unwrap();
+        fs::write(full_path.join("cgroup.freeze"), "1\n").unwrap();
+        fs::write(full_path.join("cgroup.events"), "populated 1\nfrozen 1\n").unwrap();
+
+        super::refresh_pinned_control_group_freeze_ownership(&mut pinned).unwrap();
+        super::freeze_pinned_control_group(&mut pinned, Duration::from_millis(10)).unwrap();
+        drop(pinned);
+
+        assert!(
+            fs::read_to_string(full_path.join("cgroup.freeze"))
+                .unwrap()
+                .starts_with('1'),
+            "delete must not thaw a leaf frozen after the cgroup was pinned"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pinned_control_group_owns_a_leaf_freeze_when_only_an_ancestor_was_frozen() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = Path::new(
+            "/user.slice/user-1000.slice/user@1000.service/app.slice/tmux-spawn-6302a262-c059-4ec9-9b93-1318f3b50a3f.scope",
+        );
+        let full_path = super::linux_control_group_full_path_at_root(path, tmp.path()).unwrap();
+        fs::create_dir_all(&full_path).unwrap();
+        fs::write(full_path.join("cgroup.kill"), "0\n").unwrap();
+        fs::write(full_path.join("cgroup.freeze"), "0\n").unwrap();
+        fs::write(full_path.join("cgroup.events"), "populated 1\nfrozen 1\n").unwrap();
+        fs::write(full_path.join("cgroup.procs"), "").unwrap();
+        let metadata = fs::metadata(&full_path).unwrap();
+        let identity = super::TmuxControlGroupIdentity {
+            path: path.to_string_lossy().into_owned(),
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            boot_id: Some(super::linux_boot_id().unwrap()),
+        };
+
+        let mut pinned = super::open_pinned_linux_control_group(&identity, &full_path).unwrap();
+        super::freeze_pinned_control_group(&mut pinned, Duration::from_millis(10)).unwrap();
+        assert!(
+            fs::read_to_string(full_path.join("cgroup.freeze"))
+                .unwrap()
+                .starts_with('1'),
+            "effective ancestor freeze must not substitute for a leaf freeze request"
+        );
+        let events_path = full_path.join("cgroup.events");
+        let freeze_path = full_path.join("cgroup.freeze");
+        let thaw_updater = thread::spawn(move || {
+            let started_at = Instant::now();
+            while started_at.elapsed() < Duration::from_secs(1) {
+                if fs::read_to_string(&freeze_path).is_ok_and(|value| value.starts_with('0')) {
+                    fs::write(events_path, "populated 1\nfrozen 0\n").unwrap();
+                    return;
+                }
+                thread::sleep(Duration::from_millis(1));
+            }
+            panic!("fixture never observed owned leaf thaw request");
+        });
+        drop(pinned);
+        thaw_updater.join().unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn interrupted_cgroup_freeze_helper() {
+        let (Some(state_dir), Some(id), Some(full_path)) = (
+            env::var_os("AGENT_SESSION_TEST_RECOVERY_STATE_DIR"),
+            env::var_os("AGENT_SESSION_TEST_RECOVERY_ID"),
+            env::var_os("AGENT_SESSION_TEST_RECOVERY_CGROUP"),
+        ) else {
+            return;
+        };
+        let context = test_context(Path::new(&state_dir));
+        let mut record = load_session_record(&context, id.to_str().unwrap()).unwrap();
+        let identity = super::persisted_tmux_runtime_identity(&record)
+            .unwrap()
+            .unwrap();
+        let control_group = identity.control_group.as_ref().unwrap();
+        let full_path = PathBuf::from(full_path);
+        let mut pinned = super::open_pinned_linux_control_group(control_group, &full_path).unwrap();
+        super::set_tmux_termination_state(
+            &mut record,
+            super::TmuxTerminationState::FreezePending {
+                thaw_on_recovery: true,
+            },
+        )
+        .unwrap();
+        write_session_record(&context, &record).unwrap();
+        let events_path = full_path.join("cgroup.events");
+        let freeze_path = full_path.join("cgroup.freeze");
+        thread::spawn(move || {
+            let started_at = Instant::now();
+            while started_at.elapsed() < Duration::from_secs(3) {
+                if fs::read_to_string(&freeze_path).is_ok_and(|value| value.starts_with('1')) {
+                    fs::write(events_path, "populated 1\nfrozen 1\n").unwrap();
+                    return;
+                }
+                thread::sleep(Duration::from_millis(1));
+            }
+            panic!("crash helper never observed freeze request");
+        });
+        super::freeze_pinned_control_group(&mut pinned, Duration::from_secs(1)).unwrap();
+        std::process::exit(0);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn startup_recovers_a_freeze_left_by_an_interrupted_delete() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let context = test_context(tmp.path());
+        let id = create_test_record_id(
+            &context,
+            AgentKind::Codex,
+            None,
+            Some("recover-interrupted-freeze"),
+        );
+        let path = Path::new(
+            "/user.slice/user-1000.slice/user@1000.service/app.slice/tmux-spawn-6302a262-c059-4ec9-9b93-1318f3b50a3f.scope",
+        );
+        let cgroup_root = tmp.path().join("cgroup-root");
+        let full_path = super::linux_control_group_full_path_at_root(path, &cgroup_root).unwrap();
+        fs::create_dir_all(&full_path).unwrap();
+        fs::write(full_path.join("cgroup.kill"), "0\n").unwrap();
+        fs::write(full_path.join("cgroup.freeze"), "0\n").unwrap();
+        fs::write(full_path.join("cgroup.events"), "populated 1\nfrozen 0\n").unwrap();
+        fs::write(full_path.join("cgroup.procs"), "").unwrap();
+        let metadata = fs::metadata(&full_path).unwrap();
+        let mut record = load_session_record(&context, &id).unwrap();
+        let identity = TmuxRuntimeIdentity {
+            launch_id: Some(record.runtime.as_ref().unwrap().launch_id.clone()),
+            session_id: "$91".to_string(),
+            pane_id: "%91".to_string(),
+            pane_pid: 91,
+            process_group_id: Some(91),
+            process_session_id: Some(91),
+            process_session_members: Vec::new(),
+            control_group_members: Vec::new(),
+            control_group: Some(super::TmuxControlGroupIdentity {
+                path: path.to_string_lossy().into_owned(),
+                device: metadata.dev(),
+                inode: metadata.ino(),
+                boot_id: Some(super::linux_boot_id().unwrap()),
+            }),
+        };
+        persist_tmux_runtime_identity(&mut record, &identity).unwrap();
+        write_session_record(&context, &record).unwrap();
+
+        let output = Command::new(env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("tests::interrupted_cgroup_freeze_helper")
+            .arg("--nocapture")
+            .env("AGENT_SESSION_TEST_RECOVERY_STATE_DIR", tmp.path())
+            .env("AGENT_SESSION_TEST_RECOVERY_ID", &id)
+            .env("AGENT_SESSION_TEST_RECOVERY_CGROUP", &full_path)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "freeze helper failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            fs::read_to_string(full_path.join("cgroup.freeze"))
+                .unwrap()
+                .starts_with('1'),
+            "the subprocess must exit without running the cgroup guard destructor"
+        );
+
+        let events_path = full_path.join("cgroup.events");
+        let freeze_path = full_path.join("cgroup.freeze");
+        let thaw_updater = thread::spawn(move || {
+            let started_at = Instant::now();
+            while started_at.elapsed() < Duration::from_secs(1) {
+                if fs::read_to_string(&freeze_path).is_ok_and(|value| value.starts_with('0')) {
+                    fs::write(events_path, "populated 1\nfrozen 0\n").unwrap();
+                    return;
+                }
+                thread::sleep(Duration::from_millis(1));
+            }
+            panic!("fixture never observed recovery thaw request");
+        });
+
+        super::recover_interrupted_tmux_terminations_at_cgroup_root(&context, &cgroup_root)
+            .unwrap();
+        thaw_updater.join().unwrap();
+
+        assert!(
+            fs::read_to_string(full_path.join("cgroup.freeze"))
+                .unwrap()
+                .starts_with('0')
+        );
+        let recovered = load_session_record(&context, &id).unwrap();
+        assert!(
+            !recovered
+                .extra
+                .contains_key(super::DELETE_TMUX_TERMINATION_STATE_KEY)
+        );
+    }
+
+    #[test]
+    fn startup_recovery_ignores_an_unrelated_malformed_session_record() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let context = test_context(tmp.path());
+        let malformed_dir = context.state_dir.join("sessions/unrelated-malformed");
+        fs::create_dir_all(&malformed_dir).unwrap();
+        fs::write(malformed_dir.join("session.json"), "{not-json").unwrap();
+
+        super::recover_interrupted_tmux_terminations_at_cgroup_root(
+            &context,
+            &tmp.path().join("missing-cgroup-root"),
+        )
+        .unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn startup_retains_freeze_ownership_when_thaw_cannot_be_verified() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let context = test_context(tmp.path());
+        let id = create_test_record_id(
+            &context,
+            AgentKind::Codex,
+            None,
+            Some("retain-interrupted-freeze"),
+        );
+        let path = Path::new(
+            "/user.slice/user-1000.slice/user@1000.service/app.slice/tmux-spawn-6302a262-c059-4ec9-9b93-1318f3b50a3f.scope",
+        );
+        let cgroup_root = tmp.path().join("cgroup-root");
+        let full_path = super::linux_control_group_full_path_at_root(path, &cgroup_root).unwrap();
+        fs::create_dir_all(&full_path).unwrap();
+        fs::write(full_path.join("cgroup.kill"), "0\n").unwrap();
+        fs::write(full_path.join("cgroup.freeze"), "1\n").unwrap();
+        fs::write(full_path.join("cgroup.events"), "populated 1\nfrozen 1\n").unwrap();
+        fs::write(full_path.join("cgroup.procs"), "").unwrap();
+        let metadata = fs::metadata(&full_path).unwrap();
+        let mut record = load_session_record(&context, &id).unwrap();
+        let launch_id = record.runtime.as_ref().unwrap().launch_id.clone();
+        persist_tmux_runtime_identity(
+            &mut record,
+            &TmuxRuntimeIdentity {
+                launch_id: Some(launch_id),
+                session_id: "$91".to_string(),
+                pane_id: "%91".to_string(),
+                pane_pid: 91,
+                process_group_id: Some(91),
+                process_session_id: Some(91),
+                process_session_members: Vec::new(),
+                control_group_members: Vec::new(),
+                control_group: Some(super::TmuxControlGroupIdentity {
+                    path: path.to_string_lossy().into_owned(),
+                    device: metadata.dev(),
+                    inode: metadata.ino(),
+                    boot_id: Some(super::linux_boot_id().unwrap()),
+                }),
+            },
+        )
+        .unwrap();
+        super::set_tmux_termination_state(
+            &mut record,
+            super::TmuxTerminationState::FreezePending {
+                thaw_on_recovery: true,
+            },
+        )
+        .unwrap();
+        write_session_record(&context, &record).unwrap();
+
+        assert!(
+            super::recover_interrupted_tmux_terminations_at_cgroup_root(&context, &cgroup_root,)
+                .is_err()
+        );
+        let retained = load_session_record(&context, &id).unwrap();
+        assert!(
+            retained
+                .extra
+                .contains_key(super::DELETE_TMUX_TERMINATION_STATE_KEY),
+            "unverified thaw must retain durable recovery ownership"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn startup_recovery_covers_pending_confirmed_and_prefrozen_states() {
+        let cases = [
+            (
+                super::TmuxTerminationState::Pending {
+                    thaw_on_recovery: true,
+                },
+                Some(super::TmuxTerminationState::Pending {
+                    thaw_on_recovery: false,
+                }),
+                true,
+                false,
+            ),
+            (
+                super::TmuxTerminationState::KillConfirmed {
+                    thaw_on_recovery: true,
+                },
+                Some(super::TmuxTerminationState::KillConfirmed {
+                    thaw_on_recovery: false,
+                }),
+                true,
+                true,
+            ),
+            (
+                super::TmuxTerminationState::FreezePending {
+                    thaw_on_recovery: false,
+                },
+                None,
+                false,
+                false,
+            ),
+        ];
+
+        for (index, (state, expected_state, expect_thaw, expect_kill)) in
+            cases.into_iter().enumerate()
+        {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let context = test_context(tmp.path());
+            let id = create_test_record_id(
+                &context,
+                AgentKind::Codex,
+                None,
+                Some(&format!("recover-state-{index}")),
+            );
+            let path = Path::new(
+                "/user.slice/user-1000.slice/user@1000.service/app.slice/tmux-spawn-6302a262-c059-4ec9-9b93-1318f3b50a3f.scope",
+            );
+            let cgroup_root = tmp.path().join("cgroup-root");
+            let full_path =
+                super::linux_control_group_full_path_at_root(path, &cgroup_root).unwrap();
+            fs::create_dir_all(&full_path).unwrap();
+            fs::write(full_path.join("cgroup.kill"), "0\n").unwrap();
+            fs::write(full_path.join("cgroup.freeze"), "1\n").unwrap();
+            fs::write(full_path.join("cgroup.events"), "populated 1\nfrozen 1\n").unwrap();
+            fs::write(full_path.join("cgroup.procs"), "").unwrap();
+            let metadata = fs::metadata(&full_path).unwrap();
+            let mut record = load_session_record(&context, &id).unwrap();
+            let launch_id = record.runtime.as_ref().unwrap().launch_id.clone();
+            persist_tmux_runtime_identity(
+                &mut record,
+                &TmuxRuntimeIdentity {
+                    launch_id: Some(launch_id),
+                    session_id: "$91".to_string(),
+                    pane_id: "%91".to_string(),
+                    pane_pid: 91,
+                    process_group_id: Some(91),
+                    process_session_id: Some(91),
+                    process_session_members: Vec::new(),
+                    control_group_members: Vec::new(),
+                    control_group: Some(super::TmuxControlGroupIdentity {
+                        path: path.to_string_lossy().into_owned(),
+                        device: metadata.dev(),
+                        inode: metadata.ino(),
+                        boot_id: Some(super::linux_boot_id().unwrap()),
+                    }),
+                },
+            )
+            .unwrap();
+            super::set_tmux_termination_state(&mut record, state).unwrap();
+            write_session_record(&context, &record).unwrap();
+
+            let thaw_updater = expect_thaw.then(|| {
+                let events_path = full_path.join("cgroup.events");
+                let freeze_path = full_path.join("cgroup.freeze");
+                thread::spawn(move || {
+                    let started_at = Instant::now();
+                    while started_at.elapsed() < Duration::from_secs(2) {
+                        if fs::read_to_string(&freeze_path)
+                            .is_ok_and(|value| value.starts_with('0'))
+                        {
+                            fs::write(events_path, "populated 1\nfrozen 0\n").unwrap();
+                            return;
+                        }
+                        thread::sleep(Duration::from_millis(1));
+                    }
+                    panic!("fixture never observed state-recovery thaw request");
+                })
+            });
+
+            super::recover_interrupted_tmux_terminations_at_cgroup_root(&context, &cgroup_root)
+                .unwrap();
+            if let Some(thaw_updater) = thaw_updater {
+                thaw_updater.join().unwrap();
+            }
+            let recovered = load_session_record(&context, &id).unwrap();
+            assert_eq!(
+                super::persisted_tmux_termination_state(&recovered).unwrap(),
+                expected_state
+            );
+            assert_eq!(
+                fs::read_to_string(full_path.join("cgroup.kill"))
+                    .unwrap()
+                    .starts_with('1'),
+                expect_kill
+            );
+            assert_eq!(
+                fs::read_to_string(full_path.join("cgroup.freeze"))
+                    .unwrap()
+                    .starts_with('0'),
+                expect_thaw
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn startup_kill_confirmed_recovery_signals_a_persisted_member_outside_the_cgroup() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let context = test_context(tmp.path());
+        let id = create_test_record_id(
+            &context,
+            AgentKind::Codex,
+            None,
+            Some("recover-migrated-cgroup-member"),
+        );
+        let path = Path::new(
+            "/user.slice/user-1000.slice/user@1000.service/app.slice/tmux-spawn-6302a262-c059-4ec9-9b93-1318f3b50a3f.scope",
+        );
+        let cgroup_root = tmp.path().join("cgroup-root");
+        let full_path = super::linux_control_group_full_path_at_root(path, &cgroup_root).unwrap();
+        fs::create_dir_all(&full_path).unwrap();
+        fs::write(full_path.join("cgroup.kill"), "0\n").unwrap();
+        fs::write(full_path.join("cgroup.freeze"), "0\n").unwrap();
+        fs::write(full_path.join("cgroup.events"), "populated 0\nfrozen 0\n").unwrap();
+        fs::write(full_path.join("cgroup.procs"), "").unwrap();
+        let metadata = fs::metadata(&full_path).unwrap();
+        let mut pane = TestProcessGroup::spawn();
+        let pane_identity = super::read_linux_process_identity(pane.pid() as libc::pid_t)
+            .unwrap()
+            .expect("live test process");
+        let member = TmuxProcessIdentity {
+            pid: pane_identity.pid,
+            start_time: pane_identity.start_time,
+        };
+        let mut record = load_session_record(&context, &id).unwrap();
+        let identity = TmuxRuntimeIdentity {
+            launch_id: Some(record.runtime.as_ref().unwrap().launch_id.clone()),
+            session_id: "$91".to_string(),
+            pane_id: "%91".to_string(),
+            pane_pid: member.pid,
+            process_group_id: Some(pane.process_group_id),
+            process_session_id: Some(pane_identity.session_id),
+            process_session_members: Vec::new(),
+            control_group_members: vec![member.clone()],
+            control_group: Some(super::TmuxControlGroupIdentity {
+                path: path.to_string_lossy().into_owned(),
+                device: metadata.dev(),
+                inode: metadata.ino(),
+                boot_id: Some(super::linux_boot_id().unwrap()),
+            }),
+        };
+        persist_tmux_runtime_identity(&mut record, &identity).unwrap();
+        super::set_tmux_termination_state(
+            &mut record,
+            super::TmuxTerminationState::KillConfirmed {
+                thaw_on_recovery: false,
+            },
+        )
+        .unwrap();
+        write_session_record(&context, &record).unwrap();
+
+        super::recover_interrupted_tmux_terminations_at_cgroup_root(&context, &cgroup_root)
+            .unwrap();
+
+        assert!(
+            fs::read_to_string(full_path.join("cgroup.kill"))
+                .unwrap()
+                .starts_with('1')
+        );
+        let started_at = Instant::now();
+        loop {
+            match super::read_linux_process_identity(member.pid).unwrap() {
+                None => break,
+                Some(current) if current.zombie => break,
+                Some(_) if started_at.elapsed() < Duration::from_secs(1) => {
+                    thread::sleep(Duration::from_millis(5));
+                }
+                Some(_) => panic!("persisted migrated process survived recovery"),
+            }
+        }
+        assert_eq!(
+            super::linux_control_group_runtime_status_at_root(
+                &identity,
+                identity.control_group.as_ref().unwrap(),
+                &cgroup_root,
+            ),
+            super::ProcessGroupStatus::Stopped
+        );
+        let recovered = load_session_record(&context, &id).unwrap();
+        assert_eq!(
+            super::persisted_tmux_termination_state(&recovered).unwrap(),
+            Some(super::TmuxTerminationState::KillConfirmed {
+                thaw_on_recovery: false,
+            })
+        );
+        pane.stop();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn startup_recovery_never_signals_a_persisted_member_from_another_boot() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let context = test_context(tmp.path());
+        let id = create_test_record_id(
+            &context,
+            AgentKind::Codex,
+            None,
+            Some("ignore-cross-boot-cgroup-member"),
+        );
+        let mut pane = TestProcessGroup::spawn();
+        let pane_identity = super::read_linux_process_identity(pane.pid() as libc::pid_t)
+            .unwrap()
+            .expect("live test process");
+        let member = TmuxProcessIdentity {
+            pid: pane_identity.pid,
+            start_time: pane_identity.start_time,
+        };
+        let other_boot_id = "00000000-0000-0000-0000-000000000000";
+        assert_ne!(super::linux_boot_id().unwrap(), other_boot_id);
+        let mut record = load_session_record(&context, &id).unwrap();
+        let identity = TmuxRuntimeIdentity {
+            launch_id: Some(record.runtime.as_ref().unwrap().launch_id.clone()),
+            session_id: "$91".to_string(),
+            pane_id: "%91".to_string(),
+            pane_pid: member.pid,
+            process_group_id: Some(pane.process_group_id),
+            process_session_id: Some(pane_identity.session_id),
+            process_session_members: Vec::new(),
+            control_group_members: vec![member],
+            control_group: Some(super::TmuxControlGroupIdentity {
+                path: "/user.slice/user-1000.slice/user@1000.service/app.slice/tmux-spawn-6302a262-c059-4ec9-9b93-1318f3b50a3f.scope".to_string(),
+                device: 1,
+                inode: 1,
+                boot_id: Some(other_boot_id.to_string()),
+            }),
+        };
+        persist_tmux_runtime_identity(&mut record, &identity).unwrap();
+        super::set_tmux_termination_state(
+            &mut record,
+            super::TmuxTerminationState::KillConfirmed {
+                thaw_on_recovery: false,
+            },
+        )
+        .unwrap();
+        write_session_record(&context, &record).unwrap();
+
+        super::recover_interrupted_tmux_terminations_at_cgroup_root(
+            &context,
+            &tmp.path().join("missing-cgroup-root"),
+        )
+        .unwrap();
+
+        assert_eq!(unsafe { libc::kill(pane.pid() as libc::pid_t, 0) }, 0);
+        let recovered = load_session_record(&context, &id).unwrap();
+        assert_eq!(
+            super::persisted_tmux_termination_state(&recovered).unwrap(),
+            Some(super::TmuxTerminationState::KillConfirmed {
+                thaw_on_recovery: false,
+            })
+        );
+        pane.stop();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cross_boot_pending_recovery_converges_without_signaling_a_reused_identity() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let context = test_context(tmp.path());
+        let id = create_test_record_id(
+            &context,
+            AgentKind::Codex,
+            None,
+            Some("converge-cross-boot-pending"),
+        );
+        let mut pane = TestProcessGroup::spawn();
+        let pane_identity = super::read_linux_process_identity(pane.pid() as libc::pid_t)
+            .unwrap()
+            .expect("live test process");
+        let other_boot_id = "00000000-0000-0000-0000-000000000000";
+        assert_ne!(super::linux_boot_id().unwrap(), other_boot_id);
+        let mut record = load_session_record(&context, &id).unwrap();
+        let launch_id = record.runtime.as_ref().unwrap().launch_id.clone();
+        persist_tmux_runtime_identity(
+            &mut record,
+            &TmuxRuntimeIdentity {
+                launch_id: Some(launch_id),
+                session_id: "$91".to_string(),
+                pane_id: "%91".to_string(),
+                pane_pid: pane_identity.pid,
+                process_group_id: Some(pane.process_group_id),
+                process_session_id: Some(pane_identity.session_id),
+                process_session_members: Vec::new(),
+                control_group_members: vec![TmuxProcessIdentity {
+                    pid: pane_identity.pid,
+                    start_time: pane_identity.start_time,
+                }],
+                control_group: Some(super::TmuxControlGroupIdentity {
+                    path: "/user.slice/user-1000.slice/user@1000.service/app.slice/tmux-spawn-6302a262-c059-4ec9-9b93-1318f3b50a3f.scope".to_string(),
+                    device: 1,
+                    inode: 1,
+                    boot_id: Some(other_boot_id.to_string()),
+                }),
+            },
+        )
+        .unwrap();
+        super::set_tmux_termination_state(
+            &mut record,
+            super::TmuxTerminationState::Pending {
+                thaw_on_recovery: true,
+            },
+        )
+        .unwrap();
+        write_session_record(&context, &record).unwrap();
+
+        super::recover_interrupted_tmux_terminations_at_cgroup_root(
+            &context,
+            &tmp.path().join("missing-cgroup-root"),
+        )
+        .unwrap();
+        assert_eq!(unsafe { libc::kill(pane.pid() as libc::pid_t, 0) }, 0);
+        let recovered = load_session_record(&context, &id).unwrap();
+        assert_eq!(
+            super::persisted_tmux_termination_state(&recovered).unwrap(),
+            Some(super::TmuxTerminationState::KillConfirmed {
+                thaw_on_recovery: false,
+            })
+        );
+
+        let tmux = tmp.path().join("tmux-cross-boot-stopped");
+        fs::write(
+            &tmux,
+            "#!/bin/sh\nprintf '%s\n' \"can't find session: $91\" >&2\nexit 1\n",
+        )
+        .unwrap();
+        fs::set_permissions(&tmux, fs::Permissions::from_mode(0o700)).unwrap();
+        let result = delete_session_with_timeouts(
+            &context,
+            &id,
+            tmux,
+            Duration::from_millis(50),
+            Duration::from_millis(250),
+        )
+        .unwrap();
+
+        assert!(result.deleted);
+        assert!(!session_dir(&context, &id).exists());
+        assert_eq!(unsafe { libc::kill(pane.pid() as libc::pid_t, 0) }, 0);
+        pane.stop();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_process_pin_rejects_a_reused_numeric_pid_identity() {
+        let pane = TestProcessGroup::spawn();
+        let mut expected = super::read_linux_process_identity(pane.pid() as libc::pid_t)
+            .unwrap()
+            .expect("live process identity");
+        expected.start_time = expected.start_time.saturating_add(1);
+        let captured = TmuxProcessIdentity {
+            pid: expected.pid,
+            start_time: expected.start_time,
+        };
+
+        assert_eq!(
+            super::pin_linux_process(&captured, expected.session_id).unwrap_err(),
+            super::SessionTerminationFailure::VerificationFailed
+        );
+        assert!(
+            super::pin_matching_linux_process(&captured)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(unsafe { libc::kill(pane.pid() as libc::pid_t, 0) }, 0);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn frozen_cgroup_stabilization_accumulates_a_late_member() {
+        let mut snapshots = 0;
+        let pids = super::stabilize_linux_control_group_pids(
+            vec![91],
+            Duration::from_millis(5),
+            Duration::from_millis(1),
+            Instant::now() + Duration::from_millis(100),
+            |_| {
+                snapshots += 1;
+                Ok(if snapshots == 1 {
+                    vec![91, 92]
+                } else {
+                    vec![91, 92, 92]
+                })
+            },
+        )
+        .unwrap();
+
+        assert!(snapshots >= 1);
+        assert_eq!(pids, vec![91, 92]);
+    }
+
+    #[test]
+    fn same_runtime_retry_merges_durable_control_group_members() {
+        let mut current = TmuxRuntimeIdentity {
+            launch_id: Some("launch-member-merge".to_string()),
+            session_id: "$91".to_string(),
+            pane_id: "%91".to_string(),
+            pane_pid: 91,
+            process_group_id: Some(91),
+            process_session_id: Some(91),
+            process_session_members: vec![TmuxProcessIdentity {
+                pid: 91,
+                start_time: 910,
+            }],
+            control_group_members: vec![TmuxProcessIdentity {
+                pid: 92,
+                start_time: 920,
+            }],
+            control_group: None,
+        };
+        let mut persisted = current.clone();
+        persisted.process_session_members.push(TmuxProcessIdentity {
+            pid: 94,
+            start_time: 940,
+        });
+        persisted.control_group_members = vec![
+            TmuxProcessIdentity {
+                pid: 93,
+                start_time: 930,
+            },
+            TmuxProcessIdentity {
+                pid: 92,
+                start_time: 920,
+            },
+        ];
+
+        current.merge_process_evidence_from(&persisted);
+
+        assert_eq!(
+            current.control_group_members,
+            vec![
+                TmuxProcessIdentity {
+                    pid: 92,
+                    start_time: 920,
+                },
+                TmuxProcessIdentity {
+                    pid: 93,
+                    start_time: 930,
+                },
+            ]
+        );
+        assert_eq!(
+            current.process_session_members,
+            vec![TmuxProcessIdentity {
+                pid: 91,
+                start_time: 910,
+            }],
+            "fresh process-session membership must not retain exited historical members"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_process_session_pin_rejects_an_uncaptured_member() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let descendant_pid_path = tmp.path().join("uncaptured-descendant.pid");
+        let pane = ReapedTestProcessGroup::spawn_tree(&descendant_pid_path);
+        let descendant_pid: libc::pid_t = fs::read_to_string(descendant_pid_path)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let leader = super::read_linux_process_identity(pane.pid() as libc::pid_t)
+            .unwrap()
+            .expect("live session leader");
+        let identity = TmuxRuntimeIdentity {
+            launch_id: Some("launch-uncaptured-member".to_string()),
+            session_id: "$91".to_string(),
+            pane_id: "%91".to_string(),
+            pane_pid: pane.pid() as libc::pid_t,
+            process_group_id: Some(pane.process_group_id),
+            process_session_id: Some(leader.session_id),
+            process_session_members: vec![TmuxProcessIdentity {
+                pid: leader.pid,
+                start_time: leader.start_time,
+            }],
+            control_group_members: Vec::new(),
+            control_group: None,
+        };
+
+        assert_eq!(
+            super::verify_captured_linux_process_session(
+                leader.session_id,
+                &identity.process_session_members,
+            )
+            .unwrap_err(),
+            super::SessionTerminationFailure::VerificationFailed
+        );
+        assert_eq!(unsafe { libc::kill(leader.pid, 0) }, 0);
+        assert_eq!(unsafe { libc::kill(descendant_pid, 0) }, 0);
+    }
+
     fn deletion_identity_script(
         context: &CliContext,
         record: &super::SessionRecord,
@@ -7248,6 +10640,25 @@ fi
             id = shell_words::quote(&record.id),
             state_dir = shell_words::quote(&super::display_path(&context.state_dir)),
             runtime_id = shell_words::quote(runtime_id),
+        )
+    }
+
+    fn terminate_without_process_runtime_for_test(
+        context: &CliContext,
+        id: &str,
+        tmux: &Path,
+        kill_timeout: Duration,
+        verify_timeout: Duration,
+    ) -> Result<(), super::SessionTerminationFailure> {
+        let mut record = load_session_record(context, id).unwrap();
+        super::terminate_tmux_session_with_timeouts(
+            context,
+            &mut record,
+            tmux,
+            None,
+            kill_timeout,
+            verify_timeout,
+            false,
         )
     }
 
@@ -7699,18 +11110,16 @@ fi
         .unwrap();
         fs::set_permissions(&tmux, fs::Permissions::from_mode(0o700)).unwrap();
 
-        let error = delete_session_with_timeouts(
+        let error = terminate_without_process_runtime_for_test(
             &context,
             &id,
-            tmux,
-            Duration::from_millis(50),
+            &tmux,
+            Duration::from_millis(250),
             Duration::from_millis(75),
         )
-        .unwrap_err()
-        .into_inner();
+        .unwrap_err();
 
-        assert_eq!(error.code, "session-termination-failed");
-        assert_eq!(error.details.unwrap()["reason"], "kill-timeout");
+        assert_eq!(error, super::SessionTerminationFailure::KillTimeout);
         assert!(session_dir(&context, &id).exists());
         assert_eq!(
             load_session_record(&context, &id).unwrap().tmux_session,
@@ -7743,31 +11152,33 @@ fi
         .unwrap();
         fs::set_permissions(&tmux, fs::Permissions::from_mode(0o700)).unwrap();
 
-        let error = delete_session_with_timeouts(
+        let error = terminate_without_process_runtime_for_test(
             &context,
             &id,
-            tmux,
+            &tmux,
             Duration::from_millis(50),
             Duration::from_millis(75),
         )
-        .unwrap_err()
-        .into_inner();
+        .unwrap_err();
 
-        assert_eq!(error.details.unwrap()["reason"], "kill-timeout");
+        assert_eq!(error, super::SessionTerminationFailure::KillTimeout);
         let descendant_pid: libc::pid_t = fs::read_to_string(&descendant_pid)
             .expect("descendant pid")
             .trim()
             .parse()
             .expect("numeric descendant pid");
         let started_at = Instant::now();
-        while unsafe { libc::kill(descendant_pid, 0) } == 0
-            && started_at.elapsed() < Duration::from_secs(2)
-        {
+        let stopped = loop {
+            if unsafe { libc::kill(descendant_pid, 0) } < 0 {
+                break io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH);
+            }
+            if started_at.elapsed() >= Duration::from_secs(2) {
+                break false;
+            }
             thread::sleep(Duration::from_millis(10));
-        }
-        assert_eq!(
-            io::Error::last_os_error().raw_os_error(),
-            Some(libc::ESRCH),
+        };
+        assert!(
+            stopped,
             "the timed-out tmux wrapper descendant must not survive"
         );
         assert!(session_dir(&context, &id).exists());
@@ -7780,30 +11191,29 @@ fi
         let id =
             create_test_record_id(&context, AgentKind::Claude, None, Some("delete-still-live"));
         let record = load_session_record(&context, &id).unwrap();
-        let pane = TestProcessGroup::spawn();
+        let pane = ReapedTestProcessGroup::spawn();
         let tmux = tmp.path().join("tmux-still-live");
         fs::write(
             &tmux,
             format!(
-                "#!/bin/sh\n{}exit 0\n",
-                deletion_identity_script(&context, &record, pane.pid())
+                "#!/bin/sh\n{}if [ \"$1\" = if-shell ]; then /bin/kill -KILL -- -{} 2>/dev/null || true; sleep 0.05; fi\nexit 0\n",
+                deletion_identity_script(&context, &record, pane.pid()),
+                pane.pid(),
             ),
         )
         .unwrap();
         fs::set_permissions(&tmux, fs::Permissions::from_mode(0o700)).unwrap();
 
-        let error = delete_session_with_timeouts(
+        let error = terminate_without_process_runtime_for_test(
             &context,
             &id,
-            tmux,
-            Duration::from_millis(50),
-            Duration::from_millis(75),
+            &tmux,
+            Duration::from_millis(250),
+            Duration::from_secs(1),
         )
-        .unwrap_err()
-        .into_inner();
+        .unwrap_err();
 
-        assert_eq!(error.code, "session-termination-failed");
-        assert_eq!(error.details.unwrap()["reason"], "session-still-running");
+        assert_eq!(error, super::SessionTerminationFailure::StillRunning);
         assert!(session_dir(&context, &id).exists());
     }
 
@@ -7813,30 +11223,29 @@ fi
         let context = test_context(tmp.path());
         let id = create_test_record_id(&context, AgentKind::Codex, None, Some("delete-unverified"));
         let record = load_session_record(&context, &id).unwrap();
-        let pane = TestProcessGroup::spawn();
+        let pane = ReapedTestProcessGroup::spawn();
         let tmux = tmp.path().join("tmux-unverified");
         fs::write(
             &tmux,
             format!(
-                "#!/bin/sh\n{}if [ \"$1\" = if-shell ]; then exit 0; fi\nexit 42\n",
-                deletion_identity_script(&context, &record, pane.pid())
+                "#!/bin/sh\n{}if [ \"$1\" = if-shell ]; then /bin/kill -KILL -- -{} 2>/dev/null || true; sleep 0.05; exit 0; fi\nexit 42\n",
+                deletion_identity_script(&context, &record, pane.pid()),
+                pane.pid(),
             ),
         )
         .unwrap();
         fs::set_permissions(&tmux, fs::Permissions::from_mode(0o700)).unwrap();
 
-        let error = delete_session_with_timeouts(
+        let error = terminate_without_process_runtime_for_test(
             &context,
             &id,
-            tmux,
-            Duration::from_millis(50),
+            &tmux,
+            Duration::from_millis(250),
             Duration::from_millis(75),
         )
-        .unwrap_err()
-        .into_inner();
+        .unwrap_err();
 
-        assert_eq!(error.code, "session-termination-failed");
-        assert_eq!(error.details.unwrap()["reason"], "verification-failed");
+        assert_eq!(error, super::SessionTerminationFailure::VerificationFailed);
         assert!(session_dir(&context, &id).exists());
     }
 
@@ -7846,7 +11255,7 @@ fi
         let context = test_context(tmp.path());
         let id = create_test_record_id(&context, AgentKind::Codex, None, Some("delete-retry"));
         let record = load_session_record(&context, &id).unwrap();
-        let mut pane = TestProcessGroup::spawn();
+        let mut pane = ReapedTestProcessGroup::spawn();
         let tmux = tmp.path().join("tmux-retry");
         let killed = tmp.path().join("killed");
         let report_stopped = tmp.path().join("report-stopped");
@@ -7864,42 +11273,225 @@ fi
         .unwrap();
         fs::set_permissions(&tmux, fs::Permissions::from_mode(0o700)).unwrap();
 
-        let first_error = delete_session_with_timeouts(
+        let first_error = terminate_without_process_runtime_for_test(
             &context,
             &id,
-            tmux.clone(),
+            &tmux,
             Duration::from_millis(50),
             Duration::from_millis(75),
         )
-        .unwrap_err()
-        .into_inner();
-        assert_eq!(first_error.code, "session-termination-failed");
+        .unwrap_err();
         assert_eq!(
-            first_error.details.unwrap()["reason"],
-            "verification-failed"
+            first_error,
+            super::SessionTerminationFailure::VerificationFailed
         );
         assert!(session_dir(&context, &id).exists());
 
         pane.stop();
         fs::write(&report_stopped, "stopped").unwrap();
-        let result = delete_session_with_timeouts(
+        terminate_without_process_runtime_for_test(
             &context,
             &id,
-            tmux,
+            &tmux,
             Duration::from_millis(50),
             Duration::from_millis(75),
         )
         .unwrap();
 
-        assert!(result.killed);
-        assert!(result.deleted);
-        assert!(!session_dir(&context, &id).exists());
+        assert!(session_dir(&context, &id).exists());
         let calls = fs::read_to_string(calls).unwrap();
         assert_eq!(calls.matches("if-shell").count(), 1, "{calls}");
         assert!(
             calls.contains("if-shell -F -t %91") && calls.contains("kill-session -t $91"),
             "conditional kill must bind the captured immutable pane and session ids: {calls}"
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn delete_fails_closed_for_live_descendants_without_a_control_group() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let context = test_context(tmp.path());
+        let id = create_test_record_id(
+            &context,
+            AgentKind::Codex,
+            None,
+            Some("delete-runtime-descendants"),
+        );
+        let record = load_session_record(&context, &id).unwrap();
+        let descendant_pid_path = tmp.path().join("runtime-descendant.pid");
+        let pane = ReapedTestProcessGroup::spawn_tree(&descendant_pid_path);
+        let descendant_pid: libc::pid_t = fs::read_to_string(&descendant_pid_path)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        assert_eq!(unsafe { libc::getpgid(descendant_pid) }, descendant_pid);
+        assert_eq!(
+            unsafe { libc::getsid(descendant_pid) },
+            pane.pid() as libc::pid_t
+        );
+        let tmux = tmp.path().join("tmux-runtime-descendants");
+        let killed = tmp.path().join("tmux-killed");
+        fs::write(
+            &tmux,
+            format!(
+                "#!/bin/sh\n{identity}if [ \"$1\" = has-session ]; then\n  if [ -f {killed} ]; then printf \"%s\\n\" \"can't find session: $91\" >&2; exit 1; fi\n  exit 0\nfi\nif [ \"$1\" = if-shell ]; then : > {killed}; exit 0; fi\nexit 42\n",
+                identity = deletion_identity_script(&context, &record, pane.pid()),
+                killed = killed.display(),
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&tmux, fs::Permissions::from_mode(0o700)).unwrap();
+
+        let error = delete_session_with_timeouts(
+            &context,
+            &id,
+            tmux,
+            Duration::from_millis(50),
+            Duration::from_secs(1),
+        )
+        .unwrap_err()
+        .into_inner();
+
+        assert_eq!(
+            error.details.unwrap()["reason"],
+            "runtime-identity-unavailable"
+        );
+        assert!(session_dir(&context, &id).exists());
+        assert!(
+            !killed.is_file(),
+            "tmux must remain untouched without a cgroup"
+        );
+        assert_eq!(unsafe { libc::kill(descendant_pid, 0) }, 0);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn delete_fails_closed_when_a_pinned_member_escapes_without_a_control_group() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let context = test_context(tmp.path());
+        let id = create_test_record_id(
+            &context,
+            AgentKind::Codex,
+            None,
+            Some("delete-runtime-session-escape"),
+        );
+        let record = load_session_record(&context, &id).unwrap();
+        let descendant_pid_path = tmp.path().join("escaping-descendant.pid");
+        let escape_trigger = tmp.path().join("escape.trigger");
+        let escaped_marker = tmp.path().join("escaped.marker");
+        let pane = ReapedTestProcessGroup::spawn_escaping_tree(
+            &descendant_pid_path,
+            &escape_trigger,
+            &escaped_marker,
+        );
+        let descendant_pid: libc::pid_t = fs::read_to_string(&descendant_pid_path)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        assert_eq!(
+            unsafe { libc::getsid(descendant_pid) },
+            pane.pid() as libc::pid_t
+        );
+        let tmux = tmp.path().join("tmux-runtime-session-escape");
+        let killed = tmp.path().join("tmux-killed");
+        fs::write(
+            &tmux,
+            format!(
+                "#!/bin/sh\n{identity}if [ \"$1\" = has-session ]; then\n  if [ -f {killed} ]; then printf \"%s\\n\" \"can't find session: $91\" >&2; exit 1; fi\n  exit 0\nfi\nif [ \"$1\" = if-shell ]; then\n  : > {escape_trigger}\n  while [ ! -f {escaped_marker} ]; do sleep 0.01; done\n  : > {killed}\n  exit 0\nfi\nexit 42\n",
+                identity = deletion_identity_script(&context, &record, pane.pid()),
+                killed = killed.display(),
+                escape_trigger = escape_trigger.display(),
+                escaped_marker = escaped_marker.display(),
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&tmux, fs::Permissions::from_mode(0o700)).unwrap();
+
+        let error = delete_session_with_timeouts(
+            &context,
+            &id,
+            tmux,
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+        )
+        .unwrap_err()
+        .into_inner();
+
+        assert!(
+            !escaped_marker.is_file(),
+            "delete must fail before opening a runtime escape window"
+        );
+        assert_eq!(
+            error.details.unwrap()["reason"],
+            "runtime-identity-unavailable"
+        );
+        assert!(session_dir(&context, &id).exists());
+        assert!(
+            !killed.is_file(),
+            "tmux must remain untouched without a cgroup"
+        );
+        assert_eq!(unsafe { libc::kill(descendant_pid, 0) }, 0);
+    }
+
+    #[test]
+    fn delete_retry_finishes_from_kill_confirmed_after_process_stop() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let context = test_context(tmp.path());
+        let id = create_test_record_id(
+            &context,
+            AgentKind::Codex,
+            None,
+            Some("delete-kill-confirmed-retry"),
+        );
+        let mut record = load_session_record(&context, &id).unwrap();
+        let mut pane = TestProcessGroup::spawn();
+        let identity = TmuxRuntimeIdentity {
+            launch_id: Some(record.runtime.as_ref().unwrap().launch_id.clone()),
+            session_id: "$91".to_string(),
+            pane_id: "%91".to_string(),
+            pane_pid: pane.pid() as libc::pid_t,
+            process_group_id: Some(pane.process_group_id),
+            process_session_id: super::process_session_id(pane.pid() as libc::pid_t).unwrap(),
+            process_session_members: super::process_session_members(
+                super::process_session_id(pane.pid() as libc::pid_t).unwrap(),
+                pane.pid() as libc::pid_t,
+            )
+            .unwrap(),
+            control_group_members: Vec::new(),
+            control_group: None,
+        };
+        persist_tmux_runtime_identity(&mut record, &identity).unwrap();
+        super::set_tmux_termination_state(
+            &mut record,
+            super::TmuxTerminationState::KillConfirmed {
+                thaw_on_recovery: false,
+            },
+        )
+        .unwrap();
+        write_session_record(&context, &record).unwrap();
+        pane.stop();
+        let tmux = tmp.path().join("tmux-kill-confirmed-retry");
+        fs::write(
+            &tmux,
+            "#!/bin/sh\nif [ \"$1\" = display-message ] || [ \"$1\" = has-session ]; then printf \"%s\\n\" \"can't find session: $91\" >&2; exit 1; fi\nexit 42\n",
+        )
+        .unwrap();
+        fs::set_permissions(&tmux, fs::Permissions::from_mode(0o700)).unwrap();
+
+        let result = delete_session_with_timeouts(
+            &context,
+            &id,
+            tmux,
+            Duration::from_millis(50),
+            Duration::from_millis(150),
+        )
+        .unwrap();
+
+        assert!(result.deleted);
+        assert!(!session_dir(&context, &id).exists());
     }
 
     #[test]
@@ -7920,6 +11512,14 @@ fi
             pane_id: "%91".to_string(),
             pane_pid: pane.pid() as libc::pid_t,
             process_group_id: Some(pane.process_group_id),
+            process_session_id: super::process_session_id(pane.pid() as libc::pid_t).unwrap(),
+            process_session_members: super::process_session_members(
+                super::process_session_id(pane.pid() as libc::pid_t).unwrap(),
+                pane.pid() as libc::pid_t,
+            )
+            .unwrap(),
+            control_group_members: Vec::new(),
+            control_group: None,
         };
         persist_tmux_runtime_identity(&mut record, &identity).unwrap();
         write_session_record(&context, &record).unwrap();
