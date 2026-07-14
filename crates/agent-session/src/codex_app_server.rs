@@ -504,7 +504,7 @@ if ! (umask 077; mkfifo "$provider_stderr_pipe"); then
 fi
 tee "$startup_diagnostic_pipe" < "$provider_stderr_pipe" >&2 &
 provider_stderr_pid=$!
-"$agent" --remote "unix://$proxy" --cd "$cwd" --no-alt-screen "$@" 2>"$provider_stderr_pipe"
+"$agent" -c check_for_update_on_startup=false --remote "unix://$proxy" --cd "$cwd" --no-alt-screen "$@" 2>"$provider_stderr_pipe"
 status=$?
 wait "$provider_stderr_pid" 2>/dev/null || true
 provider_stderr_pid=
@@ -3218,7 +3218,7 @@ exit 1
     fn launch_routes_the_visible_tui_through_the_private_proxy() {
         let script = launch_script();
         assert!(script.contains("codex-app-server-proxy"));
-        assert!(script.contains("\"$agent\" --remote \"unix://$proxy\""));
+        assert!(script.contains("--remote \"unix://$proxy\""));
         assert!(!script.contains("--remote \"unix://$socket\""));
         assert!(!script.contains("thread/shellCommand"));
         assert!(script.contains(".startup-stage"));
@@ -3238,6 +3238,14 @@ exit 1
             .collect::<Vec<_>>();
         assert!(!cleanup_lines[0].contains("$handoff"));
         assert!(cleanup_lines[1].contains("$handoff"));
+    }
+
+    #[test]
+    fn managed_codex_client_launch_disables_startup_update_check_without_dropping_arguments() {
+        let script = launch_script();
+        assert!(script.contains(
+            "\"$agent\" -c check_for_update_on_startup=false --remote \"unix://$proxy\" --cd \"$cwd\" --no-alt-screen \"$@\""
+        ));
     }
 
     #[test]
