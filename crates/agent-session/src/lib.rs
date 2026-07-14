@@ -3305,7 +3305,7 @@ fn normalize_title_state(mut state: SessionTitleState) -> Result<SessionTitleSta
     }
     let mut normalized_references = Vec::with_capacity(state.references.len());
     for reference in state.references {
-        let reference = reference.trim().to_string();
+        let reference = reference.trim_matches(is_javascript_whitespace).to_string();
         let number = reference.strip_prefix('#').unwrap_or_default();
         if number.is_empty()
             || number.starts_with('0')
@@ -5628,6 +5628,25 @@ mod tests {
 
         assert_eq!(err.0.code, "invalid-title-state");
         assert_eq!(consumed.get(), super::SESSION_TITLE_MAX_CHARS + 1);
+    }
+
+    #[test]
+    fn structured_title_references_use_javascript_edge_whitespace() {
+        let make_state = |reference: &str| super::SessionTitleState {
+            topic: None,
+            topic_source: super::SessionTitleTopicSource::None,
+            references: vec![reference.to_string()],
+            activity: None,
+            extra: std::collections::BTreeMap::new(),
+        };
+
+        let err = super::normalize_title_state(make_state("\u{0085}#317\u{0085}"))
+            .expect_err("JavaScript preserves U+0085, so the strict reference grammar rejects it");
+        assert_eq!(err.0.code, "invalid-title-state");
+
+        let normalized = super::normalize_title_state(make_state("\u{00a0}#317\u{00a0}"))
+            .expect("JavaScript trims non-breaking space");
+        assert_eq!(normalized.references, vec!["#317"]);
     }
 
     #[test]
