@@ -8554,6 +8554,8 @@ mod tests {
     use std::fs;
     use std::io;
     #[cfg(target_os = "linux")]
+    use std::io::BufRead as _;
+    #[cfg(target_os = "linux")]
     use std::os::unix::fs::MetadataExt;
     use std::os::unix::fs::PermissionsExt;
     use std::os::unix::process::CommandExt;
@@ -9158,7 +9160,7 @@ mod tests {
         fs::write(
             &wrapper,
             format!(
-                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> {}\nif [ \"$1\" = new-session ]; then exec {} --user --scope --quiet --collect --unit {} -- {} -L {} \"$@\"; fi\nexec {} -L {} \"$@\"\n",
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> {}\nif [ \"$1\" = new-session ]; then exec {} --user --scope --quiet --collect --unit {} -- {} -f /dev/null -L {} \"$@\"; fi\nexec {} -f /dev/null -L {} \"$@\"\n",
                 shell_words::quote(&super::display_path(&wrapper_calls)),
                 shell_words::quote(&super::display_path(&systemd_run)),
                 shell_words::quote(&scope),
@@ -9176,7 +9178,10 @@ mod tests {
         let descendant_trigger_path = tmp.path().join("detached-descendant.trigger");
         let descendant_pid_path = tmp.path().join("detached-descendant.pid");
         let runtime_id = &record.runtime.as_ref().unwrap().launch_id;
-        let output = Command::new(&wrapper)
+        let scope_anchor_channel =
+            format!("nils-delete-cgroup-anchor-{}", unsafe { libc::getpid() });
+        let mut scope_anchor = Command::new(&wrapper);
+        scope_anchor
             .arg("new-session")
             .arg("-d")
             .arg("-P")
@@ -9198,6 +9203,9 @@ mod tests {
             .arg("--exact")
             .arg("tests::control_group_detached_descendant_helper")
             .arg("--nocapture")
+            .arg(";")
+            .arg("wait-for")
+            .arg(&scope_anchor_channel)
             .env(
                 "AGENT_SESSION_TEST_CGROUP_DESCENDANT_TRIGGER",
                 &descendant_trigger_path,
@@ -9206,26 +9214,62 @@ mod tests {
                 "AGENT_SESSION_TEST_CGROUP_DESCENDANT_PID",
                 &descendant_pid_path,
             )
-            .output()
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut scope_anchor = scope_anchor.spawn().unwrap();
+        let mut output = String::new();
+        let output_length = io::BufReader::new(scope_anchor.stdout.take().unwrap())
+            .read_line(&mut output)
             .unwrap();
         assert!(
-            output.status.success(),
-            "tmux launch failed: {}",
-            String::from_utf8_lossy(&output.stderr)
+            output_length > 0,
+            "tmux scope anchor exited before publishing pane identity: status={:?}",
+            scope_anchor.try_wait()
         );
-        let output = String::from_utf8(output.stdout).unwrap();
         let mut output_fields = output.trim().split('\t');
         let tmux_session_id = output_fields.next().unwrap().to_string();
         let tmux_pane_id = output_fields.next().unwrap().to_string();
         let pane_pid: libc::pid_t = output_fields.next().unwrap().parse().unwrap();
-        let Some(control_group) = super::linux_process_control_group(pane_pid).unwrap() else {
-            eprintln!("SKIP: tmux did not create a distinct tmux-spawn cgroup scope");
+        let containment_started_at = Instant::now();
+        let mut observed_control_group = None;
+        let mut observed_since = Instant::now();
+        let control_group = loop {
+            let current = super::linux_process_control_group(pane_pid).unwrap();
+            if current != observed_control_group {
+                observed_control_group = current;
+                observed_since = Instant::now();
+            } else if observed_since.elapsed() >= Duration::from_millis(500) {
+                let Some(control_group) = observed_control_group else {
+                    scope_anchor.kill().unwrap();
+                    scope_anchor.wait().unwrap();
+                    panic!("required cgroup test must exercise a dedicated tmux cgroup path");
+                };
+                break control_group;
+            }
             assert!(
-                !require_cgroup,
-                "required cgroup test must exercise the dedicated tmux cgroup path"
+                containment_started_at.elapsed() < Duration::from_secs(3),
+                "tmux pane never reached stable cgroup containment: {observed_control_group:?}"
             );
-            return;
+            thread::sleep(Duration::from_millis(10));
         };
+        let mut retained_identity = match super::capture_tmux_runtime_identity(
+            &context,
+            &record,
+            &wrapper,
+            Duration::from_secs(1),
+        )
+        .unwrap()
+        {
+            super::TmuxRuntimeProbe::Running(identity) => *identity,
+            super::TmuxRuntimeProbe::Stopped => panic!("tmux runtime must still be running"),
+        };
+        assert_eq!(retained_identity.session_id, tmux_session_id);
+        assert_eq!(retained_identity.pane_id, tmux_pane_id);
+        assert_eq!(
+            retained_identity.control_group.as_ref(),
+            Some(&control_group),
+            "captured runtime identity must retain the stabilized pane cgroup"
+        );
         fs::write(&descendant_trigger_path, "spawn").unwrap();
         let started_at = Instant::now();
         let descendant_pid: libc::pid_t = loop {
@@ -9262,7 +9306,8 @@ mod tests {
             }
             assert!(
                 membership_started.elapsed() < Duration::from_secs(2),
-                "detached descendant never entered the pane's dedicated cgroup"
+                "detached descendant never entered the pane's dedicated cgroup: pane={control_group:?}, descendant={:?}",
+                super::linux_process_control_group(descendant_pid),
             );
             thread::sleep(Duration::from_millis(10));
         }
@@ -9281,19 +9326,6 @@ mod tests {
             "the retained member must model a process that already left the pane cgroup"
         );
         let mut retained = load_session_record(&context, &id).unwrap();
-        let mut retained_identity = match super::capture_tmux_runtime_identity(
-            &context,
-            &retained,
-            &wrapper,
-            Duration::from_secs(1),
-        )
-        .unwrap()
-        {
-            super::TmuxRuntimeProbe::Running(identity) => *identity,
-            super::TmuxRuntimeProbe::Stopped => panic!("tmux runtime must still be running"),
-        };
-        assert_eq!(retained_identity.session_id, tmux_session_id);
-        assert_eq!(retained_identity.pane_id, tmux_pane_id);
         retained_identity.control_group_members = vec![
             TmuxProcessIdentity {
                 pid: descendant_pid,
@@ -9379,6 +9411,25 @@ mod tests {
             "a same-boot Pending retry must kill a retained member outside the cgroup"
         );
         escaped_member.stop();
+        let _ = Command::new(&wrapper)
+            .arg("wait-for")
+            .arg("-S")
+            .arg(&scope_anchor_channel)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+        let anchor_started_at = Instant::now();
+        loop {
+            if scope_anchor.try_wait().unwrap().is_some() {
+                break;
+            }
+            if anchor_started_at.elapsed() >= Duration::from_secs(2) {
+                scope_anchor.kill().unwrap();
+                scope_anchor.wait().unwrap();
+                panic!("the cgroup scope anchor did not exit after deletion cleanup");
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
     }
 
     #[cfg(target_os = "linux")]
