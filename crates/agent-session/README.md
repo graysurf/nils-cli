@@ -43,11 +43,13 @@ remain usable from a phone.
 latest provider conversation implicitly. Runtime metadata is persisted before launch so hooks see the new generation;
 if tmux launch fails, the prior runtime and activity snapshot are restored. `send` bumps `updated_at`, so `list` orders
 by real control-plane activity.
-`delete` removes provider runtime files and session metadata only after a bounded exact-target check verifies that the
-recorded tmux session is stopped. A running session must first pass `tmux kill-session` and the post-kill check; an already
-stopped exact session can resume cleanup without another kill. Kill or verification failures retain the session state so
-callers can retry safely. Human success output reports the verified stopped state; the v1 JSON `killed: true` field remains
-stable for successful deletion.
+`delete` removes provider runtime files and session metadata only after bounded checks verify the recorded runtime is
+stopped. Before killing a live runtime, it captures the immutable tmux session id and pane process group, validates the
+runtime's `AGENT_SESSION_*` ownership markers, and persists that identity for retry. It then targets only the captured tmux
+session id and requires both tmux and the process group to be gone. A retry can finish cleanup without another kill only
+when that persisted identity verifies stopped. Kill failures, ambiguous tmux errors, ownership mismatches, and surviving
+processes retain all session state so callers can retry safely. Human success output reports the verified stopped state;
+the v1 JSON `killed: true` field remains stable for successful deletion.
 `--agent hermes` launches `hermes chat` interactively (one-shot `run` mode is codex/claude only).
 
 ## Durable turn state

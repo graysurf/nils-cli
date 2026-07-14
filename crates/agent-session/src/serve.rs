@@ -5175,12 +5175,50 @@ mod tests {
     use std::fs;
     use std::io::Write;
     use std::os::unix::fs::{FileTypeExt, PermissionsExt, symlink};
+    use std::os::unix::process::CommandExt;
     use tokio_tungstenite::connect_async;
     use tokio_tungstenite::tungstenite::{Message as ClientMessage, client::IntoClientRequest};
     use tower::ServiceExt;
 
     const MACHINE: &str = "test-machine";
     const TOKEN: &str = "s3cr3t-token";
+
+    struct TestProcessGroup {
+        child: Option<std::process::Child>,
+        process_group_id: libc::pid_t,
+    }
+
+    impl TestProcessGroup {
+        fn spawn() -> Self {
+            let child = std::process::Command::new("sleep")
+                .arg("30")
+                .process_group(0)
+                .spawn()
+                .expect("spawn test process group");
+            let process_group_id = child.id() as libc::pid_t;
+            Self {
+                child: Some(child),
+                process_group_id,
+            }
+        }
+
+        fn pid(&self) -> u32 {
+            self.child.as_ref().expect("live test child").id()
+        }
+    }
+
+    impl Drop for TestProcessGroup {
+        fn drop(&mut self) {
+            let Some(mut child) = self.child.take() else {
+                return;
+            };
+            // SAFETY: the child is the leader of a dedicated test-only process group.
+            unsafe {
+                libc::kill(-self.process_group_id, libc::SIGKILL);
+            }
+            let _ = child.wait();
+        }
+    }
 
     #[test]
     fn provider_prompt_subscription_requires_the_versioned_capability() {
@@ -6604,11 +6642,30 @@ mod tests {
         bin
     }
 
-    fn failing_delete_tmux(dir: &Path) -> PathBuf {
+    fn failing_delete_tmux(dir: &Path, state_dir: &Path, id: &str, pane_pid: u32) -> PathBuf {
         let bin = dir.join("failing-delete-tmux");
         std::fs::write(
             &bin,
-            "#!/usr/bin/env sh\ncase \"$1\" in\n  kill-session) exit 42 ;;\n  has-session) exit 0 ;;\n  *) exit 0 ;;\nesac\n",
+            format!(
+                r#"#!/usr/bin/env sh
+case "$1" in
+  display-message) printf '$88\t{pane_pid}\n'; exit 0 ;;
+  show-environment)
+    case "$4" in
+      AGENT_SESSION_ID) printf 'AGENT_SESSION_ID=%s\n' {id} ;;
+      AGENT_SESSION_STATE_DIR) printf 'AGENT_SESSION_STATE_DIR=%s\n' {state_dir} ;;
+      AGENT_SESSION_RUNTIME_ID) printf 'AGENT_SESSION_RUNTIME_ID=%s\n' {runtime_id} ;;
+    esac
+    exit 0 ;;
+  kill-session) exit 42 ;;
+  has-session) exit 0 ;;
+  *) exit 42 ;;
+esac
+"#,
+                id = shell_words::quote(id),
+                state_dir = shell_words::quote(&state_dir.to_string_lossy()),
+                runtime_id = shell_words::quote(&format!("launch-{id}")),
+            ),
         )
         .unwrap();
         let mut perms = std::fs::metadata(&bin).unwrap().permissions();
@@ -12114,12 +12171,13 @@ printf '%s\n' '{"schema_version":"agent-session.codex-auth-broker.v1","accounts"
     #[tokio::test]
     async fn delete_kill_failure_returns_structured_error_and_retains_state() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let tmux = failing_delete_tmux(tmp.path());
 
         for agent in ["codex", "claude"] {
             let id = format!("failed-delete-{agent}");
             let tmux_session = format!("hs-{agent}-failed-delete");
             seed_session_with_runtime(tmp.path(), &id, agent, &tmux_session);
+            let pane = TestProcessGroup::spawn();
+            let tmux = failing_delete_tmux(tmp.path(), tmp.path(), &id, pane.pid());
             let session_dir = tmp.path().join("sessions").join(&id);
             let runtime_metadata = session_dir.join("provider-runtime.json");
             std::fs::write(&runtime_metadata, format!("runtime metadata for {agent}")).unwrap();
@@ -12146,6 +12204,38 @@ printf '%s\n' '{"schema_version":"agent-session.codex-auth-broker.v1","accounts"
                 "{agent} runtime metadata must remain"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn delete_operational_tmux_probe_error_returns_structured_failure() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let tmux = tmp.path().join("operational-error-tmux");
+        std::fs::write(
+            &tmux,
+            "#!/usr/bin/env sh\nprintf '%s\\n' 'error connecting to /tmp/tmux-test/default (No such file or directory)' >&2\nexit 1\n",
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&tmux).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&tmux, permissions).unwrap();
+        let id = "probe-error-codex";
+        seed_session_with_runtime(tmp.path(), id, "codex", "hs-codex-probe-error");
+        let session_dir = tmp.path().join("sessions").join(id);
+        let st = state(tmp.path(), Some(TOKEN), tmux);
+        let request = Request::builder()
+            .method("DELETE")
+            .uri(format!("/sessions/{id}"))
+            .header("authorization", format!("Bearer {TOKEN}"))
+            .body(Body::empty())
+            .unwrap();
+
+        let (status, body) = call(router(st), request).await;
+
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "body={body}");
+        assert_eq!(body["ok"], false);
+        assert_eq!(body["error"]["code"], "session-termination-failed");
+        assert_eq!(body["error"]["details"]["reason"], "verification-failed");
+        assert!(session_dir.exists());
     }
 
     #[tokio::test]
