@@ -9118,6 +9118,10 @@ mod tests {
             );
             return;
         }
+        assert!(
+            unsafe { libc::getsid(0) } > 1,
+            "required cgroup test must run in an isolated POSIX session; prefix the command with `setsid --wait`"
+        );
         let Some(tmux) = super::binary_on_path("tmux") else {
             eprintln!("SKIP: tmux is unavailable for the Linux cgroup integration test");
             assert!(!require_cgroup, "required cgroup test must provide tmux");

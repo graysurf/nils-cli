@@ -103,7 +103,7 @@ jobs:
         env:
           AGENT_SESSION_TEST_REQUIRE_CGROUP: "1"
         run: |
-          cargo test -p nils-agent-session --lib \
+          setsid --wait cargo test -p nils-agent-session --lib \
             tests::delete_kills_a_detached_descendant_inside_a_pinned_tmux_control_group \
             -- --exact --nocapture
 
