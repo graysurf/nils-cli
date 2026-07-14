@@ -3803,7 +3803,7 @@ fn delete_kill_failure_retains_codex_and_claude_runtime_state() {
                     "-p".to_string(),
                     "-t".to_string(),
                     format!("={tmux_session}:0.0"),
-                    "#{session_id}\t#{pane_id}\t#{pane_pid}".to_string(),
+                    "#{session_id} #{pane_id} #{pane_pid}".to_string(),
                 ]),
             "delete must inspect the managed 0.0 pane, not the active pane: {calls:?}"
         );

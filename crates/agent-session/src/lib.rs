@@ -5499,7 +5499,7 @@ fn capture_tmux_runtime_identity(
         .arg("-p")
         .arg("-t")
         .arg(managed_tmux_pane_target(&record.tmux_session))
-        .arg("#{session_id}\t#{pane_id}\t#{pane_pid}");
+        .arg("#{session_id} #{pane_id} #{pane_pid}");
     let output = run_output_with_timeout(command, timeout)
         .map_err(|_| SessionTerminationFailure::VerificationFailed)?;
     if !output.status.success() {
@@ -5511,7 +5511,7 @@ fn capture_tmux_runtime_identity(
     }
     let output = String::from_utf8(output.stdout)
         .map_err(|_| SessionTerminationFailure::RuntimeIdentityUnavailable)?;
-    let mut fields = output.trim().split('\t');
+    let mut fields = output.split_whitespace();
     let session_id = fields
         .next()
         .ok_or(SessionTerminationFailure::RuntimeIdentityUnavailable)?;
@@ -9286,7 +9286,7 @@ mod tests {
                         .arg("-p")
                         .arg("-t")
                         .arg(super::managed_tmux_pane_target(&record.tmux_session))
-                        .arg("#{session_id}\t#{pane_id}\t#{pane_pid}")
+                        .arg("#{session_id} #{pane_id} #{pane_pid}")
                         .output()
                         .map(|output| {
                             (
