@@ -3736,7 +3736,7 @@ fn title_contains_reference(title: &str, reference: &str) -> bool {
         title[index + reference.len()..]
             .chars()
             .next()
-            .is_none_or(|character| !character.is_ascii_digit())
+            .is_none_or(|character| !character.is_ascii_alphanumeric() && character != '_')
     })
 }
 
@@ -6823,6 +6823,31 @@ mod tests {
         .unwrap();
 
         assert!(title.contains("#317 - Implement contract"));
+    }
+
+    #[test]
+    fn structured_title_renderer_requires_reference_token_boundary() {
+        let render = |topic: &str| {
+            super::render_session_title_state(&super::SessionTitleState {
+                topic: Some(topic.to_string()),
+                topic_source: super::SessionTitleTopicSource::Auto,
+                references: vec!["#317".to_string()],
+                activity: Some("Implement fix".to_string()),
+                extra: std::collections::BTreeMap::new(),
+            })
+            .unwrap()
+            .unwrap()
+        };
+
+        assert_eq!(
+            render("Parser #317alpha"),
+            "Parser #317alpha #317 - Implement fix"
+        );
+        assert_eq!(
+            render("Parser #317_foo"),
+            "Parser #317_foo #317 - Implement fix"
+        );
+        assert_eq!(render("Parser #317"), "Parser #317 - Implement fix");
     }
 
     #[test]
