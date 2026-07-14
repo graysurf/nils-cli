@@ -2822,6 +2822,30 @@ struct StartupArtifactBackup {
 impl StartupArtifactBackup {
     fn stage(context: &CliContext, record: &SessionRecord) -> Result<Self, CliError> {
         let dir = session_dir(context, &record.id);
+        for name in [
+            STARTUP_STAGE_FILE,
+            STARTUP_FAILURE_FILE,
+            STARTUP_DIAGNOSTIC_FILE,
+        ] {
+            let staged = dir.join(format!("{name}.resume-backup"));
+            match fs::metadata(&staged) {
+                Ok(_) => {
+                    return Err(CliError::runtime(
+                        "startup-artifact-backup-interrupted",
+                        "session has an interrupted startup artifact backup; resume is blocked to preserve prior diagnostics",
+                        Some(json!({ "id": record.id })),
+                    ));
+                }
+                Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+                Err(err) => {
+                    return Err(session_io_error(
+                        "startup-artifact-backup-failed",
+                        &staged,
+                        err,
+                    ));
+                }
+            }
+        }
         let mut backup = Self {
             entries: Vec::new(),
             finalized: false,
@@ -2833,18 +2857,6 @@ impl StartupArtifactBackup {
         ] {
             let current = dir.join(name);
             let staged = dir.join(format!("{name}.resume-backup"));
-            match fs::remove_file(&staged) {
-                Ok(()) => {}
-                Err(err) if err.kind() == io::ErrorKind::NotFound => {}
-                Err(err) => {
-                    let _ = backup.restore();
-                    return Err(session_io_error(
-                        "startup-artifact-backup-failed",
-                        &staged,
-                        err,
-                    ));
-                }
-            }
             match fs::rename(&current, &staged) {
                 Ok(()) => backup.entries.push((current, staged)),
                 Err(err) if err.kind() == io::ErrorKind::NotFound => {}

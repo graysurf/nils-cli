@@ -5371,7 +5371,13 @@ fn resume_launch_failure_restores_the_prior_runtime_and_activity() {
         "codex",
         "hs-codex-resume-launch-fail",
         &cwd,
-        &["resume", "resume-session-id", "--cd", cwd.to_str().unwrap()],
+        &[
+            "resume",
+            "resume-session-id",
+            "--cd",
+            cwd.to_str().unwrap(),
+            "--no-alt-screen",
+        ],
         Some(&codex_bin),
     );
     let record_path = session.join("session.json");
@@ -5426,6 +5432,7 @@ fn resume_launch_failure_restores_the_prior_runtime_and_activity() {
     );
 
     assert_ne!(output.code, 0);
+    assert_eq!(output.stdout_json()["error"]["code"], "command-failed");
     let after: Value =
         serde_json::from_str(&fs::read_to_string(&record_path).expect("restored record"))
             .expect("restored record json");
@@ -5447,6 +5454,74 @@ fn resume_launch_failure_restores_the_prior_runtime_and_activity() {
     assert!(
         !session.join("activity.replay.bin").exists(),
         "a failed launch must restore the prior replay-index boundary"
+    );
+}
+
+#[test]
+fn resume_fails_closed_without_deleting_interrupted_startup_backups() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let state_dir = tmp.path().join("state");
+    let cwd = tmp.path().join("repo");
+    fs::create_dir_all(&cwd).expect("repo dir");
+    let (tmux_bin, tmux_log) = fake_tmux(tmp.path());
+    let codex_bin = fake_agent(tmp.path(), "codex");
+    let session = write_resumable_session_record_with_agent_bin(
+        &state_dir,
+        "resume-interrupted-backup",
+        "codex",
+        "hs-codex-resume-interrupted-backup",
+        &cwd,
+        &[
+            "resume",
+            "resume-session-id",
+            "--cd",
+            cwd.to_str().unwrap(),
+            "--no-alt-screen",
+        ],
+        Some(&codex_bin),
+    );
+    let record_path = session.join("session.json");
+    let before = fs::read_to_string(&record_path).expect("prior record");
+    let staged_failure = session.join(".startup-failure.resume-backup");
+    fs::write(&staged_failure, "terminal-runtime-create-failed\n").unwrap();
+
+    let state_arg = state_dir.to_string_lossy().to_string();
+    let tmux_arg = tmux_bin.to_string_lossy().to_string();
+    let tmux_log_arg = tmux_log.to_string_lossy().to_string();
+    let output = run(
+        tmp.path(),
+        &[
+            "--state-dir",
+            &state_arg,
+            "resume",
+            "resume-interrupted-backup",
+            "--tmux-bin",
+            &tmux_arg,
+            "--format",
+            "json",
+        ],
+        &[
+            ("AGENT_SESSION_FAKE_TMUX_LOG", &tmux_log_arg),
+            ("AGENT_SESSION_FAKE_TMUX_HAS_SESSION", "0"),
+            ("AGENT_SESSION_FAKE_TMUX_FAIL", "new-session"),
+        ],
+    );
+
+    assert_ne!(output.code, 0);
+    assert_eq!(
+        output.stdout_json()["error"]["code"],
+        "startup-artifact-backup-interrupted"
+    );
+    assert_eq!(fs::read_to_string(&record_path).unwrap(), before);
+    assert_eq!(
+        fs::read_to_string(&staged_failure).unwrap(),
+        "terminal-runtime-create-failed\n"
+    );
+    assert!(
+        tmux_calls(&tmux_log)
+            .iter()
+            .all(|call| call.first().is_none_or(|arg| arg != "new-session")),
+        "interrupted transaction must fail before launching a new runtime"
     );
 }
 

@@ -160,7 +160,9 @@ is no second state model.
   state after an ordinary later stop, so consumers must not relabel normal
   session termination as startup failure. A resume starts a fresh startup
   lifecycle for its new runtime generation; synchronous launch rollback restores
-  the prior projection and private diagnostic artifacts.
+  the prior projection and private diagnostic artifacts. A leftover resume
+  backup from an interrupted process blocks another resume before mutation so
+  the only copy of prior diagnostic state is not silently discarded.
 - `GET /usage` — read-only provider usage report, open on loopback. The serve
   envelope contains `data.usage.schema_version: "agent-session.usage.v1"` and
   provider entries for Codex and Claude. Provider readers are bounded by
