@@ -5534,6 +5534,80 @@ fn resume_fails_closed_without_deleting_interrupted_startup_backups() {
 }
 
 #[test]
+fn resume_treats_a_dangling_startup_backup_symlink_as_interrupted_state() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let state_dir = tmp.path().join("state");
+    let codex_home = tmp.path().join("codex-home");
+    let cwd = tmp.path().join("repo");
+    fs::create_dir_all(&cwd).expect("repo dir");
+    let (tmux_bin, tmux_log) = fake_tmux(tmp.path());
+    let session = write_session_record_with_cwd(
+        &state_dir,
+        "resume-dangling-backup",
+        "codex",
+        "hs-codex-resume-dangling-backup",
+        &cwd,
+    );
+    write_codex_session_meta(
+        &codex_home.join("sessions/2026/07/05/backfill.jsonl"),
+        "resume-session-id",
+        &cwd,
+        "2000-01-01T00:00:30Z",
+    );
+    let record_path = session.join("session.json");
+    let sidecar_path = session.join("resume.json");
+    let current_failure = session.join(".startup-failure");
+    let staged_failure = session.join(".startup-failure.resume-backup");
+    let missing_target = session.join("missing-prior-artifact");
+    let before = fs::read_to_string(&record_path).expect("prior record");
+    fs::write(&current_failure, "current failure\n").unwrap();
+    symlink(&missing_target, &staged_failure).unwrap();
+
+    let state_arg = state_dir.to_string_lossy().to_string();
+    let codex_home_arg = codex_home.to_string_lossy().to_string();
+    let tmux_arg = tmux_bin.to_string_lossy().to_string();
+    let tmux_log_arg = tmux_log.to_string_lossy().to_string();
+    let output = run(
+        tmp.path(),
+        &[
+            "--state-dir",
+            &state_arg,
+            "resume",
+            "resume-dangling-backup",
+            "--tmux-bin",
+            &tmux_arg,
+            "--format",
+            "json",
+        ],
+        &[
+            ("CODEX_HOME", &codex_home_arg),
+            ("AGENT_SESSION_FAKE_TMUX_LOG", &tmux_log_arg),
+            ("AGENT_SESSION_FAKE_TMUX_HAS_SESSION", "0"),
+            ("AGENT_SESSION_FAKE_TMUX_FAIL", "new-session"),
+        ],
+    );
+
+    assert_ne!(output.code, 0);
+    assert_eq!(
+        output.stdout_json()["error"]["code"],
+        "startup-artifact-backup-interrupted"
+    );
+    assert_eq!(fs::read_to_string(&record_path).unwrap(), before);
+    assert!(!sidecar_path.exists());
+    assert_eq!(
+        fs::read_to_string(&current_failure).unwrap(),
+        "current failure\n"
+    );
+    assert_eq!(fs::read_link(&staged_failure).unwrap(), missing_target);
+    assert!(
+        tmux_calls(&tmux_log)
+            .iter()
+            .all(|call| call.first().is_none_or(|arg| arg != "new-session")),
+        "dangling backup entry must block before launching a new runtime"
+    );
+}
+
+#[test]
 fn resume_recovers_provider_identity_from_durable_sidecar() {
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let state_dir = tmp.path().join("state");

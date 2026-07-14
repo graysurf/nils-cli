@@ -2832,7 +2832,7 @@ impl StartupArtifactBackup {
         let dir = session_dir(context, &record.id);
         for name in STARTUP_ARTIFACT_FILES {
             let staged = dir.join(format!("{name}.resume-backup"));
-            match fs::metadata(&staged) {
+            match fs::symlink_metadata(&staged) {
                 Ok(_) => {
                     return Err(CliError::runtime(
                         "startup-artifact-backup-interrupted",
