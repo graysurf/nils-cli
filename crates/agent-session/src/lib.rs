@@ -5061,10 +5061,19 @@ fn run_output_with_timeout(
             }
         }
         if status.is_some() && stdout.is_some() && stderr.is_some() {
+            let Some(status) = status.take() else {
+                unreachable!("command status was checked")
+            };
+            let Some(stdout) = stdout.take() else {
+                unreachable!("command stdout was checked")
+            };
+            let Some(stderr) = stderr.take() else {
+                unreachable!("command stderr was checked")
+            };
             return Ok(std::process::Output {
-                status: status.expect("checked command status"),
-                stdout: stdout.expect("checked stdout")?,
-                stderr: stderr.expect("checked stderr")?,
+                status,
+                stdout: stdout?,
+                stderr: stderr?,
             });
         }
         if started_at.elapsed() >= timeout {
