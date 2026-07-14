@@ -45,7 +45,7 @@ use nils_common::usage_time::{
     epoch_seconds_from_f64, normalize_epoch_seconds, reset_epoch_seconds_from_str,
 };
 use notify::{Event as NotifyEvent, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Value, json};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, broadcast, mpsc, watch};
 use tokio::task::JoinSet;
@@ -60,11 +60,12 @@ use crate::provider_prompt::{
 use crate::{
     BINARY, CliContext, CliError, ProviderResumeImportArgs, SessionRecord, SessionTitleState,
     SessionTitleStateInput, SessionView, StartFailureDisposition, WorkdirSearchOptions,
-    delete_session, glance_session, list_sessions, load_session_record, non_empty_env,
-    repo_remote_url_from_cwd, resolve_tmux_bin, resume_session_by_id, search_workdirs,
-    send_auto_resume_input, send_input_serialized, session_clipboard_buffer, session_dir,
-    session_status, short_hostname, start_provider_resume_session, start_session,
-    update_session_title_if_revision, write_session_attachment,
+    canonicalize_structured_title_pair, delete_session, glance_session, list_sessions,
+    load_session_record, non_empty_env, repo_remote_url_from_cwd, resolve_tmux_bin,
+    resume_session_by_id, search_workdirs, send_auto_resume_input, send_input_serialized,
+    session_clipboard_buffer, session_dir, session_status, short_hostname,
+    start_provider_resume_session, start_session, update_session_title_if_revision,
+    write_session_attachment,
 };
 
 const ATTACH_LIVE_FIFO_NAME: &str = "attach-live.fifo";
@@ -2055,7 +2056,8 @@ struct GlanceQuery {
 struct CreateBody {
     agent: String,
     cwd: Option<String>,
-    title: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_create_title")]
+    title: CreateTitleInput,
     title_state: Option<SessionTitleStateInput>,
     id: Option<String>,
     prompt: Option<String>,
@@ -2065,6 +2067,37 @@ struct CreateBody {
     agent_args: Vec<String>,
     #[serde(default)]
     codex_account: Option<String>,
+}
+
+#[derive(Debug, Default)]
+enum CreateTitleInput {
+    #[default]
+    Missing,
+    Null,
+    Value(String),
+}
+
+impl CreateTitleInput {
+    fn is_supplied(&self) -> bool {
+        !matches!(self, Self::Missing)
+    }
+
+    fn into_value(self) -> Option<String> {
+        match self {
+            Self::Missing | Self::Null => None,
+            Self::Value(value) => Some(value),
+        }
+    }
+}
+
+fn deserialize_create_title<'de, D>(deserializer: D) -> Result<CreateTitleInput, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Ok(match Option::<String>::deserialize(deserializer)? {
+        Some(value) => CreateTitleInput::Value(value),
+        None => CreateTitleInput::Null,
+    })
 }
 
 #[derive(Debug, Deserialize)]
@@ -2246,8 +2279,18 @@ async fn create_handler(
         ));
     };
     let context = state.context.clone();
+    let title_supplied = body.title.is_supplied();
+    let title = body.title.into_value();
     let title_state = body.title_state.map(SessionTitleState::from);
-    let title = body.title.clone();
+    let (title, title_state) = match title_state {
+        Some(title_state) => {
+            match canonicalize_structured_title_pair(title, title_supplied, title_state) {
+                Ok(pair) => pair,
+                Err(err) => return envelope_err(err),
+            }
+        }
+        None => (title, None),
+    };
     if body.codex_account.is_some() && agent != AgentKind::Codex {
         return envelope_err(CliError::usage(
             "codex-account-agent-conflict",
@@ -10846,6 +10889,43 @@ mod tests {
         assert_eq!(record["title"], "Direct rewrite");
         assert!(record.get("title_state").is_none());
         assert_eq!(record["title_revision"], 3);
+    }
+
+    #[tokio::test]
+    async fn create_rejects_explicit_null_with_nonempty_title_state_in_both_modes() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let st = state(tmp.path(), Some(TOKEN), minimal_tmux(tmp.path()));
+        let title_state = json!({
+            "topic": "Explicit topic",
+            "topic_source": "user",
+            "references": [],
+            "activity": null
+        });
+        let cases = [
+            json!({
+                "agent": "codex",
+                "id": "null-title-fresh",
+                "title": null,
+                "title_state": title_state
+            }),
+            json!({
+                "agent": "codex",
+                "id": "null-title-provider-resume",
+                "provider_resume_id": "missing-provider-session",
+                "title": null,
+                "title_state": title_state
+            }),
+        ];
+
+        for body in cases {
+            let (status, body) = call(
+                router(st.clone()),
+                post_json("/sessions", Some(TOKEN), body),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "body={body}");
+            assert_eq!(body["error"]["code"], "title-state-mismatch");
+        }
     }
 
     #[tokio::test]

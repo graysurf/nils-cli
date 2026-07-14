@@ -3236,7 +3236,7 @@ fn normalize_title(title: Option<String>) -> Result<Option<String>, CliError> {
     Ok(Some(title))
 }
 
-fn canonicalize_structured_title_pair(
+pub(crate) fn canonicalize_structured_title_pair(
     title: Option<String>,
     title_supplied: bool,
     title_state: SessionTitleState,
