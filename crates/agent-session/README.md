@@ -51,8 +51,9 @@ control-plane activity.
 `delete` removes provider runtime files and session metadata only after bounded checks verify the recorded runtime is
 stopped. Before killing a live runtime, it inspects only the managed `0.0` pane, captures its immutable tmux session/pane
 ids and process group, validates the runtime's `AGENT_SESSION_*` ownership markers, and persists that identity for retry.
-It then targets only the captured tmux session id and requires both tmux and the process group to be gone. A retry can
-finish cleanup without another kill only when that persisted identity verifies stopped. Live records created by an older
+If the managed pane is replaced, it durably retains every unresolved observed process identity before proceeding. It then
+targets only the captured tmux session id and requires tmux and every retained process group to be gone. A retry can
+finish cleanup without another kill only when all persisted identities verify stopped. Live records created by an older
 version can be upgraded from their ownership markers. A stopped pre-upgrade record without a provable launch identity remains
 retained and returns `runtime-identity-unavailable`, `retryable: false`, and
 `action: manual-runtime-verification-required`; an operator must verify its runtime manually before removing that state.

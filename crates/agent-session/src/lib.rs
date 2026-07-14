@@ -87,6 +87,7 @@ const DELETE_TERMINATION_VERIFY_POLL_INTERVAL: Duration = Duration::from_millis(
 const DELETE_TERMINATION_PROBE_TIMEOUT: Duration = Duration::from_millis(100);
 const DELETE_TMUX_PROBE_MAX_OUTPUT_BYTES: usize = 4 * 1024;
 const DELETE_TMUX_IDENTITY_KEY: &str = "delete_tmux_identity";
+const DELETE_TMUX_PRIOR_IDENTITIES_KEY: &str = "delete_tmux_prior_identities";
 const TMUX_RUNTIME_NEVER_LAUNCHED_KEY: &str = "tmux_runtime_never_launched";
 
 pub fn run() -> i32 {
@@ -4783,17 +4784,34 @@ fn terminate_tmux_session_with_timeouts(
         verify_timeout.min(DELETE_TERMINATION_PROBE_TIMEOUT),
     )? {
         TmuxRuntimeProbe::Running(identity) => {
+            let mut prior_identities = persisted_prior_tmux_runtime_identities(record)?;
+            if prior_identities
+                .iter()
+                .any(|prior| !prior.same_runtime_target(&identity))
+            {
+                return Err(SessionTerminationFailure::RuntimeIdentityMismatch);
+            }
             if let Some(persisted) = persisted_tmux_runtime_identity(record)? {
                 if !persisted.same_runtime_target(&identity) {
                     return Err(SessionTerminationFailure::RuntimeIdentityMismatch);
                 }
-                if !persisted.same_process_identity(&identity) {
-                    verify_stopped_process_group(&persisted, verify_timeout)?;
+                if !persisted.same_process_identity(&identity)
+                    && !prior_identities
+                        .iter()
+                        .any(|prior| prior.same_process_identity(&persisted))
+                {
+                    prior_identities.push(persisted);
                 }
             }
-            persist_tmux_runtime_identity(record, &identity)?;
+            persist_tmux_runtime_identities(record, &identity, &prior_identities)?;
             write_session_record(context, record)
                 .map_err(|_| SessionTerminationFailure::RuntimeIdentityUnavailable)?;
+            verify_stopped_process_groups(&prior_identities, verify_timeout)?;
+            if !prior_identities.is_empty() {
+                persist_tmux_runtime_identities(record, &identity, &[])?;
+                write_session_record(context, record)
+                    .map_err(|_| SessionTerminationFailure::RuntimeIdentityUnavailable)?;
+            }
             identity
         }
         TmuxRuntimeProbe::Stopped => {
@@ -4802,7 +4820,20 @@ fn terminate_tmux_session_with_timeouts(
             }
             let identity = persisted_tmux_runtime_identity(record)?
                 .ok_or(SessionTerminationFailure::RuntimeIdentityUnavailable)?;
-            return verify_stopped_tmux_runtime(tmux_bin, &identity, verify_timeout);
+            let prior_identities = persisted_prior_tmux_runtime_identities(record)?;
+            if prior_identities
+                .iter()
+                .any(|prior| !prior.same_runtime_target(&identity))
+            {
+                return Err(SessionTerminationFailure::RuntimeIdentityMismatch);
+            }
+            let verification_started = Instant::now();
+            verify_stopped_process_groups(&prior_identities, verify_timeout)?;
+            let remaining = verify_timeout.saturating_sub(verification_started.elapsed());
+            if remaining.is_zero() {
+                return Err(SessionTerminationFailure::VerificationFailed);
+            }
+            return verify_stopped_tmux_runtime(tmux_bin, &identity, remaining);
         }
     };
 
@@ -4966,6 +4997,25 @@ fn persist_tmux_runtime_identity(
         serde_json::to_value(identity)
             .map_err(|_| SessionTerminationFailure::RuntimeIdentityUnavailable)?,
     );
+    record.extra.remove(DELETE_TMUX_PRIOR_IDENTITIES_KEY);
+    Ok(())
+}
+
+fn persist_tmux_runtime_identities(
+    record: &mut SessionRecord,
+    identity: &TmuxRuntimeIdentity,
+    prior_identities: &[TmuxRuntimeIdentity],
+) -> Result<(), SessionTerminationFailure> {
+    persist_tmux_runtime_identity(record, identity)?;
+    if prior_identities.is_empty() {
+        record.extra.remove(DELETE_TMUX_PRIOR_IDENTITIES_KEY);
+    } else {
+        record.extra.insert(
+            DELETE_TMUX_PRIOR_IDENTITIES_KEY.to_string(),
+            serde_json::to_value(prior_identities)
+                .map_err(|_| SessionTerminationFailure::RuntimeIdentityUnavailable)?,
+        );
+    }
     Ok(())
 }
 
@@ -5010,6 +5060,33 @@ fn persisted_tmux_runtime_identity(
         return Err(SessionTerminationFailure::RuntimeIdentityUnavailable);
     }
     Ok(Some(identity))
+}
+
+fn persisted_prior_tmux_runtime_identities(
+    record: &SessionRecord,
+) -> Result<Vec<TmuxRuntimeIdentity>, SessionTerminationFailure> {
+    let Some(value) = record.extra.get(DELETE_TMUX_PRIOR_IDENTITIES_KEY) else {
+        return Ok(Vec::new());
+    };
+    let identities: Vec<TmuxRuntimeIdentity> = serde_json::from_value(value.clone())
+        .map_err(|_| SessionTerminationFailure::RuntimeIdentityUnavailable)?;
+    let current_launch_id = record
+        .runtime
+        .as_ref()
+        .map(|runtime| runtime.launch_id.as_str())
+        .filter(|launch_id| !launch_id.is_empty());
+    if identities.iter().any(|identity| {
+        identity.launch_id.as_deref() != current_launch_id
+            || !valid_tmux_session_id(&identity.session_id)
+            || !valid_tmux_pane_id(&identity.pane_id)
+            || identity.pane_pid <= 1
+            || identity
+                .process_group_id
+                .is_none_or(|process_group_id| process_group_id <= 1)
+    }) {
+        return Err(SessionTerminationFailure::RuntimeIdentityUnavailable);
+    }
+    Ok(identities)
 }
 
 fn valid_tmux_session_id(value: &str) -> bool {
@@ -5066,6 +5143,21 @@ fn verify_stopped_process_group(
                 .min(verify_timeout.saturating_sub(started_at.elapsed())),
         );
     }
+}
+
+fn verify_stopped_process_groups(
+    identities: &[TmuxRuntimeIdentity],
+    verify_timeout: Duration,
+) -> Result<(), SessionTerminationFailure> {
+    let started_at = Instant::now();
+    for identity in identities {
+        let remaining = verify_timeout.saturating_sub(started_at.elapsed());
+        if remaining.is_zero() {
+            return Err(SessionTerminationFailure::VerificationFailed);
+        }
+        verify_stopped_process_group(identity, remaining)?;
+    }
+    Ok(())
 }
 
 fn verify_stopped_tmux_runtime(

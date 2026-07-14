@@ -4464,11 +4464,24 @@ exit 0
         "the original pane group must still be live"
     );
     let retained: Value = serde_json::from_slice(&fs::read(&record_path).unwrap()).unwrap();
-    assert_eq!(retained["delete_tmux_identity"]["pane_pid"], old_pane.pid());
+    assert_eq!(
+        retained["delete_tmux_identity"]["pane_pid"],
+        live_pane.pid()
+    );
     assert_eq!(
         retained["delete_tmux_identity"]["process_group_id"],
+        live_pane.pid()
+    );
+    assert_eq!(
+        retained["delete_tmux_prior_identities"][0]["pane_pid"],
         old_pane.pid()
     );
+    assert_eq!(
+        retained["delete_tmux_prior_identities"][0]["process_group_id"],
+        old_pane.pid()
+    );
+
+    fs::write(&tmux_stopped, b"").unwrap();
     old_pane.stop();
     let retry = run(
         tmp.path(),
@@ -4508,7 +4521,7 @@ exit 0
         live_pane.pid()
     );
     let calls = fs::read_to_string(&tmux_log).unwrap();
-    assert_eq!(calls.matches("kill-session -t $77").count(), 1, "{calls}");
+    assert_eq!(calls.matches("kill-session -t $77").count(), 0, "{calls}");
 
     live_pane.stop();
     let final_retry = run(
