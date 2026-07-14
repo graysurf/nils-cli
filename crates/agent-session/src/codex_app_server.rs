@@ -52,7 +52,7 @@ const MAX_PROXY_FRAME_BYTES: usize = 4 * 1024 * 1024;
 const CONTROL_RESPONSE_TIMEOUT: Duration = Duration::from_secs(10);
 const CONTROL_SUBMISSION_TIMEOUT: Duration = Duration::from_secs(15);
 const CONTROL_SUBMIT_TOTAL_TIMEOUT: Duration = Duration::from_secs(30);
-const AUDITED_CODEX_VERSION: (u64, u64, u64) = (0, 144, 1);
+const AUDITED_CODEX_VERSIONS: &[(u64, u64, u64)] = &[(0, 144, 1), (0, 144, 3)];
 const APP_SERVER_CAPABILITY_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 const APP_SERVER_CAPABILITY_PROBE_MAX_OUTPUT_BYTES: u64 = 64 * 1024;
 const MANUAL_INPUT_SECTION_FILE: &str = ".codex-app-server-manual-input";
@@ -133,7 +133,9 @@ fn app_server_capability_available(agent_bin: &Path) -> bool {
         return false;
     };
     let version_text = String::from_utf8_lossy(&version.stdout);
-    if parse_version_triplet(&version_text) != Some(AUDITED_CODEX_VERSION) {
+    if parse_version_triplet(&version_text)
+        .is_none_or(|version| !AUDITED_CODEX_VERSIONS.contains(&version))
+    {
         return false;
     }
     let Some(output) = bounded_command_output(agent_bin, &["app-server", "--help"]) else {
@@ -3759,13 +3761,19 @@ mod tests {
     }
 
     #[test]
-    fn capability_probe_requires_the_audited_version_and_unix_transport() {
+    fn capability_probe_requires_an_audited_version_and_unix_transport() {
         let _probe_guard = capability_probe_test_guard();
         let tmp = tempfile::TempDir::new().unwrap();
         for (name, version, help, expected) in [
             (
                 "supported",
                 "codex-cli 0.144.1",
+                "  --listen <URL>  Supported values: stdio://, unix://PATH",
+                true,
+            ),
+            (
+                "supported-0.144.3",
+                "codex-cli 0.144.3",
                 "  --listen <URL>  Supported values: stdio://, unix://PATH",
                 true,
             ),
