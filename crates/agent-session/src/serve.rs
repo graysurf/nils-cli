@@ -6759,7 +6759,19 @@ esac
     "kind": "tmux",
     "tmux_session": "{tmux_session}",
     "generation": 1,
-    "started_at": "2000-01-01T00:00:00Z"
+    "started_at": "2000-01-01T00:00:00Z",
+    "launch_id": "never-launched-fixture"
+  }},
+  "tmux_runtime_never_launched": "never-launched-fixture",
+  "startup": {{
+    "schema_version": "agent-session.startup.v1",
+    "state": "failed",
+    "stage": "tmux",
+    "started_at": "2000-01-01T00:00:00Z",
+    "failure_code": "terminal-runtime-create-failed",
+    "message": "The terminal runtime could not be created.",
+    "occurred_at": "2000-01-01T00:00:01Z",
+    "retry_safe": true
   }},
   "agent_args": []
 }}"#,
@@ -10672,6 +10684,70 @@ esac
         assert!(
             calls.contains("resume resume-session-id"),
             "resume must use the exact provider id: {calls:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn resume_api_rejects_unprovable_pre_upgrade_codex_and_claude_runtimes() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cwd = tmp.path().join("repo");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let log = tmp.path().join("tmux.log");
+        let tmux = resume_tmux(tmp.path(), &log);
+
+        for agent in ["codex", "claude"] {
+            let id = format!("unprovable-{agent}");
+            let tmux_session = format!("hs-{agent}-unprovable");
+            let resume_args = match agent {
+                "codex" => vec![
+                    "resume",
+                    "resume-session-id",
+                    "--cd",
+                    cwd.to_str().unwrap(),
+                    "--no-alt-screen",
+                ],
+                "claude" => vec!["--resume", "resume-session-id"],
+                _ => unreachable!(),
+            };
+            seed_resumable_session(tmp.path(), &id, agent, &tmux_session, &cwd, &resume_args);
+            let record_path = tmp.path().join("sessions").join(&id).join("session.json");
+            let mut record: Value =
+                serde_json::from_slice(&std::fs::read(&record_path).unwrap()).unwrap();
+            record.as_object_mut().unwrap().remove("startup");
+            record
+                .as_object_mut()
+                .unwrap()
+                .remove("tmux_runtime_never_launched");
+            std::fs::write(&record_path, serde_json::to_vec_pretty(&record).unwrap()).unwrap();
+            let before = std::fs::read(&record_path).unwrap();
+            let st = state(tmp.path(), Some(TOKEN), tmux.clone());
+
+            let (status, body) = call(
+                router(st),
+                post_json(&format!("/sessions/{id}/resume"), Some(TOKEN), json!({})),
+            )
+            .await;
+
+            assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "body={body}");
+            assert_eq!(body["schema_version"], "cli.agent-session.serve.v1");
+            assert_eq!(body["ok"], false);
+            assert_eq!(body["error"]["code"], "session-termination-failed");
+            assert_eq!(
+                body["error"]["details"]["reason"],
+                "runtime-identity-unavailable"
+            );
+            assert_eq!(body["error"]["details"]["retryable"], false);
+            assert_eq!(
+                body["error"]["details"]["action"],
+                "manual-runtime-verification-required"
+            );
+            assert_eq!(std::fs::read(&record_path).unwrap(), before);
+        }
+
+        let calls = std::fs::read_to_string(&log).unwrap();
+        assert!(
+            !calls.contains("new-session"),
+            "serve resume must not replace unprovable runtimes: {calls:?}"
         );
     }
 
