@@ -2820,7 +2820,10 @@ struct StartupArtifactBackup {
 }
 
 impl StartupArtifactBackup {
-    fn stage(context: &CliContext, record: &SessionRecord) -> Result<Self, CliError> {
+    fn ensure_not_interrupted(
+        context: &CliContext,
+        record: &SessionRecord,
+    ) -> Result<(), CliError> {
         let dir = session_dir(context, &record.id);
         for name in [
             STARTUP_STAGE_FILE,
@@ -2846,6 +2849,12 @@ impl StartupArtifactBackup {
                 }
             }
         }
+        Ok(())
+    }
+
+    fn stage(context: &CliContext, record: &SessionRecord) -> Result<Self, CliError> {
+        Self::ensure_not_interrupted(context, record)?;
+        let dir = session_dir(context, &record.id);
         let mut backup = Self {
             entries: Vec::new(),
             finalized: false,
@@ -2948,6 +2957,7 @@ fn resume_session_by_id(
         }
         _ => {}
     }
+    StartupArtifactBackup::ensure_not_interrupted(context, &record)?;
     if record.provider_resume.is_none()
         && AgentKind::from_name(&record.agent) == Some(AgentKind::Codex)
         && let Some(provider_resume) = capture_codex_resume_from_history(&record)
