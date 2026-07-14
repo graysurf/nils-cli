@@ -59,11 +59,11 @@ use crate::provider_prompt::{
 };
 use crate::{
     BINARY, CliContext, CliError, ProviderResumeImportArgs, SessionRecord, SessionTitleState,
-    SessionView, StartFailureDisposition, WorkdirSearchOptions, delete_session, glance_session,
-    list_sessions, load_session_record, non_empty_env, normalize_title, normalize_title_state,
-    render_session_title_state, repo_remote_url_from_cwd, resolve_tmux_bin, resume_session_by_id,
-    search_workdirs, send_auto_resume_input, send_input_serialized, session_clipboard_buffer,
-    session_dir, session_status, short_hostname, start_provider_resume_session, start_session,
+    SessionTitleStateInput, SessionView, StartFailureDisposition, WorkdirSearchOptions,
+    delete_session, glance_session, list_sessions, load_session_record, non_empty_env,
+    repo_remote_url_from_cwd, resolve_tmux_bin, resume_session_by_id, search_workdirs,
+    send_auto_resume_input, send_input_serialized, session_clipboard_buffer, session_dir,
+    session_status, short_hostname, start_provider_resume_session, start_session,
     update_session_title_if_revision, write_session_attachment,
 };
 
@@ -2056,7 +2056,7 @@ struct CreateBody {
     agent: String,
     cwd: Option<String>,
     title: Option<String>,
-    title_state: Option<SessionTitleState>,
+    title_state: Option<SessionTitleStateInput>,
     id: Option<String>,
     prompt: Option<String>,
     #[serde(default, alias = "resume_id")]
@@ -2246,32 +2246,8 @@ async fn create_handler(
         ));
     };
     let context = state.context.clone();
-    let title_state = match body.title_state.map(normalize_title_state).transpose() {
-        Ok(state) => state,
-        Err(err) => return envelope_err(err),
-    };
-    let title = if let Some(title_state) = title_state.as_ref() {
-        let rendered = match render_session_title_state(title_state) {
-            Ok(rendered) => rendered,
-            Err(err) => return envelope_err(err),
-        };
-        if let Some(explicit_title) = body.title.clone() {
-            let explicit_title = match normalize_title(Some(explicit_title)) {
-                Ok(title) => title,
-                Err(err) => return envelope_err(err),
-            };
-            if explicit_title != rendered {
-                return envelope_err(CliError::usage(
-                    "title-state-mismatch",
-                    "session title must match the canonical title_state rendering",
-                    Some(json!({ "field": "title_state" })),
-                ));
-            }
-        }
-        rendered
-    } else {
-        body.title.clone()
-    };
+    let title_state = body.title_state.map(SessionTitleState::from);
+    let title = body.title.clone();
     if body.codex_account.is_some() && agent != AgentKind::Codex {
         return envelope_err(CliError::usage(
             "codex-account-agent-conflict",
@@ -3392,11 +3368,8 @@ async fn update_session_handler(
     };
     let title_state_input = match object.get("title_state") {
         Some(Value::Null) => Some(None),
-        Some(value) => match serde_json::from_value::<SessionTitleState>(value.clone()) {
-            Ok(state) => match normalize_title_state(state) {
-                Ok(state) => Some(Some(state)),
-                Err(err) => return envelope_err(err),
-            },
+        Some(value) => match serde_json::from_value::<SessionTitleStateInput>(value.clone()) {
+            Ok(state) => Some(Some(SessionTitleState::from(state))),
             Err(_) => {
                 return envelope_err(CliError::usage(
                     "invalid-title-state",
@@ -3408,26 +3381,7 @@ async fn update_session_handler(
         None => None,
     };
     let (title, title_state) = match title_state_input {
-        Some(Some(state)) => {
-            let rendered = match render_session_title_state(&state) {
-                Ok(rendered) => rendered,
-                Err(err) => return envelope_err(err),
-            };
-            if let Some(explicit_title) = title_input {
-                let explicit_title = match normalize_title(explicit_title) {
-                    Ok(title) => title,
-                    Err(err) => return envelope_err(err),
-                };
-                if explicit_title != rendered {
-                    return envelope_err(CliError::usage(
-                        "title-state-mismatch",
-                        "session title must match the canonical title_state rendering",
-                        Some(json!({ "field": "title_state" })),
-                    ));
-                }
-            }
-            (rendered, Some(state))
-        }
+        Some(Some(state)) => (title_input.flatten(), Some(state)),
         Some(None) => (title_input.flatten(), None),
         None => match title_input {
             Some(title) => (title, None),

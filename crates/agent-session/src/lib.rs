@@ -477,13 +477,55 @@ enum SessionTitleTopicSource {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
 struct SessionTitleState {
     topic: Option<String>,
     topic_source: SessionTitleTopicSource,
     #[serde(default)]
     references: Vec<String>,
     activity: Option<String>,
+    #[serde(default, flatten, skip_serializing_if = "BTreeMap::is_empty")]
+    extra: BTreeMap<String, Value>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SessionTitleStateInput {
+    topic: Option<String>,
+    topic_source: SessionTitleTopicSource,
+    #[serde(default)]
+    references: Vec<String>,
+    activity: Option<String>,
+}
+
+impl From<SessionTitleStateInput> for SessionTitleState {
+    fn from(input: SessionTitleStateInput) -> Self {
+        Self {
+            topic: input.topic,
+            topic_source: input.topic_source,
+            references: input.references,
+            activity: input.activity,
+            extra: BTreeMap::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct SessionTitleStateView {
+    topic: Option<String>,
+    topic_source: SessionTitleTopicSource,
+    references: Vec<String>,
+    activity: Option<String>,
+}
+
+impl From<&SessionTitleState> for SessionTitleStateView {
+    fn from(state: &SessionTitleState) -> Self {
+        Self {
+            topic: state.topic.clone(),
+            topic_source: state.topic_source.clone(),
+            references: state.references.clone(),
+            activity: state.activity.clone(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -992,7 +1034,7 @@ struct SessionView {
     mode: String,
     title: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    title_state: Option<SessionTitleState>,
+    title_state: Option<SessionTitleStateView>,
     title_state_supported: bool,
     title_revision: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1070,7 +1112,7 @@ struct GlanceResult {
     agent: String,
     title: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    title_state: Option<SessionTitleState>,
+    title_state: Option<SessionTitleStateView>,
     title_state_supported: bool,
     title_revision: u64,
     tmux_session: String,
@@ -1485,7 +1527,9 @@ fn create_record(request: RecordRequest<'_>) -> Result<CreatedRecord, CliError> 
     let now = Zoned::now();
     let timestamp = now.strftime("%Y%m%d-%H%M%S").to_string();
     let iso = now.timestamp().to_string();
-    let title_slug = request.title.map(slugify);
+    let (title, title_state) =
+        canonicalize_session_title_pair(request.title.map(str::to_string), request.title_state)?;
+    let title_slug = title.as_deref().map(slugify);
     let id = resolve_session_id(
         request.context,
         request.explicit_id,
@@ -1512,8 +1556,8 @@ fn create_record(request: RecordRequest<'_>) -> Result<CreatedRecord, CliError> 
         id,
         agent: request.agent.as_str().to_string(),
         mode: request.mode.to_string(),
-        title: request.title.map(str::to_string),
-        title_state: request.title_state,
+        title,
+        title_state,
         title_revision: 0,
         cwd: display_path(request.cwd),
         tmux_session: tmux_session.clone(),
@@ -2783,17 +2827,8 @@ fn update_session_title_if_revision(
     expected: TitleUpdatePreconditions,
     tmux_bin: &Path,
 ) -> Result<SessionView, CliError> {
-    let normalized_title = normalize_title(title)?;
-    let normalized_title_state = title_state.map(normalize_title_state).transpose()?;
-    if let Some(state) = normalized_title_state.as_ref()
-        && render_session_title_state(state)? != normalized_title
-    {
-        return Err(CliError::usage(
-            "title-state-mismatch",
-            "session title must match the canonical title_state rendering",
-            Some(json!({ "field": "title_state" })),
-        ));
-    }
+    let (normalized_title, normalized_title_state) =
+        canonicalize_session_title_pair(title, title_state)?;
     let (record, previous_title) = mutate_session_record_for_title(
         context,
         id,
@@ -3189,6 +3224,27 @@ fn normalize_title(title: Option<String>) -> Result<Option<String>, CliError> {
     Ok(Some(title))
 }
 
+fn canonicalize_session_title_pair(
+    title: Option<String>,
+    title_state: Option<SessionTitleState>,
+) -> Result<(Option<String>, Option<SessionTitleState>), CliError> {
+    let title_supplied = title.is_some();
+    let normalized_title = normalize_title(title)?;
+    let normalized_title_state = title_state.map(normalize_title_state).transpose()?;
+    let Some(state) = normalized_title_state else {
+        return Ok((normalized_title, None));
+    };
+    let rendered = render_session_title_state(&state)?;
+    if title_supplied && normalized_title != rendered {
+        return Err(CliError::usage(
+            "title-state-mismatch",
+            "session title must match the canonical title_state rendering",
+            Some(json!({ "field": "title_state" })),
+        ));
+    }
+    Ok((rendered, Some(state)))
+}
+
 const SESSION_TITLE_MAX_CHARS: usize = 120;
 const SESSION_TITLE_SEPARATOR: &str = " - ";
 const SESSION_TITLE_MIN_ACTIVITY_CHARS: usize = 32;
@@ -3248,7 +3304,11 @@ fn normalize_title_state_component(
     let Some(value) = value else {
         return Ok(None);
     };
-    let value = value.split_whitespace().collect::<Vec<_>>().join(" ");
+    let value = value
+        .split(is_javascript_whitespace)
+        .filter(|component| !component.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
     if value.is_empty() {
         return Ok(None);
     }
@@ -3262,6 +3322,23 @@ fn normalize_title_state_component(
         ));
     }
     Ok(Some(value))
+}
+
+fn is_javascript_whitespace(character: char) -> bool {
+    matches!(
+        character,
+        '\u{0009}'..='\u{000d}'
+            | '\u{0020}'
+            | '\u{00a0}'
+            | '\u{1680}'
+            | '\u{2000}'..='\u{200a}'
+            | '\u{2028}'
+            | '\u{2029}'
+            | '\u{202f}'
+            | '\u{205f}'
+            | '\u{3000}'
+            | '\u{feff}'
+    )
 }
 
 fn truncate_title_component(value: &str, max_chars: usize) -> String {
@@ -3364,10 +3441,10 @@ fn render_session_title_state(state: &SessionTitleState) -> Result<Option<String
     }
 }
 
-fn effective_session_title_state(record: &SessionRecord) -> Option<SessionTitleState> {
+fn effective_session_title_state(record: &SessionRecord) -> Option<SessionTitleStateView> {
     let state = record.title_state.as_ref()?;
     match render_session_title_state(state) {
-        Ok(rendered) if rendered == record.title => Some(state.clone()),
+        Ok(rendered) if rendered == record.title => Some(SessionTitleStateView::from(state)),
         _ => None,
     }
 }
@@ -5466,11 +5543,110 @@ mod tests {
             topic_source: super::SessionTitleTopicSource::Auto,
             references: vec!["#317".to_string()],
             activity: Some("Implement contract".to_string()),
+            extra: std::collections::BTreeMap::new(),
         })
         .unwrap()
         .unwrap();
 
         assert!(title.contains("#317 - Implement contract"));
+    }
+
+    #[test]
+    fn structured_title_normalization_matches_javascript_whitespace_contract() {
+        let title = super::render_session_title_state(&super::SessionTitleState {
+            topic: Some("Alpha\u{0085}Beta\u{00a0}Gamma".to_string()),
+            topic_source: super::SessionTitleTopicSource::User,
+            references: Vec::new(),
+            activity: None,
+            extra: std::collections::BTreeMap::new(),
+        })
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(title, "Alpha\u{0085}Beta Gamma");
+    }
+
+    #[test]
+    fn create_record_rejects_a_mismatched_structured_title_pair() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let context = test_context(tmp.path());
+        let result = create_record(RecordRequest {
+            context: &context,
+            agent: AgentKind::Codex,
+            mode: "interactive",
+            title: Some("Unrelated title"),
+            title_state: Some(super::SessionTitleState {
+                topic: Some("Canonical topic".to_string()),
+                topic_source: super::SessionTitleTopicSource::User,
+                references: Vec::new(),
+                activity: None,
+                extra: std::collections::BTreeMap::new(),
+            }),
+            explicit_id: Some("mismatched-title-state"),
+            cwd: Path::new("/repo"),
+            prompt: None,
+            log_file_name: None,
+            provider_resume: None,
+            agent_args: Vec::new(),
+            agent_bin: None,
+        });
+
+        let err = match result {
+            Ok(_) => panic!("mismatched structured title must be rejected"),
+            Err(err) => err,
+        };
+        assert_eq!(err.0.code, "title-state-mismatch");
+        assert!(!super::session_dir(&context, "mismatched-title-state").exists());
+    }
+
+    #[test]
+    fn durable_title_state_preserves_future_fields_across_rewrites() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let context = test_context(tmp.path());
+        let created = create_record(RecordRequest {
+            context: &context,
+            agent: AgentKind::Codex,
+            mode: "interactive",
+            title: Some("Topic"),
+            title_state: Some(super::SessionTitleState {
+                topic: Some("Topic".to_string()),
+                topic_source: super::SessionTitleTopicSource::User,
+                references: Vec::new(),
+                activity: None,
+                extra: std::collections::BTreeMap::new(),
+            }),
+            explicit_id: Some("future-title-state"),
+            cwd: Path::new("/repo"),
+            prompt: None,
+            log_file_name: None,
+            provider_resume: None,
+            agent_args: Vec::new(),
+            agent_bin: None,
+        })
+        .unwrap();
+        drop(created);
+
+        let record_path = super::session_dir(&context, "future-title-state").join("session.json");
+        let mut raw: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&record_path).unwrap()).unwrap();
+        raw["title_state"]["future_field"] = serde_json::json!({ "enabled": true });
+        fs::write(&record_path, serde_json::to_vec_pretty(&raw).unwrap()).unwrap();
+
+        let mut record = super::load_session_record(&context, "future-title-state").unwrap();
+        let projected = serde_json::to_value(
+            super::effective_session_title_state(&record).expect("known title state projects"),
+        )
+        .unwrap();
+        assert!(projected.get("future_field").is_none());
+        record.updated_at = "2099-01-01T00:00:00Z".to_string();
+        super::write_session_record(&context, &record).unwrap();
+
+        let rewritten: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&record_path).unwrap()).unwrap();
+        assert_eq!(
+            rewritten["title_state"]["future_field"],
+            serde_json::json!({ "enabled": true })
+        );
     }
 
     fn create_test_record_id(
