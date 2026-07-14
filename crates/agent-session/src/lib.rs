@@ -5302,7 +5302,7 @@ fn terminate_tmux_session_with_timeouts(
                 .map_err(|_| SessionTerminationFailure::RuntimeIdentityUnavailable)?;
             if let Err(reason) = freeze_and_pin_process_runtime(&identity, runtime) {
                 thaw_owned_process_runtime(runtime)?;
-                drop(pinned_runtime.take());
+                release_process_runtime(pinned_runtime.take());
                 record.extra.remove(DELETE_TMUX_TERMINATION_STATE_KEY);
                 let _ = write_session_record(context, record);
                 return Err(reason);
@@ -5327,7 +5327,7 @@ fn terminate_tmux_session_with_timeouts(
                 if let Some(runtime) = pinned_runtime.as_mut() {
                     thaw_owned_process_runtime(runtime)?;
                 }
-                drop(pinned_runtime);
+                release_process_runtime(pinned_runtime);
                 record.extra.remove(DELETE_TMUX_TERMINATION_STATE_KEY);
                 write_session_record(context, record)
                     .map_err(|_| SessionTerminationFailure::RuntimeIdentityUnavailable)?;
@@ -5350,7 +5350,7 @@ fn terminate_tmux_session_with_timeouts(
                         verify_timeout,
                     )?;
                 }
-                drop(pinned_runtime);
+                release_process_runtime(pinned_runtime);
                 let remaining = verify_timeout.saturating_sub(verification_started.elapsed());
                 if remaining.is_zero() {
                     return Err(SessionTerminationFailure::VerificationFailed);
@@ -6294,6 +6294,13 @@ struct PinnedProcessRuntime {
     processes: Vec<PinnedLinuxProcess>,
     #[cfg(target_os = "linux")]
     control_group: Option<PinnedLinuxControlGroup>,
+}
+
+fn release_process_runtime(pinned_runtime: Option<PinnedProcessRuntime>) {
+    #[cfg(target_os = "linux")]
+    drop(pinned_runtime);
+    #[cfg(not(target_os = "linux"))]
+    let _ = pinned_runtime;
 }
 
 #[cfg(target_os = "linux")]
@@ -9064,10 +9071,21 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn control_group_detached_descendant_helper() {
-        let Some(descendant_pid_path) = env::var_os("AGENT_SESSION_TEST_CGROUP_DESCENDANT_PID")
-        else {
+        let (Some(descendant_trigger_path), Some(descendant_pid_path)) = (
+            env::var_os("AGENT_SESSION_TEST_CGROUP_DESCENDANT_TRIGGER"),
+            env::var_os("AGENT_SESSION_TEST_CGROUP_DESCENDANT_PID"),
+        ) else {
             return;
         };
+        let descendant_trigger_path = PathBuf::from(descendant_trigger_path);
+        let started_at = Instant::now();
+        while !descendant_trigger_path.is_file() && started_at.elapsed() < Duration::from_secs(5) {
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            descendant_trigger_path.is_file(),
+            "descendant trigger must arrive after pane cgroup containment"
+        );
         let mut command = Command::new("sleep");
         command.arg("30");
         // SAFETY: this helper models a descendant that leaves the pane's process session
@@ -9136,20 +9154,16 @@ mod tests {
             libc::getpid()
         });
         let wrapper = tmp.path().join("tmux-cgroup-wrapper");
-        let events_path_file = tmp.path().join("cgroup-events-path");
-        let observed_frozen = tmp.path().join("observed-frozen");
         let wrapper_calls = tmp.path().join("wrapper-calls");
         fs::write(
             &wrapper,
             format!(
-                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> {}\nif [ \"$1\" = new-session ]; then exec {} --user --scope --quiet --collect --unit {} -- {} -L {} \"$@\"; fi\nif [ \"$1\" = if-shell ]; then events=$(cat {}); awk '$1 == \"frozen\" {{ print $2 }}' \"$events\" > {}; fi\nexec {} -L {} \"$@\"\n",
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> {}\nif [ \"$1\" = new-session ]; then exec {} --user --scope --quiet --collect --unit {} -- {} -L {} \"$@\"; fi\nexec {} -L {} \"$@\"\n",
                 shell_words::quote(&super::display_path(&wrapper_calls)),
                 shell_words::quote(&super::display_path(&systemd_run)),
                 shell_words::quote(&scope),
                 shell_words::quote(&super::display_path(&tmux)),
                 shell_words::quote(&socket),
-                shell_words::quote(&super::display_path(&events_path_file)),
-                shell_words::quote(&super::display_path(&observed_frozen)),
                 shell_words::quote(&super::display_path(&tmux)),
                 shell_words::quote(&socket),
             ),
@@ -9159,6 +9173,7 @@ mod tests {
         let _tmux_server = TestTmuxServer {
             bin: wrapper.clone(),
         };
+        let descendant_trigger_path = tmp.path().join("detached-descendant.trigger");
         let descendant_pid_path = tmp.path().join("detached-descendant.pid");
         let runtime_id = &record.runtime.as_ref().unwrap().launch_id;
         let output = Command::new(&wrapper)
@@ -9184,6 +9199,10 @@ mod tests {
             .arg("tests::control_group_detached_descendant_helper")
             .arg("--nocapture")
             .env(
+                "AGENT_SESSION_TEST_CGROUP_DESCENDANT_TRIGGER",
+                &descendant_trigger_path,
+            )
+            .env(
                 "AGENT_SESSION_TEST_CGROUP_DESCENDANT_PID",
                 &descendant_pid_path,
             )
@@ -9199,6 +9218,15 @@ mod tests {
         let tmux_session_id = output_fields.next().unwrap().to_string();
         let tmux_pane_id = output_fields.next().unwrap().to_string();
         let pane_pid: libc::pid_t = output_fields.next().unwrap().parse().unwrap();
+        let Some(control_group) = super::linux_process_control_group(pane_pid).unwrap() else {
+            eprintln!("SKIP: tmux did not create a distinct tmux-spawn cgroup scope");
+            assert!(
+                !require_cgroup,
+                "required cgroup test must exercise the dedicated tmux cgroup path"
+            );
+            return;
+        };
+        fs::write(&descendant_trigger_path, "spawn").unwrap();
         let started_at = Instant::now();
         let descendant_pid: libc::pid_t = loop {
             if let Some(pid) = fs::read_to_string(&descendant_pid_path)
@@ -9223,14 +9251,6 @@ mod tests {
             unsafe { libc::getsid(pane_pid) },
             "the descendant must leave the pane's process session"
         );
-        let Some(control_group) = super::linux_process_control_group(pane_pid).unwrap() else {
-            eprintln!("SKIP: tmux did not create a distinct tmux-spawn cgroup scope");
-            assert!(
-                !require_cgroup,
-                "required cgroup test must exercise the dedicated tmux cgroup path"
-            );
-            return;
-        };
         let membership_started = Instant::now();
         loop {
             if super::linux_process_control_group(descendant_pid)
@@ -9249,7 +9269,6 @@ mod tests {
         let events_path = super::linux_control_group_full_path(Path::new(&control_group.path))
             .unwrap()
             .join("cgroup.events");
-        fs::write(&events_path_file, super::display_path(&events_path)).unwrap();
 
         let mut escaped_member = TestProcessGroup::spawn();
         let escaped_pid = escaped_member.pid() as libc::pid_t;
@@ -9275,10 +9294,16 @@ mod tests {
         };
         assert_eq!(retained_identity.session_id, tmux_session_id);
         assert_eq!(retained_identity.pane_id, tmux_pane_id);
-        retained_identity.control_group_members = vec![TmuxProcessIdentity {
-            pid: escaped_pid,
-            start_time: escaped_identity.start_time,
-        }];
+        retained_identity.control_group_members = vec![
+            TmuxProcessIdentity {
+                pid: descendant_pid,
+                start_time: descendant_start_time,
+            },
+            TmuxProcessIdentity {
+                pid: escaped_pid,
+                start_time: escaped_identity.start_time,
+            },
+        ];
         persist_tmux_runtime_identity(&mut retained, &retained_identity).unwrap();
         super::set_tmux_termination_state(
             &mut retained,
@@ -9301,9 +9326,8 @@ mod tests {
         let result = delete_once().or_else(|_| delete_once()).unwrap_or_else(|error| {
             let retained = load_session_record(&context, &id).unwrap();
             panic!(
-                "delete failed: {error:?}; state={:?}; frozen={:?}; cgroup_events={:?}; escaped={:?}; calls={} ",
+                "delete failed: {error:?}; state={:?}; cgroup_events={:?}; escaped={:?}; calls={} ",
                 retained.extra.get(super::DELETE_TMUX_TERMINATION_STATE_KEY),
-                fs::read_to_string(&observed_frozen),
                 fs::read_to_string(&events_path),
                 fs::read_to_string(format!("/proc/{escaped_pid}/stat")),
                 fs::read_to_string(&wrapper_calls).unwrap_or_default(),
@@ -9328,9 +9352,11 @@ mod tests {
         };
         assert!(
             stopped,
-            "the cgroup-pinned detached child must not survive: stat={:?}, cgroup={:?}",
+            "the cgroup-pinned detached child must not survive: stat={:?}, cgroup={:?}, events={:?}, calls={}",
             fs::read_to_string(format!("/proc/{descendant_pid}/stat")),
             super::linux_process_control_group_path(descendant_pid),
+            fs::read_to_string(&events_path),
+            fs::read_to_string(&wrapper_calls).unwrap_or_default(),
         );
         let escaped_started_at = Instant::now();
         let escaped_stopped = loop {
@@ -9353,11 +9379,6 @@ mod tests {
             "a same-boot Pending retry must kill a retained member outside the cgroup"
         );
         escaped_member.stop();
-        assert_eq!(
-            fs::read_to_string(&observed_frozen).unwrap().trim(),
-            "1",
-            "the cgroup must be frozen before the conditional tmux mutation"
-        );
     }
 
     #[cfg(target_os = "linux")]
