@@ -516,7 +516,7 @@ if ! (umask 077; mkfifo "$provider_stderr_pipe"); then
 fi
 tee "$startup_diagnostic_pipe" < "$provider_stderr_pipe" >&2 &
 provider_stderr_pid=$!
-"$agent" -c check_for_update_on_startup=false --remote "unix://$proxy" --cd "$cwd" --no-alt-screen "$@" 2>"$provider_stderr_pipe"
+"$agent" -c check_for_update_on_startup=false --remote "unix://$proxy" "$@" 2>"$provider_stderr_pipe"
 status=$?
 wait "$provider_stderr_pid" 2>/dev/null || true
 provider_stderr_pid=
@@ -3988,11 +3988,13 @@ exit 1
     }
 
     #[test]
-    fn managed_codex_client_launch_disables_startup_update_check_without_dropping_arguments() {
+    fn managed_codex_client_launch_disables_startup_update_check_without_owning_base_arguments() {
         let script = launch_script();
         assert!(script.contains(
-            "\"$agent\" -c check_for_update_on_startup=false --remote \"unix://$proxy\" --cd \"$cwd\" --no-alt-screen \"$@\""
+            "\"$agent\" -c check_for_update_on_startup=false --remote \"unix://$proxy\" \"$@\""
         ));
+        assert!(!script.contains("--cd \"$cwd\""));
+        assert!(!script.contains("--no-alt-screen \"$@\""));
     }
 
     #[test]
