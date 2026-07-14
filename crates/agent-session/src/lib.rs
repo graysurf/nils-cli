@@ -3759,6 +3759,10 @@ fn render_session_title_state(state: &SessionTitleState) -> Result<Option<String
 fn render_v122_legacy_session_title_state(
     state: &SessionTitleState,
 ) -> Result<Option<String>, CliError> {
+    // This compatibility output is a released v1.22.0 persistence contract.
+    // Its divergent reference-boundary cases are frozen by release-derived
+    // fixtures. A future renderer change must migrate stored pairs or retain
+    // those exact outputs before this transition path can be changed or removed.
     render_session_title_state_with_reference_matcher(state, v122_legacy_title_contains_reference)
 }
 
@@ -6927,6 +6931,41 @@ mod tests {
         let record =
             super::load_session_record(&context, "v122-compatible-title-boundary").unwrap();
         assert!(super::effective_session_title_state(&record).is_some());
+    }
+
+    #[test]
+    fn structured_title_v122_compatibility_outputs_match_release_fixtures() {
+        let render = |topic: &str, references: &[&str]| {
+            super::render_v122_legacy_session_title_state(&super::SessionTitleState {
+                topic: Some(topic.to_string()),
+                topic_source: super::SessionTitleTopicSource::Auto,
+                references: references
+                    .iter()
+                    .map(|reference| (*reference).to_string())
+                    .collect(),
+                activity: Some("Implement fix".to_string()),
+                extra: std::collections::BTreeMap::new(),
+            })
+            .unwrap()
+            .unwrap()
+        };
+
+        assert_eq!(
+            render("Parser #317alpha", &["#317"]),
+            "Parser #317alpha - Implement fix"
+        );
+        assert_eq!(
+            render("Parser #317_foo", &["#317"]),
+            "Parser #317_foo - Implement fix"
+        );
+        assert_eq!(
+            render("Parser #317alpha", &["#317", "#42"]),
+            "Parser #317alpha #42 - Implement fix"
+        );
+        assert_eq!(
+            render("Parser #317", &["#317"]),
+            "Parser #317 - Implement fix"
+        );
     }
 
     #[test]
