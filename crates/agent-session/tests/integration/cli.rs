@@ -3,14 +3,20 @@ use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::{PermissionsExt, symlink};
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicBool, Ordering},
+};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use nils_test_support::cmd::{CmdOptions, CmdOutput, run_resolved};
 use pretty_assertions::assert_eq;
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 
 fn run(dir: &Path, args: &[&str], envs: &[(&str, &str)]) -> CmdOutput {
     let options = CmdOptions::new().with_cwd(dir).with_envs(envs);
@@ -36,13 +42,104 @@ for arg in "$@"; do
 done
 printf '\036' >> "$AGENT_SESSION_FAKE_TMUX_LOG"
 
-if [ "${AGENT_SESSION_FAKE_TMUX_FAIL:-}" = "$1" ]; then
-  echo "fake tmux failed at $1" >&2
+operation="$1"
+if [ "$operation" = "if-shell" ]; then
+  operation="kill-session"
+fi
+if [ "${AGENT_SESSION_FAKE_TMUX_FAIL:-}" = "$operation" ]; then
+  echo "fake tmux failed at $operation" >&2
   exit 42
 fi
 
-if [ "$1" = "has-session" ] && [ "${AGENT_SESSION_FAKE_TMUX_HAS_SESSION:-1}" = "0" ]; then
+if [ "${AGENT_SESSION_FAKE_TMUX_ABSENT:-0}" = "1" ] && { [ "$1" = "display-message" ] || [ "$1" = "has-session" ]; }; then
+  printf "%s\n" "can't find session: ${target:-unknown}" >&2
   exit 1
+fi
+
+if [ "${AGENT_SESSION_FAKE_TMUX_ABSENT_BEFORE_LAUNCH:-0}" = "1" ] && { [ "$1" = "display-message" ] || [ "$1" = "has-session" ]; } && [ ! -f "$AGENT_SESSION_FAKE_TMUX_LOG.launched" ]; then
+  printf "%s\n" "can't find session: ${target:-unknown}" >&2
+  exit 1
+fi
+
+target=""
+previous=""
+for arg in "$@"; do
+  if [ "$previous" = "-t" ]; then
+    target="$arg"
+    break
+  fi
+  previous="$arg"
+done
+
+if [ "$1" = "kill-session" ]; then
+  printf '%s\n' "$target" >> "$AGENT_SESSION_FAKE_TMUX_LOG.killed"
+  if [ -n "${AGENT_SESSION_FAKE_TMUX_PROCESS_GROUP_ID:-}" ] && [ "${AGENT_SESSION_FAKE_TMUX_KEEP_PROCESS_GROUP:-0}" != "1" ]; then
+    kill -TERM "-${AGENT_SESSION_FAKE_TMUX_PROCESS_GROUP_ID}" 2>/dev/null || true
+  fi
+  exit 0
+fi
+
+if [ "$1" = "if-shell" ]; then
+  kill_target=""
+  for arg in "$@"; do
+    case "$arg" in
+      'kill-session -t '*) kill_target="${arg#kill-session -t }" ;;
+    esac
+  done
+  [ -n "$kill_target" ] || exit 42
+  printf '%s\n' "$kill_target" >> "$AGENT_SESSION_FAKE_TMUX_LOG.killed"
+  if [ -n "${AGENT_SESSION_FAKE_TMUX_PROCESS_GROUP_ID:-}" ] && [ "${AGENT_SESSION_FAKE_TMUX_KEEP_PROCESS_GROUP:-0}" != "1" ]; then
+    kill -TERM "-${AGENT_SESSION_FAKE_TMUX_PROCESS_GROUP_ID}" 2>/dev/null || true
+  fi
+  exit 0
+fi
+
+if [ "$1" = "has-session" ]; then
+  if [ "${AGENT_SESSION_FAKE_TMUX_HAS_SESSION:-1}" = "0" ]; then
+    printf "%s\n" "can't find session: $target" >&2
+    exit 1
+  fi
+  if [ -f "$AGENT_SESSION_FAKE_TMUX_LOG.killed" ]; then
+    while IFS= read -r killed_target; do
+      if [ "$killed_target" = "$target" ]; then
+        printf "%s\n" "can't find session: $target" >&2
+        exit 1
+      fi
+    done < "$AGENT_SESSION_FAKE_TMUX_LOG.killed"
+  fi
+  exit 0
+fi
+
+if [ "$1" = "display-message" ] && [ -n "${AGENT_SESSION_FAKE_TMUX_PANE_PID:-}" ]; then
+  last_arg=""
+  for arg in "$@"; do
+    last_arg="$arg"
+  done
+  case "$last_arg" in
+    *'#{pane_pid}')
+      session_identity="${AGENT_SESSION_FAKE_TMUX_SESSION_ID:-}"
+      [ -n "$session_identity" ] || session_identity='$77'
+      pane_identity="${AGENT_SESSION_FAKE_TMUX_PANE_ID:-}"
+      [ -n "$pane_identity" ] || pane_identity='%77'
+      printf '%s\t%s\t%s\n' "$session_identity" "$pane_identity" "$AGENT_SESSION_FAKE_TMUX_PANE_PID"
+      exit 0
+      ;;
+  esac
+fi
+
+if [ "$1" = "show-environment" ]; then
+  case "$4" in
+    AGENT_SESSION_ID) printf 'AGENT_SESSION_ID=%s\n' "$AGENT_SESSION_FAKE_TMUX_AGENT_SESSION_ID" ;;
+    AGENT_SESSION_STATE_DIR) printf 'AGENT_SESSION_STATE_DIR=%s\n' "$AGENT_SESSION_FAKE_TMUX_STATE_DIR" ;;
+    AGENT_SESSION_RUNTIME_ID)
+      runtime_id="${AGENT_SESSION_FAKE_TMUX_RUNTIME_ID:-}"
+      if [ -z "$runtime_id" ] && [ -n "${AGENT_SESSION_FAKE_TMUX_RUNTIME_RECORD:-}" ]; then
+        runtime_id="$(sed -n 's/.*"launch_id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$AGENT_SESSION_FAKE_TMUX_RUNTIME_RECORD" | head -n 1)"
+      fi
+      printf 'AGENT_SESSION_RUNTIME_ID=%s\n' "$runtime_id" ;;
+    *) exit 1 ;;
+  esac
+  exit 0
 fi
 
 if [ "$1" = "capture-pane" ]; then
@@ -102,12 +199,33 @@ if [ "$1" = "new-session" ] && [ "${AGENT_SESSION_FAKE_CODEX_SESSION_FILE+x}" = 
   IFS="$old_ifs"
 fi
 
+if [ "$1" = "new-session" ] && [ "${AGENT_SESSION_FAKE_RECORD_AT_NEW_SESSION+x}" = "x" ]; then
+  if ! grep -Eq '"generation"[[:space:]]*:[[:space:]]*2' "$AGENT_SESSION_FAKE_RECORD_AT_NEW_SESSION"; then
+    printf 'runtime generation was not persisted before tmux launch\n' >&2
+    exit 43
+  fi
+fi
+
 if [ "$1" = "new-session" ] && [ "${AGENT_SESSION_FAKE_CHMOD_AFTER_NEW_SESSION+x}" = "x" ]; then
   chmod "${AGENT_SESSION_FAKE_CHMOD_MODE:-0500}" "$AGENT_SESSION_FAKE_CHMOD_AFTER_NEW_SESSION"
 fi
 
 if [ "$1" = "new-session" ] && [ "${AGENT_SESSION_FAKE_MKDIR_AFTER_NEW_SESSION+x}" = "x" ]; then
   mkdir -p "$AGENT_SESSION_FAKE_MKDIR_AFTER_NEW_SESSION"
+fi
+
+if [ "$1" = "new-session" ]; then
+  : > "$AGENT_SESSION_FAKE_TMUX_LOG.launched"
+  if [ "${AGENT_SESSION_FAKE_TMUX_MALFORMED_LAUNCH_IDENTITY:-0}" = "1" ]; then
+    printf 'contaminated launch output\n'
+    exit 0
+  fi
+  session_identity="${AGENT_SESSION_FAKE_TMUX_SESSION_ID:-}"
+  [ -n "$session_identity" ] || session_identity='$77'
+  pane_identity="${AGENT_SESSION_FAKE_TMUX_PANE_ID:-}"
+  [ -n "$pane_identity" ] || pane_identity='%77'
+  pane_pid="${AGENT_SESSION_FAKE_TMUX_PANE_PID:-$$}"
+  printf '%s\t%s\t%s\n' "$session_identity" "$pane_identity" "$pane_pid"
 fi
 
 exit 0
@@ -174,6 +292,82 @@ fn stop_child(child: &mut Child) {
         let _ = child.kill();
     }
     let _ = child.wait();
+}
+
+struct TestProcessGroup {
+    pid: u32,
+    child: Arc<Mutex<Child>>,
+    stop_reaper: Arc<AtomicBool>,
+    reaper: Option<thread::JoinHandle<()>>,
+}
+
+impl TestProcessGroup {
+    fn pid(&self) -> u32 {
+        self.pid
+    }
+
+    fn is_running(&self) -> bool {
+        self.child
+            .lock()
+            .expect("test process lock")
+            .try_wait()
+            .expect("poll test process")
+            .is_none()
+    }
+
+    fn stop(&mut self) {
+        self.stop_reaper.store(true, Ordering::Release);
+        let mut child = self.child.lock().expect("test process lock");
+        if child.try_wait().expect("poll test process").is_none() {
+            let pgid = -(self.pid as libc::pid_t);
+            // SAFETY: the still-owned child leads this dedicated test process group.
+            unsafe {
+                libc::kill(pgid, libc::SIGKILL);
+            }
+            let _ = child.wait();
+        }
+        drop(child);
+        if let Some(reaper) = self.reaper.take() {
+            let _ = reaper.join();
+        }
+    }
+}
+
+impl Drop for TestProcessGroup {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+fn spawn_test_process_group() -> TestProcessGroup {
+    let mut command = Command::new("sleep");
+    command.arg("30").process_group(0);
+    let child = command.spawn().expect("spawn test process group");
+    let pid = child.id();
+    let child = Arc::new(Mutex::new(child));
+    let stop_reaper = Arc::new(AtomicBool::new(false));
+    let reaper_child = Arc::clone(&child);
+    let reaper_stop = Arc::clone(&stop_reaper);
+    let reaper = thread::spawn(move || {
+        while !reaper_stop.load(Ordering::Acquire) {
+            let stopped = reaper_child
+                .lock()
+                .expect("test process lock")
+                .try_wait()
+                .expect("poll test process")
+                .is_some();
+            if stopped {
+                return;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+    });
+    TestProcessGroup {
+        pid,
+        child,
+        stop_reaper,
+        reaper: Some(reaper),
+    }
 }
 
 fn tmux_calls(log: &Path) -> Vec<Vec<String>> {
@@ -3129,6 +3323,9 @@ fn start_creates_session_state_without_printing_prompt() {
         &vec![
             "new-session".to_string(),
             "-d".to_string(),
+            "-P".to_string(),
+            "-F".to_string(),
+            "#{session_id}\t#{pane_id}\t#{pane_pid}".to_string(),
             "-s".to_string(),
             result["tmux_session"].as_str().unwrap().to_string(),
             "-c".to_string(),
@@ -3175,6 +3372,8 @@ fn list_command_and_delete_manage_existing_session() {
     fs::create_dir_all(&cwd).expect("repo dir");
     let (tmux_bin, tmux_log) = fake_tmux(tmp.path());
     let claude_bin = fake_agent(tmp.path(), "claude");
+    let pane = spawn_test_process_group();
+    let pane_pid = pane.pid().to_string();
 
     let state_arg = state_dir.to_string_lossy().to_string();
     let cwd_arg = cwd.to_string_lossy().to_string();
@@ -3195,6 +3394,12 @@ fn list_command_and_delete_manage_existing_session() {
         (envs[0].0, envs[0].1.as_str()),
         (envs[1].0, envs[1].1.as_str()),
         (envs[2].0, envs[2].1.as_str()),
+    ];
+    let start_env_refs = [
+        (envs[0].0, envs[0].1.as_str()),
+        (envs[1].0, envs[1].1.as_str()),
+        (envs[2].0, envs[2].1.as_str()),
+        ("AGENT_SESSION_FAKE_TMUX_PANE_PID", pane_pid.as_str()),
     ];
 
     let start = run(
@@ -3220,7 +3425,7 @@ fn list_command_and_delete_manage_existing_session() {
             "--format",
             "json",
         ],
-        &env_refs,
+        &start_env_refs,
     );
     assert_eq!(start.code, 0, "stderr={}", start.stderr_text());
     let start_json = start.stdout_json();
@@ -3412,6 +3617,21 @@ fn list_command_and_delete_manage_existing_session() {
             .is_none()
     );
 
+    let runtime_id = record["runtime"]["launch_id"].as_str().unwrap();
+    let delete_env = [
+        (envs[0].0, envs[0].1.as_str()),
+        (envs[1].0, envs[1].1.as_str()),
+        (envs[2].0, envs[2].1.as_str()),
+        ("AGENT_SESSION_FAKE_TMUX_PANE_PID", pane_pid.as_str()),
+        (
+            "AGENT_SESSION_FAKE_TMUX_PROCESS_GROUP_ID",
+            pane_pid.as_str(),
+        ),
+        ("AGENT_SESSION_FAKE_TMUX_SESSION_ID", "$77"),
+        ("AGENT_SESSION_FAKE_TMUX_AGENT_SESSION_ID", id.as_str()),
+        ("AGENT_SESSION_FAKE_TMUX_STATE_DIR", state_arg.as_str()),
+        ("AGENT_SESSION_FAKE_TMUX_RUNTIME_ID", runtime_id),
+    ];
     let delete = run(
         tmp.path(),
         &[
@@ -3424,12 +3644,30 @@ fn list_command_and_delete_manage_existing_session() {
             "--format",
             "json",
         ],
-        &env_refs,
+        &delete_env,
     );
     assert_eq!(delete.code, 0, "stderr={}", delete.stderr_text());
     let delete_json = delete.stdout_json();
     assert_eq!(delete_json["schema_version"], "cli.agent-session.delete.v1");
     assert_eq!(data(&delete_json)["deleted"], true);
+    let delete_calls = tmux_calls(&tmux_log);
+    assert!(
+        delete_calls.iter().any(|call| {
+            call.first().is_some_and(|arg| arg == "if-shell")
+                && call.get(3).is_some_and(|arg| arg == "%77")
+                && call.get(5).is_some_and(|arg| arg == "kill-session -t $77")
+        }),
+        "delete must target only the recorded tmux session: {delete_calls:?}"
+    );
+    assert!(
+        delete_calls.iter().any(|call| call
+            == &vec![
+                "has-session".to_string(),
+                "-t".to_string(),
+                "$77".to_string(),
+            ]),
+        "delete must verify the recorded tmux session stopped: {delete_calls:?}"
+    );
 
     let list_again = run(
         tmp.path(),
@@ -3438,6 +3676,1426 @@ fn list_command_and_delete_manage_existing_session() {
     );
     assert_eq!(list_again.code, 0, "stderr={}", list_again.stderr_text());
     assert_eq!(data(&list_again.stdout_json()).as_array().unwrap().len(), 0);
+}
+
+#[test]
+fn delete_kill_failure_retains_codex_and_claude_runtime_state() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let state_dir = tmp.path().join("state");
+    let (tmux_bin, tmux_log) = fake_tmux(tmp.path());
+    let state_arg = state_dir.to_string_lossy().to_string();
+    let tmux_arg = tmux_bin.to_string_lossy().to_string();
+    let tmux_log_arg = tmux_log.to_string_lossy().to_string();
+
+    for agent in ["codex", "claude"] {
+        let id = format!("failed-delete-{agent}");
+        let tmux_session = format!("hs-{agent}-failed-delete");
+        let session_dir = write_session_record(&state_dir, &id, agent, &tmux_session);
+        let resume_path = session_dir.join("resume.json");
+        fs::write(&resume_path, format!("resume metadata for {agent}")).expect("resume metadata");
+
+        let record_path = session_dir.join("session.json");
+        let runtime_files = attach_provider_runtime(
+            tmp.path(),
+            &state_dir,
+            &session_dir,
+            &id,
+            agent,
+            &tmux_session,
+        );
+        let record: Value =
+            serde_json::from_str(&fs::read_to_string(&record_path).unwrap()).unwrap();
+        let runtime_id = record["runtime"]["launch_id"].as_str().unwrap();
+        let pane = spawn_test_process_group();
+        let pane_pid = pane.pid().to_string();
+
+        let output = run(
+            tmp.path(),
+            &[
+                "--state-dir",
+                &state_arg,
+                "delete",
+                &id,
+                "--tmux-bin",
+                &tmux_arg,
+                "--format",
+                "json",
+            ],
+            &[
+                ("AGENT_SESSION_FAKE_TMUX_LOG", &tmux_log_arg),
+                ("AGENT_SESSION_FAKE_TMUX_FAIL", "kill-session"),
+                ("AGENT_SESSION_FAKE_TMUX_PANE_PID", pane_pid.as_str()),
+                (
+                    "AGENT_SESSION_FAKE_TMUX_PROCESS_GROUP_ID",
+                    pane_pid.as_str(),
+                ),
+                ("AGENT_SESSION_FAKE_TMUX_SESSION_ID", "$77"),
+                ("AGENT_SESSION_FAKE_TMUX_AGENT_SESSION_ID", id.as_str()),
+                ("AGENT_SESSION_FAKE_TMUX_STATE_DIR", state_arg.as_str()),
+                ("AGENT_SESSION_FAKE_TMUX_RUNTIME_ID", runtime_id),
+            ],
+        );
+
+        assert_eq!(
+            output.code,
+            1,
+            "stdout={} stderr={}",
+            output.stdout_text(),
+            output.stderr_text()
+        );
+        let failure = output.stdout_json();
+        assert_eq!(failure["schema_version"], "cli.agent-session.delete.v1");
+        assert_eq!(failure["ok"], false);
+        assert_eq!(failure["error"]["code"], "session-termination-failed");
+        assert_eq!(failure["error"]["details"]["id"], id);
+        assert_eq!(failure["error"]["details"]["tmux_session"], tmux_session);
+        assert_eq!(failure["error"]["details"]["reason"], "kill-failed");
+        assert_eq!(failure["error"]["details"]["action"], "retry-delete");
+        assert!(session_dir.exists(), "{agent} state must remain retryable");
+        assert!(record_path.exists(), "{agent} session metadata must remain");
+        let retained: Value =
+            serde_json::from_str(&fs::read_to_string(&record_path).unwrap()).unwrap();
+        assert_eq!(retained["delete_tmux_identity"]["session_id"], "$77");
+        assert_eq!(retained["delete_tmux_identity"]["pane_id"], "%77");
+        assert_eq!(
+            retained["delete_tmux_identity"]["process_group_id"],
+            pane.pid()
+        );
+        assert_eq!(
+            fs::read_to_string(&resume_path).unwrap(),
+            format!("resume metadata for {agent}")
+        );
+        for runtime_file in runtime_files {
+            assert_eq!(
+                fs::read_to_string(runtime_file).unwrap(),
+                format!("runtime metadata for {agent}")
+            );
+        }
+        let calls = tmux_calls(&tmux_log);
+        assert!(
+            calls.iter().any(|call| call
+                == &vec![
+                    "display-message".to_string(),
+                    "-p".to_string(),
+                    "-t".to_string(),
+                    format!("={tmux_session}:0.0"),
+                    "#{session_id}\t#{pane_id}\t#{pane_pid}".to_string(),
+                ]),
+            "delete must inspect the managed 0.0 pane, not the active pane: {calls:?}"
+        );
+    }
+}
+
+#[test]
+fn delete_uses_launch_identity_after_runtime_stops_before_first_delete() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let state_dir = tmp.path().join("state");
+    let cwd = tmp.path().join("repo");
+    fs::create_dir_all(&cwd).expect("repo dir");
+    let (tmux_bin, tmux_log) = fake_tmux(tmp.path());
+    let state_arg = state_dir.to_string_lossy().to_string();
+    let cwd_arg = cwd.to_string_lossy().to_string();
+    let tmux_arg = tmux_bin.to_string_lossy().to_string();
+    let tmux_log_arg = tmux_log.to_string_lossy().to_string();
+
+    for agent in ["codex", "claude"] {
+        let agent_bin = fake_agent(tmp.path(), agent);
+        let agent_arg = agent_bin.to_string_lossy().to_string();
+        let id = format!("stopped-before-delete-{agent}");
+        let start = run(
+            tmp.path(),
+            &[
+                "--state-dir",
+                &state_arg,
+                "start",
+                "--agent",
+                agent,
+                "--id",
+                &id,
+                "--cwd",
+                &cwd_arg,
+                "--tmux-bin",
+                &tmux_arg,
+                "--agent-bin",
+                &agent_arg,
+                "--paste-delay-ms",
+                "0",
+                "--format",
+                "json",
+            ],
+            &[("AGENT_SESSION_FAKE_TMUX_LOG", &tmux_log_arg)],
+        );
+        assert_eq!(start.code, 0, "stdout={}", start.stdout_text());
+        let session_dir = state_dir.join("sessions").join(&id);
+        let record: Value = serde_json::from_slice(
+            &fs::read(session_dir.join("session.json")).expect("launched session record"),
+        )
+        .expect("session json");
+        assert_eq!(record["delete_tmux_identity"]["session_id"], "$77");
+        assert_eq!(record["delete_tmux_identity"]["pane_id"], "%77");
+        assert_eq!(
+            record["delete_tmux_identity"]["launch_id"],
+            record["runtime"]["launch_id"]
+        );
+
+        let delete = run(
+            tmp.path(),
+            &[
+                "--state-dir",
+                &state_arg,
+                "delete",
+                &id,
+                "--tmux-bin",
+                &tmux_arg,
+                "--format",
+                "json",
+            ],
+            &[
+                ("AGENT_SESSION_FAKE_TMUX_LOG", &tmux_log_arg),
+                ("AGENT_SESSION_FAKE_TMUX_ABSENT", "1"),
+            ],
+        );
+        assert_eq!(delete.code, 0, "stdout={}", delete.stdout_text());
+        assert_eq!(data(&delete.stdout_json())["deleted"], true);
+        assert!(
+            !session_dir.exists(),
+            "{agent} stopped state must be removed"
+        );
+    }
+}
+
+#[test]
+fn resume_refuses_to_replace_a_surviving_prior_launch_identity() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let state_dir = tmp.path().join("state");
+    let cwd = tmp.path().join("repo");
+    fs::create_dir_all(&cwd).expect("repo dir");
+    let (tmux_bin, tmux_log) = fake_tmux(tmp.path());
+    let codex_bin = fake_agent(tmp.path(), "codex");
+    let session = write_resumable_session_record_with_agent_bin(
+        &state_dir,
+        "resume-survivor",
+        "codex",
+        "hs-codex-resume-survivor",
+        &cwd,
+        &[
+            "resume",
+            "resume-session-id",
+            "--cd",
+            cwd.to_str().unwrap(),
+            "--no-alt-screen",
+        ],
+        Some(&codex_bin),
+    );
+    let record_path = session.join("session.json");
+    let mut record: Value = serde_json::from_slice(&fs::read(&record_path).unwrap()).unwrap();
+    record["runtime"]["launch_id"] = json!("prior-launch");
+    let mut prior_process = spawn_test_process_group();
+    record["delete_tmux_identity"] = json!({
+        "launch_id": "prior-launch",
+        "session_id": "$66",
+        "pane_id": "%66",
+        "pane_pid": 99999999,
+        "process_group_id": 99999999,
+    });
+    record["delete_tmux_prior_identities"] = json!([{
+        "launch_id": "prior-launch",
+        "session_id": "$66",
+        "pane_id": "%66",
+        "pane_pid": prior_process.pid(),
+        "process_group_id": prior_process.pid(),
+    }]);
+    fs::write(&record_path, serde_json::to_vec_pretty(&record).unwrap()).unwrap();
+
+    let state_arg = state_dir.to_string_lossy().to_string();
+    let tmux_arg = tmux_bin.to_string_lossy().to_string();
+    let tmux_log_arg = tmux_log.to_string_lossy().to_string();
+    let resume_args = [
+        "--state-dir",
+        &state_arg,
+        "resume",
+        "resume-survivor",
+        "--tmux-bin",
+        &tmux_arg,
+        "--format",
+        "json",
+    ];
+    let envs = [
+        ("AGENT_SESSION_FAKE_TMUX_LOG", tmux_log_arg.as_str()),
+        ("AGENT_SESSION_FAKE_TMUX_ABSENT", "1"),
+    ];
+
+    let blocked = run(tmp.path(), &resume_args, &envs);
+    assert_eq!(blocked.code, 1, "stdout={}", blocked.stdout_text());
+    let blocked_json = blocked.stdout_json();
+    assert_eq!(
+        blocked_json["error"]["details"]["reason"],
+        "process-still-running"
+    );
+    assert_eq!(blocked_json["error"]["details"]["retryable"], true);
+    assert_eq!(blocked_json["error"]["details"]["action"], "retry-resume");
+    let retained: Value = serde_json::from_slice(&fs::read(&record_path).unwrap()).unwrap();
+    assert_eq!(retained["runtime"]["launch_id"], "prior-launch");
+    assert_eq!(retained["delete_tmux_identity"]["session_id"], "$66");
+    assert_eq!(
+        retained["delete_tmux_prior_identities"][0]["process_group_id"],
+        prior_process.pid()
+    );
+    assert!(
+        tmux_calls(&tmux_log)
+            .iter()
+            .all(|call| call.first().is_none_or(|arg| arg != "new-session")),
+        "resume must not replace a runtime that still has surviving processes"
+    );
+
+    prior_process.stop();
+    let resumed = run(tmp.path(), &resume_args, &envs);
+    assert_eq!(resumed.code, 0, "stdout={}", resumed.stdout_text());
+    let replaced: Value = serde_json::from_slice(&fs::read(&record_path).unwrap()).unwrap();
+    assert_ne!(replaced["runtime"]["launch_id"], "prior-launch");
+    assert_eq!(
+        replaced["delete_tmux_identity"]["launch_id"],
+        replaced["runtime"]["launch_id"]
+    );
+    assert_eq!(replaced["delete_tmux_identity"]["session_id"], "$77");
+    assert!(replaced.get("delete_tmux_prior_identities").is_none());
+}
+
+#[test]
+fn resume_refuses_unprovable_pre_upgrade_codex_and_claude_runtimes() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let state_dir = tmp.path().join("state");
+    let cwd = tmp.path().join("repo");
+    fs::create_dir_all(&cwd).expect("repo dir");
+    let (tmux_bin, tmux_log) = fake_tmux(tmp.path());
+    let state_arg = state_dir.to_string_lossy().to_string();
+    let tmux_arg = tmux_bin.to_string_lossy().to_string();
+    let tmux_log_arg = tmux_log.to_string_lossy().to_string();
+
+    for agent in ["codex", "claude"] {
+        for runtime_shape in ["identity-free", "omitted"] {
+            let id = format!("unprovable-resume-{agent}-{runtime_shape}");
+            let tmux_session = format!("hs-{agent}-unprovable-resume-{runtime_shape}");
+            let resume_args = match agent {
+                "codex" => vec![
+                    "resume",
+                    "resume-session-id",
+                    "--cd",
+                    cwd.to_str().unwrap(),
+                    "--no-alt-screen",
+                ],
+                "claude" => vec!["--resume", "resume-session-id"],
+                _ => unreachable!(),
+            };
+            let session_dir = write_resumable_session_record(
+                &state_dir,
+                &id,
+                agent,
+                &tmux_session,
+                &cwd,
+                &resume_args,
+            );
+            let record_path = session_dir.join("session.json");
+            let mut record: Value =
+                serde_json::from_slice(&fs::read(&record_path).expect("session record")).unwrap();
+            let record = record.as_object_mut().unwrap();
+            record.remove("startup");
+            record.remove("tmux_runtime_never_launched");
+            if runtime_shape == "omitted" {
+                record.remove("runtime");
+            }
+            fs::write(&record_path, serde_json::to_vec_pretty(&record).unwrap()).unwrap();
+            let before = fs::read(&record_path).expect("session record");
+            let output = run(
+                tmp.path(),
+                &[
+                    "--state-dir",
+                    &state_arg,
+                    "resume",
+                    &id,
+                    "--tmux-bin",
+                    &tmux_arg,
+                    "--format",
+                    "json",
+                ],
+                &[
+                    ("AGENT_SESSION_FAKE_TMUX_LOG", &tmux_log_arg),
+                    ("AGENT_SESSION_FAKE_TMUX_ABSENT", "1"),
+                ],
+            );
+
+            assert_eq!(output.code, 1, "stdout={}", output.stdout_text());
+            let error = output.stdout_json();
+            assert_eq!(error["error"]["code"], "session-termination-failed");
+            assert_eq!(
+                error["error"]["details"]["reason"],
+                "runtime-identity-unavailable"
+            );
+            assert_eq!(error["error"]["details"]["retryable"], false);
+            assert_eq!(
+                error["error"]["details"]["action"],
+                "manual-runtime-verification-required"
+            );
+            assert_eq!(
+                fs::read(&record_path).expect("retained session record"),
+                before,
+                "resume must preserve the unprovable {agent} {runtime_shape} record"
+            );
+        }
+    }
+
+    assert!(
+        tmux_calls(&tmux_log)
+            .iter()
+            .all(|call| call.first().is_none_or(|arg| arg != "new-session")),
+        "unprovable pre-upgrade runtimes must never be replaced"
+    );
+}
+
+#[test]
+fn pre_upgrade_delete_handles_live_identity_and_explains_unprovable_stopped_state() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let state_dir = tmp.path().join("state");
+    let (tmux_bin, tmux_log) = fake_tmux(tmp.path());
+    let state_arg = state_dir.to_string_lossy().to_string();
+    let tmux_arg = tmux_bin.to_string_lossy().to_string();
+    let tmux_log_arg = tmux_log.to_string_lossy().to_string();
+
+    for agent in ["codex", "claude"] {
+        let live_id = format!("pre-upgrade-live-{agent}");
+        let live_session = format!("hs-{agent}-pre-upgrade-live");
+        let live_dir = write_session_record(&state_dir, &live_id, agent, &live_session);
+        let live_process = spawn_test_process_group();
+        let live_pid = live_process.pid().to_string();
+        let live_delete = run(
+            tmp.path(),
+            &[
+                "--state-dir",
+                &state_arg,
+                "delete",
+                &live_id,
+                "--tmux-bin",
+                &tmux_arg,
+                "--format",
+                "json",
+            ],
+            &[
+                ("AGENT_SESSION_FAKE_TMUX_LOG", &tmux_log_arg),
+                ("AGENT_SESSION_FAKE_TMUX_PANE_PID", &live_pid),
+                ("AGENT_SESSION_FAKE_TMUX_PROCESS_GROUP_ID", &live_pid),
+                ("AGENT_SESSION_FAKE_TMUX_AGENT_SESSION_ID", &live_id),
+                ("AGENT_SESSION_FAKE_TMUX_STATE_DIR", &state_arg),
+            ],
+        );
+        assert_eq!(live_delete.code, 0, "stdout={}", live_delete.stdout_text());
+        assert!(
+            !live_dir.exists(),
+            "live pre-upgrade {agent} state must delete"
+        );
+
+        let stopped_id = format!("pre-upgrade-stopped-{agent}");
+        let stopped_session = format!("hs-{agent}-pre-upgrade-stopped");
+        let stopped_dir = write_session_record(&state_dir, &stopped_id, agent, &stopped_session);
+        let stopped_delete = run(
+            tmp.path(),
+            &[
+                "--state-dir",
+                &state_arg,
+                "delete",
+                &stopped_id,
+                "--tmux-bin",
+                &tmux_arg,
+                "--format",
+                "json",
+            ],
+            &[
+                ("AGENT_SESSION_FAKE_TMUX_LOG", &tmux_log_arg),
+                ("AGENT_SESSION_FAKE_TMUX_ABSENT", "1"),
+            ],
+        );
+        assert_eq!(
+            stopped_delete.code,
+            1,
+            "stdout={}",
+            stopped_delete.stdout_text()
+        );
+        let error = stopped_delete.stdout_json();
+        assert_eq!(
+            error["error"]["details"]["reason"],
+            "runtime-identity-unavailable"
+        );
+        assert_eq!(error["error"]["details"]["retryable"], false);
+        assert_eq!(
+            error["error"]["details"]["action"],
+            "manual-runtime-verification-required"
+        );
+        assert!(stopped_dir.exists(), "unprovable {agent} state must remain");
+    }
+}
+
+#[test]
+fn delete_accepts_current_generation_never_launched_proof_for_codex_and_claude() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let state_dir = tmp.path().join("state");
+    let (tmux_bin, tmux_log) = fake_tmux(tmp.path());
+    let state_arg = state_dir.to_string_lossy().to_string();
+    let tmux_arg = tmux_bin.to_string_lossy().to_string();
+    let tmux_log_arg = tmux_log.to_string_lossy().to_string();
+
+    for agent in ["codex", "claude"] {
+        let id = format!("never-launched-delete-{agent}");
+        let tmux_session = format!("hs-{agent}-never-launched-delete");
+        let session_dir = write_session_record(&state_dir, &id, agent, &tmux_session);
+        let runtime_files = attach_provider_runtime(
+            tmp.path(),
+            &state_dir,
+            &session_dir,
+            &id,
+            agent,
+            &tmux_session,
+        );
+        let record_path = session_dir.join("session.json");
+        let mut record: Value =
+            serde_json::from_slice(&fs::read(&record_path).expect("session record")).unwrap();
+        record["tmux_runtime_never_launched"] = record["runtime"]["launch_id"].clone();
+        record
+            .as_object_mut()
+            .expect("session object")
+            .remove("delete_tmux_identity");
+        fs::write(&record_path, serde_json::to_vec_pretty(&record).unwrap()).unwrap();
+
+        let output = run(
+            tmp.path(),
+            &[
+                "--state-dir",
+                &state_arg,
+                "delete",
+                &id,
+                "--tmux-bin",
+                &tmux_arg,
+                "--format",
+                "json",
+            ],
+            &[
+                ("AGENT_SESSION_FAKE_TMUX_LOG", &tmux_log_arg),
+                ("AGENT_SESSION_FAKE_TMUX_ABSENT", "1"),
+            ],
+        );
+
+        assert_eq!(output.code, 0, "stdout={}", output.stdout_text());
+        assert_eq!(data(&output.stdout_json())["deleted"], true);
+        assert!(!session_dir.exists(), "{agent} metadata must be removed");
+        assert!(
+            runtime_files.iter().all(|path| !path.exists()),
+            "{agent} runtime metadata must be removed"
+        );
+    }
+
+    let calls = tmux_calls(&tmux_log);
+    assert!(
+        calls
+            .iter()
+            .all(|call| call.first().is_none_or(|arg| arg != "kill-session")),
+        "a definitively unlaunched runtime must not invoke kill-session: {calls:?}"
+    );
+}
+
+#[test]
+fn successful_delete_removes_codex_and_claude_runtime_state() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let state_dir = tmp.path().join("state");
+    let (tmux_bin, tmux_log) = fake_tmux(tmp.path());
+    let state_arg = state_dir.to_string_lossy().to_string();
+    let tmux_arg = tmux_bin.to_string_lossy().to_string();
+    let tmux_log_arg = tmux_log.to_string_lossy().to_string();
+
+    for agent in ["codex", "claude"] {
+        let id = format!("successful-delete-{agent}");
+        let tmux_session = format!("hs-{agent}-successful-delete");
+        let session_dir = write_session_record(&state_dir, &id, agent, &tmux_session);
+        let runtime_files = attach_provider_runtime(
+            tmp.path(),
+            &state_dir,
+            &session_dir,
+            &id,
+            agent,
+            &tmux_session,
+        );
+        let record: Value =
+            serde_json::from_str(&fs::read_to_string(session_dir.join("session.json")).unwrap())
+                .unwrap();
+        let runtime_id = record["runtime"]["launch_id"].as_str().unwrap();
+        let pane = spawn_test_process_group();
+        let pane_pid = pane.pid().to_string();
+
+        let output = run(
+            tmp.path(),
+            &[
+                "--state-dir",
+                &state_arg,
+                "delete",
+                &id,
+                "--tmux-bin",
+                &tmux_arg,
+                "--format",
+                "json",
+            ],
+            &[
+                ("AGENT_SESSION_FAKE_TMUX_LOG", &tmux_log_arg),
+                ("AGENT_SESSION_FAKE_TMUX_PANE_PID", pane_pid.as_str()),
+                (
+                    "AGENT_SESSION_FAKE_TMUX_PROCESS_GROUP_ID",
+                    pane_pid.as_str(),
+                ),
+                ("AGENT_SESSION_FAKE_TMUX_SESSION_ID", "$77"),
+                ("AGENT_SESSION_FAKE_TMUX_AGENT_SESSION_ID", id.as_str()),
+                ("AGENT_SESSION_FAKE_TMUX_STATE_DIR", state_arg.as_str()),
+                ("AGENT_SESSION_FAKE_TMUX_RUNTIME_ID", runtime_id),
+            ],
+        );
+
+        assert_eq!(output.code, 0, "stderr={}", output.stderr_text());
+        let result = output.stdout_json();
+        assert_eq!(result["ok"], true);
+        assert_eq!(data(&result)["killed"], true);
+        assert_eq!(data(&result)["deleted"], true);
+        assert!(!session_dir.exists(), "{agent} metadata must be removed");
+        for runtime_file in runtime_files {
+            assert!(
+                !runtime_file.exists(),
+                "{} must be removed",
+                runtime_file.display()
+            );
+        }
+    }
+
+    let calls = tmux_calls(&tmux_log);
+    for agent in ["codex", "claude"] {
+        assert!(
+            calls.iter().any(|call| {
+                call.first().is_some_and(|arg| arg == "if-shell")
+                    && call.get(3).is_some_and(|arg| arg == "%77")
+                    && call.get(5).is_some_and(|arg| arg == "kill-session -t $77")
+            }),
+            "successful delete must kill each captured immutable target ({agent}): {calls:?}"
+        );
+    }
+}
+
+#[test]
+fn delete_operational_tmux_probe_error_retains_codex_and_claude_state() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let state_dir = tmp.path().join("state");
+    let tmux_bin = tmp.path().join("tmux-probe-error");
+    let tmux_arg = tmux_bin.to_string_lossy().to_string();
+    let state_arg = state_dir.to_string_lossy().to_string();
+    write_executable(
+        &tmux_bin,
+        "#!/usr/bin/env sh\necho 'error connecting to /tmp/tmux-test/default (No such file or directory)' >&2\nexit 1\n",
+    );
+
+    for agent in ["codex", "claude"] {
+        let id = format!("probe-error-{agent}");
+        let tmux_session = format!("hs-{agent}-probe-error");
+        let session_dir = write_session_record(&state_dir, &id, agent, &tmux_session);
+        let runtime_files = attach_provider_runtime(
+            tmp.path(),
+            &state_dir,
+            &session_dir,
+            &id,
+            agent,
+            &tmux_session,
+        );
+        let output = run(
+            tmp.path(),
+            &[
+                "--state-dir",
+                &state_arg,
+                "delete",
+                &id,
+                "--tmux-bin",
+                &tmux_arg,
+                "--format",
+                "json",
+            ],
+            &[],
+        );
+
+        assert_eq!(output.code, 1, "stdout={}", output.stdout_text());
+        let error = output.stdout_json();
+        assert_eq!(error["error"]["code"], "session-termination-failed");
+        assert_eq!(error["error"]["details"]["reason"], "verification-failed");
+        assert!(session_dir.exists(), "{agent} metadata must remain");
+        assert!(runtime_files.iter().all(|path| path.exists()));
+    }
+}
+
+#[test]
+fn delete_runtime_identity_mismatch_never_kills_the_exact_name_reuse() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let state_dir = tmp.path().join("state");
+    let id = "identity-mismatch";
+    let tmux_session = "hs-codex-identity-mismatch";
+    let session_dir = write_session_record(&state_dir, id, "codex", tmux_session);
+    attach_provider_runtime(
+        tmp.path(),
+        &state_dir,
+        &session_dir,
+        id,
+        "codex",
+        tmux_session,
+    );
+    let tmux_bin = tmp.path().join("tmux-identity-mismatch");
+    let killed = tmp.path().join("wrong-session-killed");
+    write_executable(
+        &tmux_bin,
+        &format!(
+            "#!/usr/bin/env sh\ncase \"$1\" in\n  display-message) printf '$91\\t%%91\\t99999999\\n'; exit 0 ;;
+  show-environment)\n    case \"$4\" in\n      AGENT_SESSION_ID) printf 'AGENT_SESSION_ID=unrelated-session\\n' ;;
+      AGENT_SESSION_STATE_DIR) printf 'AGENT_SESSION_STATE_DIR={}\\n' ;;
+      AGENT_SESSION_RUNTIME_ID) printf 'AGENT_SESSION_RUNTIME_ID=unrelated-runtime\\n' ;;
+    esac\n    exit 0 ;;
+  has-session) [ -f {} ] && exit 1; exit 0 ;;
+  if-shell) : > {}; exit 0 ;;
+esac\nexit 42\n",
+            state_dir.display(),
+            killed.display(),
+            killed.display(),
+        ),
+    );
+    let output = run(
+        tmp.path(),
+        &[
+            "--state-dir",
+            &state_dir.to_string_lossy(),
+            "delete",
+            id,
+            "--tmux-bin",
+            &tmux_bin.to_string_lossy(),
+            "--format",
+            "json",
+        ],
+        &[],
+    );
+
+    assert_eq!(output.code, 1, "stdout={}", output.stdout_text());
+    assert_eq!(
+        output.stdout_json()["error"]["details"]["reason"],
+        "runtime-identity-mismatch"
+    );
+    assert!(!killed.exists(), "the reused exact name must not be killed");
+    assert!(session_dir.exists());
+}
+
+#[test]
+fn delete_retains_original_process_identity_when_tmux_pane_respawns() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let state_dir = tmp.path().join("state");
+    let tmux_bin = tmp.path().join("tmux-respawned-pane");
+    let tmux_log = tmp.path().join("tmux-respawned-pane.log");
+    let tmux_stopped = tmp.path().join("tmux-respawned-pane.stopped");
+    let id = "respawned-pane";
+    let tmux_session = "hs-codex-respawned-pane";
+    let session_dir = write_session_record(&state_dir, id, "codex", tmux_session);
+    attach_provider_runtime(
+        tmp.path(),
+        &state_dir,
+        &session_dir,
+        id,
+        "codex",
+        tmux_session,
+    );
+    let record_path = session_dir.join("session.json");
+    let mut old_pane = spawn_test_process_group();
+    let mut live_pane = spawn_test_process_group();
+    let mut record: Value = serde_json::from_slice(&fs::read(&record_path).unwrap()).unwrap();
+    let launch_id = record["runtime"]["launch_id"].as_str().unwrap().to_string();
+    record["delete_tmux_identity"] = json!({
+        "launch_id": launch_id,
+        "session_id": "$77",
+        "pane_id": "%77",
+        "pane_pid": old_pane.pid(),
+        "process_group_id": old_pane.pid(),
+    });
+    fs::write(&record_path, serde_json::to_vec_pretty(&record).unwrap()).unwrap();
+
+    write_executable(
+        &tmux_bin,
+        &format!(
+            r#"#!/usr/bin/env sh
+printf '%s\n' "$*" >> {tmux_log}
+case "$1" in
+  display-message)
+    if [ -f {tmux_stopped} ]; then
+      printf "%s\n" "can't find session: {tmux_session}" >&2
+      exit 1
+    fi
+    printf '$77\t%%77\t{live_pid}\n'
+    ;;
+  show-environment)
+    case "$4" in
+      AGENT_SESSION_ID) printf 'AGENT_SESSION_ID=%s\n' {id} ;;
+      AGENT_SESSION_STATE_DIR) printf 'AGENT_SESSION_STATE_DIR=%s\n' {state_dir} ;;
+      AGENT_SESSION_RUNTIME_ID) printf 'AGENT_SESSION_RUNTIME_ID=%s\n' {launch_id} ;;
+    esac
+    ;;
+  kill-session)
+    : > {tmux_stopped}
+    ;;
+  has-session)
+    if [ -f {tmux_stopped} ]; then
+      printf "%s\n" "can't find session: $77" >&2
+      exit 1
+    fi
+    ;;
+  *) exit 42 ;;
+esac
+exit 0
+"#,
+            tmux_log = shell_words::quote(&tmux_log.to_string_lossy()),
+            tmux_stopped = shell_words::quote(&tmux_stopped.to_string_lossy()),
+            live_pid = live_pane.pid(),
+            id = shell_words::quote(id),
+            state_dir = shell_words::quote(&state_dir.to_string_lossy()),
+            launch_id = shell_words::quote(&launch_id),
+        ),
+    );
+
+    let state_arg = state_dir.to_string_lossy().to_string();
+    let tmux_arg = tmux_bin.to_string_lossy().to_string();
+    let output = run(
+        tmp.path(),
+        &[
+            "--state-dir",
+            &state_arg,
+            "delete",
+            id,
+            "--tmux-bin",
+            &tmux_arg,
+            "--format",
+            "json",
+        ],
+        &[],
+    );
+
+    assert_eq!(output.code, 1, "stdout={}", output.stdout_text());
+    let error = output.stdout_json();
+    assert_eq!(error["error"]["code"], "session-termination-failed");
+    assert_eq!(error["error"]["details"]["reason"], "process-still-running");
+    assert_eq!(error["error"]["details"]["retryable"], true);
+    assert_eq!(error["error"]["details"]["action"], "retry-delete");
+    assert!(
+        session_dir.exists(),
+        "original process evidence must remain"
+    );
+    assert!(
+        old_pane.is_running(),
+        "the original pane group must still be live"
+    );
+    let retained: Value = serde_json::from_slice(&fs::read(&record_path).unwrap()).unwrap();
+    assert_eq!(
+        retained["delete_tmux_identity"]["pane_pid"],
+        live_pane.pid()
+    );
+    assert_eq!(
+        retained["delete_tmux_identity"]["process_group_id"],
+        live_pane.pid()
+    );
+    assert_eq!(
+        retained["delete_tmux_prior_identities"][0]["pane_pid"],
+        old_pane.pid()
+    );
+    assert_eq!(
+        retained["delete_tmux_prior_identities"][0]["process_group_id"],
+        old_pane.pid()
+    );
+
+    fs::write(&tmux_stopped, b"").unwrap();
+    old_pane.stop();
+    let retry = run(
+        tmp.path(),
+        &[
+            "--state-dir",
+            &state_arg,
+            "delete",
+            id,
+            "--tmux-bin",
+            &tmux_arg,
+            "--format",
+            "json",
+        ],
+        &[],
+    );
+    assert_eq!(retry.code, 1, "stdout={}", retry.stdout_text());
+    let retry_error = retry.stdout_json();
+    assert_eq!(
+        retry_error["error"]["details"]["reason"],
+        "process-still-running"
+    );
+    assert!(
+        session_dir.exists(),
+        "replacement process evidence must remain"
+    );
+    assert!(
+        live_pane.is_running(),
+        "the replacement pane group must still be live"
+    );
+    let retained: Value = serde_json::from_slice(&fs::read(&record_path).unwrap()).unwrap();
+    assert_eq!(
+        retained["delete_tmux_identity"]["pane_pid"],
+        live_pane.pid()
+    );
+    assert_eq!(
+        retained["delete_tmux_identity"]["process_group_id"],
+        live_pane.pid()
+    );
+    let calls = fs::read_to_string(&tmux_log).unwrap();
+    assert_eq!(calls.matches("kill-session -t $77").count(), 0, "{calls}");
+
+    live_pane.stop();
+    let final_retry = run(
+        tmp.path(),
+        &[
+            "--state-dir",
+            &state_arg,
+            "delete",
+            id,
+            "--tmux-bin",
+            &tmux_arg,
+            "--format",
+            "json",
+        ],
+        &[],
+    );
+    assert_eq!(final_retry.code, 0, "stdout={}", final_retry.stdout_text());
+    assert!(!session_dir.exists(), "retry must remove stopped state");
+}
+
+#[test]
+fn delete_fails_closed_when_the_managed_pane_respawns_at_kill_time() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let state_dir = tmp.path().join("state");
+    let tmux_bin = tmp.path().join("tmux-kill-time-respawn");
+    let tmux_log = tmp.path().join("tmux-kill-time-respawn.log");
+    let tmux_switched = tmp.path().join("tmux-kill-time-respawn.switched");
+    let tmux_stopped = tmp.path().join("tmux-kill-time-respawn.stopped");
+    let id = "kill-time-respawn";
+    let tmux_session = "hs-codex-kill-time-respawn";
+    let session_dir = write_session_record(&state_dir, id, "codex", tmux_session);
+    attach_provider_runtime(
+        tmp.path(),
+        &state_dir,
+        &session_dir,
+        id,
+        "codex",
+        tmux_session,
+    );
+    let record_path = session_dir.join("session.json");
+    let mut captured_pane = spawn_test_process_group();
+    let mut replacement_pane = spawn_test_process_group();
+    let mut record: Value = serde_json::from_slice(&fs::read(&record_path).unwrap()).unwrap();
+    let launch_id = record["runtime"]["launch_id"].as_str().unwrap().to_string();
+    record["delete_tmux_identity"] = json!({
+        "launch_id": launch_id,
+        "session_id": "$78",
+        "pane_id": "%78",
+        "pane_pid": captured_pane.pid(),
+        "process_group_id": captured_pane.pid(),
+    });
+    fs::write(&record_path, serde_json::to_vec_pretty(&record).unwrap()).unwrap();
+
+    write_executable(
+        &tmux_bin,
+        &format!(
+            r#"#!/usr/bin/env sh
+printf '%s\n' "$*" >> {tmux_log}
+case "$1" in
+  display-message)
+    if [ -f {tmux_stopped} ]; then
+      printf "%s\n" "can't find session: {tmux_session}" >&2
+      exit 1
+    fi
+    if [ -f {tmux_switched} ]; then
+      printf '$78\t%%78\t{replacement_pid}\n'
+    else
+      printf '$78\t%%78\t{captured_pid}\n'
+    fi
+    ;;
+  show-environment)
+    case "$4" in
+      AGENT_SESSION_ID) printf 'AGENT_SESSION_ID=%s\n' {id} ;;
+      AGENT_SESSION_STATE_DIR) printf 'AGENT_SESSION_STATE_DIR=%s\n' {state_dir} ;;
+      AGENT_SESSION_RUNTIME_ID) printf 'AGENT_SESSION_RUNTIME_ID=%s\n' {launch_id} ;;
+    esac
+    ;;
+  kill-session)
+    /bin/kill -TERM -- -{captured_pid} 2>/dev/null || true
+    : > {tmux_switched}
+    : > {tmux_stopped}
+    ;;
+  if-shell)
+    if [ ! -f {tmux_switched} ]; then
+      /bin/kill -TERM -- -{captured_pid} 2>/dev/null || true
+      : > {tmux_switched}
+      printf 'agent-session-runtime-identity-changed\n'
+    else
+      : > {tmux_stopped}
+    fi
+    ;;
+  has-session)
+    if [ -f {tmux_stopped} ]; then
+      printf "%s\n" "can't find session: $78" >&2
+      exit 1
+    fi
+    ;;
+  *) exit 42 ;;
+esac
+exit 0
+"#,
+            tmux_log = shell_words::quote(&tmux_log.to_string_lossy()),
+            tmux_switched = shell_words::quote(&tmux_switched.to_string_lossy()),
+            tmux_stopped = shell_words::quote(&tmux_stopped.to_string_lossy()),
+            captured_pid = captured_pane.pid(),
+            replacement_pid = replacement_pane.pid(),
+            id = shell_words::quote(id),
+            state_dir = shell_words::quote(&state_dir.to_string_lossy()),
+            launch_id = shell_words::quote(&launch_id),
+        ),
+    );
+
+    let output = run(
+        tmp.path(),
+        &[
+            "--state-dir",
+            &state_dir.to_string_lossy(),
+            "delete",
+            id,
+            "--tmux-bin",
+            &tmux_bin.to_string_lossy(),
+            "--format",
+            "json",
+        ],
+        &[],
+    );
+
+    assert_eq!(output.code, 1, "stdout={}", output.stdout_text());
+    let error = output.stdout_json();
+    assert_eq!(error["error"]["code"], "session-termination-failed");
+    assert_eq!(error["error"]["details"]["reason"], "process-still-running");
+    assert_eq!(error["error"]["details"]["retryable"], true);
+    assert_eq!(error["error"]["details"]["action"], "retry-delete");
+    assert!(session_dir.exists(), "replacement evidence must remain");
+    assert!(replacement_pane.is_running());
+    let retained: Value = serde_json::from_slice(&fs::read(&record_path).unwrap()).unwrap();
+    assert_eq!(
+        retained["delete_tmux_identity"]["process_group_id"],
+        replacement_pane.pid()
+    );
+    let calls = fs::read_to_string(&tmux_log).unwrap();
+    assert!(calls.contains("if-shell -F -t %78"), "{calls}");
+    assert!(
+        tmux_calls(&tmux_log)
+            .iter()
+            .all(|call| call.first().is_none_or(|arg| arg != "kill-session")),
+        "{calls}"
+    );
+
+    captured_pane.stop();
+    replacement_pane.stop();
+}
+
+#[test]
+fn delete_transition_markers_retain_uncertainty_and_recover_confirmed_shutdown() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let state_dir = tmp.path().join("state");
+    let tmux_bin = tmp.path().join("tmux-stopped-transition");
+    write_executable(
+        &tmux_bin,
+        r#"#!/usr/bin/env sh
+case "$1" in
+  display-message|has-session)
+    printf "%s\n" "can't find session: $88" >&2
+    exit 1 ;;
+  *) exit 42 ;;
+esac
+"#,
+    );
+
+    for (state, deletes) in [("pending", false), ("kill-confirmed", true)] {
+        let id = format!("delete-transition-{state}");
+        let tmux_session = format!("hs-codex-delete-transition-{state}");
+        let session_dir = write_session_record(&state_dir, &id, "codex", &tmux_session);
+        let runtime_files = attach_provider_runtime(
+            tmp.path(),
+            &state_dir,
+            &session_dir,
+            &id,
+            "codex",
+            &tmux_session,
+        );
+        let record_path = session_dir.join("session.json");
+        let launch_id = seed_delete_tmux_identity(&record_path, "$88", "%88", 99_999_988);
+        let mut record: Value =
+            serde_json::from_slice(&fs::read(&record_path).expect("session record")).unwrap();
+        record["delete_tmux_termination_state"] = json!({
+            "launch_id": launch_id,
+            "state": state,
+        });
+        record["provider_resume"] = json!({
+            "provider": "codex",
+            "session_id": "resume-session-id",
+            "captured_at": "2000-01-01T00:00:00Z",
+            "capture_method": "fixture",
+            "resume_args": [
+                "resume",
+                "resume-session-id",
+                "--cd",
+                "/tmp",
+                "--no-alt-screen"
+            ],
+        });
+        record["agent_args"] = json!([]);
+        fs::write(&record_path, serde_json::to_vec_pretty(&record).unwrap()).unwrap();
+
+        let delete = run(
+            tmp.path(),
+            &[
+                "--state-dir",
+                &state_dir.to_string_lossy(),
+                "delete",
+                &id,
+                "--tmux-bin",
+                &tmux_bin.to_string_lossy(),
+                "--format",
+                "json",
+            ],
+            &[],
+        );
+
+        if deletes {
+            assert_eq!(delete.code, 0, "stdout={}", delete.stdout_text());
+            assert!(
+                !session_dir.exists(),
+                "confirmed stopped state must clean up"
+            );
+            assert!(
+                runtime_files.iter().all(|path| !path.exists()),
+                "confirmed stopped runtime files must be removed"
+            );
+            continue;
+        }
+
+        assert_eq!(delete.code, 1, "stdout={}", delete.stdout_text());
+        let error = delete.stdout_json();
+        assert_eq!(
+            error["error"]["details"]["reason"],
+            "runtime-identity-unavailable"
+        );
+        assert_eq!(error["error"]["details"]["retryable"], false);
+        assert_eq!(
+            error["error"]["details"]["action"],
+            "manual-runtime-verification-required"
+        );
+        assert!(
+            session_dir.exists(),
+            "uncertain state must remain discoverable"
+        );
+        assert!(runtime_files.iter().all(|path| path.exists()));
+        let retained: Value =
+            serde_json::from_slice(&fs::read(&record_path).expect("retained record")).unwrap();
+        assert_eq!(
+            retained["delete_tmux_termination_state"]["state"],
+            "pending"
+        );
+
+        let resume = run(
+            tmp.path(),
+            &[
+                "--state-dir",
+                &state_dir.to_string_lossy(),
+                "resume",
+                &id,
+                "--tmux-bin",
+                &tmux_bin.to_string_lossy(),
+                "--format",
+                "json",
+            ],
+            &[],
+        );
+        assert_eq!(resume.code, 1, "stdout={}", resume.stdout_text());
+        let error = resume.stdout_json();
+        assert_eq!(
+            error["error"]["details"]["reason"],
+            "runtime-identity-unavailable"
+        );
+        assert_eq!(error["error"]["details"]["retryable"], false);
+        assert_eq!(
+            error["error"]["details"]["action"],
+            "manual-runtime-verification-required"
+        );
+        let after_resume: Value =
+            serde_json::from_slice(&fs::read(&record_path).expect("record after resume")).unwrap();
+        assert_eq!(
+            after_resume, retained,
+            "resume must preserve pending evidence"
+        );
+    }
+}
+
+#[test]
+fn delete_rejects_malformed_or_mismatched_transition_markers() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let state_dir = tmp.path().join("state");
+    let tmux_bin = tmp.path().join("tmux-stopped-invalid-transition");
+    write_executable(
+        &tmux_bin,
+        r#"#!/usr/bin/env sh
+case "$1" in
+  display-message|has-session)
+    printf "%s\n" "can't find session: $89" >&2
+    exit 1 ;;
+  *) exit 42 ;;
+esac
+"#,
+    );
+
+    for case_name in ["malformed", "mismatched"] {
+        let id = format!("delete-transition-{case_name}");
+        let tmux_session = format!("hs-claude-delete-transition-{case_name}");
+        let session_dir = write_session_record(&state_dir, &id, "claude", &tmux_session);
+        let runtime_files = attach_provider_runtime(
+            tmp.path(),
+            &state_dir,
+            &session_dir,
+            &id,
+            "claude",
+            &tmux_session,
+        );
+        let record_path = session_dir.join("session.json");
+        let launch_id = seed_delete_tmux_identity(&record_path, "$89", "%89", 99_999_989);
+        let mut record: Value =
+            serde_json::from_slice(&fs::read(&record_path).expect("session record")).unwrap();
+        record["delete_tmux_termination_state"] = match case_name {
+            "malformed" => json!({"launch_id": launch_id, "state": "unknown"}),
+            "mismatched" => {
+                json!({"launch_id": "other-launch", "state": "kill-confirmed"})
+            }
+            _ => unreachable!(),
+        };
+        fs::write(&record_path, serde_json::to_vec_pretty(&record).unwrap()).unwrap();
+        let before = fs::read(&record_path).unwrap();
+
+        let delete = run(
+            tmp.path(),
+            &[
+                "--state-dir",
+                &state_dir.to_string_lossy(),
+                "delete",
+                &id,
+                "--tmux-bin",
+                &tmux_bin.to_string_lossy(),
+                "--format",
+                "json",
+            ],
+            &[],
+        );
+
+        assert_eq!(delete.code, 1, "stdout={}", delete.stdout_text());
+        let error = delete.stdout_json();
+        assert_eq!(
+            error["error"]["details"]["reason"],
+            "runtime-identity-unavailable"
+        );
+        assert_eq!(error["error"]["details"]["retryable"], false);
+        assert_eq!(fs::read(&record_path).unwrap(), before);
+        assert!(session_dir.exists());
+        assert!(runtime_files.iter().all(|path| path.exists()));
+    }
+}
+
+#[test]
+fn delete_exhausts_bounded_identity_churn_without_losing_current_runtime() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let state_dir = tmp.path().join("state");
+    let tmux_bin = tmp.path().join("tmux-repeated-identity-churn");
+    let tmux_log = tmp.path().join("tmux-repeated-identity-churn.log");
+    let tmux_generation = tmp.path().join("tmux-repeated-identity-churn.generation");
+    let id = "repeated-identity-churn";
+    let tmux_session = "hs-codex-repeated-identity-churn";
+    let session_dir = write_session_record(&state_dir, id, "codex", tmux_session);
+    attach_provider_runtime(
+        tmp.path(),
+        &state_dir,
+        &session_dir,
+        id,
+        "codex",
+        tmux_session,
+    );
+    let record_path = session_dir.join("session.json");
+    let panes = [
+        spawn_test_process_group(),
+        spawn_test_process_group(),
+        spawn_test_process_group(),
+        spawn_test_process_group(),
+    ];
+    let launch_id = seed_delete_tmux_identity(&record_path, "$90", "%90", panes[0].pid());
+    fs::write(&tmux_generation, b"0").unwrap();
+    write_executable(
+        &tmux_bin,
+        &format!(
+            r#"#!/usr/bin/env sh
+printf '%s\n' "$*" >> {tmux_log}
+generation=$(cat {tmux_generation})
+case "$generation" in
+  0) pane_pid={pane_0} ;;
+  1) pane_pid={pane_1} ;;
+  2) pane_pid={pane_2} ;;
+  *) pane_pid={pane_3} ;;
+esac
+case "$1" in
+  display-message) printf '$90\t%%90\t%s\n' "$pane_pid" ;;
+  show-environment)
+    case "$4" in
+      AGENT_SESSION_ID) printf 'AGENT_SESSION_ID=%s\n' {id} ;;
+      AGENT_SESSION_STATE_DIR) printf 'AGENT_SESSION_STATE_DIR=%s\n' {state_dir} ;;
+      AGENT_SESSION_RUNTIME_ID) printf 'AGENT_SESSION_RUNTIME_ID=%s\n' {launch_id} ;;
+    esac ;;
+  if-shell)
+    /bin/kill -TERM -- "-$pane_pid" 2>/dev/null || true
+    printf '%s\n' "$((generation + 1))" > {tmux_generation}
+    printf 'agent-session-runtime-identity-changed\n' ;;
+  has-session) exit 0 ;;
+  *) exit 42 ;;
+esac
+exit 0
+"#,
+            tmux_log = shell_words::quote(&tmux_log.to_string_lossy()),
+            tmux_generation = shell_words::quote(&tmux_generation.to_string_lossy()),
+            pane_0 = panes[0].pid(),
+            pane_1 = panes[1].pid(),
+            pane_2 = panes[2].pid(),
+            pane_3 = panes[3].pid(),
+            id = shell_words::quote(id),
+            state_dir = shell_words::quote(&state_dir.to_string_lossy()),
+            launch_id = shell_words::quote(&launch_id),
+        ),
+    );
+
+    let delete = run(
+        tmp.path(),
+        &[
+            "--state-dir",
+            &state_dir.to_string_lossy(),
+            "delete",
+            id,
+            "--tmux-bin",
+            &tmux_bin.to_string_lossy(),
+            "--format",
+            "json",
+        ],
+        &[],
+    );
+
+    assert_eq!(delete.code, 1, "stdout={}", delete.stdout_text());
+    let error = delete.stdout_json();
+    assert_eq!(
+        error["error"]["details"]["reason"],
+        "runtime-identity-changed"
+    );
+    assert_eq!(error["error"]["details"]["retryable"], true);
+    assert_eq!(error["error"]["details"]["action"], "retry-delete");
+    assert!(session_dir.exists());
+    assert!(
+        panes[3].is_running(),
+        "latest observed group must remain live"
+    );
+    let retained: Value =
+        serde_json::from_slice(&fs::read(&record_path).expect("retained record")).unwrap();
+    assert_eq!(retained["delete_tmux_identity"]["pane_pid"], panes[3].pid());
+    assert!(retained.get("delete_tmux_termination_state").is_none());
+    let calls = fs::read_to_string(&tmux_log).unwrap();
+    assert_eq!(calls.matches("if-shell -F -t %90").count(), 3, "{calls}");
+}
+
+#[test]
+fn delete_retains_state_while_the_exact_pane_process_group_survives() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let state_dir = tmp.path().join("state");
+    let pane = spawn_test_process_group();
+    let pane_pid = pane.pid();
+    let killed = tmp.path().join("tmux-killed");
+    let tmux_bin = tmp.path().join("tmux-pane-survives");
+    let id = "pane-survives";
+    let tmux_session = "hs-claude-pane-survives";
+    let session_dir = write_session_record(&state_dir, id, "claude", tmux_session);
+    attach_provider_runtime(
+        tmp.path(),
+        &state_dir,
+        &session_dir,
+        id,
+        "claude",
+        tmux_session,
+    );
+    let record: Value = serde_json::from_str(
+        &fs::read_to_string(session_dir.join("session.json")).expect("session record"),
+    )
+    .expect("session json");
+    let runtime_id = record["runtime"]["launch_id"].as_str().unwrap();
+    write_executable(
+        &tmux_bin,
+        &format!(
+            r#"#!/usr/bin/env sh
+case "$1" in
+  display-message) printf '$92\t%%92\t{pane_pid}\n'; exit 0 ;;
+  show-environment)
+    case "$4" in
+      AGENT_SESSION_ID) printf 'AGENT_SESSION_ID={id}\n' ;;
+      AGENT_SESSION_STATE_DIR) printf 'AGENT_SESSION_STATE_DIR={}\n' ;;
+      AGENT_SESSION_RUNTIME_ID) printf 'AGENT_SESSION_RUNTIME_ID={runtime_id}\n' ;;
+    esac
+    exit 0 ;;
+  has-session) if [ -f {} ]; then printf "%s\n" "can't find session: \$92" >&2; exit 1; fi; exit 0 ;;
+  if-shell) : > {}; exit 0 ;;
+esac
+exit 42
+"#,
+            state_dir.display(),
+            killed.display(),
+            killed.display(),
+        ),
+    );
+    let output = run(
+        tmp.path(),
+        &[
+            "--state-dir",
+            &state_dir.to_string_lossy(),
+            "delete",
+            id,
+            "--tmux-bin",
+            &tmux_bin.to_string_lossy(),
+            "--format",
+            "json",
+        ],
+        &[],
+    );
+
+    assert_eq!(output.code, 1, "stdout={}", output.stdout_text());
+    assert_eq!(
+        output.stdout_json()["error"]["details"]["reason"],
+        "process-still-running"
+    );
+    assert!(session_dir.exists());
+    assert_eq!(unsafe { libc::kill(pane_pid as libc::pid_t, 0) }, 0);
+    let retained: Value = serde_json::from_str(
+        &fs::read_to_string(session_dir.join("session.json")).expect("retained session record"),
+    )
+    .expect("retained session json");
+    assert_eq!(retained["delete_tmux_identity"]["session_id"], "$92");
+    assert_eq!(retained["delete_tmux_identity"]["pane_id"], "%92");
+    assert_eq!(
+        retained["delete_tmux_identity"]["process_group_id"],
+        pane_pid
+    );
 }
 
 #[test]
@@ -3804,12 +5462,11 @@ fn failure_paths_return_json_without_leaking_prompt_and_classify_durable_startup
     );
     let calls = tmux_calls(&tmux_log);
     assert!(
-        calls.iter().any(|call| call
-            == &vec![
-                "kill-session".to_string(),
-                "-t".to_string(),
-                "hs-codex-paste-fail".to_string(),
-            ]),
+        calls.iter().any(|call| {
+            call.first().is_some_and(|arg| arg == "if-shell")
+                && call.get(3).is_some_and(|arg| arg == "%77")
+                && call.get(5).is_some_and(|arg| arg == "kill-session -t $77")
+        }),
         "failed prompt paste should kill the orphaned tmux session: {calls:?}"
     );
 
@@ -3990,6 +5647,96 @@ fn write_session_record(dir: &Path, id: &str, agent: &str, tmux_session: &str) -
     write_session_record_with_cwd(dir, id, agent, tmux_session, Path::new("/tmp"))
 }
 
+fn attach_provider_runtime(
+    tmp: &Path,
+    state_dir: &Path,
+    session_dir: &Path,
+    id: &str,
+    agent: &str,
+    tmux_session: &str,
+) -> Vec<PathBuf> {
+    let record_path = session_dir.join("session.json");
+    let mut record: Value =
+        serde_json::from_str(&fs::read_to_string(&record_path).unwrap()).unwrap();
+    let launch_id = format!("launch-{id}");
+    let runtime_files = if agent == "codex" {
+        let mut digest = Sha256::new();
+        digest.update(state_dir.as_os_str().as_encoded_bytes());
+        digest.update([0]);
+        digest.update(id.as_bytes());
+        digest.update([0]);
+        digest.update(launch_id.as_bytes());
+        let namespace: String = digest
+            .finalize()
+            .iter()
+            .take(8)
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        let runtime_dir = tmp.join("runtime/agent-session");
+        fs::create_dir_all(&runtime_dir).expect("Codex runtime dir");
+        let socket = runtime_dir.join(format!("cx-{namespace}.sock"));
+        let files = vec![
+            socket.clone(),
+            socket.with_extension("proxy"),
+            socket.with_extension("thread"),
+            socket.with_extension("attached"),
+        ];
+        record["runtime"] = json!({
+            "kind": "codex_app_server",
+            "tmux_session": tmux_session,
+            "generation": 1,
+            "started_at": "2000-01-01T00:00:00Z",
+            "launch_id": launch_id,
+            "codex_app_server_protocol": "v2",
+            "codex_app_server_socket": files[0],
+            "codex_app_server_proxy": files[1],
+            "codex_app_server_thread_handoff": files[2],
+            "codex_app_server_thread_attached": files[3],
+        });
+        files
+    } else {
+        let runtime_file = session_dir.join("provider-runtime.json");
+        record["runtime"] = json!({
+            "kind": "tmux",
+            "tmux_session": tmux_session,
+            "generation": 1,
+            "started_at": "2000-01-01T00:00:00Z",
+            "launch_id": launch_id,
+            "provider_runtime_file": runtime_file,
+        });
+        vec![runtime_file]
+    };
+    for runtime_file in &runtime_files {
+        fs::write(runtime_file, format!("runtime metadata for {agent}")).expect("runtime metadata");
+    }
+    fs::write(&record_path, serde_json::to_vec_pretty(&record).unwrap()).expect("session record");
+    runtime_files
+}
+
+fn seed_delete_tmux_identity(
+    record_path: &Path,
+    session_id: &str,
+    pane_id: &str,
+    pane_pid: u32,
+) -> String {
+    let mut record: Value =
+        serde_json::from_slice(&fs::read(record_path).expect("session record")).unwrap();
+    let launch_id = record["runtime"]["launch_id"]
+        .as_str()
+        .expect("runtime launch id")
+        .to_string();
+    record["delete_tmux_identity"] = json!({
+        "launch_id": launch_id,
+        "session_id": session_id,
+        "pane_id": pane_id,
+        "pane_pid": pane_pid,
+        "process_group_id": pane_pid,
+    });
+    fs::write(record_path, serde_json::to_vec_pretty(&record).unwrap())
+        .expect("seed delete tmux identity");
+    launch_id
+}
+
 fn write_session_record_with_cwd(
     dir: &Path,
     id: &str,
@@ -4100,7 +5847,19 @@ fn write_resumable_session_record_with_agent_bin(
     "kind": "tmux",
     "tmux_session": "{tmux_session}",
     "generation": 1,
-    "started_at": "2000-01-01T00:00:00Z"
+    "started_at": "2000-01-01T00:00:00Z",
+    "launch_id": "never-launched-fixture"
+  }},
+  "tmux_runtime_never_launched": "never-launched-fixture",
+  "startup": {{
+    "schema_version": "agent-session.startup.v1",
+    "state": "failed",
+    "stage": "tmux",
+    "started_at": "2000-01-01T00:00:00Z",
+    "failure_code": "terminal-runtime-create-failed",
+    "message": "The terminal runtime could not be created.",
+    "occurred_at": "2000-01-01T00:00:01Z",
+    "retry_safe": true
   }},
   "agent_args": ["--model", "fixture-model"]
   {agent_bin_json}
@@ -4828,7 +6587,77 @@ fn start_ignores_oversized_codex_session_meta_line() {
 }
 
 #[test]
-fn start_reports_persisted_state_when_post_launch_resume_write_fails() {
+fn run_retains_state_when_malformed_launch_identity_cannot_be_stopped() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let state_dir = tmp.path().join("state");
+    let cwd = tmp.path().join("repo");
+    fs::create_dir_all(&cwd).expect("repo dir");
+    let (tmux_bin, tmux_log) = fake_tmux(tmp.path());
+    let codex_bin = fake_agent(tmp.path(), "codex");
+    let mut pane_process = spawn_test_process_group();
+    let pane_pid = pane_process.pid().to_string();
+    let session_dir = state_dir.join("sessions/malformed-run");
+    let record_path = session_dir.join("session.json");
+
+    let state_arg = state_dir.to_string_lossy().to_string();
+    let cwd_arg = cwd.to_string_lossy().to_string();
+    let tmux_arg = tmux_bin.to_string_lossy().to_string();
+    let codex_arg = codex_bin.to_string_lossy().to_string();
+    let tmux_log_arg = tmux_log.to_string_lossy().to_string();
+    let record_arg = record_path.to_string_lossy().to_string();
+    let output = run(
+        tmp.path(),
+        &[
+            "--state-dir",
+            &state_arg,
+            "run",
+            "--agent",
+            "codex",
+            "--id",
+            "malformed-run",
+            "--cwd",
+            &cwd_arg,
+            "--prompt",
+            "fixture prompt",
+            "--tmux-bin",
+            &tmux_arg,
+            "--agent-bin",
+            &codex_arg,
+            "--format",
+            "json",
+        ],
+        &[
+            ("AGENT_SESSION_FAKE_TMUX_LOG", &tmux_log_arg),
+            ("AGENT_SESSION_FAKE_TMUX_MALFORMED_LAUNCH_IDENTITY", "1"),
+            ("AGENT_SESSION_FAKE_TMUX_FAIL", "kill-session"),
+            ("AGENT_SESSION_FAKE_TMUX_PANE_PID", &pane_pid),
+            ("AGENT_SESSION_FAKE_TMUX_AGENT_SESSION_ID", "malformed-run"),
+            ("AGENT_SESSION_FAKE_TMUX_STATE_DIR", &state_arg),
+            ("AGENT_SESSION_FAKE_TMUX_RUNTIME_RECORD", &record_arg),
+        ],
+    );
+
+    assert_eq!(output.code, 1, "stdout={}", output.stdout_text());
+    let error = output.stdout_json();
+    assert_eq!(error["error"]["code"], "session-termination-failed");
+    assert_eq!(error["error"]["details"]["reason"], "kill-failed");
+    assert_eq!(error["error"]["details"]["action"], "retry-delete");
+    assert!(
+        session_dir.exists(),
+        "uncertain live runtime must stay discoverable"
+    );
+    let record: Value = serde_json::from_slice(&fs::read(&record_path).unwrap()).unwrap();
+    assert_eq!(record["delete_tmux_identity"]["session_id"], "$77");
+    assert_eq!(record["delete_tmux_identity"]["pane_id"], "%77");
+    assert_eq!(
+        record["delete_tmux_identity"]["process_group_id"],
+        pane_process.pid()
+    );
+    pane_process.stop();
+}
+
+#[test]
+fn start_fails_closed_when_launch_identity_cannot_be_persisted() {
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let state_dir = tmp.path().join("state");
     let codex_home = tmp.path().join("codex-home");
@@ -4878,19 +6707,120 @@ fn start_reports_persisted_state_when_post_launch_resume_write_fails() {
         ],
     );
 
-    assert_eq!(output.code, 0, "stderr={}", output.stderr_text());
+    assert_eq!(output.code, 1, "stdout={}", output.stdout_text());
     let value = output.stdout_json();
-    let result = data(&value);
-    assert_eq!(result["id"], "write-fail");
-    assert_eq!(result["status"], "running");
-    assert_eq!(result["resumable"], false);
+    assert_eq!(value["error"]["code"], "file-write-failed");
     let _ = fs::set_permissions(&chmod_dir, fs::Permissions::from_mode(0o700));
     let record_path = chmod_dir.join("session.json");
     let record: Value =
         serde_json::from_str(&fs::read_to_string(&record_path).expect("session record"))
             .expect("record json");
     assert!(record.get("provider_resume").is_none());
+    assert!(record.get("delete_tmux_identity").is_none());
     assert!(!record_path.with_file_name("resume.json").exists());
+    let calls = tmux_calls(&tmux_log);
+    assert!(
+        calls
+            .iter()
+            .all(|call| call.first().is_none_or(|arg| arg != "kill-session")),
+        "a launch must remain queryable until its recovery identity is durable: {calls:?}"
+    );
+}
+
+#[test]
+fn start_retains_state_when_process_group_survives_post_launch_cleanup() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let state_dir = tmp.path().join("state");
+    let cwd = tmp.path().join("repo");
+    fs::create_dir_all(&cwd).expect("repo dir");
+    let (tmux_bin, tmux_log) = fake_tmux(tmp.path());
+    let claude_bin = fake_agent(tmp.path(), "claude");
+    let mut pane_process = spawn_test_process_group();
+    let pane_pid = pane_process.pid().to_string();
+    let session_dir = state_dir.join("sessions/process-survivor");
+
+    let state_arg = state_dir.to_string_lossy().to_string();
+    let cwd_arg = cwd.to_string_lossy().to_string();
+    let tmux_arg = tmux_bin.to_string_lossy().to_string();
+    let claude_arg = claude_bin.to_string_lossy().to_string();
+    let tmux_log_arg = tmux_log.to_string_lossy().to_string();
+    let output = run(
+        tmp.path(),
+        &[
+            "--state-dir",
+            &state_arg,
+            "start",
+            "--agent",
+            "claude",
+            "--id",
+            "process-survivor",
+            "--cwd",
+            &cwd_arg,
+            "--tmux-bin",
+            &tmux_arg,
+            "--agent-bin",
+            &claude_arg,
+            "--prompt",
+            "fixture prompt",
+            "--paste-delay-ms",
+            "0",
+            "--format",
+            "json",
+        ],
+        &[
+            ("AGENT_SESSION_FAKE_TMUX_LOG", &tmux_log_arg),
+            ("AGENT_SESSION_FAKE_TMUX_PANE_PID", &pane_pid),
+            ("AGENT_SESSION_FAKE_TMUX_PROCESS_GROUP_ID", &pane_pid),
+            ("AGENT_SESSION_FAKE_TMUX_KEEP_PROCESS_GROUP", "1"),
+            ("AGENT_SESSION_FAKE_TMUX_FAIL", "paste-buffer"),
+        ],
+    );
+
+    assert_eq!(output.code, 1, "stdout={}", output.stdout_text());
+    let error = output.stdout_json();
+    assert_eq!(error["error"]["code"], "session-termination-failed");
+    assert_eq!(error["error"]["details"]["reason"], "process-still-running");
+    assert_eq!(error["error"]["details"]["action"], "retry-delete");
+    assert!(
+        session_dir.exists(),
+        "surviving process state must remain discoverable"
+    );
+    assert!(
+        pane_process.is_running(),
+        "the fixture process group must prove kill success alone is insufficient"
+    );
+    let record: Value = serde_json::from_slice(
+        &fs::read(session_dir.join("session.json")).expect("retained session record"),
+    )
+    .unwrap();
+    assert_eq!(
+        record["delete_tmux_identity"]["process_group_id"],
+        pane_process.pid()
+    );
+    pane_process.stop();
+
+    let retry = run(
+        tmp.path(),
+        &[
+            "--state-dir",
+            &state_arg,
+            "delete",
+            "process-survivor",
+            "--tmux-bin",
+            &tmux_arg,
+            "--format",
+            "json",
+        ],
+        &[
+            ("AGENT_SESSION_FAKE_TMUX_LOG", &tmux_log_arg),
+            ("AGENT_SESSION_FAKE_TMUX_ABSENT", "1"),
+        ],
+    );
+    assert_eq!(retry.code, 0, "stdout={}", retry.stdout_text());
+    assert!(
+        !session_dir.exists(),
+        "retry must use the durable process identity"
+    );
 }
 
 #[test]
@@ -5243,6 +7173,9 @@ fn resume_recreates_tmux_runtime_from_exact_provider_identity() {
         &vec![
             "new-session".to_string(),
             "-d".to_string(),
+            "-P".to_string(),
+            "-F".to_string(),
+            "#{session_id}\t#{pane_id}\t#{pane_pid}".to_string(),
             "-s".to_string(),
             "hs-codex-recoverable".to_string(),
             "-c".to_string(),
@@ -5320,7 +7253,7 @@ fn resume_persists_runtime_generation_before_provider_launch() {
     let state_arg = state_dir.to_string_lossy().to_string();
     let tmux_arg = tmux_bin.to_string_lossy().to_string();
     let tmux_log_arg = tmux_log.to_string_lossy().to_string();
-    let chmod_dir_arg = session.to_string_lossy().to_string();
+    let record_at_launch = session.join("session.json").to_string_lossy().to_string();
     let output = run(
         tmp.path(),
         &[
@@ -5336,7 +7269,10 @@ fn resume_persists_runtime_generation_before_provider_launch() {
         &[
             ("AGENT_SESSION_FAKE_TMUX_LOG", &tmux_log_arg),
             ("AGENT_SESSION_FAKE_TMUX_HAS_SESSION", "0"),
-            ("AGENT_SESSION_FAKE_CHMOD_AFTER_NEW_SESSION", &chmod_dir_arg),
+            (
+                "AGENT_SESSION_FAKE_RECORD_AT_NEW_SESSION",
+                &record_at_launch,
+            ),
         ],
     );
 
@@ -5347,7 +7283,6 @@ fn resume_persists_runtime_generation_before_provider_launch() {
     assert_eq!(result["resumable"], true);
     assert_ne!(result["updated_at"], "2000-01-01T00:00:00Z");
     assert_eq!(result["turn_state"]["phase"], "starting");
-    let _ = fs::set_permissions(&session, fs::Permissions::from_mode(0o700));
     let record_path = session.join("session.json");
     let record: Value =
         serde_json::from_str(&fs::read_to_string(&record_path).expect("session record"))
@@ -5454,6 +7389,77 @@ fn resume_launch_failure_restores_the_prior_runtime_and_activity() {
     assert!(
         !session.join("activity.replay.bin").exists(),
         "a failed launch must restore the prior replay-index boundary"
+    );
+}
+
+#[test]
+fn resume_retains_new_generation_when_identity_persistence_and_shutdown_fail() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let state_dir = tmp.path().join("state");
+    let cwd = tmp.path().join("repo");
+    fs::create_dir_all(&cwd).expect("repo dir");
+    let (tmux_bin, tmux_log) = fake_tmux(tmp.path());
+    let codex_bin = fake_agent(tmp.path(), "codex");
+    let session = write_resumable_session_record_with_agent_bin(
+        &state_dir,
+        "resume-persist-fail",
+        "codex",
+        "hs-codex-resume-persist-fail",
+        &cwd,
+        &[
+            "resume",
+            "resume-session-id",
+            "--cd",
+            cwd.to_str().unwrap(),
+            "--no-alt-screen",
+        ],
+        Some(&codex_bin),
+    );
+    let record_path = session.join("session.json");
+    let before: Value = serde_json::from_slice(&fs::read(&record_path).unwrap()).unwrap();
+    let state_arg = state_dir.to_string_lossy().to_string();
+    let tmux_arg = tmux_bin.to_string_lossy().to_string();
+    let tmux_log_arg = tmux_log.to_string_lossy().to_string();
+    let session_arg = session.to_string_lossy().to_string();
+
+    let output = run(
+        tmp.path(),
+        &[
+            "--state-dir",
+            &state_arg,
+            "resume",
+            "resume-persist-fail",
+            "--tmux-bin",
+            &tmux_arg,
+            "--format",
+            "json",
+        ],
+        &[
+            ("AGENT_SESSION_FAKE_TMUX_LOG", &tmux_log_arg),
+            ("AGENT_SESSION_FAKE_TMUX_ABSENT_BEFORE_LAUNCH", "1"),
+            ("AGENT_SESSION_FAKE_CHMOD_AFTER_NEW_SESSION", &session_arg),
+        ],
+    );
+
+    assert_eq!(output.code, 1, "stdout={}", output.stdout_text());
+    let error = output.stdout_json();
+    assert_eq!(error["error"]["code"], "file-write-failed");
+    let _ = fs::set_permissions(&session, fs::Permissions::from_mode(0o700));
+    let retained: Value = serde_json::from_slice(&fs::read(&record_path).unwrap()).unwrap();
+    assert_eq!(retained["runtime"]["generation"], 2);
+    assert_ne!(
+        retained["runtime"]["launch_id"], before["runtime"]["launch_id"],
+        "the live replacement generation must not be rolled back to the prior identity"
+    );
+    assert!(
+        session.exists(),
+        "the current generation must remain discoverable"
+    );
+    assert!(
+        tmux_calls(&tmux_log)
+            .iter()
+            .all(|call| call.first().is_none_or(|arg| arg != "kill-session")),
+        "resume must keep the replacement queryable until its identity is durable"
     );
 }
 
@@ -5620,6 +7626,16 @@ fn resume_recovers_provider_identity_from_durable_sidecar() {
     let mut record: Value =
         serde_json::from_str(&fs::read_to_string(session.join("session.json")).unwrap()).unwrap();
     record["cwd"] = Value::String(cwd.to_string_lossy().to_string());
+    record["startup"] = json!({
+        "schema_version": "agent-session.startup.v1",
+        "state": "failed",
+        "stage": "tmux",
+        "started_at": "2000-01-01T00:00:00Z",
+        "failure_code": "terminal-runtime-create-failed",
+        "message": "The terminal runtime could not be created.",
+        "occurred_at": "2000-01-01T00:00:01Z",
+        "retry_safe": true
+    });
     fs::write(
         session.join("session.json"),
         serde_json::to_string_pretty(&record).unwrap(),
@@ -5638,6 +7654,19 @@ fn resume_recovers_provider_identity_from_durable_sidecar() {
             "--no-alt-screen",
         ],
     );
+    let sidecar_path = session.join("resume.json");
+    let mut sidecar: Value =
+        serde_json::from_slice(&fs::read(&sidecar_path).expect("resume sidecar")).unwrap();
+    sidecar["runtime"]["launch_id"] = json!("never-launched-sidecar");
+    fs::write(&sidecar_path, serde_json::to_vec_pretty(&sidecar).unwrap()).unwrap();
+    let mut record: Value =
+        serde_json::from_slice(&fs::read(session.join("session.json")).unwrap()).unwrap();
+    record["tmux_runtime_never_launched"] = json!("never-launched-sidecar");
+    fs::write(
+        session.join("session.json"),
+        serde_json::to_vec_pretty(&record).unwrap(),
+    )
+    .unwrap();
 
     let state_arg = state_dir.to_string_lossy().to_string();
     let tmux_arg = tmux_bin.to_string_lossy().to_string();
@@ -5841,6 +7870,14 @@ fn list_and_delete_ignore_unsupported_or_malformed_resume_sidecars() {
         r#"{"schema_version":"agent-session.resume.v2","provider_resume":{"provider":"codex","session_id":"future","captured_at":"2000-01-01T00:00:00Z","capture_method":"fixture","resume_args":["resume","future"]}}"#,
     )
     .expect("future resume sidecar");
+    attach_provider_runtime(
+        tmp.path(),
+        &state_dir,
+        &future,
+        "future-sidecar",
+        "codex",
+        "hs-codex-future-sidecar",
+    );
     let malformed = write_session_record(
         &state_dir,
         "malformed-sidecar",
@@ -5848,6 +7885,14 @@ fn list_and_delete_ignore_unsupported_or_malformed_resume_sidecars() {
         "hs-codex-malformed-sidecar",
     );
     fs::write(malformed.join("resume.json"), "{not-json").expect("malformed resume sidecar");
+    attach_provider_runtime(
+        tmp.path(),
+        &state_dir,
+        &malformed,
+        "malformed-sidecar",
+        "codex",
+        "hs-codex-malformed-sidecar",
+    );
 
     let state_arg = state_dir.to_string_lossy().to_string();
     let tmux_arg = tmux_bin.to_string_lossy().to_string();
@@ -5875,6 +7920,13 @@ fn list_and_delete_ignore_unsupported_or_malformed_resume_sidecars() {
     }
 
     for id in ["future-sidecar", "malformed-sidecar"] {
+        let record: Value = serde_json::from_str(
+            &fs::read_to_string(state_dir.join("sessions").join(id).join("session.json")).unwrap(),
+        )
+        .unwrap();
+        let runtime_id = record["runtime"]["launch_id"].as_str().unwrap();
+        let pane = spawn_test_process_group();
+        let pane_pid = pane.pid().to_string();
         let delete = run(
             tmp.path(),
             &[
@@ -5887,7 +7939,18 @@ fn list_and_delete_ignore_unsupported_or_malformed_resume_sidecars() {
                 "--format",
                 "json",
             ],
-            &[("AGENT_SESSION_FAKE_TMUX_LOG", &tmux_log_arg)],
+            &[
+                ("AGENT_SESSION_FAKE_TMUX_LOG", &tmux_log_arg),
+                ("AGENT_SESSION_FAKE_TMUX_PANE_PID", pane_pid.as_str()),
+                (
+                    "AGENT_SESSION_FAKE_TMUX_PROCESS_GROUP_ID",
+                    pane_pid.as_str(),
+                ),
+                ("AGENT_SESSION_FAKE_TMUX_SESSION_ID", "$77"),
+                ("AGENT_SESSION_FAKE_TMUX_AGENT_SESSION_ID", id),
+                ("AGENT_SESSION_FAKE_TMUX_STATE_DIR", state_arg.as_str()),
+                ("AGENT_SESSION_FAKE_TMUX_RUNTIME_ID", runtime_id),
+            ],
         );
         assert_eq!(delete.code, 0, "stderr={}", delete.stderr_text());
         assert_eq!(data(&delete.stdout_json())["deleted"], true);

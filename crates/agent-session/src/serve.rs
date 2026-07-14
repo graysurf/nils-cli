@@ -5175,12 +5175,50 @@ mod tests {
     use std::fs;
     use std::io::Write;
     use std::os::unix::fs::{FileTypeExt, PermissionsExt, symlink};
+    use std::os::unix::process::CommandExt;
     use tokio_tungstenite::connect_async;
     use tokio_tungstenite::tungstenite::{Message as ClientMessage, client::IntoClientRequest};
     use tower::ServiceExt;
 
     const MACHINE: &str = "test-machine";
     const TOKEN: &str = "s3cr3t-token";
+
+    struct TestProcessGroup {
+        child: Option<std::process::Child>,
+        process_group_id: libc::pid_t,
+    }
+
+    impl TestProcessGroup {
+        fn spawn() -> Self {
+            let child = std::process::Command::new("sleep")
+                .arg("30")
+                .process_group(0)
+                .spawn()
+                .expect("spawn test process group");
+            let process_group_id = child.id() as libc::pid_t;
+            Self {
+                child: Some(child),
+                process_group_id,
+            }
+        }
+
+        fn pid(&self) -> u32 {
+            self.child.as_ref().expect("live test child").id()
+        }
+    }
+
+    impl Drop for TestProcessGroup {
+        fn drop(&mut self) {
+            let Some(mut child) = self.child.take() else {
+                return;
+            };
+            // SAFETY: the child is the leader of a dedicated test-only process group.
+            unsafe {
+                libc::kill(-self.process_group_id, libc::SIGKILL);
+            }
+            let _ = child.wait();
+        }
+    }
 
     #[test]
     fn provider_prompt_subscription_requires_the_versioned_capability() {
@@ -6595,7 +6633,39 @@ mod tests {
         let bin = dir.join("tmux");
         std::fs::write(
             &bin,
-            "#!/usr/bin/env sh\ncase \"$1\" in\n  has-session) exit 0 ;;\n  capture-pane) printf 'pane\\n'; exit 0 ;;\n  show-buffer) printf 'buffered selection\\n'; exit 0 ;;\n  *) exit 0 ;;\nesac\n",
+            "#!/usr/bin/env sh\ncase \"$1\" in\n  has-session) exit 0 ;;\n  new-session) printf '%s\\t%s\\t%s\\n' '$77' '%77' \"$$\"; exit 0 ;;\n  capture-pane) printf 'pane\\n'; exit 0 ;;\n  show-buffer) printf 'buffered selection\\n'; exit 0 ;;\n  *) exit 0 ;;\nesac\n",
+        )
+        .unwrap();
+        let mut perms = std::fs::metadata(&bin).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&bin, perms).unwrap();
+        bin
+    }
+
+    fn failing_delete_tmux(dir: &Path, state_dir: &Path, id: &str, pane_pid: u32) -> PathBuf {
+        let bin = dir.join("failing-delete-tmux");
+        std::fs::write(
+            &bin,
+            format!(
+                r#"#!/usr/bin/env sh
+case "$1" in
+  display-message) printf '$88\t%%88\t{pane_pid}\n'; exit 0 ;;
+  show-environment)
+    case "$4" in
+      AGENT_SESSION_ID) printf 'AGENT_SESSION_ID=%s\n' {id} ;;
+      AGENT_SESSION_STATE_DIR) printf 'AGENT_SESSION_STATE_DIR=%s\n' {state_dir} ;;
+      AGENT_SESSION_RUNTIME_ID) printf 'AGENT_SESSION_RUNTIME_ID=%s\n' {runtime_id} ;;
+    esac
+    exit 0 ;;
+  kill-session) exit 42 ;;
+  has-session) exit 0 ;;
+  *) exit 42 ;;
+esac
+"#,
+                id = shell_words::quote(id),
+                state_dir = shell_words::quote(&state_dir.to_string_lossy()),
+                runtime_id = shell_words::quote(&format!("launch-{id}")),
+            ),
         )
         .unwrap();
         let mut perms = std::fs::metadata(&bin).unwrap().permissions();
@@ -6689,7 +6759,19 @@ mod tests {
     "kind": "tmux",
     "tmux_session": "{tmux_session}",
     "generation": 1,
-    "started_at": "2000-01-01T00:00:00Z"
+    "started_at": "2000-01-01T00:00:00Z",
+    "launch_id": "never-launched-fixture"
+  }},
+  "tmux_runtime_never_launched": "never-launched-fixture",
+  "startup": {{
+    "schema_version": "agent-session.startup.v1",
+    "state": "failed",
+    "stage": "tmux",
+    "started_at": "2000-01-01T00:00:00Z",
+    "failure_code": "terminal-runtime-create-failed",
+    "message": "The terminal runtime could not be created.",
+    "occurred_at": "2000-01-01T00:00:01Z",
+    "retry_safe": true
   }},
   "agent_args": []
 }}"#,
@@ -6836,7 +6918,7 @@ mod tests {
         executable(
             &dir.join("tmux"),
             &format!(
-                "#!/usr/bin/env sh\nprintf '%s\\n' \"$*\" >> {}\ncase \"$1\" in\n  has-session) exit 1 ;;\n  *) exit 0 ;;\nesac\n",
+                "#!/usr/bin/env sh\nprintf '%s\\n' \"$*\" >> {}\ncase \"$1\" in\n  has-session) exit 1 ;;\n  new-session) printf '%s\\t%s\\t%s\\n' '$77' '%77' \"$$\"; exit 0 ;;\n  *) exit 0 ;;\nesac\n",
                 shell_words::quote(&log.to_string_lossy())
             ),
         )
@@ -9669,7 +9751,7 @@ mod tests {
 
         let calls = std::fs::read_to_string(&log).unwrap();
         assert!(
-            calls.contains("new-session -d -s hs-codex-imported-codex"),
+            calls.contains("-s hs-codex-imported-codex"),
             "import must create a tmux runtime: {calls:?}"
         );
         assert!(
@@ -9742,7 +9824,7 @@ mod tests {
 
         let calls = std::fs::read_to_string(&log).unwrap();
         assert!(
-            calls.contains("new-session -d -s hs-claude-imported-claude"),
+            calls.contains("-s hs-claude-imported-claude"),
             "import must create a tmux runtime: {calls:?}"
         );
         assert!(
@@ -10596,12 +10678,197 @@ mod tests {
 
         let calls = std::fs::read_to_string(&log).unwrap();
         assert!(
-            calls.contains("new-session -d -s hs-codex-recover"),
+            calls.contains("-s hs-codex-recover"),
             "resume must create a tmux runtime: {calls:?}"
         );
         assert!(
             calls.contains("resume resume-session-id"),
             "resume must use the exact provider id: {calls:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn resume_api_rejects_unprovable_pre_upgrade_codex_and_claude_runtimes() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cwd = tmp.path().join("repo");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let log = tmp.path().join("tmux.log");
+        let tmux = resume_tmux(tmp.path(), &log);
+
+        for agent in ["codex", "claude"] {
+            for runtime_shape in ["identity-free", "omitted"] {
+                let id = format!("unprovable-{agent}-{runtime_shape}");
+                let tmux_session = format!("hs-{agent}-unprovable-{runtime_shape}");
+                let resume_args = match agent {
+                    "codex" => vec![
+                        "resume",
+                        "resume-session-id",
+                        "--cd",
+                        cwd.to_str().unwrap(),
+                        "--no-alt-screen",
+                    ],
+                    "claude" => vec!["--resume", "resume-session-id"],
+                    _ => unreachable!(),
+                };
+                seed_resumable_session(tmp.path(), &id, agent, &tmux_session, &cwd, &resume_args);
+                let record_path = tmp.path().join("sessions").join(&id).join("session.json");
+                let mut record: Value =
+                    serde_json::from_slice(&std::fs::read(&record_path).unwrap()).unwrap();
+                let record = record.as_object_mut().unwrap();
+                record.remove("startup");
+                record.remove("tmux_runtime_never_launched");
+                if runtime_shape == "omitted" {
+                    record.remove("runtime");
+                }
+                std::fs::write(&record_path, serde_json::to_vec_pretty(&record).unwrap()).unwrap();
+                let before = std::fs::read(&record_path).unwrap();
+                let st = state(tmp.path(), Some(TOKEN), tmux.clone());
+
+                let (status, body) = call(
+                    router(st),
+                    post_json(&format!("/sessions/{id}/resume"), Some(TOKEN), json!({})),
+                )
+                .await;
+
+                assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "body={body}");
+                assert_eq!(body["schema_version"], "cli.agent-session.serve.v1");
+                assert_eq!(body["ok"], false);
+                assert_eq!(body["error"]["code"], "session-termination-failed");
+                assert_eq!(
+                    body["error"]["details"]["reason"],
+                    "runtime-identity-unavailable"
+                );
+                assert_eq!(body["error"]["details"]["retryable"], false);
+                assert_eq!(
+                    body["error"]["details"]["action"],
+                    "manual-runtime-verification-required"
+                );
+                assert_eq!(std::fs::read(&record_path).unwrap(), before);
+            }
+        }
+
+        let calls = std::fs::read_to_string(&log).unwrap();
+        assert!(
+            !calls.contains("new-session"),
+            "serve resume must not replace unprovable runtimes: {calls:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn resume_api_reports_retry_resume_for_a_surviving_runtime() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cwd = tmp.path().join("repo");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let id = "resume-surviving-runtime";
+        seed_resumable_session(
+            tmp.path(),
+            id,
+            "codex",
+            "hs-codex-resume-surviving-runtime",
+            &cwd,
+            &[
+                "resume",
+                "resume-session-id",
+                "--cd",
+                cwd.to_str().unwrap(),
+                "--no-alt-screen",
+            ],
+        );
+        let record_path = tmp.path().join("sessions").join(id).join("session.json");
+        let mut record: Value =
+            serde_json::from_slice(&std::fs::read(&record_path).unwrap()).unwrap();
+        record["runtime"]["launch_id"] = json!("surviving-launch");
+        let pane = TestProcessGroup::spawn();
+        record["delete_tmux_identity"] = json!({
+            "launch_id": "surviving-launch",
+            "session_id": "$98",
+            "pane_id": "%98",
+            "pane_pid": pane.pid(),
+            "process_group_id": pane.pid(),
+        });
+        std::fs::write(&record_path, serde_json::to_vec_pretty(&record).unwrap()).unwrap();
+        let tmux = executable(
+            &tmp.path().join("stopped-runtime-tmux"),
+            "#!/usr/bin/env sh\nprintf '%s\\n' \"can't find session: stopped\" >&2\nexit 1\n",
+        );
+        let st = state(tmp.path(), Some(TOKEN), tmux);
+
+        let (status, body) = call(
+            router(st),
+            post_json(&format!("/sessions/{id}/resume"), Some(TOKEN), json!({})),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "body={body}");
+        assert_eq!(body["error"]["code"], "session-termination-failed");
+        assert_eq!(body["error"]["details"]["reason"], "process-still-running");
+        assert_eq!(body["error"]["details"]["retryable"], true);
+        assert_eq!(body["error"]["details"]["action"], "retry-resume");
+        assert!(record_path.exists());
+    }
+
+    #[tokio::test]
+    async fn resume_api_reports_retry_resume_for_a_surviving_prior_runtime() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cwd = tmp.path().join("repo");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let id = "resume-surviving-prior-runtime";
+        seed_resumable_session(
+            tmp.path(),
+            id,
+            "codex",
+            "hs-codex-resume-surviving-prior-runtime",
+            &cwd,
+            &[
+                "resume",
+                "resume-session-id",
+                "--cd",
+                cwd.to_str().unwrap(),
+                "--no-alt-screen",
+            ],
+        );
+        let record_path = tmp.path().join("sessions").join(id).join("session.json");
+        let mut record: Value =
+            serde_json::from_slice(&std::fs::read(&record_path).unwrap()).unwrap();
+        record["runtime"]["launch_id"] = json!("surviving-prior-launch");
+        let prior_pane = TestProcessGroup::spawn();
+        record["delete_tmux_identity"] = json!({
+            "launch_id": "surviving-prior-launch",
+            "session_id": "$98",
+            "pane_id": "%98",
+            "pane_pid": 99999999,
+            "process_group_id": 99999999,
+        });
+        record["delete_tmux_prior_identities"] = json!([{
+            "launch_id": "surviving-prior-launch",
+            "session_id": "$98",
+            "pane_id": "%98",
+            "pane_pid": prior_pane.pid(),
+            "process_group_id": prior_pane.pid(),
+        }]);
+        std::fs::write(&record_path, serde_json::to_vec_pretty(&record).unwrap()).unwrap();
+        let tmux = executable(
+            &tmp.path().join("stopped-prior-runtime-tmux"),
+            "#!/usr/bin/env sh\nprintf '%s\\n' \"can't find session: stopped\" >&2\nexit 1\n",
+        );
+        let st = state(tmp.path(), Some(TOKEN), tmux);
+
+        let (status, body) = call(
+            router(st),
+            post_json(&format!("/sessions/{id}/resume"), Some(TOKEN), json!({})),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "body={body}");
+        assert_eq!(body["error"]["code"], "session-termination-failed");
+        assert_eq!(body["error"]["details"]["reason"], "process-still-running");
+        assert_eq!(body["error"]["details"]["retryable"], true);
+        assert_eq!(body["error"]["details"]["action"], "retry-resume");
+        let retained: Value =
+            serde_json::from_slice(&std::fs::read(&record_path).unwrap()).unwrap();
+        assert_eq!(
+            retained["delete_tmux_prior_identities"][0]["process_group_id"],
+            prior_pane.pid()
         );
     }
 
@@ -11230,7 +11497,7 @@ mod tests {
         let tmux = executable(
             &tmp.path().join("tmux-resume-lock"),
             &format!(
-                "#!/usr/bin/env sh\ncase \"$1\" in\n  has-session) [ -f {running} ] ;;\n  new-session) : > {started}; while [ ! -f {release} ]; do sleep 0.01; done; : > {running}; exit 0 ;;\n  *) exit 0 ;;\nesac\n",
+                "#!/usr/bin/env sh\ncase \"$1\" in\n  has-session) [ -f {running} ] ;;\n  new-session) : > {started}; while [ ! -f {release} ]; do sleep 0.01; done; : > {running}; printf '%s\\t%s\\t%s\\n' '$77' '%77' \"$$\"; exit 0 ;;\n  *) exit 0 ;;\nesac\n",
                 started = shell_words::quote(&started.to_string_lossy()),
                 release = shell_words::quote(&release.to_string_lossy()),
                 running = shell_words::quote(&running.to_string_lossy()),
@@ -12096,6 +12363,165 @@ printf '%s\n' '{"schema_version":"agent-session.codex-auth-broker.v1","accounts"
         let (status, body) = call(router(st.clone()), del).await;
         assert_eq!(status, StatusCode::NOT_FOUND);
         assert_eq!(body["error"]["code"], "session-not-found");
+    }
+
+    #[tokio::test]
+    async fn delete_kill_failure_returns_structured_error_and_retains_state() {
+        let tmp = tempfile::TempDir::new().unwrap();
+
+        for agent in ["codex", "claude"] {
+            let id = format!("failed-delete-{agent}");
+            let tmux_session = format!("hs-{agent}-failed-delete");
+            seed_session_with_runtime(tmp.path(), &id, agent, &tmux_session);
+            let pane = TestProcessGroup::spawn();
+            let tmux = failing_delete_tmux(tmp.path(), tmp.path(), &id, pane.pid());
+            let session_dir = tmp.path().join("sessions").join(&id);
+            let runtime_metadata = session_dir.join("provider-runtime.json");
+            std::fs::write(&runtime_metadata, format!("runtime metadata for {agent}")).unwrap();
+            let st = state(tmp.path(), Some(TOKEN), tmux.clone());
+            let request = Request::builder()
+                .method("DELETE")
+                .uri(format!("/sessions/{id}"))
+                .header("authorization", format!("Bearer {TOKEN}"))
+                .body(Body::empty())
+                .unwrap();
+
+            let (status, body) = call(router(st), request).await;
+
+            assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "body={body}");
+            assert_eq!(body["schema_version"], "cli.agent-session.serve.v1");
+            assert_eq!(body["ok"], false);
+            assert_eq!(body["error"]["code"], "session-termination-failed");
+            assert_eq!(body["error"]["details"]["id"], id);
+            assert_eq!(body["error"]["details"]["tmux_session"], tmux_session);
+            assert_eq!(body["error"]["details"]["reason"], "kill-failed");
+            assert_eq!(body["error"]["details"]["action"], "retry-delete");
+            assert!(session_dir.exists(), "{agent} state must remain retryable");
+            assert!(
+                runtime_metadata.exists(),
+                "{agent} runtime metadata must remain"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn delete_stopped_pre_upgrade_session_returns_non_retryable_manual_action() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let id = "pre-upgrade-stopped";
+        seed_session(tmp.path(), id, "codex", "hs-codex-pre-upgrade-stopped");
+        let tmux = executable(
+            &tmp.path().join("pre-upgrade-stopped-tmux"),
+            "#!/usr/bin/env sh\ncase \"$1\" in\n  display-message|has-session) printf \"%s\\n\" \"can't find session: pre-upgrade\" >&2; exit 1 ;;\n  *) exit 42 ;;\nesac\n",
+        );
+        let session_dir = tmp.path().join("sessions").join(id);
+        let st = state(tmp.path(), Some(TOKEN), tmux);
+        let request = Request::builder()
+            .method("DELETE")
+            .uri(format!("/sessions/{id}"))
+            .header("authorization", format!("Bearer {TOKEN}"))
+            .body(Body::empty())
+            .unwrap();
+
+        let (status, body) = call(router(st), request).await;
+
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "body={body}");
+        assert_eq!(body["error"]["code"], "session-termination-failed");
+        assert_eq!(
+            body["error"]["details"]["reason"],
+            "runtime-identity-unavailable"
+        );
+        assert_eq!(body["error"]["details"]["retryable"], false);
+        assert_eq!(
+            body["error"]["details"]["action"],
+            "manual-runtime-verification-required"
+        );
+        assert!(
+            session_dir.exists(),
+            "pre-upgrade metadata must remain fail-closed"
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_accepts_current_generation_never_launched_proof() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let calls = tmp.path().join("never-launched-delete-calls");
+        let tmux = executable(
+            &tmp.path().join("never-launched-delete-tmux"),
+            &format!(
+                "#!/usr/bin/env sh\nprintf '%s\\n' \"$*\" >> {}\ncase \"$1\" in\n  display-message|has-session) printf \"%s\\n\" \"can't find session: never-launched\" >&2; exit 1 ;;\n  *) exit 42 ;;\nesac\n",
+                shell_words::quote(&calls.to_string_lossy())
+            ),
+        );
+
+        for agent in ["codex", "claude"] {
+            let id = format!("never-launched-delete-{agent}");
+            let tmux_session = format!("hs-{agent}-never-launched-delete");
+            seed_session_with_runtime(tmp.path(), &id, agent, &tmux_session);
+            let session_dir = tmp.path().join("sessions").join(&id);
+            let record_path = session_dir.join("session.json");
+            let mut record: Value =
+                serde_json::from_slice(&std::fs::read(&record_path).unwrap()).unwrap();
+            record["tmux_runtime_never_launched"] = record["runtime"]["launch_id"].clone();
+            std::fs::write(&record_path, serde_json::to_vec_pretty(&record).unwrap()).unwrap();
+            let runtime_metadata = session_dir.join("provider-runtime.json");
+            std::fs::write(&runtime_metadata, format!("runtime metadata for {agent}")).unwrap();
+
+            let st = state(tmp.path(), Some(TOKEN), tmux.clone());
+            let request = Request::builder()
+                .method("DELETE")
+                .uri(format!("/sessions/{id}"))
+                .header("authorization", format!("Bearer {TOKEN}"))
+                .body(Body::empty())
+                .unwrap();
+            let (status, body) = call(router(st), request).await;
+
+            assert_eq!(status, StatusCode::OK, "body={body}");
+            assert_eq!(body["ok"], true);
+            assert_eq!(body["data"]["deleted"]["deleted"], true);
+            assert!(!session_dir.exists(), "{agent} metadata must be removed");
+            assert!(
+                !runtime_metadata.exists(),
+                "{agent} runtime metadata must be removed"
+            );
+        }
+
+        let calls = std::fs::read_to_string(calls).unwrap_or_default();
+        assert!(
+            !calls.lines().any(|line| line.starts_with("kill-session")),
+            "a definitively unlaunched runtime must not invoke kill-session: {calls}"
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_operational_tmux_probe_error_returns_structured_failure() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let tmux = tmp.path().join("operational-error-tmux");
+        std::fs::write(
+            &tmux,
+            "#!/usr/bin/env sh\nprintf '%s\\n' 'error connecting to /tmp/tmux-test/default (No such file or directory)' >&2\nexit 1\n",
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&tmux).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&tmux, permissions).unwrap();
+        let id = "probe-error-codex";
+        seed_session_with_runtime(tmp.path(), id, "codex", "hs-codex-probe-error");
+        let session_dir = tmp.path().join("sessions").join(id);
+        let st = state(tmp.path(), Some(TOKEN), tmux);
+        let request = Request::builder()
+            .method("DELETE")
+            .uri(format!("/sessions/{id}"))
+            .header("authorization", format!("Bearer {TOKEN}"))
+            .body(Body::empty())
+            .unwrap();
+
+        let (status, body) = call(router(st), request).await;
+
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "body={body}");
+        assert_eq!(body["ok"], false);
+        assert_eq!(body["error"]["code"], "session-termination-failed");
+        assert_eq!(body["error"]["details"]["reason"], "verification-failed");
+        assert!(session_dir.exists());
     }
 
     #[tokio::test]
@@ -13511,7 +13937,7 @@ exit 0
         std::fs::write(
             &bin,
             format!(
-                "#!/usr/bin/env sh\nprintf '%s\\n' \"$*\" >> {}\ncase \"$1\" in\n  has-session) exit 0 ;;\n  capture-pane) printf 'pane\\n'; exit 0 ;;\n  *) exit 0 ;;\nesac\n",
+                "#!/usr/bin/env sh\nprintf '%s\\n' \"$*\" >> {}\ncase \"$1\" in\n  has-session) exit 0 ;;\n  new-session) printf '%s\\t%s\\t%s\\n' '$77' '%77' \"$$\"; exit 0 ;;\n  capture-pane) printf 'pane\\n'; exit 0 ;;\n  *) exit 0 ;;\nesac\n",
                 shell_words::quote(&log.to_string_lossy())
             ),
         )
