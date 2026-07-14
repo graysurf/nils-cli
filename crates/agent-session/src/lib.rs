@@ -3299,35 +3299,48 @@ fn render_session_title_state(state: &SessionTitleState) -> Result<Option<String
     } else {
         SESSION_TITLE_MAX_CHARS
     };
-    let references = state
-        .references
-        .iter()
-        .filter(|reference| {
-            state
-                .topic
-                .as_deref()
-                .is_none_or(|topic| !title_contains_reference(topic, reference))
-        })
-        .cloned()
-        .collect::<Vec<_>>()
-        .join(" ");
+    let topic = state.topic.as_deref().filter(|value| !value.is_empty());
+    let mut visible_topic = topic.map(|value| truncate_title_component(value, max_anchor_chars));
+    let mut references = String::new();
+    if let Some(topic) = topic {
+        for _ in 0..=state.references.len() {
+            references = state
+                .references
+                .iter()
+                .filter(|reference| {
+                    visible_topic
+                        .as_deref()
+                        .is_none_or(|value| !title_contains_reference(value, reference))
+                })
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(" ");
+            let topic_chars = if references.is_empty() {
+                max_anchor_chars
+            } else {
+                max_anchor_chars.saturating_sub(references.chars().count() + 1)
+            };
+            let next_visible_topic = truncate_title_component(topic, topic_chars);
+            if visible_topic.as_deref() == Some(next_visible_topic.as_str()) {
+                break;
+            }
+            visible_topic = Some(next_visible_topic);
+        }
+    } else {
+        references = state.references.join(" ");
+    }
     let anchor = match (
-        state.topic.as_deref().filter(|value| !value.is_empty()),
+        visible_topic.as_deref().filter(|value| !value.is_empty()),
         references.is_empty(),
     ) {
         (None, true) => None,
         (None, false) => Some(truncate_title_component(&references, max_anchor_chars)),
-        (Some(topic), true) => Some(truncate_title_component(topic, max_anchor_chars)),
-        (Some(topic), false) => {
-            let reference_chars = references.chars().count();
-            let topic_chars = max_anchor_chars.saturating_sub(reference_chars + 1);
-            let topic = truncate_title_component(topic, topic_chars);
-            Some(if topic.is_empty() {
-                truncate_title_component(&references, max_anchor_chars)
-            } else {
-                format!("{topic} {references}")
-            })
-        }
+        (Some(topic), true) => Some(topic.to_string()),
+        (Some(topic), false) => Some(if topic.is_empty() {
+            truncate_title_component(&references, max_anchor_chars)
+        } else {
+            format!("{topic} {references}")
+        }),
     };
     match (anchor, state.activity.as_deref()) {
         (None, None) => Ok(None),
@@ -5444,6 +5457,20 @@ mod tests {
             state_dir: state_dir.to_path_buf(),
             host: None,
         }
+    }
+
+    #[test]
+    fn structured_title_renderer_keeps_references_visible_after_topic_truncation() {
+        let title = super::render_session_title_state(&super::SessionTitleState {
+            topic: Some(format!("{} #317", "x".repeat(100))),
+            topic_source: super::SessionTitleTopicSource::Auto,
+            references: vec!["#317".to_string()],
+            activity: Some("Implement contract".to_string()),
+        })
+        .unwrap()
+        .unwrap();
+
+        assert!(title.contains("#317 - Implement contract"));
     }
 
     fn create_test_record_id(
