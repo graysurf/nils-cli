@@ -322,6 +322,16 @@ is no second state model.
   changes made by older daemons that do not advance the revision with `409 title-state-conflict`.
   `expected_session_created_at` remains accepted for transitional clients. Omitting these fields preserves
   unconditional updates for backward-compatible clients.
+- Session create and PATCH requests may provide `title_state` instead of deriving semantics from the rendered title.
+  Its shape is `{ "topic": string|null, "topic_source": "none"|"auto"|"user", "references": ["#123"],
+  "activity": string|null }`. A `user` topic is client-owned and stable; an `auto` topic may be revised as the session
+  converges; `none` requires a null topic. The daemon validates at most two numeric work-item references and renders the
+  compatibility `title` as `<topic and references> - <activity>`, or as the only non-empty side when one side is absent.
+  Supplying both fields requires an exact canonical match. Title-only compatibility writes remain accepted and clear
+  `title_state`, so old clients never leave structured provenance attached to an unrelated title. Reads omit stale
+  structured state if an older writer changed only the compatibility title.
+  Session and glance responses advertise `title_state_supported: true` independently of whether that session already
+  has structured state, allowing upgraded clients to migrate title-only records conservatively.
 - Attachment upload uses a raw binary request body (not multipart), capped at 25 MiB. The daemon writes the file under the
   session's private `attachments/` directory with a sanitized filename and returns the remote path in the serve envelope.
   Empty or null titles clear the custom session title so clients can fall back to the session id.

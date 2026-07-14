@@ -883,6 +883,7 @@ mod tests {
             agent: "claude".to_string(),
             mode: "interactive".to_string(),
             title: None,
+            title_state: None,
             title_revision: 0,
             cwd: "/repo".to_string(),
             tmux_session: "hs-claude-reset".to_string(),

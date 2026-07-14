@@ -444,6 +444,8 @@ struct SessionRecord {
     agent: String,
     mode: String,
     title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    title_state: Option<SessionTitleState>,
     #[serde(default)]
     title_revision: u64,
     cwd: String,
@@ -464,6 +466,24 @@ struct SessionRecord {
     extra: BTreeMap<String, Value>,
     #[serde(skip)]
     resume_sidecar_extra: BTreeMap<String, Value>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum SessionTitleTopicSource {
+    None,
+    Auto,
+    User,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct SessionTitleState {
+    topic: Option<String>,
+    topic_source: SessionTitleTopicSource,
+    #[serde(default)]
+    references: Vec<String>,
+    activity: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -971,6 +991,9 @@ struct SessionView {
     agent: String,
     mode: String,
     title: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    title_state: Option<SessionTitleState>,
+    title_state_supported: bool,
     title_revision: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     session_incarnation: Option<String>,
@@ -1009,6 +1032,7 @@ pub(crate) struct ProviderResumeImportArgs {
     pub(crate) agent: AgentKind,
     pub(crate) provider_resume_id: String,
     pub(crate) title: Option<String>,
+    pub(crate) title_state: Option<SessionTitleState>,
     pub(crate) id: Option<String>,
     pub(crate) tmux_bin: Option<PathBuf>,
     pub(crate) agent_bin: Option<PathBuf>,
@@ -1045,6 +1069,9 @@ struct GlanceResult {
     id: String,
     agent: String,
     title: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    title_state: Option<SessionTitleState>,
+    title_state_supported: bool,
     title_revision: u64,
     tmux_session: String,
     status: String,
@@ -1170,6 +1197,7 @@ fn start_session(
         agent: args.agent,
         mode: "interactive",
         title: args.title.as_deref(),
+        title_state: args.initial_title_state,
         explicit_id: args.id.as_deref(),
         cwd: &cwd,
         prompt: prompt.as_deref(),
@@ -1318,6 +1346,7 @@ fn start_run_session(context: &CliContext, args: cli::RunArgs) -> Result<StartVi
         agent: args.agent,
         mode: "run",
         title: args.title.as_deref(),
+        title_state: None,
         explicit_id: args.id.as_deref(),
         cwd: &cwd,
         prompt: Some(&prompt),
@@ -1390,6 +1419,7 @@ pub(crate) fn start_provider_resume_session(
         agent: args.agent,
         mode: "interactive",
         title: args.title.as_deref(),
+        title_state: args.title_state,
         explicit_id: args.id.as_deref(),
         cwd: &cwd,
         prompt: None,
@@ -1441,6 +1471,7 @@ struct RecordRequest<'a> {
     agent: AgentKind,
     mode: &'a str,
     title: Option<&'a str>,
+    title_state: Option<SessionTitleState>,
     explicit_id: Option<&'a str>,
     cwd: &'a Path,
     prompt: Option<&'a str>,
@@ -1482,6 +1513,7 @@ fn create_record(request: RecordRequest<'_>) -> Result<CreatedRecord, CliError> 
         agent: request.agent.as_str().to_string(),
         mode: request.mode.to_string(),
         title: request.title.map(str::to_string),
+        title_state: request.title_state,
         title_revision: 0,
         cwd: display_path(request.cwd),
         tmux_session: tmux_session.clone(),
@@ -2565,6 +2597,8 @@ fn glance_session(context: &CliContext, args: cli::GlanceArgs) -> Result<GlanceR
         id: record.id.clone(),
         agent: record.agent.clone(),
         title: record.title.clone(),
+        title_state: effective_session_title_state(&record),
+        title_state_supported: true,
         title_revision: record.title_revision,
         tmux_session: record.tmux_session.clone(),
         status,
@@ -2727,6 +2761,7 @@ fn update_session_title(
         context,
         id,
         title,
+        None,
         TitleUpdatePreconditions::default(),
         tmux_bin,
     )
@@ -2744,10 +2779,21 @@ fn update_session_title_if_revision(
     context: &CliContext,
     id: &str,
     title: Option<String>,
+    title_state: Option<SessionTitleState>,
     expected: TitleUpdatePreconditions,
     tmux_bin: &Path,
 ) -> Result<SessionView, CliError> {
     let normalized_title = normalize_title(title)?;
+    let normalized_title_state = title_state.map(normalize_title_state).transpose()?;
+    if let Some(state) = normalized_title_state.as_ref()
+        && render_session_title_state(state)? != normalized_title
+    {
+        return Err(CliError::usage(
+            "title-state-mismatch",
+            "session title must match the canonical title_state rendering",
+            Some(json!({ "field": "title_state" })),
+        ));
+    }
     let (record, previous_title) = mutate_session_record_for_title(
         context,
         id,
@@ -2784,6 +2830,7 @@ fn update_session_title_if_revision(
             let previous_title = record.title.clone();
             record.title_revision = actual_title_revision;
             record.title = normalized_title;
+            record.title_state = normalized_title_state;
             record.title_revision = actual_title_revision.checked_add(1).ok_or_else(|| {
                 CliError::data(
                     "title-revision-overflow",
@@ -3140,6 +3187,176 @@ fn normalize_title(title: Option<String>) -> Result<Option<String>, CliError> {
         ));
     }
     Ok(Some(title))
+}
+
+const SESSION_TITLE_MAX_CHARS: usize = 120;
+const SESSION_TITLE_SEPARATOR: &str = " - ";
+const SESSION_TITLE_MIN_ACTIVITY_CHARS: usize = 32;
+const SESSION_TITLE_MAX_REFERENCES: usize = 2;
+
+fn normalize_title_state(mut state: SessionTitleState) -> Result<SessionTitleState, CliError> {
+    state.topic = normalize_title_state_component(state.topic, "topic")?;
+    state.activity = normalize_title_state_component(state.activity, "activity")?;
+    match (&state.topic_source, &state.topic) {
+        (SessionTitleTopicSource::None, None)
+        | (SessionTitleTopicSource::Auto, Some(_))
+        | (SessionTitleTopicSource::User, Some(_)) => {}
+        _ => {
+            return Err(CliError::usage(
+                "invalid-title-state",
+                "topic_source must be none without a topic, or auto/user with a topic",
+                Some(json!({ "field": "title_state.topic_source" })),
+            ));
+        }
+    }
+    if state.references.len() > SESSION_TITLE_MAX_REFERENCES {
+        return Err(CliError::usage(
+            "invalid-title-state",
+            format!(
+                "title_state supports at most {SESSION_TITLE_MAX_REFERENCES} work-item references"
+            ),
+            Some(json!({ "field": "title_state.references" })),
+        ));
+    }
+    let mut normalized_references = Vec::with_capacity(state.references.len());
+    for reference in state.references {
+        let reference = reference.trim().to_string();
+        let number = reference.strip_prefix('#').unwrap_or_default();
+        if number.is_empty()
+            || number.starts_with('0')
+            || number.len() > 10
+            || !number.chars().all(|character| character.is_ascii_digit())
+        {
+            return Err(CliError::usage(
+                "invalid-title-state",
+                "title_state references must use #<positive-number>",
+                Some(json!({ "field": "title_state.references" })),
+            ));
+        }
+        if !normalized_references.contains(&reference) {
+            normalized_references.push(reference);
+        }
+    }
+    state.references = normalized_references;
+    Ok(state)
+}
+
+fn normalize_title_state_component(
+    value: Option<String>,
+    field: &str,
+) -> Result<Option<String>, CliError> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let value = value.split_whitespace().collect::<Vec<_>>().join(" ");
+    if value.is_empty() {
+        return Ok(None);
+    }
+    if value.chars().count() > SESSION_TITLE_MAX_CHARS {
+        return Err(CliError::usage(
+            "invalid-title-state",
+            format!("title_state {field} must be {SESSION_TITLE_MAX_CHARS} characters or fewer"),
+            Some(
+                json!({ "field": format!("title_state.{field}"), "max_chars": SESSION_TITLE_MAX_CHARS }),
+            ),
+        ));
+    }
+    Ok(Some(value))
+}
+
+fn truncate_title_component(value: &str, max_chars: usize) -> String {
+    let chars = value.chars().collect::<Vec<_>>();
+    if chars.len() <= max_chars {
+        return value.to_string();
+    }
+    if max_chars <= 3 {
+        return chars.into_iter().take(max_chars).collect();
+    }
+    format!(
+        "{}...",
+        chars
+            .into_iter()
+            .take(max_chars.saturating_sub(3))
+            .collect::<String>()
+    )
+}
+
+fn title_contains_reference(title: &str, reference: &str) -> bool {
+    title.match_indices(reference).any(|(index, _)| {
+        title[index + reference.len()..]
+            .chars()
+            .next()
+            .is_none_or(|character| !character.is_ascii_digit())
+    })
+}
+
+fn render_session_title_state(state: &SessionTitleState) -> Result<Option<String>, CliError> {
+    let state = normalize_title_state(state.clone())?;
+    let max_anchor_chars = if state.activity.is_some() {
+        SESSION_TITLE_MAX_CHARS
+            .saturating_sub(SESSION_TITLE_SEPARATOR.chars().count())
+            .saturating_sub(SESSION_TITLE_MIN_ACTIVITY_CHARS)
+    } else {
+        SESSION_TITLE_MAX_CHARS
+    };
+    let references = state
+        .references
+        .iter()
+        .filter(|reference| {
+            state
+                .topic
+                .as_deref()
+                .is_none_or(|topic| !title_contains_reference(topic, reference))
+        })
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let anchor = match (
+        state.topic.as_deref().filter(|value| !value.is_empty()),
+        references.is_empty(),
+    ) {
+        (None, true) => None,
+        (None, false) => Some(truncate_title_component(&references, max_anchor_chars)),
+        (Some(topic), true) => Some(truncate_title_component(topic, max_anchor_chars)),
+        (Some(topic), false) => {
+            let reference_chars = references.chars().count();
+            let topic_chars = max_anchor_chars.saturating_sub(reference_chars + 1);
+            let topic = truncate_title_component(topic, topic_chars);
+            Some(if topic.is_empty() {
+                truncate_title_component(&references, max_anchor_chars)
+            } else {
+                format!("{topic} {references}")
+            })
+        }
+    };
+    match (anchor, state.activity.as_deref()) {
+        (None, None) => Ok(None),
+        (Some(anchor), None) => Ok(Some(truncate_title_component(
+            &anchor,
+            SESSION_TITLE_MAX_CHARS,
+        ))),
+        (None, Some(activity)) => Ok(Some(truncate_title_component(
+            activity,
+            SESSION_TITLE_MAX_CHARS,
+        ))),
+        (Some(anchor), Some(activity)) => {
+            let activity_chars = SESSION_TITLE_MAX_CHARS
+                .saturating_sub(anchor.chars().count())
+                .saturating_sub(SESSION_TITLE_SEPARATOR.chars().count());
+            Ok(Some(format!(
+                "{anchor}{SESSION_TITLE_SEPARATOR}{}",
+                truncate_title_component(activity, activity_chars)
+            )))
+        }
+    }
+}
+
+fn effective_session_title_state(record: &SessionRecord) -> Option<SessionTitleState> {
+    let state = record.title_state.as_ref()?;
+    match render_session_title_state(state) {
+        Ok(rendered) if rendered == record.title => Some(state.clone()),
+        _ => None,
+    }
 }
 
 fn write_session_attachment(
@@ -4064,6 +4281,8 @@ fn session_view_from_parts(
         agent: record.agent.clone(),
         mode: record.mode.clone(),
         title: record.title.clone(),
+        title_state: effective_session_title_state(record),
+        title_state_supported: true,
         title_revision: record.title_revision,
         session_incarnation: record
             .runtime
@@ -5238,6 +5457,7 @@ mod tests {
             agent,
             mode: "interactive",
             title,
+            title_state: None,
             explicit_id,
             cwd: Path::new("/repo"),
             prompt: None,
@@ -5320,6 +5540,7 @@ mod tests {
             agent: AgentKind::Codex,
             mode: "interactive",
             title: None,
+            title_state: None,
             explicit_id: Some("malformed-startup"),
             cwd: Path::new("/repo"),
             prompt: None,
@@ -5381,6 +5602,7 @@ mod tests {
             agent: AgentKind::Codex,
             mode: "interactive",
             title: None,
+            title_state: None,
             explicit_id: Some("provider-stage"),
             cwd: Path::new("/repo"),
             prompt: None,
@@ -5427,6 +5649,7 @@ mod tests {
             agent: AgentKind::Codex,
             mode: "interactive",
             title: None,
+            title_state: None,
             explicit_id: Some("reconcile-race"),
             cwd: Path::new("/repo"),
             prompt: None,
@@ -5517,6 +5740,7 @@ mod tests {
             agent: AgentKind::Codex,
             mode: "interactive",
             title: None,
+            title_state: None,
             explicit_id: Some("startup-future-fields"),
             cwd: Path::new("/repo"),
             prompt: None,
@@ -5569,6 +5793,7 @@ mod tests {
                 agent: AgentKind::Codex,
                 mode: "interactive",
                 title: None,
+                title_state: None,
                 explicit_id: Some(id),
                 cwd: Path::new("/repo"),
                 prompt: None,
