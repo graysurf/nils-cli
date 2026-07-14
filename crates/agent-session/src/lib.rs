@@ -9280,6 +9280,21 @@ mod tests {
                 }
                 Err(error) => {
                     let pane_session_id = unsafe { libc::getsid(pane_pid) };
+                    let raw_tmux_identity = Command::new(&wrapper)
+                        .env("LC_ALL", "C")
+                        .arg("display-message")
+                        .arg("-p")
+                        .arg("-t")
+                        .arg(super::managed_tmux_pane_target(&record.tmux_session))
+                        .arg("#{session_id}\t#{pane_id}\t#{pane_pid}")
+                        .output()
+                        .map(|output| {
+                            (
+                                output.status,
+                                String::from_utf8_lossy(&output.stdout).into_owned(),
+                                String::from_utf8_lossy(&output.stderr).into_owned(),
+                            )
+                        });
                     let pane_session_members =
                         super::linux_process_session_members(pane_session_id).map(|members| {
                             members
@@ -9295,7 +9310,7 @@ mod tests {
                                 .collect::<Vec<_>>()
                         });
                     panic!(
-                        "tmux runtime identity did not stabilize within the fixture timeout: {error:?}; caller_pid={}; caller_pgid={}; caller_sid={}; pane_pid={pane_pid}; pane_pgid={:?}; pane_sid={pane_session_id}; pane_members={pane_session_members:?}; pane_cgroup={:?}; pane_stat={:?}; calls={}",
+                        "tmux runtime identity did not stabilize within the fixture timeout: {error:?}; initial_tmux_session={tmux_session_id:?}; initial_tmux_pane={tmux_pane_id:?}; raw_tmux_identity={raw_tmux_identity:?}; caller_pid={}; caller_pgid={}; caller_sid={}; pane_pid={pane_pid}; pane_pgid={:?}; pane_sid={pane_session_id}; pane_members={pane_session_members:?}; pane_cgroup={:?}; pane_stat={:?}; calls={}",
                         unsafe { libc::getpid() },
                         unsafe { libc::getpgrp() },
                         unsafe { libc::getsid(0) },
