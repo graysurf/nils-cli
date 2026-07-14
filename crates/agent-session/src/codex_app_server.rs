@@ -1865,9 +1865,12 @@ pub(crate) async fn run_control(
         .map_err(|err| format!("thread/loaded/list failed: {err}"))?;
         let ids = loaded_thread_ids(&result)
             .ok_or_else(|| "Codex loaded-thread response was malformed".to_string())?;
+        if let Some(id) = attached_loaded_thread(&record, &ids)? {
+            break id;
+        }
         match ids.as_slice() {
             [id] => break id.clone(),
-            [] if discovery_attempts < 100 => {
+            _ if discovery_attempts < 100 => {
                 discovery_attempts = discovery_attempts.saturating_add(1);
                 tokio::time::sleep(Duration::from_millis(100)).await;
             }
@@ -2101,6 +2104,23 @@ fn bind_thread(record: &SessionRecord, thread_id: &str) -> Result<(), String> {
     }
     write_private_file(attached, projected_thread_binding(thread_id).as_bytes())
         .map_err(|err| format!("Codex thread binding failed: {}", err.code()))
+}
+
+fn attached_loaded_thread(
+    record: &SessionRecord,
+    loaded_thread_ids: &[String],
+) -> Result<Option<String>, String> {
+    let attached = thread_attached_path(record)
+        .ok_or_else(|| "Codex attached marker metadata is missing".to_string())?;
+    let observed = match fs::read_to_string(attached) {
+        Ok(observed) => observed,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => return Err("Codex attached thread binding was unreadable".to_string()),
+    };
+    Ok(loaded_thread_ids
+        .iter()
+        .find(|thread_id| projected_thread_binding(thread_id) == observed)
+        .cloned())
 }
 
 fn projected_thread_binding(thread_id: &str) -> String {
@@ -5572,7 +5592,10 @@ printf '%s\n' '{"schema_version":"agent-session.codex-auth-broker.v1","account":
             respond(
                 &mut socket,
                 &loaded,
-                json!({ "data": ["raw-thread-a"], "nextCursor": null }),
+                json!({
+                    "data": ["raw-thread-decoy", "raw-thread-a"],
+                    "nextCursor": null
+                }),
             )
             .await;
             let resume = receive_json(&mut socket).await;
