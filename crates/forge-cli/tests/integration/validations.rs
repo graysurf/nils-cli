@@ -64,7 +64,7 @@ fn validation_kinds_match_spec_catalog() {
 
 #[test]
 fn sprint3_runtime_and_unavailable_kinds_match_spec() {
-    // Sprint 3 introduces three new typed kinds that do NOT live in the
+    // Runtime/unavailable typed kinds do NOT live in the
     // lock-down validation chain but still belong in the catalog so future
     // contract regressions get flagged here.
     let runtime = ForgeError::runtime_failure("cli.forge-cli.error.v1", "checks_failed", "x", None);
@@ -83,6 +83,31 @@ fn sprint3_runtime_and_unavailable_kinds_match_spec() {
     );
     assert_eq!(version.kind(), "glab_version_unsupported");
     assert_eq!(version.exit_code(), 69);
+
+    let review_timeout = ForgeError::unavailable(
+        "cli.forge-cli.error.v1",
+        "review_convergence_timeout",
+        "x",
+        None,
+    );
+    assert_eq!(review_timeout.kind(), "review_convergence_timeout");
+    assert_eq!(review_timeout.exit_code(), 69);
+}
+
+#[test]
+fn review_convergence_validation_kinds_match_spec() {
+    for kind in [
+        "review_changes_requested",
+        "review_convergence_head_missing",
+        "review_convergence_head_changed",
+        "review_convergence_activity_changed",
+        "review_snapshot_incomplete",
+        "invalid_review_convergence_config",
+    ] {
+        let err = ForgeError::validation("cli.forge-cli.error.v1", kind, "x", None);
+        assert_eq!(err.kind(), kind);
+        assert_eq!(err.exit_code(), 65, "review convergence kinds exit DATA");
+    }
 }
 
 #[test]

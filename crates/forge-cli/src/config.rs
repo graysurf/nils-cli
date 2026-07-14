@@ -10,8 +10,12 @@
 //! Resolution order for any setting (per spec):
 //!
 //! ```text
-//! explicit flag > .forge-cli.toml > spec default
+//! explicit flag > .forge-cli.toml > user-global config > spec default
 //! ```
+//!
+//! Review convergence is the safety exception: without an explicit flag, a
+//! repository may enable or strengthen a user-global gate but cannot disable
+//! `require = true`, shorten its quiet window, or remove its configured bots.
 //!
 //! Callers obtain a [`ForgeConfig`] from [`ForgeConfig::load_from`] (or
 //! [`ForgeConfig::default`] when no repo override applies) and then ask for a
@@ -36,7 +40,15 @@ pub const CONFIG_FILE_NAME: &str = ".forge-cli.toml";
 pub const GLOBAL_CONFIG_FILE_NAME: &str = "config.toml";
 
 /// Top-level config sections recognised by this version.
-const KNOWN_SECTIONS: &[&str] = &["merge", "body", "branch", "checks", "inbox", "test_first"];
+const KNOWN_SECTIONS: &[&str] = &[
+    "merge",
+    "body",
+    "branch",
+    "checks",
+    "inbox",
+    "test_first",
+    "review_convergence",
+];
 
 /// Recognised keys per section.
 const KNOWN_MERGE_KEYS: &[&str] = &["method", "delete_branch"];
@@ -55,6 +67,9 @@ const KNOWN_INBOX_KEYS: &[&str] = &[
     "cache_max_age",
     "no_cache",
 ];
+const KNOWN_REVIEW_CONVERGENCE_KEYS: &[&str] = &["require", "quiet_period", "timeout", "bots"];
+pub const MAX_REVIEW_QUIET_PERIOD: Duration = Duration::from_secs(60 * 60);
+pub const MAX_REVIEW_TIMEOUT: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// Merge strategy choices supported by both backends. The string form matches
 /// the spec catalog and `[merge].method` in `.forge-cli.toml`.
@@ -94,6 +109,57 @@ impl FromStr for MergeMethod {
     }
 }
 
+/// Waiting contract for a configured review actor. `observed` is the only v1
+/// mode: absence never waits or fails, while an already-submitted current-head
+/// review participates in the quiet window and snapshot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ReviewBotMode {
+    Observed,
+}
+
+impl ReviewBotMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Observed => "observed",
+        }
+    }
+}
+
+impl FromStr for ReviewBotMode {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "observed" => Ok(Self::Observed),
+            other => Err(format!("unknown review bot mode {other:?}")),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReviewConvergenceBot {
+    pub login: String,
+    pub mode: ReviewBotMode,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ReviewConvergencePolicy {
+    pub require: bool,
+    #[serde(serialize_with = "serialize_duration_ms")]
+    pub quiet_period: Duration,
+    #[serde(serialize_with = "serialize_duration_ms")]
+    pub timeout: Duration,
+    pub bots: Vec<ReviewConvergenceBot>,
+}
+
+fn serialize_duration_ms<S>(duration: &Duration, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    serializer.serialize_u64(u64::try_from(duration.as_millis()).unwrap_or(u64::MAX))
+}
+
 /// Loaded `.forge-cli.toml` settings. Every field is optional; the resolver
 /// helpers fall back to the spec default when both the explicit override and
 /// this field are unset.
@@ -121,6 +187,13 @@ pub struct ForgeConfig {
     /// feature/bug kinds must carry verified test-first evidence (a failing
     /// test or explicit waiver plus a passing final validation).
     pub test_first_required: Option<bool>,
+    pub review_convergence_required: Option<bool>,
+    pub review_convergence_quiet_period: Option<Duration>,
+    pub review_convergence_timeout: Option<Duration>,
+    /// Whole-list override. `Some([])` intentionally clears a lower-precedence
+    /// global bot list unless that global layer enables the monotonic safety
+    /// gate; `None` inherits it.
+    pub review_convergence_bots: Option<Vec<ReviewConvergenceBot>>,
     /// Forward-compat warnings collected while parsing (unknown keys, bad
     /// scalar types). Each entry is prefixed `unknown-config-key:` or
     /// `invalid-config-value:` so callers can render them verbatim under
@@ -223,14 +296,44 @@ impl ForgeConfig {
         global.overlaid_by(repo)
     }
 
-    /// Overlay `top` onto `self`: every field set in `top` wins; unset fields
-    /// fall back to `self`. Warnings are concatenated (base first), and the
+    /// Overlay `top` onto `self`: fields set in `top` normally win and unset
+    /// fields fall back to `self`. An enabled base review-convergence policy is
+    /// monotonic: the top layer cannot disable it, shorten its quiet period, or
+    /// remove its bots. Warnings are concatenated (base first), and the
     /// `source_path` reports the higher-precedence file when present.
     ///
     /// Exposed to the crate so callers that must distinguish layers (e.g. the
     /// `pr merge` rule-10 conflict check, which only fires on a repo-explicit
     /// `delete_branch`) can compose the layers themselves.
     pub(crate) fn overlaid_by(self, top: Self) -> Self {
+        let protect_global_review = self.review_convergence_required == Some(true);
+        let review_convergence_required = if protect_global_review {
+            Some(true)
+        } else {
+            top.review_convergence_required
+                .or(self.review_convergence_required)
+        };
+        let review_convergence_quiet_period = if protect_global_review {
+            top.review_convergence_quiet_period.map_or(
+                self.review_convergence_quiet_period,
+                |repo_quiet_period| {
+                    Some(
+                        repo_quiet_period.max(
+                            self.review_convergence_quiet_period
+                                .unwrap_or_else(|| Duration::from_secs(2 * 60)),
+                        ),
+                    )
+                },
+            )
+        } else {
+            top.review_convergence_quiet_period
+                .or(self.review_convergence_quiet_period)
+        };
+        let review_convergence_bots = merge_review_bot_layers(
+            self.review_convergence_bots.clone(),
+            top.review_convergence_bots.clone(),
+            protect_global_review,
+        );
         Self {
             merge_method: top.merge_method.or(self.merge_method),
             merge_delete_branch: top.merge_delete_branch.or(self.merge_delete_branch),
@@ -255,6 +358,12 @@ impl ForgeConfig {
             inbox_cache_max_age: top.inbox_cache_max_age.or(self.inbox_cache_max_age),
             inbox_no_cache: top.inbox_no_cache.or(self.inbox_no_cache),
             test_first_required: top.test_first_required.or(self.test_first_required),
+            review_convergence_required,
+            review_convergence_quiet_period,
+            review_convergence_timeout: top
+                .review_convergence_timeout
+                .or(self.review_convergence_timeout),
+            review_convergence_bots,
             warnings: {
                 let mut merged = self.warnings;
                 merged.extend(top.warnings);
@@ -333,6 +442,64 @@ impl ForgeConfig {
     pub fn resolve_test_first_required(&self, explicit: Option<bool>) -> bool {
         explicit.or(self.test_first_required).unwrap_or(false)
     }
+
+    /// Resolve the default-off native-review convergence policy.
+    pub fn resolve_review_convergence(
+        &self,
+        explicit_required: Option<bool>,
+    ) -> ReviewConvergencePolicy {
+        ReviewConvergencePolicy {
+            require: explicit_required
+                .or(self.review_convergence_required)
+                .unwrap_or(false),
+            quiet_period: self
+                .review_convergence_quiet_period
+                .unwrap_or_else(|| Duration::from_secs(2 * 60)),
+            timeout: self
+                .review_convergence_timeout
+                .unwrap_or_else(|| Duration::from_secs(20 * 60)),
+            bots: self.review_convergence_bots.clone().unwrap_or_default(),
+        }
+    }
+
+    pub fn invalid_review_convergence_warnings(&self) -> Vec<&str> {
+        self.warnings
+            .iter()
+            .map(String::as_str)
+            .filter(|warning| {
+                warning.starts_with("invalid-config-value:review_convergence")
+                    || [
+                        "invalid-config-value:read_error:",
+                        "invalid-config-value:parse_error:",
+                        "invalid-config-value:global_read_error:",
+                        "invalid-config-value:global_parse_error:",
+                        "invalid-config-value:root_not_table",
+                    ]
+                    .iter()
+                    .any(|prefix| warning.starts_with(prefix))
+            })
+            .collect()
+    }
+}
+
+fn merge_review_bot_layers(
+    base: Option<Vec<ReviewConvergenceBot>>,
+    top: Option<Vec<ReviewConvergenceBot>>,
+    protect_base: bool,
+) -> Option<Vec<ReviewConvergenceBot>> {
+    if !protect_base {
+        return top.or(base);
+    }
+    let mut merged = base.unwrap_or_default();
+    for bot in top.unwrap_or_default() {
+        let duplicate = merged.iter().any(|existing| {
+            existing.mode == bot.mode && existing.login.eq_ignore_ascii_case(&bot.login)
+        });
+        if !duplicate {
+            merged.push(bot);
+        }
+    }
+    Some(merged)
 }
 
 /// Resolve the user-global config path
@@ -392,6 +559,7 @@ fn parse_value(value: &Value) -> ForgeConfig {
             "checks" => parse_checks(section_table, &mut cfg),
             "inbox" => parse_inbox(section_table, &mut cfg),
             "test_first" => parse_test_first(section_table, &mut cfg),
+            "review_convergence" => parse_review_convergence(section_table, &mut cfg),
             _ => unreachable!("section filtered above"),
         }
     }
@@ -444,6 +612,113 @@ fn parse_test_first(table: &toml::map::Map<String, Value>, cfg: &mut ForgeConfig
             _ => unreachable!("key filtered above"),
         }
     }
+}
+
+fn parse_review_convergence(table: &toml::map::Map<String, Value>, cfg: &mut ForgeConfig) {
+    for (key, value) in table {
+        if !KNOWN_REVIEW_CONVERGENCE_KEYS.contains(&key.as_str()) {
+            cfg.warnings
+                .push(format!("unknown-config-key:review_convergence.{key}"));
+            continue;
+        }
+        match key.as_str() {
+            "require" => match value.as_bool() {
+                Some(required) => cfg.review_convergence_required = Some(required),
+                None => cfg
+                    .warnings
+                    .push("invalid-config-value:review_convergence.require:not_a_bool".to_string()),
+            },
+            "quiet_period" | "timeout" => match value.as_str() {
+                Some(raw) => match parse_duration(raw) {
+                    Ok(duration) => match validate_review_duration(key, duration) {
+                        Ok(()) if key == "quiet_period" => {
+                            cfg.review_convergence_quiet_period = Some(duration);
+                        }
+                        Ok(()) => cfg.review_convergence_timeout = Some(duration),
+                        Err(max) => cfg.warnings.push(format!(
+                            "invalid-config-value:review_convergence.{key}:exceeds_max:{max}"
+                        )),
+                    },
+                    Err(_) => cfg.warnings.push(format!(
+                        "invalid-config-value:review_convergence.{key}:{raw}"
+                    )),
+                },
+                None => cfg.warnings.push(format!(
+                    "invalid-config-value:review_convergence.{key}:not_a_string"
+                )),
+            },
+            "bots" => parse_review_convergence_bots(value, cfg),
+            _ => unreachable!("key filtered above"),
+        }
+    }
+}
+
+fn parse_review_convergence_bots(value: &Value, cfg: &mut ForgeConfig) {
+    let Some(items) = value.as_array() else {
+        cfg.warnings
+            .push("invalid-config-value:review_convergence.bots:not_an_array".to_string());
+        return;
+    };
+    let mut bots = Vec::new();
+    let mut valid = true;
+    for (index, item) in items.iter().enumerate() {
+        let Some(table) = item.as_table() else {
+            valid = false;
+            cfg.warnings.push(format!(
+                "invalid-config-value:review_convergence.bots.{index}:not_a_table"
+            ));
+            continue;
+        };
+        for key in table.keys() {
+            if !matches!(key.as_str(), "login" | "mode") {
+                cfg.warnings.push(format!(
+                    "unknown-config-key:review_convergence.bots.{index}.{key}"
+                ));
+            }
+        }
+        let Some(login) = table
+            .get("login")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|login| !login.is_empty())
+        else {
+            valid = false;
+            cfg.warnings.push(format!(
+                "invalid-config-value:review_convergence.bots.{index}.login"
+            ));
+            continue;
+        };
+        let Some(mode_raw) = table.get("mode").and_then(Value::as_str) else {
+            valid = false;
+            cfg.warnings.push(format!(
+                "invalid-config-value:review_convergence.bots.{index}.mode"
+            ));
+            continue;
+        };
+        let Ok(mode) = ReviewBotMode::from_str(mode_raw) else {
+            valid = false;
+            cfg.warnings.push(format!(
+                "invalid-config-value:review_convergence.bots.{index}.mode:{mode_raw}"
+            ));
+            continue;
+        };
+        bots.push(ReviewConvergenceBot {
+            login: login.to_string(),
+            mode,
+        });
+    }
+    if valid {
+        cfg.review_convergence_bots = Some(bots);
+    }
+}
+
+fn validate_review_duration(key: &str, duration: Duration) -> Result<(), &'static str> {
+    let (max, label) = if key == "quiet_period" {
+        (MAX_REVIEW_QUIET_PERIOD, "1h")
+    } else {
+        (MAX_REVIEW_TIMEOUT, "24h")
+    };
+    if duration <= max { Ok(()) } else { Err(label) }
 }
 
 fn parse_body(table: &toml::map::Map<String, Value>, cfg: &mut ForgeConfig) {
@@ -632,6 +907,15 @@ strict_providers = true
 cache_fallback = true
 cache_max_age = "30m"
 no_cache = false
+
+[review_convergence]
+require = true
+quiet_period = "2m"
+timeout = "20m"
+
+[[review_convergence.bots]]
+login = "example-review-bot"
+mode = "observed"
 "###,
         );
         let cfg = ForgeConfig::load_from(tmp.path(), Some(tmp.path()));
@@ -666,6 +950,22 @@ no_cache = false
         assert_eq!(cfg.inbox_cache_fallback, Some(true));
         assert_eq!(cfg.inbox_cache_max_age, Some(Duration::from_secs(30 * 60)));
         assert_eq!(cfg.inbox_no_cache, Some(false));
+        assert_eq!(cfg.review_convergence_required, Some(true));
+        assert_eq!(
+            cfg.review_convergence_quiet_period,
+            Some(Duration::from_secs(2 * 60))
+        );
+        assert_eq!(
+            cfg.review_convergence_timeout,
+            Some(Duration::from_secs(20 * 60))
+        );
+        assert_eq!(
+            cfg.review_convergence_bots,
+            Some(vec![ReviewConvergenceBot {
+                login: "example-review-bot".to_string(),
+                mode: ReviewBotMode::Observed,
+            }])
+        );
     }
 
     #[test]
@@ -887,6 +1187,163 @@ required_only = false
         );
         assert_eq!(cfg.resolve_checks_interval(None), Duration::from_secs(20));
         assert!(cfg.resolve_required_only(None));
+        assert_eq!(
+            cfg.resolve_review_convergence(None),
+            ReviewConvergencePolicy {
+                require: false,
+                quiet_period: Duration::from_secs(2 * 60),
+                timeout: Duration::from_secs(20 * 60),
+                bots: Vec::new(),
+            }
+        );
+    }
+
+    #[test]
+    fn review_convergence_repo_layer_cannot_downgrade_an_enabled_global_gate() {
+        let global = ForgeConfig {
+            review_convergence_required: Some(true),
+            review_convergence_quiet_period: Some(Duration::from_secs(300)),
+            review_convergence_timeout: Some(Duration::from_secs(1800)),
+            review_convergence_bots: Some(vec![ReviewConvergenceBot {
+                login: "global-bot".to_string(),
+                mode: ReviewBotMode::Observed,
+            }]),
+            ..ForgeConfig::default()
+        };
+        let repo = ForgeConfig {
+            review_convergence_required: Some(false),
+            review_convergence_quiet_period: Some(Duration::from_secs(120)),
+            review_convergence_bots: Some(vec![ReviewConvergenceBot {
+                login: "repo-bot".to_string(),
+                mode: ReviewBotMode::Observed,
+            }]),
+            ..ForgeConfig::default()
+        };
+        let layered = global.overlaid_by(repo);
+
+        let repo_policy = layered.resolve_review_convergence(None);
+        assert!(repo_policy.require);
+        assert_eq!(repo_policy.quiet_period, Duration::from_secs(300));
+        assert_eq!(repo_policy.timeout, Duration::from_secs(1800));
+        assert_eq!(repo_policy.bots.len(), 2);
+        assert!(repo_policy.bots.iter().any(|bot| bot.login == "global-bot"));
+        assert!(repo_policy.bots.iter().any(|bot| bot.login == "repo-bot"));
+
+        let explicit_policy = layered.resolve_review_convergence(Some(false));
+        assert!(!explicit_policy.require);
+    }
+
+    #[test]
+    fn enabled_global_gate_preserves_an_explicit_zero_quiet_period_when_repo_omits_it() {
+        let global = ForgeConfig {
+            review_convergence_required: Some(true),
+            review_convergence_quiet_period: Some(Duration::ZERO),
+            ..ForgeConfig::default()
+        };
+
+        let policy = global
+            .overlaid_by(ForgeConfig::default())
+            .resolve_review_convergence(None);
+        assert!(policy.require);
+        assert_eq!(policy.quiet_period, Duration::ZERO);
+    }
+
+    #[test]
+    fn invalid_repo_bot_list_does_not_clear_a_valid_global_policy() {
+        let global = ForgeConfig {
+            review_convergence_required: Some(true),
+            review_convergence_bots: Some(vec![ReviewConvergenceBot {
+                login: "global-bot".to_string(),
+                mode: ReviewBotMode::Observed,
+            }]),
+            ..ForgeConfig::default()
+        };
+        let value: Value = toml::from_str(
+            r#"
+[[review_convergence.bots]]
+login = ""
+mode = "unsupported"
+"#,
+        )
+        .expect("valid TOML");
+        let repo = parse_value(&value);
+        assert!(!repo.warnings.is_empty());
+
+        let policy = global.overlaid_by(repo).resolve_review_convergence(None);
+        assert!(policy.require);
+        assert_eq!(policy.bots.len(), 1);
+        assert_eq!(policy.bots[0].login, "global-bot");
+    }
+
+    #[test]
+    fn intentional_empty_repo_bot_list_still_clears_the_global_list() {
+        let global = ForgeConfig {
+            review_convergence_bots: Some(vec![ReviewConvergenceBot {
+                login: "global-bot".to_string(),
+                mode: ReviewBotMode::Observed,
+            }]),
+            ..ForgeConfig::default()
+        };
+        let value: Value = toml::from_str("[review_convergence]\nbots = []\n").expect("valid TOML");
+        let repo = parse_value(&value);
+        assert!(
+            global
+                .overlaid_by(repo)
+                .resolve_review_convergence(None)
+                .bots
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn excessive_review_convergence_durations_are_rejected() {
+        let value: Value = toml::from_str(
+            r#"
+[review_convergence]
+quiet_period = "3601s"
+timeout = "86401s"
+"#,
+        )
+        .expect("valid TOML");
+        let cfg = parse_value(&value);
+        assert_eq!(cfg.review_convergence_quiet_period, None);
+        assert_eq!(cfg.review_convergence_timeout, None);
+        assert!(
+            cfg.warnings
+                .iter()
+                .any(|warning| warning.contains("quiet_period") && warning.contains("exceeds_max"))
+        );
+        assert!(
+            cfg.warnings
+                .iter()
+                .any(|warning| warning.contains("timeout") && warning.contains("exceeds_max"))
+        );
+    }
+
+    #[test]
+    fn overflowing_review_convergence_durations_are_rejected_without_panicking() {
+        let value: Value = toml::from_str(
+            r#"
+[review_convergence]
+require = true
+quiet_period = "1152921504606846976h"
+timeout = "1152921504606846976h"
+"#,
+        )
+        .expect("valid TOML");
+        let cfg = parse_value(&value);
+        assert_eq!(cfg.review_convergence_quiet_period, None);
+        assert_eq!(cfg.review_convergence_timeout, None);
+        assert!(
+            cfg.warnings
+                .iter()
+                .any(|warning| warning.contains("quiet_period"))
+        );
+        assert!(
+            cfg.warnings
+                .iter()
+                .any(|warning| warning.contains("timeout"))
+        );
     }
 
     #[test]

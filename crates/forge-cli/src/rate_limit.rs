@@ -66,12 +66,11 @@ pub struct GateConfig {
     /// Proceed immediately when `graphql.remaining` is strictly greater than
     /// this. Keeps the healthy path to a single fast probe.
     pub min_remaining: u64,
-    /// Upper bound on a single wait-for-recovery phase. Note that a gated call
-    /// has two independent wait phases — the preflight and, after a
-    /// `backend_rate_limited` failure, one reactive wait — so a single gated
-    /// call can block up to `2 * max_wait`, and a multi-call op (`pr deliver`,
-    /// `pr wait-checks`) bounds each of its calls independently rather than
-    /// end-to-end.
+    /// Upper bound on a single wait-for-recovery phase. Calls without an outer
+    /// timeout can have two independent wait phases — the preflight and, after
+    /// a `backend_rate_limited` failure, one reactive wait — so they can block
+    /// up to `2 * max_wait`. When the caller supplies a timeout, that budget
+    /// instead bounds the probe, waits, real call, and retry end to end.
     pub max_wait: Duration,
     /// Interval between re-probes while the budget is below `min_remaining`.
     /// Doubles as the freshness window for the cached probe reading and as the
@@ -233,18 +232,23 @@ impl<R: BackendRunner, C: Clock> RateLimitedRunner<R, C> {
     /// Best-effort read of the current GraphQL remaining budget. `None` when
     /// the probe fails, times out, or is unparseable. Bounded by
     /// [`PROBE_TIMEOUT`] so a stalled endpoint never blocks the gated call.
-    fn probe_remaining(&self) -> Option<u64> {
+    fn probe_remaining(&self, timeout: Option<Duration>) -> Option<u64> {
+        let timeout = timeout.map(|budget| budget.min(PROBE_TIMEOUT));
+        if timeout.is_some_and(|duration| duration.is_zero()) {
+            return None;
+        }
         let output = self
             .inner
-            .run_with_timeout(&probe_call(), Some(PROBE_TIMEOUT))
+            .run_with_timeout(&probe_call(), timeout.or(Some(PROBE_TIMEOUT)))
             .ok()?;
         parse_graphql_remaining(&output.stdout)
     }
 
-    /// A GraphQL-remaining reading, reusing the cached probe when it is younger
-    /// than `poll_interval` and otherwise re-probing (and refreshing the
-    /// cache). An unreadable probe is not cached, so the next call re-probes.
-    fn cached_remaining(&self) -> Option<u64> {
+    /// A GraphQL-remaining reading, reusing the locally reserved cache when it
+    /// is younger than `poll_interval` and otherwise re-probing (and
+    /// refreshing the cache). An unreadable probe is not cached, so the next
+    /// call re-probes.
+    fn cached_remaining(&self, timeout: Option<Duration>) -> Option<u64> {
         // Copy the small reading out and release the lock before probing — the
         // probe issues a backend call and must never run under the lock.
         let cached = *self.probe_cache.lock().unwrap_or_else(|e| e.into_inner());
@@ -253,10 +257,27 @@ impl<R: BackendRunner, C: Clock> RateLimitedRunner<R, C> {
         {
             return Some(remaining);
         }
-        let remaining = self.probe_remaining()?;
+        let remaining = self.probe_remaining(timeout)?;
         *self.probe_cache.lock().unwrap_or_else(|e| e.into_inner()) =
             Some((self.clock.now(), remaining));
         Some(remaining)
+    }
+
+    /// Atomically reserve one cached GraphQL point before a real call. This
+    /// keeps sequential and concurrent paginated calls from all trusting one
+    /// stale just-above-threshold reading.
+    fn reserve_cached_budget(&self) -> bool {
+        let mut cached = self.probe_cache.lock().unwrap_or_else(|e| e.into_inner());
+        let Some((taken_at, remaining)) = cached.as_mut() else {
+            return false;
+        };
+        if self.clock.now().saturating_duration_since(*taken_at) >= self.config.poll_interval
+            || *remaining <= self.config.min_remaining
+        {
+            return false;
+        }
+        *remaining = remaining.saturating_sub(1);
+        true
     }
 
     /// Drop the cached probe reading. Called after a `backend_rate_limited`
@@ -269,17 +290,30 @@ impl<R: BackendRunner, C: Clock> RateLimitedRunner<R, C> {
     /// Poll `gh api rate_limit` until `graphql.remaining` exceeds the
     /// configured threshold or `max_wait` elapses. Best-effort: an unreadable
     /// probe returns immediately so a broken probe never blocks real work.
-    fn wait_until_healthy(&self) {
+    fn wait_until_healthy(&self, outer_start: Instant, outer_timeout: Option<Duration>) {
         let start = self.clock.now();
         loop {
-            match self.cached_remaining() {
+            let outer_left = remaining_budget(self.clock.now(), outer_start, outer_timeout);
+            if outer_left.is_some_and(|duration| duration.is_zero()) {
+                return;
+            }
+            match self.cached_remaining(outer_left) {
                 // Cannot read the budget — do not block; proceed and let the
                 // real call (and its reactive retry) handle any throttling.
                 None => return,
-                Some(remaining) if remaining > self.config.min_remaining => return,
+                Some(remaining) if remaining > self.config.min_remaining => {
+                    if self.reserve_cached_budget() {
+                        return;
+                    }
+                }
                 Some(_) => {
                     let elapsed = self.clock.now().saturating_duration_since(start);
-                    let budget_left = self.config.max_wait.saturating_sub(elapsed);
+                    let mut budget_left = self.config.max_wait.saturating_sub(elapsed);
+                    if let Some(outer_left) =
+                        remaining_budget(self.clock.now(), outer_start, outer_timeout)
+                    {
+                        budget_left = budget_left.min(outer_left);
+                    }
                     if budget_left.is_zero() {
                         return;
                     }
@@ -308,18 +342,29 @@ impl<R: BackendRunner, C: Clock> RateLimitedRunner<R, C> {
     fn gated<T>(
         &self,
         call: &BackendCall,
-        run: impl Fn(&BackendCall) -> Result<T, ForgeError>,
+        timeout: Option<Duration>,
+        run: impl Fn(&BackendCall, Option<Duration>) -> Result<T, ForgeError>,
     ) -> Result<T, ForgeError> {
         if !self.should_gate(call) {
-            return run(call);
+            return run(call, timeout);
         }
-        self.wait_until_healthy();
-        match run(call) {
+        let started = self.clock.now();
+        self.wait_until_healthy(started, timeout);
+        let call_timeout = require_remaining_budget(self.clock.now(), started, timeout)?;
+        match run(call, call_timeout) {
             Err(err) if err.kind() == RATE_LIMITED_KIND => {
                 self.invalidate_cache();
-                self.clock.sleep(self.config.poll_interval);
-                self.wait_until_healthy();
-                run(call)
+                let retry_left = require_remaining_budget(self.clock.now(), started, timeout)?;
+                let nap = retry_left
+                    .map(|budget| budget.min(self.config.poll_interval))
+                    .unwrap_or(self.config.poll_interval);
+                if nap.is_zero() {
+                    return Err(backend_timeout(timeout));
+                }
+                self.clock.sleep(nap);
+                self.wait_until_healthy(started, timeout);
+                let retry_timeout = require_remaining_budget(self.clock.now(), started, timeout)?;
+                run(call, retry_timeout)
             }
             other => other,
         }
@@ -328,7 +373,7 @@ impl<R: BackendRunner, C: Clock> RateLimitedRunner<R, C> {
 
 impl<R: BackendRunner, C: Clock> BackendRunner for RateLimitedRunner<R, C> {
     fn run(&self, call: &BackendCall) -> Result<BackendSuccess, ForgeError> {
-        self.gated(call, |c| self.inner.run(c))
+        self.gated(call, None, |c, _| self.inner.run(c))
     }
 
     fn run_with_timeout(
@@ -336,11 +381,13 @@ impl<R: BackendRunner, C: Clock> BackendRunner for RateLimitedRunner<R, C> {
         call: &BackendCall,
         timeout: Option<Duration>,
     ) -> Result<BackendSuccess, ForgeError> {
-        self.gated(call, |c| self.inner.run_with_timeout(c, timeout))
+        self.gated(call, timeout, |c, remaining| {
+            self.inner.run_with_timeout(c, remaining)
+        })
     }
 
     fn run_raw(&self, call: &BackendCall) -> Result<BackendOutput, ForgeError> {
-        self.gated(call, |c| self.inner.run_raw(c))
+        self.gated(call, None, |c, _| self.inner.run_raw(c))
     }
 
     fn run_raw_with_timeout(
@@ -348,8 +395,36 @@ impl<R: BackendRunner, C: Clock> BackendRunner for RateLimitedRunner<R, C> {
         call: &BackendCall,
         timeout: Option<Duration>,
     ) -> Result<BackendOutput, ForgeError> {
-        self.gated(call, |c| self.inner.run_raw_with_timeout(c, timeout))
+        self.gated(call, timeout, |c, remaining| {
+            self.inner.run_raw_with_timeout(c, remaining)
+        })
     }
+}
+
+fn remaining_budget(now: Instant, started: Instant, timeout: Option<Duration>) -> Option<Duration> {
+    timeout.map(|budget| budget.saturating_sub(now.saturating_duration_since(started)))
+}
+
+fn require_remaining_budget(
+    now: Instant,
+    started: Instant,
+    timeout: Option<Duration>,
+) -> Result<Option<Duration>, ForgeError> {
+    let remaining = remaining_budget(now, started, timeout);
+    if remaining.is_some_and(|duration| duration.is_zero()) {
+        Err(backend_timeout(timeout))
+    } else {
+        Ok(remaining)
+    }
+}
+
+fn backend_timeout(timeout: Option<Duration>) -> ForgeError {
+    ForgeError::unavailable(
+        nils_common::cli_contract::schema_version_for(crate::cli::BINARY, "error", 1),
+        "backend_timeout",
+        "backend call exhausted its end-to-end timeout budget",
+        timeout.map(|value| format!("timeout_ms={}", value.as_millis())),
+    )
 }
 
 #[cfg(test)]
@@ -369,6 +444,7 @@ mod tests {
         fail_remaining: RefCell<usize>,
         fail_kind: &'static str,
         calls: RefCell<Vec<Vec<String>>>,
+        timed_calls: RefCell<Vec<(bool, Option<Duration>)>>,
     }
 
     impl FakeRunner {
@@ -378,6 +454,7 @@ mod tests {
                 fail_remaining: RefCell::new(0),
                 fail_kind: RATE_LIMITED_KIND,
                 calls: RefCell::new(Vec::new()),
+                timed_calls: RefCell::new(Vec::new()),
             }
         }
 
@@ -415,6 +492,14 @@ mod tests {
 
         fn real_count(&self) -> usize {
             self.calls.borrow().len() - self.probe_count()
+        }
+
+        fn real_timeouts(&self) -> Vec<Option<Duration>> {
+            self.timed_calls
+                .borrow()
+                .iter()
+                .filter_map(|(probe, timeout)| (!probe).then_some(*timeout))
+                .collect()
         }
     }
 
@@ -454,6 +539,17 @@ mod tests {
                 stdout: "ok".into(),
                 stderr: String::new(),
             })
+        }
+
+        fn run_with_timeout(
+            &self,
+            call: &BackendCall,
+            timeout: Option<Duration>,
+        ) -> Result<BackendSuccess, ForgeError> {
+            self.timed_calls
+                .borrow_mut()
+                .push((Self::is_probe(call), timeout));
+            self.run(call)
         }
     }
 
@@ -560,6 +656,24 @@ mod tests {
     }
 
     #[test]
+    fn successful_graphql_calls_reserve_cached_budget_before_the_next_call() {
+        let runner = FakeRunner::new(vec![51, 500]);
+        let clock = FakeClock::new();
+        let gate = RateLimitedRunner::new(&runner, &clock, cfg());
+
+        gate.run(&pr_ready_call()).expect("first call");
+        gate.run(&pr_ready_call()).expect("second call");
+
+        assert_eq!(runner.real_count(), 2);
+        assert_eq!(
+            runner.probe_count(),
+            2,
+            "second call re-probes at the floor"
+        );
+        assert_eq!(clock.sleep_count(), 1, "cached 51 is spent down to 50");
+    }
+
+    #[test]
     fn throttled_budget_waits_then_proceeds_when_recovered() {
         // First probe: throttled (0); after one sleep the budget recovers.
         let runner = FakeRunner::new(vec![0, 500]);
@@ -663,19 +777,60 @@ mod tests {
     }
 
     #[test]
+    fn run_with_timeout_reuses_one_budget_across_rate_limited_retry() {
+        let runner = FakeRunner::with_fail_once(vec![4821, 4821]);
+        let clock = FakeClock::new();
+        let gate = RateLimitedRunner::new(&runner, &clock, cfg());
+
+        gate.run_with_timeout(&pr_ready_call(), Some(Duration::from_secs(60)))
+            .expect("retry succeeds");
+        assert_eq!(runner.real_count(), 2);
+        assert_eq!(clock.total_slept(), Duration::from_secs(15));
+        assert_eq!(
+            runner.real_timeouts(),
+            vec![Some(Duration::from_secs(60)), Some(Duration::from_secs(45)),],
+            "the retry receives only the shared budget left after backoff"
+        );
+    }
+
+    #[test]
     fn run_with_timeout_is_gated_like_run() {
         // The run_with_timeout path (used by inbox's threaded fan-out) must
         // preflight identically to run/run_raw — its outer wrapper is otherwise
-        // exercised by no other test.
+        // exercised by no other test. The budget is long enough for the
+        // scripted recovery wait and is shared with the real call.
         let runner = FakeRunner::new(vec![0, 500]);
         let clock = FakeClock::new();
         let gate = RateLimitedRunner::new(&runner, &clock, cfg());
 
-        gate.run_with_timeout(&pr_ready_call(), Some(Duration::from_secs(5)))
+        gate.run_with_timeout(&pr_ready_call(), Some(Duration::from_secs(60)))
             .expect("run_with_timeout");
         assert_eq!(runner.probe_count(), 2, "re-probed after sleeping");
         assert_eq!(clock.sleep_count(), 1);
         assert_eq!(runner.real_count(), 1);
+        assert_eq!(
+            runner.real_timeouts(),
+            vec![Some(Duration::from_secs(45))],
+            "the provider call receives only the budget left after preflight"
+        );
+    }
+
+    #[test]
+    fn run_with_timeout_bounds_rate_limit_wait_end_to_end() {
+        // A short caller budget must cap the proactive rate-limit wait rather
+        // than allowing the gate to consume its independent 120-second window
+        // before the real call starts.
+        let runner = FakeRunner::new(vec![0, 500]);
+        let clock = FakeClock::new();
+        let gate = RateLimitedRunner::new(&runner, &clock, cfg());
+
+        let err = gate
+            .run_with_timeout(&pr_ready_call(), Some(Duration::from_secs(5)))
+            .expect_err("outer timeout");
+        assert_eq!(err.kind(), "backend_timeout");
+        assert_eq!(runner.probe_count(), 1);
+        assert_eq!(runner.real_count(), 0, "expired budget blocks real call");
+        assert_eq!(clock.total_slept(), Duration::from_secs(5));
     }
 
     #[test]

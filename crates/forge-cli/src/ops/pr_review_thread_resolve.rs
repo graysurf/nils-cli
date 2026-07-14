@@ -105,6 +105,7 @@ pub fn run_with<R: BackendRunner, F: Fn(&str) -> Option<String>>(
             DryRunPayload {
                 provider: ctx.provider.as_str(),
                 plan,
+                review_convergence: None,
             },
             format,
             |p| println!("would run: {plan}", plan = p.plan.join(" ")),

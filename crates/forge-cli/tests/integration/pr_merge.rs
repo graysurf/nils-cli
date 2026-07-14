@@ -52,18 +52,116 @@ fn make_gitlab_repo() -> TempDir {
     tempdir
 }
 
+fn make_github_repo(config: Option<&str>) -> TempDir {
+    let tempdir = TempDir::new().expect("tempdir");
+    let repo = tempdir.path().join("repo");
+    fs::create_dir_all(&repo).expect("repo dir");
+    let git = |args: &[&str]| {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(args)
+            .output()
+            .expect("git spawn");
+        assert!(
+            out.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    };
+    git(&["init", "-q", "-b", "main"]);
+    git(&["config", "user.email", "test@example.com"]);
+    git(&["config", "user.name", "Tester"]);
+    git(&["config", "commit.gpgsign", "false"]);
+    fs::write(repo.join("README.md"), "init\n").expect("readme");
+    git(&["add", "README.md"]);
+    git(&["commit", "-q", "-m", "initial"]);
+    git(&[
+        "remote",
+        "add",
+        "origin",
+        "https://github.com/acme/widgets.git",
+    ]);
+    if let Some(config) = config {
+        fs::write(repo.join(".forge-cli.toml"), config).expect("review config");
+        git(&["add", ".forge-cli.toml"]);
+        git(&["commit", "-q", "-m", "config"]);
+    }
+    tempdir
+}
+
+fn github_merge_stub(
+    stub: &StubEnv,
+    review_nodes: &str,
+    thread_nodes: &str,
+    reject_reviews: bool,
+) -> String {
+    let merged = stub.tempdir.path().join("github-merged");
+    let review_calls = stub.tempdir.path().join("review-calls");
+    let second_review_response = stub.tempdir.path().join("second-review-response.json");
+    let review_query = if reject_reviews {
+        "echo 'native review query must be disabled' >&2; exit 98".to_string()
+    } else {
+        format!(
+            r#"count=0
+if [ -f {review_calls} ]; then count=$(cat {review_calls}); fi
+count=$((count + 1))
+printf '%s\n' "$count" > {review_calls}
+if [ "$count" -ge 2 ] && [ -f {second_review_response} ]; then
+  cat {second_review_response}
+else
+  cat <<'JSON'
+{{"data":{{"repository":{{"pullRequest":{{"headRefOid":"head123","reviews":{{"nodes":[{review_nodes}],"pageInfo":{{"hasNextPage":false,"endCursor":null}}}}}}}}}}}}
+JSON
+fi
+"#,
+            review_calls = review_calls.display(),
+            second_review_response = second_review_response.display(),
+        )
+    };
+    format!(
+        r#"#!/bin/sh
+set -eu
+case "$1 $2" in
+  "pr view")
+    case "$*" in
+      *"--json mergeCommit "*) printf '%s\n' '{{"mergeCommit":{{"oid":"merge456"}}}}' ;;
+      *) printf '%s\n' '{{"number":7,"url":"https://github.com/acme/widgets/pull/7","state":"OPEN","isDraft":false,"baseRefName":"main","headRefName":"feat/reviews","headRefOid":"head123","title":"feat: reviews","body":""}}' ;;
+    esac
+    ;;
+  "repo view")
+    printf '%s\n' '{{"name":"widgets","owner":{{"login":"acme"}},"url":"https://github.com/acme/widgets","defaultBranchRef":{{"name":"main"}},"mergeCommitAllowed":true,"squashMergeAllowed":true,"rebaseMergeAllowed":true}}'
+    ;;
+  "pr checks") printf '%s\n' '[]' ;;
+  "api graphql")
+    case "$*" in
+      *"reviews(first:"*) {review_query} ;;
+      *"reviewThreads(first: 100)"*) printf '%s\n' '{{"data":{{"repository":{{"pullRequest":{{"reviewThreads":{{"nodes":[{thread_nodes}]}}}}}}}}}}' ;;
+      *) echo "unexpected graphql args: $*" >&2; exit 99 ;;
+    esac
+    ;;
+  "pr merge") touch {merged} ;;
+  *) echo "unexpected gh args: $*" >&2; exit 99 ;;
+esac
+"#,
+        review_query = review_query,
+        thread_nodes = thread_nodes,
+        merged = merged.display(),
+    )
+}
+
 fn gitlab_merge_api_stub(stub: &StubEnv) -> String {
     gitlab_merge_api_stub_full(stub, "[]", "null")
 }
 
 /// Same stub, with a caller-provided MR discussions response so tests can
-/// exercise merge lock-down rule 12 (unresolved review threads).
+/// exercise merge lock-down rule 13 (unresolved review threads).
 fn gitlab_merge_api_stub_with_discussions(stub: &StubEnv, discussions: &str) -> String {
     gitlab_merge_api_stub_full(stub, discussions, "null")
 }
 
-/// Base stub: caller provides the MR discussions response (rule 12) and the
-/// MR `description` as a raw JSON value (rule 13 — task-list gate).
+/// Base stub: caller provides the MR discussions response (rule 13) and the
+/// MR `description` as a raw JSON value (rule 14 — task-list gate).
 fn gitlab_merge_api_stub_full(stub: &StubEnv, discussions: &str, description: &str) -> String {
     let sentinel = stub.tempdir.path().join("merged");
     let args_log = stub.tempdir.path().join("merge-args");
@@ -146,7 +244,7 @@ EOF
   "api --paginate")
     case "$*" in
       *"projects/group%2Fproject/merge_requests/7/discussions?per_page=100"*)
-        # Merge lock-down rule 12 — review-thread sweep.
+        # Merge lock-down rule 13 — review-thread sweep.
         cat <<'EOF'
 {discussions}
 EOF
@@ -215,6 +313,54 @@ fn pr_merge_dry_run_renders_squash_plan_with_delete_branch() {
     assert!(plan.iter().any(|s| s == "42"), "{plan:?}");
     assert!(plan.iter().any(|s| s == "--squash"), "{plan:?}");
     assert!(plan.iter().any(|s| s == "--delete-branch"), "{plan:?}");
+}
+
+#[test]
+fn pr_merge_github_dry_run_exposes_enabled_review_convergence() {
+    let stub = StubEnv::new().gh_stub(FORBIDDEN_STUB);
+    let out = run_forge_cli_in(
+        &stub,
+        &[
+            "--provider",
+            "github",
+            "--dry-run",
+            "--format",
+            "json",
+            "pr",
+            "merge",
+            "42",
+            "--review-convergence",
+        ],
+        None,
+    );
+    assert_eq!(out.code, 0, "stdout={}\nstderr={}", out.stdout, out.stderr);
+    let env = parse_envelope(&out.stdout);
+    assert_eq!(env["data"]["review_convergence"]["require"], true);
+}
+
+#[test]
+fn pr_merge_gitlab_dry_run_rejects_enabled_review_convergence() {
+    let tempdir = make_gitlab_repo();
+    let repo_path = tempdir.path().join("repo");
+    let stub = StubEnv::new().glab_stub(FORBIDDEN_STUB);
+    let out = run_forge_cli_in(
+        &stub,
+        &[
+            "--provider",
+            "gitlab",
+            "--dry-run",
+            "--format",
+            "json",
+            "pr",
+            "merge",
+            "7",
+            "--review-convergence",
+        ],
+        Some(&repo_path),
+    );
+    assert_eq!(out.code, 64, "stdout={}\nstderr={}", out.stdout, out.stderr);
+    let env = parse_envelope(&out.stdout);
+    assert_eq!(env["error"]["code"], "provider_unsupported");
 }
 
 #[test]
@@ -353,6 +499,560 @@ fn pr_merge_gitlab_uses_api_merge_after_required_checks_pass() {
         "{args}"
     );
     assert!(args.contains("sha=abc123"), "{args}");
+}
+
+#[test]
+fn pr_merge_observed_policy_allows_absent_bot_and_returns_snapshot() {
+    let config = r#"[review_convergence]
+require = true
+quiet_period = "0s"
+timeout = "20m"
+
+[[review_convergence.bots]]
+login = "example-review-bot"
+mode = "observed"
+"#;
+    let tempdir = make_github_repo(Some(config));
+    let repo_path = tempdir.path().join("repo");
+    let stub = StubEnv::new();
+    let body = github_merge_stub(&stub, "", "", false);
+    let stub = stub.gh_stub(&body);
+
+    let out = run_forge_cli_in(
+        &stub,
+        &[
+            "--provider",
+            "github",
+            "--repo",
+            "acme/widgets",
+            "--format",
+            "json",
+            "pr",
+            "merge",
+            "7",
+        ],
+        Some(&repo_path),
+    );
+    assert_eq!(out.code, 0, "stdout={}\nstderr={}", out.stdout, out.stderr);
+    let env = parse_envelope(&out.stdout);
+    assert_eq!(env["data"]["review_convergence"]["required"], true);
+    assert_eq!(env["data"]["review_convergence"]["head_sha"], "head123");
+    assert_eq!(
+        env["data"]["review_convergence"]["observed_reviews"],
+        serde_json::json!([])
+    );
+    assert_eq!(
+        env["data"]["review_convergence"]["missing_reviewers"],
+        serde_json::json!([])
+    );
+    assert_eq!(env["data"]["review_convergence"]["unresolved_threads"], 0);
+}
+
+#[test]
+fn pr_merge_enabled_review_convergence_requires_an_initial_provider_head() {
+    let config = r#"[review_convergence]
+require = true
+quiet_period = "0s"
+timeout = "20m"
+"#;
+    let tempdir = make_github_repo(Some(config));
+    let repo_path = tempdir.path().join("repo");
+    let stub = StubEnv::new();
+    let body = github_merge_stub(&stub, "", "", false)
+        .replace("\"headRefOid\":\"head123\",\"title\"", "\"title\"");
+    let stub = stub.gh_stub(&body);
+
+    let out = run_forge_cli_in(
+        &stub,
+        &[
+            "--provider",
+            "github",
+            "--repo",
+            "acme/widgets",
+            "--format",
+            "json",
+            "pr",
+            "merge",
+            "7",
+        ],
+        Some(&repo_path),
+    );
+    assert_eq!(out.code, 65, "stdout={}\nstderr={}", out.stdout, out.stderr);
+    let env = parse_envelope(&out.stdout);
+    assert_eq!(env["error"]["code"], "review_convergence_head_missing");
+    assert!(
+        !stub.tempdir.path().join("review-calls").exists(),
+        "convergence must bind the initial provider head before reading reviews"
+    );
+    assert!(
+        !stub.tempdir.path().join("github-merged").exists(),
+        "missing merge CAS head must fail closed"
+    );
+}
+
+#[test]
+fn pr_merge_review_convergence_false_overrides_enabled_repo_config() {
+    let config = r#"[review_convergence]
+require = true
+quiet_period = "0s"
+timeout = "20m"
+"#;
+    let tempdir = make_github_repo(Some(config));
+    let repo_path = tempdir.path().join("repo");
+    let stub = StubEnv::new();
+    let body = github_merge_stub(&stub, "", "", true);
+    let stub = stub.gh_stub(&body);
+
+    let out = run_forge_cli_in(
+        &stub,
+        &[
+            "--provider",
+            "github",
+            "--repo",
+            "acme/widgets",
+            "--format",
+            "json",
+            "pr",
+            "merge",
+            "7",
+            "--review-convergence=false",
+        ],
+        Some(&repo_path),
+    );
+    assert_eq!(out.code, 0, "stdout={}\nstderr={}", out.stdout, out.stderr);
+    let env = parse_envelope(&out.stdout);
+    assert!(env["data"].get("review_convergence").is_none());
+}
+
+#[test]
+fn pr_merge_blocks_current_head_native_changes_requested() {
+    let tempdir = make_github_repo(None);
+    let repo_path = tempdir.path().join("repo");
+    let review = r#"{"id":"PRR_1","databaseId":1,"url":"https://github.com/acme/widgets/pull/7#pullrequestreview-1","author":{"login":"reviewer"},"state":"CHANGES_REQUESTED","commit":{"oid":"head123"},"submittedAt":"2026-07-14T04:00:00Z","body":"free-form prose is not parsed"}"#;
+    let stub = StubEnv::new();
+    let body = github_merge_stub(&stub, review, "", false);
+    let stub = stub.gh_stub(&body);
+
+    let out = run_forge_cli_in(
+        &stub,
+        &[
+            "--provider",
+            "github",
+            "--repo",
+            "acme/widgets",
+            "--format",
+            "json",
+            "pr",
+            "merge",
+            "7",
+            "--review-convergence",
+        ],
+        Some(&repo_path),
+    );
+    assert_eq!(out.code, 65, "stdout={}\nstderr={}", out.stdout, out.stderr);
+    let env = parse_envelope(&out.stdout);
+    assert_eq!(env["error"]["code"], "review_changes_requested");
+    assert!(
+        env["error"]["details"]["detail"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("reviewer")
+    );
+}
+
+#[test]
+fn pr_merge_rejects_a_native_review_without_commit_oid() {
+    let tempdir = make_github_repo(None);
+    let repo_path = tempdir.path().join("repo");
+    let review = r#"{"id":"PRR_missing_commit","databaseId":8,"url":"https://github.com/acme/widgets/pull/7#pullrequestreview-8","author":{"login":"reviewer"},"state":"CHANGES_REQUESTED","commit":null,"submittedAt":"2026-07-14T04:00:00Z","body":"must fail closed"}"#;
+    let stub = StubEnv::new();
+    let body = github_merge_stub(&stub, review, "", false);
+    let stub = stub.gh_stub(&body);
+
+    let out = run_forge_cli_in(
+        &stub,
+        &[
+            "--provider",
+            "github",
+            "--repo",
+            "acme/widgets",
+            "--format",
+            "json",
+            "pr",
+            "merge",
+            "7",
+            "--review-convergence",
+        ],
+        Some(&repo_path),
+    );
+    assert_eq!(out.code, 65, "stdout={}\nstderr={}", out.stdout, out.stderr);
+    let env = parse_envelope(&out.stdout);
+    assert_eq!(env["error"]["code"], "review_snapshot_incomplete");
+    assert!(
+        env["error"]["details"]["detail"]
+            .as_str()
+            .is_some_and(|detail| detail.contains("review.commit.oid"))
+    );
+    assert!(
+        !stub.tempdir.path().join("github-merged").exists(),
+        "malformed review data must prevent provider merge"
+    );
+}
+
+#[test]
+fn pr_merge_global_config_enables_review_convergence() {
+    let tempdir = make_github_repo(None);
+    let repo_path = tempdir.path().join("repo");
+    let stub = StubEnv::new();
+    let xdg_config = stub.tempdir.path().join("global-xdg");
+    fs::create_dir_all(xdg_config.join("forge-cli")).expect("global config directory");
+    fs::write(
+        xdg_config.join("forge-cli/config.toml"),
+        r#"[review_convergence]
+require = true
+quiet_period = "0s"
+timeout = "20m"
+"#,
+    )
+    .expect("global review config");
+    let body = github_merge_stub(&stub, "", "", false);
+    let stub = stub
+        .env("XDG_CONFIG_HOME", xdg_config.to_string_lossy())
+        .gh_stub(&body);
+
+    let out = run_forge_cli_in(
+        &stub,
+        &[
+            "--provider",
+            "github",
+            "--repo",
+            "acme/widgets",
+            "--format",
+            "json",
+            "pr",
+            "merge",
+            "7",
+        ],
+        Some(&repo_path),
+    );
+    assert_eq!(out.code, 0, "stdout={}\nstderr={}", out.stdout, out.stderr);
+    let env = parse_envelope(&out.stdout);
+    assert_eq!(env["data"]["review_convergence"]["required"], true);
+}
+
+#[test]
+fn pr_merge_enabled_review_convergence_rejects_invalid_duration_config() {
+    let config = r#"[review_convergence]
+require = true
+quiet_period = "3601s"
+timeout = "20m"
+"#;
+    let tempdir = make_github_repo(Some(config));
+    let repo_path = tempdir.path().join("repo");
+    let stub = StubEnv::new();
+
+    let out = run_forge_cli_in(
+        &stub,
+        &[
+            "--provider",
+            "github",
+            "--repo",
+            "acme/widgets",
+            "--format",
+            "json",
+            "pr",
+            "merge",
+            "7",
+        ],
+        Some(&repo_path),
+    );
+    assert_eq!(out.code, 65, "stdout={}\nstderr={}", out.stdout, out.stderr);
+    let env = parse_envelope(&out.stdout);
+    assert_eq!(env["error"]["code"], "invalid_review_convergence_config");
+    assert!(
+        env["error"]["details"]["detail"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("quiet_period")
+    );
+}
+
+#[test]
+fn pr_merge_explicit_review_convergence_rejects_non_table_section() {
+    let tempdir = make_github_repo(Some("review_convergence = \"not-a-table\"\n"));
+    let repo_path = tempdir.path().join("repo");
+    let stub = StubEnv::new().gh_stub(FORBIDDEN_STUB);
+
+    let out = run_forge_cli_in(
+        &stub,
+        &[
+            "--provider",
+            "github",
+            "--dry-run",
+            "--format",
+            "json",
+            "pr",
+            "merge",
+            "7",
+            "--review-convergence",
+        ],
+        Some(&repo_path),
+    );
+    assert_eq!(out.code, 65, "stdout={}\nstderr={}", out.stdout, out.stderr);
+    let env = parse_envelope(&out.stdout);
+    assert_eq!(env["error"]["code"], "invalid_review_convergence_config");
+    assert!(
+        env["error"]["details"]["detail"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("review_convergence:not_a_table")
+    );
+}
+
+#[test]
+fn pr_merge_explicit_review_convergence_rejects_malformed_config_file() {
+    let tempdir = make_github_repo(Some("[review_convergence\nrequire = true\n"));
+    let repo_path = tempdir.path().join("repo");
+    let stub = StubEnv::new().gh_stub(FORBIDDEN_STUB);
+
+    let out = run_forge_cli_in(
+        &stub,
+        &[
+            "--provider",
+            "github",
+            "--dry-run",
+            "--format",
+            "json",
+            "pr",
+            "merge",
+            "7",
+            "--review-convergence",
+        ],
+        Some(&repo_path),
+    );
+    assert_eq!(out.code, 65, "stdout={}\nstderr={}", out.stdout, out.stderr);
+    let env = parse_envelope(&out.stdout);
+    assert_eq!(env["error"]["code"], "invalid_review_convergence_config");
+    assert!(
+        env["error"]["details"]["detail"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("parse_error")
+    );
+}
+
+#[test]
+fn pr_merge_stale_changes_requested_is_informational() {
+    let config = r#"[review_convergence]
+require = true
+quiet_period = "0s"
+timeout = "20m"
+
+[[review_convergence.bots]]
+login = "example-review-bot"
+mode = "observed"
+"#;
+    let tempdir = make_github_repo(Some(config));
+    let repo_path = tempdir.path().join("repo");
+    let review = r#"{"id":"PRR_stale","databaseId":2,"url":"https://github.com/acme/widgets/pull/7#pullrequestreview-2","author":{"login":"example-review-bot[bot]"},"state":"CHANGES_REQUESTED","commit":{"oid":"old-head"},"submittedAt":"2026-07-14T03:00:00Z","body":"stale finding"}"#;
+    let stub = StubEnv::new();
+    let body = github_merge_stub(&stub, review, "", false);
+    let stub = stub.gh_stub(&body);
+
+    let out = run_forge_cli_in(
+        &stub,
+        &[
+            "--provider",
+            "github",
+            "--repo",
+            "acme/widgets",
+            "--format",
+            "json",
+            "pr",
+            "merge",
+            "7",
+        ],
+        Some(&repo_path),
+    );
+    assert_eq!(out.code, 0, "stdout={}\nstderr={}", out.stdout, out.stderr);
+    let env = parse_envelope(&out.stdout);
+    assert_eq!(
+        env["data"]["review_convergence"]["stale_reviews"][0]["id"],
+        "PRR_stale"
+    );
+    assert_eq!(
+        env["data"]["review_convergence"]["changes_requested_by"],
+        serde_json::json!([])
+    );
+}
+
+#[test]
+fn pr_merge_commented_prose_is_not_a_machine_verdict() {
+    let config = r#"[review_convergence]
+require = true
+quiet_period = "0s"
+timeout = "20m"
+
+[[review_convergence.bots]]
+login = "example-review-bot"
+mode = "observed"
+"#;
+    let tempdir = make_github_repo(Some(config));
+    let repo_path = tempdir.path().join("repo");
+    let review = r#"{"id":"PRR_comment","databaseId":3,"url":"https://github.com/acme/widgets/pull/7#pullrequestreview-3","author":{"login":"example-review-bot[bot]"},"state":"COMMENTED","commit":{"oid":"head123"},"submittedAt":"2026-07-14T04:00:00Z","body":"REQUEST CHANGES: this prose must not be parsed"}"#;
+    let stub = StubEnv::new();
+    let body = github_merge_stub(&stub, review, "", false);
+    let stub = stub.gh_stub(&body);
+
+    let out = run_forge_cli_in(
+        &stub,
+        &[
+            "--provider",
+            "github",
+            "--repo",
+            "acme/widgets",
+            "--format",
+            "json",
+            "pr",
+            "merge",
+            "7",
+        ],
+        Some(&repo_path),
+    );
+    assert_eq!(out.code, 0, "stdout={}\nstderr={}", out.stdout, out.stderr);
+    let env = parse_envelope(&out.stdout);
+    assert_eq!(
+        env["data"]["review_convergence"]["observed_reviews"][0]["state"],
+        "COMMENTED"
+    );
+    assert_eq!(
+        env["data"]["review_convergence"]["changes_requested_by"],
+        serde_json::json!([])
+    );
+}
+
+#[test]
+fn pr_merge_rechecks_native_review_activity_immediately_before_merge() {
+    let config = r#"[review_convergence]
+require = true
+quiet_period = "0s"
+timeout = "20m"
+
+[[review_convergence.bots]]
+login = "example-review-bot"
+mode = "observed"
+"#;
+    let tempdir = make_github_repo(Some(config));
+    let repo_path = tempdir.path().join("repo");
+    let initial = r#"{"id":"PRR_comment","databaseId":3,"url":"https://github.com/acme/widgets/pull/7#pullrequestreview-3","author":{"login":"example-review-bot[bot]"},"state":"COMMENTED","commit":{"oid":"head123"},"submittedAt":"2026-07-14T04:00:00Z","body":"initial"}"#;
+    let stub = StubEnv::new();
+    fs::write(
+        stub.tempdir.path().join("second-review-response.json"),
+        r#"{"data":{"repository":{"pullRequest":{"headRefOid":"head123","reviews":{"nodes":[{"id":"PRR_comment","databaseId":3,"url":"https://github.com/acme/widgets/pull/7#pullrequestreview-3","author":{"login":"example-review-bot[bot]"},"state":"COMMENTED","commit":{"oid":"head123"},"submittedAt":"2026-07-14T04:00:00Z","body":"initial"},{"id":"PRR_blocking","databaseId":4,"url":"https://github.com/acme/widgets/pull/7#pullrequestreview-4","author":{"login":"reviewer"},"state":"CHANGES_REQUESTED","commit":{"oid":"head123"},"submittedAt":"2026-07-14T04:01:00Z","body":"late request"}],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}}}"#,
+    )
+    .expect("second review response");
+    let body = github_merge_stub(&stub, initial, "", false);
+    let stub = stub.gh_stub(&body);
+
+    let out = run_forge_cli_in(
+        &stub,
+        &[
+            "--provider",
+            "github",
+            "--repo",
+            "acme/widgets",
+            "--format",
+            "json",
+            "pr",
+            "merge",
+            "7",
+        ],
+        Some(&repo_path),
+    );
+    assert_eq!(out.code, 65, "stdout={}\nstderr={}", out.stdout, out.stderr);
+    let env = parse_envelope(&out.stdout);
+    assert_eq!(env["error"]["code"], "review_changes_requested");
+    assert!(
+        !stub.tempdir.path().join("github-merged").exists(),
+        "late review must prevent provider merge"
+    );
+}
+
+#[test]
+fn pr_merge_restarts_after_late_observed_bot_activity_before_merge() {
+    let config = r#"[review_convergence]
+require = true
+quiet_period = "0s"
+timeout = "20m"
+
+[[review_convergence.bots]]
+login = "example-review-bot"
+mode = "observed"
+"#;
+    let tempdir = make_github_repo(Some(config));
+    let repo_path = tempdir.path().join("repo");
+    let initial = r#"{"id":"PRR_comment","databaseId":3,"url":"https://github.com/acme/widgets/pull/7#pullrequestreview-3","author":{"login":"example-review-bot[bot]"},"state":"COMMENTED","commit":{"oid":"head123"},"submittedAt":"2026-07-14T04:00:00Z","body":"initial"}"#;
+    let stub = StubEnv::new();
+    fs::write(
+        stub.tempdir.path().join("second-review-response.json"),
+        r#"{"data":{"repository":{"pullRequest":{"headRefOid":"head123","reviews":{"nodes":[{"id":"PRR_comment","databaseId":3,"url":"https://github.com/acme/widgets/pull/7#pullrequestreview-3","author":{"login":"example-review-bot[bot]"},"state":"COMMENTED","commit":{"oid":"head123"},"submittedAt":"2026-07-14T04:00:00Z","body":"initial"},{"id":"PRR_followup","databaseId":4,"url":"https://github.com/acme/widgets/pull/7#pullrequestreview-4","author":{"login":"example-review-bot[bot]"},"state":"COMMENTED","commit":{"oid":"head123"},"submittedAt":"2026-07-14T04:01:00Z","body":"late follow-up"}],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}}}"#,
+    )
+    .expect("second review response");
+    let body = github_merge_stub(&stub, initial, "", false);
+    let stub = stub.gh_stub(&body);
+
+    let out = run_forge_cli_in(
+        &stub,
+        &[
+            "--provider",
+            "github",
+            "--repo",
+            "acme/widgets",
+            "--format",
+            "json",
+            "pr",
+            "merge",
+            "7",
+        ],
+        Some(&repo_path),
+    );
+    assert_eq!(out.code, 65, "stdout={}\nstderr={}", out.stdout, out.stderr);
+    let env = parse_envelope(&out.stdout);
+    assert_eq!(env["error"]["code"], "review_convergence_activity_changed");
+    assert!(
+        !stub.tempdir.path().join("github-merged").exists(),
+        "late observed activity must restart convergence before provider merge"
+    );
+}
+
+#[test]
+fn pr_merge_review_convergence_keeps_unresolved_thread_gate_authoritative() {
+    let tempdir = make_github_repo(None);
+    let repo_path = tempdir.path().join("repo");
+    let thread = r#"{"id":"PRRT_1","isResolved":false,"isOutdated":false,"path":"src/lib.rs","comments":{"nodes":[{"author":{"login":"reviewer"},"body":"please address","createdAt":"2026-07-14T04:00:00Z","url":"https://github.com/acme/widgets/pull/7#discussion_r1"}]}}"#;
+    let stub = StubEnv::new();
+    let body = github_merge_stub(&stub, "", thread, false);
+    let stub = stub.gh_stub(&body);
+
+    let out = run_forge_cli_in(
+        &stub,
+        &[
+            "--provider",
+            "github",
+            "--repo",
+            "acme/widgets",
+            "--format",
+            "json",
+            "pr",
+            "merge",
+            "7",
+            "--review-convergence",
+        ],
+        Some(&repo_path),
+    );
+    assert_eq!(out.code, 65, "stdout={}\nstderr={}", out.stdout, out.stderr);
+    let env = parse_envelope(&out.stdout);
+    assert_eq!(env["error"]["code"], "unresolved_review_threads");
 }
 
 const UNRESOLVED_DISCUSSIONS_JSON: &str = r#"[

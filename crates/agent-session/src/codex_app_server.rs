@@ -404,8 +404,23 @@ fn persisted_runtime_paths(
     Ok([socket, proxy, handoff, attached])
 }
 
-pub(crate) fn launch_script() -> &'static str {
-    r#"socket=$1
+const STARTUP_DIAGNOSTIC_COLLECTOR_SCRIPT: &str = r#"collect_startup_diagnostic() {
+  if (umask 077; tail -c 16384 > "$startup_diagnostic_buffer"); then
+    if [ "$(cat "$startup_stage" 2>/dev/null)" != initial_connection ] &&
+       [ -s "$startup_diagnostic_buffer" ]; then
+      mv -f "$startup_diagnostic_buffer" "$startup_diagnostic" 2>/dev/null ||
+        rm -f -- "$startup_diagnostic_buffer"
+    else
+      rm -f -- "$startup_diagnostic_buffer"
+    fi
+  else
+    rm -f -- "$startup_diagnostic_buffer"
+  fi
+}"#;
+
+pub(crate) fn launch_script() -> String {
+    [
+        r#"socket=$1
 proxy=$2
 handoff=$3
 attached=$4
@@ -415,10 +430,35 @@ session_id=$7
 agent=$8
 cwd=$9
 shift 9
+startup_dir="$state_dir/sessions/$session_id"
+startup_stage="$startup_dir/.startup-stage"
+startup_failure="$startup_dir/.startup-failure"
+startup_diagnostic="$startup_dir/.startup-diagnostic.log"
+startup_diagnostic_buffer="$startup_dir/.startup-diagnostic.buffer"
+startup_diagnostic_pipe="$startup_dir/.startup-diagnostic.pipe"
+provider_stderr_pipe="$startup_dir/.provider-stderr.pipe"
+"#,
+        STARTUP_DIAGNOSTIC_COLLECTOR_SCRIPT,
+        r#"
+write_startup_marker() {
+  (umask 077; printf '%s\n' "$2" > "$1") 2>/dev/null || true
+}
+record_startup_failure() {
+  write_startup_marker "$startup_failure" "$1"
+}
+rm -f -- "$startup_failure" "$startup_diagnostic" "$startup_diagnostic_buffer" "$startup_diagnostic_pipe" "$provider_stderr_pipe"
+write_startup_marker "$startup_stage" app_server
+if ! (umask 077; mkfifo "$startup_diagnostic_pipe"); then
+  record_startup_failure startup-exited
+  exit 1
+fi
+(umask 077; collect_startup_diagnostic < "$startup_diagnostic_pipe") &
+diagnostic_pid=$!
 rm -f -- "$socket" "$proxy" "$attached"
-"$agent" app-server --listen "unix://$socket" </dev/null >/dev/null 2>&1 &
+"$agent" app-server --listen "unix://$socket" </dev/null >/dev/null 2>"$startup_diagnostic_pipe" &
 server=$!
 proxy_pid=
+provider_stderr_pid=
 cleanup() {
   if [ -n "$proxy_pid" ]; then
     kill "$proxy_pid" 2>/dev/null || true
@@ -426,35 +466,66 @@ cleanup() {
   fi
   kill "$server" 2>/dev/null || true
   wait "$server" 2>/dev/null || true
-  rm -f -- "$socket" "$proxy" "$handoff" "$attached"
+  if [ -n "$provider_stderr_pid" ]; then
+    kill "$provider_stderr_pid" 2>/dev/null || true
+    wait "$provider_stderr_pid" 2>/dev/null || true
+  fi
+  wait "$diagnostic_pid" 2>/dev/null || true
+  rm -f -- "$socket" "$proxy" "$handoff" "$attached" "$startup_diagnostic_buffer" "$startup_diagnostic_pipe" "$provider_stderr_pipe"
 }
 trap cleanup EXIT HUP INT TERM
 i=0
 while [ ! -S "$socket" ]; do
   if ! kill -0 "$server" 2>/dev/null; then
+    record_startup_failure app-server-start-failed
     exit 1
   fi
   i=$((i + 1))
   if [ "$i" -ge 100 ]; then
+    record_startup_failure startup-timeout
     exit 1
   fi
   sleep 0.05
 done
-(umask 077; "$proxy_bin" --state-dir "$state_dir" codex-app-server-proxy --id "$session_id" --upstream "$socket" --listen "$proxy" </dev/null >/dev/null 2>&1) &
+write_startup_marker "$startup_stage" proxy
+(umask 077; "$proxy_bin" --state-dir "$state_dir" codex-app-server-proxy --id "$session_id" --upstream "$socket" --listen "$proxy" </dev/null >/dev/null 2>"$startup_diagnostic_pipe") &
 proxy_pid=$!
 i=0
 while [ ! -S "$proxy" ]; do
   if ! kill -0 "$proxy_pid" 2>/dev/null; then
+    if [ ! -x "$proxy_bin" ]; then
+      record_startup_failure runtime-helper-unavailable
+    else
+      record_startup_failure proxy-start-failed
+    fi
     exit 1
   fi
   i=$((i + 1))
   if [ "$i" -ge 100 ]; then
+    record_startup_failure startup-timeout
     exit 1
   fi
   sleep 0.05
 done
-"$agent" --remote "unix://$proxy" "$@"
-"#
+write_startup_marker "$startup_stage" provider_client
+if ! (umask 077; mkfifo "$provider_stderr_pipe"); then
+  record_startup_failure startup-exited
+  exit 1
+fi
+tee "$startup_diagnostic_pipe" < "$provider_stderr_pipe" >&2 &
+provider_stderr_pid=$!
+"$agent" -c check_for_update_on_startup=false --remote "unix://$proxy" --cd "$cwd" --no-alt-screen "$@" 2>"$provider_stderr_pipe"
+status=$?
+wait "$provider_stderr_pid" 2>/dev/null || true
+provider_stderr_pid=
+rm -f -- "$provider_stderr_pipe"
+if [ "$(cat "$startup_stage" 2>/dev/null)" != initial_connection ]; then
+  record_startup_failure provider-client-exited
+fi
+exit "$status"
+"#,
+    ]
+    .concat()
 }
 
 pub(crate) fn runtime_is_supported(record: &SessionRecord) -> bool {
@@ -2968,6 +3039,13 @@ async fn run_proxy_session(
     .map_err(|err| format!("upstream app-server handshake failed: {err}"))?;
     let _capability = begin_proxy_capability(&context, &record)
         .map_err(|err| format!("failed to advertise proxy capability: {}", err.code()))?;
+    let _ = crate::write_private_file(
+        &crate::session_dir(&context, &record.id).join(crate::STARTUP_STAGE_FILE),
+        b"initial_connection\n",
+    );
+    let _ = fs::remove_file(
+        crate::session_dir(&context, &record.id).join(crate::STARTUP_DIAGNOSTIC_FILE),
+    );
     let mut projection = ProxyProjection::new(context.clone(), record.clone());
     let mut bootstrap = FreshBootstrap::for_runtime(&context, &record);
     let result = async {
@@ -3859,15 +3937,89 @@ exit 1
     fn launch_routes_the_visible_tui_through_the_private_proxy() {
         let script = launch_script();
         assert!(script.contains("codex-app-server-proxy"));
-        assert!(script.contains("\"$agent\" --remote \"unix://$proxy\""));
+        assert!(script.contains("--remote \"unix://$proxy\""));
         assert!(!script.contains("--remote \"unix://$socket\""));
         assert!(!script.contains("thread/shellCommand"));
+        assert!(script.contains(".startup-stage"));
+        assert!(script.contains(".startup-failure"));
+        assert!(script.contains(".startup-diagnostic.log"));
+        assert!(script.contains("runtime-helper-unavailable"));
+        assert!(script.contains("provider-client-exited"));
+        assert!(script.contains("!= initial_connection"));
+        assert!(script.contains("collect_startup_diagnostic"));
+        assert!(script.contains("tail -c 16384"));
+        assert!(script.contains("mkfifo \"$startup_diagnostic_pipe\""));
+        assert!(script.contains("tee \"$startup_diagnostic_pipe\""));
+        assert!(!script.contains(">>\"$startup_diagnostic\""));
         let cleanup_lines = script
             .lines()
-            .filter(|line| line.trim_start().starts_with("rm -f --"))
+            .filter(|line| line.trim_start().starts_with("rm -f --") && line.contains("$socket"))
             .collect::<Vec<_>>();
         assert!(!cleanup_lines[0].contains("$handoff"));
         assert!(cleanup_lines[1].contains("$handoff"));
+    }
+
+    #[test]
+    fn managed_codex_client_launch_disables_startup_update_check_without_dropping_arguments() {
+        let script = launch_script();
+        assert!(script.contains(
+            "\"$agent\" -c check_for_update_on_startup=false --remote \"unix://$proxy\" --cd \"$cwd\" --no-alt-screen \"$@\""
+        ));
+    }
+
+    #[test]
+    fn startup_diagnostic_collector_caps_private_failure_output_and_discards_ready_output() {
+        use std::io::Write;
+        use std::process::{Command, Stdio};
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let stage = tmp.path().join("stage");
+        let diagnostic = tmp.path().join("diagnostic.log");
+        fs::write(&stage, "provider_client\n").unwrap();
+        let buffer = tmp.path().join("diagnostic.buffer");
+        let command = format!(
+            "startup_stage={}; startup_diagnostic={}; startup_diagnostic_buffer={}; {}; collect_startup_diagnostic",
+            shell_words::quote(&stage.to_string_lossy()),
+            shell_words::quote(&diagnostic.to_string_lossy()),
+            shell_words::quote(&buffer.to_string_lossy()),
+            STARTUP_DIAGNOSTIC_COLLECTOR_SCRIPT,
+        );
+        let mut child = Command::new("/bin/sh")
+            .arg("-c")
+            .arg(&command)
+            .stdin(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut input = vec![b'x'; 2 * 1024 * 1024];
+        input.extend_from_slice(b"failure-sentinel");
+        child.stdin.take().unwrap().write_all(&input).unwrap();
+        assert!(child.wait().unwrap().success());
+
+        let retained = fs::read(&diagnostic).unwrap();
+        assert!(retained.len() <= 16 * 1024);
+        assert!(retained.ends_with(b"failure-sentinel"));
+        assert_eq!(
+            fs::metadata(&diagnostic).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+
+        fs::remove_file(&diagnostic).unwrap();
+        fs::write(&stage, "initial_connection\n").unwrap();
+        let mut child = Command::new("/bin/sh")
+            .arg("-c")
+            .arg(command)
+            .stdin(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(&vec![b'y'; 2 * 1024 * 1024])
+            .unwrap();
+        assert!(child.wait().unwrap().success());
+        assert!(!diagnostic.exists());
+        assert!(!buffer.exists());
     }
 
     #[test]
@@ -5655,7 +5807,13 @@ printf '%s\n' '{"schema_version":"agent-session.codex-auth-broker.v1","account":
             host: None,
         };
         let id = "proxy-control";
-        fs::create_dir_all(crate::session_dir(&context, id)).unwrap();
+        let session_dir = crate::session_dir(&context, id);
+        fs::create_dir_all(&session_dir).unwrap();
+        crate::write_private_file(
+            &session_dir.join(crate::STARTUP_DIAGNOSTIC_FILE),
+            b"local-only startup detail\n",
+        )
+        .unwrap();
         let record = record_with_runtime(id, &upstream);
         crate::write_session_record(&context, &record).unwrap();
         crate::activity::activate_runtime(&context, &record).unwrap();
@@ -5729,7 +5887,11 @@ printf '%s\n' '{"schema_version":"agent-session.codex-auth-broker.v1","account":
         server.await.unwrap();
         proxy.await.unwrap().unwrap();
 
-        let session_dir = crate::session_dir(&context, id);
+        assert_eq!(
+            fs::read_to_string(session_dir.join(crate::STARTUP_STAGE_FILE)).unwrap(),
+            "initial_connection\n"
+        );
+        assert!(!session_dir.join(crate::STARTUP_DIAGNOSTIC_FILE).exists());
         let activity = format!(
             "{}\n{}",
             fs::read_to_string(session_dir.join("activity.json")).unwrap(),

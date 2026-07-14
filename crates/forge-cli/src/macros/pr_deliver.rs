@@ -96,6 +96,8 @@ pub struct PrDeliverDryRun {
     pub kind: &'static str,
     pub plan_steps: Vec<DryRunStep>,
     pub no_merge: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub review_convergence: Option<crate::config::ReviewConvergencePolicy>,
     /// Per-rule verdicts from the non-mutating local preflight (Rules 1a, 1b,
     /// 3, 2a, 2b, 4, 5). Additive: consumers that predate this field ignore
     /// it. The dry-run path never invokes a provider backend to compute it.
@@ -149,8 +151,28 @@ pub fn run_with<R: BackendRunner, C: Clock>(
         label_target,
     )?;
 
+    // The merge phase owns review convergence, but configuration validity is
+    // part of the macro input contract. Validate before the dry-run/live split
+    // so previews cannot report a deliverable plan that live delivery rejects.
+    let review_policy = if args.no_merge {
+        None
+    } else {
+        Some(pr_merge::resolve_review_convergence_for_workdir(
+            workdir,
+            args.review_convergence,
+            ctx.provider,
+        )?)
+    };
+
     if global.dry_run {
-        return Ok(emit_dry_run(&ctx, &args, format, workdir, global));
+        return Ok(emit_dry_run(
+            &ctx,
+            &args,
+            format,
+            workdir,
+            global,
+            review_policy.as_ref(),
+        ));
     }
 
     execute_sequence(runner, clock, global, &ctx, &args, format, workdir)
@@ -515,31 +537,27 @@ fn execute_sequence<R: BackendRunner, C: Clock>(
     });
 
     // 6. pr.merge
-    let merge_args = PrMergeArgs {
-        id: pr_number,
-        expected_head_sha: verified_subject
+    let merge_args = build_merge_args(
+        args,
+        pr_number,
+        verified_subject
             .as_ref()
             .map(|subject| subject.head.clone()),
-        method: Some(args.method),
-        keep_branch: false,
-        allow_non_default_base: args.allow_non_default_base,
-        allow_unresolved_threads: args.allow_unresolved_threads,
-        allow_unchecked_tasks: args.allow_unchecked_tasks,
-        allow_unchecked_tasks_reason: args.allow_unchecked_tasks_reason.clone(),
-    };
-    let merge_payload = match pr_merge::compute(runner, global, &merge_args, workdir) {
-        Ok(p) => p,
-        Err(err) => {
-            return Ok(emit_chain_failure(
-                steps,
-                args,
-                ctx,
-                Some((pr_number, pr_url)),
-                &err,
-                format,
-            ));
-        }
-    };
+    );
+    let merge_payload =
+        match pr_merge::compute_with_clock(runner, clock, global, &merge_args, workdir) {
+            Ok(p) => p,
+            Err(err) => {
+                return Ok(emit_chain_failure(
+                    steps,
+                    args,
+                    ctx,
+                    Some((pr_number, pr_url)),
+                    &err,
+                    format,
+                ));
+            }
+        };
     merge_sha = Some(merge_payload.merge_sha.clone());
     merged = true;
     steps.push(Step {
@@ -562,6 +580,24 @@ fn execute_sequence<R: BackendRunner, C: Clock>(
     Ok(emit_success_envelope(
         steps, args, ctx, pr_number, pr_url, merged, merge_sha, format,
     ))
+}
+
+fn build_merge_args(
+    args: &PrDeliverArgs,
+    pr_number: u64,
+    expected_head_sha: Option<String>,
+) -> PrMergeArgs {
+    PrMergeArgs {
+        id: pr_number,
+        expected_head_sha,
+        method: Some(args.method),
+        keep_branch: false,
+        allow_non_default_base: args.allow_non_default_base,
+        allow_unresolved_threads: args.allow_unresolved_threads,
+        review_convergence: args.review_convergence,
+        allow_unchecked_tasks: args.allow_unchecked_tasks,
+        allow_unchecked_tasks_reason: args.allow_unchecked_tasks_reason.clone(),
+    }
 }
 
 fn should_gate_visible_checks(provider: Provider, snapshot: &pr_checks::PrChecksPayload) -> bool {
@@ -735,8 +771,9 @@ fn emit_dry_run(
     format: OutputFormat,
     workdir: &Path,
     global: &GlobalFlags,
+    review_policy: Option<&crate::config::ReviewConvergencePolicy>,
 ) -> i32 {
-    let payload = build_dry_run_payload(ctx, args, workdir, global, git_remote_url);
+    let payload = build_dry_run_payload(ctx, args, workdir, global, review_policy, git_remote_url);
     let envelope = Envelope::success(schema_version_for(BINARY, SCHEMA, SCHEMA_VERSION), payload);
     write_envelope(&envelope, format);
     nils_common::cli_contract::exit::SUCCESS
@@ -747,6 +784,7 @@ fn build_dry_run_payload(
     args: &PrDeliverArgs,
     workdir: &Path,
     global: &GlobalFlags,
+    review_policy: Option<&crate::config::ReviewConvergencePolicy>,
     remote_url_lookup: impl FnOnce(&str) -> Option<String>,
 ) -> PrDeliverDryRun {
     let branch = match &args.head {
@@ -850,6 +888,7 @@ fn build_dry_run_payload(
         kind: args.kind.as_str(),
         plan_steps,
         no_merge: args.no_merge,
+        review_convergence: review_policy.cloned(),
         local_preflight,
     }
 }
@@ -1078,12 +1117,17 @@ fn emit_chain_failure(
         },
         steps,
     };
+    let envelope_error = EnvelopeError::new(err.kind(), err.to_string());
+    let envelope_error = match err.detail() {
+        Some(detail) => envelope_error.with_details(serde_json::json!({ "detail": detail })),
+        None => envelope_error,
+    };
     let envelope = Envelope {
         schema_version: schema_version_for(BINARY, SCHEMA, SCHEMA_VERSION),
         ok: false,
         data: Some(payload),
         warnings: Vec::new(),
-        error: Some(EnvelopeError::new(err.kind(), err.to_string())),
+        error: Some(envelope_error),
     };
     write_envelope(&envelope, format);
     err.exit_code()
@@ -1224,9 +1268,20 @@ mod tests {
             no_issue_closeout: false,
             allow_non_default_base: false,
             allow_unresolved_threads: false,
+            review_convergence: None,
             allow_unchecked_tasks: false,
             allow_unchecked_tasks_reason: None,
         }
+    }
+
+    #[test]
+    fn deliver_forwards_review_convergence_override_to_merge() {
+        let mut deliver = args(false);
+        deliver.review_convergence = Some(false);
+        let merge = build_merge_args(&deliver, 42, Some("head123".into()));
+        assert_eq!(merge.id, 42);
+        assert_eq!(merge.expected_head_sha.as_deref(), Some("head123"));
+        assert_eq!(merge.review_convergence, Some(false));
     }
 
     fn bind_test_first_phase(phase: &str, repo: &Path, evidence: &Path) -> i32 {
@@ -1267,9 +1322,10 @@ mod tests {
         deliver.head = Some("main".into());
         deliver.test_first_evidence = Some(fixture.evidence.to_string_lossy().to_string());
 
-        let payload = build_dry_run_payload(&context, &deliver, &fixture.repo, &global, |_| {
-            Some("https://github.com/sympoies/nils-cli.git".into())
-        });
+        let payload =
+            build_dry_run_payload(&context, &deliver, &fixture.repo, &global, None, |_| {
+                Some("https://github.com/sympoies/nils-cli.git".into())
+            });
         let verdict = payload
             .local_preflight
             .iter()

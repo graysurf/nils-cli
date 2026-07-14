@@ -25,6 +25,8 @@ cargo run -p nils-forge-cli -- pr review 123 --decision comments-only --comment-
 cargo run -p nils-forge-cli -- pr review validate --comment-file review.md --thread-file review-threads.json --format json
 cargo run -p nils-forge-cli -- pr review validate 123 --check-diff --comment-file review.md --thread-file review-threads.json --format json
 cargo run -p nils-forge-cli -- pr review 123 --decision comments-only --submit-review --comment-file review.md --thread-file review-threads.json --format json
+cargo run -p nils-forge-cli -- pr reviews 123 --format json
+cargo run -p nils-forge-cli -- pr merge 123 --review-convergence --format json
 ```
 
 `--thread-file` is for actionable findings only: max 50 threads, 16 KiB body
@@ -34,6 +36,23 @@ before posting. Put non-blocking notes in the review body.
 
 `forge-cli` does NOT introduce a `--json` boolean flag. Use
 `--format text|json` exclusively.
+
+Native review convergence is compatibility-preserving and off by default.
+Enable it per invocation with `--review-convergence`, per repository in
+`.forge-cli.toml`, or in the user-global config. The first `observed` bot mode
+never waits for a bot that has not submitted a review. Once relevant
+current-head review activity exists, it waits for the configured quiet period,
+reports bounded native review summaries, and blocks native
+`CHANGES_REQUESTED`. The complete paginated review snapshot is read again
+immediately before merge; partial provider data (including a review without a
+commit OID) or late review activity fails
+closed, and the initial non-empty provider head is bound through the final
+merge compare-and-swap. GitHub is the only supported provider in v1; enabled
+GitLab dry-runs fail with the same `provider_unsupported` result as live runs.
+Merge and deliver dry-run envelopes expose the resolved policy under
+`data.review_convergence`. Existing unresolved-thread enforcement remains an
+independent merge gate. See the contract for config precedence, duration
+bounds, and the JSON snapshot.
 
 ## Inbox discovery
 

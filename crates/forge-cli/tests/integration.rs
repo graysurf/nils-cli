@@ -23,6 +23,7 @@ mod integration {
     mod pr_deliver_chain;
     mod pr_merge;
     mod pr_review;
+    mod pr_reviews;
     mod pr_wait_checks;
     mod rate_limit_gate;
     mod repo_view;

@@ -1,6 +1,6 @@
 //! `pr merge` atom — the heaviest single atom in the v1 surface.
 //!
-//! Spec / ops: `cli.forge-cli.pr.merge.v1`. Layers eight lock-down policy
+//! Spec / ops: `cli.forge-cli.pr.merge.v1`. Layers nine lock-down policy
 //! rules on top of a backend invocation:
 //!
 //! | Rule                                | Triggered when                                              | Error kind                | Exit       |
@@ -11,8 +11,9 @@
 //! | 8 — required_checks_green (TTL=0)   | fresh `pr.checks --required-only` not all green             | `checks_pending`/`failed` | DATA / RT  |
 //! | 9 — merge_method_supported          | resolved method not in `repo.view.merge_methods_allowed`    | `merge_method_unsupported`| DATA 65    |
 //! | 10 — keep_branch_conflict           | `--keep-branch` set while `[merge].delete_branch=true`      | `keep_branch_conflict`    | DATA 65    |
-//! | 12 — review_threads_resolved        | unresolved review threads, `--allow-unresolved-threads=0`   | `unresolved_review_threads`| DATA 65   |
-//! | 13 — tasklist_complete              | unchecked task-list items, `--allow-unchecked-tasks=0`      | `unchecked_task_items`    | DATA 65    |
+//! | 12 — review_convergence             | enabled native-review policy has not converged              | review-specific kind       | DATA / UNAV |
+//! | 13 — review_threads_resolved        | unresolved review threads, `--allow-unresolved-threads=0`   | `unresolved_review_threads`| DATA 65   |
+//! | 14 — tasklist_complete              | unchecked task-list items, `--allow-unchecked-tasks=0`      | `unchecked_task_items`    | DATA 65    |
 //!
 //! Backend argv (per ops YAML):
 //! - GitHub: `gh pr merge <id> --{method} [--delete-branch]`
@@ -29,15 +30,17 @@ use serde::Serialize;
 
 use crate::backend::{BackendCall, BackendProgram, BackendRunner, BackendSuccess, DryRunPayload};
 use crate::cli::{BINARY, GlobalFlags, PrMergeArgs};
-use crate::config::{ForgeConfig, MergeMethod};
+use crate::config::{ForgeConfig, MergeMethod, ReviewConvergencePolicy};
 use crate::envelope::emit_success;
 use crate::error::ForgeError;
 use crate::ops::gitlab_api;
 use crate::ops::pr_review_threads;
 use crate::ops::pr_tasks;
 use crate::ops::pr_view;
+use crate::ops::pr_wait_checks::{Clock, SystemClock};
 use crate::ops::repo_view::{self, RepoViewPayload};
 use crate::ops::required_check_gate::ensure_required_checks_green;
+use crate::ops::review_convergence::{self, ReviewConvergenceSnapshot};
 use crate::provider::{Provider, ProviderContext, detect, git_remote_url};
 use crate::rate_limit::default_runner;
 use crate::validations::{git_status_porcelain, worktree_clean};
@@ -57,9 +60,13 @@ pub struct PrMergePayload {
     pub base: String,
     pub head: String,
     /// Recorded `--allow-unchecked-tasks-reason` when the task-list gate
-    /// (rule 13) was explicitly bypassed; absent otherwise.
+    /// (rule 14) was explicitly bypassed; absent otherwise.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub unchecked_tasks_override_reason: Option<String>,
+    /// Present only when the default-off review convergence policy resolves
+    /// enabled for this invocation.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub review_convergence: Option<ReviewConvergenceSnapshot>,
 }
 
 pub fn run(
@@ -105,10 +112,12 @@ pub fn run_with<R: BackendRunner, F: Fn(&str) -> Option<String>>(
     // [merge].delete_branch = true config in the same repo.
     enforce_keep_branch_conflict(args.keep_branch, repo_delete_branch)?;
     let delete_branch = if args.keep_branch { false } else { cfg_delete };
+    let policy = resolve_review_convergence_policy(&cfg, args.review_convergence)?;
+    ensure_review_convergence_provider(ctx.provider, &policy)?;
 
     if global.dry_run {
         let call = build_dry_run_merge_call(&ctx, args.id, method, delete_branch);
-        let payload = DryRunPayload::new(ctx.provider, &call);
+        let payload = DryRunPayload::new(ctx.provider, &call).with_review_convergence(&policy);
         return Ok(emit_success(
             schema_version_for(BINARY, SCHEMA, SCHEMA_VERSION),
             payload,
@@ -117,7 +126,20 @@ pub fn run_with<R: BackendRunner, F: Fn(&str) -> Option<String>>(
         ));
     }
 
-    let payload = run_lockdown_chain(runner, global, &ctx, args, workdir, method, delete_branch)?;
+    let clock = SystemClock;
+    let payload = run_lockdown_chain(
+        runner,
+        &clock,
+        global,
+        &ctx,
+        args,
+        workdir,
+        ResolvedMergeSettings {
+            method,
+            delete_branch,
+            review_policy: &policy,
+        },
+    )?;
     Ok(emit_success(
         schema_version_for(BINARY, SCHEMA, SCHEMA_VERSION),
         payload,
@@ -136,6 +158,19 @@ pub fn compute<R: BackendRunner>(
     args: &PrMergeArgs,
     workdir: &std::path::Path,
 ) -> Result<PrMergePayload, ForgeError> {
+    let clock = SystemClock;
+    compute_with_clock(runner, &clock, global, args, workdir)
+}
+
+/// Clock-injected merge entry point used by `pr deliver` so its test clock
+/// also drives the review quiet window deterministically.
+pub fn compute_with_clock<R: BackendRunner, C: Clock>(
+    runner: &R,
+    clock: &C,
+    global: &GlobalFlags,
+    args: &PrMergeArgs,
+    workdir: &std::path::Path,
+) -> Result<PrMergePayload, ForgeError> {
     let ctx = detect(
         global.provider_hint(),
         &global.remote,
@@ -147,7 +182,21 @@ pub fn compute<R: BackendRunner>(
     let cfg_delete = cfg.resolve_delete_branch(None);
     enforce_keep_branch_conflict(args.keep_branch, repo_delete_branch)?;
     let delete_branch = if args.keep_branch { false } else { cfg_delete };
-    run_lockdown_chain(runner, global, &ctx, args, workdir, method, delete_branch)
+    let policy = resolve_review_convergence_policy(&cfg, args.review_convergence)?;
+    ensure_review_convergence_provider(ctx.provider, &policy)?;
+    run_lockdown_chain(
+        runner,
+        clock,
+        global,
+        &ctx,
+        args,
+        workdir,
+        ResolvedMergeSettings {
+            method,
+            delete_branch,
+            review_policy: &policy,
+        },
+    )
 }
 
 /// Load the layered merge config and, alongside the merged view, surface the
@@ -168,14 +217,73 @@ fn load_merge_config(workdir: &std::path::Path) -> (ForgeConfig, Option<bool>) {
     )
 }
 
-fn run_lockdown_chain<R: BackendRunner>(
+pub(crate) fn resolve_review_convergence_for_workdir(
+    workdir: &std::path::Path,
+    explicit_required: Option<bool>,
+    provider: Provider,
+) -> Result<crate::config::ReviewConvergencePolicy, ForgeError> {
+    let (cfg, _) = load_merge_config(workdir);
+    let policy = resolve_review_convergence_policy(&cfg, explicit_required)?;
+    ensure_review_convergence_provider(provider, &policy)?;
+    Ok(policy)
+}
+
+fn resolve_review_convergence_policy(
+    cfg: &ForgeConfig,
+    explicit_required: Option<bool>,
+) -> Result<crate::config::ReviewConvergencePolicy, ForgeError> {
+    let policy = cfg.resolve_review_convergence(explicit_required);
+    ensure_review_convergence_config_valid(cfg, &policy)?;
+    Ok(policy)
+}
+
+fn ensure_review_convergence_config_valid(
+    cfg: &ForgeConfig,
+    policy: &crate::config::ReviewConvergencePolicy,
+) -> Result<(), ForgeError> {
+    let invalid = cfg.invalid_review_convergence_warnings();
+    if !policy.require || invalid.is_empty() {
+        return Ok(());
+    }
+    Err(ForgeError::validation(
+        schema_err(),
+        "invalid_review_convergence_config",
+        "enabled review convergence has invalid configuration",
+        Some(invalid.join(",")),
+    ))
+}
+
+fn ensure_review_convergence_provider(
+    provider: Provider,
+    policy: &ReviewConvergencePolicy,
+) -> Result<(), ForgeError> {
+    if !policy.require || matches!(provider, Provider::GitHub) {
+        return Ok(());
+    }
+    Err(ForgeError::provider_unsupported(
+        schema_err(),
+        format!(
+            "review convergence is GitHub-only in v1 (provider: {})",
+            provider.as_str()
+        ),
+        None,
+    ))
+}
+
+struct ResolvedMergeSettings<'a> {
+    method: MergeMethod,
+    delete_branch: bool,
+    review_policy: &'a crate::config::ReviewConvergencePolicy,
+}
+
+fn run_lockdown_chain<R: BackendRunner, C: Clock>(
     runner: &R,
+    clock: &C,
     global: &GlobalFlags,
     ctx: &ProviderContext,
     args: &PrMergeArgs,
     workdir: &std::path::Path,
-    method: MergeMethod,
-    delete_branch: bool,
+    settings: ResolvedMergeSettings<'_>,
 ) -> Result<PrMergePayload, ForgeError> {
     // Rule 4 — clean worktree.
     worktree_clean(workdir, git_status_porcelain)?;
@@ -195,6 +303,23 @@ fn run_lockdown_chain<R: BackendRunner>(
             )),
         ));
     }
+    let convergence_head = if settings.review_policy.require {
+        Some(
+            pr.head_sha
+                .as_deref()
+                .filter(|head| !head.is_empty())
+                .ok_or_else(|| {
+                    ForgeError::validation(
+                        schema_err(),
+                        "review_convergence_head_missing",
+                        "enabled review convergence requires a non-empty initial provider head",
+                        Some(format!("pr={}; url={}", pr.number, pr.url)),
+                    )
+                })?,
+        )
+    } else {
+        pr.head_sha.as_deref()
+    };
     if pr.draft {
         return Err(ForgeError::validation(
             schema_err(),
@@ -220,19 +345,43 @@ fn run_lockdown_chain<R: BackendRunner>(
     }
 
     // Rule 9 — method must be in the repo's allowed list.
-    enforce_method_supported(method, &repo)?;
+    enforce_method_supported(settings.method, &repo)?;
 
     // Rule 8 — TTL-zero required-check re-check.
     ensure_required_checks_green(runner, global, ctx, &args.id.to_string())?;
 
-    // Rule 12 — unresolved review threads block the merge. Bot reviewers post
-    // asynchronously after PR creation, so this gate runs at merge time — the
-    // last action — and fails closed unless explicitly bypassed.
-    if !args.allow_unresolved_threads {
+    // Rule 12 — optional native-review convergence. The first v1 mode is
+    // absence-tolerant `observed`: configured bots do not become required, but
+    // any current-head activity that already exists must settle for the quiet
+    // window and native CHANGES_REQUESTED blocks mechanically.
+    let mut review_snapshot = if settings.review_policy.require {
+        Some(review_convergence::converge(
+            runner,
+            clock,
+            ctx,
+            args.id,
+            &pr.url,
+            convergence_head,
+            settings.review_policy,
+        )?)
+    } else {
+        None
+    };
+
+    // Rule 13 — unresolved review threads remain an independent gate. When
+    // convergence is enabled, reuse the final thread read to populate the
+    // structured convergence result even if the explicit bypass is set.
+    if let Some(snapshot) = review_snapshot.as_mut() {
+        let threads = pr_review_threads::compute_for_pr(runner, ctx, &pr.url, args.id)?;
+        snapshot.unresolved_threads = threads.unresolved;
+        if !args.allow_unresolved_threads {
+            pr_review_threads::ensure_payload_resolved(&threads)?;
+        }
+    } else if !args.allow_unresolved_threads {
         pr_review_threads::ensure_review_threads_resolved(runner, ctx, &pr.url, args.id)?;
     }
 
-    // Rule 13 — unchecked task-list items in the description block the
+    // Rule 14 — unchecked task-list items in the description block the
     // merge. The description is the delivery contract: every `- [ ]` must be
     // checked off or rewritten as dispositioned before merge, unless
     // explicitly bypassed with a recorded reason.
@@ -240,8 +389,27 @@ fn run_lockdown_chain<R: BackendRunner>(
         pr_tasks::ensure_tasklist_complete(&pr.body)?;
     }
 
+    // Close the thread/task TOCTOU window with one final complete native-review
+    // read. Provider-side branch protection remains the atomic enforcement
+    // layer for activity racing this final read and the merge mutation.
+    if let Some(previous) = review_snapshot.as_ref() {
+        let unresolved_threads = previous.unresolved_threads;
+        let mut final_snapshot = review_convergence::recheck_before_merge(
+            runner,
+            ctx,
+            args.id,
+            &pr.url,
+            convergence_head,
+            settings.review_policy,
+            previous,
+        )?;
+        final_snapshot.unresolved_threads = unresolved_threads;
+        review_snapshot = Some(final_snapshot);
+    }
+
     // All gates clear — invoke the backend.
-    let merge_call = build_live_merge_call(ctx, args.id, &pr, method, delete_branch)?;
+    let merge_call =
+        build_live_merge_call(ctx, args.id, &pr, settings.method, settings.delete_branch)?;
     invoke_merge_with_idempotency_check(runner, ctx, args.id, &merge_call, pr.head_sha.as_deref())?;
 
     // Post-merge re-fetch for merge_sha.
@@ -252,8 +420,8 @@ fn run_lockdown_chain<R: BackendRunner>(
         number: pr.number,
         url: pr.url,
         merge_sha,
-        method: method.as_str(),
-        deleted_branch: delete_branch,
+        method: settings.method.as_str(),
+        deleted_branch: settings.delete_branch,
         base: pr.base,
         head: pr.head,
         unchecked_tasks_override_reason: if args.allow_unchecked_tasks {
@@ -261,6 +429,7 @@ fn run_lockdown_chain<R: BackendRunner>(
         } else {
             None
         },
+        review_convergence: review_snapshot,
     })
 }
 
@@ -411,7 +580,7 @@ fn pr_view_call(ctx: &ProviderContext, id: u64) -> BackendCall {
             OsString::from(id_str),
             OsString::from("--json"),
             // Diverges from `pr_view::GH_JSON_FIELDS` on purpose: the merge
-            // chain needs `body` for the rule-13 task-list gate and fetches
+            // chain needs `body` for the rule-14 task-list gate and fetches
             // `mergeCommit` separately post-merge via `merge_sha_call`.
             OsString::from(pr_view::GH_JSON_FIELDS),
         ],
@@ -547,7 +716,7 @@ fn extract_merge_sha(ctx: &ProviderContext, output: &BackendSuccess) -> Result<S
     })
 }
 
-/// Pull the PR/MR description out of the raw view output for the rule-13
+/// Pull the PR/MR description out of the raw view output for the rule-14
 /// task-list gate: `body` on GitHub, `description` on GitLab. Providers
 /// without a body model (local) yield the empty string, which passes the
 /// gate trivially.
@@ -649,7 +818,7 @@ struct PrView {
     head: String,
     state: String,
     head_sha: Option<String>,
-    /// PR/MR description used by the rule-13 task-list gate; empty when the
+    /// PR/MR description used by the rule-14 task-list gate; empty when the
     /// provider has no body model.
     body: String,
 }
