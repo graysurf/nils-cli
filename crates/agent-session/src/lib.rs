@@ -4385,6 +4385,18 @@ fn terminate_tmux_session_with_timeouts(
     kill_timeout: Duration,
     verify_timeout: Duration,
 ) -> Result<(), SessionTerminationFailure> {
+    match live_status_with_timeout(
+        tmux_bin,
+        tmux_session,
+        verify_timeout.min(DELETE_TERMINATION_PROBE_TIMEOUT),
+    )
+    .as_str()
+    {
+        "stopped" => return Ok(()),
+        "running" => {}
+        _ => return Err(SessionTerminationFailure::VerificationFailed),
+    }
+
     match tmux_kill_status_with_timeout(tmux_bin, tmux_session, kill_timeout) {
         Ok(status) if status.success() => {}
         Ok(_) => return Err(SessionTerminationFailure::KillFailed),
@@ -4444,8 +4456,15 @@ fn tmux_kill_status_with_timeout(
     timeout: Duration,
 ) -> io::Result<std::process::ExitStatus> {
     let mut command = ProcessCommand::new(tmux_bin);
-    command.arg("kill-session").arg("-t").arg(tmux_session);
+    command
+        .arg("kill-session")
+        .arg("-t")
+        .arg(exact_tmux_target(tmux_session));
     run_exit_status_with_timeout(command, timeout)
+}
+
+fn exact_tmux_target(tmux_session: &str) -> String {
+    format!("={tmux_session}")
 }
 
 fn session_status(tmux_bin: &Path, record: &SessionRecord) -> String {
@@ -4633,7 +4652,10 @@ fn live_status(tmux_bin: &Path, tmux_session: &str) -> String {
 
 fn live_status_with_timeout(tmux_bin: &Path, tmux_session: &str, timeout: Duration) -> String {
     let mut command = ProcessCommand::new(tmux_bin);
-    command.arg("has-session").arg("-t").arg(tmux_session);
+    command
+        .arg("has-session")
+        .arg("-t")
+        .arg(exact_tmux_target(tmux_session));
     match run_exit_status_with_timeout(command, timeout) {
         Ok(status) if status.success() => "running".to_string(),
         Ok(status) if status.code() == Some(1) => "stopped".to_string(),
@@ -5874,7 +5896,10 @@ mod tests {
         let tmux = tmp.path().join("tmux-unverified");
         fs::write(
             &tmux,
-            "#!/bin/sh\nif [ \"$1\" = kill-session ]; then exit 0; fi\nexit 42\n",
+            format!(
+                "#!/bin/sh\nif [ \"$1\" = has-session ] && [ ! -f {probe} ]; then : > {probe}; exit 0; fi\nif [ \"$1\" = kill-session ]; then exit 0; fi\nexit 42\n",
+                probe = tmp.path().join("initial-probe").display()
+            ),
         )
         .unwrap();
         fs::set_permissions(&tmux, fs::Permissions::from_mode(0o700)).unwrap();
@@ -5892,6 +5917,106 @@ mod tests {
         assert_eq!(error.code, "session-termination-failed");
         assert_eq!(error.details.unwrap()["reason"], "verification-failed");
         assert!(session_dir(&context, &id).exists());
+    }
+
+    #[test]
+    fn delete_retry_cleans_up_after_the_exact_tmux_session_is_stopped() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let context = test_context(tmp.path());
+        let id = create_test_record_id(&context, AgentKind::Codex, None, Some("delete-retry"));
+        let record = load_session_record(&context, &id).unwrap();
+        let tmux = tmp.path().join("tmux-retry");
+        let killed = tmp.path().join("killed");
+        let report_stopped = tmp.path().join("report-stopped");
+        let calls = tmp.path().join("calls");
+        fs::write(
+            &tmux,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> {calls}\nif [ \"$1\" = has-session ]; then\n  if [ -f {report_stopped} ]; then exit 1; fi\n  if [ -f {killed} ]; then exit 42; fi\n  exit 0\nfi\nif [ \"$1\" = kill-session ]; then\n  if [ -f {killed} ]; then exit 42; fi\n  : > {killed}\n  exit 0\nfi\nexit 42\n",
+                calls = calls.display(),
+                report_stopped = report_stopped.display(),
+                killed = killed.display(),
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&tmux, fs::Permissions::from_mode(0o700)).unwrap();
+
+        let first_error = delete_session_with_timeouts(
+            &context,
+            &id,
+            tmux.clone(),
+            Duration::from_millis(50),
+            Duration::from_millis(75),
+        )
+        .unwrap_err()
+        .into_inner();
+        assert_eq!(first_error.code, "session-termination-failed");
+        assert_eq!(
+            first_error.details.unwrap()["reason"],
+            "verification-failed"
+        );
+        assert!(session_dir(&context, &id).exists());
+
+        fs::write(&report_stopped, "stopped").unwrap();
+        let result = delete_session_with_timeouts(
+            &context,
+            &id,
+            tmux,
+            Duration::from_millis(50),
+            Duration::from_millis(75),
+        )
+        .unwrap();
+
+        assert!(result.killed);
+        assert!(result.deleted);
+        assert!(!session_dir(&context, &id).exists());
+        let calls = fs::read_to_string(calls).unwrap();
+        assert_eq!(calls.matches("kill-session").count(), 1, "{calls}");
+        assert!(
+            calls.contains(&format!("has-session -t ={}", record.tmux_session)),
+            "status probes must use the exact target: {calls}"
+        );
+    }
+
+    #[test]
+    fn delete_never_kills_a_longer_tmux_session_matching_a_stale_prefix() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let context = test_context(tmp.path());
+        let id = create_test_record_id(
+            &context,
+            AgentKind::Claude,
+            None,
+            Some("delete-stale-prefix"),
+        );
+        let record = load_session_record(&context, &id).unwrap();
+        let tmux = tmp.path().join("tmux-stale-prefix");
+        let killed = tmp.path().join("wrong-session-killed");
+        fs::write(
+            &tmux,
+            format!(
+                "#!/bin/sh\nif [ \"$1\" = has-session ]; then\n  if [ \"$3\" = \"={}\" ]; then exit 1; fi\n  exit 0\nfi\nif [ \"$1\" = kill-session ]; then : > {}; exit 0; fi\nexit 42\n",
+                record.tmux_session,
+                killed.display(),
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&tmux, fs::Permissions::from_mode(0o700)).unwrap();
+
+        let result = delete_session_with_timeouts(
+            &context,
+            &id,
+            tmux,
+            Duration::from_millis(50),
+            Duration::from_millis(75),
+        )
+        .unwrap();
+
+        assert!(result.deleted);
+        assert!(
+            !killed.exists(),
+            "a longer prefix match must never be killed"
+        );
+        assert!(!session_dir(&context, &id).exists());
     }
 
     #[test]
