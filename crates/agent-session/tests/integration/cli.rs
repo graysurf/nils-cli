@@ -4705,6 +4705,319 @@ exit 0
 }
 
 #[test]
+fn delete_transition_markers_retain_uncertainty_and_recover_confirmed_shutdown() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let state_dir = tmp.path().join("state");
+    let tmux_bin = tmp.path().join("tmux-stopped-transition");
+    write_executable(
+        &tmux_bin,
+        r#"#!/usr/bin/env sh
+case "$1" in
+  display-message|has-session)
+    printf "%s\n" "can't find session: $88" >&2
+    exit 1 ;;
+  *) exit 42 ;;
+esac
+"#,
+    );
+
+    for (state, deletes) in [("pending", false), ("kill-confirmed", true)] {
+        let id = format!("delete-transition-{state}");
+        let tmux_session = format!("hs-codex-delete-transition-{state}");
+        let session_dir = write_session_record(&state_dir, &id, "codex", &tmux_session);
+        let runtime_files = attach_provider_runtime(
+            tmp.path(),
+            &state_dir,
+            &session_dir,
+            &id,
+            "codex",
+            &tmux_session,
+        );
+        let record_path = session_dir.join("session.json");
+        let launch_id = seed_delete_tmux_identity(&record_path, "$88", "%88", 99_999_988);
+        let mut record: Value =
+            serde_json::from_slice(&fs::read(&record_path).expect("session record")).unwrap();
+        record["delete_tmux_termination_state"] = json!({
+            "launch_id": launch_id,
+            "state": state,
+        });
+        record["provider_resume"] = json!({
+            "provider": "codex",
+            "session_id": "resume-session-id",
+            "captured_at": "2000-01-01T00:00:00Z",
+            "capture_method": "fixture",
+            "resume_args": [
+                "resume",
+                "resume-session-id",
+                "--cd",
+                "/tmp",
+                "--no-alt-screen"
+            ],
+        });
+        record["agent_args"] = json!([]);
+        fs::write(&record_path, serde_json::to_vec_pretty(&record).unwrap()).unwrap();
+
+        let delete = run(
+            tmp.path(),
+            &[
+                "--state-dir",
+                &state_dir.to_string_lossy(),
+                "delete",
+                &id,
+                "--tmux-bin",
+                &tmux_bin.to_string_lossy(),
+                "--format",
+                "json",
+            ],
+            &[],
+        );
+
+        if deletes {
+            assert_eq!(delete.code, 0, "stdout={}", delete.stdout_text());
+            assert!(
+                !session_dir.exists(),
+                "confirmed stopped state must clean up"
+            );
+            assert!(
+                runtime_files.iter().all(|path| !path.exists()),
+                "confirmed stopped runtime files must be removed"
+            );
+            continue;
+        }
+
+        assert_eq!(delete.code, 1, "stdout={}", delete.stdout_text());
+        let error = delete.stdout_json();
+        assert_eq!(
+            error["error"]["details"]["reason"],
+            "runtime-identity-unavailable"
+        );
+        assert_eq!(error["error"]["details"]["retryable"], false);
+        assert_eq!(
+            error["error"]["details"]["action"],
+            "manual-runtime-verification-required"
+        );
+        assert!(
+            session_dir.exists(),
+            "uncertain state must remain discoverable"
+        );
+        assert!(runtime_files.iter().all(|path| path.exists()));
+        let retained: Value =
+            serde_json::from_slice(&fs::read(&record_path).expect("retained record")).unwrap();
+        assert_eq!(
+            retained["delete_tmux_termination_state"]["state"],
+            "pending"
+        );
+
+        let resume = run(
+            tmp.path(),
+            &[
+                "--state-dir",
+                &state_dir.to_string_lossy(),
+                "resume",
+                &id,
+                "--tmux-bin",
+                &tmux_bin.to_string_lossy(),
+                "--format",
+                "json",
+            ],
+            &[],
+        );
+        assert_eq!(resume.code, 1, "stdout={}", resume.stdout_text());
+        let error = resume.stdout_json();
+        assert_eq!(
+            error["error"]["details"]["reason"],
+            "runtime-identity-unavailable"
+        );
+        assert_eq!(error["error"]["details"]["retryable"], false);
+        assert_eq!(
+            error["error"]["details"]["action"],
+            "manual-runtime-verification-required"
+        );
+        let after_resume: Value =
+            serde_json::from_slice(&fs::read(&record_path).expect("record after resume")).unwrap();
+        assert_eq!(
+            after_resume, retained,
+            "resume must preserve pending evidence"
+        );
+    }
+}
+
+#[test]
+fn delete_rejects_malformed_or_mismatched_transition_markers() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let state_dir = tmp.path().join("state");
+    let tmux_bin = tmp.path().join("tmux-stopped-invalid-transition");
+    write_executable(
+        &tmux_bin,
+        r#"#!/usr/bin/env sh
+case "$1" in
+  display-message|has-session)
+    printf "%s\n" "can't find session: $89" >&2
+    exit 1 ;;
+  *) exit 42 ;;
+esac
+"#,
+    );
+
+    for case_name in ["malformed", "mismatched"] {
+        let id = format!("delete-transition-{case_name}");
+        let tmux_session = format!("hs-claude-delete-transition-{case_name}");
+        let session_dir = write_session_record(&state_dir, &id, "claude", &tmux_session);
+        let runtime_files = attach_provider_runtime(
+            tmp.path(),
+            &state_dir,
+            &session_dir,
+            &id,
+            "claude",
+            &tmux_session,
+        );
+        let record_path = session_dir.join("session.json");
+        let launch_id = seed_delete_tmux_identity(&record_path, "$89", "%89", 99_999_989);
+        let mut record: Value =
+            serde_json::from_slice(&fs::read(&record_path).expect("session record")).unwrap();
+        record["delete_tmux_termination_state"] = match case_name {
+            "malformed" => json!({"launch_id": launch_id, "state": "unknown"}),
+            "mismatched" => {
+                json!({"launch_id": "other-launch", "state": "kill-confirmed"})
+            }
+            _ => unreachable!(),
+        };
+        fs::write(&record_path, serde_json::to_vec_pretty(&record).unwrap()).unwrap();
+        let before = fs::read(&record_path).unwrap();
+
+        let delete = run(
+            tmp.path(),
+            &[
+                "--state-dir",
+                &state_dir.to_string_lossy(),
+                "delete",
+                &id,
+                "--tmux-bin",
+                &tmux_bin.to_string_lossy(),
+                "--format",
+                "json",
+            ],
+            &[],
+        );
+
+        assert_eq!(delete.code, 1, "stdout={}", delete.stdout_text());
+        let error = delete.stdout_json();
+        assert_eq!(
+            error["error"]["details"]["reason"],
+            "runtime-identity-unavailable"
+        );
+        assert_eq!(error["error"]["details"]["retryable"], false);
+        assert_eq!(fs::read(&record_path).unwrap(), before);
+        assert!(session_dir.exists());
+        assert!(runtime_files.iter().all(|path| path.exists()));
+    }
+}
+
+#[test]
+fn delete_exhausts_bounded_identity_churn_without_losing_current_runtime() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let state_dir = tmp.path().join("state");
+    let tmux_bin = tmp.path().join("tmux-repeated-identity-churn");
+    let tmux_log = tmp.path().join("tmux-repeated-identity-churn.log");
+    let tmux_generation = tmp.path().join("tmux-repeated-identity-churn.generation");
+    let id = "repeated-identity-churn";
+    let tmux_session = "hs-codex-repeated-identity-churn";
+    let session_dir = write_session_record(&state_dir, id, "codex", tmux_session);
+    attach_provider_runtime(
+        tmp.path(),
+        &state_dir,
+        &session_dir,
+        id,
+        "codex",
+        tmux_session,
+    );
+    let record_path = session_dir.join("session.json");
+    let panes = [
+        spawn_test_process_group(),
+        spawn_test_process_group(),
+        spawn_test_process_group(),
+        spawn_test_process_group(),
+    ];
+    let launch_id = seed_delete_tmux_identity(&record_path, "$90", "%90", panes[0].pid());
+    fs::write(&tmux_generation, b"0").unwrap();
+    write_executable(
+        &tmux_bin,
+        &format!(
+            r#"#!/usr/bin/env sh
+printf '%s\n' "$*" >> {tmux_log}
+generation=$(cat {tmux_generation})
+case "$generation" in
+  0) pane_pid={pane_0} ;;
+  1) pane_pid={pane_1} ;;
+  2) pane_pid={pane_2} ;;
+  *) pane_pid={pane_3} ;;
+esac
+case "$1" in
+  display-message) printf '$90\t%%90\t%s\n' "$pane_pid" ;;
+  show-environment)
+    case "$4" in
+      AGENT_SESSION_ID) printf 'AGENT_SESSION_ID=%s\n' {id} ;;
+      AGENT_SESSION_STATE_DIR) printf 'AGENT_SESSION_STATE_DIR=%s\n' {state_dir} ;;
+      AGENT_SESSION_RUNTIME_ID) printf 'AGENT_SESSION_RUNTIME_ID=%s\n' {launch_id} ;;
+    esac ;;
+  if-shell)
+    /bin/kill -TERM -- "-$pane_pid" 2>/dev/null || true
+    printf '%s\n' "$((generation + 1))" > {tmux_generation}
+    printf 'agent-session-runtime-identity-changed\n' ;;
+  has-session) exit 0 ;;
+  *) exit 42 ;;
+esac
+exit 0
+"#,
+            tmux_log = shell_words::quote(&tmux_log.to_string_lossy()),
+            tmux_generation = shell_words::quote(&tmux_generation.to_string_lossy()),
+            pane_0 = panes[0].pid(),
+            pane_1 = panes[1].pid(),
+            pane_2 = panes[2].pid(),
+            pane_3 = panes[3].pid(),
+            id = shell_words::quote(id),
+            state_dir = shell_words::quote(&state_dir.to_string_lossy()),
+            launch_id = shell_words::quote(&launch_id),
+        ),
+    );
+
+    let delete = run(
+        tmp.path(),
+        &[
+            "--state-dir",
+            &state_dir.to_string_lossy(),
+            "delete",
+            id,
+            "--tmux-bin",
+            &tmux_bin.to_string_lossy(),
+            "--format",
+            "json",
+        ],
+        &[],
+    );
+
+    assert_eq!(delete.code, 1, "stdout={}", delete.stdout_text());
+    let error = delete.stdout_json();
+    assert_eq!(
+        error["error"]["details"]["reason"],
+        "runtime-identity-changed"
+    );
+    assert_eq!(error["error"]["details"]["retryable"], true);
+    assert_eq!(error["error"]["details"]["action"], "retry-delete");
+    assert!(session_dir.exists());
+    assert!(
+        panes[3].is_running(),
+        "latest observed group must remain live"
+    );
+    let retained: Value =
+        serde_json::from_slice(&fs::read(&record_path).expect("retained record")).unwrap();
+    assert_eq!(retained["delete_tmux_identity"]["pane_pid"], panes[3].pid());
+    assert!(retained.get("delete_tmux_termination_state").is_none());
+    let calls = fs::read_to_string(&tmux_log).unwrap();
+    assert_eq!(calls.matches("if-shell -F -t %90").count(), 3, "{calls}");
+}
+
+#[test]
 fn delete_retains_state_while_the_exact_pane_process_group_survives() {
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let state_dir = tmp.path().join("state");
@@ -5398,6 +5711,30 @@ fn attach_provider_runtime(
     }
     fs::write(&record_path, serde_json::to_vec_pretty(&record).unwrap()).expect("session record");
     runtime_files
+}
+
+fn seed_delete_tmux_identity(
+    record_path: &Path,
+    session_id: &str,
+    pane_id: &str,
+    pane_pid: u32,
+) -> String {
+    let mut record: Value =
+        serde_json::from_slice(&fs::read(record_path).expect("session record")).unwrap();
+    let launch_id = record["runtime"]["launch_id"]
+        .as_str()
+        .expect("runtime launch id")
+        .to_string();
+    record["delete_tmux_identity"] = json!({
+        "launch_id": launch_id,
+        "session_id": session_id,
+        "pane_id": pane_id,
+        "pane_pid": pane_pid,
+        "process_group_id": pane_pid,
+    });
+    fs::write(record_path, serde_json::to_vec_pretty(&record).unwrap())
+        .expect("seed delete tmux identity");
+    launch_id
 }
 
 fn write_session_record_with_cwd(
