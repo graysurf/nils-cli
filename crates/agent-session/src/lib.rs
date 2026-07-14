@@ -3566,7 +3566,10 @@ pub(crate) fn canonicalize_structured_title_pair(
     let normalized_title = normalize_structured_compatibility_title(title)?;
     let state = normalize_title_state(title_state)?;
     let rendered = render_session_title_state(&state)?;
-    if title_supplied && normalized_title != rendered {
+    let supplied_title_matches = !title_supplied
+        || normalized_title == rendered
+        || normalized_title == render_v122_legacy_session_title_state(&state)?;
+    if !supplied_title_matches {
         return Err(CliError::usage(
             "title-state-mismatch",
             "session title must match the canonical title_state rendering",
@@ -3736,11 +3739,37 @@ fn title_contains_reference(title: &str, reference: &str) -> bool {
         title[index + reference.len()..]
             .chars()
             .next()
+            .is_none_or(|character| !character.is_ascii_alphanumeric() && character != '_')
+    })
+}
+
+fn v122_legacy_title_contains_reference(title: &str, reference: &str) -> bool {
+    title.match_indices(reference).any(|(index, _)| {
+        title[index + reference.len()..]
+            .chars()
+            .next()
             .is_none_or(|character| !character.is_ascii_digit())
     })
 }
 
 fn render_session_title_state(state: &SessionTitleState) -> Result<Option<String>, CliError> {
+    render_session_title_state_with_reference_matcher(state, title_contains_reference)
+}
+
+fn render_v122_legacy_session_title_state(
+    state: &SessionTitleState,
+) -> Result<Option<String>, CliError> {
+    // This compatibility output is a released v1.22.0 persistence contract.
+    // Its divergent reference-boundary cases are frozen by release-derived
+    // fixtures. A future renderer change must migrate stored pairs or retain
+    // those exact outputs before this transition path can be changed or removed.
+    render_session_title_state_with_reference_matcher(state, v122_legacy_title_contains_reference)
+}
+
+fn render_session_title_state_with_reference_matcher(
+    state: &SessionTitleState,
+    contains_reference: fn(&str, &str) -> bool,
+) -> Result<Option<String>, CliError> {
     let state = normalize_title_state(state.clone())?;
     let max_anchor_chars = if state.activity.is_some() {
         SESSION_TITLE_MAX_CHARS
@@ -3760,7 +3789,7 @@ fn render_session_title_state(state: &SessionTitleState) -> Result<Option<String
                 .filter(|reference| {
                     visible_topic
                         .as_deref()
-                        .is_none_or(|value| !title_contains_reference(value, reference))
+                        .is_none_or(|value| !contains_reference(value, reference))
                 })
                 .cloned()
                 .collect::<Vec<_>>()
@@ -3816,9 +3845,12 @@ fn render_session_title_state(state: &SessionTitleState) -> Result<Option<String
 
 fn effective_session_title_state(record: &SessionRecord) -> Option<SessionTitleStateView> {
     let state = record.title_state.as_ref()?;
-    match render_session_title_state(state) {
-        Ok(rendered) if rendered == record.title => Some(SessionTitleStateView::from(state)),
-        _ => None,
+    let rendered = render_session_title_state(state).ok()?;
+    let legacy_rendered = render_v122_legacy_session_title_state(state).ok()?;
+    if rendered == record.title || legacy_rendered == record.title {
+        Some(SessionTitleStateView::from(state))
+    } else {
+        None
     }
 }
 
@@ -6823,6 +6855,117 @@ mod tests {
         .unwrap();
 
         assert!(title.contains("#317 - Implement contract"));
+    }
+
+    #[test]
+    fn structured_title_renderer_requires_reference_token_boundary() {
+        let render = |topic: &str| {
+            super::render_session_title_state(&super::SessionTitleState {
+                topic: Some(topic.to_string()),
+                topic_source: super::SessionTitleTopicSource::Auto,
+                references: vec!["#317".to_string()],
+                activity: Some("Implement fix".to_string()),
+                extra: std::collections::BTreeMap::new(),
+            })
+            .unwrap()
+            .unwrap()
+        };
+
+        assert_eq!(
+            render("Parser #317alpha"),
+            "Parser #317alpha #317 - Implement fix"
+        );
+        assert_eq!(
+            render("Parser #317_foo"),
+            "Parser #317_foo #317 - Implement fix"
+        );
+        assert_eq!(render("Parser #317"), "Parser #317 - Implement fix");
+    }
+
+    #[test]
+    fn structured_title_boundary_accepts_v122_legacy_pairs_during_transition() {
+        let state = super::SessionTitleState {
+            topic: Some("Parser #317alpha".to_string()),
+            topic_source: super::SessionTitleTopicSource::Auto,
+            references: vec!["#317".to_string()],
+            activity: Some("Implement fix".to_string()),
+            extra: std::collections::BTreeMap::new(),
+        };
+        let legacy_title = "Parser #317alpha - Implement fix";
+        let canonical_title = "Parser #317alpha #317 - Implement fix";
+
+        let (title, _) = super::canonicalize_structured_title_pair(
+            Some(legacy_title.to_string()),
+            true,
+            state.clone(),
+        )
+        .expect("v1.22.0 clients remain compatible during the transition");
+        assert_eq!(title.as_deref(), Some(canonical_title));
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let context = test_context(tmp.path());
+        let created = create_record(RecordRequest {
+            context: &context,
+            agent: AgentKind::Codex,
+            mode: "interactive",
+            title: Some(canonical_title),
+            title_state: Some(state),
+            explicit_id: Some("v122-compatible-title-boundary"),
+            cwd: Path::new("/repo"),
+            prompt: None,
+            log_file_name: None,
+            provider_resume: None,
+            agent_args: Vec::new(),
+            agent_bin: None,
+        })
+        .unwrap();
+        drop(created);
+
+        let record_path =
+            super::session_dir(&context, "v122-compatible-title-boundary").join("session.json");
+        let mut raw: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&record_path).unwrap()).unwrap();
+        raw["title"] = serde_json::json!(legacy_title);
+        fs::write(&record_path, serde_json::to_vec_pretty(&raw).unwrap()).unwrap();
+
+        let record =
+            super::load_session_record(&context, "v122-compatible-title-boundary").unwrap();
+        assert!(super::effective_session_title_state(&record).is_some());
+    }
+
+    #[test]
+    fn structured_title_v122_compatibility_outputs_match_release_fixtures() {
+        let render = |topic: &str, references: &[&str]| {
+            super::render_v122_legacy_session_title_state(&super::SessionTitleState {
+                topic: Some(topic.to_string()),
+                topic_source: super::SessionTitleTopicSource::Auto,
+                references: references
+                    .iter()
+                    .map(|reference| (*reference).to_string())
+                    .collect(),
+                activity: Some("Implement fix".to_string()),
+                extra: std::collections::BTreeMap::new(),
+            })
+            .unwrap()
+            .unwrap()
+        };
+
+        assert_eq!(
+            render("Parser #317alpha", &["#317"]),
+            "Parser #317alpha - Implement fix"
+        );
+        assert_eq!(
+            render("Parser #317_foo", &["#317"]),
+            "Parser #317_foo - Implement fix"
+        );
+        assert_eq!(
+            render("Parser #317alpha", &["#317", "#42"]),
+            "Parser #317alpha #42 - Implement fix"
+        );
+        assert_eq!(
+            render("Parser #317", &["#317"]),
+            "Parser #317 - Implement fix"
+        );
     }
 
     #[test]
