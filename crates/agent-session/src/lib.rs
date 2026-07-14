@@ -8532,15 +8532,14 @@ fn tail_lines(text: &str, tail: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    #[cfg(target_os = "linux")]
-    use super::TmuxProcessIdentity;
     use super::{
-        AgentKind, CliContext, DeleteResult, RecordRequest, TmuxRuntimeIdentity,
-        acquire_session_record_lock, acquire_session_record_lock_timed, create_record,
-        delete_session_with_timeouts, kill_tmux_session_with_timeout, live_status_with_timeout,
-        load_session_record, persist_tmux_runtime_identity, render_delete_text, resolve_session_id,
-        session_dir, strip_trailing_blank_lines, tmux_launch_may_have_created_runtime,
-        try_acquire_session_record_lock, write_session_record,
+        AgentKind, CliContext, DeleteResult, RecordRequest, TmuxProcessIdentity,
+        TmuxRuntimeIdentity, acquire_session_record_lock, acquire_session_record_lock_timed,
+        create_record, delete_session_with_timeouts, kill_tmux_session_with_timeout,
+        live_status_with_timeout, load_session_record, persist_tmux_runtime_identity,
+        render_delete_text, resolve_session_id, session_dir, strip_trailing_blank_lines,
+        tmux_launch_may_have_created_runtime, try_acquire_session_record_lock,
+        write_session_record,
     };
     use pretty_assertions::assert_eq;
     #[cfg(target_os = "linux")]
