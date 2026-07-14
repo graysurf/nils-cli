@@ -92,6 +92,7 @@ const PROVIDER_PROMPT_PENDING_TIMEOUT: Duration = Duration::from_secs(2 * 60);
 const STRUCTURED_PROMPT_CONTROL_WAIT: Duration = Duration::from_secs(3);
 const STRUCTURED_PROMPT_CONTROL_POLL: Duration = Duration::from_millis(50);
 const CODEX_ACCOUNT_BINDING_WAIT: Duration = Duration::from_secs(30);
+const CODEX_CREATE_PROMPT_CONTROL_WAIT: Duration = CODEX_ACCOUNT_BINDING_WAIT;
 const PROVIDER_PROMPT_DISCOVERY_MAX_BACKOFF: Duration = Duration::from_secs(30);
 const PROVIDER_PROMPT_DISCOVERY_MAX_ENTRIES: usize = 64;
 const PROVIDER_PROMPT_DISCOVERY_MAX_CONCURRENT_SCANS: usize = 4;
@@ -2356,8 +2357,13 @@ async fn create_handler(
                 };
                 view.result.codex_account = binding;
                 if let Some(prompt) = deferred_prompt {
-                    let Some(handle) =
-                        wait_for_codex_control(&state, &view.result.id, &launch_id).await
+                    let Some(handle) = wait_for_codex_control_within(
+                        &state,
+                        &view.result.id,
+                        &launch_id,
+                        CODEX_CREATE_PROMPT_CONTROL_WAIT,
+                    )
+                    .await
                     else {
                         return status_json(
                             StatusCode::CONFLICT,
@@ -2391,7 +2397,16 @@ async fn wait_for_codex_control(
     id: &str,
     launch_id: &str,
 ) -> Option<ControlHandle> {
-    let deadline = Instant::now() + STRUCTURED_PROMPT_CONTROL_WAIT;
+    wait_for_codex_control_within(state, id, launch_id, STRUCTURED_PROMPT_CONTROL_WAIT).await
+}
+
+async fn wait_for_codex_control_within(
+    state: &ServeState,
+    id: &str,
+    launch_id: &str,
+    timeout: Duration,
+) -> Option<ControlHandle> {
+    let deadline = Instant::now() + timeout;
     loop {
         let handle = state.codex_controls.lock().ok().and_then(|controls| {
             controls
@@ -10089,6 +10104,42 @@ mod tests {
         assert_eq!(body["data"]["submitted"], true);
         assert!(body.pointer("/data/turn_id").is_none());
         responder.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn codex_create_prompt_control_wait_honors_startup_budget() {
+        assert!(CODEX_CREATE_PROMPT_CONTROL_WAIT > STRUCTURED_PROMPT_CONTROL_WAIT);
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let st = state(tmp.path(), Some(TOKEN), minimal_tmux(tmp.path()));
+        let launch_id = "delayed-create-control".to_string();
+        let delayed_state = st.clone();
+        let delayed_launch_id = launch_id.clone();
+        let registration = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(75)).await;
+            let (handle, _commands) = codex_app_server::control_channel();
+            delayed_state.codex_controls.lock().unwrap().insert(
+                "delayed-create".to_string(),
+                CodexControlEntry {
+                    launch_id: delayed_launch_id,
+                    handle,
+                },
+            );
+        });
+
+        let handle = wait_for_codex_control_within(
+            &st,
+            "delayed-create",
+            &launch_id,
+            Duration::from_millis(250),
+        )
+        .await;
+
+        registration.await.unwrap();
+        assert!(
+            handle.is_some(),
+            "control registered within the startup budget"
+        );
     }
 
     #[tokio::test]
