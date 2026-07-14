@@ -1223,4 +1223,119 @@ esac
             ]
         );
     }
+
+    #[test]
+    fn broker_failure_contracts_are_bounded_and_fail_closed() {
+        let lock = GlobalStateLock::new();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let script = tmp.path().join("failing-broker");
+        fs::write(
+            &script,
+            r#"#!/bin/sh
+mode=$1
+shift
+case "$mode" in
+  malformed)
+    printf '{'
+    ;;
+  future-list)
+    printf '%s\n' '{"schema_version":"agent-session.codex-auth-broker.v2","accounts":[]}'
+    ;;
+  mismatch-resolve)
+    printf '%s\n' '{"schema_version":"agent-session.codex-auth-broker.v1","account":"poies","access_token":"fixture-token","chatgpt_account_id":"workspace-fixture"}'
+    ;;
+  oversized)
+    dd if=/dev/zero bs=1048577 count=1 2>/dev/null | tr '\000' x
+    ;;
+  rejected)
+    printf '%s\n' 'private broker failure' >&2
+    exit 7
+    ;;
+  *) exit 2 ;;
+esac
+"#,
+        )
+        .unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).unwrap();
+
+        let cases = [
+            ("malformed", "codex-account-broker-invalid-response"),
+            ("oversized", "codex-account-broker-invalid-response"),
+            ("rejected", "codex-account-broker-rejected"),
+        ];
+        for (mode, expected_code) in cases {
+            let argv = serde_json::to_string(&vec![
+                script.to_string_lossy().into_owned(),
+                mode.to_string(),
+            ])
+            .unwrap();
+            let broker = EnvGuard::set(&lock, BROKER_ENV, &argv);
+            let error = run_broker(&["list"], Duration::from_secs(2)).unwrap_err();
+            assert_eq!(error.code(), expected_code, "mode={mode}");
+            drop(broker);
+        }
+
+        let future_argv = serde_json::to_string(&vec![
+            script.to_string_lossy().into_owned(),
+            "future-list".to_string(),
+        ])
+        .unwrap();
+        let broker = EnvGuard::set(&lock, BROKER_ENV, &future_argv);
+        assert_eq!(
+            list_accounts().unwrap_err().code(),
+            "codex-account-broker-invalid-response"
+        );
+        drop(broker);
+
+        let mismatch_argv = serde_json::to_string(&vec![
+            script.to_string_lossy().into_owned(),
+            "mismatch-resolve".to_string(),
+        ])
+        .unwrap();
+        let _broker = EnvGuard::set(&lock, BROKER_ENV, &mismatch_argv);
+        let error = match resolve_account("gamania", false) {
+            Ok(_) => panic!("mismatched broker account must be rejected"),
+            Err(error) => error,
+        };
+        assert_eq!(error.code(), "codex-account-broker-invalid-response");
+    }
+
+    #[test]
+    fn broker_timeout_terminates_its_process_group() {
+        let lock = GlobalStateLock::new();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let script = tmp.path().join("hanging-broker");
+        let child_pid_file = tmp.path().join("child-pid");
+        fs::write(
+            &script,
+            r#"#!/bin/sh
+child_pid_file=$1
+sleep 60 &
+child=$!
+printf '%s\n' "$child" > "$child_pid_file"
+wait "$child"
+"#,
+        )
+        .unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).unwrap();
+        let argv = serde_json::to_string(&vec![
+            script.to_string_lossy().into_owned(),
+            child_pid_file.to_string_lossy().into_owned(),
+        ])
+        .unwrap();
+        let _broker = EnvGuard::set(&lock, BROKER_ENV, &argv);
+
+        let error = run_broker(&["list"], Duration::from_millis(100)).unwrap_err();
+        assert_eq!(error.code(), "codex-account-broker-timeout");
+        let child_pid: i32 = fs::read_to_string(child_pid_file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while unsafe { libc::kill(child_pid, 0) } == 0 && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(unsafe { libc::kill(child_pid, 0) }, -1);
+    }
 }
