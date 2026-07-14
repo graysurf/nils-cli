@@ -52,7 +52,7 @@ const MAX_PROXY_FRAME_BYTES: usize = 4 * 1024 * 1024;
 const CONTROL_RESPONSE_TIMEOUT: Duration = Duration::from_secs(10);
 const CONTROL_SUBMISSION_TIMEOUT: Duration = Duration::from_secs(15);
 const CONTROL_SUBMIT_TOTAL_TIMEOUT: Duration = Duration::from_secs(30);
-const MINIMUM_AUDITED_CODEX_VERSION: (u64, u64, u64) = (0, 144, 1);
+const AUDITED_CODEX_VERSION: (u64, u64, u64) = (0, 144, 1);
 const APP_SERVER_CAPABILITY_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 const APP_SERVER_CAPABILITY_PROBE_MAX_OUTPUT_BYTES: u64 = 64 * 1024;
 const MANUAL_INPUT_SECTION_FILE: &str = ".codex-app-server-manual-input";
@@ -72,14 +72,18 @@ pub(crate) fn configure_runtime(
     record: &mut SessionRecord,
     managed: bool,
 ) -> Result<(), CliError> {
-    if !managed || record.agent != "codex" {
+    if record.agent != "codex" {
+        return Ok(());
+    }
+    let binding_required = crate::codex_account::binding_is_present(record);
+    if !managed && !binding_required {
         return Ok(());
     }
     let preference = env::var("AGENT_SESSION_CODEX_RUNTIME").unwrap_or_else(|_| "auto".into());
-    if !matches!(preference.as_str(), "auto" | "app-server") {
+    if !matches!(preference.as_str(), "auto" | "app-server") && !binding_required {
         return Ok(());
     }
-    let forced = preference == "app-server";
+    let forced = preference == "app-server" || binding_required;
     if !app_server_capability_available(agent_bin) {
         if forced {
             return Err(CliError::data(
@@ -129,9 +133,7 @@ fn app_server_capability_available(agent_bin: &Path) -> bool {
         return false;
     };
     let version_text = String::from_utf8_lossy(&version.stdout);
-    if parse_version_triplet(&version_text)
-        .is_none_or(|version| version < MINIMUM_AUDITED_CODEX_VERSION)
-    {
+    if parse_version_triplet(&version_text) != Some(AUDITED_CODEX_VERSION) {
         return false;
     }
     let Some(output) = bounded_command_output(agent_bin, &["app-server", "--help"]) else {
@@ -231,14 +233,22 @@ fn terminate_probe_process_group(child: &mut std::process::Child) {
 }
 
 fn parse_version_triplet(raw: &str) -> Option<(u64, u64, u64)> {
-    raw.split_whitespace().find_map(|token| {
-        let token = token.trim_matches(|ch: char| !ch.is_ascii_digit() && ch != '.');
-        let mut parts = token.split('.');
-        let major = parts.next()?.parse().ok()?;
-        let minor = parts.next()?.parse().ok()?;
-        let patch = parts.next()?.parse().ok()?;
-        Some((major, minor, patch))
-    })
+    let mut fields = raw.split_whitespace();
+    if fields.next()? != "codex-cli" {
+        return None;
+    }
+    let token = fields.next()?;
+    if fields.next().is_some() {
+        return None;
+    }
+    let mut parts = token.split('.');
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts.next()?.parse().ok()?;
+    let patch = parts.next()?.parse().ok()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    Some((major, minor, patch))
 }
 
 fn runtime_namespace(context: &CliContext, record: &SessionRecord) -> Result<String, CliError> {
@@ -781,6 +791,7 @@ pub(crate) fn ensure_manual_input_capability(
     context: &CliContext,
     record: &SessionRecord,
 ) -> Result<(), CliError> {
+    crate::codex_account::ensure_input_allowed(record)?;
     if !runtime_is_supported(record) {
         return Ok(());
     }
@@ -1161,8 +1172,13 @@ std::thread_local! {
 }
 
 #[cfg(test)]
-static NORMAL_CANCELLATION_ATTEMPTS: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
+fn normal_cancellation_attempts()
+-> &'static std::sync::Mutex<std::collections::HashMap<String, usize>> {
+    static ATTEMPTS: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<String, usize>>,
+    > = std::sync::OnceLock::new();
+    ATTEMPTS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
 
 #[cfg(test)]
 static BOOTSTRAP_GATE_ATTEMPTS: std::sync::atomic::AtomicUsize =
@@ -1355,6 +1371,40 @@ pub(crate) fn rate_limits_request(id: u64) -> Value {
     json!({ "id": id, "method": "account/rateLimits/read" })
 }
 
+pub(crate) fn external_auth_login_request(
+    id: u64,
+    access_token: &str,
+    chatgpt_account_id: &str,
+    chatgpt_plan_type: Option<&str>,
+) -> Value {
+    json!({
+        "id": id,
+        "method": "account/login/start",
+        "params": {
+            "type": "chatgptAuthTokens",
+            "accessToken": access_token,
+            "chatgptAccountId": chatgpt_account_id,
+            "chatgptPlanType": chatgpt_plan_type
+        }
+    })
+}
+
+pub(crate) fn external_auth_refresh_response(
+    id: Value,
+    access_token: &str,
+    chatgpt_account_id: &str,
+    chatgpt_plan_type: Option<&str>,
+) -> Value {
+    json!({
+        "id": id,
+        "result": {
+            "accessToken": access_token,
+            "chatgptAccountId": chatgpt_account_id,
+            "chatgptPlanType": chatgpt_plan_type
+        }
+    })
+}
+
 pub(crate) fn continuation_request(id: u64, thread_id: &str, message: &str) -> Value {
     json!({
         "id": id,
@@ -1457,6 +1507,11 @@ pub(crate) enum ControlCommand {
         message: String,
         response: oneshot::Sender<Result<String, String>>,
     },
+    BindAccount {
+        account: String,
+        revision: u64,
+        response: oneshot::Sender<Result<crate::codex_account::CodexAccountView, String>>,
+    },
 }
 
 impl ControlHandle {
@@ -1510,11 +1565,182 @@ impl ControlHandle {
         .await
         .map_err(|_| "codex turn submission timed out".to_string())?
     }
+
+    pub(crate) async fn bind_account(
+        &self,
+        account: &str,
+        revision: u64,
+    ) -> Result<crate::codex_account::CodexAccountView, String> {
+        let (response, receive) = oneshot::channel();
+        tokio::time::timeout(CONTROL_SUBMIT_TOTAL_TIMEOUT, async {
+            self.sender
+                .send(ControlCommand::BindAccount {
+                    account: account.to_string(),
+                    revision,
+                    response,
+                })
+                .await
+                .map_err(|_| "codex control connection unavailable".to_string())?;
+            receive
+                .await
+                .map_err(|_| "codex control connection closed".to_string())?
+        })
+        .await
+        .map_err(|_| "Codex account binding timed out".to_string())?
+    }
 }
 
 pub(crate) fn control_channel() -> (ControlHandle, mpsc::Receiver<ControlCommand>) {
     let (sender, receive) = mpsc::channel(4);
     (ControlHandle { sender }, receive)
+}
+
+async fn apply_account_binding(
+    websocket: &mut tokio_tungstenite::WebSocketStream<UnixStream>,
+    context: &CliContext,
+    record: &SessionRecord,
+    request_id: &mut u64,
+    account: &str,
+    revision: u64,
+) -> Result<crate::codex_account::CodexAccountView, String> {
+    let launch_id = record
+        .runtime
+        .as_ref()
+        .map(|runtime| runtime.launch_id.clone())
+        .ok_or_else(|| "Codex runtime identity is missing".to_string())?;
+    let resolve_account = account.to_string();
+    let credentials = tokio::task::spawn_blocking(move || {
+        crate::codex_account::resolve_account(&resolve_account, false)
+    })
+    .await
+    .map_err(|_| "Codex account broker worker failed".to_string())?;
+    let credentials = match credentials {
+        Ok(credentials) => credentials,
+        Err(_) => {
+            let _ = finish_account_binding(
+                context,
+                record,
+                &launch_id,
+                account,
+                revision,
+                Err("broker_failed"),
+            )
+            .await;
+            return Err("Codex account broker failed".to_string());
+        }
+    };
+
+    *request_id = request_id.saturating_add(1);
+    if let Err(error) = send_json(
+        websocket,
+        external_auth_login_request(
+            *request_id,
+            &credentials.access_token,
+            &credentials.chatgpt_account_id,
+            credentials.chatgpt_plan_type.as_deref(),
+        ),
+    )
+    .await
+    {
+        let _ = finish_account_binding(
+            context,
+            record,
+            &launch_id,
+            account,
+            revision,
+            Err("apply_failed"),
+        )
+        .await;
+        return Err(error);
+    }
+    let result =
+        receive_response_with_timeout(websocket, *request_id, None, None, CONTROL_RESPONSE_TIMEOUT)
+            .await;
+    if !result
+        .as_ref()
+        .is_ok_and(|result| result.get("type").and_then(Value::as_str) == Some("chatgptAuthTokens"))
+    {
+        let _ = finish_account_binding(
+            context,
+            record,
+            &launch_id,
+            account,
+            revision,
+            Err("apply_failed"),
+        )
+        .await;
+        return Err(result
+            .err()
+            .unwrap_or_else(|| "Codex external-auth response was malformed".to_string()));
+    }
+    finish_account_binding(context, record, &launch_id, account, revision, Ok(())).await
+}
+
+async fn finish_account_binding(
+    context: &CliContext,
+    record: &SessionRecord,
+    launch_id: &str,
+    account: &str,
+    revision: u64,
+    result: Result<(), &'static str>,
+) -> Result<crate::codex_account::CodexAccountView, String> {
+    let finish_context = context.clone();
+    let finish_id = record.id.clone();
+    let finish_launch_id = launch_id.to_string();
+    let finish_account = account.to_string();
+    tokio::task::spawn_blocking(move || {
+        crate::codex_account::finish_binding(
+            &finish_context,
+            &finish_id,
+            &finish_launch_id,
+            &finish_account,
+            revision,
+            result,
+        )
+    })
+    .await
+    .map_err(|_| "Codex account binding worker failed".to_string())?
+    .map_err(|err| format!("Codex account binding persistence failed: {}", err.code()))
+}
+
+async fn control_account_ready(
+    context: &CliContext,
+    record: &SessionRecord,
+    external_auth_account: Option<&str>,
+) -> Result<(), String> {
+    let check_context = context.clone();
+    let id = record.id.clone();
+    let launch_id = record
+        .runtime
+        .as_ref()
+        .map(|runtime| runtime.launch_id.clone())
+        .ok_or_else(|| "Codex runtime identity is missing".to_string())?;
+    let selected = tokio::task::spawn_blocking(move || {
+        let current = crate::load_session_record(&check_context, &id)?;
+        if current
+            .runtime
+            .as_ref()
+            .is_none_or(|runtime| runtime.launch_id != launch_id)
+        {
+            return Err(CliError::runtime(
+                "codex-account-runtime-changed",
+                "Codex session runtime changed while checking its account binding",
+                Some(json!({ "id": current.id })),
+            ));
+        }
+        crate::codex_account::ensure_input_allowed(&current)?;
+        Ok::<_, CliError>(crate::codex_account::selected_account(&current))
+    })
+    .await
+    .map_err(|_| "Codex account binding worker failed".to_string())?
+    .map_err(|err| format!("Codex account binding is not ready: {}", err.code()))?;
+    if selected.as_deref() == external_auth_account
+        || (selected.is_none() && external_auth_account.is_none())
+    {
+        Ok(())
+    } else {
+        Err("Codex account binding is not ready".to_string())
+    }
 }
 
 pub(crate) async fn run_control(
@@ -1536,10 +1762,89 @@ pub(crate) async fn run_control(
 
     let mut request_id = 1_u64;
     send_json(&mut websocket, initialize_request(request_id)).await?;
-    receive_response_with_timeout(&mut websocket, request_id, None, CONTROL_RESPONSE_TIMEOUT)
-        .await
-        .map_err(|err| format!("initialize failed: {err}"))?;
+    receive_response_with_timeout(
+        &mut websocket,
+        request_id,
+        None,
+        None,
+        CONTROL_RESPONSE_TIMEOUT,
+    )
+    .await
+    .map_err(|err| format!("initialize failed: {err}"))?;
     send_json(&mut websocket, initialized_notification()).await?;
+    let mut external_auth_account = None;
+    if let Some((account, revision)) = crate::codex_account::account_for_control_rebind(&record)
+        .map_err(|err| format!("Codex account binding is invalid: {}", err.code()))?
+    {
+        match apply_account_binding(
+            &mut websocket,
+            &context,
+            &record,
+            &mut request_id,
+            &account,
+            revision,
+        )
+        .await
+        {
+            Ok(_) => external_auth_account = Some(account),
+            Err(error) => eprintln!("warning: Codex account binding failed: {error}"),
+        }
+    }
+    if crate::codex_account::binding_is_present(&record) && external_auth_account.is_none() {
+        loop {
+            let command = tokio::select! {
+                command = commands.recv() => command,
+                message = websocket.next() => {
+                    let value = decode_message(message).await?;
+                    if respond_to_external_auth_refresh(&mut websocket, &value, None).await? {
+                        continue;
+                    }
+                    continue;
+                }
+            };
+            let Some(command) = command else {
+                return Ok(());
+            };
+            match command {
+                ControlCommand::BindAccount {
+                    account,
+                    revision,
+                    response,
+                } => {
+                    let result = apply_account_binding(
+                        &mut websocket,
+                        &context,
+                        &record,
+                        &mut request_id,
+                        &account,
+                        revision,
+                    )
+                    .await;
+                    match result {
+                        Ok(view) => {
+                            external_auth_account = Some(account);
+                            let _ = response.send(Ok(view));
+                            break;
+                        }
+                        Err(error) => {
+                            let _ = response.send(Err(error));
+                        }
+                    }
+                }
+                ControlCommand::Usage(response) => {
+                    let _ = response.send(Err(
+                        "Codex account binding is not ready; retry the account switch".to_string(),
+                    ));
+                }
+                ControlCommand::Prompt { response, .. }
+                | ControlCommand::Continue { response, .. } => {
+                    let _ = response.send(Err(
+                        "Codex account binding is not ready; retry the account switch".to_string(),
+                    ));
+                }
+            }
+        }
+    }
 
     let mut discovery_attempts = 0_u8;
     let thread_id = loop {
@@ -1549,6 +1854,9 @@ pub(crate) async fn run_control(
             &mut websocket,
             request_id,
             None,
+            external_auth_account
+                .as_deref()
+                .map(|account| (&context, &record, account)),
             CONTROL_RESPONSE_TIMEOUT,
         )
         .await
@@ -1579,6 +1887,9 @@ pub(crate) async fn run_control(
             &mut websocket,
             request_id,
             None,
+            external_auth_account
+                .as_deref()
+                .map(|account| (&context, &record, account)),
             CONTROL_RESPONSE_TIMEOUT,
         )
         .await
@@ -1594,17 +1905,25 @@ pub(crate) async fn run_control(
     // account ahead of the reset epoch captured in durable state. Re-read the
     // exact bound account once so that an existing scheduled claim becomes due
     // without waiting for a notification that happened while disconnected.
-    request_id = request_id.saturating_add(1);
-    send_json(&mut websocket, rate_limits_request(request_id)).await?;
-    let initial_usage = receive_response_with_timeout(
-        &mut websocket,
-        request_id,
-        Some((&context, &record, &mut reducer)),
-        CONTROL_RESPONSE_TIMEOUT,
-    )
-    .await
-    .map(|value| usage_snapshot(&value))?;
-    wake_from_open_usage(&context, &record, &initial_usage).await?;
+    if control_account_ready(&context, &record, external_auth_account.as_deref())
+        .await
+        .is_ok()
+    {
+        request_id = request_id.saturating_add(1);
+        send_json(&mut websocket, rate_limits_request(request_id)).await?;
+        let initial_usage = receive_response_with_timeout(
+            &mut websocket,
+            request_id,
+            Some((&context, &record, &mut reducer)),
+            external_auth_account
+                .as_deref()
+                .map(|account| (&context, &record, account)),
+            CONTROL_RESPONSE_TIMEOUT,
+        )
+        .await
+        .map(|value| usage_snapshot(&value))?;
+        wake_from_open_usage(&context, &record, &initial_usage).await?;
+    }
 
     loop {
         tokio::select! {
@@ -1612,6 +1931,16 @@ pub(crate) async fn run_control(
                 let Some(command) = command else { return Ok(()); };
                 match command {
                     ControlCommand::Usage(response) => {
+                        if let Err(error) = control_account_ready(
+                            &context,
+                            &record,
+                            external_auth_account.as_deref(),
+                        )
+                        .await
+                        {
+                            let _ = response.send(Err(error));
+                            continue;
+                        }
                         request_id = request_id.saturating_add(1);
                         if let Err(err) = send_json(&mut websocket, rate_limits_request(request_id)).await {
                             let _ = response.send(Err(err));
@@ -1621,11 +1950,24 @@ pub(crate) async fn run_control(
                             &mut websocket,
                             request_id,
                             Some((&context, &record, &mut reducer)),
+                            external_auth_account
+                                .as_deref()
+                                .map(|account| (&context, &record, account)),
                             CONTROL_RESPONSE_TIMEOUT,
                         ).await;
                         let _ = response.send(result.map(|value| usage_snapshot(&value)));
                     }
                     ControlCommand::Prompt { message, response } => {
+                        if let Err(error) = control_account_ready(
+                            &context,
+                            &record,
+                            external_auth_account.as_deref(),
+                        )
+                        .await
+                        {
+                            let _ = response.send(Err(error));
+                            continue;
+                        }
                         request_id = request_id.saturating_add(1);
                         if let Err(err) = send_json(
                             &mut websocket,
@@ -1638,6 +1980,9 @@ pub(crate) async fn run_control(
                             &mut websocket,
                             request_id,
                             Some((&context, &record, &mut reducer)),
+                            external_auth_account
+                                .as_deref()
+                                .map(|account| (&context, &record, account)),
                             CONTROL_SUBMISSION_TIMEOUT,
                         ).await.and_then(|value| {
                             value.pointer("/turn/id")
@@ -1648,6 +1993,16 @@ pub(crate) async fn run_control(
                         let _ = response.send(result);
                     }
                     ControlCommand::Continue { message, response } => {
+                        if let Err(error) = control_account_ready(
+                            &context,
+                            &record,
+                            external_auth_account.as_deref(),
+                        )
+                        .await
+                        {
+                            let _ = response.send(Err(error));
+                            continue;
+                        }
                         if !thread_resumed {
                             request_id = request_id.saturating_add(1);
                             if let Err(err) = send_json(
@@ -1661,6 +2016,9 @@ pub(crate) async fn run_control(
                                 &mut websocket,
                                 request_id,
                                 Some((&context, &record, &mut reducer)),
+                                external_auth_account
+                                    .as_deref()
+                                    .map(|account| (&context, &record, account)),
                                 CONTROL_RESPONSE_TIMEOUT,
                             ).await {
                                 let _ = response.send(Err(err));
@@ -1680,6 +2038,9 @@ pub(crate) async fn run_control(
                             &mut websocket,
                             request_id,
                             Some((&context, &record, &mut reducer)),
+                            external_auth_account
+                                .as_deref()
+                                .map(|account| (&context, &record, account)),
                             CONTROL_SUBMISSION_TIMEOUT,
                         ).await.and_then(|value| {
                             value.pointer("/turn/id")
@@ -1689,10 +2050,37 @@ pub(crate) async fn run_control(
                         });
                         let _ = response.send(result);
                     }
+                    ControlCommand::BindAccount { account, revision, response } => {
+                        external_auth_account = None;
+                        let result = apply_account_binding(
+                            &mut websocket,
+                            &context,
+                            &record,
+                            &mut request_id,
+                            &account,
+                            revision,
+                        )
+                        .await;
+                        if result.is_ok() {
+                            external_auth_account = Some(account);
+                        }
+                        let _ = response.send(result);
+                    }
                 }
             }
             message = websocket.next() => {
                 let value = decode_message(message).await?;
+                if respond_to_external_auth_refresh(
+                    &mut websocket,
+                    &value,
+                    external_auth_account
+                        .as_deref()
+                        .map(|account| (&context, &record, account)),
+                )
+                .await?
+                {
+                    continue;
+                }
                 process_live_message(&context, &record, &mut reducer, &value).await?;
             }
         }
@@ -2466,11 +2854,37 @@ async fn cancel_before_tui_mutation(
     value: &Value,
 ) -> Option<MutationAuthorization> {
     let method = value.get("method").and_then(Value::as_str);
+    if (crate::codex_account::binding_is_present(record)
+        || crate::codex_account::view_for_record(record).supported)
+        && matches!(
+            method,
+            Some("account/login/start" | "account/login/cancel" | "account/logout")
+        )
+    {
+        bootstrap.close();
+        return None;
+    }
     if !matches!(method, Some("thread/start" | "turn/start")) {
         return Some(MutationAuthorization {
             _bootstrap_gate: None,
             _manual_input_gate: None,
         });
+    }
+    if method == Some("turn/start") {
+        let account_context = context.clone();
+        let account_id = record.id.clone();
+        let allowed = tokio::task::spawn_blocking(move || {
+            let current = crate::load_session_record(&account_context, &account_id)?;
+            crate::codex_account::ensure_input_allowed(&current)
+        })
+        .await
+        .ok()
+        .and_then(Result::ok)
+        .is_some();
+        if !allowed {
+            bootstrap.close();
+            return None;
+        }
     }
     // A fresh Codex TUI emits `thread/start`, then the initial prompt emits
     // `turn/start`, while the parent create path still owns the lifecycle lock.
@@ -2480,7 +2894,12 @@ async fn cancel_before_tui_mutation(
     // still fail closed. The first turn is authorized only by a successful
     // matching thread/start response and must target the returned thread id.
     #[cfg(test)]
-    NORMAL_CANCELLATION_ATTEMPTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    {
+        let mut attempts = normal_cancellation_attempts()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *attempts.entry(record.id.clone()).or_default() += 1;
+    }
     let bootstrap_gate = if matches!(bootstrap, FreshBootstrap::Closed) {
         None
     } else {
@@ -2738,26 +3157,38 @@ async fn receive_response_with_timeout<S>(
     websocket: &mut S,
     id: u64,
     live: Option<(&CliContext, &SessionRecord, &mut FailureReducer)>,
+    external_auth: Option<(&CliContext, &SessionRecord, &str)>,
     timeout: Duration,
 ) -> Result<Value, String>
 where
-    S: futures_util::Stream<Item = Result<Message, tokio_tungstenite::tungstenite::Error>> + Unpin,
+    S: futures_util::Stream<Item = Result<Message, tokio_tungstenite::tungstenite::Error>>
+        + futures_util::Sink<Message, Error = tokio_tungstenite::tungstenite::Error>
+        + Unpin,
 {
-    tokio::time::timeout(timeout, receive_response(websocket, id, live))
-        .await
-        .map_err(|_| "Codex app-server request timed out".to_string())?
+    tokio::time::timeout(
+        timeout,
+        receive_response(websocket, id, live, external_auth),
+    )
+    .await
+    .map_err(|_| "Codex app-server request timed out".to_string())?
 }
 
 async fn receive_response<S>(
     websocket: &mut S,
     id: u64,
     mut live: Option<(&CliContext, &SessionRecord, &mut FailureReducer)>,
+    external_auth: Option<(&CliContext, &SessionRecord, &str)>,
 ) -> Result<Value, String>
 where
-    S: futures_util::Stream<Item = Result<Message, tokio_tungstenite::tungstenite::Error>> + Unpin,
+    S: futures_util::Stream<Item = Result<Message, tokio_tungstenite::tungstenite::Error>>
+        + futures_util::Sink<Message, Error = tokio_tungstenite::tungstenite::Error>
+        + Unpin,
 {
     loop {
         let value = decode_message(websocket.next().await).await?;
+        if respond_to_external_auth_refresh(websocket, &value, external_auth).await? {
+            continue;
+        }
         if value.get("id").and_then(Value::as_u64) == Some(id) {
             if let Some(error) = value.get("error") {
                 let category = error
@@ -2782,6 +3213,142 @@ where
             process_live_message(context, record, reducer, &value).await?;
         }
     }
+}
+
+async fn respond_to_external_auth_refresh<S>(
+    websocket: &mut S,
+    value: &Value,
+    external_auth: Option<(&CliContext, &SessionRecord, &str)>,
+) -> Result<bool, String>
+where
+    S: futures_util::Sink<Message, Error = tokio_tungstenite::tungstenite::Error> + Unpin,
+{
+    if value.get("method").and_then(Value::as_str) != Some("account/chatgptAuthTokens/refresh") {
+        return Ok(false);
+    }
+    if value.pointer("/params/reason").and_then(Value::as_str) != Some("unauthorized") {
+        return Err("Codex requested an unsupported external-auth refresh".to_string());
+    }
+    let id = value
+        .get("id")
+        .filter(|id| json_id_key(id).is_some())
+        .cloned()
+        .ok_or_else(|| "Codex external-auth refresh request omitted a valid id".to_string())?;
+    let (context, record, account) = external_auth.ok_or_else(|| {
+        "Codex requested an external-auth refresh without a bound account".to_string()
+    })?;
+    let launch_id = record
+        .runtime
+        .as_ref()
+        .map(|runtime| runtime.launch_id.clone())
+        .ok_or_else(|| "Codex runtime identity is missing".to_string())?;
+    let begin_context = context.clone();
+    let begin_id = record.id.clone();
+    let begin_launch_id = launch_id.clone();
+    let begin_account = account.to_string();
+    let revision = tokio::task::spawn_blocking(move || {
+        crate::codex_account::begin_binding(
+            &begin_context,
+            &begin_id,
+            &begin_launch_id,
+            &begin_account,
+        )
+    })
+    .await
+    .map_err(|_| "Codex account refresh worker failed".to_string())?
+    .map_err(|err| format!("Codex account refresh rejected: {}", err.code()))?;
+    let refresh_account = account.to_string();
+    let credentials_result = tokio::task::spawn_blocking(move || {
+        crate::codex_account::resolve_account(&refresh_account, true)
+    })
+    .await
+    .map_err(|_| "Codex account refresh worker failed".to_string());
+    let credentials = match credentials_result {
+        Ok(Ok(credentials)) => credentials,
+        Ok(Err(err)) => {
+            let _ = finish_account_binding(
+                context,
+                record,
+                &launch_id,
+                account,
+                revision,
+                Err("refresh_failed"),
+            )
+            .await;
+            return Err(format!("Codex account refresh failed: {}", err.code()));
+        }
+        Err(error) => {
+            let _ = finish_account_binding(
+                context,
+                record,
+                &launch_id,
+                account,
+                revision,
+                Err("refresh_failed"),
+            )
+            .await;
+            return Err(error);
+        }
+    };
+    let fence_context = context.clone();
+    let fence_id = record.id.clone();
+    let fence_launch_id = launch_id.clone();
+    let fence_account = account.to_string();
+    let refresh_fence = tokio::task::spawn_blocking(move || {
+        let lock = crate::acquire_session_record_lock(&fence_context, &fence_id)?;
+        let current = crate::load_session_record(&fence_context, &fence_id)?;
+        if current
+            .runtime
+            .as_ref()
+            .is_none_or(|runtime| runtime.launch_id != fence_launch_id)
+        {
+            return Err(CliError::runtime(
+                "codex-account-refresh-superseded",
+                "Codex runtime changed during credential refresh",
+                Some(json!({ "id": current.id })),
+            ));
+        }
+        let view = crate::codex_account::view_for_record(&current);
+        if view.state != "pending"
+            || view.selected_account.as_deref() != Some(fence_account.as_str())
+            || view.revision != revision
+        {
+            return Err(CliError::runtime(
+                "codex-account-refresh-superseded",
+                "Codex account binding changed during credential refresh",
+                Some(json!({ "id": current.id })),
+            ));
+        }
+        Ok::<_, CliError>(lock)
+    })
+    .await
+    .map_err(|_| "Codex account refresh fence worker failed".to_string())?
+    .map_err(|err| format!("Codex account refresh rejected: {}", err.code()))?;
+    let send_result = send_json(
+        websocket,
+        external_auth_refresh_response(
+            id,
+            &credentials.access_token,
+            &credentials.chatgpt_account_id,
+            credentials.chatgpt_plan_type.as_deref(),
+        ),
+    )
+    .await;
+    drop(refresh_fence);
+    if let Err(error) = send_result {
+        let _ = finish_account_binding(
+            context,
+            record,
+            &launch_id,
+            account,
+            revision,
+            Err("refresh_failed"),
+        )
+        .await;
+        return Err(error);
+    }
+    finish_account_binding(context, record, &launch_id, account, revision, Ok(())).await?;
+    Ok(true)
 }
 
 fn protocol_error_category(message: &str) -> &'static str {
@@ -2906,10 +3473,52 @@ mod tests {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
+    #[test]
+    fn external_auth_login_request_matches_codex_0_144_1_contract() {
+        assert_eq!(
+            external_auth_login_request(
+                7,
+                "fixture-access-token",
+                "workspace-fixture",
+                Some("pro"),
+            ),
+            json!({
+                "id": 7,
+                "method": "account/login/start",
+                "params": {
+                    "type": "chatgptAuthTokens",
+                    "accessToken": "fixture-access-token",
+                    "chatgptAccountId": "workspace-fixture",
+                    "chatgptPlanType": "pro"
+                }
+            })
+        );
+    }
+
+    #[test]
+    fn external_auth_refresh_response_preserves_json_rpc_id() {
+        assert_eq!(
+            external_auth_refresh_response(
+                json!("refresh-request"),
+                "refreshed-fixture-token",
+                "workspace-refreshed",
+                None,
+            ),
+            json!({
+                "id": "refresh-request",
+                "result": {
+                    "accessToken": "refreshed-fixture-token",
+                    "chatgptAccountId": "workspace-refreshed",
+                    "chatgptPlanType": null
+                }
+            })
+        );
+    }
+
     struct PendingMessageSink;
 
     impl futures_util::Sink<Message> for PendingMessageSink {
-        type Error = std::io::Error;
+        type Error = tokio_tungstenite::tungstenite::Error;
 
         fn poll_ready(
             self: std::pin::Pin<&mut Self>,
@@ -2927,6 +3536,55 @@ mod tests {
             _cx: &mut std::task::Context<'_>,
         ) -> std::task::Poll<Result<(), Self::Error>> {
             std::task::Poll::Pending
+        }
+
+        fn poll_close(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), Self::Error>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    impl futures_util::Stream for PendingMessageSink {
+        type Item = Result<Message, tokio_tungstenite::tungstenite::Error>;
+
+        fn poll_next(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Option<Self::Item>> {
+            std::task::Poll::Pending
+        }
+    }
+
+    #[derive(Default)]
+    struct RecordingMessageSink {
+        messages: Vec<Message>,
+    }
+
+    impl futures_util::Sink<Message> for RecordingMessageSink {
+        type Error = tokio_tungstenite::tungstenite::Error;
+
+        fn poll_ready(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), Self::Error>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn start_send(
+            mut self: std::pin::Pin<&mut Self>,
+            item: Message,
+        ) -> Result<(), Self::Error> {
+            self.messages.push(item);
+            Ok(())
+        }
+
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), Self::Error>> {
+            std::task::Poll::Ready(Ok(()))
         }
 
         fn poll_close(
@@ -3070,6 +3728,37 @@ mod tests {
     }
 
     #[test]
+    fn selected_account_requires_capability_even_with_auto_preference() {
+        let _probe_guard = capability_probe_test_guard();
+        let lock = GlobalStateLock::new();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let runtime_dir = tmp.path().join("run");
+        fs::create_dir(&runtime_dir).unwrap();
+        let _runtime_dir = EnvGuard::set(&lock, "XDG_RUNTIME_DIR", runtime_dir.to_str().unwrap());
+        let _preference = EnvGuard::set(&lock, "AGENT_SESSION_CODEX_RUNTIME", "auto");
+        let _broker = EnvGuard::set(
+            &lock,
+            "AGENT_SESSION_CODEX_ACCOUNT_BROKER",
+            r#"["/configured/broker"]"#,
+        );
+        let agent = tmp.path().join("codex");
+        fs::write(&agent, "#!/bin/sh\nprintf '%s\\n' 'codex-cli 0.145.0'\n").unwrap();
+        fs::set_permissions(&agent, fs::Permissions::from_mode(0o700)).unwrap();
+        let context = CliContext {
+            state_dir: tmp.path().join("state"),
+            host: None,
+        };
+        let mut record = record_with_runtime("selected-auto", &runtime_dir.join("placeholder"));
+        record.runtime.as_mut().unwrap().kind = "tmux".to_string();
+        record.runtime.as_mut().unwrap().extra.clear();
+        crate::codex_account::set_initial_binding(&mut record, Some("gamania")).unwrap();
+
+        let err = configure_runtime(&context, &agent, &mut record, true).unwrap_err();
+        assert_eq!(err.code(), "codex-app-server-capability-unavailable");
+        assert_eq!(record.runtime.unwrap().kind, "tmux");
+    }
+
+    #[test]
     fn capability_probe_requires_the_audited_version_and_unix_transport() {
         let _probe_guard = capability_probe_test_guard();
         let tmp = tempfile::TempDir::new().unwrap();
@@ -3083,6 +3772,36 @@ mod tests {
             (
                 "old",
                 "codex-cli 0.143.9",
+                "  --listen <URL>  Supported values: stdio://, unix://PATH",
+                false,
+            ),
+            (
+                "newer-unaudited",
+                "codex-cli 0.145.0",
+                "  --listen <URL>  Supported values: stdio://, unix://PATH",
+                false,
+            ),
+            (
+                "extra-component",
+                "codex-cli 0.144.1.1",
+                "  --listen <URL>  Supported values: stdio://, unix://PATH",
+                false,
+            ),
+            (
+                "prerelease",
+                "codex-cli 0.144.1-beta",
+                "  --listen <URL>  Supported values: stdio://, unix://PATH",
+                false,
+            ),
+            (
+                "build-metadata",
+                "codex-cli 0.144.1+custom",
+                "  --listen <URL>  Supported values: stdio://, unix://PATH",
+                false,
+            ),
+            (
+                "unrelated-token",
+                "wrapper release 0.144.1",
                 "  --listen <URL>  Supported values: stdio://, unix://PATH",
                 false,
             ),
@@ -3439,13 +4158,144 @@ exit 1
 
     #[tokio::test]
     async fn response_wait_is_bounded_for_reconnect() {
-        let mut stream = futures_util::stream::pending::<
-            Result<Message, tokio_tungstenite::tungstenite::Error>,
-        >();
-        let err = receive_response_with_timeout(&mut stream, 1, None, Duration::from_millis(5))
-            .await
-            .unwrap_err();
+        let mut stream = PendingMessageSink;
+        let err =
+            receive_response_with_timeout(&mut stream, 1, None, None, Duration::from_millis(5))
+                .await
+                .unwrap_err();
         assert_eq!(err, "Codex app-server request timed out");
+    }
+
+    #[tokio::test]
+    async fn external_auth_refresh_rebinds_durable_state_without_serializing_token() {
+        let lock = GlobalStateLock::new();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let broker = tmp.path().join("broker");
+        let calls = tmp.path().join("calls");
+        fs::write(
+            &broker,
+            r#"#!/bin/sh
+calls=$1
+shift
+printf '%s\n' "$*" >> "$calls"
+printf '%s\n' '{"schema_version":"agent-session.codex-auth-broker.v1","account":"gamania","access_token":"refreshed-fixture-token","chatgpt_account_id":"workspace-refreshed","plan":"team"}'
+"#,
+        )
+        .unwrap();
+        fs::set_permissions(&broker, fs::Permissions::from_mode(0o700)).unwrap();
+        let argv = serde_json::to_string(&vec![
+            broker.to_string_lossy().into_owned(),
+            calls.to_string_lossy().into_owned(),
+        ])
+        .unwrap();
+        let _broker = EnvGuard::set(&lock, "AGENT_SESSION_CODEX_ACCOUNT_BROKER", &argv);
+        let context = CliContext {
+            state_dir: tmp.path().join("state"),
+            host: None,
+        };
+        let mut record = record_with_runtime("refresh-success", &tmp.path().join("server.sock"));
+        crate::codex_account::set_initial_binding(&mut record, Some("gamania")).unwrap();
+        fs::create_dir_all(crate::session_dir(&context, &record.id)).unwrap();
+        crate::write_session_record(&context, &record).unwrap();
+        crate::codex_account::finish_binding(
+            &context,
+            &record.id,
+            "runtime-refresh-success",
+            "gamania",
+            1,
+            Ok(()),
+        )
+        .unwrap();
+
+        let mut sink = RecordingMessageSink::default();
+        assert!(
+            respond_to_external_auth_refresh(
+                &mut sink,
+                &json!({
+                    "id": "refresh-1",
+                    "method": "account/chatgptAuthTokens/refresh",
+                    "params": {
+                        "reason": "unauthorized",
+                        "previousAccountId": "workspace-old"
+                    }
+                }),
+                Some((&context, &record, "gamania")),
+            )
+            .await
+            .unwrap()
+        );
+        let response: Value = match &sink.messages[0] {
+            Message::Text(text) => serde_json::from_str(text).unwrap(),
+            message => panic!("unexpected refresh response: {message:?}"),
+        };
+        assert_eq!(response["id"], "refresh-1");
+        assert_eq!(response["result"]["accessToken"], "refreshed-fixture-token");
+        let persisted = crate::load_session_record(&context, &record.id).unwrap();
+        let view = crate::codex_account::view_for_record(&persisted);
+        assert_eq!(view.state, "bound");
+        assert_eq!(
+            view.applied_runtime_id.as_deref(),
+            Some("runtime-refresh-success")
+        );
+        let session_json =
+            fs::read_to_string(crate::session_dir(&context, &record.id).join("session.json"))
+                .unwrap();
+        assert!(!session_json.contains("refreshed-fixture-token"));
+        assert_eq!(
+            fs::read_to_string(calls).unwrap().trim(),
+            "resolve --account gamania --force-refresh --format json"
+        );
+    }
+
+    #[tokio::test]
+    async fn external_auth_refresh_failure_marks_binding_failed() {
+        let lock = GlobalStateLock::new();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let broker = tmp.path().join("broker");
+        fs::write(&broker, "#!/bin/sh\nexit 9\n").unwrap();
+        fs::set_permissions(&broker, fs::Permissions::from_mode(0o700)).unwrap();
+        let argv = serde_json::to_string(&vec![broker.to_string_lossy().into_owned()]).unwrap();
+        let _broker = EnvGuard::set(&lock, "AGENT_SESSION_CODEX_ACCOUNT_BROKER", &argv);
+        let context = CliContext {
+            state_dir: tmp.path().join("state"),
+            host: None,
+        };
+        let mut record = record_with_runtime("refresh-failure", &tmp.path().join("server.sock"));
+        crate::codex_account::set_initial_binding(&mut record, Some("gamania")).unwrap();
+        fs::create_dir_all(crate::session_dir(&context, &record.id)).unwrap();
+        crate::write_session_record(&context, &record).unwrap();
+        crate::codex_account::finish_binding(
+            &context,
+            &record.id,
+            "runtime-refresh-failure",
+            "gamania",
+            1,
+            Ok(()),
+        )
+        .unwrap();
+
+        let error = respond_to_external_auth_refresh(
+            &mut RecordingMessageSink::default(),
+            &json!({
+                "id": 19,
+                "method": "account/chatgptAuthTokens/refresh",
+                "params": { "reason": "unauthorized" }
+            }),
+            Some((&context, &record, "gamania")),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.starts_with("Codex account refresh failed:"));
+        let persisted = crate::load_session_record(&context, &record.id).unwrap();
+        let view = crate::codex_account::view_for_record(&persisted);
+        assert_eq!(view.state, "failed");
+        assert_eq!(view.failure_reason.as_deref(), Some("refresh_failed"));
+        assert_eq!(
+            crate::codex_account::ensure_input_allowed(&persisted)
+                .unwrap_err()
+                .code(),
+            "codex-account-not-bound"
+        );
     }
 
     #[tokio::test(start_paused = true)]
@@ -4701,6 +5551,8 @@ exit 1
             host: None,
         };
         let record = record_with_runtime("reconnect", &socket);
+        fs::create_dir_all(crate::session_dir(&context, &record.id)).unwrap();
+        crate::write_session_record(&context, &record).unwrap();
         bind_thread(&record, "raw-thread-a").unwrap();
         let server = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
@@ -4742,6 +5594,205 @@ exit 1
         assert!(usage.has_exhausted_windows);
         server.await.unwrap();
         drop(handle);
+        control.abort();
+        let _ = control.await;
+    }
+
+    #[tokio::test]
+    async fn control_reconnect_applies_external_auth_before_thread_discovery() {
+        let lock = GlobalStateLock::new();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let broker = tmp.path().join("broker");
+        fs::write(
+            &broker,
+            "#!/bin/sh\nprintf '%s\\n' '{\"schema_version\":\"agent-session.codex-auth-broker.v1\",\"account\":\"gamania\",\"access_token\":\"token-gamania\",\"chatgpt_account_id\":\"workspace-gamania\",\"plan\":\"team\"}'\n",
+        )
+        .unwrap();
+        fs::set_permissions(&broker, fs::Permissions::from_mode(0o700)).unwrap();
+        let _broker = EnvGuard::set(
+            &lock,
+            "AGENT_SESSION_CODEX_ACCOUNT_BROKER",
+            &serde_json::to_string(&vec![broker.to_string_lossy().into_owned()]).unwrap(),
+        );
+        let socket_path = tmp.path().join("auth-reconnect.sock");
+        let listener = tokio::net::UnixListener::bind(&socket_path).unwrap();
+        let context = CliContext {
+            state_dir: tmp.path().join("state"),
+            host: None,
+        };
+        let mut record = record_with_runtime("auth-reconnect", &socket_path);
+        crate::codex_account::set_initial_binding(&mut record, Some("gamania")).unwrap();
+        fs::create_dir_all(crate::session_dir(&context, &record.id)).unwrap();
+        crate::write_session_record(&context, &record).unwrap();
+        bind_thread(&record, "raw-thread-auth").unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let initialize = receive_json(&mut socket).await;
+            respond(&mut socket, &initialize, json!({})).await;
+            assert_eq!(receive_json(&mut socket).await["method"], "initialized");
+            let login = receive_json(&mut socket).await;
+            assert_eq!(login["method"], "account/login/start");
+            assert_eq!(login["params"]["accessToken"], "token-gamania");
+            assert_eq!(login["params"]["chatgptAccountId"], "workspace-gamania");
+            respond(&mut socket, &login, json!({ "type": "chatgptAuthTokens" })).await;
+            let loaded = receive_json(&mut socket).await;
+            assert_eq!(loaded["method"], "thread/loaded/list");
+            respond(
+                &mut socket,
+                &loaded,
+                json!({ "data": ["raw-thread-auth"], "nextCursor": null }),
+            )
+            .await;
+            let resume = receive_json(&mut socket).await;
+            respond(&mut socket, &resume, json!({})).await;
+            for _ in 0..2 {
+                let usage = receive_json(&mut socket).await;
+                assert_eq!(usage["method"], "account/rateLimits/read");
+                respond(
+                    &mut socket,
+                    &usage,
+                    json!({ "rateLimits": { "primary": { "usedPercent": 1 } } }),
+                )
+                .await;
+            }
+            let prompt = receive_json(&mut socket).await;
+            assert_eq!(prompt["method"], "turn/start");
+            assert_eq!(
+                prompt["params"]["input"][0]["text"],
+                "next selected-account prompt"
+            );
+            respond(
+                &mut socket,
+                &prompt,
+                json!({ "turn": { "id": "selected-account-turn" } }),
+            )
+            .await;
+        });
+        let (handle, commands) = control_channel();
+        let control_context = context.clone();
+        let control_record = record.clone();
+        let control = tokio::spawn(run_control(control_context, control_record, commands));
+        let usage = handle.usage().await;
+        if let Err(error) = usage.as_ref() {
+            drop(handle);
+            let server_result = server.await;
+            let control_result = control.await;
+            panic!("usage failed: {error}; server={server_result:?}; control={control_result:?}");
+        }
+        assert!(usage.unwrap().authoritative);
+        assert_eq!(
+            handle
+                .submit_prompt("next selected-account prompt")
+                .await
+                .unwrap(),
+            "selected-account-turn"
+        );
+        server.await.unwrap();
+        let persisted = crate::load_session_record(&context, &record.id).unwrap();
+        let view = crate::codex_account::view_for_record(&persisted);
+        assert_eq!(view.state, "bound");
+        assert_eq!(view.selected_account.as_deref(), Some("gamania"));
+        drop(handle);
+        control.abort();
+        let _ = control.await;
+    }
+
+    #[tokio::test]
+    async fn failed_reconnect_waits_for_explicit_rebind_before_thread_discovery() {
+        let lock = GlobalStateLock::new();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let broker = tmp.path().join("broker");
+        fs::write(
+            &broker,
+            "#!/bin/sh\nprintf '%s\\n' '{\"schema_version\":\"agent-session.codex-auth-broker.v1\",\"account\":\"gamania\",\"access_token\":\"token-gamania\",\"chatgpt_account_id\":\"workspace-gamania\",\"plan\":\"team\"}'\n",
+        )
+        .unwrap();
+        fs::set_permissions(&broker, fs::Permissions::from_mode(0o700)).unwrap();
+        let _broker = EnvGuard::set(
+            &lock,
+            "AGENT_SESSION_CODEX_ACCOUNT_BROKER",
+            &serde_json::to_string(&vec![broker.to_string_lossy().into_owned()]).unwrap(),
+        );
+        let socket_path = tmp.path().join("failed-reconnect.sock");
+        let listener = tokio::net::UnixListener::bind(&socket_path).unwrap();
+        let context = CliContext {
+            state_dir: tmp.path().join("state"),
+            host: None,
+        };
+        let mut record = record_with_runtime("failed-reconnect", &socket_path);
+        crate::codex_account::set_initial_binding(&mut record, Some("gamania")).unwrap();
+        fs::create_dir_all(crate::session_dir(&context, &record.id)).unwrap();
+        crate::write_session_record(&context, &record).unwrap();
+        crate::codex_account::finish_binding(
+            &context,
+            &record.id,
+            "runtime-failed-reconnect",
+            "gamania",
+            1,
+            Err("apply_failed"),
+        )
+        .unwrap();
+        record = crate::load_session_record(&context, &record.id).unwrap();
+        crate::activity::activate_runtime(&context, &record).unwrap();
+        crate::activity::ingest_codex_app_server_failure(
+            &context,
+            &record.id,
+            "runtime-failed-reconnect",
+            "thread-failed",
+            "turn-failed",
+        )
+        .unwrap();
+        bind_thread(&record, "raw-thread-failed").unwrap();
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let initialize = receive_json(&mut socket).await;
+            respond(&mut socket, &initialize, json!({})).await;
+            assert_eq!(receive_json(&mut socket).await["method"], "initialized");
+            let login = receive_json(&mut socket).await;
+            assert_eq!(login["method"], "account/login/start");
+            respond(&mut socket, &login, json!({ "type": "chatgptAuthTokens" })).await;
+            let loaded = receive_json(&mut socket).await;
+            assert_eq!(loaded["method"], "thread/loaded/list");
+            respond(
+                &mut socket,
+                &loaded,
+                json!({ "data": ["raw-thread-failed"], "nextCursor": null }),
+            )
+            .await;
+            let resume = receive_json(&mut socket).await;
+            assert_eq!(resume["method"], "thread/resume");
+            respond(&mut socket, &resume, json!({})).await;
+            let usage = receive_json(&mut socket).await;
+            assert_eq!(usage["method"], "account/rateLimits/read");
+            respond(
+                &mut socket,
+                &usage,
+                json!({ "rateLimits": { "primary": { "usedPercent": 1 } } }),
+            )
+            .await;
+        });
+        let (handle, commands) = control_channel();
+        let control = tokio::spawn(run_control(context.clone(), record.clone(), commands));
+
+        assert!(handle.usage().await.is_err());
+        let revision = crate::codex_account::begin_switch_binding(
+            &context,
+            &record.id,
+            "runtime-failed-reconnect",
+            "gamania",
+        )
+        .unwrap();
+        assert_eq!(revision, 2);
+        let view = handle.bind_account("gamania", revision).await.unwrap();
+        assert_eq!(view.state, "bound");
+        assert_eq!(
+            view.applied_runtime_id.as_deref(),
+            Some("runtime-failed-reconnect")
+        );
+        server.await.unwrap();
         control.abort();
         let _ = control.await;
     }
@@ -5742,7 +6793,10 @@ exit 1
         let mut bootstrap = FreshBootstrap::FirstTurn {
             thread_id: "fresh-thread".to_string(),
         };
-        NORMAL_CANCELLATION_ATTEMPTS.store(0, std::sync::atomic::Ordering::Relaxed);
+        normal_cancellation_attempts()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&record.id);
         assert!(
             cancel_before_tui_mutation(
                 &context,
@@ -5758,10 +6812,52 @@ exit 1
             .is_some()
         );
         assert_eq!(
-            NORMAL_CANCELLATION_ATTEMPTS.load(std::sync::atomic::Ordering::Relaxed),
+            normal_cancellation_attempts()
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .get(&record.id)
+                .copied()
+                .unwrap_or_default(),
             1
         );
         assert_eq!(bootstrap, FreshBootstrap::Closed);
+    }
+
+    #[tokio::test]
+    async fn broker_bound_tui_rejects_account_auth_mutations() {
+        let lock = GlobalStateLock::new();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let _broker = EnvGuard::set(
+            &lock,
+            "AGENT_SESSION_CODEX_ACCOUNT_BROKER",
+            r#"["/configured/broker"]"#,
+        );
+        let socket = tmp.path().join("broker-bound-auth.sock");
+        let context = CliContext {
+            state_dir: tmp.path().join("state"),
+            host: None,
+        };
+        let mut record = record_with_runtime("broker-bound-auth", &socket);
+        crate::codex_account::set_initial_binding(&mut record, Some("gamania")).unwrap();
+
+        for method in [
+            "account/login/start",
+            "account/login/cancel",
+            "account/logout",
+        ] {
+            let mut bootstrap = FreshBootstrap::Closed;
+            assert!(
+                cancel_before_tui_mutation(
+                    &context,
+                    &record,
+                    &mut bootstrap,
+                    &json!({ "id": 1, "method": method, "params": {} }),
+                )
+                .await
+                .is_none(),
+                "broker-bound TUI mutation {method} must be rejected"
+            );
+        }
     }
 
     #[tokio::test]

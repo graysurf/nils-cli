@@ -1,6 +1,7 @@
 mod activity;
 mod auto_resume;
 mod cli;
+mod codex_account;
 mod codex_app_server;
 pub mod completion;
 mod provider_prompt;
@@ -995,6 +996,7 @@ struct SessionView {
     #[serde(skip_serializing_if = "Option::is_none")]
     startup: Option<StartupProjection>,
     auto_resume: auto_resume::AutoResumeView,
+    codex_account: codex_account::CodexAccountView,
 }
 
 #[derive(Debug)]
@@ -1176,6 +1178,16 @@ fn start_session(
         agent_args: args.agent_args.clone(),
         agent_bin: Some(display_path(&agent_bin)),
     })?;
+    if let Err(err) = codex_account::set_initial_binding(
+        &mut created.record,
+        args.initial_codex_account.as_deref(),
+    ) {
+        cleanup_created_record(context, &created);
+        return Err(err);
+    }
+    if args.initial_codex_account.is_some() {
+        write_session_record(context, &created.record)?;
+    }
 
     if let Err(err) = codex_app_server::configure_runtime(
         context,
@@ -1889,8 +1901,13 @@ fn start_interactive_tmux(
             .arg(state_dir)
             .arg(&record.id)
             .arg(agent_bin)
-            .arg(&record.cwd)
-            .args(agent_args);
+            .arg(&record.cwd);
+        if provider_launch_args.is_empty() {
+            command.arg("--cd").arg(&record.cwd).arg("--no-alt-screen");
+        } else {
+            command.args(provider_launch_args);
+        }
+        command.args(agent_args);
         return run_status(command, "tmux new-session");
     }
 
@@ -2258,8 +2275,10 @@ fn send_to_session(context: &CliContext, args: cli::SendArgs) -> Result<SendResu
             Some(json!({ "id": record.id })),
         ));
     }
-    if codex_app_server::input_contains_submission(text.as_deref(), &args.keys) {
+    let submits = codex_app_server::input_contains_submission(text.as_deref(), &args.keys);
+    if submits {
         codex_app_server::ensure_manual_input_capability(context, &record)?;
+        codex_account::authorize_input_locked(context, &mut record)?;
     }
     auto_resume::cancel_for_manual_input_locked(
         context,
@@ -2321,7 +2340,7 @@ fn send_input_serialized_with_title_guard(
 ) -> Result<(), CliError> {
     let record_lock = acquire_session_record_lock(context, &expected.id)?;
     let mut manual_input = ManualInputSection::new(record_lock);
-    let current = load_session_record(context, &expected.id)?;
+    let mut current = load_session_record(context, &expected.id)?;
     ensure_same_session_identity(expected, &current)?;
     // Title persistence completes before this best-effort Claude prompt-bar
     // projection. A newer title may win while this caller is waiting to regain
@@ -2341,6 +2360,7 @@ fn send_input_serialized_with_title_guard(
     }
     if codex_app_server::input_contains_submission(text, keys) {
         codex_app_server::ensure_manual_input_capability(context, &current)?;
+        codex_account::authorize_input_locked(context, &mut current)?;
     }
     auto_resume::cancel_for_manual_input_locked(
         context,
@@ -2366,7 +2386,7 @@ pub(crate) fn send_auto_resume_input(
     text: &str,
     tmux_bin: &Path,
 ) -> Result<(), CliError> {
-    let current = load_session_record(context, &expected.id)?;
+    let mut current = load_session_record(context, &expected.id)?;
     ensure_same_session_identity(expected, &current)?;
     if live_status(tmux_bin, &current.tmux_session) != "running" {
         return Err(CliError::runtime(
@@ -2375,6 +2395,7 @@ pub(crate) fn send_auto_resume_input(
             Some(json!({ "id": current.id })),
         ));
     }
+    codex_account::authorize_input_locked(context, &mut current)?;
     send_input_unlocked(
         context,
         &current,
@@ -2964,6 +2985,9 @@ fn resume_session_by_id(
     }
     let (provider_resume, agent) = validate_resume_metadata(&record)?;
     let previous_record = record.clone();
+    let app_server_managed = agent == AgentKind::Codex
+        && (codex_app_server::runtime_is_supported(&previous_record)
+            || codex_account::binding_is_present(&previous_record));
     let previous_activity = activity::capture_snapshot(context, &record.id)?;
     let mut startup_artifacts = StartupArtifactBackup::stage(context, &record)?;
     let resume_args = provider_resume.resume_args.clone();
@@ -2994,16 +3018,33 @@ fn resume_session_by_id(
         &mut record,
         &starting_projection(&now.timestamp().to_string(), "record"),
     );
+    if app_server_managed {
+        codex_account::mark_runtime_pending(&mut record)?;
+        codex_app_server::configure_runtime(context, &agent_bin, &mut record, true)?;
+    }
     record.updated_at = now.timestamp().to_string();
     write_session_record(context, &record)?;
     activity::activate_runtime(context, &record)?;
-    if let Err(launch_err) = start_resume_tmux(
-        tmux_bin,
-        &agent_bin,
-        &context.state_dir,
-        &record,
-        &resume_args,
-    ) {
+    let launch = if app_server_managed {
+        start_interactive_tmux(
+            tmux_bin,
+            &agent_bin,
+            agent,
+            &context.state_dir,
+            &record,
+            &resume_args,
+            &record.agent_args,
+        )
+    } else {
+        start_resume_tmux(
+            tmux_bin,
+            &agent_bin,
+            &context.state_dir,
+            &record,
+            &resume_args,
+        )
+    };
+    if let Err(launch_err) = launch {
         let record_restore = write_session_record(context, &previous_record);
         let activity_restore = activity::restore_snapshot(context, &record.id, &previous_activity);
         let artifact_restore = startup_artifacts.restore();
@@ -4056,6 +4097,7 @@ fn session_view_from_parts(
         turn_state: activity::state_for_view(context, record),
         startup: startup_projection_for_view(record),
         auto_resume: auto_resume::view_for_record(context, record),
+        codex_account: codex_account::view_for_record(record),
     }
 }
 
