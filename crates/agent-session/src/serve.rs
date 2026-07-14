@@ -6633,7 +6633,7 @@ mod tests {
         let bin = dir.join("tmux");
         std::fs::write(
             &bin,
-            "#!/usr/bin/env sh\ncase \"$1\" in\n  has-session) exit 0 ;;\n  capture-pane) printf 'pane\\n'; exit 0 ;;\n  show-buffer) printf 'buffered selection\\n'; exit 0 ;;\n  *) exit 0 ;;\nesac\n",
+            "#!/usr/bin/env sh\ncase \"$1\" in\n  has-session) exit 0 ;;\n  new-session) printf '%s\\t%s\\t%s\\n' '$77' '%77' \"$$\"; exit 0 ;;\n  capture-pane) printf 'pane\\n'; exit 0 ;;\n  show-buffer) printf 'buffered selection\\n'; exit 0 ;;\n  *) exit 0 ;;\nesac\n",
         )
         .unwrap();
         let mut perms = std::fs::metadata(&bin).unwrap().permissions();
@@ -6649,7 +6649,7 @@ mod tests {
             format!(
                 r#"#!/usr/bin/env sh
 case "$1" in
-  display-message) printf '$88\t{pane_pid}\n'; exit 0 ;;
+  display-message) printf '$88\t%%88\t{pane_pid}\n'; exit 0 ;;
   show-environment)
     case "$4" in
       AGENT_SESSION_ID) printf 'AGENT_SESSION_ID=%s\n' {id} ;;
@@ -6906,7 +6906,7 @@ esac
         executable(
             &dir.join("tmux"),
             &format!(
-                "#!/usr/bin/env sh\nprintf '%s\\n' \"$*\" >> {}\ncase \"$1\" in\n  has-session) exit 1 ;;\n  *) exit 0 ;;\nesac\n",
+                "#!/usr/bin/env sh\nprintf '%s\\n' \"$*\" >> {}\ncase \"$1\" in\n  has-session) exit 1 ;;\n  new-session) printf '%s\\t%s\\t%s\\n' '$77' '%77' \"$$\"; exit 0 ;;\n  *) exit 0 ;;\nesac\n",
                 shell_words::quote(&log.to_string_lossy())
             ),
         )
@@ -9739,7 +9739,7 @@ esac
 
         let calls = std::fs::read_to_string(&log).unwrap();
         assert!(
-            calls.contains("new-session -d -s hs-codex-imported-codex"),
+            calls.contains("-s hs-codex-imported-codex"),
             "import must create a tmux runtime: {calls:?}"
         );
         assert!(
@@ -9812,7 +9812,7 @@ esac
 
         let calls = std::fs::read_to_string(&log).unwrap();
         assert!(
-            calls.contains("new-session -d -s hs-claude-imported-claude"),
+            calls.contains("-s hs-claude-imported-claude"),
             "import must create a tmux runtime: {calls:?}"
         );
         assert!(
@@ -10666,7 +10666,7 @@ esac
 
         let calls = std::fs::read_to_string(&log).unwrap();
         assert!(
-            calls.contains("new-session -d -s hs-codex-recover"),
+            calls.contains("-s hs-codex-recover"),
             "resume must create a tmux runtime: {calls:?}"
         );
         assert!(
@@ -11300,7 +11300,7 @@ esac
         let tmux = executable(
             &tmp.path().join("tmux-resume-lock"),
             &format!(
-                "#!/usr/bin/env sh\ncase \"$1\" in\n  has-session) [ -f {running} ] ;;\n  new-session) : > {started}; while [ ! -f {release} ]; do sleep 0.01; done; : > {running}; exit 0 ;;\n  *) exit 0 ;;\nesac\n",
+                "#!/usr/bin/env sh\ncase \"$1\" in\n  has-session) [ -f {running} ] ;;\n  new-session) : > {started}; while [ ! -f {release} ]; do sleep 0.01; done; : > {running}; printf '%s\\t%s\\t%s\\n' '$77' '%77' \"$$\"; exit 0 ;;\n  *) exit 0 ;;\nesac\n",
                 started = shell_words::quote(&started.to_string_lossy()),
                 release = shell_words::quote(&release.to_string_lossy()),
                 running = shell_words::quote(&running.to_string_lossy()),
@@ -12204,6 +12204,43 @@ printf '%s\n' '{"schema_version":"agent-session.codex-auth-broker.v1","accounts"
                 "{agent} runtime metadata must remain"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn delete_stopped_pre_upgrade_session_returns_non_retryable_manual_action() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let id = "pre-upgrade-stopped";
+        seed_session(tmp.path(), id, "codex", "hs-codex-pre-upgrade-stopped");
+        let tmux = executable(
+            &tmp.path().join("pre-upgrade-stopped-tmux"),
+            "#!/usr/bin/env sh\ncase \"$1\" in\n  display-message|has-session) printf \"%s\\n\" \"can't find session: pre-upgrade\" >&2; exit 1 ;;\n  *) exit 42 ;;\nesac\n",
+        );
+        let session_dir = tmp.path().join("sessions").join(id);
+        let st = state(tmp.path(), Some(TOKEN), tmux);
+        let request = Request::builder()
+            .method("DELETE")
+            .uri(format!("/sessions/{id}"))
+            .header("authorization", format!("Bearer {TOKEN}"))
+            .body(Body::empty())
+            .unwrap();
+
+        let (status, body) = call(router(st), request).await;
+
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "body={body}");
+        assert_eq!(body["error"]["code"], "session-termination-failed");
+        assert_eq!(
+            body["error"]["details"]["reason"],
+            "runtime-identity-unavailable"
+        );
+        assert_eq!(body["error"]["details"]["retryable"], false);
+        assert_eq!(
+            body["error"]["details"]["action"],
+            "manual-runtime-verification-required"
+        );
+        assert!(
+            session_dir.exists(),
+            "pre-upgrade metadata must remain fail-closed"
+        );
     }
 
     #[tokio::test]
@@ -13651,7 +13688,7 @@ exit 0
         std::fs::write(
             &bin,
             format!(
-                "#!/usr/bin/env sh\nprintf '%s\\n' \"$*\" >> {}\ncase \"$1\" in\n  has-session) exit 0 ;;\n  capture-pane) printf 'pane\\n'; exit 0 ;;\n  *) exit 0 ;;\nesac\n",
+                "#!/usr/bin/env sh\nprintf '%s\\n' \"$*\" >> {}\ncase \"$1\" in\n  has-session) exit 0 ;;\n  new-session) printf '%s\\t%s\\t%s\\n' '$77' '%77' \"$$\"; exit 0 ;;\n  capture-pane) printf 'pane\\n'; exit 0 ;;\n  *) exit 0 ;;\nesac\n",
                 shell_words::quote(&log.to_string_lossy())
             ),
         )
