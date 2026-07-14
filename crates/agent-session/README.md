@@ -204,6 +204,9 @@ is no second state model.
   `$HOME/.config`) with bounded depth, count, and elapsed-time limits. Add `git_only=true&exclude_worktrees=true` for
   the curated project picker: only primary git working trees are returned, ordered by most-recent session cwd usage
   (`last_used`) and then name/path.
+- `GET /codex/accounts` — authenticated nickname-only account inventory from
+  the configured host credential broker. The response never contains access
+  tokens, ChatGPT account ids, auth paths, or broker diagnostics.
 - `GET /activity/events` — authenticated metadata-only SSE for activity snapshots and heartbeats. Events carry a daemon-boot
   `stream_id` and increasing `sequence`; `Last-Event-ID` enables count-and-byte-bounded replay, while stale/foreign cursors
   and lagged consumers receive a reset. Concurrent subscribers are daemon-capped and saturation returns a stable
@@ -221,18 +224,32 @@ is no second state model.
 - `POST /sessions` (create), `PATCH /sessions/{id}` (title update), `POST /sessions/{id}/send`,
   `POST /sessions/{id}/prompt`,
   `POST /sessions/{id}/resume`,
+  `PUT /sessions/{id}/account`,
   `PUT /sessions/{id}/auto-resume`, `DELETE /sessions/{id}/auto-resume`,
   `POST /sessions/{id}/attachments?filename=...`, `DELETE /sessions/{id}` — writes, require a bearer token.
 - `POST /sessions/{id}/prompt` submits exact prompt text through a supported provider control plane. This versioned mutation never
   sends multiline text through terminal keys; unsupported or not-yet-ready sessions fail closed.
+- `PUT /sessions/{id}/account` accepts
+  `{ "account": "nickname", "expected_session_incarnation": "launch-id" }`
+  only for
+  an idle, serve-managed Codex app-server runtime. It does not recreate tmux or
+  resume the provider conversation. The daemon resolves credentials through the
+  host broker, sends Codex `account/login/start` with `chatgptAuthTokens`, and
+  returns only after the durable binding is `bound` to the current launch id.
+  Prompt, terminal-input, and auto-resume submission paths fail closed while a
+  selected binding is `pending` or `failed`, so the next accepted prompt uses
+  the newly selected account.
 - `POST /sessions` normally creates a fresh session from `agent`, optional `cwd`, `title`, `id`, `prompt`, and
-  `agent_args`. When `provider_resume_id` is present (alias: `resume_id`), the daemon imports an existing Codex or
+  `agent_args`. A fresh Codex create may additionally provide
+  `codex_account`; when a prompt is also present, the daemon completes account
+  binding before submitting that prompt. `codex_account` is rejected for other
+  providers and for provider-import mode. When `provider_resume_id` is present (alias: `resume_id`), the daemon imports an existing Codex or
   Claude provider conversation instead: it resolves the original cwd from local provider history, persists exact
   `provider_resume` metadata, and starts tmux with the canonical resume command. In resume-id mode, omit `cwd`, `prompt`,
   and `agent_args`; invalid, missing, ambiguous, or unsupported provider ids return structured errors.
   For a fresh serve-managed Codex session, `agent-session` probes bounded
   `codex --version` and `codex app-server --help` process groups. The audited
-  floor is Codex `0.144.1`, and help must advertise Unix `--listen` support. A
+  version is exactly Codex `0.144.1`, and help must advertise Unix `--listen` support. A
   matching CLI is launched as a remote TUI over a private short socket below an
   owned, non-symlinked mode-`0700` `XDG_RUNTIME_DIR`; otherwise auto mode
   degrades to the existing raw TUI. `AGENT_SESSION_CODEX_RUNTIME=raw` forces
@@ -268,6 +285,13 @@ is no second state model.
   The bridge remains with the tmux runtime across daemon restarts. Runtime paths
   are namespaced by state and launch identity; delete and launch failure
   validate and remove the app-server socket, bridge socket, and marker paths.
+  A selected account is persisted only as nickname, revision, public state
+  (`unsupported`, `unbound`, `pending`, `bound`, or `failed`), and applied
+  launch id. On daemon reconnect or stopped-session resume, the new control
+  connection re-applies that nickname before accepting input. Codex
+  `account/chatgptAuthTokens/refresh` with reason `unauthorized` triggers one
+  forced broker refresh and the same durable pending/bound transition; failure
+  becomes visible and remains fail closed.
 - Session reads include a monotonic `title_revision`. `PATCH /sessions/{id}` may include
   `expected_title_revision`; a stale value returns `409 title-revision-conflict` without changing the title.
   Upgraded clients also send the runtime's random `session_incarnation` as `expected_session_incarnation` and the
@@ -356,6 +380,19 @@ on the token bytes; when no token is configured (or it is empty) those endpoints
 token from stdin, rejects empty input, rejects multiple newline-separated tokens, and rejects input over 8192 bytes.
 `--token-stdin` conflicts with `--token`; both forms avoid printing token material in errors. Use a strong,
 high-entropy token.
+
+Codex account switching is enabled by
+`AGENT_SESSION_CODEX_ACCOUNT_BROKER`, whose value is a JSON argv array rather
+than a shell command, for example
+`["/opt/agent-console/bin/codex-account-broker"]`. The daemon invokes that argv
+with either `list --format json`, `resolve --account <nickname> --format json`,
+or `resolve --account <nickname> --force-refresh --format json`. Broker output
+uses `agent-session.codex-auth-broker.v1`: list returns public `accounts`, while
+resolve returns the exact nickname plus `access_token`, `chatgpt_account_id`,
+and optional `plan`. Broker execution is process-group and time bounded with
+bounded output. Credential values remain in memory only and are never added to
+session documents or HTTP projections. Invalid configuration, malformed output,
+duplicate or unsafe nicknames, timeout, and non-zero exit all fail closed.
 
 Trust model: the daemon binds loopback and *refuses* a non-loopback bind unless `--allow-non-loopback` is passed, because
 it drives a remote shell. Session reads (`list` / `glance`) are intentionally open on the bind address, while path-bearing

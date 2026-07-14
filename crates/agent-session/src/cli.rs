@@ -87,6 +87,10 @@ pub struct StartArgs {
     #[arg(skip)]
     pub app_server_managed: bool,
 
+    /// Internal: account nickname selected by the serve daemon.
+    #[arg(skip)]
+    pub initial_codex_account: Option<String>,
+
     /// Agent to run.
     #[arg(long, value_enum)]
     pub agent: AgentKind,

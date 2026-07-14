@@ -90,6 +90,7 @@ const PROVIDER_PROMPT_PENDING_POLL_INTERVAL: Duration = Duration::from_millis(50
 const PROVIDER_PROMPT_PENDING_TIMEOUT: Duration = Duration::from_secs(2 * 60);
 const STRUCTURED_PROMPT_CONTROL_WAIT: Duration = Duration::from_secs(3);
 const STRUCTURED_PROMPT_CONTROL_POLL: Duration = Duration::from_millis(50);
+const CODEX_ACCOUNT_BINDING_WAIT: Duration = Duration::from_secs(30);
 const PROVIDER_PROMPT_DISCOVERY_MAX_BACKOFF: Duration = Duration::from_secs(30);
 const PROVIDER_PROMPT_DISCOVERY_MAX_ENTRIES: usize = 64;
 const PROVIDER_PROMPT_DISCOVERY_MAX_CONCURRENT_SCANS: usize = 4;
@@ -200,6 +201,13 @@ pub fn run_serve(context: &CliContext, args: cli::ServeArgs) -> i32 {
     };
 
     runtime.block_on(async move {
+        if let Err(err) = fence_codex_controls_before_listen(context, &tmux_bin) {
+            eprintln!(
+                "error: failed to fence Codex account controls: {}",
+                err.code()
+            );
+            return exit::RUNTIME;
+        }
         let session_collector = default_session_collector();
         let activity_broker = ActivityBroker::start(
             context.clone(),
@@ -255,6 +263,7 @@ fn router(state: Arc<ServeState>) -> Router {
     Router::new()
         .route("/healthz", get(healthz))
         .route("/sessions", get(list_handler).post(create_handler))
+        .route("/codex/accounts", get(codex_accounts_handler))
         .route("/activity/events", get(activity_events_handler))
         .route("/usage", get(usage_handler))
         .route("/workdirs", get(workdirs_handler))
@@ -264,6 +273,10 @@ fn router(state: Arc<ServeState>) -> Router {
         .route("/sessions/{id}/send", post(send_handler))
         .route("/sessions/{id}/prompt", post(structured_prompt_handler))
         .route("/sessions/{id}/resume", post(resume_handler))
+        .route(
+            "/sessions/{id}/account",
+            axum::routing::put(codex_account_handler),
+        )
         .route(
             "/sessions/{id}/auto-resume",
             get(auto_resume_status_handler)
@@ -1338,7 +1351,9 @@ fn envelope_err(err: CliError) -> Response {
         "session-exists"
         | "title-revision-conflict"
         | "title-state-conflict"
-        | "session-incarnation-conflict" => StatusCode::CONFLICT,
+        | "session-incarnation-conflict"
+        | "codex-account-session-incarnation-conflict"
+        | "codex-account-session-busy" => StatusCode::CONFLICT,
         _ => match data.exit_code {
             exit::USAGE => StatusCode::BAD_REQUEST,
             exit::DATA => StatusCode::UNPROCESSABLE_ENTITY,
@@ -2021,6 +2036,8 @@ struct CreateBody {
     provider_resume_id: Option<String>,
     #[serde(default)]
     agent_args: Vec<String>,
+    #[serde(default)]
+    codex_account: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2038,6 +2055,12 @@ struct StructuredPromptBody {
 #[derive(Debug, Deserialize)]
 struct AutoResumeBody {
     enabled: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct CodexAccountBody {
+    account: String,
+    expected_session_incarnation: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2076,6 +2099,20 @@ async fn list_handler(State(state): State<Arc<ServeState>>) -> Response {
             "observed_at": activity_observed_at(),
             "sessions": sessions,
         })),
+        Ok(Err(err)) => envelope_err(err),
+        Err(_) => join_err(),
+    }
+}
+
+async fn codex_accounts_handler(
+    State(state): State<Arc<ServeState>>,
+    headers: HeaderMap,
+) -> Response {
+    if let Some(response) = deny_unauthorized(&state, &headers) {
+        return response;
+    }
+    match tokio::task::spawn_blocking(crate::codex_account::list_accounts).await {
+        Ok(Ok(accounts)) => envelope_ok(json!({ "machine": state.machine, "accounts": accounts })),
         Ok(Err(err)) => envelope_err(err),
         Err(_) => join_err(),
     }
@@ -2182,7 +2219,21 @@ async fn create_handler(
         ));
     };
     let context = state.context.clone();
+    if body.codex_account.is_some() && agent != AgentKind::Codex {
+        return envelope_err(CliError::usage(
+            "codex-account-agent-conflict",
+            "codex_account is supported only for Codex sessions",
+            None,
+        ));
+    }
     if let Some(provider_resume_id) = body.provider_resume_id {
+        if body.codex_account.is_some() {
+            return envelope_err(CliError::usage(
+                "codex-account-provider-resume-conflict",
+                "create the resumable Codex session first, then bind its account",
+                None,
+            ));
+        }
         if body.cwd.is_some() {
             return envelope_err(CliError::usage(
                 "provider-resume-cwd-conflict",
@@ -2219,13 +2270,25 @@ async fn create_handler(
             Err(_) => join_err(),
         };
     }
+    let selected_account = body.codex_account;
+    let prompt = body.prompt;
+    let deferred_prompt = if selected_account.is_some() {
+        prompt.clone()
+    } else {
+        None
+    };
     let args = cli::StartArgs {
         app_server_managed: true,
+        initial_codex_account: selected_account.clone(),
         agent,
         cwd: body.cwd.map(PathBuf::from),
         title: body.title,
         id: body.id,
-        prompt: body.prompt,
+        prompt: if selected_account.is_some() {
+            None
+        } else {
+            prompt
+        },
         prompt_file: None,
         prompt_stdin: false,
         tmux_bin: Some(state.tmux_bin.clone()),
@@ -2235,9 +2298,340 @@ async fn create_handler(
         format: nils_common::cli_contract::OutputFormat::Json,
     };
     match tokio::task::spawn_blocking(move || start_session(&context, args)).await {
-        Ok(Ok(view)) => envelope_ok(json!({ "machine": state.machine, "session": view.result })),
+        Ok(Ok(mut view)) => {
+            if selected_account.is_some() {
+                let Some(launch_id) = view
+                    .result
+                    .session_incarnation
+                    .as_deref()
+                    .map(str::to_string)
+                else {
+                    return status_json(
+                        StatusCode::CONFLICT,
+                        "codex-account-unsupported",
+                        "created Codex session does not support account binding",
+                    );
+                };
+                let requested_account = selected_account.as_deref().unwrap_or_default();
+                let binding = match wait_for_account_binding(
+                    &state,
+                    &view.result.id,
+                    &launch_id,
+                    requested_account,
+                    1,
+                )
+                .await
+                {
+                    Ok(binding) => binding,
+                    Err(response) => return response,
+                };
+                view.result.codex_account = binding;
+                if let Some(prompt) = deferred_prompt {
+                    let Some(handle) =
+                        wait_for_codex_control(&state, &view.result.id, &launch_id).await
+                    else {
+                        return status_json(
+                            StatusCode::CONFLICT,
+                            "structured-prompt-unavailable",
+                            "structured prompt control is not ready for this session",
+                        );
+                    };
+                    if let Err(response) = submit_structured_prompt_locked(
+                        &state,
+                        &view.result.id,
+                        &launch_id,
+                        Some((requested_account, 1)),
+                        &handle,
+                        &prompt,
+                    )
+                    .await
+                    {
+                        return response;
+                    }
+                }
+            }
+            envelope_ok(json!({ "machine": state.machine, "session": view.result }))
+        }
         Ok(Err(err)) => envelope_err(err),
         Err(_) => join_err(),
+    }
+}
+
+async fn wait_for_codex_control(
+    state: &ServeState,
+    id: &str,
+    launch_id: &str,
+) -> Option<ControlHandle> {
+    let deadline = Instant::now() + STRUCTURED_PROMPT_CONTROL_WAIT;
+    loop {
+        let handle = state.codex_controls.lock().ok().and_then(|controls| {
+            controls
+                .get(id)
+                .filter(|entry| entry.launch_id == launch_id)
+                .map(|entry| entry.handle.clone())
+        });
+        if handle.is_some() || Instant::now() >= deadline {
+            return handle;
+        }
+        tokio::time::sleep(STRUCTURED_PROMPT_CONTROL_POLL).await;
+    }
+}
+
+async fn wait_for_account_binding(
+    state: &ServeState,
+    id: &str,
+    launch_id: &str,
+    requested_account: &str,
+    requested_revision: u64,
+) -> Result<crate::codex_account::CodexAccountView, Response> {
+    let deadline = Instant::now() + CODEX_ACCOUNT_BINDING_WAIT;
+    let mut poll_delay = STRUCTURED_PROMPT_CONTROL_POLL;
+    loop {
+        let context = state.context.clone();
+        let load_id = id.to_string();
+        let record = match tokio::task::spawn_blocking(move || {
+            load_session_record(&context, &load_id)
+        })
+        .await
+        {
+            Ok(Ok(record)) => record,
+            Ok(Err(err)) => return Err(envelope_err(err)),
+            Err(_) => return Err(join_err()),
+        };
+        if record
+            .runtime
+            .as_ref()
+            .is_none_or(|runtime| runtime.launch_id != launch_id)
+        {
+            return Err(status_json(
+                StatusCode::CONFLICT,
+                "codex-account-runtime-changed",
+                "Codex session runtime changed while binding its account",
+            ));
+        }
+        let view = crate::codex_account::view_for_record(&record);
+        let requested_binding = view.selected_account.as_deref() == Some(requested_account)
+            && view.revision == requested_revision;
+        match view.state {
+            "bound"
+                if requested_binding && view.applied_runtime_id.as_deref() == Some(launch_id) =>
+            {
+                return Ok(view);
+            }
+            "bound" | "pending" | "failed" if !requested_binding => {
+                return Err(status_json(
+                    StatusCode::CONFLICT,
+                    "codex-account-binding-superseded",
+                    "the requested Codex account binding was superseded",
+                ));
+            }
+            "bound" => {
+                return Err(status_json(
+                    StatusCode::CONFLICT,
+                    "codex-account-binding-superseded",
+                    "the requested Codex account binding was applied to another runtime",
+                ));
+            }
+            "failed" | "unsupported" => {
+                return Err(status_json(
+                    StatusCode::BAD_GATEWAY,
+                    "codex-account-binding-failed",
+                    "Codex account binding failed",
+                ));
+            }
+            _ if Instant::now() >= deadline => {
+                return Err(status_json(
+                    StatusCode::GATEWAY_TIMEOUT,
+                    "codex-account-binding-timeout",
+                    "Codex account binding timed out",
+                ));
+            }
+            _ => {
+                tokio::time::sleep(poll_delay).await;
+                poll_delay = (poll_delay * 2).min(Duration::from_millis(500));
+            }
+        }
+    }
+}
+
+async fn submit_structured_prompt_locked(
+    state: &ServeState,
+    id: &str,
+    launch_id: &str,
+    expected_binding: Option<(&str, u64)>,
+    handle: &ControlHandle,
+    text: &str,
+) -> Result<(), Response> {
+    let lock_context = state.context.clone();
+    let lock_id = id.to_string();
+    let expected_launch_id = launch_id.to_string();
+    let expected_binding =
+        expected_binding.map(|(account, revision)| (account.to_string(), revision));
+    let record_lock = match tokio::task::spawn_blocking(move || {
+        let record_lock = crate::acquire_session_record_lock(&lock_context, &lock_id)?;
+        let mut current = load_session_record(&lock_context, &lock_id)?;
+        if current
+            .runtime
+            .as_ref()
+            .is_none_or(|runtime| runtime.launch_id != expected_launch_id)
+        {
+            return Err(CliError::data(
+                "session-incarnation-conflict",
+                "session runtime changed before prompt submission",
+                Some(json!({ "id": current.id })),
+            ));
+        }
+        if let Some((account, revision)) = expected_binding
+            && crate::codex_account::binding_snapshot(&current)
+                != (crate::codex_account::BindingSnapshot::Bound { account, revision })
+        {
+            return Err(CliError::data(
+                "codex-account-binding-superseded",
+                "the requested Codex account binding was superseded before prompt submission",
+                Some(json!({ "id": current.id })),
+            ));
+        }
+        crate::codex_account::authorize_input_locked(&lock_context, &mut current)?;
+        auto_resume::cancel_for_manual_input_locked(
+            &lock_context,
+            &current.id,
+            &jiff::Timestamp::now().to_string(),
+        )?;
+        crate::codex_account::ensure_input_allowed(&current)?;
+        Ok::<_, CliError>(record_lock)
+    })
+    .await
+    {
+        Ok(Ok(record_lock)) => record_lock,
+        Ok(Err(err))
+            if matches!(
+                err.code(),
+                "codex-account-binding-superseded" | "session-incarnation-conflict"
+            ) =>
+        {
+            return Err(status_json(
+                StatusCode::CONFLICT,
+                err.code(),
+                "session account or runtime changed before prompt submission",
+            ));
+        }
+        Ok(Err(err)) => return Err(envelope_err(err)),
+        Err(_) => return Err(join_err()),
+    };
+
+    let response = handle.submit_prompt(text).await.map(|_| ()).map_err(|_| {
+        status_json(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "structured-prompt-outcome-unknown",
+            "structured prompt submission outcome is unknown",
+        )
+    });
+    drop(record_lock);
+    response
+}
+
+async fn codex_account_handler(
+    State(state): State<Arc<ServeState>>,
+    headers: HeaderMap,
+    AxPath(id): AxPath<String>,
+    Json(body): Json<CodexAccountBody>,
+) -> Response {
+    if let Some(response) = deny_unauthorized(&state, &headers) {
+        return response;
+    }
+    let Some(expected_session_incarnation) = body
+        .expected_session_incarnation
+        .as_deref()
+        .filter(|value| !value.is_empty() && value.len() <= 128)
+    else {
+        return status_json(
+            StatusCode::BAD_REQUEST,
+            "invalid-session-incarnation",
+            "expected_session_incarnation is required",
+        );
+    };
+    let context = state.context.clone();
+    let load_id = id.clone();
+    let record =
+        match tokio::task::spawn_blocking(move || load_session_record(&context, &load_id)).await {
+            Ok(Ok(record)) => record,
+            Ok(Err(err)) => return envelope_err(err),
+            Err(_) => return join_err(),
+        };
+    if !crate::codex_account::view_for_record(&record).supported {
+        return status_json(
+            StatusCode::CONFLICT,
+            "codex-account-unsupported",
+            "this session does not support Codex account switching",
+        );
+    }
+    let Some(launch_id) = record
+        .runtime
+        .as_ref()
+        .map(|runtime| runtime.launch_id.clone())
+    else {
+        return status_json(
+            StatusCode::CONFLICT,
+            "codex-account-unsupported",
+            "this session does not support Codex account switching",
+        );
+    };
+    if launch_id != expected_session_incarnation {
+        return status_json(
+            StatusCode::CONFLICT,
+            "codex-account-session-incarnation-conflict",
+            "session was replaced before its Codex account switch was applied",
+        );
+    }
+    let Some(handle) = wait_for_codex_control(&state, &id, &launch_id).await else {
+        return status_json(
+            StatusCode::CONFLICT,
+            "codex-account-control-unavailable",
+            "Codex account control is not ready for this session",
+        );
+    };
+    let begin_context = state.context.clone();
+    let begin_id = id.clone();
+    let begin_launch_id = launch_id.clone();
+    let begin_account = body.account.clone();
+    let revision = match tokio::task::spawn_blocking(move || {
+        crate::codex_account::begin_switch_binding(
+            &begin_context,
+            &begin_id,
+            &begin_launch_id,
+            &begin_account,
+        )
+    })
+    .await
+    {
+        Ok(Ok(revision)) => revision,
+        Ok(Err(err)) => return envelope_err(err),
+        Err(_) => return join_err(),
+    };
+    match handle.bind_account(&body.account, revision).await {
+        Ok(view) => envelope_ok(json!({ "machine": state.machine, "codex_account": view })),
+        Err(_) => {
+            let finish_context = state.context.clone();
+            let finish_id = id.clone();
+            let finish_launch_id = launch_id.clone();
+            let finish_account = body.account.clone();
+            let _ = tokio::task::spawn_blocking(move || {
+                crate::codex_account::finish_binding(
+                    &finish_context,
+                    &finish_id,
+                    &finish_launch_id,
+                    &finish_account,
+                    revision,
+                    Err("apply_failed"),
+                )
+            })
+            .await;
+            status_json(
+                StatusCode::BAD_GATEWAY,
+                "codex-account-binding-failed",
+                "Codex account binding failed",
+            )
+        }
     }
 }
 
@@ -2358,40 +2752,12 @@ async fn structured_prompt_handler(
         );
     };
 
-    // Serialize this provider mutation with replacement, terminal input, and
-    // auto-resume ticks. Cancellation intentionally leaves the healthy idle
-    // `enabled` state intact for a fresh session, while disarming any
-    // continuation that was already armed or scheduled before this request.
-    let lock_context = state.context.clone();
-    let expected = record.clone();
-    let record_lock = match tokio::task::spawn_blocking(move || {
-        let record_lock = crate::acquire_session_record_lock(&lock_context, &expected.id)?;
-        let current = load_session_record(&lock_context, &expected.id)?;
-        crate::ensure_same_session_identity(&expected, &current)?;
-        auto_resume::cancel_for_manual_input_locked(
-            &lock_context,
-            &current.id,
-            &jiff::Timestamp::now().to_string(),
-        )?;
-        Ok::<_, CliError>(record_lock)
-    })
-    .await
+    match submit_structured_prompt_locked(&state, &record.id, &launch_id, None, &handle, &body.text)
+        .await
     {
-        Ok(Ok(record_lock)) => record_lock,
-        Ok(Err(err)) => return envelope_err(err),
-        Err(_) => return join_err(),
-    };
-
-    let response = match handle.submit_prompt(&body.text).await {
-        Ok(_) => envelope_ok(json!({ "machine": state.machine, "submitted": true })),
-        Err(_) => status_json(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "structured-prompt-outcome-unknown",
-            "structured prompt submission outcome is unknown",
-        ),
-    };
-    drop(record_lock);
-    response
+        Ok(()) => envelope_ok(json!({ "machine": state.machine, "submitted": true })),
+        Err(response) => response,
+    }
 }
 
 fn structured_prompt_has_unsafe_control(text: &str) -> bool {
@@ -2544,6 +2910,7 @@ async fn auto_resume_loop(state: Arc<ServeState>) {
 struct CodexAutoResumeTarget {
     id: String,
     launch_id: String,
+    binding: crate::codex_account::BindingSnapshot,
 }
 
 async fn partition_auto_resume_ids(
@@ -2559,9 +2926,11 @@ async fn partition_auto_resume_ids(
                 .ok()
                 .filter(codex_app_server::runtime_is_supported)
                 .and_then(|record| {
+                    let binding = crate::codex_account::binding_snapshot(&record);
                     record.runtime.map(|runtime| CodexAutoResumeTarget {
                         id: record.id,
                         launch_id: runtime.launch_id,
+                        binding,
                     })
                 });
             if let Some(target) = target {
@@ -2639,10 +3008,11 @@ async fn process_codex_auto_resume_id(state: Arc<ServeState>, target: CodexAutoR
     let id = target.id;
     tokio::task::spawn_blocking(move || {
         let now_epoch = jiff::Timestamp::now().as_second();
-        if let Err(err) = auto_resume::tick_for_runtime(
+        if let Err(err) = auto_resume::tick_for_runtime_and_binding(
             &context,
             &id,
             &expected_launch_id,
+            &target.binding,
             now_epoch,
             &usage,
             |_| {
@@ -2726,6 +3096,28 @@ async fn codex_control_loop(state: Arc<ServeState>) {
             if already_running {
                 continue;
             }
+            let prepare_context = state.context.clone();
+            let prepare_id = record.id.clone();
+            let prepare_launch_id = launch_id.clone();
+            let record = match tokio::task::spawn_blocking(move || {
+                crate::codex_account::prepare_control_reconnect(
+                    &prepare_context,
+                    &prepare_id,
+                    &prepare_launch_id,
+                )
+            })
+            .await
+            {
+                Ok(Ok(record)) => record,
+                Ok(Err(err)) => {
+                    eprintln!(
+                        "warning: Codex account reconnect fence failed: {}",
+                        err.code()
+                    );
+                    continue;
+                }
+                Err(_) => continue,
+            };
             let (handle, commands) = codex_app_server::control_channel();
             if let Ok(mut controls) = state.codex_controls.lock() {
                 controls.insert(
@@ -2757,10 +3149,64 @@ async fn codex_control_loop(state: Arc<ServeState>) {
     }
 }
 
+fn fence_codex_controls_before_listen(context: &CliContext, tmux: &Path) -> Result<(), CliError> {
+    let root = context.state_dir.join("sessions");
+    let candidates: Vec<SessionRecord> = match std::fs::read_dir(root) {
+        Ok(entries) => entries
+            .filter_map(Result::ok)
+            .filter_map(|entry| entry.file_name().into_string().ok())
+            .filter_map(|id| load_session_record(context, &id).ok())
+            .filter(|record| {
+                codex_app_server::runtime_is_supported(record)
+                    && crate::codex_account::binding_is_present(record)
+            })
+            .collect(),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Vec::new(),
+        Err(_) => {
+            return Err(CliError::runtime(
+                "codex-account-reconnect-fence-unavailable",
+                "failed to inspect session records before serving",
+                None,
+            ));
+        }
+    };
+    if candidates.is_empty() {
+        return Ok(());
+    }
+    let snapshots = crate::tmux_session_snapshots(tmux).ok_or_else(|| {
+        CliError::runtime(
+            "codex-account-reconnect-fence-unavailable",
+            "failed to inspect live sessions before fencing Codex account controls",
+            None,
+        )
+    })?;
+    for record in candidates
+        .into_iter()
+        .filter(|record| snapshots.contains_key(&record.tmux_session))
+    {
+        let Some(launch_id) = record
+            .runtime
+            .as_ref()
+            .map(|runtime| runtime.launch_id.as_str())
+        else {
+            continue;
+        };
+        crate::codex_account::prepare_control_reconnect(context, &record.id, launch_id)?;
+    }
+    Ok(())
+}
+
 fn discover_codex_controls(context: &CliContext, tmux: &Path) -> Vec<SessionRecord> {
     let Some(tmux_snapshots) = crate::tmux_session_snapshots(tmux) else {
         return Vec::new();
     };
+    discover_codex_controls_from_snapshots(context, &tmux_snapshots)
+}
+
+fn discover_codex_controls_from_snapshots(
+    context: &CliContext,
+    tmux_snapshots: &std::collections::BTreeMap<String, crate::TmuxSessionSnapshot>,
+) -> Vec<SessionRecord> {
     let root = context.state_dir.join("sessions");
     let Ok(entries) = std::fs::read_dir(root) else {
         return Vec::new();
@@ -8612,10 +9058,12 @@ mod tests {
                 CodexAutoResumeTarget {
                     id: "slow".to_string(),
                     launch_id: "slow-launch".to_string(),
+                    binding: crate::codex_account::BindingSnapshot::Unbound,
                 },
                 CodexAutoResumeTarget {
                     id: "fast".to_string(),
                     launch_id: "fast-launch".to_string(),
+                    binding: crate::codex_account::BindingSnapshot::Unbound,
                 },
             ],
         ));
@@ -8695,6 +9143,7 @@ mod tests {
         let target = CodexAutoResumeTarget {
             id: record.id.clone(),
             launch_id: "launch-a".to_string(),
+            binding: crate::codex_account::binding_snapshot(&record),
         };
         record.runtime.as_mut().unwrap().launch_id = "launch-b".to_string();
         crate::write_session_record(&context, &record).unwrap();
@@ -9383,6 +9832,124 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn codex_account_switch_routes_the_nickname_to_the_exact_runtime_control() {
+        let lock = GlobalStateLock::new();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let _broker = EnvGuard::set(
+            &lock,
+            "AGENT_SESSION_CODEX_ACCOUNT_BROKER",
+            r#"["/bin/false"]"#,
+        );
+        let launch_id = seed_codex_app_server_session(tmp.path(), "account-switch");
+        let st = state(tmp.path(), Some(TOKEN), minimal_tmux(tmp.path()));
+        let record = load_session_record(&st.context, "account-switch").unwrap();
+        crate::activity::activate_runtime(&st.context, &record).unwrap();
+        for (event_id, kind) in [
+            ("turn-start", "turn_started"),
+            ("turn-done", "turn_completed"),
+        ] {
+            let event = serde_json::from_value(json!({
+                "schema_version": crate::activity::TURN_EVENT_VERSION,
+                "event_id": event_id,
+                "runtime_id": launch_id,
+                "provider": "codex",
+                "provider_turn_id": "turn-account-switch",
+                "kind": kind,
+                "confidence": "authoritative"
+            }))
+            .unwrap();
+            crate::activity::ingest_event(&st.context, &record.id, event).unwrap();
+        }
+        let (handle, mut commands) = codex_app_server::control_channel();
+        st.codex_controls.lock().unwrap().insert(
+            record.id.clone(),
+            CodexControlEntry {
+                launch_id: launch_id.clone(),
+                handle,
+            },
+        );
+        let responder_launch_id = launch_id.clone();
+        let responder = tokio::spawn(async move {
+            let Some(codex_app_server::ControlCommand::BindAccount {
+                account,
+                revision,
+                response,
+            }) = commands.recv().await
+            else {
+                panic!("account switch did not reach the Codex control plane");
+            };
+            assert_eq!(account, "gamania");
+            assert_eq!(revision, 1);
+            response
+                .send(Ok(crate::codex_account::CodexAccountView {
+                    schema_version: crate::codex_account::VIEW_SCHEMA_VERSION,
+                    supported: true,
+                    state: "bound",
+                    selected_account: Some(account),
+                    revision: 1,
+                    applied_runtime_id: Some(responder_launch_id),
+                    failure_reason: None,
+                }))
+                .unwrap();
+        });
+
+        let (status, body) = call(
+            router(st),
+            put_json(
+                "/sessions/account-switch/account",
+                Some(TOKEN),
+                json!({ "account": "gamania", "expected_session_incarnation": launch_id }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "body={body}");
+        assert_eq!(body["data"]["codex_account"]["state"], "bound");
+        assert_eq!(body["data"]["codex_account"]["selected_account"], "gamania");
+        assert_eq!(body["data"]["codex_account"]["revision"], 1);
+        responder.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn create_binding_wait_rejects_a_superseding_account_revision() {
+        let lock = GlobalStateLock::new();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let _broker = EnvGuard::set(
+            &lock,
+            "AGENT_SESSION_CODEX_ACCOUNT_BROKER",
+            r#"["/bin/false"]"#,
+        );
+        let launch_id = seed_codex_app_server_session(tmp.path(), "create-binding-race");
+        let st = state(tmp.path(), Some(TOKEN), minimal_tmux(tmp.path()));
+        let mut record = load_session_record(&st.context, "create-binding-race").unwrap();
+        crate::codex_account::set_initial_binding(&mut record, Some("sym")).unwrap();
+        crate::write_session_record(&st.context, &record).unwrap();
+        crate::codex_account::finish_binding(&st.context, &record.id, &launch_id, "sym", 1, Ok(()))
+            .unwrap();
+
+        let response = wait_for_account_binding(&st, &record.id, &launch_id, "gamania", 1)
+            .await
+            .unwrap_err();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+
+        let (handle, mut commands) = codex_app_server::control_channel();
+        let response = submit_structured_prompt_locked(
+            &st,
+            &record.id,
+            &launch_id,
+            Some(("gamania", 1)),
+            &handle,
+            "must not reach superseding account",
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert!(matches!(
+            commands.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[tokio::test]
     async fn structured_prompt_cancels_armed_auto_resume_before_provider_control() {
         let tmp = tempfile::TempDir::new().unwrap();
         let launch_id = seed_codex_app_server_session(tmp.path(), "structured-armed");
@@ -9436,6 +10003,69 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::OK, "body={body}");
         responder.await.unwrap();
+    }
+
+    #[test]
+    fn account_switch_cancels_and_versions_codex_auto_resume_evidence() {
+        let lock = GlobalStateLock::new();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let _broker = EnvGuard::set(
+            &lock,
+            "AGENT_SESSION_CODEX_ACCOUNT_BROKER",
+            r#"["/bin/false"]"#,
+        );
+        let launch_id = seed_codex_app_server_session(tmp.path(), "account-auto-resume");
+        let context = CliContext {
+            state_dir: tmp.path().to_path_buf(),
+            host: None,
+        };
+        let mut record = load_session_record(&context, "account-auto-resume").unwrap();
+        crate::codex_account::set_initial_binding(&mut record, Some("gamania")).unwrap();
+        crate::write_session_record(&context, &record).unwrap();
+        crate::codex_account::finish_binding(
+            &context,
+            &record.id,
+            &launch_id,
+            "gamania",
+            1,
+            Ok(()),
+        )
+        .unwrap();
+        record = load_session_record(&context, &record.id).unwrap();
+        crate::activity::activate_runtime(&context, &record).unwrap();
+        auto_resume::set_enabled(&context, &record.id, true, "2030-01-01T00:00:00Z").unwrap();
+        crate::activity::ingest_codex_app_server_failure(
+            &context, &record.id, &launch_id, "thread-a", "turn-a",
+        )
+        .unwrap();
+        let account_a = crate::codex_account::binding_snapshot(&record);
+
+        crate::codex_account::begin_switch_binding(&context, &record.id, &launch_id, "sym")
+            .unwrap();
+        let mut submissions = 0;
+        let outcome = auto_resume::tick_for_runtime_and_binding(
+            &context,
+            &record.id,
+            &launch_id,
+            &account_a,
+            1_893_456_000,
+            &UsageSnapshot {
+                authoritative: true,
+                has_exhausted_windows: false,
+                exhausted_reset_epochs: Vec::new(),
+            },
+            |_| {
+                submissions += 1;
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(outcome, auto_resume::TickOutcome::Unchanged);
+        assert_eq!(submissions, 0);
+        let view = auto_resume::view_for_record(&context, &record);
+        assert_eq!(view.state, "cancelled");
+        assert_eq!(view.failure_reason.as_deref(), Some("account_switch"));
     }
 
     #[tokio::test]
@@ -10456,6 +11086,18 @@ mod tests {
 
         let (status, body) = call(
             router(st.clone()),
+            put_json(
+                "/sessions/steer/account",
+                None,
+                json!({ "account": "gamania" }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(body["error"]["code"], "unauthorized");
+
+        let (status, body) = call(
+            router(st.clone()),
             post_bytes(
                 "/sessions/steer/attachments?filename=secret.png",
                 None,
@@ -10465,6 +11107,37 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::UNAUTHORIZED);
         assert_eq!(body["error"]["code"], "unauthorized");
+    }
+
+    #[tokio::test]
+    async fn codex_accounts_route_is_authenticated_and_projects_no_credentials() {
+        let lock = GlobalStateLock::new();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let broker = tmp.path().join("broker");
+        fs::write(
+            &broker,
+            r#"#!/bin/sh
+printf '%s\n' '{"schema_version":"agent-session.codex-auth-broker.v1","accounts":[{"account":"gamania","label":"Gamania","plan":"team"}]}'
+"#,
+        )
+        .unwrap();
+        fs::set_permissions(&broker, fs::Permissions::from_mode(0o700)).unwrap();
+        let argv = serde_json::to_string(&vec![broker.to_string_lossy().into_owned()]).unwrap();
+        let _broker = EnvGuard::set(&lock, "AGENT_SESSION_CODEX_ACCOUNT_BROKER", &argv);
+        let st = state(tmp.path(), Some(TOKEN), minimal_tmux(tmp.path()));
+
+        let (status, body) = call(router(st.clone()), get_auth("/codex/accounts", None)).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(body["error"]["code"], "unauthorized");
+
+        let (status, body) = call(router(st), get_auth("/codex/accounts", Some(TOKEN))).await;
+        assert_eq!(status, StatusCode::OK, "body={body}");
+        assert_eq!(body["data"]["machine"], MACHINE);
+        assert_eq!(body["data"]["accounts"][0]["account"], "gamania");
+        assert_eq!(body["data"]["accounts"][0]["label"], "Gamania");
+        let encoded = body.to_string();
+        assert!(!encoded.contains("access_token"));
+        assert!(!encoded.contains("chatgpt_account_id"));
     }
 
     #[tokio::test]

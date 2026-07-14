@@ -267,6 +267,23 @@ pub(crate) fn cancel_for_manual_input_locked(
     id: &str,
     now: &str,
 ) -> Result<(), CliError> {
+    cancel_active_locked(context, id, now, "manual_input")
+}
+
+pub(crate) fn cancel_for_account_switch_locked(
+    context: &CliContext,
+    id: &str,
+    now: &str,
+) -> Result<(), CliError> {
+    cancel_active_locked(context, id, now, "account_switch")
+}
+
+fn cancel_active_locked(
+    context: &CliContext,
+    id: &str,
+    now: &str,
+    reason: &str,
+) -> Result<(), CliError> {
     let mut state = read_state(context, id, now)?;
     if !state.enabled
         || !matches!(
@@ -281,7 +298,7 @@ pub(crate) fn cancel_for_manual_input_locked(
     state.updated_at = now.to_string();
     state.scheduled_at = None;
     state.next_check_at = None;
-    state.failure_reason = Some("manual_input".to_string());
+    state.failure_reason = Some(reason.to_string());
     write_state(context, id, &state)
 }
 
@@ -303,11 +320,12 @@ pub(crate) fn try_cancel_for_manual_input_for_runtime(
     let Some(_lock) = try_acquire_session_record_lock(context, &canonical_id)? else {
         return Ok(ManualInputCancelOutcome::Busy);
     };
-    let record = load_session_record(context, &canonical_id)?;
+    let mut record = load_session_record(context, &canonical_id)?;
     crate::ensure_same_session_identity(&observed, &record)?;
     if !runtime_matches(&record, Some(expected_launch_id)) {
         return Ok(ManualInputCancelOutcome::RuntimeChanged);
     }
+    crate::codex_account::authorize_input_locked(context, &mut record)?;
     cancel_for_manual_input_locked(context, &record.id, now)?;
     Ok(ManualInputCancelOutcome::Ready)
 }
@@ -572,9 +590,10 @@ pub(crate) fn tick<F>(
 where
     F: FnMut(&SessionRecord) -> Result<(), CliError>,
 {
-    tick_inner(context, id, None, now_epoch, usage, submit)
+    tick_inner(context, id, None, None, now_epoch, usage, submit)
 }
 
+#[cfg(test)]
 pub(crate) fn tick_for_runtime<F>(
     context: &CliContext,
     id: &str,
@@ -590,6 +609,30 @@ where
         context,
         id,
         Some(expected_launch_id),
+        None,
+        now_epoch,
+        usage,
+        submit,
+    )
+}
+
+pub(crate) fn tick_for_runtime_and_binding<F>(
+    context: &CliContext,
+    id: &str,
+    expected_launch_id: &str,
+    expected_binding: &crate::codex_account::BindingSnapshot,
+    now_epoch: i64,
+    usage: &UsageSnapshot,
+    submit: F,
+) -> Result<TickOutcome, CliError>
+where
+    F: FnMut(&SessionRecord) -> Result<(), CliError>,
+{
+    tick_inner(
+        context,
+        id,
+        Some(expected_launch_id),
+        Some(expected_binding),
         now_epoch,
         usage,
         submit,
@@ -600,6 +643,7 @@ fn tick_inner<F>(
     context: &CliContext,
     id: &str,
     expected_launch_id: Option<&str>,
+    expected_binding: Option<&crate::codex_account::BindingSnapshot>,
     now_epoch: i64,
     usage: &UsageSnapshot,
     mut submit: F,
@@ -611,9 +655,14 @@ where
     let observed = load_session_record(context, id)?;
     let canonical_id = observed.id.clone();
     let _lock = acquire_session_record_lock(context, &canonical_id)?;
-    let record = load_session_record(context, &canonical_id)?;
+    let mut record = load_session_record(context, &canonical_id)?;
     crate::ensure_same_session_identity(&observed, &record)?;
     if !runtime_matches(&record, expected_launch_id) {
+        return Ok(TickOutcome::Unchanged);
+    }
+    if expected_binding
+        .is_some_and(|expected| crate::codex_account::binding_snapshot(&record) != *expected)
+    {
         return Ok(TickOutcome::Unchanged);
     }
     let mut state = read_state(context, &record.id, &now)?;
@@ -720,6 +769,9 @@ where
 
     // Claim before submitting. A crash after this durable write is never
     // retried automatically, which preserves the no-duplicate guarantee.
+    if record.agent == "codex" {
+        crate::codex_account::authorize_input_locked(context, &mut record)?;
+    }
     state.state = "checking".to_string();
     state.updated_at = now.clone();
     state.scheduled_at = None;
