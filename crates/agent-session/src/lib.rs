@@ -16,7 +16,7 @@ use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, Stdio};
 use std::thread;
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use clap::Parser;
 use clap::error::ErrorKind;
@@ -48,6 +48,16 @@ use cli::{AgentKind, Cli, Command, SpecialKey};
 
 const SESSION_DOCUMENT_VERSION: &str = "agent-session.session.v1";
 const SESSION_RESUME_DOCUMENT_VERSION: &str = "agent-session.resume.v1";
+const STARTUP_PROJECTION_VERSION: &str = "agent-session.startup.v1";
+const STARTUP_EXTRA_KEY: &str = "startup";
+const STARTUP_STAGE_FILE: &str = ".startup-stage";
+const STARTUP_FAILURE_FILE: &str = ".startup-failure";
+const STARTUP_DIAGNOSTIC_FILE: &str = ".startup-diagnostic.log";
+const STARTUP_ARTIFACT_FILES: [&str; 3] = [
+    STARTUP_STAGE_FILE,
+    STARTUP_FAILURE_FILE,
+    STARTUP_DIAGNOSTIC_FILE,
+];
 const SESSION_RESUME_FILE: &str = "resume.json";
 const SESSION_LOCKS_DIR: &str = "session-locks";
 const BINARY: &str = "agent-session";
@@ -209,7 +219,7 @@ fn render_clap_message(err: &clap::Error) -> String {
 
 fn run_start(context: &CliContext, args: cli::StartArgs) -> i32 {
     let format = args.format;
-    match start_session(context, args) {
+    match start_session(context, args, StartFailureDisposition::ReturnError) {
         Ok(view) => render_single_success(
             START_COMMAND,
             view.format,
@@ -499,6 +509,415 @@ struct RuntimeInfo {
     extra: BTreeMap<String, Value>,
 }
 
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq, Serialize)]
+struct StartupProjection {
+    schema_version: String,
+    state: String,
+    stage: String,
+    started_at: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    failure_code: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    message: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    occurred_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    retry_safe: Option<bool>,
+    #[serde(default, flatten, skip_serializing_if = "BTreeMap::is_empty")]
+    extra: BTreeMap<String, Value>,
+}
+
+fn startup_stage_is_allowed(stage: &str) -> bool {
+    matches!(
+        stage,
+        "record"
+            | "tmux"
+            | "runtime"
+            | "app_server"
+            | "proxy"
+            | "provider_client"
+            | "initial_connection"
+    )
+}
+
+fn startup_failure_details(
+    code: &str,
+    observed_stage: &str,
+) -> Option<(&'static str, &'static str, bool)> {
+    match code {
+        "runtime-helper-unavailable" => Some((
+            "proxy",
+            "Session runtime helper is unavailable after an upgrade.",
+            true,
+        )),
+        "agent-binary-unavailable" => Some((
+            "runtime",
+            "The selected agent CLI could not be started.",
+            false,
+        )),
+        "working-directory-unavailable" => Some((
+            "record",
+            "The selected working directory is unavailable.",
+            false,
+        )),
+        "terminal-runtime-create-failed" => {
+            Some(("tmux", "The terminal runtime could not be created.", true))
+        }
+        "app-server-start-failed" => Some((
+            "app_server",
+            "The agent control server did not become ready.",
+            true,
+        )),
+        "proxy-start-failed" => Some((
+            "proxy",
+            "Agent Console could not connect the terminal to the agent runtime.",
+            true,
+        )),
+        "provider-client-exited" => Some((
+            "provider_client",
+            "The agent exited before the session was ready.",
+            true,
+        )),
+        "provider-configuration-rejected" => Some((
+            "provider_client",
+            "The agent needs configuration or sign-in on this machine.",
+            false,
+        )),
+        "startup-timeout" if startup_stage_is_allowed(observed_stage) => Some((
+            match observed_stage {
+                "record" => "record",
+                "tmux" => "tmux",
+                "runtime" => "runtime",
+                "app_server" => "app_server",
+                "proxy" => "proxy",
+                "provider_client" => "provider_client",
+                "initial_connection" => "initial_connection",
+                _ => unreachable!("stage checked above"),
+            },
+            "Session startup timed out; the outcome may be uncertain.",
+            false,
+        )),
+        "startup-exited" if startup_stage_is_allowed(observed_stage) => Some((
+            match observed_stage {
+                "record" => "record",
+                "tmux" => "tmux",
+                "runtime" => "runtime",
+                "app_server" => "app_server",
+                "proxy" => "proxy",
+                "provider_client" => "provider_client",
+                "initial_connection" => "initial_connection",
+                _ => unreachable!("stage checked above"),
+            },
+            "The session stopped during startup.",
+            true,
+        )),
+        _ => None,
+    }
+}
+
+fn startup_projection_is_valid(startup: &StartupProjection) -> bool {
+    if startup.schema_version != STARTUP_PROJECTION_VERSION
+        || !startup_stage_is_allowed(&startup.stage)
+        || startup.started_at.parse::<Timestamp>().is_err()
+    {
+        return false;
+    }
+    match startup.state.as_str() {
+        "starting" | "ready" => {
+            startup.failure_code.is_none()
+                && startup.message.is_none()
+                && startup.occurred_at.is_none()
+                && startup.retry_safe.is_none()
+        }
+        "failed" => {
+            let (Some(code), Some(message), Some(occurred_at), Some(retry_safe)) = (
+                startup.failure_code.as_deref(),
+                startup.message.as_deref(),
+                startup.occurred_at.as_deref(),
+                startup.retry_safe,
+            ) else {
+                return false;
+            };
+            let Some((stage, expected_message, expected_retry_safe)) =
+                startup_failure_details(code, &startup.stage)
+            else {
+                return false;
+            };
+            startup.stage == stage
+                && message == expected_message
+                && retry_safe == expected_retry_safe
+                && occurred_at.parse::<Timestamp>().is_ok()
+        }
+        _ => false,
+    }
+}
+
+fn startup_projection(record: &SessionRecord) -> Option<StartupProjection> {
+    let startup =
+        serde_json::from_value::<StartupProjection>(record.extra.get(STARTUP_EXTRA_KEY)?.clone())
+            .ok()?;
+    startup_projection_is_valid(&startup).then_some(startup)
+}
+
+fn store_startup_projection(record: &mut SessionRecord, startup: &StartupProjection) {
+    let mut durable = startup.clone();
+    if let Some(current) = startup_projection(record) {
+        for (key, value) in current.extra {
+            durable.extra.entry(key).or_insert(value);
+        }
+    }
+    record.extra.insert(
+        STARTUP_EXTRA_KEY.to_string(),
+        serde_json::to_value(durable).expect("startup projection is serializable"),
+    );
+}
+
+fn startup_projection_for_view(record: &SessionRecord) -> Option<StartupProjection> {
+    let mut startup = startup_projection(record)?;
+    startup.extra.clear();
+    Some(startup)
+}
+
+fn starting_projection(started_at: &str, stage: &str) -> StartupProjection {
+    debug_assert!(startup_stage_is_allowed(stage));
+    StartupProjection {
+        schema_version: STARTUP_PROJECTION_VERSION.to_string(),
+        state: "starting".to_string(),
+        stage: stage.to_string(),
+        started_at: started_at.to_string(),
+        failure_code: None,
+        message: None,
+        occurred_at: None,
+        retry_safe: None,
+        extra: BTreeMap::new(),
+    }
+}
+
+fn ready_projection(started_at: &str) -> StartupProjection {
+    StartupProjection {
+        state: "ready".to_string(),
+        stage: "initial_connection".to_string(),
+        ..starting_projection(started_at, "initial_connection")
+    }
+}
+
+fn failed_projection(
+    started_at: &str,
+    code: &str,
+    observed_stage: &str,
+    occurred_at: Option<&str>,
+) -> StartupProjection {
+    let (effective_code, (stage, message, retry_safe)) =
+        startup_failure_details(code, observed_stage)
+            .map(|details| (code, details))
+            .unwrap_or_else(|| {
+                (
+                    "startup-exited",
+                    startup_failure_details("startup-exited", observed_stage)
+                        .expect("allowed startup stage has a generic failure"),
+                )
+            });
+    StartupProjection {
+        schema_version: STARTUP_PROJECTION_VERSION.to_string(),
+        state: "failed".to_string(),
+        stage: stage.to_string(),
+        started_at: started_at.to_string(),
+        failure_code: Some(effective_code.to_string()),
+        message: Some(message.to_string()),
+        occurred_at: Some(
+            occurred_at
+                .map(ToOwned::to_owned)
+                .unwrap_or_else(|| Zoned::now().timestamp().to_string()),
+        ),
+        retry_safe: Some(retry_safe),
+        extra: BTreeMap::new(),
+    }
+}
+
+fn read_bounded_startup_marker(path: &Path) -> Option<String> {
+    let metadata = fs::metadata(path).ok()?;
+    if !metadata.is_file() || metadata.len() > 64 {
+        return None;
+    }
+    let value = fs::read_to_string(path).ok()?;
+    let value = value.trim();
+    (!value.is_empty() && value.len() <= 64 && !value.chars().any(char::is_whitespace))
+        .then(|| value.to_string())
+}
+
+fn startup_stage_marker(context: &CliContext, record: &SessionRecord) -> Option<String> {
+    let stage =
+        read_bounded_startup_marker(&session_dir(context, &record.id).join(STARTUP_STAGE_FILE))?;
+    startup_stage_is_allowed(&stage).then_some(stage)
+}
+
+fn startup_failure_marker(
+    context: &CliContext,
+    record: &SessionRecord,
+) -> Option<(String, String)> {
+    let path = session_dir(context, &record.id).join(STARTUP_FAILURE_FILE);
+    let code = read_bounded_startup_marker(&path)?;
+    startup_failure_details(&code, "runtime")?;
+    let seconds = fs::metadata(path)
+        .ok()?
+        .modified()
+        .ok()?
+        .duration_since(UNIX_EPOCH)
+        .ok()?
+        .as_secs()
+        .try_into()
+        .ok()?;
+    let occurred_at = Timestamp::from_second(seconds).ok()?.to_string();
+    Some((code, occurred_at))
+}
+
+fn stopped_startup_failure_code(stage: &str) -> &'static str {
+    match stage {
+        "tmux" => "terminal-runtime-create-failed",
+        "app_server" => "app-server-start-failed",
+        "proxy" => "proxy-start-failed",
+        "provider_client" | "initial_connection" => "provider-client-exited",
+        _ => "startup-exited",
+    }
+}
+
+fn desired_startup_projection(
+    context: &CliContext,
+    record: &SessionRecord,
+    status: &str,
+) -> Option<StartupProjection> {
+    let current = startup_projection(record)?;
+    if current.state != "starting" {
+        return None;
+    }
+    let observed_stage =
+        startup_stage_marker(context, record).unwrap_or_else(|| current.stage.clone());
+    if let Some((code, occurred_at)) = startup_failure_marker(context, record) {
+        return Some(failed_projection(
+            &current.started_at,
+            &code,
+            &observed_stage,
+            Some(&occurred_at),
+        ));
+    }
+    if status == "stopped" {
+        if observed_stage == "initial_connection" {
+            return Some(ready_projection(&current.started_at));
+        }
+        let code = stopped_startup_failure_code(&observed_stage);
+        return Some(failed_projection(
+            &current.started_at,
+            code,
+            &observed_stage,
+            None,
+        ));
+    }
+    if status == "running" {
+        if codex_app_server::runtime_is_supported(record) {
+            if observed_stage == "initial_connection" {
+                return Some(ready_projection(&current.started_at));
+            }
+            if observed_stage != current.stage {
+                return Some(starting_projection(&current.started_at, &observed_stage));
+            }
+            return None;
+        }
+        return Some(ready_projection(&current.started_at));
+    }
+    None
+}
+
+fn reconcile_owned_startup_projection(
+    context: &CliContext,
+    record: &mut SessionRecord,
+    status: &str,
+) {
+    let Some(desired) = desired_startup_projection(context, record, status) else {
+        return;
+    };
+    if startup_projection(record).as_ref() == Some(&desired) {
+        return;
+    }
+    let previous = startup_projection(record);
+    let previous_updated_at = record.updated_at.clone();
+    store_startup_projection(record, &desired);
+    record.updated_at = Zoned::now().timestamp().to_string();
+    if write_session_record(context, record).is_err() {
+        if let Some(previous) = previous {
+            store_startup_projection(record, &previous);
+        }
+        record.updated_at = previous_updated_at;
+    }
+}
+
+fn advance_owned_startup_stage(
+    context: &CliContext,
+    record: &mut SessionRecord,
+    stage: &str,
+) -> Result<(), CliError> {
+    let Some(current) = startup_projection(record) else {
+        return Ok(());
+    };
+    if current.state != "starting" || current.stage == stage {
+        return Ok(());
+    }
+    let previous_updated_at = record.updated_at.clone();
+    store_startup_projection(record, &starting_projection(&current.started_at, stage));
+    record.updated_at = Zoned::now().timestamp().to_string();
+    if let Err(err) = write_session_record(context, record) {
+        store_startup_projection(record, &current);
+        record.updated_at = previous_updated_at;
+        return Err(err);
+    }
+    Ok(())
+}
+
+fn reconcile_startup_projection(
+    context: &CliContext,
+    observed: SessionRecord,
+    observed_status: String,
+    bulk_snapshot_started_at: Option<&Timestamp>,
+) -> (SessionRecord, String) {
+    if startup_projection(&observed).is_none_or(|startup| startup.state != "starting") {
+        return (observed, observed_status);
+    }
+    let lock = match try_acquire_session_record_lock(context, &observed.id) {
+        Ok(Some(lock)) => lock,
+        Ok(None) | Err(_) => return (observed, observed_status),
+    };
+    let mut current = match load_session_record(context, &observed.id) {
+        Ok(current) if ensure_same_session_identity(&observed, &current).is_ok() => current,
+        _ => return (observed, observed_status),
+    };
+    if current.updated_at != observed.updated_at
+        || startup_projection(&current) != startup_projection(&observed)
+    {
+        return (current, observed_status);
+    }
+    if let Some(snapshot_started_at) = bulk_snapshot_started_at
+        && current
+            .updated_at
+            .parse::<Timestamp>()
+            .ok()
+            .is_none_or(|updated_at| updated_at >= *snapshot_started_at)
+    {
+        return (current, observed_status);
+    }
+    let Some(desired) = desired_startup_projection(context, &current, &observed_status) else {
+        return (current, observed_status);
+    };
+    if startup_projection(&current).as_ref() == Some(&desired) {
+        return (current, observed_status);
+    }
+    store_startup_projection(&mut current, &desired);
+    current.updated_at = Zoned::now().timestamp().to_string();
+    if write_session_record(context, &current).is_err() {
+        return (observed, observed_status);
+    }
+    drop(lock);
+    (current, observed_status)
+}
+
 fn same_runtime_identity(left: Option<&RuntimeInfo>, right: Option<&RuntimeInfo>) -> bool {
     match (left, right) {
         (Some(left), Some(right)) => {
@@ -573,6 +992,8 @@ struct SessionView {
     runtime_started_at: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     turn_state: Option<activity::TurnState>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    startup: Option<StartupProjection>,
     auto_resume: auto_resume::AutoResumeView,
 }
 
@@ -638,6 +1059,8 @@ struct GlanceResult {
     runtime_started_at: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     turn_state: Option<activity::TurnState>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    startup: Option<StartupProjection>,
     auto_resume: auto_resume::AutoResumeView,
 }
 
@@ -722,7 +1145,17 @@ impl CliError {
     }
 }
 
-fn start_session(context: &CliContext, args: cli::StartArgs) -> Result<StartView, CliError> {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StartFailureDisposition {
+    ReturnError,
+    ReturnSession,
+}
+
+fn start_session(
+    context: &CliContext,
+    args: cli::StartArgs,
+    failure_disposition: StartFailureDisposition,
+) -> Result<StartView, CliError> {
     validate_agent_args(args.agent, &args.agent_args)?;
     let cwd = resolve_cwd(args.cwd.as_deref())?;
     let prompt = read_prompt(&args.prompt, args.prompt_file.as_deref(), args.prompt_stdin)?;
@@ -762,6 +1195,11 @@ fn start_session(context: &CliContext, args: cli::StartArgs) -> Result<StartView
         }
     };
 
+    if let Err(err) = advance_owned_startup_stage(context, &mut created.record, "tmux") {
+        cleanup_created_record(context, &created);
+        return Err(err);
+    }
+
     if let Err(err) = start_interactive_tmux(
         &tmux_bin,
         &agent_bin,
@@ -771,9 +1209,44 @@ fn start_session(context: &CliContext, args: cli::StartArgs) -> Result<StartView
         &provider_plan.launch_args,
         &args.agent_args,
     ) {
-        cleanup_created_record(context, &created);
-        return Err(err);
+        let started_at = startup_projection(&created.record)
+            .map(|startup| startup.started_at)
+            .unwrap_or_else(|| created.record.created_at.clone());
+        let code = if err.code() == "codex-app-server-proxy-binary-unavailable" {
+            "runtime-helper-unavailable"
+        } else {
+            "terminal-runtime-create-failed"
+        };
+        let failed = failed_projection(&started_at, code, "tmux", None);
+        store_startup_projection(&mut created.record, &failed);
+        created.record.updated_at = Zoned::now().timestamp().to_string();
+        if let Err(write_err) = write_session_record(context, &created.record) {
+            cleanup_created_record(context, &created);
+            return Err(write_err);
+        }
+        let result = (failure_disposition == StartFailureDisposition::ReturnSession).then(|| {
+            session_view(
+                context,
+                &created.record,
+                Some("stopped".to_string()),
+                Some(&tmux_bin),
+            )
+        });
+        record_workdir_usage(context, &cwd);
+        if let Some(create_bootstrap) = create_bootstrap {
+            create_bootstrap.finish(|| created.release_lifecycle_lock());
+        } else {
+            created.release_lifecycle_lock();
+        }
+        return match result {
+            Some(result) => Ok(StartView {
+                format: args.format,
+                result,
+            }),
+            None => Err(err),
+        };
     }
+    let _ = advance_owned_startup_stage(context, &mut created.record, "runtime");
     if created.prompt_file.is_some() {
         if args.paste_delay_ms > 0 {
             thread::sleep(Duration::from_millis(args.paste_delay_ms));
@@ -796,12 +1269,9 @@ fn start_session(context: &CliContext, args: cli::StartArgs) -> Result<StartView
         }
     }
 
-    let result = session_view(
-        context,
-        &created.record,
-        Some("running".to_string()),
-        Some(&tmux_bin),
-    );
+    let status = session_status(&tmux_bin, &created.record);
+    reconcile_owned_startup_projection(context, &mut created.record, &status);
+    let result = session_view(context, &created.record, Some(status), Some(&tmux_bin));
     record_workdir_usage(context, &cwd);
     // Keep the app-server bootstrap marker valid for the entire create-lock
     // lifetime. Explicit ordering avoids Rust's reverse local-drop order from
@@ -903,7 +1373,7 @@ pub(crate) fn start_provider_resume_session(
     };
     let tmux_bin = resolve_tmux_bin(args.tmux_bin.as_deref());
     let agent_bin = resolve_agent_bin(args.agent, args.agent_bin.as_deref());
-    let created = create_record(RecordRequest {
+    let mut created = create_record(RecordRequest {
         context,
         agent: args.agent,
         mode: "interactive",
@@ -917,6 +1387,8 @@ pub(crate) fn start_provider_resume_session(
         agent_bin: Some(display_path(&agent_bin)),
     })?;
 
+    advance_owned_startup_stage(context, &mut created.record, "tmux")?;
+
     if let Err(err) = start_resume_tmux(
         &tmux_bin,
         &agent_bin,
@@ -927,13 +1399,11 @@ pub(crate) fn start_provider_resume_session(
         cleanup_created_record(context, &created);
         return Err(err);
     }
+    advance_owned_startup_stage(context, &mut created.record, "runtime")?;
 
-    let result = session_view(
-        context,
-        &created.record,
-        Some("running".to_string()),
-        Some(&tmux_bin),
-    );
+    let status = session_status(&tmux_bin, &created.record);
+    reconcile_owned_startup_projection(context, &mut created.record, &status);
+    let result = session_view(context, &created.record, Some(status), Some(&tmux_bin));
     record_workdir_usage(context, &cwd);
     Ok(StartView {
         format: args.format,
@@ -994,7 +1464,7 @@ fn create_record(request: RecordRequest<'_>) -> Result<CreatedRecord, CliError> 
         None => None,
     };
     let log_file = request.log_file_name.map(|name| session_dir.join(name));
-    let record = SessionRecord {
+    let mut record = SessionRecord {
         schema_version: SESSION_DOCUMENT_VERSION.to_string(),
         id,
         agent: request.agent.as_str().to_string(),
@@ -1006,7 +1476,7 @@ fn create_record(request: RecordRequest<'_>) -> Result<CreatedRecord, CliError> 
         prompt_file: prompt_file.as_ref().map(|path| display_path(path)),
         log_file: log_file.as_ref().map(|path| display_path(path)),
         created_at: iso.clone(),
-        updated_at: iso,
+        updated_at: iso.clone(),
         provider_resume: request.provider_resume,
         runtime: Some(RuntimeInfo {
             kind: "tmux".to_string(),
@@ -1021,6 +1491,9 @@ fn create_record(request: RecordRequest<'_>) -> Result<CreatedRecord, CliError> 
         extra: BTreeMap::new(),
         resume_sidecar_extra: BTreeMap::new(),
     };
+    if request.mode == "interactive" {
+        store_startup_projection(&mut record, &starting_projection(&iso, "record"));
+    }
 
     write_session_record(request.context, &record)?;
     if let Err(err) = activity::activate_runtime(request.context, &record) {
@@ -1326,6 +1799,33 @@ fn new_session_command(tmux_bin: &Path, scope_runner: Option<&Path>) -> ProcessC
     }
 }
 
+fn current_runtime_helper() -> Result<PathBuf, CliError> {
+    #[cfg(test)]
+    let executable = env::var_os("AGENT_SESSION_TEST_RUNTIME_HELPER")
+        .map(PathBuf::from)
+        .map(Ok)
+        .unwrap_or_else(env::current_exe);
+    #[cfg(not(test))]
+    let executable = env::current_exe();
+    let executable = executable.map_err(|_| {
+        CliError::runtime(
+            "codex-app-server-proxy-binary-unavailable",
+            "the agent-session runtime helper is unavailable",
+            None,
+        )
+    })?;
+    let executable_ready = fs::metadata(&executable)
+        .is_ok_and(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0);
+    if !executable_ready {
+        return Err(CliError::runtime(
+            "codex-app-server-proxy-binary-unavailable",
+            "the agent-session runtime helper is unavailable",
+            None,
+        ));
+    }
+    Ok(executable)
+}
+
 fn start_interactive_tmux(
     tmux_bin: &Path,
     agent_bin: &Path,
@@ -1375,13 +1875,7 @@ fn start_interactive_tmux(
                 Some(json!({ "id": record.id })),
             )
         })?;
-        let proxy_bin = env::current_exe().map_err(|err| {
-            CliError::runtime(
-                "codex-app-server-proxy-binary-unavailable",
-                format!("failed to resolve the agent-session proxy binary: {err}"),
-                Some(json!({ "id": record.id })),
-            )
-        })?;
+        let proxy_bin = current_runtime_helper()?;
         command
             .arg("sh")
             .arg("-c")
@@ -2035,6 +2529,8 @@ fn glance_session(context: &CliContext, args: cli::GlanceArgs) -> Result<GlanceR
     let mut record = load_session_record(context, &args.id)?;
     let tmux_bin = resolve_tmux_bin(args.tmux_bin.as_deref());
     let status = session_status(&tmux_bin, &record);
+    let (reconciled, status) = reconcile_startup_projection(context, record, status, None);
+    record = reconciled;
     if status != "running" {
         record = backfill_provider_resume(context, record);
     }
@@ -2066,6 +2562,7 @@ fn glance_session(context: &CliContext, args: cli::GlanceArgs) -> Result<GlanceR
             .as_ref()
             .map(|runtime| runtime.started_at.clone()),
         turn_state: activity::state_for_view(context, &record),
+        startup: startup_projection_for_view(&record),
         auto_resume: auto_resume::view_for_record(context, &record),
     })
 }
@@ -2322,6 +2819,110 @@ fn resume_session(context: &CliContext, args: cli::ResumeArgs) -> Result<Session
     resume_session_by_id(context, &args.id, &tmux_bin)
 }
 
+struct StartupArtifactBackup {
+    entries: Vec<(PathBuf, PathBuf)>,
+    finalized: bool,
+}
+
+impl StartupArtifactBackup {
+    fn ensure_not_interrupted(
+        context: &CliContext,
+        record: &SessionRecord,
+    ) -> Result<(), CliError> {
+        let dir = session_dir(context, &record.id);
+        for name in STARTUP_ARTIFACT_FILES {
+            let staged = dir.join(format!("{name}.resume-backup"));
+            match fs::symlink_metadata(&staged) {
+                Ok(_) => {
+                    return Err(CliError::runtime(
+                        "startup-artifact-backup-interrupted",
+                        "session has an interrupted startup artifact backup; resume is blocked to preserve prior diagnostics",
+                        Some(json!({ "id": record.id })),
+                    ));
+                }
+                Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+                Err(err) => {
+                    return Err(session_io_error(
+                        "startup-artifact-backup-failed",
+                        &staged,
+                        err,
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn stage(context: &CliContext, record: &SessionRecord) -> Result<Self, CliError> {
+        Self::ensure_not_interrupted(context, record)?;
+        let dir = session_dir(context, &record.id);
+        let mut backup = Self {
+            entries: Vec::new(),
+            finalized: false,
+        };
+        for name in STARTUP_ARTIFACT_FILES {
+            let current = dir.join(name);
+            let staged = dir.join(format!("{name}.resume-backup"));
+            match fs::rename(&current, &staged) {
+                Ok(()) => backup.entries.push((current, staged)),
+                Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+                Err(err) => {
+                    let _ = backup.restore();
+                    return Err(session_io_error(
+                        "startup-artifact-backup-failed",
+                        &current,
+                        err,
+                    ));
+                }
+            }
+        }
+        Ok(backup)
+    }
+
+    fn restore(&mut self) -> Result<(), CliError> {
+        let mut first_error = None;
+        for (current, staged) in self.entries.iter().rev() {
+            match fs::remove_file(current) {
+                Ok(()) => {}
+                Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+                Err(err) => {
+                    first_error.get_or_insert_with(|| {
+                        session_io_error("startup-artifact-restore-failed", current, err)
+                    });
+                    continue;
+                }
+            }
+            if let Err(err) = fs::rename(staged, current) {
+                first_error.get_or_insert_with(|| {
+                    session_io_error("startup-artifact-restore-failed", staged, err)
+                });
+            }
+        }
+        if first_error.is_none() {
+            self.finalized = true;
+        }
+        match first_error {
+            Some(err) => Err(err),
+            None => Ok(()),
+        }
+    }
+
+    fn discard(mut self) {
+        for (_, staged) in &self.entries {
+            let _ = fs::remove_file(staged);
+        }
+        self.finalized = true;
+    }
+}
+
+impl Drop for StartupArtifactBackup {
+    fn drop(&mut self) {
+        if !self.finalized {
+            let _ = self.restore();
+        }
+    }
+}
+
 fn resume_session_by_id(
     context: &CliContext,
     id: &str,
@@ -2353,6 +2954,7 @@ fn resume_session_by_id(
         }
         _ => {}
     }
+    StartupArtifactBackup::ensure_not_interrupted(context, &record)?;
     if record.provider_resume.is_none()
         && AgentKind::from_name(&record.agent) == Some(AgentKind::Codex)
         && let Some(provider_resume) = capture_codex_resume_from_history(&record)
@@ -2363,6 +2965,7 @@ fn resume_session_by_id(
     let (provider_resume, agent) = validate_resume_metadata(&record)?;
     let previous_record = record.clone();
     let previous_activity = activity::capture_snapshot(context, &record.id)?;
+    let mut startup_artifacts = StartupArtifactBackup::stage(context, &record)?;
     let resume_args = provider_resume.resume_args.clone();
     let agent_bin = record
         .agent_bin
@@ -2387,6 +2990,10 @@ fn resume_session_by_id(
             .map(|runtime| runtime.extra.clone())
             .unwrap_or_default(),
     });
+    store_startup_projection(
+        &mut record,
+        &starting_projection(&now.timestamp().to_string(), "record"),
+    );
     record.updated_at = now.timestamp().to_string();
     write_session_record(context, &record)?;
     activity::activate_runtime(context, &record)?;
@@ -2399,7 +3006,8 @@ fn resume_session_by_id(
     ) {
         let record_restore = write_session_record(context, &previous_record);
         let activity_restore = activity::restore_snapshot(context, &record.id, &previous_activity);
-        if record_restore.is_err() || activity_restore.is_err() {
+        let artifact_restore = startup_artifacts.restore();
+        if record_restore.is_err() || activity_restore.is_err() || artifact_restore.is_err() {
             return Err(CliError::runtime(
                 "resume-launch-rollback-failed",
                 "provider resume launch failed and the prior durable runtime could not be fully restored",
@@ -2407,12 +3015,15 @@ fn resume_session_by_id(
                     "id": record.id,
                     "launch_error": launch_err.code(),
                     "record_restored": record_restore.is_ok(),
-                    "activity_restored": activity_restore.is_ok()
+                    "activity_restored": activity_restore.is_ok(),
+                    "startup_artifacts_restored": artifact_restore.is_ok()
                 })),
             ));
         }
         return Err(launch_err);
     }
+    reconcile_owned_startup_projection(context, &mut record, "running");
+    startup_artifacts.discard();
     Ok(session_view(
         context,
         &record,
@@ -2813,8 +3424,22 @@ fn list_sessions(
                 )?;
                 let record = read_session_record(&resolved.record_path)?;
                 validate_record_id(&record, &resolved.expected_id, &resolved.record_path)?;
-                let (status, last_terminal_activity_at) =
+                let (status, observed_last_terminal_activity_at) =
                     session_list_runtime_snapshot(&tmux_bin, tmux_snapshots.as_ref(), &record);
+                let observed_status = status.clone();
+                let (record, status) = reconcile_startup_projection(
+                    context,
+                    record,
+                    status,
+                    tmux_snapshots
+                        .as_ref()
+                        .map(|snapshots| &snapshots.started_at),
+                );
+                let last_terminal_activity_at = if status == observed_status {
+                    observed_last_terminal_activity_at
+                } else {
+                    last_terminal_activity_at(&tmux_bin, &record, &status)
+                };
                 let record = if status == "running" {
                     record
                 } else {
@@ -2848,6 +3473,8 @@ fn load_session_view(
         .map(Path::to_path_buf)
         .unwrap_or_else(|| resolve_tmux_bin(None));
     let status = session_status(&tmux_bin, &record);
+    let (reconciled, status) = reconcile_startup_projection(context, record, status, None);
+    record = reconciled;
     if status != "running" {
         record = backfill_provider_resume(context, record);
     }
@@ -3427,6 +4054,7 @@ fn session_view_from_parts(
             .as_ref()
             .map(|runtime| runtime.started_at.clone()),
         turn_state: activity::state_for_view(context, record),
+        startup: startup_projection_for_view(record),
         auto_resume: auto_resume::view_for_record(context, record),
     }
 }
@@ -3447,13 +4075,24 @@ struct TmuxSessionSnapshot {
     last_terminal_activity_at: Option<String>,
 }
 
+struct TmuxSessionSnapshots {
+    started_at: Timestamp,
+    sessions: BTreeMap<String, TmuxSessionSnapshot>,
+}
+
+impl TmuxSessionSnapshots {
+    fn contains_key(&self, tmux_session: &str) -> bool {
+        self.sessions.contains_key(tmux_session)
+    }
+}
+
 fn session_list_runtime_snapshot(
     tmux_bin: &Path,
-    tmux_snapshots: Option<&BTreeMap<String, TmuxSessionSnapshot>>,
+    tmux_snapshots: Option<&TmuxSessionSnapshots>,
     record: &SessionRecord,
 ) -> (String, Option<String>) {
     match tmux_snapshots {
-        Some(snapshots) => match snapshots.get(&record.tmux_session) {
+        Some(snapshots) => match snapshots.sessions.get(&record.tmux_session) {
             Some(snapshot) => (
                 "running".to_string(),
                 snapshot.last_terminal_activity_at.clone(),
@@ -3464,7 +4103,8 @@ fn session_list_runtime_snapshot(
     }
 }
 
-fn tmux_session_snapshots(tmux_bin: &Path) -> Option<BTreeMap<String, TmuxSessionSnapshot>> {
+fn tmux_session_snapshots(tmux_bin: &Path) -> Option<TmuxSessionSnapshots> {
+    let started_at = Timestamp::now();
     let output = ProcessCommand::new(tmux_bin)
         .arg("list-windows")
         .arg("-a")
@@ -3497,8 +4137,9 @@ fn tmux_session_snapshots(tmux_bin: &Path) -> Option<BTreeMap<String, TmuxSessio
             })
             .or_insert(Some(epoch_seconds));
     }
-    Some(
-        activity_by_session
+    Some(TmuxSessionSnapshots {
+        started_at,
+        sessions: activity_by_session
             .into_iter()
             .map(|(session, maybe_epoch_seconds)| {
                 (
@@ -3510,7 +4151,7 @@ fn tmux_session_snapshots(tmux_bin: &Path) -> Option<BTreeMap<String, TmuxSessio
                 )
             })
             .collect(),
-    )
+    })
 }
 
 fn tmux_window_activity_at(tmux_bin: &Path, tmux_session: &str) -> Option<String> {
@@ -4626,6 +5267,294 @@ mod tests {
         let id = create_test_record_id(&context, AgentKind::Codex, None, Some("custom-id"));
 
         assert_eq!(id, "custom-id");
+    }
+
+    #[test]
+    fn malformed_or_unknown_startup_metadata_is_not_projected() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let context = test_context(tmp.path());
+        let mut record = create_record(RecordRequest {
+            context: &context,
+            agent: AgentKind::Codex,
+            mode: "interactive",
+            title: None,
+            explicit_id: Some("malformed-startup"),
+            cwd: Path::new("/repo"),
+            prompt: None,
+            log_file_name: None,
+            provider_resume: None,
+            agent_args: Vec::new(),
+            agent_bin: None,
+        })
+        .unwrap()
+        .record;
+        record.extra.insert(
+            super::STARTUP_EXTRA_KEY.to_string(),
+            serde_json::json!({
+                "schema_version": "agent-session.startup.v1",
+                "state": "failed",
+                "stage": "proxy",
+                "started_at": "2000-01-01T00:00:00Z",
+                "failure_code": "raw-provider-error",
+                "message": "token=secret /home/user/private",
+                "occurred_at": "2000-01-01T00:00:01Z",
+                "retry_safe": true
+            }),
+        );
+
+        assert!(super::startup_projection(&record).is_none());
+    }
+
+    fn make_managed_runtime(record: &mut super::SessionRecord, tmp: &Path) {
+        let runtime = record.runtime.as_mut().unwrap();
+        runtime.kind = super::codex_app_server::RUNTIME_KIND.to_string();
+        runtime.extra.insert(
+            super::codex_app_server::PROTOCOL_KEY.to_string(),
+            serde_json::json!(super::codex_app_server::PROTOCOL_VERSION),
+        );
+        for (key, name) in [
+            (super::codex_app_server::SOCKET_KEY, "runtime.sock"),
+            (super::codex_app_server::PROXY_KEY, "runtime.proxy"),
+            (
+                super::codex_app_server::THREAD_HANDOFF_KEY,
+                "runtime.thread",
+            ),
+            (
+                super::codex_app_server::THREAD_ATTACHED_KEY,
+                "runtime.attached",
+            ),
+        ] {
+            runtime
+                .extra
+                .insert(key.to_string(), serde_json::json!(tmp.join(name)));
+        }
+    }
+
+    #[test]
+    fn managed_provider_stage_stays_starting_until_connection_or_failure() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let context = test_context(tmp.path());
+        let mut created = create_record(RecordRequest {
+            context: &context,
+            agent: AgentKind::Codex,
+            mode: "interactive",
+            title: None,
+            explicit_id: Some("provider-stage"),
+            cwd: Path::new("/repo"),
+            prompt: None,
+            log_file_name: None,
+            provider_resume: None,
+            agent_args: Vec::new(),
+            agent_bin: None,
+        })
+        .unwrap();
+        make_managed_runtime(&mut created.record, tmp.path());
+        super::write_session_record(&context, &created.record).unwrap();
+        let session_dir = super::session_dir(&context, &created.record.id);
+        fs::write(
+            session_dir.join(super::STARTUP_STAGE_FILE),
+            "provider_client\n",
+        )
+        .unwrap();
+
+        let projection = super::desired_startup_projection(&context, &created.record, "running")
+            .expect("provider stage should advance the starting projection");
+        assert_eq!(projection.state, "starting");
+        assert_eq!(projection.stage, "provider_client");
+
+        fs::write(
+            session_dir.join(super::STARTUP_FAILURE_FILE),
+            "provider-client-exited\n",
+        )
+        .unwrap();
+        let projection = super::desired_startup_projection(&context, &created.record, "stopped")
+            .expect("provider exit should become a durable startup failure");
+        assert_eq!(projection.state, "failed");
+        assert_eq!(
+            projection.failure_code.as_deref(),
+            Some("provider-client-exited")
+        );
+    }
+
+    #[test]
+    fn startup_reconciliation_skips_owned_or_changed_lifecycles_without_a_locked_probe() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let context = test_context(tmp.path());
+        let mut created = create_record(RecordRequest {
+            context: &context,
+            agent: AgentKind::Codex,
+            mode: "interactive",
+            title: None,
+            explicit_id: Some("reconcile-race"),
+            cwd: Path::new("/repo"),
+            prompt: None,
+            log_file_name: None,
+            provider_resume: None,
+            agent_args: Vec::new(),
+            agent_bin: None,
+        })
+        .unwrap();
+        make_managed_runtime(&mut created.record, tmp.path());
+        super::write_session_record(&context, &created.record).unwrap();
+        fs::write(
+            super::session_dir(&context, &created.record.id).join(super::STARTUP_STAGE_FILE),
+            "provider_client\n",
+        )
+        .unwrap();
+
+        let observed = created.record.clone();
+        let (record, status) =
+            super::reconcile_startup_projection(&context, observed, "stopped".to_string(), None);
+        assert_eq!(status, "stopped");
+        assert_eq!(
+            super::startup_projection(&record).unwrap().state,
+            "starting"
+        );
+
+        created.record.updated_at = "2099-01-01T00:00:00Z".to_string();
+        super::write_session_record(&context, &created.record).unwrap();
+        drop(created);
+        let (record, status) =
+            super::reconcile_startup_projection(&context, record, "stopped".to_string(), None);
+        assert_eq!(status, "stopped");
+        assert_eq!(
+            super::startup_projection(&record).unwrap().state,
+            "starting"
+        );
+
+        let stale_bulk_started_at = "2000-01-01T00:00:00Z".parse::<jiff::Timestamp>().unwrap();
+        let (record, status) = super::reconcile_startup_projection(
+            &context,
+            record,
+            "stopped".to_string(),
+            Some(&stale_bulk_started_at),
+        );
+        assert_eq!(status, "stopped");
+        assert_eq!(
+            super::startup_projection(&record).unwrap().state,
+            "starting"
+        );
+
+        let (record, status) =
+            super::reconcile_startup_projection(&context, record, "running".to_string(), None);
+        assert_eq!(status, "running");
+        assert_eq!(
+            super::startup_projection(&record).unwrap().state,
+            "starting"
+        );
+        assert_eq!(
+            super::startup_projection(&record).unwrap().stage,
+            "provider_client"
+        );
+
+        fs::write(
+            super::session_dir(&context, &record.id).join(super::STARTUP_STAGE_FILE),
+            "initial_connection\n",
+        )
+        .unwrap();
+        let (record, status) =
+            super::reconcile_startup_projection(&context, record, "running".to_string(), None);
+        assert_eq!(status, "running");
+        assert_eq!(super::startup_projection(&record).unwrap().state, "ready");
+        assert_eq!(
+            super::startup_projection(
+                &super::load_session_record(&context, "reconcile-race").unwrap()
+            )
+            .unwrap()
+            .state,
+            "ready"
+        );
+    }
+
+    #[test]
+    fn startup_reconciliation_preserves_nested_future_fields_on_disk_but_not_in_views() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let context = test_context(tmp.path());
+        let mut created = create_record(RecordRequest {
+            context: &context,
+            agent: AgentKind::Codex,
+            mode: "interactive",
+            title: None,
+            explicit_id: Some("startup-future-fields"),
+            cwd: Path::new("/repo"),
+            prompt: None,
+            log_file_name: None,
+            provider_resume: None,
+            agent_args: Vec::new(),
+            agent_bin: None,
+        })
+        .unwrap();
+        created.record.extra.insert(
+            super::STARTUP_EXTRA_KEY.to_string(),
+            serde_json::json!({
+                "schema_version": "agent-session.startup.v1",
+                "state": "starting",
+                "stage": "record",
+                "started_at": created.record.created_at,
+                "future_private_state": { "keep": true }
+            }),
+        );
+        super::write_session_record(&context, &created.record).unwrap();
+
+        super::reconcile_owned_startup_projection(&context, &mut created.record, "running");
+        let persisted: serde_json::Value = serde_json::from_slice(
+            &fs::read(super::session_dir(&context, &created.record.id).join("session.json"))
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            persisted["startup"]["future_private_state"],
+            serde_json::json!({ "keep": true })
+        );
+        let view = serde_json::to_value(super::session_view(
+            &context,
+            &created.record,
+            Some("running".to_string()),
+            Some(Path::new("/bin/true")),
+        ))
+        .unwrap();
+        assert!(view["startup"].get("future_private_state").is_none());
+    }
+
+    #[test]
+    fn list_reconciles_multiple_starting_records_with_one_bulk_tmux_probe() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let context = test_context(tmp.path());
+        let mut sessions = Vec::new();
+        for id in ["bulk-starting-a", "bulk-starting-b"] {
+            let created = create_record(RecordRequest {
+                context: &context,
+                agent: AgentKind::Codex,
+                mode: "interactive",
+                title: None,
+                explicit_id: Some(id),
+                cwd: Path::new("/repo"),
+                prompt: None,
+                log_file_name: None,
+                provider_resume: None,
+                agent_args: Vec::new(),
+                agent_bin: None,
+            })
+            .unwrap();
+            sessions.push(created.record.tmux_session.clone());
+        }
+        let calls = tmp.path().join("tmux.calls");
+        let tmux = tmp.path().join("tmux");
+        fs::write(
+            &tmux,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$1\" >> {}\nif [ \"$1\" = list-windows ]; then\n  printf '%s\\t100\\n' {} {}\n  exit 0\nfi\nif [ \"$1\" = has-session ]; then exit 0; fi\nexit 1\n",
+                shell_words::quote(&calls.to_string_lossy()),
+                shell_words::quote(&sessions[0]),
+                shell_words::quote(&sessions[1]),
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&tmux, fs::Permissions::from_mode(0o700)).unwrap();
+
+        let views = super::list_sessions(&context, Some(&tmux)).unwrap();
+        assert_eq!(views.len(), 2);
+        assert_eq!(fs::read_to_string(calls).unwrap(), "list-windows\n");
     }
 
     #[test]

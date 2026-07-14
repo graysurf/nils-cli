@@ -3678,7 +3678,7 @@ fn run_and_logs_cover_json_contract_and_file_fallback() {
 }
 
 #[test]
-fn failure_paths_return_json_without_leaking_prompt_or_orphaning_state() {
+fn failure_paths_return_json_without_leaking_prompt_and_classify_durable_startup() {
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let state_dir = tmp.path().join("state");
     let cwd = tmp.path().join("repo");
@@ -3697,10 +3697,12 @@ fn failure_paths_return_json_without_leaking_prompt_or_orphaning_state() {
             tmux_log.to_string_lossy().to_string(),
         ),
         ("AGENT_SESSION_FAKE_TMUX_FAIL", "new-session".to_string()),
+        ("AGENT_SESSION_TMUX_BIN", tmux_arg.clone()),
     ];
     let env_refs = [
         (envs[0].0, envs[0].1.as_str()),
         (envs[1].0, envs[1].1.as_str()),
+        (envs[2].0, envs[2].1.as_str()),
     ];
 
     let output = run(
@@ -3733,8 +3735,29 @@ fn failure_paths_return_json_without_leaking_prompt_or_orphaning_state() {
     assert_eq!(value["ok"], false);
     assert_eq!(value["error"]["code"], "command-failed");
     assert!(
-        !state_dir.join("sessions").join("fail-start").exists(),
-        "failed tmux startup should not leave session state"
+        state_dir.join("sessions").join("fail-start").exists(),
+        "post-record tmux failure should remain a durable stopped session"
+    );
+    let list_env_refs = [
+        env_refs[0],
+        env_refs[1],
+        env_refs[2],
+        ("AGENT_SESSION_FAKE_TMUX_HAS_SESSION", "0"),
+    ];
+    let list = run(
+        tmp.path(),
+        &["--state-dir", &state_arg, "list", "--format", "json"],
+        &list_env_refs,
+    );
+    assert_eq!(list.code, 0, "stderr={}", list.stderr_text());
+    let list_value = list.stdout_json();
+    let listed = &data(&list_value)[0];
+    assert_eq!(listed["status"], "stopped");
+    assert_eq!(listed["startup"]["state"], "failed");
+    assert_eq!(listed["startup"]["stage"], "tmux");
+    assert_eq!(
+        listed["startup"]["failure_code"],
+        "terminal-runtime-create-failed"
     );
 
     let envs = [
@@ -5132,7 +5155,7 @@ fn resume_recreates_tmux_runtime_from_exact_provider_identity() {
     fs::create_dir_all(&cwd).expect("repo dir");
     let (tmux_bin, tmux_log) = fake_tmux(tmp.path());
     let codex_bin = fake_agent(tmp.path(), "codex");
-    write_resumable_session_record_with_agent_bin(
+    let session = write_resumable_session_record_with_agent_bin(
         &state_dir,
         "recoverable",
         "codex",
@@ -5147,6 +5170,35 @@ fn resume_recreates_tmux_runtime_from_exact_provider_identity() {
         ],
         Some(&codex_bin),
     );
+    let record_path = session.join("session.json");
+    let mut failed_record: Value =
+        serde_json::from_str(&fs::read_to_string(&record_path).unwrap()).unwrap();
+    failed_record["startup"] = json!({
+        "schema_version": "agent-session.startup.v1",
+        "state": "failed",
+        "stage": "tmux",
+        "started_at": "2000-01-01T00:00:00Z",
+        "failure_code": "terminal-runtime-create-failed",
+        "message": "The terminal runtime could not be created.",
+        "occurred_at": "2000-01-01T00:00:01Z",
+        "retry_safe": true
+    });
+    fs::write(
+        &record_path,
+        serde_json::to_string_pretty(&failed_record).unwrap(),
+    )
+    .unwrap();
+    fs::write(session.join(".startup-stage"), "tmux\n").unwrap();
+    fs::write(
+        session.join(".startup-failure"),
+        "terminal-runtime-create-failed\n",
+    )
+    .unwrap();
+    fs::write(
+        session.join(".startup-diagnostic.log"),
+        "private prior failure\n",
+    )
+    .unwrap();
 
     let state_arg = state_dir.to_string_lossy().to_string();
     let tmux_arg = tmux_bin.to_string_lossy().to_string();
@@ -5177,13 +5229,13 @@ fn resume_recreates_tmux_runtime_from_exact_provider_identity() {
     assert_eq!(result["id"], "recoverable");
     assert_eq!(result["status"], "running");
     assert_eq!(result["resumable"], true);
+    assert_eq!(result["startup"]["state"], "ready");
 
     let calls = tmux_calls(&tmux_log);
     let new_session = calls
         .iter()
         .find(|call| call.first().is_some_and(|arg| arg == "new-session"))
         .expect("new-session call");
-    let record_path = state_dir.join("sessions/recoverable/session.json");
     let record: Value = serde_json::from_str(&fs::read_to_string(&record_path).unwrap()).unwrap();
     let runtime_id = record["runtime"]["launch_id"].as_str().expect("runtime id");
     assert_eq!(
@@ -5217,10 +5269,28 @@ fn resume_recreates_tmux_runtime_from_exact_provider_identity() {
     assert_eq!(record["runtime"]["generation"], 2);
     assert_ne!(record["updated_at"], "2000-01-01T00:00:00Z");
     assert_eq!(record["agent_bin"], codex_arg);
+    assert_eq!(record["startup"]["state"], "ready");
+    assert!(!session.join(".startup-failure").exists());
+    assert!(!session.join(".startup-diagnostic.log").exists());
     assert!(
         record_path.with_file_name("resume.json").is_file(),
         "resume should refresh the durable sidecar"
     );
+
+    let list = run(
+        tmp.path(),
+        &["--state-dir", &state_arg, "list", "--format", "json"],
+        &[
+            ("AGENT_SESSION_TMUX_BIN", &tmux_arg),
+            ("AGENT_SESSION_FAKE_TMUX_LOG", &tmux_log_arg),
+            ("AGENT_SESSION_FAKE_TMUX_HAS_SESSION", "0"),
+        ],
+    );
+    assert_eq!(list.code, 0, "stderr={}", list.stderr_text());
+    let list_value = list.stdout_json();
+    let listed = &data(&list_value)[0];
+    assert_eq!(listed["status"], "stopped");
+    assert_eq!(listed["startup"]["state"], "ready");
 }
 
 #[test]
@@ -5301,10 +5371,40 @@ fn resume_launch_failure_restores_the_prior_runtime_and_activity() {
         "codex",
         "hs-codex-resume-launch-fail",
         &cwd,
-        &["resume", "resume-session-id", "--cd", cwd.to_str().unwrap()],
+        &[
+            "resume",
+            "resume-session-id",
+            "--cd",
+            cwd.to_str().unwrap(),
+            "--no-alt-screen",
+        ],
         Some(&codex_bin),
     );
     let record_path = session.join("session.json");
+    let mut seeded: Value =
+        serde_json::from_str(&fs::read_to_string(&record_path).unwrap()).unwrap();
+    seeded["startup"] = json!({
+        "schema_version": "agent-session.startup.v1",
+        "state": "failed",
+        "stage": "tmux",
+        "started_at": "2000-01-01T00:00:00Z",
+        "failure_code": "terminal-runtime-create-failed",
+        "message": "The terminal runtime could not be created.",
+        "occurred_at": "2000-01-01T00:00:01Z",
+        "retry_safe": true
+    });
+    fs::write(&record_path, serde_json::to_string_pretty(&seeded).unwrap()).unwrap();
+    fs::write(session.join(".startup-stage"), "tmux\n").unwrap();
+    fs::write(
+        session.join(".startup-failure"),
+        "terminal-runtime-create-failed\n",
+    )
+    .unwrap();
+    fs::write(
+        session.join(".startup-diagnostic.log"),
+        "private prior failure\n",
+    )
+    .unwrap();
     let before: Value =
         serde_json::from_str(&fs::read_to_string(&record_path).expect("prior record"))
             .expect("prior record json");
@@ -5332,11 +5432,21 @@ fn resume_launch_failure_restores_the_prior_runtime_and_activity() {
     );
 
     assert_ne!(output.code, 0);
+    assert_eq!(output.stdout_json()["error"]["code"], "command-failed");
     let after: Value =
         serde_json::from_str(&fs::read_to_string(&record_path).expect("restored record"))
             .expect("restored record json");
     assert_eq!(after["runtime"], before["runtime"]);
     assert_eq!(after["updated_at"], before["updated_at"]);
+    assert_eq!(after["startup"], before["startup"]);
+    assert_eq!(
+        fs::read_to_string(session.join(".startup-failure")).unwrap(),
+        "terminal-runtime-create-failed\n"
+    );
+    assert_eq!(
+        fs::read_to_string(session.join(".startup-diagnostic.log")).unwrap(),
+        "private prior failure\n"
+    );
     assert!(
         !session.join("activity.json").exists(),
         "a failed launch must not retain a phantom Starting runtime"
@@ -5344,6 +5454,156 @@ fn resume_launch_failure_restores_the_prior_runtime_and_activity() {
     assert!(
         !session.join("activity.replay.bin").exists(),
         "a failed launch must restore the prior replay-index boundary"
+    );
+}
+
+#[test]
+fn resume_fails_closed_without_deleting_interrupted_startup_backups() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let state_dir = tmp.path().join("state");
+    let codex_home = tmp.path().join("codex-home");
+    let cwd = tmp.path().join("repo");
+    fs::create_dir_all(&cwd).expect("repo dir");
+    let (tmux_bin, tmux_log) = fake_tmux(tmp.path());
+    write_codex_session_meta(
+        &codex_home.join("sessions/2026/07/05/backfill.jsonl"),
+        "resume-session-id",
+        &cwd,
+        "2000-01-01T00:00:30Z",
+    );
+    let state_arg = state_dir.to_string_lossy().to_string();
+    let codex_home_arg = codex_home.to_string_lossy().to_string();
+    let tmux_arg = tmux_bin.to_string_lossy().to_string();
+    let tmux_log_arg = tmux_log.to_string_lossy().to_string();
+    for (suffix, artifact) in [
+        ("stage", ".startup-stage"),
+        ("failure", ".startup-failure"),
+        ("diagnostic", ".startup-diagnostic.log"),
+    ] {
+        let id = format!("resume-interrupted-{suffix}");
+        let session = write_session_record_with_cwd(
+            &state_dir,
+            &id,
+            "codex",
+            &format!("hs-codex-resume-interrupted-{suffix}"),
+            &cwd,
+        );
+        let record_path = session.join("session.json");
+        let sidecar_path = session.join("resume.json");
+        let before = fs::read_to_string(&record_path).expect("prior record");
+        let staged = session.join(format!("{artifact}.resume-backup"));
+        fs::write(&staged, "prior private artifact\n").unwrap();
+        let output = run(
+            tmp.path(),
+            &[
+                "--state-dir",
+                &state_arg,
+                "resume",
+                &id,
+                "--tmux-bin",
+                &tmux_arg,
+                "--format",
+                "json",
+            ],
+            &[
+                ("CODEX_HOME", &codex_home_arg),
+                ("AGENT_SESSION_FAKE_TMUX_LOG", &tmux_log_arg),
+                ("AGENT_SESSION_FAKE_TMUX_HAS_SESSION", "0"),
+                ("AGENT_SESSION_FAKE_TMUX_FAIL", "new-session"),
+            ],
+        );
+
+        assert_ne!(output.code, 0);
+        assert_eq!(
+            output.stdout_json()["error"]["code"],
+            "startup-artifact-backup-interrupted"
+        );
+        assert_eq!(fs::read_to_string(&record_path).unwrap(), before);
+        assert!(!sidecar_path.exists());
+        assert_eq!(
+            fs::read_to_string(&staged).unwrap(),
+            "prior private artifact\n"
+        );
+    }
+    assert!(
+        tmux_calls(&tmux_log)
+            .iter()
+            .all(|call| call.first().is_none_or(|arg| arg != "new-session")),
+        "interrupted transaction must fail before launching a new runtime"
+    );
+}
+
+#[test]
+fn resume_treats_a_dangling_startup_backup_symlink_as_interrupted_state() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let state_dir = tmp.path().join("state");
+    let codex_home = tmp.path().join("codex-home");
+    let cwd = tmp.path().join("repo");
+    fs::create_dir_all(&cwd).expect("repo dir");
+    let (tmux_bin, tmux_log) = fake_tmux(tmp.path());
+    let session = write_session_record_with_cwd(
+        &state_dir,
+        "resume-dangling-backup",
+        "codex",
+        "hs-codex-resume-dangling-backup",
+        &cwd,
+    );
+    write_codex_session_meta(
+        &codex_home.join("sessions/2026/07/05/backfill.jsonl"),
+        "resume-session-id",
+        &cwd,
+        "2000-01-01T00:00:30Z",
+    );
+    let record_path = session.join("session.json");
+    let sidecar_path = session.join("resume.json");
+    let current_failure = session.join(".startup-failure");
+    let staged_failure = session.join(".startup-failure.resume-backup");
+    let missing_target = session.join("missing-prior-artifact");
+    let before = fs::read_to_string(&record_path).expect("prior record");
+    fs::write(&current_failure, "current failure\n").unwrap();
+    symlink(&missing_target, &staged_failure).unwrap();
+
+    let state_arg = state_dir.to_string_lossy().to_string();
+    let codex_home_arg = codex_home.to_string_lossy().to_string();
+    let tmux_arg = tmux_bin.to_string_lossy().to_string();
+    let tmux_log_arg = tmux_log.to_string_lossy().to_string();
+    let output = run(
+        tmp.path(),
+        &[
+            "--state-dir",
+            &state_arg,
+            "resume",
+            "resume-dangling-backup",
+            "--tmux-bin",
+            &tmux_arg,
+            "--format",
+            "json",
+        ],
+        &[
+            ("CODEX_HOME", &codex_home_arg),
+            ("AGENT_SESSION_FAKE_TMUX_LOG", &tmux_log_arg),
+            ("AGENT_SESSION_FAKE_TMUX_HAS_SESSION", "0"),
+            ("AGENT_SESSION_FAKE_TMUX_FAIL", "new-session"),
+        ],
+    );
+
+    assert_ne!(output.code, 0);
+    assert_eq!(
+        output.stdout_json()["error"]["code"],
+        "startup-artifact-backup-interrupted"
+    );
+    assert_eq!(fs::read_to_string(&record_path).unwrap(), before);
+    assert!(!sidecar_path.exists());
+    assert_eq!(
+        fs::read_to_string(&current_failure).unwrap(),
+        "current failure\n"
+    );
+    assert_eq!(fs::read_link(&staged_failure).unwrap(), missing_target);
+    assert!(
+        tmux_calls(&tmux_log)
+            .iter()
+            .all(|call| call.first().is_none_or(|arg| arg != "new-session")),
+        "dangling backup entry must block before launching a new runtime"
     );
 }
 

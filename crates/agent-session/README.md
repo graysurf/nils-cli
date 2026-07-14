@@ -140,8 +140,29 @@ is no second state model.
 - `GET /healthz`, `GET /sessions`, `GET /sessions/{id}/glance?tail=N` — reads, open on loopback. `GET /sessions`
   additively reports `data.observed_at`, sampled from daemon time after the returned session state is assembled. Sessions report
   `running`, `stopped`, or `unknown` live status plus a boolean `resumable` field and best-effort `repo_name` derived from
-  the recorded `cwd`. New records also expose optional `runtime_started_at` and
-  `turn_state`; old records omit them.
+  the recorded `cwd`. New interactive records also expose optional
+  `runtime_started_at`, `turn_state`, and `startup`; old records omit them.
+  `startup` is the metadata-only `agent-session.startup.v1` projection shared by
+  create, list, and glance responses. Its state is `starting`, `ready`, or
+  `failed`; its bounded stage is `record`, `tmux`, `runtime`, `app_server`,
+  `proxy`, `provider_client`, or `initial_connection`. Failed projections add
+  an RFC 3339 `occurred_at` captured from the private failure marker, boolean
+  `retry_safe`, one reviewed message, and one
+  allowlisted code: `runtime-helper-unavailable`, `agent-binary-unavailable`,
+  `working-directory-unavailable`, `terminal-runtime-create-failed`,
+  `app-server-start-failed`, `proxy-start-failed`, `provider-client-exited`,
+  `provider-configuration-rejected`, `startup-timeout`, or `startup-exited`.
+  Managed launchers retain only bounded stage/failure markers in the record and
+  keep startup stderr in a private, tail-capped local diagnostic file only until
+  the initial connection succeeds; raw argv, environment, provider responses,
+  stderr, prompts, and filesystem paths are never copied into the projection. A
+  record that reached `ready` keeps that
+  state after an ordinary later stop, so consumers must not relabel normal
+  session termination as startup failure. A resume starts a fresh startup
+  lifecycle for its new runtime generation; synchronous launch rollback restores
+  the prior projection and private diagnostic artifacts. A leftover resume
+  backup from an interrupted process blocks another resume before mutation so
+  the only copy of prior diagnostic state is not silently discarded.
 - `GET /usage` — read-only provider usage report, open on loopback. The serve
   envelope contains `data.usage.schema_version: "agent-session.usage.v1"` and
   provider entries for Codex and Claude. Provider readers are bounded by
