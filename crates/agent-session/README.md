@@ -270,7 +270,8 @@ is no second state model.
   and `agent_args`; invalid, missing, ambiguous, or unsupported provider ids return structured errors.
   For a fresh serve-managed Codex session, `agent-session` probes bounded
   `codex --version` and `codex app-server --help` process groups. The audited
-  version is exactly Codex `0.144.1`, and help must advertise Unix `--listen` support. A
+  versions are exactly Codex `0.144.1` and `0.144.3`, and help must advertise
+  Unix `--listen` support. A
   matching CLI is launched as a remote TUI over a private short socket below an
   owned, non-symlinked mode-`0700` `XDG_RUNTIME_DIR`; otherwise auto mode
   degrades to the existing raw TUI. `AGENT_SESSION_CODEX_RUNTIME=raw` forces
