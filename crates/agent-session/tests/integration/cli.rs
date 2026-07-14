@@ -4572,7 +4572,7 @@ exit 0
 }
 
 #[test]
-fn delete_fails_closed_when_the_managed_pane_respawns_at_kill_time() {
+fn delete_recaptures_and_terminates_a_bounded_replacement_pane() {
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let state_dir = tmp.path().join("state");
     let tmux_bin = tmp.path().join("tmux-kill-time-respawn");
@@ -4678,19 +4678,14 @@ exit 0
         &[],
     );
 
-    assert_eq!(output.code, 1, "stdout={}", output.stdout_text());
-    let error = output.stdout_json();
-    assert_eq!(error["error"]["code"], "session-termination-failed");
-    assert_eq!(error["error"]["details"]["reason"], "process-still-running");
-    assert_eq!(error["error"]["details"]["retryable"], true);
-    assert_eq!(error["error"]["details"]["action"], "retry-delete");
-    assert!(session_dir.exists(), "replacement evidence must remain");
-    assert!(replacement_pane.is_running());
-    let retained: Value = serde_json::from_slice(&fs::read(&record_path).unwrap()).unwrap();
-    assert_eq!(
-        retained["delete_tmux_identity"]["process_group_id"],
-        replacement_pane.pid()
+    assert_eq!(output.code, 0, "stdout={}", output.stdout_text());
+    assert_eq!(data(&output.stdout_json())["deleted"], true);
+    assert!(
+        !session_dir.exists(),
+        "completed delete must remove metadata"
     );
+    assert!(!captured_pane.is_running());
+    assert!(!replacement_pane.is_running());
     let calls = fs::read_to_string(&tmux_log).unwrap();
     assert!(calls.contains("if-shell -F -t %78"), "{calls}");
     assert!(
@@ -5018,7 +5013,7 @@ exit 0
 }
 
 #[test]
-fn delete_retains_state_while_the_exact_pane_process_group_survives() {
+fn delete_terminates_the_exact_pane_process_group_after_tmux_stops() {
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let state_dir = tmp.path().join("state");
     let pane = spawn_test_process_group();
@@ -5079,23 +5074,13 @@ exit 42
         &[],
     );
 
-    assert_eq!(output.code, 1, "stdout={}", output.stdout_text());
-    assert_eq!(
-        output.stdout_json()["error"]["details"]["reason"],
-        "process-still-running"
+    assert_eq!(output.code, 0, "stdout={}", output.stdout_text());
+    assert_eq!(data(&output.stdout_json())["deleted"], true);
+    assert!(
+        !session_dir.exists(),
+        "completed delete must remove metadata"
     );
-    assert!(session_dir.exists());
-    assert_eq!(unsafe { libc::kill(pane_pid as libc::pid_t, 0) }, 0);
-    let retained: Value = serde_json::from_str(
-        &fs::read_to_string(session_dir.join("session.json")).expect("retained session record"),
-    )
-    .expect("retained session json");
-    assert_eq!(retained["delete_tmux_identity"]["session_id"], "$92");
-    assert_eq!(retained["delete_tmux_identity"]["pane_id"], "%92");
-    assert_eq!(
-        retained["delete_tmux_identity"]["process_group_id"],
-        pane_pid
-    );
+    assert!(!pane.is_running());
 }
 
 #[test]

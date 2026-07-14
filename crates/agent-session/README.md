@@ -54,7 +54,8 @@ stopped. Before killing a live runtime, it inspects only the managed `0.0` pane,
 ids and process group, validates the runtime's `AGENT_SESSION_*` ownership markers, persists that identity for retry, and
 uses one tmux-server conditional command to kill only if the captured session, pane, and pane PID still match.
 If the managed pane is replaced, it durably retains every unresolved observed process identity before proceeding. It then
-targets only the captured tmux session id and requires tmux and every retained process group to be gone. A retry can
+targets only the captured tmux session id, terminates the verified pane process group with bounded TERM/KILL escalation,
+and requires tmux and every retained process group to be gone. A retry can
 finish cleanup without another kill only when all persisted identities verify stopped. Live records created by an older
 version can be upgraded from their ownership markers. A stopped pre-upgrade record without a provable launch identity remains
 retained and returns `runtime-identity-unavailable`, `retryable: false`, and
