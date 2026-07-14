@@ -12377,6 +12377,57 @@ printf '%s\n' '{"schema_version":"agent-session.codex-auth-broker.v1","accounts"
     }
 
     #[tokio::test]
+    async fn delete_accepts_current_generation_never_launched_proof() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let calls = tmp.path().join("never-launched-delete-calls");
+        let tmux = executable(
+            &tmp.path().join("never-launched-delete-tmux"),
+            &format!(
+                "#!/usr/bin/env sh\nprintf '%s\\n' \"$*\" >> {}\ncase \"$1\" in\n  display-message|has-session) printf \"%s\\n\" \"can't find session: never-launched\" >&2; exit 1 ;;\n  *) exit 42 ;;\nesac\n",
+                shell_words::quote(&calls.to_string_lossy())
+            ),
+        );
+
+        for agent in ["codex", "claude"] {
+            let id = format!("never-launched-delete-{agent}");
+            let tmux_session = format!("hs-{agent}-never-launched-delete");
+            seed_session_with_runtime(tmp.path(), &id, agent, &tmux_session);
+            let session_dir = tmp.path().join("sessions").join(&id);
+            let record_path = session_dir.join("session.json");
+            let mut record: Value =
+                serde_json::from_slice(&std::fs::read(&record_path).unwrap()).unwrap();
+            record["tmux_runtime_never_launched"] = record["runtime"]["launch_id"].clone();
+            std::fs::write(&record_path, serde_json::to_vec_pretty(&record).unwrap()).unwrap();
+            let runtime_metadata = session_dir.join("provider-runtime.json");
+            std::fs::write(&runtime_metadata, format!("runtime metadata for {agent}")).unwrap();
+
+            let st = state(tmp.path(), Some(TOKEN), tmux.clone());
+            let request = Request::builder()
+                .method("DELETE")
+                .uri(format!("/sessions/{id}"))
+                .header("authorization", format!("Bearer {TOKEN}"))
+                .body(Body::empty())
+                .unwrap();
+            let (status, body) = call(router(st), request).await;
+
+            assert_eq!(status, StatusCode::OK, "body={body}");
+            assert_eq!(body["ok"], true);
+            assert_eq!(body["data"]["deleted"]["deleted"], true);
+            assert!(!session_dir.exists(), "{agent} metadata must be removed");
+            assert!(
+                !runtime_metadata.exists(),
+                "{agent} runtime metadata must be removed"
+            );
+        }
+
+        let calls = std::fs::read_to_string(calls).unwrap_or_default();
+        assert!(
+            !calls.lines().any(|line| line.starts_with("kill-session")),
+            "a definitively unlaunched runtime must not invoke kill-session: {calls}"
+        );
+    }
+
+    #[tokio::test]
     async fn delete_operational_tmux_probe_error_returns_structured_failure() {
         let tmp = tempfile::TempDir::new().unwrap();
         let tmux = tmp.path().join("operational-error-tmux");

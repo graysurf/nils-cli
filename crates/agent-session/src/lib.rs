@@ -4783,10 +4783,24 @@ fn terminate_tmux_session_with_timeouts(
         verify_timeout.min(DELETE_TERMINATION_PROBE_TIMEOUT),
     )? {
         TmuxRuntimeProbe::Running(identity) => {
-            if let Some(persisted) = persisted_tmux_runtime_identity(record)?
-                && !persisted.same_runtime_target(&identity)
-            {
-                return Err(SessionTerminationFailure::RuntimeIdentityMismatch);
+            if let Some(persisted) = persisted_tmux_runtime_identity(record)? {
+                if !persisted.same_runtime_target(&identity) {
+                    return Err(SessionTerminationFailure::RuntimeIdentityMismatch);
+                }
+                if !persisted.same_process_identity(&identity) {
+                    let verification_started = Instant::now();
+                    terminate_known_tmux_runtime(
+                        tmux_bin,
+                        &identity,
+                        kill_timeout,
+                        verify_timeout,
+                    )?;
+                    let remaining = verify_timeout.saturating_sub(verification_started.elapsed());
+                    if remaining.is_zero() {
+                        return Err(SessionTerminationFailure::VerificationFailed);
+                    }
+                    return verify_stopped_tmux_runtime(tmux_bin, &persisted, remaining);
+                }
             }
             persist_tmux_runtime_identity(record, &identity)?;
             write_session_record(context, record)
@@ -4794,6 +4808,9 @@ fn terminate_tmux_session_with_timeouts(
             identity
         }
         TmuxRuntimeProbe::Stopped => {
+            if runtime_is_proven_never_launched(record) {
+                return Ok(());
+            }
             let identity = persisted_tmux_runtime_identity(record)?
                 .ok_or(SessionTerminationFailure::RuntimeIdentityUnavailable)?;
             return verify_stopped_tmux_runtime(tmux_bin, &identity, verify_timeout);
@@ -4819,6 +4836,10 @@ impl TmuxRuntimeIdentity {
         self.launch_id == other.launch_id
             && self.session_id == other.session_id
             && self.pane_id == other.pane_id
+    }
+
+    fn same_process_identity(&self, other: &Self) -> bool {
+        self.pane_pid == other.pane_pid && self.process_group_id == other.process_group_id
     }
 }
 

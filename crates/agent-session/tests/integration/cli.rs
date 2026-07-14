@@ -4090,6 +4090,73 @@ fn pre_upgrade_delete_handles_live_identity_and_explains_unprovable_stopped_stat
 }
 
 #[test]
+fn delete_accepts_current_generation_never_launched_proof_for_codex_and_claude() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let state_dir = tmp.path().join("state");
+    let (tmux_bin, tmux_log) = fake_tmux(tmp.path());
+    let state_arg = state_dir.to_string_lossy().to_string();
+    let tmux_arg = tmux_bin.to_string_lossy().to_string();
+    let tmux_log_arg = tmux_log.to_string_lossy().to_string();
+
+    for agent in ["codex", "claude"] {
+        let id = format!("never-launched-delete-{agent}");
+        let tmux_session = format!("hs-{agent}-never-launched-delete");
+        let session_dir = write_session_record(&state_dir, &id, agent, &tmux_session);
+        let runtime_files = attach_provider_runtime(
+            tmp.path(),
+            &state_dir,
+            &session_dir,
+            &id,
+            agent,
+            &tmux_session,
+        );
+        let record_path = session_dir.join("session.json");
+        let mut record: Value =
+            serde_json::from_slice(&fs::read(&record_path).expect("session record")).unwrap();
+        record["tmux_runtime_never_launched"] = record["runtime"]["launch_id"].clone();
+        record
+            .as_object_mut()
+            .expect("session object")
+            .remove("delete_tmux_identity");
+        fs::write(&record_path, serde_json::to_vec_pretty(&record).unwrap()).unwrap();
+
+        let output = run(
+            tmp.path(),
+            &[
+                "--state-dir",
+                &state_arg,
+                "delete",
+                &id,
+                "--tmux-bin",
+                &tmux_arg,
+                "--format",
+                "json",
+            ],
+            &[
+                ("AGENT_SESSION_FAKE_TMUX_LOG", &tmux_log_arg),
+                ("AGENT_SESSION_FAKE_TMUX_ABSENT", "1"),
+            ],
+        );
+
+        assert_eq!(output.code, 0, "stdout={}", output.stdout_text());
+        assert_eq!(data(&output.stdout_json())["deleted"], true);
+        assert!(!session_dir.exists(), "{agent} metadata must be removed");
+        assert!(
+            runtime_files.iter().all(|path| !path.exists()),
+            "{agent} runtime metadata must be removed"
+        );
+    }
+
+    let calls = tmux_calls(&tmux_log);
+    assert!(
+        calls
+            .iter()
+            .all(|call| call.first().is_none_or(|arg| arg != "kill-session")),
+        "a definitively unlaunched runtime must not invoke kill-session: {calls:?}"
+    );
+}
+
+#[test]
 fn successful_delete_removes_codex_and_claude_runtime_state() {
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let state_dir = tmp.path().join("state");
@@ -4275,6 +4342,114 @@ esac\nexit 42\n",
     );
     assert!(!killed.exists(), "the reused exact name must not be killed");
     assert!(session_dir.exists());
+}
+
+#[test]
+fn delete_retains_original_process_identity_when_tmux_pane_respawns() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let state_dir = tmp.path().join("state");
+    let (tmux_bin, tmux_log) = fake_tmux(tmp.path());
+    let id = "respawned-pane";
+    let tmux_session = "hs-codex-respawned-pane";
+    let session_dir = write_session_record(&state_dir, id, "codex", tmux_session);
+    attach_provider_runtime(
+        tmp.path(),
+        &state_dir,
+        &session_dir,
+        id,
+        "codex",
+        tmux_session,
+    );
+    let record_path = session_dir.join("session.json");
+    let mut old_pane = spawn_test_process_group();
+    let live_pane = spawn_test_process_group();
+    let mut record: Value = serde_json::from_slice(&fs::read(&record_path).unwrap()).unwrap();
+    let launch_id = record["runtime"]["launch_id"].as_str().unwrap().to_string();
+    record["delete_tmux_identity"] = json!({
+        "launch_id": launch_id,
+        "session_id": "$77",
+        "pane_id": "%77",
+        "pane_pid": old_pane.pid(),
+        "process_group_id": old_pane.pid(),
+    });
+    fs::write(&record_path, serde_json::to_vec_pretty(&record).unwrap()).unwrap();
+
+    let state_arg = state_dir.to_string_lossy().to_string();
+    let tmux_arg = tmux_bin.to_string_lossy().to_string();
+    let tmux_log_arg = tmux_log.to_string_lossy().to_string();
+    let live_pid = live_pane.pid().to_string();
+    let output = run(
+        tmp.path(),
+        &[
+            "--state-dir",
+            &state_arg,
+            "delete",
+            id,
+            "--tmux-bin",
+            &tmux_arg,
+            "--format",
+            "json",
+        ],
+        &[
+            ("AGENT_SESSION_FAKE_TMUX_LOG", &tmux_log_arg),
+            ("AGENT_SESSION_FAKE_TMUX_PANE_PID", &live_pid),
+            ("AGENT_SESSION_FAKE_TMUX_PROCESS_GROUP_ID", &live_pid),
+            ("AGENT_SESSION_FAKE_TMUX_AGENT_SESSION_ID", id),
+            ("AGENT_SESSION_FAKE_TMUX_STATE_DIR", &state_arg),
+            ("AGENT_SESSION_FAKE_TMUX_RUNTIME_ID", &launch_id),
+        ],
+    );
+
+    assert_eq!(output.code, 1, "stdout={}", output.stdout_text());
+    let error = output.stdout_json();
+    assert_eq!(error["error"]["code"], "session-termination-failed");
+    assert_eq!(error["error"]["details"]["reason"], "process-still-running");
+    assert_eq!(error["error"]["details"]["retryable"], true);
+    assert_eq!(error["error"]["details"]["action"], "retry-delete");
+    assert!(
+        session_dir.exists(),
+        "original process evidence must remain"
+    );
+    assert!(
+        old_pane.is_running(),
+        "the original pane group must still be live"
+    );
+    let retained: Value = serde_json::from_slice(&fs::read(&record_path).unwrap()).unwrap();
+    assert_eq!(retained["delete_tmux_identity"]["pane_pid"], old_pane.pid());
+    assert_eq!(
+        retained["delete_tmux_identity"]["process_group_id"],
+        old_pane.pid()
+    );
+    assert!(
+        tmux_calls(&tmux_log).iter().any(|call| call
+            == &vec![
+                "kill-session".to_string(),
+                "-t".to_string(),
+                "$77".to_string()
+            ]),
+        "the exact current tmux target must be terminated"
+    );
+
+    old_pane.stop();
+    let retry = run(
+        tmp.path(),
+        &[
+            "--state-dir",
+            &state_arg,
+            "delete",
+            id,
+            "--tmux-bin",
+            &tmux_arg,
+            "--format",
+            "json",
+        ],
+        &[
+            ("AGENT_SESSION_FAKE_TMUX_LOG", &tmux_log_arg),
+            ("AGENT_SESSION_FAKE_TMUX_ABSENT", "1"),
+        ],
+    );
+    assert_eq!(retry.code, 0, "stdout={}", retry.stdout_text());
+    assert!(!session_dir.exists(), "retry must remove stopped state");
 }
 
 #[test]
@@ -5878,6 +6053,7 @@ fn run_retains_state_when_malformed_launch_identity_cannot_be_stopped() {
     let error = output.stdout_json();
     assert_eq!(error["error"]["code"], "session-termination-failed");
     assert_eq!(error["error"]["details"]["reason"], "kill-failed");
+    assert_eq!(error["error"]["details"]["action"], "retry-delete");
     assert!(
         session_dir.exists(),
         "uncertain live runtime must stay discoverable"
@@ -6016,6 +6192,7 @@ fn start_retains_state_when_process_group_survives_post_launch_cleanup() {
     let error = output.stdout_json();
     assert_eq!(error["error"]["code"], "session-termination-failed");
     assert_eq!(error["error"]["details"]["reason"], "process-still-running");
+    assert_eq!(error["error"]["details"]["action"], "retry-delete");
     assert!(
         session_dir.exists(),
         "surviving process state must remain discoverable"
