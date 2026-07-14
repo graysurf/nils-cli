@@ -1,5 +1,5 @@
 use std::fs::{self, OpenOptions};
-use std::io::{Read, Write};
+use std::io::{self, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::{PermissionsExt, symlink};
@@ -341,8 +341,18 @@ impl Drop for TestProcessGroup {
 
 fn spawn_test_process_group() -> TestProcessGroup {
     let mut command = Command::new("sleep");
-    command.arg("30").process_group(0);
-    let child = command.spawn().expect("spawn test process group");
+    command.arg("30");
+    // SAFETY: this test-only child must own a dedicated process session.
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setsid() < 0 {
+                Err(io::Error::last_os_error())
+            } else {
+                Ok(())
+            }
+        });
+    }
+    let child = command.spawn().expect("spawn test process session");
     let pid = child.id();
     let child = Arc::new(Mutex::new(child));
     let stop_reaper = Arc::new(AtomicBool::new(false));

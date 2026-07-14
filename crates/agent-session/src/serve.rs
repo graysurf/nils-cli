@@ -5263,11 +5263,19 @@ mod tests {
 
     impl TestProcessGroup {
         fn spawn() -> Self {
-            let child = std::process::Command::new("sleep")
-                .arg("30")
-                .process_group(0)
-                .spawn()
-                .expect("spawn test process group");
+            let mut command = std::process::Command::new("sleep");
+            command.arg("30");
+            // SAFETY: this test-only child must own a dedicated process session.
+            unsafe {
+                command.pre_exec(|| {
+                    if libc::setsid() < 0 {
+                        Err(io::Error::last_os_error())
+                    } else {
+                        Ok(())
+                    }
+                });
+            }
+            let child = command.spawn().expect("spawn test process session");
             let process_group_id = child.id() as libc::pid_t;
             Self {
                 child: Some(child),
