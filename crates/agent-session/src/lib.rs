@@ -1261,8 +1261,13 @@ fn start_session(
         Ok(identity) => identity,
         Err(err) => {
             if tmux_launch_may_have_created_runtime(&err)
-                && let Err(termination_err) =
-                    recover_failed_tmux_launch(context, &mut created.record, &tmux_bin, None)
+                && let Err(termination_err) = recover_failed_tmux_launch(
+                    context,
+                    &mut created.record,
+                    &tmux_bin,
+                    None,
+                    SessionTerminationOperation::FailedLaunch,
+                )
             {
                 return Err(termination_err);
             }
@@ -1313,6 +1318,7 @@ fn start_session(
             &mut created.record,
             &tmux_bin,
             Some(&launch_identity),
+            SessionTerminationOperation::FailedLaunch,
         )?;
         cleanup_created_record(context, &created);
         return Err(err);
@@ -1328,6 +1334,7 @@ fn start_session(
                 &mut created.record,
                 &tmux_bin,
                 Some(&launch_identity),
+                SessionTerminationOperation::FailedLaunch,
             )?;
             cleanup_created_record(context, &created);
             return Err(err);
@@ -1404,8 +1411,13 @@ fn start_run_session(context: &CliContext, args: cli::RunArgs) -> Result<StartVi
         Ok(identity) => identity,
         Err(err) => {
             if tmux_launch_may_have_created_runtime(&err)
-                && let Err(termination_err) =
-                    recover_failed_tmux_launch(context, &mut created.record, &tmux_bin, None)
+                && let Err(termination_err) = recover_failed_tmux_launch(
+                    context,
+                    &mut created.record,
+                    &tmux_bin,
+                    None,
+                    SessionTerminationOperation::FailedLaunch,
+                )
             {
                 return Err(termination_err);
             }
@@ -1420,6 +1432,7 @@ fn start_run_session(context: &CliContext, args: cli::RunArgs) -> Result<StartVi
             &mut created.record,
             &tmux_bin,
             Some(&launch_identity),
+            SessionTerminationOperation::FailedLaunch,
         )?;
         cleanup_created_record(context, &created);
         return Err(err);
@@ -1495,8 +1508,13 @@ pub(crate) fn start_provider_resume_session(
         Ok(identity) => identity,
         Err(err) => {
             if tmux_launch_may_have_created_runtime(&err)
-                && let Err(termination_err) =
-                    recover_failed_tmux_launch(context, &mut created.record, &tmux_bin, None)
+                && let Err(termination_err) = recover_failed_tmux_launch(
+                    context,
+                    &mut created.record,
+                    &tmux_bin,
+                    None,
+                    SessionTerminationOperation::FailedLaunch,
+                )
             {
                 return Err(termination_err);
             }
@@ -1511,6 +1529,7 @@ pub(crate) fn start_provider_resume_session(
             &mut created.record,
             &tmux_bin,
             Some(&launch_identity),
+            SessionTerminationOperation::FailedLaunch,
         )?;
         cleanup_created_record(context, &created);
         return Err(err);
@@ -3186,18 +3205,21 @@ fn resume_session_by_id(
         write_session_record(context, &record)?;
     }
     let (provider_resume, agent) = validate_resume_metadata(&record)?;
-    match persisted_tmux_runtime_identity(&record)
-        .map_err(|reason| session_termination_error(&record, reason))?
-    {
+    match persisted_tmux_runtime_identity(&record).map_err(|reason| {
+        session_termination_error(&record, reason, SessionTerminationOperation::Resume)
+    })? {
         Some(identity) => {
             verify_stopped_tmux_runtime(tmux_bin, &identity, DELETE_TERMINATION_VERIFY_TIMEOUT)
-                .map_err(|reason| session_termination_error(&record, reason))?;
+                .map_err(|reason| {
+                    session_termination_error(&record, reason, SessionTerminationOperation::Resume)
+                })?;
         }
         None if runtime_is_proven_never_launched(&record) => {}
         None => {
             return Err(session_termination_error(
                 &record,
                 SessionTerminationFailure::RuntimeIdentityUnavailable,
+                SessionTerminationOperation::Resume,
             ));
         }
     }
@@ -3265,7 +3287,13 @@ fn resume_session_by_id(
     let launch_error = match launch {
         Ok(identity) => {
             if let Err(err) = persist_launched_tmux_identity(context, &mut record, &identity) {
-                match recover_failed_tmux_launch(context, &mut record, tmux_bin, Some(&identity)) {
+                match recover_failed_tmux_launch(
+                    context,
+                    &mut record,
+                    tmux_bin,
+                    Some(&identity),
+                    SessionTerminationOperation::Resume,
+                ) {
                     Ok(()) => Some(err),
                     Err(termination_err) => {
                         startup_artifacts.discard();
@@ -3277,7 +3305,13 @@ fn resume_session_by_id(
             }
         }
         Err(err) if tmux_launch_may_have_created_runtime(&err) => {
-            match recover_failed_tmux_launch(context, &mut record, tmux_bin, None) {
+            match recover_failed_tmux_launch(
+                context,
+                &mut record,
+                tmux_bin,
+                None,
+                SessionTerminationOperation::Resume,
+            ) {
                 Ok(()) => Some(err),
                 Err(termination_err) => {
                     startup_artifacts.discard();
@@ -4558,7 +4592,9 @@ fn delete_session_with_timeouts(
         kill_timeout,
         verify_timeout,
     )
-    .map_err(|reason| session_termination_error(&record, reason))?;
+    .map_err(|reason| {
+        session_termination_error(&record, reason, SessionTerminationOperation::Delete)
+    })?;
     codex_app_server::cleanup_runtime_files(context, &record)?;
     fs::remove_dir_all(&session_dir).map_err(|err| {
         CliError::runtime(
@@ -4586,6 +4622,22 @@ enum SessionTerminationFailure {
     RuntimeIdentityMismatch,
     RuntimeIdentityUnavailable,
     VerificationFailed,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SessionTerminationOperation {
+    Delete,
+    Resume,
+    FailedLaunch,
+}
+
+impl SessionTerminationOperation {
+    fn retry_action(self) -> &'static str {
+        match self {
+            Self::Resume => "retry-resume",
+            Self::Delete | Self::FailedLaunch => "retry-delete",
+        }
+    }
 }
 
 impl SessionTerminationFailure {
@@ -4628,11 +4680,11 @@ impl SessionTerminationFailure {
         )
     }
 
-    fn action(self) -> &'static str {
+    fn action(self, operation: SessionTerminationOperation) -> &'static str {
         match self {
             Self::RuntimeIdentityMismatch => "resolve-runtime-identity-mismatch",
             Self::RuntimeIdentityUnavailable => "manual-runtime-verification-required",
-            _ => "retry-delete",
+            _ => operation.retry_action(),
         }
     }
 }
@@ -4640,6 +4692,7 @@ impl SessionTerminationFailure {
 fn session_termination_error(
     record: &SessionRecord,
     reason: SessionTerminationFailure,
+    operation: SessionTerminationOperation,
 ) -> CliError {
     CliError::runtime(
         "session-termination-failed",
@@ -4649,7 +4702,7 @@ fn session_termination_error(
             "tmux_session": record.tmux_session,
             "reason": reason.reason(),
             "retryable": reason.retryable(),
-            "action": reason.action(),
+            "action": reason.action(operation),
         })),
     )
 }
@@ -4659,6 +4712,7 @@ fn recover_failed_tmux_launch(
     record: &mut SessionRecord,
     tmux_bin: &Path,
     known_identity: Option<&TmuxRuntimeIdentity>,
+    operation: SessionTerminationOperation,
 ) -> Result<(), CliError> {
     let identity = match known_identity {
         Some(identity) => identity.clone(),
@@ -4668,20 +4722,21 @@ fn recover_failed_tmux_launch(
             tmux_bin,
             DELETE_TERMINATION_PROBE_TIMEOUT,
         )
-        .map_err(|reason| session_termination_error(record, reason))?
+        .map_err(|reason| session_termination_error(record, reason, operation))?
         {
             TmuxRuntimeProbe::Running(identity) => identity,
             TmuxRuntimeProbe::Stopped => {
                 return Err(session_termination_error(
                     record,
                     SessionTerminationFailure::RuntimeIdentityUnavailable,
+                    operation,
                 ));
             }
         },
     };
 
     persist_tmux_runtime_identity(record, &identity)
-        .map_err(|reason| session_termination_error(record, reason))?;
+        .map_err(|reason| session_termination_error(record, reason, operation))?;
     write_session_record(context, record)?;
     terminate_known_tmux_runtime(
         tmux_bin,
@@ -4689,7 +4744,7 @@ fn recover_failed_tmux_launch(
         PANE_INPUT_COMMAND_TIMEOUT,
         DELETE_TERMINATION_VERIFY_TIMEOUT,
     )
-    .map_err(|reason| session_termination_error(record, reason))
+    .map_err(|reason| session_termination_error(record, reason, operation))
 }
 
 fn terminate_known_tmux_runtime(

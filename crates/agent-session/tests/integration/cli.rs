@@ -3718,6 +3718,7 @@ fn delete_kill_failure_retains_codex_and_claude_runtime_state() {
         assert_eq!(failure["error"]["details"]["id"], id);
         assert_eq!(failure["error"]["details"]["tmux_session"], tmux_session);
         assert_eq!(failure["error"]["details"]["reason"], "kill-failed");
+        assert_eq!(failure["error"]["details"]["action"], "retry-delete");
         assert!(session_dir.exists(), "{agent} state must remain retryable");
         assert!(record_path.exists(), "{agent} session metadata must remain");
         let retained: Value =
@@ -3893,6 +3894,7 @@ fn resume_refuses_to_replace_a_surviving_launch_identity() {
         "process-still-running"
     );
     assert_eq!(blocked_json["error"]["details"]["retryable"], true);
+    assert_eq!(blocked_json["error"]["details"]["action"], "retry-resume");
     let retained: Value = serde_json::from_slice(&fs::read(&record_path).unwrap()).unwrap();
     assert_eq!(retained["runtime"]["launch_id"], "prior-launch");
     assert_eq!(retained["delete_tmux_identity"]["session_id"], "$66");
