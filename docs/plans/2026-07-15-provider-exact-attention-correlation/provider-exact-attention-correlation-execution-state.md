@@ -3,19 +3,20 @@
 <!-- plan-issue-record:v2 role=state profile=tracking -->
 ## Execution State
 
-- Status: in-progress
+- Status: complete
 - Target scope: one provider-neutral v1 invariant, runtime-selected Codex
   attention authority with app-server exact resolution, capability-selected
   Claude exact-or-limited Elicitation, and an explicit conservative limitation
   for generic permission dialogs.
 - Execution window: Sprint 1 shared boundary -> Sprints 2 and 3 independent /
   parallel provider lanes -> Sprint 4 integration and delivery.
-- Current task: Task 4.1, complete specialist review, delivery, deployment, and
-  live polling/SSE/Agent Console acceptance.
-- Next task: Task 4.2, close the tracker only after deployed acceptance and the
-  completion audit pass.
-- Last updated: 2026-07-15
-- Branch: `feat/provider-exact-attention-correlation`
+- Current task: Task 4.2 complete; implementation, follow-up correction,
+  deployment, and live acceptance are finished.
+- Next task: none; close tracking issue #1237 after publishing this final
+  execution state.
+- Last updated: 2026-07-16
+- Branches: `feat/provider-exact-attention-correlation`,
+  `fix/claude-attention-shadow`, and `docs/provider-attention-closeout`
 - Source document:
   `docs/plans/2026-07-15-provider-exact-attention-correlation/provider-exact-attention-correlation-plan.md`
 - Implementation source:
@@ -44,8 +45,8 @@
 | 2.3 | done | Implement Codex runtime source arbitration and capability status | pending; Runtime extra plus tmux env select protocol or hook authority; generic protocol-authority permission reporter suppresses at source; mismatch and projection loss remain unknown until a new generation; doctor reports exact capability and policy. | Codex 0.144.3 supported; versions outside exact audit remain unverified. |
 | 3.1 | done | Verify Claude capability and capture branch-specific test-first evidence | pending; Official Claude hooks contract and installed 2.1.210 confirm optional elicitation_id on Elicitation and ElicitationResult; sanitized live canary remains.; Sanitized Claude 2.1.210 MCP canary: form emitted request/result with no elicitation_id; URL emitted no callbacks. Both are conservative terminal outcomes; artifacts retained under agent-out. | No raw message, URL, schema, content, or provider id retained. |
 | 3.2 | done | Implement selected Claude exact or conservative branch | pending; Claude setup adds Elicitation/ElicitationResult; same nonempty id maps to exact runtime-scoped request/clear, missing request id latches conservatively, missing result id is ignored; form/URL/privacy/setup tests pass. | AskUserQuestion and generic permission behavior remain unchanged; rollback disables only the new admission/setup entries. |
-| 4.1 | in-progress | Publish capability status and run integration acceptance | Contract and evidence docs updated; doctor and setup dry-runs pass; Claude 2.1.210 canary proves the missing-id conservative branch; focused tests, the full crate suite, local-fast, docs-only, plan validation, and final API-contract, maintainability, and red-team testing reviews pass. Merged deployment, live provider sessions, polling/SSE, Agent Console, and first/subsequent-prompt retitle acceptance remain. | Same-id clear before `Stop` where exact is supported. |
-| 4.2 | pending | Deliver implementation PRs and close tracker | pending | Close only after completion audit. |
+| 4.1 | done | Publish capability status and run integration acceptance | Contract and evidence docs, doctor/setup migration, live Claude AskUserQuestion clear, live Codex completion, polling, authenticated SSE, staged-binary/tmux PATH parity, and first/subsequent-prompt retitle tests all pass. | Same-id clear before `Stop` is verified where exact is supported; generic no-id permissions remain conservative by design. |
+| 4.2 | done | Deliver implementation PRs and close tracker | nils-cli PRs #1239 and #1241 and sympoies-infra PR #116 merged; `agent-session 1.22.5 (v1.22.5-2-g2fc5602d)` is installed and active in `agent-console-serve.service`; sanitized acceptance evidence retained under agent-out. | Completion audit passed; tracker is ready to close after this docs-only state update merges. |
 
 ## Session Log
 
@@ -135,6 +136,27 @@
   budget. The three runtime-allocation tests now create their private runtime
   roots directly under `/tmp`; focused authority/source-guard/transport tests
   pass and the provider-visible failed check remains the retained red evidence.
+- 2026-07-16: PR #1239 merged the shared provider-neutral contract and exact
+  Codex/conditional-Claude correlation. Live Claude acceptance then exposed a
+  duplicate AskUserQuestion permission shadow and a long-lived tmux PATH that
+  could select an older helper.
+- 2026-07-16: Follow-up nils-cli PR #1241 and coordinated sympoies-infra PR
+  #116 retired the duplicate managed Claude notifier, suppressed the
+  AskUserQuestion shadow, and pinned each spawned/resumed tmux session to the
+  staged daemon PATH. All Linux, macOS, coverage, CodeQL, focused, and local
+  validation gates passed.
+- 2026-07-16: The merged binary was installed and the service restarted. A
+  fresh Claude session transitioned `working -> needs_input(clarification) ->
+  working -> waiting(completed)` without a duplicate latch; a fresh Codex
+  session completed as `provider_hook/authoritative`. Polling and
+  authenticated SSE passed, and both tmux sessions selected the installed
+  helper path.
+- 2026-07-16: Retitle was retained on the independent metadata-safe
+  `provider-prompt.v1` channel. Focused Agent Console tests passed for the
+  immediate first prompt, each distinct later prompt, replay suppression, and
+  an initial summary still in flight. Activity-to-retitle coupling was
+  deliberately not added because it would duplicate one prompt across two
+  event sources.
 
 ## Validation
 
@@ -159,10 +181,16 @@
 | macOS socket-path CI regression | red-to-green | GitHub coverage failed in `configured_app_server_runtime_selects_protocol_attention_authority` because its temporary Unix socket path exceeded the platform budget; all three runtime-allocation tests pass with short private `/tmp` roots. | GitHub Actions run `29440660587`, job `87438487132`; local focused rerun |
 | Claude 2.1.210 MCP Elicitation canary | pass | Form request/result omitted ids and selected conservative behavior; URL remained unverified-conservative. | `20260716-010014-claude-elicitation-canary/result.json` |
 | `plan-tooling validate --file ... --explain` | pass | The eight-task plan bundle validates with zero errors. | local worktree |
+| PR #1239 GitHub required checks | pass | Linux, macOS, coverage, CodeQL, and cargo-deny passed before merge. | GitHub Actions run `29441064625` |
+| PR #1241 follow-up validation | pass | 499/499 local-fast tests, 95/95 integration tests, and all updated-head GitHub checks passed. | GitHub Actions run `29445657482` |
+| sympoies-infra helper-path validation | pass | Focused fail-closed override regressions and post-review `make validate` passed. | serenvia/sympoies-infra#116 |
+| Live deployment acceptance | pass | Installed service binary and tmux helper PATH agree; Claude exact clarification clears; Codex completes authoritatively; polling and authenticated SSE snapshots pass. | `20260716-024029-provider-exact-attention-acceptance/README.md` |
+| Agent Console retitle acceptance | pass | First prompt, each distinct later prompt, replay suppression, and in-flight initial summary tests passed 3/3. | `packages/ui/test/dashboardHooks.test.ts` focused run |
 
 ## Handoff
 
-- Continue Task 4.1 in this managed worktree. Repair any concrete specialist
-  finding before delivery, then merge, install the release binary, refresh the
-  additive Claude hooks, and retain live provider/polling/SSE/Agent Console
-  acceptance evidence before closing #1237.
+- No implementation work remains. Merge the docs-only closeout update, publish
+  the final tracking checkpoint, close #1237, and remove the managed worktrees.
+- Sanitized deployment and live-test evidence is retained at
+  `20260716-024029-provider-exact-attention-acceptance/README.md` under the
+  project agent-out tree.
