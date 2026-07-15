@@ -454,6 +454,11 @@ fn install_into_staging(
         app_binary_sha256,
     };
     let old_current = read_receipt(&paths.current_receipt())?;
+    if let Some(old) = old_current.as_ref()
+        && old.tag != new_receipt.tag
+    {
+        retire_transition_daemons(paths, lock, old)?;
+    }
     write_receipt(&paths.pending_receipt(), &new_receipt)?;
     replace_stable_app(paths, &new_receipt)?;
     if let Some(old) = old_current.as_ref()
@@ -857,12 +862,30 @@ pub fn rollback(dry_run: bool, strict: bool) -> Result<BackendStatus, CliError> 
             dry_run: true,
         });
     }
+    retire_transition_daemons(&paths, &lock, &current)?;
     write_receipt(&paths.pending_receipt(), &previous)?;
     if !stable_app_matches(&paths, &previous)? {
         replace_stable_app(&paths, &previous)?;
     }
     recover_pending(&paths, &lock, strict)?;
     status_unlocked(&lock, &paths, false)
+}
+
+fn retire_transition_daemons(
+    paths: &BackendPaths,
+    lock: &PeekabooLock,
+    receipt: &Receipt,
+) -> Result<(), CliError> {
+    let (cli_asset, _, _) = release_contract_for_receipt(lock, receipt)?;
+    let contract = RuntimeContract::new(
+        receipt.cli_binary_sha256[..16].into(),
+        cli_asset.bridge_build.clone(),
+    );
+    crate::commands::retire_obsolete_daemons_at(
+        &paths.cli_for(&receipt.tag),
+        &crate::commands::runtime_socket_dir(),
+        &[contract],
+    )
 }
 
 fn verify_receipt(

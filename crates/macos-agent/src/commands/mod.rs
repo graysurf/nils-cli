@@ -299,7 +299,7 @@ fn bridge_identity_matches(
     backend::bridge_handshake_matches(value, expected_host, expected_build)
 }
 
-fn retire_obsolete_daemons_at(
+pub(crate) fn retire_obsolete_daemons_at(
     binary: &Path,
     socket_dir: &Path,
     contracts: &[RuntimeContract],
@@ -358,7 +358,7 @@ fn retire_obsolete_daemons_at(
     Ok(())
 }
 
-fn runtime_socket_dir() -> PathBuf {
+pub(crate) fn runtime_socket_dir() -> PathBuf {
     let home = std::env::var_os("HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("~"));

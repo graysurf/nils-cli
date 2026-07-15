@@ -33,6 +33,10 @@ impl MacosAgentHarness {
         resolve("macos-agent")
     }
 
+    pub fn home_dir(&self) -> &Path {
+        self.home_dir.path()
+    }
+
     pub fn cmd_options(&self, cwd: &Path) -> CmdOptions {
         let home = self.home_dir.path().to_string_lossy().to_string();
         let agent_home = self.agent_home.to_string_lossy().to_string();

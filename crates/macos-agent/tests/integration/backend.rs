@@ -191,6 +191,74 @@ fn install_is_idempotent_and_rollback_selects_only_a_verified_previous_receipt()
 }
 
 #[test]
+fn backend_transition_retires_owned_daemons_before_later_locks_drop_authority() {
+    let harness = common::MacosAgentHarness::new();
+    let cwd = TempDir::new().expect("cwd");
+    let backend_root = cwd.path().join("backend");
+    let release_a = candidate(cwd.path(), "v3.9.2", '2');
+    let release_b = candidate(cwd.path(), "v3.9.3", '3');
+    let release_c = candidate(cwd.path(), "v3.9.4", '4');
+    authorize_rollback(&release_b, &release_a);
+    authorize_rollback(&release_c, &release_b);
+
+    let installed_a = run_backend(
+        &harness,
+        cwd.path(),
+        &backend_root,
+        &release_a,
+        &["--format", "json", "backend", "install"],
+    );
+    assert_eq!(installed_a.code, 0, "{}", installed_a.stderr_text());
+
+    let release_a_identity =
+        &sha256(&release_a.source.join("peekaboo-macos-universal/peekaboo"))[..16];
+    let socket_dir = harness
+        .home_dir()
+        .join("Library/Application Support/Peekaboo");
+    fs::create_dir_all(&socket_dir).expect("socket directory");
+    let owned_daemon = socket_dir.join(format!("daemon-{release_a_identity}.sock"));
+    let owned_auto = socket_dir.join(format!("auto-{release_a_identity}.sock"));
+    let unrelated = socket_dir.join("daemon-unrelated.sock");
+    for socket in [&owned_daemon, &owned_auto, &unrelated] {
+        fs::write(socket, b"fixture").expect("socket fixture");
+    }
+
+    for candidate in [&release_b, &release_c] {
+        let installed = run_backend(
+            &harness,
+            cwd.path(),
+            &backend_root,
+            candidate,
+            &["--format", "json", "backend", "install"],
+        );
+        assert_eq!(installed.code, 0, "{}", installed.stderr_text());
+    }
+
+    assert!(!owned_daemon.exists());
+    assert!(!owned_auto.exists());
+    assert!(unrelated.exists());
+
+    let release_c_identity =
+        &sha256(&release_c.source.join("peekaboo-macos-universal/peekaboo"))[..16];
+    let rollback_daemon = socket_dir.join(format!("daemon-{release_c_identity}.sock"));
+    let rollback_auto = socket_dir.join(format!("auto-{release_c_identity}.sock"));
+    for socket in [&rollback_daemon, &rollback_auto] {
+        fs::write(socket, b"fixture").expect("rollback socket fixture");
+    }
+    let rolled_back = run_backend(
+        &harness,
+        cwd.path(),
+        &backend_root,
+        &release_c,
+        &["--format", "json", "backend", "rollback"],
+    );
+    assert_eq!(rolled_back.code, 0, "{}", rolled_back.stderr_text());
+    assert!(!rollback_daemon.exists());
+    assert!(!rollback_auto.exists());
+    assert!(unrelated.exists());
+}
+
+#[test]
 fn rollback_recovers_an_interruption_after_the_stable_app_swap() {
     let harness = common::MacosAgentHarness::new();
     let cwd = TempDir::new().expect("cwd");
@@ -765,6 +833,18 @@ JSON
     fi
     ;;
   *" bridge status "*)
+    bridge_socket=''
+    previous=''
+    for argument in "$@"; do
+      [ "$previous" = --bridge-socket ] && bridge_socket=$argument
+      previous=$argument
+    done
+    if [ -n "$bridge_socket" ]; then
+      cat <<'JSON'
+{{"success":true,"data":{{"selected":{{"source":"remote","handshake":{{"hostKind":"onDemand","build":"{version} ({version})"}}}}}}}}
+JSON
+      exit 0
+    fi
     [ "$mode" = malformed_probe ] && echo 'not-json' && exit 0
     if [ "$mode" = bridge_failed ]; then
       cat <<'JSON'
@@ -783,6 +863,10 @@ JSON
 {{"success":true,"data":{{"remoteSkipped":false,"selected":{{"source":"remote","socketPath":"/private/bridge.sock","handshake":{{"hostKind":"gui","build":"{version} (fixture-{token})"}}}},"candidates":[{{"socketPath":"/private/bridge.sock","result":{{"success":{{"hostKind":"gui"}}}}}}],"client":{{"processIdentifier":1}}}}}}
 JSON
     fi
+    ;;
+  *" daemon stop "*)
+    for socket do :; done
+    rm -- "$socket"
     ;;
   *" tools "*) echo '{{"success":true,"data":{{"tools":[{{"name":"see"}}]}}}}' ;;
   *) echo '{{"success":true}}' ;;
