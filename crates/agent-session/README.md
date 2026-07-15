@@ -71,6 +71,11 @@ retained and returns `runtime-identity-unavailable`, `retryable: false`, and
 `action: manual-runtime-verification-required`; an operator must verify its runtime manually before removing that state.
 Kill failures, ambiguous tmux errors, ownership mismatches, and surviving processes retain all session state. Human
 success output reports the verified stopped state; the v1 JSON `killed: true` field remains stable for successful deletion.
+When tmux returns a successful but blank identity probe for a stale session, deletion confirms the exact session is absent
+and still requires every persisted process boundary to verify stopped before removing metadata.
+For a stopped session without a one-shot run log, `agent-session logs <id>` falls back to the private, tail-capped startup
+diagnostic. Codex sessions retain that diagnostic after a startup failure or non-zero provider-client exit; a clean exit
+after readiness discards it.
 `--agent hermes` launches `hermes chat` interactively (one-shot `run` mode is codex/claude only).
 
 ## Durable turn state
@@ -181,8 +186,10 @@ is no second state model.
   `app-server-start-failed`, `proxy-start-failed`, `provider-client-exited`,
   `provider-configuration-rejected`, `startup-timeout`, or `startup-exited`.
   Managed launchers retain only bounded stage/failure markers in the record and
-  keep startup stderr in a private, tail-capped local diagnostic file only until
-  the initial connection succeeds; raw argv, environment, provider responses,
+  keep stderr in a private, tail-capped local diagnostic file for startup failures
+  and non-zero Codex provider-client exits after readiness; clean exits discard it.
+  The local `agent-session logs <id>` command can read that diagnostic, but it is
+  never copied into the session projection. Raw argv, environment, provider responses,
   stderr, prompts, and filesystem paths are never copied into the projection. A
   record that reached `ready` keeps that
   state after an ordinary later stop, so consumers must not relabel normal

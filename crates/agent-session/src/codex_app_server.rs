@@ -408,12 +408,17 @@ fn persisted_runtime_paths(
 
 const STARTUP_DIAGNOSTIC_COLLECTOR_SCRIPT: &str = r#"collect_startup_diagnostic() {
   if (umask 077; tail -c 16384 > "$startup_diagnostic_buffer"); then
-    if [ "$(cat "$startup_stage" 2>/dev/null)" != initial_connection ] &&
+    runtime_exit="$(cat "$runtime_exit_status" 2>/dev/null)"
+    if { [ "$(cat "$startup_stage" 2>/dev/null)" != initial_connection ] ||
+         { [ -n "$runtime_exit" ] && [ "$runtime_exit" != 0 ]; }; } &&
        [ -s "$startup_diagnostic_buffer" ]; then
       mv -f "$startup_diagnostic_buffer" "$startup_diagnostic" 2>/dev/null ||
         rm -f -- "$startup_diagnostic_buffer"
     else
       rm -f -- "$startup_diagnostic_buffer"
+    fi
+    if [ "$runtime_exit" = 0 ]; then
+      rm -f -- "$runtime_exit_status"
     fi
   else
     rm -f -- "$startup_diagnostic_buffer"
@@ -436,6 +441,7 @@ startup_dir="$state_dir/sessions/$session_id"
 startup_stage="$startup_dir/.startup-stage"
 startup_failure="$startup_dir/.startup-failure"
 startup_diagnostic="$startup_dir/.startup-diagnostic.log"
+runtime_exit_status="$startup_dir/.runtime-exit-status"
 startup_diagnostic_buffer="$startup_dir/.startup-diagnostic.buffer"
 startup_diagnostic_pipe="$startup_dir/.startup-diagnostic.pipe"
 provider_stderr_pipe="$startup_dir/.provider-stderr.pipe"
@@ -448,7 +454,7 @@ write_startup_marker() {
 record_startup_failure() {
   write_startup_marker "$startup_failure" "$1"
 }
-rm -f -- "$startup_failure" "$startup_diagnostic" "$startup_diagnostic_buffer" "$startup_diagnostic_pipe" "$provider_stderr_pipe"
+rm -f -- "$startup_failure" "$startup_diagnostic" "$runtime_exit_status" "$startup_diagnostic_buffer" "$startup_diagnostic_pipe" "$provider_stderr_pipe"
 write_startup_marker "$startup_stage" app_server
 if ! (umask 077; mkfifo "$startup_diagnostic_pipe"); then
   record_startup_failure startup-exited
@@ -461,7 +467,12 @@ rm -f -- "$socket" "$proxy" "$attached"
 server=$!
 proxy_pid=
 provider_stderr_pid=
+diagnostic_hold_open=
 cleanup() {
+  if [ -n "$diagnostic_hold_open" ]; then
+    exec 9>&-
+    diagnostic_hold_open=
+  fi
   if [ -n "$proxy_pid" ]; then
     kill "$proxy_pid" 2>/dev/null || true
     wait "$proxy_pid" 2>/dev/null || true
@@ -516,8 +527,16 @@ if ! (umask 077; mkfifo "$provider_stderr_pipe"); then
 fi
 tee "$startup_diagnostic_pipe" < "$provider_stderr_pipe" >&2 &
 provider_stderr_pid=$!
+if ! exec 9>"$startup_diagnostic_pipe"; then
+  record_startup_failure startup-exited
+  exit 1
+fi
+diagnostic_hold_open=1
 "$agent" -c check_for_update_on_startup=false --remote "unix://$proxy" "$@" 2>"$provider_stderr_pipe"
 status=$?
+write_startup_marker "$runtime_exit_status" "$status"
+exec 9>&-
+diagnostic_hold_open=
 wait "$provider_stderr_pid" 2>/dev/null || true
 provider_stderr_pid=
 rm -f -- "$provider_stderr_pipe"
@@ -3972,6 +3991,19 @@ exit 1
         assert!(script.contains(".startup-stage"));
         assert!(script.contains(".startup-failure"));
         assert!(script.contains(".startup-diagnostic.log"));
+        assert!(script.contains(".runtime-exit-status"));
+        assert!(script.contains("write_startup_marker \"$runtime_exit_status\" \"$status\""));
+        let hold = script
+            .find("exec 9>\"$startup_diagnostic_pipe\"")
+            .expect("diagnostic pipe hold");
+        let marker = script
+            .find("write_startup_marker \"$runtime_exit_status\" \"$status\"")
+            .expect("runtime exit marker");
+        let release = script[marker..]
+            .find("exec 9>&-")
+            .map(|offset| marker + offset)
+            .expect("diagnostic pipe release");
+        assert!(hold < marker && marker < release);
         assert!(script.contains("runtime-helper-unavailable"));
         assert!(script.contains("provider-client-exited"));
         assert!(script.contains("!= initial_connection"));
@@ -3999,20 +4031,23 @@ exit 1
     }
 
     #[test]
-    fn startup_diagnostic_collector_caps_private_failure_output_and_discards_ready_output() {
+    fn startup_diagnostic_collector_caps_private_failure_output_discards_clean_ready_output_and_retains_abnormal_ready_output()
+     {
         use std::io::Write;
         use std::process::{Command, Stdio};
 
         let tmp = tempfile::TempDir::new().unwrap();
         let stage = tmp.path().join("stage");
         let diagnostic = tmp.path().join("diagnostic.log");
+        let exit_status = tmp.path().join("runtime-exit-status");
         fs::write(&stage, "provider_client\n").unwrap();
         let buffer = tmp.path().join("diagnostic.buffer");
         let command = format!(
-            "startup_stage={}; startup_diagnostic={}; startup_diagnostic_buffer={}; {}; collect_startup_diagnostic",
+            "startup_stage={}; startup_diagnostic={}; startup_diagnostic_buffer={}; runtime_exit_status={}; {}; collect_startup_diagnostic",
             shell_words::quote(&stage.to_string_lossy()),
             shell_words::quote(&diagnostic.to_string_lossy()),
             shell_words::quote(&buffer.to_string_lossy()),
+            shell_words::quote(&exit_status.to_string_lossy()),
             STARTUP_DIAGNOSTIC_COLLECTOR_SCRIPT,
         );
         let mut child = Command::new("/bin/sh")
@@ -4038,7 +4073,7 @@ exit 1
         fs::write(&stage, "initial_connection\n").unwrap();
         let mut child = Command::new("/bin/sh")
             .arg("-c")
-            .arg(command)
+            .arg(&command)
             .stdin(Stdio::piped())
             .spawn()
             .unwrap();
@@ -4051,6 +4086,22 @@ exit 1
         assert!(child.wait().unwrap().success());
         assert!(!diagnostic.exists());
         assert!(!buffer.exists());
+
+        fs::write(&exit_status, "1\n").unwrap();
+        let mut child = Command::new("/bin/sh")
+            .arg("-c")
+            .arg(&command)
+            .stdin(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(b"post-ready-failure\n")
+            .unwrap();
+        assert!(child.wait().unwrap().success());
+        assert_eq!(fs::read(&diagnostic).unwrap(), b"post-ready-failure\n");
     }
 
     #[test]
