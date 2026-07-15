@@ -3580,6 +3580,15 @@ fn add_runtime_tmux_environment(
     ] {
         command.arg("-e").arg(value);
     }
+    if let Some(path) = env::var_os("PATH") {
+        // A long-lived tmux server keeps the environment from when that server
+        // started. Pin each new session to the current daemon PATH so provider
+        // hooks cannot resolve an older agent-session helper after a staged
+        // daemon upgrade.
+        let mut assignment = OsString::from("PATH=");
+        assignment.push(path);
+        command.arg("-e").arg(assignment);
+    }
     Ok(())
 }
 

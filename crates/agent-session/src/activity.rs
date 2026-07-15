@@ -2396,6 +2396,16 @@ fn normalize_provider_hook(
     };
     let notification = raw.get("notification_type").and_then(Value::as_str);
     let tool_name = raw.get("tool_name").and_then(Value::as_str);
+    if agent == AgentKind::Claude
+        && event_name == "PermissionRequest"
+        && tool_name == Some("AskUserQuestion")
+    {
+        // AskUserQuestion is already owned by the exact PreToolUse/PostToolUse
+        // correlation below. Claude may also emit an uncorrelated permission
+        // request for the same UI; admitting both would strand a conservative
+        // approval after the exact question resolves.
+        return Ok(None);
+    }
     let exact_clarification = agent == AgentKind::Claude
         && tool_name == Some("AskUserQuestion")
         && matches!(
@@ -2760,7 +2770,7 @@ pub(crate) fn doctor(
                 AgentKind::Claude => (
                     "partial",
                     "idle_prompt is observed completion; raw Stop remains non-final because other hooks may continue",
-                    "AskUserQuestion uses exact runtime-scoped tool_use_id correlation; Elicitation uses exact elicitation_id when both callbacks provide it and otherwise latches conservatively; PermissionRequest and notifications remain conservative latches",
+                    "AskUserQuestion uses exact runtime-scoped tool_use_id correlation; Elicitation uses exact elicitation_id when both callbacks provide it and otherwise latches conservatively; other PermissionRequest and configured notification signals remain conservative latches",
                     "Claude settings hooks compose additively and execute with the user's permissions",
                     "Run activity setup --agent claude --dry-run and then --apply",
                 ),
@@ -3268,10 +3278,6 @@ fn provider_specs(agent: AgentKind) -> Vec<ProviderSpec> {
             },
             ProviderSpec {
                 event: "Notification",
-                matcher: Some("permission_prompt"),
-            },
-            ProviderSpec {
-                event: "Notification",
                 matcher: Some("idle_prompt"),
             },
             ProviderSpec {
@@ -3297,6 +3303,16 @@ fn provider_specs(agent: AgentKind) -> Vec<ProviderSpec> {
                 matcher: None,
             },
         ],
+    }
+}
+
+fn retired_provider_specs(agent: AgentKind) -> Vec<ProviderSpec> {
+    match agent {
+        AgentKind::Claude => vec![ProviderSpec {
+            event: "Notification",
+            matcher: Some("permission_prompt"),
+        }],
+        AgentKind::Codex | AgentKind::Hermes => Vec::new(),
     }
 }
 
@@ -3787,7 +3803,10 @@ fn json_provider_configured(agent: AgentKind, path: &Path) -> Result<bool, CliEr
     })?;
     Ok(provider_specs(agent)
         .iter()
-        .all(|spec| json_has_spec(&value, agent, *spec)))
+        .all(|spec| json_has_spec(&value, agent, *spec))
+        && retired_provider_specs(agent)
+            .iter()
+            .all(|spec| !json_has_spec(&value, agent, *spec)))
 }
 
 pub(crate) fn codex_protocol_attention_source_guard_configured() -> bool {
@@ -3890,6 +3909,9 @@ fn plan_json_provider(
         ));
     }
     let remove = action == SetupAction::Remove;
+    for spec in retired_provider_specs(agent) {
+        remove_retired_json_spec(&mut updated, agent, spec)?;
+    }
     for spec in provider_specs(agent) {
         mutate_json_spec(&mut updated, agent, spec, remove)?;
     }
@@ -3903,7 +3925,10 @@ fn plan_json_provider(
     })?;
     let configured = provider_specs(agent)
         .iter()
-        .all(|spec| json_has_spec(&updated, agent, *spec));
+        .all(|spec| json_has_spec(&updated, agent, *spec))
+        && retired_provider_specs(agent)
+            .iter()
+            .all(|spec| !json_has_spec(&updated, agent, *spec));
     Ok(ProviderConfigPlan {
         path: path.to_path_buf(),
         original_bytes,
@@ -3998,6 +4023,60 @@ fn mutate_json_spec(
         );
         groups.push(Value::Object(group));
     }
+    if groups.is_empty() {
+        hooks.remove(spec.event);
+    }
+    if hooks.is_empty() {
+        root.remove("hooks");
+    }
+    Ok(())
+}
+
+fn remove_retired_json_spec(
+    root: &mut Value,
+    agent: AgentKind,
+    spec: ProviderSpec,
+) -> Result<(), CliError> {
+    let root = root.as_object_mut().expect("validated object");
+    let Some(hooks) = root.get_mut("hooks") else {
+        return Ok(());
+    };
+    let Some(hooks) = hooks.as_object_mut() else {
+        return Err(CliError::data(
+            "provider-config-invalid",
+            "provider hooks must be an object",
+            None,
+        ));
+    };
+    let Some(groups) = hooks.get_mut(spec.event) else {
+        return Ok(());
+    };
+    let Some(groups) = groups.as_array_mut() else {
+        return Err(CliError::data(
+            "provider-config-invalid",
+            format!("provider hook event {} must be an array", spec.event),
+            None,
+        ));
+    };
+    let command = owned_command(agent, Some(spec.event));
+    for group in groups.iter_mut() {
+        if group.get("matcher").and_then(Value::as_str) != spec.matcher {
+            continue;
+        }
+        if let Some(handlers) = group.get_mut("hooks").and_then(Value::as_array_mut) {
+            handlers.retain(|handler| {
+                !(handler.get("type").and_then(Value::as_str) == Some("command")
+                    && handler.get("command").and_then(Value::as_str) == Some(command.as_str())
+                    && handler.get("timeout").and_then(Value::as_u64) == Some(5))
+            });
+        }
+    }
+    groups.retain(|group| {
+        group
+            .get("hooks")
+            .and_then(Value::as_array)
+            .is_none_or(|handlers| !handlers.is_empty())
+    });
     if groups.is_empty() {
         hooks.remove(spec.event);
     }
@@ -5248,6 +5327,29 @@ mod tests {
             missing_correlation.code(),
             "provider-hook-correlation-missing"
         );
+    }
+
+    #[test]
+    fn claude_ask_user_question_shadows_do_not_pin_attention() {
+        let mapped = normalize_provider_hook(
+            AgentKind::Claude,
+            None,
+            "runtime-1",
+            &json!({
+                "hook_event_name": "PermissionRequest",
+                "session_id": "claude-session",
+                "tool_name": "AskUserQuestion",
+                "tool_input": {"questions": [{"question": "discarded"}]}
+            }),
+        )
+        .expect("shadow signal should be safely recognized");
+        assert!(
+            mapped.is_none(),
+            "AskUserQuestion exact PreToolUse/PostToolUse correlation must be the sole attention occurrence"
+        );
+        assert!(!provider_specs(AgentKind::Claude).iter().any(|spec| {
+            spec.event == "Notification" && spec.matcher == Some("permission_prompt")
+        }));
     }
 
     #[test]
