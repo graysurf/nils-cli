@@ -20,6 +20,8 @@ const DEFAULT_RESPONSE_TIMEOUT: Duration = Duration::from_secs(120);
 const CLEAN_EXIT_TIMEOUT: Duration = Duration::from_secs(5);
 const EVENT_QUEUE_CAPACITY: usize = 16;
 const WRITE_QUEUE_CAPACITY: usize = 8;
+const MAX_PENDING_REQUESTS: usize = 16;
+const MAX_PENDING_METADATA_BYTES: usize = 64 * 1024;
 
 pub fn run_local(args: &McpArgs, transport: &str) -> Result<u8, CliError> {
     run_with_io(args, transport, std::io::stdin(), std::io::stdout())
@@ -176,7 +178,7 @@ fn proxy_events(
     child: &mut ChildGuard,
 ) -> Result<u8, CliError> {
     let mut upstream_writer = UpstreamWriterState::new(upstream_writer);
-    let mut pending = BTreeMap::<String, PendingRequest>::new();
+    let mut pending = PendingRequests::default();
     let mut client_eof = false;
     let mut upstream_eof = false;
     let mut shutdown_completed = false;
@@ -254,10 +256,7 @@ fn proxy_events(
                     .with_operation("mcp"),
             );
         }
-        if pending
-            .values()
-            .any(|request| request.started.elapsed() >= response_timeout)
-        {
+        if pending.has_expired(response_timeout) {
             return Err(
                 CliError::upstream("Peekaboo MCP response deadline exceeded").with_operation("mcp"),
             );
@@ -306,7 +305,7 @@ fn handle_client_frame(
     journal: &mut Journal,
     output: &mut impl Write,
     upstream_writer: &mut UpstreamWriterState,
-    pending: &mut BTreeMap<String, PendingRequest>,
+    pending: &mut PendingRequests,
     frame: &[u8],
 ) -> Result<(), CliError> {
     let request = match serde_json::from_slice::<serde_json::Value>(frame) {
@@ -417,14 +416,29 @@ fn handle_client_frame(
             write_protocol_error(output, id.clone(), -32600, "duplicate JSON-RPC request id")?;
             return Ok(());
         }
-        pending.insert(
-            key,
-            PendingRequest {
-                method: method.into(),
-                tool: tool.clone(),
-                started: Instant::now(),
-            },
-        );
+        let request = PendingRequest {
+            method: method.into(),
+            tool: tool.clone(),
+            started: Instant::now(),
+        };
+        if !pending.can_insert(&key, &request) {
+            record_mcp_step(
+                journal,
+                method,
+                tool.as_deref(),
+                StepStatus::PolicyBlocked,
+                Some("resource_limit"),
+                Duration::ZERO,
+            )?;
+            write_protocol_error(
+                output,
+                serde_json::Value::Null,
+                -32002,
+                "outstanding request limit exceeded",
+            )?;
+            return Ok(());
+        }
+        pending.insert(key, request);
     }
     upstream_writer.enqueue(frame)?;
     if id.is_none() {
@@ -444,7 +458,7 @@ fn handle_upstream_frame(
     args: &McpArgs,
     journal: &mut Journal,
     output: &mut impl Write,
-    pending: &mut BTreeMap<String, PendingRequest>,
+    pending: &mut PendingRequests,
     frame: &[u8],
 ) -> Result<bool, CliError> {
     let mut response = serde_json::from_slice::<serde_json::Value>(frame).map_err(|_| {
@@ -607,6 +621,66 @@ struct PendingRequest {
     method: String,
     tool: Option<String>,
     started: Instant,
+}
+
+impl PendingRequest {
+    fn retained_bytes(&self, key: &str) -> usize {
+        key.len()
+            .saturating_add(self.method.len())
+            .saturating_add(self.tool.as_deref().map_or(0, str::len))
+    }
+}
+
+#[derive(Debug, Default)]
+struct PendingRequests {
+    entries: BTreeMap<String, PendingRequest>,
+    retained_bytes: usize,
+    earliest_started: Option<Instant>,
+}
+
+impl PendingRequests {
+    fn contains_key(&self, key: &str) -> bool {
+        self.entries.contains_key(key)
+    }
+
+    fn can_insert(&self, key: &str, request: &PendingRequest) -> bool {
+        self.entries.len() < MAX_PENDING_REQUESTS
+            && self
+                .retained_bytes
+                .checked_add(request.retained_bytes(key))
+                .is_some_and(|bytes| bytes <= MAX_PENDING_METADATA_BYTES)
+    }
+
+    fn insert(&mut self, key: String, request: PendingRequest) {
+        self.retained_bytes = self
+            .retained_bytes
+            .saturating_add(request.retained_bytes(&key));
+        self.earliest_started = Some(
+            self.earliest_started
+                .map_or(request.started, |earliest| earliest.min(request.started)),
+        );
+        self.entries.insert(key, request);
+    }
+
+    fn remove(&mut self, key: &str) -> Option<PendingRequest> {
+        let request = self.entries.remove(key)?;
+        self.retained_bytes = self
+            .retained_bytes
+            .saturating_sub(request.retained_bytes(key));
+        if self.earliest_started == Some(request.started) {
+            self.earliest_started = self.entries.values().map(|row| row.started).min();
+        }
+        Some(request)
+    }
+
+    fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    fn has_expired(&self, timeout: Duration) -> bool {
+        self.earliest_started
+            .is_some_and(|started| started.elapsed() >= timeout)
+    }
 }
 
 #[derive(Debug, Clone, Copy)]

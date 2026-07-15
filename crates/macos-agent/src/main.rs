@@ -42,7 +42,9 @@ fn main() -> ExitCode {
 fn requested_error_format(args: &[String]) -> ErrorFormat {
     let mut arguments = args.iter().skip(1);
     while let Some(argument) = arguments.next() {
-        if argument == "--error-format" {
+        if argument == "--" {
+            break;
+        } else if argument == "--error-format" {
             if arguments.next().is_some_and(|value| value == "json") {
                 return ErrorFormat::Json;
             }
@@ -73,6 +75,32 @@ mod tests {
         assert_eq!(
             requested_error_format(&["macos-agent".into(), "--error-format=json".into()]),
             ErrorFormat::Json
+        );
+    }
+
+    #[test]
+    fn parse_error_format_stops_at_the_exec_passthrough_separator() {
+        assert_eq!(
+            requested_error_format(&[
+                "macos-agent".into(),
+                "--error-format".into(),
+                "json".into(),
+                "exec".into(),
+                "--".into(),
+                "see".into(),
+            ]),
+            ErrorFormat::Json
+        );
+        assert_eq!(
+            requested_error_format(&[
+                "macos-agent".into(),
+                "exec".into(),
+                "--".into(),
+                "see".into(),
+                "--error-format".into(),
+                "json".into(),
+            ]),
+            ErrorFormat::Text
         );
     }
 }

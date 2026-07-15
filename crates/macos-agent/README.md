@@ -74,6 +74,31 @@ Bridge and otherwise starts the verified CLI daemon on its own digest-scoped
 socket. A release transition retires only inactive daemon sockets whose exact
 old build is still authorized by the embedded lock. `process` passes
 `--no-remote`.
+
+## Migrating from the native engine
+
+The adapter v2 boundary begins with nils-cli v1.22.6. Existing callers must
+migrate as one breaking contract change; there are no compatibility aliases:
+
+- `preflight` → `doctor --strict` for permission, Bridge, runtime, and
+  capability readiness.
+- `windows`, `apps`, `window`, `input`, `input-source`, and `ax` → `exec --
+  <peekaboo argv>` with an observable `--expected` postcondition for mutations.
+- `observe`, `debug`, `wait`, and `profile` have no adapter-level grammar.
+  Use the corresponding reviewed Peekaboo argv through `exec`; structural
+  evidence, debug redaction, and postcondition ownership now live in journal v2
+  and the calling skill.
+- `scenario` now accepts reviewed Peekaboo scenario JSON through `--file`; the
+  former native scenario schema is not accepted.
+- TSV output and the former global retry, timeout, and trace flags are removed.
+  Successful adapter envelopes use `macos-agent.adapter.v2`; upstream JSON is
+  nested under `result.upstream`. Typed adapter failures remain on stderr and
+  use the exit codes listed below.
+
+Create a new `--out-dir` after 512 journal steps. This explicit rotation bound
+caps cross-process reopen and integrity-scan work while retaining the complete
+append-only record for each run directory.
+
 Evidence modes are:
 
 - `minimal`: structural journal and sanitized upstream response.

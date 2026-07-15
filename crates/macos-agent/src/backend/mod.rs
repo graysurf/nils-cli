@@ -852,6 +852,9 @@ pub fn rollback(dry_run: bool, strict: bool) -> Result<BackendStatus, CliError> 
         .ok_or_else(|| backend_error("no previous backend receipt exists"))?;
     let outgoing = verify_transition_runtime(&paths, &lock, &current, strict)?;
     verify_receipt_any_version(&paths, &lock, &previous, strict)?;
+    if !stable_app_matches(&paths, &previous)? {
+        refuse_unowned_app(&paths)?;
+    }
     if dry_run {
         return Ok(BackendStatus {
             locked_tag: lock.tag,

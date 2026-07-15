@@ -414,6 +414,47 @@ fn rollback_rejects_replaced_current_cli_before_transition_side_effects() {
 }
 
 #[test]
+fn rollback_dry_run_rejects_the_same_unowned_stable_app_as_execution() {
+    let harness = common::MacosAgentHarness::new();
+    let cwd = TempDir::new().expect("cwd");
+    let backend_root = cwd.path().join("backend");
+    let old = candidate(cwd.path(), "v3.9.2", '2');
+    let new = candidate(cwd.path(), "v3.9.3", '3');
+    authorize_rollback(&new, &old);
+    for candidate in [&old, &new] {
+        let installed = run_backend(
+            &harness,
+            cwd.path(),
+            &backend_root,
+            candidate,
+            &["--format", "json", "backend", "install"],
+        );
+        assert_eq!(installed.code, 0, "{}", installed.stderr_text());
+    }
+
+    let current_path = backend_root.join("receipts/current.json");
+    let previous_path = backend_root.join("receipts/previous.json");
+    let current_before = fs::read(&current_path).expect("current receipt");
+    let previous_before = fs::read(&previous_path).expect("previous receipt");
+    let stable_app = backend_root.join("stable/Peekaboo.app/Contents/MacOS/Peekaboo");
+    fs::write(&stable_app, b"unowned stable app").expect("drift stable app");
+    let stable_before = fs::read(&stable_app).expect("drifted stable app");
+
+    for args in [
+        &["--error-format", "json", "backend", "rollback", "--dry-run"][..],
+        &["--error-format", "json", "backend", "rollback"][..],
+    ] {
+        let rejected = run_backend(&harness, cwd.path(), &backend_root, &new, args);
+        assert_eq!(rejected.code, 69, "{args:?}: {}", rejected.stderr_text());
+        assert_eq!(rejected.stderr_json()["error"]["class"], "backend");
+        assert_eq!(fs::read(&current_path).expect("current"), current_before);
+        assert_eq!(fs::read(&previous_path).expect("previous"), previous_before);
+        assert_eq!(fs::read(&stable_app).expect("stable app"), stable_before);
+        assert!(!backend_root.join("receipts/pending.json").exists());
+    }
+}
+
+#[test]
 fn rollback_recovers_an_interruption_after_the_stable_app_swap() {
     let harness = common::MacosAgentHarness::new();
     let cwd = TempDir::new().expect("cwd");

@@ -282,7 +282,18 @@ pub fn run_remote_mcp(args: &McpArgs) -> Result<u8, CliError> {
         let _ = cleanup(host, &token);
         return Err(transport_error("SSH MCP output transport failed"));
     }
-    let status = process.wait_bounded(Duration::from_secs(5))?;
+    let status = match process.wait_bounded(test_mode::ssh_mcp_exit_timeout()) {
+        Ok(status) => status,
+        Err(error) => {
+            let _ = error_thread.join();
+            return match cleanup(host, &token) {
+                Ok(()) => Err(error),
+                Err(_) => Err(transport_error(
+                    "SSH MCP transport did not exit cleanly and remote cleanup could not be confirmed",
+                )),
+            };
+        }
+    };
     let (terminal_stderr, terminal_truncated) = error_thread
         .join()
         .map_err(|_| transport_error("SSH MCP terminal-status reader failed"))?;

@@ -24,6 +24,7 @@ static STEP_SCAN_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::Atom
 #[cfg(test)]
 static STEP_SCAN_ROOT: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
 const MAX_JOURNAL_BYTES: u64 = 32 * 1024 * 1024;
+const MAX_JOURNAL_STEPS: u64 = 512;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -354,7 +355,13 @@ impl Journal {
     pub fn record_step(&mut self, input: StepInput) -> Result<StepRecord, CliError> {
         let _lock = JournalLock::acquire(&self.root)?;
         recover_sequence_transaction(&self.root)?;
-        let sequence = read_sequence(&self.root)? + 1;
+        let committed_sequence = read_sequence(&self.root)?;
+        if committed_sequence >= MAX_JOURNAL_STEPS {
+            return Err(journal_error(
+                "journal rotation is required at the 512-step bound; use a new output directory",
+            ));
+        }
+        let sequence = committed_sequence + 1;
         let id = format!("step-{sequence:06}");
         let command = input
             .argv
@@ -1681,6 +1688,47 @@ mod tests {
         journal.close().expect("close");
         assert_eq!(STEP_SCAN_COUNT.load(Ordering::Relaxed), 1);
         *STEP_SCAN_ROOT.lock().expect("scan root") = None;
+    }
+
+    #[test]
+    fn journal_rotation_bound_limits_repeated_reopen_work() {
+        let root = TempDir::new().expect("root");
+        let mut journal = open(root.path(), EvidenceMode::Minimal);
+        for _ in 0..512 {
+            journal
+                .record_step(StepInput {
+                    parent_id: None,
+                    intent: None,
+                    expected: None,
+                    argv: vec!["see".into()],
+                    status: StepStatus::Passed,
+                    failure_class: None,
+                    duration_ms: 1,
+                    retries: 0,
+                    precondition_refs: vec![],
+                    postcondition_refs: vec![],
+                    snapshot_lineage: None,
+                    artifact_refs: vec![],
+                })
+                .expect("within rotation bound");
+        }
+        let error = journal
+            .record_step(StepInput {
+                parent_id: None,
+                intent: None,
+                expected: None,
+                argv: vec!["see".into()],
+                status: StepStatus::Passed,
+                failure_class: None,
+                duration_ms: 1,
+                retries: 0,
+                precondition_refs: vec![],
+                postcondition_refs: vec![],
+                snapshot_lineage: None,
+                artifact_refs: vec![],
+            })
+            .expect_err("journal must require rotation at its step bound");
+        assert!(error.message().contains("rotation"), "{error}");
     }
 
     #[test]

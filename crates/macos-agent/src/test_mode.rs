@@ -1,4 +1,5 @@
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 pub fn enabled() -> bool {
     cfg!(debug_assertions)
@@ -56,6 +57,16 @@ pub fn cleanup_failure() -> bool {
     enabled() && std::env::var_os("NILS_MACOS_AGENT_TEST_CLEANUP_FAIL").is_some()
 }
 
+pub fn ssh_mcp_exit_timeout() -> Duration {
+    if enabled()
+        && let Ok(value) = std::env::var("NILS_MACOS_AGENT_TEST_SSH_MCP_EXIT_TIMEOUT_MS")
+        && let Ok(milliseconds) = value.parse::<u64>()
+    {
+        return Duration::from_millis(milliseconds.clamp(1, 60_000));
+    }
+    Duration::from_secs(5)
+}
+
 pub fn verification_tool_override(program: &Path) -> Option<PathBuf> {
     if !enabled() || program.components().count() != 1 {
         return None;
@@ -68,6 +79,10 @@ pub fn verification_tool_override(program: &Path) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::enabled;
+    #[cfg(not(debug_assertions))]
+    use super::ssh_mcp_exit_timeout;
+    #[cfg(not(debug_assertions))]
+    use std::time::Duration;
 
     #[test]
     fn false_like_environment_values_do_not_enable_test_mode() {
@@ -88,14 +103,25 @@ mod tests {
     #[test]
     fn release_builds_ignore_test_mode_environment() {
         let previous = std::env::var_os("AGENTS_MACOS_AGENT_TEST_MODE");
+        let previous_timeout = std::env::var_os("NILS_MACOS_AGENT_TEST_SSH_MCP_EXIT_TIMEOUT_MS");
         // SAFETY: this focused test restores the process environment before returning.
-        unsafe { std::env::set_var("AGENTS_MACOS_AGENT_TEST_MODE", "1") };
+        unsafe {
+            std::env::set_var("AGENTS_MACOS_AGENT_TEST_MODE", "1");
+            std::env::set_var("NILS_MACOS_AGENT_TEST_SSH_MCP_EXIT_TIMEOUT_MS", "1");
+        }
         assert!(!enabled());
+        assert_eq!(ssh_mcp_exit_timeout(), Duration::from_secs(5));
         // SAFETY: restore the value observed before this test.
         unsafe {
             match previous {
                 Some(value) => std::env::set_var("AGENTS_MACOS_AGENT_TEST_MODE", value),
                 None => std::env::remove_var("AGENTS_MACOS_AGENT_TEST_MODE"),
+            }
+            match previous_timeout {
+                Some(value) => {
+                    std::env::set_var("NILS_MACOS_AGENT_TEST_SSH_MCP_EXIT_TIMEOUT_MS", value)
+                }
+                None => std::env::remove_var("NILS_MACOS_AGENT_TEST_SSH_MCP_EXIT_TIMEOUT_MS"),
             }
         }
     }

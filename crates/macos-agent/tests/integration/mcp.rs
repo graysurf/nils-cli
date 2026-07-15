@@ -557,6 +557,56 @@ fn silent_upstream_is_terminated_at_the_mcp_response_deadline() {
 }
 
 #[test]
+fn silent_reading_upstream_cannot_grow_outstanding_request_state_without_bound() {
+    let harness = common::MacosAgentHarness::new();
+    let cwd = TempDir::new().expect("cwd");
+    let fake = cwd.path().join("peekaboo");
+    fs::write(&fake, "#!/bin/sh\nwhile IFS= read -r line; do :; done\n").expect("fake");
+    fs::set_permissions(&fake, fs::Permissions::from_mode(0o755)).expect("chmod");
+    let mut input = String::new();
+    for id in 1..=40 {
+        input.push_str(&format!(
+            "{{\"jsonrpc\":\"2.0\",\"id\":{id},\"method\":\"tools/list\",\"params\":{{}}}}\n"
+        ));
+    }
+    let oversized_id = "i".repeat(70 * 1024);
+    input.push_str(&format!(
+        "{{\"jsonrpc\":\"2.0\",\"id\":\"{oversized_id}\",\"method\":\"tools/list\",\"params\":{{}}}}\n"
+    ));
+    let options = harness
+        .cmd_options(cwd.path())
+        .with_env(
+            "NILS_MACOS_AGENT_PEEKABOO_BIN",
+            fake.to_str().expect("fake"),
+        )
+        .with_env("NILS_MACOS_AGENT_TEST_MCP_RESPONSE_TIMEOUT_MS", "2000")
+        .with_stdin_str(&input);
+    let out_dir = cwd.path().join("bounded-pending-journal");
+    let out = harness.run_with_options(
+        cwd.path(),
+        &["mcp", "--out-dir", out_dir.to_str().expect("out")],
+        options,
+    );
+    assert_eq!(out.code, 70, "{}", out.stderr_text());
+    let errors = out
+        .stdout_text()
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("protocol error"))
+        .collect::<Vec<_>>();
+    assert!(
+        errors.iter().any(|frame| {
+            frame["error"]["code"] == -32002
+                && frame["error"]["message"] == "outstanding request limit exceeded"
+        }),
+        "missing bounded-pending rejection: {errors:?}"
+    );
+    assert!(
+        out.stdout.len() < 128 * 1024,
+        "resource-limit response echoed oversized correlation data"
+    );
+}
+
+#[test]
 fn blocked_upstream_stdin_is_bounded_by_the_mcp_deadline() {
     let harness = common::MacosAgentHarness::new();
     let cwd = TempDir::new().expect("cwd");
@@ -585,6 +635,61 @@ fn blocked_upstream_stdin_is_bounded_by_the_mcp_deadline() {
     assert_eq!(out.code, 70, "{}", out.stderr_text());
     assert!(started.elapsed() < Duration::from_secs(1));
     assert_terminal_failure_step(&out_dir, "mcp_write_timeout");
+}
+
+#[test]
+fn ssh_mcp_exit_timeout_attempts_token_scoped_remote_cleanup() {
+    let harness = common::MacosAgentHarness::new();
+    let cwd = TempDir::new().expect("cwd");
+    let cleanup_marker = cwd.path().join("cleanup-invoked");
+    let fake_ssh = cwd.path().join("ssh");
+    fs::write(
+        &fake_ssh,
+        r#"#!/bin/sh
+while [ "$1" = "-o" ]; do shift 2; done
+[ "$1" = "--" ] && shift
+shift
+case " $* " in
+  *" __remote-mcp "*) exec 1>&-; sleep 10 ;;
+  *" __remote-cleanup "*) : > "$MCP_CLEANUP_MARKER"; exit 0 ;;
+esac
+exit 1
+"#,
+    )
+    .expect("ssh");
+    fs::set_permissions(&fake_ssh, fs::Permissions::from_mode(0o755)).expect("chmod ssh");
+    let options = harness
+        .cmd_options(cwd.path())
+        .with_env("NILS_MACOS_AGENT_SSH_BIN", fake_ssh.to_str().expect("ssh"))
+        .with_env(
+            "MCP_CLEANUP_MARKER",
+            cleanup_marker.to_str().expect("marker"),
+        )
+        .with_env("NILS_MACOS_AGENT_TEST_SSH_MCP_EXIT_TIMEOUT_MS", "40")
+        .with_stdin_str("");
+    let started = Instant::now();
+    let out = harness.run_with_options(
+        cwd.path(),
+        &[
+            "--error-format",
+            "json",
+            "mcp",
+            "--host",
+            "fixture-role",
+            "--out-dir",
+            cwd.path()
+                .join("ssh-timeout-journal")
+                .to_str()
+                .expect("out"),
+        ],
+        options,
+    );
+    assert_eq!(out.code, 75, "{}", out.stderr_text());
+    assert!(started.elapsed() < Duration::from_secs(8));
+    assert!(
+        cleanup_marker.exists(),
+        "SSH MCP timeout skipped token-scoped cleanup"
+    );
 }
 
 #[test]

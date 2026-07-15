@@ -36,6 +36,28 @@ fn root_help_exposes_only_the_peekaboo_adapter_surface() {
 }
 
 #[test]
+fn readme_maps_every_retired_public_surface_to_the_adapter_v2_boundary() {
+    let readme =
+        std::fs::read_to_string(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("README.md"))
+            .expect("README");
+    for required in [
+        "## Migrating from the native engine",
+        "`preflight` → `doctor --strict`",
+        "`windows`, `apps`, `window`, `input`, `input-source`, and `ax`",
+        "`observe`, `debug`, `wait`, and `profile`",
+        "`scenario`",
+        "`macos-agent.adapter.v2`",
+        "exit codes",
+        "nils-cli v1.22.6",
+    ] {
+        assert!(
+            readme.contains(required),
+            "missing migration contract: {required}"
+        );
+    }
+}
+
+#[test]
 fn repository_contains_a_complete_immutable_peekaboo_lock() {
     let lock_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("peekaboo-lock.json");
     let raw = std::fs::read_to_string(&lock_path)
