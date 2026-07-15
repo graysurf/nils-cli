@@ -803,6 +803,13 @@ fn activity_events_are_runtime_bound_private_and_deterministic() {
             .windows(2)
             .any(|pair| { pair == ["-e", &format!("AGENT_SESSION_RUNTIME_ID={runtime_id}")] })
     );
+    let inherited_path = std::env::var("PATH").expect("test PATH");
+    assert!(
+        new_session
+            .windows(2)
+            .any(|pair| { pair == ["-e", &format!("PATH={inherited_path}")] }),
+        "new tmux sessions must receive the daemon PATH instead of inheriting a stale tmux-server PATH: {new_session:?}"
+    );
 
     let event = |event_id: &str,
                  kind: &str,
@@ -3717,6 +3724,7 @@ fn start_creates_session_state_without_printing_prompt() {
         .iter()
         .find(|call| call.first().is_some_and(|arg| arg == "new-session"))
         .expect("new-session call");
+    let inherited_path = std::env::var("PATH").expect("test PATH");
     assert_eq!(
         new_session,
         &vec![
@@ -3737,6 +3745,8 @@ fn start_creates_session_state_without_printing_prompt() {
             format!("AGENT_SESSION_RUNTIME_ID={runtime_id}"),
             "-e".to_string(),
             "AGENT_SESSION_ATTENTION_AUTHORITY=hook".to_string(),
+            "-e".to_string(),
+            format!("PATH={inherited_path}"),
             "--".to_string(),
             codex_arg.clone(),
             "--cd".to_string(),
@@ -7874,6 +7884,7 @@ fn resume_recreates_tmux_runtime_from_exact_provider_identity() {
         .expect("new-session call");
     let record: Value = serde_json::from_str(&fs::read_to_string(&record_path).unwrap()).unwrap();
     let runtime_id = record["runtime"]["launch_id"].as_str().expect("runtime id");
+    let inherited_path = std::env::var("PATH").expect("test PATH");
     assert_eq!(
         new_session,
         &vec![
@@ -7894,6 +7905,8 @@ fn resume_recreates_tmux_runtime_from_exact_provider_identity() {
             format!("AGENT_SESSION_RUNTIME_ID={runtime_id}"),
             "-e".to_string(),
             "AGENT_SESSION_ATTENTION_AUTHORITY=hook".to_string(),
+            "-e".to_string(),
+            format!("PATH={inherited_path}"),
             "--".to_string(),
             codex_arg.clone(),
             "resume".to_string(),

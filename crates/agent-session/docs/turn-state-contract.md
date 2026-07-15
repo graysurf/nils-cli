@@ -356,7 +356,11 @@ provider-specific `attention_authority` policy, trust requirements, and repair
 guidance without emitting provider config content.
 Configured status requires every exact owned hook command/timeout and, for
 Codex, an exact owned or valid composed notify argv; helper health resolves the bare `agent-session`
-command on PATH. Hook/notification diagnostics are bound to the active
+command on PATH. Every start and resume passes the current daemon `PATH` as a
+session-scoped `tmux new-session` environment value, so a durable tmux server
+cannot supply an older helper path after a staged daemon upgrade. The service
+launcher remains responsible for putting the selected daemon directory first.
+Hook/notification diagnostics are bound to the active
 launch id/generation and the newest current-runtime diagnostic is selected
 deterministically across sessions.
 

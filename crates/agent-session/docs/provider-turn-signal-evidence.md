@@ -112,6 +112,12 @@ retains a monotonic public revision/timestamp and fails closed if unreadable or
 if a parseable state is not itself a valid runtime-owned `unknown` state.
 Authority never switches within a runtime.
 
+The same runtime injection passes the daemon's current `PATH` to each new tmux
+session. This is deliberately session-scoped: a tmux server may outlive the
+serve daemon and retain its older global environment, but provider hooks in a
+new pane must resolve the staged `agent-session` helper selected by the current
+launcher.
+
 For fresh agent-session-managed sessions, bounded version/help probes admit
 only an explicit app-server transport allowlist plus Unix-listen support before
 launching `codex app-server` and connecting the visible TUI through a private
