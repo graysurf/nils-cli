@@ -1489,8 +1489,15 @@ fn verify_app_metadata(
 ) -> Result<(), CliError> {
     let raw = fs::read_to_string(app.join("Contents/Info.plist"))
         .map_err(|_| backend_error("Peekaboo app metadata is unavailable"))?;
-    let document = roxmltree::Document::parse(&raw)
-        .map_err(|_| backend_error("Peekaboo app metadata is malformed"))?;
+    let document = roxmltree::Document::parse_with_options(
+        &raw,
+        roxmltree::ParsingOptions {
+            allow_dtd: true,
+            nodes_limit: 16_384,
+            entity_resolver: None,
+        },
+    )
+    .map_err(|_| backend_error("Peekaboo app metadata is malformed"))?;
     let dictionary = document
         .descendants()
         .find(|node| node.has_tag_name("dict"))
