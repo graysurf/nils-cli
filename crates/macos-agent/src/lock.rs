@@ -10,6 +10,13 @@ use crate::test_mode;
 const EMBEDDED_LOCK: &str = include_str!("../peekaboo-lock.json");
 const CLI_NOTARIZATION_WAIVER_TAG: &str = "v3.9.3";
 const CLI_NOTARIZATION_WAIVER_COMMIT: &str = "3cfd612adbcb1b43e8431a7a1f3b02ec45d01269";
+const CLI_NOTARIZATION_WAIVER_ARCHIVE_SHA256: &str =
+    "793251fd3fd3b3f1ba5e61095c1204aa1cfcd6eae19a4d46fdb443b547a8cccf";
+const CLI_NOTARIZATION_WAIVER_EXECUTABLE_SHA256: &str =
+    "6380687e62cf42d1b7830394cd1e760dffab0db24b270627c15eee7b51c67072";
+const CLI_NOTARIZATION_WAIVER_SIGNING_AUTHORITY: &str =
+    "Developer ID Application: Peter Steinberger (Y5PE65HELJ)";
+const CLI_NOTARIZATION_WAIVER_TEAM_ID: &str = "Y5PE65HELJ";
 const CLI_NOTARIZATION_WAIVER_APPROVAL: &str =
     "https://github.com/graysurf/agent-runtime-kit/issues/610#issuecomment-4984437753";
 const CLI_NOTARIZATION_WAIVER_APPROVED_AT: &str = "2026-07-15";
@@ -290,6 +297,10 @@ fn validate_notarization(
                 && repository == "https://github.com/openclaw/Peekaboo"
                 && tag == CLI_NOTARIZATION_WAIVER_TAG
                 && commit == CLI_NOTARIZATION_WAIVER_COMMIT
+                && asset.sha256 == CLI_NOTARIZATION_WAIVER_ARCHIVE_SHA256
+                && asset.executable_sha256 == CLI_NOTARIZATION_WAIVER_EXECUTABLE_SHA256
+                && asset.signing_authority == CLI_NOTARIZATION_WAIVER_SIGNING_AUTHORITY
+                && asset.team_id == CLI_NOTARIZATION_WAIVER_TEAM_ID
                 && waiver.repository == repository
                 && waiver.tag == tag
                 && waiver.commit == commit
@@ -390,6 +401,49 @@ mod tests {
         let mut app_waiver = PeekabooLock::embedded().expect("embedded lock");
         app_waiver.assets[1].notarization = app_waiver.assets[0].notarization.clone();
         assert!(app_waiver.validate().is_err());
+    }
+
+    #[test]
+    fn exact_cli_notarization_waiver_rejects_coordinated_tuple_drift() {
+        let mut archive = PeekabooLock::embedded().expect("embedded lock");
+        archive.assets[0].sha256 = "0".repeat(64);
+        archive.assets[0]
+            .notarization
+            .waiver
+            .as_mut()
+            .expect("CLI waiver")
+            .archive_sha256 = "0".repeat(64);
+        assert!(archive.validate().is_err());
+
+        let mut executable = PeekabooLock::embedded().expect("embedded lock");
+        executable.assets[0].executable_sha256 = "1".repeat(64);
+        executable.assets[0]
+            .notarization
+            .waiver
+            .as_mut()
+            .expect("CLI waiver")
+            .executable_sha256 = "1".repeat(64);
+        assert!(executable.validate().is_err());
+
+        let mut authority = PeekabooLock::embedded().expect("embedded lock");
+        authority.assets[0].signing_authority = "Different signer".into();
+        authority.assets[0]
+            .notarization
+            .waiver
+            .as_mut()
+            .expect("CLI waiver")
+            .signing_authority = "Different signer".into();
+        assert!(authority.validate().is_err());
+
+        let mut team = PeekabooLock::embedded().expect("embedded lock");
+        team.assets[0].team_id = "DIFFERENT".into();
+        team.assets[0]
+            .notarization
+            .waiver
+            .as_mut()
+            .expect("CLI waiver")
+            .team_id = "DIFFERENT".into();
+        assert!(team.validate().is_err());
     }
 
     #[test]

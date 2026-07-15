@@ -1544,17 +1544,34 @@ fn verify_signature(
             Path::new("codesign"),
             &["-vvvv", "-R=notarized", "--check-notarization", &path_text],
         )?;
-        if assessment.exit_code != 0 || assessment.timed_out {
-            return match asset.notarization.policy {
-                NotarizationPolicy::Required => {
-                    Err(backend_error("Peekaboo CLI notarization assessment failed"))
-                }
-                NotarizationPolicy::Waived => Ok(NotarizationAssessment::Waived),
-            };
-        }
-        return Ok(NotarizationAssessment::Passed);
+        return classify_cli_notarization_assessment(
+            asset.notarization.policy,
+            assessment.exit_code,
+            assessment.timed_out,
+        );
     }
     Ok(NotarizationAssessment::NotAssessed)
+}
+
+fn classify_cli_notarization_assessment(
+    policy: NotarizationPolicy,
+    exit_code: i32,
+    timed_out: bool,
+) -> Result<NotarizationAssessment, CliError> {
+    if timed_out {
+        return Err(backend_error(
+            "Peekaboo CLI notarization assessment timed out",
+        ));
+    }
+    if exit_code == 0 {
+        return Ok(NotarizationAssessment::Passed);
+    }
+    match policy {
+        NotarizationPolicy::Required => {
+            Err(backend_error("Peekaboo CLI notarization assessment failed"))
+        }
+        NotarizationPolicy::Waived => Ok(NotarizationAssessment::Waived),
+    }
 }
 
 fn run_tool(program: &Path, args: &[&str]) -> Result<process::ProcessOutput, CliError> {
@@ -1737,11 +1754,26 @@ mod tests {
     use tempfile::TempDir;
 
     use super::{
-        LifecycleLock, LifecycleLockMode, RECEIPT_SCHEMA, Receipt, app_contract_for_receipt,
-        macos_version_supported, obsolete_runtime_contracts, safe_tag, validate_archive_path,
-        validate_symlink_tree,
+        LifecycleLock, LifecycleLockMode, NotarizationAssessment, RECEIPT_SCHEMA, Receipt,
+        app_contract_for_receipt, classify_cli_notarization_assessment, macos_version_supported,
+        obsolete_runtime_contracts, safe_tag, validate_archive_path, validate_symlink_tree,
     };
-    use crate::lock::PeekabooLock;
+    use crate::lock::{NotarizationPolicy, PeekabooLock};
+
+    #[test]
+    fn completed_cli_notary_rejection_is_waived_but_timeout_fails_closed() {
+        assert_eq!(
+            classify_cli_notarization_assessment(NotarizationPolicy::Waived, 1, false)
+                .expect("completed rejection is the approved exception"),
+            NotarizationAssessment::Waived
+        );
+        let timeout = classify_cli_notarization_assessment(NotarizationPolicy::Waived, 1, true)
+            .expect_err("an inconclusive timeout must fail closed");
+        assert!(timeout.to_string().contains("timed out"));
+        assert!(
+            classify_cli_notarization_assessment(NotarizationPolicy::Required, 1, false).is_err()
+        );
+    }
 
     #[test]
     fn rejects_archive_traversal_and_absolute_paths() {
