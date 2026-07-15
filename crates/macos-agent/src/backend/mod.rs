@@ -15,6 +15,8 @@ use crate::test_mode;
 
 const RECEIPT_SCHEMA: &str = "macos-agent.backend-receipt.v1";
 const LIFECYCLE_LOCK_FILE: &str = ".backend-lifecycle.lock";
+const STABLE_APP_INCOMING: &str = ".nils-peekaboo-incoming";
+const STABLE_APP_BACKUP: &str = ".nils-peekaboo-backup";
 
 #[derive(Debug, Clone, Copy)]
 enum LifecycleLockMode {
@@ -61,6 +63,8 @@ impl Drop for LifecycleLock {
 #[derive(Debug)]
 pub struct VerifiedBackend {
     path: PathBuf,
+    runtime_identity: String,
+    expected_version: Option<String>,
     _lease: Option<LifecycleLock>,
 }
 
@@ -71,6 +75,14 @@ impl VerifiedBackend {
 
     pub fn digest(&self) -> Result<String, CliError> {
         Ok(format!("sha256:{}", hash_file(&self.path)?))
+    }
+
+    pub fn runtime_identity(&self) -> &str {
+        &self.runtime_identity
+    }
+
+    pub fn expected_version(&self) -> Option<&str> {
+        self.expected_version.as_deref()
     }
 }
 
@@ -434,23 +446,76 @@ fn recover_pending(
         verify_receipt_any_version(paths, lock, &pending, strict)?;
     }
     let current = read_receipt(&paths.current_receipt())?;
-    if stable_app_matches(paths, &pending)? {
-        if let Some(current) = current.as_ref()
-            && current.tag != pending.tag
-        {
-            write_receipt(&paths.previous_receipt(), current)?;
+    if let Some(current) = current.as_ref() {
+        if current.tag == lock.tag && current.commit == lock.commit {
+            verify_receipt(paths, lock, current, strict)?;
+        } else {
+            verify_receipt_any_version(paths, lock, current, strict)?;
         }
-        write_receipt(&paths.current_receipt(), &pending)?;
-    } else if !current
+    }
+    let incoming = paths.stable_app.with_file_name(STABLE_APP_INCOMING);
+    let backup = paths.stable_app.with_file_name(STABLE_APP_BACKUP);
+    if stable_app_matches(paths, &pending)? {
+        finalize_pending(paths, &pending, current.as_ref(), &incoming, &backup)?;
+        return Ok(());
+    }
+    if !paths.stable_app.exists() && app_path_matches(&incoming, &pending)? {
+        verify_receipt_app(&incoming, lock, &pending, strict)?;
+        fs::rename(&incoming, &paths.stable_app)
+            .map_err(|_| backend_error("failed to recover the staged stable app"))?;
+        finalize_pending(paths, &pending, current.as_ref(), &incoming, &backup)?;
+        return Ok(());
+    }
+    if current
         .as_ref()
         .is_some_and(|receipt| stable_app_matches(paths, receipt).unwrap_or(false))
     {
-        return Err(backend_error(
-            "interrupted backend activation cannot prove stable app ownership",
-        ));
+        remove_transaction_dir(&incoming)?;
+        remove_transaction_dir(&backup)?;
+        return fs::remove_file(paths.pending_receipt())
+            .map_err(|_| backend_error("failed to abandon interrupted backend activation"));
     }
+    if !paths.stable_app.exists()
+        && let Some(current) = current.as_ref()
+        && app_path_matches(&backup, current)?
+    {
+        verify_receipt_app(&backup, lock, current, strict)?;
+        fs::rename(&backup, &paths.stable_app)
+            .map_err(|_| backend_error("failed to restore the previous stable app"))?;
+        remove_transaction_dir(&incoming)?;
+        return fs::remove_file(paths.pending_receipt())
+            .map_err(|_| backend_error("failed to abandon interrupted backend activation"));
+    }
+    Err(backend_error(
+        "interrupted backend activation cannot prove stable app ownership",
+    ))
+}
+
+fn finalize_pending(
+    paths: &BackendPaths,
+    pending: &Receipt,
+    current: Option<&Receipt>,
+    incoming: &Path,
+    backup: &Path,
+) -> Result<(), CliError> {
+    if let Some(current) = current
+        && current.tag != pending.tag
+    {
+        write_receipt(&paths.previous_receipt(), current)?;
+    }
+    write_receipt(&paths.current_receipt(), pending)?;
+    remove_transaction_dir(incoming)?;
+    remove_transaction_dir(backup)?;
     fs::remove_file(paths.pending_receipt())
         .map_err(|_| backend_error("failed to clear recovered backend activation receipt"))
+}
+
+fn remove_transaction_dir(path: &Path) -> Result<(), CliError> {
+    if path.exists() {
+        fs::remove_dir_all(path)
+            .map_err(|_| backend_error("failed to clear a stable app transaction directory"))?;
+    }
+    Ok(())
 }
 
 pub fn verify(strict: bool) -> Result<VerificationReport, CliError> {
@@ -589,16 +654,26 @@ pub fn doctor(strict: bool) -> Result<DoctorReport, CliError> {
 
 pub fn acquire_verified_backend() -> Result<VerifiedBackend, CliError> {
     if let Some(path) = test_mode::peekaboo_bin_override() {
-        return Ok(VerifiedBackend { path, _lease: None });
+        let digest = hash_file(&path)?;
+        return Ok(VerifiedBackend {
+            path,
+            runtime_identity: digest[..16].into(),
+            expected_version: None,
+            _lease: None,
+        });
     }
     ensure_supported_platform()?;
     let lock = PeekabooLock::embedded()?;
     let paths = BackendPaths::resolve()?;
     let lease = LifecycleLock::acquire(&paths.root, LifecycleLockMode::Shared)?;
     verify_unlocked(false, &lock, &paths)?;
+    let receipt = read_receipt(&paths.current_receipt())?
+        .ok_or_else(|| backend_error("the verified backend receipt is unavailable"))?;
     let path = paths.current_cli()?;
     Ok(VerifiedBackend {
         path,
+        runtime_identity: receipt.cli_binary_sha256[..16].into(),
+        expected_version: Some(receipt.tag.trim_start_matches('v').into()),
         _lease: Some(lease),
     })
 }
@@ -894,15 +969,31 @@ fn refuse_unowned_app(paths: &BackendPaths) -> Result<(), CliError> {
 }
 
 fn stable_app_matches(paths: &BackendPaths, receipt: &Receipt) -> Result<bool, CliError> {
-    let binary = paths
-        .stable_app
-        .join("Contents")
-        .join("MacOS")
-        .join("Peekaboo");
+    app_path_matches(&paths.stable_app, receipt)
+}
+
+fn app_path_matches(app: &Path, receipt: &Receipt) -> Result<bool, CliError> {
+    let binary = app.join("Contents").join("MacOS").join("Peekaboo");
     if !binary.is_file() {
         return Ok(false);
     }
     Ok(hash_file(&binary)? == receipt.app_binary_sha256)
+}
+
+fn verify_receipt_app(
+    app: &Path,
+    lock: &PeekabooLock,
+    receipt: &Receipt,
+    strict: bool,
+) -> Result<(), CliError> {
+    if !app_path_matches(app, receipt)? {
+        return Err(backend_error(
+            "stable app transaction digest does not match its receipt",
+        ));
+    }
+    let (app_asset, minimum_macos) = app_contract_for_receipt(lock, receipt)?;
+    verify_signature(app, app_asset, true, strict)?;
+    verify_app_metadata(app, app_asset, &receipt.tag, minimum_macos)
 }
 
 fn replace_stable_app(paths: &BackendPaths, receipt: &Receipt) -> Result<(), CliError> {
@@ -914,10 +1005,10 @@ fn replace_stable_app(paths: &BackendPaths, receipt: &Receipt) -> Result<(), Cli
         .ok_or_else(|| backend_error("stable app path has no parent"))?;
     fs::create_dir_all(parent)
         .map_err(|_| backend_error("failed to create the stable app parent directory"))?;
-    let incoming = parent.join(format!(".nils-peekaboo-incoming-{}", std::process::id()));
-    let backup = parent.join(format!(".nils-peekaboo-backup-{}", std::process::id()));
-    let _ = fs::remove_dir_all(&incoming);
-    let _ = fs::remove_dir_all(&backup);
+    let incoming = parent.join(STABLE_APP_INCOMING);
+    let backup = parent.join(STABLE_APP_BACKUP);
+    remove_transaction_dir(&incoming)?;
+    remove_transaction_dir(&backup)?;
     copy_tree(&source, &incoming)?;
     let incoming_hash = hash_file(&incoming.join("Contents/MacOS/Peekaboo"))?;
     if incoming_hash != receipt.app_binary_sha256 {
@@ -942,7 +1033,7 @@ fn replace_stable_app(paths: &BackendPaths, receipt: &Receipt) -> Result<(), Cli
         )));
     }
     if had_current {
-        let _ = fs::remove_dir_all(&backup);
+        remove_transaction_dir(&backup)?;
     }
     Ok(())
 }

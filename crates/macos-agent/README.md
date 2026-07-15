@@ -66,9 +66,11 @@ macos-agent exec \
 
 Use `--runtime app|daemon|auto|process` to select the effective Peekaboo
 authority. `app` is the stable default: it launches the owned app and pins
-`~/Library/Application Support/Peekaboo/bridge.sock`. `daemon` starts the
-verified CLI daemon and pins `daemon.sock` in the same directory. `auto` leaves
-selection to Peekaboo. `process` passes `--no-remote`. Evidence modes are:
+`~/Library/Application Support/Peekaboo/bridge.sock`, then verifies that the
+Bridge handshake advertises the active release. `daemon` and `auto` start the
+verified CLI daemon on separate executable-digest-scoped sockets in the same
+directory and verify its release handshake. `process` passes `--no-remote`.
+Evidence modes are:
 
 - `minimal`: structural journal and sanitized upstream response.
 - `debug`: minimal plus a sanitized upstream result artifact.

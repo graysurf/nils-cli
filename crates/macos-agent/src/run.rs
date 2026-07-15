@@ -34,6 +34,27 @@ pub fn command_label(cli: &Cli) -> &'static str {
     }
 }
 
+pub(crate) fn capability_report(strict: bool) -> Result<serde_json::Value, CliError> {
+    let lock = PeekabooLock::embedded()?;
+    let live = strict
+        .then(|| backend::doctor(true))
+        .transpose()?
+        .map(|value| {
+            serde_json::to_value(value)
+                .map_err(|_| CliError::upstream("failed to encode capability verification"))
+        })
+        .transpose()?;
+    Ok(serde_json::json!({
+        "backend": {"tag": lock.tag, "minimum_macos": lock.minimum_macos},
+        "transport": ["local", "ssh"],
+        "interfaces": ["exec", "scenario", "mcp_stdio"],
+        "runtime": ["app", "daemon", "auto", "process"],
+        "tool_profiles": ["observe", "interact", "extended"],
+        "disabled": crate::policy::disabled_capabilities(),
+        "live": live,
+    }))
+}
+
 pub fn run(cli: Cli) -> Result<u8, CliError> {
     let command = command_label(&cli);
     match cli.command {
@@ -141,28 +162,7 @@ pub fn run(cli: Cli) -> Result<u8, CliError> {
                     "capabilities",
                 );
             }
-            let lock = PeekabooLock::embedded()?;
-            let live =
-                if args.strict {
-                    Some(serde_json::to_value(backend::doctor(true)?).map_err(|_| {
-                        CliError::upstream("failed to encode capability verification")
-                    })?)
-                } else {
-                    None
-                };
-            emit(
-                cli.format,
-                command,
-                serde_json::json!({
-                    "backend": {"tag": lock.tag, "minimum_macos": lock.minimum_macos},
-                    "transport": ["local", "ssh"],
-                    "interfaces": ["exec", "scenario", "mcp_stdio"],
-                    "runtime": ["app", "daemon", "auto", "process"],
-                    "tool_profiles": ["observe", "interact", "extended"],
-                    "disabled": crate::policy::disabled_capabilities(),
-                    "live": live,
-                }),
-            )
+            emit(cli.format, command, capability_report(args.strict)?)
         }
         CommandGroup::Exec(args) => {
             if args.host.is_some() {

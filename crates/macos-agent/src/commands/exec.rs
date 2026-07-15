@@ -59,7 +59,7 @@ pub fn run_local(
         None,
         &binary,
     )?;
-    if let Err(error) = prepare_runtime(args.runtime, binary.path()) {
+    if let Err(error) = prepare_runtime(args.runtime, &binary) {
         let _ = journal.record_step(StepInput {
             parent_id,
             intent: args.intent.clone(),
@@ -78,7 +78,7 @@ pub fn run_local(
         return Err(error);
     }
     let (envs, removed_envs) = hardened_env(None);
-    let upstream_argv = runtime_argv(args.runtime, &args.argv);
+    let upstream_argv = runtime_argv(args.runtime, &args.argv, binary.runtime_identity());
     let output = process::run(
         binary.path(),
         &upstream_argv,

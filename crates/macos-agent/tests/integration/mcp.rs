@@ -11,9 +11,11 @@ fn stdio_mcp_filters_tools_denies_calls_and_keeps_protocol_stdout_clean() {
     let harness = common::MacosAgentHarness::new();
     let cwd = TempDir::new().expect("cwd");
     let fake = cwd.path().join("peekaboo");
+    let request_log = cwd.path().join("upstream-requests.jsonl");
     let script = r#"#!/bin/sh
 [ -z "${OPENAI_API_KEY:-}" ] || exit 90
 while IFS= read -r line; do
+  printf '%s\n' "$line" >> "$MCP_REQUEST_LOG"
   case "$line" in
     *'"id":1'*) printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-03-26","capabilities":{},"serverInfo":{"name":"fake","version":"1"}}}' ;;
     *'"id":2'*) printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"see"},{"name":"click"},{"name":"shell"},{"name":"browser"}]}}' ;;
@@ -39,6 +41,10 @@ done
             fake.to_str().expect("fake"),
         )
         .with_env("OPENAI_API_KEY", "seed-provider-key")
+        .with_env(
+            "MCP_REQUEST_LOG",
+            request_log.to_str().expect("request log"),
+        )
         .with_stdin_str(input);
     let out = harness.run_with_options(
         cwd.path(),
@@ -81,6 +87,66 @@ done
     assert!(!journal.contains("seed-mcp-secret"));
     assert!(!journal.contains("seed-cancel-secret"));
     assert!(!journal.contains("seed-provider-key"));
+    let forwarded = fs::read_to_string(&request_log).expect("request log");
+    assert!(!forwarded.contains("seed-mcp-secret"));
+    assert!(!forwarded.contains("\"id\":3"));
+    assert!(!forwarded.contains("\"id\":5"));
+}
+
+#[test]
+fn idless_mutating_tool_call_is_rejected_before_upstream_execution() {
+    let harness = common::MacosAgentHarness::new();
+    let cwd = TempDir::new().expect("cwd");
+    let fake = cwd.path().join("peekaboo");
+    let request_log = cwd.path().join("upstream-requests.jsonl");
+    fs::write(
+        &fake,
+        r#"#!/bin/sh
+while IFS= read -r line; do
+  printf '%s\n' "$line" >> "$MCP_REQUEST_LOG"
+  case "$line" in
+    *'"id":1'*) printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":null}' ;;
+  esac
+done
+"#,
+    )
+    .expect("fake");
+    fs::set_permissions(&fake, fs::Permissions::from_mode(0o755)).expect("chmod");
+    let out_dir = cwd.path().join("idless-journal");
+    let options = harness
+        .cmd_options(cwd.path())
+        .with_env("NILS_MACOS_AGENT_PEEKABOO_BIN", fake.to_str().expect("fake"))
+        .with_env(
+            "MCP_REQUEST_LOG",
+            request_log.to_str().expect("request log"),
+        )
+        .with_stdin_str(concat!(
+            "{\"jsonrpc\":\"2.0\",\"method\":\"tools/call\",\"params\":{\"name\":\"click\",\"arguments\":{\"token\":\"idless-secret-canary\"}}}\n",
+            "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"shutdown\",\"params\":{}}\n",
+        ));
+    let out = harness.run_with_options(
+        cwd.path(),
+        &[
+            "mcp",
+            "--out-dir",
+            out_dir.to_str().expect("out"),
+            "--tool-profile",
+            "interact",
+        ],
+        options,
+    );
+    assert_eq!(out.code, 0, "{}", out.stderr_text());
+    let first: serde_json::Value =
+        serde_json::from_str(out.stdout_text().lines().next().expect("policy response"))
+            .expect("response JSON");
+    assert_eq!(first["id"], serde_json::Value::Null);
+    assert_eq!(first["error"]["code"], -32600);
+    let forwarded = fs::read_to_string(&request_log).expect("request log");
+    assert!(!forwarded.contains("idless-secret-canary"));
+    assert!(!forwarded.contains("tools/call"));
+    let journal = fs::read_to_string(out_dir.join("steps.jsonl")).expect("journal");
+    assert!(journal.contains("policy_blocked"));
+    assert!(!journal.contains("idless-secret-canary"));
 }
 
 #[test]
@@ -451,16 +517,14 @@ fn nonzero_upstream_exit_is_not_reported_as_a_clean_mcp_session() {
             fake.to_str().expect("fake"),
         )
         .with_stdin_str("{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"shutdown\",\"params\":{}}\n");
+    let out_dir = cwd.path().join("nonzero-journal");
     let out = harness.run_with_options(
         cwd.path(),
-        &[
-            "mcp",
-            "--out-dir",
-            cwd.path().join("nonzero-journal").to_str().expect("out"),
-        ],
+        &["mcp", "--out-dir", out_dir.to_str().expect("out")],
         options,
     );
     assert_eq!(out.code, 70, "{}", out.stderr_text());
+    assert_terminal_failure_step(&out_dir, "mcp_upstream_exit");
 }
 
 #[test]
@@ -481,17 +545,15 @@ fn silent_upstream_is_terminated_at_the_mcp_response_deadline() {
             "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"see\",\"arguments\":{}}}\n",
         );
     let started = Instant::now();
+    let out_dir = cwd.path().join("deadline-journal");
     let out = harness.run_with_options(
         cwd.path(),
-        &[
-            "mcp",
-            "--out-dir",
-            cwd.path().join("deadline-journal").to_str().expect("out"),
-        ],
+        &["mcp", "--out-dir", out_dir.to_str().expect("out")],
         options,
     );
     assert_eq!(out.code, 70, "{}", out.stderr_text());
     assert!(started.elapsed() < Duration::from_secs(1));
+    assert_terminal_failure_step(&out_dir, "mcp_response_timeout");
 }
 
 #[test]
@@ -514,20 +576,15 @@ fn blocked_upstream_stdin_is_bounded_by_the_mcp_deadline() {
         .with_env("NILS_MACOS_AGENT_TEST_MCP_RESPONSE_TIMEOUT_MS", "40")
         .with_stdin_str(&input);
     let started = Instant::now();
+    let out_dir = cwd.path().join("blocked-write-journal");
     let out = harness.run_with_options(
         cwd.path(),
-        &[
-            "mcp",
-            "--out-dir",
-            cwd.path()
-                .join("blocked-write-journal")
-                .to_str()
-                .expect("out"),
-        ],
+        &["mcp", "--out-dir", out_dir.to_str().expect("out")],
         options,
     );
     assert_eq!(out.code, 70, "{}", out.stderr_text());
     assert!(started.elapsed() < Duration::from_secs(1));
+    assert_terminal_failure_step(&out_dir, "mcp_write_timeout");
 }
 
 #[test]
@@ -608,20 +665,29 @@ fn malformed_or_unknown_json_rpc_responses_fail_closed() {
             .with_stdin_str(
                 "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"shutdown\",\"params\":{}}\n",
             );
+        let out_dir = cwd.path().join(format!("response-{name}"));
         let out = harness.run_with_options(
             cwd.path(),
-            &[
-                "mcp",
-                "--out-dir",
-                cwd.path()
-                    .join(format!("response-{name}"))
-                    .to_str()
-                    .expect("out"),
-            ],
+            &["mcp", "--out-dir", out_dir.to_str().expect("out")],
             options,
         );
         assert_eq!(out.code, 70, "{name}: {}", out.stderr_text());
+        assert_terminal_failure_step(&out_dir, "mcp_protocol");
     }
+}
+
+fn assert_terminal_failure_step(out_dir: &std::path::Path, expected_class: &str) {
+    let journal = fs::read_to_string(out_dir.join("steps.jsonl")).expect("terminal step log");
+    let terminal: serde_json::Value =
+        serde_json::from_str(journal.lines().last().expect("terminal failure step"))
+            .expect("terminal step JSON");
+    assert!(matches!(
+        terminal["status"].as_str(),
+        Some("failed" | "unknown")
+    ));
+    assert_eq!(terminal["failure_class"], expected_class);
+    assert_eq!(terminal["command"], "mcp");
+    assert!(!journal.contains("idless-secret-canary"));
 }
 
 #[test]

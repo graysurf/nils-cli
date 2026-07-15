@@ -99,6 +99,48 @@ fn capabilities_publish_every_enforced_hard_denial() {
 }
 
 #[test]
+fn local_and_ssh_capabilities_publish_the_same_contract() {
+    let harness = common::MacosAgentHarness::new();
+    let cwd = TempDir::new().expect("cwd");
+    let local = harness.run(cwd.path(), &["--format", "json", "capabilities"]);
+    assert_eq!(local.code, 0, "{}", local.stderr_text());
+
+    let fake_ssh = cwd.path().join("ssh");
+    write_executable(
+        &fake_ssh,
+        r#"#!/bin/sh
+while [ "$1" = "-o" ]; do shift 2; done
+[ "$1" = "--" ] && shift
+shift
+shift
+exec "$NILS_MACOS_AGENT_REMOTE_BIN" "$@"
+"#,
+    );
+    let remote_root = cwd.path().join("remote-sessions");
+    let options = harness
+        .cmd_options(cwd.path())
+        .with_env("NILS_MACOS_AGENT_SSH_BIN", fake_ssh.to_str().expect("ssh"))
+        .with_env(
+            "NILS_MACOS_AGENT_REMOTE_BIN",
+            harness.macos_agent_bin().to_str().expect("agent"),
+        )
+        .with_env(
+            "NILS_MACOS_AGENT_REMOTE_ROOT",
+            remote_root.to_str().expect("remote root"),
+        );
+    let remote = harness.run_with_options(
+        cwd.path(),
+        &["--format", "json", "capabilities", "--host", "fixture-role"],
+        options,
+    );
+    assert_eq!(remote.code, 0, "{}", remote.stderr_text());
+    assert_eq!(
+        local.stdout_json()["result"],
+        remote.stdout_json()["result"]
+    );
+}
+
+#[test]
 fn exec_preserves_upstream_json_and_writes_structural_journal() {
     let harness = common::MacosAgentHarness::new();
     let cwd = TempDir::new().expect("cwd");

@@ -123,6 +123,70 @@ fn seeded_secrets_and_private_paths_do_not_survive_journal_persistence() {
 }
 
 #[test]
+fn debug_exec_artifact_redacts_nested_payloads_and_private_paths_end_to_end() {
+    let harness = common::MacosAgentHarness::new();
+    let cwd = TempDir::new().expect("cwd");
+    let fake = cwd.path().join("peekaboo");
+    fs::write(
+        &fake,
+        r#"#!/bin/sh
+cat <<'JSON'
+{"success":true,"data":{"title":"debug-title-canary","text":"debug-text-canary","value":"debug-value-canary","token":"sk-debug-token-canary","user":"private-user-canary","host":"private-host-canary","path":"/Users/private-person/Library/debug-path-canary","nested":[{"clipboard":"debug-clipboard-canary"}]}}
+JSON
+"#,
+    )
+    .expect("fake");
+    fs::set_permissions(&fake, fs::Permissions::from_mode(0o755)).expect("chmod");
+    let out_dir = cwd.path().join("debug-artifact-journal");
+    let options = harness.cmd_options(cwd.path()).with_env(
+        "NILS_MACOS_AGENT_PEEKABOO_BIN",
+        fake.to_str().expect("fake"),
+    );
+    let out = harness.run_with_options(
+        cwd.path(),
+        &[
+            "--format",
+            "json",
+            "exec",
+            "--out-dir",
+            out_dir.to_str().expect("out"),
+            "--evidence-mode",
+            "debug",
+            "--",
+            "see",
+            "--json",
+        ],
+        options,
+    );
+    assert_eq!(out.code, 0, "{}", out.stderr_text());
+    let index = fs::read_to_string(out_dir.join("artifacts/index.json")).expect("artifact index");
+    let index_json: serde_json::Value = serde_json::from_str(&index).expect("index JSON");
+    let relative = index_json["artifacts"][0]["relative_path"]
+        .as_str()
+        .expect("debug artifact path");
+    let artifact = fs::read_to_string(out_dir.join(relative)).expect("debug artifact");
+    let steps = fs::read_to_string(out_dir.join("steps.jsonl")).expect("steps");
+    let persisted = format!("{index}\n{artifact}\n{steps}");
+    for forbidden in [
+        "debug-title-canary",
+        "debug-text-canary",
+        "debug-value-canary",
+        "sk-debug-token-canary",
+        "private-user-canary",
+        "private-host-canary",
+        "private-person",
+        "debug-path-canary",
+        "debug-clipboard-canary",
+    ] {
+        assert!(
+            !persisted.contains(forbidden),
+            "debug persistence leaked {forbidden}: {persisted}"
+        );
+    }
+    assert!(artifact.contains("<suppressed>"));
+}
+
+#[test]
 fn replay_refuses_when_the_effective_backend_binary_changes() {
     let harness = common::MacosAgentHarness::new();
     let cwd = TempDir::new().expect("cwd");

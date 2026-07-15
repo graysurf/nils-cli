@@ -53,6 +53,8 @@ const ADMITTED_CLI: &[&str] = &[
     "window",
 ];
 
+const REVIEWED_CAPTURE_SUBCOMMANDS: &[&str] = &["live", "video", "watch"];
+
 const HARD_DENIED_OPTIONS: &[&str] = &[
     "analyze",
     "api_key",
@@ -128,6 +130,17 @@ pub fn validate_exec_argv(argv: &[String]) -> Result<(), CliError> {
         return Err(policy_error(format!(
             "Peekaboo command `{command}` is not in the pinned adapter allowlist"
         )));
+    }
+    if command == "capture" {
+        let subcommand = argv.get(1).map(|value| normalize_tool(value));
+        if subcommand
+            .as_deref()
+            .is_none_or(|value| !REVIEWED_CAPTURE_SUBCOMMANDS.contains(&value))
+        {
+            return Err(policy_error(
+                "Peekaboo capture subcommand is not in the pinned adapter allowlist",
+            ));
+        }
     }
     if argv.iter().skip(1).any(|value| denied_option(value)) {
         return Err(policy_error(format!(
@@ -322,6 +335,23 @@ mod tests {
         assert!(validate_exec_argv(&["permissions".into(), "grant".into()]).is_err());
         assert!(validate_exec_argv(&["bridge".into(), "status".into()]).is_err());
         assert!(validate_exec_argv(&["run".into(), "unreviewed.json".into()]).is_err());
+        assert!(
+            validate_exec_argv(&[
+                "capture".into(),
+                "action".into(),
+                "--".into(),
+                "/bin/sh".into(),
+                "-c".into(),
+                "touch owned".into(),
+            ])
+            .is_err()
+        );
+        for subcommand in ["live", "video", "watch"] {
+            assert!(
+                validate_exec_argv(&["capture".into(), subcommand.into(), "--help".into()]).is_ok(),
+                "reviewed capture subcommand {subcommand} must remain admitted"
+            );
+        }
         assert!(
             validate_exec_argv(&[
                 "--bridge-socket".into(),

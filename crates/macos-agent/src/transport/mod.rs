@@ -721,25 +721,7 @@ fn execute_remote_operation(
             ))
         }
         RemoteCommand::Capabilities { strict } => {
-            let lock = PeekabooLock::embedded()?;
-            let live = strict
-                .then(|| backend::doctor(true))
-                .transpose()?
-                .map(|value| serde_json::to_value(value).expect("serializable verification"));
-            Ok((
-                serde_json::json!({
-                    "backend": {"tag": lock.tag, "minimum_macos": lock.minimum_macos},
-                    "transport": ["local", "ssh"],
-                    "interfaces": ["exec", "scenario", "mcp_stdio"],
-                    "runtime": ["app", "daemon", "auto", "process"],
-                    "tool_profiles": ["observe", "interact", "extended"],
-                    "disabled": crate::policy::disabled_capabilities(),
-                    "live": live,
-                }),
-                0,
-                false,
-                true,
-            ))
+            Ok((crate::run::capability_report(strict)?, 0, false, true))
         }
         RemoteCommand::Exec {
             argv,

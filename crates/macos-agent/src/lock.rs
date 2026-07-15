@@ -1,5 +1,6 @@
 use std::collections::BTreeSet;
 use std::fs;
+use std::path::{Component, Path};
 
 use serde::{Deserialize, Serialize};
 
@@ -212,8 +213,9 @@ fn validate_assets(assets: &[AssetLock]) -> Result<(), CliError> {
             || !is_lower_hex(&asset.sha256)
             || asset.executable_sha256.len() != 64
             || !is_lower_hex(&asset.executable_sha256)
-            || asset.archive_root.contains("..")
-            || asset.executable.contains("..")
+            || !safe_asset_name(&asset.name)
+            || !safe_relative_path(&asset.archive_root)
+            || !safe_relative_path(&asset.executable)
             || asset.architectures.is_empty()
             || asset.signing_authority.trim().is_empty()
             || asset.team_id.trim().is_empty()
@@ -222,6 +224,24 @@ fn validate_assets(assets: &[AssetLock]) -> Result<(), CliError> {
         }
     }
     Ok(())
+}
+
+fn safe_asset_name(value: &str) -> bool {
+    safe_relative_path(value) && !value.contains('/')
+}
+
+fn safe_relative_path(value: &str) -> bool {
+    if value.is_empty()
+        || Path::new(value).is_absolute()
+        || value
+            .split('/')
+            .any(|part| part.is_empty() || matches!(part, "." | ".."))
+    {
+        return false;
+    }
+    let mut components = Path::new(value).components().peekable();
+    components.peek().is_some()
+        && components.all(|component| matches!(component, Component::Normal(_)))
 }
 
 fn is_lower_hex(value: &str) -> bool {
@@ -248,5 +268,49 @@ mod tests {
             lock.app_asset().bundle_id.as_deref(),
             Some("boo.peekaboo.mac")
         );
+    }
+
+    #[test]
+    fn locked_asset_paths_are_confined_to_safe_relative_components() {
+        for unsafe_name in [
+            "",
+            ".",
+            "../escape",
+            "nested/asset",
+            "/private/asset",
+            "asset/",
+            "./asset",
+        ] {
+            let mut lock = PeekabooLock::embedded().expect("embedded lock");
+            lock.assets[0].name = unsafe_name.into();
+            assert!(
+                lock.validate().is_err(),
+                "unsafe asset name was admitted: {unsafe_name:?}"
+            );
+        }
+        for unsafe_path in [
+            "",
+            ".",
+            "../escape",
+            "safe/../escape",
+            "/private/escape",
+            "safe/./binary",
+            "safe//binary",
+            "safe/",
+        ] {
+            let mut archive_root = PeekabooLock::embedded().expect("embedded lock");
+            archive_root.assets[0].archive_root = unsafe_path.into();
+            assert!(
+                archive_root.validate().is_err(),
+                "unsafe archive root was admitted: {unsafe_path:?}"
+            );
+
+            let mut executable = PeekabooLock::embedded().expect("embedded lock");
+            executable.assets[0].executable = unsafe_path.into();
+            assert!(
+                executable.validate().is_err(),
+                "unsafe executable path was admitted: {unsafe_path:?}"
+            );
+        }
     }
 }

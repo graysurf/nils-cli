@@ -234,6 +234,65 @@ fn rollback_recovers_an_interruption_after_the_stable_app_swap() {
 }
 
 #[test]
+fn install_recovers_the_half_swap_after_the_stable_app_was_moved_to_backup() {
+    let harness = common::MacosAgentHarness::new();
+    let cwd = TempDir::new().expect("cwd");
+    let backend_root = cwd.path().join("backend");
+    let old = candidate(cwd.path(), "v3.9.2", '2');
+    let new = candidate(cwd.path(), "v3.9.3", '3');
+    authorize_rollback(&new, &old);
+    for candidate in [&old, &new] {
+        let installed = run_backend(
+            &harness,
+            cwd.path(),
+            &backend_root,
+            candidate,
+            &["--format", "json", "backend", "install"],
+        );
+        assert_eq!(installed.code, 0, "{}", installed.stderr_text());
+    }
+
+    let current_new = fs::read(backend_root.join("receipts/current.json")).expect("new receipt");
+    let previous_old = fs::read(backend_root.join("receipts/previous.json")).expect("old receipt");
+    fs::write(backend_root.join("receipts/current.json"), &previous_old)
+        .expect("restore old current receipt");
+    fs::write(backend_root.join("receipts/pending.json"), &current_new)
+        .expect("stage pending new receipt");
+
+    let stable_parent = backend_root.join("stable");
+    let stable = stable_parent.join("Peekaboo.app");
+    fs::remove_dir_all(&stable).expect("remove active new app");
+    copy_fixture_app(
+        &backend_root.join("versions/v3.9.2/app/Peekaboo.app"),
+        &stable,
+    );
+    let incoming = stable_parent.join(".nils-peekaboo-incoming");
+    let backup = stable_parent.join(".nils-peekaboo-backup");
+    copy_fixture_app(
+        &backend_root.join("versions/v3.9.3/app/Peekaboo.app"),
+        &incoming,
+    );
+    fs::rename(&stable, &backup).expect("simulate crash after stable-to-backup rename");
+
+    let recovered = run_backend(
+        &harness,
+        cwd.path(),
+        &backend_root,
+        &new,
+        &["--format", "json", "backend", "install"],
+    );
+    assert_eq!(recovered.code, 0, "{}", recovered.stderr_text());
+    assert_eq!(
+        recovered.stdout_json()["result"]["current"]["tag"],
+        "v3.9.3"
+    );
+    assert!(stable.is_dir());
+    assert!(!incoming.exists());
+    assert!(!backup.exists());
+    assert!(!backend_root.join("receipts/pending.json").exists());
+}
+
+#[test]
 fn doctor_parses_the_pinned_permissions_and_bridge_schemas_fail_closed() {
     let harness = common::MacosAgentHarness::new();
     let cwd = TempDir::new().expect("cwd");
@@ -895,6 +954,19 @@ fn refresh_asset_digest(lock_path: &Path, assets: &Path, kind: &str) {
 fn write_executable(path: &Path, body: &str) {
     fs::write(path, body).expect("write executable");
     fs::set_permissions(path, fs::Permissions::from_mode(0o755)).expect("chmod executable");
+}
+
+fn copy_fixture_app(source: &Path, destination: &Path) {
+    fs::create_dir_all(destination.join("Contents/MacOS")).expect("app destination");
+    fs::copy(
+        source.join("Contents/Info.plist"),
+        destination.join("Contents/Info.plist"),
+    )
+    .expect("copy app metadata");
+    let executable = destination.join("Contents/MacOS/Peekaboo");
+    fs::copy(source.join("Contents/MacOS/Peekaboo"), &executable).expect("copy app executable");
+    fs::set_permissions(&executable, fs::Permissions::from_mode(0o755))
+        .expect("app executable mode");
 }
 
 fn sha256(path: &Path) -> String {

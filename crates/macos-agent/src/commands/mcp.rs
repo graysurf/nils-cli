@@ -41,11 +41,49 @@ pub fn run_with_io(
         &binary,
     )?;
     let result = run_session(args, input, output, &mut journal, &binary);
+    let terminal_record = result.as_ref().err().map_or(Ok(()), |error| {
+        record_mcp_step(
+            &mut journal,
+            "session",
+            None,
+            StepStatus::Unknown,
+            Some(terminal_failure_class(error)),
+            Duration::ZERO,
+        )
+    });
     let close = journal.close();
-    match (result, close) {
-        (Err(error), _) => Err(error),
-        (Ok(_), Err(error)) => Err(error),
-        (Ok(code), Ok(_)) => Ok(code),
+    match (result, terminal_record, close) {
+        (_, Err(error), _) => Err(error),
+        (Err(error), Ok(()), _) => Err(error),
+        (Ok(_), Ok(()), Err(error)) => Err(error),
+        (Ok(code), Ok(()), Ok(_)) => Ok(code),
+    }
+}
+
+fn terminal_failure_class(error: &CliError) -> &'static str {
+    let message = error.message();
+    if message.contains("response deadline") {
+        "mcp_response_timeout"
+    } else if message.contains("request write deadline") {
+        "mcp_write_timeout"
+    } else if message.contains("invalid")
+        || message.contains("non-object")
+        || message.contains("response id")
+        || message.contains("JSON-RPC")
+    {
+        "mcp_protocol"
+    } else if message.contains("exited")
+        || message.contains("ended unexpectedly")
+        || message.contains("closed stdout")
+        || message.contains("did not exit cleanly")
+    {
+        "mcp_upstream_exit"
+    } else if message.contains("failed to forward") || message.contains("failed to write") {
+        "mcp_write"
+    } else if message.contains("failed to read") {
+        "mcp_io"
+    } else {
+        "mcp_session"
     }
 }
 
@@ -56,7 +94,7 @@ fn run_session(
     journal: &mut Journal,
     binary: &crate::backend::VerifiedBackend,
 ) -> Result<u8, CliError> {
-    prepare_runtime(args.runtime, binary.path())?;
+    prepare_runtime(args.runtime, binary)?;
     let upstream_args = runtime_argv(
         args.runtime,
         &[
@@ -65,6 +103,7 @@ fn run_session(
             "--transport".into(),
             "stdio".into(),
         ],
+        binary.runtime_identity(),
     );
     let (envs, removed_envs) = hardened_env(Some(args.tool_profile));
     let mut command = Command::new(binary.path());
@@ -213,18 +252,18 @@ fn proxy_events(
             }
         }
 
+        if upstream_writer.has_expired(response_timeout) {
+            return Err(
+                CliError::upstream("Peekaboo MCP request write deadline exceeded")
+                    .with_operation("mcp"),
+            );
+        }
         if pending
             .values()
             .any(|request| request.started.elapsed() >= response_timeout)
         {
             return Err(
                 CliError::upstream("Peekaboo MCP response deadline exceeded").with_operation("mcp"),
-            );
-        }
-        if upstream_writer.has_expired(response_timeout) {
-            return Err(
-                CliError::upstream("Peekaboo MCP request write deadline exceeded")
-                    .with_operation("mcp"),
             );
         }
         if upstream_eof && let Some(status) = child.try_wait()? {
@@ -341,6 +380,23 @@ fn handle_client_frame(
         .pointer("/params/name")
         .and_then(serde_json::Value::as_str)
         .map(policy::normalize_tool);
+    if method == "tools/call" && id.is_none() {
+        record_mcp_step(
+            journal,
+            method,
+            tool.as_deref(),
+            StepStatus::PolicyBlocked,
+            Some("policy"),
+            Duration::ZERO,
+        )?;
+        write_protocol_error(
+            output,
+            serde_json::Value::Null,
+            -32600,
+            "tool calls require a JSON-RPC request id",
+        )?;
+        return Ok(());
+    }
     if method == "tools/call"
         && tool
             .as_deref()

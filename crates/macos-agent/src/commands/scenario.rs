@@ -36,7 +36,7 @@ pub fn run_local(
         None,
         &binary,
     )?;
-    prepare_runtime(args.runtime, binary.path())?;
+    prepare_runtime(args.runtime, &binary)?;
     let source_digest = hex(&Sha256::digest(&raw));
     let staged_source = StagedScenario::create(&args.out_dir, &raw)?;
     let upstream = vec![
@@ -47,7 +47,7 @@ pub fn run_local(
     let (envs, removed_envs) = hardened_env(None);
     let output = process::run(
         binary.path(),
-        &runtime_argv(args.runtime, &upstream),
+        &runtime_argv(args.runtime, &upstream, binary.runtime_identity()),
         &envs,
         &removed_envs,
         None,
