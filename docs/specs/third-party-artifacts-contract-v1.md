@@ -18,7 +18,8 @@ The contract is deterministic and anchored to `cargo metadata --format-version 1
   - generator mode semantics for `--check` and `--write`
 - Out of scope:
   - legal interpretation of individual upstream licenses or notice obligations
-  - non-Rust dependency ecosystems
+- non-Rust dependency ecosystems other than an explicitly locked runtime
+  backend declared by a workspace crate
 
 ## Canonical Generator Entrypoint
 
@@ -44,6 +45,9 @@ The artifact must contain the following sections in order:
    - columns: `License Expression`, `Crate Count`
 6. `## Dependency List` section with markdown table:
    - columns: `Crate`, `Version`, `License`, `Source`
+7. `## Locked Runtime Backend` section generated from
+   `crates/macos-agent/peekaboo-lock.json` with exact version, license, source,
+   and non-embedding/on-demand install model.
 
 ### `THIRD_PARTY_NOTICES.md` (required sections)
 
@@ -68,6 +72,8 @@ The artifact must contain the following sections in order:
      - `Notice files` (discovered list or fallback wording)
      - `License file references` (deterministic list when discovered)
      - or `License file reference: none declared`
+6. `## Locked Runtime Backend Notice` generated from the immutable Peekaboo
+   lock with exact version, license/source links, and distribution model.
 
 ## Deterministic Rules
 
@@ -114,6 +120,7 @@ Regenerate `THIRD_PARTY_LICENSES.md` and `THIRD_PARTY_NOTICES.md` when any of th
 
 - `Cargo.lock`
 - dependency graph or crate metadata reachable from `cargo metadata --format-version 1 --locked`
+- `crates/macos-agent/peekaboo-lock.json`
 - `scripts/generate-third-party-artifacts.sh`
 - this contract when it changes schema/ordering/output expectations
 

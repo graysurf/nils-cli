@@ -20,8 +20,7 @@ impl MacosAgentHarness {
         std::fs::create_dir_all(agent_home.join("out")).expect("create AGENT_HOME/out");
 
         let stub_dir = StubBinDir::new();
-        write_stub_from_fixture(&stub_dir, "osascript", "stub-osascript-ok.txt");
-        write_stub_from_fixture(&stub_dir, "cliclick", "stub-cliclick-ok.txt");
+        stub_dir.write_exe("lipo", "#!/bin/sh\necho 'arm64 x86_64'\n");
 
         Self {
             home_dir,
@@ -59,13 +58,4 @@ impl Default for MacosAgentHarness {
     fn default() -> Self {
         Self::new()
     }
-}
-
-fn write_stub_from_fixture(dir: &StubBinDir, name: &str, fixture: &str) {
-    let fixture_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("tests")
-        .join("fixtures")
-        .join(fixture);
-    let script = std::fs::read_to_string(&fixture_path).expect("read stub fixture");
-    dir.write_exe(name, &script);
 }

@@ -1,0 +1,56 @@
+use std::path::PathBuf;
+
+use tempfile::TempDir;
+
+use crate::common;
+
+#[test]
+fn root_help_exposes_only_the_peekaboo_adapter_surface() {
+    let harness = common::MacosAgentHarness::new();
+    let cwd = TempDir::new().expect("tempdir");
+
+    let out = harness.run(cwd.path(), &["--help"]);
+    assert_eq!(out.code, 0, "stderr: {}", out.stderr_text());
+
+    let help = format!("{}{}", out.stdout_text(), out.stderr_text());
+    for command in [
+        "backend",
+        "doctor",
+        "capabilities",
+        "exec",
+        "scenario",
+        "mcp",
+        "journal",
+    ] {
+        assert!(
+            help.contains(command),
+            "missing new adapter command: {command}"
+        );
+    }
+    for retired in ["preflight", "input-source", "ax", "observe", "profile"] {
+        assert!(
+            !help.contains(&format!("\n  {retired}")),
+            "retired engine command still exposed: {retired}"
+        );
+    }
+}
+
+#[test]
+fn repository_contains_a_complete_immutable_peekaboo_lock() {
+    let lock_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("peekaboo-lock.json");
+    let raw = std::fs::read_to_string(&lock_path)
+        .unwrap_or_else(|err| panic!("required Peekaboo lock is missing: {err}"));
+    let lock: serde_json::Value = serde_json::from_str(&raw).expect("lock must be valid JSON");
+
+    assert_eq!(lock["schema_version"], 1);
+    assert_eq!(lock["repository"], "https://github.com/openclaw/Peekaboo");
+    assert_eq!(lock["tag"], "v3.9.3");
+    assert_eq!(lock["commit"], "3cfd612adbcb1b43e8431a7a1f3b02ec45d01269");
+    assert_eq!(lock["minimum_macos"], "15.0");
+    assert_eq!(lock["assets"].as_array().map(Vec::len), Some(2));
+    assert!(
+        lock["required_capability_probes"]
+            .as_array()
+            .is_some_and(|rows| !rows.is_empty())
+    );
+}

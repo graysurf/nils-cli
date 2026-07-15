@@ -3,7 +3,7 @@
 This file documents third-party Rust crate licenses used by this workspace.
 
 - Data source: `cargo metadata --format-version 1 --locked`
-- Cargo.lock SHA256: `9f5ab25ef6fe0b8a85a92b82176dba2e270301fa443de36e2050d782b2fbdd37`
+- Cargo.lock SHA256: `19351d43fe89e953fd2e92e0b1e3e22e5ad9b36fc8dd09c9b7ba63e0fd1a3c48`
 - Third-party crates (`source != null`): 468
 - Workspace crates (`source == null`, excluded below): 45
 
@@ -521,3 +521,9 @@ This file documents third-party Rust crate licenses used by this workspace.
 | zvariant | 5.13.0 | MIT | crates.io |
 | zvariant_derive | 5.13.0 | MIT | crates.io |
 | zvariant_utils | 3.5.0 | MIT | crates.io |
+
+## Locked Runtime Backend
+
+- Peekaboo `v3.9.3` is licensed under `MIT`.
+- Source and license: <https://github.com/openclaw/Peekaboo/blob/v3.9.3/LICENSE>
+- The nils-cli package does not embed Peekaboo. `macos-agent backend install` downloads the exact official release assets named and SHA256-locked in `crates/macos-agent/peekaboo-lock.json` into user-scoped storage.
