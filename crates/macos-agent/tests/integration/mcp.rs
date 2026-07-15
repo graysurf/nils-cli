@@ -564,15 +564,15 @@ fn silent_reading_upstream_cannot_grow_outstanding_request_state_without_bound()
     fs::write(&fake, "#!/bin/sh\nwhile IFS= read -r line; do :; done\n").expect("fake");
     fs::set_permissions(&fake, fs::Permissions::from_mode(0o755)).expect("chmod");
     let mut input = String::new();
+    let oversized_id = "i".repeat(70 * 1024);
+    input.push_str(&format!(
+        "{{\"jsonrpc\":\"2.0\",\"id\":\"{oversized_id}\",\"method\":\"tools/list\",\"params\":{{}}}}\n"
+    ));
     for id in 1..=40 {
         input.push_str(&format!(
             "{{\"jsonrpc\":\"2.0\",\"id\":{id},\"method\":\"tools/list\",\"params\":{{}}}}\n"
         ));
     }
-    let oversized_id = "i".repeat(70 * 1024);
-    input.push_str(&format!(
-        "{{\"jsonrpc\":\"2.0\",\"id\":\"{oversized_id}\",\"method\":\"tools/list\",\"params\":{{}}}}\n"
-    ));
     let options = harness
         .cmd_options(cwd.path())
         .with_env(
