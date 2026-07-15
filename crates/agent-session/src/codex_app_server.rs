@@ -530,7 +530,7 @@ while [ ! -S "$socket" ]; do
   sleep 0.05
 done
 write_startup_marker "$startup_stage" proxy
-(umask 077; "$proxy_bin" --state-dir "$state_dir" codex-app-server-proxy --id "$session_id" --upstream "$socket" --listen "$proxy" </dev/null >/dev/null 2>"$startup_diagnostic_pipe") &
+(umask 077; exec "$proxy_bin" --state-dir "$state_dir" codex-app-server-proxy --id "$session_id" --upstream "$socket" --listen "$proxy" </dev/null >/dev/null 2>"$startup_diagnostic_pipe") &
 proxy_pid=$!
 i=0
 while [ ! -S "$proxy" ]; do
@@ -4049,6 +4049,9 @@ exit 1
         assert!(script.contains("tail -c 16384"));
         assert!(script.contains("mkfifo \"$startup_diagnostic_pipe\""));
         assert!(script.contains("tee \"$startup_diagnostic_pipe\""));
+        assert!(script.contains(
+            "(umask 077; exec \"$proxy_bin\" --state-dir \"$state_dir\" codex-app-server-proxy"
+        ));
         assert!(script.contains("kill -9 \"$provider_stderr_pid\""));
         let final_tee_kill = script
             .rfind("kill -9 \"$provider_stderr_pid\"")
