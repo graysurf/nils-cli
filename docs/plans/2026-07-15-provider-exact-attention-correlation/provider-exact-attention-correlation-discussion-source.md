@@ -19,27 +19,38 @@ problem is exact attention correlation: when a provider asks for approval or
 input, `agent-session` must clear that request only when the same provider
 request is known to be resolved [U1] [F1] [F2].
 
-This is not a Codex-only redesign and it does not revive the proposed v2 schema.
-Codex and Claude share the same reducer invariant and stable v1 contract, while
-each provider supplies different correlation evidence.
+This remains one Codex/Claude design. Both providers share the same reducer
+invariant and stable v1 contract. They differ only in the evidence their
+adapters can safely normalize. The design does not revive the proposed v2
+schema and does not assume that every provider dialog is exactly correlatable.
 
 ## Decision
 
-Use one shared contract, two provider evidence lanes, and one explicit
-unsupported case:
+Use one shared contract, provider-specific evidence adapters, and explicit
+runtime source authority:
 
 1. Keep `agent-session.turn-event.v1` and `agent-session.turn-state.v1` as the
    provider-neutral boundary. Do not introduce v2 or a new provider trait before
    evidence requires one.
-2. Implement exact Codex attention for agent-session-managed app-server
-   runtimes from the JSON-RPC server request id and matching
-   `serverRequest/resolved` notification.
-3. Extend Claude exact attention beyond the already-supported
-   `AskUserQuestion` path using `Elicitation` and `ElicitationResult` when both
-   callbacks carry the same non-empty `elicitation_id`. Verify installed and
-   live form/URL payloads before enabling this mapping.
-4. Keep generic Codex and Claude permission dialogs conservative. Their hooks
-   still expose no request id shared with the later tool event, so arbitrary
+2. For an agent-session-managed Codex app-server runtime admitted by the exact
+   attention capability gate, the app-server protocol is the sole attention
+   authority for covered methods. Project the typed JSON-RPC request id and
+   clear it only on the matching `serverRequest/resolved` notification.
+3. For raw, unmanaged, or deliberately hook-authoritative Codex runtimes,
+   retain conservative generic hook latching. Do not attempt to pair an
+   identifier-less hook with an exact protocol request.
+4. Select Codex authority once at runtime creation or resume. Do not switch
+   authority mid-runtime: delayed events make that ambiguous. If an admitted
+   protocol projection becomes unhealthy, fail closed to an explicit degraded
+   or unknown activity result and require a new runtime/resume before selecting
+   hook-authoritative fallback.
+5. Extend Claude exact attention beyond the already-supported
+   `AskUserQuestion` path only when `Elicitation` and `ElicitationResult` carry
+   the same non-empty `elicitation_id`. If installed/live evidence does not
+   prove that pair, a conservative Claude outcome is a valid completed lane,
+   not a blocker for Codex.
+6. Keep generic Codex and Claude permission dialogs conservative. Their hooks
+   expose no identifier shared with the later tool event, so arbitrary
    `PostToolUse` remains progress only and never clears a permission latch.
 
 ## Shared invariant
@@ -53,9 +64,11 @@ The current reducer already expresses the provider-neutral rule [F1] [F2]:
   remaining correlations because it proves the prior interaction is over.
 - Uncorrelated progress updates `last_progress_at`; it never proves a pending
   request was answered.
+- Consumer dismissal suppresses one rendered fingerprint locally. It does not
+  mutate or clear producer-owned pending attention.
 
-The existing normalized v1 event is the provider adapter boundary. Each lane
-projects provider-private identifiers through the runtime-scoped hash before
+The existing normalized v1 event is the provider adapter boundary. Each exact
+lane projects provider-private identifiers through a runtime-scoped hash before
 persistence or serving.
 
 ## Disposition of the session 7/8 handoff
@@ -70,9 +83,9 @@ persistence or serving.
 | Clear waiting on later progress | Progress is intentionally uncorrelated | Rejected as unsafe |
 | Remove every manual dismissal | Exact requests clear; uncorrelated permissions stay conservative | Partially complete |
 
-The remaining work is additive provider evidence projection. No contract
-migration or coordinated runtime-kit/Agent Console implementation lane is
-required [F1] [F5] [F6].
+The remaining work is additive provider evidence projection and capability
+reporting. No contract migration or coordinated runtime-kit/Agent Console
+implementation lane is required [F1] [F5] [F6].
 
 ## Confirmed current facts
 
@@ -88,8 +101,8 @@ required [F1] [F5] [F6].
   `PreToolUse`, `PostToolUse`, and `PostToolUseFailure`, proving that v1 supports
   exact provider correlation without a schema change [F1] [F2] [F4].
 - Agent Console consumes v1 exact clears and retains fingerprint-scoped manual
-  dismissal for attention that cannot be correlated. No frontend change is
-  expected [F5].
+  dismissal for attention that cannot be correlated. Dismissal is presentation
+  state only; no frontend change is expected [F5].
 - Activity installation is owned by `agent-session activity setup`; current
   runtime-kit parity intentionally excludes this product-specific bridge [F1]
   [F6].
@@ -111,10 +124,22 @@ server requests plus a matching resolution [W1] [A2]:
 | `item/tool/requestUserInput` | `clarification` | same request id; experimental/version-gated |
 | `mcpServer/elicitation/request` | structural `clarification` or `authentication` | same request id |
 
+The installed schema defines JSON-RPC `RequestId` as `string | int64` [A2]. A
+safe projection must preserve that type before hashing, so integer `1` and
+string `"1"` cannot alias. Raw ids never cross the adapter boundary.
+
 The proxy does not yet project these methods. The generic Codex
-`PermissionRequest` hook may also fire but has no identifier shared with
-`PostToolUse`; without reconciliation, one request can be double-counted or a
-delayed hook can reopen a resolved request [F2] [F4] [W2].
+`PermissionRequest` hook may also fire but exposes no identifier shared with an
+app-server request or later `PostToolUse` [F2] [F4] [W2]. A private pairing
+ledger cannot distinguish a delayed duplicate hook from a genuinely new
+same-turn hook-only request. Therefore the two sources are arbitrated, never
+reconciled heuristically.
+
+Current semantic deduplication also excludes `attention_id` for Codex approval
+requests [F2]. Exact protocol events must either include their projected id in
+the semantic key or bypass semantic deduplication while retaining event-id
+replay protection; otherwise concurrent exact approvals can collapse before
+the reducer sees them.
 
 ### Claude evidence lane
 
@@ -128,32 +153,54 @@ id, request attention, then clear only that id. URL mode maps to
 `authentication`; other admitted modes map to `clarification`. Message, URL,
 requested schema, response content, and decisions are discarded.
 
-Generic Claude permissions remain different. `PermissionRequest` explicitly
-omits `tool_use_id`. `PermissionDenied` includes one but fires only for an
-auto-mode classifier denial, not when the user answers a manual permission
-dialog [W3]. It cannot close the generic permission gap.
+When the installed or live callback pair lacks a matching id, the Claude lane
+ends in a documented limited state: record a conservative request when safely
+observable and do not emit an uncorrelated clear. Generic Claude permissions
+remain different. `PermissionRequest` omits `tool_use_id`.
+`PermissionDenied` includes one but covers an auto-mode classifier denial, not
+the user resolving a manual permission dialog [W3].
 
 ## Required behavior
 
+### Shared capability and failure boundary
+
+1. Exact-attention admission is separate from the provider's baseline minimum
+   version. Use a capability-specific audited version range or a verified
+   runtime shape probe; a newer unverified provider is conservative/unverified,
+   not silently exact-capable.
+2. Setup presence alone is not capability proof. Doctor and evidence docs must
+   distinguish installed callbacks, verified correlated payloads, conservative
+   support, and unhealthy projection.
+3. Failure is asymmetric. A lost/malformed resolution never clears a latch. A
+   recognizable request whose exact id cannot be retained must conservatively
+   latch through a bounded fallback correlation or mark activity explicitly
+   degraded/unknown before the proxy continues; it must not remain falsely
+   `working`.
+4. Exact live acceptance must observe a matching request and clear while the
+   same turn remains active. A later `Stop` or new turn is not proof that the
+   exact-clear adapter worked.
+
 ### Codex app-server adapter
 
-1. Validate a recognized request against the bound thread and active turn when
-   present.
-2. Project its JSON-RPC request id and emit an authoritative
-   provider-structured v1 request.
-3. Derive the same projected id from `serverRequest/resolved` and emit the
-   matching clear.
-4. Treat unmatched or repeated resolutions as idempotent no-ops; never clear a
-   different request.
-5. Keep a private bounded runtime/turn reconciliation ledger:
-   - pair one permission-hook placeholder with one exact app-server approval in
-     either arrival order;
-   - replace the placeholder rather than increment visible pending count;
-   - retain a resolved tombstone until turn boundary so a delayed hook cannot
-     reopen the request;
-   - keep hook-only requests latched and protocol-only requests exactly
-     clearable; and
-   - keep concurrent exact request ids independent.
+1. At runtime creation/resume, select `protocol-authoritative` only when the
+   managed app-server capability is admitted and healthy; otherwise select
+   `hook-authoritative` for raw/unmanaged/conservative operation.
+2. In protocol-authoritative mode, generic `PermissionRequest` hooks are
+   progress/diagnostic evidence only and never create attention. All covered
+   attention comes from the app-server protocol.
+3. In hook-authoritative mode, generic permission hooks retain the existing
+   conservative latch and protocol attention projection is not admitted.
+4. Validate a recognized protocol request against the bound thread and active
+   turn when present. Canonicalize the bounded request id as a typed value
+   (`s:<value>` or `i:<canonical-i64>`) before runtime-scoped hashing.
+5. Emit an authoritative provider-structured v1 request, derive the same
+   projected id from `serverRequest/resolved`, and clear only that request.
+   Unmatched/repeated resolutions are idempotent no-ops.
+6. Preserve distinct exact ids through semantic deduplication. Event-id replay
+   protection remains active.
+7. Do not switch authority mid-runtime. If protocol projection becomes
+   unhealthy, expose degraded/unknown activity without manufacturing a clear;
+   a new runtime/resume may select conservative hook authority.
 
 ### Claude hook adapter
 
@@ -163,18 +210,25 @@ dialog [W3]. It cannot close the generic permission gap.
    flows carry the same non-empty id in both callbacks.
 3. For proven pairs, use the projected id for stable request/clear events and
    preserve existing `AskUserQuestion` behavior.
-4. If an id is absent, record at most a conservative request; an uncorrelated
-   result must not clear it. Report the limitation rather than inventing
-   correlation.
+4. If an id is absent or mismatched, record at most a conservative request; an
+   uncorrelated result must not clear it. Report this as a valid limited
+   capability outcome.
 5. Discard content-bearing MCP fields before normalized event construction.
+6. Roll back by disabling Elicitation admission first, leaving installed
+   callbacks as harmless fail-open no-ops. Do not use global
+   `activity setup --remove`, which removes unrelated agent-session-managed
+   Claude hooks. If physical cleanup is required, ship a targeted forward
+   migration that preserves existing hook entries before reverting the binary.
 
 ## Scope
 
-- Shared regression tests for exact clear and progress-never-clears behavior.
-- Codex app-server projection, exact events, duplicate reconciliation,
-  capability/version evidence, and docs/doctor updates.
+- Shared v1 invariant and runtime authority-mode regression coverage.
+- Codex app-server typed request-id projection, exact events, semantic-dedupe
+  safety, source arbitration, failure behavior, capability evidence, and
+  docs/doctor updates.
 - Claude Elicitation capability probe, setup, exact normalization when proven,
-  conservative degradation otherwise, fixtures, and docs/doctor updates.
+  conservative terminal outcome otherwise, fixtures, rollback, and docs/doctor
+  updates.
 - Existing Agent Console polling/SSE behavior as read-only live acceptance.
 
 ## Non-scope
@@ -185,24 +239,28 @@ dialog [W3]. It cannot close the generic permission gap.
   change.
 - No terminal/transcript/UI/content heuristic.
 - No exact-clear claim for generic Codex or Claude permission dialogs.
-- No clearing on arbitrary `PostToolUse`, elapsed time, terminal activity, or
-  manual UI dismissal.
+- No hook/protocol pairing ledger, timing correlation, arbitrary
+  `PostToolUse` clear, or producer clear from manual UI dismissal.
 
 ## Requirements
 
 - R1 — Both providers use the same v1 invariant and public contract; provider
   differences remain at evidence normalization.
-- R2 — Exact resolution clears only the request with the same projected id,
-  including concurrent pending requests.
-- R3 — Codex hook/protocol duplicates converge to one visible request across
-  either arrival order, replay, restart, and delayed delivery.
+- R2 — Exact resolution clears only the request with the same type-preserving
+  projected id, including concurrent pending requests.
+- R3 — Each Codex runtime selects one attention authority at creation/resume;
+  protocol-authoritative runtimes ignore generic attention hooks, while
+  hook-authoritative runtimes latch them conservatively. No mid-runtime switch
+  or heuristic source pairing is allowed.
 - R4 — Claude Elicitation clears automatically only when installed/live
-  evidence proves a shared non-empty id.
-- R5 — Hook-only or identifier-less requests remain conservatively latched
-  until a lifecycle boundary or existing manual presentation dismissal;
-  progress does not clear them.
+  evidence proves a shared non-empty id. Otherwise the lane completes with an
+  explicit conservative limitation.
+- R5 — Hook-only or identifier-less producer attention remains latched until a
+  lifecycle boundary. Agent Console may independently suppress its rendered
+  fingerprint; that is not a producer transition.
 - R6 — Malformed, oversized, mismatched, stale, unsupported, or dropped exact
-  evidence never manufactures a clear.
+  evidence never manufactures a clear or leaves a recognized attention request
+  falsely reported as healthy `working`.
 - R7 — Only projected ids and allowlisted classification/timestamps reach
   persistence, diagnostics, views, or SSE.
 - R8 — AskUserQuestion, raw/unmanaged Codex, generic permissions, Hermes, and
@@ -210,41 +268,52 @@ dialog [W3]. It cannot close the generic permission gap.
 
 ## Acceptance criteria
 
-- A managed Codex request enters `needs_input`; matching
-  `serverRequest/resolved` clears only it within one proxy round-trip.
-- Two concurrent Codex requests count as two and clear independently.
-- Hook-first, protocol-first, delayed-hook-after-resolution, duplicate,
-  reconnect/replay, and restart fixtures converge without double-count/reopen.
-- A live Claude Elicitation pair with a shared id enters `needs_input` and
-  clears through its result; identifier-less fixtures remain conservative.
+- A managed protocol-authoritative Codex request enters `needs_input`; matching
+  `serverRequest/resolved` clears only it within one proxy round-trip while the
+  turn remains active.
+- String and integer request ids, including concurrent integer `1` and string
+  `"1"`, project distinctly and clear independently. Concurrent counts follow
+  `2 -> 1 -> 0` even inside the semantic-dedupe window.
+- Protocol-authoritative fixtures prove generic permission hooks are ignored
+  for attention. Hook-authoritative fixtures prove the same hooks remain
+  conservatively latched. No fixture depends on arrival timing or pairing.
+- Queue-full, oversized, malformed, replay, reconnect, restart, and schema-drift
+  fixtures prove the asymmetric degraded/unknown and no-false-clear behavior.
+- Claude acceptance follows the capability matrix: matching non-empty ids
+  require exact request/clear evidence while the turn remains active; absent or
+  mismatched ids require the documented conservative terminal outcome.
 - Existing Claude AskUserQuestion exact clearing remains green.
 - Generic provider permission fixtures prove `PostToolUse` advances progress
-  without clearing the latch.
-- List/glance and `/activity/events` retain v1, and Agent Console clears exact
-  cues without a frontend change.
-- Retained fixtures/artifacts contain no raw ids or content-bearing fields.
+  without clearing the producer latch; consumer dismissal is tested separately
+  as presentation suppression.
+- List/glance and `/activity/events` retain v1, and retained evidence contains
+  no raw ids or content-bearing fields.
 
 ## Validation plan
 
-- Declare the contract delta and affected tests, then capture meaningful
-  test-first failures before production edits.
-- Run focused Rust tests for correlation, concurrency, reconciliation,
-  replay/restart, privacy, bounds, and fail-close behavior.
+- Declare each provider lane's contract delta and affected tests, then capture
+  meaningful lane-specific test-first failures before production edits.
+- Run focused Rust tests for typed correlation, concurrency, deduplication,
+  authority modes, capability drift, replay/restart, privacy, bounds, and
+  asymmetric fail-close behavior.
 - Run `bash scripts/ci/nils-cli-checks-entrypoint.sh --local-fast` and
   `bash scripts/ci/nils-cli-checks-entrypoint.sh --docs-only`.
 - Re-audit installed Codex schema into `agent-out` and capture sanitized
   installed Claude form/URL Elicitation fixtures.
-- Run managed Codex/Claude live acceptance through polling, SSE, and current
-  Agent Console.
+- Run managed Codex and capability-selected Claude live acceptance. Hold the
+  turn open until a same-projected-id `attention_requested` /
+  `attention_cleared` pair and polling/SSE revision are observed.
 
 ## Risks and guardrails
 
 - Claude documents `elicitation_id` as optional; exact support is per proven
   payload shape, not a blanket provider claim.
-- Codex reconciliation is one-to-one, bounded, runtime/turn scoped, and keeps
-  resolved tombstones. Timing alone never correlates or clears attention.
-- Changed recognized provider shapes fail closed behind audited capability
-  evidence.
+- Codex hooks and app-server requests share no stable key. Authority selection,
+  not a reconciliation ledger, prevents double counting.
+- Exact provider capability has its own audited range/shape evidence. A generic
+  minimum version or installed hook entry is insufficient.
+- Changed or lost recognized request evidence degrades activity instead of
+  silently leaving it `working`; changed/lost resolution evidence never clears.
 - Classification uses event/method and structural mode only. Raw ids are
   projected; content fields are discarded in memory.
 - Any required public breaking change stops execution for re-triage instead of
@@ -261,7 +330,7 @@ dialog [W3]. It cannot close the generic permission gap.
 
 ## Sources
 
-- [U1] User direction, paraphrased: preserve one shared Codex/Claude hook design,
+- [U1] User direction, paraphrased: preserve one shared Codex/Claude design,
   reassess current reality, rewrite the document, open an L2 tracker, and commit
   its documents to `main`.
 - [F1] `crates/agent-session/docs/turn-state-contract.md`.
@@ -288,6 +357,6 @@ Recommended plan: docs/plans/2026-07-15-provider-exact-attention-correlation/pro
 
 Recommended execution state: docs/plans/2026-07-15-provider-exact-attention-correlation/provider-exact-attention-correlation-execution-state.md
 
-- Tracking level: L2 with provider-specific tasks and reviewed PRs.
+- Tracking level: L2 with independent provider tasks and reviewed PRs.
 - Next-task source: Sprint 1, Task 1.1 in the recommended plan.
 - Retention intent: archive with the completed L2 bundle.

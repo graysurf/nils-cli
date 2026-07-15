@@ -4,14 +4,14 @@
 ## Execution State
 
 - Status: ready-to-start; implementation not started
-- Target scope: one provider-neutral v1 invariant with Codex app-server exact
-  request resolution, capability-gated Claude Elicitation correlation, and an
-  explicit conservative limitation for generic permission dialogs.
-- Execution window: Sprint 1 evidence gates -> Sprint 2 Codex lane -> Sprint 3
-  Claude lane -> Sprint 4 integration and delivery.
+- Target scope: one provider-neutral v1 invariant, runtime-selected Codex
+  attention authority with app-server exact resolution, capability-selected
+  Claude exact-or-limited Elicitation, and an explicit conservative limitation
+  for generic permission dialogs.
+- Execution window: Sprint 1 shared boundary -> Sprints 2 and 3 independent /
+  parallel provider lanes -> Sprint 4 integration and delivery.
 - Current task: none; plan bundle publication and tracker initialization.
-- Next task: Task 1.1, declare the contract delta and capture test-first
-  evidence.
+- Next task: Task 1.1, freeze the shared invariant and authority-mode contract.
 - Last updated: 2026-07-15
 - Branch: `feat/provider-exact-attention-correlation`
 - Source document:
@@ -24,24 +24,25 @@
 
 - Validate the plan bundle and docs-only repository gate before opening the
   tracker.
-- Capture meaningful test-first failure evidence before production edits.
-- Re-audit installed Codex schema and sanitize Claude Elicitation fixtures
-  before enabling exact mappings.
-- Run focused reducer/setup/doctor tests plus nils-cli local-fast.
-- Require specialist review, provider checks, and live polling/SSE/Agent Console
-  acceptance before final closeout.
+- Preserve the already-green shared invariant, then capture meaningful
+  provider-lane test-first failures before production edits.
+- Re-audit the installed Codex typed request-id schema and sanitize Claude
+  Elicitation fixtures before selecting exact capability.
+- Run focused reducer/proxy/setup/doctor tests plus nils-cli local-fast.
+- Require specialist review, provider checks, and pre-lifecycle-boundary live
+  polling/SSE/Agent Console acceptance before final closeout.
 
 ## Task Ledger
 
 | ID | Status | Task | Evidence | Notes |
 | --- | --- | --- | --- | --- |
-| 1.1 | pending | Declare contract delta and capture test-first evidence | pending | Freeze exact clear and progress-never-clears behavior. |
-| 1.2 | pending | Verify installed provider capability shapes | pending | Codex schema and sanitized Claude form/URL fixtures. |
-| 2.1 | pending | Project Codex app-server request/resolution metadata | pending | Keep v1 and metadata-only boundary. |
-| 2.2 | pending | Reconcile duplicate Codex hook/protocol evidence | pending | Bounded runtime/turn ledger with resolved tombstones. |
-| 3.1 | pending | Add capability-gated Claude Elicitation mapping | pending | Exact only with matching non-empty id. |
-| 3.2 | pending | Publish provider capability/degradation status | pending | State generic permission limitation. |
-| 4.1 | pending | Run repository and live provider acceptance | pending | Polling, SSE, and unchanged Agent Console. |
+| 1.1 | pending | Freeze shared invariant and authority-mode contract | pending | No source pairing; provider lanes become independent. |
+| 2.1 | pending | Verify Codex capability and capture test-first evidence | pending | Typed `string \| int64`, dedupe, loss, and schema-drift reds. |
+| 2.2 | pending | Implement typed Codex projection and fail-closed reduction | pending | Exact ids survive semantic dedupe. |
+| 2.3 | pending | Implement Codex runtime source arbitration and capability status | pending | One authority selected at create/resume; no mid-runtime switch. |
+| 3.1 | pending | Verify Claude capability and capture branch-specific test-first evidence | pending | Select exact or conservative terminal branch. |
+| 3.2 | pending | Implement selected Claude exact or conservative branch | pending | Selective rollback; no global setup removal. |
+| 4.1 | pending | Publish capability status and run integration acceptance | pending | Same-id clear before `Stop` where exact is supported. |
 | 4.2 | pending | Deliver implementation PRs and close tracker | pending | Close only after completion audit. |
 
 ## Session Log
@@ -55,6 +56,11 @@
 - 2026-07-15: Plan archive and open-issue audit found related foundations but no
   duplicate. Archived #1151/#1154 own app-server auto-resume; open #1118 owns
   Codex hook representation convergence.
+- 2026-07-15: Pre-merge specialist review rejected uncorrelated Codex
+  hook/protocol reconciliation as unimplementable. The plan now selects one
+  attention authority per runtime, preserves typed exact ids through semantic
+  deduplication, treats request/resolution loss asymmetrically, and makes
+  Claude's conservative capability result a valid independent lane outcome.
 
 ## Validation
 
@@ -64,9 +70,9 @@
 | `plan-archive search` for turn-state/activity/app-server plans | pass | Found app-server foundation; no exact-attention duplicate. | local catalog |
 | Open nils-cli issue audit | pass | #1118 is related configuration work, not this scope. | GitHub issue list |
 | Installed version audit | pass | Claude 2.1.210, Codex 0.144.3, agent-session 1.22.4. | local runtime |
-| `plan-tooling validate` | pass | Bundle structure and all eight tasks validate with zero errors. | local |
-| `bash scripts/ci/nils-cli-checks-entrypoint.sh --docs-only` | pass | Placement, hygiene, markdown, contract, and fixture checks passed. | local |
-| `bash scripts/ci/nils-cli-checks-entrypoint.sh --local-fast` | pass | Correctly selected docs-only mode for the three-file bundle and passed. | local |
+| `plan-tooling validate` | pass | Repaired eight-task graph validates with zero errors. | local |
+| `bash scripts/ci/nils-cli-checks-entrypoint.sh --docs-only` | pass | Repaired three-file bundle passes all docs checks. | local |
+| `bash scripts/ci/nils-cli-checks-entrypoint.sh --local-fast` | pass | Repository correctly selected docs-only mode and passed. | local |
 
 ## Handoff
 
