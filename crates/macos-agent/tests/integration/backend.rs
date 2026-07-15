@@ -455,6 +455,117 @@ fn rollback_dry_run_rejects_the_same_unowned_stable_app_as_execution() {
 }
 
 #[test]
+fn rollback_rejects_a_digest_matching_target_with_tampered_bundle_metadata() {
+    let harness = common::MacosAgentHarness::new();
+    let cwd = TempDir::new().expect("cwd");
+    let backend_root = cwd.path().join("backend");
+    let old = candidate(cwd.path(), "v3.9.2", '2');
+    let new = candidate(cwd.path(), "v3.9.3", '3');
+    authorize_rollback(&new, &old);
+    for candidate in [&old, &new] {
+        let installed = run_backend(
+            &harness,
+            cwd.path(),
+            &backend_root,
+            candidate,
+            &["--format", "json", "backend", "install"],
+        );
+        assert_eq!(installed.code, 0, "{}", installed.stderr_text());
+    }
+
+    let current_path = backend_root.join("receipts/current.json");
+    let previous_path = backend_root.join("receipts/previous.json");
+    let current_before = fs::read(&current_path).expect("current receipt");
+    let previous_before = fs::read(&previous_path).expect("previous receipt");
+    let stable_root = backend_root.join("stable/Peekaboo.app");
+    fs::copy(
+        backend_root.join("versions/v3.9.2/app/Peekaboo.app/Contents/MacOS/Peekaboo"),
+        stable_root.join("Contents/MacOS/Peekaboo"),
+    )
+    .expect("install exact rollback executable");
+    fs::write(
+        stable_root.join("Contents/Info.plist"),
+        b"tampered sealed resource",
+    )
+    .expect("tamper stable bundle metadata");
+    let stable_executable_before =
+        fs::read(stable_root.join("Contents/MacOS/Peekaboo")).expect("stable executable");
+    let stable_metadata_before =
+        fs::read(stable_root.join("Contents/Info.plist")).expect("stable metadata");
+
+    for args in [
+        &["--error-format", "json", "backend", "rollback", "--dry-run"][..],
+        &["--error-format", "json", "backend", "rollback"][..],
+    ] {
+        let rejected = run_backend(&harness, cwd.path(), &backend_root, &new, args);
+        assert_eq!(rejected.code, 69, "{args:?}: {}", rejected.stderr_text());
+        assert_eq!(rejected.stderr_json()["error"]["class"], "backend");
+        assert_eq!(fs::read(&current_path).expect("current"), current_before);
+        assert_eq!(fs::read(&previous_path).expect("previous"), previous_before);
+        assert_eq!(
+            fs::read(stable_root.join("Contents/MacOS/Peekaboo")).expect("stable executable"),
+            stable_executable_before
+        );
+        assert_eq!(
+            fs::read(stable_root.join("Contents/Info.plist")).expect("stable metadata"),
+            stable_metadata_before
+        );
+        assert!(!backend_root.join("receipts/pending.json").exists());
+    }
+}
+
+#[test]
+fn interrupted_recovery_rejects_a_digest_matching_tampered_stable_bundle() {
+    let harness = common::MacosAgentHarness::new();
+    let cwd = TempDir::new().expect("cwd");
+    let backend_root = cwd.path().join("backend");
+    let old = candidate(cwd.path(), "v3.9.2", '2');
+    let new = candidate(cwd.path(), "v3.9.3", '3');
+    authorize_rollback(&new, &old);
+    for candidate in [&old, &new] {
+        let installed = run_backend(
+            &harness,
+            cwd.path(),
+            &backend_root,
+            candidate,
+            &["--format", "json", "backend", "install"],
+        );
+        assert_eq!(installed.code, 0, "{}", installed.stderr_text());
+    }
+
+    let current_path = backend_root.join("receipts/current.json");
+    let previous_path = backend_root.join("receipts/previous.json");
+    let pending_path = backend_root.join("receipts/pending.json");
+    let current_before = fs::read(&current_path).expect("current receipt");
+    let previous_before = fs::read(&previous_path).expect("previous receipt");
+    fs::write(&pending_path, &previous_before).expect("simulate pending rollback receipt");
+    let stable_root = backend_root.join("stable/Peekaboo.app");
+    fs::copy(
+        backend_root.join("versions/v3.9.2/app/Peekaboo.app/Contents/MacOS/Peekaboo"),
+        stable_root.join("Contents/MacOS/Peekaboo"),
+    )
+    .expect("simulate completed executable swap");
+    fs::write(
+        stable_root.join("Contents/Info.plist"),
+        b"tampered sealed resource",
+    )
+    .expect("tamper stable bundle metadata");
+
+    let rejected = run_backend(
+        &harness,
+        cwd.path(),
+        &backend_root,
+        &new,
+        &["--error-format", "json", "backend", "install"],
+    );
+    assert_eq!(rejected.code, 69, "{}", rejected.stderr_text());
+    assert_eq!(rejected.stderr_json()["error"]["class"], "backend");
+    assert_eq!(fs::read(&current_path).expect("current"), current_before);
+    assert_eq!(fs::read(&previous_path).expect("previous"), previous_before);
+    assert_eq!(fs::read(&pending_path).expect("pending"), previous_before);
+}
+
+#[test]
 fn rollback_recovers_an_interruption_after_the_stable_app_swap() {
     let harness = common::MacosAgentHarness::new();
     let cwd = TempDir::new().expect("cwd");
@@ -478,6 +589,11 @@ fn rollback_recovers_an_interruption_after_the_stable_app_swap() {
         backend_root.join("stable/Peekaboo.app/Contents/MacOS/Peekaboo"),
     )
     .expect("simulate rollback app swap before receipt commit");
+    fs::copy(
+        backend_root.join("versions/v3.9.2/app/Peekaboo.app/Contents/Info.plist"),
+        backend_root.join("stable/Peekaboo.app/Contents/Info.plist"),
+    )
+    .expect("simulate rollback metadata swap before receipt commit");
 
     let recovered = run_backend(
         &harness,

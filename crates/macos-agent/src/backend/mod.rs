@@ -284,7 +284,7 @@ fn status_unlocked(
     });
     let app_owned = current
         .as_ref()
-        .is_some_and(|receipt| stable_app_matches(paths, receipt).unwrap_or(false));
+        .is_some_and(|receipt| verify_receipt_app(&paths.stable_app, lock, receipt, false).is_ok());
     Ok(BackendStatus {
         locked_tag: lock.tag.clone(),
         locked_commit: lock.commit.clone(),
@@ -326,7 +326,7 @@ pub fn install(dry_run: bool, strict: bool) -> Result<BackendStatus, CliError> {
         && current.tag == lock.tag
         && current.commit == lock.commit
         && verify_receipt(&paths, &lock, &current, strict).is_ok()
-        && stable_app_matches(&paths, &current).unwrap_or(false)
+        && verify_receipt_app(&paths.stable_app, &lock, &current, strict).is_ok()
     {
         return status_unlocked(&lock, &paths, dry_run);
     }
@@ -496,6 +496,7 @@ fn recover_pending(
     let incoming = paths.stable_app.with_file_name(STABLE_APP_INCOMING);
     let backup = paths.stable_app.with_file_name(STABLE_APP_BACKUP);
     if stable_app_matches(paths, &pending)? {
+        verify_receipt_app(&paths.stable_app, lock, &pending, strict)?;
         finalize_pending(paths, &pending, current.as_ref(), &incoming, &backup)?;
         return Ok(());
     }
@@ -506,10 +507,10 @@ fn recover_pending(
         finalize_pending(paths, &pending, current.as_ref(), &incoming, &backup)?;
         return Ok(());
     }
-    if current
-        .as_ref()
-        .is_some_and(|receipt| stable_app_matches(paths, receipt).unwrap_or(false))
+    if let Some(current) = current.as_ref()
+        && stable_app_matches(paths, current)?
     {
+        verify_receipt_app(&paths.stable_app, lock, current, strict)?;
         remove_transaction_dir(&incoming)?;
         remove_transaction_dir(&backup)?;
         return fs::remove_file(paths.pending_receipt())
@@ -852,7 +853,9 @@ pub fn rollback(dry_run: bool, strict: bool) -> Result<BackendStatus, CliError> 
         .ok_or_else(|| backend_error("no previous backend receipt exists"))?;
     let outgoing = verify_transition_runtime(&paths, &lock, &current, strict)?;
     verify_receipt_any_version(&paths, &lock, &previous, strict)?;
-    if !stable_app_matches(&paths, &previous)? {
+    if stable_app_matches(&paths, &previous)? {
+        verify_receipt_app(&paths.stable_app, &lock, &previous, strict)?;
+    } else {
         refuse_unowned_app(&paths)?;
     }
     if dry_run {

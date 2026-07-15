@@ -1,7 +1,8 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs;
+use std::fs::{self, OpenOptions};
 use std::io::{BufRead, Read, Write};
-use std::os::unix::fs::PermissionsExt;
+use std::os::fd::AsRawFd;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::os::unix::process::CommandExt;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Child, ExitStatus};
@@ -30,6 +31,7 @@ const MAX_REQUEST_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_TRANSFER_FILES: usize = 256;
 const MAX_TRANSFER_BYTES: usize = 8 * 1024 * 1024;
 const MAX_MCP_TERMINAL_BYTES: usize = 64 * 1024;
+const MAX_REMOTE_SESSION_ROOTS: usize = 16;
 const MCP_TERMINAL_PREFIX: &str = "NILS_MACOS_AGENT_MCP_TERMINAL=";
 static TOKEN_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
@@ -279,8 +281,12 @@ pub fn run_remote_mcp(args: &McpArgs) -> Result<u8, CliError> {
     if copy_result.is_err() {
         process.terminate_and_reap();
         let _ = error_thread.join();
-        let _ = cleanup(host, &token);
-        return Err(transport_error("SSH MCP output transport failed"));
+        return match cleanup(host, &token) {
+            Ok(()) => Err(transport_error("SSH MCP output transport failed")),
+            Err(_) => Err(transport_error(
+                "SSH MCP output transport failed and remote cleanup could not be confirmed",
+            )),
+        };
     }
     let status = match process.wait_bounded(test_mode::ssh_mcp_exit_timeout()) {
         Ok(status) => status,
@@ -467,7 +473,7 @@ fn run_remote_mcp_endpoint_inner(token: &str) -> Result<u8, CliError> {
         return Err(transport_error("remote MCP control frame is incompatible"));
     }
     let root = remote_session_root(token)?;
-    create_private_dir(&root)?;
+    create_bounded_remote_session(&root)?;
     let args = McpArgs {
         host: None,
         out_dir: root.join("journal"),
@@ -742,7 +748,7 @@ fn execute_remote_operation(
             runtime,
             timeout_seconds,
         } => {
-            create_private_dir(root)?;
+            create_bounded_remote_session(root)?;
             let args = ExecArgs {
                 host: None,
                 out_dir: root.join("journal"),
@@ -769,7 +775,7 @@ fn execute_remote_operation(
             runtime,
             timeout_seconds,
         } => {
-            create_private_dir(root)?;
+            create_bounded_remote_session(root)?;
             let input_dir = root.join("input");
             create_private_dir(&input_dir)?;
             let source = base64::engine::general_purpose::STANDARD
@@ -1133,6 +1139,73 @@ fn create_private_dir(path: &Path) -> Result<(), CliError> {
         .map_err(|_| transport_error("failed to secure private transport storage"))
 }
 
+#[derive(Debug)]
+struct RemoteSessionAllocationLock(fs::File);
+
+impl RemoteSessionAllocationLock {
+    fn acquire(parent: &Path) -> Result<Self, CliError> {
+        create_private_dir(parent)?;
+        let mut lock_name = parent
+            .file_name()
+            .ok_or_else(|| transport_error("remote session storage has no lock identity"))?
+            .to_os_string();
+        lock_name.push(".allocation.lock");
+        let path = parent.with_file_name(lock_name);
+        let file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .mode(SECRET_FILE_MODE)
+            .open(&path)
+            .map_err(|_| transport_error("failed to open remote session allocation lock"))?;
+        fs::set_permissions(&path, fs::Permissions::from_mode(SECRET_FILE_MODE))
+            .map_err(|_| transport_error("failed to secure remote session allocation lock"))?;
+        // SAFETY: `flock` observes the valid descriptor owned by `file`.
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
+            return Err(transport_error(
+                "failed to acquire remote session allocation lock",
+            ));
+        }
+        Ok(Self(file))
+    }
+}
+
+impl Drop for RemoteSessionAllocationLock {
+    fn drop(&mut self) {
+        // SAFETY: `flock` observes the valid descriptor owned by this guard.
+        let _ = unsafe { libc::flock(self.0.as_raw_fd(), libc::LOCK_UN) };
+    }
+}
+
+fn create_bounded_remote_session(path: &Path) -> Result<(), CliError> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| transport_error("remote session root has no parent"))?;
+    let _guard = RemoteSessionAllocationLock::acquire(parent)?;
+    let mut existing = 0usize;
+    for entry in fs::read_dir(parent)
+        .map_err(|_| transport_error("failed to inspect remote session storage"))?
+    {
+        let entry =
+            entry.map_err(|_| transport_error("failed to inspect a remote session directory"))?;
+        let file_type = entry
+            .file_type()
+            .map_err(|_| transport_error("failed to inspect a remote session entry"))?;
+        if file_type.is_dir() {
+            existing = existing.saturating_add(1);
+            if existing >= MAX_REMOTE_SESSION_ROOTS {
+                return Err(transport_error(
+                    "remote session storage reached its aggregate root bound",
+                ));
+            }
+        }
+    }
+    fs::create_dir(path)
+        .map_err(|_| transport_error("failed to create private remote session storage"))?;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+        .map_err(|_| transport_error("failed to secure private remote session storage"))
+}
+
 fn remove_session(root: &Path) -> Result<(), CliError> {
     if test_mode::cleanup_failure() {
         return Err(transport_error("remote session cleanup failed"));
@@ -1175,14 +1248,16 @@ mod tests {
     use std::os::unix::fs::symlink;
     use std::os::unix::process::CommandExt;
     use std::process::{Command, Stdio};
+    use std::sync::{Arc, Barrier};
     use std::time::{Duration, Instant};
 
     use sha2::Digest;
     use tempfile::TempDir;
 
     use super::{
-        ProcessGroupChild, TransferredFile, collect_files, install_transferred_files,
-        read_bounded_line, validate_host, validate_relative,
+        MAX_REMOTE_SESSION_ROOTS, ProcessGroupChild, TransferredFile, collect_files,
+        create_bounded_remote_session, install_transferred_files, read_bounded_line,
+        remove_session, validate_host, validate_relative,
     };
 
     #[test]
@@ -1200,6 +1275,50 @@ mod tests {
         assert_eq!(read_bounded_line(&mut valid, 8).expect("frame"), b"{}\n");
         let mut oversized = Cursor::new(vec![b'x'; 9]);
         assert!(read_bounded_line(&mut oversized, 8).is_err());
+    }
+
+    #[test]
+    fn remote_session_storage_has_an_aggregate_root_bound() {
+        let base = TempDir::new().expect("remote session base");
+        let contenders = MAX_REMOTE_SESSION_ROOTS * 2;
+        let barrier = Arc::new(Barrier::new(contenders));
+        let attempts = (0..contenders)
+            .map(|sequence| {
+                let barrier = Arc::clone(&barrier);
+                let root = base.path().join(format!("{sequence:032x}"));
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    create_bounded_remote_session(&root)
+                })
+            })
+            .collect::<Vec<_>>();
+        let admitted = attempts
+            .into_iter()
+            .map(|attempt| attempt.join().expect("allocator thread").is_ok())
+            .filter(|admitted| *admitted)
+            .count();
+        assert_eq!(admitted, MAX_REMOTE_SESSION_ROOTS);
+        assert_eq!(
+            fs::read_dir(base.path())
+                .expect("session roots")
+                .filter_map(Result::ok)
+                .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
+                .count(),
+            MAX_REMOTE_SESSION_ROOTS
+        );
+        let overflow = base.path().join(format!("{:032x}", contenders));
+        assert!(
+            create_bounded_remote_session(&overflow).is_err(),
+            "remote session roots exceeded their aggregate bound"
+        );
+        let released = fs::read_dir(base.path())
+            .expect("session roots")
+            .filter_map(Result::ok)
+            .find(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
+            .expect("one admitted session")
+            .path();
+        remove_session(&released).expect("free one root");
+        create_bounded_remote_session(&overflow).expect("released slot is reusable");
     }
 
     #[test]

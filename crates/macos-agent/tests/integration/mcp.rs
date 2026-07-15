@@ -1,5 +1,6 @@
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
+use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use tempfile::TempDir;
@@ -699,6 +700,62 @@ exit 1
     assert!(
         cleanup_marker.exists(),
         "SSH MCP timeout skipped token-scoped cleanup"
+    );
+}
+
+#[test]
+fn ssh_mcp_output_failure_reports_unconfirmed_remote_cleanup() {
+    let harness = common::MacosAgentHarness::new();
+    let cwd = TempDir::new().expect("cwd");
+    let cleanup_marker = cwd.path().join("cleanup-invoked");
+    let fake_ssh = cwd.path().join("ssh");
+    fs::write(
+        &fake_ssh,
+        r#"#!/bin/sh
+while [ "$1" = "-o" ]; do shift 2; done
+[ "$1" = "--" ] && shift
+shift
+case " $* " in
+  *" __remote-mcp "*) while :; do printf '%4096s\n' x; done ;;
+  *" __remote-cleanup "*) : > "$MCP_CLEANUP_MARKER"; exit 1 ;;
+esac
+exit 1
+"#,
+    )
+    .expect("ssh");
+    fs::set_permissions(&fake_ssh, fs::Permissions::from_mode(0o755)).expect("chmod ssh");
+    let agent_home = harness.home_dir().join(".agents");
+    fs::create_dir_all(agent_home.join("out")).expect("agent out");
+    let mut child = Command::new(harness.macos_agent_bin())
+        .args([
+            "--error-format",
+            "json",
+            "mcp",
+            "--host",
+            "fixture-role",
+            "--out-dir",
+        ])
+        .arg(cwd.path().join("ssh-output-failure-journal"))
+        .env("HOME", harness.home_dir())
+        .env("AGENT_HOME", &agent_home)
+        .env("AGENTS_MACOS_AGENT_TEST_MODE", "1")
+        .env("AGENTS_MACOS_AGENT_TEST_TIMESTAMP", "20260101-000000")
+        .env("NILS_MACOS_AGENT_SSH_BIN", &fake_ssh)
+        .env("MCP_CLEANUP_MARKER", &cleanup_marker)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn macos-agent");
+    drop(child.stdout.take());
+    let output = child.wait_with_output().expect("wait for macos-agent");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(75), "{stderr}");
+    assert!(cleanup_marker.exists(), "output failure skipped cleanup");
+    assert!(
+        stderr
+            .contains("SSH MCP output transport failed and remote cleanup could not be confirmed"),
+        "cleanup uncertainty was discarded: {stderr}"
     );
 }
 

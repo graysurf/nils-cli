@@ -99,6 +99,10 @@ Create a new `--out-dir` after 512 journal steps. This explicit rotation bound
 caps cross-process reopen and integrity-scan work while retaining the complete
 append-only record for each run directory.
 
+SSH transport retains at most 16 concurrent or cleanup-pending remote session
+roots per user. New sessions fail closed at that aggregate bound until a
+completed or explicitly cleaned session releases a slot.
+
 Evidence modes are:
 
 - `minimal`: structural journal and sanitized upstream response.
