@@ -185,7 +185,19 @@ pub fn mutating_invocation(argv: &[String]) -> bool {
         .skip(1)
         .take_while(|value| value.as_str() != "--")
         .any(|value| matches!(value.as_str(), "--help" | "-h"));
-    !informational && exec_command(argv).as_deref().is_some_and(mutating_command)
+    !informational
+        && !read_only_family_invocation(argv)
+        && exec_command(argv).as_deref().is_some_and(mutating_command)
+}
+
+fn read_only_family_invocation(argv: &[String]) -> bool {
+    let Some(command) = argv.first().map(|value| normalize_tool(value)) else {
+        return false;
+    };
+    let Some(subcommand) = argv.get(1).map(|value| normalize_tool(value)) else {
+        return false;
+    };
+    matches!(command.as_str(), "app" | "window") && subcommand == "list"
 }
 
 pub fn snapshot_lineage(argv: &[String]) -> Option<String> {
@@ -370,6 +382,28 @@ mod tests {
             "1".into()
         ]));
         assert!(mutating_invocation(&["type".into(), "9".into()]));
+    }
+
+    #[test]
+    fn read_only_family_subcommands_do_not_require_postconditions() {
+        assert!(!mutating_invocation(&["app".into(), "list".into()]));
+        assert!(!mutating_invocation(&[
+            "window".into(),
+            "list".into(),
+            "--app".into(),
+            "Calculator".into()
+        ]));
+        assert!(mutating_invocation(&[
+            "app".into(),
+            "launch".into(),
+            "Calculator".into()
+        ]));
+        assert!(mutating_invocation(&[
+            "window".into(),
+            "move".into(),
+            "--app".into(),
+            "Calculator".into()
+        ]));
     }
 
     #[test]
