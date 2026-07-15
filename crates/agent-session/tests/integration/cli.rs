@@ -5597,6 +5597,33 @@ fn logs_fall_back_to_a_retained_startup_diagnostic_for_a_stopped_session() {
     assert_eq!(data(&logs)["source"], "diagnostic");
     assert_eq!(data(&logs)["text"], "retry after sign-in\n");
 
+    fs::write(
+        session_dir.join(".startup-diagnostic.log"),
+        [vec![0x80], b"capped diagnostic\n".to_vec()].concat(),
+    )
+    .expect("split UTF-8 diagnostic tail");
+    let split_utf8 = run(
+        tmp.path(),
+        &[
+            "--state-dir",
+            &state_arg,
+            "logs",
+            "failed-startup-diagnostic",
+            "--tmux-bin",
+            &tmux_arg,
+            "--format",
+            "json",
+        ],
+        &[
+            ("AGENT_SESSION_FAKE_TMUX_LOG", &tmux_log_arg),
+            ("AGENT_SESSION_FAKE_TMUX_HAS_SESSION", "0"),
+        ],
+    );
+    assert_eq!(split_utf8.code, 0, "stdout={}", split_utf8.stdout_text());
+    let logs = split_utf8.stdout_json();
+    assert_eq!(data(&logs)["source"], "diagnostic");
+    assert_eq!(data(&logs)["text"], "�capped diagnostic\n");
+
     fs::remove_file(session_dir.join(".startup-diagnostic.log"))
         .expect("remove startup diagnostic");
     fs::write(session_dir.join(".runtime-exit-status"), "17\n").expect("runtime exit status");
@@ -7420,6 +7447,7 @@ fn resume_recreates_tmux_runtime_from_exact_provider_identity() {
         "private prior failure\n",
     )
     .unwrap();
+    fs::write(session.join(".runtime-exit-status"), "17\n").unwrap();
 
     let state_arg = state_dir.to_string_lossy().to_string();
     let tmux_arg = tmux_bin.to_string_lossy().to_string();
@@ -7496,6 +7524,7 @@ fn resume_recreates_tmux_runtime_from_exact_provider_identity() {
     assert_eq!(record["startup"]["state"], "ready");
     assert!(!session.join(".startup-failure").exists());
     assert!(!session.join(".startup-diagnostic.log").exists());
+    assert!(!session.join(".runtime-exit-status").exists());
     assert!(
         record_path.with_file_name("resume.json").is_file(),
         "resume should refresh the durable sidecar"
@@ -7631,6 +7660,7 @@ fn resume_launch_failure_restores_the_prior_runtime_and_activity() {
         "private prior failure\n",
     )
     .unwrap();
+    fs::write(session.join(".runtime-exit-status"), "17\n").unwrap();
     let before: Value =
         serde_json::from_str(&fs::read_to_string(&record_path).expect("prior record"))
             .expect("prior record json");
@@ -7672,6 +7702,10 @@ fn resume_launch_failure_restores_the_prior_runtime_and_activity() {
     assert_eq!(
         fs::read_to_string(session.join(".startup-diagnostic.log")).unwrap(),
         "private prior failure\n"
+    );
+    assert_eq!(
+        fs::read_to_string(session.join(".runtime-exit-status")).unwrap(),
+        "17\n"
     );
     assert!(
         !session.join("activity.json").exists(),
@@ -7776,6 +7810,7 @@ fn resume_fails_closed_without_deleting_interrupted_startup_backups() {
         ("stage", ".startup-stage"),
         ("failure", ".startup-failure"),
         ("diagnostic", ".startup-diagnostic.log"),
+        ("exit-status", ".runtime-exit-status"),
     ] {
         let id = format!("resume-interrupted-{suffix}");
         let session = write_session_record_with_cwd(

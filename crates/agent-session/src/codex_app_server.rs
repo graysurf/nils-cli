@@ -532,7 +532,7 @@ if ! exec 9>"$startup_diagnostic_pipe"; then
   exit 1
 fi
 diagnostic_hold_open=1
-"$agent" -c check_for_update_on_startup=false --remote "unix://$proxy" "$@" 2>"$provider_stderr_pipe"
+"$agent" -c check_for_update_on_startup=false --remote "unix://$proxy" "$@" 9>&- 2>"$provider_stderr_pipe"
 status=$?
 write_startup_marker "$runtime_exit_status" "$status"
 exec 9>&-
@@ -3505,7 +3505,8 @@ mod tests {
     use std::collections::BTreeMap;
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
-    use std::sync::{Mutex, MutexGuard, OnceLock};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
     fn capability_probe_test_guard() -> MutexGuard<'static, ()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -3999,11 +4000,14 @@ exit 1
         let marker = script
             .find("write_startup_marker \"$runtime_exit_status\" \"$status\"")
             .expect("runtime exit marker");
+        let provider_child_close = script
+            .find("\"$@\" 9>&- 2>\"$provider_stderr_pipe\"")
+            .expect("provider child closes diagnostic hold descriptor");
         let release = script[marker..]
             .find("exec 9>&-")
             .map(|offset| marker + offset)
             .expect("diagnostic pipe release");
-        assert!(hold < marker && marker < release);
+        assert!(hold < provider_child_close && provider_child_close < marker && marker < release);
         assert!(script.contains("runtime-helper-unavailable"));
         assert!(script.contains("provider-client-exited"));
         assert!(script.contains("!= initial_connection"));
@@ -4021,10 +4025,168 @@ exit 1
     }
 
     #[test]
+    fn launch_script_retains_failed_provider_diagnostics_without_leaking_the_hold_descriptor() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let helper = tmp.path().join("fake-codex-runtime");
+        fs::write(
+            &helper,
+            r#"#!/bin/sh
+if [ "$1" = app-server ]; then
+  : > "$FAKE_APP_SERVER_REQUEST"
+  exec sleep 60
+fi
+case " $* " in
+  *" codex-app-server-proxy "*)
+    : > "$FAKE_PROXY_REQUEST"
+    exec sleep 60
+    ;;
+esac
+i=0
+while [ "$(cat "$FAKE_PROVIDER_STAGE" 2>/dev/null)" != initial_connection ]; do
+  i=$((i + 1))
+  [ "$i" -lt 200 ] || exit 99
+  sleep 0.01
+done
+printf '%s' "$FAKE_PROVIDER_STDERR" >&2
+if [ "$FAKE_PROVIDER_DESCENDANT" = 1 ]; then
+  sleep 10 </dev/null >/dev/null 2>&1 &
+  printf '%s' "$!" > "$FAKE_PROVIDER_DESCENDANT_PID"
+fi
+exit "$FAKE_PROVIDER_EXIT"
+"#,
+        )
+        .unwrap();
+        fs::set_permissions(&helper, fs::Permissions::from_mode(0o700)).unwrap();
+        let state_dir = tmp.path().join("state");
+        let cwd = tmp.path().join("cwd");
+        fs::create_dir(&cwd).unwrap();
+
+        let run_case = |id: &str, status: i32, stderr: &str, descendant: bool| {
+            let session_dir = state_dir.join("sessions").join(id);
+            fs::create_dir_all(&session_dir).unwrap();
+            let socket = tmp.path().join(format!("{id}-app.sock"));
+            let proxy = tmp.path().join(format!("{id}-proxy.sock"));
+            let handoff = tmp.path().join(format!("{id}-thread"));
+            let attached = tmp.path().join(format!("{id}-attached"));
+            let stage = session_dir.join(".startup-stage");
+            let descendant_pid = session_dir.join("descendant.pid");
+            let app_server_request = session_dir.join("app-server.request");
+            let proxy_request = session_dir.join("proxy.request");
+            let stop = Arc::new(AtomicBool::new(false));
+            let bind_socket = |request: PathBuf,
+                               socket: PathBuf,
+                               stage: Option<PathBuf>,
+                               stop: Arc<AtomicBool>| {
+                thread::spawn(move || {
+                    let deadline = Instant::now() + Duration::from_secs(3);
+                    while !request.exists()
+                        && !stop.load(Ordering::Relaxed)
+                        && Instant::now() < deadline
+                    {
+                        thread::sleep(Duration::from_millis(5));
+                    }
+                    if stop.load(Ordering::Relaxed) {
+                        return;
+                    }
+                    let _listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+                    if let Some(stage) = stage {
+                        while fs::read_to_string(&stage)
+                            .ok()
+                            .is_none_or(|value| value.trim() != "provider_client")
+                            && !stop.load(Ordering::Relaxed)
+                            && Instant::now() < deadline
+                        {
+                            thread::sleep(Duration::from_millis(5));
+                        }
+                        if !stop.load(Ordering::Relaxed) {
+                            fs::write(stage, "initial_connection\n").unwrap();
+                        }
+                    }
+                    while !stop.load(Ordering::Relaxed) {
+                        thread::sleep(Duration::from_millis(5));
+                    }
+                })
+            };
+            let app_server_thread = bind_socket(
+                app_server_request.clone(),
+                socket.clone(),
+                None,
+                Arc::clone(&stop),
+            );
+            let proxy_thread = bind_socket(
+                proxy_request.clone(),
+                proxy.clone(),
+                Some(stage.clone()),
+                Arc::clone(&stop),
+            );
+            let mut command = Command::new("/bin/sh");
+            command
+                .arg("-c")
+                .arg(launch_script())
+                .arg("agent-session-launch-test")
+                .arg(&socket)
+                .arg(&proxy)
+                .arg(&handoff)
+                .arg(&attached)
+                .arg(&helper)
+                .arg(&state_dir)
+                .arg(id)
+                .arg(&helper)
+                .arg(&cwd)
+                .env("FAKE_PROVIDER_STAGE", &stage)
+                .env("FAKE_APP_SERVER_REQUEST", &app_server_request)
+                .env("FAKE_PROXY_REQUEST", &proxy_request)
+                .env("FAKE_PROVIDER_EXIT", status.to_string())
+                .env("FAKE_PROVIDER_STDERR", stderr)
+                .env(
+                    "FAKE_PROVIDER_DESCENDANT",
+                    if descendant { "1" } else { "0" },
+                )
+                .env("FAKE_PROVIDER_DESCENDANT_PID", &descendant_pid);
+            let output = crate::run_output_with_timeout(command, Duration::from_secs(3));
+            stop.store(true, Ordering::Relaxed);
+            app_server_thread.join().unwrap();
+            proxy_thread.join().unwrap();
+            let output =
+                output.expect("generated launcher must terminate without waiting for descendants");
+            if let Ok(pid) = fs::read_to_string(&descendant_pid)
+                && let Ok(pid) = pid.parse::<libc::pid_t>()
+            {
+                unsafe {
+                    libc::kill(pid, libc::SIGTERM);
+                }
+            }
+            assert_eq!(output.status.code(), Some(status));
+            session_dir
+        };
+
+        let failed = run_case("failed-stderr", 17, "post-ready-failure\n", true);
+        assert_eq!(
+            fs::read(failed.join(".startup-diagnostic.log")).unwrap(),
+            b"post-ready-failure\n"
+        );
+        assert_eq!(
+            fs::read_to_string(failed.join(".runtime-exit-status")).unwrap(),
+            "17\n"
+        );
+
+        let status_only = run_case("failed-status-only", 23, "", false);
+        assert!(!status_only.join(".startup-diagnostic.log").exists());
+        assert_eq!(
+            fs::read_to_string(status_only.join(".runtime-exit-status")).unwrap(),
+            "23\n"
+        );
+
+        let clean = run_case("clean", 0, "ordinary ready stderr\n", false);
+        assert!(!clean.join(".startup-diagnostic.log").exists());
+        assert!(!clean.join(".runtime-exit-status").exists());
+    }
+
+    #[test]
     fn managed_codex_client_launch_disables_startup_update_check_without_owning_base_arguments() {
         let script = launch_script();
         assert!(script.contains(
-            "\"$agent\" -c check_for_update_on_startup=false --remote \"unix://$proxy\" \"$@\""
+            "\"$agent\" -c check_for_update_on_startup=false --remote \"unix://$proxy\" \"$@\" 9>&-"
         ));
         assert!(!script.contains("--cd \"$cwd\""));
         assert!(!script.contains("--no-alt-screen \"$@\""));
@@ -4102,6 +4264,24 @@ exit 1
             .unwrap();
         assert!(child.wait().unwrap().success());
         assert_eq!(fs::read(&diagnostic).unwrap(), b"post-ready-failure\n");
+
+        fs::remove_file(&diagnostic).unwrap();
+        let mut split_utf8 = "🙂".repeat(4096).into_bytes();
+        split_utf8.push(b'x');
+        let mut child = Command::new("/bin/sh")
+            .arg("-c")
+            .arg(&command)
+            .stdin(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child.stdin.take().unwrap().write_all(&split_utf8).unwrap();
+        assert!(child.wait().unwrap().success());
+        let retained = fs::read(&diagnostic).unwrap();
+        assert_eq!(retained.len(), 16 * 1024);
+        assert!(
+            std::str::from_utf8(&retained).is_err(),
+            "the byte cap fixture must split a multibyte code point"
+        );
     }
 
     #[test]

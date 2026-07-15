@@ -5021,11 +5021,11 @@ fn read_session_log_file(
         }
     }
     let diagnostic = session_dir(context, &record.id).join(STARTUP_DIAGNOSTIC_FILE);
-    match fs::read_to_string(&diagnostic) {
-        Ok(text) => Ok(Some(LogsResult {
+    match fs::read(&diagnostic) {
+        Ok(bytes) => Ok(Some(LogsResult {
             id: record.id.clone(),
             source: "diagnostic".to_string(),
-            text: tail_lines(&text, tail),
+            text: tail_lines(&String::from_utf8_lossy(&bytes), tail),
         })),
         Err(err) if err.kind() == io::ErrorKind::NotFound => {
             let exit_status = session_dir(context, &record.id).join(RUNTIME_EXIT_STATUS_FILE);
