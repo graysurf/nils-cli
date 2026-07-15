@@ -59,10 +59,12 @@ const STARTUP_EXTRA_KEY: &str = "startup";
 const STARTUP_STAGE_FILE: &str = ".startup-stage";
 const STARTUP_FAILURE_FILE: &str = ".startup-failure";
 const STARTUP_DIAGNOSTIC_FILE: &str = ".startup-diagnostic.log";
-const STARTUP_ARTIFACT_FILES: [&str; 3] = [
+const RUNTIME_EXIT_STATUS_FILE: &str = ".runtime-exit-status";
+const STARTUP_ARTIFACT_FILES: [&str; 4] = [
     STARTUP_STAGE_FILE,
     STARTUP_FAILURE_FILE,
     STARTUP_DIAGNOSTIC_FILE,
+    RUNTIME_EXIT_STATUS_FILE,
 ];
 const SESSION_RESUME_FILE: &str = "resume.json";
 const SESSION_LOCKS_DIR: &str = "session-locks";
@@ -298,6 +300,7 @@ fn run_attach(context: &CliContext, args: cli::AttachArgs) -> i32 {
 fn run_logs(context: &CliContext, args: cli::LogsArgs) -> i32 {
     match load_session_record(context, &args.id).and_then(|record| {
         session_logs(
+            context,
             &record,
             args.tail,
             &resolve_tmux_bin(args.tmux_bin.as_deref()),
@@ -4967,11 +4970,12 @@ fn format_tmux_window_activity(epoch_seconds: i64) -> Option<String> {
 }
 
 fn session_logs(
+    context: &CliContext,
     record: &SessionRecord,
     tail: usize,
     tmux_bin: &Path,
 ) -> Result<LogsResult, CliError> {
-    if let Some(result) = read_session_log_file(record, tail)? {
+    if let Some(result) = read_session_log_file(context, record, tail)? {
         return Ok(result);
     }
 
@@ -4987,12 +4991,13 @@ fn session_logs(
 
     Err(CliError::runtime(
         "logs-unavailable",
-        "no tmux pane output or log file is available",
+        "no tmux pane output, log file, or failure diagnostic is available",
         Some(json!({ "id": record.id })),
     ))
 }
 
 fn read_session_log_file(
+    context: &CliContext,
     record: &SessionRecord,
     tail: usize,
 ) -> Result<Option<LogsResult>, CliError> {
@@ -5005,7 +5010,7 @@ fn read_session_log_file(
                     text: tail_lines(&text, tail),
                 }));
             }
-            Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
             Err(err) => {
                 return Err(CliError::runtime(
                     "log-read-failed",
@@ -5015,7 +5020,36 @@ fn read_session_log_file(
             }
         }
     }
-    Ok(None)
+    let diagnostic = session_dir(context, &record.id).join(STARTUP_DIAGNOSTIC_FILE);
+    match fs::read(&diagnostic) {
+        Ok(bytes) => Ok(Some(LogsResult {
+            id: record.id.clone(),
+            source: "diagnostic".to_string(),
+            text: tail_lines(&String::from_utf8_lossy(&bytes), tail),
+        })),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {
+            let exit_status = session_dir(context, &record.id).join(RUNTIME_EXIT_STATUS_FILE);
+            let Some(status) = read_bounded_startup_marker(&exit_status)
+                .and_then(|value| value.parse::<u8>().ok())
+                .filter(|status| *status != 0)
+            else {
+                return Ok(None);
+            };
+            Ok(Some(LogsResult {
+                id: record.id.clone(),
+                source: "diagnostic".to_string(),
+                text: tail_lines(
+                    &format!("provider client exited with status {status}\n"),
+                    tail,
+                ),
+            }))
+        }
+        Err(err) => Err(CliError::runtime(
+            "log-read-failed",
+            format!("failed to read {}: {err}", diagnostic.display()),
+            Some(json!({ "log_file": display_path(&diagnostic) })),
+        )),
+    }
 }
 
 fn delete_session(
@@ -5543,7 +5577,7 @@ fn capture_tmux_runtime_identity(
     }
     let output = String::from_utf8(output.stdout)
         .map_err(|_| SessionTerminationFailure::RuntimeIdentityUnavailable)?;
-    if output.trim().is_empty() && runtime_is_proven_never_launched(record) {
+    if output.trim().is_empty() {
         let exact_session_target = format!("={}", record.tmux_session);
         return match verified_tmux_status_with_timeout(tmux_bin, &exact_session_target, timeout)
             .as_str()
