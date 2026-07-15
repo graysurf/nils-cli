@@ -61,6 +61,10 @@ if [ "${AGENT_SESSION_FAKE_TMUX_ABSENT_BEFORE_LAUNCH:-0}" = "1" ] && { [ "$1" = 
   exit 1
 fi
 
+if [ "${AGENT_SESSION_FAKE_TMUX_BLANK_DISPLAY:-0}" = "1" ] && [ "$1" = "display-message" ]; then
+  exit 0
+fi
+
 target=""
 previous=""
 for arg in "$@"; do
@@ -4245,6 +4249,86 @@ fn delete_accepts_current_generation_never_launched_proof_for_codex_and_claude()
             .iter()
             .all(|call| call.first().is_none_or(|arg| arg != "kill-session")),
         "a definitively unlaunched runtime must not invoke kill-session: {calls:?}"
+    );
+}
+
+#[test]
+fn delete_accepts_blank_identity_output_only_after_exact_absence_confirmation() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let state_dir = tmp.path().join("state");
+    let (tmux_bin, tmux_log) = fake_tmux(tmp.path());
+    let state_arg = state_dir.to_string_lossy().to_string();
+    let tmux_arg = tmux_bin.to_string_lossy().to_string();
+    let tmux_log_arg = tmux_log.to_string_lossy().to_string();
+
+    for (id, has_session, expected_code) in [
+        ("blank-absent-never-launched", "0", 0),
+        ("blank-live-never-launched", "1", 1),
+    ] {
+        let tmux_session = format!("hs-codex-{id}");
+        let session_dir = write_session_record(&state_dir, id, "codex", &tmux_session);
+        attach_provider_runtime(
+            tmp.path(),
+            &state_dir,
+            &session_dir,
+            id,
+            "codex",
+            &tmux_session,
+        );
+        let record_path = session_dir.join("session.json");
+        let mut record: Value =
+            serde_json::from_slice(&fs::read(&record_path).expect("session record")).unwrap();
+        record["tmux_runtime_never_launched"] = record["runtime"]["launch_id"].clone();
+        record
+            .as_object_mut()
+            .expect("session object")
+            .remove("delete_tmux_identity");
+        fs::write(&record_path, serde_json::to_vec_pretty(&record).unwrap()).unwrap();
+
+        let output = run(
+            tmp.path(),
+            &[
+                "--state-dir",
+                &state_arg,
+                "delete",
+                id,
+                "--tmux-bin",
+                &tmux_arg,
+                "--format",
+                "json",
+            ],
+            &[
+                ("AGENT_SESSION_FAKE_TMUX_LOG", &tmux_log_arg),
+                ("AGENT_SESSION_FAKE_TMUX_BLANK_DISPLAY", "1"),
+                ("AGENT_SESSION_FAKE_TMUX_HAS_SESSION", has_session),
+            ],
+        );
+
+        assert_eq!(
+            output.code,
+            expected_code,
+            "stdout={}",
+            output.stdout_text()
+        );
+        assert_eq!(session_dir.exists(), expected_code != 0);
+        if expected_code != 0 {
+            assert_eq!(
+                output.stdout_json()["error"]["details"]["reason"],
+                "runtime-identity-unavailable"
+            );
+        }
+    }
+
+    let calls = tmux_calls(&tmux_log);
+    assert!(
+        calls
+            .iter()
+            .any(|call| call.first().is_some_and(|arg| arg == "has-session"))
+    );
+    assert!(
+        calls
+            .iter()
+            .all(|call| call.first().is_none_or(|arg| arg != "kill-session"))
     );
 }
 

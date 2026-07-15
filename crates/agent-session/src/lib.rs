@@ -5543,6 +5543,16 @@ fn capture_tmux_runtime_identity(
     }
     let output = String::from_utf8(output.stdout)
         .map_err(|_| SessionTerminationFailure::RuntimeIdentityUnavailable)?;
+    if output.trim().is_empty() && runtime_is_proven_never_launched(record) {
+        let exact_session_target = format!("={}", record.tmux_session);
+        return match verified_tmux_status_with_timeout(tmux_bin, &exact_session_target, timeout)
+            .as_str()
+        {
+            "stopped" => Ok(TmuxRuntimeProbe::Stopped),
+            "running" => Err(SessionTerminationFailure::RuntimeIdentityUnavailable),
+            _ => Err(SessionTerminationFailure::VerificationFailed),
+        };
+    }
     let mut fields = output.split_whitespace();
     let session_id = fields
         .next()
