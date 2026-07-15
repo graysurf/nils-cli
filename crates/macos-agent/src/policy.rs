@@ -179,6 +179,14 @@ pub fn mutating_command(command: &str) -> bool {
     )
 }
 
+pub fn mutating_invocation(argv: &[String]) -> bool {
+    let informational = argv
+        .iter()
+        .skip(1)
+        .any(|value| matches!(value.as_str(), "--help" | "-h" | "--version" | "-V"));
+    !informational && exec_command(argv).as_deref().is_some_and(mutating_command)
+}
+
 pub fn snapshot_lineage(argv: &[String]) -> Option<String> {
     argv.iter().enumerate().find_map(|(index, value)| {
         if value == "--snapshot" {
@@ -319,9 +327,23 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        ToolProfile, allowed_tools, mcp_call_allowed, tool_allowed, validate_exec_argv,
-        validate_scenario,
+        ToolProfile, allowed_tools, mcp_call_allowed, mutating_invocation, tool_allowed,
+        validate_exec_argv, validate_scenario,
     };
+
+    #[test]
+    fn help_and_version_invocations_are_informational_but_real_actions_still_mutate() {
+        assert!(!mutating_invocation(&["click".into(), "--help".into()]));
+        assert!(!mutating_invocation(&["type".into(), "-h".into()]));
+        assert!(!mutating_invocation(&["app".into(), "--version".into()]));
+        assert!(!mutating_invocation(&["window".into(), "-V".into()]));
+        assert!(mutating_invocation(&[
+            "click".into(),
+            "--on".into(),
+            "1".into()
+        ]));
+        assert!(mutating_invocation(&["type".into(), "9".into()]));
+    }
 
     #[test]
     fn hard_denials_apply_to_cli_and_scenarios() {

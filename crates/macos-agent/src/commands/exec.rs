@@ -93,8 +93,7 @@ pub fn run_local(
     .map_err(|_| {
         CliError::upstream("failed to start the locked Peekaboo executable").with_operation("exec")
     })?;
-    let command = policy::exec_command(&args.argv).unwrap_or_else(|| "unknown".into());
-    let mutating = policy::mutating_command(&command);
+    let mutating = policy::mutating_invocation(&args.argv);
     let mut status = if output.timed_out && mutating {
         StepStatus::Unknown
     } else if output.timed_out || output.exit_code != 0 {
@@ -218,8 +217,7 @@ pub fn run_local(
 
 fn validate(args: &ExecArgs) -> Result<(), CliError> {
     policy::validate_exec_argv(&args.argv)?;
-    let command = policy::exec_command(&args.argv).unwrap_or_default();
-    if policy::mutating_command(&command)
+    if policy::mutating_invocation(&args.argv)
         && args
             .expected
             .as_deref()
