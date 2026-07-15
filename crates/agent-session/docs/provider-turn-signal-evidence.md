@@ -5,7 +5,9 @@
 This report freezes the provider lifecycle evidence used by
 `agent-session.turn-event.v1` and `agent-session.turn-state.v1`. It was audited
 on 2026-07-11 against Codex CLI 0.144.1, Claude Code 2.1.206, Hermes Agent
-0.18.2, and the agent-session 1.21.17 implementation baseline. The support floors are deliberately the
+0.18.2, and the agent-session 1.21.17 implementation baseline. The exact
+attention addendum was audited on 2026-07-15 against Codex CLI 0.144.3 and
+Claude Code 2.1.210. The support floors are deliberately the
 oldest versions directly covered by this audit, not guesses about earlier
 releases.
 
@@ -33,14 +35,18 @@ created.
   and block automatic setup. Codex appends its full notification JSON to that
   argv; agent-session discards content after parsing and never persists it, but
   the provider-supplied argv is transiently visible to same-host process inspection.
-- [Codex app-server errors](https://learn.chatgpt.com/docs/app-server#errors)
-  documents structured turn failures. The audited 0.144.1 schema and live Unix
+- [Codex app-server](https://learn.chatgpt.com/docs/app-server) documents
+  structured turn failures and server requests. The audited 0.144.1/0.144.3
+  schemas and live Unix
   WebSocket probe expose `Turn.status`, `Turn.error.codexErrorInfo`, the
-  `error` notification, `account/rateLimits/read`, and `turn/start`.
+  `error` notification, `account/rateLimits/read`, `turn/start`, typed
+  `RequestId` (`string | int64`), five admitted blocking request methods, and
+  `serverRequest/resolved`.
 - [Claude Code hooks](https://code.claude.com/docs/en/hooks) documents parallel
   matching hooks, exact `AskUserQuestion` matching, shared `tool_use_id` on
   `PreToolUse`/`PostToolUse`/`PostToolUseFailure`, `PermissionRequest` without
-  that id, and notifications including `idle_prompt`.
+  that id, notifications including `idle_prompt`, and `Elicitation` /
+  `ElicitationResult` with an optional `elicitation_id` on both callbacks.
 - [Hermes hooks](https://github.com/NousResearch/hermes-agent/blob/main/website/docs/user-guide/features/hooks.md)
   documents `pre_llm_call`, `post_llm_call`, `pre_approval_request`,
   `post_approval_response`, shell-hook consent, and synthetic hook tests. The
@@ -51,8 +57,8 @@ created.
 
 | Provider | Audited floor | Classification | Start | Completion | Attention | Failure | Setup |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| Codex | 0.144.1 | supported; usage-failure supported only for agent-session app-server v2 runtimes | `UserPromptSubmit`, observed | matching `agent-turn-complete`, authoritative; raw `Stop` remains journal evidence only | `PermissionRequest`, observed conservative latch | live app-server `failed` + `usageLimitExceeded`, authoritative; raw TUI remains unavailable | additive hooks/notify plus capability-probed private Unix app-server runtime for fresh sessions |
-| Claude Code | 2.1.206 | partial; usage-failure supported | `UserPromptSubmit`, observed | `idle_prompt`, observed; raw `Stop` is journal evidence only | exact `AskUserQuestion` request/clear; `PermissionRequest`/notification conservative latch | structured `StopFailure.error`, authoritative; only `rate_limit` can arm auto-resume | additive merge into `~/.claude/settings.json` |
+| Codex | 0.144.1 baseline; exact-attention versions 0.144.1 and 0.144.3 | supported; exact attention and usage failure require an audited agent-session app-server v2 runtime | `UserPromptSubmit`, observed | matching `agent-turn-complete`, authoritative; raw `Stop` remains journal evidence only | managed protocol authority: typed exact request/resolution; raw/unmanaged hook authority: `PermissionRequest` conservative latch | live app-server `failed` + `usageLimitExceeded`, authoritative; raw TUI remains unavailable | additive hooks/notify plus capability-probed private Unix app-server runtime for fresh sessions |
+| Claude Code | 2.1.206 baseline; Elicitation audit 2.1.210 | partial; usage failure supported; Elicitation exact only when both callbacks carry the same non-empty id | `UserPromptSubmit`, observed | `idle_prompt`, observed; raw `Stop` is journal evidence only | exact `AskUserQuestion`; conditional exact `Elicitation`; `PermissionRequest`/notification conservative latch | structured `StopFailure.error`, authoritative; only `rate_limit` can arm auto-resume | additive merge into `~/.claude/settings.json` |
 | Hermes | 0.18.2 | supported | `pre_llm_call`, observed | successful non-interrupted `post_llm_call`, authoritative | non-empty shell `extra.tool_call_id` projects to exact pre/post correlation; missing/empty-id tuple fallback remains conservative | runtime/fallback only | additive merge into `~/.hermes/config.yaml`; Hermes consent remains mandatory |
 
 Versions below the audited floor remain usable. `activity doctor` reports them
@@ -76,11 +82,38 @@ turn. Duplicate completion is idempotent.
 
 `PermissionRequest` has `turn_id` but no request identifier shared with
 `PostToolUse`; `PostToolUse.tool_use_id` cannot be correlated to the preceding
-approval. Multiple approval requests therefore use agent-session-owned opaque
+approval. Raw or unmanaged runtimes therefore use agent-session-owned opaque
 attention ids and remain latched. Unrelated progress never clears them.
 
-For fresh agent-session-managed sessions, bounded version/help probes require
-the audited Codex 0.144.1 floor plus explicit Unix-listen support before
+An audited managed app-server runtime instead preselects protocol attention
+authority. The metadata-only proxy admits
+`item/commandExecution/requestApproval`, `item/fileChange/requestApproval`,
+`item/permissions/requestApproval`, `item/tool/requestUserInput`, and
+`mcpServer/elicitation/request`, then clears only the same typed request id on
+`serverRequest/resolved`. MCP elicitation `form` and `openai/form` map to
+clarification, while `url` maps to authentication; an unknown or malformed mode
+fails closed. JSON integer `1` and string `"1"` remain distinct in the bounded
+in-memory pending table. Each occurrence receives a fresh opaque correlation
+token, so sequential provider id reuse remains exact without retaining the raw
+id in the activity snapshot, journal, replay index, or public state. The runtime
+injects its authority into tmux; the installed generic `PermissionRequest`
+command checks that environment before invoking the helper, which also protects
+against an older helper during rollback. Protocol authority is selected only
+when that exact guarded command is present and no second direct unguarded
+reporter can bypass it; an unguarded or missing command keeps hook authority even
+when app-server transport is available. Missing or
+conflicting authority, wrong-turn or malformed recognized metadata, malformed
+or lost proxy transport, a projection queue gap, or an unexpected permission
+hook writes a durable generation-scoped unhealthy marker and degrades activity
+to `unknown` until a new runtime generation. A dedicated health fence orders the
+pending marker against activity commits and the durable auto-resume claim; the
+stable mirror is then reconciled under the session-record lock. The marker
+retains a monotonic public revision/timestamp and fails closed if unreadable or
+if a parseable state is not itself a valid runtime-owned `unknown` state.
+Authority never switches within a runtime.
+
+For fresh agent-session-managed sessions, bounded version/help probes admit
+only an explicit app-server transport allowlist plus Unix-listen support before
 launching `codex app-server` and connecting the visible TUI through a private
 metadata-projecting Unix WebSocket bridge. The bridge observes the exact TUI
 connection and forwards its frames unchanged; bounded background projection
@@ -119,6 +152,22 @@ attention at PreToolUse, and clears only the matching clarification after
 success or failure. The installed-version live probe retained only event names,
 tool name, id presence, and a one-way comparison digest; its Pre/Post digests
 matched.
+
+`Elicitation` and `ElicitationResult` are installed as an additional exact-or-
+conservative pair. When both callbacks expose the same non-empty
+`elicitation_id`, the adapter projects it into the same v1 exact-correlation
+namespace; form mode maps to clarification and URL mode maps to authentication.
+Because the provider contract makes the id optional, an identifier-less request
+remains a conservative latch and an identifier-less result is ignored. Message,
+URL, requested schema, response content, MCP server name, and raw id never enter
+the normalized event.
+
+The sanitized Claude Code 2.1.210 form canary observed both callbacks but no
+`elicitation_id` on either side, so the installed form path is classified
+conservative. A separate URL canary did not observe either callback and is
+classified unverified-conservative. These installed results do not weaken the
+conditional adapter: a future callback pair is admitted as exact only when the
+same non-empty id is actually present; no version floor alone claims support.
 
 `PermissionRequest` explicitly omits `tool_use_id`, even though later tool events
 include one. A separate installed-version permission/progress probe reproduced
@@ -175,6 +224,16 @@ The executable fixtures cover:
   and bounded journal eviction;
 - exact AskUserQuestion request/success/failure correlation and independent
   clearing alongside unrelated generic attention;
+- conditional exact Claude Elicitation form/URL correlation, identifier-less
+  conservative fallback, setup parity, and content-field rejection;
+- all five admitted Codex server-request methods, typed integer/string id
+  separation, per-occurrence tokens with sequential id reuse, MCP mode mapping,
+  concurrent `2 -> 1 -> 0` clearing before completion, idempotent unmatched or
+  repeated resolution, queue/shape bounds, wrong-turn rejection, authority
+  suppression, source-guard capability selection, transport-loss and malformed-
+  frame degradation, stable marker revision across unrelated record updates,
+  invalid/nondegraded-marker rejection, held-session-lock authority breach,
+  guarded-plus-unguarded source rejection, and no same-runtime recovery;
 - unrelated progress while attention is pending, including monotonic
   `current_turn.last_progress_at` without phase relaxation;
 - Stop followed by continuation/new-turn evidence;

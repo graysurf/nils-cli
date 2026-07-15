@@ -134,6 +134,64 @@ focus, browser clocks, or provider-supplied timestamps. Exact
 own runtime-scoped clarification correlation. Old snapshots omit the field and
 remain valid.
 
+## Attention correlation authority
+
+The v1 reducer is provider-neutral. Exact provider adapters may request and
+clear attention only with the same opaque, runtime-scoped correlation. A
+different id and an uncorrelated `progress` event never prove resolution;
+completion, failure, a new turn, or a new runtime remain the only boundaries
+that may clear all outstanding attention.
+
+Each runtime selects one attention authority when it is created or resumed and
+keeps that authority for the lifetime of the runtime. Hook and protocol
+observations are not paired by arrival time, event kind, or semantic similarity.
+A provider protocol may be selected as the exact authority only when the
+admitted interaction matrix proves complete request coverage and the runtime
+suppresses the corresponding generic attention hook at its source. Otherwise
+the runtime selects conservative hook authority. An event from a suppressed
+attention source is an authority-invariant breach: it neither creates attention
+nor advances `last_progress_at`, and the runtime degrades to unknown until a new
+runtime or resume selects authority again.
+
+Client dismissal remains presentation-only fingerprint suppression. It cannot
+clear producer-owned attention or influence authority selection.
+
+For Codex, a raw or unmanaged runtime selects `hook`; its generic
+`PermissionRequest` remains a conservative approval latch. An audited managed
+app-server runtime selects `protocol`, injects
+`AGENT_SESSION_ATTENTION_AUTHORITY=protocol`, and suppresses that generic hook
+before the helper is invoked, including when the installed helper predates
+authority-aware ingest. Protocol authority is unavailable until that guarded
+installed command is verified and no second direct unguarded reporter is
+present; app-server transport may still run with hook authority. Its private
+proxy admits only the audited blocking
+request method allowlist and `serverRequest/resolved`. Request ids retain their
+JSON `string` versus `int64` type only in the bounded in-memory pending table;
+each admitted request occurrence receives a fresh opaque correlation token.
+The raw request id is never persisted or exposed, and a provider may reuse the
+same id after its prior request resolves without hitting durable replay
+deduplication. A recognized malformed request, wrong-turn request, observation
+loss, malformed proxy data, projection failure, or hook/record authority
+mismatch writes a durable runtime-generation unhealthy marker. A private health
+fence linearizes the scoped pending poison marker against activity commits and
+the durable auto-resume submission claim; stable activity mirroring then uses
+the session-record lock. The marker owns a stable degradation revision and
+phase timestamp. Invalid, unreadable, or parseable-but-nondegraded marker states
+fail closed instead of being exposed.
+The public v1 state becomes `unknown`, auto-resume becomes unavailable, and
+later same-runtime events are rejected; only a new runtime generation can
+remove the marker, select authority, and recover. If an open turn has no
+provider turn id, its first non-null exact attention request binds the turn;
+later mismatches fail closed. Nullable MCP elicitation remains admitted without
+inventing a turn id.
+
+For Claude Code, `AskUserQuestion` remains exact through `tool_use_id`.
+`Elicitation` and `ElicitationResult` are also exact when both carry the same
+non-empty `elicitation_id`: form mode maps to `clarification`, and URL mode maps
+to `authentication`. Since Claude's hook contract makes the id optional, a
+request without it is a conservative latch and a result without it is a no-op.
+Generic permission and notification signals remain conservative.
+
 ## Deterministic transition rules
 
 | Input | Rule |
@@ -150,6 +208,7 @@ remain valid.
 | duplicate `event_id` | no state or revision change within the 4096-event active-runtime replay horizon |
 | missing/prior runtime id | reject before host timestamp or reducer |
 | corrupt snapshot | expose safe `unknown`; list/serve/delete remain available |
+| unhealthy authority/projection | expose `unknown`, accept no later event in the same runtime, recover only on a new runtime generation |
 
 Claude `PermissionRequest` / `permission_prompt` signals mean that a permission
 dialog is actually being shown, so they emit `attention_requested` even when
@@ -286,8 +345,9 @@ rolled back if the second guarded write fails. Doctor scans session records
 once, probes provider versions concurrently with a two-second bound per
 provider, and reports installed version or a bounded probe error, audited
 classification, config status or sanitized configuration error, Codex
-`notification_mode`, finality and correlation limits, trust requirements, and
-repair guidance without emitting provider config content.
+`notification_mode`, finality and correlation limits, `exact_attention`, the
+provider-specific `attention_authority` policy, trust requirements, and repair
+guidance without emitting provider config content.
 Configured status requires every exact owned hook command/timeout and, for
 Codex, an exact owned or valid composed notify argv; helper health resolves the bare `agent-session`
 command on PATH. Hook/notification diagnostics are bound to the active

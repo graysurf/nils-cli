@@ -1712,7 +1712,14 @@ fn create_record(request: RecordRequest<'_>) -> Result<CreatedRecord, CliError> 
             generation: 1,
             started_at: now.timestamp().to_string(),
             launch_id: uuid::Uuid::new_v4().to_string(),
-            extra: BTreeMap::new(),
+            extra: if request.agent == AgentKind::Codex {
+                BTreeMap::from([(
+                    codex_app_server::ATTENTION_AUTHORITY_KEY.to_string(),
+                    json!("hook"),
+                )])
+            } else {
+                BTreeMap::new()
+            },
         }),
         agent_args: request.agent_args,
         agent_bin: request.agent_bin,
@@ -3565,6 +3572,11 @@ fn add_runtime_tmux_environment(
         format!("AGENT_SESSION_ID={}", record.id),
         format!("AGENT_SESSION_STATE_DIR={}", display_path(state_dir)),
         format!("AGENT_SESSION_RUNTIME_ID={runtime_id}"),
+        format!(
+            "{}={}",
+            codex_app_server::ATTENTION_AUTHORITY_ENV,
+            codex_app_server::attention_authority(record)
+        ),
     ] {
         command.arg("-e").arg(value);
     }
