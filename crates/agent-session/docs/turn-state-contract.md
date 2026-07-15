@@ -190,7 +190,11 @@ For Claude Code, `AskUserQuestion` remains exact through `tool_use_id`.
 non-empty `elicitation_id`: form mode maps to `clarification`, and URL mode maps
 to `authentication`. Since Claude's hook contract makes the id optional, a
 request without it is a conservative latch and a result without it is a no-op.
-Generic permission and notification signals remain conservative.
+Generic permission and notification signals remain conservative. The managed
+Claude setup excludes the uncorrelated `permission_prompt` notification because
+current Claude versions emit it as a duplicate of `PermissionRequest`, and an
+`AskUserQuestion` `PermissionRequest` is ignored because the same interaction is
+already owned by exact PreToolUse/PostToolUse correlation.
 
 ## Deterministic transition rules
 
@@ -210,13 +214,15 @@ Generic permission and notification signals remain conservative.
 | corrupt snapshot | expose safe `unknown`; list/serve/delete remain available |
 | unhealthy authority/projection | expose `unknown`, accept no later event in the same runtime, recover only on a new runtime generation |
 
-Claude `PermissionRequest` / `permission_prompt` signals mean that a permission
-dialog is actually being shown, so they emit `attention_requested` even when
-the payload reports `permission_mode: "bypassPermissions"`. The mode hint does
-not override the observed prompt; bypass mode retains a root/home deletion
-circuit breaker. Because these approvals have no correlated clear event, they
-keep the conservative latch above until completion, a new turn, or a runtime
-boundary.
+Claude `PermissionRequest` signals for tools other than `AskUserQuestion` mean
+that a permission dialog is actually being shown, so they emit
+`attention_requested` even when the payload reports `permission_mode:
+"bypassPermissions"`. The mode hint does not override the observed prompt;
+bypass mode retains a root/home deletion circuit breaker. Because these
+approvals have no correlated clear event, they keep the conservative latch
+above until completion, a new turn, or a runtime boundary. User-owned or
+previously configured `permission_prompt` notification reporters normalize the
+same way, but the managed setup does not install that duplicate source.
 
 Hermes 0.18.2 shell hooks put approval kwargs under the allowlisted `extra`
 object and may leave top-level `session_id` empty. Agent-session falls back to

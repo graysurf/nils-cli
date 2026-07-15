@@ -1694,6 +1694,89 @@ fn activity_setup_is_dry_run_first_additive_idempotent_and_reversible() {
 }
 
 #[test]
+fn claude_setup_removes_retired_permission_notification_without_touching_user_hooks() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let home = tmp.path().join("home");
+    fs::create_dir_all(home.join(".claude")).expect("claude dir");
+    let settings_path = home.join(".claude/settings.json");
+    let home_arg = home.to_string_lossy().to_string();
+    let envs = [("HOME", home_arg.as_str())];
+    let apply = |flag: &str| {
+        run(
+            tmp.path(),
+            &[
+                "activity", "setup", "--agent", "claude", flag, "--format", "json",
+            ],
+            &envs,
+        )
+    };
+
+    let initial = apply("--apply");
+    assert_eq!(initial.code, 0, "stderr={}", initial.stderr_text());
+    let mut settings: Value = serde_json::from_str(
+        &fs::read_to_string(&settings_path).expect("initial managed settings"),
+    )
+    .expect("settings json");
+    let notifications = settings["hooks"]["Notification"]
+        .as_array_mut()
+        .expect("notification groups");
+    notifications.push(json!({
+        "matcher": "permission_prompt",
+        "hooks": [
+            {
+                "type": "command",
+                "command": "agent-session activity hook --agent claude",
+                "timeout": 5
+            },
+            {
+                "type": "command",
+                "command": "user-permission-notifier",
+                "timeout": 7
+            }
+        ]
+    }));
+    fs::write(
+        &settings_path,
+        serde_json::to_vec_pretty(&settings).expect("retired settings json"),
+    )
+    .expect("retired managed settings");
+
+    let dry_run = apply("--dry-run");
+    assert_eq!(dry_run.code, 0, "stderr={}", dry_run.stderr_text());
+    assert_eq!(data(&dry_run.stdout_json())["configured"], false);
+    assert_eq!(data(&dry_run.stdout_json())["would_change"], true);
+    assert_eq!(data(&dry_run.stdout_json())["would_configure"], true);
+
+    let repaired = apply("--repair");
+    assert_eq!(repaired.code, 0, "stderr={}", repaired.stderr_text());
+    assert_eq!(data(&repaired.stdout_json())["changed"], true);
+    assert_eq!(data(&repaired.stdout_json())["configured"], true);
+    let repaired_settings = fs::read_to_string(&settings_path).expect("repaired settings");
+    let repaired_json: Value =
+        serde_json::from_str(&repaired_settings).expect("repaired settings json");
+    let retired_group = repaired_json["hooks"]["Notification"]
+        .as_array()
+        .expect("notification groups")
+        .iter()
+        .find(|group| group["matcher"] == "permission_prompt")
+        .expect("user permission notification group retained");
+    assert_eq!(
+        retired_group["hooks"],
+        json!([{
+            "type": "command",
+            "command": "user-permission-notifier",
+            "timeout": 7
+        }])
+    );
+
+    let remove = apply("--remove");
+    assert_eq!(remove.code, 0, "stderr={}", remove.stderr_text());
+    let removed_settings = fs::read_to_string(&settings_path).expect("removed settings");
+    assert!(removed_settings.contains("user-permission-notifier"));
+    assert!(!removed_settings.contains("agent-session activity hook"));
+}
+
+#[test]
 fn codex_activity_setup_composes_and_restores_a_user_owned_notify() {
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let home = tmp.path().join("home");
@@ -3473,8 +3556,8 @@ fn claude_ask_user_question_clears_exactly_and_keeps_generic_attention() {
         hook(json!({
             "hook_event_name": "PermissionRequest",
             "session_id": provider_session_id,
-            "tool_name": "Bash",
-            "tool_input": {"command": "discarded"}
+            "tool_name": "AskUserQuestion",
+            "tool_input": {"questions": [{"question": "discarded"}]}
         }))
         .code,
         0
@@ -3483,7 +3566,7 @@ fn claude_ask_user_question_clears_exactly_and_keeps_generic_attention() {
     assert_eq!(data(&pending)["turn_state"]["phase"], "needs_input");
     assert_eq!(
         data(&pending)["turn_state"]["current_turn"]["attention"]["pending_count"],
-        2
+        1
     );
 
     assert_eq!(
@@ -3499,10 +3582,27 @@ fn claude_ask_user_question_clears_exactly_and_keeps_generic_attention() {
     );
     let cleared = status();
     let turn = &data(&cleared)["turn_state"]["current_turn"];
-    assert_eq!(data(&cleared)["turn_state"]["phase"], "needs_input");
-    assert_eq!(turn["attention"]["pending_count"], 1);
+    assert_eq!(data(&cleared)["turn_state"]["phase"], "working");
+    assert!(turn.get("attention").is_none());
     assert_eq!(turn["started_at"], started_at);
     assert!(turn["last_progress_at"].is_string());
+
+    assert_eq!(
+        hook(json!({
+            "hook_event_name": "PermissionRequest",
+            "session_id": provider_session_id,
+            "tool_name": "Bash",
+            "tool_input": {"command": "discarded"}
+        }))
+        .code,
+        0
+    );
+    let generic = status();
+    assert_eq!(data(&generic)["turn_state"]["phase"], "needs_input");
+    assert_eq!(
+        data(&generic)["turn_state"]["current_turn"]["attention"]["pending_count"],
+        1
+    );
 
     assert_eq!(
         hook(json!({

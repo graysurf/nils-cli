@@ -177,11 +177,17 @@ completion, a new turn, or a runtime boundary; later progress may prove work is
 continuing but never proves the request was answered.
 
 `PermissionRequest` runs when a permission dialog is about to be shown, and a
-`permission_prompt` notification likewise reports an actual prompt. The adapter
-therefore treats either signal as authoritative over the payload's
-`permission_mode` hint. This includes `bypassPermissions`, where root/home
-deletion still has a circuit-breaker prompt. Those uncorrelated signals keep the
-same conservative latch as every other permission mode.
+`permission_prompt` notification likewise reports an actual prompt. Current
+Claude emits both for one dialog, however, and the notification has neither a
+request id nor a distinct resolution. The managed setup therefore owns
+`PermissionRequest` and does not install the duplicate notification reporter;
+user-owned or previously configured notification reporters still normalize
+conservatively.
+
+`AskUserQuestion` permission shadows are also ignored because exact
+PreToolUse/PostToolUse correlation already owns that interaction. Other
+permission requests remain authoritative over the payload's `permission_mode`
+hint, including the `bypassPermissions` root/home deletion circuit breaker.
 
 `StopFailure` exposes a documented finite `error` enum. The adapter treats that
 enum as authoritative failure classification, maps it to the metadata-only
