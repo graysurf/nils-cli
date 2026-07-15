@@ -9,9 +9,12 @@
 
 use nils_test_support::cmd::{self, CmdOptions, CmdOutput};
 use nils_test_support::{StubBinDir, bin, write_exe};
-use pretty_assertions::assert_eq;
+use pretty_assertions::{assert_eq, assert_ne};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
 use tempfile::TempDir;
 
 /// Canary string standing in for a decrypted secret value. It must NEVER reach
@@ -24,6 +27,27 @@ fn secrets_bin() -> PathBuf {
 
 fn run(args: &[&str], options: &CmdOptions) -> CmdOutput {
     cmd::run_with(&secrets_bin(), args, options)
+}
+
+fn spawn(args: &[&str], options: &CmdOptions) -> Child {
+    let mut command = Command::new(secrets_bin());
+    command
+        .args(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    if let Some(cwd) = options.cwd.as_deref() {
+        command.current_dir(cwd);
+    }
+    for key in &options.env_remove {
+        command.env_remove(key);
+    }
+    for (key, value) in &options.envs {
+        command.env(key, value);
+    }
+    if options.stdin_null {
+        command.stdin(Stdio::null());
+    }
+    command.spawn().expect("spawn secrets")
 }
 
 fn assert_exit(output: &CmdOutput, code: i32) {
@@ -176,6 +200,12 @@ if [[ "$mode" == "e" ]]; then
   if [[ "${SOPS_SIGNAL:-0}" == "1" ]]; then
     kill -TERM "$$"
   fi
+
+  if [[ "${SOPS_BLOCK:-0}" == "1" ]]; then
+    printf '%s\n' "$$" > "${SOPS_PID_FILE:?}"
+    : > "${SOPS_READY_FILE:?}"
+    while :; do :; done
+  fi
 fi
 
 if [[ "${SOPS_FAIL:-0}" == "1" ]]; then
@@ -184,6 +214,14 @@ if [[ "${SOPS_FAIL:-0}" == "1" ]]; then
 fi
 
 if [[ "$mode" == "d" ]]; then
+  if [[ "$file" == "${SOPS_STORE:-}"/.git/secrets-add-*.enc.env.tmp ]]; then
+    # Simulate SOPS' complete-document decrypt/MAC validation. The mixed
+    # fixture contains an ENC marker but is not a valid encrypted document.
+    if [[ "${SOPS_MIXED_OUTPUT:-0}" == "1" || "${SOPS_NO_ENC:-0}" == "1" ]]; then
+      exit 1
+    fi
+    exit 0
+  fi
   # Decrypt: emit fake plaintext to stdout (the CLI redirects this into .env).
   printf 'API_KEY=TOP-SECRET-VALUE\nDB_URL=postgres://localhost/db\n# comment\n'
   exit 0
@@ -206,7 +244,9 @@ if [[ "$mode" == "e" ]]; then
     echo "sops: missing plaintext input" >&2
     exit 1
   fi
-  if [[ "${SOPS_NO_ENC:-0}" == "1" ]]; then
+  if [[ "${SOPS_MIXED_OUTPUT:-0}" == "1" ]]; then
+    printf 'API_KEY=TOP-SECRET-VALUE\nCOMMENT=ENC[\n'
+  elif [[ "${SOPS_NO_ENC:-0}" == "1" ]]; then
     printf 'API_KEY=TOP-SECRET-VALUE\n'
   else
     printf 'API_KEY=ENC[AES256_GCM,data:abc,type:str]\n'
@@ -231,6 +271,116 @@ fn assert_no_add_temp_files(store: &Path) {
         leftovers.is_empty(),
         "secrets add temporary files were not cleaned up: {leftovers:?}"
     );
+}
+
+fn wait_for_file(path: &Path) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !path.exists() {
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for {}",
+            path.display()
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[cfg(unix)]
+fn send_signal(pid: u32, signal: &str) {
+    let status = Command::new("kill")
+        .args([signal, &pid.to_string()])
+        .status()
+        .expect("run kill");
+    assert!(status.success(), "kill {signal} {pid} failed");
+}
+
+#[cfg(unix)]
+fn add_interrupted_at_cli_preserves_target(signal: &str, prior: Option<&str>) {
+    let tmp = TempDir::new().expect("tmp");
+    let app = tmp.path().join("app");
+    fs::create_dir_all(&app).expect("app dir");
+    fs::write(app.join(".env"), format!("API_KEY={SECRET_CANARY}\n")).expect("write src");
+
+    let stubs = StubBinDir::new();
+    let store = tmp.path().join("store");
+    init_store(&store);
+    let target = store.join("repos/graysurf/g14-infra.enc.env");
+    if let Some(prior) = prior {
+        fs::create_dir_all(target.parent().expect("target parent")).expect("target parent");
+        fs::write(&target, prior).expect("existing ciphertext");
+    }
+    let git_log = tmp.path().join("git.log");
+    let sops_ready = tmp.path().join("sops.ready");
+    let sops_pid_file = tmp.path().join("sops.pid");
+    fs::write(&git_log, "").expect("git log");
+    git_stub(stubs.path());
+    sops_stub(stubs.path());
+
+    let mut child = spawn(
+        &["add"],
+        &options(&app, &store, stubs.path())
+            .with_env("GIT_LOG", &git_log.to_string_lossy())
+            .with_env("SOPS_STORE", &store.to_string_lossy())
+            .with_env(
+                "SOPS_ASSERT_FINAL_STATE",
+                if prior.is_some() {
+                    "unchanged"
+                } else {
+                    "absent"
+                },
+            )
+            .with_env("SOPS_EXPECTED_TARGET", prior.unwrap_or_default().trim_end())
+            .with_env("SOPS_REQUIRE_FILENAME_OVERRIDE", "1")
+            .with_env("SOPS_BLOCK", "1")
+            .with_env("SOPS_READY_FILE", &sops_ready.to_string_lossy())
+            .with_env("SOPS_PID_FILE", &sops_pid_file.to_string_lossy()),
+    );
+
+    wait_for_file(&sops_ready);
+    wait_for_file(&sops_pid_file);
+    send_signal(child.id(), signal);
+    let sops_pid = fs::read_to_string(&sops_pid_file)
+        .expect("read sops pid")
+        .trim()
+        .parse::<u32>()
+        .expect("parse sops pid");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while child.try_wait().expect("poll secrets").is_none() {
+        assert!(Instant::now() < deadline, "timed out waiting for secrets");
+        thread::sleep(Duration::from_millis(10));
+    }
+
+    // Before the production signal handler exists, the SOPS stub is orphaned
+    // and still owns the inherited stderr pipe. Stop it before collecting CLI
+    // output so the red fixture remains hermetic; after the repair the CLI has
+    // already terminated and reaped it.
+    let _ = Command::new("kill")
+        .args(["-TERM", &sops_pid.to_string()])
+        .status();
+    let output = child.wait_with_output().expect("wait secrets");
+
+    let captured = CmdOutput {
+        code: output.status.code().unwrap_or(-1),
+        stdout: output.stdout,
+        stderr: output.stderr,
+    };
+    assert_ne!(captured.code, 0);
+    assert_no_secret_leak(&captured);
+    match prior {
+        Some(prior) => assert_eq!(
+            fs::read_to_string(&target).expect("prior target retained"),
+            prior
+        ),
+        None => assert!(!target.exists(), "signal must not create the target"),
+    }
+    let git_calls = fs::read_to_string(&git_log).expect("git log");
+    assert!(
+        !git_calls.lines().any(|line| {
+            line.starts_with("add ") || line.starts_with("commit ") || line.starts_with("push ")
+        }),
+        "signal must not mutate git: {git_calls}"
+    );
+    assert_no_add_temp_files(&store);
 }
 
 // --------------------------------- tests -------------------------------------
@@ -629,6 +779,52 @@ fn add_non_ciphertext_output_leaves_no_target_or_temp() {
 }
 
 #[test]
+fn add_marker_bearing_mixed_plaintext_preserves_prior_target_and_git() {
+    let tmp = TempDir::new().expect("tmp");
+    let app = tmp.path().join("app");
+    fs::create_dir_all(&app).expect("app dir");
+    fs::write(app.join(".env"), format!("API_KEY={SECRET_CANARY}\n")).expect("write src");
+
+    let stubs = StubBinDir::new();
+    let store = tmp.path().join("store");
+    init_store(&store);
+    let target = store.join("repos/graysurf/g14-infra.enc.env");
+    fs::create_dir_all(target.parent().expect("target parent")).expect("target parent");
+    let original = "API_KEY=ENC[AES256_GCM,data:original,type:str]\n";
+    fs::write(&target, original).expect("existing ciphertext");
+    let git_log = tmp.path().join("git.log");
+    fs::write(&git_log, "").expect("git log");
+    git_stub(stubs.path());
+    sops_stub(stubs.path());
+
+    let output = run(
+        &["add"],
+        &options(&app, &store, stubs.path())
+            .with_env("GIT_LOG", &git_log.to_string_lossy())
+            .with_env("SOPS_STORE", &store.to_string_lossy())
+            .with_env("SOPS_ASSERT_FINAL_STATE", "unchanged")
+            .with_env("SOPS_EXPECTED_TARGET", original.trim_end())
+            .with_env("SOPS_REQUIRE_FILENAME_OVERRIDE", "1")
+            .with_env("SOPS_MIXED_OUTPUT", "1"),
+    );
+
+    assert_exit(&output, 1);
+    assert_no_secret_leak(&output);
+    assert_eq!(
+        fs::read_to_string(&target).expect("prior target retained"),
+        original
+    );
+    let git_calls = fs::read_to_string(&git_log).expect("git log");
+    assert!(
+        !git_calls.lines().any(|line| {
+            line.starts_with("add ") || line.starts_with("commit ") || line.starts_with("push ")
+        }),
+        "invalid document must not mutate git: {git_calls}"
+    );
+    assert_no_add_temp_files(&store);
+}
+
+#[test]
 fn add_unchanged_stages_without_committing_or_pushing() {
     let tmp = TempDir::new().expect("tmp");
     let app = tmp.path().join("app");
@@ -774,6 +970,21 @@ fn add_cleans_temp_when_sops_is_terminated_by_signal() {
         "signal failure must not create the final target"
     );
     assert_no_add_temp_files(&store);
+}
+
+#[cfg(unix)]
+#[test]
+fn add_sigint_to_cli_cleans_temp_with_absent_target() {
+    add_interrupted_at_cli_preserves_target("-INT", None);
+}
+
+#[cfg(unix)]
+#[test]
+fn add_sigterm_to_cli_cleans_temp_and_preserves_prior_target() {
+    add_interrupted_at_cli_preserves_target(
+        "-TERM",
+        Some("API_KEY=ENC[AES256_GCM,data:original,type:str]\n"),
+    );
 }
 
 #[test]

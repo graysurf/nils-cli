@@ -2577,6 +2577,7 @@ version = "1.22.5"
 dependencies = [
  "clap",
  "clap_complete",
+ "ctrlc",
  "nils-build-info",
  "nils-common",
  "nils-test-support",

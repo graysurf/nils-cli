@@ -36,10 +36,11 @@ stdout and the JSON envelope carry only **metadata** — store paths, store entr
 **names**, booleans, and counts. Decrypted secret **values** are written
 directly to `./.env` (mode `600`) and are never echoed to stdout or placed in
 the JSON envelope. `add` encrypts into a mode-600 temporary output under the
-store's `.git` directory, validates the ciphertext, and only then atomically
-renames it over the tracked target. The target never contains plaintext;
-encryption failure or invalid output (`ENC[` missing) leaves any prior
-ciphertext unchanged and removes the temporary output. This contract is
+store's `.git` directory, asks SOPS to decrypt and MAC-verify the complete
+temporary document, and only then atomically renames it over the tracked target.
+The target never contains plaintext; encryption failure, invalid output,
+SIGINT, or SIGTERM leaves any prior ciphertext unchanged and removes the
+temporary output. This contract is
 exercised by hermetic tests in `crates/secrets/tests/integration.rs` that use a
 secret canary string and assert it never appears on stdout/stderr.
 
