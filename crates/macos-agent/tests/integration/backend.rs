@@ -259,6 +259,161 @@ fn backend_transition_retires_owned_daemons_before_later_locks_drop_authority() 
 }
 
 #[test]
+fn failed_transition_retirement_keeps_the_verified_outgoing_state_intact() {
+    let harness = common::MacosAgentHarness::new();
+    let cwd = TempDir::new().expect("cwd");
+    let backend_root = cwd.path().join("backend");
+    let old = candidate(cwd.path(), "v3.9.2", '2');
+    let new = candidate(cwd.path(), "v3.9.3", '3');
+    authorize_rollback(&new, &old);
+    let installed = run_backend(
+        &harness,
+        cwd.path(),
+        &backend_root,
+        &old,
+        &["--format", "json", "backend", "install"],
+    );
+    assert_eq!(installed.code, 0, "{}", installed.stderr_text());
+
+    let old_identity = &sha256(&old.source.join("peekaboo-macos-universal/peekaboo"))[..16];
+    let socket_dir = harness
+        .home_dir()
+        .join("Library/Application Support/Peekaboo");
+    fs::create_dir_all(&socket_dir).expect("socket directory");
+    let socket = socket_dir.join(format!("daemon-{old_identity}.sock"));
+    fs::write(&socket, b"fixture").expect("socket fixture");
+    let current_path = backend_root.join("receipts/current.json");
+    let current_before = fs::read(&current_path).expect("current receipt");
+    let stable_app = backend_root.join("stable/Peekaboo.app/Contents/MacOS/Peekaboo");
+    let stable_before = fs::read(&stable_app).expect("stable app");
+
+    let rejected = run_backend_probe_mode(
+        &harness,
+        cwd.path(),
+        &backend_root,
+        &new,
+        &["--error-format", "json", "backend", "install"],
+        "daemon_stop_failed",
+    );
+    assert_eq!(rejected.code, 69, "{}", rejected.stderr_text());
+    assert!(socket.exists());
+    assert_eq!(
+        fs::read(&current_path).expect("current receipt"),
+        current_before
+    );
+    assert_eq!(fs::read(&stable_app).expect("stable app"), stable_before);
+    assert!(!backend_root.join("receipts/pending.json").exists());
+}
+
+#[test]
+fn rollback_rejects_malformed_current_receipt_before_transition_side_effects() {
+    let harness = common::MacosAgentHarness::new();
+    let cwd = TempDir::new().expect("cwd");
+    let backend_root = cwd.path().join("backend");
+    let old = candidate(cwd.path(), "v3.9.2", '2');
+    let new = candidate(cwd.path(), "v3.9.3", '3');
+    authorize_rollback(&new, &old);
+    for candidate in [&old, &new] {
+        let installed = run_backend(
+            &harness,
+            cwd.path(),
+            &backend_root,
+            candidate,
+            &["--format", "json", "backend", "install"],
+        );
+        assert_eq!(installed.code, 0, "{}", installed.stderr_text());
+    }
+
+    let receipt_path = backend_root.join("receipts/current.json");
+    let mut current: serde_json::Value =
+        serde_json::from_slice(&fs::read(&receipt_path).expect("current receipt"))
+            .expect("receipt JSON");
+    current["cli_binary_sha256"] = json!("../short");
+    let tampered_receipt = serde_json::to_vec_pretty(&current).expect("tampered receipt");
+    fs::write(&receipt_path, &tampered_receipt).expect("write tampered receipt");
+    let stable_app = backend_root.join("stable/Peekaboo.app/Contents/MacOS/Peekaboo");
+    let stable_before = fs::read(&stable_app).expect("stable app");
+
+    let rejected = run_backend(
+        &harness,
+        cwd.path(),
+        &backend_root,
+        &new,
+        &["--error-format", "json", "backend", "rollback"],
+    );
+    assert_eq!(rejected.code, 69, "{}", rejected.stderr_text());
+    assert_eq!(
+        fs::read(&receipt_path).expect("current receipt"),
+        tampered_receipt
+    );
+    assert_eq!(fs::read(&stable_app).expect("stable app"), stable_before);
+    assert!(!backend_root.join("receipts/pending.json").exists());
+}
+
+#[test]
+fn rollback_rejects_replaced_current_cli_before_transition_side_effects() {
+    let harness = common::MacosAgentHarness::new();
+    let cwd = TempDir::new().expect("cwd");
+    let backend_root = cwd.path().join("backend");
+    let old = candidate(cwd.path(), "v3.9.2", '2');
+    let new = candidate(cwd.path(), "v3.9.3", '3');
+    authorize_rollback(&new, &old);
+    for candidate in [&old, &new] {
+        let installed = run_backend(
+            &harness,
+            cwd.path(),
+            &backend_root,
+            candidate,
+            &["--format", "json", "backend", "install"],
+        );
+        assert_eq!(installed.code, 0, "{}", installed.stderr_text());
+    }
+
+    let receipt_path = backend_root.join("receipts/current.json");
+    let current_receipt = fs::read(&receipt_path).expect("current receipt");
+    let current: serde_json::Value =
+        serde_json::from_slice(&current_receipt).expect("receipt JSON");
+    let identity = &current["cli_binary_sha256"].as_str().expect("CLI digest")[..16];
+    let socket_dir = harness
+        .home_dir()
+        .join("Library/Application Support/Peekaboo");
+    fs::create_dir_all(&socket_dir).expect("socket directory");
+    let socket = socket_dir.join(format!("daemon-{identity}.sock"));
+    fs::write(&socket, b"fixture").expect("socket fixture");
+    let marker = cwd.path().join("untrusted-cli-invoked");
+    let current_cli = backend_root.join("versions/v3.9.3/cli/peekaboo");
+    write_executable(
+        &current_cli,
+        &format!(
+            "#!/bin/sh\nprintf invoked > '{}'\nprintf '%s\\n' '{{\"success\":true,\"data\":{{\"selected\":{{\"source\":\"remote\",\"handshake\":{{\"hostKind\":\"onDemand\",\"build\":\"3.9.3 (3.9.3)\"}}}}}}}}'\n",
+            marker.display()
+        ),
+    );
+    let stable_app = backend_root.join("stable/Peekaboo.app/Contents/MacOS/Peekaboo");
+    let stable_before = fs::read(&stable_app).expect("stable app");
+
+    let rejected = run_backend(
+        &harness,
+        cwd.path(),
+        &backend_root,
+        &new,
+        &["--error-format", "json", "backend", "rollback"],
+    );
+    assert_eq!(rejected.code, 69, "{}", rejected.stderr_text());
+    assert!(!marker.exists(), "unverified current CLI was executed");
+    assert!(
+        socket.exists(),
+        "socket changed before current verification"
+    );
+    assert_eq!(
+        fs::read(&receipt_path).expect("current receipt"),
+        current_receipt
+    );
+    assert_eq!(fs::read(&stable_app).expect("stable app"), stable_before);
+    assert!(!backend_root.join("receipts/pending.json").exists());
+}
+
+#[test]
 fn rollback_recovers_an_interruption_after_the_stable_app_swap() {
     let harness = common::MacosAgentHarness::new();
     let cwd = TempDir::new().expect("cwd");
@@ -865,6 +1020,7 @@ JSON
     fi
     ;;
   *" daemon stop "*)
+    [ "$mode" = daemon_stop_failed ] && exit 1
     for socket do :; done
     rm -- "$socket"
     ;;

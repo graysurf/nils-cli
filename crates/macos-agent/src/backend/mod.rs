@@ -457,7 +457,8 @@ fn install_into_staging(
     if let Some(old) = old_current.as_ref()
         && old.tag != new_receipt.tag
     {
-        retire_transition_daemons(paths, lock, old)?;
+        let outgoing = verify_transition_runtime(paths, lock, old, strict)?;
+        retire_transition_daemons(&outgoing)?;
     }
     write_receipt(&paths.pending_receipt(), &new_receipt)?;
     replace_stable_app(paths, &new_receipt)?;
@@ -849,6 +850,7 @@ pub fn rollback(dry_run: bool, strict: bool) -> Result<BackendStatus, CliError> 
         .ok_or_else(|| backend_error("no current backend receipt exists"))?;
     let previous = read_receipt(&paths.previous_receipt())?
         .ok_or_else(|| backend_error("no previous backend receipt exists"))?;
+    let outgoing = verify_transition_runtime(&paths, &lock, &current, strict)?;
     verify_receipt_any_version(&paths, &lock, &previous, strict)?;
     if dry_run {
         return Ok(BackendStatus {
@@ -862,7 +864,7 @@ pub fn rollback(dry_run: bool, strict: bool) -> Result<BackendStatus, CliError> 
             dry_run: true,
         });
     }
-    retire_transition_daemons(&paths, &lock, &current)?;
+    retire_transition_daemons(&outgoing)?;
     write_receipt(&paths.pending_receipt(), &previous)?;
     if !stable_app_matches(&paths, &previous)? {
         replace_stable_app(&paths, &previous)?;
@@ -871,20 +873,38 @@ pub fn rollback(dry_run: bool, strict: bool) -> Result<BackendStatus, CliError> 
     status_unlocked(&lock, &paths, false)
 }
 
-fn retire_transition_daemons(
+struct VerifiedTransitionRuntime {
+    binary: PathBuf,
+    contract: RuntimeContract,
+}
+
+fn verify_transition_runtime(
     paths: &BackendPaths,
     lock: &PeekabooLock,
     receipt: &Receipt,
-) -> Result<(), CliError> {
+    strict: bool,
+) -> Result<VerifiedTransitionRuntime, CliError> {
+    if receipt.tag == lock.tag && receipt.commit == lock.commit {
+        verify_receipt(paths, lock, receipt, strict)?;
+    } else {
+        verify_receipt_any_version(paths, lock, receipt, strict)?;
+    }
     let (cli_asset, _, _) = release_contract_for_receipt(lock, receipt)?;
-    let contract = RuntimeContract::new(
-        receipt.cli_binary_sha256[..16].into(),
-        cli_asset.bridge_build.clone(),
-    );
+    let identity = cli_asset
+        .executable_sha256
+        .get(..16)
+        .ok_or_else(|| backend_error("locked CLI digest cannot identify its runtime"))?;
+    Ok(VerifiedTransitionRuntime {
+        binary: paths.cli_for(&receipt.tag),
+        contract: RuntimeContract::new(identity.into(), cli_asset.bridge_build.clone()),
+    })
+}
+
+fn retire_transition_daemons(runtime: &VerifiedTransitionRuntime) -> Result<(), CliError> {
     crate::commands::retire_obsolete_daemons_at(
-        &paths.cli_for(&receipt.tag),
+        &runtime.binary,
         &crate::commands::runtime_socket_dir(),
-        &[contract],
+        std::slice::from_ref(&runtime.contract),
     )
 }
 
@@ -1570,10 +1590,29 @@ fn read_receipt(path: &Path) -> Result<Option<Receipt>, CliError> {
     };
     let receipt = serde_json::from_slice::<Receipt>(&raw)
         .map_err(|_| backend_error("backend receipt is malformed"))?;
-    if receipt.schema_version != RECEIPT_SCHEMA || !safe_tag(&receipt.tag) {
+    if receipt.schema_version != RECEIPT_SCHEMA
+        || !safe_tag(&receipt.tag)
+        || !receipt_digests_are_valid(&receipt)
+    {
         return Err(backend_error("backend receipt is unsupported or unsafe"));
     }
     Ok(Some(receipt))
+}
+
+fn receipt_digests_are_valid(receipt: &Receipt) -> bool {
+    [
+        &receipt.cli_archive_sha256,
+        &receipt.app_archive_sha256,
+        &receipt.cli_binary_sha256,
+        &receipt.app_binary_sha256,
+    ]
+    .into_iter()
+    .all(|digest| {
+        digest.len() == 64
+            && digest
+                .bytes()
+                .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+    })
 }
 
 fn write_receipt(path: &Path, receipt: &Receipt) -> Result<(), CliError> {

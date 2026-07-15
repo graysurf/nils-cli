@@ -519,5 +519,18 @@ exit 64
         assert!(!old_daemon.exists());
         assert!(!old_auto.exists());
         assert!(unrelated.exists());
+
+        let wrong_build = socket_dir.join("daemon-fedcba9876543210.sock");
+        fs::write(&wrong_build, b"fixture").expect("wrong-build socket fixture");
+        retire_obsolete_daemons_at(
+            &fake,
+            &socket_dir,
+            &[RuntimeContract::new(
+                "fedcba9876543210".into(),
+                "3.9.1 (3.9.1)".into(),
+            )],
+        )
+        .expect("preserve mismatched runtime");
+        assert!(wrong_build.exists());
     }
 }
