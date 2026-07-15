@@ -29,13 +29,17 @@ macos-agent capabilities --strict --format json
 Install downloads the official locked CLI and app assets into private,
 versioned user storage, validates archive paths/symlinks, archive SHA256 values,
 and locked extracted-executable SHA256 values, then checks version,
-architecture, app metadata, and exact code-signing identities. `--strict`
-always assesses CLI notarization and app Gatekeeper. The app assessment remains
-mandatory. Only the complete, machine-checked v3.9.3 standalone CLI tuple in
-the lock may continue after a failed notarization assessment; strict
-verification reports `notary=waived` and `security_posture=reduced`. There is no
-runtime bypass flag, and later releases require notarization unless a separately
-reviewed lock-schema change says otherwise. Lifecycle responses from install,
+architecture, app metadata, and exact code-signing identities. Download,
+archive, architecture, signature, and Gatekeeper commands use fixed macOS
+system paths rather than caller-controlled `PATH` lookup. App Gatekeeper/notary
+assessment is mandatory during both install and execution verification;
+`--strict` additionally assesses standalone CLI notarization. Only the complete,
+machine-checked v3.9.3 standalone CLI tuple in the lock may continue after a
+normally completed failed notarization assessment; timeout or signal termination
+fails closed. Strict verification reports `notary=waived` and
+`security_posture=reduced`. There is no runtime bypass flag, and later releases
+require notarization unless a separately reviewed lock-schema change says
+otherwise. Lifecycle responses from install,
 status, and rollback also expose `strict`, `cli_notarization_policy`, and
 `security_posture`; an accepted waiver is therefore never collapsed into an
 undifferentiated `verified=true` result. It atomically owns one stable app path.
@@ -168,8 +172,9 @@ macos-agent mcp --host mac-role --out-dir "$ssh_mcp_dir" --tool-profile interact
 
 The proxy keeps stdout JSON-RPC-clean, filters `tools/list`, rejects disallowed
 `tools/call` requests before forwarding, clears provider API keys, and journals
-only method/tool metadata. Request, response, and server-notification envelopes
-are validated before correlation. Bounded reader and writer queues plus write
+only bounded structural `mcp_method`/`mcp_tool` metadata. Request, response, and
+server-notification envelopes are validated before correlation. Bounded reader
+and writer queues plus write
 and response deadlines prevent a stalled upstream from consuming unbounded
 memory or holding a session indefinitely. SSH carries a bounded typed terminal
 status outside protocol stdout, preserving upstream exit class 70 while
@@ -208,7 +213,9 @@ and a caller-supplied current snapshot that matches it. Replay recomputes the
 command, policy, argument shape, and replay class from retained argv before
 execution. Unknown mutations, unguarded mutations, secrets, typed/clipboard
 values, policy blocks, tampered replay metadata, or changed backend digests are
-never replayed. See the
+never replayed. Journals received over SSH are also never locally replayable:
+the current interface cannot supply and re-verify a fresh explicit remote
+target, so both replay planning and execution refuse those steps. See the
 [`journal v2 spec`](docs/specs/macos-agent-journal-v2.md).
 
 ## Exit classes

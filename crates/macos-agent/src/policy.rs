@@ -183,7 +183,8 @@ pub fn mutating_invocation(argv: &[String]) -> bool {
     let informational = argv
         .iter()
         .skip(1)
-        .any(|value| matches!(value.as_str(), "--help" | "-h" | "--version" | "-V"));
+        .take_while(|value| value.as_str() != "--")
+        .any(|value| matches!(value.as_str(), "--help" | "-h"));
     !informational && exec_command(argv).as_deref().is_some_and(mutating_command)
 }
 
@@ -335,8 +336,34 @@ mod tests {
     fn help_and_version_invocations_are_informational_but_real_actions_still_mutate() {
         assert!(!mutating_invocation(&["click".into(), "--help".into()]));
         assert!(!mutating_invocation(&["type".into(), "-h".into()]));
-        assert!(!mutating_invocation(&["app".into(), "--version".into()]));
-        assert!(!mutating_invocation(&["window".into(), "-V".into()]));
+        assert!(!mutating_invocation(&[
+            "capture".into(),
+            "live".into(),
+            "--help".into()
+        ]));
+        assert!(!mutating_invocation(&[
+            "app".into(),
+            "launch".into(),
+            "--help".into()
+        ]));
+        assert!(!mutating_invocation(&[
+            "window".into(),
+            "move".into(),
+            "-h".into()
+        ]));
+        assert!(!mutating_invocation(&[
+            "click".into(),
+            "--on".into(),
+            "B1".into(),
+            "--help".into()
+        ]));
+        assert!(mutating_invocation(&[
+            "type".into(),
+            "--".into(),
+            "--help".into()
+        ]));
+        assert!(mutating_invocation(&["app".into(), "--version".into()]));
+        assert!(mutating_invocation(&["window".into(), "-V".into()]));
         assert!(mutating_invocation(&[
             "click".into(),
             "--on".into(),

@@ -30,11 +30,13 @@ Each step includes a monotonically increasing sequence, run-scoped correlation
 ID, optional parent, timestamp, sanitized intent and expected postcondition,
 command and argv shape, backend digest, runtime, transport, duration, retry
 count, status, normalized failure class, pre/postcondition references, optional
-snapshot lineage, replay class, and indexed artifact references.
+snapshot lineage, replay class, and indexed artifact references. MCP steps also
+retain bounded structural `mcp_method` and optional `mcp_tool` identifiers; raw
+protocol envelopes and payloads remain excluded.
 
 Statuses are `passed`, `failed`, `unknown`, and `policy_blocked`. A mutating
-timeout is always `unknown`; callers must inspect current state and may not
-blindly retry it.
+timeout or signal termination is always `unknown`; callers must inspect current
+state and may not blindly retry it.
 
 ## Evidence modes
 
@@ -80,7 +82,10 @@ class, and normal policy from retained argv, reruns backend/runtime checks under
 one shared backend lifecycle lease, and appends a child step. Stale snapshots,
 mismatched state, changed backends, tampered derived metadata, unguarded
 mutations, and missing fresh postconditions are refused. The fresh postcondition
-is suppressed on persistence like every other expected value.
+is suppressed on persistence like every other expected value. A journal whose
+manifest transport is not `local` is never eligible for local replay: the
+current interface cannot supply and re-verify a fresh explicit remote target,
+so both planning and execution fail closed.
 
 ## Review and ownership
 

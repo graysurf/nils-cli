@@ -61,17 +61,16 @@ pub fn run_local(
     let stderr = String::from_utf8_lossy(&output.stderr).to_string();
     let parsed = serde_json::from_str::<serde_json::Value>(stdout.trim()).ok();
     let malformed_json = !output.timed_out && output.exit_code == 0 && parsed.is_none();
-    let status = if output.timed_out {
+    let unknown_mutation = output.timed_out || output.signal.is_some();
+    let status = if unknown_mutation {
         StepStatus::Unknown
     } else if output.exit_code == 0 && !malformed_json {
         StepStatus::Passed
     } else {
         StepStatus::Failed
     };
-    let failure_class = if output.timed_out {
+    let failure_class = if unknown_mutation {
         Some("unknown_mutation".into())
-    } else if output.signal.is_some() {
-        Some("upstream_signal".into())
     } else if malformed_json {
         Some("upstream_malformed_json".into())
     } else if output.exit_code != 0 {

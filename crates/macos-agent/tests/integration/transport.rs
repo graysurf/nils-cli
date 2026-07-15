@@ -99,6 +99,52 @@ shift
             .unwrap_or(0),
         0
     );
+
+    let replay_plan = harness.run_with_options(
+        cwd.path(),
+        &[
+            "--format",
+            "json",
+            "journal",
+            "replay-plan",
+            "--out-dir",
+            out_dir.to_str().expect("out"),
+        ],
+        harness.cmd_options(cwd.path()).with_env(
+            "NILS_MACOS_AGENT_PEEKABOO_BIN",
+            fake_peekaboo.to_str().expect("peekaboo"),
+        ),
+    );
+    assert_eq!(replay_plan.code, 0, "{}", replay_plan.stderr_text());
+    assert_eq!(
+        replay_plan.stdout_json()["result"]["steps"][0]["eligible"],
+        false
+    );
+    assert!(
+        replay_plan.stdout_json()["result"]["steps"][0]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("remote"))
+    );
+
+    let replay = harness.run_with_options(
+        cwd.path(),
+        &[
+            "--error-format",
+            "json",
+            "journal",
+            "replay-step",
+            "--out-dir",
+            out_dir.to_str().expect("out"),
+            "--step",
+            "step-000001",
+        ],
+        harness.cmd_options(cwd.path()).with_env(
+            "NILS_MACOS_AGENT_PEEKABOO_BIN",
+            fake_peekaboo.to_str().expect("peekaboo"),
+        ),
+    );
+    assert_eq!(replay.code, 78, "{}", replay.stdout_text());
+    assert_eq!(replay.stderr_json()["error"]["class"], "policy");
 }
 
 #[test]
@@ -280,6 +326,44 @@ printf '%s\n' '{"success":true,"steps":[]}'
         "staged source was not removed"
     );
     assert_eq!(fs::read(&source).expect("source preserved"), source_body);
+}
+
+#[test]
+fn signaled_scenario_is_an_unknown_never_replayable_mutation() {
+    let harness = common::MacosAgentHarness::new();
+    let cwd = TempDir::new().expect("cwd");
+    let fake_peekaboo = cwd.path().join("peekaboo");
+    write_executable(&fake_peekaboo, "#!/bin/sh\nkill -TERM $$\n");
+    let source = cwd.path().join("signaled.peekaboo.json");
+    fs::write(&source, br#"{"steps":[{"command":"see"}]}"#).expect("scenario");
+    let out_dir = cwd.path().join("signaled-scenario-journal");
+    let out = harness.run_with_options(
+        cwd.path(),
+        &[
+            "--format",
+            "json",
+            "scenario",
+            "--out-dir",
+            out_dir.to_str().expect("out"),
+            "--file",
+            source.to_str().expect("source"),
+        ],
+        harness.cmd_options(cwd.path()).with_env(
+            "NILS_MACOS_AGENT_PEEKABOO_BIN",
+            fake_peekaboo.to_str().expect("fake"),
+        ),
+    );
+    assert_eq!(out.code, 70);
+    assert_eq!(out.stdout_json()["result"]["upstream"]["signal"], 15);
+    let step: serde_json::Value = serde_json::from_str(
+        fs::read_to_string(out_dir.join("steps.jsonl"))
+            .expect("journal")
+            .trim(),
+    )
+    .expect("step JSON");
+    assert_eq!(step["status"], "unknown");
+    assert_eq!(step["failure_class"], "unknown_mutation");
+    assert_eq!(step["replay_class"], "never");
 }
 
 #[test]

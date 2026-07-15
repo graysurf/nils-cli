@@ -56,13 +56,18 @@ impl RuntimeBinding {
 
     pub fn argv(&self, argv: &[String]) -> Vec<String> {
         let mut result = Vec::with_capacity(argv.len() + 2);
-        result.extend_from_slice(argv);
+        let separator = argv
+            .iter()
+            .position(|value| value == "--")
+            .unwrap_or(argv.len());
+        result.extend_from_slice(&argv[..separator]);
         if let Some(socket) = self.socket.as_ref() {
             result.push("--bridge-socket".into());
             result.push(socket.to_string_lossy().into_owned());
         } else {
             result.push("--no-remote".into());
         }
+        result.extend_from_slice(&argv[separator..]);
         result
     }
 }
@@ -420,6 +425,36 @@ mod tests {
             auto.iter()
                 .any(|value| value.ends_with("/Peekaboo/auto-0123456789abcdef.sock"))
         );
+    }
+
+    #[test]
+    fn runtime_selector_precedes_the_upstream_literal_separator() {
+        let command = vec!["type".into(), "--".into(), "--help".into()];
+        let app = RuntimeBinding::for_mode(RuntimeMode::App, "0123456789abcdef").argv(&command);
+        let process =
+            RuntimeBinding::for_mode(RuntimeMode::Process, "0123456789abcdef").argv(&command);
+
+        let app_separator = app
+            .iter()
+            .position(|value| value == "--")
+            .expect("separator");
+        let app_selector = app
+            .iter()
+            .position(|value| value == "--bridge-socket")
+            .expect("app selector");
+        assert!(app_selector < app_separator, "{app:?}");
+        assert_eq!(&app[app_separator..], ["--", "--help"]);
+
+        let process_separator = process
+            .iter()
+            .position(|value| value == "--")
+            .expect("separator");
+        let process_selector = process
+            .iter()
+            .position(|value| value == "--no-remote")
+            .expect("process selector");
+        assert!(process_selector < process_separator, "{process:?}");
+        assert_eq!(&process[process_separator..], ["--", "--help"]);
     }
 
     #[test]

@@ -94,14 +94,15 @@ pub fn run_local(
         CliError::upstream("failed to start the locked Peekaboo executable").with_operation("exec")
     })?;
     let mutating = policy::mutating_invocation(&args.argv);
-    let mut status = if output.timed_out && mutating {
+    let unknown_mutation = mutating && (output.timed_out || output.signal.is_some());
+    let mut status = if unknown_mutation {
         StepStatus::Unknown
     } else if output.timed_out || output.exit_code != 0 {
         StepStatus::Failed
     } else {
         StepStatus::Passed
     };
-    let mut failure_class = if output.timed_out && mutating {
+    let mut failure_class = if unknown_mutation {
         Some("unknown_mutation".into())
     } else if output.timed_out {
         Some("upstream_timeout".into())

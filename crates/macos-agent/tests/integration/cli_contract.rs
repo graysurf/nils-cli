@@ -290,6 +290,44 @@ fn signal_and_timeout_preserve_distinct_upstream_and_mutation_state() {
             .contains("upstream_signal")
     );
 
+    let mutation_signal_dir = cwd.path().join("mutation-signal-journal");
+    let mutation_signal = harness.run_with_options(
+        cwd.path(),
+        &[
+            "--format",
+            "json",
+            "exec",
+            "--out-dir",
+            mutation_signal_dir.to_str().expect("out"),
+            "--expected",
+            "fixture state changed",
+            "--",
+            "click",
+            "--id",
+            "B1",
+            "--snapshot",
+            "snapshot-1",
+        ],
+        harness.cmd_options(cwd.path()).with_env(
+            "NILS_MACOS_AGENT_PEEKABOO_BIN",
+            signaled.to_str().expect("signal fixture"),
+        ),
+    );
+    assert_eq!(mutation_signal.code, 70);
+    assert_eq!(
+        mutation_signal.stdout_json()["result"]["upstream"]["signal"],
+        15
+    );
+    let mutation_signal_step: serde_json::Value = serde_json::from_str(
+        fs::read_to_string(mutation_signal_dir.join("steps.jsonl"))
+            .expect("mutation signal journal")
+            .trim(),
+    )
+    .expect("step JSON");
+    assert_eq!(mutation_signal_step["status"], "unknown");
+    assert_eq!(mutation_signal_step["failure_class"], "unknown_mutation");
+    assert_eq!(mutation_signal_step["replay_class"], "never");
+
     let sleeping = cwd.path().join("peekaboo-timeout");
     write_executable(&sleeping, "#!/bin/sh\nsleep 3\n");
     let read_dir = cwd.path().join("read-timeout-journal");

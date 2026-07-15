@@ -85,6 +85,20 @@ done
     let journal = fs::read_to_string(out_dir.join("steps.jsonl")).expect("journal");
     assert!(journal.contains("policy_blocked"));
     assert_eq!(journal.lines().count(), 6);
+    let steps = journal
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("journal JSON"))
+        .collect::<Vec<_>>();
+    assert!(
+        steps
+            .iter()
+            .any(|step| { step["mcp_method"] == "tools/list" && step.get("mcp_tool").is_none() })
+    );
+    assert!(
+        steps
+            .iter()
+            .any(|step| { step["mcp_method"] == "tools/call" && step["mcp_tool"] == "shell" })
+    );
     assert!(!journal.contains("seed-mcp-secret"));
     assert!(!journal.contains("seed-cancel-secret"));
     assert!(!journal.contains("seed-provider-key"));

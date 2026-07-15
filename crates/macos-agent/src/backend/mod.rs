@@ -32,15 +32,17 @@ struct LifecycleLock(fs::File);
 
 impl LifecycleLock {
     fn acquire(root: &Path, mode: LifecycleLockMode) -> Result<Self, CliError> {
+        reject_symlink_components(root)?;
         let path = root.join(LIFECYCLE_LOCK_FILE);
         let file = OpenOptions::new()
             .create(true)
             .read(true)
             .write(true)
             .mode(SECRET_FILE_MODE)
+            .custom_flags(libc::O_NOFOLLOW)
             .open(&path)
             .map_err(|_| backend_error("failed to open the backend lifecycle lock"))?;
-        fs::set_permissions(&path, fs::Permissions::from_mode(SECRET_FILE_MODE))
+        file.set_permissions(fs::Permissions::from_mode(SECRET_FILE_MODE))
             .map_err(|_| backend_error("failed to secure the backend lifecycle lock"))?;
         let operation = match mode {
             LifecycleLockMode::Shared => libc::LOCK_SH,
@@ -1291,7 +1293,7 @@ fn download_asset(asset: &AssetLock, downloads: &Path) -> Result<PathBuf, CliErr
         asset.url.clone(),
     ];
     let output = process::run(
-        Path::new("curl"),
+        &backend_tool("curl")?,
         &args,
         &[],
         &[],
@@ -1327,15 +1329,15 @@ enum ArchiveKind {
 fn validate_archive_listing(path: &Path, kind: ArchiveKind) -> Result<(), CliError> {
     let (program, args) = match kind {
         ArchiveKind::TarGz => (
-            Path::new("tar"),
+            backend_tool("tar")?,
             vec!["-tzf".into(), path.to_string_lossy().into_owned()],
         ),
         ArchiveKind::Zip => (
-            Path::new("unzip"),
+            backend_tool("unzip")?,
             vec!["-Z1".into(), path.to_string_lossy().into_owned()],
         ),
     };
-    let output = process::run(program, &args, &[], &[], None, Duration::from_secs(30))
+    let output = process::run(&program, &args, &[], &[], None, Duration::from_secs(30))
         .map_err(|_| backend_error("failed to inspect a locked archive"))?;
     if output.exit_code != 0 || output.timed_out || output.stdout_truncated {
         return Err(backend_error(
@@ -1375,7 +1377,7 @@ fn validate_archive_path(raw: &str) -> Result<(), CliError> {
 fn extract_archive(path: &Path, destination: &Path, kind: ArchiveKind) -> Result<(), CliError> {
     let (program, args) = match kind {
         ArchiveKind::TarGz => (
-            Path::new("tar"),
+            backend_tool("tar")?,
             vec![
                 "-xzf".into(),
                 path.to_string_lossy().into_owned(),
@@ -1384,7 +1386,7 @@ fn extract_archive(path: &Path, destination: &Path, kind: ArchiveKind) -> Result
             ],
         ),
         ArchiveKind::Zip => (
-            Path::new("unzip"),
+            backend_tool("unzip")?,
             vec![
                 "-q".into(),
                 path.to_string_lossy().into_owned(),
@@ -1393,7 +1395,7 @@ fn extract_archive(path: &Path, destination: &Path, kind: ArchiveKind) -> Result
             ],
         ),
     };
-    let output = process::run(program, &args, &[], &[], None, Duration::from_secs(120))
+    let output = process::run(&program, &args, &[], &[], None, Duration::from_secs(120))
         .map_err(|_| backend_error("failed to start archive extraction"))?;
     if output.exit_code != 0 || output.timed_out {
         return Err(backend_error("locked archive extraction failed"));
@@ -1468,11 +1470,20 @@ fn verify_architectures(binary: &Path, expected: &[String]) -> Result<(), CliErr
         Path::new("lipo"),
         &args.iter().map(String::as_str).collect::<Vec<_>>(),
     )?;
-    let actual = String::from_utf8_lossy(&output.stdout);
+    let actual = String::from_utf8_lossy(&output.stdout)
+        .split_whitespace()
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    let actual_set = actual.iter().cloned().collect::<BTreeSet<_>>();
+    let expected_set = expected.iter().cloned().collect::<BTreeSet<_>>();
     if output.exit_code != 0
-        || expected
-            .iter()
-            .any(|arch| !actual.split_whitespace().any(|row| row == arch))
+        || output.timed_out
+        || output.stdout_truncated
+        || actual.is_empty()
+        || actual_set.len() != actual.len()
+        || expected_set.is_empty()
+        || expected_set.len() != expected.len()
+        || actual_set != expected_set
     {
         return Err(backend_error(
             "Peekaboo executable architecture does not match the lock",
@@ -1542,7 +1553,7 @@ fn verify_signature(
     path: &Path,
     asset: &AssetLock,
     app: bool,
-    require_assessment: bool,
+    require_cli_assessment: bool,
 ) -> Result<NotarizationAssessment, CliError> {
     let path_text = path.to_string_lossy().into_owned();
     let mut verify_args = vec!["--verify", "--deep", "--strict", "--verbose=2"];
@@ -1566,7 +1577,7 @@ fn verify_signature(
             "Peekaboo signing identity does not match the lock",
         ));
     }
-    if app && require_assessment {
+    if app {
         let assessment = run_tool(Path::new("spctl"), &["-a", "-vv", &path_text])?;
         let assessment_text = format!(
             "{}{}",
@@ -1582,7 +1593,7 @@ fn verify_signature(
             ));
         }
         return Ok(NotarizationAssessment::Passed);
-    } else if !app && require_assessment {
+    } else if require_cli_assessment {
         let assessment = run_tool(
             Path::new("codesign"),
             &["-vvvv", "-R=notarized", "--check-notarization", &path_text],
@@ -1591,6 +1602,7 @@ fn verify_signature(
             asset.notarization.policy,
             assessment.exit_code,
             assessment.timed_out,
+            assessment.signal,
         );
     }
     Ok(NotarizationAssessment::NotAssessed)
@@ -1600,10 +1612,16 @@ fn classify_cli_notarization_assessment(
     policy: NotarizationPolicy,
     exit_code: i32,
     timed_out: bool,
+    signal: Option<i32>,
 ) -> Result<NotarizationAssessment, CliError> {
     if timed_out {
         return Err(backend_error(
             "Peekaboo CLI notarization assessment timed out",
+        ));
+    }
+    if signal.is_some() {
+        return Err(backend_error(
+            "Peekaboo CLI notarization assessment terminated by signal",
         ));
     }
     if exit_code == 0 {
@@ -1618,14 +1636,42 @@ fn classify_cli_notarization_assessment(
 }
 
 fn run_tool(program: &Path, args: &[&str]) -> Result<process::ProcessOutput, CliError> {
-    let program =
-        test_mode::verification_tool_override(program).unwrap_or_else(|| program.to_path_buf());
+    let program = if program.components().count() == 1 {
+        let name = program
+            .to_str()
+            .ok_or_else(|| backend_error("required backend tool name is invalid"))?;
+        backend_tool(name)?
+    } else {
+        program.to_path_buf()
+    };
     let args = args
         .iter()
         .map(|arg| (*arg).to_string())
         .collect::<Vec<_>>();
     process::run(&program, &args, &[], &[], None, Duration::from_secs(30))
         .map_err(|_| backend_error("required backend verification tool is unavailable"))
+}
+
+fn backend_tool(name: &str) -> Result<PathBuf, CliError> {
+    let logical = Path::new(name);
+    if let Some(path) = test_mode::verification_tool_override(logical) {
+        return Ok(path);
+    }
+    production_tool_path(name)
+        .map(Path::to_path_buf)
+        .ok_or_else(|| backend_error("required backend tool is not allowlisted"))
+}
+
+fn production_tool_path(name: &str) -> Option<&'static Path> {
+    match name {
+        "curl" => Some(Path::new("/usr/bin/curl")),
+        "tar" => Some(Path::new("/usr/bin/tar")),
+        "unzip" => Some(Path::new("/usr/bin/unzip")),
+        "lipo" => Some(Path::new("/usr/bin/lipo")),
+        "codesign" => Some(Path::new("/usr/bin/codesign")),
+        "spctl" => Some(Path::new("/usr/sbin/spctl")),
+        _ => None,
+    }
 }
 
 fn copy_tree(source: &Path, destination: &Path) -> Result<(), CliError> {
@@ -1673,10 +1719,34 @@ fn copy_file(source: &Path, destination: &Path, mode: u32) -> Result<(), CliErro
 }
 
 fn create_private_dir(path: &Path) -> Result<(), CliError> {
+    reject_symlink_components(path)?;
     fs::create_dir_all(path)
         .map_err(|_| backend_error("failed to create private backend storage"))?;
+    reject_symlink_components(path)?;
     fs::set_permissions(path, fs::Permissions::from_mode(0o700))
         .map_err(|_| backend_error("failed to secure private backend storage"))?;
+    Ok(())
+}
+
+fn reject_symlink_components(path: &Path) -> Result<(), CliError> {
+    let mut current = PathBuf::new();
+    for component in path.components() {
+        current.push(component.as_os_str());
+        match fs::symlink_metadata(&current) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(backend_error(
+                    "private backend storage path contains a symlink",
+                ));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => break,
+            Err(_) => {
+                return Err(backend_error(
+                    "failed to inspect private backend storage path",
+                ));
+            }
+        }
+    }
     Ok(())
 }
 
@@ -1790,6 +1860,7 @@ fn backend_error(message: impl Into<String>) -> CliError {
 mod tests {
     use std::fs;
     use std::os::unix::fs::symlink;
+    use std::path::Path;
     use std::sync::mpsc;
     use std::thread;
     use std::time::Duration;
@@ -1797,25 +1868,47 @@ mod tests {
     use tempfile::TempDir;
 
     use super::{
-        LifecycleLock, LifecycleLockMode, NotarizationAssessment, RECEIPT_SCHEMA, Receipt,
-        app_contract_for_receipt, classify_cli_notarization_assessment, macos_version_supported,
-        obsolete_runtime_contracts, safe_tag, validate_archive_path, validate_symlink_tree,
+        LIFECYCLE_LOCK_FILE, LifecycleLock, LifecycleLockMode, NotarizationAssessment,
+        RECEIPT_SCHEMA, Receipt, app_contract_for_receipt, classify_cli_notarization_assessment,
+        create_private_dir, macos_version_supported, obsolete_runtime_contracts,
+        production_tool_path, safe_tag, validate_archive_path, validate_symlink_tree,
     };
     use crate::lock::{NotarizationPolicy, PeekabooLock};
 
     #[test]
     fn completed_cli_notary_rejection_is_waived_but_timeout_fails_closed() {
         assert_eq!(
-            classify_cli_notarization_assessment(NotarizationPolicy::Waived, 1, false)
+            classify_cli_notarization_assessment(NotarizationPolicy::Waived, 1, false, None)
                 .expect("completed rejection is the approved exception"),
             NotarizationAssessment::Waived
         );
-        let timeout = classify_cli_notarization_assessment(NotarizationPolicy::Waived, 1, true)
-            .expect_err("an inconclusive timeout must fail closed");
+        let timeout =
+            classify_cli_notarization_assessment(NotarizationPolicy::Waived, 1, true, None)
+                .expect_err("an inconclusive timeout must fail closed");
         assert!(timeout.to_string().contains("timed out"));
         assert!(
-            classify_cli_notarization_assessment(NotarizationPolicy::Required, 1, false).is_err()
+            classify_cli_notarization_assessment(NotarizationPolicy::Required, 1, false, None)
+                .is_err()
         );
+        let signal =
+            classify_cli_notarization_assessment(NotarizationPolicy::Waived, 1, false, Some(9))
+                .expect_err("a signaled assessment is inconclusive and must fail closed");
+        assert!(signal.to_string().contains("terminated by signal"));
+    }
+
+    #[test]
+    fn production_verification_tools_use_fixed_system_paths() {
+        for (tool, expected) in [
+            ("curl", "/usr/bin/curl"),
+            ("tar", "/usr/bin/tar"),
+            ("unzip", "/usr/bin/unzip"),
+            ("lipo", "/usr/bin/lipo"),
+            ("codesign", "/usr/bin/codesign"),
+            ("spctl", "/usr/sbin/spctl"),
+        ] {
+            assert_eq!(production_tool_path(tool), Some(Path::new(expected)));
+        }
+        assert_eq!(production_tool_path("unknown"), None);
     }
 
     #[test]
@@ -1835,6 +1928,28 @@ mod tests {
 
         symlink("/etc/passwd", root.path().join("escape")).expect("escaping link");
         assert!(validate_symlink_tree(root.path()).is_err());
+    }
+
+    #[test]
+    fn private_backend_storage_and_lifecycle_lock_reject_symlinks() {
+        let root = TempDir::new().expect("root");
+        let outside = TempDir::new().expect("outside");
+        let linked_root = root.path().join("backend");
+        symlink(outside.path(), &linked_root).expect("backend root symlink");
+        assert!(
+            create_private_dir(&linked_root.join("versions")).is_err(),
+            "private backend storage followed a symlinked ancestor"
+        );
+
+        let lock_root = root.path().join("lock-root");
+        fs::create_dir(&lock_root).expect("lock root");
+        let victim = outside.path().join("victim");
+        fs::write(&victim, "do not open through a lock symlink").expect("victim");
+        symlink(&victim, lock_root.join(LIFECYCLE_LOCK_FILE)).expect("lock symlink");
+        assert!(
+            LifecycleLock::acquire(&lock_root, LifecycleLockMode::Shared).is_err(),
+            "lifecycle lock followed a symlink"
+        );
     }
 
     #[test]

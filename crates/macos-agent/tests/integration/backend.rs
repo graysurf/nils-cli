@@ -1075,6 +1075,61 @@ fn malformed_archives_metadata_and_escaping_symlinks_fail_before_activation() {
 }
 
 #[test]
+fn app_gatekeeper_is_mandatory_for_non_strict_install_and_execution() {
+    let harness = common::MacosAgentHarness::new();
+    let cwd = TempDir::new().expect("cwd");
+    let candidate = candidate(cwd.path(), "v3.9.3", '3');
+
+    for failure in ["gatekeeper", "gatekeeper_source"] {
+        let backend_root = cwd.path().join(format!("install-{failure}"));
+        let out = run_backend_with_failure(
+            &harness,
+            cwd.path(),
+            &backend_root,
+            &candidate,
+            &["--error-format", "json", "backend", "install"],
+            failure,
+        );
+        assert_eq!(out.code, 69, "{failure}: {}", out.stderr_text());
+        assert_eq!(out.stderr_json()["error"]["class"], "backend");
+        assert!(!backend_root.join("receipts/current.json").exists());
+    }
+
+    let backend_root = cwd.path().join("runtime");
+    let install = run_backend(
+        &harness,
+        cwd.path(),
+        &backend_root,
+        &candidate,
+        &["--format", "json", "backend", "install"],
+    );
+    assert_eq!(install.code, 0, "{}", install.stderr_text());
+    for failure in ["gatekeeper", "gatekeeper_source"] {
+        let journal = cwd.path().join(format!("runtime-{failure}-journal"));
+        let out = run_backend_with_failure(
+            &harness,
+            cwd.path(),
+            &backend_root,
+            &candidate,
+            &[
+                "--error-format",
+                "json",
+                "exec",
+                "--out-dir",
+                journal.to_str().expect("journal"),
+                "--",
+                "sleep",
+                "1",
+                "--json",
+            ],
+            failure,
+        );
+        assert_eq!(out.code, 69, "{failure}: {}", out.stderr_text());
+        assert_eq!(out.stderr_json()["error"]["class"], "backend");
+    }
+}
+
+#[test]
 fn strict_architecture_signature_notary_and_gatekeeper_checks_are_independently_enforced() {
     let harness = common::MacosAgentHarness::new();
     let cwd = TempDir::new().expect("cwd");
@@ -1100,6 +1155,7 @@ fn strict_architecture_signature_notary_and_gatekeeper_checks_are_independently_
 
     for failure in [
         "architecture",
+        "architecture_extra",
         "signature",
         "notary",
         "gatekeeper",
@@ -1136,7 +1192,16 @@ fn candidate(root: &Path, tag: &str, commit_char: char) -> Candidate {
     fs::create_dir_all(&tools).expect("tools");
     write_executable(
         &tools.join("lipo"),
-        "#!/bin/sh\n[ \"${NILS_MACOS_AGENT_TEST_VERIFY_FAIL:-}\" = architecture ] && exit 1\nprintf '%s\\n' 'arm64 x86_64'\n",
+        r#"#!/bin/sh
+[ "${NILS_MACOS_AGENT_TEST_VERIFY_FAIL:-}" = architecture ] && exit 1
+if [ "${NILS_MACOS_AGENT_TEST_VERIFY_FAIL:-}" = architecture_extra ]; then
+  printf '%s\n' 'arm64 x86_64 i386'
+elif printf '%s' "$*" | grep -q 'Peekaboo.app/Contents/MacOS/Peekaboo'; then
+  printf '%s\n' 'arm64'
+else
+  printf '%s\n' 'arm64 x86_64'
+fi
+"#,
     );
     write_executable(
         &tools.join("codesign"),

@@ -76,6 +76,10 @@ pub struct StepRecord {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub expected: Option<String>,
     pub command: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mcp_method: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mcp_tool: Option<String>,
     pub argv_shape: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub replay_argv: Option<Vec<String>>,
@@ -375,6 +379,14 @@ impl Journal {
             &input.argv,
             input.snapshot_lineage.as_deref(),
         );
+        let mcp_method = (command == "mcp")
+            .then(|| input.argv.get(1))
+            .flatten()
+            .and_then(|value| safe_protocol_metadata(value));
+        let mcp_tool = (command == "mcp")
+            .then(|| input.argv.get(2))
+            .flatten()
+            .and_then(|value| safe_protocol_metadata(value));
         let (argv_shape, replay_argv) =
             sanitize_argv(&input.argv, self.manifest.evidence_mode, replay_class);
         let step = StepRecord {
@@ -390,6 +402,8 @@ impl Journal {
                 .map(|value| sanitize_text(value, self.manifest.evidence_mode)),
             expected: input.expected.as_deref().map(suppressed),
             command,
+            mcp_method,
+            mcp_tool,
             argv_shape,
             replay_argv,
             backend_digest: self.manifest.backend_digest.clone(),
@@ -550,12 +564,21 @@ pub fn record_system_failure(root: &Path, class: &str) -> Result<(), CliError> {
 
 pub fn replay_plan(root: &Path, selected: Option<&str>) -> Result<ReplayPlan, CliError> {
     let _lock = JournalLock::acquire(root)?;
+    let manifest: Manifest = read_json(&root.join("manifest.json"))?;
     let (steps, _) = read_steps_recover(root)?;
     let rows = steps
         .into_iter()
         .filter(|step| selected.is_none_or(|selected| selected == step.id))
         .map(|step| {
-            let (eligible, reason) = replay_eligibility(&step, false, None, None);
+            let (eligible, reason) = if manifest.transport == "local" {
+                replay_eligibility(&step, false, None, None)
+            } else {
+                (
+                    false,
+                    "remote journal replay requires a fresh explicit remote target and is not supported"
+                        .into(),
+                )
+            };
             ReplayPlanRow {
                 id: step.id,
                 replay_class: step.replay_class,
@@ -581,6 +604,12 @@ pub fn prepare_replay(
 ) -> Result<ReplayRequest, CliError> {
     let _lock = JournalLock::acquire(root)?;
     let manifest: Manifest = read_json(&root.join("manifest.json"))?;
+    if manifest.transport != "local" {
+        return Err(CliError::policy(
+            "remote journal replay requires a fresh explicit remote target and is not supported",
+        )
+        .with_operation("journal.replay-step"));
+    }
     let lock = PeekabooLock::embedded()?;
     if manifest.backend_digest != effective_backend_digest(&lock, false)? {
         return Err(CliError::policy("journal backend digest is stale")
@@ -814,6 +843,15 @@ fn sensitive_flag(value: &str) -> bool {
 
 fn normalize_command(value: &str) -> String {
     value.trim().to_ascii_lowercase().replace('-', "_")
+}
+
+fn safe_protocol_metadata(value: &str) -> Option<String> {
+    (!value.is_empty()
+        && value.len() <= 128
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'_' | b'-' | b'.')))
+    .then(|| value.to_string())
 }
 
 fn sanitize_text(value: &str, mode: EvidenceMode) -> String {
