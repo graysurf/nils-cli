@@ -8,6 +8,11 @@ use crate::error::CliError;
 use crate::test_mode;
 
 const EMBEDDED_LOCK: &str = include_str!("../peekaboo-lock.json");
+const CLI_NOTARIZATION_WAIVER_TAG: &str = "v3.9.3";
+const CLI_NOTARIZATION_WAIVER_COMMIT: &str = "3cfd612adbcb1b43e8431a7a1f3b02ec45d01269";
+const CLI_NOTARIZATION_WAIVER_APPROVAL: &str =
+    "https://github.com/graysurf/agent-runtime-kit/issues/610#issuecomment-4984437753";
+const CLI_NOTARIZATION_WAIVER_APPROVED_AT: &str = "2026-07-15";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PeekabooLock {
@@ -54,6 +59,35 @@ pub struct AssetLock {
     pub bundle_id: Option<String>,
     pub signing_authority: String,
     pub team_id: String,
+    pub notarization: NotarizationLock,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NotarizationLock {
+    pub policy: NotarizationPolicy,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub waiver: Option<NotarizationWaiver>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum NotarizationPolicy {
+    Required,
+    Waived,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NotarizationWaiver {
+    pub repository: String,
+    pub tag: String,
+    pub commit: String,
+    pub archive_sha256: String,
+    pub executable_sha256: String,
+    pub signing_authority: String,
+    pub team_id: String,
+    pub approved_at: String,
+    pub approval: String,
+    pub reason: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -108,7 +142,7 @@ impl PeekabooLock {
     }
 
     fn validate(&self) -> Result<(), CliError> {
-        if self.schema_version != 1 {
+        if self.schema_version != 2 {
             return Err(lock_error("unsupported lock schema version"));
         }
         if self.repository != "https://github.com/openclaw/Peekaboo" {
@@ -139,7 +173,7 @@ impl PeekabooLock {
                 "lock must contain exactly one CLI and one app asset",
             ));
         }
-        validate_assets(&self.assets, &self.tag)?;
+        validate_assets(&self.assets, &self.repository, &self.tag, &self.commit)?;
         if self.required_capability_probes.is_empty()
             || self
                 .required_capability_probes
@@ -174,7 +208,12 @@ impl PeekabooLock {
                     "rollback release identity is malformed or duplicated",
                 ));
             }
-            validate_assets(&release.assets, &release.tag)?;
+            validate_assets(
+                &release.assets,
+                &self.repository,
+                &release.tag,
+                &release.commit,
+            )?;
         }
         Ok(())
     }
@@ -196,7 +235,12 @@ impl RollbackReleaseLock {
     }
 }
 
-fn validate_assets(assets: &[AssetLock], tag: &str) -> Result<(), CliError> {
+fn validate_assets(
+    assets: &[AssetLock],
+    repository: &str,
+    tag: &str,
+    commit: &str,
+) -> Result<(), CliError> {
     let kinds = assets
         .iter()
         .map(|asset| asset.kind.as_str())
@@ -224,8 +268,46 @@ fn validate_assets(assets: &[AssetLock], tag: &str) -> Result<(), CliError> {
         {
             return Err(lock_error(format!("asset `{}` is malformed", asset.kind)));
         }
+        validate_notarization(asset, repository, tag, commit)?;
     }
     Ok(())
+}
+
+fn validate_notarization(
+    asset: &AssetLock,
+    repository: &str,
+    tag: &str,
+    commit: &str,
+) -> Result<(), CliError> {
+    match (asset.notarization.policy, &asset.notarization.waiver) {
+        (NotarizationPolicy::Required, None) => Ok(()),
+        (NotarizationPolicy::Required, Some(_)) => Err(lock_error(format!(
+            "asset `{}` has a notarization waiver while notarization is required",
+            asset.kind
+        ))),
+        (NotarizationPolicy::Waived, Some(waiver))
+            if asset.kind == "cli"
+                && repository == "https://github.com/openclaw/Peekaboo"
+                && tag == CLI_NOTARIZATION_WAIVER_TAG
+                && commit == CLI_NOTARIZATION_WAIVER_COMMIT
+                && waiver.repository == repository
+                && waiver.tag == tag
+                && waiver.commit == commit
+                && waiver.archive_sha256 == asset.sha256
+                && waiver.executable_sha256 == asset.executable_sha256
+                && waiver.signing_authority == asset.signing_authority
+                && waiver.team_id == asset.team_id
+                && waiver.approved_at == CLI_NOTARIZATION_WAIVER_APPROVED_AT
+                && waiver.approval == CLI_NOTARIZATION_WAIVER_APPROVAL
+                && !waiver.reason.trim().is_empty() =>
+        {
+            Ok(())
+        }
+        (NotarizationPolicy::Waived, _) => Err(lock_error(format!(
+            "asset `{}` has an invalid notarization waiver",
+            asset.kind
+        ))),
+    }
 }
 
 pub(crate) fn bridge_build_number<'a>(value: &'a str, tag: &str) -> Option<&'a str> {
@@ -270,7 +352,7 @@ fn lock_error(message: impl Into<String>) -> CliError {
 
 #[cfg(test)]
 mod tests {
-    use super::PeekabooLock;
+    use super::{NotarizationPolicy, PeekabooLock};
 
     #[test]
     fn embedded_lock_is_complete_and_immutable() {
@@ -279,11 +361,35 @@ mod tests {
         assert_eq!(lock.assets.len(), 2);
         assert_eq!(lock.cli_asset().architectures, ["arm64", "x86_64"]);
         assert_eq!(lock.cli_asset().bridge_build, "3.9.3 (3.9.3)");
+        assert_eq!(
+            lock.cli_asset().notarization.policy,
+            NotarizationPolicy::Waived
+        );
+        assert_eq!(
+            lock.app_asset().notarization.policy,
+            NotarizationPolicy::Required
+        );
         assert_eq!(lock.app_asset().bridge_build, "3.9.3 (3090399)");
         assert_eq!(
             lock.app_asset().bundle_id.as_deref(),
             Some("boo.peekaboo.mac")
         );
+    }
+
+    #[test]
+    fn exact_cli_notarization_waiver_is_fail_closed() {
+        let mut mismatched = PeekabooLock::embedded().expect("embedded lock");
+        mismatched.assets[0]
+            .notarization
+            .waiver
+            .as_mut()
+            .expect("CLI waiver")
+            .executable_sha256 = "0".repeat(64);
+        assert!(mismatched.validate().is_err());
+
+        let mut app_waiver = PeekabooLock::embedded().expect("embedded lock");
+        app_waiver.assets[1].notarization = app_waiver.assets[0].notarization.clone();
+        assert!(app_waiver.validate().is_err());
     }
 
     #[test]

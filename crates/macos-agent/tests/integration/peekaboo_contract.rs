@@ -64,12 +64,18 @@ fn repository_contains_a_complete_immutable_peekaboo_lock() {
         .unwrap_or_else(|err| panic!("required Peekaboo lock is missing: {err}"));
     let lock: serde_json::Value = serde_json::from_str(&raw).expect("lock must be valid JSON");
 
-    assert_eq!(lock["schema_version"], 1);
+    assert_eq!(lock["schema_version"], 2);
     assert_eq!(lock["repository"], "https://github.com/openclaw/Peekaboo");
     assert_eq!(lock["tag"], "v3.9.3");
     assert_eq!(lock["commit"], "3cfd612adbcb1b43e8431a7a1f3b02ec45d01269");
     assert_eq!(lock["minimum_macos"], "15.0");
     assert_eq!(lock["assets"].as_array().map(Vec::len), Some(2));
+    assert_eq!(lock["assets"][0]["notarization"]["policy"], "waived");
+    assert_eq!(
+        lock["assets"][0]["notarization"]["waiver"]["approval"],
+        "https://github.com/graysurf/agent-runtime-kit/issues/610#issuecomment-4984437753"
+    );
+    assert_eq!(lock["assets"][1]["notarization"]["policy"], "required");
     assert!(
         lock["required_capability_probes"]
             .as_array()

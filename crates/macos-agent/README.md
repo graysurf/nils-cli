@@ -30,8 +30,13 @@ Install downloads the official locked CLI and app assets into private,
 versioned user storage, validates archive paths/symlinks, archive SHA256 values,
 and locked extracted-executable SHA256 values, then checks version,
 architecture, app metadata, and exact code-signing identities. `--strict`
-additionally requires the locked CLI notarization and app Gatekeeper
-assessments. It atomically owns one stable app path. Rollback is permitted only
+always assesses CLI notarization and app Gatekeeper. The app assessment remains
+mandatory. Only the complete, machine-checked v3.9.3 standalone CLI tuple in
+the lock may continue after a failed notarization assessment; strict
+verification reports `notary=waived` and `security_posture=reduced`. There is no
+runtime bypass flag, and later releases require notarization unless a separately
+reviewed lock-schema change says otherwise. It atomically owns one stable app
+path. Rollback is permitted only
 when the exact prior tag, commit, assets, and executable digests are retained in
 the embedded `rollback_releases` allowlist; mutable receipts are never a trust
 root. A shared verified-backend lease, including the digest recorded in the

@@ -10,7 +10,9 @@ use nils_common::fs::{SECRET_FILE_MODE, sha256_file, write_atomic};
 use serde::{Deserialize, Serialize};
 
 use crate::error::CliError;
-use crate::lock::{AssetLock, PeekabooLock, RollbackReleaseLock, bridge_build_number};
+use crate::lock::{
+    AssetLock, NotarizationPolicy, PeekabooLock, RollbackReleaseLock, bridge_build_number,
+};
 use crate::process;
 use crate::test_mode;
 
@@ -167,6 +169,7 @@ pub struct VerificationReport {
     pub active_tag: String,
     pub rollback_active: bool,
     pub strict: bool,
+    pub security_posture: &'static str,
     pub ready: bool,
     pub checks: Vec<CheckResult>,
 }
@@ -188,6 +191,13 @@ pub struct CheckResult {
     pub id: String,
     pub status: &'static str,
     pub message: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NotarizationAssessment {
+    NotAssessed,
+    Passed,
+    Waived,
 }
 
 #[derive(Debug, Clone)]
@@ -581,15 +591,16 @@ fn verify_unlocked(
     let receipt = read_receipt(&paths.current_receipt())?
         .ok_or_else(|| backend_error("the locked Peekaboo backend is not installed"))?;
     let rollback_active = receipt.tag != lock.tag || receipt.commit != lock.commit;
-    if rollback_active {
-        verify_receipt_any_version(paths, lock, &receipt, strict)?;
+    let cli_notarization = if rollback_active {
+        verify_receipt_any_version(paths, lock, &receipt, strict)?
     } else {
-        verify_receipt(paths, lock, &receipt, strict)?;
-    }
+        verify_receipt(paths, lock, &receipt, strict)?
+    };
     if !stable_app_matches(paths, &receipt)? {
         return Err(backend_error("the stable app identity has drifted"));
     }
-    let (active_app_asset, minimum_macos) = app_contract_for_receipt(lock, &receipt)?;
+    let (active_cli_asset, active_app_asset, minimum_macos) =
+        release_contract_for_receipt(lock, &receipt)?;
     verify_signature(&paths.stable_app, active_app_asset, true, strict)?;
     verify_app_metadata(
         &paths.stable_app,
@@ -625,7 +636,21 @@ fn verify_unlocked(
                 "codesign",
                 "CLI and app signatures match exact locked identities",
             ),
-            passed("notary", "CLI passes Apple's notarization requirement"),
+            match cli_notarization {
+                NotarizationAssessment::Passed => {
+                    passed("notary", "CLI passes Apple's notarization requirement")
+                }
+                NotarizationAssessment::Waived => CheckResult {
+                    id: "notary".into(),
+                    status: "waived",
+                    message: "exact Peekaboo v3.9.3 standalone CLI notarization is waived by graysurf/agent-runtime-kit#610; every other trust gate remains enforced".into(),
+                },
+                NotarizationAssessment::NotAssessed => {
+                    return Err(backend_error(
+                        "strict verification did not assess CLI notarization",
+                    ));
+                }
+            },
             passed(
                 "gatekeeper",
                 "app passes Gatekeeper as a notarized Developer ID release",
@@ -637,6 +662,10 @@ fn verify_unlocked(
         active_tag: receipt.tag,
         rollback_active,
         strict,
+        security_posture: match active_cli_asset.notarization.policy {
+            NotarizationPolicy::Required => "full",
+            NotarizationPolicy::Waived => "reduced",
+        },
         ready: true,
         checks,
     })
@@ -919,7 +948,7 @@ fn verify_receipt(
     lock: &PeekabooLock,
     receipt: &Receipt,
     strict: bool,
-) -> Result<(), CliError> {
+) -> Result<NotarizationAssessment, CliError> {
     if receipt.schema_version != RECEIPT_SCHEMA
         || receipt.tag != lock.tag
         || receipt.commit != lock.commit
@@ -951,7 +980,7 @@ fn verify_receipt(
             &lock.app_asset().architectures,
         )?;
     }
-    verify_signature(
+    let cli_notarization = verify_signature(
         &paths.cli_for(&receipt.tag),
         lock.cli_asset(),
         false,
@@ -964,7 +993,7 @@ fn verify_receipt(
         &receipt.tag,
         &lock.minimum_macos,
     )?;
-    Ok(())
+    Ok(cli_notarization)
 }
 
 fn verify_receipt_any_version(
@@ -972,7 +1001,7 @@ fn verify_receipt_any_version(
     lock: &PeekabooLock,
     receipt: &Receipt,
     strict: bool,
-) -> Result<(), CliError> {
+) -> Result<NotarizationAssessment, CliError> {
     if receipt.schema_version != RECEIPT_SCHEMA || !safe_tag(&receipt.tag) {
         return Err(backend_error("previous receipt is malformed"));
     }
@@ -999,7 +1028,7 @@ fn verify_receipt_any_version(
             &release.app_asset().architectures,
         )?;
     }
-    verify_signature(
+    let cli_notarization = verify_signature(
         &paths.cli_for(&receipt.tag),
         release.cli_asset(),
         false,
@@ -1017,7 +1046,7 @@ fn verify_receipt_any_version(
         &receipt.tag,
         &release.minimum_macos,
     )?;
-    Ok(())
+    Ok(cli_notarization)
 }
 
 fn verify_rollback_receipt_identity(
@@ -1471,7 +1500,7 @@ fn verify_signature(
     asset: &AssetLock,
     app: bool,
     require_assessment: bool,
-) -> Result<(), CliError> {
+) -> Result<NotarizationAssessment, CliError> {
     let path_text = path.to_string_lossy().into_owned();
     let mut verify_args = vec!["--verify", "--deep", "--strict", "--verbose=2"];
     verify_args.push(&path_text);
@@ -1509,16 +1538,23 @@ fn verify_signature(
                 "Peekaboo app Gatekeeper/notary assessment failed",
             ));
         }
+        return Ok(NotarizationAssessment::Passed);
     } else if !app && require_assessment {
         let assessment = run_tool(
             Path::new("codesign"),
             &["-vvvv", "-R=notarized", "--check-notarization", &path_text],
         )?;
         if assessment.exit_code != 0 || assessment.timed_out {
-            return Err(backend_error("Peekaboo CLI notarization assessment failed"));
+            return match asset.notarization.policy {
+                NotarizationPolicy::Required => {
+                    Err(backend_error("Peekaboo CLI notarization assessment failed"))
+                }
+                NotarizationPolicy::Waived => Ok(NotarizationAssessment::Waived),
+            };
         }
+        return Ok(NotarizationAssessment::Passed);
     }
-    Ok(())
+    Ok(NotarizationAssessment::NotAssessed)
 }
 
 fn run_tool(program: &Path, args: &[&str]) -> Result<process::ProcessOutput, CliError> {

@@ -1083,6 +1083,83 @@ fn strict_architecture_signature_notary_and_gatekeeper_checks_are_independently_
     }
 }
 
+#[test]
+fn exact_cli_notarization_waiver_is_visible_and_does_not_generalize() {
+    let harness = common::MacosAgentHarness::new();
+    let cwd = TempDir::new().expect("cwd");
+    let candidate = candidate(cwd.path(), "v3.9.3", '3');
+    authorize_cli_notarization_waiver(&candidate.lock);
+    let backend_root = cwd.path().join("waived-cli-notary");
+
+    let install = run_backend_with_failure(
+        &harness,
+        cwd.path(),
+        &backend_root,
+        &candidate,
+        &["--format", "json", "backend", "install", "--strict"],
+        "notary",
+    );
+    assert_eq!(install.code, 0, "{}", install.stderr_text());
+
+    let verify = run_backend_with_failure(
+        &harness,
+        cwd.path(),
+        &backend_root,
+        &candidate,
+        &["--format", "json", "backend", "verify", "--strict"],
+        "notary",
+    );
+    assert_eq!(verify.code, 0, "{}", verify.stderr_text());
+    let result = &verify.stdout_json()["result"];
+    assert_eq!(result["security_posture"], "reduced");
+    let notary = result["checks"]
+        .as_array()
+        .expect("checks")
+        .iter()
+        .find(|check| check["id"] == "notary")
+        .expect("notary check");
+    assert_eq!(notary["status"], "waived");
+    assert!(
+        notary["message"]
+            .as_str()
+            .expect("notary message")
+            .contains("graysurf/agent-runtime-kit#610")
+    );
+}
+
+#[test]
+fn mismatched_cli_notarization_waiver_is_rejected_before_install() {
+    let harness = common::MacosAgentHarness::new();
+    let cwd = TempDir::new().expect("cwd");
+    let candidate = candidate(cwd.path(), "v3.9.3", '3');
+    authorize_cli_notarization_waiver(&candidate.lock);
+    let mut lock = read_lock(&candidate.lock);
+    let cli = lock["assets"]
+        .as_array_mut()
+        .expect("assets")
+        .iter_mut()
+        .find(|asset| asset["kind"] == "cli")
+        .expect("CLI asset");
+    cli["notarization"]["waiver"]["executable_sha256"] = json!("0".repeat(64));
+    write_lock(&candidate.lock, &lock);
+
+    let rejected = run_backend(
+        &harness,
+        cwd.path(),
+        &cwd.path().join("mismatched-waiver"),
+        &candidate,
+        &["--error-format", "json", "backend", "install", "--strict"],
+    );
+    assert_eq!(rejected.code, 69, "{}", rejected.stderr_text());
+    assert_eq!(rejected.stderr_json()["error"]["class"], "backend");
+    assert!(
+        rejected.stderr_json()["error"]["message"]
+            .as_str()
+            .expect("error message")
+            .contains("notarization waiver")
+    );
+}
+
 struct Candidate {
     lock: PathBuf,
     assets: PathBuf,
@@ -1220,7 +1297,7 @@ esac
     assert!(zip.success());
     let commit = commit_char.to_string().repeat(40);
     let lock = json!({
-        "schema_version": 1,
+        "schema_version": 2,
         "repository": "https://github.com/openclaw/Peekaboo",
         "tag": tag,
         "commit": commit,
@@ -1234,7 +1311,8 @@ esac
                 "sha256":sha256(&assets.join(&cli_name)),"archive_root":"peekaboo-macos-universal","executable":"peekaboo",
                 "executable_sha256":sha256(&cli),
                 "bridge_build":format!("{version} ({version})"),
-                "architectures":["arm64","x86_64"],"signing_authority":"Fixture CLI","team_id":"FIXTURE"
+                "architectures":["arm64","x86_64"],"signing_authority":"Fixture CLI","team_id":"FIXTURE",
+                "notarization":{"policy":"required"}
             },
             {
                 "kind":"app","name":app_name,
@@ -1242,7 +1320,8 @@ esac
                 "sha256":sha256(&assets.join(&app_name)),"archive_root":"Peekaboo.app","executable":"Contents/MacOS/Peekaboo",
                 "executable_sha256":sha256(&app_binary),
                 "bridge_build":format!("{version} (fixture-{token})"),
-                "architectures":["arm64"],"bundle_id":"boo.peekaboo.mac","signing_authority":"Fixture App","team_id":"FIXTURE"
+                "architectures":["arm64"],"bundle_id":"boo.peekaboo.mac","signing_authority":"Fixture App","team_id":"FIXTURE",
+                "notarization":{"policy":"required"}
             }
         ],
         "archive_policy":{"reject_absolute_paths":true,"reject_parent_traversal":true,"allow_internal_symlinks":true,"reject_symlink_escape":true},
@@ -1362,6 +1441,36 @@ fn read_lock(path: &Path) -> serde_json::Value {
 
 fn write_lock(path: &Path, value: &serde_json::Value) {
     fs::write(path, serde_json::to_vec_pretty(value).expect("encode lock")).expect("write lock");
+}
+
+fn authorize_cli_notarization_waiver(path: &Path) {
+    let mut lock = read_lock(path);
+    lock["commit"] = json!("3cfd612adbcb1b43e8431a7a1f3b02ec45d01269");
+    let repository = lock["repository"].clone();
+    let tag = lock["tag"].clone();
+    let commit = lock["commit"].clone();
+    let cli = lock["assets"]
+        .as_array_mut()
+        .expect("assets")
+        .iter_mut()
+        .find(|asset| asset["kind"] == "cli")
+        .expect("CLI asset");
+    cli["notarization"] = json!({
+        "policy": "waived",
+        "waiver": {
+            "repository": repository,
+            "tag": tag,
+            "commit": commit,
+            "archive_sha256": cli["sha256"].clone(),
+            "executable_sha256": cli["executable_sha256"].clone(),
+            "signing_authority": cli["signing_authority"].clone(),
+            "team_id": cli["team_id"].clone(),
+            "approved_at": "2026-07-15",
+            "approval": "https://github.com/graysurf/agent-runtime-kit/issues/610#issuecomment-4984437753",
+            "reason": "Exact standalone CLI notarization exception; every other trust gate remains required."
+        }
+    });
+    write_lock(path, &lock);
 }
 
 fn authorize_rollback(current: &Candidate, previous: &Candidate) {
