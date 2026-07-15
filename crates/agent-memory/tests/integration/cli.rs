@@ -346,6 +346,25 @@ fn check_flags_missing_frontmatter() {
 }
 
 #[test]
+fn check_flags_duplicate_frontmatter() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    seed_check_scope(tmp.path());
+    fs::write(
+        tmp.path().join("global/alpha.md"),
+        "---\nname: alpha-note\ndescription: \"summary for alpha-note\"\nmetadata:\n  node_type: memory\n  type: user\n  originSessionId: 00000000-0000-0000-0000-000000000000\n---\n\n---\nname: duplicate\ndescription: \"raw duplicate\"\nmetadata:\n  type: user\n---\n\nAlpha body; see [[beta]].\n",
+    )
+    .expect("alpha");
+
+    let out = run(tmp.path(), &["check", "global", "--strict"]);
+    assert_eq!(out.code, 1, "stderr={}", out.stderr_text());
+    assert!(
+        out.stdout_text().contains("frontmatter-duplicate"),
+        "{}",
+        out.stdout_text()
+    );
+}
+
+#[test]
 fn check_accepts_handauthored_note_and_strict_promotes_warning() {
     let tmp = tempfile::TempDir::new().expect("tempdir");
     seed_check_scope(tmp.path());
@@ -926,6 +945,71 @@ fn candidate_promotion_is_dry_run_first_then_atomic_apply() {
 
     let check = run(tmp.path(), &["check", "global", "--strict"]);
     assert_eq!(check.code, 0, "stderr={}", check.stderr_text());
+}
+
+#[test]
+fn candidate_promotion_with_frontmatter_emits_single_header() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    seed_recall_layout(tmp.path());
+    let source = tmp.path().join("candidates/codex/frontmatter-candidate.md");
+    fs::write(
+        &source,
+        "---\nname: frontmatter-candidate\ndescription: \"Untrusted candidate description\"\nmetadata:\n  type: project\n---\n\nPromote this candidate body without its original header.\n",
+    )
+    .expect("candidate");
+    fs::write(
+        tmp.path().join("candidates/codex/MEMORY.md"),
+        "# Codex candidates\n\n- [Frontmatter candidate](frontmatter-candidate.md) — review\n",
+    )
+    .expect("candidate index");
+
+    let applied = run(
+        tmp.path(),
+        &[
+            "candidate",
+            "promote",
+            "codex",
+            "frontmatter-candidate",
+            "--type",
+            "feedback",
+            "--description",
+            "Canonical promoted description",
+            "--session-id",
+            "00000000-0000-0000-0000-000000000000",
+            "--apply",
+        ],
+    );
+    assert_eq!(applied.code, 0, "stderr={}", applied.stderr_text());
+
+    let promoted = fs::read_to_string(tmp.path().join("global/frontmatter-candidate.md"))
+        .expect("promoted note");
+    assert_eq!(
+        promoted.lines().filter(|line| line.trim() == "---").count(),
+        2,
+        "{promoted}"
+    );
+    assert!(
+        promoted.contains("description: \"Canonical promoted description\""),
+        "{promoted}"
+    );
+    assert!(promoted.contains("type: feedback"), "{promoted}");
+    assert!(
+        promoted.contains("Promote this candidate body without its original header."),
+        "{promoted}"
+    );
+    assert!(
+        !promoted.contains("Untrusted candidate description"),
+        "{promoted}"
+    );
+
+    let check = run(tmp.path(), &["check", "global", "--strict"]);
+    assert_eq!(
+        check.code,
+        0,
+        "stdout={} stderr={}",
+        check.stdout_text(),
+        check.stderr_text()
+    );
 }
 
 #[cfg(unix)]

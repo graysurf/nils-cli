@@ -60,6 +60,26 @@ pub(crate) fn parse(contents: &str) -> Option<Frontmatter> {
     Some(frontmatter)
 }
 
+/// Return the note body after a complete leading `---` fenced block.
+///
+/// Files without a complete leading block are returned unchanged. One blank
+/// separator line is removed because [`render_note`] supplies the canonical
+/// separator when the body is promoted into a curated note.
+pub(crate) fn body_after_frontmatter(contents: &str) -> &str {
+    let Some(end) = frontmatter_end(contents) else {
+        return contents;
+    };
+    strip_optional_separator(&contents[end..])
+}
+
+/// Report whether a note starts with two consecutive frontmatter-style blocks.
+pub(crate) fn has_duplicate_frontmatter(contents: &str) -> bool {
+    let Some(end) = frontmatter_end(contents) else {
+        return false;
+    };
+    frontmatter_end(contents[end..].trim_start()).is_some()
+}
+
 /// Render a note file: frontmatter block followed by the body. `origin_session_id`
 /// is emitted only when supplied (hand-authored notes may legitimately omit it).
 pub(crate) fn render_note(
@@ -116,4 +136,28 @@ fn non_empty(value: &str) -> Option<String> {
     } else {
         Some(value.to_string())
     }
+}
+
+fn frontmatter_end(contents: &str) -> Option<usize> {
+    let mut lines = contents.split_inclusive('\n');
+    let first = lines.next()?;
+    if first.trim() != "---" {
+        return None;
+    }
+
+    let mut end = first.len();
+    for line in lines {
+        end += line.len();
+        if line.trim() == "---" {
+            return Some(end);
+        }
+    }
+    None
+}
+
+fn strip_optional_separator(contents: &str) -> &str {
+    contents
+        .strip_prefix("\r\n")
+        .or_else(|| contents.strip_prefix('\n'))
+        .unwrap_or(contents)
 }

@@ -414,6 +414,15 @@ fn check_frontmatter(scope: &str, file: &str, contents: &str, findings: &mut Vec
         return;
     };
 
+    if frontmatter::has_duplicate_frontmatter(contents) {
+        findings.push(Finding::error(
+            scope,
+            "frontmatter-duplicate",
+            file.to_string(),
+            "note body starts with a second YAML frontmatter block",
+        ));
+    }
+
     if frontmatter.name.is_none() {
         findings.push(Finding::error(
             scope,
