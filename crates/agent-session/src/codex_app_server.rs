@@ -4059,10 +4059,6 @@ while [ "$(cat "$FAKE_PROVIDER_STAGE" 2>/dev/null)" != initial_connection ]; do
   sleep 0.01
 done
 printf '%s' "$FAKE_PROVIDER_STDERR" >&2
-if [ "$FAKE_PROVIDER_DESCENDANT" = 1 ]; then
-  sleep 300 </dev/null >/dev/null &
-  printf '%s' "$!" > "$FAKE_PROVIDER_DESCENDANT_PID"
-fi
 exit "$FAKE_PROVIDER_EXIT"
 "#,
         )
@@ -4080,7 +4076,7 @@ exit "$FAKE_PROVIDER_EXIT"
             let handoff = tmp.path().join(format!("{id}-thread"));
             let attached = tmp.path().join(format!("{id}-attached"));
             let stage = session_dir.join(".startup-stage");
-            let descendant_pid = session_dir.join("descendant.pid");
+            let provider_stderr_pipe = session_dir.join(".provider-stderr.pipe");
             let app_server_request = session_dir.join("app-server.request");
             let proxy_request = session_dir.join("proxy.request");
             let stop = Arc::new(AtomicBool::new(false));
@@ -4130,6 +4126,37 @@ exit "$FAKE_PROVIDER_EXIT"
                 Some(stage.clone()),
                 Arc::clone(&stop),
             );
+            let descriptor_holder_thread = descendant.then(|| {
+                thread::spawn(move || {
+                    let deadline = Instant::now() + Duration::from_secs(10);
+                    let stderr = loop {
+                        match OpenOptions::new()
+                            .write(true)
+                            .custom_flags(libc::O_NONBLOCK)
+                            .open(&provider_stderr_pipe)
+                        {
+                            Ok(stderr) => break stderr,
+                            Err(err)
+                                if Instant::now() < deadline
+                                    && matches!(
+                                        err.raw_os_error(),
+                                        Some(libc::ENOENT) | Some(libc::ENXIO)
+                                    ) =>
+                            {
+                                thread::sleep(Duration::from_millis(5));
+                            }
+                            Err(err) => panic!("provider stderr holder must open the pipe: {err}"),
+                        }
+                    };
+                    Command::new("sleep")
+                        .arg("300")
+                        .stdin(Stdio::null())
+                        .stdout(Stdio::null())
+                        .stderr(Stdio::from(stderr))
+                        .spawn()
+                        .expect("provider stderr holder must start")
+                })
+            });
             let mut command = Command::new("/bin/sh");
             command
                 .arg("-c")
@@ -4148,31 +4175,35 @@ exit "$FAKE_PROVIDER_EXIT"
                 .env("FAKE_APP_SERVER_REQUEST", &app_server_request)
                 .env("FAKE_PROXY_REQUEST", &proxy_request)
                 .env("FAKE_PROVIDER_EXIT", status.to_string())
-                .env("FAKE_PROVIDER_STDERR", stderr)
-                .env(
-                    "FAKE_PROVIDER_DESCENDANT",
-                    if descendant { "1" } else { "0" },
-                )
-                .env("FAKE_PROVIDER_DESCENDANT_PID", &descendant_pid);
+                .env("FAKE_PROVIDER_STDERR", stderr);
             let output = crate::run_output_with_timeout(command, Duration::from_secs(60));
             stop.store(true, Ordering::Relaxed);
             app_server_thread.join().unwrap();
             proxy_thread.join().unwrap();
-            let output =
-                output.expect("generated launcher must terminate without waiting for descendants");
+            let mut descriptor_holder = descriptor_holder_thread.map(|thread| {
+                thread
+                    .join()
+                    .expect("provider stderr holder setup must not panic")
+            });
+            let holder_was_alive = descriptor_holder
+                .as_mut()
+                .map(|child| {
+                    let alive = child
+                        .try_wait()
+                        .expect("provider stderr holder status must be readable")
+                        .is_none();
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    alive
+                })
+                .unwrap_or(true);
+            let output = output
+                .expect("generated launcher must terminate without waiting for stderr holders");
             if descendant {
-                let pid = fs::read_to_string(&descendant_pid)
-                    .expect("provider descendant must persist its pid")
-                    .parse::<libc::pid_t>()
-                    .expect("provider descendant pid must be valid");
-                assert_eq!(
-                    unsafe { libc::kill(pid, 0) },
-                    0,
-                    "generated launcher must return while the provider descendant is still alive"
+                assert!(
+                    holder_was_alive,
+                    "generated launcher must return while the provider stderr holder is alive"
                 );
-                unsafe {
-                    libc::kill(pid, libc::SIGTERM);
-                }
             }
             assert_eq!(output.status.code(), Some(status));
             session_dir
