@@ -2865,6 +2865,10 @@ fn codex_protocol_authority_suppresses_permission_hook_and_breach_fails_closed()
     let mut child = Command::new(binary)
         .current_dir(tmp.path())
         .args(["activity", "hook", "--agent", "codex"])
+        // The parent may itself be a managed Codex runtime. This child must
+        // model missing authority instead of inheriting the valid protocol
+        // authority that the test is deliberately trying to omit.
+        .env_remove("AGENT_SESSION_ATTENTION_AUTHORITY")
         .envs(missing_authority_env)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
