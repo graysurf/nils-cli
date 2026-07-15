@@ -18,6 +18,7 @@
       "archive_root": "peekaboo-macos-universal",
       "executable": "peekaboo",
       "executable_sha256": "6380687e62cf42d1b7830394cd1e760dffab0db24b270627c15eee7b51c67072",
+      "bridge_build": "3.9.3 (3.9.3)",
       "architectures": ["arm64", "x86_64"],
       "signing_authority": "Developer ID Application: Peter Steinberger (Y5PE65HELJ)",
       "team_id": "Y5PE65HELJ"
@@ -30,6 +31,7 @@
       "archive_root": "Peekaboo.app",
       "executable": "Contents/MacOS/Peekaboo",
       "executable_sha256": "1269052aaa38f484a24cab06ea7e004478515471ffcba6302205f44abda66023",
+      "bridge_build": "3.9.3 (3090399)",
       "architectures": ["arm64"],
       "bundle_id": "boo.peekaboo.mac",
       "signing_authority": "Developer ID Application: OpenClaw Foundation (FWJYW4S8P8)",

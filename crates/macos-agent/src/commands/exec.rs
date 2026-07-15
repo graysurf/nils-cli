@@ -4,7 +4,7 @@ use std::time::Duration;
 use nils_common::fs::{SECRET_FILE_MODE, write_atomic};
 
 use crate::cli::ExecArgs;
-use crate::commands::{hardened_env, peekaboo_binary, prepare_runtime, runtime_argv};
+use crate::commands::{hardened_env, peekaboo_binary, prepare_runtime};
 use crate::error::{CliError, ErrorClass};
 use crate::journal::{
     ArtifactInput, Journal, StepInput, StepStatus, sanitize_json, sanitize_output,
@@ -59,26 +59,29 @@ pub fn run_local(
         None,
         &binary,
     )?;
-    if let Err(error) = prepare_runtime(args.runtime, &binary) {
-        let _ = journal.record_step(StepInput {
-            parent_id,
-            intent: args.intent.clone(),
-            expected: args.expected.clone(),
-            argv: args.argv.clone(),
-            status: StepStatus::Failed,
-            failure_class: Some("backend_drift".into()),
-            duration_ms: 0,
-            retries: 0,
-            precondition_refs: Vec::new(),
-            postcondition_refs: Vec::new(),
-            snapshot_lineage: None,
-            artifact_refs: Vec::new(),
-        });
-        let _ = journal.close();
-        return Err(error);
-    }
+    let runtime = match prepare_runtime(args.runtime, &binary) {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            let _ = journal.record_step(StepInput {
+                parent_id,
+                intent: args.intent.clone(),
+                expected: args.expected.clone(),
+                argv: args.argv.clone(),
+                status: StepStatus::Failed,
+                failure_class: Some("backend_drift".into()),
+                duration_ms: 0,
+                retries: 0,
+                precondition_refs: Vec::new(),
+                postcondition_refs: Vec::new(),
+                snapshot_lineage: None,
+                artifact_refs: Vec::new(),
+            });
+            let _ = journal.close();
+            return Err(error);
+        }
+    };
     let (envs, removed_envs) = hardened_env(None);
-    let upstream_argv = runtime_argv(args.runtime, &args.argv, binary.runtime_identity());
+    let upstream_argv = runtime.argv(&args.argv);
     let output = process::run(
         binary.path(),
         &upstream_argv,

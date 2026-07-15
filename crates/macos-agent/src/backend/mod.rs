@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::fs::{self, OpenOptions};
 use std::io;
 use std::os::fd::AsRawFd;
@@ -9,7 +10,7 @@ use nils_common::fs::{SECRET_FILE_MODE, sha256_file, write_atomic};
 use serde::{Deserialize, Serialize};
 
 use crate::error::CliError;
-use crate::lock::{AssetLock, PeekabooLock, RollbackReleaseLock};
+use crate::lock::{AssetLock, PeekabooLock, RollbackReleaseLock, bridge_build_number};
 use crate::process;
 use crate::test_mode;
 
@@ -64,8 +65,33 @@ impl Drop for LifecycleLock {
 pub struct VerifiedBackend {
     path: PathBuf,
     runtime_identity: String,
-    expected_version: Option<String>,
+    cli_bridge_build: Option<String>,
+    app_bridge_build: Option<String>,
+    obsolete_runtimes: Vec<RuntimeContract>,
     _lease: Option<LifecycleLock>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RuntimeContract {
+    identity: String,
+    bridge_build: String,
+}
+
+impl RuntimeContract {
+    pub(crate) fn new(identity: String, bridge_build: String) -> Self {
+        Self {
+            identity,
+            bridge_build,
+        }
+    }
+
+    pub(crate) fn identity(&self) -> &str {
+        &self.identity
+    }
+
+    pub(crate) fn bridge_build(&self) -> &str {
+        &self.bridge_build
+    }
 }
 
 impl VerifiedBackend {
@@ -81,8 +107,16 @@ impl VerifiedBackend {
         &self.runtime_identity
     }
 
-    pub fn expected_version(&self) -> Option<&str> {
-        self.expected_version.as_deref()
+    pub fn cli_bridge_build(&self) -> Option<&str> {
+        self.cli_bridge_build.as_deref()
+    }
+
+    pub fn app_bridge_build(&self) -> Option<&str> {
+        self.app_bridge_build.as_deref()
+    }
+
+    pub(crate) fn obsolete_runtimes(&self) -> &[RuntimeContract] {
+        &self.obsolete_runtimes
     }
 }
 
@@ -486,6 +520,12 @@ fn recover_pending(
         return fs::remove_file(paths.pending_receipt())
             .map_err(|_| backend_error("failed to abandon interrupted backend activation"));
     }
+    if current.is_none() && !paths.stable_app.exists() && !backup.exists() {
+        remove_transaction_dir(&incoming)?;
+        return fs::remove_file(paths.pending_receipt()).map_err(|_| {
+            backend_error("failed to restart the interrupted first backend activation")
+        });
+    }
     Err(backend_error(
         "interrupted backend activation cannot prove stable app ownership",
     ))
@@ -601,6 +641,9 @@ pub fn doctor(strict: bool) -> Result<DoctorReport, CliError> {
     let paths = BackendPaths::resolve()?;
     let _guard = LifecycleLock::acquire(&paths.root, LifecycleLockMode::Shared)?;
     let backend = verify_unlocked(strict, &lock, &paths)?;
+    let receipt = read_receipt(&paths.current_receipt())?
+        .ok_or_else(|| backend_error("the verified backend receipt is unavailable"))?;
+    let (_, app_asset, _) = release_contract_for_receipt(&lock, &receipt)?;
     let binary = paths.current_cli()?;
     let mut permissions = None;
     let mut bridge = None;
@@ -608,7 +651,8 @@ pub fn doctor(strict: bool) -> Result<DoctorReport, CliError> {
     for probe in &lock.required_capability_probes {
         let arguments = probe.argv.iter().map(String::as_str).collect::<Vec<_>>();
         let output = run_tool(&binary, &arguments);
-        let (status, message) = evaluate_capability_probe(&probe.id, output, &lock.tag);
+        let (status, message) =
+            evaluate_capability_probe(&probe.id, output, &receipt.tag, &app_asset.bridge_build);
         let check = CheckResult {
             id: probe.id.clone(),
             status,
@@ -658,7 +702,9 @@ pub fn acquire_verified_backend() -> Result<VerifiedBackend, CliError> {
         return Ok(VerifiedBackend {
             path,
             runtime_identity: digest[..16].into(),
-            expected_version: None,
+            cli_bridge_build: None,
+            app_bridge_build: None,
+            obsolete_runtimes: Vec::new(),
             _lease: None,
         });
     }
@@ -670,10 +716,14 @@ pub fn acquire_verified_backend() -> Result<VerifiedBackend, CliError> {
     let receipt = read_receipt(&paths.current_receipt())?
         .ok_or_else(|| backend_error("the verified backend receipt is unavailable"))?;
     let path = paths.current_cli()?;
+    let (cli_asset, app_asset, _) = release_contract_for_receipt(&lock, &receipt)?;
+    let obsolete_runtimes = obsolete_runtime_contracts(&lock, &receipt);
     Ok(VerifiedBackend {
         path,
         runtime_identity: receipt.cli_binary_sha256[..16].into(),
-        expected_version: Some(receipt.tag.trim_start_matches('v').into()),
+        cli_bridge_build: Some(cli_asset.bridge_build.clone()),
+        app_bridge_build: Some(app_asset.bridge_build.clone()),
+        obsolete_runtimes,
         _lease: Some(lease),
     })
 }
@@ -682,6 +732,7 @@ fn evaluate_capability_probe(
     id: &str,
     output: Result<process::ProcessOutput, CliError>,
     locked_tag: &str,
+    expected_app_build: &str,
 ) -> (&'static str, &'static str) {
     let Ok(output) = output else {
         return ("fail", "required capability probe failed");
@@ -734,13 +785,10 @@ fn evaluate_capability_probe(
             let source = value
                 .pointer("/data/selected/source")
                 .and_then(serde_json::Value::as_str);
-            let host_kind = value
-                .pointer("/data/selected/handshake/hostKind")
-                .and_then(serde_json::Value::as_str);
-            if source == Some("remote") && host_kind == Some("gui") {
+            if bridge_handshake_matches(&value, "gui", expected_app_build) {
                 ("pass", "Peekaboo GUI Bridge is selected and ready")
             } else if source.is_some() {
-                ("blocked", "Peekaboo GUI Bridge is unavailable")
+                ("blocked", "Peekaboo GUI Bridge exact build is unavailable")
             } else {
                 ("fail", "Bridge capability schema is incompatible")
             }
@@ -758,6 +806,26 @@ fn evaluate_capability_probe(
         }
         _ => ("fail", "unrecognized mandatory capability probe"),
     }
+}
+
+pub(crate) fn bridge_handshake_matches(
+    value: &serde_json::Value,
+    expected_host: &str,
+    expected_build: &str,
+) -> bool {
+    value.get("success").and_then(serde_json::Value::as_bool) == Some(true)
+        && value
+            .pointer("/data/selected/source")
+            .and_then(serde_json::Value::as_str)
+            == Some("remote")
+        && value
+            .pointer("/data/selected/handshake/hostKind")
+            .and_then(serde_json::Value::as_str)
+            == Some(expected_host)
+        && value
+            .pointer("/data/selected/handshake/build")
+            .and_then(serde_json::Value::as_str)
+            == Some(expected_build)
 }
 
 pub fn rollback(dry_run: bool, strict: bool) -> Result<BackendStatus, CliError> {
@@ -1038,17 +1106,52 @@ fn replace_stable_app(paths: &BackendPaths, receipt: &Receipt) -> Result<(), Cli
     Ok(())
 }
 
-fn app_contract_for_receipt<'a>(
+fn release_contract_for_receipt<'a>(
     lock: &'a PeekabooLock,
     receipt: &Receipt,
-) -> Result<(&'a AssetLock, &'a str), CliError> {
+) -> Result<(&'a AssetLock, &'a AssetLock, &'a str), CliError> {
     if receipt.tag == lock.tag && receipt.commit == lock.commit {
-        return Ok((lock.app_asset(), &lock.minimum_macos));
+        return Ok((lock.cli_asset(), lock.app_asset(), &lock.minimum_macos));
     }
     let release = lock
         .rollback_release(&receipt.tag, &receipt.commit)
         .ok_or_else(|| backend_error("receipt release is not authorized by the embedded lock"))?;
-    Ok((release.app_asset(), &release.minimum_macos))
+    Ok((
+        release.cli_asset(),
+        release.app_asset(),
+        &release.minimum_macos,
+    ))
+}
+
+fn app_contract_for_receipt<'a>(
+    lock: &'a PeekabooLock,
+    receipt: &Receipt,
+) -> Result<(&'a AssetLock, &'a str), CliError> {
+    let (_, app, minimum_macos) = release_contract_for_receipt(lock, receipt)?;
+    Ok((app, minimum_macos))
+}
+
+fn obsolete_runtime_contracts(lock: &PeekabooLock, receipt: &Receipt) -> Vec<RuntimeContract> {
+    let active_identity = &receipt.cli_binary_sha256[..16];
+    let current = std::iter::once((lock.tag.as_str(), lock.commit.as_str(), lock.cli_asset()));
+    let rollback = lock.rollback_releases.iter().map(|release| {
+        (
+            release.tag.as_str(),
+            release.commit.as_str(),
+            release.cli_asset(),
+        )
+    });
+    let mut seen = BTreeSet::new();
+    current
+        .chain(rollback)
+        .filter(|(tag, commit, _)| *tag != receipt.tag || *commit != receipt.commit)
+        .filter_map(|(_, _, asset)| {
+            let identity = asset.executable_sha256[..16].to_string();
+            let key = (identity.clone(), asset.bridge_build.clone());
+            (identity != active_identity && seen.insert(key.clone()))
+                .then(|| RuntimeContract::new(key.0, key.1))
+        })
+        .collect()
 }
 
 fn download_asset(asset: &AssetLock, downloads: &Path) -> Result<PathBuf, CliError> {
@@ -1278,12 +1381,15 @@ fn verify_app_metadata(
         .descendants()
         .find(|node| node.has_tag_name("dict"))
         .ok_or_else(|| backend_error("Peekaboo app metadata dictionary is unavailable"))?;
+    let bundle_build = bridge_build_number(&asset.bridge_build, tag)
+        .ok_or_else(|| backend_error("locked Peekaboo app build identity is malformed"))?;
     for (key, expected) in [
         (
             "CFBundleIdentifier",
             asset.bundle_id.as_deref().unwrap_or_default(),
         ),
         ("CFBundleShortVersionString", tag.trim_start_matches('v')),
+        ("CFBundleVersion", bundle_build),
         ("LSMinimumSystemVersion", minimum_macos),
     ] {
         if expected.is_empty() || plist_string(dictionary, key).as_deref() != Some(expected) {
@@ -1528,7 +1634,8 @@ mod tests {
 
     use super::{
         LifecycleLock, LifecycleLockMode, RECEIPT_SCHEMA, Receipt, app_contract_for_receipt,
-        macos_version_supported, safe_tag, validate_archive_path, validate_symlink_tree,
+        macos_version_supported, obsolete_runtime_contracts, safe_tag, validate_archive_path,
+        validate_symlink_tree,
     };
     use crate::lock::PeekabooLock;
 
@@ -1617,5 +1724,35 @@ mod tests {
         assert_eq!(asset.signing_authority, "Historical App Authority");
         assert_eq!(asset.team_id, "HISTORY");
         assert_eq!(minimum, "15.0");
+    }
+
+    #[test]
+    fn inactive_locked_releases_become_exact_obsolete_runtime_contracts() {
+        let mut lock = PeekabooLock::embedded().expect("lock");
+        let mut historical_cli = lock.cli_asset().clone();
+        historical_cli.executable_sha256 = "2".repeat(64);
+        historical_cli.bridge_build = "3.9.2 (historical)".into();
+        lock.rollback_releases
+            .push(crate::lock::RollbackReleaseLock {
+                tag: "v3.9.2".into(),
+                commit: "2".repeat(40),
+                minimum_macos: "15.0".into(),
+                assets: vec![historical_cli, lock.app_asset().clone()],
+            });
+        let receipt = Receipt {
+            schema_version: RECEIPT_SCHEMA.into(),
+            tag: lock.tag.clone(),
+            commit: lock.commit.clone(),
+            installed_at: "fixture".into(),
+            cli_archive_sha256: lock.cli_asset().sha256.clone(),
+            app_archive_sha256: lock.app_asset().sha256.clone(),
+            cli_binary_sha256: lock.cli_asset().executable_sha256.clone(),
+            app_binary_sha256: lock.app_asset().executable_sha256.clone(),
+        };
+
+        let contracts = obsolete_runtime_contracts(&lock, &receipt);
+        assert_eq!(contracts.len(), 1);
+        assert_eq!(contracts[0].identity(), "2222222222222222");
+        assert_eq!(contracts[0].bridge_build(), "3.9.2 (historical)");
     }
 }

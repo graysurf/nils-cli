@@ -12,9 +12,9 @@ fake-backend/fake-SSH test suite, but it is not a desktop automation target.
 ## Backend lifecycle
 
 The exact repository, tag, commit, asset URLs, SHA256 values, architectures,
-bundle/signing identities, minimum macOS, and capability probes are frozen in
-[`peekaboo-lock.json`](peekaboo-lock.json). Runtime code never resolves a
-floating `latest` release.
+CLI/app Bridge builds, bundle/signing identities, minimum macOS, and capability
+probes are frozen in [`peekaboo-lock.json`](peekaboo-lock.json). Runtime code
+never resolves a floating `latest` release.
 
 ```bash
 macos-agent backend install --dry-run --format json
@@ -65,11 +65,15 @@ macos-agent exec \
 ```
 
 Use `--runtime app|daemon|auto|process` to select the effective Peekaboo
-authority. `app` is the stable default: it launches the owned app and pins
-`~/Library/Application Support/Peekaboo/bridge.sock`, then verifies that the
-Bridge handshake advertises the active release. `daemon` and `auto` start the
-verified CLI daemon on separate executable-digest-scoped sockets in the same
-directory and verify its release handshake. `process` passes `--no-remote`.
+authority. `app` is the stable default: it reuses the owned app only when its
+exact locked Bridge build is ready, otherwise launches a new stable app
+instance on `~/Library/Application Support/Peekaboo/bridge.sock` and verifies
+the exact handshake. `daemon` starts the verified CLI daemon on an
+executable-digest-scoped socket. `auto` first selects an exact compatible GUI
+Bridge and otherwise starts the verified CLI daemon on its own digest-scoped
+socket. A release transition retires only inactive daemon sockets whose exact
+old build is still authorized by the embedded lock. `process` passes
+`--no-remote`.
 Evidence modes are:
 
 - `minimal`: structural journal and sanitized upstream response.

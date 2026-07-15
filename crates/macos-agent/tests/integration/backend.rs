@@ -293,6 +293,42 @@ fn install_recovers_the_half_swap_after_the_stable_app_was_moved_to_backup() {
 }
 
 #[test]
+fn install_recovers_a_partial_first_install_incoming_app() {
+    let harness = common::MacosAgentHarness::new();
+    let cwd = TempDir::new().expect("cwd");
+    let backend_root = cwd.path().join("backend");
+    let candidate = candidate(cwd.path(), "v3.9.3", '3');
+    let installed = run_backend(
+        &harness,
+        cwd.path(),
+        &backend_root,
+        &candidate,
+        &["--format", "json", "backend", "install"],
+    );
+    assert_eq!(installed.code, 0, "{}", installed.stderr_text());
+
+    let current = fs::read(backend_root.join("receipts/current.json")).expect("current receipt");
+    fs::remove_dir_all(backend_root.join("stable/Peekaboo.app")).expect("remove stable app");
+    fs::remove_file(backend_root.join("receipts/current.json")).expect("remove current receipt");
+    fs::write(backend_root.join("receipts/pending.json"), current).expect("pending receipt");
+    let partial = backend_root.join("stable/.nils-peekaboo-incoming/Contents/MacOS");
+    fs::create_dir_all(&partial).expect("partial incoming tree");
+    fs::write(partial.join("Peekaboo"), b"partial").expect("partial incoming executable");
+
+    let recovered = run_backend(
+        &harness,
+        cwd.path(),
+        &backend_root,
+        &candidate,
+        &["--format", "json", "backend", "install"],
+    );
+    assert_eq!(recovered.code, 0, "{}", recovered.stderr_text());
+    assert!(backend_root.join("stable/Peekaboo.app").is_dir());
+    assert!(!backend_root.join("stable/.nils-peekaboo-incoming").exists());
+    assert!(!backend_root.join("receipts/pending.json").exists());
+}
+
+#[test]
 fn doctor_parses_the_pinned_permissions_and_bridge_schemas_fail_closed() {
     let harness = common::MacosAgentHarness::new();
     let cwd = TempDir::new().expect("cwd");
@@ -318,7 +354,13 @@ fn doctor_parses_the_pinned_permissions_and_bridge_schemas_fail_closed() {
     assert_eq!(ready.code, 0, "{}", ready.stderr_text());
     assert_eq!(ready.stdout_json()["result"]["ready"], true);
 
-    for mode in ["permission_denied", "bridge_failed", "malformed_probe"] {
+    for mode in [
+        "permission_denied",
+        "bridge_failed",
+        "bridge_missing_build",
+        "bridge_stale_build",
+        "malformed_probe",
+    ] {
         let blocked = run_backend_probe_mode(
             &harness,
             cwd.path(),
@@ -492,7 +534,7 @@ fn mutable_receipt_hashes_cannot_authorize_replaced_code_or_bundle_drift() {
         &["--format", "json", "backend", "install"],
     );
     assert_eq!(installed.code, 0, "{}", installed.stderr_text());
-    let wrong_metadata = b"<plist><dict><key>CFBundleIdentifier</key><string>evil.bundle</string><key>CFBundleShortVersionString</key><string>3.9.3</string><key>LSMinimumSystemVersion</key><string>15.0</string></dict></plist>";
+    let wrong_metadata = b"<plist><dict><key>CFBundleIdentifier</key><string>boo.peekaboo.mac</string><key>CFBundleShortVersionString</key><string>3.9.3</string><key>CFBundleVersion</key><string>stale-build</string><key>LSMinimumSystemVersion</key><string>15.0</string></dict></plist>";
     for plist in [
         app_root.join("versions/v3.9.3/app/Peekaboo.app/Contents/Info.plist"),
         app_root.join("stable/Peekaboo.app/Contents/Info.plist"),
@@ -728,9 +770,17 @@ JSON
       cat <<'JSON'
 {{"success":true,"data":{{"remoteSkipped":false,"selected":{{"source":"local","socketPath":null,"handshake":null}},"candidates":[{{"socketPath":"/private/bridge.sock","result":{{"failure":{{"kind":"system","message":"connection refused"}}}}}}],"client":{{"processIdentifier":1}}}}}}
 JSON
+    elif [ "$mode" = bridge_missing_build ]; then
+      cat <<'JSON'
+{{"success":true,"data":{{"remoteSkipped":false,"selected":{{"source":"remote","socketPath":"/private/bridge.sock","handshake":{{"hostKind":"gui"}}}}}}}}
+JSON
+    elif [ "$mode" = bridge_stale_build ]; then
+      cat <<'JSON'
+{{"success":true,"data":{{"remoteSkipped":false,"selected":{{"source":"remote","socketPath":"/private/bridge.sock","handshake":{{"hostKind":"gui","build":"{version} (stale)"}}}}}}}}
+JSON
     else
       cat <<'JSON'
-{{"success":true,"data":{{"remoteSkipped":false,"selected":{{"source":"remote","socketPath":"/private/bridge.sock","handshake":{{"hostKind":"gui"}}}},"candidates":[{{"socketPath":"/private/bridge.sock","result":{{"success":{{"hostKind":"gui"}}}}}}],"client":{{"processIdentifier":1}}}}}}
+{{"success":true,"data":{{"remoteSkipped":false,"selected":{{"source":"remote","socketPath":"/private/bridge.sock","handshake":{{"hostKind":"gui","build":"{version} (fixture-{token})"}}}},"candidates":[{{"socketPath":"/private/bridge.sock","result":{{"success":{{"hostKind":"gui"}}}}}}],"client":{{"processIdentifier":1}}}}}}
 JSON
     fi
     ;;
@@ -748,7 +798,7 @@ esac
     fs::write(
         source.join("Peekaboo.app/Contents/Info.plist"),
         format!(
-            "<plist><dict><key>CFBundleIdentifier</key><string>boo.peekaboo.mac</string><key>CFBundleShortVersionString</key><string>{version}</string><key>LSMinimumSystemVersion</key><string>15.0</string></dict></plist>"
+            "<plist><dict><key>CFBundleIdentifier</key><string>boo.peekaboo.mac</string><key>CFBundleShortVersionString</key><string>{version}</string><key>CFBundleVersion</key><string>fixture-{token}</string><key>LSMinimumSystemVersion</key><string>15.0</string></dict></plist>"
         ),
     )
     .expect("plist");
@@ -786,6 +836,7 @@ esac
                 "url":format!("https://github.com/openclaw/Peekaboo/releases/download/{tag}/fixture-cli"),
                 "sha256":sha256(&assets.join(&cli_name)),"archive_root":"peekaboo-macos-universal","executable":"peekaboo",
                 "executable_sha256":sha256(&cli),
+                "bridge_build":format!("{version} ({version})"),
                 "architectures":["arm64","x86_64"],"signing_authority":"Fixture CLI","team_id":"FIXTURE"
             },
             {
@@ -793,6 +844,7 @@ esac
                 "url":format!("https://github.com/openclaw/Peekaboo/releases/download/{tag}/fixture-app"),
                 "sha256":sha256(&assets.join(&app_name)),"archive_root":"Peekaboo.app","executable":"Contents/MacOS/Peekaboo",
                 "executable_sha256":sha256(&app_binary),
+                "bridge_build":format!("{version} (fixture-{token})"),
                 "architectures":["arm64"],"bundle_id":"boo.peekaboo.mac","signing_authority":"Fixture App","team_id":"FIXTURE"
             }
         ],

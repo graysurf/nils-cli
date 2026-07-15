@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 use std::os::unix::process::CommandExt;
 
 use crate::cli::McpArgs;
-use crate::commands::{hardened_env, peekaboo_binary, prepare_runtime, runtime_argv};
+use crate::commands::{hardened_env, peekaboo_binary, prepare_runtime};
 use crate::error::CliError;
 use crate::journal::{Journal, StepInput, StepStatus};
 use crate::policy;
@@ -94,17 +94,13 @@ fn run_session(
     journal: &mut Journal,
     binary: &crate::backend::VerifiedBackend,
 ) -> Result<u8, CliError> {
-    prepare_runtime(args.runtime, binary)?;
-    let upstream_args = runtime_argv(
-        args.runtime,
-        &[
-            "mcp".into(),
-            "serve".into(),
-            "--transport".into(),
-            "stdio".into(),
-        ],
-        binary.runtime_identity(),
-    );
+    let runtime = prepare_runtime(args.runtime, binary)?;
+    let upstream_args = runtime.argv(&[
+        "mcp".into(),
+        "serve".into(),
+        "--transport".into(),
+        "stdio".into(),
+    ]);
     let (envs, removed_envs) = hardened_env(Some(args.tool_profile));
     let mut command = Command::new(binary.path());
     command

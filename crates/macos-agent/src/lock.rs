@@ -48,6 +48,7 @@ pub struct AssetLock {
     pub archive_root: String,
     pub executable: String,
     pub executable_sha256: String,
+    pub bridge_build: String,
     pub architectures: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bundle_id: Option<String>,
@@ -138,7 +139,7 @@ impl PeekabooLock {
                 "lock must contain exactly one CLI and one app asset",
             ));
         }
-        validate_assets(&self.assets)?;
+        validate_assets(&self.assets, &self.tag)?;
         if self.required_capability_probes.is_empty()
             || self
                 .required_capability_probes
@@ -173,7 +174,7 @@ impl PeekabooLock {
                     "rollback release identity is malformed or duplicated",
                 ));
             }
-            validate_assets(&release.assets)?;
+            validate_assets(&release.assets, &release.tag)?;
         }
         Ok(())
     }
@@ -195,7 +196,7 @@ impl RollbackReleaseLock {
     }
 }
 
-fn validate_assets(assets: &[AssetLock]) -> Result<(), CliError> {
+fn validate_assets(assets: &[AssetLock], tag: &str) -> Result<(), CliError> {
     let kinds = assets
         .iter()
         .map(|asset| asset.kind.as_str())
@@ -216,6 +217,7 @@ fn validate_assets(assets: &[AssetLock]) -> Result<(), CliError> {
             || !safe_asset_name(&asset.name)
             || !safe_relative_path(&asset.archive_root)
             || !safe_relative_path(&asset.executable)
+            || bridge_build_number(&asset.bridge_build, tag).is_none()
             || asset.architectures.is_empty()
             || asset.signing_authority.trim().is_empty()
             || asset.team_id.trim().is_empty()
@@ -224,6 +226,18 @@ fn validate_assets(assets: &[AssetLock]) -> Result<(), CliError> {
         }
     }
     Ok(())
+}
+
+pub(crate) fn bridge_build_number<'a>(value: &'a str, tag: &str) -> Option<&'a str> {
+    let version = tag.strip_prefix('v')?;
+    let prefix = format!("{version} (");
+    let build = value.strip_prefix(&prefix)?.strip_suffix(')')?;
+    (!build.is_empty()
+        && build.len() <= 64
+        && build
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_' | b'+')))
+    .then_some(build)
 }
 
 fn safe_asset_name(value: &str) -> bool {
@@ -264,6 +278,8 @@ mod tests {
         assert_eq!(lock.tag, "v3.9.3");
         assert_eq!(lock.assets.len(), 2);
         assert_eq!(lock.cli_asset().architectures, ["arm64", "x86_64"]);
+        assert_eq!(lock.cli_asset().bridge_build, "3.9.3 (3.9.3)");
+        assert_eq!(lock.app_asset().bridge_build, "3.9.3 (3090399)");
         assert_eq!(
             lock.app_asset().bundle_id.as_deref(),
             Some("boo.peekaboo.mac")
@@ -310,6 +326,25 @@ mod tests {
             assert!(
                 executable.validate().is_err(),
                 "unsafe executable path was admitted: {unsafe_path:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn bridge_builds_are_exact_tag_scoped_immutable_identities() {
+        for unsafe_build in [
+            "",
+            "3.9.2 (3090399)",
+            "3.9.3",
+            "3.9.3 ()",
+            "3.9.3 (build value)",
+            "3.9.3 (3090399) trailing",
+        ] {
+            let mut lock = PeekabooLock::embedded().expect("embedded lock");
+            lock.assets[0].bridge_build = unsafe_build.into();
+            assert!(
+                lock.validate().is_err(),
+                "unsafe bridge build was admitted: {unsafe_build:?}"
             );
         }
     }

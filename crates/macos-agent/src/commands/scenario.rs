@@ -6,7 +6,7 @@ use nils_common::fs::{SECRET_FILE_MODE, write_atomic};
 use sha2::{Digest, Sha256};
 
 use crate::cli::ScenarioArgs;
-use crate::commands::{hardened_env, peekaboo_binary, prepare_runtime, runtime_argv};
+use crate::commands::{hardened_env, peekaboo_binary, prepare_runtime};
 use crate::error::{CliError, ErrorClass};
 use crate::journal::{Journal, StepInput, StepStatus, sanitize_output, sanitize_result_json};
 use crate::model::{ExecutionResult, UpstreamResult};
@@ -36,7 +36,7 @@ pub fn run_local(
         None,
         &binary,
     )?;
-    prepare_runtime(args.runtime, &binary)?;
+    let runtime = prepare_runtime(args.runtime, &binary)?;
     let source_digest = hex(&Sha256::digest(&raw));
     let staged_source = StagedScenario::create(&args.out_dir, &raw)?;
     let upstream = vec![
@@ -47,7 +47,7 @@ pub fn run_local(
     let (envs, removed_envs) = hardened_env(None);
     let output = process::run(
         binary.path(),
-        &runtime_argv(args.runtime, &upstream, binary.runtime_identity()),
+        &runtime.argv(&upstream),
         &envs,
         &removed_envs,
         None,
