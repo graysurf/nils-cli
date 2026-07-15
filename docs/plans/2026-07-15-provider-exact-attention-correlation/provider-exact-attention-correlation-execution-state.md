@@ -3,17 +3,15 @@
 <!-- plan-issue-record:v2 role=state profile=tracking -->
 ## Execution State
 
-- Status: complete
+- Status: complete; tracking issue closed
 - Target scope: one provider-neutral v1 invariant, runtime-selected Codex
   attention authority with app-server exact resolution, capability-selected
   Claude exact-or-limited Elicitation, and an explicit conservative limitation
   for generic permission dialogs.
 - Execution window: Sprint 1 shared boundary -> Sprints 2 and 3 independent /
   parallel provider lanes -> Sprint 4 integration and delivery.
-- Current task: Task 4.2 complete; implementation, follow-up correction,
-  deployment, and live acceptance are finished.
-- Next task: none; close tracking issue #1237 after publishing this final
-  execution state.
+- Current task: none; tracking issue closed
+- Next task: none; tracking issue closed
 - Last updated: 2026-07-16
 - Branches: `feat/provider-exact-attention-correlation`,
   `fix/claude-attention-shadow`, and `docs/provider-attention-closeout`
@@ -22,6 +20,12 @@
 - Implementation source:
   `docs/plans/2026-07-15-provider-exact-attention-correlation/provider-exact-attention-correlation-discussion-source.md`
 - Tracking issue: <https://github.com/sympoies/nils-cli/issues/1237>
+- Branch/commit/PR: sympoies/nils-cli#1239 merged
+  (<https://github.com/sympoies/nils-cli/pull/1239>);
+  sympoies/nils-cli#1241 merged
+  (<https://github.com/sympoies/nils-cli/pull/1241>);
+  sympoies/nils-cli#1242 merged
+  (<https://github.com/sympoies/nils-cli/pull/1242>)
 
 ## Validation Plan
 
@@ -189,8 +193,6 @@
 
 ## Handoff
 
-- No implementation work remains. Merge the docs-only closeout update, publish
-  the final tracking checkpoint, close #1237, and remove the managed worktrees.
-- Sanitized deployment and live-test evidence is retained at
-  `20260716-024029-provider-exact-attention-acceptance/README.md` under the
-  project agent-out tree.
+- Tracking issue <https://github.com/sympoies/nils-cli/issues/1237> is closed;
+  terminal execution state is synchronized. No closeout or merge action
+  remains.
