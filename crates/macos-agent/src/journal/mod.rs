@@ -1513,14 +1513,15 @@ mod tests {
 
     #[test]
     fn suppressed_values_are_constant_and_not_dictionary_oracles() {
+        const SECRET_CANARY: &str = "suppress-canary-7Xf9Qp2Lm8Vw4Rz6";
         let root = TempDir::new().expect("root");
         let mut journal = open(root.path(), EvidenceMode::Debug);
         journal
             .record_step(StepInput {
                 parent_id: None,
                 intent: None,
-                expected: Some("1234".into()),
-                argv: vec!["type".into(), "1234".into()],
+                expected: Some(SECRET_CANARY.into()),
+                argv: vec!["type".into(), SECRET_CANARY.into()],
                 status: StepStatus::Passed,
                 failure_class: None,
                 duration_ms: 1,
@@ -1533,8 +1534,8 @@ mod tests {
             .expect("step");
         journal.close().expect("close");
         let raw = fs::read_to_string(root.path().join("steps.jsonl")).expect("steps");
-        assert!(!raw.contains("1234"));
-        assert!(!raw.contains("03ac674216f3e15c"));
+        assert!(!raw.contains(SECRET_CANARY));
+        assert!(!raw.contains("2bd7ddc5825fe62d"));
         assert!(!raw.contains("length="));
         assert!(raw.contains("<suppressed>"));
     }

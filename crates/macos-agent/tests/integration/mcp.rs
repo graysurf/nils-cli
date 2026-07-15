@@ -394,7 +394,7 @@ fn cancellation_is_forwarded_while_a_request_is_in_flight() {
 while IFS= read -r line; do
   case "$line" in
     *'"id":1'*)
-      if IFS= read -r -t 1.2 cancellation; then
+      if IFS= read -r -t 1 cancellation; then
         printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"cancelled":true}}'
       else
         printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"cancelled":false}}'
