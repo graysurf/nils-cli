@@ -157,9 +157,15 @@ if [[ "$mode" == "e" ]]; then
   fi
 
   if [[ "${SOPS_ASSERT_OUTPUT_MODE:-0}" == "1" ]]; then
+    shopt -s nullglob
+    output_files=("${SOPS_STORE:?}"/.git/secrets-add-*.enc.env.tmp)
+    if (( "${#output_files[@]}" != 1 )); then
+      echo "sops: expected one private encryption output, found ${#output_files[@]}" >&2
+      exit 1
+    fi
     case "$(uname -s)" in
-      Darwin|FreeBSD) output_mode="$(stat -f '%Lp' /dev/fd/1 2>/dev/null || true)" ;;
-      *) output_mode="$(stat -Lc '%a' /dev/fd/1 2>/dev/null || true)" ;;
+      Darwin|FreeBSD) output_mode="$(stat -f '%Lp' "${output_files[0]}" 2>/dev/null || true)" ;;
+      *) output_mode="$(stat -Lc '%a' "${output_files[0]}" 2>/dev/null || true)" ;;
     esac
     if [[ "$output_mode" != "600" ]]; then
       echo "sops: encryption output is not mode 600" >&2
