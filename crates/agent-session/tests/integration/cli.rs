@@ -803,6 +803,13 @@ fn activity_events_are_runtime_bound_private_and_deterministic() {
             .windows(2)
             .any(|pair| { pair == ["-e", &format!("AGENT_SESSION_RUNTIME_ID={runtime_id}")] })
     );
+    let inherited_path = std::env::var("PATH").expect("test PATH");
+    assert!(
+        new_session
+            .windows(2)
+            .any(|pair| { pair == ["-e", &format!("PATH={inherited_path}")] }),
+        "new tmux sessions must receive the daemon PATH instead of inheriting a stale tmux-server PATH: {new_session:?}"
+    );
 
     let event = |event_id: &str,
                  kind: &str,
@@ -1611,6 +1618,11 @@ fn activity_setup_is_dry_run_first_additive_idempotent_and_reversible() {
         assert_eq!(data(&apply_json)["would_configure"], true);
         let applied = fs::read(path).expect("applied config");
         assert!(String::from_utf8_lossy(&applied).contains(keep));
+        if agent == "codex" {
+            let hooks = String::from_utf8_lossy(&applied);
+            assert!(hooks.contains("AGENT_SESSION_ATTENTION_AUTHORITY"));
+            assert!(hooks.contains("= protocol"));
+        }
         let applied_notify = (agent == "codex").then(|| {
             let contents =
                 fs::read_to_string(&codex_notify_path).expect("applied Codex notify config");
@@ -1686,6 +1698,89 @@ fn activity_setup_is_dry_run_first_additive_idempotent_and_reversible() {
             assert!(removed_notify.contains("keep = true"));
         }
     }
+}
+
+#[test]
+fn claude_setup_removes_retired_permission_notification_without_touching_user_hooks() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let home = tmp.path().join("home");
+    fs::create_dir_all(home.join(".claude")).expect("claude dir");
+    let settings_path = home.join(".claude/settings.json");
+    let home_arg = home.to_string_lossy().to_string();
+    let envs = [("HOME", home_arg.as_str())];
+    let apply = |flag: &str| {
+        run(
+            tmp.path(),
+            &[
+                "activity", "setup", "--agent", "claude", flag, "--format", "json",
+            ],
+            &envs,
+        )
+    };
+
+    let initial = apply("--apply");
+    assert_eq!(initial.code, 0, "stderr={}", initial.stderr_text());
+    let mut settings: Value = serde_json::from_str(
+        &fs::read_to_string(&settings_path).expect("initial managed settings"),
+    )
+    .expect("settings json");
+    let notifications = settings["hooks"]["Notification"]
+        .as_array_mut()
+        .expect("notification groups");
+    notifications.push(json!({
+        "matcher": "permission_prompt",
+        "hooks": [
+            {
+                "type": "command",
+                "command": "agent-session activity hook --agent claude",
+                "timeout": 5
+            },
+            {
+                "type": "command",
+                "command": "user-permission-notifier",
+                "timeout": 7
+            }
+        ]
+    }));
+    fs::write(
+        &settings_path,
+        serde_json::to_vec_pretty(&settings).expect("retired settings json"),
+    )
+    .expect("retired managed settings");
+
+    let dry_run = apply("--dry-run");
+    assert_eq!(dry_run.code, 0, "stderr={}", dry_run.stderr_text());
+    assert_eq!(data(&dry_run.stdout_json())["configured"], false);
+    assert_eq!(data(&dry_run.stdout_json())["would_change"], true);
+    assert_eq!(data(&dry_run.stdout_json())["would_configure"], true);
+
+    let repaired = apply("--repair");
+    assert_eq!(repaired.code, 0, "stderr={}", repaired.stderr_text());
+    assert_eq!(data(&repaired.stdout_json())["changed"], true);
+    assert_eq!(data(&repaired.stdout_json())["configured"], true);
+    let repaired_settings = fs::read_to_string(&settings_path).expect("repaired settings");
+    let repaired_json: Value =
+        serde_json::from_str(&repaired_settings).expect("repaired settings json");
+    let retired_group = repaired_json["hooks"]["Notification"]
+        .as_array()
+        .expect("notification groups")
+        .iter()
+        .find(|group| group["matcher"] == "permission_prompt")
+        .expect("user permission notification group retained");
+    assert_eq!(
+        retired_group["hooks"],
+        json!([{
+            "type": "command",
+            "command": "user-permission-notifier",
+            "timeout": 7
+        }])
+    );
+
+    let remove = apply("--remove");
+    assert_eq!(remove.code, 0, "stderr={}", remove.stderr_text());
+    let removed_settings = fs::read_to_string(&settings_path).expect("removed settings");
+    assert!(removed_settings.contains("user-permission-notifier"));
+    assert!(!removed_settings.contains("agent-session activity hook"));
 }
 
 #[test]
@@ -2609,6 +2704,286 @@ fn codex_activity_doctor_surfaces_notification_config_errors() {
 }
 
 #[test]
+fn activity_doctor_reports_exact_attention_capability_and_authority() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let home = tmp.path().join("home");
+    fs::create_dir_all(home.join(".codex")).expect("codex dir");
+    fs::create_dir_all(home.join(".claude")).expect("claude dir");
+    let codex = tmp.path().join("codex-version");
+    let claude = tmp.path().join("claude-version");
+    write_executable(
+        &codex,
+        "#!/usr/bin/env sh\nprintf '%s\\n' 'codex-cli 0.144.3'\n",
+    );
+    write_executable(
+        &claude,
+        "#!/usr/bin/env sh\nprintf '%s\\n' '2.1.210 (Claude Code)'\n",
+    );
+    let home_arg = home.to_string_lossy().to_string();
+    let codex_arg = codex.to_string_lossy().to_string();
+    let claude_arg = claude.to_string_lossy().to_string();
+    let audited = run(
+        tmp.path(),
+        &["activity", "doctor", "--agent", "codex", "--format", "json"],
+        &[
+            ("HOME", home_arg.as_str()),
+            ("AGENT_SESSION_CODEX_BIN", codex_arg.as_str()),
+        ],
+    );
+    assert_eq!(audited.code, 0, "stderr={}", audited.stderr_text());
+    let audited_json = audited.stdout_json();
+    let codex_provider = &data(&audited_json)["providers"][0];
+    assert_eq!(codex_provider["exact_attention"], "supported");
+    assert_eq!(
+        codex_provider["attention_authority"],
+        "protocol for audited managed app-server runtimes; hook for raw or unmanaged runtimes"
+    );
+
+    write_executable(
+        &codex,
+        "#!/usr/bin/env sh\nprintf '%s\\n' 'codex-cli 0.145.0'\n",
+    );
+    let unverified = run(
+        tmp.path(),
+        &["activity", "doctor", "--agent", "codex", "--format", "json"],
+        &[
+            ("HOME", home_arg.as_str()),
+            ("AGENT_SESSION_CODEX_BIN", codex_arg.as_str()),
+        ],
+    );
+    assert_eq!(
+        data(&unverified.stdout_json())["providers"][0]["exact_attention"],
+        "unverified"
+    );
+
+    let claude_doctor = run(
+        tmp.path(),
+        &[
+            "activity", "doctor", "--agent", "claude", "--format", "json",
+        ],
+        &[
+            ("HOME", home_arg.as_str()),
+            ("AGENT_SESSION_CLAUDE_BIN", claude_arg.as_str()),
+        ],
+    );
+    let claude_json = claude_doctor.stdout_json();
+    let claude_provider = &data(&claude_json)["providers"][0];
+    assert_eq!(
+        claude_provider["exact_attention"],
+        "conditional: exact for AskUserQuestion and Elicitation callbacks with a non-empty shared id; conservative otherwise"
+    );
+    assert_eq!(claude_provider["attention_authority"], "hook");
+}
+
+#[test]
+fn codex_protocol_authority_suppresses_permission_hook_and_breach_fails_closed() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let state_dir = tmp.path().join("state");
+    let cwd = tmp.path().join("repo");
+    fs::create_dir_all(&cwd).expect("repo dir");
+    let (tmux_bin, tmux_log) = fake_tmux(tmp.path());
+    let codex_bin = fake_agent(tmp.path(), "codex");
+    let state_arg = state_dir.to_string_lossy().to_string();
+    let cwd_arg = cwd.to_string_lossy().to_string();
+    let tmux_arg = tmux_bin.to_string_lossy().to_string();
+    let codex_arg = codex_bin.to_string_lossy().to_string();
+    let tmux_log_arg = tmux_log.to_string_lossy().to_string();
+    let start = run(
+        tmp.path(),
+        &[
+            "--state-dir",
+            &state_arg,
+            "start",
+            "--agent",
+            "codex",
+            "--cwd",
+            &cwd_arg,
+            "--tmux-bin",
+            &tmux_arg,
+            "--agent-bin",
+            &codex_arg,
+            "--paste-delay-ms",
+            "0",
+            "--format",
+            "json",
+        ],
+        &[("AGENT_SESSION_FAKE_TMUX_LOG", &tmux_log_arg)],
+    );
+    assert_eq!(start.code, 0, "stderr={}", start.stderr_text());
+    let id = data(&start.stdout_json())["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let dir = state_dir.join("sessions").join(&id);
+    let record_path = dir.join("session.json");
+    let mut record: Value = serde_json::from_slice(&fs::read(&record_path).unwrap()).unwrap();
+    let runtime_id = record["runtime"]["launch_id"].as_str().unwrap().to_string();
+    record["runtime"]["kind"] = json!("codex_app_server");
+    record["runtime"]["codex_attention_authority"] = json!("protocol");
+    fs::write(&record_path, serde_json::to_vec_pretty(&record).unwrap()).unwrap();
+    let before = fs::read(dir.join("activity.json")).unwrap();
+    let permission = json!({
+        "hook_event_name": "PermissionRequest",
+        "session_id": "thread-a",
+        "turn_id": "turn-a",
+        "tool_name": "shell",
+        "tool_input": {"command": "must-not-persist"}
+    })
+    .to_string();
+    let protocol_env = [
+        ("AGENT_SESSION_ID", id.as_str()),
+        ("AGENT_SESSION_RUNTIME_ID", runtime_id.as_str()),
+        ("AGENT_SESSION_STATE_DIR", state_arg.as_str()),
+        ("AGENT_SESSION_ATTENTION_AUTHORITY", "protocol"),
+    ];
+    let suppressed = run_with_stdin(
+        tmp.path(),
+        &["activity", "hook", "--agent", "codex"],
+        &protocol_env,
+        &permission,
+    );
+    assert_eq!(suppressed.code, 0, "stderr={}", suppressed.stderr_text());
+    assert_eq!(fs::read(dir.join("activity.json")).unwrap(), before);
+
+    let missing_authority_env = [
+        ("AGENT_SESSION_ID", id.as_str()),
+        ("AGENT_SESSION_RUNTIME_ID", runtime_id.as_str()),
+        ("AGENT_SESSION_STATE_DIR", state_arg.as_str()),
+    ];
+    let record_lock_path = state_dir.join("session-locks").join(format!("{id}.lock"));
+    let record_lock = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&record_lock_path)
+        .expect("session record lock");
+    // SAFETY: the test owns the descriptor and unlocks it before dropping it.
+    assert_eq!(
+        unsafe { libc::flock(record_lock.as_raw_fd(), libc::LOCK_EX) },
+        0
+    );
+    let binary = nils_test_support::bin::resolve("agent-session");
+    let mut child = Command::new(binary)
+        .current_dir(tmp.path())
+        .args(["activity", "hook", "--agent", "codex"])
+        .envs(missing_authority_env)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn authority breach hook");
+    child
+        .stdin
+        .take()
+        .expect("hook stdin")
+        .write_all(permission.as_bytes())
+        .expect("write hook payload");
+    let marker_path = dir.join("activity.unhealthy.json");
+    let marker_deadline = Instant::now() + Duration::from_secs(1);
+    while !marker_path.is_file() && Instant::now() < marker_deadline {
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        marker_path.is_file(),
+        "authority breach must poison the runtime before waiting on the session lock"
+    );
+    let status = run(
+        tmp.path(),
+        &[
+            "--state-dir",
+            &state_arg,
+            "activity",
+            "status",
+            &id,
+            "--format",
+            "json",
+        ],
+        &[],
+    );
+    assert_eq!(
+        data(&status.stdout_json())["turn_state"]["phase"],
+        "unknown"
+    );
+    let poisoned_state = data(&status.stdout_json())["turn_state"].clone();
+    let breached = child.wait_with_output().expect("authority breach output");
+    assert!(
+        breached.status.success(),
+        "hooks remain fail-open: {}",
+        String::from_utf8_lossy(&breached.stderr)
+    );
+    // SAFETY: the test owns the locked descriptor.
+    assert_eq!(
+        unsafe { libc::flock(record_lock.as_raw_fd(), libc::LOCK_UN) },
+        0
+    );
+    let mut updated_record: Value =
+        serde_json::from_slice(&fs::read(&record_path).unwrap()).unwrap();
+    updated_record["updated_at"] = json!("2099-01-01T00:00:00Z");
+    fs::write(
+        &record_path,
+        serde_json::to_vec_pretty(&updated_record).unwrap(),
+    )
+    .unwrap();
+    let after_record_update = run(
+        tmp.path(),
+        &[
+            "--state-dir",
+            &state_arg,
+            "activity",
+            "status",
+            &id,
+            "--format",
+            "json",
+        ],
+        &[],
+    );
+    let after_record_update_state = data(&after_record_update.stdout_json())["turn_state"].clone();
+    assert_eq!(
+        (
+            after_record_update_state["revision"].clone(),
+            after_record_update_state["phase_changed_at"].clone(),
+        ),
+        (
+            poisoned_state["revision"].clone(),
+            poisoned_state["phase_changed_at"].clone(),
+        ),
+        "pending fail-close state must stay stable across unrelated record updates"
+    );
+    let diagnostic = fs::read_to_string(dir.join("activity.diagnostic.json")).unwrap();
+    assert!(diagnostic.contains("codex-attention-authority-breach"));
+    assert!(!diagnostic.contains("must-not-persist"));
+
+    let later = run_with_stdin(
+        tmp.path(),
+        &["activity", "hook", "--agent", "codex"],
+        &protocol_env,
+        &json!({
+            "hook_event_name": "PostToolUse",
+            "session_id": "thread-a",
+            "turn_id": "turn-a"
+        })
+        .to_string(),
+    );
+    assert_eq!(later.code, 0);
+    let status = run(
+        tmp.path(),
+        &[
+            "--state-dir",
+            &state_arg,
+            "activity",
+            "status",
+            &id,
+            "--format",
+            "json",
+        ],
+        &[],
+    );
+    assert_eq!(
+        data(&status.stdout_json())["turn_state"]["phase"],
+        "unknown"
+    );
+}
+
+#[test]
 fn codex_adapter_uses_authoritative_notify_after_conservative_raw_stop() {
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let state_dir = tmp.path().join("state");
@@ -3188,8 +3563,8 @@ fn claude_ask_user_question_clears_exactly_and_keeps_generic_attention() {
         hook(json!({
             "hook_event_name": "PermissionRequest",
             "session_id": provider_session_id,
-            "tool_name": "Bash",
-            "tool_input": {"command": "discarded"}
+            "tool_name": "AskUserQuestion",
+            "tool_input": {"questions": [{"question": "discarded"}]}
         }))
         .code,
         0
@@ -3198,7 +3573,7 @@ fn claude_ask_user_question_clears_exactly_and_keeps_generic_attention() {
     assert_eq!(data(&pending)["turn_state"]["phase"], "needs_input");
     assert_eq!(
         data(&pending)["turn_state"]["current_turn"]["attention"]["pending_count"],
-        2
+        1
     );
 
     assert_eq!(
@@ -3214,10 +3589,27 @@ fn claude_ask_user_question_clears_exactly_and_keeps_generic_attention() {
     );
     let cleared = status();
     let turn = &data(&cleared)["turn_state"]["current_turn"];
-    assert_eq!(data(&cleared)["turn_state"]["phase"], "needs_input");
-    assert_eq!(turn["attention"]["pending_count"], 1);
+    assert_eq!(data(&cleared)["turn_state"]["phase"], "working");
+    assert!(turn.get("attention").is_none());
     assert_eq!(turn["started_at"], started_at);
     assert!(turn["last_progress_at"].is_string());
+
+    assert_eq!(
+        hook(json!({
+            "hook_event_name": "PermissionRequest",
+            "session_id": provider_session_id,
+            "tool_name": "Bash",
+            "tool_input": {"command": "discarded"}
+        }))
+        .code,
+        0
+    );
+    let generic = status();
+    assert_eq!(data(&generic)["turn_state"]["phase"], "needs_input");
+    assert_eq!(
+        data(&generic)["turn_state"]["current_turn"]["attention"]["pending_count"],
+        1
+    );
 
     assert_eq!(
         hook(json!({
@@ -3332,6 +3724,7 @@ fn start_creates_session_state_without_printing_prompt() {
         .iter()
         .find(|call| call.first().is_some_and(|arg| arg == "new-session"))
         .expect("new-session call");
+    let inherited_path = std::env::var("PATH").expect("test PATH");
     assert_eq!(
         new_session,
         &vec![
@@ -3350,6 +3743,10 @@ fn start_creates_session_state_without_printing_prompt() {
             format!("AGENT_SESSION_STATE_DIR={}", state_dir.display()),
             "-e".to_string(),
             format!("AGENT_SESSION_RUNTIME_ID={runtime_id}"),
+            "-e".to_string(),
+            "AGENT_SESSION_ATTENTION_AUTHORITY=hook".to_string(),
+            "-e".to_string(),
+            format!("PATH={inherited_path}"),
             "--".to_string(),
             codex_arg.clone(),
             "--cd".to_string(),
@@ -7487,6 +7884,7 @@ fn resume_recreates_tmux_runtime_from_exact_provider_identity() {
         .expect("new-session call");
     let record: Value = serde_json::from_str(&fs::read_to_string(&record_path).unwrap()).unwrap();
     let runtime_id = record["runtime"]["launch_id"].as_str().expect("runtime id");
+    let inherited_path = std::env::var("PATH").expect("test PATH");
     assert_eq!(
         new_session,
         &vec![
@@ -7505,6 +7903,10 @@ fn resume_recreates_tmux_runtime_from_exact_provider_identity() {
             format!("AGENT_SESSION_STATE_DIR={}", state_dir.display()),
             "-e".to_string(),
             format!("AGENT_SESSION_RUNTIME_ID={runtime_id}"),
+            "-e".to_string(),
+            "AGENT_SESSION_ATTENTION_AUTHORITY=hook".to_string(),
+            "-e".to_string(),
+            format!("PATH={inherited_path}"),
             "--".to_string(),
             codex_arg.clone(),
             "resume".to_string(),

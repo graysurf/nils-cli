@@ -5,7 +5,7 @@
 //! `usageLimitExceeded` error and a matching terminal `failed` completion for
 //! the same bound thread and turn.
 
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::env;
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Seek, SeekFrom};
@@ -41,10 +41,15 @@ pub(crate) const SOCKET_KEY: &str = "codex_app_server_socket";
 pub(crate) const PROXY_KEY: &str = "codex_app_server_proxy";
 pub(crate) const THREAD_HANDOFF_KEY: &str = "codex_app_server_thread_handoff";
 pub(crate) const THREAD_ATTACHED_KEY: &str = "codex_app_server_thread_attached";
+pub(crate) const ATTENTION_AUTHORITY_KEY: &str = "codex_attention_authority";
+pub(crate) const ATTENTION_AUTHORITY_ENV: &str = "AGENT_SESSION_ATTENTION_AUTHORITY";
+const ATTENTION_AUTHORITY_PROTOCOL: &str = "protocol";
+const ATTENTION_AUTHORITY_HOOK: &str = "hook";
 
 const UNIX_SOCKET_PATH_BUDGET: usize = 100;
 const MAX_PROTOCOL_ID_BYTES: usize = 256;
 const MAX_REDUCER_PENDING_TURNS: usize = 64;
+const MAX_PENDING_ATTENTION_REQUESTS: usize = 64;
 const MAX_PROXY_OBSERVATIONS: usize = 16;
 const MAX_PROXY_OBSERVATION_BYTES: usize = 64 * 1024;
 const MAX_PROXY_MESSAGE_BYTES: usize = 16 * 1024 * 1024;
@@ -52,7 +57,8 @@ const MAX_PROXY_FRAME_BYTES: usize = 4 * 1024 * 1024;
 const CONTROL_RESPONSE_TIMEOUT: Duration = Duration::from_secs(10);
 const CONTROL_SUBMISSION_TIMEOUT: Duration = Duration::from_secs(15);
 const CONTROL_SUBMIT_TOTAL_TIMEOUT: Duration = Duration::from_secs(30);
-const AUDITED_CODEX_VERSIONS: &[(u64, u64, u64)] = &[(0, 144, 1), (0, 144, 3)];
+const AUDITED_APP_SERVER_VERSIONS: &[(u64, u64, u64)] = &[(0, 144, 1), (0, 144, 3)];
+const AUDITED_EXACT_ATTENTION_VERSIONS: &[(u64, u64, u64)] = &[(0, 144, 1), (0, 144, 3)];
 const APP_SERVER_CAPABILITY_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 const APP_SERVER_CAPABILITY_PROBE_MAX_OUTPUT_BYTES: u64 = 64 * 1024;
 const MANUAL_INPUT_SECTION_FILE: &str = ".codex-app-server-manual-input";
@@ -65,6 +71,32 @@ const PROXY_CAPABILITY_FILE: &str = ".codex-app-server-proxy-capability";
 const PROXY_CAPABILITY_VERSION: &str = "agent-session.codex-manual-input-proxy.v1";
 const PROXY_CAPABILITY_TTL: Duration = Duration::from_secs(365 * 24 * 60 * 60);
 const PROXY_CAPABILITY_READY_TIMEOUT: Duration = Duration::from_secs(2);
+
+pub(crate) fn attention_authority(record: &SessionRecord) -> &'static str {
+    if record.runtime.as_ref().is_some_and(|runtime| {
+        runtime.kind == RUNTIME_KIND
+            && runtime
+                .extra
+                .get(ATTENTION_AUTHORITY_KEY)
+                .and_then(Value::as_str)
+                == Some(ATTENTION_AUTHORITY_PROTOCOL)
+    }) {
+        ATTENTION_AUTHORITY_PROTOCOL
+    } else {
+        ATTENTION_AUTHORITY_HOOK
+    }
+}
+
+pub(crate) fn exact_attention_version_is_audited(version: (u64, u64, u64)) -> bool {
+    AUDITED_EXACT_ATTENTION_VERSIONS.contains(&version)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct AppServerCapabilities {
+    transport: bool,
+    exact_attention: bool,
+    source_guard: bool,
+}
 
 pub(crate) fn configure_runtime(
     context: &CliContext,
@@ -84,7 +116,9 @@ pub(crate) fn configure_runtime(
         return Ok(());
     }
     let forced = preference == "app-server" || binding_required;
-    if !app_server_capability_available(agent_bin) {
+    let mut capabilities = app_server_capabilities(agent_bin);
+    capabilities.source_guard = crate::activity::codex_protocol_attention_source_guard_configured();
+    if !capabilities.transport {
         if forced {
             return Err(CliError::data(
                 "codex-app-server-capability-unavailable",
@@ -94,6 +128,15 @@ pub(crate) fn configure_runtime(
         }
         return Ok(());
     }
+    configure_runtime_with_capabilities(context, record, forced, capabilities)
+}
+
+fn configure_runtime_with_capabilities(
+    context: &CliContext,
+    record: &mut SessionRecord,
+    forced: bool,
+    capabilities: AppServerCapabilities,
+) -> Result<(), CliError> {
     let socket = match allocate_socket_path(context, record) {
         Ok(socket) => socket,
         Err(_) if !forced => return Ok(()),
@@ -107,6 +150,16 @@ pub(crate) fn configure_runtime(
         )
     })?;
     runtime.kind = RUNTIME_KIND.to_string();
+    runtime.extra.insert(
+        ATTENTION_AUTHORITY_KEY.to_string(),
+        json!(
+            if capabilities.exact_attention && capabilities.source_guard {
+                ATTENTION_AUTHORITY_PROTOCOL
+            } else {
+                ATTENTION_AUTHORITY_HOOK
+            }
+        ),
+    );
     runtime
         .extra
         .insert(PROTOCOL_KEY.to_string(), json!(PROTOCOL_VERSION));
@@ -128,23 +181,40 @@ pub(crate) fn configure_runtime(
     write_session_record(context, record)
 }
 
-fn app_server_capability_available(agent_bin: &Path) -> bool {
+fn app_server_capabilities(agent_bin: &Path) -> AppServerCapabilities {
     let Some(version) = bounded_command_output(agent_bin, &["--version"]) else {
-        return false;
+        return AppServerCapabilities {
+            transport: false,
+            exact_attention: false,
+            source_guard: false,
+        };
     };
     let version_text = String::from_utf8_lossy(&version.stdout);
-    if parse_version_triplet(&version_text)
-        .is_none_or(|version| !AUDITED_CODEX_VERSIONS.contains(&version))
-    {
-        return false;
-    }
-    let Some(output) = bounded_command_output(agent_bin, &["app-server", "--help"]) else {
-        return false;
+    let Some(version) = parse_version_triplet(&version_text) else {
+        return AppServerCapabilities {
+            transport: false,
+            exact_attention: false,
+            source_guard: false,
+        };
     };
-    [output.stdout, output.stderr].into_iter().any(|bytes| {
+    let version_has_transport = AUDITED_APP_SERVER_VERSIONS.contains(&version);
+    let Some(output) = bounded_command_output(agent_bin, &["app-server", "--help"]) else {
+        return AppServerCapabilities {
+            transport: false,
+            exact_attention: false,
+            source_guard: false,
+        };
+    };
+    let advertised_transport = [output.stdout, output.stderr].into_iter().any(|bytes| {
         let text = String::from_utf8_lossy(&bytes);
         text.contains("--listen <URL>") && text.contains("unix://")
-    })
+    });
+    let transport = version_has_transport && advertised_transport;
+    AppServerCapabilities {
+        transport,
+        exact_attention: transport && exact_attention_version_is_audited(version),
+        source_guard: false,
+    }
 }
 
 fn bounded_command_output(agent_bin: &Path, args: &[&str]) -> Option<std::process::Output> {
@@ -2139,7 +2209,7 @@ pub(crate) async fn run_control(
                 {
                     continue;
                 }
-                process_live_message(&context, &record, &mut reducer, &value).await?;
+                process_live_message(&context, &record, &mut reducer, None, &value).await?;
             }
         }
     }
@@ -2217,6 +2287,7 @@ impl Drop for ProxySocketGuard {
 
 struct ProxyObserver {
     pending_thread_starts: BTreeSet<String>,
+    pending_attention_requests: BTreeMap<String, String>,
     reducer: Option<FailureReducer>,
 }
 
@@ -2224,6 +2295,7 @@ impl ProxyObserver {
     fn new() -> Self {
         Self {
             pending_thread_starts: BTreeSet::new(),
+            pending_attention_requests: BTreeMap::new(),
             reducer: None,
         }
     }
@@ -2267,8 +2339,33 @@ impl ProxyObserver {
                 return Err("Codex persisted thread binding did not match the response".to_string());
             }
         }
+        if matches!(
+            value.get("method").and_then(Value::as_str),
+            Some("agent-session/attention/requested" | "agent-session/attention/resolved")
+        ) && attention_authority(record) != ATTENTION_AUTHORITY_PROTOCOL
+        {
+            // Transport support and exact-attention completeness are separate
+            // capabilities. Hook-authoritative app-server runtimes ignore the
+            // private attention projection and keep lifecycle hooks as their
+            // sole source.
+            return Ok(());
+        }
         if let Some(reducer) = self.reducer.as_mut() {
-            process_live_message(context, record, reducer, value).await?;
+            process_live_message(
+                context,
+                record,
+                reducer,
+                Some(&mut self.pending_attention_requests),
+                value,
+            )
+            .await?;
+        } else if matches!(
+            value.get("method").and_then(Value::as_str),
+            Some("agent-session/attention/requested" | "agent-session/attention/resolved")
+        ) {
+            return Err(
+                "Codex attention request arrived before the runtime thread was bound".to_string(),
+            );
         }
         Ok(())
     }
@@ -2324,11 +2421,25 @@ fn json_id_key(value: &Value) -> Option<String> {
     }
 }
 
-fn message_value(message: &Message) -> Option<Value> {
-    match message {
-        Message::Text(text) => serde_json::from_str(text).ok(),
-        Message::Binary(bytes) => serde_json::from_slice(bytes).ok(),
+fn attention_request_id_key(value: &Value) -> Option<String> {
+    match value {
+        Value::String(id) if !id.is_empty() && id.len() <= MAX_PROTOCOL_ID_BYTES => {
+            Some(format!("string:{id}"))
+        }
+        Value::Number(number) => number.as_i64().map(|id| format!("int64:{id}")),
         _ => None,
+    }
+}
+
+fn message_value(message: &Message) -> Result<Option<Value>, String> {
+    match message {
+        Message::Text(text) => serde_json::from_str(text)
+            .map(Some)
+            .map_err(|_| "proxy observed malformed JSON text".to_string()),
+        Message::Binary(bytes) => serde_json::from_slice(bytes)
+            .map(Some)
+            .map_err(|_| "proxy observed malformed JSON binary data".to_string()),
+        _ => Ok(None),
     }
 }
 
@@ -2622,10 +2733,25 @@ impl ProxyProjection {
 
     async fn finish_fail_close(&mut self) {
         self.disable();
-        if let Some(task) = self.take_fail_close_task()
-            && task.await.is_err()
-        {
-            fail_closed_projection(&self.context, &self.record).await;
+        let mut retry = false;
+        if let Some(mut task) = self.take_fail_close_task() {
+            match tokio::time::timeout(CONTROL_RESPONSE_TIMEOUT, &mut task).await {
+                Ok(Ok(())) => {}
+                Ok(Err(_)) => retry = true,
+                Err(_) => {
+                    // Dropping a JoinHandle detaches the retry. The durable
+                    // unhealthy marker already makes activity and auto-resume
+                    // fail closed while a contended session lock converges.
+                }
+            }
+        }
+        if retry {
+            let context = self.context.clone();
+            let record = self.record.clone();
+            let mut task = tokio::spawn(async move {
+                fail_closed_projection(&context, &record).await;
+            });
+            let _ = tokio::time::timeout(CONTROL_RESPONSE_TIMEOUT, &mut task).await;
         }
     }
 
@@ -2696,6 +2822,70 @@ fn server_observation(value: &Value) -> ServerProjection {
     let Some(method) = value.get("method").and_then(Value::as_str) else {
         return ServerProjection::Irrelevant;
     };
+    if let Some(kind) = match method {
+        "item/commandExecution/requestApproval"
+        | "item/fileChange/requestApproval"
+        | "item/permissions/requestApproval" => Some("approval"),
+        "item/tool/requestUserInput" => Some("clarification"),
+        "mcpServer/elicitation/request" => {
+            match value.pointer("/params/mode").and_then(Value::as_str) {
+                Some("form" | "openai/form") => Some("clarification"),
+                Some("url") => Some("authentication"),
+                _ => return ServerProjection::RejectedUnique,
+            }
+        }
+        _ => None,
+    } {
+        let (Some(request_id), Some(thread_id)) = (
+            value.get("id"),
+            value.pointer("/params/threadId").and_then(Value::as_str),
+        ) else {
+            return ServerProjection::RejectedUnique;
+        };
+        let turn_id = value.pointer("/params/turnId");
+        let turn_required = method != "mcpServer/elicitation/request";
+        if attention_request_id_key(request_id).is_none()
+            || !protocol_id_is_valid(thread_id)
+            || (turn_required
+                && !turn_id
+                    .and_then(Value::as_str)
+                    .is_some_and(protocol_id_is_valid))
+            || (!turn_required
+                && turn_id.is_some_and(|turn_id| {
+                    !turn_id.is_null() && !turn_id.as_str().is_some_and(protocol_id_is_valid)
+                }))
+        {
+            return ServerProjection::RejectedUnique;
+        }
+        return bounded_observation(json!({
+            "method": "agent-session/attention/requested",
+            "params": {
+                "requestId": request_id,
+                "threadId": thread_id,
+                "turnId": turn_id,
+                "kind": kind
+            }
+        }))
+        .map(ServerProjection::Unique)
+        .unwrap_or(ServerProjection::RejectedUnique);
+    }
+    if method == "serverRequest/resolved" {
+        let (Some(request_id), Some(thread_id)) = (
+            value.pointer("/params/requestId"),
+            value.pointer("/params/threadId").and_then(Value::as_str),
+        ) else {
+            return ServerProjection::RejectedUnique;
+        };
+        if attention_request_id_key(request_id).is_none() || !protocol_id_is_valid(thread_id) {
+            return ServerProjection::RejectedUnique;
+        }
+        return bounded_observation(json!({
+            "method": "agent-session/attention/resolved",
+            "params": {"requestId": request_id, "threadId": thread_id}
+        }))
+        .map(ServerProjection::Unique)
+        .unwrap_or(ServerProjection::RejectedUnique);
+    }
     let observation = match method {
         "error" => {
             let (Some(thread_id), Some(turn_id)) = (
@@ -2782,6 +2972,12 @@ async fn fail_closed_projection(context: &CliContext, record: &SessionRecord) {
         let id = id.clone();
         let launch_id = launch_id.clone();
         match tokio::task::spawn_blocking(move || {
+            crate::activity::mark_runtime_unhealthy(
+                &context,
+                &id,
+                &launch_id,
+                "codex_projection_unavailable",
+            )?;
             crate::auto_resume::fail_closed_projection_for_runtime(
                 &context,
                 &id,
@@ -3130,7 +3326,7 @@ async fn run_proxy_session(
                 let message = message
                     .ok_or_else(|| "remote TUI closed the proxy".to_string())?
                     .map_err(|err| format!("remote TUI read failed: {err}"))?;
-                let authorization = if let Some(value) = message_value(&message) {
+                let authorization = if let Some(value) = message_value(&message)? {
                     let Some(authorization) = cancel_before_tui_mutation(
                         &context,
                         &record,
@@ -3178,7 +3374,7 @@ async fn run_proxy_session(
                     .map_err(|err| format!("upstream app-server read failed: {err}"))?;
                 let observed = message.clone();
                 let closed = matches!(message, Message::Close(_));
-                if let Some(value) = message_value(&observed) {
+                if let Some(value) = message_value(&observed)? {
                     bootstrap.observe_server(&value);
                     projection.observe_server_before_forward(&value).await?;
                 }
@@ -3196,7 +3392,11 @@ async fn run_proxy_session(
     drop(_guard);
     drop(upstream);
     drop(tui);
-    projection.finish().await;
+    if result.is_err() {
+        projection.finish_fail_close().await;
+    } else {
+        projection.finish().await;
+    }
     result
 }
 
@@ -3285,7 +3485,7 @@ where
                 .ok_or_else(|| "Codex app-server response omitted result".to_string());
         }
         if let Some((context, record, reducer)) = live.as_mut() {
-            process_live_message(context, record, reducer, &value).await?;
+            process_live_message(context, record, reducer, None, &value).await?;
         }
     }
 }
@@ -3465,8 +3665,85 @@ async fn process_live_message(
     context: &CliContext,
     record: &SessionRecord,
     reducer: &mut FailureReducer,
+    pending_attention_requests: Option<&mut BTreeMap<String, String>>,
     value: &Value,
 ) -> Result<(), String> {
+    if matches!(
+        value.get("method").and_then(Value::as_str),
+        Some("agent-session/attention/requested" | "agent-session/attention/resolved")
+    ) {
+        let method = value
+            .get("method")
+            .and_then(Value::as_str)
+            .expect("matched attention method");
+        let thread_id = value
+            .pointer("/params/threadId")
+            .and_then(Value::as_str)
+            .ok_or_else(|| "Codex attention projection omitted thread scope".to_string())?;
+        if thread_id != reducer.thread_id {
+            return Err("Codex attention projection changed runtime thread scope".to_string());
+        }
+        let typed_request_id = value
+            .pointer("/params/requestId")
+            .and_then(attention_request_id_key)
+            .ok_or_else(|| "Codex attention projection omitted typed request id".to_string())?;
+        let requested_kind = (method == "agent-session/attention/requested")
+            .then(|| {
+                value
+                    .pointer("/params/kind")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| "Codex attention projection omitted kind".to_string())
+            })
+            .transpose()?;
+        let pending_attention_requests = pending_attention_requests.ok_or_else(|| {
+            "Codex attention projection reached a non-authoritative channel".to_string()
+        })?;
+        let correlation_token = if requested_kind.is_some() {
+            if pending_attention_requests.contains_key(&typed_request_id) {
+                return Ok(());
+            }
+            if pending_attention_requests.len() >= MAX_PENDING_ATTENTION_REQUESTS {
+                return Err(
+                    "Codex attention request cardinality exceeded the bounded projection"
+                        .to_string(),
+                );
+            }
+            let token = uuid::Uuid::new_v4().to_string();
+            pending_attention_requests.insert(typed_request_id, token.clone());
+            token
+        } else {
+            let Some(token) = pending_attention_requests.remove(&typed_request_id) else {
+                return Ok(());
+            };
+            token
+        };
+        let turn_id = value.pointer("/params/turnId").and_then(Value::as_str);
+        let context = context.clone();
+        let id = record.id.clone();
+        let runtime_id = record
+            .runtime
+            .as_ref()
+            .map(|runtime| runtime.launch_id.clone())
+            .ok_or_else(|| "Codex runtime identity is missing".to_string())?;
+        let thread_id = thread_id.to_string();
+        let turn_id = turn_id.map(str::to_string);
+        let requested_kind = requested_kind.map(str::to_string);
+        tokio::task::spawn_blocking(move || {
+            crate::activity::ingest_codex_app_server_attention(
+                &context,
+                &id,
+                &runtime_id,
+                &thread_id,
+                turn_id.as_deref(),
+                &correlation_token,
+                requested_kind.as_deref(),
+            )
+        })
+        .await
+        .map_err(|_| "Codex attention ingestion worker failed".to_string())?
+        .map_err(|err| format!("Codex attention ingestion failed: {}", err.code()))?;
+        return Ok(());
+    }
     if value.get("method").and_then(Value::as_str) == Some("account/rateLimits/updated") {
         let snapshot = value
             .get("params")
@@ -3694,6 +3971,10 @@ mod tests {
                 started_at: "2030-01-01T00:00:00Z".to_string(),
                 launch_id: format!("runtime-{id}"),
                 extra: BTreeMap::from([
+                    (
+                        ATTENTION_AUTHORITY_KEY.to_string(),
+                        json!(ATTENTION_AUTHORITY_PROTOCOL),
+                    ),
                     (PROTOCOL_KEY.to_string(), json!(PROTOCOL_VERSION)),
                     (SOCKET_KEY.to_string(), json!(display_path(socket))),
                     (
@@ -3715,6 +3996,23 @@ mod tests {
             extra: BTreeMap::new(),
             resume_sidecar_extra: BTreeMap::new(),
         }
+    }
+
+    async fn wait_for_activity(
+        context: &CliContext,
+        id: &str,
+        predicate: impl Fn(&crate::activity::TurnState) -> bool,
+    ) -> crate::activity::TurnState {
+        for _ in 0..100 {
+            let state = crate::activity::activity_status(context, id)
+                .unwrap()
+                .turn_state;
+            if predicate(&state) {
+                return state;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("activity did not converge before the bounded deadline")
     }
 
     fn write_create_bootstrap_marker(record: &SessionRecord) {
@@ -3786,6 +4084,7 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let runtime_dir = tmp.path().join("run");
         fs::create_dir(&runtime_dir).unwrap();
+        fs::set_permissions(&runtime_dir, fs::Permissions::from_mode(0o700)).unwrap();
         let _runtime_dir = EnvGuard::set(&lock, "XDG_RUNTIME_DIR", runtime_dir.to_str().unwrap());
         let _preference = EnvGuard::set(&lock, "AGENT_SESSION_CODEX_RUNTIME", "app-server");
         let agent = tmp.path().join("codex");
@@ -3904,8 +4203,170 @@ mod tests {
             )
             .unwrap();
             fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
-            assert_eq!(app_server_capability_available(&path), expected, "{name}");
+            assert_eq!(app_server_capabilities(&path).transport, expected, "{name}");
         }
+    }
+
+    #[test]
+    fn configured_app_server_runtime_selects_protocol_attention_authority() {
+        let _probe_guard = capability_probe_test_guard();
+        let lock = GlobalStateLock::new();
+        let tmp = tempfile::Builder::new()
+            .prefix("agent-session-authority-")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let runtime_dir = tmp.path().join("run");
+        let home = tmp.path().join("home");
+        fs::create_dir(&runtime_dir).unwrap();
+        fs::create_dir_all(home.join(".codex")).unwrap();
+        fs::set_permissions(&runtime_dir, fs::Permissions::from_mode(0o700)).unwrap();
+        let _runtime_dir = EnvGuard::set(&lock, "XDG_RUNTIME_DIR", runtime_dir.to_str().unwrap());
+        let _home = EnvGuard::set(&lock, "HOME", home.to_str().unwrap());
+        let _preference = EnvGuard::set(&lock, "AGENT_SESSION_CODEX_RUNTIME", "app-server");
+        fs::write(
+            home.join(".codex/hooks.json"),
+            serde_json::to_vec_pretty(&json!({
+                "hooks": {
+                    "PermissionRequest": [{
+                        "hooks": [{
+                            "type": "command",
+                            "command": "sh -c 'if [ \"${AGENT_SESSION_ATTENTION_AUTHORITY:-hook}\" = protocol ]; then exit 0; fi; exec agent-session activity hook --agent codex'",
+                            "timeout": 5
+                        }]
+                    }]
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let agent = tmp.path().join("codex");
+        fs::write(
+            &agent,
+            "#!/bin/sh\nif [ \"$1\" = --version ]; then printf '%s\\n' 'codex-cli 0.144.3'; exit 0; fi\nif [ \"$1\" = app-server ] && [ \"$2\" = --help ]; then printf '%s\\n' '  --listen <URL>  Supported values: stdio://, unix://PATH'; exit 0; fi\nexit 1\n",
+        )
+        .unwrap();
+        fs::set_permissions(&agent, fs::Permissions::from_mode(0o700)).unwrap();
+        let context = CliContext {
+            state_dir: tmp.path().join("state"),
+            host: None,
+        };
+        let mut record = record_with_runtime("authority", &runtime_dir.join("placeholder"));
+        record.runtime.as_mut().unwrap().kind = "tmux".to_string();
+        record.runtime.as_mut().unwrap().extra = BTreeMap::from([(
+            ATTENTION_AUTHORITY_KEY.to_string(),
+            json!(ATTENTION_AUTHORITY_HOOK),
+        )]);
+        fs::create_dir_all(crate::session_dir(&context, &record.id)).unwrap();
+        crate::write_session_record(&context, &record).unwrap();
+
+        configure_runtime(&context, &agent, &mut record, true).unwrap();
+        assert_eq!(record.runtime.as_ref().unwrap().kind, RUNTIME_KIND);
+        assert_eq!(attention_authority(&record), ATTENTION_AUTHORITY_PROTOCOL);
+        assert_eq!(
+            record
+                .runtime
+                .as_ref()
+                .unwrap()
+                .extra
+                .get(ATTENTION_AUTHORITY_KEY),
+            Some(&json!(ATTENTION_AUTHORITY_PROTOCOL))
+        );
+    }
+
+    #[test]
+    fn unguarded_permission_hook_prevents_protocol_attention_authority() {
+        let _probe_guard = capability_probe_test_guard();
+        let lock = GlobalStateLock::new();
+        let tmp = tempfile::Builder::new()
+            .prefix("agent-session-unguarded-")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let runtime_dir = tmp.path().join("run");
+        let home = tmp.path().join("home");
+        fs::create_dir(&runtime_dir).unwrap();
+        fs::create_dir_all(home.join(".codex")).unwrap();
+        fs::set_permissions(&runtime_dir, fs::Permissions::from_mode(0o700)).unwrap();
+        let _runtime_dir = EnvGuard::set(&lock, "XDG_RUNTIME_DIR", runtime_dir.to_str().unwrap());
+        let _home = EnvGuard::set(&lock, "HOME", home.to_str().unwrap());
+        let _preference = EnvGuard::set(&lock, "AGENT_SESSION_CODEX_RUNTIME", "app-server");
+        fs::write(
+            home.join(".codex/hooks.json"),
+            serde_json::to_vec_pretty(&json!({
+                "hooks": {
+                    "PermissionRequest": [{
+                        "hooks": [
+                            {
+                                "type": "command",
+                                "command": "sh -c 'if [ \"${AGENT_SESSION_ATTENTION_AUTHORITY:-hook}\" = protocol ]; then exit 0; fi; exec agent-session activity hook --agent codex'",
+                                "timeout": 5
+                            },
+                            {
+                                "type": "command",
+                                "command": "agent-session activity hook --agent codex",
+                                "timeout": 5
+                            }
+                        ]
+                    }]
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let agent = tmp.path().join("codex");
+        fs::write(
+            &agent,
+            "#!/bin/sh\nif [ \"$1\" = --version ]; then printf '%s\\n' 'codex-cli 0.144.3'; exit 0; fi\nif [ \"$1\" = app-server ] && [ \"$2\" = --help ]; then printf '%s\\n' '  --listen <URL>  Supported values: stdio://, unix://PATH'; exit 0; fi\nexit 1\n",
+        )
+        .unwrap();
+        fs::set_permissions(&agent, fs::Permissions::from_mode(0o700)).unwrap();
+        let context = CliContext {
+            state_dir: tmp.path().join("state"),
+            host: None,
+        };
+        let mut record = record_with_runtime("unguarded-hook", &runtime_dir.join("placeholder"));
+        record.runtime.as_mut().unwrap().kind = "tmux".to_string();
+        fs::create_dir_all(crate::session_dir(&context, &record.id)).unwrap();
+        crate::write_session_record(&context, &record).unwrap();
+
+        configure_runtime(&context, &agent, &mut record, true).unwrap();
+        assert_eq!(record.runtime.as_ref().unwrap().kind, RUNTIME_KIND);
+        assert_eq!(attention_authority(&record), ATTENTION_AUTHORITY_HOOK);
+    }
+
+    #[test]
+    fn transport_only_app_server_runtime_keeps_hook_attention_authority() {
+        let lock = GlobalStateLock::new();
+        let tmp = tempfile::Builder::new()
+            .prefix("agent-session-transport-")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let runtime_dir = tmp.path().join("run");
+        fs::create_dir(&runtime_dir).unwrap();
+        fs::set_permissions(&runtime_dir, fs::Permissions::from_mode(0o700)).unwrap();
+        let _runtime_dir = EnvGuard::set(&lock, "XDG_RUNTIME_DIR", runtime_dir.to_str().unwrap());
+        let context = CliContext {
+            state_dir: tmp.path().join("state"),
+            host: None,
+        };
+        let mut record = record_with_runtime("transport-only", &runtime_dir.join("placeholder"));
+        record.runtime.as_mut().unwrap().kind = "tmux".to_string();
+        fs::create_dir_all(crate::session_dir(&context, &record.id)).unwrap();
+        crate::write_session_record(&context, &record).unwrap();
+
+        configure_runtime_with_capabilities(
+            &context,
+            &mut record,
+            true,
+            AppServerCapabilities {
+                transport: true,
+                exact_attention: false,
+                source_guard: true,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(record.runtime.as_ref().unwrap().kind, RUNTIME_KIND);
+        assert_eq!(attention_authority(&record), ATTENTION_AUTHORITY_HOOK);
     }
 
     #[test]
@@ -3931,7 +4392,7 @@ exit 1
         .unwrap();
         fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
 
-        assert!(app_server_capability_available(&path));
+        assert!(app_server_capabilities(&path).transport);
     }
 
     #[test]
@@ -4958,6 +5419,432 @@ printf '%s\n' '{"schema_version":"agent-session.codex-auth-broker.v1","account":
         ));
     }
 
+    #[test]
+    fn exact_attention_projection_preserves_typed_ids_and_discards_content() {
+        let cases = [
+            (
+                json!({
+                    "id": 1,
+                    "method": "item/commandExecution/requestApproval",
+                    "params": {
+                        "threadId": "thread-a",
+                        "turnId": "turn-a",
+                        "command": "must-not-leave-the-adapter",
+                        "reason": "must-not-leave-the-adapter"
+                    }
+                }),
+                json!(1),
+                "approval",
+                json!("turn-a"),
+            ),
+            (
+                json!({
+                    "id": "1",
+                    "method": "item/tool/requestUserInput",
+                    "params": {
+                        "threadId": "thread-a",
+                        "turnId": "turn-a",
+                        "questions": [{"question": "must-not-leave-the-adapter"}]
+                    }
+                }),
+                json!("1"),
+                "clarification",
+                json!("turn-a"),
+            ),
+            (
+                json!({
+                    "id": 2,
+                    "method": "item/fileChange/requestApproval",
+                    "params": {"threadId": "thread-a", "turnId": "turn-a", "changes": "discarded"}
+                }),
+                json!(2),
+                "approval",
+                json!("turn-a"),
+            ),
+            (
+                json!({
+                    "id": 3,
+                    "method": "item/permissions/requestApproval",
+                    "params": {"threadId": "thread-a", "turnId": "turn-a", "permissions": "discarded"}
+                }),
+                json!(3),
+                "approval",
+                json!("turn-a"),
+            ),
+            (
+                json!({
+                    "id": 4,
+                    "method": "mcpServer/elicitation/request",
+                    "params": {"threadId": "thread-a", "turnId": null, "mode": "form", "serverName": "discarded"}
+                }),
+                json!(4),
+                "clarification",
+                Value::Null,
+            ),
+        ];
+
+        let mut projected = Vec::new();
+        for (raw, request_id, kind, turn_id) in cases {
+            let ServerProjection::Unique(value) = server_observation(&raw) else {
+                panic!("recognized blocking request must be a unique projection");
+            };
+            assert_eq!(
+                value,
+                json!({
+                    "method": "agent-session/attention/requested",
+                    "params": {
+                        "requestId": request_id,
+                        "threadId": "thread-a",
+                        "turnId": turn_id,
+                        "kind": kind
+                    }
+                })
+            );
+            let wire = serde_json::to_string(&value).unwrap();
+            assert!(!wire.contains("must-not-leave-the-adapter"));
+            assert!(!wire.contains("discarded"));
+            projected.push(value);
+        }
+        assert_ne!(
+            projected[0].pointer("/params/requestId"),
+            projected[1].pointer("/params/requestId"),
+            "JSON integer 1 and string \"1\" must remain distinct"
+        );
+
+        let ServerProjection::Unique(resolved) = server_observation(&json!({
+            "method": "serverRequest/resolved",
+            "params": {"threadId": "thread-a", "requestId": 1}
+        })) else {
+            panic!("typed resolution must be a unique projection");
+        };
+        assert_eq!(
+            resolved,
+            json!({
+                "method": "agent-session/attention/resolved",
+                "params": {"threadId": "thread-a", "requestId": 1}
+            })
+        );
+    }
+
+    #[test]
+    fn mcp_elicitation_mode_maps_exactly_and_rejects_unknown_shapes() {
+        for (mode, expected) in [
+            ("form", "clarification"),
+            ("openai/form", "clarification"),
+            ("url", "authentication"),
+        ] {
+            let ServerProjection::Unique(projected) = server_observation(&json!({
+                "id": format!("request-{mode}"),
+                "method": "mcpServer/elicitation/request",
+                "params": {"threadId": "thread-a", "turnId": null, "mode": mode}
+            })) else {
+                panic!("audited MCP elicitation mode must project");
+            };
+            assert_eq!(projected["params"]["kind"], expected);
+        }
+        for mode in [Value::Null, json!("future-mode"), json!({"bad": true})] {
+            assert!(matches!(
+                server_observation(&json!({
+                    "id": "request-invalid",
+                    "method": "mcpServer/elicitation/request",
+                    "params": {"threadId": "thread-a", "turnId": null, "mode": mode}
+                })),
+                ServerProjection::RejectedUnique
+            ));
+        }
+    }
+
+    #[test]
+    fn exact_attention_projection_rejects_invalid_scope_and_request_ids() {
+        for value in [
+            json!({
+                "id": 1.5,
+                "method": "item/fileChange/requestApproval",
+                "params": {"threadId": "thread-a", "turnId": "turn-a"}
+            }),
+            json!({
+                "id": 1,
+                "method": "item/permissions/requestApproval",
+                "params": {"threadId": "", "turnId": "turn-a"}
+            }),
+            json!({
+                "method": "serverRequest/resolved",
+                "params": {"threadId": "thread-a", "requestId": {"bad": true}}
+            }),
+        ] {
+            assert!(matches!(
+                server_observation(&value),
+                ServerProjection::RejectedUnique
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn exact_attention_requests_clear_independently_before_turn_completion() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let context = CliContext {
+            state_dir: tmp.path().join("state"),
+            host: None,
+        };
+        let record = record_with_runtime("exact-attention", &tmp.path().join("server.sock"));
+        fs::create_dir_all(crate::session_dir(&context, &record.id)).unwrap();
+        crate::write_session_record(&context, &record).unwrap();
+        crate::activity::activate_runtime(&context, &record).unwrap();
+        let mut projection = ProxyProjection::new(context.clone(), record.clone());
+        projection.observe_client(&json!({
+            "method": "turn/start",
+            "params": {"threadId": "thread-a"}
+        }));
+        projection.observe_server(&json!({
+            "id": 1,
+            "method": "item/commandExecution/requestApproval",
+            "params": {"threadId": "thread-a", "turnId": "turn-a", "command": "secret"}
+        }));
+        projection.observe_server(&json!({
+            "id": "1",
+            "method": "item/commandExecution/requestApproval",
+            "params": {"threadId": "thread-a", "turnId": "turn-a", "command": "secret"}
+        }));
+        let state = wait_for_activity(&context, &record.id, |state| {
+            state
+                .current_turn
+                .as_ref()
+                .and_then(|turn| turn.attention.as_ref())
+                .is_some_and(|attention| attention.pending_count == 2)
+        })
+        .await;
+        assert_eq!(state.phase, crate::activity::TurnPhase::NeedsInput);
+        assert_eq!(
+            state
+                .current_turn
+                .as_ref()
+                .and_then(|turn| turn.attention.as_ref())
+                .map(|attention| attention.pending_count),
+            Some(2)
+        );
+        assert!(!serde_json::to_string(&state).unwrap().contains("secret"));
+
+        projection.observe_server(&json!({
+            "method": "serverRequest/resolved",
+            "params": {"threadId": "thread-a", "requestId": 1}
+        }));
+        let one = wait_for_activity(&context, &record.id, |state| {
+            state
+                .current_turn
+                .as_ref()
+                .and_then(|turn| turn.attention.as_ref())
+                .is_some_and(|attention| attention.pending_count == 1)
+        })
+        .await;
+        assert_eq!(one.phase, crate::activity::TurnPhase::NeedsInput);
+        assert_eq!(
+            one.current_turn
+                .as_ref()
+                .and_then(|turn| turn.attention.as_ref())
+                .map(|attention| attention.pending_count),
+            Some(1)
+        );
+
+        projection.observe_server(&json!({
+            "method": "serverRequest/resolved",
+            "params": {"threadId": "thread-a", "requestId": "1"}
+        }));
+        let cleared = wait_for_activity(&context, &record.id, |state| {
+            state.phase == crate::activity::TurnPhase::Working
+                && state
+                    .current_turn
+                    .as_ref()
+                    .and_then(|turn| turn.attention.as_ref())
+                    .is_none()
+        })
+        .await;
+        assert_eq!(cleared.phase, crate::activity::TurnPhase::Working);
+        assert!(
+            cleared
+                .current_turn
+                .as_ref()
+                .and_then(|turn| turn.attention.as_ref())
+                .is_none()
+        );
+
+        let revision = cleared.revision;
+        for request_id in [json!("1"), json!("unmatched")] {
+            projection.observe_server(&json!({
+                "method": "serverRequest/resolved",
+                "params": {"threadId": "thread-a", "requestId": request_id}
+            }));
+        }
+        projection.finish().await;
+        assert_eq!(
+            crate::activity::activity_status(&context, &record.id)
+                .unwrap()
+                .turn_state
+                .revision,
+            revision,
+            "repeated and unmatched resolutions must be idempotent no-ops"
+        );
+    }
+
+    #[tokio::test]
+    async fn exact_attention_allows_sequential_id_reuse_and_keeps_raw_id_private() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let context = CliContext {
+            state_dir: tmp.path().join("state"),
+            host: None,
+        };
+        let record = record_with_runtime("attention-reuse", &tmp.path().join("server.sock"));
+        let dir = crate::session_dir(&context, &record.id);
+        fs::create_dir_all(&dir).unwrap();
+        crate::write_session_record(&context, &record).unwrap();
+        crate::activity::activate_runtime(&context, &record).unwrap();
+        let mut projection = ProxyProjection::new(context.clone(), record.clone());
+        projection.observe_client(&json!({
+            "method": "turn/start",
+            "params": {"threadId": "thread-a"}
+        }));
+        let raw_id = format!("private-{}", "x".repeat(MAX_PROTOCOL_ID_BYTES - 8));
+        assert_eq!(raw_id.len(), MAX_PROTOCOL_ID_BYTES);
+
+        for occurrence in 1..=2 {
+            projection.observe_server(&json!({
+                "id": raw_id.clone(),
+                "method": "item/commandExecution/requestApproval",
+                "params": {
+                    "threadId": "thread-a",
+                    "turnId": "turn-a",
+                    "command": "private-command-must-not-persist"
+                }
+            }));
+            let requested = wait_for_activity(&context, &record.id, |state| {
+                state.phase == crate::activity::TurnPhase::NeedsInput
+            })
+            .await;
+            assert!(requested.revision >= occurrence * 2 - 1);
+
+            let activity_files = [
+                "activity.json",
+                "activity.journal.jsonl",
+                "activity.replay.bin",
+            ];
+            for _ in 0..100 {
+                if activity_files.iter().all(|file| dir.join(file).is_file()) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            assert!(activity_files.iter().all(|file| dir.join(file).is_file()));
+            for file in activity_files {
+                let bytes = fs::read(dir.join(file)).unwrap();
+                assert!(
+                    !bytes
+                        .windows(raw_id.len())
+                        .any(|window| window == raw_id.as_bytes())
+                );
+                assert!(
+                    !String::from_utf8_lossy(&bytes).contains("private-command-must-not-persist")
+                );
+            }
+            let public = serde_json::to_string(
+                &crate::activity::activity_status(&context, &record.id)
+                    .unwrap()
+                    .turn_state,
+            )
+            .unwrap();
+            assert!(!public.contains(&raw_id));
+            assert!(!public.contains("private-command-must-not-persist"));
+
+            projection.observe_server(&json!({
+                "method": "serverRequest/resolved",
+                "params": {"threadId": "thread-a", "requestId": raw_id.clone()}
+            }));
+            wait_for_activity(&context, &record.id, |state| {
+                state.phase == crate::activity::TurnPhase::Working
+                    && state
+                        .current_turn
+                        .as_ref()
+                        .and_then(|turn| turn.attention.as_ref())
+                        .is_none()
+            })
+            .await;
+        }
+        projection.finish().await;
+
+        assert!(matches!(
+            server_observation(&json!({
+                "id": "x".repeat(MAX_PROTOCOL_ID_BYTES + 1),
+                "method": "item/commandExecution/requestApproval",
+                "params": {"threadId": "thread-a", "turnId": "turn-a"}
+            })),
+            ServerProjection::RejectedUnique
+        ));
+    }
+
+    #[tokio::test]
+    async fn exact_attention_rejects_wrong_turn_and_allows_nullable_mcp_turn() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let context = CliContext {
+            state_dir: tmp.path().join("state"),
+            host: None,
+        };
+        let record = record_with_runtime("attention-turn-scope", &tmp.path().join("server.sock"));
+        fs::create_dir_all(crate::session_dir(&context, &record.id)).unwrap();
+        crate::write_session_record(&context, &record).unwrap();
+        crate::activity::activate_runtime(&context, &record).unwrap();
+        let mut projection = ProxyProjection::new(context.clone(), record.clone());
+        projection.observe_client(&json!({
+            "method": "turn/start",
+            "params": {"threadId": "thread-a"}
+        }));
+
+        projection.observe_server(&json!({
+            "id": "matching-request",
+            "method": "item/commandExecution/requestApproval",
+            "params": {"threadId": "thread-a", "turnId": "turn-a"}
+        }));
+        wait_for_activity(&context, &record.id, |state| {
+            state.phase == crate::activity::TurnPhase::NeedsInput
+        })
+        .await;
+        projection.observe_server(&json!({
+            "method": "serverRequest/resolved",
+            "params": {"threadId": "thread-a", "requestId": "matching-request"}
+        }));
+        wait_for_activity(&context, &record.id, |state| {
+            state.phase == crate::activity::TurnPhase::Working
+        })
+        .await;
+
+        projection.observe_server(&json!({
+            "id": "mcp-request",
+            "method": "mcpServer/elicitation/request",
+            "params": {"threadId": "thread-a", "turnId": null, "mode": "form"}
+        }));
+        wait_for_activity(&context, &record.id, |state| {
+            state.phase == crate::activity::TurnPhase::NeedsInput
+        })
+        .await;
+        projection.observe_server(&json!({
+            "method": "serverRequest/resolved",
+            "params": {"threadId": "thread-a", "requestId": "mcp-request"}
+        }));
+        wait_for_activity(&context, &record.id, |state| {
+            state.phase == crate::activity::TurnPhase::Working
+        })
+        .await;
+
+        projection.observe_server(&json!({
+            "id": "wrong-turn-request",
+            "method": "item/commandExecution/requestApproval",
+            "params": {"threadId": "thread-a", "turnId": "turn-b"}
+        }));
+        let unknown = wait_for_activity(&context, &record.id, |state| {
+            state.phase == crate::activity::TurnPhase::Unknown
+        })
+        .await;
+        assert_eq!(unknown.phase, crate::activity::TurnPhase::Unknown);
+        projection.finish().await;
+    }
+
     #[tokio::test]
     async fn persisted_thread_observation_skips_duplicate_marker_io() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -5429,7 +6316,7 @@ printf '%s\n' '{"schema_version":"agent-session.codex-auth-broker.v1","account":
         }));
         tokio::time::sleep(Duration::from_millis(50)).await;
         let release_lock = tokio::spawn(async move {
-            tokio::time::sleep(CONTROL_RESPONSE_TIMEOUT + Duration::from_millis(200)).await;
+            tokio::time::sleep(Duration::from_millis(500)).await;
             drop(record_lock);
         });
 
@@ -5716,6 +6603,51 @@ printf '%s\n' '{"schema_version":"agent-session.codex-auth-broker.v1","account":
         assert!(!view.enabled);
         assert_eq!(view.state, "terminal_failure");
         assert_eq!(view.failure_reason.as_deref(), Some("state_unavailable"));
+    }
+
+    #[tokio::test]
+    async fn projection_fail_close_marks_unknown_while_activity_lock_is_held() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let context = CliContext {
+            state_dir: tmp.path().join("state"),
+            host: None,
+        };
+        let record =
+            record_with_runtime("projection-activity-lock", &tmp.path().join("server.sock"));
+        let dir = crate::session_dir(&context, &record.id);
+        fs::create_dir_all(&dir).unwrap();
+        crate::write_session_record(&context, &record).unwrap();
+        crate::activity::activate_runtime(&context, &record).unwrap();
+        crate::auto_resume::set_enabled(&context, &record.id, true, "2030-01-01T00:00:00Z")
+            .unwrap();
+        let lock = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(dir.join(".activity.lock"))
+            .unwrap();
+        assert_eq!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) }, 0);
+
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            fail_closed_projection(&context, &record),
+        )
+        .await
+        .expect("activity-lock fail-close must not hang");
+        assert_eq!(
+            crate::activity::activity_status(&context, &record.id)
+                .unwrap()
+                .turn_state
+                .phase,
+            crate::activity::TurnPhase::Unknown
+        );
+        let view = crate::auto_resume::view_for_record(&context, &record);
+        assert!(!view.enabled);
+        assert_eq!(view.state, "terminal_failure");
+        assert_eq!(view.failure_reason.as_deref(), Some("state_unavailable"));
+
+        assert_eq!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_UN) }, 0);
     }
 
     #[tokio::test]
@@ -7331,9 +8263,9 @@ printf '%s\n' '{"schema_version":"agent-session.codex-auth-broker.v1","account":
         })
         .await
         .expect("the blocking bootstrap gate attempt should start within the test deadline");
-        assert_eq!(
-            BOOTSTRAP_GATE_ATTEMPTS.load(std::sync::atomic::Ordering::Relaxed),
-            1
+        assert!(
+            BOOTSTRAP_GATE_ATTEMPTS.load(std::sync::atomic::Ordering::Relaxed) >= 1,
+            "the test-owned gate attempt must be observable even when parallel tests also use the global probe"
         );
         fs::remove_file(thread_handoff_path(&record).unwrap()).unwrap();
         unlock_bootstrap_file(&bootstrap_guard.file);
@@ -7706,8 +8638,60 @@ printf '%s\n' '{"schema_version":"agent-session.codex-auth-broker.v1","account":
         server.await.unwrap();
         proxy.await.unwrap().unwrap();
         let view = crate::auto_resume::view_for_record(&context, &record);
-        assert_eq!(view.state, "cancelled");
-        assert_eq!(view.failure_reason.as_deref(), Some("manual_input"));
+        assert_eq!(view.state, "terminal_failure");
+        assert_eq!(view.failure_reason.as_deref(), Some("state_unavailable"));
+    }
+
+    #[tokio::test]
+    async fn proxy_transport_loss_durably_fails_closed() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let upstream = tmp.path().join("transport-loss.sock");
+        let listener = tokio::net::UnixListener::bind(&upstream).unwrap();
+        let context = CliContext {
+            state_dir: tmp.path().join("state"),
+            host: None,
+        };
+        let record = record_with_runtime("transport-loss", &upstream);
+        fs::create_dir_all(crate::session_dir(&context, &record.id)).unwrap();
+        crate::write_session_record(&context, &record).unwrap();
+        crate::activity::activate_runtime(&context, &record).unwrap();
+        crate::auto_resume::set_enabled(&context, &record.id, true, "2030-01-01T00:00:00Z")
+            .unwrap();
+
+        let proxy_args = crate::cli::CodexAppServerProxyArgs {
+            id: record.id.clone(),
+            upstream: upstream.clone(),
+            listen: upstream.with_extension("proxy"),
+        };
+        let proxy_context = context.clone();
+        let proxy = tokio::spawn(async move { run_proxy_session(proxy_context, proxy_args).await });
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            drop(socket);
+        });
+        let proxy_stream = connect_socket(&upstream.with_extension("proxy"))
+            .await
+            .unwrap();
+        let (tui, _) = tokio_tungstenite::client_async("ws://localhost", proxy_stream)
+            .await
+            .unwrap();
+        server.await.unwrap();
+        let result = proxy.await.unwrap();
+        assert!(
+            result.is_err(),
+            "unexpected upstream EOF must fail the proxy"
+        );
+        drop(tui);
+
+        let state = crate::activity::activity_status(&context, &record.id)
+            .unwrap()
+            .turn_state;
+        assert_eq!(state.phase, crate::activity::TurnPhase::Unknown);
+        let view = crate::auto_resume::view_for_record(&context, &record);
+        assert!(!view.enabled);
+        assert_eq!(view.state, "terminal_failure");
+        assert_eq!(view.failure_reason.as_deref(), Some("state_unavailable"));
     }
 
     #[tokio::test]

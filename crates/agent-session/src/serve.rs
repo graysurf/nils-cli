@@ -1121,7 +1121,12 @@ fn activity_notify_event_relevant(event: &NotifyEvent) -> bool {
     let known_snapshot_path = event.paths.iter().any(|path| {
         path.file_name()
             .and_then(|name| name.to_str())
-            .is_some_and(|name| matches!(name, "activity.json" | "session.json"))
+            .is_some_and(|name| {
+                matches!(
+                    name,
+                    "activity.json" | "activity.unhealthy.json" | "session.json"
+                )
+            })
     });
     // Linux inotify normally names the removed file, while macOS FSEvents can
     // coalesce a rename/removal to its watched directory. All paths delivered
@@ -9668,14 +9673,33 @@ esac
             .prefix("cx-")
             .tempdir_in("/tmp")
             .unwrap();
+        let home = tmp.path().join("home");
         fs::set_permissions(runtime_dir.path(), fs::Permissions::from_mode(0o700)).unwrap();
         let log = tmp.path().join("tmux.log");
         fs::create_dir(&cwd).unwrap();
+        fs::create_dir_all(home.join(".codex")).unwrap();
+        fs::write(
+            home.join(".codex/hooks.json"),
+            serde_json::to_vec_pretty(&json!({
+                "hooks": {
+                    "PermissionRequest": [{
+                        "hooks": [{
+                            "type": "command",
+                            "command": "sh -c 'if [ \"${AGENT_SESSION_ATTENTION_AUTHORITY:-hook}\" = protocol ]; then exit 0; fi; exec agent-session activity hook --agent codex'",
+                            "timeout": 5
+                        }]
+                    }]
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
         let codex = executable(
             &tmp.path().join("codex-app-server"),
             "#!/usr/bin/env sh\nif [ \"$1\" = --version ]; then printf '%s\\n' 'codex-cli 0.144.1'; exit 0; fi\nif [ \"$1\" = app-server ] && [ \"$2\" = --help ]; then printf '%s\\n' '  --listen <URL>  unix://'; exit 0; fi\nexit 1\n",
         );
         let _codex_bin = EnvGuard::set(&lock, "AGENT_SESSION_CODEX_BIN", codex.to_str().unwrap());
+        let _home = EnvGuard::set(&lock, "HOME", home.to_str().unwrap());
         let _runtime_dir = EnvGuard::set(
             &lock,
             "XDG_RUNTIME_DIR",
@@ -9726,6 +9750,10 @@ esac
         let calls = fs::read_to_string(log).unwrap();
         assert!(calls.contains("agent-session-codex-app-server"));
         assert!(calls.contains("app-server --listen"));
+        assert!(
+            calls.contains("AGENT_SESSION_ATTENTION_AUTHORITY=protocol"),
+            "managed exact runtime must inject protocol authority: {calls:?}"
+        );
     }
 
     // The WebSocket attach handler guards with the same `deny_unauthorized` as
