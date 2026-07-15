@@ -7,10 +7,13 @@
 //!   (mode `600`). The plaintext is never captured into a buffer that could be
 //!   printed, and the success/JSON output carries only the store-relative path,
 //!   the destination path, and the count of keys written — never any value.
-//! - `add` copies an already-plaintext file into the store and encrypts it in
-//!   place; it never reads the contents into our own output, and aborts (after
-//!   deleting the plaintext copy) if encryption fails or the result lacks
-//!   `ENC[`.
+//! - `add` asks `sops` to encrypt the source into a private same-directory
+//!   temporary output, decrypt/MAC-validates the complete document with `sops`,
+//!   then atomically renames it over the tracked target. The target therefore
+//!   never contains plaintext. Handled termination signals before installation
+//!   leave the prior ciphertext untouched; signals after installation are
+//!   deferred until add/commit/push complete, so they cannot strand a partial
+//!   Git transaction.
 //! - `which` / `list` are pure metadata.
 //! - `edit` execs `sops <file>` interactively; we inherit stdio so the editor
 //!   round-trip stays inside sops and never passes through us.
@@ -18,7 +21,11 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Command, ExitStatus, Stdio};
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+use std::thread;
+use std::time::Duration;
 
 use nils_common::cli_contract::{Envelope, EnvelopeError, OutputFormat, exit, schema_version_for};
 use serde::Serialize;
@@ -249,37 +256,53 @@ fn add_with(env: &Env, file: &str) -> Result<AddOutcome, CmdError> {
         })?;
     }
 
-    // Copy plaintext in with restrictive permissions, then encrypt IN PLACE
-    // from within the store so `.sops.yaml` creation rules resolve.
-    copy_private(&src, &target)?;
+    // Keep the tracked target absent or unchanged until SOPS has produced and
+    // we have validated a complete ciphertext file. The mode-600 private output
+    // contains only SOPS' encryption output, never a copied plaintext target.
+    // Keep the managed signal phase alive through the complete Git transaction:
+    // before installation an interrupt cancels and reaps SOPS; after
+    // installation it is deferred until add/commit/push have completed.
+    let _signal_phase = AddSignalPhase::begin()?;
+    let temp_dir = target.parent().ok_or_else(|| {
+        CmdError::runtime(format!("cannot resolve parent for {}", target.display()))
+    })?;
+    // A sibling private output guarantees that the final rename is on the same
+    // filesystem and works for both primary checkouts (`.git` directory) and
+    // linked worktrees (`.git` pointer file plus common-dir metadata).
+    let encrypted = PrivateTempFile::new(temp_dir)?;
+    let encrypted_output = encrypted.reopen()?;
 
-    let encrypt_status = Command::new("sops")
+    let mut encrypt_command = Command::new("sops");
+    encrypt_command
         .args([
             "-e",
-            "-i",
             "--input-type",
             "dotenv",
             "--output-type",
             "dotenv",
+            "--filename-override",
         ])
         .arg(&rel)
+        .arg(&src)
         .current_dir(&env.store_root)
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::inherit())
-        .status();
+        .stdout(Stdio::from(encrypted_output))
+        .stderr(Stdio::inherit());
 
-    let encrypted_ok = matches!(&encrypt_status, Ok(status) if status.success());
-    // VERIFY the result is actually encrypted before trusting it.
-    let looks_encrypted = encrypted_ok && file_contains(&target, b"ENC[");
+    let encrypt_status = run_add_sops(&mut encrypt_command)?;
+    let encrypted_ok = encrypt_status.success()
+        && validate_encrypted_document(&env.store_root, &rel, encrypted.path())?;
 
-    if !looks_encrypted {
-        // On ANY failure remove the plaintext copy and abort before staging.
-        let _ = fs::remove_file(&target);
+    if !encrypted_ok {
+        // `encrypted` removes its private output on drop. The tracked target is
+        // still absent or still holds the previous ciphertext.
         return Err(CmdError::runtime(format!(
-            "encryption failed for {rel} — plaintext removed, nothing committed"
+            "encryption failed for {rel} — target unchanged, nothing committed"
         )));
     }
+
+    enter_add_commit_phase()?;
+    encrypted.persist(&target)?;
 
     // Stage. If nothing changed, report unchanged (no commit/push).
     git_in(&env.store_root, &["add", &rel])?;
@@ -352,12 +375,15 @@ fn edit_with(env: &Env, name: Option<&str>) -> Result<i32, CmdError> {
 // ------------------------------ git helpers ----------------------------------
 
 fn git_in(store_root: &Path, args: &[&str]) -> Result<(), CmdError> {
-    let output = Command::new("git")
+    let mut command = Command::new("git");
+    command
         .args(args)
         .current_dir(store_root)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stderr(Stdio::piped());
+    protect_add_commit_child(&mut command);
+    let output = command
         .output()
         .map_err(|err| CmdError::runtime(format!("failed to run git {}: {err}", args.join(" "))))?;
     if output.status.success() {
@@ -373,12 +399,15 @@ fn git_in(store_root: &Path, args: &[&str]) -> Result<(), CmdError> {
 
 /// True when nothing is staged for `rel` (the `add` no-op short-circuit).
 fn git_index_clean(store_root: &Path, rel: &str) -> Result<bool, CmdError> {
-    let status = Command::new("git")
+    let mut command = Command::new("git");
+    command
         .args(["diff", "--cached", "--quiet", "--", rel])
         .current_dir(store_root)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(Stdio::null());
+    protect_add_commit_child(&mut command);
+    let status = command
         .status()
         .map_err(|err| CmdError::runtime(format!("failed to run git diff: {err}")))?;
     // `git diff --quiet` exits 0 when there is no diff (clean), 1 when there is.
@@ -401,21 +430,259 @@ fn create_private_file(path: &Path) -> Result<File, CmdError> {
         .map_err(|err| CmdError::runtime(format!("cannot write {}: {err}", path.display())))
 }
 
-/// Copy a plaintext file into the store with mode 600.
-fn copy_private(src: &Path, dest: &Path) -> Result<(), CmdError> {
-    let data = fs::read(src)
-        .map_err(|err| CmdError::runtime(format!("cannot read {}: {err}", src.display())))?;
-    let mut file = create_private_file(dest)?;
-    file.write_all(&data)
-        .map_err(|err| CmdError::runtime(format!("cannot write {}: {err}", dest.display())))?;
+static ADD_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+const ADD_PHASE_IDLE: u8 = 0;
+const ADD_PHASE_CANCELLABLE: u8 = 1;
+const ADD_PHASE_INTERRUPTED: u8 = 2;
+const ADD_PHASE_COMMITTING: u8 = 3;
+static ADD_PHASE: AtomicU8 = AtomicU8::new(ADD_PHASE_IDLE);
+static ADD_SIGNAL_HANDLER: OnceLock<Result<(), String>> = OnceLock::new();
+
+/// Keep commit-phase Git commands and their descendants outside the CLI's
+/// foreground process group so terminal signals cannot split the transaction.
+#[cfg(unix)]
+fn protect_add_commit_child(command: &mut Command) {
+    if ADD_PHASE.load(Ordering::Acquire) == ADD_PHASE_COMMITTING {
+        use std::os::unix::process::CommandExt;
+
+        command.process_group(0);
+    }
+}
+
+#[cfg(not(unix))]
+fn protect_add_commit_child(_command: &mut Command) {}
+
+fn prepare_add_signal_handler() -> Result<(), CmdError> {
+    let registration = ADD_SIGNAL_HANDLER.get_or_init(|| {
+        ctrlc::set_handler(|| {
+            match ADD_PHASE.compare_exchange(
+                ADD_PHASE_CANCELLABLE,
+                ADD_PHASE_INTERRUPTED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) | Err(ADD_PHASE_INTERRUPTED | ADD_PHASE_COMMITTING) => {}
+                Err(_) => {
+                    // Outside an add transaction there is nothing to clean up;
+                    // preserve ordinary CLI interruption semantics.
+                    std::process::exit(130);
+                }
+            }
+        })
+        .map_err(|err| err.to_string())
+    });
+    if let Err(err) = registration {
+        return Err(CmdError::runtime(format!(
+            "cannot install add interruption handler: {err}"
+        )));
+    }
     Ok(())
 }
 
-fn file_contains(path: &Path, needle: &[u8]) -> bool {
-    let Ok(data) = fs::read(path) else {
-        return false;
-    };
-    data.windows(needle.len()).any(|window| window == needle)
+/// Own the signal policy for one complete `secrets add` transaction.
+///
+/// Before the atomic install commit point, the handler changes the single
+/// atomic phase from cancellable to interrupted; `run_add_sops` observes that
+/// phase, kills and reaps its child, and returns an error. The main thread wins
+/// the same compare/exchange to enter the commit phase before rename. From that
+/// linearized point onward Unix Git commands run outside the CLI foreground
+/// process group. All platforms retain synchronous `Command` ownership so Git
+/// finishes and is reaped before this guard restores ordinary interruption
+/// semantics.
+struct AddSignalPhase;
+
+impl AddSignalPhase {
+    fn begin() -> Result<Self, CmdError> {
+        prepare_add_signal_handler()?;
+        ADD_PHASE.store(ADD_PHASE_CANCELLABLE, Ordering::Release);
+        Ok(Self)
+    }
+}
+
+impl Drop for AddSignalPhase {
+    fn drop(&mut self) {
+        ADD_PHASE.store(ADD_PHASE_IDLE, Ordering::Release);
+    }
+}
+
+fn ensure_add_not_interrupted() -> Result<(), CmdError> {
+    if ADD_PHASE.load(Ordering::Acquire) == ADD_PHASE_INTERRUPTED {
+        Err(add_interrupted_error())
+    } else {
+        Ok(())
+    }
+}
+
+fn enter_add_commit_phase() -> Result<(), CmdError> {
+    match ADD_PHASE.compare_exchange(
+        ADD_PHASE_CANCELLABLE,
+        ADD_PHASE_COMMITTING,
+        Ordering::AcqRel,
+        Ordering::Acquire,
+    ) {
+        Ok(_) => Ok(()),
+        Err(ADD_PHASE_INTERRUPTED) => Err(add_interrupted_error()),
+        Err(phase) => Err(CmdError::runtime(format!(
+            "invalid add transaction phase before install: {phase}"
+        ))),
+    }
+}
+
+fn add_interrupted_error() -> CmdError {
+    CmdError::runtime("operation interrupted — target unchanged, nothing committed")
+}
+
+fn run_add_sops(command: &mut Command) -> Result<ExitStatus, CmdError> {
+    let mut child = command.spawn().map_err(|err| {
+        CmdError::unavailable(format!("failed to run sops: {err}"), "sops-unavailable")
+    })?;
+
+    loop {
+        if let Err(interrupted) = ensure_add_not_interrupted() {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(interrupted);
+        }
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                ensure_add_not_interrupted()?;
+                return Ok(status);
+            }
+            Ok(None) => thread::sleep(Duration::from_millis(10)),
+            Err(err) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(CmdError::runtime(format!(
+                    "cannot wait for sops encryption: {err}"
+                )));
+            }
+        }
+    }
+}
+
+/// Ask SOPS to parse, decrypt, and MAC-verify the complete temporary document.
+/// Both output streams are discarded so validation can never expose decrypted
+/// values or malformed input through this CLI.
+fn validate_encrypted_document(
+    store_root: &Path,
+    rel: &str,
+    encrypted: &Path,
+) -> Result<bool, CmdError> {
+    let mut command = Command::new("sops");
+    command
+        .args([
+            "-d",
+            "--input-type",
+            "dotenv",
+            "--output-type",
+            "dotenv",
+            "--filename-override",
+        ])
+        .arg(rel)
+        .arg(encrypted)
+        .current_dir(store_root)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    Ok(run_add_sops(&mut command)?.success())
+}
+
+/// Mode-600 temporary ciphertext output owned by one `secrets add` attempt.
+///
+/// The path is created with `create_new` beside the final target. Drop removes
+/// it on SOPS errors, invalid output, child termination, and SIGINT/SIGTERM
+/// caught by the CLI. The sibling location guarantees `persist` can use a
+/// same-filesystem rename, including in linked Git worktrees, so the tracked
+/// target changes atomically from absent/old ciphertext to complete ciphertext.
+struct PrivateTempFile {
+    path: PathBuf,
+    file: File,
+    persisted: bool,
+}
+
+impl PrivateTempFile {
+    fn new(dir: &Path) -> Result<Self, CmdError> {
+        for _ in 0..128 {
+            let sequence = ADD_TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+            let path = dir.join(format!(
+                ".secrets-add-{}-{sequence}.enc.env.tmp",
+                std::process::id()
+            ));
+            let mut options = OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+
+            match options.open(&path) {
+                Ok(file) => {
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::PermissionsExt;
+                        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).map_err(
+                            |err| {
+                                let _ = fs::remove_file(&path);
+                                CmdError::runtime(format!(
+                                    "cannot secure temporary encryption output: {err}"
+                                ))
+                            },
+                        )?;
+                    }
+                    return Ok(Self {
+                        path,
+                        file,
+                        persisted: false,
+                    });
+                }
+                Err(err) if err.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(err) => {
+                    return Err(CmdError::runtime(format!(
+                        "cannot create private encryption output: {err}"
+                    )));
+                }
+            }
+        }
+
+        Err(CmdError::runtime(
+            "cannot allocate a unique private encryption output",
+        ))
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+
+    fn reopen(&self) -> Result<File, CmdError> {
+        self.file.try_clone().map_err(|err| {
+            CmdError::runtime(format!("cannot open private encryption output: {err}"))
+        })
+    }
+
+    fn persist(mut self, target: &Path) -> Result<(), CmdError> {
+        self.file.sync_all().map_err(|err| {
+            CmdError::runtime(format!(
+                "cannot sync encrypted output before install: {err}"
+            ))
+        })?;
+        fs::rename(&self.path, target).map_err(|err| {
+            CmdError::runtime(format!(
+                "cannot atomically install encrypted output at {}: {err}",
+                target.display()
+            ))
+        })?;
+        self.persisted = true;
+        Ok(())
+    }
+}
+
+impl Drop for PrivateTempFile {
+    fn drop(&mut self) {
+        if !self.persisted {
+            let _ = fs::remove_file(&self.path);
+        }
+    }
 }
 
 /// Count dotenv-style `KEY=...` lines. Returns the count of keys only — no
@@ -601,16 +868,6 @@ mod tests {
         let path = tmp.path().join(".env");
         fs::write(&path, "# comment\n\nA=1\nB=secret\n  C = 3\nnotakey\n").expect("write");
         assert_eq!(count_dotenv_keys(&path), 3);
-    }
-
-    #[test]
-    fn file_contains_detects_marker() {
-        let tmp = TempDir::new().expect("tempdir");
-        let path = tmp.path().join("x");
-        fs::write(&path, "A=ENC[AES256_GCM,data:...]").expect("write");
-        assert!(file_contains(&path, b"ENC["));
-        fs::write(&path, "A=plaintext").expect("write");
-        assert!(!file_contains(&path, b"ENC["));
     }
 
     #[test]
