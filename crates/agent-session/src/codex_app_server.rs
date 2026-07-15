@@ -467,31 +467,55 @@ rm -f -- "$socket" "$proxy" "$attached"
 server=$!
 proxy_pid=
 provider_stderr_pid=
-provider_stderr_guard_pid=
 diagnostic_hold_open=
+cleanup_started=
 cleanup() {
+  if [ -n "$cleanup_started" ]; then
+    return
+  fi
+  cleanup_started=1
+  trap - EXIT
+  trap '' HUP INT TERM
   if [ -n "$diagnostic_hold_open" ]; then
     exec 9>&-
     diagnostic_hold_open=
   fi
   if [ -n "$proxy_pid" ]; then
-    kill "$proxy_pid" 2>/dev/null || true
-    wait "$proxy_pid" 2>/dev/null || true
+    owned_pid=$proxy_pid
+    proxy_pid=
+    kill "$owned_pid" 2>/dev/null || true
+    wait "$owned_pid" 2>/dev/null || true
   fi
-  kill "$server" 2>/dev/null || true
-  wait "$server" 2>/dev/null || true
-  if [ -n "$provider_stderr_guard_pid" ]; then
-    kill "$provider_stderr_guard_pid" 2>/dev/null || true
-    wait "$provider_stderr_guard_pid" 2>/dev/null || true
+  if [ -n "$server" ]; then
+    owned_pid=$server
+    server=
+    kill "$owned_pid" 2>/dev/null || true
+    wait "$owned_pid" 2>/dev/null || true
   fi
   if [ -n "$provider_stderr_pid" ]; then
-    kill "$provider_stderr_pid" 2>/dev/null || true
-    wait "$provider_stderr_pid" 2>/dev/null || true
+    owned_pid=$provider_stderr_pid
+    provider_stderr_pid=
+    kill "$owned_pid" 2>/dev/null || true
+    sleep 0.25
+    kill -9 "$owned_pid" 2>/dev/null || true
+    wait "$owned_pid" 2>/dev/null || true
   fi
-  wait "$diagnostic_pid" 2>/dev/null || true
+  if [ -n "$diagnostic_pid" ]; then
+    owned_pid=$diagnostic_pid
+    diagnostic_pid=
+    wait "$owned_pid" 2>/dev/null || true
+  fi
   rm -f -- "$socket" "$proxy" "$handoff" "$attached" "$startup_diagnostic_buffer" "$startup_diagnostic_pipe" "$provider_stderr_pipe"
 }
-trap cleanup EXIT HUP INT TERM
+handle_signal() {
+  signal_status=$1
+  cleanup
+  exit "$signal_status"
+}
+trap cleanup EXIT
+trap 'handle_signal 129' HUP
+trap 'handle_signal 130' INT
+trap 'handle_signal 143' TERM
 i=0
 while [ ! -S "$socket" ]; do
   if ! kill -0 "$server" 2>/dev/null; then
@@ -542,13 +566,13 @@ status=$?
 write_startup_marker "$runtime_exit_status" "$status"
 exec 9>&-
 diagnostic_hold_open=
-(sleep 0.25; kill "$provider_stderr_pid" 2>/dev/null || true) &
-provider_stderr_guard_pid=$!
-wait "$provider_stderr_pid" 2>/dev/null || true
+sleep 0.25
+kill "$provider_stderr_pid" 2>/dev/null || true
+sleep 0.25
+kill -9 "$provider_stderr_pid" 2>/dev/null || true
+owned_pid=$provider_stderr_pid
 provider_stderr_pid=
-kill "$provider_stderr_guard_pid" 2>/dev/null || true
-wait "$provider_stderr_guard_pid" 2>/dev/null || true
-provider_stderr_guard_pid=
+wait "$owned_pid" 2>/dev/null || true
 rm -f -- "$provider_stderr_pipe"
 if [ "$(cat "$startup_stage" 2>/dev/null)" != initial_connection ]; then
   record_startup_failure provider-client-exited
@@ -4025,7 +4049,18 @@ exit 1
         assert!(script.contains("tail -c 16384"));
         assert!(script.contains("mkfifo \"$startup_diagnostic_pipe\""));
         assert!(script.contains("tee \"$startup_diagnostic_pipe\""));
-        assert!(script.contains("sleep 0.25; kill \"$provider_stderr_pid\""));
+        assert!(script.contains("kill -9 \"$provider_stderr_pid\""));
+        let final_tee_kill = script
+            .rfind("kill -9 \"$provider_stderr_pid\"")
+            .expect("final tee escalation");
+        let claim_before_wait = &script[final_tee_kill..];
+        let clear = claim_before_wait
+            .find("provider_stderr_pid=")
+            .expect("tee pid ownership clear");
+        let wait = claim_before_wait
+            .find("wait \"$owned_pid\"")
+            .expect("tee wait through claimed pid");
+        assert!(clear < wait);
         assert!(!script.contains(">>\"$startup_diagnostic\""));
         let cleanup_lines = script
             .lines()
@@ -4059,16 +4094,25 @@ while [ "$(cat "$FAKE_PROVIDER_STAGE" 2>/dev/null)" != initial_connection ]; do
   sleep 0.01
 done
 printf '%s' "$FAKE_PROVIDER_STDERR" >&2
+if [ -n "$FAKE_LAUNCHER_PID_FILE" ]; then
+  printf '%s' "$PPID" > "$FAKE_LAUNCHER_PID_FILE"
+fi
 exit "$FAKE_PROVIDER_EXIT"
 "#,
         )
         .unwrap();
         fs::set_permissions(&helper, fs::Permissions::from_mode(0o700)).unwrap();
+        let tee = tmp.path().join("tee");
+        fs::write(&tee, "#!/bin/sh\ntrap '' TERM\nexec /usr/bin/tee \"$@\"\n").unwrap();
+        fs::set_permissions(&tee, fs::Permissions::from_mode(0o700)).unwrap();
+        let mut test_paths = vec![tmp.path().to_path_buf()];
+        test_paths.extend(env::split_paths(&env::var_os("PATH").unwrap_or_default()));
+        let test_path = env::join_paths(test_paths).unwrap();
         let state_dir = tmp.path().join("state");
         let cwd = tmp.path().join("cwd");
         fs::create_dir(&cwd).unwrap();
 
-        let run_case = |id: &str, status: i32, stderr: &str, descendant: bool| {
+        let run_case = |id: &str, status: i32, stderr: &str, descendant: bool, interrupt: bool| {
             let session_dir = state_dir.join("sessions").join(id);
             fs::create_dir_all(&session_dir).unwrap();
             let socket = tmp.path().join(format!("{id}-app.sock"));
@@ -4076,7 +4120,9 @@ exit "$FAKE_PROVIDER_EXIT"
             let handoff = tmp.path().join(format!("{id}-thread"));
             let attached = tmp.path().join(format!("{id}-attached"));
             let stage = session_dir.join(".startup-stage");
+            let runtime_exit_status = session_dir.join(".runtime-exit-status");
             let provider_stderr_pipe = session_dir.join(".provider-stderr.pipe");
+            let launcher_pid_file = session_dir.join("launcher.pid");
             let app_server_request = session_dir.join("app-server.request");
             let proxy_request = session_dir.join("proxy.request");
             let stop = Arc::new(AtomicBool::new(false));
@@ -4157,6 +4203,23 @@ exit "$FAKE_PROVIDER_EXIT"
                         .expect("provider stderr holder must start")
                 })
             });
+            let interrupt_thread = interrupt.then(|| {
+                let runtime_exit_status = runtime_exit_status.clone();
+                let launcher_pid_file = launcher_pid_file.clone();
+                thread::spawn(move || {
+                    let deadline = Instant::now() + Duration::from_secs(10);
+                    while (!runtime_exit_status.exists() || !launcher_pid_file.exists())
+                        && Instant::now() < deadline
+                    {
+                        thread::sleep(Duration::from_millis(1));
+                    }
+                    let pid = fs::read_to_string(&launcher_pid_file)
+                        .expect("provider must persist the launcher pid before exiting")
+                        .parse::<libc::pid_t>()
+                        .expect("launcher pid must be valid");
+                    assert_eq!(unsafe { libc::kill(pid, libc::SIGTERM) }, 0);
+                })
+            });
             let mut command = Command::new("/bin/sh");
             command
                 .arg("-c")
@@ -4175,11 +4238,23 @@ exit "$FAKE_PROVIDER_EXIT"
                 .env("FAKE_APP_SERVER_REQUEST", &app_server_request)
                 .env("FAKE_PROXY_REQUEST", &proxy_request)
                 .env("FAKE_PROVIDER_EXIT", status.to_string())
-                .env("FAKE_PROVIDER_STDERR", stderr);
-            let output = crate::run_output_with_timeout(command, Duration::from_secs(60));
+                .env("FAKE_PROVIDER_STDERR", stderr)
+                .env(
+                    "FAKE_LAUNCHER_PID_FILE",
+                    if interrupt {
+                        launcher_pid_file.to_string_lossy().into_owned()
+                    } else {
+                        String::new()
+                    },
+                )
+                .env("PATH", &test_path);
+            let output = crate::run_output_with_timeout(command, Duration::from_secs(10));
             stop.store(true, Ordering::Relaxed);
             app_server_thread.join().unwrap();
             proxy_thread.join().unwrap();
+            if let Some(thread) = interrupt_thread {
+                thread.join().expect("launcher interrupt must not panic");
+            }
             let mut descriptor_holder = descriptor_holder_thread.map(|thread| {
                 thread
                     .join()
@@ -4205,11 +4280,14 @@ exit "$FAKE_PROVIDER_EXIT"
                     "generated launcher must return while the provider stderr holder is alive"
                 );
             }
-            assert_eq!(output.status.code(), Some(status));
+            assert_eq!(
+                output.status.code(),
+                Some(if interrupt { 143 } else { status })
+            );
             session_dir
         };
 
-        let failed = run_case("failed-stderr", 17, "post-ready-failure\n", true);
+        let failed = run_case("failed-stderr", 17, "post-ready-failure\n", true, false);
         assert_eq!(
             fs::read(failed.join(".startup-diagnostic.log")).unwrap(),
             b"post-ready-failure\n"
@@ -4219,14 +4297,24 @@ exit "$FAKE_PROVIDER_EXIT"
             "17\n"
         );
 
-        let status_only = run_case("failed-status-only", 23, "", false);
+        let interrupted = run_case("interrupted-drain", 29, "interrupted\n", true, true);
+        assert_eq!(
+            fs::read(interrupted.join(".startup-diagnostic.log")).unwrap(),
+            b"interrupted\n"
+        );
+        assert_eq!(
+            fs::read_to_string(interrupted.join(".runtime-exit-status")).unwrap(),
+            "29\n"
+        );
+
+        let status_only = run_case("failed-status-only", 23, "", false, false);
         assert!(!status_only.join(".startup-diagnostic.log").exists());
         assert_eq!(
             fs::read_to_string(status_only.join(".runtime-exit-status")).unwrap(),
             "23\n"
         );
 
-        let clean = run_case("clean", 0, "ordinary ready stderr\n", false);
+        let clean = run_case("clean", 0, "ordinary ready stderr\n", false, false);
         assert!(!clean.join(".startup-diagnostic.log").exists());
         assert!(!clean.join(".runtime-exit-status").exists());
     }
