@@ -43,8 +43,10 @@ checkouts and linked worktrees whose `.git` is a pointer file. The target never
 contains plaintext; encryption failure, invalid output, SIGINT, or SIGTERM that
 wins the atomic install commit point leaves any prior ciphertext unchanged and
 removes the temporary output. Once installation wins that commit point, handled
-signals are deferred until `git add`, commit, and push complete so they cannot
-strand an incomplete Git transaction. This contract is
+signals are ignored for the remainder of the add transaction. On Unix, active
+Git children are also isolated from foreground process-group delivery until
+`git add`, commit, and push complete, so signals cannot strand an incomplete
+Git transaction. This contract is
 exercised by hermetic tests in `crates/secrets/tests/integration.rs` that use a
 secret canary string and assert it never appears on stdout/stderr.
 

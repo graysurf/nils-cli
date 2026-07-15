@@ -375,12 +375,15 @@ fn edit_with(env: &Env, name: Option<&str>) -> Result<i32, CmdError> {
 // ------------------------------ git helpers ----------------------------------
 
 fn git_in(store_root: &Path, args: &[&str]) -> Result<(), CmdError> {
-    let output = Command::new("git")
+    let mut command = Command::new("git");
+    command
         .args(args)
         .current_dir(store_root)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stderr(Stdio::piped());
+    protect_add_commit_child(&mut command);
+    let output = command
         .output()
         .map_err(|err| CmdError::runtime(format!("failed to run git {}: {err}", args.join(" "))))?;
     if output.status.success() {
@@ -396,12 +399,15 @@ fn git_in(store_root: &Path, args: &[&str]) -> Result<(), CmdError> {
 
 /// True when nothing is staged for `rel` (the `add` no-op short-circuit).
 fn git_index_clean(store_root: &Path, rel: &str) -> Result<bool, CmdError> {
-    let status = Command::new("git")
+    let mut command = Command::new("git");
+    command
         .args(["diff", "--cached", "--quiet", "--", rel])
         .current_dir(store_root)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(Stdio::null());
+    protect_add_commit_child(&mut command);
+    let status = command
         .status()
         .map_err(|err| CmdError::runtime(format!("failed to run git diff: {err}")))?;
     // `git diff --quiet` exits 0 when there is no diff (clean), 1 when there is.
@@ -431,6 +437,20 @@ const ADD_PHASE_INTERRUPTED: u8 = 2;
 const ADD_PHASE_COMMITTING: u8 = 3;
 static ADD_PHASE: AtomicU8 = AtomicU8::new(ADD_PHASE_IDLE);
 static ADD_SIGNAL_HANDLER: OnceLock<Result<(), String>> = OnceLock::new();
+
+/// Keep commit-phase Git commands and their descendants outside the CLI's
+/// foreground process group so terminal signals cannot split the transaction.
+#[cfg(unix)]
+fn protect_add_commit_child(command: &mut Command) {
+    if ADD_PHASE.load(Ordering::Acquire) == ADD_PHASE_COMMITTING {
+        use std::os::unix::process::CommandExt;
+
+        command.process_group(0);
+    }
+}
+
+#[cfg(not(unix))]
+fn protect_add_commit_child(_command: &mut Command) {}
 
 fn prepare_add_signal_handler() -> Result<(), CmdError> {
     let registration = ADD_SIGNAL_HANDLER.get_or_init(|| {
@@ -465,9 +485,10 @@ fn prepare_add_signal_handler() -> Result<(), CmdError> {
 /// atomic phase from cancellable to interrupted; `run_add_sops` observes that
 /// phase, kills and reaps its child, and returns an error. The main thread wins
 /// the same compare/exchange to enter the commit phase before rename. From that
-/// linearized point onward Git commands retain normal `Command` ownership and
-/// are allowed to finish and be reaped before this guard restores ordinary
-/// process interruption semantics.
+/// linearized point onward Unix Git commands run outside the CLI foreground
+/// process group. All platforms retain synchronous `Command` ownership so Git
+/// finishes and is reaped before this guard restores ordinary interruption
+/// semantics.
 struct AddSignalPhase;
 
 impl AddSignalPhase {

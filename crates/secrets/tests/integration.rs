@@ -29,7 +29,7 @@ fn run(args: &[&str], options: &CmdOptions) -> CmdOutput {
     cmd::run_with(&secrets_bin(), args, options)
 }
 
-fn spawn(args: &[&str], options: &CmdOptions) -> Child {
+fn command(args: &[&str], options: &CmdOptions) -> Command {
     let mut command = Command::new(secrets_bin());
     command
         .args(args)
@@ -47,7 +47,20 @@ fn spawn(args: &[&str], options: &CmdOptions) -> Child {
     if options.stdin_null {
         command.stdin(Stdio::null());
     }
-    command.spawn().expect("spawn secrets")
+    command
+}
+
+fn spawn(args: &[&str], options: &CmdOptions) -> Child {
+    command(args, options).spawn().expect("spawn secrets")
+}
+
+#[cfg(unix)]
+fn spawn_in_process_group(args: &[&str], options: &CmdOptions) -> Child {
+    use std::os::unix::process::CommandExt;
+
+    let mut command = command(args, options);
+    command.process_group(0);
+    command.spawn().expect("spawn secrets process group")
 }
 
 fn assert_exit(output: &CmdOutput, code: i32) {
@@ -334,6 +347,19 @@ fn send_signal(pid: u32, signal: &str) {
 }
 
 #[cfg(unix)]
+fn send_process_group_signal(process_group: u32, signal: &str) {
+    let process_group = format!("-{process_group}");
+    let status = Command::new("kill")
+        .args([signal, "--", &process_group])
+        .status()
+        .expect("run process-group kill");
+    assert!(
+        status.success(),
+        "kill {signal} process group {process_group} failed"
+    );
+}
+
+#[cfg(unix)]
 fn process_exists(pid: u32) -> bool {
     Command::new("kill")
         .args(["-0", &pid.to_string()])
@@ -455,7 +481,7 @@ fn add_interrupted_after_install_finishes_git_transaction(signal: &str) {
     git_stub(stubs.path());
     sops_stub(stubs.path());
 
-    let mut child = spawn(
+    let mut child = spawn_in_process_group(
         &["add"],
         &options(&app, &store, stubs.path())
             .with_env("GIT_LOG", &git_log.to_string_lossy())
@@ -470,7 +496,7 @@ fn add_interrupted_after_install_finishes_git_transaction(signal: &str) {
 
     wait_for_file(&git_ready);
     wait_for_file(&git_pid_file);
-    send_signal(child.id(), signal);
+    send_process_group_signal(child.id(), signal);
     let git_pid = fs::read_to_string(&git_pid_file)
         .expect("read git pid")
         .trim()
@@ -482,23 +508,15 @@ fn add_interrupted_after_install_finishes_git_transaction(signal: &str) {
         assert!(Instant::now() < deadline, "timed out waiting for secrets");
         thread::sleep(Duration::from_millis(10));
     }
-    while process_exists(git_pid) {
-        assert!(
-            Instant::now() < deadline,
-            "timed out waiting for production to reap git"
-        );
-        thread::sleep(Duration::from_millis(10));
-    }
-
     let output = child.wait_with_output().expect("wait secrets");
     let captured = CmdOutput {
         code: output.status.code().unwrap_or(-1),
         stdout: output.stdout,
         stderr: output.stderr,
     };
+    assert_process_reaped(git_pid, "git add");
     assert_exit(&captured, 0);
     assert_no_secret_leak(&captured);
-    assert_process_reaped(git_pid, "git add");
 
     let target = store.join("repos/graysurf/g14-infra.enc.env");
     let stored = fs::read_to_string(&target).expect("installed ciphertext");
@@ -1157,6 +1175,12 @@ fn add_sigterm_to_cli_cleans_temp_and_preserves_prior_target() {
 #[test]
 fn add_sigterm_after_install_finishes_git_transaction() {
     add_interrupted_after_install_finishes_git_transaction("-TERM");
+}
+
+#[cfg(unix)]
+#[test]
+fn add_sigint_after_install_finishes_git_transaction() {
+    add_interrupted_after_install_finishes_git_transaction("-INT");
 }
 
 #[test]
