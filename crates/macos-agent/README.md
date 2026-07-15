@@ -35,8 +35,11 @@ mandatory. Only the complete, machine-checked v3.9.3 standalone CLI tuple in
 the lock may continue after a failed notarization assessment; strict
 verification reports `notary=waived` and `security_posture=reduced`. There is no
 runtime bypass flag, and later releases require notarization unless a separately
-reviewed lock-schema change says otherwise. It atomically owns one stable app
-path. Rollback is permitted only
+reviewed lock-schema change says otherwise. Lifecycle responses from install,
+status, and rollback also expose `strict`, `cli_notarization_policy`, and
+`security_posture`; an accepted waiver is therefore never collapsed into an
+undifferentiated `verified=true` result. It atomically owns one stable app path.
+Rollback is permitted only
 when the exact prior tag, commit, assets, and executable digests are retained in
 the embedded `rollback_releases` allowlist; mutable receipts are never a trust
 root. A shared verified-backend lease, including the digest recorded in the

@@ -155,6 +155,9 @@ impl From<&Receipt> for PublicReceipt {
 pub struct BackendStatus {
     pub locked_tag: String,
     pub locked_commit: String,
+    pub strict: bool,
+    pub security_posture: &'static str,
+    pub cli_notarization_policy: &'static str,
     pub installed: bool,
     pub verified: bool,
     pub current: Option<PublicReceipt>,
@@ -275,13 +278,14 @@ pub fn status(dry_run: bool) -> Result<BackendStatus, CliError> {
         .is_dir()
         .then(|| LifecycleLock::acquire(&paths.root, LifecycleLockMode::Shared))
         .transpose()?;
-    status_unlocked(&lock, &paths, dry_run)
+    status_unlocked(&lock, &paths, dry_run, false)
 }
 
 fn status_unlocked(
     lock: &PeekabooLock,
     paths: &BackendPaths,
     dry_run: bool,
+    strict: bool,
 ) -> Result<BackendStatus, CliError> {
     let current = read_receipt(&paths.current_receipt())?;
     let previous = read_receipt(&paths.previous_receipt())?;
@@ -295,9 +299,17 @@ fn status_unlocked(
     let app_owned = current
         .as_ref()
         .is_some_and(|receipt| verify_receipt_app(&paths.stable_app, lock, receipt, false).is_ok());
+    let notarization_policy = current
+        .as_ref()
+        .and_then(|receipt| release_contract_for_receipt(lock, receipt).ok())
+        .map(|(cli, _, _)| cli.notarization.policy)
+        .unwrap_or(lock.cli_asset().notarization.policy);
     Ok(BackendStatus {
         locked_tag: lock.tag.clone(),
         locked_commit: lock.commit.clone(),
+        strict,
+        security_posture: security_posture(notarization_policy),
+        cli_notarization_policy: notarization_policy_name(notarization_policy),
         installed: current.is_some(),
         verified,
         current: current.as_ref().map(PublicReceipt::from),
@@ -338,13 +350,16 @@ pub fn install(dry_run: bool, strict: bool) -> Result<BackendStatus, CliError> {
         && verify_receipt(&paths, &lock, &current, strict).is_ok()
         && verify_receipt_app(&paths.stable_app, &lock, &current, strict).is_ok()
     {
-        return status_unlocked(&lock, &paths, dry_run);
+        return status_unlocked(&lock, &paths, dry_run, strict);
     }
     refuse_unowned_app(&paths)?;
     if dry_run {
         return Ok(BackendStatus {
             locked_tag: lock.tag.clone(),
             locked_commit: lock.commit.clone(),
+            strict,
+            security_posture: security_posture(lock.cli_asset().notarization.policy),
+            cli_notarization_policy: notarization_policy_name(lock.cli_asset().notarization.policy),
             installed: false,
             verified: false,
             current: None,
@@ -365,7 +380,7 @@ pub fn install(dry_run: bool, strict: bool) -> Result<BackendStatus, CliError> {
     let result = install_into_staging(&paths, &lock, &staging, strict);
     let _ = fs::remove_dir_all(&staging);
     result?;
-    status_unlocked(&lock, &paths, false)
+    status_unlocked(&lock, &paths, false, strict)
 }
 
 fn install_into_staging(
@@ -888,9 +903,16 @@ pub fn rollback(dry_run: bool, strict: bool) -> Result<BackendStatus, CliError> 
         refuse_unowned_app(&paths)?;
     }
     if dry_run {
+        let previous_policy = release_contract_for_receipt(&lock, &previous)?
+            .0
+            .notarization
+            .policy;
         return Ok(BackendStatus {
             locked_tag: lock.tag,
             locked_commit: lock.commit,
+            strict,
+            security_posture: security_posture(previous_policy),
+            cli_notarization_policy: notarization_policy_name(previous_policy),
             installed: true,
             verified: true,
             current: Some(PublicReceipt::from(&previous)),
@@ -905,7 +927,21 @@ pub fn rollback(dry_run: bool, strict: bool) -> Result<BackendStatus, CliError> 
         replace_stable_app(&paths, &previous)?;
     }
     recover_pending(&paths, &lock, strict)?;
-    status_unlocked(&lock, &paths, false)
+    status_unlocked(&lock, &paths, false, strict)
+}
+
+fn security_posture(policy: NotarizationPolicy) -> &'static str {
+    match policy {
+        NotarizationPolicy::Required => "full",
+        NotarizationPolicy::Waived => "reduced",
+    }
+}
+
+fn notarization_policy_name(policy: NotarizationPolicy) -> &'static str {
+    match policy {
+        NotarizationPolicy::Required => "required",
+        NotarizationPolicy::Waived => "waived",
+    }
 }
 
 struct VerifiedTransitionRuntime {

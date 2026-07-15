@@ -114,7 +114,7 @@ pub struct BackendMutationArgs {
     /// Show the planned operation without changing backend state.
     #[arg(long)]
     pub dry_run: bool,
-    /// Require full architecture, Gatekeeper, and notarization verification.
+    /// Enforce the locked trust policy and disclose any exact notarization waiver.
     #[arg(long)]
     pub strict: bool,
 }
@@ -131,7 +131,7 @@ pub struct BackendVerifyArgs {
     /// Runtime-only trusted SSH target; never persisted.
     #[arg(long)]
     pub host: Option<String>,
-    /// Run full Gatekeeper, notary, architecture, and capability verification.
+    /// Enforce the locked trust policy and disclose any exact notarization waiver.
     #[arg(long)]
     pub strict: bool,
 }

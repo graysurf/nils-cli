@@ -10,6 +10,32 @@ use tempfile::TempDir;
 use crate::common;
 
 #[test]
+fn lifecycle_status_discloses_locked_notarization_policy() {
+    let harness = common::MacosAgentHarness::new();
+    let cwd = TempDir::new().expect("cwd");
+    let backend_root = cwd.path().join("backend");
+    let options = harness.cmd_options(cwd.path()).with_env(
+        "NILS_MACOS_AGENT_BACKEND_ROOT",
+        backend_root.to_str().expect("backend root"),
+    );
+    let status = harness.run_with_options(
+        cwd.path(),
+        &["--format", "json", "backend", "status"],
+        options,
+    );
+    assert_eq!(status.code, 0, "{}", status.stderr_text());
+    assert_eq!(status.stdout_json()["result"]["strict"], false);
+    assert_eq!(
+        status.stdout_json()["result"]["security_posture"],
+        "reduced"
+    );
+    assert_eq!(
+        status.stdout_json()["result"]["cli_notarization_policy"],
+        "waived"
+    );
+}
+
+#[test]
 fn install_is_idempotent_and_rollback_selects_only_a_verified_previous_receipt() {
     let harness = common::MacosAgentHarness::new();
     let cwd = TempDir::new().expect("cwd");
@@ -1062,6 +1088,15 @@ fn strict_architecture_signature_notary_and_gatekeeper_checks_are_independently_
         &["--format", "json", "backend", "install", "--strict"],
     );
     assert_eq!(strict_ok.code, 0, "{}", strict_ok.stderr_text());
+    assert_eq!(strict_ok.stdout_json()["result"]["strict"], true);
+    assert_eq!(
+        strict_ok.stdout_json()["result"]["security_posture"],
+        "full"
+    );
+    assert_eq!(
+        strict_ok.stdout_json()["result"]["cli_notarization_policy"],
+        "required"
+    );
 
     for failure in [
         "architecture",
