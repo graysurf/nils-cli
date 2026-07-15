@@ -34,8 +34,10 @@ conservative latching for generic permission dialogs.
 
 1. `agent-session.turn-event.v1` is sufficient because it already carries
    correlated request and clear events and the reducer enforces exact removal.
-2. Exact-attention admission needs capability-specific audited evidence; the
-   provider's baseline version floor or an installed hook entry is insufficient.
+2. Exact-attention admission needs capability-specific audited evidence for
+   shape, protocol request completeness, and generic-hook source suppression;
+   the provider's baseline version floor or an installed hook entry is
+   insufficient.
 3. Codex chooses protocol or hook attention authority at runtime creation or
    resume and never changes it mid-runtime.
 4. Claude exact Elicitation is enabled only for installed/live payload shapes
@@ -96,10 +98,11 @@ keeping raw/unmanaged Codex conservative and avoiding ambiguous source mixing.
   - `crates/agent-session/src/activity.rs`
   - Codex fixtures and affected-test decision record
 - **Description**: Regenerate the installed Codex schema, define a
-  capability-specific audited version range or verified shape probe, and add
-  failing fixtures for every admitted request/resolution method, typed
-  `RequestId`, semantic-dedupe independence, authority modes, schema drift, and
-  asymmetric observation loss before editing Codex production logic.
+  capability-specific audited version range or verified probes for shape,
+  request-surface completeness, and source suppression, and add failing fixtures
+  for every admitted request/resolution method, typed `RequestId`,
+  semantic-dedupe independence, authority modes, schema drift, and asymmetric
+  observation loss before editing Codex production logic.
 - **Dependencies**:
   - Task 1.1
 - **Complexity**: 6
@@ -114,6 +117,9 @@ keeping raw/unmanaged Codex conservative and avoiding ambiguous source mixing.
     malformed, oversized, stale, and queue-full observations.
   - Versions or shapes outside exact-attention audit evidence are expected to
     report unverified/conservative, not supported.
+  - Protocol authority remains unavailable unless the admitted interaction
+    matrix proves complete app-server request coverage and runtime-injected
+    authority suppresses the generic permission reporter at source.
 - **Validation**:
   - Allocate evidence with
     `agent-out project --repo . --topic provider-exact-attention-schema --mkdir`
@@ -157,27 +163,29 @@ keeping raw/unmanaged Codex conservative and avoiding ambiguous source mixing.
   - `crates/agent-session/src/activity.rs`
   - managed Codex runtime/proxy lifecycle
   - activity doctor output and fixtures
-- **Description**: Select attention authority at runtime creation/resume. In an
-  admitted healthy managed app-server runtime, protocol requests are the sole
-  attention source and generic `PermissionRequest` hooks are diagnostic-only:
-  they emit no normalized attention or progress event. In raw/unmanaged or
-  preselected conservative mode, hooks retain their latch and exact protocol
-  projection is not admitted. Never switch authority mid-runtime; projection
-  failure marks the runtime's exact-attention state unhealthy/degraded until a
-  new runtime/resume.
+- **Description**: Select attention authority at runtime creation/resume.
+  Protocol authority requires a healthy admitted app-server, complete request
+  coverage for the supported interaction matrix, and a runtime-injected mode
+  that makes the generic `PermissionRequest` reporter a no-op at source. In
+  raw/unmanaged, incomplete, or preselected conservative mode, hooks retain
+  their latch and exact protocol projection is not admitted. Never switch
+  authority mid-runtime. Projection failure or an unexpected permission hook at
+  ingest marks activity unhealthy/degraded until a new runtime/resume.
 - **Dependencies**:
   - Task 2.2
 - **Complexity**: 8
 - **Acceptance criteria**:
-  - Protocol-authoritative fixtures ignore generic hooks for both attention and
-    progress and clear independent exact requests through protocol resolution.
-    Hook-first and protocol-first order leave `last_progress_at` and the pending
-    Needs Input presentation identical until the exact clear.
+  - Capability fixtures reject protocol authority when request completeness or
+    hook source suppression is unproven.
+  - Protocol-authoritative fixtures prove the generic reporter no-ops at source
+    and independent exact requests clear through protocol resolution.
   - Hook-authoritative fixtures latch generic permission hooks and never claim
     an exact clear.
-  - Adversarial hook-only A plus protocol-only B, delayed hook, reconnect,
-    restart, and replay fixtures use deterministic source authority rather than
-    pairing, tombstones, or arrival timing.
+  - If a hook bypasses suppression, adversarial hook-only and hook-before-
+    protocol traces both emit neither attention nor progress, mark activity
+    degraded/unknown, leave `last_progress_at` unchanged, and cannot recover
+    before a new runtime. Reconnect, restart, and replay fixtures use the same
+    deterministic policy rather than pairing, tombstones, or arrival timing.
   - Runtime authority cannot change after creation/resume.
   - Exact-attention status uses its own audited range/shape evidence; a newer
     unverified provider and an unhealthy projection are not reported supported.
@@ -346,7 +354,9 @@ tracker early.
 - Claude documents `elicitation_id` as optional. The conservative branch is a
   valid delivery result, not a reason to block Codex.
 - Codex hook and protocol events have no shared key. Runtime authority selection
-  replaces the impossible reconciliation ledger.
+  plus capability-proven protocol completeness and hook source suppression
+  replace the impossible reconciliation ledger; an invariant breach degrades
+  the runtime.
 - Exact Codex ids must survive semantic deduplication and preserve JSON-RPC
   string/int64 type before hashing.
 - Provider schemas can drift above a baseline version floor. Exact capability

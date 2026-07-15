@@ -32,18 +32,21 @@ runtime source authority:
 1. Keep `agent-session.turn-event.v1` and `agent-session.turn-state.v1` as the
    provider-neutral boundary. Do not introduce v2 or a new provider trait before
    evidence requires one.
-2. For an agent-session-managed Codex app-server runtime admitted by the exact
-   attention capability gate, the app-server protocol is the sole attention
-   authority for covered methods. Project the typed JSON-RPC request id and
-   clear it only on the matching `serverRequest/resolved` notification.
+2. For an agent-session-managed Codex app-server runtime, select protocol
+   authority only when capability evidence proves that the app-server request
+   surface is complete for the admitted interaction matrix and generic
+   permission-hook reporting is disabled for that runtime. Project the typed
+   JSON-RPC request id and clear it only on the matching
+   `serverRequest/resolved` notification.
 3. For raw, unmanaged, or deliberately hook-authoritative Codex runtimes,
    retain conservative generic hook latching. Do not attempt to pair an
    identifier-less hook with an exact protocol request.
 4. Select Codex authority once at runtime creation or resume. Do not switch
-   authority mid-runtime: delayed events make that ambiguous. If an admitted
-   protocol projection becomes unhealthy, fail closed to an explicit degraded
-   or unknown activity result and require a new runtime/resume before selecting
-   hook-authoritative fallback.
+   authority mid-runtime: delayed events make that ambiguous. If completeness
+   cannot be proven, select hook authority. If an admitted protocol projection
+   becomes unhealthy or an unexpected generic permission hook reaches ingest,
+   fail closed to an explicit degraded or unknown activity result for the rest
+   of that runtime and require a new runtime/resume before selecting fallback.
 5. Extend Claude exact attention beyond the already-supported
    `AskUserQuestion` path only when `Elicitation` and `ElicitationResult` carry
    the same non-empty `elicitation_id`. If installed/live evidence does not
@@ -165,9 +168,10 @@ the user resolving a manual permission dialog [W3].
 ### Shared capability and failure boundary
 
 1. Exact-attention admission is separate from the provider's baseline minimum
-   version. Use a capability-specific audited version range or a verified
-   runtime shape probe; a newer unverified provider is conservative/unverified,
-   not silently exact-capable.
+   version. Use a capability-specific audited version range or verified runtime
+   probes for event shape, request-surface completeness, and source suppression;
+   a newer or incomplete provider is conservative/unverified, not silently
+   exact-capable.
 2. Setup presence alone is not capability proof. Doctor and evidence docs must
    distinguish installed callbacks, verified correlated payloads, conservative
    support, and unhealthy projection.
@@ -183,12 +187,16 @@ the user resolving a manual permission dialog [W3].
 ### Codex app-server adapter
 
 1. At runtime creation/resume, select `protocol-authoritative` only when the
-   managed app-server capability is admitted and healthy; otherwise select
-   `hook-authoritative` for raw/unmanaged/conservative operation.
-2. In protocol-authoritative mode, generic `PermissionRequest` hooks are
-   diagnostic-only inputs and emit no normalized activity event: they neither
-   create attention nor advance `last_progress_at`. All covered attention comes
-   from the app-server protocol.
+   managed app-server capability is admitted and healthy, its recognized
+   request methods are proven complete for the supported interaction matrix,
+   and runtime-injected authority makes the generic `PermissionRequest` hook
+   reporter a no-op. Otherwise select `hook-authoritative`.
+2. In protocol-authoritative mode, all covered attention comes from the
+   app-server protocol. The generic permission reporter is suppressed at the
+   source. If such a hook nevertheless reaches ingest, treat it as a capability
+   invariant breach: emit neither request nor progress, mark activity
+   degraded/unknown for the rest of the runtime, and do not restore health when
+   a later protocol request arrives.
 3. In hook-authoritative mode, generic permission hooks retain the existing
    conservative latch and protocol attention projection is not admitted.
 4. Validate a recognized protocol request against the bound thread and active
@@ -200,8 +208,9 @@ the user resolving a manual permission dialog [W3].
 6. Preserve distinct exact ids through semantic deduplication. Event-id replay
    protection remains active.
 7. Do not switch authority mid-runtime. If protocol projection becomes
-   unhealthy, expose degraded/unknown activity without manufacturing a clear;
-   a new runtime/resume may select conservative hook authority.
+   unhealthy or source suppression is violated, expose degraded/unknown
+   activity without manufacturing a clear; a new runtime/resume may select
+   conservative hook authority.
 
 ### Claude hook adapter
 
@@ -249,10 +258,11 @@ the user resolving a manual permission dialog [W3].
   differences remain at evidence normalization.
 - R2 — Exact resolution clears only the request with the same type-preserving
   projected id, including concurrent pending requests.
-- R3 — Each Codex runtime selects one attention authority at creation/resume;
-  protocol-authoritative runtimes ignore generic attention hooks, while
-  hook-authoritative runtimes latch them conservatively. No mid-runtime switch
-  or heuristic source pairing is allowed.
+- R3 — Each Codex runtime selects one attention authority at creation/resume.
+  Protocol authority requires proved app-server request completeness and
+  source-suppressed generic permission reporting. Hook authority latches those
+  hooks conservatively. An unexpected hook in protocol mode degrades the
+  runtime; no mid-runtime switch or heuristic source pairing is allowed.
 - R4 — Claude Elicitation clears automatically only when installed/live
   evidence proves a shared non-empty id. Otherwise the lane completes with an
   explicit conservative limitation.
@@ -275,11 +285,14 @@ the user resolving a manual permission dialog [W3].
 - String and integer request ids, including concurrent integer `1` and string
   `"1"`, project distinctly and clear independently. Concurrent counts follow
   `2 -> 1 -> 0` even inside the semantic-dedupe window.
-- Protocol-authoritative fixtures prove generic permission hooks emit neither
-  attention nor progress in hook-first and protocol-first order, leaving
-  `last_progress_at` and pending presentation unchanged. Hook-authoritative
-  fixtures prove the same hooks remain conservatively latched. No fixture
-  depends on arrival timing or pairing.
+- Capability fixtures prove protocol authority is unavailable unless the
+  admitted interaction matrix has complete protocol request coverage and the
+  generic permission reporter is suppressed for that runtime.
+- Protocol-authoritative fixtures prove the reporter no-ops at source. If a
+  hook bypasses suppression, hook-only and hook-before-protocol traces both
+  deterministically degrade/unknown without changing `last_progress_at` or
+  recovering mid-runtime. Hook-authoritative fixtures prove the same hook is
+  conservatively latched.
 - Queue-full, oversized, malformed, replay, reconnect, restart, and schema-drift
   fixtures prove the asymmetric degraded/unknown and no-false-clear behavior.
 - Claude acceptance follows the capability matrix: matching non-empty ids
@@ -312,7 +325,9 @@ the user resolving a manual permission dialog [W3].
 - Claude documents `elicitation_id` as optional; exact support is per proven
   payload shape, not a blanket provider claim.
 - Codex hooks and app-server requests share no stable key. Authority selection,
-  not a reconciliation ledger, prevents double counting.
+  capability-proven protocol completeness, and runtime source suppression—not a
+  reconciliation ledger—prevent double counting. If any premise fails, the
+  runtime degrades or starts hook-authoritative.
 - Exact provider capability has its own audited range/shape evidence. A generic
   minimum version or installed hook entry is insufficient.
 - Changed or lost recognized request evidence degrades activity instead of

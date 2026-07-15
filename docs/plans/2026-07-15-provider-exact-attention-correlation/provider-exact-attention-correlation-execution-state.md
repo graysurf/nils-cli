@@ -64,9 +64,13 @@
 - 2026-07-15: Opened L2 tracker #1237 from the committed bundle and initialized
   run `20260715T155230Z-issue-1237` at Sprint 1, Task 1.1. The tracker remains
   open for the later implementation session.
-- 2026-07-15: API-contract follow-up clarified that a duplicate
-  `PermissionRequest` hook in protocol-authoritative mode is diagnostic-only and
-  must not advance `last_progress_at` or change pending presentation.
+- 2026-07-15: API-contract follow-up ruled out treating a duplicate
+  `PermissionRequest` hook as progress because it must not advance
+  `last_progress_at` or change pending presentation.
+- 2026-07-15: Red-team follow-up proved that hook-only and hook-before-protocol
+  traces are indistinguishable. Protocol authority now requires proven request
+  completeness plus hook source suppression; a hook that bypasses suppression
+  degrades the runtime instead of being ignored or paired.
 
 ## Validation
 
