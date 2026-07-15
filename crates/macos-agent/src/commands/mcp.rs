@@ -432,7 +432,7 @@ fn handle_client_frame(
             )?;
             write_protocol_error(
                 output,
-                serde_json::Value::Null,
+                id.clone(),
                 -32002,
                 "outstanding request limit exceeded",
             )?;

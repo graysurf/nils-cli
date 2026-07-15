@@ -601,6 +601,16 @@ fn silent_reading_upstream_cannot_grow_outstanding_request_state_without_bound()
         "missing bounded-pending rejection: {errors:?}"
     );
     assert!(
+        errors.iter().any(|frame| frame["id"] == 17),
+        "count-limit rejection lost request correlation"
+    );
+    assert!(
+        errors
+            .iter()
+            .any(|frame| frame["id"].as_str().is_some_and(|id| id.len() == 70 * 1024)),
+        "metadata-limit rejection lost request correlation"
+    );
+    assert!(
         out.stdout.len() < 128 * 1024,
         "resource-limit response echoed oversized correlation data"
     );
