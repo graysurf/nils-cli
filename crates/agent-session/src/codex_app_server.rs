@@ -4129,9 +4129,11 @@ exit "$FAKE_PROVIDER_EXIT"
             let app_server_request = session_dir.join("app-server.request");
             let proxy_request = session_dir.join("proxy.request");
             let stop = Arc::new(AtomicBool::new(false));
+            let descriptor_holder_ready = descendant.then(|| Arc::new(AtomicBool::new(false)));
             let bind_socket = |request: PathBuf,
                                socket: PathBuf,
                                stage: Option<PathBuf>,
+                               stage_barrier: Option<Arc<AtomicBool>>,
                                stop: Arc<AtomicBool>| {
                 thread::spawn(move || {
                     let deadline = Instant::now() + Duration::from_secs(3);
@@ -4155,6 +4157,18 @@ exit "$FAKE_PROVIDER_EXIT"
                             thread::sleep(Duration::from_millis(5));
                         }
                         if !stop.load(Ordering::Relaxed) {
+                            if let Some(stage_barrier) = stage_barrier {
+                                while !stage_barrier.load(Ordering::Acquire)
+                                    && !stop.load(Ordering::Relaxed)
+                                    && Instant::now() < deadline
+                                {
+                                    thread::sleep(Duration::from_millis(5));
+                                }
+                                assert!(
+                                    stage_barrier.load(Ordering::Acquire),
+                                    "provider stderr holder must be ready before stage advance"
+                                );
+                            }
                             fs::write(stage, "initial_connection\n").unwrap();
                         }
                     }
@@ -4167,15 +4181,17 @@ exit "$FAKE_PROVIDER_EXIT"
                 app_server_request.clone(),
                 socket.clone(),
                 None,
+                None,
                 Arc::clone(&stop),
             );
             let proxy_thread = bind_socket(
                 proxy_request.clone(),
                 proxy.clone(),
                 Some(stage.clone()),
+                descriptor_holder_ready.as_ref().map(Arc::clone),
                 Arc::clone(&stop),
             );
-            let descriptor_holder_thread = descendant.then(|| {
+            let descriptor_holder_thread = descriptor_holder_ready.map(|ready| {
                 thread::spawn(move || {
                     let deadline = Instant::now() + Duration::from_secs(10);
                     let stderr = loop {
@@ -4197,13 +4213,15 @@ exit "$FAKE_PROVIDER_EXIT"
                             Err(err) => panic!("provider stderr holder must open the pipe: {err}"),
                         }
                     };
-                    Command::new("sleep")
+                    let child = Command::new("sleep")
                         .arg("300")
                         .stdin(Stdio::null())
                         .stdout(Stdio::null())
                         .stderr(Stdio::from(stderr))
                         .spawn()
-                        .expect("provider stderr holder must start")
+                        .expect("provider stderr holder must start");
+                    ready.store(true, Ordering::Release);
+                    child
                 })
             });
             let interrupt_thread = interrupt.then(|| {
