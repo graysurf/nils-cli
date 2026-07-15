@@ -21,16 +21,18 @@ These tools are required for common command paths. Each row is anchored to at le
 | `grpcurl` | `api-grpc` unary backend (via `api-testing-core::grpc::runner`); overridable with `GRPCURL_BIN` | Required (for `api-grpc call` / suite gRPC cases) | `brew install grpcurl` |
 | `ffmpeg` | `screen-record` on Linux (X11 + Wayland portal capture, audio mux) | Required on Linux | `brew install ffmpeg` |
 | `codex` | `codex-cli auth login` and `codex-cli agent *` flows | Required for `codex-cli` runtime | Install from official Codex distribution |
-| `ssh` | `codex-cli auth remote pull` remote token-authority transport | Required for `codex-cli auth remote pull` | Usually preinstalled (`brew install openssh`) |
+| `ssh` | `codex-cli auth remote pull`; `macos-agent --host` fixed-command JSON transport | Required for those remote flows | Usually preinstalled (`brew install openssh`) |
 | `gemini` | `gemini-cli auth login` flow | Required for `gemini-cli` login | Install from official Gemini CLI distribution |
 | `opencode` | `opencode-cli agent *` flows | Required for `opencode-cli` runtime | Install from official OpenCode distribution |
-| `curl` | `gemini-cli` auth refresh + rate-limit client | Required for `gemini-cli` auth flows | Usually preinstalled (`brew install curl`) |
+| `curl` | `gemini-cli` auth refresh + rate-limit client; locked Peekaboo asset download for `macos-agent backend install` | Required for those flows | Usually preinstalled (`brew install curl`) |
 | `/bin/ps` | `claude-cli` nested CLI usage-probe timeout cleanup on non-Linux Unix | Required for reliable descendant cleanup on macOS/BSD; Linux reads `/proc` directly | Usually preinstalled |
 | `tmux` | `agent-session` start/run/resume/attach/glance/send/delete/serve flows | Required for tmux-backed `agent-session` runtime | `brew install tmux` |
 | `sops` | `secrets pull/add/edit` encryption and decryption flows | Required for `secrets` runtime | `brew install sops` |
 | `security` | `claude-cli prompt-segment` Keychain credential lookup | Required on macOS unless `CLAUDE_PROMPT_SEGMENT_ACCESS_TOKEN` / `CLAUDE_PROMPT_SEGMENT_CREDENTIALS_JSON` is supplied | Preinstalled on macOS |
 | `docker` | `docker-tools container *`, `docker-tools run *`, and Docker Compose v2 resolution for `docker-tools compose down` | Required for `docker-tools` Docker-backed commands | `brew install docker` |
-| `osascript` | `macos-agent` AppleScript backend, preflight checks | Required on macOS for `macos-agent` | Preinstalled on macOS |
+| `tar`, `unzip` | Inspect and extract the exact locked Peekaboo CLI/app archives for `macos-agent backend install` | Required for `macos-agent backend install` | Usually preinstalled (`brew install gnu-tar unzip`) |
+| `lipo`, `codesign`, `spctl` | Architecture, exact signing-identity, CLI notarization assessment, and mandatory app Gatekeeper/notary verification for the locked Peekaboo backend; only the exact machine-checked v3.9.3 CLI tuple may report its failed assessment as an explicit reduced-posture waiver | Required on macOS for strict install/verify/doctor | Preinstalled with macOS/Xcode command-line tools |
+| `open` | Launch the stable, adapter-owned Peekaboo app runtime | Required for `macos-agent --runtime app` | Preinstalled on macOS |
 | `gh` | `git-cli open *` GitHub helpers, `plan-issue` GitHub I/O, `forge-cli` GitHub backend | Required for GitHub-facing flows | `brew install gh` |
 | `glab` | `forge-cli` GitLab backend, including `glab api` for MR checks/wait/merge and inbox reads | Required for GitLab-facing `forge-cli` flows | `brew install glab` |
 | `direnv` | `agent-run exec` project environment activation for applicable `.envrc` / `.env` files | Required when a project env file applies and `--direnv` is not `off` | `brew install direnv` |
@@ -65,9 +67,6 @@ in `crates/*/src`.
 | `pactl` | Linux audio source discovery for `screen-record --audio ...` | `brew install pulseaudio` |
 | `xdg-desktop-portal` + backend + PipeWire | Wayland portal capture path (`screen-record --portal`) | Prefer distro packages |
 | `open` | macOS `open` invocation for `screen-record` permission prompts | Preinstalled on macOS |
-| `hs` (Hammerspoon CLI) | Preferred AX backend path for `macos-agent ax *` (fallback to JXA when unavailable) and required backend for `macos-agent input scroll` | `brew install --cask hammerspoon` |
-| `cliclick` | Required by `macos-agent input click`, `input move`, and `input drag`; also probed by preflight | `brew install cliclick` |
-| `im-select` | Required by `macos-agent input-source *` and macOS real E2E keyboard/input-source setup | `brew install im-select` |
 | `openvpn` | Optional `forge-cli inbox --gitlab-vpn-check openvpn` readiness dependency probe; `forge-cli` never starts or stops VPN | `brew install openvpn` |
 | `glab` `mr note create --resolvable` | `forge-cli pr review` on GitLab probes `glab mr note create --help` and picks the most capable note form: with `--resolvable` it posts a non-resolvable status note; with `create` but no `--resolvable` it drops only that flag; with no `create` subcommand it uses the bare `glab mr note <id>` form. Only the first avoids registering on the `pr merge` thread gate | `brew upgrade glab` |
 | `docker-compose` | Fallback backend for `docker-tools compose down` when Docker Compose v2 is unavailable | `brew install docker-compose` |
@@ -144,7 +143,7 @@ cargo run -p agent-docs -- preflight --intent project-dev --format json \
 ### 6.1 Base contributor profile
 
 ```bash
-brew install git gh glab fzf webp ffmpeg bat zsh python bash-completion rustup-init im-select tmux sops
+brew install git gh glab fzf webp ffmpeg bat zsh python bash-completion rustup-init tmux sops
 ```
 
 ### 6.2 Linux extra profile (audio/clipboard/network ergonomics)
@@ -168,7 +167,7 @@ eval "$(/home/linuxbrew/.linuxbrew/bin/brew shellenv)"
 ## 8. Quick Environment Verification
 
 ```bash
-for c in git gh glab fzf grpcurl file ffmpeg bat im-select curl tmux sops; do
+for c in git gh glab fzf grpcurl file ffmpeg bat curl tmux sops ssh tar unzip; do
   if command -v "$c" >/dev/null 2>&1; then
     echo "[OK]   $c -> $(command -v "$c")"
   else

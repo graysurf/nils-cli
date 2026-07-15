@@ -1,104 +1,97 @@
 use std::fmt;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ErrorCategory {
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ErrorClass {
     Usage,
-    Runtime,
+    Backend,
+    Upstream,
+    Journal,
+    Transport,
+    Permission,
+    Policy,
 }
 
-impl ErrorCategory {
-    pub fn as_str(self) -> &'static str {
+impl ErrorClass {
+    pub const fn exit_code(self) -> u8 {
+        match self {
+            Self::Usage => 64,
+            Self::Backend => 69,
+            Self::Upstream => 70,
+            Self::Journal => 74,
+            Self::Transport => 75,
+            Self::Permission => 77,
+            Self::Policy => 78,
+        }
+    }
+
+    pub const fn as_str(self) -> &'static str {
         match self {
             Self::Usage => "usage",
-            Self::Runtime => "runtime",
+            Self::Backend => "backend",
+            Self::Upstream => "upstream",
+            Self::Journal => "journal",
+            Self::Transport => "transport",
+            Self::Permission => "permission",
+            Self::Policy => "policy",
         }
     }
 }
 
 #[derive(Debug, Clone)]
 pub struct CliError {
+    class: ErrorClass,
     message: String,
-    exit_code: u8,
-    category: ErrorCategory,
     operation: Option<String>,
     hints: Vec<String>,
 }
 
 impl CliError {
-    pub fn usage(message: impl Into<String>) -> Self {
-        Self::new(message, 2, ErrorCategory::Usage)
-    }
-
-    pub fn runtime(message: impl Into<String>) -> Self {
-        Self::new(message, 1, ErrorCategory::Runtime)
-    }
-
-    pub fn unsupported_platform() -> Self {
-        Self::usage("macos-agent is only supported on macOS")
-    }
-
-    pub fn timeout(operation: &str, timeout_ms: u64) -> Self {
-        let mut err = Self::runtime(format!("{operation} timed out after {timeout_ms}ms"))
-            .with_operation(operation)
-            .with_hint(
-                "Increase --timeout-ms for slower apps or enable --retries for transient failures.",
-            );
-        if operation.starts_with("ax.") {
-            err = err.with_hint(
-                "For large UI trees, reduce --max-depth/--limit before retrying to keep AX queries bounded.",
-            );
+    pub fn new(class: ErrorClass, message: impl Into<String>) -> Self {
+        Self {
+            class,
+            message: normalize_message(message.into()),
+            operation: None,
+            hints: Vec::new(),
         }
-        err
     }
 
-    pub fn ax_payload_encode(operation: &str, detail: impl Into<String>) -> Self {
-        Self::runtime(format!(
-            "{operation} failed: unable to encode AX request payload ({})",
-            detail.into().trim()
-        ))
-        .with_operation(operation)
-        .with_hint("Simplify selector/text input and retry.")
+    pub fn usage(message: impl Into<String>) -> Self {
+        Self::new(ErrorClass::Usage, message)
     }
 
-    pub fn ax_parse_failure(operation: &str, detail: impl Into<String>) -> Self {
-        Self::runtime(format!(
-            "{operation} failed: invalid AX backend JSON response ({})",
-            detail.into().trim()
-        ))
-        .with_operation(operation)
-        .with_hint("Run `macos-agent preflight --include-probes --strict` to verify Accessibility/Automation access.")
-        .with_hint("Review preflight `ax_backend_capabilities` to confirm backend support and fallback behavior.")
-        .with_hint("Use --trace to capture raw backend output for diagnosis.")
+    pub fn backend(message: impl Into<String>) -> Self {
+        Self::new(ErrorClass::Backend, message)
     }
 
-    pub fn ax_contract_failure(operation: &str, detail: impl Into<String>) -> Self {
-        Self::runtime(format!(
-            "{operation} failed: AX backend contract violation ({})",
-            detail.into().trim()
-        ))
-        .with_operation(operation)
-        .with_hint("Adjust AX selector filters so exactly one element is targeted.")
-        .with_hint("For attr/action/session/watch flows, ensure Hammerspoon backend is available.")
+    pub fn upstream(message: impl Into<String>) -> Self {
+        Self::new(ErrorClass::Upstream, message)
     }
 
-    pub fn exit_code(&self) -> u8 {
-        self.exit_code
+    pub fn journal(message: impl Into<String>) -> Self {
+        Self::new(ErrorClass::Journal, message)
     }
 
-    pub fn category(&self) -> ErrorCategory {
-        self.category
+    pub fn transport(message: impl Into<String>) -> Self {
+        Self::new(ErrorClass::Transport, message)
     }
 
-    pub fn operation(&self) -> Option<&str> {
-        self.operation.as_deref()
+    pub fn permission(message: impl Into<String>) -> Self {
+        Self::new(ErrorClass::Permission, message)
     }
 
-    pub fn hints(&self) -> &[String] {
-        &self.hints
+    pub fn policy(message: impl Into<String>) -> Self {
+        Self::new(ErrorClass::Policy, message)
     }
 
-    pub fn message(&self) -> &str {
-        &self.message
+    pub fn with_operation(mut self, operation: impl Into<String>) -> Self {
+        let operation = operation.into();
+        if !operation.trim().is_empty() {
+            self.operation = Some(operation);
+        }
+        self
     }
 
     pub fn with_hint(mut self, hint: impl Into<String>) -> Self {
@@ -109,37 +102,68 @@ impl CliError {
         self
     }
 
-    pub fn with_operation(mut self, operation: impl Into<String>) -> Self {
-        let operation = operation.into();
-        if !operation.trim().is_empty() {
-            self.operation = Some(operation);
-        }
-        self
+    pub const fn class(&self) -> ErrorClass {
+        self.class
     }
-}
 
-impl CliError {
-    fn new(message: impl Into<String>, exit_code: u8, category: ErrorCategory) -> Self {
-        let message = message
-            .into()
-            .trim()
-            .trim_start_matches("error:")
-            .trim()
-            .to_string();
-        Self {
-            message,
-            exit_code,
-            category,
-            operation: None,
-            hints: Vec::new(),
-        }
+    pub const fn exit_code(&self) -> u8 {
+        self.class.exit_code()
+    }
+
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+
+    pub fn operation(&self) -> Option<&str> {
+        self.operation.as_deref()
+    }
+
+    pub fn hints(&self) -> &[String] {
+        &self.hints
     }
 }
 
 impl fmt::Display for CliError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "error: {}", self.message)
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "error: {}", self.message)
     }
 }
 
 impl std::error::Error for CliError {}
+
+fn normalize_message(message: String) -> String {
+    message
+        .trim()
+        .trim_start_matches("error:")
+        .trim()
+        .to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{CliError, ErrorClass};
+
+    #[test]
+    fn exit_classes_are_stable_and_distinct() {
+        let classes = [
+            ErrorClass::Usage,
+            ErrorClass::Backend,
+            ErrorClass::Upstream,
+            ErrorClass::Journal,
+            ErrorClass::Transport,
+            ErrorClass::Permission,
+            ErrorClass::Policy,
+        ];
+        let mut codes = classes.map(ErrorClass::exit_code).to_vec();
+        codes.sort_unstable();
+        codes.dedup();
+        assert_eq!(codes.len(), classes.len());
+    }
+
+    #[test]
+    fn normalizes_nested_error_prefixes() {
+        let error = CliError::backend(" error: broken ");
+        assert_eq!(error.message(), "broken");
+        assert_eq!(error.exit_code(), 69);
+    }
+}

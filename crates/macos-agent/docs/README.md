@@ -4,7 +4,8 @@
 
 ## Specs
 
-- None yet. Add documents under `docs/specs/` and register them here.
+- [`specs/macos-agent-journal-v2.md`](specs/macos-agent-journal-v2.md)
+  — structural journal, redaction, recovery, replay, and review contract.
 
 ## Runbooks
 
@@ -12,7 +13,8 @@
 
 ## Reports
 
-- None yet. Add documents under `docs/reports/` and register them here.
+- None. Transient candidate and live-gate evidence belongs in workflow evidence,
+  not the released crate documentation.
 
 ## Links
 

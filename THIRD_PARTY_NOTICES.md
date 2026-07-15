@@ -3,7 +3,7 @@
 This file documents third-party notice-file discovery for Rust crates used by this workspace.
 
 - Data source: `cargo metadata --format-version 1 --locked`
-- Cargo.lock SHA256: `bdce259e4568fba17717b3341302b8c7fafd7ff04c283cfc3c98c20e7e6df939`
+- Cargo.lock SHA256: `c9b61235e05ecee00259be73388b9aed5b56fd8a14dc7719ad6890b2e5d4551d`
 - Third-party crates (`source != null`): 468
 
 ## Notice Extraction Policy
@@ -4061,3 +4061,12 @@ This file documents third-party notice-file discovery for Rust crates used by th
 - Notice files: No explicit NOTICE file discovered.
 - License file references:
   - `LICENSE`
+
+## Locked Runtime Backend Notice
+
+### Peekaboo v3.9.3
+
+- License: `MIT`
+- Source: <https://github.com/openclaw/Peekaboo/tree/v3.9.3>
+- License text: <https://github.com/openclaw/Peekaboo/blob/v3.9.3/LICENSE>
+- Distribution model: official release assets are downloaded on demand, verified against the immutable lock, and are not embedded in nils-cli release artifacts.

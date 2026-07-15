@@ -2402,17 +2402,19 @@ dependencies = [
 name = "nils-macos-agent"
 version = "1.22.5"
 dependencies = [
+ "base64",
  "clap",
  "clap_complete",
- "image",
+ "jiff",
+ "libc",
  "nils-build-info",
  "nils-common",
- "nils-screen-record",
  "nils-test-support",
  "pretty_assertions",
- "regex",
+ "roxmltree 0.21.1",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
 ]
 

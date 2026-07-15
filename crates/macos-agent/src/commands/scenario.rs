@@ -1,219 +1,187 @@
-use std::process::Command;
-use std::time::Instant;
+use std::fs;
+use std::path::PathBuf;
+use std::time::Duration;
 
-use serde::Deserialize;
-use serde_json::Value;
+use nils_common::fs::{SECRET_FILE_MODE, write_atomic};
+use sha2::{Digest, Sha256};
 
-use crate::cli::{OutputFormat, ScenarioRunArgs};
-use crate::commands::{emit_json_success, reject_tsv_for_list_only};
-use crate::error::CliError;
-use crate::model::{ScenarioRunResult, ScenarioStepResult};
+use crate::cli::ScenarioArgs;
+use crate::commands::{hardened_env, peekaboo_binary, prepare_runtime};
+use crate::error::{CliError, ErrorClass};
+use crate::journal::{Journal, StepInput, StepStatus, sanitize_output, sanitize_result_json};
+use crate::model::{ExecutionResult, UpstreamResult};
+use crate::policy;
+use crate::process;
 
-#[derive(Debug, Deserialize)]
-struct ScenarioFile {
-    steps: Vec<ScenarioStepSpec>,
+pub struct ScenarioOutcome {
+    pub result: ExecutionResult,
+    pub exit_code: u8,
 }
 
-#[derive(Debug, Deserialize)]
-struct ScenarioStepSpec {
-    #[serde(default)]
-    id: Option<String>,
-    args: Vec<String>,
+pub fn run_local(
+    args: &ScenarioArgs,
+    transport: &'static str,
+) -> Result<ScenarioOutcome, CliError> {
+    let raw = validate_source(args)?;
+    let scenario: serde_json::Value = serde_json::from_slice(&raw).map_err(|error| {
+        CliError::usage(format!("scenario is not valid JSON: {error}")).with_operation("scenario")
+    })?;
+    policy::validate_scenario(&scenario)?;
+    let binary = peekaboo_binary()?;
+    let mut journal = Journal::open_for_backend(
+        &args.out_dir,
+        args.runtime,
+        transport,
+        args.evidence_mode,
+        None,
+        &binary,
+    )?;
+    let runtime = prepare_runtime(args.runtime, &binary)?;
+    let source_digest = hex(&Sha256::digest(&raw));
+    let staged_source = StagedScenario::create(&args.out_dir, &raw)?;
+    let upstream = vec![
+        "run".into(),
+        staged_source.path().to_string_lossy().into_owned(),
+        "--json".into(),
+    ];
+    let (envs, removed_envs) = hardened_env(None);
+    let output = process::run(
+        binary.path(),
+        &runtime.argv(&upstream),
+        &envs,
+        &removed_envs,
+        None,
+        Duration::from_secs(args.timeout_seconds.clamp(1, 3600)),
+    )
+    .map_err(|_| {
+        CliError::upstream("failed to start the locked Peekaboo scenario runner")
+            .with_operation("scenario")
+    })?;
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    let parsed = serde_json::from_str::<serde_json::Value>(stdout.trim()).ok();
+    let malformed_json = !output.timed_out && output.exit_code == 0 && parsed.is_none();
+    let unknown_mutation = output.timed_out || output.signal.is_some();
+    let status = if unknown_mutation {
+        StepStatus::Unknown
+    } else if output.exit_code == 0 && !malformed_json {
+        StepStatus::Passed
+    } else {
+        StepStatus::Failed
+    };
+    let failure_class = if unknown_mutation {
+        Some("unknown_mutation".into())
+    } else if malformed_json {
+        Some("upstream_malformed_json".into())
+    } else if output.exit_code != 0 {
+        Some("upstream_scenario".into())
+    } else {
+        None
+    };
+    let step = journal.record_step(StepInput {
+        parent_id: None,
+        intent: Some("run reviewed Peekaboo scenario".into()),
+        expected: Some("scenario assertions determine per-step success".into()),
+        argv: vec!["run".into(), format!("sha256:{source_digest}")],
+        status,
+        failure_class,
+        duration_ms: output.elapsed_ms,
+        retries: 0,
+        precondition_refs: vec![format!("scenario-sha256-{source_digest}")],
+        postcondition_refs: vec!["scenario-assertions".into()],
+        snapshot_lineage: None,
+        artifact_refs: Vec::new(),
+    })?;
+    journal.close()?;
+    let json = parsed
+        .as_ref()
+        .map(|value| sanitize_result_json(value, args.evidence_mode));
+    let text = (json.is_none() && !stdout.trim().is_empty())
+        .then(|| sanitize_output(stdout.trim(), args.evidence_mode));
+    let diagnostic =
+        (!stderr.trim().is_empty()).then(|| sanitize_output(stderr.trim(), args.evidence_mode));
+    Ok(ScenarioOutcome {
+        result: ExecutionResult {
+            transport,
+            runtime: args.runtime,
+            evidence_mode: args.evidence_mode,
+            journal_step: step.id,
+            upstream: UpstreamResult {
+                exit_code: output.exit_code,
+                signal: output.signal,
+                timed_out: output.timed_out,
+                stdout_truncated: output.stdout_truncated,
+                stderr_truncated: output.stderr_truncated,
+                json,
+                text,
+                diagnostic,
+            },
+        },
+        exit_code: if output.timed_out || output.exit_code != 0 || malformed_json {
+            ErrorClass::Upstream.exit_code()
+        } else {
+            0
+        },
+    })
 }
 
-pub fn run(format: OutputFormat, args: &ScenarioRunArgs) -> Result<(), CliError> {
-    let raw = std::fs::read_to_string(&args.file).map_err(|err| {
-        CliError::runtime(format!(
-            "failed to read scenario file `{}`: {err}",
-            args.file.display()
-        ))
-        .with_operation("scenario.run")
-    })?;
-    let scenario: ScenarioFile = serde_json::from_str(&raw).map_err(|err| {
-        CliError::usage(format!(
-            "scenario file `{}` is not valid json: {err}",
-            args.file.display()
-        ))
-        .with_operation("scenario.run")
-    })?;
+struct StagedScenario(PathBuf);
 
-    if scenario.steps.is_empty() {
+impl StagedScenario {
+    fn create(root: &std::path::Path, raw: &[u8]) -> Result<Self, CliError> {
+        let path = root.join(format!(
+            ".scenario-input-{}-{}.json",
+            std::process::id(),
+            crate::test_mode::timestamp()
+                .chars()
+                .filter(|character| character.is_ascii_alphanumeric())
+                .take(24)
+                .collect::<String>()
+        ));
+        write_atomic(&path, raw, SECRET_FILE_MODE)
+            .map_err(|_| CliError::journal("failed to stage the reviewed scenario source"))?;
+        Ok(Self(path))
+    }
+
+    fn path(&self) -> &std::path::Path {
+        &self.0
+    }
+}
+
+impl Drop for StagedScenario {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.0);
+    }
+}
+
+fn hex(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut output = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        output.push(HEX[(byte >> 4) as usize] as char);
+        output.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    output
+}
+
+pub(crate) fn validate_source(args: &ScenarioArgs) -> Result<Vec<u8>, CliError> {
+    let metadata = fs::symlink_metadata(&args.file)
+        .map_err(|_| CliError::usage("scenario file is unavailable"))?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
         return Err(
-            CliError::usage("scenario file must contain at least one step")
-                .with_operation("scenario.run"),
+            CliError::policy("scenario source must be a regular non-symlink file")
+                .with_operation("scenario"),
         );
     }
-
-    let exe = std::env::current_exe().map_err(|err| {
-        CliError::runtime(format!(
-            "failed to resolve current executable for scenario run: {err}"
-        ))
-        .with_operation("scenario.run")
-    })?;
-
-    let mut step_results = Vec::with_capacity(scenario.steps.len());
-    let mut first_failed_step_id = None;
-
-    for (idx, step) in scenario.steps.iter().enumerate() {
-        if step.args.is_empty() {
-            return Err(
-                CliError::usage(format!("scenario step {} has empty args", idx + 1))
-                    .with_operation("scenario.run"),
-            );
-        }
-        if step.args.iter().any(|arg| arg == "scenario") {
-            return Err(CliError::usage(format!(
-                "scenario step {} recursively invokes `scenario`; this is not allowed",
-                idx + 1
-            ))
-            .with_operation("scenario.run")
-            .with_hint("Call primitive commands directly from step args."));
-        }
-
-        let step_id = step
-            .id
-            .clone()
-            .unwrap_or_else(|| format!("step-{}", idx + 1));
-
-        let started = Instant::now();
-        let output = Command::new(&exe)
-            .args(&step.args)
-            .output()
-            .map_err(|err| {
-                CliError::runtime(format!(
-                    "failed to execute scenario step `{step_id}`: {err}"
-                ))
-                .with_operation("scenario.run")
-            })?;
-
-        let exit_code = output.status.code().unwrap_or(-1);
-        let ok = output.status.success();
-        let stdout_text = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        let stderr_text = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        let (operation, ax_path, fallback_used) = extract_step_telemetry(&stdout_text);
-        let step_result = ScenarioStepResult {
-            step_id: step_id.clone(),
-            ok,
-            exit_code,
-            elapsed_ms: started.elapsed().as_millis() as u64,
-            operation,
-            ax_path,
-            fallback_used,
-            stdout: stdout_text,
-            stderr: stderr_text,
-        };
-
-        step_results.push(step_result);
-        if !ok {
-            first_failed_step_id = Some(step_id);
-            break;
-        }
+    if metadata.len() > 1024 * 1024 {
+        return Err(CliError::usage(
+            "scenario file exceeds the 1 MiB input bound",
+        ));
     }
-
-    let failed_steps = step_results.iter().filter(|step| !step.ok).count();
-    let passed_steps = step_results.iter().filter(|step| step.ok).count();
-    let result = ScenarioRunResult {
-        file: args.file.display().to_string(),
-        total_steps: scenario.steps.len(),
-        passed_steps,
-        failed_steps,
-        first_failed_step_id: first_failed_step_id.clone(),
-        steps: step_results,
-    };
-
-    if failed_steps > 0 {
-        let failed = first_failed_step_id.unwrap_or_else(|| "<unknown>".to_string());
-        return Err(CliError::runtime(format!(
-            "scenario run failed at `{failed}`"
-        ))
-        .with_operation("scenario.run")
-        .with_hint("Inspect step stderr in scenario output and rerun with --trace for richer diagnostics."));
+    if args.file.extension().and_then(|value| value.to_str()) != Some("json") {
+        return Err(CliError::usage(
+            "scenario file must use the `.json` extension",
+        ));
     }
-
-    match format {
-        OutputFormat::Json => {
-            emit_json_success("scenario.run", result)?;
-        }
-        OutputFormat::Text => {
-            println!(
-                "scenario.run\tfile={}\ttotal_steps={}\tpassed_steps={}\tfailed_steps={}",
-                result.file, result.total_steps, result.passed_steps, result.failed_steps
-            );
-        }
-        OutputFormat::Tsv => {
-            return reject_tsv_for_list_only();
-        }
-    }
-
-    Ok(())
-}
-
-fn extract_step_telemetry(stdout: &str) -> (Option<String>, Option<String>, Option<bool>) {
-    let payload: Value = match serde_json::from_str(stdout) {
-        Ok(value) => value,
-        Err(_) => return (None, None, None),
-    };
-    let command = payload
-        .get("command")
-        .and_then(Value::as_str)
-        .map(str::to_string);
-    let operation = command.clone();
-
-    match command.as_deref() {
-        Some("ax.click") => {
-            let fallback = payload
-                .pointer("/result/used_coordinate_fallback")
-                .and_then(Value::as_bool);
-            let ax_path = fallback.map(|value| {
-                if value {
-                    "coordinate-fallback".to_string()
-                } else {
-                    "ax-native".to_string()
-                }
-            });
-            (operation, ax_path, fallback)
-        }
-        Some("ax.type") => {
-            let fallback = payload
-                .pointer("/result/used_keyboard_fallback")
-                .and_then(Value::as_bool);
-            let ax_path = fallback.map(|value| {
-                if value {
-                    "keyboard-fallback".to_string()
-                } else {
-                    "ax-native".to_string()
-                }
-            });
-            (operation, ax_path, fallback)
-        }
-        _ => (operation, None, None),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn parse_scenario_file() {
-        let raw = r#"{"steps":[{"id":"s1","args":["preflight","--format","json"]}]}"#;
-        let parsed: ScenarioFile = serde_json::from_str(raw).expect("scenario json should parse");
-        assert_eq!(parsed.steps.len(), 1);
-        assert_eq!(parsed.steps[0].id.as_deref(), Some("s1"));
-    }
-
-    #[test]
-    fn extract_step_telemetry_maps_ax_fallback_modes() {
-        let click_payload = r#"{"command":"ax.click","result":{"used_coordinate_fallback":true}}"#;
-        let (operation, ax_path, fallback) = extract_step_telemetry(click_payload);
-        assert_eq!(operation.as_deref(), Some("ax.click"));
-        assert_eq!(ax_path.as_deref(), Some("coordinate-fallback"));
-        assert_eq!(fallback, Some(true));
-
-        let type_payload = r#"{"command":"ax.type","result":{"used_keyboard_fallback":false}}"#;
-        let (operation, ax_path, fallback) = extract_step_telemetry(type_payload);
-        assert_eq!(operation.as_deref(), Some("ax.type"));
-        assert_eq!(ax_path.as_deref(), Some("ax-native"));
-        assert_eq!(fallback, Some(false));
-    }
+    fs::read(&args.file).map_err(|_| CliError::usage("failed to read scenario file"))
 }

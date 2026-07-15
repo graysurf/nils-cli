@@ -236,6 +236,11 @@ third_party.sort(
 
 lockfile_path = repo_root / "Cargo.lock"
 lock_hash = hashlib.sha256(lockfile_path.read_bytes()).hexdigest()
+peekaboo_lock_path = repo_root / "crates" / "macos-agent" / "peekaboo-lock.json"
+peekaboo_lock = json.loads(peekaboo_lock_path.read_text(encoding="utf-8"))
+peekaboo_tag = peekaboo_lock["tag"]
+peekaboo_repo = peekaboo_lock["repository"]
+peekaboo_license = peekaboo_lock["license"]
 
 
 def license_value(pkg: dict) -> str:
@@ -297,6 +302,17 @@ for pkg in third_party:
     license_lines.append(
         f"| {md_cell(name)} | {md_cell(version)} | {md_cell(license_expr)} | {md_cell(source)} |"
     )
+
+license_lines.extend(
+    [
+        "",
+        "## Locked Runtime Backend",
+        "",
+        f"- Peekaboo `{peekaboo_tag}` is licensed under `{peekaboo_license['spdx']}`.",
+        f"- Source and license: <{peekaboo_license['source']}>",
+        "- The nils-cli package does not embed Peekaboo. `macos-agent backend install` downloads the exact official release assets named and SHA256-locked in `crates/macos-agent/peekaboo-lock.json` into user-scoped storage.",
+    ]
+)
 
 licenses_path.write_text("\n".join(license_lines) + "\n", encoding="utf-8")
 
@@ -370,6 +386,20 @@ for pkg in third_party:
         notice_lines.append("- License file reference: none declared")
 
     notice_lines.append("")
+
+notice_lines.extend(
+    [
+        "## Locked Runtime Backend Notice",
+        "",
+        f"### Peekaboo {peekaboo_tag}",
+        "",
+        f"- License: `{peekaboo_license['spdx']}`",
+        f"- Source: <{peekaboo_repo}/tree/{peekaboo_tag}>",
+        f"- License text: <{peekaboo_license['source']}>",
+        "- Distribution model: official release assets are downloaded on demand, verified against the immutable lock, and are not embedded in nils-cli release artifacts.",
+        "",
+    ]
+)
 
 notices_path.write_text("\n".join(notice_lines), encoding="utf-8")
 PY
