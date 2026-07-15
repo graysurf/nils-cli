@@ -235,7 +235,10 @@ fn local_scenario_executes_only_a_private_immutable_staged_copy() {
     write_executable(
         &fake_peekaboo,
         r#"#!/bin/sh
-mode=$(stat -c '%a' "$2") || exit 91
+case "$(uname -s)" in
+  Darwin) mode=$(stat -f '%Lp' "$2") || exit 91 ;;
+  *) mode=$(stat -c '%a' "$2") || exit 91 ;;
+esac
 printf '%s|%s\n' "$2" "$mode" > "$NILS_MACOS_AGENT_SCENARIO_LAUNCH_LOG"
 printf '%s\n' '{"success":true,"steps":[]}'
 "#,
