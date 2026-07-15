@@ -12,13 +12,13 @@ use std::path::{Path, PathBuf};
 use nils_common::git::parse_git_remote_url;
 
 /// Default store location when `SECRETS_REPO` is unset.
-pub const DEFAULT_STORE_REL: &str = "Project/graysurf/secrets";
+pub const DEFAULT_STORE_REL: &str = "Project/serenvia/secrets";
 
 /// The `.enc.env` suffix every encrypted store entry carries.
 pub const ENC_SUFFIX: &str = ".enc.env";
 
 /// Resolve the store root, honoring `$SECRETS_REPO` then falling back to
-/// `$HOME/Project/graysurf/secrets`. `home` is injected so tests stay
+/// `$HOME/Project/serenvia/secrets`. `home` is injected so tests stay
 /// hermetic.
 pub fn resolve_store_root(secrets_repo_env: Option<&str>, home: Option<&Path>) -> Option<PathBuf> {
     if let Some(value) = secrets_repo_env
@@ -146,7 +146,7 @@ mod tests {
         );
         assert_eq!(
             resolve_store_root(None, Some(&home)),
-            Some(home.join("Project/graysurf/secrets"))
+            Some(home.join("Project/serenvia/secrets"))
         );
         assert_eq!(resolve_store_root(None, None), None);
     }
