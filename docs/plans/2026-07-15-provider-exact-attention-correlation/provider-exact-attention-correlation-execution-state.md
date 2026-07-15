@@ -10,7 +10,7 @@
   for generic permission dialogs.
 - Execution window: Sprint 1 shared boundary -> Sprints 2 and 3 independent /
   parallel provider lanes -> Sprint 4 integration and delivery.
-- Current task: none; plan bundle publication and tracker initialization.
+- Current task: none; tracker initialized and implementation not started.
 - Next task: Task 1.1, freeze the shared invariant and authority-mode contract.
 - Last updated: 2026-07-15
 - Branch: `feat/provider-exact-attention-correlation`
@@ -18,7 +18,7 @@
   `docs/plans/2026-07-15-provider-exact-attention-correlation/provider-exact-attention-correlation-plan.md`
 - Implementation source:
   `docs/plans/2026-07-15-provider-exact-attention-correlation/provider-exact-attention-correlation-discussion-source.md`
-- Tracking issue: pending
+- Tracking issue: <https://github.com/sympoies/nils-cli/issues/1237>
 
 ## Validation Plan
 
@@ -61,6 +61,9 @@
   attention authority per runtime, preserves typed exact ids through semantic
   deduplication, treats request/resolution loss asymmetrically, and makes
   Claude's conservative capability result a valid independent lane outcome.
+- 2026-07-15: Opened L2 tracker #1237 from the committed bundle and initialized
+  run `20260715T155230Z-issue-1237` at Sprint 1, Task 1.1. The tracker remains
+  open for the later implementation session.
 
 ## Validation
 
@@ -76,6 +79,6 @@
 
 ## Handoff
 
-- Publish this bundle to `main`, open one L2 tracking issue from the committed
-  source/plan/state files, initialize the run controller, and begin with Task
-  1.1 in a fresh implementation worktree.
+- Publish this linked bundle to `main`. In the later implementation session,
+  resume tracker #1237 and begin with Task 1.1 in a fresh implementation
+  worktree.
