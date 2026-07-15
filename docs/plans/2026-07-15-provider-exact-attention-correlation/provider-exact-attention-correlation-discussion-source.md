@@ -186,8 +186,9 @@ the user resolving a manual permission dialog [W3].
    managed app-server capability is admitted and healthy; otherwise select
    `hook-authoritative` for raw/unmanaged/conservative operation.
 2. In protocol-authoritative mode, generic `PermissionRequest` hooks are
-   progress/diagnostic evidence only and never create attention. All covered
-   attention comes from the app-server protocol.
+   diagnostic-only inputs and emit no normalized activity event: they neither
+   create attention nor advance `last_progress_at`. All covered attention comes
+   from the app-server protocol.
 3. In hook-authoritative mode, generic permission hooks retain the existing
    conservative latch and protocol attention projection is not admitted.
 4. Validate a recognized protocol request against the bound thread and active
@@ -274,9 +275,11 @@ the user resolving a manual permission dialog [W3].
 - String and integer request ids, including concurrent integer `1` and string
   `"1"`, project distinctly and clear independently. Concurrent counts follow
   `2 -> 1 -> 0` even inside the semantic-dedupe window.
-- Protocol-authoritative fixtures prove generic permission hooks are ignored
-  for attention. Hook-authoritative fixtures prove the same hooks remain
-  conservatively latched. No fixture depends on arrival timing or pairing.
+- Protocol-authoritative fixtures prove generic permission hooks emit neither
+  attention nor progress in hook-first and protocol-first order, leaving
+  `last_progress_at` and pending presentation unchanged. Hook-authoritative
+  fixtures prove the same hooks remain conservatively latched. No fixture
+  depends on arrival timing or pairing.
 - Queue-full, oversized, malformed, replay, reconnect, restart, and schema-drift
   fixtures prove the asymmetric degraded/unknown and no-false-clear behavior.
 - Claude acceptance follows the capability matrix: matching non-empty ids

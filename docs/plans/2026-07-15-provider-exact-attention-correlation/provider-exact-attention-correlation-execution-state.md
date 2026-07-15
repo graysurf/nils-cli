@@ -64,6 +64,9 @@
 - 2026-07-15: Opened L2 tracker #1237 from the committed bundle and initialized
   run `20260715T155230Z-issue-1237` at Sprint 1, Task 1.1. The tracker remains
   open for the later implementation session.
+- 2026-07-15: API-contract follow-up clarified that a duplicate
+  `PermissionRequest` hook in protocol-authoritative mode is diagnostic-only and
+  must not advance `last_progress_at` or change pending presentation.
 
 ## Validation
 

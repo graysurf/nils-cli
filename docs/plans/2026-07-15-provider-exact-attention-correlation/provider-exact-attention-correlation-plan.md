@@ -159,17 +159,20 @@ keeping raw/unmanaged Codex conservative and avoiding ambiguous source mixing.
   - activity doctor output and fixtures
 - **Description**: Select attention authority at runtime creation/resume. In an
   admitted healthy managed app-server runtime, protocol requests are the sole
-  attention source and generic `PermissionRequest` hooks are diagnostic/progress
-  only. In raw/unmanaged or preselected conservative mode, hooks retain their
-  latch and exact protocol projection is not admitted. Never switch authority
-  mid-runtime; projection failure marks the runtime's exact-attention state
-  unhealthy/degraded until a new runtime/resume.
+  attention source and generic `PermissionRequest` hooks are diagnostic-only:
+  they emit no normalized attention or progress event. In raw/unmanaged or
+  preselected conservative mode, hooks retain their latch and exact protocol
+  projection is not admitted. Never switch authority mid-runtime; projection
+  failure marks the runtime's exact-attention state unhealthy/degraded until a
+  new runtime/resume.
 - **Dependencies**:
   - Task 2.2
 - **Complexity**: 8
 - **Acceptance criteria**:
-  - Protocol-authoritative fixtures ignore generic hooks for attention and
-    clear independent exact requests through protocol resolution.
+  - Protocol-authoritative fixtures ignore generic hooks for both attention and
+    progress and clear independent exact requests through protocol resolution.
+    Hook-first and protocol-first order leave `last_progress_at` and the pending
+    Needs Input presentation identical until the exact clear.
   - Hook-authoritative fixtures latch generic permission hooks and never claim
     an exact clear.
   - Adversarial hook-only A plus protocol-only B, delayed hook, reconnect,
