@@ -467,6 +467,7 @@ rm -f -- "$socket" "$proxy" "$attached"
 server=$!
 proxy_pid=
 provider_stderr_pid=
+provider_stderr_guard_pid=
 diagnostic_hold_open=
 cleanup() {
   if [ -n "$diagnostic_hold_open" ]; then
@@ -479,6 +480,10 @@ cleanup() {
   fi
   kill "$server" 2>/dev/null || true
   wait "$server" 2>/dev/null || true
+  if [ -n "$provider_stderr_guard_pid" ]; then
+    kill "$provider_stderr_guard_pid" 2>/dev/null || true
+    wait "$provider_stderr_guard_pid" 2>/dev/null || true
+  fi
   if [ -n "$provider_stderr_pid" ]; then
     kill "$provider_stderr_pid" 2>/dev/null || true
     wait "$provider_stderr_pid" 2>/dev/null || true
@@ -537,8 +542,13 @@ status=$?
 write_startup_marker "$runtime_exit_status" "$status"
 exec 9>&-
 diagnostic_hold_open=
+(sleep 0.25; kill "$provider_stderr_pid" 2>/dev/null || true) &
+provider_stderr_guard_pid=$!
 wait "$provider_stderr_pid" 2>/dev/null || true
 provider_stderr_pid=
+kill "$provider_stderr_guard_pid" 2>/dev/null || true
+wait "$provider_stderr_guard_pid" 2>/dev/null || true
+provider_stderr_guard_pid=
 rm -f -- "$provider_stderr_pipe"
 if [ "$(cat "$startup_stage" 2>/dev/null)" != initial_connection ]; then
   record_startup_failure provider-client-exited
@@ -4015,6 +4025,7 @@ exit 1
         assert!(script.contains("tail -c 16384"));
         assert!(script.contains("mkfifo \"$startup_diagnostic_pipe\""));
         assert!(script.contains("tee \"$startup_diagnostic_pipe\""));
+        assert!(script.contains("sleep 0.25; kill \"$provider_stderr_pid\""));
         assert!(!script.contains(">>\"$startup_diagnostic\""));
         let cleanup_lines = script
             .lines()
@@ -4049,7 +4060,7 @@ while [ "$(cat "$FAKE_PROVIDER_STAGE" 2>/dev/null)" != initial_connection ]; do
 done
 printf '%s' "$FAKE_PROVIDER_STDERR" >&2
 if [ "$FAKE_PROVIDER_DESCENDANT" = 1 ]; then
-  sleep 10 </dev/null >/dev/null 2>&1 &
+  sleep 10 </dev/null >/dev/null &
   printf '%s' "$!" > "$FAKE_PROVIDER_DESCENDANT_PID"
 fi
 exit "$FAKE_PROVIDER_EXIT"
