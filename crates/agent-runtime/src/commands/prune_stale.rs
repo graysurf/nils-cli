@@ -54,6 +54,7 @@ struct JsonEnvelope<'a> {
 struct JsonData<'a> {
     product: &'a str,
     source_root: &'a std::path::Path,
+    owned_source_roots: &'a [PathBuf],
     live_home: &'a std::path::Path,
     mode: Mode,
     candidates: usize,
@@ -65,6 +66,13 @@ struct JsonData<'a> {
 }
 
 pub fn run(args: PruneStaleArgs) -> anyhow::Result<u8> {
+    run_with_owned_source_roots(args, &[])
+}
+
+pub fn run_with_owned_source_roots(
+    args: PruneStaleArgs,
+    owned_source_roots: &[PathBuf],
+) -> anyhow::Result<u8> {
     if args.product != "claude" && args.product != "codex" && args.product != "hermes" {
         anyhow::bail!(
             "agent-runtime prune-stale: unknown --product `{}` (expected one of: claude, codex, hermes)",
@@ -75,6 +83,12 @@ pub fn run(args: PruneStaleArgs) -> anyhow::Result<u8> {
         anyhow::bail!(
             "agent-runtime prune-stale: --live-home must be absolute (got: {})",
             args.live_home.display()
+        );
+    }
+    if let Some(root) = owned_source_roots.iter().find(|root| !root.is_absolute()) {
+        anyhow::bail!(
+            "agent-runtime prune-stale: --owned-source-root must be absolute (got: {})",
+            root.display()
         );
     }
     if !args.dry_run && !args.apply {
@@ -90,10 +104,17 @@ pub fn run(args: PruneStaleArgs) -> anyhow::Result<u8> {
         overlay_enabled: !args.no_overlay,
         overlay_path: args.overlay_path.clone(),
     };
-    let outcome = prune_stale::run(&args.product, root.path(), &args.live_home, mode, &options)?;
+    let extended = prune_stale::run_with_owned_source_roots(
+        &args.product,
+        root.path(),
+        &args.live_home,
+        mode,
+        &options,
+        owned_source_roots,
+    )?;
     match args.format {
-        OutputFormat::Text => print_text(&outcome),
-        OutputFormat::Json => print_json(&outcome)?,
+        OutputFormat::Text => print_text(&extended.outcome),
+        OutputFormat::Json => print_json(&extended.outcome, &extended.owned_source_roots)?,
     }
     Ok(0)
 }
@@ -120,13 +141,17 @@ fn print_text(outcome: &prune_stale::PruneOutcome) {
     }
 }
 
-fn print_json(outcome: &prune_stale::PruneOutcome) -> anyhow::Result<()> {
+fn print_json(
+    outcome: &prune_stale::PruneOutcome,
+    owned_source_roots: &[PathBuf],
+) -> anyhow::Result<()> {
     let envelope = JsonEnvelope {
         schema_version: SCHEMA_VERSION,
         ok: true,
         data: JsonData {
             product: &outcome.product,
             source_root: &outcome.source_root,
+            owned_source_roots,
             live_home: &outcome.live_home,
             mode: outcome.mode,
             candidates: outcome.changes.len(),

@@ -17,7 +17,8 @@
 //! → Resolved Decision #9.
 #![deny(clippy::disallowed_types, clippy::disallowed_methods)]
 
-use clap::{Parser, Subcommand};
+use clap::{Arg, ArgAction, CommandFactory, FromArgMatches, Parser, Subcommand};
+use std::path::PathBuf;
 use std::process::ExitCode;
 
 pub mod audit_drift;
@@ -93,7 +94,43 @@ impl Command {
 }
 
 pub fn run() -> ExitCode {
-    let cli = Cli::parse();
+    run_cli(Cli::parse(), &[])
+}
+
+pub fn binary_command() -> clap::Command {
+    Cli::command().mut_subcommand("prune-stale", |command| {
+        command.arg(
+            Arg::new("owned_source_root")
+                .long("owned-source-root")
+                .value_name("ABSOLUTE_PATH")
+                .help("Trust an explicit prior runtime-kit source root; repeatable")
+                .action(ArgAction::Append)
+                .value_parser(clap::value_parser!(PathBuf)),
+        )
+    })
+}
+
+pub fn run_binary() -> ExitCode {
+    let matches = binary_command().get_matches();
+    let (cli, owned_source_roots) =
+        cli_and_owned_source_roots(matches).unwrap_or_else(|error| error.exit());
+    run_cli(cli, &owned_source_roots)
+}
+
+fn cli_and_owned_source_roots(
+    matches: clap::ArgMatches,
+) -> Result<(Cli, Vec<PathBuf>), clap::Error> {
+    let owned_source_roots = match matches.subcommand() {
+        Some(("prune-stale", matches)) => matches
+            .get_many::<PathBuf>("owned_source_root")
+            .map(|roots| roots.cloned().collect())
+            .unwrap_or_default(),
+        _ => Vec::new(),
+    };
+    Cli::from_arg_matches(&matches).map(|cli| (cli, owned_source_roots))
+}
+
+fn run_cli(cli: Cli, owned_source_roots: &[PathBuf]) -> ExitCode {
     let name = cli.command.name();
     match cli.command {
         Command::Render(args) => match commands::render::run(args) {
@@ -166,13 +203,15 @@ pub fn run() -> ExitCode {
                 ExitCode::from(2)
             }
         },
-        Command::PruneStale(args) => match commands::prune_stale::run(args) {
-            Ok(code) => ExitCode::from(code),
-            Err(err) => {
-                eprintln!("agent-runtime prune-stale: {err:#}");
-                ExitCode::from(2)
+        Command::PruneStale(args) => {
+            match commands::prune_stale::run_with_owned_source_roots(args, owned_source_roots) {
+                Ok(code) => ExitCode::from(code),
+                Err(err) => {
+                    eprintln!("agent-runtime prune-stale: {err:#}");
+                    ExitCode::from(2)
+                }
             }
-        },
+        }
         Command::Doctor(args) => match commands::doctor::run(args) {
             Ok(code) => ExitCode::from(code),
             Err(err) => {

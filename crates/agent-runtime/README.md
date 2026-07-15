@@ -27,6 +27,11 @@ Core runtime-kit operations:
 - `render` — render `core/` + `targets/<product>/` into `build/<product>/`;
   `--target home-prompt` renders only `AGENT_HOME.md`.
 - `install` — activate rendered output against a product's runtime home.
+- `prune-stale` — remove stale managed symlinks and the directories they empty;
+  repeat `--owned-source-root <absolute-path>` for explicit prior source
+  checkouts when validating a portable source relocation. Each prior root must
+  contain a valid, non-empty `targets/<product>/link-map.yaml`; filesystem roots
+  are rejected.
 - `uninstall` — remove installed renderer output from a product's runtime home.
 - `doctor` — diagnose host setup, runtime roots, and required CLI floors.
 - `audit-drift` — detect source-vs-rendered, rendered-vs-live, and unsafe drift.
