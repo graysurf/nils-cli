@@ -227,6 +227,8 @@ struct ActivityDocument {
     last_event_at: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pending_journal: Option<JournalEntry>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    runtime_unhealthy_reason: Option<String>,
     #[serde(default, flatten)]
     extra: Map<String, Value>,
 }
@@ -312,6 +314,69 @@ pub(crate) fn ingest_codex_app_server_failure(
     )
 }
 
+pub(crate) fn ingest_codex_app_server_attention(
+    context: &CliContext,
+    id: &str,
+    runtime_id: &str,
+    thread_id: &str,
+    turn_id: Option<&str>,
+    request_id: &str,
+    requested_kind: Option<&str>,
+) -> Result<ActivityResult, CliError> {
+    let record = load_session_record(context, id)?;
+    if crate::codex_app_server::attention_authority(&record) != "protocol" {
+        return Err(CliError::data(
+            "codex-attention-authority-mismatch",
+            "Codex protocol attention evidence is not admitted for this runtime",
+            Some(json!({ "id": record.id })),
+        ));
+    }
+    let provider_session_id =
+        projected_provider_identifier(runtime_id, AgentKind::Codex, "session", thread_id)?;
+    let provider_turn_id = turn_id
+        .map(|turn_id| projected_provider_identifier(runtime_id, AgentKind::Codex, "turn", turn_id))
+        .transpose()?;
+    let attention_id =
+        projected_provider_identifier(runtime_id, AgentKind::Codex, "attention", request_id)?;
+    let (kind, attention_kind, event_label) = match requested_kind {
+        Some(kind @ ("approval" | "clarification" | "authentication" | "other")) => (
+            TurnEventKind::AttentionRequested,
+            Some(kind.to_string()),
+            "requested",
+        ),
+        Some(_) => {
+            return Err(CliError::data(
+                "codex-attention-kind-invalid",
+                "Codex protocol attention kind is outside the v1 allowlist",
+                None,
+            ));
+        }
+        None => (TurnEventKind::AttentionCleared, None, "resolved"),
+    };
+    ingest_event_retry(
+        context,
+        id,
+        TurnEvent {
+            schema_version: TURN_EVENT_VERSION.to_string(),
+            event_id: format!("codex-app-server-attention:{event_label}:{attention_id}"),
+            runtime_id: runtime_id.to_string(),
+            provider: AgentKind::Codex.as_str().to_string(),
+            provider_session_id: Some(provider_session_id),
+            provider_turn_id,
+            kind,
+            failure_reason: None,
+            attention_id: Some(attention_id),
+            attention_kind,
+            attention_correlation_ambiguous: false,
+            confidence: Confidence::Authoritative,
+            // `provider_hook` is the stable v1 wire value for all structured
+            // provider evidence, including the app-server protocol.
+            source_kind: SourceKind::ProviderHook,
+            provider_time: None,
+        },
+    )
+}
+
 /// Project durable activity state onto the explicitly allowlisted stream
 /// contract. Durable snapshots preserve additive fields for forward
 /// compatibility; those unknown fields must not cross the daemon stream's
@@ -375,6 +440,8 @@ pub(crate) struct ProviderDoctor {
     pub(crate) notification_mode: Option<String>,
     pub(crate) completion: String,
     pub(crate) attention_correlation: String,
+    pub(crate) exact_attention: String,
+    pub(crate) attention_authority: String,
     pub(crate) trust: String,
     pub(crate) guidance: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -721,7 +788,12 @@ fn stable_hermes_approval_event_id(
 fn semantic_event_key(event: &TurnEvent) -> String {
     let mut digest = Sha256::new();
     digest.update(b"agent-session.semantic-event.v1\0");
-    let correlated_attention_id = if event.attention_kind.as_deref() == Some("clarification")
+    let exact_attention = event
+        .attention_id
+        .as_deref()
+        .is_some_and(|id| id.starts_with("local:v1:"))
+        && !event.attention_correlation_ambiguous;
+    let correlated_attention_id = if exact_attention
         || (event.provider == AgentKind::Hermes.as_str()
             && event.attention_kind.as_deref() == Some("approval"))
         || event.kind == TurnEventKind::AttentionCleared
@@ -964,12 +1036,67 @@ pub(crate) fn activate_runtime(
             .transpose()?,
         last_event_at: None,
         pending_journal: None,
+        runtime_unhealthy_reason: None,
         extra: existing
             .take()
             .map_or_else(Map::new, |document| document.extra),
     };
     write_document(&path, &document)?;
     Ok(document.state)
+}
+
+pub(crate) fn mark_runtime_unhealthy(
+    context: &CliContext,
+    id: &str,
+    runtime_id: &str,
+    reason: &str,
+) -> Result<(), CliError> {
+    let record = load_session_record(context, id)?;
+    let runtime = record.runtime.as_ref().ok_or_else(|| {
+        CliError::data(
+            "runtime-id-missing",
+            "session runtime is missing its launch id",
+            Some(json!({ "id": record.id })),
+        )
+    })?;
+    if runtime.launch_id != runtime_id {
+        return Err(CliError::data(
+            "runtime-id-mismatch",
+            "activity degradation does not belong to the active runtime generation",
+            Some(json!({ "id": record.id })),
+        ));
+    }
+    let dir = session_dir(context, id);
+    let _lock = acquire_lock(&dir)?;
+    let path = dir.join(ACTIVITY_FILE);
+    let journal_path = dir.join(ACTIVITY_JOURNAL_FILE);
+    let replay_path = dir.join(ACTIVITY_REPLAY_FILE);
+    let mut document = read_document(&path)?;
+    repair_pending_transaction(&path, &journal_path, &replay_path, &mut document)?;
+    if document.runtime_id != runtime_id || document.runtime_generation != runtime.generation {
+        return Err(CliError::data(
+            "runtime-id-mismatch",
+            "activity snapshot does not match the active runtime generation",
+            Some(json!({ "id": record.id })),
+        ));
+    }
+    if document.runtime_unhealthy_reason.is_some() {
+        return Ok(());
+    }
+    let at = now();
+    document.runtime_unhealthy_reason = Some(reason.to_string());
+    document.pending_attention.clear();
+    document.overflow_attention = None;
+    if let Some(current) = document.state.current_turn.as_mut() {
+        current.attention = None;
+    }
+    if document.state.phase != TurnPhase::Unknown {
+        document.state.phase_changed_at = at;
+    }
+    document.state.phase = TurnPhase::Unknown;
+    document.state.revision = document.state.revision.saturating_add(1);
+    document.state.source = runtime_source();
+    write_document(&path, &document)
 }
 
 fn quarantine_activity_snapshot(path: &Path, code: &str) -> Result<(), CliError> {
@@ -1243,6 +1370,13 @@ fn ingest_event_with_lock(
         ));
     }
     repair_pending_transaction(&path, &journal_path, &replay_path, &mut document)?;
+    if let Some(reason) = document.runtime_unhealthy_reason.as_deref() {
+        return Err(CliError::data(
+            "activity-runtime-unhealthy",
+            "activity evidence is unavailable until the session starts a new runtime generation",
+            Some(json!({ "id": record.id, "reason": reason })),
+        ));
+    }
     if let (Some(bound), Some(observed)) = (
         document.provider_session_id.as_ref(),
         event.provider_session_id.as_ref(),
@@ -1381,6 +1515,27 @@ pub(crate) fn activity_status(context: &CliContext, id: &str) -> Result<Activity
     })
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CodexHookAttentionDisposition {
+    Accept,
+    Suppress,
+    Breach,
+}
+
+fn codex_hook_attention_disposition(
+    record: &SessionRecord,
+    injected_authority: Option<&str>,
+) -> CodexHookAttentionDisposition {
+    match (
+        crate::codex_app_server::attention_authority(record),
+        injected_authority,
+    ) {
+        ("protocol", Some("protocol")) => CodexHookAttentionDisposition::Suppress,
+        ("hook", None | Some("hook")) => CodexHookAttentionDisposition::Accept,
+        _ => CodexHookAttentionDisposition::Breach,
+    }
+}
+
 pub(crate) fn ingest_provider_hook(
     context: &CliContext,
     agent: AgentKind,
@@ -1423,6 +1578,36 @@ pub(crate) fn ingest_provider_hook(
             None,
         )
     })?;
+    let raw_event_name = event_override
+        .or_else(|| raw.get("hook_event_name").and_then(Value::as_str))
+        .or_else(|| raw.get("event").and_then(Value::as_str));
+    if agent == AgentKind::Codex && raw_event_name == Some("PermissionRequest") {
+        let record = load_session_record(context, &id)?;
+        let injected_authority =
+            std::env::var(crate::codex_app_server::ATTENTION_AUTHORITY_ENV).ok();
+        match codex_hook_attention_disposition(&record, injected_authority.as_deref()) {
+            CodexHookAttentionDisposition::Accept => {}
+            CodexHookAttentionDisposition::Suppress => {
+                // The managed app-server adapter is the sole attention
+                // authority. Suppress the generic reporter before it can
+                // normalize or mutate durable activity state.
+                return Ok(false);
+            }
+            CodexHookAttentionDisposition::Breach => {
+                mark_runtime_unhealthy(
+                    context,
+                    &id,
+                    &runtime_id,
+                    "codex_attention_authority_mismatch",
+                )?;
+                return Err(CliError::data(
+                    "codex-attention-authority-breach",
+                    "Codex permission hook authority did not match the immutable runtime selection",
+                    Some(json!({ "id": record.id })),
+                ));
+            }
+        }
+    }
     let Some(event) = normalize_provider_hook(agent, event_override, &runtime_id, &raw)? else {
         return Ok(false);
     };
@@ -1792,6 +1977,18 @@ fn normalize_provider_hook(
             event_name,
             "PreToolUse" | "PostToolUse" | "PostToolUseFailure"
         );
+    let claude_elicitation =
+        agent == AgentKind::Claude && matches!(event_name, "Elicitation" | "ElicitationResult");
+    let elicitation_id = claude_elicitation
+        .then(|| optional_hook_string(raw, "elicitation_id"))
+        .transpose()?
+        .flatten();
+    if event_name == "ElicitationResult" && elicitation_id.is_none() {
+        // Claude documents this identifier as optional. An identifier-less
+        // result cannot safely clear a conservative request latch.
+        return Ok(None);
+    }
+    let exact_elicitation = claude_elicitation && elicitation_id.is_some();
     let exact_hermes_approval = agent == AgentKind::Hermes
         && matches!(
             event_name,
@@ -1840,6 +2037,18 @@ fn normalize_provider_hook(
             (TurnEventKind::AttentionCleared, None, Confidence::Observed)
         }
         (AgentKind::Claude, "PostToolUseFailure", _) if exact_clarification => {
+            (TurnEventKind::AttentionCleared, None, Confidence::Observed)
+        }
+        (AgentKind::Claude, "Elicitation", _) => (
+            TurnEventKind::AttentionRequested,
+            Some(if raw.get("mode").and_then(Value::as_str) == Some("url") {
+                "authentication"
+            } else {
+                "clarification"
+            }),
+            Confidence::Observed,
+        ),
+        (AgentKind::Claude, "ElicitationResult", _) if exact_elicitation => {
             (TurnEventKind::AttentionCleared, None, Confidence::Observed)
         }
         (AgentKind::Claude, "PermissionRequest", _)
@@ -1917,6 +2126,13 @@ fn normalize_provider_hook(
                 .transpose()?,
             false,
         )
+    } else if exact_elicitation {
+        (
+            elicitation_id
+                .map(|value| projected_provider_identifier(runtime_id, agent, "attention", value))
+                .transpose()?,
+            false,
+        )
     } else if let Some(metadata) = hermes_approval_metadata {
         let (id, ambiguous) = hermes_approval_correlation(runtime_id, metadata)?;
         (Some(id), ambiguous)
@@ -1931,7 +2147,9 @@ fn normalize_provider_hook(
         ));
     }
     let attention_id = match kind {
-        TurnEventKind::AttentionRequested if exact_clarification || exact_hermes_approval => {
+        TurnEventKind::AttentionRequested
+            if exact_clarification || exact_elicitation || exact_hermes_approval =>
+        {
             exact_attention_id
         }
         TurnEventKind::AttentionRequested => Some(uuid::Uuid::new_v4().to_string()),
@@ -2110,14 +2328,14 @@ pub(crate) fn doctor(
                 AgentKind::Codex => (
                     "supported",
                     "agent-turn-complete is authoritative; raw Stop remains non-final observation because matching hooks may continue the turn",
-                    "PermissionRequest has no request id shared with PostToolUse; attention is conservatively latched",
+                    "audited managed app-server runtimes correlate typed blocking request ids with serverRequest/resolved; raw or unmanaged PermissionRequest hooks remain conservative latches",
                     "Codex requires review/trust for each non-managed hook definition; a safe singular user notify argv is composed through bounded direct execution without a shell",
                     "Run activity setup --agent codex --dry-run before initial apply; for drift, review activity setup --agent codex --repair --dry-run before repair. Unsafe, recursive, or non-reversible user-owned notify commands are preserved and reported without argv content",
                 ),
                 AgentKind::Claude => (
                     "partial",
                     "idle_prompt is observed completion; raw Stop remains non-final because other hooks may continue",
-                    "AskUserQuestion uses exact runtime-scoped tool_use_id correlation; PermissionRequest and notifications remain conservative latches",
+                    "AskUserQuestion uses exact runtime-scoped tool_use_id correlation; Elicitation uses exact elicitation_id when both callbacks provide it and otherwise latches conservatively; PermissionRequest and notifications remain conservative latches",
                     "Claude settings hooks compose additively and execute with the user's permissions",
                     "Run activity setup --agent claude --dry-run and then --apply",
                 ),
@@ -2139,6 +2357,32 @@ pub(crate) fn doctor(
             supported_classification
         } else {
             "unverified"
+        };
+        let (exact_attention, attention_authority) = match agent {
+            AgentKind::Codex => {
+                let exact_attention = if version
+                    .as_deref()
+                    .and_then(parse_version_triplet)
+                    .is_some_and(crate::codex_app_server::exact_attention_version_is_audited)
+                {
+                    "supported"
+                } else {
+                    "unverified"
+                };
+                (
+                    exact_attention,
+                    "protocol for audited managed app-server runtimes; hook for raw or unmanaged runtimes",
+                )
+            }
+            AgentKind::Claude => (
+                if audited {
+                    "conditional: exact for AskUserQuestion and Elicitation callbacks with a non-empty shared id; conservative otherwise"
+                } else {
+                    "unverified"
+                },
+                "hook",
+            ),
+            AgentKind::Hermes => (if audited { "supported" } else { "unverified" }, "hook"),
         };
         let mut guidance = if matches!(classification, "unavailable" | "unverified") {
             format!(
@@ -2180,6 +2424,8 @@ pub(crate) fn doctor(
             notification_mode,
             completion: completion.to_string(),
             attention_correlation: attention_correlation.to_string(),
+            exact_attention: exact_attention.to_string(),
+            attention_authority: attention_authority.to_string(),
             trust: trust.to_string(),
             guidance,
             last_event_at: activity_summary.last_event_at,
@@ -2582,6 +2828,14 @@ fn provider_specs(agent: AgentKind) -> Vec<ProviderSpec> {
             ProviderSpec {
                 event: "PostToolUseFailure",
                 matcher: Some("AskUserQuestion"),
+            },
+            ProviderSpec {
+                event: "Elicitation",
+                matcher: None,
+            },
+            ProviderSpec {
+                event: "ElicitationResult",
+                matcher: None,
             },
             ProviderSpec {
                 event: "Stop",
@@ -3483,6 +3737,7 @@ mod tests {
             provider_session_id: None,
             last_event_at: None,
             pending_journal: None,
+            runtime_unhealthy_reason: None,
             extra: Map::new(),
         }
     }
@@ -3590,6 +3845,91 @@ mod tests {
         .expect("test session");
         created.release_lifecycle_lock();
         (context, created)
+    }
+
+    #[test]
+    fn codex_permission_hook_obeys_the_immutable_runtime_authority() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let (_, created) = test_session(&tmp);
+        assert_eq!(
+            codex_hook_attention_disposition(&created.record, Some("hook")),
+            CodexHookAttentionDisposition::Accept
+        );
+        assert_eq!(
+            codex_hook_attention_disposition(&created.record, None),
+            CodexHookAttentionDisposition::Accept
+        );
+        assert_eq!(
+            codex_hook_attention_disposition(&created.record, Some("protocol")),
+            CodexHookAttentionDisposition::Breach
+        );
+
+        let mut protocol = created.record.clone();
+        let runtime = protocol.runtime.as_mut().unwrap();
+        runtime.kind = crate::codex_app_server::RUNTIME_KIND.to_string();
+        runtime.extra.insert(
+            crate::codex_app_server::ATTENTION_AUTHORITY_KEY.to_string(),
+            json!("protocol"),
+        );
+        assert_eq!(
+            codex_hook_attention_disposition(&protocol, Some("protocol")),
+            CodexHookAttentionDisposition::Suppress
+        );
+        for injected in [None, Some("hook"), Some("future-mode")] {
+            assert_eq!(
+                codex_hook_attention_disposition(&protocol, injected),
+                CodexHookAttentionDisposition::Breach
+            );
+        }
+    }
+
+    #[test]
+    fn unhealthy_runtime_cannot_recover_until_a_new_generation() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let (context, mut created) = test_session(&tmp);
+        let runtime_id = created.record.runtime.as_ref().unwrap().launch_id.clone();
+        let mut started = event(TurnEventKind::TurnStarted, "start");
+        started.runtime_id = runtime_id.clone();
+        ingest_event(&context, &created.record.id, started).unwrap();
+        mark_runtime_unhealthy(
+            &context,
+            &created.record.id,
+            &runtime_id,
+            "fixture_projection_loss",
+        )
+        .unwrap();
+        let unknown = activity_status(&context, &created.record.id)
+            .unwrap()
+            .turn_state;
+        assert_eq!(unknown.phase, TurnPhase::Unknown);
+        let revision = unknown.revision;
+
+        let mut progress = event(TurnEventKind::Progress, "late-progress");
+        progress.runtime_id = runtime_id.clone();
+        let error = ingest_event(&context, &created.record.id, progress)
+            .expect_err("same-runtime evidence cannot recover degraded activity");
+        assert_eq!(error.code(), "activity-runtime-unhealthy");
+        assert_eq!(
+            activate_runtime(&context, &created.record).unwrap().phase,
+            TurnPhase::Unknown
+        );
+        assert_eq!(
+            activity_status(&context, &created.record.id)
+                .unwrap()
+                .turn_state
+                .revision,
+            revision
+        );
+
+        let runtime = created.record.runtime.as_mut().unwrap();
+        runtime.generation += 1;
+        runtime.launch_id = "runtime-next".to_string();
+        runtime.started_at = "2030-01-01T00:00:00Z".to_string();
+        write_session_record(&context, &created.record).unwrap();
+        assert_eq!(
+            activate_runtime(&context, &created.record).unwrap().phase,
+            TurnPhase::Starting
+        );
     }
 
     #[test]
@@ -4317,6 +4657,122 @@ mod tests {
         assert_eq!(
             missing_correlation.code(),
             "provider-hook-correlation-missing"
+        );
+    }
+
+    #[test]
+    fn claude_elicitation_uses_exact_id_when_present_and_never_manufactures_a_clear() {
+        for (mode, expected_kind) in [("form", "clarification"), ("url", "authentication")] {
+            let request = normalize_provider_hook(
+                AgentKind::Claude,
+                None,
+                "runtime-1",
+                &json!({
+                    "hook_event_name": "Elicitation",
+                    "session_id": "claude-session",
+                    "mcp_server_name": "fixture-server",
+                    "mode": mode,
+                    "elicitation_id": "elicit-secret-1",
+                    "message": "must-not-leave-normalizer",
+                    "url": "https://must-not-leave.invalid",
+                    "requested_schema": {"secret": true}
+                }),
+            )
+            .expect("request mapping")
+            .expect("recognized elicitation request");
+            assert_eq!(request.kind, TurnEventKind::AttentionRequested);
+            assert_eq!(request.attention_kind.as_deref(), Some(expected_kind));
+            let correlation = request.attention_id.as_deref().expect("exact id");
+            assert!(correlation.starts_with("local:v1:"));
+
+            let response = normalize_provider_hook(
+                AgentKind::Claude,
+                None,
+                "runtime-1",
+                &json!({
+                    "hook_event_name": "ElicitationResult",
+                    "session_id": "claude-session",
+                    "mcp_server_name": "fixture-server",
+                    "mode": mode,
+                    "elicitation_id": "elicit-secret-1",
+                    "action": "accept",
+                    "content": {"answer": "must-not-leave-normalizer"}
+                }),
+            )
+            .expect("response mapping")
+            .expect("recognized elicitation response");
+            assert_eq!(response.kind, TurnEventKind::AttentionCleared);
+            assert_eq!(response.attention_id.as_deref(), Some(correlation));
+
+            for event in [request, response] {
+                let wire = serde_json::to_string(&event).unwrap();
+                for forbidden in [
+                    "elicit-secret-1",
+                    "fixture-server",
+                    "must-not-leave-normalizer",
+                    "must-not-leave.invalid",
+                    "answer",
+                ] {
+                    assert!(!wire.contains(forbidden), "forbidden {forbidden}");
+                }
+            }
+        }
+
+        let conservative = normalize_provider_hook(
+            AgentKind::Claude,
+            None,
+            "runtime-1",
+            &json!({
+                "hook_event_name": "Elicitation",
+                "session_id": "claude-session",
+                "mode": "form",
+                "message": "identifier omitted"
+            }),
+        )
+        .expect("missing-id request remains safe")
+        .expect("missing-id request is conservatively latched");
+        assert_eq!(conservative.kind, TurnEventKind::AttentionRequested);
+        assert_eq!(
+            conservative.attention_kind.as_deref(),
+            Some("clarification")
+        );
+        assert!(conservative.attention_id.is_some());
+
+        assert!(
+            normalize_provider_hook(
+                AgentKind::Claude,
+                None,
+                "runtime-1",
+                &json!({
+                    "hook_event_name": "ElicitationResult",
+                    "session_id": "claude-session",
+                    "mode": "form",
+                    "action": "decline"
+                }),
+            )
+            .expect("identifier-less result is safely ignored")
+            .is_none(),
+            "identifier-less results must never clear a conservative latch"
+        );
+    }
+
+    #[test]
+    fn exact_codex_approval_ids_survive_semantic_deduplication() {
+        let mut first = event(TurnEventKind::AttentionRequested, "first");
+        first.attention_kind = Some("approval".to_string());
+        first.attention_id = Some(
+            "local:v1:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+        );
+        let mut second = first.clone();
+        second.event_id = "second".to_string();
+        second.attention_id = Some(
+            "local:v1:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string(),
+        );
+
+        assert_ne!(
+            semantic_event_key(&first),
+            semantic_event_key(&second),
+            "independent exact approvals must not collapse inside the semantic dedupe window"
         );
     }
 
@@ -5133,6 +5589,12 @@ mod tests {
         assert!(claude_specs.iter().any(|spec| {
             spec.event == "PostToolUseFailure" && spec.matcher == Some("AskUserQuestion")
         }));
+        assert!(claude_specs.iter().any(|spec| spec.event == "Elicitation"));
+        assert!(
+            claude_specs
+                .iter()
+                .any(|spec| spec.event == "ElicitationResult")
+        );
     }
 
     #[test]

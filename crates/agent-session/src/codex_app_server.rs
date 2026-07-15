@@ -41,6 +41,10 @@ pub(crate) const SOCKET_KEY: &str = "codex_app_server_socket";
 pub(crate) const PROXY_KEY: &str = "codex_app_server_proxy";
 pub(crate) const THREAD_HANDOFF_KEY: &str = "codex_app_server_thread_handoff";
 pub(crate) const THREAD_ATTACHED_KEY: &str = "codex_app_server_thread_attached";
+pub(crate) const ATTENTION_AUTHORITY_KEY: &str = "codex_attention_authority";
+pub(crate) const ATTENTION_AUTHORITY_ENV: &str = "AGENT_SESSION_ATTENTION_AUTHORITY";
+const ATTENTION_AUTHORITY_PROTOCOL: &str = "protocol";
+const ATTENTION_AUTHORITY_HOOK: &str = "hook";
 
 const UNIX_SOCKET_PATH_BUDGET: usize = 100;
 const MAX_PROTOCOL_ID_BYTES: usize = 256;
@@ -65,6 +69,25 @@ const PROXY_CAPABILITY_FILE: &str = ".codex-app-server-proxy-capability";
 const PROXY_CAPABILITY_VERSION: &str = "agent-session.codex-manual-input-proxy.v1";
 const PROXY_CAPABILITY_TTL: Duration = Duration::from_secs(365 * 24 * 60 * 60);
 const PROXY_CAPABILITY_READY_TIMEOUT: Duration = Duration::from_secs(2);
+
+pub(crate) fn attention_authority(record: &SessionRecord) -> &'static str {
+    if record.runtime.as_ref().is_some_and(|runtime| {
+        runtime.kind == RUNTIME_KIND
+            && runtime
+                .extra
+                .get(ATTENTION_AUTHORITY_KEY)
+                .and_then(Value::as_str)
+                == Some(ATTENTION_AUTHORITY_PROTOCOL)
+    }) {
+        ATTENTION_AUTHORITY_PROTOCOL
+    } else {
+        ATTENTION_AUTHORITY_HOOK
+    }
+}
+
+pub(crate) fn exact_attention_version_is_audited(version: (u64, u64, u64)) -> bool {
+    AUDITED_CODEX_VERSIONS.contains(&version)
+}
 
 pub(crate) fn configure_runtime(
     context: &CliContext,
@@ -107,6 +130,10 @@ pub(crate) fn configure_runtime(
         )
     })?;
     runtime.kind = RUNTIME_KIND.to_string();
+    runtime.extra.insert(
+        ATTENTION_AUTHORITY_KEY.to_string(),
+        json!(ATTENTION_AUTHORITY_PROTOCOL),
+    );
     runtime
         .extra
         .insert(PROTOCOL_KEY.to_string(), json!(PROTOCOL_VERSION));
@@ -2139,7 +2166,7 @@ pub(crate) async fn run_control(
                 {
                     continue;
                 }
-                process_live_message(&context, &record, &mut reducer, &value).await?;
+                process_live_message(&context, &record, &mut reducer, None, &value).await?;
             }
         }
     }
@@ -2217,6 +2244,7 @@ impl Drop for ProxySocketGuard {
 
 struct ProxyObserver {
     pending_thread_starts: BTreeSet<String>,
+    pending_attention_requests: BTreeSet<String>,
     reducer: Option<FailureReducer>,
 }
 
@@ -2224,6 +2252,7 @@ impl ProxyObserver {
     fn new() -> Self {
         Self {
             pending_thread_starts: BTreeSet::new(),
+            pending_attention_requests: BTreeSet::new(),
             reducer: None,
         }
     }
@@ -2268,7 +2297,21 @@ impl ProxyObserver {
             }
         }
         if let Some(reducer) = self.reducer.as_mut() {
-            process_live_message(context, record, reducer, value).await?;
+            process_live_message(
+                context,
+                record,
+                reducer,
+                Some(&mut self.pending_attention_requests),
+                value,
+            )
+            .await?;
+        } else if matches!(
+            value.get("method").and_then(Value::as_str),
+            Some("agent-session/attention/requested" | "agent-session/attention/resolved")
+        ) {
+            return Err(
+                "Codex attention request arrived before the runtime thread was bound".to_string(),
+            );
         }
         Ok(())
     }
@@ -2320,6 +2363,16 @@ fn json_id_key(value: &Value) -> Option<String> {
     match value {
         Value::String(id) if id.len() <= MAX_PROTOCOL_ID_BYTES => Some(value.to_string()),
         Value::Number(_) => Some(value.to_string()),
+        _ => None,
+    }
+}
+
+fn attention_request_id_key(value: &Value) -> Option<String> {
+    match value {
+        Value::String(id) if !id.is_empty() && id.len() <= MAX_PROTOCOL_ID_BYTES => {
+            Some(format!("string:{id}"))
+        }
+        Value::Number(number) => number.as_i64().map(|id| format!("int64:{id}")),
         _ => None,
     }
 }
@@ -2696,6 +2749,63 @@ fn server_observation(value: &Value) -> ServerProjection {
     let Some(method) = value.get("method").and_then(Value::as_str) else {
         return ServerProjection::Irrelevant;
     };
+    if let Some(kind) = match method {
+        "item/commandExecution/requestApproval"
+        | "item/fileChange/requestApproval"
+        | "item/permissions/requestApproval" => Some("approval"),
+        "item/tool/requestUserInput" | "mcpServer/elicitation/request" => Some("clarification"),
+        _ => None,
+    } {
+        let (Some(request_id), Some(thread_id)) = (
+            value.get("id"),
+            value.pointer("/params/threadId").and_then(Value::as_str),
+        ) else {
+            return ServerProjection::RejectedUnique;
+        };
+        let turn_id = value.pointer("/params/turnId");
+        let turn_required = method != "mcpServer/elicitation/request";
+        if attention_request_id_key(request_id).is_none()
+            || !protocol_id_is_valid(thread_id)
+            || (turn_required
+                && !turn_id
+                    .and_then(Value::as_str)
+                    .is_some_and(protocol_id_is_valid))
+            || (!turn_required
+                && turn_id.is_some_and(|turn_id| {
+                    !turn_id.is_null() && !turn_id.as_str().is_some_and(protocol_id_is_valid)
+                }))
+        {
+            return ServerProjection::RejectedUnique;
+        }
+        return bounded_observation(json!({
+            "method": "agent-session/attention/requested",
+            "params": {
+                "requestId": request_id,
+                "threadId": thread_id,
+                "turnId": turn_id,
+                "kind": kind
+            }
+        }))
+        .map(ServerProjection::Unique)
+        .unwrap_or(ServerProjection::RejectedUnique);
+    }
+    if method == "serverRequest/resolved" {
+        let (Some(request_id), Some(thread_id)) = (
+            value.pointer("/params/requestId"),
+            value.pointer("/params/threadId").and_then(Value::as_str),
+        ) else {
+            return ServerProjection::RejectedUnique;
+        };
+        if attention_request_id_key(request_id).is_none() || !protocol_id_is_valid(thread_id) {
+            return ServerProjection::RejectedUnique;
+        }
+        return bounded_observation(json!({
+            "method": "agent-session/attention/resolved",
+            "params": {"requestId": request_id, "threadId": thread_id}
+        }))
+        .map(ServerProjection::Unique)
+        .unwrap_or(ServerProjection::RejectedUnique);
+    }
     let observation = match method {
         "error" => {
             let (Some(thread_id), Some(turn_id)) = (
@@ -2782,6 +2892,12 @@ async fn fail_closed_projection(context: &CliContext, record: &SessionRecord) {
         let id = id.clone();
         let launch_id = launch_id.clone();
         match tokio::task::spawn_blocking(move || {
+            crate::activity::mark_runtime_unhealthy(
+                &context,
+                &id,
+                &launch_id,
+                "codex_projection_unavailable",
+            )?;
             crate::auto_resume::fail_closed_projection_for_runtime(
                 &context,
                 &id,
@@ -3285,7 +3401,7 @@ where
                 .ok_or_else(|| "Codex app-server response omitted result".to_string());
         }
         if let Some((context, record, reducer)) = live.as_mut() {
-            process_live_message(context, record, reducer, &value).await?;
+            process_live_message(context, record, reducer, None, &value).await?;
         }
     }
 }
@@ -3465,8 +3581,73 @@ async fn process_live_message(
     context: &CliContext,
     record: &SessionRecord,
     reducer: &mut FailureReducer,
+    pending_attention_requests: Option<&mut BTreeSet<String>>,
     value: &Value,
 ) -> Result<(), String> {
+    if matches!(
+        value.get("method").and_then(Value::as_str),
+        Some("agent-session/attention/requested" | "agent-session/attention/resolved")
+    ) {
+        let method = value
+            .get("method")
+            .and_then(Value::as_str)
+            .expect("matched attention method");
+        let thread_id = value
+            .pointer("/params/threadId")
+            .and_then(Value::as_str)
+            .ok_or_else(|| "Codex attention projection omitted thread scope".to_string())?;
+        if thread_id != reducer.thread_id {
+            return Err("Codex attention projection changed runtime thread scope".to_string());
+        }
+        let request_id = value
+            .pointer("/params/requestId")
+            .and_then(attention_request_id_key)
+            .ok_or_else(|| "Codex attention projection omitted typed request id".to_string())?;
+        let requested_kind = (method == "agent-session/attention/requested")
+            .then(|| {
+                value
+                    .pointer("/params/kind")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| "Codex attention projection omitted kind".to_string())
+            })
+            .transpose()?;
+        let pending_attention_requests = pending_attention_requests.ok_or_else(|| {
+            "Codex attention projection reached a non-authoritative channel".to_string()
+        })?;
+        if requested_kind.is_some() {
+            if !pending_attention_requests.insert(request_id.clone()) {
+                return Ok(());
+            }
+        } else if !pending_attention_requests.remove(&request_id) {
+            return Ok(());
+        }
+        let turn_id = value.pointer("/params/turnId").and_then(Value::as_str);
+        let context = context.clone();
+        let id = record.id.clone();
+        let runtime_id = record
+            .runtime
+            .as_ref()
+            .map(|runtime| runtime.launch_id.clone())
+            .ok_or_else(|| "Codex runtime identity is missing".to_string())?;
+        let thread_id = thread_id.to_string();
+        let turn_id = turn_id.map(str::to_string);
+        let requested_kind = requested_kind.map(str::to_string);
+        tokio::task::spawn_blocking(move || {
+            crate::activity::ingest_codex_app_server_attention(
+                &context,
+                &id,
+                &runtime_id,
+                &thread_id,
+                turn_id.as_deref(),
+                &request_id,
+                requested_kind.as_deref(),
+            )
+        })
+        .await
+        .map_err(|_| "Codex attention ingestion worker failed".to_string())?
+        .map_err(|err| format!("Codex attention ingestion failed: {}", err.code()))?;
+        return Ok(());
+    }
     if value.get("method").and_then(Value::as_str) == Some("account/rateLimits/updated") {
         let snapshot = value
             .get("params")
@@ -3694,6 +3875,10 @@ mod tests {
                 started_at: "2030-01-01T00:00:00Z".to_string(),
                 launch_id: format!("runtime-{id}"),
                 extra: BTreeMap::from([
+                    (
+                        ATTENTION_AUTHORITY_KEY.to_string(),
+                        json!(ATTENTION_AUTHORITY_PROTOCOL),
+                    ),
                     (PROTOCOL_KEY.to_string(), json!(PROTOCOL_VERSION)),
                     (SOCKET_KEY.to_string(), json!(display_path(socket))),
                     (
@@ -3786,6 +3971,7 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let runtime_dir = tmp.path().join("run");
         fs::create_dir(&runtime_dir).unwrap();
+        fs::set_permissions(&runtime_dir, fs::Permissions::from_mode(0o700)).unwrap();
         let _runtime_dir = EnvGuard::set(&lock, "XDG_RUNTIME_DIR", runtime_dir.to_str().unwrap());
         let _preference = EnvGuard::set(&lock, "AGENT_SESSION_CODEX_RUNTIME", "app-server");
         let agent = tmp.path().join("codex");
@@ -3906,6 +4092,50 @@ mod tests {
             fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
             assert_eq!(app_server_capability_available(&path), expected, "{name}");
         }
+    }
+
+    #[test]
+    fn configured_app_server_runtime_selects_protocol_attention_authority() {
+        let _probe_guard = capability_probe_test_guard();
+        let lock = GlobalStateLock::new();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let runtime_dir = tmp.path().join("run");
+        fs::create_dir(&runtime_dir).unwrap();
+        fs::set_permissions(&runtime_dir, fs::Permissions::from_mode(0o700)).unwrap();
+        let _runtime_dir = EnvGuard::set(&lock, "XDG_RUNTIME_DIR", runtime_dir.to_str().unwrap());
+        let _preference = EnvGuard::set(&lock, "AGENT_SESSION_CODEX_RUNTIME", "app-server");
+        let agent = tmp.path().join("codex");
+        fs::write(
+            &agent,
+            "#!/bin/sh\nif [ \"$1\" = --version ]; then printf '%s\\n' 'codex-cli 0.144.3'; exit 0; fi\nif [ \"$1\" = app-server ] && [ \"$2\" = --help ]; then printf '%s\\n' '  --listen <URL>  Supported values: stdio://, unix://PATH'; exit 0; fi\nexit 1\n",
+        )
+        .unwrap();
+        fs::set_permissions(&agent, fs::Permissions::from_mode(0o700)).unwrap();
+        let context = CliContext {
+            state_dir: tmp.path().join("state"),
+            host: None,
+        };
+        let mut record = record_with_runtime("authority", &runtime_dir.join("placeholder"));
+        record.runtime.as_mut().unwrap().kind = "tmux".to_string();
+        record.runtime.as_mut().unwrap().extra = BTreeMap::from([(
+            ATTENTION_AUTHORITY_KEY.to_string(),
+            json!(ATTENTION_AUTHORITY_HOOK),
+        )]);
+        fs::create_dir_all(crate::session_dir(&context, &record.id)).unwrap();
+        crate::write_session_record(&context, &record).unwrap();
+
+        configure_runtime(&context, &agent, &mut record, true).unwrap();
+        assert_eq!(record.runtime.as_ref().unwrap().kind, RUNTIME_KIND);
+        assert_eq!(attention_authority(&record), ATTENTION_AUTHORITY_PROTOCOL);
+        assert_eq!(
+            record
+                .runtime
+                .as_ref()
+                .unwrap()
+                .extra
+                .get(ATTENTION_AUTHORITY_KEY),
+            Some(&json!(ATTENTION_AUTHORITY_PROTOCOL))
+        );
     }
 
     #[test]
@@ -4956,6 +5186,232 @@ printf '%s\n' '{"schema_version":"agent-session.codex-auth-broker.v1","account":
             })),
             ServerProjection::Irrelevant
         ));
+    }
+
+    #[test]
+    fn exact_attention_projection_preserves_typed_ids_and_discards_content() {
+        let cases = [
+            (
+                json!({
+                    "id": 1,
+                    "method": "item/commandExecution/requestApproval",
+                    "params": {
+                        "threadId": "thread-a",
+                        "turnId": "turn-a",
+                        "command": "must-not-leave-the-adapter",
+                        "reason": "must-not-leave-the-adapter"
+                    }
+                }),
+                json!(1),
+                "approval",
+                json!("turn-a"),
+            ),
+            (
+                json!({
+                    "id": "1",
+                    "method": "item/tool/requestUserInput",
+                    "params": {
+                        "threadId": "thread-a",
+                        "turnId": "turn-a",
+                        "questions": [{"question": "must-not-leave-the-adapter"}]
+                    }
+                }),
+                json!("1"),
+                "clarification",
+                json!("turn-a"),
+            ),
+            (
+                json!({
+                    "id": 2,
+                    "method": "item/fileChange/requestApproval",
+                    "params": {"threadId": "thread-a", "turnId": "turn-a", "changes": "discarded"}
+                }),
+                json!(2),
+                "approval",
+                json!("turn-a"),
+            ),
+            (
+                json!({
+                    "id": 3,
+                    "method": "item/permissions/requestApproval",
+                    "params": {"threadId": "thread-a", "turnId": "turn-a", "permissions": "discarded"}
+                }),
+                json!(3),
+                "approval",
+                json!("turn-a"),
+            ),
+            (
+                json!({
+                    "id": 4,
+                    "method": "mcpServer/elicitation/request",
+                    "params": {"threadId": "thread-a", "turnId": null, "serverName": "discarded"}
+                }),
+                json!(4),
+                "clarification",
+                Value::Null,
+            ),
+        ];
+
+        let mut projected = Vec::new();
+        for (raw, request_id, kind, turn_id) in cases {
+            let ServerProjection::Unique(value) = server_observation(&raw) else {
+                panic!("recognized blocking request must be a unique projection");
+            };
+            assert_eq!(
+                value,
+                json!({
+                    "method": "agent-session/attention/requested",
+                    "params": {
+                        "requestId": request_id,
+                        "threadId": "thread-a",
+                        "turnId": turn_id,
+                        "kind": kind
+                    }
+                })
+            );
+            let wire = serde_json::to_string(&value).unwrap();
+            assert!(!wire.contains("must-not-leave-the-adapter"));
+            assert!(!wire.contains("discarded"));
+            projected.push(value);
+        }
+        assert_ne!(
+            projected[0].pointer("/params/requestId"),
+            projected[1].pointer("/params/requestId"),
+            "JSON integer 1 and string \"1\" must remain distinct"
+        );
+
+        let ServerProjection::Unique(resolved) = server_observation(&json!({
+            "method": "serverRequest/resolved",
+            "params": {"threadId": "thread-a", "requestId": 1}
+        })) else {
+            panic!("typed resolution must be a unique projection");
+        };
+        assert_eq!(
+            resolved,
+            json!({
+                "method": "agent-session/attention/resolved",
+                "params": {"threadId": "thread-a", "requestId": 1}
+            })
+        );
+    }
+
+    #[test]
+    fn exact_attention_projection_rejects_invalid_scope_and_request_ids() {
+        for value in [
+            json!({
+                "id": 1.5,
+                "method": "item/fileChange/requestApproval",
+                "params": {"threadId": "thread-a", "turnId": "turn-a"}
+            }),
+            json!({
+                "id": 1,
+                "method": "item/permissions/requestApproval",
+                "params": {"threadId": "", "turnId": "turn-a"}
+            }),
+            json!({
+                "method": "serverRequest/resolved",
+                "params": {"threadId": "thread-a", "requestId": {"bad": true}}
+            }),
+        ] {
+            assert!(matches!(
+                server_observation(&value),
+                ServerProjection::RejectedUnique
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn exact_attention_requests_clear_independently_before_turn_completion() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let context = CliContext {
+            state_dir: tmp.path().join("state"),
+            host: None,
+        };
+        let record = record_with_runtime("exact-attention", &tmp.path().join("server.sock"));
+        fs::create_dir_all(crate::session_dir(&context, &record.id)).unwrap();
+        crate::write_session_record(&context, &record).unwrap();
+        crate::activity::activate_runtime(&context, &record).unwrap();
+        let mut projection = ProxyProjection::new(context.clone(), record.clone());
+        projection.observe_client(&json!({
+            "method": "turn/start",
+            "params": {"threadId": "thread-a"}
+        }));
+        projection.observe_server(&json!({
+            "id": 1,
+            "method": "item/commandExecution/requestApproval",
+            "params": {"threadId": "thread-a", "turnId": "turn-a", "command": "secret"}
+        }));
+        projection.observe_server(&json!({
+            "id": "1",
+            "method": "item/commandExecution/requestApproval",
+            "params": {"threadId": "thread-a", "turnId": "turn-a", "command": "secret"}
+        }));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let state = crate::activity::activity_status(&context, &record.id)
+            .unwrap()
+            .turn_state;
+        assert_eq!(state.phase, crate::activity::TurnPhase::NeedsInput);
+        assert_eq!(
+            state
+                .current_turn
+                .as_ref()
+                .and_then(|turn| turn.attention.as_ref())
+                .map(|attention| attention.pending_count),
+            Some(2)
+        );
+        assert!(!serde_json::to_string(&state).unwrap().contains("secret"));
+
+        projection.observe_server(&json!({
+            "method": "serverRequest/resolved",
+            "params": {"threadId": "thread-a", "requestId": 1}
+        }));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let one = crate::activity::activity_status(&context, &record.id)
+            .unwrap()
+            .turn_state;
+        assert_eq!(one.phase, crate::activity::TurnPhase::NeedsInput);
+        assert_eq!(
+            one.current_turn
+                .as_ref()
+                .and_then(|turn| turn.attention.as_ref())
+                .map(|attention| attention.pending_count),
+            Some(1)
+        );
+
+        projection.observe_server(&json!({
+            "method": "serverRequest/resolved",
+            "params": {"threadId": "thread-a", "requestId": "1"}
+        }));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let cleared = crate::activity::activity_status(&context, &record.id)
+            .unwrap()
+            .turn_state;
+        assert_eq!(cleared.phase, crate::activity::TurnPhase::Working);
+        assert!(
+            cleared
+                .current_turn
+                .as_ref()
+                .and_then(|turn| turn.attention.as_ref())
+                .is_none()
+        );
+
+        let revision = cleared.revision;
+        for request_id in [json!("1"), json!("unmatched")] {
+            projection.observe_server(&json!({
+                "method": "serverRequest/resolved",
+                "params": {"threadId": "thread-a", "requestId": request_id}
+            }));
+        }
+        projection.finish().await;
+        assert_eq!(
+            crate::activity::activity_status(&context, &record.id)
+                .unwrap()
+                .turn_state
+                .revision,
+            revision,
+            "repeated and unmatched resolutions must be idempotent no-ops"
+        );
     }
 
     #[tokio::test]
@@ -7331,9 +7787,9 @@ printf '%s\n' '{"schema_version":"agent-session.codex-auth-broker.v1","account":
         })
         .await
         .expect("the blocking bootstrap gate attempt should start within the test deadline");
-        assert_eq!(
-            BOOTSTRAP_GATE_ATTEMPTS.load(std::sync::atomic::Ordering::Relaxed),
-            1
+        assert!(
+            BOOTSTRAP_GATE_ATTEMPTS.load(std::sync::atomic::Ordering::Relaxed) >= 1,
+            "the test-owned gate attempt must be observable even when parallel tests also use the global probe"
         );
         fs::remove_file(thread_handoff_path(&record).unwrap()).unwrap();
         unlock_bootstrap_file(&bootstrap_guard.file);

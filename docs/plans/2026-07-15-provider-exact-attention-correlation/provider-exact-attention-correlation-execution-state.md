@@ -3,15 +3,17 @@
 <!-- plan-issue-record:v2 role=state profile=tracking -->
 ## Execution State
 
-- Status: ready-to-start; implementation not started
+- Status: in-progress
 - Target scope: one provider-neutral v1 invariant, runtime-selected Codex
   attention authority with app-server exact resolution, capability-selected
   Claude exact-or-limited Elicitation, and an explicit conservative limitation
   for generic permission dialogs.
 - Execution window: Sprint 1 shared boundary -> Sprints 2 and 3 independent /
   parallel provider lanes -> Sprint 4 integration and delivery.
-- Current task: none; tracker initialized and implementation not started.
-- Next task: Task 1.1, freeze the shared invariant and authority-mode contract.
+- Current task: Task 4.1, complete specialist review, delivery, deployment, and
+  live polling/SSE/Agent Console acceptance.
+- Next task: Task 4.2, close the tracker only after deployed acceptance and the
+  completion audit pass.
 - Last updated: 2026-07-15
 - Branch: `feat/provider-exact-attention-correlation`
 - Source document:
@@ -36,13 +38,13 @@
 
 | ID | Status | Task | Evidence | Notes |
 | --- | --- | --- | --- | --- |
-| 1.1 | pending | Freeze shared invariant and authority-mode contract | pending | No source pairing; provider lanes become independent. |
-| 2.1 | pending | Verify Codex capability and capture test-first evidence | pending | Typed `string \| int64`, dedupe, loss, and schema-drift reds. |
-| 2.2 | pending | Implement typed Codex projection and fail-closed reduction | pending | Exact ids survive semantic dedupe. |
-| 2.3 | pending | Implement Codex runtime source arbitration and capability status | pending | One authority selected at create/resume; no mid-runtime switch. |
-| 3.1 | pending | Verify Claude capability and capture branch-specific test-first evidence | pending | Select exact or conservative terminal branch. |
-| 3.2 | pending | Implement selected Claude exact or conservative branch | pending | Selective rollback; no global setup removal. |
-| 4.1 | pending | Publish capability status and run integration acceptance | pending | Same-id clear before `Stop` where exact is supported. |
+| 1.1 | done | Freeze shared invariant and authority-mode contract | Focused reducer and AskUserQuestion baseline passed; contract update in worktree.; Authority-mode contract recorded in crates/agent-session/docs/turn-state-contract.md; three focused activity baselines passed. | No source pairing; provider lanes become independent. |
+| 2.1 | done | Verify Codex capability and capture test-first evidence | pending; Codex 0.144.3 generated schema confirms string-or-int64 RequestId and serverRequest/resolved; four compile-valid focused red tests retained in test-first evidence. | Schema and red-test artifacts retained under agent-out; production edits now authorized. |
+| 2.2 | done | Implement typed Codex projection and fail-closed reduction | pending; Implementation started from verified red tests.; Typed string/int64 projection, five-method allowlist, exact 2-to-1-to-0 clearing, privacy, idempotence, malformed/queue fail-close, and activity degradation tests pass. | v1 wire contract retained; only opaque projected ids persist. |
+| 2.3 | done | Implement Codex runtime source arbitration and capability status | pending; Runtime extra plus tmux env select protocol or hook authority; generic protocol-authority permission reporter suppresses at source; mismatch and projection loss remain unknown until a new generation; doctor reports exact capability and policy. | Codex 0.144.3 supported; versions outside exact audit remain unverified. |
+| 3.1 | done | Verify Claude capability and capture branch-specific test-first evidence | pending; Official Claude hooks contract and installed 2.1.210 confirm optional elicitation_id on Elicitation and ElicitationResult; sanitized live canary remains.; Sanitized Claude 2.1.210 MCP canary: form emitted request/result with no elicitation_id; URL emitted no callbacks. Both are conservative terminal outcomes; artifacts retained under agent-out. | No raw message, URL, schema, content, or provider id retained. |
+| 3.2 | done | Implement selected Claude exact or conservative branch | pending; Claude setup adds Elicitation/ElicitationResult; same nonempty id maps to exact runtime-scoped request/clear, missing request id latches conservatively, missing result id is ignored; form/URL/privacy/setup tests pass. | AskUserQuestion and generic permission behavior remain unchanged; rollback disables only the new admission/setup entries. |
+| 4.1 | in-progress | Publish capability status and run integration acceptance | Contract and evidence docs updated; doctor and setup dry-runs pass; Claude 2.1.210 canary proves the missing-id conservative branch; focused tests, the full crate suite, local-fast, docs-only, and plan validation pass. Specialist review, merged deployment, live provider sessions, polling/SSE, and Agent Console acceptance remain. | Same-id clear before `Stop` where exact is supported. |
 | 4.2 | pending | Deliver implementation PRs and close tracker | pending | Close only after completion audit. |
 
 ## Session Log
@@ -71,6 +73,25 @@
   traces are indistinguishable. Protocol authority now requires proven request
   completeness plus hook source suppression; a hook that bypasses suppression
   degrades the runtime instead of being ignored or paired.
+- 2026-07-15: Resumed run `20260715T161951Z-issue-1237` in managed worktree
+  `feat/provider-exact-attention-correlation`. The existing exact-clear,
+  progress-never-clears, and AskUserQuestion correlation regressions passed
+  before the shared authority contract was edited.
+- 2026-07-15: Task 1.1 completed. The provider-neutral v1 correlation and
+  one-authority-per-runtime rules are now explicit; Codex capability evidence
+  and failing adapter fixtures are the active scope.
+- 2026-07-15: Tasks 2.1 through 3.2 completed. Codex 0.144.3 uses the app-server
+  protocol as one immutable exact attention authority; Claude uses the same v1
+  contract with exact same-id Elicitation when available and a conservative
+  latch otherwise. Mixed-source or projection failure degrades the runtime
+  until a new generation instead of guessing.
+- 2026-07-15: The sanitized Claude 2.1.210 MCP canary observed form
+  `Elicitation` and `ElicitationResult` without `elicitation_id`; the deployed
+  capability must therefore remain conservative on this installed version.
+  The URL branch emitted no callbacks and remains unverified-conservative.
+- 2026-07-15: Test-first evidence is complete. Four provider-correlation tests
+  failed before production edits and now pass; the affected crate, local-fast,
+  docs-only, and plan gates are green. Pre-merge specialist review is active.
 
 ## Validation
 
@@ -83,9 +104,17 @@
 | `plan-tooling validate` | pass | Repaired eight-task graph validates with zero errors. | local |
 | `bash scripts/ci/nils-cli-checks-entrypoint.sh --docs-only` | pass | Repaired three-file bundle passes all docs checks. | local |
 | `bash scripts/ci/nils-cli-checks-entrypoint.sh --local-fast` | pass | Repository correctly selected docs-only mode and passed. | local |
+| Focused activity reducer and AskUserQuestion baselines | pass | Exact ids clear independently, progress never clears attention, and existing Claude exact correlation remains green. | local worktree |
+| Four provider-correlation red-to-green regressions | pass | Codex typed projection and independent 2-to-1-to-0 clearing, semantic-id preservation, and Claude exact-or-conservative normalization pass. | `20260716-003843-provider-exact-attention-test-first/test-first-evidence.json` |
+| `cargo test -p nils-agent-session` | pass | 395 unit tests and 92 integration tests passed. | local worktree |
+| `bash scripts/ci/nils-cli-checks-entrypoint.sh --local-fast` | pass | Formatting, Clippy with denied warnings, docs gates, 487 nextest tests, and doctests passed. | local worktree |
+| `bash scripts/ci/nils-cli-checks-entrypoint.sh --docs-only` | pass | Strict documentation and CLI-contract checks passed. | local worktree |
+| Claude 2.1.210 MCP Elicitation canary | pass | Form request/result omitted ids and selected conservative behavior; URL remained unverified-conservative. | `20260716-010014-claude-elicitation-canary/result.json` |
+| `plan-tooling validate --file ... --explain` | pass | The eight-task plan bundle validates with zero errors. | local worktree |
 
 ## Handoff
 
-- Publish this linked bundle to `main`. In the later implementation session,
-  resume tracker #1237 and begin with Task 1.1 in a fresh implementation
-  worktree.
+- Continue Task 4.1 in this managed worktree. Repair any concrete specialist
+  finding before delivery, then merge, install the release binary, refresh the
+  additive Claude hooks, and retain live provider/polling/SSE/Agent Console
+  acceptance evidence before closing #1237.
