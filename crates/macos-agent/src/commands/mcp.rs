@@ -19,8 +19,8 @@ const MAX_FRAME_BYTES: usize = 4 * 1024 * 1024;
 const DEFAULT_RESPONSE_TIMEOUT: Duration = Duration::from_secs(120);
 const CLEAN_EXIT_TIMEOUT: Duration = Duration::from_secs(5);
 const EVENT_QUEUE_CAPACITY: usize = 16;
-const WRITE_QUEUE_CAPACITY: usize = 8;
 const MAX_PENDING_REQUESTS: usize = 16;
+const WRITE_QUEUE_CAPACITY: usize = MAX_PENDING_REQUESTS;
 const MAX_PENDING_METADATA_BYTES: usize = 64 * 1024;
 
 pub fn run_local(args: &McpArgs, transport: &str) -> Result<u8, CliError> {

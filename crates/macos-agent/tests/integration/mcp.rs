@@ -760,6 +760,92 @@ exit 1
 }
 
 #[test]
+fn ssh_mcp_missing_terminal_reports_unconfirmed_remote_cleanup() {
+    let harness = common::MacosAgentHarness::new();
+    let cwd = TempDir::new().expect("cwd");
+    let fake_peekaboo = cwd.path().join("peekaboo");
+    fs::write(
+        &fake_peekaboo,
+        r#"#!/bin/sh
+while IFS= read -r line; do
+  case "$line" in
+    *'"id":1'*) printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":null}' ;;
+  esac
+done
+"#,
+    )
+    .expect("peekaboo");
+    fs::set_permissions(&fake_peekaboo, fs::Permissions::from_mode(0o755)).expect("chmod");
+    let fake_ssh = cwd.path().join("ssh");
+    fs::write(
+        &fake_ssh,
+        r#"#!/bin/sh
+while [ "$1" = "-o" ]; do shift 2; done
+[ "$1" = "--" ] && shift
+shift
+shift
+case " $* " in
+  *" __remote-mcp "*) exec "$NILS_MACOS_AGENT_REMOTE_BIN" "$@" 2>/dev/null ;;
+esac
+exec "$NILS_MACOS_AGENT_REMOTE_BIN" "$@"
+"#,
+    )
+    .expect("ssh");
+    fs::set_permissions(&fake_ssh, fs::Permissions::from_mode(0o755)).expect("chmod ssh");
+    let remote_root = cwd.path().join("missing-terminal-remote");
+    let options = harness
+        .cmd_options(cwd.path())
+        .with_env(
+            "NILS_MACOS_AGENT_PEEKABOO_BIN",
+            fake_peekaboo.to_str().expect("peekaboo"),
+        )
+        .with_env("NILS_MACOS_AGENT_SSH_BIN", fake_ssh.to_str().expect("ssh"))
+        .with_env(
+            "NILS_MACOS_AGENT_REMOTE_BIN",
+            harness.macos_agent_bin().to_str().expect("agent"),
+        )
+        .with_env(
+            "NILS_MACOS_AGENT_REMOTE_ROOT",
+            remote_root.to_str().expect("remote root"),
+        )
+        .with_env("NILS_MACOS_AGENT_TEST_CLEANUP_FAIL", "1")
+        .with_stdin_str("{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"shutdown\",\"params\":{}}\n");
+    let out = harness.run_with_options(
+        cwd.path(),
+        &[
+            "--error-format",
+            "json",
+            "mcp",
+            "--host",
+            "fixture-role",
+            "--out-dir",
+            cwd.path()
+                .join("missing-terminal-journal")
+                .to_str()
+                .expect("out"),
+        ],
+        options,
+    );
+    assert_eq!(out.code, 75, "{}", out.stderr_text());
+    assert!(
+        out.stderr_json()["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("remote cleanup could not be confirmed")),
+        "missing terminal discarded cleanup uncertainty: {}",
+        out.stderr_text()
+    );
+    assert_eq!(
+        fs::read_dir(&remote_root)
+            .expect("retained remote session")
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
+            .count(),
+        1,
+        "failed cleanup should retain exactly one bounded session slot"
+    );
+}
+
+#[test]
 fn malformed_json_rpc_requests_never_reach_upstream() {
     let harness = common::MacosAgentHarness::new();
     let cwd = TempDir::new().expect("cwd");

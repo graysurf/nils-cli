@@ -324,10 +324,14 @@ pub fn run_remote_mcp(args: &McpArgs) -> Result<u8, CliError> {
         }
     });
     let Some(terminal) = terminal else {
-        let _ = cleanup(host, &token);
-        return Err(transport_error(
-            "SSH MCP transport ended without a valid terminal status",
-        ));
+        return match cleanup(host, &token) {
+            Ok(()) => Err(transport_error(
+                "SSH MCP transport ended without a valid terminal status",
+            )),
+            Err(_) => Err(transport_error(
+                "SSH MCP transport ended without a valid terminal status and remote cleanup could not be confirmed",
+            )),
+        };
     };
     collect_result?;
     if !terminal.ok {
