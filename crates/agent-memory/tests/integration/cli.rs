@@ -1012,6 +1012,103 @@ fn candidate_promotion_with_frontmatter_emits_single_header() {
     );
 }
 
+#[test]
+fn candidate_promotion_preserves_opaque_thematic_rule_body() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    seed_recall_layout(tmp.path());
+    fs::write(
+        tmp.path().join("candidates/codex/thematic-rules.md"),
+        "---\nImportant first section.\n---\n\nRemaining candidate body.\n",
+    )
+    .expect("candidate");
+
+    let applied = run(
+        tmp.path(),
+        &[
+            "candidate",
+            "promote",
+            "codex",
+            "thematic-rules",
+            "--type",
+            "reference",
+            "--description",
+            "Preserve opaque Markdown",
+            "--session-id",
+            "00000000-0000-0000-0000-000000000000",
+            "--apply",
+        ],
+    );
+    assert_eq!(applied.code, 0, "stderr={}", applied.stderr_text());
+
+    let promoted =
+        fs::read_to_string(tmp.path().join("global/thematic-rules.md")).expect("promoted note");
+    assert!(
+        promoted.contains("---\nImportant first section.\n---\n\nRemaining candidate body."),
+        "{promoted}"
+    );
+
+    let text_check = run(tmp.path(), &["check", "global", "--strict"]);
+    assert_eq!(
+        text_check.code,
+        0,
+        "stdout={} stderr={}",
+        text_check.stdout_text(),
+        text_check.stderr_text()
+    );
+    let json_check = run(tmp.path(), &["check", "global", "--format", "json"]);
+    assert_eq!(json_check.code, 0, "stderr={}", json_check.stderr_text());
+    let report: serde_json::Value =
+        serde_json::from_str(json_check.stdout_text().trim()).expect("check json");
+    assert_eq!(report["ok"], true, "{report}");
+}
+
+#[test]
+fn candidate_promotion_preserves_indented_fence_example() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    seed_recall_layout(tmp.path());
+    fs::write(
+        tmp.path().join("candidates/codex/indented-example.md"),
+        "    ---\n    name: code-example\n    description: example data\n    ---\n\nRetained code sample.\n",
+    )
+    .expect("candidate");
+
+    let applied = run(
+        tmp.path(),
+        &[
+            "candidate",
+            "promote",
+            "codex",
+            "indented-example",
+            "--type",
+            "reference",
+            "--description",
+            "Preserve indented Markdown",
+            "--session-id",
+            "00000000-0000-0000-0000-000000000000",
+            "--apply",
+        ],
+    );
+    assert_eq!(applied.code, 0, "stderr={}", applied.stderr_text());
+
+    let promoted =
+        fs::read_to_string(tmp.path().join("global/indented-example.md")).expect("promoted note");
+    assert!(
+        promoted.contains(
+            "    ---\n    name: code-example\n    description: example data\n    ---\n\nRetained code sample."
+        ),
+        "{promoted}"
+    );
+
+    let check = run(tmp.path(), &["check", "global", "--strict"]);
+    assert_eq!(
+        check.code,
+        0,
+        "stdout={} stderr={}",
+        check.stdout_text(),
+        check.stderr_text()
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn candidate_promotion_supports_valid_global_symlink_layout() {

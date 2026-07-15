@@ -16,19 +16,47 @@ pub(crate) struct Frontmatter {
     pub origin_session_id: Option<String>,
 }
 
-/// Parse the leading `---` fenced YAML block. Returns `None` when the file has
-/// no frontmatter block at all.
+/// Parse a complete leading `---` fenced YAML block. Returns `None` when the
+/// file has no complete frontmatter block at all.
 pub(crate) fn parse(contents: &str) -> Option<Frontmatter> {
-    let mut lines = contents.lines();
-    if lines.next().map(str::trim) != Some("---") {
-        return None;
+    parse_leading_block(contents).map(|(frontmatter, _)| frontmatter)
+}
+
+/// Return the note body after recognizable candidate frontmatter.
+///
+/// Files without a complete, unindented block containing both `name` and
+/// `description` are returned unchanged. One blank separator line is removed
+/// because [`render_note`] supplies the canonical separator when the body is
+/// promoted into a curated note.
+pub(crate) fn body_after_frontmatter(contents: &str) -> &str {
+    let Some((frontmatter, end)) = parse_leading_block(contents) else {
+        return contents;
+    };
+    if !is_candidate_frontmatter(&frontmatter) {
+        return contents;
     }
+    strip_optional_separator(&contents[end..])
+}
+
+/// Report whether a note starts with two consecutive recognizable blocks.
+pub(crate) fn has_duplicate_frontmatter(contents: &str) -> bool {
+    let Some((_, end)) = parse_leading_block(contents) else {
+        return false;
+    };
+    let body = strip_optional_separator(&contents[end..]);
+    parse_leading_block(body).is_some_and(|(frontmatter, _)| is_candidate_frontmatter(&frontmatter))
+}
+
+fn parse_leading_block(contents: &str) -> Option<(Frontmatter, usize)> {
+    let end = frontmatter_end(contents)?;
+    let mut lines = contents[..end].lines();
+    lines.next();
 
     let mut frontmatter = Frontmatter::default();
     let mut in_metadata = false;
     for line in lines {
         let trimmed = line.trim();
-        if trimmed == "---" {
+        if is_frontmatter_fence(line) {
             break;
         }
         if trimmed.is_empty() {
@@ -57,27 +85,7 @@ pub(crate) fn parse(contents: &str) -> Option<Frontmatter> {
             }
         }
     }
-    Some(frontmatter)
-}
-
-/// Return the note body after a complete leading `---` fenced block.
-///
-/// Files without a complete leading block are returned unchanged. One blank
-/// separator line is removed because [`render_note`] supplies the canonical
-/// separator when the body is promoted into a curated note.
-pub(crate) fn body_after_frontmatter(contents: &str) -> &str {
-    let Some(end) = frontmatter_end(contents) else {
-        return contents;
-    };
-    strip_optional_separator(&contents[end..])
-}
-
-/// Report whether a note starts with two consecutive frontmatter-style blocks.
-pub(crate) fn has_duplicate_frontmatter(contents: &str) -> bool {
-    let Some(end) = frontmatter_end(contents) else {
-        return false;
-    };
-    frontmatter_end(contents[end..].trim_start()).is_some()
+    Some((frontmatter, end))
 }
 
 /// Render a note file: frontmatter block followed by the body. `origin_session_id`
@@ -138,21 +146,31 @@ fn non_empty(value: &str) -> Option<String> {
     }
 }
 
+fn is_candidate_frontmatter(frontmatter: &Frontmatter) -> bool {
+    frontmatter.name.is_some() && frontmatter.description.is_some()
+}
+
 fn frontmatter_end(contents: &str) -> Option<usize> {
     let mut lines = contents.split_inclusive('\n');
     let first = lines.next()?;
-    if first.trim() != "---" {
+    if !is_frontmatter_fence(first) {
         return None;
     }
 
     let mut end = first.len();
     for line in lines {
         end += line.len();
-        if line.trim() == "---" {
+        if is_frontmatter_fence(line) {
             return Some(end);
         }
     }
     None
+}
+
+fn is_frontmatter_fence(line: &str) -> bool {
+    let line = line.strip_suffix('\n').unwrap_or(line);
+    let line = line.strip_suffix('\r').unwrap_or(line);
+    line.starts_with("---") && line.trim_end() == "---"
 }
 
 fn strip_optional_separator(contents: &str) -> &str {
