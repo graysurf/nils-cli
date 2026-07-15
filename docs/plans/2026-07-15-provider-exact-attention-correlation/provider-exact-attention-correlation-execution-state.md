@@ -129,6 +129,12 @@
   guarded/unguarded regressions pass. The final full gates and API-contract,
   maintainability, and red-team testing follow-ups all passed with no blocking
   findings; delivery and deployed acceptance remain active.
+- 2026-07-15: The first final-HEAD GitHub coverage run exposed a macOS-only
+  test portability failure before coverage measurement: the runner's temporary
+  directory made the configured app-server test socket exceed the Unix path
+  budget. The three runtime-allocation tests now create their private runtime
+  roots directly under `/tmp`; focused authority/source-guard/transport tests
+  pass and the provider-visible failed check remains the retained red evidence.
 
 ## Validation
 
@@ -150,6 +156,7 @@
 | Final `cargo test -p nils-agent-session` | pass | 403 unit and 94 integration tests passed after all marker, health-fence, source-guard, and proxy-loss review fixes. | local worktree |
 | Final `bash scripts/ci/nils-cli-checks-entrypoint.sh --local-fast` | pass | Docs gates, formatting, denied-warning Clippy, 497 nextest tests, and doctests passed. | local worktree |
 | Final specialist follow-up | pass | API-contract, maintainability, and red-team testing reviewers found no blocking issues after the health-fence, marker, source-guard, and proxy-loss fixes. | PR #1239 review evidence |
+| macOS socket-path CI regression | red-to-green | GitHub coverage failed in `configured_app_server_runtime_selects_protocol_attention_authority` because its temporary Unix socket path exceeded the platform budget; all three runtime-allocation tests pass with short private `/tmp` roots. | GitHub Actions run `29440660587`, job `87438487132`; local focused rerun |
 | Claude 2.1.210 MCP Elicitation canary | pass | Form request/result omitted ids and selected conservative behavior; URL remained unverified-conservative. | `20260716-010014-claude-elicitation-canary/result.json` |
 | `plan-tooling validate --file ... --explain` | pass | The eight-task plan bundle validates with zero errors. | local worktree |
 

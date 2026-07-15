@@ -4211,7 +4211,10 @@ mod tests {
     fn configured_app_server_runtime_selects_protocol_attention_authority() {
         let _probe_guard = capability_probe_test_guard();
         let lock = GlobalStateLock::new();
-        let tmp = tempfile::TempDir::new().unwrap();
+        let tmp = tempfile::Builder::new()
+            .prefix("agent-session-authority-")
+            .tempdir_in("/tmp")
+            .unwrap();
         let runtime_dir = tmp.path().join("run");
         let home = tmp.path().join("home");
         fs::create_dir(&runtime_dir).unwrap();
@@ -4274,7 +4277,10 @@ mod tests {
     fn unguarded_permission_hook_prevents_protocol_attention_authority() {
         let _probe_guard = capability_probe_test_guard();
         let lock = GlobalStateLock::new();
-        let tmp = tempfile::TempDir::new().unwrap();
+        let tmp = tempfile::Builder::new()
+            .prefix("agent-session-unguarded-")
+            .tempdir_in("/tmp")
+            .unwrap();
         let runtime_dir = tmp.path().join("run");
         let home = tmp.path().join("home");
         fs::create_dir(&runtime_dir).unwrap();
@@ -4330,7 +4336,10 @@ mod tests {
     #[test]
     fn transport_only_app_server_runtime_keeps_hook_attention_authority() {
         let lock = GlobalStateLock::new();
-        let tmp = tempfile::TempDir::new().unwrap();
+        let tmp = tempfile::Builder::new()
+            .prefix("agent-session-transport-")
+            .tempdir_in("/tmp")
+            .unwrap();
         let runtime_dir = tmp.path().join("run");
         fs::create_dir(&runtime_dir).unwrap();
         fs::set_permissions(&runtime_dir, fs::Permissions::from_mode(0o700)).unwrap();
