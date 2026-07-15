@@ -1611,6 +1611,11 @@ fn activity_setup_is_dry_run_first_additive_idempotent_and_reversible() {
         assert_eq!(data(&apply_json)["would_configure"], true);
         let applied = fs::read(path).expect("applied config");
         assert!(String::from_utf8_lossy(&applied).contains(keep));
+        if agent == "codex" {
+            let hooks = String::from_utf8_lossy(&applied);
+            assert!(hooks.contains("AGENT_SESSION_ATTENTION_AUTHORITY"));
+            assert!(hooks.contains("= protocol"));
+        }
         let applied_notify = (agent == "codex").then(|| {
             let contents =
                 fs::read_to_string(&codex_notify_path).expect("applied Codex notify config");
@@ -2605,6 +2610,286 @@ fn codex_activity_doctor_surfaces_notification_config_errors() {
             .as_str()
             .expect("guidance")
             .contains("fix the provider configuration before running repair")
+    );
+}
+
+#[test]
+fn activity_doctor_reports_exact_attention_capability_and_authority() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let home = tmp.path().join("home");
+    fs::create_dir_all(home.join(".codex")).expect("codex dir");
+    fs::create_dir_all(home.join(".claude")).expect("claude dir");
+    let codex = tmp.path().join("codex-version");
+    let claude = tmp.path().join("claude-version");
+    write_executable(
+        &codex,
+        "#!/usr/bin/env sh\nprintf '%s\\n' 'codex-cli 0.144.3'\n",
+    );
+    write_executable(
+        &claude,
+        "#!/usr/bin/env sh\nprintf '%s\\n' '2.1.210 (Claude Code)'\n",
+    );
+    let home_arg = home.to_string_lossy().to_string();
+    let codex_arg = codex.to_string_lossy().to_string();
+    let claude_arg = claude.to_string_lossy().to_string();
+    let audited = run(
+        tmp.path(),
+        &["activity", "doctor", "--agent", "codex", "--format", "json"],
+        &[
+            ("HOME", home_arg.as_str()),
+            ("AGENT_SESSION_CODEX_BIN", codex_arg.as_str()),
+        ],
+    );
+    assert_eq!(audited.code, 0, "stderr={}", audited.stderr_text());
+    let audited_json = audited.stdout_json();
+    let codex_provider = &data(&audited_json)["providers"][0];
+    assert_eq!(codex_provider["exact_attention"], "supported");
+    assert_eq!(
+        codex_provider["attention_authority"],
+        "protocol for audited managed app-server runtimes; hook for raw or unmanaged runtimes"
+    );
+
+    write_executable(
+        &codex,
+        "#!/usr/bin/env sh\nprintf '%s\\n' 'codex-cli 0.145.0'\n",
+    );
+    let unverified = run(
+        tmp.path(),
+        &["activity", "doctor", "--agent", "codex", "--format", "json"],
+        &[
+            ("HOME", home_arg.as_str()),
+            ("AGENT_SESSION_CODEX_BIN", codex_arg.as_str()),
+        ],
+    );
+    assert_eq!(
+        data(&unverified.stdout_json())["providers"][0]["exact_attention"],
+        "unverified"
+    );
+
+    let claude_doctor = run(
+        tmp.path(),
+        &[
+            "activity", "doctor", "--agent", "claude", "--format", "json",
+        ],
+        &[
+            ("HOME", home_arg.as_str()),
+            ("AGENT_SESSION_CLAUDE_BIN", claude_arg.as_str()),
+        ],
+    );
+    let claude_json = claude_doctor.stdout_json();
+    let claude_provider = &data(&claude_json)["providers"][0];
+    assert_eq!(
+        claude_provider["exact_attention"],
+        "conditional: exact for AskUserQuestion and Elicitation callbacks with a non-empty shared id; conservative otherwise"
+    );
+    assert_eq!(claude_provider["attention_authority"], "hook");
+}
+
+#[test]
+fn codex_protocol_authority_suppresses_permission_hook_and_breach_fails_closed() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let state_dir = tmp.path().join("state");
+    let cwd = tmp.path().join("repo");
+    fs::create_dir_all(&cwd).expect("repo dir");
+    let (tmux_bin, tmux_log) = fake_tmux(tmp.path());
+    let codex_bin = fake_agent(tmp.path(), "codex");
+    let state_arg = state_dir.to_string_lossy().to_string();
+    let cwd_arg = cwd.to_string_lossy().to_string();
+    let tmux_arg = tmux_bin.to_string_lossy().to_string();
+    let codex_arg = codex_bin.to_string_lossy().to_string();
+    let tmux_log_arg = tmux_log.to_string_lossy().to_string();
+    let start = run(
+        tmp.path(),
+        &[
+            "--state-dir",
+            &state_arg,
+            "start",
+            "--agent",
+            "codex",
+            "--cwd",
+            &cwd_arg,
+            "--tmux-bin",
+            &tmux_arg,
+            "--agent-bin",
+            &codex_arg,
+            "--paste-delay-ms",
+            "0",
+            "--format",
+            "json",
+        ],
+        &[("AGENT_SESSION_FAKE_TMUX_LOG", &tmux_log_arg)],
+    );
+    assert_eq!(start.code, 0, "stderr={}", start.stderr_text());
+    let id = data(&start.stdout_json())["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let dir = state_dir.join("sessions").join(&id);
+    let record_path = dir.join("session.json");
+    let mut record: Value = serde_json::from_slice(&fs::read(&record_path).unwrap()).unwrap();
+    let runtime_id = record["runtime"]["launch_id"].as_str().unwrap().to_string();
+    record["runtime"]["kind"] = json!("codex_app_server");
+    record["runtime"]["codex_attention_authority"] = json!("protocol");
+    fs::write(&record_path, serde_json::to_vec_pretty(&record).unwrap()).unwrap();
+    let before = fs::read(dir.join("activity.json")).unwrap();
+    let permission = json!({
+        "hook_event_name": "PermissionRequest",
+        "session_id": "thread-a",
+        "turn_id": "turn-a",
+        "tool_name": "shell",
+        "tool_input": {"command": "must-not-persist"}
+    })
+    .to_string();
+    let protocol_env = [
+        ("AGENT_SESSION_ID", id.as_str()),
+        ("AGENT_SESSION_RUNTIME_ID", runtime_id.as_str()),
+        ("AGENT_SESSION_STATE_DIR", state_arg.as_str()),
+        ("AGENT_SESSION_ATTENTION_AUTHORITY", "protocol"),
+    ];
+    let suppressed = run_with_stdin(
+        tmp.path(),
+        &["activity", "hook", "--agent", "codex"],
+        &protocol_env,
+        &permission,
+    );
+    assert_eq!(suppressed.code, 0, "stderr={}", suppressed.stderr_text());
+    assert_eq!(fs::read(dir.join("activity.json")).unwrap(), before);
+
+    let missing_authority_env = [
+        ("AGENT_SESSION_ID", id.as_str()),
+        ("AGENT_SESSION_RUNTIME_ID", runtime_id.as_str()),
+        ("AGENT_SESSION_STATE_DIR", state_arg.as_str()),
+    ];
+    let record_lock_path = state_dir.join("session-locks").join(format!("{id}.lock"));
+    let record_lock = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&record_lock_path)
+        .expect("session record lock");
+    // SAFETY: the test owns the descriptor and unlocks it before dropping it.
+    assert_eq!(
+        unsafe { libc::flock(record_lock.as_raw_fd(), libc::LOCK_EX) },
+        0
+    );
+    let binary = nils_test_support::bin::resolve("agent-session");
+    let mut child = Command::new(binary)
+        .current_dir(tmp.path())
+        .args(["activity", "hook", "--agent", "codex"])
+        .envs(missing_authority_env)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn authority breach hook");
+    child
+        .stdin
+        .take()
+        .expect("hook stdin")
+        .write_all(permission.as_bytes())
+        .expect("write hook payload");
+    let marker_path = dir.join("activity.unhealthy.json");
+    let marker_deadline = Instant::now() + Duration::from_secs(1);
+    while !marker_path.is_file() && Instant::now() < marker_deadline {
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        marker_path.is_file(),
+        "authority breach must poison the runtime before waiting on the session lock"
+    );
+    let status = run(
+        tmp.path(),
+        &[
+            "--state-dir",
+            &state_arg,
+            "activity",
+            "status",
+            &id,
+            "--format",
+            "json",
+        ],
+        &[],
+    );
+    assert_eq!(
+        data(&status.stdout_json())["turn_state"]["phase"],
+        "unknown"
+    );
+    let poisoned_state = data(&status.stdout_json())["turn_state"].clone();
+    let breached = child.wait_with_output().expect("authority breach output");
+    assert!(
+        breached.status.success(),
+        "hooks remain fail-open: {}",
+        String::from_utf8_lossy(&breached.stderr)
+    );
+    // SAFETY: the test owns the locked descriptor.
+    assert_eq!(
+        unsafe { libc::flock(record_lock.as_raw_fd(), libc::LOCK_UN) },
+        0
+    );
+    let mut updated_record: Value =
+        serde_json::from_slice(&fs::read(&record_path).unwrap()).unwrap();
+    updated_record["updated_at"] = json!("2099-01-01T00:00:00Z");
+    fs::write(
+        &record_path,
+        serde_json::to_vec_pretty(&updated_record).unwrap(),
+    )
+    .unwrap();
+    let after_record_update = run(
+        tmp.path(),
+        &[
+            "--state-dir",
+            &state_arg,
+            "activity",
+            "status",
+            &id,
+            "--format",
+            "json",
+        ],
+        &[],
+    );
+    let after_record_update_state = data(&after_record_update.stdout_json())["turn_state"].clone();
+    assert_eq!(
+        (
+            after_record_update_state["revision"].clone(),
+            after_record_update_state["phase_changed_at"].clone(),
+        ),
+        (
+            poisoned_state["revision"].clone(),
+            poisoned_state["phase_changed_at"].clone(),
+        ),
+        "pending fail-close state must stay stable across unrelated record updates"
+    );
+    let diagnostic = fs::read_to_string(dir.join("activity.diagnostic.json")).unwrap();
+    assert!(diagnostic.contains("codex-attention-authority-breach"));
+    assert!(!diagnostic.contains("must-not-persist"));
+
+    let later = run_with_stdin(
+        tmp.path(),
+        &["activity", "hook", "--agent", "codex"],
+        &protocol_env,
+        &json!({
+            "hook_event_name": "PostToolUse",
+            "session_id": "thread-a",
+            "turn_id": "turn-a"
+        })
+        .to_string(),
+    );
+    assert_eq!(later.code, 0);
+    let status = run(
+        tmp.path(),
+        &[
+            "--state-dir",
+            &state_arg,
+            "activity",
+            "status",
+            &id,
+            "--format",
+            "json",
+        ],
+        &[],
+    );
+    assert_eq!(
+        data(&status.stdout_json())["turn_state"]["phase"],
+        "unknown"
     );
 }
 

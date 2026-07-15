@@ -160,13 +160,30 @@ For Codex, a raw or unmanaged runtime selects `hook`; its generic
 `PermissionRequest` remains a conservative approval latch. An audited managed
 app-server runtime selects `protocol`, injects
 `AGENT_SESSION_ATTENTION_AUTHORITY=protocol`, and suppresses that generic hook
-before normalization. Its private proxy admits only the audited blocking
+before the helper is invoked, including when the installed helper predates
+authority-aware ingest. Protocol authority is unavailable until that guarded
+installed command is verified and no second direct unguarded reporter is
+present; app-server transport may still run with hook authority. Its private
+proxy admits only the audited blocking
 request method allowlist and `serverRequest/resolved`. Request ids retain their
-JSON `string` versus `int64` type until they are projected into an opaque
-runtime-scoped id. A recognized malformed request, observation loss, projection
-failure, or hook/record authority mismatch marks the activity runtime
-unhealthy. The public v1 state becomes `unknown` and rejects later same-runtime
-events; only a new runtime generation can select authority and recover.
+JSON `string` versus `int64` type only in the bounded in-memory pending table;
+each admitted request occurrence receives a fresh opaque correlation token.
+The raw request id is never persisted or exposed, and a provider may reuse the
+same id after its prior request resolves without hitting durable replay
+deduplication. A recognized malformed request, wrong-turn request, observation
+loss, malformed proxy data, projection failure, or hook/record authority
+mismatch writes a durable runtime-generation unhealthy marker. A private health
+fence linearizes the scoped pending poison marker against activity commits and
+the durable auto-resume submission claim; stable activity mirroring then uses
+the session-record lock. The marker owns a stable degradation revision and
+phase timestamp. Invalid, unreadable, or parseable-but-nondegraded marker states
+fail closed instead of being exposed.
+The public v1 state becomes `unknown`, auto-resume becomes unavailable, and
+later same-runtime events are rejected; only a new runtime generation can
+remove the marker, select authority, and recover. If an open turn has no
+provider turn id, its first non-null exact attention request binds the turn;
+later mismatches fail closed. Nullable MCP elicitation remains admitted without
+inventing a turn id.
 
 For Claude Code, `AskUserQuestion` remains exact through `tool_use_id`.
 `Elicitation` and `ElicitationResult` are also exact when both carry the same

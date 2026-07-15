@@ -30,6 +30,8 @@ const ACTIVITY_JOURNAL_FILE: &str = "activity.journal.jsonl";
 const ACTIVITY_REPLAY_FILE: &str = "activity.replay.bin";
 const ACTIVITY_DIAGNOSTIC_FILE: &str = "activity.diagnostic.json";
 const ACTIVITY_LOCK_FILE: &str = ".activity.lock";
+const ACTIVITY_HEALTH_LOCK_FILE: &str = ".activity-health.lock";
+const ACTIVITY_UNHEALTHY_FILE: &str = "activity.unhealthy.json";
 const MAX_EVENT_BYTES: u64 = 64 * 1024;
 const MAX_JOURNAL_EVENTS: usize = 256;
 const MAX_JOURNAL_BYTES: usize = 64 * 1024;
@@ -48,6 +50,7 @@ const MAX_CODEX_FORWARD_ARGS: usize = 64;
 const MAX_CODEX_FORWARD_ARGV_BYTES: usize = 16 * 1024;
 const CODEX_FORWARD_TIMEOUT: Duration = Duration::from_secs(2);
 const CODEX_COMPLETION_RETRY_TIMEOUT: Duration = Duration::from_secs(5);
+const RUNTIME_UNHEALTHY_LOCK_TIMEOUT: Duration = Duration::from_millis(250);
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -231,6 +234,24 @@ struct ActivityDocument {
     runtime_unhealthy_reason: Option<String>,
     #[serde(default, flatten)]
     extra: Map<String, Value>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct RuntimeUnhealthyMarker {
+    schema_version: String,
+    runtime_id: String,
+    runtime_generation: u64,
+    reason: String,
+    marked_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    state: Option<TurnState>,
+}
+
+enum RuntimeUnhealthyStatus {
+    Absent,
+    Matching(Box<TurnState>),
+    Pending(String),
+    Invalid,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -508,6 +529,7 @@ struct VersionProbe {
 pub(crate) struct ActivitySnapshot {
     document: Option<Vec<u8>>,
     replay: Option<Vec<u8>>,
+    unhealthy: Option<Vec<u8>>,
 }
 
 #[derive(Debug)]
@@ -520,6 +542,47 @@ impl Drop for ActivityLock {
             libc::flock(self.0.as_raw_fd(), libc::LOCK_UN);
         }
     }
+}
+
+#[derive(Debug)]
+pub(crate) struct RuntimeHealthFence(fs::File);
+
+impl Drop for RuntimeHealthFence {
+    fn drop(&mut self) {
+        // SAFETY: flock only observes the valid descriptor owned by self.
+        unsafe {
+            libc::flock(self.0.as_raw_fd(), libc::LOCK_UN);
+        }
+    }
+}
+
+fn acquire_health_fence(dir: &Path) -> Result<RuntimeHealthFence, CliError> {
+    let path = dir.join(ACTIVITY_HEALTH_LOCK_FILE);
+    let file = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .mode(SECRET_FILE_MODE)
+        .open(&path)
+        .map_err(|err| activity_io_error("activity-health-lock-open-failed", &path, err))?;
+    fs::set_permissions(&path, fs::Permissions::from_mode(SECRET_FILE_MODE))
+        .map_err(|err| activity_io_error("activity-health-lock-permission-failed", &path, err))?;
+    // SAFETY: flock only observes the valid descriptor owned by file.
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
+        return Err(activity_io_error(
+            "activity-health-lock-failed",
+            &path,
+            io::Error::last_os_error(),
+        ));
+    }
+    Ok(RuntimeHealthFence(file))
+}
+
+pub(crate) fn acquire_runtime_health_fence(
+    context: &CliContext,
+    record: &SessionRecord,
+) -> Result<RuntimeHealthFence, CliError> {
+    acquire_health_fence(&session_dir(context, &record.id))
 }
 
 fn acquire_lock(dir: &Path) -> Result<ActivityLock, CliError> {
@@ -595,6 +658,170 @@ fn activity_io_error(code: &str, path: &Path, err: io::Error) -> CliError {
         format!("activity storage failed at {}: {err}", path.display()),
         Some(json!({ "path": display_path(path) })),
     )
+}
+
+fn runtime_unhealthy_marker_path(dir: &Path) -> PathBuf {
+    dir.join(ACTIVITY_UNHEALTHY_FILE)
+}
+
+fn write_runtime_unhealthy_marker(
+    dir: &Path,
+    runtime_id: &str,
+    runtime_generation: u64,
+    reason: &str,
+    state: &TurnState,
+) -> Result<(), CliError> {
+    write_runtime_unhealthy_marker_value(
+        dir,
+        runtime_id,
+        runtime_generation,
+        reason,
+        &state.phase_changed_at,
+        Some(state),
+    )
+}
+
+fn write_runtime_unhealthy_pending_marker(
+    dir: &Path,
+    runtime_id: &str,
+    runtime_generation: u64,
+    reason: &str,
+) -> Result<(), CliError> {
+    write_runtime_unhealthy_marker_value(dir, runtime_id, runtime_generation, reason, &now(), None)
+}
+
+fn write_runtime_unhealthy_marker_value(
+    dir: &Path,
+    runtime_id: &str,
+    runtime_generation: u64,
+    reason: &str,
+    marked_at: &str,
+    state: Option<&TurnState>,
+) -> Result<(), CliError> {
+    let marker = RuntimeUnhealthyMarker {
+        schema_version: "agent-session.activity-unhealthy.v1".to_string(),
+        runtime_id: runtime_id.to_string(),
+        runtime_generation,
+        reason: reason.to_string(),
+        marked_at: marked_at.to_string(),
+        state: state.cloned(),
+    };
+    let bytes = serde_json::to_vec_pretty(&marker).map_err(|err| {
+        CliError::runtime(
+            "activity-unhealthy-render-failed",
+            format!("failed to render the runtime activity health marker: {err}"),
+            None,
+        )
+    })?;
+    let path = runtime_unhealthy_marker_path(dir);
+    write_atomic(&path, &bytes, SECRET_FILE_MODE).map_err(|err| {
+        CliError::runtime(
+            "activity-unhealthy-write-failed",
+            format!("failed to persist the runtime activity health marker: {err}"),
+            Some(json!({ "path": display_path(&path) })),
+        )
+    })
+}
+
+fn runtime_unhealthy_marker(
+    dir: &Path,
+    runtime_id: &str,
+    runtime_generation: u64,
+) -> RuntimeUnhealthyStatus {
+    let bytes = match fs::read(runtime_unhealthy_marker_path(dir)) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return RuntimeUnhealthyStatus::Absent;
+        }
+        Err(_) => return RuntimeUnhealthyStatus::Invalid,
+    };
+    let Ok(marker) = serde_json::from_slice::<RuntimeUnhealthyMarker>(&bytes) else {
+        return RuntimeUnhealthyStatus::Invalid;
+    };
+    if marker.schema_version != "agent-session.activity-unhealthy.v1"
+        || marker.marked_at.trim().is_empty()
+        || marker.marked_at.parse::<jiff::Timestamp>().is_err()
+        || marker.reason.trim().is_empty()
+    {
+        return RuntimeUnhealthyStatus::Invalid;
+    }
+    if marker.runtime_id != runtime_id || marker.runtime_generation != runtime_generation {
+        return RuntimeUnhealthyStatus::Absent;
+    }
+    match marker.state {
+        Some(state) if runtime_unhealthy_state_is_valid(&state) => {
+            RuntimeUnhealthyStatus::Matching(Box::new(state))
+        }
+        Some(_) => RuntimeUnhealthyStatus::Invalid,
+        None => RuntimeUnhealthyStatus::Pending(marker.marked_at),
+    }
+}
+
+fn runtime_unhealthy_state_is_valid(state: &TurnState) -> bool {
+    state.schema_version == TURN_STATE_VERSION
+        && state.phase == TurnPhase::Unknown
+        && state.phase_changed_at.parse::<jiff::Timestamp>().is_ok()
+        && state.source.kind == SourceKind::Runtime
+        && state.source.provider.is_none()
+        && state.source.confidence == Confidence::Authoritative
+        && state
+            .current_turn
+            .as_ref()
+            .is_none_or(|turn| turn.attention.is_none())
+}
+
+fn degraded_state(mut state: TurnState, at: &str) -> TurnState {
+    if let Some(current) = state.current_turn.as_mut() {
+        current.attention = None;
+    }
+    if state.phase != TurnPhase::Unknown {
+        state.phase_changed_at = at.to_string();
+    }
+    state.phase = TurnPhase::Unknown;
+    state.revision = state.revision.saturating_add(1);
+    state.source = runtime_source();
+    state
+}
+
+fn marker_state_from_snapshot(
+    dir: &Path,
+    record: &SessionRecord,
+    runtime_id: &str,
+    runtime_generation: u64,
+    at: &str,
+) -> TurnState {
+    read_document(&dir.join(ACTIVITY_FILE))
+        .ok()
+        .filter(|document| {
+            document.runtime_id == runtime_id && document.runtime_generation == runtime_generation
+        })
+        .map(|document| {
+            if document.runtime_unhealthy_reason.is_some()
+                && document.state.phase == TurnPhase::Unknown
+            {
+                document.state
+            } else {
+                degraded_state(document.state, at)
+            }
+        })
+        .unwrap_or_else(|| {
+            let mut state = unknown_state(record);
+            state.phase_changed_at = at.to_string();
+            state
+        })
+}
+
+fn remove_runtime_unhealthy_marker(dir: &Path) -> Result<(), CliError> {
+    let path = runtime_unhealthy_marker_path(dir);
+    match fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(activity_io_error(
+            "activity-unhealthy-remove-failed",
+            &path,
+            err,
+        )),
+    }
 }
 
 fn now() -> String {
@@ -979,11 +1206,29 @@ pub(crate) fn activate_runtime(
         && existing.runtime_id == runtime_id
         && existing.runtime_generation == runtime_generation
     {
-        return Ok(if replay_matches_document(&dir, existing) {
-            existing.state.clone()
-        } else {
-            unknown_state(record)
-        });
+        return Ok(
+            match runtime_unhealthy_marker(&dir, runtime_id, runtime_generation) {
+                RuntimeUnhealthyStatus::Matching(state) => *state,
+                RuntimeUnhealthyStatus::Pending(marked_at) => marker_state_from_snapshot(
+                    &dir,
+                    record,
+                    runtime_id,
+                    runtime_generation,
+                    &marked_at,
+                ),
+                RuntimeUnhealthyStatus::Invalid => marker_state_from_snapshot(
+                    &dir,
+                    record,
+                    runtime_id,
+                    runtime_generation,
+                    &existing.state.phase_changed_at,
+                ),
+                RuntimeUnhealthyStatus::Absent if replay_matches_document(&dir, existing) => {
+                    existing.state.clone()
+                }
+                RuntimeUnhealthyStatus::Absent => unknown_state(record),
+            },
+        );
     }
     initialize_replay_index(&replay_path, runtime_id, runtime_generation)?;
     let at = runtime.started_at.clone();
@@ -1042,6 +1287,7 @@ pub(crate) fn activate_runtime(
             .map_or_else(Map::new, |document| document.extra),
     };
     write_document(&path, &document)?;
+    remove_runtime_unhealthy_marker(&dir)?;
     Ok(document.state)
 }
 
@@ -1051,7 +1297,56 @@ pub(crate) fn mark_runtime_unhealthy(
     runtime_id: &str,
     reason: &str,
 ) -> Result<(), CliError> {
-    let record = load_session_record(context, id)?;
+    let observed = load_session_record(context, id)?;
+    let observed_runtime = observed.runtime.as_ref().ok_or_else(|| {
+        CliError::data(
+            "runtime-id-missing",
+            "session runtime is missing its launch id",
+            Some(json!({ "id": observed.id })),
+        )
+    })?;
+    if observed_runtime.launch_id != runtime_id {
+        return Err(CliError::data(
+            "runtime-id-mismatch",
+            "activity degradation does not belong to the active runtime generation",
+            Some(json!({ "id": observed.id })),
+        ));
+    }
+    let dir = session_dir(context, id);
+    {
+        let _health_fence = acquire_health_fence(&dir)?;
+        match runtime_unhealthy_marker(&dir, runtime_id, observed_runtime.generation) {
+            RuntimeUnhealthyStatus::Matching(_) => return Ok(()),
+            RuntimeUnhealthyStatus::Pending(_) | RuntimeUnhealthyStatus::Invalid => {}
+            RuntimeUnhealthyStatus::Absent => {
+                // Poison this exact runtime generation before waiting for the
+                // shared session-record fence. The health fence linearizes the
+                // poison write against activity commits and auto-resume claims.
+                write_runtime_unhealthy_pending_marker(
+                    &dir,
+                    runtime_id,
+                    observed_runtime.generation,
+                    reason,
+                )?;
+            }
+        }
+    }
+    let _record_lock = match crate::acquire_session_record_lock_timed(
+        context,
+        &observed.id,
+        RUNTIME_UNHEALTHY_LOCK_TIMEOUT,
+    ) {
+        Ok(lock) => lock,
+        Err(error) if error.code() == "session-record-lock-timeout" => {
+            // The scoped pending marker is already a durable fail-closed
+            // barrier. A later retry or runtime activation can reconcile the
+            // public state after the record writer releases its fence.
+            return Ok(());
+        }
+        Err(error) => return Err(error),
+    };
+    let record = load_session_record(context, &observed.id)?;
+    crate::ensure_same_session_identity(&observed, &record)?;
     let runtime = record.runtime.as_ref().ok_or_else(|| {
         CliError::data(
             "runtime-id-missing",
@@ -1066,8 +1361,25 @@ pub(crate) fn mark_runtime_unhealthy(
             Some(json!({ "id": record.id })),
         ));
     }
-    let dir = session_dir(context, id);
-    let _lock = acquire_lock(&dir)?;
+    if matches!(
+        runtime_unhealthy_marker(&dir, runtime_id, runtime.generation),
+        RuntimeUnhealthyStatus::Matching(_)
+    ) {
+        return Ok(());
+    }
+    let marker_state =
+        marker_state_from_snapshot(&dir, &record, runtime_id, runtime.generation, &now());
+    write_runtime_unhealthy_marker(&dir, runtime_id, runtime.generation, reason, &marker_state)?;
+    let _lock = match acquire_lock_with_timeout(&dir, RUNTIME_UNHEALTHY_LOCK_TIMEOUT) {
+        Ok(lock) => lock,
+        Err(error) if error.code() == "activity-lock-timeout" => {
+            // The marker is the durable fail-closed source of truth. Mirroring
+            // into activity.json is best effort while another writer owns the
+            // lock; views and later ingestion already reject this generation.
+            return Ok(());
+        }
+        Err(error) => return Err(error),
+    };
     let path = dir.join(ACTIVITY_FILE);
     let journal_path = dir.join(ACTIVITY_JOURNAL_FILE);
     let replay_path = dir.join(ACTIVITY_REPLAY_FILE);
@@ -1081,21 +1393,30 @@ pub(crate) fn mark_runtime_unhealthy(
         ));
     }
     if document.runtime_unhealthy_reason.is_some() {
+        write_runtime_unhealthy_marker(
+            &dir,
+            runtime_id,
+            runtime.generation,
+            reason,
+            &document.state,
+        )?;
         return Ok(());
     }
-    let at = now();
     document.runtime_unhealthy_reason = Some(reason.to_string());
     document.pending_attention.clear();
     document.overflow_attention = None;
-    if let Some(current) = document.state.current_turn.as_mut() {
-        current.attention = None;
-    }
-    if document.state.phase != TurnPhase::Unknown {
-        document.state.phase_changed_at = at;
-    }
-    document.state.phase = TurnPhase::Unknown;
-    document.state.revision = document.state.revision.saturating_add(1);
-    document.state.source = runtime_source();
+    document.state = if marker_state.revision > document.state.revision {
+        marker_state
+    } else {
+        degraded_state(document.state, &now())
+    };
+    write_runtime_unhealthy_marker(
+        &dir,
+        runtime_id,
+        runtime.generation,
+        reason,
+        &document.state,
+    )?;
     write_document(&path, &document)
 }
 
@@ -1164,6 +1485,30 @@ fn replay_matches_document(dir: &Path, document: &ActivityDocument) -> bool {
 
 pub(crate) fn state_for_view(context: &CliContext, record: &SessionRecord) -> Option<TurnState> {
     let dir = session_dir(context, &record.id);
+    if let Some(runtime) = record.runtime.as_ref() {
+        match runtime_unhealthy_marker(&dir, &runtime.launch_id, runtime.generation) {
+            RuntimeUnhealthyStatus::Matching(state) => return Some(*state),
+            RuntimeUnhealthyStatus::Pending(marked_at) => {
+                return Some(marker_state_from_snapshot(
+                    &dir,
+                    record,
+                    &runtime.launch_id,
+                    runtime.generation,
+                    &marked_at,
+                ));
+            }
+            RuntimeUnhealthyStatus::Invalid => {
+                return Some(marker_state_from_snapshot(
+                    &dir,
+                    record,
+                    &runtime.launch_id,
+                    runtime.generation,
+                    &runtime.started_at,
+                ));
+            }
+            RuntimeUnhealthyStatus::Absent => {}
+        }
+    }
     let path = dir.join(ACTIVITY_FILE);
     if !path.is_file() {
         return None;
@@ -1179,6 +1524,20 @@ pub(crate) fn state_for_view(context: &CliContext, record: &SessionRecord) -> Op
     }
 }
 
+pub(crate) fn runtime_is_unhealthy(context: &CliContext, record: &SessionRecord) -> bool {
+    let Some(runtime) = record.runtime.as_ref() else {
+        return false;
+    };
+    !matches!(
+        runtime_unhealthy_marker(
+            &session_dir(context, &record.id),
+            &runtime.launch_id,
+            runtime.generation,
+        ),
+        RuntimeUnhealthyStatus::Absent
+    )
+}
+
 pub(crate) fn capture_snapshot(
     context: &CliContext,
     id: &str,
@@ -1188,6 +1547,7 @@ pub(crate) fn capture_snapshot(
     Ok(ActivitySnapshot {
         document: read_optional_activity_file(&dir.join(ACTIVITY_FILE))?,
         replay: read_optional_activity_file(&dir.join(ACTIVITY_REPLAY_FILE))?,
+        unhealthy: read_optional_activity_file(&dir.join(ACTIVITY_UNHEALTHY_FILE))?,
     })
 }
 
@@ -1207,7 +1567,11 @@ pub(crate) fn restore_snapshot(
     let dir = session_dir(context, id);
     let _lock = acquire_lock(&dir)?;
     restore_activity_file(&dir.join(ACTIVITY_FILE), snapshot.document.as_deref())?;
-    restore_activity_file(&dir.join(ACTIVITY_REPLAY_FILE), snapshot.replay.as_deref())
+    restore_activity_file(&dir.join(ACTIVITY_REPLAY_FILE), snapshot.replay.as_deref())?;
+    restore_activity_file(
+        &dir.join(ACTIVITY_UNHEALTHY_FILE),
+        snapshot.unhealthy.as_deref(),
+    )
 }
 
 fn restore_activity_file(path: &Path, snapshot: Option<&[u8]>) -> Result<(), CliError> {
@@ -1292,7 +1656,24 @@ fn ingest_event_with_lock(
     lock_mode: ActivityLockMode,
 ) -> Result<ActivityResult, CliError> {
     validate_event(&event)?;
-    let record = load_session_record(context, id)?;
+    let observed = load_session_record(context, id)?;
+    let record_lock = match lock_mode {
+        ActivityLockMode::Blocking => crate::acquire_session_record_lock(context, &observed.id)?,
+        ActivityLockMode::NonBlocking => {
+            crate::try_acquire_session_record_lock(context, &observed.id)?.ok_or_else(|| {
+                CliError::runtime(
+                    "activity-lock-busy",
+                    "activity state is busy",
+                    Some(json!({ "id": observed.id })),
+                )
+            })?
+        }
+        ActivityLockMode::Timed(timeout) => {
+            crate::acquire_session_record_lock_timed(context, &observed.id, timeout)?
+        }
+    };
+    let record = load_session_record(context, &observed.id)?;
+    crate::ensure_same_session_identity(&observed, &record)?;
     if event.provider != record.agent {
         return Err(CliError::data(
             "activity-provider-mismatch",
@@ -1351,11 +1732,32 @@ fn ingest_event_with_lock(
     }
 
     let dir = session_dir(context, &record.id);
+    if !matches!(
+        runtime_unhealthy_marker(&dir, active_runtime_id, active_runtime_generation),
+        RuntimeUnhealthyStatus::Absent
+    ) {
+        return Err(CliError::data(
+            "activity-runtime-unhealthy",
+            "activity evidence is unavailable until the session starts a new runtime generation",
+            Some(json!({ "id": record.id })),
+        ));
+    }
     let _lock = match lock_mode {
         ActivityLockMode::Blocking => acquire_lock(&dir)?,
         ActivityLockMode::NonBlocking => acquire_lock_nonblocking(&dir)?,
         ActivityLockMode::Timed(timeout) => acquire_lock_with_timeout(&dir, timeout)?,
     };
+    let _health_fence = acquire_health_fence(&dir)?;
+    if !matches!(
+        runtime_unhealthy_marker(&dir, active_runtime_id, active_runtime_generation),
+        RuntimeUnhealthyStatus::Absent
+    ) {
+        return Err(CliError::data(
+            "activity-runtime-unhealthy",
+            "activity evidence is unavailable until the session starts a new runtime generation",
+            Some(json!({ "id": record.id })),
+        ));
+    }
     let path = dir.join(ACTIVITY_FILE);
     let journal_path = dir.join(ACTIVITY_JOURNAL_FILE);
     let replay_path = dir.join(ACTIVITY_REPLAY_FILE);
@@ -1375,6 +1777,23 @@ fn ingest_event_with_lock(
             "activity-runtime-unhealthy",
             "activity evidence is unavailable until the session starts a new runtime generation",
             Some(json!({ "id": record.id, "reason": reason })),
+        ));
+    }
+    if event.kind == TurnEventKind::AttentionRequested
+        && let (Some(expected), Some(observed)) = (
+            document
+                .state
+                .current_turn
+                .as_ref()
+                .and_then(|turn| turn.provider_turn_id.as_ref()),
+            event.provider_turn_id.as_ref(),
+        )
+        && expected != observed
+    {
+        return Err(CliError::data(
+            "provider-turn-id-mismatch",
+            "attention request does not belong to the active provider turn",
+            Some(json!({ "id": record.id })),
         ));
     }
     if let (Some(bound), Some(observed)) = (
@@ -1404,7 +1823,9 @@ fn ingest_event_with_lock(
         &dedupe_key,
     )? {
         let state = document.state.clone();
+        drop(_health_fence);
         drop(_lock);
+        drop(record_lock);
         arm_auto_resume_from_event(context, &record.id, &event, &state, &now())?;
         return Ok(ActivityResult {
             id: record.id,
@@ -1424,7 +1845,9 @@ fn ingest_event_with_lock(
     let semantic_key = semantic_event_key(&event);
     if semantic_event_is_duplicate(&document, &event, &semantic_key, &received_at) {
         let state = document.state.clone();
+        drop(_health_fence);
         drop(_lock);
+        drop(record_lock);
         arm_auto_resume_from_event(context, &record.id, &event, &state, &received_at)?;
         return Ok(ActivityResult {
             id: record.id,
@@ -1459,7 +1882,9 @@ fn ingest_event_with_lock(
     document.pending_journal = None;
     write_document(&path, &document)?;
     let state = document.state;
+    drop(_health_fence);
     drop(_lock);
+    drop(record_lock);
     arm_auto_resume_from_event(context, &record.id, &event, &state, &received_at)?;
     Ok(ActivityResult {
         id: record.id,
@@ -2626,16 +3051,12 @@ pub(crate) fn setup(
 
 fn provider_version(agent: AgentKind) -> VersionProbe {
     probe_version_command(
-        match agent {
-            AgentKind::Codex => "codex",
-            AgentKind::Claude => "claude",
-            AgentKind::Hermes => "hermes",
-        },
+        crate::resolve_agent_bin(agent, None),
         Duration::from_secs(2),
     )
 }
 
-fn probe_version_command(binary: &str, timeout: Duration) -> VersionProbe {
+fn probe_version_command(binary: impl AsRef<std::ffi::OsStr>, timeout: Duration) -> VersionProbe {
     let mut command = ProcessCommand::new(binary);
     command
         .arg("--version")
@@ -2881,6 +3302,12 @@ fn provider_specs(agent: AgentKind) -> Vec<ProviderSpec> {
 
 fn owned_command(agent: AgentKind, event: Option<&str>) -> String {
     match event {
+        Some("PermissionRequest") if agent == AgentKind::Codex => concat!(
+            "sh -c '",
+            "if [ \"${AGENT_SESSION_ATTENTION_AUTHORITY:-hook}\" = protocol ]; ",
+            "then exit 0; fi; exec agent-session activity hook --agent codex'"
+        )
+        .to_string(),
         Some(event) if agent == AgentKind::Hermes => {
             format!("agent-session activity hook --agent hermes --event {event}")
         }
@@ -3363,6 +3790,61 @@ fn json_provider_configured(agent: AgentKind, path: &Path) -> Result<bool, CliEr
         .all(|spec| json_has_spec(&value, agent, *spec)))
 }
 
+pub(crate) fn codex_protocol_attention_source_guard_configured() -> bool {
+    let Ok(path) = provider_config_path(AgentKind::Codex) else {
+        return false;
+    };
+    let Ok(bytes) = fs::read(path) else {
+        return false;
+    };
+    let Ok(value) = serde_json::from_slice::<Value>(&bytes) else {
+        return false;
+    };
+    let expected = owned_command(AgentKind::Codex, Some("PermissionRequest"));
+    let Some(groups) = value
+        .get("hooks")
+        .and_then(|hooks| hooks.get("PermissionRequest"))
+        .and_then(Value::as_array)
+    else {
+        return false;
+    };
+    let mut guarded = false;
+    for group in groups {
+        let matcher = group.get("matcher").and_then(Value::as_str);
+        let Some(handlers) = group.get("hooks").and_then(Value::as_array) else {
+            return false;
+        };
+        for handler in handlers {
+            if handler.get("type").and_then(Value::as_str) != Some("command") {
+                continue;
+            }
+            let Some(command) = handler.get("command").and_then(Value::as_str) else {
+                return false;
+            };
+            if !codex_permission_reporter_command(command) {
+                continue;
+            }
+            if matcher.is_none()
+                && command == expected
+                && handler.get("timeout").and_then(Value::as_u64) == Some(5)
+            {
+                guarded = true;
+            } else {
+                // A second direct reporter can bypass the runtime authority
+                // guard even when the owned handler is also installed.
+                return false;
+            }
+        }
+    }
+    guarded
+}
+
+fn codex_permission_reporter_command(command: &str) -> bool {
+    command.contains("agent-session")
+        && command.contains("activity hook")
+        && command.contains("--agent codex")
+}
+
 fn setup_json_provider(
     agent: AgentKind,
     path: &Path,
@@ -3446,7 +3928,7 @@ fn json_has_spec(value: &Value, agent: AgentKind, spec: ProviderSpec) -> bool {
                             handlers.iter().any(|handler| {
                                 handler.get("type").and_then(Value::as_str) == Some("command")
                                     && handler.get("command").and_then(Value::as_str)
-                                        == Some(owned_command(agent, None).as_str())
+                                        == Some(owned_command(agent, Some(spec.event)).as_str())
                                     && handler.get("timeout").and_then(Value::as_u64) == Some(5)
                             })
                         })
@@ -3481,7 +3963,8 @@ fn mutate_json_spec(
             None,
         ));
     };
-    let command = owned_command(agent, None);
+    let command = owned_command(agent, Some(spec.event));
+    let legacy_command = owned_command(agent, None);
     for group in groups.iter_mut() {
         if group.get("matcher").and_then(Value::as_str) != spec.matcher {
             continue;
@@ -3489,7 +3972,12 @@ fn mutate_json_spec(
         if let Some(handlers) = group.get_mut("hooks").and_then(Value::as_array_mut) {
             handlers.retain(|handler| {
                 !(handler.get("type").and_then(Value::as_str) == Some("command")
-                    && handler.get("command").and_then(Value::as_str) == Some(command.as_str()))
+                    && handler
+                        .get("command")
+                        .and_then(Value::as_str)
+                        .is_some_and(|candidate| {
+                            candidate == command || candidate == legacy_command
+                        }))
             });
         }
     }
@@ -3887,10 +4375,14 @@ mod tests {
     fn unhealthy_runtime_cannot_recover_until_a_new_generation() {
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let (context, mut created) = test_session(&tmp);
+        created.record.updated_at = "2000-01-01T00:00:00Z".to_string();
+        write_session_record(&context, &created.record).unwrap();
         let runtime_id = created.record.runtime.as_ref().unwrap().launch_id.clone();
         let mut started = event(TurnEventKind::TurnStarted, "start");
         started.runtime_id = runtime_id.clone();
-        ingest_event(&context, &created.record.id, started).unwrap();
+        let working = ingest_event(&context, &created.record.id, started)
+            .unwrap()
+            .turn_state;
         mark_runtime_unhealthy(
             &context,
             &created.record.id,
@@ -3902,7 +4394,10 @@ mod tests {
             .unwrap()
             .turn_state;
         assert_eq!(unknown.phase, TurnPhase::Unknown);
+        assert!(unknown.revision > working.revision);
+        assert_ne!(unknown.phase_changed_at, created.record.updated_at);
         let revision = unknown.revision;
+        let changed_at = unknown.phase_changed_at.clone();
 
         let mut progress = event(TurnEventKind::Progress, "late-progress");
         progress.runtime_id = runtime_id.clone();
@@ -3914,11 +4409,62 @@ mod tests {
             TurnPhase::Unknown
         );
         assert_eq!(
+            (
+                activity_status(&context, &created.record.id)
+                    .unwrap()
+                    .turn_state
+                    .revision,
+                activity_status(&context, &created.record.id)
+                    .unwrap()
+                    .turn_state
+                    .phase_changed_at,
+            ),
+            (revision, changed_at)
+        );
+
+        fs::write(
+            session_dir(&context, &created.record.id).join(ACTIVITY_UNHEALTHY_FILE),
+            b"{malformed",
+        )
+        .unwrap();
+        assert!(runtime_is_unhealthy(&context, &created.record));
+        assert_eq!(
             activity_status(&context, &created.record.id)
                 .unwrap()
                 .turn_state
-                .revision,
-            revision
+                .phase,
+            TurnPhase::Unknown
+        );
+        let auto_resume = crate::auto_resume::view_for_record(&context, &created.record);
+        assert_eq!(auto_resume.state, "terminal_failure");
+        assert_eq!(
+            auto_resume.failure_reason.as_deref(),
+            Some("state_unavailable")
+        );
+
+        let mut false_healthy = unknown.clone();
+        false_healthy.phase = TurnPhase::Working;
+        false_healthy.source = provider_source(&event(TurnEventKind::Progress, "false-healthy"));
+        fs::write(
+            session_dir(&context, &created.record.id).join(ACTIVITY_UNHEALTHY_FILE),
+            serde_json::to_vec_pretty(&RuntimeUnhealthyMarker {
+                schema_version: "agent-session.activity-unhealthy.v1".to_string(),
+                runtime_id: runtime_id.clone(),
+                runtime_generation: created.record.runtime.as_ref().unwrap().generation,
+                reason: "invalid_state_fixture".to_string(),
+                marked_at: "2030-01-01T00:00:00Z".to_string(),
+                state: Some(false_healthy),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            activity_status(&context, &created.record.id)
+                .unwrap()
+                .turn_state
+                .phase,
+            TurnPhase::Unknown,
+            "a parseable marker cannot publish a non-degraded state"
         );
 
         let runtime = created.record.runtime.as_mut().unwrap();
@@ -3929,6 +4475,50 @@ mod tests {
         assert_eq!(
             activate_runtime(&context, &created.record).unwrap().phase,
             TurnPhase::Starting
+        );
+    }
+
+    #[test]
+    fn exact_attention_binds_an_unidentified_open_turn_before_rejecting_mismatch() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let (context, created) = test_session(&tmp);
+        let runtime_id = created.record.runtime.as_ref().unwrap().launch_id.clone();
+
+        let mut started = event(TurnEventKind::TurnStarted, "start-without-turn");
+        started.runtime_id = runtime_id.clone();
+        started.provider_turn_id = None;
+        ingest_event(&context, &created.record.id, started).unwrap();
+
+        let mut first = event(TurnEventKind::AttentionRequested, "attention-turn-a");
+        first.runtime_id = runtime_id.clone();
+        first.provider_turn_id = Some("turn-a".to_string());
+        first.attention_id = Some("local:v1:attention-a".to_string());
+        first.attention_kind = Some("approval".to_string());
+        let bound = ingest_event(&context, &created.record.id, first)
+            .unwrap()
+            .turn_state;
+        let bound_turn = bound
+            .current_turn
+            .as_ref()
+            .and_then(|turn| turn.provider_turn_id.as_deref())
+            .expect("first exact request must bind the open turn")
+            .to_string();
+
+        let mut second = event(TurnEventKind::AttentionRequested, "attention-turn-b");
+        second.runtime_id = runtime_id;
+        second.provider_turn_id = Some("turn-b".to_string());
+        second.attention_id = Some("local:v1:attention-b".to_string());
+        second.attention_kind = Some("approval".to_string());
+        let error = ingest_event(&context, &created.record.id, second)
+            .expect_err("a later exact request cannot change the bound turn");
+        assert_eq!(error.code(), "provider-turn-id-mismatch");
+        assert_eq!(
+            activity_status(&context, &created.record.id)
+                .unwrap()
+                .turn_state
+                .current_turn
+                .and_then(|turn| turn.provider_turn_id),
+            Some(bound_turn)
         );
     }
 
@@ -5165,7 +5755,7 @@ mod tests {
         };
         let cwd = tmp.path().join("repo");
         fs::create_dir_all(&cwd).expect("repo dir");
-        let created = create_record(RecordRequest {
+        let mut created = create_record(RecordRequest {
             context: &context,
             agent: AgentKind::Hermes,
             mode: "interactive",
@@ -5180,6 +5770,7 @@ mod tests {
             agent_bin: None,
         })
         .expect("Hermes session");
+        created.release_lifecycle_lock();
         let runtime_id = created
             .record
             .runtime
@@ -5566,6 +6157,10 @@ mod tests {
             AgentKind::Codex,
             provider_specs(AgentKind::Codex)[0]
         ));
+        let permission_command = owned_command(AgentKind::Codex, Some("PermissionRequest"));
+        assert!(permission_command.contains("AGENT_SESSION_ATTENTION_AUTHORITY"));
+        assert!(permission_command.contains("= protocol"));
+        assert!(permission_command.contains("exec agent-session activity hook --agent codex"));
 
         let hermes: serde_yaml_ng::Value = serde_yaml_ng::from_str(&format!(
             "hooks:\n  pre_llm_call:\n    - command: {}\n      timeout: 1\n",
@@ -5964,6 +6559,11 @@ fn reduce(document: &mut ActivityDocument, event: &TurnEvent, at: &str) {
                     attention: None,
                     extra: Map::new(),
                 });
+            } else if let Some(current) = document.state.current_turn.as_mut()
+                && current.provider_turn_id.is_none()
+                && event.provider_turn_id.is_some()
+            {
+                current.provider_turn_id = event.provider_turn_id.clone();
             }
             let attention_id = event.attention_id.as_deref().unwrap_or_default();
             let duplicate_hermes_approval = event.attention_correlation_ambiguous

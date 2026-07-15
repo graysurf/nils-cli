@@ -90,15 +90,30 @@ authority. The metadata-only proxy admits
 `item/commandExecution/requestApproval`, `item/fileChange/requestApproval`,
 `item/permissions/requestApproval`, `item/tool/requestUserInput`, and
 `mcpServer/elicitation/request`, then clears only the same typed request id on
-`serverRequest/resolved`. JSON integer `1` and string `"1"` are distinct before
-runtime-scoped SHA-256 projection. The runtime injects its authority into tmux;
-the generic `PermissionRequest` reporter becomes a source-level no-op. Missing
-or conflicting authority, malformed recognized metadata, a projection queue
-gap, or an unexpected permission hook degrades activity to `unknown` until a
-new runtime generation. Authority never switches within a runtime.
+`serverRequest/resolved`. MCP elicitation `form` and `openai/form` map to
+clarification, while `url` maps to authentication; an unknown or malformed mode
+fails closed. JSON integer `1` and string `"1"` remain distinct in the bounded
+in-memory pending table. Each occurrence receives a fresh opaque correlation
+token, so sequential provider id reuse remains exact without retaining the raw
+id in the activity snapshot, journal, replay index, or public state. The runtime
+injects its authority into tmux; the installed generic `PermissionRequest`
+command checks that environment before invoking the helper, which also protects
+against an older helper during rollback. Protocol authority is selected only
+when that exact guarded command is present and no second direct unguarded
+reporter can bypass it; an unguarded or missing command keeps hook authority even
+when app-server transport is available. Missing or
+conflicting authority, wrong-turn or malformed recognized metadata, malformed
+or lost proxy transport, a projection queue gap, or an unexpected permission
+hook writes a durable generation-scoped unhealthy marker and degrades activity
+to `unknown` until a new runtime generation. A dedicated health fence orders the
+pending marker against activity commits and the durable auto-resume claim; the
+stable mirror is then reconciled under the session-record lock. The marker
+retains a monotonic public revision/timestamp and fails closed if unreadable or
+if a parseable state is not itself a valid runtime-owned `unknown` state.
+Authority never switches within a runtime.
 
-For fresh agent-session-managed sessions, bounded version/help probes require
-the audited Codex 0.144.1 floor plus explicit Unix-listen support before
+For fresh agent-session-managed sessions, bounded version/help probes admit
+only an explicit app-server transport allowlist plus Unix-listen support before
 launching `codex app-server` and connecting the visible TUI through a private
 metadata-projecting Unix WebSocket bridge. The bridge observes the exact TUI
 connection and forwards its frames unchanged; bounded background projection
@@ -212,9 +227,13 @@ The executable fixtures cover:
 - conditional exact Claude Elicitation form/URL correlation, identifier-less
   conservative fallback, setup parity, and content-field rejection;
 - all five admitted Codex server-request methods, typed integer/string id
-  separation, concurrent `2 -> 1 -> 0` clearing before completion, idempotent
-  unmatched/repeated resolution, queue/shape bounds, authority suppression,
-  projection degradation, and no same-runtime recovery;
+  separation, per-occurrence tokens with sequential id reuse, MCP mode mapping,
+  concurrent `2 -> 1 -> 0` clearing before completion, idempotent unmatched or
+  repeated resolution, queue/shape bounds, wrong-turn rejection, authority
+  suppression, source-guard capability selection, transport-loss and malformed-
+  frame degradation, stable marker revision across unrelated record updates,
+  invalid/nondegraded-marker rejection, held-session-lock authority breach,
+  guarded-plus-unguarded source rejection, and no same-runtime recovery;
 - unrelated progress while attention is pending, including monotonic
   `current_turn.last_progress_at` without phase relaxation;
 - Stop followed by continuation/new-turn evidence;

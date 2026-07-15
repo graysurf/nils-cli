@@ -44,7 +44,7 @@
 | 2.3 | done | Implement Codex runtime source arbitration and capability status | pending; Runtime extra plus tmux env select protocol or hook authority; generic protocol-authority permission reporter suppresses at source; mismatch and projection loss remain unknown until a new generation; doctor reports exact capability and policy. | Codex 0.144.3 supported; versions outside exact audit remain unverified. |
 | 3.1 | done | Verify Claude capability and capture branch-specific test-first evidence | pending; Official Claude hooks contract and installed 2.1.210 confirm optional elicitation_id on Elicitation and ElicitationResult; sanitized live canary remains.; Sanitized Claude 2.1.210 MCP canary: form emitted request/result with no elicitation_id; URL emitted no callbacks. Both are conservative terminal outcomes; artifacts retained under agent-out. | No raw message, URL, schema, content, or provider id retained. |
 | 3.2 | done | Implement selected Claude exact or conservative branch | pending; Claude setup adds Elicitation/ElicitationResult; same nonempty id maps to exact runtime-scoped request/clear, missing request id latches conservatively, missing result id is ignored; form/URL/privacy/setup tests pass. | AskUserQuestion and generic permission behavior remain unchanged; rollback disables only the new admission/setup entries. |
-| 4.1 | in-progress | Publish capability status and run integration acceptance | Contract and evidence docs updated; doctor and setup dry-runs pass; Claude 2.1.210 canary proves the missing-id conservative branch; focused tests, the full crate suite, local-fast, docs-only, and plan validation pass. Specialist review, merged deployment, live provider sessions, polling/SSE, and Agent Console acceptance remain. | Same-id clear before `Stop` where exact is supported. |
+| 4.1 | in-progress | Publish capability status and run integration acceptance | Contract and evidence docs updated; doctor and setup dry-runs pass; Claude 2.1.210 canary proves the missing-id conservative branch; focused tests, the full crate suite, local-fast, docs-only, plan validation, and final API-contract, maintainability, and red-team testing reviews pass. Merged deployment, live provider sessions, polling/SSE, Agent Console, and first/subsequent-prompt retitle acceptance remain. | Same-id clear before `Stop` where exact is supported. |
 | 4.2 | pending | Deliver implementation PRs and close tracker | pending | Close only after completion audit. |
 
 ## Session Log
@@ -92,6 +92,43 @@
 - 2026-07-15: Test-first evidence is complete. Four provider-correlation tests
   failed before production edits and now pass; the affected crate, local-fast,
   docs-only, and plan gates are green. Pre-merge specialist review is active.
+- 2026-07-15: First-wave specialist review found request-id reuse, wrong-turn
+  scope, MCP mode classification, raw-id privacy, projection lock contention,
+  transport/exact capability coupling, rollback compatibility, and coverage
+  gaps. The implementation now uses per-occurrence opaque tokens, rejects
+  wrong-turn requests, maps MCP modes explicitly, retains no raw request id,
+  separates transport from exact capability, source-guards the installed hook
+  command, and persists a generation-scoped unhealthy marker without waiting
+  indefinitely on the activity lock. The expanded crate suite and Clippy pass;
+  reviewer follow-up remains active.
+- 2026-07-15: Follow-up API, maintainability, and red-team review found public
+  revision reset, unbound-turn scope, marker serialization/corruption,
+  unverified installed source suppression, and proxy transport-loss paths. The
+  second fix wave gives the marker a stable monotonic public state, serializes
+  degradation with activity/auto-resume through the session-record lock, fails
+  closed on invalid markers, binds the first non-null exact turn id, requires
+  the guarded installed command before protocol authority, and degrades on
+  proxy EOF/read/write/malformed-data failure. Final follow-up and full gates
+  remain active.
+- 2026-07-15: Retitle integration was reassessed at the user's request. Codex
+  and Claude already trigger first-prompt and subsequent-prompt auto-retitles
+  through the independent `provider-prompt.v1` attach channel, while completion
+  fallback already consumes authoritative v1 turn state. Folding prompt text
+  into the metadata-only activity pipeline would violate the privacy and
+  failure-isolation boundary, so no cross-repo feature edit is warranted. The
+  deployed acceptance must instead prove both prompt retitles still work after
+  the activity changes.
+- 2026-07-15: Final red-team lock review found that a one-shot authority breach
+  could time out behind the session-record lock before poisoning the runtime.
+  The fail-close path now writes a runtime-scoped pending marker first, with a
+  stable timestamp, and a dedicated health fence orders that write against
+  activity commits and the durable auto-resume submission claim. Parseable
+  markers must themselves contain a runtime-owned `unknown` state, and Codex
+  protocol authority is rejected when any second direct unguarded permission
+  reporter exists. Held-lock, record-update stability, invalid-state, and mixed
+  guarded/unguarded regressions pass. The final full gates and API-contract,
+  maintainability, and red-team testing follow-ups all passed with no blocking
+  findings; delivery and deployed acceptance remain active.
 
 ## Validation
 
@@ -106,9 +143,13 @@
 | `bash scripts/ci/nils-cli-checks-entrypoint.sh --local-fast` | pass | Repository correctly selected docs-only mode and passed. | local |
 | Focused activity reducer and AskUserQuestion baselines | pass | Exact ids clear independently, progress never clears attention, and existing Claude exact correlation remains green. | local worktree |
 | Four provider-correlation red-to-green regressions | pass | Codex typed projection and independent 2-to-1-to-0 clearing, semantic-id preservation, and Claude exact-or-conservative normalization pass. | `20260716-003843-provider-exact-attention-test-first/test-first-evidence.json` |
-| `cargo test -p nils-agent-session` | pass | 395 unit tests and 92 integration tests passed. | local worktree |
+| `cargo test -p nils-agent-session` | pass | After first-wave review fixes, 400 unit tests and 94 integration tests passed. | local worktree |
+| `cargo clippy -p nils-agent-session --all-targets --all-features -- -D warnings` | pass | Expanded production and test paths compile with zero warnings. | local worktree |
 | `bash scripts/ci/nils-cli-checks-entrypoint.sh --local-fast` | pass | Formatting, Clippy with denied warnings, docs gates, 487 nextest tests, and doctests passed. | local worktree |
 | `bash scripts/ci/nils-cli-checks-entrypoint.sh --docs-only` | pass | Strict documentation and CLI-contract checks passed. | local worktree |
+| Final `cargo test -p nils-agent-session` | pass | 403 unit and 94 integration tests passed after all marker, health-fence, source-guard, and proxy-loss review fixes. | local worktree |
+| Final `bash scripts/ci/nils-cli-checks-entrypoint.sh --local-fast` | pass | Docs gates, formatting, denied-warning Clippy, 497 nextest tests, and doctests passed. | local worktree |
+| Final specialist follow-up | pass | API-contract, maintainability, and red-team testing reviewers found no blocking issues after the health-fence, marker, source-guard, and proxy-loss fixes. | PR #1239 review evidence |
 | Claude 2.1.210 MCP Elicitation canary | pass | Form request/result omitted ids and selected conservative behavior; URL remained unverified-conservative. | `20260716-010014-claude-elicitation-canary/result.json` |
 | `plan-tooling validate --file ... --explain` | pass | The eight-task plan bundle validates with zero errors. | local worktree |
 

@@ -171,6 +171,16 @@ fn projection_unavailable(state: &DurableAutoResume) -> bool {
 }
 
 pub(crate) fn view_for_record(context: &CliContext, record: &SessionRecord) -> AutoResumeView {
+    if crate::activity::runtime_is_unhealthy(context, record) {
+        return AutoResumeView {
+            schema_version: AUTO_RESUME_SCHEMA_VERSION,
+            supported: supported(record),
+            enabled: false,
+            state: "terminal_failure".to_string(),
+            scheduled_at: None,
+            failure_reason: Some("state_unavailable".to_string()),
+        };
+    }
     let now = Timestamp::now().to_string();
     match read_state(context, &record.id, &now) {
         Ok(state) => view(record, state),
@@ -196,6 +206,13 @@ pub(crate) fn set_enabled(
     let _lock = acquire_session_record_lock(context, &canonical_id)?;
     let record = load_session_record(context, &canonical_id)?;
     crate::ensure_same_session_identity(&observed, &record)?;
+    if enabled && crate::activity::runtime_is_unhealthy(context, &record) {
+        return Err(CliError::data(
+            "auto-resume-state-unavailable",
+            "auto-resume projection is unavailable until this session runtime is restarted",
+            Some(json!({ "id": record.id })),
+        ));
+    }
     if enabled && !supported(&record) {
         return Err(CliError::data(
             "auto-resume-unsupported",
@@ -511,6 +528,15 @@ fn record_scheduler_error_inner(
     if !runtime_matches(&record, expected_launch_id) {
         return Ok(TickOutcome::Unchanged);
     }
+    if crate::activity::runtime_is_unhealthy(context, &record) {
+        let mut state = read_state(context, &record.id, &now)?;
+        state.enabled = false;
+        state.state = "terminal_failure".to_string();
+        state.updated_at = now;
+        state.failure_reason = Some("state_unavailable".to_string());
+        write_state(context, &record.id, &state)?;
+        return Ok(TickOutcome::TerminalFailure);
+    }
     let state = read_state(context, &record.id, &now)?;
     if !state.enabled
         || !matches!(
@@ -769,6 +795,15 @@ where
 
     // Claim before submitting. A crash after this durable write is never
     // retried automatically, which preserves the no-duplicate guarantee.
+    let health_fence = crate::activity::acquire_runtime_health_fence(context, &record)?;
+    if crate::activity::runtime_is_unhealthy(context, &record) {
+        state.enabled = false;
+        state.state = "terminal_failure".to_string();
+        state.updated_at = now;
+        state.failure_reason = Some("state_unavailable".to_string());
+        write_state(context, &record.id, &state)?;
+        return Ok(TickOutcome::TerminalFailure);
+    }
     if record.agent == "codex" {
         crate::codex_account::authorize_input_locked(context, &mut record)?;
     }
@@ -777,6 +812,7 @@ where
     state.scheduled_at = None;
     state.next_check_at = None;
     write_state(context, &record.id, &state)?;
+    drop(health_fence);
     match submit(&record) {
         Ok(()) => {
             state.state = "resumed".to_string();
