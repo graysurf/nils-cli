@@ -100,8 +100,9 @@ exit 0
 }
 
 /// Write a sops stub. For `-d` (decrypt) it writes a fake plaintext dotenv (with
-/// the secret canary) to stdout. For `-e -i` (encrypt in place) it rewrites the
-/// target file with an `ENC[...]` marker. Behavior is steered by env vars.
+/// the secret canary) to stdout. For `-e`, it supports both the retired in-place
+/// shape and the safe stdout-output shape so the tests can prove the final
+/// target's state while encryption is running. Behavior is steered by env vars.
 fn sops_stub(dir: &Path) {
     write_exe(
         dir,
@@ -111,17 +112,65 @@ printf '%s\n' "$*" >> "${SOPS_LOG:-/dev/null}"
 
 mode=""
 file=""
+filename_override=""
 inplace=0
-for a in "$@"; do
-  case "$a" in
+while (( "$#" )); do
+  case "$1" in
     -d) mode="d" ;;
     -e) mode="e" ;;
     -i) inplace=1 ;;
+    --filename-override)
+      shift
+      filename_override="${1:-}"
+      ;;
+    --input-type|--output-type)
+      shift
+      ;;
     -*) ;;
-    dotenv) ;;
-    *) file="$a" ;;
+    *) file="$1" ;;
   esac
+  shift
 done
+
+if [[ "$mode" == "e" ]]; then
+  final_target="${SOPS_STORE:-}/${filename_override:-$file}"
+
+  case "${SOPS_ASSERT_FINAL_STATE:-}" in
+    absent)
+      if [[ -e "$final_target" ]]; then
+        echo "sops: final target existed during encryption" >&2
+        exit 1
+      fi
+      ;;
+    unchanged)
+      if [[ ! -f "$final_target" ]] ||
+         [[ "$(<"$final_target")" != "${SOPS_EXPECTED_TARGET:-}" ]]; then
+        echo "sops: final target changed during encryption" >&2
+        exit 1
+      fi
+      ;;
+  esac
+
+  if [[ "${SOPS_REQUIRE_FILENAME_OVERRIDE:-0}" == "1" && -z "$filename_override" ]]; then
+    echo "sops: missing filename override" >&2
+    exit 1
+  fi
+
+  if [[ "${SOPS_ASSERT_OUTPUT_MODE:-0}" == "1" ]]; then
+    case "$(uname -s)" in
+      Darwin|FreeBSD) output_mode="$(stat -f '%Lp' /dev/fd/1 2>/dev/null || true)" ;;
+      *) output_mode="$(stat -Lc '%a' /dev/fd/1 2>/dev/null || true)" ;;
+    esac
+    if [[ "$output_mode" != "600" ]]; then
+      echo "sops: encryption output is not mode 600" >&2
+      exit 1
+    fi
+  fi
+
+  if [[ "${SOPS_SIGNAL:-0}" == "1" ]]; then
+    kill -TERM "$$"
+  fi
+fi
 
 if [[ "${SOPS_FAIL:-0}" == "1" ]]; then
   echo "sops: simulated failure" >&2
@@ -144,9 +193,37 @@ if [[ "$mode" == "e" && "$inplace" == "1" ]]; then
   exit 0
 fi
 
+if [[ "$mode" == "e" ]]; then
+  # Safe encryption shape: consume the source path and emit ciphertext only to
+  # stdout, which the CLI redirects to its private temporary output.
+  if [[ ! -f "$file" ]]; then
+    echo "sops: missing plaintext input" >&2
+    exit 1
+  fi
+  if [[ "${SOPS_NO_ENC:-0}" == "1" ]]; then
+    printf 'API_KEY=TOP-SECRET-VALUE\n'
+  else
+    printf 'API_KEY=ENC[AES256_GCM,data:abc,type:str]\n'
+  fi
+  exit 0
+fi
+
 # Bare `sops <file>` (edit): no-op success.
 exit 0
 "#,
+    );
+}
+
+fn assert_no_add_temp_files(store: &Path) {
+    let leftovers: Vec<_> = fs::read_dir(store.join(".git"))
+        .expect("read store .git")
+        .filter_map(Result::ok)
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|name| name.starts_with("secrets-add-"))
+        .collect();
+    assert!(
+        leftovers.is_empty(),
+        "secrets add temporary files were not cleaned up: {leftovers:?}"
     );
 }
 
@@ -456,13 +533,21 @@ fn add_encrypts_commits_and_pushes() {
     let store = tmp.path().join("store");
     init_store(&store);
     let git_log = tmp.path().join("git.log");
+    let sops_log = tmp.path().join("sops.log");
     fs::write(&git_log, "").expect("git log");
+    fs::write(&sops_log, "").expect("sops log");
     git_stub(stubs.path());
     sops_stub(stubs.path());
 
     let output = run(
         &["add"],
-        &options(&app, &store, stubs.path()).with_env("GIT_LOG", &git_log.to_string_lossy()),
+        &options(&app, &store, stubs.path())
+            .with_env("GIT_LOG", &git_log.to_string_lossy())
+            .with_env("SOPS_LOG", &sops_log.to_string_lossy())
+            .with_env("SOPS_STORE", &store.to_string_lossy())
+            .with_env("SOPS_ASSERT_FINAL_STATE", "absent")
+            .with_env("SOPS_ASSERT_OUTPUT_MODE", "1")
+            .with_env("SOPS_REQUIRE_FILENAME_OVERRIDE", "1"),
     );
     assert_exit(&output, 0);
     assert_no_secret_leak(&output);
@@ -482,12 +567,23 @@ fn add_encrypts_commits_and_pushes() {
     assert!(git_calls.contains("commit"));
     assert!(git_calls.contains("push"));
 
+    let sops_calls = fs::read_to_string(&sops_log).expect("sops log");
+    assert!(
+        sops_calls.contains("--filename-override repos/graysurf/g14-infra.enc.env"),
+        "sops must evaluate creation rules against the final target path: {sops_calls}"
+    );
+    assert!(
+        !sops_calls.split_whitespace().any(|arg| arg == "-i"),
+        "add must not encrypt the tracked target in place: {sops_calls}"
+    );
+    assert_no_add_temp_files(&store);
+
     let stdout = output.stdout_text();
     assert!(stdout.contains("repos/graysurf/g14-infra.enc.env"));
 }
 
 #[test]
-fn add_failed_encryption_removes_plaintext_and_aborts() {
+fn add_non_ciphertext_output_leaves_no_target_or_temp() {
     let tmp = TempDir::new().expect("tmp");
     let app = tmp.path().join("app");
     fs::create_dir_all(&app).expect("app dir");
@@ -505,6 +601,9 @@ fn add_failed_encryption_removes_plaintext_and_aborts() {
         &["add"],
         &options(&app, &store, stubs.path())
             .with_env("GIT_LOG", &git_log.to_string_lossy())
+            .with_env("SOPS_STORE", &store.to_string_lossy())
+            .with_env("SOPS_ASSERT_FINAL_STATE", "absent")
+            .with_env("SOPS_REQUIRE_FILENAME_OVERRIDE", "1")
             // sops succeeds but leaves plaintext (no ENC marker) -> must abort.
             .with_env("SOPS_NO_ENC", "1"),
     );
@@ -515,11 +614,160 @@ fn add_failed_encryption_removes_plaintext_and_aborts() {
     // Plaintext copy removed; nothing staged/committed/pushed.
     assert!(
         !store.join("repos/graysurf/g14-infra.enc.env").exists(),
-        "plaintext copy must be removed on failure"
+        "invalid encryption output must not create the final target"
     );
     let git_calls = fs::read_to_string(&git_log).expect("git log");
     assert!(!git_calls.contains("commit"), "must not commit on failure");
     assert!(!git_calls.contains("push"), "must not push on failure");
+    assert_no_add_temp_files(&store);
+}
+
+#[test]
+fn add_unchanged_stages_without_committing_or_pushing() {
+    let tmp = TempDir::new().expect("tmp");
+    let app = tmp.path().join("app");
+    fs::create_dir_all(&app).expect("app dir");
+    fs::write(app.join(".env"), format!("API_KEY={SECRET_CANARY}\n")).expect("write src");
+
+    let stubs = StubBinDir::new();
+    let store = tmp.path().join("store");
+    init_store(&store);
+    let target = store.join("repos/graysurf/g14-infra.enc.env");
+    fs::create_dir_all(target.parent().expect("target parent")).expect("target parent");
+    let ciphertext = "API_KEY=ENC[AES256_GCM,data:abc,type:str]\n";
+    fs::write(&target, ciphertext).expect("existing ciphertext");
+    let git_log = tmp.path().join("git.log");
+    fs::write(&git_log, "").expect("git log");
+    git_stub(stubs.path());
+    sops_stub(stubs.path());
+
+    let output = run(
+        &["add"],
+        &options(&app, &store, stubs.path())
+            .with_env("GIT_LOG", &git_log.to_string_lossy())
+            .with_env("GIT_DIFF_CLEAN", "1")
+            .with_env("SOPS_STORE", &store.to_string_lossy())
+            .with_env("SOPS_ASSERT_FINAL_STATE", "unchanged")
+            .with_env("SOPS_EXPECTED_TARGET", ciphertext.trim_end())
+            .with_env("SOPS_ASSERT_OUTPUT_MODE", "1")
+            .with_env("SOPS_REQUIRE_FILENAME_OVERRIDE", "1"),
+    );
+    assert_exit(&output, 0);
+    assert_no_secret_leak(&output);
+    assert!(output.stdout_text().contains("unchanged"));
+    assert_eq!(
+        fs::read_to_string(&target).expect("ciphertext retained"),
+        ciphertext
+    );
+
+    let git_calls = fs::read_to_string(&git_log).expect("git log");
+    assert!(git_calls.contains("add repos/graysurf/g14-infra.enc.env"));
+    assert!(
+        !git_calls.contains("commit"),
+        "must not commit unchanged data"
+    );
+    assert!(!git_calls.contains("push"), "must not push unchanged data");
+    assert_no_add_temp_files(&store);
+}
+
+#[test]
+fn add_sops_failure_preserves_existing_ciphertext_and_cleans_temp() {
+    let tmp = TempDir::new().expect("tmp");
+    let app = tmp.path().join("app");
+    fs::create_dir_all(&app).expect("app dir");
+    fs::write(app.join(".env"), format!("API_KEY={SECRET_CANARY}\n")).expect("write src");
+
+    let stubs = StubBinDir::new();
+    let store = tmp.path().join("store");
+    init_store(&store);
+    let target = store.join("repos/graysurf/g14-infra.enc.env");
+    fs::create_dir_all(target.parent().expect("target parent")).expect("target parent");
+    let original = "API_KEY=ENC[AES256_GCM,data:original,type:str]\n";
+    fs::write(&target, original).expect("existing ciphertext");
+    git_stub(stubs.path());
+    sops_stub(stubs.path());
+
+    let output = run(
+        &["add"],
+        &options(&app, &store, stubs.path())
+            .with_env("SOPS_STORE", &store.to_string_lossy())
+            .with_env("SOPS_ASSERT_FINAL_STATE", "unchanged")
+            .with_env("SOPS_EXPECTED_TARGET", original.trim_end())
+            .with_env("SOPS_REQUIRE_FILENAME_OVERRIDE", "1")
+            .with_env("SOPS_FAIL", "1"),
+    );
+    assert_exit(&output, 1);
+    assert_no_secret_leak(&output);
+    assert_eq!(
+        fs::read_to_string(&target).expect("existing ciphertext retained"),
+        original
+    );
+    assert_no_add_temp_files(&store);
+}
+
+#[test]
+fn add_non_ciphertext_output_preserves_existing_target_and_cleans_temp() {
+    let tmp = TempDir::new().expect("tmp");
+    let app = tmp.path().join("app");
+    fs::create_dir_all(&app).expect("app dir");
+    fs::write(app.join(".env"), format!("API_KEY={SECRET_CANARY}\n")).expect("write src");
+
+    let stubs = StubBinDir::new();
+    let store = tmp.path().join("store");
+    init_store(&store);
+    let target = store.join("repos/graysurf/g14-infra.enc.env");
+    fs::create_dir_all(target.parent().expect("target parent")).expect("target parent");
+    let original = "API_KEY=ENC[AES256_GCM,data:original,type:str]\n";
+    fs::write(&target, original).expect("existing ciphertext");
+    git_stub(stubs.path());
+    sops_stub(stubs.path());
+
+    let output = run(
+        &["add"],
+        &options(&app, &store, stubs.path())
+            .with_env("SOPS_STORE", &store.to_string_lossy())
+            .with_env("SOPS_ASSERT_FINAL_STATE", "unchanged")
+            .with_env("SOPS_EXPECTED_TARGET", original.trim_end())
+            .with_env("SOPS_REQUIRE_FILENAME_OVERRIDE", "1")
+            .with_env("SOPS_NO_ENC", "1"),
+    );
+    assert_exit(&output, 1);
+    assert_no_secret_leak(&output);
+    assert_eq!(
+        fs::read_to_string(&target).expect("existing ciphertext retained"),
+        original
+    );
+    assert_no_add_temp_files(&store);
+}
+
+#[test]
+fn add_cleans_temp_when_sops_is_terminated_by_signal() {
+    let tmp = TempDir::new().expect("tmp");
+    let app = tmp.path().join("app");
+    fs::create_dir_all(&app).expect("app dir");
+    fs::write(app.join(".env"), format!("API_KEY={SECRET_CANARY}\n")).expect("write src");
+
+    let stubs = StubBinDir::new();
+    let store = tmp.path().join("store");
+    init_store(&store);
+    git_stub(stubs.path());
+    sops_stub(stubs.path());
+
+    let output = run(
+        &["add"],
+        &options(&app, &store, stubs.path())
+            .with_env("SOPS_STORE", &store.to_string_lossy())
+            .with_env("SOPS_ASSERT_FINAL_STATE", "absent")
+            .with_env("SOPS_REQUIRE_FILENAME_OVERRIDE", "1")
+            .with_env("SOPS_SIGNAL", "1"),
+    );
+    assert_exit(&output, 1);
+    assert_no_secret_leak(&output);
+    assert!(
+        !store.join("repos/graysurf/g14-infra.enc.env").exists(),
+        "signal failure must not create the final target"
+    );
+    assert_no_add_temp_files(&store);
 }
 
 #[test]

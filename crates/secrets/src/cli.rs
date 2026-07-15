@@ -20,7 +20,7 @@ EXAMPLES:
   secrets completion zsh
 
 ENVIRONMENT:
-  SECRETS_REPO  Override the store path (default: ~/Project/graysurf/secrets).
+  SECRETS_REPO  Override the store path (default: ~/Project/serenvia/secrets).
 
 SECURITY:
   stdout and --format json carry only METADATA (store paths, entry names,

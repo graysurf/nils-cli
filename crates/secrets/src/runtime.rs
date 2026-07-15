@@ -7,10 +7,10 @@
 //!   (mode `600`). The plaintext is never captured into a buffer that could be
 //!   printed, and the success/JSON output carries only the store-relative path,
 //!   the destination path, and the count of keys written — never any value.
-//! - `add` copies an already-plaintext file into the store and encrypts it in
-//!   place; it never reads the contents into our own output, and aborts (after
-//!   deleting the plaintext copy) if encryption fails or the result lacks
-//!   `ENC[`.
+//! - `add` asks `sops` to encrypt the source into a private temporary output
+//!   under the store's `.git` directory, validates the ciphertext, then
+//!   atomically renames it over the tracked target. The target therefore never
+//!   contains plaintext, and failures leave the prior ciphertext untouched.
 //! - `which` / `list` are pure metadata.
 //! - `edit` execs `sops <file>` interactively; we inherit stdio so the editor
 //!   round-trip stays inside sops and never passes through us.
@@ -19,6 +19,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use nils_common::cli_contract::{Envelope, EnvelopeError, OutputFormat, exit, schema_version_for};
 use serde::Serialize;
@@ -249,37 +250,43 @@ fn add_with(env: &Env, file: &str) -> Result<AddOutcome, CmdError> {
         })?;
     }
 
-    // Copy plaintext in with restrictive permissions, then encrypt IN PLACE
-    // from within the store so `.sops.yaml` creation rules resolve.
-    copy_private(&src, &target)?;
+    // Keep the tracked target absent or unchanged until SOPS has produced and
+    // we have validated a complete ciphertext file. The private output lives
+    // under `.git`, so even an interrupted run cannot expose a tracked
+    // plaintext path or an untracked plaintext sibling beside it.
+    let encrypted = PrivateTempFile::new(&env.store_root.join(".git"))?;
+    let encrypted_output = encrypted.reopen()?;
 
     let encrypt_status = Command::new("sops")
         .args([
             "-e",
-            "-i",
             "--input-type",
             "dotenv",
             "--output-type",
             "dotenv",
+            "--filename-override",
         ])
         .arg(&rel)
+        .arg(&src)
         .current_dir(&env.store_root)
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
+        .stdout(Stdio::from(encrypted_output))
         .stderr(Stdio::inherit())
         .status();
 
     let encrypted_ok = matches!(&encrypt_status, Ok(status) if status.success());
     // VERIFY the result is actually encrypted before trusting it.
-    let looks_encrypted = encrypted_ok && file_contains(&target, b"ENC[");
+    let looks_encrypted = encrypted_ok && file_contains(encrypted.path(), b"ENC[");
 
     if !looks_encrypted {
-        // On ANY failure remove the plaintext copy and abort before staging.
-        let _ = fs::remove_file(&target);
+        // `encrypted` removes its private output on drop. The tracked target is
+        // still absent or still holds the previous ciphertext.
         return Err(CmdError::runtime(format!(
-            "encryption failed for {rel} — plaintext removed, nothing committed"
+            "encryption failed for {rel} — target unchanged, nothing committed"
         )));
     }
+
+    encrypted.persist(&target)?;
 
     // Stage. If nothing changed, report unchanged (no commit/push).
     git_in(&env.store_root, &["add", &rel])?;
@@ -401,14 +408,103 @@ fn create_private_file(path: &Path) -> Result<File, CmdError> {
         .map_err(|err| CmdError::runtime(format!("cannot write {}: {err}", path.display())))
 }
 
-/// Copy a plaintext file into the store with mode 600.
-fn copy_private(src: &Path, dest: &Path) -> Result<(), CmdError> {
-    let data = fs::read(src)
-        .map_err(|err| CmdError::runtime(format!("cannot read {}: {err}", src.display())))?;
-    let mut file = create_private_file(dest)?;
-    file.write_all(&data)
-        .map_err(|err| CmdError::runtime(format!("cannot write {}: {err}", dest.display())))?;
-    Ok(())
+static ADD_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+/// Mode-600 temporary ciphertext output owned by one `secrets add` attempt.
+///
+/// The path is created with `create_new` below the store's ignored `.git`
+/// directory. Drop removes it on SOPS errors, invalid output, and child signal
+/// termination. `persist` uses a same-filesystem rename so the tracked target
+/// changes atomically from absent/old ciphertext to complete new ciphertext.
+struct PrivateTempFile {
+    path: PathBuf,
+    file: File,
+    persisted: bool,
+}
+
+impl PrivateTempFile {
+    fn new(dir: &Path) -> Result<Self, CmdError> {
+        for _ in 0..128 {
+            let sequence = ADD_TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+            let path = dir.join(format!(
+                "secrets-add-{}-{sequence}.enc.env.tmp",
+                std::process::id()
+            ));
+            let mut options = OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+
+            match options.open(&path) {
+                Ok(file) => {
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::PermissionsExt;
+                        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).map_err(
+                            |err| {
+                                let _ = fs::remove_file(&path);
+                                CmdError::runtime(format!(
+                                    "cannot secure temporary encryption output: {err}"
+                                ))
+                            },
+                        )?;
+                    }
+                    return Ok(Self {
+                        path,
+                        file,
+                        persisted: false,
+                    });
+                }
+                Err(err) if err.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(err) => {
+                    return Err(CmdError::runtime(format!(
+                        "cannot create private encryption output: {err}"
+                    )));
+                }
+            }
+        }
+
+        Err(CmdError::runtime(
+            "cannot allocate a unique private encryption output",
+        ))
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+
+    fn reopen(&self) -> Result<File, CmdError> {
+        self.file.try_clone().map_err(|err| {
+            CmdError::runtime(format!("cannot open private encryption output: {err}"))
+        })
+    }
+
+    fn persist(mut self, target: &Path) -> Result<(), CmdError> {
+        self.file.sync_all().map_err(|err| {
+            CmdError::runtime(format!(
+                "cannot sync encrypted output before install: {err}"
+            ))
+        })?;
+        fs::rename(&self.path, target).map_err(|err| {
+            CmdError::runtime(format!(
+                "cannot atomically install encrypted output at {}: {err}",
+                target.display()
+            ))
+        })?;
+        self.persisted = true;
+        Ok(())
+    }
+}
+
+impl Drop for PrivateTempFile {
+    fn drop(&mut self) {
+        if !self.persisted {
+            let _ = fs::remove_file(&self.path);
+        }
+    }
 }
 
 fn file_contains(path: &Path, needle: &[u8]) -> bool {

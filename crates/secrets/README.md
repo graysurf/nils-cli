@@ -5,7 +5,7 @@ store, from anywhere. It is a thin wrapper over `sops` and `git`: run it from
 inside a cloned repo and it maps the repo's `origin` remote to a store entry,
 decrypts that entry into `./.env`, or encrypts `./.env` back into the store.
 
-This crate ports the `graysurf/secrets` bash script into the workspace.
+This crate ports the `serenvia/secrets` bash script into the workspace.
 
 ## Commands
 
@@ -35,9 +35,11 @@ secrets completion zsh
 stdout and the JSON envelope carry only **metadata** — store paths, store entry
 **names**, booleans, and counts. Decrypted secret **values** are written
 directly to `./.env` (mode `600`) and are never echoed to stdout or placed in
-the JSON envelope. `add` never reads the plaintext source into our own output,
-and aborts (deleting the plaintext copy it placed in the store) if encryption
-fails or the result is not actually encrypted (`ENC[` missing). This contract is
+the JSON envelope. `add` encrypts into a mode-600 temporary output under the
+store's `.git` directory, validates the ciphertext, and only then atomically
+renames it over the tracked target. The target never contains plaintext;
+encryption failure or invalid output (`ENC[` missing) leaves any prior
+ciphertext unchanged and removes the temporary output. This contract is
 exercised by hermetic tests in `crates/secrets/tests/integration.rs` that use a
 secret canary string and assert it never appears on stdout/stderr.
 
@@ -53,7 +55,9 @@ secret canary string and assert it never appears on stdout/stderr.
 
 ## Environment
 
-- `SECRETS_REPO`: override the store path. Default: `~/Project/graysurf/secrets`.
+- `SECRETS_REPO`: override the store path. The shared Serenvia environment sets
+  it to `$HOME/Project/serenvia/secrets`; the CLI uses that same path as its
+  fallback when the variable is unset.
 
 ## Dependencies
 
