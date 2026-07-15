@@ -236,24 +236,30 @@ pub enum JournalCommand {
 
 #[derive(Debug, Clone, Args)]
 pub struct JournalReadArgs {
+    /// Existing structural execution journal directory.
     #[arg(long)]
     pub out_dir: PathBuf,
 }
 
 #[derive(Debug, Clone, Args)]
 pub struct JournalReplayPlanArgs {
+    /// Existing structural execution journal directory.
     #[arg(long)]
     pub out_dir: PathBuf,
+    /// Optional journal step identifier to inspect.
     #[arg(long)]
     pub step: Option<String>,
 }
 
 #[derive(Debug, Clone, Args)]
 pub struct JournalReplayStepArgs {
+    /// Existing structural execution journal directory.
     #[arg(long)]
     pub out_dir: PathBuf,
+    /// Journal step identifier to replay.
     #[arg(long)]
     pub step: String,
+    /// Acknowledge conditional replay after current-state checks.
     #[arg(long)]
     pub confirm_conditional: bool,
     /// Current caller-observed snapshot/state reference for conditional replay.
