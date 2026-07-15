@@ -346,6 +346,25 @@ fn check_flags_missing_frontmatter() {
 }
 
 #[test]
+fn check_flags_duplicate_frontmatter() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    seed_check_scope(tmp.path());
+    fs::write(
+        tmp.path().join("global/alpha.md"),
+        "---\nname: alpha-note\ndescription: \"summary for alpha-note\"\nmetadata:\n  node_type: memory\n  type: user\n  originSessionId: 00000000-0000-0000-0000-000000000000\n---\n\n---\nname: duplicate\ndescription: \"raw duplicate\"\nmetadata:\n  type: user\n---\n\nAlpha body; see [[beta]].\n",
+    )
+    .expect("alpha");
+
+    let out = run(tmp.path(), &["check", "global", "--strict"]);
+    assert_eq!(out.code, 1, "stderr={}", out.stderr_text());
+    assert!(
+        out.stdout_text().contains("frontmatter-duplicate"),
+        "{}",
+        out.stdout_text()
+    );
+}
+
+#[test]
 fn check_accepts_handauthored_note_and_strict_promotes_warning() {
     let tmp = tempfile::TempDir::new().expect("tempdir");
     seed_check_scope(tmp.path());
@@ -926,6 +945,168 @@ fn candidate_promotion_is_dry_run_first_then_atomic_apply() {
 
     let check = run(tmp.path(), &["check", "global", "--strict"]);
     assert_eq!(check.code, 0, "stderr={}", check.stderr_text());
+}
+
+#[test]
+fn candidate_promotion_with_frontmatter_emits_single_header() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    seed_recall_layout(tmp.path());
+    let source = tmp.path().join("candidates/codex/frontmatter-candidate.md");
+    fs::write(
+        &source,
+        "---\nname: frontmatter-candidate\ndescription: \"Untrusted candidate description\"\nmetadata:\n  type: project\n---\n\nPromote this candidate body without its original header.\n",
+    )
+    .expect("candidate");
+    fs::write(
+        tmp.path().join("candidates/codex/MEMORY.md"),
+        "# Codex candidates\n\n- [Frontmatter candidate](frontmatter-candidate.md) — review\n",
+    )
+    .expect("candidate index");
+
+    let applied = run(
+        tmp.path(),
+        &[
+            "candidate",
+            "promote",
+            "codex",
+            "frontmatter-candidate",
+            "--type",
+            "feedback",
+            "--description",
+            "Canonical promoted description",
+            "--session-id",
+            "00000000-0000-0000-0000-000000000000",
+            "--apply",
+        ],
+    );
+    assert_eq!(applied.code, 0, "stderr={}", applied.stderr_text());
+
+    let promoted = fs::read_to_string(tmp.path().join("global/frontmatter-candidate.md"))
+        .expect("promoted note");
+    assert_eq!(
+        promoted.lines().filter(|line| line.trim() == "---").count(),
+        2,
+        "{promoted}"
+    );
+    assert!(
+        promoted.contains("description: \"Canonical promoted description\""),
+        "{promoted}"
+    );
+    assert!(promoted.contains("type: feedback"), "{promoted}");
+    assert!(
+        promoted.contains("Promote this candidate body without its original header."),
+        "{promoted}"
+    );
+    assert!(
+        !promoted.contains("Untrusted candidate description"),
+        "{promoted}"
+    );
+
+    let check = run(tmp.path(), &["check", "global", "--strict"]);
+    assert_eq!(
+        check.code,
+        0,
+        "stdout={} stderr={}",
+        check.stdout_text(),
+        check.stderr_text()
+    );
+}
+
+#[test]
+fn candidate_promotion_preserves_opaque_thematic_rule_body() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    seed_recall_layout(tmp.path());
+    fs::write(
+        tmp.path().join("candidates/codex/thematic-rules.md"),
+        "---\nImportant first section.\n---\n\nRemaining candidate body.\n",
+    )
+    .expect("candidate");
+
+    let applied = run(
+        tmp.path(),
+        &[
+            "candidate",
+            "promote",
+            "codex",
+            "thematic-rules",
+            "--type",
+            "reference",
+            "--description",
+            "Preserve opaque Markdown",
+            "--session-id",
+            "00000000-0000-0000-0000-000000000000",
+            "--apply",
+        ],
+    );
+    assert_eq!(applied.code, 0, "stderr={}", applied.stderr_text());
+
+    let promoted =
+        fs::read_to_string(tmp.path().join("global/thematic-rules.md")).expect("promoted note");
+    assert!(
+        promoted.contains("---\nImportant first section.\n---\n\nRemaining candidate body."),
+        "{promoted}"
+    );
+
+    let text_check = run(tmp.path(), &["check", "global", "--strict"]);
+    assert_eq!(
+        text_check.code,
+        0,
+        "stdout={} stderr={}",
+        text_check.stdout_text(),
+        text_check.stderr_text()
+    );
+    let json_check = run(tmp.path(), &["check", "global", "--format", "json"]);
+    assert_eq!(json_check.code, 0, "stderr={}", json_check.stderr_text());
+    let report: serde_json::Value =
+        serde_json::from_str(json_check.stdout_text().trim()).expect("check json");
+    assert_eq!(report["ok"], true, "{report}");
+}
+
+#[test]
+fn candidate_promotion_preserves_indented_fence_example() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    seed_recall_layout(tmp.path());
+    fs::write(
+        tmp.path().join("candidates/codex/indented-example.md"),
+        "    ---\n    name: code-example\n    description: example data\n    ---\n\nRetained code sample.\n",
+    )
+    .expect("candidate");
+
+    let applied = run(
+        tmp.path(),
+        &[
+            "candidate",
+            "promote",
+            "codex",
+            "indented-example",
+            "--type",
+            "reference",
+            "--description",
+            "Preserve indented Markdown",
+            "--session-id",
+            "00000000-0000-0000-0000-000000000000",
+            "--apply",
+        ],
+    );
+    assert_eq!(applied.code, 0, "stderr={}", applied.stderr_text());
+
+    let promoted =
+        fs::read_to_string(tmp.path().join("global/indented-example.md")).expect("promoted note");
+    assert!(
+        promoted.contains(
+            "    ---\n    name: code-example\n    description: example data\n    ---\n\nRetained code sample."
+        ),
+        "{promoted}"
+    );
+
+    let check = run(tmp.path(), &["check", "global", "--strict"]);
+    assert_eq!(
+        check.code,
+        0,
+        "stdout={} stderr={}",
+        check.stdout_text(),
+        check.stderr_text()
+    );
 }
 
 #[cfg(unix)]

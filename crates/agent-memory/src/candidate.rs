@@ -226,15 +226,16 @@ fn promote(layout: &Layout, args: &CandidatePromoteArgs) -> Result<i32, CliError
         )));
     }
 
-    let source_body = fs::read_to_string(&source).map_err(|err| {
+    let source_contents = fs::read_to_string(&source).map_err(|err| {
         CliError::runtime(format!("failed to read {}: {err}", display_path(&source)))
     })?;
+    let source_body = frontmatter::body_after_frontmatter(&source_contents);
     let note = frontmatter::render_note(
         &args.name,
         &args.description,
         &args.r#type,
         Some(&args.session_id),
-        &source_body,
+        source_body,
     );
     let title = args.title.as_deref().unwrap_or(&args.name);
     let hook = args.hook.as_deref().unwrap_or(&args.description);
