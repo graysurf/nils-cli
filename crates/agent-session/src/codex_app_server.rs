@@ -4160,9 +4160,11 @@ exit "$FAKE_PROVIDER_EXIT"
             proxy_thread.join().unwrap();
             let output =
                 output.expect("generated launcher must terminate without waiting for descendants");
-            if let Ok(pid) = fs::read_to_string(&descendant_pid)
-                && let Ok(pid) = pid.parse::<libc::pid_t>()
-            {
+            if descendant {
+                let pid = fs::read_to_string(&descendant_pid)
+                    .expect("provider descendant must persist its pid")
+                    .parse::<libc::pid_t>()
+                    .expect("provider descendant pid must be valid");
                 assert_eq!(
                     unsafe { libc::kill(pid, 0) },
                     0,
