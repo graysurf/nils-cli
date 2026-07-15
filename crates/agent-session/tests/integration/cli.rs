@@ -4267,7 +4267,7 @@ fn delete_accepts_blank_identity_output_only_after_exact_absence_confirmation() 
     ] {
         let tmux_session = format!("hs-codex-{id}");
         let session_dir = write_session_record(&state_dir, id, "codex", &tmux_session);
-        attach_provider_runtime(
+        let runtime_files = attach_provider_runtime(
             tmp.path(),
             &state_dir,
             &session_dir,
@@ -4284,6 +4284,8 @@ fn delete_accepts_blank_identity_output_only_after_exact_absence_confirmation() 
             .expect("session object")
             .remove("delete_tmux_identity");
         fs::write(&record_path, serde_json::to_vec_pretty(&record).unwrap()).unwrap();
+        let record_before = fs::read(&record_path).expect("session record before delete");
+        let calls_before = tmux_calls(&tmux_log).len();
 
         let output = run(
             tmp.path(),
@@ -4310,21 +4312,46 @@ fn delete_accepts_blank_identity_output_only_after_exact_absence_confirmation() 
             "stdout={}",
             output.stdout_text()
         );
-        assert_eq!(session_dir.exists(), expected_code != 0);
-        if expected_code != 0 {
+        let calls = tmux_calls(&tmux_log);
+        let exact_probe = vec![
+            "has-session".to_string(),
+            "-t".to_string(),
+            format!("={tmux_session}"),
+        ];
+        assert!(
+            calls[calls_before..]
+                .iter()
+                .any(|call| call == &exact_probe),
+            "delete must confirm the exact session target: {:?}",
+            &calls[calls_before..]
+        );
+
+        if expected_code == 0 {
+            assert!(!session_dir.exists());
+            assert!(
+                runtime_files.iter().all(|path| !path.exists()),
+                "successful cleanup must remove provider runtime files"
+            );
+        } else {
+            assert!(session_dir.exists());
             assert_eq!(
                 output.stdout_json()["error"]["details"]["reason"],
                 "runtime-identity-unavailable"
             );
+            assert_eq!(
+                fs::read(&record_path).expect("retained session record"),
+                record_before
+            );
+            for runtime_file in runtime_files {
+                assert_eq!(
+                    fs::read_to_string(runtime_file).expect("retained runtime file"),
+                    "runtime metadata for codex"
+                );
+            }
         }
     }
 
     let calls = tmux_calls(&tmux_log);
-    assert!(
-        calls
-            .iter()
-            .any(|call| call.first().is_some_and(|arg| arg == "has-session"))
-    );
     assert!(
         calls
             .iter()
