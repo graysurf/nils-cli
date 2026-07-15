@@ -190,7 +190,7 @@ pub fn mutating_invocation(argv: &[String]) -> bool {
         && exec_command(argv).as_deref().is_some_and(mutating_command)
 }
 
-fn read_only_family_invocation(argv: &[String]) -> bool {
+pub(crate) fn read_only_family_invocation(argv: &[String]) -> bool {
     let Some(command) = argv.first().map(|value| normalize_tool(value)) else {
         return false;
     };

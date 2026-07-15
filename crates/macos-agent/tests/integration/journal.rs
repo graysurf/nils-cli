@@ -83,6 +83,64 @@ fn summarize_review_and_guarded_replay_are_cli_accessible() {
 }
 
 #[test]
+fn local_family_lists_are_safe_and_replay_eligible() {
+    let harness = common::MacosAgentHarness::new();
+    let cwd = TempDir::new().expect("cwd");
+    let fake = cwd.path().join("peekaboo");
+    fs::write(&fake, "#!/bin/sh\nprintf '%s\\n' '{\"success\":true}'\n").expect("fake");
+    fs::set_permissions(&fake, fs::Permissions::from_mode(0o755)).expect("chmod");
+
+    for (family, subcommand) in [("app", "list"), ("window", "list")] {
+        let out_dir = cwd.path().join(format!("{family}-list-journal"));
+        let options = harness.cmd_options(cwd.path()).with_env(
+            "NILS_MACOS_AGENT_PEEKABOO_BIN",
+            fake.to_str().expect("fake"),
+        );
+        let observed = harness.run_with_options(
+            cwd.path(),
+            &[
+                "--format",
+                "json",
+                "exec",
+                "--out-dir",
+                out_dir.to_str().expect("out"),
+                "--",
+                family,
+                subcommand,
+            ],
+            options.clone(),
+        );
+        assert_eq!(observed.code, 0, "{}", observed.stderr_text());
+
+        let step: serde_json::Value = serde_json::from_str(
+            fs::read_to_string(out_dir.join("steps.jsonl"))
+                .expect("steps")
+                .lines()
+                .next()
+                .expect("step"),
+        )
+        .expect("step json");
+        assert_eq!(step["replay_class"], "safe");
+        assert_eq!(step["replay_argv"], serde_json::json!([family, subcommand]));
+
+        let plan = harness.run_with_options(
+            cwd.path(),
+            &[
+                "--format",
+                "json",
+                "journal",
+                "replay-plan",
+                "--out-dir",
+                out_dir.to_str().expect("out"),
+            ],
+            options,
+        );
+        assert_eq!(plan.code, 0, "{}", plan.stderr_text());
+        assert_eq!(plan.stdout_json()["result"]["steps"][0]["eligible"], true);
+    }
+}
+
+#[test]
 fn seeded_secrets_and_private_paths_do_not_survive_journal_persistence() {
     let root = TempDir::new().expect("root");
     let mut journal = macos_agent::journal::Journal::open(

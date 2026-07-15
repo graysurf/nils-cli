@@ -12,6 +12,7 @@ use crate::backend::VerifiedBackend;
 use crate::cli::{EvidenceMode, RuntimeMode, ToolProfile};
 use crate::error::CliError;
 use crate::lock::PeekabooLock;
+use crate::policy;
 use crate::test_mode;
 
 pub const JOURNAL_SCHEMA: &str = "macos-agent.journal.v2";
@@ -753,6 +754,9 @@ fn classify_replay(
     {
         return ReplayClass::Never;
     }
+    if policy::read_only_family_invocation(argv) {
+        return ReplayClass::Safe;
+    }
     match command {
         "see" | "list" | "inspect-ui" | "screenshot" | "sleep" | "tools" | "bridge" => {
             ReplayClass::Safe
@@ -1360,8 +1364,8 @@ mod tests {
 
     use super::{
         EvidenceMode, Journal, ReplayClass, RuntimeMode, STEP_SCAN_COUNT, STEP_SCAN_ROOT,
-        StepInput, StepStatus, prepare_replay, read_steps_recover, replay_plan, review,
-        sanitize_argv,
+        StepInput, StepStatus, classify_replay, prepare_replay, read_steps_recover, replay_plan,
+        review, sanitize_argv,
     };
     use std::sync::atomic::Ordering;
 
@@ -1394,6 +1398,41 @@ mod tests {
         assert!(!raw.contains("canary-secret"));
         assert_eq!(step.replay_class, ReplayClass::Never);
         assert!(step.replay_argv.is_none());
+    }
+
+    #[test]
+    fn family_lists_are_safe_without_relaxing_family_mutations() {
+        for argv in [
+            vec![String::from("app"), String::from("list")],
+            vec![String::from("window"), String::from("list")],
+        ] {
+            assert_eq!(
+                classify_replay(&argv[0], StepStatus::Passed, &argv, None),
+                ReplayClass::Safe
+            );
+        }
+        for argv in [
+            vec![
+                String::from("app"),
+                String::from("launch"),
+                String::from("Calculator"),
+            ],
+            vec![
+                String::from("window"),
+                String::from("move"),
+                String::from("--x"),
+                String::from("10"),
+            ],
+        ] {
+            assert_eq!(
+                classify_replay(&argv[0], StepStatus::Passed, &argv, None),
+                ReplayClass::Never
+            );
+            assert_eq!(
+                classify_replay(&argv[0], StepStatus::Passed, &argv, Some("snapshot-1")),
+                ReplayClass::Conditional
+            );
+        }
     }
 
     #[test]
