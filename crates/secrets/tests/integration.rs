@@ -75,6 +75,22 @@ fn init_store(store: &Path) {
     fs::create_dir_all(store.join("stacks")).expect("store stacks");
 }
 
+/// Initialize the store as a linked worktree: `.git` is the standard pointer
+/// file and the per-worktree admin directory names the shared common dir.
+fn init_linked_store(store: &Path, common_git_dir: &Path) {
+    let worktree_git_dir = common_git_dir.join("worktrees/secrets-store");
+    fs::create_dir_all(&worktree_git_dir).expect("linked worktree git dir");
+    fs::write(worktree_git_dir.join("commondir"), "../..\n").expect("commondir");
+    fs::create_dir_all(store).expect("store dir");
+    fs::write(
+        store.join(".git"),
+        format!("gitdir: {}\n", worktree_git_dir.display()),
+    )
+    .expect("linked worktree .git file");
+    fs::create_dir_all(store.join("repos")).expect("store repos");
+    fs::create_dir_all(store.join("stacks")).expect("store stacks");
+}
+
 /// Base options: CWD in `app_repo`, store via SECRETS_REPO, stubs on PATH.
 fn options(app_repo: &Path, store: &Path, stubs: &Path) -> CmdOptions {
     CmdOptions::default()
@@ -110,6 +126,11 @@ esac
 
 case "$1" in
   add|commit|push)
+    if [[ "${GIT_BLOCK_COMMAND:-}" == "$1" ]]; then
+      printf '%s\n' "$$" > "${GIT_PID_FILE:?}"
+      : > "${GIT_READY_FILE:?}"
+      sleep "${GIT_BLOCK_SECONDS:-0.25}"
+    fi
     exit 0
     ;;
   diff)
@@ -182,7 +203,10 @@ if [[ "$mode" == "e" ]]; then
 
   if [[ "${SOPS_ASSERT_OUTPUT_MODE:-0}" == "1" ]]; then
     shopt -s nullglob
-    output_files=("${SOPS_STORE:?}"/.git/secrets-add-*.enc.env.tmp)
+    output_files=(
+      "${SOPS_STORE:?}"/.git/secrets-add-*.enc.env.tmp
+      "${SOPS_STORE:?}"/repos/graysurf/.secrets-add-*.enc.env.tmp
+    )
     if (( "${#output_files[@]}" != 1 )); then
       echo "sops: expected one private encryption output, found ${#output_files[@]}" >&2
       exit 1
@@ -214,7 +238,8 @@ if [[ "${SOPS_FAIL:-0}" == "1" ]]; then
 fi
 
 if [[ "$mode" == "d" ]]; then
-  if [[ "$file" == "${SOPS_STORE:-}"/.git/secrets-add-*.enc.env.tmp ]]; then
+  if [[ "${file##*/}" == secrets-add-*.enc.env.tmp ||
+        "${file##*/}" == .secrets-add-*.enc.env.tmp ]]; then
     # Simulate SOPS' complete-document decrypt/MAC validation. The mixed
     # fixture contains an ENC marker but is not a valid encrypted document.
     if [[ "${SOPS_MIXED_OUTPUT:-0}" == "1" || "${SOPS_NO_ENC:-0}" == "1" ]]; then
@@ -261,12 +286,26 @@ exit 0
 }
 
 fn assert_no_add_temp_files(store: &Path) {
-    let leftovers: Vec<_> = fs::read_dir(store.join(".git"))
-        .expect("read store .git")
-        .filter_map(Result::ok)
-        .map(|entry| entry.file_name().to_string_lossy().into_owned())
-        .filter(|name| name.starts_with("secrets-add-"))
-        .collect();
+    fn collect(dir: &Path, leftovers: &mut Vec<PathBuf>) {
+        let Ok(entries) = fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.filter_map(Result::ok) {
+            let path = entry.path();
+            if path.is_dir() {
+                collect(&path, leftovers);
+            } else {
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                if name.starts_with("secrets-add-") || name.starts_with(".secrets-add-") {
+                    leftovers.push(path);
+                }
+            }
+        }
+    }
+
+    let mut leftovers = Vec::new();
+    collect(store, &mut leftovers);
     assert!(
         leftovers.is_empty(),
         "secrets add temporary files were not cleaned up: {leftovers:?}"
@@ -292,6 +331,28 @@ fn send_signal(pid: u32, signal: &str) {
         .status()
         .expect("run kill");
     assert!(status.success(), "kill {signal} {pid} failed");
+}
+
+#[cfg(unix)]
+fn process_exists(pid: u32) -> bool {
+    Command::new("kill")
+        .args(["-0", &pid.to_string()])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+#[cfg(unix)]
+fn assert_process_reaped(pid: u32, label: &str) {
+    if process_exists(pid) {
+        // Cleanup is strictly failure-only: the assertion must observe the
+        // production process already gone before the test intervenes.
+        let _ = Command::new("kill")
+            .args(["-TERM", &pid.to_string()])
+            .status();
+        panic!("{label} process {pid} was still alive after secrets exited");
+    }
 }
 
 #[cfg(unix)]
@@ -350,13 +411,7 @@ fn add_interrupted_at_cli_preserves_target(signal: &str, prior: Option<&str>) {
         thread::sleep(Duration::from_millis(10));
     }
 
-    // Before the production signal handler exists, the SOPS stub is orphaned
-    // and still owns the inherited stderr pipe. Stop it before collecting CLI
-    // output so the red fixture remains hermetic; after the repair the CLI has
-    // already terminated and reaped it.
-    let _ = Command::new("kill")
-        .args(["-TERM", &sops_pid.to_string()])
-        .status();
+    assert_process_reaped(sops_pid, "SOPS");
     let output = child.wait_with_output().expect("wait secrets");
 
     let captured = CmdOutput {
@@ -380,6 +435,82 @@ fn add_interrupted_at_cli_preserves_target(signal: &str, prior: Option<&str>) {
         }),
         "signal must not mutate git: {git_calls}"
     );
+    assert_no_add_temp_files(&store);
+}
+
+#[cfg(unix)]
+fn add_interrupted_after_install_finishes_git_transaction(signal: &str) {
+    let tmp = TempDir::new().expect("tmp");
+    let app = tmp.path().join("app");
+    fs::create_dir_all(&app).expect("app dir");
+    fs::write(app.join(".env"), format!("API_KEY={SECRET_CANARY}\n")).expect("write src");
+
+    let stubs = StubBinDir::new();
+    let store = tmp.path().join("store");
+    init_store(&store);
+    let git_log = tmp.path().join("git.log");
+    let git_ready = tmp.path().join("git.ready");
+    let git_pid_file = tmp.path().join("git.pid");
+    fs::write(&git_log, "").expect("git log");
+    git_stub(stubs.path());
+    sops_stub(stubs.path());
+
+    let mut child = spawn(
+        &["add"],
+        &options(&app, &store, stubs.path())
+            .with_env("GIT_LOG", &git_log.to_string_lossy())
+            .with_env("GIT_BLOCK_COMMAND", "add")
+            .with_env("GIT_BLOCK_SECONDS", "0.25")
+            .with_env("GIT_READY_FILE", &git_ready.to_string_lossy())
+            .with_env("GIT_PID_FILE", &git_pid_file.to_string_lossy())
+            .with_env("SOPS_STORE", &store.to_string_lossy())
+            .with_env("SOPS_ASSERT_FINAL_STATE", "absent")
+            .with_env("SOPS_REQUIRE_FILENAME_OVERRIDE", "1"),
+    );
+
+    wait_for_file(&git_ready);
+    wait_for_file(&git_pid_file);
+    send_signal(child.id(), signal);
+    let git_pid = fs::read_to_string(&git_pid_file)
+        .expect("read git pid")
+        .trim()
+        .parse::<u32>()
+        .expect("parse git pid");
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while child.try_wait().expect("poll secrets").is_none() {
+        assert!(Instant::now() < deadline, "timed out waiting for secrets");
+        thread::sleep(Duration::from_millis(10));
+    }
+    while process_exists(git_pid) {
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for production to reap git"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+
+    let output = child.wait_with_output().expect("wait secrets");
+    let captured = CmdOutput {
+        code: output.status.code().unwrap_or(-1),
+        stdout: output.stdout,
+        stderr: output.stderr,
+    };
+    assert_exit(&captured, 0);
+    assert_no_secret_leak(&captured);
+    assert_process_reaped(git_pid, "git add");
+
+    let target = store.join("repos/graysurf/g14-infra.enc.env");
+    let stored = fs::read_to_string(&target).expect("installed ciphertext");
+    assert!(stored.contains("ENC["), "stored: {stored}");
+    assert!(
+        !stored.contains(SECRET_CANARY),
+        "plaintext persisted: {stored}"
+    );
+    let git_calls = fs::read_to_string(&git_log).expect("git log");
+    assert!(git_calls.lines().any(|line| line.starts_with("add ")));
+    assert!(git_calls.lines().any(|line| line.starts_with("commit ")));
+    assert!(git_calls.lines().any(|line| line.starts_with("push ")));
     assert_no_add_temp_files(&store);
 }
 
@@ -739,6 +870,41 @@ fn add_encrypts_commits_and_pushes() {
 }
 
 #[test]
+fn add_supports_linked_worktree_git_file_and_common_dir() {
+    let tmp = TempDir::new().expect("tmp");
+    let app = tmp.path().join("app");
+    fs::create_dir_all(&app).expect("app dir");
+    fs::write(app.join(".env"), format!("API_KEY={SECRET_CANARY}\n")).expect("write src");
+
+    let stubs = StubBinDir::new();
+    let store = tmp.path().join("store-linked");
+    let common_git_dir = tmp.path().join("store-common.git");
+    init_linked_store(&store, &common_git_dir);
+    let git_log = tmp.path().join("git.log");
+    fs::write(&git_log, "").expect("git log");
+    git_stub(stubs.path());
+    sops_stub(stubs.path());
+
+    let output = run(
+        &["add"],
+        &options(&app, &store, stubs.path())
+            .with_env("GIT_LOG", &git_log.to_string_lossy())
+            .with_env("SOPS_STORE", &store.to_string_lossy())
+            .with_env("SOPS_ASSERT_FINAL_STATE", "absent")
+            .with_env("SOPS_REQUIRE_FILENAME_OVERRIDE", "1"),
+    );
+    assert_exit(&output, 0);
+    assert_no_secret_leak(&output);
+    let stored = fs::read_to_string(store.join("repos/graysurf/g14-infra.enc.env"))
+        .expect("linked worktree ciphertext");
+    assert!(stored.contains("ENC["), "stored: {stored}");
+    let git_calls = fs::read_to_string(&git_log).expect("git log");
+    assert!(git_calls.lines().any(|line| line.starts_with("commit ")));
+    assert!(git_calls.lines().any(|line| line.starts_with("push ")));
+    assert_no_add_temp_files(&store);
+}
+
+#[test]
 fn add_non_ciphertext_output_leaves_no_target_or_temp() {
     let tmp = TempDir::new().expect("tmp");
     let app = tmp.path().join("app");
@@ -985,6 +1151,12 @@ fn add_sigterm_to_cli_cleans_temp_and_preserves_prior_target() {
         "-TERM",
         Some("API_KEY=ENC[AES256_GCM,data:original,type:str]\n"),
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn add_sigterm_after_install_finishes_git_transaction() {
+    add_interrupted_after_install_finishes_git_transaction("-TERM");
 }
 
 #[test]

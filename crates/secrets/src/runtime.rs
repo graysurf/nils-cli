@@ -7,11 +7,13 @@
 //!   (mode `600`). The plaintext is never captured into a buffer that could be
 //!   printed, and the success/JSON output carries only the store-relative path,
 //!   the destination path, and the count of keys written — never any value.
-//! - `add` asks `sops` to encrypt the source into a private temporary output
-//!   under the store's `.git` directory, decrypt/MAC-validates the complete
-//!   document with `sops`, then atomically renames it over the tracked target.
-//!   The target therefore never contains plaintext, and failures or handled
-//!   termination signals leave the prior ciphertext untouched.
+//! - `add` asks `sops` to encrypt the source into a private same-directory
+//!   temporary output, decrypt/MAC-validates the complete document with `sops`,
+//!   then atomically renames it over the tracked target. The target therefore
+//!   never contains plaintext. Handled termination signals before installation
+//!   leave the prior ciphertext untouched; signals after installation are
+//!   deferred until add/commit/push complete, so they cannot strand a partial
+//!   Git transaction.
 //! - `which` / `list` are pure metadata.
 //! - `edit` execs `sops <file>` interactively; we inherit stdio so the editor
 //!   round-trip stays inside sops and never passes through us.
@@ -21,7 +23,7 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::thread;
 use std::time::Duration;
 
@@ -255,14 +257,19 @@ fn add_with(env: &Env, file: &str) -> Result<AddOutcome, CmdError> {
     }
 
     // Keep the tracked target absent or unchanged until SOPS has produced and
-    // we have validated a complete ciphertext file. The private output lives
-    // under `.git`, so even an interrupted run cannot expose a tracked
-    // plaintext path or an untracked plaintext sibling beside it.
-    prepare_add_signal_handler()?;
-    ADD_TEMP_ACTIVE.store(true, Ordering::Release);
-    let encrypted = PrivateTempFile::new(&env.store_root.join(".git")).inspect_err(|_| {
-        ADD_TEMP_ACTIVE.store(false, Ordering::Release);
+    // we have validated a complete ciphertext file. The mode-600 private output
+    // contains only SOPS' encryption output, never a copied plaintext target.
+    // Keep the managed signal phase alive through the complete Git transaction:
+    // before installation an interrupt cancels and reaps SOPS; after
+    // installation it is deferred until add/commit/push have completed.
+    let _signal_phase = AddSignalPhase::begin()?;
+    let temp_dir = target.parent().ok_or_else(|| {
+        CmdError::runtime(format!("cannot resolve parent for {}", target.display()))
     })?;
+    // A sibling private output guarantees that the final rename is on the same
+    // filesystem and works for both primary checkouts (`.git` directory) and
+    // linked worktrees (`.git` pointer file plus common-dir metadata).
+    let encrypted = PrivateTempFile::new(temp_dir)?;
     let encrypted_output = encrypted.reopen()?;
 
     let mut encrypt_command = Command::new("sops");
@@ -294,7 +301,7 @@ fn add_with(env: &Env, file: &str) -> Result<AddOutcome, CmdError> {
         )));
     }
 
-    ensure_add_not_interrupted()?;
+    enter_add_commit_phase()?;
     encrypted.persist(&target)?;
 
     // Stage. If nothing changed, report unchanged (no commit/push).
@@ -418,19 +425,28 @@ fn create_private_file(path: &Path) -> Result<File, CmdError> {
 }
 
 static ADD_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
-static ADD_INTERRUPTED: AtomicBool = AtomicBool::new(false);
-static ADD_TEMP_ACTIVE: AtomicBool = AtomicBool::new(false);
+const ADD_PHASE_IDLE: u8 = 0;
+const ADD_PHASE_CANCELLABLE: u8 = 1;
+const ADD_PHASE_INTERRUPTED: u8 = 2;
+const ADD_PHASE_COMMITTING: u8 = 3;
+static ADD_PHASE: AtomicU8 = AtomicU8::new(ADD_PHASE_IDLE);
 static ADD_SIGNAL_HANDLER: OnceLock<Result<(), String>> = OnceLock::new();
 
 fn prepare_add_signal_handler() -> Result<(), CmdError> {
     let registration = ADD_SIGNAL_HANDLER.get_or_init(|| {
         ctrlc::set_handler(|| {
-            if ADD_TEMP_ACTIVE.load(Ordering::Acquire) {
-                ADD_INTERRUPTED.store(true, Ordering::Release);
-            } else {
-                // Outside the private-temp phase there is nothing to clean up;
-                // preserve ordinary CLI interruption semantics.
-                std::process::exit(130);
+            match ADD_PHASE.compare_exchange(
+                ADD_PHASE_CANCELLABLE,
+                ADD_PHASE_INTERRUPTED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) | Err(ADD_PHASE_INTERRUPTED | ADD_PHASE_COMMITTING) => {}
+                Err(_) => {
+                    // Outside an add transaction there is nothing to clean up;
+                    // preserve ordinary CLI interruption semantics.
+                    std::process::exit(130);
+                }
             }
         })
         .map_err(|err| err.to_string())
@@ -440,18 +456,59 @@ fn prepare_add_signal_handler() -> Result<(), CmdError> {
             "cannot install add interruption handler: {err}"
         )));
     }
-    ADD_INTERRUPTED.store(false, Ordering::Release);
     Ok(())
 }
 
+/// Own the signal policy for one complete `secrets add` transaction.
+///
+/// Before the atomic install commit point, the handler changes the single
+/// atomic phase from cancellable to interrupted; `run_add_sops` observes that
+/// phase, kills and reaps its child, and returns an error. The main thread wins
+/// the same compare/exchange to enter the commit phase before rename. From that
+/// linearized point onward Git commands retain normal `Command` ownership and
+/// are allowed to finish and be reaped before this guard restores ordinary
+/// process interruption semantics.
+struct AddSignalPhase;
+
+impl AddSignalPhase {
+    fn begin() -> Result<Self, CmdError> {
+        prepare_add_signal_handler()?;
+        ADD_PHASE.store(ADD_PHASE_CANCELLABLE, Ordering::Release);
+        Ok(Self)
+    }
+}
+
+impl Drop for AddSignalPhase {
+    fn drop(&mut self) {
+        ADD_PHASE.store(ADD_PHASE_IDLE, Ordering::Release);
+    }
+}
+
 fn ensure_add_not_interrupted() -> Result<(), CmdError> {
-    if ADD_INTERRUPTED.load(Ordering::Acquire) {
-        Err(CmdError::runtime(
-            "operation interrupted — target unchanged, nothing committed",
-        ))
+    if ADD_PHASE.load(Ordering::Acquire) == ADD_PHASE_INTERRUPTED {
+        Err(add_interrupted_error())
     } else {
         Ok(())
     }
+}
+
+fn enter_add_commit_phase() -> Result<(), CmdError> {
+    match ADD_PHASE.compare_exchange(
+        ADD_PHASE_CANCELLABLE,
+        ADD_PHASE_COMMITTING,
+        Ordering::AcqRel,
+        Ordering::Acquire,
+    ) {
+        Ok(_) => Ok(()),
+        Err(ADD_PHASE_INTERRUPTED) => Err(add_interrupted_error()),
+        Err(phase) => Err(CmdError::runtime(format!(
+            "invalid add transaction phase before install: {phase}"
+        ))),
+    }
+}
+
+fn add_interrupted_error() -> CmdError {
+    CmdError::runtime("operation interrupted — target unchanged, nothing committed")
 }
 
 fn run_add_sops(command: &mut Command) -> Result<ExitStatus, CmdError> {
@@ -511,11 +568,11 @@ fn validate_encrypted_document(
 
 /// Mode-600 temporary ciphertext output owned by one `secrets add` attempt.
 ///
-/// The path is created with `create_new` below the store's ignored `.git`
-/// directory. Drop removes it on SOPS errors, invalid output, child termination,
-/// and SIGINT/SIGTERM caught by the CLI. `persist` uses a same-filesystem rename
-/// so the tracked target changes atomically from absent/old ciphertext to
-/// complete new ciphertext.
+/// The path is created with `create_new` beside the final target. Drop removes
+/// it on SOPS errors, invalid output, child termination, and SIGINT/SIGTERM
+/// caught by the CLI. The sibling location guarantees `persist` can use a
+/// same-filesystem rename, including in linked Git worktrees, so the tracked
+/// target changes atomically from absent/old ciphertext to complete ciphertext.
 struct PrivateTempFile {
     path: PathBuf,
     file: File,
@@ -527,7 +584,7 @@ impl PrivateTempFile {
         for _ in 0..128 {
             let sequence = ADD_TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
             let path = dir.join(format!(
-                "secrets-add-{}-{sequence}.enc.env.tmp",
+                ".secrets-add-{}-{sequence}.enc.env.tmp",
                 std::process::id()
             ));
             let mut options = OpenOptions::new();
@@ -595,7 +652,6 @@ impl PrivateTempFile {
             ))
         })?;
         self.persisted = true;
-        ADD_TEMP_ACTIVE.store(false, Ordering::Release);
         Ok(())
     }
 }
@@ -605,7 +661,6 @@ impl Drop for PrivateTempFile {
         if !self.persisted {
             let _ = fs::remove_file(&self.path);
         }
-        ADD_TEMP_ACTIVE.store(false, Ordering::Release);
     }
 }
 
