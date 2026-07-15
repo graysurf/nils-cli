@@ -4060,7 +4060,7 @@ while [ "$(cat "$FAKE_PROVIDER_STAGE" 2>/dev/null)" != initial_connection ]; do
 done
 printf '%s' "$FAKE_PROVIDER_STDERR" >&2
 if [ "$FAKE_PROVIDER_DESCENDANT" = 1 ]; then
-  sleep 10 </dev/null >/dev/null &
+  sleep 60 </dev/null >/dev/null &
   printf '%s' "$!" > "$FAKE_PROVIDER_DESCENDANT_PID"
 fi
 exit "$FAKE_PROVIDER_EXIT"
@@ -4154,7 +4154,7 @@ exit "$FAKE_PROVIDER_EXIT"
                     if descendant { "1" } else { "0" },
                 )
                 .env("FAKE_PROVIDER_DESCENDANT_PID", &descendant_pid);
-            let output = crate::run_output_with_timeout(command, Duration::from_secs(3));
+            let output = crate::run_output_with_timeout(command, Duration::from_secs(10));
             stop.store(true, Ordering::Relaxed);
             app_server_thread.join().unwrap();
             proxy_thread.join().unwrap();
