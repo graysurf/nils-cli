@@ -1734,6 +1734,9 @@ fn reject_symlink_components(path: &Path) -> Result<(), CliError> {
         current.push(component.as_os_str());
         match fs::symlink_metadata(&current) {
             Ok(metadata) if metadata.file_type().is_symlink() => {
+                if allowed_platform_symlink(&current) {
+                    continue;
+                }
                 return Err(backend_error(
                     "private backend storage path contains a symlink",
                 ));
@@ -1748,6 +1751,24 @@ fn reject_symlink_components(path: &Path) -> Result<(), CliError> {
         }
     }
     Ok(())
+}
+
+fn allowed_platform_symlink(path: &Path) -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        let expected_target = match path.to_str() {
+            Some("/var") => Path::new("private/var"),
+            Some("/tmp") => Path::new("private/tmp"),
+            Some("/etc") => Path::new("private/etc"),
+            _ => return false,
+        };
+        fs::read_link(path).ok().as_deref() == Some(expected_target)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = path;
+        false
+    }
 }
 
 fn hash_file(path: &Path) -> Result<String, CliError> {
@@ -1950,6 +1971,15 @@ mod tests {
             LifecycleLock::acquire(&lock_root, LifecycleLockMode::Shared).is_err(),
             "lifecycle lock followed a symlink"
         );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn fixed_macos_private_directory_aliases_remain_compatible() {
+        assert!(super::allowed_platform_symlink(Path::new("/var")));
+        assert!(super::allowed_platform_symlink(Path::new("/tmp")));
+        assert!(super::allowed_platform_symlink(Path::new("/etc")));
+        assert!(!super::allowed_platform_symlink(Path::new("/opt")));
     }
 
     #[test]
