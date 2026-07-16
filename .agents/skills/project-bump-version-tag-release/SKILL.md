@@ -88,8 +88,13 @@ Default delivery mode (PR-based):
 - After commit, pushes the branch and invokes `forge-cli pr deliver --kind chore --method squash`,
   which opens a draft PR, waits for required status checks to pass, promotes it to ready, and
   squash-merges into `main` (deleting the source branch).
+- A canonical single-commit version-only release PR uses the reduced release-only CI lane only
+  when protected base policy recognizes the change and the exact base `main` SHA has one trusted
+  successful full CI run. Missing or ambiguous proof falls back to full PR CI; the required check
+  names remain `test`, `test_macos`, and `coverage` in both lanes.
 - Fast-forwards local `main` to the merge commit, creates the annotated tag `vX.Y.Z` on that
-  commit, and pushes the tag to trigger `release.yml`.
+  commit, and pushes the tag to trigger `release.yml`. The tag gate reuses the unique trusted
+  merged PR's exact-SHA CI when available and otherwise falls back to polling checks on that SHA.
 - The tap stage waits for the source release workflow to finish, then waits for
   the dispatched `sympoies/homebrew-tap` formula-update workflow to finish before
   performing the local Homebrew install / upgrade check.
@@ -100,13 +105,15 @@ the legacy semantics locally).
 
 Default check selection (no `--full-checks` and no `--ci-gate-main`):
 
-- Refresh `Cargo.lock` via `cargo generate-lockfile`.
+- Refresh `Cargo.lock` via `cargo update --workspace`, preserving committed registry and
+  transitive dependency pins while updating workspace packages.
 - Regenerate tracked third-party artifacts so they match the new lockfile (CI's drift audit will
   reject mismatches on the bump commit).
 - Run `cargo check --workspace --locked` to catch lockfile/compile breaks locally.
-- No `ci.yml` query before bump — in PR mode, `forge-cli pr deliver` waits for required checks
-  before merging; in direct-push mode, the post-push `ci.yml` wait on the bump commit is the
-  safety net (see Workflow below).
+- No `ci.yml` query before bump — in PR mode, `forge-cli pr deliver` waits for the required checks
+  from either the proven reduced release-only lane or its fail-closed full-CI fallback before
+  merging; in direct-push mode, the post-push `ci.yml` wait on the bump commit is the safety net
+  (see Workflow below).
 
 Use `--full-checks` to additionally run the full audit stack locally
 (`project-verify-required-checks.sh`: clippy, nextest, zsh completion, all CI audit scripts).
@@ -127,7 +134,10 @@ Outputs (nils-cli stage):
 - Pins workspace crate-to-crate `path` dependencies to the target version (and adds `version = "X.Y.Z"` when missing).
 - If manifests are already at target version, treats version bump as idempotent and continues.
 - Updates README release tag examples (unless `--skip-readme`).
-- Refreshes `Cargo.lock` via `cargo generate-lockfile` and validates via `cargo check --workspace --locked`. With `--full-checks`, additionally runs the full audit stack via `project-verify-required-checks.sh`.
+- Refreshes `Cargo.lock` via `cargo update --workspace`, preserving committed registry and
+  transitive dependency pins, and validates via `cargo check --workspace --locked`. With
+  `--full-checks`, additionally runs the full audit stack via
+  `project-verify-required-checks.sh`.
 - Automatically disables an incompatible `RUSTC_WRAPPER` (for example a broken `sccache` wrapper) before running release cargo commands.
 - Regenerates tracked third-party artifacts (`THIRD_PARTY_LICENSES.md`, `THIRD_PARTY_NOTICES.md`) so the bump commit matches CI's drift audit, then refreshes them again before commit.
 - Runs `project-verify-required-checks.sh` with `NILS_CLI_TEST_RUNNER=nextest` by default (only under `--full-checks`).
