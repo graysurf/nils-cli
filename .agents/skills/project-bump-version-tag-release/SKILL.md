@@ -88,8 +88,13 @@ Default delivery mode (PR-based):
 - After commit, pushes the branch and invokes `forge-cli pr deliver --kind chore --method squash`,
   which opens a draft PR, waits for required status checks to pass, promotes it to ready, and
   squash-merges into `main` (deleting the source branch).
+- A canonical single-commit version-only release PR uses the reduced release-only CI lane only
+  when protected base policy recognizes the change and the exact base `main` SHA has one trusted
+  successful full CI run. Missing or ambiguous proof falls back to full PR CI; the required check
+  names remain `test`, `test_macos`, and `coverage` in both lanes.
 - Fast-forwards local `main` to the merge commit, creates the annotated tag `vX.Y.Z` on that
-  commit, and pushes the tag to trigger `release.yml`.
+  commit, and pushes the tag to trigger `release.yml`. The tag gate reuses the unique trusted
+  merged PR's exact-SHA CI when available and otherwise falls back to polling checks on that SHA.
 - The tap stage waits for the source release workflow to finish, then waits for
   the dispatched `sympoies/homebrew-tap` formula-update workflow to finish before
   performing the local Homebrew install / upgrade check.
@@ -104,9 +109,10 @@ Default check selection (no `--full-checks` and no `--ci-gate-main`):
 - Regenerate tracked third-party artifacts so they match the new lockfile (CI's drift audit will
   reject mismatches on the bump commit).
 - Run `cargo check --workspace --locked` to catch lockfile/compile breaks locally.
-- No `ci.yml` query before bump — in PR mode, `forge-cli pr deliver` waits for required checks
-  before merging; in direct-push mode, the post-push `ci.yml` wait on the bump commit is the
-  safety net (see Workflow below).
+- No `ci.yml` query before bump — in PR mode, `forge-cli pr deliver` waits for the required checks
+  from either the proven reduced release-only lane or its fail-closed full-CI fallback before
+  merging; in direct-push mode, the post-push `ci.yml` wait on the bump commit is the safety net
+  (see Workflow below).
 
 Use `--full-checks` to additionally run the full audit stack locally
 (`project-verify-required-checks.sh`: clippy, nextest, zsh completion, all CI audit scripts).

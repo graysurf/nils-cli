@@ -54,12 +54,13 @@ Default behavior:
   is not protected); `--skip-push` keeps everything local without opening a PR.
 
   Local checks are minimal: refresh Cargo.lock, regenerate third-party artifacts,
-  then run `cargo check --workspace --locked`. The full audit stack (clippy, nextest,
-  zsh completion, docs/audit scripts) runs on CI for every PR — in PR mode the
-  delivery macro waits for it before merging; in direct-push mode the bump commit
-  triggers ci.yml and the tap stage waits for that run to be green. Use --full-checks
-  to run the full audit locally (slow); use --skip-ci-wait (direct-push only) to
-  fire-and-forget without gating on the bump commit's ci.yml run.
+  then run `cargo check --workspace --locked`. A canonical release PR uses reduced
+  release-only CI only when the exact base main commit has trusted full CI; missing
+  or ambiguous proof falls back to full PR CI. The delivery macro waits for the
+  required checks in either lane. After merge, release.yml reuses that exact-SHA PR CI
+  when uniquely proven and otherwise polls exact-SHA checks. In direct-push mode the
+  bump commit triggers ci.yml and the tap stage waits for it. Use --full-checks to run
+  the full audit locally (slow); use --skip-ci-wait (direct-push only) to skip that gate.
 
   After tagging the nils-cli release, the source release workflow dispatches
   sympoies/homebrew-tap to update Formula/nils-cli.rb from published release
