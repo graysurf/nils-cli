@@ -34,6 +34,7 @@ pub mod pr_state;
 pub mod pr_tasks;
 pub mod pr_view;
 pub mod pr_wait_checks;
+pub mod repo_push_default;
 pub mod repo_view;
 pub mod required_check_gate;
 pub mod review_convergence;

@@ -52,8 +52,8 @@ pub struct Cli {
     #[arg(long, global = true, value_name = "path")]
     pub store_root: Option<PathBuf>,
 
-    /// Render the backend command that would run, without invoking it. The
-    /// envelope's `data.plan` carries the exact argv.
+    /// Validate and describe the planned operation without applying its
+    /// mutation. Read-only preflight calls may still run.
     #[arg(long, global = true, action = ArgAction::SetTrue)]
     pub dry_run: bool,
 
@@ -188,6 +188,20 @@ pub struct SearchArgs {
 pub struct RepoArgs {
     #[command(subcommand)]
     pub command: Option<RepoCommand>,
+}
+
+/// `repo push-default` arguments.
+#[derive(Args, Debug, Clone)]
+pub struct RepoPushDefaultArgs {
+    /// Commit-ish to deliver. It must resolve to the currently checked-out HEAD.
+    #[arg(long, default_value = "HEAD")]
+    pub head: String,
+    /// Exact remote default-branch SHA observed before authoring the commit.
+    #[arg(long = "expected-base", value_name = "SHA")]
+    pub expected_base: String,
+    /// UTF-8 file describing the user's explicit direct-main authorization.
+    #[arg(long = "reason-file", value_name = "PATH")]
+    pub reason_file: PathBuf,
 }
 
 #[derive(Args, Debug)]
@@ -1399,6 +1413,8 @@ pub struct IssueCommentArgs {
 pub enum RepoCommand {
     /// Resolve the repo slug, default branch, and supported merge methods.
     View,
+    /// Deliver one signed commit to the default branch with a normal fast-forward push.
+    PushDefault(RepoPushDefaultArgs),
 }
 
 /// `auth` subtree.
@@ -1431,6 +1447,9 @@ pub fn dispatch(args: Vec<OsString>) -> i32 {
         Some(Command::Repo(RepoArgs {
             command: Some(RepoCommand::View),
         })) => ops::repo_view::run(&global, format),
+        Some(Command::Repo(RepoArgs {
+            command: Some(RepoCommand::PushDefault(args)),
+        })) => ops::repo_push_default::run(&global, args, format),
         Some(Command::Pr(PrArgs {
             command: Some(PrCommand::Create(args)),
         })) => ops::pr_create::run(&global, args, format),

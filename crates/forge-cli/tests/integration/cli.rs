@@ -94,6 +94,39 @@ fn label_help_lists_every_v1_subcommand() {
 }
 
 #[test]
+fn repo_help_lists_governed_default_branch_delivery() {
+    let stub = StubEnv::new();
+    let out = run_forge_cli(&stub, &["repo", "--help"]);
+    assert_eq!(out.code, 0, "stderr={}", out.stderr);
+    for sub in ["view", "push-default"] {
+        assert!(
+            out.stdout.contains(sub),
+            "repo --help missing {sub}: stdout={}",
+            out.stdout
+        );
+    }
+}
+
+#[test]
+fn repo_push_default_help_exposes_guarded_contract_inputs() {
+    let stub = StubEnv::new();
+    let out = run_forge_cli(&stub, &["repo", "push-default", "--help"]);
+    assert_eq!(out.code, 0, "stderr={}", out.stderr);
+    for expected in [
+        "--head",
+        "--expected-base",
+        "--reason-file",
+        "normal fast-forward push",
+    ] {
+        assert!(
+            out.stdout.contains(expected),
+            "repo push-default --help missing {expected}: stdout={}",
+            out.stdout
+        );
+    }
+}
+
+#[test]
 fn pr_help_lists_every_v1_subcommand() {
     let stub = StubEnv::new();
     let out = run_forge_cli(&stub, &["pr", "--help"]);

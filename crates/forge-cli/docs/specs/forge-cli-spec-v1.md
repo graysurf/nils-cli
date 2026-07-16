@@ -61,7 +61,8 @@ In scope (v1):
   `reopen`.
 - Repository label lifecycle: `label list`, `label audit`, and
   `label ensure`.
-- Read-only helpers used by the macros: `auth status`, `repo view`.
+- Repository helpers: read-only `repo view` and the explicitly governed
+  `repo push-default` delivery exception.
 - Macro ops: `pr deliver` (kind = `feature` | `bug`), composing the
   atoms above into the agent-runtime-kit standard "open draft → wait CI →
   ready → merge → cleanup" flow.
@@ -92,7 +93,9 @@ gap (GitLab has no equivalent today) or remove the "lock down behaviour" value
   - Other hosts → `USAGE 64` with `error.kind = "provider_unsupported"`
     and a hint to file a follow-up; v1 does not auto-fall-back to
     HTTPS-only Gitea/Forgejo even though the URL shape would allow it.
-- All remote calls go through the backend subprocess. `forge-cli` does
+- All provider API calls go through the backend subprocess. The governed
+  `repo push-default` operation additionally invokes local `git` for validation,
+  one expected-old-OID compare-and-swap fast-forward, and remote-ref read-back. `forge-cli` does
   not open HTTP sockets, does not hold tokens, and does not write to
   the user's `~/.config/gh` or `~/.config/glab`.
 - Backend stdout (typically `--json` from `gh`/`glab`) is parsed and
@@ -138,6 +141,7 @@ Parity matrix (v1):
 | `label ensure`                              | `gh label create/edit`                                                                                                                       | `glab label create/edit`                                    | exact (no delete/rename by default)                                                                                      |
 | `auth status`                               | `gh auth status`                                                                                                                             | `glab auth status`                                          | exact (text → typed)                                                                                                     |
 | `repo view`                                 | `gh repo view --json …`                                                                                                                      | `glab repo view -F json`                                    | exact                                                                                                                    |
+| `repo push-default`                         | local Git validation/push plus `gh repo view --json …` default-branch resolution                                                             | local Git validation/push plus `glab repo view -F json`     | exact; no provider force path                                                                                            |
 | `inbox list`                                | `gh search prs/issues --json …`                                                                                                              | `glab api --hostname <host> …`                              | normalized aggregation                                                                                                   |
 | `inbox status`                              | same provider reads as `inbox list`                                                                                                          | same provider reads as `inbox list`                         | bounded counts                                                                                                           |
 | `inbox next`                                | same provider reads as `inbox list`                                                                                                          | same provider reads as `inbox list`                         | ranked bounded subset                                                                                                    |
@@ -155,7 +159,8 @@ GitLab capability status:
 
 - Supported with stable JSON/API: PR/MR create, view, list, edit, comment,
   ready, close, checks, wait-checks, merge, deliver; issue create/view/edit,
-  comment, close, reopen; label list/audit/ensure; auth status; repo view;
+  comment, close, reopen; label list/audit/ensure; auth status; repo view and
+  governed repo push-default;
   inbox list/status/next; activity feed.
 - Intentionally unsupported in v1: GitLab `activity commits`,
   `activity events`, `activity summary`, and `search` operations.
@@ -216,7 +221,8 @@ forge-cli
 │   ├── list
 │   └── next
 ├── repo
-│   └── view
+│   ├── view
+│   └── push-default
 ├── auth
 │   └── status
 └── completion              (workspace standard)
@@ -232,7 +238,9 @@ Global flags (every subcommand):
 - `--dry-run` — render the backend command that *would* run plus all
   validation checks, but do not invoke it. Output envelope carries the
   exact argv under `data.plan` for atomic commands or `data.actions[].plan`
-  for `label ensure`.
+  for `label ensure`. `repo push-default` instead runs its read-only local and
+  provider preflight and emits `pushed=false` with the exact `push_refspec`;
+  it never invokes `git push` in dry-run mode.
 
 `forge-cli` itself does not expose `--token`, `--host`, or any auth
 override. Those belong to `gh`/`glab` and are configured there.
@@ -340,6 +348,69 @@ backend mapping, validation rules, and output schema versions.
   - resolved head branch MUST be pushed and remote-tracked.
 - Output schema: `cli.forge-cli.pr.create.v1`,
   `data = { number, url, head, base, draft, title, kind, provider }`.
+
+### `repo push-default`
+
+- Input: `--head <ref>` (default `HEAD`, and must resolve to the checked-out
+  commit), required `--expected-base <full-sha>`, and required
+  `--reason-file <path>` naming a regular file of at most 2,000 bytes that
+  contains the caller's explicit authorization basis.
+- Validation:
+  - the selected Git remote must expose exactly one actual push URL (including
+    any configured `remote.<name>.pushurl`), and that destination's host and
+    repository identity must match the provider result; the local backend is
+    unsupported;
+  - HTTP(S) push URLs containing userinfo are rejected; callers use credential
+    helpers rather than embedding credential material in a subprocess argument;
+  - after the push URL is expanded once, no effective `url.*.insteadOf` or
+    `url.*.pushInsteadOf` rule may match it again; empty rewrite prefixes are
+    universal matches and are rejected. This prevents Git from retargeting the
+    mutation independently of base/read-back operations;
+  - the worktree is clean and checked out on a non-default branch;
+  - the remote default branch still equals `--expected-base`;
+  - `HEAD` is exactly one commit ahead of that base and the base is its
+    ancestor;
+  - `git log --format=%G?` reports `G` for the delivered commit.
+- Mutation: exactly one command-scoped `git -c push.followTags=false -c
+  push.pushOption= -c push.recurseSubmodules=no push --porcelain --no-follow-tags
+  --no-recurse-submodules --no-push-option
+  --force-with-lease=refs/heads/<default>:<expected-base> --
+  <validated-push-url> <head-sha>:refs/heads/<default>` invocation. The exact
+  old-OID lease is used only as a compare-and-swap guard; the independent
+  ancestry proof keeps the update fast-forward-only. There is no unconstrained
+  force, delete, retry, or direct-merge option, and inherited tag, submodule,
+  and push-option expansion is disabled. Any concurrent remote change is
+  returned as `default_push_rejected`.
+- Destination pinning: the expected-base read, push, and post-push read-back all
+  use the same validated URL rather than re-resolving the remote name.
+- Resource bounds: every Git subprocess has a 120-second timeout and an 8 MiB
+  per-stream capture limit. Timeout or output-limit failure kills the complete
+  child process group and returns `git_timeout` or `git_output_limit`
+  without retrying a push. The provider metadata subprocess uses the same
+  finite deadline and backend capture/process-group contract. Shipped release
+  builds always execute `git` with these hard bounds; executable and bound
+  overrides exist only in debug test builds.
+- Read-back: exact `git ls-remote` after the push must equal the delivered SHA;
+  otherwise the op fails closed with `default_push_verification_failed` and
+  tells the caller to inspect the already-mutated remote.
+- Output schema: `cli.forge-cli.repo.push-default.v1`; the receipt contains the
+  repository, remote/default branch, authoring branch, head/base SHAs, reason,
+  exact refspec, `pushed`, and `observed_remote_sha`.
+- Typed failures: `push_destination_missing`,
+  `push_destination_ambiguous`, `push_destination_credentials_unsupported`,
+  `push_destination_rewrite_ambiguous`,
+  `provider_mismatch`, `provider_unsupported`, `repository_mismatch`,
+  `dirty_worktree`, `detached_head`, `default_branch_checkout`,
+  `head_not_checked_out`, `expected_base_mismatch`,
+  `expected_base_missing`, `expected_base_not_ancestor`,
+  `direct_commit_count_invalid`, `commit_signature_unverified`,
+  `reason_file_unreadable`, `reason_invalid`, `local_path_present`,
+  `object_id_invalid`, `remote_default_lookup_failed`,
+  `remote_default_branch_missing`, `git_timeout`, `git_output_limit`,
+  `backend_timeout`, `backend_output_limit`,
+  `default_push_rejected`, `default_push_verification_failed`, and
+  `software_error`. Callers must preserve their declared DATA, RUNTIME,
+  UNAVAILABLE, SOFTWARE, or USAGE exit class.
 
 ### `pr wait-checks`
 
@@ -725,11 +796,15 @@ backend implementations cannot diverge.
    read/append-only and do not check.)
 5. **Push state.** The resolved head branch MUST be pushed to a
    remote-tracking branch before `create` or `deliver` runs.
-6. **Default-branch protection.** `forge-cli` refuses any operation
-   that would force-push, delete, or merge directly into the repo
-   default branch except via a merged PR/MR. `--allow-non-default-base`
-   exists for non-default *base* branches (e.g. release lanes); there
-   is no flag to bypass the default-branch force-push refusal.
+6. **Default-branch protection.** PR/MR delivery remains the default.
+   `forge-cli` refuses any unconstrained force-push, caller-controlled lease,
+   delete, or direct merge
+   into the repo default branch. The sole direct-delivery exception is
+   `repo push-default`: one clean, locally verified signed commit on the exact
+   expected remote base, one uniquely bound actual push destination, delivered
+   with an exact old-OID compare-and-swap fast-forward and remote SHA read-back.
+   `--allow-non-default-base` applies only to PR/MR base branches; no flag
+   bypasses the default-branch force refusal.
 7. **Draft → ready → merge ordering.** `pr merge` refuses to merge a
    draft. There is no `--merge-as-draft`. Callers MUST run `pr ready`
    first (or use `pr deliver`, which sequences them).
@@ -807,31 +882,58 @@ backend implementations cannot diverge.
 
 Violations map to `DATA 65` with one of these `data.error.kind` values:
 
-| `error.kind`                          | Triggered by rule |
-| ------------------------------------- | ----------------- |
-| `branch_name_invalid`                 | 1                 |
-| `branch_kind_mismatch`                | 1                 |
-| `body_missing_summary`                | 2                 |
-| `body_missing_test_plan`              | 2                 |
-| `title_too_long`                      | 3                 |
-| `dirty_worktree`                      | 4                 |
-| `head_not_pushed`                     | 5                 |
-| `default_branch_protected`            | 6                 |
-| `draft_merge_refused`                 | 7                 |
-| `checks_pending`                      | 8                 |
-| `checks_failed`                       | 8 (`RUNTIME 1`)   |
-| `merge_method_unsupported`            | 9                 |
-| `keep_branch_conflict`                | 10                |
-| `local_path_present`                  | 11                |
-| `review_changes_requested`            | 12                |
-| `review_convergence_head_missing`     | 12                |
-| `review_convergence_head_changed`     | 12                |
-| `review_convergence_activity_changed` | 12                |
-| `review_snapshot_incomplete`          | 12                |
-| `invalid_review_convergence_config`   | 12                |
-| `unresolved_review_threads`           | 13                |
-| `unchecked_task_items`                | 14                |
-| `review_thread_pr_mismatch`           | 15                |
+| `error.kind`                               | Triggered by rule    |
+| ------------------------------------------ | -------------------- |
+| `branch_name_invalid`                      | 1                    |
+| `branch_kind_mismatch`                     | 1                    |
+| `body_missing_summary`                     | 2                    |
+| `body_missing_test_plan`                   | 2                    |
+| `title_too_long`                           | 3                    |
+| `dirty_worktree`                           | 4                    |
+| `head_not_pushed`                          | 5                    |
+| `default_branch_protected`                 | 6                    |
+| `push_destination_missing`                 | 6                    |
+| `push_destination_ambiguous`               | 6                    |
+| `push_destination_credentials_unsupported` | 6                    |
+| `push_destination_rewrite_ambiguous`       | 6                    |
+| `provider_mismatch`                        | 6                    |
+| `provider_unsupported`                     | 6 (`USAGE 64`)       |
+| `repository_mismatch`                      | 6                    |
+| `detached_head`                            | 6                    |
+| `default_branch_checkout`                  | 6                    |
+| `head_not_checked_out`                     | 6                    |
+| `expected_base_mismatch`                   | 6                    |
+| `expected_base_missing`                    | 6                    |
+| `expected_base_not_ancestor`               | 6                    |
+| `direct_commit_count_invalid`              | 6                    |
+| `commit_signature_unverified`              | 6                    |
+| `reason_file_unreadable`                   | 6                    |
+| `reason_invalid`                           | 6                    |
+| `object_id_invalid`                        | 6                    |
+| `remote_default_lookup_failed`             | 6 (`UNAVAILABLE 69`) |
+| `remote_default_branch_missing`            | 6                    |
+| `git_timeout`                              | 6 (`UNAVAILABLE 69`) |
+| `git_output_limit`                         | 6 (`UNAVAILABLE 69`) |
+| `backend_timeout`                          | 6 (`UNAVAILABLE 69`) |
+| `backend_output_limit`                     | 6 (`UNAVAILABLE 69`) |
+| `default_push_rejected`                    | 6 (`RUNTIME 1`)      |
+| `default_push_verification_failed`         | 6 (`RUNTIME 1`)      |
+| `software_error`                           | 6 (`SOFTWARE 70`)    |
+| `draft_merge_refused`                      | 7                    |
+| `checks_pending`                           | 8                    |
+| `checks_failed`                            | 8 (`RUNTIME 1`)      |
+| `merge_method_unsupported`                 | 9                    |
+| `keep_branch_conflict`                     | 10                   |
+| `local_path_present`                       | 11                   |
+| `review_changes_requested`                 | 12                   |
+| `review_convergence_head_missing`          | 12                   |
+| `review_convergence_head_changed`          | 12                   |
+| `review_convergence_activity_changed`      | 12                   |
+| `review_snapshot_incomplete`               | 12                   |
+| `invalid_review_convergence_config`        | 12                   |
+| `unresolved_review_threads`                | 13                   |
+| `unchecked_task_items`                     | 14                   |
+| `review_thread_pr_mismatch`                | 15                   |
 
 ## Activity output contract
 

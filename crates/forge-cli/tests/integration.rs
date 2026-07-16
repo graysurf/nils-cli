@@ -26,6 +26,7 @@ mod integration {
     mod pr_reviews;
     mod pr_wait_checks;
     mod rate_limit_gate;
+    mod repo_push_default;
     mod repo_view;
     mod required_check_gate;
     mod search;

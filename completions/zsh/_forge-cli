@@ -21,7 +21,7 @@ json\:"Single-record JSON envelope (snake_case)"))' \
 '--provider=[Override auto-detected provider]:PROVIDER:(github gitlab local)' \
 '--repo=[Override the repo slug (\`owner/name\`). When absent it is derived from the remote URL]:owner/name:_default' \
 '--store-root=[Root directory of the file-backed store used by \`--provider local\`. Overrides the \`FORGE_CLI_LOCAL_STORE\` env var]:path:_files' \
-'--dry-run[Render the backend command that would run, without invoking it. The envelope'\''s \`data.plan\` carries the exact argv]' \
+'--dry-run[Validate and describe the planned operation without applying its mutation. Read-only preflight calls may still run]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
 '-V[Print version]' \
@@ -43,7 +43,7 @@ json\:"Single-record JSON envelope (snake_case)"))' \
 '--provider=[Override auto-detected provider]:PROVIDER:(github gitlab local)' \
 '--repo=[Override the repo slug (\`owner/name\`). When absent it is derived from the remote URL]:owner/name:_default' \
 '--store-root=[Root directory of the file-backed store used by \`--provider local\`. Overrides the \`FORGE_CLI_LOCAL_STORE\` env var]:path:_files' \
-'--dry-run[Render the backend command that would run, without invoking it. The envelope'\''s \`data.plan\` carries the exact argv]' \
+'--dry-run[Validate and describe the planned operation without applying its mutation. Read-only preflight calls may still run]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
 ":: :_forge-cli__subcmd__pr_commands" \
@@ -76,7 +76,7 @@ json\:"Single-record JSON envelope (snake_case)"))' \
 '--store-root=[Root directory of the file-backed store used by \`--provider local\`. Overrides the \`FORGE_CLI_LOCAL_STORE\` env var]:path:_files' \
 '--no-draft[Open as ready-for-review instead of draft (default\: open as draft)]' \
 '--strict-labels[Fail when selected labels are missing, not applicable, or conflict]' \
-'--dry-run[Render the backend command that would run, without invoking it. The envelope'\''s \`data.plan\` carries the exact argv]' \
+'--dry-run[Validate and describe the planned operation without applying its mutation. Read-only preflight calls may still run]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
 && ret=0
@@ -89,7 +89,7 @@ json\:"Single-record JSON envelope (snake_case)"))' \
 '--provider=[Override auto-detected provider]:PROVIDER:(github gitlab local)' \
 '--repo=[Override the repo slug (\`owner/name\`). When absent it is derived from the remote URL]:owner/name:_default' \
 '--store-root=[Root directory of the file-backed store used by \`--provider local\`. Overrides the \`FORGE_CLI_LOCAL_STORE\` env var]:path:_files' \
-'--dry-run[Render the backend command that would run, without invoking it. The envelope'\''s \`data.plan\` carries the exact argv]' \
+'--dry-run[Validate and describe the planned operation without applying its mutation. Read-only preflight calls may still run]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
 ':id -- Numeric id or branch name:_default' \
@@ -107,7 +107,7 @@ json\:"Single-record JSON envelope (snake_case)"))' \
 '--provider=[Override auto-detected provider]:PROVIDER:(github gitlab local)' \
 '--repo=[Override the repo slug (\`owner/name\`). When absent it is derived from the remote URL]:owner/name:_default' \
 '--store-root=[Root directory of the file-backed store used by \`--provider local\`. Overrides the \`FORGE_CLI_LOCAL_STORE\` env var]:path:_files' \
-'--dry-run[Render the backend command that would run, without invoking it. The envelope'\''s \`data.plan\` carries the exact argv]' \
+'--dry-run[Validate and describe the planned operation without applying its mutation. Read-only preflight calls may still run]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
 && ret=0
@@ -127,7 +127,7 @@ json\:"Single-record JSON envelope (snake_case)"))' \
 '--provider=[Override auto-detected provider]:PROVIDER:(github gitlab local)' \
 '--repo=[Override the repo slug (\`owner/name\`). When absent it is derived from the remote URL]:owner/name:_default' \
 '--store-root=[Root directory of the file-backed store used by \`--provider local\`. Overrides the \`FORGE_CLI_LOCAL_STORE\` env var]:path:_files' \
-'--dry-run[Render the backend command that would run, without invoking it. The envelope'\''s \`data.plan\` carries the exact argv]' \
+'--dry-run[Validate and describe the planned operation without applying its mutation. Read-only preflight calls may still run]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
 ':id -- Numeric PR / MR id:_default' \
@@ -143,7 +143,7 @@ json\:"Single-record JSON envelope (snake_case)"))' \
 '--provider=[Override auto-detected provider]:PROVIDER:(github gitlab local)' \
 '--repo=[Override the repo slug (\`owner/name\`). When absent it is derived from the remote URL]:owner/name:_default' \
 '--store-root=[Root directory of the file-backed store used by \`--provider local\`. Overrides the \`FORGE_CLI_LOCAL_STORE\` env var]:path:_files' \
-'--dry-run[Render the backend command that would run, without invoking it. The envelope'\''s \`data.plan\` carries the exact argv]' \
+'--dry-run[Validate and describe the planned operation without applying its mutation. Read-only preflight calls may still run]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
 ':id -- Numeric PR / MR id:_default' \
@@ -167,7 +167,7 @@ json\:"Single-record JSON envelope (snake_case)"))' \
 '--store-root=[Root directory of the file-backed store used by \`--provider local\`. Overrides the \`FORGE_CLI_LOCAL_STORE\` env var]:path:_files' \
 '--mirror-issue[Mirror a compact activity note to \`--issue\` (required; omitting it returns the \`issue_required\` envelope at runtime)]' \
 '--submit-review[Submit a native provider review event instead of posting an outcome comment. On GitHub this POSTs \`.../pulls/<id>/reviews\`, creating the \`#pullrequestreview-\` object; \`--decision\` maps to the review event (comments-only→COMMENT, approve→APPROVE, request-changes→REQUEST_CHANGES). The review is authored by the invoking token'\''s identity (e.g. a reviewer bot via FORGE_BOT_PROFILE). A body is required for COMMENT and REQUEST_CHANGES and optional for APPROVE. GitHub-only in v1]' \
-'--dry-run[Render the backend command that would run, without invoking it. The envelope'\''s \`data.plan\` carries the exact argv]' \
+'--dry-run[Validate and describe the planned operation without applying its mutation. Read-only preflight calls may still run]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
 '::id -- Numeric PR / MR id:_default' \
@@ -193,7 +193,7 @@ json\:"Single-record JSON envelope (snake_case)"))' \
 '--repo=[Override the repo slug (\`owner/name\`). When absent it is derived from the remote URL]:owner/name:_default' \
 '--store-root=[Root directory of the file-backed store used by \`--provider local\`. Overrides the \`FORGE_CLI_LOCAL_STORE\` env var]:path:_files' \
 '--check-diff[Check thread path / line coordinates against the live GitHub PR diff]' \
-'--dry-run[Render the backend command that would run, without invoking it. The envelope'\''s \`data.plan\` carries the exact argv]' \
+'--dry-run[Validate and describe the planned operation without applying its mutation. Read-only preflight calls may still run]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
 '::id -- Numeric PR id. Required with `--check-diff`:_default' \
@@ -235,7 +235,7 @@ json\:"Single-record JSON envelope (snake_case)"))' \
 '--provider=[Override auto-detected provider]:PROVIDER:(github gitlab local)' \
 '--repo=[Override the repo slug (\`owner/name\`). When absent it is derived from the remote URL]:owner/name:_default' \
 '--store-root=[Root directory of the file-backed store used by \`--provider local\`. Overrides the \`FORGE_CLI_LOCAL_STORE\` env var]:path:_files' \
-'--dry-run[Render the backend command that would run, without invoking it. The envelope'\''s \`data.plan\` carries the exact argv]' \
+'--dry-run[Validate and describe the planned operation without applying its mutation. Read-only preflight calls may still run]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
 ':id -- Numeric PR / MR id:_default' \
@@ -249,7 +249,7 @@ json\:"Single-record JSON envelope (snake_case)"))' \
 '--provider=[Override auto-detected provider]:PROVIDER:(github gitlab local)' \
 '--repo=[Override the repo slug (\`owner/name\`). When absent it is derived from the remote URL]:owner/name:_default' \
 '--store-root=[Root directory of the file-backed store used by \`--provider local\`. Overrides the \`FORGE_CLI_LOCAL_STORE\` env var]:path:_files' \
-'--dry-run[Render the backend command that would run, without invoking it. The envelope'\''s \`data.plan\` carries the exact argv]' \
+'--dry-run[Validate and describe the planned operation without applying its mutation. Read-only preflight calls may still run]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
 ':id -- Numeric PR / MR id:_default' \
@@ -263,7 +263,7 @@ json\:"Single-record JSON envelope (snake_case)"))' \
 '--provider=[Override auto-detected provider]:PROVIDER:(github gitlab local)' \
 '--repo=[Override the repo slug (\`owner/name\`). When absent it is derived from the remote URL]:owner/name:_default' \
 '--store-root=[Root directory of the file-backed store used by \`--provider local\`. Overrides the \`FORGE_CLI_LOCAL_STORE\` env var]:path:_files' \
-'--dry-run[Render the backend command that would run, without invoking it. The envelope'\''s \`data.plan\` carries the exact argv]' \
+'--dry-run[Validate and describe the planned operation without applying its mutation. Read-only preflight calls may still run]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
 ":: :_forge-cli__subcmd__pr__subcmd__review-threads_commands" \
@@ -284,7 +284,7 @@ json\:"Single-record JSON envelope (snake_case)"))' \
 '--provider=[Override auto-detected provider]:PROVIDER:(github gitlab local)' \
 '--repo=[Override the repo slug (\`owner/name\`). When absent it is derived from the remote URL]:owner/name:_default' \
 '--store-root=[Root directory of the file-backed store used by \`--provider local\`. Overrides the \`FORGE_CLI_LOCAL_STORE\` env var]:path:_files' \
-'--dry-run[Render the backend command that would run, without invoking it. The envelope'\''s \`data.plan\` carries the exact argv]' \
+'--dry-run[Validate and describe the planned operation without applying its mutation. Read-only preflight calls may still run]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
 ':id -- Numeric PR / MR id:_default' \
@@ -301,7 +301,7 @@ json\:"Single-record JSON envelope (snake_case)"))' \
 '--provider=[Override auto-detected provider]:PROVIDER:(github gitlab local)' \
 '--repo=[Override the repo slug (\`owner/name\`). When absent it is derived from the remote URL]:owner/name:_default' \
 '--store-root=[Root directory of the file-backed store used by \`--provider local\`. Overrides the \`FORGE_CLI_LOCAL_STORE\` env var]:path:_files' \
-'--dry-run[Render the backend command that would run, without invoking it. The envelope'\''s \`data.plan\` carries the exact argv]' \
+'--dry-run[Validate and describe the planned operation without applying its mutation. Read-only preflight calls may still run]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
 ':id -- Numeric PR / MR id:_default' \
@@ -318,7 +318,7 @@ json\:"Single-record JSON envelope (snake_case)"))' \
 '--provider=[Override auto-detected provider]:PROVIDER:(github gitlab local)' \
 '--repo=[Override the repo slug (\`owner/name\`). When absent it is derived from the remote URL]:owner/name:_default' \
 '--store-root=[Root directory of the file-backed store used by \`--provider local\`. Overrides the \`FORGE_CLI_LOCAL_STORE\` env var]:path:_files' \
-'--dry-run[Render the backend command that would run, without invoking it. The envelope'\''s \`data.plan\` carries the exact argv]' \
+'--dry-run[Validate and describe the planned operation without applying its mutation. Read-only preflight calls may still run]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
 ':id -- Numeric PR / MR id:_default' \
@@ -368,7 +368,7 @@ json\:"Single-record JSON envelope (snake_case)"))' \
 '--provider=[Override auto-detected provider]:PROVIDER:(github gitlab local)' \
 '--repo=[Override the repo slug (\`owner/name\`). When absent it is derived from the remote URL]:owner/name:_default' \
 '--store-root=[Root directory of the file-backed store used by \`--provider local\`. Overrides the \`FORGE_CLI_LOCAL_STORE\` env var]:path:_files' \
-'--dry-run[Render the backend command that would run, without invoking it. The envelope'\''s \`data.plan\` carries the exact argv]' \
+'--dry-run[Validate and describe the planned operation without applying its mutation. Read-only preflight calls may still run]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
 ':id -- Numeric pull request id:_default' \
@@ -382,7 +382,7 @@ json\:"Single-record JSON envelope (snake_case)"))' \
 '--provider=[Override auto-detected provider]:PROVIDER:(github gitlab local)' \
 '--repo=[Override the repo slug (\`owner/name\`). When absent it is derived from the remote URL]:owner/name:_default' \
 '--store-root=[Root directory of the file-backed store used by \`--provider local\`. Overrides the \`FORGE_CLI_LOCAL_STORE\` env var]:path:_files' \
-'--dry-run[Render the backend command that would run, without invoking it. The envelope'\''s \`data.plan\` carries the exact argv]' \
+'--dry-run[Validate and describe the planned operation without applying its mutation. Read-only preflight calls may still run]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
 ':id -- Numeric PR / MR id:_default' \
@@ -403,7 +403,7 @@ json\:"Single-record JSON envelope (snake_case)"))' \
 '--allow-non-default-base[Allow merges where the PR'\''s base is not the repo'\''s default branch. Without this flag, mismatched bases trigger \`default_branch_protected\`]' \
 '--allow-unresolved-threads[Merge despite unresolved review threads. Without this flag, any unresolved thread (bot or human) triggers \`unresolved_review_threads\`]' \
 '--allow-unchecked-tasks[Merge despite unchecked task-list items in the PR/MR description. Without this flag, any unchecked \`- \[ \]\` item triggers \`unchecked_task_items\`. Requires \`--allow-unchecked-tasks-reason\`]' \
-'--dry-run[Render the backend command that would run, without invoking it. The envelope'\''s \`data.plan\` carries the exact argv]' \
+'--dry-run[Validate and describe the planned operation without applying its mutation. Read-only preflight calls may still run]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
 ':id -- Numeric PR / MR id:_default' \
@@ -417,7 +417,7 @@ json\:"Single-record JSON envelope (snake_case)"))' \
 '--provider=[Override auto-detected provider]:PROVIDER:(github gitlab local)' \
 '--repo=[Override the repo slug (\`owner/name\`). When absent it is derived from the remote URL]:owner/name:_default' \
 '--store-root=[Root directory of the file-backed store used by \`--provider local\`. Overrides the \`FORGE_CLI_LOCAL_STORE\` env var]:path:_files' \
-'--dry-run[Render the backend command that would run, without invoking it. The envelope'\''s \`data.plan\` carries the exact argv]' \
+'--dry-run[Validate and describe the planned operation without applying its mutation. Read-only preflight calls may still run]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
 ':id -- Numeric id:_default' \
@@ -432,7 +432,7 @@ json\:"Single-record JSON envelope (snake_case)"))' \
 '--provider=[Override auto-detected provider]:PROVIDER:(github gitlab local)' \
 '--repo=[Override the repo slug (\`owner/name\`). When absent it is derived from the remote URL]:owner/name:_default' \
 '--store-root=[Root directory of the file-backed store used by \`--provider local\`. Overrides the \`FORGE_CLI_LOCAL_STORE\` env var]:path:_files' \
-'--dry-run[Render the backend command that would run, without invoking it. The envelope'\''s \`data.plan\` carries the exact argv]' \
+'--dry-run[Validate and describe the planned operation without applying its mutation. Read-only preflight calls may still run]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
 ':id -- Numeric id or branch name (GitHub accepts both natively; GitLab resolves numeric ids via `mr view` to fetch the source branch):_default' \
@@ -449,7 +449,7 @@ json\:"Single-record JSON envelope (snake_case)"))' \
 '--provider=[Override auto-detected provider]:PROVIDER:(github gitlab local)' \
 '--repo=[Override the repo slug (\`owner/name\`). When absent it is derived from the remote URL]:owner/name:_default' \
 '--store-root=[Root directory of the file-backed store used by \`--provider local\`. Overrides the \`FORGE_CLI_LOCAL_STORE\` env var]:path:_files' \
-'--dry-run[Render the backend command that would run, without invoking it. The envelope'\''s \`data.plan\` carries the exact argv]' \
+'--dry-run[Validate and describe the planned operation without applying its mutation. Read-only preflight calls may still run]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
 ':id -- Numeric id or branch name:_default' \
@@ -483,7 +483,7 @@ json\:"Single-record JSON envelope (snake_case)"))' \
 '--allow-non-default-base[Allow merges where the PR'\''s base is not the repo'\''s default branch]' \
 '--allow-unresolved-threads[Merge despite unresolved review threads. Without this flag, any unresolved thread (bot or human) triggers \`unresolved_review_threads\` at the merge step]' \
 '--allow-unchecked-tasks[Merge despite unchecked task-list items in the PR/MR description. Without this flag, any unchecked \`- \[ \]\` item triggers \`unchecked_task_items\` at the merge step. Requires \`--allow-unchecked-tasks-reason\`]' \
-'--dry-run[Render the backend command that would run, without invoking it. The envelope'\''s \`data.plan\` carries the exact argv]' \
+'--dry-run[Validate and describe the planned operation without applying its mutation. Read-only preflight calls may still run]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
 && ret=0
@@ -624,7 +624,7 @@ json\:"Single-record JSON envelope (snake_case)"))' \
 '--provider=[Override auto-detected provider]:PROVIDER:(github gitlab local)' \
 '--repo=[Override the repo slug (\`owner/name\`). When absent it is derived from the remote URL]:owner/name:_default' \
 '--store-root=[Root directory of the file-backed store used by \`--provider local\`. Overrides the \`FORGE_CLI_LOCAL_STORE\` env var]:path:_files' \
-'--dry-run[Render the backend command that would run, without invoking it. The envelope'\''s \`data.plan\` carries the exact argv]' \
+'--dry-run[Validate and describe the planned operation without applying its mutation. Read-only preflight calls may still run]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
 ":: :_forge-cli__subcmd__issue_commands" \
@@ -650,7 +650,7 @@ json\:"Single-record JSON envelope (snake_case)"))' \
 '--provider=[Override auto-detected provider]:PROVIDER:(github gitlab local)' \
 '--repo=[Override the repo slug (\`owner/name\`). When absent it is derived from the remote URL]:owner/name:_default' \
 '--store-root=[Root directory of the file-backed store used by \`--provider local\`. Overrides the \`FORGE_CLI_LOCAL_STORE\` env var]:path:_files' \
-'--dry-run[Render the backend command that would run, without invoking it. The envelope'\''s \`data.plan\` carries the exact argv]' \
+'--dry-run[Validate and describe the planned operation without applying its mutation. Read-only preflight calls may still run]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
 && ret=0
@@ -664,7 +664,7 @@ json\:"Single-record JSON envelope (snake_case)"))' \
 '--repo=[Override the repo slug (\`owner/name\`). When absent it is derived from the remote URL]:owner/name:_default' \
 '--store-root=[Root directory of the file-backed store used by \`--provider local\`. Overrides the \`FORGE_CLI_LOCAL_STORE\` env var]:path:_files' \
 '--with-comments[Also fetch the issue'\''s comment stream and embed it under \`comments\` in the envelope payload. Adds one GitLab API call; for GitHub the comments are pulled in the same \`gh issue view --json\` invocation]' \
-'--dry-run[Render the backend command that would run, without invoking it. The envelope'\''s \`data.plan\` carries the exact argv]' \
+'--dry-run[Validate and describe the planned operation without applying its mutation. Read-only preflight calls may still run]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
 ':id -- Numeric issue id:_default' \
@@ -683,7 +683,7 @@ json\:"Single-record JSON envelope (snake_case)"))' \
 '--provider=[Override auto-detected provider]:PROVIDER:(github gitlab local)' \
 '--repo=[Override the repo slug (\`owner/name\`). When absent it is derived from the remote URL]:owner/name:_default' \
 '--store-root=[Root directory of the file-backed store used by \`--provider local\`. Overrides the \`FORGE_CLI_LOCAL_STORE\` env var]:path:_files' \
-'--dry-run[Render the backend command that would run, without invoking it. The envelope'\''s \`data.plan\` carries the exact argv]' \
+'--dry-run[Validate and describe the planned operation without applying its mutation. Read-only preflight calls may still run]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
 && ret=0
@@ -702,7 +702,7 @@ json\:"Single-record JSON envelope (snake_case)"))' \
 '--provider=[Override auto-detected provider]:PROVIDER:(github gitlab local)' \
 '--repo=[Override the repo slug (\`owner/name\`). When absent it is derived from the remote URL]:owner/name:_default' \
 '--store-root=[Root directory of the file-backed store used by \`--provider local\`. Overrides the \`FORGE_CLI_LOCAL_STORE\` env var]:path:_files' \
-'--dry-run[Render the backend command that would run, without invoking it. The envelope'\''s \`data.plan\` carries the exact argv]' \
+'--dry-run[Validate and describe the planned operation without applying its mutation. Read-only preflight calls may still run]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
 ':id -- Numeric issue id:_default' \
@@ -718,7 +718,7 @@ json\:"Single-record JSON envelope (snake_case)"))' \
 '--provider=[Override auto-detected provider]:PROVIDER:(github gitlab local)' \
 '--repo=[Override the repo slug (\`owner/name\`). When absent it is derived from the remote URL]:owner/name:_default' \
 '--store-root=[Root directory of the file-backed store used by \`--provider local\`. Overrides the \`FORGE_CLI_LOCAL_STORE\` env var]:path:_files' \
-'--dry-run[Render the backend command that would run, without invoking it. The envelope'\''s \`data.plan\` carries the exact argv]' \
+'--dry-run[Validate and describe the planned operation without applying its mutation. Read-only preflight calls may still run]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
 ':id -- Numeric issue id:_default' \
@@ -733,7 +733,7 @@ json\:"Single-record JSON envelope (snake_case)"))' \
 '--provider=[Override auto-detected provider]:PROVIDER:(github gitlab local)' \
 '--repo=[Override the repo slug (\`owner/name\`). When absent it is derived from the remote URL]:owner/name:_default' \
 '--store-root=[Root directory of the file-backed store used by \`--provider local\`. Overrides the \`FORGE_CLI_LOCAL_STORE\` env var]:path:_files' \
-'--dry-run[Render the backend command that would run, without invoking it. The envelope'\''s \`data.plan\` carries the exact argv]' \
+'--dry-run[Validate and describe the planned operation without applying its mutation. Read-only preflight calls may still run]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
 ':id -- Numeric issue id:_default' \
@@ -747,7 +747,7 @@ json\:"Single-record JSON envelope (snake_case)"))' \
 '--provider=[Override auto-detected provider]:PROVIDER:(github gitlab local)' \
 '--repo=[Override the repo slug (\`owner/name\`). When absent it is derived from the remote URL]:owner/name:_default' \
 '--store-root=[Root directory of the file-backed store used by \`--provider local\`. Overrides the \`FORGE_CLI_LOCAL_STORE\` env var]:path:_files' \
-'--dry-run[Render the backend command that would run, without invoking it. The envelope'\''s \`data.plan\` carries the exact argv]' \
+'--dry-run[Validate and describe the planned operation without applying its mutation. Read-only preflight calls may still run]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
 ':id -- Numeric id:_default' \
@@ -813,7 +813,7 @@ json\:"Single-record JSON envelope (snake_case)"))' \
 '--provider=[Override auto-detected provider]:PROVIDER:(github gitlab local)' \
 '--repo=[Override the repo slug (\`owner/name\`). When absent it is derived from the remote URL]:owner/name:_default' \
 '--store-root=[Root directory of the file-backed store used by \`--provider local\`. Overrides the \`FORGE_CLI_LOCAL_STORE\` env var]:path:_files' \
-'--dry-run[Render the backend command that would run, without invoking it. The envelope'\''s \`data.plan\` carries the exact argv]' \
+'--dry-run[Validate and describe the planned operation without applying its mutation. Read-only preflight calls may still run]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
 ":: :_forge-cli__subcmd__activity_commands" \
@@ -837,7 +837,7 @@ json\:"Single-record JSON envelope (snake_case)"))' \
 '--provider=[Override auto-detected provider]:PROVIDER:(github gitlab local)' \
 '--repo=[Override the repo slug (\`owner/name\`). When absent it is derived from the remote URL]:owner/name:_default' \
 '--store-root=[Root directory of the file-backed store used by \`--provider local\`. Overrides the \`FORGE_CLI_LOCAL_STORE\` env var]:path:_files' \
-'--dry-run[Render the backend command that would run, without invoking it. The envelope'\''s \`data.plan\` carries the exact argv]' \
+'--dry-run[Validate and describe the planned operation without applying its mutation. Read-only preflight calls may still run]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
 && ret=0
@@ -853,7 +853,7 @@ json\:"Single-record JSON envelope (snake_case)"))' \
 '--repo=[Override the repo slug (\`owner/name\`). When absent it is derived from the remote URL]:owner/name:_default' \
 '--store-root=[Root directory of the file-backed store used by \`--provider local\`. Overrides the \`FORGE_CLI_LOCAL_STORE\` env var]:path:_files' \
 '--public-only[Use the public-events endpoint even for @me]' \
-'--dry-run[Render the backend command that would run, without invoking it. The envelope'\''s \`data.plan\` carries the exact argv]' \
+'--dry-run[Validate and describe the planned operation without applying its mutation. Read-only preflight calls may still run]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
 && ret=0
@@ -868,7 +868,7 @@ json\:"Single-record JSON envelope (snake_case)"))' \
 '--provider=[Override auto-detected provider]:PROVIDER:(github gitlab local)' \
 '--repo=[Override the repo slug (\`owner/name\`). When absent it is derived from the remote URL]:owner/name:_default' \
 '--store-root=[Root directory of the file-backed store used by \`--provider local\`. Overrides the \`FORGE_CLI_LOCAL_STORE\` env var]:path:_files' \
-'--dry-run[Render the backend command that would run, without invoking it. The envelope'\''s \`data.plan\` carries the exact argv]' \
+'--dry-run[Validate and describe the planned operation without applying its mutation. Read-only preflight calls may still run]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
 && ret=0
@@ -884,7 +884,7 @@ json\:"Single-record JSON envelope (snake_case)"))' \
 '--provider=[Override auto-detected provider]:PROVIDER:(github gitlab local)' \
 '--repo=[Override the repo slug (\`owner/name\`). When absent it is derived from the remote URL]:owner/name:_default' \
 '--store-root=[Root directory of the file-backed store used by \`--provider local\`. Overrides the \`FORGE_CLI_LOCAL_STORE\` env var]:path:_files' \
-'--dry-run[Render the backend command that would run, without invoking it. The envelope'\''s \`data.plan\` carries the exact argv]' \
+'--dry-run[Validate and describe the planned operation without applying its mutation. Read-only preflight calls may still run]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
 && ret=0
@@ -937,7 +937,7 @@ json\:"Single-record JSON envelope (snake_case)"))' \
 '--provider=[Override auto-detected provider]:PROVIDER:(github gitlab local)' \
 '--repo=[Override the repo slug (\`owner/name\`). When absent it is derived from the remote URL]:owner/name:_default' \
 '--store-root=[Root directory of the file-backed store used by \`--provider local\`. Overrides the \`FORGE_CLI_LOCAL_STORE\` env var]:path:_files' \
-'--dry-run[Render the backend command that would run, without invoking it. The envelope'\''s \`data.plan\` carries the exact argv]' \
+'--dry-run[Validate and describe the planned operation without applying its mutation. Read-only preflight calls may still run]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
 ":: :_forge-cli__subcmd__label_commands" \
@@ -959,7 +959,7 @@ json\:"Single-record JSON envelope (snake_case)"))' \
 '--provider=[Override auto-detected provider]:PROVIDER:(github gitlab local)' \
 '--repo=[Override the repo slug (\`owner/name\`). When absent it is derived from the remote URL]:owner/name:_default' \
 '--store-root=[Root directory of the file-backed store used by \`--provider local\`. Overrides the \`FORGE_CLI_LOCAL_STORE\` env var]:path:_files' \
-'--dry-run[Render the backend command that would run, without invoking it. The envelope'\''s \`data.plan\` carries the exact argv]' \
+'--dry-run[Validate and describe the planned operation without applying its mutation. Read-only preflight calls may still run]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
 && ret=0
@@ -974,7 +974,7 @@ json\:"Single-record JSON envelope (snake_case)"))' \
 '--provider=[Override auto-detected provider]:PROVIDER:(github gitlab local)' \
 '--repo=[Override the repo slug (\`owner/name\`). When absent it is derived from the remote URL]:owner/name:_default' \
 '--store-root=[Root directory of the file-backed store used by \`--provider local\`. Overrides the \`FORGE_CLI_LOCAL_STORE\` env var]:path:_files' \
-'--dry-run[Render the backend command that would run, without invoking it. The envelope'\''s \`data.plan\` carries the exact argv]' \
+'--dry-run[Validate and describe the planned operation without applying its mutation. Read-only preflight calls may still run]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
 && ret=0
@@ -990,7 +990,7 @@ json\:"Single-record JSON envelope (snake_case)"))' \
 '--repo=[Override the repo slug (\`owner/name\`). When absent it is derived from the remote URL]:owner/name:_default' \
 '--store-root=[Root directory of the file-backed store used by \`--provider local\`. Overrides the \`FORGE_CLI_LOCAL_STORE\` env var]:path:_files' \
 '--update-existing[Update color / description drift on existing labels]' \
-'--dry-run[Render the backend command that would run, without invoking it. The envelope'\''s \`data.plan\` carries the exact argv]' \
+'--dry-run[Validate and describe the planned operation without applying its mutation. Read-only preflight calls may still run]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
 && ret=0
@@ -1039,7 +1039,7 @@ json\:"Single-record JSON envelope (snake_case)"))' \
 '--provider=[Override auto-detected provider]:PROVIDER:(github gitlab local)' \
 '--repo=[Override the repo slug (\`owner/name\`). When absent it is derived from the remote URL]:owner/name:_default' \
 '--store-root=[Root directory of the file-backed store used by \`--provider local\`. Overrides the \`FORGE_CLI_LOCAL_STORE\` env var]:path:_files' \
-'--dry-run[Render the backend command that would run, without invoking it. The envelope'\''s \`data.plan\` carries the exact argv]' \
+'--dry-run[Validate and describe the planned operation without applying its mutation. Read-only preflight calls may still run]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
 ":: :_forge-cli__subcmd__inbox_commands" \
@@ -1077,7 +1077,7 @@ json\:"Single-record JSON envelope (snake_case)"))' \
 '--strict-providers[Fail when any selected inbox provider fails]' \
 '--cache-fallback[Include recent cached items when a selected provider is unavailable or times out]' \
 '--no-cache[Disable inbox cache reads and writes]' \
-'--dry-run[Render the backend command that would run, without invoking it. The envelope'\''s \`data.plan\` carries the exact argv]' \
+'--dry-run[Validate and describe the planned operation without applying its mutation. Read-only preflight calls may still run]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
 && ret=0
@@ -1107,7 +1107,7 @@ json\:"Single-record JSON envelope (snake_case)"))' \
 '--strict-providers[Fail when any selected inbox provider fails]' \
 '--cache-fallback[Include recent cached items when a selected provider is unavailable or times out]' \
 '--no-cache[Disable inbox cache reads and writes]' \
-'--dry-run[Render the backend command that would run, without invoking it. The envelope'\''s \`data.plan\` carries the exact argv]' \
+'--dry-run[Validate and describe the planned operation without applying its mutation. Read-only preflight calls may still run]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
 && ret=0
@@ -1137,7 +1137,7 @@ json\:"Single-record JSON envelope (snake_case)"))' \
 '--strict-providers[Fail when any selected inbox provider fails]' \
 '--cache-fallback[Include recent cached items when a selected provider is unavailable or times out]' \
 '--no-cache[Disable inbox cache reads and writes]' \
-'--dry-run[Render the backend command that would run, without invoking it. The envelope'\''s \`data.plan\` carries the exact argv]' \
+'--dry-run[Validate and describe the planned operation without applying its mutation. Read-only preflight calls may still run]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
 && ret=0
@@ -1186,7 +1186,7 @@ json\:"Single-record JSON envelope (snake_case)"))' \
 '--provider=[Override auto-detected provider]:PROVIDER:(github gitlab local)' \
 '--repo=[Override the repo slug (\`owner/name\`). When absent it is derived from the remote URL]:owner/name:_default' \
 '--store-root=[Root directory of the file-backed store used by \`--provider local\`. Overrides the \`FORGE_CLI_LOCAL_STORE\` env var]:path:_files' \
-'--dry-run[Render the backend command that would run, without invoking it. The envelope'\''s \`data.plan\` carries the exact argv]' \
+'--dry-run[Validate and describe the planned operation without applying its mutation. Read-only preflight calls may still run]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
 ":: :_forge-cli__subcmd__search_commands" \
@@ -1209,7 +1209,7 @@ json\:"Single-record JSON envelope (snake_case)"))' \
 '--provider=[Override auto-detected provider]:PROVIDER:(github gitlab local)' \
 '--repo=[Override the repo slug (\`owner/name\`). When absent it is derived from the remote URL]:owner/name:_default' \
 '--store-root=[Root directory of the file-backed store used by \`--provider local\`. Overrides the \`FORGE_CLI_LOCAL_STORE\` env var]:path:_files' \
-'--dry-run[Render the backend command that would run, without invoking it. The envelope'\''s \`data.plan\` carries the exact argv]' \
+'--dry-run[Validate and describe the planned operation without applying its mutation. Read-only preflight calls may still run]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
 ':query -- Free-text query passed to the provider'\''s search primitive:_default' \
@@ -1225,7 +1225,7 @@ json\:"Single-record JSON envelope (snake_case)"))' \
 '--provider=[Override auto-detected provider]:PROVIDER:(github gitlab local)' \
 '--repo=[Override the repo slug (\`owner/name\`). When absent it is derived from the remote URL]:owner/name:_default' \
 '--store-root=[Root directory of the file-backed store used by \`--provider local\`. Overrides the \`FORGE_CLI_LOCAL_STORE\` env var]:path:_files' \
-'--dry-run[Render the backend command that would run, without invoking it. The envelope'\''s \`data.plan\` carries the exact argv]' \
+'--dry-run[Validate and describe the planned operation without applying its mutation. Read-only preflight calls may still run]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
 ':query -- Free-text query passed to the provider'\''s search primitive:_default' \
@@ -1240,7 +1240,7 @@ json\:"Single-record JSON envelope (snake_case)"))' \
 '--provider=[Override auto-detected provider]:PROVIDER:(github gitlab local)' \
 '--repo=[Override the repo slug (\`owner/name\`). When absent it is derived from the remote URL]:owner/name:_default' \
 '--store-root=[Root directory of the file-backed store used by \`--provider local\`. Overrides the \`FORGE_CLI_LOCAL_STORE\` env var]:path:_files' \
-'--dry-run[Render the backend command that would run, without invoking it. The envelope'\''s \`data.plan\` carries the exact argv]' \
+'--dry-run[Validate and describe the planned operation without applying its mutation. Read-only preflight calls may still run]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
 ':reference -- Target issue / PR to find references to. Accepts a GitHub URL, `owner/name#number`, or `#number` / `number` (repo from context):_default' \
@@ -1290,7 +1290,7 @@ json\:"Single-record JSON envelope (snake_case)"))' \
 '--provider=[Override auto-detected provider]:PROVIDER:(github gitlab local)' \
 '--repo=[Override the repo slug (\`owner/name\`). When absent it is derived from the remote URL]:owner/name:_default' \
 '--store-root=[Root directory of the file-backed store used by \`--provider local\`. Overrides the \`FORGE_CLI_LOCAL_STORE\` env var]:path:_files' \
-'--dry-run[Render the backend command that would run, without invoking it. The envelope'\''s \`data.plan\` carries the exact argv]' \
+'--dry-run[Validate and describe the planned operation without applying its mutation. Read-only preflight calls may still run]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
 ":: :_forge-cli__subcmd__repo_commands" \
@@ -1311,7 +1311,23 @@ json\:"Single-record JSON envelope (snake_case)"))' \
 '--provider=[Override auto-detected provider]:PROVIDER:(github gitlab local)' \
 '--repo=[Override the repo slug (\`owner/name\`). When absent it is derived from the remote URL]:owner/name:_default' \
 '--store-root=[Root directory of the file-backed store used by \`--provider local\`. Overrides the \`FORGE_CLI_LOCAL_STORE\` env var]:path:_files' \
-'--dry-run[Render the backend command that would run, without invoking it. The envelope'\''s \`data.plan\` carries the exact argv]' \
+'--dry-run[Validate and describe the planned operation without applying its mutation. Read-only preflight calls may still run]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+&& ret=0
+;;
+(push-default)
+_arguments "${_arguments_options[@]}" : \
+'--head=[Commit-ish to deliver. It must resolve to the currently checked-out HEAD]:HEAD:_default' \
+'--expected-base=[Exact remote default-branch SHA observed before authoring the commit]:SHA:_default' \
+'--reason-file=[UTF-8 file describing the user'\''s explicit direct-main authorization]:PATH:_files' \
+'--format=[Output format (defaults to text)]:FORMAT:((text\:"Human-readable text output (default)"
+json\:"Single-record JSON envelope (snake_case)"))' \
+'--remote=[Git remote whose URL feeds provider detection (default\: \`origin\`)]:REMOTE:_default' \
+'--provider=[Override auto-detected provider]:PROVIDER:(github gitlab local)' \
+'--repo=[Override the repo slug (\`owner/name\`). When absent it is derived from the remote URL]:owner/name:_default' \
+'--store-root=[Root directory of the file-backed store used by \`--provider local\`. Overrides the \`FORGE_CLI_LOCAL_STORE\` env var]:path:_files' \
+'--dry-run[Validate and describe the planned operation without applying its mutation. Read-only preflight calls may still run]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
 && ret=0
@@ -1329,6 +1345,10 @@ _arguments "${_arguments_options[@]}" : \
         curcontext="${curcontext%:*:*}:forge-cli-repo-help-command-$line[1]:"
         case $line[1] in
             (view)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(push-default)
 _arguments "${_arguments_options[@]}" : \
 && ret=0
 ;;
@@ -1352,7 +1372,7 @@ json\:"Single-record JSON envelope (snake_case)"))' \
 '--provider=[Override auto-detected provider]:PROVIDER:(github gitlab local)' \
 '--repo=[Override the repo slug (\`owner/name\`). When absent it is derived from the remote URL]:owner/name:_default' \
 '--store-root=[Root directory of the file-backed store used by \`--provider local\`. Overrides the \`FORGE_CLI_LOCAL_STORE\` env var]:path:_files' \
-'--dry-run[Render the backend command that would run, without invoking it. The envelope'\''s \`data.plan\` carries the exact argv]' \
+'--dry-run[Validate and describe the planned operation without applying its mutation. Read-only preflight calls may still run]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
 ":: :_forge-cli__subcmd__auth_commands" \
@@ -1373,7 +1393,7 @@ json\:"Single-record JSON envelope (snake_case)"))' \
 '--provider=[Override auto-detected provider]:PROVIDER:(github gitlab local)' \
 '--repo=[Override the repo slug (\`owner/name\`). When absent it is derived from the remote URL]:owner/name:_default' \
 '--store-root=[Root directory of the file-backed store used by \`--provider local\`. Overrides the \`FORGE_CLI_LOCAL_STORE\` env var]:path:_files' \
-'--dry-run[Render the backend command that would run, without invoking it. The envelope'\''s \`data.plan\` carries the exact argv]' \
+'--dry-run[Validate and describe the planned operation without applying its mutation. Read-only preflight calls may still run]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
 && ret=0
@@ -1414,7 +1434,7 @@ json\:"Single-record JSON envelope (snake_case)"))' \
 '--provider=[Override auto-detected provider]:PROVIDER:(github gitlab local)' \
 '--repo=[Override the repo slug (\`owner/name\`). When absent it is derived from the remote URL]:owner/name:_default' \
 '--store-root=[Root directory of the file-backed store used by \`--provider local\`. Overrides the \`FORGE_CLI_LOCAL_STORE\` env var]:path:_files' \
-'--dry-run[Render the backend command that would run, without invoking it. The envelope'\''s \`data.plan\` carries the exact argv]' \
+'--dry-run[Validate and describe the planned operation without applying its mutation. Read-only preflight calls may still run]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
 ':shell -- Target shell:(bash elvish fish powershell zsh)' \
@@ -1725,6 +1745,10 @@ _arguments "${_arguments_options[@]}" : \
         curcontext="${curcontext%:*:*}:forge-cli-help-repo-command-$line[1]:"
         case $line[1] in
             (view)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(push-default)
 _arguments "${_arguments_options[@]}" : \
 && ret=0
 ;;
@@ -2184,8 +2208,14 @@ _forge-cli__subcmd__help__subcmd__pr__subcmd__wait-checks_commands() {
 _forge-cli__subcmd__help__subcmd__repo_commands() {
     local commands; commands=(
 'view:Resolve the repo slug, default branch, and supported merge methods' \
+'push-default:Deliver one signed commit to the default branch with a normal fast-forward push' \
     )
     _describe -t commands 'forge-cli help repo commands' commands "$@"
+}
+(( $+functions[_forge-cli__subcmd__help__subcmd__repo__subcmd__push-default_commands] )) ||
+_forge-cli__subcmd__help__subcmd__repo__subcmd__push-default_commands() {
+    local commands; commands=()
+    _describe -t commands 'forge-cli help repo push-default commands' commands "$@"
 }
 (( $+functions[_forge-cli__subcmd__help__subcmd__repo__subcmd__view_commands] )) ||
 _forge-cli__subcmd__help__subcmd__repo__subcmd__view_commands() {
@@ -2746,6 +2776,7 @@ _forge-cli__subcmd__pr__subcmd__wait-checks_commands() {
 _forge-cli__subcmd__repo_commands() {
     local commands; commands=(
 'view:Resolve the repo slug, default branch, and supported merge methods' \
+'push-default:Deliver one signed commit to the default branch with a normal fast-forward push' \
 'help:Print this message or the help of the given subcommand(s)' \
     )
     _describe -t commands 'forge-cli repo commands' commands "$@"
@@ -2754,6 +2785,7 @@ _forge-cli__subcmd__repo_commands() {
 _forge-cli__subcmd__repo__subcmd__help_commands() {
     local commands; commands=(
 'view:Resolve the repo slug, default branch, and supported merge methods' \
+'push-default:Deliver one signed commit to the default branch with a normal fast-forward push' \
 'help:Print this message or the help of the given subcommand(s)' \
     )
     _describe -t commands 'forge-cli repo help commands' commands "$@"
@@ -2763,10 +2795,20 @@ _forge-cli__subcmd__repo__subcmd__help__subcmd__help_commands() {
     local commands; commands=()
     _describe -t commands 'forge-cli repo help help commands' commands "$@"
 }
+(( $+functions[_forge-cli__subcmd__repo__subcmd__help__subcmd__push-default_commands] )) ||
+_forge-cli__subcmd__repo__subcmd__help__subcmd__push-default_commands() {
+    local commands; commands=()
+    _describe -t commands 'forge-cli repo help push-default commands' commands "$@"
+}
 (( $+functions[_forge-cli__subcmd__repo__subcmd__help__subcmd__view_commands] )) ||
 _forge-cli__subcmd__repo__subcmd__help__subcmd__view_commands() {
     local commands; commands=()
     _describe -t commands 'forge-cli repo help view commands' commands "$@"
+}
+(( $+functions[_forge-cli__subcmd__repo__subcmd__push-default_commands] )) ||
+_forge-cli__subcmd__repo__subcmd__push-default_commands() {
+    local commands; commands=()
+    _describe -t commands 'forge-cli repo push-default commands' commands "$@"
 }
 (( $+functions[_forge-cli__subcmd__repo__subcmd__view_commands] )) ||
 _forge-cli__subcmd__repo__subcmd__view_commands() {

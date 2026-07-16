@@ -232,6 +232,9 @@ _forge-cli() {
             forge__cli__help__pr__review__threads,resolve)
                 cmd="forge__cli__help__pr__review__threads__resolve"
                 ;;
+            forge__cli__help__repo,push-default)
+                cmd="forge__cli__help__repo__push__default"
+                ;;
             forge__cli__help__repo,view)
                 cmd="forge__cli__help__repo__view"
                 ;;
@@ -493,11 +496,17 @@ _forge-cli() {
             forge__cli__repo,help)
                 cmd="forge__cli__repo__help"
                 ;;
+            forge__cli__repo,push-default)
+                cmd="forge__cli__repo__push__default"
+                ;;
             forge__cli__repo,view)
                 cmd="forge__cli__repo__view"
                 ;;
             forge__cli__repo__help,help)
                 cmd="forge__cli__repo__help__help"
+                ;;
+            forge__cli__repo__help,push-default)
+                cmd="forge__cli__repo__help__push__default"
                 ;;
             forge__cli__repo__help,view)
                 cmd="forge__cli__repo__help__view"
@@ -1663,8 +1672,22 @@ _forge-cli() {
             return 0
             ;;
         forge__cli__help__repo)
-            opts="view"
+            opts="view push-default"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        forge__cli__help__repo__push__default)
+            opts=""
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
             fi
@@ -4143,7 +4166,7 @@ _forge-cli() {
             return 0
             ;;
         forge__cli__repo)
-            opts="-h --format --remote --provider --repo --store-root --dry-run --help view help"
+            opts="-h --format --remote --provider --repo --store-root --dry-run --help view push-default help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -4177,7 +4200,7 @@ _forge-cli() {
             return 0
             ;;
         forge__cli__repo__help)
-            opts="view help"
+            opts="view push-default help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -4204,6 +4227,20 @@ _forge-cli() {
             COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
             return 0
             ;;
+        forge__cli__repo__help__push__default)
+            opts=""
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
         forge__cli__repo__help__view)
             opts=""
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
@@ -4211,6 +4248,52 @@ _forge-cli() {
                 return 0
             fi
             case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        forge__cli__repo__push__default)
+            opts="-h --head --expected-base --reason-file --format --remote --provider --repo --store-root --dry-run --help"
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                --head)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --expected-base)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --reason-file)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --format)
+                    COMPREPLY=($(compgen -W "text json" -- "${cur}"))
+                    return 0
+                    ;;
+                --remote)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --provider)
+                    COMPREPLY=($(compgen -W "github gitlab local" -- "${cur}"))
+                    return 0
+                    ;;
+                --repo)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --store-root)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
                 *)
                     COMPREPLY=()
                     ;;
