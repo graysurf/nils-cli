@@ -58,7 +58,16 @@ if [[ -z "$repo_root" || ! -d "$repo_root" ]] || ! command -v python3 >/dev/null
   exit 0
 fi
 
-verdict="$({ python3 - "$repo_root" "$base_ref" "$head_ref" "$branch" <<'PY'
+# Bash 3.2 misparses grave accents inside a quoted heredoc nested in command
+# substitution. Keep the Python heredoc outside command substitution and use a
+# private temporary file so the protected-base detector remains macOS-safe.
+verdict_file="$(mktemp "${TMPDIR:-/tmp}/detect-release-only.XXXXXX" 2>/dev/null)" || {
+  echo false
+  exit 0
+}
+trap 'rm -f "$verdict_file"' EXIT
+verdict=false
+if python3 - "$repo_root" "$base_ref" "$head_ref" "$branch" >"$verdict_file" 2>/dev/null <<'PY'
 from __future__ import annotations
 
 import hashlib
@@ -319,7 +328,9 @@ try:
 except (OSError, subprocess.CalledProcessError, UnicodeError, ValueError):
     print("false")
 PY
-} 2>/dev/null)" || verdict=false
+then
+  verdict="$(cat "$verdict_file" 2>/dev/null)" || verdict=false
+fi
 
 case "$verdict" in
   true|false) echo "$verdict" ;;
