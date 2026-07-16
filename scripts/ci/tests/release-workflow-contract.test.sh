@@ -67,6 +67,9 @@ assert_contains .agents/skills/project-bump-version-tag-release/SKILL.md \
 assert_contains .agents/skills/project-bump-version-tag-release/SKILL.md \
   "falls back to full PR CI" \
   "release skill documents the fail-closed full-CI fallback"
+assert_contains .agents/skills/project-bump-version-tag-release/SKILL.md \
+  "cargo update --workspace" \
+  "release skill documents the implemented lockfile refresh command"
 assert_contains .agents/skills/project-bump-version-tag-release/scripts/project-bump-version-tag-release.sh \
   "reuses that exact-SHA PR CI" \
   "release helper help documents tag-gate CI reuse"

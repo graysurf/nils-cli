@@ -105,7 +105,8 @@ the legacy semantics locally).
 
 Default check selection (no `--full-checks` and no `--ci-gate-main`):
 
-- Refresh `Cargo.lock` via `cargo generate-lockfile`.
+- Refresh `Cargo.lock` via `cargo update --workspace`, preserving committed registry and
+  transitive dependency pins while updating workspace packages.
 - Regenerate tracked third-party artifacts so they match the new lockfile (CI's drift audit will
   reject mismatches on the bump commit).
 - Run `cargo check --workspace --locked` to catch lockfile/compile breaks locally.
@@ -133,7 +134,10 @@ Outputs (nils-cli stage):
 - Pins workspace crate-to-crate `path` dependencies to the target version (and adds `version = "X.Y.Z"` when missing).
 - If manifests are already at target version, treats version bump as idempotent and continues.
 - Updates README release tag examples (unless `--skip-readme`).
-- Refreshes `Cargo.lock` via `cargo generate-lockfile` and validates via `cargo check --workspace --locked`. With `--full-checks`, additionally runs the full audit stack via `project-verify-required-checks.sh`.
+- Refreshes `Cargo.lock` via `cargo update --workspace`, preserving committed registry and
+  transitive dependency pins, and validates via `cargo check --workspace --locked`. With
+  `--full-checks`, additionally runs the full audit stack via
+  `project-verify-required-checks.sh`.
 - Automatically disables an incompatible `RUSTC_WRAPPER` (for example a broken `sccache` wrapper) before running release cargo commands.
 - Regenerates tracked third-party artifacts (`THIRD_PARTY_LICENSES.md`, `THIRD_PARTY_NOTICES.md`) so the bump commit matches CI's drift audit, then refreshes them again before commit.
 - Runs `project-verify-required-checks.sh` with `NILS_CLI_TEST_RUNNER=nextest` by default (only under `--full-checks`).
