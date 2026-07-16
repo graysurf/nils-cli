@@ -344,6 +344,14 @@ fn output_with_timeout(
     cmd: &mut Command,
     timeout: Option<Duration>,
 ) -> Result<std::process::Output, ProcessOutputError> {
+    output_with_limits(cmd, timeout, BACKEND_CAPTURE_LIMIT_BYTES)
+}
+
+pub(crate) fn output_with_limits(
+    cmd: &mut Command,
+    timeout: Option<Duration>,
+    capture_limit: usize,
+) -> Result<std::process::Output, ProcessOutputError> {
     let Some(timeout) = timeout.filter(|duration| !duration.is_zero()) else {
         return cmd.output().map_err(ProcessOutputError::Io);
     };
@@ -360,8 +368,13 @@ fn output_with_timeout(
         .take()
         .ok_or_else(|| ProcessOutputError::Io(io::Error::other("child stderr was not piped")))?;
     let (limit_tx, limit_rx) = mpsc::channel();
-    let stdout_reader = spawn_output_reader(stdout, OutputStream::Stdout, limit_tx.clone());
-    let stderr_reader = spawn_output_reader(stderr, OutputStream::Stderr, limit_tx);
+    let stdout_reader = spawn_output_reader(
+        stdout,
+        OutputStream::Stdout,
+        capture_limit,
+        limit_tx.clone(),
+    );
+    let stderr_reader = spawn_output_reader(stderr, OutputStream::Stderr, capture_limit, limit_tx);
     let started = Instant::now();
     loop {
         if let Ok(stream) = limit_rx.try_recv() {
@@ -371,7 +384,7 @@ fn output_with_timeout(
                 .map_err(ProcessOutputError::Io)?;
             return Err(ProcessOutputError::OutputLimit {
                 stream: collected.limit_exceeded.unwrap_or(stream),
-                limit: BACKEND_CAPTURE_LIMIT_BYTES,
+                limit: capture_limit,
                 output: collected.output,
             });
         }
@@ -381,7 +394,7 @@ fn output_with_timeout(
             if let Some(stream) = collected.limit_exceeded {
                 return Err(ProcessOutputError::OutputLimit {
                     stream,
-                    limit: BACKEND_CAPTURE_LIMIT_BYTES,
+                    limit: capture_limit,
                     output: collected.output,
                 });
             }
@@ -395,7 +408,7 @@ fn output_with_timeout(
             if let Some(stream) = collected.limit_exceeded {
                 return Err(ProcessOutputError::OutputLimit {
                     stream,
-                    limit: BACKEND_CAPTURE_LIMIT_BYTES,
+                    limit: capture_limit,
                     output: collected.output,
                 });
             }
@@ -411,6 +424,7 @@ fn output_with_timeout(
 fn spawn_output_reader<R>(
     mut reader: R,
     stream: OutputStream,
+    capture_limit: usize,
     limit_tx: mpsc::Sender<OutputStream>,
 ) -> JoinHandle<io::Result<CapturedStream>>
 where
@@ -427,7 +441,7 @@ where
                     limit_exceeded: false,
                 });
             }
-            let remaining = BACKEND_CAPTURE_LIMIT_BYTES.saturating_sub(output.len());
+            let remaining = capture_limit.saturating_sub(output.len());
             if read > remaining {
                 output.extend_from_slice(&chunk[..remaining]);
                 let _ = limit_tx.send(stream);
@@ -477,13 +491,13 @@ struct CollectedOutput {
 }
 
 #[derive(Debug, Clone, Copy)]
-enum OutputStream {
+pub(crate) enum OutputStream {
     Stdout,
     Stderr,
 }
 
 impl OutputStream {
-    fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::Stdout => "stdout",
             Self::Stderr => "stderr",
@@ -491,7 +505,7 @@ impl OutputStream {
     }
 }
 
-enum ProcessOutputError {
+pub(crate) enum ProcessOutputError {
     Io(io::Error),
     Timeout {
         timeout: Duration,
@@ -520,7 +534,7 @@ fn kill_child_group(child: &mut Child) {
     let _ = child.kill();
 }
 
-fn format_duration(duration: Duration) -> String {
+pub(crate) fn format_duration(duration: Duration) -> String {
     let millis = duration.as_millis();
     if millis < 1_000 {
         format!("{millis}ms")

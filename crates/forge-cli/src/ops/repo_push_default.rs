@@ -11,11 +11,14 @@ use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::path::Path;
 use std::process::Command;
+use std::time::Duration;
 
 use nils_common::cli_contract::{OutputFormat, schema_version_for};
 use serde::Serialize;
 
-use crate::backend::{BackendRunner, redact_and_tail};
+use crate::backend::{
+    BackendRunner, ProcessOutputError, format_duration, output_with_limits, redact_and_tail,
+};
 use crate::cli::{BINARY, GlobalFlags, RepoPushDefaultArgs};
 use crate::envelope::emit_success;
 use crate::error::ForgeError;
@@ -27,9 +30,15 @@ use crate::validations::no_local_path;
 const SCHEMA: &str = "repo.push-default";
 const SCHEMA_VERSION: u32 = 1;
 const MAX_REASON_BYTES: usize = 2_000;
+const DEFAULT_GIT_TIMEOUT: Duration = Duration::from_secs(120);
+const DEFAULT_GIT_CAPTURE_LIMIT_BYTES: usize = 8 * 1024 * 1024;
 
 /// Testing-only executable override for local Git subprocesses.
 pub const ENV_GIT_BIN: &str = "FORGE_CLI_GIT_BIN";
+/// Testing-only timeout override for local Git subprocesses.
+pub const ENV_GIT_TIMEOUT_MS: &str = "FORGE_CLI_GIT_TIMEOUT_MS";
+/// Testing-only capture-limit override for local Git subprocesses.
+pub const ENV_GIT_CAPTURE_LIMIT_BYTES: &str = "FORGE_CLI_GIT_CAPTURE_LIMIT_BYTES";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GitOutput {
@@ -51,18 +60,51 @@ impl GitRunner for ProcessGitRunner {
         let executable = std::env::var_os(ENV_GIT_BIN)
             .filter(|value| !value.is_empty())
             .unwrap_or_else(|| OsString::from("git"));
-        let output = Command::new(&executable)
-            .arg("-C")
-            .arg(workdir)
-            .args(args)
-            .output()
-            .map_err(|error| {
-                ForgeError::software(
+        let mut command = Command::new(&executable);
+        command.arg("-C").arg(workdir).args(args);
+        let timeout = configured_git_timeout();
+        let capture_limit = configured_git_capture_limit();
+        let output = match output_with_limits(&mut command, Some(timeout), capture_limit) {
+            Ok(output) => output,
+            Err(ProcessOutputError::Io(error)) => {
+                return Err(ForgeError::software(
                     schema_error(),
                     format!("failed to launch {}", executable.to_string_lossy()),
                     Some(error.to_string()),
-                )
-            })?;
+                ));
+            }
+            Err(ProcessOutputError::Timeout { timeout, output }) => {
+                let stderr = redact_and_tail(&String::from_utf8_lossy(&output.stderr));
+                return Err(ForgeError::unavailable(
+                    schema_error(),
+                    "git_timeout",
+                    format!(
+                        "{} timed out after {}",
+                        executable.to_string_lossy(),
+                        format_duration(timeout)
+                    ),
+                    (!stderr.is_empty()).then_some(stderr),
+                ));
+            }
+            Err(ProcessOutputError::OutputLimit {
+                stream,
+                limit,
+                output,
+            }) => {
+                let stderr = redact_and_tail(&String::from_utf8_lossy(&output.stderr));
+                return Err(ForgeError::unavailable(
+                    schema_error(),
+                    "git_output_limit",
+                    format!(
+                        "{} {} exceeded the {}-byte capture limit",
+                        executable.to_string_lossy(),
+                        stream.as_str(),
+                        limit
+                    ),
+                    (!stderr.is_empty()).then_some(stderr),
+                ));
+            }
+        };
         Ok(GitOutput {
             success: output.status.success(),
             exit_code: output.status.code().unwrap_or(-1),
@@ -70,6 +112,23 @@ impl GitRunner for ProcessGitRunner {
             stderr: redact_and_tail(&String::from_utf8_lossy(&output.stderr)),
         })
     }
+}
+
+fn configured_git_timeout() -> Duration {
+    std::env::var(ENV_GIT_TIMEOUT_MS)
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .map(Duration::from_millis)
+        .unwrap_or(DEFAULT_GIT_TIMEOUT)
+}
+
+fn configured_git_capture_limit() -> usize {
+    std::env::var(ENV_GIT_CAPTURE_LIMIT_BYTES)
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_GIT_CAPTURE_LIMIT_BYTES)
 }
 
 /// Receipt emitted after validation and optional delivery.
@@ -156,6 +215,17 @@ pub fn run_with<R: BackendRunner, G: GitRunner>(
             None,
         )
     })?;
+    if let Some(explicit_repo) = global.repo.as_deref()
+        && !explicit_repo.eq_ignore_ascii_case(&remote_slug)
+    {
+        return Err(validation(
+            "repository_mismatch",
+            format!(
+                "explicit repository '{explicit_repo}' does not match push destination '{remote_slug}'"
+            ),
+            None,
+        ));
+    }
     let mut metadata_ctx = ctx.clone();
     metadata_ctx.repo = Some(metadata_repo_locator(ctx.provider, &ctx.host, &remote_slug));
     let repo = repo_view::compute(backend, &metadata_ctx)?;
@@ -629,6 +699,13 @@ fn ls_remote_head<G: GitRunner>(
         workdir,
         &os_args(&["ls-remote", "--exit-code", "--", destination, default_ref]),
     )?;
+    if !output.success && output.exit_code == 2 && output.stdout.trim().is_empty() {
+        return Err(validation(
+            "remote_default_branch_missing",
+            format!("remote '{remote_label}' does not expose {default_ref}"),
+            None,
+        ));
+    }
     if !output.success {
         return Err(ForgeError::unavailable(
             schema_error(),

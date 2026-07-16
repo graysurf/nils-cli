@@ -4,6 +4,7 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::{Duration, Instant};
 
 use pretty_assertions::assert_eq;
 
@@ -45,6 +46,10 @@ struct GitScenario<'a> {
     symbolic_ref_exit: i32,
     ancestry_exit: i32,
     push_exit: i32,
+    push_sleep: bool,
+    remote_output_bytes: usize,
+    timeout_ms: Option<&'a str>,
+    capture_limit_bytes: Option<&'a str>,
 }
 
 impl Default for GitScenario<'static> {
@@ -61,6 +66,10 @@ impl Default for GitScenario<'static> {
             symbolic_ref_exit: 0,
             ancestry_exit: 0,
             push_exit: 0,
+            push_sleep: false,
+            remote_output_bytes: 0,
+            timeout_ms: None,
+            capture_limit_bytes: None,
         }
     }
 }
@@ -87,7 +96,11 @@ while [ "$1" = "-c" ]; do
 done
 case "$1" in
   remote)
-    printf '%s' '{push_urls}'
+    if [ '{remote_output_bytes}' -gt 0 ]; then
+      head -c '{remote_output_bytes}' /dev/zero | tr '\000' x
+    else
+      printf '%s' '{push_urls}'
+    fi
     ;;
   check-ref-format)
     exit 0
@@ -135,6 +148,12 @@ case "$1" in
     printf '%s\n' '{signature}'
     ;;
   push)
+    if [ '{push_sleep}' = true ]; then
+      sleep 30 &
+      child_pid=$!
+      printf '%s\n' "$child_pid" > "$GIT_CHILD_PID_FILE"
+      wait "$child_pid"
+    fi
     if [ '{push_exit}' -ne 0 ]; then
       printf '%s\n' 'rejected: non-fast-forward' >&2
       exit '{push_exit}'
@@ -162,6 +181,8 @@ esac
         symbolic_ref_exit = scenario.symbolic_ref_exit,
         ancestry_exit = scenario.ancestry_exit,
         push_exit = scenario.push_exit,
+        push_sleep = scenario.push_sleep,
+        remote_output_bytes = scenario.remote_output_bytes,
     )
 }
 
@@ -182,27 +203,46 @@ fn run_with_options(
     provider: &str,
     head: &str,
 ) -> (StubEnv, super::support::CmdOutput) {
+    run_with_repo_options(scenario, dry_run, provider, head, "sympoies/demo")
+}
+
+fn run_with_repo_options(
+    scenario: GitScenario<'_>,
+    dry_run: bool,
+    provider: &str,
+    head: &str,
+    repository: &str,
+) -> (StubEnv, super::support::CmdOutput) {
     let stub = match provider {
         "github" => StubEnv::new().gh_stub(&gh_stub()),
         "gitlab" => StubEnv::new().glab_stub(&glab_stub()),
+        "local" => StubEnv::new(),
         other => panic!("unsupported test provider: {other}"),
     };
     let reason = stub.tempdir.path().join("reason.md");
     let state = stub.tempdir.path().join("pushed");
     let log = stub.tempdir.path().join("git.log");
+    let child_pid = stub.tempdir.path().join("git-child.pid");
     fs::write(
         &reason,
         "User explicitly requested direct commit and push to main for this hotfix.",
     )
     .expect("reason");
     let git_body = git_stub(&state.to_string_lossy(), &log.to_string_lossy(), scenario);
+    let mut stub = stub.env("GIT_CHILD_PID_FILE", child_pid.to_string_lossy());
+    if let Some(timeout_ms) = scenario.timeout_ms {
+        stub = stub.env("FORGE_CLI_GIT_TIMEOUT_MS", timeout_ms);
+    }
+    if let Some(capture_limit_bytes) = scenario.capture_limit_bytes {
+        stub = stub.env("FORGE_CLI_GIT_CAPTURE_LIMIT_BYTES", capture_limit_bytes);
+    }
     let stub = stub.git_stub(&git_body);
     let reason = reason.to_string_lossy().into_owned();
     let mut args = vec![
         "--provider",
         provider,
         "--repo",
-        "sympoies/demo",
+        repository,
         "--format",
         "json",
         "repo",
@@ -549,6 +589,22 @@ fn push_default_exact_lease_rejects_real_remote_rewind_race() {
 }
 
 #[test]
+fn push_default_real_missing_remote_ref_has_typed_data_error() {
+    let scenario = setup_real_git(RealGitRace::None, false);
+    git_output(&[
+        "--git-dir",
+        scenario.remote.to_str().expect("remote"),
+        "update-ref",
+        "-d",
+        "refs/heads/main",
+    ]);
+    let out = run_real_git(&scenario);
+    assert_eq!(out.code, 65, "stdout={} stderr={}", out.stdout, out.stderr);
+    let envelope = parse_envelope(&out.stdout);
+    assert_eq!(envelope["error"]["code"], "remote_default_branch_missing");
+}
+
+#[test]
 fn push_default_disables_inherited_real_git_push_expansion() {
     let scenario = setup_real_git(RealGitRace::None, true);
     let out = run_real_git(&scenario);
@@ -590,6 +646,58 @@ fn push_default_disables_inherited_real_git_push_expansion() {
 }
 
 #[test]
+fn push_default_bounds_stalled_git_push_and_kills_its_process_group() {
+    let started = Instant::now();
+    let (stub, out) = run(GitScenario {
+        push_sleep: true,
+        timeout_ms: Some("75"),
+        ..GitScenario::default()
+    });
+    assert_eq!(out.code, 69, "stdout={} stderr={}", out.stdout, out.stderr);
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "bounded Git call took {:?}",
+        started.elapsed()
+    );
+    let envelope = parse_envelope(&out.stdout);
+    assert_eq!(envelope["error"]["code"], "git_timeout");
+    let log = fs::read_to_string(stub.tempdir.path().join("git.log")).expect("git log");
+    assert_eq!(
+        log.lines()
+            .filter(|line| line.contains("push --porcelain"))
+            .count(),
+        1,
+        "timed-out push must not retry"
+    );
+    assert!(!stub.tempdir.path().join("pushed").exists());
+    let child_pid = fs::read_to_string(stub.tempdir.path().join("git-child.pid"))
+        .expect("child pid")
+        .trim()
+        .to_string();
+    std::thread::sleep(Duration::from_millis(25));
+    let alive = Command::new("kill")
+        .args(["-0", &child_pid])
+        .output()
+        .expect("probe child");
+    assert!(
+        !alive.status.success(),
+        "timed-out Git descendant {child_pid} survived process-group cleanup"
+    );
+}
+
+#[test]
+fn push_default_bounds_git_output_before_parsing_it() {
+    let (_stub, out) = run(GitScenario {
+        remote_output_bytes: 2_048,
+        capture_limit_bytes: Some("1024"),
+        ..GitScenario::default()
+    });
+    assert_eq!(out.code, 69, "stdout={} stderr={}", out.stdout, out.stderr);
+    let envelope = parse_envelope(&out.stdout);
+    assert_eq!(envelope["error"]["code"], "git_output_limit");
+}
+
+#[test]
 fn push_default_rejects_cross_provider_destination_before_push() {
     let (stub, out) = run_with_options(GitScenario::default(), false, "gitlab", "HEAD");
     assert_eq!(out.code, 65, "stdout={} stderr={}", out.stdout, out.stderr);
@@ -598,6 +706,31 @@ fn push_default_rejects_cross_provider_destination_before_push() {
     let log = fs::read_to_string(stub.tempdir.path().join("git.log")).expect("git log");
     assert!(!log.lines().any(|line| line.contains("push --porcelain")));
     assert!(!stub.tempdir.path().join("pushed").exists());
+}
+
+#[test]
+fn push_default_rejects_mismatched_explicit_repository_before_provider_lookup() {
+    let (stub, out) = run_with_repo_options(
+        GitScenario::default(),
+        true,
+        "github",
+        "HEAD",
+        "sympoies/other",
+    );
+    assert_eq!(out.code, 65, "stdout={} stderr={}", out.stdout, out.stderr);
+    let envelope = parse_envelope(&out.stdout);
+    assert_eq!(envelope["error"]["code"], "repository_mismatch");
+    let log = fs::read_to_string(stub.tempdir.path().join("git.log")).expect("git log");
+    assert!(!log.lines().any(|line| line.contains("ls-remote")));
+    assert!(!log.lines().any(|line| line.contains("push --porcelain")));
+}
+
+#[test]
+fn push_default_local_provider_is_usage_error() {
+    let (_stub, out) = run_with_options(GitScenario::default(), true, "local", "HEAD");
+    assert_eq!(out.code, 64, "stdout={} stderr={}", out.stdout, out.stderr);
+    let envelope = parse_envelope(&out.stdout);
+    assert_eq!(envelope["error"]["code"], "provider_unsupported");
 }
 
 #[test]
@@ -845,6 +978,8 @@ fn push_default_error_catalog_covers_the_runtime_contract() {
         "expected_base_mismatch",
         "expected_base_missing",
         "expected_base_not_ancestor",
+        "git_output_limit",
+        "git_timeout",
         "head_not_checked_out",
         "local_path_present",
         "object_id_invalid",
@@ -865,4 +1000,8 @@ fn push_default_error_catalog_covers_the_runtime_contract() {
             "missing {kind} from direct-delivery catalog"
         );
     }
+    assert!(
+        block.contains("exit: DATA | RUNTIME | UNAVAILABLE | SOFTWARE | USAGE"),
+        "direct-delivery exit catalog must include every emitted exit class"
+    );
 }

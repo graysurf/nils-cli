@@ -378,6 +378,10 @@ backend mapping, validation rules, and output schema versions.
   returned as `default_push_rejected`.
 - Destination pinning: the expected-base read, push, and post-push read-back all
   use the same validated URL rather than re-resolving the remote name.
+- Resource bounds: every Git subprocess has a 120-second timeout and an 8 MiB
+  per-stream capture limit. Timeout or output-limit failure kills the complete
+  child process group and returns `git_timeout` or `git_output_limit`
+  without retrying a push.
 - Read-back: exact `git ls-remote` after the push must equal the delivered SHA;
   otherwise the op fails closed with `default_push_verification_failed` and
   tells the caller to inspect the already-mutated remote.
@@ -393,9 +397,10 @@ backend mapping, validation rules, and output schema versions.
   `direct_commit_count_invalid`, `commit_signature_unverified`,
   `reason_file_unreadable`, `reason_invalid`, `local_path_present`,
   `object_id_invalid`, `remote_default_lookup_failed`,
-  `remote_default_branch_missing`, `default_push_rejected`,
-  `default_push_verification_failed`, and `software_error`. Callers must
-  preserve their declared DATA, RUNTIME, UNAVAILABLE, or SOFTWARE exit class.
+  `remote_default_branch_missing`, `git_timeout`, `git_output_limit`,
+  `default_push_rejected`, `default_push_verification_failed`, and
+  `software_error`. Callers must preserve their declared DATA, RUNTIME,
+  UNAVAILABLE, SOFTWARE, or USAGE exit class.
 
 ### `pr wait-checks`
 
@@ -867,53 +872,55 @@ backend implementations cannot diverge.
 
 Violations map to `DATA 65` with one of these `data.error.kind` values:
 
-| `error.kind`                          | Triggered by rule |
-| ------------------------------------- | ----------------- |
-| `branch_name_invalid`                 | 1                 |
-| `branch_kind_mismatch`                | 1                 |
-| `body_missing_summary`                | 2                 |
-| `body_missing_test_plan`              | 2                 |
-| `title_too_long`                      | 3                 |
-| `dirty_worktree`                      | 4                 |
-| `head_not_pushed`                     | 5                 |
-| `default_branch_protected`            | 6                 |
-| `push_destination_missing`            | 6                 |
-| `push_destination_ambiguous`          | 6                 |
-| `push_destination_credentials_unsupported` | 6            |
-| `provider_mismatch`                   | 6                 |
-| `provider_unsupported`                | 6                 |
-| `repository_mismatch`                 | 6                 |
-| `detached_head`                       | 6                 |
-| `default_branch_checkout`             | 6                 |
-| `head_not_checked_out`                | 6                 |
-| `expected_base_mismatch`              | 6                 |
-| `expected_base_missing`               | 6                 |
-| `expected_base_not_ancestor`          | 6                 |
-| `direct_commit_count_invalid`          | 6                 |
-| `commit_signature_unverified`          | 6                 |
-| `reason_file_unreadable`               | 6                 |
-| `reason_invalid`                       | 6                 |
-| `object_id_invalid`                    | 6                 |
-| `remote_default_lookup_failed`         | 6 (`UNAVAILABLE 69`) |
-| `remote_default_branch_missing`        | 6                 |
-| `default_push_rejected`                | 6 (`RUNTIME 1`) |
-| `default_push_verification_failed`     | 6 (`RUNTIME 1`) |
-| `software_error`                       | 6 (`SOFTWARE 70`) |
-| `draft_merge_refused`                 | 7                 |
-| `checks_pending`                      | 8                 |
-| `checks_failed`                       | 8 (`RUNTIME 1`)   |
-| `merge_method_unsupported`            | 9                 |
-| `keep_branch_conflict`                | 10                |
-| `local_path_present`                  | 11                |
-| `review_changes_requested`            | 12                |
-| `review_convergence_head_missing`     | 12                |
-| `review_convergence_head_changed`     | 12                |
-| `review_convergence_activity_changed` | 12                |
-| `review_snapshot_incomplete`          | 12                |
-| `invalid_review_convergence_config`   | 12                |
-| `unresolved_review_threads`           | 13                |
-| `unchecked_task_items`                | 14                |
-| `review_thread_pr_mismatch`           | 15                |
+| `error.kind`                               | Triggered by rule    |
+| ------------------------------------------ | -------------------- |
+| `branch_name_invalid`                      | 1                    |
+| `branch_kind_mismatch`                     | 1                    |
+| `body_missing_summary`                     | 2                    |
+| `body_missing_test_plan`                   | 2                    |
+| `title_too_long`                           | 3                    |
+| `dirty_worktree`                           | 4                    |
+| `head_not_pushed`                          | 5                    |
+| `default_branch_protected`                 | 6                    |
+| `push_destination_missing`                 | 6                    |
+| `push_destination_ambiguous`               | 6                    |
+| `push_destination_credentials_unsupported` | 6                    |
+| `provider_mismatch`                        | 6                    |
+| `provider_unsupported`                     | 6 (`USAGE 64`)       |
+| `repository_mismatch`                      | 6                    |
+| `detached_head`                            | 6                    |
+| `default_branch_checkout`                  | 6                    |
+| `head_not_checked_out`                     | 6                    |
+| `expected_base_mismatch`                   | 6                    |
+| `expected_base_missing`                    | 6                    |
+| `expected_base_not_ancestor`               | 6                    |
+| `direct_commit_count_invalid`              | 6                    |
+| `commit_signature_unverified`              | 6                    |
+| `reason_file_unreadable`                   | 6                    |
+| `reason_invalid`                           | 6                    |
+| `object_id_invalid`                        | 6                    |
+| `remote_default_lookup_failed`             | 6 (`UNAVAILABLE 69`) |
+| `remote_default_branch_missing`            | 6                    |
+| `git_timeout`                              | 6 (`UNAVAILABLE 69`) |
+| `git_output_limit`                         | 6 (`UNAVAILABLE 69`) |
+| `default_push_rejected`                    | 6 (`RUNTIME 1`)      |
+| `default_push_verification_failed`         | 6 (`RUNTIME 1`)      |
+| `software_error`                           | 6 (`SOFTWARE 70`)    |
+| `draft_merge_refused`                      | 7                    |
+| `checks_pending`                           | 8                    |
+| `checks_failed`                            | 8 (`RUNTIME 1`)      |
+| `merge_method_unsupported`                 | 9                    |
+| `keep_branch_conflict`                     | 10                   |
+| `local_path_present`                       | 11                   |
+| `review_changes_requested`                 | 12                   |
+| `review_convergence_head_missing`          | 12                   |
+| `review_convergence_head_changed`          | 12                   |
+| `review_convergence_activity_changed`      | 12                   |
+| `review_snapshot_incomplete`               | 12                   |
+| `invalid_review_convergence_config`        | 12                   |
+| `unresolved_review_threads`                | 13                   |
+| `unchecked_task_items`                     | 14                   |
+| `review_thread_pr_mismatch`                | 15                   |
 
 ## Activity output contract
 
