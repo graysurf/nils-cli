@@ -760,8 +760,25 @@ fn doctor_parses_the_pinned_permissions_and_bridge_schemas_fail_closed() {
     assert_eq!(ready.code, 0, "{}", ready.stderr_text());
     assert_eq!(ready.stdout_json()["result"]["ready"], true);
 
+    let stable_app_ready = run_backend_probe_mode(
+        &harness,
+        cwd.path(),
+        &backend_root,
+        &candidate,
+        &["--format", "json", "doctor", "--strict"],
+        "stable_app_ready_default_stale",
+    );
+    assert_eq!(
+        stable_app_ready.code,
+        0,
+        "{}",
+        stable_app_ready.stderr_text()
+    );
+    assert_eq!(stable_app_ready.stdout_json()["result"]["ready"], true);
+
     for mode in [
         "permission_denied",
+        "stable_app_permission_denied_default_ready",
         "bridge_failed",
         "bridge_missing_build",
         "bridge_stale_build",
@@ -788,6 +805,38 @@ fn doctor_parses_the_pinned_permissions_and_bridge_schemas_fail_closed() {
     );
     assert_eq!(report_only.code, 0, "{}", report_only.stderr_text());
     assert_eq!(report_only.stdout_json()["result"]["ready"], false);
+
+    let runtime_trace = cwd.path().join("doctor-runtime-actions.log");
+    for (args, expected_code) in [
+        (&["--format", "json", "doctor", "--strict"][..], 77),
+        (&["--format", "json", "doctor"][..], 0),
+    ] {
+        let unavailable = run_backend_probe_mode_with_runtime_trace(
+            &harness,
+            cwd.path(),
+            &backend_root,
+            &candidate,
+            args,
+            "bridge_failed",
+            &runtime_trace,
+        );
+        assert_eq!(
+            unavailable.code,
+            expected_code,
+            "{}",
+            unavailable.stderr_text()
+        );
+        assert_eq!(
+            unavailable.stdout_json()["result"]["ready"],
+            false,
+            "{}",
+            unavailable.stderr_text()
+        );
+        assert!(
+            !runtime_trace.exists(),
+            "doctor attempted runtime preparation or launch"
+        );
+    }
 }
 
 #[test]
@@ -1222,10 +1271,22 @@ if [ "$1" = "--version" ]; then
   exit 0
 fi
 mode="${{NILS_MACOS_AGENT_TEST_PROBE_MODE:-real_ready}}"
+bridge_socket=''
+previous=''
+for argument in "$@"; do
+  [ "$previous" = --bridge-socket ] && bridge_socket=$argument
+  previous=$argument
+done
+stable_app_socket=false
+case "$bridge_socket" in
+  *"/Library/Application Support/Peekaboo/bridge.sock") stable_app_socket=true ;;
+esac
 case " $* " in
   *" permissions status "*)
     [ "$mode" = malformed_probe ] && echo 'not-json' && exit 0
-    if [ "$mode" = permission_denied ]; then
+    if [ "$mode" = permission_denied ] ||
+       {{ [ "$mode" = stable_app_ready_default_stale ] && [ "$stable_app_socket" = false ]; }} ||
+       {{ [ "$mode" = stable_app_permission_denied_default_ready ] && [ "$stable_app_socket" = true ]; }}; then
       cat <<'JSON'
 {{
   "success": true,
@@ -1245,18 +1306,16 @@ JSON
     fi
     ;;
   *" bridge status "*)
-    bridge_socket=''
-    previous=''
-    for argument in "$@"; do
-      [ "$previous" = --bridge-socket ] && bridge_socket=$argument
-      previous=$argument
-    done
-    if [ -n "$bridge_socket" ]; then
+    case "$bridge_socket" in
+      *"/Library/Application Support/Peekaboo/bridge.sock") ;;
+      '') ;;
+      *)
       cat <<'JSON'
 {{"success":true,"data":{{"selected":{{"source":"remote","handshake":{{"hostKind":"onDemand","build":"{version} ({version})"}}}}}}}}
 JSON
       exit 0
-    fi
+      ;;
+    esac
     [ "$mode" = malformed_probe ] && echo 'not-json' && exit 0
     if [ "$mode" = bridge_failed ]; then
       cat <<'JSON'
@@ -1266,7 +1325,7 @@ JSON
       cat <<'JSON'
 {{"success":true,"data":{{"remoteSkipped":false,"selected":{{"source":"remote","socketPath":"/private/bridge.sock","handshake":{{"hostKind":"gui"}}}}}}}}
 JSON
-    elif [ "$mode" = bridge_stale_build ]; then
+    elif [ "$mode" = bridge_stale_build ] || {{ [ "$mode" = stable_app_ready_default_stale ] && [ -z "$bridge_socket" ]; }}; then
       cat <<'JSON'
 {{"success":true,"data":{{"remoteSkipped":false,"selected":{{"source":"remote","socketPath":"/private/bridge.sock","handshake":{{"hostKind":"gui","build":"{version} (stale)"}}}}}}}}
 JSON
@@ -1455,6 +1514,41 @@ fn run_backend_probe_mode(
             candidate.tools.to_str().expect("tools"),
         )
         .with_env("NILS_MACOS_AGENT_TEST_PROBE_MODE", mode);
+    harness.run_with_options(cwd, args, options)
+}
+
+fn run_backend_probe_mode_with_runtime_trace(
+    harness: &common::MacosAgentHarness,
+    cwd: &Path,
+    backend_root: &Path,
+    candidate: &Candidate,
+    args: &[&str],
+    mode: &str,
+    runtime_trace: &Path,
+) -> nils_test_support::cmd::CmdOutput {
+    let options = harness
+        .cmd_options(cwd)
+        .with_env(
+            "NILS_MACOS_AGENT_BACKEND_ROOT",
+            backend_root.to_str().expect("backend root"),
+        )
+        .with_env(
+            "NILS_MACOS_AGENT_TEST_ASSET_DIR",
+            candidate.assets.to_str().expect("assets"),
+        )
+        .with_env(
+            "NILS_MACOS_AGENT_LOCK_PATH",
+            candidate.lock.to_str().expect("lock"),
+        )
+        .with_env(
+            "NILS_MACOS_AGENT_TEST_TOOL_DIR",
+            candidate.tools.to_str().expect("tools"),
+        )
+        .with_env("NILS_MACOS_AGENT_TEST_PROBE_MODE", mode)
+        .with_env(
+            "NILS_MACOS_AGENT_TEST_RUNTIME_ACTION_TRACE",
+            runtime_trace.to_str().expect("runtime trace"),
+        );
     harness.run_with_options(cwd, args, options)
 }
 

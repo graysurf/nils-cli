@@ -701,9 +701,15 @@ pub fn doctor(strict: bool) -> Result<DoctorReport, CliError> {
     let mut permissions = None;
     let mut bridge = None;
     let mut capabilities = Vec::new();
+    let stable_app_socket = crate::commands::stable_app_socket();
     for probe in &lock.required_capability_probes {
-        let arguments = probe.argv.iter().map(String::as_str).collect::<Vec<_>>();
-        let output = run_tool(&binary, &arguments);
+        let mut arguments = probe.argv.clone();
+        if matches!(probe.id.as_str(), "permissions" | "bridge") {
+            arguments.push("--bridge-socket".into());
+            arguments.push(stable_app_socket.to_string_lossy().into_owned());
+        }
+        let argument_refs = arguments.iter().map(String::as_str).collect::<Vec<_>>();
+        let output = run_tool(&binary, &argument_refs);
         let (status, message) =
             evaluate_capability_probe(&probe.id, output, &receipt.tag, &app_asset.bridge_build);
         let check = CheckResult {

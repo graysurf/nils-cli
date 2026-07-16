@@ -44,7 +44,7 @@ impl RuntimeBinding {
 
     fn for_mode(runtime: RuntimeMode, identity: &str) -> Self {
         let socket = match runtime {
-            RuntimeMode::App => Some(runtime_socket_dir().join("bridge.sock")),
+            RuntimeMode::App => Some(stable_app_socket()),
             RuntimeMode::Daemon => {
                 Some(runtime_socket_dir().join(format!("daemon-{identity}.sock")))
             }
@@ -97,6 +97,7 @@ pub fn prepare_runtime(
     binary: &VerifiedBackend,
 ) -> Result<RuntimeBinding, CliError> {
     if test_mode::enabled() {
+        record_test_runtime_action("prepare-runtime")?;
         return Ok(RuntimeBinding::for_mode(runtime, binary.runtime_identity()));
     }
     if runtime == RuntimeMode::Process {
@@ -105,7 +106,7 @@ pub fn prepare_runtime(
     let paths = BackendPaths::resolve()?;
     let socket_dir = runtime_socket_dir();
     retire_obsolete_daemons_at(binary.path(), &socket_dir, binary.obsolete_runtimes())?;
-    let app_socket = socket_dir.join("bridge.sock");
+    let app_socket = stable_app_socket();
     match runtime {
         RuntimeMode::App => {
             if !paths.stable_app().is_dir() {
@@ -172,6 +173,7 @@ pub fn prepare_runtime(
 }
 
 fn launch_stable_app(paths: &BackendPaths) -> Result<(), CliError> {
+    record_test_runtime_action("launch-stable-app")?;
     let args = vec![
         "-g".into(),
         "-n".into(),
@@ -209,6 +211,7 @@ fn start_daemon(
         }
         BridgeProbe::Unavailable => {}
     }
+    record_test_runtime_action("start-daemon")?;
     let args = vec![
         "daemon".into(),
         "start".into(),
@@ -368,6 +371,17 @@ pub(crate) fn runtime_socket_dir() -> PathBuf {
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("~"));
     home.join("Library/Application Support/Peekaboo")
+}
+
+pub(crate) fn stable_app_socket() -> PathBuf {
+    runtime_socket_dir().join("bridge.sock")
+}
+
+fn record_test_runtime_action(action: &str) -> Result<(), CliError> {
+    test_mode::record_runtime_action(action).map_err(|_| {
+        CliError::backend("failed to record a test runtime action")
+            .with_operation("runtime.test-trace")
+    })
 }
 
 pub fn hardened_env(profile: Option<ToolProfile>) -> (Vec<(String, String)>, Vec<&'static str>) {
