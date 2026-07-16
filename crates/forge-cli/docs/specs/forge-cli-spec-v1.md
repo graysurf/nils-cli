@@ -363,8 +363,9 @@ backend mapping, validation rules, and output schema versions.
   - HTTP(S) push URLs containing userinfo are rejected; callers use credential
     helpers rather than embedding credential material in a subprocess argument;
   - after the push URL is expanded once, no effective `url.*.insteadOf` or
-    `url.*.pushInsteadOf` rule may match it again; this prevents Git from
-    retargeting the mutation independently of base/read-back operations;
+    `url.*.pushInsteadOf` rule may match it again; empty rewrite prefixes are
+    universal matches and are rejected. This prevents Git from retargeting the
+    mutation independently of base/read-back operations;
   - the worktree is clean and checked out on a non-default branch;
   - the remote default branch still equals `--expected-base`;
   - `HEAD` is exactly one commit ahead of that base and the base is its

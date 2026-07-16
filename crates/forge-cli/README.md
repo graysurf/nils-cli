@@ -37,7 +37,8 @@ uses an exact-old-object lease as a compare-and-swap; and verifies the remote
 SHA afterward. The selected remote must expose exactly one push URL, and that
 actual destination must match the provider repository; all remote reads and the
 push are pinned to that URL. HTTP(S) userinfo and any second-stage Git URL
-rewrite are rejected. Release builds fix the Git executable, timeout, and
+rewrite are rejected, including empty rewrite prefixes that match every URL.
+Release builds fix the Git executable, timeout, and
 capture cap; provider metadata and every Git subprocess are bounded. The
 command exposes no caller-controlled force mode. Callers remain responsible for
 obtaining explicit user authorization and recording it in a regular

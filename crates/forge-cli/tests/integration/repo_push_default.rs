@@ -429,7 +429,8 @@ if [[ " $* " == *" push --porcelain "* ]]; then
       ;;
   esac
 fi
-if [[ "${WRAPPER_REWRITE_URL:-true}" == true ]]; then
+if [[ "${WRAPPER_REWRITE_URL:-true}" == true ]] ||
+   [[ "${WRAPPER_REWRITE_URL:-true}" == non-push && " $* " != *" push --porcelain "* ]]; then
   for i in "${!args[@]}"; do
     if [[ "${args[$i]}" == "https://github.com/sympoies/demo.git" ]]; then
       args[$i]="$REAL_REMOTE"
@@ -697,6 +698,58 @@ fn push_default_rejects_second_stage_url_rewrite_before_alternate_push() {
         .stub
         .envs
         .push(("WRAPPER_REWRITE_URL".to_string(), "false".to_string()));
+
+    let out = run_real_git(&scenario);
+    assert_eq!(out.code, 65, "stdout={} stderr={}", out.stdout, out.stderr);
+    let envelope = parse_envelope(&out.stdout);
+    assert_eq!(
+        envelope["error"]["code"],
+        "push_destination_rewrite_ambiguous"
+    );
+    let alternate_head = git_output(&[
+        "--git-dir",
+        alternate.to_str().expect("alternate"),
+        "rev-parse",
+        "refs/heads/main",
+    ]);
+    assert_eq!(alternate_head, scenario.base);
+}
+
+#[test]
+fn push_default_rejects_empty_push_instead_of_before_alternate_push() {
+    let mut scenario = setup_real_git(RealGitRace::None, false);
+    let alternate_root = scenario.stub.tempdir.path().join("alternate-root");
+    let alternate = alternate_root.join("https:/github.com/sympoies/demo.git");
+    fs::create_dir_all(alternate.parent().expect("alternate parent"))
+        .expect("create alternate parent");
+    git_output(&["init", "--bare", alternate.to_str().expect("alternate")]);
+    git_output(&[
+        "-C",
+        scenario.worktree.to_str().expect("worktree"),
+        "push",
+        alternate.to_str().expect("alternate"),
+        &format!("{}:refs/heads/main", scenario.base),
+    ]);
+    git_output(&[
+        "-C",
+        scenario.worktree.to_str().expect("worktree"),
+        "remote",
+        "set-url",
+        "--push",
+        "origin",
+        "https://github.com/sympoies/demo.git",
+    ]);
+    git_output(&[
+        "-C",
+        scenario.worktree.to_str().expect("worktree"),
+        "config",
+        &format!("url.file://{}/.pushInsteadOf", alternate_root.display()),
+        "",
+    ]);
+    scenario
+        .stub
+        .envs
+        .push(("WRAPPER_REWRITE_URL".to_string(), "non-push".to_string()));
 
     let out = run_real_git(&scenario);
     assert_eq!(out.code, 65, "stdout={} stderr={}", out.stdout, out.stderr);

@@ -610,7 +610,7 @@ fn reject_second_stage_url_rewrites<G: GitRunner>(
                 None,
             ));
         };
-        if !value.is_empty() && destination.starts_with(value) {
+        if destination.starts_with(value) {
             return Err(validation(
                 "push_destination_rewrite_ambiguous",
                 "the validated push URL would be rewritten again by Git configuration",
