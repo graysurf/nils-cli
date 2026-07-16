@@ -54,7 +54,10 @@ changes TCC permissions.
 
 `doctor` without `--strict` is report-only and exits successfully with
 `ready=false` when the environment is not ready. `doctor --strict` exits 77 for
-the same failed permission, Bridge, runtime, or capability checks.
+the same failed permission, Bridge, runtime, or capability checks. Its Bridge
+probe targets the stable app socket at
+`~/Library/Application Support/Peekaboo/bridge.sock` directly, so an unrelated
+default-selected daemon cannot satisfy or block stable-app readiness.
 
 ## Execute Peekaboo
 

@@ -760,6 +760,22 @@ fn doctor_parses_the_pinned_permissions_and_bridge_schemas_fail_closed() {
     assert_eq!(ready.code, 0, "{}", ready.stderr_text());
     assert_eq!(ready.stdout_json()["result"]["ready"], true);
 
+    let stable_app_ready = run_backend_probe_mode(
+        &harness,
+        cwd.path(),
+        &backend_root,
+        &candidate,
+        &["--format", "json", "doctor", "--strict"],
+        "stable_app_ready_default_stale",
+    );
+    assert_eq!(
+        stable_app_ready.code,
+        0,
+        "{}",
+        stable_app_ready.stderr_text()
+    );
+    assert_eq!(stable_app_ready.stdout_json()["result"]["ready"], true);
+
     for mode in [
         "permission_denied",
         "bridge_failed",
@@ -1251,12 +1267,16 @@ JSON
       [ "$previous" = --bridge-socket ] && bridge_socket=$argument
       previous=$argument
     done
-    if [ -n "$bridge_socket" ]; then
+    case "$bridge_socket" in
+      *"/Library/Application Support/Peekaboo/bridge.sock") ;;
+      '') ;;
+      *)
       cat <<'JSON'
 {{"success":true,"data":{{"selected":{{"source":"remote","handshake":{{"hostKind":"onDemand","build":"{version} ({version})"}}}}}}}}
 JSON
       exit 0
-    fi
+      ;;
+    esac
     [ "$mode" = malformed_probe ] && echo 'not-json' && exit 0
     if [ "$mode" = bridge_failed ]; then
       cat <<'JSON'
@@ -1266,7 +1286,7 @@ JSON
       cat <<'JSON'
 {{"success":true,"data":{{"remoteSkipped":false,"selected":{{"source":"remote","socketPath":"/private/bridge.sock","handshake":{{"hostKind":"gui"}}}}}}}}
 JSON
-    elif [ "$mode" = bridge_stale_build ]; then
+    elif [ "$mode" = bridge_stale_build ] || {{ [ "$mode" = stable_app_ready_default_stale ] && [ -z "$bridge_socket" ]; }}; then
       cat <<'JSON'
 {{"success":true,"data":{{"remoteSkipped":false,"selected":{{"source":"remote","socketPath":"/private/bridge.sock","handshake":{{"hostKind":"gui","build":"{version} (stale)"}}}}}}}}
 JSON
