@@ -238,7 +238,7 @@ PY
 )"
 (
   cd "$producer_repo"
-  CARGO_NET_OFFLINE=true bash \
+  bash \
     .agents/skills/project-bump-version-tag-release/scripts/project-bump-version-tag-release.sh \
     --version "$producer_version" \
     --prepare-only
