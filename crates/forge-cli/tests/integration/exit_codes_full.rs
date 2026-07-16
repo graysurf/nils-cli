@@ -98,6 +98,7 @@ const LOCKDOWN_DATA_KINDS: &[&str] = &[
     "invalid_review_convergence_config",
     "pending_review_not_found",
     "pending_review_author_mismatch",
+    "pending_review_not_deletable",
 ];
 
 #[test]

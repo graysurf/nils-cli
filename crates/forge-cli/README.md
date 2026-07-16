@@ -73,8 +73,10 @@ bounds, and the JSON snapshot.
 Provider-valid pending reviews are listed separately under
 `pr reviews data.pending_reviews`; they are not submitted review activity. To
 recover a stuck draft, copy its `PRR_...` id into `pr pending-review delete`.
-The command verifies PR membership, `PENDING` state, and the invoking GitHub
-identity before deleting that exact node.
+The command verifies PR membership, `PENDING` state, provider-native
+`viewerDidAuthor`, and `viewerCanDelete` before deleting that exact node. It
+works for GitHub App installation actors without relying on the user-only
+`GET /user` endpoint.
 
 ## Inbox discovery
 

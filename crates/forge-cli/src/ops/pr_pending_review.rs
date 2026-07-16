@@ -1,11 +1,9 @@
 //! Authenticated recovery for provider-valid pending GitHub reviews.
 
-use std::ffi::OsString;
-
 use nils_common::cli_contract::{OutputFormat, schema_version_for};
 use serde::Serialize;
 
-use crate::backend::{BackendCall, BackendProgram, BackendRunner, BackendSuccess};
+use crate::backend::{BackendRunner, BackendSuccess};
 use crate::cli::{BINARY, GlobalFlags, PrPendingReviewDeleteArgs};
 use crate::envelope::emit_success;
 use crate::error::ForgeError;
@@ -35,7 +33,6 @@ struct PrPendingReviewDeleteDryRunPayload {
     review_id: String,
     guard_plan: Vec<String>,
     snapshot_plan: Vec<String>,
-    identity_plan: Vec<String>,
     delete_plan: Vec<String>,
 }
 
@@ -69,24 +66,30 @@ pub fn run_delete_with<R: BackendRunner, F: Fn(&str) -> Option<String>>(
 
     let view_output = runner.run(&pr_view::build_view_call(&ctx, &args.id.to_string()))?;
     let view = pr_view::parse_view_output(&ctx, &view_output)?;
-    let snapshot = pr_reviews::compute_for_pr(runner, &ctx, view.number, &view.url)?;
+    let snapshot = pr_reviews::compute_pending_guards_for_pr(runner, &ctx, view.number, &view.url)?;
     let pending = snapshot
-        .pending_reviews
+        .reviews
         .iter()
         .find(|review| review.id == args.review)
         .ok_or_else(|| pending_not_found(args.id, &args.review))?;
 
-    let identity_output = runner.run(&build_github_identity_call(&ctx))?;
-    let actor = parse_github_identity(&identity_output)?;
-    if !pending.author.eq_ignore_ascii_case(&actor) {
+    if !pending.viewer_did_author {
         return Err(ForgeError::validation(
             schema_err(),
             "pending_review_author_mismatch",
             "the pending review is not authored by the invoking GitHub identity",
             Some(format!(
-                "review_id={}; review_author={}; invoking_actor={actor}",
+                "review_id={}; review_author={}",
                 pending.id, pending.author
             )),
+        ));
+    }
+    if !pending.viewer_can_delete {
+        return Err(ForgeError::validation(
+            schema_err(),
+            "pending_review_not_deletable",
+            "the invoking GitHub identity cannot delete the pending review",
+            Some(format!("review_id={}", pending.id)),
         ));
     }
 
@@ -129,8 +132,7 @@ fn emit_dry_run<F: Fn(&str) -> Option<String>>(
     let slug = pr_reviews::resolve_repo_slug(ctx, &global.remote, remote_url_lookup)?;
     let (owner, name) = pr_reviews::split_slug(&slug)?;
     let guard = pr_view::build_view_call(ctx, &args.id.to_string());
-    let snapshot = pr_reviews::build_github_reviews_call(ctx, owner, name, args.id, None);
-    let identity = build_github_identity_call(ctx);
+    let snapshot = pr_reviews::build_github_pending_reviews_call(ctx, owner, name, args.id, None);
     let delete = pr_review::build_github_delete_pending_review_call(ctx, &args.review);
     let payload = PrPendingReviewDeleteDryRunPayload {
         provider: ctx.provider.as_str(),
@@ -138,7 +140,6 @@ fn emit_dry_run<F: Fn(&str) -> Option<String>>(
         review_id: args.review.clone(),
         guard_plan: guard.plan_argv(),
         snapshot_plan: snapshot.plan_argv(),
-        identity_plan: identity.plan_argv(),
         delete_plan: delete.plan_argv(),
     };
     Ok(emit_success(schema_ok(), payload, format, |payload| {
@@ -162,25 +163,6 @@ fn ensure_github(ctx: &ProviderContext) -> Result<(), ForgeError> {
         ),
         None,
     ))
-}
-
-fn build_github_identity_call(ctx: &ProviderContext) -> BackendCall {
-    let mut argv = vec![OsString::from("api"), OsString::from("user")];
-    ctx.push_github_api_hostname(&mut argv);
-    argv.extend([OsString::from("--jq"), OsString::from(".login")]);
-    BackendCall::new(BackendProgram::Gh, argv)
-}
-
-fn parse_github_identity(output: &BackendSuccess) -> Result<String, ForgeError> {
-    let actor = output.stdout.trim();
-    if actor.is_empty() {
-        return Err(ForgeError::software(
-            schema_err(),
-            "gh api user did not return the invoking GitHub identity",
-            None,
-        ));
-    }
-    Ok(actor.to_string())
 }
 
 fn parse_deleted_review(output: &BackendSuccess) -> Result<(String, String), ForgeError> {

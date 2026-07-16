@@ -22,11 +22,19 @@ const MAX_SUMMARY_BYTES: usize = 4096;
 const MAX_REVIEW_PAGES: usize = 100;
 
 const GITHUB_REVIEWS_QUERY: &str = "query($owner: String!, $name: String!, $pr: Int!, $after: String) { repository(owner: $owner, name: $name) { pullRequest(number: $pr) { headRefOid reviews(first: 100, after: $after) { nodes { id databaseId url author { login } state commit { oid } submittedAt body } pageInfo { hasNextPage endCursor } } } } }";
+const GITHUB_PENDING_REVIEWS_QUERY: &str = "query($owner: String!, $name: String!, $pr: Int!, $after: String) { repository(owner: $owner, name: $name) { pullRequest(number: $pr) { headRefOid reviews(first: 100, after: $after, states: [PENDING]) { nodes { id url author { login } state viewerDidAuthor viewerCanDelete } pageInfo { hasNextPage endCursor } } } } }";
 
 struct ReviewPage {
     head_sha: String,
     reviews: Vec<NativeReviewSummary>,
     pending_reviews: Vec<PendingReviewSummary>,
+    has_next_page: bool,
+    end_cursor: Option<String>,
+}
+
+struct PendingReviewGuardPage {
+    head_sha: String,
+    reviews: Vec<PendingReviewGuard>,
     has_next_page: bool,
     end_cursor: Option<String>,
 }
@@ -56,9 +64,24 @@ pub struct PendingReviewSummary {
     pub url: String,
     pub author: String,
     pub state: String,
-    pub commit_sha: String,
+    pub commit_sha: Option<String>,
     pub summary: String,
     pub summary_truncated: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PendingReviewGuard {
+    pub id: String,
+    pub url: String,
+    pub author: String,
+    pub viewer_did_author: bool,
+    pub viewer_can_delete: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PendingReviewGuardSnapshot {
+    pub head_sha: String,
+    pub reviews: Vec<PendingReviewGuard>,
 }
 
 /// Envelope payload for `cli.forge-cli.pr.reviews.v1`.
@@ -131,6 +154,80 @@ pub fn compute_for_pr<R: BackendRunner>(
     pr_url: &str,
 ) -> Result<PrReviewsPayload, ForgeError> {
     compute_for_pr_with_timeout(runner, ctx, number, pr_url, None)
+}
+
+/// Fetch only pending reviews and the provider-native viewer ownership/capability
+/// fields required by exact-node recovery. Submitted-review parsing remains an
+/// independent convergence concern and cannot block recovery.
+pub(crate) fn compute_pending_guards_for_pr<R: BackendRunner>(
+    runner: &R,
+    ctx: &ProviderContext,
+    number: u64,
+    pr_url: &str,
+) -> Result<PendingReviewGuardSnapshot, ForgeError> {
+    ensure_github(ctx)?;
+    let slug = github_repo_slug_from_url(pr_url).ok_or_else(|| {
+        ForgeError::software(
+            schema_err(),
+            "unable to derive GitHub owner/repo from PR url",
+            Some(format!("url={pr_url}")),
+        )
+    })?;
+    let (owner, name) = split_slug(&slug)?;
+    let mut cursor = None;
+    let mut seen_cursors = BTreeSet::new();
+    let mut expected_head = None;
+    let mut reviews = Vec::new();
+
+    for page_index in 0..MAX_REVIEW_PAGES {
+        let output = runner.run(&build_github_pending_reviews_call(
+            ctx,
+            owner,
+            name,
+            number,
+            cursor.as_deref(),
+        ))?;
+        let page = parse_github_pending_review_page(&output)?;
+        if expected_head
+            .as_deref()
+            .is_some_and(|head| head != page.head_sha)
+        {
+            return Err(snapshot_incomplete(
+                "the PR head changed while paginating pending reviews",
+                Some(format!(
+                    "expected_head={} provider_head={}",
+                    expected_head.as_deref().unwrap_or("<missing>"),
+                    page.head_sha
+                )),
+            ));
+        }
+        expected_head.get_or_insert(page.head_sha);
+        reviews.extend(page.reviews);
+        if !page.has_next_page {
+            return Ok(PendingReviewGuardSnapshot {
+                head_sha: expected_head.unwrap_or_default(),
+                reviews,
+            });
+        }
+        let next = page.end_cursor.ok_or_else(|| {
+            snapshot_incomplete(
+                "pending review pagination is missing endCursor",
+                Some(format!("page={}", page_index + 1)),
+            )
+        })?;
+        if !seen_cursors.insert(next.clone()) {
+            return Err(snapshot_incomplete(
+                "pending review pagination repeated a cursor",
+                Some(format!("page={}; cursor={next}", page_index + 1)),
+            ));
+        }
+        cursor = Some(next);
+    }
+
+    Err(snapshot_incomplete(
+        "pending review pagination exceeded the safety page limit",
+        Some(format!("max_pages={MAX_REVIEW_PAGES}")),
+    ))
 }
 
 /// Deadline-aware variant used by merge convergence. The timeout covers the
@@ -263,6 +360,34 @@ pub(crate) fn build_github_reviews_call(
     BackendCall::new(BackendProgram::Gh, argv)
 }
 
+pub(crate) fn build_github_pending_reviews_call(
+    ctx: &ProviderContext,
+    owner: &str,
+    name: &str,
+    number: u64,
+    after: Option<&str>,
+) -> BackendCall {
+    let mut argv = vec![OsString::from("api"), OsString::from("graphql")];
+    ctx.push_github_api_hostname(&mut argv);
+    argv.extend([
+        OsString::from("-f"),
+        OsString::from(format!("query={GITHUB_PENDING_REVIEWS_QUERY}")),
+        OsString::from("-f"),
+        OsString::from(format!("owner={owner}")),
+        OsString::from("-f"),
+        OsString::from(format!("name={name}")),
+        OsString::from("-F"),
+        OsString::from(format!("pr={number}")),
+    ]);
+    if let Some(after) = after {
+        argv.extend([
+            OsString::from("-f"),
+            OsString::from(format!("after={after}")),
+        ]);
+    }
+    BackendCall::new(BackendProgram::Gh, argv)
+}
+
 fn parse_github_review_page(output: &BackendSuccess) -> Result<ReviewPage, ForgeError> {
     let value: serde_json::Value = serde_json::from_str(output.stdout.trim()).map_err(|err| {
         ForgeError::software(
@@ -318,7 +443,6 @@ fn parse_github_review_page(output: &BackendSuccess) -> Result<ReviewPage, Forge
         let url = required_string(node, "/url", "review.url")?;
         let author = string_at(node, "/author/login");
         let state = required_review_state(node)?;
-        let commit_sha = required_string(node, "/commit/oid", "review.commit.oid")?;
         if state == "PENDING" {
             pending_reviews.push(PendingReviewSummary {
                 id,
@@ -326,12 +450,13 @@ fn parse_github_review_page(output: &BackendSuccess) -> Result<ReviewPage, Forge
                 url,
                 author,
                 state,
-                commit_sha,
+                commit_sha: optional_string(node, "/commit/oid"),
                 summary,
                 summary_truncated,
             });
             continue;
         }
+        let commit_sha = required_string(node, "/commit/oid", "review.commit.oid")?;
         let review = NativeReviewSummary {
             id,
             database_id,
@@ -350,6 +475,89 @@ fn parse_github_review_page(output: &BackendSuccess) -> Result<ReviewPage, Forge
         head_sha,
         reviews,
         pending_reviews,
+        has_next_page,
+        end_cursor,
+    })
+}
+
+fn parse_github_pending_review_page(
+    output: &BackendSuccess,
+) -> Result<PendingReviewGuardPage, ForgeError> {
+    let value: serde_json::Value = serde_json::from_str(output.stdout.trim()).map_err(|err| {
+        ForgeError::software(
+            schema_err(),
+            "pending reviews response is invalid JSON",
+            Some(err.to_string()),
+        )
+    })?;
+    if value
+        .get("errors")
+        .and_then(|errors| errors.as_array())
+        .is_some_and(|errors| !errors.is_empty())
+    {
+        return Err(snapshot_incomplete(
+            "GitHub returned partial pending-review data",
+            Some(format!(
+                "graphql_errors={}",
+                value["errors"].as_array().map_or(0, Vec::len)
+            )),
+        ));
+    }
+    let pull = value
+        .pointer("/data/repository/pullRequest")
+        .ok_or_else(|| {
+            snapshot_incomplete("pending reviews response is missing pullRequest", None)
+        })?;
+    let head_sha = required_string(pull, "/headRefOid", "headRefOid")?;
+    let nodes = pull
+        .pointer("/reviews/nodes")
+        .and_then(|item| item.as_array())
+        .ok_or_else(|| {
+            snapshot_incomplete("pending reviews response is missing reviews nodes", None)
+        })?;
+    let page_info = pull
+        .pointer("/reviews/pageInfo")
+        .ok_or_else(|| snapshot_incomplete("pending reviews response is missing pageInfo", None))?;
+    let has_next_page = page_info
+        .get("hasNextPage")
+        .and_then(|item| item.as_bool())
+        .ok_or_else(|| {
+            snapshot_incomplete("pending reviews pageInfo is missing hasNextPage", None)
+        })?;
+    let end_cursor = optional_string(page_info, "/endCursor");
+
+    let reviews = nodes
+        .iter()
+        .map(|node| {
+            let id = required_string(node, "/id", "review.id")?;
+            let state = required_review_state(node)?;
+            if state != "PENDING" {
+                return Err(snapshot_incomplete(
+                    "pending-only review query returned a non-pending review",
+                    Some(format!("review_id={id}; state={state}")),
+                ));
+            }
+            Ok(PendingReviewGuard {
+                id,
+                url: required_string(node, "/url", "review.url")?,
+                author: required_string(node, "/author/login", "review.author.login")?,
+                viewer_did_author: required_bool(
+                    node,
+                    "/viewerDidAuthor",
+                    "review.viewerDidAuthor",
+                )?,
+                viewer_can_delete: required_bool(
+                    node,
+                    "/viewerCanDelete",
+                    "review.viewerCanDelete",
+                )?,
+            })
+        })
+        .collect::<Result<Vec<_>, ForgeError>>()?;
+
+    Ok(PendingReviewGuardPage {
+        head_sha,
+        reviews,
         has_next_page,
         end_cursor,
     })
@@ -388,6 +596,30 @@ fn required_string(
                 Some(format!("field={field}")),
             )
         })
+}
+
+fn required_bool(
+    value: &serde_json::Value,
+    pointer: &str,
+    field: &str,
+) -> Result<bool, ForgeError> {
+    value
+        .pointer(pointer)
+        .and_then(|item| item.as_bool())
+        .ok_or_else(|| {
+            snapshot_incomplete(
+                "reviews response is missing a required field",
+                Some(format!("field={field}")),
+            )
+        })
+}
+
+fn optional_string(value: &serde_json::Value, pointer: &str) -> Option<String> {
+    value
+        .pointer(pointer)
+        .and_then(|item| item.as_str())
+        .filter(|item| !item.is_empty())
+        .map(str::to_string)
 }
 
 fn remaining_timeout(

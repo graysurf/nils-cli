@@ -452,8 +452,8 @@ operations:
         head_sha: string
         current_head_reviews: list<{id, database_id?, url, author, state, commit_sha, submitted_at, summary, summary_truncated}>
         stale_reviews: list<{id, database_id?, url, author, state, commit_sha, submitted_at, summary, summary_truncated}>
-        pending_reviews: list<{id, database_id?, url, author, state, commit_sha, summary, summary_truncated}>
-    notes: "all review pages are read (100 nodes/page, max 100 pages); provider-valid PENDING reviews have no submitted_at and are returned separately, never as convergence activity. Partial GraphQL data, missing required fields, unknown states, head drift, or unsafe pagination return review_snapshot_incomplete. summary is bounded to 4096 UTF-8 bytes and is never parsed as a machine verdict; commit_sha != head_sha is stale/informational."
+        pending_reviews: list<{id, database_id?, url, author, state, commit_sha?, summary, summary_truncated}>
+    notes: "all review pages are read (100 nodes/page, max 100 pages); provider-valid PENDING reviews have no submitted_at, may have no commit_sha, and are returned separately, never as convergence activity. Partial GraphQL data, missing required submitted-review fields, unknown states, head drift, or unsafe pagination return review_snapshot_incomplete. summary is bounded to 4096 UTF-8 bytes and is never parsed as a machine verdict; submitted commit_sha != head_sha is stale/informational."
 
   - id: pr.pending-review.delete
     schema_version: cli.forge-cli.pr.pending-review.delete.v1
@@ -467,11 +467,11 @@ operations:
     validations:
       - pending_review_not_found
       - pending_review_author_mismatch
+      - pending_review_not_deletable
     backends:
       github:
         - { program: gh, argv: [pr, view, "{id}", --json, "number,url,state,isDraft,baseRefName,headRefName,headRefOid,title,body"] }
-        - { program: gh, argv: [api, graphql, "--hostname <host when host != github.com>", -f, "query=<headRefOid and paginated reviews query>", -f, "owner={owner}", -f, "name={name}", -F, "pr={id}", "-f after={cursor}?"] }
-        - { program: gh, argv: [api, user, "--hostname <host when host != github.com>", --jq, .login] }
+        - { program: gh, argv: [api, graphql, "--hostname <host when host != github.com>", -f, "query=<headRefOid and paginated PENDING reviews with viewerDidAuthor/viewerCanDelete>", -f, "owner={owner}", -f, "name={name}", -F, "pr={id}", "-f after={cursor}?"] }
         - { program: gh, argv: [api, graphql, "--hostname <host when host != github.com>", -f, "query=<deletePullRequestReview>", -f, "reviewId={review_id}"] }
       gitlab: unsupported # provider_unsupported (USAGE 64)
       local: unsupported  # provider_unsupported (USAGE 64)
