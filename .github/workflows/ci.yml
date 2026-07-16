@@ -10,25 +10,39 @@ jobs:
   changes:
     runs-on: ubuntu-latest
     permissions:
+      actions: read
       contents: read
     outputs:
+      base_sha: ${{ steps.detect.outputs.base_sha }}
       docs_only: ${{ steps.detect.outputs.docs_only }}
+      head_sha: ${{ steps.detect.outputs.head_sha }}
+      release_branch: ${{ steps.detect.outputs.release_branch }}
+      release_candidate: ${{ steps.detect.outputs.release_candidate }}
+      release_only: ${{ steps.finalize.outputs.release_only }}
     steps:
       - name: Checkout
         uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
-      - name: Detect docs-only change set
+      - name: Detect change set
         id: detect
         env:
+          EVENT_NAME: ${{ github.event_name }}
+          EVENT_SHA: ${{ github.sha }}
+          HEAD_REF: ${{ github.event.pull_request.head.ref }}
+          HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name }}
           PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           PUSH_BEFORE_SHA: ${{ github.event.before }}
+          REPOSITORY: ${{ github.repository }}
         run: |
           if [ -n "${PR_BASE_SHA}" ]; then
             base="${PR_BASE_SHA}"
+            head="${PR_HEAD_SHA}"
           else
             base="${PUSH_BEFORE_SHA}"
+            head="${EVENT_SHA}"
           fi
           # Any detection error falls back to "false" so the full Rust jobs run
           # rather than leaving the release-gated checks unresolved.
@@ -37,8 +51,67 @@ jobs:
             true|false) ;;
             *) docs_only=false ;;
           esac
+          release_candidate=false
+          if [ "${EVENT_NAME}" = "pull_request" ] && \
+             [ "${HEAD_REPOSITORY}" = "${REPOSITORY}" ] && \
+             [ -n "${HEAD_REF}" ]; then
+            release_candidate="$(
+              bash scripts/ci/detect-release-only.sh \
+                --base "${base}" \
+                --head "${head}" \
+                --branch "${HEAD_REF}" \
+                2>/dev/null || true
+            )"
+          fi
+          case "${release_candidate}" in
+            true|false) ;;
+            *) release_candidate=false ;;
+          esac
+          echo "base_sha=${base}" >> "$GITHUB_OUTPUT"
           echo "docs_only=${docs_only}" >> "$GITHUB_OUTPUT"
-          echo "docs_only=${docs_only} (base=${base})"
+          echo "head_sha=${head}" >> "$GITHUB_OUTPUT"
+          echo "release_branch=${HEAD_REF}" >> "$GITHUB_OUTPUT"
+          echo "release_candidate=${release_candidate}" >> "$GITHUB_OUTPUT"
+          echo "docs_only=${docs_only} release_candidate=${release_candidate} (base=${base}, head=${head})"
+
+      - name: Prove full CI on exact base main commit
+        id: base_ci
+        if: steps.detect.outputs.release_candidate == 'true'
+        uses: actions/github-script@v9
+        env:
+          BASE_SHA: ${{ steps.detect.outputs.base_sha }}
+        with:
+          script: |
+            const { findTrustedMainCi } = require("./.github/scripts/release-ci-gate.cjs");
+            try {
+              const trusted = await findTrustedMainCi({
+                github,
+                context,
+                sha: process.env.BASE_SHA,
+              });
+              core.setOutput("trusted", trusted ? "true" : "false");
+              if (trusted) {
+                core.info(`Reusing full base CI run ${trusted.runId}: ${trusted.runUrl}`);
+              } else {
+                core.info("Exact base commit has no unique successful full CI run; using full PR CI.");
+              }
+            } catch (error) {
+              core.warning(`Could not prove full base CI; using full PR CI: ${error.message}`);
+              core.setOutput("trusted", "false");
+            }
+
+      - name: Finalize fail-closed CI lane
+        id: finalize
+        env:
+          BASE_CI_TRUSTED: ${{ steps.base_ci.outputs.trusted }}
+          RELEASE_CANDIDATE: ${{ steps.detect.outputs.release_candidate }}
+        run: |
+          release_only=false
+          if [ "${RELEASE_CANDIDATE}" = "true" ] && [ "${BASE_CI_TRUSTED}" = "true" ]; then
+            release_only=true
+          fi
+          echo "release_only=${release_only}" >> "$GITHUB_OUTPUT"
+          echo "release_only=${release_only}"
 
   cargo_deny:
     name: cargo-deny (advisories + bans)
@@ -76,20 +149,23 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Set up Node.js
+        if: needs.changes.outputs.release_only != 'true'
         uses: actions/setup-node@v6
         with:
           node-version: "20"
 
       - name: Install zsh + xvfb + ripgrep + tmux
+        if: needs.changes.outputs.release_only != 'true'
         run: sudo apt-get update && sudo apt-get install -y zsh xvfb xauth ripgrep tmux
 
       - name: Install cargo-nextest
+        if: needs.changes.outputs.release_only != 'true'
         uses: taiki-e/install-action@v2
         with:
           tool: cargo-nextest
 
       - name: Provision systemd user scopes
-        if: needs.changes.outputs.docs_only != 'true'
+        if: needs.changes.outputs.docs_only != 'true' && needs.changes.outputs.release_only != 'true'
         run: |
           uid="$(id -u)"
           sudo loginctl enable-linger "${USER}"
@@ -99,7 +175,7 @@ jobs:
           test -S "/run/user/${uid}/systemd/private"
 
       - name: Require agent-session cgroup containment
-        if: needs.changes.outputs.docs_only != 'true'
+        if: needs.changes.outputs.docs_only != 'true' && needs.changes.outputs.release_only != 'true'
         env:
           AGENT_SESSION_TEST_REQUIRE_CGROUP: "1"
         run: |
@@ -113,9 +189,18 @@ jobs:
         run: |
           if [ "${{ needs.changes.outputs.docs_only }}" = "true" ]; then
             bash scripts/ci/nils-cli-checks-entrypoint.sh --docs-only
+          elif [ "${{ needs.changes.outputs.release_only }}" = "true" ]; then
+            bash scripts/ci/release-only-checks.sh \
+              --base "${{ needs.changes.outputs.base_sha }}" \
+              --head "${{ needs.changes.outputs.head_sha }}" \
+              --branch "${{ needs.changes.outputs.release_branch }}"
           else
             bash scripts/ci/nils-cli-checks-entrypoint.sh --xvfb
           fi
+
+      - name: Full validation marker
+        if: needs.changes.outputs.docs_only != 'true' && needs.changes.outputs.release_only != 'true'
+        run: true
 
       - name: Publish JUnit report
         if: always() && hashFiles('target/nextest/ci/junit.xml') != ''
@@ -154,11 +239,13 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Set up Node.js
+        if: needs.changes.outputs.release_only != 'true'
         uses: actions/setup-node@v6
         with:
           node-version: "20"
 
       - name: Install bash + ripgrep
+        if: needs.changes.outputs.release_only != 'true'
         run: |
           if ! /opt/homebrew/bin/bash --version >/dev/null 2>&1; then
             brew install bash
@@ -168,6 +255,7 @@ jobs:
           fi
 
       - name: Install cargo-nextest
+        if: needs.changes.outputs.release_only != 'true'
         uses: taiki-e/install-action@v2
         with:
           tool: cargo-nextest
@@ -178,9 +266,18 @@ jobs:
         run: |
           if [ "${{ needs.changes.outputs.docs_only }}" = "true" ]; then
             /opt/homebrew/bin/bash scripts/ci/nils-cli-checks-entrypoint.sh --docs-only
+          elif [ "${{ needs.changes.outputs.release_only }}" = "true" ]; then
+            bash scripts/ci/release-only-checks.sh \
+              --base "${{ needs.changes.outputs.base_sha }}" \
+              --head "${{ needs.changes.outputs.head_sha }}" \
+              --branch "${{ needs.changes.outputs.release_branch }}"
           else
             /opt/homebrew/bin/bash scripts/ci/nils-cli-checks-entrypoint.sh
           fi
+
+      - name: Full validation marker
+        if: needs.changes.outputs.docs_only != 'true' && needs.changes.outputs.release_only != 'true'
+        run: true
 
       - name: Publish JUnit report
         if: always() && hashFiles('target/nextest/ci/junit.xml') != ''
@@ -209,24 +306,23 @@ jobs:
     env:
       COVERAGE_FAIL_UNDER_LINES: "85"
     steps:
-      # Docs-only change sets skip every coverage step (step-level, never
-      # job-level) so this check still concludes `success` and the release gate
-      # in release.yml stays satisfied on docs-only tagged commits.
+      # Docs-only and proven release-only change sets skip coverage work at the
+      # step level so the required `coverage` job still concludes `success`.
       - name: Checkout
         uses: actions/checkout@v7
 
       - name: Set up Rust
-        if: needs.changes.outputs.docs_only != 'true'
+        if: needs.changes.outputs.docs_only != 'true' && needs.changes.outputs.release_only != 'true'
         uses: dtolnay/rust-toolchain@stable
         with:
           components: llvm-tools-preview
 
       - name: Cache cargo
-        if: needs.changes.outputs.docs_only != 'true'
+        if: needs.changes.outputs.docs_only != 'true' && needs.changes.outputs.release_only != 'true'
         uses: Swatinem/rust-cache@v2
 
       - name: Install cargo tools
-        if: needs.changes.outputs.docs_only != 'true'
+        if: needs.changes.outputs.docs_only != 'true' && needs.changes.outputs.release_only != 'true'
         uses: taiki-e/install-action@v2
         with:
           tool: |
@@ -234,36 +330,40 @@ jobs:
             cargo-nextest
 
       - name: Clear previous coverage outputs
-        if: needs.changes.outputs.docs_only != 'true'
+        if: needs.changes.outputs.docs_only != 'true' && needs.changes.outputs.release_only != 'true'
         run: rm -rf target/coverage && mkdir -p target/coverage
 
       - name: Generate LCOV report
-        if: needs.changes.outputs.docs_only != 'true'
+        if: needs.changes.outputs.docs_only != 'true' && needs.changes.outputs.release_only != 'true'
         run: cargo llvm-cov nextest --profile ci --workspace --lcov --output-path target/coverage/lcov.info --fail-under-lines "$COVERAGE_FAIL_UNDER_LINES"
 
       - name: Generate HTML report
-        if: always() && needs.changes.outputs.docs_only != 'true' && hashFiles('target/coverage/lcov.info') != ''
+        if: always() && needs.changes.outputs.docs_only != 'true' && needs.changes.outputs.release_only != 'true' && hashFiles('target/coverage/lcov.info') != ''
         run: cargo llvm-cov report --html --output-dir target/coverage
 
       - name: Run doctests (not included in coverage)
-        if: needs.changes.outputs.docs_only != 'true'
+        if: needs.changes.outputs.docs_only != 'true' && needs.changes.outputs.release_only != 'true'
         run: cargo test --workspace --doc
 
+      - name: Full validation marker
+        if: needs.changes.outputs.docs_only != 'true' && needs.changes.outputs.release_only != 'true'
+        run: true
+
       - name: Coverage summary
-        if: always() && needs.changes.outputs.docs_only != 'true'
+        if: always() && needs.changes.outputs.docs_only != 'true' && needs.changes.outputs.release_only != 'true'
         run: |
           env GITHUB_STEP_SUMMARY=/dev/stdout bash scripts/ci/coverage-summary.sh target/coverage/lcov.info \
             | tee target/coverage/coverage-summary.md >> "$GITHUB_STEP_SUMMARY"
 
       - name: PR comment (sticky coverage summary)
-        if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork == false && needs.changes.outputs.docs_only != 'true' && hashFiles('target/coverage/lcov.info') != ''
+        if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork == false && needs.changes.outputs.docs_only != 'true' && needs.changes.outputs.release_only != 'true' && hashFiles('target/coverage/lcov.info') != ''
         uses: marocchino/sticky-pull-request-comment@v3
         with:
           header: coverage
           path: target/coverage/coverage-summary.md
 
       - name: Upload coverage LCOV
-        if: always() && needs.changes.outputs.docs_only != 'true' && hashFiles('target/coverage/lcov.info') != ''
+        if: always() && needs.changes.outputs.docs_only != 'true' && needs.changes.outputs.release_only != 'true' && hashFiles('target/coverage/lcov.info') != ''
         uses: actions/upload-artifact@v7
         with:
           name: coverage-lcov
@@ -271,7 +371,7 @@ jobs:
           retention-days: 7
 
       - name: Upload coverage HTML
-        if: always() && needs.changes.outputs.docs_only != 'true' && hashFiles('target/coverage/html/index.html') != ''
+        if: always() && needs.changes.outputs.docs_only != 'true' && needs.changes.outputs.release_only != 'true' && hashFiles('target/coverage/html/index.html') != ''
         uses: actions/upload-artifact@v7
         with:
           name: coverage-html
@@ -279,11 +379,11 @@ jobs:
           retention-days: 7
 
       - name: Cleanup coverage outputs (avoid bloating cache)
-        if: always() && needs.changes.outputs.docs_only != 'true'
+        if: always() && needs.changes.outputs.docs_only != 'true' && needs.changes.outputs.release_only != 'true'
         run: rm -rf target/coverage
 
   coverage_badge:
-    if: github.event_name == 'push' && needs.changes.outputs.docs_only != 'true'
+    if: github.event_name == 'push' && needs.changes.outputs.docs_only != 'true' && needs.changes.outputs.release_only != 'true'
     runs-on: ubuntu-latest
     needs:
       - changes
