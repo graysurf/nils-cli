@@ -31,7 +31,7 @@ use std::time::{Duration, Instant};
 use axum::Json;
 use axum::Router;
 use axum::body::{Body, Bytes, to_bytes};
-use axum::extract::rejection::JsonRejection;
+use axum::extract::rejection::{JsonRejection, QueryRejection};
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path as AxPath, Query, State};
 use axum::http::header::{AUTHORIZATION, CONTENT_TYPE};
@@ -53,6 +53,7 @@ use tokio::task::JoinSet;
 use crate::auto_resume::{self, UsageSnapshot};
 use crate::cli::{self, AgentKind, SpecialKey};
 use crate::codex_app_server::{self, ControlHandle};
+use crate::maintenance::{self, MaintenanceActionRequest, MaintenanceOperation};
 use crate::provider_prompt::{
     MAX_PROVIDER_PROMPT_BYTES, PROVIDER_PROMPT_CAPABILITY, ProviderKind, ProviderPromptEvent,
     ProviderPromptSource, ProviderPromptTail,
@@ -60,10 +61,10 @@ use crate::provider_prompt::{
 use crate::{
     BINARY, CliContext, CliError, ProviderResumeImportArgs, SessionRecord, SessionTitleState,
     SessionTitleStateInput, SessionView, StartFailureDisposition, WorkdirSearchOptions,
-    canonicalize_structured_title_pair, delete_session, glance_session, list_sessions,
-    load_session_record, non_empty_env, repo_remote_url_from_cwd, resolve_tmux_bin,
-    resume_session_by_id, search_workdirs, send_auto_resume_input, send_input_serialized,
-    session_clipboard_buffer, session_dir, session_status, short_hostname,
+    canonicalize_structured_title_pair, cleanup_session_delete_tombstones, delete_session,
+    glance_session, list_sessions, load_session_record, non_empty_env, repo_remote_url_from_cwd,
+    resolve_tmux_bin, resume_session_by_id, search_workdirs, send_auto_resume_input,
+    send_input_serialized, session_clipboard_buffer, session_dir, session_status, short_hostname,
     start_provider_resume_session, start_session, update_session_title_if_revision,
     write_session_attachment,
 };
@@ -272,6 +273,14 @@ pub fn run_serve(context: &CliContext, args: cli::ServeArgs) -> i32 {
             "agent-session serve listening on http://{bind} (machine={})",
             state.machine
         );
+        // Logical deletion commits via an atomic tombstone rename. Physical
+        // cleanup must never delay listener availability, so retry a bounded
+        // number of old quarantines on a detached background worker only after
+        // the socket has bound successfully.
+        let cleanup_context = context.clone();
+        std::thread::spawn(move || {
+            let _ = cleanup_session_delete_tombstones(&cleanup_context, 64);
+        });
         let app = router(state.clone());
         let codex_control_task = tokio::spawn(codex_control_loop(state.clone()));
         let auto_resume_task = tokio::spawn(auto_resume_loop(state.clone()));
@@ -307,6 +316,11 @@ fn router(state: Arc<ServeState>) -> Router {
         .route("/sessions/{id}/send", post(send_handler))
         .route("/sessions/{id}/prompt", post(structured_prompt_handler))
         .route("/sessions/{id}/resume", post(resume_handler))
+        .route("/sessions/{id}/maintenance", get(maintenance_handler))
+        .route(
+            "/sessions/{id}/maintenance/actions",
+            post(maintenance_action_handler),
+        )
         .route(
             "/sessions/{id}/account",
             axum::routing::put(codex_account_handler),
@@ -1391,6 +1405,8 @@ fn envelope_err(err: CliError) -> Response {
         | "title-revision-conflict"
         | "title-state-conflict"
         | "session-incarnation-conflict"
+        | "maintenance-preview-stale"
+        | "maintenance-session-busy"
         | "codex-account-session-incarnation-conflict"
         | "codex-account-session-busy" => StatusCode::CONFLICT,
         _ => match data.exit_code {
@@ -2062,6 +2078,12 @@ fn deny_unauthorized(state: &ServeState, headers: &HeaderMap) -> Option<Response
 #[derive(Debug, Deserialize)]
 struct GlanceQuery {
     tail: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MaintenanceQuery {
+    operation: MaintenanceOperation,
 }
 
 #[derive(Debug, Deserialize)]
@@ -3388,6 +3410,80 @@ async fn resume_handler(
     let tmux = state.tmux_bin.clone();
     match tokio::task::spawn_blocking(move || resume_session_by_id(&context, &id, &tmux)).await {
         Ok(Ok(session)) => envelope_ok(json!({ "machine": state.machine, "session": session })),
+        Ok(Err(err)) => envelope_err(err),
+        Err(_) => join_err(),
+    }
+}
+
+async fn maintenance_handler(
+    State(state): State<Arc<ServeState>>,
+    headers: HeaderMap,
+    AxPath(id): AxPath<String>,
+    query: Result<Query<MaintenanceQuery>, QueryRejection>,
+) -> Response {
+    if let Some(resp) = deny_unauthorized(&state, &headers) {
+        return resp;
+    }
+    let operation = match query {
+        Ok(Query(query)) => query.operation,
+        Err(_) => {
+            return envelope_err(CliError::usage(
+                "invalid-maintenance-query",
+                "maintenance query requires one supported operation",
+                Some(json!({ "field": "operation" })),
+            ));
+        }
+    };
+    let context = state.context.clone();
+    let tmux = state.tmux_bin.clone();
+    match tokio::task::spawn_blocking(move || maintenance::preview(&context, &id, &tmux, operation))
+        .await
+    {
+        Ok(Ok(maintenance)) => {
+            envelope_ok(json!({ "machine": state.machine, "maintenance": maintenance }))
+        }
+        Ok(Err(err)) => envelope_err(err),
+        Err(_) => join_err(),
+    }
+}
+
+async fn maintenance_action_handler(
+    State(state): State<Arc<ServeState>>,
+    headers: HeaderMap,
+    AxPath(id): AxPath<String>,
+    body: Result<Json<MaintenanceActionRequest>, JsonRejection>,
+) -> Response {
+    if let Some(resp) = deny_unauthorized(&state, &headers) {
+        return resp;
+    }
+    let Json(request) = match body {
+        Ok(body) => body,
+        Err(_) => {
+            return envelope_err(CliError::usage(
+                "invalid-maintenance-action-request",
+                "maintenance action body does not match the versioned contract",
+                None,
+            ));
+        }
+    };
+    let context = state.context.clone();
+    let tmux = state.tmux_bin.clone();
+    let action_id = id.clone();
+    match tokio::task::spawn_blocking(move || {
+        maintenance::execute(&context, &action_id, &tmux, request)
+    })
+    .await
+    {
+        Ok(Ok(result)) => {
+            if result.deleted() {
+                if let Ok(mut controls) = state.codex_controls.lock() {
+                    controls.remove(&id);
+                }
+                state.attach_brokers.shutdown_session(&id).await;
+                state.provider_prompt_discovery.evict_session(&id).await;
+            }
+            envelope_ok(json!({ "machine": state.machine, "maintenance_result": result }))
+        }
         Ok(Err(err)) => envelope_err(err),
         Err(_) => join_err(),
     }
@@ -10885,6 +10981,651 @@ esac
             !calls.contains("new-session"),
             "serve resume must not replace unprovable runtimes: {calls:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn maintenance_preview_is_authenticated_and_projects_safe_runtime_facts() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cwd = tmp.path().join("repo");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let id = "maintenance-preview";
+        seed_resumable_session(
+            tmp.path(),
+            id,
+            "codex",
+            "hs-codex-maintenance-preview",
+            &cwd,
+            &[
+                "resume",
+                "resume-session-id",
+                "--cd",
+                cwd.to_str().unwrap(),
+                "--no-alt-screen",
+            ],
+        );
+        let record_path = tmp.path().join("sessions").join(id).join("session.json");
+        let mut record: Value =
+            serde_json::from_slice(&std::fs::read(&record_path).unwrap()).unwrap();
+        record["runtime"]["launch_id"] = json!("maintenance-preview-launch");
+        let pane = TestProcessGroup::spawn();
+        record["delete_tmux_identity"] = json!({
+            "launch_id": "maintenance-preview-launch",
+            "session_id": "$98",
+            "pane_id": "%98",
+            "pane_pid": pane.pid(),
+            "process_group_id": pane.pid(),
+        });
+        std::fs::write(&record_path, serde_json::to_vec_pretty(&record).unwrap()).unwrap();
+        let tmux = executable(
+            &tmp.path().join("stopped-maintenance-tmux"),
+            "#!/usr/bin/env sh\nprintf '%s\\n' \"can't find session: stopped\" >&2\nexit 1\n",
+        );
+        let st = state(tmp.path(), Some(TOKEN), tmux);
+
+        let (status, body) = call(
+            router(st.clone()),
+            get_auth(
+                &format!("/sessions/{id}/maintenance?operation=resume"),
+                None,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "body={body}");
+
+        let (status, body) = call(
+            router(st),
+            get_auth(
+                &format!("/sessions/{id}/maintenance?operation=resume"),
+                Some(TOKEN),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "body={body}");
+        let maintenance = &body["data"]["maintenance"];
+        assert_eq!(
+            maintenance["schema_version"],
+            "agent-session.session-maintenance.v1"
+        );
+        assert_eq!(maintenance["state"], "blocked");
+        assert_eq!(
+            maintenance["session_incarnation"],
+            "maintenance-preview-launch"
+        );
+        assert_eq!(maintenance["session_generation"], 1);
+        assert_eq!(maintenance["issue"]["kind"], "process_boundary_live");
+        assert_eq!(maintenance["issue"]["operation"], "resume");
+        assert_eq!(maintenance["boundary"]["kind"], "process_group");
+        assert!(
+            maintenance["boundary"]["safe_process_count"]
+                .as_u64()
+                .unwrap()
+                >= 1
+        );
+        assert_eq!(maintenance["actions"][0]["id"], "retry_resume");
+        assert_eq!(maintenance["actions"][0]["destructive"], false);
+        let digest = maintenance["preview_digest"].as_str().unwrap();
+        assert!(digest.starts_with("sha256:"));
+        assert_eq!(digest.len(), 71);
+
+        let serialized = maintenance.to_string();
+        for forbidden in [
+            tmp.path().to_str().unwrap(),
+            "tmux_session",
+            "process_group_id",
+            "control_group",
+            "argv",
+            "environment",
+            "transcript",
+        ] {
+            assert!(
+                !serialized.contains(forbidden),
+                "maintenance preview leaked {forbidden}: {serialized}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn maintenance_preview_lock_admission_is_bounded_and_session_scoped() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cwd = tmp.path().join("repo");
+        std::fs::create_dir_all(&cwd).unwrap();
+        for id in ["maintenance-busy", "maintenance-independent"] {
+            seed_resumable_session(
+                tmp.path(),
+                id,
+                "codex",
+                &format!("hs-codex-{id}"),
+                &cwd,
+                &[
+                    "resume",
+                    "resume-session-id",
+                    "--cd",
+                    cwd.to_str().unwrap(),
+                    "--no-alt-screen",
+                ],
+            );
+        }
+        let log = tmp.path().join("tmux.log");
+        let tmux = resume_tmux(tmp.path(), &log);
+        let st = state(tmp.path(), Some(TOKEN), tmux);
+        let _held = crate::acquire_session_record_lock(&st.context, "maintenance-busy")
+            .expect("hold busy session lock");
+
+        let started = Instant::now();
+        let (busy, independent) = tokio::join!(
+            call(
+                router(st.clone()),
+                get_auth(
+                    "/sessions/maintenance-busy/maintenance?operation=resume",
+                    Some(TOKEN),
+                ),
+            ),
+            call(
+                router(st),
+                get_auth(
+                    "/sessions/maintenance-independent/maintenance?operation=resume",
+                    Some(TOKEN),
+                ),
+            ),
+        );
+
+        assert_eq!(busy.0, StatusCode::CONFLICT, "body={}", busy.1);
+        assert_eq!(busy.1["error"]["code"], "maintenance-session-busy");
+        assert_eq!(busy.1["error"]["details"]["retryable"], true);
+        assert_eq!(independent.0, StatusCode::OK, "body={}", independent.1);
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "maintenance lock admission must stay bounded"
+        );
+    }
+
+    #[tokio::test]
+    async fn maintenance_action_rejects_a_stale_preview_before_retrying() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cwd = tmp.path().join("repo");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let id = "maintenance-stale";
+        seed_resumable_session(
+            tmp.path(),
+            id,
+            "codex",
+            "hs-codex-maintenance-stale",
+            &cwd,
+            &[
+                "resume",
+                "resume-session-id",
+                "--cd",
+                cwd.to_str().unwrap(),
+                "--no-alt-screen",
+            ],
+        );
+        let record_path = tmp.path().join("sessions").join(id).join("session.json");
+        let mut record: Value =
+            serde_json::from_slice(&std::fs::read(&record_path).unwrap()).unwrap();
+        record["runtime"]["launch_id"] = json!("maintenance-stale-launch");
+        record["tmux_runtime_never_launched"] = json!(true);
+        std::fs::write(&record_path, serde_json::to_vec_pretty(&record).unwrap()).unwrap();
+        let log = tmp.path().join("tmux.log");
+        let tmux = resume_tmux(tmp.path(), &log);
+        let st = state(tmp.path(), Some(TOKEN), tmux);
+
+        let (status, preview) = call(
+            router(st.clone()),
+            get_auth(
+                &format!("/sessions/{id}/maintenance?operation=resume"),
+                Some(TOKEN),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "body={preview}");
+        let maintenance = &preview["data"]["maintenance"];
+
+        let (status, body) = call(
+            router(st),
+            post_json(
+                &format!("/sessions/{id}/maintenance/actions"),
+                Some(TOKEN),
+                json!({
+                    "operation": "resume",
+                    "action": "retry_resume",
+                    "expected_session_incarnation": maintenance["session_incarnation"],
+                    "expected_session_generation": maintenance["session_generation"],
+                    "expected_preview_digest": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+                }),
+            ),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::CONFLICT, "body={body}");
+        assert_eq!(body["error"]["code"], "maintenance-preview-stale");
+        let calls = std::fs::read_to_string(&log).unwrap_or_default();
+        assert!(
+            !calls.contains("new-session"),
+            "stale action must not replace the runtime: {calls:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn maintenance_action_rejects_durable_generation_drift_without_mutation() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cwd = tmp.path().join("repo");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let id = "maintenance-generation-drift";
+        seed_resumable_session(
+            tmp.path(),
+            id,
+            "codex",
+            "hs-codex-maintenance-generation-drift",
+            &cwd,
+            &[
+                "resume",
+                "resume-session-id",
+                "--cd",
+                cwd.to_str().unwrap(),
+                "--no-alt-screen",
+            ],
+        );
+        let record_path = tmp.path().join("sessions").join(id).join("session.json");
+        let log = tmp.path().join("tmux.log");
+        let tmux = resume_tmux(tmp.path(), &log);
+        let st = state(tmp.path(), Some(TOKEN), tmux);
+
+        let (status, preview) = call(
+            router(st.clone()),
+            get_auth(
+                &format!("/sessions/{id}/maintenance?operation=resume"),
+                Some(TOKEN),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "body={preview}");
+        let maintenance = &preview["data"]["maintenance"];
+
+        let mut drifted: Value =
+            serde_json::from_slice(&std::fs::read(&record_path).unwrap()).unwrap();
+        drifted["runtime"]["generation"] = json!(2);
+        std::fs::write(&record_path, serde_json::to_vec_pretty(&drifted).unwrap()).unwrap();
+        let after_drift = std::fs::read(&record_path).unwrap();
+
+        let (status, body) = call(
+            router(st),
+            post_json(
+                &format!("/sessions/{id}/maintenance/actions"),
+                Some(TOKEN),
+                json!({
+                    "operation": "resume",
+                    "action": "retry_resume",
+                    "expected_session_incarnation": maintenance["session_incarnation"],
+                    "expected_session_generation": maintenance["session_generation"],
+                    "expected_preview_digest": maintenance["preview_digest"]
+                }),
+            ),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::CONFLICT, "body={body}");
+        assert_eq!(body["error"]["code"], "maintenance-preview-stale");
+        assert_eq!(std::fs::read(&record_path).unwrap(), after_drift);
+        assert!(record_path.exists());
+        let calls = std::fs::read_to_string(&log).unwrap_or_default();
+        assert!(
+            !calls.contains("new-session"),
+            "state drift must fence runtime replacement: {calls:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn maintenance_retry_resume_uses_the_preview_and_returns_a_safe_result() {
+        let lock = GlobalStateLock::new();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cwd = tmp.path().join("repo");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let id = "maintenance-retry-resume";
+        seed_resumable_session(
+            tmp.path(),
+            id,
+            "codex",
+            "hs-codex-maintenance-retry-resume",
+            &cwd,
+            &[
+                "resume",
+                "resume-session-id",
+                "--cd",
+                cwd.to_str().unwrap(),
+                "--no-alt-screen",
+            ],
+        );
+        let log = tmp.path().join("tmux.log");
+        let tmux = resume_tmux(tmp.path(), &log);
+        let codex = fake_agent(tmp.path(), "codex");
+        let _codex_bin = EnvGuard::set(&lock, "AGENT_SESSION_CODEX_BIN", codex.to_str().unwrap());
+        let st = state(tmp.path(), Some(TOKEN), tmux);
+
+        let (status, preview) = call(
+            router(st.clone()),
+            get_auth(
+                &format!("/sessions/{id}/maintenance?operation=resume"),
+                Some(TOKEN),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "body={preview}");
+        let maintenance = &preview["data"]["maintenance"];
+
+        let (status, body) = call(
+            router(st),
+            post_json(
+                &format!("/sessions/{id}/maintenance/actions"),
+                Some(TOKEN),
+                json!({
+                    "operation": "resume",
+                    "action": "retry_resume",
+                    "expected_session_incarnation": maintenance["session_incarnation"],
+                    "expected_session_generation": maintenance["session_generation"],
+                    "expected_preview_digest": maintenance["preview_digest"]
+                }),
+            ),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK, "body={body}");
+        let result = &body["data"]["maintenance_result"];
+        assert_eq!(
+            result["schema_version"],
+            "agent-session.session-maintenance.v1"
+        );
+        assert_eq!(result["session_id"], id);
+        assert_eq!(result["operation"], "resume");
+        assert_eq!(result["action"], "retry_resume");
+        assert_eq!(result["outcome"], "resumed");
+        assert_eq!(result["status"], "running");
+        assert_eq!(result["session_generation"], 2);
+        assert_eq!(result["cleanup_pending"], false);
+        let serialized = result.to_string();
+        for forbidden in [
+            tmp.path().to_str().unwrap(),
+            "tmux_session",
+            "cwd",
+            "resume-session-id",
+            "argv",
+            "environment",
+            "transcript",
+        ] {
+            assert!(
+                !serialized.contains(forbidden),
+                "maintenance result leaked {forbidden}: {serialized}"
+            );
+        }
+        assert!(
+            std::fs::read_to_string(&log)
+                .unwrap()
+                .contains("new-session")
+        );
+    }
+
+    #[tokio::test]
+    async fn maintenance_retry_resume_preserves_claude_resume_arguments() {
+        let lock = GlobalStateLock::new();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cwd = tmp.path().join("repo");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let id = "maintenance-claude-retry-resume";
+        seed_resumable_session(
+            tmp.path(),
+            id,
+            "claude",
+            "hs-claude-maintenance-retry-resume",
+            &cwd,
+            &["--resume", "resume-session-id"],
+        );
+        let log = tmp.path().join("tmux.log");
+        let tmux = resume_tmux(tmp.path(), &log);
+        let claude = fake_agent(tmp.path(), "claude");
+        let _claude_bin =
+            EnvGuard::set(&lock, "AGENT_SESSION_CLAUDE_BIN", claude.to_str().unwrap());
+        let st = state(tmp.path(), Some(TOKEN), tmux);
+
+        let (status, preview) = call(
+            router(st.clone()),
+            get_auth(
+                &format!("/sessions/{id}/maintenance?operation=resume"),
+                Some(TOKEN),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "body={preview}");
+        let maintenance = &preview["data"]["maintenance"];
+
+        let (status, body) = call(
+            router(st),
+            post_json(
+                &format!("/sessions/{id}/maintenance/actions"),
+                Some(TOKEN),
+                json!({
+                    "operation": "resume",
+                    "action": "retry_resume",
+                    "expected_session_incarnation": maintenance["session_incarnation"],
+                    "expected_session_generation": maintenance["session_generation"],
+                    "expected_preview_digest": maintenance["preview_digest"]
+                }),
+            ),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK, "body={body}");
+        assert_eq!(body["data"]["maintenance_result"]["session_generation"], 2);
+        let calls = std::fs::read_to_string(&log).unwrap();
+        assert!(
+            calls.contains("--resume resume-session-id"),
+            "maintenance must preserve Claude's exact resume form: {calls:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn maintenance_rejects_destructive_repair_for_an_unverified_process_group() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cwd = tmp.path().join("repo");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let id = "maintenance-unverified-boundary";
+        seed_resumable_session(
+            tmp.path(),
+            id,
+            "codex",
+            "hs-codex-maintenance-unverified-boundary",
+            &cwd,
+            &[
+                "resume",
+                "resume-session-id",
+                "--cd",
+                cwd.to_str().unwrap(),
+                "--no-alt-screen",
+            ],
+        );
+        let record_path = tmp.path().join("sessions").join(id).join("session.json");
+        let mut record: Value =
+            serde_json::from_slice(&std::fs::read(&record_path).unwrap()).unwrap();
+        record["runtime"]["launch_id"] = json!("maintenance-unverified-launch");
+        let pane = TestProcessGroup::spawn();
+        record["delete_tmux_identity"] = json!({
+            "launch_id": "maintenance-unverified-launch",
+            "session_id": "$98",
+            "pane_id": "%98",
+            "pane_pid": pane.pid(),
+            "process_group_id": pane.pid(),
+        });
+        std::fs::write(&record_path, serde_json::to_vec_pretty(&record).unwrap()).unwrap();
+        let tmux = executable(
+            &tmp.path().join("stopped-unverified-tmux"),
+            "#!/usr/bin/env sh\nprintf '%s\\n' \"can't find session: stopped\" >&2\nexit 1\n",
+        );
+        let st = state(tmp.path(), Some(TOKEN), tmux);
+
+        let (status, preview) = call(
+            router(st.clone()),
+            get_auth(
+                &format!("/sessions/{id}/maintenance?operation=resume"),
+                Some(TOKEN),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "body={preview}");
+        let maintenance = &preview["data"]["maintenance"];
+        assert_eq!(maintenance["state"], "blocked");
+        assert_eq!(maintenance["boundary"]["kind"], "process_group");
+
+        let (status, body) = call(
+            router(st),
+            post_json(
+                &format!("/sessions/{id}/maintenance/actions"),
+                Some(TOKEN),
+                json!({
+                    "operation": "resume",
+                    "action": "terminate_runtime_then_resume",
+                    "expected_session_incarnation": maintenance["session_incarnation"],
+                    "expected_session_generation": maintenance["session_generation"],
+                    "expected_preview_digest": maintenance["preview_digest"],
+                    "confirmed": true
+                }),
+            ),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::CONFLICT, "body={body}");
+        assert_eq!(body["error"]["code"], "maintenance-preview-stale");
+        assert_eq!(
+            crate::process_group_status(pane.pid() as libc::pid_t),
+            crate::ProcessGroupStatus::Running,
+            "an unverified process group must never be signalled"
+        );
+        assert!(record_path.exists());
+    }
+
+    #[tokio::test]
+    async fn maintenance_retry_delete_requires_confirmation_and_redacts_safe_failure_details() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cwd = tmp.path().join("repo");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let id = "maintenance-delete-confirmation";
+        seed_resumable_session(
+            tmp.path(),
+            id,
+            "codex",
+            "hs-codex-maintenance-delete-confirmation",
+            &cwd,
+            &[
+                "resume",
+                "resume-session-id",
+                "--cd",
+                cwd.to_str().unwrap(),
+                "--no-alt-screen",
+            ],
+        );
+        let record_path = tmp.path().join("sessions").join(id).join("session.json");
+        let mut record: Value =
+            serde_json::from_slice(&std::fs::read(&record_path).unwrap()).unwrap();
+        record["runtime"]["launch_id"] = json!("maintenance-delete-confirmation-launch");
+        let pane = TestProcessGroup::spawn();
+        record["delete_tmux_identity"] = json!({
+            "launch_id": "maintenance-delete-confirmation-launch",
+            "session_id": "$97",
+            "pane_id": "%97",
+            "pane_pid": pane.pid(),
+            "process_group_id": pane.pid(),
+        });
+        std::fs::write(&record_path, serde_json::to_vec_pretty(&record).unwrap()).unwrap();
+        let tmux = executable(
+            &tmp.path().join("stopped-delete-confirmation-tmux"),
+            "#!/usr/bin/env sh\nprintf '%s\\n' \"can't find session: stopped\" >&2\nexit 1\n",
+        );
+        let st = state(tmp.path(), Some(TOKEN), tmux);
+
+        let (status, preview) = call(
+            router(st.clone()),
+            get_auth(
+                &format!("/sessions/{id}/maintenance?operation=delete"),
+                Some(TOKEN),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "body={preview}");
+        let maintenance = &preview["data"]["maintenance"];
+        assert_eq!(maintenance["state"], "blocked");
+        assert_eq!(maintenance["boundary"]["kind"], "process_group");
+        assert_eq!(maintenance["actions"][0]["id"], "retry_delete");
+        assert_eq!(maintenance["actions"][0]["destructive"], true);
+        assert_eq!(maintenance["actions"][0]["requires_confirmation"], true);
+        let request = json!({
+            "operation": "delete",
+            "action": "retry_delete",
+            "expected_session_incarnation": maintenance["session_incarnation"],
+            "expected_session_generation": maintenance["session_generation"],
+            "expected_preview_digest": maintenance["preview_digest"]
+        });
+
+        let (status, body) = call(
+            router(st.clone()),
+            post_json(
+                &format!("/sessions/{id}/maintenance/actions"),
+                Some(TOKEN),
+                request.clone(),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "body={body}");
+        assert_eq!(body["error"]["code"], "maintenance-confirmation-required");
+        assert!(record_path.exists());
+        assert_eq!(
+            crate::process_group_status(pane.pid() as libc::pid_t),
+            crate::ProcessGroupStatus::Running
+        );
+
+        let mut confirmed = request;
+        confirmed["confirmed"] = json!(true);
+        let (status, body) = call(
+            router(st),
+            post_json(
+                &format!("/sessions/{id}/maintenance/actions"),
+                Some(TOKEN),
+                confirmed,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "body={body}");
+        assert_eq!(body["error"]["code"], "session-maintenance-failed");
+        let details = body["error"]["details"].as_object().unwrap();
+        let mut keys = details.keys().map(String::as_str).collect::<Vec<_>>();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            vec![
+                "id",
+                "kind",
+                "operation",
+                "retryable",
+                "session_metadata_retained"
+            ]
+        );
+        assert_eq!(details["kind"], "process_boundary_live");
+        assert_eq!(details["session_metadata_retained"], true);
+        assert!(record_path.exists());
+        assert_eq!(
+            crate::process_group_status(pane.pid() as libc::pid_t),
+            crate::ProcessGroupStatus::Running,
+            "retry delete must not signal an unverified process boundary"
+        );
+        let serialized = body.to_string();
+        for forbidden in [
+            tmp.path().to_str().unwrap(),
+            "tmux_session",
+            "pane_pid",
+            "process_group_id",
+            "cause",
+        ] {
+            assert!(
+                !serialized.contains(forbidden),
+                "maintenance failure leaked {forbidden}: {serialized}"
+            );
+        }
     }
 
     #[tokio::test]

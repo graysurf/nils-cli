@@ -1,0 +1,41 @@
+{
+  "schema_version": "agent-session.session-maintenance.v1",
+  "session_id": "fixture-codex",
+  "operation": "resume",
+  "state": "repairable",
+  "session_incarnation": "fixture-runtime-incarnation",
+  "session_generation": 1,
+  "issue": {
+    "kind": "process_boundary_live",
+    "operation": "resume",
+    "retryable": true,
+    "preserves_session_metadata": true,
+    "message": "the recorded runtime process boundary is still live"
+  },
+  "boundary": {
+    "kind": "managed_scope",
+    "safe_process_count": 2
+  },
+  "preservation": {
+    "session_metadata_retained_until_success": true,
+    "provider_conversation_retained": true,
+    "destructive_scope": "verified_recorded_runtime_only"
+  },
+  "actions": [
+    {
+      "id": "retry_resume",
+      "label": "Retry resume",
+      "destructive": false,
+      "requires_confirmation": false,
+      "preserves_session_metadata": true
+    },
+    {
+      "id": "terminate_runtime_then_resume",
+      "label": "Terminate recorded runtime, then resume",
+      "destructive": true,
+      "requires_confirmation": true,
+      "preserves_session_metadata": true
+    }
+  ],
+  "preview_digest": "sha256:8d5dece08afdf22b39fcbba1d1bc33dd6d967e81a4728a715be06995d9db7f24"
+}

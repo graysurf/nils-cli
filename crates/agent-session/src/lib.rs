@@ -4,6 +4,7 @@ mod cli;
 mod codex_account;
 mod codex_app_server;
 pub mod completion;
+mod maintenance;
 mod provider_prompt;
 mod serve;
 
@@ -68,6 +69,7 @@ const STARTUP_ARTIFACT_FILES: [&str; 4] = [
 ];
 const SESSION_RESUME_FILE: &str = "resume.json";
 const SESSION_LOCKS_DIR: &str = "session-locks";
+const SESSION_DELETE_TOMBSTONES_DIR: &str = "session-delete-tombstones";
 const BINARY: &str = "agent-session";
 const START_COMMAND: &str = "start";
 const RUN_COMMAND: &str = "run";
@@ -1137,6 +1139,8 @@ struct DeleteResult {
     killed: bool,
     deleted: bool,
     session_dir: String,
+    #[serde(skip)]
+    cleanup_pending: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -3309,16 +3313,38 @@ fn resume_session_by_id(
     let observed = load_session_record(context, id)?;
     let canonical_id = observed.id.clone();
     let _record_lock = acquire_session_record_lock(context, &canonical_id)?;
-    let mut record = load_session_record(context, &canonical_id)?;
+    let record = load_session_record(context, &canonical_id)?;
     ensure_same_session_identity(&observed, &record)?;
+    resume_session_locked(context, record, tmux_bin).map(|outcome| outcome.session)
+}
+
+struct ResumeSessionOutcome {
+    session: SessionView,
+    session_incarnation: Option<String>,
+    session_generation: Option<u64>,
+}
+
+fn resume_session_locked(
+    context: &CliContext,
+    mut record: SessionRecord,
+    tmux_bin: &Path,
+) -> Result<ResumeSessionOutcome, CliError> {
     match session_status(tmux_bin, &record).as_str() {
         "running" => {
-            return Ok(session_view(
-                context,
-                &record,
-                Some("running".to_string()),
-                Some(tmux_bin),
-            ));
+            return Ok(ResumeSessionOutcome {
+                session: session_view(
+                    context,
+                    &record,
+                    Some("running".to_string()),
+                    Some(tmux_bin),
+                ),
+                session_incarnation: record
+                    .runtime
+                    .as_ref()
+                    .map(|runtime| runtime.launch_id.clone())
+                    .filter(|launch_id| !launch_id.is_empty()),
+                session_generation: record.runtime.as_ref().map(|runtime| runtime.generation),
+            });
         }
         "unknown" => {
             return Err(CliError::runtime(
@@ -3516,12 +3542,20 @@ fn resume_session_by_id(
     }
     reconcile_owned_startup_projection(context, &mut record, "running");
     startup_artifacts.discard();
-    Ok(session_view(
-        context,
-        &record,
-        Some("running".to_string()),
-        Some(tmux_bin),
-    ))
+    Ok(ResumeSessionOutcome {
+        session: session_view(
+            context,
+            &record,
+            Some("running".to_string()),
+            Some(tmux_bin),
+        ),
+        session_incarnation: record
+            .runtime
+            .as_ref()
+            .map(|runtime| runtime.launch_id.clone())
+            .filter(|launch_id| !launch_id.is_empty()),
+        session_generation: record.runtime.as_ref().map(|runtime| runtime.generation),
+    })
 }
 
 fn start_resume_tmux(
@@ -5098,14 +5132,31 @@ fn delete_session_with_timeouts(
     let canonical_id = observed.id.clone();
     let _record_lock = acquire_session_record_lock(context, &canonical_id)?;
     let resolved = resolve_session_record_path(context, &canonical_id)?;
-    let mut record = read_session_record(&resolved.record_path)?;
+    let record = read_session_record(&resolved.record_path)?;
     ensure_same_session_identity(&observed, &record)?;
     validate_record_id(&record, &resolved.expected_id, &resolved.record_path)?;
-    let session_dir = resolved.session_dir;
+    delete_session_locked_with_timeouts(
+        context,
+        record,
+        resolved.session_dir,
+        &tmux_bin,
+        kill_timeout,
+        verify_timeout,
+    )
+}
+
+fn delete_session_locked_with_timeouts(
+    context: &CliContext,
+    mut record: SessionRecord,
+    session_dir: PathBuf,
+    tmux_bin: &Path,
+    kill_timeout: Duration,
+    verify_timeout: Duration,
+) -> Result<DeleteResult, CliError> {
     terminate_tmux_session_with_timeouts(
         context,
         &mut record,
-        &tmux_bin,
+        tmux_bin,
         None,
         kill_timeout,
         verify_timeout,
@@ -5115,20 +5166,120 @@ fn delete_session_with_timeouts(
         session_termination_error(&record, reason, SessionTerminationOperation::Delete)
     })?;
     codex_app_server::cleanup_runtime_files(context, &record)?;
-    fs::remove_dir_all(&session_dir).map_err(|err| {
-        CliError::runtime(
-            "session-delete-failed",
-            format!("failed to delete {}: {err}", session_dir.display()),
-            Some(json!({ "path": display_path(&session_dir) })),
-        )
-    })?;
+    let cleanup_pending = commit_session_directory_delete(context, &record.id, &session_dir)?;
     Ok(DeleteResult {
         id: record.id,
         tmux_session: record.tmux_session,
         killed: true,
         deleted: true,
         session_dir: display_path(&session_dir),
+        cleanup_pending,
     })
+}
+
+fn commit_session_directory_delete(
+    context: &CliContext,
+    id: &str,
+    session_dir: &Path,
+) -> Result<bool, CliError> {
+    commit_session_directory_delete_with(context, id, session_dir, |path| fs::remove_dir_all(path))
+}
+
+fn commit_session_directory_delete_with<F>(
+    context: &CliContext,
+    id: &str,
+    session_dir: &Path,
+    cleanup: F,
+) -> Result<bool, CliError>
+where
+    F: FnOnce(&Path) -> io::Result<()>,
+{
+    let tombstones = context.state_dir.join(SESSION_DELETE_TOMBSTONES_DIR);
+    ensure_private_delete_tombstone_root(&tombstones)?;
+    let tombstone = tombstones.join(format!("{id}-{}", uuid::Uuid::new_v4()));
+    fs::rename(session_dir, &tombstone).map_err(|err| {
+        CliError::runtime(
+            "session-delete-failed",
+            format!("failed to delete {}: {err}", session_dir.display()),
+            Some(json!({ "path": display_path(session_dir) })),
+        )
+    })?;
+    // The same-filesystem rename is the logical delete commit. Cleanup happens
+    // outside the live sessions namespace and is deliberately best-effort: a
+    // failure can leave quarantined bytes, but can no longer produce a partial
+    // live session while the API falsely claims metadata was retained.
+    Ok(cleanup(&tombstone).is_err())
+}
+
+fn ensure_private_delete_tombstone_root(root: &Path) -> Result<(), CliError> {
+    match fs::create_dir(root) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+        Err(error) => {
+            return Err(CliError::runtime(
+                "session-delete-failed",
+                format!("failed to prepare session delete quarantine: {error}"),
+                None,
+            ));
+        }
+    }
+    let metadata = fs::symlink_metadata(root).map_err(|error| {
+        CliError::runtime(
+            "session-delete-failed",
+            format!("failed to verify session delete quarantine: {error}"),
+            None,
+        )
+    })?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(CliError::runtime(
+            "session-delete-failed",
+            "session delete quarantine is not a private directory",
+            None,
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(root, fs::Permissions::from_mode(0o700)).map_err(|error| {
+            CliError::runtime(
+                "session-delete-failed",
+                format!("failed to secure session delete quarantine: {error}"),
+                None,
+            )
+        })?;
+    }
+    Ok(())
+}
+
+fn cleanup_session_delete_tombstones(context: &CliContext, limit: usize) -> io::Result<usize> {
+    let root = context.state_dir.join(SESSION_DELETE_TOMBSTONES_DIR);
+    let root_type = match fs::symlink_metadata(&root) {
+        Ok(metadata) => metadata.file_type(),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(0),
+        Err(error) => return Err(error),
+    };
+    if root_type.is_symlink() || !root_type.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "session delete tombstone root is not a private directory",
+        ));
+    }
+    let entries = fs::read_dir(&root)?;
+    let mut removed = 0;
+    for entry in entries.take(limit) {
+        let entry = entry?;
+        let file_type = entry.file_type()?;
+        let path = entry.path();
+        let result = if file_type.is_dir() && !file_type.is_symlink() {
+            fs::remove_dir_all(&path)
+        } else {
+            fs::remove_file(&path)
+        };
+        if result.is_ok() {
+            removed += 1;
+        }
+    }
+    Ok(removed)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -5274,6 +5425,100 @@ fn recover_failed_tmux_launch(
     .map_err(|reason| session_termination_error(record, reason, operation))
 }
 
+#[derive(Clone, Copy)]
+enum VerifiedRuntimeTerminationMode<'a> {
+    LiveTmux {
+        tmux_bin: &'a Path,
+        kill_timeout: Duration,
+    },
+    AlreadyStopped {
+        tmux_bin: &'a Path,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum VerifiedRuntimeTerminationOutcome {
+    Complete,
+    TmuxIdentityChanged,
+}
+
+fn terminate_verified_process_runtime_transaction(
+    context: &CliContext,
+    record: &mut SessionRecord,
+    identity: &mut TmuxRuntimeIdentity,
+    mode: VerifiedRuntimeTerminationMode<'_>,
+    verify_timeout: Duration,
+) -> Result<VerifiedRuntimeTerminationOutcome, SessionTerminationFailure> {
+    let mut pinned_runtime = prepare_process_runtime(identity)?;
+    refresh_process_runtime_freeze_ownership(&mut pinned_runtime)?;
+    let mut thaw_on_recovery = process_runtime_thaw_on_recovery(&pinned_runtime);
+    set_tmux_termination_state(
+        record,
+        TmuxTerminationState::FreezePending { thaw_on_recovery },
+    )?;
+    write_session_record(context, record)
+        .map_err(|_| SessionTerminationFailure::RuntimeIdentityUnavailable)?;
+    if let Err(reason) = freeze_and_pin_process_runtime(identity, &mut pinned_runtime) {
+        let _ = thaw_owned_process_runtime(&mut pinned_runtime);
+        release_process_runtime(Some(pinned_runtime));
+        record.extra.remove(DELETE_TMUX_TERMINATION_STATE_KEY);
+        let _ = write_session_record(context, record);
+        return Err(reason);
+    }
+    thaw_on_recovery = process_runtime_thaw_on_recovery(&pinned_runtime);
+    identity.control_group_members = process_runtime_identities(&pinned_runtime);
+    let prior_identities = persisted_prior_tmux_runtime_identities(record)?;
+    persist_tmux_runtime_identities(record, identity, &prior_identities)?;
+    set_tmux_termination_state(record, TmuxTerminationState::Pending { thaw_on_recovery })?;
+    write_session_record(context, record)
+        .map_err(|_| SessionTerminationFailure::RuntimeIdentityUnavailable)?;
+    verify_process_runtime_frozen(&pinned_runtime)?;
+
+    let kill_outcome = match mode {
+        VerifiedRuntimeTerminationMode::LiveTmux {
+            tmux_bin,
+            kill_timeout,
+        } => tmux_kill_identity_with_timeout(tmux_bin, identity, kill_timeout)?,
+        VerifiedRuntimeTerminationMode::AlreadyStopped { tmux_bin } => {
+            verify_stopped_tmux_runtime(tmux_bin, identity, verify_timeout)?;
+            TmuxIdentityKillOutcome::KillConfirmed
+        }
+    };
+    if kill_outcome == TmuxIdentityKillOutcome::IdentityChanged {
+        thaw_owned_process_runtime(&mut pinned_runtime)?;
+        release_process_runtime(Some(pinned_runtime));
+        record.extra.remove(DELETE_TMUX_TERMINATION_STATE_KEY);
+        write_session_record(context, record)
+            .map_err(|_| SessionTerminationFailure::RuntimeIdentityUnavailable)?;
+        return Ok(VerifiedRuntimeTerminationOutcome::TmuxIdentityChanged);
+    }
+
+    set_tmux_termination_state(
+        record,
+        TmuxTerminationState::KillConfirmed { thaw_on_recovery },
+    )?;
+    write_session_record(context, record)
+        .map_err(|_| SessionTerminationFailure::RuntimeIdentityUnavailable)?;
+    let verification_started = Instant::now();
+    let terminated =
+        terminate_captured_process_runtime(identity, &mut pinned_runtime, verify_timeout);
+    release_process_runtime(Some(pinned_runtime));
+    terminated?;
+    let remaining = verify_timeout.saturating_sub(verification_started.elapsed());
+    if remaining.is_zero() {
+        return Err(SessionTerminationFailure::VerificationFailed);
+    }
+    let tmux_bin = match mode {
+        VerifiedRuntimeTerminationMode::LiveTmux { tmux_bin, .. }
+        | VerifiedRuntimeTerminationMode::AlreadyStopped { tmux_bin } => tmux_bin,
+    };
+    verify_stopped_tmux_runtime(tmux_bin, identity, remaining)?;
+    record.extra.remove(DELETE_TMUX_TERMINATION_STATE_KEY);
+    write_session_record(context, record)
+        .map_err(|_| SessionTerminationFailure::RuntimeIdentityUnavailable)?;
+    Ok(VerifiedRuntimeTerminationOutcome::Complete)
+}
+
 fn terminate_tmux_session_with_timeouts(
     context: &CliContext,
     record: &mut SessionRecord,
@@ -5369,52 +5614,31 @@ fn terminate_tmux_session_with_timeouts(
         if identity_changes >= DELETE_TERMINATION_IDENTITY_RETRY_LIMIT {
             return Err(SessionTerminationFailure::RuntimeIdentityChanged);
         }
-        let mut pinned_runtime = if terminate_process_group {
-            Some(prepare_process_runtime(&identity)?)
-        } else {
-            None
-        };
-        if let Some(runtime) = pinned_runtime.as_mut() {
-            refresh_process_runtime_freeze_ownership(runtime)?;
-        }
-        let mut thaw_on_recovery = pinned_runtime
-            .as_ref()
-            .is_some_and(process_runtime_thaw_on_recovery);
-        if let Some(runtime) = pinned_runtime.as_mut() {
-            set_tmux_termination_state(
+        if terminate_process_group {
+            match terminate_verified_process_runtime_transaction(
+                context,
                 record,
-                TmuxTerminationState::FreezePending { thaw_on_recovery },
-            )?;
-            write_session_record(context, record)
-                .map_err(|_| SessionTerminationFailure::RuntimeIdentityUnavailable)?;
-            if let Err(reason) = freeze_and_pin_process_runtime(&identity, runtime) {
-                thaw_owned_process_runtime(runtime)?;
-                release_process_runtime(pinned_runtime.take());
-                record.extra.remove(DELETE_TMUX_TERMINATION_STATE_KEY);
-                let _ = write_session_record(context, record);
-                return Err(reason);
+                &mut identity,
+                VerifiedRuntimeTerminationMode::LiveTmux {
+                    tmux_bin,
+                    kill_timeout,
+                },
+                verify_timeout,
+            )? {
+                VerifiedRuntimeTerminationOutcome::Complete => return Ok(()),
+                VerifiedRuntimeTerminationOutcome::TmuxIdentityChanged => {
+                    identity_changes += 1;
+                    continue;
+                }
             }
-            thaw_on_recovery = process_runtime_thaw_on_recovery(runtime);
-            identity.control_group_members = process_runtime_identities(runtime);
-            let prior_identities = persisted_prior_tmux_runtime_identities(record)?;
-            persist_tmux_runtime_identities(record, &identity, &prior_identities)?;
-            set_tmux_termination_state(record, TmuxTerminationState::Pending { thaw_on_recovery })?;
-            write_session_record(context, record)
-                .map_err(|_| SessionTerminationFailure::RuntimeIdentityUnavailable)?;
-        } else {
-            set_tmux_termination_state(record, TmuxTerminationState::Pending { thaw_on_recovery })?;
-            write_session_record(context, record)
-                .map_err(|_| SessionTerminationFailure::RuntimeIdentityUnavailable)?;
         }
-        if let Some(runtime) = pinned_runtime.as_ref() {
-            verify_process_runtime_frozen(runtime)?;
-        }
+
+        let thaw_on_recovery = false;
+        set_tmux_termination_state(record, TmuxTerminationState::Pending { thaw_on_recovery })?;
+        write_session_record(context, record)
+            .map_err(|_| SessionTerminationFailure::RuntimeIdentityUnavailable)?;
         match tmux_kill_identity_with_timeout(tmux_bin, &identity, kill_timeout)? {
             TmuxIdentityKillOutcome::IdentityChanged => {
-                if let Some(runtime) = pinned_runtime.as_mut() {
-                    thaw_owned_process_runtime(runtime)?;
-                }
-                release_process_runtime(pinned_runtime);
                 record.extra.remove(DELETE_TMUX_TERMINATION_STATE_KEY);
                 write_session_record(context, record)
                     .map_err(|_| SessionTerminationFailure::RuntimeIdentityUnavailable)?;
@@ -5428,16 +5652,6 @@ fn terminate_tmux_session_with_timeouts(
                 write_session_record(context, record)
                     .map_err(|_| SessionTerminationFailure::RuntimeIdentityUnavailable)?;
                 let verification_started = Instant::now();
-                if terminate_process_group {
-                    terminate_captured_process_runtime(
-                        &identity,
-                        pinned_runtime
-                            .as_mut()
-                            .ok_or(SessionTerminationFailure::VerificationFailed)?,
-                        verify_timeout,
-                    )?;
-                }
-                release_process_runtime(pinned_runtime);
                 let remaining = verify_timeout.saturating_sub(verification_started.elapsed());
                 if remaining.is_zero() {
                     return Err(SessionTerminationFailure::VerificationFailed);
@@ -6439,9 +6653,6 @@ fn prepare_process_runtime(
             .process_session_id
             .filter(|session_id| *session_id > 1 && *session_id != unsafe { libc::getsid(0) })
             .ok_or(SessionTerminationFailure::RuntimeIdentityUnavailable)?;
-        if identity.process_session_members.is_empty() {
-            return Err(SessionTerminationFailure::RuntimeIdentityUnavailable);
-        }
         let control_group_identity = identity
             .control_group
             .as_ref()
@@ -6513,10 +6724,19 @@ fn freeze_and_pin_process_runtime(
             identity.pane_pid,
             &identity.process_session_members,
         )?;
-        verify_captured_linux_process_session(
-            process_session_id,
-            &identity.process_session_members,
-        )?;
+        if identity.process_session_members.is_empty() {
+            let pane = read_linux_process_identity(identity.pane_pid)?
+                .filter(|pane| !pane.zombie && pane.session_id == process_session_id)
+                .ok_or(SessionTerminationFailure::VerificationFailed)?;
+            if pane.pid != identity.pane_pid {
+                return Err(SessionTerminationFailure::VerificationFailed);
+            }
+        } else {
+            verify_captured_linux_process_session(
+                process_session_id,
+                &identity.process_session_members,
+            )?;
+        }
         let frozen_processes = pin_linux_control_group_processes(
             control_group,
             control_group_identity,
@@ -11628,6 +11848,7 @@ fi
             killed: true,
             deleted: true,
             session_dir: "/state/sessions/stopped-session".to_string(),
+            cleanup_pending: false,
         };
 
         assert_eq!(
@@ -11662,6 +11883,94 @@ fi
         assert_eq!(strip_trailing_blank_lines(""), "");
         // Content with no trailing blanks is unchanged.
         assert_eq!(strip_trailing_blank_lines("only"), "only");
+    }
+
+    #[test]
+    fn session_delete_commits_before_best_effort_partial_tombstone_cleanup() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let context = test_context(tmp.path());
+        let session_dir = tmp.path().join("sessions").join("delete-commit");
+        std::fs::create_dir_all(&session_dir).unwrap();
+        std::fs::write(session_dir.join("session.json"), b"retained record").unwrap();
+        std::fs::write(session_dir.join("artifact.log"), b"cleanup first").unwrap();
+
+        let cleanup_pending = super::commit_session_directory_delete_with(
+            &context,
+            "delete-commit",
+            &session_dir,
+            |tombstone| {
+                std::fs::remove_file(tombstone.join("artifact.log"))?;
+                Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "injected cleanup failure",
+                ))
+            },
+        )
+        .expect("the atomic rename commits deletion before cleanup");
+        assert!(cleanup_pending);
+
+        assert!(
+            !session_dir.exists(),
+            "the live session namespace is deleted"
+        );
+        let tombstone_root = tmp.path().join(super::SESSION_DELETE_TOMBSTONES_DIR);
+        let tombstones = std::fs::read_dir(&tombstone_root)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect::<Vec<_>>();
+        assert_eq!(tombstones.len(), 1);
+        assert!(tombstones[0].join("session.json").exists());
+        assert!(!tombstones[0].join("artifact.log").exists());
+
+        // A replacement may legitimately reuse the same public id after the
+        // logical delete commits. Tombstone cleanup is rooted outside the live
+        // namespace and must never follow the id back into that replacement.
+        std::fs::create_dir_all(&session_dir).unwrap();
+        std::fs::write(session_dir.join("session.json"), b"replacement record").unwrap();
+
+        assert_eq!(
+            super::cleanup_session_delete_tombstones(&context, 64).unwrap(),
+            1
+        );
+        assert_eq!(
+            std::fs::read(session_dir.join("session.json")).unwrap(),
+            b"replacement record"
+        );
+        assert_eq!(std::fs::read_dir(tombstone_root).unwrap().count(), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn session_delete_rejects_a_symlinked_tombstone_root_before_moving_live_metadata() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let context = test_context(tmp.path());
+        let session_dir = tmp.path().join("sessions").join("delete-symlink");
+        std::fs::create_dir_all(&session_dir).unwrap();
+        std::fs::write(session_dir.join("session.json"), b"live record").unwrap();
+        let foreign_root = tmp.path().join("foreign-quarantine");
+        std::fs::create_dir(&foreign_root).unwrap();
+        symlink(
+            &foreign_root,
+            tmp.path().join(super::SESSION_DELETE_TOMBSTONES_DIR),
+        )
+        .unwrap();
+
+        let error = super::commit_session_directory_delete_with(
+            &context,
+            "delete-symlink",
+            &session_dir,
+            |_| panic!("cleanup must not run when quarantine ownership is invalid"),
+        )
+        .expect_err("a symlinked quarantine root must fail closed");
+
+        assert_eq!(error.code(), "session-delete-failed");
+        assert_eq!(
+            std::fs::read(session_dir.join("session.json")).unwrap(),
+            b"live record"
+        );
+        assert_eq!(std::fs::read_dir(foreign_root).unwrap().count(), 0);
     }
 
     #[test]
