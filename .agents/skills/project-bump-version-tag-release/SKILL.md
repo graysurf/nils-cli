@@ -44,6 +44,12 @@ Inputs:
   - `--ci-gate-main` (pre-bump strict gate: require the prior `origin/main` commit's `ci.yml` to be
     green; fail when gate conditions are not met)
   - `--skip-readme` (do not update README release tag example)
+  - `--prepare-only` (internal contract-test mode: apply the same release-managed manifest,
+    `Cargo.lock`, README, and third-party artifact transform, then exit before validation, staging,
+    commit, push, tag, or deployment. It implicitly disables push and tap stages; requires only
+    `git`, `python3`, and `cargo` from the normal command prerequisites; and still enforces the
+    clean-worktree policy unless `--allow-dirty` is passed. Do not combine it with delivery, tap,
+    or check-selection flags; `--from-tap` is rejected because the mode disables the tap stage.)
   - `--skip-push` (do not push commit or tag to `origin`; **implies `--direct-push` semantics
     locally and disables the tap stage and the bump-commit ci.yml wait**)
   - `--skip-ci-wait` (direct-push only: do not wait for `ci.yml` on the bump commit before the

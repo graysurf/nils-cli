@@ -12,7 +12,7 @@ assert_contains() {
   local file="$1"
   local pattern="$2"
   local label="$3"
-  if ! rg -q --fixed-strings "$pattern" "$file"; then
+  if ! rg -q --fixed-strings -- "$pattern" "$file"; then
     echo "FAIL: $label" >&2
     echo "  missing from $file: $pattern" >&2
     exit 1
@@ -46,6 +46,24 @@ assert_contains .agents/skills/project-verify-required-checks/scripts/project-ve
   "release gate unit tests are in the required suite"
 assert_contains DEVELOPMENT.md "bash scripts/ci/tests/detect-release-only.test.sh" \
   "development contract lists the release classifier tests"
+assert_contains docs/specs/workspace-ci-entrypoint-inventory-v1.md \
+  "release_candidate" \
+  "CI inventory records the semantic release candidate output"
+assert_contains docs/specs/workspace-ci-entrypoint-inventory-v1.md \
+  "release_only=true" \
+  "CI inventory records the trusted reduced-lane decision"
+assert_contains docs/specs/workspace-ci-entrypoint-inventory-v1.md \
+  ".github/scripts/release-ci-gate.cjs" \
+  "CI inventory owns the shared release gate module"
+assert_contains docs/specs/workspace-ci-entrypoint-inventory-v1.md \
+  "scripts/ci/detect-release-only.sh" \
+  "CI inventory owns the semantic release detector"
+assert_contains docs/specs/workspace-ci-entrypoint-inventory-v1.md \
+  "scripts/ci/release-only-checks.sh" \
+  "CI inventory owns the reduced release checker"
+assert_contains .agents/skills/project-bump-version-tag-release/SKILL.md \
+  "--prepare-only" \
+  "release skill documents the internal producer contract mode"
 
 echo
 echo "PASS: release-workflow-contract.test.sh"
