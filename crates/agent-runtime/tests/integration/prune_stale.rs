@@ -18,6 +18,10 @@ fn run_cli(args: &[&str]) -> CmdOutput {
     cmd::run(&agent_runtime_bin(), args, &[], None)
 }
 
+fn run_cli_with_env(args: &[&str], envs: &[(&str, &str)]) -> CmdOutput {
+    cmd::run(&agent_runtime_bin(), args, envs, None)
+}
+
 fn write(path: &Path, body: &str) {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).unwrap();
@@ -69,6 +73,16 @@ entries:
 "#,
     );
     fs::canonicalize(&root).unwrap()
+}
+
+#[test]
+fn help_lists_owned_source_root_as_a_repeatable_structured_option() {
+    let output = run_cli(&["prune-stale", "--help"]);
+
+    assert_eq!(output.code, 0);
+    let stdout = output.stdout_text();
+    assert!(stdout.contains("--owned-source-root <ABSOLUTE_PATH>"));
+    assert!(stdout.contains("repeatable"));
 }
 
 #[test]
@@ -214,6 +228,227 @@ fn apply_prunes_recursive_claude_stale_skill_files_and_empty_directories() {
     assert!(
         !stale_skill.exists(),
         "empty stale skill directory should be removed after stale symlinks"
+    );
+}
+
+#[test]
+fn apply_removes_stale_symlinks_from_explicit_prior_source_roots() {
+    let tmp = TempDir::new().unwrap();
+    let source_root = build_claude_source_root(tmp.path());
+    let prior_source_root = tmp.path().join("prior-src");
+    fs::create_dir_all(prior_source_root.join("targets/claude")).unwrap();
+    fs::copy(
+        source_root.join("targets/claude/link-map.yaml"),
+        prior_source_root.join("targets/claude/link-map.yaml"),
+    )
+    .unwrap();
+    let prior_source_root = fs::canonicalize(prior_source_root).unwrap();
+    let second_prior_source_root = tmp.path().join("second-prior-src");
+    fs::create_dir_all(second_prior_source_root.join("targets/claude")).unwrap();
+    fs::copy(
+        source_root.join("targets/claude/link-map.yaml"),
+        second_prior_source_root.join("targets/claude/link-map.yaml"),
+    )
+    .unwrap();
+    let second_prior_source_root = fs::canonicalize(second_prior_source_root).unwrap();
+    let live_home = tmp.path().join("claude-home");
+    let scan_root = live_home.join("plugins/reporting/skills");
+    let stale = scan_root.join("old/scripts/tool.sh");
+    let second_stale = scan_root.join("older/scripts/tool.sh");
+    let foreign = scan_root.join("foreign/SKILL.md");
+
+    symlink(
+        &prior_source_root.join("build/claude/plugins/reporting/skills/old/scripts/tool.sh"),
+        &stale,
+    );
+    symlink(
+        &second_prior_source_root
+            .join("build/claude/plugins/reporting/skills/older/scripts/tool.sh"),
+        &second_stale,
+    );
+    symlink(Path::new("/var/empty/foreign-skill"), &foreign);
+
+    let source_arg = source_root.to_string_lossy().into_owned();
+    let prior_source_arg = prior_source_root.to_string_lossy().into_owned();
+    let prior_source_equals_arg = format!("--owned-source-root={prior_source_arg}");
+    let second_prior_source_arg = second_prior_source_root.to_string_lossy().into_owned();
+    let live_arg = live_home.to_string_lossy().into_owned();
+    let output = run_cli(&[
+        "prune-stale",
+        "--source-root",
+        &source_arg,
+        &prior_source_equals_arg,
+        "--owned-source-root",
+        &second_prior_source_arg,
+        "--product",
+        "claude",
+        "--live-home",
+        &live_arg,
+        "--apply",
+        "--format",
+        "json",
+    ]);
+
+    assert_eq!(
+        output.code,
+        0,
+        "apply should accept the explicit prior source root; stderr=\n{}",
+        output.stderr_text()
+    );
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let roots = json["data"]["owned_source_roots"].as_array().unwrap();
+    assert_eq!(roots.len(), 3);
+    assert!(roots.iter().any(|root| root == &source_arg));
+    assert!(roots.iter().any(|root| root == &prior_source_arg));
+    assert!(roots.iter().any(|root| root == &second_prior_source_arg));
+    assert!(
+        fs::symlink_metadata(&stale).is_err(),
+        "stale symlink into the explicit prior source root should be removed"
+    );
+    assert!(
+        fs::symlink_metadata(&second_stale).is_err(),
+        "stale symlink into the second explicit prior source root should be removed"
+    );
+    assert!(
+        fs::symlink_metadata(&foreign)
+            .unwrap()
+            .file_type()
+            .is_symlink(),
+        "unrelated foreign symlink must remain untouched"
+    );
+}
+
+#[test]
+fn rejects_relative_owned_source_root_flag() {
+    let tmp = TempDir::new().unwrap();
+    let source_root = build_codex_source_root(tmp.path());
+    let live_home = tmp.path().join("codex-home");
+    let source_arg = source_root.to_string_lossy().into_owned();
+    let live_arg = live_home.to_string_lossy().into_owned();
+    let output = run_cli(&[
+        "prune-stale",
+        "--source-root",
+        &source_arg,
+        "--owned-source-root",
+        "prior-source",
+        "--product",
+        "codex",
+        "--live-home",
+        &live_arg,
+        "--dry-run",
+    ]);
+
+    assert_eq!(output.code, 2);
+    assert!(output.stderr_text().contains("must be absolute"));
+}
+
+#[test]
+fn ambient_owned_source_root_variables_do_not_grant_authority() {
+    let tmp = TempDir::new().unwrap();
+    let source_root = build_codex_source_root(tmp.path());
+    let live_home = tmp.path().join("codex-home");
+    let source_arg = source_root.to_string_lossy().into_owned();
+    let live_arg = live_home.to_string_lossy().into_owned();
+    let foreign = live_home.join("skills/reporting/foreign");
+    symlink(Path::new("/var/empty/foreign-skill"), &foreign);
+    let output = run_cli_with_env(
+        &[
+            "prune-stale",
+            "--source-root",
+            &source_arg,
+            "--product",
+            "codex",
+            "--live-home",
+            &live_arg,
+            "--apply",
+        ],
+        &[
+            ("NILS_AGENT_RUNTIME_PRUNE_OWNED_SOURCE_ROOTS", "/"),
+            ("NILS_AGENT_RUNTIME_PRUNE_CONFIRM_OWNED_SOURCE_ROOTS", "1"),
+        ],
+    );
+
+    assert_eq!(output.code, 0);
+    assert!(
+        fs::symlink_metadata(&foreign)
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+}
+
+#[test]
+fn rejects_filesystem_root_without_removing_foreign_symlink() {
+    let tmp = TempDir::new().unwrap();
+    let source_root = build_codex_source_root(tmp.path());
+    let live_home = tmp.path().join("codex-home");
+    let foreign = live_home.join("skills/reporting/foreign");
+    symlink(Path::new("/var/empty/foreign-skill"), &foreign);
+    let source_arg = source_root.to_string_lossy().into_owned();
+    let live_arg = live_home.to_string_lossy().into_owned();
+    let output = run_cli(&[
+        "prune-stale",
+        "--source-root",
+        &source_arg,
+        "--owned-source-root",
+        "/",
+        "--product",
+        "codex",
+        "--live-home",
+        &live_arg,
+        "--apply",
+    ]);
+
+    assert_eq!(output.code, 2);
+    assert!(output.stderr_text().contains("cannot be a filesystem root"));
+    assert!(
+        fs::symlink_metadata(&foreign)
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+}
+
+#[test]
+fn rejects_non_runtime_kit_root_without_removing_its_symlink() {
+    let tmp = TempDir::new().unwrap();
+    let source_root = build_codex_source_root(tmp.path());
+    let unrelated_root = tmp.path().join("unrelated");
+    write(
+        &unrelated_root.join("targets/codex/link-map.yaml"),
+        "schema_version: 1\nentries: []\n",
+    );
+    let unrelated_root = fs::canonicalize(unrelated_root).unwrap();
+    let live_home = tmp.path().join("codex-home");
+    let foreign = live_home.join("skills/reporting/foreign");
+    symlink(&unrelated_root.join("foreign-skill"), &foreign);
+    let source_arg = source_root.to_string_lossy().into_owned();
+    let unrelated_arg = unrelated_root.to_string_lossy().into_owned();
+    let live_arg = live_home.to_string_lossy().into_owned();
+    let output = run_cli(&[
+        "prune-stale",
+        "--source-root",
+        &source_arg,
+        "--owned-source-root",
+        &unrelated_arg,
+        "--product",
+        "codex",
+        "--live-home",
+        &live_arg,
+        "--apply",
+    ]);
+
+    assert_eq!(output.code, 2);
+    assert!(
+        output
+            .stderr_text()
+            .contains("link-map contains no managed entries")
+    );
+    assert!(
+        fs::symlink_metadata(&foreign)
+            .unwrap()
+            .file_type()
+            .is_symlink()
     );
 }
 

@@ -1,9 +1,10 @@
 //! `agent-runtime prune-stale` body.
 //!
 //! The command scans only install-map-owned runtime-home roots, then removes
-//! stale symlinks whose targets are lexically under the selected source root.
-//! Ambiguous user-owned files, non-empty directories, and foreign symlinks are
-//! reported but never deleted.
+//! stale symlinks whose targets are lexically under the selected source root or
+//! an additional source root the caller explicitly marks as owned. Ambiguous
+//! user-owned files, non-empty directories, and foreign symlinks are reported
+//! but never deleted.
 
 use crate::install::link_map::{LinkMap, LinkMapError};
 use crate::install::overlay::{self, LinkMapOverlay, OverlaySummary};
@@ -69,6 +70,28 @@ pub struct PruneOutcome {
     pub changes: Vec<PruneChange>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub overlay: Option<OverlaySummary>,
+}
+
+#[derive(Debug, Error)]
+pub enum PruneWithOwnedRootsError {
+    #[error(transparent)]
+    Prune(#[from] PruneError),
+    #[error("owned source root must be absolute: {path}")]
+    RelativeOwnedSourceRoot { path: PathBuf },
+    #[error("owned source root cannot be a filesystem root: {path}")]
+    FilesystemOwnedSourceRoot { path: PathBuf },
+    #[error("owned source root has no valid non-empty {product} link-map: {path}: {reason}")]
+    InvalidOwnedSourceRoot {
+        path: PathBuf,
+        product: String,
+        reason: String,
+    },
+}
+
+#[derive(Debug, Serialize)]
+pub struct PruneWithOwnedRootsOutcome {
+    pub outcome: PruneOutcome,
+    pub owned_source_roots: Vec<PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -170,12 +193,55 @@ pub fn run(
     mode: Mode,
     options: &PruneOptions,
 ) -> Result<PruneOutcome, PruneError> {
+    let owned_source_roots = BTreeSet::from([normalize_absolute_path(source_root)]);
+    run_inner(
+        product,
+        source_root,
+        live_home,
+        mode,
+        options,
+        &owned_source_roots,
+    )
+}
+
+pub fn run_with_owned_source_roots(
+    product: &str,
+    source_root: &Path,
+    live_home: &Path,
+    mode: Mode,
+    options: &PruneOptions,
+    additional_owned_source_roots: &[PathBuf],
+) -> Result<PruneWithOwnedRootsOutcome, PruneWithOwnedRootsError> {
+    let owned_source_roots =
+        collect_owned_source_roots(product, source_root, additional_owned_source_roots)?;
+    let outcome = run_inner(
+        product,
+        source_root,
+        live_home,
+        mode,
+        options,
+        &owned_source_roots,
+    )?;
+    Ok(PruneWithOwnedRootsOutcome {
+        outcome,
+        owned_source_roots: owned_source_roots.into_iter().collect(),
+    })
+}
+
+fn run_inner(
+    product: &str,
+    source_root: &Path,
+    live_home: &Path,
+    mode: Mode,
+    options: &PruneOptions,
+    owned_source_roots: &BTreeSet<PathBuf>,
+) -> Result<PruneOutcome, PruneError> {
     let mut link_map = LinkMap::load(source_root, product)?;
     let overlay = merge_overlay(&mut link_map, source_root, options)?;
     let plan = InstallPlan::build(product, source_root, live_home, Path::new(""), &link_map)?;
     let expected = expected_paths_from_plan(live_home, &plan);
     let scan_roots = live_surface::scan_roots(&link_map);
-    let candidates = collect_candidates(live_home, source_root, &expected, &scan_roots)?;
+    let candidates = collect_candidates(live_home, owned_source_roots, &expected, &scan_roots)?;
     let changes = match mode {
         Mode::DryRun => candidates.into_iter().map(dry_run_change).collect(),
         Mode::Apply => apply_candidates(candidates)?,
@@ -189,6 +255,39 @@ pub fn run(
         changes,
         overlay,
     })
+}
+
+fn collect_owned_source_roots(
+    product: &str,
+    source_root: &Path,
+    additional_owned_source_roots: &[PathBuf],
+) -> Result<BTreeSet<PathBuf>, PruneWithOwnedRootsError> {
+    let mut roots = BTreeSet::from([normalize_absolute_path(source_root)]);
+    for root in additional_owned_source_roots {
+        if !root.is_absolute() {
+            return Err(PruneWithOwnedRootsError::RelativeOwnedSourceRoot { path: root.clone() });
+        }
+        let root = normalize_absolute_path(root);
+        if root.parent().is_none() {
+            return Err(PruneWithOwnedRootsError::FilesystemOwnedSourceRoot { path: root });
+        }
+        let link_map = LinkMap::load(&root, product).map_err(|error| {
+            PruneWithOwnedRootsError::InvalidOwnedSourceRoot {
+                path: root.clone(),
+                product: product.to_string(),
+                reason: error.to_string(),
+            }
+        })?;
+        if link_map.entries.is_empty() {
+            return Err(PruneWithOwnedRootsError::InvalidOwnedSourceRoot {
+                path: root,
+                product: product.to_string(),
+                reason: "link-map contains no managed entries".to_string(),
+            });
+        }
+        roots.insert(root);
+    }
+    Ok(roots)
 }
 
 fn merge_overlay(
@@ -227,7 +326,7 @@ fn expected_paths_from_plan(live_home: &Path, plan: &InstallPlan) -> BTreeSet<Pa
 
 fn collect_candidates(
     live_home: &Path,
-    source_root: &Path,
+    owned_source_roots: &BTreeSet<PathBuf>,
     expected: &BTreeSet<PathBuf>,
     scan_roots: &BTreeSet<PathBuf>,
 ) -> Result<Vec<Candidate>, PruneError> {
@@ -235,7 +334,7 @@ fn collect_candidates(
     for rel_root in scan_roots {
         collect_dir(
             live_home,
-            source_root,
+            owned_source_roots,
             expected,
             rel_root,
             rel_root,
@@ -250,7 +349,7 @@ fn collect_candidates(
 
 fn collect_dir(
     live_home: &Path,
-    source_root: &Path,
+    owned_source_roots: &BTreeSet<PathBuf>,
     expected: &BTreeSet<PathBuf>,
     scan_root: &Path,
     rel_dir: &Path,
@@ -295,7 +394,7 @@ fn collect_dir(
                 path: child_abs.clone(),
                 source,
             })?;
-            if symlink_target_is_owned(source_root, &target) {
+            if symlink_target_is_owned(owned_source_roots, &target) {
                 candidates.push(Candidate::Symlink {
                     rel_path: child_rel,
                     path: child_abs,
@@ -319,7 +418,7 @@ fn collect_dir(
         } else if child_meta.is_dir() {
             let child_removable = collect_dir(
                 live_home,
-                source_root,
+                owned_source_roots,
                 expected,
                 scan_root,
                 &child_rel,
@@ -521,13 +620,14 @@ fn change_rel_path(change: &PruneChange) -> &Path {
     }
 }
 
-fn symlink_target_is_owned(source_root: &Path, target: &Path) -> bool {
+fn symlink_target_is_owned(owned_source_roots: &BTreeSet<PathBuf>, target: &Path) -> bool {
     if !target.is_absolute() {
         return false;
     }
-    let source_root = normalize_absolute_path(source_root);
     let target = normalize_absolute_path(target);
-    target.starts_with(source_root)
+    owned_source_roots
+        .iter()
+        .any(|source_root| target.starts_with(source_root))
 }
 
 fn normalize_absolute_path(path: &Path) -> PathBuf {
