@@ -12,6 +12,15 @@ if [[ ! -f "$script" ]]; then
   echo "FAIL: missing release-only detector: $script" >&2
   exit 1
 fi
+
+echo "== system bash parser compatibility =="
+if [[ ! -x /bin/bash ]]; then
+  echo "FAIL: /bin/bash is required for release detector compatibility" >&2
+  exit 1
+fi
+/bin/bash -n "$script"
+echo "ok: release-only detector parses with /bin/bash"
+
 producer_script="$repo_root/.agents/skills/project-bump-version-tag-release/scripts/project-bump-version-tag-release.sh"
 if [[ ! -f "$producer_script" ]]; then
   echo "FAIL: missing canonical release producer: $producer_script" >&2
