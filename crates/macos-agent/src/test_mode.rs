@@ -1,5 +1,6 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
+use std::{fs::OpenOptions, io::Write};
 
 pub fn enabled() -> bool {
     cfg!(debug_assertions)
@@ -55,6 +56,17 @@ pub fn lock_path_override() -> Option<PathBuf> {
 
 pub fn cleanup_failure() -> bool {
     enabled() && std::env::var_os("NILS_MACOS_AGENT_TEST_CLEANUP_FAIL").is_some()
+}
+
+pub fn record_runtime_action(action: &str) -> std::io::Result<()> {
+    if !enabled() {
+        return Ok(());
+    }
+    let Some(path) = std::env::var_os("NILS_MACOS_AGENT_TEST_RUNTIME_ACTION_TRACE") else {
+        return Ok(());
+    };
+    let mut trace = OpenOptions::new().create(true).append(true).open(path)?;
+    writeln!(trace, "{action}")
 }
 
 pub fn ssh_mcp_exit_timeout() -> Duration {
