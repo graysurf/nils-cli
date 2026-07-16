@@ -485,7 +485,7 @@ operations:
         review_url: string
         author: string
         deleted: boolean
-    notes: "the live command fetches the named PR and complete review snapshot first; --review must identify a PENDING node in that snapshot and its author must equal gh api user. Only then is that exact node id passed to deletePullRequestReview."
+    notes: "the live command fetches the named PR and complete paginated pending-only review snapshot first; --review must identify a PENDING node with viewerDidAuthor and viewerCanDelete both true. Only then is that exact node id passed to deletePullRequestReview."
 
   - id: pr.tasks
     schema_version: cli.forge-cli.pr.tasks.v1

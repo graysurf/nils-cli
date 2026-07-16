@@ -4,7 +4,44 @@ use std::fs;
 
 use pretty_assertions::assert_eq;
 
-use super::support::{StubEnv, parse_envelope, run_forge_cli};
+use super::support::{CmdOutput, StubEnv, parse_envelope, run_forge_cli};
+
+#[test]
+fn pr_pending_review_catalog_uses_provider_native_viewer_guards() {
+    let catalog = include_str!("../../docs/specs/forge-cli-ops-v1.yaml");
+    let operation = catalog
+        .split_once("  - id: pr.pending-review.delete\n")
+        .expect("pending-review operation")
+        .1
+        .split_once("  - id: pr.tasks\n")
+        .expect("pr.tasks follows pending-review operation")
+        .0;
+
+    assert!(operation.contains("viewerDidAuthor"));
+    assert!(operation.contains("viewerCanDelete"));
+    assert!(!operation.contains("gh api user"));
+}
+
+fn run_pending_delete_with_script(script: &str, review: &str) -> CmdOutput {
+    let stub = StubEnv::new().gh_stub(script);
+    run_forge_cli(
+        &stub,
+        &[
+            "--provider",
+            "github",
+            "--repo",
+            "acme/widgets",
+            "--format",
+            "json",
+            "pr",
+            "pending-review",
+            "delete",
+            "42",
+            "--review",
+            review,
+        ],
+    )
+}
 
 #[test]
 fn pr_pending_review_delete_verifies_and_deletes_the_exact_pending_node() {
@@ -394,6 +431,210 @@ esac
         env["error"]["message"]
             .as_str()
             .is_some_and(|message| message.contains("different review"))
+    );
+}
+
+#[test]
+fn pr_pending_review_delete_classifies_invalid_mutation_receipts() {
+    let cases = [
+        ("invalid-json", "not-json", 70, "software_error"),
+        (
+            "graphql-error",
+            r#"{"errors":[{"message":"denied"}],"data":{"deletePullRequestReview":null}}"#,
+            1,
+            "backend_error",
+        ),
+        (
+            "missing-url",
+            r#"{"data":{"deletePullRequestReview":{"pullRequestReview":{"id":"PRR_pending"}}}}"#,
+            70,
+            "software_error",
+        ),
+    ];
+
+    for (name, receipt, exit_code, error_code) in cases {
+        let script = r#"#!/bin/sh
+set -eu
+case "$1 $2" in
+  "pr view")
+    printf '%s\n' '{"number":42,"url":"https://github.com/acme/widgets/pull/42","state":"OPEN","isDraft":false,"baseRefName":"main","headRefName":"feat/reviews","headRefOid":"head-new","title":"feat: reviews","body":""}'
+    ;;
+  "api graphql")
+    case "$*" in
+      *"deletePullRequestReview(input:"*)
+        printf '%s\n' '__RECEIPT__'
+        ;;
+      *)
+        printf '%s\n' '{"data":{"repository":{"pullRequest":{"headRefOid":"head-new","reviews":{"nodes":[{"id":"PRR_pending","url":"https://github.com/acme/widgets/pull/42#pullrequestreview-102","author":{"login":"reviewer"},"state":"PENDING","viewerDidAuthor":true,"viewerCanDelete":true}],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}}}'
+        ;;
+    esac
+    ;;
+  *)
+    echo "unexpected gh args: $*" >&2
+    exit 99
+    ;;
+esac
+"#
+        .replace("__RECEIPT__", receipt);
+        let stub = StubEnv::new().gh_stub(&script);
+
+        let out = run_forge_cli(
+            &stub,
+            &[
+                "--provider",
+                "github",
+                "--repo",
+                "acme/widgets",
+                "--format",
+                "json",
+                "pr",
+                "pending-review",
+                "delete",
+                "42",
+                "--review",
+                "PRR_pending",
+            ],
+        );
+
+        assert_eq!(
+            out.code, exit_code,
+            "case={name}\nstdout={}\nstderr={}",
+            out.stdout, out.stderr
+        );
+        let env = parse_envelope(&out.stdout);
+        assert_eq!(env["ok"], false, "case={name}");
+        assert_eq!(env["error"]["code"], error_code, "case={name}");
+    }
+}
+
+#[test]
+fn pr_pending_review_delete_rejects_incomplete_or_non_pending_snapshots() {
+    let cases = [
+        (
+            "graphql-error",
+            r#"{"errors":[{"message":"partial"}],"data":{"repository":{"pullRequest":null}}}"#,
+        ),
+        (
+            "missing-viewer-guard",
+            r#"{"data":{"repository":{"pullRequest":{"headRefOid":"head-new","reviews":{"nodes":[{"id":"PRR_pending","url":"https://github.com/acme/widgets/pull/42#pullrequestreview-102","author":{"login":"reviewer"},"state":"PENDING","viewerDidAuthor":true}],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}}}"#,
+        ),
+        (
+            "non-pending-node",
+            r#"{"data":{"repository":{"pullRequest":{"headRefOid":"head-new","reviews":{"nodes":[{"id":"PRR_pending","url":"https://github.com/acme/widgets/pull/42#pullrequestreview-102","author":{"login":"reviewer"},"state":"COMMENTED","viewerDidAuthor":true,"viewerCanDelete":true}],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}}}"#,
+        ),
+    ];
+
+    for (name, snapshot) in cases {
+        let script = r#"#!/bin/sh
+set -eu
+case "$1 $2" in
+  "pr view")
+    printf '%s\n' '{"number":42,"url":"https://github.com/acme/widgets/pull/42","state":"OPEN","isDraft":false,"baseRefName":"main","headRefName":"feat/reviews","headRefOid":"head-new","title":"feat: reviews","body":""}'
+    ;;
+  "api graphql")
+    case "$*" in
+      *"deletePullRequestReview(input:"*)
+        echo "delete must not run for an invalid snapshot" >&2
+        exit 99
+        ;;
+      *)
+        printf '%s\n' '__SNAPSHOT__'
+        ;;
+    esac
+    ;;
+  *)
+    echo "unexpected gh args: $*" >&2
+    exit 99
+    ;;
+esac
+"#
+        .replace("__SNAPSHOT__", snapshot);
+        let out = run_pending_delete_with_script(&script, "PRR_pending");
+
+        assert_eq!(
+            out.code, 65,
+            "case={name}\nstdout={}\nstderr={}",
+            out.stdout, out.stderr
+        );
+        let env = parse_envelope(&out.stdout);
+        assert_eq!(env["error"]["code"], "review_snapshot_incomplete");
+    }
+}
+
+#[test]
+fn pr_pending_review_delete_rejects_head_drift_while_paginating() {
+    let script = r#"#!/bin/sh
+set -eu
+case "$1 $2" in
+  "pr view")
+    printf '%s\n' '{"number":42,"url":"https://github.com/acme/widgets/pull/42","state":"OPEN","isDraft":false,"baseRefName":"main","headRefName":"feat/reviews","headRefOid":"head-new","title":"feat: reviews","body":""}'
+    ;;
+  "api graphql")
+    case "$*" in
+      *"deletePullRequestReview(input:"*)
+        echo "delete must not run after head drift" >&2
+        exit 99
+        ;;
+      *"after=cursor-1"*)
+        printf '%s\n' '{"data":{"repository":{"pullRequest":{"headRefOid":"head-changed","reviews":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}}}'
+        ;;
+      *)
+        printf '%s\n' '{"data":{"repository":{"pullRequest":{"headRefOid":"head-new","reviews":{"nodes":[],"pageInfo":{"hasNextPage":true,"endCursor":"cursor-1"}}}}}}'
+        ;;
+    esac
+    ;;
+  *)
+    echo "unexpected gh args: $*" >&2
+    exit 99
+    ;;
+esac
+"#;
+
+    let out = run_pending_delete_with_script(script, "PRR_pending");
+    assert_eq!(out.code, 65, "stdout={}\nstderr={}", out.stdout, out.stderr);
+    let env = parse_envelope(&out.stdout);
+    assert_eq!(env["error"]["code"], "review_snapshot_incomplete");
+    assert!(
+        env["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("head changed"))
+    );
+}
+
+#[test]
+fn pr_pending_review_delete_rejects_a_repeated_pagination_cursor() {
+    let script = r#"#!/bin/sh
+set -eu
+case "$1 $2" in
+  "pr view")
+    printf '%s\n' '{"number":42,"url":"https://github.com/acme/widgets/pull/42","state":"OPEN","isDraft":false,"baseRefName":"main","headRefName":"feat/reviews","headRefOid":"head-new","title":"feat: reviews","body":""}'
+    ;;
+  "api graphql")
+    case "$*" in
+      *"deletePullRequestReview(input:"*)
+        echo "delete must not run after a repeated cursor" >&2
+        exit 99
+        ;;
+      *)
+        printf '%s\n' '{"data":{"repository":{"pullRequest":{"headRefOid":"head-new","reviews":{"nodes":[],"pageInfo":{"hasNextPage":true,"endCursor":"cursor-1"}}}}}}'
+        ;;
+    esac
+    ;;
+  *)
+    echo "unexpected gh args: $*" >&2
+    exit 99
+    ;;
+esac
+"#;
+
+    let out = run_pending_delete_with_script(script, "PRR_pending");
+    assert_eq!(out.code, 65, "stdout={}\nstderr={}", out.stdout, out.stderr);
+    let env = parse_envelope(&out.stdout);
+    assert_eq!(env["error"]["code"], "review_snapshot_incomplete");
+    assert!(
+        env["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("repeated a cursor"))
     );
 }
 
