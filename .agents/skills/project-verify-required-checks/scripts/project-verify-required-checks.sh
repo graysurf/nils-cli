@@ -17,6 +17,9 @@ Runs the full CI/parity checks from DEVELOPMENT.md:
   - bash scripts/ci/tests/completion-freshness-audit.test.sh
   - bash scripts/ci/tests/local-fast-checks.test.sh
   - bash scripts/ci/tests/detect-docs-only.test.sh
+  - bash scripts/ci/tests/detect-release-only.test.sh
+  - node scripts/ci/tests/release-ci-gate.test.cjs
+  - bash scripts/ci/tests/release-workflow-contract.test.sh
   - bash scripts/ci/tests/shared-helper-adoption-audit.test.sh
   - bash scripts/ci/tests/publish-order-audit.test.sh
   - bash scripts/ci/tests/docs-hygiene-audit.test.sh
@@ -78,7 +81,7 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-required_cmds=(git npx rg)
+required_cmds=(git node npx rg)
 if [[ "$docs_only" -eq 0 ]]; then
   required_cmds+=(cargo python3 zsh)
 fi
@@ -143,6 +146,9 @@ run bash scripts/ci/tests/install-local-release-binaries.test.sh
 run bash scripts/ci/tests/completion-freshness-audit.test.sh
 run bash scripts/ci/tests/local-fast-checks.test.sh
 run bash scripts/ci/tests/detect-docs-only.test.sh
+run bash scripts/ci/tests/detect-release-only.test.sh
+run node scripts/ci/tests/release-ci-gate.test.cjs
+run bash scripts/ci/tests/release-workflow-contract.test.sh
 run bash scripts/ci/tests/shared-helper-adoption-audit.test.sh
 run bash scripts/ci/tests/publish-order-audit.test.sh
 run bash scripts/ci/tests/docs-hygiene-audit.test.sh
