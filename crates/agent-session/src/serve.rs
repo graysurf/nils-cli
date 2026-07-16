@@ -59,14 +59,14 @@ use crate::provider_prompt::{
     ProviderPromptSource, ProviderPromptTail,
 };
 use crate::{
-    BINARY, CliContext, CliError, ProviderResumeImportArgs, SessionRecord, SessionTitleState,
-    SessionTitleStateInput, SessionView, StartFailureDisposition, WorkdirSearchOptions,
-    canonicalize_structured_title_pair, cleanup_session_delete_tombstones, delete_session,
-    glance_session, list_sessions, load_session_record, non_empty_env, repo_remote_url_from_cwd,
-    resolve_tmux_bin, resume_session_by_id, search_workdirs, send_auto_resume_input,
-    send_input_serialized, session_clipboard_buffer, session_dir, session_status, short_hostname,
-    start_provider_resume_session, start_session, update_session_title_if_revision,
-    write_session_attachment,
+    BINARY, CliContext, CliError, ProviderResumeImportArgs, SessionRecord, SessionRegistryFence,
+    SessionTitleState, SessionTitleStateInput, SessionView, StartFailureDisposition,
+    WorkdirSearchOptions, canonicalize_structured_title_pair, cleanup_session_delete_tombstones,
+    delete_session, glance_session, list_sessions, load_session_record, non_empty_env,
+    repo_remote_url_from_cwd, resolve_tmux_bin, resume_session_by_id, search_workdirs,
+    send_auto_resume_input, send_input_serialized, session_clipboard_buffer, session_dir,
+    session_status, short_hostname, start_provider_resume_session, start_session,
+    update_session_title_if_revision, write_session_attachment,
 };
 
 const ATTACH_LIVE_FIFO_NAME: &str = "attach-live.fifo";
@@ -110,6 +110,7 @@ const ACTIVITY_STREAM_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
 const ACTIVITY_STREAM_DEBOUNCE: Duration = Duration::from_millis(25);
 const ACTIVITY_STREAM_MAX_REFRESH_CADENCE: Duration = Duration::from_millis(250);
 const ACTIVITY_STREAM_OVERSIZED_REASON: &str = "oversized_snapshot";
+const SESSION_DELETE_TOMBSTONE_CLEANUP_LIMIT: usize = 64;
 const RESET_AT_KEYS: &[&str] = &["reset_at", "resetAt", "resets_at", "resetsAt"];
 const RESET_AT_EPOCH_KEYS: &[&str] = &[
     "reset_at_epoch",
@@ -169,6 +170,21 @@ impl CodexAccountSwitchRegistry {
 
 fn default_session_collector() -> SessionCollector {
     Arc::new(|context, tmux_bin| list_sessions(context, Some(tmux_bin)))
+}
+
+async fn bind_listener_and_start_delete_tombstone_cleanup(
+    context: &CliContext,
+    bind: SocketAddr,
+) -> io::Result<tokio::net::TcpListener> {
+    let listener = tokio::net::TcpListener::bind(bind).await?;
+    let cleanup_context = context.clone();
+    std::thread::spawn(move || {
+        let _ = cleanup_session_delete_tombstones(
+            &cleanup_context,
+            SESSION_DELETE_TOMBSTONE_CLEANUP_LIMIT,
+        );
+    });
+    Ok(listener)
 }
 
 pub fn run_serve(context: &CliContext, args: cli::ServeArgs) -> i32 {
@@ -262,7 +278,7 @@ pub fn run_serve(context: &CliContext, args: cli::ServeArgs) -> i32 {
             codex_account_switches: CodexAccountSwitchRegistry::default(),
             session_collector,
         });
-        let listener = match tokio::net::TcpListener::bind(bind).await {
+        let listener = match bind_listener_and_start_delete_tombstone_cleanup(context, bind).await {
             Ok(listener) => listener,
             Err(err) => {
                 eprintln!("error: failed to bind {bind}: {err}");
@@ -273,14 +289,6 @@ pub fn run_serve(context: &CliContext, args: cli::ServeArgs) -> i32 {
             "agent-session serve listening on http://{bind} (machine={})",
             state.machine
         );
-        // Logical deletion commits via an atomic tombstone rename. Physical
-        // cleanup must never delay listener availability, so retry a bounded
-        // number of old quarantines on a detached background worker only after
-        // the socket has bound successfully.
-        let cleanup_context = context.clone();
-        std::thread::spawn(move || {
-            let _ = cleanup_session_delete_tombstones(&cleanup_context, 64);
-        });
         let app = router(state.clone());
         let codex_control_task = tokio::spawn(codex_control_loop(state.clone()));
         let auto_resume_task = tokio::spawn(auto_resume_loop(state.clone()));
@@ -3475,18 +3483,35 @@ async fn maintenance_action_handler(
     .await
     {
         Ok(Ok(result)) => {
-            if result.deleted() {
-                if let Ok(mut controls) = state.codex_controls.lock() {
-                    controls.remove(&id);
-                }
-                state.attach_brokers.shutdown_session(&id).await;
-                state.provider_prompt_discovery.evict_session(&id).await;
+            if let Some(fence) = result.deleted_registry_fence().cloned() {
+                cleanup_deleted_session_registries(&state, &fence).await;
             }
             envelope_ok(json!({ "machine": state.machine, "maintenance_result": result }))
         }
         Ok(Err(err)) => envelope_err(err),
         Err(_) => join_err(),
     }
+}
+
+async fn cleanup_deleted_session_registries(state: &ServeState, fence: &SessionRegistryFence) {
+    if let Some(expected_launch_id) = fence.runtime_launch_id.as_deref()
+        && let Ok(mut controls) = state.codex_controls.lock()
+    {
+        let matches = controls
+            .get(&fence.session_id)
+            .is_some_and(|entry| entry.launch_id == expected_launch_id);
+        if matches {
+            controls.remove(&fence.session_id);
+        }
+    }
+    state
+        .attach_brokers
+        .shutdown_session_if_matches(fence)
+        .await;
+    state
+        .provider_prompt_discovery
+        .evict_session_if_matches(fence)
+        .await;
 }
 
 async fn update_session_handler(
@@ -3750,11 +3775,7 @@ async fn delete_handler(
     let delete_id = id.clone();
     match tokio::task::spawn_blocking(move || delete_session(&context, &delete_id, tmux)).await {
         Ok(Ok(result)) => {
-            if let Ok(mut controls) = state.codex_controls.lock() {
-                controls.remove(&id);
-            }
-            state.attach_brokers.shutdown_session(&id).await;
-            state.provider_prompt_discovery.evict_session(&id).await;
+            cleanup_deleted_session_registries(&state, &result.registry_fence).await;
             envelope_ok(json!({ "machine": state.machine, "deleted": result }))
         }
         Ok(Err(err)) => envelope_err(err),
@@ -3929,6 +3950,7 @@ struct AttachBrokerSlot {
 struct AttachBrokerGeneration {
     generation: u64,
     subscribers: usize,
+    registry_fence: SessionRegistryFence,
     broker: AttachBroker,
 }
 
@@ -4115,11 +4137,18 @@ impl ProviderPromptDiscoveryRegistry {
         }
     }
 
-    async fn evict_session(&self, session_id: &str) {
-        self.entries
-            .lock()
-            .await
-            .retain(|key, _| key.session_id != session_id);
+    async fn evict_session_if_matches(&self, fence: &SessionRegistryFence) {
+        let (Some(expected_launch_id), Some(expected_generation)) =
+            (fence.runtime_launch_id.as_deref(), fence.runtime_generation)
+        else {
+            return;
+        };
+        self.entries.lock().await.retain(|key, _| {
+            key.session_id != fence.session_id
+                || key.tmux_session != fence.tmux_session
+                || key.launch_id != expected_launch_id
+                || key.generation != expected_generation
+        });
     }
 
     #[cfg(test)]
@@ -4248,9 +4277,11 @@ impl AttachBrokerRegistry {
             ));
         }
 
+        let registry_fence = SessionRegistryFence::from_record(record);
         let target = format!("{}:0.0", record.tmux_session);
         if let Some(active) = slot_state.active.as_mut()
             && active.broker.target == target
+            && active.registry_fence == registry_fence
         {
             // Subscribe before checking `closed`. If the reader exits between
             // these operations, this receiver observes its terminal event.
@@ -4279,6 +4310,7 @@ impl AttachBrokerRegistry {
         slot_state.active = Some(AttachBrokerGeneration {
             generation,
             subscribers: 1,
+            registry_fence,
             broker,
         });
         Ok(AttachSubscription {
@@ -4305,12 +4337,15 @@ impl AttachBrokerRegistry {
         }
     }
 
-    async fn shutdown_session(&self, session_id: &str) {
-        let slot = self.entries.lock().await.remove(session_id);
+    async fn shutdown_session_if_matches(&self, fence: &SessionRegistryFence) {
+        let slot = self.entries.lock().await.get(&fence.session_id).cloned();
         if let Some(slot) = slot {
             let mut slot = slot.lock().await;
-            slot.accepting = false;
-            if let Some(active) = slot.active.take() {
+            let matches = slot
+                .active
+                .as_ref()
+                .is_some_and(|active| active.registry_fence == *fence);
+            if matches && let Some(active) = slot.active.take() {
                 active.broker.stop().await;
             }
         }
@@ -5364,6 +5399,78 @@ mod tests {
     const MACHINE: &str = "test-machine";
     const TOKEN: &str = "s3cr3t-token";
 
+    #[tokio::test]
+    async fn delete_tombstone_cleanup_starts_after_bind_and_is_bounded() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let context = CliContext {
+            state_dir: tmp.path().to_path_buf(),
+            host: None,
+        };
+        let root = tmp.path().join(crate::SESSION_DELETE_TOMBSTONES_DIR);
+        std::fs::create_dir(&root).unwrap();
+        for index in 0..65 {
+            let tombstone = root.join(format!("session-{index}"));
+            std::fs::create_dir(&tombstone).unwrap();
+            std::fs::write(tombstone.join("session.json"), b"retired").unwrap();
+        }
+
+        let occupied = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = occupied.local_addr().unwrap();
+        assert!(
+            bind_listener_and_start_delete_tombstone_cleanup(&context, address)
+                .await
+                .is_err()
+        );
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 65);
+
+        drop(occupied);
+        let listener = bind_listener_and_start_delete_tombstone_cleanup(&context, address)
+            .await
+            .unwrap();
+        let connected = tokio::net::TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        drop(connected);
+
+        let started_at = Instant::now();
+        loop {
+            let remaining = std::fs::read_dir(&root).unwrap().count();
+            if remaining == 1 {
+                break;
+            }
+            assert!(
+                started_at.elapsed() < Duration::from_secs(2),
+                "post-bind cleanup did not finish its bounded sweep: remaining={remaining}"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn delete_tombstone_cleanup_failure_does_not_block_listener_availability() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let context = CliContext {
+            state_dir: tmp.path().to_path_buf(),
+            host: None,
+        };
+        std::fs::write(
+            tmp.path().join(crate::SESSION_DELETE_TOMBSTONES_DIR),
+            b"invalid cleanup root",
+        )
+        .unwrap();
+
+        let listener = bind_listener_and_start_delete_tombstone_cleanup(
+            &context,
+            "127.0.0.1:0".parse().unwrap(),
+        )
+        .await
+        .unwrap();
+        let connected = tokio::net::TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        drop(connected);
+    }
+
     struct TestProcessGroup {
         child: Option<std::process::Child>,
         process_group_id: libc::pid_t,
@@ -5731,7 +5838,17 @@ mod tests {
         assert!(registry.resolve_source(&second).await.is_none());
         assert_eq!(registry.entry_count().await, 1);
 
-        registry.evict_session("discovery-lifecycle").await;
+        registry
+            .evict_session_if_matches(&crate::SessionRegistryFence::from_record(&first))
+            .await;
+        assert_eq!(
+            registry.entry_count().await,
+            1,
+            "late cleanup for the deleted generation must retain its replacement"
+        );
+        registry
+            .evict_session_if_matches(&crate::SessionRegistryFence::from_record(&second))
+            .await;
         assert_eq!(registry.entry_count().await, 0);
     }
 
@@ -11275,6 +11392,191 @@ esac
     }
 
     #[tokio::test]
+    async fn maintenance_resume_accepts_a_pre_runtime_record_with_paired_null_identity() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let id = "maintenance-pre-runtime-paired-null";
+        seed_session(
+            tmp.path(),
+            id,
+            "codex",
+            "hs-codex-maintenance-pre-runtime-paired-null",
+        );
+        let st = state(tmp.path(), Some(TOKEN), minimal_tmux(tmp.path()));
+
+        let (status, preview) = call(
+            router(st.clone()),
+            get_auth(
+                &format!("/sessions/{id}/maintenance?operation=resume"),
+                Some(TOKEN),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "body={preview}");
+        let maintenance = &preview["data"]["maintenance"];
+
+        let (status, body) = call(
+            router(st),
+            post_json(
+                &format!("/sessions/{id}/maintenance/actions"),
+                Some(TOKEN),
+                json!({
+                    "operation": "resume",
+                    "action": "retry_resume",
+                    "expected_session_incarnation": null,
+                    "expected_session_generation": null,
+                    "expected_preview_digest": maintenance["preview_digest"]
+                }),
+            ),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK, "body={body}");
+        let result = &body["data"]["maintenance_result"];
+        assert_eq!(result["outcome"], "resumed");
+        assert_eq!(result["status"], "running");
+        assert_eq!(result["session_incarnation"], Value::Null);
+        assert_eq!(result["session_generation"], Value::Null);
+    }
+
+    #[tokio::test]
+    async fn maintenance_delete_by_prefix_cleans_the_canonical_runtime_registry() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cwd = tmp.path().join("repo");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let id = "maintenance-prefix-delete-canonical";
+        let prefix = "maintenance-prefix-delete-can";
+        seed_resumable_session(
+            tmp.path(),
+            id,
+            "codex",
+            "hs-codex-maintenance-prefix-delete-canonical",
+            &cwd,
+            &[
+                "resume",
+                "resume-session-id",
+                "--cd",
+                cwd.to_str().unwrap(),
+                "--no-alt-screen",
+            ],
+        );
+        let tmux = executable(
+            &tmp.path().join("stopped-prefix-delete-tmux"),
+            "#!/usr/bin/env sh\nprintf '%s\\n' \"can't find session: stopped\" >&2\nexit 1\n",
+        );
+        let st = state(tmp.path(), Some(TOKEN), tmux);
+        let (handle, _commands) = codex_app_server::control_channel();
+        st.codex_controls.lock().unwrap().insert(
+            id.to_string(),
+            CodexControlEntry {
+                launch_id: "never-launched-fixture".to_string(),
+                handle,
+            },
+        );
+
+        let (status, preview) = call(
+            router(st.clone()),
+            get_auth(
+                &format!("/sessions/{prefix}/maintenance?operation=delete"),
+                Some(TOKEN),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "body={preview}");
+        let maintenance = &preview["data"]["maintenance"];
+
+        let (status, body) = call(
+            router(st.clone()),
+            post_json(
+                &format!("/sessions/{prefix}/maintenance/actions"),
+                Some(TOKEN),
+                json!({
+                    "operation": "delete",
+                    "action": "retry_delete",
+                    "expected_session_incarnation": maintenance["session_incarnation"],
+                    "expected_session_generation": maintenance["session_generation"],
+                    "expected_preview_digest": maintenance["preview_digest"],
+                    "confirmed": true
+                }),
+            ),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK, "body={body}");
+        assert_eq!(body["data"]["maintenance_result"]["session_id"], id);
+        assert!(
+            !st.codex_controls.lock().unwrap().contains_key(id),
+            "prefix deletion must clean the canonical runtime registry entry"
+        );
+    }
+
+    #[tokio::test]
+    async fn maintenance_inspect_reuses_the_bounded_preview_status_probe() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cwd = tmp.path().join("repo");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let id = "maintenance-inspect-one-probe";
+        seed_resumable_session(
+            tmp.path(),
+            id,
+            "codex",
+            "hs-codex-maintenance-inspect-one-probe",
+            &cwd,
+            &[
+                "resume",
+                "resume-session-id",
+                "--cd",
+                cwd.to_str().unwrap(),
+                "--no-alt-screen",
+            ],
+        );
+        let calls = tmp.path().join("tmux-status-calls");
+        let tmux = executable(
+            &tmp.path().join("stopped-inspect-tmux"),
+            &format!(
+                "#!/usr/bin/env sh\nprintf '%s\\n' \"$*\" >> {}\nexit 1\n",
+                shell_words::quote(&crate::display_path(&calls)),
+            ),
+        );
+        let st = state(tmp.path(), Some(TOKEN), tmux);
+
+        let (status, preview) = call(
+            router(st.clone()),
+            get_auth(
+                &format!("/sessions/{id}/maintenance?operation=inspect"),
+                Some(TOKEN),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "body={preview}");
+        let maintenance = &preview["data"]["maintenance"];
+        std::fs::write(&calls, b"").unwrap();
+
+        let (status, body) = call(
+            router(st),
+            post_json(
+                &format!("/sessions/{id}/maintenance/actions"),
+                Some(TOKEN),
+                json!({
+                    "operation": "inspect",
+                    "action": "inspect",
+                    "expected_session_incarnation": maintenance["session_incarnation"],
+                    "expected_session_generation": maintenance["session_generation"],
+                    "expected_preview_digest": maintenance["preview_digest"]
+                }),
+            ),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK, "body={body}");
+        assert_eq!(body["data"]["maintenance_result"]["status"], "stopped");
+        assert_eq!(
+            std::fs::read_to_string(&calls).unwrap().lines().count(),
+            1,
+            "the action must reuse the prepared preview status instead of probing tmux twice"
+        );
+    }
+
+    #[tokio::test]
     async fn maintenance_retry_resume_uses_the_preview_and_returns_a_safe_result() {
         let lock = GlobalStateLock::new();
         let tmp = tempfile::TempDir::new().unwrap();
@@ -14398,6 +14700,53 @@ exit 0
             !enables[0].split_whitespace().any(|arg| arg == "-o"),
             "a fresh broker must replace a stale tmux pipe instead of preserving it: {calls:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn late_attach_cleanup_does_not_stop_a_same_id_replacement() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let state_dir = tmp.path().join("state");
+        let calls = tmp.path().join("calls.log");
+        let source = tmp.path().join("pane-output.fifo");
+        let writer_pid = tmp.path().join("writer.pid");
+        create_private_fifo(&source).unwrap();
+        seed_session_with_runtime(
+            &state_dir,
+            "replacement-fence",
+            "codex",
+            "hs-codex-replacement-fence",
+        );
+        let tmux = fanout_tmux(tmp.path(), &calls, &source, &writer_pid);
+        let context = CliContext {
+            state_dir,
+            host: None,
+        };
+        let old_record = load_session_record(&context, "replacement-fence").unwrap();
+        let old_fence = crate::SessionRegistryFence::from_record(&old_record);
+        let registry = AttachBrokerRegistry::default();
+        let first = registry
+            .subscribe(&context, &tmux, &old_record)
+            .await
+            .unwrap();
+
+        let mut replacement = old_record.clone();
+        let runtime = replacement.runtime.as_mut().unwrap();
+        runtime.launch_id = "launch-replacement-fence-next".to_string();
+        runtime.generation = 2;
+        let second = registry
+            .subscribe(&context, &tmux, &replacement)
+            .await
+            .unwrap();
+        registry.shutdown_session_if_matches(&old_fence).await;
+
+        assert_eq!(
+            registry.subscriber_count("replacement-fence").await,
+            1,
+            "cleanup for the deleted runtime must retain the same-id replacement broker"
+        );
+        first.release().await;
+        second.release().await;
+        wait_for_subscriber_count(&registry, "replacement-fence", 0).await;
     }
 
     #[tokio::test]

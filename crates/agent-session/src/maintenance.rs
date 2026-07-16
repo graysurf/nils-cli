@@ -125,16 +125,19 @@ pub(crate) struct MaintenanceActionResult {
     session_generation: Option<u64>,
     status: &'static str,
     cleanup_pending: bool,
+    #[serde(skip)]
+    deleted_registry_fence: Option<SessionRegistryFence>,
 }
 
 impl MaintenanceActionResult {
-    pub(crate) fn deleted(&self) -> bool {
-        self.outcome == "deleted"
+    pub(crate) fn deleted_registry_fence(&self) -> Option<&SessionRegistryFence> {
+        self.deleted_registry_fence.as_ref()
     }
 }
 
 struct PreviewAssessment {
     state: &'static str,
+    runtime_status: &'static str,
     issue_kind: Option<&'static str>,
     issue_message: Option<&'static str>,
     retryable: bool,
@@ -242,6 +245,7 @@ fn assess(
         "running" => {
             return Ok(PreviewAssessment {
                 state: "healthy",
+                runtime_status: "running",
                 issue_kind: None,
                 issue_message: None,
                 retryable: true,
@@ -255,6 +259,7 @@ fn assess(
             return Ok(blocked_assessment(
                 "unknown",
                 "session status could not be verified",
+                "unknown",
                 "unknown",
                 0,
                 Vec::new(),
@@ -274,6 +279,7 @@ fn assess(
         }
         return Ok(PreviewAssessment {
             state: "healthy",
+            runtime_status: "stopped",
             issue_kind: None,
             issue_message: None,
             retryable: true,
@@ -287,6 +293,7 @@ fn assess(
         return Ok(blocked_assessment(
             "runtime_identity_unavailable",
             "the recorded runtime identity is unavailable",
+            "stopped",
             "unknown",
             0,
             prior_identities,
@@ -301,6 +308,7 @@ fn assess(
         return Ok(blocked_assessment(
             "runtime_identity_changed",
             "the recorded runtime identity changed",
+            "stopped",
             "unknown",
             0,
             identities,
@@ -323,6 +331,7 @@ fn assess(
         return Ok(blocked_assessment(
             "runtime_identity_unavailable",
             "the recorded runtime boundary could not be verified",
+            "stopped",
             "unknown",
             0,
             identities,
@@ -334,6 +343,7 @@ fn assess(
         }
         return Ok(PreviewAssessment {
             state: "healthy",
+            runtime_status: "stopped",
             issue_kind: None,
             issue_message: None,
             retryable: true,
@@ -347,6 +357,7 @@ fn assess(
         return Ok(blocked_assessment(
             "runtime_identity_changed",
             "more than one recorded runtime boundary remains live",
+            "stopped",
             "unknown",
             running.len(),
             identities,
@@ -366,6 +377,7 @@ fn assess(
         );
     Ok(PreviewAssessment {
         state: if repairable { "repairable" } else { "blocked" },
+        runtime_status: "stopped",
         issue_kind: Some("process_boundary_live"),
         issue_message: Some("the recorded runtime process boundary is still live"),
         retryable: true,
@@ -379,6 +391,7 @@ fn assess(
 fn startup_failed_assessment(digest_identities: Vec<TmuxRuntimeIdentity>) -> PreviewAssessment {
     PreviewAssessment {
         state: "blocked",
+        runtime_status: "stopped",
         issue_kind: Some("startup_failed"),
         issue_message: Some("the last runtime startup failed"),
         retryable: true,
@@ -390,15 +403,15 @@ fn startup_failed_assessment(digest_identities: Vec<TmuxRuntimeIdentity>) -> Pre
 }
 
 fn assess_repairable_boundary(
-    identity: &TmuxRuntimeIdentity,
+    _identity: &TmuxRuntimeIdentity,
 ) -> (&'static str, usize, Option<TmuxRuntimeIdentity>) {
     #[cfg(target_os = "linux")]
-    if identity.control_group.is_some()
-        && let Ok(pinned_runtime) = prepare_process_runtime(identity)
+    if _identity.control_group.is_some()
+        && let Ok(pinned_runtime) = prepare_process_runtime(_identity)
     {
         let current_members = process_runtime_identities(&pinned_runtime);
         let count = current_members.len().max(1);
-        let mut repairable = identity.clone();
+        let mut repairable = _identity.clone();
         repairable.control_group_members = current_members;
         release_process_runtime(Some(pinned_runtime));
         return ("managed_scope", count, Some(repairable));
@@ -409,12 +422,14 @@ fn assess_repairable_boundary(
 fn blocked_assessment(
     issue_kind: &'static str,
     issue_message: &'static str,
+    runtime_status: &'static str,
     boundary_kind: &'static str,
     safe_process_count: usize,
     digest_identities: Vec<TmuxRuntimeIdentity>,
 ) -> PreviewAssessment {
     PreviewAssessment {
         state: "blocked",
+        runtime_status,
         issue_kind: Some(issue_kind),
         issue_message: Some(issue_message),
         retryable: matches!(
@@ -549,6 +564,7 @@ fn execute_inner(
     let mut record = load_session_record(context, &canonical_id)?;
     ensure_same_session_identity(&observed, &record)?;
     let prepared = preview_locked(&record, tmux_bin, request.operation)?;
+    let prepared_runtime_status = prepared.assessment.runtime_status;
     let preview = &prepared.view;
     if preview.session_incarnation != request.expected_session_incarnation
         || preview.session_generation != request.expected_session_generation
@@ -591,6 +607,7 @@ fn execute_inner(
                 session_generation: resumed.session_generation,
                 status: "running",
                 cleanup_pending: false,
+                deleted_registry_fence: None,
             })
         }
         MaintenanceActionId::RetryDelete | MaintenanceActionId::TerminateRuntimeThenDelete => {
@@ -604,6 +621,7 @@ fn execute_inner(
                 PANE_INPUT_COMMAND_TIMEOUT,
                 DELETE_TERMINATION_VERIFY_TIMEOUT,
             )?;
+            let deleted_registry_fence = deleted.registry_fence.clone();
             Ok(MaintenanceActionResult {
                 schema_version: SCHEMA_VERSION,
                 session_id: deleted.id,
@@ -614,10 +632,10 @@ fn execute_inner(
                 session_generation: None,
                 status: "deleted",
                 cleanup_pending: deleted.cleanup_pending,
+                deleted_registry_fence: Some(deleted_registry_fence),
             })
         }
         MaintenanceActionId::RetryAttach | MaintenanceActionId::Inspect => {
-            let status = session_status(tmux_bin, &record);
             Ok(MaintenanceActionResult {
                 schema_version: SCHEMA_VERSION,
                 session_id: record.id,
@@ -630,12 +648,9 @@ fn execute_inner(
                     .map(|runtime| runtime.launch_id.clone())
                     .filter(|value| !value.is_empty()),
                 session_generation: record.runtime.as_ref().map(|runtime| runtime.generation),
-                status: match status.as_str() {
-                    "running" => "running",
-                    "stopped" => "stopped",
-                    _ => "unknown",
-                },
+                status: prepared_runtime_status,
                 cleanup_pending: false,
+                deleted_registry_fence: None,
             })
         }
     }

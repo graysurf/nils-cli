@@ -140,9 +140,12 @@ Successful actions return a safe result:
 }
 ```
 
-`outcome` is `resumed`, `deleted`, or `inspected`. A successful delete omits
-runtime identity by encoding both identity fields as `null` and reports
-`status: deleted`. Deletion atomically removes the complete session directory
+`outcome` is `resumed`, `deleted`, or `inspected`. Runtime identity fields are a
+pair: they are either both populated or both `null`; mixed nullability is
+invalid. A successful `resumed` result normally carries the new incarnation and
+generation, but an already-running record that predates runtime metadata may
+validly return both fields as `null`. A successful delete always encodes both
+identity fields as `null` and reports `status: deleted`. Deletion atomically removes the complete session directory
 from the live namespace before returning success. `cleanup_pending: true` means
 the quarantined tombstone still needs producer-owned physical cleanup; the
 daemon starts a bounded tombstone janitor in the background after its listener

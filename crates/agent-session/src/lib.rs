@@ -1141,6 +1141,31 @@ struct DeleteResult {
     session_dir: String,
     #[serde(skip)]
     cleanup_pending: bool,
+    #[serde(skip)]
+    registry_fence: SessionRegistryFence,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SessionRegistryFence {
+    session_id: String,
+    tmux_session: String,
+    runtime_launch_id: Option<String>,
+    runtime_generation: Option<u64>,
+}
+
+impl SessionRegistryFence {
+    fn from_record(record: &SessionRecord) -> Self {
+        Self {
+            session_id: record.id.clone(),
+            tmux_session: record.tmux_session.clone(),
+            runtime_launch_id: record
+                .runtime
+                .as_ref()
+                .map(|runtime| runtime.launch_id.clone())
+                .filter(|launch_id| !launch_id.is_empty()),
+            runtime_generation: record.runtime.as_ref().map(|runtime| runtime.generation),
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -5153,6 +5178,7 @@ fn delete_session_locked_with_timeouts(
     kill_timeout: Duration,
     verify_timeout: Duration,
 ) -> Result<DeleteResult, CliError> {
+    let registry_fence = SessionRegistryFence::from_record(&record);
     terminate_tmux_session_with_timeouts(
         context,
         &mut record,
@@ -5174,6 +5200,7 @@ fn delete_session_locked_with_timeouts(
         deleted: true,
         session_dir: display_path(&session_dir),
         cleanup_pending,
+        registry_fence,
     })
 }
 
@@ -5480,7 +5507,7 @@ fn terminate_verified_process_runtime_transaction(
             kill_timeout,
         } => tmux_kill_identity_with_timeout(tmux_bin, identity, kill_timeout)?,
         VerifiedRuntimeTerminationMode::AlreadyStopped { tmux_bin } => {
-            verify_stopped_tmux_runtime(tmux_bin, identity, verify_timeout)?;
+            verify_tmux_target_stopped(tmux_bin, identity, verify_timeout)?;
             TmuxIdentityKillOutcome::KillConfirmed
         }
     };
@@ -7777,6 +7804,40 @@ fn verify_stopped_tmux_runtime(
     }
 }
 
+fn verify_tmux_target_stopped(
+    tmux_bin: &Path,
+    identity: &TmuxRuntimeIdentity,
+    verify_timeout: Duration,
+) -> Result<(), SessionTerminationFailure> {
+    let started_at = Instant::now();
+    let mut observed_running = false;
+    loop {
+        let remaining = verify_timeout.saturating_sub(started_at.elapsed());
+        if remaining.is_zero() {
+            return Err(if observed_running {
+                SessionTerminationFailure::StillRunning
+            } else {
+                SessionTerminationFailure::VerificationFailed
+            });
+        }
+        match verified_tmux_status_with_timeout(
+            tmux_bin,
+            &identity.session_id,
+            remaining.min(DELETE_TERMINATION_PROBE_TIMEOUT),
+        )
+        .as_str()
+        {
+            "stopped" => return Ok(()),
+            "running" => observed_running = true,
+            _ => {}
+        }
+        thread::sleep(
+            DELETE_TERMINATION_VERIFY_POLL_INTERVAL
+                .min(verify_timeout.saturating_sub(started_at.elapsed())),
+        );
+    }
+}
+
 fn verified_tmux_status_with_timeout(tmux_bin: &Path, target: &str, timeout: Duration) -> String {
     let mut command = ProcessCommand::new(tmux_bin);
     command
@@ -8857,13 +8918,13 @@ fn tail_lines(text: &str, tail: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        AgentKind, CliContext, DeleteResult, RecordRequest, TmuxProcessIdentity,
-        TmuxRuntimeIdentity, acquire_session_record_lock, acquire_session_record_lock_timed,
-        create_record, delete_session_with_timeouts, kill_tmux_session_with_timeout,
-        live_status_with_timeout, load_session_record, persist_tmux_runtime_identity,
-        render_delete_text, resolve_session_id, session_dir, strip_trailing_blank_lines,
-        tmux_launch_may_have_created_runtime, try_acquire_session_record_lock,
-        write_session_record,
+        AgentKind, CliContext, DeleteResult, RecordRequest, SessionRegistryFence,
+        TmuxProcessIdentity, TmuxRuntimeIdentity, acquire_session_record_lock,
+        acquire_session_record_lock_timed, create_record, delete_session_with_timeouts,
+        kill_tmux_session_with_timeout, live_status_with_timeout, load_session_record,
+        persist_tmux_runtime_identity, render_delete_text, resolve_session_id, session_dir,
+        strip_trailing_blank_lines, tmux_launch_may_have_created_runtime,
+        try_acquire_session_record_lock, write_session_record,
     };
     use pretty_assertions::assert_eq;
     #[cfg(target_os = "linux")]
@@ -9589,11 +9650,13 @@ mod tests {
         });
         let wrapper = tmp.path().join("tmux-cgroup-wrapper");
         let wrapper_calls = tmp.path().join("wrapper-calls");
+        let force_stopped = tmp.path().join("force-tmux-stopped");
         fs::write(
             &wrapper,
             format!(
-                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> {}\nif [ \"$1\" = new-session ]; then exec {} --user --scope --quiet --collect --unit {} -- {} -f /dev/null -L {} \"$@\"; fi\nexec {} -f /dev/null -L {} \"$@\"\n",
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> {}\nif [ -f {} ] && {{ [ \"$1\" = has-session ] || [ \"$1\" = display-message ]; }}; then printf '%s\\n' \"can't find session: stopped\" >&2; exit 1; fi\nif [ \"$1\" = new-session ]; then exec {} --user --scope --quiet --collect --unit {} -- {} -f /dev/null -L {} \"$@\"; fi\nexec {} -f /dev/null -L {} \"$@\"\n",
                 shell_words::quote(&super::display_path(&wrapper_calls)),
+                shell_words::quote(&super::display_path(&force_stopped)),
                 shell_words::quote(&super::display_path(&systemd_run)),
                 shell_words::quote(&scope),
                 shell_words::quote(&super::display_path(&tmux)),
@@ -9801,6 +9864,7 @@ mod tests {
         let events_path = super::linux_control_group_full_path(Path::new(&control_group.path))
             .unwrap()
             .join("cgroup.events");
+        let procs_path = events_path.with_file_name("cgroup.procs");
 
         let mut escaped_member = TestProcessGroup::spawn();
         let escaped_pid = escaped_member.pid() as libc::pid_t;
@@ -9824,36 +9888,60 @@ mod tests {
             },
         ];
         persist_tmux_runtime_identity(&mut retained, &retained_identity).unwrap();
-        super::set_tmux_termination_state(
-            &mut retained,
-            super::TmuxTerminationState::Pending {
-                thaw_on_recovery: false,
-            },
+        write_session_record(&context, &retained).unwrap();
+        fs::write(&force_stopped, b"stopped").unwrap();
+
+        let preview = crate::maintenance::preview(
+            &context,
+            &id,
+            &wrapper,
+            crate::maintenance::MaintenanceOperation::Delete,
         )
         .unwrap();
-        write_session_record(&context, &retained).unwrap();
-
-        let delete_once = || {
-            delete_session_with_timeouts(
-                &context,
-                &id,
-                wrapper.clone(),
-                Duration::from_secs(1),
-                Duration::from_secs(2),
-            )
-        };
-        let result = delete_once().or_else(|_| delete_once()).unwrap_or_else(|error| {
+        let preview: serde_json::Value = serde_json::to_value(preview).unwrap();
+        assert_eq!(preview["state"], "repairable");
+        assert_eq!(preview["boundary"]["kind"], "managed_scope");
+        assert!(
+            preview["actions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|action| { action["id"] == "terminate_runtime_then_delete" })
+        );
+        let result = crate::maintenance::execute(
+            &context,
+            &id,
+            &wrapper,
+            crate::maintenance::MaintenanceActionRequest {
+                operation: crate::maintenance::MaintenanceOperation::Delete,
+                action: crate::maintenance::MaintenanceActionId::TerminateRuntimeThenDelete,
+                expected_session_incarnation: preview["session_incarnation"]
+                    .as_str()
+                    .map(str::to_string),
+                expected_session_generation: preview["session_generation"].as_u64(),
+                expected_preview_digest: preview["preview_digest"].as_str().unwrap().to_string(),
+                confirmed: true,
+            },
+        )
+        .unwrap_or_else(|error| {
             let retained = load_session_record(&context, &id).unwrap();
+            let cgroup_processes = fs::read_to_string(&procs_path).map(|pids| {
+                pids.lines()
+                    .map(|pid| (pid.to_string(), fs::read_to_string(format!("/proc/{pid}/stat"))))
+                    .collect::<Vec<_>>()
+            });
             panic!(
-                "delete failed: {error:?}; state={:?}; cgroup_events={:?}; escaped={:?}; calls={} ",
+                "delete failed: {error:?}; state={:?}; cgroup_events={:?}; cgroup_processes={cgroup_processes:?}; escaped={:?}; calls={} ",
                 retained.extra.get(super::DELETE_TMUX_TERMINATION_STATE_KEY),
                 fs::read_to_string(&events_path),
                 fs::read_to_string(format!("/proc/{escaped_pid}/stat")),
                 fs::read_to_string(&wrapper_calls).unwrap_or_default(),
             )
         });
+        let result: serde_json::Value = serde_json::to_value(result).unwrap();
 
-        assert!(result.deleted);
+        assert_eq!(result["outcome"], "deleted");
+        assert_eq!(result["cleanup_pending"], false);
         assert!(!session_dir(&context, &id).exists());
         let started_at = Instant::now();
         let stopped = loop {
@@ -11849,6 +11937,12 @@ fi
             deleted: true,
             session_dir: "/state/sessions/stopped-session".to_string(),
             cleanup_pending: false,
+            registry_fence: SessionRegistryFence {
+                session_id: "stopped-session".to_string(),
+                tmux_session: "hs-codex-stopped-session".to_string(),
+                runtime_launch_id: None,
+                runtime_generation: None,
+            },
         };
 
         assert_eq!(
