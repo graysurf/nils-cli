@@ -52,11 +52,24 @@ jobs:
             *) docs_only=false ;;
           esac
           release_candidate=false
+          policy_dir="${RUNNER_TEMP}/release-policy"
+          mkdir -p "${policy_dir}"
+          release_detector="${policy_dir}/detect-release-only.sh"
+          release_gate="${policy_dir}/release-ci-gate.cjs"
+          policy_available=false
+          if git show "${base}:scripts/ci/detect-release-only.sh" >"${release_detector}" 2>/dev/null && \
+             git show "${base}:.github/scripts/release-ci-gate.cjs" >"${release_gate}" 2>/dev/null; then
+            policy_available=true
+            echo "RELEASE_GATE_PATH=${release_gate}" >> "$GITHUB_ENV"
+          else
+            rm -f "${release_detector}" "${release_gate}"
+          fi
           if [ "${EVENT_NAME}" = "pull_request" ] && \
              [ "${HEAD_REPOSITORY}" = "${REPOSITORY}" ] && \
+             [ "${policy_available}" = "true" ] && \
              [ -n "${HEAD_REF}" ]; then
             release_candidate="$(
-              bash scripts/ci/detect-release-only.sh \
+              bash "${release_detector}" \
                 --base "${base}" \
                 --head "${head}" \
                 --branch "${HEAD_REF}" \
@@ -82,7 +95,7 @@ jobs:
           BASE_SHA: ${{ steps.detect.outputs.base_sha }}
         with:
           script: |
-            const { findTrustedMainCi } = require("./.github/scripts/release-ci-gate.cjs");
+            const { findTrustedMainCi } = require(process.env.RELEASE_GATE_PATH);
             try {
               const trusted = await findTrustedMainCi({
                 github,
@@ -139,6 +152,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
 
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
@@ -190,7 +205,13 @@ jobs:
           if [ "${{ needs.changes.outputs.docs_only }}" = "true" ]; then
             bash scripts/ci/nils-cli-checks-entrypoint.sh --docs-only
           elif [ "${{ needs.changes.outputs.release_only }}" = "true" ]; then
-            bash scripts/ci/release-only-checks.sh \
+            policy_dir="${RUNNER_TEMP}/release-policy"
+            mkdir -p "${policy_dir}"
+            git show "${{ needs.changes.outputs.base_sha }}:scripts/ci/detect-release-only.sh" \
+              >"${policy_dir}/detect-release-only.sh"
+            git show "${{ needs.changes.outputs.base_sha }}:scripts/ci/release-only-checks.sh" \
+              >"${policy_dir}/release-only-checks.sh"
+            bash "${policy_dir}/release-only-checks.sh" \
               --base "${{ needs.changes.outputs.base_sha }}" \
               --head "${{ needs.changes.outputs.head_sha }}" \
               --branch "${{ needs.changes.outputs.release_branch }}"
@@ -229,6 +250,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
 
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
@@ -267,7 +290,13 @@ jobs:
           if [ "${{ needs.changes.outputs.docs_only }}" = "true" ]; then
             /opt/homebrew/bin/bash scripts/ci/nils-cli-checks-entrypoint.sh --docs-only
           elif [ "${{ needs.changes.outputs.release_only }}" = "true" ]; then
-            bash scripts/ci/release-only-checks.sh \
+            policy_dir="${RUNNER_TEMP}/release-policy"
+            mkdir -p "${policy_dir}"
+            git show "${{ needs.changes.outputs.base_sha }}:scripts/ci/detect-release-only.sh" \
+              >"${policy_dir}/detect-release-only.sh"
+            git show "${{ needs.changes.outputs.base_sha }}:scripts/ci/release-only-checks.sh" \
+              >"${policy_dir}/release-only-checks.sh"
+            bash "${policy_dir}/release-only-checks.sh" \
               --base "${{ needs.changes.outputs.base_sha }}" \
               --head "${{ needs.changes.outputs.head_sha }}" \
               --branch "${{ needs.changes.outputs.release_branch }}"

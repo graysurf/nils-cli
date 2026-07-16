@@ -276,7 +276,7 @@ fi
 # instead of launching an audit that is known to require rg.
 verify_missing_rg_bin="$tmp_dir/verify-missing-rg-bin"
 mkdir -p "$verify_missing_rg_bin"
-for tool in git npx; do
+for tool in git node npx; do
   src="$(command -v "$tool" 2>/dev/null || true)"
   [[ -n "$src" ]] && ln -s "$src" "$verify_missing_rg_bin/$tool"
 done

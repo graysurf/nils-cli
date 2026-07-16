@@ -74,6 +74,8 @@ if (fs.existsSync(modulePath)) {
       head_sha: releaseSha,
       html_url: `https://github.com/${fullName}/actions/runs/100`,
       repository: { full_name: fullName },
+      head_repository: { full_name: fullName },
+      pull_requests: [],
     };
     const mainRun = {
       id: 200,
@@ -168,6 +170,18 @@ if (fs.existsSync(modulePath)) {
       },
       "failed required job": (state) => {
         state.jobsByRun[100][0].conclusion = "failure";
+      },
+      "fork workflow run": (state) => {
+        state.workflowRuns[0].head_repository.full_name = "someone/nils-cli";
+      },
+      "mismatched associated PR": (state) => {
+        state.workflowRuns[0].pull_requests = [
+          {
+            number: 9999,
+            head: { sha: releaseSha },
+            base: { ref: "main" },
+          },
+        ];
       },
     };
 

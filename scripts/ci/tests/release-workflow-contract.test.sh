@@ -29,6 +29,10 @@ assert_contains .github/workflows/ci.yml "release_only:" \
   "CI publishes the release-only decision"
 assert_contains .github/workflows/ci.yml "scripts/ci/detect-release-only.sh" \
   "CI uses the semantic release classifier"
+assert_contains .github/workflows/ci.yml "git show \"\${base}:scripts/ci/detect-release-only.sh\"" \
+  "release-only classification loads protected base policy"
+assert_contains .github/workflows/ci.yml "\${{ needs.changes.outputs.base_sha }}:scripts/ci/release-only-checks.sh" \
+  "reduced checks load the exact base checker"
 assert_contains .github/workflows/ci.yml "findTrustedMainCi" \
   "release-only CI requires exact-base full CI proof"
 assert_contains .github/workflows/ci.yml "Full validation marker" \

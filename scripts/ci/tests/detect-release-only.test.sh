@@ -12,6 +12,11 @@ if [[ ! -f "$script" ]]; then
   echo "FAIL: missing release-only detector: $script" >&2
   exit 1
 fi
+producer_script="$repo_root/.agents/skills/project-bump-version-tag-release/scripts/project-bump-version-tag-release.sh"
+if [[ ! -f "$producer_script" ]]; then
+  echo "FAIL: missing canonical release producer: $producer_script" >&2
+  exit 1
+fi
 
 tmp_root="$(mktemp -d "${TMPDIR:-/tmp}/detect-release-only.XXXXXX")"
 trap 'rm -rf "$tmp_root"' EXIT
@@ -165,6 +170,22 @@ git -C "$extra" commit -q --amend --no-edit
 assert_verdict "extra changed file" false "$extra" \
   --base "$base_sha" --head HEAD --branch chore/release-1-2-4
 
+for policy_path in \
+  .github/workflows/ci.yml \
+  .github/scripts/release-ci-gate.cjs \
+  scripts/ci/detect-release-only.sh \
+  scripts/ci/release-only-checks.sh; do
+  policy_name="${policy_path//\//-}"
+  policy_tamper="$tmp_root/policy-${policy_name}"
+  cp -R "$canonical" "$policy_tamper"
+  mkdir -p "$policy_tamper/$(dirname "$policy_path")"
+  printf 'untrusted policy override\n' >"$policy_tamper/$policy_path"
+  git -C "$policy_tamper" add "$policy_path"
+  git -C "$policy_tamper" commit -q --amend --no-edit
+  assert_verdict "policy override ${policy_path}" false "$policy_tamper" \
+    --base "$base_sha" --head HEAD --branch chore/release-1-2-4
+done
+
 partial="$tmp_root/partial"
 cp -R "$canonical" "$partial"
 replace_text 'version = "1.2.4"' 'version = "1.2.3"' "$partial/crates/common/Cargo.toml"
@@ -184,6 +205,54 @@ cp -R "$canonical" "$two_commits"
 git -C "$two_commits" commit -q --allow-empty -m "chore: second commit"
 assert_verdict "more than one commit" false "$two_commits" \
   --base "$base_sha" --head HEAD --branch chore/release-1-2-4
+
+echo "== canonical producer integration =="
+producer_repo="$tmp_root/producer"
+git clone -q --shared "$repo_root" "$producer_repo"
+git -C "$producer_repo" config user.name "Release CI Test"
+git -C "$producer_repo" config user.email "release-ci@example.test"
+
+# Local validation runs before this change is committed, so copy the current
+# producer into the clone and make it part of the immutable fixture baseline.
+cp "$producer_script" \
+  "$producer_repo/.agents/skills/project-bump-version-tag-release/scripts/project-bump-version-tag-release.sh"
+git -C "$producer_repo" add \
+  .agents/skills/project-bump-version-tag-release/scripts/project-bump-version-tag-release.sh
+if ! git -C "$producer_repo" diff --cached --quiet; then
+  git -C "$producer_repo" commit -q --amend --no-edit
+fi
+
+producer_base="$(git -C "$producer_repo" rev-parse HEAD)"
+producer_version="$(python3 - "$producer_repo/Cargo.toml" <<'PY'
+import pathlib
+import re
+import sys
+
+text = pathlib.Path(sys.argv[1]).read_text()
+match = re.search(r'(?ms)^\[workspace[.]package\].*?^version\s*=\s*"(\d+)\.(\d+)\.(\d+)"', text)
+if not match:
+    raise SystemExit("workspace version missing")
+major, minor, patch = map(int, match.groups())
+print(f"{major}.{minor}.{patch + 1}")
+PY
+)"
+(
+  cd "$producer_repo"
+  CARGO_NET_OFFLINE=true bash \
+    .agents/skills/project-bump-version-tag-release/scripts/project-bump-version-tag-release.sh \
+    --version "$producer_version" \
+    --prepare-only
+)
+git -C "$producer_repo" add \
+  Cargo.toml Cargo.lock README.md THIRD_PARTY_LICENSES.md THIRD_PARTY_NOTICES.md \
+  crates/*/Cargo.toml
+git -C "$producer_repo" commit -q \
+  -m "chore(release): bump cli versions to ${producer_version}"
+producer_head="$(git -C "$producer_repo" rev-parse HEAD)"
+assert_verdict "real producer output" true "$producer_repo" \
+  --base "$producer_base" \
+  --head "$producer_head" \
+  --branch "chore/release-${producer_version//./-}"
 
 echo
 echo "PASS: detect-release-only.test.sh"

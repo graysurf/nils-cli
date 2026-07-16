@@ -14,6 +14,8 @@ Options:
   --ci-gate-main          Require CI gate on main (pre-bump check): fail if the prior
                           origin/main commit's ci.yml run is not green.
   --skip-readme           Do not update README release tag examples.
+  --prepare-only          Apply the release-managed file transform, then stop before
+                          validation, commit, push, tag, or deploy. Contract-test helper.
   --direct-push           Opt out of the default PR-based flow and push the bump commit + tag
                           directly to the current branch (legacy behavior). Fails when the
                           branch is protected — use the default PR flow instead.
@@ -939,6 +941,7 @@ full_checks=0
 skip_checks=0  # backward-compat alias of new default; tracked for usage notes only
 ci_gate_main=0
 skip_readme=0
+prepare_only=0
 direct_push=0
 release_branch_arg=""
 skip_push=0
@@ -978,6 +981,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --skip-readme)
       skip_readme=1
+      shift
+      ;;
+    --prepare-only)
+      prepare_only=1
       shift
       ;;
     --direct-push)
@@ -1074,9 +1081,18 @@ if ! [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
   die "invalid --version: ${version} (expected X.Y.Z or vX.Y.Z)"
 fi
 
+if [[ "$prepare_only" -eq 1 ]]; then
+  skip_push=1
+  skip_tap=1
+fi
+
 tag="v${version}"
 
-for cmd in git python3 cargo semantic-commit git-scope; do
+required_commands=(git python3 cargo)
+if [[ "$prepare_only" -eq 0 ]]; then
+  required_commands+=(semantic-commit git-scope)
+fi
+for cmd in "${required_commands[@]}"; do
   if ! command -v "$cmd" >/dev/null 2>&1; then
     die "missing required command: ${cmd}"
   fi
@@ -1100,7 +1116,10 @@ if [[ -n "$current_branch" && "$current_branch" != "main" ]]; then
   note "current branch is '${current_branch}' (release tags are typically on main)"
 fi
 
-repo_parent="$(cd "$repo_root/.." 2>/dev/null && pwd || true)"
+repo_parent=""
+if repo_parent="$(cd "$repo_root/.." 2>/dev/null && pwd)"; then
+  :
+fi
 source_repo_slug="$(git -C "$repo_root" remote get-url origin 2>/dev/null \
   | sed -E 's#(git@github\.com:|https://github\.com/)([^/]+/[^/.]+)(\.git)?$#\2#' \
   || true)"
@@ -1349,6 +1368,11 @@ checks_script="$repo_root/.agents/skills/project-verify-required-checks/scripts/
 refresh_lockfile
 # Keep third-party artifacts aligned with the new lockfile; CI re-audits drift on the bump commit.
 refresh_third_party_artifacts_if_present
+
+if [[ "$prepare_only" -eq 1 ]]; then
+  note "release-managed files prepared for ${version}; stopping before validation and delivery"
+  exit 0
+fi
 
 if [[ "$full_checks" -eq 1 ]]; then
   if [[ ! -f "$checks_script" ]]; then

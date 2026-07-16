@@ -137,6 +137,7 @@ async function findTrustedPullRequestCi({
   if (trustedPulls.length !== 1) {
     return null;
   }
+  const trustedPull = trustedPulls[0];
 
   const runs = await listAll(
     github,
@@ -158,7 +159,13 @@ async function findTrustedPullRequestCi({
       run.conclusion === "success" &&
       run.head_branch === branch &&
       run.head_sha === sha &&
-      run.repository?.full_name === fullName,
+      run.repository?.full_name === fullName &&
+      run.head_repository?.full_name === fullName &&
+      ((run.pull_requests || []).length === 0 ||
+        ((run.pull_requests || []).length === 1 &&
+          run.pull_requests[0].number === trustedPull.number &&
+          run.pull_requests[0].head?.sha === sha &&
+          run.pull_requests[0].base?.ref === "main")),
   );
   if (trustedRuns.length !== 1) {
     return null;
@@ -177,7 +184,7 @@ async function findTrustedPullRequestCi({
   }
 
   return {
-    prNumber: trustedPulls[0].number,
+    prNumber: trustedPull.number,
     runId: run.id,
     runUrl: run.html_url,
   };
