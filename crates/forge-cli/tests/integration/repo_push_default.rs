@@ -102,6 +102,9 @@ case "$1" in
       printf '%s' '{push_urls}'
     fi
     ;;
+  config)
+    exit 1
+    ;;
   check-ref-format)
     exit 0
     ;;
@@ -426,11 +429,13 @@ if [[ " $* " == *" push --porcelain "* ]]; then
       ;;
   esac
 fi
-for i in "${!args[@]}"; do
-  if [[ "${args[$i]}" == "https://github.com/sympoies/demo.git" ]]; then
-    args[$i]="$REAL_REMOTE"
-  fi
-done
+if [[ "${WRAPPER_REWRITE_URL:-true}" == true ]]; then
+  for i in "${!args[@]}"; do
+    if [[ "${args[$i]}" == "https://github.com/sympoies/demo.git" ]]; then
+      args[$i]="$REAL_REMOTE"
+    fi
+  done
+fi
 exec git "${args[@]}"
 "#;
     let race_action = match race {
@@ -441,6 +446,7 @@ exec git "${args[@]}"
     let stub = stub
         .env("REAL_REMOTE", remote.to_string_lossy())
         .env("REAL_GIT_LOG", git_log.to_string_lossy())
+        .env("WRAPPER_REWRITE_URL", "true")
         .env("RACE_ACTION", race_action)
         .env("RACE_TARGET", &rewind_target)
         .git_stub(wrapper);
@@ -643,6 +649,97 @@ fn push_default_disables_inherited_real_git_push_expansion() {
     assert!(log.contains("push.followTags=false"));
     assert!(log.contains("push.pushOption="));
     assert!(log.contains("push.recurseSubmodules=no"));
+}
+
+#[test]
+fn push_default_rejects_second_stage_url_rewrite_before_alternate_push() {
+    let mut scenario = setup_real_git(RealGitRace::None, false);
+    let alternate = scenario.stub.tempdir.path().join("alternate.git");
+    git_output(&["init", "--bare", alternate.to_str().expect("alternate")]);
+    git_output(&[
+        "-C",
+        scenario.worktree.to_str().expect("worktree"),
+        "push",
+        alternate.to_str().expect("alternate"),
+        &format!("{}:refs/heads/main", scenario.base),
+    ]);
+    git_output(&[
+        "-C",
+        scenario.worktree.to_str().expect("worktree"),
+        "remote",
+        "set-url",
+        "origin",
+        "alias:sympoies/demo.git",
+    ]);
+    for (key, value) in [
+        (
+            "url.https://github.com/.insteadOf".to_string(),
+            "alias:".to_string(),
+        ),
+        (
+            format!("url.file://{}.insteadOf", scenario.remote.display()),
+            "https://github.com/sympoies/demo.git".to_string(),
+        ),
+        (
+            format!("url.file://{}.pushInsteadOf", alternate.display()),
+            "https://github.com/sympoies/demo.git".to_string(),
+        ),
+    ] {
+        git_output(&[
+            "-C",
+            scenario.worktree.to_str().expect("worktree"),
+            "config",
+            &key,
+            &value,
+        ]);
+    }
+    scenario
+        .stub
+        .envs
+        .push(("WRAPPER_REWRITE_URL".to_string(), "false".to_string()));
+
+    let out = run_real_git(&scenario);
+    assert_eq!(out.code, 65, "stdout={} stderr={}", out.stdout, out.stderr);
+    let envelope = parse_envelope(&out.stdout);
+    assert_eq!(
+        envelope["error"]["code"],
+        "push_destination_rewrite_ambiguous"
+    );
+    let alternate_head = git_output(&[
+        "--git-dir",
+        alternate.to_str().expect("alternate"),
+        "rev-parse",
+        "refs/heads/main",
+    ]);
+    assert_eq!(alternate_head, scenario.base);
+}
+
+#[test]
+fn push_default_rejects_non_regular_reason_input() {
+    let stub = StubEnv::new();
+    let out = run_forge_cli_in(
+        &stub,
+        &[
+            "--provider",
+            "github",
+            "--repo",
+            "sympoies/demo",
+            "--format",
+            "json",
+            "repo",
+            "push-default",
+            "--head",
+            "HEAD",
+            "--expected-base",
+            BASE,
+            "--reason-file",
+            stub.tempdir.path().to_str().expect("tempdir"),
+        ],
+        Some(stub.tempdir.path()),
+    );
+    assert_eq!(out.code, 65, "stdout={} stderr={}", out.stdout, out.stderr);
+    let envelope = parse_envelope(&out.stdout);
+    assert_eq!(envelope["error"]["code"], "reason_invalid");
 }
 
 #[test]
@@ -978,6 +1075,8 @@ fn push_default_error_catalog_covers_the_runtime_contract() {
         "expected_base_mismatch",
         "expected_base_missing",
         "expected_base_not_ancestor",
+        "backend_output_limit",
+        "backend_timeout",
         "git_output_limit",
         "git_timeout",
         "head_not_checked_out",
@@ -988,6 +1087,7 @@ fn push_default_error_catalog_covers_the_runtime_contract() {
         "push_destination_ambiguous",
         "push_destination_credentials_unsupported",
         "push_destination_missing",
+        "push_destination_rewrite_ambiguous",
         "reason_file_unreadable",
         "reason_invalid",
         "remote_default_branch_missing",

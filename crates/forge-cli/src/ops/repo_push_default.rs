@@ -8,7 +8,8 @@
 //! reads the remote ref back.
 
 use std::ffi::{OsStr, OsString};
-use std::fs;
+use std::fs::{self, File};
+use std::io::Read;
 use std::path::Path;
 use std::process::Command;
 use std::time::Duration;
@@ -32,6 +33,8 @@ const SCHEMA_VERSION: u32 = 1;
 const MAX_REASON_BYTES: usize = 2_000;
 const DEFAULT_GIT_TIMEOUT: Duration = Duration::from_secs(120);
 const DEFAULT_GIT_CAPTURE_LIMIT_BYTES: usize = 8 * 1024 * 1024;
+const DEFAULT_PROVIDER_TIMEOUT: Duration = Duration::from_secs(120);
+const URL_REWRITE_CONFIG_PATTERN: &str = "^url\\..*\\.(insteadOf|pushInsteadOf)$";
 
 /// Testing-only executable override for local Git subprocesses.
 pub const ENV_GIT_BIN: &str = "FORGE_CLI_GIT_BIN";
@@ -55,21 +58,28 @@ pub trait GitRunner {
 #[derive(Debug, Default)]
 struct ProcessGitRunner;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GitProcessSettings {
+    executable: OsString,
+    timeout: Duration,
+    capture_limit: usize,
+}
+
 impl GitRunner for ProcessGitRunner {
     fn run(&self, workdir: &Path, args: &[OsString]) -> Result<GitOutput, ForgeError> {
-        let executable = std::env::var_os(ENV_GIT_BIN)
-            .filter(|value| !value.is_empty())
-            .unwrap_or_else(|| OsString::from("git"));
-        let mut command = Command::new(&executable);
+        let settings = current_git_process_settings();
+        let mut command = Command::new(&settings.executable);
         command.arg("-C").arg(workdir).args(args);
-        let timeout = configured_git_timeout();
-        let capture_limit = configured_git_capture_limit();
-        let output = match output_with_limits(&mut command, Some(timeout), capture_limit) {
+        let output = match output_with_limits(
+            &mut command,
+            Some(settings.timeout),
+            settings.capture_limit,
+        ) {
             Ok(output) => output,
             Err(ProcessOutputError::Io(error)) => {
                 return Err(ForgeError::software(
                     schema_error(),
-                    format!("failed to launch {}", executable.to_string_lossy()),
+                    format!("failed to launch {}", settings.executable.to_string_lossy()),
                     Some(error.to_string()),
                 ));
             }
@@ -80,7 +90,7 @@ impl GitRunner for ProcessGitRunner {
                     "git_timeout",
                     format!(
                         "{} timed out after {}",
-                        executable.to_string_lossy(),
+                        settings.executable.to_string_lossy(),
                         format_duration(timeout)
                     ),
                     (!stderr.is_empty()).then_some(stderr),
@@ -97,7 +107,7 @@ impl GitRunner for ProcessGitRunner {
                     "git_output_limit",
                     format!(
                         "{} {} exceeded the {}-byte capture limit",
-                        executable.to_string_lossy(),
+                        settings.executable.to_string_lossy(),
                         stream.as_str(),
                         limit
                     ),
@@ -114,21 +124,39 @@ impl GitRunner for ProcessGitRunner {
     }
 }
 
-fn configured_git_timeout() -> Duration {
-    std::env::var(ENV_GIT_TIMEOUT_MS)
+fn current_git_process_settings() -> GitProcessSettings {
+    let executable = std::env::var_os(ENV_GIT_BIN).filter(|value| !value.is_empty());
+    let timeout = std::env::var(ENV_GIT_TIMEOUT_MS)
         .ok()
         .and_then(|value| value.parse::<u64>().ok())
         .filter(|value| *value > 0)
-        .map(Duration::from_millis)
-        .unwrap_or(DEFAULT_GIT_TIMEOUT)
-}
-
-fn configured_git_capture_limit() -> usize {
-    std::env::var(ENV_GIT_CAPTURE_LIMIT_BYTES)
+        .map(Duration::from_millis);
+    let capture_limit = std::env::var(ENV_GIT_CAPTURE_LIMIT_BYTES)
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or(DEFAULT_GIT_CAPTURE_LIMIT_BYTES)
+        .filter(|value| *value > 0);
+    resolve_git_process_settings(cfg!(debug_assertions), executable, timeout, capture_limit)
+}
+
+fn resolve_git_process_settings(
+    allow_testing_overrides: bool,
+    executable: Option<OsString>,
+    timeout: Option<Duration>,
+    capture_limit: Option<usize>,
+) -> GitProcessSettings {
+    if allow_testing_overrides {
+        GitProcessSettings {
+            executable: executable.unwrap_or_else(|| OsString::from("git")),
+            timeout: timeout.unwrap_or(DEFAULT_GIT_TIMEOUT),
+            capture_limit: capture_limit.unwrap_or(DEFAULT_GIT_CAPTURE_LIMIT_BYTES),
+        }
+    } else {
+        GitProcessSettings {
+            executable: OsString::from("git"),
+            timeout: DEFAULT_GIT_TIMEOUT,
+            capture_limit: DEFAULT_GIT_CAPTURE_LIMIT_BYTES,
+        }
+    }
 }
 
 /// Receipt emitted after validation and optional delivery.
@@ -200,6 +228,7 @@ pub fn run_with<R: BackendRunner, G: GitRunner>(
     }
     let push_url = unique_push_url(&push_url_lookup.stdout, &global.remote)?;
     reject_http_push_url_userinfo(&push_url)?;
+    reject_second_stage_url_rewrites(git, workdir, &push_url)?;
 
     let ctx = detect(
         global.provider_hint(),
@@ -228,7 +257,7 @@ pub fn run_with<R: BackendRunner, G: GitRunner>(
     }
     let mut metadata_ctx = ctx.clone();
     metadata_ctx.repo = Some(metadata_repo_locator(ctx.provider, &ctx.host, &remote_slug));
-    let repo = repo_view::compute(backend, &metadata_ctx)?;
+    let repo = load_repo_metadata(backend, &metadata_ctx)?;
     let repository = format!("{}/{}", repo.owner, repo.name);
     bind_remote_repository(&push_url, &repository)?;
     bind_remote_metadata(&push_url, &repo.url, &repository)?;
@@ -478,13 +507,37 @@ pub fn run_with<R: BackendRunner, G: GitRunner>(
 }
 
 fn read_reason(path: &Path) -> Result<String, ForgeError> {
-    let bytes = fs::read(path).map_err(|error| {
+    let metadata = fs::symlink_metadata(path).map_err(|error| {
+        validation(
+            "reason_file_unreadable",
+            format!("failed to inspect --reason-file '{}'", path.display()),
+            Some(error.to_string()),
+        )
+    })?;
+    if !metadata.file_type().is_file() {
+        return Err(validation(
+            "reason_invalid",
+            "direct-main reason must be a regular file",
+            None,
+        ));
+    }
+    let file = File::open(path).map_err(|error| {
         validation(
             "reason_file_unreadable",
             format!("failed to read --reason-file '{}'", path.display()),
             Some(error.to_string()),
         )
     })?;
+    let mut bytes = Vec::with_capacity(MAX_REASON_BYTES + 1);
+    file.take((MAX_REASON_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
+        .map_err(|error| {
+            validation(
+                "reason_file_unreadable",
+                format!("failed to read --reason-file '{}'", path.display()),
+                Some(error.to_string()),
+            )
+        })?;
     if bytes.len() > MAX_REASON_BYTES {
         return Err(validation(
             "reason_invalid",
@@ -519,6 +572,65 @@ fn read_reason(path: &Path) -> Result<String, ForgeError> {
     }
     no_local_path(&reason, "direct-main reason")?;
     Ok(reason)
+}
+
+fn reject_second_stage_url_rewrites<G: GitRunner>(
+    git: &G,
+    workdir: &Path,
+    destination: &str,
+) -> Result<(), ForgeError> {
+    let output = git.run(
+        workdir,
+        &os_args(&[
+            "config",
+            "--null",
+            "--get-regexp",
+            URL_REWRITE_CONFIG_PATTERN,
+        ]),
+    )?;
+    if !output.success && output.exit_code == 1 && output.stdout.is_empty() {
+        return Ok(());
+    }
+    if !output.success {
+        return Err(ForgeError::software(
+            schema_error(),
+            "failed to inspect Git URL rewrite configuration",
+            (!output.stderr.is_empty()).then_some(output.stderr),
+        ));
+    }
+    for record in output
+        .stdout
+        .split('\0')
+        .filter(|record| !record.is_empty())
+    {
+        let Some((_key, value)) = record.split_once('\n') else {
+            return Err(ForgeError::software(
+                schema_error(),
+                "git config returned a malformed URL rewrite record",
+                None,
+            ));
+        };
+        if !value.is_empty() && destination.starts_with(value) {
+            return Err(validation(
+                "push_destination_rewrite_ambiguous",
+                "the validated push URL would be rewritten again by Git configuration",
+                Some(
+                    "remove the matching url.*.insteadOf or url.*.pushInsteadOf rule for this delivery"
+                        .into(),
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn load_repo_metadata<R: BackendRunner>(
+    backend: &R,
+    context: &crate::provider::ProviderContext,
+) -> Result<repo_view::RepoViewPayload, ForgeError> {
+    let call = repo_view::build_call_for_default_branch(context);
+    let output = backend.run_with_timeout(&call, Some(DEFAULT_PROVIDER_TIMEOUT))?;
+    repo_view::parse_backend_output(context, &output)
 }
 
 fn unique_push_url(output: &str, remote: &str) -> Result<String, ForgeError> {
@@ -806,6 +918,41 @@ fn schema_error() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
+
+    use crate::backend::{BackendCall, BackendSuccess};
+    use crate::provider::{DetectionSource, ProviderContext};
+
+    struct TimeoutRecordingRunner {
+        timeout: Cell<Option<Duration>>,
+    }
+
+    impl BackendRunner for TimeoutRecordingRunner {
+        fn run(&self, _call: &BackendCall) -> Result<BackendSuccess, ForgeError> {
+            panic!("governed metadata lookup must use run_with_timeout")
+        }
+
+        fn run_with_timeout(
+            &self,
+            _call: &BackendCall,
+            timeout: Option<Duration>,
+        ) -> Result<BackendSuccess, ForgeError> {
+            self.timeout.set(timeout);
+            Ok(BackendSuccess {
+                stdout: r#"{
+                    "name":"demo",
+                    "owner":{"login":"sympoies"},
+                    "url":"https://github.com/sympoies/demo",
+                    "defaultBranchRef":{"name":"main"},
+                    "mergeCommitAllowed":false,
+                    "squashMergeAllowed":true,
+                    "rebaseMergeAllowed":false
+                }"#
+                .to_string(),
+                stderr: String::new(),
+            })
+        }
+    }
 
     #[test]
     fn remote_provider_binding_rejects_forced_cross_provider_delivery() {
@@ -819,5 +966,34 @@ mod tests {
         let error = bind_remote_provider("git@github.com:sympoies/demo.git", Provider::Local)
             .expect_err("local provider cannot authorize a real Git push");
         assert_eq!(error.kind(), "provider_unsupported");
+    }
+
+    #[test]
+    fn production_git_settings_ignore_testing_overrides() {
+        let settings = resolve_git_process_settings(
+            false,
+            Some(OsString::from("/tmp/fabricated-git")),
+            Some(Duration::from_secs(9_999)),
+            Some(usize::MAX),
+        );
+        assert_eq!(settings.executable, OsString::from("git"));
+        assert_eq!(settings.timeout, DEFAULT_GIT_TIMEOUT);
+        assert_eq!(settings.capture_limit, DEFAULT_GIT_CAPTURE_LIMIT_BYTES);
+    }
+
+    #[test]
+    fn governed_provider_metadata_uses_a_finite_timeout() {
+        let runner = TimeoutRecordingRunner {
+            timeout: Cell::new(None),
+        };
+        let context = ProviderContext {
+            provider: Provider::GitHub,
+            host: "github.com".to_string(),
+            source: DetectionSource::Flag,
+            repo: Some("github.com/sympoies/demo".to_string()),
+        };
+        let payload = load_repo_metadata(&runner, &context).expect("metadata");
+        assert_eq!(payload.default_branch, "main");
+        assert_eq!(runner.timeout.get(), Some(DEFAULT_PROVIDER_TIMEOUT));
     }
 }

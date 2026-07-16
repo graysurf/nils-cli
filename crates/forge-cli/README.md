@@ -32,14 +32,16 @@ cargo run -p nils-forge-cli -- repo push-default --expected-base <sha> --reason-
 
 `repo push-default` is a narrow, policy-driven exception to PR delivery. It
 requires a clean non-default checkout whose `HEAD` is exactly one locally
-verified signed commit ahead of `--expected-base`; performs only a normal
-fast-forward push to the provider-resolved default branch; and verifies the
-remote SHA afterward. The selected remote must expose exactly one push URL,
-and that actual destination must match the provider repository; all remote
-reads and the push are pinned to that URL. HTTP(S) userinfo is rejected so
-embedded credentials never enter the Git subprocess argv. It has no force mode.
-Callers remain responsible for obtaining explicit user authorization and
-recording it in `--reason-file`.
+verified signed commit ahead of `--expected-base`; proves fast-forward ancestry;
+uses an exact-old-object lease as a compare-and-swap; and verifies the remote
+SHA afterward. The selected remote must expose exactly one push URL, and that
+actual destination must match the provider repository; all remote reads and the
+push are pinned to that URL. HTTP(S) userinfo and any second-stage Git URL
+rewrite are rejected. Release builds fix the Git executable, timeout, and
+capture cap; provider metadata and every Git subprocess are bounded. The
+command exposes no caller-controlled force mode. Callers remain responsible for
+obtaining explicit user authorization and recording it in a regular
+`--reason-file`.
 
 `--thread-file` is for actionable findings only: max 50 threads, 16 KiB body
 each. Use `pr review validate` for local schema/privacy checks, and add

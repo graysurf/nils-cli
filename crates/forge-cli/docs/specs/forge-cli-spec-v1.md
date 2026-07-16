@@ -353,7 +353,8 @@ backend mapping, validation rules, and output schema versions.
 
 - Input: `--head <ref>` (default `HEAD`, and must resolve to the checked-out
   commit), required `--expected-base <full-sha>`, and required
-  `--reason-file <path>` containing the caller's explicit authorization basis.
+  `--reason-file <path>` naming a regular file of at most 2,000 bytes that
+  contains the caller's explicit authorization basis.
 - Validation:
   - the selected Git remote must expose exactly one actual push URL (including
     any configured `remote.<name>.pushurl`), and that destination's host and
@@ -361,6 +362,9 @@ backend mapping, validation rules, and output schema versions.
     unsupported;
   - HTTP(S) push URLs containing userinfo are rejected; callers use credential
     helpers rather than embedding credential material in a subprocess argument;
+  - after the push URL is expanded once, no effective `url.*.insteadOf` or
+    `url.*.pushInsteadOf` rule may match it again; this prevents Git from
+    retargeting the mutation independently of base/read-back operations;
   - the worktree is clean and checked out on a non-default branch;
   - the remote default branch still equals `--expected-base`;
   - `HEAD` is exactly one commit ahead of that base and the base is its
@@ -381,7 +385,10 @@ backend mapping, validation rules, and output schema versions.
 - Resource bounds: every Git subprocess has a 120-second timeout and an 8 MiB
   per-stream capture limit. Timeout or output-limit failure kills the complete
   child process group and returns `git_timeout` or `git_output_limit`
-  without retrying a push.
+  without retrying a push. The provider metadata subprocess uses the same
+  finite deadline and backend capture/process-group contract. Shipped release
+  builds always execute `git` with these hard bounds; executable and bound
+  overrides exist only in debug test builds.
 - Read-back: exact `git ls-remote` after the push must equal the delivered SHA;
   otherwise the op fails closed with `default_push_verification_failed` and
   tells the caller to inspect the already-mutated remote.
@@ -390,6 +397,7 @@ backend mapping, validation rules, and output schema versions.
   exact refspec, `pushed`, and `observed_remote_sha`.
 - Typed failures: `push_destination_missing`,
   `push_destination_ambiguous`, `push_destination_credentials_unsupported`,
+  `push_destination_rewrite_ambiguous`,
   `provider_mismatch`, `provider_unsupported`, `repository_mismatch`,
   `dirty_worktree`, `detached_head`, `default_branch_checkout`,
   `head_not_checked_out`, `expected_base_mismatch`,
@@ -398,6 +406,7 @@ backend mapping, validation rules, and output schema versions.
   `reason_file_unreadable`, `reason_invalid`, `local_path_present`,
   `object_id_invalid`, `remote_default_lookup_failed`,
   `remote_default_branch_missing`, `git_timeout`, `git_output_limit`,
+  `backend_timeout`, `backend_output_limit`,
   `default_push_rejected`, `default_push_verification_failed`, and
   `software_error`. Callers must preserve their declared DATA, RUNTIME,
   UNAVAILABLE, SOFTWARE, or USAGE exit class.
@@ -885,6 +894,7 @@ Violations map to `DATA 65` with one of these `data.error.kind` values:
 | `push_destination_missing`                 | 6                    |
 | `push_destination_ambiguous`               | 6                    |
 | `push_destination_credentials_unsupported` | 6                    |
+| `push_destination_rewrite_ambiguous`       | 6                    |
 | `provider_mismatch`                        | 6                    |
 | `provider_unsupported`                     | 6 (`USAGE 64`)       |
 | `repository_mismatch`                      | 6                    |
@@ -903,6 +913,8 @@ Violations map to `DATA 65` with one of these `data.error.kind` values:
 | `remote_default_branch_missing`            | 6                    |
 | `git_timeout`                              | 6 (`UNAVAILABLE 69`) |
 | `git_output_limit`                         | 6 (`UNAVAILABLE 69`) |
+| `backend_timeout`                          | 6 (`UNAVAILABLE 69`) |
+| `backend_output_limit`                     | 6 (`UNAVAILABLE 69`) |
 | `default_push_rejected`                    | 6 (`RUNTIME 1`)      |
 | `default_push_verification_failed`         | 6 (`RUNTIME 1`)      |
 | `software_error`                           | 6 (`SOFTWARE 70`)    |
