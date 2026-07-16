@@ -5,7 +5,7 @@ use pretty_assertions::assert_eq;
 use super::support::{StubEnv, parse_envelope, run_forge_cli};
 
 #[test]
-fn pr_reviews_catalog_requires_commit_sha() {
+fn pr_reviews_catalog_requires_commit_sha_only_for_submitted_reviews() {
     let catalog = include_str!("../../docs/specs/forge-cli-ops-v1.yaml");
     let reviews = catalog
         .split_once("  - id: pr.reviews\n")
@@ -15,10 +15,20 @@ fn pr_reviews_catalog_requires_commit_sha() {
         .expect("pr.tasks follows pr.reviews")
         .0;
 
-    assert_eq!(reviews.matches("commit_sha").count(), 3);
     assert!(
-        !reviews.contains("commit_sha?"),
-        "successful review entries require commit_sha"
+        reviews.contains(
+            "current_head_reviews: list<{id, database_id?, url, author, state, commit_sha,"
+        ),
+        "current-head submitted reviews require commit_sha"
+    );
+    assert!(
+        reviews.contains("stale_reviews: list<{id, database_id?, url, author, state, commit_sha,"),
+        "stale submitted reviews require commit_sha"
+    );
+    assert!(
+        reviews
+            .contains("pending_reviews: list<{id, database_id?, url, author, state, commit_sha?"),
+        "pending review commit_sha must remain nullable"
     );
 }
 
@@ -119,6 +129,105 @@ esac
     let env = parse_envelope(&out.stdout);
     assert_eq!(env["data"]["current_head_reviews"][0]["id"], "PRR_page_1");
     assert_eq!(env["data"]["current_head_reviews"][1]["id"], "PRR_page_2");
+}
+
+#[test]
+fn pr_reviews_separates_pending_reviews_without_requiring_submitted_at() {
+    let stub = StubEnv::new().gh_stub(
+        r#"#!/bin/sh
+set -eu
+case "$1 $2" in
+  "pr view")
+    printf '%s\n' '{"number":42,"url":"https://github.com/acme/widgets/pull/42","state":"OPEN","isDraft":false,"baseRefName":"main","headRefName":"feat/reviews","headRefOid":"head-new","title":"feat: reviews","body":""}'
+    ;;
+  "api graphql")
+    printf '%s\n' '{"data":{"repository":{"pullRequest":{"headRefOid":"head-new","reviews":{"nodes":[{"id":"PRR_pending","databaseId":102,"url":"https://github.com/acme/widgets/pull/42#pullrequestreview-102","author":{"login":"example-review-bot[bot]"},"state":"PENDING","commit":null,"submittedAt":null,"body":"Pending review summary"}],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}}}'
+    ;;
+  *)
+    echo "unexpected gh args: $*" >&2
+    exit 99
+    ;;
+esac
+"#,
+    );
+
+    let out = run_forge_cli(
+        &stub,
+        &[
+            "--provider",
+            "github",
+            "--repo",
+            "acme/widgets",
+            "--format",
+            "json",
+            "pr",
+            "reviews",
+            "42",
+        ],
+    );
+    assert_eq!(out.code, 0, "stdout={}\nstderr={}", out.stdout, out.stderr);
+    let env = parse_envelope(&out.stdout);
+    assert_eq!(
+        env["data"]["current_head_reviews"]
+            .as_array()
+            .unwrap()
+            .len(),
+        0
+    );
+    assert_eq!(env["data"]["stale_reviews"].as_array().unwrap().len(), 0);
+    assert_eq!(env["data"]["pending_reviews"][0]["id"], "PRR_pending");
+    assert_eq!(
+        env["data"]["pending_reviews"][0]["commit_sha"],
+        serde_json::Value::Null
+    );
+    assert_eq!(
+        env["data"]["pending_reviews"][0]["author"],
+        "example-review-bot[bot]"
+    );
+}
+
+#[test]
+fn pr_reviews_still_rejects_a_submitted_review_without_submitted_at() {
+    let stub = StubEnv::new().gh_stub(
+        r#"#!/bin/sh
+set -eu
+case "$1 $2" in
+  "pr view")
+    printf '%s\n' '{"number":42,"url":"https://github.com/acme/widgets/pull/42","state":"OPEN","isDraft":false,"baseRefName":"main","headRefName":"feat/reviews","headRefOid":"head-new","title":"feat: reviews","body":""}'
+    ;;
+  "api graphql")
+    printf '%s\n' '{"data":{"repository":{"pullRequest":{"headRefOid":"head-new","reviews":{"nodes":[{"id":"PRR_invalid","databaseId":103,"url":"https://github.com/acme/widgets/pull/42#pullrequestreview-103","author":{"login":"reviewer"},"state":"COMMENTED","commit":{"oid":"head-new"},"submittedAt":null,"body":"Invalid submitted review"}],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}}}'
+    ;;
+  *)
+    echo "unexpected gh args: $*" >&2
+    exit 99
+    ;;
+esac
+"#,
+    );
+
+    let out = run_forge_cli(
+        &stub,
+        &[
+            "--provider",
+            "github",
+            "--repo",
+            "acme/widgets",
+            "--format",
+            "json",
+            "pr",
+            "reviews",
+            "42",
+        ],
+    );
+    assert_eq!(out.code, 65, "stdout={}\nstderr={}", out.stdout, out.stderr);
+    let env = parse_envelope(&out.stdout);
+    assert_eq!(env["error"]["code"], "review_snapshot_incomplete");
+    assert!(
+        env["error"]["details"]["detail"]
+            .as_str()
+            .is_some_and(|detail| detail.contains("review.submittedAt"))
+    );
 }
 
 #[test]

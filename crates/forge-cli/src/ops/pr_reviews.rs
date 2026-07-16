@@ -22,10 +22,19 @@ const MAX_SUMMARY_BYTES: usize = 4096;
 const MAX_REVIEW_PAGES: usize = 100;
 
 const GITHUB_REVIEWS_QUERY: &str = "query($owner: String!, $name: String!, $pr: Int!, $after: String) { repository(owner: $owner, name: $name) { pullRequest(number: $pr) { headRefOid reviews(first: 100, after: $after) { nodes { id databaseId url author { login } state commit { oid } submittedAt body } pageInfo { hasNextPage endCursor } } } } }";
+const GITHUB_PENDING_REVIEWS_QUERY: &str = "query($owner: String!, $name: String!, $pr: Int!, $after: String) { repository(owner: $owner, name: $name) { pullRequest(number: $pr) { headRefOid reviews(first: 100, after: $after, states: [PENDING]) { nodes { id url author { login } state viewerDidAuthor viewerCanDelete } pageInfo { hasNextPage endCursor } } } } }";
 
 struct ReviewPage {
     head_sha: String,
     reviews: Vec<NativeReviewSummary>,
+    pending_reviews: Vec<PendingReviewSummary>,
+    has_next_page: bool,
+    end_cursor: Option<String>,
+}
+
+struct PendingReviewGuardPage {
+    head_sha: String,
+    reviews: Vec<PendingReviewGuard>,
     has_next_page: bool,
     end_cursor: Option<String>,
 }
@@ -46,6 +55,35 @@ pub struct NativeReviewSummary {
     pub summary_truncated: bool,
 }
 
+/// One provider-valid draft review. Pending reviews have no `submittedAt` and
+/// therefore remain separate from submitted current-head/stale activity.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct PendingReviewSummary {
+    pub id: String,
+    pub database_id: Option<u64>,
+    pub url: String,
+    pub author: String,
+    pub state: String,
+    pub commit_sha: Option<String>,
+    pub summary: String,
+    pub summary_truncated: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PendingReviewGuard {
+    pub id: String,
+    pub url: String,
+    pub author: String,
+    pub viewer_did_author: bool,
+    pub viewer_can_delete: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PendingReviewGuardSnapshot {
+    pub head_sha: String,
+    pub reviews: Vec<PendingReviewGuard>,
+}
+
 /// Envelope payload for `cli.forge-cli.pr.reviews.v1`.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct PrReviewsPayload {
@@ -55,6 +93,7 @@ pub struct PrReviewsPayload {
     pub head_sha: String,
     pub current_head_reviews: Vec<NativeReviewSummary>,
     pub stale_reviews: Vec<NativeReviewSummary>,
+    pub pending_reviews: Vec<PendingReviewSummary>,
 }
 
 pub fn run(
@@ -117,6 +156,80 @@ pub fn compute_for_pr<R: BackendRunner>(
     compute_for_pr_with_timeout(runner, ctx, number, pr_url, None)
 }
 
+/// Fetch only pending reviews and the provider-native viewer ownership/capability
+/// fields required by exact-node recovery. Submitted-review parsing remains an
+/// independent convergence concern and cannot block recovery.
+pub(crate) fn compute_pending_guards_for_pr<R: BackendRunner>(
+    runner: &R,
+    ctx: &ProviderContext,
+    number: u64,
+    pr_url: &str,
+) -> Result<PendingReviewGuardSnapshot, ForgeError> {
+    ensure_github(ctx)?;
+    let slug = github_repo_slug_from_url(pr_url).ok_or_else(|| {
+        ForgeError::software(
+            schema_err(),
+            "unable to derive GitHub owner/repo from PR url",
+            Some(format!("url={pr_url}")),
+        )
+    })?;
+    let (owner, name) = split_slug(&slug)?;
+    let mut cursor = None;
+    let mut seen_cursors = BTreeSet::new();
+    let mut expected_head = None;
+    let mut reviews = Vec::new();
+
+    for page_index in 0..MAX_REVIEW_PAGES {
+        let output = runner.run(&build_github_pending_reviews_call(
+            ctx,
+            owner,
+            name,
+            number,
+            cursor.as_deref(),
+        ))?;
+        let page = parse_github_pending_review_page(&output)?;
+        if expected_head
+            .as_deref()
+            .is_some_and(|head| head != page.head_sha)
+        {
+            return Err(snapshot_incomplete(
+                "the PR head changed while paginating pending reviews",
+                Some(format!(
+                    "expected_head={} provider_head={}",
+                    expected_head.as_deref().unwrap_or("<missing>"),
+                    page.head_sha
+                )),
+            ));
+        }
+        expected_head.get_or_insert(page.head_sha);
+        reviews.extend(page.reviews);
+        if !page.has_next_page {
+            return Ok(PendingReviewGuardSnapshot {
+                head_sha: expected_head.unwrap_or_default(),
+                reviews,
+            });
+        }
+        let next = page.end_cursor.ok_or_else(|| {
+            snapshot_incomplete(
+                "pending review pagination is missing endCursor",
+                Some(format!("page={}", page_index + 1)),
+            )
+        })?;
+        if !seen_cursors.insert(next.clone()) {
+            return Err(snapshot_incomplete(
+                "pending review pagination repeated a cursor",
+                Some(format!("page={}; cursor={next}", page_index + 1)),
+            ));
+        }
+        cursor = Some(next);
+    }
+
+    Err(snapshot_incomplete(
+        "pending review pagination exceeded the safety page limit",
+        Some(format!("max_pages={MAX_REVIEW_PAGES}")),
+    ))
+}
+
 /// Deadline-aware variant used by merge convergence. The timeout covers the
 /// complete paginated snapshot, including rate-limit preflight and subprocess
 /// execution in deadline-aware runners.
@@ -142,6 +255,7 @@ pub fn compute_for_pr_with_timeout<R: BackendRunner>(
     let mut expected_head = None;
     let mut current_head_reviews = Vec::new();
     let mut stale_reviews = Vec::new();
+    let mut pending_reviews = Vec::new();
 
     for page_index in 0..MAX_REVIEW_PAGES {
         let remaining = remaining_timeout(timeout, started)?;
@@ -164,6 +278,7 @@ pub fn compute_for_pr_with_timeout<R: BackendRunner>(
             ));
         }
         let head_sha = expected_head.get_or_insert(page.head_sha);
+        pending_reviews.extend(page.pending_reviews);
         for review in page.reviews {
             if review.commit_sha == head_sha.as_str() {
                 current_head_reviews.push(review);
@@ -179,6 +294,7 @@ pub fn compute_for_pr_with_timeout<R: BackendRunner>(
                 head_sha: expected_head.unwrap_or_default(),
                 current_head_reviews,
                 stale_reviews,
+                pending_reviews,
             });
         }
         let next = page.end_cursor.ok_or_else(|| {
@@ -216,7 +332,7 @@ fn ensure_github(ctx: &ProviderContext) -> Result<(), ForgeError> {
     ))
 }
 
-fn build_github_reviews_call(
+pub(crate) fn build_github_reviews_call(
     ctx: &ProviderContext,
     owner: &str,
     name: &str,
@@ -228,6 +344,34 @@ fn build_github_reviews_call(
     argv.extend([
         OsString::from("-f"),
         OsString::from(format!("query={GITHUB_REVIEWS_QUERY}")),
+        OsString::from("-f"),
+        OsString::from(format!("owner={owner}")),
+        OsString::from("-f"),
+        OsString::from(format!("name={name}")),
+        OsString::from("-F"),
+        OsString::from(format!("pr={number}")),
+    ]);
+    if let Some(after) = after {
+        argv.extend([
+            OsString::from("-f"),
+            OsString::from(format!("after={after}")),
+        ]);
+    }
+    BackendCall::new(BackendProgram::Gh, argv)
+}
+
+pub(crate) fn build_github_pending_reviews_call(
+    ctx: &ProviderContext,
+    owner: &str,
+    name: &str,
+    number: u64,
+    after: Option<&str>,
+) -> BackendCall {
+    let mut argv = vec![OsString::from("api"), OsString::from("graphql")];
+    ctx.push_github_api_hostname(&mut argv);
+    argv.extend([
+        OsString::from("-f"),
+        OsString::from(format!("query={GITHUB_PENDING_REVIEWS_QUERY}")),
         OsString::from("-f"),
         OsString::from(format!("owner={owner}")),
         OsString::from("-f"),
@@ -287,19 +431,39 @@ fn parse_github_review_page(output: &BackendSuccess) -> Result<ReviewPage, Forge
         .map(str::to_string);
 
     let mut reviews = Vec::with_capacity(nodes.len());
+    let mut pending_reviews = Vec::new();
     for node in nodes {
         let body = node
             .get("body")
             .and_then(|item| item.as_str())
             .unwrap_or("");
         let (summary, summary_truncated) = bounded_summary(body);
+        let id = required_string(node, "/id", "review.id")?;
+        let database_id = node.get("databaseId").and_then(|item| item.as_u64());
+        let url = required_string(node, "/url", "review.url")?;
+        let author = string_at(node, "/author/login");
+        let state = required_review_state(node)?;
+        if state == "PENDING" {
+            pending_reviews.push(PendingReviewSummary {
+                id,
+                database_id,
+                url,
+                author,
+                state,
+                commit_sha: optional_string(node, "/commit/oid"),
+                summary,
+                summary_truncated,
+            });
+            continue;
+        }
+        let commit_sha = required_string(node, "/commit/oid", "review.commit.oid")?;
         let review = NativeReviewSummary {
-            id: required_string(node, "/id", "review.id")?,
-            database_id: node.get("databaseId").and_then(|item| item.as_u64()),
-            url: required_string(node, "/url", "review.url")?,
-            author: string_at(node, "/author/login"),
-            state: required_review_state(node)?,
-            commit_sha: required_string(node, "/commit/oid", "review.commit.oid")?,
+            id,
+            database_id,
+            url,
+            author,
+            state,
+            commit_sha,
             submitted_at: required_string(node, "/submittedAt", "review.submittedAt")?,
             summary,
             summary_truncated,
@@ -308,6 +472,90 @@ fn parse_github_review_page(output: &BackendSuccess) -> Result<ReviewPage, Forge
     }
 
     Ok(ReviewPage {
+        head_sha,
+        reviews,
+        pending_reviews,
+        has_next_page,
+        end_cursor,
+    })
+}
+
+fn parse_github_pending_review_page(
+    output: &BackendSuccess,
+) -> Result<PendingReviewGuardPage, ForgeError> {
+    let value: serde_json::Value = serde_json::from_str(output.stdout.trim()).map_err(|err| {
+        ForgeError::software(
+            schema_err(),
+            "pending reviews response is invalid JSON",
+            Some(err.to_string()),
+        )
+    })?;
+    if value
+        .get("errors")
+        .and_then(|errors| errors.as_array())
+        .is_some_and(|errors| !errors.is_empty())
+    {
+        return Err(snapshot_incomplete(
+            "GitHub returned partial pending-review data",
+            Some(format!(
+                "graphql_errors={}",
+                value["errors"].as_array().map_or(0, Vec::len)
+            )),
+        ));
+    }
+    let pull = value
+        .pointer("/data/repository/pullRequest")
+        .ok_or_else(|| {
+            snapshot_incomplete("pending reviews response is missing pullRequest", None)
+        })?;
+    let head_sha = required_string(pull, "/headRefOid", "headRefOid")?;
+    let nodes = pull
+        .pointer("/reviews/nodes")
+        .and_then(|item| item.as_array())
+        .ok_or_else(|| {
+            snapshot_incomplete("pending reviews response is missing reviews nodes", None)
+        })?;
+    let page_info = pull
+        .pointer("/reviews/pageInfo")
+        .ok_or_else(|| snapshot_incomplete("pending reviews response is missing pageInfo", None))?;
+    let has_next_page = page_info
+        .get("hasNextPage")
+        .and_then(|item| item.as_bool())
+        .ok_or_else(|| {
+            snapshot_incomplete("pending reviews pageInfo is missing hasNextPage", None)
+        })?;
+    let end_cursor = optional_string(page_info, "/endCursor");
+
+    let reviews = nodes
+        .iter()
+        .map(|node| {
+            let id = required_string(node, "/id", "review.id")?;
+            let state = required_review_state(node)?;
+            if state != "PENDING" {
+                return Err(snapshot_incomplete(
+                    "pending-only review query returned a non-pending review",
+                    Some(format!("review_id={id}; state={state}")),
+                ));
+            }
+            Ok(PendingReviewGuard {
+                id,
+                url: required_string(node, "/url", "review.url")?,
+                author: required_string(node, "/author/login", "review.author.login")?,
+                viewer_did_author: required_bool(
+                    node,
+                    "/viewerDidAuthor",
+                    "review.viewerDidAuthor",
+                )?,
+                viewer_can_delete: required_bool(
+                    node,
+                    "/viewerCanDelete",
+                    "review.viewerCanDelete",
+                )?,
+            })
+        })
+        .collect::<Result<Vec<_>, ForgeError>>()?;
+
+    Ok(PendingReviewGuardPage {
         head_sha,
         reviews,
         has_next_page,
@@ -348,6 +596,30 @@ fn required_string(
                 Some(format!("field={field}")),
             )
         })
+}
+
+fn required_bool(
+    value: &serde_json::Value,
+    pointer: &str,
+    field: &str,
+) -> Result<bool, ForgeError> {
+    value
+        .pointer(pointer)
+        .and_then(|item| item.as_bool())
+        .ok_or_else(|| {
+            snapshot_incomplete(
+                "reviews response is missing a required field",
+                Some(format!("field={field}")),
+            )
+        })
+}
+
+fn optional_string(value: &serde_json::Value, pointer: &str) -> Option<String> {
+    value
+        .pointer(pointer)
+        .and_then(|item| item.as_str())
+        .filter(|item| !item.is_empty())
+        .map(str::to_string)
 }
 
 fn remaining_timeout(
@@ -392,7 +664,7 @@ fn string_at(value: &serde_json::Value, pointer: &str) -> String {
         .to_string()
 }
 
-fn resolve_repo_slug<F: Fn(&str) -> Option<String>>(
+pub(crate) fn resolve_repo_slug<F: Fn(&str) -> Option<String>>(
     ctx: &ProviderContext,
     remote: &str,
     lookup: &F,
@@ -413,7 +685,7 @@ fn resolve_repo_slug<F: Fn(&str) -> Option<String>>(
     ))
 }
 
-fn split_slug(slug: &str) -> Result<(&str, &str), ForgeError> {
+pub(crate) fn split_slug(slug: &str) -> Result<(&str, &str), ForgeError> {
     slug.split_once('/').ok_or_else(|| {
         ForgeError::validation(
             schema_err(),
@@ -430,11 +702,12 @@ fn schema_err() -> String {
 
 fn render_text(payload: &PrReviewsPayload) {
     println!(
-        "reviews for #{number} at {head}: {current} current, {stale} stale\n  {url}",
+        "reviews for #{number} at {head}: {current} current, {stale} stale, {pending} pending\n  {url}",
         number = payload.number,
         head = payload.head_sha,
         current = payload.current_head_reviews.len(),
         stale = payload.stale_reviews.len(),
+        pending = payload.pending_reviews.len(),
         url = payload.url,
     );
 }

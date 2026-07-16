@@ -26,6 +26,7 @@ cargo run -p nils-forge-cli -- pr review validate --comment-file review.md --thr
 cargo run -p nils-forge-cli -- pr review validate 123 --check-diff --comment-file review.md --thread-file review-threads.json --format json
 cargo run -p nils-forge-cli -- pr review 123 --decision comments-only --submit-review --comment-file review.md --thread-file review-threads.json --format json
 cargo run -p nils-forge-cli -- pr reviews 123 --format json
+cargo run -p nils-forge-cli -- pr pending-review delete 123 --review PRR_pending --dry-run --format json
 cargo run -p nils-forge-cli -- pr merge 123 --review-convergence --format json
 cargo run -p nils-forge-cli -- repo push-default --expected-base <sha> --reason-file reason.md --dry-run --format json
 ```
@@ -68,6 +69,14 @@ Merge and deliver dry-run envelopes expose the resolved policy under
 `data.review_convergence`. Existing unresolved-thread enforcement remains an
 independent merge gate. See the contract for config precedence, duration
 bounds, and the JSON snapshot.
+
+Provider-valid pending reviews are listed separately under
+`pr reviews data.pending_reviews`; they are not submitted review activity. To
+recover a stuck draft, copy its `PRR_...` id into `pr pending-review delete`.
+The command verifies PR membership, `PENDING` state, provider-native
+`viewerDidAuthor`, and `viewerCanDelete` before deleting that exact node. It
+works for GitHub App installation actors without relying on the user-only
+`GET /user` endpoint.
 
 ## Inbox discovery
 

@@ -1368,7 +1368,10 @@ fn build_github_submit_review_call(
     BackendCall::new(BackendProgram::Gh, argv)
 }
 
-fn build_github_delete_pending_review_call(ctx: &ProviderContext, review_id: &str) -> BackendCall {
+pub(crate) fn build_github_delete_pending_review_call(
+    ctx: &ProviderContext,
+    review_id: &str,
+) -> BackendCall {
     let mut argv = vec![OsString::from("api"), OsString::from("graphql")];
     ctx.push_github_api_hostname(&mut argv);
     argv.extend([

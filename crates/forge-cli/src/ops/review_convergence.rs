@@ -553,6 +553,28 @@ mod tests {
     }
 
     #[test]
+    fn pending_review_does_not_contribute_submitted_convergence_activity() {
+        let pending = r#"{"id":"PRR_pending","databaseId":9,"url":"https://github.com/acme/widgets/pull/7#pullrequestreview-9","author":{"login":"example-review-bot[bot]"},"state":"PENDING","commit":{"oid":"head"},"submittedAt":null,"body":"draft"}"#;
+        let runner = QueueRunner::new([reviews_json("head", pending)]);
+        let clock = StepClock::new();
+        let snapshot = converge(
+            &runner,
+            &clock,
+            &ctx(),
+            7,
+            "https://github.com/acme/widgets/pull/7",
+            Some("head"),
+            &policy(120, 1200),
+        )
+        .expect("pending review is valid provider state");
+
+        assert!(snapshot.observed_reviews.is_empty());
+        assert!(snapshot.stale_reviews.is_empty());
+        assert!(snapshot.changes_requested_by.is_empty());
+        assert!(snapshot.latest_activity_at.is_none());
+    }
+
+    #[test]
     fn observed_review_waits_for_the_quiet_period() {
         let current = review("PRR_1", "COMMENTED", "2026-07-14T04:00:00Z");
         let runner = QueueRunner::new([reviews_json("head", &current)]);
