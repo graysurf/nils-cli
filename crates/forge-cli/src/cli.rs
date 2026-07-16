@@ -673,6 +673,34 @@ pub struct PrReviewsArgs {
     pub id: u64,
 }
 
+/// `pr pending-review` recovery group.
+#[derive(Args, Debug, Clone)]
+pub struct PrPendingReviewArgs {
+    #[command(subcommand)]
+    pub command: PrPendingReviewCommand,
+}
+
+/// Authenticated recovery actions for provider-valid pending reviews.
+#[derive(Subcommand, Debug, Clone)]
+pub enum PrPendingReviewCommand {
+    /// Verify and delete one exact pending review node.
+    Delete(PrPendingReviewDeleteArgs),
+}
+
+/// `pr pending-review delete` arguments.
+#[derive(Args, Debug, Clone)]
+pub struct PrPendingReviewDeleteArgs {
+    /// Numeric pull request id that must own the pending review.
+    pub id: u64,
+    /// Pending review node id (`PRR_...`) returned by `pr reviews`.
+    #[arg(
+        long,
+        value_name = "REVIEW_ID",
+        value_parser = clap::builder::NonEmptyStringValueParser::new()
+    )]
+    pub review: String,
+}
+
 /// CLI-facing merge method enum so clap can render `--method squash|merge|rebase`
 /// without leaking the config crate's `MergeMethod` into the CLI layer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -857,6 +885,8 @@ pub enum PrCommand {
     ReviewThreads(PrReviewThreadsArgs),
     /// List native review summaries, classified against the current head.
     Reviews(PrReviewsArgs),
+    /// Recover an authenticated actor's pending native review.
+    PendingReview(PrPendingReviewArgs),
     /// List GFM task-list items in the PR / MR description with their state.
     Tasks(PrTasksArgs),
     /// Merge a ready PR / MR.
@@ -1496,6 +1526,13 @@ pub fn dispatch(args: Vec<OsString>) -> i32 {
             command: Some(PrCommand::Reviews(args)),
         })) => ops::pr_reviews::run(&global, args, format),
         Some(Command::Pr(PrArgs {
+            command: Some(PrCommand::PendingReview(args)),
+        })) => match args.command {
+            PrPendingReviewCommand::Delete(delete_args) => {
+                ops::pr_pending_review::run_delete(&global, delete_args, format)
+            }
+        },
+        Some(Command::Pr(PrArgs {
             command: Some(PrCommand::Tasks(args)),
         })) => ops::pr_tasks::run(&global, args, format),
         Some(Command::Pr(PrArgs {
@@ -1776,6 +1813,7 @@ mod tests {
             "comments",
             "ready",
             "review-threads",
+            "pending-review",
             "tasks",
             "merge",
             "close",
@@ -1788,6 +1826,7 @@ mod tests {
                 "view" | "checks" | "wait-checks" => argv.push("1"),
                 // `review-threads` is a clean subcommand group: list via `list <id>`.
                 "review-threads" => argv.extend(["list", "1"]),
+                "pending-review" => argv.extend(["delete", "1", "--review", "PRR_pending"]),
                 "edit" | "comment" | "comments" | "ready" | "tasks" | "merge" | "close" => {
                     argv.push("1")
                 }
@@ -1881,6 +1920,31 @@ mod tests {
                     })),
             })) => assert_eq!(id, 7),
             other => panic!("expected review-threads list, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pr_pending_review_delete_subcommand_parses() {
+        let cli = parse(&[
+            "pr",
+            "pending-review",
+            "delete",
+            "7",
+            "--review",
+            "PRR_pending",
+        ])
+        .expect("pending-review delete parses");
+        match cli.command {
+            Some(Command::Pr(PrArgs {
+                command:
+                    Some(PrCommand::PendingReview(PrPendingReviewArgs {
+                        command: PrPendingReviewCommand::Delete(args),
+                    })),
+            })) => {
+                assert_eq!(args.id, 7);
+                assert_eq!(args.review, "PRR_pending");
+            }
+            other => panic!("expected pending-review delete, got {other:?}"),
         }
     }
 

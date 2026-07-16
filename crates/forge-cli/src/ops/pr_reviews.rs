@@ -26,6 +26,7 @@ const GITHUB_REVIEWS_QUERY: &str = "query($owner: String!, $name: String!, $pr: 
 struct ReviewPage {
     head_sha: String,
     reviews: Vec<NativeReviewSummary>,
+    pending_reviews: Vec<PendingReviewSummary>,
     has_next_page: bool,
     end_cursor: Option<String>,
 }
@@ -46,6 +47,20 @@ pub struct NativeReviewSummary {
     pub summary_truncated: bool,
 }
 
+/// One provider-valid draft review. Pending reviews have no `submittedAt` and
+/// therefore remain separate from submitted current-head/stale activity.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct PendingReviewSummary {
+    pub id: String,
+    pub database_id: Option<u64>,
+    pub url: String,
+    pub author: String,
+    pub state: String,
+    pub commit_sha: String,
+    pub summary: String,
+    pub summary_truncated: bool,
+}
+
 /// Envelope payload for `cli.forge-cli.pr.reviews.v1`.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct PrReviewsPayload {
@@ -55,6 +70,7 @@ pub struct PrReviewsPayload {
     pub head_sha: String,
     pub current_head_reviews: Vec<NativeReviewSummary>,
     pub stale_reviews: Vec<NativeReviewSummary>,
+    pub pending_reviews: Vec<PendingReviewSummary>,
 }
 
 pub fn run(
@@ -142,6 +158,7 @@ pub fn compute_for_pr_with_timeout<R: BackendRunner>(
     let mut expected_head = None;
     let mut current_head_reviews = Vec::new();
     let mut stale_reviews = Vec::new();
+    let mut pending_reviews = Vec::new();
 
     for page_index in 0..MAX_REVIEW_PAGES {
         let remaining = remaining_timeout(timeout, started)?;
@@ -164,6 +181,7 @@ pub fn compute_for_pr_with_timeout<R: BackendRunner>(
             ));
         }
         let head_sha = expected_head.get_or_insert(page.head_sha);
+        pending_reviews.extend(page.pending_reviews);
         for review in page.reviews {
             if review.commit_sha == head_sha.as_str() {
                 current_head_reviews.push(review);
@@ -179,6 +197,7 @@ pub fn compute_for_pr_with_timeout<R: BackendRunner>(
                 head_sha: expected_head.unwrap_or_default(),
                 current_head_reviews,
                 stale_reviews,
+                pending_reviews,
             });
         }
         let next = page.end_cursor.ok_or_else(|| {
@@ -216,7 +235,7 @@ fn ensure_github(ctx: &ProviderContext) -> Result<(), ForgeError> {
     ))
 }
 
-fn build_github_reviews_call(
+pub(crate) fn build_github_reviews_call(
     ctx: &ProviderContext,
     owner: &str,
     name: &str,
@@ -287,19 +306,39 @@ fn parse_github_review_page(output: &BackendSuccess) -> Result<ReviewPage, Forge
         .map(str::to_string);
 
     let mut reviews = Vec::with_capacity(nodes.len());
+    let mut pending_reviews = Vec::new();
     for node in nodes {
         let body = node
             .get("body")
             .and_then(|item| item.as_str())
             .unwrap_or("");
         let (summary, summary_truncated) = bounded_summary(body);
+        let id = required_string(node, "/id", "review.id")?;
+        let database_id = node.get("databaseId").and_then(|item| item.as_u64());
+        let url = required_string(node, "/url", "review.url")?;
+        let author = string_at(node, "/author/login");
+        let state = required_review_state(node)?;
+        let commit_sha = required_string(node, "/commit/oid", "review.commit.oid")?;
+        if state == "PENDING" {
+            pending_reviews.push(PendingReviewSummary {
+                id,
+                database_id,
+                url,
+                author,
+                state,
+                commit_sha,
+                summary,
+                summary_truncated,
+            });
+            continue;
+        }
         let review = NativeReviewSummary {
-            id: required_string(node, "/id", "review.id")?,
-            database_id: node.get("databaseId").and_then(|item| item.as_u64()),
-            url: required_string(node, "/url", "review.url")?,
-            author: string_at(node, "/author/login"),
-            state: required_review_state(node)?,
-            commit_sha: required_string(node, "/commit/oid", "review.commit.oid")?,
+            id,
+            database_id,
+            url,
+            author,
+            state,
+            commit_sha,
             submitted_at: required_string(node, "/submittedAt", "review.submittedAt")?,
             summary,
             summary_truncated,
@@ -310,6 +349,7 @@ fn parse_github_review_page(output: &BackendSuccess) -> Result<ReviewPage, Forge
     Ok(ReviewPage {
         head_sha,
         reviews,
+        pending_reviews,
         has_next_page,
         end_cursor,
     })
@@ -392,7 +432,7 @@ fn string_at(value: &serde_json::Value, pointer: &str) -> String {
         .to_string()
 }
 
-fn resolve_repo_slug<F: Fn(&str) -> Option<String>>(
+pub(crate) fn resolve_repo_slug<F: Fn(&str) -> Option<String>>(
     ctx: &ProviderContext,
     remote: &str,
     lookup: &F,
@@ -413,7 +453,7 @@ fn resolve_repo_slug<F: Fn(&str) -> Option<String>>(
     ))
 }
 
-fn split_slug(slug: &str) -> Result<(&str, &str), ForgeError> {
+pub(crate) fn split_slug(slug: &str) -> Result<(&str, &str), ForgeError> {
     slug.split_once('/').ok_or_else(|| {
         ForgeError::validation(
             schema_err(),
@@ -430,11 +470,12 @@ fn schema_err() -> String {
 
 fn render_text(payload: &PrReviewsPayload) {
     println!(
-        "reviews for #{number} at {head}: {current} current, {stale} stale\n  {url}",
+        "reviews for #{number} at {head}: {current} current, {stale} stale, {pending} pending\n  {url}",
         number = payload.number,
         head = payload.head_sha,
         current = payload.current_head_reviews.len(),
         stale = payload.stale_reviews.len(),
+        pending = payload.pending_reviews.len(),
         url = payload.url,
     );
 }

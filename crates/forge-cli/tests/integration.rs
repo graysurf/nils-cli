@@ -22,6 +22,7 @@ mod integration {
     mod pr_deliver;
     mod pr_deliver_chain;
     mod pr_merge;
+    mod pr_pending_review;
     mod pr_review;
     mod pr_reviews;
     mod pr_wait_checks;
