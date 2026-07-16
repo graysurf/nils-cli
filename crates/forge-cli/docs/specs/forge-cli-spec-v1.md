@@ -61,7 +61,8 @@ In scope (v1):
   `reopen`.
 - Repository label lifecycle: `label list`, `label audit`, and
   `label ensure`.
-- Read-only helpers used by the macros: `auth status`, `repo view`.
+- Repository helpers: read-only `repo view` and the explicitly governed
+  `repo push-default` delivery exception.
 - Macro ops: `pr deliver` (kind = `feature` | `bug`), composing the
   atoms above into the agent-runtime-kit standard "open draft → wait CI →
   ready → merge → cleanup" flow.
@@ -92,7 +93,9 @@ gap (GitLab has no equivalent today) or remove the "lock down behaviour" value
   - Other hosts → `USAGE 64` with `error.kind = "provider_unsupported"`
     and a hint to file a follow-up; v1 does not auto-fall-back to
     HTTPS-only Gitea/Forgejo even though the URL shape would allow it.
-- All remote calls go through the backend subprocess. `forge-cli` does
+- All provider API calls go through the backend subprocess. The governed
+  `repo push-default` operation additionally invokes local `git` for validation,
+  one normal push, and remote-ref read-back. `forge-cli` does
   not open HTTP sockets, does not hold tokens, and does not write to
   the user's `~/.config/gh` or `~/.config/glab`.
 - Backend stdout (typically `--json` from `gh`/`glab`) is parsed and
@@ -138,6 +141,7 @@ Parity matrix (v1):
 | `label ensure`                              | `gh label create/edit`                                                                                                                       | `glab label create/edit`                                    | exact (no delete/rename by default)                                                                                      |
 | `auth status`                               | `gh auth status`                                                                                                                             | `glab auth status`                                          | exact (text → typed)                                                                                                     |
 | `repo view`                                 | `gh repo view --json …`                                                                                                                      | `glab repo view -F json`                                    | exact                                                                                                                    |
+| `repo push-default`                         | local Git validation/push plus `gh repo view --json …` default-branch resolution                                                             | local Git validation/push plus `glab repo view -F json`     | exact; no provider force path                                                                                            |
 | `inbox list`                                | `gh search prs/issues --json …`                                                                                                              | `glab api --hostname <host> …`                              | normalized aggregation                                                                                                   |
 | `inbox status`                              | same provider reads as `inbox list`                                                                                                          | same provider reads as `inbox list`                         | bounded counts                                                                                                           |
 | `inbox next`                                | same provider reads as `inbox list`                                                                                                          | same provider reads as `inbox list`                         | ranked bounded subset                                                                                                    |
@@ -155,7 +159,8 @@ GitLab capability status:
 
 - Supported with stable JSON/API: PR/MR create, view, list, edit, comment,
   ready, close, checks, wait-checks, merge, deliver; issue create/view/edit,
-  comment, close, reopen; label list/audit/ensure; auth status; repo view;
+  comment, close, reopen; label list/audit/ensure; auth status; repo view and
+  governed repo push-default;
   inbox list/status/next; activity feed.
 - Intentionally unsupported in v1: GitLab `activity commits`,
   `activity events`, `activity summary`, and `search` operations.
@@ -216,7 +221,8 @@ forge-cli
 │   ├── list
 │   └── next
 ├── repo
-│   └── view
+│   ├── view
+│   └── push-default
 ├── auth
 │   └── status
 └── completion              (workspace standard)
@@ -232,7 +238,9 @@ Global flags (every subcommand):
 - `--dry-run` — render the backend command that *would* run plus all
   validation checks, but do not invoke it. Output envelope carries the
   exact argv under `data.plan` for atomic commands or `data.actions[].plan`
-  for `label ensure`.
+  for `label ensure`. `repo push-default` instead runs its read-only local and
+  provider preflight and emits `pushed=false` with the exact `push_refspec`;
+  it never invokes `git push` in dry-run mode.
 
 `forge-cli` itself does not expose `--token`, `--host`, or any auth
 override. Those belong to `gh`/`glab` and are configured there.
@@ -340,6 +348,36 @@ backend mapping, validation rules, and output schema versions.
   - resolved head branch MUST be pushed and remote-tracked.
 - Output schema: `cli.forge-cli.pr.create.v1`,
   `data = { number, url, head, base, draft, title, kind, provider }`.
+
+### `repo push-default`
+
+- Input: `--head <ref>` (default `HEAD`, and must resolve to the checked-out
+  commit), required `--expected-base <full-sha>`, and required
+  `--reason-file <path>` containing the caller's explicit authorization basis.
+- Validation:
+  - the selected Git remote must expose exactly one actual push URL (including
+    any configured `remote.<name>.pushurl`), and that destination's host and
+    repository identity must match the provider result; the local backend is
+    unsupported;
+  - HTTP(S) push URLs containing userinfo are rejected; callers use credential
+    helpers rather than embedding credential material in a subprocess argument;
+  - the worktree is clean and checked out on a non-default branch;
+  - the remote default branch still equals `--expected-base`;
+  - `HEAD` is exactly one commit ahead of that base and the base is its
+    ancestor;
+  - `git log --format=%G?` reports `G` for the delivered commit.
+- Mutation: exactly one `git push --porcelain -- <validated-push-url>
+  <head-sha>:refs/heads/<default>` invocation. There is no force,
+  force-with-lease, delete, retry, or direct-merge option. A concurrent remote
+  change is returned as `default_push_rejected`.
+- Destination pinning: the expected-base read, push, and post-push read-back all
+  use the same validated URL rather than re-resolving the remote name.
+- Read-back: exact `git ls-remote` after the push must equal the delivered SHA;
+  otherwise the op fails closed with `default_push_verification_failed` and
+  tells the caller to inspect the already-mutated remote.
+- Output schema: `cli.forge-cli.repo.push-default.v1`; the receipt contains the
+  repository, remote/default branch, authoring branch, head/base SHAs, reason,
+  exact refspec, `pushed`, and `observed_remote_sha`.
 
 ### `pr wait-checks`
 
@@ -725,11 +763,14 @@ backend implementations cannot diverge.
    read/append-only and do not check.)
 5. **Push state.** The resolved head branch MUST be pushed to a
    remote-tracking branch before `create` or `deliver` runs.
-6. **Default-branch protection.** `forge-cli` refuses any operation
-   that would force-push, delete, or merge directly into the repo
-   default branch except via a merged PR/MR. `--allow-non-default-base`
-   exists for non-default *base* branches (e.g. release lanes); there
-   is no flag to bypass the default-branch force-push refusal.
+6. **Default-branch protection.** PR/MR delivery remains the default.
+   `forge-cli` refuses any force-push, force-with-lease, delete, or direct merge
+   into the repo default branch. The sole direct-delivery exception is
+   `repo push-default`: one clean, locally verified signed commit on the exact
+   expected remote base, one uniquely bound actual push destination, delivered
+   with a normal fast-forward push and remote SHA read-back.
+   `--allow-non-default-base` applies only to PR/MR base branches; no flag
+   bypasses the default-branch force refusal.
 7. **Draft → ready → merge ordering.** `pr merge` refuses to merge a
    draft. There is no `--merge-as-draft`. Callers MUST run `pr ready`
    first (or use `pr deliver`, which sequences them).

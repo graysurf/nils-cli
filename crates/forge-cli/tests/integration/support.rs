@@ -13,6 +13,7 @@ use std::process::{Command, Stdio};
 use tempfile::TempDir;
 
 const SCRUBBED_ENV: &[&str] = &[
+    "FORGE_CLI_GIT_BIN",
     "FORGE_CLI_INBOX_GITLAB_HOST",
     "FORGE_CLI_INBOX_GITLAB_VPN",
     "FORGE_CLI_INBOX_GITLAB_VPN_CHECK",
@@ -99,6 +100,12 @@ impl StubEnv {
     pub fn glab_stub(self, body: &str) -> Self {
         let path = self.write_stub("glab", body);
         self.env("FORGE_CLI_GLAB_BIN", path.to_string_lossy())
+    }
+
+    /// Set FORGE_CLI_GIT_BIN to point at a controlled Git stub.
+    pub fn git_stub(self, body: &str) -> Self {
+        let path = self.write_stub("git", body);
+        self.env("FORGE_CLI_GIT_BIN", path.to_string_lossy())
     }
 }
 

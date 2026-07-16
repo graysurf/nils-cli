@@ -52,9 +52,13 @@ validations_catalog:
     error_kind: head_not_pushed
     exit: DATA
   default_branch_protected:
-    rule: "refuse force-push / direct merge to repo default branch"
+    rule: "refuse force-push / direct merge to repo default branch; governed repo.push-default permits only one normal fast-forward commit"
     error_kind: default_branch_protected
     exit: DATA
+  direct_default_delivery:
+    rule: "one actual push destination bound to the provider repository; clean non-default checkout; exact remote base; one locally verified signed commit; normal push; exact remote read-back"
+    error_kind: push_destination_missing | push_destination_ambiguous | push_destination_credentials_unsupported | provider_mismatch | repository_mismatch | dirty_worktree | default_branch_checkout | expected_base_mismatch | expected_base_not_ancestor | direct_commit_count_invalid | commit_signature_unverified | default_push_rejected | default_push_verification_failed
+    exit: DATA | RUNTIME
   draft_merge_refused:
     rule: "pr.draft == false at merge time"
     error_kind: draft_merge_refused
@@ -718,6 +722,33 @@ operations:
         url: string
         default_branch: string
         merge_methods_allowed: list<enum<squash|merge|rebase>>
+
+  - id: repo.push-default
+    schema_version: cli.forge-cli.repo.push-default.v1
+    summary: Deliver exactly one explicitly authorized signed commit to the remote default branch without force.
+    inputs:
+      - { name: --head,          type: string, default: HEAD }
+      - { name: --expected-base, type: full-commit-sha, required: true }
+      - { name: --reason-file,   type: path, required: true }
+    validations: [worktree_clean, default_branch_protected, direct_default_delivery, no_local_path]
+    backends:
+      github: { repo: { program: gh, argv: [repo, view, --json, "name,owner,defaultBranchRef,mergeCommitAllowed,squashMergeAllowed,rebaseMergeAllowed,url"] }, push: { program: git, argv: [push, --porcelain, --, "{validated_push_url}", "{head_sha}:refs/heads/{default_branch}"] } }
+      gitlab: { repo: { program: glab, argv: [repo, view, -F, json] }, push: { program: git, argv: [push, --porcelain, --, "{validated_push_url}", "{head_sha}:refs/heads/{default_branch}"] } }
+    output:
+      data:
+        provider: enum<github|gitlab>
+        repository: string
+        remote: string
+        default_branch: string
+        authoring_branch: string
+        head: string
+        head_sha: string
+        expected_base: string
+        reason: string
+        push_refspec: string
+        pushed: bool
+        observed_remote_sha: string
+    notes: "No force, force-with-lease, delete, retry, or direct-merge path exists. Dry-run performs the read-only preflight and emits pushed=false."
 
   - id: auth.status
     schema_version: cli.forge-cli.auth.status.v1

@@ -27,7 +27,19 @@ cargo run -p nils-forge-cli -- pr review validate 123 --check-diff --comment-fil
 cargo run -p nils-forge-cli -- pr review 123 --decision comments-only --submit-review --comment-file review.md --thread-file review-threads.json --format json
 cargo run -p nils-forge-cli -- pr reviews 123 --format json
 cargo run -p nils-forge-cli -- pr merge 123 --review-convergence --format json
+cargo run -p nils-forge-cli -- repo push-default --expected-base <sha> --reason-file reason.md --dry-run --format json
 ```
+
+`repo push-default` is a narrow, policy-driven exception to PR delivery. It
+requires a clean non-default checkout whose `HEAD` is exactly one locally
+verified signed commit ahead of `--expected-base`; performs only a normal
+fast-forward push to the provider-resolved default branch; and verifies the
+remote SHA afterward. The selected remote must expose exactly one push URL,
+and that actual destination must match the provider repository; all remote
+reads and the push are pinned to that URL. HTTP(S) userinfo is rejected so
+embedded credentials never enter the Git subprocess argv. It has no force mode.
+Callers remain responsible for obtaining explicit user authorization and
+recording it in `--reason-file`.
 
 `--thread-file` is for actionable findings only: max 50 threads, 16 KiB body
 each. Use `pr review validate` for local schema/privacy checks, and add
