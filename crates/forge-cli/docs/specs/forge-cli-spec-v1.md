@@ -95,7 +95,7 @@ gap (GitLab has no equivalent today) or remove the "lock down behaviour" value
     HTTPS-only Gitea/Forgejo even though the URL shape would allow it.
 - All provider API calls go through the backend subprocess. The governed
   `repo push-default` operation additionally invokes local `git` for validation,
-  one normal push, and remote-ref read-back. `forge-cli` does
+  one expected-old-OID compare-and-swap fast-forward, and remote-ref read-back. `forge-cli` does
   not open HTTP sockets, does not hold tokens, and does not write to
   the user's `~/.config/gh` or `~/.config/glab`.
 - Backend stdout (typically `--json` from `gh`/`glab`) is parsed and
@@ -366,10 +366,16 @@ backend mapping, validation rules, and output schema versions.
   - `HEAD` is exactly one commit ahead of that base and the base is its
     ancestor;
   - `git log --format=%G?` reports `G` for the delivered commit.
-- Mutation: exactly one `git push --porcelain -- <validated-push-url>
-  <head-sha>:refs/heads/<default>` invocation. There is no force,
-  force-with-lease, delete, retry, or direct-merge option. A concurrent remote
-  change is returned as `default_push_rejected`.
+- Mutation: exactly one command-scoped `git -c push.followTags=false -c
+  push.pushOption= -c push.recurseSubmodules=no push --porcelain --no-follow-tags
+  --no-recurse-submodules --no-push-option
+  --force-with-lease=refs/heads/<default>:<expected-base> --
+  <validated-push-url> <head-sha>:refs/heads/<default>` invocation. The exact
+  old-OID lease is used only as a compare-and-swap guard; the independent
+  ancestry proof keeps the update fast-forward-only. There is no unconstrained
+  force, delete, retry, or direct-merge option, and inherited tag, submodule,
+  and push-option expansion is disabled. Any concurrent remote change is
+  returned as `default_push_rejected`.
 - Destination pinning: the expected-base read, push, and post-push read-back all
   use the same validated URL rather than re-resolving the remote name.
 - Read-back: exact `git ls-remote` after the push must equal the delivered SHA;
@@ -378,6 +384,18 @@ backend mapping, validation rules, and output schema versions.
 - Output schema: `cli.forge-cli.repo.push-default.v1`; the receipt contains the
   repository, remote/default branch, authoring branch, head/base SHAs, reason,
   exact refspec, `pushed`, and `observed_remote_sha`.
+- Typed failures: `push_destination_missing`,
+  `push_destination_ambiguous`, `push_destination_credentials_unsupported`,
+  `provider_mismatch`, `provider_unsupported`, `repository_mismatch`,
+  `dirty_worktree`, `detached_head`, `default_branch_checkout`,
+  `head_not_checked_out`, `expected_base_mismatch`,
+  `expected_base_missing`, `expected_base_not_ancestor`,
+  `direct_commit_count_invalid`, `commit_signature_unverified`,
+  `reason_file_unreadable`, `reason_invalid`, `local_path_present`,
+  `object_id_invalid`, `remote_default_lookup_failed`,
+  `remote_default_branch_missing`, `default_push_rejected`,
+  `default_push_verification_failed`, and `software_error`. Callers must
+  preserve their declared DATA, RUNTIME, UNAVAILABLE, or SOFTWARE exit class.
 
 ### `pr wait-checks`
 
@@ -764,11 +782,12 @@ backend implementations cannot diverge.
 5. **Push state.** The resolved head branch MUST be pushed to a
    remote-tracking branch before `create` or `deliver` runs.
 6. **Default-branch protection.** PR/MR delivery remains the default.
-   `forge-cli` refuses any force-push, force-with-lease, delete, or direct merge
+   `forge-cli` refuses any unconstrained force-push, caller-controlled lease,
+   delete, or direct merge
    into the repo default branch. The sole direct-delivery exception is
    `repo push-default`: one clean, locally verified signed commit on the exact
    expected remote base, one uniquely bound actual push destination, delivered
-   with a normal fast-forward push and remote SHA read-back.
+   with an exact old-OID compare-and-swap fast-forward and remote SHA read-back.
    `--allow-non-default-base` applies only to PR/MR base branches; no flag
    bypasses the default-branch force refusal.
 7. **Draft → ready → merge ordering.** `pr merge` refuses to merge a
@@ -858,6 +877,28 @@ Violations map to `DATA 65` with one of these `data.error.kind` values:
 | `dirty_worktree`                      | 4                 |
 | `head_not_pushed`                     | 5                 |
 | `default_branch_protected`            | 6                 |
+| `push_destination_missing`            | 6                 |
+| `push_destination_ambiguous`          | 6                 |
+| `push_destination_credentials_unsupported` | 6            |
+| `provider_mismatch`                   | 6                 |
+| `provider_unsupported`                | 6                 |
+| `repository_mismatch`                 | 6                 |
+| `detached_head`                       | 6                 |
+| `default_branch_checkout`             | 6                 |
+| `head_not_checked_out`                | 6                 |
+| `expected_base_mismatch`              | 6                 |
+| `expected_base_missing`               | 6                 |
+| `expected_base_not_ancestor`          | 6                 |
+| `direct_commit_count_invalid`          | 6                 |
+| `commit_signature_unverified`          | 6                 |
+| `reason_file_unreadable`               | 6                 |
+| `reason_invalid`                       | 6                 |
+| `object_id_invalid`                    | 6                 |
+| `remote_default_lookup_failed`         | 6 (`UNAVAILABLE 69`) |
+| `remote_default_branch_missing`        | 6                 |
+| `default_push_rejected`                | 6 (`RUNTIME 1`) |
+| `default_push_verification_failed`     | 6 (`RUNTIME 1`) |
+| `software_error`                       | 6 (`SOFTWARE 70`) |
 | `draft_merge_refused`                 | 7                 |
 | `checks_pending`                      | 8                 |
 | `checks_failed`                       | 8 (`RUNTIME 1`)   |

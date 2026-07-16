@@ -4,7 +4,8 @@
 //! delivery policy. It never authors a commit and never exposes a force mode.
 //! The caller supplies the exact remote base observed before authoring one
 //! signed commit in a non-default managed worktree. This op rechecks that
-//! contract, performs a normal push, and reads the remote ref back.
+//! contract, performs one expected-old-OID compare-and-swap fast-forward, and
+//! reads the remote ref back.
 
 use std::ffi::{OsStr, OsString};
 use std::fs;
@@ -148,9 +149,19 @@ pub fn run_with<R: BackendRunner, G: GitRunner>(
         |_| Some(push_url.clone()),
     )?;
     bind_remote_provider(&push_url, ctx.provider)?;
-    let repo = repo_view::compute(backend, &ctx)?;
+    let remote_slug = parse_slug(&push_url).ok_or_else(|| {
+        validation(
+            "repository_mismatch",
+            "the selected Git push URL does not identify an owner/repository slug",
+            None,
+        )
+    })?;
+    let mut metadata_ctx = ctx.clone();
+    metadata_ctx.repo = Some(metadata_repo_locator(ctx.provider, &ctx.host, &remote_slug));
+    let repo = repo_view::compute(backend, &metadata_ctx)?;
     let repository = format!("{}/{}", repo.owner, repo.name);
     bind_remote_repository(&push_url, &repository)?;
+    bind_remote_metadata(&push_url, &repo.url, &repository)?;
 
     let default_ref = format!("refs/heads/{}", repo.default_branch);
     let default_ref_check = git.run(workdir, &os_args(&["check-ref-format", &default_ref]))?;
@@ -205,17 +216,6 @@ pub fn run_with<R: BackendRunner, G: GitRunner>(
             Some("create a managed worktree from the remote default branch".into()),
         ));
     }
-    if args.head != "HEAD" && args.head != branch {
-        return Err(validation(
-            "head_not_checked_out",
-            format!(
-                "--head '{}' is not the checked-out branch '{}'",
-                args.head, branch
-            ),
-            Some("use --head HEAD or the current branch name".into()),
-        ));
-    }
-
     let head_sha = git_capture(
         git,
         workdir,
@@ -223,6 +223,29 @@ pub fn run_with<R: BackendRunner, G: GitRunner>(
         "HEAD resolution",
     )?;
     let head_sha = validate_object_id(head_sha.trim())?;
+    let requested_head = format!("{}^{{commit}}", args.head);
+    let requested_head_lookup = git.run(
+        workdir,
+        &os_args(&["rev-parse", "--verify", "--end-of-options", &requested_head]),
+    )?;
+    if !requested_head_lookup.success {
+        return Err(validation(
+            "head_not_checked_out",
+            format!("--head '{}' does not resolve to a commit", args.head),
+            (!requested_head_lookup.stderr.is_empty()).then_some(requested_head_lookup.stderr),
+        ));
+    }
+    let requested_head_sha = validate_object_id(requested_head_lookup.stdout.trim())?;
+    if requested_head_sha != head_sha {
+        return Err(validation(
+            "head_not_checked_out",
+            format!(
+                "--head '{}' resolves to {requested_head_sha}, not checked-out HEAD {head_sha}",
+                args.head
+            ),
+            Some(format!("checked-out branch: {branch}")),
+        ));
+    }
 
     let observed_base = ls_remote_head(git, workdir, &push_url, &global.remote, &default_ref)?;
     if observed_base != expected_base {
@@ -248,11 +271,18 @@ pub fn run_with<R: BackendRunner, G: GitRunner>(
         workdir,
         &os_args(&["merge-base", "--is-ancestor", &expected_base, &head_sha]),
     )?;
-    if !ancestry.success {
+    if !ancestry.success && ancestry.exit_code == 1 {
         return Err(validation(
             "expected_base_not_ancestor",
             "the expected remote base is not an ancestor of HEAD",
             None,
+        ));
+    }
+    if !ancestry.success {
+        return Err(ForgeError::software(
+            schema_error(),
+            "git ancestry check failed",
+            (!ancestry.stderr.is_empty()).then_some(ancestry.stderr),
         ));
     }
 
@@ -314,15 +344,32 @@ pub fn run_with<R: BackendRunner, G: GitRunner>(
         return Ok(emit_success(schema_success(), payload, format, render_text));
     }
 
+    let exact_lease = format!("--force-with-lease={default_ref}:{expected_base}");
     let push = git.run(
         workdir,
-        &os_args(&["push", "--porcelain", "--", &push_url, &push_refspec]),
+        &os_args(&[
+            "-c",
+            "push.followTags=false",
+            "-c",
+            "push.pushOption=",
+            "-c",
+            "push.recurseSubmodules=no",
+            "push",
+            "--porcelain",
+            "--no-follow-tags",
+            "--no-recurse-submodules",
+            "--no-push-option",
+            &exact_lease,
+            "--",
+            &push_url,
+            &push_refspec,
+        ]),
     )?;
     if !push.success {
         return Err(ForgeError::runtime_failure(
             schema_error(),
             "default_push_rejected",
-            "the normal fast-forward push to the remote default branch was rejected",
+            "the compare-and-swap fast-forward push to the remote default branch was rejected",
             (!push.stderr.is_empty()).then_some(push.stderr),
         ));
     }
@@ -463,6 +510,65 @@ fn bind_remote_repository(remote_url: &str, repository: &str) -> Result<(), Forg
         ));
     }
     Ok(())
+}
+
+fn metadata_repo_locator(provider: Provider, host: &str, repository: &str) -> String {
+    let host = canonical_forge_host(host);
+    match provider {
+        Provider::GitHub => format!("{host}/{repository}"),
+        Provider::GitLab => format!("https://{host}/{repository}"),
+        Provider::Local => repository.to_string(),
+    }
+}
+
+fn bind_remote_metadata(
+    push_url: &str,
+    metadata_url: &str,
+    repository: &str,
+) -> Result<(), ForgeError> {
+    let push_host = parse_host(push_url)
+        .map(|host| canonical_forge_host(&host))
+        .ok_or_else(|| {
+            validation(
+                "repository_mismatch",
+                "the selected Git push URL does not expose a forge host",
+                None,
+            )
+        })?;
+    let metadata_host = parse_host(metadata_url)
+        .map(|host| canonical_forge_host(&host))
+        .ok_or_else(|| {
+            validation(
+                "repository_mismatch",
+                "provider repository metadata does not expose a forge host",
+                None,
+            )
+        })?;
+    let metadata_slug = parse_slug(metadata_url).ok_or_else(|| {
+        validation(
+            "repository_mismatch",
+            "provider repository metadata does not identify an owner/repository slug",
+            None,
+        )
+    })?;
+    if push_host != metadata_host || !metadata_slug.eq_ignore_ascii_case(repository) {
+        return Err(validation(
+            "repository_mismatch",
+            format!(
+                "provider repository metadata '{metadata_host}/{metadata_slug}' does not match push destination '{push_host}/{repository}'"
+            ),
+            None,
+        ));
+    }
+    Ok(())
+}
+
+fn canonical_forge_host(host: &str) -> String {
+    match host.trim().to_ascii_lowercase().as_str() {
+        "ssh.github.com" => "github.com".to_string(),
+        "altssh.gitlab.com" => "gitlab.com".to_string(),
+        other => other.to_string(),
+    }
 }
 
 fn bind_remote_provider(remote_url: &str, provider: Provider) -> Result<(), ForgeError> {

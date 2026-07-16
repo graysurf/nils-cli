@@ -56,9 +56,9 @@ validations_catalog:
     error_kind: default_branch_protected
     exit: DATA
   direct_default_delivery:
-    rule: "one actual push destination bound to the provider repository; clean non-default checkout; exact remote base; one locally verified signed commit; normal push; exact remote read-back"
-    error_kind: push_destination_missing | push_destination_ambiguous | push_destination_credentials_unsupported | provider_mismatch | repository_mismatch | dirty_worktree | default_branch_checkout | expected_base_mismatch | expected_base_not_ancestor | direct_commit_count_invalid | commit_signature_unverified | default_push_rejected | default_push_verification_failed
-    exit: DATA | RUNTIME
+    rule: "one actual push destination bound by host and slug to provider metadata; clean non-default checkout; exact remote base; one locally verified signed commit; expected-old-OID compare-and-swap fast-forward with inherited push expansion disabled; exact remote read-back"
+    error_kind: push_destination_missing | push_destination_ambiguous | push_destination_credentials_unsupported | provider_mismatch | provider_unsupported | repository_mismatch | dirty_worktree | detached_head | default_branch_checkout | head_not_checked_out | expected_base_mismatch | expected_base_missing | expected_base_not_ancestor | direct_commit_count_invalid | commit_signature_unverified | reason_file_unreadable | reason_invalid | local_path_present | object_id_invalid | remote_default_lookup_failed | remote_default_branch_missing | default_push_rejected | default_push_verification_failed | software_error
+    exit: DATA | RUNTIME | UNAVAILABLE | SOFTWARE
   draft_merge_refused:
     rule: "pr.draft == false at merge time"
     error_kind: draft_merge_refused
@@ -732,8 +732,8 @@ operations:
       - { name: --reason-file,   type: path, required: true }
     validations: [worktree_clean, default_branch_protected, direct_default_delivery, no_local_path]
     backends:
-      github: { repo: { program: gh, argv: [repo, view, --json, "name,owner,defaultBranchRef,mergeCommitAllowed,squashMergeAllowed,rebaseMergeAllowed,url"] }, push: { program: git, argv: [push, --porcelain, --, "{validated_push_url}", "{head_sha}:refs/heads/{default_branch}"] } }
-      gitlab: { repo: { program: glab, argv: [repo, view, -F, json] }, push: { program: git, argv: [push, --porcelain, --, "{validated_push_url}", "{head_sha}:refs/heads/{default_branch}"] } }
+      github: { repo: { program: gh, argv: [repo, view, "{host}/{owner}/{repo}", --json, "name,owner,defaultBranchRef,mergeCommitAllowed,squashMergeAllowed,rebaseMergeAllowed,url"] }, push: { program: git, argv: [-c, push.followTags=false, -c, "push.pushOption=", -c, push.recurseSubmodules=no, push, --porcelain, --no-follow-tags, --no-recurse-submodules, --no-push-option, "--force-with-lease=refs/heads/{default_branch}:{expected_base}", --, "{validated_push_url}", "{head_sha}:refs/heads/{default_branch}"] } }
+      gitlab: { repo: { program: glab, argv: [repo, view, "https://{host}/{owner}/{repo}", -F, json] }, push: { program: git, argv: [-c, push.followTags=false, -c, "push.pushOption=", -c, push.recurseSubmodules=no, push, --porcelain, --no-follow-tags, --no-recurse-submodules, --no-push-option, "--force-with-lease=refs/heads/{default_branch}:{expected_base}", --, "{validated_push_url}", "{head_sha}:refs/heads/{default_branch}"] } }
     output:
       data:
         provider: enum<github|gitlab>
@@ -748,7 +748,7 @@ operations:
         push_refspec: string
         pushed: bool
         observed_remote_sha: string
-    notes: "No force, force-with-lease, delete, retry, or direct-merge path exists. Dry-run performs the read-only preflight and emits pushed=false."
+    notes: "No unconstrained force, delete, retry, or direct-merge path exists. The internal exact old-OID lease is a compare-and-swap guard, and the separate ancestry proof keeps the resulting update fast-forward-only. Dry-run performs the read-only preflight and emits pushed=false."
 
   - id: auth.status
     schema_version: cli.forge-cli.auth.status.v1
