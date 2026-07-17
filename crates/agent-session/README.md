@@ -171,10 +171,13 @@ web console). It builds its own tokio runtime and reuses the synchronous lifecyc
 is no second state model.
 
 - `GET /healthz`, `GET /sessions`, `GET /sessions/{id}/glance?tail=N` — reads, open on loopback. `GET /sessions`
-  additively reports `data.observed_at`, sampled from daemon time after the returned session state is assembled. Sessions report
+  additively reports `data.observed_at`, sampled from daemon time after the returned session state is assembled, plus
+  `data.agent_profiles` containing only ready server-owned `{ id, label, agent }`
+  launch-profile summaries. Sessions report
   `running`, `stopped`, or `unknown` live status plus a boolean `resumable` field and best-effort `repo_name` derived from
   the recorded `cwd`. New interactive records also expose optional
-  `runtime_started_at`, `turn_state`, and `startup`; old records omit them.
+  `runtime_started_at`, `turn_state`, and `startup`; a profiled session also
+  exposes its safe `agent_profile` id. Old records omit them.
   `startup` is the metadata-only `agent-session.startup.v1` projection shared by
   create, list, and glance responses. Its state is `starting`, `ready`, or
   `failed`; its bounded stage is `record`, `tmux`, `runtime`, `app_server`,
@@ -296,7 +299,12 @@ is no second state model.
   selected binding is `pending` or `failed`, so the next accepted prompt uses
   the newly selected account.
 - `POST /sessions` normally creates a fresh session from `agent`, optional `cwd`, `title`, `id`, `prompt`, and
-  `agent_args`. A fresh Codex create may additionally provide
+  `agent_args`. A fresh create may add an advertised `agent_profile`; the id
+  must match the supplied base `agent` and be ready when the request arrives.
+  Profiles are rejected in provider-import mode. The server resolves the
+  profile's executable, provider config root, readiness command, and
+  auto-resume capability; callers cannot submit or override those fields. A
+  fresh Codex create may additionally provide
   `codex_account`; when a prompt is also present, the daemon completes account
   binding before submitting that prompt. `codex_account` is rejected for other
   providers and for provider-import mode. When `provider_resume_id` is present (alias: `resume_id`), the daemon imports an existing Codex or
@@ -460,6 +468,24 @@ and optional `plan`. Broker execution is process-group and time bounded with
 bounded output. Credential values remain in memory only and are never added to
 session documents or HTTP projections. Invalid configuration, malformed output,
 duplicate or unsafe nicknames, timeout, and non-zero exit all fail closed.
+
+Server-owned launch profiles are configured with
+`AGENT_SESSION_LAUNCH_PROFILES`, a JSON array. For example:
+
+```json
+[{"id":"custom-claude","label":"Custom Claude","agent":"claude","agent_bin":"/opt/agent/bin/custom-claude","provider_config_dir":"/srv/agent/claude","readiness_args":["--check"],"auto_resume_supported":false}]
+```
+
+The daemon rejects malformed, duplicate, relative-path, or over-bounded
+configuration at startup. A profile is advertised only when its executable is
+an executable regular file, its optional provider config root is a directory,
+and the optional readiness argv exits successfully within two seconds. The
+readiness argv always runs against `agent_bin`; no shell is involved. Profile
+paths and readiness details never enter HTTP responses. The safe id and private
+provider root persist with the runtime and its durable resume sidecar, so exact
+binary and transcript discovery survive daemon restarts. Set
+`auto_resume_supported` only when the profile has authoritative usage semantics
+for its provider; the default is fail-closed `false`.
 
 Trust model: the daemon binds loopback and *refuses* a non-loopback bind unless `--allow-non-loopback` is passed, because
 it drives a remote shell. Session reads (`list` / `glance`) are intentionally open on the bind address, while path-bearing

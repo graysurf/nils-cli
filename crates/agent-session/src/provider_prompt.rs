@@ -10,6 +10,7 @@ use uuid::Uuid;
 use crate::{
     AgentKind, SessionRecord, claude_projects_root, codex_sessions_root, read_claude_session_cwd,
     read_codex_resumable_session_meta, resolve_provider_transcript_path_from_roots,
+    session_provider_config_dir,
 };
 
 pub(crate) const PROVIDER_PROMPT_CAPABILITY: &str = "provider-prompt.v1";
@@ -423,8 +424,17 @@ fn resolve_provider_prompt_source(record: &SessionRecord) -> Option<ProviderProm
     resolve_provider_prompt_source_from_roots(
         record,
         codex_sessions_root().as_deref(),
-        claude_projects_root().as_deref(),
+        claude_projects_root_for_record(record, claude_projects_root()).as_deref(),
     )
+}
+
+fn claude_projects_root_for_record(
+    record: &SessionRecord,
+    fallback: Option<PathBuf>,
+) -> Option<PathBuf> {
+    session_provider_config_dir(record)
+        .map(|config_dir| config_dir.join("projects"))
+        .or(fallback)
 }
 
 fn resolve_provider_prompt_source_from_roots(
@@ -930,6 +940,30 @@ mod tests {
                 Some(&claude_root),
             )
             .is_none()
+        );
+    }
+
+    #[test]
+    fn profiled_claude_uses_its_persisted_config_root() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let profile_config = tmp.path().join(".claude-gpt");
+        let fallback = tmp.path().join(".claude/projects");
+        let mut record = record("claude", "claude-id");
+        record.runtime = Some(crate::RuntimeInfo {
+            kind: "tmux".to_string(),
+            tmux_session: record.tmux_session.clone(),
+            generation: 1,
+            started_at: "2099-01-01T00:00:00Z".to_string(),
+            launch_id: "runtime-1".to_string(),
+            extra: BTreeMap::from([(
+                "agent_profile_provider_config_dir".to_string(),
+                json!(profile_config),
+            )]),
+        });
+
+        assert_eq!(
+            claude_projects_root_for_record(&record, Some(fallback)),
+            Some(profile_config.join("projects"))
         );
     }
 

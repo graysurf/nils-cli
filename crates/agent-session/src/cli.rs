@@ -97,6 +97,18 @@ pub struct StartArgs {
     #[arg(skip)]
     pub initial_title_state: Option<SessionTitleState>,
 
+    /// Internal: server-owned launch profile id selected by the serve daemon.
+    #[arg(skip)]
+    pub initial_agent_profile: Option<String>,
+
+    /// Internal: provider config root owned by the selected launch profile.
+    #[arg(skip)]
+    pub initial_provider_config_dir: Option<PathBuf>,
+
+    /// Internal: whether the selected profile has authoritative auto-resume usage.
+    #[arg(skip)]
+    pub initial_profile_auto_resume_supported: Option<bool>,
+
     /// Agent to run.
     #[arg(long, value_enum)]
     pub agent: AgentKind,
