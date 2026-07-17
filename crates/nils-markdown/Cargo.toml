@@ -1,6 +1,6 @@
 [package]
 name = "nils-markdown"
-version = "1.22.9"
+version = "1.22.10"
 edition.workspace = true
 license.workspace = true
 description = "Shared minijinja-backed Markdown template layer for the nils-cli workspace."
@@ -36,8 +36,8 @@ anyhow = { workspace = true, optional = true }
 clap = { workspace = true, optional = true }
 clap_complete = { workspace = true, optional = true }
 minijinja = { workspace = true }
-nils-build-info = { version = "1.22.9", path = "../nils-build-info", optional = true }
-nils-common = { version = "1.22.9", path = "../nils-common", package = "nils-common" }
+nils-build-info = { version = "1.22.10", path = "../nils-build-info", optional = true }
+nils-common = { version = "1.22.10", path = "../nils-common", package = "nils-common" }
 pretty_assertions = { workspace = true, optional = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -45,5 +45,5 @@ thiserror = { workspace = true }
 
 [dev-dependencies]
 anyhow = { workspace = true }
-nils-test-support = { version = "1.22.9", path = "../nils-test-support" }
+nils-test-support = { version = "1.22.10", path = "../nils-test-support" }
 tempfile = "3"
