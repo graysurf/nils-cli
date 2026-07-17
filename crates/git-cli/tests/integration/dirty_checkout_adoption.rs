@@ -6,7 +6,9 @@ use nils_test_support::cmd::{CmdOutput, run_with};
 use pretty_assertions::assert_eq;
 use serde_json::json;
 use std::fs;
-use std::os::unix::ffi::{OsStrExt, OsStringExt};
+use std::os::unix::ffi::OsStrExt;
+#[cfg(target_os = "linux")]
+use std::os::unix::ffi::OsStringExt;
 use std::os::unix::fs::{PermissionsExt, symlink};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -177,6 +179,7 @@ fn dirty_snapshot_is_sensitive_without_mutating_checkout() {
     );
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn dirty_snapshot_supports_non_utf8_native_paths() {
     let repo = init_repo();
