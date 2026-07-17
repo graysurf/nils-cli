@@ -2484,8 +2484,20 @@ async fn codex_accounts_handler(
     if let Some(response) = deny_unauthorized(&state, &headers) {
         return response;
     }
-    match tokio::task::spawn_blocking(crate::codex_account::list_accounts).await {
-        Ok(Ok(accounts)) => envelope_ok(json!({ "machine": state.machine, "accounts": accounts })),
+    let agent_bin = crate::resolve_agent_bin(AgentKind::Codex, None);
+    match tokio::task::spawn_blocking(move || {
+        crate::codex_account::list_accounts().map(|accounts| {
+            let readiness = codex_app_server::account_binding_readiness(&agent_bin);
+            (accounts, readiness)
+        })
+    })
+    .await
+    {
+        Ok(Ok((accounts, readiness))) => envelope_ok(json!({
+            "machine": state.machine,
+            "accounts": accounts,
+            "readiness": readiness,
+        })),
         Ok(Err(err)) => envelope_err(err),
         Err(_) => join_err(),
     }
@@ -13959,6 +13971,13 @@ esac
     async fn codex_accounts_route_is_authenticated_and_projects_no_credentials() {
         let lock = GlobalStateLock::new();
         let tmp = tempfile::TempDir::new().unwrap();
+        let codex = tmp.path().join("codex");
+        fs::write(
+            &codex,
+            "#!/bin/sh\nif [ \"$1\" = --version ]; then printf '%s\\n' 'codex-cli 0.144.5'; exit 0; fi\nif [ \"$1\" = app-server ] && [ \"$2\" = --help ]; then printf '%s\\n' '  --listen <URL>  Supported values: stdio://, unix://PATH'; exit 0; fi\nexit 1\n",
+        )
+        .unwrap();
+        fs::set_permissions(&codex, fs::Permissions::from_mode(0o700)).unwrap();
         let broker = tmp.path().join("broker");
         fs::write(
             &broker,
@@ -13970,6 +13989,7 @@ printf '%s\n' '{"schema_version":"agent-session.codex-auth-broker.v1","accounts"
         fs::set_permissions(&broker, fs::Permissions::from_mode(0o700)).unwrap();
         let argv = serde_json::to_string(&vec![broker.to_string_lossy().into_owned()]).unwrap();
         let _broker = EnvGuard::set(&lock, "AGENT_SESSION_CODEX_ACCOUNT_BROKER", &argv);
+        let _codex_bin = EnvGuard::set(&lock, "AGENT_SESSION_CODEX_BIN", codex.to_str().unwrap());
         let st = state(tmp.path(), Some(TOKEN), minimal_tmux(tmp.path()));
 
         let (status, body) = call(router(st.clone()), get_auth("/codex/accounts", None)).await;
@@ -13981,6 +14001,14 @@ printf '%s\n' '{"schema_version":"agent-session.codex-auth-broker.v1","accounts"
         assert_eq!(body["data"]["machine"], MACHINE);
         assert_eq!(body["data"]["accounts"][0]["account"], "gamania");
         assert_eq!(body["data"]["accounts"][0]["label"], "Gamania");
+        assert_eq!(
+            body["data"]["readiness"],
+            json!({
+                "schema_version": "agent-session.codex-account-readiness.v1",
+                "supported": true,
+                "provider_version": "0.144.5",
+            })
+        );
         let encoded = body.to_string();
         assert!(!encoded.contains("access_token"));
         assert!(!encoded.contains("chatgpt_account_id"));
