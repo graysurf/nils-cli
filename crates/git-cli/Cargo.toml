@@ -18,10 +18,13 @@ path = "src/main.rs"
 anyhow = { workspace = true }
 clap = { workspace = true }
 clap_complete = { workspace = true }
+getrandom = { workspace = true }
+libc = { workspace = true }
 nils-build-info = { version = "1.22.12", path = "../nils-build-info" }
 nils-common = { version = "1.22.12", path = "../nils-common", package = "nils-common" }
 serde = { workspace = true }
 serde_json = { workspace = true, features = ["preserve_order"] }
+sha2 = { workspace = true }
 thiserror = { workspace = true }
 time = { version = "0.3", features = ["formatting"] }
 

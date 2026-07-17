@@ -17,7 +17,8 @@ subcommands (matching the binary's `--help` output):
 - `commit`: `context`, `context-json` (aliases `context_json`, `contextjson`, `json`),
   `to-stash` (alias `stash`).
 - `branch`: `cleanup` (alias `delete-merged`).
-- `worktree`: `add`, `list`, `remove`, `prune`, `go`.
+- `worktree`: `add`, `list`, `remove`, `prune`, `go`, `dirty-snapshot`, `adopt-dirty`,
+  `revoke-dirty`.
 - `ci`: `pick`.
 - `open`: `repo`, `branch`, `default-branch` (alias `default`), `commit`, `compare`,
   `pr` (aliases `pull-request`, `mr`, `merge-request`), `pulls` (aliases `prs`,
@@ -80,6 +81,27 @@ subcommands (matching the binary's `--help` output):
   static `gxwcd` completion workaround, though `gxwcd` remains for cd-on-select ergonomics). Use
   `--shell` to emit an evaluable `cd -- <path>` command (mirrors `utils root --shell`). Options:
   `--shell`, `--format text|json`.
+- `dirty-snapshot`: Compute a bounded, two-pass identity for the current dirty checkout without
+  printing raw paths or file content. The identity binds the physical checkout instance, `HEAD`,
+  symbolic branch, raw index stages, unstaged content, and untracked regular-file/symlink state.
+  Clean checkouts, active Git operations, unmerged stages, dirty submodules, escaping symlinks,
+  special filesystem objects, and resource-limit overflow fail closed. Options: `--format
+  text|json`.
+- `adopt-dirty`: Exchange one unexpired runtime-issued challenge for an opaque adoption receipt.
+  Requires `AGENT_RUNTIME_DIRTY_CHECKOUT_ADOPTION=1` plus `--challenge <token>` and
+  `--reason-file <path>`. The reason must be a non-empty, no-follow regular file of at most 2,000
+  bytes. The command recomputes the exact snapshot under the shared lease lock, consumes the
+  challenge once, rejects live foreign ownership, and writes private receipt and lease-v2 state.
+  Retained state contains digests, not the bearer token or reason text. Options: `--format
+  text|json`.
+- `revoke-dirty`: Revoke only the active adoption matching `--receipt <id>` without changing Git
+  content. Revocation remains available when the adoption feature gate is disabled. Options:
+  `--format text|json`.
+
+`dirty-snapshot`, `adopt-dirty`, and `revoke-dirty` use the standard versioned JSON envelope in
+`--format json` mode (`cli.git-cli.worktree.<command>.v1`). Snapshot output contains opaque keys and
+hashes rather than raw local paths; adoption output returns only `receipt_id` and `snapshot_id`.
+Operational failures use the same envelope and nonzero exit status.
 
 The managed layout (`repo-key`, the managed/external classification, and slug-based resolution) is
 anchored to the repository's primary worktree, so `worktree` commands behave identically whether run

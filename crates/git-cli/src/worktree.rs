@@ -10,13 +10,18 @@ use std::env;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 
+pub mod dirty_checkout_adoption;
+
 const BINARY: &str = "git-cli";
 
 pub fn dispatch(cmd: &str, args: &[String]) -> Option<i32> {
     match cmd {
         "add" => Some(run_add(args)),
+        "adopt-dirty" => Some(dirty_checkout_adoption::run_adopt_dirty(args)),
+        "dirty-snapshot" => Some(dirty_checkout_adoption::run_dirty_snapshot(args)),
         "list" => Some(run_list(args)),
         "remove" => Some(run_remove(args)),
+        "revoke-dirty" => Some(dirty_checkout_adoption::run_revoke_dirty(args)),
         "prune" => Some(run_prune(args)),
         "go" => Some(run_go(args)),
         _ => None,

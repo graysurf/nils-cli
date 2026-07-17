@@ -343,6 +343,29 @@ fn build_worktree_group() -> Command {
                 .arg(format_arg()),
         )
         .subcommand(
+            Command::new("dirty-snapshot")
+                .about("Hash the current dirty checkout state")
+                .arg(format_arg()),
+        )
+        .subcommand(
+            Command::new("adopt-dirty")
+                .about("Adopt one challenged dirty checkout snapshot")
+                .arg(
+                    Arg::new("challenge")
+                        .long("challenge")
+                        .value_name("token")
+                        .required(true),
+                )
+                .arg(
+                    Arg::new("reason-file")
+                        .long("reason-file")
+                        .value_name("path")
+                        .value_hint(ValueHint::FilePath)
+                        .required(true),
+                )
+                .arg(format_arg()),
+        )
+        .subcommand(
             Command::new("list")
                 .about("List git worktrees")
                 .arg(format_arg()),
@@ -378,6 +401,17 @@ fn build_worktree_group() -> Command {
         .subcommand(
             Command::new("prune")
                 .about("Prune stale git worktree metadata")
+                .arg(format_arg()),
+        )
+        .subcommand(
+            Command::new("revoke-dirty")
+                .about("Revoke a receipt-bound dirty adoption")
+                .arg(
+                    Arg::new("receipt")
+                        .long("receipt")
+                        .value_name("id")
+                        .required(true),
+                )
                 .arg(format_arg()),
         )
         .subcommand(Command::new("help").about("Display help message for worktree"))
@@ -551,6 +585,34 @@ mod tests {
             go.get_arguments().any(|arg| arg.get_id() == "shell"),
             "worktree go should advertise --shell in completion"
         );
+    }
+
+    #[test]
+    fn dirty_checkout_commands_expose_frozen_completion_flags() {
+        let cmd = build_command_model();
+        let worktree = cmd
+            .find_subcommand("worktree")
+            .expect("worktree group present");
+        for (command, expected) in [
+            ("dirty-snapshot", vec!["format"]),
+            ("adopt-dirty", vec!["challenge", "reason-file", "format"]),
+            ("revoke-dirty", vec!["receipt", "format"]),
+        ] {
+            let command = worktree
+                .find_subcommand(command)
+                .unwrap_or_else(|| panic!("worktree {command} command present"));
+            let actual: Vec<String> = command
+                .get_arguments()
+                .map(|argument| argument.get_id().to_string())
+                .collect();
+            for flag in expected {
+                assert!(
+                    actual.iter().any(|actual| actual == flag),
+                    "worktree {} should expose {flag}, got {actual:?}",
+                    command.get_name()
+                );
+            }
+        }
     }
 
     #[test]
