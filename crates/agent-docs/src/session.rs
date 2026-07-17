@@ -12,13 +12,15 @@ use crate::cli::{
     SessionActivateArgs, SessionArgs, SessionCommand, SessionCommonArgs, SessionVerifyArgs,
 };
 use crate::config::load_catalog_from_roots;
-use crate::env::{PathOverrides, resolve_roots};
-use crate::model::{Context, FallbackMode, OutputFormat};
+use crate::env::{PathOverrides, ResolvedRoots, resolve_roots};
+use crate::integration;
+use crate::model::{Context, FallbackMode, OutputFormat, Product};
 use crate::resolver;
 
-const RECORD_SCHEMA: &str = "agent-docs.session.v1";
+const RECORD_SCHEMA: &str = "agent-docs.session.v2";
 const EXIT_OK: i32 = 0;
 const EXIT_RUNTIME: i32 = 1;
+const EXIT_CONFIG: i32 = 3;
 const EXIT_DATA: i32 = 65;
 const SECRET_MODE: u32 = 0o600;
 const LOCK_OWNER_FILE: &str = "owner.json";
@@ -31,6 +33,8 @@ struct SessionRecord {
     session_hash: String,
     project_hash: String,
     product: String,
+    #[serde(default)]
+    integration_fingerprint: Option<String>,
     active_intents: BTreeMap<String, String>,
     activated_at: String,
     producer_version: String,
@@ -44,40 +48,74 @@ struct SessionData {
     verified: bool,
 }
 
-pub fn run(args: SessionArgs, overrides: PathOverrides, fallback: FallbackMode) -> i32 {
+pub fn run(
+    args: SessionArgs,
+    overrides: PathOverrides,
+    fallback: FallbackMode,
+    use_user_config: bool,
+    expected_integration_fingerprint: Option<String>,
+) -> i32 {
     match args.command {
-        SessionCommand::Activate(args) => activate(args, overrides, fallback),
-        SessionCommand::Status(args) => status(args, overrides),
-        SessionCommand::Verify(args) => verify(args, overrides, fallback),
+        SessionCommand::Activate(args) => activate(
+            args,
+            overrides,
+            fallback,
+            use_user_config,
+            expected_integration_fingerprint.as_deref(),
+        ),
+        SessionCommand::Status(args) => {
+            status(args, overrides, expected_integration_fingerprint.as_deref())
+        }
+        SessionCommand::Verify(args) => verify(
+            args,
+            overrides,
+            fallback,
+            use_user_config,
+            expected_integration_fingerprint.as_deref(),
+        ),
     }
 }
 
-fn activate(args: SessionActivateArgs, overrides: PathOverrides, fallback: FallbackMode) -> i32 {
+fn activate(
+    args: SessionActivateArgs,
+    overrides: PathOverrides,
+    fallback: FallbackMode,
+    use_user_config: bool,
+    expected_integration_fingerprint: Option<&str>,
+) -> i32 {
     let common = &args.common;
     let result = (|| -> Result<SessionData, SessionFailure> {
         validate_common(common)?;
         let roots = resolve_roots(&overrides)
             .map_err(|err| SessionFailure::runtime("root-resolution-failed", err.to_string()))?;
-        let catalog = load_catalog_from_roots(&roots)
-            .map_err(|err| SessionFailure::runtime("catalog-load-failed", err.to_string()))?;
-        let available = resolver::declared_intents(&roots, fallback, &catalog);
+        let (catalog, integration_fingerprint) = load_session_catalog(
+            &roots,
+            common.product,
+            fallback,
+            use_user_config,
+            expected_integration_fingerprint,
+        )?;
+        let available = resolver::declared_intents(&roots, fallback, &catalog.catalog);
         let path = record_path(common, &roots.project_path)?;
         let _lock = RecordLock::acquire(&path)?;
         let mut record = if path.exists() {
-            let record = read_record(&path)?;
-            validate_record_context(common, &roots.project_path, &record)?;
-            record
-        } else {
-            SessionRecord {
-                schema: RECORD_SCHEMA.to_string(),
-                session_hash: digest(common.session_id.trim().as_bytes()),
-                project_hash: project_hash(&roots.project_path),
-                product: common.product.as_str().to_string(),
-                active_intents: BTreeMap::new(),
-                activated_at: jiff::Timestamp::now().to_string(),
-                producer_version: env!("CARGO_PKG_VERSION").to_string(),
+            match read_record(&path) {
+                Ok(record) => {
+                    validate_record_context(common, &roots.project_path, &record)?;
+                    record
+                }
+                Err(failure) if failure.code == "unsupported-record" => {
+                    new_record(common, &roots.project_path, integration_fingerprint.clone())
+                }
+                Err(failure) => return Err(failure),
             }
+        } else {
+            new_record(common, &roots.project_path, integration_fingerprint.clone())
         };
+        if record.integration_fingerprint != integration_fingerprint {
+            record.active_intents.clear();
+            record.integration_fingerprint = integration_fingerprint.clone();
+        }
         for raw in &args.intent {
             let intent =
                 Context::parse(raw).map_err(|err| SessionFailure::data("invalid-intent", err))?;
@@ -87,7 +125,7 @@ fn activate(args: SessionActivateArgs, overrides: PathOverrides, fallback: Fallb
                     format!("intent `{intent}` is not declared"),
                 ));
             }
-            let report = resolver::resolve_intent_with_catalog_for_product(
+            let report = resolver::resolve_intent_with_effective_catalog_for_product(
                 &intent,
                 &roots,
                 Some(common.product),
@@ -104,7 +142,7 @@ fn activate(args: SessionActivateArgs, overrides: PathOverrides, fallback: Fallb
             }
             record
                 .active_intents
-                .insert(intent.to_string(), fingerprint(&report, &catalog)?);
+                .insert(intent.to_string(), fingerprint(&report, &catalog.catalog)?);
         }
         record.activated_at = jiff::Timestamp::now().to_string();
         write_record(&path, &record)?;
@@ -113,7 +151,11 @@ fn activate(args: SessionActivateArgs, overrides: PathOverrides, fallback: Fallb
     render(common.format, "activate", result)
 }
 
-fn status(common: SessionCommonArgs, overrides: PathOverrides) -> i32 {
+fn status(
+    common: SessionCommonArgs,
+    overrides: PathOverrides,
+    expected_integration_fingerprint: Option<&str>,
+) -> i32 {
     let result = (|| -> Result<SessionData, SessionFailure> {
         validate_common(&common)?;
         let roots = resolve_roots(&overrides)
@@ -121,22 +163,47 @@ fn status(common: SessionCommonArgs, overrides: PathOverrides) -> i32 {
         let path = record_path(&common, &roots.project_path)?;
         let record = read_record(&path)?;
         validate_record_context(&common, &roots.project_path, &record)?;
+        if let Some(expected) = expected_integration_fingerprint
+            && record.integration_fingerprint.as_deref() != Some(expected)
+        {
+            return Err(SessionFailure::data(
+                "stale-integration-decision",
+                "session activation does not match the requested integration fingerprint",
+            ));
+        }
         data(&path, &common.state_home, &record, false)
     })();
     render(common.format, "status", result)
 }
 
-fn verify(args: SessionVerifyArgs, overrides: PathOverrides, fallback: FallbackMode) -> i32 {
+fn verify(
+    args: SessionVerifyArgs,
+    overrides: PathOverrides,
+    fallback: FallbackMode,
+    use_user_config: bool,
+    expected_integration_fingerprint: Option<&str>,
+) -> i32 {
     let common = &args.common;
     let result = (|| -> Result<SessionData, SessionFailure> {
         validate_common(common)?;
         let roots = resolve_roots(&overrides)
             .map_err(|err| SessionFailure::runtime("root-resolution-failed", err.to_string()))?;
-        let catalog = load_catalog_from_roots(&roots)
-            .map_err(|err| SessionFailure::runtime("catalog-load-failed", err.to_string()))?;
+        let (catalog, integration_fingerprint) = load_session_catalog(
+            &roots,
+            common.product,
+            fallback,
+            use_user_config,
+            expected_integration_fingerprint,
+        )?;
         let path = record_path(common, &roots.project_path)?;
         let record = read_record(&path)?;
         validate_record_context(common, &roots.project_path, &record)?;
+        if record.integration_fingerprint != integration_fingerprint {
+            return Err(SessionFailure::data(
+                "stale-integration-decision",
+                "session activation does not match the current integration decision",
+            ));
+        }
         for raw in &args.require_intent {
             let intent =
                 Context::parse(raw).map_err(|err| SessionFailure::data("invalid-intent", err))?;
@@ -146,7 +213,7 @@ fn verify(args: SessionVerifyArgs, overrides: PathOverrides, fallback: FallbackM
                     format!("intent `{intent}` is not active"),
                 ));
             };
-            let report = resolver::resolve_intent_with_catalog_for_product(
+            let report = resolver::resolve_intent_with_effective_catalog_for_product(
                 &intent,
                 &roots,
                 Some(common.product),
@@ -155,7 +222,9 @@ fn verify(args: SessionVerifyArgs, overrides: PathOverrides, fallback: FallbackM
                 true,
                 &catalog,
             );
-            if report.has_unsatisfied_required() || *stored != fingerprint(&report, &catalog)? {
+            if report.has_unsatisfied_required()
+                || *stored != fingerprint(&report, &catalog.catalog)?
+            {
                 return Err(SessionFailure::data(
                     "stale-activation",
                     format!("activation for `{intent}` no longer matches the resolved catalog"),
@@ -165,6 +234,61 @@ fn verify(args: SessionVerifyArgs, overrides: PathOverrides, fallback: FallbackM
         data(&path, &common.state_home, &record, true)
     })();
     render(common.format, "verify", result)
+}
+
+fn load_session_catalog(
+    roots: &ResolvedRoots,
+    product: Product,
+    fallback: FallbackMode,
+    use_user_config: bool,
+    expected_integration_fingerprint: Option<&str>,
+) -> Result<(integration::EffectiveCatalog, Option<String>), SessionFailure> {
+    if !use_user_config {
+        let catalog = load_catalog_from_roots(roots)
+            .map_err(|err| SessionFailure::runtime("catalog-load-failed", err.to_string()))?;
+        return Ok((
+            integration::EffectiveCatalog {
+                catalog,
+                private_project_catalog: false,
+            },
+            None,
+        ));
+    }
+    let (catalog, current) = integration::load_bound_catalog_with_fingerprint(
+        roots,
+        product,
+        fallback,
+        expected_integration_fingerprint,
+    )
+    .map_err(|err| match err.kind() {
+        integration::BoundCatalogErrorKind::Data => {
+            SessionFailure::data(err.code(), err.to_string())
+        }
+        integration::BoundCatalogErrorKind::Config => {
+            SessionFailure::config(err.code(), err.to_string())
+        }
+        integration::BoundCatalogErrorKind::Runtime => {
+            SessionFailure::runtime(err.code(), err.to_string())
+        }
+    })?;
+    Ok((catalog, Some(current)))
+}
+
+fn new_record(
+    common: &SessionCommonArgs,
+    project: &Path,
+    integration_fingerprint: Option<String>,
+) -> SessionRecord {
+    SessionRecord {
+        schema: RECORD_SCHEMA.to_string(),
+        session_hash: digest(common.session_id.trim().as_bytes()),
+        project_hash: project_hash(project),
+        product: common.product.as_str().to_string(),
+        integration_fingerprint,
+        active_intents: BTreeMap::new(),
+        activated_at: jiff::Timestamp::now().to_string(),
+        producer_version: env!("CARGO_PKG_VERSION").to_string(),
+    }
 }
 
 fn validate_common(common: &SessionCommonArgs) -> Result<(), SessionFailure> {
@@ -336,6 +460,13 @@ impl SessionFailure {
             code,
             message: message.into(),
             exit_code: EXIT_DATA,
+        }
+    }
+    fn config(code: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            code,
+            message: message.into(),
+            exit_code: EXIT_CONFIG,
         }
     }
     fn runtime(code: &'static str, message: impl Into<String>) -> Self {

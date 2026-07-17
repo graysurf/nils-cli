@@ -18,6 +18,8 @@ _agent-docs() {
 '--docs-home=[Override the docs-home root (otherwise derived from the install symlink)]:PATH:_files' \
 '--project-path=[Override the project root path]:PATH:_files' \
 '--worktree-fallback=[Project worktree fallback mode]:MODE:(auto local-only)' \
+'--integration-fingerprint=[Require the current integration decision to match this fingerprint]:SHA256:_default' \
+'--user-config[Select the effective private user catalog for this operation]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
 '-V[Print version]' \
@@ -39,7 +41,9 @@ _arguments "${_arguments_options[@]}" : \
 '--docs-home=[Override the docs-home root (otherwise derived from the install symlink)]:PATH:_files' \
 '--project-path=[Override the project root path]:PATH:_files' \
 '--worktree-fallback=[Project worktree fallback mode]:MODE:(auto local-only)' \
+'--integration-fingerprint=[Require the current integration decision to match this fingerprint]:SHA256:_default' \
 '--strict[Exit non-zero when the audit finds problems]' \
+'--user-config[Select the effective private user catalog for this operation]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
 && ret=0
@@ -52,8 +56,10 @@ _arguments "${_arguments_options[@]}" : \
 '--docs-home=[Override the docs-home root (otherwise derived from the install symlink)]:PATH:_files' \
 '--project-path=[Override the project root path]:PATH:_files' \
 '--worktree-fallback=[Project worktree fallback mode]:MODE:(auto local-only)' \
+'--integration-fingerprint=[Require the current integration decision to match this fingerprint]:SHA256:_default' \
 '--strict[Exit non-zero when required docs are unsatisfied]' \
 '--require-declared-intent[Exit non-zero when the requested intent is not declared by applicable documents or validation]' \
+'--user-config[Select the effective private user catalog for this operation]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
 && ret=0
@@ -64,9 +70,11 @@ _arguments "${_arguments_options[@]}" : \
 '--docs-home=[Override the docs-home root (otherwise derived from the install symlink)]:PATH:_files' \
 '--project-path=[Override the project root path]:PATH:_files' \
 '--worktree-fallback=[Project worktree fallback mode]:MODE:(auto local-only)' \
+'--integration-fingerprint=[Require the current integration decision to match this fingerprint]:SHA256:_default' \
 '--print[Print the stub to stdout without writing (default)]' \
 '--dry-run[Report the target path and stub without writing]' \
 '--force[Write the stub, overwriting any existing AGENT_DOCS.toml]' \
+'--user-config[Select the effective private user catalog for this operation]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
 && ret=0
@@ -79,6 +87,8 @@ _arguments "${_arguments_options[@]}" : \
 '--docs-home=[Override the docs-home root (otherwise derived from the install symlink)]:PATH:_files' \
 '--project-path=[Override the project root path]:PATH:_files' \
 '--worktree-fallback=[Project worktree fallback mode]:MODE:(auto local-only)' \
+'--integration-fingerprint=[Require the current integration decision to match this fingerprint]:SHA256:_default' \
+'--user-config[Select the effective private user catalog for this operation]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
 && ret=0
@@ -90,6 +100,8 @@ _arguments "${_arguments_options[@]}" : \
 '--docs-home=[Override the docs-home root (otherwise derived from the install symlink)]:PATH:_files' \
 '--project-path=[Override the project root path]:PATH:_files' \
 '--worktree-fallback=[Project worktree fallback mode]:MODE:(auto local-only)' \
+'--integration-fingerprint=[Require the current integration decision to match this fingerprint]:SHA256:_default' \
+'--user-config[Select the effective private user catalog for this operation]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
 && ret=0
@@ -103,15 +115,147 @@ _arguments "${_arguments_options[@]}" : \
 '--docs-home=[Override the docs-home root (otherwise derived from the install symlink)]:PATH:_files' \
 '--project-path=[Override the project root path]:PATH:_files' \
 '--worktree-fallback=[Project worktree fallback mode]:MODE:(auto local-only)' \
+'--integration-fingerprint=[Require the current integration decision to match this fingerprint]:SHA256:_default' \
+'--user-config[Select the effective private user catalog for this operation]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
 && ret=0
+;;
+(config)
+_arguments "${_arguments_options[@]}" : \
+'--docs-home=[Override the docs-home root (otherwise derived from the install symlink)]:PATH:_files' \
+'--project-path=[Override the project root path]:PATH:_files' \
+'--worktree-fallback=[Project worktree fallback mode]:MODE:(auto local-only)' \
+'--integration-fingerprint=[Require the current integration decision to match this fingerprint]:SHA256:_default' \
+'--user-config[Select the effective private user catalog for this operation]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+":: :_agent-docs__subcmd__config_commands" \
+"*::: :->config" \
+&& ret=0
+
+    case $state in
+    (config)
+        words=($line[1] "${words[@]}")
+        (( CURRENT += 1 ))
+        curcontext="${curcontext%:*:*}:agent-docs-config-command-$line[1]:"
+        case $line[1] in
+            (enroll)
+_arguments "${_arguments_options[@]}" : \
+'--catalog=[Absolute private catalog path outside every target Git worktree]:PATH:_files' \
+'--reason=[Optional local explanation]:TEXT:_default' \
+'--format=[Output format]:FORMAT:(text json)' \
+'--docs-home=[Override the docs-home root (otherwise derived from the install symlink)]:PATH:_files' \
+'--project-path=[Override the project root path]:PATH:_files' \
+'--worktree-fallback=[Project worktree fallback mode]:MODE:(auto local-only)' \
+'--integration-fingerprint=[Require the current integration decision to match this fingerprint]:SHA256:_default' \
+'--all-worktrees[Match every worktree belonging to this local clone]' \
+'--apply[Apply the proposed user-config update]' \
+'--user-config[Select the effective private user catalog for this operation]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+&& ret=0
+;;
+(exclude)
+_arguments "${_arguments_options[@]}" : \
+'--reason=[Optional local explanation]:TEXT:_default' \
+'--format=[Output format]:FORMAT:(text json)' \
+'--docs-home=[Override the docs-home root (otherwise derived from the install symlink)]:PATH:_files' \
+'--project-path=[Override the project root path]:PATH:_files' \
+'--worktree-fallback=[Project worktree fallback mode]:MODE:(auto local-only)' \
+'--integration-fingerprint=[Require the current integration decision to match this fingerprint]:SHA256:_default' \
+'--all-worktrees[Match every worktree belonging to this local clone]' \
+'--apply[Apply the proposed user-config update]' \
+'--user-config[Select the effective private user catalog for this operation]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+&& ret=0
+;;
+(show)
+_arguments "${_arguments_options[@]}" : \
+'--format=[Output format]:FORMAT:(text json)' \
+'--docs-home=[Override the docs-home root (otherwise derived from the install symlink)]:PATH:_files' \
+'--project-path=[Override the project root path]:PATH:_files' \
+'--worktree-fallback=[Project worktree fallback mode]:MODE:(auto local-only)' \
+'--integration-fingerprint=[Require the current integration decision to match this fingerprint]:SHA256:_default' \
+'--user-config[Select the effective private user catalog for this operation]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+&& ret=0
+;;
+(list)
+_arguments "${_arguments_options[@]}" : \
+'--format=[Output format]:FORMAT:(text json)' \
+'--docs-home=[Override the docs-home root (otherwise derived from the install symlink)]:PATH:_files' \
+'--project-path=[Override the project root path]:PATH:_files' \
+'--worktree-fallback=[Project worktree fallback mode]:MODE:(auto local-only)' \
+'--integration-fingerprint=[Require the current integration decision to match this fingerprint]:SHA256:_default' \
+'--user-config[Select the effective private user catalog for this operation]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+&& ret=0
+;;
+(remove)
+_arguments "${_arguments_options[@]}" : \
+'--format=[Output format]:FORMAT:(text json)' \
+'--docs-home=[Override the docs-home root (otherwise derived from the install symlink)]:PATH:_files' \
+'--project-path=[Override the project root path]:PATH:_files' \
+'--worktree-fallback=[Project worktree fallback mode]:MODE:(auto local-only)' \
+'--integration-fingerprint=[Require the current integration decision to match this fingerprint]:SHA256:_default' \
+'--all-worktrees[Match every worktree belonging to this local clone]' \
+'--apply[Apply the proposed user-config update]' \
+'--user-config[Select the effective private user catalog for this operation]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+&& ret=0
+;;
+        esac
+    ;;
+esac
+;;
+(integration)
+_arguments "${_arguments_options[@]}" : \
+'--docs-home=[Override the docs-home root (otherwise derived from the install symlink)]:PATH:_files' \
+'--project-path=[Override the project root path]:PATH:_files' \
+'--worktree-fallback=[Project worktree fallback mode]:MODE:(auto local-only)' \
+'--integration-fingerprint=[Require the current integration decision to match this fingerprint]:SHA256:_default' \
+'--user-config[Select the effective private user catalog for this operation]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+":: :_agent-docs__subcmd__integration_commands" \
+"*::: :->integration" \
+&& ret=0
+
+    case $state in
+    (integration)
+        words=($line[1] "${words[@]}")
+        (( CURRENT += 1 ))
+        curcontext="${curcontext%:*:*}:agent-docs-integration-command-$line[1]:"
+        case $line[1] in
+            (resolve)
+_arguments "${_arguments_options[@]}" : \
+'--product=[Product whose automatic integration decision is being resolved]:PRODUCT:(codex claude hermes)' \
+'--format=[Output format]:FORMAT:(text json)' \
+'--docs-home=[Override the docs-home root (otherwise derived from the install symlink)]:PATH:_files' \
+'--project-path=[Override the project root path]:PATH:_files' \
+'--worktree-fallback=[Project worktree fallback mode]:MODE:(auto local-only)' \
+'--integration-fingerprint=[Require the current integration decision to match this fingerprint]:SHA256:_default' \
+'--user-config[Select the effective private user catalog for this operation]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+&& ret=0
+;;
+        esac
+    ;;
+esac
 ;;
 (session)
 _arguments "${_arguments_options[@]}" : \
 '--docs-home=[Override the docs-home root (otherwise derived from the install symlink)]:PATH:_files' \
 '--project-path=[Override the project root path]:PATH:_files' \
 '--worktree-fallback=[Project worktree fallback mode]:MODE:(auto local-only)' \
+'--integration-fingerprint=[Require the current integration decision to match this fingerprint]:SHA256:_default' \
+'--user-config[Select the effective private user catalog for this operation]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
 ":: :_agent-docs__subcmd__session_commands" \
@@ -134,6 +278,8 @@ _arguments "${_arguments_options[@]}" : \
 '--docs-home=[Override the docs-home root (otherwise derived from the install symlink)]:PATH:_files' \
 '--project-path=[Override the project root path]:PATH:_files' \
 '--worktree-fallback=[Project worktree fallback mode]:MODE:(auto local-only)' \
+'--integration-fingerprint=[Require the current integration decision to match this fingerprint]:SHA256:_default' \
+'--user-config[Select the effective private user catalog for this operation]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
 && ret=0
@@ -147,6 +293,8 @@ _arguments "${_arguments_options[@]}" : \
 '--docs-home=[Override the docs-home root (otherwise derived from the install symlink)]:PATH:_files' \
 '--project-path=[Override the project root path]:PATH:_files' \
 '--worktree-fallback=[Project worktree fallback mode]:MODE:(auto local-only)' \
+'--integration-fingerprint=[Require the current integration decision to match this fingerprint]:SHA256:_default' \
+'--user-config[Select the effective private user catalog for this operation]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
 && ret=0
@@ -161,6 +309,8 @@ _arguments "${_arguments_options[@]}" : \
 '--docs-home=[Override the docs-home root (otherwise derived from the install symlink)]:PATH:_files' \
 '--project-path=[Override the project root path]:PATH:_files' \
 '--worktree-fallback=[Project worktree fallback mode]:MODE:(auto local-only)' \
+'--integration-fingerprint=[Require the current integration decision to match this fingerprint]:SHA256:_default' \
+'--user-config[Select the effective private user catalog for this operation]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
 && ret=0
@@ -174,6 +324,8 @@ _arguments "${_arguments_options[@]}" : \
 '--docs-home=[Override the docs-home root (otherwise derived from the install symlink)]:PATH:_files' \
 '--project-path=[Override the project root path]:PATH:_files' \
 '--worktree-fallback=[Project worktree fallback mode]:MODE:(auto local-only)' \
+'--integration-fingerprint=[Require the current integration decision to match this fingerprint]:SHA256:_default' \
+'--user-config[Select the effective private user catalog for this operation]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
 ':shell:(bash zsh)' \
@@ -193,6 +345,8 @@ _agent-docs_commands() {
 'explain:Explain what an intent resolves to and why' \
 'list:List the declared documents, validation contracts, and intents' \
 'remove:Remove a \`\[\[document\]\]\` entry from the project catalog' \
+'config:Manage exact user-local project enrollment and exclusion rules' \
+'integration:Resolve the typed automatic integration decision for this checkout' \
 'session:Manage durable selective intent activation scoped to a session, project, and product' \
 'completion:Generate shell completion scripts' \
     )
@@ -208,6 +362,42 @@ _agent-docs__subcmd__completion_commands() {
     local commands; commands=()
     _describe -t commands 'agent-docs completion commands' commands "$@"
 }
+(( $+functions[_agent-docs__subcmd__config_commands] )) ||
+_agent-docs__subcmd__config_commands() {
+    local commands; commands=(
+'enroll:Enroll an external private project catalog for this checkout' \
+'exclude:Exclude this checkout from automatic agent-docs integration' \
+'show:Show rules matching this checkout' \
+'list:List every user-local project rule' \
+'remove:Remove the exact rule for this checkout' \
+    )
+    _describe -t commands 'agent-docs config commands' commands "$@"
+}
+(( $+functions[_agent-docs__subcmd__config__subcmd__enroll_commands] )) ||
+_agent-docs__subcmd__config__subcmd__enroll_commands() {
+    local commands; commands=()
+    _describe -t commands 'agent-docs config enroll commands' commands "$@"
+}
+(( $+functions[_agent-docs__subcmd__config__subcmd__exclude_commands] )) ||
+_agent-docs__subcmd__config__subcmd__exclude_commands() {
+    local commands; commands=()
+    _describe -t commands 'agent-docs config exclude commands' commands "$@"
+}
+(( $+functions[_agent-docs__subcmd__config__subcmd__list_commands] )) ||
+_agent-docs__subcmd__config__subcmd__list_commands() {
+    local commands; commands=()
+    _describe -t commands 'agent-docs config list commands' commands "$@"
+}
+(( $+functions[_agent-docs__subcmd__config__subcmd__remove_commands] )) ||
+_agent-docs__subcmd__config__subcmd__remove_commands() {
+    local commands; commands=()
+    _describe -t commands 'agent-docs config remove commands' commands "$@"
+}
+(( $+functions[_agent-docs__subcmd__config__subcmd__show_commands] )) ||
+_agent-docs__subcmd__config__subcmd__show_commands() {
+    local commands; commands=()
+    _describe -t commands 'agent-docs config show commands' commands "$@"
+}
 (( $+functions[_agent-docs__subcmd__explain_commands] )) ||
 _agent-docs__subcmd__explain_commands() {
     local commands; commands=()
@@ -217,6 +407,18 @@ _agent-docs__subcmd__explain_commands() {
 _agent-docs__subcmd__init_commands() {
     local commands; commands=()
     _describe -t commands 'agent-docs init commands' commands "$@"
+}
+(( $+functions[_agent-docs__subcmd__integration_commands] )) ||
+_agent-docs__subcmd__integration_commands() {
+    local commands; commands=(
+'resolve:Resolve the automatic integration action and decision fingerprint' \
+    )
+    _describe -t commands 'agent-docs integration commands' commands "$@"
+}
+(( $+functions[_agent-docs__subcmd__integration__subcmd__resolve_commands] )) ||
+_agent-docs__subcmd__integration__subcmd__resolve_commands() {
+    local commands; commands=()
+    _describe -t commands 'agent-docs integration resolve commands' commands "$@"
 }
 (( $+functions[_agent-docs__subcmd__list_commands] )) ||
 _agent-docs__subcmd__list_commands() {

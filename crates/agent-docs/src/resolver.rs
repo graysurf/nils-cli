@@ -8,6 +8,7 @@
 
 use std::collections::HashMap;
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use nils_common::git as shared_git;
@@ -15,6 +16,7 @@ use nils_common::git as shared_git;
 use crate::config::load_catalog_from_roots;
 use crate::content;
 use crate::env::ResolvedRoots;
+use crate::integration::EffectiveCatalog;
 use crate::model::{
     AuditTarget, ConfigLoadError, Context, DocumentEntry, DocumentSource, DocumentStatus,
     DocumentValidation, FallbackMode, LoadedCatalog, PreflightReport, Product, ResolveSummary,
@@ -73,6 +75,11 @@ pub fn resolve_intent_with_catalog(
     )
 }
 
+struct CatalogPolicy<'a> {
+    catalog: &'a LoadedCatalog,
+    private_project_catalog: bool,
+}
+
 pub fn resolve_intent_with_catalog_for_product(
     intent: &Context,
     roots: &ResolvedRoots,
@@ -82,15 +89,63 @@ pub fn resolve_intent_with_catalog_for_product(
     emit_content: bool,
     catalog: &LoadedCatalog,
 ) -> PreflightReport {
+    resolve_intent_with_catalog_for_product_policy(
+        intent,
+        roots,
+        product,
+        strict,
+        fallback_mode,
+        emit_content,
+        CatalogPolicy {
+            catalog,
+            private_project_catalog: false,
+        },
+    )
+}
+
+pub(crate) fn resolve_intent_with_effective_catalog_for_product(
+    intent: &Context,
+    roots: &ResolvedRoots,
+    product: Option<Product>,
+    strict: bool,
+    fallback_mode: FallbackMode,
+    emit_content: bool,
+    effective: &EffectiveCatalog,
+) -> PreflightReport {
+    resolve_intent_with_catalog_for_product_policy(
+        intent,
+        roots,
+        product,
+        strict,
+        fallback_mode,
+        emit_content,
+        CatalogPolicy {
+            catalog: &effective.catalog,
+            private_project_catalog: effective.private_project_catalog,
+        },
+    )
+}
+
+fn resolve_intent_with_catalog_for_product_policy(
+    intent: &Context,
+    roots: &ResolvedRoots,
+    product: Option<Product>,
+    strict: bool,
+    fallback_mode: FallbackMode,
+    emit_content: bool,
+    policy: CatalogPolicy<'_>,
+) -> PreflightReport {
     let documents = resolve_documents(
         roots,
         product,
         fallback_mode,
         emit_content,
-        catalog,
+        policy.catalog,
+        policy.private_project_catalog,
         &mut |entry| entry.context == *intent,
     );
-    let validation = resolve_validation_contract_for_product(intent, roots, product, catalog);
+    let validation =
+        resolve_validation_contract_for_product(intent, roots, product, policy.catalog);
     let summary = ResolveSummary::from_documents(&documents);
 
     PreflightReport {
@@ -131,6 +186,7 @@ pub fn resolve_documents_for_target_for_product(
         fallback_mode,
         false,
         catalog,
+        false,
         &mut |entry| target.includes_scope(entry.scope),
     )
 }
@@ -150,7 +206,25 @@ pub fn resolve_all_documents_for_product(
     fallback_mode: FallbackMode,
     catalog: &LoadedCatalog,
 ) -> Vec<ResolvedDocument> {
-    resolve_documents(roots, product, fallback_mode, false, catalog, &mut |_| true)
+    resolve_all_documents_for_product_policy(roots, product, fallback_mode, catalog, false)
+}
+
+pub(crate) fn resolve_all_documents_for_product_policy(
+    roots: &ResolvedRoots,
+    product: Option<Product>,
+    fallback_mode: FallbackMode,
+    catalog: &LoadedCatalog,
+    private_project_catalog: bool,
+) -> Vec<ResolvedDocument> {
+    resolve_documents(
+        roots,
+        product,
+        fallback_mode,
+        false,
+        catalog,
+        private_project_catalog,
+        &mut |_| true,
+    )
 }
 
 fn resolve_documents(
@@ -159,6 +233,7 @@ fn resolve_documents(
     fallback_mode: FallbackMode,
     emit_content: bool,
     catalog: &LoadedCatalog,
+    private_project_catalog: bool,
     accept: &mut dyn FnMut(&DocumentEntry) -> bool,
 ) -> Vec<ResolvedDocument> {
     let mut documents: Vec<ResolvedDocument> = Vec::new();
@@ -185,7 +260,14 @@ fn resolve_documents(
             {
                 continue;
             }
-            let resolved = resolve_entry(entry, scope_catalog, roots, fallback_mode, emit_content);
+            let resolved = resolve_entry(
+                entry,
+                scope_catalog,
+                roots,
+                fallback_mode,
+                emit_content,
+                private_project_catalog && scope_catalog.source_scope == Scope::Project,
+            );
             // De-duplicate by resolved path; a later (project) catalog entry
             // overrides an earlier (home) one at the same position.
             if let Some(existing) = index_by_path.get(&resolved.path).copied() {
@@ -206,28 +288,23 @@ fn resolve_entry(
     roots: &ResolvedRoots,
     fallback_mode: FallbackMode,
     emit_content: bool,
+    private_project_catalog: bool,
 ) -> ResolvedDocument {
     let path = resolve_entry_path(entry, roots, fallback_mode);
     let when_satisfied = predicate::evaluate(&entry.when, &roots.project_path);
     let required = entry.required && when_satisfied;
 
-    let status = if path.exists() {
+    let raw = read_entry_content(&path, roots, private_project_catalog);
+    let status = if raw.is_some() {
         DocumentStatus::Present
     } else {
         DocumentStatus::Missing
     };
-
-    let validation = if status == DocumentStatus::Present {
-        content::validate(&path, entry)
-    } else {
-        DocumentValidation::missing()
-    };
-
-    let content = if emit_content && status == DocumentStatus::Present {
-        std::fs::read_to_string(&path).ok()
-    } else {
-        None
-    };
+    let validation = raw
+        .as_deref()
+        .map(|raw| content::validate_content(raw, entry))
+        .unwrap_or_else(DocumentValidation::missing);
+    let content = if emit_content { raw } else { None };
 
     ResolvedDocument {
         context: entry.context.clone(),
@@ -241,9 +318,87 @@ fn resolve_entry(
         status,
         validation,
         source: DocumentSource::from_scope(scope_catalog.source_scope),
-        why: describe_why(entry, scope_catalog, when_satisfied),
+        why: describe_why(
+            entry,
+            scope_catalog,
+            when_satisfied,
+            private_project_catalog,
+        ),
         content,
     }
+}
+
+fn read_entry_content(
+    path: &Path,
+    roots: &ResolvedRoots,
+    private_project_catalog: bool,
+) -> Option<String> {
+    if !private_project_catalog {
+        return fs::read_to_string(path).ok();
+    }
+    read_private_project_document(path, roots).ok()
+}
+
+fn read_private_project_document(path: &Path, roots: &ResolvedRoots) -> std::io::Result<String> {
+    let metadata = fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "private project document must be a regular file and not a symlink",
+        ));
+    }
+
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    let mut file = options.open(path)?;
+    let opened_metadata = file.metadata()?;
+    if !opened_metadata.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "private project document must be a regular file",
+        ));
+    }
+
+    let canonical_path = fs::canonicalize(path)?;
+    let mut allowed_roots = vec![fs::canonicalize(&roots.project_path)?];
+    if roots.is_linked_worktree
+        && let Some(primary) = roots.primary_worktree_path.as_deref()
+        && let Ok(primary) = fs::canonicalize(primary)
+    {
+        allowed_roots.push(primary);
+    }
+    if !allowed_roots
+        .iter()
+        .any(|root| canonical_path.starts_with(root))
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "private project document resolves outside the target worktree",
+        ));
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let path_metadata = fs::metadata(&canonical_path)?;
+        if opened_metadata.dev() != path_metadata.dev()
+            || opened_metadata.ino() != path_metadata.ino()
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "private project document changed while it was opened",
+            ));
+        }
+    }
+
+    let mut raw = String::new();
+    file.read_to_string(&mut raw)?;
+    Ok(raw)
 }
 
 fn resolve_entry_path(
@@ -314,10 +469,16 @@ fn describe_why(
     entry: &DocumentEntry,
     scope_catalog: &ScopeCatalog,
     when_satisfied: bool,
+    private_project_catalog: bool,
 ) -> String {
+    let catalog_source = if private_project_catalog {
+        "user"
+    } else {
+        DocumentSource::from_scope(scope_catalog.source_scope).as_str()
+    };
     let mut why = format!(
         "{} catalog {} document, scope={}",
-        scope_catalog.source_scope,
+        catalog_source,
         scope_catalog.file_path.display(),
         entry.scope
     );

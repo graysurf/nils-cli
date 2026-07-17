@@ -22,6 +22,9 @@ fn help_lists_only_the_new_surface() {
         "explain",
         "list",
         "remove",
+        "config",
+        "integration",
+        "session",
         "completion",
     ] {
         assert!(help.contains(command), "help missing `{command}`:\n{help}");
@@ -65,6 +68,56 @@ fn retired_subcommands_exit_usage() {
             out.code, 64,
             "retired `{}` should be a usage error: code={} stderr={}",
             retired[0], out.code, out.stderr
+        );
+    }
+}
+
+#[test]
+fn private_config_surface_is_structured() {
+    let temp = tempfile::TempDir::new().unwrap();
+    let options = cmd::CmdOptions::default().with_cwd(temp.path());
+    for (args, expected) in [
+        (
+            ["config", "--help"].as_slice(),
+            ["enroll", "exclude", "show", "list", "remove"].as_slice(),
+        ),
+        (
+            ["config", "enroll", "--help"].as_slice(),
+            [
+                "--catalog",
+                "--all-worktrees",
+                "--reason",
+                "--apply",
+                "--format",
+            ]
+            .as_slice(),
+        ),
+        (["integration", "--help"].as_slice(), ["resolve"].as_slice()),
+        (
+            ["integration", "resolve", "--help"].as_slice(),
+            ["--product", "codex", "claude", "hermes", "--format"].as_slice(),
+        ),
+    ] {
+        let out = run_cli(args, &options);
+        assert_eq!(out.code, 0, "stderr: {}", out.stderr);
+        for token in expected {
+            assert!(
+                out.stdout.contains(token),
+                "help for {args:?} missing `{token}`:\n{}",
+                out.stdout
+            );
+        }
+    }
+
+    let remove = run_cli(&["config", "remove", "--help"], &options);
+    assert_eq!(remove.code, 0, "stderr: {}", remove.stderr);
+    assert!(!remove.stdout.contains("--reason"), "{}", remove.stdout);
+
+    let root = root_help();
+    for option in ["--user-config", "--integration-fingerprint"] {
+        assert!(
+            root.contains(option),
+            "root help missing `{option}`:\n{root}"
         );
     }
 }

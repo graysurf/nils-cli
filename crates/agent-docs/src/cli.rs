@@ -11,7 +11,7 @@ use crate::model::{AuditTarget, FallbackMode, OutputFormat, Product, Scope};
     long_version = nils_build_info::long_version(env!("CARGO_PKG_VERSION")),
     about = "Data-driven required-doc resolution and auditing for agent workflows",
     long_about = "Resolve and audit the documents and validation contract a repository declares in its AGENT_DOCS.toml catalog. Policy is data the repo owns; this binary is a generic resolver and auditor.",
-    after_help = "EXAMPLES:\n  agent-docs audit --target all --strict\n  agent-docs preflight --intent project-dev --format json\n  agent-docs init --print\n  agent-docs list\n  agent-docs explain --intent project-dev\n  agent-docs completion zsh\n\nENVIRONMENT:\n  AGENT_DOCS_HOME  Docs-home fallback when --docs-home is omitted and no\n                   install symlink resolves.\n  PROJECT_PATH     Default project root when --project-path is omitted.\n\nDOCS-HOME RESOLUTION:\n  --docs-home flag, else the install symlink (dirname of\n  ~/.claude/CLAUDE.md or ~/.codex/AGENTS.md), else AGENT_DOCS_HOME.\n\nEXIT CODES:\n  0   success\n  1   strict failure (unsatisfied required docs / audit problems)\n  3   catalog (config) error\n  4   runtime error\n  64  command-line usage error\n  65  undeclared intent when preflight --require-declared-intent is set",
+    after_help = "EXAMPLES:\n  agent-docs audit --target all --strict\n  agent-docs preflight --intent project-dev --format json\n  agent-docs integration resolve --product claude --format json\n  agent-docs config enroll --catalog /abs/private/catalog.toml\n  agent-docs init --print\n  agent-docs list\n  agent-docs explain --intent project-dev\n  agent-docs completion zsh\n\nENVIRONMENT:\n  AGENT_DOCS_HOME  Docs-home fallback when --docs-home is omitted and no\n                   install symlink resolves.\n  PROJECT_PATH     Default project root when --project-path is omitted.\n  XDG_CONFIG_HOME  Absolute root containing agent-docs/config.toml.\n  HOME             Absolute fallback root for .config/agent-docs/config.toml.\n\nDOCS-HOME RESOLUTION:\n  --docs-home flag, else the install symlink (dirname of\n  ~/.claude/CLAUDE.md or ~/.codex/AGENTS.md), else AGENT_DOCS_HOME.\n\nEXIT CODES:\n  0   success\n  1   strict failure (unsatisfied required docs / audit problems)\n  3   catalog/config error\n  4   runtime or invariant error\n  64  command-line usage error\n  65  stale bound data or required undeclared intent",
     disable_help_subcommand = true
 )]
 pub struct Cli {
@@ -42,6 +42,22 @@ pub struct Cli {
     )]
     pub worktree_fallback: FallbackMode,
 
+    #[arg(
+        long,
+        global = true,
+        help = "Select the effective private user catalog for this operation"
+    )]
+    pub user_config: bool,
+
+    #[arg(
+        long,
+        global = true,
+        value_name = "SHA256",
+        requires = "user_config",
+        help = "Require the current integration decision to match this fingerprint"
+    )]
+    pub integration_fingerprint: Option<String>,
+
     #[command(subcommand)]
     pub command: Command,
 }
@@ -60,6 +76,10 @@ pub enum Command {
     List(ListArgs),
     /// Remove a `[[document]]` entry from the project catalog.
     Remove(RemoveArgs),
+    /// Manage exact user-local project enrollment and exclusion rules.
+    Config(ConfigArgs),
+    /// Resolve the typed automatic integration decision for this checkout.
+    Integration(IntegrationArgs),
     /// Manage durable selective intent activation scoped to a session, project, and product.
     Session(SessionArgs),
     /// Generate shell completion scripts.
@@ -214,6 +234,123 @@ pub struct RemoveArgs {
 pub struct CompletionArgs {
     #[arg(value_enum)]
     pub shell: crate::completion::CompletionShell,
+}
+
+#[derive(Debug, Args)]
+pub struct ConfigArgs {
+    #[command(subcommand)]
+    pub command: ConfigCommand,
+}
+
+#[derive(Debug, Subcommand)]
+#[command(rename_all = "kebab-case")]
+pub enum ConfigCommand {
+    /// Enroll an external private project catalog for this checkout.
+    Enroll(ConfigEnrollArgs),
+    /// Exclude this checkout from automatic agent-docs integration.
+    Exclude(ConfigRuleArgs),
+    /// Show rules matching this checkout.
+    Show(ConfigFormatArgs),
+    /// List every user-local project rule.
+    List(ConfigFormatArgs),
+    /// Remove the exact rule for this checkout.
+    Remove(ConfigRemoveArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct ConfigEnrollArgs {
+    #[arg(
+        long,
+        value_name = "PATH",
+        help = "Absolute private catalog path outside every target Git worktree"
+    )]
+    pub catalog: PathBuf,
+    #[arg(long, help = "Match every worktree belonging to this local clone")]
+    pub all_worktrees: bool,
+    #[arg(long, value_name = "TEXT", help = "Optional local explanation")]
+    pub reason: Option<String>,
+    #[arg(long, help = "Apply the proposed user-config update")]
+    pub apply: bool,
+    #[arg(
+        long,
+        value_enum,
+        default_value_t = OutputFormat::Text,
+        help = "Output format"
+    )]
+    pub format: OutputFormat,
+}
+
+#[derive(Debug, Args)]
+pub struct ConfigRuleArgs {
+    #[arg(long, help = "Match every worktree belonging to this local clone")]
+    pub all_worktrees: bool,
+    #[arg(long, value_name = "TEXT", help = "Optional local explanation")]
+    pub reason: Option<String>,
+    #[arg(long, help = "Apply the proposed user-config update")]
+    pub apply: bool,
+    #[arg(
+        long,
+        value_enum,
+        default_value_t = OutputFormat::Text,
+        help = "Output format"
+    )]
+    pub format: OutputFormat,
+}
+
+#[derive(Debug, Args)]
+pub struct ConfigRemoveArgs {
+    #[arg(long, help = "Match every worktree belonging to this local clone")]
+    pub all_worktrees: bool,
+    #[arg(long, help = "Apply the proposed user-config update")]
+    pub apply: bool,
+    #[arg(
+        long,
+        value_enum,
+        default_value_t = OutputFormat::Text,
+        help = "Output format"
+    )]
+    pub format: OutputFormat,
+}
+
+#[derive(Debug, Args)]
+pub struct ConfigFormatArgs {
+    #[arg(
+        long,
+        value_enum,
+        default_value_t = OutputFormat::Text,
+        help = "Output format"
+    )]
+    pub format: OutputFormat,
+}
+
+#[derive(Debug, Args)]
+pub struct IntegrationArgs {
+    #[command(subcommand)]
+    pub command: IntegrationCommand,
+}
+
+#[derive(Debug, Subcommand)]
+#[command(rename_all = "kebab-case")]
+pub enum IntegrationCommand {
+    /// Resolve the automatic integration action and decision fingerprint.
+    Resolve(IntegrationResolveArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct IntegrationResolveArgs {
+    #[arg(
+        long,
+        value_enum,
+        help = "Product whose automatic integration decision is being resolved"
+    )]
+    pub product: Product,
+    #[arg(
+        long,
+        value_enum,
+        default_value_t = OutputFormat::Text,
+        help = "Output format"
+    )]
+    pub format: OutputFormat,
 }
 
 #[derive(Debug, Args)]

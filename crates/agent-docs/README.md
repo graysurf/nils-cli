@@ -2,10 +2,11 @@
 
 ## Overview
 
-`agent-docs` resolves and audits the documents and validation contract a
-repository declares in its `AGENT_DOCS.toml` catalog. Policy is **data the repo
-owns**; the binary is a generic resolver and auditor with no hardcoded required
-documents.
+`agent-docs` resolves and audits the documents and validation contract selected
+for a repository. A repository normally owns that policy in `AGENT_DOCS.toml`;
+an exact user-local rule can instead select a private project catalog stored
+outside every target Git worktree. The binary remains a generic resolver and
+auditor with no hardcoded required documents.
 
 It is built for two non-agent-facing jobs:
 
@@ -15,8 +16,9 @@ It is built for two non-agent-facing jobs:
   document set and the per-repo validation contract), emitted in a versioned
   JSON shape that consuming hooks inject and enforce.
 
-Plus durable selective intent state (`session`) and catalog management:
-`init` / `explain` / `list` / `remove`.
+Plus durable selective intent state (`session`), repository catalog management
+(`init` / `explain` / `list` / `remove`), user-local rule management (`config`),
+and typed automatic-integration decisions (`integration resolve`).
 
 The agent does not run a per-task `agent-docs` preflight: always-on policy is
 delivered by the harness (auto-loaded prompt files), intent docs are
@@ -34,18 +36,24 @@ design in `graysurf/agent-runtime-kit`
 | `explain` | Explain what an intent resolves to and why. |
 | `list` | List declared documents, validation contracts, and intents. |
 | `remove` | Remove a `[[document]]` entry from the project catalog. |
-| `session activate/status/verify` | Persist and verify intent activation scoped to a session, repository, and product. |
+| `config enroll/exclude/show/list/remove` | Preview or apply exact user-local enrollment and exclusion rules. |
+| `integration resolve` | Resolve a typed integration action and content-bound fingerprint. |
+| `session activate/status/verify` | Persist and verify intent activation scoped to a session, repository, product, and integration decision. |
 | `completion` | Generate shell completion scripts. |
 
-There are no `resolve` / `baseline` / `scaffold-*` / `add` / `contexts`
-commands and no `startup` per-task context — they were retired in the engine
-redesign.
+There is no top-level `resolve` command. The retired `baseline` / `scaffold-*` /
+`add` / `contexts` commands and `startup` per-task context remain absent.
 
 ### Global options
 
 - `--docs-home <PATH>` — override the docs-home root.
 - `--project-path <PATH>` — override the project root.
 - `--worktree-fallback <auto|local-only>` — linked-worktree fallback mode.
+- `--user-config` — opt a catalog-consuming operation into the effective
+  user-local integration decision; `preflight`, `explain`, `list`, and `session`
+  require an accompanying `--product`.
+- `--integration-fingerprint <SHA256>` — with `--user-config`, require the
+  current decision to equal a previously resolved fingerprint.
 
 ## docs-home resolution
 
@@ -63,10 +71,21 @@ install surfaces instead of failing silently.
 
 ## Catalog model
 
-Two catalog files are loaded and merged: the **docs-home** catalog
+By default, two catalog files are loaded and merged: the **docs-home** catalog
 (`<docs_home>/AGENT_DOCS.toml`, the shared defaults a repo inherits) and the
-**project** catalog (`<project>/AGENT_DOCS.toml`, per-repo overrides). When the
-docs-home and project are the same directory the file is loaded once.
+**repository project** catalog (`<project>/AGENT_DOCS.toml`, per-repo
+overrides). When the docs-home and project are the same directory the file is
+loaded once.
+
+An effective user enrollment replaces only the repository project catalog with
+one external private project catalog. The private catalog retains project-scope
+semantics: relative document paths, predicates, and validation commands remain
+rooted at the target project. To preserve the stable preflight v2 contract,
+resolved private documents report `source = "project"`; physical provenance is
+reported separately as `selected_catalog.origin = "user"` by
+`integration resolve`. Private and repository project catalogs are never merged;
+if both are selected, `integration resolve` returns `block/catalog-conflict`.
+The docs-home catalog still combines with whichever project catalog is selected.
 
 A catalog declares two array-of-tables sections:
 
@@ -149,6 +168,103 @@ and — if `last-reviewed-within-days` is set — carries a recent enough
 Resolved documents are de-duplicated by resolved path; a project-catalog entry
 overrides a docs-home entry that resolves to the same path.
 
+## Private project configuration
+
+The fixed user registry is `$XDG_CONFIG_HOME/agent-docs/config.toml`, falling
+back to `$HOME/.config/agent-docs/config.toml` when `XDG_CONFIG_HOME` is unset.
+The selected root must be absolute. The strict schema is:
+
+```toml
+schema_version = 1
+
+[[project]]
+match = "project-path" # or "git-common-dir"
+path = "/canonical/absolute/path"
+mode = "enroll" # or "exclude"
+catalog = "/absolute/private/catalog.toml" # enroll only
+reason = "optional local explanation"
+```
+
+Rules use exact canonical filesystem identity. `project-path` matches one
+worktree; `git-common-dir`, created with `--all-worktrees`, matches all
+worktrees of one local clone. Remote URLs, provider slugs, globs, prefixes, and
+regular expressions are not identities. Multiple effective matches block as
+ambiguous.
+
+Mutating commands are previews unless `--apply` is explicit:
+
+```bash
+agent-docs config enroll --catalog /abs/private/project.toml --reason "local policy"
+agent-docs config enroll --catalog /abs/private/project.toml --apply
+agent-docs config exclude --all-worktrees --apply
+agent-docs config show --format json
+agent-docs config list --format json
+agent-docs config remove --all-worktrees --apply
+```
+
+`enroll`, `exclude`, and `remove` modify only the user registry. They never
+write, stage, ignore, move, or delete files in the target repository. Updates
+retain unrelated rules and comments, take a descriptor-held advisory lock,
+re-read while locked, and atomically replace and sync the registry. The lock
+file remains in place and a process crash releases the descriptor lock without
+leaving a stale create-only sentinel. On Unix, CLI-created configuration
+directories use mode `0700`; config and lock files use `0600`.
+
+The registry and selected private catalog are limited to one MiB and must be
+current-user-owned regular files, with neither the final path nor an ancestor
+resolved through a symlink, and must not be group/world writable. Rule reasons
+are limited to 500 bytes. A private catalog must be absolute, canonical, and
+outside the target Git common directory and every target worktree. Private
+catalog document paths must be relative and remain inside the target worktree;
+selected document reads reject symlinks and bind validation and emitted content
+to one opened file snapshot. These private-file restrictions do not change
+repository-owned `AGENT_DOCS.toml` permissions.
+
+Resolve policy before enabling a consumer:
+
+```bash
+agent-docs integration resolve --product claude --format json
+agent-docs --user-config --integration-fingerprint "$FINGERPRINT" \
+  preflight --intent project-dev --product claude --format json
+```
+
+`integration resolve` returns one of four typed actions:
+
+- `integrate`: `user-enrollment` or `repository-catalog` selected one catalog;
+- `exclude`: an exact `user-exclusion` matched;
+- `unmanaged`: `no-catalog` selected nothing;
+- `block`: for example `catalog-conflict`, `ambiguous-user-rule`, or an invalid
+  or unavailable selected catalog.
+
+Malformed, unreadable, or insecure global user configuration never grants an
+enrollment or exclusion. A valid repository catalog remains integrated with a
+diagnostic; otherwise the project remains unmanaged with a diagnostic. By
+contrast, a matched enrollment whose selected private catalog is unsafe,
+missing, or invalid blocks integration.
+
+The decision fingerprint binds the canonical project and common-dir identity,
+matched selector/mode/reason, typed action and reason code, selected catalog
+origin/path/content digest, selected docs-home catalog digest, product,
+fallback mode, and schema version. Unrelated registry entries are excluded, so
+their edits do not stale a binding. Pass the fingerprint back with
+`--user-config --integration-fingerprint` to prevent time-of-check/time-of-use
+drift.
+
+### Migration and rollback
+
+To migrate repository-local private policy, first copy the catalog outside all
+target worktrees, secure it, preview and then apply `config enroll`, resolve and
+record a product-specific fingerprint, and only then opt consumers into
+`--user-config`. Do not delete or move the repository catalog through config
+management; enrollment intentionally blocks while a repository catalog is
+present, so repository changes remain a separate reviewed operation.
+
+To roll back consumer behavior immediately, stop passing `--user-config` and
+`--integration-fingerprint`; default commands continue to use only repository
+policy. To remove the stored rule, run the matching
+`config remove [--all-worktrees] --apply`. `config exclude` is an explicit
+automatic-integration policy, not a rollback of enrollment.
+
 ## `preflight --intent X` JSON contract
 
 `agent-docs preflight --intent <X> --format json` emits the
@@ -213,6 +329,10 @@ Field notes:
 - `documents[].content` is the full document body, emitted so a hook can inject
   the doc without re-reading the file. It is present only for resolved, present
   documents (omitted for missing ones).
+- `documents[].source` describes the stable catalog layer: `home` or `project`.
+  A private selected catalog is the effective project layer and therefore emits
+  `project`; use `integration resolve`'s `selected_catalog.origin` to distinguish
+  repository and user physical provenance.
 - `documents[].required` is `declared_required && when_satisfied`.
 - `validation.declared` is `false` when no `[[validation]]` entry matches the
   intent (then `commands` is empty).
@@ -245,28 +365,41 @@ for the v2 product model; CLI JSON consumers should treat
 `agent-docs.preflight.v2` and `agent-docs.audit.v2` as the product-aware
 contract boundaries.
 
+Private catalog provenance is intentionally internal to the resolver and the
+new integration-decision response. It does not add a public `DocumentSource`
+variant or a required field to public `ScopeCatalog` literals, and it does not
+expand the closed `documents[].source` value domain of preflight v2.
+
 ## Selective intent session state
 
 Session activation performs strict declared-intent preflight and writes an
-atomic state record keyed by hashes of the session id and canonical repository
-root. Stored records contain no raw session id or machine path. Verification
-re-resolves documents and catalog data, so changed content or configuration
-invalidates stale activation.
-JSON responses expose `record_file` relative to `--state-home`; consumers that
-need the local file join the two paths without persisting a machine-specific
-state-home value.
+atomic `agent-docs.session.v2` state record keyed by hashes of the session id
+and canonical repository root. Stored records contain no raw session id or
+machine path. Activation records the effective integration fingerprint;
+verification re-resolves that decision plus document and catalog data, so a
+relevant policy or selected-content change reports
+`stale-integration-decision`. Unrelated registry edits preserve validity.
+`session status --integration-fingerprint <value>` compares the requested
+fingerprint directly with the stored activation. Prior record schemas remain
+unsupported for status and verify; an explicit activate first validates the
+current catalog and then replaces a v1 record rather than silently carrying
+its intents forward. JSON responses expose `record_file` relative to
+`--state-home`; consumers that need the local file join the two paths without
+persisting a machine-specific state-home value.
 
 ```bash
-agent-docs session activate --session-id "$SESSION_ID" --product codex \
-  --state-home "$STATE_HOME" --intent project-dev --format json
-agent-docs session status --session-id "$SESSION_ID" --product codex \
-  --state-home "$STATE_HOME" --format json
-agent-docs session verify --session-id "$SESSION_ID" --product codex \
+agent-docs --user-config session activate --session-id "$SESSION_ID" \
+  --product codex --state-home "$STATE_HOME" --intent project-dev --format json
+agent-docs --user-config session status --session-id "$SESSION_ID" \
+  --product codex --state-home "$STATE_HOME" --format json
+agent-docs --user-config --integration-fingerprint "$FINGERPRINT" \
+  session verify --session-id "$SESSION_ID" --product codex \
   --state-home "$STATE_HOME" --require-intent project-dev --format json
 ```
 
-Products without hooks may still use these shared CLI records, but the record
-does not claim that product-native hooks invoked activation.
+Omit `--user-config` for the repository-catalog-only behavior. Products without
+hooks may still use these shared CLI records, but the record does not claim that
+product-native hooks invoked activation.
 
 In text mode, the guarded failure is written to stderr:
 
@@ -334,13 +467,20 @@ preview the target path without writing, or `--force` to write the file.
 | --- | --- |
 | 0 | success |
 | 1 | strict failure (unsatisfied required docs / audit problems) |
-| 3 | catalog (config) error |
-| 4 | runtime error |
+| 3 | catalog/config error, including a bound decision that selects no catalog |
+| 4 | runtime or internal invariant error |
 | 64 | command-line usage error |
-| 65 | undeclared intent when `preflight --require-declared-intent` is set |
+| 65 | stale bound data, or undeclared intent when required |
 
 `--strict` makes `audit` and `preflight` exit `1` when the resolved state is not
-clean (problems, or unsatisfied required documents).
+clean (problems, or unsatisfied required documents). Typed integration policy
+outcomes, including `exclude`, `unmanaged`, and `block`, are successful resolver
+responses (exit `0`). A catalog-consuming command that binds `--user-config`
+classifies failures consistently: no selected catalog is config exit `3`, a
+stale `--integration-fingerprint` is data exit `65`, and resolution or invariant
+failure is runtime exit `4`. `config` and `integration` honor `--format json` for
+both success and failure envelopes, while malformed command lines use
+`cli.agent-docs.error.v1` and exit `64`.
 
 ## Worktree fallback
 
