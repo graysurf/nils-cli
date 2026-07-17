@@ -64,9 +64,10 @@ use crate::{
     WorkdirSearchOptions, canonicalize_structured_title_pair, cleanup_session_delete_tombstones,
     delete_session, glance_session, list_sessions, load_session_record, non_empty_env,
     repo_remote_url_from_cwd, resolve_tmux_bin, resume_session_by_id, search_workdirs,
-    send_auto_resume_input, send_input_serialized, session_clipboard_buffer, session_dir,
-    session_status, short_hostname, start_provider_resume_session, start_session,
-    update_session_title_if_revision, write_session_attachment,
+    send_auto_resume_input, send_input_serialized, session_agent_profile, session_clipboard_buffer,
+    session_dir, session_provider_config_dir, session_status, short_hostname,
+    start_provider_resume_session, start_session, update_session_title_if_revision,
+    write_session_attachment,
 };
 
 const ATTACH_LIVE_FIFO_NAME: &str = "attach-live.fifo";
@@ -101,6 +102,7 @@ const PROVIDER_PROMPT_DISCOVERY_MAX_CONCURRENT_SCANS: usize = 4;
 const MAX_CONCURRENT_AUTO_RESUME_TICKS: usize = 4;
 const MAX_AGENT_LAUNCH_PROFILES: usize = 16;
 const AGENT_LAUNCH_PROFILE_READINESS_TIMEOUT: Duration = Duration::from_secs(2);
+const AGENT_LAUNCH_PROFILE_READINESS_CACHE_TTL: Duration = Duration::from_secs(1);
 const ATTACH_SCHEMA_VERSION: &str = "agent-session.attach.v1";
 const ATTACH_EVENT_SCHEMA_VERSION: &str = "agent-session.attach.event.v1";
 const ACTIVITY_STREAM_EVENT_SCHEMA_VERSION: &str = "agent-session.activity-stream.event.v1";
@@ -175,9 +177,17 @@ fn default_session_collector() -> SessionCollector {
     Arc::new(|context, tmux_bin| list_sessions(context, Some(tmux_bin)))
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 struct AgentLaunchProfiles {
     entries: Vec<AgentLaunchProfile>,
+    readiness_cache: Arc<StdMutex<AgentLaunchProfileReadinessCache>>,
+}
+
+#[derive(Debug, Default)]
+struct AgentLaunchProfileReadinessCache {
+    observed_at: Option<Instant>,
+    summaries: Vec<AgentLaunchProfileSummary>,
+    refreshing: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -288,7 +298,10 @@ impl AgentLaunchProfiles {
                 auto_resume_supported: config.auto_resume_supported,
             });
         }
-        Ok(Self { entries })
+        Ok(Self {
+            entries,
+            readiness_cache: Arc::new(StdMutex::new(AgentLaunchProfileReadinessCache::default())),
+        })
     }
 
     fn get(&self, id: &str) -> Option<&AgentLaunchProfile> {
@@ -296,11 +309,48 @@ impl AgentLaunchProfiles {
     }
 
     fn ready_summaries(&self) -> Vec<AgentLaunchProfileSummary> {
+        let now = Instant::now();
+        {
+            let mut cache = self
+                .readiness_cache
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if cache.observed_at.is_some_and(|observed_at| {
+                now.saturating_duration_since(observed_at)
+                    < AGENT_LAUNCH_PROFILE_READINESS_CACHE_TTL
+            }) || cache.refreshing
+            {
+                return cache.summaries.clone();
+            }
+            cache.refreshing = true;
+        }
+
+        let summaries = self.probe_ready_summaries();
+        let mut cache = self
+            .readiness_cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        cache.observed_at = Some(Instant::now());
+        cache.summaries.clone_from(&summaries);
+        cache.refreshing = false;
+        summaries
+    }
+
+    fn probe_ready_summaries(&self) -> Vec<AgentLaunchProfileSummary> {
         self.entries
             .iter()
             .filter(|profile| profile.is_ready())
             .map(AgentLaunchProfile::summary)
             .collect()
+    }
+}
+
+impl Default for AgentLaunchProfiles {
+    fn default() -> Self {
+        Self {
+            entries: Vec::new(),
+            readiness_cache: Arc::new(StdMutex::new(AgentLaunchProfileReadinessCache::default())),
+        }
     }
 }
 
@@ -3690,11 +3740,48 @@ async fn resume_handler(
     }
     let context = state.context.clone();
     let tmux = state.tmux_bin.clone();
-    match tokio::task::spawn_blocking(move || resume_session_by_id(&context, &id, &tmux)).await {
+    let launch_profiles = state.launch_profiles.clone();
+    match tokio::task::spawn_blocking(move || {
+        validate_launch_profile_resume(&context, &id, &launch_profiles)?;
+        resume_session_by_id(&context, &id, &tmux)
+    })
+    .await
+    {
         Ok(Ok(session)) => envelope_ok(json!({ "machine": state.machine, "session": session })),
         Ok(Err(err)) => envelope_err(err),
         Err(_) => join_err(),
     }
+}
+
+fn validate_launch_profile_resume(
+    context: &CliContext,
+    id: &str,
+    launch_profiles: &AgentLaunchProfiles,
+) -> Result<(), CliError> {
+    let record = load_session_record(context, id)?;
+    let Some(profile_id) = session_agent_profile(&record) else {
+        return Ok(());
+    };
+    let Some(profile) = launch_profiles.get(profile_id) else {
+        return Err(unavailable_launch_profile());
+    };
+    let provider_config_dir = session_provider_config_dir(&record);
+    if AgentKind::from_name(&record.agent) != Some(profile.agent)
+        || record.agent_bin.as_deref() != profile.agent_bin.to_str()
+        || provider_config_dir.as_deref() != profile.provider_config_dir.as_deref()
+        || !profile.is_ready()
+    {
+        return Err(unavailable_launch_profile());
+    }
+    Ok(())
+}
+
+fn unavailable_launch_profile() -> CliError {
+    CliError::runtime(
+        "agent-profile-unavailable",
+        "agent launch profile is unavailable",
+        None,
+    )
 }
 
 async fn maintenance_handler(
@@ -5712,7 +5799,7 @@ mod tests {
         );
 
         fs::write(&launcher, "#!/usr/bin/env sh\nexit 1\n").unwrap();
-        assert!(profiles.ready_summaries().is_empty());
+        assert!(profiles.probe_ready_summaries().is_empty());
     }
 
     #[test]
@@ -5751,6 +5838,46 @@ mod tests {
             std::io::Error::last_os_error().raw_os_error(),
             Some(libc::ESRCH)
         );
+    }
+
+    #[test]
+    fn launch_profile_readiness_is_single_flight_across_parallel_reads() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let calls = tmp.path().join("readiness.calls");
+        let launcher = executable(
+            &tmp.path().join("profile-readiness"),
+            &format!(
+                "#!/usr/bin/env sh\nprintf x >> {}\nsleep 0.2\n",
+                shell_words::quote(&calls.to_string_lossy())
+            ),
+        );
+        let profiles = AgentLaunchProfiles::from_json(
+            &json!([{
+                "id":"claude-gpt",
+                "label":"Claude GPT",
+                "agent":"claude",
+                "agent_bin":launcher,
+                "readiness_args":["--check"],
+            }])
+            .to_string(),
+        )
+        .unwrap();
+        let barrier = Arc::new(std::sync::Barrier::new(16));
+        let threads = (0..16)
+            .map(|_| {
+                let barrier = barrier.clone();
+                let profiles = profiles.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    profiles.ready_summaries()
+                })
+            })
+            .collect::<Vec<_>>();
+        for thread in threads {
+            thread.join().unwrap();
+        }
+
+        assert_eq!(fs::read_to_string(calls).unwrap(), "x");
     }
 
     #[test]
@@ -11529,6 +11656,43 @@ esac
         assert!(
             calls.contains("resume resume-session-id"),
             "resume must use the exact provider id: {calls:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn resume_rejects_a_profile_removed_from_the_server_registry() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cwd = tmp.path().join("repo");
+        fs::create_dir_all(&cwd).unwrap();
+        let log = tmp.path().join("tmux.log");
+        let tmux = resume_tmux(tmp.path(), &log);
+        let launcher = fake_agent(tmp.path(), "claude-gpt");
+        seed_resumable_session(
+            tmp.path(),
+            "revoked-profile",
+            "claude",
+            "hs-claude-revoked-profile",
+            &cwd,
+            &["--resume", "resume-session-id"],
+        );
+        let record_path = tmp.path().join("sessions/revoked-profile/session.json");
+        let mut record: Value = serde_json::from_slice(&fs::read(&record_path).unwrap()).unwrap();
+        record["agent_bin"] = json!(launcher);
+        record["runtime"]["agent_profile"] = json!("claude-gpt");
+        fs::write(&record_path, serde_json::to_vec_pretty(&record).unwrap()).unwrap();
+
+        let (status, body) = call(
+            router(state(tmp.path(), Some(TOKEN), tmux)),
+            post_json("/sessions/revoked-profile/resume", Some(TOKEN), json!({})),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "body={body}");
+        assert_eq!(body["error"]["code"], "agent-profile-unavailable");
+        let calls = fs::read_to_string(log).unwrap_or_default();
+        assert!(
+            !calls.contains("new-session"),
+            "body={body}, calls={calls:?}"
         );
     }
 

@@ -4983,7 +4983,7 @@ pub(crate) fn session_provider_config_dir(record: &SessionRecord) -> Option<Path
 }
 
 pub(crate) fn session_profile_auto_resume_supported(record: &SessionRecord) -> bool {
-    record
+    let configured = record
         .runtime
         .as_ref()
         .and_then(|runtime| {
@@ -4991,8 +4991,12 @@ pub(crate) fn session_profile_auto_resume_supported(record: &SessionRecord) -> b
                 .extra
                 .get(AGENT_PROFILE_AUTO_RESUME_SUPPORTED_RUNTIME_KEY)
         })
-        .and_then(Value::as_bool)
-        .unwrap_or(true)
+        .and_then(Value::as_bool);
+    if session_agent_profile(record).is_some() {
+        configured == Some(true)
+    } else {
+        configured.unwrap_or(true)
+    }
 }
 
 fn last_terminal_activity_at(

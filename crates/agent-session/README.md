@@ -481,9 +481,14 @@ configuration at startup. A profile is advertised only when its executable is
 an executable regular file, its optional provider config root is a directory,
 and the optional readiness argv exits successfully within two seconds. The
 readiness argv always runs against `agent_bin`; no shell is involved. Profile
-paths and readiness details never enter HTTP responses. The safe id and private
+discovery probes are single-flight and briefly cached so open session-list
+reads cannot multiply readiness subprocesses. Profile paths and readiness
+details never enter HTTP responses. The safe id and private
 provider root persist with the runtime and its durable resume sidecar, so exact
-binary and transcript discovery survive daemon restarts. Set
+binary and transcript discovery survive daemon restarts. A stopped profiled
+session resumes only while the same id, base agent, executable, config root,
+and readiness contract remain present in the current server registry; removing
+or changing a profile revokes its persisted launcher. Set
 `auto_resume_supported` only when the profile has authoritative usage semantics
 for its provider; the default is fail-closed `false`.
 

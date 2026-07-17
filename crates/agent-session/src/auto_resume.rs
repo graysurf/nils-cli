@@ -1568,32 +1568,40 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let (_, mut record) = seed_session(&tmp);
         record.agent = "codex".to_string();
-        let runtime = record.runtime.as_mut().unwrap();
-        runtime.kind = "codex_app_server".to_string();
-        runtime
-            .extra
-            .insert("agent_profile".to_string(), json!("codex-custom"));
-        runtime.extra.insert(
+        {
+            let runtime = record.runtime.as_mut().unwrap();
+            runtime.kind = "codex_app_server".to_string();
+            runtime
+                .extra
+                .insert("agent_profile".to_string(), json!("codex-custom"));
+            runtime
+                .extra
+                .insert("codex_app_server_protocol".to_string(), json!("v2"));
+            for (key, suffix) in [
+                ("codex_app_server_socket", "sock"),
+                ("codex_app_server_proxy", "proxy"),
+                ("codex_app_server_thread_handoff", "thread"),
+                ("codex_app_server_thread_attached", "attached"),
+            ] {
+                runtime.extra.insert(
+                    key.to_string(),
+                    json!(format!(
+                        "/run/user/1000/agent-session/codex-profile.{suffix}"
+                    )),
+                );
+            }
+        }
+
+        assert!(!supported(&record));
+        record.runtime.as_mut().unwrap().extra.insert(
+            "agent_profile_auto_resume_supported".to_string(),
+            json!("invalid"),
+        );
+        assert!(!supported(&record));
+        record.runtime.as_mut().unwrap().extra.insert(
             "agent_profile_auto_resume_supported".to_string(),
             json!(false),
         );
-        runtime
-            .extra
-            .insert("codex_app_server_protocol".to_string(), json!("v2"));
-        for (key, suffix) in [
-            ("codex_app_server_socket", "sock"),
-            ("codex_app_server_proxy", "proxy"),
-            ("codex_app_server_thread_handoff", "thread"),
-            ("codex_app_server_thread_attached", "attached"),
-        ] {
-            runtime.extra.insert(
-                key.to_string(),
-                json!(format!(
-                    "/run/user/1000/agent-session/codex-profile.{suffix}"
-                )),
-            );
-        }
-
         assert!(!supported(&record));
         record.runtime.as_mut().unwrap().extra.insert(
             "agent_profile_auto_resume_supported".to_string(),
