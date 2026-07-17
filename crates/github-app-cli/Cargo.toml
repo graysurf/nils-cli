@@ -1,6 +1,6 @@
 [package]
 name = "nils-github-app-cli"
-version = "1.22.12"
+version = "1.23.0"
 edition.workspace = true
 license.workspace = true
 
@@ -26,12 +26,12 @@ clap_complete = { workspace = true }
 # cost — while the pure-Rust `rust_crypto` backend drags in `rsa` (RUSTSEC-2023-0071)
 # and a duplicate old-generation RustCrypto/EC tree. We only mint RS256 App JWTs.
 jsonwebtoken = { version = "10", default-features = false, features = ["use_pem", "aws_lc_rs"] }
-nils-build-info = { version = "1.22.12", path = "../nils-build-info" }
-nils-common = { version = "1.22.12", path = "../nils-common", package = "nils-common" }
+nils-build-info = { version = "1.23.0", path = "../nils-build-info" }
+nils-common = { version = "1.23.0", path = "../nils-common", package = "nils-common" }
 reqwest = { version = "0.13", default-features = false, features = ["blocking", "json", "rustls"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 
 [dev-dependencies]
-nils-test-support = { version = "1.22.12", path = "../nils-test-support" }
+nils-test-support = { version = "1.23.0", path = "../nils-test-support" }
 pretty_assertions = { workspace = true }
