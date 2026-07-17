@@ -2639,6 +2639,42 @@ fn pr_review_submit_native_requires_expected_head_before_backend() {
 }
 
 #[test]
+fn pr_review_expected_head_requires_submit_review_before_backend() {
+    let stub = StubEnv::new();
+    let capture = stub.tempdir.path().join("gh-args.log");
+    let stub = stub.gh_stub(&github_review_submit_stub(&capture.to_string_lossy()));
+
+    let out = run_forge_cli(
+        &stub,
+        &[
+            "--provider",
+            "github",
+            "--repo",
+            "acme/widgets",
+            "--format",
+            "json",
+            "pr",
+            "review",
+            "44",
+            "--decision",
+            "comments-only",
+            "--comment",
+            "Summary body",
+            "--expected-head",
+            "head-44",
+        ],
+    );
+
+    assert_eq!(out.code, 65, "stdout={}\nstderr={}", out.stdout, out.stderr);
+    let env = parse_envelope(&out.stdout);
+    assert_eq!(
+        env["error"]["code"],
+        "expected_review_head_requires_submit_review"
+    );
+    assert_backend_not_invoked(&capture);
+}
+
+#[test]
 fn pr_review_submit_native_rejects_expected_head_mismatch_before_mutation() {
     let stub = StubEnv::new();
     let capture = stub.tempdir.path().join("gh-args.log");
