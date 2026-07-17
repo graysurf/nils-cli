@@ -4,6 +4,7 @@
 
 ## Specs
 
+- [Dirty checkout adoption JSON contract v1](specs/dirty-checkout-adoption-json-contract-v1.md)
 - [git-cli worktree convention](specs/git-cli-worktree-convention.md)
 
 ## Runbooks

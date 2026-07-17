@@ -253,6 +253,9 @@ struct RawArgs {
 }
 
 pub fn run() -> i32 {
+    if let Some(status) = worktree::dirty_checkout_adoption::run_internal_snapshot_worker() {
+        return status;
+    }
     // Short-circuit `COMPLETE=<shell> git-cli ...` dynamic-completion requests
     // before the hand-rolled dispatch. No-op when `COMPLETE` is unset, so
     // ordinary invocations are unaffected.

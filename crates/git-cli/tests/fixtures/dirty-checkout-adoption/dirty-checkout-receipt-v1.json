@@ -1,0 +1,13 @@
+{
+  "schema": "agent-runtime.dirty-checkout-receipt.v1",
+  "receipt_id": "4444444444444444444444444444444444444444444444444444444444444444",
+  "session_key": "2222222222222222222222222222222222222222222222222222222222222222",
+  "repository_key": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "checkout_key": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+  "checkout_instance": "cccccccccccccccccccccccccccccccc",
+  "snapshot_id": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+  "authorization_turn_digest": "3333333333333333333333333333333333333333333333333333333333333333",
+  "reason_digest": "5555555555555555555555555555555555555555555555555555555555555555",
+  "challenge_digest": "6666666666666666666666666666666666666666666666666666666666666666",
+  "adopted_at": 1700000100
+}
