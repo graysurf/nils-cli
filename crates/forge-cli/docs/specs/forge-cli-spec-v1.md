@@ -618,8 +618,9 @@ backend mapping, validation rules, and output schema versions.
   plus the `--issue` requirement — is enforced before any backend post, so a
   rejected mirror can never leave a posted review outcome with no mirror.
 - Output schema:
-  `data = { provider, number, decision, submitted_review, pr_comment_url,
-  issue_number, issue_comment_url, mirrored, lenses, review_threads? }`.
+  `data = { provider, number, decision, submitted_review, head_sha?,
+  pr_comment_url, issue_number, issue_comment_url, mirrored, lenses,
+  review_threads? }`. `head_sha` is present for `--submit-review`.
 
 ### `pr review validate`
 
