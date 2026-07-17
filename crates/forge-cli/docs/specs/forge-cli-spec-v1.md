@@ -533,8 +533,15 @@ backend mapping, validation rules, and output schema versions.
   identity the inherited `gh` token carries, so a reviewer-bot token (for example
   via `FORGE_BOT_PROFILE`) yields a bot-authored review. A body is required for
   `COMMENT` and `REQUEST_CHANGES` and optional for `APPROVE` (a body-less approve
-  omits the `body` field). The same PR-existence guard runs first, and the
-  reviews POST is rendered in `--dry-run` as `data.plan`. `--submit-review` on
+  omits the `body` field). The same PR-existence guard runs first, followed by a
+  complete pending-only review snapshot. If the authenticated viewer already
+  owns a pending review, the command returns `github_pending_review_exists`
+  (`RUNTIME 1`) before any review mutation. Its detail includes the provider
+  head, viewer-owned pending count, and deletable count so callers can inspect
+  `pr reviews` and delete only the exact guarded node before retrying. Pending
+  reviews owned by other viewers do not block submission. The pending guard and
+  reviews POST are rendered in `--dry-run` as
+  `data.pending_review_guard_plan` and `data.plan`. `--submit-review` on
   GitLab / Local returns `provider_unsupported` (`USAGE 64`).
   If GitHub rejects the native review submission with HTTP 422, the command
   returns `github_native_review_rejected` (`RUNTIME 1`) and preserves the raw

@@ -16,7 +16,7 @@ use crate::cli::{
 };
 use crate::envelope::emit_success;
 use crate::error::ForgeError;
-use crate::ops::pr_comment;
+use crate::ops::{pr_comment, pr_reviews};
 use crate::provider::{Provider, ProviderContext, detect, git_remote_url};
 use crate::rate_limit::default_runner;
 use crate::validations::{no_escaped_control_markdown, no_local_path};
@@ -88,6 +88,9 @@ struct PrReviewDryRunPayload {
     /// `None` on GitLab / Local. Surfaced so dry-run renders every backend
     /// command the live run performs.
     guard_plan: Option<Vec<String>>,
+    /// GitHub-only pending-review ownership snapshot that runs before any
+    /// native review mutation.
+    pending_review_guard_plan: Option<Vec<String>>,
     plan: Vec<String>,
     issue_number: Option<u64>,
     issue_plan: Option<Vec<String>>,
@@ -399,6 +402,15 @@ pub fn run_with<R: BackendRunner, F: Fn(&str) -> Option<String>>(
         let guard_plan = (ctx.provider == Provider::GitHub).then(|| {
             BackendCall::new(BackendProgram::Gh, github_pull_lookup_argv(&ctx, id)).plan_argv()
         });
+        let pending_review_guard_plan = if args.submit_review && ctx.provider == Provider::GitHub {
+            let (owner, name) = github_owner_name(&ctx)?;
+            Some(
+                pr_reviews::build_github_pending_reviews_call(&ctx, owner, name, id, None)
+                    .plan_argv(),
+            )
+        } else {
+            None
+        };
         let issue_plan = mirror_issue.map(|issue| {
             let mirror_body = build_issue_mirror_body(
                 ctx.provider,
@@ -417,6 +429,7 @@ pub fn run_with<R: BackendRunner, F: Fn(&str) -> Option<String>>(
                 decision: args.decision.as_str(),
                 submitted_review: args.submit_review,
                 guard_plan,
+                pending_review_guard_plan,
                 plan: pr_call.plan_argv(),
                 issue_number: args.issue,
                 issue_plan,
@@ -431,6 +444,12 @@ pub fn run_with<R: BackendRunner, F: Fn(&str) -> Option<String>>(
             |p| {
                 if let Some(guard) = p.guard_plan.as_ref() {
                     println!("would verify pull request: {plan}", plan = guard.join(" "));
+                }
+                if let Some(guard) = p.pending_review_guard_plan.as_ref() {
+                    println!(
+                        "would verify pending review ownership: {plan}",
+                        plan = guard.join(" ")
+                    );
                 }
                 if let Some(target) = p.target_plan.as_ref() {
                     println!(
@@ -471,6 +490,9 @@ pub fn run_with<R: BackendRunner, F: Fn(&str) -> Option<String>>(
     // is GitHub-only.
     if ctx.provider == Provider::GitHub {
         ensure_github_pull_request(runner, &ctx, id)?;
+        if args.submit_review {
+            ensure_no_viewer_pending_github_review(runner, &ctx, id)?;
+        }
     }
 
     // GitLab only: probe which `mr note` form this `glab` build supports
@@ -1241,7 +1263,7 @@ fn github_owner_name(ctx: &ProviderContext) -> Result<(&str, &str), ForgeError> 
         return Err(ForgeError::validation(
             schema_err(),
             "repo_required",
-            "pr review --thread-file requires --repo owner/name or a recognised GitHub remote",
+            "github native review submission requires --repo owner/name or a recognised GitHub remote",
             None,
         ));
     };
@@ -1249,7 +1271,7 @@ fn github_owner_name(ctx: &ProviderContext) -> Result<(&str, &str), ForgeError> 
         ForgeError::validation(
             schema_err(),
             "repo_required",
-            "pr review --thread-file requires a repo slug shaped as owner/name",
+            "github native review submission requires a repo slug shaped as owner/name",
             Some(format!("repo={repo}")),
         )
     })
@@ -1775,6 +1797,49 @@ fn ensure_github_pull_request<R: BackendRunner>(
         schema_err(),
         format!("failed to verify github pull request #{id} before posting the review outcome"),
         (!detail.is_empty()).then(|| detail.to_string()),
+    ))
+}
+
+/// Fail before any native-review mutation when the authenticated GitHub viewer
+/// already owns a pending review. GitHub otherwise reports an ambiguous HTTP
+/// 422 whose prose is not stable enough for machine-readable recovery.
+fn ensure_no_viewer_pending_github_review<R: BackendRunner>(
+    runner: &R,
+    ctx: &ProviderContext,
+    id: u64,
+) -> Result<(), ForgeError> {
+    let repo = ctx.repo.as_deref().ok_or_else(|| {
+        ForgeError::validation(
+            schema_err(),
+            "repo_required",
+            "github native review preflight requires --repo owner/name or a recognised GitHub remote",
+            None,
+        )
+    })?;
+    let pr_url = format!("https://{host}/{repo}/pull/{id}", host = ctx.host);
+    let snapshot = pr_reviews::compute_pending_guards_for_pr(runner, ctx, id, &pr_url)?;
+    let pending_review_count = snapshot
+        .reviews
+        .iter()
+        .filter(|review| review.viewer_did_author)
+        .count();
+    if pending_review_count == 0 {
+        return Ok(());
+    }
+    let deletable_pending_review_count = snapshot
+        .reviews
+        .iter()
+        .filter(|review| review.viewer_did_author && review.viewer_can_delete)
+        .count();
+
+    Err(ForgeError::runtime_failure(
+        schema_err(),
+        "github_pending_review_exists",
+        "github native review submission is blocked because the authenticated viewer already owns a pending review",
+        Some(format!(
+            "provider=github; pr={id}; head_sha={head}; pending_review_count={pending_review_count}; deletable_pending_review_count={deletable_pending_review_count}; suggestion=inspect pr reviews and delete only the exact viewer-owned pending review bound to the expected PR head before retrying",
+            head = snapshot.head_sha,
+        )),
     ))
 }
 

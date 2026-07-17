@@ -78,6 +78,11 @@ The command verifies PR membership, `PENDING` state, provider-native
 works for GitHub App installation actors without relying on the user-only
 `GET /user` endpoint.
 
+`pr review --submit-review` performs the same pending-only ownership preflight
+before any native review mutation. A viewer-owned draft returns the typed
+`github_pending_review_exists` error with the provider head and counts; drafts
+owned by other viewers remain non-blocking.
+
 ## Inbox discovery
 
 `forge-cli inbox` is a read-only personal work inbox for agents, scheduled jobs,

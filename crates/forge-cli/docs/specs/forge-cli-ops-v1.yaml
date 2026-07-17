@@ -276,6 +276,7 @@ operations:
     #   invalid_review_thread_spec (DATA 65) — malformed, oversized, or locally invalid thread spec fields
     #   thread_file_requires_submit_review (DATA 65) — --thread-file without --submit-review
     #   provider_unsupported (USAGE 64) — --submit-review or --thread-file on gitlab/local (native review/thread creation is GitHub-only in v1)
+    #   github_pending_review_exists (RUNTIME 1) — the authenticated GitHub viewer already owns a pending review; returned before any native review mutation, with provider head and pending/deletable counts for exact-node recovery
     #   github_native_review_rejected (RUNTIME 1) — GitHub rejected native review submission with HTTP 422; retry with an eligible reviewer identity or omit --submit-review for an outcome comment fallback
     #   github_review_thread_rejected (RUNTIME 1) — GitHub rejected addPullRequestReviewThread for one spec; detail preserves the raw backend error plus spec index/path/line after best-effort pending-review cleanup.
     # A non-404 guard failure (rate limit, 5xx, forbidden/SSO) surfaces as backend_error (RUNTIME 1),
@@ -284,6 +285,7 @@ operations:
       github:
         - { program: gh, argv: [api, "repos/{repo}/pulls/{id}", --jq, ".number"] } # PR-existence guard; <id> must be a pull request before posting (also rendered in --dry-run as guard_plan)
         - { program: gh, argv: [api, "repos/{repo}/issues/{id}/comments", --method, POST, --raw-field, "body={comment_or_file}", --jq, ".html_url"] } # default (outcome comment)
+        - { program: gh, argv: [api, graphql, -f, "query=<pending reviews with viewer ownership>", -f, "owner={owner}", -f, "name={repo}", -F, "pr={id}"] } # with --submit-review: complete pending-only preflight; a viewer-owned pending review returns github_pending_review_exists before mutation (rendered as pending_review_guard_plan)
         - { program: gh, argv: [api, "repos/{repo}/pulls/{id}/reviews", --method, POST, --raw-field, "body={comment_or_file}", --raw-field, "event={EVENT}", --jq, ".html_url"] } # with --submit-review (native review event); body field omitted for a body-less APPROVE; review authored by the inherited gh token's identity
         - { program: gh, argv: [api, graphql, -f, "query=<pull request id lookup>", -f, "owner={owner}", -f, "name={repo}", -F, "number={id}"] } # with --thread-file: resolve the PR node id
         - { program: gh, argv: [api, graphql, -f, "query=<addPullRequestReview>", -f, "pullRequestId={pull_request_id}"] } # with --thread-file: create a pending review
@@ -307,6 +309,7 @@ operations:
         number: integer
         decision: enum<comments-only|approve|request-changes>
         submitted_review: bool # true when a native review event was submitted (--submit-review); then pr_comment_url is the #pullrequestreview- URL
+        pending_review_guard_plan?: list<string> # dry-run only, with --submit-review: pending-only GraphQL preflight argv
         pr_comment_url: string
         issue_number: integer?
         issue_comment_url: string?
