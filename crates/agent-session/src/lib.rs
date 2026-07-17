@@ -57,6 +57,9 @@ const SESSION_DOCUMENT_VERSION: &str = "agent-session.session.v1";
 const SESSION_RESUME_DOCUMENT_VERSION: &str = "agent-session.resume.v1";
 const STARTUP_PROJECTION_VERSION: &str = "agent-session.startup.v1";
 const STARTUP_EXTRA_KEY: &str = "startup";
+const AGENT_PROFILE_RUNTIME_KEY: &str = "agent_profile";
+const AGENT_PROFILE_PROVIDER_CONFIG_DIR_RUNTIME_KEY: &str = "agent_profile_provider_config_dir";
+const AGENT_PROFILE_AUTO_RESUME_SUPPORTED_RUNTIME_KEY: &str = "agent_profile_auto_resume_supported";
 const STARTUP_STAGE_FILE: &str = ".startup-stage";
 const STARTUP_FAILURE_FILE: &str = ".startup-failure";
 const STARTUP_DIAGNOSTIC_FILE: &str = ".startup-diagnostic.log";
@@ -1081,6 +1084,8 @@ struct DurableResumeRecord {
 struct SessionView {
     id: String,
     agent: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    agent_profile: Option<String>,
     mode: String,
     title: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1257,6 +1262,10 @@ impl CliError {
         &self.0.code
     }
 
+    fn message(&self) -> &str {
+        &self.0.message
+    }
+
     fn usage(code: impl Into<String>, message: impl Into<String>, details: Option<Value>) -> Self {
         Self(Box::new(CliErrorData {
             code: code.into(),
@@ -1325,6 +1334,35 @@ fn start_session(
         agent_args: args.agent_args.clone(),
         agent_bin: Some(display_path(&agent_bin)),
     })?;
+    if let Some(agent_profile) = args.initial_agent_profile.as_deref() {
+        let Some(runtime) = created.record.runtime.as_mut() else {
+            cleanup_created_record(context, &created);
+            return Err(CliError::runtime(
+                "agent-profile-runtime-missing",
+                "launch profile metadata requires a session runtime",
+                Some(json!({ "id": created.record.id })),
+            ));
+        };
+        runtime
+            .extra
+            .insert(AGENT_PROFILE_RUNTIME_KEY.to_string(), json!(agent_profile));
+        if let Some(config_dir) = args.initial_provider_config_dir.as_deref() {
+            runtime.extra.insert(
+                AGENT_PROFILE_PROVIDER_CONFIG_DIR_RUNTIME_KEY.to_string(),
+                json!(display_path(config_dir)),
+            );
+        }
+        if let Some(supported) = args.initial_profile_auto_resume_supported {
+            runtime.extra.insert(
+                AGENT_PROFILE_AUTO_RESUME_SUPPORTED_RUNTIME_KEY.to_string(),
+                json!(supported),
+            );
+        }
+        if let Err(err) = write_session_record(context, &created.record) {
+            cleanup_created_record(context, &created);
+            return Err(err);
+        }
+    }
     if let Err(err) = codex_account::set_initial_binding(
         &mut created.record,
         args.initial_codex_account.as_deref(),
@@ -4885,6 +4923,7 @@ fn session_view_from_parts(
     SessionView {
         id: record.id.clone(),
         agent: record.agent.clone(),
+        agent_profile: session_agent_profile(record).map(str::to_string),
         mode: record.mode.clone(),
         title: record.title.clone(),
         title_state: effective_session_title_state(record),
@@ -4923,6 +4962,41 @@ fn session_view_from_parts(
         startup: startup_projection_for_view(record),
         auto_resume: auto_resume::view_for_record(context, record),
         codex_account: codex_account::view_for_record(record),
+    }
+}
+
+fn runtime_extra_string<'a>(record: &'a SessionRecord, key: &str) -> Option<&'a str> {
+    record
+        .runtime
+        .as_ref()
+        .and_then(|runtime| runtime.extra.get(key))
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+}
+
+pub(crate) fn session_agent_profile(record: &SessionRecord) -> Option<&str> {
+    runtime_extra_string(record, AGENT_PROFILE_RUNTIME_KEY)
+}
+
+pub(crate) fn session_provider_config_dir(record: &SessionRecord) -> Option<PathBuf> {
+    runtime_extra_string(record, AGENT_PROFILE_PROVIDER_CONFIG_DIR_RUNTIME_KEY).map(PathBuf::from)
+}
+
+pub(crate) fn session_profile_auto_resume_setting(record: &SessionRecord) -> Option<bool> {
+    record.runtime.as_ref().and_then(|runtime| {
+        runtime
+            .extra
+            .get(AGENT_PROFILE_AUTO_RESUME_SUPPORTED_RUNTIME_KEY)
+            .and_then(Value::as_bool)
+    })
+}
+
+pub(crate) fn session_profile_auto_resume_supported(record: &SessionRecord) -> bool {
+    let configured = session_profile_auto_resume_setting(record);
+    if session_agent_profile(record).is_some() {
+        configured == Some(true)
+    } else {
+        configured.unwrap_or(true)
     }
 }
 
@@ -9908,7 +9982,7 @@ mod tests {
                 .iter()
                 .any(|action| { action["id"] == "terminate_runtime_then_delete" })
         );
-        let result = crate::maintenance::execute(
+        let result = crate::maintenance::execute_with_resume_guard(
             &context,
             &id,
             &wrapper,
@@ -9922,6 +9996,7 @@ mod tests {
                 expected_preview_digest: preview["preview_digest"].as_str().unwrap().to_string(),
                 confirmed: true,
             },
+            |_| Ok(()),
         )
         .unwrap_or_else(|error| {
             let retained = load_session_record(&context, &id).unwrap();

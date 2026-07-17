@@ -18,7 +18,7 @@ use std::fs::OpenOptions;
 use std::io::{self, Read};
 use std::net::SocketAddr;
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, Stdio};
@@ -64,9 +64,10 @@ use crate::{
     WorkdirSearchOptions, canonicalize_structured_title_pair, cleanup_session_delete_tombstones,
     delete_session, glance_session, list_sessions, load_session_record, non_empty_env,
     repo_remote_url_from_cwd, resolve_tmux_bin, resume_session_by_id, search_workdirs,
-    send_auto_resume_input, send_input_serialized, session_clipboard_buffer, session_dir,
-    session_status, short_hostname, start_provider_resume_session, start_session,
-    update_session_title_if_revision, write_session_attachment,
+    send_auto_resume_input, send_input_serialized, session_agent_profile, session_clipboard_buffer,
+    session_dir, session_profile_auto_resume_setting, session_provider_config_dir, session_status,
+    short_hostname, start_provider_resume_session, start_session, update_session_title_if_revision,
+    write_session_attachment,
 };
 
 const ATTACH_LIVE_FIFO_NAME: &str = "attach-live.fifo";
@@ -99,6 +100,9 @@ const PROVIDER_PROMPT_DISCOVERY_MAX_BACKOFF: Duration = Duration::from_secs(30);
 const PROVIDER_PROMPT_DISCOVERY_MAX_ENTRIES: usize = 64;
 const PROVIDER_PROMPT_DISCOVERY_MAX_CONCURRENT_SCANS: usize = 4;
 const MAX_CONCURRENT_AUTO_RESUME_TICKS: usize = 4;
+const MAX_AGENT_LAUNCH_PROFILES: usize = 16;
+const AGENT_LAUNCH_PROFILE_READINESS_TIMEOUT: Duration = Duration::from_secs(2);
+const AGENT_LAUNCH_PROFILE_READINESS_CACHE_TTL: Duration = Duration::from_secs(1);
 const ATTACH_SCHEMA_VERSION: &str = "agent-session.attach.v1";
 const ATTACH_EVENT_SCHEMA_VERSION: &str = "agent-session.attach.event.v1";
 const ACTIVITY_STREAM_EVENT_SCHEMA_VERSION: &str = "agent-session.activity-stream.event.v1";
@@ -138,6 +142,7 @@ struct ServeState {
     codex_controls: Arc<StdMutex<HashMap<String, CodexControlEntry>>>,
     codex_account_switches: CodexAccountSwitchRegistry,
     session_collector: SessionCollector,
+    launch_profiles: AgentLaunchProfiles,
 }
 
 #[derive(Clone)]
@@ -170,6 +175,256 @@ impl CodexAccountSwitchRegistry {
 
 fn default_session_collector() -> SessionCollector {
     Arc::new(|context, tmux_bin| list_sessions(context, Some(tmux_bin)))
+}
+
+#[derive(Clone, Debug)]
+struct AgentLaunchProfiles {
+    entries: Vec<AgentLaunchProfile>,
+    readiness_cache: Arc<StdMutex<AgentLaunchProfileReadinessCache>>,
+}
+
+#[derive(Debug, Default)]
+struct AgentLaunchProfileReadinessCache {
+    observed_at: Option<Instant>,
+    summaries: Vec<AgentLaunchProfileSummary>,
+    refreshing: bool,
+}
+
+#[derive(Clone, Debug)]
+struct AgentLaunchProfile {
+    id: String,
+    label: String,
+    agent: AgentKind,
+    agent_bin: PathBuf,
+    provider_config_dir: Option<PathBuf>,
+    readiness_args: Vec<String>,
+    auto_resume_supported: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AgentLaunchProfileConfig {
+    id: String,
+    label: String,
+    agent: String,
+    agent_bin: PathBuf,
+    provider_config_dir: Option<PathBuf>,
+    #[serde(default)]
+    readiness_args: Vec<String>,
+    #[serde(default)]
+    auto_resume_supported: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+struct AgentLaunchProfileSummary {
+    id: String,
+    label: String,
+    agent: String,
+}
+
+impl AgentLaunchProfiles {
+    fn from_environment() -> Result<Self, CliError> {
+        let Some(raw) = non_empty_env("AGENT_SESSION_LAUNCH_PROFILES") else {
+            return Ok(Self::default());
+        };
+        Self::from_json(&raw)
+    }
+
+    fn from_json(raw: &str) -> Result<Self, CliError> {
+        let configs: Vec<AgentLaunchProfileConfig> = serde_json::from_str(raw).map_err(|_| {
+            invalid_agent_launch_profiles("launch profiles must be a valid JSON array")
+        })?;
+        if configs.len() > MAX_AGENT_LAUNCH_PROFILES {
+            return Err(invalid_agent_launch_profiles(
+                "too many launch profiles are configured",
+            ));
+        }
+        let mut entries = Vec::with_capacity(configs.len());
+        for config in configs {
+            if !valid_agent_profile_id(&config.id) {
+                return Err(invalid_agent_launch_profiles(
+                    "launch profile ids must use 1-32 lowercase letters, digits, or hyphens",
+                ));
+            }
+            if entries
+                .iter()
+                .any(|entry: &AgentLaunchProfile| entry.id == config.id)
+            {
+                return Err(invalid_agent_launch_profiles(
+                    "launch profile ids must be unique",
+                ));
+            }
+            let label = config.label.trim();
+            if label.is_empty() || label.len() > 64 || label.chars().any(char::is_control) {
+                return Err(invalid_agent_launch_profiles(
+                    "launch profile labels must contain 1-64 safe characters",
+                ));
+            }
+            let Some(agent) = AgentKind::from_name(&config.agent) else {
+                return Err(invalid_agent_launch_profiles(
+                    "launch profiles must reference a supported base agent",
+                ));
+            };
+            if !config.agent_bin.is_absolute() {
+                return Err(invalid_agent_launch_profiles(
+                    "launch profile agent_bin paths must be absolute",
+                ));
+            }
+            if config
+                .provider_config_dir
+                .as_ref()
+                .is_some_and(|path| !path.is_absolute())
+            {
+                return Err(invalid_agent_launch_profiles(
+                    "launch profile provider_config_dir paths must be absolute",
+                ));
+            }
+            if config.readiness_args.len() > 8
+                || config.readiness_args.iter().any(|arg| {
+                    arg.len() > 256 || arg.contains('\0') || arg.chars().any(char::is_control)
+                })
+            {
+                return Err(invalid_agent_launch_profiles(
+                    "launch profile readiness arguments exceed safe bounds",
+                ));
+            }
+            entries.push(AgentLaunchProfile {
+                id: config.id,
+                label: label.to_string(),
+                agent,
+                agent_bin: config.agent_bin,
+                provider_config_dir: config.provider_config_dir,
+                readiness_args: config.readiness_args,
+                auto_resume_supported: config.auto_resume_supported,
+            });
+        }
+        Ok(Self {
+            entries,
+            readiness_cache: Arc::new(StdMutex::new(AgentLaunchProfileReadinessCache::default())),
+        })
+    }
+
+    fn get(&self, id: &str) -> Option<&AgentLaunchProfile> {
+        self.entries.iter().find(|profile| profile.id == id)
+    }
+
+    fn ready_summaries(&self) -> Vec<AgentLaunchProfileSummary> {
+        let now = Instant::now();
+        {
+            let mut cache = self
+                .readiness_cache
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if cache.observed_at.is_some_and(|observed_at| {
+                now.saturating_duration_since(observed_at)
+                    < AGENT_LAUNCH_PROFILE_READINESS_CACHE_TTL
+            }) || cache.refreshing
+            {
+                return cache.summaries.clone();
+            }
+            cache.refreshing = true;
+        }
+
+        let summaries = self.probe_ready_summaries();
+        let mut cache = self
+            .readiness_cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        cache.observed_at = Some(Instant::now());
+        cache.summaries.clone_from(&summaries);
+        cache.refreshing = false;
+        summaries
+    }
+
+    fn probe_ready_summaries(&self) -> Vec<AgentLaunchProfileSummary> {
+        self.entries
+            .iter()
+            .filter(|profile| profile.is_ready())
+            .map(AgentLaunchProfile::summary)
+            .collect()
+    }
+}
+
+impl Default for AgentLaunchProfiles {
+    fn default() -> Self {
+        Self {
+            entries: Vec::new(),
+            readiness_cache: Arc::new(StdMutex::new(AgentLaunchProfileReadinessCache::default())),
+        }
+    }
+}
+
+impl AgentLaunchProfile {
+    fn summary(&self) -> AgentLaunchProfileSummary {
+        AgentLaunchProfileSummary {
+            id: self.id.clone(),
+            label: self.label.clone(),
+            agent: self.agent.as_str().to_string(),
+        }
+    }
+
+    fn is_ready(&self) -> bool {
+        let Ok(metadata) = std::fs::metadata(&self.agent_bin) else {
+            return false;
+        };
+        if !metadata.is_file() || metadata.permissions().mode() & 0o111 == 0 {
+            return false;
+        }
+        if self
+            .provider_config_dir
+            .as_ref()
+            .is_some_and(|path| !path.is_dir())
+        {
+            return false;
+        }
+        if self.readiness_args.is_empty() {
+            return true;
+        }
+        let mut command = ProcessCommand::new(&self.agent_bin);
+        command.args(&self.readiness_args);
+        run_agent_profile_readiness(command, AGENT_LAUNCH_PROFILE_READINESS_TIMEOUT)
+    }
+}
+
+fn run_agent_profile_readiness(mut command: ProcessCommand, timeout: Duration) -> bool {
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .process_group(0);
+    let Ok(mut child) = command.spawn() else {
+        return false;
+    };
+    let started_at = Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return status.success(),
+            Ok(None) if started_at.elapsed() < timeout => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Ok(None) | Err(_) => {
+                // SAFETY: readiness commands are leaders of dedicated process groups.
+                unsafe {
+                    let _ = libc::kill(-(child.id() as libc::pid_t), libc::SIGKILL);
+                }
+                let _ = child.kill();
+                let _ = child.wait();
+                return false;
+            }
+        }
+    }
+}
+
+fn valid_agent_profile_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 32
+        && id.bytes().enumerate().all(|(index, byte)| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || (index > 0 && byte == b'-')
+        })
+}
+
+fn invalid_agent_launch_profiles(message: &str) -> CliError {
+    CliError::usage("invalid-agent-launch-profiles", message, None)
 }
 
 async fn bind_listener_and_start_delete_tombstone_cleanup(
@@ -231,6 +486,14 @@ pub fn run_serve(context: &CliContext, args: cli::ServeArgs) -> i32 {
         .or_else(short_hostname)
         .unwrap_or_else(|| "unknown".to_string());
 
+    let launch_profiles = match AgentLaunchProfiles::from_environment() {
+        Ok(profiles) => profiles,
+        Err(err) => {
+            eprintln!("error: {}", err.message());
+            return exit::USAGE;
+        }
+    };
+
     let tmux_bin = resolve_tmux_bin(args.tmux_bin.as_deref());
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -277,6 +540,7 @@ pub fn run_serve(context: &CliContext, args: cli::ServeArgs) -> i32 {
             codex_controls: Arc::new(StdMutex::new(HashMap::new())),
             codex_account_switches: CodexAccountSwitchRegistry::default(),
             session_collector,
+            launch_profiles,
         });
         let listener = match bind_listener_and_start_delete_tombstone_cleanup(context, bind).await {
             Ok(listener) => listener,
@@ -2097,6 +2361,7 @@ struct MaintenanceQuery {
 #[derive(Debug, Deserialize)]
 struct CreateBody {
     agent: String,
+    agent_profile: Option<String>,
     cwd: Option<String>,
     #[serde(default, deserialize_with = "deserialize_create_title")]
     title: CreateTitleInput,
@@ -2195,11 +2460,17 @@ async fn list_handler(State(state): State<Arc<ServeState>>) -> Response {
     let context = state.context.clone();
     let tmux = state.tmux_bin.clone();
     let collect = state.session_collector.clone();
-    match tokio::task::spawn_blocking(move || collect(&context, &tmux)).await {
-        Ok(Ok(sessions)) => envelope_ok(json!({
+    let launch_profiles = state.launch_profiles.clone();
+    match tokio::task::spawn_blocking(move || {
+        collect(&context, &tmux).map(|sessions| (sessions, launch_profiles.ready_summaries()))
+    })
+    .await
+    {
+        Ok(Ok((sessions, agent_profiles))) => envelope_ok(json!({
             "machine": state.machine,
             "observed_at": activity_observed_at(),
             "sessions": sessions,
+            "agent_profiles": agent_profiles,
         })),
         Ok(Err(err)) => envelope_err(err),
         Err(_) => join_err(),
@@ -2320,6 +2591,50 @@ async fn create_handler(
             None,
         ));
     };
+    let launch_profile = match body.agent_profile.as_deref() {
+        Some(id) => {
+            let Some(profile) = state.launch_profiles.get(id) else {
+                return envelope_err(CliError::usage(
+                    "unknown-agent-profile",
+                    "the requested agent profile is not configured on this machine",
+                    Some(json!({ "agent_profile": id })),
+                ));
+            };
+            if profile.agent != agent {
+                return envelope_err(CliError::usage(
+                    "agent-profile-agent-conflict",
+                    "the requested agent profile does not match the base agent",
+                    Some(json!({
+                        "agent": agent.as_str(),
+                        "agent_profile": id,
+                    })),
+                ));
+            }
+            let profile = profile.clone();
+            let readiness_profile = profile.clone();
+            let ready =
+                match tokio::task::spawn_blocking(move || readiness_profile.is_ready()).await {
+                    Ok(ready) => ready,
+                    Err(_) => return join_err(),
+                };
+            if !ready {
+                return envelope_err(CliError::runtime(
+                    "agent-profile-unavailable",
+                    "the requested agent profile is not ready on this machine",
+                    Some(json!({ "agent_profile": id })),
+                ));
+            }
+            Some(profile)
+        }
+        None => None,
+    };
+    if launch_profile.is_some() && body.provider_resume_id.is_some() {
+        return envelope_err(CliError::usage(
+            "agent-profile-provider-resume-conflict",
+            "agent profiles are supported only for new sessions",
+            None,
+        ));
+    }
     let context = state.context.clone();
     let title_supplied = body.title.is_supplied();
     let title = body.title.into_value();
@@ -2396,6 +2711,13 @@ async fn create_handler(
         app_server_managed: true,
         initial_codex_account: selected_account.clone(),
         initial_title_state: title_state,
+        initial_agent_profile: launch_profile.as_ref().map(|profile| profile.id.clone()),
+        initial_provider_config_dir: launch_profile
+            .as_ref()
+            .and_then(|profile| profile.provider_config_dir.clone()),
+        initial_profile_auto_resume_supported: launch_profile
+            .as_ref()
+            .map(|profile| profile.auto_resume_supported),
         agent,
         cwd: body.cwd.map(PathBuf::from),
         title,
@@ -2408,7 +2730,9 @@ async fn create_handler(
         prompt_file: None,
         prompt_stdin: false,
         tmux_bin: Some(state.tmux_bin.clone()),
-        agent_bin: None,
+        agent_bin: launch_profile
+            .as_ref()
+            .map(|profile| profile.agent_bin.clone()),
         agent_args: body.agent_args,
         paste_delay_ms: cli::DEFAULT_PASTE_DELAY_MS,
         format: nils_common::cli_contract::OutputFormat::Json,
@@ -3416,11 +3740,56 @@ async fn resume_handler(
     }
     let context = state.context.clone();
     let tmux = state.tmux_bin.clone();
-    match tokio::task::spawn_blocking(move || resume_session_by_id(&context, &id, &tmux)).await {
+    let launch_profiles = state.launch_profiles.clone();
+    match tokio::task::spawn_blocking(move || {
+        validate_launch_profile_resume(&context, &id, &launch_profiles)?;
+        resume_session_by_id(&context, &id, &tmux)
+    })
+    .await
+    {
         Ok(Ok(session)) => envelope_ok(json!({ "machine": state.machine, "session": session })),
         Ok(Err(err)) => envelope_err(err),
         Err(_) => join_err(),
     }
+}
+
+fn validate_launch_profile_resume(
+    context: &CliContext,
+    id: &str,
+    launch_profiles: &AgentLaunchProfiles,
+) -> Result<(), CliError> {
+    let record = load_session_record(context, id)?;
+    validate_launch_profile_resume_record(&record, launch_profiles)
+}
+
+fn validate_launch_profile_resume_record(
+    record: &SessionRecord,
+    launch_profiles: &AgentLaunchProfiles,
+) -> Result<(), CliError> {
+    let Some(profile_id) = session_agent_profile(record) else {
+        return Ok(());
+    };
+    let Some(profile) = launch_profiles.get(profile_id) else {
+        return Err(unavailable_launch_profile());
+    };
+    let provider_config_dir = session_provider_config_dir(record);
+    if AgentKind::from_name(&record.agent) != Some(profile.agent)
+        || record.agent_bin.as_deref() != profile.agent_bin.to_str()
+        || provider_config_dir.as_deref() != profile.provider_config_dir.as_deref()
+        || session_profile_auto_resume_setting(record) != Some(profile.auto_resume_supported)
+        || !profile.is_ready()
+    {
+        return Err(unavailable_launch_profile());
+    }
+    Ok(())
+}
+
+fn unavailable_launch_profile() -> CliError {
+    CliError::runtime(
+        "agent-profile-unavailable",
+        "agent launch profile is unavailable",
+        None,
+    )
 }
 
 async fn maintenance_handler(
@@ -3476,9 +3845,12 @@ async fn maintenance_action_handler(
     };
     let context = state.context.clone();
     let tmux = state.tmux_bin.clone();
+    let launch_profiles = state.launch_profiles.clone();
     let action_id = id.clone();
     match tokio::task::spawn_blocking(move || {
-        maintenance::execute(&context, &action_id, &tmux, request)
+        maintenance::execute_with_resume_guard(&context, &action_id, &tmux, request, |record| {
+            validate_launch_profile_resume_record(record, &launch_profiles)
+        })
     })
     .await
     {
@@ -5399,6 +5771,145 @@ mod tests {
     const MACHINE: &str = "test-machine";
     const TOKEN: &str = "s3cr3t-token";
 
+    #[test]
+    fn launch_profiles_advertise_only_ready_safe_summaries() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config_dir = tmp.path().join("claude-gpt");
+        fs::create_dir(&config_dir).unwrap();
+        let launcher = tmp.path().join("claude-gpt-launcher");
+        fs::write(&launcher, "#!/usr/bin/env sh\nexit 0\n").unwrap();
+        let mut permissions = fs::metadata(&launcher).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&launcher, permissions).unwrap();
+        let profiles = AgentLaunchProfiles::from_json(
+            &json!([{
+                "id": "claude-gpt",
+                "label": "Claude GPT",
+                "agent": "claude",
+                "agent_bin": launcher,
+                "provider_config_dir": config_dir,
+                "readiness_args": ["--check"],
+                "auto_resume_supported": false,
+            }])
+            .to_string(),
+        )
+        .unwrap();
+
+        let summaries = profiles.ready_summaries();
+        assert_eq!(
+            summaries,
+            vec![AgentLaunchProfileSummary {
+                id: "claude-gpt".to_string(),
+                label: "Claude GPT".to_string(),
+                agent: "claude".to_string(),
+            }]
+        );
+        assert_eq!(
+            serde_json::to_value(&summaries).unwrap(),
+            json!([{"id":"claude-gpt","label":"Claude GPT","agent":"claude"}])
+        );
+
+        fs::write(&launcher, "#!/usr/bin/env sh\nexit 1\n").unwrap();
+        assert!(profiles.probe_ready_summaries().is_empty());
+    }
+
+    #[test]
+    fn launch_profile_readiness_timeout_kills_its_process_group() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let pid_file = tmp.path().join("readiness.pid");
+        let mut command = ProcessCommand::new("/bin/sh");
+        command.arg("-c").arg(format!(
+            "echo $$ > '{}'; sleep 30 & wait",
+            pid_file.display()
+        ));
+
+        let started_at = Instant::now();
+        assert!(!run_agent_profile_readiness(
+            command,
+            Duration::from_millis(100)
+        ));
+        assert!(started_at.elapsed() < Duration::from_secs(1));
+
+        let process_group = fs::read_to_string(pid_file)
+            .unwrap()
+            .trim()
+            .parse::<libc::pid_t>()
+            .unwrap();
+        let cleanup_deadline = Instant::now() + Duration::from_millis(500);
+        let result = loop {
+            // SAFETY: signal 0 only probes whether the dedicated process group remains.
+            let result = unsafe { libc::kill(-process_group, 0) };
+            if result == -1 || Instant::now() >= cleanup_deadline {
+                break result;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        assert_eq!(result, -1);
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ESRCH)
+        );
+    }
+
+    #[test]
+    fn launch_profile_readiness_is_single_flight_across_parallel_reads() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let calls = tmp.path().join("readiness.calls");
+        let launcher = executable(
+            &tmp.path().join("profile-readiness"),
+            &format!(
+                "#!/usr/bin/env sh\nprintf x >> {}\nsleep 0.2\n",
+                shell_words::quote(&calls.to_string_lossy())
+            ),
+        );
+        let profiles = AgentLaunchProfiles::from_json(
+            &json!([{
+                "id":"claude-gpt",
+                "label":"Claude GPT",
+                "agent":"claude",
+                "agent_bin":launcher,
+                "readiness_args":["--check"],
+            }])
+            .to_string(),
+        )
+        .unwrap();
+        let barrier = Arc::new(std::sync::Barrier::new(16));
+        let threads = (0..16)
+            .map(|_| {
+                let barrier = barrier.clone();
+                let profiles = profiles.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    profiles.ready_summaries()
+                })
+            })
+            .collect::<Vec<_>>();
+        for thread in threads {
+            thread.join().unwrap();
+        }
+
+        assert_eq!(fs::read_to_string(calls).unwrap(), "x");
+    }
+
+    #[test]
+    fn launch_profiles_reject_browser_like_or_ambiguous_configuration() {
+        let invalid = json!([{
+            "id": "../claude-gpt",
+            "label": "Claude GPT",
+            "agent": "claude",
+            "agent_bin": "/bin/false",
+        }])
+        .to_string();
+        assert!(AgentLaunchProfiles::from_json(&invalid).is_err());
+
+        let duplicate = json!([
+            {"id":"same","label":"One","agent":"claude","agent_bin":"/bin/false"},
+            {"id":"same","label":"Two","agent":"claude","agent_bin":"/bin/false"},
+        ])
+        .to_string();
+        assert!(AgentLaunchProfiles::from_json(&duplicate).is_err());
+    }
+
     #[tokio::test]
     async fn delete_tombstone_cleanup_starts_after_bind_and_is_bounded() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -6932,6 +7443,7 @@ mod tests {
             codex_controls: Arc::new(StdMutex::new(HashMap::new())),
             codex_account_switches: CodexAccountSwitchRegistry::default(),
             session_collector,
+            launch_profiles: AgentLaunchProfiles::default(),
         })
     }
 
@@ -10036,6 +10548,131 @@ esac
     }
 
     #[tokio::test]
+    async fn create_uses_and_persists_a_ready_server_launch_profile() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cwd = tmp.path().join("repo");
+        let config_dir = tmp.path().join(".claude-gpt");
+        fs::create_dir_all(&cwd).unwrap();
+        fs::create_dir_all(&config_dir).unwrap();
+        let launcher = fake_agent(tmp.path(), "claude-gpt");
+        let profiles = AgentLaunchProfiles::from_json(
+            &json!([{
+                "id":"claude-gpt",
+                "label":"Claude GPT",
+                "agent":"claude",
+                "agent_bin":launcher,
+                "provider_config_dir":config_dir,
+                "readiness_args":["--check"],
+                "auto_resume_supported":false,
+            }])
+            .to_string(),
+        )
+        .unwrap();
+        let log = tmp.path().join("tmux.log");
+        let tmux = logging_tmux(tmp.path(), &log);
+        let mut st = state(tmp.path(), Some(TOKEN), tmux);
+        Arc::get_mut(&mut st).unwrap().launch_profiles = profiles;
+
+        let (list_status, list_body) = call(router(st.clone()), get("/sessions")).await;
+        assert_eq!(list_status, StatusCode::OK, "body={list_body}");
+        assert_eq!(
+            list_body["data"]["agent_profiles"],
+            json!([{"id":"claude-gpt","label":"Claude GPT","agent":"claude"}])
+        );
+
+        let (status, body) = call(
+            router(st),
+            post_json(
+                "/sessions",
+                Some(TOKEN),
+                json!({
+                    "agent":"claude",
+                    "agent_profile":"claude-gpt",
+                    "id":"profiled-claude",
+                    "cwd":cwd,
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "body={body}");
+        assert_eq!(body["data"]["session"]["agent"], "claude");
+        assert_eq!(body["data"]["session"]["agent_profile"], "claude-gpt");
+        assert_eq!(body["data"]["session"]["auto_resume"]["supported"], false);
+
+        let record = load_session_record(
+            &CliContext {
+                state_dir: tmp.path().to_path_buf(),
+                host: None,
+            },
+            "profiled-claude",
+        )
+        .unwrap();
+        assert_eq!(record.agent_bin.as_deref(), launcher.to_str());
+        assert_eq!(crate::session_agent_profile(&record), Some("claude-gpt"));
+        assert_eq!(
+            crate::session_provider_config_dir(&record),
+            Some(config_dir)
+        );
+        assert!(!crate::session_profile_auto_resume_supported(&record));
+    }
+
+    #[tokio::test]
+    async fn create_rejects_unknown_mismatched_or_unready_launch_profiles() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let launcher = fake_agent(tmp.path(), "profile-agent");
+        let profiles = AgentLaunchProfiles::from_json(
+            &json!([{
+                "id":"codex-profile",
+                "label":"Codex Profile",
+                "agent":"codex",
+                "agent_bin":launcher,
+                "readiness_args":["--check"],
+            }])
+            .to_string(),
+        )
+        .unwrap();
+        let mut st = state(tmp.path(), Some(TOKEN), minimal_tmux(tmp.path()));
+        Arc::get_mut(&mut st).unwrap().launch_profiles = profiles;
+
+        let (status, body) = call(
+            router(st.clone()),
+            post_json(
+                "/sessions",
+                Some(TOKEN),
+                json!({"agent":"claude","agent_profile":"missing"}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"]["code"], "unknown-agent-profile");
+
+        let (status, body) = call(
+            router(st.clone()),
+            post_json(
+                "/sessions",
+                Some(TOKEN),
+                json!({"agent":"claude","agent_profile":"codex-profile"}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"]["code"], "agent-profile-agent-conflict");
+
+        fs::write(&launcher, "#!/usr/bin/env sh\nexit 1\n").unwrap();
+        let (status, body) = call(
+            router(st),
+            post_json(
+                "/sessions",
+                Some(TOKEN),
+                json!({"agent":"codex","agent_profile":"codex-profile"}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(body["error"]["code"], "agent-profile-unavailable");
+    }
+
+    #[tokio::test]
     async fn create_imports_codex_session_from_provider_resume_id() {
         let lock = GlobalStateLock::new();
         let tmp = tempfile::TempDir::new().unwrap();
@@ -11034,6 +11671,100 @@ esac
     }
 
     #[tokio::test]
+    async fn resume_rejects_a_profile_removed_from_the_server_registry() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cwd = tmp.path().join("repo");
+        fs::create_dir_all(&cwd).unwrap();
+        let log = tmp.path().join("tmux.log");
+        let tmux = resume_tmux(tmp.path(), &log);
+        let launcher = fake_agent(tmp.path(), "claude-gpt");
+        seed_resumable_session(
+            tmp.path(),
+            "revoked-profile",
+            "claude",
+            "hs-claude-revoked-profile",
+            &cwd,
+            &["--resume", "resume-session-id"],
+        );
+        let record_path = tmp.path().join("sessions/revoked-profile/session.json");
+        let mut record: Value = serde_json::from_slice(&fs::read(&record_path).unwrap()).unwrap();
+        record["agent_bin"] = json!(launcher);
+        record["runtime"]["agent_profile"] = json!("claude-gpt");
+        fs::write(&record_path, serde_json::to_vec_pretty(&record).unwrap()).unwrap();
+
+        let (status, body) = call(
+            router(state(tmp.path(), Some(TOKEN), tmux)),
+            post_json("/sessions/revoked-profile/resume", Some(TOKEN), json!({})),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "body={body}");
+        assert_eq!(body["error"]["code"], "agent-profile-unavailable");
+        let calls = fs::read_to_string(log).unwrap_or_default();
+        assert!(
+            !calls.contains("new-session"),
+            "body={body}, calls={calls:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn resume_rejects_stale_profile_auto_resume_capability() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cwd = tmp.path().join("repo");
+        fs::create_dir_all(&cwd).unwrap();
+        let log = tmp.path().join("tmux.log");
+        let tmux = resume_tmux(tmp.path(), &log);
+        let launcher = fake_agent(tmp.path(), "claude-gpt");
+        seed_resumable_session(
+            tmp.path(),
+            "stale-profile-capability",
+            "claude",
+            "hs-claude-stale-profile-capability",
+            &cwd,
+            &["--resume", "resume-session-id"],
+        );
+        let record_path = tmp
+            .path()
+            .join("sessions/stale-profile-capability/session.json");
+        let mut record: Value = serde_json::from_slice(&fs::read(&record_path).unwrap()).unwrap();
+        record["agent_bin"] = json!(launcher);
+        record["runtime"]["agent_profile"] = json!("claude-gpt");
+        record["runtime"]["agent_profile_auto_resume_supported"] = json!(true);
+        fs::write(&record_path, serde_json::to_vec_pretty(&record).unwrap()).unwrap();
+        let profiles = AgentLaunchProfiles::from_json(
+            &json!([{
+                "id":"claude-gpt",
+                "label":"Claude GPT",
+                "agent":"claude",
+                "agent_bin":launcher,
+                "auto_resume_supported":false,
+            }])
+            .to_string(),
+        )
+        .unwrap();
+        let mut st = state(tmp.path(), Some(TOKEN), tmux);
+        Arc::get_mut(&mut st).unwrap().launch_profiles = profiles;
+
+        let (status, body) = call(
+            router(st),
+            post_json(
+                "/sessions/stale-profile-capability/resume",
+                Some(TOKEN),
+                json!({}),
+            ),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "body={body}");
+        assert_eq!(body["error"]["code"], "agent-profile-unavailable");
+        let calls = fs::read_to_string(log).unwrap_or_default();
+        assert!(
+            !calls.contains("new-session"),
+            "body={body}, calls={calls:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn resume_api_rejects_unprovable_pre_upgrade_codex_and_claude_runtimes() {
         let tmp = tempfile::TempDir::new().unwrap();
         let cwd = tmp.path().join("repo");
@@ -11721,6 +12452,72 @@ esac
             calls.contains("--resume resume-session-id"),
             "maintenance must preserve Claude's exact resume form: {calls:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn maintenance_resume_actions_reject_a_removed_profile_before_mutation() {
+        for (suffix, action, confirmed) in [
+            ("retry", "retry_resume", false),
+            ("terminate", "terminate_runtime_then_resume", true),
+        ] {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let cwd = tmp.path().join("repo");
+            fs::create_dir_all(&cwd).unwrap();
+            let id = format!("maintenance-revoked-profile-{suffix}");
+            seed_resumable_session(
+                tmp.path(),
+                &id,
+                "claude",
+                &format!("hs-claude-maintenance-revoked-{suffix}"),
+                &cwd,
+                &["--resume", "resume-session-id"],
+            );
+            let record_path = tmp.path().join("sessions").join(&id).join("session.json");
+            let mut record: Value =
+                serde_json::from_slice(&fs::read(&record_path).unwrap()).unwrap();
+            record["agent_bin"] = json!(fake_agent(tmp.path(), &format!("claude-gpt-{suffix}")));
+            record["runtime"]["agent_profile"] = json!("claude-gpt");
+            record["runtime"]["agent_profile_auto_resume_supported"] = json!(false);
+            fs::write(&record_path, serde_json::to_vec_pretty(&record).unwrap()).unwrap();
+            let log = tmp.path().join("tmux.log");
+            let st = state(tmp.path(), Some(TOKEN), resume_tmux(tmp.path(), &log));
+
+            let (status, preview) = call(
+                router(st.clone()),
+                get_auth(
+                    &format!("/sessions/{id}/maintenance?operation=resume"),
+                    Some(TOKEN),
+                ),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "body={preview}");
+            let maintenance = &preview["data"]["maintenance"];
+
+            let (status, body) = call(
+                router(st),
+                post_json(
+                    &format!("/sessions/{id}/maintenance/actions"),
+                    Some(TOKEN),
+                    json!({
+                        "operation": "resume",
+                        "action": action,
+                        "expected_session_incarnation": maintenance["session_incarnation"],
+                        "expected_session_generation": maintenance["session_generation"],
+                        "expected_preview_digest": maintenance["preview_digest"],
+                        "confirmed": confirmed,
+                    }),
+                ),
+            )
+            .await;
+
+            assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "body={body}");
+            assert_eq!(body["error"]["code"], "agent-profile-unavailable");
+            let calls = fs::read_to_string(log).unwrap_or_default();
+            assert!(
+                !calls.contains("new-session"),
+                "body={body}, calls={calls:?}"
+            );
+        }
     }
 
     #[tokio::test]

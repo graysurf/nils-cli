@@ -528,14 +528,15 @@ fn hex_digest(bytes: impl AsRef<[u8]>) -> String {
     encoded
 }
 
-pub(crate) fn execute(
+pub(crate) fn execute_with_resume_guard(
     context: &CliContext,
     id: &str,
     tmux_bin: &Path,
     request: MaintenanceActionRequest,
+    resume_guard: impl Fn(&SessionRecord) -> Result<(), CliError>,
 ) -> Result<MaintenanceActionResult, CliError> {
     let operation = request.operation;
-    execute_inner(context, id, tmux_bin, request)
+    execute_inner(context, id, tmux_bin, request, &resume_guard)
         .map_err(|error| sanitize_maintenance_error(id, operation, error))
 }
 
@@ -544,6 +545,7 @@ fn execute_inner(
     id: &str,
     tmux_bin: &Path,
     request: MaintenanceActionRequest,
+    resume_guard: &impl Fn(&SessionRecord) -> Result<(), CliError>,
 ) -> Result<MaintenanceActionResult, CliError> {
     let requested_operation = request.operation;
     validate_action_pair(requested_operation, request.action)?;
@@ -571,6 +573,13 @@ fn execute_inner(
         || preview.preview_digest != request.expected_preview_digest
     {
         return Err(stale_preview_error(&record));
+    }
+
+    if matches!(
+        request.action,
+        MaintenanceActionId::RetryResume | MaintenanceActionId::TerminateRuntimeThenResume
+    ) {
+        resume_guard(&record)?;
     }
 
     if matches!(
@@ -793,6 +802,7 @@ fn sanitize_maintenance_error(
             | "invalid-maintenance-preview-digest"
             | "maintenance-confirmation-required"
             | "session-maintenance-failed"
+            | "agent-profile-unavailable"
     ) {
         return error;
     }

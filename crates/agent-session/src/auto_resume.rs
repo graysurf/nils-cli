@@ -84,7 +84,8 @@ fn supported(record: &SessionRecord) -> bool {
     // signal. Codex is supported only when this exact runtime was launched
     // through the app-server v2 protocol; the standalone TUI notification
     // surface remains fail-closed because it has no structured failure reason.
-    record.agent == "claude" || crate::codex_app_server::runtime_is_supported(record)
+    crate::session_profile_auto_resume_supported(record)
+        && (record.agent == "claude" || crate::codex_app_server::runtime_is_supported(record))
 }
 
 fn default_state(now: &str) -> DurableAutoResume {
@@ -946,6 +947,18 @@ mod tests {
         (context, record)
     }
 
+    #[test]
+    fn launch_profile_can_fail_closed_auto_resume_support() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (_, mut record) = seed_session(&tmp);
+        record.runtime.as_mut().unwrap().extra.insert(
+            "agent_profile_auto_resume_supported".to_string(),
+            json!(false),
+        );
+
+        assert!(!supported(&record));
+    }
+
     fn waiting_revision(context: &CliContext, record: &SessionRecord) -> u64 {
         let started = json!({
             "schema_version": "agent-session.turn-event.v1",
@@ -1548,6 +1561,53 @@ mod tests {
         assert!(view.supported);
         assert!(view.enabled);
         assert_eq!(view.state, "enabled");
+    }
+
+    #[test]
+    fn profiled_app_server_codex_requires_explicit_auto_resume_support() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (_, mut record) = seed_session(&tmp);
+        record.agent = "codex".to_string();
+        {
+            let runtime = record.runtime.as_mut().unwrap();
+            runtime.kind = "codex_app_server".to_string();
+            runtime
+                .extra
+                .insert("agent_profile".to_string(), json!("codex-custom"));
+            runtime
+                .extra
+                .insert("codex_app_server_protocol".to_string(), json!("v2"));
+            for (key, suffix) in [
+                ("codex_app_server_socket", "sock"),
+                ("codex_app_server_proxy", "proxy"),
+                ("codex_app_server_thread_handoff", "thread"),
+                ("codex_app_server_thread_attached", "attached"),
+            ] {
+                runtime.extra.insert(
+                    key.to_string(),
+                    json!(format!(
+                        "/run/user/1000/agent-session/codex-profile.{suffix}"
+                    )),
+                );
+            }
+        }
+
+        assert!(!supported(&record));
+        record.runtime.as_mut().unwrap().extra.insert(
+            "agent_profile_auto_resume_supported".to_string(),
+            json!("invalid"),
+        );
+        assert!(!supported(&record));
+        record.runtime.as_mut().unwrap().extra.insert(
+            "agent_profile_auto_resume_supported".to_string(),
+            json!(false),
+        );
+        assert!(!supported(&record));
+        record.runtime.as_mut().unwrap().extra.insert(
+            "agent_profile_auto_resume_supported".to_string(),
+            json!(true),
+        );
+        assert!(supported(&record));
     }
 
     #[test]
