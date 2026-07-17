@@ -138,6 +138,20 @@ _arguments "${_arguments_options[@]}" : \
 '--help[Print help (see more with '\''--help'\'')]' \
 && ret=0
 ;;
+(prepare)
+_arguments "${_arguments_options[@]}" : \
+'--session-id=[]:ID:_default' \
+'--product=[]:PRODUCT:(codex claude hermes)' \
+'--state-home=[]:DIR:_files' \
+'--format=[]:FORMAT:(text json)' \
+'*--intent=[]:INTENT:_default' \
+'--docs-home=[Override the docs-home root (otherwise derived from the install symlink)]:PATH:_files' \
+'--project-path=[Override the project root path]:PATH:_files' \
+'--worktree-fallback=[Project worktree fallback mode]:MODE:(auto local-only)' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+&& ret=0
+;;
 (status)
 _arguments "${_arguments_options[@]}" : \
 '--session-id=[]:ID:_default' \
@@ -237,6 +251,7 @@ _agent-docs__subcmd__remove_commands() {
 _agent-docs__subcmd__session_commands() {
     local commands; commands=(
 'activate:Strictly preflight and atomically activate one or more declared intents' \
+'prepare:Atomically prepare one or more declared intents (activate + strict preflight) and report a stable JSON result usable by a runtime hook' \
 'status:Show active intents for the current session/project/product scope' \
 'verify:Re-resolve the catalog and verify required intents are active and fresh' \
     )
@@ -246,6 +261,11 @@ _agent-docs__subcmd__session_commands() {
 _agent-docs__subcmd__session__subcmd__activate_commands() {
     local commands; commands=()
     _describe -t commands 'agent-docs session activate commands' commands "$@"
+}
+(( $+functions[_agent-docs__subcmd__session__subcmd__prepare_commands] )) ||
+_agent-docs__subcmd__session__subcmd__prepare_commands() {
+    local commands; commands=()
+    _describe -t commands 'agent-docs session prepare commands' commands "$@"
 }
 (( $+functions[_agent-docs__subcmd__session__subcmd__status_commands] )) ||
 _agent-docs__subcmd__session__subcmd__status_commands() {
