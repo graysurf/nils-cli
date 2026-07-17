@@ -25,6 +25,10 @@ static HERMETIC_STATE_DIR: LazyLock<tempfile::TempDir> = LazyLock::new(|| {
 pub fn plan_issue_cmd_options() -> CmdOptions {
     CmdOptions::new()
         .with_cwd(Path::new(env!("CARGO_MANIFEST_DIR")))
+        // Test-local PATH stubs must remain authoritative even when the host
+        // exports a production forge-cli override. Individual tests can add a
+        // deliberate override after this shared baseline.
+        .with_env_remove("FORGE_CLI_BIN")
         .with_env(
             "PLAN_ISSUE_HOME",
             HERMETIC_STATE_DIR

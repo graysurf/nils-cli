@@ -16,7 +16,7 @@ use crate::cli::{
 };
 use crate::envelope::emit_success;
 use crate::error::ForgeError;
-use crate::ops::pr_comment;
+use crate::ops::{pr_comment, pr_reviews};
 use crate::provider::{Provider, ProviderContext, detect, git_remote_url};
 use crate::rate_limit::default_runner;
 use crate::validations::{no_escaped_control_markdown, no_local_path};
@@ -36,7 +36,7 @@ const REVIEW_THREAD_BODY_MAX_BYTES: usize = 16 * 1024;
 const MIRROR_URL_PENDING: &str = "<pending>";
 
 const GITHUB_REVIEW_TARGET_QUERY: &str = "query($owner: String!, $name: String!, $number: Int!) { repository(owner: $owner, name: $name) { pullRequest(number: $number) { id url } } }";
-const GITHUB_ADD_PENDING_REVIEW_MUTATION: &str = "mutation($pullRequestId: ID!) { addPullRequestReview(input: {pullRequestId: $pullRequestId}) { pullRequestReview { id url } } }";
+const GITHUB_ADD_PENDING_REVIEW_MUTATION: &str = "mutation($pullRequestId: ID!, $commitOID: GitObjectID!) { addPullRequestReview(input: {pullRequestId: $pullRequestId, commitOID: $commitOID}) { pullRequestReview { id url } } }";
 const GITHUB_ADD_REVIEW_THREAD_MUTATION: &str = "mutation($reviewId: ID!, $path: String!, $body: String!, $line: Int, $side: DiffSide!, $startLine: Int, $startSide: DiffSide, $subjectType: PullRequestReviewThreadSubjectType!) { addPullRequestReviewThread(input: {pullRequestReviewId: $reviewId, path: $path, body: $body, line: $line, side: $side, startLine: $startLine, startSide: $startSide, subjectType: $subjectType}) { thread { id path line subjectType comments(first: 1) { nodes { url } } } } }";
 const GITHUB_SUBMIT_REVIEW_MUTATION: &str = "mutation($reviewId: ID!, $event: PullRequestReviewEvent!, $body: String) { submitPullRequestReview(input: {pullRequestReviewId: $reviewId, event: $event, body: $body}) { pullRequestReview { url } } }";
 const GITHUB_DELETE_PENDING_REVIEW_MUTATION: &str = "mutation($reviewId: ID!) { deletePullRequestReview(input: {pullRequestReviewId: $reviewId}) { pullRequestReview { id url } } }";
@@ -67,6 +67,8 @@ pub struct PrReviewPayload {
     /// (`--submit-review`); `false` when an outcome comment was posted. When
     /// `true`, `pr_comment_url` holds the `#pullrequestreview-` object URL.
     pub submitted_review: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub head_sha: Option<String>,
     pub pr_comment_url: String,
     pub issue_number: Option<u64>,
     pub issue_comment_url: Option<String>,
@@ -84,10 +86,15 @@ struct PrReviewDryRunPayload {
     /// `true` when the live run would submit a native review event
     /// (`--submit-review`); `false` for the outcome-comment form.
     submitted_review: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    head_sha: Option<String>,
     /// GitHub-only PR-existence guard read that runs before the live post.
     /// `None` on GitLab / Local. Surfaced so dry-run renders every backend
     /// command the live run performs.
     guard_plan: Option<Vec<String>>,
+    /// GitHub-only pending-review ownership snapshot that runs before any
+    /// native review mutation.
+    pending_review_guard_plan: Option<Vec<String>>,
     plan: Vec<String>,
     issue_number: Option<u64>,
     issue_plan: Option<Vec<String>>,
@@ -355,6 +362,27 @@ pub fn run_with<R: BackendRunner, F: Fn(&str) -> Option<String>>(
         None
     };
 
+    let expected_review_head = if args.submit_review {
+        Some(args.expected_head.as_deref().ok_or_else(|| {
+            ForgeError::validation(
+                schema_err(),
+                "expected_review_head_required",
+                "--submit-review requires --expected-head <SHA> so the native review cannot attach to an unreviewed PR head",
+                None,
+            )
+        })?)
+    } else {
+        if args.expected_head.is_some() {
+            return Err(ForgeError::validation(
+                schema_err(),
+                "expected_review_head_requires_submit_review",
+                "--expected-head is only valid with --submit-review",
+                None,
+            ));
+        }
+        None
+    };
+
     if global.dry_run {
         // dry-run must not touch a backend, so it cannot probe `glab` capability;
         // render the preferred non-resolvable GitLab form (the live run may pick
@@ -381,7 +409,11 @@ pub fn run_with<R: BackendRunner, F: Fn(&str) -> Option<String>>(
         } else {
             let (owner, name) = github_owner_name(&ctx)?;
             (
-                build_github_pending_review_call(&ctx, "<pull-request-id>"),
+                build_github_pending_review_call(
+                    &ctx,
+                    "<pull-request-id>",
+                    expected_review_head.expect("validated native review head"),
+                ),
                 Some(build_github_review_target_call(&ctx, owner, name, id).plan_argv()),
                 Some(
                     build_github_submit_review_call(
@@ -399,6 +431,15 @@ pub fn run_with<R: BackendRunner, F: Fn(&str) -> Option<String>>(
         let guard_plan = (ctx.provider == Provider::GitHub).then(|| {
             BackendCall::new(BackendProgram::Gh, github_pull_lookup_argv(&ctx, id)).plan_argv()
         });
+        let pending_review_guard_plan = if args.submit_review && ctx.provider == Provider::GitHub {
+            let (owner, name) = github_owner_name(&ctx)?;
+            Some(
+                pr_reviews::build_github_pending_reviews_call(&ctx, owner, name, id, None)
+                    .plan_argv(),
+            )
+        } else {
+            None
+        };
         let issue_plan = mirror_issue.map(|issue| {
             let mirror_body = build_issue_mirror_body(
                 ctx.provider,
@@ -416,7 +457,9 @@ pub fn run_with<R: BackendRunner, F: Fn(&str) -> Option<String>>(
                 number: id,
                 decision: args.decision.as_str(),
                 submitted_review: args.submit_review,
+                head_sha: expected_review_head.map(str::to_string),
                 guard_plan,
+                pending_review_guard_plan,
                 plan: pr_call.plan_argv(),
                 issue_number: args.issue,
                 issue_plan,
@@ -431,6 +474,12 @@ pub fn run_with<R: BackendRunner, F: Fn(&str) -> Option<String>>(
             |p| {
                 if let Some(guard) = p.guard_plan.as_ref() {
                     println!("would verify pull request: {plan}", plan = guard.join(" "));
+                }
+                if let Some(guard) = p.pending_review_guard_plan.as_ref() {
+                    println!(
+                        "would verify pending review ownership: {plan}",
+                        plan = guard.join(" ")
+                    );
                 }
                 if let Some(target) = p.target_plan.as_ref() {
                     println!(
@@ -471,6 +520,14 @@ pub fn run_with<R: BackendRunner, F: Fn(&str) -> Option<String>>(
     // is GitHub-only.
     if ctx.provider == Provider::GitHub {
         ensure_github_pull_request(runner, &ctx, id)?;
+        if args.submit_review {
+            ensure_no_viewer_pending_github_review(
+                runner,
+                &ctx,
+                id,
+                expected_review_head.expect("validated native review head"),
+            )?;
+        }
     }
 
     // GitLab only: probe which `mr note` form this `glab` build supports
@@ -497,6 +554,7 @@ pub fn run_with<R: BackendRunner, F: Fn(&str) -> Option<String>>(
             &ctx,
             id,
             args.decision,
+            expected_review_head.expect("validated native review head"),
             body_present.then_some(body.as_str()),
             &thread_specs,
         )?
@@ -528,6 +586,7 @@ pub fn run_with<R: BackendRunner, F: Fn(&str) -> Option<String>>(
             number: id,
             decision: args.decision.as_str(),
             submitted_review: args.submit_review,
+            head_sha: expected_review_head.map(str::to_string),
             pr_comment_url,
             issue_number: args.issue,
             issue_comment_url,
@@ -663,7 +722,8 @@ fn validate_args_with_parent_fallbacks(
 /// `#pullrequestreview-` object), otherwise the outcome-comment post. Used by
 /// both the dry-run plan and the live run so they never diverge. `glab_form` is
 /// only consulted on the GitLab comment path (native submission is GitHub-only,
-/// guarded earlier in `run_with`).
+/// guarded earlier in `run_with`). Native submission binds the provider
+/// mutation to the caller-reviewed `--expected-head`.
 fn build_review_post_call(
     ctx: &ProviderContext,
     id: u64,
@@ -678,7 +738,15 @@ fn build_review_post_call(
         let body_opt = body_present.then_some(body);
         BackendCall::new(
             BackendProgram::Gh,
-            github_review_submit_argv(ctx, id, event, body_opt),
+            github_review_submit_argv(
+                ctx,
+                id,
+                event,
+                args.expected_head
+                    .as_deref()
+                    .expect("validated native review head"),
+                body_opt,
+            ),
         )
     } else {
         build_pr_comment_call(ctx, id, body, glab_form)
@@ -1118,6 +1186,7 @@ fn submit_github_review_with_threads<R: BackendRunner>(
     ctx: &ProviderContext,
     number: u64,
     decision: PrReviewDecision,
+    expected_head: &str,
     body: Option<&str>,
     specs: &[PreparedReviewThreadSpec],
 ) -> Result<(String, Vec<CreatedReviewThread>), ForgeError> {
@@ -1129,6 +1198,7 @@ fn submit_github_review_with_threads<R: BackendRunner>(
     let pending_output = runner.run(&build_github_pending_review_call(
         ctx,
         &target.pull_request_id,
+        expected_head,
     ))?;
     let pending = parse_github_pending_review(&pending_output)?;
 
@@ -1241,7 +1311,7 @@ fn github_owner_name(ctx: &ProviderContext) -> Result<(&str, &str), ForgeError> 
         return Err(ForgeError::validation(
             schema_err(),
             "repo_required",
-            "pr review --thread-file requires --repo owner/name or a recognised GitHub remote",
+            "github native review submission requires --repo owner/name or a recognised GitHub remote",
             None,
         ));
     };
@@ -1249,7 +1319,7 @@ fn github_owner_name(ctx: &ProviderContext) -> Result<(&str, &str), ForgeError> 
         ForgeError::validation(
             schema_err(),
             "repo_required",
-            "pr review --thread-file requires a repo slug shaped as owner/name",
+            "github native review submission requires a repo slug shaped as owner/name",
             Some(format!("repo={repo}")),
         )
     })
@@ -1292,7 +1362,11 @@ fn build_github_pr_files_call(
     Ok(BackendCall::new(BackendProgram::Gh, argv))
 }
 
-fn build_github_pending_review_call(ctx: &ProviderContext, pull_request_id: &str) -> BackendCall {
+fn build_github_pending_review_call(
+    ctx: &ProviderContext,
+    pull_request_id: &str,
+    expected_head: &str,
+) -> BackendCall {
     let mut argv = vec![OsString::from("api"), OsString::from("graphql")];
     ctx.push_github_api_hostname(&mut argv);
     argv.extend([
@@ -1300,6 +1374,8 @@ fn build_github_pending_review_call(ctx: &ProviderContext, pull_request_id: &str
         OsString::from(format!("query={GITHUB_ADD_PENDING_REVIEW_MUTATION}")),
         OsString::from("-f"),
         OsString::from(format!("pullRequestId={pull_request_id}")),
+        OsString::from("-f"),
+        OsString::from(format!("commitOID={expected_head}")),
     ]);
     BackendCall::new(BackendProgram::Gh, argv)
 }
@@ -1652,6 +1728,7 @@ fn github_review_submit_argv(
     ctx: &ProviderContext,
     id: u64,
     event: &str,
+    expected_head: &str,
     body: Option<&str>,
 ) -> Vec<OsString> {
     let endpoint = ctx
@@ -1663,6 +1740,10 @@ fn github_review_submit_argv(
     ctx.push_github_api_hostname(&mut argv);
     argv.push(OsString::from(endpoint));
     argv.extend([OsString::from("--method"), OsString::from("POST")]);
+    argv.extend([
+        OsString::from("--raw-field"),
+        OsString::from(format!("commit_id={expected_head}")),
+    ]);
     if let Some(body) = body {
         argv.extend([
             OsString::from("--raw-field"),
@@ -1775,6 +1856,61 @@ fn ensure_github_pull_request<R: BackendRunner>(
         schema_err(),
         format!("failed to verify github pull request #{id} before posting the review outcome"),
         (!detail.is_empty()).then(|| detail.to_string()),
+    ))
+}
+
+/// Fail before any native-review mutation when the authenticated GitHub viewer
+/// already owns a pending review. GitHub otherwise reports an ambiguous HTTP
+/// 422 whose prose is not stable enough for machine-readable recovery.
+fn ensure_no_viewer_pending_github_review<R: BackendRunner>(
+    runner: &R,
+    ctx: &ProviderContext,
+    id: u64,
+    expected_head: &str,
+) -> Result<(), ForgeError> {
+    let repo = ctx.repo.as_deref().ok_or_else(|| {
+        ForgeError::validation(
+            schema_err(),
+            "repo_required",
+            "github native review preflight requires --repo owner/name or a recognised GitHub remote",
+            None,
+        )
+    })?;
+    let pr_url = format!("https://{host}/{repo}/pull/{id}", host = ctx.host);
+    let snapshot = pr_reviews::compute_pending_guards_for_pr(runner, ctx, id, &pr_url)?;
+    if snapshot.head_sha != expected_head {
+        return Err(ForgeError::validation(
+            schema_err(),
+            "github_review_head_changed",
+            "the provider PR head differs from the head supplied for native review submission",
+            Some(format!(
+                "expected_head={expected_head}; provider_head={provider_head}",
+                provider_head = snapshot.head_sha,
+            )),
+        ));
+    }
+    let pending_review_count = snapshot
+        .reviews
+        .iter()
+        .filter(|review| review.viewer_did_author)
+        .count();
+    if pending_review_count == 0 {
+        return Ok(());
+    }
+    let deletable_pending_review_count = snapshot
+        .reviews
+        .iter()
+        .filter(|review| review.viewer_did_author && review.viewer_can_delete)
+        .count();
+
+    Err(ForgeError::runtime_failure(
+        schema_err(),
+        "github_pending_review_exists",
+        "github native review submission is blocked because the authenticated viewer already owns a pending review",
+        Some(format!(
+            "provider=github; pr={id}; head_sha={head}; pending_review_count={pending_review_count}; deletable_pending_review_count={deletable_pending_review_count}; suggestion=inspect pr reviews and delete only the exact viewer-owned pending review bound to the expected PR head before retrying",
+            head = snapshot.head_sha,
+        )),
     ))
 }
 
@@ -1921,6 +2057,7 @@ mod tests {
             issue: None,
             mirror_issue: false,
             submit_review,
+            expected_head: submit_review.then(|| "head-44".to_string()),
             thread_file: None,
         }
     }
@@ -1952,6 +2089,7 @@ mod tests {
             &ctx(Some("acme/widgets")),
             44,
             "REQUEST_CHANGES",
+            "head-44",
             Some("nope"),
         );
         let joined = argv_joined(&argv);
@@ -1961,13 +2099,15 @@ mod tests {
         );
         assert!(joined.contains("--method POST"), "{joined}");
         assert!(joined.contains("event=REQUEST_CHANGES"), "{joined}");
+        assert!(joined.contains("commit_id=head-44"), "{joined}");
         assert!(joined.contains("body=nope"), "{joined}");
         assert!(joined.contains("--jq .html_url"), "{joined}");
     }
 
     #[test]
     fn submit_argv_omits_body_field_when_none() {
-        let argv = github_review_submit_argv(&ctx(Some("acme/widgets")), 44, "APPROVE", None);
+        let argv =
+            github_review_submit_argv(&ctx(Some("acme/widgets")), 44, "APPROVE", "head-44", None);
         let joined = argv_joined(&argv);
         assert!(joined.contains("event=APPROVE"), "{joined}");
         assert!(
@@ -1980,7 +2120,7 @@ mod tests {
     fn submit_argv_adds_hostname_for_enterprise_host() {
         let mut ctx = ctx(Some("acme/widgets"));
         ctx.host = "internal.ghe.com".into();
-        let argv = github_review_submit_argv(&ctx, 44, "COMMENT", Some("note"));
+        let argv = github_review_submit_argv(&ctx, 44, "COMMENT", "head-44", Some("note"));
         let strs: Vec<String> = argv
             .iter()
             .map(|s| s.to_string_lossy().into_owned())

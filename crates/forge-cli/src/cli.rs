@@ -506,6 +506,14 @@ pub struct PrReviewArgs {
     /// REQUEST_CHANGES and optional for APPROVE. GitHub-only in v1.
     #[arg(long = "submit-review", action = ArgAction::SetTrue)]
     pub submit_review: bool,
+    /// Full PR head SHA that was reviewed. Required with `--submit-review` and
+    /// bound to both the pending-review preflight and provider mutation.
+    #[arg(
+        long = "expected-head",
+        value_name = "SHA",
+        value_parser = clap::builder::NonEmptyStringValueParser::new()
+    )]
+    pub expected_head: Option<String>,
     /// Create or validate review threads from a JSON array of actionable
     /// findings (max 50 threads; 16 KiB body each). Requires --submit-review
     /// when posting; may be inherited by `validate` without posting. Omit this

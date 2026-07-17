@@ -24,7 +24,7 @@ cargo run -p nils-forge-cli -- pr deliver --kind feature --dry-run --format json
 cargo run -p nils-forge-cli -- pr review 123 --decision comments-only --comment-file review.md --mirror-issue --issue 456 --format json
 cargo run -p nils-forge-cli -- pr review validate --comment-file review.md --thread-file review-threads.json --format json
 cargo run -p nils-forge-cli -- pr review validate 123 --check-diff --comment-file review.md --thread-file review-threads.json --format json
-cargo run -p nils-forge-cli -- pr review 123 --decision comments-only --submit-review --comment-file review.md --thread-file review-threads.json --format json
+cargo run -p nils-forge-cli -- pr review 123 --decision comments-only --submit-review --expected-head <sha> --comment-file review.md --thread-file review-threads.json --format json
 cargo run -p nils-forge-cli -- pr reviews 123 --format json
 cargo run -p nils-forge-cli -- pr pending-review delete 123 --review PRR_pending --dry-run --format json
 cargo run -p nils-forge-cli -- pr merge 123 --review-convergence --format json
@@ -77,6 +77,13 @@ The command verifies PR membership, `PENDING` state, provider-native
 `viewerDidAuthor`, and `viewerCanDelete` before deleting that exact node. It
 works for GitHub App installation actors without relying on the user-only
 `GET /user` endpoint.
+
+`pr review --submit-review` requires `--expected-head <sha>`, performs the same
+pending-only ownership preflight, and compares the provider head before any
+native review mutation. A viewer-owned draft returns the typed
+`github_pending_review_exists` error with the provider head and counts; head
+drift returns `github_review_head_changed`; drafts owned by other viewers remain
+non-blocking. The expected head is also bound to the provider mutation.
 
 ## Inbox discovery
 
