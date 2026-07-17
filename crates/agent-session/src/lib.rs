@@ -4982,16 +4982,17 @@ pub(crate) fn session_provider_config_dir(record: &SessionRecord) -> Option<Path
     runtime_extra_string(record, AGENT_PROFILE_PROVIDER_CONFIG_DIR_RUNTIME_KEY).map(PathBuf::from)
 }
 
+pub(crate) fn session_profile_auto_resume_setting(record: &SessionRecord) -> Option<bool> {
+    record.runtime.as_ref().and_then(|runtime| {
+        runtime
+            .extra
+            .get(AGENT_PROFILE_AUTO_RESUME_SUPPORTED_RUNTIME_KEY)
+            .and_then(Value::as_bool)
+    })
+}
+
 pub(crate) fn session_profile_auto_resume_supported(record: &SessionRecord) -> bool {
-    let configured = record
-        .runtime
-        .as_ref()
-        .and_then(|runtime| {
-            runtime
-                .extra
-                .get(AGENT_PROFILE_AUTO_RESUME_SUPPORTED_RUNTIME_KEY)
-        })
-        .and_then(Value::as_bool);
+    let configured = session_profile_auto_resume_setting(record);
     if session_agent_profile(record).is_some() {
         configured == Some(true)
     } else {
@@ -9981,7 +9982,7 @@ mod tests {
                 .iter()
                 .any(|action| { action["id"] == "terminate_runtime_then_delete" })
         );
-        let result = crate::maintenance::execute(
+        let result = crate::maintenance::execute_with_resume_guard(
             &context,
             &id,
             &wrapper,
@@ -9995,6 +9996,7 @@ mod tests {
                 expected_preview_digest: preview["preview_digest"].as_str().unwrap().to_string(),
                 confirmed: true,
             },
+            |_| Ok(()),
         )
         .unwrap_or_else(|error| {
             let retained = load_session_record(&context, &id).unwrap();
