@@ -399,12 +399,17 @@ json\:"Single-record JSON envelope (snake_case)"))' \
             (delete)
 _arguments "${_arguments_options[@]}" : \
 '--review=[Pending review node id (\`PRR_...\`) returned by \`pr reviews\`]:REVIEW_ID:_default' \
+'--expected-head=[Pull-request head that must still be current immediately before deletion]:SHA:_default' \
+'--expected-commit=[Commit to which the pending review must still be bound]:SHA:_default' \
+'(--expected-body-file)--expected-body=[Exact pending-review body expected before deletion]:EXPECTED_BODY:_default' \
+'(--expected-body)--expected-body-file=[Read the exact expected pending-review body from a file. Use \`-\` for stdin]:PATH:_default' \
 '--format=[Output format (defaults to text)]:FORMAT:((text\:"Human-readable text output (default)"
 json\:"Single-record JSON envelope (snake_case)"))' \
 '--remote=[Git remote whose URL feeds provider detection (default\: \`origin\`)]:REMOTE:_default' \
 '--provider=[Override auto-detected provider]:PROVIDER:(github gitlab local)' \
 '--repo=[Override the repo slug (\`owner/name\`). When absent it is derived from the remote URL]:owner/name:_default' \
 '--store-root=[Root directory of the file-backed store used by \`--provider local\`. Overrides the \`FORGE_CLI_LOCAL_STORE\` env var]:path:_files' \
+'--confirm-abandoned[Confirm that the exact guarded pending review is an abandoned draft]' \
 '--dry-run[Validate and describe the planned operation without applying its mutation. Read-only preflight calls may still run]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
@@ -455,6 +460,7 @@ json\:"Single-record JSON envelope (snake_case)"))' \
 ;;
 (merge)
 _arguments "${_arguments_options[@]}" : \
+'--expected-head=[Compare-and-swap head verified by the caller before merge]:SHA:_default' \
 '--method=[Merge method override. When omitted, falls back to \`.forge-cli.toml \[merge\].method\` then the spec default \`squash\`]:METHOD:(squash merge rebase)' \
 '--review-convergence=[Override \`\[review_convergence\].require\`. Passing the flag without a value enables it; use \`--review-convergence=false\` to disable a repo or user-global opt-in for this invocation]::REVIEW_CONVERGENCE:(true false)' \
 '--allow-unchecked-tasks-reason=[Required when \`--allow-unchecked-tasks\` is set. Non-empty free-form text describing why the unchecked items are safe to merge past; the reason is recorded in the merge envelope payload]:TEXT:_default' \

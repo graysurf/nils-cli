@@ -125,7 +125,7 @@ Parity matrix (v1):
 | `pr review-threads resolve <id> --thread …` | `gh api graphql` (`addPullRequestReviewThreadReply` then `resolveReviewThread`)                                                              | unsupported in v1                                           | GitHub-only seam                                                                                                         |
 | `pr review-threads reply <id> --thread …`   | `gh api graphql` (`addPullRequestReviewThreadReply`)                                                                                         | unsupported in v1                                           | GitHub-only seam                                                                                                         |
 | `pr reviews <id>`                           | `gh api graphql` (native `reviews` connection plus `headRefOid`)                                                                             | unsupported in v1                                           | GitHub-only normalized current-head/stale review snapshot                                                                |
-| `pr pending-review delete <id> --review …`  | PR view + complete pending-only snapshot with viewer guards + `deletePullRequestReview`                                                      | unsupported in v1                                           | GitHub-only authenticated recovery for one exact pending review                                                          |
+| `pr pending-review delete <id> --review …`  | PR view + complete pending-only membership snapshot + exact-target final read with content/viewer/comment guards + `deletePullRequestReview` | unsupported in v1                                           | GitHub-only confirmed-abandoned recovery for one body-only pending review                                                |
 | `pr tasks <id>`                             | `gh pr view <id> --json number,url,body`                                                                                                     | `glab mr view <id> -F json` (`description`)                 | normalized task-list state                                                                                               |
 | `pr merge <id>`                             | `gh pr merge <id> --squash --delete-branch`                                                                                                  | `glab api --method PUT .../merge` after gates               | exact (method honoured per repo cfg)                                                                                     |
 | `pr close <id>`                             | `gh pr close <id>`                                                                                                                           | `glab mr close <id>`                                        | exact                                                                                                                    |
@@ -497,22 +497,43 @@ backend mapping, validation rules, and output schema versions.
 
 ### `pr pending-review delete`
 
-- `pr pending-review delete <id> --review <PRR_...>` emits
+- `pr pending-review delete <id> --review <PRR_...> --expected-head <sha>
+  --expected-commit <sha> (--expected-body <text> | --expected-body-file <path>)
+  --confirm-abandoned` emits
   `cli.forge-cli.pr.pending-review.delete.v1` and is a GitHub-only recovery
   primitive. GitLab and local return `provider_unsupported` (`USAGE 64`).
 - Before mutation it fetches the named PR, reads a complete paginated
-  pending-only review snapshot, and requires `--review` to name an entry with
-  provider-native `viewerDidAuthor: true` and `viewerCanDelete: true`. A missing
-  or already-submitted node returns `pending_review_not_found`; an ownership
-  mismatch returns `pending_review_author_mismatch`; a missing delete
-  capability returns `pending_review_not_deletable`. All are `DATA 65` and no
-  delete mutation runs. Submitted-review parsing is independent and cannot
-  block this recovery path.
-- After those guards, the command passes only the verified node id to
-  `deletePullRequestReview` and verifies the returned id. The success payload is
-  `data = { provider, number, url, head_sha, review_id, review_url, author,
-  deleted }`. `--dry-run` is offline and renders the PR guard, pending snapshot,
-  and exact delete plans.
+  pending-only membership snapshot while retaining only the named review body,
+  and requires `--review` to name an entry whose PR head, review commit, and
+  normalized body exactly match the required expected values. The entry must
+  also have provider-native
+  `viewerDidAuthor: true` and `viewerCanDelete: true`. A missing or
+  already-submitted node returns `pending_review_not_found`; ownership and
+  delete-capability failures return `pending_review_author_mismatch` and
+  `pending_review_not_deletable`; content drift returns the corresponding
+  `pending_review_*_mismatch`. Submitted-review parsing is independent and
+  cannot block this recovery path.
+- After the membership checks, the command reads the exact review node again
+  immediately before deletion. It revalidates PR membership, head, commit,
+  body, ownership, and delete capability. `pending_review_pr_mismatch` rejects
+  a moved or inconsistent target. Reviews with inline draft comments return
+  `pending_review_inline_comments_present` and require manual provider recovery;
+  this primitive deletes only confirmed abandoned body-only drafts.
+- Only the revalidated node id is passed to `deletePullRequestReview`, and the
+  returned id must match. The success payload is
+  `data = { provider, number, url, head_sha, commit_sha, review_id, review_url,
+  author, deleted }`. GitHub does not expose content compare-and-swap on this
+  deletion mutation, so a small residual race remains between the exact final
+  read and delete; explicit abandonment confirmation, immutable content guards,
+  and the inline-comment refusal bound that risk, but cannot remove it.
+- `--dry-run` is offline. It validates a named `--expected-body-file`, renders
+  the PR guard, complete snapshot, exact-target read, and delete plans, and
+  never emits the expected body or its file path.
+- Expected and provider review bodies are limited to 64 KiB. Inline values and
+  named files are checked before provider access; file and live stdin inputs use
+  bounded reads. Oversized expected input returns
+  `pending_review_body_too_large`, while an oversized provider body fails the
+  snapshot closed as `review_snapshot_incomplete`.
 
 ### `pr review`
 
@@ -704,6 +725,10 @@ backend mapping, validation rules, and output schema versions.
     dispositioned before merge);
   - `--method squash|merge|rebase` (default `squash`, configurable
     per repo).
+- Direct callers may pass `--expected-head <sha>`. The first provider snapshot
+  must still expose that exact head or the command returns
+  `test_first_evidence_provider_head_mismatch` before any merge mutation. The
+  same reviewed head remains bound through the provider merge compare-and-swap.
 - With convergence enabled, a complete native-review snapshot is fetched once
   more after the thread/task gates and immediately before the provider merge.
   A late request blocks; any other observed activity change returns
@@ -920,12 +945,21 @@ backend implementations cannot diverge.
     positional PR's review threads and confirming `--thread <id>` is present
     before posting a reply or resolving. `--dry-run` remains offline and skips
     this lookup.
-16. **Pending-review recovery ownership.** `pr pending-review delete` reads the
-    target PR's complete pending-review snapshot before mutation. The exact
-    `--review` node must be `PENDING`, belong to the target PR, report
-    `viewerDidAuthor: true`, and report `viewerCanDelete: true`. These
-    provider-native viewer fields support both user and GitHub App installation
-    actors without relying on the user-only `GET /user` endpoint.
+16. **Pending-review recovery ownership and content binding.**
+    `pr pending-review delete` requires `--confirm-abandoned`, exact expected PR
+    head and review commit values, plus an expected body or body file. It reads
+    the target PR's complete pending-review membership snapshot, then re-fetches
+    the exact `--review` node immediately before mutation. Both reads must still
+    show a matching `PENDING` body-only review on the named PR with
+    `viewerDidAuthor: true` and `viewerCanDelete: true`; head, commit, normalized
+    body, and PR membership are revalidated, and any inline comment requires
+    manual provider recovery. Expected and provider bodies must not exceed 64
+    KiB; file and stdin inputs are read with that bound, and complete pagination
+    retains only the target body. These provider-native viewer fields support
+    both user and GitHub App installation actors without relying on the
+    user-only `GET /user` endpoint. GitHub exposes no content CAS on the delete
+    mutation, so the documented final-read-to-delete race remains after these
+    guards.
 
 Violations map to `DATA 65` with one of these `data.error.kind` values:
 
@@ -976,7 +1010,7 @@ Violations map to `DATA 65` with one of these `data.error.kind` values:
 | `review_convergence_head_missing`          | 12                   |
 | `review_convergence_head_changed`          | 12                   |
 | `review_convergence_activity_changed`      | 12                   |
-| `review_snapshot_incomplete`               | 12                   |
+| `review_snapshot_incomplete`               | 12, 16               |
 | `invalid_review_convergence_config`        | 12                   |
 | `unresolved_review_threads`                | 13                   |
 | `unchecked_task_items`                     | 14                   |
@@ -984,6 +1018,12 @@ Violations map to `DATA 65` with one of these `data.error.kind` values:
 | `pending_review_not_found`                 | 16                   |
 | `pending_review_author_mismatch`           | 16                   |
 | `pending_review_not_deletable`             | 16                   |
+| `pending_review_head_mismatch`             | 16                   |
+| `pending_review_commit_mismatch`           | 16                   |
+| `pending_review_body_mismatch`             | 16                   |
+| `pending_review_body_too_large`            | 16                   |
+| `pending_review_pr_mismatch`               | 16                   |
+| `pending_review_inline_comments_present`   | 16                   |
 
 ## Activity output contract
 

@@ -20,9 +20,11 @@ pub const SCHEMA: &str = "pr.reviews";
 pub const SCHEMA_VERSION: u32 = 1;
 const MAX_SUMMARY_BYTES: usize = 4096;
 const MAX_REVIEW_PAGES: usize = 100;
+pub(crate) const MAX_PENDING_REVIEW_BODY_BYTES: usize = 64 * 1024;
 
 const GITHUB_REVIEWS_QUERY: &str = "query($owner: String!, $name: String!, $pr: Int!, $after: String) { repository(owner: $owner, name: $name) { pullRequest(number: $pr) { headRefOid reviews(first: 100, after: $after) { nodes { id databaseId url author { login } state commit { oid } submittedAt body } pageInfo { hasNextPage endCursor } } } } }";
-const GITHUB_PENDING_REVIEWS_QUERY: &str = "query($owner: String!, $name: String!, $pr: Int!, $after: String) { repository(owner: $owner, name: $name) { pullRequest(number: $pr) { headRefOid reviews(first: 100, after: $after, states: [PENDING]) { nodes { id url author { login } state viewerDidAuthor viewerCanDelete } pageInfo { hasNextPage endCursor } } } } }";
+const GITHUB_PENDING_REVIEWS_QUERY: &str = "query($owner: String!, $name: String!, $pr: Int!, $after: String) { repository(owner: $owner, name: $name) { pullRequest(number: $pr) { headRefOid reviews(first: 100, after: $after, states: [PENDING]) { nodes { id url author { login } state commit { oid } body viewerDidAuthor viewerCanDelete } pageInfo { hasNextPage endCursor } } } } }";
+const GITHUB_PENDING_REVIEW_TARGET_QUERY: &str = "query($review: ID!) { node(id: $review) { ... on PullRequestReview { id url author { login } state commit { oid } body viewerDidAuthor viewerCanDelete comments(first: 1) { totalCount } pullRequest { number url headRefOid } } } }";
 
 struct ReviewPage {
     head_sha: String,
@@ -74,6 +76,8 @@ pub(crate) struct PendingReviewGuard {
     pub id: String,
     pub url: String,
     pub author: String,
+    pub commit_sha: Option<String>,
+    pub body: String,
     pub viewer_did_author: bool,
     pub viewer_can_delete: bool,
 }
@@ -82,6 +86,15 @@ pub(crate) struct PendingReviewGuard {
 pub(crate) struct PendingReviewGuardSnapshot {
     pub head_sha: String,
     pub reviews: Vec<PendingReviewGuard>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PendingReviewTarget {
+    pub number: u64,
+    pub pr_url: String,
+    pub head_sha: String,
+    pub inline_comment_count: u64,
+    pub review: PendingReviewGuard,
 }
 
 /// Envelope payload for `cli.forge-cli.pr.reviews.v1`.
@@ -165,6 +178,29 @@ pub(crate) fn compute_pending_guards_for_pr<R: BackendRunner>(
     number: u64,
     pr_url: &str,
 ) -> Result<PendingReviewGuardSnapshot, ForgeError> {
+    compute_pending_guards_for_pr_matching(runner, ctx, number, pr_url, None)
+}
+
+/// Complete the pending-only pagination while retaining only the named review.
+/// Every page and node is still parsed and validated, but unrelated bodies are
+/// dropped before the next provider page is read.
+pub(crate) fn compute_pending_guard_for_pr<R: BackendRunner>(
+    runner: &R,
+    ctx: &ProviderContext,
+    number: u64,
+    pr_url: &str,
+    review_id: &str,
+) -> Result<PendingReviewGuardSnapshot, ForgeError> {
+    compute_pending_guards_for_pr_matching(runner, ctx, number, pr_url, Some(review_id))
+}
+
+fn compute_pending_guards_for_pr_matching<R: BackendRunner>(
+    runner: &R,
+    ctx: &ProviderContext,
+    number: u64,
+    pr_url: &str,
+    review_id: Option<&str>,
+) -> Result<PendingReviewGuardSnapshot, ForgeError> {
     ensure_github(ctx)?;
     let slug = github_repo_slug_from_url(pr_url).ok_or_else(|| {
         ForgeError::software(
@@ -202,7 +238,24 @@ pub(crate) fn compute_pending_guards_for_pr<R: BackendRunner>(
             ));
         }
         expected_head.get_or_insert(page.head_sha);
-        reviews.extend(page.reviews);
+        for mut review in page.reviews {
+            if review_id.is_some_and(|target| review.id != target) {
+                continue;
+            }
+            if review_id.is_some() && !reviews.is_empty() {
+                return Err(snapshot_incomplete(
+                    "pending review pagination returned the target more than once",
+                    Some(format!("review_id={}", review.id)),
+                ));
+            }
+            if review_id.is_none() {
+                // Native-review submission needs only viewer ownership and
+                // delete capability counts. Do not retain every provider body
+                // across the complete snapshot.
+                review.body = String::new();
+            }
+            reviews.push(review);
+        }
         if !page.has_next_page {
             return Ok(PendingReviewGuardSnapshot {
                 head_sha: expected_head.unwrap_or_default(),
@@ -228,6 +281,19 @@ pub(crate) fn compute_pending_guards_for_pr<R: BackendRunner>(
         "pending review pagination exceeded the safety page limit",
         Some(format!("max_pages={MAX_REVIEW_PAGES}")),
     ))
+}
+
+/// Re-fetch one exact pending review immediately before destructive recovery.
+/// This target-bound read prevents an early pagination page from becoming the
+/// final mutation authority.
+pub(crate) fn compute_pending_target<R: BackendRunner>(
+    runner: &R,
+    ctx: &ProviderContext,
+    review_id: &str,
+) -> Result<Option<PendingReviewTarget>, ForgeError> {
+    ensure_github(ctx)?;
+    let output = runner.run(&build_github_pending_review_target_call(ctx, review_id))?;
+    parse_github_pending_review_target(&output)
 }
 
 /// Deadline-aware variant used by merge convergence. The timeout covers the
@@ -385,6 +451,21 @@ pub(crate) fn build_github_pending_reviews_call(
             OsString::from(format!("after={after}")),
         ]);
     }
+    BackendCall::new(BackendProgram::Gh, argv)
+}
+
+pub(crate) fn build_github_pending_review_target_call(
+    ctx: &ProviderContext,
+    review_id: &str,
+) -> BackendCall {
+    let mut argv = vec![OsString::from("api"), OsString::from("graphql")];
+    ctx.push_github_api_hostname(&mut argv);
+    argv.extend([
+        OsString::from("-f"),
+        OsString::from(format!("query={GITHUB_PENDING_REVIEW_TARGET_QUERY}")),
+        OsString::from("-f"),
+        OsString::from(format!("review={review_id}")),
+    ]);
     BackendCall::new(BackendProgram::Gh, argv)
 }
 
@@ -548,10 +629,13 @@ fn parse_github_pending_review_page(
                     Some(format!("review_id={id}")),
                 ));
             }
+            let body = required_pending_review_body(node, &id)?;
             Ok(PendingReviewGuard {
                 id,
                 url: required_string(node, "/url", "review.url")?,
                 author: author.unwrap_or_else(|| "<unknown>".to_string()),
+                commit_sha: optional_string(node, "/commit/oid"),
+                body,
                 viewer_did_author,
                 viewer_can_delete,
             })
@@ -564,6 +648,93 @@ fn parse_github_pending_review_page(
         has_next_page,
         end_cursor,
     })
+}
+
+fn parse_github_pending_review_target(
+    output: &BackendSuccess,
+) -> Result<Option<PendingReviewTarget>, ForgeError> {
+    let value: serde_json::Value = serde_json::from_str(output.stdout.trim()).map_err(|err| {
+        ForgeError::software(
+            schema_err(),
+            "pending review target response is invalid JSON",
+            Some(err.to_string()),
+        )
+    })?;
+    if value
+        .get("errors")
+        .and_then(|errors| errors.as_array())
+        .is_some_and(|errors| !errors.is_empty())
+    {
+        return Err(snapshot_incomplete(
+            "GitHub returned partial pending-review target data",
+            Some(format!(
+                "graphql_errors={}",
+                value["errors"].as_array().map_or(0, Vec::len)
+            )),
+        ));
+    }
+    let node = value.pointer("/data/node").ok_or_else(|| {
+        snapshot_incomplete("pending review target response is missing node", None)
+    })?;
+    if node.is_null() {
+        return Ok(None);
+    }
+    let id = required_string(node, "/id", "review.id")?;
+    let state = required_review_state(node)?;
+    if state != "PENDING" {
+        return Ok(None);
+    }
+    let viewer_did_author = required_bool(node, "/viewerDidAuthor", "review.viewerDidAuthor")?;
+    let viewer_can_delete = required_bool(node, "/viewerCanDelete", "review.viewerCanDelete")?;
+    let author = optional_string(node, "/author/login");
+    if viewer_did_author && author.is_none() {
+        return Err(snapshot_incomplete(
+            "a viewer-owned pending review is missing author login",
+            Some(format!("review_id={id}")),
+        ));
+    }
+    let body = required_pending_review_body(node, &id)?;
+
+    Ok(Some(PendingReviewTarget {
+        number: required_u64(node, "/pullRequest/number", "review.pullRequest.number")?,
+        pr_url: required_string(node, "/pullRequest/url", "review.pullRequest.url")?,
+        head_sha: required_string(
+            node,
+            "/pullRequest/headRefOid",
+            "review.pullRequest.headRefOid",
+        )?,
+        inline_comment_count: required_u64(
+            node,
+            "/comments/totalCount",
+            "review.comments.totalCount",
+        )?,
+        review: PendingReviewGuard {
+            id,
+            url: required_string(node, "/url", "review.url")?,
+            author: author.unwrap_or_else(|| "<unknown>".to_string()),
+            commit_sha: optional_string(node, "/commit/oid"),
+            body,
+            viewer_did_author,
+            viewer_can_delete,
+        },
+    }))
+}
+
+fn required_pending_review_body(
+    node: &serde_json::Value,
+    review_id: &str,
+) -> Result<String, ForgeError> {
+    let body = required_string_allow_empty(node, "/body", "review.body")?;
+    if body.len() > MAX_PENDING_REVIEW_BODY_BYTES {
+        return Err(snapshot_incomplete(
+            "pending review body exceeds the recovery safety limit",
+            Some(format!(
+                "review_id={review_id}; body_bytes={}; max_bytes={MAX_PENDING_REVIEW_BODY_BYTES}",
+                body.len()
+            )),
+        ));
+    }
+    Ok(body)
 }
 
 fn required_review_state(node: &serde_json::Value) -> Result<String, ForgeError> {
@@ -601,6 +772,23 @@ fn required_string(
         })
 }
 
+fn required_string_allow_empty(
+    value: &serde_json::Value,
+    pointer: &str,
+    field: &str,
+) -> Result<String, ForgeError> {
+    value
+        .pointer(pointer)
+        .and_then(|item| item.as_str())
+        .map(str::to_string)
+        .ok_or_else(|| {
+            snapshot_incomplete(
+                "reviews response is missing a required field",
+                Some(format!("field={field}")),
+            )
+        })
+}
+
 fn required_bool(
     value: &serde_json::Value,
     pointer: &str,
@@ -609,6 +797,18 @@ fn required_bool(
     value
         .pointer(pointer)
         .and_then(|item| item.as_bool())
+        .ok_or_else(|| {
+            snapshot_incomplete(
+                "reviews response is missing a required field",
+                Some(format!("field={field}")),
+            )
+        })
+}
+
+fn required_u64(value: &serde_json::Value, pointer: &str, field: &str) -> Result<u64, ForgeError> {
+    value
+        .pointer(pointer)
+        .and_then(|item| item.as_u64())
         .ok_or_else(|| {
             snapshot_incomplete(
                 "reviews response is missing a required field",
