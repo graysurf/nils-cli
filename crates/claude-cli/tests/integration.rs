@@ -37,6 +37,10 @@ fn base_options(cache_dir: &Path) -> CmdOptions {
         .with_env_remove_prefix("CLAUDE_PROMPT")
         .with_env_remove("NO_COLOR")
         .with_env_remove("TZ")
+        .with_env(
+            "CLAUDE_CONFIG_DIR",
+            &path_str(&cache_dir.join("claude-config")),
+        )
         .with_env("CLAUDE_PROMPT_SEGMENT_CACHE_DIR", &path_str(cache_dir))
         .with_env("CLAUDE_PROMPT_SEGMENT_KEYCHAIN_DISABLED", "1")
 }

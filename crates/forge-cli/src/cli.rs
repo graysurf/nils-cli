@@ -623,8 +623,12 @@ pub struct PrTasksArgs {
 pub struct PrMergeArgs {
     /// Numeric PR / MR id.
     pub id: u64,
-    /// Macro-internal compare-and-swap head. Not exposed as a CLI flag.
-    #[arg(skip)]
+    /// Compare-and-swap head verified by the caller before merge.
+    #[arg(
+        long = "expected-head",
+        value_name = "SHA",
+        value_parser = clap::builder::NonEmptyStringValueParser::new()
+    )]
     pub expected_head_sha: Option<String>,
     /// Merge method override. When omitted, falls back to
     /// `.forge-cli.toml [merge].method` then the spec default `squash`.
@@ -707,6 +711,38 @@ pub struct PrPendingReviewDeleteArgs {
         value_parser = clap::builder::NonEmptyStringValueParser::new()
     )]
     pub review: String,
+    /// Pull-request head that must still be current immediately before deletion.
+    #[arg(
+        long = "expected-head",
+        value_name = "SHA",
+        value_parser = clap::builder::NonEmptyStringValueParser::new()
+    )]
+    pub expected_head: String,
+    /// Commit to which the pending review must still be bound.
+    #[arg(
+        long = "expected-commit",
+        value_name = "SHA",
+        value_parser = clap::builder::NonEmptyStringValueParser::new()
+    )]
+    pub expected_commit: String,
+    /// Exact pending-review body expected before deletion.
+    #[arg(
+        long = "expected-body",
+        conflicts_with = "expected_body_file",
+        required_unless_present = "expected_body_file"
+    )]
+    pub expected_body: Option<String>,
+    /// Read the exact expected pending-review body from a file. Use `-` for stdin.
+    #[arg(
+        long = "expected-body-file",
+        value_name = "PATH",
+        conflicts_with = "expected_body",
+        required_unless_present = "expected_body"
+    )]
+    pub expected_body_file: Option<String>,
+    /// Confirm that the exact guarded pending review is an abandoned draft.
+    #[arg(long = "confirm-abandoned", action = ArgAction::SetTrue, required = true)]
+    pub confirm_abandoned: bool,
 }
 
 /// CLI-facing merge method enum so clap can render `--method squash|merge|rebase`
@@ -1834,7 +1870,19 @@ mod tests {
                 "view" | "checks" | "wait-checks" => argv.push("1"),
                 // `review-threads` is a clean subcommand group: list via `list <id>`.
                 "review-threads" => argv.extend(["list", "1"]),
-                "pending-review" => argv.extend(["delete", "1", "--review", "PRR_pending"]),
+                "pending-review" => argv.extend([
+                    "delete",
+                    "1",
+                    "--review",
+                    "PRR_pending",
+                    "--expected-head",
+                    "head-reviewed",
+                    "--expected-commit",
+                    "head-reviewed",
+                    "--expected-body",
+                    "abandoned draft",
+                    "--confirm-abandoned",
+                ]),
                 "edit" | "comment" | "comments" | "ready" | "tasks" | "merge" | "close" => {
                     argv.push("1")
                 }
@@ -1940,6 +1988,13 @@ mod tests {
             "7",
             "--review",
             "PRR_pending",
+            "--expected-head",
+            "head-reviewed",
+            "--expected-commit",
+            "head-reviewed",
+            "--expected-body",
+            "abandoned draft",
+            "--confirm-abandoned",
         ])
         .expect("pending-review delete parses");
         match cli.command {
@@ -1951,6 +2006,11 @@ mod tests {
             })) => {
                 assert_eq!(args.id, 7);
                 assert_eq!(args.review, "PRR_pending");
+                assert_eq!(args.expected_head, "head-reviewed");
+                assert_eq!(args.expected_commit, "head-reviewed");
+                assert_eq!(args.expected_body.as_deref(), Some("abandoned draft"));
+                assert!(args.expected_body_file.is_none());
+                assert!(args.confirm_abandoned);
             }
             other => panic!("expected pending-review delete, got {other:?}"),
         }

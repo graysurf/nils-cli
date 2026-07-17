@@ -759,7 +759,7 @@ case "$2" in
   graphql)
     case "$*" in
       *"states: [PENDING]"*)
-        printf '%s\n' '{{"data":{{"repository":{{"pullRequest":{{"headRefOid":"head-44","reviews":{{"nodes":[{{"id":"PRR_other_pending","url":"https://github.com/acme/widgets/pull/44#pullrequestreview-9901","author":null,"state":"PENDING","viewerDidAuthor":false,"viewerCanDelete":false}}],"pageInfo":{{"hasNextPage":false,"endCursor":null}}}}}}}}}}}}'
+        printf '%s\n' '{{"data":{{"repository":{{"pullRequest":{{"headRefOid":"head-44","reviews":{{"nodes":[{{"id":"PRR_other_pending","url":"https://github.com/acme/widgets/pull/44#pullrequestreview-9901","author":null,"state":"PENDING","commit":null,"body":"","viewerDidAuthor":false,"viewerCanDelete":false}}],"pageInfo":{{"hasNextPage":false,"endCursor":null}}}}}}}}}}}}'
         ;;
       *)
         echo "stub: unexpected graphql payload: $*" >&2
@@ -838,7 +838,7 @@ case "$2" in
   graphql)
     case "$*" in
       *"states: [PENDING]"*)
-        printf '%s\n' '{{"data":{{"repository":{{"pullRequest":{{"headRefOid":"head-44","reviews":{{"nodes":[{{"id":"PRR_pending","url":"https://github.com/acme/widgets/pull/44#pullrequestreview-9911","author":{{"login":"review-bot"}},"state":"PENDING","viewerDidAuthor":true,"viewerCanDelete":false}}],"pageInfo":{{"hasNextPage":false,"endCursor":null}}}}}}}}}}}}'
+        printf '%s\n' '{{"data":{{"repository":{{"pullRequest":{{"headRefOid":"head-44","reviews":{{"nodes":[{{"id":"PRR_pending","url":"https://github.com/acme/widgets/pull/44#pullrequestreview-9911","author":{{"login":"review-bot"}},"state":"PENDING","commit":{{"oid":"head-44"}},"body":"Pending review","viewerDidAuthor":true,"viewerCanDelete":false}}],"pageInfo":{{"hasNextPage":false,"endCursor":null}}}}}}}}}}}}'
         ;;
       *)
         echo "stub: unexpected graphql payload: $*" >&2

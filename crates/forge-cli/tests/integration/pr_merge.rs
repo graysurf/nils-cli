@@ -316,6 +316,74 @@ fn pr_merge_dry_run_renders_squash_plan_with_delete_branch() {
 }
 
 #[test]
+fn pr_merge_expected_head_rejects_provider_drift_before_mutation() {
+    let tempdir = make_github_repo(None);
+    let repo_path = tempdir.path().join("repo");
+    let stub = StubEnv::new();
+    let merged = stub.tempdir.path().join("github-merged");
+    let body = github_merge_stub(&stub, "", "", false);
+    let stub = stub.gh_stub(&body);
+
+    let out = run_forge_cli_in(
+        &stub,
+        &[
+            "--provider",
+            "github",
+            "--format",
+            "json",
+            "pr",
+            "merge",
+            "7",
+            "--expected-head",
+            "head-reviewed",
+        ],
+        Some(&repo_path),
+    );
+
+    assert_eq!(out.code, 65, "stdout={}\nstderr={}", out.stdout, out.stderr);
+    let env = parse_envelope(&out.stdout);
+    assert_eq!(
+        env["error"]["code"],
+        "test_first_evidence_provider_head_mismatch"
+    );
+    assert!(
+        !merged.exists(),
+        "merge mutation must not run after head drift"
+    );
+}
+
+#[test]
+fn pr_merge_expected_head_allows_the_matching_provider_head() {
+    let tempdir = make_github_repo(None);
+    let repo_path = tempdir.path().join("repo");
+    let stub = StubEnv::new();
+    let merged = stub.tempdir.path().join("github-merged");
+    let body = github_merge_stub(&stub, "", "", true);
+    let stub = stub.gh_stub(&body);
+
+    let out = run_forge_cli_in(
+        &stub,
+        &[
+            "--provider",
+            "github",
+            "--format",
+            "json",
+            "pr",
+            "merge",
+            "7",
+            "--expected-head",
+            "head123",
+        ],
+        Some(&repo_path),
+    );
+
+    assert_eq!(out.code, 0, "stdout={}\nstderr={}", out.stdout, out.stderr);
+    let env = parse_envelope(&out.stdout);
+    assert_eq!(env["data"]["merge_sha"], "merge456");
+    assert!(merged.exists(), "matching reviewed head must reach merge");
+}
+
+#[test]
 fn pr_merge_github_dry_run_exposes_enabled_review_convergence() {
     let stub = StubEnv::new().gh_stub(FORBIDDEN_STUB);
     let out = run_forge_cli_in(

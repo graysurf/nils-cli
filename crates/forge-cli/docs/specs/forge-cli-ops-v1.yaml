@@ -469,6 +469,11 @@ operations:
     inputs:
       - { name: <id>, type: integer, required: true }
       - { name: --review, type: string, required: true }
+      - { name: --expected-head, type: string, required: true }
+      - { name: --expected-commit, type: string, required: true }
+      - { name: --expected-body, type: string, required: conditional } # mutually exclusive with --expected-body-file
+      - { name: --expected-body-file, type: path, required: conditional }
+      - { name: --confirm-abandoned, type: bool, required: true }
     dry_run:
       offline: true
       repo_resolution: "--repo owner/name or recognised forge remote"
@@ -476,10 +481,17 @@ operations:
       - pending_review_not_found
       - pending_review_author_mismatch
       - pending_review_not_deletable
+      - pending_review_head_mismatch
+      - pending_review_commit_mismatch
+      - pending_review_body_mismatch
+      - pending_review_body_too_large
+      - pending_review_pr_mismatch
+      - pending_review_inline_comments_present
     backends:
       github:
         - { program: gh, argv: [pr, view, "{id}", --json, "number,url,state,isDraft,baseRefName,headRefName,headRefOid,title,body"] }
-        - { program: gh, argv: [api, graphql, "--hostname <host when host != github.com>", -f, "query=<headRefOid and paginated PENDING reviews with viewerDidAuthor/viewerCanDelete>", -f, "owner={owner}", -f, "name={name}", -F, "pr={id}", "-f after={cursor}?"] }
+        - { program: gh, argv: [api, graphql, "--hostname <host when host != github.com>", -f, "query=<headRefOid and paginated PENDING reviews with commit/body/viewerDidAuthor/viewerCanDelete>", -f, "owner={owner}", -f, "name={name}", -F, "pr={id}", "-f after={cursor}?"] }
+        - { program: gh, argv: [api, graphql, "--hostname <host when host != github.com>", -f, "query=<exact PullRequestReview node with pullRequest, commit, body, viewer guards, and comments(first: 1) totalCount>", -f, "review={review_id}"] }
         - { program: gh, argv: [api, graphql, "--hostname <host when host != github.com>", -f, "query=<deletePullRequestReview>", -f, "reviewId={review_id}"] }
       gitlab: unsupported # provider_unsupported (USAGE 64)
       local: unsupported  # provider_unsupported (USAGE 64)
@@ -489,11 +501,12 @@ operations:
         number: integer
         url: string
         head_sha: string
+        commit_sha: string
         review_id: string
         review_url: string
         author: string
         deleted: boolean
-    notes: "the live command fetches the named PR and complete paginated pending-only review snapshot first; --review must identify a PENDING node with viewerDidAuthor and viewerCanDelete both true. Only then is that exact node id passed to deletePullRequestReview."
+    notes: "destructive recovery requires an explicit --confirm-abandoned acknowledgement plus exact expected PR head, review commit, and review body. Expected and provider bodies are limited to 64 KiB; file and stdin inputs use bounded reads. The live command reads and validates a complete paginated pending-only membership snapshot while retaining only the target body, then re-fetches the exact target node immediately before mutation and revalidates PR membership, PENDING state, head, commit, normalized body, viewerDidAuthor, and viewerCanDelete. Inline draft comments fail with pending_review_inline_comments_present and require manual provider recovery. Body values and body-file paths are never emitted; dry-run validates a named body file and includes the exact-target plan. Only the revalidated node id is passed to deletePullRequestReview. GitHub exposes no content CAS for that mutation, so a small final-read-to-delete race remains despite the explicit confirmation and guards."
 
   - id: pr.tasks
     schema_version: cli.forge-cli.pr.tasks.v1
@@ -517,6 +530,7 @@ operations:
     summary: Merge a ready PR/MR with the configured method.
     inputs:
       - { name: <id>,                       type: integer,                       required: true }
+      - { name: --expected-head,            type: string,                        default: null }
       - { name: --method,                   type: enum<squash|merge|rebase>,     default: squash }
       - { name: --keep-branch,              type: bool,                          default: false }
       - { name: --allow-non-default-base,   type: bool,                          default: false }
@@ -526,6 +540,7 @@ operations:
       - { name: --allow-unchecked-tasks-reason, type: string,                    default: null }
     validations:
       - worktree_clean
+      - test_first_evidence_provider_head_mismatch # when --expected-head is supplied, the first provider snapshot must still match it before merge mutation
       - draft_merge_refused
       - default_branch_protected
       - required_checks_green   # TTL-zero re-check

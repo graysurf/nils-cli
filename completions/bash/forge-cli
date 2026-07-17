@@ -3645,12 +3645,16 @@ _forge-cli() {
             return 0
             ;;
         forge__cli__pr__merge)
-            opts="-h --method --keep-branch --allow-non-default-base --allow-unresolved-threads --review-convergence --allow-unchecked-tasks --allow-unchecked-tasks-reason --format --remote --provider --repo --store-root --dry-run --help"
+            opts="-h --expected-head --method --keep-branch --allow-non-default-base --allow-unresolved-threads --review-convergence --allow-unchecked-tasks --allow-unchecked-tasks-reason --format --remote --provider --repo --store-root --dry-run --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
             fi
             case "${prev}" in
+                --expected-head)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
                 --method)
                     COMPREPLY=($(compgen -W "squash merge rebase" -- "${cur}"))
                     return 0
@@ -3725,13 +3729,29 @@ _forge-cli() {
             return 0
             ;;
         forge__cli__pr__pending__review__delete)
-            opts="-h --review --format --remote --provider --repo --store-root --dry-run --help"
+            opts="-h --review --expected-head --expected-commit --expected-body --expected-body-file --confirm-abandoned --format --remote --provider --repo --store-root --dry-run --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
             fi
             case "${prev}" in
                 --review)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --expected-head)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --expected-commit)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --expected-body)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --expected-body-file)
                     COMPREPLY=($(compgen -f "${cur}"))
                     return 0
                     ;;

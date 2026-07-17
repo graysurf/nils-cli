@@ -26,8 +26,8 @@ cargo run -p nils-forge-cli -- pr review validate --comment-file review.md --thr
 cargo run -p nils-forge-cli -- pr review validate 123 --check-diff --comment-file review.md --thread-file review-threads.json --format json
 cargo run -p nils-forge-cli -- pr review 123 --decision comments-only --submit-review --expected-head <sha> --comment-file review.md --thread-file review-threads.json --format json
 cargo run -p nils-forge-cli -- pr reviews 123 --format json
-cargo run -p nils-forge-cli -- pr pending-review delete 123 --review PRR_pending --dry-run --format json
-cargo run -p nils-forge-cli -- pr merge 123 --review-convergence --format json
+cargo run -p nils-forge-cli -- pr pending-review delete 123 --review PRR_pending --expected-head <sha> --expected-commit <sha> --expected-body-file review.md --confirm-abandoned --dry-run --format json
+cargo run -p nils-forge-cli -- pr merge 123 --expected-head <reviewed-sha> --review-convergence --format json
 cargo run -p nils-forge-cli -- repo push-default --expected-base <sha> --reason-file reason.md --dry-run --format json
 ```
 
@@ -72,11 +72,23 @@ bounds, and the JSON snapshot.
 
 Provider-valid pending reviews are listed separately under
 `pr reviews data.pending_reviews`; they are not submitted review activity. To
-recover a stuck draft, copy its `PRR_...` id into `pr pending-review delete`.
-The command verifies PR membership, `PENDING` state, provider-native
-`viewerDidAuthor`, and `viewerCanDelete` before deleting that exact node. It
-works for GitHub App installation actors without relying on the user-only
-`GET /user` endpoint.
+recover a confirmed abandoned draft, copy its `PRR_...` id, head, commit, and
+body into `pr pending-review delete` and pass `--confirm-abandoned`. The command
+reads the complete pending membership snapshot, then re-fetches the exact node
+and verifies those content guards, PR membership, `PENDING` state,
+provider-native `viewerDidAuthor`, and `viewerCanDelete` immediately before
+deleting it. Drafts with inline comments fail closed and require manual provider
+recovery. It works for GitHub App installation actors without relying on the
+user-only `GET /user` endpoint. The pending body and body-file path are never
+emitted by the delete command. Expected and provider bodies are limited to 64
+KiB, file and stdin inputs use bounded reads, and complete pagination retains
+only the target body. GitHub provides no content CAS for the deletion, so an
+unavoidable small race remains between the final exact-node read and the
+mutation.
+
+Direct `pr merge` callers can pass `--expected-head <sha>` to bind the merge to
+the head they reviewed. Provider drift then fails before the merge mutation;
+`pr deliver` uses the same compare-and-swap internally.
 
 `pr review --submit-review` requires `--expected-head <sha>`, performs the same
 pending-only ownership preflight, and compares the provider head before any
