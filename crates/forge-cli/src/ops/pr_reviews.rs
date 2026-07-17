@@ -537,20 +537,23 @@ fn parse_github_pending_review_page(
                     Some(format!("review_id={id}; state={state}")),
                 ));
             }
+            let viewer_did_author =
+                required_bool(node, "/viewerDidAuthor", "review.viewerDidAuthor")?;
+            let viewer_can_delete =
+                required_bool(node, "/viewerCanDelete", "review.viewerCanDelete")?;
+            let author = optional_string(node, "/author/login");
+            if viewer_did_author && author.is_none() {
+                return Err(snapshot_incomplete(
+                    "a viewer-owned pending review is missing author login",
+                    Some(format!("review_id={id}")),
+                ));
+            }
             Ok(PendingReviewGuard {
                 id,
                 url: required_string(node, "/url", "review.url")?,
-                author: required_string(node, "/author/login", "review.author.login")?,
-                viewer_did_author: required_bool(
-                    node,
-                    "/viewerDidAuthor",
-                    "review.viewerDidAuthor",
-                )?,
-                viewer_can_delete: required_bool(
-                    node,
-                    "/viewerCanDelete",
-                    "review.viewerCanDelete",
-                )?,
+                author: author.unwrap_or_else(|| "<unknown>".to_string()),
+                viewer_did_author,
+                viewer_can_delete,
             })
         })
         .collect::<Result<Vec<_>, ForgeError>>()?;

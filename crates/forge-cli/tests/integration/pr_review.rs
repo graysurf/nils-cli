@@ -759,7 +759,7 @@ case "$2" in
   graphql)
     case "$*" in
       *"states: [PENDING]"*)
-        printf '%s\n' '{{"data":{{"repository":{{"pullRequest":{{"headRefOid":"head-44","reviews":{{"nodes":[{{"id":"PRR_other_pending","url":"https://github.com/acme/widgets/pull/44#pullrequestreview-9901","author":{{"login":"other-reviewer"}},"state":"PENDING","viewerDidAuthor":false,"viewerCanDelete":false}}],"pageInfo":{{"hasNextPage":false,"endCursor":null}}}}}}}}}}}}'
+        printf '%s\n' '{{"data":{{"repository":{{"pullRequest":{{"headRefOid":"head-44","reviews":{{"nodes":[{{"id":"PRR_other_pending","url":"https://github.com/acme/widgets/pull/44#pullrequestreview-9901","author":null,"state":"PENDING","viewerDidAuthor":false,"viewerCanDelete":false}}],"pageInfo":{{"hasNextPage":false,"endCursor":null}}}}}}}}}}}}'
         ;;
       *)
         echo "stub: unexpected graphql payload: $*" >&2
@@ -838,7 +838,7 @@ case "$2" in
   graphql)
     case "$*" in
       *"states: [PENDING]"*)
-        printf '%s\n' '{{"data":{{"repository":{{"pullRequest":{{"headRefOid":"head-44","reviews":{{"nodes":[{{"id":"PRR_pending","url":"https://github.com/acme/widgets/pull/44#pullrequestreview-9911","author":{{"login":"review-bot"}},"state":"PENDING","viewerDidAuthor":true,"viewerCanDelete":true}}],"pageInfo":{{"hasNextPage":false,"endCursor":null}}}}}}}}}}}}'
+        printf '%s\n' '{{"data":{{"repository":{{"pullRequest":{{"headRefOid":"head-44","reviews":{{"nodes":[{{"id":"PRR_pending","url":"https://github.com/acme/widgets/pull/44#pullrequestreview-9911","author":{{"login":"review-bot"}},"state":"PENDING","viewerDidAuthor":true,"viewerCanDelete":false}}],"pageInfo":{{"hasNextPage":false,"endCursor":null}}}}}}}}}}}}'
         ;;
       *)
         echo "stub: unexpected graphql payload: $*" >&2
@@ -1216,6 +1216,8 @@ fn pr_review_thread_file_creates_resolvable_github_review_thread() {
             "--decision",
             "comments-only",
             "--submit-review",
+            "--expected-head",
+            "head-44",
             "--comment-file",
             review_file.to_str().expect("utf8 path"),
             "--thread-file",
@@ -1252,6 +1254,10 @@ fn pr_review_thread_file_creates_resolvable_github_review_thread() {
     assert!(
         calls.contains("addPullRequestReview(input:"),
         "pending review mutation missing: {calls}"
+    );
+    assert!(
+        calls.contains("commitOID=head-44"),
+        "pending review mutation must bind the reviewed head: {calls}"
     );
     assert!(
         calls.contains("addPullRequestReviewThread(input:"),
@@ -1296,6 +1302,8 @@ fn pr_review_thread_file_dry_run_renders_thread_creation_plan() {
             "--decision",
             "comments-only",
             "--submit-review",
+            "--expected-head",
+            "head-44",
             "--comment",
             "Summary body",
             "--thread-file",
@@ -1323,6 +1331,17 @@ fn pr_review_thread_file_dry_run_renders_thread_creation_plan() {
     );
     assert!(thread_plan.contains("path=src/lib.rs"), "{thread_plan}");
     assert!(thread_plan.contains("line=42"), "{thread_plan}");
+    let pending_guard_plan = env["data"]["pending_review_guard_plan"]
+        .as_array()
+        .expect("pending_review_guard_plan present")
+        .iter()
+        .map(|v| v.as_str().unwrap_or_default())
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(
+        pending_guard_plan.contains("states: [PENDING]"),
+        "threaded dry-run must render the pending-review guard: {pending_guard_plan}"
+    );
 }
 
 #[test]
@@ -2213,6 +2232,8 @@ fn pr_review_thread_file_cleans_up_pending_review_after_thread_failure() {
             "--decision",
             "comments-only",
             "--submit-review",
+            "--expected-head",
+            "head-44",
             "--comment",
             "Summary body",
             "--thread-file",
@@ -2271,6 +2292,8 @@ fn pr_review_thread_file_maps_github_diff_failure_to_typed_error_and_cleans_up()
             "--decision",
             "comments-only",
             "--submit-review",
+            "--expected-head",
+            "head-44",
             "--comment",
             "Summary body",
             "--thread-file",
@@ -2336,6 +2359,8 @@ fn pr_review_thread_file_cleans_up_pending_review_after_submit_failure() {
             "--decision",
             "comments-only",
             "--submit-review",
+            "--expected-head",
+            "head-44",
             "--comment",
             "Summary body",
             "--thread-file",
@@ -2394,6 +2419,8 @@ fn pr_review_thread_file_submit_422_is_actionable_and_cleans_up() {
             "--decision",
             "approve",
             "--submit-review",
+            "--expected-head",
+            "head-44",
             "--comment",
             "Summary body",
             "--thread-file",
@@ -2533,6 +2560,8 @@ fn pr_review_submit_native_review_event_on_github() {
             "--decision",
             "request-changes",
             "--submit-review",
+            "--expected-head",
+            "head-44",
             "--comment",
             "Needs another pass.",
         ],
@@ -2564,6 +2593,10 @@ fn pr_review_submit_native_review_event_on_github() {
     );
     assert!(calls.contains("--method POST"), "{calls}");
     assert!(
+        calls.contains("commit_id=head-44"),
+        "native review POST must bind the reviewed head: {calls}"
+    );
+    assert!(
         calls.contains("event=REQUEST_CHANGES"),
         "decision must map to the review event: {calls}"
     );
@@ -2572,6 +2605,78 @@ fn pr_review_submit_native_review_event_on_github() {
     assert!(
         !calls.contains("issues/44/comments"),
         "native review must not post an issue comment: {calls}"
+    );
+}
+
+#[test]
+fn pr_review_submit_native_requires_expected_head_before_backend() {
+    let stub = StubEnv::new();
+    let capture = stub.tempdir.path().join("gh-args.log");
+    let stub = stub.gh_stub(&github_review_submit_stub(&capture.to_string_lossy()));
+
+    let out = run_forge_cli(
+        &stub,
+        &[
+            "--provider",
+            "github",
+            "--repo",
+            "acme/widgets",
+            "--format",
+            "json",
+            "pr",
+            "review",
+            "44",
+            "--decision",
+            "approve",
+            "--submit-review",
+        ],
+    );
+
+    assert_eq!(out.code, 65, "stdout={}\nstderr={}", out.stdout, out.stderr);
+    let env = parse_envelope(&out.stdout);
+    assert_eq!(env["error"]["code"], "expected_review_head_required");
+    assert_backend_not_invoked(&capture);
+}
+
+#[test]
+fn pr_review_submit_native_rejects_expected_head_mismatch_before_mutation() {
+    let stub = StubEnv::new();
+    let capture = stub.tempdir.path().join("gh-args.log");
+    let stub = stub.gh_stub(&github_review_submit_stub(&capture.to_string_lossy()));
+
+    let out = run_forge_cli(
+        &stub,
+        &[
+            "--provider",
+            "github",
+            "--repo",
+            "acme/widgets",
+            "--format",
+            "json",
+            "pr",
+            "review",
+            "44",
+            "--decision",
+            "approve",
+            "--submit-review",
+            "--expected-head",
+            "head-old",
+        ],
+    );
+
+    assert_eq!(out.code, 65, "stdout={}\nstderr={}", out.stdout, out.stderr);
+    let env = parse_envelope(&out.stdout);
+    assert_eq!(env["error"]["code"], "github_review_head_changed");
+    let detail = env["error"]["details"]["detail"]
+        .as_str()
+        .expect("detail is preserved");
+    assert!(detail.contains("expected_head=head-old"), "{detail}");
+    assert!(detail.contains("provider_head=head-44"), "{detail}");
+    let calls = fs::read_to_string(capture).expect("read captured calls");
+    assert!(calls.contains("states: [PENDING]"), "{calls}");
+    assert!(
+        !calls.contains("repos/acme/widgets/pulls/44/reviews"),
+        "head mismatch must stop before native review mutation: {calls}"
     );
 }
 
@@ -2598,6 +2703,8 @@ fn pr_review_submit_native_rejects_viewer_owned_pending_review_before_mutation()
             "--decision",
             "comments-only",
             "--submit-review",
+            "--expected-head",
+            "head-44",
             "--comment",
             "Summary body",
         ],
@@ -2613,6 +2720,10 @@ fn pr_review_submit_native_rejects_viewer_owned_pending_review_before_mutation()
         .expect("detail is preserved");
     assert!(detail.contains("head_sha=head-44"), "{detail}");
     assert!(detail.contains("pending_review_count=1"), "{detail}");
+    assert!(
+        detail.contains("deletable_pending_review_count=0"),
+        "viewer ownership must block independently of delete capability: {detail}"
+    );
 
     let calls = fs::read_to_string(capture).expect("read captured calls");
     assert!(calls.contains("states: [PENDING]"), "{calls}");
@@ -2651,6 +2762,8 @@ fn pr_review_thread_file_rejects_viewer_owned_pending_review_before_mutation() {
             "--decision",
             "comments-only",
             "--submit-review",
+            "--expected-head",
+            "head-44",
             "--comment",
             "Summary body",
             "--thread-file",
@@ -2693,6 +2806,8 @@ fn pr_review_submit_native_approve_allows_empty_body() {
             "--decision",
             "approve",
             "--submit-review",
+            "--expected-head",
+            "head-44",
         ],
     );
 
@@ -2739,6 +2854,8 @@ fn pr_review_submit_native_approve_422_is_actionable() {
             "--decision",
             "approve",
             "--submit-review",
+            "--expected-head",
+            "head-44",
             "--comment",
             "Looks good.",
         ],
@@ -2836,6 +2953,8 @@ fn pr_review_submit_native_dry_run_renders_review_submit() {
             "--decision",
             "request-changes",
             "--submit-review",
+            "--expected-head",
+            "head-44",
             "--comment",
             "Status: needs work",
         ],

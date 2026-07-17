@@ -524,9 +524,11 @@ backend mapping, validation rules, and output schema versions.
 - By default `--decision` is recorded in the envelope and generated issue mirror
   body only (the outcome-comment form); it does not call provider-native
   approve/request-changes APIs.
-- With `--submit-review` (GitHub-only in v1) the command instead submits a native
+- With `--submit-review --expected-head <sha>` (GitHub-only in v1) the command
+  instead submits a native
   pull request review event: it POSTs `gh api repos/{repo}/pulls/{id}/reviews`
-  with `--decision` mapped to the review `event`
+  with `--decision` mapped to the review `event` and the reviewed head bound as
+  `commit_id`
   (`comments-only→COMMENT`, `approve→APPROVE`, `request-changes→REQUEST_CHANGES`),
   creating the `#pullrequestreview-` object reported as `data.pr_comment_url`
   with `data.submitted_review = true`. The review is authored by whatever
@@ -534,14 +536,20 @@ backend mapping, validation rules, and output schema versions.
   via `FORGE_BOT_PROFILE`) yields a bot-authored review. A body is required for
   `COMMENT` and `REQUEST_CHANGES` and optional for `APPROVE` (a body-less approve
   omits the `body` field). The same PR-existence guard runs first, followed by a
-  complete pending-only review snapshot. If the authenticated viewer already
+  complete pending-only review snapshot. The provider head must still equal
+  `--expected-head`; drift returns `github_review_head_changed` (`DATA 65`)
+  before any mutation. The successful payload exposes the bound head as
+  `data.head_sha`. If the authenticated viewer already
   owns a pending review, the command returns `github_pending_review_exists`
   (`RUNTIME 1`) before any review mutation. Its detail includes the provider
   head, viewer-owned pending count, and deletable count so callers can inspect
   `pr reviews` and delete only the exact guarded node before retrying. Pending
   reviews owned by other viewers do not block submission. The pending guard and
   reviews POST are rendered in `--dry-run` as
-  `data.pending_review_guard_plan` and `data.plan`. `--submit-review` on
+  `data.pending_review_guard_plan` and `data.plan`. Omitting the expected head
+  returns `expected_review_head_required` (`DATA 65`); supplying it without
+  `--submit-review` returns `expected_review_head_requires_submit_review`
+  (`DATA 65`). `--submit-review` on
   GitLab / Local returns `provider_unsupported` (`USAGE 64`).
   If GitHub rejects the native review submission with HTTP 422, the command
   returns `github_native_review_rejected` (`RUNTIME 1`) and preserves the raw
@@ -558,7 +566,8 @@ backend mapping, validation rules, and output schema versions.
   256 KiB, 50 specs, 1024-byte paths, and 16 KiB bodies; put lower-priority
   findings in the summary body or split them into a later review. `--thread-file`
   requires `--submit-review`; omit it for a summary-only review. A live GitHub run first
-  looks up the PR node id, creates a pending review, adds each thread with
+  looks up the PR node id, creates a pending review bound to
+  `--expected-head` through `commitOID`, adds each thread with
   `addPullRequestReviewThread`, then publishes the review with
   `submitPullRequestReview`. JSON output includes
   `data.review_threads[] = { id, url, path, line, subject_type }`, where `id` is

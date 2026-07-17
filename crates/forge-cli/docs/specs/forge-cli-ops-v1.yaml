@@ -266,6 +266,7 @@ operations:
       - { name: --issue,          type: integer, required: false }
       - { name: --mirror-issue,   type: bool,    default: false }
       - { name: --submit-review,  type: bool,    default: false } # GitHub-only: submit a native review event (#pullrequestreview-) instead of an outcome comment; --decision maps to event (comments-only->COMMENT, approve->APPROVE, request-changes->REQUEST_CHANGES); body required for COMMENT/REQUEST_CHANGES, optional for APPROVE
+      - { name: --expected-head,  type: string,  required: false } # Required with --submit-review and invalid without it; compared with the complete pending-review snapshot head before mutation and bound to the REST commit_id / GraphQL commitOID
       - { name: --thread-file,    type: path,    required: false } # GitHub-only JSON array of actionable review-thread specs; requires --submit-review; max 256 KiB, 50 specs, 1024-byte paths, 16 KiB bodies. Use only for findings that should be repaired then resolved via pr review-threads resolve.
     validations:
       - no_local_path # review comment body, thread spec bodies/paths, AND the generated issue mirror (lens values are user-controlled), validated before any post
@@ -275,6 +276,9 @@ operations:
     #   id_not_pull_request (DATA 65)  — GitHub <id> is not a pull request (the guard saw HTTP 404)
     #   invalid_review_thread_spec (DATA 65) — malformed, oversized, or locally invalid thread spec fields
     #   thread_file_requires_submit_review (DATA 65) — --thread-file without --submit-review
+    #   expected_review_head_required (DATA 65) — --submit-review without --expected-head
+    #   expected_review_head_requires_submit_review (DATA 65) — --expected-head without --submit-review
+    #   github_review_head_changed (DATA 65) — the provider head differs from --expected-head; returned before native review mutation
     #   provider_unsupported (USAGE 64) — --submit-review or --thread-file on gitlab/local (native review/thread creation is GitHub-only in v1)
     #   github_pending_review_exists (RUNTIME 1) — the authenticated GitHub viewer already owns a pending review; returned before any native review mutation, with provider head and pending/deletable counts for exact-node recovery
     #   github_native_review_rejected (RUNTIME 1) — GitHub rejected native review submission with HTTP 422; retry with an eligible reviewer identity or omit --submit-review for an outcome comment fallback
@@ -286,9 +290,9 @@ operations:
         - { program: gh, argv: [api, "repos/{repo}/pulls/{id}", --jq, ".number"] } # PR-existence guard; <id> must be a pull request before posting (also rendered in --dry-run as guard_plan)
         - { program: gh, argv: [api, "repos/{repo}/issues/{id}/comments", --method, POST, --raw-field, "body={comment_or_file}", --jq, ".html_url"] } # default (outcome comment)
         - { program: gh, argv: [api, graphql, -f, "query=<pending reviews with viewer ownership>", -f, "owner={owner}", -f, "name={repo}", -F, "pr={id}"] } # with --submit-review: complete pending-only preflight; a viewer-owned pending review returns github_pending_review_exists before mutation (rendered as pending_review_guard_plan)
-        - { program: gh, argv: [api, "repos/{repo}/pulls/{id}/reviews", --method, POST, --raw-field, "body={comment_or_file}", --raw-field, "event={EVENT}", --jq, ".html_url"] } # with --submit-review (native review event); body field omitted for a body-less APPROVE; review authored by the inherited gh token's identity
+        - { program: gh, argv: [api, "repos/{repo}/pulls/{id}/reviews", --method, POST, --raw-field, "body={comment_or_file}", --raw-field, "event={EVENT}", --raw-field, "commit_id={expected_head}", --jq, ".html_url"] } # with --submit-review (native review event); body field omitted for a body-less APPROVE; commit_id binds the mutation to --expected-head; review authored by the inherited gh token's identity
         - { program: gh, argv: [api, graphql, -f, "query=<pull request id lookup>", -f, "owner={owner}", -f, "name={repo}", -F, "number={id}"] } # with --thread-file: resolve the PR node id
-        - { program: gh, argv: [api, graphql, -f, "query=<addPullRequestReview>", -f, "pullRequestId={pull_request_id}"] } # with --thread-file: create a pending review
+        - { program: gh, argv: [api, graphql, -f, "query=<addPullRequestReview>", -f, "pullRequestId={pull_request_id}", -f, "commitOID={expected_head}"] } # with --thread-file: create a pending review bound to --expected-head
         - { program: gh, argv: [api, graphql, -f, "query=<addPullRequestReviewThread>", -f, "reviewId={review_id}", -f, "path={path}", -f, "body={thread_body}", -F, "line={line}", -f, "side={LEFT|RIGHT}", -f, "subjectType={LINE|FILE}"] } # repeated for each actionable thread spec; returns PRRT_* id and comment URL
         - { program: gh, argv: [api, graphql, -f, "query=<submitPullRequestReview>", -f, "reviewId={review_id}", -f, "event={EVENT}", -f, "body={comment_or_file}"] } # publishes the pending review created for --thread-file
         - { program: gh, argv: [api, graphql, -f, "query=<deletePullRequestReview>", -f, "reviewId={review_id}"] } # best-effort cleanup only when a --thread-file run fails after pending review creation and before publish
@@ -309,6 +313,7 @@ operations:
         number: integer
         decision: enum<comments-only|approve|request-changes>
         submitted_review: bool # true when a native review event was submitted (--submit-review); then pr_comment_url is the #pullrequestreview- URL
+        head_sha?: string # present with --submit-review; the caller-reviewed head bound to preflight and mutation
         pending_review_guard_plan?: list<string> # dry-run only, with --submit-review: pending-only GraphQL preflight argv
         pr_comment_url: string
         issue_number: integer?
