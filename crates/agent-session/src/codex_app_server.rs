@@ -57,10 +57,11 @@ const MAX_PROXY_FRAME_BYTES: usize = 4 * 1024 * 1024;
 const CONTROL_RESPONSE_TIMEOUT: Duration = Duration::from_secs(10);
 const CONTROL_SUBMISSION_TIMEOUT: Duration = Duration::from_secs(15);
 const CONTROL_SUBMIT_TOTAL_TIMEOUT: Duration = Duration::from_secs(30);
-const AUDITED_APP_SERVER_VERSIONS: &[(u64, u64, u64)] = &[(0, 144, 1), (0, 144, 3)];
+const MINIMUM_APP_SERVER_VERSION: (u64, u64, u64) = (0, 144, 1);
 const AUDITED_EXACT_ATTENTION_VERSIONS: &[(u64, u64, u64)] = &[(0, 144, 1), (0, 144, 3)];
 const APP_SERVER_CAPABILITY_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 const APP_SERVER_CAPABILITY_PROBE_MAX_OUTPUT_BYTES: u64 = 64 * 1024;
+const CODEX_ACCOUNT_READINESS_SCHEMA_VERSION: &str = "agent-session.codex-account-readiness.v1";
 const MANUAL_INPUT_SECTION_FILE: &str = ".codex-app-server-manual-input";
 const MANUAL_INPUT_GATE_FILE: &str = ".codex-app-server-manual-input-gate";
 const MANUAL_INPUT_SECTION_VERSION: &str = "agent-session.codex-manual-input.v1";
@@ -98,6 +99,47 @@ struct AppServerCapabilities {
     source_guard: bool,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub(crate) struct CodexAccountReadiness {
+    schema_version: &'static str,
+    supported: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    provider_version: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason_code: Option<&'static str>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct AppServerProbe {
+    capabilities: AppServerCapabilities,
+    provider_version: Option<String>,
+    reason_code: Option<&'static str>,
+}
+
+impl AppServerProbe {
+    fn unavailable(reason_code: &'static str, provider_version: Option<String>) -> Self {
+        Self {
+            capabilities: AppServerCapabilities {
+                transport: false,
+                exact_attention: false,
+                source_guard: false,
+            },
+            provider_version,
+            reason_code: Some(reason_code),
+        }
+    }
+}
+
+pub(crate) fn account_binding_readiness(agent_bin: &Path) -> CodexAccountReadiness {
+    let probe = app_server_probe(agent_bin);
+    CodexAccountReadiness {
+        schema_version: CODEX_ACCOUNT_READINESS_SCHEMA_VERSION,
+        supported: probe.capabilities.transport,
+        provider_version: probe.provider_version,
+        reason_code: probe.reason_code,
+    }
+}
+
 pub(crate) fn configure_runtime(
     context: &CliContext,
     agent_bin: &Path,
@@ -116,14 +158,18 @@ pub(crate) fn configure_runtime(
         return Ok(());
     }
     let forced = preference == "app-server" || binding_required;
-    let mut capabilities = app_server_capabilities(agent_bin);
+    let probe = app_server_probe(agent_bin);
+    let mut capabilities = probe.capabilities;
     capabilities.source_guard = crate::activity::codex_protocol_attention_source_guard_configured();
     if !capabilities.transport {
         if forced {
             return Err(CliError::data(
                 "codex-app-server-capability-unavailable",
                 "installed Codex does not advertise app-server Unix listen support",
-                None,
+                Some(json!({
+                    "provider_version": probe.provider_version,
+                    "reason_code": probe.reason_code,
+                })),
             ));
         }
         return Ok(());
@@ -181,39 +227,47 @@ fn configure_runtime_with_capabilities(
     write_session_record(context, record)
 }
 
+#[cfg(test)]
 fn app_server_capabilities(agent_bin: &Path) -> AppServerCapabilities {
+    app_server_probe(agent_bin).capabilities
+}
+
+fn app_server_probe(agent_bin: &Path) -> AppServerProbe {
     let Some(version) = bounded_command_output(agent_bin, &["--version"]) else {
-        return AppServerCapabilities {
-            transport: false,
-            exact_attention: false,
-            source_guard: false,
-        };
+        return AppServerProbe::unavailable("codex-unavailable", None);
     };
     let version_text = String::from_utf8_lossy(&version.stdout);
     let Some(version) = parse_version_triplet(&version_text) else {
-        return AppServerCapabilities {
-            transport: false,
-            exact_attention: false,
-            source_guard: false,
-        };
+        return AppServerProbe::unavailable("codex-version-unrecognized", None);
     };
-    let version_has_transport = AUDITED_APP_SERVER_VERSIONS.contains(&version);
+    let provider_version = Some(format!("{}.{}.{}", version.0, version.1, version.2));
+    if version < MINIMUM_APP_SERVER_VERSION {
+        return AppServerProbe::unavailable("codex-version-too-old", provider_version);
+    }
     let Some(output) = bounded_command_output(agent_bin, &["app-server", "--help"]) else {
-        return AppServerCapabilities {
-            transport: false,
-            exact_attention: false,
-            source_guard: false,
-        };
+        return AppServerProbe::unavailable(
+            "codex-app-server-transport-unavailable",
+            provider_version,
+        );
     };
     let advertised_transport = [output.stdout, output.stderr].into_iter().any(|bytes| {
         let text = String::from_utf8_lossy(&bytes);
         text.contains("--listen <URL>") && text.contains("unix://")
     });
-    let transport = version_has_transport && advertised_transport;
-    AppServerCapabilities {
-        transport,
-        exact_attention: transport && exact_attention_version_is_audited(version),
-        source_guard: false,
+    if !advertised_transport {
+        return AppServerProbe::unavailable(
+            "codex-app-server-transport-unavailable",
+            provider_version,
+        );
+    }
+    AppServerProbe {
+        capabilities: AppServerCapabilities {
+            transport: true,
+            exact_attention: exact_attention_version_is_audited(version),
+            source_guard: false,
+        },
+        provider_version,
+        reason_code: None,
     }
 }
 
@@ -4135,7 +4189,7 @@ mod tests {
     }
 
     #[test]
-    fn capability_probe_requires_an_audited_version_and_unix_transport() {
+    fn capability_probe_accepts_newer_versions_with_unix_transport() {
         let _probe_guard = capability_probe_test_guard();
         let tmp = tempfile::TempDir::new().unwrap();
         for (name, version, help, expected) in [
@@ -4158,10 +4212,16 @@ mod tests {
                 false,
             ),
             (
-                "newer-unaudited",
+                "newer-patch",
+                "codex-cli 0.144.5",
+                "  --listen <URL>  Supported values: stdio://, unix://PATH",
+                true,
+            ),
+            (
+                "newer-minor",
                 "codex-cli 0.145.0",
                 "  --listen <URL>  Supported values: stdio://, unix://PATH",
-                false,
+                true,
             ),
             (
                 "extra-component",
@@ -4205,6 +4265,35 @@ mod tests {
             fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
             assert_eq!(app_server_capabilities(&path).transport, expected, "{name}");
         }
+    }
+
+    #[test]
+    fn account_binding_readiness_reports_bounded_safe_reasons() {
+        let _probe_guard = capability_probe_test_guard();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let old = tmp.path().join("old");
+        fs::write(&old, "#!/bin/sh\nprintf '%s\\n' 'codex-cli 0.143.9'\n").unwrap();
+        fs::set_permissions(&old, fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(
+            account_binding_readiness(&old),
+            CodexAccountReadiness {
+                schema_version: CODEX_ACCOUNT_READINESS_SCHEMA_VERSION,
+                supported: false,
+                provider_version: Some("0.143.9".to_string()),
+                reason_code: Some("codex-version-too-old"),
+            }
+        );
+
+        let missing = tmp.path().join("missing");
+        assert_eq!(
+            account_binding_readiness(&missing),
+            CodexAccountReadiness {
+                schema_version: CODEX_ACCOUNT_READINESS_SCHEMA_VERSION,
+                supported: false,
+                provider_version: None,
+                reason_code: Some("codex-unavailable"),
+            }
+        );
     }
 
     #[test]
