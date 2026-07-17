@@ -3,7 +3,7 @@
 This file documents third-party notice-file discovery for Rust crates used by this workspace.
 
 - Data source: `cargo metadata --format-version 1 --locked`
-- Cargo.lock SHA256: `2340ed6c7f1f20abf04efebce1d73ec20980aa3bd6bbd9b5ce88ebb8504b362e`
+- Cargo.lock SHA256: `1660f5a03e4ee29be5b41293ceff0f3890bd2a39f1a94f98d3b09f1c25530f75`
 - Third-party crates (`source != null`): 468
 
 ## Notice Extraction Policy
