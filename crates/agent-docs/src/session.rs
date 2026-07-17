@@ -42,11 +42,19 @@ struct SessionData {
     active_intents: Vec<String>,
     record_file: String,
     verified: bool,
+    /// Intents newly prepared (or refreshed) by this `prepare` call. Absent for
+    /// activate/status/verify so their stable output shape is unchanged.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    prepared_intents: Option<Vec<String>>,
+    /// Stable reason code for a `prepare` result (`prepared` / `already-current`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason: Option<String>,
 }
 
 pub fn run(args: SessionArgs, overrides: PathOverrides, fallback: FallbackMode) -> i32 {
     match args.command {
         SessionCommand::Activate(args) => activate(args, overrides, fallback),
+        SessionCommand::Prepare(args) => prepare(args, overrides, fallback),
         SessionCommand::Status(args) => status(args, overrides),
         SessionCommand::Verify(args) => verify(args, overrides, fallback),
     }
@@ -111,6 +119,91 @@ fn activate(args: SessionActivateArgs, overrides: PathOverrides, fallback: Fallb
         data(&path, &common.state_home, &record, true)
     })();
     render(common.format, "activate", result)
+}
+
+/// Prepare one or more declared intents atomically and report a stable JSON
+/// result. `prepare` performs the same strict preflight + activation as
+/// `activate`, but additionally reports which intents were newly prepared this
+/// call and a stable `reason` code, so a runtime hook can drive intent
+/// preparation with a single trusted invocation instead of a separate
+/// activate + preflight round-trip.
+fn prepare(args: SessionActivateArgs, overrides: PathOverrides, fallback: FallbackMode) -> i32 {
+    let common = &args.common;
+    let result = (|| -> Result<SessionData, SessionFailure> {
+        validate_common(common)?;
+        let roots = resolve_roots(&overrides)
+            .map_err(|err| SessionFailure::runtime("root-resolution-failed", err.to_string()))?;
+        let catalog = load_catalog_from_roots(&roots)
+            .map_err(|err| SessionFailure::runtime("catalog-load-failed", err.to_string()))?;
+        let available = resolver::declared_intents(&roots, fallback, &catalog);
+        let path = record_path(common, &roots.project_path)?;
+        let _lock = RecordLock::acquire(&path)?;
+        let mut record = if path.exists() {
+            let record = read_record(&path)?;
+            validate_record_context(common, &roots.project_path, &record)?;
+            record
+        } else {
+            SessionRecord {
+                schema: RECORD_SCHEMA.to_string(),
+                session_hash: digest(common.session_id.trim().as_bytes()),
+                project_hash: project_hash(&roots.project_path),
+                product: common.product.as_str().to_string(),
+                active_intents: BTreeMap::new(),
+                activated_at: jiff::Timestamp::now().to_string(),
+                producer_version: env!("CARGO_PKG_VERSION").to_string(),
+            }
+        };
+        let mut prepared: Vec<String> = Vec::new();
+        for raw in &args.intent {
+            let intent =
+                Context::parse(raw).map_err(|err| SessionFailure::data("invalid-intent", err))?;
+            if !available.iter().any(|item| item == intent.as_str()) {
+                return Err(SessionFailure::data(
+                    "undeclared-intent",
+                    format!("intent `{intent}` is not declared"),
+                ));
+            }
+            let report = resolver::resolve_intent_with_catalog_for_product(
+                &intent,
+                &roots,
+                Some(common.product),
+                true,
+                fallback,
+                true,
+                &catalog,
+            );
+            if report.has_unsatisfied_required() {
+                return Err(SessionFailure::data(
+                    "preflight-unsatisfied",
+                    format!("strict preflight failed for `{intent}`"),
+                ));
+            }
+            let fingerprint = fingerprint(&report, &catalog)?;
+            let key = intent.to_string();
+            let is_new = match record.active_intents.get(&key) {
+                Some(existing) => existing != &fingerprint,
+                None => true,
+            };
+            if is_new {
+                prepared.push(key.clone());
+            }
+            record.active_intents.insert(key, fingerprint);
+        }
+        record.activated_at = jiff::Timestamp::now().to_string();
+        write_record(&path, &record)?;
+        let mut out = data(&path, &common.state_home, &record, true)?;
+        out.reason = Some(
+            if prepared.is_empty() {
+                "already-current"
+            } else {
+                "prepared"
+            }
+            .to_string(),
+        );
+        out.prepared_intents = Some(prepared);
+        Ok(out)
+    })();
+    render(common.format, "prepare", result)
 }
 
 fn status(common: SessionCommonArgs, overrides: PathOverrides) -> i32 {
@@ -279,6 +372,8 @@ fn data(
         active_intents: record.active_intents.keys().cloned().collect(),
         record_file: record_file.to_string_lossy().replace('\\', "/"),
         verified,
+        prepared_intents: None,
+        reason: None,
     })
 }
 

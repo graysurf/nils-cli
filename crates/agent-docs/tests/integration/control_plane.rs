@@ -348,3 +348,96 @@ fn session_activation_reclaims_stale_directory_lock() {
     assert_eq!(recovered.code, 0, "stderr: {}", recovered.stderr);
     assert!(!lock.exists());
 }
+
+#[test]
+fn session_prepare_activates_and_reports_stable_result() {
+    let env = TestEnv::new();
+    env.write_project_catalog(catalog())
+        .write_project_doc("DEVELOPMENT.md", "# Development\n");
+    let state_home = env.project_path(".state");
+    let state = state_home.to_str().unwrap();
+
+    let prepare = env.run(&[
+        "session",
+        "prepare",
+        "--session-id",
+        "session-prepare",
+        "--product",
+        "codex",
+        "--state-home",
+        state,
+        "--intent",
+        "project-dev",
+        "--format",
+        "json",
+    ]);
+    assert_eq!(prepare.code, 0, "stderr: {}", prepare.stderr);
+    let json = prepare.json();
+    assert_eq!(json["schema_version"], "cli.agent-docs.session.prepare.v1");
+    assert_eq!(json["data"]["verified"], true);
+    assert_eq!(json["data"]["active_intents"][0], "project-dev");
+    assert_eq!(json["data"]["prepared_intents"][0], "project-dev");
+    assert_eq!(json["data"]["reason"], "prepared");
+
+    // Re-preparing the same intent is idempotent and reported as already-current.
+    let again = env.run(&[
+        "session",
+        "prepare",
+        "--session-id",
+        "session-prepare",
+        "--product",
+        "codex",
+        "--state-home",
+        state,
+        "--intent",
+        "project-dev",
+        "--format",
+        "json",
+    ]);
+    assert_eq!(again.code, 0, "stderr: {}", again.stderr);
+    let again_json = again.json();
+    assert_eq!(again_json["data"]["reason"], "already-current");
+    assert_eq!(
+        again_json["data"]["prepared_intents"]
+            .as_array()
+            .unwrap()
+            .len(),
+        0
+    );
+
+    // A prepared intent verifies as active.
+    let verify = env.run(&[
+        "session",
+        "verify",
+        "--session-id",
+        "session-prepare",
+        "--product",
+        "codex",
+        "--state-home",
+        state,
+        "--require-intent",
+        "project-dev",
+        "--format",
+        "json",
+    ]);
+    assert_eq!(verify.code, 0, "stderr: {}", verify.stderr);
+    assert_eq!(verify.json()["data"]["verified"], true);
+
+    // An undeclared intent fails closed with a stable reason code.
+    let undeclared = env.run(&[
+        "session",
+        "prepare",
+        "--session-id",
+        "session-prepare",
+        "--product",
+        "codex",
+        "--state-home",
+        state,
+        "--intent",
+        "browser-test",
+        "--format",
+        "json",
+    ]);
+    assert_eq!(undeclared.code, 65, "stderr: {}", undeclared.stderr);
+    assert_eq!(undeclared.json()["error"]["code"], "undeclared-intent");
+}

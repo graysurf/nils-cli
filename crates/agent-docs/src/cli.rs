@@ -227,6 +227,9 @@ pub struct SessionArgs {
 pub enum SessionCommand {
     /// Strictly preflight and atomically activate one or more declared intents.
     Activate(SessionActivateArgs),
+    /// Atomically prepare one or more declared intents (activate + strict
+    /// preflight) and report a stable JSON result usable by a runtime hook.
+    Prepare(SessionActivateArgs),
     /// Show active intents for the current session/project/product scope.
     Status(SessionCommonArgs),
     /// Re-resolve the catalog and verify required intents are active and fresh.
