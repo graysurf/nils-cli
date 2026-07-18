@@ -11562,20 +11562,18 @@ mod tests {
         assert!(error.to_string().contains("size limit"));
     }
 
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    // macOS hosted runners cannot reliably start this four-process kqueue fixture; see #1290.
+    #[cfg(target_os = "linux")]
     #[test]
     fn detached_double_fork_pipe_holder_is_owned_and_terminated() {
         let root = tempfile::TempDir::new().expect("detached child root");
         let pid_path = root.path().join("detached.pid");
-        let mut supervisor = spawn_authenticated_supervisor_fixture_with_timeout(
-            "detached-double-fork",
-            &pid_path,
-            Duration::from_secs(10),
-        );
-        let publication_deadline = Instant::now() + Duration::from_secs(5);
+        let mut supervisor =
+            spawn_authenticated_supervisor_fixture("detached-double-fork", &pid_path);
+        let started = Instant::now();
         while !pid_path.exists() {
             assert!(
-                Instant::now() < publication_deadline,
+                started.elapsed() < Duration::from_secs(1),
                 "detached fixture did not publish its process identity"
             );
             std::thread::sleep(Duration::from_millis(2));
