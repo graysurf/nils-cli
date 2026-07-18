@@ -200,8 +200,6 @@ pub fn run(args: &[String]) -> i32 {
             let file_changed = outcome.previous_status != outcome.new_status
                 || outcome.previous_evidence != outcome.new_evidence
                 || outcome.notes_changed;
-            let appended = !outcome.previous_evidence.is_empty()
-                && outcome.new_evidence != outcome.previous_evidence;
             let notes = cfg.notes.as_ref().map(|_| NotesDelta {
                 previous: outcome.previous_notes.clone(),
                 new: outcome.new_notes.clone(),
@@ -221,7 +219,7 @@ pub fn run(args: &[String]) -> i32 {
                 evidence: EvidenceDelta {
                     previous: outcome.previous_evidence.clone(),
                     new: outcome.new_evidence.clone(),
-                    appended,
+                    appended: outcome.evidence_appended,
                 },
                 notes,
                 file_changed,

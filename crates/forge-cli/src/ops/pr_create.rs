@@ -680,7 +680,7 @@ fn write_body_tempfile(body: &str) -> Result<NamedTempFile, ForgeError> {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn build_create_call(
+pub(crate) fn build_create_call(
     ctx: &ProviderContext,
     head: &str,
     base: &str,
@@ -1175,6 +1175,7 @@ mod tests {
             format: Some(OutputFormat::Json),
             remote: "origin".into(),
             provider: None,
+            host: None,
             repo: None,
             store_root: None,
             dry_run: true,
@@ -1202,6 +1203,7 @@ mod tests {
             format: None,
             remote: "origin".into(),
             provider: None,
+            host: None,
             repo: None,
             store_root: None,
             dry_run: true,
@@ -1226,6 +1228,7 @@ mod tests {
             format: None,
             remote: "origin".into(),
             provider: None,
+            host: None,
             repo: None,
             store_root: None,
             dry_run: true,
@@ -1250,6 +1253,7 @@ mod tests {
             format: None,
             remote: "origin".into(),
             provider: None,
+            host: None,
             repo: None,
             store_root: None,
             dry_run: true,
@@ -1510,6 +1514,7 @@ mod tests {
             format: Some(OutputFormat::Json),
             remote: "origin".into(),
             provider: Some(ProviderFlag::Local),
+            host: None,
             repo: None,
             store_root: None,
             dry_run: true,
@@ -1546,6 +1551,7 @@ mod tests {
             format: Some(OutputFormat::Json),
             remote: "origin".into(),
             provider: None,
+            host: None,
             repo: None,
             store_root: None,
             dry_run: true,
@@ -1614,6 +1620,7 @@ mod tests {
             format: None,
             remote: "origin".into(),
             provider: None,
+            host: None,
             repo: None,
             store_root: None,
             dry_run: true,

@@ -171,7 +171,8 @@ fn run_github_search<R: BackendRunner>(
     format: OutputFormat,
 ) -> Result<i32, ForgeError> {
     let limit = limit_for_provider(args.limit);
-    let call = build_github_search_call(kind, repo_slug, &args.query, &args.match_fields, limit);
+    let call = build_github_search_call(kind, repo_slug, &args.query, &args.match_fields, limit)
+        .with_host(Provider::GitHub, &ctx.host);
     if global.dry_run {
         return Ok(emit_search_dry_run(
             schema_ok(kind.schema()),
@@ -283,7 +284,7 @@ fn run_github_refs_to<R: BackendRunner>(
 
 fn build_github_refs_to_call(ctx: &ProviderContext, target: &RefTarget, limit: u32) -> BackendCall {
     let mut argv = vec![OsString::from("api"), OsString::from("graphql")];
-    push_github_hostname(ctx, &mut argv);
+    ctx.push_github_api_hostname(&mut argv);
     argv.extend([
         OsString::from("-F"),
         OsString::from(format!("owner={}", target.owner)),
@@ -296,14 +297,7 @@ fn build_github_refs_to_call(ctx: &ProviderContext, target: &RefTarget, limit: u
         OsString::from("-f"),
         OsString::from(format!("query={REFS_TO_GRAPHQL_QUERY}")),
     ]);
-    BackendCall::new(BackendProgram::Gh, argv)
-}
-
-fn push_github_hostname(ctx: &ProviderContext, argv: &mut Vec<OsString>) {
-    if ctx.host != "github.com" {
-        argv.push(OsString::from("--hostname"));
-        argv.push(OsString::from(&ctx.host));
-    }
+    BackendCall::new(BackendProgram::Gh, argv).with_host(Provider::GitHub, &ctx.host)
 }
 
 /// Parse a `<ref>` into its `(owner, name, number)` target. Accepts a GitHub
@@ -496,7 +490,7 @@ fn ref_invalid(value: &str) -> ForgeError {
 
 fn build_github_search_call(
     kind: SearchKind,
-    repo_slug: &str,
+    repo_locator: &str,
     query: &str,
     match_fields: &[SearchMatchField],
     limit: u32,
@@ -506,7 +500,7 @@ fn build_github_search_call(
         OsString::from(kind.gh_noun()),
         OsString::from(query),
         OsString::from("--repo"),
-        OsString::from(repo_slug),
+        OsString::from(repo_locator),
         OsString::from("--match"),
         OsString::from(match_csv(match_fields)),
         OsString::from("--limit"),
@@ -538,12 +532,16 @@ fn resolve_repo_slug<F: Fn(&str) -> Option<String>>(
     {
         return Ok(parsed.path);
     }
-    Err(ForgeError::validation(
+    Err(repo_required())
+}
+
+fn repo_required() -> ForgeError {
+    ForgeError::validation(
         schema_err(),
         "repo_required",
         "search is single-repo scoped: pass --repo owner/name or run inside a repo with a recognised forge remote",
         None,
-    ))
+    )
 }
 
 fn limit_for_provider(limit: u32) -> u32 {
@@ -746,6 +744,7 @@ mod tests {
             format: Some(OutputFormat::Json),
             remote: "origin".into(),
             provider: Some(provider),
+            host: None,
             repo: Some("acme/widget".into()),
             store_root: None,
             dry_run: false,

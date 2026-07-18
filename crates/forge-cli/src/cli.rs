@@ -42,9 +42,17 @@ pub struct Cli {
     #[arg(long, global = true, value_enum)]
     pub provider: Option<ProviderFlag>,
 
-    /// Override the repo slug (`owner/name`). When absent it is derived from
-    /// the remote URL.
-    #[arg(long, global = true, value_name = "owner/name")]
+    /// Override the forge authority (`hostname` or `hostname:port`). With
+    /// `--provider`, a syntactically valid custom authority is accepted unless
+    /// it is positively identified as the other provider. Without `--provider`,
+    /// the authority must identify a supported provider.
+    #[arg(long, global = true, value_name = "HOST")]
+    pub host: Option<String>,
+
+    /// Override the remote-derived repository path. Accepted shapes: GitHub
+    /// `owner/name`; GitLab `group[/subgroup...]/project`; Local `local:<slug>` or
+    /// `<slug>`.
+    #[arg(long, global = true, value_name = "REPOSITORY")]
     pub repo: Option<String>,
 
     /// Root directory of the file-backed store used by `--provider local`.
@@ -67,6 +75,7 @@ pub struct GlobalFlags {
     pub format: Option<OutputFormat>,
     pub remote: String,
     pub provider: Option<ProviderFlag>,
+    pub host: Option<String>,
     pub repo: Option<String>,
     pub store_root: Option<PathBuf>,
     pub dry_run: bool,
@@ -78,6 +87,7 @@ impl From<&Cli> for GlobalFlags {
             format: cli.format,
             remote: cli.remote.clone(),
             provider: cli.provider,
+            host: cli.host.clone(),
             repo: cli.repo.clone(),
             store_root: cli.store_root.clone(),
             dry_run: cli.dry_run,
@@ -93,11 +103,27 @@ impl GlobalFlags {
 
     /// Convert the optional `--provider` flag into the typed provider hint.
     pub fn provider_hint(&self) -> ProviderHint {
-        match self.provider {
-            Some(ProviderFlag::Github) => ProviderHint::Forced(crate::provider::Provider::GitHub),
-            Some(ProviderFlag::Gitlab) => ProviderHint::Forced(crate::provider::Provider::GitLab),
-            Some(ProviderFlag::Local) => ProviderHint::Forced(crate::provider::Provider::Local),
-            None => ProviderHint::Auto,
+        match (self.provider, self.host.as_deref()) {
+            (Some(ProviderFlag::Github), Some(host)) => {
+                ProviderHint::ForcedHost(crate::provider::Provider::GitHub, host.to_string())
+            }
+            (Some(ProviderFlag::Gitlab), Some(host)) => {
+                ProviderHint::ForcedHost(crate::provider::Provider::GitLab, host.to_string())
+            }
+            (Some(ProviderFlag::Local), Some(host)) => {
+                ProviderHint::ForcedHost(crate::provider::Provider::Local, host.to_string())
+            }
+            (Some(ProviderFlag::Github), None) => {
+                ProviderHint::Forced(crate::provider::Provider::GitHub)
+            }
+            (Some(ProviderFlag::Gitlab), None) => {
+                ProviderHint::Forced(crate::provider::Provider::GitLab)
+            }
+            (Some(ProviderFlag::Local), None) => {
+                ProviderHint::Forced(crate::provider::Provider::Local)
+            }
+            (None, Some(host)) => ProviderHint::Host(host.to_string()),
+            (None, None) => ProviderHint::Auto,
         }
     }
 
@@ -1831,6 +1857,48 @@ mod tests {
         let cli = parse(&["--provider", "github", "auth", "status"]).expect("parse");
         let global: GlobalFlags = (&cli).into();
         assert_eq!(global.provider, Some(ProviderFlag::Github));
+    }
+
+    #[test]
+    fn parses_global_host_binding() {
+        let cli = parse(&[
+            "--provider",
+            "gitlab",
+            "--host",
+            "gitlab.example.com",
+            "--repo",
+            "group/project",
+            "repo",
+            "view",
+        ])
+        .expect("parse");
+        let global: GlobalFlags = (&cli).into();
+        assert_eq!(global.host.as_deref(), Some("gitlab.example.com"));
+        assert_eq!(
+            global.provider_hint(),
+            ProviderHint::ForcedHost(
+                crate::provider::Provider::GitLab,
+                "gitlab.example.com".into()
+            )
+        );
+    }
+
+    #[test]
+    fn parses_host_only_binding_after_subcommand() {
+        let cli = parse(&[
+            "repo",
+            "view",
+            "--host",
+            "internal.ghe.com",
+            "--repo",
+            "owner/repo",
+        ])
+        .expect("parse");
+        let global: GlobalFlags = (&cli).into();
+        assert_eq!(
+            global.provider_hint(),
+            ProviderHint::Host("internal.ghe.com".into())
+        );
     }
 
     #[test]

@@ -318,6 +318,13 @@ pub fn run_with<R: BackendRunner + Sync>(
     command: InboxCommand,
     format: OutputFormat,
 ) -> Result<i32, ForgeError> {
+    if global.host.is_some() {
+        return Err(ForgeError::provider_unsupported(
+            schema_err(),
+            "--host is not supported by inbox; use inbox --gitlab-host HOST for GitLab",
+            Some("explicit GitHub Enterprise inbox search is unsupported in v1".into()),
+        ));
+    }
     match command {
         InboxCommand::List(args) => run_list(runner, global, args, format),
         InboxCommand::Status(args) => run_status(runner, global, args, format),
@@ -853,7 +860,7 @@ impl ProviderPlan {
         match self.target.provider {
             // Local contributes no inbox targets (see `resolve_targets`), so
             // this arm is unreachable for it; fold for exhaustiveness.
-            Provider::GitHub | Provider::Local => github_queries(&self.config)
+            Provider::GitHub | Provider::Local => github_queries(&self.target.host, &self.config)
                 .into_iter()
                 .map(|q| q.call.plan_argv())
                 .collect(),
@@ -1041,7 +1048,7 @@ fn execute_github<R: BackendRunner + Sync>(
     config: &QueryConfig,
     runtime: &InboxRuntimeConfig,
 ) -> Result<ProviderSuccess, ForgeError> {
-    let queries = github_queries(config);
+    let queries = github_queries(&target.host, config);
     let _ = runtime;
     let per_query = run_queries_in_parallel(runner, &queries, None, |query, output| {
         parse_github_items(target, query, output)
@@ -1630,13 +1637,13 @@ fn format_duration(duration: Duration) -> String {
     }
 }
 
-fn github_queries(config: &QueryConfig) -> Vec<ProviderQuery> {
+fn github_queries(host: &str, config: &QueryConfig) -> Vec<ProviderQuery> {
     let mut queries = Vec::new();
     if config.wants(InboxKindFlag::Review) && config.allows_pr() {
         queries.push(ProviderQuery {
             reason: InboxKindFlag::Review,
             source: "github_search_prs",
-            call: github_search_call("prs", "--review-requested", config.query_limit),
+            call: github_search_call(host, "prs", "--review-requested", config.query_limit),
         });
     }
     if config.wants(InboxKindFlag::Assigned) {
@@ -1644,14 +1651,14 @@ fn github_queries(config: &QueryConfig) -> Vec<ProviderQuery> {
             queries.push(ProviderQuery {
                 reason: InboxKindFlag::Assigned,
                 source: "github_search_prs",
-                call: github_search_call("prs", "--assignee", config.query_limit),
+                call: github_search_call(host, "prs", "--assignee", config.query_limit),
             });
         }
         if config.allows_issue() {
             queries.push(ProviderQuery {
                 reason: InboxKindFlag::Assigned,
                 source: "github_search_issues",
-                call: github_search_call("issues", "--assignee", config.query_limit),
+                call: github_search_call(host, "issues", "--assignee", config.query_limit),
             });
         }
     }
@@ -1660,14 +1667,14 @@ fn github_queries(config: &QueryConfig) -> Vec<ProviderQuery> {
             queries.push(ProviderQuery {
                 reason: InboxKindFlag::Authored,
                 source: "github_search_prs",
-                call: github_search_call("prs", "--author", config.query_limit),
+                call: github_search_call(host, "prs", "--author", config.query_limit),
             });
         }
         if config.allows_issue() {
             queries.push(ProviderQuery {
                 reason: InboxKindFlag::Authored,
                 source: "github_search_issues",
-                call: github_search_call("issues", "--author", config.query_limit),
+                call: github_search_call(host, "issues", "--author", config.query_limit),
             });
         }
     }
@@ -1676,21 +1683,21 @@ fn github_queries(config: &QueryConfig) -> Vec<ProviderQuery> {
             queries.push(ProviderQuery {
                 reason: InboxKindFlag::Involved,
                 source: "github_search_prs",
-                call: github_search_call("prs", "--involves", config.query_limit),
+                call: github_search_call(host, "prs", "--involves", config.query_limit),
             });
         }
         if config.allows_issue() {
             queries.push(ProviderQuery {
                 reason: InboxKindFlag::Involved,
                 source: "github_search_issues",
-                call: github_search_call("issues", "--involves", config.query_limit),
+                call: github_search_call(host, "issues", "--involves", config.query_limit),
             });
         }
     }
     queries
 }
 
-fn github_search_call(kind: &str, qualifier: &str, limit: u32) -> BackendCall {
+fn github_search_call(host: &str, kind: &str, qualifier: &str, limit: u32) -> BackendCall {
     BackendCall::new(
         BackendProgram::Gh,
         [
@@ -1710,6 +1717,7 @@ fn github_search_call(kind: &str, qualifier: &str, limit: u32) -> BackendCall {
             OsString::from(GH_JSON_FIELDS),
         ],
     )
+    .with_host(Provider::GitHub, host)
 }
 
 fn gitlab_identity_call(host: &str) -> BackendCall {
@@ -2374,6 +2382,7 @@ mod tests {
             format: None,
             remote: "missing-remote".into(),
             provider: None,
+            host: None,
             repo: None,
             store_root: None,
             dry_run: false,
@@ -2383,6 +2392,23 @@ mod tests {
         assert_eq!(targets[0].provider, Provider::GitHub);
         assert_eq!(targets[1].provider, Provider::GitLab);
         assert_eq!(targets[1].host, "gitlab.com");
+    }
+
+    #[test]
+    fn github_inbox_queries_bind_target_host() {
+        let config = QueryConfig::new(
+            vec![InboxKindFlag::Review, InboxKindFlag::Assigned],
+            InboxItemTypeFlag::All,
+            5,
+        );
+        let queries = github_queries("internal.ghe.com", &config);
+
+        assert!(!queries.is_empty());
+        assert!(
+            queries
+                .iter()
+                .all(|query| query.call.resolved_host() == Some("internal.ghe.com"))
+        );
     }
 
     #[test]

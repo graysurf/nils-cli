@@ -9,6 +9,7 @@ mod fix;
 pub mod ledger;
 mod ledger_sync;
 mod ledger_update;
+pub mod mutation_lock;
 pub mod parse;
 mod repo_root;
 mod repr;

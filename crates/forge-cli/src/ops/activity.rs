@@ -18,7 +18,7 @@ use crate::cli::{
 use crate::envelope::emit_success;
 use crate::error::ForgeError;
 use crate::ops::gitlab_api;
-use crate::provider::{Provider, ProviderContext, detect, git_remote_url};
+use crate::provider::{Provider, ProviderContext, detect, detect_unscoped, git_remote_url};
 use crate::rate_limit::default_runner;
 
 const COMMITS_SCHEMA: &str = "activity.commits";
@@ -173,12 +173,21 @@ pub fn run_with<R: BackendRunner, F: Fn(&str) -> Option<String>>(
     format: OutputFormat,
     remote_url_lookup: F,
 ) -> Result<i32, ForgeError> {
-    let ctx = detect(
-        global.provider_hint(),
-        &global.remote,
-        global.repo.as_deref(),
-        &remote_url_lookup,
-    )?;
+    let ctx = if matches!(&command, ActivityCommand::Feed(_)) {
+        detect(
+            global.provider_hint(),
+            &global.remote,
+            global.repo.as_deref(),
+            &remote_url_lookup,
+        )?
+    } else {
+        detect_unscoped(
+            global.provider_hint(),
+            &global.remote,
+            global.repo.as_deref(),
+            &remote_url_lookup,
+        )?
+    };
     match ctx.provider {
         Provider::GitHub => run_github(runner, global, &ctx, command, format, &remote_url_lookup),
         Provider::GitLab => run_gitlab(runner, global, &ctx, command, format, &remote_url_lookup),
@@ -1627,6 +1636,7 @@ mod tests {
             format: Some(OutputFormat::Json),
             remote: "origin".into(),
             provider: Some(provider),
+            host: None,
             repo: None,
             store_root: None,
             dry_run: false,

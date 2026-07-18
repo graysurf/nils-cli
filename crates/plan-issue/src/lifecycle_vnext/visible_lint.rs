@@ -33,6 +33,10 @@ pub mod codes {
     // State.
     pub const STATE_MISSING_TASK_LEDGER: &str = "state-missing-task-ledger";
     pub const STATE_FINAL_TASK_LEDGER_NOT_EXPANDED: &str = "state-final-task-ledger-not-expanded";
+    pub const STATE_FINAL_CURRENT_ACTIONABLE: &str = "state-final-current-actionable";
+    pub const STATE_FINAL_NEXT_ACTION_MISSING: &str = "state-final-next-action-missing";
+    pub const STATE_TARGET_SCOPE_MISSING: &str = "state-target-scope-missing";
+    pub const STATE_TARGET_SCOPE_STATUS_TOKEN: &str = "state-target-scope-status-token";
 
     // Session.
     pub const SESSION_MISSING_SUMMARY: &str = "session-missing-summary";
@@ -91,14 +95,18 @@ impl VisibleReport {
 }
 
 /// Hints that callers pass to refine lint behavior beyond the registry
-/// defaults. `state_is_final` and `review_has_findings` mirror the taxonomy
-/// rules from the comment taxonomy doc.
+/// defaults. State finality controls ledger expansion, while terminal closure
+/// controls canonical current/next/scope fields. `review_has_findings` mirrors
+/// the review taxonomy rule.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct LintHints {
     /// `true` when the caller is rendering the final state checkpoint and
     /// the Task Ledger must be expanded. Non-final state may collapse rows
     /// but must keep the `## Task Ledger` heading visible.
     pub state_is_final: bool,
+    /// `true` when the state is terminal (`RECORD_CLOSED`) and its visible
+    /// current/next/scope fields must be canonical.
+    pub state_is_closed: bool,
     /// `true` when review findings are present and the review comment must
     /// include a disposition row.
     pub review_has_findings: bool,
@@ -176,6 +184,79 @@ fn check_state(body: &str, hints: LintHints, report: &mut VisibleReport) {
             "final state must expand the Task Ledger rows (no `<details>` wrapper)",
         ));
     }
+
+    if hints.state_is_closed {
+        if state_header_field(body, "- Current task:").as_deref() != Some("complete") {
+            report.push(VisibleFinding::new(
+                PayloadRole::State,
+                codes::STATE_FINAL_CURRENT_ACTIONABLE,
+                "final state must render `- Current task: complete`",
+            ));
+        }
+        if state_header_field(body, "- Next task:").as_deref() != Some("none") {
+            report.push(VisibleFinding::new(
+                PayloadRole::State,
+                codes::STATE_FINAL_NEXT_ACTION_MISSING,
+                "final state must render `- Next task: none`",
+            ));
+        }
+    }
+
+    if hints.state_is_closed {
+        match state_header_field(body, "- Target scope:").as_deref() {
+            None | Some("") => report.push(VisibleFinding::new(
+                PayloadRole::State,
+                codes::STATE_TARGET_SCOPE_MISSING,
+                "final state must retain a non-empty authored target scope",
+            )),
+            Some(scope) if is_state_status_token(scope) => report.push(VisibleFinding::new(
+                PayloadRole::State,
+                codes::STATE_TARGET_SCOPE_STATUS_TOKEN,
+                "state target scope must describe authored scope, not a phase or status token",
+            )),
+            Some(_) => {}
+        }
+    }
+}
+
+fn state_header_field(body: &str, prefix: &str) -> Option<String> {
+    let lines = body.lines().collect::<Vec<_>>();
+    let start = lines
+        .iter()
+        .enumerate()
+        .filter_map(|(index, line)| {
+            matches!(line.trim(), "## Current State" | "## Execution State").then_some(index)
+        })
+        .next_back()?;
+    lines[start + 1..]
+        .iter()
+        .take_while(|line| !line.trim().starts_with("## "))
+        .find_map(|line| {
+            line.trim()
+                .strip_prefix(prefix)
+                .map(str::trim)
+                .map(str::to_string)
+        })
+}
+
+fn is_state_status_token(value: &str) -> bool {
+    let normalized = value.trim().to_ascii_lowercase().replace('_', "-");
+    matches!(
+        normalized.as_str(),
+        "initial"
+            | "implementing"
+            | "validating"
+            | "reviewing"
+            | "in-progress"
+            | "ready-for-close"
+            | "closed"
+            | "blocked"
+            | "complete"
+            | "done"
+            | "pending"
+            | "deferred"
+            | "waived"
+    )
 }
 
 fn check_session(body: &str, report: &mut VisibleReport) {

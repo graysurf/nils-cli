@@ -76,9 +76,8 @@ auditable but do not satisfy gate requirements once superseded.
 1. `source` and `plan` markers exist with structured payloads. `commit`
    matches a known commit in the local repo when `--bundle` is provided.
 2. Latest `state` payload has `status=complete`.
-3. Latest `state` payload `tasks` array has every entry in `done` or
-   `deferred` (with `deferred` entries explaining themselves via state
-   `notes`).
+3. Latest `state` payload `tasks` array has every entry in `done`,
+   `deferred`, or `waived`, matching the terminal Task Ledger vocabulary.
 4. Latest `validation` payload has `overall=pass`.
 5. Latest `review` payload `decision` is `approve` or `comments-only`,
    with no `findings` entry whose disposition is `residual` and severity
@@ -95,17 +94,14 @@ auditable but do not satisfy gate requirements once superseded.
    are included in the same label edit; final read-back must contain only that
    state label.
 
-When checks 1–7 or the label-catalog preflight fail, `record close` returns
-exit 1 without provider writes. The label convergence gate then performs one
-reversible label edit and provider read-back before the closeout comment,
-dashboard edit, and issue close. If that gate fails, the issue remains open
-and no closeout write is posted; a partially applied edit is compensated by
-reversing and verifying only this command's label delta. The same compensation
-runs if a later pre-close write fails, preserving unrelated provider changes;
-rollback failure is surfaced separately. The issue-close request is the commit
-point, so an ambiguous close response never restores pre-close labels on a
-potentially closed issue. Every failure emits a machine-readable code matching
-the spec
+When checks 1–8 or label-catalog preflight fail, `record close` exits without
+provider writes. While holding the lifecycle lock, it rereads gate-bearing issue
+and PR evidence, reevaluates the gate, and closes the issue as the first
+mutation. It then converges labels, resolves closeout evidence under the
+contract's latest-semantic-match and single-post-attempt rule, and writes the
+final dashboard. Failures after confirmed closure do not reopen the issue and
+are returned for retry or repair. Every failure emits a machine-readable code
+matching the spec
 [Strict Closeout Validation](issue-backed-plan-record-contract-v2.md#strict-closeout-validation).
 
 ## Dashboard Invariants

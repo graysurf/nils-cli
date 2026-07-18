@@ -27,7 +27,7 @@ use nils_common::cli_contract::{Envelope, EnvelopeError, OutputFormat, schema_ve
 use serde::Serialize;
 use serde_json::Value;
 
-use crate::backend::{BackendCall, BackendProgram, BackendRunner};
+use crate::backend::BackendRunner;
 use crate::cli::{
     BINARY, GlobalFlags, PrCreateArgs, PrDeliverArgs, PrListArgs, PrMergeArgs, PrStateFilter,
     PrWaitChecksArgs,
@@ -794,14 +794,7 @@ fn build_dry_run_payload(
     let mut plan_steps = vec![
         DryRunStep {
             step: "auth_status",
-            plan: BackendCall::new(
-                BackendProgram::for_provider(ctx.provider),
-                [
-                    std::ffi::OsString::from("auth"),
-                    std::ffi::OsString::from("status"),
-                ],
-            )
-            .plan_argv(),
+            plan: auth_status::build_call(ctx).plan_argv(),
         },
         DryRunStep {
             step: "repo_view",
@@ -827,7 +820,7 @@ fn build_dry_run_payload(
         });
         plan_steps.push(DryRunStep {
             step: "merge",
-            plan: pr_merge_dry_plan(ctx, args),
+            plan: pr_merge_dry_plan(ctx, args, workdir),
         });
         if !args.no_issue_closeout {
             plan_steps.push(DryRunStep {
@@ -903,154 +896,69 @@ fn pr_lookup_dry_plan(ctx: &ProviderContext, head: &str) -> Vec<String> {
 }
 
 fn repo_view_dry_plan(ctx: &ProviderContext) -> Vec<String> {
-    let mut call = BackendCall::new(
-        BackendProgram::for_provider(ctx.provider),
-        match ctx.provider {
-            Provider::GitHub | Provider::Local => vec![
-                std::ffi::OsString::from("repo"),
-                std::ffi::OsString::from("view"),
-                std::ffi::OsString::from("--json"),
-            ],
-            Provider::GitLab => vec![
-                std::ffi::OsString::from("repo"),
-                std::ffi::OsString::from("view"),
-                std::ffi::OsString::from("-F"),
-                std::ffi::OsString::from("json"),
-            ],
-        },
-    );
-    if let Provider::GitHub = ctx.provider {
-        call.argv.push(std::ffi::OsString::from(
-            "name,owner,defaultBranchRef,mergeCommitAllowed,squashMergeAllowed,rebaseMergeAllowed,url",
-        ));
-    }
-    call.plan_argv()
+    repo_view::build_call_for_default_branch(ctx).plan_argv()
 }
 
 fn pr_create_dry_plan(ctx: &ProviderContext, args: &PrDeliverArgs) -> Vec<String> {
-    let head = args
-        .head
-        .clone()
-        .unwrap_or_else(|| "<current-branch>".into());
-    let base = args.base.clone().unwrap_or_else(|| "<repo-default>".into());
-    let mut argv = match ctx.provider {
-        Provider::GitHub | Provider::Local => vec![
-            "pr",
-            "create",
-            "--head",
-            &head,
-            "--base",
-            &base,
-            "--title",
-            &args.title,
-            "--draft",
-        ],
-        Provider::GitLab => vec![
-            "mr",
-            "create",
-            "--source-branch",
-            &head,
-            "--target-branch",
-            &base,
-            "--title",
-            &args.title,
-            "--draft",
-        ],
-    };
-    if args.body.is_some() {
-        argv.extend_from_slice(&["--body", "<inline>"]);
-    } else if args.body_file.is_some() {
-        argv.extend_from_slice(&["--body-file", "<path>"]);
-    }
-    let joined_labels = args.labels.join(",");
-    match ctx.provider {
-        Provider::GitHub | Provider::Local => {
-            for label in &args.labels {
-                argv.extend_from_slice(&["--label", label]);
-            }
-        }
-        Provider::GitLab => {
-            if !args.labels.is_empty() {
-                argv.extend_from_slice(&["--label", &joined_labels]);
-            }
-        }
-    }
-    let mut out = vec![
-        BackendProgram::for_provider(ctx.provider)
-            .default_executable()
-            .to_string(),
-    ];
-    out.extend(argv.into_iter().map(String::from));
-    out
+    let head = args.head.as_deref().unwrap_or("<current-branch>");
+    let base = args.base.as_deref().unwrap_or("<repo-default>");
+    pr_create::build_create_call(
+        ctx,
+        head,
+        base,
+        &args.title,
+        "<body>",
+        Path::new("<body-file>"),
+        true,
+        &args.reviewers,
+        &args.labels,
+    )
+    .plan_argv()
 }
 
 fn pr_wait_checks_dry_plan(ctx: &ProviderContext) -> Vec<String> {
-    let prog = BackendProgram::for_provider(ctx.provider).default_executable();
-    match ctx.provider {
-        Provider::GitHub | Provider::Local => {
-            pr_checks::build_github_required_call(ctx, "<pr-number>").plan_argv()
-        }
-        Provider::GitLab => vec![
-            prog.into(),
-            "ci".into(),
-            "status".into(),
-            "-b".into(),
-            "<branch>".into(),
-        ],
-    }
+    pr_checks::build_dry_run_call(
+        ctx,
+        &crate::cli::PrChecksArgs {
+            id: "<pr-number>".into(),
+            required_only: true,
+        },
+    )
+    .plan_argv()
 }
 
 fn pr_ready_dry_plan(ctx: &ProviderContext) -> Vec<String> {
-    let prog = BackendProgram::for_provider(ctx.provider).default_executable();
-    match ctx.provider {
-        Provider::GitHub | Provider::Local => vec![
-            prog.into(),
-            "pr".into(),
-            "ready".into(),
-            "<pr-number>".into(),
-        ],
-        Provider::GitLab => vec![
-            prog.into(),
-            "mr".into(),
-            "update".into(),
-            "<pr-number>".into(),
-            "--ready".into(),
-        ],
-    }
+    pr_ready::build_ready_call(ctx, 0)
+        .plan_argv()
+        .into_iter()
+        .map(|arg| {
+            if arg == "0" {
+                "<pr-number>".into()
+            } else {
+                arg
+            }
+        })
+        .collect()
 }
 
-fn pr_merge_dry_plan(ctx: &ProviderContext, args: &PrDeliverArgs) -> Vec<String> {
-    let prog = BackendProgram::for_provider(ctx.provider).default_executable();
-    let method = args.method.into_method();
-    let mut out: Vec<String> = match ctx.provider {
-        Provider::GitHub | Provider::Local => vec![
-            prog.into(),
-            "pr".into(),
-            "merge".into(),
-            "<pr-number>".into(),
-            format!("--{}", method.as_str()),
-        ],
-        Provider::GitLab => {
-            let mut v = vec![
-                prog.to_string(),
-                "mr".into(),
-                "merge".into(),
-                "<pr-number>".into(),
-            ];
-            if matches!(method, crate::config::MergeMethod::Squash) {
-                v.push("--squash".into());
-            }
-            v
+fn pr_merge_dry_plan(ctx: &ProviderContext, args: &PrDeliverArgs, workdir: &Path) -> Vec<String> {
+    let cfg = ForgeConfig::load_layered(workdir, find_git_toplevel(workdir).as_deref());
+    pr_merge::build_dry_run_merge_call(
+        ctx,
+        0,
+        args.method.into_method(),
+        cfg.resolve_delete_branch(None),
+    )
+    .plan_argv()
+    .into_iter()
+    .map(|arg| {
+        if arg == "0" {
+            "<pr-number>".into()
+        } else {
+            arg.replace("/0/merge", "/<pr-number>/merge")
         }
-    };
-    let cfg = ForgeConfig::default();
-    if cfg.resolve_delete_branch(None) {
-        match ctx.provider {
-            Provider::GitHub | Provider::Local => out.push("--delete-branch".into()),
-            Provider::GitLab => out.push("--remove-source-branch".into()),
-        }
-    }
-    out
+    })
+    .collect()
 }
 
 /// Dry-run plan for the post-merge closeout step. Two-phase at run time
@@ -1314,6 +1222,7 @@ mod tests {
             format: Some(OutputFormat::Json),
             remote: "origin".into(),
             provider: Some(crate::cli::ProviderFlag::Local),
+            host: None,
             repo: None,
             store_root: None,
             dry_run: true,
@@ -1368,7 +1277,7 @@ mod tests {
         });
         plan_steps.push(DryRunStep {
             step: "merge",
-            plan: pr_merge_dry_plan(&c, &a),
+            plan: pr_merge_dry_plan(&c, &a, Path::new(".")),
         });
         plan_steps.push(DryRunStep {
             step: "issue_closeout",
@@ -1377,6 +1286,96 @@ mod tests {
         assert_eq!(plan_steps.len(), 8);
         // Skip-when --no-merge collapses to 5 steps (closeout is merge-gated).
         let _ = format;
+    }
+
+    #[test]
+    fn enterprise_dry_run_plans_bind_resolved_host_and_repository() {
+        for (context, provider) in [
+            (
+                ProviderContext {
+                    provider: Provider::GitHub,
+                    host: "github.example.test".into(),
+                    source: DetectionSource::Flag,
+                    repo: Some("owner/repo".into()),
+                },
+                crate::cli::ProviderFlag::Github,
+            ),
+            (
+                ProviderContext {
+                    provider: Provider::GitLab,
+                    host: "gitlab.example.test".into(),
+                    source: DetectionSource::Flag,
+                    repo: Some("group/subgroup/repo".into()),
+                },
+                crate::cli::ProviderFlag::Gitlab,
+            ),
+        ] {
+            let workdir = tempfile::tempdir().unwrap();
+            let global = GlobalFlags {
+                format: Some(OutputFormat::Json),
+                remote: "origin".into(),
+                provider: Some(provider),
+                host: Some(context.host.clone()),
+                repo: context.repo.clone(),
+                store_root: None,
+                dry_run: true,
+            };
+            let payload = build_dry_run_payload(
+                &context,
+                &args(false),
+                workdir.path(),
+                &global,
+                None,
+                |_| None,
+            );
+            let auth = payload
+                .plan_steps
+                .iter()
+                .find(|step| step.step == "auth_status")
+                .unwrap();
+            assert!(
+                auth.plan
+                    .windows(2)
+                    .any(|pair| { pair[0] == "--hostname" && pair[1] == context.host }),
+                "auth dry plan is not host-bound: {:?}",
+                auth.plan
+            );
+
+            let locator = context.repo_locator().unwrap();
+            for step_name in [
+                "repo_view",
+                "lookup",
+                "create",
+                "wait_checks",
+                "ready",
+                "merge",
+                "issue_closeout",
+            ] {
+                let step = payload
+                    .plan_steps
+                    .iter()
+                    .find(|step| step.step == step_name)
+                    .unwrap();
+                let repository_bound = step.plan.iter().any(|arg| arg == &locator)
+                    || context.provider == Provider::GitLab
+                        && step_name == "merge"
+                        && step
+                            .plan
+                            .windows(2)
+                            .any(|pair| pair[0] == "--hostname" && pair[1] == context.host)
+                        && step.plan.iter().any(|arg| {
+                            arg.contains(&format!(
+                                "projects/{}/merge_requests/",
+                                context.repo.as_deref().unwrap().replace('/', "%2F")
+                            ))
+                        });
+                assert!(
+                    repository_bound,
+                    "{step_name} dry plan is not repository-bound: {:?}",
+                    step.plan
+                );
+            }
+        }
     }
 
     #[test]
@@ -1441,7 +1440,7 @@ mod tests {
     fn no_merge_dry_plan_excludes_ready_and_merge() {
         let c = ctx();
         let a = args(true);
-        let _plan = pr_merge_dry_plan(&c, &a); // smoke test
+        let _plan = pr_merge_dry_plan(&c, &a, Path::new(".")); // smoke test
         // The actual emission path filters ready/merge when no_merge is true;
         // that branch is covered by the integration test asserting plan_steps
         // length is 4 in that mode.

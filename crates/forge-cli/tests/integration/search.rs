@@ -2,7 +2,7 @@
 
 use pretty_assertions::assert_eq;
 
-use super::support::{StubEnv, parse_envelope, run_forge_cli};
+use super::support::{StubEnv, parse_envelope, run_forge_cli, run_forge_cli_in};
 
 const GH_SEARCH_STUB: &str = r#"#!/bin/sh
 case "$*" in
@@ -189,6 +189,127 @@ fn search_issues_dry_run_lists_gh_search_plan() {
 }
 
 #[test]
+fn search_issues_keeps_enterprise_repo_filter_unqualified() {
+    let stub = StubEnv::new().gh_stub("#!/bin/sh\nexit 97\n");
+    let out = run_forge_cli(
+        &stub,
+        &[
+            "--provider",
+            "github",
+            "--host",
+            "internal.ghe.com",
+            "--repo",
+            "acme/widget",
+            "--dry-run",
+            "--format",
+            "json",
+            "search",
+            "issues",
+            "rumdl",
+        ],
+    );
+    assert_eq!(out.code, 0, "stderr={}", out.stderr);
+    let envelope = parse_envelope(&out.stdout);
+    let plan = envelope["data"]["plan"].as_array().expect("plan array");
+    let repo = plan
+        .iter()
+        .position(|value| value == "--repo")
+        .and_then(|index| plan.get(index + 1))
+        .expect("--repo slug");
+    assert_eq!(repo, "acme/widget");
+}
+
+#[test]
+fn search_issues_binds_enterprise_host_separately_from_repo_filter() {
+    let stub = StubEnv::new().gh_stub(
+        r#"#!/bin/sh
+if [ "$GH_HOST" != "internal.ghe.com" ]; then
+  echo "unexpected GH_HOST: $GH_HOST" >&2
+  exit 96
+fi
+case "$*" in
+  "search issues rumdl --repo acme/widget --match title,body,comments --limit 30 --json number,title,url,state,repository,isPullRequest")
+    printf '[]\n'
+    ;;
+  *)
+    echo "unexpected gh argv: $*" >&2
+    exit 97
+    ;;
+esac
+"#,
+    );
+    let out = run_forge_cli(
+        &stub,
+        &[
+            "--provider",
+            "github",
+            "--host",
+            "internal.ghe.com",
+            "--repo",
+            "acme/widget",
+            "--format",
+            "json",
+            "search",
+            "issues",
+            "rumdl",
+        ],
+    );
+    assert_eq!(out.code, 0, "stdout={} stderr={}", out.stdout, out.stderr);
+}
+
+#[test]
+fn search_issues_overrides_conflicting_ambient_github_host() {
+    let stub = StubEnv::new().env("GH_HOST", "wrong.ghe.example").gh_stub(
+        r#"#!/bin/sh
+if [ "$GH_HOST" != "github.com" ]; then
+  echo "unexpected GH_HOST: $GH_HOST" >&2
+  exit 96
+fi
+printf '[]\n'
+"#,
+    );
+    let out = run_forge_cli(
+        &stub,
+        &[
+            "--provider",
+            "github",
+            "--repo",
+            "acme/widget",
+            "--format",
+            "json",
+            "search",
+            "issues",
+            "rumdl",
+        ],
+    );
+    assert_eq!(out.code, 0, "stdout={} stderr={}", out.stdout, out.stderr);
+}
+
+#[test]
+fn search_explicit_host_without_repo_fails_before_backend() {
+    let stub = StubEnv::new().gh_stub("#!/bin/sh\necho backend-called >&2\nexit 99\n");
+    let out = run_forge_cli_in(
+        &stub,
+        &[
+            "--provider",
+            "github",
+            "--host",
+            "internal.ghe.com",
+            "--format",
+            "json",
+            "search",
+            "issues",
+            "rumdl",
+        ],
+        Some(stub.tempdir.path()),
+    );
+    assert_eq!(out.code, 65, "stdout={} stderr={}", out.stdout, out.stderr);
+    let envelope = parse_envelope(&out.stdout);
+    assert_eq!(envelope["error"]["code"], "repo_required");
+    assert!(!out.stderr.contains("backend-called"));
+}
+
+#[test]
 fn search_gitlab_branch_is_provider_unsupported() {
     let stub = StubEnv::new();
     let out = run_forge_cli(
@@ -196,6 +317,8 @@ fn search_gitlab_branch_is_provider_unsupported() {
         &[
             "--provider",
             "gitlab",
+            "--host",
+            "gitlab.com",
             "--repo",
             "acme/widget",
             "--format",
@@ -351,6 +474,8 @@ fn search_refs_to_gitlab_branch_is_provider_unsupported() {
         &[
             "--provider",
             "gitlab",
+            "--host",
+            "gitlab.com",
             "--repo",
             "acme/widget",
             "--format",

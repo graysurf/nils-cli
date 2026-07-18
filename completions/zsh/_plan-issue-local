@@ -566,7 +566,7 @@ _arguments "${_arguments_options[@]}" : \
         case $line[1] in
             (init)
 _arguments "${_arguments_options[@]}" : \
-'--provider-repo=[Repository slug in \`owner/repo\` form]:owner/repo:_default' \
+'--provider-repo=[Repository identity as \`owner/repo\` or a qualified provider URL]:url|owner/repo:_default' \
 '--issue=[Issue number]:number:_default' \
 '--profile=[Lifecycle profile for the new run]:PROFILE:(tracking dispatch)' \
 '--bundle=[Plan bundle directory]:dir:_files' \
@@ -624,8 +624,8 @@ esac
 ;;
 (checkpoint)
 _arguments "${_arguments_options[@]}" : \
-'--provider-repo=[Repository slug for live mode]:owner/repo:_default' \
-'--issue=[Issue number for live mode]:number:_default' \
+'--provider-repo=[Repository identity for live mode. It must match the persisted run state. Runs without provider/host metadata require a qualified URL. Persisted self-hosted identities require either a matching checkout or a qualified URL that confirms the same provider, host, and repository]:url|owner/repo:_default' \
+'--issue=[Issue number for live mode. Must match a nonzero persisted issue]:number:_default' \
 '--profile=[Lifecycle profile]:PROFILE:(tracking dispatch)' \
 '--run-state=[Run-state path]:path:_files' \
 '--post=[Comma-separated lifecycle roles to render (\`state,session,validation,review\`)]:roles:_default' \
@@ -768,7 +768,7 @@ _plan-issue-local__subcmd__ready-sprint_commands() {
 (( $+functions[_plan-issue-local__subcmd__record_commands] )) ||
 _plan-issue-local__subcmd__record_commands() {
     local commands; commands=(
-'open:Open a provider issue from a plan bundle and post initial lifecycle comments (v3 issue-backed plan record contract). Idempotent\: re-running for the same bundle resumes the existing tracker instead of creating a duplicate. The dedup key is the source snapshot identity (repo-relative path + last-commit SHA) embedded in the source lifecycle comment; on a match only the missing lifecycle comments are attached. A partial open is therefore safe to retry' \
+'open:Open a provider issue from a plan bundle and post initial lifecycle comments (v3 issue-backed plan record contract). Idempotent\: re-running for the same bundle resumes the existing tracker instead of creating a duplicate. The dedup key is the source snapshot identity (repo-relative path + revision) embedded as a direct issue-body identity marker. Automatic resume requires exactly one valid exact body marker; historical identity found only in source lifecycle comments requires repair. On a trusted match only missing lifecycle comments are attached' \
 'attach:Attach source, plan, and initial state lifecycle comments to an existing provider issue' \
 'post:Append a canonical lifecycle comment (state, session, validation, review, or closeout) to an existing plan record issue' \
 'repair-dashboard:Recompute and edit the dashboard issue body from active payload evidence. Old state payload formats require one-off migration/repair' \

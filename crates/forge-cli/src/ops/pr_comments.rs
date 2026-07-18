@@ -110,6 +110,20 @@ fn build_comments_call(
 ) -> Result<BackendCall, ForgeError> {
     match ctx.provider {
         Provider::GitHub => {
+            let view_host = gitlab_host_from_url(&view.url).ok_or_else(|| {
+                ForgeError::software(
+                    schema_err(),
+                    "unable to derive GitHub host from PR url",
+                    Some(format!("url={}", view.url)),
+                )
+            })?;
+            if !crate::provider::authorities_equal(Provider::GitHub, &view_host, &ctx.host) {
+                return Err(ForgeError::software(
+                    schema_err(),
+                    "GitHub PR url authority does not match the selected provider host",
+                    None,
+                ));
+            }
             let slug = github_repo_slug_from_url(&view.url).ok_or_else(|| {
                 ForgeError::software(
                     schema_err(),
@@ -121,14 +135,10 @@ fn build_comments_call(
                 "repos/{slug}/issues/{n}/comments?per_page=100",
                 n = view.number,
             );
-            Ok(BackendCall::new(
-                BackendProgram::Gh,
-                [
-                    OsString::from("api"),
-                    OsString::from("--paginate"),
-                    OsString::from(path),
-                ],
-            ))
+            let mut argv = vec![OsString::from("api"), OsString::from("--paginate")];
+            ctx.push_github_api_hostname(&mut argv);
+            argv.push(OsString::from(path));
+            Ok(BackendCall::new(BackendProgram::Gh, argv).with_host(Provider::GitHub, &ctx.host))
         }
         Provider::Local => {
             // The synthetic `local://<slug>/pull/<n>` URL has no github-style
@@ -437,10 +447,52 @@ mod tests {
             format: Some(OutputFormat::Json),
             remote: "origin".into(),
             provider: Some(crate::cli::ProviderFlag::Github),
+            host: None,
             repo: Some("o/r".into()),
             store_root: None,
             dry_run: false,
         }
+    }
+
+    #[test]
+    fn github_enterprise_comments_call_binds_context_host() {
+        let ctx = ProviderContext {
+            provider: Provider::GitHub,
+            host: "internal.ghe.com".into(),
+            source: crate::provider::DetectionSource::Flag,
+            repo: Some("o/r".into()),
+        };
+        let view = pr_view::PrViewPayload {
+            provider: "github",
+            number: 7,
+            url: "https://internal.ghe.com/o/r/pull/7".into(),
+            state: "OPEN",
+            draft: false,
+            title: "t".into(),
+            head: "feat/x".into(),
+            head_sha: None,
+            head_repository: None,
+            base: "main".into(),
+            mergeable: "MERGEABLE",
+            merged_at: None,
+            merge_commit_sha: None,
+            labels: Vec::new(),
+            body: None,
+            closing_issue_refs: Vec::new(),
+        };
+
+        let call = build_comments_call(&ctx, &view).expect("comments call");
+        let argv = call
+            .argv
+            .iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert!(
+            argv.windows(2)
+                .any(|pair| pair == ["--hostname", "internal.ghe.com"]),
+            "argv={argv:?}"
+        );
+        assert_eq!(call.resolved_host(), Some("internal.ghe.com"));
     }
 
     #[test]
@@ -601,6 +653,7 @@ mod tests {
             format: Some(OutputFormat::Json),
             remote: "origin".into(),
             provider: Some(crate::cli::ProviderFlag::Gitlab),
+            host: Some("gitlab.example.com".into()),
             repo: Some("grp/proj".into()),
             store_root: None,
             dry_run: false,

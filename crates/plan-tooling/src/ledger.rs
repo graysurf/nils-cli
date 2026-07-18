@@ -6,18 +6,40 @@
 //! `## Task Ledger` section is touched, every other byte of the file is
 //! preserved verbatim.
 
+use std::collections::HashMap;
 use std::fmt;
 use std::io;
 use std::path::{Path, PathBuf};
+#[cfg(test)]
+use std::sync::{Arc, Mutex};
 
 use nils_common::fs as common_fs;
 use nils_common::markdown::canonicalize_table_cell;
+use pulldown_cmark::{Event, HeadingLevel, Parser, Tag};
+
+use crate::exec_state::{ExecutionStateMutation, MutationLockError};
 
 const HEADING: &str = "## Task Ledger";
 const COL_ID: &str = "ID";
 const COL_STATUS: &str = "Status";
 const COL_EVIDENCE: &str = "Evidence";
 const COL_NOTES: &str = "Notes";
+
+#[cfg(test)]
+type AfterReadHook = Arc<dyn Fn(&Path) + Send + Sync>;
+#[cfg(test)]
+static AFTER_READ_HOOK: Mutex<Option<AfterReadHook>> = Mutex::new(None);
+
+#[cfg(test)]
+fn run_after_read_hook(path: &Path) {
+    let hook = AFTER_READ_HOOK
+        .lock()
+        .expect("after-read hook lock")
+        .clone();
+    if let Some(hook) = hook {
+        hook(path);
+    }
+}
 
 /// Status vocabulary for `ledger-update`; the completion clap model consumes
 /// this so the validator and shell completions cannot drift.
@@ -39,6 +61,18 @@ pub enum LedgerError {
     WriteFailed {
         path: PathBuf,
         source: common_fs::AtomicWriteError,
+    },
+    LockBusy {
+        path: PathBuf,
+        lock_path: PathBuf,
+    },
+    LockFailed {
+        path: PathBuf,
+        lock_path: PathBuf,
+        source: io::Error,
+    },
+    UnsafeFileAlias {
+        path: PathBuf,
     },
     TableMalformed {
         path: PathBuf,
@@ -63,6 +97,9 @@ impl LedgerError {
         match self {
             LedgerError::ReadFailed { .. } => "ledger-file-read-failed",
             LedgerError::WriteFailed { .. } => "ledger-file-write-failed",
+            LedgerError::LockBusy { .. } => "ledger-update-lock-busy",
+            LedgerError::LockFailed { .. } => "ledger-update-lock-failed",
+            LedgerError::UnsafeFileAlias { .. } => "ledger-file-unsafe-alias",
             LedgerError::TableMalformed { .. } => "ledger-table-malformed",
             LedgerError::RowNotFound { .. } => "ledger-row-not-found",
             LedgerError::RowAmbiguous { .. } => "ledger-row-ambiguous",
@@ -80,6 +117,27 @@ impl fmt::Display for LedgerError {
             LedgerError::WriteFailed { path, source } => {
                 write!(f, "failed to write {}: {source}", path.display())
             }
+            LedgerError::LockBusy { path, lock_path } => write!(
+                f,
+                "{}: execution-state mutation lock is busy at {}; retry after the active mutation finishes (the kernel releases the lock when its process exits)",
+                path.display(),
+                lock_path.display()
+            ),
+            LedgerError::LockFailed {
+                path,
+                lock_path,
+                source,
+            } => write!(
+                f,
+                "{}: failed to acquire execution-state mutation lock at {}: {source}",
+                path.display(),
+                lock_path.display()
+            ),
+            LedgerError::UnsafeFileAlias { path } => write!(
+                f,
+                "{}: execution-state file must be a regular file with exactly one hard link",
+                path.display()
+            ),
             LedgerError::TableMalformed { path, reason } => {
                 write!(
                     f,
@@ -130,20 +188,146 @@ pub struct LedgerRow {
     pub notes: String,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct LedgerColumns {
+    id: usize,
+    status: usize,
+    task: usize,
+    evidence: usize,
+    notes: Option<usize>,
+}
+
+fn required_column_index(
+    header: &[String],
+    column: &str,
+    path: &Path,
+) -> Result<usize, LedgerError> {
+    let matches = header
+        .iter()
+        .enumerate()
+        .filter_map(|(index, value)| (value == column).then_some(index))
+        .collect::<Vec<_>>();
+    match matches.as_slice() {
+        [index] => Ok(*index),
+        [] => Err(LedgerError::TableMalformed {
+            path: path.to_path_buf(),
+            reason: format!("header missing `{column}` column"),
+        }),
+        _ => Err(LedgerError::TableMalformed {
+            path: path.to_path_buf(),
+            reason: format!("header has duplicate `{column}` columns"),
+        }),
+    }
+}
+
+fn parse_header_columns(
+    header_cells: &[String],
+    path: &Path,
+) -> Result<LedgerColumns, LedgerError> {
+    let trimmed_header: Vec<String> = header_cells.iter().map(|c| c.trim().to_string()).collect();
+    let id = required_column_index(&trimmed_header, COL_ID, path)?;
+    let status = required_column_index(&trimmed_header, COL_STATUS, path)?;
+    let task_columns = trimmed_header
+        .iter()
+        .enumerate()
+        .filter_map(|(index, column)| matches!(column.as_str(), "Task" | "Title").then_some(index))
+        .collect::<Vec<_>>();
+    let task = match task_columns.as_slice() {
+        [index] => *index,
+        [] => {
+            return Err(LedgerError::TableMalformed {
+                path: path.to_path_buf(),
+                reason: "header missing `Task` or `Title` column".to_string(),
+            });
+        }
+        _ => {
+            return Err(LedgerError::TableMalformed {
+                path: path.to_path_buf(),
+                reason: "header has ambiguous task-description columns (`Task` and `Title`)"
+                    .to_string(),
+            });
+        }
+    };
+    let evidence = required_column_index(&trimmed_header, COL_EVIDENCE, path)?;
+    let notes_columns = trimmed_header
+        .iter()
+        .enumerate()
+        .filter_map(|(index, column)| (column == COL_NOTES).then_some(index))
+        .collect::<Vec<_>>();
+    let notes = match notes_columns.as_slice() {
+        [] => None,
+        [index] => Some(*index),
+        _ => {
+            return Err(LedgerError::TableMalformed {
+                path: path.to_path_buf(),
+                reason: format!("header has duplicate `{COL_NOTES}` columns"),
+            });
+        }
+    };
+
+    Ok(LedgerColumns {
+        id,
+        status,
+        task,
+        evidence,
+        notes,
+    })
+}
+
+fn task_ledger_heading_indices(raw: &str) -> Vec<usize> {
+    Parser::new(raw)
+        .into_offset_iter()
+        .filter_map(|(event, range)| match event {
+            Event::Start(Tag::Heading {
+                level: HeadingLevel::H2,
+                ..
+            }) => {
+                let line_start = raw[..range.start]
+                    .rfind('\n')
+                    .map(|offset| offset + 1)
+                    .unwrap_or(0);
+                let line = raw[line_start..]
+                    .split_once('\n')
+                    .map(|(line, _)| line)
+                    .unwrap_or(&raw[line_start..])
+                    .trim_end_matches('\r');
+                let indentation = line.bytes().take_while(|byte| *byte == b' ').count();
+                (indentation <= 3 && line[indentation..].trim_end() == HEADING).then(|| {
+                    raw[..line_start]
+                        .bytes()
+                        .filter(|byte| *byte == b'\n')
+                        .count()
+                })
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+fn task_ledger_heading_index(raw: &str, path: &Path) -> Result<usize, LedgerError> {
+    let headings = task_ledger_heading_indices(raw);
+    match headings.as_slice() {
+        [index] => Ok(*index),
+        [] => Err(LedgerError::TableMalformed {
+            path: path.to_path_buf(),
+            reason: format!("missing `{HEADING}` heading"),
+        }),
+        _ => Err(LedgerError::TableMalformed {
+            path: path.to_path_buf(),
+            reason: format!("multiple `{HEADING}` headings"),
+        }),
+    }
+}
+
 /// Parse the `## Task Ledger` table out of `raw` and return rows.
 ///
 /// Returns `Err(LedgerError::TableMalformed)` when the heading or expected
-/// columns (`ID`, `Status`, `Task`, `Evidence`) are missing. `Notes` is
-/// optional; rows without a notes column report an empty string.
+/// columns (`ID`, `Status`, exactly one of `Task`/`Title`, `Evidence`) are
+/// missing. `Notes` is optional; rows without a notes column report an empty
+/// string.
 pub fn read_rows(raw: &str, path: &Path) -> Result<Vec<LedgerRow>, LedgerError> {
     let lines: Vec<&str> = raw.split('\n').collect();
-    let heading_idx = lines
-        .iter()
-        .position(|line| line.trim() == HEADING)
-        .ok_or_else(|| LedgerError::TableMalformed {
-            path: path.to_path_buf(),
-            reason: format!("missing `{HEADING}` heading"),
-        })?;
+    let heading_idx = task_ledger_heading_index(raw, path)?;
     let mut header_idx = None;
     for (idx, line) in lines.iter().enumerate().skip(heading_idx + 1) {
         if line.trim().is_empty() {
@@ -166,49 +350,31 @@ pub fn read_rows(raw: &str, path: &Path) -> Result<Vec<LedgerRow>, LedgerError> 
         path: path.to_path_buf(),
         reason: "header is not a pipe row".to_string(),
     })?;
-    let trimmed_header: Vec<String> = header_cells.iter().map(|c| c.trim().to_string()).collect();
-    let id_col = trimmed_header
-        .iter()
-        .position(|c| c == COL_ID)
-        .ok_or_else(|| LedgerError::TableMalformed {
-            path: path.to_path_buf(),
-            reason: format!("header missing `{COL_ID}` column"),
-        })?;
-    let status_col = trimmed_header
-        .iter()
-        .position(|c| c == COL_STATUS)
-        .ok_or_else(|| LedgerError::TableMalformed {
-            path: path.to_path_buf(),
-            reason: format!("header missing `{COL_STATUS}` column"),
-        })?;
-    let task_col = trimmed_header
-        .iter()
-        .position(|c| c == "Task")
-        .ok_or_else(|| LedgerError::TableMalformed {
-            path: path.to_path_buf(),
-            reason: "header missing `Task` column".to_string(),
-        })?;
-    let evidence_col = trimmed_header
-        .iter()
-        .position(|c| c == COL_EVIDENCE)
-        .ok_or_else(|| LedgerError::TableMalformed {
-            path: path.to_path_buf(),
-            reason: format!("header missing `{COL_EVIDENCE}` column"),
-        })?;
-    let notes_col = trimmed_header.iter().position(|c| c == COL_NOTES);
+    let columns = parse_header_columns(&header_cells, path)?;
 
     let separator_idx = header_idx + 1;
-    if !lines
+    let separator_cells = lines
         .get(separator_idx)
-        .map(|line| is_separator_row(line))
-        .unwrap_or(false)
-    {
-        return Err(LedgerError::TableMalformed {
+        .and_then(|line| split_row(line))
+        .filter(|_| is_separator_row(lines[separator_idx]))
+        .ok_or_else(|| LedgerError::TableMalformed {
             path: path.to_path_buf(),
             reason: "expected separator row beneath header".to_string(),
+        })?;
+    if separator_cells.len() != header_cells.len() {
+        return Err(LedgerError::TableMalformed {
+            path: path.to_path_buf(),
+            reason: format!(
+                "separator has {} cells but header has {}",
+                separator_cells.len(),
+                header_cells.len()
+            ),
         });
     }
+
     let mut rows = Vec::new();
+    let mut id_occurrences = HashMap::new();
+    let mut first_duplicate_id = None;
     let mut idx = separator_idx + 1;
     while idx < lines.len() {
         let line = lines[idx];
@@ -216,33 +382,79 @@ pub fn read_rows(raw: &str, path: &Path) -> Result<Vec<LedgerRow>, LedgerError> 
             break;
         }
         if !line.trim_start().starts_with('|') {
-            break;
-        }
-        if let Some(cells) = split_row(line) {
-            rows.push(LedgerRow {
-                id: cells
-                    .get(id_col)
-                    .map(|c| c.trim().to_string())
-                    .unwrap_or_default(),
-                status: cells
-                    .get(status_col)
-                    .map(|c| c.trim().to_string())
-                    .unwrap_or_default(),
-                task: cells
-                    .get(task_col)
-                    .map(|c| c.trim().to_string())
-                    .unwrap_or_default(),
-                evidence: cells
-                    .get(evidence_col)
-                    .map(|c| c.trim().to_string())
-                    .unwrap_or_default(),
-                notes: notes_col
-                    .and_then(|c| cells.get(c))
-                    .map(|c| c.trim().to_string())
-                    .unwrap_or_default(),
+            return Err(LedgerError::TableMalformed {
+                path: path.to_path_buf(),
+                reason: format!("row {} is not a complete pipe row", idx + 1),
             });
         }
+        let cells = split_row(line).ok_or_else(|| LedgerError::TableMalformed {
+            path: path.to_path_buf(),
+            reason: format!("row {} is not a complete pipe row", idx + 1),
+        })?;
+        if cells.len() != header_cells.len() {
+            return Err(LedgerError::TableMalformed {
+                path: path.to_path_buf(),
+                reason: format!(
+                    "row {} has {} cells but header has {}",
+                    idx + 1,
+                    cells.len(),
+                    header_cells.len()
+                ),
+            });
+        }
+
+        let id = cells[columns.id].trim().to_string();
+        let status = cells[columns.status].trim().to_string();
+        let task = cells[columns.task].trim().to_string();
+        if id.is_empty() {
+            return Err(LedgerError::TableMalformed {
+                path: path.to_path_buf(),
+                reason: format!("row {} has an empty task ID", idx + 1),
+            });
+        }
+        let occurrences = id_occurrences.entry(id.clone()).or_insert(0);
+        *occurrences += 1;
+        if *occurrences == 2 && first_duplicate_id.is_none() {
+            first_duplicate_id = Some(id.clone());
+        }
+        if !STATUS_VALUES.contains(&status.as_str()) {
+            return Err(LedgerError::TableMalformed {
+                path: path.to_path_buf(),
+                reason: format!("row {} has invalid status `{status}`", idx + 1),
+            });
+        }
+        if task.is_empty() {
+            return Err(LedgerError::TableMalformed {
+                path: path.to_path_buf(),
+                reason: format!("row {} has an empty task description", idx + 1),
+            });
+        }
+
+        rows.push(LedgerRow {
+            id,
+            status,
+            task,
+            evidence: cells[columns.evidence].trim().to_string(),
+            notes: columns
+                .notes
+                .map(|column| cells[column].trim().to_string())
+                .unwrap_or_default(),
+        });
         idx += 1;
+    }
+    if rows.is_empty() {
+        return Err(LedgerError::TableMalformed {
+            path: path.to_path_buf(),
+            reason: "Task Ledger must contain at least one row".to_string(),
+        });
+    }
+    if let Some(task_id) = first_duplicate_id {
+        let occurrences = id_occurrences[&task_id];
+        return Err(LedgerError::RowAmbiguous {
+            path: path.to_path_buf(),
+            task_id,
+            occurrences,
+        });
     }
     Ok(rows)
 }
@@ -255,10 +467,32 @@ pub struct PatchOutcome {
     pub new_status: String,
     pub previous_evidence: String,
     pub new_evidence: String,
+    pub evidence_appended: bool,
     pub previous_notes: String,
     pub new_notes: String,
     pub notes_changed: bool,
     pub new_text: String,
+}
+
+fn map_mutation_lock_error(error: MutationLockError) -> LedgerError {
+    match error {
+        MutationLockError::Busy { path, lock_path } => LedgerError::LockBusy { path, lock_path },
+        MutationLockError::UnsafeFileAlias { path } => LedgerError::UnsafeFileAlias { path },
+        MutationLockError::Failed { path, source, .. }
+            if source.kind() == io::ErrorKind::NotFound =>
+        {
+            LedgerError::ReadFailed { path, source }
+        }
+        MutationLockError::Failed {
+            path,
+            lock_path,
+            source,
+        } => LedgerError::LockFailed {
+            path,
+            lock_path,
+            source,
+        },
+    }
 }
 
 /// Apply a row patch to the file at `path`, write atomically, return outcome.
@@ -271,19 +505,24 @@ pub fn update_row(
     dry_run: bool,
 ) -> Result<PatchOutcome, LedgerError> {
     validate_status(status)?;
-    let raw = std::fs::read_to_string(path).map_err(|source| LedgerError::ReadFailed {
-        path: path.to_path_buf(),
-        source,
-    })?;
+    let mutation = ExecutionStateMutation::begin(path).map_err(map_mutation_lock_error)?;
+    let raw = mutation
+        .read_to_string()
+        .map_err(|source| LedgerError::ReadFailed {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    #[cfg(test)]
+    run_after_read_hook(path);
 
     let outcome = patch_text(&raw, path, task_id, status, evidence, notes)?;
     if !dry_run && outcome.new_text != raw {
-        common_fs::write_atomic(path, outcome.new_text.as_bytes(), 0o644).map_err(|source| {
-            LedgerError::WriteFailed {
+        mutation
+            .write_atomic(outcome.new_text.as_bytes())
+            .map_err(|source| LedgerError::WriteFailed {
                 path: path.to_path_buf(),
                 source,
-            }
-        })?;
+            })?;
     }
     Ok(outcome)
 }
@@ -296,15 +535,12 @@ fn patch_text(
     evidence: &str,
     notes: Option<&str>,
 ) -> Result<PatchOutcome, LedgerError> {
+    // Mutation is permitted only for a ledger that satisfies the same complete
+    // controlled dialect consumed by checkpoint and close-ready readers.
+    read_rows(raw, path)?;
     let trailing_newline = raw.ends_with('\n');
     let lines: Vec<&str> = raw.split('\n').collect();
-    let heading_idx = lines
-        .iter()
-        .position(|line| line.trim() == HEADING)
-        .ok_or_else(|| LedgerError::TableMalformed {
-            path: path.to_path_buf(),
-            reason: format!("missing `{HEADING}` heading"),
-        })?;
+    let heading_idx = task_ledger_heading_index(raw, path)?;
 
     let mut header_idx = None;
     for (idx, line) in lines.iter().enumerate().skip(heading_idx + 1) {
@@ -329,29 +565,11 @@ fn patch_text(
         path: path.to_path_buf(),
         reason: format!("header line is not a pipe row: `{}`", lines[header_idx]),
     })?;
-    let trimmed_header: Vec<String> = header_cells.iter().map(|c| c.trim().to_string()).collect();
-    let id_col = trimmed_header
-        .iter()
-        .position(|c| c == COL_ID)
-        .ok_or_else(|| LedgerError::TableMalformed {
-            path: path.to_path_buf(),
-            reason: format!("header missing `{COL_ID}` column: {trimmed_header:?}"),
-        })?;
-    let status_col = trimmed_header
-        .iter()
-        .position(|c| c == COL_STATUS)
-        .ok_or_else(|| LedgerError::TableMalformed {
-            path: path.to_path_buf(),
-            reason: format!("header missing `{COL_STATUS}` column: {trimmed_header:?}"),
-        })?;
-    let evidence_col = trimmed_header
-        .iter()
-        .position(|c| c == COL_EVIDENCE)
-        .ok_or_else(|| LedgerError::TableMalformed {
-            path: path.to_path_buf(),
-            reason: format!("header missing `{COL_EVIDENCE}` column: {trimmed_header:?}"),
-        })?;
-    let notes_col = trimmed_header.iter().position(|c| c == COL_NOTES);
+    let columns = parse_header_columns(&header_cells, path)?;
+    let id_col = columns.id;
+    let status_col = columns.status;
+    let evidence_col = columns.evidence;
+    let notes_col = columns.notes;
 
     let separator_idx = header_idx + 1;
     if !lines
@@ -412,12 +630,15 @@ fn patch_text(
         .unwrap_or_default();
 
     let new_evidence_value = canonicalize_table_cell(evidence).trim().to_string();
+    let evidence_appended = !new_evidence_value.is_empty()
+        && !previous_evidence.is_empty()
+        && !is_evidence_placeholder(&previous_evidence);
     let new_evidence = if new_evidence_value.is_empty() {
         previous_evidence.clone()
-    } else if previous_evidence.is_empty() || is_evidence_placeholder(&previous_evidence) {
-        new_evidence_value
-    } else {
+    } else if evidence_appended {
         format!("{previous_evidence}; {new_evidence_value}")
+    } else {
+        new_evidence_value
     };
     let new_status = status.to_string();
     let new_notes = match notes {
@@ -458,6 +679,7 @@ fn patch_text(
         new_status,
         previous_evidence,
         new_evidence,
+        evidence_appended,
         previous_notes,
         new_notes,
         notes_changed,
@@ -479,18 +701,46 @@ fn is_evidence_placeholder(value: &str) -> bool {
 
 fn split_row(line: &str) -> Option<Vec<String>> {
     let trimmed = line.trim_end();
-    let trimmed = trimmed.strip_prefix('|')?;
-    let trimmed = trimmed.strip_suffix('|')?;
-    Some(trimmed.split('|').map(|cell| cell.to_string()).collect())
+    let row = trimmed.strip_prefix('|')?;
+    if !row.ends_with('|') || pipe_is_escaped(row.as_bytes(), row.len() - 1) {
+        return None;
+    }
+    let row = &row[..row.len() - 1];
+
+    let mut cells = Vec::new();
+    let mut cell_start = 0;
+    for (offset, byte) in row.bytes().enumerate() {
+        if byte == b'|' && !pipe_is_escaped(row.as_bytes(), offset) {
+            cells.push(row[cell_start..offset].to_string());
+            cell_start = offset + 1;
+        }
+    }
+    cells.push(row[cell_start..].to_string());
+    Some(cells)
+}
+
+fn pipe_is_escaped(row: &[u8], pipe_offset: usize) -> bool {
+    let preceding_backslashes = row[..pipe_offset]
+        .iter()
+        .rev()
+        .take_while(|byte| **byte == b'\\')
+        .count();
+    preceding_backslashes % 2 == 1
+}
+
+fn is_separator_cell(cell: &str) -> bool {
+    let delimiter = cell.trim();
+    let delimiter = delimiter.strip_prefix(':').unwrap_or(delimiter);
+    let delimiter = delimiter.strip_suffix(':').unwrap_or(delimiter);
+
+    delimiter.len() >= 3 && delimiter.chars().all(|ch| ch == '-')
 }
 
 fn is_separator_row(line: &str) -> bool {
     let Some(cells) = split_row(line) else {
         return false;
     };
-    cells
-        .iter()
-        .all(|c| !c.trim().is_empty() && c.trim().chars().all(|ch| ch == '-' || ch == ':'))
+    cells.iter().all(|cell| is_separator_cell(cell))
 }
 
 fn render_row(cells: &[String]) -> String {
@@ -513,6 +763,11 @@ fn render_row(cells: &[String]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Barrier, Condvar, mpsc};
+    use std::thread;
+    use std::time::Duration;
+
+    static AFTER_READ_HOOK_TEST_LOCK: Mutex<()> = Mutex::new(());
 
     const SAMPLE: &str = "# Demo
 
@@ -528,6 +783,551 @@ mod tests {
 
 - trailing section preserved verbatim
 ";
+
+    #[test]
+    fn concurrent_updates_never_lose_a_successful_change() {
+        let _hook_test_guard = AFTER_READ_HOOK_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = Arc::new(temp.path().join("execution-state.md"));
+        std::fs::write(path.as_ref(), SAMPLE).expect("write ledger");
+
+        let arrivals = Arc::new((Mutex::new(0usize), Condvar::new()));
+        let hook_arrivals = Arc::clone(&arrivals);
+        let hook_path = Arc::clone(&path);
+        *AFTER_READ_HOOK.lock().expect("install after-read hook") =
+            Some(Arc::new(move |read_path| {
+                if read_path != hook_path.as_ref() {
+                    return;
+                }
+                let (lock, ready) = &*hook_arrivals;
+                let mut count = lock.lock().expect("arrival count");
+                *count += 1;
+                ready.notify_all();
+                let _ = ready
+                    .wait_timeout_while(count, Duration::from_secs(1), |count| *count < 2)
+                    .expect("wait for concurrent readers");
+            }));
+
+        let start = Arc::new(Barrier::new(3));
+        let launch = |task_id: &'static str, evidence: &'static str| {
+            let path = Arc::clone(&path);
+            let start = Arc::clone(&start);
+            thread::spawn(move || {
+                start.wait();
+                update_row(&path, task_id, "done", evidence, None, false)
+            })
+        };
+        let first = launch("1.1", "first-concurrent-update");
+        let second = launch("1.2", "second-concurrent-update");
+        start.wait();
+
+        let first = first.join();
+        let second = second.join();
+        *AFTER_READ_HOOK.lock().expect("clear after-read hook") = None;
+        let results = [
+            (
+                "1.1",
+                "first-concurrent-update",
+                first.expect("first update thread"),
+            ),
+            (
+                "1.2",
+                "second-concurrent-update",
+                second.expect("second update thread"),
+            ),
+        ];
+
+        let final_text = std::fs::read_to_string(path.as_ref()).expect("read final ledger");
+        let rows = read_rows(&final_text, path.as_ref()).expect("parse final ledger");
+        for (task_id, evidence, result) in results {
+            match result {
+                Ok(_) => {
+                    let row = rows
+                        .iter()
+                        .find(|row| row.id == task_id)
+                        .expect("updated row remains present");
+                    assert_eq!(
+                        (row.status.as_str(), row.evidence.as_str()),
+                        ("done", evidence),
+                        "successful update to row {task_id} was lost"
+                    );
+                }
+                Err(error) => assert_eq!(error.code(), "ledger-update-lock-busy"),
+            }
+        }
+    }
+
+    fn assert_overlapping_exec_state_mutation_never_loses_success(
+        mutate: impl FnOnce(
+            &Path,
+        )
+            -> Result<crate::exec_state::SyncReport, crate::exec_state::ExecStateError>,
+        verify_mutation: impl FnOnce(&str),
+    ) {
+        let _hook_test_guard = AFTER_READ_HOOK_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = Arc::new(temp.path().join("execution-state.md"));
+        let initial = SAMPLE.replacen(
+            "# Demo\n\n",
+            "# Demo\n\n## Execution State\n\n- Status: active\n- Tracking issue: not yet opened\n\n",
+            1,
+        );
+        std::fs::write(path.as_ref(), initial).expect("write execution state");
+
+        let (read_tx, read_rx) = mpsc::sync_channel(0);
+        let (release_tx, release_rx) = mpsc::sync_channel(0);
+        let release_rx = Arc::new(Mutex::new(release_rx));
+        let hook_path = Arc::clone(&path);
+        *AFTER_READ_HOOK.lock().expect("install after-read hook") =
+            Some(Arc::new(move |read_path| {
+                if read_path != hook_path.as_ref() {
+                    return;
+                }
+                read_tx.send(()).expect("signal ledger read");
+                release_rx
+                    .lock()
+                    .expect("release receiver")
+                    .recv()
+                    .expect("release ledger update");
+            }));
+
+        let update_path = Arc::clone(&path);
+        let update = thread::spawn(move || {
+            update_row(
+                &update_path,
+                "1.1",
+                "done",
+                "ledger-concurrent-update",
+                None,
+                false,
+            )
+        });
+        read_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("ledger read reached overlap point");
+
+        let mutation_result = mutate(path.as_ref());
+        release_tx.send(()).expect("release ledger update");
+        let update_result = update.join().expect("ledger update thread");
+        *AFTER_READ_HOOK.lock().expect("clear after-read hook") = None;
+
+        update_result.expect("ledger update succeeds");
+        let final_text = std::fs::read_to_string(path.as_ref()).expect("read final state");
+        let row = read_rows(&final_text, path.as_ref())
+            .expect("parse final ledger")
+            .into_iter()
+            .find(|row| row.id == "1.1")
+            .expect("updated row remains present");
+        assert_eq!(
+            (row.status.as_str(), row.evidence.as_str()),
+            ("done", "ledger-concurrent-update")
+        );
+
+        match mutation_result {
+            Ok(_) => verify_mutation(&final_text),
+            Err(error) => assert_eq!(error.code(), "exec-state-mutation-lock-busy"),
+        }
+    }
+
+    #[test]
+    fn ledger_update_overlapping_tracking_sync_never_loses_success() {
+        assert_overlapping_exec_state_mutation_never_loses_success(
+            |path| {
+                crate::exec_state::sync_tracking_issue(path, "https://example.test/issues/1", false)
+            },
+            |final_text| {
+                assert!(
+                    final_text.contains("- Tracking issue: <https://example.test/issues/1>"),
+                    "successful tracking-issue sync was lost"
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn ledger_update_overlapping_terminal_writeback_never_loses_success() {
+        assert_overlapping_exec_state_mutation_never_loses_success(
+            |path| {
+                crate::exec_state::writeback_terminal(
+                    path,
+                    &crate::exec_state::TerminalState {
+                        status: Some("complete; tracking issue closed".to_string()),
+                        ..crate::exec_state::TerminalState::default()
+                    },
+                    false,
+                )
+            },
+            |final_text| {
+                assert!(
+                    final_text.contains("- Status: complete; tracking issue closed"),
+                    "successful terminal writeback was lost"
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn ledger_update_lock_is_released_on_success_dry_run_and_errors() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("execution-state.md");
+        std::fs::write(&path, SAMPLE).expect("write ledger");
+        let lock_path = crate::exec_state::execution_state_mutation_lock_path(&path);
+        let assert_released = |state_path: &Path| {
+            let lock_path = crate::exec_state::execution_state_mutation_lock_path(state_path);
+            drop(
+                crate::mutation_lock::OwnedFileLock::acquire(&lock_path)
+                    .expect("mutation lock released"),
+            );
+        };
+
+        update_row(&path, "1.1", "done", "success", None, false).expect("successful update");
+        assert!(lock_path.exists(), "stable advisory lock file missing");
+        assert_released(&path);
+
+        let before_dry_run = std::fs::read_to_string(&path).expect("read before dry-run");
+        update_row(&path, "1.2", "done", "dry-run", None, true).expect("dry-run update");
+        assert_released(&path);
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read after dry-run"),
+            before_dry_run
+        );
+
+        let error =
+            update_row(&path, "99.9", "done", "missing", None, false).expect_err("missing row");
+        assert_eq!(error.code(), "ledger-row-not-found");
+        assert_released(&path);
+
+        let missing_path = temp.path().join("missing.md");
+        let missing_lock_path =
+            crate::exec_state::execution_state_mutation_lock_path(&missing_path);
+        let error = update_row(&missing_path, "1.1", "done", "missing", None, false)
+            .expect_err("missing ledger");
+        assert_eq!(error.code(), "ledger-file-read-failed");
+        assert!(
+            missing_lock_path.exists(),
+            "stable advisory lock file missing after read error"
+        );
+        assert_released(&missing_path);
+    }
+
+    #[test]
+    fn reads_title_as_the_task_description_column() {
+        let title_dialect = SAMPLE.replace(
+            "| ID | Status | Task | Evidence | Notes |",
+            "| ID | Status | Title | Evidence | Notes |",
+        );
+
+        let rows = read_rows(&title_dialect, Path::new("demo.md")).expect("read Title dialect");
+
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0].task, "Implement `ledger-update`");
+    }
+
+    #[test]
+    fn reader_and_patcher_preserve_escaped_pipe_cells() {
+        let escaped = SAMPLE.replace(
+            "| 1.1 | pending | Implement `ledger-update` |  | first row |",
+            "| 1.1 | pending | Implement `a \\| b` |  | first \\| row |",
+        );
+
+        let rows = read_rows(&escaped, Path::new("demo.md")).expect("read escaped pipes");
+        assert_eq!(rows[0].task, "Implement `a \\| b`");
+        assert_eq!(rows[0].notes, "first \\| row");
+
+        let outcome = patch_text(
+            &escaped,
+            Path::new("demo.md"),
+            "1.1",
+            "done",
+            "PR #999",
+            None,
+        )
+        .expect("patch row containing escaped pipes");
+        assert!(
+            outcome
+                .new_text
+                .contains("| 1.1 | done | Implement `a \\| b` | PR #999 | first \\| row |"),
+            "{}",
+            outcome.new_text
+        );
+    }
+
+    #[test]
+    fn rejects_ambiguous_task_description_columns() {
+        let ambiguous = SAMPLE
+            .replace(
+                "| ID | Status | Task | Evidence | Notes |",
+                "| ID | Status | Task | Title | Evidence | Notes |",
+            )
+            .replace(
+                "| --- | --- | --- | --- | --- |",
+                "| --- | --- | --- | --- | --- | --- |",
+            );
+
+        let err = read_rows(&ambiguous, Path::new("demo.md")).expect_err("ambiguous title columns");
+
+        assert_eq!(err.code(), "ledger-table-malformed");
+        assert!(err.to_string().contains("ambiguous"), "{err}");
+    }
+
+    #[test]
+    fn reader_rejects_duplicate_required_columns() {
+        for duplicated in ["ID", "Status", "Evidence", "Notes"] {
+            let raw = SAMPLE
+                .replace(
+                    "| ID | Status | Task | Evidence | Notes |",
+                    &format!("| ID | Status | Task | Evidence | {duplicated} | Notes |"),
+                )
+                .replace(
+                    "| --- | --- | --- | --- | --- |",
+                    "| --- | --- | --- | --- | --- | --- |",
+                );
+
+            let err = read_rows(&raw, Path::new("demo.md"))
+                .expect_err("duplicate required column must be rejected");
+            assert_eq!(err.code(), "ledger-table-malformed");
+            assert!(err.to_string().contains("duplicate"), "{duplicated}: {err}");
+        }
+    }
+
+    #[test]
+    fn reader_rejects_multiple_task_ledger_sections() {
+        let raw = format!("{SAMPLE}\n{SAMPLE}");
+
+        let err = read_rows(&raw, Path::new("demo.md"))
+            .expect_err("multiple Task Ledger sections must be rejected");
+
+        assert_eq!(err.code(), "ledger-table-malformed");
+        assert!(err.to_string().contains("multiple"), "{err}");
+    }
+
+    #[test]
+    fn reader_and_patcher_ignore_fenced_task_ledger_sections() {
+        for fence in ["```", "~~~"] {
+            let fenced_only = format!("{fence}markdown\n{SAMPLE}\n{fence}\n");
+            let err = read_rows(&fenced_only, Path::new("demo.md"))
+                .expect_err("fenced Task Ledger must not be structural");
+            assert_eq!(err.code(), "ledger-table-malformed", "fence={fence}");
+
+            let raw = format!("{fenced_only}\n{SAMPLE}");
+            let rows = read_rows(&raw, Path::new("demo.md"))
+                .expect("the real Task Ledger must be selected");
+            assert_eq!(rows.len(), 3, "fence={fence}");
+
+            let outcome = patch_text(&raw, Path::new("demo.md"), "1.1", "done", "PR #999", None)
+                .expect("patch the real Task Ledger");
+            assert_eq!(
+                outcome.new_text.matches("PR #999").count(),
+                1,
+                "fence={fence}"
+            );
+            assert!(
+                outcome
+                    .new_text
+                    .starts_with(&format!("{fence}markdown\n{SAMPLE}\n{fence}")),
+                "fenced example changed for fence={fence}"
+            );
+        }
+    }
+
+    #[test]
+    fn reader_accepts_commonmark_indented_task_ledger_heading() {
+        for indentation in [" ", "  ", "   "] {
+            let raw = SAMPLE.replacen("## Task Ledger", &format!("{indentation}## Task Ledger"), 1);
+
+            let rows = read_rows(&raw, Path::new("demo.md"))
+                .expect("one to three spaces remain a structural heading");
+            assert_eq!(rows.len(), 3, "indentation={}", indentation.len());
+        }
+    }
+
+    #[test]
+    fn reader_rejects_indented_code_task_ledger_heading() {
+        let raw = SAMPLE.replacen("## Task Ledger", "    ## Task Ledger", 1);
+
+        let err = read_rows(&raw, Path::new("demo.md"))
+            .expect_err("indented code heading must not be structural");
+
+        assert_eq!(err.code(), "ledger-table-malformed");
+    }
+
+    #[test]
+    fn reader_rejects_empty_ledger() {
+        let raw = "# Demo\n\n## Task Ledger\n\n| ID | Status | Task | Evidence |\n| --- | --- | --- | --- |\n";
+
+        let err = read_rows(raw, Path::new("demo.md")).expect_err("empty ledger");
+
+        assert_eq!(err.code(), "ledger-table-malformed");
+        assert!(err.to_string().contains("at least one"), "{err}");
+    }
+
+    #[test]
+    fn reader_rejects_duplicate_task_ids_as_ambiguous() {
+        let duplicate = SAMPLE.replace(
+            "| 1.2 | pending | Implement `ledger-sync` |  | second row |",
+            "| 1.1 | pending | Implement `ledger-sync` |  | second row |",
+        );
+
+        let err = read_rows(&duplicate, Path::new("demo.md")).expect_err("duplicate");
+
+        assert_eq!(err.code(), "ledger-row-ambiguous");
+    }
+
+    #[test]
+    fn reader_rejects_empty_task_ids_as_malformed() {
+        let empty = SAMPLE.replace(
+            "| 1.1 | pending | Implement `ledger-update` |  | first row |",
+            "|  | pending | Implement `ledger-update` |  | first row |",
+        );
+
+        let err = read_rows(&empty, Path::new("demo.md")).expect_err("empty");
+
+        assert_eq!(err.code(), "ledger-table-malformed");
+        assert!(err.to_string().contains("empty"), "{err}");
+    }
+
+    #[test]
+    fn reader_rejects_empty_task_description_and_invalid_status() {
+        let empty_task = SAMPLE.replace(
+            "| 1.1 | pending | Implement `ledger-update` |  | first row |",
+            "| 1.1 | pending |  |  | first row |",
+        );
+        let empty_status = SAMPLE.replace(
+            "| 1.1 | pending | Implement `ledger-update` |  | first row |",
+            "| 1.1 |  | Implement `ledger-update` |  | first row |",
+        );
+        let unknown_status = SAMPLE.replace(
+            "| 1.1 | pending | Implement `ledger-update` |  | first row |",
+            "| 1.1 | complete | Implement `ledger-update` |  | first row |",
+        );
+
+        for raw in [empty_task, empty_status, unknown_status] {
+            let err = read_rows(&raw, Path::new("demo.md")).expect_err("invalid row semantics");
+            assert_eq!(err.code(), "ledger-table-malformed");
+        }
+    }
+
+    #[test]
+    fn reader_accepts_markdown_separator_alignment_markers() {
+        let aligned = SAMPLE.replace(
+            "| --- | --- | --- | --- | --- |",
+            "| :--- | ---: | :---: | ---- | ----- |",
+        );
+
+        let rows = read_rows(&aligned, Path::new("demo.md")).expect("valid aligned separator");
+
+        assert_eq!(rows.len(), 3);
+    }
+
+    #[test]
+    fn reader_rejects_non_markdown_separator_cells() {
+        for invalid in ["-", "--", ":", ":::", "-:-", ":--", "--:", "::---", "---::"] {
+            let malformed = SAMPLE.replacen(
+                "| --- | --- | --- | --- | --- |",
+                &format!("| {invalid} | --- | --- | --- | --- |"),
+                1,
+            );
+
+            let err = read_rows(&malformed, Path::new("demo.md"))
+                .expect_err("invalid separator cell must be rejected");
+
+            assert_eq!(err.code(), "ledger-table-malformed", "cell {invalid:?}");
+        }
+    }
+
+    #[test]
+    fn reader_rejects_separator_or_data_rows_with_wrong_width() {
+        let short_separator = SAMPLE.replace(
+            "| --- | --- | --- | --- | --- |",
+            "| --- | --- | --- | --- |",
+        );
+        let wide_separator = SAMPLE.replace(
+            "| --- | --- | --- | --- | --- |",
+            "| --- | --- | --- | --- | --- | --- |",
+        );
+        let short_row = SAMPLE.replace(
+            "| 1.1 | pending | Implement `ledger-update` |  | first row |",
+            "| 1.1 | pending | Implement `ledger-update` |  |",
+        );
+        let wide_row = SAMPLE.replace(
+            "| 1.1 | pending | Implement `ledger-update` |  | first row |",
+            "| 1.1 | pending | Implement `ledger-update` |  | first row | extra |",
+        );
+        let missing_trailing_pipe = SAMPLE.replace(
+            "| 1.1 | pending | Implement `ledger-update` |  | first row |",
+            "| 1.1 | pending | Implement `ledger-update` |  | first row",
+        );
+        let missing_leading_pipe = SAMPLE.replace(
+            "| 1.2 | pending | Implement `ledger-sync` |  | second row |",
+            "1.2 | pending | Implement `ledger-sync` |  | second row |",
+        );
+
+        for raw in [
+            short_separator,
+            wide_separator,
+            short_row,
+            wide_row,
+            missing_trailing_pipe,
+            missing_leading_pipe,
+        ] {
+            let err = read_rows(&raw, Path::new("demo.md")).expect_err("wrong-width row");
+            assert_eq!(err.code(), "ledger-table-malformed");
+        }
+    }
+
+    #[test]
+    fn patcher_accepts_title_as_the_task_description_column() {
+        let title_dialect = SAMPLE.replace(
+            "| ID | Status | Task | Evidence | Notes |",
+            "| ID | Status | Title | Evidence | Notes |",
+        );
+
+        let outcome = patch_text(
+            &title_dialect,
+            Path::new("demo.md"),
+            "1.1",
+            "done",
+            "PR #999",
+            None,
+        )
+        .expect("patch Title dialect");
+
+        assert!(
+            outcome
+                .new_text
+                .contains("| 1.1 | done | Implement `ledger-update` | PR #999 | first row |")
+        );
+    }
+
+    #[test]
+    fn patcher_rejects_ambiguous_task_description_columns() {
+        let ambiguous = SAMPLE
+            .replace(
+                "| ID | Status | Task | Evidence | Notes |",
+                "| ID | Status | Task | Title | Evidence | Notes |",
+            )
+            .replace(
+                "| --- | --- | --- | --- | --- |",
+                "| --- | --- | --- | --- | --- | --- |",
+            );
+
+        let err = patch_text(
+            &ambiguous,
+            Path::new("demo.md"),
+            "1.1",
+            "done",
+            "PR #999",
+            None,
+        )
+        .expect_err("ambiguous title columns");
+
+        assert_eq!(err.code(), "ledger-table-malformed");
+        assert!(err.to_string().contains("ambiguous"), "{err}");
+    }
 
     #[test]
     fn patches_status_and_evidence_into_empty_cell() {
@@ -622,7 +1422,7 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_id_returns_ambiguous() {
+    fn patcher_rejects_duplicate_task_id_as_ambiguous() {
         let doubled = SAMPLE.replace(
             "| 1.2 | pending | Implement `ledger-sync` |  | second row |",
             "| 1.1 | pending | dup |  | dup |",

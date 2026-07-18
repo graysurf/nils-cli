@@ -61,8 +61,8 @@ pub enum TrackingRunCommand {
 
 #[derive(Debug, Clone, Args, Serialize)]
 pub struct TrackingRunInitArgs {
-    /// Repository slug in `owner/repo` form.
-    #[arg(long = "provider-repo", value_name = "owner/repo")]
+    /// Repository identity as `owner/repo` or a qualified provider URL.
+    #[arg(long = "provider-repo", value_name = "url|owner/repo")]
     pub provider_repo: String,
 
     /// Issue number.
@@ -208,11 +208,14 @@ impl RunPhaseArg {
 
 #[derive(Debug, Clone, Args, Serialize)]
 pub struct TrackingCheckpointArgs {
-    /// Repository slug for live mode.
-    #[arg(long = "provider-repo", value_name = "owner/repo")]
+    /// Repository identity for live mode. It must match the persisted run state.
+    /// Runs without provider/host metadata require a qualified URL. Persisted
+    /// self-hosted identities require either a matching checkout or a qualified
+    /// URL that confirms the same provider, host, and repository.
+    #[arg(long = "provider-repo", value_name = "url|owner/repo")]
     pub provider_repo: Option<String>,
 
-    /// Issue number for live mode.
+    /// Issue number for live mode. Must match a nonzero persisted issue.
     #[arg(long, value_name = "number")]
     pub issue: Option<u64>,
 

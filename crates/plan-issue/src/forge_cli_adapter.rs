@@ -34,7 +34,8 @@ use serde_json::json;
 use crate::adapter::{PrMergeSummary, ProviderAdapter};
 use crate::commands::plan::CloseReason;
 
-const TRACKER_ISSUE_SCAN_LIMIT: &str = "200";
+const TRACKER_ISSUE_SCAN_LIMIT: usize = 200;
+const TRACKER_ISSUE_SCAN_MAX: usize = 12_800;
 const REPOSITORY_LABEL_SCAN_LIMIT: usize = 200;
 const REPOSITORY_LABEL_SCAN_MAX: usize = 12_800;
 
@@ -79,6 +80,9 @@ pub struct ForgeCliAdapter {
     /// `gitlab`, or `local`). Local rides the same forge-cli rail; the store
     /// root is read by forge-cli from `FORGE_CLI_LOCAL_STORE`.
     provider: &'static str,
+    /// Explicit provider host forwarded to forge-cli. This prevents a validated
+    /// self-hosted target from being re-derived from the adapter process cwd.
+    host: Option<String>,
     /// Force flag. Trait methods do not consult it because forge-cli's own
     /// markdown / local-path validation gates already enforce the same policy;
     /// this field is retained so the adapter can grow a `--force` pass-through
@@ -91,7 +95,17 @@ pub struct ForgeCliAdapter {
 impl ForgeCliAdapter {
     /// GitLab-backed adapter (emits `--provider gitlab`).
     pub fn new(force: bool) -> Self {
-        Self::with_provider("gitlab", force, Box::new(ProcessForgeCliRunner))
+        Self::with_provider("gitlab", None, force, Box::new(ProcessForgeCliRunner))
+    }
+
+    /// GitLab-backed adapter bound to a validated provider host.
+    pub fn new_on_host(force: bool, host: Option<&str>) -> Self {
+        Self::with_provider(
+            "gitlab",
+            host.map(str::to_string),
+            force,
+            Box::new(ProcessForgeCliRunner),
+        )
     }
 
     /// GitHub-backed adapter (emits `--provider github`). Selected for GitHub
@@ -99,22 +113,34 @@ impl ForgeCliAdapter {
     /// in-crate `gh` client; identity is the inherited ambient token, exactly
     /// as the prior `GhCliAdapter` behaved.
     pub fn new_github(force: bool) -> Self {
-        Self::with_provider("github", force, Box::new(ProcessForgeCliRunner))
+        Self::with_provider("github", None, force, Box::new(ProcessForgeCliRunner))
+    }
+
+    /// GitHub-backed adapter bound to a validated provider host.
+    pub fn new_github_on_host(force: bool, host: Option<&str>) -> Self {
+        Self::with_provider(
+            "github",
+            host.map(str::to_string),
+            force,
+            Box::new(ProcessForgeCliRunner),
+        )
     }
 
     /// Local-backend adapter (emits `--provider local`). forge-cli reads the
     /// file store root from `FORGE_CLI_LOCAL_STORE`; the e2e driver sets it.
     pub fn new_local(force: bool) -> Self {
-        Self::with_provider("local", force, Box::new(ProcessForgeCliRunner))
+        Self::with_provider("local", None, force, Box::new(ProcessForgeCliRunner))
     }
 
     fn with_provider(
         provider: &'static str,
+        host: Option<String>,
         force: bool,
         runner: Box<dyn ForgeCliRunner + Send + Sync>,
     ) -> Self {
         Self {
             provider,
+            host,
             force,
             runner,
         }
@@ -123,13 +149,13 @@ impl ForgeCliAdapter {
     /// Test-only constructor that swaps in a scripted runner (GitLab provider).
     #[cfg(test)]
     pub fn with_runner(force: bool, runner: Box<dyn ForgeCliRunner + Send + Sync>) -> Self {
-        Self::with_provider("gitlab", force, runner)
+        Self::with_provider("gitlab", None, force, runner)
     }
 
     /// Test-only constructor for the local provider with a scripted runner.
     #[cfg(test)]
     pub fn with_runner_local(force: bool, runner: Box<dyn ForgeCliRunner + Send + Sync>) -> Self {
-        Self::with_provider("local", force, runner)
+        Self::with_provider("local", None, force, runner)
     }
 
     /// Test-only constructor for the GitHub provider with a scripted runner.
@@ -137,7 +163,7 @@ impl ForgeCliAdapter {
     /// `--required-only` on the merge-gate `pr checks` call).
     #[cfg(test)]
     pub fn with_runner_github(force: bool, runner: Box<dyn ForgeCliRunner + Send + Sync>) -> Self {
-        Self::with_provider("github", force, runner)
+        Self::with_provider("github", None, force, runner)
     }
 
     /// Run forge-cli with the given args, parse the v1 envelope, and return
@@ -173,16 +199,15 @@ impl ForgeCliAdapter {
             .ok_or_else(|| format!("forge-cli {} envelope missing `data`", args.join(" ")))
     }
 
-    /// Common argv prefix: `--format json --provider <provider> --repo <slug>`.
-    fn base_args<'a>(&self, repo: &'a str) -> Vec<&'a str> {
-        vec![
-            "--format",
-            "json",
-            "--provider",
-            self.provider,
-            "--repo",
-            repo,
-        ]
+    /// Common argv prefix: `--format json --provider <provider> [--host <host>]
+    /// --repo <slug>`.
+    fn base_args<'a>(&'a self, repo: &'a str) -> Vec<&'a str> {
+        let mut args = vec!["--format", "json", "--provider", self.provider];
+        if let Some(host) = self.host.as_deref() {
+            args.extend(["--host", host]);
+        }
+        args.extend(["--repo", repo]);
+        args
     }
 
     fn body_file_str(path: &Path) -> Result<&str, String> {
@@ -224,6 +249,17 @@ impl ProviderAdapter for ForgeCliAdapter {
         let comments_json = serde_json::to_string(&envelope)
             .map_err(|err| format!("failed to serialize issue evidence comments: {err}"))?;
         Ok((body, comments_json))
+    }
+
+    fn issue_state(&self, repo: &str, issue: u64) -> Result<String, String> {
+        let issue_str = issue.to_string();
+        let mut args = self.base_args(repo);
+        args.extend(["issue", "view", &issue_str]);
+        let data = self.run_envelope(&args)?;
+        data.get("state")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .ok_or_else(|| "forge-cli issue view data missing `state`".to_string())
     }
 
     fn issue_labels(&self, repo: &str, issue: u64) -> Result<Vec<String>, String> {
@@ -283,28 +319,41 @@ impl ProviderAdapter for ForgeCliAdapter {
             .map(|s| s.trim())
             .filter(|s| !s.is_empty())
             .collect();
-        let mut args = self.base_args(repo);
-        args.extend([
-            "issue",
-            "list",
-            "--state",
-            "open",
-            "--limit",
-            TRACKER_ISSUE_SCAN_LIMIT,
-        ]);
-        for label in &trimmed_labels {
-            args.push("--label");
-            args.push(label);
+        let mut limit = TRACKER_ISSUE_SCAN_LIMIT;
+        loop {
+            let limit_arg = limit.to_string();
+            let mut args = self.base_args(repo);
+            args.extend([
+                "issue",
+                "list",
+                "--state",
+                "open",
+                "--limit",
+                limit_arg.as_str(),
+            ]);
+            for label in &trimmed_labels {
+                args.push("--label");
+                args.push(label);
+            }
+            let data = self.run_envelope(&args)?;
+            let items = data
+                .get("items")
+                .and_then(Value::as_array)
+                .ok_or_else(|| "forge-cli issue list data missing `items`".to_string())?;
+            let numbers = items
+                .iter()
+                .filter_map(|item| item.get("number").and_then(Value::as_u64))
+                .collect::<Vec<_>>();
+            if items.len() < limit {
+                return Ok(numbers);
+            }
+            if limit >= TRACKER_ISSUE_SCAN_MAX {
+                return Err(format!(
+                    "forge-cli issue list returned at least {limit} open issues; record-open scan completeness could not be proven"
+                ));
+            }
+            limit = (limit * 2).min(TRACKER_ISSUE_SCAN_MAX);
         }
-        let data = self.run_envelope(&args)?;
-        let items = data
-            .get("items")
-            .and_then(Value::as_array)
-            .ok_or_else(|| "forge-cli issue list data missing `items`".to_string())?;
-        Ok(items
-            .iter()
-            .filter_map(|item| item.get("number").and_then(Value::as_u64))
-            .collect())
     }
 
     fn create_issue(
@@ -746,6 +795,25 @@ mod tests {
         )
     }
 
+    fn adapter_with_github_on_host(
+        host: &str,
+        responses: Vec<&str>,
+    ) -> (ForgeCliAdapter, std::sync::Arc<RunnerHandle>) {
+        let runner = std::sync::Arc::new(RunnerHandle::new(responses));
+        let proxy = RunnerProxy {
+            inner: runner.clone(),
+        };
+        (
+            ForgeCliAdapter::with_provider(
+                "github",
+                Some(host.to_string()),
+                false,
+                Box::new(proxy),
+            ),
+            runner,
+        )
+    }
+
     /// Thread-safe wrapper around `ScriptedRunner` so the adapter trait
     /// bound (`Send + Sync`) is satisfied while keeping the test API tiny.
     struct RunnerHandle {
@@ -794,7 +862,81 @@ mod tests {
         assert_eq!(
             argv[limit_idx + 1],
             "200",
-            "record-open resume scan must preserve the previous broad scan ceiling"
+            "record-open resume scan must begin with the previous broad scan window"
+        );
+    }
+
+    #[test]
+    fn list_open_tracker_issues_expands_until_scan_completeness_is_proven() {
+        let first_items = (1..=200)
+            .map(|number| json!({"number": number}))
+            .collect::<Vec<_>>();
+        let second_items = (1..=201)
+            .map(|number| json!({"number": number}))
+            .collect::<Vec<_>>();
+        let first = json!({
+            "ok": true,
+            "schema_version": "cli.forge-cli.issue.list.v1",
+            "data": {"provider": "github", "items": first_items},
+        })
+        .to_string();
+        let second = json!({
+            "ok": true,
+            "schema_version": "cli.forge-cli.issue.list.v1",
+            "data": {"provider": "github", "items": second_items},
+        })
+        .to_string();
+        let (adapter, handle) = adapter_with(vec![
+            Box::leak(first.into_boxed_str()),
+            Box::leak(second.into_boxed_str()),
+        ]);
+
+        let issues = adapter
+            .list_open_tracker_issues("o/r", &[])
+            .expect("scan must expand past a full first page");
+
+        assert_eq!(issues.len(), 201);
+        assert_eq!(issues.last(), Some(&201));
+        let calls = handle.calls();
+        assert_eq!(calls.len(), 2);
+        let limits = calls
+            .iter()
+            .map(|argv| {
+                let index = argv.iter().position(|arg| arg == "--limit").unwrap();
+                argv[index + 1].clone()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(limits, vec!["200", "400"]);
+    }
+
+    #[test]
+    fn retained_non_default_authority_is_forwarded_as_forge_cli_host() {
+        let (adapter, handle) = adapter_with_github_on_host(
+            "internal.ghe.com:8443",
+            vec![
+                r#"{"ok":true,"schema_version":"cli.forge-cli.issue.view.v1","data":{"body":"body"}}"#,
+            ],
+        );
+
+        assert_eq!(
+            adapter.issue_body("acme/widgets", 42).expect("issue body"),
+            "body"
+        );
+        assert_eq!(
+            handle.calls(),
+            vec![vec![
+                "--format",
+                "json",
+                "--provider",
+                "github",
+                "--host",
+                "internal.ghe.com:8443",
+                "--repo",
+                "acme/widgets",
+                "issue",
+                "view",
+                "42",
+            ]]
         );
     }
 
@@ -890,7 +1032,7 @@ mod tests {
     }
 
     #[test]
-    fn github_tracker_scan_preserves_legacy_200_issue_limit() {
+    fn github_tracker_scan_begins_with_legacy_200_issue_window() {
         let (adapter, handle) = adapter_with_github(vec![
             r#"{
             "ok": true,
@@ -973,6 +1115,22 @@ mod tests {
         assert_eq!(
             arr[0].get("created_at").and_then(Value::as_str),
             Some("2025-01-01T00:00:00Z")
+        );
+    }
+
+    #[test]
+    fn issue_state_reads_provider_authoritative_state() {
+        let (adapter, handle) = adapter_with_github(vec![
+            r#"{"ok":true,"schema_version":"cli.forge-cli.issue.view.v1","data":{"provider":"github","number":42,"url":"u","state":"closed","title":"t","body":"","labels":[],"assignees":[]}}"#,
+        ]);
+        assert_eq!(
+            adapter.issue_state("o/r", 42).expect("issue state"),
+            "closed"
+        );
+        let argv = &handle.calls()[0];
+        assert!(
+            argv.windows(3)
+                .any(|window| window == ["issue", "view", "42"])
         );
     }
 

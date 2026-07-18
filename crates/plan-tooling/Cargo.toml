@@ -24,6 +24,7 @@ nils-build-info = { version = "1.24.0", path = "../nils-build-info" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 pulldown-cmark = { workspace = true }
+libc = "0.2"
 
 [dev-dependencies]
 nils-test-support = { version = "1.24.0", path = "../nils-test-support" }

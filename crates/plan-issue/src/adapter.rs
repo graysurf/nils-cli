@@ -22,6 +22,14 @@ pub trait ProviderAdapter {
     /// issue-view-with-comments call.
     fn issue_evidence(&self, repo: &str, issue: u64) -> Result<(String, String), String>;
 
+    /// Read the provider-authoritative issue state (`open` or `closed`).
+    ///
+    /// The default keeps test-only adapters source-compatible while failing
+    /// closed when they cannot independently confirm an ambiguous mutation.
+    fn issue_state(&self, _repo: &str, _issue: u64) -> Result<String, String> {
+        Err("provider adapter does not support authoritative issue-state reads".to_string())
+    }
+
     /// Read the provider-confirmed labels currently attached to an issue.
     fn issue_labels(&self, repo: &str, issue: u64) -> Result<Vec<String>, String>;
 

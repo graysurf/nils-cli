@@ -39,6 +39,7 @@
 //!   - `FORGE_CLI_RATE_LIMIT_POLL_SECS` (default 15) — re-probe interval while
 //!     throttled.
 
+use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -159,10 +160,11 @@ pub fn is_graphql_backed(call: &BackendCall) -> bool {
     }
 }
 
-/// The free rate-limit probe call. `gh api rate_limit` returns the full REST
-/// rate-limit document and does not consume any budget.
-fn probe_call() -> BackendCall {
+/// The free rate-limit probe call, bound to the same resolved authority as the
+/// GraphQL-backed call it gates.
+fn probe_call(host: &str) -> BackendCall {
     BackendCall::new(BackendProgram::Gh, ["api", "rate_limit"])
+        .with_host(crate::provider::Provider::GitHub, host)
 }
 
 /// Extract `resources.graphql.remaining` from a `gh api rate_limit` document.
@@ -183,20 +185,10 @@ pub struct RateLimitedRunner<R, C> {
     inner: R,
     clock: C,
     config: GateConfig,
-    /// Last probe reading `(taken_at, remaining)`, reused within
-    /// `config.poll_interval` so a burst of *sequential* closely-spaced gated
-    /// calls (e.g. the `pr deliver` chain, or the two `pr checks` calls per
-    /// wait-checks poll) collapses to a single probe instead of one per call.
-    ///
-    /// A `Mutex` (not `RefCell`) so the runner stays `Sync`: ops that fan out
-    /// across threads (`inbox`'s parallel provider queries) share one runner
-    /// and require `R: Sync`. There is no single-flight coordination, so a
-    /// *concurrent* cold-cache fan-out issues up to one probe per thread rather
-    /// than one total — bounded, and against the free `rate_limit` endpoint, so
-    /// it is a small request burst, not a latency or correctness risk. Critical
-    /// sections only copy the small reading in or out, never spanning a backend
-    /// call, so the lock is never held across I/O.
-    probe_cache: Mutex<Option<(Instant, u64)>>,
+    /// Fresh probe readings keyed by resolved GitHub authority. Keeping the
+    /// authority (including any non-default HTTPS port) in the key prevents one
+    /// host's budget from authorizing work against another host.
+    probe_cache: Mutex<HashMap<String, (Instant, u64)>>,
 }
 
 /// The default backend runner for every production op `run()` entrypoint, and
@@ -221,7 +213,7 @@ impl<R: BackendRunner, C: Clock> RateLimitedRunner<R, C> {
             inner,
             clock,
             config,
-            probe_cache: Mutex::new(None),
+            probe_cache: Mutex::new(HashMap::new()),
         }
     }
 
@@ -229,46 +221,50 @@ impl<R: BackendRunner, C: Clock> RateLimitedRunner<R, C> {
         self.config.enabled && is_graphql_backed(call)
     }
 
-    /// Best-effort read of the current GraphQL remaining budget. `None` when
-    /// the probe fails, times out, or is unparseable. Bounded by
-    /// [`PROBE_TIMEOUT`] so a stalled endpoint never blocks the gated call.
-    fn probe_remaining(&self, timeout: Option<Duration>) -> Option<u64> {
+    /// Best-effort read of the current GraphQL remaining budget for `host`.
+    fn probe_remaining(&self, host: &str, timeout: Option<Duration>) -> Option<u64> {
         let timeout = timeout.map(|budget| budget.min(PROBE_TIMEOUT));
         if timeout.is_some_and(|duration| duration.is_zero()) {
             return None;
         }
         let output = self
             .inner
-            .run_with_timeout(&probe_call(), timeout.or(Some(PROBE_TIMEOUT)))
+            .run_with_timeout(&probe_call(host), timeout.or(Some(PROBE_TIMEOUT)))
             .ok()?;
         parse_graphql_remaining(&output.stdout)
     }
 
-    /// A GraphQL-remaining reading, reusing the locally reserved cache when it
-    /// is younger than `poll_interval` and otherwise re-probing (and
-    /// refreshing the cache). An unreadable probe is not cached, so the next
-    /// call re-probes.
-    fn cached_remaining(&self, timeout: Option<Duration>) -> Option<u64> {
-        // Copy the small reading out and release the lock before probing — the
-        // probe issues a backend call and must never run under the lock.
-        let cached = *self.probe_cache.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some((taken_at, remaining)) = cached
+    fn cached_remaining(&self, host: &str, timeout: Option<Duration>) -> Option<u64> {
+        let observed = self
+            .probe_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(host)
+            .copied();
+        if let Some((taken_at, remaining)) = observed
             && self.clock.now().saturating_duration_since(taken_at) < self.config.poll_interval
         {
             return Some(remaining);
         }
-        let remaining = self.probe_remaining(timeout)?;
-        *self.probe_cache.lock().unwrap_or_else(|e| e.into_inner()) =
-            Some((self.clock.now(), remaining));
-        Some(remaining)
+        let remaining = self.probe_remaining(host, timeout)?;
+        let taken_at = self.clock.now();
+        let mut cache = self.probe_cache.lock().unwrap_or_else(|e| e.into_inner());
+        let current = cache.get(host).copied();
+        if current == observed {
+            cache.insert(host.to_string(), (taken_at, remaining));
+            Some(remaining)
+        } else {
+            // A same-host probe or reservation changed the slot while this
+            // probe was in flight. Preserve that newer state rather than
+            // restoring budget a concurrent call already reserved.
+            current.map(|(_, remaining)| remaining)
+        }
     }
 
-    /// Atomically reserve one cached GraphQL point before a real call. This
-    /// keeps sequential and concurrent paginated calls from all trusting one
-    /// stale just-above-threshold reading.
-    fn reserve_cached_budget(&self) -> bool {
+    /// Atomically reserve one cached GraphQL point before a real call.
+    fn reserve_cached_budget(&self, host: &str) -> bool {
         let mut cached = self.probe_cache.lock().unwrap_or_else(|e| e.into_inner());
-        let Some((taken_at, remaining)) = cached.as_mut() else {
+        let Some((taken_at, remaining)) = cached.get_mut(host) else {
             return false;
         };
         if self.clock.now().saturating_duration_since(*taken_at) >= self.config.poll_interval
@@ -280,29 +276,31 @@ impl<R: BackendRunner, C: Clock> RateLimitedRunner<R, C> {
         true
     }
 
-    /// Drop the cached probe reading. Called after a `backend_rate_limited`
-    /// failure so the reactive wait re-probes fresh rather than trusting a
-    /// reading that predates the throttling.
-    fn invalidate_cache(&self) {
-        *self.probe_cache.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    /// Drop only the cached reading for the authority that was throttled.
+    fn invalidate_cache(&self, host: &str) {
+        self.probe_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(host);
     }
 
-    /// Poll `gh api rate_limit` until `graphql.remaining` exceeds the
-    /// configured threshold or `max_wait` elapses. Best-effort: an unreadable
-    /// probe returns immediately so a broken probe never blocks real work.
-    fn wait_until_healthy(&self, outer_start: Instant, outer_timeout: Option<Duration>) {
+    /// Poll the host-bound rate-limit endpoint until healthy or bounded wait.
+    fn wait_until_healthy(
+        &self,
+        host: &str,
+        outer_start: Instant,
+        outer_timeout: Option<Duration>,
+    ) {
         let start = self.clock.now();
         loop {
             let outer_left = remaining_budget(self.clock.now(), outer_start, outer_timeout);
             if outer_left.is_some_and(|duration| duration.is_zero()) {
                 return;
             }
-            match self.cached_remaining(outer_left) {
-                // Cannot read the budget — do not block; proceed and let the
-                // real call (and its reactive retry) handle any throttling.
+            match self.cached_remaining(host, outer_left) {
                 None => return,
                 Some(remaining) if remaining > self.config.min_remaining => {
-                    if self.reserve_cached_budget() {
+                    if self.reserve_cached_budget(host) {
                         return;
                     }
                 }
@@ -348,12 +346,13 @@ impl<R: BackendRunner, C: Clock> RateLimitedRunner<R, C> {
         if !self.should_gate(call) {
             return run(call, timeout);
         }
+        let host = call.resolved_host().unwrap_or("github.com");
         let started = self.clock.now();
-        self.wait_until_healthy(started, timeout);
+        self.wait_until_healthy(host, started, timeout);
         let call_timeout = require_remaining_budget(self.clock.now(), started, timeout)?;
         match run(call, call_timeout) {
             Err(err) if err.kind() == RATE_LIMITED_KIND => {
-                self.invalidate_cache();
+                self.invalidate_cache(host);
                 let retry_left = require_remaining_budget(self.clock.now(), started, timeout)?;
                 let nap = retry_left
                     .map(|budget| budget.min(self.config.poll_interval))
@@ -362,7 +361,7 @@ impl<R: BackendRunner, C: Clock> RateLimitedRunner<R, C> {
                     return Err(backend_timeout(timeout));
                 }
                 self.clock.sleep(nap);
-                self.wait_until_healthy(started, timeout);
+                self.wait_until_healthy(host, started, timeout);
                 let retry_timeout = require_remaining_budget(self.clock.now(), started, timeout)?;
                 run(call, retry_timeout)
             }
@@ -434,6 +433,8 @@ mod tests {
     use std::time::Instant;
 
     use pretty_assertions::assert_eq;
+
+    use crate::provider::Provider;
 
     /// Scripted runner that serves queued `graphql.remaining` probe values and
     /// records every call's argv. The first `fail_remaining` non-probe calls
@@ -893,6 +894,53 @@ mod tests {
     }
 
     #[test]
+    fn probes_and_cache_are_scoped_to_resolved_github_host() {
+        struct HostRunner {
+            calls: RefCell<Vec<(bool, String)>>,
+        }
+        impl BackendRunner for HostRunner {
+            fn run(&self, call: &BackendCall) -> Result<BackendSuccess, ForgeError> {
+                let is_probe = FakeRunner::is_probe(call);
+                self.calls.borrow_mut().push((
+                    is_probe,
+                    call.resolved_host()
+                        .expect("GitHub calls carry a host")
+                        .into(),
+                ));
+                Ok(BackendSuccess {
+                    stdout: if is_probe {
+                        r#"{"resources":{"graphql":{"remaining":4821}}}"#.into()
+                    } else {
+                        "ok".into()
+                    },
+                    stderr: String::new(),
+                })
+            }
+        }
+
+        let runner = HostRunner {
+            calls: RefCell::new(Vec::new()),
+        };
+        let clock = FakeClock::new();
+        let gate = RateLimitedRunner::new(&runner, &clock, cfg());
+        let host_a = pr_ready_call().with_host(Provider::GitHub, "ghe-a.example:8443");
+        let host_b = pr_ready_call().with_host(Provider::GitHub, "ghe-b.example:8443");
+
+        gate.run(&host_a).expect("host A first");
+        gate.run(&host_a).expect("host A cached");
+        gate.run(&host_b).expect("host B separate cache");
+
+        let probes = runner
+            .calls
+            .borrow()
+            .iter()
+            .filter(|(probe, _)| *probe)
+            .map(|(_, host)| host.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(probes, ["ghe-a.example:8443", "ghe-b.example:8443"]);
+    }
+
+    #[test]
     fn from_env_parses_disable_tokens_fallbacks_and_clamp() {
         let _guard = ENV_GUARD.lock().unwrap_or_else(|e| e.into_inner());
         let keys = [
@@ -999,6 +1047,92 @@ mod tests {
         let out = gate.run(&pr_ready_call()).expect("run");
         assert_eq!(out.stdout, "ok");
         assert_eq!(clock.sleep_count(), 0, "unreadable probe never sleeps");
+    }
+
+    #[test]
+    fn cold_cache_probe_does_not_overwrite_concurrent_same_host_reservation() {
+        use std::sync::Barrier;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct ReservationRaceRunner {
+            probes: AtomicUsize,
+            reals: AtomicUsize,
+            cold_probes_started: Barrier,
+            first_reservation_observed: Barrier,
+        }
+
+        impl BackendRunner for ReservationRaceRunner {
+            fn run(&self, call: &BackendCall) -> Result<BackendSuccess, ForgeError> {
+                if FakeRunner::is_probe(call) {
+                    let probe_index = self.probes.fetch_add(1, Ordering::SeqCst);
+                    if probe_index < 2 {
+                        self.cold_probes_started.wait();
+                        if probe_index == 1 {
+                            // Hold the late cold-cache response until the first
+                            // gated call reaches the inner runner. Reaching it
+                            // proves the first probe was cached and reserved.
+                            self.first_reservation_observed.wait();
+                        }
+                    }
+                    return Ok(BackendSuccess {
+                        stdout: r#"{"resources":{"graphql":{"remaining":52}}}"#.into(),
+                        stderr: String::new(),
+                    });
+                }
+
+                let real_index = self.reals.fetch_add(1, Ordering::SeqCst);
+                if real_index == 0 {
+                    self.first_reservation_observed.wait();
+                }
+                Ok(BackendSuccess {
+                    stdout: "ok".into(),
+                    stderr: String::new(),
+                })
+            }
+        }
+
+        struct SyncClock {
+            now: Mutex<Instant>,
+        }
+
+        impl Clock for SyncClock {
+            fn now(&self) -> Instant {
+                *self.now.lock().unwrap_or_else(|e| e.into_inner())
+            }
+
+            fn sleep(&self, duration: Duration) {
+                *self.now.lock().unwrap_or_else(|e| e.into_inner()) += duration;
+            }
+        }
+
+        let runner = ReservationRaceRunner {
+            probes: AtomicUsize::new(0),
+            reals: AtomicUsize::new(0),
+            cold_probes_started: Barrier::new(2),
+            first_reservation_observed: Barrier::new(2),
+        };
+        let clock = SyncClock {
+            now: Mutex::new(Instant::now()),
+        };
+        let gate = RateLimitedRunner::new(&runner, &clock, cfg());
+
+        std::thread::scope(|scope| {
+            for _ in 0..2 {
+                scope.spawn(|| {
+                    gate.run(&pr_ready_call()).expect("concurrent gated call");
+                });
+            }
+        });
+
+        // Both cold probes reported 52. Two successful reservations must leave
+        // the cache at the threshold (50), forcing this third call to re-probe.
+        gate.run(&pr_ready_call()).expect("third gated call");
+        assert_eq!(runner.reals.load(Ordering::SeqCst), 3);
+        assert_eq!(
+            runner.probes.load(Ordering::SeqCst),
+            3,
+            "a late cold probe must not restore the point reserved by its peer"
+        );
     }
 
     #[test]

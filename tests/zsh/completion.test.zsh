@@ -181,6 +181,14 @@ done
 
 (( required_count > 0 )) || fail "matrix produced zero required CLIs"
 
+forge_cli_completion="$ZSH_COMPLETIONS_DIR/_forge-cli"
+[[ -f "$forge_cli_completion" ]] || fail "missing forge-cli zsh completion: $forge_cli_completion"
+grep -Eq -- "'--repo=\\[[^']*GitHub[^']*GitLab[^']*Local[^']*\\]:REPOSITORY:_default'" "$forge_cli_completion" \
+  || fail "forge-cli --repo completion must describe GitHub/GitLab/Local shapes with REPOSITORY value name"
+if grep -Fq -- ':owner/name:_default' "$forge_cli_completion"; then
+  fail "forge-cli --repo completion must not use the GitHub-only owner/name value name"
+fi
+
 source "$ALIASES_FILE" || fail "failed to source zsh aliases file: $ALIASES_FILE"
 
 for binary in ${(k)required_alias_prefix_by_binary}; do

@@ -104,6 +104,33 @@ fn activity_commits_github_normalizes_search_results() {
 }
 
 #[test]
+fn activity_commits_ignores_irrelevant_repository_shape() {
+    let stub = StubEnv::new().gh_stub(GH_ACTIVITY_STUB);
+    let out = run_forge_cli(
+        &stub,
+        &[
+            "--provider",
+            "github",
+            "--repo",
+            "owner/nested/repo",
+            "--format",
+            "json",
+            "activity",
+            "commits",
+            "--user",
+            "alice",
+            "--since",
+            "2026-05-01",
+            "--limit",
+            "2",
+        ],
+    );
+    assert_eq!(out.code, 0, "stdout={} stderr={}", out.stdout, out.stderr);
+    let envelope = parse_envelope(&out.stdout);
+    assert_eq!(envelope["data"]["item_count"], 1);
+}
+
+#[test]
 fn activity_events_github_resolves_me_and_normalizes_events() {
     let stub = StubEnv::new().gh_stub(GH_ACTIVITY_STUB);
     let out = run_forge_cli(
@@ -204,6 +231,8 @@ fn activity_feed_gitlab_normalizes_project_events_without_flattening_provider_se
         &[
             "--provider",
             "gitlab",
+            "--host",
+            "gitlab.com",
             "--repo",
             "group/widget",
             "--format",
@@ -402,6 +431,8 @@ fn activity_feed_dry_run_lists_gitlab_project_plans_and_clamps_limit() {
         &[
             "--provider",
             "gitlab",
+            "--host",
+            "gitlab.com",
             "--repo",
             "group/widget",
             "--dry-run",
@@ -497,6 +528,8 @@ fn activity_gitlab_branch_is_provider_unsupported() {
         &[
             "--provider",
             "gitlab",
+            "--host",
+            "gitlab.com",
             "--format",
             "json",
             "activity",
