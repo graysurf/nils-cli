@@ -290,7 +290,7 @@ emit_escaped_control_error() {
 # disables the check for tests that exercise unrelated paths.
 maybe_reject_escaped_control() {
   if [[ "${FORGE_CLI_STUB_NO_MD_GUARD:-}" == "1" ]]; then return; fi
-  if [[ -n "$body_file" && -f "$body_file" ]]; then
+  if [[ -n "$body_file" ]]; then
     if grep -q '\\n' "$body_file" || grep -q '\\r' "$body_file" || grep -q '\\t' "$body_file"; then
       emit_escaped_control_error
     fi
@@ -316,7 +316,7 @@ emit_local_path_error() {
 # disables the check.
 maybe_reject_local_path() {
   if [[ "${FORGE_CLI_STUB_NO_PATH_GUARD:-}" == "1" ]]; then return; fi
-  if [[ -n "$body_file" && -f "$body_file" ]]; then
+  if [[ -n "$body_file" ]]; then
     if grep -Eq '/Users/[A-Za-z0-9._-]+|/home/[A-Za-z0-9._-]+' "$body_file" \
        && ! grep -Eq '^/(home/(agent|linuxbrew|runner))' "$body_file"; then
       emit_local_path_error "$1"
@@ -360,7 +360,7 @@ case "$group $verb" in
     url="${FORGE_CLI_STUB_CREATE_URL:-https://github.com/sympoies/nils-cli/issues/999}"
     num="${url##*/}"
     if [[ -n "${FORGE_CLI_STUB_CAPTURE_CREATE_BODY_FILE:-}" && -n "$body_file" ]]; then
-      cp "$body_file" "$FORGE_CLI_STUB_CAPTURE_CREATE_BODY_FILE"
+      cat "$body_file" > "$FORGE_CLI_STUB_CAPTURE_CREATE_BODY_FILE"
     fi
     if [[ -n "${FORGE_CLI_STUB_CREATED_ISSUE_FILE:-}" ]]; then
       printf '%s\n' "$num" > "$FORGE_CLI_STUB_CREATED_ISSUE_FILE"
@@ -371,7 +371,7 @@ case "$group $verb" in
     maybe_reject_local_path "body"
     maybe_reject_escaped_control
     if [[ -n "${FORGE_CLI_STUB_CAPTURE_BODY_FILE:-}" && -n "$body_file" ]]; then
-      cp "$body_file" "$FORGE_CLI_STUB_CAPTURE_BODY_FILE"
+      cat "$body_file" > "$FORGE_CLI_STUB_CAPTURE_BODY_FILE"
     fi
     if [[ -n "$body_file" && -n "${FORGE_CLI_STUB_FAIL_BODY_EDIT_ONCE_MARKER:-}" && ! -e "$FORGE_CLI_STUB_FAIL_BODY_EDIT_ONCE_MARKER" ]]; then
       touch "$FORGE_CLI_STUB_FAIL_BODY_EDIT_ONCE_MARKER"
@@ -466,7 +466,7 @@ case "$group $verb" in
     if [[ -n "${FORGE_CLI_STUB_COMMENT_STORE_DIR:-}" && -n "$body_file" ]]; then
       mkdir -p "$FORGE_CLI_STUB_COMMENT_STORE_DIR"
       store_name="$(printf '%08d.md' "$comment_call")"
-      cp "$body_file" "$FORGE_CLI_STUB_COMMENT_STORE_DIR/$store_name"
+      cat "$body_file" > "$FORGE_CLI_STUB_COMMENT_STORE_DIR/$store_name"
     fi
     if [[ -n "${FORGE_CLI_STUB_STORE_THEN_FAIL_COMMENT_ON_CALL:-}" && "$comment_call" == "$FORGE_CLI_STUB_STORE_THEN_FAIL_COMMENT_ON_CALL" ]]; then
       if [[ -n "${FORGE_CLI_STUB_FAIL_COMMENT_SWITCH_FILE:-}" ]]; then
@@ -476,7 +476,7 @@ case "$group $verb" in
       exit 1
     fi
     if [[ -n "${FORGE_CLI_STUB_CAPTURE_COMMENT_FILE:-}" && -n "$body_file" ]]; then
-      cp "$body_file" "$FORGE_CLI_STUB_CAPTURE_COMMENT_FILE"
+      cat "$body_file" > "$FORGE_CLI_STUB_CAPTURE_COMMENT_FILE"
     fi
     url="${FORGE_CLI_STUB_COMMENT_URL:-https://github.com/$repo/issues/${id}#issuecomment-1}"
     emit "{\"ok\":true,\"schema_version\":\"cli.forge-cli.issue.comment.v1\",\"data\":{\"provider\":\"$provider\",\"number\":$id,\"url\":\"$url\"}}"
