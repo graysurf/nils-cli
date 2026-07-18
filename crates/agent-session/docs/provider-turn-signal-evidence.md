@@ -62,7 +62,7 @@ created.
 | Provider | Audited floor | Classification | Start | Completion | Attention | Failure | Setup |
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | Codex | 0.144.1 baseline; exact-attention versions 0.144.1 and 0.144.3 | supported; exact attention and usage failure require an audited agent-session app-server v2 runtime | `UserPromptSubmit`, observed | matching `agent-turn-complete`, authoritative; raw `Stop` remains journal evidence only | managed protocol authority: typed exact request/resolution; raw/unmanaged hook authority: `PermissionRequest` conservative latch | live app-server `failed` + `usageLimitExceeded`, authoritative; raw TUI remains unavailable | additive hooks/notify plus capability-probed private Unix app-server runtime for fresh sessions |
-| Claude Code | 2.1.206 baseline; Elicitation audit 2.1.210 | partial; usage failure supported; Elicitation exact only when both callbacks carry the same non-empty id | `UserPromptSubmit`, observed; general `PreToolUse` and `SubagentStop` provide observed progress/reactivation | `idle_prompt`, observed; raw `Stop` is journal evidence only | exact `AskUserQuestion`; conditional exact `Elicitation`; `PermissionRequest`/notification conservative latch | structured `StopFailure.error`, authoritative; only `rate_limit` can arm auto-resume | additive merge into `~/.claude/settings.json` |
+| Claude Code | 2.1.206 baseline; Elicitation audit 2.1.210 | partial; usage failure supported; Elicitation exact only when both callbacks carry the same non-empty id | `UserPromptSubmit`, observed; general `PreToolUse` provides observed progress/reactivation; uncorrelated `SubagentStop` is ignored | `idle_prompt`, observed; raw `Stop` is journal evidence only | exact `AskUserQuestion`; conditional exact `Elicitation`; `PermissionRequest`/notification conservative latch | structured `StopFailure.error`, authoritative; only `rate_limit` can arm auto-resume | additive merge into `~/.claude/settings.json` |
 | Hermes | 0.18.2 | supported | `pre_llm_call`, observed | successful non-interrupted `post_llm_call`, authoritative | non-empty shell `extra.tool_call_id` projects to exact pre/post correlation; missing/empty-id tuple fallback remains conservative | runtime/fallback only | additive merge into `~/.hermes/config.yaml`; Hermes consent remains mandatory |
 
 Versions below the audited floor remain usable. `activity doctor` reports them
@@ -155,12 +155,18 @@ Raw `Stop` is therefore treated exactly like Codex raw Stop. `idle_prompt` is a
 later provider notification explicitly meaning that Claude is done and waiting
 for another prompt, so it may yield observed Waiting.
 
-General `PreToolUse` fires before every tool call, and `SubagentStop` fires after
-a subagent finishes responding. The managed adapter installs both as observed
-progress. Either signal can re-establish Working after an observed
-`idle_prompt`, closing the false-Waiting window before a long tool or between
-back-to-back subagents. Progress remains uncorrelated and cannot clear pending
-attention.
+General `PreToolUse` fires before every tool call, so the managed adapter installs
+it as observed progress. It can re-establish Working after an observed
+`idle_prompt`, closing the false-Waiting window before a long tool. `SubagentStop`
+fires only after a subagent finishes and carries no parent-turn correlation; it
+is deliberately not admitted because a late background callback could resurrect
+a genuinely waiting parent. Progress remains uncorrelated and cannot clear
+pending attention.
+
+General Claude progress receives no stable provider event id and has idempotent
+reducer semantics. It remains in the bounded journal and split-write repair path,
+but uses the short semantic replay guard instead of consuming the 4096-entry
+exact replay horizon needed by lifecycle, failure, and attention evidence.
 
 `PreToolUse`, `PostToolUse`, and `PostToolUseFailure` expose the same
 `tool_use_id` for `AskUserQuestion`. The adapter projects that raw id through a
@@ -335,13 +341,14 @@ Apply/repair/remove parse and plan both files before either mutation; a guarded
 second-write failure restores the first write, while a rollback race surfaces an
 explicit error naming both metadata-only paths.
 
-Claude setup adds general `PreToolUse` and `SubagentStop` progress hooks plus
-exact `AskUserQuestion` matcher groups for `PreToolUse`, `PostToolUse`, and
+Claude setup adds a general `PreToolUse` progress hook plus exact
+`AskUserQuestion` matcher groups for `PreToolUse`, `PostToolUse`, and
 `PostToolUseFailure`, while retaining the general `PostToolUse` progress hook.
-Claude Code deduplicates identical matching command handlers. The exact
-`AskUserQuestion` normalizer arm runs before general progress, and an
-AskUserQuestion completion is ingested once even though the exact and general
-PostToolUse groups both match.
+Previously managed `SubagentStop` progress handlers are retired during setup or
+repair without touching user-owned handlers. Claude Code deduplicates identical
+matching command handlers. The exact `AskUserQuestion` normalizer arm runs before
+general progress, and an AskUserQuestion completion is ingested once even though
+the exact and general PostToolUse groups both match.
 
 Provider hooks and the Codex completion notification invoke the local binary
 without network access. They no-op when
