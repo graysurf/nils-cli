@@ -5777,9 +5777,28 @@ fn state_path_repository_binding(
     (expected, allow_any_git_repo)
 }
 
+#[cfg(target_os = "macos")]
+fn normalize_platform_path_alias(path: PathBuf) -> PathBuf {
+    for alias in ["var", "tmp", "etc"] {
+        let source = Path::new("/").join(alias);
+        if let Ok(relative) = path.strip_prefix(&source) {
+            return Path::new("/private").join(alias).join(relative);
+        }
+    }
+    path
+}
+
+#[cfg(not(target_os = "macos"))]
+fn normalize_platform_path_alias(path: PathBuf) -> PathBuf {
+    path
+}
+
 fn has_symlinked_path_component(repo_root: &Path, path: &Path) -> bool {
-    let repo_root = absolutize(repo_root);
-    let path = absolutize(path);
+    // macOS exposes system temporary paths through `/var` while Git commonly
+    // reports the same checkout through `/private/var`. Normalize only these
+    // platform aliases before checking repository-internal path components.
+    let repo_root = normalize_platform_path_alias(absolutize(repo_root));
+    let path = normalize_platform_path_alias(absolutize(path));
     let Ok(relative) = path.strip_prefix(&repo_root) else {
         return true;
     };
