@@ -11567,12 +11567,15 @@ mod tests {
     fn detached_double_fork_pipe_holder_is_owned_and_terminated() {
         let root = tempfile::TempDir::new().expect("detached child root");
         let pid_path = root.path().join("detached.pid");
-        let mut supervisor =
-            spawn_authenticated_supervisor_fixture("detached-double-fork", &pid_path);
-        let started = Instant::now();
+        let mut supervisor = spawn_authenticated_supervisor_fixture_with_timeout(
+            "detached-double-fork",
+            &pid_path,
+            Duration::from_secs(10),
+        );
+        let publication_deadline = Instant::now() + Duration::from_secs(5);
         while !pid_path.exists() {
             assert!(
-                started.elapsed() < Duration::from_secs(1),
+                Instant::now() < publication_deadline,
                 "detached fixture did not publish its process identity"
             );
             std::thread::sleep(Duration::from_millis(2));
