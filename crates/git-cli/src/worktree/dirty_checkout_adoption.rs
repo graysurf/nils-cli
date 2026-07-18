@@ -6740,56 +6740,36 @@ fn wait_pinned_process_until(process: &PinnedProcess, deadline: Instant) -> Resu
     }
 }
 
-#[cfg(target_os = "macos")]
-fn descendant_processes_with<F>(
-    root: libc::pid_t,
+#[cfg(any(test, target_os = "macos"))]
+fn macos_descendant_processes_from_identity_with<R, L, F>(
+    root: ProcessIdentity,
     deadline: Instant,
+    mut read_record: R,
+    mut list_children: L,
     mut observe: F,
 ) -> Result<ProcessScan>
 where
+    R: FnMut(libc::pid_t) -> Result<Option<ProcessRecord>>,
+    L: FnMut(libc::pid_t, &mut [libc::pid_t]) -> Result<usize>,
     F: FnMut(ProcessIdentity),
 {
     let mut identities = Vec::new();
     let mut seen = HashSet::new();
     let mut edge_visits = 0_usize;
-    let Some(root_identity) = process_identity(root)? else {
-        return Ok(ProcessScan {
-            identities,
-            #[cfg(test)]
-            edge_visits,
-        });
-    };
-    let mut frontier = vec![root_identity];
+    let mut frontier = vec![root];
     let mut children = vec![0 as libc::pid_t; PROCESS_SCAN_LIMITS.descendants + 1];
     while let Some(parent) = frontier.pop() {
         ensure_deadline(deadline)?;
-        if process_identity(parent.pid)? != Some(parent) {
+        if read_record(parent.pid)?.map(|record| record.identity) != Some(parent) {
             continue;
         }
-        unsafe {
-            *libc::__error() = 0;
-        }
-        let count = unsafe {
-            libc::proc_listchildpids(
-                parent.pid,
-                children.as_mut_ptr().cast(),
-                std::mem::size_of_val(children.as_slice()) as libc::c_int,
-            )
-        };
-        if count < 0 {
-            let error = io::Error::last_os_error();
-            if error.raw_os_error() == Some(libc::ESRCH) {
-                continue;
-            }
-            return Err(process_scan_resource_error());
-        }
-        if process_identity(parent.pid)? != Some(parent) {
+        let count = list_children(parent.pid, &mut children)?;
+        if read_record(parent.pid)?.map(|record| record.identity) != Some(parent) {
             continue;
         }
         if count == 0 {
             continue;
         }
-        let count = count as usize;
         if count > PROCESS_SCAN_LIMITS.descendants {
             return Err(process_scan_resource_error());
         }
@@ -6803,7 +6783,7 @@ where
                         .checked_add(1)
                         .ok_or_else(process_scan_resource_error)?;
                 }
-                macos_process_record(pid)
+                read_record(pid)
             },
             |identity| {
                 if seen.insert(identity) {
@@ -6826,6 +6806,70 @@ where
 }
 
 #[cfg(target_os = "macos")]
+fn descendant_processes_from_identity_with<F>(
+    root: ProcessIdentity,
+    deadline: Instant,
+    observe: F,
+) -> Result<ProcessScan>
+where
+    F: FnMut(ProcessIdentity),
+{
+    macos_descendant_processes_from_identity_with(
+        root,
+        deadline,
+        macos_process_record,
+        |parent, children| {
+            unsafe {
+                *libc::__error() = 0;
+            }
+            let count = unsafe {
+                libc::proc_listchildpids(
+                    parent,
+                    children.as_mut_ptr().cast(),
+                    std::mem::size_of_val(children) as libc::c_int,
+                )
+            };
+            if count < 0 {
+                let error = io::Error::last_os_error();
+                if error.raw_os_error() == Some(libc::ESRCH) {
+                    return Ok(0);
+                }
+                return Err(process_scan_resource_error());
+            }
+            Ok(count as usize)
+        },
+        observe,
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn descendant_processes_from_identity(
+    root: ProcessIdentity,
+    deadline: Instant,
+) -> Result<ProcessScan> {
+    descendant_processes_from_identity_with(root, deadline, |_| {})
+}
+
+#[cfg(target_os = "macos")]
+fn descendant_processes_with<F>(
+    root: libc::pid_t,
+    deadline: Instant,
+    observe: F,
+) -> Result<ProcessScan>
+where
+    F: FnMut(ProcessIdentity),
+{
+    let Some(root_identity) = process_identity(root)? else {
+        return Ok(ProcessScan {
+            identities: Vec::new(),
+            #[cfg(test)]
+            edge_visits: 0,
+        });
+    };
+    descendant_processes_from_identity_with(root_identity, deadline, observe)
+}
+
+#[cfg(target_os = "macos")]
 fn descendant_processes(root: libc::pid_t, deadline: Instant) -> Result<ProcessScan> {
     descendant_processes_with(root, deadline, |_| {})
 }
@@ -6839,7 +6883,7 @@ fn macos_fallback_descendants_with<R, S>(
 ) -> Result<ProcessScan>
 where
     R: FnMut(libc::pid_t) -> Result<Option<ProcessIdentity>>,
-    S: FnMut(libc::pid_t, Instant) -> Result<ProcessScan>,
+    S: FnMut(ProcessIdentity, Instant) -> Result<ProcessScan>,
 {
     ensure_deadline(deadline)?;
     if current_identity(root.pid)? != Some(root) {
@@ -6849,7 +6893,7 @@ where
             edge_visits: 0,
         });
     }
-    scan_descendants(root.pid, deadline)
+    scan_descendants(root, deadline)
 }
 
 #[cfg(target_os = "linux")]
@@ -7148,7 +7192,7 @@ impl ProcessOwner {
             self.root,
             deadline,
             process_identity,
-            descendant_processes,
+            descendant_processes_from_identity,
         )?;
         identities.extend(fallback.identities);
         if identities.len() > PROCESS_SCAN_LIMITS.descendants {
@@ -10558,8 +10602,8 @@ mod tests {
                 assert_eq!(pid, root.pid);
                 Ok(Some(replacement))
             },
-            |pid, _deadline| {
-                assert_eq!(pid, root.pid);
+            |identity, _deadline| {
+                assert_eq!(identity, root);
                 scans.set(scans.get() + 1);
                 Ok(ProcessScan {
                     identities: vec![unrelated],
@@ -10577,6 +10621,181 @@ mod tests {
             scans.get(),
             0,
             "a stale root identity must suppress descendant discovery"
+        );
+    }
+
+    #[test]
+    fn macos_fallback_rejects_root_reuse_between_precheck_and_scan() {
+        let root = ProcessIdentity {
+            pid: 20,
+            generation: 20_000,
+        };
+        let replacement = ProcessIdentity {
+            pid: root.pid,
+            generation: 29_999,
+        };
+        let unrelated = ProcessIdentity {
+            pid: 21,
+            generation: 21_000,
+        };
+        let child_lists = std::cell::Cell::new(0_usize);
+        let observed = std::cell::RefCell::new(Vec::new());
+
+        let scan = macos_fallback_descendants_with(
+            root,
+            Instant::now() + Duration::from_secs(1),
+            |pid| {
+                assert_eq!(pid, root.pid);
+                Ok(Some(root))
+            },
+            |expected_root, deadline| {
+                macos_descendant_processes_from_identity_with(
+                    expected_root,
+                    deadline,
+                    |pid| match pid {
+                        pid if pid == root.pid => Ok(Some(ProcessRecord::new(
+                            replacement.pid,
+                            1,
+                            replacement.generation,
+                            1,
+                        ))),
+                        pid if pid == unrelated.pid => Ok(Some(ProcessRecord::new(
+                            unrelated.pid,
+                            root.pid,
+                            unrelated.generation,
+                            1,
+                        ))),
+                        _ => Ok(None),
+                    },
+                    |pid, children| {
+                        assert_eq!(pid, root.pid);
+                        child_lists.set(child_lists.get() + 1);
+                        children[0] = unrelated.pid;
+                        Ok(1)
+                    },
+                    |identity| observed.borrow_mut().push(identity),
+                )
+            },
+        )
+        .expect("root reuse during fallback scanning is a vanished ownership edge");
+
+        assert!(
+            scan.identities.is_empty(),
+            "fallback scanning must remain bound to the prevalidated root generation"
+        );
+        assert_eq!(child_lists.get(), 0);
+        assert!(observed.borrow().is_empty());
+    }
+
+    #[test]
+    fn macos_fallback_fail_closed_boundary_matrix() {
+        let root = ProcessIdentity {
+            pid: 30,
+            generation: 30_000,
+        };
+        let child = ProcessIdentity {
+            pid: 31,
+            generation: 31_000,
+        };
+
+        let vanished_scans = std::cell::Cell::new(0_usize);
+        let vanished = macos_fallback_descendants_with(
+            root,
+            Instant::now() + Duration::from_secs(1),
+            |_| Ok(None),
+            |_, _| {
+                vanished_scans.set(vanished_scans.get() + 1);
+                Ok(ProcessScan {
+                    identities: vec![child],
+                    edge_visits: 1,
+                })
+            },
+        )
+        .expect("a vanished root is an absent ownership edge");
+        assert!(vanished.identities.is_empty());
+        assert_eq!(vanished_scans.get(), 0);
+
+        let failed_scans = std::cell::Cell::new(0_usize);
+        let identity_error = macos_fallback_descendants_with(
+            root,
+            Instant::now() + Duration::from_secs(1),
+            |_| Err(process_scan_resource_error()),
+            |_, _| {
+                failed_scans.set(failed_scans.get() + 1);
+                Ok(ProcessScan {
+                    identities: vec![child],
+                    edge_visits: 1,
+                })
+            },
+        )
+        .expect_err("identity read failures must remain containment failures");
+        assert_eq!(
+            identity_error
+                .downcast_ref::<DirtyCheckoutError>()
+                .expect("typed identity failure")
+                .kind(),
+            DirtyCheckoutErrorKind::ResourceUnavailable
+        );
+        assert_eq!(failed_scans.get(), 0);
+
+        let expired_identity_reads = std::cell::Cell::new(0_usize);
+        let expired_scans = std::cell::Cell::new(0_usize);
+        let expired = macos_fallback_descendants_with(
+            root,
+            Instant::now() - Duration::from_secs(1),
+            |_| {
+                expired_identity_reads.set(expired_identity_reads.get() + 1);
+                Ok(Some(root))
+            },
+            |_, _| {
+                expired_scans.set(expired_scans.get() + 1);
+                Ok(ProcessScan {
+                    identities: vec![child],
+                    edge_visits: 1,
+                })
+            },
+        )
+        .expect_err("an expired fallback deadline must fail before discovery");
+        assert_eq!(
+            expired
+                .downcast_ref::<DirtyCheckoutError>()
+                .expect("typed fallback timeout")
+                .kind(),
+            DirtyCheckoutErrorKind::Timeout
+        );
+        assert_eq!(expired_identity_reads.get(), 0);
+        assert_eq!(expired_scans.get(), 0);
+
+        let delegated_scans = std::cell::Cell::new(0_usize);
+        let delegated = macos_fallback_descendants_with(
+            root,
+            Instant::now() + Duration::from_secs(1),
+            |_| Ok(Some(root)),
+            |_, _| {
+                delegated_scans.set(delegated_scans.get() + 1);
+                Ok(ProcessScan {
+                    identities: vec![child],
+                    edge_visits: 1,
+                })
+            },
+        )
+        .expect("an exact live root delegates discovery");
+        assert_eq!(delegated.identities, vec![child]);
+        assert_eq!(delegated_scans.get(), 1);
+
+        let scanner_error = macos_fallback_descendants_with(
+            root,
+            Instant::now() + Duration::from_secs(1),
+            |_| Ok(Some(root)),
+            |_, _| Err(process_scan_resource_error()),
+        )
+        .expect_err("scanner containment failures must propagate");
+        assert_eq!(
+            scanner_error
+                .downcast_ref::<DirtyCheckoutError>()
+                .expect("typed scanner failure")
+                .kind(),
+            DirtyCheckoutErrorKind::ResourceUnavailable
         );
     }
 
