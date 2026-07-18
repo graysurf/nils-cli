@@ -1,6 +1,8 @@
 #![allow(dead_code)]
 
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 use nils_test_support::StubBinDir;
 use nils_test_support::bin::resolve;
@@ -13,6 +15,30 @@ pub struct GitCliHarness {
     home_dir: TempDir,
     xdg_config_home: PathBuf,
     stub_bin_dir: StubBinDir,
+}
+
+struct PrivateTestBinary {
+    _directory: TempDir,
+    path: PathBuf,
+}
+
+fn nearest_trusted_copy_parent(binary: &Path) -> PathBuf {
+    let euid = unsafe { libc::geteuid() };
+    binary
+        .parent()
+        .expect("git-cli Cargo output parent")
+        .ancestors()
+        .find(|candidate| {
+            candidate.ancestors().all(|ancestor| {
+                std::fs::symlink_metadata(ancestor).is_ok_and(|metadata| {
+                    metadata.file_type().is_dir()
+                        && (metadata.uid() == 0 || metadata.uid() == euid)
+                        && metadata.mode() & 0o022 == 0
+                })
+            })
+        })
+        .expect("trusted git-cli test binary parent")
+        .to_path_buf()
 }
 
 impl GitCliHarness {
@@ -32,7 +58,40 @@ impl GitCliHarness {
     }
 
     pub fn git_cli_bin(&self) -> PathBuf {
-        resolve("git-cli")
+        static TEST_BINARY: OnceLock<PrivateTestBinary> = OnceLock::new();
+        TEST_BINARY
+            .get_or_init(|| {
+                let shared = resolve("git-cli");
+                let parent = nearest_trusted_copy_parent(&shared);
+                let directory = tempfile::Builder::new()
+                    .prefix(".git-cli-integration-")
+                    .tempdir_in(&parent)
+                    .expect("create private git-cli test binary directory");
+                std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700))
+                    .expect("secure git-cli test binary directory");
+                let path = directory.path().join("git-cli");
+                let staged = directory.path().join(".git-cli.staged");
+                let mut source =
+                    std::fs::File::open(&shared).expect("open shared git-cli test binary");
+                let mut destination = std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .mode(0o700)
+                    .open(&staged)
+                    .expect("create staged git-cli test binary");
+                std::io::copy(&mut source, &mut destination).expect("copy git-cli test binary");
+                destination
+                    .sync_all()
+                    .expect("sync staged git-cli test binary");
+                drop(destination);
+                std::fs::rename(&staged, &path).expect("publish git-cli test binary copy");
+                PrivateTestBinary {
+                    _directory: directory,
+                    path,
+                }
+            })
+            .path
+            .clone()
     }
 
     pub fn cmd_options(&self, cwd: &Path) -> CmdOptions {
@@ -125,4 +184,52 @@ fi
 exit 0
 "#,
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn git_cli_test_binary_is_an_isolated_private_copy() {
+        let shared = resolve("git-cli");
+        let shared_mode = std::fs::metadata(&shared)
+            .expect("shared git-cli metadata")
+            .permissions()
+            .mode();
+        let harness = GitCliHarness::new();
+        let isolated = harness.git_cli_bin();
+
+        assert_ne!(
+            std::fs::canonicalize(&isolated).expect("canonical isolated binary"),
+            std::fs::canonicalize(&shared).expect("canonical shared binary"),
+            "integration harness must not execute or chmod the shared Cargo output"
+        );
+        assert_eq!(
+            std::fs::metadata(&shared)
+                .expect("shared git-cli metadata after harness setup")
+                .permissions()
+                .mode(),
+            shared_mode,
+            "harness setup must not mutate the shared Cargo output"
+        );
+        assert_eq!(
+            std::fs::metadata(&isolated)
+                .expect("isolated git-cli metadata")
+                .permissions()
+                .mode()
+                & 0o077,
+            0,
+            "isolated test binary must be private"
+        );
+        assert_eq!(
+            std::fs::metadata(isolated.parent().expect("isolated binary parent"))
+                .expect("isolated binary parent metadata")
+                .permissions()
+                .mode()
+                & 0o077,
+            0,
+            "isolated test binary parent must be private"
+        );
+    }
 }

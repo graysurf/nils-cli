@@ -1,5 +1,6 @@
 use crate::common;
 use common::GitCliHarness;
+use nils_test_support::cmd::run_with;
 
 #[test]
 fn completion_export_succeeds_outside_git_repo() {
@@ -70,6 +71,64 @@ fn completion_bash_emits_dynamic_registration() {
         stdout.contains("-F _clap_complete_git_cli git-cli"),
         "dynamic bash registration binds the completer to git-cli via complete -F"
     );
+}
+
+#[test]
+fn dynamic_completion_exposes_dirty_checkout_argument_contracts() {
+    let harness = GitCliHarness::new();
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    std::fs::write(dir.path().join("reason.txt"), "reason\n").expect("write reason fixture");
+
+    let complete = |words: &[&str], index: &str| {
+        let options = harness
+            .cmd_options(dir.path())
+            .with_env("COMPLETE", "zsh")
+            .with_env("_CLAP_COMPLETE_INDEX", index)
+            .with_env("_CLAP_IFS", "\n");
+        let mut args = vec!["--", "git-cli"];
+        args.extend_from_slice(words);
+        let output = run_with(&harness.git_cli_bin(), &args, &options);
+        assert_eq!(output.code, 0, "stderr: {}", output.stderr_text());
+        output
+            .stdout_text()
+            .lines()
+            .map(|line| {
+                line.split(':')
+                    .next()
+                    .expect("completion candidate")
+                    .to_string()
+            })
+            .collect::<Vec<_>>()
+    };
+    let has = |candidates: &[String], expected: &str| {
+        candidates.iter().any(|candidate| candidate == expected)
+    };
+
+    let snapshot = complete(&["worktree", "dirty-snapshot", ""], "3");
+    assert!(has(&snapshot, "--format"));
+    assert!(!has(&snapshot, "--challenge"));
+
+    let adoption = complete(&["worktree", "adopt-dirty", ""], "3");
+    for expected in ["--challenge", "--reason-file", "--format"] {
+        assert!(has(&adoption, expected), "missing {expected}: {adoption:?}");
+    }
+    assert!(!has(&adoption, "--receipt"));
+
+    let revocation = complete(&["worktree", "revoke-dirty", ""], "3");
+    for expected in ["--receipt", "--format"] {
+        assert!(
+            has(&revocation, expected),
+            "missing {expected}: {revocation:?}"
+        );
+    }
+    assert!(!has(&revocation, "--reason-file"));
+
+    assert_eq!(
+        complete(&["worktree", "adopt-dirty", "--format", ""], "4"),
+        ["text", "json"]
+    );
+    let reason_files = complete(&["worktree", "adopt-dirty", "--reason-file", "r"], "4");
+    assert!(has(&reason_files, "reason.txt"));
 }
 
 #[test]

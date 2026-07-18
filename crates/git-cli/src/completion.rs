@@ -354,6 +354,7 @@ fn build_worktree_group() -> Command {
                     Arg::new("challenge")
                         .long("challenge")
                         .value_name("token")
+                        .num_args(1)
                         .required(true),
                 )
                 .arg(
@@ -361,6 +362,7 @@ fn build_worktree_group() -> Command {
                         .long("reason-file")
                         .value_name("path")
                         .value_hint(ValueHint::FilePath)
+                        .num_args(1)
                         .required(true),
                 )
                 .arg(format_arg()),
@@ -410,6 +412,7 @@ fn build_worktree_group() -> Command {
                     Arg::new("receipt")
                         .long("receipt")
                         .value_name("id")
+                        .num_args(1)
                         .required(true),
                 )
                 .arg(format_arg()),
@@ -557,6 +560,7 @@ fn format_arg() -> Arg {
         .long("format")
         .help("Output format")
         .value_name("format")
+        .num_args(1)
         .value_parser(["text", "json"])
 }
 
@@ -571,6 +575,7 @@ fn kind_arg() -> Arg {
 #[cfg(test)]
 mod tests {
     use super::build_command_model;
+    use clap::{Arg, ArgAction, ValueHint};
 
     #[test]
     fn worktree_group_exposes_go_subcommand() {
@@ -587,32 +592,88 @@ mod tests {
         );
     }
 
+    fn assert_single_value_argument(
+        argument: &Arg,
+        required: bool,
+        value_hint: ValueHint,
+        possible_values: &[&str],
+    ) {
+        assert_eq!(argument.is_required_set(), required);
+        assert!(matches!(argument.get_action(), ArgAction::Set));
+        assert_eq!(
+            argument
+                .get_num_args()
+                .map(|range| (range.min_values(), range.max_values())),
+            Some((1, 1)),
+            "{} must consume exactly one value",
+            argument.get_id()
+        );
+        assert_eq!(argument.get_value_hint(), value_hint);
+        let actual_values: Vec<_> = argument
+            .get_possible_values()
+            .iter()
+            .map(|value| value.get_name().to_string())
+            .collect();
+        let expected_values: Vec<_> = possible_values
+            .iter()
+            .map(|value| (*value).to_string())
+            .collect();
+        assert_eq!(actual_values, expected_values);
+    }
+
     #[test]
-    fn dirty_checkout_commands_expose_frozen_completion_flags() {
+    fn dirty_checkout_commands_expose_exact_completion_argument_contracts() {
         let cmd = build_command_model();
         let worktree = cmd
             .find_subcommand("worktree")
             .expect("worktree group present");
-        for (command, expected) in [
+        for (command_name, expected_ids) in [
             ("dirty-snapshot", vec!["format"]),
             ("adopt-dirty", vec!["challenge", "reason-file", "format"]),
             ("revoke-dirty", vec!["receipt", "format"]),
         ] {
             let command = worktree
-                .find_subcommand(command)
-                .unwrap_or_else(|| panic!("worktree {command} command present"));
-            let actual: Vec<String> = command
+                .find_subcommand(command_name)
+                .unwrap_or_else(|| panic!("worktree {command_name} command present"));
+            let actual_ids: Vec<_> = command
                 .get_arguments()
-                .map(|argument| argument.get_id().to_string())
+                .map(|argument| argument.get_id().as_str())
                 .collect();
-            for flag in expected {
-                assert!(
-                    actual.iter().any(|actual| actual == flag),
-                    "worktree {} should expose {flag}, got {actual:?}",
-                    command.get_name()
-                );
-            }
+            assert_eq!(actual_ids, expected_ids, "{command_name} argument IDs");
+
+            let format = command
+                .get_arguments()
+                .find(|argument| argument.get_id() == "format")
+                .expect("format argument");
+            assert_eq!(format.get_long(), Some("format"));
+            assert_single_value_argument(format, false, ValueHint::Unknown, &["text", "json"]);
         }
+
+        let adopt = worktree
+            .find_subcommand("adopt-dirty")
+            .expect("adopt-dirty command");
+        let challenge = adopt
+            .get_arguments()
+            .find(|argument| argument.get_id() == "challenge")
+            .expect("challenge argument");
+        assert_eq!(challenge.get_long(), Some("challenge"));
+        assert_single_value_argument(challenge, true, ValueHint::Unknown, &[]);
+        let reason_file = adopt
+            .get_arguments()
+            .find(|argument| argument.get_id() == "reason-file")
+            .expect("reason-file argument");
+        assert_eq!(reason_file.get_long(), Some("reason-file"));
+        assert_single_value_argument(reason_file, true, ValueHint::FilePath, &[]);
+
+        let revoke = worktree
+            .find_subcommand("revoke-dirty")
+            .expect("revoke-dirty command");
+        let receipt = revoke
+            .get_arguments()
+            .find(|argument| argument.get_id() == "receipt")
+            .expect("receipt argument");
+        assert_eq!(receipt.get_long(), Some("receipt"));
+        assert_single_value_argument(receipt, true, ValueHint::Unknown, &[]);
     }
 
     #[test]

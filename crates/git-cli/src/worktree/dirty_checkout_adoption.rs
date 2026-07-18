@@ -31,6 +31,7 @@ const MAX_GIT_STDERR_BYTES: usize = 1024 * 1024;
 const MAX_CAPTURE_BYTES: usize = 64 * 1024 * 1024;
 const MAX_PATH_BYTES: usize = 32 * 1024 * 1024;
 const MAX_STATE_FILE_BYTES: usize = 16 * 1024;
+const MAX_REVOCATION_TOMBSTONES: usize = 64;
 const MAX_REASON_BYTES: usize = 2_000;
 const MAX_ENTRY_COUNT: usize = 100_000;
 const MAX_FILE_BYTES: u64 = 1024 * 1024 * 1024;
@@ -287,20 +288,6 @@ impl LeaseRecord {
         }
     }
 
-    fn checkout_root(&self) -> &str {
-        match self {
-            Self::V1(lease) => &lease.checkout_root,
-            Self::V2(lease) => &lease.checkout_root,
-        }
-    }
-
-    fn checkout_git_dir(&self) -> &str {
-        match self {
-            Self::V1(lease) => &lease.checkout_git_dir,
-            Self::V2(lease) => &lease.checkout_git_dir,
-        }
-    }
-
     fn acquired_at(&self) -> u64 {
         match self {
             Self::V1(lease) => lease.acquired_at,
@@ -387,6 +374,7 @@ struct ReceiptRecord {
 struct PendingAdoptionRecord {
     schema: String,
     receipt_id: String,
+    token_digest: String,
     challenge_digest: String,
     session_key: String,
     checkout_instance: String,
@@ -394,6 +382,10 @@ struct PendingAdoptionRecord {
     predecessor_receipt_id: Option<String>,
     predecessor_receipt_digest: Option<String>,
     predecessor_spent_challenge_digest: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    predecessor_lease_digest: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    predecessor_lease_bytes: Option<Vec<u8>>,
 }
 
 #[derive(Debug)]
@@ -406,6 +398,7 @@ struct SnapshotBudget {
     capture_bytes: usize,
     path_bytes: usize,
     file_bytes: u64,
+    traversal_entries: usize,
 }
 
 impl SnapshotBudget {
@@ -452,6 +445,22 @@ impl SnapshotBudget {
         }
         Ok(())
     }
+
+    fn charge_traversal_entry(&mut self) -> Result<()> {
+        self.traversal_entries = self.traversal_entries.checked_add(1).ok_or_else(|| {
+            domain_error(
+                DirtyCheckoutErrorKind::ResourceUnavailable,
+                "checkout filesystem entry count overflowed",
+            )
+        })?;
+        if self.traversal_entries > MAX_ENTRY_COUNT {
+            return Err(domain_error(
+                DirtyCheckoutErrorKind::ResourceUnavailable,
+                "checkout filesystem entry count exceeds the supported limit",
+            ));
+        }
+        Ok(())
+    }
 }
 
 struct FramedHasher(Sha256);
@@ -478,10 +487,14 @@ pub fn dirty_snapshot(checkout: &Path) -> Result<DirtySnapshot> {
 }
 
 fn dirty_snapshot_cli(checkout: &Path) -> Result<DirtySnapshot> {
-    let deadline = deadline_after(SNAPSHOT_TIMEOUT)?;
+    dirty_snapshot_cli_until(checkout, deadline_after(SNAPSHOT_TIMEOUT)?)
+}
+
+fn dirty_snapshot_cli_until(checkout: &Path, deadline: Instant) -> Result<DirtySnapshot> {
     let executable = snapshot_worker_executable()?;
+    executable.revalidate()?;
     ensure_deadline(deadline)?;
-    let mut command = Command::new(executable);
+    let mut command = Command::new(executable.command_path());
     command
         .env(SNAPSHOT_WORKER_ENV, "1")
         .env(SNAPSHOT_WORKER_CHECKOUT_ENV, checkout.as_os_str())
@@ -514,7 +527,7 @@ fn decode_snapshot_worker_output(output: std::process::Output) -> Result<DirtySn
         ));
     }
     match (response.snapshot, response.error) {
-        (Some(snapshot), None) if snapshot.schema == SNAPSHOT_SCHEMA => Ok(DirtySnapshot {
+        (Some(snapshot), None) if valid_worker_snapshot(&snapshot) => Ok(DirtySnapshot {
             schema: SNAPSHOT_SCHEMA,
             repository_key: snapshot.repository_key,
             checkout_key: snapshot.checkout_key,
@@ -526,6 +539,10 @@ fn decode_snapshot_worker_output(output: std::process::Output) -> Result<DirtySn
             untracked_entries: snapshot.untracked_entries,
             hashed_bytes: snapshot.hashed_bytes,
         }),
+        (Some(_), None) => Err(domain_error(
+            DirtyCheckoutErrorKind::SnapshotFailed,
+            "dirty snapshot worker success response is semantically invalid",
+        )),
         (None, Some(error)) => {
             let kind = error_kind_from_code(&error.code).ok_or_else(|| {
                 domain_error(
@@ -542,6 +559,21 @@ fn decode_snapshot_worker_output(output: std::process::Output) -> Result<DirtySn
     }
 }
 
+fn valid_worker_snapshot(snapshot: &SnapshotWorkerSnapshot) -> bool {
+    snapshot.schema == SNAPSHOT_SCHEMA
+        && is_lower_hex(&snapshot.repository_key, 64)
+        && is_lower_hex(&snapshot.checkout_key, 64)
+        && is_lower_hex(&snapshot.checkout_instance, 32)
+        && is_lower_hex(&snapshot.snapshot_id, 64)
+        && valid_head_identity(&snapshot.head_oid)
+        && is_lower_hex(&snapshot.branch_ref_digest, 64)
+        && snapshot
+            .tracked_entries
+            .checked_add(snapshot.untracked_entries)
+            .is_some_and(|entries| entries <= MAX_ENTRY_COUNT)
+        && snapshot.hashed_bytes <= MAX_TOTAL_BYTES
+}
+
 pub(crate) fn run_internal_snapshot_worker() -> Option<i32> {
     if env::var_os(SNAPSHOT_WORKER_ENV).as_deref() != Some(OsStr::new("1")) {
         return None;
@@ -549,7 +581,10 @@ pub(crate) fn run_internal_snapshot_worker() -> Option<i32> {
     let result = env::var_os(SNAPSHOT_WORKER_CHECKOUT_ENV)
         .map(PathBuf::from)
         .context("dirty snapshot worker checkout is unavailable")
-        .and_then(|checkout| dirty_snapshot_worker(&checkout, Instant::now() + SNAPSHOT_TIMEOUT));
+        .and_then(|checkout| {
+            let deadline = Instant::now() + SNAPSHOT_TIMEOUT;
+            dirty_snapshot_worker(&checkout, deadline)
+        });
     let response = match result {
         Ok(snapshot) => SnapshotWorkerResponse {
             schema: SNAPSHOT_WORKER_SCHEMA.to_string(),
@@ -578,7 +613,39 @@ pub(crate) fn run_internal_snapshot_worker() -> Option<i32> {
     }
 }
 
-fn snapshot_worker_executable() -> Result<PathBuf> {
+struct SnapshotWorkerExecutable {
+    source_path: PathBuf,
+    command_path: PathBuf,
+    file: File,
+    metadata: Metadata,
+}
+
+impl SnapshotWorkerExecutable {
+    fn command_path(&self) -> &Path {
+        &self.command_path
+    }
+
+    fn revalidate(&self) -> Result<()> {
+        validate_worker_path_permissions(&self.source_path)?;
+        let path_metadata = fs::metadata(&self.source_path)
+            .context("dirty snapshot worker executable could not be revalidated")?;
+        let file_metadata = self
+            .file
+            .metadata()
+            .context("dirty snapshot worker executable descriptor is unavailable")?;
+        if !same_metadata(&self.metadata, &path_metadata)
+            || !same_metadata(&self.metadata, &file_metadata)
+        {
+            return Err(domain_error(
+                DirtyCheckoutErrorKind::ResourceUnavailable,
+                "dirty snapshot worker executable changed after validation",
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn snapshot_worker_executable() -> Result<SnapshotWorkerExecutable> {
     let current = env::current_exe()
         .and_then(fs::canonicalize)
         .context("dirty snapshot worker executable could not be resolved")?;
@@ -598,21 +665,72 @@ fn snapshot_worker_executable() -> Result<PathBuf> {
         fs::canonicalize(target_dir.join("git-cli"))
             .context("dirty snapshot worker executable is unavailable")?
     };
-    let metadata = fs::metadata(&candidate)
+    let file = File::open(&candidate)
+        .context("dirty snapshot worker executable descriptor could not be opened")?;
+    let metadata = file
+        .metadata()
         .context("dirty snapshot worker executable metadata is unavailable")?;
+    validate_worker_file_metadata(&metadata)?;
+    validate_worker_path_permissions(&candidate)?;
+    let path_metadata =
+        fs::metadata(&candidate).context("dirty snapshot worker executable path is unavailable")?;
+    if !same_metadata(&metadata, &path_metadata) {
+        return Err(domain_error(
+            DirtyCheckoutErrorKind::ResourceUnavailable,
+            "dirty snapshot worker executable changed during validation",
+        ));
+    }
+    let command_path = if cfg!(target_os = "linux") {
+        PathBuf::from(format!("/proc/self/fd/{}", file.as_raw_fd()))
+    } else if cfg!(target_os = "macos") {
+        PathBuf::from(format!("/dev/fd/{}", file.as_raw_fd()))
+    } else {
+        candidate.clone()
+    };
+    Ok(SnapshotWorkerExecutable {
+        source_path: candidate,
+        command_path,
+        file,
+        metadata,
+    })
+}
+
+fn validate_worker_file_metadata(metadata: &Metadata) -> Result<()> {
     let owner = metadata.uid();
     let mode = metadata.mode();
     if !metadata.file_type().is_file()
+        || mode & 0o111 == 0
         || (owner != 0 && owner != unsafe { libc::geteuid() })
-        || mode & 0o002 != 0
-        || (owner == 0 && mode & 0o020 != 0)
+        || mode & 0o022 != 0
     {
         return Err(domain_error(
             DirtyCheckoutErrorKind::ResourceUnavailable,
             "dirty snapshot worker executable is not trusted",
         ));
     }
-    Ok(candidate)
+    Ok(())
+}
+
+fn validate_worker_path_permissions(candidate: &Path) -> Result<()> {
+    let metadata = fs::symlink_metadata(candidate)
+        .context("dirty snapshot worker executable metadata is unavailable")?;
+    validate_worker_file_metadata(&metadata)?;
+    let euid = unsafe { libc::geteuid() };
+    let mut component = candidate.parent();
+    while let Some(directory) = component {
+        let metadata = fs::symlink_metadata(directory)
+            .context("dirty snapshot worker parent metadata is unavailable")?;
+        let owner = metadata.uid();
+        let mode = metadata.mode();
+        if !metadata.file_type().is_dir() || (owner != 0 && owner != euid) || mode & 0o022 != 0 {
+            return Err(domain_error(
+                DirtyCheckoutErrorKind::ResourceUnavailable,
+                "dirty snapshot worker executable path is not trusted",
+            ));
+        }
+        component = directory.parent();
+    }
+    Ok(())
 }
 
 fn run_snapshot_worker_command(
@@ -666,46 +784,20 @@ pub fn adopt_dirty(
     challenge_token: &str,
     reason_file: &Path,
 ) -> Result<AdoptionReceipt> {
-    adopt_dirty_with_snapshot(
-        checkout,
-        state_root,
-        challenge_token,
-        reason_file,
-        dirty_snapshot,
-    )
-}
-
-fn adopt_dirty_cli(
-    checkout: &Path,
-    state_root: &Path,
-    challenge_token: &str,
-    reason_file: &Path,
-) -> Result<AdoptionReceipt> {
-    adopt_dirty_with_snapshot(
-        checkout,
-        state_root,
-        challenge_token,
-        reason_file,
-        dirty_snapshot_cli,
-    )
-}
-
-fn adopt_dirty_with_snapshot<F>(
-    checkout: &Path,
-    state_root: &Path,
-    challenge_token: &str,
-    reason_file: &Path,
-    mut snapshotter: F,
-) -> Result<AdoptionReceipt>
-where
-    F: FnMut(&Path) -> Result<DirtySnapshot>,
-{
+    let deadline = deadline_after(SNAPSHOT_TIMEOUT)?;
+    let mut previous = None;
+    let mut snapshotter = |path: &Path, barrier_deadline: Instant| {
+        snapshot_reusing(path, barrier_deadline, &mut previous)
+    };
+    let mut now = unix_time;
     adopt_dirty_inner(
         checkout,
         state_root,
         challenge_token,
         reason_file,
+        deadline,
         &mut snapshotter,
+        &mut now,
     )
     .map_err(|error| {
         command_error(
@@ -716,15 +808,151 @@ where
     })
 }
 
-fn adopt_dirty_inner<F>(
+fn adopt_dirty_cli(
     checkout: &Path,
     state_root: &Path,
     challenge_token: &str,
     reason_file: &Path,
-    snapshotter: &mut F,
+) -> Result<AdoptionReceipt> {
+    let deadline = deadline_after(SNAPSHOT_TIMEOUT)?;
+    let mut previous: Option<DirtySnapshot> = None;
+    let mut snapshotter = |path: &Path, barrier_deadline: Instant| {
+        let snapshot = dirty_snapshot_cli_until(path, barrier_deadline)?;
+        if previous.as_ref().is_some_and(|prior| prior != &snapshot) {
+            return Err(domain_error(
+                DirtyCheckoutErrorKind::SnapshotFailed,
+                "checkout changed between adoption verification barriers",
+            ));
+        }
+        previous = Some(snapshot.clone());
+        Ok(snapshot)
+    };
+    let mut now = unix_time;
+    adopt_dirty_inner(
+        checkout,
+        state_root,
+        challenge_token,
+        reason_file,
+        deadline,
+        &mut snapshotter,
+        &mut now,
+    )
+    .map_err(|error| {
+        command_error(
+            error,
+            DirtyCheckoutErrorKind::AdoptionFailed,
+            "dirty checkout adoption failed",
+        )
+    })
+}
+
+fn snapshot_reusing(
+    checkout: &Path,
+    deadline: Instant,
+    previous: &mut Option<DirtySnapshot>,
+) -> Result<DirtySnapshot> {
+    let current = dirty_snapshot_worker(checkout, deadline)?;
+    if previous.as_ref().is_some_and(|prior| prior != &current) {
+        return Err(domain_error(
+            DirtyCheckoutErrorKind::SnapshotFailed,
+            "checkout changed between adoption verification barriers",
+        ));
+    }
+    *previous = Some(current.clone());
+    Ok(current)
+}
+
+#[cfg(test)]
+fn adopt_dirty_with_snapshot<F>(
+    checkout: &Path,
+    state_root: &Path,
+    challenge_token: &str,
+    reason_file: &Path,
+    snapshotter: F,
 ) -> Result<AdoptionReceipt>
 where
     F: FnMut(&Path) -> Result<DirtySnapshot>,
+{
+    adopt_dirty_with_snapshot_and_clock(
+        checkout,
+        state_root,
+        challenge_token,
+        reason_file,
+        snapshotter,
+        unix_time,
+    )
+}
+
+#[cfg(test)]
+fn adopt_dirty_with_snapshot_and_clock<F, G>(
+    checkout: &Path,
+    state_root: &Path,
+    challenge_token: &str,
+    reason_file: &Path,
+    snapshotter: F,
+    now: G,
+) -> Result<AdoptionReceipt>
+where
+    F: FnMut(&Path) -> Result<DirtySnapshot>,
+    G: FnMut() -> Result<u64>,
+{
+    let deadline = deadline_after(SNAPSHOT_TIMEOUT)?;
+    let mut snapshotter = snapshotter;
+    adopt_dirty_with_snapshot_clock_and_deadline(
+        checkout,
+        state_root,
+        challenge_token,
+        reason_file,
+        |path, _| snapshotter(path),
+        now,
+        deadline,
+    )
+}
+
+#[cfg(test)]
+fn adopt_dirty_with_snapshot_clock_and_deadline<F, G>(
+    checkout: &Path,
+    state_root: &Path,
+    challenge_token: &str,
+    reason_file: &Path,
+    mut snapshotter: F,
+    mut now: G,
+    deadline: Instant,
+) -> Result<AdoptionReceipt>
+where
+    F: FnMut(&Path, Instant) -> Result<DirtySnapshot>,
+    G: FnMut() -> Result<u64>,
+{
+    adopt_dirty_inner(
+        checkout,
+        state_root,
+        challenge_token,
+        reason_file,
+        deadline,
+        &mut snapshotter,
+        &mut now,
+    )
+    .map_err(|error| {
+        command_error(
+            error,
+            DirtyCheckoutErrorKind::AdoptionFailed,
+            "dirty checkout adoption failed",
+        )
+    })
+}
+
+fn adopt_dirty_inner<F, G>(
+    checkout: &Path,
+    state_root: &Path,
+    challenge_token: &str,
+    reason_file: &Path,
+    deadline: Instant,
+    snapshotter: &mut F,
+    now: &mut G,
+) -> Result<AdoptionReceipt>
+where
+    F: FnMut(&Path, Instant) -> Result<DirtySnapshot>,
+    G: FnMut() -> Result<u64>,
 {
     if !is_lower_hex(challenge_token, 64) {
         return Err(domain_error(
@@ -732,8 +960,9 @@ where
             "challenge token is malformed",
         ));
     }
-    let challenge_digest = sha256_hex(challenge_token.as_bytes());
-    let identity = resolve_checkout(checkout, false, deadline_after(SNAPSHOT_TIMEOUT)?)?;
+    ensure_deadline(deadline)?;
+    let token_digest = sha256_hex(challenge_token.as_bytes());
+    let identity = resolve_checkout(checkout, false, deadline)?;
     let checkout_dir = checkout_state_dir(state_root, &identity)?;
     let challenge_dir = checkout_dir.join("challenges");
     verify_private_directory(&challenge_dir).map_err(|error| {
@@ -743,45 +972,7 @@ where
             "dirty-checkout challenge directory is untrusted",
         )
     })?;
-    let _lock = LeaseLock::acquire(&checkout_dir)?;
-
-    let challenge_path = challenge_dir.join(format!("{challenge_digest}.json"));
-    if matches!(
-        recover_pending_adoption(&checkout_dir, &challenge_dir, &identity, &challenge_digest)?,
-        PendingRecovery::Committed | PendingRecovery::Revoked
-    ) {
-        return Err(domain_error(
-            DirtyCheckoutErrorKind::ChallengeReused,
-            "dirty-checkout challenge was consumed by a recovered adoption",
-        ));
-    }
-    let challenge_bytes = match read_private_regular(&challenge_path, MAX_STATE_FILE_BYTES, true) {
-        Ok(bytes) => bytes,
-        Err(error)
-            if error
-                .downcast_ref::<io::Error>()
-                .is_some_and(|error| error.kind() == io::ErrorKind::NotFound) =>
-        {
-            return Err(domain_error(
-                DirtyCheckoutErrorKind::ChallengeReused,
-                "dirty-checkout challenge is unavailable or already consumed",
-            ));
-        }
-        Err(error) => {
-            return Err(command_error(
-                error,
-                DirtyCheckoutErrorKind::MalformedState,
-                "dirty-checkout challenge state is untrusted",
-            ));
-        }
-    };
-    let challenge: ChallengeRecord = serde_json::from_slice(&challenge_bytes).map_err(|_| {
-        domain_error(
-            DirtyCheckoutErrorKind::MalformedState,
-            "dirty-checkout challenge state is malformed",
-        )
-    })?;
-    validate_challenge(&challenge, &identity, &challenge_digest)?;
+    let _lock = LeaseLock::acquire_until(&checkout_dir, deadline)?;
 
     let reason = read_regular_bounded(reason_file, MAX_REASON_BYTES).map_err(|error| {
         command_error(
@@ -803,10 +994,88 @@ where
         ));
     }
     let reason_digest = sha256_hex(&reason);
-    let initial_now = unix_time()?;
+
+    match inspect_pending_adoption(&checkout_dir, &challenge_dir, &identity, &token_digest)? {
+        PendingRecovery::Committed => {
+            return committed_adoption_retry(
+                CommittedAdoptionRetry {
+                    checkout_dir: &checkout_dir,
+                    challenge_dir: &challenge_dir,
+                    identity: &identity,
+                    token_digest: &token_digest,
+                    reason_digest: &reason_digest,
+                    provisional_pending: true,
+                    deadline,
+                },
+                snapshotter,
+                &mut *now,
+            )?
+            .ok_or_else(|| {
+                domain_error(
+                    DirtyCheckoutErrorKind::MalformedState,
+                    "recovered adoption does not match its committed artifacts",
+                )
+            });
+        }
+        PendingRecovery::Revoked => {
+            return Err(domain_error(
+                DirtyCheckoutErrorKind::ChallengeReused,
+                "dirty-checkout challenge was consumed by a revoked adoption",
+            ));
+        }
+        PendingRecovery::None | PendingRecovery::RolledBack => {}
+    }
+
+    let challenge_path = challenge_dir.join(format!("{token_digest}.json"));
+    let challenge_bytes = match read_private_regular(&challenge_path, MAX_STATE_FILE_BYTES, true) {
+        Ok(bytes) => bytes,
+        Err(error)
+            if error
+                .downcast_ref::<io::Error>()
+                .is_some_and(|error| error.kind() == io::ErrorKind::NotFound) =>
+        {
+            if let Some(receipt) = committed_adoption_retry(
+                CommittedAdoptionRetry {
+                    checkout_dir: &checkout_dir,
+                    challenge_dir: &challenge_dir,
+                    identity: &identity,
+                    token_digest: &token_digest,
+                    reason_digest: &reason_digest,
+                    provisional_pending: false,
+                    deadline,
+                },
+                snapshotter,
+                &mut *now,
+            )? {
+                return Ok(receipt);
+            }
+            return Err(domain_error(
+                DirtyCheckoutErrorKind::ChallengeReused,
+                "dirty-checkout challenge is unavailable or already consumed",
+            ));
+        }
+        Err(error) => {
+            return Err(command_error(
+                error,
+                DirtyCheckoutErrorKind::MalformedState,
+                "dirty-checkout challenge state is untrusted",
+            ));
+        }
+    };
+    let challenge_digest = sha256_hex(&challenge_bytes);
+    let challenge: ChallengeRecord = serde_json::from_slice(&challenge_bytes).map_err(|_| {
+        domain_error(
+            DirtyCheckoutErrorKind::MalformedState,
+            "dirty-checkout challenge state is malformed",
+        )
+    })?;
+    validate_challenge_identity(&challenge, &identity, &token_digest)?;
+    validate_challenge_at(&challenge, now()?)?;
+    let initial_now = now()?;
 
     let lease_path = checkout_dir.join("lease.json");
-    let existing = load_lease(&lease_path)?;
+    let existing_bytes = read_optional_private(&lease_path, "checkout lease")?;
+    let existing = existing_bytes.as_deref().map(parse_lease).transpose()?;
     if let Some(lease) = &existing {
         validate_lease(lease, &identity)?;
         if lease.expires_at() > initial_now && lease.session_key() != challenge.session_key {
@@ -848,9 +1117,19 @@ where
         _ => None,
     };
 
-    let initial_snapshot = snapshotter(&identity.root)?;
+    let predecessor_lease_bytes = existing
+        .as_ref()
+        .filter(|lease| {
+            lease.schema() == LEASE_V1_SCHEMA
+                && lease.expires_at() > initial_now
+                && lease.session_key() == challenge.session_key
+                && lease.adoption().is_none()
+        })
+        .and(existing_bytes.clone());
+
+    let initial_snapshot = snapshot_before_deadline(snapshotter, &identity.root, deadline)?;
     validate_snapshot_matches_challenge(&initial_snapshot, &challenge)?;
-    validate_adoption_boundary(&challenge, &identity, unix_time()?)?;
+    validate_adoption_boundary(&challenge, &identity, now()?)?;
 
     let receipts_dir = checkout_dir.join("receipts");
     private_directory(&receipts_dir).map_err(|error| {
@@ -863,21 +1142,12 @@ where
     let receipt_id = random_hex(32)?;
     let receipt_path = receipts_dir.join(format!("{receipt_id}.json"));
     let spent_challenge_path = receipts_dir.join(format!(".challenge-{receipt_id}.json"));
-    let checkout_root_text = identity.root.to_str().ok_or_else(|| {
-        domain_error(
-            DirtyCheckoutErrorKind::InvalidInput,
-            "checkout root is not valid UTF-8 for the lease-v2 wire format",
-        )
-    })?;
-    let checkout_git_dir_text = identity.git_dir.to_str().ok_or_else(|| {
-        domain_error(
-            DirtyCheckoutErrorKind::InvalidInput,
-            "checkout Git directory is not valid UTF-8 for the lease-v2 wire format",
-        )
-    })?;
+    let checkout_root_text = lease_path_text(&identity.root);
+    let checkout_git_dir_text = lease_path_text(&identity.git_dir);
     let pending = PendingAdoptionRecord {
         schema: PENDING_ADOPTION_SCHEMA.to_string(),
         receipt_id: receipt_id.clone(),
+        token_digest: token_digest.clone(),
         challenge_digest: challenge_digest.clone(),
         session_key: challenge.session_key.clone(),
         checkout_instance: identity.checkout_instance.clone(),
@@ -887,20 +1157,22 @@ where
             .map(|predecessor| predecessor.receipt_id.clone()),
         predecessor_receipt_digest: predecessor
             .as_ref()
-            .map(|predecessor| predecessor.receipt_digest.clone()),
+            .and_then(|predecessor| predecessor.receipt_digest.clone()),
         predecessor_spent_challenge_digest: predecessor
             .as_ref()
-            .map(|predecessor| predecessor.spent_challenge_digest.clone()),
+            .and_then(|predecessor| predecessor.spent_challenge_digest.clone()),
+        predecessor_lease_digest: predecessor_lease_bytes.as_deref().map(sha256_hex),
+        predecessor_lease_bytes,
     };
-    validate_pending_adoption(&pending, &identity, &challenge_digest)?;
-    let pending_path = pending_adoption_path(&checkout_dir, &challenge_digest);
+    validate_pending_adoption(&pending, &identity, &token_digest)?;
+    let pending_path = pending_adoption_path(&checkout_dir, &token_digest);
     if let Err(error) = write_json_atomic(&pending_path, &pending, false) {
         return Err(transition_failure_after_recovery(
             error,
             &checkout_dir,
             &challenge_dir,
             &identity,
-            &challenge_digest,
+            &token_digest,
         ));
     }
 
@@ -951,39 +1223,39 @@ where
         };
 
     let prepared_snapshot = transition_result_after_recovery(
-        snapshotter(&identity.root),
+        snapshot_before_deadline(snapshotter, &identity.root, deadline),
         &checkout_dir,
         &challenge_dir,
         &identity,
-        &challenge_digest,
+        &token_digest,
     )?;
     transition_result_after_recovery(
         validate_snapshot_matches_challenge(&prepared_snapshot, &challenge),
         &checkout_dir,
         &challenge_dir,
         &identity,
-        &challenge_digest,
+        &token_digest,
     )?;
     let prepared_at = transition_result_after_recovery(
-        unix_time(),
+        now(),
         &checkout_dir,
         &challenge_dir,
         &identity,
-        &challenge_digest,
+        &token_digest,
     )?;
     transition_result_after_recovery(
         validate_adoption_boundary(&challenge, &identity, prepared_at),
         &checkout_dir,
         &challenge_dir,
         &identity,
-        &challenge_digest,
+        &token_digest,
     )?;
     let (prepared_receipt, _) = transition_result_after_recovery(
         build_transition(&prepared_snapshot, prepared_at),
         &checkout_dir,
         &challenge_dir,
         &identity,
-        &challenge_digest,
+        &token_digest,
     )?;
     if let Err(error) = write_json_atomic(&receipt_path, &prepared_receipt, false) {
         return Err(transition_failure_after_recovery(
@@ -991,44 +1263,44 @@ where
             &checkout_dir,
             &challenge_dir,
             &identity,
-            &challenge_digest,
+            &token_digest,
         ));
     }
 
     let snapshot = transition_result_after_recovery(
-        snapshotter(&identity.root),
+        snapshot_before_deadline(snapshotter, &identity.root, deadline),
         &checkout_dir,
         &challenge_dir,
         &identity,
-        &challenge_digest,
+        &token_digest,
     )?;
     transition_result_after_recovery(
         validate_snapshot_matches_challenge(&snapshot, &challenge),
         &checkout_dir,
         &challenge_dir,
         &identity,
-        &challenge_digest,
+        &token_digest,
     )?;
     let transition_at = transition_result_after_recovery(
-        unix_time(),
+        now(),
         &checkout_dir,
         &challenge_dir,
         &identity,
-        &challenge_digest,
+        &token_digest,
     )?;
     transition_result_after_recovery(
         validate_adoption_boundary(&challenge, &identity, transition_at),
         &checkout_dir,
         &challenge_dir,
         &identity,
-        &challenge_digest,
+        &token_digest,
     )?;
     let (receipt_record, lease) = transition_result_after_recovery(
         build_transition(&snapshot, transition_at),
         &checkout_dir,
         &challenge_dir,
         &identity,
-        &challenge_digest,
+        &token_digest,
     )?;
     if let Err(error) = write_json_atomic(&receipt_path, &receipt_record, true) {
         return Err(transition_failure_after_recovery(
@@ -1036,18 +1308,18 @@ where
             &checkout_dir,
             &challenge_dir,
             &identity,
-            &challenge_digest,
+            &token_digest,
         ));
     }
     if let Err(error) =
-        validate_adoption_precommit_with(&challenge, &identity, || Ok(()), unix_time)
+        validate_adoption_precommit_with(&challenge, &identity, || Ok(()), &mut *now)
     {
         return Err(transition_failure_after_recovery(
             error,
             &checkout_dir,
             &challenge_dir,
             &identity,
-            &challenge_digest,
+            &token_digest,
         ));
     }
     if let Err(error) = fs::rename(&challenge_path, &spent_challenge_path)
@@ -1058,7 +1330,7 @@ where
             &checkout_dir,
             &challenge_dir,
             &identity,
-            &challenge_digest,
+            &token_digest,
         ));
     }
     if let Err(error) = sync_directory(&challenge_dir).and_then(|()| sync_directory(&receipts_dir))
@@ -1068,21 +1340,23 @@ where
             &checkout_dir,
             &challenge_dir,
             &identity,
-            &challenge_digest,
+            &token_digest,
         ));
     }
 
     match install_lease(&lease_path, &lease, existing.as_ref(), &identity) {
         LeaseInstallOutcome::Installed => {
-            let post_install = snapshotter(&identity.root).and_then(|post_snapshot| {
-                validate_snapshot_matches_challenge(&post_snapshot, &challenge)
-            });
+            let post_install = snapshot_before_deadline(snapshotter, &identity.root, deadline)
+                .and_then(|post_snapshot| {
+                    validate_snapshot_matches_challenge(&post_snapshot, &challenge)
+                })
+                .and_then(|()| validate_adoption_boundary(&challenge, &identity, now()?));
             if let Err(error) = post_install {
                 if let Err(rollback_error) = rollback_installed_adoption(
                     &checkout_dir,
                     &challenge_dir,
                     &identity,
-                    &challenge_digest,
+                    &token_digest,
                     &receipt_id,
                 ) {
                     return Err(domain_error(
@@ -1094,12 +1368,8 @@ where
                 }
                 return Err(error);
             }
-            if recover_pending_adoption(
-                &checkout_dir,
-                &challenge_dir,
-                &identity,
-                &challenge_digest,
-            )? != PendingRecovery::Committed
+            if recover_pending_adoption(&checkout_dir, &challenge_dir, &identity, &token_digest)?
+                != PendingRecovery::Committed
             {
                 return Err(domain_error(
                     DirtyCheckoutErrorKind::AdoptionFailed,
@@ -1113,7 +1383,7 @@ where
                 &checkout_dir,
                 &challenge_dir,
                 &identity,
-                &challenge_digest,
+                &token_digest,
             ));
         }
         LeaseInstallOutcome::Ambiguous(error) => {
@@ -1130,6 +1400,168 @@ where
         receipt_id,
         snapshot_id: snapshot.snapshot_id,
     })
+}
+
+fn snapshot_before_deadline<F>(
+    snapshotter: &mut F,
+    checkout: &Path,
+    deadline: Instant,
+) -> Result<DirtySnapshot>
+where
+    F: FnMut(&Path, Instant) -> Result<DirtySnapshot>,
+{
+    ensure_deadline(deadline)?;
+    let snapshot = snapshotter(checkout, deadline)?;
+    ensure_deadline(deadline)?;
+    Ok(snapshot)
+}
+
+struct CommittedAdoptionRetry<'a> {
+    checkout_dir: &'a Path,
+    challenge_dir: &'a Path,
+    identity: &'a CheckoutIdentity,
+    token_digest: &'a str,
+    reason_digest: &'a str,
+    provisional_pending: bool,
+    deadline: Instant,
+}
+
+fn committed_adoption_retry<F, G>(
+    retry: CommittedAdoptionRetry<'_>,
+    snapshotter: &mut F,
+    now: &mut G,
+) -> Result<Option<AdoptionReceipt>>
+where
+    F: FnMut(&Path, Instant) -> Result<DirtySnapshot>,
+    G: FnMut() -> Result<u64>,
+{
+    let CommittedAdoptionRetry {
+        checkout_dir,
+        challenge_dir,
+        identity,
+        token_digest,
+        reason_digest,
+        provisional_pending,
+        deadline,
+    } = retry;
+    let Some(lease) = load_lease(&checkout_dir.join("lease.json"))? else {
+        return Ok(None);
+    };
+    validate_lease(&lease, identity)?;
+    let Some(adoption) = lease.adoption() else {
+        return Ok(None);
+    };
+    let receipt_id = adoption.receipt_id.clone();
+    let receipts_dir = checkout_dir.join("receipts");
+    verify_private_directory(&receipts_dir).map_err(|error| {
+        command_error(
+            error,
+            DirtyCheckoutErrorKind::MalformedState,
+            "committed adoption receipt directory is untrusted",
+        )
+    })?;
+    let spent_path = receipts_dir.join(format!(".challenge-{receipt_id}.json"));
+    let Some(spent_bytes) = read_optional_private(&spent_path, "committed adoption challenge")?
+    else {
+        return Err(domain_error(
+            DirtyCheckoutErrorKind::MalformedState,
+            "committed adoption challenge artifact is missing",
+        ));
+    };
+    let spent: ChallengeRecord = serde_json::from_slice(&spent_bytes).map_err(|_| {
+        domain_error(
+            DirtyCheckoutErrorKind::MalformedState,
+            "committed adoption challenge artifact is malformed",
+        )
+    })?;
+    validate_challenge_identity(&spent, identity, &spent.token_digest)?;
+    if spent.token_digest != token_digest {
+        return Ok(None);
+    }
+    let receipt_path = receipts_dir.join(format!("{receipt_id}.json"));
+    let receipt_bytes =
+        read_private_regular(&receipt_path, MAX_STATE_FILE_BYTES, true).map_err(|error| {
+            command_error(
+                error,
+                DirtyCheckoutErrorKind::MalformedState,
+                "committed adoption receipt is unavailable",
+            )
+        })?;
+    let receipt: ReceiptRecord = serde_json::from_slice(&receipt_bytes).map_err(|_| {
+        domain_error(
+            DirtyCheckoutErrorKind::MalformedState,
+            "committed adoption receipt is malformed",
+        )
+    })?;
+    validate_receipt(&receipt, identity, &receipt_id)?;
+    validate_receipt_matches_lease(&receipt, &lease)?;
+    validate_spent_challenge_matches_lease(&spent_bytes, &spent, identity, &lease)?;
+    if adoption.reason_digest != reason_digest {
+        return Err(domain_error(
+            DirtyCheckoutErrorKind::ChallengeReused,
+            "committed adoption retry inputs or artifacts do not match",
+        ));
+    }
+
+    let verification = (|| -> Result<()> {
+        let before_snapshot = now()?;
+        if lease.expires_at() <= before_snapshot {
+            return Err(domain_error(
+                DirtyCheckoutErrorKind::ChallengeReused,
+                "committed adoption lease expired during retry validation",
+            ));
+        }
+        if provisional_pending {
+            validate_adoption_boundary(&spent, identity, before_snapshot)?;
+        }
+        let snapshot = snapshot_before_deadline(snapshotter, &identity.root, deadline)?;
+        validate_snapshot_matches_challenge(&snapshot, &spent)?;
+        let after_snapshot = now()?;
+        if lease.expires_at() <= after_snapshot {
+            return Err(domain_error(
+                DirtyCheckoutErrorKind::ChallengeReused,
+                "committed adoption lease expired during retry validation",
+            ));
+        }
+        if provisional_pending {
+            validate_adoption_boundary(&spent, identity, after_snapshot)?;
+        }
+        Ok(())
+    })();
+
+    if let Err(error) = verification {
+        if provisional_pending
+            && let Err(rollback_error) = rollback_installed_adoption(
+                checkout_dir,
+                challenge_dir,
+                identity,
+                token_digest,
+                &receipt_id,
+            )
+        {
+            return Err(domain_error(
+                DirtyCheckoutErrorKind::AdoptionFailed,
+                format!(
+                    "provisional adoption verification failed and rollback is incomplete: {error}; rollback failed: {rollback_error}"
+                ),
+            ));
+        }
+        return Err(error);
+    }
+
+    if provisional_pending
+        && recover_pending_adoption(checkout_dir, challenge_dir, identity, token_digest)?
+            != PendingRecovery::Committed
+    {
+        return Err(domain_error(
+            DirtyCheckoutErrorKind::AdoptionFailed,
+            "verified provisional adoption did not finalize committed recovery",
+        ));
+    }
+    Ok(Some(AdoptionReceipt {
+        receipt_id: receipt.receipt_id,
+        snapshot_id: receipt.snapshot_id,
+    }))
 }
 
 fn validate_snapshot_matches_challenge(
@@ -1155,7 +1587,7 @@ fn rollback_installed_adoption(
     checkout_dir: &Path,
     challenge_dir: &Path,
     identity: &CheckoutIdentity,
-    challenge_digest: &str,
+    token_digest: &str,
     receipt_id: &str,
 ) -> Result<()> {
     let lease_path = checkout_dir.join("lease.json");
@@ -1164,7 +1596,7 @@ fn rollback_installed_adoption(
         .context("post-install adoption rollback could not revoke the lease")?;
     sync_directory(checkout_dir)
         .context("post-install adoption rollback tombstone could not be made durable")?;
-    if recover_pending_adoption(checkout_dir, challenge_dir, identity, challenge_digest)?
+    if recover_pending_adoption(checkout_dir, challenge_dir, identity, token_digest)?
         != PendingRecovery::Revoked
     {
         return Err(domain_error(
@@ -1180,8 +1612,8 @@ struct ExpiredPredecessor {
     receipt_id: String,
     receipt_path: PathBuf,
     spent_challenge_path: PathBuf,
-    receipt_digest: String,
-    spent_challenge_digest: String,
+    receipt_digest: Option<String>,
+    spent_challenge_digest: Option<String>,
 }
 
 fn expired_predecessor(
@@ -1197,94 +1629,60 @@ fn expired_predecessor(
     let spent_challenge_path =
         receipts_dir.join(format!(".challenge-{}.json", adoption.receipt_id));
     let receipt_bytes =
-        read_private_regular(&receipt_path, MAX_STATE_FILE_BYTES, true).map_err(|error| {
-            command_error(
-                error,
+        read_optional_private(&receipt_path, "expired adoption predecessor receipt")?;
+    if let Some(receipt_bytes) = &receipt_bytes {
+        let receipt: ReceiptRecord = serde_json::from_slice(receipt_bytes).map_err(|_| {
+            domain_error(
                 DirtyCheckoutErrorKind::MalformedState,
-                "expired adoption predecessor receipt is unavailable",
+                "expired adoption predecessor receipt is malformed",
             )
         })?;
-    let receipt: ReceiptRecord = serde_json::from_slice(&receipt_bytes).map_err(|_| {
-        domain_error(
-            DirtyCheckoutErrorKind::MalformedState,
-            "expired adoption predecessor receipt is malformed",
-        )
-    })?;
-    validate_receipt(&receipt, identity, &adoption.receipt_id)?;
-    if adoption.receipt_schema != receipt.schema
-        || lease.session_key() != receipt.session_key
-        || lease.checkout_instance() != receipt.checkout_instance
-        || adoption.snapshot_id != receipt.snapshot_id
-        || adoption.authorization_turn_digest != receipt.authorization_turn_digest
-        || adoption.reason_digest != receipt.reason_digest
-        || adoption.adopted_at != receipt.adopted_at
-        || adoption.challenge_digest != receipt.challenge_digest
-    {
-        return Err(domain_error(
-            DirtyCheckoutErrorKind::MalformedState,
-            "expired adoption predecessor receipt identity is inconsistent",
-        ));
+        validate_receipt(&receipt, identity, &adoption.receipt_id)?;
+        validate_receipt_matches_lease(&receipt, lease)?;
     }
-    let spent_bytes = read_private_regular(&spent_challenge_path, MAX_STATE_FILE_BYTES, true)
-        .map_err(|error| {
-            command_error(
-                error,
+    let spent_bytes = read_optional_private(
+        &spent_challenge_path,
+        "expired adoption predecessor challenge",
+    )?;
+    if let Some(spent_bytes) = &spent_bytes {
+        let spent: ChallengeRecord = serde_json::from_slice(spent_bytes).map_err(|_| {
+            domain_error(
                 DirtyCheckoutErrorKind::MalformedState,
-                "expired adoption predecessor challenge is unavailable",
+                "expired adoption predecessor challenge is malformed",
             )
         })?;
-    let spent: ChallengeRecord = serde_json::from_slice(&spent_bytes).map_err(|_| {
-        domain_error(
-            DirtyCheckoutErrorKind::MalformedState,
-            "expired adoption predecessor challenge is malformed",
-        )
-    })?;
-    validate_challenge_identity(&spent, identity, &adoption.challenge_digest)?;
-    if spent.issued_at != adoption.challenge_issued_at || spent.snapshot_id != adoption.snapshot_id
-    {
-        return Err(domain_error(
-            DirtyCheckoutErrorKind::MalformedState,
-            "expired adoption predecessor challenge identity is inconsistent",
-        ));
+        validate_spent_challenge_matches_lease(spent_bytes, &spent, identity, lease)?;
     }
     Ok(Some(ExpiredPredecessor {
         receipt_id: adoption.receipt_id.clone(),
         receipt_path,
         spent_challenge_path,
-        receipt_digest: sha256_hex(&receipt_bytes),
-        spent_challenge_digest: sha256_hex(&spent_bytes),
+        receipt_digest: receipt_bytes.as_deref().map(sha256_hex),
+        spent_challenge_digest: spent_bytes.as_deref().map(sha256_hex),
     }))
 }
 
 fn load_bound_predecessor(
     receipts_dir: &Path,
     receipt_id: &str,
-    expected_receipt_digest: &str,
-    expected_spent_challenge_digest: &str,
+    expected_receipt_digest: Option<&str>,
+    expected_spent_challenge_digest: Option<&str>,
 ) -> Result<ExpiredPredecessor> {
     let receipt_path = receipts_dir.join(format!("{receipt_id}.json"));
     let spent_challenge_path = receipts_dir.join(format!(".challenge-{receipt_id}.json"));
-    let receipt_bytes =
-        read_private_regular(&receipt_path, MAX_STATE_FILE_BYTES, true).map_err(|error| {
-            command_error(
-                error,
-                DirtyCheckoutErrorKind::MalformedState,
-                "bound predecessor receipt is unavailable",
-            )
-        })?;
-    let spent_bytes = read_private_regular(&spent_challenge_path, MAX_STATE_FILE_BYTES, true)
-        .map_err(|error| {
-            command_error(
-                error,
-                DirtyCheckoutErrorKind::MalformedState,
-                "bound predecessor challenge is unavailable",
-            )
-        })?;
-    let receipt_digest = sha256_hex(&receipt_bytes);
-    let spent_challenge_digest = sha256_hex(&spent_bytes);
-    if receipt_digest != expected_receipt_digest
-        || spent_challenge_digest != expected_spent_challenge_digest
-    {
+    let receipt_bytes = read_optional_private(&receipt_path, "bound predecessor receipt")?;
+    let spent_bytes = read_optional_private(&spent_challenge_path, "bound predecessor challenge")?;
+    let receipt_matches = match (&receipt_bytes, expected_receipt_digest) {
+        (Some(bytes), Some(expected)) => sha256_hex(bytes) == expected,
+        (None, _) => true,
+        (Some(_), None) => false,
+    };
+    let spent_matches = match (&spent_bytes, expected_spent_challenge_digest) {
+        (Some(bytes), Some(expected)) => sha256_hex(bytes) == expected,
+        (None, _) => true,
+        (Some(_), None) => false,
+    };
+    if !receipt_matches || !spent_matches {
         return Err(domain_error(
             DirtyCheckoutErrorKind::MalformedState,
             "bound predecessor artifacts do not match pending adoption state",
@@ -1294,8 +1692,8 @@ fn load_bound_predecessor(
         receipt_id: receipt_id.to_string(),
         receipt_path,
         spent_challenge_path,
-        receipt_digest,
-        spent_challenge_digest,
+        receipt_digest: expected_receipt_digest.map(str::to_string),
+        spent_challenge_digest: expected_spent_challenge_digest.map(str::to_string),
     })
 }
 
@@ -1323,17 +1721,36 @@ enum PendingRecovery {
     Revoked,
 }
 
-fn pending_adoption_path(checkout_dir: &Path, challenge_digest: &str) -> PathBuf {
-    checkout_dir.join(format!(".pending-adoption-{challenge_digest}.json"))
+fn pending_adoption_path(checkout_dir: &Path, token_digest: &str) -> PathBuf {
+    checkout_dir.join(format!(".pending-adoption-{token_digest}.json"))
 }
 
 fn recover_pending_adoption(
     checkout_dir: &Path,
     challenge_dir: &Path,
     identity: &CheckoutIdentity,
-    challenge_digest: &str,
+    token_digest: &str,
 ) -> Result<PendingRecovery> {
-    let pending_path = pending_adoption_path(checkout_dir, challenge_digest);
+    recover_pending_adoption_with(checkout_dir, challenge_dir, identity, token_digest, true)
+}
+
+fn inspect_pending_adoption(
+    checkout_dir: &Path,
+    challenge_dir: &Path,
+    identity: &CheckoutIdentity,
+    token_digest: &str,
+) -> Result<PendingRecovery> {
+    recover_pending_adoption_with(checkout_dir, challenge_dir, identity, token_digest, false)
+}
+
+fn recover_pending_adoption_with(
+    checkout_dir: &Path,
+    challenge_dir: &Path,
+    identity: &CheckoutIdentity,
+    token_digest: &str,
+    finalize_committed: bool,
+) -> Result<PendingRecovery> {
+    let pending_path = pending_adoption_path(checkout_dir, token_digest);
     let Some(pending_bytes) = read_optional_private(&pending_path, "pending adoption")? else {
         return Ok(PendingRecovery::None);
     };
@@ -1343,7 +1760,7 @@ fn recover_pending_adoption(
             "pending dirty-checkout adoption state is malformed",
         )
     })?;
-    validate_pending_adoption(&pending, identity, challenge_digest)?;
+    validate_pending_adoption(&pending, identity, token_digest)?;
 
     let receipts_dir = checkout_dir.join("receipts");
     verify_private_directory(&receipts_dir).map_err(|error| {
@@ -1355,7 +1772,7 @@ fn recover_pending_adoption(
     })?;
     let receipt_path = receipts_dir.join(format!("{}.json", pending.receipt_id));
     let spent_challenge_path = receipts_dir.join(format!(".challenge-{}.json", pending.receipt_id));
-    let challenge_path = challenge_dir.join(format!("{challenge_digest}.json"));
+    let challenge_path = challenge_dir.join(format!("{token_digest}.json"));
     let revoked_lease_path = checkout_dir.join(format!(".revoked-{}.json", pending.receipt_id));
 
     if let Some(revoked_bytes) = read_optional_private(&revoked_lease_path, "revoked adoption")? {
@@ -1378,19 +1795,30 @@ fn recover_pending_adoption(
                 "revoked adoption tombstone does not match pending state",
             ));
         }
-        if let Some(challenge) =
-            load_pending_challenge(&challenge_path, identity, challenge_digest)?
-            && challenge.token_digest != pending.challenge_digest
+        if let Some(challenge) = load_pending_challenge(
+            &challenge_path,
+            identity,
+            token_digest,
+            &pending.challenge_digest,
+        )? && challenge.token_digest != pending.token_digest
         {
             return Err(domain_error(
                 DirtyCheckoutErrorKind::MalformedState,
                 "revoked adoption has an inconsistent live challenge",
             ));
         }
-        if let Some(spent) =
-            load_pending_challenge(&spent_challenge_path, identity, challenge_digest)?
-            && (spent.token_digest != pending.challenge_digest
-                || spent.snapshot_id != pending.snapshot_id)
+        if let Some(spent) = load_pending_challenge(
+            &spent_challenge_path,
+            identity,
+            token_digest,
+            &pending.challenge_digest,
+        )? && (spent.token_digest != pending.token_digest
+            || spent.session_key != revoked.session_key()
+            || spent.snapshot_id != pending.snapshot_id
+            || spent.authorization_turn_digest != adoption.authorization_turn_digest
+            || spent.issued_at != adoption.challenge_issued_at
+            || adoption.adopted_at < spent.issued_at
+            || adoption.adopted_at >= spent.expires_at)
         {
             return Err(domain_error(
                 DirtyCheckoutErrorKind::MalformedState,
@@ -1407,16 +1835,9 @@ fn recover_pending_adoption(
                 )
             })?;
             validate_receipt(&receipt, identity, &pending.receipt_id)?;
-            if receipt.session_key != pending.session_key
-                || receipt.snapshot_id != pending.snapshot_id
-                || receipt.challenge_digest != pending.challenge_digest
-            {
-                return Err(domain_error(
-                    DirtyCheckoutErrorKind::MalformedState,
-                    "revoked adoption receipt does not match pending state",
-                ));
-            }
+            validate_receipt_matches_lease(&receipt, &revoked)?;
         }
+        restore_pending_predecessor_lease(checkout_dir, &pending, identity)?;
         for path in [&challenge_path, &spent_challenge_path, &receipt_path] {
             match fs::remove_file(path) {
                 Ok(()) => {}
@@ -1456,26 +1877,24 @@ fn recover_pending_adoption(
                 "committed pending adoption artifacts are incomplete or malformed",
             )
         })?;
-        if artifacts.receipt_id != pending.receipt_id {
+        if artifacts.receipt_id != pending.receipt_id
+            || artifacts.receipt_digest.is_none()
+            || artifacts.spent_challenge_digest.is_none()
+        {
             return Err(domain_error(
                 DirtyCheckoutErrorKind::MalformedState,
-                "committed pending adoption receipt identity is inconsistent",
+                "committed pending adoption artifacts are incomplete or inconsistent",
             ));
         }
-        if let (
-            Some(predecessor_receipt_id),
-            Some(predecessor_receipt_digest),
-            Some(predecessor_spent_challenge_digest),
-        ) = (
-            &pending.predecessor_receipt_id,
-            &pending.predecessor_receipt_digest,
-            &pending.predecessor_spent_challenge_digest,
-        ) {
+        if !finalize_committed {
+            return Ok(PendingRecovery::Committed);
+        }
+        if let Some(predecessor_receipt_id) = &pending.predecessor_receipt_id {
             let predecessor = load_bound_predecessor(
                 &receipts_dir,
                 predecessor_receipt_id,
-                predecessor_receipt_digest,
-                predecessor_spent_challenge_digest,
+                pending.predecessor_receipt_digest.as_deref(),
+                pending.predecessor_spent_challenge_digest.as_deref(),
             )?;
             cleanup_expired_predecessor(&predecessor)?;
         }
@@ -1485,9 +1904,18 @@ fn recover_pending_adoption(
         return Ok(PendingRecovery::Committed);
     }
 
-    let current_challenge = load_pending_challenge(&challenge_path, identity, challenge_digest)?;
-    let spent_challenge =
-        load_pending_challenge(&spent_challenge_path, identity, challenge_digest)?;
+    let current_challenge = load_pending_challenge(
+        &challenge_path,
+        identity,
+        token_digest,
+        &pending.challenge_digest,
+    )?;
+    let spent_challenge = load_pending_challenge(
+        &spent_challenge_path,
+        identity,
+        token_digest,
+        &pending.challenge_digest,
+    )?;
     match (current_challenge.is_some(), spent_challenge.is_some()) {
         (true, false) => {}
         (false, true) => fs::rename(&spent_challenge_path, &challenge_path)
@@ -1553,33 +1981,41 @@ fn read_optional_private(path: &Path, label: &str) -> Result<Option<Vec<u8>>> {
 fn load_pending_challenge(
     path: &Path,
     identity: &CheckoutIdentity,
+    token_digest: &str,
     challenge_digest: &str,
 ) -> Result<Option<ChallengeRecord>> {
     let Some(bytes) = read_optional_private(path, "pending adoption challenge")? else {
         return Ok(None);
     };
+    if sha256_hex(&bytes) != challenge_digest {
+        return Err(domain_error(
+            DirtyCheckoutErrorKind::MalformedState,
+            "pending adoption challenge artifact does not match its recovery marker",
+        ));
+    }
     let challenge: ChallengeRecord = serde_json::from_slice(&bytes).map_err(|_| {
         domain_error(
             DirtyCheckoutErrorKind::MalformedState,
             "pending adoption challenge state is malformed",
         )
     })?;
-    validate_challenge_identity(&challenge, identity, challenge_digest)?;
+    validate_challenge_identity(&challenge, identity, token_digest)?;
     Ok(Some(challenge))
 }
 
 fn validate_pending_adoption(
     pending: &PendingAdoptionRecord,
     identity: &CheckoutIdentity,
-    challenge_digest: &str,
+    token_digest: &str,
 ) -> Result<()> {
     let valid = pending.schema == PENDING_ADOPTION_SCHEMA
         && is_lower_hex(&pending.receipt_id, 64)
+        && is_lower_hex(&pending.token_digest, 64)
         && is_lower_hex(&pending.challenge_digest, 64)
         && is_lower_hex(&pending.session_key, 64)
         && is_lower_hex(&pending.checkout_instance, 32)
         && is_lower_hex(&pending.snapshot_id, 64)
-        && pending.challenge_digest == challenge_digest
+        && pending.token_digest == token_digest
         && pending.checkout_instance == identity.checkout_instance
         && match (
             &pending.predecessor_receipt_id,
@@ -1587,13 +2023,17 @@ fn validate_pending_adoption(
             &pending.predecessor_spent_challenge_digest,
         ) {
             (None, None, None) => true,
-            (Some(receipt_id), Some(receipt_digest), Some(spent_digest)) => {
+            (Some(receipt_id), receipt_digest, spent_digest) => {
                 is_lower_hex(receipt_id, 64)
                     && receipt_id != &pending.receipt_id
-                    && is_lower_hex(receipt_digest, 64)
-                    && is_lower_hex(spent_digest, 64)
+                    && receipt_digest
+                        .as_ref()
+                        .is_none_or(|digest| is_lower_hex(digest, 64))
+                    && spent_digest
+                        .as_ref()
+                        .is_none_or(|digest| is_lower_hex(digest, 64))
             }
-            _ => false,
+            (None, _, _) => false,
         };
     if !valid {
         return Err(domain_error(
@@ -1601,7 +2041,64 @@ fn validate_pending_adoption(
             "pending dirty-checkout adoption state is malformed",
         ));
     }
+    validate_pending_predecessor_lease(pending, identity)?;
     Ok(())
+}
+
+fn validate_pending_predecessor_lease<'a>(
+    pending: &'a PendingAdoptionRecord,
+    identity: &CheckoutIdentity,
+) -> Result<Option<&'a [u8]>> {
+    let (digest, bytes) = match (
+        pending.predecessor_lease_digest.as_deref(),
+        pending.predecessor_lease_bytes.as_deref(),
+    ) {
+        (None, None) => return Ok(None),
+        (Some(digest), Some(bytes)) => (digest, bytes),
+        _ => {
+            return Err(domain_error(
+                DirtyCheckoutErrorKind::MalformedState,
+                "pending predecessor lease binding is incomplete",
+            ));
+        }
+    };
+    let lease = parse_lease(bytes)?;
+    validate_lease(&lease, identity)?;
+    if !is_lower_hex(digest, 64)
+        || sha256_hex(bytes) != digest
+        || lease.schema() != LEASE_V1_SCHEMA
+        || lease.session_key() != pending.session_key
+        || lease.checkout_instance() != pending.checkout_instance
+        || lease.adoption().is_some()
+    {
+        return Err(domain_error(
+            DirtyCheckoutErrorKind::MalformedState,
+            "pending predecessor lease does not match its recovery marker",
+        ));
+    }
+    Ok(Some(bytes))
+}
+
+fn restore_pending_predecessor_lease(
+    checkout_dir: &Path,
+    pending: &PendingAdoptionRecord,
+    identity: &CheckoutIdentity,
+) -> Result<()> {
+    let expected = validate_pending_predecessor_lease(pending, identity)?;
+    let lease_path = checkout_dir.join("lease.json");
+    match (
+        read_optional_private(&lease_path, "restored predecessor lease")?,
+        expected,
+    ) {
+        (None, Some(bytes)) => write_state_atomic(&lease_path, bytes, false)
+            .context("exact predecessor lease restoration failed"),
+        (Some(actual), Some(expected)) if actual == expected => Ok(()),
+        (None, None) => Ok(()),
+        _ => Err(domain_error(
+            DirtyCheckoutErrorKind::MalformedState,
+            "revoked adoption predecessor lease state is inconsistent",
+        )),
+    }
 }
 
 fn transition_result_after_recovery<T>(
@@ -1609,7 +2106,7 @@ fn transition_result_after_recovery<T>(
     checkout_dir: &Path,
     challenge_dir: &Path,
     identity: &CheckoutIdentity,
-    challenge_digest: &str,
+    token_digest: &str,
 ) -> Result<T> {
     result.map_err(|error| {
         transition_failure_after_recovery(
@@ -1617,7 +2114,7 @@ fn transition_result_after_recovery<T>(
             checkout_dir,
             challenge_dir,
             identity,
-            challenge_digest,
+            token_digest,
         )
     })
 }
@@ -1627,9 +2124,9 @@ fn transition_failure_after_recovery(
     checkout_dir: &Path,
     challenge_dir: &Path,
     identity: &CheckoutIdentity,
-    challenge_digest: &str,
+    token_digest: &str,
 ) -> anyhow::Error {
-    match recover_pending_adoption(checkout_dir, challenge_dir, identity, challenge_digest) {
+    match inspect_pending_adoption(checkout_dir, challenge_dir, identity, token_digest) {
         Ok(PendingRecovery::None | PendingRecovery::RolledBack) => error,
         Ok(PendingRecovery::Committed | PendingRecovery::Revoked) => domain_error(
             DirtyCheckoutErrorKind::AdoptionFailed,
@@ -1675,7 +2172,7 @@ where
     };
     match load_lease(path) {
         Ok(Some(actual)) if validate_lease(&actual, identity).is_ok() && actual == *expected => {
-            LeaseInstallOutcome::Ambiguous(error)
+            LeaseInstallOutcome::Installed
         }
         Ok(actual) if actual.as_ref() == previous => LeaseInstallOutcome::NotInstalled(error),
         _ => LeaseInstallOutcome::Ambiguous(error),
@@ -1709,7 +2206,25 @@ fn revoke_dirty_inner(checkout: &Path, state_root: &Path, receipt_id: &str) -> R
             "dirty-checkout receipt directory is untrusted",
         )
     })?;
+    let challenge_dir = checkout_dir.join("challenges");
+    verify_private_directory(&challenge_dir).map_err(|error| {
+        command_error(
+            error,
+            DirtyCheckoutErrorKind::MalformedState,
+            "dirty-checkout challenge directory is untrusted",
+        )
+    })?;
     let _lock = LeaseLock::acquire(&checkout_dir)?;
+    if recover_revocation_tombstone(
+        &checkout_dir,
+        &challenge_dir,
+        &receipts_dir,
+        &identity,
+        receipt_id,
+    )? {
+        return Ok(());
+    }
+
     let receipt_path = receipts_dir.join(format!("{receipt_id}.json"));
     let receipt_bytes =
         read_private_regular(&receipt_path, MAX_STATE_FILE_BYTES, true).map_err(|error| {
@@ -1735,6 +2250,59 @@ fn revoke_dirty_inner(checkout: &Path, state_root: &Path, receipt_id: &str) -> R
         )
     })?;
     validate_lease(&lease, &identity)?;
+    validate_receipt_matches_lease(&receipt, &lease)?;
+
+    let spent_path = receipts_dir.join(format!(".challenge-{receipt_id}.json"));
+    let spent_bytes =
+        read_private_regular(&spent_path, MAX_STATE_FILE_BYTES, true).map_err(|error| {
+            command_error(
+                error,
+                DirtyCheckoutErrorKind::MalformedState,
+                "dirty-checkout spent challenge is unavailable",
+            )
+        })?;
+    let spent: ChallengeRecord = serde_json::from_slice(&spent_bytes).map_err(|_| {
+        domain_error(
+            DirtyCheckoutErrorKind::MalformedState,
+            "dirty-checkout spent challenge is malformed",
+        )
+    })?;
+    validate_spent_challenge_matches_lease(&spent_bytes, &spent, &identity, &lease)?;
+
+    match recover_pending_adoption(
+        &checkout_dir,
+        &challenge_dir,
+        &identity,
+        &spent.token_digest,
+    )? {
+        PendingRecovery::None | PendingRecovery::Committed => {}
+        PendingRecovery::RolledBack | PendingRecovery::Revoked => {
+            return Err(domain_error(
+                DirtyCheckoutErrorKind::MalformedState,
+                "active adoption changed while revocation was prepared",
+            ));
+        }
+    }
+
+    let revoked_path = checkout_dir.join(format!(".revoked-{receipt_id}.json"));
+    fs::rename(&lease_path, &revoked_path).context("failed to revoke adopted checkout lease")?;
+    sync_directory(&checkout_dir).context("revoked lease tombstone could not be made durable")?;
+    if !recover_revocation_tombstone(
+        &checkout_dir,
+        &challenge_dir,
+        &receipts_dir,
+        &identity,
+        receipt_id,
+    )? {
+        return Err(domain_error(
+            DirtyCheckoutErrorKind::RevocationFailed,
+            "durable revocation tombstone could not be recovered",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_receipt_matches_lease(receipt: &ReceiptRecord, lease: &LeaseRecord) -> Result<()> {
     let adoption = lease.adoption().ok_or_else(|| {
         domain_error(
             DirtyCheckoutErrorKind::MalformedState,
@@ -1755,57 +2323,249 @@ fn revoke_dirty_inner(checkout: &Path, state_root: &Path, receipt_id: &str) -> R
     {
         return Err(domain_error(
             DirtyCheckoutErrorKind::MalformedState,
-            "receipt does not match the active dirty-checkout adoption",
+            "receipt does not match the dirty-checkout adoption",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_spent_challenge_matches_lease(
+    bytes: &[u8],
+    spent: &ChallengeRecord,
+    identity: &CheckoutIdentity,
+    lease: &LeaseRecord,
+) -> Result<()> {
+    validate_challenge_identity(spent, identity, &spent.token_digest)?;
+    let adoption = lease.adoption().ok_or_else(|| {
+        domain_error(
+            DirtyCheckoutErrorKind::MalformedState,
+            "checkout lease has no dirty adoption",
+        )
+    })?;
+    if lease.schema() != LEASE_V2_SCHEMA
+        || sha256_hex(bytes) != adoption.challenge_digest
+        || spent.session_key != lease.session_key()
+        || spent.snapshot_id != adoption.snapshot_id
+        || spent.authorization_turn_digest != adoption.authorization_turn_digest
+        || spent.issued_at != adoption.challenge_issued_at
+        || adoption.adopted_at < spent.issued_at
+        || adoption.adopted_at >= spent.expires_at
+    {
+        return Err(domain_error(
+            DirtyCheckoutErrorKind::MalformedState,
+            "spent challenge does not match the dirty-checkout adoption",
+        ));
+    }
+    Ok(())
+}
+
+fn recover_revocation_tombstone(
+    checkout_dir: &Path,
+    challenge_dir: &Path,
+    receipts_dir: &Path,
+    identity: &CheckoutIdentity,
+    receipt_id: &str,
+) -> Result<bool> {
+    let tombstone_path = checkout_dir.join(format!(".revoked-{receipt_id}.json"));
+    let Some(tombstone_bytes) = read_optional_private(&tombstone_path, "revoked adoption")? else {
+        return Ok(false);
+    };
+    let tombstone = parse_lease(&tombstone_bytes)?;
+    validate_lease(&tombstone, identity)?;
+    let adoption = tombstone.adoption().ok_or_else(|| {
+        domain_error(
+            DirtyCheckoutErrorKind::MalformedState,
+            "revoked adoption tombstone has no adoption identity",
+        )
+    })?;
+    if adoption.receipt_id != receipt_id {
+        return Err(domain_error(
+            DirtyCheckoutErrorKind::MalformedState,
+            "revoked adoption tombstone receipt identity is inconsistent",
         ));
     }
 
-    let challenge_dir = checkout_dir.join("challenges");
-    match recover_pending_adoption(
-        &checkout_dir,
-        &challenge_dir,
-        &identity,
-        &receipt.challenge_digest,
-    )? {
-        PendingRecovery::None | PendingRecovery::Committed => {}
-        PendingRecovery::RolledBack | PendingRecovery::Revoked => {
-            return Err(domain_error(
-                DirtyCheckoutErrorKind::MalformedState,
-                "active adoption changed while revocation was prepared",
-            ));
+    for entry in fs::read_dir(checkout_dir).context("revocation recovery state is unavailable")? {
+        let entry = entry.context("revocation recovery state is unreadable")?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        let Some(token_digest) = name
+            .strip_prefix(".pending-adoption-")
+            .and_then(|name| name.strip_suffix(".json"))
+            .filter(|digest| is_lower_hex(digest, 64))
+        else {
+            continue;
+        };
+        let Some(pending_bytes) = read_optional_private(&entry.path(), "pending adoption")? else {
+            continue;
+        };
+        let pending: PendingAdoptionRecord =
+            serde_json::from_slice(&pending_bytes).map_err(|_| {
+                domain_error(
+                    DirtyCheckoutErrorKind::MalformedState,
+                    "pending dirty-checkout adoption state is malformed",
+                )
+            })?;
+        validate_pending_adoption(&pending, identity, token_digest)?;
+        if pending.receipt_id == receipt_id {
+            if pending.challenge_digest != adoption.challenge_digest
+                || recover_pending_adoption(checkout_dir, challenge_dir, identity, token_digest)?
+                    != PendingRecovery::Revoked
+            {
+                return Err(domain_error(
+                    DirtyCheckoutErrorKind::MalformedState,
+                    "revoked adoption pending state is inconsistent",
+                ));
+            }
+            break;
         }
     }
 
-    let revoked_lease_path = checkout_dir.join(format!(".revoked-{receipt_id}.json"));
-    fs::rename(&lease_path, &revoked_lease_path)
-        .context("failed to revoke adopted checkout lease")?;
-    sync_directory(&checkout_dir).context("revoked lease tombstone could not be made durable")?;
-
-    let challenge_path = challenge_dir.join(format!("{}.json", receipt.challenge_digest));
-    let spent_challenge_path = receipts_dir.join(format!(".challenge-{receipt_id}.json"));
-    for path in [&receipt_path, &challenge_path, &spent_challenge_path] {
+    let receipt_path = receipts_dir.join(format!("{receipt_id}.json"));
+    if let Some(bytes) = read_optional_private(&receipt_path, "revoked adoption receipt")? {
+        let receipt: ReceiptRecord = serde_json::from_slice(&bytes).map_err(|_| {
+            domain_error(
+                DirtyCheckoutErrorKind::MalformedState,
+                "revoked adoption receipt is malformed",
+            )
+        })?;
+        validate_receipt(&receipt, identity, receipt_id)?;
+        validate_receipt_matches_lease(&receipt, &tombstone)?;
+    }
+    let spent_path = receipts_dir.join(format!(".challenge-{receipt_id}.json"));
+    let mut token_digest = None;
+    if let Some(bytes) = read_optional_private(&spent_path, "revoked adoption challenge")? {
+        let spent: ChallengeRecord = serde_json::from_slice(&bytes).map_err(|_| {
+            domain_error(
+                DirtyCheckoutErrorKind::MalformedState,
+                "revoked adoption challenge is malformed",
+            )
+        })?;
+        validate_spent_challenge_matches_lease(&bytes, &spent, identity, &tombstone)?;
+        token_digest = Some(spent.token_digest);
+    }
+    for path in [&receipt_path, &spent_path] {
         match fs::remove_file(path) {
             Ok(()) => {}
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(error) => {
-                return Err(error).context("revoked adoption artifact cleanup failed");
-            }
+            Err(error) => return Err(error).context("revoked adoption artifact cleanup failed"),
         }
     }
-    sync_directory(&receipts_dir)
+    if let Some(token_digest) = token_digest {
+        let challenge_path = challenge_dir.join(format!("{token_digest}.json"));
+        match fs::remove_file(&challenge_path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error).context("revoked adoption challenge cleanup failed"),
+        }
+    }
+    sync_directory(receipts_dir)
         .context("revoked adoption receipt cleanup could not be made durable")?;
-    sync_directory(&challenge_dir)
+    sync_directory(challenge_dir)
         .context("revoked adoption challenge cleanup could not be made durable")?;
-    sync_directory(&checkout_dir)
+    sync_directory(checkout_dir)
         .context("revoked adoption tombstone could not be confirmed durable")?;
+    prune_revocation_tombstones(checkout_dir, identity, receipt_id)?;
+    Ok(true)
+}
+
+fn prune_revocation_tombstones(
+    checkout_dir: &Path,
+    identity: &CheckoutIdentity,
+    current_receipt_id: &str,
+) -> Result<()> {
+    let mut protected = HashSet::from([current_receipt_id.to_string()]);
+    for entry in
+        fs::read_dir(checkout_dir).context("pending adoption references are unavailable")?
+    {
+        let entry = entry.context("pending adoption reference entry is unreadable")?;
+        let name = entry.file_name();
+        let Some(token_digest) = name
+            .to_str()
+            .and_then(|name| name.strip_prefix(".pending-adoption-"))
+            .and_then(|name| name.strip_suffix(".json"))
+            .filter(|digest| is_lower_hex(digest, 64))
+        else {
+            continue;
+        };
+        let bytes = read_private_regular(&entry.path(), MAX_STATE_FILE_BYTES, true)?;
+        let pending: PendingAdoptionRecord = serde_json::from_slice(&bytes).map_err(|_| {
+            domain_error(
+                DirtyCheckoutErrorKind::MalformedState,
+                "pending adoption tombstone reference is malformed",
+            )
+        })?;
+        validate_pending_adoption(&pending, identity, token_digest)?;
+        protected.insert(pending.receipt_id);
+    }
+
+    let mut tombstones = Vec::new();
+    for entry in fs::read_dir(checkout_dir).context("revocation tombstones are unavailable")? {
+        let entry = entry.context("revocation tombstone entry is unreadable")?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        let Some(receipt_id) = name
+            .strip_prefix(".revoked-")
+            .and_then(|name| name.strip_suffix(".json"))
+            .filter(|receipt_id| is_lower_hex(receipt_id, 64))
+        else {
+            continue;
+        };
+        let bytes = read_private_regular(&entry.path(), MAX_STATE_FILE_BYTES, true)?;
+        let lease = parse_lease(&bytes)?;
+        validate_lease(&lease, identity)?;
+        let adoption = lease.adoption().ok_or_else(|| {
+            domain_error(
+                DirtyCheckoutErrorKind::MalformedState,
+                "revocation tombstone has no adoption identity",
+            )
+        })?;
+        if adoption.receipt_id != receipt_id {
+            return Err(domain_error(
+                DirtyCheckoutErrorKind::MalformedState,
+                "revocation tombstone filename does not match its adoption identity",
+            ));
+        }
+        tombstones.push((
+            protected.contains(receipt_id),
+            adoption.adopted_at,
+            entry.path(),
+        ));
+    }
+    tombstones.sort_by_key(|(protected, adopted_at, path)| {
+        (
+            *protected,
+            *adopted_at,
+            path.as_os_str().as_bytes().to_vec(),
+        )
+    });
+    let remove_count = tombstones.len().saturating_sub(MAX_REVOCATION_TOMBSTONES);
+    let removable = tombstones
+        .into_iter()
+        .filter(|(protected, _, _)| !protected)
+        .take(remove_count)
+        .map(|(_, _, path)| path)
+        .collect::<Vec<_>>();
+    for path in &removable {
+        fs::remove_file(path).context("expired revocation tombstone cleanup failed")?;
+    }
+    if !removable.is_empty() {
+        sync_directory(checkout_dir)
+            .context("revocation tombstone retention could not be made durable")?;
+    }
     Ok(())
 }
 
 fn snapshot_once(checkout: &Path, deadline: Instant) -> Result<SnapshotPass> {
     ensure_deadline(deadline)?;
     let identity = resolve_checkout(checkout, true, deadline)?;
-    reject_command_bearing_git_config(&identity.root, deadline)?;
-    reject_active_git_operation(&identity)?;
     let mut budget = SnapshotBudget::default();
+    reject_command_bearing_git_config(&mut budget, &identity.root, deadline)?;
+    reject_active_git_operation(&identity)?;
 
     let branch_output = snapshot_git_output(
         &mut budget,
@@ -1886,6 +2646,8 @@ fn snapshot_once(checkout: &Path, deadline: Instant) -> Result<SnapshotPass> {
     }
     validate_index_flags(&flags_output.stdout, &tracked, &mut budget)?;
     drop(flags_output);
+
+    reject_initialized_submodule_config(&identity.root, &tracked, &mut budget, deadline)?;
 
     let staged_output = snapshot_git_output(
         &mut budget,
@@ -2057,13 +2819,17 @@ fn snapshot_once(checkout: &Path, deadline: Instant) -> Result<SnapshotPass> {
     })
 }
 
-fn reject_command_bearing_git_config(cwd: &Path, deadline: Instant) -> Result<()> {
-    const COMMAND_BEARING_CONFIG: &str = r"^(include\.path|includeIf\..*\.path|filter\..*\.(clean|smudge|process)|diff\..*\.(command|textconv))$";
-    let output = git_output(
+fn reject_command_bearing_git_config(
+    budget: &mut SnapshotBudget,
+    cwd: &Path,
+    deadline: Instant,
+) -> Result<()> {
+    const COMMAND_BEARING_CONFIG: &str = r"^(include\.path|includeif\..*\.path|filter\..*\.(clean|smudge|process)|diff\..*\.(command|textconv))$";
+    let output = snapshot_git_output(
+        budget,
         cwd,
         &[
             "config",
-            "--local",
             "--no-includes",
             "--name-only",
             "--null",
@@ -2084,6 +2850,80 @@ fn reject_command_bearing_git_config(cwd: &Path, deadline: Instant) -> Result<()
             "repository Git configuration could not be validated",
         )),
     }
+}
+
+fn reject_initialized_submodule_config(
+    root: &Path,
+    tracked: &[IndexEntry],
+    budget: &mut SnapshotBudget,
+    deadline: Instant,
+) -> Result<()> {
+    let mut visited = HashSet::new();
+    reject_initialized_submodule_config_inner(root, tracked, budget, deadline, &mut visited)
+}
+
+fn reject_initialized_submodule_config_inner(
+    root: &Path,
+    tracked: &[IndexEntry],
+    budget: &mut SnapshotBudget,
+    deadline: Instant,
+    visited: &mut HashSet<PathBuf>,
+) -> Result<()> {
+    for entry in tracked
+        .iter()
+        .filter(|entry| entry.mode.as_slice() == b"160000")
+    {
+        ensure_deadline(deadline)?;
+        let path = root.join(OsStr::from_bytes(&entry.path));
+        let result = (|| -> Result<()> {
+            verify_parent_within_root(root, &path)?;
+            let metadata = match fs::symlink_metadata(&path) {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+                Err(error) => {
+                    return Err(error).context("submodule metadata is unavailable");
+                }
+            };
+            ensure!(
+                metadata.file_type().is_dir() && !metadata.file_type().is_symlink(),
+                "submodule checkout path is not a directory"
+            );
+            let canonical =
+                fs::canonicalize(&path).context("submodule path could not be verified")?;
+            ensure!(
+                canonical.starts_with(root),
+                "submodule path escapes the checkout"
+            );
+            ensure!(
+                visited.insert(canonical.clone()),
+                "submodule checkout graph contains a cycle"
+            );
+            reject_command_bearing_git_config(budget, &canonical, deadline)?;
+            let index_output = snapshot_git_output(
+                budget,
+                &canonical,
+                &["ls-files", "--stage", "-z"],
+                MAX_GIT_OUTPUT_BYTES,
+                deadline,
+            )?;
+            ensure!(
+                index_output.status.success(),
+                "submodule index listing failed"
+            );
+            let nested = parse_index_bounded(&index_output.stdout, MAX_ENTRY_COUNT, budget)?;
+            reject_initialized_submodule_config_inner(
+                &canonical, &nested, budget, deadline, visited,
+            )
+        })();
+        if let Err(error) = result {
+            return Err(command_error(
+                error,
+                DirtyCheckoutErrorKind::UnsupportedGitState,
+                "submodule Git configuration is unsupported",
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn snapshot_git_output(
@@ -2470,7 +3310,6 @@ fn reject_special_filesystem_objects(
     deadline: Instant,
 ) -> Result<()> {
     let mut directories = vec![PathBuf::new()];
-    let mut entry_count = 0_usize;
     while let Some(relative_directory) = directories.pop() {
         ensure_deadline(deadline)?;
         let directory = root.join(&relative_directory);
@@ -2495,13 +3334,7 @@ fn reject_special_filesystem_objects(
             {
                 continue;
             }
-            entry_count = entry_count.saturating_add(1);
-            if entry_count > MAX_ENTRY_COUNT {
-                return Err(domain_error(
-                    DirtyCheckoutErrorKind::ResourceUnavailable,
-                    "checkout filesystem entry count exceeds the supported limit",
-                ));
-            }
+            budget.charge_traversal_entry()?;
             let path = entry.path();
             let relative = path
                 .strip_prefix(root)
@@ -2566,7 +3399,12 @@ fn hash_worktree_object(
     let before = match fs::symlink_metadata(&path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            ensure!(!submodule, "submodule checkout is unavailable");
+            if submodule {
+                return Err(domain_error(
+                    DirtyCheckoutErrorKind::UnsupportedGitState,
+                    "dirty or unavailable submodules are unsupported",
+                ));
+            }
             hasher.field(b"worktree_kind", b"missing");
             return Ok(());
         }
@@ -2574,52 +3412,63 @@ fn hash_worktree_object(
     };
 
     if submodule {
-        ensure!(
-            before.file_type().is_dir(),
-            "dirty or unavailable submodules are unsupported"
-        );
-        let canonical = fs::canonicalize(&path).context("submodule path could not be verified")?;
-        ensure!(
-            canonical.starts_with(root),
-            "submodule path escapes the checkout"
-        );
-        reject_special_filesystem_objects(&canonical, &HashSet::new(), budget, deadline)?;
-        let head = snapshot_git_output(
-            budget,
-            &canonical,
-            &["rev-parse", "--verify", "HEAD^{commit}"],
-            256,
-            deadline,
-        )?;
-        ensure!(
-            head.status.success(),
-            "dirty or unavailable submodules are unsupported"
-        );
-        let submodule_head = strip_git_line(&head.stdout)?;
-        ensure!(
-            index_oid.is_some_and(|oid| oid.as_slice() == submodule_head),
-            "dirty or unavailable submodules are unsupported"
-        );
-        let status = snapshot_git_output(
-            budget,
-            &canonical,
-            &[
-                "status",
-                "--porcelain=v1",
-                "-z",
-                "--untracked-files=all",
-                "--ignore-submodules=none",
-            ],
-            MAX_GIT_OUTPUT_BYTES,
-            deadline,
-        )?;
-        ensure!(
-            status.status.success() && status.stdout.is_empty(),
-            "dirty submodules are unsupported"
-        );
-        hasher.field(b"worktree_kind", b"submodule");
-        hasher.field(b"worktree_digest", submodule_head);
-        return Ok(());
+        let result = (|| -> Result<()> {
+            ensure!(
+                before.file_type().is_dir(),
+                "dirty or unavailable submodules are unsupported"
+            );
+            let canonical =
+                fs::canonicalize(&path).context("submodule path could not be verified")?;
+            ensure!(
+                canonical.starts_with(root),
+                "submodule path escapes the checkout"
+            );
+            reject_command_bearing_git_config(budget, &canonical, deadline)?;
+            reject_special_filesystem_objects(&canonical, &HashSet::new(), budget, deadline)?;
+            let head = snapshot_git_output(
+                budget,
+                &canonical,
+                &["rev-parse", "--verify", "HEAD^{commit}"],
+                256,
+                deadline,
+            )?;
+            ensure!(
+                head.status.success(),
+                "dirty or unavailable submodules are unsupported"
+            );
+            let submodule_head = strip_git_line(&head.stdout)?;
+            ensure!(
+                index_oid.is_some_and(|oid| oid.as_slice() == submodule_head),
+                "dirty or unavailable submodules are unsupported"
+            );
+            let status = snapshot_git_output(
+                budget,
+                &canonical,
+                &[
+                    "status",
+                    "--porcelain=v1",
+                    "-z",
+                    "--untracked-files=all",
+                    "--ignore-submodules=none",
+                ],
+                MAX_GIT_OUTPUT_BYTES,
+                deadline,
+            )?;
+            ensure!(
+                status.status.success() && status.stdout.is_empty(),
+                "dirty submodules are unsupported"
+            );
+            hasher.field(b"worktree_kind", b"submodule");
+            hasher.field(b"worktree_digest", submodule_head);
+            Ok(())
+        })();
+        return result.map_err(|error| {
+            command_error(
+                error,
+                DirtyCheckoutErrorKind::UnsupportedGitState,
+                "dirty or unavailable submodules are unsupported",
+            )
+        });
     }
 
     if before.file_type().is_symlink() {
@@ -2773,15 +3622,6 @@ fn same_metadata(left: &Metadata, right: &Metadata) -> bool {
         && left.mtime_nsec() == right.mtime_nsec()
         && left.ctime() == right.ctime()
         && left.ctime_nsec() == right.ctime_nsec()
-}
-
-fn validate_challenge(
-    record: &ChallengeRecord,
-    identity: &CheckoutIdentity,
-    digest: &str,
-) -> Result<()> {
-    validate_challenge_identity(record, identity, digest)?;
-    validate_challenge_at(record, unix_time()?)
 }
 
 fn validate_challenge_identity(
@@ -2943,15 +3783,14 @@ fn validate_lease(lease: &LeaseRecord, identity: &CheckoutIdentity) -> Result<()
             "checkout lease identity or timestamps are malformed",
         ));
     }
-    validate_lease_text_path(lease.checkout_root(), &identity.root, "checkout lease root")?;
-    validate_lease_text_path(
-        lease.checkout_git_dir(),
-        &identity.git_dir,
-        "checkout lease Git directory",
-    )?;
-
     match lease {
         LeaseRecord::V1(lease) => {
+            validate_lease_text_path(&lease.checkout_root, &identity.root, "checkout lease root")?;
+            validate_lease_text_path(
+                &lease.checkout_git_dir,
+                &identity.git_dir,
+                "checkout lease Git directory",
+            )?;
             if lease.schema != LEASE_V1_SCHEMA {
                 return Err(domain_error(
                     DirtyCheckoutErrorKind::MalformedState,
@@ -3017,6 +3856,10 @@ fn validate_lease_text_path(value: &str, expected: &Path, label: &str) -> Result
     Ok(())
 }
 
+fn lease_path_text(path: &Path) -> String {
+    path.to_string_lossy().into_owned()
+}
+
 fn validate_lease_raw_path(
     value: &str,
     text: &str,
@@ -3033,12 +3876,12 @@ fn validate_lease_raw_path(
     if bytes.is_empty()
         || bytes.contains(&0)
         || !path.is_absolute()
-        || bytes.as_slice() != text.as_bytes()
+        || text != lease_path_text(expected)
         || bytes.as_slice() != expected.as_os_str().as_bytes()
     {
         return Err(domain_error(
             DirtyCheckoutErrorKind::MalformedState,
-            format!("{label} does not match the textual path or current checkout"),
+            format!("{label} does not match the compatible text or current checkout"),
         ));
     }
     Ok(bytes)
@@ -3225,8 +4068,12 @@ fn read_regular_bounded(path: &Path, max_bytes: usize) -> Result<Vec<u8>> {
 fn write_json_atomic(path: &Path, value: &impl Serialize, replace: bool) -> Result<()> {
     let mut payload = serde_json::to_vec(value).context("state serialization failed")?;
     payload.push(b'\n');
+    write_state_atomic(path, &payload, replace)
+}
+
+fn write_state_atomic(path: &Path, payload: &[u8], replace: bool) -> Result<()> {
     ensure!(
-        payload.len() <= MAX_STATE_FILE_BYTES,
+        !payload.is_empty() && payload.len() <= MAX_STATE_FILE_BYTES,
         "serialized state exceeds the supported limit"
     );
     let parent = path
@@ -3241,8 +4088,7 @@ fn write_json_atomic(path: &Path, value: &impl Serialize, replace: bool) -> Resu
         .open(&temporary)
         .context("temporary state file could not be created")?;
     let result = (|| -> Result<()> {
-        file.write_all(&payload)
-            .context("state file write failed")?;
+        file.write_all(payload).context("state file write failed")?;
         file.sync_all().context("state file sync failed")?;
         drop(file);
         if replace {
@@ -3295,6 +4141,16 @@ struct LeaseLock(File);
 
 impl LeaseLock {
     fn acquire(directory: &Path) -> Result<Self> {
+        Self::acquire_until(
+            directory,
+            Instant::now()
+                .checked_add(LOCK_WAIT)
+                .unwrap_or_else(Instant::now),
+        )
+    }
+
+    fn acquire_until(directory: &Path, transaction_deadline: Instant) -> Result<Self> {
+        ensure_deadline(transaction_deadline)?;
         let path = directory.join("lease.lock");
         let file = OpenOptions::new()
             .read(true)
@@ -3337,7 +4193,7 @@ impl LeaseLock {
                     format!("checkout lease lock failed: {error}"),
                 ));
             }
-            if started.elapsed() >= LOCK_WAIT {
+            if started.elapsed() >= LOCK_WAIT || Instant::now() >= transaction_deadline {
                 return Err(domain_error(
                     DirtyCheckoutErrorKind::Timeout,
                     "checkout lease lock timed out",
@@ -3749,21 +4605,133 @@ fn drain_nonblocking<R: Read>(
 
 fn terminate_child(child: &mut Child, process_group: libc::pid_t) {
     unsafe {
-        let _ = libc::kill(-process_group, libc::SIGKILL);
+        let _ = libc::kill(-process_group, libc::SIGSTOP);
     }
-    let _ = child.kill();
-    let reap_deadline = Instant::now()
-        .checked_add(Duration::from_millis(250))
-        .unwrap_or_else(Instant::now);
-    loop {
-        match child.try_wait() {
-            Ok(Some(_)) | Err(_) => return,
-            Ok(None) if Instant::now() < reap_deadline => {
-                std::thread::sleep(Duration::from_millis(5));
+    terminate_descendants_with(
+        process_group,
+        descendant_pids,
+        |pid, signal| unsafe { libc::kill(pid, signal) == 0 },
+        || {
+            unsafe {
+                let _ = libc::kill(-process_group, libc::SIGKILL);
             }
-            Ok(None) => return,
+            let _ = child.kill();
+            let reap_deadline = Instant::now()
+                .checked_add(Duration::from_millis(250))
+                .unwrap_or_else(Instant::now);
+            loop {
+                match child.try_wait() {
+                    Ok(Some(_)) | Err(_) => break,
+                    Ok(None) if Instant::now() < reap_deadline => {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Ok(None) => break,
+                }
+            }
+        },
+    );
+}
+
+fn terminate_descendants_with<D, S, B>(
+    process_group: libc::pid_t,
+    mut discover: D,
+    mut signal: S,
+    between_kill_passes: B,
+) where
+    D: FnMut(libc::pid_t) -> Vec<libc::pid_t>,
+    S: FnMut(libc::pid_t, libc::c_int) -> bool,
+    B: FnOnce(),
+{
+    let mut attempted = HashSet::new();
+    let mut stopped = Vec::new();
+    for _ in 0..4 {
+        let mut added = false;
+        for pid in discover(process_group) {
+            if attempted.insert(pid) {
+                added = true;
+                if signal(pid, libc::SIGSTOP) {
+                    stopped.push(pid);
+                }
+            }
+        }
+        if !added {
+            break;
         }
     }
+    for pid in stopped {
+        let _ = signal(pid, libc::SIGKILL);
+    }
+    between_kill_passes();
+}
+
+#[cfg(target_os = "linux")]
+fn descendant_pids(root: libc::pid_t) -> Vec<libc::pid_t> {
+    let mut parents = std::collections::HashMap::new();
+    let Ok(entries) = fs::read_dir("/proc") else {
+        return Vec::new();
+    };
+    for entry in entries.flatten() {
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|value| value.parse::<libc::pid_t>().ok())
+        else {
+            continue;
+        };
+        let Ok(status) = fs::read_to_string(entry.path().join("status")) else {
+            continue;
+        };
+        let Some(parent) = status.lines().find_map(|line| {
+            line.strip_prefix("PPid:")
+                .and_then(|value| value.trim().parse::<libc::pid_t>().ok())
+        }) else {
+            continue;
+        };
+        parents.insert(pid, parent);
+    }
+    let mut descendants = Vec::new();
+    let mut frontier = vec![root];
+    while let Some(parent) = frontier.pop() {
+        for (&pid, &candidate_parent) in &parents {
+            if candidate_parent == parent && !descendants.contains(&pid) {
+                descendants.push(pid);
+                frontier.push(pid);
+            }
+        }
+    }
+    descendants
+}
+
+#[cfg(target_os = "macos")]
+fn descendant_pids(root: libc::pid_t) -> Vec<libc::pid_t> {
+    let mut descendants = Vec::new();
+    let mut frontier = vec![root];
+    while let Some(parent) = frontier.pop() {
+        let mut children = vec![0 as libc::pid_t; 1024];
+        let count = unsafe {
+            libc::proc_listchildpids(
+                parent,
+                children.as_mut_ptr().cast(),
+                std::mem::size_of_val(children.as_slice()) as libc::c_int,
+            )
+        };
+        if count <= 0 {
+            continue;
+        }
+        children.truncate((count as usize).min(children.len()));
+        for pid in children {
+            if pid > 0 && !descendants.contains(&pid) {
+                descendants.push(pid);
+                frontier.push(pid);
+            }
+        }
+    }
+    descendants
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn descendant_pids(_root: libc::pid_t) -> Vec<libc::pid_t> {
+    Vec::new()
 }
 
 pub(super) fn run_dirty_snapshot(args: &[String]) -> i32 {
@@ -4056,6 +5024,143 @@ fn resolve_state_root() -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::process::ExitStatusExt;
+
+    fn successful_worker_output(snapshot: serde_json::Value) -> std::process::Output {
+        std::process::Output {
+            status: std::process::ExitStatus::from_raw(0),
+            stdout: serde_json::to_vec(&serde_json::json!({
+                "schema": SNAPSHOT_WORKER_SCHEMA,
+                "snapshot": snapshot,
+                "error": null,
+            }))
+            .expect("serialize worker response"),
+            stderr: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn snapshot_worker_success_rejects_semantically_invalid_identity_and_budgets() {
+        let valid = serde_json::json!({
+            "schema": SNAPSHOT_SCHEMA,
+            "repository_key": "a".repeat(64),
+            "checkout_key": "b".repeat(64),
+            "checkout_instance": "c".repeat(32),
+            "snapshot_id": "d".repeat(64),
+            "head_oid": "e".repeat(40),
+            "branch_ref_digest": "f".repeat(64),
+            "tracked_entries": 1,
+            "untracked_entries": 1,
+            "hashed_bytes": 2,
+        });
+        let mut cases = Vec::new();
+        for (label, field, value) in [
+            ("malformed repository key", "repository_key", "a".repeat(63)),
+            ("uppercase checkout key", "checkout_key", "B".repeat(64)),
+            (
+                "malformed checkout instance",
+                "checkout_instance",
+                "not-an-instance".to_string(),
+            ),
+            ("uppercase snapshot digest", "snapshot_id", "D".repeat(64)),
+            (
+                "malformed branch digest",
+                "branch_ref_digest",
+                "not-a-digest".to_string(),
+            ),
+        ] {
+            let mut invalid = valid.clone();
+            invalid[field] = serde_json::json!(value);
+            cases.push((label, invalid));
+        }
+        let mut invalid_head = valid.clone();
+        invalid_head["head_oid"] = serde_json::json!("not-a-head");
+        cases.push(("malformed HEAD", invalid_head));
+        let mut invalid_entries = valid.clone();
+        invalid_entries["tracked_entries"] = serde_json::json!(MAX_ENTRY_COUNT);
+        invalid_entries["untracked_entries"] = serde_json::json!(1);
+        cases.push(("combined entry budget", invalid_entries));
+        let mut invalid_bytes = valid;
+        invalid_bytes["hashed_bytes"] = serde_json::json!(MAX_TOTAL_BYTES + 1);
+        cases.push(("hashed byte budget", invalid_bytes));
+
+        for (label, snapshot) in cases {
+            let error = decode_snapshot_worker_output(successful_worker_output(snapshot))
+                .expect_err("semantically invalid worker success must be rejected");
+            assert_eq!(
+                error
+                    .downcast_ref::<DirtyCheckoutError>()
+                    .expect("typed invalid worker response")
+                    .kind(),
+                DirtyCheckoutErrorKind::SnapshotFailed,
+                "{label}"
+            );
+        }
+    }
+
+    #[test]
+    fn snapshot_worker_executable_rejects_group_and_world_writable_files() {
+        let root = tempfile::TempDir::new().expect("worker executable root");
+        let executable = root.path().join("git-cli");
+        fs::write(&executable, b"worker").expect("write worker fixture");
+
+        for (mode, trusted) in [(0o700, true), (0o755, true), (0o775, false), (0o702, false)] {
+            fs::set_permissions(&executable, fs::Permissions::from_mode(mode))
+                .expect("set worker fixture mode");
+            let metadata = fs::metadata(&executable).expect("worker fixture metadata");
+            assert_eq!(
+                validate_worker_file_metadata(&metadata).is_ok(),
+                trusted,
+                "unexpected worker trust result for mode {mode:o}"
+            );
+        }
+    }
+
+    #[test]
+    fn snapshot_worker_executable_rejects_effective_user_group_writable_ancestors() {
+        let root = tempfile::Builder::new()
+            .prefix("worker-ancestor-")
+            .tempdir_in(env::current_dir().expect("current test directory"))
+            .expect("worker ancestor root");
+        let executable = root.path().join("git-cli");
+        fs::write(&executable, b"worker").expect("write worker fixture");
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o700))
+            .expect("set worker mode");
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o770))
+            .expect("make effective-user ancestor group writable");
+
+        let error = validate_worker_path_permissions(&executable)
+            .expect_err("effective-user group-writable ancestor must be rejected");
+        assert_eq!(
+            error
+                .downcast_ref::<DirtyCheckoutError>()
+                .expect("typed worker path error")
+                .kind(),
+            DirtyCheckoutErrorKind::ResourceUnavailable
+        );
+    }
+
+    #[test]
+    fn descendant_termination_does_not_resignal_cached_numeric_pids() {
+        let reused_pid = 42_424 as libc::pid_t;
+        let mut signals = Vec::new();
+
+        terminate_descendants_with(
+            7,
+            |_| vec![reused_pid],
+            |pid, signal| {
+                signals.push((pid, signal));
+                true
+            },
+            || {},
+        );
+
+        assert_eq!(
+            signals,
+            vec![(reused_pid, libc::SIGSTOP), (reused_pid, libc::SIGKILL)],
+            "a cached numeric PID must be stopped once and killed once"
+        );
+    }
 
     fn assert_process_absent(pid: libc::pid_t, label: &str) {
         let deadline = Instant::now() + Duration::from_millis(500);
@@ -4181,7 +5286,17 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn detached_pipe_holder_does_not_leave_reader_threads() {
+    fn detached_pipe_holder_does_not_leave_reader_threads_or_processes() {
+        struct KillOnDrop(libc::pid_t);
+
+        impl Drop for KillOnDrop {
+            fn drop(&mut self) {
+                unsafe {
+                    libc::kill(self.0, libc::SIGKILL);
+                }
+            }
+        }
+
         let root = tempfile::TempDir::new().expect("detached child root");
         let pid_path = root.path().join("detached.pid");
         let script = format!(
@@ -4214,11 +5329,72 @@ mod tests {
             .expect("read detached child pid")
             .parse()
             .expect("parse detached child pid");
-        unsafe {
-            libc::kill(pid, libc::SIGKILL);
-        }
+        let cleanup = KillOnDrop(pid);
 
         assert_eq!(after, baseline, "timeout leaked output reader threads");
+        assert_process_absent(pid, "detached timeout descendant");
+        drop(cleanup);
+    }
+
+    #[test]
+    fn snapshot_budget_counters_accept_exact_limits_and_reject_limit_plus_one() {
+        let one_byte = std::process::Output {
+            status: std::process::ExitStatus::from_raw(0),
+            stdout: vec![0],
+            stderr: Vec::new(),
+        };
+        let assert_resource = |error: anyhow::Error, label: &str| {
+            assert_eq!(
+                error
+                    .downcast_ref::<DirtyCheckoutError>()
+                    .unwrap_or_else(|| panic!("typed {label} budget error"))
+                    .kind(),
+                DirtyCheckoutErrorKind::ResourceUnavailable,
+                "unexpected {label} budget error: {error}"
+            );
+        };
+
+        let mut capture = SnapshotBudget {
+            capture_bytes: MAX_CAPTURE_BYTES - 1,
+            ..SnapshotBudget::default()
+        };
+        capture
+            .charge_output(&one_byte)
+            .expect("exact capture-byte limit is accepted");
+        assert_resource(
+            capture
+                .output_limit(1)
+                .expect_err("capture limit plus one must be rejected"),
+            "capture",
+        );
+
+        let mut paths = SnapshotBudget {
+            path_bytes: MAX_PATH_BYTES - 1,
+            ..SnapshotBudget::default()
+        };
+        paths
+            .charge_path(1)
+            .expect("exact path-byte limit is accepted");
+        assert_resource(
+            paths
+                .charge_path(1)
+                .expect_err("path-byte limit plus one must be rejected"),
+            "path",
+        );
+
+        let mut traversal = SnapshotBudget {
+            traversal_entries: MAX_ENTRY_COUNT - 1,
+            ..SnapshotBudget::default()
+        };
+        traversal
+            .charge_traversal_entry()
+            .expect("exact traversal-entry limit is accepted");
+        assert_resource(
+            traversal
+                .charge_traversal_entry()
+                .expect_err("traversal-entry limit plus one must be rejected"),
+            "traversal",
+        );
     }
 
     #[test]
@@ -4234,30 +5410,60 @@ mod tests {
 
     #[test]
     fn aggregate_file_budget_is_checked_before_opening_the_file() {
+        const CHILD_ENV: &str = "NILS_GIT_CLI_TEST_PREOPEN_BUDGET";
+        if env::var_os(CHILD_ENV).is_none() {
+            let status = Command::new(env::current_exe().expect("current test executable"))
+                .arg("aggregate_file_budget_is_checked_before_opening_the_file")
+                .arg("--nocapture")
+                .env(CHILD_ENV, "1")
+                .env("RUST_TEST_THREADS", "1")
+                .status()
+                .expect("run isolated descriptor-budget test");
+            assert!(status.success(), "isolated descriptor-budget test failed");
+            return;
+        }
+
         let root = tempfile::TempDir::new().expect("snapshot root");
-        let path = root.path().join("unreadable");
+        let path = root.path().join("unopenable");
         fs::write(&path, b"x").expect("write fixture");
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o000))
-            .expect("make fixture unreadable");
         let mut hasher = FramedHasher::new();
         let mut budget = SnapshotBudget {
             file_bytes: MAX_TOTAL_BYTES,
             ..SnapshotBudget::default()
         };
+        let mut limits = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        assert_eq!(
+            unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limits) },
+            0,
+            "read descriptor limit"
+        );
+        let original = limits;
+        limits.rlim_cur = 0;
+        assert_eq!(
+            unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limits) },
+            0,
+            "exhaust descriptor budget"
+        );
 
-        let error = hash_worktree_object(
+        let result = hash_worktree_object(
             &mut hasher,
             root.path(),
-            b"unreadable",
+            b"unopenable",
             false,
             None,
             &mut budget,
             Instant::now() + Duration::from_secs(1),
-        )
-        .expect_err("remaining aggregate budget must be checked before open");
+        );
 
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o600))
-            .expect("restore fixture permissions");
+        assert_eq!(
+            unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &original) },
+            0,
+            "restore descriptor limit"
+        );
+        let error = result.expect_err("aggregate budget must be checked before file open");
         assert!(
             error.to_string().contains("total bytes"),
             "unexpected pre-open failure: {error}"
@@ -4340,10 +5546,14 @@ mod tests {
     fn adoption_rechecks_the_complete_snapshot_after_durable_preparation() {
         let (checkout, state_root, reason_path, snapshot, challenge_path) =
             adoption_transaction_fixture();
+        let checkout_root =
+            fs::canonicalize(checkout.path()).expect("canonicalize checkout fixture root");
+        let state_root_path =
+            fs::canonicalize(state_root.path()).expect("canonicalize state fixture root");
         let checkout_dir = checkout_state_dir(
-            state_root.path(),
+            &state_root_path,
             &resolve_checkout(
-                checkout.path(),
+                &checkout_root,
                 false,
                 deadline_after(SNAPSHOT_TIMEOUT).expect("identity deadline"),
             )
@@ -4353,8 +5563,8 @@ mod tests {
         let mut calls = 0;
 
         let error = adopt_dirty_with_snapshot(
-            checkout.path(),
-            state_root.path(),
+            &checkout_root,
+            &state_root_path,
             &"a".repeat(64),
             &reason_path,
             |path| {
@@ -4392,15 +5602,18 @@ mod tests {
     fn adoption_rolls_back_when_the_post_install_snapshot_drifts() {
         let (checkout, state_root, reason_path, snapshot, challenge_path) =
             adoption_transaction_fixture();
-        let checkout_dir = state_root
-            .path()
+        let checkout_root =
+            fs::canonicalize(checkout.path()).expect("canonicalize checkout fixture root");
+        let state_root_path =
+            fs::canonicalize(state_root.path()).expect("canonicalize state fixture root");
+        let checkout_dir = state_root_path
             .join(&snapshot.repository_key)
             .join(&snapshot.checkout_key);
         let mut calls = 0;
 
         let error = adopt_dirty_with_snapshot(
-            checkout.path(),
-            state_root.path(),
+            &checkout_root,
+            &state_root_path,
             &"a".repeat(64),
             &reason_path,
             |path| {
@@ -4442,8 +5655,8 @@ mod tests {
         );
 
         let replay = adopt_dirty(
-            checkout.path(),
-            state_root.path(),
+            &checkout_root,
+            &state_root_path,
             &"a".repeat(64),
             &reason_path,
         )
@@ -4454,6 +5667,296 @@ mod tests {
                 .expect("typed challenge replay")
                 .kind(),
             DirtyCheckoutErrorKind::ChallengeReused
+        );
+    }
+
+    #[test]
+    fn adoption_expiry_is_checked_at_the_durable_authorization_boundary() {
+        let (checkout, state_root, reason_path, snapshot, challenge_path) =
+            adoption_transaction_fixture();
+        let checkout_root =
+            fs::canonicalize(checkout.path()).expect("canonicalize checkout fixture root");
+        let state_root_path =
+            fs::canonicalize(state_root.path()).expect("canonicalize state fixture root");
+        let challenge: ChallengeRecord =
+            serde_json::from_slice(&fs::read(&challenge_path).expect("read expiring challenge"))
+                .expect("parse expiring challenge");
+        let checkout_dir = state_root_path
+            .join(&snapshot.repository_key)
+            .join(&snapshot.checkout_key);
+        let valid_at = challenge.issued_at;
+        let expired_at = challenge.expires_at;
+        let lease_installed = std::cell::Cell::new(false);
+        let mut snapshot_calls = 0;
+
+        let error = adopt_dirty_with_snapshot_and_clock(
+            &checkout_root,
+            &state_root_path,
+            &"a".repeat(64),
+            &reason_path,
+            |path| {
+                snapshot_calls += 1;
+                lease_installed.set(checkout_dir.join("lease.json").exists());
+                dirty_snapshot(path)
+            },
+            || {
+                Ok(if lease_installed.get() {
+                    expired_at
+                } else {
+                    valid_at
+                })
+            },
+        )
+        .expect_err("authorization expiring before durable acceptance must be rejected");
+
+        assert_eq!(snapshot_calls, 4);
+        assert!(
+            lease_installed.get(),
+            "synthetic expiry must begin only after the lease is observably installed"
+        );
+        assert_eq!(
+            error
+                .downcast_ref::<DirtyCheckoutError>()
+                .expect("typed durable-boundary expiry")
+                .kind(),
+            DirtyCheckoutErrorKind::ChallengeExpired
+        );
+        assert!(
+            !checkout_dir.join("lease.json").exists(),
+            "expired authorization must not leave an accepted lease"
+        );
+    }
+
+    #[test]
+    fn crash_after_lease_install_rechecks_authorization_before_commit_recovery() {
+        let (checkout, state_root, reason_path, snapshot, challenge_path) =
+            adoption_transaction_fixture();
+        let checkout_root =
+            fs::canonicalize(checkout.path()).expect("canonicalize checkout fixture root");
+        let state_root_path =
+            fs::canonicalize(state_root.path()).expect("canonicalize state fixture root");
+        let challenge: ChallengeRecord =
+            serde_json::from_slice(&fs::read(&challenge_path).expect("read crash challenge"))
+                .expect("parse crash challenge");
+        let checkout_dir = state_root_path
+            .join(&snapshot.repository_key)
+            .join(&snapshot.checkout_key);
+        let mut snapshot_calls = 0;
+
+        let crashed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = adopt_dirty_with_snapshot_and_clock(
+                &checkout_root,
+                &state_root_path,
+                &"a".repeat(64),
+                &reason_path,
+                |path| {
+                    snapshot_calls += 1;
+                    if snapshot_calls == 4 {
+                        panic!("injected crash after durable lease installation");
+                    }
+                    dirty_snapshot(path)
+                },
+                || Ok(challenge.issued_at),
+            );
+        }));
+        assert!(crashed.is_err(), "fault injection must interrupt adoption");
+        assert!(checkout_dir.join("lease.json").exists());
+        assert!(
+            fs::read_dir(&checkout_dir)
+                .expect("list pending crash state")
+                .filter_map(|entry| entry.ok())
+                .any(|entry| entry
+                    .file_name()
+                    .as_bytes()
+                    .starts_with(b".pending-adoption-")),
+            "crash must retain provisional pending state"
+        );
+
+        let error = adopt_dirty_with_snapshot_and_clock(
+            &checkout_root,
+            &state_root_path,
+            &"a".repeat(64),
+            &reason_path,
+            dirty_snapshot,
+            || Ok(challenge.expires_at),
+        )
+        .expect_err("expired provisional authorization must not recover as committed");
+
+        assert_eq!(
+            error
+                .downcast_ref::<DirtyCheckoutError>()
+                .expect("typed crash-recovery expiry")
+                .kind(),
+            DirtyCheckoutErrorKind::ChallengeExpired
+        );
+        assert!(
+            !checkout_dir.join("lease.json").exists(),
+            "unverified provisional lease must be revoked"
+        );
+    }
+
+    #[test]
+    fn committed_retry_requires_lease_to_remain_active_through_snapshot() {
+        let (checkout, state_root, reason_path, snapshot, _challenge_path) =
+            adoption_transaction_fixture();
+        let checkout_root =
+            fs::canonicalize(checkout.path()).expect("canonicalize checkout fixture root");
+        let state_root_path =
+            fs::canonicalize(state_root.path()).expect("canonicalize state fixture root");
+        let checkout_dir = state_root_path
+            .join(&snapshot.repository_key)
+            .join(&snapshot.checkout_key);
+
+        adopt_dirty_with_snapshot_and_clock(
+            &checkout_root,
+            &state_root_path,
+            &"a".repeat(64),
+            &reason_path,
+            dirty_snapshot,
+            unix_time,
+        )
+        .expect("create committed adoption");
+        let lease = load_lease(&checkout_dir.join("lease.json"))
+            .expect("load committed lease")
+            .expect("committed lease");
+        let before_expiry = lease.expires_at() - 1;
+        let at_expiry = lease.expires_at();
+        let clock_calls = std::cell::Cell::new(0usize);
+
+        let error = adopt_dirty_with_snapshot_and_clock(
+            &checkout_root,
+            &state_root_path,
+            &"a".repeat(64),
+            &reason_path,
+            dirty_snapshot,
+            || {
+                let call = clock_calls.get();
+                clock_calls.set(call + 1);
+                Ok(if call == 0 { before_expiry } else { at_expiry })
+            },
+        )
+        .expect_err("retry must fail when the lease expires during snapshot validation");
+
+        assert_eq!(
+            error
+                .downcast_ref::<DirtyCheckoutError>()
+                .expect("typed committed retry expiry")
+                .kind(),
+            DirtyCheckoutErrorKind::ChallengeReused
+        );
+        assert_eq!(clock_calls.get(), 2, "retry must check lease expiry twice");
+    }
+
+    #[test]
+    fn adoption_rollback_restores_exact_active_same_session_v1_lease() {
+        let (checkout, state_root, reason_path, snapshot, _challenge_path) =
+            adoption_transaction_fixture();
+        let checkout_root =
+            fs::canonicalize(checkout.path()).expect("canonicalize checkout fixture root");
+        let state_root_path =
+            fs::canonicalize(state_root.path()).expect("canonicalize state fixture root");
+        let identity = resolve_checkout(
+            &checkout_root,
+            false,
+            deadline_after(SNAPSHOT_TIMEOUT).expect("identity deadline"),
+        )
+        .expect("resolve checkout identity");
+        let checkout_dir = state_root_path
+            .join(&snapshot.repository_key)
+            .join(&snapshot.checkout_key);
+        let lease_path = checkout_dir.join("lease.json");
+        let now = unix_time().expect("predecessor lease time");
+        let predecessor = LeaseRecord::V1(LeaseV1Wire {
+            schema: LEASE_V1_SCHEMA.to_string(),
+            session_key: "b".repeat(64),
+            checkout_instance: identity.checkout_instance.clone(),
+            checkout_root: identity.root.to_string_lossy().into_owned(),
+            checkout_git_dir: identity.git_dir.to_string_lossy().into_owned(),
+            acquired_at: now - 10,
+            refreshed_at: now,
+            expires_at: now + 3_600,
+        });
+        let mut predecessor_bytes =
+            serde_json::to_vec_pretty(&predecessor).expect("serialize exact predecessor");
+        predecessor_bytes.push(b'\n');
+        fs::write(&lease_path, &predecessor_bytes).expect("write exact predecessor lease");
+        fs::set_permissions(&lease_path, fs::Permissions::from_mode(0o600))
+            .expect("make predecessor lease private");
+        sync_directory(&checkout_dir).expect("make predecessor durable");
+        let mut snapshot_calls = 0;
+
+        let error = adopt_dirty_with_snapshot(
+            &checkout_root,
+            &state_root_path,
+            &"a".repeat(64),
+            &reason_path,
+            |path| {
+                snapshot_calls += 1;
+                if snapshot_calls == 4 {
+                    fs::write(path.join("dirty.txt"), b"rollback exact predecessor\n")
+                        .expect("introduce post-install drift");
+                }
+                dirty_snapshot(path)
+            },
+        )
+        .expect_err("post-install drift must roll back over the v1 predecessor");
+
+        assert_eq!(
+            error
+                .downcast_ref::<DirtyCheckoutError>()
+                .expect("typed predecessor rollback")
+                .kind(),
+            DirtyCheckoutErrorKind::ChallengeDrift
+        );
+        assert_eq!(
+            fs::read(&lease_path).expect("read restored predecessor"),
+            predecessor_bytes,
+            "rollback must restore the exact predecessor bytes"
+        );
+    }
+
+    #[test]
+    fn adoption_reuses_one_deadline_across_snapshot_barriers() {
+        let (checkout, state_root, reason_path, snapshot, _challenge_path) =
+            adoption_transaction_fixture();
+        let checkout_root =
+            fs::canonicalize(checkout.path()).expect("canonicalize checkout fixture root");
+        let state_root_path =
+            fs::canonicalize(state_root.path()).expect("canonicalize state fixture root");
+        let checkout_dir = state_root_path
+            .join(&snapshot.repository_key)
+            .join(&snapshot.checkout_key);
+        let transaction_deadline = deadline_after(SNAPSHOT_TIMEOUT).expect("transaction deadline");
+        let mut observed_deadlines = Vec::new();
+
+        adopt_dirty_with_snapshot_clock_and_deadline(
+            &checkout_root,
+            &state_root_path,
+            &"a".repeat(64),
+            &reason_path,
+            |_, barrier_deadline| {
+                observed_deadlines.push(barrier_deadline);
+                Ok(snapshot.clone())
+            },
+            unix_time,
+            transaction_deadline,
+        )
+        .expect("stable snapshot barriers must complete before the deadline");
+
+        assert_eq!(
+            observed_deadlines.len(),
+            4,
+            "adoption must execute every snapshot barrier"
+        );
+        assert!(
+            observed_deadlines
+                .iter()
+                .all(|deadline| *deadline == transaction_deadline),
+            "every snapshot barrier must receive the original transaction deadline"
+        );
+        assert!(
+            checkout_dir.join("lease.json").exists(),
+            "deadline observation must complete a real adoption transition"
         );
     }
 
@@ -4532,6 +6035,177 @@ mod tests {
     }
 
     #[test]
+    fn persisted_adoption_requires_transition_before_challenge_expiry() {
+        let identity = CheckoutIdentity {
+            root: PathBuf::from("/checkout"),
+            git_dir: PathBuf::from("/checkout/.git"),
+            common_dir: PathBuf::from("/checkout/.git"),
+            repository_key: "a".repeat(64),
+            checkout_key: "b".repeat(64),
+            checkout_instance: "c".repeat(32),
+        };
+        let challenge = ChallengeRecord {
+            schema: CHALLENGE_SCHEMA.to_string(),
+            token_digest: "d".repeat(64),
+            session_key: "e".repeat(64),
+            repository_key: identity.repository_key.clone(),
+            checkout_key: identity.checkout_key.clone(),
+            checkout_instance: identity.checkout_instance.clone(),
+            snapshot_id: "f".repeat(64),
+            head_oid: "1".repeat(40),
+            branch_ref_digest: "2".repeat(64),
+            authorization_turn_digest: "3".repeat(64),
+            issued_at: 10,
+            expires_at: 20,
+        };
+        let mut challenge_bytes = serde_json::to_vec(&challenge).expect("serialize challenge");
+        challenge_bytes.push(b'\n');
+        let challenge_digest = sha256_hex(&challenge_bytes);
+
+        for (adopted_at, valid) in [(19, true), (20, false), (21, false)] {
+            let lease = LeaseRecord::V2(Box::new(LeaseV2Wire {
+                schema: LEASE_V2_SCHEMA.to_string(),
+                session_key: challenge.session_key.clone(),
+                checkout_instance: identity.checkout_instance.clone(),
+                checkout_root: "/checkout".to_string(),
+                checkout_git_dir: "/checkout/.git".to_string(),
+                checkout_root_bytes: hex_bytes(identity.root.as_os_str().as_bytes()),
+                checkout_git_dir_bytes: hex_bytes(identity.git_dir.as_os_str().as_bytes()),
+                acquired_at: adopted_at,
+                refreshed_at: adopted_at,
+                expires_at: 100,
+                adoption: AdoptionRecord {
+                    schema: ADOPTION_SCHEMA.to_string(),
+                    receipt_schema: RECEIPT_SCHEMA.to_string(),
+                    receipt_id: "4".repeat(64),
+                    snapshot_id: challenge.snapshot_id.clone(),
+                    authorization_turn_digest: challenge.authorization_turn_digest.clone(),
+                    reason_digest: "5".repeat(64),
+                    adopted_at,
+                    challenge_issued_at: challenge.issued_at,
+                    challenge_digest: challenge_digest.clone(),
+                },
+            }));
+            assert_eq!(
+                validate_spent_challenge_matches_lease(
+                    &challenge_bytes,
+                    &challenge,
+                    &identity,
+                    &lease,
+                )
+                .is_ok(),
+                valid,
+                "unexpected persisted authorization result at {adopted_at}"
+            );
+        }
+    }
+
+    #[test]
+    fn revocation_tombstones_are_pruned_oldest_first_with_current_protected() {
+        let root = tempfile::TempDir::new().expect("tombstone retention root");
+        let checkout = root.path().join("checkout");
+        let git_dir = root.path().join("git-dir");
+        let checkout_dir = root.path().join("state");
+        for directory in [&checkout, &git_dir, &checkout_dir] {
+            fs::create_dir(directory).expect("create tombstone retention directory");
+            fs::set_permissions(directory, fs::Permissions::from_mode(0o700))
+                .expect("make tombstone retention directory private");
+        }
+        let identity = CheckoutIdentity {
+            root: checkout,
+            git_dir: git_dir.clone(),
+            common_dir: git_dir,
+            repository_key: "a".repeat(64),
+            checkout_key: "b".repeat(64),
+            checkout_instance: "c".repeat(32),
+        };
+        let mut receipt_ids = Vec::new();
+        for index in 0..=MAX_REVOCATION_TOMBSTONES {
+            let receipt_id = format!("{index:064x}");
+            let adopted_at = 100 + index as u64;
+            let lease = LeaseRecord::V2(Box::new(LeaseV2Wire {
+                schema: LEASE_V2_SCHEMA.to_string(),
+                session_key: "d".repeat(64),
+                checkout_instance: identity.checkout_instance.clone(),
+                checkout_root: identity.root.to_string_lossy().into_owned(),
+                checkout_git_dir: identity.git_dir.to_string_lossy().into_owned(),
+                checkout_root_bytes: hex_bytes(identity.root.as_os_str().as_bytes()),
+                checkout_git_dir_bytes: hex_bytes(identity.git_dir.as_os_str().as_bytes()),
+                acquired_at: adopted_at,
+                refreshed_at: adopted_at,
+                expires_at: adopted_at + 100,
+                adoption: AdoptionRecord {
+                    schema: ADOPTION_SCHEMA.to_string(),
+                    receipt_schema: RECEIPT_SCHEMA.to_string(),
+                    receipt_id: receipt_id.clone(),
+                    snapshot_id: "e".repeat(64),
+                    authorization_turn_digest: "f".repeat(64),
+                    reason_digest: "1".repeat(64),
+                    adopted_at,
+                    challenge_issued_at: adopted_at - 1,
+                    challenge_digest: "2".repeat(64),
+                },
+            }));
+            write_json_atomic(
+                &checkout_dir.join(format!(".revoked-{receipt_id}.json")),
+                &lease,
+                false,
+            )
+            .expect("write tombstone fixture");
+            receipt_ids.push(receipt_id);
+        }
+        let protected_token_digest = "9".repeat(64);
+        let protected_pending = PendingAdoptionRecord {
+            schema: PENDING_ADOPTION_SCHEMA.to_string(),
+            receipt_id: receipt_ids[0].clone(),
+            token_digest: protected_token_digest.clone(),
+            challenge_digest: "2".repeat(64),
+            session_key: "d".repeat(64),
+            checkout_instance: identity.checkout_instance.clone(),
+            snapshot_id: "e".repeat(64),
+            predecessor_receipt_id: None,
+            predecessor_receipt_digest: None,
+            predecessor_spent_challenge_digest: None,
+            predecessor_lease_digest: None,
+            predecessor_lease_bytes: None,
+        };
+        write_json_atomic(
+            &pending_adoption_path(&checkout_dir, &protected_token_digest),
+            &protected_pending,
+            false,
+        )
+        .expect("write pending tombstone reference");
+        let current = receipt_ids.last().expect("current tombstone");
+
+        prune_revocation_tombstones(&checkout_dir, &identity, current)
+            .expect("prune tombstone retention set");
+
+        let remaining = fs::read_dir(&checkout_dir)
+            .expect("list retained tombstones")
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| entry.file_name().as_bytes().starts_with(b".revoked-"))
+            .count();
+        assert_eq!(remaining, MAX_REVOCATION_TOMBSTONES);
+        assert!(
+            checkout_dir
+                .join(format!(".revoked-{}.json", receipt_ids[0]))
+                .exists(),
+            "pending-referenced tombstone must remain durable"
+        );
+        assert!(
+            !checkout_dir
+                .join(format!(".revoked-{}.json", receipt_ids[1]))
+                .exists(),
+            "oldest unreferenced tombstone should be pruned first"
+        );
+        assert!(
+            checkout_dir
+                .join(format!(".revoked-{current}.json"))
+                .exists()
+        );
+    }
+
+    #[test]
     fn predecessor_cleanup_failure_is_reported_for_recovery() {
         let root = tempfile::TempDir::new().expect("predecessor cleanup root");
         let receipt_path = root.path().join("receipt.json");
@@ -4542,8 +6216,8 @@ mod tests {
             receipt_id: "a".repeat(64),
             receipt_path,
             spent_challenge_path,
-            receipt_digest: "b".repeat(64),
-            spent_challenge_digest: "c".repeat(64),
+            receipt_digest: Some("b".repeat(64)),
+            spent_challenge_digest: Some("c".repeat(64)),
         };
 
         cleanup_expired_predecessor(&predecessor)
@@ -4598,6 +6272,11 @@ mod tests {
             issued_at: 10,
             expires_at: 20,
         };
+        let challenge_artifact_digest = {
+            let mut bytes = serde_json::to_vec(&challenge).expect("serialize recovery challenge");
+            bytes.push(b'\n');
+            sha256_hex(&bytes)
+        };
         let receipt = ReceiptRecord {
             schema: RECEIPT_SCHEMA.to_string(),
             receipt_id: receipt_id.clone(),
@@ -4608,7 +6287,7 @@ mod tests {
             snapshot_id: challenge.snapshot_id.clone(),
             authorization_turn_digest: challenge.authorization_turn_digest.clone(),
             reason_digest: "6".repeat(64),
-            challenge_digest: challenge_digest.clone(),
+            challenge_digest: challenge_artifact_digest.clone(),
             adopted_at: 15,
         };
         let pending_path = pending_adoption_path(&checkout_dir, &challenge_digest);
@@ -4618,13 +6297,16 @@ mod tests {
         let pending = PendingAdoptionRecord {
             schema: PENDING_ADOPTION_SCHEMA.to_string(),
             receipt_id: receipt_id.clone(),
-            challenge_digest: challenge_digest.clone(),
+            token_digest: challenge_digest.clone(),
+            challenge_digest: challenge_artifact_digest.clone(),
             session_key: challenge.session_key.clone(),
             checkout_instance: identity.checkout_instance.clone(),
             snapshot_id: challenge.snapshot_id.clone(),
             predecessor_receipt_id: None,
             predecessor_receipt_digest: None,
             predecessor_spent_challenge_digest: None,
+            predecessor_lease_digest: None,
+            predecessor_lease_bytes: None,
         };
 
         write_json_atomic(&challenge_path, &challenge, false).expect("write challenge");
@@ -4668,7 +6350,7 @@ mod tests {
                 reason_digest: receipt.reason_digest.clone(),
                 adopted_at: 15,
                 challenge_issued_at: challenge.issued_at,
-                challenge_digest: challenge_digest.clone(),
+                challenge_digest: challenge_artifact_digest.clone(),
             },
         }));
         write_json_atomic(&checkout_dir.join("lease.json"), &lease, false)
@@ -4681,6 +6363,41 @@ mod tests {
         assert!(!pending_path.exists());
         assert!(receipt_path.exists());
         assert!(spent_path.exists());
+
+        write_json_atomic(&pending_path, &pending, false)
+            .expect("write missing-receipt recovery marker");
+        fs::remove_file(&receipt_path).expect("remove current committed receipt");
+        let missing_receipt =
+            recover_pending_adoption(&checkout_dir, &challenge_dir, &identity, &challenge_digest)
+                .expect_err("committed recovery must require the current receipt");
+        assert_eq!(
+            missing_receipt
+                .downcast_ref::<DirtyCheckoutError>()
+                .expect("typed missing receipt error")
+                .kind(),
+            DirtyCheckoutErrorKind::MalformedState
+        );
+        assert!(pending_path.exists());
+
+        write_json_atomic(&receipt_path, &receipt, false).expect("restore current receipt");
+        fs::remove_file(&spent_path).expect("remove current spent challenge");
+        let missing_spent =
+            recover_pending_adoption(&checkout_dir, &challenge_dir, &identity, &challenge_digest)
+                .expect_err("committed recovery must require the exact spent challenge");
+        assert_eq!(
+            missing_spent
+                .downcast_ref::<DirtyCheckoutError>()
+                .expect("typed missing spent challenge error")
+                .kind(),
+            DirtyCheckoutErrorKind::MalformedState
+        );
+        assert!(pending_path.exists());
+        write_json_atomic(&spent_path, &challenge, false).expect("restore spent challenge");
+        assert_eq!(
+            recover_pending_adoption(&checkout_dir, &challenge_dir, &identity, &challenge_digest)
+                .expect("finish restored committed transition"),
+            PendingRecovery::Committed
+        );
 
         let committed_pending = PendingAdoptionRecord {
             predecessor_receipt_id: Some(predecessor_receipt_id.clone()),
@@ -4714,6 +6431,41 @@ mod tests {
         fs::remove_file(&pending_path).expect("remove unbound predecessor marker");
         fs::remove_file(&predecessor_receipt_path).expect("remove unbound predecessor receipt");
         fs::remove_file(&predecessor_spent_path).expect("remove unbound predecessor challenge");
+
+        let predecessor_receipt_bytes = b"bound predecessor receipt";
+        let predecessor_spent_bytes = b"bound predecessor challenge";
+        let bound_pending = PendingAdoptionRecord {
+            predecessor_receipt_digest: Some(sha256_hex(predecessor_receipt_bytes)),
+            predecessor_spent_challenge_digest: Some(sha256_hex(predecessor_spent_bytes)),
+            ..committed_pending.clone()
+        };
+        for missing_path in [&predecessor_receipt_path, &predecessor_spent_path] {
+            fs::write(&predecessor_receipt_path, predecessor_receipt_bytes)
+                .expect("write bound predecessor receipt");
+            fs::write(&predecessor_spent_path, predecessor_spent_bytes)
+                .expect("write bound predecessor challenge");
+            for path in [&predecessor_receipt_path, &predecessor_spent_path] {
+                fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+                    .expect("make bound predecessor artifact private");
+            }
+            write_json_atomic(&pending_path, &bound_pending, false)
+                .expect("write bound predecessor marker");
+            fs::remove_file(missing_path).expect("simulate partial predecessor cleanup");
+
+            assert_eq!(
+                recover_pending_adoption(
+                    &checkout_dir,
+                    &challenge_dir,
+                    &identity,
+                    &challenge_digest,
+                )
+                .expect("resume partial predecessor cleanup"),
+                PendingRecovery::Committed
+            );
+            assert!(!pending_path.exists());
+            assert!(!predecessor_receipt_path.exists());
+            assert!(!predecessor_spent_path.exists());
+        }
 
         fs::remove_file(checkout_dir.join("lease.json")).expect("remove committed lease");
         write_json_atomic(&pending_path, &committed_pending, false)
@@ -4789,7 +6541,7 @@ mod tests {
                 write_json_atomic(&lease_path, &expected, true)?;
                 Err(anyhow::anyhow!("injected post-install durability failure"))
             }),
-            LeaseInstallOutcome::Ambiguous(_)
+            LeaseInstallOutcome::Installed
         ));
 
         let mut different = expected.clone();
@@ -4988,6 +6740,7 @@ mod tests {
         );
         let challenge: ChallengeRecord =
             serde_json::from_str(challenge_fixture).expect("strict challenge fixture");
+        let challenge_artifact_digest = sha256_hex(challenge_fixture.as_bytes());
 
         let expected_receipt = ReceiptRecord {
             schema: RECEIPT_SCHEMA.to_string(),
@@ -4999,7 +6752,7 @@ mod tests {
             snapshot_id: "d".repeat(64),
             authorization_turn_digest: "3".repeat(64),
             reason_digest: "5".repeat(64),
-            challenge_digest: "6".repeat(64),
+            challenge_digest: challenge_artifact_digest.clone(),
             adopted_at: 1_700_000_100,
         };
         assert_eq!(
@@ -5018,7 +6771,7 @@ mod tests {
             reason_digest: "5".repeat(64),
             adopted_at: 1_700_000_100,
             challenge_issued_at: 1_700_000_000,
-            challenge_digest: "6".repeat(64),
+            challenge_digest: challenge_artifact_digest.clone(),
         };
         assert_eq!(
             serde_json::to_value(&expected_adoption).expect("serialize adoption producer"),
@@ -5086,6 +6839,8 @@ mod tests {
         assert_eq!(challenge.head_oid, snapshot.head_oid);
         assert_eq!(challenge.branch_ref_digest, snapshot.branch_ref_digest);
         assert_eq!(receipt.session_key, challenge.session_key);
+        assert_eq!(receipt.challenge_digest, challenge_artifact_digest);
+        assert_ne!(receipt.challenge_digest, challenge.token_digest);
         assert_eq!(receipt.repository_key, challenge.repository_key);
         assert_eq!(receipt.checkout_key, challenge.checkout_key);
         assert_eq!(receipt.checkout_instance, challenge.checkout_instance);
