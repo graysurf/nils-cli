@@ -8152,6 +8152,17 @@ mod tests {
         }
     }
 
+    fn true_executable() -> &'static str {
+        #[cfg(target_os = "macos")]
+        {
+            "/usr/bin/true"
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            "/bin/true"
+        }
+    }
+
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     struct SupervisorFixture {
         child: Child,
@@ -9317,7 +9328,7 @@ mod tests {
             current: generation_a,
             signals: Vec::new(),
         };
-        let mut child = Command::new("/bin/true")
+        let mut child = Command::new(true_executable())
             .spawn()
             .expect("spawn completed cleanup child");
 
@@ -9969,7 +9980,7 @@ mod tests {
             last_generation: 5,
         };
         let mut control = RecordingControl(Vec::new());
-        let mut child = Command::new("/bin/true")
+        let mut child = Command::new(true_executable())
             .spawn()
             .expect("spawn completed cleanup child");
 
@@ -10036,7 +10047,7 @@ mod tests {
 
         let mut owner = ChurningOwner { next_generation: 1 };
         let mut control = CountingControl { pinned: 0 };
-        let mut child = Command::new("/bin/true")
+        let mut child = Command::new(true_executable())
             .spawn()
             .expect("spawn completed cleanup child");
 
@@ -10101,7 +10112,7 @@ mod tests {
         let mut control = KillFailingControl {
             signals: Vec::new(),
         };
-        let mut child = Command::new("/bin/true")
+        let mut child = Command::new(true_executable())
             .spawn()
             .expect("spawn completed cleanup child");
 
@@ -10210,7 +10221,7 @@ mod tests {
         let mut control = DeadlineCrossingControl {
             signals: Vec::new(),
         };
-        let mut child = Command::new("/bin/true")
+        let mut child = Command::new(true_executable())
             .spawn()
             .expect("spawn completed cleanup child");
 
