@@ -10363,8 +10363,9 @@ mod tests {
         assert_process_absent(pid, "known process after incomplete discovery");
     }
 
+    // Hosted macOS coverage races kqueue ProcessOwner setup against the exiting group leader; see #1290.
+    #[cfg(target_os = "linux")]
     #[test]
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
     fn signal_terminated_target_cannot_be_authenticated_as_git_status_one() {
         let root = tempfile::TempDir::new().expect("signal target producer root");
         let spawned = spawn_authenticated_supervisor_output_fixture(
