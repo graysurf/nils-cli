@@ -172,12 +172,22 @@ is no second state model.
 
 - `GET /healthz`, `GET /sessions`, `GET /sessions/{id}/glance?tail=N` — reads, open on loopback. `GET /sessions`
   additively reports `data.observed_at`, sampled from daemon time after the returned session state is assembled, plus
-  `data.agent_profiles` containing only ready server-owned `{ id, label, agent }`
-  launch-profile summaries. Sessions report
+  `data.agent_profiles` containing only ready server-owned
+  `{ id, label, agent, provider_resume_import_supported }` launch-profile
+  summaries. `data.capabilities.profile_resume_import` advertises support for
+  selecting one of those safe ids during provider import; executable paths,
+  configuration roots, readiness commands, and environment remain private.
+  `data.capabilities.managed_resume_command` remains false until an unqualified
+  CLI resume can revalidate the daemon's active profile registry and readiness
+  contract; consumers must copy the provider session ID during that skew.
+  Sessions report
   `running`, `stopped`, or `unknown` live status plus a boolean `resumable` field and best-effort `repo_name` derived from
   the recorded `cwd`. New interactive records also expose optional
   `runtime_started_at`, `turn_state`, and `startup`; a profiled session also
-  exposes its safe `agent_profile` id. Old records omit them.
+  exposes its safe `agent_profile` id. When a known profile drift would make a
+  stopped session fail resume, the daemon sets `resumable: false` plus one
+  bounded `resume_blocked_reason` code. Old records and daemons omit the
+  additive fields.
   `startup` is the metadata-only `agent-session.startup.v1` projection shared by
   create, list, and glance responses. Its state is `starting`, `ready`, or
   `failed`; its bounded stage is `record`, `tmux`, `runtime`, `app_server`,
@@ -313,14 +323,16 @@ is no second state model.
 - `POST /sessions` normally creates a fresh session from `agent`, optional `cwd`, `title`, `id`, `prompt`, and
   `agent_args`. A fresh create may add an advertised `agent_profile`; the id
   must match the supplied base `agent` and be ready when the request arrives.
-  Profiles are rejected in provider-import mode. The server resolves the
-  profile's executable, provider config root, readiness command, and
+  A profile whose summary reports `provider_resume_import_supported: true` may
+  also be selected with `provider_resume_id`; discovery is then confined to
+  that profile's provider root and never falls back to the daemon process's
+  base root. The server resolves the profile's executable, provider config root, readiness command, and
   auto-resume capability; callers cannot submit or override those fields. A
   fresh Codex create may additionally provide
   `codex_account`; when a prompt is also present, the daemon completes account
   binding before submitting that prompt. `codex_account` is rejected for other
   providers and for provider-import mode. When `provider_resume_id` is present (alias: `resume_id`), the daemon imports an existing Codex or
-  Claude provider conversation instead: it resolves the original cwd from local provider history, persists exact
+  Claude provider conversation instead: it resolves the original cwd from the selected local provider history, persists exact
   `provider_resume` metadata, and starts tmux with the canonical resume command. In resume-id mode, omit `cwd`, `prompt`,
   and `agent_args`; invalid, missing, ambiguous, or unsupported provider ids return structured errors.
   For a fresh serve-managed Codex session, `agent-session` probes bounded
@@ -493,14 +505,19 @@ configuration at startup. A profile is advertised only when its executable is
 an executable regular file, its optional provider config root is a directory,
 and the optional readiness argv exits successfully within two seconds. The
 readiness argv always runs against `agent_bin`; no shell is involved. Profile
-discovery probes are single-flight and briefly cached so open session-list
-reads cannot multiply readiness subprocesses. Profile paths and readiness
-details never enter HTTP responses. The safe id and private
+discovery probes are single-flight; concurrent session-list reads share the
+same in-flight result, while a later read probes fresh. Profile paths and readiness
+details never enter HTTP responses. The safe id and any configured private
 provider root persist with the runtime and its durable resume sidecar, so exact
-binary and transcript discovery survive daemon restarts. A stopped profiled
-session resumes only while the same id, base agent, executable, config root,
-auto-resume capability, and readiness contract remain present in the current
-server registry; removing or changing a profile revokes its persisted launcher. Set
+binary and transcript discovery survive daemon restarts. Both daemon-managed
+and standalone `agent-session resume <managed-id>` launches pin the persisted
+provider root, when present, in the provider-specific environment before
+invoking the durable launcher. The daemon resume endpoint additionally requires
+the same id, base agent, executable, optional config root, auto-resume
+capability, and readiness contract to remain present in the current server
+registry; removing or changing a profile revokes resume through that endpoint.
+Because standalone resume cannot enforce the live registry, the daemon does not
+advertise it as a managed copy action. Set
 `auto_resume_supported` only when the profile has authoritative usage semantics
 for its provider; the default is fail-closed `false`.
 

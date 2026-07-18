@@ -43,6 +43,7 @@ use nils_provider_resume::{
     CODEX_RESUME_SCAN_MAX_DEPTH, ClaudeResumeScanBudget, CodexResumeScanBudget, ResumeIdError,
     ResumeProvider, ResumeResolveError, collect_claude_provider_resume_matches,
     collect_codex_provider_resume_matches, normalize_resume_id, resolve_resume_source,
+    resolve_resume_source_in_config_dir,
 };
 pub(crate) use nils_provider_resume::{
     claude_projects_root, codex_sessions_root, read_claude_session_cwd,
@@ -1086,6 +1087,8 @@ struct SessionView {
     agent: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     agent_profile: Option<String>,
+    #[serde(skip)]
+    profile_resume_context: Result<Option<DurableProfileResumeContext>, CliError>,
     mode: String,
     title: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1098,6 +1101,8 @@ struct SessionView {
     tmux_session: String,
     status: String,
     resumable: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    resume_blocked_reason: Option<String>,
     repo_name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     provider_resume: Option<ProviderResumeView>,
@@ -1133,6 +1138,9 @@ pub(crate) struct ProviderResumeImportArgs {
     pub(crate) id: Option<String>,
     pub(crate) tmux_bin: Option<PathBuf>,
     pub(crate) agent_bin: Option<PathBuf>,
+    pub(crate) agent_profile: Option<String>,
+    pub(crate) provider_config_dir: Option<PathBuf>,
+    pub(crate) profile_auto_resume_supported: Option<bool>,
     pub(crate) agent_args: Vec<String>,
     pub(crate) format: OutputFormat,
 }
@@ -1334,35 +1342,13 @@ fn start_session(
         agent_args: args.agent_args.clone(),
         agent_bin: Some(display_path(&agent_bin)),
     })?;
-    if let Some(agent_profile) = args.initial_agent_profile.as_deref() {
-        let Some(runtime) = created.record.runtime.as_mut() else {
-            cleanup_created_record(context, &created);
-            return Err(CliError::runtime(
-                "agent-profile-runtime-missing",
-                "launch profile metadata requires a session runtime",
-                Some(json!({ "id": created.record.id })),
-            ));
-        };
-        runtime
-            .extra
-            .insert(AGENT_PROFILE_RUNTIME_KEY.to_string(), json!(agent_profile));
-        if let Some(config_dir) = args.initial_provider_config_dir.as_deref() {
-            runtime.extra.insert(
-                AGENT_PROFILE_PROVIDER_CONFIG_DIR_RUNTIME_KEY.to_string(),
-                json!(display_path(config_dir)),
-            );
-        }
-        if let Some(supported) = args.initial_profile_auto_resume_supported {
-            runtime.extra.insert(
-                AGENT_PROFILE_AUTO_RESUME_SUPPORTED_RUNTIME_KEY.to_string(),
-                json!(supported),
-            );
-        }
-        if let Err(err) = write_session_record(context, &created.record) {
-            cleanup_created_record(context, &created);
-            return Err(err);
-        }
-    }
+    persist_initial_profile_context(
+        context,
+        &mut created,
+        args.initial_agent_profile.as_deref(),
+        args.initial_provider_config_dir.as_deref(),
+        args.initial_profile_auto_resume_supported,
+    )?;
     if let Err(err) = codex_account::set_initial_binding(
         &mut created.record,
         args.initial_codex_account.as_deref(),
@@ -1607,7 +1593,12 @@ pub(crate) fn start_provider_resume_session(
     validate_provider_resume_import_agent_args(args.agent, &args.agent_args)?;
     validate_agent_args(args.agent, &args.agent_args)?;
     let provider_resume_id = normalize_provider_resume_id(&args.provider_resume_id)?;
-    let source = resolve_provider_resume_source(args.agent, &provider_resume_id)?;
+    let source = resolve_provider_resume_source(
+        args.agent,
+        &provider_resume_id,
+        args.provider_config_dir.as_deref(),
+        args.agent_profile.as_deref(),
+    )?;
     let cwd = resolve_cwd(Some(&source.cwd))?;
     let cwd_string = display_path(&cwd);
     let resume_args = canonical_provider_resume_args(args.agent, &cwd_string, &provider_resume_id)
@@ -1645,6 +1636,14 @@ pub(crate) fn start_provider_resume_session(
         agent_args: args.agent_args,
         agent_bin: Some(display_path(&agent_bin)),
     })?;
+
+    persist_initial_profile_context(
+        context,
+        &mut created,
+        args.agent_profile.as_deref(),
+        args.provider_config_dir.as_deref(),
+        args.profile_auto_resume_supported,
+    )?;
 
     advance_owned_startup_stage(context, &mut created.record, "tmux")?;
 
@@ -1694,6 +1693,46 @@ pub(crate) fn start_provider_resume_session(
         format: args.format,
         result,
     })
+}
+
+fn persist_initial_profile_context(
+    context: &CliContext,
+    created: &mut CreatedRecord,
+    agent_profile: Option<&str>,
+    provider_config_dir: Option<&Path>,
+    profile_auto_resume_supported: Option<bool>,
+) -> Result<(), CliError> {
+    let Some(agent_profile) = agent_profile else {
+        return Ok(());
+    };
+    let Some(runtime) = created.record.runtime.as_mut() else {
+        cleanup_created_record(context, created);
+        return Err(CliError::runtime(
+            "agent-profile-runtime-missing",
+            "launch profile metadata requires a session runtime",
+            Some(json!({ "id": created.record.id })),
+        ));
+    };
+    runtime
+        .extra
+        .insert(AGENT_PROFILE_RUNTIME_KEY.to_string(), json!(agent_profile));
+    if let Some(config_dir) = provider_config_dir {
+        runtime.extra.insert(
+            AGENT_PROFILE_PROVIDER_CONFIG_DIR_RUNTIME_KEY.to_string(),
+            json!(display_path(config_dir)),
+        );
+    }
+    if let Some(supported) = profile_auto_resume_supported {
+        runtime.extra.insert(
+            AGENT_PROFILE_AUTO_RESUME_SUPPORTED_RUNTIME_KEY.to_string(),
+            json!(supported),
+        );
+    }
+    if let Err(err) = write_session_record(context, &created.record) {
+        cleanup_created_record(context, created);
+        return Err(err);
+    }
+    Ok(())
 }
 
 struct CreatedRecord {
@@ -1939,6 +1978,8 @@ fn normalize_provider_resume_id(session_id: &str) -> Result<String, CliError> {
 fn resolve_provider_resume_source(
     agent: AgentKind,
     session_id: &str,
+    provider_config_dir: Option<&Path>,
+    agent_profile: Option<&str>,
 ) -> Result<ProviderResumeSource, CliError> {
     let provider = match agent {
         AgentKind::Codex => ResumeProvider::Codex,
@@ -1953,55 +1994,92 @@ fn resolve_provider_resume_source(
     };
     // The shared resolver owns the bounded history scan and returns a structured
     // outcome; the user-facing error text and exit-code mapping stay here.
-    match resolve_resume_source(provider, session_id) {
+    let resolved = match provider_config_dir {
+        Some(config_dir) => resolve_resume_source_in_config_dir(provider, config_dir, session_id),
+        None => resolve_resume_source(provider, session_id),
+    };
+    match resolved {
         Ok(resolved) => Ok(ProviderResumeSource {
             cwd: resolved.cwd,
             capture_method: resolved.capture_method.to_string(),
         }),
-        Err(ResumeResolveError::NotFound) => Err(provider_resume_not_found(agent, session_id)),
-        Err(ResumeResolveError::Ambiguous { cwd_count }) => {
-            Err(provider_resume_ambiguous(agent, session_id, cwd_count))
+        Err(ResumeResolveError::NotFound) => {
+            Err(provider_resume_not_found(agent, session_id, agent_profile))
         }
-        Err(ResumeResolveError::Truncated) => {
-            Err(provider_resume_scan_truncated(agent, session_id))
-        }
+        Err(ResumeResolveError::Ambiguous { cwd_count }) => Err(provider_resume_ambiguous(
+            agent,
+            session_id,
+            cwd_count,
+            agent_profile,
+        )),
+        Err(ResumeResolveError::Truncated) => Err(provider_resume_scan_truncated(
+            agent,
+            session_id,
+            agent_profile,
+        )),
     }
 }
 
-fn provider_resume_not_found(agent: AgentKind, session_id: &str) -> CliError {
+fn provider_resume_details(
+    agent: AgentKind,
+    session_id: &str,
+    agent_profile: Option<&str>,
+) -> Value {
+    let mut details = json!({
+        "agent": agent.as_str(),
+        "provider_resume_id": session_id,
+    });
+    if let Some(agent_profile) = agent_profile {
+        details["agent_profile"] = json!(agent_profile);
+    }
+    details
+}
+
+fn provider_resume_not_found(
+    agent: AgentKind,
+    session_id: &str,
+    agent_profile: Option<&str>,
+) -> CliError {
     CliError::data(
         "provider-resume-not-found",
         format!(
             "no {} provider history contains resume id: {session_id}",
             agent.as_str()
         ),
-        Some(json!({ "agent": agent.as_str(), "provider_resume_id": session_id })),
+        Some(provider_resume_details(agent, session_id, agent_profile)),
     )
 }
 
-fn provider_resume_ambiguous(agent: AgentKind, session_id: &str, cwd_count: usize) -> CliError {
+fn provider_resume_ambiguous(
+    agent: AgentKind,
+    session_id: &str,
+    cwd_count: usize,
+    agent_profile: Option<&str>,
+) -> CliError {
+    let mut details = provider_resume_details(agent, session_id, agent_profile);
+    details["cwd_count"] = json!(cwd_count);
     CliError::data(
         "provider-resume-ambiguous",
         format!(
             "{} provider history has multiple cwd matches for resume id: {session_id}",
             agent.as_str()
         ),
-        Some(json!({
-            "agent": agent.as_str(),
-            "provider_resume_id": session_id,
-            "cwd_count": cwd_count,
-        })),
+        Some(details),
     )
 }
 
-fn provider_resume_scan_truncated(agent: AgentKind, session_id: &str) -> CliError {
+fn provider_resume_scan_truncated(
+    agent: AgentKind,
+    session_id: &str,
+    agent_profile: Option<&str>,
+) -> CliError {
     CliError::runtime(
         "provider-resume-scan-truncated",
         format!(
             "{} provider history scan was truncated before resume id could be resolved: {session_id}",
             agent.as_str()
         ),
-        Some(json!({ "agent": agent.as_str(), "provider_resume_id": session_id })),
+        Some(provider_resume_details(agent, session_id, agent_profile)),
     )
 }
 
@@ -2427,7 +2505,7 @@ fn capture_codex_resume(
     record: &SessionRecord,
     launch_started_at: SystemTime,
 ) -> Option<ProviderResume> {
-    let root = codex_sessions_root()?;
+    let root = codex_resume_history_root(record)?;
     let timeout = Duration::from_millis(env_u64(
         "AGENT_SESSION_CODEX_CAPTURE_TIMEOUT_MS",
         CODEX_RESUME_CAPTURE_TIMEOUT_MS,
@@ -2502,7 +2580,7 @@ fn capture_codex_resume(
 }
 
 fn capture_codex_resume_from_history(record: &SessionRecord) -> Option<ProviderResume> {
-    let root = codex_sessions_root()?;
+    let root = codex_resume_history_root(record)?;
     let earliest = record
         .created_at
         .parse::<Timestamp>()
@@ -2533,6 +2611,13 @@ fn capture_codex_resume_from_history(record: &SessionRecord) -> Option<ProviderR
         return Some(codex_provider_resume(record, candidate_id));
     }
     None
+}
+
+fn codex_resume_history_root(record: &SessionRecord) -> Option<PathBuf> {
+    if session_agent_profile(record).is_some() {
+        return session_provider_config_dir(record).map(|root| root.join("sessions"));
+    }
+    codex_sessions_root()
 }
 
 fn codex_candidate_satisfied_ambiguity_window(
@@ -3418,6 +3503,7 @@ fn resume_session_locked(
         }
         _ => {}
     }
+    let durable_profile_context = validate_durable_profile_resume_context(&record)?;
     StartupArtifactBackup::ensure_not_interrupted(context, &record)?;
     if record.provider_resume.is_none()
         && AgentKind::from_name(&record.agent) == Some(AgentKind::Codex)
@@ -3493,10 +3579,9 @@ fn resume_session_locked(
             || codex_account::binding_is_present(&previous_record));
     let previous_activity = activity::capture_snapshot(context, &record.id)?;
     let mut startup_artifacts = StartupArtifactBackup::stage(context, &record)?;
-    let agent_bin = record
-        .agent_bin
-        .as_deref()
-        .map(PathBuf::from)
+    let agent_bin = durable_profile_context
+        .map(|profile| profile.agent_bin)
+        .or_else(|| record.agent_bin.as_deref().map(PathBuf::from))
         .unwrap_or_else(|| resolve_agent_bin(agent, None));
     let now = Zoned::now();
     let next_generation = record
@@ -3676,6 +3761,21 @@ fn add_runtime_tmux_environment(
         ),
     ] {
         command.arg("-e").arg(value);
+    }
+    if let (Some(agent), Some(config_dir)) = (
+        AgentKind::from_name(&record.agent),
+        session_provider_config_dir(record),
+    ) {
+        let env_key = match agent {
+            AgentKind::Codex => Some("CODEX_HOME"),
+            AgentKind::Claude => Some("CLAUDE_CONFIG_DIR"),
+            AgentKind::Hermes => None,
+        };
+        if let Some(env_key) = env_key {
+            let mut assignment = OsString::from(format!("{env_key}="));
+            assignment.push(config_dir);
+            command.arg("-e").arg(assignment);
+        }
     }
     if let Some(path) = env::var_os("PATH") {
         // A long-lived tmux server keeps the environment from when that server
@@ -4920,10 +5020,16 @@ fn session_view_from_parts(
     status: String,
     last_terminal_activity_at: Option<String>,
 ) -> SessionView {
+    let profile_resume_context = if status == "stopped" && is_resumable(record) {
+        durable_profile_resume_context(record)
+    } else {
+        Ok(None)
+    };
     SessionView {
         id: record.id.clone(),
         agent: record.agent.clone(),
         agent_profile: session_agent_profile(record).map(str::to_string),
+        profile_resume_context,
         mode: record.mode.clone(),
         title: record.title.clone(),
         title_state: effective_session_title_state(record),
@@ -4938,6 +5044,7 @@ fn session_view_from_parts(
         tmux_session: record.tmux_session.clone(),
         status,
         resumable: is_resumable(record),
+        resume_blocked_reason: None,
         repo_name: repo_name_from_cwd(&record.cwd),
         provider_resume: record
             .provider_resume
@@ -4998,6 +5105,89 @@ pub(crate) fn session_profile_auto_resume_supported(record: &SessionRecord) -> b
     } else {
         configured.unwrap_or(true)
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DurableProfileResumeContext {
+    profile_id: String,
+    agent: AgentKind,
+    agent_bin: PathBuf,
+    provider_config_dir: Option<PathBuf>,
+    auto_resume_supported: bool,
+}
+
+fn validate_durable_profile_resume_context(
+    record: &SessionRecord,
+) -> Result<Option<DurableProfileResumeContext>, CliError> {
+    let Some(context) = durable_profile_resume_context(record)? else {
+        return Ok(None);
+    };
+    let launcher_ready = fs::metadata(&context.agent_bin)
+        .is_ok_and(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0);
+    let provider_root_ready = context
+        .provider_config_dir
+        .as_ref()
+        .is_none_or(|root| fs::metadata(root).is_ok_and(|metadata| metadata.is_dir()));
+    if !launcher_ready || !provider_root_ready {
+        return Err(profile_unavailable(&context.profile_id));
+    }
+    Ok(Some(context))
+}
+
+fn durable_profile_resume_context(
+    record: &SessionRecord,
+) -> Result<Option<DurableProfileResumeContext>, CliError> {
+    let Some(profile_id) = session_agent_profile(record) else {
+        return Ok(None);
+    };
+    let Some(agent) = AgentKind::from_name(&record.agent) else {
+        return Err(profile_metadata_unavailable(profile_id));
+    };
+    if agent == AgentKind::Hermes {
+        return Err(profile_metadata_unavailable(profile_id));
+    }
+    let Some(agent_bin) = record
+        .agent_bin
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .map(PathBuf::from)
+    else {
+        return Err(profile_metadata_unavailable(profile_id));
+    };
+    let provider_config_dir = session_provider_config_dir(record);
+    let Some(auto_resume_supported) = session_profile_auto_resume_setting(record) else {
+        return Err(profile_metadata_unavailable(profile_id));
+    };
+    if !agent_bin.is_absolute()
+        || provider_config_dir
+            .as_ref()
+            .is_some_and(|path| !path.is_absolute())
+    {
+        return Err(profile_metadata_unavailable(profile_id));
+    }
+    Ok(Some(DurableProfileResumeContext {
+        profile_id: profile_id.to_string(),
+        agent,
+        agent_bin,
+        provider_config_dir,
+        auto_resume_supported,
+    }))
+}
+
+fn profile_metadata_unavailable(profile_id: &str) -> CliError {
+    CliError::runtime(
+        "agent-profile-metadata-unavailable",
+        "session launch profile metadata does not contain an enforceable provider context",
+        Some(json!({ "agent_profile": profile_id })),
+    )
+}
+
+fn profile_unavailable(profile_id: &str) -> CliError {
+    CliError::runtime(
+        "agent-profile-unavailable",
+        "agent launch profile is unavailable",
+        Some(json!({ "agent_profile": profile_id })),
+    )
 }
 
 fn last_terminal_activity_at(
@@ -11168,6 +11358,51 @@ fi
         let id = create_test_record_id(&context, AgentKind::Codex, None, Some("custom-id"));
 
         assert_eq!(id, "custom-id");
+    }
+
+    #[test]
+    fn profiled_codex_capture_uses_only_its_persisted_history_root() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let context = test_context(tmp.path());
+        let profile_root = tmp.path().join("profile-codex-home");
+        let mut record = create_record(RecordRequest {
+            context: &context,
+            agent: AgentKind::Codex,
+            mode: "interactive",
+            title: None,
+            title_state: None,
+            explicit_id: Some("profiled-codex-root"),
+            cwd: Path::new("/repo"),
+            prompt: None,
+            log_file_name: None,
+            provider_resume: None,
+            agent_args: Vec::new(),
+            agent_bin: Some("/opt/profile-codex".to_string()),
+        })
+        .unwrap()
+        .record;
+        let runtime = record.runtime.as_mut().unwrap();
+        runtime.extra.insert(
+            super::AGENT_PROFILE_RUNTIME_KEY.to_string(),
+            serde_json::json!("codex-profile"),
+        );
+        runtime.extra.insert(
+            super::AGENT_PROFILE_PROVIDER_CONFIG_DIR_RUNTIME_KEY.to_string(),
+            serde_json::json!(profile_root),
+        );
+
+        assert_eq!(
+            super::codex_resume_history_root(&record),
+            Some(profile_root.join("sessions"))
+        );
+
+        record
+            .runtime
+            .as_mut()
+            .unwrap()
+            .extra
+            .remove(super::AGENT_PROFILE_PROVIDER_CONFIG_DIR_RUNTIME_KEY);
+        assert_eq!(super::codex_resume_history_root(&record), None);
     }
 
     #[test]

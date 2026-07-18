@@ -7684,6 +7684,79 @@ fn list_backfills_codex_resume_metadata_from_late_session_meta() {
 }
 
 #[test]
+fn list_backfills_profiled_codex_only_from_its_selected_root() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let state_dir = tmp.path().join("state");
+    let base_codex_home = tmp.path().join("base-codex-home");
+    let profile_codex_home = tmp.path().join("profile-codex-home");
+    let cwd = tmp.path().join("repo");
+    fs::create_dir_all(&cwd).expect("repo dir");
+    fs::create_dir_all(&profile_codex_home).expect("profile codex home");
+    let (tmux_bin, tmux_log) = fake_tmux(tmp.path());
+    let launcher = fake_agent(tmp.path(), "profile-codex-bin");
+    let session = write_session_record_with_cwd(
+        &state_dir,
+        "late-profile-codex",
+        "codex",
+        "hs-codex-late-profile",
+        &cwd,
+    );
+    let record_path = session.join("session.json");
+    let mut record: Value = serde_json::from_slice(&fs::read(&record_path).unwrap()).unwrap();
+    record["agent_bin"] = json!(launcher);
+    record["runtime"] = json!({
+        "kind": "tmux",
+        "tmux_session": "hs-codex-late-profile",
+        "generation": 2,
+        "started_at": "2000-01-01T00:00:00Z",
+        "launch_id": "late-profile-runtime",
+        "agent_profile": "codex-profile",
+        "agent_profile_provider_config_dir": profile_codex_home,
+        "agent_profile_auto_resume_supported": false,
+    });
+    fs::write(&record_path, serde_json::to_vec_pretty(&record).unwrap()).unwrap();
+    write_codex_session_meta(
+        &base_codex_home.join("sessions/2026/07/05/base-decoy.jsonl"),
+        "base-decoy-id",
+        &cwd,
+        "2000-01-01T00:00:20Z",
+    );
+    write_codex_session_meta(
+        &profile_codex_home.join("sessions/2026/07/05/profile.jsonl"),
+        "profile-session-id",
+        &cwd,
+        "2000-01-01T00:00:30Z",
+    );
+
+    let state_arg = state_dir.to_string_lossy().to_string();
+    let base_codex_home_arg = base_codex_home.to_string_lossy().to_string();
+    let tmux_arg = tmux_bin.to_string_lossy().to_string();
+    let tmux_log_arg = tmux_log.to_string_lossy().to_string();
+    let output = run(
+        tmp.path(),
+        &["--state-dir", &state_arg, "list", "--format", "json"],
+        &[
+            ("CODEX_HOME", &base_codex_home_arg),
+            ("AGENT_SESSION_TMUX_BIN", &tmux_arg),
+            ("AGENT_SESSION_FAKE_TMUX_LOG", &tmux_log_arg),
+            ("AGENT_SESSION_FAKE_TMUX_HAS_SESSION", "0"),
+        ],
+    );
+
+    assert_eq!(output.code, 0, "stderr={}", output.stderr_text());
+    let value = output.stdout_json();
+    let sessions = data(&value).as_array().expect("list data");
+    assert_eq!(
+        sessions[0]["provider_resume"]["session_id"],
+        "profile-session-id"
+    );
+    assert_ne!(
+        sessions[0]["provider_resume"]["session_id"],
+        "base-decoy-id"
+    );
+}
+
+#[test]
 fn list_does_not_backfill_codex_resume_metadata_from_later_same_cwd_session() {
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let state_dir = tmp.path().join("state");
@@ -7950,6 +8023,218 @@ fn resume_recreates_tmux_runtime_from_exact_provider_identity() {
     let listed = &data(&list_value)[0];
     assert_eq!(listed["status"], "stopped");
     assert_eq!(listed["startup"]["state"], "ready");
+}
+
+#[test]
+fn standalone_resume_pins_profile_provider_config_root() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let state_dir = tmp.path().join("state");
+    let cwd = tmp.path().join("repo");
+    let profile_config = tmp.path().join("profile-claude");
+    fs::create_dir_all(&cwd).expect("repo dir");
+    fs::create_dir_all(&profile_config).expect("profile config dir");
+    let (tmux_bin, tmux_log) = fake_tmux(tmp.path());
+    let launcher = fake_agent(tmp.path(), "profile-claude-bin");
+    let session = write_resumable_session_record_with_agent_bin(
+        &state_dir,
+        "profile-resume",
+        "claude",
+        "hs-claude-profile-resume",
+        &cwd,
+        &["--resume", "resume-session-id"],
+        Some(&launcher),
+    );
+    let record_path = session.join("session.json");
+    let mut record: Value = serde_json::from_slice(&fs::read(&record_path).unwrap()).unwrap();
+    record["runtime"]["agent_profile"] = json!("profile-claude");
+    record["runtime"]["agent_profile_provider_config_dir"] = json!(profile_config);
+    record["runtime"]["agent_profile_auto_resume_supported"] = json!(false);
+    fs::write(&record_path, serde_json::to_vec_pretty(&record).unwrap()).unwrap();
+
+    let state_arg = state_dir.to_string_lossy().to_string();
+    let tmux_arg = tmux_bin.to_string_lossy().to_string();
+    let tmux_log_arg = tmux_log.to_string_lossy().to_string();
+    let output = run(
+        tmp.path(),
+        &[
+            "--state-dir",
+            &state_arg,
+            "resume",
+            "profile-resume",
+            "--tmux-bin",
+            &tmux_arg,
+            "--format",
+            "json",
+        ],
+        &[
+            ("AGENT_SESSION_FAKE_TMUX_LOG", &tmux_log_arg),
+            ("AGENT_SESSION_FAKE_TMUX_HAS_SESSION", "0"),
+        ],
+    );
+
+    assert_eq!(output.code, 0, "stderr={}", output.stderr_text());
+    let calls = tmux_calls(&tmux_log);
+    let new_session = calls
+        .iter()
+        .find(|call| call.first().is_some_and(|arg| arg == "new-session"))
+        .expect("new-session call");
+    assert!(
+        new_session.windows(2).any(|args| args
+            == [
+                "-e",
+                &format!("CLAUDE_CONFIG_DIR={}", profile_config.display())
+            ]),
+        "standalone resume must pin the durable profile root: {new_session:?}"
+    );
+    assert!(
+        new_session
+            .iter()
+            .any(|arg| arg == launcher.to_string_lossy().as_ref()),
+        "standalone resume must use the durable launcher: {new_session:?}"
+    );
+}
+
+#[test]
+fn standalone_resume_supports_wrapper_owned_profile_root() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let state_dir = tmp.path().join("state");
+    let cwd = tmp.path().join("repo");
+    fs::create_dir_all(&cwd).expect("repo dir");
+    let (tmux_bin, tmux_log) = fake_tmux(tmp.path());
+    let launcher = fake_agent(tmp.path(), "rootless-profile-bin");
+    let session = write_resumable_session_record_with_agent_bin(
+        &state_dir,
+        "rootless-profile-resume",
+        "claude",
+        "hs-claude-rootless-profile-resume",
+        &cwd,
+        &["--resume", "resume-session-id"],
+        Some(&launcher),
+    );
+    let record_path = session.join("session.json");
+    let mut record: Value = serde_json::from_slice(&fs::read(&record_path).unwrap()).unwrap();
+    record["runtime"]["agent_profile"] = json!("rootless-profile");
+    record["runtime"]["agent_profile_auto_resume_supported"] = json!(false);
+    fs::write(&record_path, serde_json::to_vec_pretty(&record).unwrap()).unwrap();
+
+    let state_arg = state_dir.to_string_lossy().to_string();
+    let tmux_arg = tmux_bin.to_string_lossy().to_string();
+    let tmux_log_arg = tmux_log.to_string_lossy().to_string();
+    let output = run(
+        tmp.path(),
+        &[
+            "--state-dir",
+            &state_arg,
+            "resume",
+            "rootless-profile-resume",
+            "--tmux-bin",
+            &tmux_arg,
+            "--format",
+            "json",
+        ],
+        &[
+            ("AGENT_SESSION_FAKE_TMUX_LOG", &tmux_log_arg),
+            ("AGENT_SESSION_FAKE_TMUX_HAS_SESSION", "0"),
+        ],
+    );
+
+    assert_eq!(output.code, 0, "stderr={}", output.stderr_text());
+    let calls = tmux_calls(&tmux_log);
+    let new_session = calls
+        .iter()
+        .find(|call| call.first().is_some_and(|arg| arg == "new-session"))
+        .expect("new-session call");
+    assert!(
+        new_session
+            .iter()
+            .any(|arg| arg == launcher.to_string_lossy().as_ref())
+    );
+    assert!(
+        new_session
+            .iter()
+            .all(|arg| !arg.starts_with("CLAUDE_CONFIG_DIR="))
+    );
+}
+
+#[test]
+fn standalone_profile_resume_fails_closed_without_complete_durable_context() {
+    for (case, persist_launcher, provider_root, expected_code) in [
+        (
+            "missing-launcher",
+            false,
+            Some("ready"),
+            "agent-profile-metadata-unavailable",
+        ),
+        (
+            "removed-provider-root",
+            true,
+            Some("removed"),
+            "agent-profile-unavailable",
+        ),
+    ] {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let state_dir = tmp.path().join("state");
+        let cwd = tmp.path().join("repo");
+        fs::create_dir_all(&cwd).expect("repo dir");
+        let (tmux_bin, tmux_log) = fake_tmux(tmp.path());
+        let launcher = fake_agent(tmp.path(), "profile-claude-bin");
+        let session = write_resumable_session_record_with_agent_bin(
+            &state_dir,
+            &format!("profile-resume-{case}"),
+            "claude",
+            &format!("hs-claude-profile-resume-{case}"),
+            &cwd,
+            &["--resume", "resume-session-id"],
+            persist_launcher.then_some(launcher.as_path()),
+        );
+        let record_path = session.join("session.json");
+        let mut record: Value = serde_json::from_slice(&fs::read(&record_path).unwrap()).unwrap();
+        record["runtime"]["agent_profile"] = json!("profile-claude");
+        if let Some(provider_root) = provider_root {
+            let profile_config = tmp.path().join(format!("profile-claude-{provider_root}"));
+            if provider_root == "ready" {
+                fs::create_dir_all(&profile_config).expect("profile config dir");
+            }
+            record["runtime"]["agent_profile_provider_config_dir"] = json!(profile_config);
+        }
+        record["runtime"]["agent_profile_auto_resume_supported"] = json!(false);
+        fs::write(&record_path, serde_json::to_vec_pretty(&record).unwrap()).unwrap();
+
+        let state_arg = state_dir.to_string_lossy().to_string();
+        let tmux_arg = tmux_bin.to_string_lossy().to_string();
+        let tmux_log_arg = tmux_log.to_string_lossy().to_string();
+        let output = run(
+            tmp.path(),
+            &[
+                "--state-dir",
+                &state_arg,
+                "resume",
+                &format!("profile-resume-{case}"),
+                "--tmux-bin",
+                &tmux_arg,
+                "--format",
+                "json",
+            ],
+            &[
+                ("AGENT_SESSION_FAKE_TMUX_LOG", &tmux_log_arg),
+                ("AGENT_SESSION_FAKE_TMUX_HAS_SESSION", "0"),
+            ],
+        );
+
+        assert_ne!(output.code, 0, "{case} unexpectedly resumed");
+        assert_eq!(
+            output.stdout_json()["error"]["code"],
+            expected_code,
+            "{case}: {}",
+            output.stderr_text()
+        );
+        assert!(
+            tmux_calls(&tmux_log)
+                .iter()
+                .all(|call| call.first().is_none_or(|arg| arg != "new-session")),
+            "{case} must fail before creating a tmux runtime"
+        );
+    }
 }
 
 #[test]

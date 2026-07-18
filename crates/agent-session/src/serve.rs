@@ -63,11 +63,10 @@ use crate::{
     SessionTitleState, SessionTitleStateInput, SessionView, StartFailureDisposition,
     WorkdirSearchOptions, canonicalize_structured_title_pair, cleanup_session_delete_tombstones,
     delete_session, glance_session, list_sessions, load_session_record, non_empty_env,
-    repo_remote_url_from_cwd, resolve_tmux_bin, resume_session_by_id, search_workdirs,
-    send_auto_resume_input, send_input_serialized, session_agent_profile, session_clipboard_buffer,
-    session_dir, session_profile_auto_resume_setting, session_provider_config_dir, session_status,
-    short_hostname, start_provider_resume_session, start_session, update_session_title_if_revision,
-    write_session_attachment,
+    profile_unavailable, repo_remote_url_from_cwd, resolve_tmux_bin, resume_session_by_id,
+    search_workdirs, send_auto_resume_input, send_input_serialized, session_clipboard_buffer,
+    session_dir, session_status, short_hostname, start_provider_resume_session, start_session,
+    update_session_title_if_revision, write_session_attachment,
 };
 
 const ATTACH_LIVE_FIFO_NAME: &str = "attach-live.fifo";
@@ -102,7 +101,6 @@ const PROVIDER_PROMPT_DISCOVERY_MAX_CONCURRENT_SCANS: usize = 4;
 const MAX_CONCURRENT_AUTO_RESUME_TICKS: usize = 4;
 const MAX_AGENT_LAUNCH_PROFILES: usize = 16;
 const AGENT_LAUNCH_PROFILE_READINESS_TIMEOUT: Duration = Duration::from_secs(2);
-const AGENT_LAUNCH_PROFILE_READINESS_CACHE_TTL: Duration = Duration::from_secs(1);
 const ATTACH_SCHEMA_VERSION: &str = "agent-session.attach.v1";
 const ATTACH_EVENT_SCHEMA_VERSION: &str = "agent-session.attach.event.v1";
 const ACTIVITY_STREAM_EVENT_SCHEMA_VERSION: &str = "agent-session.activity-stream.event.v1";
@@ -180,14 +178,14 @@ fn default_session_collector() -> SessionCollector {
 #[derive(Clone, Debug)]
 struct AgentLaunchProfiles {
     entries: Vec<AgentLaunchProfile>,
-    readiness_cache: Arc<StdMutex<AgentLaunchProfileReadinessCache>>,
+    readiness_probe: Arc<(StdMutex<AgentLaunchProfileReadiness>, std::sync::Condvar)>,
 }
 
 #[derive(Debug, Default)]
-struct AgentLaunchProfileReadinessCache {
-    observed_at: Option<Instant>,
-    summaries: Vec<AgentLaunchProfileSummary>,
+struct AgentLaunchProfileReadiness {
     refreshing: bool,
+    generation: u64,
+    summaries: Vec<AgentLaunchProfileSummary>,
 }
 
 #[derive(Clone, Debug)]
@@ -220,6 +218,7 @@ struct AgentLaunchProfileSummary {
     id: String,
     label: String,
     agent: String,
+    provider_resume_import_supported: bool,
 }
 
 impl AgentLaunchProfiles {
@@ -300,7 +299,10 @@ impl AgentLaunchProfiles {
         }
         Ok(Self {
             entries,
-            readiness_cache: Arc::new(StdMutex::new(AgentLaunchProfileReadinessCache::default())),
+            readiness_probe: Arc::new((
+                StdMutex::new(AgentLaunchProfileReadiness::default()),
+                std::sync::Condvar::new(),
+            )),
         })
     }
 
@@ -309,30 +311,30 @@ impl AgentLaunchProfiles {
     }
 
     fn ready_summaries(&self) -> Vec<AgentLaunchProfileSummary> {
-        let now = Instant::now();
-        {
-            let mut cache = self
-                .readiness_cache
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if cache.observed_at.is_some_and(|observed_at| {
-                now.saturating_duration_since(observed_at)
-                    < AGENT_LAUNCH_PROFILE_READINESS_CACHE_TTL
-            }) || cache.refreshing
-            {
-                return cache.summaries.clone();
-            }
-            cache.refreshing = true;
-        }
-
-        let summaries = self.probe_ready_summaries();
-        let mut cache = self
-            .readiness_cache
+        let (readiness, completed) = &*self.readiness_probe;
+        let mut state = readiness
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        cache.observed_at = Some(Instant::now());
-        cache.summaries.clone_from(&summaries);
-        cache.refreshing = false;
+        if state.refreshing {
+            let generation = state.generation;
+            while state.refreshing && state.generation == generation {
+                state = completed
+                    .wait(state)
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+            }
+            return state.summaries.clone();
+        }
+        state.refreshing = true;
+        drop(state);
+
+        let summaries = self.probe_ready_summaries();
+        let mut state = readiness
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.summaries.clone_from(&summaries);
+        state.generation = state.generation.wrapping_add(1);
+        state.refreshing = false;
+        completed.notify_all();
         summaries
     }
 
@@ -349,7 +351,10 @@ impl Default for AgentLaunchProfiles {
     fn default() -> Self {
         Self {
             entries: Vec::new(),
-            readiness_cache: Arc::new(StdMutex::new(AgentLaunchProfileReadinessCache::default())),
+            readiness_probe: Arc::new((
+                StdMutex::new(AgentLaunchProfileReadiness::default()),
+                std::sync::Condvar::new(),
+            )),
         }
     }
 }
@@ -360,6 +365,8 @@ impl AgentLaunchProfile {
             id: self.id.clone(),
             label: self.label.clone(),
             agent: self.agent.as_str().to_string(),
+            provider_resume_import_supported: self.provider_config_dir.is_some()
+                && matches!(self.agent, AgentKind::Codex | AgentKind::Claude),
         }
     }
 
@@ -2474,7 +2481,50 @@ async fn list_handler(State(state): State<Arc<ServeState>>) -> Response {
     let collect = state.session_collector.clone();
     let launch_profiles = state.launch_profiles.clone();
     match tokio::task::spawn_blocking(move || {
-        collect(&context, &tmux).map(|sessions| (sessions, launch_profiles.ready_summaries()))
+        collect(&context, &tmux).map(|mut sessions| {
+            // List projection must observe removals and readiness failures on
+            // this request. Probe once per configured profile, then reuse that
+            // request-local snapshot for every stopped session below.
+            let agent_profiles = launch_profiles.ready_summaries();
+            for session in &mut sessions {
+                if !session.resumable || session.status != "stopped" {
+                    continue;
+                }
+                let blocked = if session
+                    .agent_profile
+                    .as_deref()
+                    .is_some_and(|profile_id| launch_profiles.get(profile_id).is_none())
+                {
+                    session
+                        .agent_profile
+                        .as_deref()
+                        .map(unavailable_launch_profile)
+                } else {
+                    match &session.profile_resume_context {
+                        Ok(Some(durable)) => {
+                            match validate_durable_launch_profile_context(durable, &launch_profiles)
+                            {
+                                Ok(Some(profile))
+                                    if !agent_profiles
+                                        .iter()
+                                        .any(|ready| ready.id == profile.id) =>
+                                {
+                                    Some(unavailable_launch_profile(&profile.id))
+                                }
+                                Ok(_) => None,
+                                Err(err) => Some(err),
+                            }
+                        }
+                        Ok(None) => None,
+                        Err(err) => Some(err.clone()),
+                    }
+                };
+                let Some(err) = blocked else { continue };
+                session.resumable = false;
+                session.resume_blocked_reason = Some(err.code().to_string());
+            }
+            (sessions, agent_profiles)
+        })
     })
     .await
     {
@@ -2483,6 +2533,11 @@ async fn list_handler(State(state): State<Arc<ServeState>>) -> Response {
             "observed_at": activity_observed_at(),
             "sessions": sessions,
             "agent_profiles": agent_profiles,
+            "capabilities": {
+                "profile_resume_import": true,
+                "managed_resume_command": false,
+                "resume_blocked_reason": true,
+            },
         })),
         Ok(Err(err)) => envelope_err(err),
         Err(_) => join_err(),
@@ -2652,13 +2707,6 @@ async fn create_handler(
         }
         None => None,
     };
-    if launch_profile.is_some() && body.provider_resume_id.is_some() {
-        return envelope_err(CliError::usage(
-            "agent-profile-provider-resume-conflict",
-            "agent profiles are supported only for new sessions",
-            None,
-        ));
-    }
     let context = state.context.clone();
     let title_supplied = body.title.is_supplied();
     let title = body.title.into_value();
@@ -2701,6 +2749,18 @@ async fn create_handler(
                 None,
             ));
         }
+        if launch_profile
+            .as_ref()
+            .is_some_and(|profile| profile.provider_config_dir.is_none())
+        {
+            return envelope_err(CliError::runtime(
+                "agent-profile-provider-root-unavailable",
+                "the requested agent profile does not declare a provider configuration root for resume import",
+                launch_profile
+                    .as_ref()
+                    .map(|profile| json!({ "agent_profile": profile.id })),
+            ));
+        }
         let args = ProviderResumeImportArgs {
             agent,
             provider_resume_id,
@@ -2708,7 +2768,16 @@ async fn create_handler(
             title_state,
             id: body.id,
             tmux_bin: Some(state.tmux_bin.clone()),
-            agent_bin: None,
+            agent_bin: launch_profile
+                .as_ref()
+                .map(|profile| profile.agent_bin.clone()),
+            agent_profile: launch_profile.as_ref().map(|profile| profile.id.clone()),
+            provider_config_dir: launch_profile
+                .as_ref()
+                .and_then(|profile| profile.provider_config_dir.clone()),
+            profile_auto_resume_supported: launch_profile
+                .as_ref()
+                .map(|profile| profile.auto_resume_supported),
             agent_args: body.agent_args,
             format: nils_common::cli_contract::OutputFormat::Json,
         };
@@ -3927,29 +3996,57 @@ fn validate_launch_profile_resume_record(
     record: &SessionRecord,
     launch_profiles: &AgentLaunchProfiles,
 ) -> Result<(), CliError> {
-    let Some(profile_id) = session_agent_profile(record) else {
+    let Some(profile) = validate_launch_profile_context_record(record, launch_profiles)? else {
         return Ok(());
     };
-    let Some(profile) = launch_profiles.get(profile_id) else {
-        return Err(unavailable_launch_profile());
-    };
-    let provider_config_dir = session_provider_config_dir(record);
-    if AgentKind::from_name(&record.agent) != Some(profile.agent)
-        || record.agent_bin.as_deref() != profile.agent_bin.to_str()
-        || provider_config_dir.as_deref() != profile.provider_config_dir.as_deref()
-        || session_profile_auto_resume_setting(record) != Some(profile.auto_resume_supported)
-        || !profile.is_ready()
-    {
-        return Err(unavailable_launch_profile());
+    if !profile.is_ready() {
+        return Err(unavailable_launch_profile(&profile.id));
     }
     Ok(())
 }
 
-fn unavailable_launch_profile() -> CliError {
+fn validate_launch_profile_context_record<'a>(
+    record: &SessionRecord,
+    launch_profiles: &'a AgentLaunchProfiles,
+) -> Result<Option<&'a AgentLaunchProfile>, CliError> {
+    let Some(profile_id) = crate::session_agent_profile(record) else {
+        return Ok(None);
+    };
+    if launch_profiles.get(profile_id).is_none() {
+        return Err(unavailable_launch_profile(profile_id));
+    }
+    let Some(durable) = crate::durable_profile_resume_context(record)? else {
+        return Err(crate::profile_metadata_unavailable(profile_id));
+    };
+    validate_durable_launch_profile_context(&durable, launch_profiles)
+}
+
+fn validate_durable_launch_profile_context<'a>(
+    durable: &crate::DurableProfileResumeContext,
+    launch_profiles: &'a AgentLaunchProfiles,
+) -> Result<Option<&'a AgentLaunchProfile>, CliError> {
+    let Some(profile) = launch_profiles.get(&durable.profile_id) else {
+        return Err(unavailable_launch_profile(&durable.profile_id));
+    };
+    if durable.agent != profile.agent
+        || durable.agent_bin != profile.agent_bin
+        || durable.provider_config_dir.as_deref() != profile.provider_config_dir.as_deref()
+        || durable.auto_resume_supported != profile.auto_resume_supported
+    {
+        return Err(drifted_launch_profile(&durable.profile_id));
+    }
+    Ok(Some(profile))
+}
+
+fn unavailable_launch_profile(profile_id: &str) -> CliError {
+    profile_unavailable(profile_id)
+}
+
+fn drifted_launch_profile(profile_id: &str) -> CliError {
     CliError::runtime(
-        "agent-profile-unavailable",
-        "agent launch profile is unavailable",
-        None,
+        "agent-profile-context-mismatch",
+        "session launch profile context no longer matches the server registry",
+        Some(json!({ "agent_profile": profile_id })),
     )
 }
 
@@ -5963,11 +6060,12 @@ mod tests {
                 id: "claude-gpt".to_string(),
                 label: "Claude GPT".to_string(),
                 agent: "claude".to_string(),
+                provider_resume_import_supported: true,
             }]
         );
         assert_eq!(
             serde_json::to_value(&summaries).unwrap(),
-            json!([{"id":"claude-gpt","label":"Claude GPT","agent":"claude"}])
+            json!([{"id":"claude-gpt","label":"Claude GPT","agent":"claude","provider_resume_import_supported":true}])
         );
 
         fs::write(&launcher, "#!/usr/bin/env sh\nexit 1\n").unwrap();
@@ -6046,7 +6144,15 @@ mod tests {
             })
             .collect::<Vec<_>>();
         for thread in threads {
-            thread.join().unwrap();
+            assert_eq!(
+                thread.join().unwrap(),
+                vec![AgentLaunchProfileSummary {
+                    id: "claude-gpt".to_string(),
+                    label: "Claude GPT".to_string(),
+                    agent: "claude".to_string(),
+                    provider_resume_import_supported: false,
+                }]
+            );
         }
 
         assert_eq!(fs::read_to_string(calls).unwrap(), "x");
@@ -10738,7 +10844,15 @@ esac
         assert_eq!(list_status, StatusCode::OK, "body={list_body}");
         assert_eq!(
             list_body["data"]["agent_profiles"],
-            json!([{"id":"claude-gpt","label":"Claude GPT","agent":"claude"}])
+            json!([{"id":"claude-gpt","label":"Claude GPT","agent":"claude","provider_resume_import_supported":true}])
+        );
+        assert_eq!(
+            list_body["data"]["capabilities"]["profile_resume_import"],
+            true
+        );
+        assert_eq!(
+            list_body["data"]["capabilities"]["managed_resume_command"],
+            false
         );
 
         let (status, body) = call(
@@ -10775,6 +10889,150 @@ esac
             Some(config_dir)
         );
         assert!(!crate::session_profile_auto_resume_supported(&record));
+    }
+
+    #[tokio::test]
+    async fn fresh_profile_session_stops_and_resumes_with_its_durable_context() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cwd = tmp.path().join("worktrees/issue-362");
+        let config_dir = tmp.path().join("codex-profile");
+        let transcript = config_dir.join("sessions/2026/07/18/fresh-profile.jsonl");
+        let running = tmp.path().join("profile-runtime-running");
+        let pane_pid = tmp.path().join("profile-pane.pid");
+        let log = tmp.path().join("tmux.log");
+        fs::create_dir_all(&cwd).unwrap();
+        fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+        let launcher = fake_agent(tmp.path(), "codex-profile-bin");
+        let transcript_line = json!({
+            "timestamp":"2099-01-01T00:00:00Z",
+            "type":"session_meta",
+            "payload":{
+                "id":"fresh-provider-id",
+                "session_id":"fresh-provider-id",
+                "cwd":cwd,
+                "source":"cli",
+                "timestamp":"2099-01-01T00:00:00Z"
+            }
+        })
+        .to_string();
+        let tmux = executable(
+            &tmp.path().join("tmux"),
+            &format!(
+                r#"#!/usr/bin/env sh
+printf '%s\n' "$*" >> {log}
+case "$1" in
+  has-session)
+    if test -f {running}; then
+      exit 0
+    fi
+    printf '%s\n' "can't find session: fresh-profile" >&2
+    exit 1
+    ;;
+  new-session)
+    printf '%s\n' {transcript_line} > {transcript}
+    : > {running}
+    printf '%s\t%s\t%s\n' '$77' '%77' "$(cat {pane_pid})"
+    ;;
+  *) exit 0 ;;
+esac
+"#,
+                log = shell_words::quote(&log.to_string_lossy()),
+                running = shell_words::quote(&running.to_string_lossy()),
+                pane_pid = shell_words::quote(&pane_pid.to_string_lossy()),
+                transcript = shell_words::quote(&transcript.to_string_lossy()),
+                transcript_line = shell_words::quote(&transcript_line),
+            ),
+        );
+        let profiles = AgentLaunchProfiles::from_json(
+            &json!([{
+                "id":"codex-profile",
+                "label":"Codex Profile",
+                "agent":"codex",
+                "agent_bin":launcher,
+                "provider_config_dir":config_dir,
+                "auto_resume_supported":false,
+            }])
+            .to_string(),
+        )
+        .unwrap();
+        let mut st = state(tmp.path(), Some(TOKEN), tmux);
+        Arc::get_mut(&mut st).unwrap().launch_profiles = profiles;
+        let first_pane = TestProcessGroup::spawn();
+        fs::write(&pane_pid, first_pane.pid().to_string()).unwrap();
+
+        let (create_status, create_body) = call(
+            router(st.clone()),
+            post_json(
+                "/sessions",
+                Some(TOKEN),
+                json!({
+                    "agent":"codex",
+                    "agent_profile":"codex-profile",
+                    "id":"fresh-profile",
+                    "cwd":cwd,
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(create_status, StatusCode::OK, "body={create_body}");
+        assert_eq!(
+            create_body["data"]["session"]["provider_resume"]["session_id"],
+            "fresh-provider-id"
+        );
+
+        drop(first_pane);
+        fs::remove_file(&running).unwrap();
+        let (list_status, list_body) = call(router(st.clone()), get("/sessions")).await;
+        assert_eq!(list_status, StatusCode::OK, "body={list_body}");
+        let stopped = &list_body["data"]["sessions"][0];
+        assert_eq!(stopped["status"], "stopped");
+        assert_eq!(stopped["resumable"], true);
+        assert_eq!(stopped["cwd"], cwd.to_string_lossy().as_ref());
+        assert_eq!(stopped["agent_profile"], "codex-profile");
+
+        let resumed_pane = TestProcessGroup::spawn();
+        fs::write(&pane_pid, resumed_pane.pid().to_string()).unwrap();
+        let (resume_status, resume_body) = call(
+            router(st),
+            post_json("/sessions/fresh-profile/resume", Some(TOKEN), json!({})),
+        )
+        .await;
+        assert_eq!(resume_status, StatusCode::OK, "body={resume_body}");
+        assert_eq!(
+            resume_body["data"]["session"]["cwd"],
+            cwd.to_string_lossy().as_ref()
+        );
+        assert_eq!(
+            resume_body["data"]["session"]["agent_profile"],
+            "codex-profile"
+        );
+
+        let calls = fs::read_to_string(log).unwrap();
+        assert_eq!(
+            calls
+                .lines()
+                .filter(|line| line.contains("new-session"))
+                .count(),
+            2,
+            "fresh create and managed resume must each launch once: {calls:?}"
+        );
+        assert!(
+            calls.contains(&format!("CODEX_HOME={}", config_dir.display())),
+            "both launches must pin the effective profile root: {calls:?}"
+        );
+        assert!(
+            calls.contains(launcher.to_string_lossy().as_ref()),
+            "both launches must use the profile wrapper: {calls:?}"
+        );
+        assert!(
+            calls.contains(cwd.to_string_lossy().as_ref()),
+            "managed resume must retain the original worktree cwd: {calls:?}"
+        );
+        assert!(
+            calls.contains("resume fresh-provider-id"),
+            "managed resume must use the captured provider id: {calls:?}"
+        );
+        drop(resumed_pane);
     }
 
     #[tokio::test]
@@ -10984,6 +11242,129 @@ esac
                 .join("sessions/imported-claude/resume.json")
                 .is_file(),
             "import must persist durable resume metadata"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_imports_claude_session_only_from_selected_profile_root() {
+        let lock = GlobalStateLock::new();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let expected_cwd = tmp.path().join("profile-repo");
+        let wrong_cwd = tmp.path().join("base-repo");
+        let base_config = tmp.path().join("base-claude");
+        let profile_config = tmp.path().join("profile-claude");
+        fs::create_dir_all(&expected_cwd).unwrap();
+        fs::create_dir_all(&wrong_cwd).unwrap();
+        write_claude_session_transcript(
+            &base_config,
+            "-base-project",
+            "shared-claude-id",
+            &wrong_cwd,
+        );
+        write_claude_session_transcript(
+            &profile_config,
+            "-profile-project",
+            "shared-claude-id",
+            &expected_cwd,
+        );
+        let launcher = fake_agent(tmp.path(), "profile-claude-bin");
+        let profiles = AgentLaunchProfiles::from_json(
+            &json!([{
+                "id":"profile-claude",
+                "label":"Profile Claude",
+                "agent":"claude",
+                "agent_bin":launcher,
+                "provider_config_dir":profile_config,
+                "auto_resume_supported":false,
+            }])
+            .to_string(),
+        )
+        .unwrap();
+        let log = tmp.path().join("tmux.log");
+        let tmux = logging_tmux(tmp.path(), &log);
+        let _base_config = EnvGuard::set(&lock, "CLAUDE_CONFIG_DIR", base_config.to_str().unwrap());
+        let mut st = state(tmp.path(), Some(TOKEN), tmux);
+        Arc::get_mut(&mut st).unwrap().launch_profiles = profiles;
+
+        let (status, body) = call(
+            router(st),
+            post_json(
+                "/sessions",
+                Some(TOKEN),
+                json!({
+                    "agent":"claude",
+                    "agent_profile":"profile-claude",
+                    "id":"profile-import",
+                    "provider_resume_id":"shared-claude-id"
+                }),
+            ),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK, "body={body}");
+        let session = &body["data"]["session"];
+        assert_eq!(session["cwd"], expected_cwd.to_string_lossy().as_ref());
+        assert_eq!(session["agent_profile"], "profile-claude");
+        let calls = fs::read_to_string(log).unwrap();
+        assert!(
+            calls.contains(&format!("CLAUDE_CONFIG_DIR={}", profile_config.display())),
+            "profile import must pin the selected provider root: {calls:?}"
+        );
+        assert!(
+            !calls.contains(wrong_cwd.to_string_lossy().as_ref()),
+            "profile import must never recover cwd from the base root: {calls:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_profile_import_does_not_fall_back_to_base_provider_root() {
+        let lock = GlobalStateLock::new();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let base_cwd = tmp.path().join("base-repo");
+        let base_config = tmp.path().join("base-claude");
+        let profile_config = tmp.path().join("profile-claude");
+        fs::create_dir_all(&base_cwd).unwrap();
+        fs::create_dir_all(&profile_config).unwrap();
+        write_claude_session_transcript(&base_config, "-base-project", "base-only-id", &base_cwd);
+        let launcher = fake_agent(tmp.path(), "profile-claude-bin");
+        let profiles = AgentLaunchProfiles::from_json(
+            &json!([{
+                "id":"profile-claude",
+                "label":"Profile Claude",
+                "agent":"claude",
+                "agent_bin":launcher,
+                "provider_config_dir":profile_config,
+                "auto_resume_supported":false,
+            }])
+            .to_string(),
+        )
+        .unwrap();
+        let log = tmp.path().join("tmux.log");
+        let tmux = logging_tmux(tmp.path(), &log);
+        let _base_config = EnvGuard::set(&lock, "CLAUDE_CONFIG_DIR", base_config.to_str().unwrap());
+        let mut st = state(tmp.path(), Some(TOKEN), tmux);
+        Arc::get_mut(&mut st).unwrap().launch_profiles = profiles;
+
+        let (status, body) = call(
+            router(st),
+            post_json(
+                "/sessions",
+                Some(TOKEN),
+                json!({
+                    "agent":"claude",
+                    "agent_profile":"profile-claude",
+                    "provider_resume_id":"base-only-id"
+                }),
+            ),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "body={body}");
+        assert_eq!(body["error"]["code"], "provider-resume-not-found");
+        assert_eq!(body["error"]["details"]["agent_profile"], "profile-claude");
+        assert!(
+            !log.exists() || !fs::read_to_string(log).unwrap().contains("new-session"),
+            "a base-root-only provider session must not launch"
         );
     }
 
@@ -12204,8 +12585,17 @@ esac
         record["runtime"]["agent_profile"] = json!("claude-gpt");
         fs::write(&record_path, serde_json::to_vec_pretty(&record).unwrap()).unwrap();
 
+        let st = state(tmp.path(), Some(TOKEN), tmux);
+        let (list_status, list_body) = call(router(st.clone()), get("/sessions")).await;
+        assert_eq!(list_status, StatusCode::OK, "body={list_body}");
+        assert_eq!(list_body["data"]["sessions"][0]["resumable"], false);
+        assert_eq!(
+            list_body["data"]["sessions"][0]["resume_blocked_reason"],
+            "agent-profile-unavailable"
+        );
+
         let (status, body) = call(
-            router(state(tmp.path(), Some(TOKEN), tmux)),
+            router(st),
             post_json("/sessions/revoked-profile/resume", Some(TOKEN), json!({})),
         )
         .await;
@@ -12223,7 +12613,9 @@ esac
     async fn resume_rejects_stale_profile_auto_resume_capability() {
         let tmp = tempfile::TempDir::new().unwrap();
         let cwd = tmp.path().join("repo");
+        let config_dir = tmp.path().join("claude-gpt-config");
         fs::create_dir_all(&cwd).unwrap();
+        fs::create_dir_all(&config_dir).unwrap();
         let log = tmp.path().join("tmux.log");
         let tmux = resume_tmux(tmp.path(), &log);
         let launcher = fake_agent(tmp.path(), "claude-gpt");
@@ -12241,6 +12633,7 @@ esac
         let mut record: Value = serde_json::from_slice(&fs::read(&record_path).unwrap()).unwrap();
         record["agent_bin"] = json!(launcher);
         record["runtime"]["agent_profile"] = json!("claude-gpt");
+        record["runtime"]["agent_profile_provider_config_dir"] = json!(config_dir);
         record["runtime"]["agent_profile_auto_resume_supported"] = json!(true);
         fs::write(&record_path, serde_json::to_vec_pretty(&record).unwrap()).unwrap();
         let profiles = AgentLaunchProfiles::from_json(
@@ -12249,6 +12642,7 @@ esac
                 "label":"Claude GPT",
                 "agent":"claude",
                 "agent_bin":launcher,
+                "provider_config_dir":config_dir,
                 "auto_resume_supported":false,
             }])
             .to_string(),
@@ -12268,11 +12662,265 @@ esac
         .await;
 
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "body={body}");
-        assert_eq!(body["error"]["code"], "agent-profile-unavailable");
+        assert_eq!(body["error"]["code"], "agent-profile-context-mismatch");
         let calls = fs::read_to_string(log).unwrap_or_default();
         assert!(
             !calls.contains("new-session"),
             "body={body}, calls={calls:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn resume_rejects_profile_provider_root_drift() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cwd = tmp.path().join("repo");
+        let durable_config_dir = tmp.path().join("profile-root-before");
+        let drifted_config_dir = tmp.path().join("profile-root-after");
+        fs::create_dir_all(&cwd).unwrap();
+        fs::create_dir_all(&durable_config_dir).unwrap();
+        fs::create_dir_all(&drifted_config_dir).unwrap();
+        let log = tmp.path().join("tmux.log");
+        let tmux = resume_tmux(tmp.path(), &log);
+        let launcher = fake_agent(tmp.path(), "claude-gpt");
+        seed_resumable_session(
+            tmp.path(),
+            "profile-root-drift",
+            "claude",
+            "hs-claude-profile-root-drift",
+            &cwd,
+            &["--resume", "resume-session-id"],
+        );
+        let record_path = tmp.path().join("sessions/profile-root-drift/session.json");
+        let mut record: Value = serde_json::from_slice(&fs::read(&record_path).unwrap()).unwrap();
+        record["agent_bin"] = json!(launcher);
+        record["runtime"]["agent_profile"] = json!("claude-gpt");
+        record["runtime"]["agent_profile_provider_config_dir"] = json!(durable_config_dir);
+        record["runtime"]["agent_profile_auto_resume_supported"] = json!(false);
+        fs::write(&record_path, serde_json::to_vec_pretty(&record).unwrap()).unwrap();
+        let profiles = AgentLaunchProfiles::from_json(
+            &json!([{
+                "id":"claude-gpt",
+                "label":"Claude GPT",
+                "agent":"claude",
+                "agent_bin":launcher,
+                "provider_config_dir":drifted_config_dir,
+                "auto_resume_supported":false,
+            }])
+            .to_string(),
+        )
+        .unwrap();
+        let mut st = state(tmp.path(), Some(TOKEN), tmux);
+        Arc::get_mut(&mut st).unwrap().launch_profiles = profiles;
+
+        let (status, body) = call(
+            router(st),
+            post_json(
+                "/sessions/profile-root-drift/resume",
+                Some(TOKEN),
+                json!({}),
+            ),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "body={body}");
+        assert_eq!(body["error"]["code"], "agent-profile-context-mismatch");
+        let calls = fs::read_to_string(log).unwrap_or_default();
+        assert!(
+            !calls.contains("new-session"),
+            "provider-root drift must fail before launch: {calls:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn resume_rechecks_profile_readiness_and_fails_before_launch() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cwd = tmp.path().join("repo");
+        let config_dir = tmp.path().join("claude-gpt-config");
+        fs::create_dir_all(&cwd).unwrap();
+        fs::create_dir_all(&config_dir).unwrap();
+        let log = tmp.path().join("tmux.log");
+        let tmux = resume_tmux(tmp.path(), &log);
+        let launcher = executable(
+            &tmp.path().join("claude-gpt"),
+            "#!/usr/bin/env sh\nexit 23\n",
+        );
+        seed_resumable_session(
+            tmp.path(),
+            "profile-readiness-failed",
+            "claude",
+            "hs-claude-profile-readiness-failed",
+            &cwd,
+            &["--resume", "resume-session-id"],
+        );
+        let record_path = tmp
+            .path()
+            .join("sessions/profile-readiness-failed/session.json");
+        let mut record: Value = serde_json::from_slice(&fs::read(&record_path).unwrap()).unwrap();
+        record["agent_bin"] = json!(launcher);
+        record["runtime"]["agent_profile"] = json!("claude-gpt");
+        record["runtime"]["agent_profile_provider_config_dir"] = json!(config_dir);
+        record["runtime"]["agent_profile_auto_resume_supported"] = json!(false);
+        fs::write(&record_path, serde_json::to_vec_pretty(&record).unwrap()).unwrap();
+        let profiles = AgentLaunchProfiles::from_json(
+            &json!([{
+                "id":"claude-gpt",
+                "label":"Claude GPT",
+                "agent":"claude",
+                "agent_bin":launcher,
+                "provider_config_dir":config_dir,
+                "readiness_args":["--check"],
+                "auto_resume_supported":false,
+            }])
+            .to_string(),
+        )
+        .unwrap();
+        let mut st = state(tmp.path(), Some(TOKEN), tmux);
+        Arc::get_mut(&mut st).unwrap().launch_profiles = profiles;
+
+        let (status, body) = call(
+            router(st),
+            post_json(
+                "/sessions/profile-readiness-failed/resume",
+                Some(TOKEN),
+                json!({}),
+            ),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "body={body}");
+        assert_eq!(body["error"]["code"], "agent-profile-unavailable");
+        let calls = fs::read_to_string(log).unwrap_or_default();
+        assert!(
+            !calls.contains("new-session"),
+            "failed readiness must stop before tmux launch: {calls:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_fails_closed_immediately_after_a_profile_root_is_removed() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cwd = tmp.path().join("repo");
+        let config_dir = tmp.path().join("claude-gpt-config");
+        fs::create_dir_all(&cwd).unwrap();
+        fs::create_dir_all(&config_dir).unwrap();
+        let log = tmp.path().join("tmux.log");
+        let tmux = resume_tmux(tmp.path(), &log);
+        let launcher = fake_agent(tmp.path(), "claude-gpt");
+        seed_resumable_session(
+            tmp.path(),
+            "profile-root-removed",
+            "claude",
+            "hs-claude-profile-root-removed",
+            &cwd,
+            &["--resume", "resume-session-id"],
+        );
+        let record_path = tmp
+            .path()
+            .join("sessions/profile-root-removed/session.json");
+        let mut record: Value = serde_json::from_slice(&fs::read(&record_path).unwrap()).unwrap();
+        record["agent_bin"] = json!(launcher);
+        record["runtime"]["agent_profile"] = json!("claude-gpt");
+        record["runtime"]["agent_profile_provider_config_dir"] = json!(config_dir);
+        record["runtime"]["agent_profile_auto_resume_supported"] = json!(false);
+        fs::write(&record_path, serde_json::to_vec_pretty(&record).unwrap()).unwrap();
+        let profiles = AgentLaunchProfiles::from_json(
+            &json!([{
+                "id":"claude-gpt",
+                "label":"Claude GPT",
+                "agent":"claude",
+                "agent_bin":launcher,
+                "provider_config_dir":config_dir,
+                "auto_resume_supported":false,
+            }])
+            .to_string(),
+        )
+        .unwrap();
+        let mut st = state(tmp.path(), Some(TOKEN), tmux);
+        Arc::get_mut(&mut st).unwrap().launch_profiles = profiles;
+
+        let (ready_status, ready_body) = call(router(st.clone()), get("/sessions")).await;
+        assert_eq!(ready_status, StatusCode::OK, "body={ready_body}");
+        assert_eq!(
+            ready_body["data"]["agent_profiles"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(ready_body["data"]["sessions"][0]["resumable"], true);
+
+        fs::remove_dir(&config_dir).unwrap();
+        let (removed_status, removed_body) = call(router(st), get("/sessions")).await;
+        assert_eq!(removed_status, StatusCode::OK, "body={removed_body}");
+        assert!(
+            removed_body["data"]["agent_profiles"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(removed_body["data"]["sessions"][0]["resumable"], false);
+        assert_eq!(
+            removed_body["data"]["sessions"][0]["resume_blocked_reason"],
+            "agent-profile-unavailable"
+        );
+    }
+
+    #[tokio::test]
+    async fn resume_profile_pins_durable_provider_root_and_launcher() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cwd = tmp.path().join("repo");
+        let config_dir = tmp.path().join("profile-claude");
+        fs::create_dir_all(&cwd).unwrap();
+        fs::create_dir_all(&config_dir).unwrap();
+        let log = tmp.path().join("tmux.log");
+        let tmux = resume_tmux(tmp.path(), &log);
+        let launcher = fake_agent(tmp.path(), "profile-claude-bin");
+        seed_resumable_session(
+            tmp.path(),
+            "profile-resume",
+            "claude",
+            "hs-claude-profile-resume",
+            &cwd,
+            &["--resume", "resume-session-id"],
+        );
+        let record_path = tmp.path().join("sessions/profile-resume/session.json");
+        let mut record: Value = serde_json::from_slice(&fs::read(&record_path).unwrap()).unwrap();
+        record["agent_bin"] = json!(launcher);
+        record["runtime"]["agent_profile"] = json!("profile-claude");
+        record["runtime"]["agent_profile_provider_config_dir"] = json!(config_dir);
+        record["runtime"]["agent_profile_auto_resume_supported"] = json!(false);
+        fs::write(&record_path, serde_json::to_vec_pretty(&record).unwrap()).unwrap();
+        let profiles = AgentLaunchProfiles::from_json(
+            &json!([{
+                "id":"profile-claude",
+                "label":"Profile Claude",
+                "agent":"claude",
+                "agent_bin":launcher,
+                "provider_config_dir":config_dir,
+                "auto_resume_supported":false,
+            }])
+            .to_string(),
+        )
+        .unwrap();
+        let mut st = state(tmp.path(), Some(TOKEN), tmux);
+        Arc::get_mut(&mut st).unwrap().launch_profiles = profiles;
+
+        let (status, body) = call(
+            router(st),
+            post_json("/sessions/profile-resume/resume", Some(TOKEN), json!({})),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK, "body={body}");
+        assert_eq!(body["data"]["session"]["auto_resume"]["supported"], false);
+        let calls = fs::read_to_string(log).unwrap();
+        assert!(
+            calls.contains(&format!("CLAUDE_CONFIG_DIR={}", config_dir.display())),
+            "managed resume must pin the durable provider root: {calls:?}"
+        );
+        assert!(
+            calls.contains(launcher.to_string_lossy().as_ref()),
+            "managed resume must use the durable launcher: {calls:?}"
         );
     }
 
