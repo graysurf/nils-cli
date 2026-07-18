@@ -8172,6 +8172,7 @@ mod tests {
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     impl SupervisorFixture {
+        #[cfg(target_os = "linux")]
         fn id(&self) -> u32 {
             self.child.id()
         }
@@ -9619,7 +9620,8 @@ mod tests {
         );
     }
 
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    // macOS hosted runners can exhaust kqueue tracking while creating this fixture; see #1290.
+    #[cfg(target_os = "linux")]
     #[test]
     fn missing_supervisor_completion_cleans_a_prescanned_escaped_descendant() {
         use std::os::unix::net::UnixStream;
