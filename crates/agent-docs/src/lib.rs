@@ -136,7 +136,14 @@ fn dispatch(cli: Cli, output_format: nils_common::cli_contract::OutputFormat) ->
 
     match cli.command {
         Command::Audit(args) => {
-            let roots = match resolve_roots_or_exit(&overrides) {
+            let roots = match resolve_roots_or_exit(
+                &overrides,
+                CatalogCommandContract {
+                    format: args.format,
+                    command: "audit",
+                    schema_version: 2,
+                },
+            ) {
                 Ok(roots) => roots,
                 Err(code) => return code,
             };
@@ -149,8 +156,15 @@ fn dispatch(cli: Cli, output_format: nils_common::cli_contract::OutputFormat) ->
             ) {
                 Ok(report) => report,
                 Err(err) => {
-                    eprintln!("error: {err}");
-                    return config_error_exit_code(&err);
+                    let exit_code = config_error_exit_code(&err);
+                    return render_command_failure(
+                        args.format,
+                        "audit",
+                        2,
+                        "catalog-load-failed",
+                        &err.to_string(),
+                        exit_code,
+                    );
                 }
             };
             let exit_code = if args.strict && report.has_problems() {
@@ -165,7 +179,14 @@ fn dispatch(cli: Cli, output_format: nils_common::cli_contract::OutputFormat) ->
                 Ok(intent) => intent,
                 Err(code) => return code,
             };
-            let roots = match resolve_roots_or_exit(&overrides) {
+            let roots = match resolve_roots_or_exit(
+                &overrides,
+                CatalogCommandContract {
+                    format: args.format,
+                    command: "preflight",
+                    schema_version: 2,
+                },
+            ) {
                 Ok(roots) => roots,
                 Err(code) => return code,
             };
@@ -194,8 +215,12 @@ fn dispatch(cli: Cli, output_format: nils_common::cli_contract::OutputFormat) ->
                 &catalog,
             );
             if args.require_declared_intent {
-                let available_intents =
-                    resolver::declared_intents(&roots, fallback_mode, &catalog.catalog);
+                let available_intents = resolver::declared_intents_for_product(
+                    &roots,
+                    args.product,
+                    fallback_mode,
+                    &catalog.catalog,
+                );
                 if !available_intents.iter().any(|name| name == intent.as_str()) {
                     return print_failure_rendered(
                         args.format,
@@ -216,7 +241,14 @@ fn dispatch(cli: Cli, output_format: nils_common::cli_contract::OutputFormat) ->
             print_rendered(render_preflight(args.format, &report), exit_code)
         }
         Command::Init(args) => {
-            let roots = match resolve_roots_or_exit(&overrides) {
+            let roots = match resolve_roots_or_exit(
+                &overrides,
+                CatalogCommandContract {
+                    format: args.format,
+                    command: "init",
+                    schema_version: 1,
+                },
+            ) {
                 Ok(roots) => roots,
                 Err(code) => return code,
             };
@@ -233,7 +265,14 @@ fn dispatch(cli: Cli, output_format: nils_common::cli_contract::OutputFormat) ->
             }
         }
         Command::Explain(args) => {
-            let roots = match resolve_roots_or_exit(&overrides) {
+            let roots = match resolve_roots_or_exit(
+                &overrides,
+                CatalogCommandContract {
+                    format: args.format,
+                    command: "explain",
+                    schema_version: 1,
+                },
+            ) {
                 Ok(roots) => roots,
                 Err(code) => return code,
             };
@@ -275,15 +314,25 @@ fn dispatch(cli: Cli, output_format: nils_common::cli_contract::OutputFormat) ->
                     print_rendered(render_explain_intent(args.format, &payload), EXIT_OK)
                 }
                 None => {
-                    let intents =
-                        resolver::available_intents_for_product(args.product, &catalog.catalog);
+                    let intents = resolver::available_intents_for_product_in_roots(
+                        &roots,
+                        args.product,
+                        &catalog.catalog,
+                    );
                     let payload = ExplainIntents { intents: &intents };
                     print_rendered(render_explain_intents(args.format, &payload), EXIT_OK)
                 }
             }
         }
         Command::List(args) => {
-            let roots = match resolve_roots_or_exit(&overrides) {
+            let roots = match resolve_roots_or_exit(
+                &overrides,
+                CatalogCommandContract {
+                    format: args.format,
+                    command: "list",
+                    schema_version: 1,
+                },
+            ) {
                 Ok(roots) => roots,
                 Err(code) => return code,
             };
@@ -307,14 +356,18 @@ fn dispatch(cli: Cli, output_format: nils_common::cli_contract::OutputFormat) ->
                 args.product,
                 fallback_mode,
                 &catalog.catalog,
-                catalog.private_project_catalog,
+                &catalog.private_allowed_roots,
             );
             let validations = resolver::all_validation_contracts_for_product(
                 &roots,
                 args.product,
                 &catalog.catalog,
             );
-            let intents = resolver::available_intents_for_product(args.product, &catalog.catalog);
+            let intents = resolver::available_intents_for_product_in_roots(
+                &roots,
+                args.product,
+                &catalog.catalog,
+            );
             let report = ListReport {
                 docs_home: roots.docs_home.clone(),
                 project_path: roots.project_path.clone(),
@@ -329,7 +382,14 @@ fn dispatch(cli: Cli, output_format: nils_common::cli_contract::OutputFormat) ->
                 Ok(intent) => intent,
                 Err(code) => return code,
             };
-            let roots = match resolve_roots_or_exit(&overrides) {
+            let roots = match resolve_roots_or_exit(
+                &overrides,
+                CatalogCommandContract {
+                    format: args.format,
+                    command: "remove",
+                    schema_version: 1,
+                },
+            ) {
                 Ok(roots) => roots,
                 Err(code) => return code,
             };
@@ -382,10 +442,19 @@ fn parse_intent(raw: &str) -> Result<Context, i32> {
     })
 }
 
-fn resolve_roots_or_exit(overrides: &PathOverrides) -> Result<ResolvedRoots, i32> {
+fn resolve_roots_or_exit(
+    overrides: &PathOverrides,
+    contract: CatalogCommandContract,
+) -> Result<ResolvedRoots, i32> {
     resolve_roots(overrides).map_err(|err| {
-        eprintln!("error: {err:#}");
-        EXIT_RUNTIME
+        render_command_failure(
+            contract.format,
+            contract.command,
+            contract.schema_version,
+            "root-resolution-failed",
+            &format!("{err:#}"),
+            EXIT_RUNTIME,
+        )
     })
 }
 
@@ -439,10 +508,18 @@ fn load_effective_catalog(
         .map(|catalog| integration::EffectiveCatalog {
             catalog,
             private_project_catalog: false,
+            private_allowed_roots: Vec::new(),
         })
         .map_err(|err| {
-            eprintln!("error: {err}");
-            config_error_exit_code(&err)
+            let exit_code = config_error_exit_code(&err);
+            render_command_failure(
+                contract.format,
+                contract.command,
+                contract.schema_version,
+                "catalog-load-failed",
+                &err.to_string(),
+                exit_code,
+            )
         })
 }
 

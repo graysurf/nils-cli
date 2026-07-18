@@ -2,20 +2,28 @@ use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow};
+
+pub(crate) const MAX_PRIVATE_DOCUMENT_BYTES: usize = 1024 * 1024;
+pub(crate) const MAX_PRIVATE_DOCUMENTS: usize = 1024;
+pub(crate) const MAX_PRIVATE_AGGREGATE_BYTES: usize = 16 * 1024 * 1024;
 use nils_common::cli_contract::{Envelope, EnvelopeError, schema_version_for};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
 use crate::cli::{IntegrationArgs, IntegrationCommand, IntegrationResolveArgs};
 use crate::config::{config_path_for_root, load_scope_catalog_from_str};
-use crate::env::{PathOverrides, ProjectIdentity, ResolvedRoots, resolve_roots};
+use crate::env::{
+    DocsHomeSource, PathOverrides, PrimaryWorktreeFallback, ProjectIdentity, ResolvedRoots,
+    RootIdentity, resolve_roots,
+};
 use crate::model::{
     CatalogOrigin, FallbackMode, LoadedCatalog, OutputFormat, Product, Scope, ScopeCatalog,
 };
 use crate::user_config::{
     ConfigDiagnostic, ConfigRead, ConfigState, ProjectRule, RuleMode, SelectorKind, config_path,
-    matching_rules, read_config, read_selected_catalog,
+    matching_rules_for_selection, parse_selected_catalog, read_config_for_identity,
+    read_selected_catalog,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -49,10 +57,13 @@ pub(crate) enum BoundCatalogError {
 }
 
 impl BoundCatalogError {
-    pub(crate) const fn kind(&self) -> BoundCatalogErrorKind {
+    pub(crate) fn kind(&self) -> BoundCatalogErrorKind {
         match self {
             Self::StaleFingerprint { .. } => BoundCatalogErrorKind::Data,
             Self::CatalogNotSelected { .. } => BoundCatalogErrorKind::Config,
+            Self::Resolution(err) if err.downcast_ref::<UserConfigResolutionError>().is_some() => {
+                BoundCatalogErrorKind::Config
+            }
             Self::Resolution(_) | Self::MissingCatalog => BoundCatalogErrorKind::Runtime,
         }
     }
@@ -143,8 +154,10 @@ struct FingerprintInput<'a> {
     schema_version: u32,
     product: Product,
     fallback_mode: FallbackMode,
-    project_path: &'a Path,
-    git_common_dir: Option<&'a Path>,
+    project_identity: &'a RootIdentity,
+    primary_worktree_fallback: Option<&'a PrimaryWorktreeFallback>,
+    docs_home_identity: &'a RootIdentity,
+    docs_home_source: DocsHomeSource,
     config_state: Option<ConfigState>,
     selector: Option<SelectorKind>,
     selector_path: Option<&'a Path>,
@@ -166,6 +179,7 @@ struct ResolutionSnapshot {
 pub(crate) struct EffectiveCatalog {
     pub(crate) catalog: LoadedCatalog,
     pub(crate) private_project_catalog: bool,
+    pub(crate) private_allowed_roots: Vec<PathBuf>,
 }
 
 struct DecisionCatalog {
@@ -173,12 +187,51 @@ struct DecisionCatalog {
     catalog: LoadedCatalog,
     docs_home_digest: String,
     private_project_catalog: bool,
+    private_allowed_roots: Vec<PathBuf>,
 }
 
 struct CatalogFile {
     path: PathBuf,
     raw: String,
     digest: String,
+}
+
+#[derive(Debug)]
+struct UserConfigResolutionError(anyhow::Error);
+
+impl fmt::Display for UserConfigResolutionError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{:#}", self.0)
+    }
+}
+
+impl std::error::Error for UserConfigResolutionError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.0.as_ref())
+    }
+}
+
+fn config_resolution_error(source: anyhow::Error) -> anyhow::Error {
+    anyhow::Error::new(UserConfigResolutionError(source))
+}
+
+#[derive(Debug)]
+struct IntegrationCommandError {
+    code: &'static str,
+    exit_code: i32,
+    source: anyhow::Error,
+}
+
+impl fmt::Display for IntegrationCommandError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{:#}", self.source)
+    }
+}
+
+impl std::error::Error for IntegrationCommandError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.source.as_ref())
+    }
 }
 
 pub fn run(args: IntegrationArgs, overrides: &PathOverrides, fallback_mode: FallbackMode) -> i32 {
@@ -196,7 +249,7 @@ pub fn run(args: IntegrationArgs, overrides: &PathOverrides, fallback_mode: Fall
                 OutputFormat::Json => {
                     let envelope: Envelope<()> = Envelope::failure(
                         schema_version_for("agent-docs", "integration.resolve", 1),
-                        EnvelopeError::new("integration-resolve-failed", message),
+                        EnvelopeError::new(err.code, message),
                     );
                     match serde_json::to_string(&envelope) {
                         Ok(serialized) => println!("{serialized}"),
@@ -205,7 +258,7 @@ pub fn run(args: IntegrationArgs, overrides: &PathOverrides, fallback_mode: Fall
                 }
                 OutputFormat::Text => eprintln!("error: {message}"),
             }
-            4
+            err.exit_code
         }
     }
 }
@@ -214,16 +267,37 @@ fn run_resolve(
     args: IntegrationResolveArgs,
     overrides: &PathOverrides,
     fallback_mode: FallbackMode,
-) -> Result<()> {
-    let roots = resolve_roots(overrides)?;
-    let result = resolve_decision(&roots, args.product, fallback_mode)?;
+) -> std::result::Result<(), IntegrationCommandError> {
+    let roots = resolve_roots(overrides).map_err(|source| IntegrationCommandError {
+        code: "root-resolution-failed",
+        exit_code: 4,
+        source,
+    })?;
+    let result = resolve_decision(&roots, args.product, fallback_mode).map_err(|source| {
+        let exit_code = if source.downcast_ref::<UserConfigResolutionError>().is_some() {
+            3
+        } else {
+            4
+        };
+        IntegrationCommandError {
+            code: "integration-resolve-failed",
+            exit_code,
+            source,
+        }
+    })?;
     match args.format {
         OutputFormat::Json => {
             let envelope = Envelope::success(
                 schema_version_for("agent-docs", "integration.resolve", 1),
                 result,
             );
-            println!("{}", serde_json::to_string(&envelope)?);
+            let serialized =
+                serde_json::to_string(&envelope).map_err(|source| IntegrationCommandError {
+                    code: "integration-render-failed",
+                    exit_code: 4,
+                    source: source.into(),
+                })?;
+            println!("{serialized}");
             Ok(())
         }
         OutputFormat::Text => {
@@ -249,11 +323,11 @@ fn resolve_snapshot(
     product: Product,
     fallback_mode: FallbackMode,
 ) -> Result<ResolutionSnapshot> {
-    let config_path = config_path()?;
+    let identity = project_identity(roots);
+    let config_path = config_path().map_err(config_resolution_error)?;
     let repository_path = config_path_for_root(&roots.project_path);
     let repository_present = fs::symlink_metadata(&repository_path).is_ok();
-    let identity = project_identity(roots);
-    let read = read_config()?;
+    let read = read_config_for_identity(&identity).map_err(config_resolution_error)?;
 
     let (config_state, config, mut diagnostics) = match read {
         ConfigRead::Missing => (ConfigState::Missing, None, Vec::new()),
@@ -262,7 +336,7 @@ fn resolve_snapshot(
     };
     let matches = config
         .as_ref()
-        .map(|config| matching_rules(config, &identity))
+        .map(|config| matching_rules_for_selection(config, &identity))
         .unwrap_or_default();
 
     let (action, reason_code, rule, decision_catalog) = if matches.len() > 1 {
@@ -340,12 +414,15 @@ fn resolve_snapshot(
     } else {
         None
     };
+    let primary_worktree_fallback = roots.primary_worktree_fallback();
     let fingerprint_input = FingerprintInput {
-        schema_version: 1,
+        schema_version: 2,
         product,
         fallback_mode,
-        project_path: &roots.project_path,
-        git_common_dir: roots.git_common_dir.as_deref(),
+        project_identity: &roots.project_identity,
+        primary_worktree_fallback: primary_worktree_fallback.as_ref(),
+        docs_home_identity: &roots.docs_home_identity,
+        docs_home_source: roots.docs_home_source,
         config_state: fingerprint_config_state,
         selector: rule.map(|rule| rule.selector),
         selector_path: rule.map(|rule| rule.path.as_path()),
@@ -362,6 +439,7 @@ fn resolve_snapshot(
     let catalog = decision_catalog.map(|decision| EffectiveCatalog {
         catalog: decision.catalog,
         private_project_catalog: decision.private_project_catalog,
+        private_allowed_roots: decision.private_allowed_roots,
     });
 
     Ok(ResolutionSnapshot {
@@ -438,23 +516,16 @@ fn selected_user_catalog(
             },
         )
     })?;
-    let raw = std::str::from_utf8(&snapshot.bytes).map_err(|err| {
+    let project = parse_selected_catalog(&snapshot, identity).map_err(|err| {
         (
             "selected-catalog-invalid",
             ConfigDiagnostic {
                 code: "selected-catalog-invalid".to_string(),
-                message: format!("private catalog is not valid UTF-8: {err}"),
+                message: err.to_string(),
             },
         )
     })?;
-    let project = load_scope_catalog_from_str(
-        Scope::Project,
-        CatalogOrigin::User,
-        &identity.project_path,
-        &snapshot.path,
-        raw,
-    )
-    .map_err(|err| {
+    let private_allowed_roots = private_allowed_roots(identity).map_err(|err| {
         (
             "selected-catalog-invalid",
             ConfigDiagnostic {
@@ -485,7 +556,29 @@ fn selected_user_catalog(
         },
         docs_home_digest,
         private_project_catalog: true,
+        private_allowed_roots,
     })
+}
+
+fn private_allowed_roots(identity: &ProjectIdentity) -> Result<Vec<PathBuf>> {
+    let mut roots = vec![fs::canonicalize(&identity.project_path).with_context(|| {
+        format!(
+            "failed to canonicalize project root {}",
+            identity.project_path.display()
+        )
+    })?];
+    if let Some(primary) = identity.primary_worktree_fallback() {
+        let primary = fs::canonicalize(&primary.path).with_context(|| {
+            format!(
+                "failed to canonicalize verified fallback root {}",
+                primary.path.display()
+            )
+        })?;
+        if !roots.contains(&primary) {
+            roots.push(primary);
+        }
+    }
+    Ok(roots)
 }
 
 fn selected_repository_catalog(
@@ -534,6 +627,7 @@ fn load_repository_catalog(roots: &ResolvedRoots) -> Result<DecisionCatalog> {
         catalog: LoadedCatalog { home, project },
         docs_home_digest,
         private_project_catalog: false,
+        private_allowed_roots: Vec::new(),
     })
 }
 
@@ -554,13 +648,6 @@ fn read_catalog_file(path: &Path) -> Result<Option<CatalogFile>> {
             return Err(err).with_context(|| format!("failed to read {}", path.display()));
         }
     };
-    if bytes.len() > crate::user_config::MAX_PRIVATE_CATALOG_BYTES {
-        bail!(
-            "catalog {} exceeds the {}-byte size limit",
-            path.display(),
-            crate::user_config::MAX_PRIVATE_CATALOG_BYTES
-        );
-    }
     let raw = String::from_utf8(bytes.clone())
         .with_context(|| format!("catalog {} is not valid UTF-8", path.display()))?;
     let canonical = fs::canonicalize(path)
@@ -598,5 +685,6 @@ fn project_identity(roots: &ResolvedRoots) -> ProjectIdentity {
         is_linked_worktree: roots.is_linked_worktree,
         git_common_dir: roots.git_common_dir.clone(),
         primary_worktree_path: roots.primary_worktree_path.clone(),
+        worktree_roots: roots.worktree_roots.clone(),
     }
 }

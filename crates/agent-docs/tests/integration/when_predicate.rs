@@ -11,6 +11,7 @@ fn code_doc_catalog() -> &'static str {
 fn docs_only_repo_auto_skips_code_doc() {
     let env = TestEnv::new();
     env.write_home_catalog(code_doc_catalog());
+    env.write_project_catalog(code_doc_catalog());
     // No Cargo.toml / package.json, and DEVELOPMENT.md absent. The predicate is
     // false, so the doc is not required and strict passes with no opt-out.
     let out = env.run(&["preflight", "--intent", "project-dev", "--format", "json"]);
@@ -33,6 +34,7 @@ fn docs_only_repo_auto_skips_code_doc() {
 fn code_repo_requires_the_code_doc() {
     let env = TestEnv::new();
     env.write_home_catalog(code_doc_catalog());
+    env.write_project_catalog(code_doc_catalog());
     env.write_project_doc("Cargo.toml", "[package]\nname = \"x\"\n");
     // Marker present but DEVELOPMENT.md missing -> required and unsatisfied.
     let out = env.run(&["preflight", "--intent", "project-dev", "--format", "json"]);
@@ -51,6 +53,9 @@ fn code_repo_requires_the_code_doc() {
 fn and_composition_requires_all_atoms() {
     let env = TestEnv::new();
     env.write_home_catalog(
+        "[[document]]\ncontext = \"project-dev\"\nscope = \"project\"\npath = \"DEVELOPMENT.md\"\nrequired = true\nwhen = \"path-exists:Cargo.toml && path-exists:src/**\"\n",
+    );
+    env.write_project_catalog(
         "[[document]]\ncontext = \"project-dev\"\nscope = \"project\"\npath = \"DEVELOPMENT.md\"\nrequired = true\nwhen = \"path-exists:Cargo.toml && path-exists:src/**\"\n",
     );
     // Only Cargo.toml, no src/** -> AND clause false -> not required.

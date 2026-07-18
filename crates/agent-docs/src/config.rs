@@ -102,7 +102,7 @@ pub(crate) fn load_scope_catalog_from_str(
     file_path: &Path,
     raw: &str,
 ) -> Result<ScopeCatalog, ConfigLoadError> {
-    let parsed = parse_toml(file_path, raw)?;
+    let parsed = parse_toml(file_path, raw, origin)?;
     let documents = parse_documents(source_scope, origin, file_path, &parsed)?;
     let validations = parse_validations(file_path, &parsed)?;
     let skill_policy = parse_skill_policy(file_path, &parsed)?;
@@ -152,10 +152,14 @@ fn same_config_file(docs_home: &Path, project_path: &Path) -> bool {
     home == project
 }
 
-fn parse_toml(file_path: &Path, raw: &str) -> Result<Value, ConfigLoadError> {
+fn parse_toml(
+    file_path: &Path,
+    raw: &str,
+    origin: CatalogOrigin,
+) -> Result<Value, ConfigLoadError> {
     raw.parse::<toml::Table>()
         .map(Value::Table)
-        .map_err(|err| parse_error(file_path, raw, &err))
+        .map_err(|err| parse_error(file_path, raw, &err, origin))
 }
 
 fn array_of_tables<'a>(
@@ -214,7 +218,7 @@ fn parse_documents(
         )?;
         let context = parse_context(file_path, "document", index, table)?;
         let scope = parse_scope(file_path, index, table)?;
-        validate_scope_for_source(source_scope, scope, file_path, index)?;
+        validate_scope_for_source(source_scope, origin, scope, file_path, index)?;
         let path = parse_path(file_path, index, table, origin)?;
         let products = parse_products(file_path, "document", index, table)?;
         let required = parse_bool(file_path, index, table, "required")?.unwrap_or(false);
@@ -501,10 +505,20 @@ fn parse_allowed_prefixes(file_path: &Path, value: &Value) -> Result<Vec<String>
 
 fn validate_scope_for_source(
     source_scope: Scope,
+    origin: CatalogOrigin,
     document_scope: Scope,
     file_path: &Path,
     index: usize,
 ) -> Result<(), ConfigLoadError> {
+    if origin == CatalogOrigin::User && document_scope != Scope::Project {
+        return Err(ConfigLoadError::validation(
+            file_path.to_path_buf(),
+            "document",
+            index,
+            "scope",
+            "private/user catalog documents require project scope",
+        ));
+    }
     if source_scope == Scope::Project && document_scope == Scope::Global {
         return Err(ConfigLoadError::validation(
             file_path.to_path_buf(),
@@ -832,16 +846,22 @@ fn value_type(value: &Value) -> &'static str {
     }
 }
 
-fn parse_error(file_path: &Path, raw: &str, err: &toml::de::Error) -> ConfigLoadError {
+fn parse_error(
+    file_path: &Path,
+    raw: &str,
+    err: &toml::de::Error,
+    origin: CatalogOrigin,
+) -> ConfigLoadError {
     let location = err
         .span()
         .map(|span| byte_offset_to_line_column(raw, span.start));
+    let message = if origin == CatalogOrigin::User {
+        "invalid private catalog TOML".to_string()
+    } else {
+        format!("invalid TOML in {CONFIG_FILE_NAME}: {err}")
+    };
 
-    ConfigLoadError::parse(
-        file_path.to_path_buf(),
-        format!("invalid TOML in {CONFIG_FILE_NAME}: {err}"),
-        location,
-    )
+    ConfigLoadError::parse(file_path.to_path_buf(), message, location)
 }
 
 fn byte_offset_to_line_column(raw: &str, offset: usize) -> ConfigErrorLocation {

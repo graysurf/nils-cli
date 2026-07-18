@@ -11,6 +11,7 @@ fn marker_catalog() -> &'static str {
 fn zero_byte_required_doc_is_invalid() {
     let env = TestEnv::new();
     env.write_home_catalog(marker_catalog());
+    env.write_project_catalog(marker_catalog());
     env.write_project_doc("DEVELOPMENT.md", "");
     let out = env.run(&["preflight", "--intent", "project-dev", "--format", "json"]);
     let json = out.json();
@@ -28,6 +29,7 @@ fn zero_byte_required_doc_is_invalid() {
 fn marker_less_required_doc_is_invalid() {
     let env = TestEnv::new();
     env.write_home_catalog(marker_catalog());
+    env.write_project_catalog(marker_catalog());
     env.write_project_doc("DEVELOPMENT.md", "# Dev\n\nno validation section here\n");
     let out = env.run(&["preflight", "--intent", "project-dev", "--format", "json"]);
     let doc = &out.json()["documents"][0];
@@ -39,6 +41,7 @@ fn marker_less_required_doc_is_invalid() {
 fn valid_doc_passes() {
     let env = TestEnv::new();
     env.write_home_catalog(marker_catalog());
+    env.write_project_catalog(marker_catalog());
     env.write_project_doc(
         "DEVELOPMENT.md",
         "# Dev\n\n## Validation\n\nrun the tests\n",
@@ -60,6 +63,7 @@ fn valid_doc_passes() {
 fn audit_flags_invalid_required_doc() {
     let env = TestEnv::new();
     env.write_home_catalog(marker_catalog());
+    env.write_project_catalog(marker_catalog());
     env.write_project_doc("DEVELOPMENT.md", "");
     let out = env.run(&["audit", "--target", "project", "--format", "json"]);
     let json = out.json();
