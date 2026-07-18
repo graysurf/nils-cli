@@ -6774,11 +6774,13 @@ unsafe extern "C" {
         task: libc::mach_port_t,
         name: libc::mach_port_t,
     ) -> libc::kern_return_t;
+    #[link_name = "mach_task_self_"]
+    static CURRENT_MACH_TASK: libc::mach_port_t;
 }
 
 #[cfg(target_os = "macos")]
 fn current_mach_task() -> libc::mach_port_t {
-    unsafe { libc::mach_task_self_ }
+    unsafe { CURRENT_MACH_TASK }
 }
 
 #[cfg(target_os = "macos")]
@@ -8346,6 +8348,14 @@ mod tests {
             .process_group(0)
             .spawn()
             .expect("spawn authenticated supervisor output fixture");
+        let fallback_owner = if scenario == "internal-failure" {
+            None
+        } else {
+            Some(
+                ProcessOwner::for_root(child.id() as libc::pid_t)
+                    .expect("create scoped output fallback owner"),
+            )
+        };
         drop(receiver);
         if let Err(error) = sender.write_all(PROCESS_SUPERVISOR_CAPABILITY) {
             unsafe {
@@ -8369,7 +8379,7 @@ mod tests {
             child,
             supervised: true,
             cleanup_proof: Some(sender),
-            fallback_owner: None,
+            fallback_owner,
         }
     }
 
