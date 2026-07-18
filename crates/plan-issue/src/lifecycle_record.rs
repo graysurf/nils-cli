@@ -1,13 +1,14 @@
 use std::collections::BTreeMap;
 
 use nils_markdown::Engine;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::commands::record::{LifecycleCommentKind, RecordProfile, TaskLedgerDisplay};
 
 const DASHBOARD_TEMPLATE: &str = include_str!("../templates/lifecycle_record/dashboard.md.tera");
 const DASHBOARD_TEMPLATE_NAME: &str = "lifecycle_record_dashboard";
+const RECORD_IDENTITY_COMMENT_PREFIX: &str = "<!-- plan-issue-record-identity:v1:hex:";
 
 const SNAPSHOT_TEMPLATE: &str = include_str!("../templates/lifecycle_record/snapshot.md.tera");
 const SNAPSHOT_TEMPLATE_NAME: &str = "lifecycle_record_snapshot";
@@ -139,6 +140,7 @@ struct SnapshotView<'a> {
     profile: &'a str,
     path: Option<&'a str>,
     commit: Option<&'a str>,
+    committed: bool,
     summary: Option<&'a str>,
     details_summary: &'static str,
     content: &'a str,
@@ -147,6 +149,7 @@ struct SnapshotView<'a> {
 
 #[derive(Debug, Serialize)]
 struct DashboardView<'a> {
+    identity_marker: String,
     title: &'static str,
     status: String,
     profile: &'a str,
@@ -248,6 +251,12 @@ pub struct LifecycleEvidence {
     /// missing payloads as unparseable evidence.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub payload: Option<RecordPayload>,
+    /// Title recovered from the selected latest plan comment. Kept internal so
+    /// pre-title snapshots without `SnapshotData.title` never scan unrelated
+    /// issue body or older role text.
+    #[serde(skip)]
+    #[doc(hidden)]
+    pub plan_title: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -257,9 +266,27 @@ pub struct UnsupportedMarker {
     pub created_at: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RecordIdentity {
+    pub profile: String,
+    pub source_path: String,
+    pub source_commit: String,
+}
+
+impl RecordIdentity {
+    pub fn matches(&self, profile: RecordProfile, source_path: &str, source_commit: &str) -> bool {
+        self.profile == profile.as_str()
+            && self.source_path == source_path
+            && self.source_commit == source_commit
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct RecordAudit {
     pub profile_filter: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub record_identity: Option<RecordIdentity>,
     pub body_sections: BodySections,
     /// Latest v2 lifecycle evidence indexed by role name (`source`,
     /// `plan`, `state`, `session`, `validation`, `review`, `closeout`).
@@ -299,6 +326,55 @@ struct CommentJson {
     created_at: Option<String>,
 }
 
+pub fn render_record_identity_marker(
+    profile: RecordProfile,
+    source_path: &str,
+    source_commit: &str,
+) -> String {
+    let identity = RecordIdentity {
+        profile: profile.as_str().to_string(),
+        source_path: source_path.to_string(),
+        source_commit: source_commit.to_string(),
+    };
+    let payload = serde_json::to_vec(&identity).expect("record identity serializes");
+    format!(
+        "{RECORD_IDENTITY_COMMENT_PREFIX}{} -->",
+        encode_hex(&payload)
+    )
+}
+
+pub fn extract_record_identity(body: &str) -> Result<Option<RecordIdentity>, String> {
+    let count = body.matches(RECORD_IDENTITY_COMMENT_PREFIX).count();
+    if count == 0 {
+        return Ok(None);
+    }
+    if count != 1 {
+        return Err("issue body contains multiple record identity markers".to_string());
+    }
+    let line = body
+        .lines()
+        .find(|line| line.contains(RECORD_IDENTITY_COMMENT_PREFIX))
+        .map(str::trim)
+        .ok_or_else(|| "record identity marker line is missing".to_string())?;
+    let encoded = line
+        .strip_prefix(RECORD_IDENTITY_COMMENT_PREFIX)
+        .and_then(|value| value.strip_suffix(" -->"))
+        .ok_or_else(|| "record identity marker is malformed".to_string())?;
+    let decoded = decode_hex(encoded)?;
+    let identity: RecordIdentity = serde_json::from_slice(&decoded)
+        .map_err(|err| format!("record identity payload is invalid: {err}"))?;
+    if !matches!(identity.profile.as_str(), "tracking" | "dispatch") {
+        return Err(format!(
+            "record identity profile `{}` is unsupported",
+            identity.profile
+        ));
+    }
+    if identity.source_path.trim().is_empty() || identity.source_commit.trim().is_empty() {
+        return Err("record identity fields must be non-empty".to_string());
+    }
+    Ok(Some(identity))
+}
+
 pub fn render_dashboard(input: DashboardInput) -> String {
     let title = if input.status.trim().eq_ignore_ascii_case("complete") {
         "## Final Dashboard"
@@ -310,6 +386,7 @@ pub fn render_dashboard(input: DashboardInput) -> String {
     let tracker_block = render_tracker_block(input.title.as_deref(), input.issue_url.as_deref());
 
     let view = DashboardView {
+        identity_marker: String::new(),
         title,
         status: input.status.trim().to_string(),
         profile: input.profile.as_str(),
@@ -398,6 +475,7 @@ pub fn audit_record(
     comments_json: &str,
     profile_filter: Option<RecordProfile>,
 ) -> Result<RecordAudit, String> {
+    let explicit_record_identity = body.map(extract_record_identity).transpose()?.flatten();
     let mut comments = parse_comments_json(comments_json)?;
     comments.sort_by(|left, right| {
         compare_created_at(right.created_at.as_deref(), left.created_at.as_deref())
@@ -455,6 +533,28 @@ pub fn audit_record(
                     })?;
                 }
                 let status = payload.as_ref().and_then(derive_status_from_payload);
+                let plan_title = matches!(role, PayloadRole::Plan)
+                    .then(|| {
+                        payload
+                            .as_ref()
+                            .and_then(|payload| payload.parse_snapshot().ok())
+                            .and_then(|snapshot| snapshot.title)
+                            .filter(|title| !title.trim().is_empty())
+                            .or_else(|| {
+                                extract_snapshot_content(comment_body)
+                                    .ok()
+                                    .and_then(|content| {
+                                        content.lines().find_map(|line| {
+                                            line.trim()
+                                                .strip_prefix("# ")
+                                                .map(str::trim)
+                                                .filter(|title| !title.is_empty())
+                                                .map(str::to_string)
+                                        })
+                                    })
+                            })
+                    })
+                    .flatten();
                 let candidate = LifecycleEvidence {
                     role,
                     profile,
@@ -462,6 +562,7 @@ pub fn audit_record(
                     created_at: created_at.clone(),
                     status,
                     payload,
+                    plan_title,
                 };
                 evidence_text.push_str(comment_body);
                 evidence_text.push('\n');
@@ -486,8 +587,19 @@ pub fn audit_record(
         }
     }
 
+    let record_identity = explicit_record_identity.or_else(|| {
+        let source = evidence.get("source")?;
+        let snapshot = source.payload.as_ref()?.parse_snapshot().ok()?;
+        Some(RecordIdentity {
+            profile: source.profile.as_str().to_string(),
+            source_path: snapshot.path,
+            source_commit: snapshot.commit,
+        })
+    });
+
     Ok(RecordAudit {
         profile_filter: profile_filter.map(|profile| profile.as_str().to_string()),
+        record_identity,
         body_sections: inspect_body_sections(body.unwrap_or_default()),
         evidence,
         missing_required,
@@ -592,10 +704,37 @@ fn review_decision_label(value: ReviewDecision) -> &'static str {
     }
 }
 
+fn is_dashboard_status_token(value: &str) -> bool {
+    let normalized = value.trim().to_ascii_lowercase().replace('_', "-");
+    matches!(
+        normalized.as_str(),
+        "initial"
+            | "implementing"
+            | "validating"
+            | "reviewing"
+            | "in-progress"
+            | "ready-for-close"
+            | "closed"
+            | "blocked"
+            | "complete"
+            | "done"
+            | "pending"
+            | "deferred"
+            | "waived"
+    )
+}
+
+fn legacy_plan_title_from_evidence(audit: &RecordAudit) -> Option<String> {
+    audit
+        .evidence
+        .get("plan")
+        .and_then(|evidence| evidence.plan_title.clone())
+}
+
 /// Render the canonical dashboard for an issue-backed plan record from
 /// audit evidence alone — callers no longer need to pass every per-role
-/// URL. Returns a `## Final Dashboard` when the latest state payload
-/// reports `status=complete`, otherwise `## Current Dashboard`. Pending
+/// URL. Returns a `## Final Dashboard` when the latest closeout payload
+/// reports `final_status=complete`, otherwise `## Current Dashboard`. Pending
 /// roles render as `pending` so the dashboard remains idempotent across
 /// repeated calls with the same evidence.
 pub fn render_dashboard_from_audit(
@@ -607,10 +746,12 @@ pub fn render_dashboard_from_audit(
     let state_data = state_evidence
         .and_then(|hit| hit.payload.as_ref())
         .and_then(|payload| payload.parse_state().ok());
-    let is_complete = state_evidence
-        .and_then(|hit| hit.status.as_deref())
-        .map(|status| status.eq_ignore_ascii_case("complete"))
-        .unwrap_or(false);
+    let is_complete = audit
+        .evidence
+        .get("closeout")
+        .and_then(|hit| hit.payload.as_ref())
+        .and_then(|payload| payload.parse_closeout().ok())
+        .is_some_and(|closeout| closeout.final_status.eq_ignore_ascii_case("complete"));
 
     let dashboard_title = if is_complete {
         "## Final Dashboard"
@@ -629,22 +770,58 @@ pub fn render_dashboard_from_audit(
         })
         .unwrap_or_else(|| "tracking".to_string());
 
-    let status_value = state_evidence
-        .and_then(|hit| hit.status.clone())
-        .unwrap_or_else(|| "pending".to_string());
+    let status_value = if is_complete {
+        "complete".to_string()
+    } else {
+        state_evidence
+            .and_then(|hit| hit.status.clone())
+            .unwrap_or_else(|| "pending".to_string())
+    };
 
-    let target_scope = state_data
+    let plan_title = audit
+        .evidence
+        .get("plan")
+        .and_then(|hit| hit.payload.as_ref())
+        .and_then(|payload| payload.parse_snapshot().ok())
+        .and_then(|snapshot| snapshot.title)
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| legacy_plan_title_from_evidence(audit));
+    let projected_target_scope = state_data
         .as_ref()
         .and_then(|data| data.target_scope.clone())
-        .unwrap_or_else(|| "pending".to_string());
-    let current = state_data
-        .as_ref()
-        .and_then(|data| data.current.clone())
-        .unwrap_or_else(|| "pending".to_string());
-    let next_action = state_data
-        .as_ref()
-        .and_then(|data| data.next_action.clone())
-        .unwrap_or_else(|| "pending".to_string());
+        .filter(|value| !value.trim().is_empty());
+    let target_scope = if is_complete {
+        plan_title.unwrap_or_else(|| {
+            if projected_target_scope
+                .as_deref()
+                .is_none_or(is_dashboard_status_token)
+            {
+                title
+                    .map(str::to_string)
+                    .unwrap_or_else(|| "pending".to_string())
+            } else {
+                projected_target_scope.expect("non-empty target scope")
+            }
+        })
+    } else {
+        projected_target_scope.unwrap_or_else(|| "pending".to_string())
+    };
+    let current = if is_complete {
+        "complete".to_string()
+    } else {
+        state_data
+            .as_ref()
+            .and_then(|data| data.current.clone())
+            .unwrap_or_else(|| "pending".to_string())
+    };
+    let next_action = if is_complete {
+        "none".to_string()
+    } else {
+        state_data
+            .as_ref()
+            .and_then(|data| data.next_action.clone())
+            .unwrap_or_else(|| "pending".to_string())
+    };
     let validation_status = audit
         .evidence
         .get("validation")
@@ -674,8 +851,20 @@ pub fn render_dashboard_from_audit(
     let is_dispatch_profile = profile_str == "dispatch";
     let show_review = is_dispatch_profile || audit.evidence.contains_key("review");
     let tracker_block = render_tracker_block(title, issue_url);
+    let identity_marker = audit
+        .record_identity
+        .as_ref()
+        .map(|identity| {
+            let profile = match identity.profile.as_str() {
+                "dispatch" => RecordProfile::Dispatch,
+                _ => RecordProfile::Tracking,
+            };
+            render_record_identity_marker(profile, &identity.source_path, &identity.source_commit)
+        })
+        .unwrap_or_default();
 
     let view = DashboardView {
+        identity_marker,
         title: dashboard_title,
         status: status_value,
         profile: &profile_str,
@@ -1477,6 +1666,12 @@ fn hex_value(byte: u8) -> Option<u8> {
 }
 
 impl RecordPayload {
+    /// Compare the semantic lifecycle content while ignoring emission time.
+    /// Schema validation has already occurred before a payload enters an audit.
+    pub(crate) fn semantically_matches(&self, other: &Self) -> bool {
+        self.role == other.role && self.profile == other.profile && self.data == other.data
+    }
+
     pub fn parse_state(&self) -> Result<StateData, PayloadError> {
         self.decode_data(PayloadRole::State)
     }
@@ -1632,6 +1827,7 @@ pub fn render_record_snapshot_comment(
         profile: profile.as_str(),
         path,
         commit,
+        committed: commit.is_some_and(|value| !value.starts_with("dirty-sha256:")),
         summary,
         details_summary: default_details_summary(kind),
         content,
@@ -2856,6 +3052,29 @@ mod sprint3_tests {
         json!(format!(
             "<!-- plan-issue-record:v2 role={role} profile=tracking -->\n\n```{PAYLOAD_FENCE_INFO}\n{payload_json}\n```\n",
         ))
+    }
+
+    #[test]
+    fn record_payload_semantic_match_ignores_updated_at_only() {
+        let expected = RecordPayload {
+            schema: PAYLOAD_SCHEMA_V2.to_string(),
+            role: PayloadRole::Closeout,
+            profile: PayloadProfile::Tracking,
+            updated_at: Some("2026-07-18T01:00:00Z".to_string()),
+            data: json!({"final_status": "complete"}),
+        };
+        let mut candidate = expected.clone();
+        candidate.updated_at = Some("2026-07-18T02:00:00Z".to_string());
+        assert!(expected.semantically_matches(&candidate));
+
+        candidate.role = PayloadRole::Review;
+        assert!(!expected.semantically_matches(&candidate));
+        candidate = expected.clone();
+        candidate.profile = PayloadProfile::Dispatch;
+        assert!(!expected.semantically_matches(&candidate));
+        candidate = expected.clone();
+        candidate.data = json!({"final_status": "complete", "notes": "different"});
+        assert!(!expected.semantically_matches(&candidate));
     }
 
     #[test]

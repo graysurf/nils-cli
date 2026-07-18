@@ -27,6 +27,8 @@ const SCRUBBED_ENV: &[&str] = &[
     "FORGE_CLI_INBOX_CACHE_MAX_AGE",
     "FORGE_CLI_INBOX_NO_CACHE",
     "FORGE_CLI_INBOX_CACHE_DIR",
+    "GH_HOST",
+    "GITLAB_HOST",
 ];
 
 /// Resolve the compiled `forge-cli` binary. Uses the shared
@@ -124,8 +126,9 @@ pub fn run_forge_cli(stub: &StubEnv, args: &[&str]) -> CmdOutput {
     run_forge_cli_in(stub, args, None)
 }
 
-/// Run `forge-cli` from inside `cwd`. When `cwd` is `None`, the binary inherits
-/// the parent test's working directory.
+/// Run `forge-cli` from inside `cwd`. When `cwd` is `None`, the binary runs in
+/// the stub's isolated temp directory so the developer checkout's Git remote
+/// cannot affect provider-routing fixtures.
 pub fn run_forge_cli_in(stub: &StubEnv, args: &[&str], cwd: Option<&Path>) -> CmdOutput {
     let mut cmd = Command::new(forge_cli_bin());
     cmd.args(args);
@@ -147,9 +150,7 @@ pub fn run_forge_cli_in(stub: &StubEnv, args: &[&str], cwd: Option<&Path>) -> Cm
     for (k, v) in &stub.envs {
         cmd.env(k, v);
     }
-    if let Some(dir) = cwd {
-        cmd.current_dir(dir);
-    }
+    cmd.current_dir(cwd.unwrap_or_else(|| stub.tempdir.path()));
     let output = cmd.output().expect("spawn forge-cli");
     CmdOutput {
         code: output.status.code().unwrap_or(-1),
@@ -171,6 +172,7 @@ pub fn run_forge_cli_with_stdin(stub: &StubEnv, args: &[&str], stdin: &str) -> C
     for (k, v) in &stub.envs {
         cmd.env(k, v);
     }
+    cmd.current_dir(stub.tempdir.path());
     let mut child = cmd
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())

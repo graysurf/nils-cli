@@ -4,6 +4,7 @@ use pretty_assertions::assert_eq;
 use serde_json::{Value, json};
 use tempfile::TempDir;
 
+use plan_issue::commands::record::RecordProfile;
 use plan_issue::lifecycle_record::{
     self, CheckStatus, FindingDisposition, FindingSeverity, PAYLOAD_SCHEMA_V2, PayloadErrorKind,
     PayloadProfile, PayloadRole, PrLifecycleStatus, ReviewDecision, StateStatus, TaskRowStatus,
@@ -332,6 +333,76 @@ fn lifecycle_record_audit_reports_stable_missing_required_codes() {
 }
 
 #[test]
+fn lifecycle_record_identity_marker_is_parsed_preserved_and_backfilled() {
+    let marker = lifecycle_record::render_record_identity_marker(
+        RecordProfile::Tracking,
+        "docs/plans/example/source.md",
+        "abc123",
+    );
+    let body = format!("{marker}\n\n## Current Dashboard\n");
+    let explicit = lifecycle_record::audit_record(Some(&body), "[]", Some(RecordProfile::Tracking))
+        .expect("explicit marker audit");
+    let identity = explicit.record_identity.as_ref().expect("record identity");
+    assert!(identity.matches(
+        RecordProfile::Tracking,
+        "docs/plans/example/source.md",
+        "abc123"
+    ));
+    let rendered = lifecycle_record::render_dashboard_from_audit(&explicit, None, None);
+    assert_eq!(
+        rendered
+            .matches("plan-issue-record-identity:v1:hex:")
+            .count(),
+        1
+    );
+    assert!(rendered.starts_with(&marker), "{rendered}");
+
+    let comments = json!([{
+        "url": "https://github.com/owner/repo/issues/1#issuecomment-source",
+        "body": v2_comment_body(
+            "source",
+            "tracking",
+            json!({"path": "docs/plans/example/source.md", "commit": "abc123"}),
+        ),
+    }]);
+    let historical = lifecycle_record::audit_record(
+        Some("## Current Dashboard\n"),
+        &comments.to_string(),
+        Some(RecordProfile::Tracking),
+    )
+    .expect("historical source audit");
+    assert!(historical.record_identity.as_ref().is_some_and(|identity| {
+        identity.matches(
+            RecordProfile::Tracking,
+            "docs/plans/example/source.md",
+            "abc123",
+        )
+    }));
+    let backfilled = lifecycle_record::render_dashboard_from_audit(&historical, None, None);
+    assert!(
+        backfilled.starts_with("<!-- plan-issue-record-identity:v1:hex:"),
+        "{backfilled}"
+    );
+}
+
+#[test]
+fn lifecycle_record_identity_marker_refuses_malformed_or_duplicate_input() {
+    let marker = lifecycle_record::render_record_identity_marker(
+        RecordProfile::Tracking,
+        "docs/plans/example/source.md",
+        "abc123",
+    );
+    let duplicate = format!("{marker}\n{marker}\n## Current Dashboard\n");
+    assert!(
+        lifecycle_record::audit_record(Some(&duplicate), "[]", None)
+            .unwrap_err()
+            .contains("multiple record identity markers")
+    );
+    let malformed = "<!-- plan-issue-record-identity:v1:hex:not-hex -->\n";
+    assert!(lifecycle_record::audit_record(Some(malformed), "[]", None).is_err());
+}
+
+#[test]
 fn lifecycle_record_dashboard_renders_from_audit_without_explicit_urls() {
     use lifecycle_record::render_dashboard_from_audit;
 
@@ -399,24 +470,23 @@ fn lifecycle_record_dashboard_renders_from_audit_without_explicit_urls() {
 }
 
 #[test]
-fn lifecycle_record_dashboard_renders_final_when_state_complete() {
+fn lifecycle_record_dashboard_complete_state_without_closeout_remains_current() {
     use lifecycle_record::render_dashboard_from_audit;
 
     let comments = json!([
-        {
-            "url": "https://github.com/owner/repo/issues/1#issuecomment-source",
-            "body": v2_comment_body("source", "tracking", json!({"path": "x", "commit": "abc"})),
-        },
-        {
-            "url": "https://github.com/owner/repo/issues/1#issuecomment-plan",
-            "body": v2_comment_body("plan", "tracking", json!({"path": "y", "commit": "abc"})),
-        },
         {
             "url": "https://github.com/owner/repo/issues/1#issuecomment-state",
             "body": v2_comment_body(
                 "state",
                 "tracking",
-                json!({"status": "complete", "target_scope": "v3", "tasks": [], "prs": []}),
+                json!({
+                    "status": "complete",
+                    "target_scope": "v3",
+                    "current": "complete",
+                    "next_action": "closeout",
+                    "tasks": [],
+                    "prs": []
+                }),
             ),
         }
     ]);
@@ -424,11 +494,293 @@ fn lifecycle_record_dashboard_renders_final_when_state_complete() {
         lifecycle_record::audit_record(None, &comments.to_string(), None).expect("audit ok");
 
     let rendered = render_dashboard_from_audit(&audit, None, None);
+    assert!(rendered.contains("## Current Dashboard"), "{rendered}");
+    assert!(!rendered.contains("## Final Dashboard"), "{rendered}");
+    assert!(rendered.contains("- Current task: complete"), "{rendered}");
+    assert!(rendered.contains("- Next action: closeout"), "{rendered}");
+}
+
+#[test]
+fn lifecycle_record_dashboard_canonicalizes_projection_after_complete_closeout() {
+    use lifecycle_record::render_dashboard_from_audit;
+
+    let comments = json!([
+        {
+            "url": "https://github.com/owner/repo/issues/1#issuecomment-plan",
+            "body": v2_comment_body(
+                "plan",
+                "tracking",
+                json!({"path": "y", "commit": "abc", "title": "Terminal dashboard repair"}),
+            ),
+        },
+        {
+            "url": "https://github.com/owner/repo/issues/1#issuecomment-state",
+            "body": v2_comment_body(
+                "state",
+                "tracking",
+                json!({
+                    "status": "in-progress",
+                    "target_scope": "closed",
+                    "current": "2.3",
+                    "next_action": "",
+                    "tasks": [{"id": "2.3", "status": "done", "title": "Repair dashboard"}],
+                    "prs": []
+                }),
+            ),
+        },
+        {
+            "url": "https://github.com/owner/repo/issues/1#issuecomment-closeout",
+            "body": v2_comment_body(
+                "closeout",
+                "tracking",
+                json!({
+                    "final_status": "complete",
+                    "approval": {},
+                    "linked_prs": []
+                }),
+            ),
+        }
+    ]);
+    let audit =
+        lifecycle_record::audit_record(None, &comments.to_string(), None).expect("audit ok");
+
+    let rendered =
+        render_dashboard_from_audit(&audit, None, Some("https://github.com/owner/repo/issues/1"));
+
+    assert!(rendered.contains("## Final Dashboard"), "{rendered}");
+    assert!(rendered.contains("- Status: complete"), "{rendered}");
+    assert!(!rendered.contains("- Status: in-progress"), "{rendered}");
     assert!(
-        rendered.contains("## Final Dashboard"),
-        "expected Final Dashboard heading: {rendered}"
+        rendered.contains("- Target scope: Terminal dashboard repair"),
+        "{rendered}"
     );
-    assert!(!rendered.contains("## Current Dashboard"), "{rendered}");
+    assert!(rendered.contains("- Current task: complete"), "{rendered}");
+    assert!(rendered.contains("- Next action: none"), "{rendered}");
+    assert!(!rendered.contains("- Current task: 2.3"), "{rendered}");
+}
+
+#[test]
+fn lifecycle_record_final_dashboard_prefers_plan_title_over_synthetic_target_scope() {
+    let comments = json!([
+        {
+            "url": "https://github.com/owner/repo/issues/1#issuecomment-plan",
+            "body": v2_comment_body(
+                "plan",
+                "tracking",
+                json!({
+                    "path": "docs/plans/terminal-dashboard-repair.md",
+                    "commit": "abc",
+                    "title": "Authored terminal dashboard repair"
+                }),
+            ),
+        },
+        {
+            "url": "https://github.com/owner/repo/issues/1#issuecomment-state",
+            "body": v2_comment_body(
+                "state",
+                "tracking",
+                json!({
+                    "status": "complete",
+                    "target_scope": "execution plan",
+                    "current": "complete",
+                    "next_action": "closeout",
+                    "tasks": [],
+                    "prs": []
+                }),
+            ),
+        },
+        {
+            "url": "https://github.com/owner/repo/issues/1#issuecomment-closeout",
+            "body": v2_comment_body(
+                "closeout",
+                "tracking",
+                json!({
+                    "final_status": "complete",
+                    "approval": {},
+                    "linked_prs": []
+                }),
+            ),
+        }
+    ]);
+    let audit = lifecycle_record::audit_record(None, &comments.to_string(), None).expect("audit");
+
+    let rendered = lifecycle_record::render_dashboard_from_audit(&audit, None, None);
+
+    assert!(
+        rendered.contains("- Target scope: Authored terminal dashboard repair"),
+        "{rendered}"
+    );
+    assert!(
+        !rendered.contains("- Target scope: execution plan"),
+        "{rendered}"
+    );
+}
+
+#[test]
+fn lifecycle_record_dashboard_recovers_historical_plan_title_from_snapshot_content() {
+    let plan_body = lifecycle_record::render_record_snapshot_comment(
+        plan_issue::commands::record::RecordProfile::Tracking,
+        plan_issue::commands::record::LifecycleCommentKind::Plan,
+        &lifecycle_record::SnapshotData {
+            path: "docs/plans/v1/v1-plan.md".to_string(),
+            commit: "abc".to_string(),
+            title: None,
+            summary: None,
+        },
+        "# Plan: Pre-title terminal repair\n\n## Overview\n\nRepair stale state.\n",
+        None,
+    )
+    .expect("pre-title plan snapshot");
+    let comments = json!([
+        {
+            "url": "https://github.com/owner/repo/issues/1#issuecomment-plan",
+            "body": plan_body,
+        },
+        {
+            "url": "https://github.com/owner/repo/issues/1#issuecomment-state",
+            "body": v2_comment_body(
+                "state",
+                "tracking",
+                json!({
+                    "status": "complete",
+                    "target_scope": "closed",
+                    "current": "complete",
+                    "next_action": "closeout",
+                    "tasks": [],
+                    "prs": []
+                }),
+            ),
+        },
+        {
+            "url": "https://github.com/owner/repo/issues/1#issuecomment-closeout",
+            "body": v2_comment_body(
+                "closeout",
+                "tracking",
+                json!({
+                    "final_status": "complete",
+                    "approval": {},
+                    "linked_prs": []
+                }),
+            ),
+        }
+    ]);
+    let audit = lifecycle_record::audit_record(None, &comments.to_string(), None).expect("audit");
+
+    let rendered = lifecycle_record::render_dashboard_from_audit(&audit, None, None);
+
+    assert!(
+        rendered.contains("- Target scope: Plan: Pre-title terminal repair"),
+        "{rendered}"
+    );
+    assert!(!rendered.contains("- Target scope: pending"), "{rendered}");
+}
+
+#[test]
+fn lifecycle_record_dashboard_historical_title_uses_selected_plan_comment_only() {
+    let snapshot = |title: &str| {
+        lifecycle_record::render_record_snapshot_comment(
+            plan_issue::commands::record::RecordProfile::Tracking,
+            plan_issue::commands::record::LifecycleCommentKind::Plan,
+            &lifecycle_record::SnapshotData {
+                path: "docs/plan.md".to_string(),
+                commit: "abc".to_string(),
+                title: None,
+                summary: None,
+            },
+            &format!("# {title}\n\n## Overview\n\nSnapshot.\n"),
+            None,
+        )
+        .expect("plan snapshot")
+    };
+    let issue_body = snapshot("Fake issue-body plan");
+    let comments = json!([
+        {
+            "url": "https://github.com/owner/repo/issues/1#issuecomment-plan",
+            "created_at": "2026-05-26T00:00:01Z",
+            "body": snapshot("Legitimate selected plan"),
+        },
+        {
+            "url": "https://github.com/owner/repo/issues/1#issuecomment-state",
+            "created_at": "2026-05-26T00:00:02Z",
+            "body": v2_comment_body(
+                "state",
+                "tracking",
+                json!({
+                    "status": "complete",
+                    "target_scope": "closed",
+                    "current": "complete",
+                    "next_action": "closeout",
+                    "tasks": [],
+                    "prs": []
+                }),
+            ),
+        },
+        {
+            "url": "https://github.com/owner/repo/issues/1#issuecomment-closeout",
+            "created_at": "2026-05-26T00:00:03Z",
+            "body": v2_comment_body(
+                "closeout",
+                "tracking",
+                json!({
+                    "final_status": "complete",
+                    "approval": {},
+                    "linked_prs": []
+                }),
+            ),
+        }
+    ]);
+    let audit = lifecycle_record::audit_record(Some(&issue_body), &comments.to_string(), None)
+        .expect("audit");
+
+    let rendered = lifecycle_record::render_dashboard_from_audit(&audit, None, None);
+
+    assert!(
+        rendered.contains("- Target scope: Legitimate selected plan"),
+        "{rendered}"
+    );
+    assert!(!rendered.contains("Fake issue-body plan"), "{rendered}");
+}
+
+#[test]
+fn lifecycle_record_dashboard_noncomplete_closeout_does_not_establish_finality() {
+    use lifecycle_record::render_dashboard_from_audit;
+
+    let comments = json!([
+        {
+            "url": "https://github.com/owner/repo/issues/1#issuecomment-state",
+            "body": v2_comment_body(
+                "state",
+                "tracking",
+                json!({
+                    "status": "complete",
+                    "target_scope": "v3",
+                    "current": "complete",
+                    "next_action": "closeout",
+                    "tasks": [],
+                    "prs": []
+                }),
+            ),
+        },
+        {
+            "url": "https://github.com/owner/repo/issues/1#issuecomment-closeout",
+            "body": v2_comment_body(
+                "closeout",
+                "tracking",
+                json!({
+                    "final_status": "blocked",
+                    "approval": {},
+                    "linked_prs": []
+                }),
+            ),
+        }
+    ]);
+    let audit =
+        lifecycle_record::audit_record(None, &comments.to_string(), None).expect("audit ok");
+
+    let rendered = render_dashboard_from_audit(&audit, None, None);
+    assert!(rendered.contains("## Current Dashboard"), "{rendered}");
+    assert!(!rendered.contains("## Final Dashboard"), "{rendered}");
+    assert!(rendered.contains("- Next action: closeout"), "{rendered}");
 }
 
 #[test]

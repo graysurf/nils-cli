@@ -902,6 +902,7 @@ mod tests {
             format: Some(OutputFormat::Json),
             remote: "origin".into(),
             provider: Some(crate::cli::ProviderFlag::Github),
+            host: None,
             repo: Some("acme/widgets".into()),
             store_root: None,
             dry_run: false,

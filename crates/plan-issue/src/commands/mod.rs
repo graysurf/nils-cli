@@ -21,6 +21,158 @@ use self::record::RecordArgs;
 use self::sprint::{AcceptSprintArgs, MultiSprintGuideArgs, ReadySprintArgs, StartSprintArgs};
 use self::tracking::TrackingArgs;
 
+fn sanitize_linked_pr_argument(raw: &str) -> String {
+    if contains_prefixed_token(raw) || contains_bearer_token68(raw) {
+        return "[redacted]".to_string();
+    }
+
+    let Some(separator) = raw.find("://") else {
+        return raw.to_string();
+    };
+
+    let authority_start = separator + 3;
+    let authority_end = raw[authority_start..]
+        .find(['/', '?', '#'])
+        .map_or(raw.len(), |offset| authority_start + offset);
+    let authority = &raw[authority_start..authority_end];
+    let suffix = &raw[authority_end..];
+    let suffix_end = suffix.find(['?', '#']).unwrap_or(suffix.len());
+    let has_sensitive_suffix = suffix_end < suffix.len();
+    let Some((_, safe_authority)) = authority.rsplit_once('@') else {
+        if !has_sensitive_suffix {
+            return raw.to_string();
+        }
+        return format!(
+            "{}{}?<redacted>",
+            &raw[..authority_end],
+            &suffix[..suffix_end]
+        );
+    };
+
+    let mut sanitized = format!(
+        "{}<redacted-userinfo>@{}{}",
+        &raw[..authority_start],
+        safe_authority,
+        &suffix[..suffix_end]
+    );
+    if has_sensitive_suffix {
+        sanitized.push_str("?<redacted>");
+    }
+    sanitized
+}
+
+fn contains_prefixed_token(value: &str) -> bool {
+    const PREFIXES: [&str; 7] = [
+        "github_pat_",
+        "ghp_",
+        "ghs_",
+        "ghr_",
+        "gho_",
+        "ghu_",
+        "glpat-",
+    ];
+    const MIN_TOKEN_BODY_LEN: usize = 16;
+
+    let lower = value.to_ascii_lowercase();
+    PREFIXES.iter().any(|prefix| {
+        lower.match_indices(prefix).any(|(offset, _)| {
+            let boundary_before = offset == 0
+                || !lower.as_bytes()[offset - 1].is_ascii_alphanumeric()
+                    && lower.as_bytes()[offset - 1] != b'_';
+            let body = &lower[offset + prefix.len()..];
+            let body_len = body
+                .bytes()
+                .take_while(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+                .count();
+            boundary_before && body_len >= MIN_TOKEN_BODY_LEN
+        })
+    })
+}
+
+fn contains_bearer_token68(value: &str) -> bool {
+    let mut offset = 0;
+    while offset < value.len() {
+        let rest = &value[offset..];
+        let boundary_before = offset == 0
+            || !value[..offset]
+                .chars()
+                .next_back()
+                .is_some_and(|ch| ch.is_ascii_alphanumeric());
+        if boundary_before
+            && let Some(scheme) = rest.get(.."Bearer".len())
+            && scheme.eq_ignore_ascii_case("Bearer")
+        {
+            let after_scheme = &rest["Bearer".len()..];
+            let whitespace_len = after_scheme
+                .bytes()
+                .take_while(|byte| matches!(byte, b' ' | b'\t'))
+                .count();
+            if whitespace_len > 0 && token68_run_len(&after_scheme[whitespace_len..]) > 0 {
+                return true;
+            }
+        }
+        offset += rest
+            .chars()
+            .next()
+            .expect("offset remains on a character boundary")
+            .len_utf8();
+    }
+    false
+}
+
+fn token68_run_len(value: &str) -> usize {
+    let body_len = value
+        .bytes()
+        .take_while(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~' | b'+' | b'/')
+        })
+        .count();
+    if body_len == 0 {
+        return 0;
+    }
+    body_len
+        + value[body_len..]
+            .bytes()
+            .take_while(|byte| *byte == b'=')
+            .count()
+}
+
+fn redact_linked_pr_arguments(value: &mut Value) {
+    match value {
+        Value::String(raw) => *raw = sanitize_linked_pr_argument(raw),
+        Value::Array(items) => {
+            for item in items {
+                redact_linked_pr_arguments(item);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn redact_repository_arguments(value: &mut Value) {
+    match value {
+        Value::Object(fields) => {
+            for (name, field) in fields {
+                if name == "provider_repo"
+                    && let Some(raw) = field.as_str()
+                {
+                    *field = Value::String(crate::provider::credential_free_repo_argument(raw));
+                } else if name == "linked_pr" {
+                    redact_linked_pr_arguments(field);
+                } else {
+                    redact_repository_arguments(field);
+                }
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                redact_repository_arguments(item);
+            }
+        }
+        _ => {}
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, ValueEnum)]
 pub enum PrGrouping {
     #[value(name = "per-sprint", alias = "per-spring")]
@@ -268,7 +420,9 @@ impl Command {
             Self::Completion(args) => serde_json::to_value(args),
         };
 
-        payload.unwrap_or(Value::Null)
+        let mut payload = payload.unwrap_or(Value::Null);
+        redact_repository_arguments(&mut payload);
+        payload
     }
 
     pub fn validate(&self, dry_run: bool) -> Result<(), ValidationError> {
@@ -455,4 +609,63 @@ fn validate_multi_sprint_guide_args(args: &MultiSprintGuideArgs) -> Result<(), V
         ));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pretty_assertions::assert_eq;
+    use serde_json::json;
+
+    #[test]
+    fn linked_pr_argument_sanitizer_preserves_safe_references() {
+        let mut payload = json!({
+            "linked_pr": [
+                "acme/widgets#42",
+                "https://github.com/acme/widgets/pull/42"
+            ]
+        });
+
+        redact_repository_arguments(&mut payload);
+
+        assert_eq!(
+            payload,
+            json!({
+                "linked_pr": [
+                    "acme/widgets#42",
+                    "https://github.com/acme/widgets/pull/42"
+                ]
+            })
+        );
+    }
+
+    #[test]
+    fn linked_pr_argument_sanitizer_removes_url_credentials() {
+        let mut payload = json!({
+            "linked_pr": [
+                "https://alice:secret@github.com/acme/widgets/pull/42",
+                "https://github.com/acme/widgets/pull/42?token=secret#credential",
+                "ssh://deploy:private@gitlab.example.com/acme/widgets",
+                "prefix Authorization: Bearer abc~def+/== suffix",
+                "prefix bEaReR\tsecret-token== suffix"
+            ]
+        });
+
+        redact_repository_arguments(&mut payload);
+
+        let rendered = payload.to_string();
+        for secret in [
+            "alice",
+            "secret",
+            "credential",
+            "deploy",
+            "private",
+            "abc~def+/==",
+            "secret-token==",
+        ] {
+            assert!(!rendered.contains(secret), "{rendered}");
+        }
+        assert!(rendered.contains("github.com"), "{rendered}");
+        assert!(rendered.contains("gitlab.example.com"), "{rendered}");
+    }
 }

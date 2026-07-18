@@ -1,6 +1,8 @@
 //! High-level CLI behaviour: help, version, and --dry-run plumbing for the
 //! two read-only atoms.
 
+use std::process::Command;
+
 use pretty_assertions::assert_eq;
 
 use super::support::{StubEnv, parse_envelope, run_forge_cli};
@@ -29,6 +31,31 @@ fn help_lists_every_top_level_subcommand() {
     assert!(
         !out.stdout.contains("--json"),
         "must not surface --json flag"
+    );
+}
+
+#[test]
+fn root_repo_help_is_provider_neutral() {
+    let stub = StubEnv::new();
+    let out = run_forge_cli(&stub, &["--help"]);
+    assert_eq!(out.code, 0, "stderr={}", out.stderr);
+    for expected in [
+        "--repo <REPOSITORY>",
+        "Override the remote-derived repository path",
+        "GitHub `owner/name`",
+        "GitLab `group[/subgroup...]/project`",
+        "Local `local:<slug>` or `<slug>`",
+    ] {
+        assert!(
+            out.stdout.contains(expected),
+            "root --repo help missing {expected}: stdout={}",
+            out.stdout
+        );
+    }
+    assert!(
+        !out.stdout.contains("--repo <owner/name>"),
+        "root --repo value name must not imply a GitHub-only shape: stdout={}",
+        out.stdout
     );
 }
 
@@ -203,6 +230,54 @@ fn issue_help_lists_every_v1_subcommand() {
             out.stdout
         );
     }
+}
+
+#[test]
+fn forced_provider_and_repo_require_host_for_unclassified_remote_authority() {
+    let stub = StubEnv::new();
+    let init = Command::new("git")
+        .args(["init", "--quiet"])
+        .current_dir(stub.tempdir.path())
+        .status()
+        .expect("initialize Git repository");
+    assert!(init.success(), "git init failed: {init}");
+    let add_remote = Command::new("git")
+        .args([
+            "remote",
+            "add",
+            "origin",
+            "https://gitlab.corp.example/group/project.git",
+        ])
+        .current_dir(stub.tempdir.path())
+        .status()
+        .expect("add custom-authority Git remote");
+    assert!(add_remote.success(), "git remote add failed: {add_remote}");
+
+    let out = run_forge_cli(
+        &stub,
+        &[
+            "--provider",
+            "gitlab",
+            "--repo",
+            "group/project",
+            "--dry-run",
+            "--format",
+            "json",
+            "repo",
+            "view",
+        ],
+    );
+
+    assert_eq!(out.code, 64, "stdout={}\nstderr={}", out.stdout, out.stderr);
+    let envelope = parse_envelope(&out.stdout);
+    assert_eq!(envelope["error"]["code"], "provider_unsupported");
+    assert!(
+        envelope["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("pass --host"),
+        "error must require an explicit host: {envelope}"
+    );
 }
 
 #[test]

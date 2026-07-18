@@ -19,6 +19,7 @@ fn evidence_for(role: PayloadRole, status: Option<&str>) -> LifecycleEvidence {
         created_at: Some("2026-05-26T00:00:00Z".to_string()),
         status: status.map(|s| s.to_string()),
         payload: None,
+        plan_title: None,
     }
 }
 
@@ -29,6 +30,7 @@ fn audit_with(roles: &[(PayloadRole, Option<&str>)]) -> RecordAudit {
     }
     RecordAudit {
         profile_filter: Some("tracking".to_string()),
+        record_identity: None,
         body_sections: BodySections {
             current_dashboard: false,
             final_dashboard: false,

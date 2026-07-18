@@ -141,6 +141,166 @@ fn ledger_update_row_not_found_returns_stable_code() {
 }
 
 #[test]
+fn ledger_update_existing_lock_returns_stable_busy_code() {
+    let repo = common::init_repo();
+    write_ledger(repo.path());
+    let ledger_path = repo.path().join("docs/plans/demo/demo-execution-state.md");
+    let lock_path = repo
+        .path()
+        .join("docs/plans/demo/demo-execution-state.md.lock");
+    let _active_lock = plan_tooling::mutation_lock::OwnedFileLock::acquire(&lock_path)
+        .expect("hold advisory lock");
+    let before = std::fs::read_to_string(&ledger_path).expect("read before busy update");
+
+    let out = common::run_plan_tooling(
+        repo.path(),
+        &[
+            "ledger-update",
+            "--execution-state",
+            "docs/plans/demo/demo-execution-state.md",
+            "--task",
+            "1.1",
+            "--status",
+            "done",
+            "--evidence",
+            "PR #1",
+            "--format",
+            "json",
+        ],
+    );
+
+    assert_eq!(out.code, 1, "stderr: {}", out.stderr);
+    let value: serde_json::Value = serde_json::from_str(&out.stdout).expect("json");
+    assert_eq!(value["error"]["code"], "ledger-update-lock-busy");
+    assert!(
+        value["error"]["message"]
+            .as_str()
+            .expect("error message")
+            .contains("kernel releases")
+    );
+    assert_eq!(
+        std::fs::read_to_string(ledger_path).expect("read after busy update"),
+        before,
+        "a busy ledger must not be mutated"
+    );
+}
+
+#[test]
+fn exec_state_sync_existing_shared_lock_returns_stable_busy_code() {
+    let repo = common::init_repo();
+    write_ledger(repo.path());
+    let execution_state_path = repo.path().join("docs/plans/demo/demo-execution-state.md");
+    let lock_path = repo
+        .path()
+        .join("docs/plans/demo/demo-execution-state.md.lock");
+    let _active_lock = plan_tooling::mutation_lock::OwnedFileLock::acquire(&lock_path)
+        .expect("hold advisory lock");
+    let before = std::fs::read_to_string(&execution_state_path).expect("read before busy sync");
+
+    let out = common::run_plan_tooling(
+        repo.path(),
+        &[
+            "exec-state-sync",
+            "--execution-state",
+            "docs/plans/demo/demo-execution-state.md",
+            "--issue-url",
+            "https://example.test/issues/1",
+            "--format",
+            "json",
+        ],
+    );
+
+    assert_eq!(out.code, 1, "stderr: {}", out.stderr);
+    let value: serde_json::Value = serde_json::from_str(&out.stdout).expect("json");
+    assert_eq!(value["error"]["code"], "exec-state-mutation-lock-busy");
+    assert!(
+        value["error"]["message"]
+            .as_str()
+            .expect("error message")
+            .contains("kernel releases")
+    );
+    assert_eq!(
+        std::fs::read_to_string(execution_state_path).expect("read after busy sync"),
+        before,
+        "a busy execution state must not be mutated"
+    );
+}
+
+#[test]
+fn ledger_update_rejects_any_duplicate_id_before_writing() {
+    let repo = common::init_repo();
+    let path = repo.path().join("docs/plans/demo/demo-execution-state.md");
+    let duplicate = LEDGER_FIXTURE.replace(
+        "| 1.2 | pending | Implement `ledger-sync` |  | second row |",
+        "| 2.1 | pending | Implement `ledger-sync` |  | second row |",
+    );
+    common::write_file(&path, &duplicate);
+
+    let out = common::run_plan_tooling(
+        repo.path(),
+        &[
+            "ledger-update",
+            "--execution-state",
+            "docs/plans/demo/demo-execution-state.md",
+            "--task",
+            "1.1",
+            "--status",
+            "done",
+            "--evidence",
+            "PR #1",
+            "--format",
+            "json",
+        ],
+    );
+
+    assert_eq!(out.code, 1, "stderr: {}", out.stderr);
+    let value: serde_json::Value = serde_json::from_str(&out.stdout).expect("json");
+    assert_eq!(value["error"]["code"], "ledger-row-ambiguous");
+    assert_eq!(
+        std::fs::read_to_string(path).expect("read after rejected update"),
+        duplicate,
+        "an invalid controlled ledger must not be mutated"
+    );
+}
+
+#[test]
+fn ledger_update_rejects_missing_leading_pipe_before_writing() {
+    let repo = common::init_repo();
+    let path = repo.path().join("docs/plans/demo/demo-execution-state.md");
+    let malformed = LEDGER_FIXTURE.replace(
+        "| 1.2 | pending | Implement `ledger-sync` |  | second row |",
+        "1.2 | pending | Implement `ledger-sync` |  | second row |",
+    );
+    common::write_file(&path, &malformed);
+
+    let out = common::run_plan_tooling(
+        repo.path(),
+        &[
+            "ledger-update",
+            "--execution-state",
+            "docs/plans/demo/demo-execution-state.md",
+            "--task",
+            "1.1",
+            "--status",
+            "done",
+            "--evidence",
+            "PR #1",
+            "--format",
+            "json",
+        ],
+    );
+
+    assert_eq!(out.code, 1, "stderr: {}", out.stderr);
+    let value: serde_json::Value = serde_json::from_str(&out.stdout).expect("json");
+    assert_eq!(value["error"]["code"], "ledger-table-malformed");
+    assert_eq!(
+        std::fs::read_to_string(path).expect("read after rejected update"),
+        malformed,
+        "an invalid controlled ledger must not be mutated"
+    );
+}
+
+#[test]
 fn ledger_update_appends_to_existing_evidence() {
     let repo = common::init_repo();
     let prefilled = LEDGER_FIXTURE.replace(
@@ -173,4 +333,49 @@ fn ledger_update_appends_to_existing_evidence() {
     assert_eq!(value["evidence"]["previous"], "issue#146");
     assert_eq!(value["evidence"]["new"], "issue#146; PR #999");
     assert_eq!(value["evidence"]["appended"], serde_json::Value::Bool(true));
+}
+
+#[test]
+fn ledger_update_reports_placeholder_evidence_as_replaced() {
+    for placeholder in ["—", "n/a", "tbd"] {
+        let repo = common::init_repo();
+        let prefilled = LEDGER_FIXTURE.replace(
+            "| 1.1 | pending | Implement `ledger-update` |  | first row |",
+            &format!("| 1.1 | pending | Implement `ledger-update` | {placeholder} | first row |"),
+        );
+        common::write_file(
+            &repo.path().join("docs/plans/demo/demo-execution-state.md"),
+            &prefilled,
+        );
+
+        let out = common::run_plan_tooling(
+            repo.path(),
+            &[
+                "ledger-update",
+                "--execution-state",
+                "docs/plans/demo/demo-execution-state.md",
+                "--task",
+                "1.1",
+                "--status",
+                "done",
+                "--evidence",
+                "PR #999",
+                "--format",
+                "json",
+            ],
+        );
+        assert_eq!(
+            out.code, 0,
+            "placeholder={placeholder:?} stderr={}",
+            out.stderr
+        );
+        let value: serde_json::Value = serde_json::from_str(&out.stdout).expect("json");
+        assert_eq!(value["evidence"]["previous"], placeholder);
+        assert_eq!(value["evidence"]["new"], "PR #999");
+        assert_eq!(
+            value["evidence"]["appended"],
+            serde_json::Value::Bool(false),
+            "placeholder={placeholder:?}"
+        );
+    }
 }

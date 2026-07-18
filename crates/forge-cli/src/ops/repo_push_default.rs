@@ -24,7 +24,10 @@ use crate::cli::{BINARY, GlobalFlags, RepoPushDefaultArgs};
 use crate::envelope::emit_success;
 use crate::error::ForgeError;
 use crate::ops::repo_view;
-use crate::provider::{Provider, classify_host, detect, parse_host, parse_slug};
+use crate::provider::{
+    Provider, authorities_equal, canonical_provider_host, classify_host, detect, parse_host,
+    parse_slug,
+};
 use crate::rate_limit::default_runner;
 use crate::validations::no_local_path;
 
@@ -237,6 +240,7 @@ pub fn run_with<R: BackendRunner, G: GitRunner>(
         |_| Some(push_url.clone()),
     )?;
     bind_remote_provider(&push_url, ctx.provider)?;
+    bind_remote_authority(ctx.provider, &ctx.host, &push_url)?;
     let remote_slug = parse_slug(&push_url).ok_or_else(|| {
         validation(
             "repository_mismatch",
@@ -256,11 +260,11 @@ pub fn run_with<R: BackendRunner, G: GitRunner>(
         ));
     }
     let mut metadata_ctx = ctx.clone();
-    metadata_ctx.repo = Some(metadata_repo_locator(ctx.provider, &ctx.host, &remote_slug));
+    metadata_ctx.repo = Some(remote_slug.clone());
     let repo = load_repo_metadata(backend, &metadata_ctx)?;
     let repository = format!("{}/{}", repo.owner, repo.name);
     bind_remote_repository(&push_url, &repository)?;
-    bind_remote_metadata(&push_url, &repo.url, &repository)?;
+    bind_remote_metadata(ctx.provider, &push_url, &repo.url, &repository)?;
 
     let default_ref = format!("refs/heads/{}", repo.default_branch);
     let default_ref_check = git.run(workdir, &os_args(&["check-ref-format", &default_ref]))?;
@@ -694,22 +698,40 @@ fn bind_remote_repository(remote_url: &str, repository: &str) -> Result<(), Forg
     Ok(())
 }
 
-fn metadata_repo_locator(provider: Provider, host: &str, repository: &str) -> String {
-    let host = canonical_forge_host(host);
-    match provider {
-        Provider::GitHub => format!("{host}/{repository}"),
-        Provider::GitLab => format!("https://{host}/{repository}"),
-        Provider::Local => repository.to_string(),
+fn bind_remote_authority(
+    provider: Provider,
+    selected_authority: &str,
+    push_url: &str,
+) -> Result<(), ForgeError> {
+    let push_authority = parse_host(push_url).ok_or_else(|| {
+        validation(
+            "provider_mismatch",
+            "the selected Git push URL does not expose a valid forge authority",
+            None,
+        )
+    })?;
+    if !authorities_equal(provider, selected_authority, &push_authority) {
+        return Err(validation(
+            "provider_mismatch",
+            format!(
+                "resolved forge authority '{}' does not match Git push authority '{}'",
+                canonical_provider_host(provider, selected_authority),
+                canonical_provider_host(provider, &push_authority)
+            ),
+            None,
+        ));
     }
+    Ok(())
 }
 
 fn bind_remote_metadata(
+    provider: Provider,
     push_url: &str,
     metadata_url: &str,
     repository: &str,
 ) -> Result<(), ForgeError> {
     let push_host = parse_host(push_url)
-        .map(|host| canonical_forge_host(&host))
+        .map(|host| canonical_provider_host(provider, &host))
         .ok_or_else(|| {
             validation(
                 "repository_mismatch",
@@ -718,7 +740,7 @@ fn bind_remote_metadata(
             )
         })?;
     let metadata_host = parse_host(metadata_url)
-        .map(|host| canonical_forge_host(&host))
+        .map(|host| canonical_provider_host(provider, &host))
         .ok_or_else(|| {
             validation(
                 "repository_mismatch",
@@ -745,14 +767,6 @@ fn bind_remote_metadata(
     Ok(())
 }
 
-fn canonical_forge_host(host: &str) -> String {
-    match host.trim().to_ascii_lowercase().as_str() {
-        "ssh.github.com" => "github.com".to_string(),
-        "altssh.gitlab.com" => "gitlab.com".to_string(),
-        other => other.to_string(),
-    }
-}
-
 fn bind_remote_provider(remote_url: &str, provider: Provider) -> Result<(), ForgeError> {
     if provider == Provider::Local {
         return Err(ForgeError::provider_unsupported(
@@ -768,14 +782,9 @@ fn bind_remote_provider(remote_url: &str, provider: Provider) -> Result<(), Forg
             None,
         )
     })?;
-    let remote_provider = classify_host(&remote_host).ok_or_else(|| {
-        ForgeError::provider_unsupported(
-            schema_error(),
-            format!("unsupported forge host for repo push-default: {remote_host}"),
-            None,
-        )
-    })?;
-    if remote_provider != provider {
+    if let Some(remote_provider) = classify_host(&remote_host)
+        && remote_provider != provider
+    {
         return Err(validation(
             "provider_mismatch",
             format!(
@@ -918,13 +927,14 @@ fn schema_error() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::cell::Cell;
+    use std::cell::{Cell, RefCell};
 
     use crate::backend::{BackendCall, BackendSuccess};
     use crate::provider::{DetectionSource, ProviderContext};
 
     struct TimeoutRecordingRunner {
         timeout: Cell<Option<Duration>>,
+        plan: RefCell<Vec<String>>,
     }
 
     impl BackendRunner for TimeoutRecordingRunner {
@@ -934,10 +944,11 @@ mod tests {
 
         fn run_with_timeout(
             &self,
-            _call: &BackendCall,
+            call: &BackendCall,
             timeout: Option<Duration>,
         ) -> Result<BackendSuccess, ForgeError> {
             self.timeout.set(timeout);
+            self.plan.replace(call.plan_argv());
             Ok(BackendSuccess {
                 stdout: r#"{
                     "name":"demo",
@@ -969,6 +980,36 @@ mod tests {
     }
 
     #[test]
+    fn selected_authority_must_match_push_authority_including_port() {
+        let error = bind_remote_authority(
+            Provider::GitHub,
+            "internal.ghe.com:8443",
+            "https://internal.ghe.com/sympoies/demo.git",
+        )
+        .expect_err("explicit authority and push authority differ by port");
+        assert_eq!(error.kind(), "provider_mismatch");
+
+        bind_remote_authority(
+            Provider::GitHub,
+            "internal.ghe.com:8443",
+            "https://internal.ghe.com:8443/sympoies/demo.git",
+        )
+        .expect("matching non-default port");
+    }
+
+    #[test]
+    fn metadata_authority_must_match_push_authority_including_port() {
+        let error = bind_remote_metadata(
+            Provider::GitHub,
+            "https://internal.ghe.com:8443/sympoies/demo.git",
+            "https://internal.ghe.com/sympoies/demo",
+            "sympoies/demo",
+        )
+        .expect_err("metadata from the default port cannot authorize port 8443");
+        assert_eq!(error.kind(), "repository_mismatch");
+    }
+
+    #[test]
     fn production_git_settings_ignore_testing_overrides() {
         let settings = resolve_git_process_settings(
             false,
@@ -982,18 +1023,27 @@ mod tests {
     }
 
     #[test]
-    fn governed_provider_metadata_uses_a_finite_timeout() {
+    fn governed_provider_metadata_uses_timeout_and_single_repo_qualification() {
         let runner = TimeoutRecordingRunner {
             timeout: Cell::new(None),
+            plan: RefCell::new(Vec::new()),
         };
         let context = ProviderContext {
             provider: Provider::GitHub,
-            host: "github.com".to_string(),
+            host: "internal.ghe.com".to_string(),
             source: DetectionSource::Flag,
-            repo: Some("github.com/sympoies/demo".to_string()),
+            repo: Some("sympoies/demo".to_string()),
         };
         let payload = load_repo_metadata(&runner, &context).expect("metadata");
         assert_eq!(payload.default_branch, "main");
         assert_eq!(runner.timeout.get(), Some(DEFAULT_PROVIDER_TIMEOUT));
+        let plan = runner.plan.borrow();
+        let locator = plan
+            .iter()
+            .position(|value| value == "view")
+            .and_then(|index| plan.get(index + 1))
+            .expect("repo view locator");
+        assert_eq!(locator, "internal.ghe.com/sympoies/demo");
+        assert_eq!(locator.matches("internal.ghe.com").count(), 1);
     }
 }

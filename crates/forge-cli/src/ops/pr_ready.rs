@@ -109,7 +109,7 @@ fn run_backend_and_fetch<R: BackendRunner>(
     pr_view::parse_view_output(ctx, &view_output)
 }
 
-fn build_ready_call(ctx: &ProviderContext, id: u64) -> BackendCall {
+pub(crate) fn build_ready_call(ctx: &ProviderContext, id: u64) -> BackendCall {
     let program = BackendProgram::for_provider(ctx.provider);
     let mut argv: Vec<OsString> = match ctx.provider {
         Provider::GitHub | Provider::Local => vec![
@@ -184,6 +184,7 @@ mod tests {
             format: None,
             remote: "origin".into(),
             provider,
+            host: None,
             repo: None,
             store_root: None,
             dry_run,
