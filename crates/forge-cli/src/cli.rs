@@ -670,9 +670,24 @@ pub struct PrMergeArgs {
     #[arg(long = "allow-non-default-base", action = ArgAction::SetTrue)]
     pub allow_non_default_base: bool,
     /// Merge despite unresolved review threads. Without this flag, any
-    /// unresolved thread (bot or human) triggers `unresolved_review_threads`.
-    #[arg(long = "allow-unresolved-threads", action = ArgAction::SetTrue)]
+    /// non-outdated unresolved thread (bot or human) triggers
+    /// `unresolved_review_threads`. Requires `--allow-unresolved-threads-reason`.
+    #[arg(
+        long = "allow-unresolved-threads",
+        action = ArgAction::SetTrue,
+        requires = "allow_unresolved_threads_reason"
+    )]
     pub allow_unresolved_threads: bool,
+    /// Required when `--allow-unresolved-threads` is set. Non-empty free-form
+    /// text describing why the unresolved threads are safe to merge past; the
+    /// reason is recorded in the merge envelope payload.
+    #[arg(
+        long = "allow-unresolved-threads-reason",
+        value_name = "TEXT",
+        requires = "allow_unresolved_threads",
+        value_parser = clap::builder::NonEmptyStringValueParser::new()
+    )]
+    pub allow_unresolved_threads_reason: Option<String>,
     /// Override `[review_convergence].require`. Passing the flag without a
     /// value enables it; use `--review-convergence=false` to disable a repo or
     /// user-global opt-in for this invocation.
@@ -1082,10 +1097,25 @@ pub struct PrDeliverArgs {
     #[arg(long = "allow-non-default-base", action = ArgAction::SetTrue)]
     pub allow_non_default_base: bool,
     /// Merge despite unresolved review threads. Without this flag, any
-    /// unresolved thread (bot or human) triggers `unresolved_review_threads`
-    /// at the merge step.
-    #[arg(long = "allow-unresolved-threads", action = ArgAction::SetTrue)]
+    /// non-outdated unresolved thread (bot or human) triggers
+    /// `unresolved_review_threads` at the merge step. Requires
+    /// `--allow-unresolved-threads-reason`.
+    #[arg(
+        long = "allow-unresolved-threads",
+        action = ArgAction::SetTrue,
+        requires = "allow_unresolved_threads_reason"
+    )]
     pub allow_unresolved_threads: bool,
+    /// Required when `--allow-unresolved-threads` is set. Non-empty free-form
+    /// text describing why the unresolved threads are safe to merge past; the
+    /// reason is recorded in the merge-step payload.
+    #[arg(
+        long = "allow-unresolved-threads-reason",
+        value_name = "TEXT",
+        requires = "allow_unresolved_threads",
+        value_parser = clap::builder::NonEmptyStringValueParser::new()
+    )]
+    pub allow_unresolved_threads_reason: Option<String>,
     /// Override `[review_convergence].require` for the merge phase. Passing
     /// the flag without a value enables it; `--review-convergence=false`
     /// disables a configured opt-in for this invocation.
@@ -2194,6 +2224,62 @@ mod tests {
                 "--title",
                 "demo",
                 "--allow-unchecked-tasks"
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn pr_merge_allow_unresolved_threads_requires_reason() {
+        // Bypassing the unresolved-threads gate must carry a recorded reason,
+        // mirroring `--allow-unchecked-tasks` / `--allow-unchecked-tasks-reason`.
+        assert!(
+            parse(&["pr", "merge", "1", "--allow-unresolved-threads"]).is_err(),
+            "--allow-unresolved-threads without a reason must be rejected"
+        );
+        assert!(
+            parse(&[
+                "pr",
+                "merge",
+                "1",
+                "--allow-unresolved-threads-reason",
+                "outdated bot threads"
+            ])
+            .is_err(),
+            "the reason without the bypass flag must be rejected"
+        );
+        assert!(
+            parse(&[
+                "pr",
+                "merge",
+                "1",
+                "--allow-unresolved-threads",
+                "--allow-unresolved-threads-reason",
+                "outdated bot threads"
+            ])
+            .is_ok()
+        );
+        assert!(
+            parse(&[
+                "pr",
+                "merge",
+                "1",
+                "--allow-unresolved-threads",
+                "--allow-unresolved-threads-reason",
+                ""
+            ])
+            .is_err(),
+            "empty bypass reason must be rejected"
+        );
+        assert!(
+            parse(&[
+                "pr",
+                "deliver",
+                "--kind",
+                "feature",
+                "--title",
+                "demo",
+                "--allow-unresolved-threads"
             ])
             .is_err()
         );

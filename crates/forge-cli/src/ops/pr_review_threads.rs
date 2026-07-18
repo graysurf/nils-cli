@@ -5,11 +5,16 @@
 //! on GitHub (REST review comments carry no resolved bit), resolvable
 //! discussions on GitLab. Issue-style comments stay on `pr comments`.
 //!
-//! Also hosts [`ensure_review_threads_resolved`], the `pr merge` lock-down
-//! rule (rule 13): merging while unresolved threads exist fails closed with
-//! `unresolved_review_threads` unless `--allow-unresolved-threads` is passed.
-//! Bot reviewers post threads asynchronously after PR creation, so the gate
-//! runs at merge time — the last action — rather than at creation.
+//! Also hosts [`ensure_payload_resolved`], the `pr merge` unresolved-thread gate
+//! (rule 13), and [`ensure_review_threads_resolved`], a convenience composition
+//! of [`compute_for_pr`] + [`ensure_payload_resolved`]. The gate blocks only on
+//! non-outdated unresolved threads and fails closed with
+//! `unresolved_review_threads` unless `--allow-unresolved-threads` (with a
+//! recorded reason) is passed; outdated unresolved threads are dispositioned
+//! `stale` by the merge step, not blocked. `pr merge` runs rule 13 inline (so it
+//! can record those stale dispositions) rather than through the composition
+//! helper. Bot reviewers post threads asynchronously after PR creation, so the
+//! gate runs at merge time — the last action — rather than at creation.
 //!
 //! The local provider has no review-thread model: the atom returns an empty
 //! thread list and the merge gate passes trivially.
@@ -48,7 +53,9 @@ pub struct PrReviewThreadSummary {
     pub id: String,
     pub resolved: bool,
     /// GitHub `isOutdated` (the anchored diff hunk changed); always false on
-    /// GitLab. Outdated-but-unresolved threads still count as unresolved.
+    /// GitLab. Outdated unresolved threads are mechanically dispositioned
+    /// `stale` at the merge gate (recorded, non-blocking) rather than blocking
+    /// the merge; see [`stale_dispositions`].
     pub outdated: bool,
     pub author: String,
     /// File the thread is anchored to; empty for non-inline threads.
@@ -68,6 +75,22 @@ pub struct PrReviewThreadsPayload {
     pub total: usize,
     pub unresolved: usize,
     pub threads: Vec<PrReviewThreadSummary>,
+}
+
+/// An outdated, unresolved review thread mechanically dispositioned `stale`
+/// at the merge gate (rule 13). Recorded so a genuine finding whose anchor
+/// merely moved stays auditable rather than being silently dropped.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct StaleThreadDisposition {
+    pub thread_id: String,
+    pub author: String,
+    pub path: String,
+    /// First line of the thread's first comment.
+    pub summary: String,
+    /// Always `"stale"` in v1.
+    pub disposition: &'static str,
+    /// Mechanical reason the thread was dispositioned rather than blocking.
+    pub rationale: &'static str,
 }
 
 pub fn run(
@@ -165,10 +188,14 @@ pub fn run_with<R: BackendRunner, F: Fn(&str) -> Option<String>>(
     ))
 }
 
-/// `pr merge` lock-down rule 13. Fetches review threads for the PR/MR and
-/// fails closed with `unresolved_review_threads` (DATA 65) when any thread is
-/// unresolved. The local provider passes trivially (no thread model). Callers
-/// bypass via `--allow-unresolved-threads`, which skips this call entirely.
+/// Convenience composition of [`compute_for_pr`] + [`ensure_payload_resolved`]:
+/// fetch review threads for the PR/MR and fail closed with
+/// `unresolved_review_threads` (DATA 65) when a non-outdated thread is
+/// unresolved (outdated threads are dispositioned `stale` by the merge step, not
+/// blocked here). The local provider passes trivially (no thread model). `pr
+/// merge` runs rule 13 inline rather than through this helper so it can also
+/// record the stale dispositions; this composition remains for callers that only
+/// need the gate result.
 pub fn ensure_review_threads_resolved<R: BackendRunner>(
     runner: &R,
     ctx: &ProviderContext,
@@ -212,17 +239,23 @@ pub fn compute_for_pr<R: BackendRunner>(
     })
 }
 
-/// Apply the existing unresolved-thread rule to an already-fetched snapshot.
+/// Apply the unresolved-thread merge gate to an already-fetched snapshot.
+///
+/// Only non-outdated unresolved threads block. An outdated unresolved thread
+/// (its anchored diff hunk changed) is mechanically dispositioned `stale` by
+/// [`stale_dispositions`] and recorded in the merge payload rather than
+/// blocking the merge, so a stale bot review can no longer wedge convergence.
+/// Resolved threads never block.
 pub fn ensure_payload_resolved(payload: &PrReviewThreadsPayload) -> Result<(), ForgeError> {
-    let unresolved: Vec<&PrReviewThreadSummary> = payload
+    let blocking: Vec<&PrReviewThreadSummary> = payload
         .threads
         .iter()
-        .filter(|thread| !thread.resolved)
+        .filter(|thread| !thread.resolved && !thread.outdated)
         .collect();
-    if unresolved.is_empty() {
+    if blocking.is_empty() {
         return Ok(());
     }
-    let listing = unresolved
+    let listing = blocking
         .iter()
         .map(|t| {
             let first_line = t.body.lines().next().unwrap_or("");
@@ -240,10 +273,30 @@ pub fn ensure_payload_resolved(payload: &PrReviewThreadsPayload) -> Result<(), F
         "unresolved_review_threads",
         format!(
             "{n} unresolved review thread(s) on the PR/MR; disposition each (repair / resolve as accepted / convert to a follow-up) or pass --allow-unresolved-threads to bypass",
-            n = unresolved.len(),
+            n = blocking.len(),
         ),
         Some(listing),
     ))
+}
+
+/// Unresolved threads whose anchored diff hunk is outdated. At the merge gate
+/// these are mechanically dispositioned `stale`: recorded (never silently
+/// dropped) so a genuine finding whose anchor merely moved stays auditable,
+/// but no longer counted as blocking by [`ensure_payload_resolved`].
+pub fn stale_dispositions(payload: &PrReviewThreadsPayload) -> Vec<StaleThreadDisposition> {
+    payload
+        .threads
+        .iter()
+        .filter(|thread| !thread.resolved && thread.outdated)
+        .map(|thread| StaleThreadDisposition {
+            thread_id: thread.id.clone(),
+            author: thread.author.clone(),
+            path: thread.path.clone(),
+            summary: thread.body.lines().next().unwrap_or("").to_string(),
+            disposition: "stale",
+            rationale: "the anchored diff hunk is outdated; the referenced code changed",
+        })
+        .collect()
 }
 
 pub(crate) fn build_threads_call(
@@ -895,6 +948,36 @@ mod tests {
         ensure_review_threads_resolved(&runner, &ctx(Provider::Local), "local://store/pull/3", 3)
             .expect("local provider must pass");
         assert!(runner.calls().is_empty());
+    }
+
+    #[test]
+    fn ensure_payload_resolved_does_not_block_on_outdated_and_records_stale() {
+        let payload = PrReviewThreadsPayload {
+            provider: "github",
+            number: 7,
+            url: "https://github.com/acme/widgets/pull/7".into(),
+            total: 1,
+            unresolved: 1,
+            threads: vec![PrReviewThreadSummary {
+                id: "PRRT_outdated".into(),
+                resolved: false,
+                outdated: true,
+                author: "quality-bot".into(),
+                path: "src/lib.rs".into(),
+                created_at: "t".into(),
+                url: "https://github.com/acme/widgets/pull/7#discussion_r1".into(),
+                body: "nit: rename this local\nsecond line".into(),
+            }],
+        };
+        // An outdated unresolved thread must not block the gate...
+        ensure_payload_resolved(&payload).expect("outdated threads must not block");
+        // ...but must be recorded as a stale disposition for auditability.
+        let stale = stale_dispositions(&payload);
+        assert_eq!(stale.len(), 1);
+        assert_eq!(stale[0].thread_id, "PRRT_outdated");
+        assert_eq!(stale[0].disposition, "stale");
+        assert_eq!(stale[0].summary, "nit: rename this local");
+        assert_eq!(stale[0].path, "src/lib.rs");
     }
 
     fn json_global() -> GlobalFlags {

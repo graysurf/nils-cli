@@ -76,7 +76,7 @@ validations_catalog:
     error_kind: keep_branch_conflict
     exit: DATA
   review_threads_resolved:
-    rule: "no unresolved review threads at merge time unless --allow-unresolved-threads is set"
+    rule: "no non-outdated unresolved review threads at merge time unless --allow-unresolved-threads (with --allow-unresolved-threads-reason) is set; outdated unresolved threads are mechanically dispositioned stale (recorded in data.stale_thread_dispositions) and do not block"
     error_kind: unresolved_review_threads
     exit: DATA
   review_convergence:
@@ -341,6 +341,7 @@ operations:
         mirrored: bool
         lenses: list<string>
         review_threads?: list<{ id: string, url: string, path: string, line?: integer, subject_type: enum<LINE|FILE> }>
+        threads_skipped_idempotent?: integer # cross-run duplicates skipped: findings whose (path, body) already had a live (non-resolved, non-outdated) thread on the current head; omitted when 0. When every finding is a duplicate the review event is skipped, so submitted_review is false
 
   - id: pr.review.validate
     schema_version: cli.forge-cli.pr.review.validate.v1
@@ -554,7 +555,8 @@ operations:
       - { name: --method,                   type: enum<squash|merge|rebase>,     default: squash }
       - { name: --keep-branch,              type: bool,                          default: false }
       - { name: --allow-non-default-base,   type: bool,                          default: false }
-      - { name: --allow-unresolved-threads, type: bool,                          default: false }
+      - { name: --allow-unresolved-threads, type: bool,                          default: false } # requires --allow-unresolved-threads-reason
+      - { name: --allow-unresolved-threads-reason, type: string,                 default: null }
       - { name: --review-convergence,        type: optional<bool>,               default: resolved-config }
       - { name: --allow-unchecked-tasks,    type: bool,                          default: false }
       - { name: --allow-unchecked-tasks-reason, type: string,                    default: null }
@@ -579,6 +581,9 @@ operations:
         merge_sha: string
         method: enum<squash|merge|rebase>
         deleted_branch: bool
+        unchecked_tasks_override_reason?: string # present only when --allow-unchecked-tasks bypass was used
+        unresolved_threads_override_reason?: string # present only when --allow-unresolved-threads bypass was used
+        stale_thread_dispositions?: list<{ thread_id: string, author: string, path: string, summary: string, disposition: "stale", rationale: string }> # outdated unresolved threads dispositioned stale at rule 13; omitted when none
         review_convergence: optional<{required, head_sha, observed_reviews, stale_reviews, unresolved_threads, changes_requested_by, missing_reviewers, latest_activity_at?, quiet_until?, quiet_period_ms, timeout_ms, waited_ms, bots}>
       dry_run_data:
         review_convergence: resolved<{require, quiet_period, timeout, bots}>
@@ -1006,7 +1011,8 @@ macros:
       - { name: --no-merge,                 type: bool,                         default: false }
       - { name: --no-issue-closeout,        type: bool,                         default: false } # skip the post-merge deterministic linked-issue closeout
       - { name: --allow-non-default-base,   type: bool,                         default: false }
-      - { name: --allow-unresolved-threads, type: bool,                         default: false }
+      - { name: --allow-unresolved-threads, type: bool,                         default: false } # requires --allow-unresolved-threads-reason
+      - { name: --allow-unresolved-threads-reason, type: string,                default: null }
       - { name: --review-convergence,        type: optional<bool>,              default: resolved-config }
       - { name: --allow-unchecked-tasks,    type: bool,                         default: false }
       - { name: --allow-unchecked-tasks-reason, type: string,                   default: null }

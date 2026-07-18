@@ -481,6 +481,7 @@ json\:"Single-record JSON envelope (snake_case)"))' \
 _arguments "${_arguments_options[@]}" : \
 '--expected-head=[Compare-and-swap head verified by the caller before merge]:SHA:_default' \
 '--method=[Merge method override. When omitted, falls back to \`.forge-cli.toml \[merge\].method\` then the spec default \`squash\`]:METHOD:(squash merge rebase)' \
+'--allow-unresolved-threads-reason=[Required when \`--allow-unresolved-threads\` is set. Non-empty free-form text describing why the unresolved threads are safe to merge past; the reason is recorded in the merge envelope payload]:TEXT:_default' \
 '--review-convergence=[Override \`\[review_convergence\].require\`. Passing the flag without a value enables it; use \`--review-convergence=false\` to disable a repo or user-global opt-in for this invocation]::REVIEW_CONVERGENCE:(true false)' \
 '--allow-unchecked-tasks-reason=[Required when \`--allow-unchecked-tasks\` is set. Non-empty free-form text describing why the unchecked items are safe to merge past; the reason is recorded in the merge envelope payload]:TEXT:_default' \
 '--format=[Output format (defaults to text)]:FORMAT:((text\:"Human-readable text output (default)"
@@ -492,7 +493,7 @@ json\:"Single-record JSON envelope (snake_case)"))' \
 '--store-root=[Root directory of the file-backed store used by \`--provider local\`. Overrides the \`FORGE_CLI_LOCAL_STORE\` env var]:path:_files' \
 '--keep-branch[Skip the post-merge branch deletion (\`--delete-branch\` on gh, \`--remove-source-branch\` on glab). Mutually exclusive with the implicit-true default; flagging both is \`keep_branch_conflict\`]' \
 '--allow-non-default-base[Allow merges where the PR'\''s base is not the repo'\''s default branch. Without this flag, mismatched bases trigger \`default_branch_protected\`]' \
-'--allow-unresolved-threads[Merge despite unresolved review threads. Without this flag, any unresolved thread (bot or human) triggers \`unresolved_review_threads\`]' \
+'--allow-unresolved-threads[Merge despite unresolved review threads. Without this flag, any non-outdated unresolved thread (bot or human) triggers \`unresolved_review_threads\`. Requires \`--allow-unresolved-threads-reason\`]' \
 '--allow-unchecked-tasks[Merge despite unchecked task-list items in the PR/MR description. Without this flag, any unchecked \`- \[ \]\` item triggers \`unchecked_task_items\`. Requires \`--allow-unchecked-tasks-reason\`]' \
 '--dry-run[Validate and describe the planned operation without applying its mutation. Read-only preflight calls may still run]' \
 '-h[Print help (see more with '\''--help'\'')]' \
@@ -563,6 +564,7 @@ _arguments "${_arguments_options[@]}" : \
 '--label-catalog=[Validate labels against this catalog when \`--strict-labels\` is set]:PATH:_default' \
 '--test-first-evidence=[Directory holding a \`test-first-evidence\` record, forwarded to the create step and verified by the test-first gate when \`\[test_first\].require\` resolves true for a feature/bug PR. Requires a complete v2 record with a testable classification and a bound baseline/delivery subject matching the current checkout]:DIR:_default' \
 '--timeout=[Cumulative CI-wait budget before declaring \`checks_timeout\` (default \`30m\`)]:TIMEOUT:_default' \
+'--allow-unresolved-threads-reason=[Required when \`--allow-unresolved-threads\` is set. Non-empty free-form text describing why the unresolved threads are safe to merge past; the reason is recorded in the merge-step payload]:TEXT:_default' \
 '--review-convergence=[Override \`\[review_convergence\].require\` for the merge phase. Passing the flag without a value enables it; \`--review-convergence=false\` disables a configured opt-in for this invocation]::REVIEW_CONVERGENCE:(true false)' \
 '--allow-unchecked-tasks-reason=[Required when \`--allow-unchecked-tasks\` is set. Non-empty free-form text describing why the unchecked items are safe to merge past; the reason is recorded in the merge-step payload]:TEXT:_default' \
 '--format=[Output format (defaults to text)]:FORMAT:((text\:"Human-readable text output (default)"
@@ -576,7 +578,7 @@ json\:"Single-record JSON envelope (snake_case)"))' \
 '--no-merge[Stop after \`pr.wait-checks\` — do not promote to ready or merge]' \
 '--no-issue-closeout[Skip the post-merge linked-issue closeout. By default, after a successful merge the macro deterministically closes any still-open issue referenced by a \`Closes/Fixes #N\` closing keyword (GitHub surfaces these via \`closingIssuesReferences\`), so delivery does not depend on GitHub'\''s asynchronous auto-close latency. Plan-tracking PRs use non-closing \`Refs #N\` (empty \`closingIssuesReferences\`) and are unaffected either way]' \
 '--allow-non-default-base[Allow merges where the PR'\''s base is not the repo'\''s default branch]' \
-'--allow-unresolved-threads[Merge despite unresolved review threads. Without this flag, any unresolved thread (bot or human) triggers \`unresolved_review_threads\` at the merge step]' \
+'--allow-unresolved-threads[Merge despite unresolved review threads. Without this flag, any non-outdated unresolved thread (bot or human) triggers \`unresolved_review_threads\` at the merge step. Requires \`--allow-unresolved-threads-reason\`]' \
 '--allow-unchecked-tasks[Merge despite unchecked task-list items in the PR/MR description. Without this flag, any unchecked \`- \[ \]\` item triggers \`unchecked_task_items\` at the merge step. Requires \`--allow-unchecked-tasks-reason\`]' \
 '--dry-run[Validate and describe the planned operation without applying its mutation. Read-only preflight calls may still run]' \
 '-h[Print help (see more with '\''--help'\'')]' \

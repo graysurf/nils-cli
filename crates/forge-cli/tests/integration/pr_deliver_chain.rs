@@ -1528,6 +1528,7 @@ fn local_deliver_args(evidence: &Path) -> PrDeliverArgs {
         no_issue_closeout: false,
         allow_non_default_base: false,
         allow_unresolved_threads: false,
+        allow_unresolved_threads_reason: None,
         review_convergence: None,
         allow_unchecked_tasks: false,
         allow_unchecked_tasks_reason: None,

@@ -5,7 +5,12 @@
 //! rendered review outcome, and forge-cli posts it to the PR/MR plus an
 //! optional compact issue activity mirror.
 
-use std::{collections::HashMap, ffi::OsString, fs, io::Read};
+use std::{
+    collections::{HashMap, HashSet},
+    ffi::OsString,
+    fs,
+    io::Read,
+};
 
 use nils_common::cli_contract::{OutputFormat, schema_version_for};
 use serde::{Deserialize, Serialize};
@@ -16,7 +21,7 @@ use crate::cli::{
 };
 use crate::envelope::emit_success;
 use crate::error::ForgeError;
-use crate::ops::{pr_comment, pr_reviews};
+use crate::ops::{pr_comment, pr_review_threads, pr_reviews};
 use crate::provider::{Provider, ProviderContext, detect, git_remote_url};
 use crate::rate_limit::default_runner;
 use crate::validations::{no_escaped_control_markdown, no_local_path};
@@ -76,6 +81,17 @@ pub struct PrReviewPayload {
     pub lenses: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub review_threads: Vec<CreatedReviewThread>,
+    /// Number of finding threads skipped as cross-run idempotent duplicates:
+    /// a finding whose `(path, body)` already had a live (non-resolved,
+    /// non-outdated) thread on the current head. Absent when zero. When every
+    /// finding was a duplicate the review event itself is skipped, so
+    /// `submitted_review` is `false` and `review_threads` is empty.
+    #[serde(default, skip_serializing_if = "is_zero_usize")]
+    pub threads_skipped_idempotent: usize,
+}
+
+fn is_zero_usize(value: &usize) -> bool {
+    *value == 0
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -538,46 +554,67 @@ pub fn run_with<R: BackendRunner, F: Fn(&str) -> Option<String>>(
     } else {
         GlabNoteForm::CreateResolvable
     };
-    let (pr_comment_url, review_threads) = if thread_specs.is_empty() {
-        let pr_call = build_review_post_call(&ctx, id, &args, &body, body_present, glab_form);
-        let pr_output = runner.run(&pr_call).map_err(|err| {
-            if args.submit_review && ctx.provider == Provider::GitHub {
-                map_github_native_review_submit_error(args.decision, err)
-            } else {
-                err
-            }
-        })?;
-        (first_url(&pr_output.stdout).unwrap_or_default(), Vec::new())
-    } else {
-        submit_github_review_with_threads(
-            runner,
-            &ctx,
-            id,
-            args.decision,
-            expected_review_head.expect("validated native review head"),
-            body_present.then_some(body.as_str()),
-            &thread_specs,
-        )?
-    };
+    // `review_skipped_idempotent` is the explicit "no review event was posted
+    // because every finding was already threaded" signal, set only by the threads
+    // branch (where `submit_github_review_with_threads` returns `review_url:
+    // None`). The summary-only branch always posts, so an empty URL there means
+    // "provider URL not parsed", not "skipped" — the two must not be conflated.
+    let (pr_comment_url, review_threads, threads_skipped_idempotent, review_skipped_idempotent) =
+        if thread_specs.is_empty() {
+            let pr_call = build_review_post_call(&ctx, id, &args, &body, body_present, glab_form);
+            let pr_output = runner.run(&pr_call).map_err(|err| {
+                if args.submit_review && ctx.provider == Provider::GitHub {
+                    map_github_native_review_submit_error(args.decision, err)
+                } else {
+                    err
+                }
+            })?;
+            (
+                first_url(&pr_output.stdout).unwrap_or_default(),
+                Vec::new(),
+                0,
+                false,
+            )
+        } else {
+            let submission = submit_github_review_with_threads(
+                runner,
+                &ctx,
+                id,
+                args.decision,
+                expected_review_head.expect("validated native review head"),
+                body_present.then_some(body.as_str()),
+                &thread_specs,
+            )?;
+            let review_skipped_idempotent = submission.review_url.is_none();
+            (
+                submission.review_url.unwrap_or_default(),
+                submission.created,
+                submission.skipped,
+                review_skipped_idempotent,
+            )
+        };
 
-    let issue_comment_url = if let Some(issue_number) = mirror_issue {
-        // The mirror body's user-controlled content (lenses) was already
-        // validated up front against MIRROR_URL_PENDING; the only difference
-        // here is the provider-returned `pr_comment_url`, which is never
-        // user-controlled, so it needs no re-validation after the post.
-        let mirror_body = build_issue_mirror_body(
-            ctx.provider,
-            id,
-            args.decision,
-            &args.lenses,
-            &pr_comment_url,
-        );
-        let issue_call = build_issue_comment_call(&ctx, issue_number, &mirror_body);
-        let issue_output = runner.run(&issue_call)?;
-        first_url(&issue_output.stdout)
-    } else {
-        None
-    };
+    // When the review was skipped entirely as an idempotent no-op there is no
+    // new PR activity to mirror, so skip the issue breadcrumb too.
+    let issue_comment_url =
+        if let Some(issue_number) = mirror_issue.filter(|_| !review_skipped_idempotent) {
+            // The mirror body's user-controlled content (lenses) was already
+            // validated up front against MIRROR_URL_PENDING; the only difference
+            // here is the provider-returned `pr_comment_url`, which is never
+            // user-controlled, so it needs no re-validation after the post.
+            let mirror_body = build_issue_mirror_body(
+                ctx.provider,
+                id,
+                args.decision,
+                &args.lenses,
+                &pr_comment_url,
+            );
+            let issue_call = build_issue_comment_call(&ctx, issue_number, &mirror_body);
+            let issue_output = runner.run(&issue_call)?;
+            first_url(&issue_output.stdout)
+        } else {
+            None
+        };
 
     Ok(emit_success(
         schema_version(),
@@ -585,7 +622,7 @@ pub fn run_with<R: BackendRunner, F: Fn(&str) -> Option<String>>(
             provider: ctx.provider.as_str(),
             number: id,
             decision: args.decision.as_str(),
-            submitted_review: args.submit_review,
+            submitted_review: args.submit_review && !review_skipped_idempotent,
             head_sha: expected_review_head.map(str::to_string),
             pr_comment_url,
             issue_number: args.issue,
@@ -593,6 +630,7 @@ pub fn run_with<R: BackendRunner, F: Fn(&str) -> Option<String>>(
             mirrored: args.mirror_issue,
             lenses: args.lenses,
             review_threads,
+            threads_skipped_idempotent,
         },
         format,
         render_text,
@@ -1181,6 +1219,15 @@ fn review_thread_range_not_in_diff_err(
     )
 }
 
+/// Result of the GitHub native-review-with-threads submission. `review_url` is
+/// `None` when the review was skipped entirely because every finding already
+/// had a live thread on the current head (cross-run idempotency).
+struct GithubReviewSubmission {
+    review_url: Option<String>,
+    created: Vec<CreatedReviewThread>,
+    skipped: usize,
+}
+
 fn submit_github_review_with_threads<R: BackendRunner>(
     runner: &R,
     ctx: &ProviderContext,
@@ -1189,11 +1236,40 @@ fn submit_github_review_with_threads<R: BackendRunner>(
     expected_head: &str,
     body: Option<&str>,
     specs: &[PreparedReviewThreadSpec],
-) -> Result<(String, Vec<CreatedReviewThread>), ForgeError> {
+) -> Result<GithubReviewSubmission, ForgeError> {
     let (owner, name) = github_owner_name(ctx)?;
     let target_output = runner.run(&build_github_review_target_call(ctx, owner, name, number))?;
     let target = parse_github_review_target(&target_output)?;
-    let _target_url = target.url;
+
+    // Cross-run idempotency: skip any finding that already has a live
+    // (non-resolved, non-outdated) thread on the current head, keyed on
+    // (path, body). This never deletes or mutates a prior thread or review; it
+    // only avoids creating a duplicate. An outdated match is not a live
+    // duplicate (the anchor moved), so it is posted fresh; the stale copy is
+    // dispositioned at the merge gate. Within-run order of surviving specs is
+    // preserved.
+    let existing = pr_review_threads::compute_for_pr(runner, ctx, &target.url, number)?;
+    let live_fingerprints: HashSet<(&str, &str)> = existing
+        .threads
+        .iter()
+        .filter(|thread| !thread.resolved && !thread.outdated)
+        .map(|thread| (thread.path.as_str(), thread.body.as_str()))
+        .collect();
+    let to_post: Vec<&PreparedReviewThreadSpec> = specs
+        .iter()
+        .filter(|spec| !live_fingerprints.contains(&(spec.path.as_str(), spec.body.as_str())))
+        .collect();
+    let skipped = specs.len() - to_post.len();
+
+    // Every finding already has a live thread: adding an empty review would
+    // only create review-event noise, so skip the submission entirely.
+    if to_post.is_empty() {
+        return Ok(GithubReviewSubmission {
+            review_url: None,
+            created: Vec::new(),
+            skipped,
+        });
+    }
 
     let pending_output = runner.run(&build_github_pending_review_call(
         ctx,
@@ -1202,8 +1278,8 @@ fn submit_github_review_with_threads<R: BackendRunner>(
     ))?;
     let pending = parse_github_pending_review(&pending_output)?;
 
-    let mut review_threads = Vec::with_capacity(specs.len());
-    for (idx, spec) in specs.iter().enumerate() {
+    let mut review_threads = Vec::with_capacity(to_post.len());
+    for (idx, spec) in to_post.iter().copied().enumerate() {
         let output = match runner.run(&build_github_add_review_thread_call(
             ctx,
             &pending.review_id,
@@ -1235,7 +1311,11 @@ fn submit_github_review_with_threads<R: BackendRunner>(
         }
     };
     let review_url = parse_submitted_review_url(&submit_output).unwrap_or(pending.url);
-    Ok((review_url, review_threads))
+    Ok(GithubReviewSubmission {
+        review_url: Some(review_url),
+        created: review_threads,
+        skipped,
+    })
 }
 
 fn map_github_review_thread_error(

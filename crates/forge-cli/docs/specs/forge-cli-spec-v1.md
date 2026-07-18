@@ -611,7 +611,15 @@ backend mapping, validation rules, and output schema versions.
   looks up the PR node id, creates a pending review bound to
   `--expected-head` through `commitOID`, adds each thread with
   `addPullRequestReviewThread`, then publishes the review with
-  `submitPullRequestReview`. JSON output includes
+  `submitPullRequestReview`. Before creating threads it reads the PR's
+  existing review threads and skips any finding whose `(path, body)` already
+  has a live (non-resolved, non-outdated) thread on the current head —
+  cross-run idempotency, so re-running delivery on an unchanged head neither
+  duplicates threads nor re-submits an equivalent review, and never deletes or
+  mutates a prior thread/review; an outdated match is posted fresh.
+  `data.threads_skipped_idempotent` reports the number skipped, and when every
+  finding is already threaded the review event itself is skipped
+  (`submitted_review` is `false`). JSON output includes
   `data.review_threads[] = { id, url, path, line, subject_type }`, where `id` is
   the `PRRT_...` handle consumed by `pr review-threads resolve`. Dry-run output
   includes `data.target_plan`, `data.thread_plan[]`, `data.submit_plan`, and
@@ -662,7 +670,9 @@ backend mapping, validation rules, and output schema versions.
 - Output schema:
   `data = { provider, number, decision, submitted_review, head_sha?,
   pr_comment_url, issue_number, issue_comment_url, mirrored, lenses,
-  review_threads? }`. `head_sha` is present for `--submit-review`.
+  review_threads?, threads_skipped_idempotent? }`. `head_sha` is present for
+  `--submit-review`; `threads_skipped_idempotent` is present (non-zero) when
+  cross-run duplicates were skipped.
 
 ### `pr review validate`
 
@@ -737,8 +747,11 @@ backend mapping, validation rules, and output schema versions.
     stayed quiet for the resolved quiet period; the initial provider view must
     also expose a non-empty head OID or the merge fails closed with
     `review_convergence_head_missing`;
-  - no unresolved review threads OR explicitly bypassed via
-    `--allow-unresolved-threads`;
+  - no non-outdated unresolved review threads (outdated unresolved threads
+    are mechanically dispositioned `stale` and recorded, not blocking) OR
+    the remaining live threads explicitly bypassed via
+    `--allow-unresolved-threads` with a recorded
+    `--allow-unresolved-threads-reason`;
   - no unchecked task-list items in the description OR explicitly
     bypassed via `--allow-unchecked-tasks` with a recorded
     `--allow-unchecked-tasks-reason` (the description is the delivery
@@ -770,7 +783,12 @@ backend mapping, validation rules, and output schema versions.
   equals that same OID.
 - Output schema: `cli.forge-cli.pr.merge.v1`,
   `data = { number, url, merge_sha, method, deleted_branch,
-  review_convergence? }`. The additive convergence snapshot contains
+  unchecked_tasks_override_reason?, unresolved_threads_override_reason?,
+  stale_thread_dispositions?, review_convergence? }`.
+  `unchecked_tasks_override_reason` / `unresolved_threads_override_reason` are
+  present only when the matching bypass was used; `stale_thread_dispositions`
+  lists the outdated threads dispositioned `stale` at rule 13 (omitted when
+  none). The additive convergence snapshot contains
   `required`, `head_sha`, `observed_reviews`, `stale_reviews`,
   `unresolved_threads`, `changes_requested_by`, `missing_reviewers`,
   `latest_activity_at`, `quiet_until`, `quiet_period_ms`, `timeout_ms`,
@@ -946,11 +964,18 @@ backend implementations cannot diverge.
     `provider_unsupported`.
 13. **Review-thread gating.** `pr merge` (and the `pr deliver` merge
     step) fetches review threads during the final merge gates and refuses to
-    merge while any thread is unresolved
-    (GitHub `reviewThreads`, GitLab resolvable discussions). Bypass
-    with `--allow-unresolved-threads`. The local provider has no
+    merge while any **non-outdated** thread is unresolved
+    (GitHub `reviewThreads`, GitLab resolvable discussions). An **outdated**
+    unresolved thread (its anchored diff hunk changed) is mechanically
+    dispositioned `stale` — recorded in the merge payload as
+    `stale_thread_dispositions` (thread id, author, path, summary, rationale),
+    never silently dropped — and no longer blocks, so an accumulation of stale
+    bot threads can no longer wedge convergence. Bypass any remaining live
+    threads with `--allow-unresolved-threads` plus a required
+    `--allow-unresolved-threads-reason`, recorded as
+    `unresolved_threads_override_reason`. The local provider has no
     thread model and passes trivially. The error `detail` lists each
-    unresolved thread (author, file anchor, first line).
+    blocking (non-outdated) unresolved thread (author, file anchor, first line).
 14. **Task-list gating.** `pr merge` (and the `pr deliver` merge step)
     parses GFM task-list items out of the PR/MR description fetched at
     merge time and refuses to merge while any `- [ ]` item is
