@@ -2468,6 +2468,9 @@ fn normalize_provider_hook(
             Some("clarification"),
             Confidence::Observed,
         ),
+        (AgentKind::Claude, "PreToolUse", _) | (AgentKind::Claude, "SubagentStop", _) => {
+            (TurnEventKind::Progress, None, Confidence::Observed)
+        }
         (AgentKind::Claude, "PostToolUse", _) if exact_clarification => {
             (TurnEventKind::AttentionCleared, None, Confidence::Observed)
         }
@@ -2769,7 +2772,7 @@ pub(crate) fn doctor(
                 ),
                 AgentKind::Claude => (
                     "partial",
-                    "idle_prompt is observed completion; raw Stop remains non-final because other hooks may continue",
+                    "idle_prompt is observed completion; general PreToolUse and SubagentStop reactivate continued work; raw Stop remains non-final because other hooks may continue",
                     "AskUserQuestion uses exact runtime-scoped tool_use_id correlation; Elicitation uses exact elicitation_id when both callbacks provide it and otherwise latches conservatively; other PermissionRequest and configured notification signals remain conservative latches",
                     "Claude settings hooks compose additively and execute with the user's permissions",
                     "Run activity setup --agent claude --dry-run and then --apply",
@@ -3246,6 +3249,10 @@ fn provider_specs(agent: AgentKind) -> Vec<ProviderSpec> {
             },
             ProviderSpec {
                 event: "PreToolUse",
+                matcher: None,
+            },
+            ProviderSpec {
+                event: "PreToolUse",
                 matcher: Some("AskUserQuestion"),
             },
             ProviderSpec {
@@ -3274,6 +3281,10 @@ fn provider_specs(agent: AgentKind) -> Vec<ProviderSpec> {
             },
             ProviderSpec {
                 event: "StopFailure",
+                matcher: None,
+            },
+            ProviderSpec {
+                event: "SubagentStop",
                 matcher: None,
             },
             ProviderSpec {
@@ -5192,6 +5203,77 @@ mod tests {
     }
 
     #[test]
+    fn claude_continuation_tool_signals_reactivate_working() {
+        let payloads = [
+            json!({
+                "hook_event_name": "PreToolUse",
+                "session_id": "claude-session",
+                "tool_name": "Task",
+                "tool_use_id": "tool-secret",
+                "tool_input": {"prompt": "discarded"}
+            }),
+            json!({
+                "hook_event_name": "SubagentStop",
+                "session_id": "claude-session",
+                "agent_id": "subagent-secret",
+                "agent_transcript_path": "/secret/transcript"
+            }),
+        ];
+        let normalized = payloads
+            .iter()
+            .map(|payload| normalize_provider_hook(AgentKind::Claude, None, "runtime-1", payload))
+            .collect::<Result<Vec<_>, _>>()
+            .expect("continuation signal normalization");
+
+        assert_eq!(
+            normalized
+                .iter()
+                .map(|event| event.as_ref().map(|event| event.kind.clone()))
+                .collect::<Vec<_>>(),
+            vec![Some(TurnEventKind::Progress), Some(TurnEventKind::Progress)]
+        );
+
+        for normalized_event in normalized {
+            let serialized = serde_json::to_string(
+                normalized_event
+                    .as_ref()
+                    .expect("recognized continuation signal"),
+            )
+            .expect("continuation event json");
+            for forbidden in [
+                "tool-secret",
+                "discarded",
+                "subagent-secret",
+                "/secret/transcript",
+            ] {
+                assert!(!serialized.contains(forbidden), "forbidden {forbidden}");
+            }
+
+            let mut document = document();
+            reduce(
+                &mut document,
+                &event(TurnEventKind::TurnStarted, "turn-started"),
+                "2026-07-18T00:00:01Z",
+            );
+            reduce(
+                &mut document,
+                &event(TurnEventKind::TurnCompleted, "idle-prompt"),
+                "2026-07-18T00:00:02Z",
+            );
+            assert_eq!(document.state.phase, TurnPhase::Waiting);
+            assert!(document.state.current_turn.is_none());
+
+            reduce(
+                &mut document,
+                &normalized_event.expect("recognized continuation signal"),
+                "2026-07-18T00:00:03Z",
+            );
+            assert_eq!(document.state.phase, TurnPhase::Working);
+            assert!(document.state.current_turn.is_some());
+        }
+    }
+
+    #[test]
     fn claude_bypass_permissions_prompt_is_latched() {
         // PermissionRequest and permission_prompt hooks mean Claude is showing a
         // real dialog, including the root/home deletion circuit breaker that remains
@@ -5698,11 +5780,13 @@ mod tests {
                 include_str!("../tests/fixtures/activity/claude-events.jsonl"),
                 vec![
                     TurnEventKind::TurnStarted,
+                    TurnEventKind::Progress,
                     TurnEventKind::AttentionRequested,
                     TurnEventKind::AttentionCleared,
                     TurnEventKind::AttentionRequested,
                     TurnEventKind::AttentionCleared,
                     TurnEventKind::AttentionRequested,
+                    TurnEventKind::Progress,
                     TurnEventKind::Progress,
                     TurnEventKind::StopObserved,
                     TurnEventKind::TurnCompleted,
@@ -5739,6 +5823,7 @@ mod tests {
                 assert!(!serialized.contains("claude-session"));
                 assert!(!serialized.contains("hermes-session"));
                 assert!(!serialized.contains("tool-1"));
+                assert!(!serialized.contains("subagent-secret"));
                 assert!(!serialized.contains("rate_limit"));
             }
         }
@@ -6276,6 +6361,11 @@ mod tests {
 
         let claude_specs = provider_specs(AgentKind::Claude);
         assert!(
+            claude_specs
+                .iter()
+                .any(|spec| spec.event == "PreToolUse" && spec.matcher.is_none())
+        );
+        assert!(
             claude_specs.iter().any(|spec| {
                 spec.event == "PreToolUse" && spec.matcher == Some("AskUserQuestion")
             })
@@ -6291,6 +6381,11 @@ mod tests {
             claude_specs
                 .iter()
                 .any(|spec| spec.event == "ElicitationResult")
+        );
+        assert!(
+            claude_specs
+                .iter()
+                .any(|spec| spec.event == "SubagentStop" && spec.matcher.is_none())
         );
     }
 

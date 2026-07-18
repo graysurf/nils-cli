@@ -196,6 +196,14 @@ current Claude versions emit it as a duplicate of `PermissionRequest`, and an
 `AskUserQuestion` `PermissionRequest` is ignored because the same interaction is
 already owned by exact PreToolUse/PostToolUse correlation.
 
+Managed Claude setup also installs a general `PreToolUse` hook and
+`SubagentStop`. Both normalize to uncorrelated `progress`: a continued turn
+that was last observed at `idle_prompt` can re-establish `working` as soon as a
+tool starts, and a completed subagent keeps the parent turn active across
+back-to-back work. The exact `AskUserQuestion` arm is evaluated first, so its
+`PreToolUse` remains `attention_requested` rather than progress. These positive
+signals never clear pending attention.
+
 ## Deterministic transition rules
 
 | Input | Rule |
