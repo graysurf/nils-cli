@@ -339,11 +339,15 @@ impl AgentLaunchProfiles {
     }
 
     fn probe_ready_summaries(&self) -> Vec<AgentLaunchProfileSummary> {
-        self.entries
-            .iter()
-            .filter(|profile| profile.is_ready())
-            .map(AgentLaunchProfile::summary)
-            .collect()
+        std::thread::scope(|scope| {
+            self.entries
+                .iter()
+                .map(|profile| scope.spawn(move || profile.is_ready().then(|| profile.summary())))
+                .collect::<Vec<_>>()
+                .into_iter()
+                .filter_map(|probe| probe.join().ok().flatten())
+                .collect()
+        })
     }
 }
 
@@ -6156,6 +6160,43 @@ mod tests {
         }
 
         assert_eq!(fs::read_to_string(calls).unwrap(), "x");
+    }
+
+    #[test]
+    fn launch_profile_readiness_probes_profiles_in_parallel_and_preserves_order() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let launcher = executable(
+            &tmp.path().join("profile-readiness"),
+            "#!/usr/bin/env sh\nsleep 0.25\n",
+        );
+        let configs = (0..4)
+            .map(|index| {
+                json!({
+                    "id": format!("profile-{index}"),
+                    "label": format!("Profile {index}"),
+                    "agent": "claude",
+                    "agent_bin": launcher,
+                    "readiness_args": ["--check"],
+                })
+            })
+            .collect::<Vec<_>>();
+        let profiles =
+            AgentLaunchProfiles::from_json(&serde_json::to_string(&configs).unwrap()).unwrap();
+
+        let started_at = Instant::now();
+        let summaries = profiles.probe_ready_summaries();
+        assert!(
+            started_at.elapsed() < Duration::from_millis(700),
+            "bounded profiles must be probed concurrently: {:?}",
+            started_at.elapsed()
+        );
+        assert_eq!(
+            summaries
+                .iter()
+                .map(|summary| summary.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["profile-0", "profile-1", "profile-2", "profile-3"]
+        );
     }
 
     #[test]
