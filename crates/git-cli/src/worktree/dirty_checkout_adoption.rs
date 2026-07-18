@@ -11503,7 +11503,8 @@ mod tests {
         assert!(error.to_string().contains("time limit"));
     }
 
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    // Hosted macOS coverage races kqueue ownership with the exiting group leader; see #1290.
+    #[cfg(target_os = "linux")]
     #[test]
     fn output_cleanup_tracks_escaped_descendants_after_the_group_leader_exits() {
         let root = tempfile::TempDir::new().expect("escaped output child root");
