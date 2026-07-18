@@ -48,7 +48,9 @@ pub struct PrReviewThreadSummary {
     pub id: String,
     pub resolved: bool,
     /// GitHub `isOutdated` (the anchored diff hunk changed); always false on
-    /// GitLab. Outdated-but-unresolved threads still count as unresolved.
+    /// GitLab. Outdated unresolved threads are mechanically dispositioned
+    /// `stale` at the merge gate (recorded, non-blocking) rather than blocking
+    /// the merge; see [`stale_dispositions`].
     pub outdated: bool,
     pub author: String,
     /// File the thread is anchored to; empty for non-inline threads.
@@ -68,6 +70,22 @@ pub struct PrReviewThreadsPayload {
     pub total: usize,
     pub unresolved: usize,
     pub threads: Vec<PrReviewThreadSummary>,
+}
+
+/// An outdated, unresolved review thread mechanically dispositioned `stale`
+/// at the merge gate (rule 13). Recorded so a genuine finding whose anchor
+/// merely moved stays auditable rather than being silently dropped.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct StaleThreadDisposition {
+    pub thread_id: String,
+    pub author: String,
+    pub path: String,
+    /// First line of the thread's first comment.
+    pub summary: String,
+    /// Always `"stale"` in v1.
+    pub disposition: &'static str,
+    /// Mechanical reason the thread was dispositioned rather than blocking.
+    pub rationale: &'static str,
 }
 
 pub fn run(
@@ -212,17 +230,23 @@ pub fn compute_for_pr<R: BackendRunner>(
     })
 }
 
-/// Apply the existing unresolved-thread rule to an already-fetched snapshot.
+/// Apply the unresolved-thread merge gate to an already-fetched snapshot.
+///
+/// Only non-outdated unresolved threads block. An outdated unresolved thread
+/// (its anchored diff hunk changed) is mechanically dispositioned `stale` by
+/// [`stale_dispositions`] and recorded in the merge payload rather than
+/// blocking the merge, so a stale bot review can no longer wedge convergence.
+/// Resolved threads never block.
 pub fn ensure_payload_resolved(payload: &PrReviewThreadsPayload) -> Result<(), ForgeError> {
-    let unresolved: Vec<&PrReviewThreadSummary> = payload
+    let blocking: Vec<&PrReviewThreadSummary> = payload
         .threads
         .iter()
-        .filter(|thread| !thread.resolved)
+        .filter(|thread| !thread.resolved && !thread.outdated)
         .collect();
-    if unresolved.is_empty() {
+    if blocking.is_empty() {
         return Ok(());
     }
-    let listing = unresolved
+    let listing = blocking
         .iter()
         .map(|t| {
             let first_line = t.body.lines().next().unwrap_or("");
@@ -240,10 +264,30 @@ pub fn ensure_payload_resolved(payload: &PrReviewThreadsPayload) -> Result<(), F
         "unresolved_review_threads",
         format!(
             "{n} unresolved review thread(s) on the PR/MR; disposition each (repair / resolve as accepted / convert to a follow-up) or pass --allow-unresolved-threads to bypass",
-            n = unresolved.len(),
+            n = blocking.len(),
         ),
         Some(listing),
     ))
+}
+
+/// Unresolved threads whose anchored diff hunk is outdated. At the merge gate
+/// these are mechanically dispositioned `stale`: recorded (never silently
+/// dropped) so a genuine finding whose anchor merely moved stays auditable,
+/// but no longer counted as blocking by [`ensure_payload_resolved`].
+pub fn stale_dispositions(payload: &PrReviewThreadsPayload) -> Vec<StaleThreadDisposition> {
+    payload
+        .threads
+        .iter()
+        .filter(|thread| !thread.resolved && thread.outdated)
+        .map(|thread| StaleThreadDisposition {
+            thread_id: thread.id.clone(),
+            author: thread.author.clone(),
+            path: thread.path.clone(),
+            summary: thread.body.lines().next().unwrap_or("").to_string(),
+            disposition: "stale",
+            rationale: "the anchored diff hunk is outdated; the referenced code changed",
+        })
+        .collect()
 }
 
 pub(crate) fn build_threads_call(

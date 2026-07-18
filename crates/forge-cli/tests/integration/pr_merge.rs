@@ -1123,6 +1123,105 @@ fn pr_merge_review_convergence_keeps_unresolved_thread_gate_authoritative() {
     assert_eq!(env["error"]["code"], "unresolved_review_threads");
 }
 
+#[test]
+fn pr_merge_github_outdated_thread_is_dispositioned_stale_and_merges() {
+    // An unresolved thread whose anchored diff hunk is outdated must be
+    // mechanically dispositioned `stale` (recorded, not silently dropped) and
+    // must not block the merge. This breaks the "outdated threads accumulate
+    // and block forever" loop (nils-cli#1272).
+    let tempdir = make_github_repo(None);
+    let repo_path = tempdir.path().join("repo");
+    let thread = r#"{"id":"PRRT_stale","isResolved":false,"isOutdated":true,"path":"src/lib.rs","comments":{"nodes":[{"author":{"login":"quality-bot"},"body":"nit: rename this local","createdAt":"2026-07-14T04:00:00Z","url":"https://github.com/acme/widgets/pull/7#discussion_r9"}]}}"#;
+    let stub = StubEnv::new();
+    let body = github_merge_stub(&stub, "", thread, false);
+    let stub = stub.gh_stub(&body);
+
+    let out = run_forge_cli_in(
+        &stub,
+        &[
+            "--provider",
+            "github",
+            "--repo",
+            "acme/widgets",
+            "--format",
+            "json",
+            "pr",
+            "merge",
+            "7",
+        ],
+        Some(&repo_path),
+    );
+    assert_eq!(
+        out.code, 0,
+        "outdated-only threads must not block; stdout={}\nstderr={}",
+        out.stdout, out.stderr
+    );
+    let env = parse_envelope(&out.stdout);
+    assert_eq!(env["data"]["merge_sha"], "merge456");
+    let dispositions = env["data"]["stale_thread_dispositions"]
+        .as_array()
+        .expect("stale_thread_dispositions must be recorded");
+    assert_eq!(
+        dispositions.len(),
+        1,
+        "the outdated thread must be recorded as dispositioned stale"
+    );
+    assert_eq!(dispositions[0]["thread_id"], "PRRT_stale");
+    assert_eq!(dispositions[0]["disposition"], "stale");
+    assert!(
+        stub.tempdir.path().join("github-merged").exists(),
+        "merge must reach the backend once outdated threads are dispositioned"
+    );
+}
+
+#[test]
+fn pr_merge_github_mixed_outdated_and_live_thread_still_blocks() {
+    // A non-outdated unresolved thread must still block even when an outdated
+    // thread is present: stale disposition must not weaken the live gate.
+    let tempdir = make_github_repo(None);
+    let repo_path = tempdir.path().join("repo");
+    let outdated = r#"{"id":"PRRT_stale","isResolved":false,"isOutdated":true,"path":"src/lib.rs","comments":{"nodes":[{"author":{"login":"quality-bot"},"body":"nit: moved code","createdAt":"2026-07-14T04:00:00Z","url":"https://github.com/acme/widgets/pull/7#discussion_r9"}]}}"#;
+    let live = r#"{"id":"PRRT_live","isResolved":false,"isOutdated":false,"path":"src/main.rs","comments":{"nodes":[{"author":{"login":"reviewer"},"body":"please address this","createdAt":"2026-07-14T05:00:00Z","url":"https://github.com/acme/widgets/pull/7#discussion_r10"}]}}"#;
+    let thread_nodes = format!("{outdated},{live}");
+    let stub = StubEnv::new();
+    let body = github_merge_stub(&stub, "", &thread_nodes, false);
+    let stub = stub.gh_stub(&body);
+
+    let out = run_forge_cli_in(
+        &stub,
+        &[
+            "--provider",
+            "github",
+            "--repo",
+            "acme/widgets",
+            "--format",
+            "json",
+            "pr",
+            "merge",
+            "7",
+        ],
+        Some(&repo_path),
+    );
+    assert_eq!(
+        out.code, 65,
+        "a live unresolved thread must still block; stdout={}\nstderr={}",
+        out.stdout, out.stderr
+    );
+    let env = parse_envelope(&out.stdout);
+    assert_eq!(env["error"]["code"], "unresolved_review_threads");
+    let detail = env["error"]["details"]["detail"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(
+        detail.contains("reviewer") && !detail.contains("quality-bot"),
+        "only the live (non-outdated) thread should be listed as blocking: {detail}"
+    );
+    assert!(
+        !stub.tempdir.path().join("github-merged").exists(),
+        "the gate must fire before the backend merge call"
+    );
+}
+
 const UNRESOLVED_DISCUSSIONS_JSON: &str = r#"[
   {
     "id": "d1",
@@ -1204,12 +1303,18 @@ fn pr_merge_gitlab_allow_unresolved_threads_bypasses_gate() {
             "merge",
             "7",
             "--allow-unresolved-threads",
+            "--allow-unresolved-threads-reason",
+            "outdated bot threads",
         ],
         Some(&repo_path),
     );
     assert_eq!(out.code, 0, "stdout={}\nstderr={}", out.stdout, out.stderr);
     let env = parse_envelope(&out.stdout);
     assert_eq!(env["data"]["merge_sha"], "def456");
+    assert_eq!(
+        env["data"]["unresolved_threads_override_reason"], "outdated bot threads",
+        "the recorded bypass reason must be present in the merge payload"
+    );
     assert!(args_log.exists(), "bypassed merge must reach the backend");
 }
 

@@ -3107,7 +3107,7 @@ _forge-cli() {
             return 0
             ;;
         forge__cli__pr__deliver)
-            opts="-h --kind --title --body --body-file --head --base --method --reviewer --label --label-catalog --strict-labels --test-first-evidence --timeout --no-merge --no-issue-closeout --allow-non-default-base --allow-unresolved-threads --review-convergence --allow-unchecked-tasks --allow-unchecked-tasks-reason --format --remote --provider --repo --store-root --dry-run --help"
+            opts="-h --kind --title --body --body-file --head --base --method --reviewer --label --label-catalog --strict-labels --test-first-evidence --timeout --no-merge --no-issue-closeout --allow-non-default-base --allow-unresolved-threads --allow-unresolved-threads-reason --review-convergence --allow-unchecked-tasks --allow-unchecked-tasks-reason --format --remote --provider --repo --store-root --dry-run --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -3158,6 +3158,10 @@ _forge-cli() {
                     return 0
                     ;;
                 --timeout)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --allow-unresolved-threads-reason)
                     COMPREPLY=($(compgen -f "${cur}"))
                     return 0
                     ;;
@@ -3645,7 +3649,7 @@ _forge-cli() {
             return 0
             ;;
         forge__cli__pr__merge)
-            opts="-h --expected-head --method --keep-branch --allow-non-default-base --allow-unresolved-threads --review-convergence --allow-unchecked-tasks --allow-unchecked-tasks-reason --format --remote --provider --repo --store-root --dry-run --help"
+            opts="-h --expected-head --method --keep-branch --allow-non-default-base --allow-unresolved-threads --allow-unresolved-threads-reason --review-convergence --allow-unchecked-tasks --allow-unchecked-tasks-reason --format --remote --provider --repo --store-root --dry-run --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -3657,6 +3661,10 @@ _forge-cli() {
                     ;;
                 --method)
                     COMPREPLY=($(compgen -W "squash merge rebase" -- "${cur}"))
+                    return 0
+                    ;;
+                --allow-unresolved-threads-reason)
+                    COMPREPLY=($(compgen -f "${cur}"))
                     return 0
                     ;;
                 --review-convergence)

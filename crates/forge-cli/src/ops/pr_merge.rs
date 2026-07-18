@@ -63,6 +63,15 @@ pub struct PrMergePayload {
     /// (rule 14) was explicitly bypassed; absent otherwise.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub unchecked_tasks_override_reason: Option<String>,
+    /// Recorded `--allow-unresolved-threads-reason` when the unresolved-threads
+    /// gate (rule 13) was explicitly bypassed; absent otherwise.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unresolved_threads_override_reason: Option<String>,
+    /// Outdated unresolved review threads mechanically dispositioned `stale`
+    /// at rule 13 (the anchored diff hunk changed) so they no longer block;
+    /// recorded for auditability. Empty/absent when none were dispositioned.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub stale_thread_dispositions: Vec<pr_review_threads::StaleThreadDisposition>,
     /// Present only when the default-off review convergence policy resolves
     /// enabled for this invocation.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -368,17 +377,18 @@ fn run_lockdown_chain<R: BackendRunner, C: Clock>(
         None
     };
 
-    // Rule 13 — unresolved review threads remain an independent gate. When
-    // convergence is enabled, reuse the final thread read to populate the
-    // structured convergence result even if the explicit bypass is set.
+    // Rule 13 — unresolved review threads. Outdated threads (their anchored
+    // diff hunk changed) are mechanically dispositioned `stale` and recorded
+    // rather than blocking; only non-outdated unresolved threads block. One
+    // thread read serves the gate, the recorded stale dispositions, and (when
+    // convergence is enabled) the structured convergence snapshot.
+    let thread_payload = pr_review_threads::compute_for_pr(runner, ctx, &pr.url, args.id)?;
     if let Some(snapshot) = review_snapshot.as_mut() {
-        let threads = pr_review_threads::compute_for_pr(runner, ctx, &pr.url, args.id)?;
-        snapshot.unresolved_threads = threads.unresolved;
-        if !args.allow_unresolved_threads {
-            pr_review_threads::ensure_payload_resolved(&threads)?;
-        }
-    } else if !args.allow_unresolved_threads {
-        pr_review_threads::ensure_review_threads_resolved(runner, ctx, &pr.url, args.id)?;
+        snapshot.unresolved_threads = thread_payload.unresolved;
+    }
+    let stale_thread_dispositions = pr_review_threads::stale_dispositions(&thread_payload);
+    if !args.allow_unresolved_threads {
+        pr_review_threads::ensure_payload_resolved(&thread_payload)?;
     }
 
     // Rule 14 — unchecked task-list items in the description block the
@@ -429,6 +439,12 @@ fn run_lockdown_chain<R: BackendRunner, C: Clock>(
         } else {
             None
         },
+        unresolved_threads_override_reason: if args.allow_unresolved_threads {
+            args.allow_unresolved_threads_reason.clone()
+        } else {
+            None
+        },
+        stale_thread_dispositions,
         review_convergence: review_snapshot,
     })
 }
