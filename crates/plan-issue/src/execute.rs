@@ -3822,8 +3822,9 @@ fn verified_recorded_path(
 }
 
 fn repo_relative_identity(path: &Path, repo_root: &Path) -> Option<PathBuf> {
-    let absolute = absolutize(path);
-    let relative = absolute.strip_prefix(repo_root).ok()?;
+    let canonical_path = fs::canonicalize(absolutize(path)).ok()?;
+    let canonical_root = fs::canonicalize(repo_root).ok()?;
+    let relative = canonical_path.strip_prefix(canonical_root).ok()?;
     is_safe_repo_relative(relative).then(|| relative.to_path_buf())
 }
 
