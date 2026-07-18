@@ -204,6 +204,18 @@ for arg in "$@"; do
   prev="$arg"
 done
 
+# macOS `/dev/fd` opens share the inherited descriptor offset. Materialize the
+# body once so independent stub guards and captures each read complete content.
+body_file_copy=""
+case "$body_file" in
+  /dev/fd/*|/proc/self/fd/*)
+    body_file_copy="$(mktemp "${TMPDIR:-/tmp}/forge-cli-stub-body.XXXXXX")"
+    trap 'rm -f "$body_file_copy"' EXIT
+    cat "$body_file" > "$body_file_copy"
+    body_file="$body_file_copy"
+    ;;
+esac
+
 if [[ -n "${FORGE_CLI_STUB_LOG:-}" ]]; then
   printf '%s\n' "${logged[*]}" >> "$FORGE_CLI_STUB_LOG"
 fi
