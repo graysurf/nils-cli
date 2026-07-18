@@ -1515,6 +1515,30 @@ fn hermes_shell_wire_approvals_use_exact_ids_and_compatibility_fallback() {
     assert!(session_dir.join("activity.replay.bin").is_file());
 }
 
+fn managed_claude_hook_count(settings: &Value, event: &str, matcher: Option<&str>) -> usize {
+    let Some(groups) = settings["hooks"][event].as_array() else {
+        return 0;
+    };
+    groups
+        .iter()
+        .filter(|group| group.get("matcher").and_then(Value::as_str) == matcher)
+        .flat_map(|group| group["hooks"].as_array().into_iter().flatten())
+        .filter(|handler| {
+            handler["type"] == "command"
+                && handler["command"] == "agent-session activity hook --agent claude"
+                && handler["timeout"] == 5
+        })
+        .count()
+}
+
+fn assert_managed_claude_hook(settings: &Value, event: &str, matcher: Option<&str>) {
+    assert_eq!(
+        managed_claude_hook_count(settings, event, matcher),
+        1,
+        "expected exactly one managed Claude hook for {event} matcher {matcher:?}: {settings}"
+    );
+}
+
 #[test]
 fn activity_setup_is_dry_run_first_additive_idempotent_and_reversible() {
     let tmp = tempfile::TempDir::new().expect("tempdir");
@@ -1623,6 +1647,16 @@ fn activity_setup_is_dry_run_first_additive_idempotent_and_reversible() {
             assert!(hooks.contains("AGENT_SESSION_ATTENTION_AUTHORITY"));
             assert!(hooks.contains("= protocol"));
         }
+        if agent == "claude" {
+            let settings: Value =
+                serde_json::from_slice(&applied).expect("applied Claude settings json");
+            assert_managed_claude_hook(&settings, "PreToolUse", None);
+            assert_managed_claude_hook(&settings, "PreToolUse", Some("AskUserQuestion"));
+            assert_eq!(
+                managed_claude_hook_count(&settings, "SubagentStop", None),
+                0
+            );
+        }
         let applied_notify = (agent == "codex").then(|| {
             let contents =
                 fs::read_to_string(&codex_notify_path).expect("applied Codex notify config");
@@ -1701,7 +1735,103 @@ fn activity_setup_is_dry_run_first_additive_idempotent_and_reversible() {
 }
 
 #[test]
-fn claude_setup_removes_retired_permission_notification_without_touching_user_hooks() {
+fn claude_setup_upgrades_prior_managed_hooks_without_touching_user_hooks() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let home = tmp.path().join("home");
+    fs::create_dir_all(home.join(".claude")).expect("claude dir");
+    let settings_path = home.join(".claude/settings.json");
+    let home_arg = home.to_string_lossy().to_string();
+    let envs = [("HOME", home_arg.as_str())];
+    let apply = |flag: &str| {
+        run(
+            tmp.path(),
+            &[
+                "activity", "setup", "--agent", "claude", flag, "--format", "json",
+            ],
+            &envs,
+        )
+    };
+
+    let initial = apply("--apply");
+    assert_eq!(initial.code, 0, "stderr={}", initial.stderr_text());
+    let mut settings: Value = serde_json::from_str(
+        &fs::read_to_string(&settings_path).expect("initial managed settings"),
+    )
+    .expect("settings json");
+    let groups = settings["hooks"]["PreToolUse"]
+        .as_array_mut()
+        .expect("managed pre-tool groups");
+    let group = groups
+        .iter_mut()
+        .find(|group| group.get("matcher").is_none())
+        .expect("matcher-less managed pre-tool group");
+    let handlers = group["hooks"].as_array_mut().expect("managed handlers");
+    handlers.retain(|handler| handler["command"] != "agent-session activity hook --agent claude");
+    handlers.push(json!({
+        "type": "command",
+        "command": "user-pre-tool-hook",
+        "timeout": 7
+    }));
+    settings["hooks"]["SubagentStop"] = json!([{
+        "hooks": [{
+            "type": "command",
+            "command": "user-subagent-stop-hook",
+            "timeout": 7
+        }]
+    }]);
+    assert_eq!(managed_claude_hook_count(&settings, "PreToolUse", None), 0);
+    assert_eq!(
+        managed_claude_hook_count(&settings, "SubagentStop", None),
+        0
+    );
+    assert_managed_claude_hook(&settings, "PreToolUse", Some("AskUserQuestion"));
+    fs::write(
+        &settings_path,
+        serde_json::to_vec_pretty(&settings).expect("prior settings json"),
+    )
+    .expect("prior managed settings");
+    let prior = fs::read(&settings_path).expect("prior settings bytes");
+
+    let dry_run = apply("--dry-run");
+    assert_eq!(dry_run.code, 0, "stderr={}", dry_run.stderr_text());
+    assert_eq!(data(&dry_run.stdout_json())["configured"], false);
+    assert_eq!(data(&dry_run.stdout_json())["would_change"], true);
+    assert_eq!(data(&dry_run.stdout_json())["would_configure"], true);
+    assert_eq!(fs::read(&settings_path).expect("dry-run settings"), prior);
+
+    let repaired = apply("--repair");
+    assert_eq!(repaired.code, 0, "stderr={}", repaired.stderr_text());
+    assert_eq!(data(&repaired.stdout_json())["changed"], true);
+    assert_eq!(data(&repaired.stdout_json())["configured"], true);
+    let repaired_settings = fs::read_to_string(&settings_path).expect("repaired Claude settings");
+    let repaired_json: Value =
+        serde_json::from_str(&repaired_settings).expect("repaired settings json");
+    assert_managed_claude_hook(&repaired_json, "PreToolUse", None);
+    assert_managed_claude_hook(&repaired_json, "PreToolUse", Some("AskUserQuestion"));
+    assert_eq!(
+        managed_claude_hook_count(&repaired_json, "SubagentStop", None),
+        0
+    );
+    assert!(repaired_settings.contains("user-pre-tool-hook"));
+    assert!(repaired_settings.contains("user-subagent-stop-hook"));
+
+    let second = apply("--repair");
+    assert_eq!(second.code, 0, "stderr={}", second.stderr_text());
+    assert_eq!(data(&second.stdout_json())["changed"], false);
+    let second_settings: Value = serde_json::from_str(
+        &fs::read_to_string(&settings_path).expect("second repaired settings"),
+    )
+    .expect("second settings json");
+    assert_managed_claude_hook(&second_settings, "PreToolUse", None);
+    assert_managed_claude_hook(&second_settings, "PreToolUse", Some("AskUserQuestion"));
+    assert_eq!(
+        managed_claude_hook_count(&second_settings, "SubagentStop", None),
+        0
+    );
+}
+
+#[test]
+fn claude_setup_removes_retired_hooks_without_touching_user_hooks() {
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let home = tmp.path().join("home");
     fs::create_dir_all(home.join(".claude")).expect("claude dir");
@@ -1742,6 +1872,20 @@ fn claude_setup_removes_retired_permission_notification_without_touching_user_ho
             }
         ]
     }));
+    settings["hooks"]["SubagentStop"] = json!([{
+        "hooks": [
+            {
+                "type": "command",
+                "command": "agent-session activity hook --agent claude",
+                "timeout": 5
+            },
+            {
+                "type": "command",
+                "command": "user-subagent-stop-hook",
+                "timeout": 7
+            }
+        ]
+    }]);
     fs::write(
         &settings_path,
         serde_json::to_vec_pretty(&settings).expect("retired settings json"),
@@ -1775,11 +1919,26 @@ fn claude_setup_removes_retired_permission_notification_without_touching_user_ho
             "timeout": 7
         }])
     );
+    let retired_subagent_group = repaired_json["hooks"]["SubagentStop"]
+        .as_array()
+        .expect("subagent-stop groups")
+        .iter()
+        .find(|group| group.get("matcher").is_none())
+        .expect("user subagent-stop group retained");
+    assert_eq!(
+        retired_subagent_group["hooks"],
+        json!([{
+            "type": "command",
+            "command": "user-subagent-stop-hook",
+            "timeout": 7
+        }])
+    );
 
     let remove = apply("--remove");
     assert_eq!(remove.code, 0, "stderr={}", remove.stderr_text());
     let removed_settings = fs::read_to_string(&settings_path).expect("removed settings");
     assert!(removed_settings.contains("user-permission-notifier"));
+    assert!(removed_settings.contains("user-subagent-stop-hook"));
     assert!(!removed_settings.contains("agent-session activity hook"));
 }
 

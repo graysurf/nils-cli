@@ -17,8 +17,8 @@ use crate::env::ResolvedRoots;
 use crate::integration::EffectiveCatalog;
 use crate::model::{
     AuditTarget, ConfigLoadError, Context, DocumentEntry, DocumentSource, DocumentStatus,
-    DocumentValidation, FallbackMode, LoadedCatalog, PreflightReport, Product, ResolveSummary,
-    ResolvedDocument, Scope, ScopeCatalog, ValidationContract,
+    DocumentValidation, FallbackMode, LoadedCatalog, Phase, PreflightReport, Product,
+    ResolveSummary, ResolvedDocument, Scope, ScopeCatalog, ValidationContract,
 };
 use crate::paths::normalize_path;
 use crate::predicate;
@@ -101,10 +101,39 @@ pub fn resolve_intent_with_catalog_for_product(
     emit_content: bool,
     catalog: &LoadedCatalog,
 ) -> PreflightReport {
+    resolve_intent_with_catalog_for_scope(
+        intent,
+        roots,
+        product,
+        None,
+        strict,
+        fallback_mode,
+        emit_content,
+        catalog,
+    )
+}
+
+/// Resolve an intent scoped to an optional product AND an optional phase.
+///
+/// With `phase = Some(p)`, documents are filtered to those whose declared
+/// phases include `p` plus every no-phase document (which applies to all
+/// phases). `phase = None` applies no phase filter.
+#[allow(clippy::too_many_arguments)]
+pub fn resolve_intent_with_catalog_for_scope(
+    intent: &Context,
+    roots: &ResolvedRoots,
+    product: Option<Product>,
+    phase: Option<Phase>,
+    strict: bool,
+    fallback_mode: FallbackMode,
+    emit_content: bool,
+    catalog: &LoadedCatalog,
+) -> PreflightReport {
     resolve_intent_with_catalog_for_product_policy(
         intent,
         roots,
         product,
+        phase,
         strict,
         fallback_mode,
         emit_content,
@@ -124,10 +153,34 @@ pub(crate) fn resolve_intent_with_effective_catalog_for_product(
     emit_content: bool,
     effective: &EffectiveCatalog,
 ) -> PreflightReport {
+    resolve_intent_with_effective_catalog_for_scope(
+        intent,
+        roots,
+        product,
+        None,
+        strict,
+        fallback_mode,
+        emit_content,
+        effective,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn resolve_intent_with_effective_catalog_for_scope(
+    intent: &Context,
+    roots: &ResolvedRoots,
+    product: Option<Product>,
+    phase: Option<Phase>,
+    strict: bool,
+    fallback_mode: FallbackMode,
+    emit_content: bool,
+    effective: &EffectiveCatalog,
+) -> PreflightReport {
     resolve_intent_with_catalog_for_product_policy(
         intent,
         roots,
         product,
+        phase,
         strict,
         fallback_mode,
         emit_content,
@@ -138,10 +191,12 @@ pub(crate) fn resolve_intent_with_effective_catalog_for_product(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn resolve_intent_with_catalog_for_product_policy(
     intent: &Context,
     roots: &ResolvedRoots,
     product: Option<Product>,
+    phase: Option<Phase>,
     strict: bool,
     fallback_mode: FallbackMode,
     emit_content: bool,
@@ -150,6 +205,7 @@ fn resolve_intent_with_catalog_for_product_policy(
     let documents = resolve_documents(
         roots,
         product,
+        phase.as_ref(),
         fallback_mode,
         emit_content,
         policy.catalog,
@@ -164,6 +220,7 @@ fn resolve_intent_with_catalog_for_product_policy(
         schema_version: PreflightReport::SCHEMA_VERSION,
         intent: intent.clone(),
         product,
+        phase,
         strict,
         docs_home: roots.docs_home.clone(),
         project_path: roots.project_path.clone(),
@@ -195,6 +252,7 @@ pub fn resolve_documents_for_target_for_product(
     resolve_documents(
         roots,
         product,
+        None,
         fallback_mode,
         false,
         catalog,
@@ -231,6 +289,7 @@ pub(crate) fn resolve_all_documents_for_product_policy(
     resolve_documents(
         roots,
         product,
+        None,
         fallback_mode,
         false,
         catalog,
@@ -239,9 +298,11 @@ pub(crate) fn resolve_all_documents_for_product_policy(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn resolve_documents(
     roots: &ResolvedRoots,
     product: Option<Product>,
+    phase: Option<&Phase>,
     fallback_mode: FallbackMode,
     emit_content: bool,
     catalog: &LoadedCatalog,
@@ -259,6 +320,9 @@ fn resolve_documents(
                 continue;
             }
             if !matches_product(&entry.products, product) {
+                continue;
+            }
+            if !matches_phase(&entry.phases, phase) {
                 continue;
             }
             // A `scope = "project"` entry declared in the *home* (docs-home)
@@ -331,6 +395,7 @@ fn resolve_entry(
         scope: entry.scope,
         path,
         products: entry.products.clone(),
+        phases: entry.phases.clone(),
         declared_required: entry.required,
         required,
         when: entry.when_raw.clone(),
@@ -589,6 +654,13 @@ pub fn resolve_validation_contract_for_product(
 
 fn matches_product(products: &[Product], requested: Option<Product>) -> bool {
     products.is_empty() || requested.is_none_or(|product| products.contains(&product))
+}
+
+/// A document matches a phase filter when it declares no phases (applies to all
+/// phases) or when the requested phase is one of its declared phases. A `None`
+/// request (no `--phase`) matches every document.
+fn matches_phase(phases: &[Phase], requested: Option<&Phase>) -> bool {
+    phases.is_empty() || requested.is_none_or(|phase| phases.contains(phase))
 }
 
 /// The distinct intents declared anywhere in the catalog, sorted.

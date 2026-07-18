@@ -136,6 +136,13 @@ pub struct PreflightArgs {
 
     #[arg(
         long,
+        value_name = "PHASE",
+        help = "Filter documents to a workflow phase (no-phase docs always apply)"
+    )]
+    pub phase: Option<String>,
+
+    #[arg(
+        long,
         help = "Exit non-zero when the requested intent is not declared by applicable documents or validation"
     )]
     pub require_declared_intent: bool,
@@ -364,6 +371,9 @@ pub struct SessionArgs {
 pub enum SessionCommand {
     /// Strictly preflight and atomically activate one or more declared intents.
     Activate(SessionActivateArgs),
+    /// Atomically prepare one or more declared intents (activate + strict
+    /// preflight) and report a stable JSON result usable by a runtime hook.
+    Prepare(SessionActivateArgs),
     /// Show active intents for the current session/project/product scope.
     Status(SessionCommonArgs),
     /// Re-resolve the catalog and verify required intents are active and fresh.
@@ -388,6 +398,12 @@ pub struct SessionActivateArgs {
     pub common: SessionCommonArgs,
     #[arg(long, value_name = "INTENT", required = true)]
     pub intent: Vec<String>,
+    #[arg(
+        long,
+        value_name = "PHASE",
+        help = "Scope preparation to a workflow phase (no-phase docs always apply)"
+    )]
+    pub phase: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -396,4 +412,10 @@ pub struct SessionVerifyArgs {
     pub common: SessionCommonArgs,
     #[arg(long = "require-intent", value_name = "INTENT", required = true)]
     pub require_intent: Vec<String>,
+    #[arg(
+        long,
+        value_name = "PHASE",
+        help = "Verify a phase-scoped or full preparation for the required intents"
+    )]
+    pub phase: Option<String>,
 }

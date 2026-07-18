@@ -3,7 +3,7 @@
 This file documents third-party Rust crate licenses used by this workspace.
 
 - Data source: `cargo metadata --format-version 1 --locked`
-- Cargo.lock SHA256: `4a28fe97b2bd977f8cbea75b8a5666e47a2384302357ed22ab586c0711b55105`
+- Cargo.lock SHA256: `e1fd4bd45393a5912ad6c174aa148e8c37e7f58608aaaa237a5bb850f1cd47e5`
 - Third-party crates (`source != null`): 468
 - Workspace crates (`source == null`, excluded below): 45
 
@@ -97,8 +97,8 @@ This file documents third-party Rust crate licenses used by this workspace.
 | cfg_aliases | 0.2.1 | MIT | crates.io |
 | chrono | 0.4.45 | MIT OR Apache-2.0 | crates.io |
 | chrono-tz | 0.10.4 | MIT OR Apache-2.0 | crates.io |
-| clap | 4.6.1 | MIT OR Apache-2.0 | crates.io |
-| clap_builder | 4.6.0 | MIT OR Apache-2.0 | crates.io |
+| clap | 4.6.2 | MIT OR Apache-2.0 | crates.io |
+| clap_builder | 4.6.2 | MIT OR Apache-2.0 | crates.io |
 | clap_complete | 4.6.7 | MIT OR Apache-2.0 | crates.io |
 | clap_derive | 4.6.1 | MIT OR Apache-2.0 | crates.io |
 | clap_lex | 1.1.0 | MIT OR Apache-2.0 | crates.io |
@@ -317,8 +317,8 @@ This file documents third-party Rust crate licenses used by this workspace.
 | rand_chacha | 0.9.0 | MIT OR Apache-2.0 | crates.io |
 | rand_core | 0.6.4 | MIT OR Apache-2.0 | crates.io |
 | rand_core | 0.9.5 | MIT OR Apache-2.0 | crates.io |
-| regex | 1.13.0 | MIT OR Apache-2.0 | crates.io |
-| regex-automata | 0.4.14 | MIT OR Apache-2.0 | crates.io |
+| regex | 1.13.1 | MIT OR Apache-2.0 | crates.io |
+| regex-automata | 0.4.16 | MIT OR Apache-2.0 | crates.io |
 | regex-bites | 0.1.6 | MIT OR Apache-2.0 | crates.io |
 | regex-syntax | 0.8.11 | MIT OR Apache-2.0 | crates.io |
 | reqwest | 0.13.4 | MIT OR Apache-2.0 | crates.io |
@@ -394,15 +394,15 @@ This file documents third-party Rust crate licenses used by this workspace.
 | tinystr | 0.8.3 | Unicode-3.0 | crates.io |
 | tinyvec | 1.11.0 | Zlib OR Apache-2.0 OR MIT | crates.io |
 | tinyvec_macros | 0.1.1 | MIT OR Apache-2.0 OR Zlib | crates.io |
-| tokio | 1.52.3 | MIT | crates.io |
+| tokio | 1.53.0 | MIT | crates.io |
 | tokio-macros | 2.7.0 | MIT | crates.io |
 | tokio-rustls | 0.26.4 | MIT OR Apache-2.0 | crates.io |
 | tokio-tungstenite | 0.29.0 | MIT | crates.io |
 | toml | 1.1.2+spec-1.1.0 | MIT OR Apache-2.0 | crates.io |
 | toml_datetime | 1.1.1+spec-1.1.0 | MIT OR Apache-2.0 | crates.io |
-| toml_edit | 0.25.12+spec-1.1.0 | MIT OR Apache-2.0 | crates.io |
+| toml_edit | 0.25.13+spec-1.1.0 | MIT OR Apache-2.0 | crates.io |
 | toml_parser | 1.1.2+spec-1.1.0 | MIT OR Apache-2.0 | crates.io |
-| toml_writer | 1.1.1+spec-1.1.0 | MIT OR Apache-2.0 | crates.io |
+| toml_writer | 1.1.2+spec-1.1.0 | MIT OR Apache-2.0 | crates.io |
 | tower | 0.5.3 | MIT | crates.io |
 | tower-http | 0.6.11 | MIT | crates.io |
 | tower-layer | 0.3.3 | MIT | crates.io |
@@ -437,7 +437,7 @@ This file documents third-party Rust crate licenses used by this workspace.
 | usvg | 0.47.0 | Apache-2.0 OR MIT | crates.io |
 | utf8_iter | 1.0.4 | Apache-2.0 OR MIT | crates.io |
 | utf8parse | 0.2.2 | Apache-2.0 OR MIT | crates.io |
-| uuid | 1.23.4 | Apache-2.0 OR MIT | crates.io |
+| uuid | 1.24.0 | Apache-2.0 OR MIT | crates.io |
 | valuable | 0.1.1 | MIT | crates.io |
 | vcpkg | 0.2.15 | MIT/Apache-2.0 | crates.io |
 | version_check | 0.9.5 | MIT/Apache-2.0 | crates.io |

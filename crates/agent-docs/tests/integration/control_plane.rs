@@ -348,3 +348,453 @@ fn session_activation_reclaims_stale_directory_lock() {
     assert_eq!(recovered.code, 0, "stderr: {}", recovered.stderr);
     assert!(!lock.exists());
 }
+
+#[test]
+fn session_prepare_activates_and_reports_stable_result() {
+    let env = TestEnv::new();
+    env.write_project_catalog(catalog())
+        .write_project_doc("DEVELOPMENT.md", "# Development\n");
+    let state_home = env.project_path(".state");
+    let state = state_home.to_str().unwrap();
+
+    let prepare = env.run(&[
+        "session",
+        "prepare",
+        "--session-id",
+        "session-prepare",
+        "--product",
+        "codex",
+        "--state-home",
+        state,
+        "--intent",
+        "project-dev",
+        "--format",
+        "json",
+    ]);
+    assert_eq!(prepare.code, 0, "stderr: {}", prepare.stderr);
+    let json = prepare.json();
+    assert_eq!(json["schema_version"], "cli.agent-docs.session.prepare.v1");
+    assert_eq!(json["data"]["verified"], true);
+    assert_eq!(json["data"]["active_intents"][0], "project-dev");
+    assert_eq!(json["data"]["prepared_intents"][0], "project-dev");
+    assert_eq!(json["data"]["reason"], "prepared");
+
+    // Re-preparing the same intent is idempotent and reported as already-current.
+    let again = env.run(&[
+        "session",
+        "prepare",
+        "--session-id",
+        "session-prepare",
+        "--product",
+        "codex",
+        "--state-home",
+        state,
+        "--intent",
+        "project-dev",
+        "--format",
+        "json",
+    ]);
+    assert_eq!(again.code, 0, "stderr: {}", again.stderr);
+    let again_json = again.json();
+    assert_eq!(again_json["data"]["reason"], "already-current");
+    assert_eq!(
+        again_json["data"]["prepared_intents"]
+            .as_array()
+            .unwrap()
+            .len(),
+        0
+    );
+
+    // A prepared intent verifies as active.
+    let verify = env.run(&[
+        "session",
+        "verify",
+        "--session-id",
+        "session-prepare",
+        "--product",
+        "codex",
+        "--state-home",
+        state,
+        "--require-intent",
+        "project-dev",
+        "--format",
+        "json",
+    ]);
+    assert_eq!(verify.code, 0, "stderr: {}", verify.stderr);
+    assert_eq!(verify.json()["data"]["verified"], true);
+
+    // An undeclared intent fails closed with a stable reason code.
+    let undeclared = env.run(&[
+        "session",
+        "prepare",
+        "--session-id",
+        "session-prepare",
+        "--product",
+        "codex",
+        "--state-home",
+        state,
+        "--intent",
+        "browser-test",
+        "--format",
+        "json",
+    ]);
+    assert_eq!(undeclared.code, 65, "stderr: {}", undeclared.stderr);
+    assert_eq!(undeclared.json()["error"]["code"], "undeclared-intent");
+}
+
+fn phase_catalog() -> &'static str {
+    r#"
+[[document]]
+context = "project-dev"
+scope = "project"
+path = "DEVELOPMENT.md"
+required = true
+
+[[document]]
+context = "project-dev"
+scope = "project"
+path = "EDIT.md"
+required = true
+phase = "edit"
+
+[[document]]
+context = "project-dev"
+scope = "project"
+path = "DELIVERY.md"
+required = true
+phase = "delivery"
+"#
+}
+
+#[test]
+fn phase_scoped_prepare_and_verify_pass() {
+    let env = TestEnv::new();
+    // Only the no-phase and edit-phase docs exist; the delivery doc is absent.
+    env.write_project_catalog(phase_catalog())
+        .write_project_doc("DEVELOPMENT.md", "# Development\n")
+        .write_project_doc("EDIT.md", "# Edit\n");
+    let state_home = env.project_path(".state");
+    let state = state_home.to_str().unwrap();
+
+    let prepare = env.run(&[
+        "session",
+        "prepare",
+        "--session-id",
+        "phase-session",
+        "--product",
+        "codex",
+        "--state-home",
+        state,
+        "--intent",
+        "project-dev",
+        "--phase",
+        "edit",
+        "--format",
+        "json",
+    ]);
+    assert_eq!(prepare.code, 0, "stderr: {}", prepare.stderr);
+    let json = prepare.json();
+    assert_eq!(json["data"]["phase"], "edit", "{json}");
+    assert_eq!(json["data"]["reason"], "prepared");
+
+    let verify = env.run(&[
+        "session",
+        "verify",
+        "--session-id",
+        "phase-session",
+        "--product",
+        "codex",
+        "--state-home",
+        state,
+        "--require-intent",
+        "project-dev",
+        "--phase",
+        "edit",
+        "--format",
+        "json",
+    ]);
+    assert_eq!(verify.code, 0, "stderr: {}", verify.stderr);
+    assert_eq!(verify.json()["data"]["verified"], true);
+}
+
+#[test]
+fn full_prepare_covers_a_phase_scoped_verify() {
+    let env = TestEnv::new();
+    // A full prepare requires every doc across all phases to be present.
+    env.write_project_catalog(phase_catalog())
+        .write_project_doc("DEVELOPMENT.md", "# Development\n")
+        .write_project_doc("EDIT.md", "# Edit\n")
+        .write_project_doc("DELIVERY.md", "# Delivery\n");
+    let state_home = env.project_path(".state");
+    let state = state_home.to_str().unwrap();
+
+    let prepare = env.run(&[
+        "session",
+        "prepare",
+        "--session-id",
+        "full-session",
+        "--product",
+        "codex",
+        "--state-home",
+        state,
+        "--intent",
+        "project-dev",
+        "--format",
+        "json",
+    ]);
+    assert_eq!(prepare.code, 0, "stderr: {}", prepare.stderr);
+
+    // A full (no-phase) prepare covers every phase's subset.
+    let verify = env.run(&[
+        "session",
+        "verify",
+        "--session-id",
+        "full-session",
+        "--product",
+        "codex",
+        "--state-home",
+        state,
+        "--require-intent",
+        "project-dev",
+        "--phase",
+        "edit",
+        "--format",
+        "json",
+    ]);
+    assert_eq!(verify.code, 0, "stderr: {}", verify.stderr);
+    assert_eq!(verify.json()["data"]["verified"], true);
+}
+
+#[test]
+fn phase_prepare_does_not_satisfy_a_different_phase_verify() {
+    let env = TestEnv::new();
+    env.write_project_catalog(phase_catalog())
+        .write_project_doc("DEVELOPMENT.md", "# Development\n")
+        .write_project_doc("EDIT.md", "# Edit\n");
+    let state_home = env.project_path(".state");
+    let state = state_home.to_str().unwrap();
+
+    let prepare = env.run(&[
+        "session",
+        "prepare",
+        "--session-id",
+        "cross-phase-session",
+        "--product",
+        "codex",
+        "--state-home",
+        state,
+        "--intent",
+        "project-dev",
+        "--phase",
+        "edit",
+        "--format",
+        "json",
+    ]);
+    assert_eq!(prepare.code, 0, "stderr: {}", prepare.stderr);
+
+    let verify = env.run(&[
+        "session",
+        "verify",
+        "--session-id",
+        "cross-phase-session",
+        "--product",
+        "codex",
+        "--state-home",
+        state,
+        "--require-intent",
+        "project-dev",
+        "--phase",
+        "delivery",
+        "--format",
+        "json",
+    ]);
+    assert_eq!(
+        verify.code, 65,
+        "verifying an unprepared phase must fail: stdout: {} stderr: {}",
+        verify.stdout, verify.stderr
+    );
+    assert_eq!(verify.json()["error"]["code"], "missing-intent");
+}
+
+#[test]
+fn phase_prepare_with_missing_phase_doc_is_phase_unsatisfied() {
+    let env = TestEnv::new();
+    // EDIT.md (required for the edit phase) is missing.
+    env.write_project_catalog(phase_catalog())
+        .write_project_doc("DEVELOPMENT.md", "# Development\n");
+    let state_home = env.project_path(".state");
+    let state = state_home.to_str().unwrap();
+
+    let prepare = env.run(&[
+        "session",
+        "prepare",
+        "--session-id",
+        "unsatisfied-session",
+        "--product",
+        "codex",
+        "--state-home",
+        state,
+        "--intent",
+        "project-dev",
+        "--phase",
+        "edit",
+        "--format",
+        "json",
+    ]);
+    assert_eq!(
+        prepare.code, 65,
+        "stdout: {} stderr: {}",
+        prepare.stdout, prepare.stderr
+    );
+    assert_eq!(prepare.json()["error"]["code"], "phase-unsatisfied");
+}
+
+#[test]
+fn no_phase_verify_is_not_satisfied_by_a_phase_only_prepare() {
+    let env = TestEnv::new();
+    env.write_project_catalog(phase_catalog())
+        .write_project_doc("DEVELOPMENT.md", "# Development\n")
+        .write_project_doc("EDIT.md", "# Edit\n");
+    let state_home = env.project_path(".state");
+    let state = state_home.to_str().unwrap();
+
+    let prepare = env.run(&[
+        "session",
+        "prepare",
+        "--session-id",
+        "phase-only-session",
+        "--product",
+        "codex",
+        "--state-home",
+        state,
+        "--intent",
+        "project-dev",
+        "--phase",
+        "edit",
+        "--format",
+        "json",
+    ]);
+    assert_eq!(prepare.code, 0, "stderr: {}", prepare.stderr);
+
+    // A phase-only prepare must NOT satisfy a no-phase verify: a full verify
+    // requires the full (no-phase) activation, which was never written.
+    let verify = env.run(&[
+        "session",
+        "verify",
+        "--session-id",
+        "phase-only-session",
+        "--product",
+        "codex",
+        "--state-home",
+        state,
+        "--require-intent",
+        "project-dev",
+        "--format",
+        "json",
+    ]);
+    assert_eq!(
+        verify.code, 65,
+        "stdout: {} stderr: {}",
+        verify.stdout, verify.stderr
+    );
+    assert_eq!(verify.json()["error"]["code"], "missing-intent");
+}
+
+#[test]
+fn phase_scoped_verify_detects_stale_activation() {
+    let env = TestEnv::new();
+    env.write_project_catalog(phase_catalog())
+        .write_project_doc("DEVELOPMENT.md", "# Development\n")
+        .write_project_doc("EDIT.md", "# Edit\n");
+    let state_home = env.project_path(".state");
+    let state = state_home.to_str().unwrap();
+
+    let prepare = env.run(&[
+        "session",
+        "prepare",
+        "--session-id",
+        "stale-phase-session",
+        "--product",
+        "codex",
+        "--state-home",
+        state,
+        "--intent",
+        "project-dev",
+        "--phase",
+        "edit",
+        "--format",
+        "json",
+    ]);
+    assert_eq!(prepare.code, 0, "stderr: {}", prepare.stderr);
+
+    // Mutating the edit-phase required doc invalidates the phase-scoped
+    // fingerprint, so a later phase verify must fail closed.
+    env.write_project_doc("EDIT.md", "# Edit\n\nChanged.\n");
+    let stale = env.run(&[
+        "session",
+        "verify",
+        "--session-id",
+        "stale-phase-session",
+        "--product",
+        "codex",
+        "--state-home",
+        state,
+        "--require-intent",
+        "project-dev",
+        "--phase",
+        "edit",
+        "--format",
+        "json",
+    ]);
+    assert_eq!(
+        stale.code, 65,
+        "stdout: {} stderr: {}",
+        stale.stdout, stale.stderr
+    );
+    assert_eq!(stale.json()["error"]["code"], "stale-activation");
+}
+
+#[test]
+fn session_rejects_malformed_phase() {
+    let env = TestEnv::new();
+    env.write_project_catalog(phase_catalog())
+        .write_project_doc("DEVELOPMENT.md", "# Development\n")
+        .write_project_doc("EDIT.md", "# Edit\n");
+    let state_home = env.project_path(".state");
+    let state = state_home.to_str().unwrap();
+
+    // Every mutation-capable session subcommand that accepts --phase must reject
+    // a malformed value with the same stable, fail-closed error code.
+    for (command, intent_flag) in [
+        ("prepare", "--intent"),
+        ("activate", "--intent"),
+        ("verify", "--require-intent"),
+    ] {
+        let out = env.run(&[
+            "session",
+            command,
+            "--session-id",
+            "malformed-phase-session",
+            "--product",
+            "codex",
+            "--state-home",
+            state,
+            intent_flag,
+            "project-dev",
+            "--phase",
+            "bad phase",
+            "--format",
+            "json",
+        ]);
+        assert_eq!(
+            out.code, 65,
+            "command={command} stdout: {} stderr: {}",
+            out.stdout, out.stderr
+        );
+        assert_eq!(
+            out.json()["error"]["code"],
+            "invalid-phase",
+            "command={command}"
+        );
+    }
+}

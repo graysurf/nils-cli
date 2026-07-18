@@ -43,6 +43,45 @@ impl fmt::Display for Context {
     }
 }
 
+/// A free-form workflow-phase identifier (for example `edit` or `delivery`).
+///
+/// Phases are declared by the catalog, not compiled into the binary, so a
+/// consumer defines its own phase vocabulary and adding a phase never needs a
+/// new release. Validated on the same charset as [`Context`].
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize)]
+#[serde(transparent)]
+pub struct Phase(String);
+
+impl Phase {
+    /// Validate and construct a phase identifier. Allowed characters mirror
+    /// [`Context`]: ASCII alphanumerics, `-`, `_`, `.`, and `/`.
+    pub fn parse(raw: &str) -> Result<Self, String> {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            return Err("phase cannot be empty".to_string());
+        }
+        if let Some(bad) = trimmed
+            .chars()
+            .find(|ch| !(ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.' | '/')))
+        {
+            return Err(format!(
+                "phase `{trimmed}` contains unsupported character `{bad}`; allowed: a-z A-Z 0-9 - _ . /"
+            ));
+        }
+        Ok(Self(trimmed.to_string()))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for Phase {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, ValueEnum)]
 #[serde(rename_all = "kebab-case")]
 pub enum Scope {
@@ -339,6 +378,11 @@ pub struct ResolvedDocument {
     pub scope: Scope,
     pub path: PathBuf,
     pub products: Vec<Product>,
+    /// The catalog phases this document is scoped to. Empty means the document
+    /// applies to every phase; omitted from JSON when empty so no-phase catalog
+    /// output stays byte-identical.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub phases: Vec<Phase>,
     /// Whether the catalog marked the entry `required = true`.
     pub declared_required: bool,
     /// Whether the entry is required for this run (`declared_required` AND the
@@ -418,6 +462,10 @@ pub struct PreflightReport {
     pub schema_version: &'static str,
     pub intent: Context,
     pub product: Option<Product>,
+    /// The requested phase filter, or `None` when no `--phase` was supplied.
+    /// Omitted from JSON when absent so no-phase output stays byte-identical.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub phase: Option<Phase>,
     pub strict: bool,
     pub docs_home: PathBuf,
     pub project_path: PathBuf,
@@ -489,6 +537,11 @@ pub struct DocumentEntry {
     pub scope: Scope,
     pub path: PathBuf,
     pub products: Vec<Product>,
+    /// The phases this document is scoped to. Empty means every phase. Omitted
+    /// from JSON when empty so no-phase catalogs serialize byte-identically
+    /// (which keeps the session fingerprint stable across the upgrade).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub phases: Vec<Phase>,
     pub required: bool,
     pub when: When,
     /// The raw `when` string as written in the catalog (for display / audit).

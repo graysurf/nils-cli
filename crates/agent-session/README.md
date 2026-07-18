@@ -264,8 +264,14 @@ is no second state model.
   the curated project picker: only primary git working trees are returned, ordered by most-recent session cwd usage
   (`last_used`) and then name/path.
 - `GET /codex/accounts` — authenticated nickname-only account inventory from
-  the configured host credential broker. The response never contains access
-  tokens, ChatGPT account ids, auth paths, or broker diagnostics.
+  the configured host credential broker. The additive `readiness` projection
+  reports whether the installed Codex version meets the minimum app-server
+  floor and currently advertises Unix listen support, with only a canonical
+  provider version and stable safe reason code. Newer stable Codex releases are
+  accepted by capability instead of an exact-version allowlist; exact protocol
+  attention remains limited to explicitly audited versions and otherwise falls
+  back to hook authority. The response never contains access tokens, ChatGPT
+  account ids, auth paths, or broker diagnostics.
 - `GET /activity/events` — authenticated metadata-only SSE for activity snapshots and heartbeats. Events carry a daemon-boot
   `stream_id` and increasing `sequence`; `Last-Event-ID` enables count-and-byte-bounded replay, while stale/foreign cursors
   and lagged consumers receive a reset. Concurrent subscribers are daemon-capped and saturation returns a stable
@@ -286,8 +292,14 @@ is no second state model.
   `PUT /sessions/{id}/account`,
   `PUT /sessions/{id}/auto-resume`, `DELETE /sessions/{id}/auto-resume`,
   `POST /sessions/{id}/attachments?filename=...`, `DELETE /sessions/{id}` — writes, require a bearer token.
-- `POST /sessions/{id}/prompt` submits exact prompt text through a supported provider control plane. This versioned mutation never
-  sends multiline text through terminal keys; unsupported or not-yet-ready sessions fail closed.
+- `POST /sessions/{id}/prompt` submits exact prompt text through a supported provider control plane. The compatibility route accepts
+  `{ "text": "...", "expected_session_incarnation": "launch-id" }`; the incarnation is optional for older clients, and
+  a new daemon validates it against the authoritative runtime under the session-record lock before provider dispatch.
+  Clients that require a cross-version fence use `POST /sessions/{id}/prompt/v2`, which requires both fields, rejects
+  unknown fields, and is absent from older daemons so they fail before provider dispatch. A replacement returns HTTP 409
+  `session-incarnation-conflict` without submitting. Success returns `submitted: true` plus the locked
+  `session_incarnation`, while the provider turn id remains private. These mutations never send multiline text through
+  terminal keys; unsupported or not-yet-ready sessions fail closed.
 - `PUT /sessions/{id}/account` accepts
   `{ "account": "nickname", "expected_session_incarnation": "launch-id" }`
   only for

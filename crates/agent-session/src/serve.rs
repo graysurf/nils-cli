@@ -587,6 +587,10 @@ fn router(state: Arc<ServeState>) -> Router {
         .route("/sessions/{id}/buffer", get(buffer_handler))
         .route("/sessions/{id}/send", post(send_handler))
         .route("/sessions/{id}/prompt", post(structured_prompt_handler))
+        .route(
+            "/sessions/{id}/prompt/v2",
+            post(fenced_structured_prompt_handler),
+        )
         .route("/sessions/{id}/resume", post(resume_handler))
         .route("/sessions/{id}/maintenance", get(maintenance_handler))
         .route(
@@ -2417,6 +2421,14 @@ struct SendBody {
 #[derive(Debug, Deserialize)]
 struct StructuredPromptBody {
     text: String,
+    expected_session_incarnation: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FencedStructuredPromptBody {
+    text: String,
+    expected_session_incarnation: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2484,8 +2496,20 @@ async fn codex_accounts_handler(
     if let Some(response) = deny_unauthorized(&state, &headers) {
         return response;
     }
-    match tokio::task::spawn_blocking(crate::codex_account::list_accounts).await {
-        Ok(Ok(accounts)) => envelope_ok(json!({ "machine": state.machine, "accounts": accounts })),
+    let agent_bin = crate::resolve_agent_bin(AgentKind::Codex, None);
+    match tokio::task::spawn_blocking(move || {
+        crate::codex_account::list_accounts().map(|accounts| {
+            let readiness = codex_app_server::account_binding_readiness(&agent_bin);
+            (accounts, readiness)
+        })
+    })
+    .await
+    {
+        Ok(Ok((accounts, readiness))) => envelope_ok(json!({
+            "machine": state.machine,
+            "accounts": accounts,
+            "readiness": readiness,
+        })),
         Ok(Err(err)) => envelope_err(err),
         Err(_) => join_err(),
     }
@@ -2789,6 +2813,7 @@ async fn create_handler(
                         &state,
                         &view.result.id,
                         &launch_id,
+                        None,
                         Some((requested_account, 1)),
                         &handle,
                         &prompt,
@@ -2912,31 +2937,119 @@ async fn wait_for_account_binding(
     }
 }
 
+fn structured_prompt_incarnation_conflict(
+    id: &str,
+    expected_session_incarnation: &str,
+    actual_session_incarnation: Option<&str>,
+) -> CliError {
+    CliError::data(
+        "session-incarnation-conflict",
+        "session runtime changed before prompt submission",
+        Some(json!({
+            "id": id,
+            "expected_session_incarnation": expected_session_incarnation,
+            "actual_session_incarnation": actual_session_incarnation,
+        })),
+    )
+}
+
+async fn load_structured_prompt_record_locked(
+    state: &ServeState,
+    id: &str,
+    expected_session_incarnation: Option<&str>,
+) -> Result<SessionRecord, Response> {
+    let context = state.context.clone();
+    let id = id.to_string();
+    let expected_session_incarnation = expected_session_incarnation.map(str::to_string);
+    match tokio::task::spawn_blocking(move || {
+        let _record_lock = crate::acquire_session_record_lock(&context, &id)?;
+        let current = load_session_record(&context, &id)?;
+        if let Some(expected) = expected_session_incarnation {
+            let actual = current
+                .runtime
+                .as_ref()
+                .map(|runtime| runtime.launch_id.as_str());
+            if actual != Some(expected.as_str()) {
+                return Err(structured_prompt_incarnation_conflict(
+                    &current.id,
+                    &expected,
+                    actual,
+                ));
+            }
+        }
+        Ok::<_, CliError>(current)
+    })
+    .await
+    {
+        Ok(Ok(record)) => Ok(record),
+        Ok(Err(err)) => Err(envelope_err(err)),
+        Err(_) => Err(join_err()),
+    }
+}
+
+async fn wait_for_structured_prompt_control(
+    state: &ServeState,
+    id: &str,
+    launch_id: &str,
+    expected_session_incarnation: Option<&str>,
+    timeout: Duration,
+) -> Result<ControlHandle, Response> {
+    if let Some(handle) = wait_for_codex_control_within(state, id, launch_id, timeout).await {
+        return Ok(handle);
+    }
+
+    let unavailable_fence = expected_session_incarnation.unwrap_or(launch_id);
+    load_structured_prompt_record_locked(state, id, Some(unavailable_fence)).await?;
+    Err(status_json(
+        StatusCode::CONFLICT,
+        "structured-prompt-unavailable",
+        "structured prompt control is not ready for this session",
+    ))
+}
+
 async fn submit_structured_prompt_locked(
     state: &ServeState,
     id: &str,
     launch_id: &str,
+    expected_session_incarnation: Option<&str>,
     expected_binding: Option<(&str, u64)>,
     handle: &ControlHandle,
     text: &str,
-) -> Result<(), Response> {
+) -> Result<String, Response> {
     let lock_context = state.context.clone();
     let lock_id = id.to_string();
     let expected_launch_id = launch_id.to_string();
+    let expected_session_incarnation = expected_session_incarnation.map(str::to_string);
     let expected_binding =
         expected_binding.map(|(account, revision)| (account.to_string(), revision));
-    let record_lock = match tokio::task::spawn_blocking(move || {
+    let (record_lock, session_incarnation) = match tokio::task::spawn_blocking(move || {
         let record_lock = crate::acquire_session_record_lock(&lock_context, &lock_id)?;
         let mut current = load_session_record(&lock_context, &lock_id)?;
-        if current
+        let Some(actual_launch_id) = current
             .runtime
             .as_ref()
-            .is_none_or(|runtime| runtime.launch_id != expected_launch_id)
+            .map(|runtime| runtime.launch_id.clone())
+        else {
+            return Err(structured_prompt_incarnation_conflict(
+                &current.id,
+                &expected_launch_id,
+                None,
+            ));
+        };
+        if actual_launch_id != expected_launch_id {
+            return Err(structured_prompt_incarnation_conflict(
+                &current.id,
+                &expected_launch_id,
+                Some(&actual_launch_id),
+            ));
+        }
+        if let Some(expected) = expected_session_incarnation
+            && actual_launch_id != expected
         {
-            return Err(CliError::data(
-                "session-incarnation-conflict",
-                "session runtime changed before prompt submission",
-                Some(json!({ "id": current.id })),
+            return Err(structured_prompt_incarnation_conflict(
+                &current.id,
+                &expected,
+                Some(&actual_launch_id),
             ));
         }
         if let Some((account, revision)) = expected_binding
@@ -2956,34 +3069,33 @@ async fn submit_structured_prompt_locked(
             &jiff::Timestamp::now().to_string(),
         )?;
         crate::codex_account::ensure_input_allowed(&current)?;
-        Ok::<_, CliError>(record_lock)
+        Ok::<_, CliError>((record_lock, actual_launch_id))
     })
     .await
     {
-        Ok(Ok(record_lock)) => record_lock,
-        Ok(Err(err))
-            if matches!(
-                err.code(),
-                "codex-account-binding-superseded" | "session-incarnation-conflict"
-            ) =>
-        {
+        Ok(Ok(locked)) => locked,
+        Ok(Err(err)) if err.code() == "codex-account-binding-superseded" => {
             return Err(status_json(
                 StatusCode::CONFLICT,
                 err.code(),
-                "session account or runtime changed before prompt submission",
+                "session account changed before prompt submission",
             ));
         }
         Ok(Err(err)) => return Err(envelope_err(err)),
         Err(_) => return Err(join_err()),
     };
 
-    let response = handle.submit_prompt(text).await.map(|_| ()).map_err(|_| {
-        status_json(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "structured-prompt-outcome-unknown",
-            "structured prompt submission outcome is unknown",
-        )
-    });
+    let response = handle
+        .submit_prompt(text)
+        .await
+        .map(|_| session_incarnation)
+        .map_err(|_| {
+            status_json(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "structured-prompt-outcome-unknown",
+                "structured prompt submission outcome is unknown",
+            )
+        });
     drop(record_lock);
     response
 }
@@ -3153,35 +3265,80 @@ async fn structured_prompt_handler(
     if let Some(resp) = deny_unauthorized(&state, &headers) {
         return resp;
     }
-    if body.text.trim().is_empty() {
+    submit_structured_prompt_handler(state, id, body.text, body.expected_session_incarnation).await
+}
+
+async fn fenced_structured_prompt_handler(
+    State(state): State<Arc<ServeState>>,
+    headers: HeaderMap,
+    AxPath(id): AxPath<String>,
+    body: Result<Json<FencedStructuredPromptBody>, JsonRejection>,
+) -> Response {
+    if let Some(resp) = deny_unauthorized(&state, &headers) {
+        return resp;
+    }
+    let Json(body) = match body {
+        Ok(body) => body,
+        Err(_) => {
+            return envelope_err(CliError::usage(
+                "invalid-json-body",
+                "request body must be JSON with text and expected_session_incarnation fields only",
+                None,
+            ));
+        }
+    };
+    submit_structured_prompt_handler(
+        state,
+        id,
+        body.text,
+        Some(body.expected_session_incarnation),
+    )
+    .await
+}
+
+async fn submit_structured_prompt_handler(
+    state: Arc<ServeState>,
+    id: String,
+    text: String,
+    expected_session_incarnation: Option<String>,
+) -> Response {
+    if text.trim().is_empty() {
         return status_json(
             StatusCode::BAD_REQUEST,
             "empty-prompt",
             "structured prompt text must not be blank",
         );
     }
-    if body.text.len() > MAX_PROVIDER_PROMPT_BYTES {
+    if text.len() > MAX_PROVIDER_PROMPT_BYTES {
         return status_json(
             StatusCode::PAYLOAD_TOO_LARGE,
             "prompt-too-large",
             "structured prompt exceeds the maximum supported size",
         );
     }
-    if structured_prompt_has_unsafe_control(&body.text) {
+    if structured_prompt_has_unsafe_control(&text) {
         return status_json(
             StatusCode::BAD_REQUEST,
             "unsafe-prompt-control",
             "structured prompt contains an unsupported control character",
         );
     }
+    let expected_session_incarnation = match expected_session_incarnation.as_deref() {
+        Some(value) if value.trim().is_empty() || value.len() > 128 => {
+            return status_json(
+                StatusCode::BAD_REQUEST,
+                "invalid-session-incarnation",
+                "expected_session_incarnation must be a nonblank identifier of at most 128 bytes",
+            );
+        }
+        value => value,
+    };
 
-    let context = state.context.clone();
-    let load_id = id.clone();
     let record =
-        match tokio::task::spawn_blocking(move || load_session_record(&context, &load_id)).await {
-            Ok(Ok(record)) => record,
-            Ok(Err(err)) => return envelope_err(err),
-            Err(_) => return join_err(),
+        match load_structured_prompt_record_locked(&state, &id, expected_session_incarnation).await
+        {
+            Ok(record) => record,
+            Err(response) => return response,
         };
     if !codex_app_server::runtime_is_supported(&record) {
         return status_json(
@@ -3202,31 +3359,35 @@ async fn structured_prompt_handler(
         );
     };
 
-    let deadline = Instant::now() + STRUCTURED_PROMPT_CONTROL_WAIT;
-    let handle = loop {
-        let handle = state.codex_controls.lock().ok().and_then(|controls| {
-            controls
-                .get(&id)
-                .filter(|entry| entry.launch_id == launch_id)
-                .map(|entry| entry.handle.clone())
-        });
-        if handle.is_some() || Instant::now() >= deadline {
-            break handle;
-        }
-        tokio::time::sleep(STRUCTURED_PROMPT_CONTROL_POLL).await;
-    };
-    let Some(handle) = handle else {
-        return status_json(
-            StatusCode::CONFLICT,
-            "structured-prompt-unavailable",
-            "structured prompt control is not ready for this session",
-        );
+    let handle = match wait_for_structured_prompt_control(
+        &state,
+        &id,
+        &launch_id,
+        expected_session_incarnation,
+        STRUCTURED_PROMPT_CONTROL_WAIT,
+    )
+    .await
+    {
+        Ok(handle) => handle,
+        Err(response) => return response,
     };
 
-    match submit_structured_prompt_locked(&state, &record.id, &launch_id, None, &handle, &body.text)
-        .await
+    match submit_structured_prompt_locked(
+        &state,
+        &record.id,
+        &launch_id,
+        expected_session_incarnation,
+        None,
+        &handle,
+        &text,
+    )
+    .await
     {
-        Ok(()) => envelope_ok(json!({ "machine": state.machine, "submitted": true })),
+        Ok(session_incarnation) => envelope_ok(json!({
+            "machine": state.machine,
+            "submitted": true,
+            "session_incarnation": session_incarnation,
+        })),
         Err(response) => response,
     }
 }
@@ -11127,7 +11288,10 @@ esac
         let (handle, mut commands) = codex_app_server::control_channel();
         st.codex_controls.lock().unwrap().insert(
             "structured".to_string(),
-            CodexControlEntry { launch_id, handle },
+            CodexControlEntry {
+                launch_id: launch_id.clone(),
+                handle,
+            },
         );
         let prompt = "inspect first line\nthen second line";
         let responder_context = st.context.clone();
@@ -11159,16 +11323,277 @@ esac
         let (status, body) = call(
             router(st.clone()),
             post_json(
-                "/sessions/structured/prompt",
+                "/sessions/structured/prompt/v2",
                 Some(TOKEN),
-                json!({ "text": prompt }),
+                json!({
+                    "text": prompt,
+                    "expected_session_incarnation": launch_id,
+                }),
             ),
         )
         .await;
         assert_eq!(status, StatusCode::OK, "body={body}");
         assert_eq!(body["data"]["submitted"], true);
+        assert_eq!(body["data"]["session_incarnation"], "launch-structured");
         assert!(body.pointer("/data/turn_id").is_none());
         responder.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn structured_prompt_reports_unknown_outcome_after_provider_rejection() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let launch_id = seed_codex_app_server_session(tmp.path(), "structured-rejected");
+        let st = state(tmp.path(), Some(TOKEN), minimal_tmux(tmp.path()));
+        let record = load_session_record(&st.context, "structured-rejected").unwrap();
+        crate::activity::activate_runtime(&st.context, &record).unwrap();
+        let (handle, mut commands) = codex_app_server::control_channel();
+        st.codex_controls.lock().unwrap().insert(
+            record.id.clone(),
+            CodexControlEntry {
+                launch_id: launch_id.clone(),
+                handle,
+            },
+        );
+        let responder = tokio::spawn(async move {
+            let Some(codex_app_server::ControlCommand::Prompt { response, .. }) =
+                commands.recv().await
+            else {
+                panic!("structured prompt did not reach the Codex control plane");
+            };
+            response
+                .send(Err("provider rejected the prompt".to_string()))
+                .unwrap();
+        });
+
+        let (status, body) = call(
+            router(st),
+            post_json(
+                "/sessions/structured-rejected/prompt/v2",
+                Some(TOKEN),
+                json!({
+                    "text": "inspect provider acknowledgement",
+                    "expected_session_incarnation": launch_id,
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "body={body}");
+        assert_eq!(body["error"]["code"], "structured-prompt-outcome-unknown");
+        assert!(body.pointer("/data/submitted").is_none());
+        responder.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn structured_prompt_compatibility_route_honors_stale_expected_incarnation() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let launch_id = seed_codex_app_server_session(tmp.path(), "structured-compat-stale");
+        let st = state(tmp.path(), Some(TOKEN), minimal_tmux(tmp.path()));
+        let record = load_session_record(&st.context, "structured-compat-stale").unwrap();
+        crate::activity::activate_runtime(&st.context, &record).unwrap();
+        let (handle, mut commands) = codex_app_server::control_channel();
+        st.codex_controls
+            .lock()
+            .unwrap()
+            .insert(record.id.clone(), CodexControlEntry { launch_id, handle });
+        let dispatch = tokio::spawn(async move {
+            let Ok(Some(codex_app_server::ControlCommand::Prompt { response, .. })) =
+                tokio::time::timeout(Duration::from_millis(250), commands.recv()).await
+            else {
+                return false;
+            };
+            response
+                .send(Ok("turn-must-not-submit".to_string()))
+                .unwrap();
+            true
+        });
+
+        let (status, body) = call(
+            router(st),
+            post_json(
+                "/sessions/structured-compat-stale/prompt",
+                Some(TOKEN),
+                json!({
+                    "text": "must honor the optional compatibility fence",
+                    "expected_session_incarnation": "launch-structured-compat-previous",
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "body={body}");
+        assert_eq!(body["error"]["code"], "session-incarnation-conflict");
+        assert!(
+            !dispatch.await.unwrap(),
+            "stale compatibility prompt reached provider control"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn structured_prompt_fences_runtime_replacement_under_record_lock() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let launch_id = seed_codex_app_server_session(tmp.path(), "structured-stale");
+        let st = state(tmp.path(), Some(TOKEN), minimal_tmux(tmp.path()));
+        let record = load_session_record(&st.context, "structured-stale").unwrap();
+        crate::activity::activate_runtime(&st.context, &record).unwrap();
+        let (handle, mut commands) = codex_app_server::control_channel();
+        st.codex_controls.lock().unwrap().insert(
+            "structured-stale".to_string(),
+            CodexControlEntry {
+                launch_id: launch_id.clone(),
+                handle,
+            },
+        );
+        let record_lock =
+            crate::acquire_session_record_lock(&st.context, "structured-stale").unwrap();
+        let expected_launch_id = launch_id.clone();
+        let request_state = st.clone();
+        let request = tokio::spawn(async move {
+            call(
+                router(request_state),
+                post_json(
+                    "/sessions/structured-stale/prompt/v2",
+                    Some(TOKEN),
+                    json!({
+                        "text": "must not reach the replacement runtime",
+                        "expected_session_incarnation": expected_launch_id,
+                    }),
+                ),
+            )
+            .await
+        });
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            !request.is_finished(),
+            "request must wait for the record lock"
+        );
+        let record_path = tmp.path().join("sessions/structured-stale/session.json");
+        let mut replacement: Value =
+            serde_json::from_str(&std::fs::read_to_string(&record_path).unwrap()).unwrap();
+        replacement["runtime"]["launch_id"] = json!("launch-structured-stale-v2");
+        std::fs::write(
+            &record_path,
+            serde_json::to_vec_pretty(&replacement).unwrap(),
+        )
+        .unwrap();
+        drop(record_lock);
+
+        let (status, body) = request.await.unwrap();
+        assert_eq!(status, StatusCode::CONFLICT, "body={body}");
+        assert_eq!(body["error"]["code"], "session-incarnation-conflict");
+        assert_eq!(
+            body["error"]["details"]["actual_session_incarnation"],
+            "launch-structured-stale-v2"
+        );
+        assert!(
+            matches!(
+                commands.try_recv(),
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+            ),
+            "stale prompt reached provider control"
+        );
+    }
+
+    #[tokio::test]
+    async fn structured_prompt_control_wait_rechecks_runtime_replacement() {
+        for (id, explicit_fence) in [
+            ("structured-wait-replace-v2", true),
+            ("structured-wait-replace-compat", false),
+        ] {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let launch_id = seed_codex_app_server_session(tmp.path(), id);
+            let st = state(tmp.path(), Some(TOKEN), minimal_tmux(tmp.path()));
+            let expected_session_incarnation = explicit_fence.then_some(launch_id.as_str());
+            let record =
+                load_structured_prompt_record_locked(&st, id, expected_session_incarnation)
+                    .await
+                    .expect("initial structured prompt preflight");
+            assert_eq!(
+                record
+                    .runtime
+                    .as_ref()
+                    .map(|runtime| runtime.launch_id.as_str()),
+                Some(launch_id.as_str())
+            );
+
+            let replacement_launch_id = format!("{launch_id}-replacement");
+            let record_path = tmp.path().join(format!("sessions/{id}/session.json"));
+            let mut replacement: Value =
+                serde_json::from_str(&std::fs::read_to_string(&record_path).unwrap()).unwrap();
+            replacement["runtime"]["launch_id"] = json!(replacement_launch_id);
+            std::fs::write(
+                &record_path,
+                serde_json::to_vec_pretty(&replacement).unwrap(),
+            )
+            .unwrap();
+
+            let response = match wait_for_structured_prompt_control(
+                &st,
+                id,
+                &launch_id,
+                expected_session_incarnation,
+                Duration::ZERO,
+            )
+            .await
+            {
+                Ok(_) => panic!("replacement must supersede unavailable control"),
+                Err(response) => response,
+            };
+            assert_eq!(response.status(), StatusCode::CONFLICT);
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let body: Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(body["error"]["code"], "session-incarnation-conflict");
+            assert_eq!(
+                body["error"]["details"]["actual_session_incarnation"], replacement_launch_id,
+                "explicit_fence={explicit_fence}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn structured_prompt_final_lock_rejects_replacement_after_initial_read() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let launch_id = seed_codex_app_server_session(tmp.path(), "structured-final-fence");
+        let st = state(tmp.path(), Some(TOKEN), minimal_tmux(tmp.path()));
+        let (handle, mut commands) = codex_app_server::control_channel();
+        let record_path = tmp
+            .path()
+            .join("sessions/structured-final-fence/session.json");
+        let mut replacement: Value =
+            serde_json::from_str(&std::fs::read_to_string(&record_path).unwrap()).unwrap();
+        replacement["runtime"]["launch_id"] = json!("launch-structured-final-fence-v2");
+        std::fs::write(
+            &record_path,
+            serde_json::to_vec_pretty(&replacement).unwrap(),
+        )
+        .unwrap();
+
+        let response = submit_structured_prompt_locked(
+            &st,
+            "structured-final-fence",
+            &launch_id,
+            Some(&launch_id),
+            None,
+            &handle,
+            "must not cross the final locked recheck",
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["error"]["code"], "session-incarnation-conflict");
+        assert_eq!(
+            body["error"]["details"]["actual_session_incarnation"],
+            "launch-structured-final-fence-v2"
+        );
+        assert!(matches!(
+            commands.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
     }
 
     #[tokio::test]
@@ -11433,6 +11858,7 @@ esac
             &st,
             &record.id,
             &launch_id,
+            None,
             Some(("gamania", 1)),
             &handle,
             "must not reach superseding account",
@@ -11499,6 +11925,11 @@ esac
         )
         .await;
         assert_eq!(status, StatusCode::OK, "body={body}");
+        assert_eq!(body["data"]["submitted"], true);
+        assert_eq!(
+            body["data"]["session_incarnation"],
+            "launch-structured-armed"
+        );
         responder.await.unwrap();
     }
 
@@ -11586,6 +12017,87 @@ esac
         .await;
         assert_eq!(status, StatusCode::CONFLICT, "body={body}");
         assert_eq!(body["error"]["code"], "structured-prompt-unsupported");
+    }
+
+    #[tokio::test]
+    async fn fenced_structured_prompt_requires_exact_body_shape() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let st = state(tmp.path(), Some(TOKEN), minimal_tmux(tmp.path()));
+
+        for body in [
+            json!({ "text": "missing the required fence" }),
+            json!({
+                "text": "misspelled fence",
+                "expected_session_incarnaton": "launch-missing",
+            }),
+            json!({
+                "text": "unexpected field",
+                "expected_session_incarnation": "launch-missing",
+                "unexpected": true,
+            }),
+        ] {
+            let (status, body) = call(
+                router(st.clone()),
+                post_json("/sessions/missing/prompt/v2", Some(TOKEN), body),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "body={body}");
+            assert_eq!(body["error"]["code"], "invalid-json-body");
+        }
+    }
+
+    #[tokio::test]
+    async fn structured_prompt_reports_stale_fence_before_unsupported_runtime() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        seed_session_with_runtime(
+            tmp.path(),
+            "unsupported-replacement",
+            "claude",
+            "hs-claude-unsupported-replacement",
+        );
+        let st = state(tmp.path(), Some(TOKEN), minimal_tmux(tmp.path()));
+
+        let (status, body) = call(
+            router(st),
+            post_json(
+                "/sessions/unsupported-replacement/prompt/v2",
+                Some(TOKEN),
+                json!({
+                    "text": "must not be classified as readiness",
+                    "expected_session_incarnation": "launch-unsupported-previous",
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "body={body}");
+        assert_eq!(body["error"]["code"], "session-incarnation-conflict");
+        assert_eq!(
+            body["error"]["details"]["actual_session_incarnation"],
+            "launch-unsupported-replacement"
+        );
+    }
+
+    #[tokio::test]
+    async fn structured_prompt_rejects_malformed_expected_incarnation() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let st = state(tmp.path(), Some(TOKEN), minimal_tmux(tmp.path()));
+
+        for expected in ["".to_string(), "   ".to_string(), "x".repeat(129)] {
+            let (status, body) = call(
+                router(st.clone()),
+                post_json(
+                    "/sessions/missing/prompt",
+                    Some(TOKEN),
+                    json!({
+                        "text": "inspect the current session",
+                        "expected_session_incarnation": expected,
+                    }),
+                ),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "body={body}");
+            assert_eq!(body["error"]["code"], "invalid-session-incarnation");
+        }
     }
 
     #[tokio::test]
@@ -13959,6 +14471,13 @@ esac
     async fn codex_accounts_route_is_authenticated_and_projects_no_credentials() {
         let lock = GlobalStateLock::new();
         let tmp = tempfile::TempDir::new().unwrap();
+        let codex = tmp.path().join("codex");
+        fs::write(
+            &codex,
+            "#!/bin/sh\nif [ \"$1\" = --version ]; then printf '%s\\n' 'codex-cli 0.144.5'; exit 0; fi\nif [ \"$1\" = app-server ] && [ \"$2\" = --help ]; then printf '%s\\n' '  --listen <URL>  Supported values: stdio://, unix://PATH'; exit 0; fi\nexit 1\n",
+        )
+        .unwrap();
+        fs::set_permissions(&codex, fs::Permissions::from_mode(0o700)).unwrap();
         let broker = tmp.path().join("broker");
         fs::write(
             &broker,
@@ -13970,6 +14489,7 @@ printf '%s\n' '{"schema_version":"agent-session.codex-auth-broker.v1","accounts"
         fs::set_permissions(&broker, fs::Permissions::from_mode(0o700)).unwrap();
         let argv = serde_json::to_string(&vec![broker.to_string_lossy().into_owned()]).unwrap();
         let _broker = EnvGuard::set(&lock, "AGENT_SESSION_CODEX_ACCOUNT_BROKER", &argv);
+        let _codex_bin = EnvGuard::set(&lock, "AGENT_SESSION_CODEX_BIN", codex.to_str().unwrap());
         let st = state(tmp.path(), Some(TOKEN), minimal_tmux(tmp.path()));
 
         let (status, body) = call(router(st.clone()), get_auth("/codex/accounts", None)).await;
@@ -13981,6 +14501,14 @@ printf '%s\n' '{"schema_version":"agent-session.codex-auth-broker.v1","accounts"
         assert_eq!(body["data"]["machine"], MACHINE);
         assert_eq!(body["data"]["accounts"][0]["account"], "gamania");
         assert_eq!(body["data"]["accounts"][0]["label"], "Gamania");
+        assert_eq!(
+            body["data"]["readiness"],
+            json!({
+                "schema_version": "agent-session.codex-account-readiness.v1",
+                "supported": true,
+                "provider_version": "0.144.5",
+            })
+        );
         let encoded = body.to_string();
         assert!(!encoded.contains("access_token"));
         assert!(!encoded.contains("chatgpt_account_id"));

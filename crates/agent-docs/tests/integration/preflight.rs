@@ -161,6 +161,110 @@ fn preflight_product_filters_documents_and_validation_contracts() {
     );
 }
 
+fn env_with_phases() -> TestEnv {
+    let env = TestEnv::new();
+    env.write_project_catalog(
+        "[[document]]\ncontext = \"project-dev\"\nscope = \"project\"\npath = \"DEVELOPMENT.md\"\nrequired = true\n\n[[document]]\ncontext = \"project-dev\"\nscope = \"project\"\npath = \"EDIT.md\"\nrequired = true\nphase = \"edit\"\n\n[[document]]\ncontext = \"project-dev\"\nscope = \"project\"\npath = \"DELIVERY.md\"\nrequired = true\nphase = \"delivery\"\n",
+    );
+    env.write_project_doc("DEVELOPMENT.md", "# Dev\n");
+    env.write_project_doc("EDIT.md", "# Edit\n");
+    env.write_project_doc("DELIVERY.md", "# Delivery\n");
+    env
+}
+
+#[test]
+fn preflight_phase_includes_no_phase_and_matching_docs_only() {
+    let env = env_with_phases();
+    let out = env.run(&[
+        "preflight",
+        "--intent",
+        "project-dev",
+        "--phase",
+        "edit",
+        "--format",
+        "json",
+    ]);
+    assert!(out.success(), "stderr: {}", out.stderr);
+    let json = out.json();
+    assert_eq!(json["phase"], "edit", "{json}");
+    let docs = json["documents"].as_array().unwrap();
+    assert_eq!(docs.len(), 2, "{json}");
+    assert!(
+        docs.iter()
+            .any(|doc| doc["path"].as_str().unwrap().ends_with("DEVELOPMENT.md"))
+    );
+    assert!(
+        docs.iter()
+            .any(|doc| doc["path"].as_str().unwrap().ends_with("EDIT.md"))
+    );
+    assert!(
+        !docs
+            .iter()
+            .any(|doc| doc["path"].as_str().unwrap().ends_with("DELIVERY.md")),
+        "delivery-only doc must be excluded from the edit phase: {json}"
+    );
+}
+
+#[test]
+fn preflight_without_phase_returns_all_documents_and_omits_phase_field() {
+    let env = env_with_phases();
+    let out = env.run(&["preflight", "--intent", "project-dev", "--format", "json"]);
+    assert!(out.success(), "stderr: {}", out.stderr);
+    let json = out.json();
+    // The top-level `phase` key is absent for a no-phase call (byte-compatible).
+    assert!(
+        json.get("phase").is_none(),
+        "no-phase preflight must omit the phase field: {json}"
+    );
+    assert_eq!(json["documents"].as_array().unwrap().len(), 3, "{json}");
+}
+
+#[test]
+fn preflight_undeclared_phase_returns_the_no_phase_set() {
+    let env = env_with_phases();
+    let out = env.run(&[
+        "preflight",
+        "--intent",
+        "project-dev",
+        "--phase",
+        "refactor",
+        "--format",
+        "json",
+    ]);
+    assert!(
+        out.success(),
+        "an undeclared phase is valid, not an error: stderr: {}",
+        out.stderr
+    );
+    let json = out.json();
+    assert_eq!(json["phase"], "refactor", "{json}");
+    let docs = json["documents"].as_array().unwrap();
+    assert_eq!(docs.len(), 1, "only the no-phase doc applies: {json}");
+    assert!(
+        docs[0]["path"]
+            .as_str()
+            .unwrap()
+            .ends_with("DEVELOPMENT.md")
+    );
+}
+
+#[test]
+fn preflight_rejects_malformed_phase_flag() {
+    let env = env_with_phases();
+    let out = env.run(&[
+        "preflight",
+        "--intent",
+        "project-dev",
+        "--phase",
+        "bad phase",
+    ]);
+    assert_eq!(
+        out.code, 64,
+        "malformed --phase is a usage error: stdout:\n{}\nstderr:\n{}",
+        out.stdout, out.stderr
+    );
+}
+
 #[test]
 fn require_declared_intent_respects_product_filtering() {
     let env = TestEnv::new();

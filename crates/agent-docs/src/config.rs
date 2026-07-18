@@ -6,18 +6,19 @@ use toml::Value;
 use crate::env::ResolvedRoots;
 use crate::model::{
     CatalogOrigin, ConfigErrorLocation, ConfigLoadError, Context, DocumentEntry, LoadedCatalog,
-    Product, Scope, ScopeCatalog, SkillPolicy, ValidationEntry, When,
+    Phase, Product, Scope, ScopeCatalog, SkillPolicy, ValidationEntry, When,
 };
 use crate::path_classes::PathClassContract;
 use crate::predicate::parse_when;
 
 pub const CONFIG_FILE_NAME: &str = "AGENT_DOCS.toml";
 
-const ALLOWED_DOCUMENT_FIELDS: [&str; 9] = [
+const ALLOWED_DOCUMENT_FIELDS: [&str; 10] = [
     "context",
     "scope",
     "path",
     "product",
+    "phase",
     "required",
     "when",
     "marker",
@@ -221,6 +222,7 @@ fn parse_documents(
         validate_scope_for_source(source_scope, origin, scope, file_path, index)?;
         let path = parse_path(file_path, index, table, origin)?;
         let products = parse_products(file_path, "document", index, table)?;
+        let phases = parse_phases(file_path, "document", index, table)?;
         let required = parse_bool(file_path, index, table, "required")?.unwrap_or(false);
         let (when, when_raw) = parse_when_field(file_path, index, table)?;
         let marker = parse_opt_string(file_path, "document", index, table, "marker")?;
@@ -232,6 +234,7 @@ fn parse_documents(
             scope,
             path,
             products,
+            phases,
             required,
             when,
             when_raw,
@@ -365,6 +368,75 @@ fn parse_product(
                 Product::supported_values().join(", ")
             ),
         )
+    })
+}
+
+fn parse_phases(
+    file_path: &Path,
+    section: &'static str,
+    index: usize,
+    table: &toml::map::Map<String, Value>,
+) -> Result<Vec<Phase>, ConfigLoadError> {
+    let Some(value) = table.get("phase") else {
+        return Ok(Vec::new());
+    };
+
+    let mut phases = match value {
+        Value::String(raw) => vec![parse_phase(file_path, section, index, raw)?],
+        Value::Array(items) => {
+            if items.is_empty() {
+                return Err(ConfigLoadError::validation(
+                    file_path.to_path_buf(),
+                    section,
+                    index,
+                    "phase",
+                    "`phase` must list at least one phase when using array form",
+                ));
+            }
+            let mut parsed = Vec::with_capacity(items.len());
+            for item in items {
+                let Some(raw) = item.as_str() else {
+                    return Err(ConfigLoadError::validation(
+                        file_path.to_path_buf(),
+                        section,
+                        index,
+                        "phase",
+                        format!(
+                            "invalid phase entry: expected string, found {}",
+                            value_type(item)
+                        ),
+                    ));
+                };
+                parsed.push(parse_phase(file_path, section, index, raw)?);
+            }
+            parsed
+        }
+        other => {
+            return Err(ConfigLoadError::validation(
+                file_path.to_path_buf(),
+                section,
+                index,
+                "phase",
+                format!(
+                    "invalid type for `phase`: expected string or array of strings, found {}",
+                    value_type(other)
+                ),
+            ));
+        }
+    };
+    phases.sort();
+    phases.dedup();
+    Ok(phases)
+}
+
+fn parse_phase(
+    file_path: &Path,
+    section: &'static str,
+    index: usize,
+    raw: &str,
+) -> Result<Phase, ConfigLoadError> {
+    Phase::parse(raw).map_err(|message| {
+        ConfigLoadError::validation(file_path.to_path_buf(), section, index, "phase", message)
     })
 }
 
