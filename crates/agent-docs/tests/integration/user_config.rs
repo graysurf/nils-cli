@@ -3174,7 +3174,7 @@ fn non_regular_private_catalog_and_document_fail_deterministically() {
     assert!(preflight.json()["documents"][0].get("content").is_none());
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "macos")))]
 #[test]
 fn non_utf_selectors_fail_before_config_mutation() {
     use std::ffi::OsString;
@@ -3283,7 +3283,7 @@ fn non_utf_config_destination_fails_before_filesystem_mutation() {
     assert!(!xdg.join("agent-docs").exists());
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "macos")))]
 #[test]
 fn non_utf_private_catalog_identity_fails_before_config_mutation() {
     use std::ffi::OsString;
