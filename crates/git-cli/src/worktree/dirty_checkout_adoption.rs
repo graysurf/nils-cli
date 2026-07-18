@@ -3,7 +3,9 @@ use anyhow::{Context, Result, bail, ensure};
 use nils_common::cli_contract::{OutputFormat, exit};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::HashSet;
+#[cfg(any(test, target_os = "macos"))]
+use std::collections::HashMap;
+use std::collections::{HashSet, VecDeque};
 use std::env;
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, File, Metadata, OpenOptions};
@@ -31,7 +33,12 @@ const MAX_GIT_STDERR_BYTES: usize = 1024 * 1024;
 const MAX_CAPTURE_BYTES: usize = 64 * 1024 * 1024;
 const MAX_PATH_BYTES: usize = 32 * 1024 * 1024;
 const MAX_STATE_FILE_BYTES: usize = 16 * 1024;
+const MAX_PENDING_STATE_FILE_BYTES: usize = MAX_STATE_FILE_BYTES * 4 + 4 * 1024;
 const MAX_REVOCATION_TOMBSTONES: usize = 64;
+const MAX_RECOVERY_DIRECTORY_ENTRIES: usize = 1_024;
+const MAX_RECOVERY_STATE_ENTRIES: usize = 256;
+const MAX_RECOVERY_AGGREGATE_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_RECOVERY_NAME_BYTES: usize = 256 * 1024;
 const MAX_REASON_BYTES: usize = 2_000;
 const MAX_ENTRY_COUNT: usize = 100_000;
 const MAX_FILE_BYTES: u64 = 1024 * 1024 * 1024;
@@ -46,6 +53,12 @@ const UNBORN_HEAD_PREFIX: &str = "unborn:";
 const TRUSTED_GIT_PATHS: &[&str] = &["/usr/bin/git", "/bin/git"];
 const SNAPSHOT_WORKER_ENV: &str = "NILS_GIT_CLI_INTERNAL_DIRTY_SNAPSHOT_WORKER";
 const SNAPSHOT_WORKER_CHECKOUT_ENV: &str = "NILS_GIT_CLI_INTERNAL_DIRTY_SNAPSHOT_CHECKOUT";
+const PROCESS_SUPERVISOR_ENV: &str = "NILS_GIT_CLI_INTERNAL_PROCESS_SUPERVISOR";
+const PROCESS_SUPERVISOR_CAPABILITY_FD_ENV: &str =
+    "NILS_GIT_CLI_INTERNAL_PROCESS_SUPERVISOR_CAPABILITY_FD";
+const PROCESS_SUPERVISOR_CAPABILITY: &[u8] = b"nils-git-cli-process-supervisor-v1";
+const PROCESS_SUPERVISOR_COMPLETION: &[u8] = b"nils-git-cli-process-supervisor-completion-v1";
+const PROCESS_SUPERVISOR_COMPLETION_BYTES: usize = PROCESS_SUPERVISOR_COMPLETION.len() + 6;
 const SNAPSHOT_WORKER_SCHEMA: &str = "nils-git-cli.dirty-snapshot-worker.v1";
 
 #[non_exhaustive]
@@ -613,11 +626,481 @@ pub(crate) fn run_internal_snapshot_worker() -> Option<i32> {
     }
 }
 
+const PROCESS_SUPERVISOR_POLL_INTERVAL: Duration = Duration::from_millis(10);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ProcessSupervisorCompletionKind {
+    Target = 1,
+    Terminated = 2,
+    InternalFailure = 3,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ProcessSupervisorCompletion {
+    kind: ProcessSupervisorCompletionKind,
+    cleanup_complete: bool,
+    exit_code: i32,
+}
+
+fn write_process_supervisor_completion<W: Write>(
+    writer: &mut W,
+    completion: ProcessSupervisorCompletion,
+) -> io::Result<()> {
+    let mut frame = Vec::with_capacity(PROCESS_SUPERVISOR_COMPLETION_BYTES);
+    frame.extend_from_slice(PROCESS_SUPERVISOR_COMPLETION);
+    frame.push(completion.kind as u8);
+    frame.push(u8::from(completion.cleanup_complete));
+    frame.extend_from_slice(&completion.exit_code.to_be_bytes());
+    writer.write_all(&frame)
+}
+
+fn read_process_supervisor_completion<R: Read>(
+    reader: &mut R,
+) -> Result<ProcessSupervisorCompletion> {
+    let mut frame = vec![0_u8; PROCESS_SUPERVISOR_COMPLETION_BYTES];
+    reader
+        .read_exact(&mut frame)
+        .context("process supervisor completion is unavailable")?;
+    let mut trailing = [0_u8; 1];
+    if reader
+        .read(&mut trailing)
+        .context("process supervisor completion could not be sealed")?
+        != 0
+        || &frame[..PROCESS_SUPERVISOR_COMPLETION.len()] != PROCESS_SUPERVISOR_COMPLETION
+    {
+        return Err(process_scan_resource_error());
+    }
+    let kind_offset = PROCESS_SUPERVISOR_COMPLETION.len();
+    let kind = match frame[kind_offset] {
+        1 => ProcessSupervisorCompletionKind::Target,
+        2 => ProcessSupervisorCompletionKind::Terminated,
+        3 => ProcessSupervisorCompletionKind::InternalFailure,
+        _ => return Err(process_scan_resource_error()),
+    };
+    let cleanup_complete = match frame[kind_offset + 1] {
+        0 => false,
+        1 => true,
+        _ => return Err(process_scan_resource_error()),
+    };
+    let exit_code = i32::from_be_bytes(
+        frame[kind_offset + 2..]
+            .try_into()
+            .map_err(|_| process_scan_resource_error())?,
+    );
+    Ok(ProcessSupervisorCompletion {
+        kind,
+        cleanup_complete,
+        exit_code,
+    })
+}
+
+static PROCESS_SUPERVISOR_TERMINATE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+extern "C" fn request_process_supervisor_termination(_signal: libc::c_int) {
+    PROCESS_SUPERVISOR_TERMINATE.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+fn supervisor_parent_is_trusted() -> bool {
+    let Ok(current) = env::current_exe() else {
+        return false;
+    };
+    let Ok(current_metadata) = fs::metadata(current) else {
+        return false;
+    };
+    let parent = unsafe { libc::getppid() };
+
+    #[cfg(target_os = "linux")]
+    let parent_metadata = fs::metadata(format!("/proc/{parent}/exe"));
+
+    #[cfg(target_os = "macos")]
+    let parent_metadata = {
+        let mut bytes = vec![0_u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
+        let length =
+            unsafe { libc::proc_pidpath(parent, bytes.as_mut_ptr().cast(), bytes.len() as u32) };
+        if length <= 0 {
+            return false;
+        }
+        bytes.truncate(length as usize);
+        fs::metadata(PathBuf::from(OsString::from_vec(bytes)))
+    };
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    let parent_metadata: io::Result<Metadata> = Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "process parent identity is unsupported",
+    ));
+
+    parent_metadata.is_ok_and(|metadata| same_metadata(&current_metadata, &metadata))
+}
+
+#[cfg(target_os = "linux")]
+fn linux_peer_credentials_match(
+    credentials: libc::ucred,
+    parent: libc::pid_t,
+    effective_uid: libc::uid_t,
+) -> bool {
+    credentials.pid == parent && credentials.uid == effective_uid
+}
+
+#[derive(Debug)]
+struct AuthenticatedProcessSupervisor {
+    channel: std::os::unix::net::UnixStream,
+    deadline: Instant,
+}
+
+fn monotonic_clock_nanos() -> Result<u64> {
+    let mut value = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    if unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut value) } != 0 {
+        return Err(process_scan_resource_error());
+    }
+    u64::try_from(value.tv_sec)
+        .ok()
+        .and_then(|seconds| seconds.checked_mul(1_000_000_000))
+        .and_then(|nanos| {
+            u64::try_from(value.tv_nsec)
+                .ok()
+                .and_then(|fraction| nanos.checked_add(fraction))
+        })
+        .ok_or_else(process_scan_resource_error)
+}
+
+fn monotonic_deadline_nanos(deadline: Instant) -> Result<u64> {
+    let now_nanos = monotonic_clock_nanos()?;
+    let now = Instant::now();
+    now_nanos
+        .checked_add(
+            u64::try_from(deadline.saturating_duration_since(now).as_nanos())
+                .map_err(|_| process_scan_resource_error())?,
+        )
+        .ok_or_else(process_scan_resource_error)
+}
+
+fn instant_from_monotonic_deadline(deadline_nanos: u64) -> Result<Instant> {
+    let now_nanos = monotonic_clock_nanos()?;
+    let remaining = Duration::from_nanos(deadline_nanos.saturating_sub(now_nanos));
+    if remaining > SNAPSHOT_TIMEOUT {
+        return Err(process_scan_resource_error());
+    }
+    Instant::now()
+        .checked_add(remaining)
+        .ok_or_else(process_scan_resource_error)
+}
+
+fn process_supervisor_owner_is_lost(channel: &std::os::unix::net::UnixStream) -> Result<bool> {
+    let mut byte = [0_u8; 1];
+    let result = unsafe {
+        libc::recv(
+            channel.as_raw_fd(),
+            byte.as_mut_ptr().cast(),
+            byte.len(),
+            libc::MSG_DONTWAIT | libc::MSG_PEEK,
+        )
+    };
+    if result == 0 {
+        return Ok(true);
+    }
+    if result > 0 {
+        return Err(process_scan_resource_error());
+    }
+    let error = io::Error::last_os_error();
+    if matches!(
+        error.kind(),
+        io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+    ) {
+        Ok(false)
+    } else {
+        Err(process_scan_resource_error())
+    }
+}
+
+fn validate_process_supervisor_capability() -> Result<AuthenticatedProcessSupervisor> {
+    validate_process_supervisor_capability_with(supervisor_parent_is_trusted)
+}
+
+fn validate_process_supervisor_capability_with<F>(
+    parent_is_trusted: F,
+) -> Result<AuthenticatedProcessSupervisor>
+where
+    F: FnOnce() -> bool,
+{
+    use std::os::fd::FromRawFd;
+    use std::os::unix::net::UnixStream;
+
+    if !parent_is_trusted() {
+        return Err(process_scan_resource_error());
+    }
+    let descriptor = env::var_os(PROCESS_SUPERVISOR_CAPABILITY_FD_ENV)
+        .and_then(|value| {
+            value
+                .to_str()
+                .and_then(|value| value.parse::<libc::c_int>().ok())
+        })
+        .filter(|descriptor| *descriptor > libc::STDERR_FILENO)
+        .ok_or_else(process_scan_resource_error)?;
+
+    #[cfg(target_os = "linux")]
+    {
+        let mut credentials = std::mem::MaybeUninit::<libc::ucred>::zeroed();
+        let mut length = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+        let result = unsafe {
+            libc::getsockopt(
+                descriptor,
+                libc::SOL_SOCKET,
+                libc::SO_PEERCRED,
+                credentials.as_mut_ptr().cast(),
+                &mut length,
+            )
+        };
+        if result != 0 || length as usize != std::mem::size_of::<libc::ucred>() {
+            return Err(process_scan_resource_error());
+        }
+        let credentials = unsafe { credentials.assume_init() };
+        if !linux_peer_credentials_match(credentials, unsafe { libc::getppid() }, unsafe {
+            libc::geteuid()
+        }) {
+            return Err(process_scan_resource_error());
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let mut uid = 0;
+        let mut gid = 0;
+        if unsafe { libc::getpeereid(descriptor, &mut uid, &mut gid) } != 0
+            || uid != unsafe { libc::geteuid() }
+        {
+            return Err(process_scan_resource_error());
+        }
+    }
+
+    let mut request = vec![0_u8; PROCESS_SUPERVISOR_CAPABILITY.len() + 8];
+    let mut stream = unsafe { UnixStream::from_raw_fd(descriptor) };
+    stream
+        .read_exact(&mut request)
+        .context("process supervisor capability is unavailable")?;
+    if &request[..PROCESS_SUPERVISOR_CAPABILITY.len()] != PROCESS_SUPERVISOR_CAPABILITY {
+        return Err(process_scan_resource_error());
+    }
+    let deadline_nanos = u64::from_be_bytes(
+        request[PROCESS_SUPERVISOR_CAPABILITY.len()..]
+            .try_into()
+            .map_err(|_| process_scan_resource_error())?,
+    );
+    let deadline = instant_from_monotonic_deadline(deadline_nanos)?;
+    let descriptor_flags = unsafe { libc::fcntl(descriptor, libc::F_GETFD) };
+    if descriptor_flags < 0
+        || unsafe {
+            libc::fcntl(
+                descriptor,
+                libc::F_SETFD,
+                descriptor_flags | libc::FD_CLOEXEC,
+            )
+        } < 0
+    {
+        return Err(process_scan_resource_error());
+    }
+    Ok(AuthenticatedProcessSupervisor {
+        channel: stream,
+        deadline,
+    })
+}
+
+pub(crate) fn run_internal_process_supervisor() -> Option<i32> {
+    if env::var_os(PROCESS_SUPERVISOR_ENV).as_deref() != Some(OsStr::new("1")) {
+        return None;
+    }
+    let authenticated = match validate_process_supervisor_capability() {
+        Ok(authenticated) => authenticated,
+        Err(_) => return Some(exit::RUNTIME),
+    };
+    let mut arguments = env::args_os().skip(1);
+    let Some(program) = arguments.next() else {
+        return Some(exit::RUNTIME);
+    };
+    let arguments: Vec<OsString> = arguments.collect();
+    Some(
+        supervise_process_with_cleanup_proof(
+            program,
+            &arguments,
+            Some(authenticated.channel),
+            authenticated.deadline,
+        )
+        .unwrap_or(exit::RUNTIME),
+    )
+}
+
+fn supervise_process_with_cleanup_proof(
+    program: OsString,
+    arguments: &[OsString],
+    mut completion_channel: Option<std::os::unix::net::UnixStream>,
+    deadline: Instant,
+) -> Result<i32> {
+    PROCESS_SUPERVISOR_TERMINATE.store(false, std::sync::atomic::Ordering::SeqCst);
+    let previous = unsafe {
+        libc::signal(
+            libc::SIGTERM,
+            request_process_supervisor_termination as *const () as libc::sighandler_t,
+        )
+    };
+    if previous == libc::SIG_ERR {
+        return Err(process_scan_resource_error());
+    }
+    let result = supervise_process_with(
+        program,
+        arguments,
+        completion_channel.as_mut(),
+        deadline,
+        || PROCESS_SUPERVISOR_TERMINATE.load(std::sync::atomic::Ordering::SeqCst),
+    );
+    if result.is_err()
+        && let Some(channel) = &mut completion_channel
+    {
+        let _ = write_process_supervisor_completion(
+            channel,
+            ProcessSupervisorCompletion {
+                kind: ProcessSupervisorCompletionKind::InternalFailure,
+                cleanup_complete: false,
+                exit_code: exit::RUNTIME,
+            },
+        );
+    }
+    result
+}
+
+fn supervise_process_with<F>(
+    program: OsString,
+    arguments: &[OsString],
+    completion_channel: Option<&mut std::os::unix::net::UnixStream>,
+    deadline: Instant,
+    should_terminate: F,
+) -> Result<i32>
+where
+    F: FnMut() -> bool,
+{
+    let mut owner = ProcessOwner::new()?;
+    supervise_process_with_owner(
+        program,
+        arguments,
+        &mut owner,
+        completion_channel,
+        deadline,
+        should_terminate,
+    )
+}
+
+fn supervise_process_with_owner<T, F>(
+    program: OsString,
+    arguments: &[OsString],
+    owner: &mut T,
+    mut completion_channel: Option<&mut std::os::unix::net::UnixStream>,
+    deadline: Instant,
+    mut should_terminate: F,
+) -> Result<i32>
+where
+    T: OwnedProcessTracker,
+    F: FnMut() -> bool,
+{
+    let mut command = Command::new(program);
+    command
+        .args(arguments)
+        .env_remove(PROCESS_SUPERVISOR_ENV)
+        .env_remove(PROCESS_SUPERVISOR_CAPABILITY_FD_ENV)
+        .stdin(Stdio::null());
+    let mut child = command
+        .spawn()
+        .context("supervised process could not be started")?;
+    loop {
+        let owner_lost = match completion_channel.as_deref() {
+            Some(channel) => process_supervisor_owner_is_lost(channel)?,
+            None => false,
+        };
+        let deadline_expired = Instant::now() >= deadline;
+        let signal_requested = should_terminate();
+        if owner_lost || deadline_expired || signal_requested {
+            terminate_owned_processes(owner, &mut child)?;
+            if !owner_lost && let Some(channel) = &mut completion_channel {
+                write_process_supervisor_completion(
+                    channel,
+                    ProcessSupervisorCompletion {
+                        kind: ProcessSupervisorCompletionKind::Terminated,
+                        cleanup_complete: true,
+                        exit_code: exit::RUNTIME,
+                    },
+                )
+                .context("process supervisor completion could not be delivered")?;
+            }
+            return Ok(exit::RUNTIME);
+        }
+        let refresh_deadline = deadline.min(
+            Instant::now()
+                .checked_add(PROCESS_CLEANUP_TIMEOUT)
+                .unwrap_or(deadline),
+        );
+        if let Err(error) = owner.refresh(refresh_deadline) {
+            let deadline_expired = Instant::now() >= deadline;
+            return match terminate_owned_processes(owner, &mut child) {
+                Ok(()) if deadline_expired => {
+                    if let Some(channel) = &mut completion_channel {
+                        write_process_supervisor_completion(
+                            channel,
+                            ProcessSupervisorCompletion {
+                                kind: ProcessSupervisorCompletionKind::Terminated,
+                                cleanup_complete: true,
+                                exit_code: exit::RUNTIME,
+                            },
+                        )
+                        .context("process supervisor completion could not be delivered")?;
+                    }
+                    Ok(exit::RUNTIME)
+                }
+                Ok(()) => Err(error),
+                Err(cleanup_error) => Err(cleanup_error),
+            };
+        }
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                terminate_owned_processes(owner, &mut child)?;
+                let Some(exit_code) = status.code() else {
+                    return Err(domain_error(
+                        DirtyCheckoutErrorKind::ResourceUnavailable,
+                        "supervised process terminated without an exit status",
+                    ));
+                };
+                if let Some(channel) = &mut completion_channel {
+                    write_process_supervisor_completion(
+                        channel,
+                        ProcessSupervisorCompletion {
+                            kind: ProcessSupervisorCompletionKind::Target,
+                            cleanup_complete: true,
+                            exit_code,
+                        },
+                    )
+                    .context("process supervisor completion could not be delivered")?;
+                }
+                return Ok(exit_code);
+            }
+            Ok(None) => std::thread::sleep(PROCESS_SUPERVISOR_POLL_INTERVAL),
+            Err(error) => {
+                return match terminate_owned_processes(owner, &mut child) {
+                    Ok(()) => Err(error).context("supervised process status failed"),
+                    Err(cleanup_error) => Err(cleanup_error),
+                };
+            }
+        }
+    }
+}
+
 struct SnapshotWorkerExecutable {
     source_path: PathBuf,
     command_path: PathBuf,
     file: File,
     metadata: Metadata,
+    #[cfg(test)]
+    _private_root: Option<tempfile::TempDir>,
 }
 
 impl SnapshotWorkerExecutable {
@@ -626,23 +1109,77 @@ impl SnapshotWorkerExecutable {
     }
 
     fn revalidate(&self) -> Result<()> {
-        validate_worker_path_permissions(&self.source_path)?;
-        let path_metadata = fs::metadata(&self.source_path)
-            .context("dirty snapshot worker executable could not be revalidated")?;
         let file_metadata = self
             .file
             .metadata()
             .context("dirty snapshot worker executable descriptor is unavailable")?;
-        if !same_metadata(&self.metadata, &path_metadata)
-            || !same_metadata(&self.metadata, &file_metadata)
-        {
+        validate_worker_file_metadata(&file_metadata)?;
+        if !same_metadata(&self.metadata, &file_metadata) {
             return Err(domain_error(
                 DirtyCheckoutErrorKind::ResourceUnavailable,
                 "dirty snapshot worker executable changed after validation",
             ));
         }
+        if self.command_path == self.source_path {
+            validate_worker_path_permissions(&self.source_path)?;
+            let path_metadata = fs::metadata(&self.source_path)
+                .context("dirty snapshot worker executable could not be revalidated")?;
+            if !same_metadata(&self.metadata, &path_metadata) {
+                return Err(domain_error(
+                    DirtyCheckoutErrorKind::ResourceUnavailable,
+                    "dirty snapshot worker executable changed after validation",
+                ));
+            }
+        }
         Ok(())
     }
+}
+
+#[cfg(test)]
+fn private_test_worker_executable(
+    candidate: PathBuf,
+) -> Result<(PathBuf, Option<tempfile::TempDir>)> {
+    let source = File::open(&candidate)
+        .context("dirty snapshot worker test executable could not be opened")?;
+    let source_metadata = source
+        .metadata()
+        .context("dirty snapshot worker test executable metadata is unavailable")?;
+    if source_metadata.mode() & 0o022 == 0 || source_metadata.uid() != unsafe { libc::geteuid() } {
+        return Ok((candidate, None));
+    }
+
+    let private_root = tempfile::TempDir::new()
+        .context("private dirty snapshot worker test root could not be created")?;
+    let private_candidate = private_root.path().join("git-cli");
+    let mut private_file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o700)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+        .open(&private_candidate)
+        .context("private dirty snapshot worker test executable could not be created")?;
+    io::copy(&mut &source, &mut private_file)
+        .context("dirty snapshot worker test executable could not be copied")?;
+    private_file
+        .sync_all()
+        .context("private dirty snapshot worker test executable could not be synced")?;
+    private_file
+        .set_permissions(fs::Permissions::from_mode(0o500))
+        .context("private dirty snapshot worker test executable could not be hardened")?;
+    let current_source_metadata = source
+        .metadata()
+        .context("dirty snapshot worker test executable could not be revalidated")?;
+    let source_path_metadata = fs::metadata(&candidate)
+        .context("dirty snapshot worker test executable path is unavailable")?;
+    if !same_metadata(&source_metadata, &current_source_metadata)
+        || !same_metadata(&current_source_metadata, &source_path_metadata)
+    {
+        return Err(domain_error(
+            DirtyCheckoutErrorKind::ResourceUnavailable,
+            "dirty snapshot worker test executable changed during private installation",
+        ));
+    }
+    Ok((private_candidate, Some(private_root)))
 }
 
 fn snapshot_worker_executable() -> Result<SnapshotWorkerExecutable> {
@@ -665,21 +1202,14 @@ fn snapshot_worker_executable() -> Result<SnapshotWorkerExecutable> {
         fs::canonicalize(target_dir.join("git-cli"))
             .context("dirty snapshot worker executable is unavailable")?
     };
+    #[cfg(test)]
+    let (candidate, private_root) = private_test_worker_executable(candidate)?;
     let file = File::open(&candidate)
         .context("dirty snapshot worker executable descriptor could not be opened")?;
     let metadata = file
         .metadata()
         .context("dirty snapshot worker executable metadata is unavailable")?;
     validate_worker_file_metadata(&metadata)?;
-    validate_worker_path_permissions(&candidate)?;
-    let path_metadata =
-        fs::metadata(&candidate).context("dirty snapshot worker executable path is unavailable")?;
-    if !same_metadata(&metadata, &path_metadata) {
-        return Err(domain_error(
-            DirtyCheckoutErrorKind::ResourceUnavailable,
-            "dirty snapshot worker executable changed during validation",
-        ));
-    }
     let command_path = if cfg!(target_os = "linux") {
         PathBuf::from(format!("/proc/self/fd/{}", file.as_raw_fd()))
     } else if cfg!(target_os = "macos") {
@@ -687,11 +1217,24 @@ fn snapshot_worker_executable() -> Result<SnapshotWorkerExecutable> {
     } else {
         candidate.clone()
     };
+    if command_path == candidate {
+        validate_worker_path_permissions(&candidate)?;
+        let path_metadata = fs::metadata(&candidate)
+            .context("dirty snapshot worker executable path is unavailable")?;
+        if !same_metadata(&metadata, &path_metadata) {
+            return Err(domain_error(
+                DirtyCheckoutErrorKind::ResourceUnavailable,
+                "dirty snapshot worker executable changed during validation",
+            ));
+        }
+    }
     Ok(SnapshotWorkerExecutable {
         source_path: candidate,
         command_path,
         file,
         metadata,
+        #[cfg(test)]
+        _private_root: private_root,
     })
 }
 
@@ -973,6 +1516,13 @@ where
         )
     })?;
     let _lock = LeaseLock::acquire_until(&checkout_dir, deadline)?;
+    recover_checkout_pending_adoptions(
+        &checkout_dir,
+        &challenge_dir,
+        &identity,
+        &token_digest,
+        deadline,
+    )?;
 
     let reason = read_regular_bounded(reason_file, MAX_REASON_BYTES).map_err(|error| {
         command_error(
@@ -995,8 +1545,16 @@ where
     }
     let reason_digest = sha256_hex(&reason);
 
-    match inspect_pending_adoption(&checkout_dir, &challenge_dir, &identity, &token_digest)? {
-        PendingRecovery::Committed => {
+    let pending_recovery = inspect_pending_adoption_until(
+        &checkout_dir,
+        &challenge_dir,
+        &identity,
+        &token_digest,
+        deadline,
+    )?;
+    match pending_recovery {
+        PendingRecovery::Staged | PendingRecovery::Committed => {
+            let staged_pending = pending_recovery == PendingRecovery::Staged;
             return committed_adoption_retry(
                 CommittedAdoptionRetry {
                     checkout_dir: &checkout_dir,
@@ -1005,6 +1563,7 @@ where
                     token_digest: &token_digest,
                     reason_digest: &reason_digest,
                     provisional_pending: true,
+                    staged_pending,
                     deadline,
                 },
                 snapshotter,
@@ -1042,6 +1601,7 @@ where
                     token_digest: &token_digest,
                     reason_digest: &reason_digest,
                     provisional_pending: false,
+                    staged_pending: false,
                     deadline,
                 },
                 snapshotter,
@@ -1117,15 +1677,8 @@ where
         _ => None,
     };
 
-    let predecessor_lease_bytes = existing
-        .as_ref()
-        .filter(|lease| {
-            lease.schema() == LEASE_V1_SCHEMA
-                && lease.expires_at() > initial_now
-                && lease.session_key() == challenge.session_key
-                && lease.adoption().is_none()
-        })
-        .and(existing_bytes.clone());
+    let predecessor_lease_bytes =
+        preserved_predecessor_lease_bytes(existing.as_ref(), existing_bytes.clone());
 
     let initial_snapshot = snapshot_before_deadline(snapshotter, &identity.root, deadline)?;
     validate_snapshot_matches_challenge(&initial_snapshot, &challenge)?;
@@ -1166,13 +1719,16 @@ where
     };
     validate_pending_adoption(&pending, &identity, &token_digest)?;
     let pending_path = pending_adoption_path(&checkout_dir, &token_digest);
-    if let Err(error) = write_json_atomic(&pending_path, &pending, false) {
+    if let Err(error) =
+        write_json_atomic_with_limit(&pending_path, &pending, false, MAX_PENDING_STATE_FILE_BYTES)
+    {
         return Err(transition_failure_after_recovery(
             error,
             &checkout_dir,
             &challenge_dir,
             &identity,
             &token_digest,
+            deadline,
         ));
     }
 
@@ -1228,6 +1784,7 @@ where
         &challenge_dir,
         &identity,
         &token_digest,
+        deadline,
     )?;
     transition_result_after_recovery(
         validate_snapshot_matches_challenge(&prepared_snapshot, &challenge),
@@ -1235,6 +1792,7 @@ where
         &challenge_dir,
         &identity,
         &token_digest,
+        deadline,
     )?;
     let prepared_at = transition_result_after_recovery(
         now(),
@@ -1242,6 +1800,7 @@ where
         &challenge_dir,
         &identity,
         &token_digest,
+        deadline,
     )?;
     transition_result_after_recovery(
         validate_adoption_boundary(&challenge, &identity, prepared_at),
@@ -1249,6 +1808,7 @@ where
         &challenge_dir,
         &identity,
         &token_digest,
+        deadline,
     )?;
     let (prepared_receipt, _) = transition_result_after_recovery(
         build_transition(&prepared_snapshot, prepared_at),
@@ -1256,6 +1816,7 @@ where
         &challenge_dir,
         &identity,
         &token_digest,
+        deadline,
     )?;
     if let Err(error) = write_json_atomic(&receipt_path, &prepared_receipt, false) {
         return Err(transition_failure_after_recovery(
@@ -1264,6 +1825,7 @@ where
             &challenge_dir,
             &identity,
             &token_digest,
+            deadline,
         ));
     }
 
@@ -1273,6 +1835,7 @@ where
         &challenge_dir,
         &identity,
         &token_digest,
+        deadline,
     )?;
     transition_result_after_recovery(
         validate_snapshot_matches_challenge(&snapshot, &challenge),
@@ -1280,6 +1843,7 @@ where
         &challenge_dir,
         &identity,
         &token_digest,
+        deadline,
     )?;
     let transition_at = transition_result_after_recovery(
         now(),
@@ -1287,6 +1851,7 @@ where
         &challenge_dir,
         &identity,
         &token_digest,
+        deadline,
     )?;
     transition_result_after_recovery(
         validate_adoption_boundary(&challenge, &identity, transition_at),
@@ -1294,6 +1859,7 @@ where
         &challenge_dir,
         &identity,
         &token_digest,
+        deadline,
     )?;
     let (receipt_record, lease) = transition_result_after_recovery(
         build_transition(&snapshot, transition_at),
@@ -1301,6 +1867,7 @@ where
         &challenge_dir,
         &identity,
         &token_digest,
+        deadline,
     )?;
     if let Err(error) = write_json_atomic(&receipt_path, &receipt_record, true) {
         return Err(transition_failure_after_recovery(
@@ -1309,6 +1876,7 @@ where
             &challenge_dir,
             &identity,
             &token_digest,
+            deadline,
         ));
     }
     if let Err(error) =
@@ -1320,6 +1888,7 @@ where
             &challenge_dir,
             &identity,
             &token_digest,
+            deadline,
         ));
     }
     if let Err(error) = fs::rename(&challenge_path, &spent_challenge_path)
@@ -1331,6 +1900,7 @@ where
             &challenge_dir,
             &identity,
             &token_digest,
+            deadline,
         ));
     }
     if let Err(error) = sync_directory(&challenge_dir).and_then(|()| sync_directory(&receipts_dir))
@@ -1341,35 +1911,71 @@ where
             &challenge_dir,
             &identity,
             &token_digest,
+            deadline,
         ));
     }
 
-    match install_lease(&lease_path, &lease, existing.as_ref(), &identity) {
+    let staged_path = staged_lease_path(&checkout_dir, &receipt_id);
+    match install_lease(&staged_path, &lease, None, &identity) {
         LeaseInstallOutcome::Installed => {
-            let post_install = snapshot_before_deadline(snapshotter, &identity.root, deadline)
+            let post_stage = snapshot_before_deadline(snapshotter, &identity.root, deadline)
                 .and_then(|post_snapshot| {
                     validate_snapshot_matches_challenge(&post_snapshot, &challenge)
                 })
                 .and_then(|()| validate_adoption_boundary(&challenge, &identity, now()?));
-            if let Err(error) = post_install {
-                if let Err(rollback_error) = rollback_installed_adoption(
+            if let Err(error) = post_stage {
+                if let Err(rollback_error) = rollback_provisional_adoption(
+                    &staged_path,
                     &checkout_dir,
                     &challenge_dir,
                     &identity,
                     &token_digest,
                     &receipt_id,
+                    deadline,
                 ) {
                     return Err(domain_error(
                         DirtyCheckoutErrorKind::AdoptionFailed,
                         format!(
-                            "post-install snapshot verification failed and rollback is incomplete: {error}; rollback failed: {rollback_error}"
+                            "post-stage snapshot verification failed and rollback is incomplete: {error}; rollback failed: {rollback_error}"
                         ),
                     ));
                 }
                 return Err(error);
             }
-            if recover_pending_adoption(&checkout_dir, &challenge_dir, &identity, &token_digest)?
-                != PendingRecovery::Committed
+            match publish_staged_lease(
+                &staged_path,
+                &lease_path,
+                &lease,
+                existing_bytes.as_deref(),
+                &identity,
+            ) {
+                LeaseInstallOutcome::Installed => {}
+                LeaseInstallOutcome::NotInstalled(error) => {
+                    return Err(transition_failure_after_recovery(
+                        error,
+                        &checkout_dir,
+                        &challenge_dir,
+                        &identity,
+                        &token_digest,
+                        deadline,
+                    ));
+                }
+                LeaseInstallOutcome::Ambiguous(error) => {
+                    return Err(domain_error(
+                        DirtyCheckoutErrorKind::AdoptionFailed,
+                        format!(
+                            "checkout lease publication is ambiguous; recovery state was retained: {error}"
+                        ),
+                    ));
+                }
+            }
+            if recover_pending_adoption_until(
+                &checkout_dir,
+                &challenge_dir,
+                &identity,
+                &token_digest,
+                deadline,
+            )? != PendingRecovery::Committed
             {
                 return Err(domain_error(
                     DirtyCheckoutErrorKind::AdoptionFailed,
@@ -1384,13 +1990,14 @@ where
                 &challenge_dir,
                 &identity,
                 &token_digest,
+                deadline,
             ));
         }
         LeaseInstallOutcome::Ambiguous(error) => {
             return Err(domain_error(
                 DirtyCheckoutErrorKind::AdoptionFailed,
                 format!(
-                    "checkout lease installation is ambiguous; recovery state was retained: {error}"
+                    "staged checkout lease installation is ambiguous; recovery state was retained: {error}"
                 ),
             ));
         }
@@ -1400,6 +2007,13 @@ where
         receipt_id,
         snapshot_id: snapshot.snapshot_id,
     })
+}
+
+fn preserved_predecessor_lease_bytes(
+    existing: Option<&LeaseRecord>,
+    existing_bytes: Option<Vec<u8>>,
+) -> Option<Vec<u8>> {
+    existing.and(existing_bytes)
 }
 
 fn snapshot_before_deadline<F>(
@@ -1423,6 +2037,7 @@ struct CommittedAdoptionRetry<'a> {
     token_digest: &'a str,
     reason_digest: &'a str,
     provisional_pending: bool,
+    staged_pending: bool,
     deadline: Instant,
 }
 
@@ -1442,9 +2057,31 @@ where
         token_digest,
         reason_digest,
         provisional_pending,
+        staged_pending,
         deadline,
     } = retry;
-    let Some(lease) = load_lease(&checkout_dir.join("lease.json"))? else {
+    let staged_pending_record = if staged_pending {
+        let pending_path = pending_adoption_path(checkout_dir, token_digest);
+        let pending_bytes =
+            read_private_regular(&pending_path, MAX_PENDING_STATE_FILE_BYTES, true)?;
+        let pending: PendingAdoptionRecord =
+            serde_json::from_slice(&pending_bytes).map_err(|_| {
+                domain_error(
+                    DirtyCheckoutErrorKind::MalformedState,
+                    "staged adoption recovery marker is malformed",
+                )
+            })?;
+        validate_pending_adoption(&pending, identity, token_digest)?;
+        Some(pending)
+    } else {
+        None
+    };
+    let authoritative_lease_path = checkout_dir.join("lease.json");
+    let lease_path = staged_pending_record.as_ref().map_or_else(
+        || authoritative_lease_path.clone(),
+        |pending| staged_lease_path(checkout_dir, &pending.receipt_id),
+    );
+    let Some(lease) = load_lease(&lease_path)? else {
         return Ok(None);
     };
     validate_lease(&lease, identity)?;
@@ -1531,12 +2168,14 @@ where
 
     if let Err(error) = verification {
         if provisional_pending
-            && let Err(rollback_error) = rollback_installed_adoption(
+            && let Err(rollback_error) = rollback_provisional_adoption(
+                &lease_path,
                 checkout_dir,
                 challenge_dir,
                 identity,
                 token_digest,
                 &receipt_id,
+                deadline,
             )
         {
             return Err(domain_error(
@@ -1549,9 +2188,35 @@ where
         return Err(error);
     }
 
+    if let Some(pending) = &staged_pending_record {
+        match publish_staged_lease(
+            &lease_path,
+            &authoritative_lease_path,
+            &lease,
+            pending.predecessor_lease_bytes.as_deref(),
+            identity,
+        ) {
+            LeaseInstallOutcome::Installed => {}
+            LeaseInstallOutcome::NotInstalled(error) => return Err(error),
+            LeaseInstallOutcome::Ambiguous(error) => {
+                return Err(domain_error(
+                    DirtyCheckoutErrorKind::AdoptionFailed,
+                    format!(
+                        "checkout lease publication is ambiguous; recovery state was retained: {error}"
+                    ),
+                ));
+            }
+        }
+    }
+
     if provisional_pending
-        && recover_pending_adoption(checkout_dir, challenge_dir, identity, token_digest)?
-            != PendingRecovery::Committed
+        && recover_pending_adoption_until(
+            checkout_dir,
+            challenge_dir,
+            identity,
+            token_digest,
+            deadline,
+        )? != PendingRecovery::Committed
     {
         return Err(domain_error(
             DirtyCheckoutErrorKind::AdoptionFailed,
@@ -1583,25 +2248,96 @@ fn validate_snapshot_matches_challenge(
     Ok(())
 }
 
-fn rollback_installed_adoption(
+fn rollback_provisional_adoption(
+    provisional_lease_path: &Path,
     checkout_dir: &Path,
     challenge_dir: &Path,
     identity: &CheckoutIdentity,
     token_digest: &str,
     receipt_id: &str,
+    deadline: Instant,
 ) -> Result<()> {
-    let lease_path = checkout_dir.join("lease.json");
+    rollback_provisional_adoption_with_pruning(ProvisionalRollback {
+        provisional_lease_path,
+        checkout_dir,
+        challenge_dir,
+        identity,
+        token_digest,
+        receipt_id,
+        prune_revocations: true,
+        deadline,
+    })
+}
+
+fn rollback_provisional_adoption_without_pruning(
+    provisional_lease_path: &Path,
+    checkout_dir: &Path,
+    challenge_dir: &Path,
+    identity: &CheckoutIdentity,
+    token_digest: &str,
+    receipt_id: &str,
+    deadline: Instant,
+) -> Result<()> {
+    rollback_provisional_adoption_with_pruning(ProvisionalRollback {
+        provisional_lease_path,
+        checkout_dir,
+        challenge_dir,
+        identity,
+        token_digest,
+        receipt_id,
+        prune_revocations: false,
+        deadline,
+    })
+}
+
+struct ProvisionalRollback<'a> {
+    provisional_lease_path: &'a Path,
+    checkout_dir: &'a Path,
+    challenge_dir: &'a Path,
+    identity: &'a CheckoutIdentity,
+    token_digest: &'a str,
+    receipt_id: &'a str,
+    prune_revocations: bool,
+    deadline: Instant,
+}
+
+fn rollback_provisional_adoption_with_pruning(rollback: ProvisionalRollback<'_>) -> Result<()> {
+    let ProvisionalRollback {
+        provisional_lease_path,
+        checkout_dir,
+        challenge_dir,
+        identity,
+        token_digest,
+        receipt_id,
+        prune_revocations,
+        deadline,
+    } = rollback;
     let revoked_lease_path = checkout_dir.join(format!(".revoked-{receipt_id}.json"));
-    fs::rename(&lease_path, &revoked_lease_path)
-        .context("post-install adoption rollback could not revoke the lease")?;
+    fs::rename(provisional_lease_path, &revoked_lease_path)
+        .context("provisional adoption rollback could not revoke the lease")?;
     sync_directory(checkout_dir)
-        .context("post-install adoption rollback tombstone could not be made durable")?;
-    if recover_pending_adoption(checkout_dir, challenge_dir, identity, token_digest)?
-        != PendingRecovery::Revoked
-    {
+        .context("provisional adoption rollback tombstone could not be made durable")?;
+    let recovery = if prune_revocations {
+        recover_pending_adoption_until(
+            checkout_dir,
+            challenge_dir,
+            identity,
+            token_digest,
+            deadline,
+        )?
+    } else {
+        recover_pending_adoption_without_pruning(
+            checkout_dir,
+            challenge_dir,
+            identity,
+            token_digest,
+            deadline,
+        )?
+    };
+    if recovery != PendingRecovery::Revoked {
         return Err(domain_error(
             DirtyCheckoutErrorKind::AdoptionFailed,
-            "post-install adoption rollback did not enter revoked recovery state",
+            "provisional adoption rollback did not enter revoked recovery state",
         ));
     }
     Ok(())
@@ -1713,10 +2449,66 @@ fn cleanup_expired_predecessor(predecessor: &ExpiredPredecessor) -> Result<()> {
     Ok(())
 }
 
+struct RecoveryScanBudget {
+    deadline: Instant,
+    directory_entries: usize,
+    state_entries: usize,
+    aggregate_bytes: u64,
+    name_bytes: usize,
+}
+
+impl RecoveryScanBudget {
+    fn new(deadline: Instant) -> Self {
+        Self {
+            deadline,
+            directory_entries: 0,
+            state_entries: 0,
+            aggregate_bytes: 0,
+            name_bytes: 0,
+        }
+    }
+
+    fn charge(&mut self, entry: &fs::DirEntry, state_entry: bool) -> Result<()> {
+        ensure_deadline(self.deadline)?;
+        self.directory_entries = self.directory_entries.saturating_add(1);
+        self.name_bytes = self
+            .name_bytes
+            .saturating_add(entry.file_name().as_bytes().len());
+        if self.directory_entries > MAX_RECOVERY_DIRECTORY_ENTRIES
+            || self.name_bytes > MAX_RECOVERY_NAME_BYTES
+        {
+            return Err(domain_error(
+                DirtyCheckoutErrorKind::ResourceUnavailable,
+                "checkout recovery directory exceeds the supported scan limit",
+            ));
+        }
+        if state_entry {
+            self.state_entries = self.state_entries.saturating_add(1);
+            let metadata = fs::symlink_metadata(entry.path())
+                .context("checkout recovery state metadata is unavailable")?;
+            self.aggregate_bytes = self.aggregate_bytes.saturating_add(metadata.len());
+            if self.state_entries > MAX_RECOVERY_STATE_ENTRIES
+                || self.aggregate_bytes > MAX_RECOVERY_AGGREGATE_BYTES
+            {
+                return Err(domain_error(
+                    DirtyCheckoutErrorKind::ResourceUnavailable,
+                    "checkout recovery state exceeds the supported aggregate limit",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn check_deadline(&self) -> Result<()> {
+        ensure_deadline(self.deadline)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PendingRecovery {
     None,
     RolledBack,
+    Staged,
     Committed,
     Revoked,
 }
@@ -1725,22 +2517,217 @@ fn pending_adoption_path(checkout_dir: &Path, token_digest: &str) -> PathBuf {
     checkout_dir.join(format!(".pending-adoption-{token_digest}.json"))
 }
 
+fn staged_lease_path(checkout_dir: &Path, receipt_id: &str) -> PathBuf {
+    checkout_dir.join(format!(".pending-lease-{receipt_id}.json"))
+}
+
+fn recover_pending_batch_with<I, R, B, P>(
+    records: I,
+    current_token_digest: &str,
+    mut recover: R,
+    mut rollback_staged: B,
+    prune: P,
+) -> Result<()>
+where
+    I: IntoIterator<Item = (String, String)>,
+    R: FnMut(&str) -> Result<PendingRecovery>,
+    B: FnMut(&str, &str) -> Result<()>,
+    P: FnOnce(Option<&str>) -> Result<()>,
+{
+    let mut failed_receipt_id = None;
+    let recovery_result = (|| {
+        for (token_digest, receipt_id) in records {
+            if token_digest == current_token_digest {
+                continue;
+            }
+            let recovery = match recover(&token_digest) {
+                Ok(recovery) => recovery,
+                Err(error) => {
+                    failed_receipt_id = Some(receipt_id);
+                    return Err(error);
+                }
+            };
+            if recovery == PendingRecovery::Staged
+                && let Err(error) = rollback_staged(&token_digest, &receipt_id)
+            {
+                failed_receipt_id = Some(receipt_id);
+                return Err(error);
+            }
+        }
+        Ok(())
+    })();
+    let prune_result = prune(failed_receipt_id.as_deref());
+
+    match (recovery_result, prune_result) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(primary), Ok(())) => Err(primary),
+        (Ok(()), Err(prune_error)) => Err(prune_error),
+        (Err(primary), Err(prune_error)) => {
+            let context = format!(
+                "checkout-wide pending-adoption recovery failed: {primary:#}; deferred revocation tombstone pruning also failed: {prune_error:#}"
+            );
+            Err(primary.context(context))
+        }
+    }
+}
+
+fn recover_checkout_pending_adoptions(
+    checkout_dir: &Path,
+    challenge_dir: &Path,
+    identity: &CheckoutIdentity,
+    current_token_digest: &str,
+    deadline: Instant,
+) -> Result<()> {
+    let mut budget = RecoveryScanBudget::new(deadline);
+    let mut pending_records = Vec::new();
+    let mut protected_receipts = HashSet::new();
+    let mut tombstone_candidates = HashSet::new();
+    for entry in fs::read_dir(checkout_dir).context("pending adoption scan is unavailable")? {
+        let entry = entry.context("pending adoption scan entry is unreadable")?;
+        let name = entry.file_name();
+        let token_digest = name
+            .to_str()
+            .and_then(|name| name.strip_prefix(".pending-adoption-"))
+            .and_then(|name| name.strip_suffix(".json"))
+            .filter(|digest| is_lower_hex(digest, 64));
+        let tombstone_receipt = name
+            .to_str()
+            .and_then(|name| name.strip_prefix(".revoked-"))
+            .and_then(|name| name.strip_suffix(".json"))
+            .filter(|receipt_id| is_lower_hex(receipt_id, 64));
+        budget.charge(
+            &entry,
+            token_digest.is_some() || tombstone_receipt.is_some(),
+        )?;
+        if let Some(receipt_id) = tombstone_receipt {
+            tombstone_candidates.insert(receipt_id.to_string());
+        }
+        let Some(token_digest) = token_digest else {
+            continue;
+        };
+        let pending_bytes =
+            read_private_regular(&entry.path(), MAX_PENDING_STATE_FILE_BYTES, true)?;
+        let pending: PendingAdoptionRecord =
+            serde_json::from_slice(&pending_bytes).map_err(|_| {
+                domain_error(
+                    DirtyCheckoutErrorKind::MalformedState,
+                    "checkout-wide recovery marker is malformed",
+                )
+            })?;
+        validate_pending_adoption(&pending, identity, token_digest)?;
+        tombstone_candidates.insert(pending.receipt_id.clone());
+        protected_receipts.insert(pending.receipt_id.clone());
+        pending_records.push((token_digest.to_string(), pending.receipt_id));
+    }
+    budget.check_deadline()?;
+
+    recover_pending_batch_with(
+        pending_records,
+        current_token_digest,
+        |token_digest| {
+            recover_pending_adoption_without_pruning(
+                checkout_dir,
+                challenge_dir,
+                identity,
+                token_digest,
+                deadline,
+            )
+        },
+        |token_digest, receipt_id| {
+            rollback_provisional_adoption_without_pruning(
+                &staged_lease_path(checkout_dir, receipt_id),
+                checkout_dir,
+                challenge_dir,
+                identity,
+                token_digest,
+                receipt_id,
+                deadline,
+            )
+        },
+        |failed_receipt_id| {
+            if let Some(receipt_id) = failed_receipt_id {
+                protected_receipts.insert(receipt_id.to_string());
+            }
+            prune_revocation_tombstone_candidates(
+                checkout_dir,
+                identity,
+                &protected_receipts,
+                tombstone_candidates,
+                deadline,
+            )
+        },
+    )?;
+    budget.check_deadline()
+}
+
+#[cfg(test)]
 fn recover_pending_adoption(
     checkout_dir: &Path,
     challenge_dir: &Path,
     identity: &CheckoutIdentity,
     token_digest: &str,
 ) -> Result<PendingRecovery> {
-    recover_pending_adoption_with(checkout_dir, challenge_dir, identity, token_digest, true)
+    recover_pending_adoption_until(
+        checkout_dir,
+        challenge_dir,
+        identity,
+        token_digest,
+        deadline_after(SNAPSHOT_TIMEOUT)?,
+    )
 }
 
-fn inspect_pending_adoption(
+fn recover_pending_adoption_until(
     checkout_dir: &Path,
     challenge_dir: &Path,
     identity: &CheckoutIdentity,
     token_digest: &str,
+    deadline: Instant,
 ) -> Result<PendingRecovery> {
-    recover_pending_adoption_with(checkout_dir, challenge_dir, identity, token_digest, false)
+    recover_pending_adoption_with(
+        checkout_dir,
+        challenge_dir,
+        identity,
+        token_digest,
+        true,
+        true,
+        deadline,
+    )
+}
+
+fn recover_pending_adoption_without_pruning(
+    checkout_dir: &Path,
+    challenge_dir: &Path,
+    identity: &CheckoutIdentity,
+    token_digest: &str,
+    deadline: Instant,
+) -> Result<PendingRecovery> {
+    recover_pending_adoption_with(
+        checkout_dir,
+        challenge_dir,
+        identity,
+        token_digest,
+        true,
+        false,
+        deadline,
+    )
+}
+
+fn inspect_pending_adoption_until(
+    checkout_dir: &Path,
+    challenge_dir: &Path,
+    identity: &CheckoutIdentity,
+    token_digest: &str,
+    deadline: Instant,
+) -> Result<PendingRecovery> {
+    recover_pending_adoption_with(
+        checkout_dir,
+        challenge_dir,
+        identity,
+        token_digest,
+        false,
+        false,
+        deadline,
+    )
 }
 
 fn recover_pending_adoption_with(
@@ -1749,9 +2736,17 @@ fn recover_pending_adoption_with(
     identity: &CheckoutIdentity,
     token_digest: &str,
     finalize_committed: bool,
+    prune_revocations: bool,
+    deadline: Instant,
 ) -> Result<PendingRecovery> {
+    ensure_deadline(deadline)?;
     let pending_path = pending_adoption_path(checkout_dir, token_digest);
-    let Some(pending_bytes) = read_optional_private(&pending_path, "pending adoption")? else {
+    let Some(pending_bytes) = read_optional_private_with_limit(
+        &pending_path,
+        "pending adoption",
+        MAX_PENDING_STATE_FILE_BYTES,
+    )?
+    else {
         return Ok(PendingRecovery::None);
     };
     let pending: PendingAdoptionRecord = serde_json::from_slice(&pending_bytes).map_err(|_| {
@@ -1849,10 +2844,65 @@ fn recover_pending_adoption_with(
         }
         sync_directory(challenge_dir)?;
         sync_directory(&receipts_dir)?;
+        if prune_revocations {
+            prune_revocation_tombstones(checkout_dir, identity, &pending.receipt_id, deadline)?;
+        }
         fs::remove_file(&pending_path)
             .context("revoked adoption recovery marker cleanup failed")?;
         sync_directory(checkout_dir)?;
         return Ok(PendingRecovery::Revoked);
+    }
+
+    let staged_path = staged_lease_path(checkout_dir, &pending.receipt_id);
+    if let Some(staged_bytes) = read_optional_private(&staged_path, "staged adoption lease")? {
+        let staged = parse_lease(&staged_bytes)?;
+        validate_lease(&staged, identity)?;
+        let adoption = staged.adoption().ok_or_else(|| {
+            domain_error(
+                DirtyCheckoutErrorKind::MalformedState,
+                "staged adoption lease has no adoption identity",
+            )
+        })?;
+        if staged.session_key() != pending.session_key
+            || staged.checkout_instance() != pending.checkout_instance
+            || adoption.receipt_id != pending.receipt_id
+            || adoption.snapshot_id != pending.snapshot_id
+            || adoption.challenge_digest != pending.challenge_digest
+        {
+            return Err(domain_error(
+                DirtyCheckoutErrorKind::MalformedState,
+                "staged adoption lease does not match pending state",
+            ));
+        }
+        if load_pending_challenge(
+            &challenge_path,
+            identity,
+            token_digest,
+            &pending.challenge_digest,
+        )?
+        .is_some()
+        {
+            return Err(domain_error(
+                DirtyCheckoutErrorKind::MalformedState,
+                "staged adoption has an inconsistent live challenge",
+            ));
+        }
+        let artifacts = expired_predecessor(checkout_dir, identity, &staged)?.ok_or_else(|| {
+            domain_error(
+                DirtyCheckoutErrorKind::MalformedState,
+                "staged pending adoption artifacts are incomplete or malformed",
+            )
+        })?;
+        if artifacts.receipt_id != pending.receipt_id
+            || artifacts.receipt_digest.is_none()
+            || artifacts.spent_challenge_digest.is_none()
+        {
+            return Err(domain_error(
+                DirtyCheckoutErrorKind::MalformedState,
+                "staged pending adoption artifacts are incomplete or inconsistent",
+            ));
+        }
+        return Ok(PendingRecovery::Staged);
     }
 
     let lease = load_lease(&checkout_dir.join("lease.json"))?;
@@ -1961,7 +3011,15 @@ fn recover_pending_adoption_with(
 }
 
 fn read_optional_private(path: &Path, label: &str) -> Result<Option<Vec<u8>>> {
-    match read_private_regular(path, MAX_STATE_FILE_BYTES, true) {
+    read_optional_private_with_limit(path, label, MAX_STATE_FILE_BYTES)
+}
+
+fn read_optional_private_with_limit(
+    path: &Path,
+    label: &str,
+    max_bytes: usize,
+) -> Result<Option<Vec<u8>>> {
+    match read_private_regular(path, max_bytes, true) {
         Ok(bytes) => Ok(Some(bytes)),
         Err(error)
             if error
@@ -2064,12 +3122,15 @@ fn validate_pending_predecessor_lease<'a>(
     };
     let lease = parse_lease(bytes)?;
     validate_lease(&lease, identity)?;
+    let predecessor_matches = match (lease.adoption(), pending.predecessor_receipt_id.as_deref()) {
+        (None, None) => lease.schema() == LEASE_V1_SCHEMA,
+        (Some(adoption), Some(receipt_id)) => adoption.receipt_id == receipt_id,
+        _ => false,
+    };
     if !is_lower_hex(digest, 64)
         || sha256_hex(bytes) != digest
-        || lease.schema() != LEASE_V1_SCHEMA
-        || lease.session_key() != pending.session_key
         || lease.checkout_instance() != pending.checkout_instance
-        || lease.adoption().is_some()
+        || !predecessor_matches
     {
         return Err(domain_error(
             DirtyCheckoutErrorKind::MalformedState,
@@ -2107,6 +3168,7 @@ fn transition_result_after_recovery<T>(
     challenge_dir: &Path,
     identity: &CheckoutIdentity,
     token_digest: &str,
+    deadline: Instant,
 ) -> Result<T> {
     result.map_err(|error| {
         transition_failure_after_recovery(
@@ -2115,6 +3177,7 @@ fn transition_result_after_recovery<T>(
             challenge_dir,
             identity,
             token_digest,
+            deadline,
         )
     })
 }
@@ -2125,13 +3188,24 @@ fn transition_failure_after_recovery(
     challenge_dir: &Path,
     identity: &CheckoutIdentity,
     token_digest: &str,
+    deadline: Instant,
 ) -> anyhow::Error {
-    match inspect_pending_adoption(checkout_dir, challenge_dir, identity, token_digest) {
+    match inspect_pending_adoption_until(
+        checkout_dir,
+        challenge_dir,
+        identity,
+        token_digest,
+        deadline,
+    ) {
         Ok(PendingRecovery::None | PendingRecovery::RolledBack) => error,
-        Ok(PendingRecovery::Committed | PendingRecovery::Revoked) => domain_error(
-            DirtyCheckoutErrorKind::AdoptionFailed,
-            format!("adoption transition became committed while handling a failure: {error}"),
-        ),
+        Ok(PendingRecovery::Staged | PendingRecovery::Committed | PendingRecovery::Revoked) => {
+            domain_error(
+                DirtyCheckoutErrorKind::AdoptionFailed,
+                format!(
+                    "adoption transition retained recovery state while handling a failure: {error}"
+                ),
+            )
+        }
         Err(recovery_error) => domain_error(
             DirtyCheckoutErrorKind::AdoptionFailed,
             format!(
@@ -2140,6 +3214,68 @@ fn transition_failure_after_recovery(
         ),
     }
 }
+fn publish_staged_lease(
+    staged_path: &Path,
+    authoritative_path: &Path,
+    expected: &LeaseRecord,
+    expected_previous_bytes: Option<&[u8]>,
+    identity: &CheckoutIdentity,
+) -> LeaseInstallOutcome {
+    let actual_previous_bytes =
+        match read_optional_private(authoritative_path, "authoritative lease") {
+            Ok(actual) => actual,
+            Err(error) => return LeaseInstallOutcome::NotInstalled(error),
+        };
+    if actual_previous_bytes.as_deref() != expected_previous_bytes {
+        let error = match actual_previous_bytes.as_deref() {
+            Some(bytes) => {
+                match parse_lease(bytes).and_then(|lease| validate_lease(&lease, identity)) {
+                    Ok(()) => domain_error(
+                        DirtyCheckoutErrorKind::ForeignLease,
+                        "authoritative checkout lease changed before staged publication",
+                    ),
+                    Err(error) => error,
+                }
+            }
+            None => domain_error(
+                DirtyCheckoutErrorKind::AdoptionFailed,
+                "authoritative checkout lease disappeared before staged publication",
+            ),
+        };
+        return LeaseInstallOutcome::NotInstalled(error);
+    }
+    let previous = match expected_previous_bytes.map(parse_lease).transpose() {
+        Ok(previous) => previous,
+        Err(error) => return LeaseInstallOutcome::NotInstalled(error),
+    };
+    install_lease_with(
+        authoritative_path,
+        expected,
+        previous.as_ref(),
+        identity,
+        || {
+            let staged = load_lease(staged_path)?.ok_or_else(|| {
+                domain_error(
+                    DirtyCheckoutErrorKind::MalformedState,
+                    "staged checkout lease is missing",
+                )
+            })?;
+            validate_lease(&staged, identity)?;
+            ensure!(
+                staged == *expected,
+                "staged checkout lease changed before publication"
+            );
+            fs::rename(staged_path, authoritative_path)
+                .context("staged checkout lease could not be published")?;
+            sync_directory(
+                authoritative_path
+                    .parent()
+                    .context("checkout lease has no parent directory")?,
+            )
+        },
+    )
+}
+
 enum LeaseInstallOutcome {
     Installed,
     NotInstalled(anyhow::Error),
@@ -2190,13 +3326,27 @@ pub fn revoke_dirty(checkout: &Path, state_root: &Path, receipt_id: &str) -> Res
 }
 
 fn revoke_dirty_inner(checkout: &Path, state_root: &Path, receipt_id: &str) -> Result<()> {
+    revoke_dirty_inner_until(
+        checkout,
+        state_root,
+        receipt_id,
+        deadline_after(SNAPSHOT_TIMEOUT)?,
+    )
+}
+
+fn revoke_dirty_inner_until(
+    checkout: &Path,
+    state_root: &Path,
+    receipt_id: &str,
+    deadline: Instant,
+) -> Result<()> {
     if !is_lower_hex(receipt_id, 64) {
         return Err(domain_error(
             DirtyCheckoutErrorKind::InvalidInput,
             "receipt ID is malformed",
         ));
     }
-    let identity = resolve_checkout(checkout, false, Instant::now() + GIT_TIMEOUT)?;
+    let identity = resolve_checkout(checkout, false, deadline)?;
     let checkout_dir = checkout_state_dir(state_root, &identity)?;
     let receipts_dir = checkout_dir.join("receipts");
     verify_private_directory(&receipts_dir).map_err(|error| {
@@ -2214,13 +3364,14 @@ fn revoke_dirty_inner(checkout: &Path, state_root: &Path, receipt_id: &str) -> R
             "dirty-checkout challenge directory is untrusted",
         )
     })?;
-    let _lock = LeaseLock::acquire(&checkout_dir)?;
+    let _lock = LeaseLock::acquire_until(&checkout_dir, deadline)?;
     if recover_revocation_tombstone(
         &checkout_dir,
         &challenge_dir,
         &receipts_dir,
         &identity,
         receipt_id,
+        deadline,
     )? {
         return Ok(());
     }
@@ -2269,14 +3420,15 @@ fn revoke_dirty_inner(checkout: &Path, state_root: &Path, receipt_id: &str) -> R
     })?;
     validate_spent_challenge_matches_lease(&spent_bytes, &spent, &identity, &lease)?;
 
-    match recover_pending_adoption(
+    match recover_pending_adoption_until(
         &checkout_dir,
         &challenge_dir,
         &identity,
         &spent.token_digest,
+        deadline,
     )? {
         PendingRecovery::None | PendingRecovery::Committed => {}
-        PendingRecovery::RolledBack | PendingRecovery::Revoked => {
+        PendingRecovery::RolledBack | PendingRecovery::Staged | PendingRecovery::Revoked => {
             return Err(domain_error(
                 DirtyCheckoutErrorKind::MalformedState,
                 "active adoption changed while revocation was prepared",
@@ -2284,6 +3436,7 @@ fn revoke_dirty_inner(checkout: &Path, state_root: &Path, receipt_id: &str) -> R
         }
     }
 
+    ensure_deadline(deadline)?;
     let revoked_path = checkout_dir.join(format!(".revoked-{receipt_id}.json"));
     fs::rename(&lease_path, &revoked_path).context("failed to revoke adopted checkout lease")?;
     sync_directory(&checkout_dir).context("revoked lease tombstone could not be made durable")?;
@@ -2293,6 +3446,7 @@ fn revoke_dirty_inner(checkout: &Path, state_root: &Path, receipt_id: &str) -> R
         &receipts_dir,
         &identity,
         receipt_id,
+        deadline,
     )? {
         return Err(domain_error(
             DirtyCheckoutErrorKind::RevocationFailed,
@@ -2365,7 +3519,9 @@ fn recover_revocation_tombstone(
     receipts_dir: &Path,
     identity: &CheckoutIdentity,
     receipt_id: &str,
+    deadline: Instant,
 ) -> Result<bool> {
+    ensure_deadline(deadline)?;
     let tombstone_path = checkout_dir.join(format!(".revoked-{receipt_id}.json"));
     let Some(tombstone_bytes) = read_optional_private(&tombstone_path, "revoked adoption")? else {
         return Ok(false);
@@ -2385,20 +3541,31 @@ fn recover_revocation_tombstone(
         ));
     }
 
+    let mut budget = RecoveryScanBudget::new(deadline);
+    let mut token_digests = Vec::new();
     for entry in fs::read_dir(checkout_dir).context("revocation recovery state is unavailable")? {
         let entry = entry.context("revocation recovery state is unreadable")?;
         let name = entry.file_name();
-        let Some(name) = name.to_str() else {
-            continue;
-        };
-        let Some(token_digest) = name
-            .strip_prefix(".pending-adoption-")
+        let token_digest = name
+            .to_str()
+            .and_then(|name| name.strip_prefix(".pending-adoption-"))
             .and_then(|name| name.strip_suffix(".json"))
-            .filter(|digest| is_lower_hex(digest, 64))
+            .filter(|digest| is_lower_hex(digest, 64));
+        budget.charge(&entry, token_digest.is_some())?;
+        if let Some(token_digest) = token_digest {
+            token_digests.push(token_digest.to_string());
+        }
+    }
+    budget.check_deadline()?;
+
+    for token_digest in token_digests {
+        budget.check_deadline()?;
+        let Some(pending_bytes) = read_optional_private_with_limit(
+            &pending_adoption_path(checkout_dir, &token_digest),
+            "pending adoption",
+            MAX_PENDING_STATE_FILE_BYTES,
+        )?
         else {
-            continue;
-        };
-        let Some(pending_bytes) = read_optional_private(&entry.path(), "pending adoption")? else {
             continue;
         };
         let pending: PendingAdoptionRecord =
@@ -2408,11 +3575,16 @@ fn recover_revocation_tombstone(
                     "pending dirty-checkout adoption state is malformed",
                 )
             })?;
-        validate_pending_adoption(&pending, identity, token_digest)?;
+        validate_pending_adoption(&pending, identity, &token_digest)?;
         if pending.receipt_id == receipt_id {
             if pending.challenge_digest != adoption.challenge_digest
-                || recover_pending_adoption(checkout_dir, challenge_dir, identity, token_digest)?
-                    != PendingRecovery::Revoked
+                || recover_pending_adoption_until(
+                    checkout_dir,
+                    challenge_dir,
+                    identity,
+                    &token_digest,
+                    deadline,
+                )? != PendingRecovery::Revoked
             {
                 return Err(domain_error(
                     DirtyCheckoutErrorKind::MalformedState,
@@ -2422,6 +3594,7 @@ fn recover_revocation_tombstone(
             break;
         }
     }
+    budget.check_deadline()?;
 
     let receipt_path = receipts_dir.join(format!("{receipt_id}.json"));
     if let Some(bytes) = read_optional_private(&receipt_path, "revoked adoption receipt")? {
@@ -2446,6 +3619,7 @@ fn recover_revocation_tombstone(
         validate_spent_challenge_matches_lease(&bytes, &spent, identity, &tombstone)?;
         token_digest = Some(spent.token_digest);
     }
+    budget.check_deadline()?;
     for path in [&receipt_path, &spent_path] {
         match fs::remove_file(path) {
             Ok(()) => {}
@@ -2467,7 +3641,7 @@ fn recover_revocation_tombstone(
         .context("revoked adoption challenge cleanup could not be made durable")?;
     sync_directory(checkout_dir)
         .context("revoked adoption tombstone could not be confirmed durable")?;
-    prune_revocation_tombstones(checkout_dir, identity, receipt_id)?;
+    prune_revocation_tombstones(checkout_dir, identity, receipt_id, deadline)?;
     Ok(true)
 }
 
@@ -2475,22 +3649,35 @@ fn prune_revocation_tombstones(
     checkout_dir: &Path,
     identity: &CheckoutIdentity,
     current_receipt_id: &str,
+    deadline: Instant,
 ) -> Result<()> {
     let mut protected = HashSet::from([current_receipt_id.to_string()]);
-    for entry in
-        fs::read_dir(checkout_dir).context("pending adoption references are unavailable")?
-    {
-        let entry = entry.context("pending adoption reference entry is unreadable")?;
+    let mut candidates = HashSet::new();
+    let mut budget = RecoveryScanBudget::new(deadline);
+    for entry in fs::read_dir(checkout_dir).context("revocation retention state is unavailable")? {
+        let entry = entry.context("revocation retention state entry is unreadable")?;
         let name = entry.file_name();
-        let Some(token_digest) = name
+        let token_digest = name
             .to_str()
             .and_then(|name| name.strip_prefix(".pending-adoption-"))
             .and_then(|name| name.strip_suffix(".json"))
-            .filter(|digest| is_lower_hex(digest, 64))
-        else {
+            .filter(|digest| is_lower_hex(digest, 64));
+        let tombstone_receipt = name
+            .to_str()
+            .and_then(|name| name.strip_prefix(".revoked-"))
+            .and_then(|name| name.strip_suffix(".json"))
+            .filter(|receipt_id| is_lower_hex(receipt_id, 64));
+        budget.charge(
+            &entry,
+            token_digest.is_some() || tombstone_receipt.is_some(),
+        )?;
+        if let Some(receipt_id) = tombstone_receipt {
+            candidates.insert(receipt_id.to_string());
+        }
+        let Some(token_digest) = token_digest else {
             continue;
         };
-        let bytes = read_private_regular(&entry.path(), MAX_STATE_FILE_BYTES, true)?;
+        let bytes = read_private_regular(&entry.path(), MAX_PENDING_STATE_FILE_BYTES, true)?;
         let pending: PendingAdoptionRecord = serde_json::from_slice(&bytes).map_err(|_| {
             domain_error(
                 DirtyCheckoutErrorKind::MalformedState,
@@ -2498,24 +3685,30 @@ fn prune_revocation_tombstones(
             )
         })?;
         validate_pending_adoption(&pending, identity, token_digest)?;
+        candidates.insert(pending.receipt_id.clone());
         protected.insert(pending.receipt_id);
     }
+    budget.check_deadline()?;
+    prune_revocation_tombstone_candidates(checkout_dir, identity, &protected, candidates, deadline)
+}
 
+fn prune_revocation_tombstone_candidates<I>(
+    checkout_dir: &Path,
+    identity: &CheckoutIdentity,
+    protected: &HashSet<String>,
+    candidates: I,
+    deadline: Instant,
+) -> Result<()>
+where
+    I: IntoIterator<Item = String>,
+{
     let mut tombstones = Vec::new();
-    for entry in fs::read_dir(checkout_dir).context("revocation tombstones are unavailable")? {
-        let entry = entry.context("revocation tombstone entry is unreadable")?;
-        let name = entry.file_name();
-        let Some(name) = name.to_str() else {
+    for receipt_id in candidates {
+        ensure_deadline(deadline)?;
+        let path = checkout_dir.join(format!(".revoked-{receipt_id}.json"));
+        let Some(bytes) = read_optional_private(&path, "revocation tombstone")? else {
             continue;
         };
-        let Some(receipt_id) = name
-            .strip_prefix(".revoked-")
-            .and_then(|name| name.strip_suffix(".json"))
-            .filter(|receipt_id| is_lower_hex(receipt_id, 64))
-        else {
-            continue;
-        };
-        let bytes = read_private_regular(&entry.path(), MAX_STATE_FILE_BYTES, true)?;
         let lease = parse_lease(&bytes)?;
         validate_lease(&lease, identity)?;
         let adoption = lease.adoption().ok_or_else(|| {
@@ -2531,33 +3724,34 @@ fn prune_revocation_tombstones(
             ));
         }
         tombstones.push((
-            protected.contains(receipt_id),
+            protected.contains(&receipt_id),
             adoption.adopted_at,
-            entry.path(),
+            receipt_id,
         ));
     }
-    tombstones.sort_by_key(|(protected, adopted_at, path)| {
-        (
-            *protected,
-            *adopted_at,
-            path.as_os_str().as_bytes().to_vec(),
-        )
+    tombstones.sort_by(|left, right| {
+        left.0
+            .cmp(&right.0)
+            .then_with(|| left.1.cmp(&right.1))
+            .then_with(|| left.2.cmp(&right.2))
     });
     let remove_count = tombstones.len().saturating_sub(MAX_REVOCATION_TOMBSTONES);
-    let removable = tombstones
+    let mut removed = false;
+    for (_, _, receipt_id) in tombstones
         .into_iter()
         .filter(|(protected, _, _)| !protected)
         .take(remove_count)
-        .map(|(_, _, path)| path)
-        .collect::<Vec<_>>();
-    for path in &removable {
-        fs::remove_file(path).context("expired revocation tombstone cleanup failed")?;
+    {
+        ensure_deadline(deadline)?;
+        fs::remove_file(checkout_dir.join(format!(".revoked-{receipt_id}.json")))
+            .context("expired revocation tombstone cleanup failed")?;
+        removed = true;
     }
-    if !removable.is_empty() {
+    if removed {
         sync_directory(checkout_dir)
             .context("revocation tombstone retention could not be made durable")?;
     }
-    Ok(())
+    ensure_deadline(deadline)
 }
 
 fn snapshot_once(checkout: &Path, deadline: Instant) -> Result<SnapshotPass> {
@@ -2852,6 +4046,30 @@ fn reject_command_bearing_git_config(
     }
 }
 
+fn validate_git_toplevel(
+    budget: &mut SnapshotBudget,
+    expected: &Path,
+    deadline: Instant,
+) -> Result<()> {
+    let output = snapshot_git_output(
+        budget,
+        expected,
+        &["rev-parse", "--show-toplevel"],
+        1024 * 1024,
+        deadline,
+    )?;
+    ensure!(
+        output.status.success(),
+        "submodule Git worktree identity is unavailable"
+    );
+    let resolved = canonical_git_path(expected, strip_git_line(&output.stdout)?)?;
+    ensure!(
+        resolved == expected,
+        "submodule Git worktree identity does not match its index path"
+    );
+    Ok(())
+}
+
 fn reject_initialized_submodule_config(
     root: &Path,
     tracked: &[IndexEntry],
@@ -2898,6 +4116,7 @@ fn reject_initialized_submodule_config_inner(
                 visited.insert(canonical.clone()),
                 "submodule checkout graph contains a cycle"
             );
+            validate_git_toplevel(budget, &canonical, deadline)?;
             reject_command_bearing_git_config(budget, &canonical, deadline)?;
             let index_output = snapshot_git_output(
                 budget,
@@ -2911,6 +4130,19 @@ fn reject_initialized_submodule_config_inner(
                 "submodule index listing failed"
             );
             let nested = parse_index_bounded(&index_output.stdout, MAX_ENTRY_COUNT, budget)?;
+            drop(index_output);
+            let flags_output = snapshot_git_output(
+                budget,
+                &canonical,
+                &["ls-files", "-v", "-z"],
+                MAX_GIT_OUTPUT_BYTES,
+                deadline,
+            )?;
+            ensure!(
+                flags_output.status.success(),
+                "submodule index flags are unavailable"
+            );
+            validate_index_flags(&flags_output.stdout, &nested, budget)?;
             reject_initialized_submodule_config_inner(
                 &canonical, &nested, budget, deadline, visited,
             )
@@ -2983,6 +4215,7 @@ fn resolve_checkout(
 ) -> Result<CheckoutIdentity> {
     let requested =
         fs::canonicalize(checkout).context("checkout identity could not be resolved")?;
+    let requested_root = requested_checkout_root(&requested)?;
     let root_output = git_output_os(
         &requested,
         &[
@@ -2994,6 +4227,12 @@ fn resolve_checkout(
     )?;
     ensure!(root_output.status.success(), "path is not a Git checkout");
     let root = canonical_git_path(&requested, strip_git_line(&root_output.stdout)?)?;
+    if root != requested_root {
+        return Err(domain_error(
+            DirtyCheckoutErrorKind::UnsupportedGitState,
+            "Git checkout top-level does not match the requested physical checkout",
+        ));
+    }
     let git_dir_output = git_output(
         &root,
         &["rev-parse", "--absolute-git-dir"],
@@ -3023,6 +4262,38 @@ fn resolve_checkout(
         checkout_key,
         checkout_instance,
     })
+}
+
+fn requested_checkout_root(requested: &Path) -> Result<PathBuf> {
+    for ancestor in requested.ancestors() {
+        let marker = ancestor.join(".git");
+        match fs::symlink_metadata(&marker) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(domain_error(
+                    DirtyCheckoutErrorKind::UnsupportedGitState,
+                    "requested checkout has a symbolic Git identity marker",
+                ));
+            }
+            Ok(metadata) if metadata.is_file() || metadata.is_dir() => {
+                return fs::canonicalize(ancestor)
+                    .context("requested checkout root could not be canonicalized");
+            }
+            Ok(_) => {
+                return Err(domain_error(
+                    DirtyCheckoutErrorKind::UnsupportedGitState,
+                    "requested checkout has an unsupported Git identity marker",
+                ));
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error).context("requested checkout Git identity is unavailable");
+            }
+        }
+    }
+    Err(domain_error(
+        DirtyCheckoutErrorKind::UnsupportedGitState,
+        "requested path is not inside a physical Git checkout",
+    ))
 }
 
 fn canonical_git_path(base: &Path, raw: &[u8]) -> Result<PathBuf> {
@@ -3423,6 +4694,7 @@ fn hash_worktree_object(
                 canonical.starts_with(root),
                 "submodule path escapes the checkout"
             );
+            validate_git_toplevel(budget, &canonical, deadline)?;
             reject_command_bearing_git_config(budget, &canonical, deadline)?;
             reject_special_filesystem_objects(&canonical, &HashSet::new(), budget, deadline)?;
             let head = snapshot_git_output(
@@ -4066,14 +5338,32 @@ fn read_regular_bounded(path: &Path, max_bytes: usize) -> Result<Vec<u8>> {
 }
 
 fn write_json_atomic(path: &Path, value: &impl Serialize, replace: bool) -> Result<()> {
+    write_json_atomic_with_limit(path, value, replace, MAX_STATE_FILE_BYTES)
+}
+
+fn write_json_atomic_with_limit(
+    path: &Path,
+    value: &impl Serialize,
+    replace: bool,
+    max_bytes: usize,
+) -> Result<()> {
     let mut payload = serde_json::to_vec(value).context("state serialization failed")?;
     payload.push(b'\n');
-    write_state_atomic(path, &payload, replace)
+    write_state_atomic_with_limit(path, &payload, replace, max_bytes)
 }
 
 fn write_state_atomic(path: &Path, payload: &[u8], replace: bool) -> Result<()> {
+    write_state_atomic_with_limit(path, payload, replace, MAX_STATE_FILE_BYTES)
+}
+
+fn write_state_atomic_with_limit(
+    path: &Path,
+    payload: &[u8],
+    replace: bool,
+    max_bytes: usize,
+) -> Result<()> {
     ensure!(
-        !payload.is_empty() && payload.len() <= MAX_STATE_FILE_BYTES,
+        !payload.is_empty() && payload.len() <= max_bytes,
         "serialized state exceeds the supported limit"
     );
     let parent = path
@@ -4140,15 +5430,6 @@ fn sync_directory(path: &Path) -> Result<()> {
 struct LeaseLock(File);
 
 impl LeaseLock {
-    fn acquire(directory: &Path) -> Result<Self> {
-        Self::acquire_until(
-            directory,
-            Instant::now()
-                .checked_add(LOCK_WAIT)
-                .unwrap_or_else(Instant::now),
-        )
-    }
-
     fn acquire_until(directory: &Path, transaction_deadline: Instant) -> Result<Self> {
         ensure_deadline(transaction_deadline)?;
         let path = directory.join("lease.lock");
@@ -4314,6 +5595,12 @@ fn git_output_os(
     command
         .arg("-c")
         .arg("core.fsmonitor=false")
+        .arg("-c")
+        .arg("core.trustctime=true")
+        .arg("-c")
+        .arg("core.checkStat=default")
+        .arg("-c")
+        .arg("core.fileMode=true")
         .arg("-C")
         .arg(cwd)
         .args(args)
@@ -4427,6 +5714,139 @@ fn output_with_aggregate_limit(
     )
 }
 
+struct SpawnedOutputChild {
+    child: Child,
+    supervised: bool,
+    cleanup_proof: Option<std::os::unix::net::UnixStream>,
+    fallback_owner: Option<ProcessOwner>,
+}
+
+fn spawn_output_child(command: &mut Command, deadline: Instant) -> Result<SpawnedOutputChild> {
+    let is_snapshot_worker = command.get_envs().any(|(name, value)| {
+        name == OsStr::new(SNAPSHOT_WORKER_ENV) && value == Some(OsStr::new("1"))
+    });
+    if is_snapshot_worker {
+        return command
+            .spawn()
+            .map(|child| SpawnedOutputChild {
+                child,
+                supervised: false,
+                cleanup_proof: None,
+                fallback_owner: None,
+            })
+            .context("Git command could not be started");
+    }
+    let running_git_cli = env::var_os(SNAPSHOT_WORKER_ENV).as_deref() == Some(OsStr::new("1"))
+        || env::current_exe().is_ok_and(|path| path.file_name() == Some(OsStr::new("git-cli")));
+    if !running_git_cli {
+        return command
+            .spawn()
+            .map(|child| SpawnedOutputChild {
+                child,
+                supervised: false,
+                cleanup_proof: None,
+                fallback_owner: None,
+            })
+            .context("Git command could not be started");
+    }
+
+    let executable = snapshot_worker_executable()?;
+    spawn_supervisor_output_child(command, &executable, deadline)
+}
+
+fn spawn_supervisor_output_child(
+    command: &mut Command,
+    executable: &SnapshotWorkerExecutable,
+    deadline: Instant,
+) -> Result<SpawnedOutputChild> {
+    let program = command.get_program().to_os_string();
+    let arguments: Vec<OsString> = command.get_args().map(OsString::from).collect();
+    let environment: Vec<(OsString, Option<OsString>)> = command
+        .get_envs()
+        .map(|(name, value)| (name.to_os_string(), value.map(OsString::from)))
+        .collect();
+    let current_dir = command.get_current_dir().map(PathBuf::from);
+    executable.revalidate()?;
+    let deadline_nanos = monotonic_deadline_nanos(deadline)?;
+    let (mut capability_sender, capability_receiver) =
+        std::os::unix::net::UnixStream::pair().context("process supervisor capability failed")?;
+    let capability_descriptor = capability_receiver.as_raw_fd();
+    let descriptor_flags = unsafe { libc::fcntl(capability_descriptor, libc::F_GETFD) };
+    if descriptor_flags < 0
+        || unsafe {
+            libc::fcntl(
+                capability_descriptor,
+                libc::F_SETFD,
+                descriptor_flags & !libc::FD_CLOEXEC,
+            )
+        } < 0
+    {
+        return Err(process_scan_resource_error());
+    }
+    let mut supervisor = Command::new(executable.command_path());
+    supervisor
+        .arg(program)
+        .args(arguments)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .process_group(0);
+    if let Some(current_dir) = current_dir {
+        supervisor.current_dir(current_dir);
+    }
+    for (name, value) in environment {
+        match value {
+            Some(value) => {
+                supervisor.env(name, value);
+            }
+            None => {
+                supervisor.env_remove(name);
+            }
+        }
+    }
+    supervisor.env(PROCESS_SUPERVISOR_ENV, "1").env(
+        PROCESS_SUPERVISOR_CAPABILITY_FD_ENV,
+        capability_descriptor.to_string(),
+    );
+    let mut child = supervisor
+        .spawn()
+        .context("Git command could not be started")?;
+    let fallback_owner = match ProcessOwner::for_root(child.id() as libc::pid_t) {
+        Ok(owner) => owner,
+        Err(error) => {
+            unsafe {
+                let _ = libc::kill(-(child.id() as libc::pid_t), libc::SIGKILL);
+            }
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(error);
+        }
+    };
+    drop(capability_receiver);
+    if let Err(error) = capability_sender.write_all(PROCESS_SUPERVISOR_CAPABILITY) {
+        unsafe {
+            let _ = libc::kill(-(child.id() as libc::pid_t), libc::SIGKILL);
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(error).context("process supervisor capability could not be delivered");
+    }
+    if let Err(error) = capability_sender.write_all(&deadline_nanos.to_be_bytes()) {
+        unsafe {
+            let _ = libc::kill(-(child.id() as libc::pid_t), libc::SIGKILL);
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(error).context("process supervisor deadline could not be delivered");
+    }
+    Ok(SpawnedOutputChild {
+        child,
+        supervised: true,
+        cleanup_proof: Some(capability_sender),
+        fallback_owner: Some(fallback_owner),
+    })
+}
+
 fn output_with_aggregate_limit_until(
     command: &mut Command,
     deadline: Instant,
@@ -4435,12 +5855,32 @@ fn output_with_aggregate_limit_until(
     aggregate_limit: usize,
 ) -> Result<std::process::Output> {
     ensure_deadline(deadline)?;
-    let mut child = command
-        .spawn()
-        .context("Git command could not be started")?;
+    let child = spawn_output_child(command, deadline)?;
+    collect_output_child_until(child, deadline, stdout_limit, stderr_limit, aggregate_limit)
+}
+
+fn collect_output_child_until(
+    spawned: SpawnedOutputChild,
+    deadline: Instant,
+    stdout_limit: usize,
+    stderr_limit: usize,
+    aggregate_limit: usize,
+) -> Result<std::process::Output> {
+    let SpawnedOutputChild {
+        mut child,
+        supervised,
+        mut cleanup_proof,
+        mut fallback_owner,
+    } = spawned;
     let process_group = child.id() as libc::pid_t;
     if Instant::now() >= deadline {
-        terminate_child(&mut child, process_group);
+        terminate_child(
+            &mut child,
+            process_group,
+            supervised,
+            &mut cleanup_proof,
+            &mut fallback_owner,
+        );
         return Err(domain_error(
             DirtyCheckoutErrorKind::Timeout,
             "Git command exceeded the supported time limit",
@@ -4451,7 +5891,13 @@ fn output_with_aggregate_limit_until(
     if let Err(error) =
         set_nonblocking(stdout.as_raw_fd()).and_then(|()| set_nonblocking(stderr.as_raw_fd()))
     {
-        terminate_child(&mut child, process_group);
+        terminate_child(
+            &mut child,
+            process_group,
+            supervised,
+            &mut cleanup_proof,
+            &mut fallback_owner,
+        );
         return Err(domain_error(
             DirtyCheckoutErrorKind::ResourceUnavailable,
             format!("Git output pipes could not be made nonblocking: {error}"),
@@ -4463,11 +5909,44 @@ fn output_with_aggregate_limit_until(
     let mut stdout_eof = false;
     let mut stderr_eof = false;
     loop {
+        if let Some(owner) = &mut fallback_owner
+            && let Err(error) = owner.identities(deadline)
+        {
+            terminate_child(
+                &mut child,
+                process_group,
+                supervised,
+                &mut cleanup_proof,
+                &mut fallback_owner,
+            );
+            return Err(error);
+        }
         if stdout_eof && stderr_eof {
             match child.try_wait() {
                 Ok(Some(status)) => {
-                    unsafe {
-                        let _ = libc::kill(-process_group, libc::SIGKILL);
+                    if supervised {
+                        let completion = cleanup_proof
+                            .as_mut()
+                            .ok_or_else(process_scan_resource_error)
+                            .and_then(read_process_supervisor_completion);
+                        let valid_target = completion.is_ok_and(|completion| {
+                            completion.kind == ProcessSupervisorCompletionKind::Target
+                                && completion.cleanup_complete
+                                && status.code() == Some(completion.exit_code)
+                        });
+                        if !valid_target {
+                            terminate_child(
+                                &mut child,
+                                process_group,
+                                supervised,
+                                &mut cleanup_proof,
+                                &mut fallback_owner,
+                            );
+                            return Err(domain_error(
+                                DirtyCheckoutErrorKind::ResourceUnavailable,
+                                "process supervisor completion could not be authenticated",
+                            ));
+                        }
                     }
                     return Ok(std::process::Output {
                         status,
@@ -4477,7 +5956,13 @@ fn output_with_aggregate_limit_until(
                 }
                 Ok(None) => {}
                 Err(error) => {
-                    terminate_child(&mut child, process_group);
+                    terminate_child(
+                        &mut child,
+                        process_group,
+                        supervised,
+                        &mut cleanup_proof,
+                        &mut fallback_owner,
+                    );
                     return Err(error).context("Git command status failed");
                 }
             }
@@ -4485,7 +5970,13 @@ fn output_with_aggregate_limit_until(
 
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
-            terminate_child(&mut child, process_group);
+            terminate_child(
+                &mut child,
+                process_group,
+                supervised,
+                &mut cleanup_proof,
+                &mut fallback_owner,
+            );
             return Err(domain_error(
                 DirtyCheckoutErrorKind::Timeout,
                 "Git command exceeded the supported time limit",
@@ -4521,7 +6012,13 @@ fn output_with_aggregate_limit_until(
             if error.kind() == io::ErrorKind::Interrupted {
                 continue;
             }
-            terminate_child(&mut child, process_group);
+            terminate_child(
+                &mut child,
+                process_group,
+                supervised,
+                &mut cleanup_proof,
+                &mut fallback_owner,
+            );
             return Err(error).context("Git output polling failed");
         }
 
@@ -4535,7 +6032,13 @@ fn output_with_aggregate_limit_until(
             ) {
                 Ok(eof) => stdout_eof = eof,
                 Err(error) => {
-                    terminate_child(&mut child, process_group);
+                    terminate_child(
+                        &mut child,
+                        process_group,
+                        supervised,
+                        &mut cleanup_proof,
+                        &mut fallback_owner,
+                    );
                     return Err(error);
                 }
             }
@@ -4550,7 +6053,13 @@ fn output_with_aggregate_limit_until(
             ) {
                 Ok(eof) => stderr_eof = eof,
                 Err(error) => {
-                    terminate_child(&mut child, process_group);
+                    terminate_child(
+                        &mut child,
+                        process_group,
+                        supervised,
+                        &mut cleanup_proof,
+                        &mut fallback_owner,
+                    );
                     return Err(error);
                 }
             }
@@ -4603,135 +6112,1521 @@ fn drain_nonblocking<R: Read>(
     }
 }
 
-fn terminate_child(child: &mut Child, process_group: libc::pid_t) {
-    unsafe {
-        let _ = libc::kill(-process_group, libc::SIGSTOP);
-    }
-    terminate_descendants_with(
-        process_group,
-        descendant_pids,
-        |pid, signal| unsafe { libc::kill(pid, signal) == 0 },
-        || {
-            unsafe {
-                let _ = libc::kill(-process_group, libc::SIGKILL);
-            }
-            let _ = child.kill();
-            let reap_deadline = Instant::now()
-                .checked_add(Duration::from_millis(250))
-                .unwrap_or_else(Instant::now);
-            loop {
-                match child.try_wait() {
-                    Ok(Some(_)) | Err(_) => break,
-                    Ok(None) if Instant::now() < reap_deadline => {
-                        std::thread::sleep(Duration::from_millis(5));
-                    }
-                    Ok(None) => break,
-                }
-            }
-        },
-    );
+const PROCESS_CLEANUP_TIMEOUT: Duration = Duration::from_millis(250);
+const PROCESS_SCAN_LIMITS: ProcessScanLimits = ProcessScanLimits {
+    process_entries: 32_768,
+    metadata_bytes: 32 * 1024 * 1024,
+    descendants: 4_096,
+};
+const MAX_PROCESS_CLEANUP_GENERATIONS: usize = PROCESS_SCAN_LIMITS.descendants;
+const MAX_PROC_STAT_BYTES: usize = 4 * 1024;
+const MAX_PROC_CHILDREN_BYTES: usize = 64 * 1024;
+
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+struct ProcessIdentity {
+    pid: libc::pid_t,
+    generation: u128,
 }
 
-fn terminate_descendants_with<D, S, B>(
-    process_group: libc::pid_t,
-    mut discover: D,
-    mut signal: S,
-    between_kill_passes: B,
-) where
-    D: FnMut(libc::pid_t) -> Vec<libc::pid_t>,
-    S: FnMut(libc::pid_t, libc::c_int) -> bool,
-    B: FnOnce(),
+#[derive(Clone, Copy, Debug)]
+struct ProcessRecord {
+    identity: ProcessIdentity,
+    parent: libc::pid_t,
+    #[cfg(test)]
+    metadata_bytes: usize,
+}
+
+impl ProcessRecord {
+    fn new(pid: libc::pid_t, parent: libc::pid_t, generation: u128, metadata_bytes: usize) -> Self {
+        #[cfg(not(test))]
+        let _ = metadata_bytes;
+        Self {
+            identity: ProcessIdentity { pid, generation },
+            parent,
+            #[cfg(test)]
+            metadata_bytes,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ProcessScanLimits {
+    process_entries: usize,
+    metadata_bytes: usize,
+    descendants: usize,
+}
+
+#[derive(Debug)]
+struct ProcessScan {
+    identities: Vec<ProcessIdentity>,
+    #[cfg(test)]
+    edge_visits: usize,
+}
+
+fn process_scan_resource_error() -> anyhow::Error {
+    domain_error(
+        DirtyCheckoutErrorKind::ResourceUnavailable,
+        "process cleanup exceeds the supported resource limit",
+    )
+}
+
+#[cfg(test)]
+fn collect_descendant_processes_with<F>(
+    root: libc::pid_t,
+    deadline: Instant,
+    limits: ProcessScanLimits,
+    read_records: F,
+) -> Result<ProcessScan>
+where
+    F: FnOnce(Instant) -> Result<Vec<ProcessRecord>>,
 {
-    let mut attempted = HashSet::new();
-    let mut stopped = Vec::new();
-    for _ in 0..4 {
-        let mut added = false;
-        for pid in discover(process_group) {
-            if attempted.insert(pid) {
-                added = true;
-                if signal(pid, libc::SIGSTOP) {
-                    stopped.push(pid);
+    ensure_deadline(deadline)?;
+    let records = read_records(deadline)?;
+    ensure_deadline(deadline)?;
+    if records.len() > limits.process_entries {
+        return Err(process_scan_resource_error());
+    }
+
+    let mut metadata_bytes = 0_usize;
+    let mut children: std::collections::HashMap<libc::pid_t, Vec<ProcessIdentity>> =
+        std::collections::HashMap::new();
+    for record in records {
+        ensure_deadline(deadline)?;
+        metadata_bytes = metadata_bytes
+            .checked_add(record.metadata_bytes)
+            .ok_or_else(process_scan_resource_error)?;
+        if metadata_bytes > limits.metadata_bytes {
+            return Err(process_scan_resource_error());
+        }
+        children
+            .entry(record.parent)
+            .or_default()
+            .push(record.identity);
+    }
+
+    let mut identities = Vec::new();
+    let mut seen = HashSet::new();
+    let mut frontier = vec![root];
+    let mut edge_visits = 0_usize;
+    while let Some(parent) = frontier.pop() {
+        ensure_deadline(deadline)?;
+        let Some(direct) = children.get(&parent) else {
+            continue;
+        };
+        for identity in direct {
+            edge_visits = edge_visits
+                .checked_add(1)
+                .ok_or_else(process_scan_resource_error)?;
+            if seen.insert(*identity) {
+                if identities.len() >= limits.descendants {
+                    return Err(process_scan_resource_error());
                 }
+                identities.push(*identity);
+                frontier.push(identity.pid);
             }
         }
-        if !added {
-            break;
-        }
     }
-    for pid in stopped {
-        let _ = signal(pid, libc::SIGKILL);
-    }
-    between_kill_passes();
+    Ok(ProcessScan {
+        identities,
+        #[cfg(test)]
+        edge_visits,
+    })
 }
 
 #[cfg(target_os = "linux")]
-fn descendant_pids(root: libc::pid_t) -> Vec<libc::pid_t> {
-    let mut parents = std::collections::HashMap::new();
-    let Ok(entries) = fs::read_dir("/proc") else {
-        return Vec::new();
+fn pin_process_identity_result_with<H, O, V>(
+    identity: ProcessIdentity,
+    open: O,
+    current_identity: V,
+) -> Result<Option<H>>
+where
+    O: FnOnce(libc::pid_t) -> io::Result<H>,
+    V: FnOnce(libc::pid_t) -> Result<Option<ProcessIdentity>>,
+{
+    let handle = match open(identity.pid) {
+        Ok(handle) => handle,
+        Err(error) if error.raw_os_error() == Some(libc::ESRCH) => return Ok(None),
+        Err(_) => return Err(process_scan_resource_error()),
     };
-    for entry in entries.flatten() {
-        let Some(pid) = entry
+    Ok((current_identity(identity.pid)? == Some(identity)).then_some(handle))
+}
+
+#[cfg(target_os = "linux")]
+fn parse_linux_process_record(bytes: &[u8]) -> Option<ProcessRecord> {
+    let open = bytes.iter().position(|byte| *byte == b' ')?;
+    let close = bytes.iter().rposition(|byte| *byte == b')')?;
+    let pid = std::str::from_utf8(bytes.get(..open)?)
+        .ok()?
+        .parse::<libc::pid_t>()
+        .ok()?;
+    let mut fields = bytes
+        .get(close + 1..)?
+        .split(|byte| byte.is_ascii_whitespace())
+        .filter(|field| !field.is_empty());
+    let parent = std::str::from_utf8(fields.nth(1)?)
+        .ok()?
+        .parse::<libc::pid_t>()
+        .ok()?;
+    let generation = std::str::from_utf8(fields.nth(17)?)
+        .ok()?
+        .parse::<u128>()
+        .ok()?;
+    Some(ProcessRecord::new(pid, parent, generation, bytes.len()))
+}
+
+#[cfg(target_os = "linux")]
+fn read_linux_metadata(path: &Path, byte_limit: usize) -> Result<Option<Vec<u8>>> {
+    let file = match OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+        .open(path)
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => return Err(process_scan_resource_error()),
+    };
+    let mut bytes = Vec::with_capacity(256.min(byte_limit));
+    file.take((byte_limit + 1) as u64)
+        .read_to_end(&mut bytes)
+        .map_err(|_| process_scan_resource_error())?;
+    if bytes.len() > byte_limit {
+        return Err(process_scan_resource_error());
+    }
+    Ok(Some(bytes))
+}
+
+#[cfg(target_os = "linux")]
+fn charge_process_scan(counter: &mut usize, amount: usize, limit: usize) -> Result<()> {
+    *counter = counter
+        .checked_add(amount)
+        .ok_or_else(process_scan_resource_error)?;
+    if *counter > limit {
+        return Err(process_scan_resource_error());
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn read_linux_process_record_at(
+    proc_root: &Path,
+    pid: libc::pid_t,
+    deadline: Instant,
+    metadata_bytes: &mut usize,
+    limits: ProcessScanLimits,
+) -> Result<Option<ProcessRecord>> {
+    ensure_deadline(deadline)?;
+    let Some(bytes) = read_linux_metadata(
+        &proc_root.join(pid.to_string()).join("stat"),
+        MAX_PROC_STAT_BYTES,
+    )?
+    else {
+        return Ok(None);
+    };
+    charge_process_scan(metadata_bytes, bytes.len(), limits.metadata_bytes)?;
+    Ok(parse_linux_process_record(&bytes).filter(|record| record.identity.pid == pid))
+}
+
+#[cfg(target_os = "linux")]
+fn linux_process_identity_matches_at(
+    proc_root: &Path,
+    expected: ProcessIdentity,
+    deadline: Instant,
+    metadata_bytes: &mut usize,
+    limits: ProcessScanLimits,
+) -> Result<bool> {
+    Ok(
+        read_linux_process_record_at(proc_root, expected.pid, deadline, metadata_bytes, limits)?
+            .is_some_and(|record| record.identity == expected),
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn visit_linux_child_identities_at<F>(
+    proc_root: &Path,
+    parent: ProcessIdentity,
+    deadline: Instant,
+    process_entries: &mut usize,
+    metadata_bytes: &mut usize,
+    limits: ProcessScanLimits,
+    mut visit: F,
+) -> Result<()>
+where
+    F: FnMut(ProcessIdentity) -> Result<()>,
+{
+    ensure_deadline(deadline)?;
+    if !linux_process_identity_matches_at(proc_root, parent, deadline, metadata_bytes, limits)? {
+        return Ok(());
+    }
+    let task_path = proc_root.join(parent.pid.to_string()).join("task");
+    let tasks = match fs::read_dir(task_path) {
+        Ok(tasks) => tasks,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(_) => return Err(process_scan_resource_error()),
+    };
+    for task in tasks {
+        ensure_deadline(deadline)?;
+        let Ok(task) = task else {
+            continue;
+        };
+        if task
             .file_name()
             .to_str()
             .and_then(|value| value.parse::<libc::pid_t>().ok())
+            .is_none()
+        {
+            continue;
+        }
+        if !linux_process_identity_matches_at(proc_root, parent, deadline, metadata_bytes, limits)?
+        {
+            return Ok(());
+        }
+        charge_process_scan(process_entries, 1, limits.process_entries)?;
+        let Some(bytes) =
+            read_linux_metadata(&task.path().join("children"), MAX_PROC_CHILDREN_BYTES)?
         else {
             continue;
         };
-        let Ok(status) = fs::read_to_string(entry.path().join("status")) else {
-            continue;
-        };
-        let Some(parent) = status.lines().find_map(|line| {
-            line.strip_prefix("PPid:")
-                .and_then(|value| value.trim().parse::<libc::pid_t>().ok())
-        }) else {
-            continue;
-        };
-        parents.insert(pid, parent);
+        charge_process_scan(metadata_bytes, bytes.len(), limits.metadata_bytes)?;
+        if !linux_process_identity_matches_at(proc_root, parent, deadline, metadata_bytes, limits)?
+        {
+            return Ok(());
+        }
+        let child_pids = bytes
+            .split(|byte| byte.is_ascii_whitespace())
+            .filter(|field| !field.is_empty())
+            .map(|field| {
+                ensure_deadline(deadline)?;
+                let pid = std::str::from_utf8(field)
+                    .ok()
+                    .and_then(|field| field.parse::<libc::pid_t>().ok())
+                    .ok_or_else(process_scan_resource_error)?;
+                charge_process_scan(process_entries, 1, limits.process_entries)?;
+                Ok(pid)
+            });
+        visit_identity_bound_children_with(
+            parent,
+            child_pids,
+            |pid| read_linux_process_record_at(proc_root, pid, deadline, metadata_bytes, limits),
+            &mut visit,
+        )?;
     }
-    let mut descendants = Vec::new();
-    let mut frontier = vec![root];
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn descendant_processes_at<F>(
+    proc_root: &Path,
+    root: libc::pid_t,
+    deadline: Instant,
+    limits: ProcessScanLimits,
+    mut observe: F,
+) -> Result<ProcessScan>
+where
+    F: FnMut(ProcessIdentity),
+{
+    ensure_deadline(deadline)?;
+    let mut identities = Vec::new();
+    let mut seen = HashSet::new();
+    let mut process_entries = 0_usize;
+    let mut metadata_bytes = 0_usize;
+    let mut edge_visits = 0_usize;
+    let Some(root_identity) =
+        read_linux_process_record_at(proc_root, root, deadline, &mut metadata_bytes, limits)?
+            .map(|record| record.identity)
+    else {
+        return Ok(ProcessScan {
+            identities,
+            #[cfg(test)]
+            edge_visits,
+        });
+    };
+    let mut frontier = vec![root_identity];
     while let Some(parent) = frontier.pop() {
-        for (&pid, &candidate_parent) in &parents {
-            if candidate_parent == parent && !descendants.contains(&pid) {
-                descendants.push(pid);
-                frontier.push(pid);
+        ensure_deadline(deadline)?;
+        visit_linux_child_identities_at(
+            proc_root,
+            parent,
+            deadline,
+            &mut process_entries,
+            &mut metadata_bytes,
+            limits,
+            |identity| {
+                ensure_deadline(deadline)?;
+                edge_visits = edge_visits
+                    .checked_add(1)
+                    .ok_or_else(process_scan_resource_error)?;
+                if !seen.insert(identity) {
+                    return Ok(());
+                }
+                if identities.len() >= limits.descendants {
+                    return Err(process_scan_resource_error());
+                }
+                observe(identity);
+                identities.push(identity);
+                frontier.push(identity);
+                Ok(())
+            },
+        )?;
+    }
+    Ok(ProcessScan {
+        identities,
+        #[cfg(test)]
+        edge_visits,
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn descendant_processes_with<F>(
+    root: libc::pid_t,
+    deadline: Instant,
+    observe: F,
+) -> Result<ProcessScan>
+where
+    F: FnMut(ProcessIdentity),
+{
+    descendant_processes_at(
+        Path::new("/proc"),
+        root,
+        deadline,
+        PROCESS_SCAN_LIMITS,
+        observe,
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn process_identity(pid: libc::pid_t) -> Result<Option<ProcessIdentity>> {
+    let Some(bytes) = read_linux_metadata(
+        &Path::new("/proc").join(pid.to_string()).join("stat"),
+        MAX_PROC_STAT_BYTES,
+    )?
+    else {
+        return Ok(None);
+    };
+    let record = parse_linux_process_record(&bytes).ok_or_else(process_scan_resource_error)?;
+    if record.identity.pid != pid {
+        return Err(process_scan_resource_error());
+    }
+    Ok(Some(record.identity))
+}
+
+#[cfg(target_os = "linux")]
+struct PinnedProcess {
+    pidfd: File,
+}
+
+#[cfg(target_os = "linux")]
+fn pin_process(identity: ProcessIdentity) -> Result<Option<PinnedProcess>> {
+    use std::os::fd::FromRawFd;
+
+    pin_process_identity_result_with(
+        identity,
+        |pid| {
+            let pidfd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0_u32) };
+            if pidfd < 0 {
+                return Err(io::Error::last_os_error());
             }
+            Ok(unsafe { File::from_raw_fd(pidfd as libc::c_int) })
+        },
+        process_identity,
+    )
+    .map(|pinned| pinned.map(|pidfd| PinnedProcess { pidfd }))
+}
+
+#[cfg(target_os = "linux")]
+fn signal_pinned_process_result_with<F>(send: F) -> Result<bool>
+where
+    F: FnOnce() -> io::Result<()>,
+{
+    match send() {
+        Ok(()) => Ok(true),
+        Err(error) if error.raw_os_error() == Some(libc::ESRCH) => Ok(false),
+        Err(_) => Err(process_scan_resource_error()),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn signal_pinned_process(process: &PinnedProcess, signal: libc::c_int) -> Result<bool> {
+    signal_pinned_process_result_with(|| {
+        let status = unsafe {
+            libc::syscall(
+                libc::SYS_pidfd_send_signal,
+                process.pidfd.as_raw_fd(),
+                signal,
+                std::ptr::null::<libc::siginfo_t>(),
+                0_u32,
+            )
+        };
+        if status == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
+        }
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn wait_pinned_process_until(process: &PinnedProcess, deadline: Instant) -> Result<()> {
+    loop {
+        ensure_deadline(deadline)?;
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let timeout_millis = remaining.as_millis().min(libc::c_int::MAX as u128) as libc::c_int;
+        let mut descriptor = libc::pollfd {
+            fd: process.pidfd.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let status = unsafe { libc::poll(&mut descriptor, 1, timeout_millis) };
+        if status > 0 {
+            if descriptor.revents & libc::POLLIN != 0 {
+                return Ok(());
+            }
+            return Err(process_scan_resource_error());
+        }
+        if status == 0 {
+            continue;
+        }
+        if io::Error::last_os_error().kind() != io::ErrorKind::Interrupted {
+            return Err(process_scan_resource_error());
         }
     }
-    descendants
+}
+
+#[cfg(any(test, target_os = "linux", target_os = "macos"))]
+fn visit_identity_bound_children_with<I, R, F>(
+    parent: ProcessIdentity,
+    children: I,
+    mut read_record: R,
+    mut visit: F,
+) -> Result<()>
+where
+    I: IntoIterator<Item = Result<libc::pid_t>>,
+    R: FnMut(libc::pid_t) -> Result<Option<ProcessRecord>>,
+    F: FnMut(ProcessIdentity) -> Result<()>,
+{
+    for child in children {
+        if read_record(parent.pid)?.map(|record| record.identity) != Some(parent) {
+            return Ok(());
+        }
+        let pid = child?;
+        let Some(record) = read_record(pid)? else {
+            continue;
+        };
+        if record.parent != parent.pid {
+            continue;
+        }
+        if read_record(parent.pid)?.map(|record| record.identity) != Some(parent) {
+            return Ok(());
+        }
+        visit(record.identity)?;
+    }
+    Ok(())
 }
 
 #[cfg(target_os = "macos")]
-fn descendant_pids(root: libc::pid_t) -> Vec<libc::pid_t> {
-    let mut descendants = Vec::new();
-    let mut frontier = vec![root];
+fn macos_process_record(pid: libc::pid_t) -> Result<Option<ProcessRecord>> {
+    let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::zeroed();
+    let size = std::mem::size_of::<libc::proc_bsdinfo>();
+    unsafe {
+        *libc::__error() = 0;
+    }
+    let read = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            info.as_mut_ptr().cast(),
+            size as libc::c_int,
+        )
+    };
+    if read == size as libc::c_int {
+        let info = unsafe { info.assume_init() };
+        return Ok((info.pbi_pid == pid as u32).then(|| {
+            ProcessRecord::new(
+                pid,
+                info.pbi_ppid as libc::pid_t,
+                ((info.pbi_start_tvsec as u128) << 64) | info.pbi_start_tvusec as u128,
+                size,
+            )
+        }));
+    }
+    let error = io::Error::last_os_error();
+    if read == 0 && error.raw_os_error() == Some(libc::ESRCH) {
+        Ok(None)
+    } else {
+        Err(process_scan_resource_error())
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn process_identity(pid: libc::pid_t) -> Result<Option<ProcessIdentity>> {
+    Ok(macos_process_record(pid)?.map(|record| record.identity))
+}
+
+#[cfg(target_os = "macos")]
+unsafe extern "C" {
+    fn task_suspend(target_task: libc::mach_port_t) -> libc::kern_return_t;
+    fn task_resume(target_task: libc::mach_port_t) -> libc::kern_return_t;
+    fn mach_port_deallocate(
+        task: libc::mach_port_t,
+        name: libc::mach_port_t,
+    ) -> libc::kern_return_t;
+}
+
+#[cfg(target_os = "macos")]
+struct MachTaskPort(libc::mach_port_t);
+
+#[cfg(target_os = "macos")]
+impl Drop for MachTaskPort {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = mach_port_deallocate(libc::mach_task_self(), self.0);
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+struct PinnedProcess {
+    identity: ProcessIdentity,
+    task: MachTaskPort,
+}
+
+#[cfg(target_os = "macos")]
+fn pin_process(identity: ProcessIdentity) -> Result<Option<PinnedProcess>> {
+    let mut task = 0;
+    let status = unsafe { libc::task_for_pid(libc::mach_task_self(), identity.pid, &mut task) };
+    if status != libc::KERN_SUCCESS {
+        return match process_identity(identity.pid)? {
+            None => Ok(None),
+            Some(_) => Err(process_scan_resource_error()),
+        };
+    }
+    let task = MachTaskPort(task);
+    if process_identity(identity.pid)? != Some(identity) {
+        return Ok(None);
+    }
+    Ok(Some(PinnedProcess { identity, task }))
+}
+
+#[cfg(target_os = "macos")]
+fn signal_pinned_process(process: &PinnedProcess, signal: libc::c_int) -> Result<bool> {
+    let status = match signal {
+        libc::SIGSTOP => unsafe { task_suspend(process.task.0) },
+        libc::SIGCONT => unsafe { task_resume(process.task.0) },
+        libc::SIGKILL => unsafe { libc::task_terminate(process.task.0) },
+        _ => return Err(process_scan_resource_error()),
+    };
+    if status == libc::KERN_SUCCESS {
+        return Ok(true);
+    }
+    if process_identity(process.identity.pid)? != Some(process.identity) {
+        Ok(false)
+    } else {
+        Err(process_scan_resource_error())
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn wait_pinned_process_until(process: &PinnedProcess, deadline: Instant) -> Result<()> {
+    loop {
+        if process_identity(process.identity.pid)? != Some(process.identity) {
+            return Ok(());
+        }
+        ensure_deadline(deadline)?;
+        std::thread::sleep(
+            deadline
+                .saturating_duration_since(Instant::now())
+                .min(Duration::from_millis(2)),
+        );
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn descendant_processes_with<F>(
+    root: libc::pid_t,
+    deadline: Instant,
+    mut observe: F,
+) -> Result<ProcessScan>
+where
+    F: FnMut(ProcessIdentity),
+{
+    let mut identities = Vec::new();
+    let mut seen = HashSet::new();
+    let mut edge_visits = 0_usize;
+    let Some(root_identity) = process_identity(root)? else {
+        return Ok(ProcessScan {
+            identities,
+            #[cfg(test)]
+            edge_visits,
+        });
+    };
+    let mut frontier = vec![root_identity];
+    let mut children = vec![0 as libc::pid_t; PROCESS_SCAN_LIMITS.descendants + 1];
     while let Some(parent) = frontier.pop() {
-        let mut children = vec![0 as libc::pid_t; 1024];
+        ensure_deadline(deadline)?;
+        if process_identity(parent.pid)? != Some(parent) {
+            continue;
+        }
+        unsafe {
+            *libc::__error() = 0;
+        }
         let count = unsafe {
             libc::proc_listchildpids(
-                parent,
+                parent.pid,
                 children.as_mut_ptr().cast(),
                 std::mem::size_of_val(children.as_slice()) as libc::c_int,
             )
         };
-        if count <= 0 {
+        if count < 0 {
+            let error = io::Error::last_os_error();
+            if error.raw_os_error() == Some(libc::ESRCH) {
+                continue;
+            }
+            return Err(process_scan_resource_error());
+        }
+        if process_identity(parent.pid)? != Some(parent) {
             continue;
         }
-        children.truncate((count as usize).min(children.len()));
-        for pid in children {
-            if pid > 0 && !descendants.contains(&pid) {
-                descendants.push(pid);
-                frontier.push(pid);
+        if count == 0 {
+            continue;
+        }
+        let count = count as usize;
+        if count > PROCESS_SCAN_LIMITS.descendants {
+            return Err(process_scan_resource_error());
+        }
+        visit_identity_bound_children_with(
+            parent,
+            children.iter().take(count).copied().map(Ok),
+            |pid| {
+                ensure_deadline(deadline)?;
+                if pid != parent.pid {
+                    edge_visits = edge_visits
+                        .checked_add(1)
+                        .ok_or_else(process_scan_resource_error)?;
+                }
+                macos_process_record(pid)
+            },
+            |identity| {
+                if seen.insert(identity) {
+                    if identities.len() >= PROCESS_SCAN_LIMITS.descendants {
+                        return Err(process_scan_resource_error());
+                    }
+                    observe(identity);
+                    identities.push(identity);
+                    frontier.push(identity);
+                }
+                Ok(())
+            },
+        )?;
+    }
+    Ok(ProcessScan {
+        identities,
+        #[cfg(test)]
+        edge_visits,
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn descendant_processes(root: libc::pid_t, deadline: Instant) -> Result<ProcessScan> {
+    descendant_processes_with(root, deadline, |_| {})
+}
+
+#[cfg(target_os = "linux")]
+fn probe_pidfd_support() -> Result<()> {
+    use std::os::fd::FromRawFd;
+
+    let descriptor = unsafe { libc::syscall(libc::SYS_pidfd_open, libc::getpid(), 0_u32) };
+    if descriptor < 0 {
+        return Err(process_scan_resource_error());
+    }
+    let pidfd = unsafe { File::from_raw_fd(descriptor as libc::c_int) };
+    let status = unsafe {
+        libc::syscall(
+            libc::SYS_pidfd_send_signal,
+            pidfd.as_raw_fd(),
+            0,
+            std::ptr::null::<libc::siginfo_t>(),
+            0_u32,
+        )
+    };
+    if status != 0 {
+        return Err(process_scan_resource_error());
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+struct ProcessOwner {
+    root: ProcessIdentity,
+    reap_adopted: bool,
+    known: HashSet<ProcessIdentity>,
+}
+
+#[cfg(target_os = "linux")]
+impl ProcessOwner {
+    fn new() -> Result<Self> {
+        let root = unsafe { libc::getpid() };
+        Self::with_root(root, true)
+    }
+
+    fn for_root(root: libc::pid_t) -> Result<Self> {
+        Self::with_root(root, false)
+    }
+
+    fn with_root(root: libc::pid_t, reap_adopted: bool) -> Result<Self> {
+        probe_pidfd_support()?;
+        if reap_adopted && unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) } != 0 {
+            return Err(process_scan_resource_error());
+        }
+        let root = process_identity(root)?.ok_or_else(process_scan_resource_error)?;
+        Ok(Self {
+            root,
+            reap_adopted,
+            known: HashSet::new(),
+        })
+    }
+
+    fn refresh(&mut self, deadline: Instant) -> Result<()> {
+        ensure_deadline(deadline)
+    }
+
+    fn identities(&mut self, deadline: Instant) -> Result<Vec<ProcessIdentity>> {
+        if process_identity(self.root.pid)? != Some(self.root) {
+            return Ok(Vec::new());
+        }
+        let known = &mut self.known;
+        let mut generation_limit_exceeded = false;
+        let scan = descendant_processes_at(
+            Path::new("/proc"),
+            self.root.pid,
+            deadline,
+            PROCESS_SCAN_LIMITS,
+            |identity| {
+                if known.contains(&identity) {
+                    return;
+                }
+                if known.len() >= MAX_PROCESS_CLEANUP_GENERATIONS {
+                    generation_limit_exceeded = true;
+                    return;
+                }
+                known.insert(identity);
+            },
+        )?;
+        if generation_limit_exceeded {
+            return Err(process_scan_resource_error());
+        }
+        Ok(scan.identities)
+    }
+
+    fn known_identities(&self) -> Vec<ProcessIdentity> {
+        self.known.iter().copied().collect()
+    }
+
+    fn reap_adopted_children(&self) -> bool {
+        self.reap_adopted
+    }
+}
+
+#[cfg(any(test, target_os = "macos"))]
+#[derive(Clone, Copy, Debug)]
+enum MacosProcessEvent {
+    Child { pid: libc::pid_t },
+    Exit { pid: libc::pid_t },
+    Drained,
+}
+
+#[cfg(any(test, target_os = "macos"))]
+fn reduce_macos_process_event_with<R>(
+    _root: ProcessIdentity,
+    tracked: &mut HashMap<libc::pid_t, ProcessIdentity>,
+    pending: &mut HashMap<libc::pid_t, ProcessIdentity>,
+    event: MacosProcessEvent,
+    mut read_record: R,
+) -> Result<()>
+where
+    R: FnMut(libc::pid_t) -> Result<Option<ProcessRecord>>,
+{
+    match event {
+        MacosProcessEvent::Child { pid } => {
+            let Some(record) = read_record(pid)? else {
+                return Ok(());
+            };
+            let distinct_pending = pending
+                .keys()
+                .filter(|pending_pid| !tracked.contains_key(pending_pid))
+                .count();
+            if !tracked.contains_key(&pid)
+                && !pending.contains_key(&pid)
+                && tracked.len().saturating_add(distinct_pending) >= MAX_PROCESS_CLEANUP_GENERATIONS
+            {
+                return Err(process_scan_resource_error());
+            }
+            pending.insert(pid, record.identity);
+        }
+        MacosProcessEvent::Exit { pid } => {
+            pending.remove(&pid);
+            if read_record(pid)?.is_none() {
+                tracked.remove(&pid);
+            }
+        }
+        MacosProcessEvent::Drained => {
+            let candidates: Vec<_> = pending
+                .iter()
+                .map(|(pid, identity)| (*pid, *identity))
+                .collect();
+            for (pid, identity) in candidates {
+                let current = read_record(pid)?;
+                pending.remove(&pid);
+                if current.map(|record| record.identity) == Some(identity) {
+                    tracked.insert(pid, identity);
+                }
             }
         }
     }
-    descendants
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+struct ProcessOwner {
+    root: ProcessIdentity,
+    queue: File,
+    tracked: HashMap<libc::pid_t, ProcessIdentity>,
+    pending: HashMap<libc::pid_t, ProcessIdentity>,
+}
+
+#[cfg(target_os = "macos")]
+impl ProcessOwner {
+    fn new() -> Result<Self> {
+        Self::for_root(unsafe { libc::getpid() })
+    }
+
+    fn for_root(root_pid: libc::pid_t) -> Result<Self> {
+        use std::os::fd::FromRawFd;
+
+        let descriptor = unsafe { libc::kqueue() };
+        if descriptor < 0 {
+            return Err(process_scan_resource_error());
+        }
+        let queue = unsafe { File::from_raw_fd(descriptor) };
+        let root = process_identity(root_pid)?.ok_or_else(process_scan_resource_error)?;
+        let change = libc::kevent {
+            ident: root_pid as libc::uintptr_t,
+            filter: libc::EVFILT_PROC,
+            flags: libc::EV_ADD | libc::EV_ENABLE | libc::EV_CLEAR,
+            fflags: libc::NOTE_TRACK | libc::NOTE_FORK | libc::NOTE_EXIT,
+            data: 0,
+            udata: std::ptr::null_mut(),
+        };
+        let changed = unsafe {
+            libc::kevent(
+                queue.as_raw_fd(),
+                &change,
+                1,
+                std::ptr::null_mut(),
+                0,
+                std::ptr::null(),
+            )
+        };
+        if changed < 0 {
+            return Err(process_scan_resource_error());
+        }
+        Ok(Self {
+            root,
+            queue,
+            tracked: HashMap::new(),
+            pending: HashMap::new(),
+        })
+    }
+
+    fn refresh(&mut self, deadline: Instant) -> Result<()> {
+        let timeout = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        loop {
+            ensure_deadline(deadline)?;
+            let mut events: [libc::kevent; 64] = unsafe { std::mem::zeroed() };
+            let count = unsafe {
+                libc::kevent(
+                    self.queue.as_raw_fd(),
+                    std::ptr::null(),
+                    0,
+                    events.as_mut_ptr(),
+                    events.len() as libc::c_int,
+                    &timeout,
+                )
+            };
+            if count < 0 {
+                let error = io::Error::last_os_error();
+                if error.kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(process_scan_resource_error());
+            }
+            if count == 0 {
+                reduce_macos_process_event_with(
+                    self.root,
+                    &mut self.tracked,
+                    &mut self.pending,
+                    MacosProcessEvent::Drained,
+                    |pid| {
+                        ensure_deadline(deadline)?;
+                        macos_process_record(pid)
+                    },
+                )?;
+                return Ok(());
+            }
+            for event in &events[..count as usize] {
+                ensure_deadline(deadline)?;
+                let flags = unsafe { std::ptr::addr_of!(event.fflags).read_unaligned() };
+                let pid =
+                    unsafe { std::ptr::addr_of!(event.ident).read_unaligned() as libc::pid_t };
+                if flags & libc::NOTE_TRACKERR != 0 {
+                    return Err(process_scan_resource_error());
+                }
+                if flags & libc::NOTE_CHILD != 0 {
+                    reduce_macos_process_event_with(
+                        self.root,
+                        &mut self.tracked,
+                        &mut self.pending,
+                        MacosProcessEvent::Child { pid },
+                        macos_process_record,
+                    )?;
+                }
+                if flags & libc::NOTE_EXIT != 0 {
+                    reduce_macos_process_event_with(
+                        self.root,
+                        &mut self.tracked,
+                        &mut self.pending,
+                        MacosProcessEvent::Exit { pid },
+                        macos_process_record,
+                    )?;
+                }
+            }
+        }
+    }
+
+    fn identities(&mut self, deadline: Instant) -> Result<Vec<ProcessIdentity>> {
+        self.refresh(deadline)?;
+        let mut identities = HashSet::new();
+        let mut stale = Vec::new();
+        for identity in self.tracked.values().copied() {
+            ensure_deadline(deadline)?;
+            if process_identity(identity.pid)? == Some(identity) {
+                identities.insert(identity);
+            } else {
+                stale.push(identity);
+            }
+        }
+        for identity in stale {
+            if self.tracked.get(&identity.pid) == Some(&identity) {
+                self.tracked.remove(&identity.pid);
+            }
+        }
+        identities.extend(descendant_processes(self.root.pid, deadline)?.identities);
+        if identities.len() > PROCESS_SCAN_LIMITS.descendants {
+            return Err(process_scan_resource_error());
+        }
+        for identity in identities.iter().copied() {
+            self.tracked.insert(identity.pid, identity);
+        }
+        Ok(identities.into_iter().collect())
+    }
+
+    fn known_identities(&self) -> Vec<ProcessIdentity> {
+        self.tracked
+            .values()
+            .chain(self.pending.values())
+            .copied()
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect()
+    }
+
+    fn reap_adopted_children(&self) -> bool {
+        false
+    }
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-fn descendant_pids(_root: libc::pid_t) -> Vec<libc::pid_t> {
-    Vec::new()
+struct ProcessOwner {
+    root: libc::pid_t,
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+impl ProcessOwner {
+    fn new() -> Result<Self> {
+        Self::for_root(unsafe { libc::getpid() })
+    }
+
+    fn for_root(root: libc::pid_t) -> Result<Self> {
+        Ok(Self { root })
+    }
+
+    fn refresh(&mut self, deadline: Instant) -> Result<()> {
+        ensure_deadline(deadline)
+    }
+
+    fn identities(&mut self, deadline: Instant) -> Result<Vec<ProcessIdentity>> {
+        Ok(descendant_processes(self.root, deadline)?.identities)
+    }
+
+    fn known_identities(&self) -> Vec<ProcessIdentity> {
+        Vec::new()
+    }
+
+    fn reap_adopted_children(&self) -> bool {
+        false
+    }
+}
+
+trait OwnedProcessTracker {
+    fn refresh(&mut self, deadline: Instant) -> Result<()> {
+        ensure_deadline(deadline)
+    }
+    fn identities(&mut self, deadline: Instant) -> Result<Vec<ProcessIdentity>>;
+    fn known_identities(&self) -> Vec<ProcessIdentity>;
+    fn reap_adopted_children(&self) -> bool {
+        false
+    }
+}
+
+impl OwnedProcessTracker for ProcessOwner {
+    fn refresh(&mut self, deadline: Instant) -> Result<()> {
+        ProcessOwner::refresh(self, deadline)
+    }
+
+    fn identities(&mut self, deadline: Instant) -> Result<Vec<ProcessIdentity>> {
+        ProcessOwner::identities(self, deadline)
+    }
+
+    fn known_identities(&self) -> Vec<ProcessIdentity> {
+        ProcessOwner::known_identities(self)
+    }
+
+    fn reap_adopted_children(&self) -> bool {
+        ProcessOwner::reap_adopted_children(self)
+    }
+}
+
+trait OwnedProcessControl {
+    type Pinned;
+
+    fn pin(&mut self, identity: ProcessIdentity) -> Result<Option<Self::Pinned>>;
+    fn signal(&mut self, process: &Self::Pinned, signal: libc::c_int) -> Result<bool>;
+    fn wait_for_exit(&mut self, _process: &Self::Pinned, _deadline: Instant) -> Result<()> {
+        Ok(())
+    }
+}
+
+struct SystemProcessControl;
+
+impl OwnedProcessControl for SystemProcessControl {
+    type Pinned = PinnedProcess;
+
+    fn pin(&mut self, identity: ProcessIdentity) -> Result<Option<Self::Pinned>> {
+        pin_process(identity)
+    }
+
+    fn signal(&mut self, process: &Self::Pinned, signal: libc::c_int) -> Result<bool> {
+        signal_pinned_process(process, signal)
+    }
+
+    fn wait_for_exit(&mut self, process: &Self::Pinned, deadline: Instant) -> Result<()> {
+        wait_pinned_process_until(process, deadline)
+    }
+}
+
+fn terminate_owned_identity_until_with<C>(
+    control: &mut C,
+    identity: ProcessIdentity,
+    deadline: Instant,
+) -> Result<()>
+where
+    C: OwnedProcessControl,
+{
+    ensure_deadline(deadline)?;
+    let Some(process) = control.pin(identity)? else {
+        return Ok(());
+    };
+    ensure_deadline(deadline)?;
+    if !control.signal(&process, libc::SIGSTOP)? {
+        return Ok(());
+    }
+    if let Err(error) = ensure_deadline(deadline) {
+        return match control.signal(&process, libc::SIGCONT) {
+            Ok(_) => Err(error),
+            Err(resume_error) => Err(resume_error),
+        };
+    }
+    if let Err(error) = control.signal(&process, libc::SIGKILL) {
+        return match control.signal(&process, libc::SIGCONT) {
+            Ok(_) => Err(error),
+            Err(resume_error) => Err(resume_error),
+        };
+    }
+    control.wait_for_exit(&process, deadline)
+}
+
+fn terminate_owned_processes<T: OwnedProcessTracker>(
+    owner: &mut T,
+    child: &mut Child,
+) -> Result<()> {
+    let deadline = Instant::now()
+        .checked_add(PROCESS_CLEANUP_TIMEOUT)
+        .unwrap_or_else(Instant::now);
+    terminate_owned_processes_until(owner, child, deadline)
+}
+
+fn terminate_owned_processes_until<T: OwnedProcessTracker>(
+    owner: &mut T,
+    child: &mut Child,
+    deadline: Instant,
+) -> Result<()> {
+    terminate_owned_processes_until_with(owner, child, deadline, &mut SystemProcessControl)
+}
+
+fn terminate_owned_processes_until_with<T, C>(
+    owner: &mut T,
+    child: &mut Child,
+    deadline: Instant,
+    control: &mut C,
+) -> Result<()>
+where
+    T: OwnedProcessTracker,
+    C: OwnedProcessControl,
+{
+    let mut attempted = HashSet::new();
+    let mut containment_error = None;
+    if let Err(error) = owner.refresh(deadline) {
+        containment_error.get_or_insert(error);
+    }
+    if let Err(error) = child.kill()
+        && error.kind() != io::ErrorKind::InvalidInput
+    {
+        containment_error.get_or_insert_with(process_scan_resource_error);
+    }
+    'discovery: loop {
+        if let Err(error) = ensure_deadline(deadline) {
+            containment_error.get_or_insert(error);
+            break;
+        }
+        let mut identities = match owner.identities(deadline) {
+            Ok(identities) => identities,
+            Err(error) => {
+                containment_error.get_or_insert(error);
+                Vec::new()
+            }
+        };
+        identities.extend(owner.known_identities());
+        let mut added = false;
+        for identity in identities {
+            if let Err(error) = ensure_deadline(deadline) {
+                containment_error.get_or_insert(error);
+                break 'discovery;
+            }
+            if attempted.contains(&identity) {
+                continue;
+            }
+            if attempted.len() >= MAX_PROCESS_CLEANUP_GENERATIONS {
+                containment_error.get_or_insert_with(process_scan_resource_error);
+                break 'discovery;
+            }
+            attempted.insert(identity);
+            added = true;
+            if let Err(error) = terminate_owned_identity_until_with(control, identity, deadline) {
+                containment_error.get_or_insert(error);
+            }
+            if let Err(error) = ensure_deadline(deadline) {
+                containment_error.get_or_insert(error);
+                break 'discovery;
+            }
+        }
+        if containment_error.is_some() || !added {
+            break;
+        }
+    }
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            Ok(None) => {
+                containment_error.get_or_insert_with(|| {
+                    domain_error(
+                        DirtyCheckoutErrorKind::Timeout,
+                        "process cleanup exceeded its deadline",
+                    )
+                });
+                break;
+            }
+            Err(_) => {
+                containment_error.get_or_insert_with(process_scan_resource_error);
+                break;
+            }
+        }
+    }
+    if owner.reap_adopted_children() {
+        loop {
+            if Instant::now() >= deadline {
+                containment_error.get_or_insert_with(|| {
+                    domain_error(
+                        DirtyCheckoutErrorKind::Timeout,
+                        "process cleanup exceeded its deadline",
+                    )
+                });
+                break;
+            }
+            let reaped = unsafe { libc::waitpid(-1, std::ptr::null_mut(), libc::WNOHANG) };
+            if reaped > 0 {
+                continue;
+            }
+            if reaped < 0 {
+                let error = io::Error::last_os_error();
+                if error.kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                if error.raw_os_error() != Some(libc::ECHILD) {
+                    containment_error.get_or_insert_with(process_scan_resource_error);
+                }
+                break;
+            }
+            if Instant::now() >= deadline {
+                containment_error.get_or_insert_with(|| {
+                    domain_error(
+                        DirtyCheckoutErrorKind::Timeout,
+                        "process cleanup exceeded its deadline",
+                    )
+                });
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+    if let Some(error) = containment_error {
+        Err(error)
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+struct PinnedProcess;
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn pin_process(_identity: ProcessIdentity) -> Result<Option<PinnedProcess>> {
+    Ok(None)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn signal_pinned_process(_process: &PinnedProcess, _signal: libc::c_int) -> Result<bool> {
+    Ok(false)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn wait_pinned_process_until(_process: &PinnedProcess, _deadline: Instant) -> Result<()> {
+    Ok(())
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn descendant_processes_with<F>(
+    _root: libc::pid_t,
+    _deadline: Instant,
+    _observe: F,
+) -> Result<ProcessScan>
+where
+    F: FnMut(ProcessIdentity),
+{
+    Ok(ProcessScan {
+        identities: Vec::new(),
+        #[cfg(test)]
+        edge_visits: 0,
+    })
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn descendant_processes(root: libc::pid_t, deadline: Instant) -> Result<ProcessScan> {
+    descendant_processes_with(root, deadline, |_| {})
+}
+
+fn read_supervisor_cleanup_proof_with<R: Read>(reader: &mut R) -> bool {
+    read_process_supervisor_completion(reader).is_ok_and(|completion| {
+        completion.cleanup_complete
+            && completion.kind != ProcessSupervisorCompletionKind::InternalFailure
+    })
+}
+
+fn signal_cleanup_leader_with<F>(pid: libc::pid_t, supervised: bool, mut send: F) -> io::Result<()>
+where
+    F: FnMut(libc::pid_t, libc::c_int) -> io::Result<()>,
+{
+    if supervised {
+        send(pid, libc::SIGTERM)
+    } else {
+        send(-pid, libc::SIGSTOP)
+    }
+}
+
+fn signal_cleanup_leader(pid: libc::pid_t, supervised: bool) -> io::Result<()> {
+    signal_cleanup_leader_with(pid, supervised, |target, signal| {
+        if unsafe { libc::kill(target, signal) } == 0 {
+            return Ok(());
+        }
+        let error = io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::ESRCH) {
+            Ok(())
+        } else {
+            Err(error)
+        }
+    })
+}
+
+fn should_use_unpinned_cleanup_signals(supervised: bool, leader_reaped: bool) -> bool {
+    !supervised || !leader_reaped
+}
+
+#[cfg(test)]
+thread_local! {
+    static UNPINNED_CLEANUP_SIGNAL_ATTEMPTS: std::cell::Cell<usize> = const {
+        std::cell::Cell::new(0)
+    };
+}
+
+#[cfg(test)]
+fn record_unpinned_cleanup_signal_attempt() {
+    UNPINNED_CLEANUP_SIGNAL_ATTEMPTS.with(|attempts| attempts.set(attempts.get() + 1));
+}
+
+#[cfg(test)]
+fn reset_unpinned_cleanup_signal_attempts() {
+    UNPINNED_CLEANUP_SIGNAL_ATTEMPTS.with(|attempts| attempts.set(0));
+}
+
+#[cfg(test)]
+fn unpinned_cleanup_signal_attempts() -> usize {
+    UNPINNED_CLEANUP_SIGNAL_ATTEMPTS.with(std::cell::Cell::get)
+}
+
+fn terminate_child(
+    child: &mut Child,
+    process_group: libc::pid_t,
+    supervised: bool,
+    cleanup_proof: &mut Option<std::os::unix::net::UnixStream>,
+    fallback_owner: &mut Option<ProcessOwner>,
+) {
+    let cleanup_started = Instant::now();
+    let supervisor_grace = PROCESS_CLEANUP_TIMEOUT
+        .checked_add(Duration::from_millis(25))
+        .unwrap_or(PROCESS_CLEANUP_TIMEOUT);
+    let cleanup_timeout = if supervised {
+        supervisor_grace
+            .checked_add(PROCESS_CLEANUP_TIMEOUT)
+            .unwrap_or(supervisor_grace)
+    } else {
+        PROCESS_CLEANUP_TIMEOUT
+    };
+    let cleanup_deadline = cleanup_started
+        .checked_add(cleanup_timeout)
+        .unwrap_or(cleanup_started);
+    let mut leader_reaped = child.try_wait().is_ok_and(|status| status.is_some());
+    if should_use_unpinned_cleanup_signals(supervised, leader_reaped) {
+        #[cfg(test)]
+        record_unpinned_cleanup_signal_attempt();
+        let _ = signal_cleanup_leader(process_group, supervised);
+    }
+
+    if supervised {
+        if leader_reaped
+            && cleanup_proof
+                .as_mut()
+                .is_some_and(read_supervisor_cleanup_proof_with)
+        {
+            return;
+        }
+        let supervisor_deadline = cleanup_started
+            .checked_add(supervisor_grace)
+            .unwrap_or(cleanup_started)
+            .min(cleanup_deadline);
+        loop {
+            match child.try_wait() {
+                Ok(Some(_)) => {
+                    leader_reaped = true;
+                    if cleanup_proof
+                        .as_mut()
+                        .is_some_and(read_supervisor_cleanup_proof_with)
+                    {
+                        return;
+                    }
+                    break;
+                }
+                Ok(None) if Instant::now() < supervisor_deadline => {
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+                Ok(None) | Err(_) => break,
+            }
+        }
+        if should_use_unpinned_cleanup_signals(supervised, leader_reaped) {
+            #[cfg(test)]
+            record_unpinned_cleanup_signal_attempt();
+            unsafe {
+                let _ = libc::kill(-process_group, libc::SIGSTOP);
+            }
+        }
+    }
+
+    if let Some(owner) = fallback_owner {
+        let _ = terminate_owned_processes_until(owner, child, cleanup_deadline);
+    }
+
+    if !supervised {
+        let mut known = HashSet::new();
+        let mut pending = VecDeque::new();
+        let mut control = SystemProcessControl;
+        while Instant::now() < cleanup_deadline {
+            let mut added = false;
+            let mut generation_limit_exceeded = false;
+            let scan_result =
+                descendant_processes_with(process_group, cleanup_deadline, |identity| {
+                    if known.contains(&identity) {
+                        return;
+                    }
+                    if known.len() >= MAX_PROCESS_CLEANUP_GENERATIONS {
+                        generation_limit_exceeded = true;
+                        return;
+                    }
+                    known.insert(identity);
+                    pending.push_back(identity);
+                    added = true;
+                });
+            while let Some(identity) = pending.pop_front() {
+                if Instant::now() >= cleanup_deadline {
+                    break;
+                }
+                let _ =
+                    terminate_owned_identity_until_with(&mut control, identity, cleanup_deadline);
+            }
+            if scan_result.is_err() || generation_limit_exceeded || !added {
+                break;
+            }
+        }
+        #[cfg(test)]
+        record_unpinned_cleanup_signal_attempt();
+        unsafe {
+            if libc::kill(-process_group, libc::SIGKILL) != 0 {
+                let _ = libc::kill(-process_group, libc::SIGCONT);
+            }
+        }
+    }
+    let _ = child.kill();
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) | Err(_) => break,
+            Ok(None) if Instant::now() < cleanup_deadline => {
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            Ok(None) => break,
+        }
+    }
 }
 
 pub(super) fn run_dirty_snapshot(args: &[String]) -> i32 {
@@ -4935,6 +7830,10 @@ fn redact_adopt_parse_error(error: CliError) -> CliError {
 }
 
 fn parse_revoke_args(raw: &[String]) -> std::result::Result<Option<RevokeArgs>, CliError> {
+    parse_revoke_args_inner(raw).map_err(redact_revoke_parse_error)
+}
+
+fn parse_revoke_args_inner(raw: &[String]) -> std::result::Result<Option<RevokeArgs>, CliError> {
     let mut args = raw.to_vec();
     let format = take_format(&mut args)?;
     if args
@@ -4985,6 +7884,14 @@ fn parse_revoke_args(raw: &[String]) -> std::result::Result<Option<RevokeArgs>, 
     }))
 }
 
+fn redact_revoke_parse_error(error: CliError) -> CliError {
+    let message = match error.code {
+        "missing-format" | "invalid-format" => "--format requires text or json",
+        _ => "invalid revoke-dirty arguments",
+    };
+    CliError::usage(error.code, message)
+}
+
 fn adoption_cli_error(error: anyhow::Error) -> CliError {
     if let Some(domain) = error.downcast_ref::<DirtyCheckoutError>() {
         return if domain.kind.exit_code() == exit::RUNTIME {
@@ -4997,10 +7904,7 @@ fn adoption_cli_error(error: anyhow::Error) -> CliError {
 }
 
 fn feature_enabled() -> bool {
-    matches!(
-        env::var("AGENT_RUNTIME_DIRTY_CHECKOUT_ADOPTION").as_deref(),
-        Ok("1" | "true" | "TRUE" | "yes" | "YES")
-    )
+    env::var_os("AGENT_RUNTIME_DIRTY_CHECKOUT_ADOPTION").as_deref() == Some(OsStr::new("1"))
 }
 
 fn resolve_state_root() -> Result<PathBuf> {
@@ -5036,6 +7940,797 @@ mod tests {
             }))
             .expect("serialize worker response"),
             stderr: Vec::new(),
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    struct SupervisorFixture {
+        child: Child,
+        completion_channel: Option<std::os::unix::net::UnixStream>,
+        reaped: bool,
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    impl SupervisorFixture {
+        fn id(&self) -> u32 {
+            self.child.id()
+        }
+
+        fn abandon_owner(&mut self) {
+            drop(self.completion_channel.take());
+        }
+
+        fn try_wait(&mut self) -> io::Result<Option<std::process::ExitStatus>> {
+            let status = self.child.try_wait()?;
+            if status.is_some() {
+                self.reaped = true;
+            }
+            Ok(status)
+        }
+
+        fn wait(&mut self) -> io::Result<std::process::ExitStatus> {
+            let status = self.child.wait()?;
+            self.reaped = true;
+            Ok(status)
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    impl Drop for SupervisorFixture {
+        fn drop(&mut self) {
+            if self.reaped {
+                return;
+            }
+            unsafe {
+                libc::kill(-(self.child.id() as libc::pid_t), libc::SIGKILL);
+            }
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn pin_published_process_with<C: OwnedProcessControl>(
+        control: &mut C,
+        identity: ProcessIdentity,
+    ) -> Result<Option<C::Pinned>> {
+        control.pin(identity)
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn signal_published_process_with<C: OwnedProcessControl>(
+        control: &mut C,
+        process: &C::Pinned,
+    ) -> Result<()> {
+        control.signal(process, libc::SIGKILL).map(|_| ())
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    struct PublishedPidCleanup(Option<PinnedProcess>);
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    impl PublishedPidCleanup {
+        fn new(identity: ProcessIdentity) -> Self {
+            let mut control = SystemProcessControl;
+            let process = pin_published_process_with(&mut control, identity)
+                .ok()
+                .flatten();
+            Self(process)
+        }
+
+        #[cfg(target_os = "linux")]
+        fn process(&self) -> Option<&PinnedProcess> {
+            self.0.as_ref()
+        }
+
+        fn terminate_and_wait(&mut self) -> Result<()> {
+            let Some(process) = &self.0 else {
+                return Ok(());
+            };
+            let mut control = SystemProcessControl;
+            signal_published_process_with(&mut control, process)?;
+            wait_pinned_process_until(process, Instant::now() + Duration::from_secs(1))?;
+            self.0 = None;
+            Ok(())
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    impl Drop for PublishedPidCleanup {
+        fn drop(&mut self) {
+            let _ = self.terminate_and_wait();
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn fixture_monotonic_deadline(timeout: Duration) -> u64 {
+        let mut now = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        assert_eq!(
+            unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut now) },
+            0,
+            "read fixture monotonic clock"
+        );
+        let now = u64::try_from(now.tv_sec)
+            .expect("nonnegative monotonic seconds")
+            .checked_mul(1_000_000_000)
+            .and_then(|value| value.checked_add(u64::try_from(now.tv_nsec).ok()?))
+            .expect("bounded monotonic clock");
+        now.checked_add(u64::try_from(timeout.as_nanos()).expect("bounded fixture timeout"))
+            .expect("bounded fixture deadline")
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn spawn_authenticated_supervisor_fixture(
+        scenario: &str,
+        pid_path: &Path,
+    ) -> SupervisorFixture {
+        spawn_authenticated_supervisor_fixture_with_timeout(
+            scenario,
+            pid_path,
+            Duration::from_secs(5),
+        )
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn spawn_authenticated_supervisor_fixture_with_timeout(
+        scenario: &str,
+        pid_path: &Path,
+        timeout: Duration,
+    ) -> SupervisorFixture {
+        spawn_authenticated_supervisor_fixture_with_timeout_and_delay(
+            scenario,
+            pid_path,
+            timeout,
+            Duration::ZERO,
+        )
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn spawn_authenticated_supervisor_fixture_with_timeout_and_delay(
+        scenario: &str,
+        pid_path: &Path,
+        timeout: Duration,
+        capability_delay: Duration,
+    ) -> SupervisorFixture {
+        use std::os::unix::net::UnixStream;
+
+        let deadline_nanos = fixture_monotonic_deadline(timeout);
+        let (mut sender, receiver) = UnixStream::pair().expect("fixture capability socket");
+        let descriptor = receiver.as_raw_fd();
+        let flags = unsafe { libc::fcntl(descriptor, libc::F_GETFD) };
+        assert!(flags >= 0, "read fixture descriptor flags");
+        assert!(
+            unsafe { libc::fcntl(descriptor, libc::F_SETFD, flags & !libc::FD_CLOEXEC) } >= 0,
+            "make fixture descriptor inheritable"
+        );
+        let child = Command::new(env::current_exe().expect("current test executable"))
+            .arg("authenticated_process_supervisor_test_fixture")
+            .arg("--nocapture")
+            .env(PROCESS_SUPERVISOR_ENV, "1")
+            .env(PROCESS_SUPERVISOR_CAPABILITY_FD_ENV, descriptor.to_string())
+            .env("NILS_PROCESS_SUPERVISOR_TEST_SCENARIO", scenario)
+            .env("NILS_PROCESS_SUPERVISOR_TEST_PID_PATH", pid_path)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .process_group(0)
+            .spawn()
+            .expect("spawn authenticated supervisor fixture");
+        let mut child = child;
+        drop(receiver);
+        std::thread::sleep(capability_delay);
+        if let Err(error) = sender.write_all(PROCESS_SUPERVISOR_CAPABILITY) {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("deliver fixture capability: {error}");
+        }
+        if let Err(error) = sender.write_all(&deadline_nanos.to_be_bytes()) {
+            unsafe {
+                let _ = libc::kill(-(child.id() as libc::pid_t), libc::SIGKILL);
+            }
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("deliver fixture deadline: {error}");
+        }
+        SupervisorFixture {
+            child,
+            completion_channel: Some(sender),
+            reaped: false,
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn spawn_authenticated_supervisor_output_fixture(
+        scenario: &str,
+        pid_path: &Path,
+    ) -> SpawnedOutputChild {
+        use std::os::unix::net::UnixStream;
+
+        let (mut sender, receiver) = UnixStream::pair().expect("fixture capability socket");
+        let descriptor = receiver.as_raw_fd();
+        let flags = unsafe { libc::fcntl(descriptor, libc::F_GETFD) };
+        assert!(flags >= 0, "read fixture descriptor flags");
+        assert!(
+            unsafe { libc::fcntl(descriptor, libc::F_SETFD, flags & !libc::FD_CLOEXEC) } >= 0,
+            "make fixture descriptor inheritable"
+        );
+        let mut child = Command::new(env::current_exe().expect("current test executable"))
+            .arg("authenticated_process_supervisor_test_fixture")
+            .arg("--nocapture")
+            .env(PROCESS_SUPERVISOR_ENV, "1")
+            .env(PROCESS_SUPERVISOR_CAPABILITY_FD_ENV, descriptor.to_string())
+            .env("NILS_PROCESS_SUPERVISOR_TEST_SCENARIO", scenario)
+            .env("NILS_PROCESS_SUPERVISOR_TEST_PID_PATH", pid_path)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .process_group(0)
+            .spawn()
+            .expect("spawn authenticated supervisor output fixture");
+        let fallback_owner = ProcessOwner::for_root(child.id() as libc::pid_t)
+            .expect("create scoped output fallback owner");
+        drop(receiver);
+        if let Err(error) = sender.write_all(PROCESS_SUPERVISOR_CAPABILITY) {
+            unsafe {
+                let _ = libc::kill(-(child.id() as libc::pid_t), libc::SIGKILL);
+            }
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("deliver output fixture capability: {error}");
+        }
+        if let Err(error) =
+            sender.write_all(&fixture_monotonic_deadline(Duration::from_secs(5)).to_be_bytes())
+        {
+            unsafe {
+                let _ = libc::kill(-(child.id() as libc::pid_t), libc::SIGKILL);
+            }
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("deliver output fixture deadline: {error}");
+        }
+        SpawnedOutputChild {
+            child,
+            supervised: true,
+            cleanup_proof: Some(sender),
+            fallback_owner: Some(fallback_owner),
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn run_process_supervisor_capability_fixture(
+        scenario: &str,
+        capability: Option<&[u8]>,
+    ) -> std::process::ExitStatus {
+        use std::os::unix::net::UnixStream;
+
+        let sockets = capability.map(|_| UnixStream::pair().expect("capability test socket"));
+        let mut command = Command::new(env::current_exe().expect("current test executable"));
+        command
+            .arg("process_supervisor_capability_validation_test_fixture")
+            .arg("--nocapture")
+            .env("NILS_PROCESS_SUPERVISOR_CAPABILITY_TEST", scenario)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .process_group(0);
+        if scenario == "malformed-fd" {
+            command.env(PROCESS_SUPERVISOR_CAPABILITY_FD_ENV, "not-a-descriptor");
+        }
+        if let Some((_, receiver)) = &sockets {
+            let descriptor = receiver.as_raw_fd();
+            let flags = unsafe { libc::fcntl(descriptor, libc::F_GETFD) };
+            assert!(flags >= 0, "read capability fixture descriptor flags");
+            assert!(
+                unsafe { libc::fcntl(descriptor, libc::F_SETFD, flags & !libc::FD_CLOEXEC) } >= 0,
+                "make capability fixture descriptor inheritable"
+            );
+            command.env(PROCESS_SUPERVISOR_CAPABILITY_FD_ENV, descriptor.to_string());
+        }
+        let mut child = command
+            .spawn()
+            .expect("spawn capability validation fixture");
+        if let (Some(bytes), Some((sender, receiver))) = (capability, sockets) {
+            drop(receiver);
+            (&sender)
+                .write_all(bytes)
+                .expect("deliver capability validation bytes");
+            (&sender)
+                .write_all(&fixture_monotonic_deadline(Duration::from_secs(1)).to_be_bytes())
+                .expect("deliver capability validation deadline");
+        }
+        child
+            .wait()
+            .expect("wait for capability validation fixture")
+    }
+
+    #[test]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn process_supervisor_capability_validation_test_fixture() {
+        let Some(scenario) = env::var_os("NILS_PROCESS_SUPERVISOR_CAPABILITY_TEST") else {
+            return;
+        };
+        let result = if scenario == OsStr::new("valid-untrusted-parent") {
+            validate_process_supervisor_capability_with(|| false)
+        } else {
+            validate_process_supervisor_capability()
+        };
+        if scenario == OsStr::new("valid") {
+            result.expect("trusted parent with the exact capability must authenticate");
+        } else {
+            result.expect_err("invalid supervisor capability boundary must fail closed");
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn process_supervisor_wrong_peer_sender_test_fixture() {
+        use std::os::unix::net::UnixStream;
+
+        let Some(socket_path) = env::var_os("NILS_PROCESS_SUPERVISOR_WRONG_PEER_SOCKET") else {
+            return;
+        };
+        let mut sender = UnixStream::connect(socket_path).expect("connect wrong-peer sender");
+        sender
+            .write_all(PROCESS_SUPERVISOR_CAPABILITY)
+            .expect("deliver wrong-peer capability");
+        sender
+            .write_all(&fixture_monotonic_deadline(Duration::from_secs(1)).to_be_bytes())
+            .expect("deliver wrong-peer deadline");
+    }
+
+    #[test]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn process_supervisor_capability_boundaries_are_independent_and_fail_closed() {
+        let mismatched = vec![b'x'; PROCESS_SUPERVISOR_CAPABILITY.len()];
+        for (scenario, capability) in [
+            ("missing-fd", None),
+            ("malformed-fd", None),
+            ("mismatched-capability", Some(mismatched.as_slice())),
+            (
+                "valid-untrusted-parent",
+                Some(PROCESS_SUPERVISOR_CAPABILITY),
+            ),
+            ("valid", Some(PROCESS_SUPERVISOR_CAPABILITY)),
+        ] {
+            let status = run_process_supervisor_capability_fixture(scenario, capability);
+            assert!(
+                status.success(),
+                "capability boundary fixture failed: {scenario}"
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn process_supervisor_rejects_capability_from_non_parent_peer() {
+        use std::os::unix::net::UnixListener;
+
+        let root = tempfile::TempDir::new().expect("wrong-peer capability root");
+        let socket_path = root.path().join("capability.sock");
+        let listener = UnixListener::bind(&socket_path).expect("bind wrong-peer capability socket");
+        let mut sender = Command::new(env::current_exe().expect("current test executable"))
+            .arg("process_supervisor_wrong_peer_sender_test_fixture")
+            .arg("--nocapture")
+            .env("NILS_PROCESS_SUPERVISOR_WRONG_PEER_SOCKET", &socket_path)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn wrong-peer capability sender");
+        let (receiver, _) = listener.accept().expect("accept wrong-peer capability");
+        let descriptor = receiver.as_raw_fd();
+        let flags = unsafe { libc::fcntl(descriptor, libc::F_GETFD) };
+        assert!(flags >= 0, "read wrong-peer descriptor flags");
+        assert!(
+            unsafe { libc::fcntl(descriptor, libc::F_SETFD, flags & !libc::FD_CLOEXEC) } >= 0,
+            "make wrong-peer descriptor inheritable"
+        );
+        let mut validator = Command::new(env::current_exe().expect("current test executable"))
+            .arg("process_supervisor_capability_validation_test_fixture")
+            .arg("--nocapture")
+            .env("NILS_PROCESS_SUPERVISOR_CAPABILITY_TEST", "wrong-peer")
+            .env(PROCESS_SUPERVISOR_CAPABILITY_FD_ENV, descriptor.to_string())
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .process_group(0)
+            .spawn()
+            .expect("spawn wrong-peer capability validator");
+        drop(receiver);
+
+        assert!(
+            validator
+                .wait()
+                .expect("wait for wrong-peer validator")
+                .success(),
+            "a non-parent peer must fail authentication"
+        );
+        assert!(
+            sender.wait().expect("wait for wrong-peer sender").success(),
+            "wrong-peer sender fixture failed"
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn process_supervisor_peer_credentials_reject_wrong_parent_or_user() {
+        let expected_parent = 42;
+        let expected_uid = 1_000;
+        let credentials = libc::ucred {
+            pid: expected_parent,
+            uid: expected_uid,
+            gid: 1_000,
+        };
+
+        assert!(linux_peer_credentials_match(
+            credentials,
+            expected_parent,
+            expected_uid
+        ));
+        assert!(!linux_peer_credentials_match(
+            libc::ucred {
+                pid: expected_parent + 1,
+                ..credentials
+            },
+            expected_parent,
+            expected_uid,
+        ));
+        assert!(!linux_peer_credentials_match(
+            libc::ucred {
+                uid: expected_uid + 1,
+                ..credentials
+            },
+            expected_parent,
+            expected_uid,
+        ));
+    }
+
+    #[test]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn authenticated_process_supervisor_test_fixture() {
+        let Some(scenario) = env::var_os("NILS_PROCESS_SUPERVISOR_TEST_SCENARIO") else {
+            return;
+        };
+        let authenticated =
+            validate_process_supervisor_capability().expect("authenticate fixture parent");
+        let program = if scenario == OsStr::new("internal-failure") {
+            PathBuf::from("/nils-supervisor-fixture/missing-target")
+        } else {
+            env::current_exe().expect("current test executable")
+        };
+        let arguments = vec![
+            OsString::from("process_supervisor_target_test_fixture"),
+            OsString::from("--nocapture"),
+        ];
+        let expected = match scenario.to_str() {
+            Some("successful-child") => exit::SUCCESS,
+            Some(
+                "blocked-child"
+                | "detached-double-fork"
+                | "escaped-output-timeout"
+                | "target-status-one",
+            ) => exit::RUNTIME,
+            Some("internal-failure" | "target-signal") => {
+                supervise_process_with_cleanup_proof(
+                    program.into_os_string(),
+                    &arguments,
+                    Some(authenticated.channel),
+                    authenticated.deadline,
+                )
+                .expect_err("fixture target launch must fail internally");
+                std::process::exit(exit::RUNTIME);
+            }
+            _ => panic!("unsupported supervisor fixture scenario"),
+        };
+        let status = supervise_process_with_cleanup_proof(
+            program.into_os_string(),
+            &arguments,
+            Some(authenticated.channel),
+            authenticated.deadline,
+        )
+        .expect("run supervisor fixture");
+        if scenario == OsStr::new("target-status-one") {
+            std::process::exit(status);
+        }
+        assert_eq!(status, expected);
+    }
+
+    #[test]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[allow(clippy::zombie_processes)] // The supervisor, not this short-lived fixture parent, owns reaping.
+    fn process_supervisor_target_test_fixture() {
+        let Some(scenario) = env::var_os("NILS_PROCESS_SUPERVISOR_TEST_SCENARIO") else {
+            return;
+        };
+        let pid_path =
+            env::var_os("NILS_PROCESS_SUPERVISOR_TEST_PID_PATH").expect("fixture pid path");
+        match scenario.to_str() {
+            Some("target-signal") => {
+                unsafe {
+                    libc::kill(libc::getpid(), libc::SIGKILL);
+                }
+                unreachable!("SIGKILL target survived");
+            }
+            Some("target-status-one") => std::process::exit(exit::RUNTIME),
+            Some("blocked-child") => {
+                fs::write(pid_path, unsafe { libc::getpid() }.to_string())
+                    .expect("publish blocked fixture PID");
+                loop {
+                    std::thread::park_timeout(Duration::from_secs(1));
+                }
+            }
+            Some("successful-child") => {
+                let mut child = Command::new(env::current_exe().expect("current test executable"))
+                    .arg("process_supervisor_leaf_test_fixture")
+                    .arg("--nocapture")
+                    .env("NILS_PROCESS_SUPERVISOR_LEAF", "1")
+                    .env("NILS_PROCESS_SUPERVISOR_TEST_PID_PATH", &pid_path)
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .spawn()
+                    .expect("spawn surviving fixture child");
+                let deadline = Instant::now() + Duration::from_secs(1);
+                while !Path::new(&pid_path).exists() {
+                    if Instant::now() >= deadline {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        panic!("surviving fixture child did not publish its PID");
+                    }
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+            }
+            Some(scenario @ ("detached-double-fork" | "escaped-output-timeout")) => {
+                let mut intermediate =
+                    Command::new(env::current_exe().expect("current test executable"));
+                intermediate
+                    .arg("process_supervisor_intermediate_test_fixture")
+                    .arg("--nocapture")
+                    .env("NILS_PROCESS_SUPERVISOR_INTERMEDIATE", "1")
+                    .env("NILS_PROCESS_SUPERVISOR_TEST_PID_PATH", &pid_path)
+                    .stdin(Stdio::null())
+                    .process_group(0);
+                if scenario == "escaped-output-timeout" {
+                    intermediate.env("NILS_PROCESS_SUPERVISOR_LEAF_INHERIT_OUTPUT", "1");
+                } else {
+                    intermediate.stdout(Stdio::null()).stderr(Stdio::null());
+                }
+                intermediate
+                    .spawn()
+                    .expect("spawn detached fixture intermediate");
+                while !Path::new(&pid_path).exists() {
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+                loop {
+                    std::thread::park_timeout(Duration::from_secs(1));
+                }
+            }
+            _ => panic!("unsupported target fixture scenario"),
+        }
+    }
+
+    #[test]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[allow(clippy::zombie_processes)] // Exiting here deliberately reparents the leaf to the supervisor.
+    fn process_supervisor_intermediate_test_fixture() {
+        if env::var_os("NILS_PROCESS_SUPERVISOR_INTERMEDIATE").as_deref() != Some(OsStr::new("1")) {
+            return;
+        }
+        let pid_path =
+            env::var_os("NILS_PROCESS_SUPERVISOR_TEST_PID_PATH").expect("fixture pid path");
+        let mut command = Command::new(env::current_exe().expect("current test executable"));
+        command
+            .arg("process_supervisor_leaf_test_fixture")
+            .arg("--nocapture")
+            .env("NILS_PROCESS_SUPERVISOR_LEAF", "1")
+            .env("NILS_PROCESS_SUPERVISOR_TEST_PID_PATH", pid_path)
+            .stdin(Stdio::null())
+            .process_group(0);
+        if env::var_os("NILS_PROCESS_SUPERVISOR_LEAF_INHERIT_OUTPUT").as_deref()
+            != Some(OsStr::new("1"))
+        {
+            command.stdout(Stdio::null()).stderr(Stdio::null());
+        }
+        command.spawn().expect("spawn detached fixture leaf");
+        if let Some(release_path) = env::var_os("NILS_PROCESS_SUPERVISOR_INTERMEDIATE_RELEASE_PATH")
+        {
+            while !Path::new(&release_path).exists() {
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        } else if let Some(delay) =
+            env::var_os("NILS_PROCESS_SUPERVISOR_INTERMEDIATE_EXIT_DELAY_MS")
+                .and_then(|value| value.to_str().and_then(|value| value.parse::<u64>().ok()))
+        {
+            std::thread::sleep(Duration::from_millis(delay));
+        }
+    }
+
+    #[test]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn process_supervisor_leaf_test_fixture() {
+        if env::var_os("NILS_PROCESS_SUPERVISOR_LEAF").as_deref() != Some(OsStr::new("1")) {
+            return;
+        }
+        let pid_path =
+            env::var_os("NILS_PROCESS_SUPERVISOR_TEST_PID_PATH").expect("fixture pid path");
+        fs::write(pid_path, unsafe { libc::getpid() }.to_string())
+            .expect("publish fixture leaf PID");
+        loop {
+            std::thread::park_timeout(Duration::from_secs(1));
+        }
+    }
+
+    #[test]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[allow(clippy::zombie_processes)] // The collector must own the escaped leaf after this leader exits.
+    fn output_cleanup_escaped_descendant_test_fixture() {
+        if env::var_os("NILS_OUTPUT_CLEANUP_ESCAPED_DESCENDANT").as_deref() != Some(OsStr::new("1"))
+        {
+            return;
+        }
+        let pid_path =
+            env::var_os("NILS_PROCESS_SUPERVISOR_TEST_PID_PATH").expect("fixture pid path");
+        let exit_after_publish = env::var_os("NILS_OUTPUT_CLEANUP_EXIT_AFTER_PUBLISH").as_deref()
+            == Some(OsStr::new("1"));
+        let hard_exit_after_publish = env::var_os("NILS_OUTPUT_CLEANUP_HARD_EXIT_AFTER_PUBLISH")
+            .as_deref()
+            == Some(OsStr::new("1"));
+        if let Some(start_path) = env::var_os("NILS_OUTPUT_CLEANUP_START_PATH") {
+            while !Path::new(&start_path).exists() {
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        }
+        let mut child = Command::new(env::current_exe().expect("current test executable"));
+        child
+            .arg("process_supervisor_intermediate_test_fixture")
+            .arg("--nocapture")
+            .env("NILS_PROCESS_SUPERVISOR_INTERMEDIATE", "1")
+            .env("NILS_PROCESS_SUPERVISOR_TEST_PID_PATH", &pid_path)
+            .stdin(Stdio::null())
+            .process_group(0);
+        if !exit_after_publish {
+            child.env("NILS_PROCESS_SUPERVISOR_LEAF_INHERIT_OUTPUT", "1");
+        } else {
+            child.stdout(Stdio::null()).stderr(Stdio::null());
+            if let Some(release_path) = env::var_os("NILS_OUTPUT_CLEANUP_RELEASE_PATH") {
+                child.env(
+                    "NILS_PROCESS_SUPERVISOR_INTERMEDIATE_RELEASE_PATH",
+                    release_path,
+                );
+            } else {
+                child.env("NILS_PROCESS_SUPERVISOR_INTERMEDIATE_EXIT_DELAY_MS", "500");
+            }
+        }
+        let mut child = child
+            .spawn()
+            .expect("spawn escaped output fixture intermediate");
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while !Path::new(&pid_path).exists() {
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("escaped output fixture leaf did not publish its PID");
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        child
+            .wait()
+            .expect("reap escaped output fixture intermediate");
+        if exit_after_publish {
+            std::thread::sleep(Duration::from_millis(100));
+            if hard_exit_after_publish {
+                unsafe { libc::_exit(exit::RUNTIME) };
+            }
+            return;
+        }
+        loop {
+            std::thread::park_timeout(Duration::from_secs(1));
+        }
+    }
+
+    #[test]
+    fn dirty_checkout_error_contract_exhaustively_freezes_codes_exits_and_json_envelopes() {
+        fn expected(kind: DirtyCheckoutErrorKind) -> (&'static str, i32) {
+            match kind {
+                DirtyCheckoutErrorKind::CleanCheckout => ("dirty-checkout-clean", exit::DATA),
+                DirtyCheckoutErrorKind::UnsupportedGitState => {
+                    ("dirty-checkout-unsupported-git-state", exit::DATA)
+                }
+                DirtyCheckoutErrorKind::ChallengeExpired => {
+                    ("dirty-checkout-challenge-expired", exit::DATA)
+                }
+                DirtyCheckoutErrorKind::ChallengeReused => {
+                    ("dirty-checkout-challenge-reused", exit::DATA)
+                }
+                DirtyCheckoutErrorKind::ChallengeDrift => {
+                    ("dirty-checkout-challenge-drift", exit::DATA)
+                }
+                DirtyCheckoutErrorKind::ForeignLease => {
+                    ("dirty-checkout-foreign-lease", exit::DATA)
+                }
+                DirtyCheckoutErrorKind::MalformedState => {
+                    ("dirty-checkout-malformed-state", exit::DATA)
+                }
+                DirtyCheckoutErrorKind::InvalidInput => {
+                    ("dirty-checkout-invalid-input", exit::DATA)
+                }
+                DirtyCheckoutErrorKind::Timeout => ("dirty-checkout-timeout", exit::RUNTIME),
+                DirtyCheckoutErrorKind::ResourceUnavailable => {
+                    ("dirty-checkout-resource-unavailable", exit::RUNTIME)
+                }
+                DirtyCheckoutErrorKind::SnapshotFailed => {
+                    ("dirty-checkout-snapshot-failed", exit::RUNTIME)
+                }
+                DirtyCheckoutErrorKind::AdoptionFailed => {
+                    ("dirty-checkout-adoption-failed", exit::RUNTIME)
+                }
+                DirtyCheckoutErrorKind::RevocationFailed => {
+                    ("dirty-checkout-revoke-failed", exit::RUNTIME)
+                }
+            }
+        }
+
+        let kinds = [
+            DirtyCheckoutErrorKind::CleanCheckout,
+            DirtyCheckoutErrorKind::UnsupportedGitState,
+            DirtyCheckoutErrorKind::ChallengeExpired,
+            DirtyCheckoutErrorKind::ChallengeReused,
+            DirtyCheckoutErrorKind::ChallengeDrift,
+            DirtyCheckoutErrorKind::ForeignLease,
+            DirtyCheckoutErrorKind::MalformedState,
+            DirtyCheckoutErrorKind::InvalidInput,
+            DirtyCheckoutErrorKind::Timeout,
+            DirtyCheckoutErrorKind::ResourceUnavailable,
+            DirtyCheckoutErrorKind::SnapshotFailed,
+            DirtyCheckoutErrorKind::AdoptionFailed,
+            DirtyCheckoutErrorKind::RevocationFailed,
+        ];
+        assert_eq!(kinds.len(), 13);
+
+        for kind in kinds {
+            let (code, exit_code) = expected(kind);
+            assert_eq!(kind.code(), code);
+            assert_eq!(kind.exit_code(), exit_code);
+            assert_eq!(error_kind_from_code(code), Some(kind));
+
+            let cli_error = adoption_cli_error(domain_error(kind, "contract message"));
+            assert_eq!(cli_error.code, code);
+            assert_eq!(cli_error.exit_code, exit_code);
+            assert_eq!(cli_error.message.as_ref(), "contract message");
+            assert!(cli_error.hint.is_none());
+            assert!(cli_error.details.is_none());
+
+            let value = serde_json::to_value(super::super::error_envelope(
+                "worktree.dirty-snapshot",
+                &cli_error,
+            ))
+            .expect("serialize exact error envelope");
+            let mut envelope_keys = value
+                .as_object()
+                .expect("error envelope object")
+                .keys()
+                .map(String::as_str)
+                .collect::<Vec<_>>();
+            envelope_keys.sort_unstable();
+            assert_eq!(envelope_keys, ["error", "ok", "schema_version"]);
+            assert_eq!(
+                value["schema_version"],
+                "cli.git-cli.worktree.dirty-snapshot.v1"
+            );
+            assert_eq!(value["ok"], false);
+            let mut error_keys = value["error"]
+                .as_object()
+                .expect("error object")
+                .keys()
+                .map(String::as_str)
+                .collect::<Vec<_>>();
+            error_keys.sort_unstable();
+            assert_eq!(error_keys, ["code", "message"]);
+            assert_eq!(value["error"]["code"], code);
+            assert_eq!(value["error"]["message"], "contract message");
         }
     }
 
@@ -5116,8 +8811,27 @@ mod tests {
         }
     }
 
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn descriptor_backed_worker(path: &Path) -> SnapshotWorkerExecutable {
+        let file = File::open(path).expect("open worker fixture descriptor");
+        let metadata = file.metadata().expect("read worker fixture metadata");
+        let command_path = if cfg!(target_os = "linux") {
+            PathBuf::from(format!("/proc/self/fd/{}", file.as_raw_fd()))
+        } else {
+            PathBuf::from(format!("/dev/fd/{}", file.as_raw_fd()))
+        };
+        SnapshotWorkerExecutable {
+            source_path: path.to_path_buf(),
+            command_path,
+            file,
+            metadata,
+            _private_root: None,
+        }
+    }
+
     #[test]
-    fn snapshot_worker_executable_rejects_effective_user_group_writable_ancestors() {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn descriptor_backed_worker_accepts_owner_controlled_group_writable_ancestry() {
         let root = tempfile::Builder::new()
             .prefix("worker-ancestor-")
             .tempdir_in(env::current_dir().expect("current test directory"))
@@ -5126,40 +8840,1985 @@ mod tests {
         fs::write(&executable, b"worker").expect("write worker fixture");
         fs::set_permissions(&executable, fs::Permissions::from_mode(0o700))
             .expect("set worker mode");
-        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o770))
-            .expect("make effective-user ancestor group writable");
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o775))
+            .expect("make owner-controlled ancestor group writable");
 
-        let error = validate_worker_path_permissions(&executable)
-            .expect_err("effective-user group-writable ancestor must be rejected");
+        descriptor_backed_worker(&executable)
+            .revalidate()
+            .expect("descriptor-backed launch must not depend on mutable ancestor path modes");
+    }
+
+    #[test]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn descriptor_backed_worker_remains_bound_after_path_replacement() {
+        let root = tempfile::TempDir::new().expect("worker replacement root");
+        let executable = root.path().join("git-cli");
+        let displaced = root.path().join("git-cli.original");
+        fs::write(&executable, b"trusted worker").expect("write worker fixture");
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o700))
+            .expect("set worker mode");
+        let worker = descriptor_backed_worker(&executable);
+
+        fs::rename(&executable, &displaced).expect("displace worker path");
+        fs::write(&executable, b"replacement worker").expect("replace worker path");
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o700))
+            .expect("set replacement mode");
+
+        worker
+            .revalidate()
+            .expect("held descriptor must remain bound to the originally validated worker inode");
+        assert!(same_metadata(
+            &worker.metadata,
+            &worker.file.metadata().expect("held worker metadata")
+        ));
+        assert!(!same_metadata(
+            &worker.metadata,
+            &fs::metadata(&executable).expect("replacement path metadata")
+        ));
+    }
+
+    #[test]
+    fn checkout_wide_recovery_prunes_once_after_processing_all_pending_records() {
+        let records: Vec<_> = (0..MAX_RECOVERY_STATE_ENTRIES)
+            .map(|index| (format!("token-{index}"), format!("receipt-{index}")))
+            .collect();
+        let recovered = std::cell::Cell::new(0_usize);
+        let pruned = std::cell::Cell::new(0_usize);
+
+        recover_pending_batch_with(
+            records,
+            "token-0",
+            |_| {
+                recovered.set(recovered.get() + 1);
+                Ok(PendingRecovery::Revoked)
+            },
+            |_, _| panic!("revoked records do not require staged rollback"),
+            |failed_receipt_id| {
+                assert!(failed_receipt_id.is_none());
+                pruned.set(pruned.get() + 1);
+                Ok(())
+            },
+        )
+        .expect("checkout-wide recovery succeeds");
+
+        assert_eq!(recovered.get(), MAX_RECOVERY_STATE_ENTRIES - 1);
+        assert_eq!(
+            pruned.get(),
+            1,
+            "retention pruning must not rescan the checkout after every recovered marker"
+        );
+    }
+
+    #[test]
+    fn checkout_wide_recovery_prunes_after_failed_staged_rollback() {
+        let state_entries = std::cell::Cell::new(MAX_RECOVERY_STATE_ENTRIES);
+        let pruned = std::cell::Cell::new(0_usize);
+
+        let error = recover_pending_batch_with(
+            [("staged-token".to_string(), "staged-receipt".to_string())],
+            "current-token",
+            |_| Ok(PendingRecovery::Staged),
+            |_, _| {
+                state_entries.set(state_entries.get() + 1);
+                Err(domain_error(
+                    DirtyCheckoutErrorKind::AdoptionFailed,
+                    "staged rollback failed after durable tombstone rename",
+                ))
+            },
+            |failed_receipt_id| {
+                assert_eq!(failed_receipt_id, Some("staged-receipt"));
+                pruned.set(pruned.get() + 1);
+                state_entries.set(state_entries.get() - 1);
+                Ok(())
+            },
+        )
+        .expect_err("the staged rollback failure remains primary");
+
+        assert!(
+            error
+                .to_string()
+                .contains("staged rollback failed after durable tombstone rename")
+        );
+        assert_eq!(pruned.get(), 1, "deferred pruning must still run");
+        assert_eq!(state_entries.get(), MAX_RECOVERY_STATE_ENTRIES);
+    }
+
+    #[test]
+    fn checkout_wide_recovery_preserves_primary_error_when_pruning_also_fails() {
+        let error = recover_pending_batch_with(
+            [("staged-token".to_string(), "staged-receipt".to_string())],
+            "current-token",
+            |_| Ok(PendingRecovery::Staged),
+            |_, _| {
+                Err(domain_error(
+                    DirtyCheckoutErrorKind::AdoptionFailed,
+                    "unique primary recovery failure",
+                ))
+            },
+            |failed_receipt_id| {
+                assert_eq!(failed_receipt_id, Some("staged-receipt"));
+                Err(domain_error(
+                    DirtyCheckoutErrorKind::ResourceUnavailable,
+                    "unique deferred prune failure",
+                ))
+            },
+        )
+        .expect_err("both recovery and pruning fail");
+
         assert_eq!(
             error
                 .downcast_ref::<DirtyCheckoutError>()
-                .expect("typed worker path error")
+                .expect("primary typed error remains in the error chain")
+                .kind(),
+            DirtyCheckoutErrorKind::AdoptionFailed
+        );
+        let diagnostic = error.to_string();
+        assert!(diagnostic.contains("unique primary recovery failure"));
+        assert!(diagnostic.contains("unique deferred prune failure"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn process_identity_replacement_before_pinning_receives_no_signal() {
+        let generation_a = ProcessIdentity {
+            pid: 42_424,
+            generation: 11,
+        };
+        let generation_b = ProcessIdentity {
+            pid: generation_a.pid,
+            generation: 12,
+        };
+        let current = std::cell::Cell::new(generation_a);
+        let mut signals = Vec::new();
+
+        let pinned = pin_process_identity_result_with(
+            generation_a,
+            |_| {
+                current.set(generation_b);
+                Ok(generation_a.pid)
+            },
+            |_| Ok(Some(current.get())),
+        )
+        .expect("post-open generation validation succeeds");
+        if let Some(handle) = pinned {
+            signals.push((handle, libc::SIGKILL));
+        }
+
+        assert!(pinned.is_none(), "generation B must not be pinned as A");
+        assert!(signals.is_empty(), "generation B must receive zero signals");
+    }
+
+    #[test]
+    fn delayed_cleanup_signals_use_only_the_successfully_pinned_generation() {
+        struct SingleOwner(ProcessIdentity);
+
+        impl OwnedProcessTracker for SingleOwner {
+            fn identities(&mut self, _deadline: Instant) -> Result<Vec<ProcessIdentity>> {
+                Ok(vec![self.0])
+            }
+
+            fn known_identities(&self) -> Vec<ProcessIdentity> {
+                vec![self.0]
+            }
+        }
+
+        struct ReplacingControl {
+            replacement: ProcessIdentity,
+            current: ProcessIdentity,
+            signals: Vec<(ProcessIdentity, libc::c_int)>,
+        }
+
+        impl OwnedProcessControl for ReplacingControl {
+            type Pinned = ProcessIdentity;
+
+            fn pin(&mut self, identity: ProcessIdentity) -> Result<Option<Self::Pinned>> {
+                self.current = self.replacement;
+                Ok(Some(identity))
+            }
+
+            fn signal(&mut self, process: &Self::Pinned, signal: libc::c_int) -> Result<bool> {
+                self.signals.push((*process, signal));
+                Ok(true)
+            }
+        }
+
+        let generation_a = ProcessIdentity {
+            pid: 42_424,
+            generation: 11,
+        };
+        let generation_b = ProcessIdentity {
+            pid: generation_a.pid,
+            generation: 12,
+        };
+        let mut owner = SingleOwner(generation_a);
+        let mut control = ReplacingControl {
+            replacement: generation_b,
+            current: generation_a,
+            signals: Vec::new(),
+        };
+        let mut child = Command::new("/bin/true")
+            .spawn()
+            .expect("spawn completed cleanup child");
+
+        terminate_owned_processes_until_with(
+            &mut owner,
+            &mut child,
+            Instant::now() + Duration::from_secs(1),
+            &mut control,
+        )
+        .expect("opaque-handle cleanup succeeds");
+
+        assert_eq!(control.current, generation_b);
+        assert_eq!(
+            control.signals,
+            vec![(generation_a, libc::SIGSTOP), (generation_a, libc::SIGKILL)],
+            "cleanup must signal only the opaque handle acquired for generation A"
+        );
+        assert!(
+            control
+                .signals
+                .iter()
+                .all(|(handle, _)| *handle != generation_b),
+            "the replacement generation must receive no cleanup signal"
+        );
+    }
+
+    #[test]
+    fn published_pid_cleanup_pins_the_original_generation_before_delayed_signal() {
+        struct ReplacingControl {
+            current: ProcessIdentity,
+            replacement: ProcessIdentity,
+            signals: Vec<(ProcessIdentity, libc::c_int)>,
+        }
+
+        impl OwnedProcessControl for ReplacingControl {
+            type Pinned = ProcessIdentity;
+
+            fn pin(&mut self, identity: ProcessIdentity) -> Result<Option<Self::Pinned>> {
+                self.current = self.replacement;
+                Ok(Some(identity))
+            }
+
+            fn signal(&mut self, process: &Self::Pinned, signal: libc::c_int) -> Result<bool> {
+                self.signals.push((*process, signal));
+                Ok(true)
+            }
+        }
+
+        let generation_a = ProcessIdentity {
+            pid: 54_321,
+            generation: 7,
+        };
+        let generation_b = ProcessIdentity {
+            pid: generation_a.pid,
+            generation: 8,
+        };
+        let mut control = ReplacingControl {
+            current: generation_a,
+            replacement: generation_b,
+            signals: Vec::new(),
+        };
+
+        let pinned = pin_published_process_with(&mut control, generation_a)
+            .expect("pin published generation")
+            .expect("published generation exists");
+        signal_published_process_with(&mut control, &pinned).expect("clean published generation");
+
+        assert_eq!(control.current, generation_b);
+        assert_eq!(control.signals, vec![(generation_a, libc::SIGKILL)]);
+        assert!(
+            control
+                .signals
+                .iter()
+                .all(|(identity, _)| *identity != generation_b),
+            "delayed fixture cleanup must never signal the reused PID generation"
+        );
+    }
+
+    #[test]
+    fn supervisor_cleanup_completion_requires_authenticated_proof() {
+        let mut valid = Vec::new();
+        write_process_supervisor_completion(
+            &mut valid,
+            ProcessSupervisorCompletion {
+                kind: ProcessSupervisorCompletionKind::Terminated,
+                cleanup_complete: true,
+                exit_code: exit::RUNTIME,
+            },
+        )
+        .expect("serialize authenticated cleanup completion");
+        let mut overlong = valid.clone();
+        overlong.push(0);
+        assert!(read_supervisor_cleanup_proof_with(&mut io::Cursor::new(
+            valid
+        )));
+        assert!(!read_supervisor_cleanup_proof_with(&mut io::Cursor::new(
+            overlong
+        )));
+        assert!(!read_supervisor_cleanup_proof_with(&mut io::Cursor::new(
+            Vec::<u8>::new()
+        )));
+        assert!(!read_supervisor_cleanup_proof_with(&mut io::Cursor::new(
+            b"wrong-proof".to_vec()
+        )));
+    }
+
+    #[test]
+    fn authenticated_target_status_one_remains_a_git_domain_result() {
+        use std::os::unix::net::UnixStream;
+
+        let (completion_reader, mut completion_writer) =
+            UnixStream::pair().expect("target status completion socket");
+        write_process_supervisor_completion(
+            &mut completion_writer,
+            ProcessSupervisorCompletion {
+                kind: ProcessSupervisorCompletionKind::Target,
+                cleanup_complete: true,
+                exit_code: 1,
+            },
+        )
+        .expect("deliver target status completion");
+        drop(completion_writer);
+        let mut command = Command::new("/bin/sh");
+        command
+            .args(["-c", "exit 1"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .process_group(0);
+        let child = command
+            .spawn()
+            .expect("spawn authenticated status-one fixture");
+        let spawned = SpawnedOutputChild {
+            child,
+            supervised: true,
+            cleanup_proof: Some(completion_reader),
+            fallback_owner: None,
+        };
+
+        let output = collect_output_child_until(
+            spawned,
+            Instant::now() + Duration::from_secs(1),
+            1024,
+            1024,
+            1024,
+        )
+        .expect("authenticated target status one remains available to Git consumers");
+
+        assert_eq!(output.status.code(), Some(1));
+    }
+
+    #[test]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn authenticated_supervisor_producer_preserves_normal_target_status_one() {
+        let root = tempfile::TempDir::new().expect("target status producer root");
+        let spawned = spawn_authenticated_supervisor_output_fixture(
+            "target-status-one",
+            &root.path().join("unused.pid"),
+        );
+
+        let output = collect_output_child_until(
+            spawned,
+            Instant::now() + Duration::from_secs(5),
+            1024,
+            1024,
+            1024,
+        )
+        .expect("authenticated target status one remains a Git-domain result");
+
+        assert_eq!(output.status.code(), Some(exit::RUNTIME));
+    }
+
+    #[test]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn authenticated_supervisor_producer_internal_failure_is_not_git_status_one() {
+        let root = tempfile::TempDir::new().expect("internal failure producer root");
+        let spawned = spawn_authenticated_supervisor_output_fixture(
+            "internal-failure",
+            &root.path().join("unused.pid"),
+        );
+
+        let error = collect_output_child_until(
+            spawned,
+            Instant::now() + Duration::from_secs(5),
+            1024,
+            1024,
+            1024,
+        )
+        .expect_err("authenticated internal failure must not enter the Git status domain");
+
+        assert_eq!(
+            error
+                .downcast_ref::<DirtyCheckoutError>()
+                .expect("typed authenticated internal failure")
                 .kind(),
             DirtyCheckoutErrorKind::ResourceUnavailable
         );
     }
 
     #[test]
-    fn descendant_termination_does_not_resignal_cached_numeric_pids() {
-        let reused_pid = 42_424 as libc::pid_t;
-        let mut signals = Vec::new();
+    fn authenticated_supervisor_internal_failure_cannot_become_git_status_one() {
+        use std::os::unix::net::UnixStream;
 
-        terminate_descendants_with(
-            7,
-            |_| vec![reused_pid],
-            |pid, signal| {
-                signals.push((pid, signal));
-                true
+        let (completion_reader, mut completion_writer) =
+            UnixStream::pair().expect("internal failure completion socket");
+        write_process_supervisor_completion(
+            &mut completion_writer,
+            ProcessSupervisorCompletion {
+                kind: ProcessSupervisorCompletionKind::InternalFailure,
+                cleanup_complete: false,
+                exit_code: 1,
             },
-            || {},
+        )
+        .expect("deliver internal failure completion");
+        drop(completion_writer);
+        let mut command = Command::new("/bin/sh");
+        command
+            .args(["-c", "exit 1"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .process_group(0);
+        let child = command.spawn().expect("spawn internal status-one fixture");
+        let spawned = SpawnedOutputChild {
+            child,
+            supervised: true,
+            cleanup_proof: Some(completion_reader),
+            fallback_owner: None,
+        };
+
+        let error = collect_output_child_until(
+            spawned,
+            Instant::now() + Duration::from_secs(1),
+            1024,
+            1024,
+            1024,
+        )
+        .expect_err("authenticated internal failure must not become Git status one");
+
+        assert_eq!(
+            error
+                .downcast_ref::<DirtyCheckoutError>()
+                .expect("typed authenticated internal failure")
+                .kind(),
+            DirtyCheckoutErrorKind::ResourceUnavailable
+        );
+    }
+
+    #[test]
+    fn supervised_child_without_authenticated_completion_cannot_return_git_status_one() {
+        use std::os::unix::net::UnixStream;
+
+        let (completion_reader, completion_writer) =
+            UnixStream::pair().expect("supervisor completion socket");
+        drop(completion_writer);
+        let mut command = Command::new("/bin/sh");
+        command
+            .args(["-c", "exit 1"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .process_group(0);
+        let child = command
+            .spawn()
+            .expect("spawn status-one supervisor fixture");
+        let spawned = SpawnedOutputChild {
+            child,
+            supervised: true,
+            cleanup_proof: Some(completion_reader),
+            fallback_owner: None,
+        };
+
+        let error = collect_output_child_until(
+            spawned,
+            Instant::now() + Duration::from_secs(1),
+            1024,
+            1024,
+            1024,
+        )
+        .expect_err("missing authenticated completion must not become Git status one");
+
+        assert_eq!(
+            error
+                .downcast_ref::<DirtyCheckoutError>()
+                .expect("typed missing supervisor completion error")
+                .kind(),
+            DirtyCheckoutErrorKind::ResourceUnavailable
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn missing_supervisor_completion_cleans_a_prescanned_escaped_descendant() {
+        use std::os::unix::net::UnixStream;
+
+        let root = tempfile::TempDir::new().expect("missing completion escaped root");
+        let pid_path = root.path().join("escaped.pid");
+        let start_path = root.path().join("start");
+        let release_path = root.path().join("release");
+        let (completion_reader, completion_writer) =
+            UnixStream::pair().expect("missing completion socket");
+        drop(completion_writer);
+        let mut command = Command::new(env::current_exe().expect("current test executable"));
+        command
+            .arg("output_cleanup_escaped_descendant_test_fixture")
+            .arg("--nocapture")
+            .env("NILS_OUTPUT_CLEANUP_ESCAPED_DESCENDANT", "1")
+            .env("NILS_OUTPUT_CLEANUP_EXIT_AFTER_PUBLISH", "1")
+            .env("NILS_OUTPUT_CLEANUP_START_PATH", &start_path)
+            .env("NILS_OUTPUT_CLEANUP_RELEASE_PATH", &release_path)
+            .env("NILS_PROCESS_SUPERVISOR_TEST_PID_PATH", &pid_path)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .process_group(0);
+        let child = command
+            .spawn()
+            .expect("spawn unexpected supervisor exit fixture");
+        let mut fallback_owner = ProcessOwner::for_root(child.id() as libc::pid_t)
+            .expect("create scoped escaped fallback owner");
+        fs::write(&start_path, []).expect("release escaped fixture start gate");
+        let publication_deadline = Instant::now() + Duration::from_secs(1);
+        while !pid_path.exists() {
+            assert!(
+                Instant::now() < publication_deadline,
+                "escaped fixture did not publish its PID"
+            );
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        let pid = fs::read_to_string(&pid_path)
+            .expect("read escaped fixture PID")
+            .parse::<libc::pid_t>()
+            .expect("parse escaped fixture PID");
+        let identity = process_identity(pid)
+            .expect("read escaped fixture identity")
+            .expect("escaped fixture remains present before collection");
+        let prescanned = fallback_owner
+            .identities(Instant::now() + Duration::from_secs(1))
+            .expect("prescan escaped supervisor descendants");
+        assert!(
+            prescanned.contains(&identity),
+            "escaped descendant must be retained before unexpected supervisor exit"
+        );
+        let pinned = pin_process(identity)
+            .expect("pin prescanned escaped descendant")
+            .expect("prescanned escaped descendant remains present");
+        fs::write(&release_path, []).expect("release escaped intermediate");
+        let spawned = SpawnedOutputChild {
+            child,
+            supervised: true,
+            cleanup_proof: Some(completion_reader),
+            fallback_owner: Some(fallback_owner),
+        };
+
+        let error = collect_output_child_until(
+            spawned,
+            Instant::now() + Duration::from_secs(2),
+            1024,
+            1024,
+            1024,
+        )
+        .expect_err("missing authenticated completion must fail supervision");
+        assert_eq!(
+            error
+                .downcast_ref::<DirtyCheckoutError>()
+                .expect("typed unexpected supervisor exit error")
+                .kind(),
+            DirtyCheckoutErrorKind::ResourceUnavailable
+        );
+
+        #[cfg(target_os = "linux")]
+        let still_running = {
+            let exit_deadline = Instant::now() + Duration::from_millis(500);
+            loop {
+                let state = fs::read(format!("/proc/{pid}/stat"))
+                    .ok()
+                    .and_then(|bytes| {
+                        bytes
+                            .iter()
+                            .rposition(|byte| *byte == b')')
+                            .and_then(|end| bytes.get(end + 2).copied())
+                    });
+                if state.is_none() || state == Some(b'Z') {
+                    break false;
+                }
+                if Instant::now() >= exit_deadline {
+                    break true;
+                }
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        };
+        #[cfg(target_os = "macos")]
+        let still_running = {
+            let exit_deadline = Instant::now() + Duration::from_millis(500);
+            loop {
+                if process_identity(pid).expect("recheck escaped descendant") != Some(identity) {
+                    break false;
+                }
+                if Instant::now() >= exit_deadline {
+                    break true;
+                }
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        };
+        if still_running {
+            let _ = signal_pinned_process(&pinned, libc::SIGKILL);
+            panic!("escaped descendant survived missing-completion fallback cleanup");
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn lost_trackers_fail_unavailable_without_signaling_an_unseen_descendant() {
+        use std::os::unix::net::UnixStream;
+
+        let root = tempfile::TempDir::new().expect("lost tracker characterization root");
+        let pid_path = root.path().join("escaped.pid");
+        let release_path = root.path().join("release");
+        let (completion_reader, completion_writer) =
+            UnixStream::pair().expect("lost tracker completion socket");
+        drop(completion_writer);
+        let mut command = Command::new(env::current_exe().expect("current test executable"));
+        command
+            .arg("output_cleanup_escaped_descendant_test_fixture")
+            .arg("--nocapture")
+            .env("NILS_OUTPUT_CLEANUP_ESCAPED_DESCENDANT", "1")
+            .env("NILS_OUTPUT_CLEANUP_EXIT_AFTER_PUBLISH", "1")
+            .env("NILS_OUTPUT_CLEANUP_HARD_EXIT_AFTER_PUBLISH", "1")
+            .env("NILS_OUTPUT_CLEANUP_RELEASE_PATH", &release_path)
+            .env("NILS_PROCESS_SUPERVISOR_TEST_PID_PATH", &pid_path)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .process_group(0);
+        let mut child = command.spawn().expect("spawn hard-exit supervisor fixture");
+        let supervisor_pid = child.id() as libc::pid_t;
+        let fallback_owner =
+            ProcessOwner::for_root(supervisor_pid).expect("create unscanned fallback owner");
+
+        let mut canary_command = Command::new("/bin/sleep");
+        canary_command
+            .arg("60")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .process_group(supervisor_pid);
+        let canary_child = canary_command
+            .spawn()
+            .expect("spawn unrelated process-group canary");
+        let mut canary = SupervisorFixture {
+            child: canary_child,
+            completion_channel: None,
+            reaped: false,
+        };
+        let canary_pid = canary.id() as libc::pid_t;
+        let canary_identity = process_identity(canary_pid)
+            .expect("read canary identity")
+            .expect("canary remains present after spawn");
+        let mut canary_cleanup = PublishedPidCleanup::new(canary_identity);
+        assert!(
+            canary_cleanup.process().is_some(),
+            "test cleanup must pin the canary generation"
+        );
+
+        let publication_deadline = Instant::now() + Duration::from_secs(1);
+        while !pid_path.exists() {
+            assert!(
+                Instant::now() < publication_deadline,
+                "escaped fixture did not publish its PID"
+            );
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        let leaf_pid = fs::read_to_string(&pid_path)
+            .expect("read unseen leaf PID")
+            .parse::<libc::pid_t>()
+            .expect("parse unseen leaf PID");
+        let leaf_identity = process_identity(leaf_pid)
+            .expect("read unseen leaf identity")
+            .expect("unseen leaf remains present before tracker loss");
+        let mut test_only_leaf_reaper = PublishedPidCleanup::new(leaf_identity);
+        assert!(
+            test_only_leaf_reaper.process().is_some(),
+            "test-only cleanup must pin the escaped leaf generation"
+        );
+        assert!(
+            fallback_owner.known_identities().is_empty(),
+            "the caller fallback owner must not prescan the escaped leaf"
+        );
+
+        fs::write(&release_path, []).expect("release hard-exit supervisor fixture");
+        let supervisor_status = child.wait().expect("reap hard-exit supervisor fixture");
+        assert_eq!(supervisor_status.code(), Some(exit::RUNTIME));
+        assert_eq!(
+            process_identity(supervisor_pid).expect("recheck supervisor identity"),
+            None,
+            "the supervisor generation must be gone before fallback collection"
+        );
+
+        reset_unpinned_cleanup_signal_attempts();
+        let spawned = SpawnedOutputChild {
+            child,
+            supervised: true,
+            cleanup_proof: Some(completion_reader),
+            fallback_owner: Some(fallback_owner),
+        };
+        let collection_started = Instant::now();
+        let error = collect_output_child_until(
+            spawned,
+            collection_started + Duration::from_secs(3),
+            16 * 1024,
+            16 * 1024,
+            32 * 1024,
+        )
+        .expect_err("lost tracking authorities must fail unavailable");
+        assert!(
+            collection_started.elapsed() < Duration::from_secs(2),
+            "missing cleanup proof must fail within the bounded cleanup window"
+        );
+        assert_eq!(
+            error
+                .downcast_ref::<DirtyCheckoutError>()
+                .expect("typed lost tracker error")
+                .kind(),
+            DirtyCheckoutErrorKind::ResourceUnavailable
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("process supervisor completion could not be authenticated"),
+            "the caller must not accept missing authenticated cleanup proof"
+        );
+        assert_eq!(
+            unpinned_cleanup_signal_attempts(),
+            0,
+            "a reaped supervisor must disable every unpinned cleanup signal path"
         );
 
         assert_eq!(
-            signals,
-            vec![(reused_pid, libc::SIGSTOP), (reused_pid, libc::SIGKILL)],
-            "a cached numeric PID must be stopped once and killed once"
+            process_identity(canary_pid).expect("recheck canary identity"),
+            Some(canary_identity),
+            "cleanup must not replace or terminate the unrelated canary generation"
         );
+        let canary_stat =
+            fs::read(format!("/proc/{canary_pid}/stat")).expect("read canary process state");
+        let canary_state = canary_stat
+            .iter()
+            .rposition(|byte| *byte == b')')
+            .and_then(|end| canary_stat.get(end + 2).copied())
+            .expect("parse canary process state");
+        assert!(
+            !matches!(canary_state, b'T' | b't' | b'Z'),
+            "cleanup must not stop or terminate the unrelated process-group canary"
+        );
+        assert!(
+            signal_pinned_process(canary_cleanup.process().expect("pinned canary handle"), 0,)
+                .expect("probe pinned canary"),
+            "the unrelated canary must remain alive"
+        );
+        assert_eq!(
+            process_identity(leaf_pid).expect("recheck unseen leaf identity"),
+            Some(leaf_identity),
+            "no termination claim exists for a leaf unseen before every tracker was lost"
+        );
+        assert!(
+            signal_pinned_process(
+                test_only_leaf_reaper
+                    .process()
+                    .expect("pinned test-only leaf handle"),
+                0,
+            )
+            .expect("probe pinned unseen leaf"),
+            "the accepted residual leaves the unseen generation for test-only cleanup"
+        );
+
+        test_only_leaf_reaper
+            .terminate_and_wait()
+            .expect("terminate and observe the unseen leaf through its stable test handle");
+        canary_cleanup
+            .terminate_and_wait()
+            .expect("terminate and observe the canary through its stable test handle");
+        canary.wait().expect("reap unrelated canary");
+    }
+
+    #[test]
+    fn reaped_supervisor_disables_unpinned_pid_and_process_group_signals() {
+        assert!(!should_use_unpinned_cleanup_signals(true, true));
+        assert!(should_use_unpinned_cleanup_signals(true, false));
+        assert!(should_use_unpinned_cleanup_signals(false, true));
+    }
+
+    #[test]
+    fn supervised_timeout_cleanup_signals_term_before_any_fallback_stop() {
+        let mut signals = Vec::new();
+        signal_cleanup_leader_with(42, true, |target, signal| {
+            signals.push((target, signal));
+            Ok(())
+        })
+        .expect("initial supervisor cleanup signal succeeds");
+
+        assert_eq!(
+            signals,
+            vec![(42, libc::SIGTERM)],
+            "the supervisor must retain execution so its ownership tracker can clean descendants"
+        );
+    }
+
+    #[test]
+    fn owned_cleanup_continues_until_a_quiescent_generation_pass() {
+        struct WaveOwner {
+            next_generation: u128,
+            last_generation: u128,
+        }
+
+        impl OwnedProcessTracker for WaveOwner {
+            fn identities(&mut self, _deadline: Instant) -> Result<Vec<ProcessIdentity>> {
+                if self.next_generation > self.last_generation {
+                    return Ok(Vec::new());
+                }
+                let identity = ProcessIdentity {
+                    pid: 40_000 + self.next_generation as libc::pid_t,
+                    generation: self.next_generation,
+                };
+                self.next_generation += 1;
+                Ok(vec![identity])
+            }
+
+            fn known_identities(&self) -> Vec<ProcessIdentity> {
+                Vec::new()
+            }
+        }
+
+        struct RecordingControl(Vec<(ProcessIdentity, libc::c_int)>);
+
+        impl OwnedProcessControl for RecordingControl {
+            type Pinned = ProcessIdentity;
+
+            fn pin(&mut self, identity: ProcessIdentity) -> Result<Option<Self::Pinned>> {
+                Ok(Some(identity))
+            }
+
+            fn signal(&mut self, process: &Self::Pinned, signal: libc::c_int) -> Result<bool> {
+                self.0.push((*process, signal));
+                Ok(true)
+            }
+        }
+
+        let mut owner = WaveOwner {
+            next_generation: 1,
+            last_generation: 5,
+        };
+        let mut control = RecordingControl(Vec::new());
+        let mut child = Command::new("/bin/true")
+            .spawn()
+            .expect("spawn completed cleanup child");
+
+        terminate_owned_processes_until_with(
+            &mut owner,
+            &mut child,
+            Instant::now() + Duration::from_secs(1),
+            &mut control,
+        )
+        .expect("all escaping generations are cleaned");
+
+        let killed: Vec<_> = control
+            .0
+            .iter()
+            .filter_map(|(identity, signal)| (*signal == libc::SIGKILL).then_some(*identity))
+            .collect();
+        assert_eq!(
+            killed.len(),
+            5,
+            "cleanup must not treat four discovery passes as a containment boundary"
+        );
+    }
+
+    #[test]
+    fn owned_cleanup_rejects_cumulative_generation_limit_plus_one() {
+        struct ChurningOwner {
+            next_generation: usize,
+        }
+
+        impl OwnedProcessTracker for ChurningOwner {
+            fn identities(&mut self, _deadline: Instant) -> Result<Vec<ProcessIdentity>> {
+                if self.next_generation > PROCESS_SCAN_LIMITS.descendants + 1 {
+                    return Ok(Vec::new());
+                }
+                let identity = ProcessIdentity {
+                    pid: 42_424,
+                    generation: self.next_generation as u128,
+                };
+                self.next_generation += 1;
+                Ok(vec![identity])
+            }
+
+            fn known_identities(&self) -> Vec<ProcessIdentity> {
+                Vec::new()
+            }
+        }
+
+        struct CountingControl {
+            pinned: usize,
+        }
+
+        impl OwnedProcessControl for CountingControl {
+            type Pinned = ProcessIdentity;
+
+            fn pin(&mut self, identity: ProcessIdentity) -> Result<Option<Self::Pinned>> {
+                self.pinned += 1;
+                Ok(Some(identity))
+            }
+
+            fn signal(&mut self, _process: &Self::Pinned, _signal: libc::c_int) -> Result<bool> {
+                Ok(true)
+            }
+        }
+
+        let mut owner = ChurningOwner { next_generation: 1 };
+        let mut control = CountingControl { pinned: 0 };
+        let mut child = Command::new("/bin/true")
+            .spawn()
+            .expect("spawn completed cleanup child");
+
+        let error = terminate_owned_processes_until_with(
+            &mut owner,
+            &mut child,
+            Instant::now() + Duration::from_secs(5),
+            &mut control,
+        )
+        .expect_err("cumulative generation churn must fail closed");
+
+        assert_eq!(
+            error
+                .downcast_ref::<DirtyCheckoutError>()
+                .expect("typed generation-limit error")
+                .kind(),
+            DirtyCheckoutErrorKind::ResourceUnavailable
+        );
+        assert_eq!(control.pinned, PROCESS_SCAN_LIMITS.descendants);
+    }
+
+    #[test]
+    fn failed_kill_resumes_a_stopped_pinned_process_before_cleanup_returns_error() {
+        struct SingleOwner(ProcessIdentity);
+
+        impl OwnedProcessTracker for SingleOwner {
+            fn identities(&mut self, _deadline: Instant) -> Result<Vec<ProcessIdentity>> {
+                Ok(vec![self.0])
+            }
+
+            fn known_identities(&self) -> Vec<ProcessIdentity> {
+                vec![self.0]
+            }
+        }
+
+        struct KillFailingControl {
+            signals: Vec<libc::c_int>,
+        }
+
+        impl OwnedProcessControl for KillFailingControl {
+            type Pinned = ProcessIdentity;
+
+            fn pin(&mut self, identity: ProcessIdentity) -> Result<Option<Self::Pinned>> {
+                Ok(Some(identity))
+            }
+
+            fn signal(&mut self, _process: &Self::Pinned, signal: libc::c_int) -> Result<bool> {
+                self.signals.push(signal);
+                if signal == libc::SIGKILL {
+                    Err(process_scan_resource_error())
+                } else {
+                    Ok(true)
+                }
+            }
+        }
+
+        let identity = ProcessIdentity {
+            pid: 42_424,
+            generation: 11,
+        };
+        let mut owner = SingleOwner(identity);
+        let mut control = KillFailingControl {
+            signals: Vec::new(),
+        };
+        let mut child = Command::new("/bin/true")
+            .spawn()
+            .expect("spawn completed cleanup child");
+
+        terminate_owned_processes_until_with(
+            &mut owner,
+            &mut child,
+            Instant::now() + Duration::from_secs(1),
+            &mut control,
+        )
+        .expect_err("failed termination must fail containment");
+
+        assert_eq!(
+            control.signals,
+            vec![libc::SIGSTOP, libc::SIGKILL, libc::SIGCONT],
+            "cleanup must resume a process that it stopped but could not terminate"
+        );
+    }
+
+    #[test]
+    fn successful_kill_waits_for_pinned_process_termination_before_cleanup_returns() {
+        struct TerminationControl {
+            signals: Vec<libc::c_int>,
+            waited: bool,
+        }
+
+        impl OwnedProcessControl for TerminationControl {
+            type Pinned = ProcessIdentity;
+
+            fn pin(&mut self, identity: ProcessIdentity) -> Result<Option<Self::Pinned>> {
+                Ok(Some(identity))
+            }
+
+            fn signal(&mut self, _process: &Self::Pinned, signal: libc::c_int) -> Result<bool> {
+                self.signals.push(signal);
+                Ok(true)
+            }
+
+            fn wait_for_exit(&mut self, _process: &Self::Pinned, _deadline: Instant) -> Result<()> {
+                self.waited = true;
+                Ok(())
+            }
+        }
+
+        let identity = ProcessIdentity {
+            pid: 42_424,
+            generation: 11,
+        };
+        let mut control = TerminationControl {
+            signals: Vec::new(),
+            waited: false,
+        };
+
+        terminate_owned_identity_until_with(
+            &mut control,
+            identity,
+            Instant::now() + Duration::from_secs(1),
+        )
+        .expect("stable termination is observed");
+
+        assert_eq!(control.signals, vec![libc::SIGSTOP, libc::SIGKILL]);
+        assert!(
+            control.waited,
+            "cleanup completion must wait until the pinned generation terminates"
+        );
+    }
+
+    #[test]
+    fn cleanup_deadline_resumes_a_process_stopped_mid_phase_without_late_kill() {
+        struct SingleOwner(ProcessIdentity);
+
+        impl OwnedProcessTracker for SingleOwner {
+            fn identities(&mut self, _deadline: Instant) -> Result<Vec<ProcessIdentity>> {
+                Ok(vec![self.0])
+            }
+
+            fn known_identities(&self) -> Vec<ProcessIdentity> {
+                vec![self.0]
+            }
+        }
+
+        struct DeadlineCrossingControl {
+            signals: Vec<libc::c_int>,
+        }
+
+        impl OwnedProcessControl for DeadlineCrossingControl {
+            type Pinned = ProcessIdentity;
+
+            fn pin(&mut self, identity: ProcessIdentity) -> Result<Option<Self::Pinned>> {
+                Ok(Some(identity))
+            }
+
+            fn signal(&mut self, _process: &Self::Pinned, signal: libc::c_int) -> Result<bool> {
+                self.signals.push(signal);
+                if signal == libc::SIGSTOP {
+                    std::thread::sleep(Duration::from_millis(75));
+                }
+                Ok(true)
+            }
+        }
+
+        let identity = ProcessIdentity {
+            pid: 42_424,
+            generation: 11,
+        };
+        let mut owner = SingleOwner(identity);
+        let mut control = DeadlineCrossingControl {
+            signals: Vec::new(),
+        };
+        let mut child = Command::new("/bin/true")
+            .spawn()
+            .expect("spawn completed cleanup child");
+
+        terminate_owned_processes_until_with(
+            &mut owner,
+            &mut child,
+            Instant::now() + Duration::from_millis(50),
+            &mut control,
+        )
+        .expect_err("crossing the shared cleanup deadline must fail containment");
+
+        assert_eq!(
+            control.signals,
+            vec![libc::SIGSTOP, libc::SIGCONT],
+            "deadline expiry must resume the stopped process instead of signaling after expiry"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_process_pinning_propagates_post_open_identity_read_failures() {
+        let identity = ProcessIdentity {
+            pid: 42_424,
+            generation: 11,
+        };
+
+        let error = pin_process_identity_result_with::<(), _, _>(
+            identity,
+            |_| Ok(()),
+            |_| Err(process_scan_resource_error()),
+        )
+        .expect_err("post-pidfd identity read failures must fail containment");
+
+        assert_eq!(
+            error
+                .downcast_ref::<DirtyCheckoutError>()
+                .expect("typed identity-read containment error")
+                .kind(),
+            DirtyCheckoutErrorKind::ResourceUnavailable
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_process_pinning_treats_only_esrch_as_vanished() {
+        let identity = ProcessIdentity {
+            pid: 42_424,
+            generation: 11,
+        };
+        let vanished = pin_process_identity_result_with::<(), _, _>(
+            identity,
+            |_| Err(io::Error::from_raw_os_error(libc::ESRCH)),
+            |_| Ok(Some(identity)),
+        )
+        .expect("ESRCH means the discovered generation has exited");
+        assert!(vanished.is_none());
+
+        for error_code in [libc::ENOSYS, libc::EMFILE, libc::ENFILE, libc::EPERM] {
+            let error = pin_process_identity_result_with::<(), _, _>(
+                identity,
+                |_| Err(io::Error::from_raw_os_error(error_code)),
+                |_| Ok(Some(identity)),
+            )
+            .expect_err("pidfd resource and policy failures must fail containment");
+            assert_eq!(
+                error
+                    .downcast_ref::<DirtyCheckoutError>()
+                    .expect("typed pidfd containment error")
+                    .kind(),
+                DirtyCheckoutErrorKind::ResourceUnavailable
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_pidfd_signaling_treats_only_esrch_as_vanished() {
+        assert!(signal_pinned_process_result_with(|| Ok(())).expect("successful pidfd signal"));
+        assert!(
+            !signal_pinned_process_result_with(|| Err(io::Error::from_raw_os_error(libc::ESRCH)))
+                .expect("ESRCH means the pinned generation has exited")
+        );
+
+        for error_code in [libc::ENOSYS, libc::EBADF, libc::EPERM, libc::EINVAL] {
+            let error =
+                signal_pinned_process_result_with(|| Err(io::Error::from_raw_os_error(error_code)))
+                    .expect_err("pidfd signal failures other than ESRCH must fail containment");
+            assert_eq!(
+                error
+                    .downcast_ref::<DirtyCheckoutError>()
+                    .expect("typed pidfd signal containment error")
+                    .kind(),
+                DirtyCheckoutErrorKind::ResourceUnavailable
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cleanup_failure_terminates_known_processes_and_cannot_report_success() {
+        struct FailingOwner {
+            known: Vec<ProcessIdentity>,
+        }
+
+        impl OwnedProcessTracker for FailingOwner {
+            fn identities(&mut self, _deadline: Instant) -> Result<Vec<ProcessIdentity>> {
+                Err(process_scan_resource_error())
+            }
+
+            fn known_identities(&self) -> Vec<ProcessIdentity> {
+                self.known.clone()
+            }
+        }
+
+        let mut child = Command::new("/bin/sh")
+            .args(["-c", "while :; do :; done"])
+            .spawn()
+            .expect("spawn cleanup failure fixture");
+        let pid = child.id() as libc::pid_t;
+        let identity = process_identity(pid)
+            .expect("read cleanup fixture identity")
+            .expect("cleanup fixture process exists");
+        let mut owner = FailingOwner {
+            known: vec![identity],
+        };
+
+        let error = terminate_owned_processes(&mut owner, &mut child)
+            .expect_err("incomplete discovery must fail containment after cleanup");
+
+        assert_eq!(
+            error
+                .downcast_ref::<DirtyCheckoutError>()
+                .expect("typed cleanup failure")
+                .kind(),
+            DirtyCheckoutErrorKind::ResourceUnavailable
+        );
+        assert_process_absent(pid, "known process after incomplete discovery");
+    }
+
+    #[test]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn signal_terminated_target_cannot_be_authenticated_as_git_status_one() {
+        let root = tempfile::TempDir::new().expect("signal target producer root");
+        let spawned = spawn_authenticated_supervisor_output_fixture(
+            "target-signal",
+            &root.path().join("unused.pid"),
+        );
+
+        let error = collect_output_child_until(
+            spawned,
+            Instant::now() + Duration::from_secs(5),
+            1024,
+            1024,
+            1024,
+        )
+        .expect_err("signal termination must remain outside the Git exit-status domain");
+
+        assert_eq!(
+            error
+                .downcast_ref::<DirtyCheckoutError>()
+                .expect("typed abnormal-target result")
+                .kind(),
+            DirtyCheckoutErrorKind::ResourceUnavailable
+        );
+    }
+
+    #[test]
+    fn successful_child_with_cleanup_failure_cannot_cross_supervisor_success_boundary() {
+        struct CleanupFailingOwner;
+
+        impl OwnedProcessTracker for CleanupFailingOwner {
+            fn identities(&mut self, _deadline: Instant) -> Result<Vec<ProcessIdentity>> {
+                Err(process_scan_resource_error())
+            }
+
+            fn known_identities(&self) -> Vec<ProcessIdentity> {
+                Vec::new()
+            }
+        }
+
+        let error = supervise_process_with_owner(
+            OsString::from("/bin/true"),
+            &[],
+            &mut CleanupFailingOwner,
+            None,
+            Instant::now() + Duration::from_secs(1),
+            || false,
+        )
+        .expect_err("cleanup failure must replace a successful child result");
+
+        assert_eq!(
+            error
+                .downcast_ref::<DirtyCheckoutError>()
+                .expect("typed supervisor cleanup failure")
+                .kind(),
+            DirtyCheckoutErrorKind::ResourceUnavailable
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn process_cleanup_deadline_bounds_every_cleanup_phase() {
+        struct EmptyOwner;
+
+        impl OwnedProcessTracker for EmptyOwner {
+            fn identities(&mut self, _deadline: Instant) -> Result<Vec<ProcessIdentity>> {
+                Ok(Vec::new())
+            }
+
+            fn known_identities(&self) -> Vec<ProcessIdentity> {
+                Vec::new()
+            }
+        }
+
+        let mut child = Command::new("/bin/sh")
+            .args(["-c", "while :; do :; done"])
+            .spawn()
+            .expect("spawn expired cleanup fixture");
+        let pid = child.id() as libc::pid_t;
+        let mut owner = EmptyOwner;
+        let error = terminate_owned_processes_until(
+            &mut owner,
+            &mut child,
+            Instant::now() - Duration::from_millis(1),
+        )
+        .expect_err("an expired cleanup deadline must fail closed");
+
+        assert_eq!(
+            error
+                .downcast_ref::<DirtyCheckoutError>()
+                .expect("typed cleanup timeout")
+                .kind(),
+            DirtyCheckoutErrorKind::Timeout
+        );
+        let status = child.wait().expect("reap expired-deadline direct child");
+        assert!(
+            !status.success(),
+            "the direct child must still be terminated"
+        );
+        assert_process_absent(pid, "expired-deadline direct child");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_process_scan_is_linear_bounded_and_deadline_first() {
+        let limits = ProcessScanLimits {
+            process_entries: 6,
+            metadata_bytes: 600,
+            descendants: 4,
+        };
+        let records = vec![
+            ProcessRecord::new(10, 1, 10, 100),
+            ProcessRecord::new(11, 10, 11, 100),
+            ProcessRecord::new(12, 10, 12, 100),
+            ProcessRecord::new(13, 11, 13, 100),
+            ProcessRecord::new(14, 12, 14, 100),
+            ProcessRecord::new(99, 1, 99, 100),
+        ];
+        let scan = collect_descendant_processes_with(
+            10,
+            Instant::now() + Duration::from_secs(1),
+            limits,
+            |_| Ok(records.clone()),
+        )
+        .expect("exact process, byte, and descendant caps must pass");
+        assert_eq!(scan.identities.len(), 4);
+        assert_eq!(scan.edge_visits, 4, "each descendant edge is visited once");
+
+        let assert_resource = |result: Result<ProcessScan>| {
+            assert_eq!(
+                result
+                    .expect_err("cap plus one must fail")
+                    .downcast_ref::<DirtyCheckoutError>()
+                    .expect("typed process scan error")
+                    .kind(),
+                DirtyCheckoutErrorKind::ResourceUnavailable
+            );
+        };
+        assert_resource(collect_descendant_processes_with(
+            10,
+            Instant::now() + Duration::from_secs(1),
+            ProcessScanLimits {
+                process_entries: 5,
+                ..limits
+            },
+            |_| Ok(records.clone()),
+        ));
+        assert_resource(collect_descendant_processes_with(
+            10,
+            Instant::now() + Duration::from_secs(1),
+            ProcessScanLimits {
+                metadata_bytes: 599,
+                ..limits
+            },
+            |_| Ok(records.clone()),
+        ));
+        assert_resource(collect_descendant_processes_with(
+            10,
+            Instant::now() + Duration::from_secs(1),
+            ProcessScanLimits {
+                descendants: 3,
+                ..limits
+            },
+            |_| Ok(records),
+        ));
+
+        let mut reads = 0;
+        let expired = collect_descendant_processes_with(
+            10,
+            Instant::now() - Duration::from_millis(1),
+            limits,
+            |_| {
+                reads += 1;
+                Ok(Vec::new())
+            },
+        )
+        .expect_err("an expired cleanup deadline must fail");
+        assert_eq!(
+            expired
+                .downcast_ref::<DirtyCheckoutError>()
+                .expect("typed cleanup timeout")
+                .kind(),
+            DirtyCheckoutErrorKind::Timeout
+        );
+        assert_eq!(reads, 0, "no process metadata may be read after expiry");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_targeted_reader_scans_only_reachable_processes_and_retains_a_bounded_prefix() {
+        fn write_process(root: &Path, pid: libc::pid_t, parent: libc::pid_t, children: &str) {
+            let task = root
+                .join(pid.to_string())
+                .join("task")
+                .join(pid.to_string());
+            fs::create_dir_all(&task).expect("create synthetic process task");
+            fs::write(task.join("children"), children).expect("write synthetic children");
+            let mut stat = format!("{pid} (process-{pid}) S {parent}").into_bytes();
+            for _ in 0..17 {
+                stat.extend_from_slice(b" 0");
+            }
+            stat.extend_from_slice(format!(" {pid}00\n").as_bytes());
+            fs::write(root.join(pid.to_string()).join("stat"), stat).expect("write synthetic stat");
+        }
+
+        let proc_root = tempfile::TempDir::new().expect("synthetic proc root");
+        write_process(proc_root.path(), 10, 1, "11\n");
+        write_process(proc_root.path(), 11, 10, "12\n");
+        write_process(proc_root.path(), 12, 11, "");
+        write_process(proc_root.path(), 99, 1, "100\n");
+        write_process(proc_root.path(), 100, 99, "");
+        let limits = ProcessScanLimits {
+            process_entries: 8,
+            metadata_bytes: 4 * 1024,
+            descendants: 2,
+        };
+        let mut observed = Vec::new();
+
+        let scan = descendant_processes_at(
+            proc_root.path(),
+            10,
+            Instant::now() + Duration::from_secs(1),
+            limits,
+            |identity| observed.push(identity),
+        )
+        .expect("reachable synthetic descendants must be discovered");
+
+        assert_eq!(
+            scan.identities
+                .iter()
+                .map(|identity| identity.pid)
+                .collect::<Vec<_>>(),
+            vec![11, 12]
+        );
+        assert_eq!(scan.edge_visits, 2);
+        assert_eq!(observed, scan.identities);
+        assert!(scan.identities.iter().all(|identity| identity.pid != 99));
+
+        let mut bounded_prefix = Vec::new();
+        let error = descendant_processes_at(
+            proc_root.path(),
+            10,
+            Instant::now() + Duration::from_secs(1),
+            ProcessScanLimits {
+                descendants: 1,
+                ..limits
+            },
+            |identity| bounded_prefix.push(identity),
+        )
+        .expect_err("descendant cap plus one must fail closed");
+        assert_eq!(
+            error
+                .downcast_ref::<DirtyCheckoutError>()
+                .expect("typed targeted scan error")
+                .kind(),
+            DirtyCheckoutErrorKind::ResourceUnavailable
+        );
+        assert_eq!(
+            bounded_prefix
+                .iter()
+                .map(|identity| identity.pid)
+                .collect::<Vec<_>>(),
+            vec![11],
+            "already discovered identities must remain available for cleanup"
+        );
+
+        let late_task = proc_root.path().join("10/task/20");
+        fs::create_dir_all(&late_task).expect("create late synthetic task");
+        fs::write(
+            late_task.join("children"),
+            vec![b' '; MAX_PROC_CHILDREN_BYTES + 1],
+        )
+        .expect("write oversized late-task metadata");
+        let mut streamed_prefix = Vec::new();
+        descendant_processes_at(
+            proc_root.path(),
+            10,
+            Instant::now() + Duration::from_secs(1),
+            ProcessScanLimits {
+                metadata_bytes: MAX_PROC_CHILDREN_BYTES * 2,
+                ..limits
+            },
+            |identity| streamed_prefix.push(identity),
+        )
+        .expect_err("a later task metadata overflow must fail closed");
+        assert_eq!(
+            streamed_prefix
+                .iter()
+                .map(|identity| identity.pid)
+                .collect::<Vec<_>>(),
+            vec![11],
+            "a later task failure must preserve the earlier task's discovered identity"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_targeted_reader_rejects_recycled_child_pid_with_unrelated_parent() {
+        fn write_process(root: &Path, pid: libc::pid_t, parent: libc::pid_t, children: &str) {
+            let task = root
+                .join(pid.to_string())
+                .join("task")
+                .join(pid.to_string());
+            fs::create_dir_all(&task).expect("create synthetic process task");
+            fs::write(task.join("children"), children).expect("write synthetic children");
+            let mut stat = format!("{pid} (process-{pid}) S {parent}").into_bytes();
+            for _ in 0..17 {
+                stat.extend_from_slice(b" 0");
+            }
+            stat.extend_from_slice(format!(" {pid}00\n").as_bytes());
+            fs::write(root.join(pid.to_string()).join("stat"), stat).expect("write synthetic stat");
+        }
+
+        let proc_root = tempfile::TempDir::new().expect("synthetic proc root");
+        write_process(proc_root.path(), 10, 1, "11\n");
+        write_process(proc_root.path(), 11, 99, "");
+
+        let scan = descendant_processes_at(
+            proc_root.path(),
+            10,
+            Instant::now() + Duration::from_secs(1),
+            ProcessScanLimits {
+                process_entries: 4,
+                metadata_bytes: 1024,
+                descendants: 2,
+            },
+            |_| {},
+        )
+        .expect("an unrelated PID generation must be skipped");
+
+        assert!(
+            scan.identities.is_empty(),
+            "a recycled children entry whose current occupant has another parent is not owned"
+        );
+    }
+
+    #[test]
+    fn identity_bound_child_visiting_retains_safe_prefix_and_rejects_parent_swaps() {
+        let parent = ProcessIdentity {
+            pid: 10,
+            generation: 1_000,
+        };
+        let child = ProcessIdentity {
+            pid: 11,
+            generation: 1_100,
+        };
+        let replacement = ProcessIdentity {
+            pid: parent.pid,
+            generation: 9_999,
+        };
+        let mut observed = Vec::new();
+        let error = visit_identity_bound_children_with(
+            parent,
+            [Ok(11), Ok(12)],
+            |pid| {
+                if pid == parent.pid {
+                    Ok(Some(ProcessRecord::new(pid, 1, parent.generation, 0)))
+                } else if pid == child.pid {
+                    Ok(Some(ProcessRecord::new(
+                        pid,
+                        parent.pid,
+                        child.generation,
+                        0,
+                    )))
+                } else {
+                    Err(process_scan_resource_error())
+                }
+            },
+            |identity| {
+                observed.push(identity);
+                Ok(())
+            },
+        )
+        .expect_err("a later child metadata failure must fail containment");
+        assert!(error.downcast_ref::<DirtyCheckoutError>().is_some());
+        assert_eq!(
+            observed,
+            vec![child],
+            "a child validated before a later failure remains available to cleanup"
+        );
+
+        let validations = std::cell::Cell::new(0_u8);
+        observed.clear();
+        visit_identity_bound_children_with(
+            parent,
+            [Ok(11)],
+            |pid| {
+                if pid == parent.pid {
+                    let validation = validations.get();
+                    validations.set(validation + 1);
+                    let generation = if validation == 0 {
+                        parent.generation
+                    } else {
+                        replacement.generation
+                    };
+                    Ok(Some(ProcessRecord::new(pid, 1, generation, 0)))
+                } else {
+                    Ok(Some(ProcessRecord::new(
+                        pid,
+                        parent.pid,
+                        child.generation,
+                        0,
+                    )))
+                }
+            },
+            |identity| {
+                observed.push(identity);
+                Ok(())
+            },
+        )
+        .expect("a parent replacement is an absent edge, not a scan failure");
+        assert!(
+            observed.is_empty(),
+            "a child edge must not publish across a parent generation change"
+        );
+    }
+
+    #[test]
+    fn macos_event_reducer_retains_reparented_child_after_parent_reap() {
+        let root = ProcessIdentity {
+            pid: 10,
+            generation: 1_000,
+        };
+        let parent = ProcessIdentity {
+            pid: 11,
+            generation: 1_100,
+        };
+        let leaf = ProcessIdentity {
+            pid: 12,
+            generation: 1_200,
+        };
+        let mut tracked = std::collections::HashMap::from([(parent.pid, parent)]);
+        let mut pending = std::collections::HashMap::new();
+
+        reduce_macos_process_event_with(
+            root,
+            &mut tracked,
+            &mut pending,
+            MacosProcessEvent::Exit { pid: parent.pid },
+            |_| Ok(None),
+        )
+        .expect("parent exit reduction succeeds");
+        reduce_macos_process_event_with(
+            root,
+            &mut tracked,
+            &mut pending,
+            MacosProcessEvent::Child { pid: leaf.pid },
+            |pid| Ok(Some(ProcessRecord::new(pid, 1, leaf.generation, 0))),
+        )
+        .expect("reparented child event reduction succeeds");
+        assert_eq!(pending.get(&leaf.pid), Some(&leaf));
+        assert!(!tracked.contains_key(&leaf.pid));
+
+        reduce_macos_process_event_with(
+            root,
+            &mut tracked,
+            &mut pending,
+            MacosProcessEvent::Drained,
+            |pid| Ok(Some(ProcessRecord::new(pid, 1, leaf.generation, 0))),
+        )
+        .expect("drained child generation revalidation succeeds");
+        assert_eq!(
+            tracked.get(&leaf.pid),
+            Some(&leaf),
+            "NOTE_TRACK ancestry must survive rapid parent reap and child reparenting"
+        );
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn macos_event_reducer_rejects_reused_child_before_drain() {
+        let root = ProcessIdentity {
+            pid: 10,
+            generation: 1_000,
+        };
+        let child = ProcessIdentity {
+            pid: 11,
+            generation: 1_100,
+        };
+        let replacement = ProcessIdentity {
+            pid: child.pid,
+            generation: 9_999,
+        };
+        let mut tracked = std::collections::HashMap::new();
+        let mut pending = std::collections::HashMap::new();
+
+        reduce_macos_process_event_with(
+            root,
+            &mut tracked,
+            &mut pending,
+            MacosProcessEvent::Child { pid: child.pid },
+            |pid| Ok(Some(ProcessRecord::new(pid, root.pid, child.generation, 0))),
+        )
+        .expect("child event stages an exact generation");
+        reduce_macos_process_event_with(
+            root,
+            &mut tracked,
+            &mut pending,
+            MacosProcessEvent::Exit { pid: child.pid },
+            |pid| Ok(Some(ProcessRecord::new(pid, 1, replacement.generation, 0))),
+        )
+        .expect("exit cancels the pending generation");
+        reduce_macos_process_event_with(
+            root,
+            &mut tracked,
+            &mut pending,
+            MacosProcessEvent::Drained,
+            |pid| Ok(Some(ProcessRecord::new(pid, 1, replacement.generation, 0))),
+        )
+        .expect("drain after replacement succeeds");
+
+        assert!(tracked.is_empty(), "the replacement PID is never published");
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn macos_event_reducer_discards_generation_change_before_drain() {
+        let root = ProcessIdentity {
+            pid: 10,
+            generation: 1_000,
+        };
+        let child = ProcessIdentity {
+            pid: 11,
+            generation: 1_100,
+        };
+        let replacement = ProcessIdentity {
+            pid: child.pid,
+            generation: 9_999,
+        };
+        let mut tracked = std::collections::HashMap::new();
+        let mut pending = std::collections::HashMap::new();
+
+        reduce_macos_process_event_with(
+            root,
+            &mut tracked,
+            &mut pending,
+            MacosProcessEvent::Child { pid: child.pid },
+            |pid| Ok(Some(ProcessRecord::new(pid, root.pid, child.generation, 0))),
+        )
+        .expect("child event stages generation A");
+        reduce_macos_process_event_with(
+            root,
+            &mut tracked,
+            &mut pending,
+            MacosProcessEvent::Drained,
+            |pid| Ok(Some(ProcessRecord::new(pid, 1, replacement.generation, 0))),
+        )
+        .expect("drain generation comparison succeeds");
+
+        assert!(tracked.is_empty(), "neither generation is published");
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn macos_event_reducer_stale_exit_preserves_tracked_replacement() {
+        let root = ProcessIdentity {
+            pid: 10,
+            generation: 1_000,
+        };
+        let replacement = ProcessIdentity {
+            pid: 11,
+            generation: 9_999,
+        };
+        let mut tracked = std::collections::HashMap::from([(replacement.pid, replacement)]);
+        let mut pending = std::collections::HashMap::new();
+
+        reduce_macos_process_event_with(
+            root,
+            &mut tracked,
+            &mut pending,
+            MacosProcessEvent::Exit {
+                pid: replacement.pid,
+            },
+            |pid| {
+                Ok(Some(ProcessRecord::new(
+                    pid,
+                    root.pid,
+                    replacement.generation,
+                    0,
+                )))
+            },
+        )
+        .expect("stale exit event reduction succeeds");
+        assert_eq!(
+            tracked.get(&replacement.pid),
+            Some(&replacement),
+            "an old exit event must not erase the current tracked generation"
+        );
+    }
+
+    #[test]
+    fn macos_child_resolution_discards_edges_when_parent_generation_changes() {
+        let parent = ProcessIdentity {
+            pid: 10,
+            generation: 1_000,
+        };
+        let replacement = ProcessIdentity {
+            pid: parent.pid,
+            generation: 9_999,
+        };
+        let validations = std::cell::Cell::new(0_u8);
+        let mut observed = Vec::new();
+
+        visit_identity_bound_children_with(
+            parent,
+            [Ok(11)],
+            |pid| {
+                if pid == parent.pid {
+                    let validation = validations.get();
+                    validations.set(validation + 1);
+                    let generation = if validation == 0 {
+                        parent.generation
+                    } else {
+                        replacement.generation
+                    };
+                    Ok(Some(ProcessRecord::new(pid, 1, generation, 0)))
+                } else {
+                    Ok(Some(ProcessRecord::new(pid, parent.pid, 1_100, 0)))
+                }
+            },
+            |identity| {
+                observed.push(identity);
+                Ok(())
+            },
+        )
+        .expect("generation validation must remain available");
+
+        assert!(
+            observed.is_empty(),
+            "children resolved across a parent generation change must be discarded"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_targeted_reader_revalidates_parent_generation_before_following_its_children() {
+        fn write_process(
+            root: &Path,
+            pid: libc::pid_t,
+            parent: libc::pid_t,
+            generation: u128,
+            children: &str,
+        ) {
+            let task = root
+                .join(pid.to_string())
+                .join("task")
+                .join(pid.to_string());
+            fs::create_dir_all(&task).expect("create synthetic process task");
+            fs::write(task.join("children"), children).expect("write synthetic children");
+            let mut stat = format!("{pid} (process-{pid}) S {parent}").into_bytes();
+            for _ in 0..17 {
+                stat.extend_from_slice(b" 0");
+            }
+            stat.extend_from_slice(format!(" {generation}\n").as_bytes());
+            fs::write(root.join(pid.to_string()).join("stat"), stat).expect("write synthetic stat");
+        }
+
+        let proc_root = tempfile::TempDir::new().expect("synthetic proc root");
+        write_process(proc_root.path(), 10, 1, 1_000, "11\n");
+        write_process(proc_root.path(), 11, 10, 1_100, "12\n");
+        write_process(proc_root.path(), 12, 11, 1_200, "");
+        let mut observed = Vec::new();
+
+        let scan = descendant_processes_at(
+            proc_root.path(),
+            10,
+            Instant::now() + Duration::from_secs(1),
+            ProcessScanLimits {
+                process_entries: 8,
+                metadata_bytes: 8 * 1024,
+                descendants: 4,
+            },
+            |identity| {
+                observed.push(identity);
+                if identity.pid == 11 {
+                    write_process(proc_root.path(), 11, 99, 9_999, "12\n");
+                }
+            },
+        )
+        .expect("a replaced frontier parent must be discarded rather than followed");
+
+        assert_eq!(
+            scan.identities
+                .iter()
+                .map(|identity| identity.pid)
+                .collect::<Vec<_>>(),
+            vec![11],
+            "the replacement generation's child edge must never become owned"
+        );
+        assert_eq!(observed, scan.identities);
+    }
+
+    #[test]
+    fn direct_supervisor_activation_cannot_execute_an_arbitrary_program() {
+        let root = tempfile::TempDir::new().expect("supervisor activation root");
+        let marker = root.path().join("executed");
+        let executable = snapshot_worker_executable().expect("trusted git-cli executable");
+        let status = Command::new(&executable.source_path)
+            .env(PROCESS_SUPERVISOR_ENV, "1")
+            .args([
+                OsStr::new("/bin/sh"),
+                OsStr::new("-c"),
+                OsStr::new("printf executed > \"$NILS_SUPERVISOR_MARKER\""),
+            ])
+            .env("NILS_SUPERVISOR_MARKER", &marker)
+            .status()
+            .expect("invoke direct supervisor activation");
+
+        assert!(
+            !status.success(),
+            "unauthenticated supervisor mode must fail"
+        );
+        assert!(!marker.exists(), "unauthenticated argv must never execute");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_process_stat_parser_accepts_non_utf8_process_names() {
+        let mut stat = b"4242 (process-\xff-name) S 7".to_vec();
+        for _ in 0..17 {
+            stat.extend_from_slice(b" 0");
+        }
+        stat.extend_from_slice(b" 12345\n");
+
+        let record = parse_linux_process_record(&stat)
+            .expect("non-UTF-8 process names must not hide process identity");
+        assert_eq!(record.identity.pid, 4242);
+        assert_eq!(record.parent, 7);
+        assert_eq!(record.identity.generation, 12345);
     }
 
     fn assert_process_absent(pid: libc::pid_t, label: &str) {
@@ -5219,37 +10878,116 @@ mod tests {
         assert_process_absent(child_pid, "timed-out snapshot worker child");
     }
 
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn supervisor_ownership_eof_terminates_the_target_before_the_original_deadline() {
+        let root = tempfile::TempDir::new().expect("ownership EOF root");
+        let pid_path = root.path().join("blocked.pid");
+        let mut supervisor = spawn_authenticated_supervisor_fixture_with_timeout(
+            "blocked-child",
+            &pid_path,
+            Duration::from_secs(5),
+        );
+        let publication_deadline = Instant::now() + Duration::from_secs(1);
+        while !pid_path.exists() {
+            assert!(
+                Instant::now() < publication_deadline,
+                "blocked target did not publish its PID"
+            );
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        let pid = fs::read_to_string(&pid_path)
+            .expect("read blocked target PID")
+            .parse::<libc::pid_t>()
+            .expect("parse blocked target PID");
+
+        supervisor.abandon_owner();
+        let owner_loss_deadline = Instant::now() + Duration::from_millis(500);
+        let status = loop {
+            if let Some(status) = supervisor.try_wait().expect("poll abandoned supervisor") {
+                break status;
+            }
+            assert!(
+                Instant::now() < owner_loss_deadline,
+                "supervisor ignored authenticated ownership-channel EOF"
+            );
+            std::thread::sleep(Duration::from_millis(2));
+        };
+
+        assert!(status.success(), "ownership-loss supervisor fixture failed");
+        assert_process_absent(pid, "target after supervisor ownership loss");
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn supervisor_retains_the_original_absolute_deadline_after_spawn() {
+        let root = tempfile::TempDir::new().expect("supervisor deadline root");
+        let pid_path = root.path().join("blocked.pid");
+        let started = Instant::now();
+        let mut supervisor = spawn_authenticated_supervisor_fixture_with_timeout_and_delay(
+            "blocked-child",
+            &pid_path,
+            Duration::from_millis(500),
+            Duration::from_millis(300),
+        );
+        let completion_deadline = Instant::now() + Duration::from_secs(1);
+        let status = loop {
+            if let Some(status) = supervisor.try_wait().expect("poll deadline supervisor") {
+                break status;
+            }
+            assert!(
+                Instant::now() < completion_deadline,
+                "supervisor did not retain the original absolute deadline"
+            );
+            std::thread::sleep(Duration::from_millis(2));
+        };
+
+        assert!(status.success(), "deadline supervisor fixture failed");
+        assert!(
+            started.elapsed() < Duration::from_millis(700),
+            "supervisor reset the deadline after delayed authentication: {:?}",
+            started.elapsed()
+        );
+        let pid = fs::read_to_string(&pid_path)
+            .expect("read deadline target PID")
+            .parse::<libc::pid_t>()
+            .expect("parse deadline target PID");
+        assert_process_absent(pid, "target after supervisor deadline");
+    }
+
     #[test]
     fn successful_git_output_reaps_a_surviving_process_group_child() {
         let root = tempfile::TempDir::new().expect("surviving child root");
         let pid_path = root.path().join("child.pid");
-        let script = format!(
-            "sleep 60 </dev/null >/dev/null 2>&1 & printf %s $! > '{}'",
-            pid_path.display()
-        );
-        let mut command = Command::new("/bin/sh");
-        command
-            .args(["-c", &script])
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .process_group(0);
-
-        let output = output_with_limits(&mut command, Duration::from_secs(1), 1024, 1024)
-            .expect("successful leader must return after reaping its process group");
-
-        assert!(output.status.success());
-        let pid: libc::pid_t = fs::read_to_string(pid_path)
+        let mut supervisor = spawn_authenticated_supervisor_fixture("successful-child", &pid_path);
+        let publication_deadline = Instant::now() + Duration::from_secs(1);
+        while !pid_path.exists() {
+            assert!(
+                Instant::now() < publication_deadline,
+                "successful child did not publish its process identity"
+            );
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        let pid: libc::pid_t = fs::read_to_string(&pid_path)
             .expect("read surviving child pid")
             .parse()
             .expect("parse surviving child pid");
+        let identity = process_identity(pid)
+            .expect("read surviving child identity")
+            .expect("surviving child generation exists");
+        let cleanup = PublishedPidCleanup::new(identity);
+        let status = supervisor.wait().expect("wait for supervisor fixture");
+
+        assert!(status.success(), "authenticated supervisor fixture failed");
         assert_process_absent(pid, "successful command child");
+        drop(cleanup);
     }
 
     #[test]
     fn git_output_deadline_does_not_join_a_descendant_held_pipe() {
         let mut command = Command::new("/bin/sh");
         command
-            .args(["-c", "while :; do :; done & exit 0"])
+            .args(["-c", "while :; do :; done & while :; do :; done"])
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .process_group(0);
@@ -5264,6 +11002,49 @@ mod tests {
             started.elapsed()
         );
         assert!(error.to_string().contains("time limit"));
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn output_cleanup_tracks_escaped_descendants_after_the_group_leader_exits() {
+        let root = tempfile::TempDir::new().expect("escaped output child root");
+        let pid_path = root.path().join("escaped.pid");
+        let spawned =
+            spawn_authenticated_supervisor_output_fixture("escaped-output-timeout", &pid_path);
+        let publication_deadline = Instant::now() + Duration::from_secs(1);
+        while !pid_path.exists() {
+            assert!(
+                Instant::now() < publication_deadline,
+                "escaped output leaf did not publish its process identity"
+            );
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        let pid: libc::pid_t = fs::read_to_string(&pid_path)
+            .expect("read escaped output leaf PID")
+            .parse()
+            .expect("parse escaped output leaf PID");
+        let identity = process_identity(pid)
+            .expect("read escaped output leaf identity")
+            .expect("escaped output leaf generation exists");
+        let cleanup = PublishedPidCleanup::new(identity);
+
+        let error = collect_output_child_until(
+            spawned,
+            Instant::now() + Duration::from_millis(100),
+            1024,
+            1024,
+            1024,
+        )
+        .expect_err("the parked target must hit the supervised output deadline");
+        assert_eq!(
+            error
+                .downcast_ref::<DirtyCheckoutError>()
+                .expect("typed escaped output timeout")
+                .kind(),
+            DirtyCheckoutErrorKind::Timeout
+        );
+        assert_process_absent(pid, "escaped output descendant after leader exit");
+        drop(cleanup);
     }
 
     #[test]
@@ -5284,55 +11065,38 @@ mod tests {
         assert!(error.to_string().contains("size limit"));
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
-    fn detached_pipe_holder_does_not_leave_reader_threads_or_processes() {
-        struct KillOnDrop(libc::pid_t);
-
-        impl Drop for KillOnDrop {
-            fn drop(&mut self) {
-                unsafe {
-                    libc::kill(self.0, libc::SIGKILL);
-                }
-            }
-        }
-
+    fn detached_double_fork_pipe_holder_is_owned_and_terminated() {
         let root = tempfile::TempDir::new().expect("detached child root");
         let pid_path = root.path().join("detached.pid");
-        let script = format!(
-            "/usr/bin/python3 -c 'import os,time; os.setsid(); open(\"{}\", \"w\").write(str(os.getpid())); time.sleep(60)'",
-            pid_path.display()
-        );
-        let reader_threads = || {
-            fs::read_dir("/proc/self/task")
-                .expect("list process threads")
-                .filter_map(|entry| entry.ok())
-                .filter(|entry| {
-                    fs::read_to_string(entry.path().join("comm"))
-                        .is_ok_and(|name| name.starts_with("git-std"))
-                })
-                .count()
-        };
-        let baseline = reader_threads();
-        let mut command = Command::new("/bin/sh");
-        command
-            .args(["-c", &script])
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .process_group(0);
-
-        output_with_limits(&mut command, Duration::from_millis(100), 1024, 1024)
-            .expect_err("detached pipe holder must hit the deadline");
-        std::thread::sleep(Duration::from_millis(20));
-        let after = reader_threads();
+        let mut supervisor =
+            spawn_authenticated_supervisor_fixture("detached-double-fork", &pid_path);
+        let started = Instant::now();
+        while !pid_path.exists() {
+            assert!(
+                started.elapsed() < Duration::from_secs(1),
+                "detached fixture did not publish its process identity"
+            );
+            std::thread::sleep(Duration::from_millis(2));
+        }
         let pid: libc::pid_t = fs::read_to_string(&pid_path)
-            .expect("read detached child pid")
+            .expect("read detached final pid")
             .parse()
-            .expect("parse detached child pid");
-        let cleanup = KillOnDrop(pid);
+            .expect("parse detached final pid");
+        let identity = process_identity(pid)
+            .expect("read detached final identity")
+            .expect("detached final generation exists");
+        let cleanup = PublishedPidCleanup::new(identity);
+        unsafe {
+            libc::kill(-(supervisor.id() as libc::pid_t), libc::SIGTERM);
+        }
+        let status = supervisor
+            .wait()
+            .expect("wait for detached supervisor fixture");
+        assert!(status.success(), "detached supervisor fixture failed");
 
-        assert_eq!(after, baseline, "timeout leaked output reader threads");
-        assert_process_absent(pid, "detached timeout descendant");
+        assert_process_absent(pid, "detached double-fork timeout descendant");
         drop(cleanup);
     }
 
@@ -5424,7 +11188,8 @@ mod tests {
         }
 
         let root = tempfile::TempDir::new().expect("snapshot root");
-        let path = root.path().join("unopenable");
+        let canonical_root = fs::canonicalize(root.path()).expect("canonical snapshot root");
+        let path = canonical_root.join("unopenable");
         fs::write(&path, b"x").expect("write fixture");
         let mut hasher = FramedHasher::new();
         let mut budget = SnapshotBudget {
@@ -5450,7 +11215,7 @@ mod tests {
 
         let result = hash_worktree_object(
             &mut hasher,
-            root.path(),
+            &canonical_root,
             b"unopenable",
             false,
             None,
@@ -5671,6 +11436,90 @@ mod tests {
     }
 
     #[test]
+    fn post_install_rollback_prunes_revocation_tombstones() {
+        let (checkout, state_root, reason_path, snapshot, _challenge_path) =
+            adoption_transaction_fixture();
+        let checkout_root =
+            fs::canonicalize(checkout.path()).expect("canonicalize checkout fixture root");
+        let state_root_path =
+            fs::canonicalize(state_root.path()).expect("canonicalize state fixture root");
+        let identity = resolve_checkout(
+            &checkout_root,
+            false,
+            deadline_after(SNAPSHOT_TIMEOUT).expect("identity deadline"),
+        )
+        .expect("resolve checkout identity");
+        let checkout_dir = state_root_path
+            .join(&snapshot.repository_key)
+            .join(&snapshot.checkout_key);
+        let mut receipt_ids = Vec::new();
+        for index in 0..MAX_REVOCATION_TOMBSTONES {
+            let receipt_id = format!("{index:064x}");
+            let adopted_at = index as u64 + 1;
+            let lease = LeaseRecord::V2(Box::new(LeaseV2Wire {
+                schema: LEASE_V2_SCHEMA.to_string(),
+                session_key: "d".repeat(64),
+                checkout_instance: identity.checkout_instance.clone(),
+                checkout_root: identity.root.to_string_lossy().into_owned(),
+                checkout_git_dir: identity.git_dir.to_string_lossy().into_owned(),
+                checkout_root_bytes: hex_bytes(identity.root.as_os_str().as_bytes()),
+                checkout_git_dir_bytes: hex_bytes(identity.git_dir.as_os_str().as_bytes()),
+                acquired_at: adopted_at,
+                refreshed_at: adopted_at,
+                expires_at: adopted_at + 100,
+                adoption: AdoptionRecord {
+                    schema: ADOPTION_SCHEMA.to_string(),
+                    receipt_schema: RECEIPT_SCHEMA.to_string(),
+                    receipt_id: receipt_id.clone(),
+                    snapshot_id: "e".repeat(64),
+                    authorization_turn_digest: "f".repeat(64),
+                    reason_digest: "1".repeat(64),
+                    adopted_at,
+                    challenge_issued_at: adopted_at - 1,
+                    challenge_digest: "2".repeat(64),
+                },
+            }));
+            write_json_atomic(
+                &checkout_dir.join(format!(".revoked-{receipt_id}.json")),
+                &lease,
+                false,
+            )
+            .expect("write rollback tombstone fixture");
+            receipt_ids.push(receipt_id);
+        }
+        let mut calls = 0;
+
+        adopt_dirty_with_snapshot(
+            &checkout_root,
+            &state_root_path,
+            &"a".repeat(64),
+            &reason_path,
+            |path| {
+                calls += 1;
+                if calls == 4 {
+                    fs::write(path.join("dirty.txt"), b"drift for tombstone pruning\n")
+                        .expect("introduce post-stage drift");
+                }
+                dirty_snapshot(path)
+            },
+        )
+        .expect_err("post-stage drift must roll back adoption");
+
+        let remaining = fs::read_dir(&checkout_dir)
+            .expect("list rollback tombstones")
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| entry.file_name().as_bytes().starts_with(b".revoked-"))
+            .count();
+        assert_eq!(remaining, MAX_REVOCATION_TOMBSTONES);
+        assert!(
+            !checkout_dir
+                .join(format!(".revoked-{}.json", receipt_ids[0]))
+                .exists(),
+            "oldest unprotected tombstone must be pruned"
+        );
+    }
+
+    #[test]
     fn adoption_expiry_is_checked_at_the_durable_authorization_boundary() {
         let (checkout, state_root, reason_path, snapshot, challenge_path) =
             adoption_transaction_fixture();
@@ -5686,7 +11535,8 @@ mod tests {
             .join(&snapshot.checkout_key);
         let valid_at = challenge.issued_at;
         let expired_at = challenge.expires_at;
-        let lease_installed = std::cell::Cell::new(false);
+        let fourth_barrier_seen = std::cell::Cell::new(false);
+        let authoritative_lease_visible = std::cell::Cell::new(false);
         let mut snapshot_calls = 0;
 
         let error = adopt_dirty_with_snapshot_and_clock(
@@ -5696,11 +11546,14 @@ mod tests {
             &reason_path,
             |path| {
                 snapshot_calls += 1;
-                lease_installed.set(checkout_dir.join("lease.json").exists());
+                if snapshot_calls == 4 {
+                    authoritative_lease_visible.set(checkout_dir.join("lease.json").exists());
+                    fourth_barrier_seen.set(true);
+                }
                 dirty_snapshot(path)
             },
             || {
-                Ok(if lease_installed.get() {
+                Ok(if fourth_barrier_seen.get() {
                     expired_at
                 } else {
                     valid_at
@@ -5711,8 +11564,8 @@ mod tests {
 
         assert_eq!(snapshot_calls, 4);
         assert!(
-            lease_installed.get(),
-            "synthetic expiry must begin only after the lease is observably installed"
+            !authoritative_lease_visible.get(),
+            "authoritative lease must remain unpublished through the fourth barrier"
         );
         assert_eq!(
             error
@@ -5728,7 +11581,7 @@ mod tests {
     }
 
     #[test]
-    fn crash_after_lease_install_rechecks_authorization_before_commit_recovery() {
+    fn crash_after_lease_staging_rechecks_authorization_before_commit_recovery() {
         let (checkout, state_root, reason_path, snapshot, challenge_path) =
             adoption_transaction_fixture();
         let checkout_root =
@@ -5752,7 +11605,7 @@ mod tests {
                 |path| {
                     snapshot_calls += 1;
                     if snapshot_calls == 4 {
-                        panic!("injected crash after durable lease installation");
+                        panic!("injected crash after durable lease staging");
                     }
                     dirty_snapshot(path)
                 },
@@ -5760,7 +11613,19 @@ mod tests {
             );
         }));
         assert!(crashed.is_err(), "fault injection must interrupt adoption");
-        assert!(checkout_dir.join("lease.json").exists());
+        assert!(
+            !checkout_dir.join("lease.json").exists(),
+            "crash before barrier four must not publish authoritative authority"
+        );
+        assert_eq!(
+            fs::read_dir(&checkout_dir)
+                .expect("list staged crash state")
+                .filter_map(|entry| entry.ok())
+                .filter(|entry| entry.file_name().as_bytes().starts_with(b".pending-lease-"))
+                .count(),
+            1,
+            "crash must retain one private staged lease"
+        );
         assert!(
             fs::read_dir(&checkout_dir)
                 .expect("list pending crash state")
@@ -5792,6 +11657,96 @@ mod tests {
         assert!(
             !checkout_dir.join("lease.json").exists(),
             "unverified provisional lease must be revoked"
+        );
+    }
+
+    #[test]
+    fn staged_retry_preserves_a_newer_authoritative_foreign_lease() {
+        let (checkout, state_root, reason_path, snapshot, challenge_path) =
+            adoption_transaction_fixture();
+        let checkout_root =
+            fs::canonicalize(checkout.path()).expect("canonicalize checkout fixture root");
+        let state_root_path =
+            fs::canonicalize(state_root.path()).expect("canonicalize state fixture root");
+        let identity = resolve_checkout(
+            &checkout_root,
+            false,
+            deadline_after(SNAPSHOT_TIMEOUT).expect("identity deadline"),
+        )
+        .expect("resolve checkout identity");
+        let challenge: ChallengeRecord =
+            serde_json::from_slice(&fs::read(&challenge_path).expect("read crash challenge"))
+                .expect("parse crash challenge");
+        let checkout_dir = state_root_path
+            .join(&snapshot.repository_key)
+            .join(&snapshot.checkout_key);
+        let lease_path = checkout_dir.join("lease.json");
+        let mut snapshot_calls = 0;
+
+        let crashed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = adopt_dirty_with_snapshot_and_clock(
+                &checkout_root,
+                &state_root_path,
+                &"a".repeat(64),
+                &reason_path,
+                |path| {
+                    snapshot_calls += 1;
+                    if snapshot_calls == 4 {
+                        panic!("injected crash after durable lease staging");
+                    }
+                    dirty_snapshot(path)
+                },
+                || Ok(challenge.issued_at),
+            );
+        }));
+        assert!(crashed.is_err(), "fault injection must interrupt adoption");
+
+        let foreign = LeaseRecord::V1(LeaseV1Wire {
+            schema: LEASE_V1_SCHEMA.to_string(),
+            session_key: "b".repeat(64),
+            checkout_instance: identity.checkout_instance.clone(),
+            checkout_root: identity.root.to_string_lossy().into_owned(),
+            checkout_git_dir: identity.git_dir.to_string_lossy().into_owned(),
+            acquired_at: challenge.issued_at,
+            refreshed_at: challenge.issued_at,
+            expires_at: challenge.expires_at.saturating_add(3_600),
+        });
+        let mut foreign_bytes =
+            serde_json::to_vec_pretty(&foreign).expect("serialize newer foreign lease");
+        foreign_bytes.push(b'\n');
+        fs::write(&lease_path, &foreign_bytes).expect("write newer foreign lease");
+        fs::set_permissions(&lease_path, fs::Permissions::from_mode(0o600))
+            .expect("make newer foreign lease private");
+        sync_directory(&checkout_dir).expect("make newer foreign lease durable");
+
+        let error = adopt_dirty_with_snapshot_and_clock(
+            &checkout_root,
+            &state_root_path,
+            &"a".repeat(64),
+            &reason_path,
+            dirty_snapshot,
+            || Ok(challenge.issued_at),
+        )
+        .expect_err("staged retry must not overwrite a newer foreign lease");
+
+        assert_eq!(
+            error
+                .downcast_ref::<DirtyCheckoutError>()
+                .expect("typed foreign staged-retry conflict")
+                .kind(),
+            DirtyCheckoutErrorKind::ForeignLease
+        );
+        assert_eq!(
+            fs::read(&lease_path).expect("read preserved foreign lease"),
+            foreign_bytes,
+            "staged retry must preserve the exact newer foreign lease bytes"
+        );
+        assert!(
+            fs::read_dir(&checkout_dir)
+                .expect("list retained staged state")
+                .filter_map(|entry| entry.ok())
+                .any(|entry| entry.file_name().as_bytes().starts_with(b".pending-lease-")),
+            "foreign conflict must retain staged recovery evidence"
         );
     }
 
@@ -5848,7 +11803,54 @@ mod tests {
     }
 
     #[test]
-    fn adoption_rollback_restores_exact_active_same_session_v1_lease() {
+    fn pending_rollback_binds_expired_authoritative_lease_bytes() {
+        let now = 1_000;
+        let v1 = LeaseRecord::V1(LeaseV1Wire {
+            schema: LEASE_V1_SCHEMA.to_string(),
+            session_key: "a".repeat(64),
+            checkout_instance: "b".repeat(64),
+            checkout_root: "/checkout".to_string(),
+            checkout_git_dir: "/checkout/.git".to_string(),
+            acquired_at: 1,
+            refreshed_at: 2,
+            expires_at: now - 1,
+        });
+        let v2 = LeaseRecord::V2(Box::new(LeaseV2Wire {
+            schema: LEASE_V2_SCHEMA.to_string(),
+            session_key: "a".repeat(64),
+            checkout_instance: "b".repeat(64),
+            checkout_root: "/checkout".to_string(),
+            checkout_git_dir: "/checkout/.git".to_string(),
+            checkout_root_bytes: hex_bytes(OsStr::new("/checkout").as_bytes()),
+            checkout_git_dir_bytes: hex_bytes(OsStr::new("/checkout/.git").as_bytes()),
+            acquired_at: 1,
+            refreshed_at: 2,
+            expires_at: now - 1,
+            adoption: AdoptionRecord {
+                schema: ADOPTION_SCHEMA.to_string(),
+                receipt_schema: RECEIPT_SCHEMA.to_string(),
+                receipt_id: "c".repeat(64),
+                snapshot_id: "d".repeat(64),
+                authorization_turn_digest: "e".repeat(64),
+                reason_digest: "f".repeat(64),
+                adopted_at: 2,
+                challenge_issued_at: 1,
+                challenge_digest: "1".repeat(64),
+            },
+        }));
+
+        for lease in [&v1, &v2] {
+            let bytes = serde_json::to_vec(lease).expect("serialize expired predecessor");
+            assert_eq!(
+                preserved_predecessor_lease_bytes(Some(lease), Some(bytes.clone())),
+                Some(bytes),
+                "pre-publication rollback must retain the untouched expired predecessor"
+            );
+        }
+    }
+
+    #[test]
+    fn adoption_rollback_restores_exact_max_size_active_same_session_v1_lease() {
         let (checkout, state_root, reason_path, snapshot, _challenge_path) =
             adoption_transaction_fixture();
         let checkout_root =
@@ -5879,6 +11881,7 @@ mod tests {
         let mut predecessor_bytes =
             serde_json::to_vec_pretty(&predecessor).expect("serialize exact predecessor");
         predecessor_bytes.push(b'\n');
+        predecessor_bytes.resize(MAX_STATE_FILE_BYTES, b' ');
         fs::write(&lease_path, &predecessor_bytes).expect("write exact predecessor lease");
         fs::set_permissions(&lease_path, fs::Permissions::from_mode(0o600))
             .expect("make predecessor lease private");
@@ -5912,6 +11915,159 @@ mod tests {
             fs::read(&lease_path).expect("read restored predecessor"),
             predecessor_bytes,
             "rollback must restore the exact predecessor bytes"
+        );
+    }
+
+    #[test]
+    fn adoption_recovery_scan_rejects_the_entry_cap_plus_one_before_mutation() {
+        const RECOVERY_ENTRY_CAP: usize = 1_024;
+        let (checkout, state_root, reason_path, snapshot, challenge_path) =
+            adoption_transaction_fixture();
+        let checkout_root =
+            fs::canonicalize(checkout.path()).expect("canonicalize checkout fixture root");
+        let state_root_path =
+            fs::canonicalize(state_root.path()).expect("canonicalize state fixture root");
+        let checkout_dir = state_root_path
+            .join(&snapshot.repository_key)
+            .join(&snapshot.checkout_key);
+        for index in 0..RECOVERY_ENTRY_CAP {
+            fs::write(checkout_dir.join(format!("inert-{index:04}")), b"")
+                .expect("write inert recovery scan entry");
+        }
+        fs::write(checkout_root.join("dirty.txt"), b"stale challenge\n")
+            .expect("drift challenge fixture");
+
+        let error = adopt_dirty(
+            &checkout_root,
+            &state_root_path,
+            &"a".repeat(64),
+            &reason_path,
+        )
+        .expect_err("oversized recovery scan must fail closed");
+
+        assert_eq!(
+            error
+                .downcast_ref::<DirtyCheckoutError>()
+                .expect("typed recovery scan limit")
+                .kind(),
+            DirtyCheckoutErrorKind::ResourceUnavailable
+        );
+        assert!(
+            challenge_path.exists(),
+            "scan refusal must not consume challenge"
+        );
+        assert!(
+            !checkout_dir.join("receipts").exists(),
+            "scan refusal must precede transition artifacts"
+        );
+    }
+
+    #[test]
+    fn adoption_recovers_checkout_wide_pending_predecessor_before_another_token() {
+        let (checkout, state_root, reason_path, snapshot, challenge_path) =
+            adoption_transaction_fixture();
+        let checkout_root =
+            fs::canonicalize(checkout.path()).expect("canonicalize checkout fixture root");
+        let state_root_path =
+            fs::canonicalize(state_root.path()).expect("canonicalize state fixture root");
+        let identity = resolve_checkout(
+            &checkout_root,
+            false,
+            deadline_after(SNAPSHOT_TIMEOUT).expect("identity deadline"),
+        )
+        .expect("resolve checkout identity");
+        let checkout_dir = state_root_path
+            .join(&snapshot.repository_key)
+            .join(&snapshot.checkout_key);
+        let challenge_dir = checkout_dir.join("challenges");
+        let lease_path = checkout_dir.join("lease.json");
+        let now = unix_time().expect("predecessor lease time");
+        let predecessor = LeaseRecord::V1(LeaseV1Wire {
+            schema: LEASE_V1_SCHEMA.to_string(),
+            session_key: "b".repeat(64),
+            checkout_instance: identity.checkout_instance.clone(),
+            checkout_root: identity.root.to_string_lossy().into_owned(),
+            checkout_git_dir: identity.git_dir.to_string_lossy().into_owned(),
+            acquired_at: now - 10,
+            refreshed_at: now,
+            expires_at: now + 3_600,
+        });
+        let mut predecessor_bytes =
+            serde_json::to_vec_pretty(&predecessor).expect("serialize predecessor");
+        predecessor_bytes.push(b'\n');
+        fs::write(&lease_path, &predecessor_bytes).expect("write predecessor lease");
+        fs::set_permissions(&lease_path, fs::Permissions::from_mode(0o600))
+            .expect("make predecessor private");
+        sync_directory(&checkout_dir).expect("make predecessor durable");
+        let original_challenge: ChallengeRecord =
+            serde_json::from_slice(&fs::read(&challenge_path).expect("read first challenge"))
+                .expect("parse first challenge");
+        let first_token_digest = sha256_hex("a".repeat(64).as_bytes());
+        let mut snapshot_calls = 0;
+
+        let crashed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = adopt_dirty_with_snapshot(
+                &checkout_root,
+                &state_root_path,
+                &"a".repeat(64),
+                &reason_path,
+                |path| {
+                    snapshot_calls += 1;
+                    if snapshot_calls == 4 {
+                        panic!("injected crash after first-token lease staging");
+                    }
+                    dirty_snapshot(path)
+                },
+            );
+        }));
+        assert!(crashed.is_err(), "fault injection must interrupt adoption");
+        let first_pending_path = pending_adoption_path(&checkout_dir, &first_token_digest);
+        let pending_bytes = fs::read(&first_pending_path).expect("read first pending marker");
+        let pending: PendingAdoptionRecord =
+            serde_json::from_slice(&pending_bytes).expect("parse first pending marker");
+        fs::rename(
+            staged_lease_path(&checkout_dir, &pending.receipt_id),
+            checkout_dir.join(format!(".revoked-{}.json", pending.receipt_id)),
+        )
+        .expect("simulate durable first-token rollback tombstone");
+        sync_directory(&checkout_dir).expect("make first-token tombstone durable");
+
+        let second_token = "d".repeat(64);
+        let second_token_digest = sha256_hex(second_token.as_bytes());
+        let mut second_challenge = original_challenge;
+        second_challenge.token_digest = second_token_digest.clone();
+        write_json_atomic(
+            &challenge_dir.join(format!("{second_token_digest}.json")),
+            &second_challenge,
+            false,
+        )
+        .expect("write second challenge");
+        fs::write(checkout_root.join("dirty.txt"), b"stale second challenge\n")
+            .expect("drift second-token snapshot");
+
+        let error = adopt_dirty(
+            &checkout_root,
+            &state_root_path,
+            &second_token,
+            &reason_path,
+        )
+        .expect_err("stale second challenge must be rejected");
+
+        assert_eq!(
+            error
+                .downcast_ref::<DirtyCheckoutError>()
+                .expect("typed second-token drift")
+                .kind(),
+            DirtyCheckoutErrorKind::ChallengeDrift
+        );
+        assert_eq!(
+            fs::read(&lease_path).expect("read recovered predecessor"),
+            predecessor_bytes,
+            "checkout-wide recovery must preserve the exact predecessor"
+        );
+        assert!(
+            !first_pending_path.exists(),
+            "first-token recovery must complete before second-token validation"
         );
     }
 
@@ -6101,6 +12257,75 @@ mod tests {
     }
 
     #[test]
+    fn revocation_pruning_accepts_the_scan_cap_and_rejects_cap_plus_one() {
+        fn fixture(entry_count: usize) -> (tempfile::TempDir, PathBuf, CheckoutIdentity) {
+            let root = tempfile::TempDir::new().expect("revocation scan root");
+            let checkout = root.path().join("checkout");
+            let git_dir = root.path().join("git-dir");
+            let checkout_dir = root.path().join("state");
+            for directory in [&checkout, &git_dir, &checkout_dir] {
+                fs::create_dir(directory).expect("create revocation scan directory");
+                fs::set_permissions(directory, fs::Permissions::from_mode(0o700))
+                    .expect("make revocation scan directory private");
+            }
+            for index in 0..entry_count {
+                fs::write(checkout_dir.join(format!("inert-{index:04}")), b"")
+                    .expect("write revocation scan entry");
+            }
+            let identity = CheckoutIdentity {
+                root: checkout,
+                git_dir: git_dir.clone(),
+                common_dir: git_dir,
+                repository_key: "a".repeat(64),
+                checkout_key: "b".repeat(64),
+                checkout_instance: "c".repeat(32),
+            };
+            (root, checkout_dir, identity)
+        }
+
+        let (_exact_root, exact_dir, exact_identity) = fixture(MAX_RECOVERY_DIRECTORY_ENTRIES);
+        prune_revocation_tombstones(
+            &exact_dir,
+            &exact_identity,
+            &"d".repeat(64),
+            deadline_after(SNAPSHOT_TIMEOUT).expect("exact scan deadline"),
+        )
+        .expect("the exact revocation scan entry cap must remain supported");
+
+        let deadline_error = prune_revocation_tombstones(
+            &exact_dir,
+            &exact_identity,
+            &"d".repeat(64),
+            Instant::now(),
+        )
+        .expect_err("an expired revocation scan deadline must fail closed");
+        assert_eq!(
+            deadline_error
+                .downcast_ref::<DirtyCheckoutError>()
+                .expect("typed revocation scan timeout")
+                .kind(),
+            DirtyCheckoutErrorKind::Timeout
+        );
+
+        let (_overflow_root, overflow_dir, overflow_identity) =
+            fixture(MAX_RECOVERY_DIRECTORY_ENTRIES + 1);
+        let error = prune_revocation_tombstones(
+            &overflow_dir,
+            &overflow_identity,
+            &"d".repeat(64),
+            deadline_after(SNAPSHOT_TIMEOUT).expect("overflow scan deadline"),
+        )
+        .expect_err("revocation scan entry cap plus one must fail closed");
+        assert_eq!(
+            error
+                .downcast_ref::<DirtyCheckoutError>()
+                .expect("typed revocation scan limit")
+                .kind(),
+            DirtyCheckoutErrorKind::ResourceUnavailable
+        );
+    }
+
+    #[test]
     fn revocation_tombstones_are_pruned_oldest_first_with_current_protected() {
         let root = tempfile::TempDir::new().expect("tombstone retention root");
         let checkout = root.path().join("checkout");
@@ -6177,8 +12402,13 @@ mod tests {
         .expect("write pending tombstone reference");
         let current = receipt_ids.last().expect("current tombstone");
 
-        prune_revocation_tombstones(&checkout_dir, &identity, current)
-            .expect("prune tombstone retention set");
+        prune_revocation_tombstones(
+            &checkout_dir,
+            &identity,
+            current,
+            deadline_after(SNAPSHOT_TIMEOUT).expect("pruning deadline"),
+        )
+        .expect("prune tombstone retention set");
 
         let remaining = fs::read_dir(&checkout_dir)
             .expect("list retained tombstones")
@@ -6203,6 +12433,120 @@ mod tests {
                 .join(format!(".revoked-{current}.json"))
                 .exists()
         );
+    }
+
+    #[test]
+    fn failed_checkout_recovery_protects_every_prescanned_pending_tombstone() {
+        let root = tempfile::TempDir::new().expect("pending tombstone recovery root");
+        let checkout = root.path().join("checkout");
+        let git_dir = root.path().join("git-dir");
+        let checkout_dir = root.path().join("state");
+        let challenge_dir = checkout_dir.join("challenges");
+        let receipts_dir = checkout_dir.join("receipts");
+        for directory in [
+            checkout.as_path(),
+            git_dir.as_path(),
+            checkout_dir.as_path(),
+            challenge_dir.as_path(),
+            receipts_dir.as_path(),
+        ] {
+            fs::create_dir(directory).expect("create pending tombstone recovery directory");
+            fs::set_permissions(directory, fs::Permissions::from_mode(0o700))
+                .expect("make pending tombstone recovery directory private");
+        }
+        let identity = CheckoutIdentity {
+            root: checkout,
+            git_dir: git_dir.clone(),
+            common_dir: git_dir,
+            repository_key: "a".repeat(64),
+            checkout_key: "b".repeat(64),
+            checkout_instance: "c".repeat(32),
+        };
+        let mut receipt_ids = Vec::new();
+        for index in 0..=MAX_REVOCATION_TOMBSTONES {
+            let receipt_id = format!("{index:064x}");
+            let adopted_at = 100 + index as u64;
+            let lease = LeaseRecord::V2(Box::new(LeaseV2Wire {
+                schema: LEASE_V2_SCHEMA.to_string(),
+                session_key: "d".repeat(64),
+                checkout_instance: identity.checkout_instance.clone(),
+                checkout_root: identity.root.to_string_lossy().into_owned(),
+                checkout_git_dir: identity.git_dir.to_string_lossy().into_owned(),
+                checkout_root_bytes: hex_bytes(identity.root.as_os_str().as_bytes()),
+                checkout_git_dir_bytes: hex_bytes(identity.git_dir.as_os_str().as_bytes()),
+                acquired_at: adopted_at,
+                refreshed_at: adopted_at,
+                expires_at: adopted_at + 100,
+                adoption: AdoptionRecord {
+                    schema: ADOPTION_SCHEMA.to_string(),
+                    receipt_schema: RECEIPT_SCHEMA.to_string(),
+                    receipt_id: receipt_id.clone(),
+                    snapshot_id: "e".repeat(64),
+                    authorization_turn_digest: "f".repeat(64),
+                    reason_digest: "1".repeat(64),
+                    adopted_at,
+                    challenge_issued_at: adopted_at - 1,
+                    challenge_digest: "2".repeat(64),
+                },
+            }));
+            write_json_atomic(
+                &checkout_dir.join(format!(".revoked-{receipt_id}.json")),
+                &lease,
+                false,
+            )
+            .expect("write pending tombstone recovery fixture");
+            receipt_ids.push(receipt_id);
+        }
+        for (token_digest, receipt_id) in [
+            ("8".repeat(64), &receipt_ids[0]),
+            ("9".repeat(64), &receipt_ids[1]),
+        ] {
+            let pending = PendingAdoptionRecord {
+                schema: PENDING_ADOPTION_SCHEMA.to_string(),
+                receipt_id: receipt_id.clone(),
+                token_digest: token_digest.clone(),
+                challenge_digest: "2".repeat(64),
+                session_key: "7".repeat(64),
+                checkout_instance: identity.checkout_instance.clone(),
+                snapshot_id: "e".repeat(64),
+                predecessor_receipt_id: None,
+                predecessor_receipt_digest: None,
+                predecessor_spent_challenge_digest: None,
+                predecessor_lease_digest: None,
+                predecessor_lease_bytes: None,
+            };
+            write_json_atomic(
+                &pending_adoption_path(&checkout_dir, &token_digest),
+                &pending,
+                false,
+            )
+            .expect("write pending tombstone reference");
+        }
+
+        let error = recover_checkout_pending_adoptions(
+            &checkout_dir,
+            &challenge_dir,
+            &identity,
+            &"6".repeat(64),
+            deadline_after(SNAPSHOT_TIMEOUT).expect("pending tombstone recovery deadline"),
+        )
+        .expect_err("one mismatched pending recovery must remain primary");
+
+        assert_eq!(
+            error
+                .downcast_ref::<DirtyCheckoutError>()
+                .expect("typed pending tombstone recovery failure")
+                .kind(),
+            DirtyCheckoutErrorKind::MalformedState
+        );
+        for receipt_id in &receipt_ids[..2] {
+            assert!(
+                checkout_dir
+                    .join(format!(".revoked-{receipt_id}.json"))
+                    .exists(),
+                "every prescanned pending marker must protect its tombstone"
+            );
+        }
     }
 
     #[test]

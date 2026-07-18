@@ -1180,6 +1180,17 @@ fn emit_success<T: Serialize, F: FnOnce() -> String>(
     }
 }
 
+fn error_envelope(command: &str, err: &CliError) -> Envelope<()> {
+    let mut envelope_error = EnvelopeError::new(err.code, err.message.as_ref());
+    if let Some(hint) = &err.hint {
+        envelope_error = envelope_error.with_hint(hint.as_ref());
+    }
+    if let Some(details) = &err.details {
+        envelope_error = envelope_error.with_details((**details).clone());
+    }
+    Envelope::failure(schema_version_for(BINARY, command, 1), envelope_error)
+}
+
 fn emit_error(command: &str, format: OutputFormat, err: CliError) -> i32 {
     if err.code == "help" {
         return exit::SUCCESS;
@@ -1187,15 +1198,7 @@ fn emit_error(command: &str, format: OutputFormat, err: CliError) -> i32 {
 
     match format {
         OutputFormat::Json => {
-            let mut envelope_error = EnvelopeError::new(err.code, err.message.as_ref());
-            if let Some(hint) = &err.hint {
-                envelope_error = envelope_error.with_hint(hint.as_ref());
-            }
-            if let Some(details) = err.details {
-                envelope_error = envelope_error.with_details(*details);
-            }
-            let envelope: Envelope<()> =
-                Envelope::failure(schema_version_for(BINARY, command, 1), envelope_error);
+            let envelope = error_envelope(command, &err);
             match serde_json::to_string(&envelope) {
                 Ok(serialized) => println!("{serialized}"),
                 Err(serialize_err) => eprintln!("failed to serialize JSON error: {serialize_err}"),

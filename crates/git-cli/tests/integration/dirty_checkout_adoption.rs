@@ -4,6 +4,7 @@ use git_cli::worktree::dirty_checkout_adoption::{
     revoke_dirty,
 };
 use nils_test_support::cmd::{CmdOutput, run_with};
+#[cfg(target_os = "linux")]
 use nils_test_support::git::{InitRepoOptions, init_repo_at_with};
 use pretty_assertions::assert_eq;
 use serde_json::json;
@@ -13,7 +14,7 @@ use std::os::fd::AsRawFd;
 use std::os::unix::ffi::OsStrExt;
 #[cfg(target_os = "linux")]
 use std::os::unix::ffi::OsStringExt;
-use std::os::unix::fs::{PermissionsExt, symlink};
+use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -267,6 +268,134 @@ fn adoption_supports_a_non_utf8_checkout_root_on_linux() {
         ),
         status_before,
         "adoption lifecycle must not mutate the checkout"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn real_cli_worker_lifecycle_supports_a_non_utf8_checkout_root() {
+    let checkout_parent = tempfile::TempDir::new().expect("CLI checkout parent");
+    let checkout = checkout_parent
+        .path()
+        .join(std::ffi::OsString::from_vec(b"cli-checkout-\xff".to_vec()));
+    fs::create_dir(&checkout).expect("create CLI non-UTF-8 checkout root");
+    init_repo_at_with(
+        &checkout,
+        InitRepoOptions::new()
+            .with_branch("main")
+            .with_initial_commit(),
+    );
+    fs::write(checkout.join("dirty.txt"), b"dirty CLI checkout\n")
+        .expect("write CLI dirty checkout fixture");
+    let status_before = git(
+        &checkout,
+        &["status", "--porcelain=v1", "--untracked-files=all"],
+    );
+    let harness = GitCliHarness::new();
+    let state_home = tempfile::TempDir::new().expect("CLI state home");
+    let reason_file = state_home.path().join("reason.txt");
+    fs::write(&reason_file, b"Preserve the native checkout.\n").expect("write CLI reason");
+
+    let snapshot_output = run_governed_command(
+        &harness,
+        &checkout,
+        state_home.path(),
+        false,
+        &["worktree", "dirty-snapshot", "--format=json"],
+    );
+    assert_eq!(
+        snapshot_output.code,
+        0,
+        "stderr: {}",
+        snapshot_output.stderr_text()
+    );
+    let snapshot_json: serde_json::Value =
+        serde_json::from_str(snapshot_output.stdout_text().trim()).expect("CLI snapshot JSON");
+    let data = &snapshot_json["data"];
+    let snapshot = DirtySnapshot {
+        schema: "agent-runtime.dirty-checkout-snapshot.v1",
+        repository_key: data["repository_key"]
+            .as_str()
+            .expect("repository key")
+            .to_string(),
+        checkout_key: data["checkout_key"]
+            .as_str()
+            .expect("checkout key")
+            .to_string(),
+        checkout_instance: data["checkout_instance"]
+            .as_str()
+            .expect("checkout instance")
+            .to_string(),
+        snapshot_id: data["snapshot_id"]
+            .as_str()
+            .expect("snapshot ID")
+            .to_string(),
+        head_oid: data["head_oid"]
+            .as_str()
+            .expect("HEAD identity")
+            .to_string(),
+        branch_ref_digest: data["branch_ref_digest"]
+            .as_str()
+            .expect("branch digest")
+            .to_string(),
+        tracked_entries: data["tracked_entries"].as_u64().expect("tracked count") as usize,
+        untracked_entries: data["untracked_entries"].as_u64().expect("untracked count") as usize,
+        hashed_bytes: data["hashed_bytes"].as_u64().expect("hashed bytes"),
+    };
+    write_challenge(state_home.path(), &snapshot);
+    let reason_arg = reason_file.to_string_lossy().to_string();
+    let adopted = run_governed_command(
+        &harness,
+        &checkout,
+        state_home.path(),
+        true,
+        &[
+            "worktree",
+            "adopt-dirty",
+            "--challenge",
+            CHALLENGE_TOKEN,
+            "--reason-file",
+            &reason_arg,
+            "--format=json",
+        ],
+    );
+    assert_eq!(adopted.code, 0, "stderr: {}", adopted.stderr_text());
+    let adopted_json: serde_json::Value =
+        serde_json::from_str(adopted.stdout_text().trim()).expect("CLI adoption JSON");
+    let receipt_id = adopted_json["data"]["receipt_id"]
+        .as_str()
+        .expect("CLI receipt ID");
+    let lease_path = checkout_state_dir(state_home.path(), &snapshot).join("lease.json");
+    let lease: serde_json::Value =
+        serde_json::from_slice(&fs::read(&lease_path).expect("read CLI native lease"))
+            .expect("parse CLI native lease");
+    assert_eq!(lease["checkout_root_bytes"], path_hex(&checkout));
+    assert_eq!(
+        lease["checkout_git_dir_bytes"],
+        path_hex(&checkout.join(".git"))
+    );
+
+    let revoked = run_governed_command(
+        &harness,
+        &checkout,
+        state_home.path(),
+        false,
+        &[
+            "worktree",
+            "revoke-dirty",
+            "--receipt",
+            receipt_id,
+            "--format=json",
+        ],
+    );
+    assert_eq!(revoked.code, 0, "stderr: {}", revoked.stderr_text());
+    assert_eq!(
+        git(
+            &checkout,
+            &["status", "--porcelain=v1", "--untracked-files=all"]
+        ),
+        status_before,
+        "real CLI lifecycle must preserve the non-UTF-8 checkout"
     );
 }
 
@@ -1132,6 +1261,44 @@ fn adopt_dirty_rejects_symlink_reason_files() {
 }
 
 #[test]
+fn governed_cli_feature_gate_accepts_only_exact_one() {
+    let harness = GitCliHarness::new();
+    let repo = init_repo();
+    let state_home = tempfile::TempDir::new().expect("state home");
+    let state_root = state_home.path().to_string_lossy().to_string();
+    let args = [
+        "worktree",
+        "adopt-dirty",
+        "--challenge",
+        CHALLENGE_TOKEN,
+        "--reason-file",
+        "/nonexistent/adoption-reason.txt",
+        "--format=json",
+    ];
+
+    for rejected in ["true", "TRUE", "yes", "YES", "01", "1 ", " 1"] {
+        let options = harness
+            .cmd_options(repo.path())
+            .with_env("AGENT_RUNTIME_CHECKOUT_LEASE_STATE_HOME", &state_root)
+            .with_env("AGENT_RUNTIME_DIRTY_CHECKOUT_ADOPTION", rejected);
+        let output = run_with(&harness.git_cli_bin(), &args, &options);
+        assert_json_error(
+            &output,
+            "dirty-checkout-adoption-disabled",
+            nils_common::cli_contract::exit::DATA,
+        );
+    }
+
+    let options = harness
+        .cmd_options(repo.path())
+        .with_env("AGENT_RUNTIME_CHECKOUT_LEASE_STATE_HOME", &state_root)
+        .with_env("AGENT_RUNTIME_DIRTY_CHECKOUT_ADOPTION", "1");
+    let accepted = run_with(&harness.git_cli_bin(), &args, &options);
+    let (_, code) = json_error_identity(&accepted);
+    assert_ne!(code, "dirty-checkout-adoption-disabled");
+}
+
+#[test]
 fn governed_cli_enforces_gate_and_returns_private_json_contracts() {
     let harness = GitCliHarness::new();
     let repo = init_repo();
@@ -1618,6 +1785,51 @@ fn adopt_dirty_argument_errors_never_reflect_bearer_or_path_values() {
 }
 
 #[test]
+fn revoke_dirty_argument_errors_never_reflect_receipt_format_or_stray_values() {
+    let harness = GitCliHarness::new();
+    let repo = init_repo();
+    let receipt = "receipt-value-that-must-not-leak";
+    let stray = "secret-positional-value";
+
+    for format in [None, Some("--format=json")] {
+        let mut args = vec!["worktree", "revoke-dirty", "--receipt", receipt, stray];
+        if let Some(format) = format {
+            args.push(format);
+        }
+        let output = harness.run(repo.path(), &args);
+        assert_ne!(output.code, 0);
+        let rendered = format!("{}{}", output.stdout_text(), output.stderr_text());
+        for secret in [receipt, stray] {
+            assert!(
+                !rendered.contains(secret),
+                "malformed argument output reflected {secret:?}: {rendered}"
+            );
+        }
+    }
+
+    let invalid_format = "secret-output-format";
+    let output = harness.run(
+        repo.path(),
+        &[
+            "worktree",
+            "revoke-dirty",
+            "--receipt",
+            receipt,
+            "--format",
+            invalid_format,
+        ],
+    );
+    assert_ne!(output.code, 0);
+    let rendered = format!("{}{}", output.stdout_text(), output.stderr_text());
+    for secret in [receipt, invalid_format] {
+        assert!(
+            !rendered.contains(secret),
+            "malformed format output reflected {secret:?}: {rendered}"
+        );
+    }
+}
+
+#[test]
 fn adopt_dirty_requires_nonempty_utf8_reason_before_state_transition() {
     let repo = init_repo();
     let state_home = tempfile::TempDir::new().expect("state home");
@@ -1938,7 +2150,11 @@ fn concurrent_adoption_consumes_a_challenge_exactly_once() {
         .map(|worker| worker.join().expect("adoption worker"))
         .collect();
 
-    assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 2);
+    assert_eq!(
+        results.iter().filter(|result| result.is_ok()).count(),
+        2,
+        "concurrent adoption results: {results:?}"
+    );
     let receipts: Vec<_> = results
         .iter()
         .map(|result| {
@@ -2236,6 +2452,215 @@ fn dirty_snapshot_rejects_hidden_index_flags() {
             "unexpected error for {flag}: {error}"
         );
     }
+}
+
+#[test]
+fn dirty_snapshot_rejects_hidden_index_flags_in_recursive_submodules() {
+    for flag in ["--assume-unchanged", "--skip-worktree"] {
+        let child = init_repo();
+        fs::write(child.path().join("tracked.txt"), "tracked\n").expect("write child file");
+        git(child.path(), &["add", "--", "tracked.txt"]);
+        git(child.path(), &["commit", "-qm", "add child fixture"]);
+
+        let repo = init_repo();
+        let child_path = child.path().to_string_lossy().to_string();
+        git(
+            repo.path(),
+            &[
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "add",
+                &child_path,
+                "modules/child",
+            ],
+        );
+        git(repo.path(), &["commit", "-qam", "add child submodule"]);
+        let child_checkout = repo.path().join("modules/child");
+        git(
+            &child_checkout,
+            &["update-index", flag, "--", "tracked.txt"],
+        );
+        fs::write(repo.path().join("dirty.txt"), "dirty\n").expect("write dirty anchor");
+
+        let error = dirty_snapshot(repo.path())
+            .expect_err("hidden recursive submodule index flag must fail closed");
+        assert_eq!(
+            error
+                .downcast_ref::<DirtyCheckoutError>()
+                .expect("typed recursive index-flag error")
+                .kind(),
+            DirtyCheckoutErrorKind::UnsupportedGitState,
+            "unexpected error for {flag}: {error}"
+        );
+    }
+}
+
+#[test]
+fn dirty_snapshot_overrides_repository_stat_cache_weakening() {
+    let repo = init_repo();
+    let tracked = repo.path().join("tracked.txt");
+    fs::write(&tracked, "original\n").expect("write tracked fixture");
+    git(repo.path(), &["add", "--", "tracked.txt"]);
+    git(repo.path(), &["commit", "-qm", "add tracked fixture"]);
+    git(repo.path(), &["config", "core.trustctime", "false"]);
+    git(repo.path(), &["config", "core.checkStat", "minimal"]);
+    fs::write(&tracked, "original\n").expect("refresh tracked fixture metadata");
+    std::thread::sleep(std::time::Duration::from_millis(1_100));
+    git(repo.path(), &["update-index", "--refresh"]);
+    fs::write(repo.path().join("dirty.txt"), "dirty\n").expect("write dirty anchor");
+    let before = dirty_snapshot(repo.path()).expect("snapshot before hidden edit");
+    let metadata = fs::metadata(&tracked).expect("tracked metadata");
+
+    fs::write(&tracked, "modified\n").expect("same-size tracked edit");
+    let path = std::ffi::CString::new(tracked.as_os_str().as_bytes()).expect("NUL-free path");
+    let times = [
+        libc::timespec {
+            tv_sec: metadata.atime(),
+            tv_nsec: metadata.atime_nsec(),
+        },
+        libc::timespec {
+            tv_sec: metadata.mtime(),
+            tv_nsec: metadata.mtime_nsec(),
+        },
+    ];
+    assert_eq!(
+        unsafe { libc::utimensat(libc::AT_FDCWD, path.as_ptr(), times.as_ptr(), 0) },
+        0,
+        "restore tracked fixture timestamps: {}",
+        std::io::Error::last_os_error()
+    );
+
+    let after = dirty_snapshot(repo.path()).expect("snapshot after hidden edit");
+    assert_ne!(
+        after.snapshot_id, before.snapshot_id,
+        "same-size restored-mtime edit must change the snapshot"
+    );
+}
+
+#[test]
+fn dirty_snapshot_forces_file_mode_tracking_against_hostile_local_config() {
+    let repo = init_repo();
+    let tracked = repo.path().join("tracked.txt");
+    fs::write(&tracked, "tracked\n").expect("write chmod fixture");
+    git(repo.path(), &["add", "--", "tracked.txt"]);
+    git(repo.path(), &["commit", "-qm", "add chmod fixture"]);
+    git(repo.path(), &["config", "core.fileMode", "false"]);
+    fs::write(repo.path().join("dirty.txt"), "dirty\n").expect("write dirty anchor");
+    let before = dirty_snapshot(repo.path()).expect("snapshot before chmod-only drift");
+
+    fs::set_permissions(&tracked, fs::Permissions::from_mode(0o755))
+        .expect("change only tracked executable mode");
+    assert_eq!(
+        git(repo.path(), &["diff", "--name-only", "--"]),
+        "",
+        "hostile local config must hide the chmod from an unprotected Git invocation"
+    );
+
+    let after = dirty_snapshot(repo.path()).expect("snapshot after chmod-only drift");
+    assert_ne!(
+        after.snapshot_id, before.snapshot_id,
+        "trusted snapshot must detect chmod-only drift despite local core.fileMode=false"
+    );
+}
+
+#[test]
+fn adopt_dirty_rejects_top_level_worktree_redirect_without_touching_target_state() {
+    let source = init_repo();
+    fs::write(source.path().join("source.txt"), "source\n").expect("write source fixture");
+    git(source.path(), &["add", "--", "source.txt"]);
+    git(source.path(), &["commit", "-qm", "add source fixture"]);
+
+    let target = init_repo();
+    fs::write(target.path().join("target.txt"), "target\n").expect("write target fixture");
+    git(target.path(), &["add", "--", "target.txt"]);
+    git(target.path(), &["commit", "-qm", "add target fixture"]);
+    fs::write(target.path().join("dirty.txt"), "target dirty\n")
+        .expect("write target dirty anchor");
+
+    let state_home = tempfile::TempDir::new().expect("redirect state home");
+    let reason_file = state_home.path().join("reason.txt");
+    fs::write(&reason_file, "Preserve the dirty checkout.\n").expect("write reason");
+    let target_snapshot = dirty_snapshot(target.path()).expect("snapshot redirect target");
+    let target_challenge = write_challenge(state_home.path(), &target_snapshot);
+    let target_state = checkout_state_dir(state_home.path(), &target_snapshot);
+    let target_instance = target.path().join(".git/.agent-runtime-checkout-instance");
+    let instance_before = fs::read(&target_instance).expect("read target instance sentinel");
+    let challenge_before = fs::read(&target_challenge).expect("read target challenge");
+    let target_arg = target.path().to_string_lossy().to_string();
+    git(
+        source.path(),
+        &["config", "core.worktree", target_arg.as_str()],
+    );
+
+    let error = adopt_dirty(
+        source.path(),
+        state_home.path(),
+        CHALLENGE_TOKEN,
+        &reason_file,
+    )
+    .expect_err("top-level worktree redirect must fail closed");
+
+    assert_eq!(
+        error
+            .downcast_ref::<DirtyCheckoutError>()
+            .expect("typed top-level redirect error")
+            .kind(),
+        DirtyCheckoutErrorKind::UnsupportedGitState
+    );
+    assert_eq!(
+        fs::read(&target_instance).expect("read preserved target instance sentinel"),
+        instance_before
+    );
+    assert_eq!(
+        fs::read(&target_challenge).expect("read preserved target challenge"),
+        challenge_before
+    );
+    assert!(!target_state.join("lease.json").exists());
+    assert!(!target_state.join("receipts").exists());
+}
+
+#[test]
+fn dirty_snapshot_rejects_submodule_worktree_identity_redirects() {
+    let child = init_repo();
+    fs::write(child.path().join("tracked.txt"), "tracked\n").expect("write child file");
+    git(child.path(), &["add", "--", "tracked.txt"]);
+    git(child.path(), &["commit", "-qm", "add child fixture"]);
+
+    let repo = init_repo();
+    let child_path = child.path().to_string_lossy().to_string();
+    git(
+        repo.path(),
+        &[
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "add",
+            &child_path,
+            "modules/child",
+        ],
+    );
+    git(repo.path(), &["commit", "-qam", "add child submodule"]);
+    let redirect = tempfile::TempDir::new().expect("redirected submodule worktree");
+    fs::write(redirect.path().join("README.md"), "init").expect("populate redirected initial file");
+    fs::write(redirect.path().join("tracked.txt"), "tracked\n")
+        .expect("populate redirected worktree");
+    let redirect_arg = redirect.path().to_string_lossy().to_string();
+    git(
+        &repo.path().join("modules/child"),
+        &["config", "core.worktree", &redirect_arg],
+    );
+    fs::write(repo.path().join("dirty.txt"), "dirty\n").expect("write dirty anchor");
+
+    let error =
+        dirty_snapshot(repo.path()).expect_err("submodule Git identity redirect must fail closed");
+    assert_eq!(
+        error
+            .downcast_ref::<DirtyCheckoutError>()
+            .expect("typed submodule identity error")
+            .kind(),
+        DirtyCheckoutErrorKind::UnsupportedGitState
+    );
 }
 
 #[test]

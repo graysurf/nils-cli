@@ -103,6 +103,11 @@ subcommands (matching the binary's `--help` output):
 hashes rather than raw local paths; adoption output returns only `receipt_id` and `snapshot_id`.
 Operational failures use the same envelope and nonzero exit status.
 
+Process containment is generation-bound: live tracking authority protects descendants it discovers
+or adopts. If every tracker is lost abnormally before a descendant is observed, there is no
+termination guarantee for that unseen descendant. Missing authenticated cleanup proof fails with
+`dirty-checkout-resource-unavailable`; post-loss fallback does not signal an unpinned PID or PGID.
+
 The managed layout (`repo-key`, the managed/external classification, and slug-based resolution) is
 anchored to the repository's primary worktree, so `worktree` commands behave identically whether run
 from the primary checkout or from inside any linked worktree.
