@@ -14,5 +14,12 @@
 # is mitigation; the root-cause isolation fix is tracked in #934.
 retries = 2
 
+# Process-containment fixtures own kernel tracking resources that cannot be
+# shared safely across parallel tests. Reserve the full CI thread pool for
+# those fixtures so retries do not mask deterministic resource contention.
+[[profile.ci.overrides]]
+filter = 'package(nils-git-cli) & test(/(supervisor|output_cleanup|detached_double_fork|successful_git_output|signal_terminated_target)/)'
+threads-required = "num-test-threads"
+
 [profile.ci.junit]
 path = "junit.xml"
