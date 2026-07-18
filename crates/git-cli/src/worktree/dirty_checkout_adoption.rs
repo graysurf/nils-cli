@@ -13,10 +13,11 @@ use std::io::{self, Read, Write};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 #[cfg(test)]
 use std::os::unix::fs::PermissionsExt;
-use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
+use std::os::unix::fs::{DirBuilderExt, FileExt, MetadataExt, OpenOptionsExt};
 use std::os::unix::process::CommandExt;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 
@@ -1099,9 +1100,18 @@ struct SnapshotWorkerExecutable {
     command_path: PathBuf,
     file: File,
     metadata: Metadata,
+    digest: [u8; 32],
     #[cfg(test)]
     _private_root: Option<tempfile::TempDir>,
 }
+
+struct WorkerDigestCache {
+    file: File,
+    metadata: Metadata,
+    digest: [u8; 32],
+}
+
+static WORKER_DIGEST_CACHE: OnceLock<Mutex<Option<WorkerDigestCache>>> = OnceLock::new();
 
 impl SnapshotWorkerExecutable {
     fn command_path(&self) -> &Path {
@@ -1114,7 +1124,10 @@ impl SnapshotWorkerExecutable {
             .metadata()
             .context("dirty snapshot worker executable descriptor is unavailable")?;
         validate_worker_file_metadata(&file_metadata)?;
-        if !same_metadata(&self.metadata, &file_metadata) {
+        if !same_metadata(&self.metadata, &file_metadata)
+            && (!same_worker_descriptor_metadata(&self.metadata, &file_metadata)
+                || worker_file_digest(&self.file, file_metadata.len())? != self.digest)
+        {
             return Err(domain_error(
                 DirtyCheckoutErrorKind::ResourceUnavailable,
                 "dirty snapshot worker executable changed after validation",
@@ -1133,6 +1146,89 @@ impl SnapshotWorkerExecutable {
         }
         Ok(())
     }
+}
+
+fn same_worker_descriptor_metadata(left: &Metadata, right: &Metadata) -> bool {
+    left.dev() == right.dev()
+        && left.ino() == right.ino()
+        && left.mode() == right.mode()
+        && left.uid() == right.uid()
+        && left.gid() == right.gid()
+        && left.nlink() == right.nlink()
+        && left.len() == right.len()
+        && left.mtime() == right.mtime()
+        && left.mtime_nsec() == right.mtime_nsec()
+}
+
+fn worker_file_digest(file: &File, length: u64) -> Result<[u8; 32]> {
+    ensure!(
+        length <= MAX_CAPTURE_BYTES as u64,
+        "dirty snapshot worker executable exceeds the supported size limit"
+    );
+    let mut digest = Sha256::new();
+    let mut offset = 0_u64;
+    let mut buffer = [0_u8; 64 * 1024];
+    while offset < length {
+        let read_limit = usize::try_from((length - offset).min(buffer.len() as u64))
+            .expect("bounded worker executable read size");
+        let read = file
+            .read_at(&mut buffer[..read_limit], offset)
+            .context("dirty snapshot worker executable could not be hashed")?;
+        ensure!(
+            read > 0,
+            "dirty snapshot worker executable changed while hashing"
+        );
+        digest.update(&buffer[..read]);
+        offset += read as u64;
+    }
+    let mut trailing = [0_u8; 1];
+    ensure!(
+        file.read_at(&mut trailing, length)
+            .context("dirty snapshot worker executable final read failed")?
+            == 0,
+        "dirty snapshot worker executable changed while hashing"
+    );
+    Ok(digest.finalize().into())
+}
+
+fn cached_worker_file_digest(file: &File, metadata: &Metadata) -> Result<[u8; 32]> {
+    let cache = WORKER_DIGEST_CACHE.get_or_init(|| Mutex::new(None));
+    let mut cache = cache.lock().map_err(|_| {
+        domain_error(
+            DirtyCheckoutErrorKind::ResourceUnavailable,
+            "dirty snapshot worker executable digest cache is unavailable",
+        )
+    })?;
+    if let Some(cached) = cache.as_ref() {
+        let cached_metadata = cached
+            .file
+            .metadata()
+            .context("cached dirty snapshot worker executable is unavailable")?;
+        if same_metadata(&cached.metadata, &cached_metadata)
+            && same_metadata(&cached_metadata, metadata)
+        {
+            return Ok(cached.digest);
+        }
+    }
+
+    let digest = worker_file_digest(file, metadata.len())?;
+    let hashed_metadata = file
+        .metadata()
+        .context("dirty snapshot worker executable could not be revalidated after hashing")?;
+    if !same_metadata(metadata, &hashed_metadata) {
+        return Err(domain_error(
+            DirtyCheckoutErrorKind::ResourceUnavailable,
+            "dirty snapshot worker executable changed during validation",
+        ));
+    }
+    *cache = Some(WorkerDigestCache {
+        file: file
+            .try_clone()
+            .context("dirty snapshot worker executable descriptor could not be retained")?,
+        metadata: hashed_metadata,
+        digest,
+    });
+    Ok(digest)
 }
 
 #[cfg(test)]
@@ -1210,6 +1306,7 @@ fn snapshot_worker_executable() -> Result<SnapshotWorkerExecutable> {
         .metadata()
         .context("dirty snapshot worker executable metadata is unavailable")?;
     validate_worker_file_metadata(&metadata)?;
+    let digest = cached_worker_file_digest(&file, &metadata)?;
     let command_path = if cfg!(target_os = "linux") {
         PathBuf::from(format!("/proc/self/fd/{}", file.as_raw_fd()))
     } else if cfg!(target_os = "macos") {
@@ -1233,6 +1330,7 @@ fn snapshot_worker_executable() -> Result<SnapshotWorkerExecutable> {
         command_path,
         file,
         metadata,
+        digest,
         #[cfg(test)]
         _private_root: private_root,
     })
@@ -6114,12 +6212,16 @@ fn drain_nonblocking<R: Read>(
 
 const PROCESS_CLEANUP_TIMEOUT: Duration = Duration::from_millis(250);
 const PROCESS_SCAN_LIMITS: ProcessScanLimits = ProcessScanLimits {
+    #[cfg(any(test, target_os = "linux"))]
     process_entries: 32_768,
+    #[cfg(any(test, target_os = "linux"))]
     metadata_bytes: 32 * 1024 * 1024,
     descendants: 4_096,
 };
 const MAX_PROCESS_CLEANUP_GENERATIONS: usize = PROCESS_SCAN_LIMITS.descendants;
+#[cfg(any(test, target_os = "linux"))]
 const MAX_PROC_STAT_BYTES: usize = 4 * 1024;
+#[cfg(any(test, target_os = "linux"))]
 const MAX_PROC_CHILDREN_BYTES: usize = 64 * 1024;
 
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
@@ -6151,7 +6253,9 @@ impl ProcessRecord {
 
 #[derive(Clone, Copy, Debug)]
 struct ProcessScanLimits {
+    #[cfg(any(test, target_os = "linux"))]
     process_entries: usize,
+    #[cfg(any(test, target_os = "linux"))]
     metadata_bytes: usize,
     descendants: usize,
 }
@@ -6673,13 +6777,18 @@ unsafe extern "C" {
 }
 
 #[cfg(target_os = "macos")]
+fn current_mach_task() -> libc::mach_port_t {
+    unsafe { libc::mach_task_self_ }
+}
+
+#[cfg(target_os = "macos")]
 struct MachTaskPort(libc::mach_port_t);
 
 #[cfg(target_os = "macos")]
 impl Drop for MachTaskPort {
     fn drop(&mut self) {
         unsafe {
-            let _ = mach_port_deallocate(libc::mach_task_self(), self.0);
+            let _ = mach_port_deallocate(current_mach_task(), self.0);
         }
     }
 }
@@ -6693,7 +6802,7 @@ struct PinnedProcess {
 #[cfg(target_os = "macos")]
 fn pin_process(identity: ProcessIdentity) -> Result<Option<PinnedProcess>> {
     let mut task = 0;
-    let status = unsafe { libc::task_for_pid(libc::mach_task_self(), identity.pid, &mut task) };
+    let status = unsafe { libc::task_for_pid(current_mach_task(), identity.pid, &mut task) };
     if status != libc::KERN_SUCCESS {
         return match process_identity(identity.pid)? {
             None => Ok(None),
@@ -6867,11 +6976,6 @@ where
         });
     };
     descendant_processes_from_identity_with(root_identity, deadline, observe)
-}
-
-#[cfg(target_os = "macos")]
-fn descendant_processes(root: libc::pid_t, deadline: Instant) -> Result<ProcessScan> {
-    descendant_processes_with(root, deadline, |_| {})
 }
 
 #[cfg(any(test, target_os = "macos"))]
@@ -8242,8 +8346,6 @@ mod tests {
             .process_group(0)
             .spawn()
             .expect("spawn authenticated supervisor output fixture");
-        let fallback_owner = ProcessOwner::for_root(child.id() as libc::pid_t)
-            .expect("create scoped output fallback owner");
         drop(receiver);
         if let Err(error) = sender.write_all(PROCESS_SUPERVISOR_CAPABILITY) {
             unsafe {
@@ -8267,7 +8369,7 @@ mod tests {
             child,
             supervised: true,
             cleanup_proof: Some(sender),
-            fallback_owner: Some(fallback_owner),
+            fallback_owner: None,
         }
     }
 
@@ -8887,6 +8989,7 @@ mod tests {
     fn descriptor_backed_worker(path: &Path) -> SnapshotWorkerExecutable {
         let file = File::open(path).expect("open worker fixture descriptor");
         let metadata = file.metadata().expect("read worker fixture metadata");
+        let digest = worker_file_digest(&file, metadata.len()).expect("hash worker fixture");
         let command_path = if cfg!(target_os = "linux") {
             PathBuf::from(format!("/proc/self/fd/{}", file.as_raw_fd()))
         } else {
@@ -8897,6 +9000,7 @@ mod tests {
             command_path,
             file,
             metadata,
+            digest,
             _private_root: None,
         }
     }
@@ -8939,10 +9043,16 @@ mod tests {
         worker
             .revalidate()
             .expect("held descriptor must remain bound to the originally validated worker inode");
-        assert!(same_metadata(
+        let held_metadata = worker.file.metadata().expect("held worker metadata");
+        assert!(same_worker_descriptor_metadata(
             &worker.metadata,
-            &worker.file.metadata().expect("held worker metadata")
+            &held_metadata
         ));
+        assert_eq!(
+            worker_file_digest(&worker.file, held_metadata.len())
+                .expect("held worker content digest"),
+            worker.digest
+        );
         assert!(!same_metadata(
             &worker.metadata,
             &fs::metadata(&executable).expect("replacement path metadata")
