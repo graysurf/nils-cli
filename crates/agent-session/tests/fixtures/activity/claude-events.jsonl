@@ -1,4 +1,5 @@
 {"hook_event_name":"UserPromptSubmit","session_id":"claude-session","permission_mode":"default"}
+{"hook_event_name":"PreToolUse","session_id":"claude-session","tool_name":"Bash","tool_use_id":"tool-1","permission_mode":"default"}
 {"hook_event_name":"PreToolUse","session_id":"claude-session","tool_name":"AskUserQuestion","tool_use_id":"tool-question-1","permission_mode":"default"}
 {"hook_event_name":"PostToolUse","session_id":"claude-session","tool_name":"AskUserQuestion","tool_use_id":"tool-question-1","duration_ms":12,"permission_mode":"default"}
 {"hook_event_name":"PreToolUse","session_id":"claude-session","tool_name":"AskUserQuestion","tool_use_id":"tool-question-2","permission_mode":"default"}
