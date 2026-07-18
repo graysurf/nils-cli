@@ -6830,6 +6830,28 @@ fn descendant_processes(root: libc::pid_t, deadline: Instant) -> Result<ProcessS
     descendant_processes_with(root, deadline, |_| {})
 }
 
+#[cfg(any(test, target_os = "macos"))]
+fn macos_fallback_descendants_with<R, S>(
+    root: ProcessIdentity,
+    deadline: Instant,
+    mut current_identity: R,
+    mut scan_descendants: S,
+) -> Result<ProcessScan>
+where
+    R: FnMut(libc::pid_t) -> Result<Option<ProcessIdentity>>,
+    S: FnMut(libc::pid_t, Instant) -> Result<ProcessScan>,
+{
+    ensure_deadline(deadline)?;
+    if current_identity(root.pid)? != Some(root) {
+        return Ok(ProcessScan {
+            identities: Vec::new(),
+            #[cfg(test)]
+            edge_visits: 0,
+        });
+    }
+    scan_descendants(root.pid, deadline)
+}
+
 #[cfg(target_os = "linux")]
 fn probe_pidfd_support() -> Result<()> {
     use std::os::fd::FromRawFd;
@@ -7122,7 +7144,13 @@ impl ProcessOwner {
                 self.tracked.remove(&identity.pid);
             }
         }
-        identities.extend(descendant_processes(self.root.pid, deadline)?.identities);
+        let fallback = macos_fallback_descendants_with(
+            self.root,
+            deadline,
+            process_identity,
+            descendant_processes,
+        )?;
+        identities.extend(fallback.identities);
         if identities.len() > PROCESS_SCAN_LIMITS.descendants {
             return Err(process_scan_resource_error());
         }
@@ -10504,6 +10532,51 @@ mod tests {
         assert!(
             observed.is_empty(),
             "a child edge must not publish across a parent generation change"
+        );
+    }
+
+    #[test]
+    fn macos_fallback_rejects_reused_root_generation_before_descendant_scan() {
+        let root = ProcessIdentity {
+            pid: 10,
+            generation: 1_000,
+        };
+        let replacement = ProcessIdentity {
+            pid: root.pid,
+            generation: 9_999,
+        };
+        let unrelated = ProcessIdentity {
+            pid: 11,
+            generation: 11_000,
+        };
+        let scans = std::cell::Cell::new(0_usize);
+
+        let scan = macos_fallback_descendants_with(
+            root,
+            Instant::now() + Duration::from_secs(1),
+            |pid| {
+                assert_eq!(pid, root.pid);
+                Ok(Some(replacement))
+            },
+            |pid, _deadline| {
+                assert_eq!(pid, root.pid);
+                scans.set(scans.get() + 1);
+                Ok(ProcessScan {
+                    identities: vec![unrelated],
+                    edge_visits: 1,
+                })
+            },
+        )
+        .expect("a reused root is an absent edge, not a scan failure");
+
+        assert!(
+            scan.identities.is_empty(),
+            "fallback discovery must not adopt descendants through a reused root PID"
+        );
+        assert_eq!(
+            scans.get(),
+            0,
+            "a stale root identity must suppress descendant discovery"
         );
     }
 
