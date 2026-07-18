@@ -133,6 +133,24 @@ pub fn resolve_resume_source(
     resolve_resume_source_in(provider, &root, session_id)
 }
 
+/// Resolve `session_id` beneath an explicit provider configuration directory.
+///
+/// The configuration directory is the daemon-owned provider context (for
+/// example `CODEX_HOME` or `CLAUDE_CONFIG_DIR`), not the nested history
+/// directory. This keeps profile-aware callers from accidentally falling back
+/// to the process-wide provider root while preserving the same bounded scan.
+pub fn resolve_resume_source_in_config_dir(
+    provider: ResumeProvider,
+    config_dir: &Path,
+    session_id: &str,
+) -> Result<ResolvedResume, ResumeResolveError> {
+    let history_root = match provider {
+        ResumeProvider::Codex => config_dir.join("sessions"),
+        ResumeProvider::Claude => config_dir.join("projects"),
+    };
+    resolve_resume_source_in(provider, &history_root, session_id)
+}
+
 /// Resolve `session_id` against an explicit provider history `root`.
 ///
 /// Same contract as [`resolve_resume_source`] but with the root supplied by the
@@ -754,6 +772,29 @@ mod tests {
         let resolved =
             resolve_resume_source_in(ResumeProvider::Codex, &sessions, "target-id").unwrap();
         assert_eq!(resolved.cwd, PathBuf::from("/repo/one"));
+        assert_eq!(resolved.capture_method, "codex-session-meta-import");
+    }
+
+    #[test]
+    fn resolve_resume_source_in_config_dir_uses_provider_owned_history_child() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let profile_config = tmp.path().join("profile");
+        let sessions = profile_config.join("sessions");
+        fs::create_dir_all(&sessions).unwrap();
+        fs::write(
+            sessions.join("rollout.jsonl"),
+            r#"{"timestamp":"2099-01-01T00:00:00Z","type":"session_meta","payload":{"id":"profile-id","session_id":"profile-id","cwd":"/repo/profile","source":"cli","timestamp":"2099-01-01T00:00:00Z"}}"#,
+        )
+        .unwrap();
+
+        let resolved = resolve_resume_source_in_config_dir(
+            ResumeProvider::Codex,
+            &profile_config,
+            "profile-id",
+        )
+        .unwrap();
+
+        assert_eq!(resolved.cwd, PathBuf::from("/repo/profile"));
         assert_eq!(resolved.capture_method, "codex-session-meta-import");
     }
 

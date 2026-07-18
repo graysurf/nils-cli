@@ -1,3 +1,4 @@
+use std::ffi::{OsStr, OsString};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
@@ -66,6 +67,7 @@ fn exit_status_from_code(code: i32) -> std::process::ExitStatus {
 pub struct CmdOptions {
     pub cwd: Option<PathBuf>,
     pub envs: Vec<(String, String)>,
+    pub envs_os: Vec<(OsString, OsString)>,
     pub env_remove: Vec<String>,
     pub stdin: Option<Vec<u8>>,
     pub stdin_null: bool,
@@ -76,6 +78,7 @@ impl Default for CmdOptions {
         Self {
             cwd: None,
             envs: Vec::new(),
+            envs_os: Vec::new(),
             env_remove: Vec::new(),
             stdin: None,
             stdin_null: true,
@@ -136,6 +139,12 @@ impl CmdOptions {
 
     pub fn with_env(mut self, key: &str, value: &str) -> Self {
         self.envs.push((key.to_string(), value.to_string()));
+        self
+    }
+
+    pub fn with_env_os(mut self, key: &OsStr, value: &OsStr) -> Self {
+        self.envs_os
+            .push((key.to_os_string(), value.to_os_string()));
         self
     }
 
@@ -212,6 +221,12 @@ pub fn run_resolved(bin_name: &str, args: &[&str], options: &CmdOptions) -> CmdO
     run_with(&bin, args, options)
 }
 
+/// Resolve a workspace binary and run it with platform-native arguments.
+pub fn run_resolved_os(bin_name: &str, args: &[&OsStr], options: &CmdOptions) -> CmdOutput {
+    let bin = crate::bin::resolve(bin_name);
+    run_with_os(&bin, args, options)
+}
+
 /// Resolve and run a workspace binary in a specific directory.
 pub fn run_resolved_in_dir(
     bin_name: &str,
@@ -248,14 +263,21 @@ pub fn run_resolved_in_dir_with_stdin_str(
 }
 
 pub fn run_with(bin: &Path, args: &[&str], options: &CmdOptions) -> CmdOutput {
-    run_impl(bin, args, options, None)
+    let args = args.iter().map(|arg| OsStr::new(*arg)).collect::<Vec<_>>();
+    run_impl_os(bin, &args, options, None)
+}
+
+/// Run a binary with platform-native arguments and explicit options.
+pub fn run_with_os(bin: &Path, args: &[&OsStr], options: &CmdOptions) -> CmdOutput {
+    run_impl_os(bin, args, options, None)
 }
 
 pub fn run_in_dir_with(dir: &Path, bin: &Path, args: &[&str], options: &CmdOptions) -> CmdOutput {
-    run_impl(bin, args, options, Some(dir))
+    let args = args.iter().map(|arg| OsStr::new(*arg)).collect::<Vec<_>>();
+    run_impl_os(bin, &args, options, Some(dir))
 }
 
-fn run_impl(bin: &Path, args: &[&str], options: &CmdOptions, dir: Option<&Path>) -> CmdOutput {
+fn run_impl_os(bin: &Path, args: &[&OsStr], options: &CmdOptions, dir: Option<&Path>) -> CmdOutput {
     let mut cmd = Command::new(bin);
     if let Some(dir) = dir {
         cmd.current_dir(dir);
@@ -269,6 +291,9 @@ fn run_impl(bin: &Path, args: &[&str], options: &CmdOptions, dir: Option<&Path>)
         cmd.env_remove(key);
     }
     for (key, value) in &options.envs {
+        cmd.env(key, value);
+    }
+    for (key, value) in &options.envs_os {
         cmd.env(key, value);
     }
 
