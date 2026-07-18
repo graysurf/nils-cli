@@ -1232,8 +1232,8 @@ required = true
     let document = &out.json()["documents"][0];
     assert_eq!(
         document["path"],
-        env.project
-            .join("nested/POLICY.md")
+        fs::canonicalize(env.project.join("nested/POLICY.md"))
+            .expect("canonicalize primary nested policy")
             .to_str()
             .expect("utf-8 primary nested policy")
     );
