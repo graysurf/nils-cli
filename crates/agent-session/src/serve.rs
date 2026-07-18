@@ -6274,12 +6274,17 @@ mod tests {
 
     #[test]
     fn launch_profile_readiness_unwind_releases_single_flight_owner() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let launcher = executable(
+            &tmp.path().join("profile-readiness"),
+            "#!/usr/bin/env sh\nexit 0\n",
+        );
         let profiles = AgentLaunchProfiles::from_json(
             &json!([{
                 "id":"claude-gpt",
                 "label":"Claude GPT",
                 "agent":"claude",
-                "agent_bin":"/bin/true",
+                "agent_bin":launcher,
             }])
             .to_string(),
         )
