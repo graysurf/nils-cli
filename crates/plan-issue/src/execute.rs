@@ -1,5 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
-use std::ffi::{CString, OsStr, OsString};
+use std::ffi::{CStr, CString, OsStr, OsString};
 use std::fs::{self, File};
 use std::io::{Seek, SeekFrom, Write};
 use std::os::fd::{AsRawFd, FromRawFd};
@@ -9327,12 +9327,50 @@ fn ensure_private_temp_markdown_dir(dir: &Path) -> Result<TempMarkdownDir, Strin
     })
 }
 
-fn cleanup_stale_temp_markdown(dir: &TempMarkdownDir) {
-    let Ok(entries) = fs::read_dir(descriptor_path(&dir.descriptor)) else {
-        return;
+fn temp_markdown_entry_names(dir: &TempMarkdownDir) -> Vec<OsString> {
+    let current = CString::new(".").expect("current directory name is NUL-free");
+    // Open a fresh stream relative to the retained descriptor. Reopening a
+    // directory through `/dev/fd` is not portable to macOS.
+    // SAFETY: the parent descriptor is live and `current` is NUL-terminated.
+    let descriptor = unsafe {
+        libc::openat(
+            dir.descriptor.as_raw_fd(),
+            current.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
     };
-    for entry in entries.flatten().take(STALE_TEMP_MARKDOWN_SCAN_LIMIT) {
-        let file_name = entry.file_name();
+    if descriptor < 0 {
+        return Vec::new();
+    }
+    // SAFETY: `descriptor` uniquely owns a freshly opened directory stream.
+    let stream = unsafe { libc::fdopendir(descriptor) };
+    if stream.is_null() {
+        // SAFETY: `fdopendir` failed, so ownership remains with this function.
+        let _ = unsafe { libc::close(descriptor) };
+        return Vec::new();
+    }
+
+    let mut names = Vec::new();
+    while names.len() < STALE_TEMP_MARKDOWN_SCAN_LIMIT {
+        // SAFETY: `stream` remains live until `closedir` below.
+        let entry = unsafe { libc::readdir(stream) };
+        if entry.is_null() {
+            break;
+        }
+        // SAFETY: `readdir` returned a live entry with a NUL-terminated name.
+        let name = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) }.to_bytes();
+        if name == b"." || name == b".." {
+            continue;
+        }
+        names.push(OsStr::from_bytes(name).to_os_string());
+    }
+    // SAFETY: `stream` is live and owns `descriptor`.
+    let _ = unsafe { libc::closedir(stream) };
+    names
+}
+
+fn cleanup_stale_temp_markdown(dir: &TempMarkdownDir) {
+    for file_name in temp_markdown_entry_names(dir) {
         if Path::new(&file_name)
             .extension()
             .and_then(|extension| extension.to_str())
@@ -9340,6 +9378,24 @@ fn cleanup_stale_temp_markdown(dir: &TempMarkdownDir) {
         {
             continue;
         }
+        let Ok(name) = CString::new(file_name.as_bytes()) else {
+            continue;
+        };
+        // Inspect the entry through the retained directory descriptor without
+        // following a symlink or blocking on a non-regular special file.
+        // SAFETY: the parent descriptor is live and `name` is NUL-terminated.
+        let descriptor = unsafe {
+            libc::openat(
+                dir.descriptor.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
+            )
+        };
+        if descriptor < 0 {
+            continue;
+        }
+        // SAFETY: `descriptor` was returned uniquely by `openat` above.
+        let entry = unsafe { File::from_raw_fd(descriptor) };
         let Ok(metadata) = entry.metadata() else {
             continue;
         };
@@ -9351,7 +9407,7 @@ fn cleanup_stale_temp_markdown(dir: &TempMarkdownDir) {
             .ok()
             .and_then(|modified| SystemTime::now().duration_since(modified).ok())
             .is_some_and(|age| age >= STALE_TEMP_MARKDOWN_AGE);
-        if stale && let Ok(name) = CString::new(file_name.as_bytes()) {
+        if stale {
             // SAFETY: deletion is relative to the retained directory descriptor,
             // so a pathname swap cannot redirect cleanup outside this directory.
             let _ = unsafe { libc::unlinkat(dir.descriptor.as_raw_fd(), name.as_ptr(), 0) };
