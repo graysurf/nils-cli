@@ -24,6 +24,26 @@ const GH_REPO_VIEW_JSON: &str = r#"{
   "rebaseMergeAllowed": false
 }"#;
 
+const GH_REPO_VIEW_INTERNAL_DEFAULT_PORT_JSON: &str = r#"{
+  "name": "demo",
+  "owner": { "login": "sympoies" },
+  "url": "https://internal.ghe.com/sympoies/demo",
+  "defaultBranchRef": { "name": "main" },
+  "mergeCommitAllowed": false,
+  "squashMergeAllowed": true,
+  "rebaseMergeAllowed": false
+}"#;
+
+const GH_REPO_VIEW_INTERNAL_8443_JSON: &str = r#"{
+  "name": "demo",
+  "owner": { "login": "sympoies" },
+  "url": "https://internal.ghe.com:8443/sympoies/demo",
+  "defaultBranchRef": { "name": "main" },
+  "mergeCommitAllowed": false,
+  "squashMergeAllowed": true,
+  "rebaseMergeAllowed": false
+}"#;
+
 const GLAB_REPO_VIEW_JSON: &str = r#"{
   "path": "demo",
   "namespace": { "full_path": "sympoies" },
@@ -50,6 +70,7 @@ struct GitScenario<'a> {
     remote_output_bytes: usize,
     timeout_ms: Option<&'a str>,
     capture_limit_bytes: Option<&'a str>,
+    provider_stub: Option<&'a str>,
 }
 
 impl Default for GitScenario<'static> {
@@ -70,6 +91,7 @@ impl Default for GitScenario<'static> {
             remote_output_bytes: 0,
             timeout_ms: None,
             capture_limit_bytes: None,
+            provider_stub: None,
         }
     }
 }
@@ -206,19 +228,27 @@ fn run_with_options(
     provider: &str,
     head: &str,
 ) -> (StubEnv, super::support::CmdOutput) {
-    run_with_repo_options(scenario, dry_run, provider, head, "sympoies/demo")
+    run_with_repo_options(scenario, dry_run, provider, None, head, "sympoies/demo")
 }
 
 fn run_with_repo_options(
     scenario: GitScenario<'_>,
     dry_run: bool,
     provider: &str,
+    host: Option<&str>,
     head: &str,
     repository: &str,
 ) -> (StubEnv, super::support::CmdOutput) {
+    let provider_stub = scenario.provider_stub.map(str::to_string);
     let stub = match provider {
-        "github" => StubEnv::new().gh_stub(&gh_stub()),
-        "gitlab" => StubEnv::new().glab_stub(&glab_stub()),
+        "github" => {
+            let script = provider_stub.unwrap_or_else(gh_stub);
+            StubEnv::new().gh_stub(&script)
+        }
+        "gitlab" => {
+            let script = provider_stub.unwrap_or_else(glab_stub);
+            StubEnv::new().glab_stub(&script)
+        }
         "local" => StubEnv::new(),
         other => panic!("unsupported test provider: {other}"),
     };
@@ -257,6 +287,9 @@ fn run_with_repo_options(
         "--reason-file",
         &reason,
     ];
+    if let Some(host) = host {
+        args.splice(2..2, ["--host", host]);
+    }
     if dry_run {
         args.insert(0, "--dry-run");
     }
@@ -864,6 +897,7 @@ fn push_default_rejects_mismatched_explicit_repository_before_provider_lookup() 
         GitScenario::default(),
         true,
         "github",
+        None,
         "HEAD",
         "sympoies/other",
     );
@@ -881,6 +915,72 @@ fn push_default_local_provider_is_usage_error() {
     assert_eq!(out.code, 64, "stdout={} stderr={}", out.stdout, out.stderr);
     let envelope = parse_envelope(&out.stdout);
     assert_eq!(envelope["error"]["code"], "provider_unsupported");
+}
+
+#[test]
+fn push_default_rejects_selected_authority_mismatch_before_metadata_lookup() {
+    let provider_stub = "#!/bin/sh\necho backend-called >&2\nexit 97\n";
+    let (stub, out) = run_with_repo_options(
+        GitScenario {
+            push_urls: "https://internal.ghe.com/sympoies/demo.git\n",
+            provider_stub: Some(provider_stub),
+            ..GitScenario::default()
+        },
+        true,
+        "github",
+        Some("internal.ghe.com:8443"),
+        "HEAD",
+        "sympoies/demo",
+    );
+    assert_eq!(out.code, 65, "stdout={} stderr={}", out.stdout, out.stderr);
+    let envelope = parse_envelope(&out.stdout);
+    assert_eq!(envelope["error"]["code"], "provider_mismatch");
+    assert!(!out.stderr.contains("backend-called"));
+    let log = fs::read_to_string(stub.tempdir.path().join("git.log")).expect("git log");
+    assert!(!log.lines().any(|line| line.contains("ls-remote")));
+}
+
+#[test]
+fn push_default_rejects_custom_port_metadata_from_default_port() {
+    let provider_stub =
+        format!("#!/bin/sh\ncat <<'EOF'\n{GH_REPO_VIEW_INTERNAL_DEFAULT_PORT_JSON}\nEOF\n");
+    let (stub, out) = run_with_repo_options(
+        GitScenario {
+            push_urls: "https://internal.ghe.com:8443/sympoies/demo.git\n",
+            provider_stub: Some(&provider_stub),
+            ..GitScenario::default()
+        },
+        true,
+        "github",
+        Some("internal.ghe.com:8443"),
+        "HEAD",
+        "sympoies/demo",
+    );
+    assert_eq!(out.code, 65, "stdout={} stderr={}", out.stdout, out.stderr);
+    let envelope = parse_envelope(&out.stdout);
+    assert_eq!(envelope["error"]["code"], "repository_mismatch");
+    let log = fs::read_to_string(stub.tempdir.path().join("git.log")).expect("git log");
+    assert!(!log.lines().any(|line| line.contains("ls-remote")));
+}
+
+#[test]
+fn push_default_accepts_matching_custom_port_across_selection_push_and_metadata() {
+    let provider_stub = format!("#!/bin/sh\ncat <<'EOF'\n{GH_REPO_VIEW_INTERNAL_8443_JSON}\nEOF\n");
+    let (_stub, out) = run_with_repo_options(
+        GitScenario {
+            push_urls: "https://internal.ghe.com:8443/sympoies/demo.git\n",
+            provider_stub: Some(&provider_stub),
+            ..GitScenario::default()
+        },
+        true,
+        "github",
+        Some("internal.ghe.com:8443"),
+        "HEAD",
+        "sympoies/demo",
+    );
+    assert_eq!(out.code, 0, "stdout={} stderr={}", out.stdout, out.stderr);
+    let envelope = parse_envelope(&out.stdout);
+    assert_eq!(envelope["data"]["pushed"], false);
 }
 
 #[test]

@@ -1,14 +1,21 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
-use std::fs;
+use std::ffi::{CStr, CString, OsStr, OsString};
+use std::fs::{self, File};
+use std::io::{Seek, SeekFrom, Write};
+use std::os::fd::{AsRawFd, FromRawFd};
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use nils_common::git as common_git;
 use nils_common::markdown as common_markdown;
 use nils_markdown::Engine;
 use plan_tooling::parse::parse_plan_with_display;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 
 const PLAN_STATUS_COMMENT_TEMPLATE: &str =
     include_str!("../templates/execute/plan_status_comment.md.tera");
@@ -51,8 +58,8 @@ use crate::commands::plan::{
 };
 use crate::commands::record::{
     LifecycleCommentKind, RecordArgs, RecordAttachArgs, RecordAuditArgs, RecordCloseArgs,
-    RecordCommand, RecordOpenArgs, RecordPostArgs, RecordRepairDashboardArgs, RecordTemplateArgs,
-    TemplateFormatArg,
+    RecordCommand, RecordOpenArgs, RecordPostArgs, RecordProfile, RecordRepairDashboardArgs,
+    RecordTemplateArgs, TemplateFormatArg,
 };
 use crate::commands::sprint::{
     AcceptSprintArgs, MultiSprintGuideArgs, ReadySprintArgs, StartSprintArgs,
@@ -61,6 +68,7 @@ use crate::commands::{Command as CliCommand, SplitStrategy, SummaryArgs};
 use crate::dispatch_record::{self, DispatchRecord};
 use crate::issue_body::{self, TaskRow};
 use crate::lifecycle_record::{self, DashboardInput};
+use crate::record_open_intent::{RecordOpenIntentState, RecordOpenIntentStore};
 use crate::render::{self, SprintCommentInput, SprintCommentMode};
 use crate::runtime_layout::{self, IssueRoot, SprintRoot};
 use crate::task_spec::{self, TaskSpecBuildOptions, TaskSpecRow, TaskSpecScope};
@@ -282,7 +290,20 @@ fn last_commit_for_path(path: &Path, allow_dirty: bool) -> Result<String, Comman
         ));
     }
     let sha = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if sha.is_empty() && !allow_dirty {
+    if allow_dirty && path_is_dirty(path)? {
+        let contents = fs::read(path).map_err(|err| {
+            CommandError::runtime(
+                "record-open-dirty-snapshot-read-failed",
+                format!("failed to read dirty snapshot {}: {err}", path.display()),
+            )
+        })?;
+        let digest = Sha256::digest(contents)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        return Ok(format!("dirty-sha256:{digest}"));
+    }
+    if sha.is_empty() {
         return Err(CommandError::runtime(
             "record-open-uncommitted",
             format!(
@@ -291,10 +312,6 @@ fn last_commit_for_path(path: &Path, allow_dirty: bool) -> Result<String, Comman
             ),
         ));
     }
-    // With `--allow-dirty` a never-committed bundle file is allowed through with
-    // an empty commit; the snapshot renderer omits the `Commit:` line for it,
-    // so the error hint above ("pass --allow-dirty") now actually bypasses the
-    // check it advertises.
     Ok(sha)
 }
 
@@ -350,13 +367,13 @@ fn resolve_bundle_snapshots(
     let plan_commit = last_commit_for_path(&bundle.plan_file, allow_dirty)?;
 
     let source_snapshot = lifecycle_record::SnapshotData {
-        path: relative_repo_path(&bundle.source_file),
+        path: relative_repo_path(&bundle.source_file)?,
         commit: source_commit,
         title: None,
         summary: None,
     };
     let plan_snapshot = lifecycle_record::SnapshotData {
-        path: relative_repo_path(&bundle.plan_file),
+        path: relative_repo_path(&bundle.plan_file)?,
         commit: plan_commit,
         title: None,
         summary: None,
@@ -364,16 +381,26 @@ fn resolve_bundle_snapshots(
     Ok((source_snapshot, plan_snapshot))
 }
 
-fn relative_repo_path(path: &Path) -> String {
-    // Try to express the path relative to the repo root for stable
-    // payload identity; otherwise fall back to the display path.
-    let cwd = std::env::current_dir().ok();
-    if let Some(cwd) = cwd
-        && let Ok(stripped) = path.strip_prefix(&cwd)
-    {
-        return stripped.to_string_lossy().to_string();
-    }
-    path.to_string_lossy().to_string()
+fn relative_repo_path(path: &Path) -> Result<String, CommandError> {
+    let repo_root = repository_root_for_confined_path(path).ok_or_else(|| {
+        CommandError::runtime(
+            "record-open-repo-root-failed",
+            format!(
+                "failed to resolve the repository root containing {}",
+                path.display()
+            ),
+        )
+    })?;
+    let relative = repo_relative_identity(path, &repo_root).ok_or_else(|| {
+        CommandError::runtime(
+            "record-open-repo-relative-path-failed",
+            format!(
+                "failed to derive a repository-relative identity for {}",
+                path.display()
+            ),
+        )
+    })?;
+    Ok(relative.to_string_lossy().to_string())
 }
 
 fn build_initial_state_payload(plan: &plan_tooling::parse::Plan) -> Value {
@@ -459,7 +486,8 @@ fn build_record_seed(
         .map(str::to_string)
         .unwrap_or_else(|| plan.title.clone());
 
-    let (source_snapshot, plan_snapshot) = resolve_bundle_snapshots(bundle, allow_dirty)?;
+    let (source_snapshot, mut plan_snapshot) = resolve_bundle_snapshots(bundle, allow_dirty)?;
+    plan_snapshot.title = Some(plan_title.clone());
     let source_content = fs::read_to_string(&bundle.source_file).map_err(|err| {
         CommandError::runtime(
             "record-open-source-read-failed",
@@ -525,8 +553,8 @@ fn build_record_seed(
 
     Ok(RecordSeed {
         plan_title,
-        source_path: path_text(&bundle.source_file),
-        plan_path: path_text(&bundle.plan_file),
+        source_path: source_snapshot.path,
+        plan_path: plan_snapshot.path,
         source_commit: source_snapshot.commit,
         plan_commit: plan_snapshot.commit,
         source_body,
@@ -653,44 +681,229 @@ fn parse_issue_reference(value: &str) -> Result<u64, CommandError> {
     ))
 }
 
-fn parse_linked_pr_reference(value: &str) -> Result<(String, u64), CommandError> {
-    let trimmed = value.trim();
-    if let Some((repo, number_raw)) = trimmed.rsplit_once('#') {
-        if !repo.contains('/') {
-            return Err(CommandError::usage(
-                "record-invalid-linked-pr",
-                format!("--linked-pr must be `owner/repo#NN` or a PR URL, got `{value}`"),
-            ));
-        }
-        let number = number_raw.parse::<u64>().map_err(|err| {
-            CommandError::usage(
-                "record-invalid-linked-pr",
-                format!("--linked-pr number is not numeric in `{value}`: {err}"),
-            )
-        })?;
-        return Ok((repo.to_string(), number));
-    }
-    if trimmed.starts_with("https://github.com/") {
-        let tail = trimmed.trim_end_matches('/');
-        if let Some(rest) = tail.strip_prefix("https://github.com/") {
-            let mut parts = rest.splitn(4, '/');
-            let owner = parts.next().unwrap_or("");
-            let repo = parts.next().unwrap_or("");
-            let kind = parts.next().unwrap_or("");
-            let number = parts.next().unwrap_or("");
-            if !owner.is_empty()
-                && !repo.is_empty()
-                && (kind == "pull" || kind == "issues")
-                && let Ok(num) = number.parse::<u64>()
-            {
-                return Ok((format!("{owner}/{repo}"), num));
-            }
-        }
-    }
-    Err(CommandError::usage(
+#[derive(Debug, Clone)]
+struct ParsedLinkedPrReference {
+    slug: String,
+    number: u64,
+    authority: Option<(crate::provider::Provider, Option<String>)>,
+}
+
+fn invalid_linked_pr(_value: &str) -> CommandError {
+    CommandError::usage(
         "record-invalid-linked-pr",
-        format!("--linked-pr must be `owner/repo#NN` or a PR URL, got `{value}`"),
-    ))
+        "--linked-pr must be `owner/repo#NN`, a GitHub PR URL, or a GitLab MR URL",
+    )
+}
+
+fn linked_pr_host_provider_hint(host: &str) -> Option<crate::provider::Provider> {
+    let host = host
+        .rsplit_once(':')
+        .filter(|(_, port)| port.chars().all(|ch| ch.is_ascii_digit()))
+        .map_or(host, |(name, _)| name)
+        .to_ascii_lowercase();
+    if host == "github.com" || host.ends_with(".github.com") || host.ends_with(".ghe.com") {
+        Some(crate::provider::Provider::GitHub)
+    } else if host == "gitlab.com" || host.starts_with("gitlab.") || host.contains(".gitlab.") {
+        Some(crate::provider::Provider::GitLab)
+    } else {
+        None
+    }
+}
+
+fn is_linked_pr_slug(value: &str) -> bool {
+    let segments = value.split('/').collect::<Vec<_>>();
+    segments.len() >= 2
+        && segments.iter().all(|segment| {
+            !segment.is_empty()
+                && segment
+                    .chars()
+                    .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.'))
+        })
+}
+
+fn parse_linked_pr_reference_full(value: &str) -> Result<ParsedLinkedPrReference, CommandError> {
+    let trimmed = value.trim().trim_end_matches('/');
+    if trimmed.contains("://") && trimmed.contains(['?', '#']) {
+        return Err(invalid_linked_pr(value));
+    }
+    if let Some((repo, number_raw)) = trimmed.rsplit_once('#') {
+        if !is_linked_pr_slug(repo) {
+            return Err(invalid_linked_pr(value));
+        }
+        let number = number_raw
+            .parse::<u64>()
+            .map_err(|_| invalid_linked_pr(value))?;
+        return Ok(ParsedLinkedPrReference {
+            slug: repo.to_string(),
+            number,
+            authority: None,
+        });
+    }
+
+    let (scheme, rest) = trimmed
+        .split_once("://")
+        .ok_or_else(|| invalid_linked_pr(value))?;
+    if scheme.eq_ignore_ascii_case("local") {
+        let (slug, number_raw) = rest
+            .rsplit_once("/pull/")
+            .ok_or_else(|| invalid_linked_pr(value))?;
+        if !is_linked_pr_slug(slug) {
+            return Err(invalid_linked_pr(value));
+        }
+        let number = number_raw
+            .split(['?', '#'])
+            .next()
+            .and_then(|raw| raw.parse::<u64>().ok())
+            .ok_or_else(|| invalid_linked_pr(value))?;
+        return Ok(ParsedLinkedPrReference {
+            slug: slug.to_string(),
+            number,
+            authority: Some((crate::provider::Provider::Local, None)),
+        });
+    }
+    if !scheme.eq_ignore_ascii_case("https") && !scheme.eq_ignore_ascii_case("http") {
+        return Err(invalid_linked_pr(value));
+    }
+    let (host, path) = rest
+        .split_once('/')
+        .ok_or_else(|| invalid_linked_pr(value))?;
+    if host.is_empty() || host.contains('@') {
+        return Err(invalid_linked_pr(value));
+    }
+    let path = path.trim_end_matches('/');
+    let (provider, slug, number_raw) = if let Some((slug, number)) = path.rsplit_once("/pull/") {
+        (crate::provider::Provider::GitHub, slug, number)
+    } else if let Some((slug, number)) = path.rsplit_once("/issues/") {
+        // Reader-side compatibility for historical execution-run v1 records,
+        // which accepted GitHub PR URLs in the issue-shaped form.
+        (crate::provider::Provider::GitHub, slug, number)
+    } else if let Some((slug, number)) = path.rsplit_once("/-/merge_requests/") {
+        (crate::provider::Provider::GitLab, slug, number)
+    } else {
+        return Err(invalid_linked_pr(value));
+    };
+    if !is_linked_pr_slug(slug) {
+        return Err(invalid_linked_pr(value));
+    }
+    if linked_pr_host_provider_hint(host).is_some_and(|hint| hint != provider) {
+        return Err(CommandError::usage(
+            "record-linked-pr-authority-ambiguous",
+            "--linked-pr URL authority conflicts with its provider path shape; refusing cross-forge routing",
+        ));
+    }
+    let number = number_raw
+        .split(['?', '#'])
+        .next()
+        .and_then(|raw| raw.parse::<u64>().ok())
+        .ok_or_else(|| invalid_linked_pr(value))?;
+    Ok(ParsedLinkedPrReference {
+        slug: slug.to_string(),
+        number,
+        authority: Some((
+            provider,
+            Some(crate::provider::canonical_provider_host(provider, host)),
+        )),
+    })
+}
+
+fn canonical_linked_pr_reference(value: &str) -> Result<String, CommandError> {
+    let parsed = parse_linked_pr_reference_full(value)?;
+    match parsed.authority {
+        None => Ok(format!("{}#{}", parsed.slug, parsed.number)),
+        Some((crate::provider::Provider::GitHub, Some(host))) => Ok(format!(
+            "https://{host}/{}/pull/{}",
+            parsed.slug, parsed.number
+        )),
+        Some((crate::provider::Provider::GitLab, Some(host))) => Ok(format!(
+            "https://{host}/{}/-/merge_requests/{}",
+            parsed.slug, parsed.number
+        )),
+        Some((crate::provider::Provider::Local, None)) => {
+            Ok(format!("local://{}/pull/{}", parsed.slug, parsed.number))
+        }
+        Some(_) => Err(invalid_linked_pr(value)),
+    }
+}
+
+fn canonicalize_execution_run_linked_prs(
+    run: &mut crate::tracking::run_state::ExecutionRun,
+) -> Result<(), CommandError> {
+    for linked in run.linked_prs.iter_mut().chain(run.pr.iter_mut()) {
+        linked.r#ref = canonical_linked_pr_reference(&linked.r#ref)?;
+        linked.url = linked
+            .url
+            .as_deref()
+            .and_then(|url| canonical_linked_pr_reference(url).ok());
+    }
+    Ok(())
+}
+
+fn parse_linked_pr_reference(value: &str) -> Result<(String, u64), CommandError> {
+    let parsed = parse_linked_pr_reference_full(value)?;
+    Ok((parsed.slug, parsed.number))
+}
+
+fn resolve_linked_pr_target(
+    value: &str,
+    tracking_repo: &crate::provider::Repo,
+) -> Result<(crate::provider::Repo, u64), CommandError> {
+    let parsed = parse_linked_pr_reference_full(value)?;
+    if let Some((provider, host)) = &parsed.authority
+        && (*provider != tracking_repo.provider
+            || !crate::provider::optional_authorities_equal(
+                *provider,
+                host.as_deref(),
+                tracking_repo.host.as_deref(),
+            ))
+    {
+        return Err(CommandError::usage(
+            "record-linked-pr-authority-mismatch",
+            "--linked-pr URL authority does not match the tracking repository authority",
+        ));
+    }
+    let repo = if let Some((provider, host)) = parsed.authority {
+        crate::provider::Repo {
+            provider,
+            slug: parsed.slug,
+            host,
+        }
+    } else {
+        crate::provider::Repo {
+            provider: tracking_repo.provider,
+            slug: parsed.slug,
+            host: tracking_repo.host.clone(),
+        }
+    };
+    Ok((repo, parsed.number))
+}
+
+fn read_live_linked_pr_evidence(
+    linked_prs: &[String],
+    tracking_repo: &crate::provider::Repo,
+    force: bool,
+) -> Result<Vec<lifecycle_record::LinkedPrEvidence>, CommandError> {
+    linked_prs
+        .iter()
+        .map(|raw| {
+            let (pr_repo_info, pr_number) = resolve_linked_pr_target(raw, tracking_repo)?;
+            let adapter = crate::provider::select_adapter(&pr_repo_info, force);
+            let summary = adapter
+                .pr_merge_summary(&pr_repo_info.slug, pr_number)
+                .map_err(|err| CommandError::runtime("record-close-pr-summary-failed", err))?;
+            Ok(lifecycle_record::LinkedPrEvidence {
+                pr_ref: format!("{}#{pr_number}", pr_repo_info.slug),
+                url: Some(pr_repo_info.pr_url(pr_number)),
+                merge_sha: summary.merged.then_some(summary.merge_sha).flatten(),
+                checks: check_status_from_state(summary.checks.as_deref()),
+                required_state: summary
+                    .required_state
+                    .as_deref()
+                    .map(|state| check_status_from_state(Some(state))),
+                required_count: summary.required_count,
+                non_required_failures: summary.non_required_failures,
+            })
+        })
+        .collect()
 }
 
 fn read_payload_data(path: &Path) -> Result<Value, CommandError> {
@@ -953,97 +1166,6 @@ fn close_label_plan_converged(
     additions_present && removals_absent && state_exclusive
 }
 
-fn restore_close_labels_after_failure(
-    adapter: &dyn ProviderAdapter,
-    repo: &str,
-    issue: u64,
-    provider: crate::provider::Provider,
-    plan: &CloseLabelPlan,
-    failure: CommandError,
-) -> CommandError {
-    let original = plan.current.as_deref().unwrap_or_default();
-    let add = plan
-        .remove
-        .iter()
-        .filter(|label| {
-            original
-                .iter()
-                .any(|previous| label_matches(Some(provider), label, previous))
-        })
-        .cloned()
-        .collect::<Vec<_>>();
-    let remove = plan
-        .add
-        .iter()
-        .filter(|label| {
-            !original
-                .iter()
-                .any(|previous| label_matches(Some(provider), label, previous))
-        })
-        .cloned()
-        .collect::<Vec<_>>();
-
-    if add.is_empty() && remove.is_empty() {
-        return failure;
-    }
-
-    if let Err(rollback_error) = adapter.edit_issue_labels(repo, issue, &add, &remove) {
-        return CommandError::runtime(
-            "record-close-label-rollback-failed",
-            format!(
-                "{}; additionally failed to restore the original labels: {rollback_error}",
-                failure.message
-            ),
-        );
-    }
-    let restored = match adapter.issue_labels(repo, issue) {
-        Ok(labels) => sorted_unique_labels_for_provider(labels, Some(provider)),
-        Err(rollback_error) => {
-            return CommandError::runtime(
-                "record-close-label-rollback-failed",
-                format!(
-                    "{}; label rollback was sent but its read-back failed: {rollback_error}",
-                    failure.message
-                ),
-            );
-        }
-    };
-    let restored_matches =
-        close_label_plan_converged_after_rollback(provider, &add, &remove, &restored);
-    if !restored_matches {
-        let expected_add = sorted_unique_labels_for_provider(add, Some(provider));
-        let expected_remove = sorted_unique_labels_for_provider(remove, Some(provider));
-        return CommandError::runtime(
-            "record-close-label-rollback-failed",
-            format!(
-                "{}; label rollback did not converge: expected present {}, expected absent {}, observed {}",
-                failure.message,
-                render_label_diagnostic(&expected_add),
-                render_label_diagnostic(&expected_remove),
-                render_label_diagnostic(&restored)
-            ),
-        );
-    }
-    failure
-}
-
-fn close_label_plan_converged_after_rollback(
-    provider: crate::provider::Provider,
-    expected_present: &[String],
-    expected_absent: &[String],
-    actual: &[String],
-) -> bool {
-    expected_present.iter().all(|expected| {
-        actual
-            .iter()
-            .any(|actual| label_matches(Some(provider), expected, actual))
-    }) && expected_absent.iter().all(|expected| {
-        !actual
-            .iter()
-            .any(|actual| label_matches(Some(provider), expected, actual))
-    })
-}
-
 fn run_record_open(
     binary: BinaryFlavor,
     dry_run: bool,
@@ -1109,7 +1231,24 @@ fn run_record_open(
         "Initial execution state seeded by `plan-issue record open`.",
     )?;
 
-    let initial_dashboard = record_initial_dashboard(args.profile, &seed.plan_title, None);
+    let identity_marker = lifecycle_record::render_record_identity_marker(
+        args.profile,
+        &seed.source_path,
+        &seed.source_commit,
+    );
+    lifecycle_record::extract_record_identity(&identity_marker)
+        .and_then(|identity| {
+            identity
+                .filter(|identity| {
+                    identity.matches(args.profile, &seed.source_path, &seed.source_commit)
+                })
+                .ok_or_else(|| "rendered record identity did not round-trip".to_string())
+        })
+        .map_err(|err| CommandError::runtime("record-open-identity-invalid", err))?;
+    let initial_dashboard = format!(
+        "{identity_marker}\n\n{}",
+        record_initial_dashboard(args.profile, &seed.plan_title, None)
+    );
 
     let normalized_labels: Vec<String> = args
         .labels
@@ -1150,45 +1289,78 @@ fn run_record_open(
     let adapter = crate::provider::select_adapter(&repo_info, force);
     let repo = repo_info.slug.as_str();
 
-    // Auto-detect an already-open tracker for this bundle before creating a new
-    // one. The dedup key is the source snapshot identity (repo-relative path +
-    // last-commit SHA) that `record open` embeds in the source lifecycle
-    // comment, so a re-run resumes the same tracker instead of duplicating it.
+    // Serialize one canonical bundle identity locally. The reservation remains
+    // held across journal reconciliation, provider reads, and all mutations.
     let identity = BundleIdentity {
-        source_path: relative_repo_path(&bundle.source_file),
+        source_path: seed.source_path.clone(),
         source_commit: seed.source_commit.clone(),
     };
-    let result = if let Some((issue_number, audit)) = detect_resumable_tracker(
-        adapter.as_ref(),
-        repo,
-        &normalized_labels,
+    let _record_open_reservation = crate::lifecycle_lock::acquire_record_open(
+        &repo_info,
         args.profile,
-        &identity,
-    )? {
-        let issue_url = repo_info.issue_url(issue_number);
-        record_open_resume(
+        &identity.source_path,
+        &identity.source_commit,
+    )?;
+    let body_path = write_temp_markdown("record-open-body", &initial_dashboard)
+        .map_err(|err| CommandError::runtime("record-open-body-write-failed", err))?;
+    let intent = RecordOpenIntentStore::new(
+        &repo_info,
+        args.profile,
+        &identity.source_path,
+        &identity.source_commit,
+    );
+    let pending = intent.load()?;
+    let result = match pending {
+        Some(pending) => record_open_continue_from_intent(
             adapter.as_ref(),
-            repo,
-            args.profile,
-            &seed,
-            issue_number,
-            &issue_url,
-            &audit,
-            binary.execution_mode(),
-        )?
-    } else {
-        let body_path = write_temp_markdown("record-open-body", &initial_dashboard)
-            .map_err(|err| CommandError::runtime("record-open-body-write-failed", err))?;
-
-        record_open_finalize(
-            adapter.as_ref(),
-            repo,
+            &repo_info,
             args.profile,
             &body_path,
             &normalized_labels,
             &seed,
+            &identity,
+            &intent,
+            pending,
+            false,
             binary.execution_mode(),
-        )?
+        )?,
+        None => {
+            if let Some(issue_number) =
+                detect_resumable_tracker(adapter.as_ref(), repo, args.profile, &identity)?
+            {
+                let issue_url = repo_info.issue_url(issue_number);
+                intent.persist_issue_known(issue_number)?;
+                record_open_resume_journaled(
+                    adapter.as_ref(),
+                    &repo_info,
+                    args.profile,
+                    &seed,
+                    issue_number,
+                    &issue_url,
+                    &identity,
+                    &intent,
+                    None,
+                    false,
+                    &normalized_labels,
+                    binary.execution_mode(),
+                )?
+            } else {
+                intent.persist_create_in_flight()?;
+                record_open_continue_from_intent(
+                    adapter.as_ref(),
+                    &repo_info,
+                    args.profile,
+                    &body_path,
+                    &normalized_labels,
+                    &seed,
+                    &identity,
+                    &intent,
+                    RecordOpenIntentState::CreateInFlight,
+                    true,
+                    binary.execution_mode(),
+                )?
+            }
+        }
     };
 
     // Mirror the live tracking-issue URL into the bundle's durable
@@ -1238,265 +1410,701 @@ fn attach_open_exec_state_sync(mut result: Value, execution_state_file: Option<&
     result
 }
 
-/// Create the tracking issue, post the initial lifecycle comments, and repair
-/// the dashboard.
-///
-/// The source lifecycle comment is posted **first** because it carries the
-/// bundle's snapshot identity (`path` + `commit`) that `record open` auto-detect
-/// matches on. Until it exists the tracker is unidentifiable, so a failure
-/// *before* the source comment posts best-effort closes (rolls back) the
-/// just-created issue — otherwise a re-run could not match the orphan and would
-/// create a duplicate. The close is sent without a comment so it still succeeds
-/// when the source post itself was the broken step.
-///
-/// Once the source comment exists the tracker is identifiable, so a later
-/// failure (plan/state post or dashboard repair) leaves the partial tracker in
-/// place: the next `record open` detects it and attaches only the missing
-/// roles. This is the resume-by-default behavior; rollback is narrowed to the
-/// pre-identity window.
-///
-/// Split out of `run_record_open` so both paths are unit-testable with a stub
-/// adapter — the live `record open` path is otherwise reachable only through the
-/// real `plan-issue` binary.
+/// Create or reconcile the issue named by the durable record-open intent, then
+/// converge its source, plan, state, and dashboard surfaces. Kept as a wrapper
+/// for focused adapter tests; the live command performs trusted auto-detection
+/// before first entering this path.
+#[cfg(test)]
 fn record_open_finalize(
     adapter: &dyn ProviderAdapter,
-    repo: &str,
+    repo_info: &crate::provider::Repo,
     profile: crate::commands::record::RecordProfile,
     body_path: &Path,
     labels: &[String],
     seed: &RecordSeed,
     execution_mode: &'static str,
 ) -> Result<Value, CommandError> {
-    let (issue_number, issue_url) = adapter
-        .create_issue(repo, &seed.plan_title, body_path, labels)
-        .map_err(|err| CommandError::runtime("record-open-issue-create-failed", err))?;
-
-    // Post the identity-bearing source comment first; roll back on failure
-    // because the orphan would carry no snapshot to resume from.
-    let source_comment_path = write_temp_markdown("record-open-source-comment", &seed.source_body)
-        .map_err(|err| CommandError::runtime("record-open-source-write-failed", err))?;
-    let source_url = match adapter.comment_issue(repo, issue_number, &source_comment_path) {
-        Ok(url) => url,
-        Err(post_err) => {
-            let mut err = CommandError::runtime("record-open-source-post-failed", post_err);
-            let rollback_note = match adapter.close_issue(
-                repo,
-                issue_number,
-                crate::commands::plan::CloseReason::NotPlanned,
-                None,
-            ) {
-                Ok(()) => format!(
-                    " (rolled back: closed orphaned issue #{issue_number} {issue_url} — it had no \
-                     source snapshot to resume from; re-run `plan-issue record open` to recreate \
-                     the tracker cleanly)"
-                ),
-                Err(close_err) => format!(
-                    " (rollback FAILED: orphaned issue #{issue_number} {issue_url} is still open \
-                     and has no source snapshot to resume from — close it before retrying so a \
-                     re-run does not create a duplicate; close error: {close_err})"
-                ),
-            };
-            err.message.push_str(&rollback_note);
-            return Err(err);
+    let identity = BundleIdentity {
+        source_path: seed.source_path.clone(),
+        source_commit: seed.source_commit.clone(),
+    };
+    let intent = RecordOpenIntentStore::new(
+        repo_info,
+        profile,
+        &identity.source_path,
+        &identity.source_commit,
+    );
+    let pending = match intent.load()? {
+        Some(pending) => (pending, false),
+        None => {
+            intent.persist_create_in_flight()?;
+            (RecordOpenIntentState::CreateInFlight, true)
         }
     };
-
-    // From here the tracker carries its source identity, so a failure leaves it
-    // in place for the next `record open` to resume instead of rolling back.
-    let populate_rest = || -> Result<Value, CommandError> {
-        let plan_path = write_temp_markdown("record-open-plan-comment", &seed.plan_body)
-            .map_err(|err| CommandError::runtime("record-open-plan-write-failed", err))?;
-        let plan_url = adapter
-            .comment_issue(repo, issue_number, &plan_path)
-            .map_err(|err| CommandError::runtime("record-open-plan-post-failed", err))?;
-        let state_path = write_temp_markdown("record-open-state-comment", &seed.state_body)
-            .map_err(|err| CommandError::runtime("record-open-state-write-failed", err))?;
-        let state_url = adapter
-            .comment_issue(repo, issue_number, &state_path)
-            .map_err(|err| CommandError::runtime("record-open-state-post-failed", err))?;
-
-        // Repair dashboard with freshly-created comment URLs through audit.
-        let (body_after, comments_json) = adapter
-            .issue_evidence(repo, issue_number)
-            .map_err(|err| CommandError::runtime("record-open-evidence-read-failed", err))?;
-        let audit =
-            lifecycle_record::audit_record(Some(&body_after), &comments_json, Some(profile))
-                .map_err(|err| CommandError::runtime("record-open-audit-failed", err))?;
-        let repaired = lifecycle_record::render_dashboard_from_audit(
-            &audit,
-            Some(&seed.plan_title),
-            Some(&issue_url),
-        );
-        let repaired_path = write_temp_markdown("record-open-dashboard", &repaired)
-            .map_err(|err| CommandError::runtime("record-open-dashboard-write-failed", err))?;
-        adapter
-            .edit_issue_body(repo, issue_number, &repaired_path)
-            .map_err(|err| CommandError::runtime("record-open-dashboard-edit-failed", err))?;
-
-        Ok(json!({
-            "operation": "record.open",
-            "execution_mode": execution_mode,
-            "dry_run": false,
-            "mode": "live",
-            "issue": {"number": issue_number, "url": issue_url.clone()},
-            "comments": {"source": source_url, "plan": plan_url, "state": state_url},
-            "labels": labels.to_vec(),
-            "dashboard_markdown": repaired,
-        }))
-    };
-
-    populate_rest().map_err(|mut err| {
-        err.message.push_str(&format!(
-            " (partial tracker left open as #{issue_number} {issue_url}; re-run \
-             `plan-issue record open` to resume and post the missing lifecycle comments)"
-        ));
-        err
-    })
+    record_open_continue_from_intent(
+        adapter,
+        repo_info,
+        profile,
+        body_path,
+        labels,
+        seed,
+        &identity,
+        &intent,
+        pending.0,
+        pending.1,
+        execution_mode,
+    )
 }
 
-/// The deterministic identity used to match a bundle to an already-open tracker:
-/// the source snapshot's repo-relative path plus its last-commit SHA, exactly as
-/// embedded in the tracker's source lifecycle comment payload. Matching requires
-/// the same launch cwd across runs (the path is `relative_repo_path`); a cwd
-/// mismatch simply misses detection and falls back to creating a new tracker.
+#[allow(clippy::too_many_arguments)]
+fn record_open_continue_from_intent(
+    adapter: &dyn ProviderAdapter,
+    repo_info: &crate::provider::Repo,
+    profile: RecordProfile,
+    body_path: &Path,
+    labels: &[String],
+    seed: &RecordSeed,
+    identity: &BundleIdentity,
+    intent: &RecordOpenIntentStore,
+    pending: RecordOpenIntentState,
+    attempt_create: bool,
+    execution_mode: &'static str,
+) -> Result<Value, CommandError> {
+    let repo = repo_info.slug.as_str();
+    match pending {
+        RecordOpenIntentState::CreateInFlight => {
+            let (issue_number, issue_url) = if attempt_create {
+                match adapter.create_issue(repo, &seed.plan_title, body_path, labels) {
+                    Ok((issue_number, _provider_url)) => {
+                        (issue_number, repo_info.issue_url(issue_number))
+                    }
+                    Err(create_error) => reconcile_unknown_record_open_create(
+                        adapter,
+                        repo_info,
+                        profile,
+                        identity,
+                        Some(&create_error),
+                    )?,
+                }
+            } else {
+                reconcile_unknown_record_open_create(adapter, repo_info, profile, identity, None)?
+            };
+            intent.persist_issue_known(issue_number)?;
+            record_open_resume_journaled(
+                adapter,
+                repo_info,
+                profile,
+                seed,
+                issue_number,
+                &issue_url,
+                identity,
+                intent,
+                None,
+                attempt_create,
+                labels,
+                execution_mode,
+            )
+        }
+        RecordOpenIntentState::IssueKnown { issue } => {
+            let issue_url = repo_info.issue_url(issue);
+            record_open_resume_journaled(
+                adapter,
+                repo_info,
+                profile,
+                seed,
+                issue,
+                &issue_url,
+                identity,
+                intent,
+                None,
+                false,
+                labels,
+                execution_mode,
+            )
+        }
+        RecordOpenIntentState::CommentInFlight {
+            issue,
+            role,
+            expected_payload,
+            expected_fingerprint: _,
+        } => {
+            let current_payload = expected_record_open_payload(seed, role)?;
+            if !expected_payload.semantically_matches(&current_payload) {
+                return Err(CommandError::runtime(
+                    "record-open-intent-invalid",
+                    format!(
+                        "record-open intent for {} comment does not match the current bundle snapshot",
+                        role.as_str()
+                    ),
+                ));
+            }
+            let issue_url = repo_info.issue_url(issue);
+            record_open_resume_journaled(
+                adapter,
+                repo_info,
+                profile,
+                seed,
+                issue,
+                &issue_url,
+                identity,
+                intent,
+                Some((role, expected_payload)),
+                false,
+                labels,
+                execution_mode,
+            )
+        }
+    }
+}
+
+fn reconcile_unknown_record_open_create(
+    adapter: &dyn ProviderAdapter,
+    repo_info: &crate::provider::Repo,
+    profile: RecordProfile,
+    identity: &BundleIdentity,
+    immediate_error: Option<&str>,
+) -> Result<(u64, String), CommandError> {
+    let repo = repo_info.slug.as_str();
+    let numbers = adapter
+        .list_open_tracker_issues(repo, &[])
+        .map_err(|err| record_open_outcome_unknown("issue create", immediate_error, err))?;
+    let mut matching = Vec::new();
+    let mut historical_only = Vec::new();
+    for number in numbers {
+        let (body, comments_json) = adapter
+            .issue_evidence(repo, number)
+            .map_err(|err| record_open_outcome_unknown("issue create", immediate_error, err))?;
+        let direct = lifecycle_record::extract_record_identity(&body)
+            .map_err(|err| record_open_outcome_unknown("issue create", immediate_error, err))?;
+        let historical = lifecycle_record::audit_record(None, &comments_json, Some(profile))
+            .map_err(|err| record_open_outcome_unknown("issue create", immediate_error, err))?
+            .record_identity;
+        if let (Some(direct), Some(historical)) = (direct.as_ref(), historical.as_ref())
+            && direct != historical
+        {
+            return Err(record_open_outcome_unknown(
+                "issue create",
+                immediate_error,
+                format!(
+                    "candidate issue #{number} has conflicting trusted issue-body and historical source-comment identities"
+                ),
+            ));
+        }
+        if direct.as_ref().is_some_and(|candidate| {
+            candidate.matches(profile, &identity.source_path, &identity.source_commit)
+        }) {
+            matching.push(number);
+        } else if historical.as_ref().is_some_and(|candidate| {
+            candidate.matches(profile, &identity.source_path, &identity.source_commit)
+        }) {
+            historical_only.push(number);
+        }
+    }
+    matching.sort_unstable();
+    matching.dedup();
+    historical_only.sort_unstable();
+    historical_only.dedup();
+    match (matching.as_slice(), historical_only.is_empty()) {
+        ([issue], true) => Ok((*issue, repo_info.issue_url(*issue))),
+        _ => Err(record_open_outcome_unknown(
+            "issue create",
+            immediate_error,
+            format!(
+                "broad provider scan found {} exact trusted issue-body identity markers and {} historical-only matching identities",
+                matching.len(),
+                historical_only.len()
+            ),
+        )),
+    }
+}
+
+fn record_open_outcome_unknown(
+    operation: &str,
+    immediate_error: Option<&str>,
+    proof_detail: impl Into<String>,
+) -> CommandError {
+    let immediate = immediate_error
+        .map(|error| format!("; provider call reported: {error}"))
+        .unwrap_or_default();
+    CommandError::runtime(
+        "record-open-outcome-unknown",
+        format!(
+            "record-open {operation} outcome is unknown{immediate}; proof readback did not establish exactly one matching provider result: {}. The durable local intent was retained and no duplicate mutation will be attempted automatically",
+            proof_detail.into()
+        ),
+    )
+}
+
+/// Deterministic bundle identity carried by the trusted issue-body marker and
+/// reused in the local record-open reservation/journal key.
 struct BundleIdentity {
     source_path: String,
     source_commit: String,
 }
 
-/// Scan the label-scoped open trackers for one whose source lifecycle comment
-/// carries the same `(path, commit)` snapshot identity as `identity`. Returns
-/// the matching issue number and its audit so the caller can attach only the
-/// missing roles. Unreadable or unparseable candidates are skipped rather than
-/// failing detection — a single malformed tracker must not block opening a new
-/// one.
+/// Broad-scan open trackers for a unique exact bundle identity stored in the
+/// issue body. Historical source-comment identity remains readable by audit
+/// and repair, but it is never trusted for automatic resume. Any historical-only
+/// match, malformed body marker, or trusted/historical ambiguity fails closed so
+/// `record open` cannot create or mutate an arbitrary tracker.
 fn detect_resumable_tracker(
     adapter: &dyn ProviderAdapter,
     repo: &str,
-    labels: &[String],
     profile: crate::commands::record::RecordProfile,
     identity: &BundleIdentity,
-) -> Result<Option<(u64, lifecycle_record::RecordAudit)>, CommandError> {
+) -> Result<Option<u64>, CommandError> {
     let numbers = adapter
-        .list_open_tracker_issues(repo, labels)
+        .list_open_tracker_issues(repo, &[])
         .map_err(|err| CommandError::runtime("record-open-list-failed", err))?;
+    let mut trusted = Vec::new();
+    let mut historical = Vec::new();
     for number in numbers {
-        let Ok((body, comments_json)) = adapter.issue_evidence(repo, number) else {
-            continue;
-        };
-        let Ok(audit) = lifecycle_record::audit_record(Some(&body), &comments_json, Some(profile))
-        else {
-            continue;
-        };
-        let matches = audit
-            .evidence
-            .get("source")
-            .and_then(|hit| hit.payload.as_ref())
-            .and_then(|payload| payload.parse_snapshot().ok())
-            .is_some_and(|snapshot| {
-                snapshot.path == identity.source_path && snapshot.commit == identity.source_commit
-            });
-        if matches {
-            return Ok(Some((number, audit)));
+        let (body, comments_json) = adapter.issue_evidence(repo, number).map_err(|err| {
+            CommandError::runtime(
+                "record-open-evidence-read-failed",
+                format!("failed to read candidate issue {number}: {err}"),
+            )
+        })?;
+        let direct = lifecycle_record::extract_record_identity(&body).map_err(|err| {
+            record_open_identity_repair_required(format!(
+                "candidate issue #{number} has an invalid issue-body identity marker: {err}"
+            ))
+        })?;
+        let historical_identity = lifecycle_record::audit_record(
+            None,
+            &comments_json,
+            Some(profile),
+        )
+        .map_err(|err| {
+            record_open_identity_repair_required(format!(
+                "candidate issue #{number} has unreadable historical lifecycle identity evidence: {err}"
+            ))
+        })?
+        .record_identity;
+
+        if let (Some(direct), Some(historical_identity)) =
+            (direct.as_ref(), historical_identity.as_ref())
+            && direct != historical_identity
+        {
+            return Err(record_open_identity_repair_required(format!(
+                "candidate issue #{number} has conflicting trusted issue-body and historical source-comment identities"
+            )));
+        }
+
+        if direct.as_ref().is_some_and(|candidate| {
+            candidate.matches(profile, &identity.source_path, &identity.source_commit)
+        }) {
+            trusted.push(number);
+        } else if historical_identity.as_ref().is_some_and(|candidate| {
+            candidate.matches(profile, &identity.source_path, &identity.source_commit)
+        }) {
+            historical.push(number);
         }
     }
-    Ok(None)
+    trusted.sort_unstable();
+    trusted.dedup();
+    historical.sort_unstable();
+    historical.dedup();
+
+    if trusted.len() > 1 || !historical.is_empty() {
+        let mut ambiguous = trusted.clone();
+        ambiguous.extend(historical.iter().copied());
+        ambiguous.sort_unstable();
+        ambiguous.dedup();
+        return Err(record_open_identity_repair_required(format!(
+            "open lifecycle tracker identity requires repair before automatic resume (candidate issues: {}); every resumable tracker must have one unique valid exact issue-body identity marker",
+            ambiguous
+                .iter()
+                .map(u64::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
+        )));
+    }
+
+    Ok(trusted.first().copied())
 }
 
-/// Resume an already-open tracker: post only the lifecycle roles the audit
-/// reports missing (`source` / `plan` / `state`), then repair the dashboard. A
-/// tracker that already has all three is a no-op (`mode: "already-open"`), so a
-/// redundant `record open` neither duplicates the issue nor its comments.
+fn record_open_identity_repair_required(message: impl Into<String>) -> CommandError {
+    CommandError::runtime("record-open-identity-repair-required", message)
+}
+
+/// Resume an already-open tracker through the same journaled convergence path
+/// used after issue creation. This wrapper is retained for focused tests.
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn record_open_resume(
     adapter: &dyn ProviderAdapter,
-    repo: &str,
+    repo_info: &crate::provider::Repo,
     profile: crate::commands::record::RecordProfile,
     seed: &RecordSeed,
     issue_number: u64,
-    issue_url: &str,
-    audit: &lifecycle_record::RecordAudit,
+    _issue_url: &str,
+    identity: &BundleIdentity,
     execution_mode: &'static str,
 ) -> Result<Value, CommandError> {
+    let intent = RecordOpenIntentStore::new(
+        repo_info,
+        profile,
+        &identity.source_path,
+        &identity.source_commit,
+    );
+    let issue_url = repo_info.issue_url(issue_number);
+    let pending_comment = match intent.load()? {
+        None => {
+            intent.persist_issue_known(issue_number)?;
+            None
+        }
+        Some(RecordOpenIntentState::IssueKnown { issue }) if issue == issue_number => None,
+        Some(RecordOpenIntentState::CommentInFlight {
+            issue,
+            role,
+            expected_payload,
+            expected_fingerprint: _,
+        }) if issue == issue_number => {
+            let current_payload = expected_record_open_payload(seed, role)?;
+            if !expected_payload.semantically_matches(&current_payload) {
+                return Err(CommandError::runtime(
+                    "record-open-intent-invalid",
+                    format!(
+                        "record-open intent for {} comment does not match the current bundle snapshot",
+                        role.as_str()
+                    ),
+                ));
+            }
+            Some((role, expected_payload))
+        }
+        Some(_) => {
+            return Err(CommandError::runtime(
+                "record-open-intent-invalid",
+                "record-open intent does not name the tracker selected for resume",
+            ));
+        }
+    };
+    record_open_resume_journaled(
+        adapter,
+        repo_info,
+        profile,
+        seed,
+        issue_number,
+        &issue_url,
+        identity,
+        &intent,
+        pending_comment,
+        false,
+        &[],
+        execution_mode,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn record_open_resume_journaled(
+    adapter: &dyn ProviderAdapter,
+    repo_info: &crate::provider::Repo,
+    profile: RecordProfile,
+    seed: &RecordSeed,
+    issue_number: u64,
+    issue_url: &str,
+    identity: &BundleIdentity,
+    intent: &RecordOpenIntentStore,
+    pending_comment: Option<(
+        lifecycle_record::PayloadRole,
+        lifecycle_record::RecordPayload,
+    )>,
+    created_this_run: bool,
+    labels: &[String],
+    execution_mode: &'static str,
+) -> Result<Value, CommandError> {
+    let _lifecycle_lock = crate::lifecycle_lock::acquire(repo_info, issue_number, profile)?;
+    let repo = repo_info.slug.as_str();
+    let pending_operation = pending_comment
+        .as_ref()
+        .map(|(role, _)| format!("{} comment", role.as_str()));
+    let (mut current_body, current_comments) =
+        adapter.issue_evidence(repo, issue_number).map_err(|err| {
+            if let Some(operation) = pending_operation.as_deref() {
+                record_open_outcome_unknown(
+                    operation,
+                    None,
+                    format!("provider evidence read failed for issue #{issue_number}: {err}"),
+                )
+            } else {
+                CommandError::runtime("record-open-evidence-read-failed", err)
+            }
+        })?;
+    validate_record_open_direct_identity(&current_body, issue_number, profile, identity).map_err(
+        |err| {
+            if let Some(operation) = pending_operation.as_deref() {
+                record_open_outcome_unknown(operation, None, err.message)
+            } else {
+                err
+            }
+        },
+    )?;
+    validate_record_open_historical_identity(&current_comments, issue_number, profile, identity)
+        .map_err(|err| {
+            if let Some(operation) = pending_operation.as_deref() {
+                record_open_outcome_unknown(operation, None, err.message)
+            } else {
+                err
+            }
+        })?;
+    let mut audit =
+        lifecycle_record::audit_record(Some(&current_body), &current_comments, Some(profile))
+            .map_err(|err| {
+                if let Some(operation) = pending_operation.as_deref() {
+                    record_open_outcome_unknown(
+                        operation,
+                        None,
+                        format!("provider lifecycle evidence is unreadable: {err}"),
+                    )
+                } else {
+                    CommandError::runtime("record-open-audit-failed", err)
+                }
+            })?;
+
+    if let Some((role, expected_payload)) = pending_comment {
+        if matching_record_open_comment_url(&audit, role, &expected_payload).is_none() {
+            return Err(record_open_outcome_unknown(
+                &format!("{} comment", role.as_str()),
+                None,
+                format!(
+                    "provider evidence for issue #{issue_number} has no same-role semantically matching payload"
+                ),
+            ));
+        }
+        intent.persist_issue_known(issue_number)?;
+    }
+
     let missing: std::collections::BTreeSet<&str> =
         audit.missing_required.iter().map(String::as_str).collect();
-
     let mut attached: Vec<&'static str> = Vec::new();
-    for &(role, code, temp_label, fail_code) in &[
+    for &(role, code, temp_label, body) in &[
         (
             "source",
             "source-missing",
-            "record-open-resume-source-comment",
-            "record-open-source-post-failed",
+            "record-open-source-comment",
+            seed.source_body.as_str(),
         ),
         (
             "plan",
             "plan-missing",
-            "record-open-resume-plan-comment",
-            "record-open-plan-post-failed",
+            "record-open-plan-comment",
+            seed.plan_body.as_str(),
         ),
         (
             "state",
             "state-missing",
-            "record-open-resume-state-comment",
-            "record-open-state-post-failed",
+            "record-open-state-comment",
+            seed.state_body.as_str(),
         ),
     ] {
         if !missing.contains(code) {
             continue;
         }
-        let body = match role {
-            "source" => seed.source_body.as_str(),
-            "plan" => seed.plan_body.as_str(),
-            _ => seed.state_body.as_str(),
-        };
+        let expected_payload = lifecycle_record::extract_payload(body).map_err(|err| {
+            CommandError::runtime(
+                "record-open-comment-payload-invalid",
+                format!("rendered {role} comment has invalid lifecycle payload: {err}"),
+            )
+        })?;
         let path = write_temp_markdown(temp_label, body)
-            .map_err(|err| CommandError::runtime("record-open-resume-write-failed", err))?;
-        adapter
-            .comment_issue(repo, issue_number, &path)
-            .map_err(|err| CommandError::runtime(fail_code, err))?;
+            .map_err(|err| CommandError::runtime("record-open-comment-write-failed", err))?;
+        intent.persist_comment_in_flight(issue_number, &expected_payload)?;
+        let post_error = adapter.comment_issue(repo, issue_number, &path).err();
+        prove_record_open_comment(
+            adapter,
+            repo,
+            issue_number,
+            profile,
+            identity,
+            expected_payload.role,
+            &expected_payload,
+        )
+        .map_err(|proof_detail| {
+            record_open_outcome_unknown(
+                &format!("{role} comment"),
+                post_error.as_deref(),
+                proof_detail,
+            )
+        })?;
+        intent.persist_issue_known(issue_number)?;
         attached.push(role);
     }
 
-    if attached.is_empty() {
-        return Ok(json!({
-            "operation": "record.open",
-            "execution_mode": execution_mode,
-            "dry_run": false,
-            "mode": "already-open",
-            "issue": {"number": issue_number, "url": issue_url},
-            "attached": attached,
-        }));
+    if !attached.is_empty() {
+        let (body_after, comments_json) = adapter
+            .issue_evidence(repo, issue_number)
+            .map_err(|err| CommandError::runtime("record-open-evidence-read-failed", err))?;
+        validate_record_open_direct_identity(&body_after, issue_number, profile, identity)?;
+        validate_record_open_historical_identity(&comments_json, issue_number, profile, identity)?;
+        audit = lifecycle_record::audit_record(Some(&body_after), &comments_json, Some(profile))
+            .map_err(|err| CommandError::runtime("record-open-audit-failed", err))?;
+        current_body = body_after;
+    }
+    if !audit.missing_required.is_empty() {
+        return Err(record_open_outcome_unknown(
+            "comment convergence",
+            None,
+            format!(
+                "provider evidence still reports missing roles: {}",
+                audit.missing_required.join(", ")
+            ),
+        ));
     }
 
-    // Re-read the now-fuller evidence and repair the dashboard so the freshly
-    // attached comment URLs are linked.
-    let (body_after, comments_json) = adapter
-        .issue_evidence(repo, issue_number)
-        .map_err(|err| CommandError::runtime("record-open-evidence-read-failed", err))?;
-    let refreshed =
-        lifecycle_record::audit_record(Some(&body_after), &comments_json, Some(profile))
-            .map_err(|err| CommandError::runtime("record-open-audit-failed", err))?;
     let repaired = lifecycle_record::render_dashboard_from_audit(
-        &refreshed,
+        &audit,
         Some(&seed.plan_title),
         Some(issue_url),
     );
-    let repaired_path = write_temp_markdown("record-open-resume-dashboard", &repaired)
-        .map_err(|err| CommandError::runtime("record-open-dashboard-write-failed", err))?;
-    adapter
-        .edit_issue_body(repo, issue_number, &repaired_path)
-        .map_err(|err| CommandError::runtime("record-open-dashboard-edit-failed", err))?;
+    if current_body != repaired {
+        let repaired_path = write_temp_markdown("record-open-dashboard", &repaired)
+            .map_err(|err| CommandError::runtime("record-open-dashboard-write-failed", err))?;
+        adapter
+            .edit_issue_body(repo, issue_number, &repaired_path)
+            .map_err(|err| CommandError::runtime("record-open-dashboard-edit-failed", err))?;
+    }
+    intent.clear()?;
 
+    let mode = if created_this_run {
+        "live"
+    } else if attached.is_empty() {
+        "already-open"
+    } else {
+        "resumed"
+    };
     Ok(json!({
         "operation": "record.open",
         "execution_mode": execution_mode,
         "dry_run": false,
-        "mode": "resumed",
+        "mode": mode,
         "issue": {"number": issue_number, "url": issue_url},
+        "comments": {
+            "source": audit.evidence.get("source").and_then(|hit| hit.url.clone()),
+            "plan": audit.evidence.get("plan").and_then(|hit| hit.url.clone()),
+            "state": audit.evidence.get("state").and_then(|hit| hit.url.clone()),
+        },
         "attached": attached,
+        "labels": labels,
         "dashboard_markdown": repaired,
     }))
+}
+
+fn expected_record_open_payload(
+    seed: &RecordSeed,
+    role: lifecycle_record::PayloadRole,
+) -> Result<lifecycle_record::RecordPayload, CommandError> {
+    let body = match role {
+        lifecycle_record::PayloadRole::Source => seed.source_body.as_str(),
+        lifecycle_record::PayloadRole::Plan => seed.plan_body.as_str(),
+        lifecycle_record::PayloadRole::State => seed.state_body.as_str(),
+        _ => {
+            return Err(CommandError::runtime(
+                "record-open-intent-invalid",
+                format!(
+                    "record-open intent contains unsupported {} comment role",
+                    role.as_str()
+                ),
+            ));
+        }
+    };
+    lifecycle_record::extract_payload(body).map_err(|err| {
+        CommandError::runtime(
+            "record-open-comment-payload-invalid",
+            format!(
+                "current rendered {} comment has invalid lifecycle payload: {err}",
+                role.as_str()
+            ),
+        )
+    })
+}
+
+fn validate_record_open_direct_identity(
+    body: &str,
+    issue_number: u64,
+    profile: RecordProfile,
+    identity: &BundleIdentity,
+) -> Result<(), CommandError> {
+    let direct_identity = lifecycle_record::extract_record_identity(body).map_err(|err| {
+        CommandError::runtime(
+            "record-open-identity-changed",
+            format!(
+                "issue #{issue_number} has an invalid direct issue-body identity marker after acquiring its lifecycle lock: {err}"
+            ),
+        )
+    })?;
+    if !direct_identity.as_ref().is_some_and(|candidate| {
+        candidate.matches(profile, &identity.source_path, &identity.source_commit)
+    }) {
+        return Err(CommandError::runtime(
+            "record-open-identity-changed",
+            format!(
+                "issue #{issue_number} no longer has the unique exact bundle identity marker in its body after acquiring its lifecycle lock"
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_record_open_historical_identity(
+    comments_json: &str,
+    issue_number: u64,
+    profile: RecordProfile,
+    identity: &BundleIdentity,
+) -> Result<(), CommandError> {
+    let historical_identity = lifecycle_record::audit_record(None, comments_json, Some(profile))
+        .map_err(|err| {
+            record_open_identity_repair_required(format!(
+                "issue #{issue_number} has unreadable historical lifecycle identity evidence after acquiring its lifecycle lock: {err}"
+            ))
+        })?
+        .record_identity;
+    if historical_identity.as_ref().is_some_and(|candidate| {
+        !candidate.matches(profile, &identity.source_path, &identity.source_commit)
+    }) {
+        return Err(record_open_identity_repair_required(format!(
+            "issue #{issue_number} has conflicting trusted issue-body and historical source-comment identities after acquiring its lifecycle lock"
+        )));
+    }
+    Ok(())
+}
+
+fn matching_record_open_comment_url(
+    audit: &lifecycle_record::RecordAudit,
+    role: lifecycle_record::PayloadRole,
+    expected: &lifecycle_record::RecordPayload,
+) -> Option<String> {
+    let evidence = audit.evidence.get(role.as_str())?;
+    evidence
+        .payload
+        .as_ref()
+        .filter(|payload| payload.semantically_matches(expected))?;
+    evidence.url.clone()
+}
+
+fn prove_record_open_comment(
+    adapter: &dyn ProviderAdapter,
+    repo: &str,
+    issue: u64,
+    profile: RecordProfile,
+    identity: &BundleIdentity,
+    role: lifecycle_record::PayloadRole,
+    expected: &lifecycle_record::RecordPayload,
+) -> Result<String, String> {
+    let (body, comments_json) = adapter
+        .issue_evidence(repo, issue)
+        .map_err(|err| format!("provider evidence read failed: {err}"))?;
+    validate_record_open_direct_identity(&body, issue, profile, identity)
+        .map_err(|err| err.message)?;
+    validate_record_open_historical_identity(&comments_json, issue, profile, identity)
+        .map_err(|err| err.message)?;
+    let audit = lifecycle_record::audit_record(Some(&body), &comments_json, Some(profile))
+        .map_err(|err| format!("provider lifecycle evidence is unreadable: {err}"))?;
+    matching_record_open_comment_url(&audit, role, expected).ok_or_else(|| {
+        format!(
+            "provider evidence for issue #{issue} has no same-role semantically matching payload"
+        )
+    })
 }
 
 fn run_record_attach(
@@ -1549,6 +2157,7 @@ fn run_record_attach(
     let repo_info = resolve_repo_info_for_live(binary, repo_override)?;
     let adapter = crate::provider::select_adapter(&repo_info, force);
     let issue_url = repo_info.issue_url(issue_number);
+    let _lifecycle_lock = crate::lifecycle_lock::acquire(&repo_info, issue_number, args.profile)?;
     let repo = repo_info.slug;
 
     let source_path = write_temp_markdown("record-attach-source-comment", &seed.source_body)
@@ -1791,7 +2400,8 @@ fn run_record_repair_dashboard(
     repo_override: Option<&str>,
     args: &RecordRepairDashboardArgs,
 ) -> Result<Value, CommandError> {
-    let (body, comments_json, issue_number, repo, issue_url) = if let Some(fixture_dir) =
+    let mut _record_repair_lifecycle_lock = None;
+    let (body, comments_json, issue_number, repo_info, issue_url) = if let Some(fixture_dir) =
         &args.fixture
     {
         let (body, comments) = read_fixture_evidence(fixture_dir)?;
@@ -1816,9 +2426,16 @@ fn run_record_repair_dashboard(
         )?;
         let issue_number = parse_issue_reference(issue_value)?;
         let repo_info = resolve_repo_info_for_live(binary, repo_override)?;
+        if !dry_run && args.out.is_none() {
+            _record_repair_lifecycle_lock = Some(crate::lifecycle_lock::acquire(
+                &repo_info,
+                issue_number,
+                RecordProfile::Tracking,
+            )?);
+        }
         let adapter = crate::provider::select_adapter(&repo_info, force);
         let issue_url = repo_info.issue_url(issue_number);
-        let repo = repo_info.slug;
+        let repo = repo_info.slug.clone();
         let (body, comments) = adapter
             .issue_evidence(&repo, issue_number)
             .map_err(|err| CommandError::runtime("record-repair-evidence-read-failed", err))?;
@@ -1826,7 +2443,7 @@ fn run_record_repair_dashboard(
             body,
             comments,
             Some(issue_number),
-            Some(repo),
+            Some(repo_info),
             Some(issue_url),
         )
     };
@@ -1860,16 +2477,12 @@ fn run_record_repair_dashboard(
     }
 
     let issue_number = issue_number.expect("live mode has issue number");
-    let repo = repo.expect("live mode has repo");
-    // Re-resolve provider so this dispatcher works when the early branch
-    // populated `repo` from the `--repo` slug alone (no Repo struct kept).
-    let repo_info = crate::provider::resolve_repo(Some(&repo))
-        .map_err(|err| CommandError::usage("repo-resolution-failed", err))?;
+    let repo_info = repo_info.expect("live mode has resolved repo");
     let adapter = crate::provider::select_adapter(&repo_info, force);
     let dashboard_path = write_temp_markdown("record-repair-dashboard", &dashboard)
         .map_err(|err| CommandError::runtime("record-repair-dashboard-write-failed", err))?;
     adapter
-        .edit_issue_body(&repo, issue_number, &dashboard_path)
+        .edit_issue_body(&repo_info.slug, issue_number, &dashboard_path)
         .map_err(|err| CommandError::runtime("record-repair-edit-failed", err))?;
 
     Ok(json!({
@@ -1880,6 +2493,50 @@ fn run_record_repair_dashboard(
         "issue": {"number": issue_number, "url": issue_url},
         "dashboard_markdown": dashboard,
     }))
+}
+
+fn matching_closeout_url(
+    audit: &lifecycle_record::RecordAudit,
+    expected: &lifecycle_record::RecordPayload,
+) -> Option<String> {
+    let closeout = audit.evidence.get("closeout")?;
+    closeout
+        .payload
+        .as_ref()
+        .filter(|payload| payload.semantically_matches(expected))?;
+    closeout.url.clone()
+}
+
+fn resolve_closeout_comment_url(
+    adapter: &dyn ProviderAdapter,
+    repo: &str,
+    issue: u64,
+    profile: RecordProfile,
+    audit: &lifecycle_record::RecordAudit,
+    expected: &lifecycle_record::RecordPayload,
+    closeout_body: &str,
+) -> Result<String, CommandError> {
+    if let Some(url) = matching_closeout_url(audit, expected) {
+        return Ok(url);
+    }
+
+    let closeout_path = write_temp_markdown("record-close-comment", closeout_body)
+        .map_err(|err| CommandError::runtime("record-close-comment-write-failed", err))?;
+    match adapter.comment_issue(repo, issue, &closeout_path) {
+        Ok(url) => Ok(url),
+        Err(post_error) => {
+            let recovered_url = adapter
+                .issue_evidence(repo, issue)
+                .ok()
+                .and_then(|(body, comments)| {
+                    lifecycle_record::audit_record(Some(&body), &comments, Some(profile)).ok()
+                })
+                .and_then(|audit| matching_closeout_url(&audit, expected));
+            recovered_url.ok_or_else(|| {
+                CommandError::runtime("record-close-comment-post-failed", post_error)
+            })
+        }
+    }
 }
 
 fn run_record_close(
@@ -1918,6 +2575,12 @@ fn run_record_close(
         None
     };
 
+    // Provider-backed live close holds the issue-scoped lifecycle lock from
+    // before the first gate-bearing evidence read through the terminal
+    // mutation and local writeback. Offline/fixture previews never mutate the
+    // provider and therefore do not contend for this lock.
+    let mut _record_close_lifecycle_lock = None;
+
     // Resolve evidence source.
     let (body, comments_json, repo_for_provider, issue_number) = if let Some(fixture_dir) =
         &args.fixture
@@ -1939,8 +2602,15 @@ fn run_record_close(
             ),
         )?;
         let repo_info = resolve_repo_info_for_live(binary, repo_override)?;
-        let adapter = crate::provider::select_adapter(&repo_info, force);
         let issue_number = parse_issue_reference(&args.issue)?;
+        if !dry_run {
+            _record_close_lifecycle_lock = Some(crate::lifecycle_lock::acquire(
+                &repo_info,
+                issue_number,
+                args.profile,
+            )?);
+        }
+        let adapter = crate::provider::select_adapter(&repo_info, force);
         let (body, comments) = adapter
             .issue_evidence(&repo_info.slug, issue_number)
             .map_err(|err| CommandError::runtime("record-close-evidence-read-failed", err))?;
@@ -1948,66 +2618,44 @@ fn run_record_close(
     };
 
     // Resolve linked PRs through provider/fixture for merge_sha + checks.
-    let mut linked_evidence: Vec<lifecycle_record::LinkedPrEvidence> = Vec::new();
-    for raw in &args.linked_pr {
-        let (pr_repo, pr_number) = parse_linked_pr_reference(raw)?;
+    let linked_evidence: Vec<lifecycle_record::LinkedPrEvidence> =
         if let Some(fixture_dir) = &args.fixture {
-            let pr_ev = read_fixture_pr_snapshot(fixture_dir, &pr_repo, pr_number)?;
-            linked_evidence.push(pr_ev);
-        } else if let Some(provider_repo) = &repo_for_provider {
-            // Pick the adapter from the PR's repo, not the issue's repo —
-            // record-close supports cross-repo linked PRs (the PR lives in a
-            // different owner/repo from the tracking issue).
-            let _ = provider_repo;
-            let pr_repo_info = crate::provider::resolve_repo(Some(&pr_repo))
-                .map_err(|err| CommandError::usage("repo-resolution-failed", err))?;
-            let adapter = crate::provider::select_adapter(&pr_repo_info, force);
-            let summary = adapter
-                .pr_merge_summary(&pr_repo, pr_number)
-                .map_err(|err| CommandError::runtime("record-close-pr-summary-failed", err))?;
-            let checks = check_status_from_state(summary.checks.as_deref());
-            let required_state = summary
-                .required_state
-                .as_deref()
-                .map(|s| check_status_from_state(Some(s)));
-            linked_evidence.push(lifecycle_record::LinkedPrEvidence {
-                pr_ref: format!("{pr_repo}#{pr_number}"),
-                url: Some(pr_repo_info.pr_url(pr_number)),
-                merge_sha: if summary.merged {
-                    summary.merge_sha
-                } else {
-                    None
-                },
-                checks,
-                required_state,
-                required_count: summary.required_count,
-                non_required_failures: summary.non_required_failures,
-            });
-            let _ = provider_repo;
+            args.linked_pr
+                .iter()
+                .map(|raw| {
+                    let (pr_repo, pr_number) = parse_linked_pr_reference(raw)?;
+                    read_fixture_pr_snapshot(fixture_dir, &pr_repo, pr_number)
+                })
+                .collect::<Result<_, _>>()?
+        } else if let Some(tracking_repo) = repo_for_provider.as_ref() {
+            read_live_linked_pr_evidence(&args.linked_pr, tracking_repo, force)?
         } else {
-            // body-file/comments-json mode without fixture: cannot resolve PR
-            // state without the provider. Treat as missing merge_sha.
-            linked_evidence.push(lifecycle_record::LinkedPrEvidence {
-                pr_ref: format!("{pr_repo}#{pr_number}"),
-                url: None,
-                merge_sha: None,
-                checks: lifecycle_record::CheckStatus::None,
-                required_state: None,
-                required_count: None,
-                non_required_failures: Vec::new(),
-            });
-        }
-    }
+            args.linked_pr
+                .iter()
+                .map(|raw| {
+                    let (pr_repo, pr_number) = parse_linked_pr_reference(raw)?;
+                    // body-file/comments-json mode without fixture cannot resolve
+                    // provider state, so the strict gate sees a missing merge SHA.
+                    Ok(lifecycle_record::LinkedPrEvidence {
+                        pr_ref: format!("{pr_repo}#{pr_number}"),
+                        url: None,
+                        merge_sha: None,
+                        checks: lifecycle_record::CheckStatus::None,
+                        required_state: None,
+                        required_count: None,
+                        non_required_failures: Vec::new(),
+                    })
+                })
+                .collect::<Result<_, CommandError>>()?
+        };
 
     let audit = lifecycle_record::audit_record(Some(&body), &comments_json, Some(args.profile))
         .map_err(|err| CommandError::runtime("record-close-audit-failed", err))?;
 
-    // Compute canonical final dashboard from audit.
+    // Audit the provider evidence before constructing the closeout preview.
     let issue_url_hint = repo_for_provider
         .as_ref()
         .map(|repo| repo.issue_url(issue_number));
-    let canonical_dashboard =
-        lifecycle_record::render_dashboard_from_audit(&audit, None, issue_url_hint.as_deref());
 
     let gate = lifecycle_record::evaluate_strict_closeout_gate(
         &audit,
@@ -2108,6 +2756,35 @@ fn run_record_close(
     )
     .map_err(|err| CommandError::runtime("record-close-render-failed", err))?;
 
+    // Dry-run and fixture previews have not posted the closeout comment yet, but
+    // their `final_dashboard` must represent the evidence that this command
+    // would append. Add the rendered payload to an in-memory audit instead of
+    // treating a pre-close `state.status=complete` comment as terminal.
+    let preview_closeout_payload = lifecycle_record::extract_payload(&closeout_body)
+        .map_err(|err| CommandError::runtime("record-close-render-failed", err.to_string()))?;
+    let preview_closeout_status = preview_closeout_payload
+        .parse_closeout()
+        .map_err(|err| CommandError::runtime("record-close-render-failed", err.to_string()))?
+        .final_status;
+    let mut preview_audit = audit.clone();
+    preview_audit.evidence.insert(
+        "closeout".to_string(),
+        lifecycle_record::LifecycleEvidence {
+            role: lifecycle_record::PayloadRole::Closeout,
+            profile: args.profile.into(),
+            url: None,
+            created_at: None,
+            status: Some(preview_closeout_status.clone()),
+            payload: Some(preview_closeout_payload.clone()),
+            plan_title: None,
+        },
+    );
+    let canonical_dashboard = lifecycle_record::render_dashboard_from_audit(
+        &preview_audit,
+        None,
+        issue_url_hint.as_deref(),
+    );
+
     let (requested_add_labels, requested_remove_labels) =
         normalize_label_mutations(&args.add_labels, &args.remove_labels, "record-close")?;
     let label_mutation_requested =
@@ -2143,6 +2820,17 @@ fn run_record_close(
     let remove_labels = label_plan.remove.clone();
     let label_mutation_planned = !add_labels.is_empty() || !remove_labels.is_empty();
     let labels_preview = label_plan.preview(None);
+    let execution_state_writeback = repo_for_provider
+        .as_ref()
+        .map(|repo| {
+            prepare_close_exec_state_writeback(
+                args.bundle.as_deref(),
+                repo,
+                &repo.issue_url(issue_number),
+                &linked_evidence,
+            )
+        })
+        .transpose()?;
 
     // Bundle preview for dry-run and fixture modes.
     let preview = json!({
@@ -2176,46 +2864,171 @@ fn run_record_close(
     }
 
     let repo_info = repo_for_provider.expect("live mode has repo");
-    let adapter = crate::provider::select_adapter(&repo_info, force);
     let repo = repo_info.slug.clone();
     let issue_url = repo_info.issue_url(issue_number);
-    let rollback_after_failure = |failure: CommandError| {
-        if label_mutation_planned {
-            restore_close_labels_after_failure(
-                adapter.as_ref(),
-                &repo,
-                issue_number,
-                repo_info.provider,
-                &label_plan,
-                failure,
-            )
+    let _execution_state_writeback_preflight = execution_state_writeback
+        .expect("provider-backed close preflights execution-state writeback");
+    let adapter = crate::provider::select_adapter(&repo_info, force);
+    let revalidate_close_gate = || -> Result<
+        (
+            lifecycle_record::RecordAudit,
+            Vec<lifecycle_record::LinkedPrEvidence>,
+        ),
+        CommandError,
+    > {
+        let (latest_body, latest_comments) = adapter
+            .issue_evidence(&repo, issue_number)
+            .map_err(|err| CommandError::runtime("record-close-gate-reread-failed", err))?;
+        let latest_audit = lifecycle_record::audit_record(
+            Some(&latest_body),
+            &latest_comments,
+            Some(args.profile),
+        )
+        .map_err(|err| CommandError::runtime("record-close-gate-reaudit-failed", err))?;
+        let latest_linked_evidence =
+            read_live_linked_pr_evidence(&args.linked_pr, &repo_info, force)?;
+        let latest_gate = lifecycle_record::evaluate_strict_closeout_gate(
+            &latest_audit,
+            lifecycle_record::StrictCloseoutGateInput {
+                profile: args.profile,
+                approval: Some(approval_text),
+                linked_prs: &latest_linked_evidence,
+                current_body: None,
+                expected_dashboard: None,
+                allow_non_required_check_failure: args.allow_non_required_check_failure,
+            },
+        );
+        if latest_gate.ready {
+            Ok((latest_audit, latest_linked_evidence))
         } else {
-            failure
+            Err(CommandError::runtime(
+                "record-close-gate-changed",
+                format!(
+                    "strict closeout gate changed after preflight: {} ({})",
+                    latest_gate.blocked_codes.join(", "),
+                    latest_gate
+                        .checks
+                        .iter()
+                        .filter(|check| check.status == "fail")
+                        .map(|check| format!("{}: {}", check.check, check.detail))
+                        .collect::<Vec<_>>()
+                        .join("; ")
+                ),
+            ))
         }
     };
+
+    // Re-fetch gate-bearing issue evidence under the lifecycle lock directly
+    // before provider closure. Closing is the first mutation: a failed close
+    // must not leave terminal labels, closeout evidence, or a final dashboard
+    // on an issue that is still open.
+    let (final_audit, linked_evidence) = revalidate_close_gate()?;
+
+    // The final, still-passing refresh is the evidence snapshot that is
+    // terminalized. Rebuild every closeout projection before the close, but do
+    // not mutate the provider until `close_issue` succeeds.
+    let override_block = override_reason.as_ref().map(|reason| {
+        let observed_failures: Vec<String> = linked_evidence
+            .iter()
+            .flat_map(|pr| {
+                pr.non_required_failures
+                    .iter()
+                    .map(move |name| format!("{}: {name}", pr.pr_ref))
+            })
+            .collect();
+        json!({
+            "reason": reason,
+            "observed_non_required_failures": observed_failures,
+        })
+    });
+    let final_validation_url = final_audit
+        .evidence
+        .get("validation")
+        .and_then(|hit| hit.url.clone());
+    let closeout_notes = if linked_evidence.is_empty() {
+        Some(
+            "No linked PRs were provided; closeout relied on issue-visible state, validation, review, and approval evidence.",
+        )
+    } else {
+        None
+    };
+    let closeout_payload = json!({
+        "final_status": "complete",
+        "approval": {"comment_url": approval_text},
+        "linked_prs": linked_evidence
+            .iter()
+            .map(|pr| {
+                json!({
+                    "ref": pr.pr_ref,
+                    "url": pr.url,
+                    "merge_sha": pr.merge_sha,
+                    "checks": check_status_to_str(pr.checks),
+                    "required_state": pr.required_state.map(check_status_to_str),
+                    "required_count": pr.required_count,
+                    "non_required_failures": pr.non_required_failures,
+                })
+            })
+            .collect::<Vec<_>>(),
+        "non_required_check_override": override_block,
+        "final_validation_url": final_validation_url,
+        "notes": closeout_notes,
+    });
+    let closeout_body = lifecycle_record::render_record_post_comment(
+        args.profile,
+        crate::commands::record::LifecycleCommentKind::Closeout,
+        closeout_payload,
+        Some(closeout_summary),
+        None,
+    )
+    .map_err(|err| CommandError::runtime("record-close-render-failed", err))?;
+    let preview_closeout_payload = lifecycle_record::extract_payload(&closeout_body)
+        .map_err(|err| CommandError::runtime("record-close-render-failed", err.to_string()))?;
+    let preview_closeout_status = preview_closeout_payload
+        .parse_closeout()
+        .map_err(|err| CommandError::runtime("record-close-render-failed", err.to_string()))?
+        .final_status;
+    let execution_state_writeback = prepare_close_exec_state_writeback(
+        args.bundle.as_deref(),
+        &repo_info,
+        &issue_url,
+        &linked_evidence,
+    )?;
+
+    if let Err(close_error) = adapter.close_issue(
+        &repo,
+        issue_number,
+        crate::commands::plan::CloseReason::Completed,
+        None,
+    ) {
+        let confirmed_closed = adapter
+            .issue_state(&repo, issue_number)
+            .is_ok_and(|state| state.trim().eq_ignore_ascii_case("closed"));
+        if !confirmed_closed {
+            return Err(CommandError::runtime(
+                "record-close-issue-close-failed",
+                close_error,
+            ));
+        }
+    }
+
     let confirmed_labels = if label_mutation_planned {
         adapter
             .edit_issue_labels(&repo, issue_number, &add_labels, &remove_labels)
-            .map_err(|err| {
-                rollback_after_failure(CommandError::runtime("record-close-label-edit-failed", err))
-            })?;
-        let observed = adapter.issue_labels(&repo, issue_number).map_err(|err| {
-            rollback_after_failure(CommandError::runtime(
-                "record-close-label-readback-failed",
-                err,
-            ))
-        })?;
+            .map_err(|err| CommandError::runtime("record-close-label-edit-failed", err))?;
+        let observed = adapter
+            .issue_labels(&repo, issue_number)
+            .map_err(|err| CommandError::runtime("record-close-label-readback-failed", err))?;
         let observed = sorted_unique_labels_for_provider(observed, Some(repo_info.provider));
         if !close_label_plan_converged(repo_info.provider, &label_plan, &observed) {
             let expected = label_plan.final_labels.as_deref().unwrap_or_default();
-            return Err(rollback_after_failure(CommandError::runtime(
+            return Err(CommandError::runtime(
                 "record-close-label-convergence-failed",
                 format!(
                     "provider label read-back differs from the preflighted final set; expected {}, observed {}",
                     render_label_diagnostic(expected),
                     render_label_diagnostic(&observed)
                 ),
-            )));
+            ));
         }
         Some(observed)
     } else {
@@ -2223,70 +3036,45 @@ fn run_record_close(
     };
     let labels_result = label_plan.preview(confirmed_labels.as_deref());
 
-    let closeout_path =
-        write_temp_markdown("record-close-comment", &closeout_body).map_err(|err| {
-            rollback_after_failure(CommandError::runtime(
-                "record-close-comment-write-failed",
-                err,
-            ))
-        })?;
-    let closeout_url = adapter
-        .comment_issue(&repo, issue_number, &closeout_path)
-        .map_err(|err| {
-            rollback_after_failure(CommandError::runtime(
-                "record-close-comment-post-failed",
-                err,
-            ))
-        })?;
+    let closeout_url = resolve_closeout_comment_url(
+        adapter.as_ref(),
+        &repo,
+        issue_number,
+        args.profile,
+        &final_audit,
+        &preview_closeout_payload,
+        &closeout_body,
+    )?;
 
-    // Re-audit so the final dashboard includes the closeout URL.
-    let (body_after, comments_after) =
-        adapter.issue_evidence(&repo, issue_number).map_err(|err| {
-            rollback_after_failure(CommandError::runtime(
-                "record-close-evidence-reread-failed",
-                err,
-            ))
-        })?;
-    let audit_after =
-        lifecycle_record::audit_record(Some(&body_after), &comments_after, Some(args.profile))
-            .map_err(|err| {
-                rollback_after_failure(CommandError::runtime(
-                    "record-close-audit-reread-failed",
-                    err,
-                ))
-            })?;
+    // The final gate audit is the authoritative pre-close snapshot. Provider
+    // reads can lag a successful comment write, so overlay the returned
+    // closeout URL and the freshly rendered payload directly onto that audit.
+    let mut audit_after = final_audit;
+    audit_after.evidence.insert(
+        "closeout".to_string(),
+        lifecycle_record::LifecycleEvidence {
+            role: lifecycle_record::PayloadRole::Closeout,
+            profile: args.profile.into(),
+            url: Some(closeout_url.clone()),
+            created_at: None,
+            status: Some(preview_closeout_status),
+            payload: Some(preview_closeout_payload),
+            plan_title: None,
+        },
+    );
     let final_dashboard =
         lifecycle_record::render_dashboard_from_audit(&audit_after, None, Some(&issue_url));
-    let dashboard_path =
-        write_temp_markdown("record-close-dashboard", &final_dashboard).map_err(|err| {
-            rollback_after_failure(CommandError::runtime(
-                "record-close-dashboard-write-failed",
-                err,
-            ))
-        })?;
+    let dashboard_path = write_temp_markdown("record-close-dashboard", &final_dashboard)
+        .map_err(|err| CommandError::runtime("record-close-dashboard-write-failed", err))?;
     adapter
         .edit_issue_body(&repo, issue_number, &dashboard_path)
-        .map_err(|err| {
-            rollback_after_failure(CommandError::runtime(
-                "record-close-dashboard-edit-failed",
-                err,
-            ))
-        })?;
-    adapter
-        .close_issue(
-            &repo,
-            issue_number,
-            crate::commands::plan::CloseReason::Completed,
-            None,
-        )
-        .map_err(|err| CommandError::runtime("record-close-issue-close-failed", err))?;
+        .map_err(|err| CommandError::runtime("record-close-dashboard-edit-failed", err))?;
 
-    // Write the terminal state back into the bundle's execution-state file so
-    // the in-repo copy is final immediately after closeout, not transient-stale
-    // until `plan-archive migrate`. Skipped (and reported) when no --bundle was
-    // provided; a write error is reported, not fatal (the issue is closed).
-    let execution_state_sync =
-        close_exec_state_writeback(args.bundle.as_deref(), &issue_url, &linked_evidence);
+    // Apply the preflighted terminal writeback only after the provider close
+    // succeeds. Repository, parent, and target descriptors were pinned before
+    // provider mutation; apply revalidates their identities and replaces the
+    // file relative to the pinned parent descriptor.
+    let execution_state_sync = apply_close_exec_state_writeback(execution_state_writeback)?;
 
     Ok(json!({
         "operation": "record.close",
@@ -2308,21 +3096,24 @@ fn run_record_close(
 /// Terminal-state writeback for `record close`. Patches the bundle's
 /// execution-state fields (`Status`, `Current task`, `Next task`, `Last
 /// updated`, `Branch/commit/PR`, `Tracking issue`, and `Handoff`) to coherent
-/// final values. Returns the JSON object placed
-/// under `execution_state_sync` in the close result. The `## Task Ledger` rows
+/// final values. A provider-close success followed by a local writeback failure
+/// returns a nonzero command error instead of embedding failure in a success
+/// envelope. The `## Task Ledger` rows
 /// are owned by the existing per-task `ledger-update` + `close-ready`
 /// `ledger-rows-pending` gate, so this writeback never rewrites them.
-fn close_exec_state_writeback(
-    bundle: Option<&Path>,
+enum CloseExecStateWritebackPlan {
+    Skipped(&'static str),
+    Apply {
+        exec_state: plan_tooling::exec_state::PinnedExecutionState,
+        expected_contents: String,
+        state: Box<plan_tooling::exec_state::TerminalState>,
+    },
+}
+
+fn close_exec_state_terminal_state(
     issue_url: &str,
     linked_prs: &[lifecycle_record::LinkedPrEvidence],
-) -> Value {
-    let Some(bundle_dir) = bundle else {
-        return json!({"skipped": true, "reason": "no --bundle provided"});
-    };
-    let Some(exec_state) = find_execution_state(bundle_dir) else {
-        return json!({"skipped": true, "reason": "no *-execution-state.md in bundle"});
-    };
+) -> plan_tooling::exec_state::TerminalState {
     let branch_commit_pr = if linked_prs.is_empty() {
         None
     } else {
@@ -2340,29 +3131,174 @@ fn close_exec_state_writeback(
                 .join("; "),
         )
     };
-    let state = plan_tooling::exec_state::TerminalState {
-        status: Some("complete; tracking issue closed".to_string()),
-        current_task: Some("none; tracking issue closed".to_string()),
-        next_task: Some("none; tracking issue closed".to_string()),
+    plan_tooling::exec_state::TerminalState {
+        status: Some("complete".to_string()),
+        current_task: Some("complete".to_string()),
+        next_task: Some("none".to_string()),
         last_updated: Some(chrono::Utc::now().format("%Y-%m-%d").to_string()),
         branch_commit_pr,
         tracking_issue_url: Some(issue_url.to_string()),
         handoff: Some(format!(
             "- Tracking issue <{issue_url}> is closed; terminal execution state is synchronized. No closeout or merge action remains."
         )),
+    }
+}
+
+fn prepare_close_exec_state_writeback(
+    bundle: Option<&Path>,
+    repo: &crate::provider::Repo,
+    issue_url: &str,
+    linked_prs: &[lifecycle_record::LinkedPrEvidence],
+) -> Result<CloseExecStateWritebackPlan, CommandError> {
+    let Some(bundle) = bundle else {
+        return Ok(CloseExecStateWritebackPlan::Skipped("no --bundle provided"));
     };
-    match plan_tooling::exec_state::writeback_terminal(&exec_state, &state, false) {
-        Ok(report) => json!({
-            "file": exec_state.display().to_string(),
+    let allow_any_git_repo = matches!(repo.provider, crate::provider::Provider::Local);
+    let repo_root = verified_current_repo_root_for_identity(Some(repo), allow_any_git_repo)
+        .ok_or_else(|| {
+            CommandError::usage(
+                "record-close-execution-state-path-invalid",
+                "--bundle requires a verified matching Git repository",
+            )
+        })?;
+    let bundle =
+        confined_existing_path(&repo_root, &absolutize(bundle), false).ok_or_else(|| {
+            CommandError::usage(
+                "record-close-execution-state-path-invalid",
+                "--bundle must be a real directory inside the verified repository",
+            )
+        })?;
+    let exec_state = unique_confined_execution_state(&repo_root, &bundle).map_err(|err| {
+        CommandError::usage(
+            match err {
+                StateLedgerResolutionError::Ambiguous => "record-close-execution-state-ambiguous",
+                StateLedgerResolutionError::Unresolved => {
+                    "record-close-execution-state-path-invalid"
+                }
+            },
+            "--bundle must contain at most one real *-execution-state.md file",
+        )
+    })?;
+    let Some(exec_state) = exec_state else {
+        return Ok(CloseExecStateWritebackPlan::Skipped(
+            "no *-execution-state.md in bundle",
+        ));
+    };
+    let exec_state = confined_existing_path(&repo_root, &exec_state, true).ok_or_else(|| {
+        CommandError::usage(
+            "record-close-execution-state-path-invalid",
+            "execution-state file must be a real file inside the verified repository",
+        )
+    })?;
+    let exec_state = plan_tooling::exec_state::PinnedExecutionState::pin(&repo_root, &exec_state)
+        .map_err(|err| {
+        CommandError::usage(
+            "record-close-execution-state-path-invalid",
+            format!(
+                "execution-state file could not be pinned inside the verified repository: {err}"
+            ),
+        )
+    })?;
+    let state = close_exec_state_terminal_state(issue_url, linked_prs);
+    let expected_contents = exec_state.read_to_string().map_err(|err| {
+        CommandError::runtime(
+            "record-close-execution-state-preflight-failed",
+            err.to_string(),
+        )
+    })?;
+    let ledger_rows = plan_tooling::ledger::read_rows(&expected_contents, exec_state.path())
+        .map_err(|err| {
+            let code = if err.code() == "ledger-row-ambiguous" {
+                "record-close-execution-state-ledger-ambiguous"
+            } else {
+                "record-close-execution-state-ledger-malformed"
+            };
+            CommandError::usage(code, err.to_string())
+        })?;
+    let nonterminal = ledger_rows
+        .iter()
+        .filter(|row| !matches!(row.status.as_str(), "done" | "deferred" | "waived"))
+        .map(|row| format!("{} ({})", row.id, row.status))
+        .collect::<Vec<_>>();
+    if !nonterminal.is_empty() {
+        return Err(CommandError::usage(
+            "record-close-execution-state-ledger-pending",
+            format!(
+                "execution-state Task Ledger contains nonterminal rows: {}",
+                nonterminal.join(", ")
+            ),
+        ));
+    }
+    plan_tooling::exec_state::writeback_terminal_pinned_if_unchanged(
+        &exec_state,
+        &expected_contents,
+        &state,
+        true,
+    )
+    .map_err(|err| match err {
+        plan_tooling::exec_state::ExecStateError::ExpectedContentsChanged { .. }
+        | plan_tooling::exec_state::ExecStateError::ExpectedPathChanged { .. } => {
+            CommandError::runtime(
+                "record-close-execution-state-path-changed",
+                "execution-state path or contents changed during preflight",
+            )
+        }
+        err => CommandError::runtime(
+            "record-close-execution-state-preflight-failed",
+            err.to_string(),
+        ),
+    })?;
+    Ok(CloseExecStateWritebackPlan::Apply {
+        exec_state,
+        expected_contents,
+        state: Box::new(state),
+    })
+}
+
+fn apply_close_exec_state_writeback(
+    plan: CloseExecStateWritebackPlan,
+) -> Result<Value, CommandError> {
+    let (exec_state, expected_contents, state) = match plan {
+        CloseExecStateWritebackPlan::Skipped(reason) => {
+            return Ok(json!({"skipped": true, "reason": reason}));
+        }
+        CloseExecStateWritebackPlan::Apply {
+            exec_state,
+            expected_contents,
+            state,
+        } => (exec_state, expected_contents, state),
+    };
+    match plan_tooling::exec_state::writeback_terminal_pinned_if_unchanged(
+        &exec_state,
+        &expected_contents,
+        &state,
+        false,
+    ) {
+        Ok(report) => Ok(json!({
+            "file": exec_state.path().display().to_string(),
             "changed": report.changed,
             "followup_commit_required": report.changed,
             "report": serde_json::to_value(&report).unwrap_or(Value::Null),
-        }),
-        Err(err) => json!({
-            "file": exec_state.display().to_string(),
-            "ok": false,
-            "error": {"code": err.code(), "message": err.to_string()},
-        }),
+        })),
+        Err(plan_tooling::exec_state::ExecStateError::ExpectedPathChanged { .. }) => {
+            Err(CommandError::runtime(
+                "record-close-execution-state-writeback-failed",
+                "provider issue is closed, but durable execution-state writeback failed: execution-state path changed after preflight",
+            ))
+        }
+        Err(plan_tooling::exec_state::ExecStateError::ExpectedContentsChanged { .. }) => {
+            Err(CommandError::runtime(
+                "record-close-execution-state-writeback-failed",
+                "provider issue is closed, but durable execution-state writeback failed: execution-state contents changed after preflight",
+            ))
+        }
+        Err(err) => Err(CommandError::runtime(
+            "record-close-execution-state-writeback-failed",
+            format!(
+                "provider issue is closed, but durable execution-state writeback failed ({}): {err}",
+                err.code()
+            ),
+        )),
     }
 }
 
@@ -2440,6 +3376,13 @@ fn run_record_audit_visible(
     let mut all_codes: Vec<&'static str> = Vec::new();
     let mut overall_pass = true;
 
+    let state_is_closed = audit
+        .evidence
+        .get("closeout")
+        .and_then(|hit| hit.payload.as_ref())
+        .and_then(|payload| payload.parse_closeout().ok())
+        .is_some_and(|closeout| closeout.final_status.eq_ignore_ascii_case("complete"));
+
     // Walk roles in canonical order so the output is deterministic regardless
     // of HashMap iteration order.
     for spec in registry::all_roles() {
@@ -2454,7 +3397,7 @@ fn run_record_audit_visible(
         });
 
         if let Some(body) = body {
-            let hints = derive_lint_hints(spec.role, evidence);
+            let hints = derive_lint_hints(spec.role, evidence, state_is_closed);
             let report = visible_lint::lint_visible(spec.role, body, hints);
             let codes: Vec<&'static str> = report.codes();
             if !report.is_pass() {
@@ -2497,6 +3440,7 @@ fn run_record_audit_visible(
 fn derive_lint_hints(
     role: crate::lifecycle_record::PayloadRole,
     evidence: Option<&crate::lifecycle_record::LifecycleEvidence>,
+    state_is_closed: bool,
 ) -> crate::lifecycle_vnext::visible_lint::LintHints {
     use crate::lifecycle_record::PayloadRole;
     use crate::lifecycle_vnext::visible_lint::LintHints;
@@ -2506,6 +3450,7 @@ fn derive_lint_hints(
 
     match role {
         PayloadRole::State => {
+            hints.state_is_closed = state_is_closed;
             // Final state when the structured payload reports `complete`.
             if let Some(payload) = payload
                 && let Ok(state) = payload.parse_state()
@@ -2705,7 +3650,7 @@ fn run_tracking(
             TrackingRunCommand::Update(args) => run_tracking_run_update(args),
         },
         TrackingCommand::Checkpoint(args) => {
-            run_tracking_checkpoint(binary, force, repo_override, args)
+            run_tracking_checkpoint(binary, dry_run, force, repo_override, args)
         }
         TrackingCommand::CloseReady(args) => run_tracking_close_ready(args),
     }
@@ -2721,8 +3666,170 @@ fn absolutize(path: &Path) -> PathBuf {
     std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
+fn is_safe_repo_relative(path: &Path) -> bool {
+    !path.as_os_str().is_empty()
+        && !path.is_absolute()
+        && path
+            .components()
+            .all(|component| matches!(component, std::path::Component::Normal(_)))
+}
+
+fn repository_identity(
+    repo: &str,
+    repo_provider: Option<&str>,
+    repo_host: Option<&str>,
+) -> Option<crate::provider::Repo> {
+    let qualified = repo.contains("://")
+        || repo.contains('@')
+        || repo.ends_with(".git")
+        || repo.starts_with("local:");
+    let parsed = qualified
+        .then(|| crate::provider::resolve_repo(Some(repo)).ok())
+        .flatten();
+    let provider = match repo_provider {
+        Some("github") => crate::provider::Provider::GitHub,
+        Some("gitlab") => crate::provider::Provider::GitLab,
+        Some("local") => crate::provider::Provider::Local,
+        Some(_) => return None,
+        None => parsed.as_ref()?.provider,
+    };
+    let slug = parsed
+        .as_ref()
+        .map(|parsed| parsed.slug.clone())
+        .unwrap_or_else(|| repo.trim().trim_end_matches('/').to_string());
+    if slug.is_empty() {
+        return None;
+    }
+    Some(crate::provider::Repo {
+        provider,
+        slug,
+        host: repo_host
+            .map(|host| crate::provider::canonical_provider_host(provider, host))
+            .or_else(|| parsed.and_then(|parsed| parsed.host)),
+    })
+}
+
+fn repository_slug_matches(
+    provider: crate::provider::Provider,
+    expected: &str,
+    actual: &str,
+) -> bool {
+    match provider {
+        crate::provider::Provider::GitHub => expected.eq_ignore_ascii_case(actual),
+        crate::provider::Provider::GitLab | crate::provider::Provider::Local => expected == actual,
+    }
+}
+
+fn repository_identity_matches(
+    expected: &crate::provider::Repo,
+    actual: &crate::provider::Repo,
+) -> bool {
+    expected.provider == actual.provider
+        && repository_slug_matches(expected.provider, &expected.slug, &actual.slug)
+        && match (expected.host.as_deref(), actual.host.as_deref()) {
+            (Some(expected_host), Some(actual_host)) => {
+                crate::provider::authorities_equal(expected.provider, expected_host, actual_host)
+            }
+            (None, None) => true,
+            _ => false,
+        }
+}
+
+fn verified_current_repo_root(
+    repo: &str,
+    repo_provider: Option<&str>,
+    repo_host: Option<&str>,
+) -> Option<PathBuf> {
+    let expected = repository_identity(repo, repo_provider, repo_host)?;
+    if matches!(expected.provider, crate::provider::Provider::Local) {
+        return common_git::repo_root().ok().flatten();
+    }
+    let actual = crate::provider::resolve_repo(None).ok()?;
+    if !repository_identity_matches(&expected, &actual) {
+        return None;
+    }
+    common_git::repo_root().ok().flatten()
+}
+
+fn verified_current_repo_root_for_identity(
+    expected: Option<&crate::provider::Repo>,
+    allow_any_git_repo: bool,
+) -> Option<PathBuf> {
+    let root = common_git::repo_root().ok().flatten()?;
+    if allow_any_git_repo {
+        return Some(root);
+    }
+    let actual = crate::provider::resolve_repo(None).ok()?;
+    expected
+        .is_some_and(|expected| repository_identity_matches(expected, &actual))
+        .then_some(root)
+}
+
+fn git_output_at(path: &Path, args: &[&str]) -> Option<String> {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(path)
+        .args(args)
+        .output()
+        .ok()?;
+    output
+        .status
+        .success()
+        .then(|| String::from_utf8_lossy(&output.stdout).trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn repository_root_for_confined_path(path: &Path) -> Option<PathBuf> {
+    let anchor = if path.is_dir() { path } else { path.parent()? };
+    Some(PathBuf::from(git_output_at(
+        anchor,
+        &["rev-parse", "--show-toplevel"],
+    )?))
+}
+
+fn verified_recorded_path(
+    expected: Option<&crate::provider::Repo>,
+    historical_slug: Option<&str>,
+    allow_any_git_repo: bool,
+    path: &Path,
+    want_file: bool,
+) -> Option<PathBuf> {
+    let link_metadata = std::fs::symlink_metadata(path).ok()?;
+    if link_metadata.file_type().is_symlink() {
+        return None;
+    }
+    let anchor = if want_file { path.parent()? } else { path };
+    let root = PathBuf::from(git_output_at(anchor, &["rev-parse", "--show-toplevel"])?);
+    if allow_any_git_repo {
+        return confined_existing_path(&root, path, want_file);
+    }
+    let remote = git_output_at(&root, &["remote", "get-url", "origin"])?;
+    let actual = crate::provider::resolve_repo(Some(&remote)).ok()?;
+    let identity_matches = expected
+        .is_some_and(|expected| repository_identity_matches(expected, &actual))
+        || (expected.is_none()
+            && historical_slug.is_some_and(|slug| {
+                repository_slug_matches(
+                    actual.provider,
+                    slug.trim().trim_end_matches('/'),
+                    &actual.slug,
+                )
+            }));
+    if !identity_matches {
+        return None;
+    }
+    confined_existing_path(&root, path, want_file)
+}
+
+fn repo_relative_identity(path: &Path, repo_root: &Path) -> Option<PathBuf> {
+    let canonical_path = fs::canonicalize(absolutize(path)).ok()?;
+    let canonical_root = fs::canonicalize(repo_root).ok()?;
+    let relative = canonical_path.strip_prefix(canonical_root).ok()?;
+    is_safe_repo_relative(relative).then(|| relative.to_path_buf())
+}
+
 fn run_tracking_run_init(
-    _repo_override: Option<&str>,
+    repo_override: Option<&str>,
     dry_run: bool,
     args: &crate::commands::tracking::TrackingRunInitArgs,
 ) -> Result<Value, CommandError> {
@@ -2730,30 +3837,162 @@ fn run_tracking_run_init(
     use crate::tracking::events::{self, ExecutionEvent, ExecutionEventKind};
     use crate::tracking::run_state::{ExecutionRun, RunPhase, RunRoot, SelectedScope};
 
+    let canonical_linked_pr = args
+        .linked_pr
+        .as_deref()
+        .map(canonical_linked_pr_reference)
+        .transpose()?;
+
     let now = args.now.clone().unwrap_or_else(default_now);
     let run_id = args
         .run_id
         .clone()
         .unwrap_or_else(|| default_run_id(args.issue, &now));
-    let repo_slug = runtime_layout::repo_slug(&args.provider_repo);
-    let root = RunRoot::new(&repo_slug, args.issue, run_id.clone())
-        .map_err(|err| CommandError::runtime("tracking-run-init-layout-failed", err.to_string()))?;
+    let requested_is_qualified = checkpoint_repo_arg_is_qualified(&args.provider_repo);
+    let global_is_qualified = repo_override.is_some_and(checkpoint_repo_arg_is_qualified);
+    let global_repo = repo_override
+        .map(|raw| {
+            crate::provider::resolve_repo(Some(raw)).map_err(|_| {
+                CommandError::usage(
+                    "tracking-run-init-repo-identity-invalid",
+                    "global repository override is invalid",
+                )
+            })
+        })
+        .transpose()?;
+    let requested_repo = if !requested_is_qualified && global_is_qualified {
+        let global = global_repo.as_ref().expect("qualified override resolved");
+        if !repository_slug_matches(global.provider, &global.slug, &args.provider_repo) {
+            return Err(CommandError::usage(
+                "tracking-run-init-repo-mismatch",
+                "global repository override does not match --provider-repo",
+            ));
+        }
+        global.clone()
+    } else {
+        crate::provider::resolve_repo(Some(&args.provider_repo)).map_err(|_| {
+            CommandError::usage(
+                "tracking-run-init-repo-identity-invalid",
+                "--provider-repo is not a valid repository identity",
+            )
+        })?
+    };
+    let repo_slug = requested_repo.slug.clone();
+    if let Some(global) = global_repo.as_ref()
+        && ((requested_is_qualified && global.provider != requested_repo.provider)
+            || !repository_slug_matches(global.provider, &global.slug, &requested_repo.slug))
+    {
+        return Err(CommandError::usage(
+            "tracking-run-init-repo-mismatch",
+            "global repository override does not match --provider-repo",
+        ));
+    }
+    let bound_repo = if requested_is_qualified {
+        if let Some(global) = global_repo.as_ref()
+            && checkpoint_repo_arg_is_qualified(repo_override.unwrap_or_default())
+            && !checkpoint_repo_identities_match(&requested_repo, global)
+        {
+            return Err(CommandError::usage(
+                "tracking-run-init-repo-mismatch",
+                "global repository override does not match --provider-repo",
+            ));
+        }
+        Some(requested_repo.clone())
+    } else if repo_override.is_some_and(checkpoint_repo_arg_is_qualified) {
+        global_repo
+    } else {
+        crate::provider::resolve_repo(None).ok().filter(|current| {
+            current.provider == requested_repo.provider
+                && repository_slug_matches(requested_repo.provider, &current.slug, &repo_slug)
+        })
+    };
+    let root = RunRoot::new(
+        &runtime_layout::repo_slug(&repo_slug),
+        args.issue,
+        run_id.clone(),
+    )
+    .map_err(|err| CommandError::runtime("tracking-run-init-layout-failed", err.to_string()))?;
     let mut run = ExecutionRun::new(
         run_id.clone(),
-        args.provider_repo.clone(),
+        repo_slug,
         args.issue,
         args.profile.as_str().to_string(),
         RunPhase::Initial,
         now.clone(),
     );
+    if let Some(bound) = bound_repo {
+        run.repo_provider = Some(bound.provider.as_str().to_string());
+        run.repo_host = bound.host;
+    }
+    let source_repo_root = if args.bundle.is_some() || args.execution_state_file.is_some() {
+        Some(
+            verified_current_repo_root(
+                &run.repo,
+                run.repo_provider.as_deref(),
+                run.repo_host.as_deref(),
+            )
+            .ok_or_else(|| {
+                CommandError::usage(
+                    "tracking-run-init-source-path-invalid",
+                    "source paths require a verified matching Git repository",
+                )
+            })?,
+        )
+    } else {
+        None
+    };
     // Persist bundle / execution-state refs as absolute, cwd-independent paths.
     // `tracking run init` resolves a relative `--bundle` against the current
     // directory, but a later `tracking checkpoint` may run from elsewhere; a
     // verbatim relative ref then fails to resolve and the state checkpoint
     // silently degrades to the single-row baseline
     // (graysurf/plan-tracking-testbed#55).
-    run.bundle = args.bundle.as_deref().map(absolutize);
-    run.execution_state_file = args.execution_state_file.as_deref().map(absolutize);
+    run.bundle = args
+        .bundle
+        .as_deref()
+        .map(|path| {
+            let absolute = absolutize(path);
+            confined_existing_path(
+                source_repo_root.as_deref().expect("source root"),
+                &absolute,
+                false,
+            )
+            .ok_or_else(|| {
+                CommandError::usage(
+                    "tracking-run-init-source-path-invalid",
+                    "--bundle must be a real directory inside the verified repository",
+                )
+            })
+        })
+        .transpose()?;
+    run.execution_state_file = args
+        .execution_state_file
+        .as_deref()
+        .map(|path| {
+            let absolute = absolutize(path);
+            confined_existing_path(
+                source_repo_root.as_deref().expect("source root"),
+                &absolute,
+                true,
+            )
+            .ok_or_else(|| {
+                CommandError::usage(
+                    "tracking-run-init-source-path-invalid",
+                    "--execution-state-file must be a real file inside the verified repository",
+                )
+            })
+        })
+        .transpose()?;
+    if let Some(repo_root) = source_repo_root {
+        run.bundle_repo_relative = args
+            .bundle
+            .as_deref()
+            .and_then(|path| repo_relative_identity(path, &repo_root));
+        run.execution_state_repo_relative = args
+            .execution_state_file
+            .as_deref()
+            .and_then(|path| repo_relative_identity(path, &repo_root));
+    }
     if args.task.is_some() || args.sprint.is_some() {
         run.selected_scope = Some(SelectedScope {
             sprint: args.sprint,
@@ -2763,7 +4002,7 @@ fn run_tracking_run_init(
     }
     run.branch = args.branch.clone();
     run.worktree = args.worktree.clone();
-    if let Some(linked) = &args.linked_pr {
+    if let Some(linked) = &canonical_linked_pr {
         run.set_linked_pr(crate::tracking::run_state::LinkedPr {
             r#ref: linked.clone(),
             url: None,
@@ -2786,14 +4025,23 @@ fn run_tracking_run_init(
         (root.run_state_path(), root.events_path())
     };
 
+    let run_init_lock = (!dry_run)
+        .then(|| TrackingRunUpdateLock::acquire(&run_state_path))
+        .transpose()?;
     if !dry_run {
-        crate::tracking::run_state::write_run_state(&run_state_path, &run).map_err(|err| {
-            CommandError::runtime("tracking-run-init-write-failed", err.to_string())
-        })?;
+        run_init_lock
+            .as_ref()
+            .expect("live init owns run-state lock")
+            .write_run_state(&run)
+            .map_err(|err| {
+                CommandError::runtime("tracking-run-init-write-failed", err.to_string())
+            })?;
         let event =
             ExecutionEvent::new(run_id.clone(), ExecutionEventKind::RunStarted, now.clone())
                 .with_detail(serde_json::json!({
-                    "repo": args.provider_repo,
+                    "repo": run.repo.as_str(),
+                    "repo_provider": run.repo_provider.as_deref(),
+                    "repo_host": run.repo_host.as_deref(),
                     "issue": args.issue,
                     "profile": args.profile.as_str(),
                 }));
@@ -2808,85 +4056,462 @@ fn run_tracking_run_init(
         "run_id": run_id,
         "run_state_path": path_text(&run_state_path),
         "events_path": path_text(&events_path),
-        "repo": args.provider_repo,
+        "repo": run.repo.as_str(),
+        "repo_provider": run.repo_provider.as_deref(),
+        "repo_host": run.repo_host.as_deref(),
         "issue": args.issue,
         "profile": args.profile.as_str(),
     }))
+}
+
+#[derive(Debug)]
+struct TrackingRunUpdateLock {
+    run_state: PathBuf,
+    target_identity: Option<(u64, u64)>,
+    target: Option<plan_tooling::mutation_lock::OwnedFileLock>,
+    _path_lock: plan_tooling::mutation_lock::OwnedFileLock,
+}
+
+impl TrackingRunUpdateLock {
+    fn acquire(run_state: &Path) -> Result<Self, CommandError> {
+        let parent = run_state.parent().unwrap_or_else(|| Path::new("."));
+        let file_name = run_state
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("run-state.json");
+        let path = parent.join(format!(".{file_name}.update.lock"));
+        let path_lock = match plan_tooling::mutation_lock::OwnedFileLock::acquire(&path) {
+            Ok(lock) => lock,
+            Err(plan_tooling::mutation_lock::OwnedFileLockError::Busy) => {
+                return Err(CommandError::runtime(
+                    "tracking-run-update-lock-busy",
+                    format!(
+                        "another update is already in progress for {}; retry after it finishes (the kernel releases lock {} when its process exits)",
+                        run_state.display(),
+                        path.display()
+                    ),
+                ));
+            }
+            Err(plan_tooling::mutation_lock::OwnedFileLockError::Failed(err)) => {
+                return Err(CommandError::runtime(
+                    "tracking-run-update-lock-acquire-failed",
+                    format!(
+                        "failed to acquire run update lock {}: {err}",
+                        path.display()
+                    ),
+                ));
+            }
+        };
+
+        let visible = match fs::symlink_metadata(run_state) {
+            Ok(metadata) => Some(metadata),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+            Err(err) => {
+                return Err(CommandError::runtime(
+                    "tracking-run-update-lock-acquire-failed",
+                    format!("failed to inspect {}: {err}", run_state.display()),
+                ));
+            }
+        };
+        if visible
+            .as_ref()
+            .is_some_and(|metadata| metadata.file_type().is_symlink() || !metadata.is_file())
+        {
+            return Err(Self::unsafe_target(run_state));
+        }
+
+        let target = if visible.is_some() {
+            match plan_tooling::mutation_lock::OwnedFileLock::acquire_existing(run_state) {
+                Ok(lock) => Some(lock),
+                Err(plan_tooling::mutation_lock::OwnedFileLockError::Busy) => {
+                    return Err(CommandError::runtime(
+                        "tracking-run-update-lock-busy",
+                        format!(
+                            "another update is already in progress for {}; retry after it finishes",
+                            run_state.display()
+                        ),
+                    ));
+                }
+                Err(plan_tooling::mutation_lock::OwnedFileLockError::Failed(_)) => {
+                    return Err(Self::unsafe_target(run_state));
+                }
+            }
+        } else {
+            None
+        };
+        let target_identity = target
+            .as_ref()
+            .map(|target| target.file().metadata())
+            .transpose()
+            .map_err(|err| {
+                CommandError::runtime(
+                    "tracking-run-update-lock-acquire-failed",
+                    format!("failed to inspect {}: {err}", run_state.display()),
+                )
+            })?
+            .map(|metadata| {
+                if metadata.nlink() != 1 || !metadata.is_file() {
+                    return Err(Self::unsafe_target(run_state));
+                }
+                Ok((metadata.dev(), metadata.ino()))
+            })
+            .transpose()?;
+
+        Ok(Self {
+            run_state: run_state.to_path_buf(),
+            target_identity,
+            target,
+            _path_lock: path_lock,
+        })
+    }
+
+    fn unsafe_target(run_state: &Path) -> CommandError {
+        CommandError::runtime(
+            "tracking-run-update-target-unsafe",
+            format!(
+                "run-state target {} must be a single-link regular file, not a symlink, hard-link alias, or special file",
+                run_state.display()
+            ),
+        )
+    }
+
+    fn read_run_state(&self) -> std::io::Result<crate::tracking::run_state::ExecutionRun> {
+        let target = self.target.as_ref().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("{} does not exist", self.run_state.display()),
+            )
+        })?;
+        crate::tracking::run_state::read_run_state_file(target.file())
+    }
+
+    fn verify_target_identity(&self) -> std::io::Result<()> {
+        match self.target_identity {
+            Some((expected_dev, expected_ino)) => {
+                let metadata = fs::symlink_metadata(&self.run_state)?;
+                if metadata.file_type().is_symlink()
+                    || !metadata.is_file()
+                    || metadata.nlink() != 1
+                    || metadata.dev() != expected_dev
+                    || metadata.ino() != expected_ino
+                {
+                    return Err(std::io::Error::other(
+                        "run-state target changed after lock acquisition",
+                    ));
+                }
+            }
+            None => match fs::symlink_metadata(&self.run_state) {
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                Ok(_) => {
+                    return Err(std::io::Error::other(
+                        "run-state target appeared after lock acquisition",
+                    ));
+                }
+                Err(err) => return Err(err),
+            },
+        }
+        Ok(())
+    }
+
+    fn write_run_state(
+        &self,
+        run: &crate::tracking::run_state::ExecutionRun,
+    ) -> std::io::Result<()> {
+        self.verify_target_identity()?;
+        crate::tracking::run_state::write_run_state(&self.run_state, run)
+    }
+}
+
+const TRACKING_RUN_PENDING_UPDATE_SCHEMA: &str = "plan-issue.pending-run-update-event.v1";
+
+#[derive(Debug, Serialize, Deserialize)]
+struct PendingRunUpdateEvent {
+    schema: String,
+    post_state: Value,
+    changed: Vec<String>,
+    update_id: String,
+    event: crate::tracking::events::ExecutionEvent,
+}
+
+fn tracking_run_pending_update_path(run_state: &Path) -> PathBuf {
+    let parent = run_state.parent().unwrap_or_else(|| Path::new("."));
+    let file_name = run_state
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("run-state.json");
+    parent.join(format!(".{file_name}.pending-update-event.json"))
+}
+
+fn clear_tracking_run_pending_update(path: &Path) -> Result<(), CommandError> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(CommandError::runtime(
+            "tracking-run-update-pending-cleanup-failed",
+            format!("failed to remove {}: {err}", path.display()),
+        )),
+    }
+}
+
+fn recover_tracking_run_pending_event(
+    run_state_path: &Path,
+    run: &crate::tracking::run_state::ExecutionRun,
+) -> Result<Option<Vec<String>>, CommandError> {
+    use crate::tracking::events;
+
+    let pending_path = tracking_run_pending_update_path(run_state_path);
+    let raw = match fs::read(&pending_path) {
+        Ok(raw) => raw,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => {
+            return Err(CommandError::runtime(
+                "tracking-run-update-pending-read-failed",
+                format!("failed to read {}: {err}", pending_path.display()),
+            ));
+        }
+    };
+    let pending: PendingRunUpdateEvent = serde_json::from_slice(&raw).map_err(|err| {
+        CommandError::runtime(
+            "tracking-run-update-pending-parse-failed",
+            format!("failed to parse {}: {err}", pending_path.display()),
+        )
+    })?;
+    if pending.schema != TRACKING_RUN_PENDING_UPDATE_SCHEMA {
+        return Err(CommandError::runtime(
+            "tracking-run-update-pending-parse-failed",
+            format!(
+                "unsupported pending update schema `{}` in {}",
+                pending.schema,
+                pending_path.display()
+            ),
+        ));
+    }
+    let current_state = serde_json::to_value(run).map_err(|err| {
+        CommandError::runtime("tracking-run-update-compare-failed", err.to_string())
+    })?;
+    if current_state != pending.post_state {
+        clear_tracking_run_pending_update(&pending_path)?;
+        return Ok(None);
+    }
+
+    let events_path = run_state_path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("events.jsonl");
+    let existing = match events::read_events(&events_path) {
+        Ok(existing) => existing,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(err) => {
+            return Err(CommandError::runtime(
+                "tracking-run-update-event-read-failed",
+                err.to_string(),
+            ));
+        }
+    };
+    let already_appended = existing.iter().any(|event| {
+        event.detail.get("update_id").and_then(Value::as_str) == Some(pending.update_id.as_str())
+    });
+    if !already_appended {
+        events::append_event(&events_path, &pending.event).map_err(|err| {
+            CommandError::runtime("tracking-run-update-event-append-failed", err.to_string())
+        })?;
+    }
+    clear_tracking_run_pending_update(&pending_path)?;
+    Ok(Some(pending.changed))
+}
+
+fn persist_tracking_run_pending_event(
+    run_state_path: &Path,
+    pending: &PendingRunUpdateEvent,
+) -> Result<(), CommandError> {
+    let path = tracking_run_pending_update_path(run_state_path);
+    let raw = serde_json::to_vec_pretty(pending).map_err(|err| {
+        CommandError::runtime(
+            "tracking-run-update-pending-serialize-failed",
+            err.to_string(),
+        )
+    })?;
+    nils_common::fs::write_atomic(&path, &raw, nils_common::fs::SECRET_FILE_MODE).map_err(|err| {
+        CommandError::runtime(
+            "tracking-run-update-pending-write-failed",
+            format!("failed to write {}: {err}", path.display()),
+        )
+    })
+}
+
+fn validate_tracking_run_update_validation_args(
+    args: &crate::commands::tracking::TrackingRunUpdateArgs,
+) -> Result<(), CommandError> {
+    if args.validation_evidence.is_some() && args.validation_command.is_none() {
+        return Err(CommandError::usage(
+            "tracking-run-update-validation-evidence-requires-command",
+            "--validation-evidence requires a complete --validation-command/--validation-status pair",
+        ));
+    }
+    if args.validation_command.is_some() != args.validation_status.is_some() {
+        return Err(CommandError::usage(
+            "tracking-run-update-validation-command-status-required",
+            "--validation-command and --validation-status must be provided together",
+        ));
+    }
+    if let Some(linked_pr) = args.linked_pr.as_deref() {
+        parse_linked_pr_reference_full(linked_pr)?;
+    }
+    Ok(())
 }
 
 fn run_tracking_run_update(
     args: &crate::commands::tracking::TrackingRunUpdateArgs,
 ) -> Result<Value, CommandError> {
     use crate::tracking::events::{self, ExecutionEvent, ExecutionEventKind};
-    use crate::tracking::run_state::{
-        self, LinkedPr, RunPhase, ValidationCommandRow, ValidationSummary,
-    };
+    use crate::tracking::run_state::{LinkedPr, RunPhase, ValidationCommandRow, ValidationSummary};
 
-    let mut run = run_state::read_run_state(&args.run_state)
+    validate_tracking_run_update_validation_args(args)?;
+    let run_update_lock = TrackingRunUpdateLock::acquire(&args.run_state)?;
+    let mut run = run_update_lock
+        .read_run_state()
         .map_err(|err| CommandError::runtime("tracking-run-update-read-failed", err.to_string()))?;
+    canonicalize_execution_run_linked_prs(&mut run)?;
+    let recovered_changes = recover_tracking_run_pending_event(&args.run_state, &run)?;
     let now = args.now.clone().unwrap_or_else(default_now);
+    let requested_phase = args.phase.map(|phase| match phase {
+        crate::commands::tracking::RunPhaseArg::Initial => RunPhase::Initial,
+        crate::commands::tracking::RunPhaseArg::Implementing => RunPhase::Implementing,
+        crate::commands::tracking::RunPhaseArg::Validating => RunPhase::Validating,
+        crate::commands::tracking::RunPhaseArg::Reviewing => RunPhase::Reviewing,
+        crate::commands::tracking::RunPhaseArg::Blocked => RunPhase::Blocked,
+        crate::commands::tracking::RunPhaseArg::ReadyForClose => RunPhase::ReadyForClose,
+        crate::commands::tracking::RunPhaseArg::Closed => RunPhase::Closed,
+    });
+    if matches!(run.phase, RunPhase::Closed)
+        && requested_phase.is_some_and(|phase| !matches!(phase, RunPhase::Closed))
+    {
+        return Err(CommandError::usage(
+            "tracking-run-update-closed-transition",
+            "a closed run cannot transition to another phase without a governed reopen operation",
+        ));
+    }
+    let resulting_phase = requested_phase.unwrap_or(run.phase);
+    if matches!(resulting_phase, RunPhase::Closed) && args.selected_task.is_some() {
+        return Err(CommandError::usage(
+            "tracking-run-update-closed-selected-task",
+            "--selected-task cannot be set while the run phase is closed",
+        ));
+    }
+    let has_ordinary_mutation = args.branch.is_some()
+        || args.linked_pr.is_some()
+        || args.validation_overall.is_some()
+        || args.validation_command.is_some()
+        || args.validation_status.is_some()
+        || args.validation_evidence.is_some()
+        || args.review_decision.is_some()
+        || !args.review_lens.is_empty()
+        || args.review_outcome_comment.is_some()
+        || args.review_findings_file.is_some()
+        || args.note.is_some();
+    if matches!(run.phase, RunPhase::Closed) && has_ordinary_mutation {
+        return Err(CommandError::usage(
+            "tracking-run-update-closed-immutable",
+            "a closed run is immutable; only `--phase closed` may repair a historical stale selected task",
+        ));
+    }
+    let explicit_closed = matches!(requested_phase, Some(RunPhase::Closed));
     let mut changes = Vec::new();
-    if let Some(phase) = args.phase {
-        let new_phase = match phase {
-            crate::commands::tracking::RunPhaseArg::Initial => RunPhase::Initial,
-            crate::commands::tracking::RunPhaseArg::Implementing => RunPhase::Implementing,
-            crate::commands::tracking::RunPhaseArg::Validating => RunPhase::Validating,
-            crate::commands::tracking::RunPhaseArg::Reviewing => RunPhase::Reviewing,
-            crate::commands::tracking::RunPhaseArg::Blocked => RunPhase::Blocked,
-            crate::commands::tracking::RunPhaseArg::ReadyForClose => RunPhase::ReadyForClose,
-            crate::commands::tracking::RunPhaseArg::Closed => RunPhase::Closed,
-        };
+    if let Some(new_phase) = requested_phase
+        && new_phase != run.phase
+    {
         run.phase = new_phase;
         changes.push("phase");
     }
-    if let Some(task) = &args.selected_task {
+    if let Some(task) = &args.selected_task
+        && run
+            .selected_scope
+            .as_ref()
+            .and_then(|scope| scope.task.as_deref())
+            != Some(task.as_str())
+    {
         let mut scope = run.selected_scope.clone().unwrap_or_default();
         scope.task = Some(task.clone());
         run.selected_scope = Some(scope);
         changes.push("selected_task");
     }
-    if let Some(branch) = &args.branch {
+    if explicit_closed
+        && let Some(scope) = run.selected_scope.as_mut()
+        && scope.task.take().is_some()
+    {
+        changes.push("selected_task");
+    }
+    if let Some(branch) = &args.branch
+        && run.branch.as_ref() != Some(branch)
+    {
         run.branch = Some(branch.clone());
         changes.push("branch");
     }
     if let Some(pr) = &args.linked_pr {
-        run.set_linked_pr(LinkedPr {
-            r#ref: pr.clone(),
-            url: None,
-            status: None,
-        });
-        changes.push("linked_pr");
+        let canonical_pr = canonical_linked_pr_reference(pr)?;
+        if run.pr.as_ref().map(|linked| linked.r#ref.as_str()) != Some(canonical_pr.as_str()) {
+            run.set_linked_pr(LinkedPr {
+                r#ref: canonical_pr,
+                url: None,
+                status: None,
+            });
+            changes.push("linked_pr");
+        }
     }
     if args.validation_overall.is_some()
         || args.validation_command.is_some()
         || args.validation_status.is_some()
         || args.validation_evidence.is_some()
     {
-        let mut summary = run.validation.clone().unwrap_or_else(|| ValidationSummary {
+        let previous = run.validation.clone();
+        let mut summary = previous.clone().unwrap_or_else(|| ValidationSummary {
             overall: "pending".to_string(),
             commands: Vec::new(),
             waiver: None,
             evidence_path: None,
         });
+        let mut effective_input = false;
         if let Some(overall) = &args.validation_overall {
             summary.overall = overall.clone();
+            effective_input = true;
         }
         if let (Some(command), Some(status)) = (&args.validation_command, &args.validation_status) {
-            summary.commands.push(ValidationCommandRow {
+            let row = ValidationCommandRow {
                 command: command.clone(),
                 status: status.clone(),
                 evidence: args.validation_evidence.clone(),
-            });
+            };
+            if !summary.commands.iter().any(|existing| {
+                existing.command == row.command
+                    && existing.status == row.status
+                    && existing.evidence == row.evidence
+            }) {
+                summary.commands.push(row);
+            }
+            effective_input = true;
         }
-        run.validation = Some(summary);
-        changes.push("validation");
+        let previous_value = previous
+            .as_ref()
+            .map(serde_json::to_value)
+            .transpose()
+            .map_err(|err| {
+                CommandError::runtime("tracking-run-update-compare-failed", err.to_string())
+            })?;
+        let next_value = serde_json::to_value(&summary).map_err(|err| {
+            CommandError::runtime("tracking-run-update-compare-failed", err.to_string())
+        })?;
+        if effective_input && previous_value.as_ref() != Some(&next_value) {
+            run.validation = Some(summary);
+            changes.push("validation");
+        }
     }
     if args.review_decision.is_some()
         || !args.review_lens.is_empty()
         || args.review_outcome_comment.is_some()
         || args.review_findings_file.is_some()
     {
-        let mut review = if let Some(existing) = run.review.clone() {
+        let previous = run.review.clone();
+        let mut review = if let Some(existing) = previous.clone() {
             existing
         } else {
             let decision = args.review_decision.clone().ok_or_else(|| {
@@ -2915,39 +4540,89 @@ fn run_tracking_run_update(
         if let Some(findings_file) = &args.review_findings_file {
             review.findings = read_review_findings_file(findings_file)?;
         }
-        run.review = Some(review);
-        changes.push("review");
+        let previous_value = previous
+            .as_ref()
+            .map(serde_json::to_value)
+            .transpose()
+            .map_err(|err| {
+                CommandError::runtime("tracking-run-update-compare-failed", err.to_string())
+            })?;
+        let next_value = serde_json::to_value(&review).map_err(|err| {
+            CommandError::runtime("tracking-run-update-compare-failed", err.to_string())
+        })?;
+        if previous_value.as_ref() != Some(&next_value) {
+            run.review = Some(review);
+            changes.push("review");
+        }
     }
     if let Some(note) = &args.note {
         run.notes.push(note.clone());
         changes.push("note");
     }
+    if changes.is_empty() {
+        return Ok(json!({
+            "operation": "tracking.run.update",
+            "run_id": run.run_id,
+            "phase": run.phase.as_str(),
+            "changed": recovered_changes.unwrap_or_default(),
+            "updated_at": run.updated_at,
+        }));
+    }
     run.updated_at = now.clone();
 
-    run_state::write_run_state(&args.run_state, &run).map_err(|err| {
+    let events_path = args
+        .run_state
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("events.jsonl");
+    let update_nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    let update_id = format!(
+        "{}:{}:{}:{update_nonce}",
+        run.run_id,
+        now,
+        std::process::id()
+    );
+    let changed = changes
+        .iter()
+        .map(|change| (*change).to_string())
+        .collect::<Vec<_>>();
+    let event = ExecutionEvent::new(
+        run.run_id.clone(),
+        ExecutionEventKind::RunUpdated,
+        now.clone(),
+    )
+    .with_detail(serde_json::json!({
+        "changed": changed,
+        "update_id": update_id,
+    }));
+    let post_state = serde_json::to_value(&run).map_err(|err| {
+        CommandError::runtime("tracking-run-update-compare-failed", err.to_string())
+    })?;
+    let pending = PendingRunUpdateEvent {
+        schema: TRACKING_RUN_PENDING_UPDATE_SCHEMA.to_string(),
+        post_state,
+        changed: changed.clone(),
+        update_id,
+        event,
+    };
+    persist_tracking_run_pending_event(&args.run_state, &pending)?;
+
+    run_update_lock.write_run_state(&run).map_err(|err| {
         CommandError::runtime("tracking-run-update-write-failed", err.to_string())
     })?;
-
-    // Append an event next to the run-state file.
-    if let Some(parent) = args.run_state.parent() {
-        let events_path = parent.join("events.jsonl");
-        let detail = serde_json::json!({"changed": changes});
-        let event = ExecutionEvent::new(
-            run.run_id.clone(),
-            ExecutionEventKind::RunUpdated,
-            now.clone(),
-        )
-        .with_detail(detail);
-        events::append_event(&events_path, &event).map_err(|err| {
-            CommandError::runtime("tracking-run-update-event-append-failed", err.to_string())
-        })?;
-    }
+    events::append_event(&events_path, &pending.event).map_err(|err| {
+        CommandError::runtime("tracking-run-update-event-append-failed", err.to_string())
+    })?;
+    clear_tracking_run_pending_update(&tracking_run_pending_update_path(&args.run_state))?;
 
     Ok(json!({
         "operation": "tracking.run.update",
         "run_id": run.run_id,
         "phase": run.phase.as_str(),
-        "changed": changes,
+        "changed": changed,
         "updated_at": run.updated_at,
     }))
 }
@@ -2983,8 +4658,299 @@ fn read_review_findings_file(
     Ok(findings)
 }
 
+struct CheckpointTarget {
+    repo: crate::provider::Repo,
+    issue: u64,
+}
+
+fn checkpoint_repo_arg_is_qualified(repo: &str) -> bool {
+    repo.contains("://")
+        || repo.contains('@')
+        || repo.ends_with(".git")
+        || repo.starts_with("local:")
+}
+
+fn checkpoint_repo_identities_match(
+    expected: &crate::provider::Repo,
+    actual: &crate::provider::Repo,
+) -> bool {
+    repository_identity_matches(expected, actual)
+}
+
+fn is_default_provider_host(repo: &crate::provider::Repo) -> bool {
+    match (repo.provider, repo.host.as_deref()) {
+        (crate::provider::Provider::GitHub, Some(host)) => {
+            crate::provider::canonical_provider_host(repo.provider, host) == "github.com"
+        }
+        (crate::provider::Provider::GitLab, Some(host)) => {
+            crate::provider::canonical_provider_host(repo.provider, host) == "gitlab.com"
+        }
+        (crate::provider::Provider::Local, None) => true,
+        _ => false,
+    }
+}
+
+#[derive(Debug)]
+enum PersistedCheckpointRepo {
+    Bound(crate::provider::Repo),
+    Unbound,
+}
+
+fn persisted_checkpoint_repo(
+    run: &crate::tracking::run_state::ExecutionRun,
+) -> Result<PersistedCheckpointRepo, ()> {
+    use crate::provider::{Provider, Repo};
+
+    let qualified = checkpoint_repo_arg_is_qualified(&run.repo);
+    let parsed = qualified
+        .then(|| crate::provider::resolve_repo(Some(&run.repo)).map_err(|_| ()))
+        .transpose()?;
+    match (run.repo_provider.as_deref(), run.repo_host.as_deref()) {
+        (None, None) => Ok(parsed
+            .map(PersistedCheckpointRepo::Bound)
+            .unwrap_or(PersistedCheckpointRepo::Unbound)),
+        (Some("local"), None) => {
+            if parsed
+                .as_ref()
+                .is_some_and(|repo| !matches!(repo.provider, Provider::Local))
+            {
+                return Err(());
+            }
+            let slug = parsed
+                .as_ref()
+                .map(|repo| repo.slug.clone())
+                .unwrap_or_else(|| run.repo.trim().trim_start_matches("local:").to_string());
+            if slug.is_empty() {
+                return Err(());
+            }
+            Ok(PersistedCheckpointRepo::Bound(Repo {
+                provider: Provider::Local,
+                slug,
+                host: None,
+            }))
+        }
+        (Some(provider), Some(host)) if matches!(provider, "github" | "gitlab") => {
+            let provider = if provider == "github" {
+                Provider::GitHub
+            } else {
+                Provider::GitLab
+            };
+            let slug = parsed
+                .as_ref()
+                .map(|repo| repo.slug.clone())
+                .unwrap_or_else(|| run.repo.trim().trim_end_matches('/').to_string());
+            if slug.is_empty() {
+                return Err(());
+            }
+            let host = crate::provider::canonical_provider_host(provider, host);
+            let bound = Repo {
+                provider,
+                slug,
+                host: Some(host.clone()),
+            };
+            let qualified_bound = format!("https://{host}/{}", bound.slug);
+            let validated =
+                crate::provider::resolve_repo(Some(&qualified_bound)).map_err(|_| ())?;
+            if !checkpoint_repo_identities_match(&bound, &validated)
+                || parsed
+                    .as_ref()
+                    .is_some_and(|parsed| !checkpoint_repo_identities_match(&bound, parsed))
+            {
+                return Err(());
+            }
+            Ok(PersistedCheckpointRepo::Bound(bound))
+        }
+        _ => Err(()),
+    }
+}
+
+#[derive(Debug)]
+enum ExplicitCheckpointRepo {
+    Bound(crate::provider::Repo),
+    Slug(String),
+}
+
+fn parse_explicit_checkpoint_repo(raw: &str) -> Result<ExplicitCheckpointRepo, CommandError> {
+    if checkpoint_repo_arg_is_qualified(raw) {
+        return crate::provider::resolve_repo(Some(raw))
+            .map(ExplicitCheckpointRepo::Bound)
+            .map_err(|_| {
+                CommandError::usage(
+                    "tracking-checkpoint-live-repo-identity-invalid",
+                    "explicit repository identity is invalid",
+                )
+            });
+    }
+    let slug = raw.trim().trim_end_matches('/');
+    if slug.is_empty() || !slug.contains('/') {
+        return Err(CommandError::usage(
+            "tracking-checkpoint-live-repo-identity-invalid",
+            "explicit repository identity is invalid",
+        ));
+    }
+    Ok(ExplicitCheckpointRepo::Slug(slug.to_string()))
+}
+
+fn explicit_checkpoint_repos_match(
+    left: &ExplicitCheckpointRepo,
+    right: &ExplicitCheckpointRepo,
+) -> bool {
+    match (left, right) {
+        (ExplicitCheckpointRepo::Bound(left), ExplicitCheckpointRepo::Bound(right)) => {
+            checkpoint_repo_identities_match(left, right)
+        }
+        (ExplicitCheckpointRepo::Bound(bound), ExplicitCheckpointRepo::Slug(slug))
+        | (ExplicitCheckpointRepo::Slug(slug), ExplicitCheckpointRepo::Bound(bound)) => {
+            repository_slug_matches(bound.provider, &bound.slug, slug)
+        }
+        (ExplicitCheckpointRepo::Slug(left), ExplicitCheckpointRepo::Slug(right)) => left == right,
+    }
+}
+
+fn explicit_checkpoint_repo_matches_bound(
+    explicit: &ExplicitCheckpointRepo,
+    bound: &crate::provider::Repo,
+) -> bool {
+    match explicit {
+        ExplicitCheckpointRepo::Bound(explicit) => {
+            checkpoint_repo_identities_match(explicit, bound)
+        }
+        ExplicitCheckpointRepo::Slug(slug) => {
+            repository_slug_matches(bound.provider, slug, &bound.slug)
+        }
+    }
+}
+
+fn resolve_checkpoint_live_target(
+    repo_override: Option<&str>,
+    args: &crate::commands::tracking::TrackingCheckpointArgs,
+    run: &crate::tracking::run_state::ExecutionRun,
+) -> Result<CheckpointTarget, CommandError> {
+    let issue = match (
+        args.issue.filter(|issue| *issue != 0),
+        (run.issue != 0).then_some(run.issue),
+    ) {
+        (Some(explicit), Some(recorded)) if explicit != recorded => {
+            return Err(CommandError::usage(
+                "tracking-checkpoint-live-target-mismatch",
+                format!("explicit issue #{explicit} does not match run-state issue #{recorded}"),
+            ));
+        }
+        (Some(explicit), _) => explicit,
+        (None, Some(recorded)) if args.issue.is_none() => recorded,
+        _ => {
+            return Err(CommandError::usage(
+                "tracking-checkpoint-live-missing-issue",
+                "a non-zero `--issue <number>` is required because the run-state carries no issue to inherit",
+            ));
+        }
+    };
+
+    let persisted = persisted_checkpoint_repo(run).map_err(|_| {
+        CommandError::usage(
+            "tracking-checkpoint-live-repo-identity-invalid",
+            "persisted repository identity metadata is malformed or contradictory",
+        )
+    })?;
+    let global = repo_override
+        .map(parse_explicit_checkpoint_repo)
+        .transpose()?;
+    let checkpoint = args
+        .provider_repo
+        .as_deref()
+        .map(parse_explicit_checkpoint_repo)
+        .transpose()?;
+    if let (Some(global), Some(checkpoint)) = (&global, &checkpoint)
+        && !explicit_checkpoint_repos_match(global, checkpoint)
+    {
+        return Err(CommandError::usage(
+            "tracking-checkpoint-live-target-mismatch",
+            "global and checkpoint repository overrides do not identify the same repository",
+        ));
+    }
+    let repo = match persisted {
+        PersistedCheckpointRepo::Bound(persisted) => {
+            if global
+                .iter()
+                .chain(checkpoint.iter())
+                .any(|explicit| !explicit_checkpoint_repo_matches_bound(explicit, &persisted))
+            {
+                return Err(CommandError::usage(
+                    "tracking-checkpoint-live-target-mismatch",
+                    format!(
+                        "explicit repository does not match the persisted {} repository identity for `{}`",
+                        persisted.provider, persisted.slug
+                    ),
+                ));
+            }
+            let qualified_override_confirms =
+                global.iter().chain(checkpoint.iter()).any(|explicit| {
+                    matches!(
+                        explicit,
+                        ExplicitCheckpointRepo::Bound(repo)
+                            if checkpoint_repo_identities_match(repo, &persisted)
+                    )
+                });
+            let checkout_confirms = crate::provider::current_remote_matches(&persisted);
+            if !is_default_provider_host(&persisted)
+                && !qualified_override_confirms
+                && !checkout_confirms
+            {
+                return Err(CommandError::usage(
+                    "tracking-checkpoint-live-repo-identity-required",
+                    "a persisted self-hosted repository requires a matching checkout or an explicit qualified repository URL for this invocation",
+                ));
+            }
+            persisted
+        }
+        PersistedCheckpointRepo::Unbound => {
+            let resolved = checkpoint
+                .as_ref()
+                .and_then(|explicit| match explicit {
+                    ExplicitCheckpointRepo::Bound(repo) => Some(repo),
+                    ExplicitCheckpointRepo::Slug(_) => None,
+                })
+                .or_else(|| {
+                    global.as_ref().and_then(|explicit| match explicit {
+                        ExplicitCheckpointRepo::Bound(repo) => Some(repo),
+                        ExplicitCheckpointRepo::Slug(_) => None,
+                    })
+                })
+                .ok_or_else(|| {
+                    CommandError::usage(
+                        "tracking-checkpoint-live-repo-identity-required",
+                        "live checkpoint requires a persisted provider/host identity or an explicit qualified repository URL",
+                    )
+                })?;
+            if global
+                .iter()
+                .chain(checkpoint.iter())
+                .any(|explicit| !explicit_checkpoint_repo_matches_bound(explicit, resolved))
+            {
+                return Err(CommandError::usage(
+                    "tracking-checkpoint-live-target-mismatch",
+                    "explicit repository overrides do not identify the same repository",
+                ));
+            }
+            let recorded_slug = run.repo.trim().trim_end_matches('/');
+            if !recorded_slug.is_empty()
+                && !repository_slug_matches(resolved.provider, recorded_slug, &resolved.slug)
+            {
+                return Err(CommandError::usage(
+                    "tracking-checkpoint-live-target-mismatch",
+                    "explicit repository does not match the run-state repository slug",
+                ));
+            }
+            resolved.clone()
+        }
+    };
+
+    Ok(CheckpointTarget { repo, issue })
+}
+
 fn run_tracking_checkpoint(
     binary: BinaryFlavor,
+    global_dry_run: bool,
     force: bool,
     repo_override: Option<&str>,
     args: &crate::commands::tracking::TrackingCheckpointArgs,
@@ -2993,7 +4959,6 @@ fn run_tracking_checkpoint(
     use crate::lifecycle_vnext::registry;
     use crate::lifecycle_vnext::visible_lint;
     use crate::tracking::reconcile;
-    use crate::tracking::run_state;
 
     // Parse requested roles from the comma-separated `--post` flag.
     let requested_roles: Vec<PayloadRole> = args
@@ -3026,9 +4991,120 @@ fn run_tracking_checkpoint(
             "`--post` must name at least one lifecycle role",
         ));
     }
+    if global_dry_run && args.live {
+        return Err(CommandError::usage(
+            "tracking-checkpoint-dry-run-live-conflict",
+            "global --dry-run cannot be combined with tracking checkpoint --live",
+        ));
+    }
+    if args.live
+        && args.fixture.is_none()
+        && (args.body_file.is_some() || args.comments_json.is_some())
+    {
+        return Err(CommandError::usage(
+            "tracking-checkpoint-live-offline-evidence-conflict",
+            "provider-live checkpoint must fetch issue evidence from its bound target; --body-file and --comments-json are offline-only",
+        ));
+    }
 
-    // Read provider evidence (fixture or explicit files).
-    let (body, comments_json) = resolve_checkpoint_inputs(args)?;
+    // Serialize this command with every run-state writer before taking the
+    // authoritative local snapshot. The guard remains alive through provider
+    // publication and optional dashboard repair.
+    let checkpoint_run_lock = TrackingRunUpdateLock::acquire(&args.run_state)?;
+
+    // Read local run state before resolving any provider target. The persisted
+    // repository/issue identity is the command's authority for every live hop.
+    let mut run = checkpoint_run_lock.read_run_state().map_err(|err| {
+        CommandError::runtime("tracking-checkpoint-run-state-read-failed", err.to_string())
+    })?;
+    canonicalize_execution_run_linked_prs(&mut run)?;
+    let provider_live = args.live && args.fixture.is_none();
+    if provider_live {
+        ensure_live_binary_for_command(binary, "tracking checkpoint --live", None)?;
+    }
+    let checkpoint_target = provider_live
+        .then(|| resolve_checkpoint_live_target(repo_override, args, &run))
+        .transpose()?;
+    let checkpoint_repo = match checkpoint_target.as_ref() {
+        Some(target) => Some(target.repo.clone()),
+        None => match persisted_checkpoint_repo(&run) {
+            Ok(PersistedCheckpointRepo::Bound(repo)) => Some(repo),
+            Ok(PersistedCheckpointRepo::Unbound) | Err(()) => None,
+        },
+    };
+    let checkpoint_adapter = checkpoint_target
+        .as_ref()
+        .map(|target| crate::provider::select_adapter(&target.repo, force));
+    // Hold the issue-scoped lifecycle lock across local snapshot acquisition,
+    // evidence fetch, reconciliation, rendering, posting, and optional dashboard
+    // repair. Fixture-live mode uses the same lock lifetime as provider-live
+    // mode instead of acquiring it only at the posting hop.
+    let _checkpoint_lifecycle_lock = if let Some(target) = checkpoint_target.as_ref() {
+        Some(crate::lifecycle_lock::acquire(
+            &target.repo,
+            target.issue,
+            args.profile,
+        )?)
+    } else if args.live && args.fixture.is_some() {
+        args.issue
+            .or((run.issue != 0).then_some(run.issue))
+            .map(|issue| {
+                crate::lifecycle_lock::acquire(
+                    &checkpoint_fixture_lock_repo(&run),
+                    issue,
+                    args.profile,
+                )
+            })
+            .transpose()?
+    } else {
+        None
+    };
+
+    // Resolve, lock, and read the execution-state Markdown before provider
+    // access. The owning guard remains alive through publication so every
+    // rendered role is derived from one coherent local generation.
+    let has_recorded_source = run.bundle.is_some()
+        || run.execution_state_file.is_some()
+        || run.bundle_repo_relative.is_some()
+        || run.execution_state_repo_relative.is_some();
+    let mut execution_state_guard = None;
+    let snapshot_result = match state_ledger_path(&run, checkpoint_repo.as_ref()) {
+        Ok(Some(path)) => {
+            let repo_root = repository_root_for_confined_path(&path).ok_or_else(|| {
+                CommandError::runtime(
+                    "state-ledger-unresolved",
+                    "execution-state file is not confined to a repository checkout",
+                )
+            })?;
+            let pinned = plan_tooling::exec_state::PinnedExecutionState::pin(&repo_root, &path)
+                .map_err(|err| {
+                    let code = if err.kind() == std::io::ErrorKind::InvalidInput {
+                        "exec-state-unsafe-file-alias"
+                    } else {
+                        "exec-state-read-failed"
+                    };
+                    CommandError::runtime(code, err.to_string())
+                })?;
+            let guard = plan_tooling::exec_state::ExecutionStateGuard::acquire_pinned(&pinned)
+                .map_err(|err| CommandError::runtime(err.code(), err.to_string()))?;
+            match execution_state_snapshot_from_guard(path, &guard) {
+                Ok(snapshot) => {
+                    execution_state_guard = Some(guard);
+                    Ok(Some(snapshot))
+                }
+                Err(_) => Err(StateLedgerResolutionError::Unresolved),
+            }
+        }
+        Ok(None) => Ok(None),
+        Err(err) => Err(err),
+    };
+
+    // Read provider evidence through the already-bound target and adapter.
+    let (body, comments_json) = resolve_checkpoint_inputs(
+        args,
+        checkpoint_target.as_ref(),
+        checkpoint_adapter.as_deref(),
+    )?;
     let audit = if let Some(comments) = comments_json.as_deref() {
         Some(
             lifecycle_record::audit_record(body.as_deref(), comments, Some(args.profile))
@@ -3037,11 +5113,6 @@ fn run_tracking_checkpoint(
     } else {
         None
     };
-
-    // Read local run state.
-    let run = run_state::read_run_state(&args.run_state).map_err(|err| {
-        CommandError::runtime("tracking-checkpoint-run-state-read-failed", err.to_string())
-    })?;
 
     // Reconcile.
     let reconciled = reconcile::reconcile(audit.as_ref(), Some(&run));
@@ -3061,38 +5132,77 @@ fn run_tracking_checkpoint(
         }));
     }
 
-    // graysurf/plan-tracking-testbed#55: when the run records a ledger source
-    // (a `bundle` or `execution_state_file`) but its Task Ledger cannot be read
-    // — a relative ref that does not resolve from the checkpoint working
-    // directory, or a moved/missing file — the `state` payload would silently
-    // degrade to the single-row synthesized baseline and post a
-    // wrong-but-plausible state comment. Refuse instead of degrading. A run
-    // with no recorded ledger source keeps the synthesized baseline.
-    if requested_roles.contains(&PayloadRole::State)
-        && (run.bundle.is_some() || run.execution_state_file.is_some())
-        && state_ledger_path(&run)
-            .map(|path| std::fs::read_to_string(&path).is_err())
-            .unwrap_or(true)
-    {
-        blocked.push(json!({
-            "code": "state-ledger-unresolved",
-            "role": "state",
-            "message": "run records a bundle / execution-state ref but its Task Ledger could not be read; refusing to post a degraded single-row state comment",
-            "suggested_unblock": "re-run `tracking run init` with an absolute --execution-state-file (or a --bundle whose directory contains a *-execution-state.md), or run checkpoint from a directory where the recorded relative path resolves",
-        }));
+    // Payload, visible Markdown, ledger preflight, target scope, and Tracking
+    // issue reconciliation all consume the guarded snapshot captured above.
+    let mut state_source_failure: Option<&'static str> = None;
+    let mut execution_state = match snapshot_result {
+        Ok(snapshot) => snapshot,
+        Err(err) => {
+            if requested_roles.contains(&PayloadRole::State) {
+                state_source_failure = Some(err.code());
+                blocked.push(json!({
+                    "code": err.code(),
+                    "role": "state",
+                    "message": match err {
+                        StateLedgerResolutionError::Unresolved => "run records a bundle / execution-state ref but no safe readable Task Ledger can be resolved; refusing to post a degraded single-row state comment",
+                        StateLedgerResolutionError::Ambiguous => "run bundle contains multiple *-execution-state.md candidates; refusing to choose one implicitly",
+                    },
+                    "suggested_unblock": "restore one unique repository-relative execution-state file or re-run `tracking run init` with an exact --execution-state-file",
+                }));
+            }
+            None
+        }
+    };
+    if requested_roles.contains(&PayloadRole::State) && has_recorded_source {
+        match execution_state.as_ref() {
+            None if !blocked.iter().any(|entry| {
+                matches!(
+                    entry["code"].as_str(),
+                    Some("state-ledger-unresolved" | "state-ledger-ambiguous")
+                )
+            }) =>
+            {
+                state_source_failure = Some("state-ledger-unresolved");
+                blocked.push(json!({
+                    "code": "state-ledger-unresolved",
+                    "role": "state",
+                    "message": "run records a bundle / execution-state ref but its Task Ledger could not be resolved; refusing to post a degraded single-row state comment",
+                    "suggested_unblock": "restore the recorded execution-state file or re-run `tracking run init` with an exact --execution-state-file",
+                }));
+            }
+            Some(snapshot) => {
+                if let Err(message) = &snapshot.rows {
+                    state_source_failure = Some("state-ledger-malformed");
+                    blocked.push(json!({
+                        "code": "state-ledger-malformed",
+                        "role": "state",
+                        "message": message,
+                        "suggested_unblock": "repair the `## Task Ledger` table before posting a state checkpoint",
+                    }));
+                }
+            }
+            None => {}
+        }
     }
 
-    // Task 1.4: reconcile the durable execution-state `Tracking issue` bullet
-    // with run-state. A live checkpoint is already a mutation, so a missing or
-    // placeholder URL is self-healed (the issue URL is derived offline from the
-    // repo slug); a genuine issue mismatch refuses the checkpoint.
+    // Reconcile the durable execution-state `Tracking issue` bullet from the
+    // same snapshot. A live self-heal is attempted only when no other blocker
+    // exists; after the write, refresh the command snapshot exactly once.
     let mut exec_state_reconcile = json!({"applicable": false});
-    if run.issue != 0
-        && let Some(es_path) = run_execution_state_path(&run)
-        && let Ok(raw) = std::fs::read_to_string(&es_path)
+    let checkpoint_issue = checkpoint_target
+        .as_ref()
+        .map(|target| target.issue)
+        .unwrap_or(run.issue);
+    if checkpoint_issue != 0
+        && let Some(snapshot) = execution_state.as_ref()
     {
-        let current = plan_tooling::exec_state::tracking_issue_value(&raw);
-        match classify_exec_state_issue(current.as_deref(), run.issue) {
+        let issue_class = classify_exec_state_issue(
+            plan_tooling::exec_state::tracking_issue_value(&snapshot.raw).as_deref(),
+            checkpoint_repo.as_ref(),
+            checkpoint_issue,
+        );
+        let es_path = snapshot.path.clone();
+        match issue_class {
             ExecStateIssueClass::Consistent => {
                 exec_state_reconcile = json!({"applicable": true, "status": "consistent"});
             }
@@ -3102,9 +5212,20 @@ fn run_tracking_checkpoint(
                 blocked.push(json!({
                     "code": "execution-state-issue-mismatch",
                     "message": format!(
-                        "durable execution-state tracking issue `{found}` does not match run-state issue #{}",
-                        run.issue
+                        "durable execution-state tracking issue `{found}` does not match checkpoint issue #{}",
+                        checkpoint_issue
                     ),
+                    "suggested_unblock": format!(
+                        "run `plan-tooling exec-state-sync --execution-state {} --issue-url <correct-url>` or fix the file",
+                        es_path.display()
+                    ),
+                }));
+            }
+            ExecStateIssueClass::Invalid => {
+                exec_state_reconcile = json!({"applicable": true, "status": "invalid"});
+                blocked.push(json!({
+                    "code": "execution-state-issue-invalid",
+                    "message": "durable execution-state tracking issue is not a valid issue URL",
                     "suggested_unblock": format!(
                         "run `plan-tooling exec-state-sync --execution-state {} --issue-url <correct-url>` or fix the file",
                         es_path.display()
@@ -3113,11 +5234,30 @@ fn run_tracking_checkpoint(
             }
             ExecStateIssueClass::Missing => {
                 let mut healed_url = None;
+                let mut heal_failure = None;
+                let issue_url = checkpoint_repo
+                    .as_ref()
+                    .map(|repo| repo.issue_url(checkpoint_issue));
                 if args.live
-                    && let Some(url) = derive_issue_url(&run.repo, run.issue)
-                    && plan_tooling::exec_state::sync_tracking_issue(&es_path, &url, false).is_ok()
+                    && blocked.is_empty()
+                    && let (Some(url), Some(guard)) = (issue_url, execution_state_guard.as_ref())
                 {
-                    healed_url = Some(url);
+                    match guard.sync_tracking_issue(&url, false) {
+                        Ok(_) => {
+                            match execution_state_snapshot_from_guard(es_path.clone(), guard) {
+                                Ok(refreshed) => {
+                                    execution_state = Some(refreshed);
+                                    healed_url = Some(url);
+                                }
+                                Err(err) => {
+                                    heal_failure = Some((err.code(), err.to_string()));
+                                }
+                            }
+                        }
+                        Err(err) => {
+                            heal_failure = Some((err.code(), err.to_string()));
+                        }
+                    }
                 }
                 if let Some(url) = healed_url {
                     exec_state_reconcile = json!({
@@ -3126,6 +5266,20 @@ fn run_tracking_checkpoint(
                         "issue_url": url,
                         "file": es_path.display().to_string(),
                     });
+                } else if let Some((code, message)) = heal_failure {
+                    exec_state_reconcile = json!({
+                        "applicable": true,
+                        "status": "self-heal-failed",
+                        "file": es_path.display().to_string(),
+                    });
+                    blocked.push(json!({
+                        "code": code,
+                        "message": message,
+                        "suggested_unblock": format!(
+                            "repair {} and retry the live checkpoint",
+                            es_path.display()
+                        ),
+                    }));
                 } else {
                     exec_state_reconcile = json!({"applicable": true, "status": "missing"});
                     blocked.push(json!({
@@ -3149,7 +5303,17 @@ fn run_tracking_checkpoint(
 
     for role in &requested_roles {
         let spec = registry::role(*role);
-        let body_result = render_checkpoint_role(*role, &run, args.profile)?;
+        if matches!(*role, PayloadRole::State)
+            && let Some(code) = state_source_failure
+        {
+            roles_skipped.push(json!({
+                "role": spec.marker_role,
+                "reason": format!("{code}: recorded execution-state source failed closed"),
+            }));
+            continue;
+        }
+        let body_result =
+            render_checkpoint_role(*role, &run, args.profile, execution_state.as_ref())?;
         match body_result {
             CheckpointRoleResult::Empty(reason) => {
                 roles_skipped.push(json!({
@@ -3233,9 +5397,8 @@ fn run_tracking_checkpoint(
         post_checkpoint_live(
             args,
             &run,
-            binary,
-            force,
-            repo_override,
+            checkpoint_target.as_ref(),
+            checkpoint_adapter.as_deref(),
             &rendered,
             &mut blocked,
         )?
@@ -3285,13 +5448,12 @@ struct CheckpointPostSummary {
 
 /// Live (or fixture) per-role posting hop for `tracking checkpoint --live`.
 ///
-/// In **live mode** this mirrors `run_record_post`'s posting hop:
-/// `resolve_repo_info_for_live` → `provider::select_adapter` →
-/// `write_temp_markdown` → `adapter.comment_issue` per rendered role,
-/// preserving `--post` declaration order. On the first per-role failure the
-/// function stops, pushes a stable `tracking-checkpoint-live-post-failed`
-/// entry into `blocked`, and skips any pending roles plus `--repair-dashboard`
-/// so a half-posted issue does not get a stale dashboard rewrite.
+/// In **live mode** this reuses the provider target, adapter, and lifecycle
+/// lock held by the caller since before the command fetched evidence. It writes
+/// each role with `adapter.comment_issue` and optionally repairs the same issue
+/// dashboard. On the first per-role failure the function stops, pushes a stable `tracking-checkpoint-live-post-failed` entry into `blocked`,
+/// and skips any pending roles plus `--repair-dashboard` so a half-posted issue
+/// does not get a stale dashboard rewrite.
 ///
 /// In **fixture mode** (`--fixture <dir>` supplied) the adapter call is
 /// skipped entirely and synthesized `fixture://issue/<n>/<role>` URLs are
@@ -3304,22 +5466,18 @@ struct CheckpointPostSummary {
 fn post_checkpoint_live(
     args: &crate::commands::tracking::TrackingCheckpointArgs,
     run: &crate::tracking::run_state::ExecutionRun,
-    binary: BinaryFlavor,
-    force: bool,
-    repo_override: Option<&str>,
+    target: Option<&CheckpointTarget>,
+    adapter: Option<&dyn crate::provider::ProviderAdapter>,
     rendered: &[Value],
     blocked: &mut Vec<Value>,
 ) -> Result<CheckpointPostSummary, CommandError> {
-    // Resolve the target issue: prefer the explicit `--issue` flag, then fall
-    // back to the issue persisted in the run-state (written by `tracking run
-    // init --issue`). The run-state is already this command's source of truth
-    // for every other field, and `status` / `close-ready` consume `--issue`
-    // the same way, so honoring it here lets the documented dispatch entrypoint
-    // (`--run-state <rs>` with no `--provider-repo`/`--issue`) post instead of
-    // silently no-opping with status=ok (finding #44). `issue == 0` is the
-    // never-written sentinel and is treated as absent so the loud blocker
-    // below still fires when nothing can be resolved.
-    let issue_number = match args.issue.or((run.issue != 0).then_some(run.issue)) {
+    // Fixture mode preserves the explicit issue override used by deterministic
+    // smoke probes. True provider mode receives an already-validated target.
+    let issue_number = match target
+        .map(|target| target.issue)
+        .or(args.issue)
+        .or((run.issue != 0).then_some(run.issue))
+    {
         Some(n) => n,
         None => {
             blocked.push(json!({
@@ -3344,9 +5502,6 @@ fn post_checkpoint_live(
     // and re-reads them through `tracking close-ready`; this hop only
     // surfaces the post-attempt shape so the probe can assert it.
     if args.fixture.is_some() {
-        let fixture_repo = checkpoint_fixture_lock_repo(run);
-        let _lifecycle_lock =
-            crate::lifecycle_lock::acquire(&fixture_repo, issue_number, args.profile)?;
         let posted: Vec<Value> = rendered
             .iter()
             .map(|entry| {
@@ -3373,23 +5528,20 @@ fn post_checkpoint_live(
         });
     }
 
-    // True live mode. Refuse on `plan-issue-local`; the binary boundary
-    // mirrors `record post`'s contract.
-    ensure_live_binary_for_command(binary, "tracking checkpoint --live", None)?;
-
-    // Mirror the issue fallback: prefer the flag / global `--repo` override,
-    // then the run-state `repo` (finding #44). An empty slug is treated as
-    // absent so `resolve_repo_info_for_live` can still apply its own discovery.
-    let provider_repo_arg = args
-        .provider_repo
-        .as_deref()
-        .or(repo_override)
-        .or((!run.repo.is_empty()).then_some(run.repo.as_str()));
-    let repo_info = resolve_repo_info_for_live(binary, provider_repo_arg)?;
-    let _lifecycle_lock = crate::lifecycle_lock::acquire(&repo_info, issue_number, args.profile)?;
-    let adapter = crate::provider::select_adapter(&repo_info, force);
-    let issue_url = repo_info.issue_url(issue_number);
-    let repo = repo_info.slug.clone();
+    let target = target.ok_or_else(|| {
+        CommandError::runtime(
+            "tracking-checkpoint-live-target-missing",
+            "provider checkpoint target was not bound before posting",
+        )
+    })?;
+    let adapter = adapter.ok_or_else(|| {
+        CommandError::runtime(
+            "tracking-checkpoint-live-adapter-missing",
+            "provider checkpoint adapter was not selected before posting",
+        )
+    })?;
+    let issue_url = target.repo.issue_url(target.issue);
+    let repo = target.repo.slug.as_str();
 
     let mut posted: Vec<Value> = Vec::new();
     let mut first_failure: Option<Value> = None;
@@ -3401,7 +5553,7 @@ fn post_checkpoint_live(
             write_temp_markdown(&format!("tracking-checkpoint-{role}-comment"), body).map_err(
                 |err| CommandError::runtime("tracking-checkpoint-comment-write-failed", err),
             )?;
-        match adapter.comment_issue(&repo, issue_number, &comment_path) {
+        match adapter.comment_issue(repo, issue_number, &comment_path) {
             Ok(url) => {
                 posted.push(json!({
                     "role": role,
@@ -3435,8 +5587,8 @@ fn post_checkpoint_live(
     // avoids overwriting the dashboard with a stale snapshot.
     let repair_dashboard_result = if args.repair_dashboard {
         Some(repair_dashboard_after_checkpoint(
-            adapter.as_ref(),
-            &repo,
+            adapter,
+            repo,
             issue_number,
             &issue_url,
         )?)
@@ -3506,6 +5658,7 @@ fn render_checkpoint_role(
     role: crate::lifecycle_record::PayloadRole,
     run: &crate::tracking::run_state::ExecutionRun,
     profile: crate::commands::record::RecordProfile,
+    execution_state: Option<&ExecutionStateSnapshot>,
 ) -> Result<CheckpointRoleResult, CommandError> {
     use crate::commands::record::{LifecycleCommentKind, TaskLedgerDisplay};
     use crate::lifecycle_record::{self, PayloadRole};
@@ -3518,7 +5671,7 @@ fn render_checkpoint_role(
     };
 
     let payload = match role {
-        PayloadRole::State => state_checkpoint_payload(run),
+        PayloadRole::State => state_checkpoint_payload(run, execution_state),
         PayloadRole::Session => match synthesize_session_payload(run) {
             Some(value) => value,
             None => {
@@ -3555,18 +5708,17 @@ fn render_checkpoint_role(
     // state file is recorded or the file can't be read — the renderer
     // then continues to emit the deterministic baseline body.
     let summary = if matches!(role, PayloadRole::State) {
-        load_state_markdown_summary(run)
+        load_state_markdown_summary(execution_state)
     } else {
         None
     };
-    let summary_ref = summary.as_deref();
 
     let body = lifecycle_record::render_record_post_comment_with_display_mode(
         profile,
         kind,
         payload,
         None,
-        summary_ref,
+        summary,
         Some(run.updated_at.as_str()),
         TaskLedgerDisplay::Auto,
         // The checkpoint controller derives live state from run-state, so the
@@ -3579,29 +5731,277 @@ fn render_checkpoint_role(
     Ok(CheckpointRoleResult::Rendered(body))
 }
 
-/// Resolve the execution-state Markdown that backs the `state` checkpoint
-/// ledger. Prefers an explicit `execution_state_file`; otherwise discovers the
-/// `*-execution-state.md` inside the run's `bundle`. The bundle fallback is what
-/// makes `tracking run init --bundle <dir>` (the canonical flow, which records
-/// only `bundle`) render the full Task Ledger instead of the single-row
-/// synthesized baseline (graysurf/plan-tracking-testbed#55).
-fn state_ledger_path(run: &crate::tracking::run_state::ExecutionRun) -> Option<PathBuf> {
-    if let Some(path) = run.execution_state_file.as_ref() {
-        return Some(path.clone());
-    }
-    run.bundle
-        .as_ref()
-        .and_then(|bundle| find_execution_state(bundle))
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StateLedgerResolutionError {
+    Unresolved,
+    Ambiguous,
 }
 
-fn load_state_markdown_summary(run: &crate::tracking::run_state::ExecutionRun) -> Option<String> {
-    let path = state_ledger_path(run)?;
-    let content = std::fs::read_to_string(&path).ok()?;
-    if content.contains("## Task Ledger") {
-        Some(content)
-    } else {
-        None
+impl StateLedgerResolutionError {
+    fn code(self) -> &'static str {
+        match self {
+            Self::Unresolved => "state-ledger-unresolved",
+            Self::Ambiguous => "state-ledger-ambiguous",
+        }
     }
+}
+
+fn recorded_repo_relative(
+    stored: Option<&Path>,
+    absolute: Option<&Path>,
+    worktree: Option<&Path>,
+) -> Option<PathBuf> {
+    stored
+        .filter(|path| is_safe_repo_relative(path))
+        .map(Path::to_path_buf)
+        .or_else(|| {
+            let relative = absolute?.strip_prefix(worktree?).ok()?;
+            is_safe_repo_relative(relative).then(|| relative.to_path_buf())
+        })
+}
+
+fn state_path_repository_binding(
+    run: &crate::tracking::run_state::ExecutionRun,
+    checkpoint_repo: Option<&crate::provider::Repo>,
+) -> (Option<crate::provider::Repo>, bool) {
+    let bound = checkpoint_repo
+        .cloned()
+        .or_else(|| match persisted_checkpoint_repo(run).ok()? {
+            PersistedCheckpointRepo::Bound(repo) => Some(repo),
+            PersistedCheckpointRepo::Unbound => None,
+        });
+    let allow_any_git_repo = bound
+        .as_ref()
+        .is_some_and(|repo| matches!(repo.provider, crate::provider::Provider::Local));
+    let expected = bound.filter(|repo| !matches!(repo.provider, crate::provider::Provider::Local));
+    (expected, allow_any_git_repo)
+}
+
+#[cfg(target_os = "macos")]
+fn normalize_platform_path_alias(path: PathBuf) -> PathBuf {
+    for alias in ["var", "tmp", "etc"] {
+        let source = Path::new("/").join(alias);
+        if let Ok(relative) = path.strip_prefix(&source) {
+            return Path::new("/private").join(alias).join(relative);
+        }
+    }
+    path
+}
+
+#[cfg(not(target_os = "macos"))]
+fn normalize_platform_path_alias(path: PathBuf) -> PathBuf {
+    path
+}
+
+fn has_symlinked_path_component(repo_root: &Path, path: &Path) -> bool {
+    // macOS exposes system temporary paths through `/var` while Git commonly
+    // reports the same checkout through `/private/var`. Normalize only these
+    // platform aliases before checking repository-internal path components.
+    let repo_root = normalize_platform_path_alias(absolutize(repo_root));
+    let path = normalize_platform_path_alias(absolutize(path));
+    let Ok(relative) = path.strip_prefix(&repo_root) else {
+        return true;
+    };
+    let mut current = repo_root;
+    for component in relative.components() {
+        match component {
+            std::path::Component::CurDir => continue,
+            std::path::Component::Normal(part) => current.push(part),
+            _ => return true,
+        }
+        if std::fs::symlink_metadata(&current)
+            .is_ok_and(|metadata| metadata.file_type().is_symlink())
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn confined_existing_path(repo_root: &Path, path: &Path, want_file: bool) -> Option<PathBuf> {
+    let canonical_root = std::fs::canonicalize(repo_root).ok()?;
+    if has_symlinked_path_component(repo_root, path) {
+        return None;
+    }
+    let link_metadata = std::fs::symlink_metadata(path).ok()?;
+    if link_metadata.file_type().is_symlink() {
+        return None;
+    }
+    let candidate = std::fs::canonicalize(path).ok()?;
+    if !candidate.starts_with(&canonical_root) {
+        return None;
+    }
+    let metadata = std::fs::metadata(&candidate).ok()?;
+    ((want_file && metadata.is_file()) || (!want_file && metadata.is_dir())).then_some(candidate)
+}
+
+fn relocated_repo_path(repo_root: &Path, relative: &Path, want_file: bool) -> Option<PathBuf> {
+    if !is_safe_repo_relative(relative) {
+        return None;
+    }
+    confined_existing_path(repo_root, &repo_root.join(relative), want_file)
+}
+
+fn unique_confined_execution_state(
+    repo_root: &Path,
+    bundle: &Path,
+) -> Result<Option<PathBuf>, StateLedgerResolutionError> {
+    let entries = std::fs::read_dir(bundle).map_err(|_| StateLedgerResolutionError::Unresolved)?;
+    let mut candidate = None;
+    for entry in entries {
+        let path = entry
+            .map_err(|_| StateLedgerResolutionError::Unresolved)?
+            .path();
+        let matches_name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.ends_with("-execution-state.md"));
+        if !matches_name {
+            continue;
+        }
+        let confined = confined_existing_path(repo_root, &path, true)
+            .ok_or(StateLedgerResolutionError::Unresolved)?;
+        if candidate.is_some() {
+            return Err(StateLedgerResolutionError::Ambiguous);
+        }
+        candidate = Some(confined);
+    }
+    Ok(candidate)
+}
+
+/// Resolve the execution-state Markdown that backs the `state` checkpoint
+/// ledger. Every candidate must be confined to the verified current checkout.
+/// An explicit file identity wins over bundle discovery, including when the
+/// original managed-worktree path has to be relocated.
+fn state_ledger_path(
+    run: &crate::tracking::run_state::ExecutionRun,
+    checkpoint_repo: Option<&crate::provider::Repo>,
+) -> Result<Option<PathBuf>, StateLedgerResolutionError> {
+    let (expected_repo, allow_any_git_repo) = state_path_repository_binding(run, checkpoint_repo);
+    let historical_slug = (expected_repo.is_none()
+        && !allow_any_git_repo
+        && !checkpoint_repo_arg_is_qualified(&run.repo))
+    .then_some(run.repo.as_str());
+    let has_exact_identity =
+        run.execution_state_file.is_some() || run.execution_state_repo_relative.is_some();
+    let has_bundle_identity = run.bundle.is_some() || run.bundle_repo_relative.is_some();
+    if !has_exact_identity && !has_bundle_identity {
+        return Ok(None);
+    }
+
+    // An existing exact path is authoritative even when the command runs from
+    // another checkout. Verify it against the containing repository's own
+    // origin rather than the ambient cwd before considering relocation.
+    if let Some(path) = run.execution_state_file.as_deref().and_then(|path| {
+        verified_recorded_path(
+            expected_repo.as_ref(),
+            historical_slug,
+            allow_any_git_repo,
+            path,
+            true,
+        )
+    }) {
+        return Ok(Some(path));
+    }
+
+    let repo_root =
+        verified_current_repo_root_for_identity(expected_repo.as_ref(), allow_any_git_repo);
+    let execution_state_relative = recorded_repo_relative(
+        run.execution_state_repo_relative.as_deref(),
+        run.execution_state_file.as_deref(),
+        run.worktree.as_deref(),
+    );
+    if let Some(path) = repo_root.as_deref().and_then(|repo_root| {
+        execution_state_relative
+            .as_deref()
+            .and_then(|relative| relocated_repo_path(repo_root, relative, true))
+    }) {
+        return Ok(Some(path));
+    }
+
+    // Once an exact execution-state identity was recorded, failure to resolve
+    // that identity is terminal. Never substitute a different unique file from
+    // the bundle: doing so can project unrelated task state as terminal proof.
+    if has_exact_identity {
+        return Err(StateLedgerResolutionError::Unresolved);
+    }
+
+    if let Some(bundle) = run.bundle.as_deref().and_then(|path| {
+        verified_recorded_path(
+            expected_repo.as_ref(),
+            historical_slug,
+            allow_any_git_repo,
+            path,
+            false,
+        )
+    }) {
+        return unique_confined_execution_state(
+            repository_root_for_confined_path(&bundle)
+                .as_deref()
+                .ok_or(StateLedgerResolutionError::Unresolved)?,
+            &bundle,
+        )?
+        .map(Some)
+        .ok_or(StateLedgerResolutionError::Unresolved);
+    }
+
+    let bundle_relative = recorded_repo_relative(
+        run.bundle_repo_relative.as_deref(),
+        run.bundle.as_deref(),
+        run.worktree.as_deref(),
+    );
+    if let Some(repo_root) = repo_root.as_deref()
+        && let Some(relative) = bundle_relative.as_deref()
+        && let Some(bundle) = relocated_repo_path(repo_root, relative, false)
+    {
+        return unique_confined_execution_state(repo_root, &bundle)?
+            .map(Some)
+            .ok_or(StateLedgerResolutionError::Unresolved);
+    }
+
+    Err(StateLedgerResolutionError::Unresolved)
+}
+
+#[derive(Debug)]
+struct ExecutionStateSnapshot {
+    path: PathBuf,
+    raw: String,
+    rows: Result<Vec<plan_tooling::ledger::LedgerRow>, String>,
+}
+
+fn execution_state_snapshot_from_guard(
+    path: PathBuf,
+    guard: &plan_tooling::exec_state::ExecutionStateGuard,
+) -> Result<ExecutionStateSnapshot, plan_tooling::exec_state::ExecStateError> {
+    let raw = guard.read_to_string()?;
+    let rows = plan_tooling::ledger::read_rows(&raw, &path).map_err(|err| err.to_string());
+    Ok(ExecutionStateSnapshot { path, raw, rows })
+}
+
+fn execution_state_snapshot(
+    run: &crate::tracking::run_state::ExecutionRun,
+) -> Result<Option<ExecutionStateSnapshot>, StateLedgerResolutionError> {
+    execution_state_snapshot_for_repo(run, None)
+}
+
+fn execution_state_snapshot_for_repo(
+    run: &crate::tracking::run_state::ExecutionRun,
+    checkpoint_repo: Option<&crate::provider::Repo>,
+) -> Result<Option<ExecutionStateSnapshot>, StateLedgerResolutionError> {
+    let Some(path) = state_ledger_path(run, checkpoint_repo)? else {
+        return Ok(None);
+    };
+    let raw = std::fs::read_to_string(&path).map_err(|_| StateLedgerResolutionError::Unresolved)?;
+    let rows = plan_tooling::ledger::read_rows(&raw, &path).map_err(|err| err.to_string());
+    Ok(Some(ExecutionStateSnapshot { path, raw, rows }))
+}
+
+fn load_state_markdown_summary(snapshot: Option<&ExecutionStateSnapshot>) -> Option<&str> {
+    let snapshot = snapshot?;
+    snapshot
+        .raw
+        .contains("## Task Ledger")
+        .then_some(snapshot.raw.as_str())
 }
 
 /// Build the `state` checkpoint payload.
@@ -3611,21 +6011,19 @@ fn load_state_markdown_summary(run: &crate::tracking::run_state::ExecutionRun) -
 /// post-time), so the provider issue is self-contained per-task history that
 /// matches the visible Task Ledger. Falls back to the single-current
 /// synthesized baseline when no ledger is recorded or it cannot be parsed.
-fn state_checkpoint_payload(run: &crate::tracking::run_state::ExecutionRun) -> Value {
+fn state_checkpoint_payload(
+    run: &crate::tracking::run_state::ExecutionRun,
+    execution_state: Option<&ExecutionStateSnapshot>,
+) -> Value {
     let mut payload = synthesize_state_payload(run);
     if let Some(object) = payload.as_object_mut() {
-        if let Some(tasks) = accumulative_state_tasks(run) {
+        if let Some(tasks) = accumulative_state_tasks(execution_state) {
             // The dashboard renders `Current task` / `Next action` straight
             // from this payload, so derive them from the durable ledger rather
             // than the never-advanced `selected_scope`. Otherwise a completed
             // plan still shows the first selected task and an empty next action
             // (graysurf/plan-tracking-testbed#54 / sympoies/nils-cli#700).
-            let ready_to_close = matches!(
-                run.phase,
-                crate::tracking::run_state::RunPhase::ReadyForClose
-                    | crate::tracking::run_state::RunPhase::Closed
-            );
-            let (current, next_action) = derive_ledger_progress(&tasks, ready_to_close);
+            let (current, next_action) = derive_ledger_progress(&tasks, run.phase);
             object.insert("current".to_string(), Value::String(current));
             object.insert("next_action".to_string(), Value::String(next_action));
             object.insert("tasks".to_string(), Value::Array(tasks));
@@ -3633,7 +6031,7 @@ fn state_checkpoint_payload(run: &crate::tracking::run_state::ExecutionRun) -> V
         // `Target scope` is the issue-backed plan scope, not a status word.
         // Prefer the authored `- Target scope:` line from the execution-state
         // header over the synthesized "in-progress" fallback.
-        if let Some(scope) = execution_state_target_scope(run) {
+        if let Some(scope) = execution_state_target_scope(execution_state) {
             object.insert("target_scope".to_string(), Value::String(scope));
         }
         // Carry every linked PR so the dashboard (built from the latest state
@@ -3647,11 +6045,14 @@ fn state_checkpoint_payload(run: &crate::tracking::run_state::ExecutionRun) -> V
 }
 
 /// Derive the dashboard `current` / `next_action` fields from the accumulative
-/// ledger `tasks[]`. `current` is the first non-terminal row id, or `complete`
-/// when every row is terminal (`done`/`deferred`/`waived`). `next_action` is
-/// the next non-terminal row after `current`, or `closeout` once the run is at
-/// ready-for-close or no work remains.
-fn derive_ledger_progress(tasks: &[Value], ready_to_close: bool) -> (String, String) {
+/// ledger `tasks[]`. Active phases select the first two non-terminal rows.
+/// Ready-for-close and closed phases render distinct canonical terminal values.
+fn derive_ledger_progress(
+    tasks: &[Value],
+    phase: crate::tracking::run_state::RunPhase,
+) -> (String, String) {
+    use crate::tracking::run_state::RunPhase;
+
     let is_terminal = |task: &Value| {
         matches!(
             task.get("status").and_then(Value::as_str).unwrap_or(""),
@@ -3665,11 +6066,19 @@ fn derive_ledger_progress(tasks: &[Value], ready_to_close: bool) -> (String, Str
             .to_string()
     };
     let pending: Vec<&Value> = tasks.iter().filter(|task| !is_terminal(task)).collect();
+
+    if pending.is_empty() && matches!(phase, RunPhase::Closed) {
+        return ("complete".to_string(), "none".to_string());
+    }
+    if pending.is_empty() && matches!(phase, RunPhase::ReadyForClose) {
+        return ("complete".to_string(), "closeout".to_string());
+    }
+
     let current = match pending.first() {
         Some(task) => id_of(task),
         None => "complete".to_string(),
     };
-    let next_action = if ready_to_close || pending.is_empty() {
+    let next_action = if pending.is_empty() {
         "closeout".to_string()
     } else {
         match pending.get(1) {
@@ -3681,38 +6090,48 @@ fn derive_ledger_progress(tasks: &[Value], ready_to_close: bool) -> (String, Str
 }
 
 /// Read the authored `- Target scope:` value from the run's execution-state
-/// header, joining wrapped continuation lines into one string. Returns `None`
-/// when no execution-state file is recorded, it cannot be read, or it has no
-/// scope line. This keeps the dashboard `target_scope` anchored to the durable
-/// plan scope instead of a synthesized status word.
-fn execution_state_target_scope(run: &crate::tracking::run_state::ExecutionRun) -> Option<String> {
-    let path = state_ledger_path(run)?;
-    let raw = std::fs::read_to_string(&path).ok()?;
+/// header, joining wrapped continuation lines into one string. The controlled
+/// `# Execution State: <scope>` heading is a fallback for older bundles that do
+/// not carry the bullet.
+fn execution_state_target_scope(snapshot: Option<&ExecutionStateSnapshot>) -> Option<String> {
+    let raw = snapshot?.raw.as_str();
     let lines: Vec<&str> = raw.lines().collect();
-    let start = lines
+    if let Some(start) = lines
         .iter()
-        .position(|line| line.trim_start().starts_with("- Target scope:"))?;
-    let first = lines[start]
-        .trim_start()
-        .strip_prefix("- Target scope:")?
-        .trim();
-    let mut scope = first.to_string();
-    for line in &lines[start + 1..] {
-        let trimmed = line.trim();
-        // Stop at a blank line, the next bullet, or the next heading; only an
-        // indented wrap of the same bullet continues the value.
-        if trimmed.is_empty()
-            || trimmed.starts_with("- ")
-            || trimmed.starts_with("## ")
-            || !line.starts_with(char::is_whitespace)
-        {
-            break;
+        .position(|line| line.trim_start().starts_with("- Target scope:"))
+    {
+        let first = lines[start]
+            .trim_start()
+            .strip_prefix("- Target scope:")?
+            .trim();
+        let mut scope = first.to_string();
+        for line in &lines[start + 1..] {
+            let trimmed = line.trim();
+            // Stop at a blank line, the next bullet, or the next heading; only
+            // an indented wrap of the same bullet continues the value.
+            if trimmed.is_empty()
+                || trimmed.starts_with("- ")
+                || trimmed.starts_with("## ")
+                || !line.starts_with(char::is_whitespace)
+            {
+                break;
+            }
+            scope.push(' ');
+            scope.push_str(trimmed);
         }
-        scope.push(' ');
-        scope.push_str(trimmed);
+        let scope = scope.trim().to_string();
+        if !scope.is_empty() {
+            return Some(scope);
+        }
     }
-    let scope = scope.trim().to_string();
-    (!scope.is_empty()).then_some(scope)
+
+    raw.lines().find_map(|line| {
+        line.trim()
+            .strip_prefix("# Execution State:")
+            .map(str::trim)
+            .filter(|scope| !scope.is_empty())
+            .map(str::to_string)
+    })
 }
 
 /// Build the accumulative `prs[]` payload from every linked PR the run has
@@ -3748,10 +6167,8 @@ fn normalize_pr_status(status: Option<&str>) -> &'static str {
 /// Parse the canonical execution-state `## Task Ledger` into the accumulative
 /// `tasks[]` payload shape. Returns `None` when no ledger is recorded, it
 /// cannot be read, or it has no rows.
-fn accumulative_state_tasks(run: &crate::tracking::run_state::ExecutionRun) -> Option<Vec<Value>> {
-    let path = state_ledger_path(run)?;
-    let raw = std::fs::read_to_string(&path).ok()?;
-    let rows = plan_tooling::ledger::read_rows(&raw, &path).ok()?;
+fn accumulative_state_tasks(snapshot: Option<&ExecutionStateSnapshot>) -> Option<Vec<Value>> {
+    let rows = snapshot?.rows.as_ref().ok()?;
     if rows.is_empty() {
         return None;
     }
@@ -3805,20 +6222,41 @@ fn synthesize_state_payload(run: &crate::tracking::run_state::ExecutionRun) -> V
         crate::tracking::run_state::RunPhase::Blocked => "blocked",
         _ => "in-progress",
     };
+    let (status, current, next_action, fallback_scope) = match run.phase {
+        crate::tracking::run_state::RunPhase::Closed => {
+            ("complete", "complete", "none", "execution plan")
+        }
+        crate::tracking::run_state::RunPhase::ReadyForClose => {
+            ("complete", "complete", "closeout", "execution plan")
+        }
+        crate::tracking::run_state::RunPhase::Blocked => (
+            "blocked",
+            run.selected_scope
+                .as_ref()
+                .and_then(|scope| scope.task.as_deref())
+                .unwrap_or_default(),
+            "",
+            "in-progress",
+        ),
+        _ => (
+            "in-progress",
+            run.selected_scope
+                .as_ref()
+                .and_then(|scope| scope.task.as_deref())
+                .unwrap_or_default(),
+            "",
+            "in-progress",
+        ),
+    };
     json!({
-        "status": match run.phase {
-            crate::tracking::run_state::RunPhase::Closed
-            | crate::tracking::run_state::RunPhase::ReadyForClose => "complete",
-            crate::tracking::run_state::RunPhase::Blocked => "blocked",
-            _ => "in-progress",
-        },
+        "status": status,
         "target_scope": run
             .selected_scope
             .as_ref()
             .and_then(|s| s.title.clone())
-            .unwrap_or_else(|| "in-progress".to_string()),
-        "current": run.selected_scope.as_ref().and_then(|s| s.task.clone()).unwrap_or_default(),
-        "next_action": "",
+            .unwrap_or_else(|| fallback_scope.to_string()),
+        "current": current,
+        "next_action": next_action,
         "tasks": [
             {"id": task_id, "status": task_status, "title": task_title}
         ],
@@ -3941,6 +6379,7 @@ fn checkpoint_lint_hints(
             crate::tracking::run_state::RunPhase::ReadyForClose
                 | crate::tracking::run_state::RunPhase::Closed
         );
+        hints.state_is_closed = matches!(run.phase, crate::tracking::run_state::RunPhase::Closed);
     }
     if matches!(role, PayloadRole::Review) {
         hints.review_has_findings = run
@@ -3954,6 +6393,8 @@ fn checkpoint_lint_hints(
 
 fn resolve_checkpoint_inputs(
     args: &crate::commands::tracking::TrackingCheckpointArgs,
+    target: Option<&CheckpointTarget>,
+    adapter: Option<&dyn crate::provider::ProviderAdapter>,
 ) -> Result<(Option<String>, Option<String>), CommandError> {
     if let Some(fixture) = &args.fixture {
         let body_path = fixture.join("body.md");
@@ -3990,18 +6431,26 @@ fn resolve_checkpoint_inputs(
         )?),
         None => None,
     };
-    // Auto-fetch live provider evidence when no fixture / explicit files
-    // were supplied but the issue is named. The live checkpoint path
-    // needs body + comments to determine `RECORD_OPEN_INITIAL` and avoid
-    // the `issue-evidence-missing` blocker; without this, callers must
-    // pre-snapshot before every checkpoint.
-    if body.is_none()
-        && comments.is_none()
-        && let (Some(repo), Some(issue)) = (args.provider_repo.as_deref(), args.issue)
-    {
-        let (b, c) =
-            auto_fetch_issue_evidence(repo, issue, "tracking-checkpoint-evidence-fetch-failed")?;
-        return Ok((Some(b), Some(c)));
+    // Auto-fetch provider evidence through the same bound target/adapter that
+    // live posting and dashboard repair will reuse. Preserve the older
+    // explicit dry-run lookup for callers that are not entering live mode.
+    if body.is_none() && comments.is_none() {
+        if let (Some(target), Some(adapter)) = (target, adapter) {
+            let (body, comments) = adapter
+                .issue_evidence(&target.repo.slug, target.issue)
+                .map_err(|err| {
+                    CommandError::runtime("tracking-checkpoint-evidence-fetch-failed", err)
+                })?;
+            return Ok((Some(body), Some(comments)));
+        }
+        if let (Some(repo), Some(issue)) = (args.provider_repo.as_deref(), args.issue) {
+            let (body, comments) = auto_fetch_issue_evidence(
+                repo,
+                issue,
+                "tracking-checkpoint-evidence-fetch-failed",
+            )?;
+            return Ok((Some(body), Some(comments)));
+        }
     }
     Ok((body, comments))
 }
@@ -4022,7 +6471,7 @@ fn run_tracking_close_ready(
     } else {
         None
     };
-    let run = match &args.run_state {
+    let mut run = match &args.run_state {
         Some(path) => Some(run_state::read_run_state(path).map_err(|err| {
             CommandError::runtime(
                 "tracking-close-ready-run-state-read-failed",
@@ -4031,9 +6480,27 @@ fn run_tracking_close_ready(
         })?),
         None => None,
     };
+    if let Some(run) = run.as_mut() {
+        canonicalize_execution_run_linked_prs(run)?;
+    }
 
     let reconciled = reconcile::reconcile(audit.as_ref(), run.as_ref());
     let mut blockers: Vec<Value> = Vec::new();
+    let execution_state = match run.as_ref().map(execution_state_snapshot) {
+        Some(Ok(snapshot)) => snapshot,
+        Some(Err(err)) => {
+            blockers.push(json!({
+                "code": err.code(),
+                "message": match err {
+                    StateLedgerResolutionError::Unresolved => "run records a bundle / execution-state ref but no safe readable Task Ledger can be resolved",
+                    StateLedgerResolutionError::Ambiguous => "run bundle contains multiple *-execution-state.md candidates; refusing to choose one implicitly",
+                },
+                "suggested_unblock": "restore one unique repository-relative execution-state file or re-run `tracking run init` with an exact --execution-state-file",
+            }));
+            None
+        }
+        None => None,
+    };
     let mut linked_prs: Vec<String> = args.linked_pr.clone();
 
     if let Some(audit) = audit.as_ref()
@@ -4045,11 +6512,15 @@ fn run_tracking_close_ready(
             linked_prs.push(pr.pr_ref);
         }
     }
-    if let Some(run) = run.as_ref()
-        && let Some(pr) = run.pr.as_ref()
-    {
-        linked_prs.push(pr.r#ref.clone());
+    if let Some(run) = run.as_ref() {
+        for pr in run.linked_prs.iter().chain(run.pr.iter()) {
+            linked_prs.push(pr.r#ref.clone());
+        }
     }
+    linked_prs = linked_prs
+        .iter()
+        .map(|linked_pr| canonical_linked_pr_reference(linked_pr))
+        .collect::<Result<Vec<_>, _>>()?;
     linked_prs.sort();
     linked_prs.dedup();
 
@@ -4075,7 +6546,7 @@ fn run_tracking_close_ready(
 
     // Ledger-rows-pending blocker (Task 1.3): when phase indicates the lane
     // is ready for close or already closed, every Task Ledger row in the
-    // bundle must be done/blocked/waived. Silent-skip when bundle is absent
+    // bundle must use a terminal status (done/deferred/waived). Silent-skip when
     // or the file cannot be read so older run-states without a bundle field
     // keep working.
     if let Some(run) = run.as_ref() {
@@ -4084,25 +6555,29 @@ fn run_tracking_close_ready(
             crate::tracking::run_state::RunPhase::ReadyForClose
                 | crate::tracking::run_state::RunPhase::Closed
         );
-        if phase_gates_ledger
-            && let Some(bundle) = run.bundle.as_ref()
-            && let Some(ledger_path) = find_execution_state(bundle)
-            && let Ok(raw) = std::fs::read_to_string(&ledger_path)
-            && let Ok(rows) = plan_tooling::ledger::read_rows(&raw, &ledger_path)
-        {
-            for row in &rows {
-                if row.status == "pending" || row.status == "in-progress" {
-                    blockers.push(json!({
-                        "code": "ledger-rows-pending",
-                        "task_id": row.id,
-                        "status": row.status,
-                        "message": "ledger row still pending at phase=ready_for_close",
-                        "suggested_unblock": format!(
-                            "plan-tooling ledger-update --task '{}' --status done --evidence <evidence>",
-                            row.id
-                        ),
-                    }));
+        if phase_gates_ledger && let Some(snapshot) = execution_state.as_ref() {
+            match &snapshot.rows {
+                Ok(rows) => {
+                    for row in rows {
+                        if !matches!(row.status.as_str(), "done" | "deferred" | "waived") {
+                            blockers.push(json!({
+                                "code": "ledger-rows-pending",
+                                "task_id": row.id,
+                                "status": row.status,
+                                "message": "ledger row still pending at phase=ready_for_close",
+                                "suggested_unblock": format!(
+                                    "plan-tooling ledger-update --task '{}' --status done --evidence <evidence>",
+                                    row.id
+                                ),
+                            }));
+                        }
+                    }
                 }
+                Err(message) => blockers.push(json!({
+                    "code": "state-ledger-malformed",
+                    "message": message,
+                    "suggested_unblock": "repair the `## Task Ledger` table before close",
+                })),
             }
         }
     }
@@ -4113,11 +6588,15 @@ fn run_tracking_close_ready(
     // live checkpoint.
     if let Some(run) = run.as_ref()
         && run.issue != 0
-        && let Some(es_path) = run_execution_state_path(run)
-        && let Ok(raw) = std::fs::read_to_string(&es_path)
+        && let Some(snapshot) = execution_state.as_ref()
     {
+        let expected_repo = match persisted_checkpoint_repo(run) {
+            Ok(PersistedCheckpointRepo::Bound(repo)) => Some(repo),
+            _ => None,
+        };
         match classify_exec_state_issue(
-            plan_tooling::exec_state::tracking_issue_value(&raw).as_deref(),
+            plan_tooling::exec_state::tracking_issue_value(&snapshot.raw).as_deref(),
+            expected_repo.as_ref(),
             run.issue,
         ) {
             ExecStateIssueClass::Consistent => {}
@@ -4126,7 +6605,15 @@ fn run_tracking_close_ready(
                 "message": "durable execution-state has no tracking issue URL; archive discovery would block with no-provider-refs",
                 "suggested_unblock": format!(
                     "run `plan-tooling exec-state-sync --execution-state {} --issue-url <url>` (or `tracking checkpoint --live` to self-heal)",
-                    es_path.display()
+                    snapshot.path.display()
+                ),
+            })),
+            ExecStateIssueClass::Invalid => blockers.push(json!({
+                "code": "execution-state-issue-invalid",
+                "message": "durable execution-state tracking issue is not a valid issue URL",
+                "suggested_unblock": format!(
+                    "run `plan-tooling exec-state-sync --execution-state {} --issue-url <correct-url>`",
+                    snapshot.path.display()
                 ),
             })),
             ExecStateIssueClass::Mismatch(found) => blockers.push(json!({
@@ -4137,7 +6624,7 @@ fn run_tracking_close_ready(
                 ),
                 "suggested_unblock": format!(
                     "run `plan-tooling exec-state-sync --execution-state {} --issue-url <correct-url>`",
-                    es_path.display()
+                    snapshot.path.display()
                 ),
             })),
         }
@@ -4245,79 +6732,109 @@ fn run_tracking_close_ready(
     }))
 }
 
-fn find_execution_state(bundle: &Path) -> Option<PathBuf> {
-    let entries = std::fs::read_dir(bundle).ok()?;
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if let Some(name) = path.file_name().and_then(|n| n.to_str())
-            && name.ends_with("-execution-state.md")
-        {
-            return Some(path);
-        }
-    }
-    None
-}
-
-/// Resolve the execution-state file a run records: the explicit
-/// `execution_state_file` (absolutized), else the `*-execution-state.md` inside
-/// the recorded `bundle`.
-fn run_execution_state_path(run: &crate::tracking::run_state::ExecutionRun) -> Option<PathBuf> {
-    if let Some(path) = run.execution_state_file.as_ref() {
-        return Some(absolutize(path));
-    }
-    run.bundle
-        .as_ref()
-        .and_then(|bundle| find_execution_state(bundle))
-}
-
-/// How the durable `Tracking issue` bullet relates to the run-state issue.
+/// How the durable `Tracking issue` bullet relates to the bound checkpoint.
 #[derive(Debug, PartialEq, Eq)]
 enum ExecStateIssueClass {
     /// Bullet absent or a `not yet opened`/placeholder value.
     Missing,
-    /// Bullet names the same issue (or a non-issue URL we leave alone).
+    /// Bullet names the same issue.
     Consistent,
-    /// Bullet names a different issue number.
+    /// Bullet is present but does not contain a valid issue URL.
+    Invalid,
+    /// Bullet names a different provider, host, repository, or issue.
     Mismatch(String),
 }
 
-/// Classify the current `Tracking issue` value against the expected issue
-/// number. Pure: callers own the IO and any self-heal write. A present value
-/// that is not a parseable issue URL is treated as `Consistent` so the gate
-/// never false-blocks on a hand-authored note.
-fn classify_exec_state_issue(current: Option<&str>, expected_issue: u64) -> ExecStateIssueClass {
+fn issue_identity_from_url(value: &str) -> Option<CheckpointTarget> {
+    if value.contains(['?', '#']) {
+        return None;
+    }
+    if let Some(local) = value.strip_prefix("local://") {
+        let marker = "/issues/";
+        let idx = local.rfind(marker)?;
+        let slug = local[..idx].trim_matches('/');
+        let issue_text = local[idx + marker.len()..]
+            .strip_suffix('/')
+            .unwrap_or(&local[idx + marker.len()..]);
+        if slug.is_empty()
+            || issue_text.is_empty()
+            || !issue_text.chars().all(|ch| ch.is_ascii_digit())
+        {
+            return None;
+        }
+        let issue = issue_text.parse().ok()?;
+        if issue == 0 {
+            return None;
+        }
+        return Some(CheckpointTarget {
+            repo: crate::provider::Repo {
+                provider: crate::provider::Provider::Local,
+                slug: slug.to_string(),
+                host: None,
+            },
+            issue,
+        });
+    }
+
+    let without_scheme = value
+        .strip_prefix("https://")
+        .or_else(|| value.strip_prefix("http://"))?;
+    let authority = without_scheme.split('/').next()?;
+    if authority.is_empty() || authority.contains('@') {
+        return None;
+    }
+    let parsed = common_git::parse_git_remote_url(value)?;
+    let (marker, idx) = ["/-/issues/", "/issues/"]
+        .into_iter()
+        .find_map(|marker| parsed.path.rfind(marker).map(|idx| (marker, idx)))?;
+    let slug = parsed.path[..idx].trim_matches('/');
+    let issue_text = parsed.path[idx + marker.len()..]
+        .strip_suffix('/')
+        .unwrap_or(&parsed.path[idx + marker.len()..]);
+    if slug.is_empty() || issue_text.is_empty() || !issue_text.chars().all(|ch| ch.is_ascii_digit())
+    {
+        return None;
+    }
+    let issue = issue_text.parse().ok()?;
+    if issue == 0 {
+        return None;
+    }
+    let repo = crate::provider::resolve_repo(Some(&format!("https://{authority}/{slug}"))).ok()?;
+    Some(CheckpointTarget { repo, issue })
+}
+
+/// Classify the current `Tracking issue` value against the expected provider
+/// target. Pure: callers own the IO and any self-heal write. A present value
+/// that is not a parseable issue URL is invalid and blocks publication.
+fn classify_exec_state_issue(
+    current: Option<&str>,
+    expected_repo: Option<&crate::provider::Repo>,
+    expected_issue: u64,
+) -> ExecStateIssueClass {
     match current {
         None => ExecStateIssueClass::Missing,
         Some(value) if plan_tooling::exec_state::is_placeholder(value) => {
             ExecStateIssueClass::Missing
         }
-        Some(value) => match issue_number_from_url(value) {
-            Some(found) if found == expected_issue => ExecStateIssueClass::Consistent,
-            Some(_) => ExecStateIssueClass::Mismatch(value.to_string()),
-            None => ExecStateIssueClass::Consistent,
+        Some(value) => match issue_identity_from_url(value) {
+            Some(found)
+                if found.issue == expected_issue
+                    && expected_repo.is_none_or(|expected| {
+                        checkpoint_repo_identities_match(expected, &found.repo)
+                    }) =>
+            {
+                ExecStateIssueClass::Consistent
+            }
+            Some(found) => ExecStateIssueClass::Mismatch(found.repo.issue_url(found.issue)),
+            None => ExecStateIssueClass::Invalid,
         },
     }
 }
 
-/// Extract the trailing issue number from a GitHub/GitLab issue URL
-/// (`.../issues/<n>` or `.../-/issues/<n>`). `None` for non-issue URLs.
+/// Extract the issue number from a GitHub, GitLab, or local issue URL.
+#[cfg(test)]
 fn issue_number_from_url(value: &str) -> Option<u64> {
-    let marker = "/issues/";
-    let idx = value.rfind(marker)?;
-    value[idx + marker.len()..]
-        .chars()
-        .take_while(char::is_ascii_digit)
-        .collect::<String>()
-        .parse()
-        .ok()
-}
-
-/// Canonical issue URL for `repo` + `issue`, derived offline from the repo
-/// slug's host. `None` when the slug cannot be resolved.
-fn derive_issue_url(repo: &str, issue: u64) -> Option<String> {
-    crate::provider::resolve_repo(Some(repo))
-        .ok()
-        .map(|info| info.issue_url(issue))
+    issue_identity_from_url(value).map(|identity| identity.issue)
 }
 
 fn resolve_close_ready_inputs(
@@ -4423,7 +6940,7 @@ fn run_tracking_status(
         None
     };
 
-    let run_state_value = match &args.run_state {
+    let mut run_state_value = match &args.run_state {
         Some(path) => match run_state::read_run_state(path) {
             Ok(value) => Some(value),
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
@@ -4436,6 +6953,9 @@ fn run_tracking_status(
         },
         None => None,
     };
+    if let Some(run) = run_state_value.as_mut() {
+        canonicalize_execution_run_linked_prs(run)?;
+    }
 
     let reconciled = reconcile::reconcile(audit.as_ref(), run_state_value.as_ref());
 
@@ -6686,30 +9206,361 @@ fn should_emit_comment(comment_mode: &crate::commands::CommentModeArgs) -> bool 
     !comment_mode.no_comment
 }
 
-fn write_temp_markdown(stem: &str, content: &str) -> Result<PathBuf, String> {
+static TEMP_MARKDOWN_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+const STALE_TEMP_MARKDOWN_AGE: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
+const STALE_TEMP_MARKDOWN_SCAN_LIMIT: usize = 256;
+
+#[derive(Debug)]
+struct TempMarkdownDir {
+    path: PathBuf,
+    descriptor: File,
+}
+
+#[derive(Debug)]
+struct TempMarkdown {
+    provider_path: PathBuf,
+    display_path: PathBuf,
+    parent: File,
+    file_name: OsString,
+    file: File,
+}
+
+impl PartialEq for TempMarkdown {
+    fn eq(&self, other: &Self) -> bool {
+        self.display_path == other.display_path
+    }
+}
+
+impl Eq for TempMarkdown {}
+
+impl TempMarkdown {
+    #[cfg(test)]
+    fn physical_path(&self) -> &Path {
+        &self.display_path
+    }
+}
+
+impl std::ops::Deref for TempMarkdown {
+    type Target = Path;
+
+    fn deref(&self) -> &Self::Target {
+        &self.provider_path
+    }
+}
+
+impl AsRef<Path> for TempMarkdown {
+    fn as_ref(&self) -> &Path {
+        &self.provider_path
+    }
+}
+
+impl Drop for TempMarkdown {
+    fn drop(&mut self) {
+        let Ok(name) = CString::new(self.file_name.as_bytes()) else {
+            return;
+        };
+        // SAFETY: the retained parent descriptor and NUL-terminated file name
+        // identify the exact directory entry created by this guard.
+        let _ = unsafe { libc::unlinkat(self.parent.as_raw_fd(), name.as_ptr(), 0) };
+    }
+}
+
+fn descriptor_path(descriptor: &File) -> PathBuf {
+    #[cfg(target_os = "linux")]
+    {
+        PathBuf::from(format!("/proc/self/fd/{}", descriptor.as_raw_fd()))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        PathBuf::from(format!("/dev/fd/{}", descriptor.as_raw_fd()))
+    }
+}
+
+fn ensure_private_temp_markdown_dir(dir: &Path) -> Result<TempMarkdownDir, String> {
+    let parent = dir.parent().ok_or_else(|| {
+        format!(
+            "temporary markdown directory has no parent: {}",
+            dir.display()
+        )
+    })?;
+    fs::create_dir_all(parent).map_err(|err| {
+        format!(
+            "failed to create temporary markdown parent {}: {err}",
+            parent.display()
+        )
+    })?;
+    match fs::symlink_metadata(dir) {
+        Ok(metadata) if metadata.file_type().is_dir() && !metadata.file_type().is_symlink() => {}
+        Ok(_) => {
+            return Err(format!(
+                "temporary markdown directory must be a real directory, not a symlink: {}",
+                dir.display()
+            ));
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            fs::create_dir(dir).map_err(|err| {
+                format!(
+                    "failed to create temporary markdown directory {}: {err}",
+                    dir.display()
+                )
+            })?;
+        }
+        Err(err) => {
+            return Err(format!(
+                "failed to inspect temporary markdown directory {}: {err}",
+                dir.display()
+            ));
+        }
+    }
+    let descriptor = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+        .open(dir)
+        .map_err(|err| {
+            format!(
+                "failed to open temporary markdown directory {}: {err}",
+                dir.display()
+            )
+        })?;
+    if !descriptor
+        .metadata()
+        .is_ok_and(|metadata| metadata.is_dir())
+    {
+        return Err(format!(
+            "temporary markdown directory changed during setup: {}",
+            dir.display()
+        ));
+    }
+    // SAFETY: `descriptor` owns a live directory descriptor and 0700 is a
+    // valid Unix mode.
+    if unsafe { libc::fchmod(descriptor.as_raw_fd(), 0o700) } != 0 {
+        let err = std::io::Error::last_os_error();
+        return Err(format!(
+            "failed to secure temporary markdown directory {}: {err}",
+            dir.display()
+        ));
+    }
+    Ok(TempMarkdownDir {
+        path: dir.to_path_buf(),
+        descriptor,
+    })
+}
+
+fn temp_markdown_entry_names(dir: &TempMarkdownDir) -> Vec<OsString> {
+    let current = CString::new(".").expect("current directory name is NUL-free");
+    // Open a fresh stream relative to the retained descriptor. Reopening a
+    // directory through `/dev/fd` is not portable to macOS.
+    // SAFETY: the parent descriptor is live and `current` is NUL-terminated.
+    let descriptor = unsafe {
+        libc::openat(
+            dir.descriptor.as_raw_fd(),
+            current.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if descriptor < 0 {
+        return Vec::new();
+    }
+    // SAFETY: `descriptor` uniquely owns a freshly opened directory stream.
+    let stream = unsafe { libc::fdopendir(descriptor) };
+    if stream.is_null() {
+        // SAFETY: `fdopendir` failed, so ownership remains with this function.
+        let _ = unsafe { libc::close(descriptor) };
+        return Vec::new();
+    }
+
+    let mut names = Vec::new();
+    while names.len() < STALE_TEMP_MARKDOWN_SCAN_LIMIT {
+        // SAFETY: `stream` remains live until `closedir` below.
+        let entry = unsafe { libc::readdir(stream) };
+        if entry.is_null() {
+            break;
+        }
+        // SAFETY: `readdir` returned a live entry with a NUL-terminated name.
+        let name = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) }.to_bytes();
+        if name == b"." || name == b".." {
+            continue;
+        }
+        names.push(OsStr::from_bytes(name).to_os_string());
+    }
+    // SAFETY: `stream` is live and owns `descriptor`.
+    let _ = unsafe { libc::closedir(stream) };
+    names
+}
+
+fn cleanup_stale_temp_markdown(dir: &TempMarkdownDir) {
+    for file_name in temp_markdown_entry_names(dir) {
+        if Path::new(&file_name)
+            .extension()
+            .and_then(|extension| extension.to_str())
+            != Some("md")
+        {
+            continue;
+        }
+        let Ok(name) = CString::new(file_name.as_bytes()) else {
+            continue;
+        };
+        // Inspect the entry through the retained directory descriptor without
+        // following a symlink or blocking on a non-regular special file.
+        // SAFETY: the parent descriptor is live and `name` is NUL-terminated.
+        let descriptor = unsafe {
+            libc::openat(
+                dir.descriptor.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
+            )
+        };
+        if descriptor < 0 {
+            continue;
+        }
+        // SAFETY: `descriptor` was returned uniquely by `openat` above.
+        let entry = unsafe { File::from_raw_fd(descriptor) };
+        let Ok(metadata) = entry.metadata() else {
+            continue;
+        };
+        if !metadata.is_file() {
+            continue;
+        }
+        let stale = metadata
+            .modified()
+            .ok()
+            .and_then(|modified| SystemTime::now().duration_since(modified).ok())
+            .is_some_and(|age| age >= STALE_TEMP_MARKDOWN_AGE);
+        if stale {
+            // SAFETY: deletion is relative to the retained directory descriptor,
+            // so a pathname swap cannot redirect cleanup outside this directory.
+            let _ = unsafe { libc::unlinkat(dir.descriptor.as_raw_fd(), name.as_ptr(), 0) };
+        }
+    }
+}
+
+fn create_temp_markdown_file(dir: &TempMarkdownDir, file_name: &OsStr) -> std::io::Result<File> {
+    let name = CString::new(file_name.as_bytes()).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "temporary markdown file name contains a NUL byte",
+        )
+    })?;
+    // Deliberately omit O_CLOEXEC: provider subprocesses receive a descriptor
+    // path for this exact file instead of reopening a swappable directory path.
+    // SAFETY: the parent descriptor is live and `name` is NUL-terminated.
+    let descriptor = unsafe {
+        libc::openat(
+            dir.descriptor.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDWR | libc::O_CREAT | libc::O_EXCL,
+            0o600,
+        )
+    };
+    if descriptor < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: `descriptor` was returned uniquely by openat above.
+    Ok(unsafe { File::from_raw_fd(descriptor) })
+}
+
+fn write_temp_markdown_in_with<F>(
+    dir: &TempMarkdownDir,
+    stem: &str,
+    content: &str,
+    timestamp: u128,
+    process_id: u32,
+    sequence: &AtomicU64,
+    mut write: F,
+) -> Result<TempMarkdown, String>
+where
+    F: FnMut(&mut File, &[u8]) -> std::io::Result<()>,
+{
+    loop {
+        let sequence = sequence.fetch_add(1, Ordering::Relaxed);
+        let file_name = OsString::from(format!("{stem}-{timestamp}-{process_id}-{sequence}.md"));
+        let display_path = dir.path.join(&file_name);
+        match create_temp_markdown_file(dir, &file_name) {
+            Ok(file) => {
+                let parent = dir.descriptor.try_clone().map_err(|err| {
+                    format!(
+                        "failed to retain temporary markdown directory {}: {err}",
+                        dir.path.display()
+                    )
+                })?;
+                let provider_path = descriptor_path(&file);
+                let mut markdown = TempMarkdown {
+                    provider_path,
+                    display_path: display_path.clone(),
+                    parent,
+                    file_name,
+                    file,
+                };
+                write(&mut markdown.file, content.as_bytes()).map_err(|err| {
+                    format!(
+                        "failed to write temporary markdown {}: {err}",
+                        display_path.display()
+                    )
+                })?;
+                markdown.file.flush().map_err(|err| {
+                    format!(
+                        "failed to flush temporary markdown {}: {err}",
+                        display_path.display()
+                    )
+                })?;
+                markdown.file.seek(SeekFrom::Start(0)).map_err(|err| {
+                    format!(
+                        "failed to rewind temporary markdown {}: {err}",
+                        display_path.display()
+                    )
+                })?;
+                return Ok(markdown);
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(err) => {
+                return Err(format!(
+                    "failed to create temporary markdown {}: {err}",
+                    display_path.display()
+                ));
+            }
+        }
+    }
+}
+
+fn write_temp_markdown_in(
+    dir: &TempMarkdownDir,
+    stem: &str,
+    content: &str,
+    timestamp: u128,
+    process_id: u32,
+    sequence: &AtomicU64,
+) -> Result<TempMarkdown, String> {
+    write_temp_markdown_in_with(
+        dir,
+        stem,
+        content,
+        timestamp,
+        process_id,
+        sequence,
+        |file, bytes| file.write_all(bytes),
+    )
+}
+
+fn write_temp_markdown(stem: &str, content: &str) -> Result<TempMarkdown, String> {
     let dir = task_spec::state_dir()
         .join("out")
         .join("plan-issue-delivery")
         .join("tmp");
-    fs::create_dir_all(&dir).map_err(|err| {
-        format!(
-            "failed to create temp output directory {}: {err}",
-            dir.display()
-        )
-    })?;
+    let dir = ensure_private_temp_markdown_dir(&dir)?;
+    cleanup_stale_temp_markdown(&dir);
 
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(|err| format!("failed to compute timestamp: {err}"))?
-        .as_millis();
-    let path = dir.join(format!("{stem}-{now}.md"));
-    fs::write(&path, content).map_err(|err| {
-        format!(
-            "failed to write temporary markdown {}: {err}",
-            path.display()
-        )
-    })?;
-    Ok(path)
+        .as_nanos();
+    write_temp_markdown_in(
+        &dir,
+        stem,
+        content,
+        now,
+        std::process::id(),
+        &TEMP_MARKDOWN_SEQUENCE,
+    )
 }
 
 fn write_subagent_prompts(
@@ -7391,7 +10242,8 @@ fn path_key(path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashMap;
+    use std::collections::{HashMap, VecDeque};
+    use std::sync::Mutex;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use crate::commands::plan::CloseReason;
@@ -7427,6 +10279,16 @@ mod tests {
         }
     }
 
+    fn execution_state_snapshot_for_test(path: &Path) -> ExecutionStateSnapshot {
+        let raw = std::fs::read_to_string(path).expect("read execution state");
+        let rows = plan_tooling::ledger::read_rows(&raw, path).map_err(|err| err.to_string());
+        ExecutionStateSnapshot {
+            path: path.to_path_buf(),
+            raw,
+            rows,
+        }
+    }
+
     fn note_value(notes: &str, key: &str) -> Option<String> {
         notes
             .split(';')
@@ -7437,11 +10299,30 @@ mod tests {
     #[derive(Default)]
     struct MockProviderAdapter {
         merged: HashMap<u64, Result<bool, String>>,
+        comment_results: Mutex<VecDeque<Result<String, String>>>,
+        evidence_results: Mutex<VecDeque<Result<(String, String), String>>>,
+        comment_calls: AtomicU64,
     }
 
     impl MockProviderAdapter {
         fn with_merge(mut self, pr: u64, result: Result<bool, String>) -> Self {
             self.merged.insert(pr, result);
+            self
+        }
+
+        fn with_comment_result(mut self, result: Result<String, String>) -> Self {
+            self.comment_results
+                .get_mut()
+                .expect("comment result queue")
+                .push_back(result);
+            self
+        }
+
+        fn with_evidence_result(mut self, result: Result<(String, String), String>) -> Self {
+            self.evidence_results
+                .get_mut()
+                .expect("evidence result queue")
+                .push_back(result);
             self
         }
     }
@@ -7476,11 +10357,20 @@ mod tests {
             _issue: u64,
             _body_file: &Path,
         ) -> Result<String, String> {
-            unreachable!("comment_issue is not needed in this test")
+            self.comment_calls.fetch_add(1, Ordering::SeqCst);
+            self.comment_results
+                .lock()
+                .expect("comment result queue")
+                .pop_front()
+                .expect("queued comment result")
         }
 
         fn issue_evidence(&self, _repo: &str, _issue: u64) -> Result<(String, String), String> {
-            unreachable!("issue_evidence is not needed in this test")
+            self.evidence_results
+                .lock()
+                .expect("evidence result queue")
+                .pop_front()
+                .expect("queued evidence result")
         }
 
         fn issue_labels(&self, _repo: &str, _issue: u64) -> Result<Vec<String>, String> {
@@ -7542,6 +10432,7 @@ mod tests {
     struct RollbackProbeAdapter {
         close_ok: bool,
         closed_issue: AtomicU64,
+        created_body: Mutex<Option<String>>,
     }
 
     impl RollbackProbeAdapter {
@@ -7549,6 +10440,7 @@ mod tests {
             Self {
                 close_ok,
                 closed_issue: AtomicU64::new(0),
+                created_body: Mutex::new(None),
             }
         }
     }
@@ -7562,9 +10454,13 @@ mod tests {
             &self,
             _repo: &str,
             _title: &str,
-            _body_file: &Path,
+            body_file: &Path,
             _labels: &[String],
         ) -> Result<(u64, String), String> {
+            *self.created_body.lock().unwrap() = Some(
+                fs::read_to_string(body_file)
+                    .map_err(|error| format!("failed to read issue body: {error}"))?,
+            );
             Ok((1, "https://github.com/owner/repo/issues/1".to_string()))
         }
 
@@ -7587,7 +10483,12 @@ mod tests {
         }
 
         fn issue_evidence(&self, _repo: &str, _issue: u64) -> Result<(String, String), String> {
-            unreachable!("issue_evidence is not needed in this test")
+            self.created_body
+                .lock()
+                .unwrap()
+                .clone()
+                .map(|body| (body, comments_envelope(&[])))
+                .ok_or_else(|| "issue has not been created".to_string())
         }
 
         fn issue_labels(&self, _repo: &str, _issue: u64) -> Result<Vec<String>, String> {
@@ -7655,65 +10556,67 @@ mod tests {
     }
 
     fn rollback_probe_seed() -> RecordSeed {
-        RecordSeed {
-            plan_title: "Rollback Probe Plan".to_string(),
-            source_path: "docs/plans/probe/probe-discussion-source.md".to_string(),
-            plan_path: "docs/plans/probe/probe-plan.md".to_string(),
-            source_commit: "abc".to_string(),
-            plan_commit: "def".to_string(),
-            source_body: "source body".to_string(),
-            plan_body: "plan body".to_string(),
-            state_body: "state body".to_string(),
+        resume_seed()
+    }
+
+    fn record_open_test_repo(slug: &str) -> crate::provider::Repo {
+        crate::provider::Repo {
+            provider: crate::provider::Provider::GitHub,
+            slug: slug.to_string(),
+            host: Some("github.com".to_string()),
         }
     }
 
     #[test]
-    fn record_open_finalize_rolls_back_orphaned_issue_on_post_failure() {
+    fn record_open_finalize_leaves_marker_identified_issue_open_on_source_post_failure() {
+        let state_lock = GlobalStateLock::new();
+        let (state, _state_env) = isolate_record_open_state(&state_lock);
         let adapter = RollbackProbeAdapter::new(true);
         let seed = rollback_probe_seed();
+        let body_path = record_open_body_file(state.path(), &seed);
+        let repo = record_open_test_repo("owner/marker-source-failure");
         let err = record_open_finalize(
             &adapter,
-            "owner/repo",
+            &repo,
             crate::commands::record::RecordProfile::Tracking,
-            Path::new("/tmp/record-open-rollback-body.md"),
+            &body_path,
             &[],
             &seed,
             "binary",
         )
-        .expect_err("a failed comment post must surface an error");
+        .expect_err("an unproven comment post must surface an outcome-unknown error");
 
-        // The original failure code is preserved.
-        assert_eq!(err.code, "record-open-source-post-failed");
-        // The orphaned issue was closed and the message says so.
-        assert_eq!(adapter.closed_issue.load(Ordering::SeqCst), 1);
+        assert_eq!(err.code, "record-open-outcome-unknown");
+        assert_eq!(adapter.closed_issue.load(Ordering::SeqCst), 0);
         assert!(
-            err.message.contains("rolled back") && err.message.contains("#1"),
-            "expected a rollback note naming the issue, got: {}",
+            err.message.contains("durable local intent was retained"),
+            "expected a retained-intent note, got: {}",
             err.message
         );
     }
 
     #[test]
-    fn record_open_finalize_reports_when_rollback_close_fails() {
+    fn record_open_finalize_does_not_attempt_close_when_source_post_fails() {
+        let state_lock = GlobalStateLock::new();
+        let (state, _state_env) = isolate_record_open_state(&state_lock);
         let adapter = RollbackProbeAdapter::new(false);
         let seed = rollback_probe_seed();
+        let body_path = record_open_body_file(state.path(), &seed);
+        let repo = record_open_test_repo("owner/no-close-on-source-failure");
         let err = record_open_finalize(
             &adapter,
-            "owner/repo",
+            &repo,
             crate::commands::record::RecordProfile::Tracking,
-            Path::new("/tmp/record-open-rollback-body.md"),
+            &body_path,
             &[],
             &seed,
             "binary",
         )
-        .expect_err("a failed comment post must surface an error");
+        .expect_err("an unproven comment post must surface an error");
 
-        assert_eq!(adapter.closed_issue.load(Ordering::SeqCst), 1);
-        assert!(
-            err.message.contains("rollback FAILED") && err.message.contains("#1"),
-            "expected a rollback-failed note, got: {}",
-            err.message
-        );
+        assert_eq!(err.code, "record-open-outcome-unknown");
+        assert_eq!(adapter.closed_issue.load(Ordering::SeqCst), 0);
+        assert!(!err.message.contains("rollback"), "{}", err.message);
     }
 
     /// Stateful stub adapter for the `record open` auto-detect / resume tests.
@@ -7724,12 +10627,30 @@ mod tests {
         open_issues: Vec<u64>,
         evidence: HashMap<u64, (String, String)>,
         create_number: u64,
+        create_calls: AtomicU64,
+        created_issue: Mutex<Option<(u64, String)>>,
+        create_store_then_error: bool,
+        create_unproven_error: bool,
+        listed_labels: Mutex<Vec<Vec<String>>>,
+        hide_posted_comments: bool,
+        intent_probe: Option<RecordOpenIntentStore>,
+        observed_create_intent: Mutex<Option<bool>>,
+        observed_comment_intents: Mutex<Vec<bool>>,
+        require_lifecycle_lock_on_evidence: Option<(
+            crate::provider::Repo,
+            crate::commands::record::RecordProfile,
+        )>,
+        break_intent_cleanup: bool,
         /// When set, `comment_issue` fails on the Nth call (1-based). Used to
         /// simulate a post failure at a precise point without depending on the
         /// (shared, race-prone) temp markdown file's contents.
         fail_on_nth_comment: Option<usize>,
+        store_then_fail_on_nth_comment: Option<usize>,
+        comment_attempts: AtomicU64,
         /// Issue numbers for each successful comment post, in call order.
         comment_calls: std::sync::Mutex<Vec<u64>>,
+        /// Provider-visible body for each successful comment post, in call order.
+        comment_bodies: std::sync::Mutex<Vec<(u64, String)>>,
         edited: std::sync::Mutex<Vec<u64>>,
         closed: std::sync::Mutex<Vec<u64>>,
     }
@@ -7739,14 +10660,71 @@ mod tests {
             self.evidence
                 .get(&issue)
                 .map(|(body, _)| body.clone())
+                .or_else(|| {
+                    self.created_issue
+                        .lock()
+                        .unwrap()
+                        .as_ref()
+                        .filter(|(created_issue, _)| *created_issue == issue)
+                        .map(|(_, body)| body.clone())
+                })
                 .ok_or_else(|| format!("no scripted evidence for issue {issue}"))
         }
 
         fn issue_evidence(&self, _repo: &str, issue: u64) -> Result<(String, String), String> {
-            self.evidence
+            if let Some((repo, profile)) = &self.require_lifecycle_lock_on_evidence {
+                match crate::lifecycle_lock::acquire(repo, issue, *profile) {
+                    Err(error) if error.code == "plan-issue-lifecycle-lock-busy" => {}
+                    Ok(_lock) => {
+                        return Err(
+                            "provider evidence was read before acquiring the lifecycle lock"
+                                .to_string(),
+                        );
+                    }
+                    Err(error) => {
+                        return Err(format!(
+                            "failed to probe lifecycle lock during provider evidence read: {}",
+                            error.message
+                        ));
+                    }
+                }
+            }
+            let (body, comments_json) = self
+                .evidence
                 .get(&issue)
                 .cloned()
-                .ok_or_else(|| format!("no scripted evidence for issue {issue}"))
+                .or_else(|| {
+                    self.created_issue
+                        .lock()
+                        .unwrap()
+                        .as_ref()
+                        .filter(|(created_issue, _)| *created_issue == issue)
+                        .map(|(_, body)| (body.clone(), comments_envelope(&[])))
+                })
+                .ok_or_else(|| format!("no scripted evidence for issue {issue}"))?;
+            let mut comments: Value = serde_json::from_str(&comments_json)
+                .map_err(|error| format!("invalid scripted comments: {error}"))?;
+            let items = comments
+                .get_mut("comments")
+                .and_then(Value::as_array_mut)
+                .ok_or_else(|| "scripted comments envelope has no comments array".to_string())?;
+            if !self.hide_posted_comments {
+                for (index, (_, posted_body)) in self
+                    .comment_bodies
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|(posted_issue, _)| *posted_issue == issue)
+                    .enumerate()
+                {
+                    items.push(json!({
+                        "body": posted_body,
+                        "url": format!("https://github.com/owner/repo/issues/{issue}#posted-{index}"),
+                        "created_at": format!("2026-02-{:02}T00:00:00Z", index + 1),
+                    }));
+                }
+            }
+            Ok((body, comments.to_string()))
         }
 
         fn issue_labels(&self, _repo: &str, _issue: u64) -> Result<Vec<String>, String> {
@@ -7760,18 +10738,42 @@ mod tests {
         fn list_open_tracker_issues(
             &self,
             _repo: &str,
-            _labels: &[String],
+            labels: &[String],
         ) -> Result<Vec<u64>, String> {
-            Ok(self.open_issues.clone())
+            self.listed_labels.lock().unwrap().push(labels.to_vec());
+            let mut issues = self.open_issues.clone();
+            if let Some((issue, _)) = self.created_issue.lock().unwrap().as_ref()
+                && !issues.contains(issue)
+            {
+                issues.push(*issue);
+            }
+            Ok(issues)
         }
 
         fn create_issue(
             &self,
             _repo: &str,
             _title: &str,
-            _body_file: &Path,
+            body_file: &Path,
             _labels: &[String],
         ) -> Result<(u64, String), String> {
+            self.create_calls.fetch_add(1, Ordering::SeqCst);
+            if let Some(intent) = &self.intent_probe {
+                let observed = matches!(
+                    intent.load(),
+                    Ok(Some(RecordOpenIntentState::CreateInFlight))
+                );
+                *self.observed_create_intent.lock().unwrap() = Some(observed);
+            }
+            if self.create_unproven_error {
+                return Err("simulated unproven issue create failure".to_string());
+            }
+            let body = fs::read_to_string(body_file)
+                .map_err(|error| format!("failed to read issue body: {error}"))?;
+            *self.created_issue.lock().unwrap() = Some((self.create_number, body));
+            if self.create_store_then_error {
+                return Err("simulated store-then-error issue create failure".to_string());
+            }
             Ok((
                 self.create_number,
                 format!(
@@ -7788,6 +10790,16 @@ mod tests {
             _body_file: &Path,
         ) -> Result<(), String> {
             self.edited.lock().unwrap().push(issue);
+            if self.break_intent_cleanup
+                && let Some(intent) = &self.intent_probe
+            {
+                fs::remove_file(intent.path()).map_err(|error| {
+                    format!("failed to remove intent before cleanup probe: {error}")
+                })?;
+                fs::create_dir(intent.path()).map_err(|error| {
+                    format!("failed to replace intent with cleanup-blocking directory: {error}")
+                })?;
+            }
             Ok(())
         }
 
@@ -7795,14 +10807,40 @@ mod tests {
             &self,
             _repo: &str,
             issue: u64,
-            _body_file: &Path,
+            body_file: &Path,
         ) -> Result<String, String> {
-            let mut calls = self.comment_calls.lock().unwrap();
-            let nth = calls.len() + 1;
+            let body = fs::read_to_string(body_file)
+                .map_err(|error| format!("failed to read comment body: {error}"))?;
+            if let Some(intent) = &self.intent_probe {
+                let posted_payload = lifecycle_record::extract_payload(&body).ok();
+                let observed = match (intent.load(), posted_payload) {
+                    (
+                        Ok(Some(RecordOpenIntentState::CommentInFlight {
+                            issue: pending_issue,
+                            role,
+                            expected_payload,
+                            ..
+                        })),
+                        Some(posted_payload),
+                    ) => {
+                        pending_issue == issue
+                            && role == posted_payload.role
+                            && expected_payload.semantically_matches(&posted_payload)
+                    }
+                    _ => false,
+                };
+                self.observed_comment_intents.lock().unwrap().push(observed);
+            }
+            let nth = self.comment_attempts.fetch_add(1, Ordering::SeqCst) as usize + 1;
+            if self.store_then_fail_on_nth_comment == Some(nth) {
+                self.comment_bodies.lock().unwrap().push((issue, body));
+                return Err(format!("simulated store-then-error on comment call {nth}"));
+            }
             if self.fail_on_nth_comment == Some(nth) {
                 return Err(format!("simulated comment post failure on call {nth}"));
             }
-            calls.push(issue);
+            self.comment_calls.lock().unwrap().push(issue);
+            self.comment_bodies.lock().unwrap().push((issue, body));
             Ok(format!(
                 "https://github.com/owner/repo/issues/{issue}#issuecomment-{nth}"
             ))
@@ -7886,20 +10924,101 @@ mod tests {
     }
 
     fn resume_seed() -> RecordSeed {
+        let profile = crate::commands::record::RecordProfile::Tracking;
+        let source_path = "docs/plans/x/x-discussion-source.md".to_string();
+        let plan_path = "docs/plans/x/x-plan.md".to_string();
+        let commit = "abc123".to_string();
+        let source_body = source_identity_comment(&source_path, &commit);
+        let plan_body = lifecycle_record::render_record_snapshot_comment(
+            profile,
+            crate::commands::record::LifecycleCommentKind::Plan,
+            &lifecycle_record::SnapshotData {
+                path: plan_path.clone(),
+                commit: commit.clone(),
+                title: Some("Resume Plan".to_string()),
+                summary: None,
+            },
+            "plan content",
+            None,
+        )
+        .expect("render plan comment");
+        let state_body = lifecycle_record::render_record_post_comment(
+            profile,
+            crate::commands::record::LifecycleCommentKind::State,
+            json!({
+                "status": "in-progress",
+                "target_scope": "Resume Plan",
+                "current": "1.1",
+                "next_action": "Continue",
+                "tasks": [],
+                "prs": [],
+                "blockers": [],
+                "links": {}
+            }),
+            Some("initial state"),
+            None,
+        )
+        .expect("render state comment");
         RecordSeed {
             plan_title: "Resume Plan".to_string(),
-            source_path: "docs/plans/x/x-discussion-source.md".to_string(),
-            plan_path: "docs/plans/x/x-plan.md".to_string(),
-            source_commit: "abc123".to_string(),
-            plan_commit: "abc123".to_string(),
-            source_body: "SRC-BODY".to_string(),
-            plan_body: "PLN-BODY".to_string(),
-            state_body: "STA-BODY".to_string(),
+            source_path,
+            plan_path,
+            source_commit: commit.clone(),
+            plan_commit: commit,
+            source_body,
+            plan_body,
+            state_body,
         }
     }
 
+    fn record_identity_body(seed: &RecordSeed) -> String {
+        format!(
+            "{}\n\n## Current Dashboard\n",
+            lifecycle_record::render_record_identity_marker(
+                crate::commands::record::RecordProfile::Tracking,
+                &seed.source_path,
+                &seed.source_commit,
+            )
+        )
+    }
+
+    fn isolate_record_open_state(lock: &GlobalStateLock) -> (TempDir, EnvGuard) {
+        crate::state::set_state_dir_override(None);
+        let state = TempDir::new().expect("record-open state");
+        let env = EnvGuard::set(lock, "PLAN_ISSUE_HOME", &state.path().to_string_lossy());
+        (state, env)
+    }
+
+    fn record_open_body_file(dir: &Path, seed: &RecordSeed) -> PathBuf {
+        let path = dir.join("record-open-body.md");
+        fs::write(&path, record_identity_body(seed)).expect("record-open body");
+        path
+    }
+
     #[test]
-    fn detect_resumable_tracker_matches_source_snapshot_identity() {
+    fn bundle_identity_is_repo_relative_from_any_launch_directory() {
+        let lock = GlobalStateLock::new();
+        let repo = init_repo_with(InitRepoOptions::new().with_initial_commit());
+        let nested = repo.path().join("docs/plans/demo");
+        fs::create_dir_all(&nested).expect("nested bundle directory");
+        let source = nested.join("demo-discussion-source.md");
+        fs::write(&source, "# Source\n").expect("source file");
+
+        let from_root = {
+            let _cwd = CwdGuard::set(&lock, repo.path()).expect("repo root cwd");
+            relative_repo_path(&source).expect("repository-relative source identity")
+        };
+        let from_nested = {
+            let _cwd = CwdGuard::set(&lock, &nested).expect("nested cwd");
+            relative_repo_path(&source).expect("repository-relative source identity")
+        };
+
+        assert_eq!(from_root, "docs/plans/demo/demo-discussion-source.md");
+        assert_eq!(from_nested, from_root);
+    }
+
+    #[test]
+    fn detect_resumable_tracker_source_comment_only_requires_repair() {
         let other = source_identity_comment("docs/plans/y/y-discussion-source.md", "zzz999");
         let wanted = source_identity_comment("docs/plans/x/x-discussion-source.md", "abc123");
         let mut evidence = HashMap::new();
@@ -7915,26 +11034,185 @@ mod tests {
             source_commit: "abc123".to_string(),
         };
 
-        let found = detect_resumable_tracker(
+        let error = detect_resumable_tracker(
             &adapter,
             "owner/repo",
-            &[],
             crate::commands::record::RecordProfile::Tracking,
             &identity,
         )
-        .expect("detection must not error");
-        let (number, audit) = found.expect("a matching tracker must be found");
-        assert_eq!(number, 7);
-        // Only the source role is present on the matched tracker.
-        assert!(audit.missing_required.iter().any(|c| c == "plan-missing"));
-        assert!(audit.missing_required.iter().any(|c| c == "state-missing"));
+        .expect_err("historical source-comment identity must not be auto-resumable");
+        assert_eq!(error.code, "record-open-identity-repair-required");
+        assert!(
+            error.message.contains("issue-body identity marker"),
+            "{error:?}"
+        );
+        assert_eq!(adapter.create_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn detect_resumable_tracker_matches_issue_body_identity_before_comments() {
+        let marker = lifecycle_record::render_record_identity_marker(
+            crate::commands::record::RecordProfile::Tracking,
+            "docs/plans/x/x-discussion-source.md",
+            "abc123",
+        );
+        let mut evidence = HashMap::new();
+        evidence.insert(
+            7,
+            (
+                format!("{marker}\n\n## Current Dashboard\n"),
+                comments_envelope(&[]),
+            ),
+        );
+        let adapter = ResumeFakeAdapter {
+            open_issues: vec![7],
+            evidence,
+            ..Default::default()
+        };
+        let identity = BundleIdentity {
+            source_path: "docs/plans/x/x-discussion-source.md".to_string(),
+            source_commit: "abc123".to_string(),
+        };
+
+        let found = detect_resumable_tracker(
+            &adapter,
+            "owner/repo",
+            crate::commands::record::RecordProfile::Tracking,
+            &identity,
+        )
+        .expect("body marker detection must not error");
+        assert_eq!(found, Some(7));
+    }
+
+    #[test]
+    fn detect_resumable_tracker_scans_all_open_issues_regardless_requested_labels() {
+        let seed = resume_seed();
+        let mut evidence = HashMap::new();
+        evidence.insert(7, (record_identity_body(&seed), comments_envelope(&[])));
+        let adapter = ResumeFakeAdapter {
+            open_issues: vec![7],
+            evidence,
+            ..Default::default()
+        };
+        let identity = BundleIdentity {
+            source_path: seed.source_path.clone(),
+            source_commit: seed.source_commit.clone(),
+        };
+
+        let found = detect_resumable_tracker(
+            &adapter,
+            "owner/repo",
+            crate::commands::record::RecordProfile::Tracking,
+            &identity,
+        )
+        .expect("dedup scan must not depend on creation labels");
+
+        assert_eq!(found, Some(7));
+        assert_eq!(
+            *adapter.listed_labels.lock().unwrap(),
+            vec![Vec::<String>::new()],
+            "identity discovery must broad-scan all open issues"
+        );
+    }
+
+    #[test]
+    fn detect_resumable_tracker_refuses_multiple_matching_issues() {
+        let marker = lifecycle_record::render_record_identity_marker(
+            crate::commands::record::RecordProfile::Tracking,
+            "docs/plans/x/x-discussion-source.md",
+            "abc123",
+        );
+        let source = source_identity_comment("docs/plans/x/x-discussion-source.md", "abc123");
+        let mut evidence = HashMap::new();
+        evidence.insert(
+            2,
+            (
+                format!("{marker}\n\n## Current Dashboard\n"),
+                comments_envelope(&[]),
+            ),
+        );
+        evidence.insert(
+            7,
+            ("historical body".to_string(), comments_envelope(&[&source])),
+        );
+        let adapter = ResumeFakeAdapter {
+            open_issues: vec![7, 2, 7],
+            evidence,
+            ..Default::default()
+        };
+        let identity = BundleIdentity {
+            source_path: "docs/plans/x/x-discussion-source.md".to_string(),
+            source_commit: "abc123".to_string(),
+        };
+
+        let error = detect_resumable_tracker(
+            &adapter,
+            "owner/repo",
+            crate::commands::record::RecordProfile::Tracking,
+            &identity,
+        )
+        .expect_err("trusted plus historical matching trackers must fail closed");
+        assert_eq!(error.code, "record-open-identity-repair-required");
+        assert!(error.message.contains("2, 7"), "{error:?}");
+    }
+
+    #[test]
+    fn detect_resumable_tracker_rejects_malformed_or_duplicate_body_markers() {
+        let valid = lifecycle_record::render_record_identity_marker(
+            crate::commands::record::RecordProfile::Tracking,
+            "docs/plans/x/x-discussion-source.md",
+            "abc123",
+        );
+        let identity = BundleIdentity {
+            source_path: "docs/plans/x/x-discussion-source.md".to_string(),
+            source_commit: "abc123".to_string(),
+        };
+
+        for (case, body) in [
+            (
+                "malformed",
+                "<!-- plan-issue-record-identity:v1:hex:not-hex -->".to_string(),
+            ),
+            ("duplicate", format!("{valid}\n{valid}")),
+        ] {
+            let mut evidence = HashMap::new();
+            evidence.insert(7, (body, comments_envelope(&[])));
+            let adapter = ResumeFakeAdapter {
+                open_issues: vec![7],
+                evidence,
+                ..Default::default()
+            };
+
+            let error = detect_resumable_tracker(
+                &adapter,
+                "owner/repo",
+                crate::commands::record::RecordProfile::Tracking,
+                &identity,
+            )
+            .expect_err("invalid candidate body marker must fail closed");
+            assert_eq!(
+                error.code, "record-open-identity-repair-required",
+                "{case}: {error:?}"
+            );
+        }
     }
 
     #[test]
     fn detect_resumable_tracker_returns_none_when_no_identity_matches() {
         let other = source_identity_comment("docs/plans/y/y-discussion-source.md", "zzz999");
+        let other_marker = lifecycle_record::render_record_identity_marker(
+            crate::commands::record::RecordProfile::Tracking,
+            "docs/plans/y/y-discussion-source.md",
+            "zzz999",
+        );
         let mut evidence = HashMap::new();
-        evidence.insert(2, ("body-2".to_string(), comments_envelope(&[&other])));
+        evidence.insert(
+            2,
+            (
+                format!("{other_marker}\n\n## Other tracker\n"),
+                comments_envelope(&[&other]),
+            ),
+        );
         let adapter = ResumeFakeAdapter {
             open_issues: vec![2],
             evidence,
@@ -7948,7 +11226,6 @@ mod tests {
         let found = detect_resumable_tracker(
             &adapter,
             "owner/repo",
-            &[],
             crate::commands::record::RecordProfile::Tracking,
             &identity,
         )
@@ -7957,11 +11234,38 @@ mod tests {
     }
 
     #[test]
+    fn detect_resumable_tracker_propagates_candidate_evidence_read_failures() {
+        let adapter = ResumeFakeAdapter {
+            open_issues: vec![7],
+            ..Default::default()
+        };
+        let identity = BundleIdentity {
+            source_path: "docs/plans/x/x-discussion-source.md".to_string(),
+            source_commit: "abc123".to_string(),
+        };
+
+        let error = detect_resumable_tracker(
+            &adapter,
+            "owner/repo",
+            crate::commands::record::RecordProfile::Tracking,
+            &identity,
+        )
+        .expect_err("provider read failure must stop duplicate tracker creation");
+
+        assert_eq!(error.code, "record-open-evidence-read-failed");
+        assert!(error.message.contains("candidate issue 7"), "{error:?}");
+    }
+
+    #[test]
     fn record_open_resume_attaches_only_missing_roles() {
-        let wanted = source_identity_comment("docs/plans/x/x-discussion-source.md", "abc123");
+        let state_lock = GlobalStateLock::new();
+        let (_state, _state_env) = isolate_record_open_state(&state_lock);
+        let seed = resume_seed();
+        let wanted = seed.source_body.clone();
         let comments_json = comments_envelope(&[&wanted]);
+        let identity_body = record_identity_body(&seed);
         let audit = lifecycle_record::audit_record(
-            Some("body-7"),
+            Some(&identity_body),
             &comments_json,
             Some(crate::commands::record::RecordProfile::Tracking),
         )
@@ -7971,21 +11275,25 @@ mod tests {
         assert!(audit.missing_required.iter().any(|c| c == "plan-missing"));
 
         let mut evidence = HashMap::new();
-        evidence.insert(7, ("body-7".to_string(), comments_json));
+        evidence.insert(7, (identity_body, comments_json));
         let adapter = ResumeFakeAdapter {
             evidence,
             ..Default::default()
         };
-        let seed = resume_seed();
+        let identity = BundleIdentity {
+            source_path: seed.source_path.clone(),
+            source_commit: seed.source_commit.clone(),
+        };
+        let repo = record_open_test_repo("owner/resume-missing-roles");
 
         let result = record_open_resume(
             &adapter,
-            "owner/repo",
+            &repo,
             crate::commands::record::RecordProfile::Tracking,
             &seed,
             7,
             "https://github.com/owner/repo/issues/7",
-            &audit,
+            &identity,
             "binary",
         )
         .expect("resume must succeed");
@@ -7996,18 +11304,98 @@ mod tests {
         // to issue 7.
         assert_eq!(result["attached"], json!(["plan", "state"]));
         assert_eq!(*adapter.comment_calls.lock().unwrap(), vec![7, 7]);
+        let (body, comments_json) = adapter
+            .issue_evidence("owner/repo", 7)
+            .expect("provider-visible posted comments");
+        let converged = lifecycle_record::audit_record(
+            Some(&body),
+            &comments_json,
+            Some(crate::commands::record::RecordProfile::Tracking),
+        )
+        .expect("audit provider-visible comments");
+        assert!(
+            converged.missing_required.is_empty(),
+            "missing={:?} evidence={:?}",
+            converged.missing_required,
+            converged.evidence.keys().collect::<Vec<_>>()
+        );
+        assert_eq!(
+            converged
+                .evidence
+                .keys()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            vec!["plan", "source", "state"]
+        );
         assert_eq!(*adapter.edited.lock().unwrap(), vec![7]);
         assert!(adapter.closed.lock().unwrap().is_empty());
     }
 
     #[test]
-    fn record_open_resume_is_noop_when_all_roles_present() {
-        let source = source_identity_comment("docs/plans/x/x-discussion-source.md", "abc123");
+    fn record_open_resume_posts_only_state_for_source_plan_partial_tracker() {
+        let state_lock = GlobalStateLock::new();
+        let (_state, _state_env) = isolate_record_open_state(&state_lock);
+        let seed = resume_seed();
+        let comments_json = comments_envelope(&[&seed.source_body, &seed.plan_body]);
+        let identity_body = record_identity_body(&seed);
+        let audit = lifecycle_record::audit_record(
+            Some(&identity_body),
+            &comments_json,
+            Some(crate::commands::record::RecordProfile::Tracking),
+        )
+        .expect("audit");
+        assert_eq!(audit.missing_required, vec!["state-missing"]);
+        let mut evidence = HashMap::new();
+        evidence.insert(7, (identity_body, comments_json));
+        let adapter = ResumeFakeAdapter {
+            evidence,
+            ..Default::default()
+        };
+        let identity = BundleIdentity {
+            source_path: seed.source_path.clone(),
+            source_commit: seed.source_commit.clone(),
+        };
+        let repo = record_open_test_repo("owner/resume-state-only");
+
+        let result = record_open_resume(
+            &adapter,
+            &repo,
+            crate::commands::record::RecordProfile::Tracking,
+            &seed,
+            7,
+            "https://github.com/owner/repo/issues/7",
+            &identity,
+            "binary",
+        )
+        .expect("resume must succeed");
+
+        assert_eq!(result["attached"], json!(["state"]));
+        let bodies = adapter.comment_bodies.lock().unwrap();
+        assert_eq!(bodies.len(), 1);
+        let posted = comments_envelope(&[bodies[0].1.as_str()]);
+        let posted_audit = lifecycle_record::audit_record(
+            None,
+            &posted,
+            Some(crate::commands::record::RecordProfile::Tracking),
+        )
+        .expect("audit posted state body");
+        assert!(posted_audit.evidence.contains_key("state"));
+        assert!(!posted_audit.evidence.contains_key("source"));
+        assert!(!posted_audit.evidence.contains_key("plan"));
+    }
+
+    #[test]
+    fn record_open_resume_converges_dashboard_when_all_roles_present() {
+        let state_lock = GlobalStateLock::new();
+        let (_state, _state_env) = isolate_record_open_state(&state_lock);
+        let seed = resume_seed();
+        let identity_body = record_identity_body(&seed);
+        let source = seed.source_body.clone();
         let plan = v2_marker_comment("plan");
         let state = v2_marker_comment("state");
         let comments_json = comments_envelope(&[&source, &plan, &state]);
         let audit = lifecycle_record::audit_record(
-            Some("body-7"),
+            Some(&identity_body),
             &comments_json,
             Some(crate::commands::record::RecordProfile::Tracking),
         )
@@ -8018,61 +11406,729 @@ mod tests {
             audit.missing_required
         );
 
-        let adapter = ResumeFakeAdapter::default();
-        let seed = resume_seed();
+        let mut evidence = HashMap::new();
+        evidence.insert(7, (identity_body, comments_json));
+        let adapter = ResumeFakeAdapter {
+            evidence,
+            ..Default::default()
+        };
+        let identity = BundleIdentity {
+            source_path: seed.source_path.clone(),
+            source_commit: seed.source_commit.clone(),
+        };
+        let repo = record_open_test_repo("owner/resume-complete");
 
         let result = record_open_resume(
             &adapter,
-            "owner/repo",
+            &repo,
             crate::commands::record::RecordProfile::Tracking,
             &seed,
             7,
             "https://github.com/owner/repo/issues/7",
-            &audit,
+            &identity,
             "binary",
         )
         .expect("resume must succeed");
 
         assert_eq!(result["mode"], "already-open");
         assert!(adapter.comment_calls.lock().unwrap().is_empty());
+        assert_eq!(*adapter.edited.lock().unwrap(), vec![7]);
+    }
+
+    #[test]
+    fn record_open_resume_revalidates_direct_body_marker_after_issue_lock() {
+        let state_lock = GlobalStateLock::new();
+        let (_state, _state_env) = isolate_record_open_state(&state_lock);
+        let seed = resume_seed();
+        let comments_json = comments_envelope(&[&seed.source_body]);
+        let mut evidence = HashMap::new();
+        evidence.insert(7, ("body marker removed".to_string(), comments_json));
+        let repo = record_open_test_repo("owner/resume-revalidation");
+        let adapter = ResumeFakeAdapter {
+            evidence,
+            require_lifecycle_lock_on_evidence: Some((
+                repo.clone(),
+                crate::commands::record::RecordProfile::Tracking,
+            )),
+            ..Default::default()
+        };
+        let identity = BundleIdentity {
+            source_path: seed.source_path.clone(),
+            source_commit: seed.source_commit.clone(),
+        };
+
+        let error = record_open_resume(
+            &adapter,
+            &repo,
+            crate::commands::record::RecordProfile::Tracking,
+            &seed,
+            7,
+            "https://github.com/owner/repo/issues/7",
+            &identity,
+            "binary",
+        )
+        .expect_err("historical source-comment fallback must not pass resume revalidation");
+
+        assert_eq!(error.code, "record-open-identity-changed");
+        assert!(adapter.comment_calls.lock().unwrap().is_empty());
         assert!(adapter.edited.lock().unwrap().is_empty());
     }
 
     #[test]
-    fn record_open_finalize_leaves_partial_tracker_after_source_posts() {
+    fn record_open_resume_rejects_post_lock_historical_identity_conflict() {
+        let state_lock = GlobalStateLock::new();
+        let (_state, _state_env) = isolate_record_open_state(&state_lock);
+        let seed = resume_seed();
+        let conflicting_source =
+            source_identity_comment("docs/plans/other/source.md", "other-commit");
+        let mut evidence = HashMap::new();
+        evidence.insert(
+            7,
+            (
+                record_identity_body(&seed),
+                comments_envelope(&[&conflicting_source]),
+            ),
+        );
+        let adapter = ResumeFakeAdapter {
+            evidence,
+            ..Default::default()
+        };
+        let identity = BundleIdentity {
+            source_path: seed.source_path.clone(),
+            source_commit: seed.source_commit.clone(),
+        };
+        let repo = record_open_test_repo("owner/resume-historical-conflict");
+        let issue_url = repo.issue_url(7);
+
+        let error = record_open_resume(
+            &adapter,
+            &repo,
+            crate::commands::record::RecordProfile::Tracking,
+            &seed,
+            7,
+            &issue_url,
+            &identity,
+            "binary",
+        )
+        .expect_err("trusted and historical identity conflict must fail closed");
+
+        assert_eq!(error.code, "record-open-identity-repair-required");
+        assert_eq!(adapter.comment_attempts.load(Ordering::SeqCst), 0);
+        assert!(adapter.edited.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn record_open_unproven_comment_error_persists_intent_and_retry_does_not_repost() {
+        let state_lock = GlobalStateLock::new();
+        let (state, _state_env) = isolate_record_open_state(&state_lock);
         let adapter = ResumeFakeAdapter {
             create_number: 1,
-            // Fail the 2nd comment post (plan), i.e. after the source comment.
             fail_on_nth_comment: Some(2),
             ..Default::default()
         };
         let seed = resume_seed();
+        let repo = record_open_test_repo("owner/unproven-comment");
+        let body_path = record_open_body_file(state.path(), &seed);
 
-        let err = record_open_finalize(
+        let first = record_open_finalize(
             &adapter,
-            "owner/repo",
+            &repo,
             crate::commands::record::RecordProfile::Tracking,
-            Path::new("/tmp/record-open-partial-body.md"),
+            &body_path,
             &[],
             &seed,
             "binary",
         )
-        .expect_err("a failed plan post must surface an error");
-
-        assert_eq!(err.code, "record-open-plan-post-failed");
-        assert!(
-            err.message.contains("partial tracker left open") && err.message.contains("#1"),
-            "expected a leave-partial note, got: {}",
-            err.message
-        );
-        // The source comment posted, so the tracker is identifiable and must NOT
-        // be rolled back — the next run resumes it.
-        assert!(
-            adapter.closed.lock().unwrap().is_empty(),
-            "must not roll back once the source comment has posted"
-        );
-        // Exactly one successful post (source) happened before the plan failure.
+        .expect_err("unproven plan comment outcome must stop");
+        assert_eq!(first.code, "record-open-outcome-unknown");
+        assert_eq!(adapter.create_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(adapter.comment_attempts.load(Ordering::SeqCst), 2);
         assert_eq!(*adapter.comment_calls.lock().unwrap(), vec![1]);
+
+        let intent = RecordOpenIntentStore::new(
+            &repo,
+            crate::commands::record::RecordProfile::Tracking,
+            &seed.source_path,
+            &seed.source_commit,
+        );
+        assert!(matches!(
+            intent.load().expect("persisted intent"),
+            Some(RecordOpenIntentState::CommentInFlight {
+                role: lifecycle_record::PayloadRole::Plan,
+                ..
+            })
+        ));
+
+        let retry = record_open_finalize(
+            &adapter,
+            &repo,
+            crate::commands::record::RecordProfile::Tracking,
+            &body_path,
+            &[],
+            &seed,
+            "binary",
+        )
+        .expect_err("identical retry must remain outcome-unknown without reposting");
+        assert_eq!(retry.code, "record-open-outcome-unknown");
+        assert_eq!(adapter.create_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(adapter.comment_attempts.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn record_open_success_without_visible_comment_retains_intent_and_never_reposts() {
+        let state_lock = GlobalStateLock::new();
+        let (state, _state_env) = isolate_record_open_state(&state_lock);
+        let adapter = ResumeFakeAdapter {
+            create_number: 7,
+            hide_posted_comments: true,
+            ..Default::default()
+        };
+        let seed = resume_seed();
+        let repo = record_open_test_repo("owner/success-with-stale-readback");
+        let body_path = record_open_body_file(state.path(), &seed);
+
+        let first = record_open_finalize(
+            &adapter,
+            &repo,
+            crate::commands::record::RecordProfile::Tracking,
+            &body_path,
+            &[],
+            &seed,
+            "binary",
+        )
+        .expect_err("a success response without semantic evidence remains uncertain");
+        assert_eq!(first.code, "record-open-outcome-unknown");
+        assert_eq!(adapter.comment_attempts.load(Ordering::SeqCst), 1);
+
+        let intent = RecordOpenIntentStore::new(
+            &repo,
+            crate::commands::record::RecordProfile::Tracking,
+            &seed.source_path,
+            &seed.source_commit,
+        );
+        assert!(matches!(
+            intent.load().expect("pending source intent"),
+            Some(RecordOpenIntentState::CommentInFlight {
+                role: lifecycle_record::PayloadRole::Source,
+                ..
+            })
+        ));
+
+        let retry = record_open_finalize(
+            &adapter,
+            &repo,
+            crate::commands::record::RecordProfile::Tracking,
+            &body_path,
+            &[],
+            &seed,
+            "binary",
+        )
+        .expect_err("retry must reconcile the retained source intent without reposting");
+        assert_eq!(retry.code, "record-open-outcome-unknown");
+        assert_eq!(adapter.comment_attempts.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn record_open_pending_comment_read_uncertainty_stays_outcome_unknown_without_repost() {
+        let state_lock = GlobalStateLock::new();
+        let (state, _state_env) = isolate_record_open_state(&state_lock);
+        let adapter = ResumeFakeAdapter::default();
+        let seed = resume_seed();
+        let repo = record_open_test_repo("owner/pending-comment-read-uncertainty");
+        let body_path = record_open_body_file(state.path(), &seed);
+        let expected_payload =
+            lifecycle_record::extract_payload(&seed.source_body).expect("rendered source payload");
+        let intent = RecordOpenIntentStore::new(
+            &repo,
+            crate::commands::record::RecordProfile::Tracking,
+            &seed.source_path,
+            &seed.source_commit,
+        );
+        intent
+            .persist_comment_in_flight(7, &expected_payload)
+            .expect("persist pending source comment");
+
+        let error = record_open_finalize(
+            &adapter,
+            &repo,
+            crate::commands::record::RecordProfile::Tracking,
+            &body_path,
+            &[],
+            &seed,
+            "binary",
+        )
+        .expect_err("uncertain readback must retain the pending comment intent");
+
+        assert_eq!(error.code, "record-open-outcome-unknown");
+        assert!(error.message.contains("source comment"), "{error:?}");
+        assert_eq!(adapter.create_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(adapter.comment_attempts.load(Ordering::SeqCst), 0);
+        assert!(matches!(
+            intent.load().expect("retained pending intent"),
+            Some(RecordOpenIntentState::CommentInFlight {
+                role: lifecycle_record::PayloadRole::Source,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn record_open_corrupt_intent_stops_before_provider_writes() {
+        let state_lock = GlobalStateLock::new();
+        let (state, _state_env) = isolate_record_open_state(&state_lock);
+        let adapter = ResumeFakeAdapter::default();
+        let seed = resume_seed();
+        let repo = record_open_test_repo("owner/corrupt-intent");
+        let body_path = record_open_body_file(state.path(), &seed);
+        let intent = RecordOpenIntentStore::new(
+            &repo,
+            crate::commands::record::RecordProfile::Tracking,
+            &seed.source_path,
+            &seed.source_commit,
+        );
+        fs::create_dir_all(intent.path().parent().expect("intent parent"))
+            .expect("create intent parent");
+        fs::write(intent.path(), b"{corrupt").expect("write corrupt intent");
+
+        let error = record_open_finalize(
+            &adapter,
+            &repo,
+            crate::commands::record::RecordProfile::Tracking,
+            &body_path,
+            &[],
+            &seed,
+            "binary",
+        )
+        .expect_err("corrupt journal must fail closed");
+
+        assert_eq!(error.code, "record-open-intent-invalid");
+        assert_eq!(adapter.create_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(adapter.comment_attempts.load(Ordering::SeqCst), 0);
+        assert!(adapter.edited.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn record_open_create_store_then_error_recovers_without_second_create() {
+        let state_lock = GlobalStateLock::new();
+        let (state, _state_env) = isolate_record_open_state(&state_lock);
+        let adapter = ResumeFakeAdapter {
+            create_number: 7,
+            create_store_then_error: true,
+            ..Default::default()
+        };
+        let seed = resume_seed();
+        let repo = record_open_test_repo("owner/create-store-then-error");
+        let body_path = record_open_body_file(state.path(), &seed);
+
+        let result = record_open_finalize(
+            &adapter,
+            &repo,
+            crate::commands::record::RecordProfile::Tracking,
+            &body_path,
+            &["requested-label".to_string()],
+            &seed,
+            "binary",
+        )
+        .expect("visible exact identity marker must prove the ambiguous create");
+
+        assert_eq!(result["issue"]["number"], 7);
+        assert_eq!(adapter.create_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(adapter.comment_attempts.load(Ordering::SeqCst), 3);
+        let intent = RecordOpenIntentStore::new(
+            &repo,
+            crate::commands::record::RecordProfile::Tracking,
+            &seed.source_path,
+            &seed.source_commit,
+        );
+        assert!(intent.load().expect("intent cleared").is_none());
+    }
+
+    #[test]
+    fn record_open_unproven_create_error_persists_intent_and_retry_does_not_create() {
+        let state_lock = GlobalStateLock::new();
+        let (state, _state_env) = isolate_record_open_state(&state_lock);
+        let adapter = ResumeFakeAdapter {
+            create_number: 7,
+            create_unproven_error: true,
+            ..Default::default()
+        };
+        let seed = resume_seed();
+        let repo = record_open_test_repo("owner/unproven-create");
+        let body_path = record_open_body_file(state.path(), &seed);
+
+        let first = record_open_finalize(
+            &adapter,
+            &repo,
+            crate::commands::record::RecordProfile::Tracking,
+            &body_path,
+            &[],
+            &seed,
+            "binary",
+        )
+        .expect_err("zero trusted markers cannot prove an ambiguous create");
+        assert_eq!(first.code, "record-open-outcome-unknown");
+        assert_eq!(adapter.create_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(adapter.comment_attempts.load(Ordering::SeqCst), 0);
+
+        let intent = RecordOpenIntentStore::new(
+            &repo,
+            crate::commands::record::RecordProfile::Tracking,
+            &seed.source_path,
+            &seed.source_commit,
+        );
+        assert!(matches!(
+            intent.load().expect("persisted create intent"),
+            Some(RecordOpenIntentState::CreateInFlight)
+        ));
+
+        let retry = record_open_finalize(
+            &adapter,
+            &repo,
+            crate::commands::record::RecordProfile::Tracking,
+            &body_path,
+            &[],
+            &seed,
+            "binary",
+        )
+        .expect_err("retry must reconcile instead of creating again");
+        assert_eq!(retry.code, "record-open-outcome-unknown");
+        assert_eq!(adapter.create_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(adapter.comment_attempts.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn record_open_comment_store_then_error_recovers_without_second_append() {
+        let state_lock = GlobalStateLock::new();
+        let (state, _state_env) = isolate_record_open_state(&state_lock);
+        let adapter = ResumeFakeAdapter {
+            create_number: 7,
+            store_then_fail_on_nth_comment: Some(1),
+            ..Default::default()
+        };
+        let seed = resume_seed();
+        let repo = record_open_test_repo("owner/comment-store-then-error");
+        let body_path = record_open_body_file(state.path(), &seed);
+
+        let result = record_open_finalize(
+            &adapter,
+            &repo,
+            crate::commands::record::RecordProfile::Tracking,
+            &body_path,
+            &[],
+            &seed,
+            "binary",
+        )
+        .expect("semantic provider evidence must prove the ambiguous source append");
+
+        assert_eq!(result["issue"]["number"], 7);
+        assert_eq!(adapter.create_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(adapter.comment_attempts.load(Ordering::SeqCst), 3);
+        let source_appends = adapter
+            .comment_bodies
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, body)| {
+                lifecycle_record::extract_payload(body)
+                    .is_ok_and(|payload| payload.role == lifecycle_record::PayloadRole::Source)
+            })
+            .count();
+        assert_eq!(source_appends, 1);
+        let intent = RecordOpenIntentStore::new(
+            &repo,
+            crate::commands::record::RecordProfile::Tracking,
+            &seed.source_path,
+            &seed.source_commit,
+        );
+        assert!(intent.load().expect("intent cleared").is_none());
+    }
+
+    #[test]
+    fn record_open_persists_write_ahead_intents_before_provider_calls() {
+        let state_lock = GlobalStateLock::new();
+        let (state, _state_env) = isolate_record_open_state(&state_lock);
+        let seed = resume_seed();
+        let repo = record_open_test_repo("owner/write-ahead-intents");
+        let body_path = record_open_body_file(state.path(), &seed);
+        let adapter = ResumeFakeAdapter {
+            create_number: 7,
+            intent_probe: Some(RecordOpenIntentStore::new(
+                &repo,
+                crate::commands::record::RecordProfile::Tracking,
+                &seed.source_path,
+                &seed.source_commit,
+            )),
+            ..Default::default()
+        };
+
+        record_open_finalize(
+            &adapter,
+            &repo,
+            crate::commands::record::RecordProfile::Tracking,
+            &body_path,
+            &[],
+            &seed,
+            "binary",
+        )
+        .expect("record open must converge");
+
+        assert_eq!(*adapter.observed_create_intent.lock().unwrap(), Some(true));
+        assert_eq!(
+            *adapter.observed_comment_intents.lock().unwrap(),
+            vec![true, true, true]
+        );
+    }
+
+    #[test]
+    fn record_open_rejects_stale_pending_payload_before_provider_writes() {
+        let state_lock = GlobalStateLock::new();
+        let (state, _state_env) = isolate_record_open_state(&state_lock);
+        let seed = resume_seed();
+        let repo = record_open_test_repo("owner/stale-pending-payload");
+        let body_path = record_open_body_file(state.path(), &seed);
+        let intent = RecordOpenIntentStore::new(
+            &repo,
+            crate::commands::record::RecordProfile::Tracking,
+            &seed.source_path,
+            &seed.source_commit,
+        );
+        let mut stale_payload =
+            lifecycle_record::extract_payload(&seed.source_body).expect("source payload");
+        stale_payload.data["summary"] = json!("stale local snapshot");
+        intent
+            .persist_comment_in_flight(7, &stale_payload)
+            .expect("persist stale pending payload");
+        let adapter = ResumeFakeAdapter::default();
+
+        let error = record_open_finalize(
+            &adapter,
+            &repo,
+            crate::commands::record::RecordProfile::Tracking,
+            &body_path,
+            &[],
+            &seed,
+            "binary",
+        )
+        .expect_err("stale pending payload must fail closed");
+
+        assert_eq!(error.code, "record-open-intent-invalid");
+        assert_eq!(adapter.create_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(adapter.comment_attempts.load(Ordering::SeqCst), 0);
+        assert!(adapter.edited.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn record_open_pending_comment_semantic_mismatch_never_reposts() {
+        let state_lock = GlobalStateLock::new();
+        let (state, _state_env) = isolate_record_open_state(&state_lock);
+        let seed = resume_seed();
+        let repo = record_open_test_repo("owner/pending-semantic-mismatch");
+        let body_path = record_open_body_file(state.path(), &seed);
+        let expected_payload =
+            lifecycle_record::extract_payload(&seed.source_body).expect("source payload");
+        let mut snapshot = expected_payload.parse_snapshot().expect("source snapshot");
+        snapshot.summary = Some("different provider-visible snapshot".to_string());
+        let mismatched_source = lifecycle_record::render_record_snapshot_comment(
+            crate::commands::record::RecordProfile::Tracking,
+            LifecycleCommentKind::Source,
+            &snapshot,
+            "different source contents",
+            Some("2026-07-18T00:00:00Z"),
+        )
+        .expect("mismatched source comment");
+        let mut evidence = HashMap::new();
+        evidence.insert(
+            7,
+            (
+                record_identity_body(&seed),
+                comments_envelope(&[&mismatched_source]),
+            ),
+        );
+        let adapter = ResumeFakeAdapter {
+            evidence,
+            ..Default::default()
+        };
+        let intent = RecordOpenIntentStore::new(
+            &repo,
+            crate::commands::record::RecordProfile::Tracking,
+            &seed.source_path,
+            &seed.source_commit,
+        );
+        intent
+            .persist_comment_in_flight(7, &expected_payload)
+            .expect("persist pending source payload");
+
+        let error = record_open_finalize(
+            &adapter,
+            &repo,
+            crate::commands::record::RecordProfile::Tracking,
+            &body_path,
+            &[],
+            &seed,
+            "binary",
+        )
+        .expect_err("same-role semantic mismatch must remain outcome-unknown");
+
+        assert_eq!(error.code, "record-open-outcome-unknown");
+        assert_eq!(adapter.comment_attempts.load(Ordering::SeqCst), 0);
+        assert!(matches!(
+            intent.load().expect("retained pending intent"),
+            Some(RecordOpenIntentState::CommentInFlight { .. })
+        ));
+    }
+
+    #[test]
+    fn record_open_intent_cleanup_failure_is_an_error() {
+        let state_lock = GlobalStateLock::new();
+        let (state, _state_env) = isolate_record_open_state(&state_lock);
+        let seed = resume_seed();
+        let repo = record_open_test_repo("owner/cleanup-failure");
+        let body_path = record_open_body_file(state.path(), &seed);
+        let adapter = ResumeFakeAdapter {
+            create_number: 7,
+            intent_probe: Some(RecordOpenIntentStore::new(
+                &repo,
+                crate::commands::record::RecordProfile::Tracking,
+                &seed.source_path,
+                &seed.source_commit,
+            )),
+            break_intent_cleanup: true,
+            ..Default::default()
+        };
+
+        let error = record_open_finalize(
+            &adapter,
+            &repo,
+            crate::commands::record::RecordProfile::Tracking,
+            &body_path,
+            &[],
+            &seed,
+            "binary",
+        )
+        .expect_err("journal cleanup failure must fail the operation");
+
+        assert_eq!(error.code, "record-open-intent-cleanup-failed");
+        assert_eq!(adapter.create_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(adapter.comment_attempts.load(Ordering::SeqCst), 3);
+    }
+
+    #[test]
+    fn record_open_mismatched_intent_stops_before_provider_writes() {
+        let state_lock = GlobalStateLock::new();
+        let (state, _state_env) = isolate_record_open_state(&state_lock);
+        let seed = resume_seed();
+        let repo = record_open_test_repo("owner/mismatched-intent");
+        let body_path = record_open_body_file(state.path(), &seed);
+        let intent = RecordOpenIntentStore::new(
+            &repo,
+            crate::commands::record::RecordProfile::Tracking,
+            &seed.source_path,
+            &seed.source_commit,
+        );
+        intent
+            .persist_create_in_flight()
+            .expect("persist valid intent");
+        let mut raw: Value = serde_json::from_slice(
+            &fs::read(intent.path()).expect("read persisted intent for tampering"),
+        )
+        .expect("parse persisted intent");
+        raw["identity"]["source_path"] = json!("docs/plans/other/source.md");
+        fs::write(
+            intent.path(),
+            serde_json::to_vec(&raw).expect("serialize mismatched intent"),
+        )
+        .expect("write mismatched intent");
+        let adapter = ResumeFakeAdapter::default();
+
+        let error = record_open_finalize(
+            &adapter,
+            &repo,
+            crate::commands::record::RecordProfile::Tracking,
+            &body_path,
+            &[],
+            &seed,
+            "binary",
+        )
+        .expect_err("mismatched journal must fail closed");
+
+        assert_eq!(error.code, "record-open-intent-invalid");
+        assert_eq!(adapter.create_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(adapter.comment_attempts.load(Ordering::SeqCst), 0);
+        assert!(adapter.edited.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn record_open_unreadable_intent_stops_before_provider_writes() {
+        let state_lock = GlobalStateLock::new();
+        let (state, _state_env) = isolate_record_open_state(&state_lock);
+        let seed = resume_seed();
+        let repo = record_open_test_repo("owner/unreadable-intent");
+        let body_path = record_open_body_file(state.path(), &seed);
+        let intent = RecordOpenIntentStore::new(
+            &repo,
+            crate::commands::record::RecordProfile::Tracking,
+            &seed.source_path,
+            &seed.source_commit,
+        );
+        fs::create_dir_all(intent.path()).expect("replace journal file with unreadable directory");
+        let adapter = ResumeFakeAdapter::default();
+
+        let error = record_open_finalize(
+            &adapter,
+            &repo,
+            crate::commands::record::RecordProfile::Tracking,
+            &body_path,
+            &[],
+            &seed,
+            "binary",
+        )
+        .expect_err("unreadable journal must fail closed");
+
+        assert_eq!(error.code, "record-open-intent-read-failed");
+        assert_eq!(adapter.create_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(adapter.comment_attempts.load(Ordering::SeqCst), 0);
+        assert!(adapter.edited.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn record_open_unknown_create_rejects_historical_only_ambiguity() {
+        let state_lock = GlobalStateLock::new();
+        let (state, _state_env) = isolate_record_open_state(&state_lock);
+        let seed = resume_seed();
+        let repo = record_open_test_repo("owner/create-historical-ambiguity");
+        let body_path = record_open_body_file(state.path(), &seed);
+        let adapter = ResumeFakeAdapter {
+            open_issues: vec![2],
+            evidence: HashMap::from([(
+                2,
+                (
+                    "historical tracker".to_string(),
+                    comments_envelope(&[&seed.source_body]),
+                ),
+            )]),
+            create_number: 7,
+            create_store_then_error: true,
+            ..Default::default()
+        };
+
+        let error = record_open_finalize(
+            &adapter,
+            &repo,
+            crate::commands::record::RecordProfile::Tracking,
+            &body_path,
+            &["creation-label".to_string()],
+            &seed,
+            "binary",
+        )
+        .expect_err("historical-only create reconciliation ambiguity must fail closed");
+
+        assert_eq!(error.code, "record-open-outcome-unknown");
+        assert_eq!(adapter.create_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(adapter.comment_attempts.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            *adapter.listed_labels.lock().unwrap(),
+            vec![Vec::<String>::new()]
+        );
     }
 
     #[test]
@@ -8247,7 +12303,8 @@ mod tests {
         );
         run.execution_state_file = Some(ledger.clone());
 
-        let payload = state_checkpoint_payload(&run);
+        let snapshot = execution_state_snapshot_for_test(&ledger);
+        let payload = state_checkpoint_payload(&run, Some(&snapshot));
         let tasks = payload["tasks"].as_array().expect("tasks array");
         assert_eq!(tasks.len(), 4, "hidden payload must carry the full ledger");
         let ids: Vec<&str> = tasks.iter().map(|t| t["id"].as_str().unwrap()).collect();
@@ -8275,7 +12332,7 @@ mod tests {
             "2026-05-29T00:00:00Z",
         );
         bare.execution_state_file = None;
-        let baseline = state_checkpoint_payload(&bare);
+        let baseline = state_checkpoint_payload(&bare, None);
         assert_eq!(
             baseline["tasks"].as_array().expect("tasks array").len(),
             1,
@@ -8284,12 +12341,11 @@ mod tests {
     }
 
     #[test]
-    fn state_checkpoint_payload_resolves_ledger_from_bundle_when_only_bundle_recorded() {
+    fn state_checkpoint_payload_consumes_bundle_discovered_snapshot() {
         // graysurf/plan-tracking-testbed#55: the canonical `tracking run init
         // --bundle <dir>` flow records only `bundle` (no `execution_state_file`).
-        // The state payload must discover the bundle's `*-execution-state.md` and
-        // carry the FULL ledger, not silently fall back to the single-row
-        // synthesized baseline.
+        // Once the command resolver discovers the bundle's unique state file,
+        // the payload must consume that snapshot and carry the FULL ledger.
         use crate::tracking::run_state::{ExecutionRun, RunPhase};
 
         let tmp = TempDir::new().expect("tempdir");
@@ -8323,7 +12379,8 @@ mod tests {
             "this case covers --bundle with no explicit execution-state file"
         );
 
-        let payload = state_checkpoint_payload(&run);
+        let snapshot = execution_state_snapshot_for_test(&bundle.join("slug-execution-state.md"));
+        let payload = state_checkpoint_payload(&run, Some(&snapshot));
         let tasks = payload["tasks"].as_array().expect("tasks array");
         assert_eq!(
             tasks.len(),
@@ -8387,7 +12444,7 @@ mod tests {
         assert_eq!(run.pr.as_ref().unwrap().r#ref, "owner/repo#1");
         assert_eq!(run.linked_prs.len(), 2, "ref dedup keeps two lane PRs");
 
-        let payload = state_checkpoint_payload(&run);
+        let payload = state_checkpoint_payload(&run, None);
         let refs: Vec<&str> = payload["prs"]
             .as_array()
             .expect("prs array")
@@ -8414,7 +12471,7 @@ mod tests {
             RunPhase::Implementing,
             "2026-05-29T00:00:00Z",
         );
-        let bare_prs = state_checkpoint_payload(&bare)["prs"].clone();
+        let bare_prs = state_checkpoint_payload(&bare, None)["prs"].clone();
         assert!(
             bare_prs.as_array().map(|a| a.is_empty()).unwrap_or(true),
             "no linked PR -> prs stays empty"
@@ -8458,8 +12515,9 @@ mod tests {
             RunPhase::ReadyForClose,
             "2026-05-30T00:00:00Z",
         );
-        run.execution_state_file = Some(done);
-        let payload = state_checkpoint_payload(&run);
+        run.execution_state_file = Some(done.clone());
+        let done_snapshot = execution_state_snapshot_for_test(&done);
+        let payload = state_checkpoint_payload(&run, Some(&done_snapshot));
         assert_eq!(
             payload["current"], "complete",
             "all rows terminal -> current=complete"
@@ -8502,8 +12560,9 @@ mod tests {
             RunPhase::Implementing,
             "2026-05-30T00:00:00Z",
         );
-        run_mid.execution_state_file = Some(mid);
-        let mid_payload = state_checkpoint_payload(&run_mid);
+        run_mid.execution_state_file = Some(mid.clone());
+        let mid_snapshot = execution_state_snapshot_for_test(&mid);
+        let mid_payload = state_checkpoint_payload(&run_mid, Some(&mid_snapshot));
         assert_eq!(
             mid_payload["current"], "1.2",
             "current = first non-terminal ledger row"
@@ -8513,6 +12572,14 @@ mod tests {
             "next_action = next non-terminal ledger row"
         );
         assert_eq!(mid_payload["target_scope"], "demo scope");
+
+        // A premature terminal phase must not hide unfinished ledger rows behind
+        // the canonical `complete` / `closeout` projection.
+        let mut premature = run_mid.clone();
+        premature.phase = RunPhase::ReadyForClose;
+        let premature_payload = state_checkpoint_payload(&premature, Some(&mid_snapshot));
+        assert_eq!(premature_payload["current"], "1.2");
+        assert_eq!(premature_payload["next_action"], "1.3");
     }
 
     #[test]
@@ -8547,9 +12614,10 @@ mod tests {
             RunPhase::Implementing,
             "2026-05-29T00:00:00Z",
         );
-        run.execution_state_file = Some(ledger);
+        run.execution_state_file = Some(ledger.clone());
 
-        let payload = state_checkpoint_payload(&run);
+        let snapshot = execution_state_snapshot_for_test(&ledger);
+        let payload = state_checkpoint_payload(&run, Some(&snapshot));
         let tasks = payload["tasks"].as_array().expect("tasks array");
         assert_eq!(
             tasks.len(),
@@ -8575,7 +12643,7 @@ mod tests {
             "2026-05-29T00:00:00Z",
         );
 
-        let marker = |profile| match render_checkpoint_role(PayloadRole::State, &run, profile)
+        let marker = |profile| match render_checkpoint_role(PayloadRole::State, &run, profile, None)
             .expect("render")
         {
             CheckpointRoleResult::Rendered(body) => body,
@@ -8848,14 +12916,47 @@ mod tests {
         );
 
         let markdown = write_temp_markdown("status", "hello").expect("write temp markdown");
+        let second_markdown =
+            write_temp_markdown("status", "world").expect("write second temp markdown");
+        assert_ne!(
+            markdown, second_markdown,
+            "temporary bodies with one stem must never overwrite each other"
+        );
         assert!(
             markdown
+                .physical_path()
                 .to_string_lossy()
                 .contains("plan-issue-delivery/tmp")
         );
         assert_eq!(
             fs::read_to_string(&markdown).expect("read markdown"),
             "hello"
+        );
+        assert_eq!(
+            fs::read_to_string(&second_markdown).expect("read second markdown"),
+            "world"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            assert_eq!(
+                fs::metadata(&markdown)
+                    .expect("temporary markdown metadata")
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+        }
+        let markdown_path = markdown.physical_path().to_path_buf();
+        let second_markdown_path = second_markdown.physical_path().to_path_buf();
+        drop(markdown);
+        drop(second_markdown);
+        assert!(!markdown_path.exists(), "temporary body must be unlinked");
+        assert!(
+            !second_markdown_path.exists(),
+            "second temporary body must be unlinked"
         );
 
         let issue_root = runtime_layout::IssueRoot::new("owner__sample", 7).expect("issue root");
@@ -8894,6 +12995,169 @@ mod tests {
         assert_eq!(
             file_path.file_name().and_then(|name| name.to_str()),
             Some("S3T1.md")
+        );
+    }
+
+    #[test]
+    fn temp_markdown_retries_create_new_collision_without_overwrite() {
+        let dir = TempDir::new().expect("tempdir");
+        let dir_handle =
+            ensure_private_temp_markdown_dir(dir.path()).expect("secure temp directory");
+        let timestamp = 123_u128;
+        let process_id = 456_u32;
+        let sequence = AtomicU64::new(0);
+        let collision = dir.path().join("status-123-456-0.md");
+        fs::write(&collision, "sentinel").expect("seed collision");
+
+        let markdown = write_temp_markdown_in(
+            &dir_handle,
+            "status",
+            "provider body",
+            timestamp,
+            process_id,
+            &sequence,
+        )
+        .expect("retry after collision");
+
+        assert_eq!(
+            markdown
+                .physical_path()
+                .file_name()
+                .and_then(|name| name.to_str()),
+            Some("status-123-456-1.md")
+        );
+        assert_eq!(
+            fs::read_to_string(&collision).expect("sentinel"),
+            "sentinel"
+        );
+        assert_eq!(
+            fs::read_to_string(&markdown).expect("provider body"),
+            "provider body"
+        );
+        let markdown_path = markdown.physical_path().to_path_buf();
+        drop(markdown);
+        assert!(!markdown_path.exists());
+        assert_eq!(fs::read_to_string(collision).expect("sentinel"), "sentinel");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn temp_markdown_directory_swap_cannot_redirect_create_cleanup_or_drop() {
+        let root = TempDir::new().expect("root");
+        let outside = TempDir::new().expect("outside");
+        let dir_path = root.path().join("tmp");
+        fs::create_dir(&dir_path).expect("temp markdown dir");
+        let stale = dir_path.join("stale.md");
+        fs::write(&stale, "stale").expect("stale body");
+        File::open(&stale)
+            .expect("open stale")
+            .set_times(
+                std::fs::FileTimes::new()
+                    .set_modified(UNIX_EPOCH)
+                    .set_accessed(UNIX_EPOCH),
+            )
+            .expect("age stale body");
+        let dir = ensure_private_temp_markdown_dir(&dir_path).expect("pin temp directory");
+        let retained = root.path().join("retained");
+        fs::rename(&dir_path, &retained).expect("rename pinned directory");
+        std::os::unix::fs::symlink(outside.path(), &dir_path).expect("replace with symlink");
+        fs::write(outside.path().join("sentinel.md"), "outside").expect("outside sentinel");
+
+        cleanup_stale_temp_markdown(&dir);
+        assert!(!retained.join("stale.md").exists());
+        assert_eq!(
+            fs::read_to_string(outside.path().join("sentinel.md")).expect("outside sentinel"),
+            "outside"
+        );
+        let markdown = write_temp_markdown_in(
+            &dir,
+            "status",
+            "provider body",
+            123,
+            456,
+            &AtomicU64::new(0),
+        )
+        .expect("descriptor-relative create");
+        assert_eq!(
+            fs::read_to_string(&markdown).expect("descriptor body"),
+            "provider body"
+        );
+        let retained_body = retained.join(&markdown.file_name);
+        assert!(retained_body.exists());
+        assert_eq!(
+            fs::read_dir(outside.path())
+                .expect("outside entries")
+                .count(),
+            1,
+            "directory swap redirected temporary body creation"
+        );
+
+        drop(markdown);
+        assert!(
+            !retained_body.exists(),
+            "drop must unlink from pinned directory"
+        );
+        assert_eq!(
+            fs::read_to_string(outside.path().join("sentinel.md")).expect("outside sentinel"),
+            "outside"
+        );
+    }
+
+    #[test]
+    fn temp_markdown_partial_write_failure_unlinks_created_file() {
+        let dir_path = TempDir::new().expect("tempdir");
+        let dir = ensure_private_temp_markdown_dir(dir_path.path()).expect("pin temp directory");
+        let error = write_temp_markdown_in_with(
+            &dir,
+            "status",
+            "provider body",
+            123,
+            456,
+            &AtomicU64::new(0),
+            |file, _| {
+                file.write_all(b"partial")?;
+                Err(std::io::Error::other("injected write failure"))
+            },
+        )
+        .expect_err("partial write must fail");
+
+        assert!(error.contains("injected write failure"), "{error}");
+        assert_eq!(
+            fs::read_dir(dir_path.path())
+                .expect("temp directory")
+                .count(),
+            0,
+            "partially written provider body was orphaned"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn temp_markdown_rejects_symlinked_delivery_directory() {
+        let lock = GlobalStateLock::new();
+        let state = TempDir::new().expect("state dir");
+        let outside = TempDir::new().expect("outside dir");
+        crate::state::set_state_dir_override(None);
+        let _state_dir = EnvGuard::set(
+            &lock,
+            "PLAN_ISSUE_HOME",
+            state.path().to_string_lossy().as_ref(),
+        );
+        let delivery = state.path().join("out/plan-issue-delivery");
+        fs::create_dir_all(&delivery).expect("delivery parent");
+        std::os::unix::fs::symlink(outside.path(), delivery.join("tmp"))
+            .expect("symlink temp directory");
+
+        let error = write_temp_markdown("status", "private body")
+            .expect_err("symlinked temp directory must be rejected");
+
+        assert!(error.contains("temporary markdown directory"), "{error}");
+        assert_eq!(
+            fs::read_dir(outside.path())
+                .expect("outside directory")
+                .count(),
+            0,
+            "provider body must not be redirected outside the state directory"
         );
     }
 
@@ -9205,14 +13469,13 @@ mod tests {
             required_count: None,
             non_required_failures: Vec::new(),
         }];
-        let out = close_exec_state_writeback(
-            Some(tmp.path()),
-            "https://github.com/o/r/issues/738",
-            &linked,
-        );
-        assert_eq!(out.get("changed").and_then(|v| v.as_bool()), Some(true));
+        let terminal =
+            close_exec_state_terminal_state("https://github.com/o/r/issues/738", &linked);
+        let report = plan_tooling::exec_state::writeback_terminal(&state, &terminal, false)
+            .expect("write terminal state");
+        assert!(report.changed);
         let written = std::fs::read_to_string(&state).unwrap();
-        assert!(written.contains("- Status: complete; tracking issue closed"));
+        assert!(written.contains("- Status: complete\n"));
         // The PR URL must be an angle-bracket autolink so the written
         // execution-state passes markdown lint (MD034 forbids bare URLs), matching
         // the `Tracking issue` bullet's treatment. Regression guard for #1006.
@@ -9225,8 +13488,8 @@ mod tests {
             "PR URL must not be written as a bare URL (MD034)"
         );
         assert!(written.contains("- Tracking issue: <https://github.com/o/r/issues/738>"));
-        assert!(written.contains("- Current task: none; tracking issue closed"));
-        assert!(written.contains("- Next task: none; tracking issue closed"));
+        assert!(written.contains("- Current task: complete\n"));
+        assert!(written.contains("- Next task: none\n"));
         assert!(written.contains(
             "- Tracking issue <https://github.com/o/r/issues/738> is closed; terminal execution state is synchronized. No closeout or merge action remains."
         ));
@@ -9238,8 +13501,83 @@ mod tests {
     }
 
     #[test]
+    fn close_exec_state_writeback_acquires_lock_before_expected_contents_comparison() {
+        let tmp = TempDir::new().expect("tempdir");
+        let state = tmp.path().join("demo-execution-state.md");
+        let concurrent_contents = "## Execution State\n\n- Status: concurrent writer\n";
+        std::fs::write(&state, concurrent_contents).expect("write concurrent state");
+        let lock_path = state.with_file_name("demo-execution-state.md.lock");
+        let _active_lock = plan_tooling::mutation_lock::OwnedFileLock::acquire(&lock_path)
+            .expect("hold execution-state lock");
+        let exec_state = plan_tooling::exec_state::PinnedExecutionState::pin(tmp.path(), &state)
+            .expect("pin execution state");
+        let plan = CloseExecStateWritebackPlan::Apply {
+            exec_state,
+            expected_contents: "## Execution State\n\n- Status: preflight snapshot\n".to_string(),
+            state: Box::new(close_exec_state_terminal_state(
+                "https://github.com/o/r/issues/738",
+                &[],
+            )),
+        };
+
+        let err = apply_close_exec_state_writeback(plan).expect_err("busy lock must fail");
+
+        assert_eq!(err.code, "record-close-execution-state-writeback-failed");
+        assert!(err.message.contains("exec-state-mutation-lock-busy"));
+        assert_eq!(
+            std::fs::read_to_string(&state).expect("read unchanged state"),
+            concurrent_contents
+        );
+        assert!(lock_path.exists(), "stable advisory lock path missing");
+    }
+
+    #[test]
+    fn close_exec_state_writeback_rejects_byte_identical_inode_replacement() {
+        const CONTENTS: &str = "## Execution State\n\n- Status: active\n- Current task: close\n- Next task: none\n\n## Handoff\n\n- Close the tracker.\n";
+
+        let tmp = TempDir::new().expect("tempdir");
+        let state = tmp.path().join("demo-execution-state.md");
+        let displaced = tmp.path().join("displaced-execution-state.md");
+        std::fs::write(&state, CONTENTS).expect("write original state");
+        let exec_state = plan_tooling::exec_state::PinnedExecutionState::pin(tmp.path(), &state)
+            .expect("pin execution state");
+        let plan = CloseExecStateWritebackPlan::Apply {
+            exec_state,
+            expected_contents: CONTENTS.to_string(),
+            state: Box::new(close_exec_state_terminal_state(
+                "https://github.com/o/r/issues/738",
+                &[],
+            )),
+        };
+        std::fs::rename(&state, &displaced).expect("displace preflight inode");
+        std::fs::write(&state, CONTENTS).expect("write byte-identical replacement");
+
+        let err = apply_close_exec_state_writeback(plan)
+            .expect_err("a byte-identical inode replacement must fail");
+
+        assert_eq!(err.code, "record-close-execution-state-writeback-failed");
+        assert!(err.message.contains("path changed after preflight"));
+        assert_eq!(
+            std::fs::read_to_string(&state).expect("replacement after failed apply"),
+            CONTENTS
+        );
+        assert_eq!(
+            std::fs::read_to_string(&displaced).expect("original after failed apply"),
+            CONTENTS
+        );
+    }
+
+    #[test]
     fn close_exec_state_writeback_skips_without_bundle() {
-        let out = close_exec_state_writeback(None, "https://x/issues/1", &[]);
+        let repo = crate::provider::Repo {
+            provider: crate::provider::Provider::GitHub,
+            slug: "o/r".to_string(),
+            host: Some("github.com".to_string()),
+        };
+        let plan =
+            prepare_close_exec_state_writeback(None, &repo, "https://github.com/o/r/issues/1", &[])
+                .expect("prepare skipped writeback");
+        let out = apply_close_exec_state_writeback(plan).expect("skipped writeback");
         assert_eq!(out.get("skipped").and_then(|v| v.as_bool()), Some(true));
     }
 
@@ -9347,27 +13685,290 @@ mod tests {
     }
 
     #[test]
-    fn classify_exec_state_issue_covers_missing_consistent_mismatch() {
+    fn classify_exec_state_issue_covers_missing_consistent_mismatch_and_invalid() {
         assert_eq!(
-            classify_exec_state_issue(None, 738),
+            classify_exec_state_issue(None, None, 738),
             ExecStateIssueClass::Missing
         );
         assert_eq!(
-            classify_exec_state_issue(Some("not yet opened"), 738),
+            classify_exec_state_issue(Some("not yet opened"), None, 738),
             ExecStateIssueClass::Missing
         );
         assert_eq!(
-            classify_exec_state_issue(Some("https://github.com/o/r/issues/738"), 738),
+            classify_exec_state_issue(Some("https://github.com/o/r/issues/738"), None, 738),
             ExecStateIssueClass::Consistent
         );
         assert_eq!(
-            classify_exec_state_issue(Some("https://github.com/o/r/issues/716"), 738),
+            classify_exec_state_issue(Some("https://github.com/o/r/issues/716"), None, 738),
             ExecStateIssueClass::Mismatch("https://github.com/o/r/issues/716".to_string())
         );
-        // Present but non-issue URL must not false-block.
         assert_eq!(
-            classify_exec_state_issue(Some("https://github.com/o/r/pull/9"), 738),
-            ExecStateIssueClass::Consistent
+            classify_exec_state_issue(Some("https://github.com/o/r/pull/9"), None, 738),
+            ExecStateIssueClass::Invalid
         );
+        assert_eq!(
+            classify_exec_state_issue(Some("hand-authored tracking note"), None, 738),
+            ExecStateIssueClass::Invalid
+        );
+    }
+
+    fn closeout_body_for_test(notes: &str) -> String {
+        lifecycle_record::render_record_post_comment(
+            RecordProfile::Tracking,
+            crate::commands::record::LifecycleCommentKind::Closeout,
+            json!({
+                "final_status": "complete",
+                "approval": {"comment_url": "https://example.test/approval"},
+                "linked_prs": [],
+                "notes": notes,
+            }),
+            Some("Closeout summary."),
+            None,
+        )
+        .expect("closeout body")
+    }
+
+    fn closeout_audit_for_test(comments: Value) -> lifecycle_record::RecordAudit {
+        lifecycle_record::audit_record(
+            None,
+            &json!({"comments": comments}).to_string(),
+            Some(RecordProfile::Tracking),
+        )
+        .expect("closeout audit")
+    }
+
+    #[test]
+    fn closeout_retry_reuses_matching_latest_comment() {
+        let body = closeout_body_for_test("closed");
+        let expected = lifecycle_record::extract_payload(&body).expect("closeout payload");
+        let existing_url = "https://example.test/issues/42#issuecomment-existing";
+        let audit = closeout_audit_for_test(json!([{
+            "body": body,
+            "url": existing_url,
+            "created_at": "2026-07-18T01:00:00Z",
+        }]));
+        let adapter = MockProviderAdapter::default().with_comment_result(Ok(
+            "https://example.test/issues/42#issuecomment-duplicate".to_string(),
+        ));
+
+        let actual = resolve_closeout_comment_url(
+            &adapter,
+            "owner/repo",
+            42,
+            RecordProfile::Tracking,
+            &audit,
+            &expected,
+            &body,
+        )
+        .expect("reuse matching closeout");
+
+        assert_eq!(actual, existing_url);
+        assert_eq!(adapter.comment_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn closeout_post_error_recovers_latest_matching_comment_without_repost() {
+        let body = closeout_body_for_test("closed");
+        let expected = lifecycle_record::extract_payload(&body).expect("closeout payload");
+        let initial_audit = closeout_audit_for_test(json!([]));
+        let recovered_url = "https://example.test/issues/42#issuecomment-recovered";
+        let recovery_comments = json!({
+            "comments": [{
+                "body": body,
+                "url": recovered_url,
+                "created_at": "2026-07-18T01:00:00Z",
+            }]
+        })
+        .to_string();
+        let adapter = MockProviderAdapter::default()
+            .with_comment_result(Err("ambiguous transport failure".to_string()))
+            .with_evidence_result(Ok((String::new(), recovery_comments)));
+
+        let actual = resolve_closeout_comment_url(
+            &adapter,
+            "owner/repo",
+            42,
+            RecordProfile::Tracking,
+            &initial_audit,
+            &expected,
+            &body,
+        )
+        .expect("recover accepted closeout");
+
+        assert_eq!(actual, recovered_url);
+        assert_eq!(adapter.comment_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn closeout_post_error_rejects_latest_mismatch_without_repost() {
+        let body = closeout_body_for_test("closed");
+        let expected = lifecycle_record::extract_payload(&body).expect("closeout payload");
+        let initial_audit = closeout_audit_for_test(json!([]));
+        let matching_older = closeout_body_for_test("closed");
+        let mismatching_latest = closeout_body_for_test("different closeout");
+        let recovery_comments = json!({
+            "comments": [
+                {
+                    "body": matching_older,
+                    "url": "https://example.test/issues/42#issuecomment-older",
+                    "created_at": "2026-07-18T01:00:00Z",
+                },
+                {
+                    "body": mismatching_latest,
+                    "url": "https://example.test/issues/42#issuecomment-latest",
+                    "created_at": "2026-07-18T02:00:00Z",
+                }
+            ]
+        })
+        .to_string();
+        let adapter = MockProviderAdapter::default()
+            .with_comment_result(Err("ambiguous transport failure".to_string()))
+            .with_evidence_result(Ok((String::new(), recovery_comments)));
+
+        let error = resolve_closeout_comment_url(
+            &adapter,
+            "owner/repo",
+            42,
+            RecordProfile::Tracking,
+            &initial_audit,
+            &expected,
+            &body,
+        )
+        .expect_err("latest mismatched closeout must not recover the post");
+
+        assert_eq!(error.code, "record-close-comment-post-failed");
+        assert_eq!(adapter.comment_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn historical_transport_alias_identities_normalize_in_memory() {
+        let cases = [
+            (
+                "github",
+                crate::provider::Provider::GitHub,
+                "ssh.github.com",
+                "github.com",
+            ),
+            (
+                "gitlab",
+                crate::provider::Provider::GitLab,
+                "altssh.gitlab.com",
+                "gitlab.com",
+            ),
+        ];
+
+        for (provider_name, provider, alias, canonical) in cases {
+            let historical = repository_identity("owner/repo", Some(provider_name), Some(alias))
+                .expect("historical identity");
+            let current = crate::provider::Repo {
+                provider,
+                slug: "owner/repo".to_string(),
+                host: Some(canonical.to_string()),
+            };
+            assert_eq!(historical.host.as_deref(), Some(canonical));
+            assert!(repository_identity_matches(&historical, &current));
+            assert!(is_default_provider_host(&historical));
+        }
+    }
+
+    #[test]
+    fn linked_pr_reference_accepts_provider_transport_aliases() {
+        let cases = [
+            (
+                crate::provider::Provider::GitHub,
+                "github.com",
+                "https://ssh.github.com/owner/repo/pull/7",
+            ),
+            (
+                crate::provider::Provider::GitLab,
+                "gitlab.com",
+                "https://altssh.gitlab.com/owner/repo/-/merge_requests/7",
+            ),
+        ];
+
+        for (provider, canonical, linked_pr) in cases {
+            let tracking_repo = crate::provider::Repo {
+                provider,
+                slug: "owner/repo".to_string(),
+                host: Some(canonical.to_string()),
+            };
+            let (target, number) = resolve_linked_pr_target(linked_pr, &tracking_repo)
+                .expect("transport alias matches tracking authority");
+            assert_eq!(target.host.as_deref(), Some(canonical));
+            assert_eq!(number, 7);
+            assert!(target.pr_url(number).contains(canonical));
+        }
+    }
+
+    #[test]
+    fn linked_pr_reference_matches_explicit_and_implicit_default_authorities() {
+        for (provider, default_host, linked_pr) in [
+            (
+                crate::provider::Provider::GitHub,
+                "github.com",
+                "https://github.com/owner/repo/pull/7",
+            ),
+            (
+                crate::provider::Provider::GitLab,
+                "gitlab.com",
+                "https://gitlab.com/owner/repo/-/merge_requests/7",
+            ),
+        ] {
+            let implicit = crate::provider::Repo {
+                provider,
+                slug: "owner/repo".to_string(),
+                host: None,
+            };
+            let (target, number) = resolve_linked_pr_target(linked_pr, &implicit)
+                .expect("explicit default host matches implicit repository authority");
+            assert_eq!(target.host.as_deref(), Some(default_host));
+            assert_eq!(number, 7);
+        }
+    }
+
+    #[test]
+    fn historical_github_issues_pr_url_canonicalizes_to_pull_url() {
+        let historical = "https://github.com/owner/repo/issues/7";
+        assert_eq!(
+            canonical_linked_pr_reference(historical).expect("historical v1 PR URL"),
+            "https://github.com/owner/repo/pull/7"
+        );
+
+        let tracking_repo = crate::provider::Repo {
+            provider: crate::provider::Provider::GitHub,
+            slug: "owner/repo".to_string(),
+            host: None,
+        };
+        let (target, number) = resolve_linked_pr_target(historical, &tracking_repo)
+            .expect("historical PR URL remains readable");
+        assert_eq!(target.slug, "owner/repo");
+        assert_eq!(number, 7);
+    }
+
+    #[test]
+    fn linked_pr_reference_rejects_untrusted_authority_and_sensitive_url_parts() {
+        let tracking_repo = crate::provider::Repo {
+            provider: crate::provider::Provider::GitHub,
+            slug: "owner/repo".to_string(),
+            host: Some("github.example.test".to_string()),
+        };
+
+        let authority_error =
+            resolve_linked_pr_target("https://attacker.example/owner/repo/pull/7", &tracking_repo)
+                .expect_err("cross-authority linked PR must fail");
+        assert_eq!(authority_error.code, "record-linked-pr-authority-mismatch");
+
+        for value in [
+            "https://operator:secret@github.example.test/owner/repo/pull/7",
+            "https://github.example.test/owner/repo/pull/7?token=secret",
+            "https://github.example.test/owner/repo/pull/7#secret",
+            "operator:secret@host/owner/repo#7",
+        ] {
+            let error = resolve_linked_pr_target(value, &tracking_repo)
+                .expect_err("credential-bearing linked PR must fail");
+            let rendered = &error.message;
+            assert!(!rendered.contains("operator"), "{rendered}");
+            assert!(!rendered.contains("secret"), "{rendered}");
+        }
     }
 }

@@ -120,6 +120,7 @@ mod tests {
             created_at: Some("2026-05-26T00:00:00Z".to_string()),
             status: status.map(|s| s.to_string()),
             payload: None,
+            plan_title: None,
         }
     }
 
@@ -130,6 +131,7 @@ mod tests {
         }
         RecordAudit {
             profile_filter: Some("tracking".to_string()),
+            record_identity: None,
             body_sections: BodySections {
                 current_dashboard: false,
                 final_dashboard: false,

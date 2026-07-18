@@ -56,7 +56,7 @@ validations_catalog:
     error_kind: default_branch_protected
     exit: DATA
   direct_default_delivery:
-    rule: "one actual push destination bound by host and slug to provider metadata with no second-stage URL rewrite; clean non-default checkout; exact remote base; one locally verified signed commit; regular bounded reason file; bounded provider/Git subprocesses; expected-old-OID compare-and-swap fast-forward with inherited push expansion disabled; exact remote read-back"
+    rule: "one actual push destination whose canonical authority exactly matches the selected authority before provider metadata lookup, with non-default HTTPS ports retained; provider metadata must match that same authority and slug; no second-stage URL rewrite; clean non-default checkout; exact remote base; one locally verified signed commit; regular bounded reason file; bounded provider/Git subprocesses; expected-old-OID compare-and-swap fast-forward with inherited push expansion disabled; exact remote read-back"
     error_kind: push_destination_missing | push_destination_ambiguous | push_destination_credentials_unsupported | push_destination_rewrite_ambiguous | provider_mismatch | provider_unsupported | repository_mismatch | dirty_worktree | detached_head | default_branch_checkout | head_not_checked_out | expected_base_mismatch | expected_base_missing | expected_base_not_ancestor | direct_commit_count_invalid | commit_signature_unverified | reason_file_unreadable | reason_invalid | local_path_present | object_id_invalid | remote_default_lookup_failed | remote_default_branch_missing | git_timeout | git_output_limit | backend_timeout | backend_output_limit | default_push_rejected | default_push_verification_failed | software_error
     exit: DATA | RUNTIME | UNAVAILABLE | SOFTWARE | USAGE
   draft_merge_refused:
@@ -92,8 +92,12 @@ validations_catalog:
     error_kind: label_unknown | label_not_applicable | label_group_conflict | label_catalog_missing
     exit: DATA
   repo_required:
-    rule: "search resolves a single repo slug from --repo or the detected forge remote"
+    rule: "repository-scoped operations resolve a single repository from --repo or a same-authority detected forge remote; explicit --host never borrows a repository from another authority"
     error_kind: repo_required
+    exit: DATA
+  repo_shape:
+    rule: "repository-scoped operations require owner/name for GitHub, group[/subgroup...]/project for GitLab, or a non-empty local-compatible path; repository-independent operations skip this irrelevant shape check"
+    error_kind: repo_invalid
     exit: DATA
   ref_invalid:
     rule: "search refs-to <ref> parses as a GitHub URL, owner/name#number, or #number / number"
@@ -115,14 +119,30 @@ global_flags:
     type: string
     default: origin
   - name: --provider
-    type: enum<github|gitlab>
+    type: enum<github|gitlab|local>
     default: auto
+  - name: --host
+    type: authority<hostname|hostname:port>
+    default: derived-from-remote-or-provider-default
+    validation: "reject schemes, userinfo, paths, query, fragment, whitespace, control characters, malformed DNS labels, and invalid ports; normalize :443 and retain non-default ports"
+    routing: "with --provider, accept a valid custom authority unless classified as the other provider; without --provider, require a recognized provider authority"
   - name: --repo
-    type: string  # owner/name slug
-    default: derived-from-remote
+    type: string  # provider-specific repository path
+    default: derived-from-same-authority-remote
   - name: --dry-run
     type: bool
     default: false
+
+provider_resolution:
+  forced_provider_only: "an existing remote must expose a valid authority classified as that provider; mismatched or unclassified remotes fail closed; the provider default applies only when no remote URL exists"
+  recognized_hosts: [github.com, "*.github.com", "*.ghe.com", gitlab.com, "*.gitlab.com"]
+  canonical_aliases: { ssh.github.com: github.com, altssh.gitlab.com: gitlab.com }
+  repository_scopes:
+    scoped: "validate repo_shape; explicit --host requires --repo or a same-authority remote repository"
+    independent: "retain repository context but skip repo_shape validation"
+  backend_environment: "remove ambient GH_HOST and GITLAB_HOST, then bind the resolved authority through the selected provider's host variable for each call"
+  inbox_global_host: "reject global --host with provider_unsupported; --gitlab-host is the inbox-local GitLab authority control and GitHub Enterprise inbox is unsupported in v1"
+  graphql_rate_limit: "bind probes to the triggering GitHub authority and key cached readings/invalidation by canonical authority"
 
 # ---------------------------------------------------------------------------
 # Atomic operations.
@@ -769,8 +789,8 @@ operations:
     summary: Resolve repo slug, default branch, default merge method.
     inputs: []
     backends:
-      github: { program: gh,   argv: [repo, view, --json, "name,owner,defaultBranchRef,mergeCommitAllowed,squashMergeAllowed,rebaseMergeAllowed,url"] }
-      gitlab: { program: glab, argv: [repo, view, -F, json] }
+      github: { program: gh,   argv: [repo, view, "{slug-or-host/slug}", --json, "name,owner,defaultBranchRef,mergeCommitAllowed,squashMergeAllowed,rebaseMergeAllowed,url"], env: { GH_HOST: "{resolved_authority}" } }
+      gitlab: { program: glab, argv: [repo, view, "{slug-or-https://host/slug}", -F, json], env: { GITLAB_HOST: "{resolved_authority}" } }
     output:
       data:
         owner: string
@@ -804,15 +824,15 @@ operations:
         push_refspec: string
         pushed: bool
         observed_remote_sha: string
-    notes: "No unconstrained force, delete, retry, or direct-merge path exists. The internal exact old-OID lease is a compare-and-swap guard, and the separate ancestry proof keeps the resulting update fast-forward-only. Every Git subprocess has a 120-second timeout and 8 MiB per-stream capture limit with process-group cleanup. Dry-run performs the read-only preflight and emits pushed=false."
+    notes: "No unconstrained force, delete, retry, or direct-merge path exists. The selected authority must match the push URL before metadata lookup, and returned metadata must match that same authority and repository; metadata from another authority cannot authorize the push. Canonical comparison preserves non-default HTTPS ports. The internal exact old-OID lease is a compare-and-swap guard, and the separate ancestry proof keeps the resulting update fast-forward-only. Every Git subprocess has a 120-second timeout and 8 MiB per-stream capture limit with process-group cleanup. Dry-run performs the read-only preflight and emits pushed=false."
 
   - id: auth.status
     schema_version: cli.forge-cli.auth.status.v1
     summary: Verify backend auth (gh / glab).
     inputs: []
     backends:
-      github: { program: gh,   argv: [auth, status] }
-      gitlab: { program: glab, argv: [auth, status] }
+      github: { program: gh,   argv: [auth, status, --hostname, "{resolved_authority}"], env: { GH_HOST: "{resolved_authority}" } }
+      gitlab: { program: glab, argv: [auth, status, --hostname, "{resolved_authority}"], env: { GITLAB_HOST: "{resolved_authority}" } }
     output:
       data:
         provider: enum<github|gitlab>
@@ -905,7 +925,7 @@ operations:
     validations:
       - repo_required
     backends:
-      github: { program: gh, argv: [search, issues, "{query}", --repo, "{slug}", --match, "{match_csv}", --limit, "{limit}", --json, "number,title,url,state,repository,isPullRequest"] }
+      github: { program: gh, argv: [search, issues, "{query}", --repo, "{raw_owner/name_slug}", --match, "{match_csv}", --limit, "{limit}", --json, "number,title,url,state,repository,isPullRequest"], env: { GH_HOST: "{resolved_authority}" } }
       gitlab: provider_unsupported   # search is GitHub-only in v1
       local:  provider_unsupported
     output:
@@ -919,7 +939,7 @@ operations:
         item_count: integer
         limited: bool
         items: list<SearchItem>
-    notes: "Single-repo scoped via --repo or the detected remote; the slug is always pushed as gh search --repo. GitLab/Local return provider_unsupported, never a silent empty result."
+    notes: "Single-repo scoped via --repo or a same-authority detected remote. gh search receives the raw owner/name slug through --repo while GH_HOST selects the resolved authority separately. GitLab/Local return provider_unsupported, never a silent empty result."
 
   - id: search.prs
     schema_version: cli.forge-cli.search.prs.v1
@@ -931,7 +951,7 @@ operations:
     validations:
       - repo_required
     backends:
-      github: { program: gh, argv: [search, prs, "{query}", --repo, "{slug}", --match, "{match_csv}", --limit, "{limit}", --json, "number,title,url,state,repository,isPullRequest"] }
+      github: { program: gh, argv: [search, prs, "{query}", --repo, "{raw_owner/name_slug}", --match, "{match_csv}", --limit, "{limit}", --json, "number,title,url,state,repository,isPullRequest"], env: { GH_HOST: "{resolved_authority}" } }
       gitlab: provider_unsupported
       local:  provider_unsupported
     output:
@@ -944,9 +964,10 @@ operations:
       - { name: <ref>,   type: string,  required: true }   # GitHub URL | owner/name#n | #n | n
       - { name: --limit, type: integer, default: 30 }
     validations:
+      - repo_required
       - ref_invalid
     backends:
-      github: { program: gh, argv: [api, graphql, -F, "owner={owner}", -F, "name={name}", -F, "number={number}", -F, "first={limit}", -f, "query={cross_referenced_event_query}"] }
+      github: { program: gh, argv: [api, graphql, -F, "owner={owner}", -F, "name={name}", -F, "number={number}", -F, "first={limit}", -f, "query={cross_referenced_event_query}"], env: { GH_HOST: "{resolved_authority}" } }
       gitlab: provider_unsupported
       local:  provider_unsupported
     output:

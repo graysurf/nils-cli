@@ -29,6 +29,14 @@ fn stdout_stub(body: &str) -> String {
     format!("#!/bin/sh\ncat <<'EOF'\n{body}\nEOF\n")
 }
 
+fn argv_bound_stub(expected: &str, body: &str) -> String {
+    format!(
+        "#!/bin/sh\n\
+         [ \"$*\" = \"{expected}\" ] || {{ echo \"unexpected argv: $*\" >&2; exit 97; }}\n\
+         cat <<'EOF'\n{body}\nEOF\n"
+    )
+}
+
 #[test]
 fn repo_view_github_normalizes_envelope() {
     let stub = StubEnv::new().gh_stub(&stdout_stub(GH_REPO_VIEW_JSON));
@@ -49,11 +57,168 @@ fn repo_view_github_normalizes_envelope() {
 }
 
 #[test]
+fn repo_view_github_enterprise_binds_host_in_positional_locator() {
+    let expected = "repo view internal.ghe.com/sympoies/nils-cli --json name,owner,defaultBranchRef,mergeCommitAllowed,squashMergeAllowed,rebaseMergeAllowed,url";
+    let stub = StubEnv::new().gh_stub(&argv_bound_stub(expected, GH_REPO_VIEW_JSON));
+    let out = run_forge_cli(
+        &stub,
+        &[
+            "--provider",
+            "github",
+            "--host",
+            "internal.ghe.com",
+            "--repo",
+            "sympoies/nils-cli",
+            "--format",
+            "json",
+            "repo",
+            "view",
+        ],
+    );
+    assert_eq!(out.code, 0, "stderr={}", out.stderr);
+}
+
+#[test]
+fn repo_view_github_custom_authority_retains_port_and_binds_environment() {
+    let expected = "repo view internal.example:8443/sympoies/nils-cli --json name,owner,defaultBranchRef,mergeCommitAllowed,squashMergeAllowed,rebaseMergeAllowed,url";
+    let script = format!(
+        "#!/bin/sh\n\
+         [ \"$GH_HOST\" = \"internal.example:8443\" ] || {{ echo \"unexpected GH_HOST: $GH_HOST\" >&2; exit 96; }}\n\
+         [ \"$*\" = \"{expected}\" ] || {{ echo \"unexpected argv: $*\" >&2; exit 97; }}\n\
+         cat <<'EOF'\n{GH_REPO_VIEW_JSON}\nEOF\n"
+    );
+    let stub = StubEnv::new().gh_stub(&script);
+    let out = run_forge_cli(
+        &stub,
+        &[
+            "--provider",
+            "github",
+            "--host",
+            "internal.example:8443",
+            "--repo",
+            "sympoies/nils-cli",
+            "--format",
+            "json",
+            "repo",
+            "view",
+        ],
+    );
+    assert_eq!(out.code, 0, "stdout={} stderr={}", out.stdout, out.stderr);
+}
+
+#[test]
+fn repo_view_rejects_untrusted_or_injected_host_before_backend() {
+    for host in [
+        "gitlab.com@attacker.example",
+        "gitlab.attacker.example",
+        "https://github.com",
+        "github.com/path",
+    ] {
+        let stub = StubEnv::new().gh_stub("#!/bin/sh\necho backend-called >&2\nexit 97\n");
+        let out = run_forge_cli(
+            &stub,
+            &[
+                "--host",
+                host,
+                "--repo",
+                "sympoies/nils-cli",
+                "--format",
+                "json",
+                "repo",
+                "view",
+            ],
+        );
+        assert_eq!(
+            out.code, 64,
+            "host={host} stdout={} stderr={}",
+            out.stdout, out.stderr
+        );
+        let envelope = parse_envelope(&out.stdout);
+        assert_eq!(envelope["error"]["code"], "provider_unsupported");
+        assert!(!out.stderr.contains("backend-called"));
+    }
+}
+
+#[test]
+fn repo_view_rejects_nested_github_repo_before_backend() {
+    let stub = StubEnv::new().gh_stub("#!/bin/sh\nexit 97\n");
+    let out = run_forge_cli(
+        &stub,
+        &[
+            "--provider",
+            "github",
+            "--repo",
+            "owner/subgroup/repo",
+            "--format",
+            "json",
+            "repo",
+            "view",
+        ],
+    );
+    assert_eq!(out.code, 65, "stderr={}", out.stderr);
+    let envelope = parse_envelope(&out.stdout);
+    assert_eq!(envelope["error"]["code"], "repo_invalid");
+}
+
+#[test]
+fn repo_view_rejects_malformed_repository_without_disclosing_credentials() {
+    const REPOSITORY: &str = "https://alice:credential-value@github.com/owner/repo/extra.git";
+
+    for format in ["json", "text"] {
+        let stub = StubEnv::new().gh_stub("#!/bin/sh\necho backend-called >&2\nexit 97\n");
+        let out = run_forge_cli(
+            &stub,
+            &[
+                "--provider",
+                "github",
+                "--repo",
+                REPOSITORY,
+                "--format",
+                format,
+                "repo",
+                "view",
+            ],
+        );
+
+        assert_eq!(out.code, 65, "format={format} stderr={}", out.stderr);
+        let combined = format!("{}{}", out.stdout, out.stderr);
+        assert!(
+            combined.contains("repo_invalid"),
+            "format={format}: {combined}"
+        );
+        assert!(!combined.contains("alice"), "format={format}: {combined}");
+        assert!(
+            !combined.contains("credential-value"),
+            "format={format}: {combined}"
+        );
+        assert!(
+            !combined.contains(REPOSITORY),
+            "format={format}: {combined}"
+        );
+        assert!(
+            !combined.contains("backend-called"),
+            "format={format}: {combined}"
+        );
+    }
+}
+
+#[test]
 fn repo_view_gitlab_normalizes_envelope() {
     let stub = StubEnv::new().glab_stub(&stdout_stub(GLAB_REPO_VIEW_JSON));
     let out = run_forge_cli(
         &stub,
-        &["--provider", "gitlab", "--format", "json", "repo", "view"],
+        &[
+            "--provider",
+            "gitlab",
+            "--host",
+            "gitlab.com",
+            "--repo",
+            "sympoies/nils-cli",
+            "--format",
+            "json",
+            "repo",
+            "view",
+        ],
     );
     assert_eq!(out.code, 0, "stderr={}", out.stderr);
     let envelope = parse_envelope(&out.stdout);
@@ -73,7 +238,18 @@ fn repo_view_parity_envelope_modulo_provider_and_url_host() {
     );
     let glab_out = run_forge_cli(
         &glab,
-        &["--provider", "gitlab", "--format", "json", "repo", "view"],
+        &[
+            "--provider",
+            "gitlab",
+            "--host",
+            "gitlab.com",
+            "--repo",
+            "sympoies/nils-cli",
+            "--format",
+            "json",
+            "repo",
+            "view",
+        ],
     );
     let gh_env = parse_envelope(&gh_out.stdout);
     let glab_env = parse_envelope(&glab_out.stdout);

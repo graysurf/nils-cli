@@ -32,7 +32,9 @@ fn body_pass_state_final_expanded() -> String {
     "## Execution State\n\n\
      - Profile: tracking\n\
      - Status: complete\n\
-     - Target scope: vNext sprint 2\n\n\
+     - Target scope: vNext sprint 2\n\
+     - Current task: complete\n\
+     - Next task: none\n\n\
      ## Task Ledger\n\n\
      | ID | Status | Task |\n\
      | --- | --- | --- |\n\
@@ -152,6 +154,52 @@ fn visible_lint_state_final_expanded_passes() {
         "expanded final state should lint clean; findings={:?}",
         report.findings
     );
+}
+
+#[test]
+fn visible_lint_rejects_stale_terminal_state_fields() {
+    let cases = [
+        (
+            "- Status: complete\n- Target scope: vNext sprint 2\n- Current task: 2.3\n- Next task: none",
+            "state-final-current-actionable",
+        ),
+        (
+            "- Status: complete\n- Target scope: vNext sprint 2\n- Current task: complete\n- Next task: ",
+            "state-final-next-action-missing",
+        ),
+        (
+            "- Status: complete\n- Current task: complete\n- Next task: none",
+            "state-target-scope-missing",
+        ),
+        (
+            "- Status: complete\n- Target scope: complete\n- Current task: complete\n- Next task: none",
+            "state-target-scope-status-token",
+        ),
+    ];
+
+    for (header, expected) in cases {
+        let body = format!(
+            "## Execution State\n\n{header}\n\n## Task Ledger\n\n\
+             | ID | Status | Title |\n\
+             | --- | --- | --- |\n\
+             | 2.3 | done | terminal repair |\n"
+        );
+        let report = lint_visible(
+            PayloadRole::State,
+            &body,
+            LintHints {
+                state_is_final: true,
+                state_is_closed: true,
+                ..LintHints::default()
+            },
+        );
+
+        assert!(
+            report.codes().contains(&expected),
+            "expected {expected}; codes={:?}; body={body}",
+            report.codes()
+        );
+    }
 }
 
 #[test]

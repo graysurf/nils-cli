@@ -117,6 +117,39 @@ echo "late glab"
 "#;
 
 #[test]
+fn inbox_rejects_global_host_actionably_without_backend_call() {
+    for command in ["list", "status", "next"] {
+        let stub = StubEnv::new()
+            .gh_stub("#!/bin/sh\necho backend-called >&2\nexit 99\n")
+            .glab_stub("#!/bin/sh\necho backend-called >&2\nexit 99\n");
+        let out = run_forge_cli(
+            &stub,
+            &[
+                "--provider",
+                "github",
+                "--host",
+                "internal.ghe.com",
+                "--format",
+                "json",
+                "inbox",
+                command,
+            ],
+        );
+        assert_eq!(out.code, 64, "command={command} stderr={}", out.stderr);
+        let envelope = parse_envelope(&out.stdout);
+        assert_eq!(envelope["error"]["code"], "provider_unsupported");
+        assert!(
+            envelope["error"]["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("--host is not supported by inbox"),
+            "command={command} envelope={envelope}"
+        );
+        assert!(!out.stderr.contains("backend-called"));
+    }
+}
+
+#[test]
 fn inbox_github_dedupes_reasons_and_normalizes_items() {
     let stub = StubEnv::new().gh_stub(GH_INBOX_STUB);
     let out = run_forge_cli(

@@ -14,7 +14,7 @@ use crate::backend::{BackendCall, BackendProgram, BackendRunner, BackendSuccess,
 use crate::cli::{BINARY, GlobalFlags};
 use crate::envelope::emit_success;
 use crate::error::ForgeError;
-use crate::provider::{Provider, ProviderContext, git_remote_url};
+use crate::provider::{Provider, ProviderContext, detect_unscoped, git_remote_url};
 use crate::rate_limit::default_runner;
 
 const SCHEMA: &str = "auth.status";
@@ -43,7 +43,7 @@ pub fn run_with<R: BackendRunner, F: Fn(&str) -> Option<String>>(
     format: OutputFormat,
     remote_url_lookup: F,
 ) -> Result<i32, ForgeError> {
-    let ctx = crate::provider::detect(
+    let ctx = detect_unscoped(
         global.provider_hint(),
         &global.remote,
         global.repo.as_deref(),
@@ -77,7 +77,7 @@ pub fn compute<R: BackendRunner, F: Fn(&str) -> Option<String>>(
     global: &GlobalFlags,
     remote_url_lookup: F,
 ) -> Result<AuthStatusPayload, ForgeError> {
-    let ctx = crate::provider::detect(
+    let ctx = detect_unscoped(
         global.provider_hint(),
         &global.remote,
         global.repo.as_deref(),
@@ -95,10 +95,18 @@ fn compute_with_ctx<R: BackendRunner>(
     parse_backend_output(ctx, &output)
 }
 
-fn build_call(ctx: &ProviderContext) -> BackendCall {
+pub(crate) fn build_call(ctx: &ProviderContext) -> BackendCall {
     let program = BackendProgram::for_provider(ctx.provider);
-    let argv: Vec<OsString> = vec![OsString::from("auth"), OsString::from("status")];
-    BackendCall::new(program, argv)
+    let argv: Vec<OsString> = vec![
+        OsString::from("auth"),
+        OsString::from("status"),
+        OsString::from("--hostname"),
+        OsString::from(crate::provider::canonical_provider_host(
+            ctx.provider,
+            &ctx.host,
+        )),
+    ];
+    BackendCall::new(program, argv).with_host(ctx.provider, &ctx.host)
 }
 
 /// Parse the backend stdout/stderr into the normalized payload.
@@ -273,12 +281,33 @@ mod tests {
     }
 
     #[test]
-    fn build_call_invokes_auth_status() {
+    fn build_call_binds_github_auth_status_to_resolved_host() {
         let ctx = github_ctx();
         let call = build_call(&ctx);
         assert_eq!(
             call.plan_argv()[1..],
-            vec!["auth".to_string(), "status".to_string()]
+            vec![
+                "auth".to_string(),
+                "status".to_string(),
+                "--hostname".to_string(),
+                "github.com".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn build_call_binds_gitlab_auth_status_to_resolved_host() {
+        let mut ctx = gitlab_ctx();
+        ctx.host = "gitlab.example.com".into();
+        let call = build_call(&ctx);
+        assert_eq!(
+            call.plan_argv()[1..],
+            vec![
+                "auth".to_string(),
+                "status".to_string(),
+                "--hostname".to_string(),
+                "gitlab.example.com".to_string(),
+            ]
         );
     }
 }
