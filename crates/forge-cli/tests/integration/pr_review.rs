@@ -915,7 +915,11 @@ esac
 /// spec body, so cross-run idempotency must skip re-creating it. The
 /// `reviewThreads(first: 100)` case is matched before `repository(owner:`
 /// because the threads query contains both substrings.
-fn github_review_thread_idempotent_stub(capture: &str, existing_outdated: bool) -> String {
+fn github_review_thread_idempotent_stub(
+    capture: &str,
+    existing_resolved: bool,
+    existing_outdated: bool,
+) -> String {
     format!(
         r#"#!/bin/sh
 set -eu
@@ -931,10 +935,7 @@ case "$2" in
   graphql)
     case "$*" in
       *"reviewThreads(first: 100)"*)
-        printf '%s\n' '{{"data":{{"repository":{{"pullRequest":{{"reviewThreads":{{"nodes":[{{"id":"PRRT_existing","isResolved":false,"isOutdated":{existing_outdated},"path":"src/lib.rs","comments":{{"nodes":[{{"author":{{"login":"quality-bot"}},"body":"Duplicate finding body.","createdAt":"2026-07-14T04:00:00Z","url":"https://github.com/acme/widgets/pull/44#discussion_r1"}}]}}}}]}}}}}}}}}}'
-        ;;
-      *"reviewThreads(first: 100)"*)
-        printf '%s\n' '{{"data":{{"repository":{{"pullRequest":{{"reviewThreads":{{"nodes":[]}}}}}}}}}}'
+        printf '%s\n' '{{"data":{{"repository":{{"pullRequest":{{"reviewThreads":{{"nodes":[{{"id":"PRRT_existing","isResolved":{existing_resolved},"isOutdated":{existing_outdated},"path":"src/lib.rs","comments":{{"nodes":[{{"author":{{"login":"quality-bot"}},"body":"Duplicate finding body.","createdAt":"2026-07-14T04:00:00Z","url":"https://github.com/acme/widgets/pull/44#discussion_r1"}}]}}}}]}}}}}}}}}}'
         ;;
       *"states: [PENDING]"*)
         printf '%s\n' '{{"data":{{"repository":{{"pullRequest":{{"headRefOid":"head-44","reviews":{{"nodes":[],"pageInfo":{{"hasNextPage":false,"endCursor":null}}}}}}}}}}}}'
@@ -1372,6 +1373,7 @@ fn pr_review_skips_duplicate_thread_on_unchanged_head() {
     let stub = stub.gh_stub(&github_review_thread_idempotent_stub(
         &capture.to_string_lossy(),
         false,
+        false,
     ));
 
     let out = run_forge_cli(
@@ -1429,6 +1431,10 @@ fn pr_review_skips_duplicate_thread_on_unchanged_head() {
         env["data"]["submitted_review"], false,
         "an all-duplicate review is a no-op, so no native review event was submitted"
     );
+    assert_eq!(
+        env["data"]["pr_comment_url"], "",
+        "no review event means no review URL on the idempotent-skip path"
+    );
 }
 
 #[test]
@@ -1452,6 +1458,7 @@ fn pr_review_reposts_when_matching_thread_is_outdated() {
     .expect("write thread specs");
     let stub = stub.gh_stub(&github_review_thread_idempotent_stub(
         &capture.to_string_lossy(),
+        false,
         true,
     ));
 
@@ -1496,6 +1503,151 @@ fn pr_review_reposts_when_matching_thread_is_outdated() {
             .unwrap_or(0),
         0,
         "an outdated match is not a live duplicate"
+    );
+    assert_eq!(env["data"]["review_threads"][0]["id"], "PRRT_kwDOthread");
+    assert_eq!(env["data"]["submitted_review"], true);
+}
+
+#[test]
+fn pr_review_skips_only_the_duplicate_and_posts_the_rest() {
+    // Partial-skip: one finding already has a live thread, another is new. Only
+    // the duplicate is skipped; the survivor is posted and the review submitted.
+    // The second spec reuses the duplicate's body on a DIFFERENT path, so it also
+    // proves the fingerprint keys on (path, body), not body alone.
+    let stub = StubEnv::new();
+    let capture = stub.tempdir.path().join("gh-args.log");
+    let review_file = stub.tempdir.path().join("review.md");
+    let thread_file = stub.tempdir.path().join("review-threads.json");
+    fs::write(&review_file, "## Testing Review\n\nOne dup, one new.\n").expect("write review");
+    fs::write(
+        &thread_file,
+        r#"[{"path":"src/lib.rs","line":42,"side":"RIGHT","body":"Duplicate finding body."},{"path":"src/other.rs","line":7,"side":"RIGHT","body":"Duplicate finding body."}]"#,
+    )
+    .expect("write thread specs");
+    let stub = stub.gh_stub(&github_review_thread_idempotent_stub(
+        &capture.to_string_lossy(),
+        false,
+        false,
+    ));
+
+    let out = run_forge_cli(
+        &stub,
+        &[
+            "--provider",
+            "github",
+            "--repo",
+            "acme/widgets",
+            "--format",
+            "json",
+            "pr",
+            "review",
+            "44",
+            "--decision",
+            "comments-only",
+            "--submit-review",
+            "--expected-head",
+            "head-44",
+            "--comment-file",
+            review_file.to_str().expect("utf8 path"),
+            "--thread-file",
+            thread_file.to_str().expect("utf8 path"),
+        ],
+    );
+
+    assert_eq!(out.code, 0, "stdout={}\nstderr={}", out.stdout, out.stderr);
+    let calls = fs::read_to_string(&capture).expect("read captured calls");
+    assert_eq!(
+        calls.matches("addPullRequestReviewThread(input:").count(),
+        1,
+        "exactly one (survivor) thread must be created: {calls}"
+    );
+    assert!(
+        calls.contains("path=src/other.rs"),
+        "the new finding (different path, same body) must be posted: {calls}"
+    );
+    assert!(
+        !calls.contains("path=src/lib.rs"),
+        "the duplicate finding must not be re-posted: {calls}"
+    );
+    assert!(
+        calls.contains("submitPullRequestReview(input:"),
+        "the review must be submitted when a survivor is posted: {calls}"
+    );
+    let env = parse_envelope(&out.stdout);
+    assert_eq!(env["data"]["threads_skipped_idempotent"], 1);
+    assert_eq!(
+        env["data"]["review_threads"]
+            .as_array()
+            .map(|a| a.len())
+            .unwrap_or(0),
+        1,
+        "only the survivor thread is in the payload"
+    );
+    assert_eq!(env["data"]["submitted_review"], true);
+}
+
+#[test]
+fn pr_review_reposts_when_matching_thread_is_resolved() {
+    // A resolved thread whose (path, body) matches a finding is NOT a live
+    // duplicate — the reviewer resolved it, so a re-finding must be posted fresh.
+    // Guards the `!resolved` half of the idempotency fingerprint.
+    let stub = StubEnv::new();
+    let capture = stub.tempdir.path().join("gh-args.log");
+    let review_file = stub.tempdir.path().join("review.md");
+    let thread_file = stub.tempdir.path().join("review-threads.json");
+    fs::write(
+        &review_file,
+        "## Testing Review\n\nOne finding, prior copy resolved.\n",
+    )
+    .expect("write review");
+    fs::write(
+        &thread_file,
+        r#"[{"path":"src/lib.rs","line":42,"side":"RIGHT","body":"Duplicate finding body."}]"#,
+    )
+    .expect("write thread specs");
+    let stub = stub.gh_stub(&github_review_thread_idempotent_stub(
+        &capture.to_string_lossy(),
+        true,
+        false,
+    ));
+
+    let out = run_forge_cli(
+        &stub,
+        &[
+            "--provider",
+            "github",
+            "--repo",
+            "acme/widgets",
+            "--format",
+            "json",
+            "pr",
+            "review",
+            "44",
+            "--decision",
+            "comments-only",
+            "--submit-review",
+            "--expected-head",
+            "head-44",
+            "--comment-file",
+            review_file.to_str().expect("utf8 path"),
+            "--thread-file",
+            thread_file.to_str().expect("utf8 path"),
+        ],
+    );
+
+    assert_eq!(out.code, 0, "stdout={}\nstderr={}", out.stdout, out.stderr);
+    let calls = fs::read_to_string(&capture).expect("read captured calls");
+    assert!(
+        calls.contains("addPullRequestReviewThread(input:"),
+        "a resolved match must be reposted fresh: {calls}"
+    );
+    let env = parse_envelope(&out.stdout);
+    assert_eq!(
+        env["data"]["threads_skipped_idempotent"]
+            .as_u64()
+            .unwrap_or(0),
+        0,
+        "a resolved match is not a live duplicate"
     );
     assert_eq!(env["data"]["review_threads"][0]["id"], "PRRT_kwDOthread");
     assert_eq!(env["data"]["submitted_review"], true);

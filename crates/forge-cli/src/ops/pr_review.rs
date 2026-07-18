@@ -554,41 +554,50 @@ pub fn run_with<R: BackendRunner, F: Fn(&str) -> Option<String>>(
     } else {
         GlabNoteForm::CreateResolvable
     };
-    let (pr_comment_url, review_threads, threads_skipped_idempotent) = if thread_specs.is_empty() {
-        let pr_call = build_review_post_call(&ctx, id, &args, &body, body_present, glab_form);
-        let pr_output = runner.run(&pr_call).map_err(|err| {
-            if args.submit_review && ctx.provider == Provider::GitHub {
-                map_github_native_review_submit_error(args.decision, err)
-            } else {
-                err
-            }
-        })?;
-        (
-            first_url(&pr_output.stdout).unwrap_or_default(),
-            Vec::new(),
-            0,
-        )
-    } else {
-        let submission = submit_github_review_with_threads(
-            runner,
-            &ctx,
-            id,
-            args.decision,
-            expected_review_head.expect("validated native review head"),
-            body_present.then_some(body.as_str()),
-            &thread_specs,
-        )?;
-        (
-            submission.review_url.unwrap_or_default(),
-            submission.created,
-            submission.skipped,
-        )
-    };
+    // `review_skipped_idempotent` is the explicit "no review event was posted
+    // because every finding was already threaded" signal, set only by the threads
+    // branch (where `submit_github_review_with_threads` returns `review_url:
+    // None`). The summary-only branch always posts, so an empty URL there means
+    // "provider URL not parsed", not "skipped" — the two must not be conflated.
+    let (pr_comment_url, review_threads, threads_skipped_idempotent, review_skipped_idempotent) =
+        if thread_specs.is_empty() {
+            let pr_call = build_review_post_call(&ctx, id, &args, &body, body_present, glab_form);
+            let pr_output = runner.run(&pr_call).map_err(|err| {
+                if args.submit_review && ctx.provider == Provider::GitHub {
+                    map_github_native_review_submit_error(args.decision, err)
+                } else {
+                    err
+                }
+            })?;
+            (
+                first_url(&pr_output.stdout).unwrap_or_default(),
+                Vec::new(),
+                0,
+                false,
+            )
+        } else {
+            let submission = submit_github_review_with_threads(
+                runner,
+                &ctx,
+                id,
+                args.decision,
+                expected_review_head.expect("validated native review head"),
+                body_present.then_some(body.as_str()),
+                &thread_specs,
+            )?;
+            let review_skipped_idempotent = submission.review_url.is_none();
+            (
+                submission.review_url.unwrap_or_default(),
+                submission.created,
+                submission.skipped,
+                review_skipped_idempotent,
+            )
+        };
 
     // When the review was skipped entirely as an idempotent no-op there is no
     // new PR activity to mirror, so skip the issue breadcrumb too.
     let issue_comment_url =
-        if let Some(issue_number) = mirror_issue.filter(|_| !pr_comment_url.is_empty()) {
+        if let Some(issue_number) = mirror_issue.filter(|_| !review_skipped_idempotent) {
             // The mirror body's user-controlled content (lenses) was already
             // validated up front against MIRROR_URL_PENDING; the only difference
             // here is the provider-returned `pr_comment_url`, which is never
@@ -613,7 +622,7 @@ pub fn run_with<R: BackendRunner, F: Fn(&str) -> Option<String>>(
             provider: ctx.provider.as_str(),
             number: id,
             decision: args.decision.as_str(),
-            submitted_review: args.submit_review && !pr_comment_url.is_empty(),
+            submitted_review: args.submit_review && !review_skipped_idempotent,
             head_sha: expected_review_head.map(str::to_string),
             pr_comment_url,
             issue_number: args.issue,

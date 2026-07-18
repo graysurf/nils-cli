@@ -382,13 +382,21 @@ fn run_lockdown_chain<R: BackendRunner, C: Clock>(
     // rather than blocking; only non-outdated unresolved threads block. One
     // thread read serves the gate, the recorded stale dispositions, and (when
     // convergence is enabled) the structured convergence snapshot.
-    let thread_payload = pr_review_threads::compute_for_pr(runner, ctx, &pr.url, args.id)?;
-    if let Some(snapshot) = review_snapshot.as_mut() {
-        snapshot.unresolved_threads = thread_payload.unresolved;
-    }
-    let stale_thread_dispositions = pr_review_threads::stale_dispositions(&thread_payload);
-    if !args.allow_unresolved_threads {
-        pr_review_threads::ensure_payload_resolved(&thread_payload)?;
+    // Read threads only when the gate or the convergence snapshot consumes the
+    // result. When the bypass is set and convergence is off, skip the read
+    // entirely so a transient thread-read failure cannot block a merge the
+    // caller explicitly bypassed the thread gate for (preserving the
+    // pre-change escape-hatch contract).
+    let mut stale_thread_dispositions = Vec::new();
+    if review_snapshot.is_some() || !args.allow_unresolved_threads {
+        let thread_payload = pr_review_threads::compute_for_pr(runner, ctx, &pr.url, args.id)?;
+        if let Some(snapshot) = review_snapshot.as_mut() {
+            snapshot.unresolved_threads = thread_payload.unresolved;
+        }
+        stale_thread_dispositions = pr_review_threads::stale_dispositions(&thread_payload);
+        if !args.allow_unresolved_threads {
+            pr_review_threads::ensure_payload_resolved(&thread_payload)?;
+        }
     }
 
     // Rule 14 — unchecked task-list items in the description block the

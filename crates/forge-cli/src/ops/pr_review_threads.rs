@@ -5,11 +5,16 @@
 //! on GitHub (REST review comments carry no resolved bit), resolvable
 //! discussions on GitLab. Issue-style comments stay on `pr comments`.
 //!
-//! Also hosts [`ensure_review_threads_resolved`], the `pr merge` lock-down
-//! rule (rule 13): merging while unresolved threads exist fails closed with
-//! `unresolved_review_threads` unless `--allow-unresolved-threads` is passed.
-//! Bot reviewers post threads asynchronously after PR creation, so the gate
-//! runs at merge time — the last action — rather than at creation.
+//! Also hosts [`ensure_payload_resolved`], the `pr merge` unresolved-thread gate
+//! (rule 13), and [`ensure_review_threads_resolved`], a convenience composition
+//! of [`compute_for_pr`] + [`ensure_payload_resolved`]. The gate blocks only on
+//! non-outdated unresolved threads and fails closed with
+//! `unresolved_review_threads` unless `--allow-unresolved-threads` (with a
+//! recorded reason) is passed; outdated unresolved threads are dispositioned
+//! `stale` by the merge step, not blocked. `pr merge` runs rule 13 inline (so it
+//! can record those stale dispositions) rather than through the composition
+//! helper. Bot reviewers post threads asynchronously after PR creation, so the
+//! gate runs at merge time — the last action — rather than at creation.
 //!
 //! The local provider has no review-thread model: the atom returns an empty
 //! thread list and the merge gate passes trivially.
@@ -183,10 +188,14 @@ pub fn run_with<R: BackendRunner, F: Fn(&str) -> Option<String>>(
     ))
 }
 
-/// `pr merge` lock-down rule 13. Fetches review threads for the PR/MR and
-/// fails closed with `unresolved_review_threads` (DATA 65) when any thread is
-/// unresolved. The local provider passes trivially (no thread model). Callers
-/// bypass via `--allow-unresolved-threads`, which skips this call entirely.
+/// Convenience composition of [`compute_for_pr`] + [`ensure_payload_resolved`]:
+/// fetch review threads for the PR/MR and fail closed with
+/// `unresolved_review_threads` (DATA 65) when a non-outdated thread is
+/// unresolved (outdated threads are dispositioned `stale` by the merge step, not
+/// blocked here). The local provider passes trivially (no thread model). `pr
+/// merge` runs rule 13 inline rather than through this helper so it can also
+/// record the stale dispositions; this composition remains for callers that only
+/// need the gate result.
 pub fn ensure_review_threads_resolved<R: BackendRunner>(
     runner: &R,
     ctx: &ProviderContext,
@@ -939,6 +948,36 @@ mod tests {
         ensure_review_threads_resolved(&runner, &ctx(Provider::Local), "local://store/pull/3", 3)
             .expect("local provider must pass");
         assert!(runner.calls().is_empty());
+    }
+
+    #[test]
+    fn ensure_payload_resolved_does_not_block_on_outdated_and_records_stale() {
+        let payload = PrReviewThreadsPayload {
+            provider: "github",
+            number: 7,
+            url: "https://github.com/acme/widgets/pull/7".into(),
+            total: 1,
+            unresolved: 1,
+            threads: vec![PrReviewThreadSummary {
+                id: "PRRT_outdated".into(),
+                resolved: false,
+                outdated: true,
+                author: "quality-bot".into(),
+                path: "src/lib.rs".into(),
+                created_at: "t".into(),
+                url: "https://github.com/acme/widgets/pull/7#discussion_r1".into(),
+                body: "nit: rename this local\nsecond line".into(),
+            }],
+        };
+        // An outdated unresolved thread must not block the gate...
+        ensure_payload_resolved(&payload).expect("outdated threads must not block");
+        // ...but must be recorded as a stale disposition for auditability.
+        let stale = stale_dispositions(&payload);
+        assert_eq!(stale.len(), 1);
+        assert_eq!(stale[0].thread_id, "PRRT_outdated");
+        assert_eq!(stale[0].disposition, "stale");
+        assert_eq!(stale[0].summary, "nit: rename this local");
+        assert_eq!(stale[0].path, "src/lib.rs");
     }
 
     fn json_global() -> GlobalFlags {

@@ -1168,6 +1168,13 @@ fn pr_merge_github_outdated_thread_is_dispositioned_stale_and_merges() {
     );
     assert_eq!(dispositions[0]["thread_id"], "PRRT_stale");
     assert_eq!(dispositions[0]["disposition"], "stale");
+    assert_eq!(dispositions[0]["author"], "quality-bot");
+    assert_eq!(dispositions[0]["path"], "src/lib.rs");
+    assert_eq!(dispositions[0]["summary"], "nit: rename this local");
+    assert_eq!(
+        dispositions[0]["rationale"],
+        "the anchored diff hunk is outdated; the referenced code changed"
+    );
     assert!(
         stub.tempdir.path().join("github-merged").exists(),
         "merge must reach the backend once outdated threads are dispositioned"
