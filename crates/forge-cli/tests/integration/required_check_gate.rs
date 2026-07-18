@@ -49,6 +49,7 @@ fn run_globals() -> GlobalFlags {
         format: None,
         remote: "origin".into(),
         provider: None,
+        host: None,
         repo: None,
         store_root: None,
         dry_run: false,

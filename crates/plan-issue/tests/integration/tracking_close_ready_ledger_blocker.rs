@@ -10,6 +10,30 @@ use plan_issue::lifecycle_record::PAYLOAD_SCHEMA_V2;
 
 use crate::common;
 
+fn repo_tempdir(prefix: &str) -> TempDir {
+    let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(std::path::Path::parent)
+        .expect("workspace root");
+    tempfile::Builder::new()
+        .prefix(prefix)
+        .tempdir_in(repo_root)
+        .expect("repository fixture")
+}
+
+fn current_repo_remote() -> String {
+    let output = std::process::Command::new("git")
+        .args(["remote", "get-url", "origin"])
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .output()
+        .expect("read origin remote");
+    assert!(output.status.success(), "git remote failed");
+    String::from_utf8(output.stdout)
+        .expect("utf-8 remote")
+        .trim()
+        .to_string()
+}
+
 fn v2_comment(role: &str, profile: &str, data: Value, visible: &str) -> String {
     let envelope = json!({
         "schema": PAYLOAD_SCHEMA_V2,
@@ -98,7 +122,7 @@ fn write_run_state(
     let mut body = json!({
         "schema": "plan-issue.execution-run.v1",
         "run_id": "run-1",
-        "repo": "owner/repo",
+        "repo": current_repo_remote(),
         "issue": 123,
         "profile": "tracking",
         "phase": phase,
@@ -123,7 +147,7 @@ fn write_ledger_bundle(tmp: &TempDir, ledger_body: &str) -> std::path::PathBuf {
 
 #[test]
 fn close_ready_emits_ledger_rows_pending_when_phase_ready_and_rows_pending() {
-    let tmp = TempDir::new().expect("tmp");
+    let tmp = repo_tempdir(".close-ready-ledger-");
     let fixture = write_complete_fixture(&tmp);
     let bundle = write_ledger_bundle(
         &tmp,
@@ -168,7 +192,7 @@ fn close_ready_emits_ledger_rows_pending_when_phase_ready_and_rows_pending() {
 
 #[test]
 fn close_ready_no_ledger_blocker_when_all_rows_done() {
-    let tmp = TempDir::new().expect("tmp");
+    let tmp = repo_tempdir(".close-ready-ledger-");
     let fixture = write_complete_fixture(&tmp);
     let bundle = write_ledger_bundle(
         &tmp,
@@ -203,8 +227,188 @@ fn close_ready_no_ledger_blocker_when_all_rows_done() {
 }
 
 #[test]
+fn close_ready_preserves_non_default_issue_url_authority_port() {
+    let tmp = repo_tempdir(".close-ready-port-");
+    let fixture = write_complete_fixture(&tmp);
+    let bundle = write_ledger_bundle(
+        &tmp,
+        "# Demo\n\n## Execution State\n\n- Tracking issue: <https://internal.ghe.com:8443/acme/widgets/issues/123>\n\n## Task Ledger\n\n| ID | Status | Task | Evidence | Notes |\n| --- | --- | --- | --- | --- |\n| 1.1 | done | A | PR#1 |  |\n",
+    );
+    let rs_path = tmp.path().join("run-state.json");
+    fs::write(
+        &rs_path,
+        json!({
+            "schema": "plan-issue.execution-run.v1",
+            "run_id": "run-port",
+            "repo": "https://internal.ghe.com:8443/acme/widgets",
+            "repo_provider": "github",
+            "repo_host": "internal.ghe.com:8443",
+            "issue": 123,
+            "profile": "tracking",
+            "phase": "ready_for_close",
+            "created_at": "2026-05-26T00:00:00Z",
+            "updated_at": "2026-05-26T01:00:00Z",
+            "bundle": bundle.to_string_lossy(),
+        })
+        .to_string(),
+    )
+    .expect("run-state");
+
+    let out = common::run_plan_issue(&[
+        "--format",
+        "json",
+        "tracking",
+        "close-ready",
+        "--fixture",
+        fixture.to_str().expect("fixture"),
+        "--run-state",
+        rs_path.to_str().expect("run state"),
+        "--approval",
+        "approver",
+    ]);
+    assert_eq!(out.code, 0, "stderr: {}", out.stderr_text());
+    let result = &out.stdout_json()["payload"]["result"];
+    let codes = result["blockers"]
+        .as_array()
+        .expect("blockers")
+        .iter()
+        .filter_map(|blocker| blocker["code"].as_str())
+        .collect::<Vec<_>>();
+    assert!(
+        !codes.contains(&"execution-state-issue-mismatch"),
+        "matching non-default authority port must remain consistent: {result}"
+    );
+}
+
+#[test]
+fn close_ready_blocks_every_nonterminal_ledger_status() {
+    for status in ["pending", "in-progress", "blocked"] {
+        let tmp = repo_tempdir(".close-ready-nonterminal-");
+        let fixture = write_complete_fixture(&tmp);
+        let bundle = write_ledger_bundle(
+            &tmp,
+            &format!(
+                "# Demo\n\n## Task Ledger\n\n| ID | Status | Task | Evidence | Notes |\n| --- | --- | --- | --- | --- |\n| 1.1 | {status} | A |  |  |\n"
+            ),
+        );
+        let rs_path = write_run_state(&tmp, "ready_for_close", Some(&bundle));
+
+        let out = common::run_plan_issue(&[
+            "--format",
+            "json",
+            "tracking",
+            "close-ready",
+            "--fixture",
+            fixture.to_str().expect("fixture"),
+            "--run-state",
+            rs_path.to_str().expect("rs"),
+            "--approval",
+            "approver",
+        ]);
+        assert_eq!(out.code, 0, "{status}: {}", out.stderr_text());
+        let result = out.stdout_json()["payload"]["result"].clone();
+        let blocker = result["blockers"]
+            .as_array()
+            .expect("blockers")
+            .iter()
+            .find(|blocker| blocker["code"] == "ledger-rows-pending")
+            .unwrap_or_else(|| panic!("{status} must block close-ready: {result}"));
+        assert_eq!(blocker["status"], status);
+        assert_eq!(result["ready"], false);
+    }
+}
+
+#[test]
+fn close_ready_reports_semantically_malformed_recorded_ledgers() {
+    let cases = [
+        (
+            "invalid-status",
+            "# Demo\n\n## Task Ledger\n\n| ID | Status | Task | Evidence |\n| --- | --- | --- | --- |\n| 1.1 | complete | A | PR#1 |\n",
+        ),
+        (
+            "missing-leading-pipe",
+            "# Demo\n\n## Task Ledger\n\n| ID | Status | Task | Evidence |\n| --- | --- | --- | --- |\n| 1.1 | done | A | PR#1 |\n1.2 | pending | Hidden task |  |\n",
+        ),
+    ];
+    for (case, ledger) in cases {
+        let tmp = repo_tempdir(".close-ready-malformed-");
+        let fixture = write_complete_fixture(&tmp);
+        let bundle = write_ledger_bundle(&tmp, ledger);
+        let rs_path = write_run_state(&tmp, "ready_for_close", Some(&bundle));
+
+        let out = common::run_plan_issue(&[
+            "--format",
+            "json",
+            "tracking",
+            "close-ready",
+            "--fixture",
+            fixture.to_str().expect("fixture"),
+            "--run-state",
+            rs_path.to_str().expect("rs"),
+            "--approval",
+            "approver",
+        ]);
+        assert_eq!(out.code, 0, "{case}: stderr: {}", out.stderr_text());
+        let result = out.stdout_json()["payload"]["result"].clone();
+        let codes = result["blockers"]
+            .as_array()
+            .expect("blockers")
+            .iter()
+            .filter_map(|blocker| blocker["code"].as_str())
+            .collect::<Vec<_>>();
+        assert!(
+            codes.contains(&"state-ledger-malformed"),
+            "{case} must fail closed: {result}"
+        );
+        assert_eq!(result["ready"], false, "{case}");
+    }
+}
+
+#[test]
+fn close_ready_reports_ambiguous_execution_state_bundle() {
+    let tmp = repo_tempdir(".close-ready-ambiguous-");
+    let fixture = write_complete_fixture(&tmp);
+    let bundle = write_ledger_bundle(
+        &tmp,
+        "# Demo\n\n## Task Ledger\n\n| ID | Status | Task | Evidence | Notes |\n| --- | --- | --- | --- | --- |\n| 1.1 | done | A | PR#1 |  |\n",
+    );
+    fs::write(
+        bundle.join("other-execution-state.md"),
+        "# Other\n\n## Task Ledger\n\n| ID | Status | Task | Evidence |\n| --- | --- | --- | --- |\n| 2.1 | done | B | PR#2 |\n",
+    )
+    .expect("second execution state");
+    let rs_path = write_run_state(&tmp, "ready_for_close", Some(&bundle));
+
+    let out = common::run_plan_issue(&[
+        "--format",
+        "json",
+        "tracking",
+        "close-ready",
+        "--fixture",
+        fixture.to_str().expect("fixture"),
+        "--run-state",
+        rs_path.to_str().expect("rs"),
+        "--approval",
+        "approver",
+    ]);
+    assert_eq!(out.code, 0, "stderr: {}", out.stderr_text());
+    let result = out.stdout_json()["payload"]["result"].clone();
+    let codes = result["blockers"]
+        .as_array()
+        .expect("blockers")
+        .iter()
+        .filter_map(|blocker| blocker["code"].as_str())
+        .collect::<Vec<_>>();
+    assert!(
+        codes.contains(&"state-ledger-ambiguous"),
+        "ambiguous bundle must block close-ready: {result}"
+    );
+    assert_eq!(result["ready"], false);
+}
+
+#[test]
 fn close_ready_silent_skips_when_bundle_absent() {
-    let tmp = TempDir::new().expect("tmp");
+    let tmp = repo_tempdir(".close-ready-ledger-");
     let fixture = write_complete_fixture(&tmp);
     let rs_path = write_run_state(&tmp, "ready_for_close", None);
 
@@ -236,7 +440,7 @@ fn close_ready_silent_skips_when_bundle_absent() {
 
 #[test]
 fn close_ready_no_ledger_blocker_when_phase_implementing() {
-    let tmp = TempDir::new().expect("tmp");
+    let tmp = repo_tempdir(".close-ready-ledger-");
     let fixture = write_complete_fixture(&tmp);
     let bundle = write_ledger_bundle(
         &tmp,

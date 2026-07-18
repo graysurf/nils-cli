@@ -19,9 +19,16 @@
 //! [`crate::ledger`] and the existing `close-ready` `ledger-rows-pending` gate,
 //! so this module never rewrites them.
 
+use std::ffi::{CString, OsStr, OsString};
 use std::fmt;
-use std::io;
-use std::path::{Path, PathBuf};
+use std::fs::{File, OpenOptions};
+use std::io::{self, Read, Write};
+use std::os::fd::{AsRawFd, FromRawFd};
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+use std::path::{Component, Path, PathBuf};
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use nils_common::fs as common_fs;
 use pulldown_cmark::{Event, HeadingLevel, Parser, Tag, TagEnd};
@@ -43,6 +50,539 @@ pub const HANDOFF_HEADING: &str = "## Handoff";
 const PLACEHOLDERS: &[&str] = &["not yet opened", "tbd", "pending", "none", "n/a", "-"];
 
 #[derive(Debug)]
+pub(crate) enum MutationLockError {
+    Busy {
+        path: PathBuf,
+        lock_path: PathBuf,
+    },
+    UnsafeFileAlias {
+        path: PathBuf,
+    },
+    Failed {
+        path: PathBuf,
+        lock_path: PathBuf,
+        source: io::Error,
+    },
+}
+
+/// A repository-confined execution-state file pinned by directory and file
+/// descriptors before provider mutations begin.
+pub struct PinnedExecutionState {
+    path: PathBuf,
+    target: DescriptorTarget,
+}
+
+struct DescriptorTarget {
+    root_path: PathBuf,
+    root: File,
+    parent: File,
+    file: Mutex<File>,
+    parent_components: Vec<OsString>,
+    file_name: OsString,
+}
+
+impl DescriptorTarget {
+    fn expected_file(&self) -> io::Result<std::sync::MutexGuard<'_, File>> {
+        self.file
+            .lock()
+            .map_err(|_| io::Error::other("execution-state descriptor identity lock was poisoned"))
+    }
+
+    fn try_clone(&self) -> io::Result<Self> {
+        Ok(Self {
+            root_path: self.root_path.clone(),
+            root: self.root.try_clone()?,
+            parent: self.parent.try_clone()?,
+            file: Mutex::new(self.expected_file()?.try_clone()?),
+            parent_components: self.parent_components.clone(),
+            file_name: self.file_name.clone(),
+        })
+    }
+
+    fn open_verified_root(&self) -> io::Result<File> {
+        let visible_root = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW)
+            .open(&self.root_path)?;
+        if !same_file(&visible_root, &self.root)? {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "repository root changed after preflight",
+            ));
+        }
+        Ok(visible_root)
+    }
+
+    fn open_verified_file_against(&self, expected: &File) -> io::Result<File> {
+        let mut visible_parent = self.open_verified_root()?;
+        for component in &self.parent_components {
+            visible_parent = openat_file(
+                &visible_parent,
+                component,
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+                0,
+            )?;
+        }
+        if !same_file(&visible_parent, &self.parent)? {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "execution-state parent directory changed after preflight",
+            ));
+        }
+        let visible_file = openat_file(
+            &visible_parent,
+            &self.file_name,
+            libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+            0,
+        )?;
+        ensure_unique_regular_file(&visible_file)?;
+        if !same_file(&visible_file, expected)? {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "execution-state file changed after preflight",
+            ));
+        }
+        Ok(visible_file)
+    }
+
+    fn open_verified_file(&self) -> io::Result<File> {
+        let expected = self.expected_file()?;
+        self.open_verified_file_against(&expected)
+    }
+
+    fn verify_identity(&self) -> io::Result<()> {
+        self.open_verified_file().map(drop)
+    }
+}
+
+impl PinnedExecutionState {
+    pub fn pin(repo_root: &Path, path: &Path) -> io::Result<Self> {
+        let relative = path.strip_prefix(repo_root).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "execution-state path is outside the repository root",
+            )
+        })?;
+        let components = relative
+            .components()
+            .map(|component| match component {
+                Component::Normal(value) => Ok(value.to_os_string()),
+                _ => Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "execution-state path must contain only normal relative components",
+                )),
+            })
+            .collect::<io::Result<Vec<_>>>()?;
+        let (file_name, parent_components) = components.split_last().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "execution-state path must name a file beneath the repository root",
+            )
+        })?;
+        let root = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW)
+            .open(repo_root)?;
+        let mut parent = root.try_clone()?;
+        for component in parent_components {
+            parent = openat_file(
+                &parent,
+                component,
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+                0,
+            )?;
+        }
+        let file = openat_file(
+            &parent,
+            file_name,
+            libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+            0,
+        )?;
+        ensure_unique_regular_file(&file)?;
+        Ok(Self {
+            path: path.to_path_buf(),
+            target: DescriptorTarget {
+                root_path: repo_root.to_path_buf(),
+                root,
+                parent,
+                file: Mutex::new(file),
+                parent_components: parent_components.to_vec(),
+                file_name: file_name.clone(),
+            },
+        })
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub fn read_to_string(&self) -> Result<String, ExecStateError> {
+        let mut file = self.target.open_verified_file().map_err(|source| {
+            unsafe_alias_error(&self.path, &source).unwrap_or_else(|| ExecStateError::ReadFailed {
+                path: self.path.clone(),
+                source,
+            })
+        })?;
+        let mut contents = String::new();
+        file.read_to_string(&mut contents)
+            .map_err(|source| ExecStateError::ReadFailed {
+                path: self.path.clone(),
+                source,
+            })?;
+        Ok(contents)
+    }
+}
+
+/// RAII transaction guard shared by every whole-file execution-state mutation.
+///
+/// The sibling lock spans the complete read/parse/patch/atomic-write sequence,
+/// including dry runs, so independently implemented mutation paths cannot
+/// replace a newer snapshot with stale content.
+pub(crate) struct ExecutionStateMutation {
+    path: PathBuf,
+    target: MutationTarget,
+    _lock: crate::mutation_lock::OwnedFileLock,
+}
+
+enum MutationTarget {
+    Path(File),
+    Pinned(DescriptorTarget),
+}
+
+impl ExecutionStateMutation {
+    pub(crate) fn begin(path: &Path) -> Result<Self, MutationLockError> {
+        let lock_path = execution_state_mutation_lock_path(path);
+        let lock = match crate::mutation_lock::OwnedFileLock::acquire(&lock_path) {
+            Ok(lock) => lock,
+            Err(crate::mutation_lock::OwnedFileLockError::Busy) => {
+                return Err(MutationLockError::Busy {
+                    path: path.to_path_buf(),
+                    lock_path,
+                });
+            }
+            Err(crate::mutation_lock::OwnedFileLockError::Failed(source)) => {
+                return Err(MutationLockError::Failed {
+                    path: path.to_path_buf(),
+                    lock_path,
+                    source,
+                });
+            }
+        };
+        let file = match open_direct_file(path) {
+            Ok(file) => file,
+            Err(source) if source.kind() == io::ErrorKind::InvalidInput => {
+                return Err(MutationLockError::UnsafeFileAlias {
+                    path: path.to_path_buf(),
+                });
+            }
+            Err(source) => {
+                return Err(MutationLockError::Failed {
+                    path: path.to_path_buf(),
+                    lock_path,
+                    source,
+                });
+            }
+        };
+        Ok(Self {
+            path: path.to_path_buf(),
+            target: MutationTarget::Path(file),
+            _lock: lock,
+        })
+    }
+
+    fn begin_pinned(pinned: &PinnedExecutionState) -> Result<Self, ExecStateError> {
+        let path = pinned.path.clone();
+        let lock_path = execution_state_mutation_lock_path(&path);
+        pinned.target.verify_identity().map_err(|source| {
+            unsafe_alias_error(&path, &source)
+                .unwrap_or_else(|| ExecStateError::ExpectedPathChanged { path: path.clone() })
+        })?;
+        let mut lock_name = pinned.target.file_name.clone();
+        lock_name.push(".lock");
+        let lock = match crate::mutation_lock::OwnedFileLock::acquire_at(
+            &pinned.target.parent,
+            &lock_name,
+        ) {
+            Ok(lock) => lock,
+            Err(crate::mutation_lock::OwnedFileLockError::Busy) => {
+                return Err(ExecStateError::MutationLockBusy { path, lock_path });
+            }
+            Err(crate::mutation_lock::OwnedFileLockError::Failed(source)) => {
+                return Err(ExecStateError::MutationLockFailed {
+                    path,
+                    lock_path,
+                    source,
+                });
+            }
+        };
+        pinned.target.verify_identity().map_err(|source| {
+            unsafe_alias_error(&path, &source)
+                .unwrap_or_else(|| ExecStateError::ExpectedPathChanged { path: path.clone() })
+        })?;
+        let target = pinned
+            .target
+            .try_clone()
+            .map_err(|source| ExecStateError::ReadFailed {
+                path: path.clone(),
+                source,
+            })?;
+        Ok(Self {
+            path,
+            target: MutationTarget::Pinned(target),
+            _lock: lock,
+        })
+    }
+
+    pub(crate) fn read_to_string(&self) -> io::Result<String> {
+        let mut file = match &self.target {
+            MutationTarget::Path(expected) => {
+                let visible = open_direct_file(&self.path)?;
+                if !same_file(&visible, expected)? {
+                    return Err(io::Error::new(
+                        io::ErrorKind::NotFound,
+                        "execution-state file changed after mutation preflight",
+                    ));
+                }
+                visible
+            }
+            MutationTarget::Pinned(target) => target.open_verified_file()?,
+        };
+        let mut contents = String::new();
+        file.read_to_string(&mut contents)?;
+        Ok(contents)
+    }
+
+    pub(crate) fn verify_path_identity(&self) -> Result<(), ExecStateError> {
+        let result = match &self.target {
+            MutationTarget::Path(expected) => open_direct_file(&self.path).and_then(|visible| {
+                if same_file(&visible, expected)? {
+                    Ok(())
+                } else {
+                    Err(io::Error::new(
+                        io::ErrorKind::NotFound,
+                        "execution-state file changed after mutation preflight",
+                    ))
+                }
+            }),
+            MutationTarget::Pinned(target) => target.verify_identity(),
+        };
+        result.map_err(|source| {
+            unsafe_alias_error(&self.path, &source).unwrap_or_else(|| {
+                ExecStateError::ExpectedPathChanged {
+                    path: self.path.clone(),
+                }
+            })
+        })
+    }
+
+    pub(crate) fn write_atomic(&self, contents: &[u8]) -> Result<(), common_fs::AtomicWriteError> {
+        match &self.target {
+            MutationTarget::Path(_) => common_fs::write_atomic(&self.path, contents, 0o644),
+            MutationTarget::Pinned(target) => {
+                target.verify_identity().map_err(|source| {
+                    common_fs::AtomicWriteError::ReplaceFile {
+                        from: self.path.clone(),
+                        to: self.path.clone(),
+                        source,
+                    }
+                })?;
+                write_atomic_at(target, &self.path, contents, 0o644)
+            }
+        }
+    }
+}
+
+pub(crate) fn execution_state_mutation_lock_path(path: &Path) -> PathBuf {
+    let mut file_name = path.file_name().unwrap_or_default().to_os_string();
+    file_name.push(".lock");
+    path.with_file_name(file_name)
+}
+
+const MAX_DESCRIPTOR_TEMP_ATTEMPTS: u32 = 10;
+static NEXT_DESCRIPTOR_TEMP_ID: AtomicU64 = AtomicU64::new(0);
+
+fn os_str_cstring(value: &OsStr) -> io::Result<CString> {
+    CString::new(value.as_bytes()).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "path component contains a NUL byte",
+        )
+    })
+}
+
+fn openat_file(parent: &File, name: &OsStr, flags: libc::c_int, mode: u32) -> io::Result<File> {
+    let name = os_str_cstring(name)?;
+    // SAFETY: `parent` is a live descriptor, `name` is NUL-terminated, and a
+    // successful descriptor is immediately transferred to `File`.
+    let fd = unsafe { libc::openat(parent.as_raw_fd(), name.as_ptr(), flags, mode) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: `fd` was returned uniquely by `openat` above.
+    Ok(unsafe { File::from_raw_fd(fd) })
+}
+
+fn same_file(left: &File, right: &File) -> io::Result<bool> {
+    let left = left.metadata()?;
+    let right = right.metadata()?;
+    Ok(left.dev() == right.dev() && left.ino() == right.ino())
+}
+
+fn ensure_unique_regular_file(file: &File) -> io::Result<()> {
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "execution-state path is not a regular file",
+        ));
+    }
+    if metadata.nlink() != 1 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "execution-state file must have exactly one hard link",
+        ));
+    }
+    Ok(())
+}
+
+fn open_direct_file(path: &Path) -> io::Result<File> {
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+        .open(path)?;
+    ensure_unique_regular_file(&file)?;
+    Ok(file)
+}
+
+fn unsafe_alias_error(path: &Path, source: &io::Error) -> Option<ExecStateError> {
+    (source.kind() == io::ErrorKind::InvalidInput).then(|| ExecStateError::UnsafeFileAlias {
+        path: path.to_path_buf(),
+    })
+}
+
+fn descriptor_temp_name(target_name: &OsStr, attempt: u32) -> OsString {
+    let id = NEXT_DESCRIPTOR_TEMP_ID.fetch_add(1, Ordering::Relaxed);
+    let mut name = Vec::with_capacity(target_name.as_bytes().len() + 48);
+    name.push(b'.');
+    name.extend_from_slice(target_name.as_bytes());
+    name.extend_from_slice(format!(".tmp-{}-{id}-{attempt}", std::process::id()).as_bytes());
+    OsString::from_vec(name)
+}
+
+fn unlinkat_file(parent: &File, name: &OsStr) {
+    let Ok(name) = os_str_cstring(name) else {
+        return;
+    };
+    // SAFETY: `parent` is live and `name` is NUL-terminated. Cleanup failure is
+    // intentionally secondary to the original write error.
+    let _ = unsafe { libc::unlinkat(parent.as_raw_fd(), name.as_ptr(), 0) };
+}
+
+fn renameat_file(parent: &File, from: &OsStr, to: &OsStr) -> io::Result<()> {
+    let from = os_str_cstring(from)?;
+    let to = os_str_cstring(to)?;
+    // SAFETY: both names are NUL-terminated and resolve relative to the same
+    // pinned directory descriptor.
+    let result = unsafe {
+        libc::renameat(
+            parent.as_raw_fd(),
+            from.as_ptr(),
+            parent.as_raw_fd(),
+            to.as_ptr(),
+        )
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+fn write_atomic_at(
+    target: &DescriptorTarget,
+    display_path: &Path,
+    contents: &[u8],
+    mode: u32,
+) -> Result<(), common_fs::AtomicWriteError> {
+    let parent = &target.parent;
+    let target_name = &target.file_name;
+    for attempt in 0..=MAX_DESCRIPTOR_TEMP_ATTEMPTS {
+        let temp_name = descriptor_temp_name(target_name, attempt);
+        let temp_path = display_path.with_file_name(&temp_name);
+        let mut file = match openat_file(
+            parent,
+            &temp_name,
+            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+            mode,
+        ) {
+            Ok(file) => file,
+            Err(source) if source.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(source) => {
+                return Err(common_fs::AtomicWriteError::CreateTempFile {
+                    path: temp_path,
+                    source,
+                });
+            }
+        };
+        if let Err(source) = file.write_all(contents) {
+            drop(file);
+            unlinkat_file(parent, &temp_name);
+            return Err(common_fs::AtomicWriteError::WriteTempFile {
+                path: temp_path,
+                source,
+            });
+        }
+        let _ = file.flush();
+        // SAFETY: `file` owns a live descriptor and `mode` is a valid Unix mode.
+        if unsafe { libc::fchmod(file.as_raw_fd(), mode as libc::mode_t) } != 0 {
+            let source = io::Error::last_os_error();
+            drop(file);
+            unlinkat_file(parent, &temp_name);
+            return Err(common_fs::AtomicWriteError::SetPermissions {
+                path: temp_path,
+                source,
+            });
+        }
+        let mut expected = match target.expected_file() {
+            Ok(expected) => expected,
+            Err(source) => {
+                unlinkat_file(parent, &temp_name);
+                return Err(common_fs::AtomicWriteError::ReplaceFile {
+                    from: temp_path,
+                    to: display_path.to_path_buf(),
+                    source,
+                });
+            }
+        };
+        if let Err(source) = target.open_verified_file_against(&expected).map(drop) {
+            unlinkat_file(parent, &temp_name);
+            return Err(common_fs::AtomicWriteError::ReplaceFile {
+                from: temp_path,
+                to: display_path.to_path_buf(),
+                source,
+            });
+        }
+        if let Err(source) = renameat_file(parent, &temp_name, target_name) {
+            unlinkat_file(parent, &temp_name);
+            return Err(common_fs::AtomicWriteError::ReplaceFile {
+                from: temp_path,
+                to: display_path.to_path_buf(),
+                source,
+            });
+        }
+        // The rename intentionally changes the visible inode. Carry the temp
+        // descriptor forward as the guard's new authorized identity so later
+        // reads still reject every replacement except this atomic write.
+        *expected = file;
+        return Ok(());
+    }
+    Err(common_fs::AtomicWriteError::TempPathExhausted {
+        target: display_path.to_path_buf(),
+        attempts: MAX_DESCRIPTOR_TEMP_ATTEMPTS + 1,
+    })
+}
+
+#[derive(Debug)]
 pub enum ExecStateError {
     ReadFailed {
         path: PathBuf,
@@ -51,6 +591,24 @@ pub enum ExecStateError {
     WriteFailed {
         path: PathBuf,
         source: common_fs::AtomicWriteError,
+    },
+    MutationLockBusy {
+        path: PathBuf,
+        lock_path: PathBuf,
+    },
+    MutationLockFailed {
+        path: PathBuf,
+        lock_path: PathBuf,
+        source: io::Error,
+    },
+    ExpectedContentsChanged {
+        path: PathBuf,
+    },
+    ExpectedPathChanged {
+        path: PathBuf,
+    },
+    UnsafeFileAlias {
+        path: PathBuf,
     },
     SectionMissing {
         path: PathBuf,
@@ -70,6 +628,13 @@ impl ExecStateError {
         match self {
             ExecStateError::ReadFailed { .. } => "exec-state-read-failed",
             ExecStateError::WriteFailed { .. } => "exec-state-write-failed",
+            ExecStateError::MutationLockBusy { .. } => "exec-state-mutation-lock-busy",
+            ExecStateError::MutationLockFailed { .. } => "exec-state-mutation-lock-failed",
+            ExecStateError::ExpectedContentsChanged { .. } => {
+                "exec-state-expected-contents-changed"
+            }
+            ExecStateError::ExpectedPathChanged { .. } => "exec-state-expected-path-changed",
+            ExecStateError::UnsafeFileAlias { .. } => "exec-state-unsafe-file-alias",
             ExecStateError::SectionMissing { .. } => "exec-state-section-missing",
             ExecStateError::DuplicateSection { .. } => "exec-state-duplicate-section",
             ExecStateError::InvalidField { .. } => "exec-state-invalid-field",
@@ -86,6 +651,37 @@ impl fmt::Display for ExecStateError {
             ExecStateError::WriteFailed { path, source } => {
                 write!(f, "failed to write {}: {source}", path.display())
             }
+            ExecStateError::MutationLockBusy { path, lock_path } => write!(
+                f,
+                "{}: execution-state mutation lock is busy at {}; retry after the active mutation finishes (the kernel releases the lock when its process exits)",
+                path.display(),
+                lock_path.display()
+            ),
+            ExecStateError::MutationLockFailed {
+                path,
+                lock_path,
+                source,
+            } => write!(
+                f,
+                "{}: failed to acquire execution-state mutation lock at {}: {source}",
+                path.display(),
+                lock_path.display()
+            ),
+            ExecStateError::ExpectedContentsChanged { path } => write!(
+                f,
+                "{}: execution-state contents changed after the expected snapshot was read",
+                path.display()
+            ),
+            ExecStateError::ExpectedPathChanged { path } => write!(
+                f,
+                "{}: execution-state path changed after the file was pinned",
+                path.display()
+            ),
+            ExecStateError::UnsafeFileAlias { path } => write!(
+                f,
+                "{}: execution-state file must be a regular file with exactly one hard link",
+                path.display()
+            ),
             ExecStateError::SectionMissing { path } => {
                 write!(f, "{}: missing `{HEADING}` section", path.display())
             }
@@ -100,6 +696,64 @@ impl fmt::Display for ExecStateError {
 }
 
 impl std::error::Error for ExecStateError {}
+
+impl From<MutationLockError> for ExecStateError {
+    fn from(error: MutationLockError) -> Self {
+        match error {
+            MutationLockError::Busy { path, lock_path } => {
+                ExecStateError::MutationLockBusy { path, lock_path }
+            }
+            MutationLockError::UnsafeFileAlias { path } => ExecStateError::UnsafeFileAlias { path },
+            MutationLockError::Failed { path, source, .. }
+                if source.kind() == io::ErrorKind::NotFound =>
+            {
+                ExecStateError::ReadFailed { path, source }
+            }
+            MutationLockError::Failed {
+                path,
+                lock_path,
+                source,
+            } => ExecStateError::MutationLockFailed {
+                path,
+                lock_path,
+                source,
+            },
+        }
+    }
+}
+
+/// Owning RAII guard for a coherent execution-state snapshot and mutation.
+///
+/// The sibling mutation lock remains held until this value is dropped. Callers
+/// can therefore retain one local snapshot across provider operations without
+/// duplicating lock naming or recursively reacquiring the same lock.
+pub struct ExecutionStateGuard {
+    mutation: ExecutionStateMutation,
+}
+
+impl ExecutionStateGuard {
+    pub fn acquire(path: &Path) -> Result<Self, ExecStateError> {
+        let mutation = ExecutionStateMutation::begin(path).map_err(ExecStateError::from)?;
+        Ok(Self { mutation })
+    }
+
+    pub fn acquire_pinned(pinned: &PinnedExecutionState) -> Result<Self, ExecStateError> {
+        let mutation = ExecutionStateMutation::begin_pinned(pinned)?;
+        Ok(Self { mutation })
+    }
+
+    pub fn read_to_string(&self) -> Result<String, ExecStateError> {
+        read(&self.mutation, &self.mutation.path)
+    }
+
+    pub fn sync_tracking_issue(
+        &self,
+        url: &str,
+        dry_run: bool,
+    ) -> Result<SyncReport, ExecStateError> {
+        sync_tracking_issue_locked(&self.mutation, url, dry_run)
+    }
+}
 
 /// What happened to a single bullet during a sync.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -183,12 +837,40 @@ pub fn sync_tracking_issue(
     url: &str,
     dry_run: bool,
 ) -> Result<SyncReport, ExecStateError> {
-    let raw = read(path)?;
+    if dry_run {
+        let raw = read_path_without_lock(path)?;
+        return sync_tracking_issue_preview(&raw, path, url);
+    }
+    let mutation = ExecutionStateMutation::begin(path).map_err(ExecStateError::from)?;
+    sync_tracking_issue_locked(&mutation, url, false)
+}
+
+fn sync_tracking_issue_preview(
+    raw: &str,
+    path: &Path,
+    url: &str,
+) -> Result<SyncReport, ExecStateError> {
+    let value = format_autolink(url);
+    let (_, change) = set_bullet(raw, path, TRACKING_ISSUE_LABEL, &value)?;
+    Ok(SyncReport {
+        changed: change.action != BulletAction::Unchanged,
+        bullets: vec![change],
+        sections: Vec::new(),
+    })
+}
+
+fn sync_tracking_issue_locked(
+    mutation: &ExecutionStateMutation,
+    url: &str,
+    dry_run: bool,
+) -> Result<SyncReport, ExecStateError> {
+    let path = mutation.path.as_path();
+    let raw = read(mutation, path)?;
     let value = format_autolink(url);
     let (new_text, change) = set_bullet(&raw, path, TRACKING_ISSUE_LABEL, &value)?;
     let changed = change.action != BulletAction::Unchanged;
     if !dry_run {
-        write_if_changed(path, &raw, &new_text)?;
+        write_if_changed(mutation, path, &raw, &new_text)?;
     }
     Ok(SyncReport {
         changed,
@@ -205,10 +887,88 @@ pub fn writeback_terminal(
     state: &TerminalState,
     dry_run: bool,
 ) -> Result<SyncReport, ExecStateError> {
+    if dry_run {
+        let raw = read_path_without_lock(path)?;
+        let (_, report) = compute_terminal_writeback(&raw, path, state)?;
+        return Ok(report);
+    }
+    let mutation = ExecutionStateMutation::begin(path).map_err(ExecStateError::from)?;
+    writeback_terminal_locked(&mutation, None, state, false)
+}
+
+/// Write terminal state only when the file still exactly matches the caller's
+/// preflight snapshot. Lock acquisition precedes the comparison, and the same
+/// lock is retained through parsing, validation, and atomic writeback.
+pub fn writeback_terminal_if_unchanged(
+    path: &Path,
+    expected_contents: &str,
+    state: &TerminalState,
+    dry_run: bool,
+) -> Result<SyncReport, ExecStateError> {
+    if dry_run {
+        let raw = read_path_without_lock(path)?;
+        if raw != expected_contents {
+            return Err(ExecStateError::ExpectedContentsChanged {
+                path: path.to_path_buf(),
+            });
+        }
+        let (_, report) = compute_terminal_writeback(&raw, path, state)?;
+        return Ok(report);
+    }
+    let mutation = ExecutionStateMutation::begin(path).map_err(ExecStateError::from)?;
+    writeback_terminal_locked(&mutation, Some(expected_contents), state, false)
+}
+
+/// Descriptor-relative variant used when provider mutations separate preflight
+/// from writeback. The pinned repository path and file identity must still be
+/// visible, and the sibling advisory lock is held through comparison and
+/// replacement.
+pub fn writeback_terminal_pinned_if_unchanged(
+    pinned: &PinnedExecutionState,
+    expected_contents: &str,
+    state: &TerminalState,
+    dry_run: bool,
+) -> Result<SyncReport, ExecStateError> {
+    if dry_run {
+        let raw = pinned.read_to_string()?;
+        if raw != expected_contents {
+            return Err(ExecStateError::ExpectedContentsChanged {
+                path: pinned.path.clone(),
+            });
+        }
+        let (_, report) = compute_terminal_writeback(&raw, &pinned.path, state)?;
+        return Ok(report);
+    }
+    let mutation = ExecutionStateMutation::begin_pinned(pinned)?;
+    writeback_terminal_locked(&mutation, Some(expected_contents), state, false)
+}
+
+fn writeback_terminal_locked(
+    mutation: &ExecutionStateMutation,
+    expected_contents: Option<&str>,
+    state: &TerminalState,
+    _dry_run: bool,
+) -> Result<SyncReport, ExecStateError> {
+    let path = mutation.path.as_path();
+    let original = read(mutation, path)?;
+    if expected_contents.is_some_and(|expected| original != expected) {
+        return Err(ExecStateError::ExpectedContentsChanged {
+            path: path.to_path_buf(),
+        });
+    }
+    let (new_text, report) = compute_terminal_writeback(&original, path, state)?;
+    write_if_changed(mutation, path, &original, &new_text)?;
+    Ok(report)
+}
+
+fn compute_terminal_writeback(
+    original: &str,
+    path: &Path,
+    state: &TerminalState,
+) -> Result<(String, SyncReport), ExecStateError> {
     validate_terminal_state(state)?;
-    let mut raw = read(path)?;
-    require_section(&raw, path, HEADING)?;
-    let original = raw.clone();
+    require_section(original, path, HEADING)?;
+    let mut raw = original.to_string();
     let mut bullets = Vec::new();
     let mut sections = Vec::new();
 
@@ -243,15 +1003,12 @@ pub fn writeback_terminal(
         sections.push(change);
     }
 
-    let changed = raw != original;
-    if !dry_run {
-        write_if_changed(path, &original, &raw)?;
-    }
-    Ok(SyncReport {
-        changed,
+    let report = SyncReport {
+        changed: raw != original,
         bullets,
         sections,
-    })
+    };
+    Ok((raw, report))
 }
 
 fn validate_terminal_state(state: &TerminalState) -> Result<(), ExecStateError> {
@@ -279,23 +1036,47 @@ fn validate_terminal_state(state: &TerminalState) -> Result<(), ExecStateError> 
     Ok(())
 }
 
-fn read(path: &Path) -> Result<String, ExecStateError> {
-    std::fs::read_to_string(path).map_err(|source| ExecStateError::ReadFailed {
-        path: path.to_path_buf(),
-        source,
+fn read_path_without_lock(path: &Path) -> Result<String, ExecStateError> {
+    let mut file = open_direct_file(path).map_err(|source| {
+        unsafe_alias_error(path, &source).unwrap_or_else(|| ExecStateError::ReadFailed {
+            path: path.to_path_buf(),
+            source,
+        })
+    })?;
+    let mut contents = String::new();
+    file.read_to_string(&mut contents)
+        .map_err(|source| ExecStateError::ReadFailed {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    Ok(contents)
+}
+
+fn read(mutation: &ExecutionStateMutation, path: &Path) -> Result<String, ExecStateError> {
+    mutation.read_to_string().map_err(|source| {
+        unsafe_alias_error(path, &source).unwrap_or_else(|| ExecStateError::ReadFailed {
+            path: path.to_path_buf(),
+            source,
+        })
     })
 }
 
-fn write_if_changed(path: &Path, original: &str, new_text: &str) -> Result<(), ExecStateError> {
+fn write_if_changed(
+    mutation: &ExecutionStateMutation,
+    path: &Path,
+    original: &str,
+    new_text: &str,
+) -> Result<(), ExecStateError> {
     if new_text == original {
         return Ok(());
     }
-    common_fs::write_atomic(path, new_text.as_bytes(), 0o644).map_err(|source| {
-        ExecStateError::WriteFailed {
+    mutation.verify_path_identity()?;
+    mutation
+        .write_atomic(new_text.as_bytes())
+        .map_err(|source| ExecStateError::WriteFailed {
             path: path.to_path_buf(),
             source,
-        }
-    })
+        })
 }
 
 /// Wrap a bare URL in a Markdown autolink (`<url>`); leave already-wrapped or
@@ -683,6 +1464,225 @@ mod tests {
 
 - 2026-06-01: authored.
 ";
+
+    #[test]
+    fn mutation_lock_releases_on_every_exit_path() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("x-execution-state.md");
+        let lock_path = execution_state_mutation_lock_path(&path);
+        std::fs::write(&path, SAMPLE).expect("write execution state");
+        let assert_released = || {
+            drop(
+                crate::mutation_lock::OwnedFileLock::acquire(&lock_path)
+                    .expect("mutation lock released"),
+            );
+        };
+
+        sync_tracking_issue(&path, "https://example.test/issues/1", false)
+            .expect("successful sync");
+        assert!(lock_path.exists(), "stable advisory lock file missing");
+        assert_released();
+
+        sync_tracking_issue(&path, "https://example.test/issues/2", true).expect("dry-run sync");
+        assert_released();
+
+        std::fs::write(&path, "# missing execution state\n").expect("write malformed state");
+        let error = sync_tracking_issue(&path, "https://example.test/issues/3", false)
+            .expect_err("missing section");
+        assert_eq!(error.code(), "exec-state-section-missing");
+        assert_released();
+
+        std::fs::remove_file(&path).expect("remove state");
+        let error = sync_tracking_issue(&path, "https://example.test/issues/4", false)
+            .expect_err("missing file");
+        assert_eq!(error.code(), "exec-state-read-failed");
+        assert_released();
+
+        std::fs::write(&path, SAMPLE).expect("restore execution state");
+        let mutation = ExecutionStateMutation::begin(&path).expect("begin write transaction");
+        std::fs::remove_file(&path).expect("remove destination file");
+        std::fs::create_dir(&path).expect("replace destination with directory");
+        mutation
+            .write_atomic(b"replacement")
+            .expect_err("atomic replacement of directory must fail");
+        drop(mutation);
+        assert_released();
+    }
+
+    #[test]
+    fn concurrent_guard_is_busy_and_lock_path_stays_stable() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("x-execution-state.md");
+        let lock_path = execution_state_mutation_lock_path(&path);
+        std::fs::write(&path, SAMPLE).expect("write execution state");
+
+        let first = ExecutionStateMutation::begin(&path).expect("first guard");
+        assert!(matches!(
+            ExecutionStateMutation::begin(&path),
+            Err(MutationLockError::Busy { .. })
+        ));
+        drop(first);
+
+        let successor = ExecutionStateMutation::begin(&path).expect("successor guard");
+        assert!(lock_path.exists(), "stable advisory lock file missing");
+        drop(successor);
+        assert!(
+            lock_path.exists(),
+            "advisory lock path must not be unlinked"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pinned_guard_reads_its_authorized_atomic_replacement() {
+        let repo = tempfile::tempdir().expect("repo");
+        let bundle = repo.path().join("bundle");
+        let path = bundle.join("x-execution-state.md");
+        std::fs::create_dir(&bundle).expect("bundle");
+        std::fs::write(&path, SAMPLE).expect("execution state");
+        let pinned = PinnedExecutionState::pin(repo.path(), &path).expect("pin execution state");
+        let guard = ExecutionStateGuard::acquire_pinned(&pinned).expect("acquire pinned guard");
+        assert_eq!(guard.read_to_string().expect("initial read"), SAMPLE);
+
+        let url = "https://example.test/issues/1";
+        let report = guard
+            .sync_tracking_issue(url, false)
+            .expect("sync tracking issue");
+        assert!(report.changed);
+        let refreshed = guard.read_to_string().expect("read authorized replacement");
+
+        assert_eq!(tracking_issue_value(&refreshed).as_deref(), Some(url));
+
+        let replacement = bundle.join("replacement.md");
+        std::fs::write(&replacement, "attacker replacement\n").expect("replacement file");
+        std::fs::rename(&replacement, &path).expect("replace visible execution state");
+        let error = guard
+            .read_to_string()
+            .expect_err("unrelated replacement must still be rejected");
+        assert_eq!(error.code(), "exec-state-read-failed");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn direct_and_pinned_execution_state_mutations_reject_hard_links() {
+        let repo = tempfile::tempdir().expect("repo");
+        let bundle = repo.path().join("bundle");
+        let path = bundle.join("x-execution-state.md");
+        let alias = repo.path().join("x-execution-state-alias.md");
+        std::fs::create_dir(&bundle).expect("bundle");
+        std::fs::write(&path, SAMPLE).expect("execution state");
+        std::fs::hard_link(&path, &alias).expect("hard-link alias");
+
+        let direct = sync_tracking_issue(&path, "https://example.test/issues/1", false)
+            .expect_err("direct mutation must reject hard links");
+        assert_eq!(direct.code(), "exec-state-unsafe-file-alias");
+        let pinned = match PinnedExecutionState::pin(repo.path(), &path) {
+            Ok(_) => panic!("pinning must reject hard links"),
+            Err(error) => error,
+        };
+        assert_eq!(pinned.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(std::fs::read_to_string(&path).expect("original"), SAMPLE);
+        assert_eq!(std::fs::read_to_string(&alias).expect("alias"), SAMPLE);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pinned_writeback_rejects_repository_root_replacement() {
+        let parent = tempfile::tempdir().expect("parent");
+        let repo = parent.path().join("repo");
+        let displaced = parent.path().join("displaced-repo");
+        let bundle = repo.join("bundle");
+        let path = bundle.join("x-execution-state.md");
+        std::fs::create_dir_all(&bundle).expect("bundle");
+        std::fs::write(&path, SAMPLE).expect("write execution state");
+        let pinned = PinnedExecutionState::pin(&repo, &path).expect("pin execution state");
+
+        std::fs::rename(&repo, &displaced).expect("displace repository root");
+        std::fs::create_dir_all(&bundle).expect("replacement bundle");
+        std::fs::write(&path, SAMPLE).expect("replacement execution state");
+        let state = TerminalState {
+            status: Some("complete".to_string()),
+            ..TerminalState::default()
+        };
+
+        let error = writeback_terminal_pinned_if_unchanged(&pinned, SAMPLE, &state, false)
+            .expect_err("repository root replacement must fail");
+
+        assert_eq!(error.code(), "exec-state-expected-path-changed");
+        assert_eq!(
+            std::fs::read_to_string(displaced.join("bundle/x-execution-state.md"))
+                .expect("displaced execution state"),
+            SAMPLE
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("replacement execution state"),
+            SAMPLE
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pinned_writeback_rejects_parent_symlink_swap_without_touching_outside() {
+        use std::os::unix::fs::symlink;
+
+        let repo = tempfile::tempdir().expect("repo");
+        let outside = tempfile::tempdir().expect("outside");
+        let bundle = repo.path().join("bundle");
+        let displaced = repo.path().join("displaced-bundle");
+        let path = bundle.join("x-execution-state.md");
+        let outside_path = outside.path().join("x-execution-state.md");
+        std::fs::create_dir(&bundle).expect("bundle");
+        std::fs::write(&path, SAMPLE).expect("write execution state");
+        std::fs::write(&outside_path, "outside sentinel\n").expect("outside sentinel");
+        let pinned = PinnedExecutionState::pin(repo.path(), &path).expect("pin execution state");
+
+        std::fs::rename(&bundle, &displaced).expect("displace pinned parent");
+        symlink(outside.path(), &bundle).expect("replace bundle with outside symlink");
+        let state = TerminalState {
+            status: Some("complete".to_string()),
+            ..TerminalState::default()
+        };
+
+        let error = writeback_terminal_pinned_if_unchanged(&pinned, SAMPLE, &state, false)
+            .expect_err("parent replacement must fail");
+
+        assert_eq!(error.code(), "exec-state-expected-path-changed");
+        assert_eq!(
+            std::fs::read_to_string(&outside_path).expect("outside after failed write"),
+            "outside sentinel\n"
+        );
+        assert!(
+            !outside.path().join("x-execution-state.md.lock").exists(),
+            "descriptor-relative lock acquisition must not follow the replacement symlink"
+        );
+        assert_eq!(
+            std::fs::read_to_string(displaced.join("x-execution-state.md"))
+                .expect("displaced original"),
+            SAMPLE
+        );
+        assert!(
+            !displaced.join("x-execution-state.md.lock").exists(),
+            "path identity rejection must precede advisory lock acquisition"
+        );
+    }
+
+    #[test]
+    fn mutation_lock_acquisition_failure_has_stable_error() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let non_directory = dir.path().join("not-a-directory");
+        std::fs::write(&non_directory, "file").expect("write parent blocker");
+        let path = non_directory.join("x-execution-state.md");
+
+        let error = sync_tracking_issue(&path, "https://example.test/issues/1", false)
+            .expect_err("lock path beneath a file must fail");
+
+        assert_eq!(error.code(), "exec-state-mutation-lock-failed");
+        assert!(
+            error
+                .to_string()
+                .contains("failed to acquire execution-state mutation lock")
+        );
+    }
 
     #[test]
     fn syncs_tracking_issue_from_placeholder() {

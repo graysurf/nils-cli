@@ -215,6 +215,7 @@ mod tests {
             format: None,
             remote: "origin".into(),
             provider,
+            host: None,
             repo: None,
             store_root: None,
             dry_run,

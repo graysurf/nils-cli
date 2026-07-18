@@ -2497,6 +2497,7 @@ dependencies = [
  "chrono",
  "clap",
  "clap_complete",
+ "libc",
  "nils-build-info",
  "nils-common",
  "nils-markdown",
@@ -2506,6 +2507,7 @@ dependencies = [
  "pulldown-cmark",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
 ]
 
@@ -2516,6 +2518,7 @@ dependencies = [
  "anyhow",
  "clap",
  "clap_complete",
+ "libc",
  "nils-build-info",
  "nils-common",
  "nils-term",

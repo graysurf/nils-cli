@@ -83,6 +83,7 @@ impl BackendProgram {
 pub struct BackendCall {
     pub program: BackendProgram,
     pub argv: Vec<OsString>,
+    env: Vec<(OsString, OsString)>,
 }
 
 impl BackendCall {
@@ -91,10 +92,56 @@ impl BackendCall {
         I: IntoIterator<Item = S>,
         S: Into<OsString>,
     {
-        Self {
+        let argv = argv.into_iter().map(Into::into).collect::<Vec<_>>();
+        let inferred_host = infer_backend_host(program, &argv);
+        let mut call = Self {
             program,
-            argv: argv.into_iter().map(Into::into).collect(),
+            argv,
+            env: Vec::new(),
+        };
+        match program {
+            BackendProgram::Gh => {
+                call.set_env("GH_HOST", inferred_host.as_deref().unwrap_or("github.com"));
+            }
+            BackendProgram::Glab => {
+                call.set_env(
+                    "GITLAB_HOST",
+                    inferred_host.as_deref().unwrap_or("gitlab.com"),
+                );
+            }
+            BackendProgram::Local => {}
         }
+        call
+    }
+
+    /// Bind this call to the resolved provider authority. Process execution also
+    /// removes both provider host variables before applying this call-local
+    /// value, so ambient configuration cannot retarget the request.
+    pub fn with_host(mut self, provider: Provider, host: impl Into<OsString>) -> Self {
+        match provider {
+            Provider::GitHub => self.set_env("GH_HOST", host),
+            Provider::GitLab => self.set_env("GITLAB_HOST", host),
+            Provider::Local => {}
+        }
+        self
+    }
+
+    pub fn resolved_host(&self) -> Option<&str> {
+        let key = match self.program {
+            BackendProgram::Gh => "GH_HOST",
+            BackendProgram::Glab => "GITLAB_HOST",
+            BackendProgram::Local => return None,
+        };
+        self.env
+            .iter()
+            .find(|(candidate, _)| candidate == OsStr::new(key))
+            .and_then(|(_, value)| value.to_str())
+    }
+
+    fn set_env(&mut self, key: impl Into<OsString>, value: impl Into<OsString>) {
+        let key = key.into();
+        self.env.retain(|(candidate, _)| candidate != &key);
+        self.env.push((key, value.into()));
     }
 
     /// Render the full `Vec<String>` argv for `data.plan` rendering. Non-UTF8
@@ -107,6 +154,36 @@ impl BackendCall {
         }
         out
     }
+}
+
+fn infer_backend_host(program: BackendProgram, argv: &[OsString]) -> Option<String> {
+    for index in 0..argv.len().saturating_sub(1) {
+        let Some(flag) = argv[index].to_str() else {
+            continue;
+        };
+        if !matches!(flag, "--hostname" | "--repo" | "-R") {
+            continue;
+        }
+        let Some(value) = argv[index + 1].to_str() else {
+            continue;
+        };
+        if flag == "--hostname" {
+            return Some(value.to_string());
+        }
+        if matches!(flag, "--repo" | "-R") {
+            if program == BackendProgram::Gh
+                && let Some((authority, slug)) = value.split_once('/')
+                && slug.contains('/')
+                && let Some(host) = crate::provider::parse_authority(authority)
+            {
+                return Some(host);
+            }
+            if let Some(host) = crate::provider::parse_host(value) {
+                return Some(host);
+            }
+        }
+    }
+    None
 }
 
 /// Successful subprocess outcome.
@@ -232,6 +309,10 @@ impl BackendRunner for ProcessRunner {
     ) -> Result<BackendOutput, ForgeError> {
         let exe = call.program.executable();
         let mut cmd = Command::new(&exe);
+        cmd.env_remove("GH_HOST").env_remove("GITLAB_HOST");
+        for (key, value) in &call.env {
+            cmd.env(key, value);
+        }
         for arg in &call.argv {
             cmd.arg(arg);
         }
@@ -609,105 +690,148 @@ pub fn is_rate_limit_stderr(stderr: &str) -> bool {
         || (s.contains("rate limit") && s.contains("exceeded"))
 }
 
-/// Replace token-shaped strings in `s` with `<redacted-token>`. Patterns
-/// covered: `gh[ps]_*`, `ghr_*`, `gho_*`, `glpat-*`, and `Bearer <token>`.
+/// Replace token-shaped strings and URL userinfo in `s` with redaction
+/// markers. Covered token patterns include GitHub and GitLab token families
+/// plus case-insensitive `Bearer <token>` authorization values.
 pub fn redact_tokens(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    let mut chars = s.chars().peekable();
-    while let Some(c) = chars.next() {
-        // Bearer prefix carries a token after the literal "Bearer "; redact
-        // the token but keep the prefix for readable context.
-        if c == 'B' && peek_consume(&mut chars, "earer ") {
-            out.push_str("Bearer ");
-            consume_token_run(&mut chars);
-            out.push_str("<redacted-token>");
-            continue;
-        }
-        if c == 'g'
-            && let Some(&n) = chars.peek()
-            && (n == 'h' || n == 'l')
+    let input = redact_url_userinfo(s);
+    let mut out = String::with_capacity(input.len());
+    let mut offset = 0;
+    while offset < input.len() {
+        let rest = &input[offset..];
+        if let Some(bearer_scheme) = rest.get(.."Bearer".len())
+            && bearer_scheme.eq_ignore_ascii_case("Bearer")
         {
-            // gh{p,s,r,o}_... | glpat-...
-            let mut buf = String::from(c);
-            buf.push(chars.next().unwrap());
-            let next = chars.peek().copied();
-            match (buf.as_str(), next) {
-                ("gh", Some(t)) if t == 'p' || t == 's' || t == 'r' || t == 'o' => {
-                    buf.push(chars.next().unwrap());
-                    if chars.peek() == Some(&'_') {
-                        chars.next();
-                        consume_token_run(&mut chars);
-                        out.push_str("<redacted-token>");
-                        continue;
-                    }
-                }
-                ("gl", Some('p')) => {
-                    buf.push(chars.next().unwrap()); // p
-                    if chars.peek() == Some(&'a') {
-                        let saved = chars.clone();
-                        buf.push(chars.next().unwrap()); // a
-                        if chars.peek() == Some(&'t') {
-                            buf.push(chars.next().unwrap()); // t
-                            if chars.peek() == Some(&'-') {
-                                chars.next();
-                                consume_token_run(&mut chars);
-                                out.push_str("<redacted-token>");
-                                continue;
-                            }
-                        }
-                        // Not glpat- after all: restore.
-                        chars = saved;
-                        buf.truncate(2);
-                    }
-                }
-                _ => {}
+            let after_scheme = &rest["Bearer".len()..];
+            let whitespace_len = after_scheme
+                .bytes()
+                .take_while(|byte| matches!(byte, b' ' | b'\t'))
+                .count();
+            let token_len = token68_run_len(&after_scheme[whitespace_len..]);
+            if whitespace_len > 0 && token_len > 0 {
+                out.push_str(bearer_scheme);
+                out.push_str(&after_scheme[..whitespace_len]);
+                out.push_str("<redacted-token>");
+                offset += "Bearer".len() + whitespace_len + token_len;
+                continue;
             }
-            out.push_str(&buf);
+        }
+
+        let mut matched = false;
+        for prefix in [
+            "github_pat_",
+            "ghp_",
+            "ghs_",
+            "ghr_",
+            "gho_",
+            "ghu_",
+            "glpat-",
+        ] {
+            if let Some(body) = rest.strip_prefix(prefix) {
+                let token_len = token_run_len(body);
+                if token_len > 0 {
+                    out.push_str("<redacted-token>");
+                    offset += prefix.len() + token_len;
+                    matched = true;
+                    break;
+                }
+            }
+        }
+        if matched {
             continue;
         }
-        out.push(c);
+
+        let ch = rest.chars().next().expect("offset is in bounds");
+        out.push(ch);
+        offset += ch.len_utf8();
     }
     out
 }
 
-fn peek_consume(iter: &mut std::iter::Peekable<std::str::Chars<'_>>, lit: &str) -> bool {
-    let saved = iter.clone();
-    for expected in lit.chars() {
-        match iter.next() {
-            Some(c) if c == expected => continue,
-            _ => {
-                *iter = saved;
-                return false;
+fn redact_url_userinfo(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let bytes = s.as_bytes();
+    let mut copied_through = 0;
+    let mut search_from = 0;
+    while let Some(relative) = s[search_from..].find("://") {
+        let separator = search_from + relative;
+        let mut scheme_start = separator;
+        while scheme_start > 0 {
+            let byte = bytes[scheme_start - 1];
+            if byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'-' | b'.') {
+                scheme_start -= 1;
+            } else {
+                break;
             }
         }
-    }
-    true
-}
-
-fn consume_token_run(iter: &mut std::iter::Peekable<std::str::Chars<'_>>) {
-    while let Some(&c) = iter.peek() {
-        if c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.' {
-            iter.next();
-        } else {
-            break;
+        let scheme = &s[scheme_start..separator];
+        if scheme.is_empty()
+            || !scheme.as_bytes()[0].is_ascii_alphabetic()
+            || !scheme
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'-' | b'.'))
+        {
+            search_from = separator + 3;
+            continue;
         }
+
+        let authority_start = separator + 3;
+        let authority_end = s[authority_start..]
+            .find(|ch: char| ch.is_ascii_whitespace() || matches!(ch, '/' | '?' | '#'))
+            .map_or(s.len(), |relative| authority_start + relative);
+        let Some(at_relative) = s[authority_start..authority_end].rfind('@') else {
+            search_from = authority_end;
+            continue;
+        };
+        let host_start = authority_start + at_relative + 1;
+        out.push_str(&s[copied_through..authority_start]);
+        out.push_str("<redacted-userinfo>@");
+        copied_through = host_start;
+        search_from = authority_end;
     }
+    out.push_str(&s[copied_through..]);
+    out
 }
 
-/// Trim `s` to the last [`STDERR_TAIL_BYTES`] and redact tokens.
+fn token68_run_len(value: &str) -> usize {
+    let body_len = value
+        .bytes()
+        .take_while(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~' | b'+' | b'/')
+        })
+        .count();
+    if body_len == 0 {
+        return 0;
+    }
+    body_len
+        + value[body_len..]
+            .bytes()
+            .take_while(|byte| *byte == b'=')
+            .count()
+}
+
+fn token_run_len(value: &str) -> usize {
+    value
+        .bytes()
+        .take_while(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
+        .count()
+}
+
+/// Redact credentials in `s`, then trim the result to the last
+/// [`STDERR_TAIL_BYTES`].
 pub fn redact_and_tail(s: &str) -> String {
-    let tail = if s.len() > STDERR_TAIL_BYTES {
-        // Step backwards on a char boundary to avoid slicing inside a
-        // multi-byte UTF-8 sequence.
-        let mut start = s.len() - STDERR_TAIL_BYTES;
-        while start < s.len() && !s.is_char_boundary(start) {
-            start += 1;
-        }
-        &s[start..]
-    } else {
-        s
-    };
-    redact_tokens(tail)
+    let redacted = redact_tokens(s);
+    if redacted.len() <= STDERR_TAIL_BYTES {
+        return redacted;
+    }
+
+    // Step forwards to a char boundary to avoid slicing inside a multi-byte
+    // UTF-8 sequence.
+    let mut start = redacted.len() - STDERR_TAIL_BYTES;
+    while !redacted.is_char_boundary(start) {
+        start += 1;
+    }
+    redacted[start..].to_string()
 }
 
 /// Probe argv for use in tests / lint assertions.
@@ -750,6 +874,66 @@ mod tests {
     }
 
     #[test]
+    fn redact_replaces_extended_tokens_and_url_userinfo() {
+        for value in [
+            "github_pat_Aa1Bb2Cc3",
+            "ghu_Aa1Bb2Cc3",
+            "bearer Aa1Bb2Cc3",
+            "BEARER Aa1Bb2Cc3",
+            "bEaReR Aa1Bb2Cc3",
+        ] {
+            let redacted = redact_tokens(value);
+            assert!(!redacted.contains("Aa1Bb2Cc3"), "{redacted}");
+            assert!(redacted.contains("<redacted-token>"), "{redacted}");
+        }
+
+        let url = "https://alice:credential-value@github.com/o/r";
+        let redacted = redact_tokens(url);
+        assert_eq!(redacted, "https://<redacted-userinfo>@github.com/o/r");
+    }
+
+    #[test]
+    fn redact_replaces_bearer_token68_with_permitted_whitespace() {
+        for value in [
+            "Bearer  secret",
+            "bEaReR   abc~def+/==",
+            "BEARER\tabc~def+/==",
+        ] {
+            let redacted = redact_tokens(value);
+            assert!(!redacted.contains("secret"), "{redacted}");
+            assert!(!redacted.contains("abc~def+/=="), "{redacted}");
+            assert!(redacted.contains("<redacted-token>"), "{redacted}");
+        }
+    }
+
+    #[test]
+    fn redact_and_tail_replaces_complete_bearer_token68() {
+        let sensitive = "Bearer  abc~def+/==";
+        let input = format!("{}{}", "x".repeat(STDERR_TAIL_BYTES), sensitive);
+        let redacted = redact_and_tail(&input);
+        assert!(!redacted.contains("abc~def+/=="), "{redacted}");
+        assert!(redacted.ends_with("Bearer  <redacted-token>"), "{redacted}");
+        assert!(redacted.len() <= STDERR_TAIL_BYTES);
+    }
+
+    #[test]
+    fn redact_preserves_unicode_across_ascii_prefix_boundaries() {
+        let input = "123456✓ authenticated";
+        assert_eq!(redact_tokens(input), input);
+    }
+
+    #[test]
+    fn redact_and_tail_redacts_before_truncating() {
+        let sensitive = "https://alice:credential-value@github.com/o/r";
+        let input = format!("{}{}", "x".repeat(STDERR_TAIL_BYTES), sensitive);
+        let redacted = redact_and_tail(&input);
+        assert!(!redacted.contains("alice"), "{redacted}");
+        assert!(!redacted.contains("credential-value"), "{redacted}");
+        assert!(redacted.contains("github.com/o/r"), "{redacted}");
+        assert!(redacted.len() <= STDERR_TAIL_BYTES);
+    }
+
+    #[test]
     fn redact_keeps_innocent_strings() {
         let s = "hello world ghp not_a_token";
         assert_eq!(redact_tokens(s), "hello world ghp not_a_token");
@@ -771,6 +955,57 @@ mod tests {
     }
 
     #[test]
+    fn backend_call_infers_non_default_port_from_github_repo_locator() {
+        let call = BackendCall::new(
+            BackendProgram::Gh,
+            ["pr", "view", "7", "--repo", "internal.example:8443/o/r"],
+        );
+        assert_eq!(call.resolved_host(), Some("internal.example:8443"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn backend_call_host_inference_skips_unrelated_non_utf8_argv() {
+        use std::os::unix::ffi::OsStringExt;
+
+        for (program, flag, value, expected_host) in [
+            (
+                BackendProgram::Gh,
+                "--repo",
+                "internal.example:8443/o/r",
+                "internal.example:8443",
+            ),
+            (
+                BackendProgram::Glab,
+                "--hostname",
+                "gitlab.example.test",
+                "gitlab.example.test",
+            ),
+            (
+                BackendProgram::Glab,
+                "-R",
+                "https://gitlab.example.test/group/project",
+                "gitlab.example.test",
+            ),
+        ] {
+            let call = BackendCall::new(
+                program,
+                vec![
+                    OsString::from("unrelated"),
+                    OsString::from_vec(vec![0xff]),
+                    OsString::from(flag),
+                    OsString::from(value),
+                ],
+            );
+            assert_eq!(
+                call.resolved_host(),
+                Some(expected_host),
+                "failed to infer the host from {flag} after non-UTF8 argv"
+            );
+        }
+    }
+
+    #[test]
     fn backend_program_executable_honours_override() {
         // Using a thread-safe env override via std::env::set_var is not safe
         // across tests; assert default name only.
@@ -785,6 +1020,38 @@ mod tests {
     /// `backend_missing` / `backend_timeout` outcome. Poison is recovered so a
     /// panic in one test does not cascade-fail the other.
     static ENV_GH_BIN_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn process_runner_applies_call_local_host_over_ambient_hosts() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _guard = ENV_GH_BIN_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let stub = dir.path().join("gh");
+        std::fs::write(
+            &stub,
+            "#!/bin/sh\nprintf '%s|%s\\n' \"$GH_HOST\" \"${GITLAB_HOST-unset}\"\n",
+        )
+        .expect("write stub");
+        let mut perms = std::fs::metadata(&stub).expect("metadata").permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&stub, perms).expect("chmod");
+
+        unsafe {
+            std::env::set_var(ENV_GH_BIN, &stub);
+            std::env::set_var("GH_HOST", "ambient.ghe.example");
+            std::env::set_var("GITLAB_HOST", "ambient.gitlab.example");
+        }
+        let call = BackendCall::new(BackendProgram::Gh, ["auth", "status"])
+            .with_host(Provider::GitHub, "internal.ghe.com:8443");
+        let output = ProcessRunner.run(&call).expect("stub succeeds");
+        unsafe {
+            std::env::remove_var(ENV_GH_BIN);
+            std::env::remove_var("GH_HOST");
+            std::env::remove_var("GITLAB_HOST");
+        }
+        assert_eq!(output.stdout.trim(), "internal.ghe.com:8443|unset");
+    }
 
     #[test]
     fn process_runner_reports_missing_backend() {
@@ -809,8 +1076,11 @@ mod tests {
         let _guard = ENV_GH_BIN_GUARD.lock().unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::TempDir::new().expect("tempdir");
         let stub = dir.path().join("gh");
-        std::fs::write(&stub, "#!/bin/sh\nsleep 2\necho should-not-complete\n")
-            .expect("write stub");
+        std::fs::write(
+            &stub,
+            "#!/bin/sh\necho 'https://alice:credential-value@github.com/o/r' >&2\nsleep 2\necho should-not-complete\n",
+        )
+        .expect("write stub");
         let mut perms = std::fs::metadata(&stub).expect("metadata").permissions();
         perms.set_mode(0o755);
         std::fs::set_permissions(&stub, perms).expect("chmod");
@@ -828,6 +1098,10 @@ mod tests {
             std::env::remove_var(ENV_GH_BIN);
         }
         assert_eq!(err.kind(), "backend_timeout");
+        let detail = err.detail().expect("timeout stderr detail");
+        assert!(!detail.contains("alice"), "{detail}");
+        assert!(!detail.contains("credential-value"), "{detail}");
+        assert!(detail.contains("github.com/o/r"), "{detail}");
         assert!(
             started.elapsed() < Duration::from_secs(1),
             "timeout should kill the child promptly"
@@ -870,7 +1144,7 @@ mod tests {
         std::fs::write(
             &stub,
             format!(
-                "#!/bin/sh\nyes 0123456789 | head -c {}\n",
+                "#!/bin/sh\necho 'https://alice:credential-value@github.com/o/r' >&2\nyes 0123456789 | head -c {}\n",
                 BACKEND_CAPTURE_LIMIT_BYTES + 1
             ),
         )
@@ -891,6 +1165,10 @@ mod tests {
         }
         let err = result.expect_err("output above the capture limit must fail");
         assert_eq!(err.kind(), "backend_output_limit");
+        let detail = err.detail().expect("output-limit stderr detail");
+        assert!(!detail.contains("alice"), "{detail}");
+        assert!(!detail.contains("credential-value"), "{detail}");
+        assert!(detail.contains("github.com/o/r"), "{detail}");
         assert!(
             started.elapsed() < Duration::from_secs(1),
             "overflow should terminate the child promptly"

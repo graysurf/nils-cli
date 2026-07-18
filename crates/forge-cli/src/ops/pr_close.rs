@@ -145,7 +145,12 @@ mod tests {
     fn ctx(p: Provider) -> ProviderContext {
         ProviderContext {
             provider: p,
-            host: "example.com".into(),
+            host: match p {
+                Provider::GitHub => "github.com",
+                Provider::GitLab => "gitlab.com",
+                Provider::Local => "local",
+            }
+            .into(),
             source: DetectionSource::Flag,
             repo: None,
         }
@@ -156,6 +161,7 @@ mod tests {
             format: None,
             remote: "origin".into(),
             provider,
+            host: None,
             repo: None,
             store_root: None,
             dry_run,

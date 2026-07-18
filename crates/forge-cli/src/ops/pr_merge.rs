@@ -503,7 +503,7 @@ pub fn build_merge_call(
     BackendCall::new(program, argv)
 }
 
-fn build_dry_run_merge_call(
+pub(crate) fn build_dry_run_merge_call(
     ctx: &ProviderContext,
     id: u64,
     method: MergeMethod,

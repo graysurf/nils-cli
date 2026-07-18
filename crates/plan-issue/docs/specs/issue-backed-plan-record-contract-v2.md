@@ -250,9 +250,15 @@ stop the two from drifting once a tracking issue exists:
   `## Handoff`) through the bundle `--bundle` directory. The fields are
   transformed in memory and committed with one atomic file write, so the
   in-repo file is coherent immediately after closeout rather than
-  transient-stale until `plan-archive migrate`. The `## Task Ledger` rows are
-  not touched here — they are owned by per-task `plan-tooling ledger-update`
-  and the `close-ready` `ledger-rows-pending` gate.
+  transient-stale until `plan-archive migrate`. For a live close, the verified
+  repository root, execution-state parent, and target file are
+  descriptor-pinned before provider closure. Post-close writeback revalidates
+  path and file identity, requires the exact preflight contents, and atomically
+  replaces the target relative to the pinned parent. A renamed,
+  symlink-swapped, replaced, or concurrently changed target fails writeback
+  instead of redirecting it. The `## Task Ledger` rows are not touched here —
+  they are owned by per-task `plan-tooling ledger-update` and the `close-ready`
+  `ledger-rows-pending` gate.
 - `tracking checkpoint --live` reconciles the durable `Tracking issue` bullet
   with run-state: a missing or placeholder URL is self-healed (the URL is
   derived offline from the repo slug) and a genuine issue mismatch refuses with
@@ -388,18 +394,26 @@ Strict, single-command closeout:
    label identity remains case-sensitive. Local stores intentionally have no
    repository catalog: additions are free-form, so availability remains
    unchecked while current-label normalization and read-back still apply.
-5. Applies the preflighted label edit and reads the final labels back to verify
-   the requested mutations and state exclusivity. If edit or convergence fails,
-   reverses and verifies this command's owned label delta; the issue remains
-   open and no closeout comment or dashboard write occurs.
-   If a later pre-close write fails, reverses and verifies only this command's
-   owned label delta before returning the original failure, preserving
-   unrelated concurrent provider labels. The issue-close request is the commit
-   point; an ambiguous close response does not restore pre-close labels on an
-   issue that may already be closed.
-6. Renders and posts the `closeout` comment with structured payload.
-7. Renders and edits the `## Final Dashboard` issue body, then closes the
-   provider issue.
+5. While holding the issue lifecycle lock, re-fetches gate-bearing issue and
+   linked-PR evidence, re-evaluates the strict gate, and closes the provider
+   issue as the first mutation. A failed close therefore leaves the issue open
+   without terminal labels, a closeout comment, or a final dashboard written by
+   this invocation. An ambiguous close response is treated as the commit point
+   because the issue may already be closed.
+6. Applies the preflighted label edit and reads the final labels back to verify
+   the requested mutations and state exclusivity.
+7. Resolves the `closeout` comment idempotently. Only the audit-selected latest
+   valid closeout is eligible for reuse. For current-schema payloads, semantic
+   equality requires identical role, profile, and `data`; only envelope
+   `updated_at` is ignored. If the latest closeout does not match, the invocation
+   makes at most one provider post attempt. A post error triggers exactly one
+   issue-evidence reread and succeeds only if that reread's latest valid closeout
+   semantically matches; the invocation never reposts.
+8. Renders and edits the `## Final Dashboard` issue body. The reused or returned
+   closeout URL and payload are overlaid on the provider read-back so transient
+   comment-list lag cannot regress the terminal dashboard. A post-close
+   projection failure is returned without reversing provider state; callers can
+   retry or repair the remaining terminal projection.
 
 Provider-bound validation rejects machine-local home paths (`/Users/<owner>/...`
 or `/home/<owner>/...`) in live write payloads. Diagnostics identify the unsafe
@@ -451,9 +465,6 @@ Failure modes that block close:
   predicted final set without mutating the provider.
 - `record-close-label-convergence-failed` when final read-back does not confirm
   every requested add/remove or still contains conflicting `state::*` labels.
-- `record-close-label-rollback-failed` when the label gate or a downstream
-  pre-close write fails and this command's owned label delta cannot be reversed
-  and confirmed.
 
 Each failure returns a stable machine-readable code that maps to a single
 unblock action.

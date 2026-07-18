@@ -19,7 +19,8 @@ _forge-cli() {
 json\:"Single-record JSON envelope (snake_case)"))' \
 '--remote=[Git remote whose URL feeds provider detection (default\: \`origin\`)]:REMOTE:_default' \
 '--provider=[Override auto-detected provider]:PROVIDER:(github gitlab local)' \
-'--repo=[Override the repo slug (\`owner/name\`). When absent it is derived from the remote URL]:owner/name:_default' \
+'--host=[Override the forge authority (\`hostname\` or \`hostname\:port\`). With \`--provider\`, a syntactically valid custom authority is accepted unless it is positively identified as the other provider. Without \`--provider\`, the authority must identify a supported provider]:HOST:_default' \
+'--repo=[Override the remote-derived repository path. Accepted shapes\: GitHub \`owner/name\`; GitLab \`group\[/subgroup...\]/project\`; Local \`local\:<slug>\` or \`<slug>\`]:REPOSITORY:_default' \
 '--store-root=[Root directory of the file-backed store used by \`--provider local\`. Overrides the \`FORGE_CLI_LOCAL_STORE\` env var]:path:_files' \
 '--dry-run[Validate and describe the planned operation without applying its mutation. Read-only preflight calls may still run]' \
 '-h[Print help (see more with '\''--help'\'')]' \
@@ -41,7 +42,8 @@ _arguments "${_arguments_options[@]}" : \
 json\:"Single-record JSON envelope (snake_case)"))' \
 '--remote=[Git remote whose URL feeds provider detection (default\: \`origin\`)]:REMOTE:_default' \
 '--provider=[Override auto-detected provider]:PROVIDER:(github gitlab local)' \
-'--repo=[Override the repo slug (\`owner/name\`). When absent it is derived from the remote URL]:owner/name:_default' \
+'--host=[Override the forge authority (\`hostname\` or \`hostname\:port\`). With \`--provider\`, a syntactically valid custom authority is accepted unless it is positively identified as the other provider. Without \`--provider\`, the authority must identify a supported provider]:HOST:_default' \
+'--repo=[Override the remote-derived repository path. Accepted shapes\: GitHub \`owner/name\`; GitLab \`group\[/subgroup...\]/project\`; Local \`local\:<slug>\` or \`<slug>\`]:REPOSITORY:_default' \
 '--store-root=[Root directory of the file-backed store used by \`--provider local\`. Overrides the \`FORGE_CLI_LOCAL_STORE\` env var]:path:_files' \
 '--dry-run[Validate and describe the planned operation without applying its mutation. Read-only preflight calls may still run]' \
 '-h[Print help (see more with '\''--help'\'')]' \
@@ -72,7 +74,8 @@ _arguments "${_arguments_options[@]}" : \
 json\:"Single-record JSON envelope (snake_case)"))' \
 '--remote=[Git remote whose URL feeds provider detection (default\: \`origin\`)]:REMOTE:_default' \
 '--provider=[Override auto-detected provider]:PROVIDER:(github gitlab local)' \
-'--repo=[Override the repo slug (\`owner/name\`). When absent it is derived from the remote URL]:owner/name:_default' \
+'--host=[Override the forge authority (\`hostname\` or \`hostname\:port\`). With \`--provider\`, a syntactically valid custom authority is accepted unless it is positively identified as the other provider. Without \`--provider\`, the authority must identify a supported provider]:HOST:_default' \
+'--repo=[Override the remote-derived repository path. Accepted shapes\: GitHub \`owner/name\`; GitLab \`group\[/subgroup...\]/project\`; Local \`local\:<slug>\` or \`<slug>\`]:REPOSITORY:_default' \
 '--store-root=[Root directory of the file-backed store used by \`--provider local\`. Overrides the \`FORGE_CLI_LOCAL_STORE\` env var]:path:_files' \
 '--no-draft[Open as ready-for-review instead of draft (default\: open as draft)]' \
 '--strict-labels[Fail when selected labels are missing, not applicable, or conflict]' \
@@ -87,7 +90,8 @@ _arguments "${_arguments_options[@]}" : \
 json\:"Single-record JSON envelope (snake_case)"))' \
 '--remote=[Git remote whose URL feeds provider detection (default\: \`origin\`)]:REMOTE:_default' \
 '--provider=[Override auto-detected provider]:PROVIDER:(github gitlab local)' \
-'--repo=[Override the repo slug (\`owner/name\`). When absent it is derived from the remote URL]:owner/name:_default' \
+'--host=[Override the forge authority (\`hostname\` or \`hostname\:port\`). With \`--provider\`, a syntactically valid custom authority is accepted unless it is positively identified as the other provider. Without \`--provider\`, the authority must identify a supported provider]:HOST:_default' \
+'--repo=[Override the remote-derived repository path. Accepted shapes\: GitHub \`owner/name\`; GitLab \`group\[/subgroup...\]/project\`; Local \`local\:<slug>\` or \`<slug>\`]:REPOSITORY:_default' \
 '--store-root=[Root directory of the file-backed store used by \`--provider local\`. Overrides the \`FORGE_CLI_LOCAL_STORE\` env var]:path:_files' \
 '--dry-run[Validate and describe the planned operation without applying its mutation. Read-only preflight calls may still run]' \
 '-h[Print help (see more with '\''--help'\'')]' \
@@ -105,7 +109,8 @@ _arguments "${_arguments_options[@]}" : \
 json\:"Single-record JSON envelope (snake_case)"))' \
 '--remote=[Git remote whose URL feeds provider detection (default\: \`origin\`)]:REMOTE:_default' \
 '--provider=[Override auto-detected provider]:PROVIDER:(github gitlab local)' \
-'--repo=[Override the repo slug (\`owner/name\`). When absent it is derived from the remote URL]:owner/name:_default' \
+'--host=[Override the forge authority (\`hostname\` or \`hostname\:port\`). With \`--provider\`, a syntactically valid custom authority is accepted unless it is positively identified as the other provider. Without \`--provider\`, the authority must identify a supported provider]:HOST:_default' \
+'--repo=[Override the remote-derived repository path. Accepted shapes\: GitHub \`owner/name\`; GitLab \`group\[/subgroup...\]/project\`; Local \`local\:<slug>\` or \`<slug>\`]:REPOSITORY:_default' \
 '--store-root=[Root directory of the file-backed store used by \`--provider local\`. Overrides the \`FORGE_CLI_LOCAL_STORE\` env var]:path:_files' \
 '--dry-run[Validate and describe the planned operation without applying its mutation. Read-only preflight calls may still run]' \
 '-h[Print help (see more with '\''--help'\'')]' \
@@ -125,7 +130,8 @@ _arguments "${_arguments_options[@]}" : \
 json\:"Single-record JSON envelope (snake_case)"))' \
 '--remote=[Git remote whose URL feeds provider detection (default\: \`origin\`)]:REMOTE:_default' \
 '--provider=[Override auto-detected provider]:PROVIDER:(github gitlab local)' \
-'--repo=[Override the repo slug (\`owner/name\`). When absent it is derived from the remote URL]:owner/name:_default' \
+'--host=[Override the forge authority (\`hostname\` or \`hostname\:port\`). With \`--provider\`, a syntactically valid custom authority is accepted unless it is positively identified as the other provider. Without \`--provider\`, the authority must identify a supported provider]:HOST:_default' \
+'--repo=[Override the remote-derived repository path. Accepted shapes\: GitHub \`owner/name\`; GitLab \`group\[/subgroup...\]/project\`; Local \`local\:<slug>\` or \`<slug>\`]:REPOSITORY:_default' \
 '--store-root=[Root directory of the file-backed store used by \`--provider local\`. Overrides the \`FORGE_CLI_LOCAL_STORE\` env var]:path:_files' \
 '--dry-run[Validate and describe the planned operation without applying its mutation. Read-only preflight calls may still run]' \
 '-h[Print help (see more with '\''--help'\'')]' \
@@ -141,7 +147,8 @@ _arguments "${_arguments_options[@]}" : \
 json\:"Single-record JSON envelope (snake_case)"))' \
 '--remote=[Git remote whose URL feeds provider detection (default\: \`origin\`)]:REMOTE:_default' \
 '--provider=[Override auto-detected provider]:PROVIDER:(github gitlab local)' \
-'--repo=[Override the repo slug (\`owner/name\`). When absent it is derived from the remote URL]:owner/name:_default' \
+'--host=[Override the forge authority (\`hostname\` or \`hostname\:port\`). With \`--provider\`, a syntactically valid custom authority is accepted unless it is positively identified as the other provider. Without \`--provider\`, the authority must identify a supported provider]:HOST:_default' \
+'--repo=[Override the remote-derived repository path. Accepted shapes\: GitHub \`owner/name\`; GitLab \`group\[/subgroup...\]/project\`; Local \`local\:<slug>\` or \`<slug>\`]:REPOSITORY:_default' \
 '--store-root=[Root directory of the file-backed store used by \`--provider local\`. Overrides the \`FORGE_CLI_LOCAL_STORE\` env var]:path:_files' \
 '--dry-run[Validate and describe the planned operation without applying its mutation. Read-only preflight calls may still run]' \
 '-h[Print help (see more with '\''--help'\'')]' \
@@ -164,7 +171,8 @@ request-changes\:"Record a request-changes outcome in the posted review comment"
 json\:"Single-record JSON envelope (snake_case)"))' \
 '--remote=[Git remote whose URL feeds provider detection (default\: \`origin\`)]:REMOTE:_default' \
 '--provider=[Override auto-detected provider]:PROVIDER:(github gitlab local)' \
-'--repo=[Override the repo slug (\`owner/name\`). When absent it is derived from the remote URL]:owner/name:_default' \
+'--host=[Override the forge authority (\`hostname\` or \`hostname\:port\`). With \`--provider\`, a syntactically valid custom authority is accepted unless it is positively identified as the other provider. Without \`--provider\`, the authority must identify a supported provider]:HOST:_default' \
+'--repo=[Override the remote-derived repository path. Accepted shapes\: GitHub \`owner/name\`; GitLab \`group\[/subgroup...\]/project\`; Local \`local\:<slug>\` or \`<slug>\`]:REPOSITORY:_default' \
 '--store-root=[Root directory of the file-backed store used by \`--provider local\`. Overrides the \`FORGE_CLI_LOCAL_STORE\` env var]:path:_files' \
 '--mirror-issue[Mirror a compact activity note to \`--issue\` (required; omitting it returns the \`issue_required\` envelope at runtime)]' \
 '--submit-review[Submit a native provider review event instead of posting an outcome comment. On GitHub this POSTs \`.../pulls/<id>/reviews\`, creating the \`#pullrequestreview-\` object; \`--decision\` maps to the review event (comments-only→COMMENT, approve→APPROVE, request-changes→REQUEST_CHANGES). The review is authored by the invoking token'\''s identity (e.g. a reviewer bot via FORGE_BOT_PROFILE). A body is required for COMMENT and REQUEST_CHANGES and optional for APPROVE. GitHub-only in v1]' \
@@ -191,7 +199,8 @@ _arguments "${_arguments_options[@]}" : \
 json\:"Single-record JSON envelope (snake_case)"))' \
 '--remote=[Git remote whose URL feeds provider detection (default\: \`origin\`)]:REMOTE:_default' \
 '--provider=[Override auto-detected provider]:PROVIDER:(github gitlab local)' \
-'--repo=[Override the repo slug (\`owner/name\`). When absent it is derived from the remote URL]:owner/name:_default' \
+'--host=[Override the forge authority (\`hostname\` or \`hostname\:port\`). With \`--provider\`, a syntactically valid custom authority is accepted unless it is positively identified as the other provider. Without \`--provider\`, the authority must identify a supported provider]:HOST:_default' \
+'--repo=[Override the remote-derived repository path. Accepted shapes\: GitHub \`owner/name\`; GitLab \`group\[/subgroup...\]/project\`; Local \`local\:<slug>\` or \`<slug>\`]:REPOSITORY:_default' \
 '--store-root=[Root directory of the file-backed store used by \`--provider local\`. Overrides the \`FORGE_CLI_LOCAL_STORE\` env var]:path:_files' \
 '--check-diff[Check thread path / line coordinates against the live GitHub PR diff]' \
 '--dry-run[Validate and describe the planned operation without applying its mutation. Read-only preflight calls may still run]' \
@@ -234,7 +243,8 @@ _arguments "${_arguments_options[@]}" : \
 json\:"Single-record JSON envelope (snake_case)"))' \
 '--remote=[Git remote whose URL feeds provider detection (default\: \`origin\`)]:REMOTE:_default' \
 '--provider=[Override auto-detected provider]:PROVIDER:(github gitlab local)' \
-'--repo=[Override the repo slug (\`owner/name\`). When absent it is derived from the remote URL]:owner/name:_default' \
+'--host=[Override the forge authority (\`hostname\` or \`hostname\:port\`). With \`--provider\`, a syntactically valid custom authority is accepted unless it is positively identified as the other provider. Without \`--provider\`, the authority must identify a supported provider]:HOST:_default' \
+'--repo=[Override the remote-derived repository path. Accepted shapes\: GitHub \`owner/name\`; GitLab \`group\[/subgroup...\]/project\`; Local \`local\:<slug>\` or \`<slug>\`]:REPOSITORY:_default' \
 '--store-root=[Root directory of the file-backed store used by \`--provider local\`. Overrides the \`FORGE_CLI_LOCAL_STORE\` env var]:path:_files' \
 '--dry-run[Validate and describe the planned operation without applying its mutation. Read-only preflight calls may still run]' \
 '-h[Print help (see more with '\''--help'\'')]' \
@@ -248,7 +258,8 @@ _arguments "${_arguments_options[@]}" : \
 json\:"Single-record JSON envelope (snake_case)"))' \
 '--remote=[Git remote whose URL feeds provider detection (default\: \`origin\`)]:REMOTE:_default' \
 '--provider=[Override auto-detected provider]:PROVIDER:(github gitlab local)' \
-'--repo=[Override the repo slug (\`owner/name\`). When absent it is derived from the remote URL]:owner/name:_default' \
+'--host=[Override the forge authority (\`hostname\` or \`hostname\:port\`). With \`--provider\`, a syntactically valid custom authority is accepted unless it is positively identified as the other provider. Without \`--provider\`, the authority must identify a supported provider]:HOST:_default' \
+'--repo=[Override the remote-derived repository path. Accepted shapes\: GitHub \`owner/name\`; GitLab \`group\[/subgroup...\]/project\`; Local \`local\:<slug>\` or \`<slug>\`]:REPOSITORY:_default' \
 '--store-root=[Root directory of the file-backed store used by \`--provider local\`. Overrides the \`FORGE_CLI_LOCAL_STORE\` env var]:path:_files' \
 '--dry-run[Validate and describe the planned operation without applying its mutation. Read-only preflight calls may still run]' \
 '-h[Print help (see more with '\''--help'\'')]' \
@@ -262,7 +273,8 @@ _arguments "${_arguments_options[@]}" : \
 json\:"Single-record JSON envelope (snake_case)"))' \
 '--remote=[Git remote whose URL feeds provider detection (default\: \`origin\`)]:REMOTE:_default' \
 '--provider=[Override auto-detected provider]:PROVIDER:(github gitlab local)' \
-'--repo=[Override the repo slug (\`owner/name\`). When absent it is derived from the remote URL]:owner/name:_default' \
+'--host=[Override the forge authority (\`hostname\` or \`hostname\:port\`). With \`--provider\`, a syntactically valid custom authority is accepted unless it is positively identified as the other provider. Without \`--provider\`, the authority must identify a supported provider]:HOST:_default' \
+'--repo=[Override the remote-derived repository path. Accepted shapes\: GitHub \`owner/name\`; GitLab \`group\[/subgroup...\]/project\`; Local \`local\:<slug>\` or \`<slug>\`]:REPOSITORY:_default' \
 '--store-root=[Root directory of the file-backed store used by \`--provider local\`. Overrides the \`FORGE_CLI_LOCAL_STORE\` env var]:path:_files' \
 '--dry-run[Validate and describe the planned operation without applying its mutation. Read-only preflight calls may still run]' \
 '-h[Print help (see more with '\''--help'\'')]' \
@@ -283,7 +295,8 @@ _arguments "${_arguments_options[@]}" : \
 json\:"Single-record JSON envelope (snake_case)"))' \
 '--remote=[Git remote whose URL feeds provider detection (default\: \`origin\`)]:REMOTE:_default' \
 '--provider=[Override auto-detected provider]:PROVIDER:(github gitlab local)' \
-'--repo=[Override the repo slug (\`owner/name\`). When absent it is derived from the remote URL]:owner/name:_default' \
+'--host=[Override the forge authority (\`hostname\` or \`hostname\:port\`). With \`--provider\`, a syntactically valid custom authority is accepted unless it is positively identified as the other provider. Without \`--provider\`, the authority must identify a supported provider]:HOST:_default' \
+'--repo=[Override the remote-derived repository path. Accepted shapes\: GitHub \`owner/name\`; GitLab \`group\[/subgroup...\]/project\`; Local \`local\:<slug>\` or \`<slug>\`]:REPOSITORY:_default' \
 '--store-root=[Root directory of the file-backed store used by \`--provider local\`. Overrides the \`FORGE_CLI_LOCAL_STORE\` env var]:path:_files' \
 '--dry-run[Validate and describe the planned operation without applying its mutation. Read-only preflight calls may still run]' \
 '-h[Print help (see more with '\''--help'\'')]' \
@@ -300,7 +313,8 @@ _arguments "${_arguments_options[@]}" : \
 json\:"Single-record JSON envelope (snake_case)"))' \
 '--remote=[Git remote whose URL feeds provider detection (default\: \`origin\`)]:REMOTE:_default' \
 '--provider=[Override auto-detected provider]:PROVIDER:(github gitlab local)' \
-'--repo=[Override the repo slug (\`owner/name\`). When absent it is derived from the remote URL]:owner/name:_default' \
+'--host=[Override the forge authority (\`hostname\` or \`hostname\:port\`). With \`--provider\`, a syntactically valid custom authority is accepted unless it is positively identified as the other provider. Without \`--provider\`, the authority must identify a supported provider]:HOST:_default' \
+'--repo=[Override the remote-derived repository path. Accepted shapes\: GitHub \`owner/name\`; GitLab \`group\[/subgroup...\]/project\`; Local \`local\:<slug>\` or \`<slug>\`]:REPOSITORY:_default' \
 '--store-root=[Root directory of the file-backed store used by \`--provider local\`. Overrides the \`FORGE_CLI_LOCAL_STORE\` env var]:path:_files' \
 '--dry-run[Validate and describe the planned operation without applying its mutation. Read-only preflight calls may still run]' \
 '-h[Print help (see more with '\''--help'\'')]' \
@@ -317,7 +331,8 @@ _arguments "${_arguments_options[@]}" : \
 json\:"Single-record JSON envelope (snake_case)"))' \
 '--remote=[Git remote whose URL feeds provider detection (default\: \`origin\`)]:REMOTE:_default' \
 '--provider=[Override auto-detected provider]:PROVIDER:(github gitlab local)' \
-'--repo=[Override the repo slug (\`owner/name\`). When absent it is derived from the remote URL]:owner/name:_default' \
+'--host=[Override the forge authority (\`hostname\` or \`hostname\:port\`). With \`--provider\`, a syntactically valid custom authority is accepted unless it is positively identified as the other provider. Without \`--provider\`, the authority must identify a supported provider]:HOST:_default' \
+'--repo=[Override the remote-derived repository path. Accepted shapes\: GitHub \`owner/name\`; GitLab \`group\[/subgroup...\]/project\`; Local \`local\:<slug>\` or \`<slug>\`]:REPOSITORY:_default' \
 '--store-root=[Root directory of the file-backed store used by \`--provider local\`. Overrides the \`FORGE_CLI_LOCAL_STORE\` env var]:path:_files' \
 '--dry-run[Validate and describe the planned operation without applying its mutation. Read-only preflight calls may still run]' \
 '-h[Print help (see more with '\''--help'\'')]' \
@@ -367,7 +382,8 @@ _arguments "${_arguments_options[@]}" : \
 json\:"Single-record JSON envelope (snake_case)"))' \
 '--remote=[Git remote whose URL feeds provider detection (default\: \`origin\`)]:REMOTE:_default' \
 '--provider=[Override auto-detected provider]:PROVIDER:(github gitlab local)' \
-'--repo=[Override the repo slug (\`owner/name\`). When absent it is derived from the remote URL]:owner/name:_default' \
+'--host=[Override the forge authority (\`hostname\` or \`hostname\:port\`). With \`--provider\`, a syntactically valid custom authority is accepted unless it is positively identified as the other provider. Without \`--provider\`, the authority must identify a supported provider]:HOST:_default' \
+'--repo=[Override the remote-derived repository path. Accepted shapes\: GitHub \`owner/name\`; GitLab \`group\[/subgroup...\]/project\`; Local \`local\:<slug>\` or \`<slug>\`]:REPOSITORY:_default' \
 '--store-root=[Root directory of the file-backed store used by \`--provider local\`. Overrides the \`FORGE_CLI_LOCAL_STORE\` env var]:path:_files' \
 '--dry-run[Validate and describe the planned operation without applying its mutation. Read-only preflight calls may still run]' \
 '-h[Print help (see more with '\''--help'\'')]' \
@@ -381,7 +397,8 @@ _arguments "${_arguments_options[@]}" : \
 json\:"Single-record JSON envelope (snake_case)"))' \
 '--remote=[Git remote whose URL feeds provider detection (default\: \`origin\`)]:REMOTE:_default' \
 '--provider=[Override auto-detected provider]:PROVIDER:(github gitlab local)' \
-'--repo=[Override the repo slug (\`owner/name\`). When absent it is derived from the remote URL]:owner/name:_default' \
+'--host=[Override the forge authority (\`hostname\` or \`hostname\:port\`). With \`--provider\`, a syntactically valid custom authority is accepted unless it is positively identified as the other provider. Without \`--provider\`, the authority must identify a supported provider]:HOST:_default' \
+'--repo=[Override the remote-derived repository path. Accepted shapes\: GitHub \`owner/name\`; GitLab \`group\[/subgroup...\]/project\`; Local \`local\:<slug>\` or \`<slug>\`]:REPOSITORY:_default' \
 '--store-root=[Root directory of the file-backed store used by \`--provider local\`. Overrides the \`FORGE_CLI_LOCAL_STORE\` env var]:path:_files' \
 '--dry-run[Validate and describe the planned operation without applying its mutation. Read-only preflight calls may still run]' \
 '-h[Print help (see more with '\''--help'\'')]' \
@@ -407,7 +424,8 @@ _arguments "${_arguments_options[@]}" : \
 json\:"Single-record JSON envelope (snake_case)"))' \
 '--remote=[Git remote whose URL feeds provider detection (default\: \`origin\`)]:REMOTE:_default' \
 '--provider=[Override auto-detected provider]:PROVIDER:(github gitlab local)' \
-'--repo=[Override the repo slug (\`owner/name\`). When absent it is derived from the remote URL]:owner/name:_default' \
+'--host=[Override the forge authority (\`hostname\` or \`hostname\:port\`). With \`--provider\`, a syntactically valid custom authority is accepted unless it is positively identified as the other provider. Without \`--provider\`, the authority must identify a supported provider]:HOST:_default' \
+'--repo=[Override the remote-derived repository path. Accepted shapes\: GitHub \`owner/name\`; GitLab \`group\[/subgroup...\]/project\`; Local \`local\:<slug>\` or \`<slug>\`]:REPOSITORY:_default' \
 '--store-root=[Root directory of the file-backed store used by \`--provider local\`. Overrides the \`FORGE_CLI_LOCAL_STORE\` env var]:path:_files' \
 '--confirm-abandoned[Confirm that the exact guarded pending review is an abandoned draft]' \
 '--dry-run[Validate and describe the planned operation without applying its mutation. Read-only preflight calls may still run]' \
@@ -450,7 +468,8 @@ _arguments "${_arguments_options[@]}" : \
 json\:"Single-record JSON envelope (snake_case)"))' \
 '--remote=[Git remote whose URL feeds provider detection (default\: \`origin\`)]:REMOTE:_default' \
 '--provider=[Override auto-detected provider]:PROVIDER:(github gitlab local)' \
-'--repo=[Override the repo slug (\`owner/name\`). When absent it is derived from the remote URL]:owner/name:_default' \
+'--host=[Override the forge authority (\`hostname\` or \`hostname\:port\`). With \`--provider\`, a syntactically valid custom authority is accepted unless it is positively identified as the other provider. Without \`--provider\`, the authority must identify a supported provider]:HOST:_default' \
+'--repo=[Override the remote-derived repository path. Accepted shapes\: GitHub \`owner/name\`; GitLab \`group\[/subgroup...\]/project\`; Local \`local\:<slug>\` or \`<slug>\`]:REPOSITORY:_default' \
 '--store-root=[Root directory of the file-backed store used by \`--provider local\`. Overrides the \`FORGE_CLI_LOCAL_STORE\` env var]:path:_files' \
 '--dry-run[Validate and describe the planned operation without applying its mutation. Read-only preflight calls may still run]' \
 '-h[Print help (see more with '\''--help'\'')]' \
@@ -469,7 +488,8 @@ _arguments "${_arguments_options[@]}" : \
 json\:"Single-record JSON envelope (snake_case)"))' \
 '--remote=[Git remote whose URL feeds provider detection (default\: \`origin\`)]:REMOTE:_default' \
 '--provider=[Override auto-detected provider]:PROVIDER:(github gitlab local)' \
-'--repo=[Override the repo slug (\`owner/name\`). When absent it is derived from the remote URL]:owner/name:_default' \
+'--host=[Override the forge authority (\`hostname\` or \`hostname\:port\`). With \`--provider\`, a syntactically valid custom authority is accepted unless it is positively identified as the other provider. Without \`--provider\`, the authority must identify a supported provider]:HOST:_default' \
+'--repo=[Override the remote-derived repository path. Accepted shapes\: GitHub \`owner/name\`; GitLab \`group\[/subgroup...\]/project\`; Local \`local\:<slug>\` or \`<slug>\`]:REPOSITORY:_default' \
 '--store-root=[Root directory of the file-backed store used by \`--provider local\`. Overrides the \`FORGE_CLI_LOCAL_STORE\` env var]:path:_files' \
 '--keep-branch[Skip the post-merge branch deletion (\`--delete-branch\` on gh, \`--remove-source-branch\` on glab). Mutually exclusive with the implicit-true default; flagging both is \`keep_branch_conflict\`]' \
 '--allow-non-default-base[Allow merges where the PR'\''s base is not the repo'\''s default branch. Without this flag, mismatched bases trigger \`default_branch_protected\`]' \
@@ -487,7 +507,8 @@ _arguments "${_arguments_options[@]}" : \
 json\:"Single-record JSON envelope (snake_case)"))' \
 '--remote=[Git remote whose URL feeds provider detection (default\: \`origin\`)]:REMOTE:_default' \
 '--provider=[Override auto-detected provider]:PROVIDER:(github gitlab local)' \
-'--repo=[Override the repo slug (\`owner/name\`). When absent it is derived from the remote URL]:owner/name:_default' \
+'--host=[Override the forge authority (\`hostname\` or \`hostname\:port\`). With \`--provider\`, a syntactically valid custom authority is accepted unless it is positively identified as the other provider. Without \`--provider\`, the authority must identify a supported provider]:HOST:_default' \
+'--repo=[Override the remote-derived repository path. Accepted shapes\: GitHub \`owner/name\`; GitLab \`group\[/subgroup...\]/project\`; Local \`local\:<slug>\` or \`<slug>\`]:REPOSITORY:_default' \
 '--store-root=[Root directory of the file-backed store used by \`--provider local\`. Overrides the \`FORGE_CLI_LOCAL_STORE\` env var]:path:_files' \
 '--dry-run[Validate and describe the planned operation without applying its mutation. Read-only preflight calls may still run]' \
 '-h[Print help (see more with '\''--help'\'')]' \
@@ -502,7 +523,8 @@ _arguments "${_arguments_options[@]}" : \
 json\:"Single-record JSON envelope (snake_case)"))' \
 '--remote=[Git remote whose URL feeds provider detection (default\: \`origin\`)]:REMOTE:_default' \
 '--provider=[Override auto-detected provider]:PROVIDER:(github gitlab local)' \
-'--repo=[Override the repo slug (\`owner/name\`). When absent it is derived from the remote URL]:owner/name:_default' \
+'--host=[Override the forge authority (\`hostname\` or \`hostname\:port\`). With \`--provider\`, a syntactically valid custom authority is accepted unless it is positively identified as the other provider. Without \`--provider\`, the authority must identify a supported provider]:HOST:_default' \
+'--repo=[Override the remote-derived repository path. Accepted shapes\: GitHub \`owner/name\`; GitLab \`group\[/subgroup...\]/project\`; Local \`local\:<slug>\` or \`<slug>\`]:REPOSITORY:_default' \
 '--store-root=[Root directory of the file-backed store used by \`--provider local\`. Overrides the \`FORGE_CLI_LOCAL_STORE\` env var]:path:_files' \
 '--dry-run[Validate and describe the planned operation without applying its mutation. Read-only preflight calls may still run]' \
 '-h[Print help (see more with '\''--help'\'')]' \
@@ -519,7 +541,8 @@ _arguments "${_arguments_options[@]}" : \
 json\:"Single-record JSON envelope (snake_case)"))' \
 '--remote=[Git remote whose URL feeds provider detection (default\: \`origin\`)]:REMOTE:_default' \
 '--provider=[Override auto-detected provider]:PROVIDER:(github gitlab local)' \
-'--repo=[Override the repo slug (\`owner/name\`). When absent it is derived from the remote URL]:owner/name:_default' \
+'--host=[Override the forge authority (\`hostname\` or \`hostname\:port\`). With \`--provider\`, a syntactically valid custom authority is accepted unless it is positively identified as the other provider. Without \`--provider\`, the authority must identify a supported provider]:HOST:_default' \
+'--repo=[Override the remote-derived repository path. Accepted shapes\: GitHub \`owner/name\`; GitLab \`group\[/subgroup...\]/project\`; Local \`local\:<slug>\` or \`<slug>\`]:REPOSITORY:_default' \
 '--store-root=[Root directory of the file-backed store used by \`--provider local\`. Overrides the \`FORGE_CLI_LOCAL_STORE\` env var]:path:_files' \
 '--dry-run[Validate and describe the planned operation without applying its mutation. Read-only preflight calls may still run]' \
 '-h[Print help (see more with '\''--help'\'')]' \
@@ -548,7 +571,8 @@ _arguments "${_arguments_options[@]}" : \
 json\:"Single-record JSON envelope (snake_case)"))' \
 '--remote=[Git remote whose URL feeds provider detection (default\: \`origin\`)]:REMOTE:_default' \
 '--provider=[Override auto-detected provider]:PROVIDER:(github gitlab local)' \
-'--repo=[Override the repo slug (\`owner/name\`). When absent it is derived from the remote URL]:owner/name:_default' \
+'--host=[Override the forge authority (\`hostname\` or \`hostname\:port\`). With \`--provider\`, a syntactically valid custom authority is accepted unless it is positively identified as the other provider. Without \`--provider\`, the authority must identify a supported provider]:HOST:_default' \
+'--repo=[Override the remote-derived repository path. Accepted shapes\: GitHub \`owner/name\`; GitLab \`group\[/subgroup...\]/project\`; Local \`local\:<slug>\` or \`<slug>\`]:REPOSITORY:_default' \
 '--store-root=[Root directory of the file-backed store used by \`--provider local\`. Overrides the \`FORGE_CLI_LOCAL_STORE\` env var]:path:_files' \
 '--strict-labels[Fail when selected labels are missing, not applicable, or conflict]' \
 '--no-merge[Stop after \`pr.wait-checks\` — do not promote to ready or merge]' \
@@ -715,7 +739,8 @@ _arguments "${_arguments_options[@]}" : \
 json\:"Single-record JSON envelope (snake_case)"))' \
 '--remote=[Git remote whose URL feeds provider detection (default\: \`origin\`)]:REMOTE:_default' \
 '--provider=[Override auto-detected provider]:PROVIDER:(github gitlab local)' \
-'--repo=[Override the repo slug (\`owner/name\`). When absent it is derived from the remote URL]:owner/name:_default' \
+'--host=[Override the forge authority (\`hostname\` or \`hostname\:port\`). With \`--provider\`, a syntactically valid custom authority is accepted unless it is positively identified as the other provider. Without \`--provider\`, the authority must identify a supported provider]:HOST:_default' \
+'--repo=[Override the remote-derived repository path. Accepted shapes\: GitHub \`owner/name\`; GitLab \`group\[/subgroup...\]/project\`; Local \`local\:<slug>\` or \`<slug>\`]:REPOSITORY:_default' \
 '--store-root=[Root directory of the file-backed store used by \`--provider local\`. Overrides the \`FORGE_CLI_LOCAL_STORE\` env var]:path:_files' \
 '--dry-run[Validate and describe the planned operation without applying its mutation. Read-only preflight calls may still run]' \
 '-h[Print help (see more with '\''--help'\'')]' \
@@ -741,7 +766,8 @@ _arguments "${_arguments_options[@]}" : \
 json\:"Single-record JSON envelope (snake_case)"))' \
 '--remote=[Git remote whose URL feeds provider detection (default\: \`origin\`)]:REMOTE:_default' \
 '--provider=[Override auto-detected provider]:PROVIDER:(github gitlab local)' \
-'--repo=[Override the repo slug (\`owner/name\`). When absent it is derived from the remote URL]:owner/name:_default' \
+'--host=[Override the forge authority (\`hostname\` or \`hostname\:port\`). With \`--provider\`, a syntactically valid custom authority is accepted unless it is positively identified as the other provider. Without \`--provider\`, the authority must identify a supported provider]:HOST:_default' \
+'--repo=[Override the remote-derived repository path. Accepted shapes\: GitHub \`owner/name\`; GitLab \`group\[/subgroup...\]/project\`; Local \`local\:<slug>\` or \`<slug>\`]:REPOSITORY:_default' \
 '--store-root=[Root directory of the file-backed store used by \`--provider local\`. Overrides the \`FORGE_CLI_LOCAL_STORE\` env var]:path:_files' \
 '--dry-run[Validate and describe the planned operation without applying its mutation. Read-only preflight calls may still run]' \
 '-h[Print help (see more with '\''--help'\'')]' \
@@ -754,7 +780,8 @@ _arguments "${_arguments_options[@]}" : \
 json\:"Single-record JSON envelope (snake_case)"))' \
 '--remote=[Git remote whose URL feeds provider detection (default\: \`origin\`)]:REMOTE:_default' \
 '--provider=[Override auto-detected provider]:PROVIDER:(github gitlab local)' \
-'--repo=[Override the repo slug (\`owner/name\`). When absent it is derived from the remote URL]:owner/name:_default' \
+'--host=[Override the forge authority (\`hostname\` or \`hostname\:port\`). With \`--provider\`, a syntactically valid custom authority is accepted unless it is positively identified as the other provider. Without \`--provider\`, the authority must identify a supported provider]:HOST:_default' \
+'--repo=[Override the remote-derived repository path. Accepted shapes\: GitHub \`owner/name\`; GitLab \`group\[/subgroup...\]/project\`; Local \`local\:<slug>\` or \`<slug>\`]:REPOSITORY:_default' \
 '--store-root=[Root directory of the file-backed store used by \`--provider local\`. Overrides the \`FORGE_CLI_LOCAL_STORE\` env var]:path:_files' \
 '--with-comments[Also fetch the issue'\''s comment stream and embed it under \`comments\` in the envelope payload. Adds one GitLab API call; for GitHub the comments are pulled in the same \`gh issue view --json\` invocation]' \
 '--dry-run[Validate and describe the planned operation without applying its mutation. Read-only preflight calls may still run]' \
@@ -774,7 +801,8 @@ _arguments "${_arguments_options[@]}" : \
 json\:"Single-record JSON envelope (snake_case)"))' \
 '--remote=[Git remote whose URL feeds provider detection (default\: \`origin\`)]:REMOTE:_default' \
 '--provider=[Override auto-detected provider]:PROVIDER:(github gitlab local)' \
-'--repo=[Override the repo slug (\`owner/name\`). When absent it is derived from the remote URL]:owner/name:_default' \
+'--host=[Override the forge authority (\`hostname\` or \`hostname\:port\`). With \`--provider\`, a syntactically valid custom authority is accepted unless it is positively identified as the other provider. Without \`--provider\`, the authority must identify a supported provider]:HOST:_default' \
+'--repo=[Override the remote-derived repository path. Accepted shapes\: GitHub \`owner/name\`; GitLab \`group\[/subgroup...\]/project\`; Local \`local\:<slug>\` or \`<slug>\`]:REPOSITORY:_default' \
 '--store-root=[Root directory of the file-backed store used by \`--provider local\`. Overrides the \`FORGE_CLI_LOCAL_STORE\` env var]:path:_files' \
 '--dry-run[Validate and describe the planned operation without applying its mutation. Read-only preflight calls may still run]' \
 '-h[Print help (see more with '\''--help'\'')]' \
@@ -793,7 +821,8 @@ _arguments "${_arguments_options[@]}" : \
 json\:"Single-record JSON envelope (snake_case)"))' \
 '--remote=[Git remote whose URL feeds provider detection (default\: \`origin\`)]:REMOTE:_default' \
 '--provider=[Override auto-detected provider]:PROVIDER:(github gitlab local)' \
-'--repo=[Override the repo slug (\`owner/name\`). When absent it is derived from the remote URL]:owner/name:_default' \
+'--host=[Override the forge authority (\`hostname\` or \`hostname\:port\`). With \`--provider\`, a syntactically valid custom authority is accepted unless it is positively identified as the other provider. Without \`--provider\`, the authority must identify a supported provider]:HOST:_default' \
+'--repo=[Override the remote-derived repository path. Accepted shapes\: GitHub \`owner/name\`; GitLab \`group\[/subgroup...\]/project\`; Local \`local\:<slug>\` or \`<slug>\`]:REPOSITORY:_default' \
 '--store-root=[Root directory of the file-backed store used by \`--provider local\`. Overrides the \`FORGE_CLI_LOCAL_STORE\` env var]:path:_files' \
 '--dry-run[Validate and describe the planned operation without applying its mutation. Read-only preflight calls may still run]' \
 '-h[Print help (see more with '\''--help'\'')]' \
@@ -809,7 +838,8 @@ _arguments "${_arguments_options[@]}" : \
 json\:"Single-record JSON envelope (snake_case)"))' \
 '--remote=[Git remote whose URL feeds provider detection (default\: \`origin\`)]:REMOTE:_default' \
 '--provider=[Override auto-detected provider]:PROVIDER:(github gitlab local)' \
-'--repo=[Override the repo slug (\`owner/name\`). When absent it is derived from the remote URL]:owner/name:_default' \
+'--host=[Override the forge authority (\`hostname\` or \`hostname\:port\`). With \`--provider\`, a syntactically valid custom authority is accepted unless it is positively identified as the other provider. Without \`--provider\`, the authority must identify a supported provider]:HOST:_default' \
+'--repo=[Override the remote-derived repository path. Accepted shapes\: GitHub \`owner/name\`; GitLab \`group\[/subgroup...\]/project\`; Local \`local\:<slug>\` or \`<slug>\`]:REPOSITORY:_default' \
 '--store-root=[Root directory of the file-backed store used by \`--provider local\`. Overrides the \`FORGE_CLI_LOCAL_STORE\` env var]:path:_files' \
 '--dry-run[Validate and describe the planned operation without applying its mutation. Read-only preflight calls may still run]' \
 '-h[Print help (see more with '\''--help'\'')]' \
@@ -824,7 +854,8 @@ _arguments "${_arguments_options[@]}" : \
 json\:"Single-record JSON envelope (snake_case)"))' \
 '--remote=[Git remote whose URL feeds provider detection (default\: \`origin\`)]:REMOTE:_default' \
 '--provider=[Override auto-detected provider]:PROVIDER:(github gitlab local)' \
-'--repo=[Override the repo slug (\`owner/name\`). When absent it is derived from the remote URL]:owner/name:_default' \
+'--host=[Override the forge authority (\`hostname\` or \`hostname\:port\`). With \`--provider\`, a syntactically valid custom authority is accepted unless it is positively identified as the other provider. Without \`--provider\`, the authority must identify a supported provider]:HOST:_default' \
+'--repo=[Override the remote-derived repository path. Accepted shapes\: GitHub \`owner/name\`; GitLab \`group\[/subgroup...\]/project\`; Local \`local\:<slug>\` or \`<slug>\`]:REPOSITORY:_default' \
 '--store-root=[Root directory of the file-backed store used by \`--provider local\`. Overrides the \`FORGE_CLI_LOCAL_STORE\` env var]:path:_files' \
 '--dry-run[Validate and describe the planned operation without applying its mutation. Read-only preflight calls may still run]' \
 '-h[Print help (see more with '\''--help'\'')]' \
@@ -838,7 +869,8 @@ _arguments "${_arguments_options[@]}" : \
 json\:"Single-record JSON envelope (snake_case)"))' \
 '--remote=[Git remote whose URL feeds provider detection (default\: \`origin\`)]:REMOTE:_default' \
 '--provider=[Override auto-detected provider]:PROVIDER:(github gitlab local)' \
-'--repo=[Override the repo slug (\`owner/name\`). When absent it is derived from the remote URL]:owner/name:_default' \
+'--host=[Override the forge authority (\`hostname\` or \`hostname\:port\`). With \`--provider\`, a syntactically valid custom authority is accepted unless it is positively identified as the other provider. Without \`--provider\`, the authority must identify a supported provider]:HOST:_default' \
+'--repo=[Override the remote-derived repository path. Accepted shapes\: GitHub \`owner/name\`; GitLab \`group\[/subgroup...\]/project\`; Local \`local\:<slug>\` or \`<slug>\`]:REPOSITORY:_default' \
 '--store-root=[Root directory of the file-backed store used by \`--provider local\`. Overrides the \`FORGE_CLI_LOCAL_STORE\` env var]:path:_files' \
 '--dry-run[Validate and describe the planned operation without applying its mutation. Read-only preflight calls may still run]' \
 '-h[Print help (see more with '\''--help'\'')]' \
@@ -904,7 +936,8 @@ _arguments "${_arguments_options[@]}" : \
 json\:"Single-record JSON envelope (snake_case)"))' \
 '--remote=[Git remote whose URL feeds provider detection (default\: \`origin\`)]:REMOTE:_default' \
 '--provider=[Override auto-detected provider]:PROVIDER:(github gitlab local)' \
-'--repo=[Override the repo slug (\`owner/name\`). When absent it is derived from the remote URL]:owner/name:_default' \
+'--host=[Override the forge authority (\`hostname\` or \`hostname\:port\`). With \`--provider\`, a syntactically valid custom authority is accepted unless it is positively identified as the other provider. Without \`--provider\`, the authority must identify a supported provider]:HOST:_default' \
+'--repo=[Override the remote-derived repository path. Accepted shapes\: GitHub \`owner/name\`; GitLab \`group\[/subgroup...\]/project\`; Local \`local\:<slug>\` or \`<slug>\`]:REPOSITORY:_default' \
 '--store-root=[Root directory of the file-backed store used by \`--provider local\`. Overrides the \`FORGE_CLI_LOCAL_STORE\` env var]:path:_files' \
 '--dry-run[Validate and describe the planned operation without applying its mutation. Read-only preflight calls may still run]' \
 '-h[Print help (see more with '\''--help'\'')]' \
@@ -928,7 +961,8 @@ _arguments "${_arguments_options[@]}" : \
 json\:"Single-record JSON envelope (snake_case)"))' \
 '--remote=[Git remote whose URL feeds provider detection (default\: \`origin\`)]:REMOTE:_default' \
 '--provider=[Override auto-detected provider]:PROVIDER:(github gitlab local)' \
-'--repo=[Override the repo slug (\`owner/name\`). When absent it is derived from the remote URL]:owner/name:_default' \
+'--host=[Override the forge authority (\`hostname\` or \`hostname\:port\`). With \`--provider\`, a syntactically valid custom authority is accepted unless it is positively identified as the other provider. Without \`--provider\`, the authority must identify a supported provider]:HOST:_default' \
+'--repo=[Override the remote-derived repository path. Accepted shapes\: GitHub \`owner/name\`; GitLab \`group\[/subgroup...\]/project\`; Local \`local\:<slug>\` or \`<slug>\`]:REPOSITORY:_default' \
 '--store-root=[Root directory of the file-backed store used by \`--provider local\`. Overrides the \`FORGE_CLI_LOCAL_STORE\` env var]:path:_files' \
 '--dry-run[Validate and describe the planned operation without applying its mutation. Read-only preflight calls may still run]' \
 '-h[Print help (see more with '\''--help'\'')]' \
@@ -943,7 +977,8 @@ _arguments "${_arguments_options[@]}" : \
 json\:"Single-record JSON envelope (snake_case)"))' \
 '--remote=[Git remote whose URL feeds provider detection (default\: \`origin\`)]:REMOTE:_default' \
 '--provider=[Override auto-detected provider]:PROVIDER:(github gitlab local)' \
-'--repo=[Override the repo slug (\`owner/name\`). When absent it is derived from the remote URL]:owner/name:_default' \
+'--host=[Override the forge authority (\`hostname\` or \`hostname\:port\`). With \`--provider\`, a syntactically valid custom authority is accepted unless it is positively identified as the other provider. Without \`--provider\`, the authority must identify a supported provider]:HOST:_default' \
+'--repo=[Override the remote-derived repository path. Accepted shapes\: GitHub \`owner/name\`; GitLab \`group\[/subgroup...\]/project\`; Local \`local\:<slug>\` or \`<slug>\`]:REPOSITORY:_default' \
 '--store-root=[Root directory of the file-backed store used by \`--provider local\`. Overrides the \`FORGE_CLI_LOCAL_STORE\` env var]:path:_files' \
 '--public-only[Use the public-events endpoint even for @me]' \
 '--dry-run[Validate and describe the planned operation without applying its mutation. Read-only preflight calls may still run]' \
@@ -959,7 +994,8 @@ _arguments "${_arguments_options[@]}" : \
 json\:"Single-record JSON envelope (snake_case)"))' \
 '--remote=[Git remote whose URL feeds provider detection (default\: \`origin\`)]:REMOTE:_default' \
 '--provider=[Override auto-detected provider]:PROVIDER:(github gitlab local)' \
-'--repo=[Override the repo slug (\`owner/name\`). When absent it is derived from the remote URL]:owner/name:_default' \
+'--host=[Override the forge authority (\`hostname\` or \`hostname\:port\`). With \`--provider\`, a syntactically valid custom authority is accepted unless it is positively identified as the other provider. Without \`--provider\`, the authority must identify a supported provider]:HOST:_default' \
+'--repo=[Override the remote-derived repository path. Accepted shapes\: GitHub \`owner/name\`; GitLab \`group\[/subgroup...\]/project\`; Local \`local\:<slug>\` or \`<slug>\`]:REPOSITORY:_default' \
 '--store-root=[Root directory of the file-backed store used by \`--provider local\`. Overrides the \`FORGE_CLI_LOCAL_STORE\` env var]:path:_files' \
 '--dry-run[Validate and describe the planned operation without applying its mutation. Read-only preflight calls may still run]' \
 '-h[Print help (see more with '\''--help'\'')]' \
@@ -975,7 +1011,8 @@ _arguments "${_arguments_options[@]}" : \
 json\:"Single-record JSON envelope (snake_case)"))' \
 '--remote=[Git remote whose URL feeds provider detection (default\: \`origin\`)]:REMOTE:_default' \
 '--provider=[Override auto-detected provider]:PROVIDER:(github gitlab local)' \
-'--repo=[Override the repo slug (\`owner/name\`). When absent it is derived from the remote URL]:owner/name:_default' \
+'--host=[Override the forge authority (\`hostname\` or \`hostname\:port\`). With \`--provider\`, a syntactically valid custom authority is accepted unless it is positively identified as the other provider. Without \`--provider\`, the authority must identify a supported provider]:HOST:_default' \
+'--repo=[Override the remote-derived repository path. Accepted shapes\: GitHub \`owner/name\`; GitLab \`group\[/subgroup...\]/project\`; Local \`local\:<slug>\` or \`<slug>\`]:REPOSITORY:_default' \
 '--store-root=[Root directory of the file-backed store used by \`--provider local\`. Overrides the \`FORGE_CLI_LOCAL_STORE\` env var]:path:_files' \
 '--dry-run[Validate and describe the planned operation without applying its mutation. Read-only preflight calls may still run]' \
 '-h[Print help (see more with '\''--help'\'')]' \
@@ -1028,7 +1065,8 @@ _arguments "${_arguments_options[@]}" : \
 json\:"Single-record JSON envelope (snake_case)"))' \
 '--remote=[Git remote whose URL feeds provider detection (default\: \`origin\`)]:REMOTE:_default' \
 '--provider=[Override auto-detected provider]:PROVIDER:(github gitlab local)' \
-'--repo=[Override the repo slug (\`owner/name\`). When absent it is derived from the remote URL]:owner/name:_default' \
+'--host=[Override the forge authority (\`hostname\` or \`hostname\:port\`). With \`--provider\`, a syntactically valid custom authority is accepted unless it is positively identified as the other provider. Without \`--provider\`, the authority must identify a supported provider]:HOST:_default' \
+'--repo=[Override the remote-derived repository path. Accepted shapes\: GitHub \`owner/name\`; GitLab \`group\[/subgroup...\]/project\`; Local \`local\:<slug>\` or \`<slug>\`]:REPOSITORY:_default' \
 '--store-root=[Root directory of the file-backed store used by \`--provider local\`. Overrides the \`FORGE_CLI_LOCAL_STORE\` env var]:path:_files' \
 '--dry-run[Validate and describe the planned operation without applying its mutation. Read-only preflight calls may still run]' \
 '-h[Print help (see more with '\''--help'\'')]' \
@@ -1050,7 +1088,8 @@ _arguments "${_arguments_options[@]}" : \
 json\:"Single-record JSON envelope (snake_case)"))' \
 '--remote=[Git remote whose URL feeds provider detection (default\: \`origin\`)]:REMOTE:_default' \
 '--provider=[Override auto-detected provider]:PROVIDER:(github gitlab local)' \
-'--repo=[Override the repo slug (\`owner/name\`). When absent it is derived from the remote URL]:owner/name:_default' \
+'--host=[Override the forge authority (\`hostname\` or \`hostname\:port\`). With \`--provider\`, a syntactically valid custom authority is accepted unless it is positively identified as the other provider. Without \`--provider\`, the authority must identify a supported provider]:HOST:_default' \
+'--repo=[Override the remote-derived repository path. Accepted shapes\: GitHub \`owner/name\`; GitLab \`group\[/subgroup...\]/project\`; Local \`local\:<slug>\` or \`<slug>\`]:REPOSITORY:_default' \
 '--store-root=[Root directory of the file-backed store used by \`--provider local\`. Overrides the \`FORGE_CLI_LOCAL_STORE\` env var]:path:_files' \
 '--dry-run[Validate and describe the planned operation without applying its mutation. Read-only preflight calls may still run]' \
 '-h[Print help (see more with '\''--help'\'')]' \
@@ -1065,7 +1104,8 @@ _arguments "${_arguments_options[@]}" : \
 json\:"Single-record JSON envelope (snake_case)"))' \
 '--remote=[Git remote whose URL feeds provider detection (default\: \`origin\`)]:REMOTE:_default' \
 '--provider=[Override auto-detected provider]:PROVIDER:(github gitlab local)' \
-'--repo=[Override the repo slug (\`owner/name\`). When absent it is derived from the remote URL]:owner/name:_default' \
+'--host=[Override the forge authority (\`hostname\` or \`hostname\:port\`). With \`--provider\`, a syntactically valid custom authority is accepted unless it is positively identified as the other provider. Without \`--provider\`, the authority must identify a supported provider]:HOST:_default' \
+'--repo=[Override the remote-derived repository path. Accepted shapes\: GitHub \`owner/name\`; GitLab \`group\[/subgroup...\]/project\`; Local \`local\:<slug>\` or \`<slug>\`]:REPOSITORY:_default' \
 '--store-root=[Root directory of the file-backed store used by \`--provider local\`. Overrides the \`FORGE_CLI_LOCAL_STORE\` env var]:path:_files' \
 '--dry-run[Validate and describe the planned operation without applying its mutation. Read-only preflight calls may still run]' \
 '-h[Print help (see more with '\''--help'\'')]' \
@@ -1080,7 +1120,8 @@ _arguments "${_arguments_options[@]}" : \
 json\:"Single-record JSON envelope (snake_case)"))' \
 '--remote=[Git remote whose URL feeds provider detection (default\: \`origin\`)]:REMOTE:_default' \
 '--provider=[Override auto-detected provider]:PROVIDER:(github gitlab local)' \
-'--repo=[Override the repo slug (\`owner/name\`). When absent it is derived from the remote URL]:owner/name:_default' \
+'--host=[Override the forge authority (\`hostname\` or \`hostname\:port\`). With \`--provider\`, a syntactically valid custom authority is accepted unless it is positively identified as the other provider. Without \`--provider\`, the authority must identify a supported provider]:HOST:_default' \
+'--repo=[Override the remote-derived repository path. Accepted shapes\: GitHub \`owner/name\`; GitLab \`group\[/subgroup...\]/project\`; Local \`local\:<slug>\` or \`<slug>\`]:REPOSITORY:_default' \
 '--store-root=[Root directory of the file-backed store used by \`--provider local\`. Overrides the \`FORGE_CLI_LOCAL_STORE\` env var]:path:_files' \
 '--update-existing[Update color / description drift on existing labels]' \
 '--dry-run[Validate and describe the planned operation without applying its mutation. Read-only preflight calls may still run]' \
@@ -1130,7 +1171,8 @@ _arguments "${_arguments_options[@]}" : \
 json\:"Single-record JSON envelope (snake_case)"))' \
 '--remote=[Git remote whose URL feeds provider detection (default\: \`origin\`)]:REMOTE:_default' \
 '--provider=[Override auto-detected provider]:PROVIDER:(github gitlab local)' \
-'--repo=[Override the repo slug (\`owner/name\`). When absent it is derived from the remote URL]:owner/name:_default' \
+'--host=[Override the forge authority (\`hostname\` or \`hostname\:port\`). With \`--provider\`, a syntactically valid custom authority is accepted unless it is positively identified as the other provider. Without \`--provider\`, the authority must identify a supported provider]:HOST:_default' \
+'--repo=[Override the remote-derived repository path. Accepted shapes\: GitHub \`owner/name\`; GitLab \`group\[/subgroup...\]/project\`; Local \`local\:<slug>\` or \`<slug>\`]:REPOSITORY:_default' \
 '--store-root=[Root directory of the file-backed store used by \`--provider local\`. Overrides the \`FORGE_CLI_LOCAL_STORE\` env var]:path:_files' \
 '--dry-run[Validate and describe the planned operation without applying its mutation. Read-only preflight calls may still run]' \
 '-h[Print help (see more with '\''--help'\'')]' \
@@ -1165,7 +1207,8 @@ required\:"Require readiness before any GitLab backend call"))' \
 json\:"Single-record JSON envelope (snake_case)"))' \
 '--remote=[Git remote whose URL feeds provider detection (default\: \`origin\`)]:REMOTE:_default' \
 '--provider=[Override auto-detected provider]:PROVIDER:(github gitlab local)' \
-'--repo=[Override the repo slug (\`owner/name\`). When absent it is derived from the remote URL]:owner/name:_default' \
+'--host=[Override the forge authority (\`hostname\` or \`hostname\:port\`). With \`--provider\`, a syntactically valid custom authority is accepted unless it is positively identified as the other provider. Without \`--provider\`, the authority must identify a supported provider]:HOST:_default' \
+'--repo=[Override the remote-derived repository path. Accepted shapes\: GitHub \`owner/name\`; GitLab \`group\[/subgroup...\]/project\`; Local \`local\:<slug>\` or \`<slug>\`]:REPOSITORY:_default' \
 '--store-root=[Root directory of the file-backed store used by \`--provider local\`. Overrides the \`FORGE_CLI_LOCAL_STORE\` env var]:path:_files' \
 '--strict-providers[Fail when any selected inbox provider fails]' \
 '--cache-fallback[Include recent cached items when a selected provider is unavailable or times out]' \
@@ -1195,7 +1238,8 @@ required\:"Require readiness before any GitLab backend call"))' \
 json\:"Single-record JSON envelope (snake_case)"))' \
 '--remote=[Git remote whose URL feeds provider detection (default\: \`origin\`)]:REMOTE:_default' \
 '--provider=[Override auto-detected provider]:PROVIDER:(github gitlab local)' \
-'--repo=[Override the repo slug (\`owner/name\`). When absent it is derived from the remote URL]:owner/name:_default' \
+'--host=[Override the forge authority (\`hostname\` or \`hostname\:port\`). With \`--provider\`, a syntactically valid custom authority is accepted unless it is positively identified as the other provider. Without \`--provider\`, the authority must identify a supported provider]:HOST:_default' \
+'--repo=[Override the remote-derived repository path. Accepted shapes\: GitHub \`owner/name\`; GitLab \`group\[/subgroup...\]/project\`; Local \`local\:<slug>\` or \`<slug>\`]:REPOSITORY:_default' \
 '--store-root=[Root directory of the file-backed store used by \`--provider local\`. Overrides the \`FORGE_CLI_LOCAL_STORE\` env var]:path:_files' \
 '--strict-providers[Fail when any selected inbox provider fails]' \
 '--cache-fallback[Include recent cached items when a selected provider is unavailable or times out]' \
@@ -1225,7 +1269,8 @@ required\:"Require readiness before any GitLab backend call"))' \
 json\:"Single-record JSON envelope (snake_case)"))' \
 '--remote=[Git remote whose URL feeds provider detection (default\: \`origin\`)]:REMOTE:_default' \
 '--provider=[Override auto-detected provider]:PROVIDER:(github gitlab local)' \
-'--repo=[Override the repo slug (\`owner/name\`). When absent it is derived from the remote URL]:owner/name:_default' \
+'--host=[Override the forge authority (\`hostname\` or \`hostname\:port\`). With \`--provider\`, a syntactically valid custom authority is accepted unless it is positively identified as the other provider. Without \`--provider\`, the authority must identify a supported provider]:HOST:_default' \
+'--repo=[Override the remote-derived repository path. Accepted shapes\: GitHub \`owner/name\`; GitLab \`group\[/subgroup...\]/project\`; Local \`local\:<slug>\` or \`<slug>\`]:REPOSITORY:_default' \
 '--store-root=[Root directory of the file-backed store used by \`--provider local\`. Overrides the \`FORGE_CLI_LOCAL_STORE\` env var]:path:_files' \
 '--strict-providers[Fail when any selected inbox provider fails]' \
 '--cache-fallback[Include recent cached items when a selected provider is unavailable or times out]' \
@@ -1277,7 +1322,8 @@ _arguments "${_arguments_options[@]}" : \
 json\:"Single-record JSON envelope (snake_case)"))' \
 '--remote=[Git remote whose URL feeds provider detection (default\: \`origin\`)]:REMOTE:_default' \
 '--provider=[Override auto-detected provider]:PROVIDER:(github gitlab local)' \
-'--repo=[Override the repo slug (\`owner/name\`). When absent it is derived from the remote URL]:owner/name:_default' \
+'--host=[Override the forge authority (\`hostname\` or \`hostname\:port\`). With \`--provider\`, a syntactically valid custom authority is accepted unless it is positively identified as the other provider. Without \`--provider\`, the authority must identify a supported provider]:HOST:_default' \
+'--repo=[Override the remote-derived repository path. Accepted shapes\: GitHub \`owner/name\`; GitLab \`group\[/subgroup...\]/project\`; Local \`local\:<slug>\` or \`<slug>\`]:REPOSITORY:_default' \
 '--store-root=[Root directory of the file-backed store used by \`--provider local\`. Overrides the \`FORGE_CLI_LOCAL_STORE\` env var]:path:_files' \
 '--dry-run[Validate and describe the planned operation without applying its mutation. Read-only preflight calls may still run]' \
 '-h[Print help (see more with '\''--help'\'')]' \
@@ -1300,7 +1346,8 @@ _arguments "${_arguments_options[@]}" : \
 json\:"Single-record JSON envelope (snake_case)"))' \
 '--remote=[Git remote whose URL feeds provider detection (default\: \`origin\`)]:REMOTE:_default' \
 '--provider=[Override auto-detected provider]:PROVIDER:(github gitlab local)' \
-'--repo=[Override the repo slug (\`owner/name\`). When absent it is derived from the remote URL]:owner/name:_default' \
+'--host=[Override the forge authority (\`hostname\` or \`hostname\:port\`). With \`--provider\`, a syntactically valid custom authority is accepted unless it is positively identified as the other provider. Without \`--provider\`, the authority must identify a supported provider]:HOST:_default' \
+'--repo=[Override the remote-derived repository path. Accepted shapes\: GitHub \`owner/name\`; GitLab \`group\[/subgroup...\]/project\`; Local \`local\:<slug>\` or \`<slug>\`]:REPOSITORY:_default' \
 '--store-root=[Root directory of the file-backed store used by \`--provider local\`. Overrides the \`FORGE_CLI_LOCAL_STORE\` env var]:path:_files' \
 '--dry-run[Validate and describe the planned operation without applying its mutation. Read-only preflight calls may still run]' \
 '-h[Print help (see more with '\''--help'\'')]' \
@@ -1316,7 +1363,8 @@ _arguments "${_arguments_options[@]}" : \
 json\:"Single-record JSON envelope (snake_case)"))' \
 '--remote=[Git remote whose URL feeds provider detection (default\: \`origin\`)]:REMOTE:_default' \
 '--provider=[Override auto-detected provider]:PROVIDER:(github gitlab local)' \
-'--repo=[Override the repo slug (\`owner/name\`). When absent it is derived from the remote URL]:owner/name:_default' \
+'--host=[Override the forge authority (\`hostname\` or \`hostname\:port\`). With \`--provider\`, a syntactically valid custom authority is accepted unless it is positively identified as the other provider. Without \`--provider\`, the authority must identify a supported provider]:HOST:_default' \
+'--repo=[Override the remote-derived repository path. Accepted shapes\: GitHub \`owner/name\`; GitLab \`group\[/subgroup...\]/project\`; Local \`local\:<slug>\` or \`<slug>\`]:REPOSITORY:_default' \
 '--store-root=[Root directory of the file-backed store used by \`--provider local\`. Overrides the \`FORGE_CLI_LOCAL_STORE\` env var]:path:_files' \
 '--dry-run[Validate and describe the planned operation without applying its mutation. Read-only preflight calls may still run]' \
 '-h[Print help (see more with '\''--help'\'')]' \
@@ -1331,7 +1379,8 @@ _arguments "${_arguments_options[@]}" : \
 json\:"Single-record JSON envelope (snake_case)"))' \
 '--remote=[Git remote whose URL feeds provider detection (default\: \`origin\`)]:REMOTE:_default' \
 '--provider=[Override auto-detected provider]:PROVIDER:(github gitlab local)' \
-'--repo=[Override the repo slug (\`owner/name\`). When absent it is derived from the remote URL]:owner/name:_default' \
+'--host=[Override the forge authority (\`hostname\` or \`hostname\:port\`). With \`--provider\`, a syntactically valid custom authority is accepted unless it is positively identified as the other provider. Without \`--provider\`, the authority must identify a supported provider]:HOST:_default' \
+'--repo=[Override the remote-derived repository path. Accepted shapes\: GitHub \`owner/name\`; GitLab \`group\[/subgroup...\]/project\`; Local \`local\:<slug>\` or \`<slug>\`]:REPOSITORY:_default' \
 '--store-root=[Root directory of the file-backed store used by \`--provider local\`. Overrides the \`FORGE_CLI_LOCAL_STORE\` env var]:path:_files' \
 '--dry-run[Validate and describe the planned operation without applying its mutation. Read-only preflight calls may still run]' \
 '-h[Print help (see more with '\''--help'\'')]' \
@@ -1381,7 +1430,8 @@ _arguments "${_arguments_options[@]}" : \
 json\:"Single-record JSON envelope (snake_case)"))' \
 '--remote=[Git remote whose URL feeds provider detection (default\: \`origin\`)]:REMOTE:_default' \
 '--provider=[Override auto-detected provider]:PROVIDER:(github gitlab local)' \
-'--repo=[Override the repo slug (\`owner/name\`). When absent it is derived from the remote URL]:owner/name:_default' \
+'--host=[Override the forge authority (\`hostname\` or \`hostname\:port\`). With \`--provider\`, a syntactically valid custom authority is accepted unless it is positively identified as the other provider. Without \`--provider\`, the authority must identify a supported provider]:HOST:_default' \
+'--repo=[Override the remote-derived repository path. Accepted shapes\: GitHub \`owner/name\`; GitLab \`group\[/subgroup...\]/project\`; Local \`local\:<slug>\` or \`<slug>\`]:REPOSITORY:_default' \
 '--store-root=[Root directory of the file-backed store used by \`--provider local\`. Overrides the \`FORGE_CLI_LOCAL_STORE\` env var]:path:_files' \
 '--dry-run[Validate and describe the planned operation without applying its mutation. Read-only preflight calls may still run]' \
 '-h[Print help (see more with '\''--help'\'')]' \
@@ -1402,7 +1452,8 @@ _arguments "${_arguments_options[@]}" : \
 json\:"Single-record JSON envelope (snake_case)"))' \
 '--remote=[Git remote whose URL feeds provider detection (default\: \`origin\`)]:REMOTE:_default' \
 '--provider=[Override auto-detected provider]:PROVIDER:(github gitlab local)' \
-'--repo=[Override the repo slug (\`owner/name\`). When absent it is derived from the remote URL]:owner/name:_default' \
+'--host=[Override the forge authority (\`hostname\` or \`hostname\:port\`). With \`--provider\`, a syntactically valid custom authority is accepted unless it is positively identified as the other provider. Without \`--provider\`, the authority must identify a supported provider]:HOST:_default' \
+'--repo=[Override the remote-derived repository path. Accepted shapes\: GitHub \`owner/name\`; GitLab \`group\[/subgroup...\]/project\`; Local \`local\:<slug>\` or \`<slug>\`]:REPOSITORY:_default' \
 '--store-root=[Root directory of the file-backed store used by \`--provider local\`. Overrides the \`FORGE_CLI_LOCAL_STORE\` env var]:path:_files' \
 '--dry-run[Validate and describe the planned operation without applying its mutation. Read-only preflight calls may still run]' \
 '-h[Print help (see more with '\''--help'\'')]' \
@@ -1418,7 +1469,8 @@ _arguments "${_arguments_options[@]}" : \
 json\:"Single-record JSON envelope (snake_case)"))' \
 '--remote=[Git remote whose URL feeds provider detection (default\: \`origin\`)]:REMOTE:_default' \
 '--provider=[Override auto-detected provider]:PROVIDER:(github gitlab local)' \
-'--repo=[Override the repo slug (\`owner/name\`). When absent it is derived from the remote URL]:owner/name:_default' \
+'--host=[Override the forge authority (\`hostname\` or \`hostname\:port\`). With \`--provider\`, a syntactically valid custom authority is accepted unless it is positively identified as the other provider. Without \`--provider\`, the authority must identify a supported provider]:HOST:_default' \
+'--repo=[Override the remote-derived repository path. Accepted shapes\: GitHub \`owner/name\`; GitLab \`group\[/subgroup...\]/project\`; Local \`local\:<slug>\` or \`<slug>\`]:REPOSITORY:_default' \
 '--store-root=[Root directory of the file-backed store used by \`--provider local\`. Overrides the \`FORGE_CLI_LOCAL_STORE\` env var]:path:_files' \
 '--dry-run[Validate and describe the planned operation without applying its mutation. Read-only preflight calls may still run]' \
 '-h[Print help (see more with '\''--help'\'')]' \
@@ -1463,7 +1515,8 @@ _arguments "${_arguments_options[@]}" : \
 json\:"Single-record JSON envelope (snake_case)"))' \
 '--remote=[Git remote whose URL feeds provider detection (default\: \`origin\`)]:REMOTE:_default' \
 '--provider=[Override auto-detected provider]:PROVIDER:(github gitlab local)' \
-'--repo=[Override the repo slug (\`owner/name\`). When absent it is derived from the remote URL]:owner/name:_default' \
+'--host=[Override the forge authority (\`hostname\` or \`hostname\:port\`). With \`--provider\`, a syntactically valid custom authority is accepted unless it is positively identified as the other provider. Without \`--provider\`, the authority must identify a supported provider]:HOST:_default' \
+'--repo=[Override the remote-derived repository path. Accepted shapes\: GitHub \`owner/name\`; GitLab \`group\[/subgroup...\]/project\`; Local \`local\:<slug>\` or \`<slug>\`]:REPOSITORY:_default' \
 '--store-root=[Root directory of the file-backed store used by \`--provider local\`. Overrides the \`FORGE_CLI_LOCAL_STORE\` env var]:path:_files' \
 '--dry-run[Validate and describe the planned operation without applying its mutation. Read-only preflight calls may still run]' \
 '-h[Print help (see more with '\''--help'\'')]' \
@@ -1484,7 +1537,8 @@ _arguments "${_arguments_options[@]}" : \
 json\:"Single-record JSON envelope (snake_case)"))' \
 '--remote=[Git remote whose URL feeds provider detection (default\: \`origin\`)]:REMOTE:_default' \
 '--provider=[Override auto-detected provider]:PROVIDER:(github gitlab local)' \
-'--repo=[Override the repo slug (\`owner/name\`). When absent it is derived from the remote URL]:owner/name:_default' \
+'--host=[Override the forge authority (\`hostname\` or \`hostname\:port\`). With \`--provider\`, a syntactically valid custom authority is accepted unless it is positively identified as the other provider. Without \`--provider\`, the authority must identify a supported provider]:HOST:_default' \
+'--repo=[Override the remote-derived repository path. Accepted shapes\: GitHub \`owner/name\`; GitLab \`group\[/subgroup...\]/project\`; Local \`local\:<slug>\` or \`<slug>\`]:REPOSITORY:_default' \
 '--store-root=[Root directory of the file-backed store used by \`--provider local\`. Overrides the \`FORGE_CLI_LOCAL_STORE\` env var]:path:_files' \
 '--dry-run[Validate and describe the planned operation without applying its mutation. Read-only preflight calls may still run]' \
 '-h[Print help (see more with '\''--help'\'')]' \
@@ -1525,7 +1579,8 @@ _arguments "${_arguments_options[@]}" : \
 json\:"Single-record JSON envelope (snake_case)"))' \
 '--remote=[Git remote whose URL feeds provider detection (default\: \`origin\`)]:REMOTE:_default' \
 '--provider=[Override auto-detected provider]:PROVIDER:(github gitlab local)' \
-'--repo=[Override the repo slug (\`owner/name\`). When absent it is derived from the remote URL]:owner/name:_default' \
+'--host=[Override the forge authority (\`hostname\` or \`hostname\:port\`). With \`--provider\`, a syntactically valid custom authority is accepted unless it is positively identified as the other provider. Without \`--provider\`, the authority must identify a supported provider]:HOST:_default' \
+'--repo=[Override the remote-derived repository path. Accepted shapes\: GitHub \`owner/name\`; GitLab \`group\[/subgroup...\]/project\`; Local \`local\:<slug>\` or \`<slug>\`]:REPOSITORY:_default' \
 '--store-root=[Root directory of the file-backed store used by \`--provider local\`. Overrides the \`FORGE_CLI_LOCAL_STORE\` env var]:path:_files' \
 '--dry-run[Validate and describe the planned operation without applying its mutation. Read-only preflight calls may still run]' \
 '-h[Print help (see more with '\''--help'\'')]' \

@@ -5,8 +5,8 @@
 //! `docs/source/plan-issue-redesign/plan-tracking-issue-run-state-controller-v1.md`.
 
 use std::collections::BTreeMap;
-use std::fs;
-use std::io;
+use std::fs::{self, File};
+use std::io::{self, Read, Seek};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -142,6 +142,12 @@ pub struct ExecutionRun {
     pub schema: String,
     pub run_id: String,
     pub repo: String,
+    /// Optional provider/host binding added compatibly to v1 records so
+    /// repository-relative relocation cannot cross provider boundaries.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo_provider: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo_host: Option<String>,
     pub issue: u64,
     pub profile: String,
     pub phase: RunPhase,
@@ -151,6 +157,13 @@ pub struct ExecutionRun {
     pub bundle: Option<PathBuf>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub execution_state_file: Option<PathBuf>,
+    /// Repository-relative identities survive managed-worktree cleanup. They
+    /// are optional so existing `plan-issue.execution-run.v1` records remain
+    /// readable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bundle_repo_relative: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_state_repo_relative: Option<PathBuf>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub selected_scope: Option<SelectedScope>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -197,6 +210,8 @@ impl ExecutionRun {
             schema: RUN_STATE_SCHEMA.to_string(),
             run_id: run_id.into(),
             repo: repo.into(),
+            repo_provider: None,
+            repo_host: None,
             issue,
             profile: profile.into(),
             phase,
@@ -204,6 +219,8 @@ impl ExecutionRun {
             updated_at: at,
             bundle: None,
             execution_state_file: None,
+            bundle_repo_relative: None,
+            execution_state_repo_relative: None,
             selected_scope: None,
             branch: None,
             worktree: None,
@@ -313,14 +330,21 @@ pub fn read_run_state(path: &Path) -> io::Result<ExecutionRun> {
     parse_run_state(&raw).map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))
 }
 
-/// Write `run-state.json` to disk. Creates parent directories as needed.
+/// Read `run-state.json` through an already-open target descriptor.
+pub fn read_run_state_file(file: &File) -> io::Result<ExecutionRun> {
+    let mut file = file.try_clone()?;
+    file.rewind()?;
+    let mut raw = String::new();
+    file.read_to_string(&mut raw)?;
+    parse_run_state(&raw).map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))
+}
+
+/// Write `run-state.json` atomically. Creates parent directories as needed.
 pub fn write_run_state(path: &Path, run: &ExecutionRun) -> io::Result<()> {
-    if let Some(parent) = path.parent() {
-        runtime_layout::ensure_dir(parent)?;
-    }
     let rendered =
         render_run_state(run).map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
-    fs::write(path, rendered)
+    nils_common::fs::write_atomic(path, rendered.as_bytes(), nils_common::fs::SECRET_FILE_MODE)
+        .map_err(io::Error::other)
 }
 
 /// Issue-scoped run root rooted under the existing
@@ -413,6 +437,8 @@ mod tests {
             RunPhase::Implementing,
             "2026-05-26T15:04:05Z",
         );
+        run.repo_provider = Some("gitlab".to_string());
+        run.repo_host = Some("gitlab.example.test".to_string());
         run.bundle = Some(PathBuf::from("docs/plans/example"));
         run.execution_state_file = Some(PathBuf::from(
             "docs/plans/example/example-execution-state.md",
@@ -442,6 +468,8 @@ mod tests {
         let parsed = parse_run_state(&rendered).expect("parse");
         assert_eq!(parsed.run_id, run.run_id);
         assert_eq!(parsed.repo, run.repo);
+        assert_eq!(parsed.repo_provider.as_deref(), Some("gitlab"));
+        assert_eq!(parsed.repo_host.as_deref(), Some("gitlab.example.test"));
         assert_eq!(parsed.issue, run.issue);
         assert_eq!(parsed.phase, run.phase);
         assert_eq!(
@@ -452,6 +480,25 @@ mod tests {
             parsed.validation.as_ref().map(|v| v.overall.clone()),
             Some("pass".to_string())
         );
+    }
+
+    #[test]
+    fn tracking_run_state_reads_v1_without_repository_binding_fields() {
+        let raw = json!({
+            "schema": RUN_STATE_SCHEMA,
+            "run_id": "pre-binding-run",
+            "repo": "owner/repo",
+            "issue": 1,
+            "profile": "tracking",
+            "phase": "initial",
+            "created_at": "2026-05-26T00:00:00Z",
+            "updated_at": "2026-05-26T00:00:00Z"
+        })
+        .to_string();
+
+        let parsed = parse_run_state(&raw).expect("pre-binding v1 record");
+        assert_eq!(parsed.repo_provider, None);
+        assert_eq!(parsed.repo_host, None);
     }
 
     #[test]

@@ -136,6 +136,69 @@ fn record_audit_expect_visible_passes_for_complete_evidence() {
 }
 
 #[test]
+fn record_audit_complete_closeout_enforces_terminal_state_fields() {
+    let (_tmp, body, comments) = write_fixture(&[
+        (
+            "state",
+            json!({
+                "status": "complete",
+                "target_scope": "complete",
+                "current": "2.3",
+                "next_action": "",
+                "tasks": [{"id": "2.3", "status": "done", "title": "terminal repair"}],
+                "prs": []
+            }),
+            "## Execution State\n\n- Profile: tracking\n- Status: complete\n- Target scope: complete\n- Current task: 2.3\n- Next task: \n\n## Task Ledger\n\n| ID | Status | Title |\n| --- | --- | --- |\n| 2.3 | done | terminal repair |",
+        ),
+        (
+            "closeout",
+            json!({
+                "final_status": "complete",
+                "approval": {"comment_url": "https://example.com/approval"},
+                "linked_prs": [],
+                "final_validation_url": "https://example.com/validation"
+            }),
+            "## Closeout\n\n- Profile: tracking\n- Final status: complete\n- Approval: https://example.com/approval\n- Linked PRs: none\n- Final validation: https://example.com/validation",
+        ),
+    ]);
+
+    let out = common::run_plan_issue(&[
+        "--format",
+        "json",
+        "record",
+        "audit",
+        "--profile",
+        "tracking",
+        "--body-file",
+        body.to_str().expect("body"),
+        "--comments-json",
+        comments.to_str().expect("comments"),
+        "--expect-visible",
+    ]);
+
+    assert_eq!(out.code, 0, "stderr: {}", out.stderr_text());
+    let envelope = out.stdout_json();
+    let visible = &envelope["payload"]["result"]["visible"];
+    assert_eq!(visible["overall_pass"], false, "{envelope}");
+    let codes = visible["codes"]
+        .as_array()
+        .expect("codes")
+        .iter()
+        .filter_map(Value::as_str)
+        .collect::<Vec<_>>();
+    for expected in [
+        "state-final-current-actionable",
+        "state-final-next-action-missing",
+        "state-target-scope-status-token",
+    ] {
+        assert!(
+            codes.contains(&expected),
+            "missing {expected}; codes={codes:?}"
+        );
+    }
+}
+
+#[test]
 fn record_audit_expect_visible_blocks_missing_task_ledger() {
     let (_tmp, body, comments) = write_fixture(&[(
         "state",

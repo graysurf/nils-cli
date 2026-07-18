@@ -11,6 +11,7 @@ pub mod lifecycle_record;
 pub mod lifecycle_vnext;
 pub mod output;
 mod provider;
+mod record_open_intent;
 pub mod render;
 pub mod runtime_layout;
 pub mod state;
@@ -178,11 +179,15 @@ where
     };
 
     let schema_version = cli.command.schema_version();
+    let repo = cli
+        .repo
+        .as_deref()
+        .map(provider::credential_free_repo_argument);
     let payload = json!({
         "binary": binary.binary_name(),
         "execution_mode": binary.execution_mode(),
         "dry_run": cli.dry_run,
-        "repo": cli.repo,
+        "repo": repo,
         "arguments": cli.command.payload(),
         "result": execution_result,
     });

@@ -120,6 +120,7 @@ mod tests {
             format: Some(OutputFormat::Json),
             remote: "origin".into(),
             provider: Some(crate::cli::ProviderFlag::Local),
+            host: None,
             repo: repo.map(str::to_string),
             store_root,
             dry_run: false,

@@ -95,8 +95,8 @@ fn build_call(ctx: &ProviderContext) -> BackendCall {
         Provider::GitHub | Provider::Local => {
             argv.push(OsString::from("repo"));
             argv.push(OsString::from("view"));
-            if let Some(slug) = ctx.repo.as_deref() {
-                argv.push(OsString::from(slug));
+            if let Some(locator) = ctx.repo_locator() {
+                argv.push(OsString::from(locator));
             }
             argv.push(OsString::from("--json"));
             argv.push(OsString::from(GH_JSON_FIELDS));
@@ -104,14 +104,14 @@ fn build_call(ctx: &ProviderContext) -> BackendCall {
         Provider::GitLab => {
             argv.push(OsString::from("repo"));
             argv.push(OsString::from("view"));
-            if let Some(slug) = ctx.repo.as_deref() {
-                argv.push(OsString::from(slug));
+            if let Some(locator) = ctx.repo_locator() {
+                argv.push(OsString::from(locator));
             }
             argv.push(OsString::from("-F"));
             argv.push(OsString::from("json"));
         }
     }
-    BackendCall::new(program, argv)
+    BackendCall::new(program, argv).with_host(ctx.provider, &ctx.host)
 }
 
 /// Re-export of the internal builder so `pr create` (and later atoms) can
@@ -415,5 +415,32 @@ mod tests {
         let argv = build_call(&ctx).plan_argv();
         let pos = argv.iter().position(|s| s == "view").expect("view present");
         assert_eq!(argv[pos + 1], "owner/name");
+    }
+
+    #[test]
+    fn build_call_github_qualifies_enterprise_repo_locator() {
+        let mut ctx = github_ctx();
+        ctx.host = "internal.ghe.com".into();
+        ctx.repo = Some("owner/name".into());
+        let call = build_call(&ctx);
+        assert_eq!(call.resolved_host(), Some("internal.ghe.com"));
+        let argv = call.plan_argv();
+        let pos = argv.iter().position(|s| s == "view").expect("view present");
+        assert_eq!(argv[pos + 1], "internal.ghe.com/owner/name");
+    }
+
+    #[test]
+    fn build_call_gitlab_uses_url_for_self_hosted_repo_locator() {
+        let mut ctx = gitlab_ctx();
+        ctx.host = "gitlab.example.com".into();
+        ctx.repo = Some("group/subgroup/project".into());
+        let call = build_call(&ctx);
+        assert_eq!(call.resolved_host(), Some("gitlab.example.com"));
+        let argv = call.plan_argv();
+        let pos = argv.iter().position(|s| s == "view").expect("view present");
+        assert_eq!(
+            argv[pos + 1],
+            "https://gitlab.example.com/group/subgroup/project"
+        );
     }
 }

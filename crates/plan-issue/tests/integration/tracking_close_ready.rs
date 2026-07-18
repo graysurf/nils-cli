@@ -197,6 +197,134 @@ fn tracking_close_ready_collects_linked_prs_from_state_and_flag() {
 }
 
 #[test]
+fn tracking_close_ready_rejects_unsafe_linked_prs_without_leaking_the_envelope() {
+    let fixture = complete_fixture();
+    for (linked_pr, secret) in [
+        (
+            "https://alice:secret-userinfo@github.com/owner/repo/pull/42",
+            "secret-userinfo",
+        ),
+        (
+            "https://github.com/owner/repo/pull/42?token=secret-query",
+            "secret-query",
+        ),
+        (
+            "prefix Authorization: Bearer secret~token+/== suffix",
+            "secret~token+/==",
+        ),
+    ] {
+        let out = common::run_plan_issue(&[
+            "--format",
+            "json",
+            "tracking",
+            "close-ready",
+            "--fixture",
+            fixture.path().to_str().expect("fixture"),
+            "--approval",
+            "approver",
+            "--linked-pr",
+            linked_pr,
+        ]);
+
+        assert_eq!(out.code, 64, "stdout={}", out.stdout_text());
+        let envelope = out.stdout_text();
+        assert!(!envelope.contains(secret), "secret leaked: {envelope}");
+        assert_eq!(
+            out.stdout_json()["error"]["code"],
+            "record-invalid-linked-pr"
+        );
+    }
+}
+
+#[test]
+fn tracking_close_ready_rejects_unsafe_linked_pr_from_run_state_without_leaking() {
+    let fixture = complete_fixture();
+    let run_state_path = fixture.path().join("run-state.json");
+    let init = common::run_plan_issue(&[
+        "--format",
+        "json",
+        "tracking",
+        "run",
+        "init",
+        "--provider-repo",
+        "owner/repo",
+        "--issue",
+        "123",
+        "--run-id",
+        "unsafe-historical-linked-pr",
+        "--now",
+        "2026-05-26T00:00:00Z",
+        "--out",
+        run_state_path.to_str().expect("run-state path"),
+    ]);
+    assert_eq!(init.code, 0, "stderr={}", init.stderr_text());
+    let mut run_state: Value =
+        serde_json::from_str(&fs::read_to_string(&run_state_path).expect("run-state body"))
+            .expect("run-state json");
+    run_state["pr"] = json!({
+        "ref": "https://alice:historical-secret@github.com/owner/repo/pull/42"
+    });
+    fs::write(
+        &run_state_path,
+        serde_json::to_vec_pretty(&run_state).expect("render run state"),
+    )
+    .expect("write historical state");
+
+    let out = common::run_plan_issue(&[
+        "--format",
+        "json",
+        "tracking",
+        "close-ready",
+        "--fixture",
+        fixture.path().to_str().expect("fixture"),
+        "--approval",
+        "approver",
+        "--run-state",
+        run_state_path.to_str().expect("run-state path"),
+    ]);
+
+    assert_eq!(out.code, 64, "stdout={}", out.stdout_text());
+    assert_eq!(
+        out.stdout_json()["error"]["code"],
+        "record-invalid-linked-pr"
+    );
+    assert!(!out.stdout_text().contains("historical-secret"));
+}
+
+#[test]
+fn tracking_close_ready_preserves_safe_token_prefix_repository_names() {
+    let fixture = complete_fixture();
+    for linked_pr in ["acme/ghp_docs#42", "acme/glpat-examples#43"] {
+        let out = common::run_plan_issue(&[
+            "--format",
+            "json",
+            "tracking",
+            "close-ready",
+            "--fixture",
+            fixture.path().to_str().expect("fixture"),
+            "--approval",
+            "approver",
+            "--linked-pr",
+            linked_pr,
+        ]);
+
+        assert_eq!(out.code, 0, "stderr={}", out.stderr_text());
+        let envelope = out.stdout_json();
+        assert_eq!(
+            envelope["payload"]["arguments"]["command"]["CloseReady"]["linked_pr"][0],
+            linked_pr
+        );
+        assert!(
+            envelope["payload"]["result"]["linked_prs"]
+                .as_array()
+                .expect("linked prs")
+                .iter()
+                .any(|value| value == linked_pr)
+        );
+    }
+}
+
+#[test]
 fn tracking_close_ready_is_non_mutating() {
     // The command must not post comments or repair dashboards; the JSON
     // envelope therefore never names a `posted` field.

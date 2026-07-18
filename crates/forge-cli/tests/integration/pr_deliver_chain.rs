@@ -1615,6 +1615,7 @@ fn pr_deliver_local_adopt_uses_remote_identity_for_bound_evidence() {
         format: Some(OutputFormat::Json),
         remote: "origin".into(),
         provider: Some(ProviderFlag::Local),
+        host: None,
         repo: None,
         store_root: Some(store),
         dry_run: false,

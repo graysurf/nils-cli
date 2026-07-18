@@ -416,6 +416,8 @@ fn pr_merge_gitlab_dry_run_rejects_enabled_review_convergence() {
         &[
             "--provider",
             "gitlab",
+            "--host",
+            "gitlab.example.com",
             "--dry-run",
             "--format",
             "json",
@@ -545,6 +547,8 @@ fn pr_merge_gitlab_uses_api_merge_after_required_checks_pass() {
         &[
             "--provider",
             "gitlab",
+            "--host",
+            "gitlab.example.com",
             "--format",
             "json",
             "pr",
@@ -1261,6 +1265,8 @@ fn pr_merge_gitlab_blocks_on_unresolved_review_threads() {
         &[
             "--provider",
             "gitlab",
+            "--host",
+            "gitlab.example.com",
             "--format",
             "json",
             "pr",
@@ -1304,6 +1310,8 @@ fn pr_merge_gitlab_allow_unresolved_threads_bypasses_gate() {
         &[
             "--provider",
             "gitlab",
+            "--host",
+            "gitlab.example.com",
             "--format",
             "json",
             "pr",
@@ -1344,6 +1352,8 @@ fn pr_merge_gitlab_blocks_on_unchecked_task_items() {
         &[
             "--provider",
             "gitlab",
+            "--host",
+            "gitlab.example.com",
             "--format",
             "json",
             "pr",
@@ -1394,6 +1404,8 @@ fn pr_merge_gitlab_allow_unchecked_tasks_bypasses_gate_and_records_reason() {
         &[
             "--provider",
             "gitlab",
+            "--host",
+            "gitlab.example.com",
             "--format",
             "json",
             "pr",

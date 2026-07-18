@@ -1,4 +1,6 @@
-{{ title }}
+{% if identity_marker %}{{ identity_marker }}
+
+{% endif %}{{ title }}
 
 This issue is the durable tracking surface for an issue-backed plan execution. The full source, plan, and execution logs remain in
 append-only issue comments.

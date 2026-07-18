@@ -84,15 +84,11 @@ gap (GitLab has no equivalent today) or remove the "lock down behaviour" value
 
 `forge-cli` is a *router + wrapper*, not a client.
 
-- Provider is auto-detected from the working tree's remote URL
-  (`origin` by default, configurable via `--remote`):
-  - `github.com` or matches `gh auth status` hosts → backend `github`,
-    subprocess `gh`.
-  - `gitlab.com` or matches `glab auth status` hosts → backend
-    `gitlab`, subprocess `glab`.
-  - Other hosts → `USAGE 64` with `error.kind = "provider_unsupported"`
-    and a hint to file a follow-up; v1 does not auto-fall-back to
-    HTTPS-only Gitea/Forgejo even though the URL shape would allow it.
+- Provider, authority, and repository location are resolved together from
+  explicit `--provider` / `--host` / `--repo` inputs and the selected Git
+  remote. Unknown or conflicting authorities fail closed as specified under
+  "Provider detection"; v1 does not auto-fall-back to HTTPS-only
+  Gitea/Forgejo even when the URL shape would permit it.
 - All provider API calls go through the backend subprocess. The governed
   `repo push-default` operation additionally invokes local `git` for validation,
   one expected-old-OID compare-and-swap fast-forward, and remote-ref read-back. `forge-cli` does
@@ -111,46 +107,46 @@ gap (GitLab has no equivalent today) or remove the "lock down behaviour" value
 
 Parity matrix (v1):
 
-| forge-cli op                                | github backend                                                                                                                               | gitlab backend                                              | Parity                                                                                                                   |
-| ------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------ |
-| `pr create`                                 | `gh pr create --draft`                                                                                                                       | `glab mr create --draft`                                    | exact                                                                                                                    |
-| `pr view <id>`                              | `gh pr view <id> --json …`                                                                                                                   | `glab mr view <id> -F json`                                 | exact                                                                                                                    |
-| `pr list`                                   | `gh pr list --json …`                                                                                                                        | `glab mr list -F json`                                      | exact                                                                                                                    |
-| `pr edit <id>`                              | `gh pr edit <id> …`                                                                                                                          | `glab mr update <id> …`                                     | exact                                                                                                                    |
-| `pr comment <id>`                           | `gh pr comment <id> --body …`                                                                                                                | `glab mr note <id> --message …`                             | exact                                                                                                                    |
-| `pr review <id>`                            | guard `gh api …/pulls/{id}`, then outcome comment, native review, or GraphQL pending review + review thread(s) + submit with `--thread-file` | `glab mr note create <id> --message … --resolvable=false`   | outcome comment, native review event, or resolvable review threads (`--thread-file`, GitHub-only); optional issue mirror |
-| `pr review validate [id]`                   | local review body/thread-file validation; with `--check-diff`, `gh api repos/{repo}/pulls/{id}/files`                                        | local validation only; `--check-diff` unsupported in v1     | schema/privacy preflight plus optional GitHub diff-coordinate validation                                                 |
-| `pr ready <id>`                             | `gh pr ready <id>`                                                                                                                           | `glab mr update <id> --ready`                               | exact                                                                                                                    |
-| `pr review-threads list <id>`               | `gh api graphql` (`reviewThreads` connection)                                                                                                | `glab api …/merge_requests/<iid>/discussions`               | normalized thread state                                                                                                  |
-| `pr review-threads resolve <id> --thread …` | `gh api graphql` (`addPullRequestReviewThreadReply` then `resolveReviewThread`)                                                              | unsupported in v1                                           | GitHub-only seam                                                                                                         |
-| `pr review-threads reply <id> --thread …`   | `gh api graphql` (`addPullRequestReviewThreadReply`)                                                                                         | unsupported in v1                                           | GitHub-only seam                                                                                                         |
-| `pr reviews <id>`                           | `gh api graphql` (native `reviews` connection plus `headRefOid`)                                                                             | unsupported in v1                                           | GitHub-only normalized current-head/stale review snapshot                                                                |
-| `pr pending-review delete <id> --review …`  | PR view + complete pending-only membership snapshot + exact-target final read with content/viewer/comment guards + `deletePullRequestReview` | unsupported in v1                                           | GitHub-only confirmed-abandoned recovery for one body-only pending review                                                |
-| `pr tasks <id>`                             | `gh pr view <id> --json number,url,body`                                                                                                     | `glab mr view <id> -F json` (`description`)                 | normalized task-list state                                                                                               |
-| `pr merge <id>`                             | `gh pr merge <id> --squash --delete-branch`                                                                                                  | `glab api --method PUT .../merge` after gates               | exact (method honoured per repo cfg)                                                                                     |
-| `pr close <id>`                             | `gh pr close <id>`                                                                                                                           | `glab mr close <id>`                                        | exact                                                                                                                    |
-| `pr checks <id>`                            | `gh pr checks <id> --json …` plus `--required` for gating                                                                                    | `glab mr view -F json` + `glab api .../pipelines/<id>/jobs` | emulated on GitLab                                                                                                       |
-| `pr wait-checks <id>`                       | poll `gh pr checks` / `gh pr checks --required`; fall back to head-SHA REST checks on rollup permission errors                               | poll structured MR pipeline/jobs snapshot                   | emulated; same envelope                                                                                                  |
-| `issue create`                              | `gh issue create …`                                                                                                                          | `glab issue create …`                                       | exact                                                                                                                    |
-| `issue view <id>`                           | `gh issue view <id> --json …`                                                                                                                | `glab issue view <id> -F json`                              | exact                                                                                                                    |
-| `issue edit <id>`                           | `gh issue edit <id> …`                                                                                                                       | `glab issue update <id> …`                                  | exact                                                                                                                    |
-| `issue comment <id>`                        | `gh issue comment <id> --body …`                                                                                                             | `glab issue note <id> --message …`                          | exact                                                                                                                    |
-| `issue close <id>`                          | `gh issue close <id>`                                                                                                                        | `glab issue close <id>`                                     | exact                                                                                                                    |
-| `issue reopen <id>`                         | `gh issue reopen <id>`                                                                                                                       | `glab issue reopen <id>`                                    | exact                                                                                                                    |
-| `label list`                                | `gh label list --json …`                                                                                                                     | paged `glab label list --output json --per-page … --page …` | exact                                                                                                                    |
-| `label audit`                               | read labels, compare with caller catalog                                                                                                     | same                                                        | exact                                                                                                                    |
-| `label ensure`                              | `gh label create/edit`                                                                                                                       | `glab label create/edit`                                    | exact (no delete/rename by default)                                                                                      |
-| `auth status`                               | `gh auth status`                                                                                                                             | `glab auth status`                                          | exact (text → typed)                                                                                                     |
-| `repo view`                                 | `gh repo view --json …`                                                                                                                      | `glab repo view -F json`                                    | exact                                                                                                                    |
-| `repo push-default`                         | local Git validation/push plus `gh repo view --json …` default-branch resolution                                                             | local Git validation/push plus `glab repo view -F json`     | exact; no provider force path                                                                                            |
-| `inbox list`                                | `gh search prs/issues --json …`                                                                                                              | `glab api --hostname <host> …`                              | normalized aggregation                                                                                                   |
-| `inbox status`                              | same provider reads as `inbox list`                                                                                                          | same provider reads as `inbox list`                         | bounded counts                                                                                                           |
-| `inbox next`                                | same provider reads as `inbox list`                                                                                                          | same provider reads as `inbox list`                         | ranked bounded subset                                                                                                    |
-| `activity commits`                          | `gh api search/commits`                                                                                                                      | unsupported in v1                                           | GitHub-only seam                                                                                                         |
-| `activity events`                           | `gh api users/<login>/events[/public]`                                                                                                       | unsupported in v1                                           | GitHub-only seam                                                                                                         |
-| `activity feed`                             | `gh api repos/<owner>/<repo>/commits` + repository activity REST                                                                             | `glab api projects/:id/repository/commits` + project events | normalized open vocabulary                                                                                               |
-| `activity summary`                          | `gh api graphql` contribution query                                                                                                          | unsupported in v1                                           | GitHub-only seam                                                                                                         |
-| `pr deliver`                                | macro: `pr list` lookup → `pr create` or adopt → `pr wait-checks` → `pr ready` → `pr merge`                                                  | same composition with gitlab atoms                          | exact (same macro logic on both)                                                                                         |
+| forge-cli op                                | github backend                                                                                                                               | gitlab backend                                                         | Parity                                                                                                                   |
+| ------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------ |
+| `pr create`                                 | `gh pr create --draft`                                                                                                                       | `glab mr create --draft`                                               | exact                                                                                                                    |
+| `pr view <id>`                              | `gh pr view <id> --json …`                                                                                                                   | `glab mr view <id> -F json`                                            | exact                                                                                                                    |
+| `pr list`                                   | `gh pr list --json …`                                                                                                                        | `glab mr list -F json`                                                 | exact                                                                                                                    |
+| `pr edit <id>`                              | `gh pr edit <id> …`                                                                                                                          | `glab mr update <id> …`                                                | exact                                                                                                                    |
+| `pr comment <id>`                           | `gh pr comment <id> --body …`                                                                                                                | `glab mr note <id> --message …`                                        | exact                                                                                                                    |
+| `pr review <id>`                            | guard `gh api …/pulls/{id}`, then outcome comment, native review, or GraphQL pending review + review thread(s) + submit with `--thread-file` | `glab mr note create <id> --message … --resolvable=false`              | outcome comment, native review event, or resolvable review threads (`--thread-file`, GitHub-only); optional issue mirror |
+| `pr review validate [id]`                   | local review body/thread-file validation; with `--check-diff`, `gh api repos/{repo}/pulls/{id}/files`                                        | local validation only; `--check-diff` unsupported in v1                | schema/privacy preflight plus optional GitHub diff-coordinate validation                                                 |
+| `pr ready <id>`                             | `gh pr ready <id>`                                                                                                                           | `glab mr update <id> --ready`                                          | exact                                                                                                                    |
+| `pr review-threads list <id>`               | `gh api graphql` (`reviewThreads` connection)                                                                                                | `glab api …/merge_requests/<iid>/discussions`                          | normalized thread state                                                                                                  |
+| `pr review-threads resolve <id> --thread …` | `gh api graphql` (`addPullRequestReviewThreadReply` then `resolveReviewThread`)                                                              | unsupported in v1                                                      | GitHub-only seam                                                                                                         |
+| `pr review-threads reply <id> --thread …`   | `gh api graphql` (`addPullRequestReviewThreadReply`)                                                                                         | unsupported in v1                                                      | GitHub-only seam                                                                                                         |
+| `pr reviews <id>`                           | `gh api graphql` (native `reviews` connection plus `headRefOid`)                                                                             | unsupported in v1                                                      | GitHub-only normalized current-head/stale review snapshot                                                                |
+| `pr pending-review delete <id> --review …`  | PR view + complete pending-only membership snapshot + exact-target final read with content/viewer/comment guards + `deletePullRequestReview` | unsupported in v1                                                      | GitHub-only confirmed-abandoned recovery for one body-only pending review                                                |
+| `pr tasks <id>`                             | `gh pr view <id> --json number,url,body`                                                                                                     | `glab mr view <id> -F json` (`description`)                            | normalized task-list state                                                                                               |
+| `pr merge <id>`                             | `gh pr merge <id> --squash --delete-branch`                                                                                                  | `glab api --method PUT .../merge` after gates                          | exact (method honoured per repo cfg)                                                                                     |
+| `pr close <id>`                             | `gh pr close <id>`                                                                                                                           | `glab mr close <id>`                                                   | exact                                                                                                                    |
+| `pr checks <id>`                            | `gh pr checks <id> --json …` plus `--required` for gating                                                                                    | `glab mr view -F json` + `glab api .../pipelines/<id>/jobs`            | emulated on GitLab                                                                                                       |
+| `pr wait-checks <id>`                       | poll `gh pr checks` / `gh pr checks --required`; fall back to head-SHA REST checks on rollup permission errors                               | poll structured MR pipeline/jobs snapshot                              | emulated; same envelope                                                                                                  |
+| `issue create`                              | `gh issue create …`                                                                                                                          | `glab issue create …`                                                  | exact                                                                                                                    |
+| `issue view <id>`                           | `gh issue view <id> --json …`                                                                                                                | `glab issue view <id> -F json`                                         | exact                                                                                                                    |
+| `issue edit <id>`                           | `gh issue edit <id> …`                                                                                                                       | `glab issue update <id> …`                                             | exact                                                                                                                    |
+| `issue comment <id>`                        | `gh issue comment <id> --body …`                                                                                                             | `glab issue note <id> --message …`                                     | exact                                                                                                                    |
+| `issue close <id>`                          | `gh issue close <id>`                                                                                                                        | `glab issue close <id>`                                                | exact                                                                                                                    |
+| `issue reopen <id>`                         | `gh issue reopen <id>`                                                                                                                       | `glab issue reopen <id>`                                               | exact                                                                                                                    |
+| `label list`                                | `gh label list --json …`                                                                                                                     | paged `glab label list --output json --per-page … --page …`            | exact                                                                                                                    |
+| `label audit`                               | read labels, compare with caller catalog                                                                                                     | same                                                                   | exact                                                                                                                    |
+| `label ensure`                              | `gh label create/edit`                                                                                                                       | `glab label create/edit`                                               | exact (no delete/rename by default)                                                                                      |
+| `auth status`                               | `gh auth status --hostname <authority>`                                                                                                      | `glab auth status --hostname <authority>`                              | exact (text → typed)                                                                                                     |
+| `repo view`                                 | `gh repo view <slug-or-host/slug> --json …`                                                                                                  | `glab repo view <slug-or-https-url> -F json`                           | exact                                                                                                                    |
+| `repo push-default`                         | local Git validation/push plus host-qualified `gh repo view --json …` default-branch resolution                                              | local Git validation/push plus host-qualified `glab repo view -F json` | exact; no provider force path                                                                                            |
+| `inbox list`                                | `gh search prs/issues --json …`                                                                                                              | `glab api --hostname <host> …`                                         | normalized aggregation                                                                                                   |
+| `inbox status`                              | same provider reads as `inbox list`                                                                                                          | same provider reads as `inbox list`                                    | bounded counts                                                                                                           |
+| `inbox next`                                | same provider reads as `inbox list`                                                                                                          | same provider reads as `inbox list`                                    | ranked bounded subset                                                                                                    |
+| `activity commits`                          | `gh api search/commits`                                                                                                                      | unsupported in v1                                                      | GitHub-only seam                                                                                                         |
+| `activity events`                           | `gh api users/<login>/events[/public]`                                                                                                       | unsupported in v1                                                      | GitHub-only seam                                                                                                         |
+| `activity feed`                             | `gh api repos/<owner>/<repo>/commits` + repository activity REST                                                                             | `glab api projects/:id/repository/commits` + project events            | normalized open vocabulary                                                                                               |
+| `activity summary`                          | `gh api graphql` contribution query                                                                                                          | unsupported in v1                                                      | GitHub-only seam                                                                                                         |
+| `pr deliver`                                | macro: `pr list` lookup → `pr create` or adopt → `pr wait-checks` → `pr ready` → `pr merge`                                                  | same composition with gitlab atoms                                     | exact (same macro logic on both)                                                                                         |
 
 "emulated" means the backend's native command differs in shape, but
 `forge-cli` normalises both into the same `cli.forge-cli.pr.checks.v1`
@@ -235,9 +231,21 @@ Global flags (every subcommand):
 
 - `--format text|json` (workspace standard).
 - `--remote <name>` (default `origin`).
-- `--provider github|gitlab` (override auto-detect).
-- `--repo <owner/name>` (override remote-derived repo slug; passed to
-  backend's `--repo` / `-R` equivalent).
+- `--provider github|gitlab|local` (override auto-detect).
+- `--host <hostname[:port]>` — select a canonical forge authority. The input
+  is an authority only: schemes, userinfo, paths, query strings, fragments,
+  whitespace, control characters, malformed DNS labels, and invalid ports are
+  rejected. HTTPS port `443` is normalized away; other ports are retained.
+  With `--provider`, a valid custom authority is accepted unless it is
+  positively identified as the other provider. Without `--provider`, the host
+  must identify a supported provider.
+- `--repo <path>` (override the remote-derived repository path). Repository-
+  scoped commands validate `owner/name` for GitHub,
+  `group[/subgroup...]/project` for GitLab, and a non-empty local-compatible
+  path for Local; invalid paths return `DATA 65` with
+  `error.kind=repo_invalid`. Repository-independent commands such as `auth
+  status` and personal `activity` commands do not reject an otherwise
+  irrelevant repository shape.
 - `--dry-run` — render the backend command that *would* run plus all
   validation checks, but do not invoke it. Output envelope carries the
   exact argv under `data.plan` for atomic commands or `data.actions[].plan`
@@ -245,8 +253,11 @@ Global flags (every subcommand):
   provider preflight and emits `pushed=false` with the exact `push_refspec`;
   it never invokes `git push` in dry-run mode.
 
-`forge-cli` itself does not expose `--token`, `--host`, or any auth
-override. Those belong to `gh`/`glab` and are configured there.
+Every backend subprocess is bound to the resolved authority for that call.
+`forge-cli` removes ambient `GH_HOST` and `GITLAB_HOST` from the child
+environment, then sets the selected provider's variable (`GH_HOST` or
+`GITLAB_HOST`) explicitly, so unrelated shell configuration cannot retarget a
+request.
 
 Inbox-local flags:
 
@@ -263,6 +274,10 @@ Inbox-local flags:
   searches (GitHub review-requested is dropped). GitLab `todos` are kept when
   their `target_type` (or target URL) matches the selected item type;
   unclassifiable todos appear only in `all` mode.
+- Global `--host` is rejected for `inbox list|status|next` with an actionable
+  `provider_unsupported` error. Inbox has a separate multi-provider resolver;
+  use inbox-local `--gitlab-host` for a non-default GitLab authority. GitHub
+  Enterprise inbox search is unsupported in v1.
 - `--gitlab-host <host>` is scoped to inbox commands only and is passed to
   every GitLab `glab api` invocation as `--hostname <host>`.
 - When `--gitlab-host` is omitted, GitLab host resolution uses
@@ -360,9 +375,15 @@ backend mapping, validation rules, and output schema versions.
   contains the caller's explicit authorization basis.
 - Validation:
   - the selected Git remote must expose exactly one actual push URL (including
-    any configured `remote.<name>.pushurl`), and that destination's host and
-    repository identity must match the provider result; the local backend is
-    unsupported;
+    any configured `remote.<name>.pushurl`). Before provider metadata is read,
+    the push destination must classify to the selected provider (unless an
+    explicit provider plus custom host selected an otherwise unclassified
+    authority), and its canonical authority must exactly equal the selected
+    authority. The provider metadata URL must then match that same authority
+    and repository identity. Canonical comparison maps provider transport
+    aliases to their API authority, normalizes HTTPS port `443`, and preserves
+    every non-default HTTPS port. Metadata from one authority cannot authorize
+    a push to another; the local backend is unsupported;
   - HTTP(S) push URLs containing userinfo are rejected; callers use credential
     helpers rather than embedding credential material in a subprocess argument;
   - after the push URL is expanded once, no effective `url.*.insteadOf` or
@@ -1112,7 +1133,9 @@ report which field matched, which the GitHub path never does).
   `data.provider`, `data.host`, `data.repo`, `data.query`, `data.match_fields`,
   `data.limit`, `data.item_count`, `data.limited`, and normalized `data.items[]`.
   They run `gh search <issues|prs> <query> --repo <slug> --match <fields>
-  --limit <n> --json …`; `--match` defaults to `title,body,comments` and is
+  --limit <n> --json …`. The `--repo` value is always the raw `owner/name`
+  slug; the resolved authority is selected separately through the call-local
+  `GH_HOST` binding. `--match` defaults to `title,body,comments` and is
   narrowable. A body-only hit the structured `issue list` cannot surface is
   returned; an empty result is a well-formed empty envelope.
 - `search refs-to <ref>` emits `cli.forge-cli.search.refs-to.v1` with
@@ -1395,32 +1418,46 @@ Two mechanisms harden this:
   budget classifier and the wiring from drifting: a newly-added op cannot ship
   ungated, and a guard test rejects an op that constructs a bare runner. REST
   calls (`gh api repos/…`), the probe itself, and non-GitHub backends are never
-  gated. The gate is best-effort: an unreadable probe never blocks real work.
+  gated. Each probe is bound to the triggering call's resolved authority, and
+  cached budget readings are keyed by that canonical authority; a reading or
+  invalidation for one GitHub host is never reused for another. The gate is
+  best-effort: an unreadable probe never blocks real work.
 
 ## Provider detection
 
-```text
-explicit --provider flag
-  ↓ (else)
-remote URL parse from `git remote get-url <--remote>`
-  ↓
-host classification:
-  github.com OR matches `gh auth status` host  → github
-  gitlab.com OR matches `glab auth status` host → gitlab
-  any other host                                → USAGE 64
-                                                  error.kind=provider_unsupported
-```
+Provider resolution binds a provider, canonical authority, and optional
+repository path before an operation builds backend argv:
 
-A forced `--provider` overrides provider classification only. The host
-still resolves from the remote URL when one is available and its host
-classifies to the forced provider (self-hosted GitLab / GHE shapes
-included); the provider default host (`github.com` / `gitlab.com`) is
-used only when no remote resolves or the remote host classifies to a
-different provider.
+1. `--provider` plus `--host` binds both explicitly. A syntactically valid
+   custom authority is accepted unless it is positively classified as the
+   other provider.
+2. `--host` without `--provider` must classify as GitHub or GitLab.
+3. `--provider` without `--host` uses an existing selected remote when that
+   remote exposes a valid authority positively classified as the selected
+   provider. A conflicting ambient remote is ignored in favor of the provider
+   default for repository-independent commands and for repository-scoped
+   commands with an explicit `--repo`. A repository-scoped command without
+   `--repo` still relies on ambient remote authority, so a mismatched,
+   malformed, or unclassified existing remote fails closed. Custom authorities
+   always require `--host`.
+4. With neither flag, the selected remote authority must classify as GitHub or
+   GitLab; unknown authorities return `USAGE 64` with
+   `error.kind=provider_unsupported`. Provider-resolution diagnostics never
+   echo the raw remote URL or its userinfo.
 
-`gh auth status` and `glab auth status` are *cached* per `forge-cli`
-invocation (single call per provider, memoised). They are not refreshed
-mid-run.
+Classification trusts only controlled provider names/suffixes (`github.com`,
+`*.github.com`, `*.ghe.com`, `gitlab.com`, and `*.gitlab.com`); branding-like
+prefixes such as `gitlab.attacker.example` are not trusted. `ssh.github.com`
+canonicalizes to `github.com`, and `altssh.gitlab.com` to `gitlab.com`.
+Non-default HTTPS ports remain part of the selected authority; SSH transport
+ports are not treated as API ports.
+
+For a repository-scoped command, explicit `--host` also requires an explicit
+`--repo` or a repository derived from a remote with the same canonical
+authority; otherwise resolution returns `repo_required` before backend
+execution. Provider repository shapes are validated as described under Global
+flags. Repository-independent commands retain any repository input for
+context but skip its shape validation.
 
 ## Migration plan: agent-runtime-kit skills → forge-cli
 

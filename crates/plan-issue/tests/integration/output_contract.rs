@@ -1,5 +1,8 @@
+use std::fs;
+
 use pretty_assertions::assert_eq;
-use serde_json::Value;
+use serde_json::{Value, json};
+use tempfile::TempDir;
 
 use crate::common;
 #[test]
@@ -126,4 +129,99 @@ fn output_text_contract_error_output_is_deterministic() {
         lines[4],
         "message: --pr-grouping group with --strategy deterministic requires --pr-group mappings"
     );
+}
+
+#[test]
+fn output_contract_redacts_global_repository_credentials() {
+    let tmp = TempDir::new().expect("tmp");
+    let out_path = tmp.path().join("run-state.json");
+    let repo = "https://global-user:global-secret@gitlab.example.test:8443/acme/widgets.git";
+
+    for format in ["json", "text"] {
+        let out = common::run_plan_issue_with_options(
+            &[
+                "--repo",
+                repo,
+                "--format",
+                format,
+                "--dry-run",
+                "tracking",
+                "run",
+                "init",
+                "--provider-repo",
+                "acme/widgets",
+                "--issue",
+                "1271",
+                "--run-id",
+                "global-repo-redaction",
+                "--now",
+                "2026-07-18T00:00:00Z",
+                "--out",
+                out_path.to_str().expect("run-state path"),
+            ],
+            common::plan_issue_cmd_options().with_cwd(tmp.path()),
+        );
+        assert_eq!(out.code, 0, "format={format} stderr={}", out.stderr_text());
+        let stdout = out.stdout_text();
+        assert!(!stdout.contains("global-user"), "format={format}: {stdout}");
+        assert!(
+            !stdout.contains("global-secret"),
+            "format={format}: {stdout}"
+        );
+    }
+}
+
+#[test]
+fn tracking_checkpoint_output_redacts_repository_credentials() {
+    let tmp = TempDir::new().expect("tmp");
+    let run_state = tmp.path().join("run-state.json");
+    fs::write(
+        &run_state,
+        json!({
+            "schema": "plan-issue.execution-run.v1",
+            "run_id": "checkpoint-repo-redaction",
+            "repo": "acme/widgets",
+            "issue": 1271,
+            "profile": "tracking",
+            "phase": "implementing",
+            "created_at": "2026-07-18T00:00:00Z",
+            "updated_at": "2026-07-18T00:00:00Z"
+        })
+        .to_string(),
+    )
+    .expect("run state");
+    let fixture = tmp.path().join("fixture");
+    fs::create_dir(&fixture).expect("fixture");
+    fs::write(fixture.join("body.md"), "## Current Dashboard\n").expect("body");
+    fs::write(fixture.join("comments.json"), "{\"comments\":[]}").expect("comments");
+    let repo =
+        "https://checkpoint-user:checkpoint-secret@gitlab.example.test:8443/acme/widgets.git";
+
+    for format in ["json", "text"] {
+        let out = common::run_plan_issue_with_options(
+            &[
+                "--format",
+                format,
+                "tracking",
+                "checkpoint",
+                "--provider-repo",
+                repo,
+                "--run-state",
+                run_state.to_str().expect("run-state path"),
+                "--fixture",
+                fixture.to_str().expect("fixture path"),
+            ],
+            common::plan_issue_cmd_options().with_cwd(tmp.path()),
+        );
+        assert_eq!(out.code, 0, "format={format} stderr={}", out.stderr_text());
+        let stdout = out.stdout_text();
+        assert!(
+            !stdout.contains("checkpoint-user"),
+            "format={format}: {stdout}"
+        );
+        assert!(
+            !stdout.contains("checkpoint-secret"),
+            "format={format}: {stdout}"
+        );
+    }
 }

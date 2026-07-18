@@ -15,9 +15,10 @@ pub enum RecordCommand {
     /// comments (v3 issue-backed plan record contract). Idempotent: re-running
     /// for the same bundle resumes the existing tracker instead of creating a
     /// duplicate. The dedup key is the source snapshot identity (repo-relative
-    /// path + last-commit SHA) embedded in the source lifecycle comment; on a
-    /// match only the missing lifecycle comments are attached. A partial open is
-    /// therefore safe to retry.
+    /// path + revision) embedded as a direct issue-body identity marker. Automatic
+    /// resume requires exactly one valid exact body marker; historical identity
+    /// found only in source lifecycle comments requires repair. On a trusted match
+    /// only missing lifecycle comments are attached.
     Open(Box<RecordOpenArgs>),
 
     /// Attach source, plan, and initial state lifecycle comments to an
