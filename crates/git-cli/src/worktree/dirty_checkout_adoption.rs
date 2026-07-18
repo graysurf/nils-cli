@@ -934,12 +934,13 @@ pub(crate) fn run_internal_process_supervisor() -> Option<i32> {
     )
 }
 
-fn supervise_process_with_cleanup_proof(
-    program: OsString,
-    arguments: &[OsString],
+fn with_process_supervisor_cleanup_proof<F>(
     mut completion_channel: Option<std::os::unix::net::UnixStream>,
-    deadline: Instant,
-) -> Result<i32> {
+    run: F,
+) -> Result<i32>
+where
+    F: FnOnce(Option<&mut std::os::unix::net::UnixStream>) -> Result<i32>,
+{
     PROCESS_SUPERVISOR_TERMINATE.store(false, std::sync::atomic::Ordering::SeqCst);
     let previous = unsafe {
         libc::signal(
@@ -950,13 +951,7 @@ fn supervise_process_with_cleanup_proof(
     if previous == libc::SIG_ERR {
         return Err(process_scan_resource_error());
     }
-    let result = supervise_process_with(
-        program,
-        arguments,
-        completion_channel.as_mut(),
-        deadline,
-        || PROCESS_SUPERVISOR_TERMINATE.load(std::sync::atomic::Ordering::SeqCst),
-    );
+    let result = run(completion_channel.as_mut());
     if result.is_err()
         && let Some(channel) = &mut completion_channel
     {
@@ -970,6 +965,42 @@ fn supervise_process_with_cleanup_proof(
         );
     }
     result
+}
+
+fn supervise_process_with_cleanup_proof(
+    program: OsString,
+    arguments: &[OsString],
+    completion_channel: Option<std::os::unix::net::UnixStream>,
+    deadline: Instant,
+) -> Result<i32> {
+    with_process_supervisor_cleanup_proof(completion_channel, |completion_channel| {
+        supervise_process_with(program, arguments, completion_channel, deadline, || {
+            PROCESS_SUPERVISOR_TERMINATE.load(std::sync::atomic::Ordering::SeqCst)
+        })
+    })
+}
+
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+fn supervise_process_with_cleanup_proof_and_owner<T>(
+    program: OsString,
+    arguments: &[OsString],
+    completion_channel: Option<std::os::unix::net::UnixStream>,
+    deadline: Instant,
+    owner: &mut T,
+) -> Result<i32>
+where
+    T: OwnedProcessTracker,
+{
+    with_process_supervisor_cleanup_proof(completion_channel, |completion_channel| {
+        supervise_process_with_owner(
+            program,
+            arguments,
+            owner,
+            completion_channel,
+            deadline,
+            || PROCESS_SUPERVISOR_TERMINATE.load(std::sync::atomic::Ordering::SeqCst),
+        )
+    })
 }
 
 fn supervise_process_with<F>(
@@ -6212,16 +6243,16 @@ fn drain_nonblocking<R: Read>(
 
 const PROCESS_CLEANUP_TIMEOUT: Duration = Duration::from_millis(250);
 const PROCESS_SCAN_LIMITS: ProcessScanLimits = ProcessScanLimits {
-    #[cfg(any(test, target_os = "linux"))]
+    #[cfg(target_os = "linux")]
     process_entries: 32_768,
-    #[cfg(any(test, target_os = "linux"))]
+    #[cfg(target_os = "linux")]
     metadata_bytes: 32 * 1024 * 1024,
     descendants: 4_096,
 };
 const MAX_PROCESS_CLEANUP_GENERATIONS: usize = PROCESS_SCAN_LIMITS.descendants;
-#[cfg(any(test, target_os = "linux"))]
+#[cfg(target_os = "linux")]
 const MAX_PROC_STAT_BYTES: usize = 4 * 1024;
-#[cfg(any(test, target_os = "linux"))]
+#[cfg(target_os = "linux")]
 const MAX_PROC_CHILDREN_BYTES: usize = 64 * 1024;
 
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
@@ -6234,18 +6265,18 @@ struct ProcessIdentity {
 struct ProcessRecord {
     identity: ProcessIdentity,
     parent: libc::pid_t,
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "linux"))]
     metadata_bytes: usize,
 }
 
 impl ProcessRecord {
     fn new(pid: libc::pid_t, parent: libc::pid_t, generation: u128, metadata_bytes: usize) -> Self {
-        #[cfg(not(test))]
+        #[cfg(not(all(test, target_os = "linux")))]
         let _ = metadata_bytes;
         Self {
             identity: ProcessIdentity { pid, generation },
             parent,
-            #[cfg(test)]
+            #[cfg(all(test, target_os = "linux"))]
             metadata_bytes,
         }
     }
@@ -6253,9 +6284,9 @@ impl ProcessRecord {
 
 #[derive(Clone, Copy, Debug)]
 struct ProcessScanLimits {
-    #[cfg(any(test, target_os = "linux"))]
+    #[cfg(target_os = "linux")]
     process_entries: usize,
-    #[cfg(any(test, target_os = "linux"))]
+    #[cfg(target_os = "linux")]
     metadata_bytes: usize,
     descendants: usize,
 }
@@ -6263,7 +6294,7 @@ struct ProcessScanLimits {
 #[derive(Debug)]
 struct ProcessScan {
     identities: Vec<ProcessIdentity>,
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "linux"))]
     edge_visits: usize,
 }
 
@@ -6274,7 +6305,7 @@ fn process_scan_resource_error() -> anyhow::Error {
     )
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 fn collect_descendant_processes_with<F>(
     root: libc::pid_t,
     deadline: Instant,
@@ -6332,7 +6363,7 @@ where
     }
     Ok(ProcessScan {
         identities,
-        #[cfg(test)]
+        #[cfg(all(test, target_os = "linux"))]
         edge_visits,
     })
 }
@@ -6540,7 +6571,7 @@ where
     else {
         return Ok(ProcessScan {
             identities,
-            #[cfg(test)]
+            #[cfg(all(test, target_os = "linux"))]
             edge_visits,
         });
     };
@@ -6574,7 +6605,7 @@ where
     }
     Ok(ProcessScan {
         identities,
-        #[cfg(test)]
+        #[cfg(all(test, target_os = "linux"))]
         edge_visits,
     })
 }
@@ -6911,7 +6942,7 @@ where
     }
     Ok(ProcessScan {
         identities,
-        #[cfg(test)]
+        #[cfg(all(test, target_os = "linux"))]
         edge_visits,
     })
 }
@@ -6973,7 +7004,7 @@ where
     let Some(root_identity) = process_identity(root)? else {
         return Ok(ProcessScan {
             identities: Vec::new(),
-            #[cfg(test)]
+            #[cfg(all(test, target_os = "linux"))]
             edge_visits: 0,
         });
     };
@@ -6995,7 +7026,7 @@ where
     if current_identity(root.pid)? != Some(root) {
         return Ok(ProcessScan {
             identities: Vec::new(),
-            #[cfg(test)]
+            #[cfg(all(test, target_os = "linux"))]
             edge_visits: 0,
         });
     }
@@ -7617,7 +7648,7 @@ where
 {
     Ok(ProcessScan {
         identities: Vec::new(),
-        #[cfg(test)]
+        #[cfg(all(test, target_os = "linux"))]
         edge_visits: 0,
     })
 }
@@ -7663,24 +7694,24 @@ fn should_use_unpinned_cleanup_signals(supervised: bool, leader_reaped: bool) ->
     !supervised || !leader_reaped
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 thread_local! {
     static UNPINNED_CLEANUP_SIGNAL_ATTEMPTS: std::cell::Cell<usize> = const {
         std::cell::Cell::new(0)
     };
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 fn record_unpinned_cleanup_signal_attempt() {
     UNPINNED_CLEANUP_SIGNAL_ATTEMPTS.with(|attempts| attempts.set(attempts.get() + 1));
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 fn reset_unpinned_cleanup_signal_attempts() {
     UNPINNED_CLEANUP_SIGNAL_ATTEMPTS.with(|attempts| attempts.set(0));
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 fn unpinned_cleanup_signal_attempts() -> usize {
     UNPINNED_CLEANUP_SIGNAL_ATTEMPTS.with(std::cell::Cell::get)
 }
@@ -7708,7 +7739,7 @@ fn terminate_child(
         .unwrap_or(cleanup_started);
     let mut leader_reaped = child.try_wait().is_ok_and(|status| status.is_some());
     if should_use_unpinned_cleanup_signals(supervised, leader_reaped) {
-        #[cfg(test)]
+        #[cfg(all(test, target_os = "linux"))]
         record_unpinned_cleanup_signal_attempt();
         let _ = signal_cleanup_leader(process_group, supervised);
     }
@@ -7744,7 +7775,7 @@ fn terminate_child(
             }
         }
         if should_use_unpinned_cleanup_signals(supervised, leader_reaped) {
-            #[cfg(test)]
+            #[cfg(all(test, target_os = "linux"))]
             record_unpinned_cleanup_signal_attempt();
             unsafe {
                 let _ = libc::kill(-process_group, libc::SIGSTOP);
@@ -7787,7 +7818,7 @@ fn terminate_child(
                 break;
             }
         }
-        #[cfg(test)]
+        #[cfg(all(test, target_os = "linux"))]
         record_unpinned_cleanup_signal_attempt();
         unsafe {
             if libc::kill(-process_group, libc::SIGKILL) != 0 {
@@ -8348,7 +8379,7 @@ mod tests {
             .process_group(0)
             .spawn()
             .expect("spawn authenticated supervisor output fixture");
-        let fallback_owner = if scenario == "internal-failure" {
+        let fallback_owner = if matches!(scenario, "internal-failure" | "target-status-one") {
             None
         } else {
             Some(
@@ -8572,6 +8603,21 @@ mod tests {
         ));
     }
 
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    struct SupervisorCompletionFixtureOwner;
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    impl OwnedProcessTracker for SupervisorCompletionFixtureOwner {
+        fn identities(&mut self, deadline: Instant) -> Result<Vec<ProcessIdentity>> {
+            ensure_deadline(deadline)?;
+            Ok(Vec::new())
+        }
+
+        fn known_identities(&self) -> Vec<ProcessIdentity> {
+            Vec::new()
+        }
+    }
+
     #[test]
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     fn authenticated_process_supervisor_test_fixture() {
@@ -8597,7 +8643,19 @@ mod tests {
                 | "escaped-output-timeout"
                 | "target-status-one",
             ) => exit::RUNTIME,
-            Some("internal-failure" | "target-signal") => {
+            Some("internal-failure") => {
+                let mut owner = SupervisorCompletionFixtureOwner;
+                supervise_process_with_cleanup_proof_and_owner(
+                    program.into_os_string(),
+                    &arguments,
+                    Some(authenticated.channel),
+                    authenticated.deadline,
+                    &mut owner,
+                )
+                .expect_err("fixture target launch must fail internally");
+                std::process::exit(exit::RUNTIME);
+            }
+            Some("target-signal") => {
                 supervise_process_with_cleanup_proof(
                     program.into_os_string(),
                     &arguments,
@@ -8609,12 +8667,23 @@ mod tests {
             }
             _ => panic!("unsupported supervisor fixture scenario"),
         };
-        let status = supervise_process_with_cleanup_proof(
-            program.into_os_string(),
-            &arguments,
-            Some(authenticated.channel),
-            authenticated.deadline,
-        )
+        let status = if scenario == OsStr::new("target-status-one") {
+            let mut owner = SupervisorCompletionFixtureOwner;
+            supervise_process_with_cleanup_proof_and_owner(
+                program.into_os_string(),
+                &arguments,
+                Some(authenticated.channel),
+                authenticated.deadline,
+                &mut owner,
+            )
+        } else {
+            supervise_process_with_cleanup_proof(
+                program.into_os_string(),
+                &arguments,
+                Some(authenticated.channel),
+                authenticated.deadline,
+            )
+        }
         .expect("run supervisor fixture");
         if scenario == OsStr::new("target-status-one") {
             std::process::exit(status);
@@ -10727,6 +10796,7 @@ mod tests {
                 scans.set(scans.get() + 1);
                 Ok(ProcessScan {
                     identities: vec![unrelated],
+                    #[cfg(all(test, target_os = "linux"))]
                     edge_visits: 1,
                 })
             },
@@ -10827,6 +10897,7 @@ mod tests {
                 vanished_scans.set(vanished_scans.get() + 1);
                 Ok(ProcessScan {
                     identities: vec![child],
+                    #[cfg(all(test, target_os = "linux"))]
                     edge_visits: 1,
                 })
             },
@@ -10844,6 +10915,7 @@ mod tests {
                 failed_scans.set(failed_scans.get() + 1);
                 Ok(ProcessScan {
                     identities: vec![child],
+                    #[cfg(all(test, target_os = "linux"))]
                     edge_visits: 1,
                 })
             },
@@ -10871,6 +10943,7 @@ mod tests {
                 expired_scans.set(expired_scans.get() + 1);
                 Ok(ProcessScan {
                     identities: vec![child],
+                    #[cfg(all(test, target_os = "linux"))]
                     edge_visits: 1,
                 })
             },
@@ -10895,6 +10968,7 @@ mod tests {
                 delegated_scans.set(delegated_scans.get() + 1);
                 Ok(ProcessScan {
                     identities: vec![child],
+                    #[cfg(all(test, target_os = "linux"))]
                     edge_visits: 1,
                 })
             },
