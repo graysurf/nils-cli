@@ -101,6 +101,11 @@ const PROVIDER_PROMPT_DISCOVERY_MAX_CONCURRENT_SCANS: usize = 4;
 const MAX_CONCURRENT_AUTO_RESUME_TICKS: usize = 4;
 const MAX_AGENT_LAUNCH_PROFILES: usize = 16;
 const AGENT_LAUNCH_PROFILE_READINESS_TIMEOUT: Duration = Duration::from_secs(2);
+#[cfg(test)]
+std::thread_local! {
+    static PANIC_AGENT_LAUNCH_PROFILE_READINESS_PROBE: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
 const ATTACH_SCHEMA_VERSION: &str = "agent-session.attach.v1";
 const ATTACH_EVENT_SCHEMA_VERSION: &str = "agent-session.attach.event.v1";
 const ACTIVITY_STREAM_EVENT_SCHEMA_VERSION: &str = "agent-session.activity-stream.event.v1";
@@ -186,6 +191,43 @@ struct AgentLaunchProfileReadiness {
     refreshing: bool,
     generation: u64,
     summaries: Vec<AgentLaunchProfileSummary>,
+}
+
+struct AgentLaunchProfileReadinessRefresh<'a> {
+    readiness: &'a StdMutex<AgentLaunchProfileReadiness>,
+    completed: &'a std::sync::Condvar,
+    active: bool,
+}
+
+impl AgentLaunchProfileReadinessRefresh<'_> {
+    fn finish(mut self, summaries: &[AgentLaunchProfileSummary]) {
+        let mut state = self
+            .readiness
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.summaries.clear();
+        state.summaries.extend_from_slice(summaries);
+        state.generation = state.generation.wrapping_add(1);
+        state.refreshing = false;
+        self.completed.notify_all();
+        self.active = false;
+    }
+}
+
+impl Drop for AgentLaunchProfileReadinessRefresh<'_> {
+    fn drop(&mut self) {
+        if !self.active {
+            return;
+        }
+        let mut state = self
+            .readiness
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.summaries.clear();
+        state.generation = state.generation.wrapping_add(1);
+        state.refreshing = false;
+        self.completed.notify_all();
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -327,18 +369,24 @@ impl AgentLaunchProfiles {
         state.refreshing = true;
         drop(state);
 
+        let refresh = AgentLaunchProfileReadinessRefresh {
+            readiness,
+            completed,
+            active: true,
+        };
         let summaries = self.probe_ready_summaries();
-        let mut state = readiness
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        state.summaries.clone_from(&summaries);
-        state.generation = state.generation.wrapping_add(1);
-        state.refreshing = false;
-        completed.notify_all();
+        refresh.finish(&summaries);
         summaries
     }
 
     fn probe_ready_summaries(&self) -> Vec<AgentLaunchProfileSummary> {
+        #[cfg(test)]
+        PANIC_AGENT_LAUNCH_PROFILE_READINESS_PROBE.with(|panic_next| {
+            assert!(
+                !panic_next.replace(false),
+                "injected launch profile readiness panic"
+            );
+        });
         std::thread::scope(|scope| {
             self.entries
                 .iter()
@@ -6197,6 +6245,28 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["profile-0", "profile-1", "profile-2", "profile-3"]
         );
+    }
+
+    #[test]
+    fn launch_profile_readiness_unwind_releases_single_flight_owner() {
+        let profiles = AgentLaunchProfiles::default();
+        PANIC_AGENT_LAUNCH_PROFILE_READINESS_PROBE.with(|panic_next| panic_next.set(true));
+
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                profiles.ready_summaries()
+            }))
+            .is_err()
+        );
+        let (readiness, _) = &*profiles.readiness_probe;
+        assert!(
+            !readiness
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .refreshing,
+            "a panicking probe must release single-flight ownership"
+        );
+        assert!(profiles.ready_summaries().is_empty());
     }
 
     #[test]
