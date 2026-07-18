@@ -4,6 +4,7 @@ mod completion;
 pub mod config;
 pub mod content;
 pub mod env;
+mod integration;
 pub mod model;
 pub mod output;
 pub mod path_classes;
@@ -11,6 +12,7 @@ pub mod paths;
 pub mod predicate;
 pub mod resolver;
 mod session;
+mod user_config;
 
 use clap::Parser;
 
@@ -23,7 +25,7 @@ use output::{
     render_init, render_list, render_preflight, render_remove, render_undeclared_intent_error,
 };
 
-use nils_common::cli_contract::exit;
+use nils_common::cli_contract::{Envelope, EnvelopeError, exit, schema_version_for};
 
 const EXIT_OK: i32 = exit::SUCCESS;
 const EXIT_STRICT: i32 = exit::RUNTIME;
@@ -41,26 +43,92 @@ where
     I: IntoIterator<Item = T>,
     T: Into<std::ffi::OsString> + Clone,
 {
-    let cli = match Cli::try_parse_from(args) {
+    let args: Vec<std::ffi::OsString> = args.into_iter().map(Into::into).collect();
+    let output_format = detect_cli_output_format(&args);
+    let cli = match Cli::try_parse_from(args.iter().cloned()) {
         Ok(parsed) => parsed,
         Err(err) => {
             use clap::error::ErrorKind;
-            let code = match err.kind() {
+            let kind = err.kind();
+            if matches!(
+                kind,
                 ErrorKind::DisplayHelp
-                | ErrorKind::DisplayVersion
-                | ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand => err.exit_code(),
-                _ => EXIT_USAGE,
+                    | ErrorKind::DisplayVersion
+                    | ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
+            ) {
+                let code = err.exit_code();
+                let _ = err.print();
+                return code;
+            }
+            let code = match kind {
+                ErrorKind::InvalidSubcommand => "unknown-subcommand",
+                _ => "parse-error",
             };
-            let _ = err.print();
-            return code;
+            return nils_common::cli_contract::emit_parse_error(
+                "agent-docs",
+                output_format,
+                code,
+                &render_clap_message(&err),
+            );
         }
     };
 
-    dispatch(cli)
+    dispatch(cli, output_format)
 }
 
-fn dispatch(cli: Cli) -> i32 {
+fn detect_cli_output_format(
+    args: &[std::ffi::OsString],
+) -> nils_common::cli_contract::OutputFormat {
+    let mut iter = args.iter().skip(1);
+    while let Some(arg) = iter.next() {
+        let arg = arg.to_string_lossy();
+        if arg == "--format"
+            && let Some(next) = iter.next()
+            && next.to_string_lossy().eq_ignore_ascii_case("json")
+        {
+            return nils_common::cli_contract::OutputFormat::Json;
+        }
+        if let Some(value) = arg.strip_prefix("--format=")
+            && value.eq_ignore_ascii_case("json")
+        {
+            return nils_common::cli_contract::OutputFormat::Json;
+        }
+    }
+    nils_common::cli_contract::OutputFormat::Text
+}
+
+fn render_clap_message(err: &clap::Error) -> String {
+    err.to_string()
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .map(|line| {
+            let line = line.trim();
+            line.strip_prefix("error:")
+                .map(str::trim)
+                .unwrap_or(line)
+                .to_string()
+        })
+        .unwrap_or_else(|| "command-line parse failed".to_string())
+}
+
+fn dispatch(cli: Cli, output_format: nils_common::cli_contract::OutputFormat) -> i32 {
+    if cli.user_config
+        && !matches!(
+            &cli.command,
+            Command::Preflight(_) | Command::Explain(_) | Command::List(_) | Command::Session(_)
+        )
+    {
+        return nils_common::cli_contract::emit_parse_error(
+            "agent-docs",
+            output_format,
+            "invalid-user-config-command",
+            "--user-config is supported only by preflight, explain, list, and session",
+        );
+    }
+
     let fallback_mode = cli.worktree_fallback;
+    let use_user_config = cli.user_config;
+    let integration_fingerprint = cli.integration_fingerprint;
     let overrides = PathOverrides {
         docs_home: cli.docs_home,
         project_path: cli.project_path,
@@ -68,7 +136,14 @@ fn dispatch(cli: Cli) -> i32 {
 
     match cli.command {
         Command::Audit(args) => {
-            let roots = match resolve_roots_or_exit(&overrides) {
+            let roots = match resolve_roots_or_exit(
+                &overrides,
+                CatalogCommandContract {
+                    format: args.format,
+                    command: "audit",
+                    schema_version: 2,
+                },
+            ) {
                 Ok(roots) => roots,
                 Err(code) => return code,
             };
@@ -81,8 +156,15 @@ fn dispatch(cli: Cli) -> i32 {
             ) {
                 Ok(report) => report,
                 Err(err) => {
-                    eprintln!("error: {err}");
-                    return config_error_exit_code(&err);
+                    let exit_code = config_error_exit_code(&err);
+                    return render_command_failure(
+                        args.format,
+                        "audit",
+                        2,
+                        "catalog-load-failed",
+                        &err.to_string(),
+                        exit_code,
+                    );
                 }
             };
             let exit_code = if args.strict && report.has_problems() {
@@ -101,18 +183,33 @@ fn dispatch(cli: Cli) -> i32 {
                 Ok(phase) => phase,
                 Err(code) => return code,
             };
-            let roots = match resolve_roots_or_exit(&overrides) {
+            let roots = match resolve_roots_or_exit(
+                &overrides,
+                CatalogCommandContract {
+                    format: args.format,
+                    command: "preflight",
+                    schema_version: 2,
+                },
+            ) {
                 Ok(roots) => roots,
                 Err(code) => return code,
             };
-            let catalog = match load_catalog_from_roots(&roots) {
+            let catalog = match load_effective_catalog(
+                &roots,
+                use_user_config,
+                args.product,
+                fallback_mode,
+                integration_fingerprint.as_deref(),
+                CatalogCommandContract {
+                    format: args.format,
+                    command: "preflight",
+                    schema_version: 2,
+                },
+            ) {
                 Ok(catalog) => catalog,
-                Err(err) => {
-                    eprintln!("error: {err}");
-                    return config_error_exit_code(&err);
-                }
+                Err(code) => return code,
             };
-            let report = resolver::resolve_intent_with_catalog_for_scope(
+            let report = resolver::resolve_intent_with_effective_catalog_for_scope(
                 &intent,
                 &roots,
                 args.product,
@@ -123,7 +220,12 @@ fn dispatch(cli: Cli) -> i32 {
                 &catalog,
             );
             if args.require_declared_intent {
-                let available_intents = resolver::declared_intents(&roots, fallback_mode, &catalog);
+                let available_intents = resolver::declared_intents_for_product(
+                    &roots,
+                    args.product,
+                    fallback_mode,
+                    &catalog.catalog,
+                );
                 if !available_intents.iter().any(|name| name == intent.as_str()) {
                     return print_failure_rendered(
                         args.format,
@@ -144,7 +246,14 @@ fn dispatch(cli: Cli) -> i32 {
             print_rendered(render_preflight(args.format, &report), exit_code)
         }
         Command::Init(args) => {
-            let roots = match resolve_roots_or_exit(&overrides) {
+            let roots = match resolve_roots_or_exit(
+                &overrides,
+                CatalogCommandContract {
+                    format: args.format,
+                    command: "init",
+                    schema_version: 1,
+                },
+            ) {
                 Ok(roots) => roots,
                 Err(code) => return code,
             };
@@ -161,16 +270,31 @@ fn dispatch(cli: Cli) -> i32 {
             }
         }
         Command::Explain(args) => {
-            let roots = match resolve_roots_or_exit(&overrides) {
+            let roots = match resolve_roots_or_exit(
+                &overrides,
+                CatalogCommandContract {
+                    format: args.format,
+                    command: "explain",
+                    schema_version: 1,
+                },
+            ) {
                 Ok(roots) => roots,
                 Err(code) => return code,
             };
-            let catalog = match load_catalog_from_roots(&roots) {
+            let catalog = match load_effective_catalog(
+                &roots,
+                use_user_config,
+                args.product,
+                fallback_mode,
+                integration_fingerprint.as_deref(),
+                CatalogCommandContract {
+                    format: args.format,
+                    command: "explain",
+                    schema_version: 1,
+                },
+            ) {
                 Ok(catalog) => catalog,
-                Err(err) => {
-                    eprintln!("error: {err}");
-                    return config_error_exit_code(&err);
-                }
+                Err(code) => return code,
             };
             match args.intent {
                 Some(raw) => {
@@ -178,7 +302,7 @@ fn dispatch(cli: Cli) -> i32 {
                         Ok(intent) => intent,
                         Err(code) => return code,
                     };
-                    let report = resolver::resolve_intent_with_catalog_for_product(
+                    let report = resolver::resolve_intent_with_effective_catalog_for_product(
                         &intent,
                         &roots,
                         args.product,
@@ -195,33 +319,60 @@ fn dispatch(cli: Cli) -> i32 {
                     print_rendered(render_explain_intent(args.format, &payload), EXIT_OK)
                 }
                 None => {
-                    let intents = resolver::available_intents_for_product(args.product, &catalog);
+                    let intents = resolver::available_intents_for_product_in_roots(
+                        &roots,
+                        args.product,
+                        &catalog.catalog,
+                    );
                     let payload = ExplainIntents { intents: &intents };
                     print_rendered(render_explain_intents(args.format, &payload), EXIT_OK)
                 }
             }
         }
         Command::List(args) => {
-            let roots = match resolve_roots_or_exit(&overrides) {
+            let roots = match resolve_roots_or_exit(
+                &overrides,
+                CatalogCommandContract {
+                    format: args.format,
+                    command: "list",
+                    schema_version: 1,
+                },
+            ) {
                 Ok(roots) => roots,
                 Err(code) => return code,
             };
-            let catalog = match load_catalog_from_roots(&roots) {
+            let catalog = match load_effective_catalog(
+                &roots,
+                use_user_config,
+                args.product,
+                fallback_mode,
+                integration_fingerprint.as_deref(),
+                CatalogCommandContract {
+                    format: args.format,
+                    command: "list",
+                    schema_version: 1,
+                },
+            ) {
                 Ok(catalog) => catalog,
-                Err(err) => {
-                    eprintln!("error: {err}");
-                    return config_error_exit_code(&err);
-                }
+                Err(code) => return code,
             };
-            let documents = resolver::resolve_all_documents_for_product(
+            let documents = resolver::resolve_all_documents_for_product_policy(
                 &roots,
                 args.product,
                 fallback_mode,
-                &catalog,
+                &catalog.catalog,
+                &catalog.private_allowed_roots,
             );
-            let validations =
-                resolver::all_validation_contracts_for_product(&roots, args.product, &catalog);
-            let intents = resolver::available_intents_for_product(args.product, &catalog);
+            let validations = resolver::all_validation_contracts_for_product(
+                &roots,
+                args.product,
+                &catalog.catalog,
+            );
+            let intents = resolver::available_intents_for_product_in_roots(
+                &roots,
+                args.product,
+                &catalog.catalog,
+            );
             let report = ListReport {
                 docs_home: roots.docs_home.clone(),
                 project_path: roots.project_path.clone(),
@@ -236,7 +387,14 @@ fn dispatch(cli: Cli) -> i32 {
                 Ok(intent) => intent,
                 Err(code) => return code,
             };
-            let roots = match resolve_roots_or_exit(&overrides) {
+            let roots = match resolve_roots_or_exit(
+                &overrides,
+                CatalogCommandContract {
+                    format: args.format,
+                    command: "remove",
+                    schema_version: 1,
+                },
+            ) {
                 Ok(roots) => roots,
                 Err(code) => return code,
             };
@@ -256,7 +414,15 @@ fn dispatch(cli: Cli) -> i32 {
                 }
             }
         }
-        Command::Session(args) => session::run(args, overrides, fallback_mode),
+        Command::Config(args) => user_config::run(args, &overrides),
+        Command::Integration(args) => integration::run(args, &overrides, fallback_mode),
+        Command::Session(args) => session::run(
+            args,
+            overrides,
+            fallback_mode,
+            use_user_config,
+            integration_fingerprint,
+        ),
         Command::Completion(args) => completion::run(args.shell),
     }
 }
@@ -291,11 +457,116 @@ fn parse_phase(raw: Option<&str>) -> Result<Option<Phase>, i32> {
     }
 }
 
-fn resolve_roots_or_exit(overrides: &PathOverrides) -> Result<ResolvedRoots, i32> {
+fn resolve_roots_or_exit(
+    overrides: &PathOverrides,
+    contract: CatalogCommandContract,
+) -> Result<ResolvedRoots, i32> {
     resolve_roots(overrides).map_err(|err| {
-        eprintln!("error: {err:#}");
-        EXIT_RUNTIME
+        render_command_failure(
+            contract.format,
+            contract.command,
+            contract.schema_version,
+            "root-resolution-failed",
+            &format!("{err:#}"),
+            EXIT_RUNTIME,
+        )
     })
+}
+
+#[derive(Clone, Copy)]
+struct CatalogCommandContract {
+    format: model::OutputFormat,
+    command: &'static str,
+    schema_version: u32,
+}
+
+fn load_effective_catalog(
+    roots: &ResolvedRoots,
+    use_user_config: bool,
+    product: Option<model::Product>,
+    fallback_mode: model::FallbackMode,
+    integration_fingerprint: Option<&str>,
+    contract: CatalogCommandContract,
+) -> Result<integration::EffectiveCatalog, i32> {
+    if use_user_config {
+        let Some(product) = product else {
+            return Err(nils_common::cli_contract::emit_parse_error(
+                "agent-docs",
+                contract_output_format(contract.format),
+                "user-config-requires-product",
+                "--user-config requires --product",
+            ));
+        };
+        return integration::load_bound_catalog(
+            roots,
+            product,
+            fallback_mode,
+            integration_fingerprint,
+        )
+        .map_err(|err| {
+            let exit_code = match err.kind() {
+                integration::BoundCatalogErrorKind::Config => EXIT_CONFIG,
+                integration::BoundCatalogErrorKind::Data => EXIT_DATA,
+                integration::BoundCatalogErrorKind::Runtime => EXIT_RUNTIME,
+            };
+            render_command_failure(
+                contract.format,
+                contract.command,
+                contract.schema_version,
+                err.code(),
+                &err.to_string(),
+                exit_code,
+            )
+        });
+    }
+    load_catalog_from_roots(roots)
+        .map(|catalog| integration::EffectiveCatalog {
+            catalog,
+            private_project_catalog: false,
+            private_allowed_roots: Vec::new(),
+        })
+        .map_err(|err| {
+            let exit_code = config_error_exit_code(&err);
+            render_command_failure(
+                contract.format,
+                contract.command,
+                contract.schema_version,
+                "catalog-load-failed",
+                &err.to_string(),
+                exit_code,
+            )
+        })
+}
+
+fn contract_output_format(format: model::OutputFormat) -> nils_common::cli_contract::OutputFormat {
+    match format {
+        model::OutputFormat::Text => nils_common::cli_contract::OutputFormat::Text,
+        model::OutputFormat::Json => nils_common::cli_contract::OutputFormat::Json,
+    }
+}
+
+fn render_command_failure(
+    format: model::OutputFormat,
+    command: &str,
+    schema_version: u32,
+    code: &str,
+    message: &str,
+    exit_code: i32,
+) -> i32 {
+    match format {
+        model::OutputFormat::Json => {
+            let envelope: Envelope<()> = Envelope::failure(
+                schema_version_for("agent-docs", command, schema_version),
+                EnvelopeError::new(code, message),
+            );
+            match serde_json::to_string(&envelope) {
+                Ok(serialized) => println!("{serialized}"),
+                Err(err) => eprintln!("error: {err:#}"),
+            }
+        }
+        model::OutputFormat::Text => eprintln!("error: {message}"),
+    }
+    exit_code
 }
 
 fn config_error_exit_code(err: &ConfigLoadError) -> i32 {

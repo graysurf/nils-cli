@@ -22,11 +22,17 @@ _agent-docs() {
             agent__docs,completion)
                 cmd="agent__docs__completion"
                 ;;
+            agent__docs,config)
+                cmd="agent__docs__config"
+                ;;
             agent__docs,explain)
                 cmd="agent__docs__explain"
                 ;;
             agent__docs,init)
                 cmd="agent__docs__init"
+                ;;
+            agent__docs,integration)
+                cmd="agent__docs__integration"
                 ;;
             agent__docs,list)
                 cmd="agent__docs__list"
@@ -39,6 +45,24 @@ _agent-docs() {
                 ;;
             agent__docs,session)
                 cmd="agent__docs__session"
+                ;;
+            agent__docs__config,enroll)
+                cmd="agent__docs__config__enroll"
+                ;;
+            agent__docs__config,exclude)
+                cmd="agent__docs__config__exclude"
+                ;;
+            agent__docs__config,list)
+                cmd="agent__docs__config__list"
+                ;;
+            agent__docs__config,remove)
+                cmd="agent__docs__config__remove"
+                ;;
+            agent__docs__config,show)
+                cmd="agent__docs__config__show"
+                ;;
+            agent__docs__integration,resolve)
+                cmd="agent__docs__integration__resolve"
                 ;;
             agent__docs__session,activate)
                 cmd="agent__docs__session__activate"
@@ -59,7 +83,7 @@ _agent-docs() {
 
     case "${cmd}" in
         agent__docs)
-            opts="-h -V --docs-home --project-path --worktree-fallback --help --version audit preflight init explain list remove session completion"
+            opts="-h -V --docs-home --project-path --worktree-fallback --user-config --integration-fingerprint --help --version audit preflight init explain list remove config integration session completion"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 1 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -77,6 +101,10 @@ _agent-docs() {
                     COMPREPLY=($(compgen -W "auto local-only" -- "${cur}"))
                     return 0
                     ;;
+                --integration-fingerprint)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
                 *)
                     COMPREPLY=()
                     ;;
@@ -85,7 +113,7 @@ _agent-docs() {
             return 0
             ;;
         agent__docs__audit)
-            opts="-h --target --format --strict --product --docs-home --project-path --worktree-fallback --help"
+            opts="-h --target --format --strict --product --docs-home --project-path --worktree-fallback --user-config --integration-fingerprint --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -115,6 +143,10 @@ _agent-docs() {
                     COMPREPLY=($(compgen -W "auto local-only" -- "${cur}"))
                     return 0
                     ;;
+                --integration-fingerprint)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
                 *)
                     COMPREPLY=()
                     ;;
@@ -123,7 +155,7 @@ _agent-docs() {
             return 0
             ;;
         agent__docs__completion)
-            opts="-h --docs-home --project-path --worktree-fallback --help bash zsh"
+            opts="-h --docs-home --project-path --worktree-fallback --user-config --integration-fingerprint --help bash zsh"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -141,6 +173,222 @@ _agent-docs() {
                     COMPREPLY=($(compgen -W "auto local-only" -- "${cur}"))
                     return 0
                     ;;
+                --integration-fingerprint)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        agent__docs__config)
+            opts="-h --docs-home --project-path --worktree-fallback --user-config --integration-fingerprint --help enroll exclude show list remove"
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                --docs-home)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --project-path)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --worktree-fallback)
+                    COMPREPLY=($(compgen -W "auto local-only" -- "${cur}"))
+                    return 0
+                    ;;
+                --integration-fingerprint)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        agent__docs__config__enroll)
+            opts="-h --catalog --all-worktrees --reason --apply --format --docs-home --project-path --worktree-fallback --user-config --integration-fingerprint --help"
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                --catalog)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --reason)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --format)
+                    COMPREPLY=($(compgen -W "text json" -- "${cur}"))
+                    return 0
+                    ;;
+                --docs-home)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --project-path)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --worktree-fallback)
+                    COMPREPLY=($(compgen -W "auto local-only" -- "${cur}"))
+                    return 0
+                    ;;
+                --integration-fingerprint)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        agent__docs__config__exclude)
+            opts="-h --all-worktrees --reason --apply --format --docs-home --project-path --worktree-fallback --user-config --integration-fingerprint --help"
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                --reason)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --format)
+                    COMPREPLY=($(compgen -W "text json" -- "${cur}"))
+                    return 0
+                    ;;
+                --docs-home)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --project-path)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --worktree-fallback)
+                    COMPREPLY=($(compgen -W "auto local-only" -- "${cur}"))
+                    return 0
+                    ;;
+                --integration-fingerprint)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        agent__docs__config__list)
+            opts="-h --format --docs-home --project-path --worktree-fallback --user-config --integration-fingerprint --help"
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                --format)
+                    COMPREPLY=($(compgen -W "text json" -- "${cur}"))
+                    return 0
+                    ;;
+                --docs-home)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --project-path)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --worktree-fallback)
+                    COMPREPLY=($(compgen -W "auto local-only" -- "${cur}"))
+                    return 0
+                    ;;
+                --integration-fingerprint)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        agent__docs__config__remove)
+            opts="-h --all-worktrees --apply --format --docs-home --project-path --worktree-fallback --user-config --integration-fingerprint --help"
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                --format)
+                    COMPREPLY=($(compgen -W "text json" -- "${cur}"))
+                    return 0
+                    ;;
+                --docs-home)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --project-path)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --worktree-fallback)
+                    COMPREPLY=($(compgen -W "auto local-only" -- "${cur}"))
+                    return 0
+                    ;;
+                --integration-fingerprint)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        agent__docs__config__show)
+            opts="-h --format --docs-home --project-path --worktree-fallback --user-config --integration-fingerprint --help"
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                --format)
+                    COMPREPLY=($(compgen -W "text json" -- "${cur}"))
+                    return 0
+                    ;;
+                --docs-home)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --project-path)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --worktree-fallback)
+                    COMPREPLY=($(compgen -W "auto local-only" -- "${cur}"))
+                    return 0
+                    ;;
+                --integration-fingerprint)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
                 *)
                     COMPREPLY=()
                     ;;
@@ -149,7 +397,7 @@ _agent-docs() {
             return 0
             ;;
         agent__docs__explain)
-            opts="-h --intent --format --product --docs-home --project-path --worktree-fallback --help"
+            opts="-h --intent --format --product --docs-home --project-path --worktree-fallback --user-config --integration-fingerprint --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -179,6 +427,10 @@ _agent-docs() {
                     COMPREPLY=($(compgen -W "auto local-only" -- "${cur}"))
                     return 0
                     ;;
+                --integration-fingerprint)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
                 *)
                     COMPREPLY=()
                     ;;
@@ -187,7 +439,7 @@ _agent-docs() {
             return 0
             ;;
         agent__docs__init)
-            opts="-h --print --dry-run --force --format --docs-home --project-path --worktree-fallback --help"
+            opts="-h --print --dry-run --force --format --docs-home --project-path --worktree-fallback --user-config --integration-fingerprint --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -209,6 +461,78 @@ _agent-docs() {
                     COMPREPLY=($(compgen -W "auto local-only" -- "${cur}"))
                     return 0
                     ;;
+                --integration-fingerprint)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        agent__docs__integration)
+            opts="-h --docs-home --project-path --worktree-fallback --user-config --integration-fingerprint --help resolve"
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                --docs-home)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --project-path)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --worktree-fallback)
+                    COMPREPLY=($(compgen -W "auto local-only" -- "${cur}"))
+                    return 0
+                    ;;
+                --integration-fingerprint)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        agent__docs__integration__resolve)
+            opts="-h --product --format --docs-home --project-path --worktree-fallback --user-config --integration-fingerprint --help"
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                --product)
+                    COMPREPLY=($(compgen -W "codex claude hermes" -- "${cur}"))
+                    return 0
+                    ;;
+                --format)
+                    COMPREPLY=($(compgen -W "text json" -- "${cur}"))
+                    return 0
+                    ;;
+                --docs-home)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --project-path)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --worktree-fallback)
+                    COMPREPLY=($(compgen -W "auto local-only" -- "${cur}"))
+                    return 0
+                    ;;
+                --integration-fingerprint)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
                 *)
                     COMPREPLY=()
                     ;;
@@ -217,7 +541,7 @@ _agent-docs() {
             return 0
             ;;
         agent__docs__list)
-            opts="-h --format --product --docs-home --project-path --worktree-fallback --help"
+            opts="-h --format --product --docs-home --project-path --worktree-fallback --user-config --integration-fingerprint --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -243,6 +567,10 @@ _agent-docs() {
                     COMPREPLY=($(compgen -W "auto local-only" -- "${cur}"))
                     return 0
                     ;;
+                --integration-fingerprint)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
                 *)
                     COMPREPLY=()
                     ;;
@@ -251,7 +579,7 @@ _agent-docs() {
             return 0
             ;;
         agent__docs__preflight)
-            opts="-h --intent --format --strict --product --phase --require-declared-intent --docs-home --project-path --worktree-fallback --help"
+            opts="-h --intent --format --strict --product --phase --require-declared-intent --docs-home --project-path --worktree-fallback --user-config --integration-fingerprint --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -285,6 +613,10 @@ _agent-docs() {
                     COMPREPLY=($(compgen -W "auto local-only" -- "${cur}"))
                     return 0
                     ;;
+                --integration-fingerprint)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
                 *)
                     COMPREPLY=()
                     ;;
@@ -293,7 +625,7 @@ _agent-docs() {
             return 0
             ;;
         agent__docs__remove)
-            opts="-h --context --scope --path --format --docs-home --project-path --worktree-fallback --help"
+            opts="-h --context --scope --path --format --docs-home --project-path --worktree-fallback --user-config --integration-fingerprint --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -327,6 +659,10 @@ _agent-docs() {
                     COMPREPLY=($(compgen -W "auto local-only" -- "${cur}"))
                     return 0
                     ;;
+                --integration-fingerprint)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
                 *)
                     COMPREPLY=()
                     ;;
@@ -335,7 +671,7 @@ _agent-docs() {
             return 0
             ;;
         agent__docs__session)
-            opts="-h --docs-home --project-path --worktree-fallback --help activate prepare status verify"
+            opts="-h --docs-home --project-path --worktree-fallback --user-config --integration-fingerprint --help activate prepare status verify"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -353,6 +689,10 @@ _agent-docs() {
                     COMPREPLY=($(compgen -W "auto local-only" -- "${cur}"))
                     return 0
                     ;;
+                --integration-fingerprint)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
                 *)
                     COMPREPLY=()
                     ;;
@@ -361,7 +701,7 @@ _agent-docs() {
             return 0
             ;;
         agent__docs__session__activate)
-            opts="-h --session-id --product --state-home --format --intent --phase --docs-home --project-path --worktree-fallback --help"
+            opts="-h --session-id --product --state-home --format --intent --phase --docs-home --project-path --worktree-fallback --user-config --integration-fingerprint --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -401,6 +741,10 @@ _agent-docs() {
                     ;;
                 --worktree-fallback)
                     COMPREPLY=($(compgen -W "auto local-only" -- "${cur}"))
+                    return 0
+                    ;;
+                --integration-fingerprint)
+                    COMPREPLY=($(compgen -f "${cur}"))
                     return 0
                     ;;
                 *)
@@ -411,7 +755,7 @@ _agent-docs() {
             return 0
             ;;
         agent__docs__session__prepare)
-            opts="-h --session-id --product --state-home --format --intent --phase --docs-home --project-path --worktree-fallback --help"
+            opts="-h --session-id --product --state-home --format --intent --phase --docs-home --project-path --worktree-fallback --user-config --integration-fingerprint --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -453,6 +797,10 @@ _agent-docs() {
                     COMPREPLY=($(compgen -W "auto local-only" -- "${cur}"))
                     return 0
                     ;;
+                --integration-fingerprint)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
                 *)
                     COMPREPLY=()
                     ;;
@@ -461,7 +809,7 @@ _agent-docs() {
             return 0
             ;;
         agent__docs__session__status)
-            opts="-h --session-id --product --state-home --format --docs-home --project-path --worktree-fallback --help"
+            opts="-h --session-id --product --state-home --format --docs-home --project-path --worktree-fallback --user-config --integration-fingerprint --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -495,6 +843,10 @@ _agent-docs() {
                     COMPREPLY=($(compgen -W "auto local-only" -- "${cur}"))
                     return 0
                     ;;
+                --integration-fingerprint)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
                 *)
                     COMPREPLY=()
                     ;;
@@ -503,7 +855,7 @@ _agent-docs() {
             return 0
             ;;
         agent__docs__session__verify)
-            opts="-h --session-id --product --state-home --format --require-intent --phase --docs-home --project-path --worktree-fallback --help"
+            opts="-h --session-id --product --state-home --format --require-intent --phase --docs-home --project-path --worktree-fallback --user-config --integration-fingerprint --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -543,6 +895,10 @@ _agent-docs() {
                     ;;
                 --worktree-fallback)
                     COMPREPLY=($(compgen -W "auto local-only" -- "${cur}"))
+                    return 0
+                    ;;
+                --integration-fingerprint)
+                    COMPREPLY=($(compgen -f "${cur}"))
                     return 0
                     ;;
                 *)

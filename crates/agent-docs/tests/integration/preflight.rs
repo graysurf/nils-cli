@@ -9,6 +9,9 @@ fn env_with_contract() -> TestEnv {
     env.write_home_catalog(
         "[[document]]\ncontext = \"project-dev\"\nscope = \"project\"\npath = \"DEVELOPMENT.md\"\nrequired = true\nmarker = \"## Validation\"\n\n[[validation]]\ncontext = \"project-dev\"\ncommands = [\"cargo test --workspace\", \"cargo clippy --all-targets -- -D warnings\"]\ndescription = \"Run before declaring done.\"\n",
     );
+    env.write_project_catalog(
+        "[[document]]\ncontext = \"project-dev\"\nscope = \"project\"\npath = \"DEVELOPMENT.md\"\nrequired = true\nmarker = \"## Validation\"\n\n[[validation]]\ncontext = \"project-dev\"\ncommands = [\"cargo test --workspace\", \"cargo clippy --all-targets -- -D warnings\"]\ndescription = \"Run before declaring done.\"\n",
+    );
     env.write_project_doc(
         "DEVELOPMENT.md",
         "# Dev\n\n## Validation\n\nrun cargo test\n",
@@ -67,6 +70,9 @@ fn preflight_product_filters_documents_and_validation_contracts() {
     let env = TestEnv::new();
     env.write_home_catalog(
         "[[document]]\ncontext = \"project-dev\"\nscope = \"home\"\npath = \"SHARED.md\"\nrequired = true\n\n[[document]]\ncontext = \"project-dev\"\nscope = \"home\"\npath = \"CODEX.md\"\nrequired = true\nproduct = \"codex\"\n\n[[document]]\ncontext = \"project-dev\"\nscope = \"home\"\npath = \"CLAUDE.md\"\nrequired = true\nproduct = \"claude\"\n\n[[validation]]\ncontext = \"project-dev\"\ncommands = [\"shared-check\"]\n\n[[validation]]\ncontext = \"project-dev\"\ncommands = [\"codex-check\"]\nproduct = \"codex\"\n\n[[validation]]\ncontext = \"project-dev\"\ncommands = [\"claude-check\"]\nproduct = \"claude\"\n",
+    );
+    env.write_project_catalog(
+        "[[validation]]\ncontext = \"project-dev\"\ncommands = [\"shared-check\"]\n\n[[validation]]\ncontext = \"project-dev\"\ncommands = [\"codex-check\"]\nproduct = \"codex\"\n\n[[validation]]\ncontext = \"project-dev\"\ncommands = [\"claude-check\"]\nproduct = \"claude\"\n",
     );
     env.write_home_doc("SHARED.md", "# Shared\n");
     env.write_home_doc("CODEX.md", "# Codex\n");
@@ -157,7 +163,7 @@ fn preflight_product_filters_documents_and_validation_contracts() {
 
 fn env_with_phases() -> TestEnv {
     let env = TestEnv::new();
-    env.write_home_catalog(
+    env.write_project_catalog(
         "[[document]]\ncontext = \"project-dev\"\nscope = \"project\"\npath = \"DEVELOPMENT.md\"\nrequired = true\n\n[[document]]\ncontext = \"project-dev\"\nscope = \"project\"\npath = \"EDIT.md\"\nrequired = true\nphase = \"edit\"\n\n[[document]]\ncontext = \"project-dev\"\nscope = \"project\"\npath = \"DELIVERY.md\"\nrequired = true\nphase = \"delivery\"\n",
     );
     env.write_project_doc("DEVELOPMENT.md", "# Dev\n");
@@ -260,7 +266,7 @@ fn preflight_rejects_malformed_phase_flag() {
 }
 
 #[test]
-fn require_declared_intent_checks_before_product_filtering() {
+fn require_declared_intent_respects_product_filtering() {
     let env = TestEnv::new();
     env.write_home_catalog(
         "[[document]]\ncontext = \"project-dev\"\nscope = \"home\"\npath = \"CODEX.md\"\nproduct = \"codex\"\n",
@@ -278,11 +284,11 @@ fn require_declared_intent_checks_before_product_filtering() {
         "json",
     ]);
 
-    assert!(out.success(), "stderr: {}", out.stderr);
-    let json = out.json();
-    assert_eq!(json["product"], "claude");
-    assert_eq!(json["documents"].as_array().unwrap().len(), 0);
-    assert_eq!(json["validation"]["declared"], false);
+    assert_eq!(out.code, 65, "stdout={} stderr={}", out.stdout, out.stderr);
+    assert_eq!(
+        out.json()["error"]["details"]["available_intents"],
+        serde_json::json!([])
+    );
 }
 
 #[test]
@@ -378,6 +384,9 @@ fn preflight_require_declared_intent_accepts_optional_or_skipped_doc_intent() {
     env.write_home_catalog(
         "[[document]]\ncontext = \"optional-tools\"\nscope = \"project\"\npath = \"OPTIONAL.md\"\nrequired = false\nwhen = \"path-exists:missing-marker\"\n",
     );
+    env.write_project_catalog(
+        "[[document]]\ncontext = \"optional-tools\"\nscope = \"project\"\npath = \"OPTIONAL.md\"\nrequired = false\nwhen = \"path-exists:missing-marker\"\n",
+    );
 
     let out = env.run(&[
         "preflight",
@@ -426,6 +435,9 @@ fn preflight_require_declared_intent_accepts_validation_only_intent() {
 fn preflight_require_declared_intent_preserves_strict_required_doc_failure() {
     let env = TestEnv::new();
     env.write_home_catalog(
+        "[[document]]\ncontext = \"project-dev\"\nscope = \"project\"\npath = \"DEVELOPMENT.md\"\nrequired = true\n",
+    );
+    env.write_project_catalog(
         "[[document]]\ncontext = \"project-dev\"\nscope = \"project\"\npath = \"DEVELOPMENT.md\"\nrequired = true\n",
     );
 

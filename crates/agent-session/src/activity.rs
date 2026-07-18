@@ -1122,6 +1122,13 @@ fn semantic_event_is_duplicate(
     (0..=1).contains(&elapsed)
 }
 
+fn event_uses_exact_replay_horizon(event: &TurnEvent) -> bool {
+    !(event.provider == AgentKind::Claude.as_str()
+        && event.kind == TurnEventKind::Progress
+        && event.source_kind == SourceKind::ProviderHook
+        && event.provider_turn_id.is_none())
+}
+
 fn normalize_provider_identifier(
     runtime_id: &str,
     agent: AgentKind,
@@ -1814,14 +1821,17 @@ fn ingest_event_with_lock(
             Some(json!({ "id": record.id })),
         ));
     }
+    let uses_exact_replay_horizon = event_uses_exact_replay_horizon(&event);
     let dedupe_key = event_dedupe_key(&event.runtime_id, &event.event_id);
-    if replay_contains(
-        &replay_path,
-        &document.runtime_id,
-        document.runtime_generation,
-        document.seen_event_count == 0,
-        &dedupe_key,
-    )? {
+    if uses_exact_replay_horizon
+        && replay_contains(
+            &replay_path,
+            &document.runtime_id,
+            document.runtime_generation,
+            document.seen_event_count == 0,
+            &dedupe_key,
+        )?
+    {
         let state = document.state.clone();
         drop(_health_fence);
         drop(_lock);
@@ -1832,13 +1842,6 @@ fn ingest_event_with_lock(
             turn_state: state,
             duplicate: true,
         });
-    }
-    if document.seen_event_count >= MAX_DEDUPE_EVENTS {
-        return Err(CliError::data(
-            "activity-dedupe-capacity-reached",
-            "activity event replay horizon is full for this runtime; resume the session to start a new runtime generation",
-            Some(json!({ "id": record.id, "max_events": MAX_DEDUPE_EVENTS })),
-        ));
     }
 
     let received_at = now();
@@ -1855,6 +1858,14 @@ fn ingest_event_with_lock(
             duplicate: true,
         });
     }
+    if uses_exact_replay_horizon && document.seen_event_count >= MAX_DEDUPE_EVENTS {
+        return Err(CliError::data(
+            "activity-dedupe-capacity-reached",
+            "activity event replay horizon is full for this runtime; resume the session to start a new runtime generation",
+            Some(json!({ "id": record.id, "max_events": MAX_DEDUPE_EVENTS })),
+        ));
+    }
+
     reduce(&mut document, &event, &received_at);
     document.last_event_at = Some(received_at.clone());
     if matches!(event.source_kind, SourceKind::ProviderHook) {
@@ -1864,20 +1875,24 @@ fn ingest_event_with_lock(
     if document.provider_session_id.is_none() {
         document.provider_session_id = event.provider_session_id.clone();
     }
-    document.seen_event_count = document.seen_event_count.saturating_add(1);
+    if uses_exact_replay_horizon {
+        document.seen_event_count = document.seen_event_count.saturating_add(1);
+    }
     let journal_entry = JournalEntry {
         received_at: received_at.clone(),
         event: event.clone(),
     };
     document.pending_journal = Some(journal_entry.clone());
     write_document(&path, &document)?;
-    replay_insert(
-        &replay_path,
-        &document.runtime_id,
-        document.runtime_generation,
-        false,
-        &dedupe_key,
-    )?;
+    if uses_exact_replay_horizon {
+        replay_insert(
+            &replay_path,
+            &document.runtime_id,
+            document.runtime_generation,
+            false,
+            &dedupe_key,
+        )?;
+    }
     append_journal_entry(&journal_path, journal_entry)?;
     document.pending_journal = None;
     write_document(&path, &document)?;
@@ -2468,6 +2483,9 @@ fn normalize_provider_hook(
             Some("clarification"),
             Confidence::Observed,
         ),
+        (AgentKind::Claude, "PreToolUse", _) => {
+            (TurnEventKind::Progress, None, Confidence::Observed)
+        }
         (AgentKind::Claude, "PostToolUse", _) if exact_clarification => {
             (TurnEventKind::AttentionCleared, None, Confidence::Observed)
         }
@@ -2769,7 +2787,7 @@ pub(crate) fn doctor(
                 ),
                 AgentKind::Claude => (
                     "partial",
-                    "idle_prompt is observed completion; raw Stop remains non-final because other hooks may continue",
+                    "idle_prompt is observed completion; general PreToolUse reactivates continued work, while uncorrelated SubagentStop is ignored and raw Stop remains non-final because other hooks may continue",
                     "AskUserQuestion uses exact runtime-scoped tool_use_id correlation; Elicitation uses exact elicitation_id when both callbacks provide it and otherwise latches conservatively; other PermissionRequest and configured notification signals remain conservative latches",
                     "Claude settings hooks compose additively and execute with the user's permissions",
                     "Run activity setup --agent claude --dry-run and then --apply",
@@ -3246,6 +3264,10 @@ fn provider_specs(agent: AgentKind) -> Vec<ProviderSpec> {
             },
             ProviderSpec {
                 event: "PreToolUse",
+                matcher: None,
+            },
+            ProviderSpec {
+                event: "PreToolUse",
                 matcher: Some("AskUserQuestion"),
             },
             ProviderSpec {
@@ -3308,10 +3330,16 @@ fn provider_specs(agent: AgentKind) -> Vec<ProviderSpec> {
 
 fn retired_provider_specs(agent: AgentKind) -> Vec<ProviderSpec> {
     match agent {
-        AgentKind::Claude => vec![ProviderSpec {
-            event: "Notification",
-            matcher: Some("permission_prompt"),
-        }],
+        AgentKind::Claude => vec![
+            ProviderSpec {
+                event: "Notification",
+                matcher: Some("permission_prompt"),
+            },
+            ProviderSpec {
+                event: "SubagentStop",
+                matcher: None,
+            },
+        ],
         AgentKind::Codex | AgentKind::Hermes => Vec::new(),
     }
 }
@@ -4381,7 +4409,10 @@ mod tests {
         assert!(started.elapsed() < Duration::from_secs(1));
     }
 
-    fn test_session(tmp: &tempfile::TempDir) -> (CliContext, crate::CreatedRecord) {
+    fn test_session_for_agent(
+        tmp: &tempfile::TempDir,
+        agent: AgentKind,
+    ) -> (CliContext, crate::CreatedRecord) {
         let context = CliContext {
             state_dir: tmp.path().join("state"),
             host: None,
@@ -4390,7 +4421,7 @@ mod tests {
         fs::create_dir_all(&cwd).expect("repo dir");
         let mut created = create_record(RecordRequest {
             context: &context,
-            agent: AgentKind::Codex,
+            agent,
             mode: "interactive",
             title: None,
             title_state: None,
@@ -4399,7 +4430,7 @@ mod tests {
             prompt: None,
             log_file_name: None,
             provider_resume: Some(ProviderResume {
-                provider: "codex".to_string(),
+                provider: agent.as_str().to_string(),
                 session_id: "session-1".to_string(),
                 captured_at: "2026-07-10T00:00:00Z".to_string(),
                 capture_method: "test".to_string(),
@@ -4412,6 +4443,10 @@ mod tests {
         .expect("test session");
         created.release_lifecycle_lock();
         (context, created)
+    }
+
+    fn test_session(tmp: &tempfile::TempDir) -> (CliContext, crate::CreatedRecord) {
+        test_session_for_agent(tmp, AgentKind::Codex)
     }
 
     #[test]
@@ -5192,6 +5227,73 @@ mod tests {
     }
 
     #[test]
+    fn claude_pre_tool_use_reactivates_working_without_admitting_stale_subagent_stop() {
+        let pre_tool_use = normalize_provider_hook(
+            AgentKind::Claude,
+            None,
+            "runtime-1",
+            &json!({
+                "hook_event_name": "PreToolUse",
+                "session_id": "claude-session",
+                "tool_name": "Task",
+                "tool_use_id": "tool-secret",
+                "tool_input": {"prompt": "discarded"}
+            }),
+        )
+        .expect("pre-tool normalization")
+        .expect("recognized pre-tool signal");
+        assert_eq!(pre_tool_use.kind, TurnEventKind::Progress);
+        assert_eq!(pre_tool_use.confidence, Confidence::Observed);
+        assert_eq!(pre_tool_use.source_kind, SourceKind::ProviderHook);
+        assert_eq!(pre_tool_use.provider, "claude");
+
+        let serialized = serde_json::to_string(&pre_tool_use).expect("continuation event json");
+        for forbidden in ["tool-secret", "discarded"] {
+            assert!(!serialized.contains(forbidden), "forbidden {forbidden}");
+        }
+
+        let mut document = document();
+        reduce(
+            &mut document,
+            &event(TurnEventKind::TurnStarted, "turn-started"),
+            "2026-07-18T00:00:01Z",
+        );
+        reduce(
+            &mut document,
+            &event(TurnEventKind::TurnCompleted, "idle-prompt"),
+            "2026-07-18T00:00:02Z",
+        );
+        assert_eq!(document.state.phase, TurnPhase::Waiting);
+        assert!(document.state.current_turn.is_none());
+
+        let stale_subagent_stop = normalize_provider_hook(
+            AgentKind::Claude,
+            None,
+            "runtime-1",
+            &json!({
+                "hook_event_name": "SubagentStop",
+                "session_id": "claude-session",
+                "agent_id": "subagent-secret",
+                "agent_transcript_path": "/secret/transcript"
+            }),
+        )
+        .expect("stale subagent-stop normalization");
+        assert!(
+            stale_subagent_stop.is_none(),
+            "an uncorrelated completed subagent must not resurrect a waiting parent turn"
+        );
+        assert_eq!(document.state.phase, TurnPhase::Waiting);
+        assert!(document.state.current_turn.is_none());
+
+        reduce(&mut document, &pre_tool_use, "2026-07-18T00:00:03Z");
+        assert_eq!(document.state.phase, TurnPhase::Working);
+        assert!(document.state.current_turn.is_some());
+        assert_eq!(document.state.source.kind, SourceKind::ProviderHook);
+        assert_eq!(document.state.source.provider.as_deref(), Some("claude"));
+        assert_eq!(document.state.source.confidence, Confidence::Observed);
+    }
+
+    #[test]
     fn claude_bypass_permissions_prompt_is_latched() {
         // PermissionRequest and permission_prompt hooks mean Claude is showing a
         // real dialog, including the root/home deletion circuit breaker that remains
@@ -5698,6 +5800,7 @@ mod tests {
                 include_str!("../tests/fixtures/activity/claude-events.jsonl"),
                 vec![
                     TurnEventKind::TurnStarted,
+                    TurnEventKind::Progress,
                     TurnEventKind::AttentionRequested,
                     TurnEventKind::AttentionCleared,
                     TurnEventKind::AttentionRequested,
@@ -5739,6 +5842,7 @@ mod tests {
                 assert!(!serialized.contains("claude-session"));
                 assert!(!serialized.contains("hermes-session"));
                 assert!(!serialized.contains("tool-1"));
+                assert!(!serialized.contains("subagent-secret"));
                 assert!(!serialized.contains("rate_limit"));
             }
         }
@@ -5807,6 +5911,117 @@ mod tests {
             "kind": "progress"
         });
         assert!(serde_json::from_value::<TurnEvent>(missing).is_err());
+    }
+
+    #[test]
+    fn claude_progress_preserves_exact_replay_capacity_for_lifecycle_events() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let (context, created) = test_session_for_agent(&tmp, AgentKind::Claude);
+        let runtime_id = created
+            .record
+            .runtime
+            .as_ref()
+            .expect("runtime")
+            .launch_id
+            .clone();
+        let dir = session_dir(&context, &created.record.id);
+        let path = dir.join(ACTIVITY_FILE);
+        let mut snapshot = read_document(&path).expect("activity snapshot");
+        snapshot.seen_event_count = MAX_DEDUPE_EVENTS - 1;
+        write_document(&path, &snapshot).expect("near-capacity snapshot");
+
+        let progress = normalize_provider_hook(
+            AgentKind::Claude,
+            None,
+            &runtime_id,
+            &json!({
+                "hook_event_name": "PreToolUse",
+                "session_id": "session-1",
+                "tool_name": "Bash",
+                "tool_use_id": "tool-secret"
+            }),
+        )
+        .expect("progress normalization")
+        .expect("recognized progress");
+        let working = ingest_event(&context, &created.record.id, progress)
+            .expect("Claude progress remains ingestible near replay capacity");
+        assert_eq!(working.turn_state.phase, TurnPhase::Working);
+        assert_eq!(
+            read_document(&path)
+                .expect("progress snapshot")
+                .seen_event_count,
+            MAX_DEDUPE_EVENTS - 1,
+            "uncorrelated Claude progress must not consume exact replay capacity"
+        );
+
+        let completed = normalize_provider_hook(
+            AgentKind::Claude,
+            None,
+            &runtime_id,
+            &json!({
+                "hook_event_name": "Notification",
+                "notification_type": "idle_prompt",
+                "session_id": "session-1"
+            }),
+        )
+        .expect("completion normalization")
+        .expect("recognized completion");
+        let waiting = ingest_event(&context, &created.record.id, completed)
+            .expect("lifecycle event retains the final exact replay slot");
+        assert_eq!(waiting.turn_state.phase, TurnPhase::Waiting);
+        assert_eq!(
+            read_document(&path)
+                .expect("completion snapshot")
+                .seen_event_count,
+            MAX_DEDUPE_EVENTS
+        );
+    }
+
+    #[test]
+    fn claude_progress_pending_journal_repairs_without_exact_replay_slot() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let (context, created) = test_session_for_agent(&tmp, AgentKind::Claude);
+        let runtime_id = created
+            .record
+            .runtime
+            .as_ref()
+            .expect("runtime")
+            .launch_id
+            .clone();
+        let dir = session_dir(&context, &created.record.id);
+        let journal_path = dir.join(ACTIVITY_JOURNAL_FILE);
+        fs::create_dir(&journal_path).expect("block journal target");
+        let progress = normalize_provider_hook(
+            AgentKind::Claude,
+            None,
+            &runtime_id,
+            &json!({
+                "hook_event_name": "PreToolUse",
+                "session_id": "session-1",
+                "tool_name": "Task",
+                "tool_use_id": "tool-secret"
+            }),
+        )
+        .expect("progress normalization")
+        .expect("recognized progress");
+
+        assert!(
+            ingest_event(&context, &created.record.id, progress.clone()).is_err(),
+            "blocked journal target must interrupt the split write"
+        );
+        let pending = read_document(&dir.join(ACTIVITY_FILE)).expect("pending snapshot");
+        assert!(pending.pending_journal.is_some());
+        assert_eq!(pending.seen_event_count, 0);
+
+        fs::remove_dir(&journal_path).expect("restore journal target");
+        let repaired = ingest_event(&context, &created.record.id, progress)
+            .expect("repair replay-exempt progress");
+        assert!(repaired.duplicate);
+        let repaired_snapshot = read_document(&dir.join(ACTIVITY_FILE)).expect("repaired snapshot");
+        assert!(repaired_snapshot.pending_journal.is_none());
+        assert_eq!(repaired_snapshot.seen_event_count, 0);
+        let journal = fs::read_to_string(journal_path).expect("repaired journal");
+        assert_eq!(journal.matches("\"kind\":\"progress\"").count(), 1);
     }
 
     #[test]
@@ -6276,6 +6491,11 @@ mod tests {
 
         let claude_specs = provider_specs(AgentKind::Claude);
         assert!(
+            claude_specs
+                .iter()
+                .any(|spec| spec.event == "PreToolUse" && spec.matcher.is_none())
+        );
+        assert!(
             claude_specs.iter().any(|spec| {
                 spec.event == "PreToolUse" && spec.matcher == Some("AskUserQuestion")
             })
@@ -6291,6 +6511,16 @@ mod tests {
             claude_specs
                 .iter()
                 .any(|spec| spec.event == "ElicitationResult")
+        );
+        assert!(
+            !claude_specs
+                .iter()
+                .any(|spec| spec.event == "SubagentStop" && spec.matcher.is_none())
+        );
+        assert!(
+            retired_provider_specs(AgentKind::Claude)
+                .iter()
+                .any(|spec| spec.event == "SubagentStop" && spec.matcher.is_none())
         );
     }
 
@@ -7009,14 +7239,16 @@ fn repair_pending_transaction(
     let Some(entry) = document.pending_journal.clone() else {
         return Ok(());
     };
-    let key = event_dedupe_key(&entry.event.runtime_id, &entry.event.event_id);
-    replay_insert(
-        replay_path,
-        &document.runtime_id,
-        document.runtime_generation,
-        false,
-        &key,
-    )?;
+    if event_uses_exact_replay_horizon(&entry.event) {
+        let key = event_dedupe_key(&entry.event.runtime_id, &entry.event.event_id);
+        replay_insert(
+            replay_path,
+            &document.runtime_id,
+            document.runtime_generation,
+            false,
+            &key,
+        )?;
+    }
     append_journal_entry(journal_path, entry)?;
     document.pending_journal = None;
     write_document(document_path, document)

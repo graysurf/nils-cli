@@ -1,7 +1,9 @@
 //! Task 1.1 — the catalog model + parser load contexts and docs from data, and
 //! invalid catalogs produce precise (section/index/field) errors.
 
-use super::common::TestEnv;
+use nils_test_support::cmd;
+
+use super::common::{TestEnv, run_cli};
 
 const EXIT_CONFIG: i32 = 3;
 
@@ -130,7 +132,20 @@ fn product_field_accepts_string_and_list_forms() {
     );
     env.write_home_doc("CODEX.md", "# Codex\n");
 
-    let out = env.run(&["list", "--format", "json"]);
+    let docs_home = env.docs_home.to_str().expect("UTF-8 docs-home");
+    let options = cmd::CmdOptions::default().with_cwd(&env.docs_home);
+    let out = run_cli(
+        &[
+            "--docs-home",
+            docs_home,
+            "--project-path",
+            docs_home,
+            "list",
+            "--format",
+            "json",
+        ],
+        &options,
+    );
     assert!(out.success(), "stderr: {}", out.stderr);
     let json = out.json();
     assert_eq!(json["documents"][0]["products"][0], "codex");

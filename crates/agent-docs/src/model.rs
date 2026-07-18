@@ -257,7 +257,7 @@ impl fmt::Display for DocumentStatus {
     }
 }
 
-/// Which catalog file a resolved document originated from.
+/// Which catalog layer a resolved document originated from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum DocumentSource {
@@ -610,6 +610,13 @@ impl SkillPolicy {
             .collect::<Vec<_>>()
             .join(", ")
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CatalogOrigin {
+    Home,
+    Repository,
+    User,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]

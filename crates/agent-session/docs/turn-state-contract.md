@@ -196,6 +196,15 @@ current Claude versions emit it as a duplicate of `PermissionRequest`, and an
 `AskUserQuestion` `PermissionRequest` is ignored because the same interaction is
 already owned by exact PreToolUse/PostToolUse correlation.
 
+Managed Claude setup also installs a general `PreToolUse` hook that normalizes
+to uncorrelated `progress`: a continued turn last observed at `idle_prompt` can
+re-establish `working` as soon as a tool starts. The exact `AskUserQuestion` arm
+is evaluated first, so its `PreToolUse` remains `attention_requested` rather
+than progress. `SubagentStop` is deliberately neither installed nor admitted as
+progress because it identifies a completed subagent without correlating that
+callback to active parent work; a late background callback must not resurrect a
+genuinely waiting parent turn. Positive progress never clears pending attention.
+
 ## Deterministic transition rules
 
 | Input | Rule |
@@ -209,7 +218,7 @@ already owned by exact PreToolUse/PostToolUse correlation.
 | matching `turn_completed` | close current turn, clear attention, enter `waiting`; authoritative Codex notifications require the exact open turn id |
 | matching `turn_failed` | close current turn with failed outcome, clear attention, enter `waiting` |
 | late completion for older turn | retain the newer current phase |
-| duplicate `event_id` | no state or revision change within the 4096-event active-runtime replay horizon |
+| duplicate exact-replay `event_id` | no state or revision change within the 4096-event active-runtime replay horizon; uncorrelated Claude progress instead uses the short semantic guard |
 | missing/prior runtime id | reject before host timestamp or reducer |
 | corrupt snapshot | expose safe `unknown`; list/serve/delete remain available |
 | unhealthy authority/projection | expose `unknown`, accept no later event in the same runtime, recover only on a new runtime generation |
@@ -279,18 +288,23 @@ Each session owns:
 Activity files are separate from `session.json`, so title/resume writes and hook
 writes cannot overwrite each other. Every reducer transaction holds the lock,
 validates both the active launch id and runtime generation, records one pending
-journal entry in the atomic snapshot, updates the fixed replay index and bounded
-journal idempotently, and clears the pending marker. A later event or runtime
-transition repairs an interrupted split write before reduction. The replay
-index is separate from the shorter journal retention, gives expected O(1)
-duplicate checks without growing the JSON snapshot, and rejects further events
-at its 4096-event capacity with resume guidance instead of forgetting old ids.
-The replay file header must match the snapshot runtime tuple. A missing,
-truncated, or swapped index for a nonempty snapshot fails closed and exposes
-Unknown; creating the index also syncs its parent directory. Provider-hook
-events additionally use a short metadata-only semantic replay guard so
-concurrent duplicate delivery cannot interrupt the same turn, inflate an
-uncorrelated attention latch, or rewrite an already observed completion.
+journal entry in the atomic snapshot, updates the fixed replay index when the
+event requires exact replay protection, appends the bounded journal
+idempotently, and clears the pending marker. A later event or runtime transition
+repairs an interrupted split write before reduction. The replay index is
+separate from the shorter journal retention, gives expected O(1) duplicate
+checks without growing the JSON snapshot, and rejects further exact-replay
+events at its 4096-event capacity with resume guidance instead of forgetting old
+ids. Uncorrelated Claude provider-hook `progress` has idempotent reducer
+semantics and no stable provider event id, so it keeps bounded journal and
+split-write repair coverage but relies on the short semantic replay guard rather
+than consuming exact replay slots. The replay file header must match the
+snapshot runtime tuple. A missing, truncated, or swapped index for a nonempty
+exact-replay horizon fails closed and exposes Unknown; creating the index also
+syncs its parent directory. Provider-hook events additionally use a short
+metadata-only semantic replay guard so concurrent duplicate delivery cannot
+interrupt the same turn, inflate an uncorrelated attention latch, or rewrite an
+already observed completion.
 Unknown additive JSON fields survive supported reads and writes. A corrupt or
 future-version snapshot is moved to a private quarantine file before a fresh
 runtime snapshot is written. Session deletion removes the entire session

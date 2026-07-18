@@ -124,3 +124,101 @@ fn clear_error_when_unresolvable() {
         out.stderr
     );
 }
+
+#[test]
+fn missing_docs_home_is_a_runtime_failure_in_text_mode() {
+    let temp = TempDir::new().unwrap();
+    let project = temp.path().join("project");
+    let missing = temp.path().join("missing-docs-home");
+    fs::create_dir(&project).unwrap();
+
+    let out = run_cli(
+        &[
+            "--docs-home",
+            missing.to_str().unwrap(),
+            "--project-path",
+            project.to_str().unwrap(),
+            "preflight",
+            "--intent",
+            "project-dev",
+            "--strict",
+        ],
+        &cmd::CmdOptions::default().with_cwd(&project),
+    );
+
+    assert_eq!(out.code, 4, "stdout={} stderr={}", out.stdout, out.stderr);
+    assert!(
+        out.stdout.is_empty(),
+        "stdout must be empty: {}",
+        out.stdout
+    );
+    assert!(out.stderr.contains("docs-home"), "stderr={}", out.stderr);
+}
+
+#[test]
+fn missing_or_non_directory_docs_home_is_a_command_stable_json_failure() {
+    let temp = TempDir::new().unwrap();
+    let project = temp.path().join("project");
+    let missing = temp.path().join("missing-docs-home");
+    let file = temp.path().join("docs-home-file");
+    fs::create_dir(&project).unwrap();
+    fs::write(&file, "not a directory\n").unwrap();
+
+    for docs_home in [&missing, &file] {
+        let out = run_cli(
+            &[
+                "--docs-home",
+                docs_home.to_str().unwrap(),
+                "--project-path",
+                project.to_str().unwrap(),
+                "preflight",
+                "--intent",
+                "project-dev",
+                "--strict",
+                "--format",
+                "json",
+            ],
+            &cmd::CmdOptions::default().with_cwd(&project),
+        );
+
+        assert_eq!(out.code, 4, "stdout={} stderr={}", out.stdout, out.stderr);
+        assert!(
+            out.stderr.is_empty(),
+            "stderr must be empty: {}",
+            out.stderr
+        );
+        let json: serde_json::Value = serde_json::from_str(&out.stdout).unwrap();
+        assert_eq!(json["schema_version"], "cli.agent-docs.preflight.v2");
+        assert_eq!(json["ok"], false);
+        assert_eq!(json["error"]["code"], "root-resolution-failed");
+    }
+}
+
+#[test]
+fn existing_catalog_free_docs_home_remains_valid() {
+    let temp = TempDir::new().unwrap();
+    let docs_home = temp.path().join("docs-home");
+    let project = temp.path().join("project");
+    fs::create_dir(&docs_home).unwrap();
+    fs::create_dir(&project).unwrap();
+
+    let out = run_cli(
+        &[
+            "--docs-home",
+            docs_home.to_str().unwrap(),
+            "--project-path",
+            project.to_str().unwrap(),
+            "preflight",
+            "--intent",
+            "project-dev",
+            "--strict",
+            "--format",
+            "json",
+        ],
+        &cmd::CmdOptions::default().with_cwd(&project),
+    );
+
+    assert_eq!(out.code, 0, "stdout={} stderr={}", out.stdout, out.stderr);
+    assert_eq!(out.json()["schema_version"], "agent-docs.preflight.v2");
+    assert_eq!(out.json()["documents"], serde_json::json!([]));
+}

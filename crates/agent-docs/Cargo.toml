@@ -32,4 +32,5 @@ libc = "0.2"
 
 [dev-dependencies]
 nils-test-support = { version = "1.24.0", path = "../nils-test-support" }
+pretty_assertions = { workspace = true }
 tempfile = "3"

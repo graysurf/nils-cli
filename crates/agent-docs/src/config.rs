@@ -5,8 +5,8 @@ use toml::Value;
 
 use crate::env::ResolvedRoots;
 use crate::model::{
-    ConfigErrorLocation, ConfigLoadError, Context, DocumentEntry, LoadedCatalog, Phase, Product,
-    Scope, ScopeCatalog, SkillPolicy, ValidationEntry, When,
+    CatalogOrigin, ConfigErrorLocation, ConfigLoadError, Context, DocumentEntry, LoadedCatalog,
+    Phase, Product, Scope, ScopeCatalog, SkillPolicy, ValidationEntry, When,
 };
 use crate::path_classes::PathClassContract;
 use crate::predicate::parse_when;
@@ -67,28 +67,57 @@ pub fn load_scope_catalog(
     if !file_path.exists() {
         return Ok(None);
     }
+    let origin = match source_scope {
+        Scope::Home | Scope::Global => CatalogOrigin::Home,
+        Scope::Project => CatalogOrigin::Repository,
+    };
+    load_catalog_file(source_scope, origin, root, &file_path).map(Some)
+}
 
-    let raw = fs::read_to_string(&file_path).map_err(|err| {
+pub fn load_external_project_catalog(
+    project_root: &Path,
+    file_path: &Path,
+) -> Result<ScopeCatalog, ConfigLoadError> {
+    load_catalog_file(Scope::Project, CatalogOrigin::User, project_root, file_path)
+}
+
+fn load_catalog_file(
+    source_scope: Scope,
+    origin: CatalogOrigin,
+    root: &Path,
+    file_path: &Path,
+) -> Result<ScopeCatalog, ConfigLoadError> {
+    let raw = fs::read_to_string(file_path).map_err(|err| {
         ConfigLoadError::io(
-            file_path.clone(),
-            format!("failed to read {CONFIG_FILE_NAME}: {err}"),
+            file_path.to_path_buf(),
+            format!("failed to read {}: {err}", file_path.display()),
         )
     })?;
-    let parsed = parse_toml(&file_path, &raw)?;
-    let documents = parse_documents(source_scope, &file_path, &parsed)?;
-    let validations = parse_validations(&file_path, &parsed)?;
-    let skill_policy = parse_skill_policy(&file_path, &parsed)?;
-    let path_classes = parse_path_classes(source_scope, &file_path, &parsed)?;
+    load_scope_catalog_from_str(source_scope, origin, root, file_path, &raw)
+}
 
-    Ok(Some(ScopeCatalog {
+pub(crate) fn load_scope_catalog_from_str(
+    source_scope: Scope,
+    origin: CatalogOrigin,
+    root: &Path,
+    file_path: &Path,
+    raw: &str,
+) -> Result<ScopeCatalog, ConfigLoadError> {
+    let parsed = parse_toml(file_path, raw, origin)?;
+    let documents = parse_documents(source_scope, origin, file_path, &parsed)?;
+    let validations = parse_validations(file_path, &parsed)?;
+    let skill_policy = parse_skill_policy(file_path, &parsed)?;
+    let path_classes = parse_path_classes(source_scope, file_path, &parsed)?;
+
+    Ok(ScopeCatalog {
         source_scope,
         root: root.to_path_buf(),
-        file_path,
+        file_path: file_path.to_path_buf(),
         documents,
         validations,
         skill_policy,
         path_classes,
-    }))
+    })
 }
 
 fn parse_path_classes(
@@ -124,10 +153,14 @@ fn same_config_file(docs_home: &Path, project_path: &Path) -> bool {
     home == project
 }
 
-fn parse_toml(file_path: &Path, raw: &str) -> Result<Value, ConfigLoadError> {
+fn parse_toml(
+    file_path: &Path,
+    raw: &str,
+    origin: CatalogOrigin,
+) -> Result<Value, ConfigLoadError> {
     raw.parse::<toml::Table>()
         .map(Value::Table)
-        .map_err(|err| parse_error(file_path, raw, &err))
+        .map_err(|err| parse_error(file_path, raw, &err, origin))
 }
 
 fn array_of_tables<'a>(
@@ -157,6 +190,7 @@ fn array_of_tables<'a>(
 
 fn parse_documents(
     source_scope: Scope,
+    origin: CatalogOrigin,
     file_path: &Path,
     parsed: &Value,
 ) -> Result<Vec<DocumentEntry>, ConfigLoadError> {
@@ -185,8 +219,8 @@ fn parse_documents(
         )?;
         let context = parse_context(file_path, "document", index, table)?;
         let scope = parse_scope(file_path, index, table)?;
-        validate_scope_for_source(source_scope, scope, file_path, index)?;
-        let path = parse_path(file_path, index, table)?;
+        validate_scope_for_source(source_scope, origin, scope, file_path, index)?;
+        let path = parse_path(file_path, index, table, origin)?;
         let products = parse_products(file_path, "document", index, table)?;
         let phases = parse_phases(file_path, "document", index, table)?;
         let required = parse_bool(file_path, index, table, "required")?.unwrap_or(false);
@@ -543,10 +577,20 @@ fn parse_allowed_prefixes(file_path: &Path, value: &Value) -> Result<Vec<String>
 
 fn validate_scope_for_source(
     source_scope: Scope,
+    origin: CatalogOrigin,
     document_scope: Scope,
     file_path: &Path,
     index: usize,
 ) -> Result<(), ConfigLoadError> {
+    if origin == CatalogOrigin::User && document_scope != Scope::Project {
+        return Err(ConfigLoadError::validation(
+            file_path.to_path_buf(),
+            "document",
+            index,
+            "scope",
+            "private/user catalog documents require project scope",
+        ));
+    }
     if source_scope == Scope::Project && document_scope == Scope::Global {
         return Err(ConfigLoadError::validation(
             file_path.to_path_buf(),
@@ -619,6 +663,7 @@ fn parse_path(
     file_path: &Path,
     index: usize,
     table: &toml::map::Map<String, Value>,
+    origin: CatalogOrigin,
 ) -> Result<PathBuf, ConfigLoadError> {
     let raw = required_string(file_path, "document", index, table, "path")?;
     let trimmed = raw.trim();
@@ -631,7 +676,27 @@ fn parse_path(
             "path cannot be empty",
         ));
     }
-    Ok(PathBuf::from(trimmed))
+    let path = PathBuf::from(trimmed);
+    if origin == CatalogOrigin::User
+        && (path.is_absolute()
+            || path.components().any(|component| {
+                matches!(
+                    component,
+                    std::path::Component::ParentDir
+                        | std::path::Component::RootDir
+                        | std::path::Component::Prefix(_)
+                )
+            }))
+    {
+        return Err(ConfigLoadError::validation(
+            file_path.to_path_buf(),
+            "document",
+            index,
+            "path",
+            "private catalog document paths must be relative and must not contain `..`",
+        ));
+    }
+    Ok(path)
 }
 
 fn parse_when_field(
@@ -853,16 +918,22 @@ fn value_type(value: &Value) -> &'static str {
     }
 }
 
-fn parse_error(file_path: &Path, raw: &str, err: &toml::de::Error) -> ConfigLoadError {
+fn parse_error(
+    file_path: &Path,
+    raw: &str,
+    err: &toml::de::Error,
+    origin: CatalogOrigin,
+) -> ConfigLoadError {
     let location = err
         .span()
         .map(|span| byte_offset_to_line_column(raw, span.start));
+    let message = if origin == CatalogOrigin::User {
+        "invalid private catalog TOML".to_string()
+    } else {
+        format!("invalid TOML in {CONFIG_FILE_NAME}: {err}")
+    };
 
-    ConfigLoadError::parse(
-        file_path.to_path_buf(),
-        format!("invalid TOML in {CONFIG_FILE_NAME}: {err}"),
-        location,
-    )
+    ConfigLoadError::parse(file_path.to_path_buf(), message, location)
 }
 
 fn byte_offset_to_line_column(raw: &str, offset: usize) -> ConfigErrorLocation {

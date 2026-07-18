@@ -13,12 +13,18 @@ use crate::cli::{
 };
 use crate::config::load_catalog_from_roots;
 use crate::env::{PathOverrides, ResolvedRoots, resolve_roots};
-use crate::model::{Context, FallbackMode, LoadedCatalog, OutputFormat, Phase, Product};
+use crate::integration;
+use crate::model::{
+    ConfigErrorKind, Context, FallbackMode, OutputFormat, Phase, PreflightReport, Product,
+};
 use crate::resolver;
 
-const RECORD_SCHEMA: &str = "agent-docs.session.v1";
+const RECORD_SCHEMA: &str = "agent-docs.session.v2";
+const LEGACY_RECORD_SCHEMA: &str = "agent-docs.session.v1";
+const INTENT_FINGERPRINT_SCHEMA: &str = "agent-docs.session-intent-fingerprint.v1";
 const EXIT_OK: i32 = 0;
-const EXIT_RUNTIME: i32 = 1;
+const EXIT_RUNTIME: i32 = 4;
+const EXIT_CONFIG: i32 = 3;
 const EXIT_DATA: i32 = 65;
 const SECRET_MODE: u32 = 0o600;
 const LOCK_OWNER_FILE: &str = "owner.json";
@@ -31,6 +37,8 @@ struct SessionRecord {
     session_hash: String,
     project_hash: String,
     product: String,
+    #[serde(default)]
+    integration_fingerprint: Option<String>,
     active_intents: BTreeMap<String, String>,
     /// Phase-scoped activations: intent -> { phase -> fingerprint }. Skipped
     /// when empty so a no-phase record serializes byte-identically to a
@@ -39,6 +47,16 @@ struct SessionRecord {
     active_phase_intents: BTreeMap<String, BTreeMap<String, String>>,
     activated_at: String,
     producer_version: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct SessionRecordEnvelope {
+    schema: String,
+}
+
+enum DecodedRecord {
+    Current(Box<SessionRecord>),
+    LegacyV1,
 }
 
 #[derive(Debug, Serialize)]
@@ -60,34 +78,177 @@ struct SessionData {
     reason: Option<String>,
 }
 
-pub fn run(args: SessionArgs, overrides: PathOverrides, fallback: FallbackMode) -> i32 {
+#[derive(Serialize)]
+struct IntentFingerprintInput<'a> {
+    schema_version: &'static str,
+    trusted_producer: TrustedProducerInput<'a>,
+    fallback: &'static str,
+    report_schema_version: &'static str,
+    intent: &'a str,
+    product: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    phase: Option<&'a str>,
+    strict: bool,
+    docs_home: &'a Path,
+    project_path: &'a Path,
+    is_linked_worktree: bool,
+    documents: Vec<ResolvedDocumentFingerprintInput<'a>>,
+    validation: ValidationFingerprintInput<'a>,
+    required_total: usize,
+    satisfied_required: usize,
+    missing_required: usize,
+    invalid_required: usize,
+}
+
+#[derive(Serialize)]
+struct TrustedProducerInput<'a> {
+    kind: &'static str,
+    binary: &'static str,
+    package_version: &'static str,
+    integration_fingerprint: Option<&'a str>,
+    private_project_catalog: bool,
+    private_allowed_roots: Vec<PathBuf>,
+    catalogs: Vec<CatalogProducerInput<'a>>,
+}
+
+#[derive(Serialize)]
+struct CatalogProducerInput<'a> {
+    source_scope: &'static str,
+    root: &'a Path,
+    file_path: &'a Path,
+    documents: Vec<CatalogDocumentFingerprintInput<'a>>,
+    validations: Vec<CatalogValidationFingerprintInput<'a>>,
+}
+
+#[derive(Serialize)]
+struct CatalogDocumentFingerprintInput<'a> {
+    context: &'a str,
+    scope: &'static str,
+    path: &'a Path,
+    products: Vec<&'static str>,
+    phases: Vec<&'a str>,
+    required: bool,
+    when: &'a str,
+    marker: Option<&'a str>,
+    freshness_days: Option<u64>,
+}
+
+#[derive(Serialize)]
+struct CatalogValidationFingerprintInput<'a> {
+    context: &'a str,
+    products: Vec<&'static str>,
+    commands: &'a [String],
+    marker: Option<&'a str>,
+}
+
+#[derive(Serialize)]
+struct ResolvedDocumentFingerprintInput<'a> {
+    context: &'a str,
+    scope: &'static str,
+    path: &'a Path,
+    products: Vec<&'static str>,
+    declared_required: bool,
+    required: bool,
+    when: &'a str,
+    when_satisfied: bool,
+    status: &'static str,
+    exists: bool,
+    non_empty: bool,
+    marker_present: Option<bool>,
+    freshness: &'static str,
+    valid: bool,
+    source: &'static str,
+    content_digest: Option<String>,
+}
+
+#[derive(Serialize)]
+struct ValidationFingerprintInput<'a> {
+    context: &'a str,
+    declared: bool,
+    commands: &'a [String],
+    marker: Option<&'a str>,
+}
+
+pub fn run(
+    args: SessionArgs,
+    overrides: PathOverrides,
+    fallback: FallbackMode,
+    use_user_config: bool,
+    expected_integration_fingerprint: Option<String>,
+) -> i32 {
     match args.command {
-        SessionCommand::Activate(args) => activate(args, overrides, fallback),
-        SessionCommand::Prepare(args) => prepare(args, overrides, fallback),
-        SessionCommand::Status(args) => status(args, overrides),
-        SessionCommand::Verify(args) => verify(args, overrides, fallback),
+        SessionCommand::Activate(args) => activate(
+            args,
+            overrides,
+            fallback,
+            use_user_config,
+            expected_integration_fingerprint.as_deref(),
+        ),
+        SessionCommand::Prepare(args) => prepare(
+            args,
+            overrides,
+            fallback,
+            use_user_config,
+            expected_integration_fingerprint.as_deref(),
+        ),
+        SessionCommand::Status(args) => status(
+            args,
+            overrides,
+            fallback,
+            use_user_config,
+            expected_integration_fingerprint.as_deref(),
+        ),
+        SessionCommand::Verify(args) => verify(
+            args,
+            overrides,
+            fallback,
+            use_user_config,
+            expected_integration_fingerprint.as_deref(),
+        ),
     }
 }
 
-fn activate(args: SessionActivateArgs, overrides: PathOverrides, fallback: FallbackMode) -> i32 {
+fn activate(
+    args: SessionActivateArgs,
+    overrides: PathOverrides,
+    fallback: FallbackMode,
+    use_user_config: bool,
+    expected_integration_fingerprint: Option<&str>,
+) -> i32 {
     let common = &args.common;
     let result = (|| -> Result<SessionData, SessionFailure> {
         validate_common(common)?;
         let phase = parse_phase_arg(args.phase.as_deref())?;
-        let roots = resolve_roots(&overrides)
-            .map_err(|err| SessionFailure::runtime("root-resolution-failed", err.to_string()))?;
-        let catalog = load_catalog_from_roots(&roots)
-            .map_err(|err| SessionFailure::runtime("catalog-load-failed", err.to_string()))?;
-        let available = resolver::declared_intents(&roots, fallback, &catalog);
+        let roots = resolve_session_roots(&overrides)?;
         let path = record_path(common, &roots.project_path)?;
         let _lock = RecordLock::acquire(&path)?;
-        let mut record = if path.exists() {
-            let record = read_record(&path)?;
-            validate_record_context(common, &roots.project_path, &record)?;
-            record
+        let existing = if path.exists() {
+            match decode_record(&path)? {
+                DecodedRecord::Current(record) => {
+                    validate_record_context(common, &roots.project_path, &record)?;
+                    Some(*record)
+                }
+                DecodedRecord::LegacyV1 => None,
+            }
         } else {
-            new_record(common, &roots.project_path)
+            None
         };
+        let (catalog, integration_fingerprint) = load_session_catalog(
+            &roots,
+            common.product,
+            fallback,
+            use_user_config,
+            expected_integration_fingerprint,
+        )?;
+        let available = resolver::declared_intents(&roots, fallback, &catalog.catalog);
+        let mut record = existing.unwrap_or_else(|| {
+            new_record(common, &roots.project_path, integration_fingerprint.clone())
+        });
+        if record.integration_fingerprint != integration_fingerprint {
+            record.active_intents.clear();
+            record.active_phase_intents.clear();
+            record.integration_fingerprint = integration_fingerprint.clone();
+        }
         for raw in &args.intent {
             let intent =
                 Context::parse(raw).map_err(|err| SessionFailure::data("invalid-intent", err))?;
@@ -97,7 +258,7 @@ fn activate(args: SessionActivateArgs, overrides: PathOverrides, fallback: Fallb
                     format!("intent `{intent}` is not declared"),
                 ));
             }
-            let report = resolver::resolve_intent_with_catalog_for_scope(
+            let report = resolver::resolve_intent_with_effective_catalog_for_scope(
                 &intent,
                 &roots,
                 Some(common.product),
@@ -117,7 +278,12 @@ fn activate(args: SessionActivateArgs, overrides: PathOverrides, fallback: Fallb
                 &mut record,
                 &intent,
                 phase.as_ref(),
-                fingerprint(&report, &catalog)?,
+                fingerprint(
+                    &report,
+                    &catalog,
+                    fallback,
+                    integration_fingerprint.as_deref(),
+                )?,
             );
         }
         record.activated_at = jiff::Timestamp::now().to_string();
@@ -135,25 +301,47 @@ fn activate(args: SessionActivateArgs, overrides: PathOverrides, fallback: Fallb
 /// call and a stable `reason` code, so a runtime hook can drive intent
 /// preparation with a single trusted invocation instead of a separate
 /// activate + preflight round-trip.
-fn prepare(args: SessionActivateArgs, overrides: PathOverrides, fallback: FallbackMode) -> i32 {
+fn prepare(
+    args: SessionActivateArgs,
+    overrides: PathOverrides,
+    fallback: FallbackMode,
+    use_user_config: bool,
+    expected_integration_fingerprint: Option<&str>,
+) -> i32 {
     let common = &args.common;
     let result = (|| -> Result<SessionData, SessionFailure> {
         validate_common(common)?;
         let phase = parse_phase_arg(args.phase.as_deref())?;
-        let roots = resolve_roots(&overrides)
-            .map_err(|err| SessionFailure::runtime("root-resolution-failed", err.to_string()))?;
-        let catalog = load_catalog_from_roots(&roots)
-            .map_err(|err| SessionFailure::runtime("catalog-load-failed", err.to_string()))?;
-        let available = resolver::declared_intents(&roots, fallback, &catalog);
+        let roots = resolve_session_roots(&overrides)?;
         let path = record_path(common, &roots.project_path)?;
         let _lock = RecordLock::acquire(&path)?;
-        let mut record = if path.exists() {
-            let record = read_record(&path)?;
-            validate_record_context(common, &roots.project_path, &record)?;
-            record
+        let existing = if path.exists() {
+            match decode_record(&path)? {
+                DecodedRecord::Current(record) => {
+                    validate_record_context(common, &roots.project_path, &record)?;
+                    Some(*record)
+                }
+                DecodedRecord::LegacyV1 => None,
+            }
         } else {
-            new_record(common, &roots.project_path)
+            None
         };
+        let (catalog, integration_fingerprint) = load_session_catalog(
+            &roots,
+            common.product,
+            fallback,
+            use_user_config,
+            expected_integration_fingerprint,
+        )?;
+        let available = resolver::declared_intents(&roots, fallback, &catalog.catalog);
+        let mut record = existing.unwrap_or_else(|| {
+            new_record(common, &roots.project_path, integration_fingerprint.clone())
+        });
+        if record.integration_fingerprint != integration_fingerprint {
+            record.active_intents.clear();
+            record.active_phase_intents.clear();
+            record.integration_fingerprint = integration_fingerprint.clone();
+        }
         let mut prepared: Vec<String> = Vec::new();
         for raw in &args.intent {
             let intent =
@@ -164,7 +352,7 @@ fn prepare(args: SessionActivateArgs, overrides: PathOverrides, fallback: Fallba
                     format!("intent `{intent}` is not declared"),
                 ));
             }
-            let report = resolver::resolve_intent_with_catalog_for_scope(
+            let report = resolver::resolve_intent_with_effective_catalog_for_scope(
                 &intent,
                 &roots,
                 Some(common.product),
@@ -180,9 +368,13 @@ fn prepare(args: SessionActivateArgs, overrides: PathOverrides, fallback: Fallba
                     format!("strict preflight failed for `{intent}`"),
                 ));
             }
-            let fingerprint = fingerprint(&report, &catalog)?;
-            let is_new = store_activation(&mut record, &intent, phase.as_ref(), fingerprint);
-            if is_new {
+            let fingerprint = fingerprint(
+                &report,
+                &catalog,
+                fallback,
+                integration_fingerprint.as_deref(),
+            )?;
+            if store_activation(&mut record, &intent, phase.as_ref(), fingerprint) {
                 prepared.push(intent.to_string());
             }
         }
@@ -204,31 +396,66 @@ fn prepare(args: SessionActivateArgs, overrides: PathOverrides, fallback: Fallba
     render(common.format, "prepare", result)
 }
 
-fn status(common: SessionCommonArgs, overrides: PathOverrides) -> i32 {
+fn status(
+    common: SessionCommonArgs,
+    overrides: PathOverrides,
+    fallback: FallbackMode,
+    use_user_config: bool,
+    expected_integration_fingerprint: Option<&str>,
+) -> i32 {
     let result = (|| -> Result<SessionData, SessionFailure> {
         validate_common(&common)?;
-        let roots = resolve_roots(&overrides)
-            .map_err(|err| SessionFailure::runtime("root-resolution-failed", err.to_string()))?;
+        let roots = resolve_session_roots(&overrides)?;
         let path = record_path(&common, &roots.project_path)?;
         let record = read_record(&path)?;
         validate_record_context(&common, &roots.project_path, &record)?;
+        if use_user_config {
+            let (_, current) = load_session_catalog(&roots, common.product, fallback, true, None)?;
+            validate_integration_fingerprints(
+                record.integration_fingerprint.as_deref(),
+                current.as_deref(),
+                expected_integration_fingerprint,
+            )?;
+        } else if let Some(expected) = expected_integration_fingerprint
+            && record.integration_fingerprint.as_deref() != Some(expected)
+        {
+            return Err(stale_integration_decision(
+                "session activation does not match the requested integration fingerprint",
+            ));
+        }
         data(&path, &common.state_home, &record, false)
     })();
     render(common.format, "status", result)
 }
 
-fn verify(args: SessionVerifyArgs, overrides: PathOverrides, fallback: FallbackMode) -> i32 {
+fn verify(
+    args: SessionVerifyArgs,
+    overrides: PathOverrides,
+    fallback: FallbackMode,
+    use_user_config: bool,
+    expected_integration_fingerprint: Option<&str>,
+) -> i32 {
     let common = &args.common;
     let result = (|| -> Result<SessionData, SessionFailure> {
         validate_common(common)?;
         let phase = parse_phase_arg(args.phase.as_deref())?;
-        let roots = resolve_roots(&overrides)
-            .map_err(|err| SessionFailure::runtime("root-resolution-failed", err.to_string()))?;
-        let catalog = load_catalog_from_roots(&roots)
-            .map_err(|err| SessionFailure::runtime("catalog-load-failed", err.to_string()))?;
+        let roots = resolve_session_roots(&overrides)?;
+        let (catalog, integration_fingerprint) = load_session_catalog(
+            &roots,
+            common.product,
+            fallback,
+            use_user_config,
+            expected_integration_fingerprint,
+        )?;
         let path = record_path(common, &roots.project_path)?;
         let record = read_record(&path)?;
         validate_record_context(common, &roots.project_path, &record)?;
+        if record.integration_fingerprint != integration_fingerprint {
+            return Err(SessionFailure::data(
+                "stale-integration-decision",
+                "session activation does not match the current integration decision",
+            ));
+        }
         for raw in &args.require_intent {
             let intent =
                 Context::parse(raw).map_err(|err| SessionFailure::data("invalid-intent", err))?;
@@ -240,6 +467,7 @@ fn verify(args: SessionVerifyArgs, overrides: PathOverrides, fallback: FallbackM
                 common.product,
                 fallback,
                 &catalog,
+                integration_fingerprint.as_deref(),
             )?;
         }
         let mut out = data(&path, &common.state_home, &record, true)?;
@@ -247,6 +475,78 @@ fn verify(args: SessionVerifyArgs, overrides: PathOverrides, fallback: FallbackM
         Ok(out)
     })();
     render(common.format, "verify", result)
+}
+
+fn resolve_session_roots(overrides: &PathOverrides) -> Result<ResolvedRoots, SessionFailure> {
+    resolve_roots(overrides)
+        .map_err(|err| SessionFailure::runtime("root-resolution-failed", err.to_string()))
+}
+
+fn stale_integration_decision(message: impl Into<String>) -> SessionFailure {
+    SessionFailure::data("stale-integration-decision", message)
+}
+
+fn validate_integration_fingerprints(
+    stored: Option<&str>,
+    current: Option<&str>,
+    expected: Option<&str>,
+) -> Result<(), SessionFailure> {
+    if let Some(expected) = expected
+        && current != Some(expected)
+    {
+        return Err(stale_integration_decision(
+            "the current integration decision does not match the requested fingerprint",
+        ));
+    }
+    if stored != current {
+        return Err(stale_integration_decision(
+            "session activation does not match the current integration decision",
+        ));
+    }
+    Ok(())
+}
+
+fn load_session_catalog(
+    roots: &ResolvedRoots,
+    product: Product,
+    fallback: FallbackMode,
+    use_user_config: bool,
+    expected_integration_fingerprint: Option<&str>,
+) -> Result<(integration::EffectiveCatalog, Option<String>), SessionFailure> {
+    if !use_user_config {
+        let catalog = load_catalog_from_roots(roots).map_err(|err| match err.kind {
+            ConfigErrorKind::Parse | ConfigErrorKind::Validation => {
+                SessionFailure::config("catalog-load-failed", err.to_string())
+            }
+            ConfigErrorKind::Io => SessionFailure::runtime("catalog-load-failed", err.to_string()),
+        })?;
+        return Ok((
+            integration::EffectiveCatalog {
+                catalog,
+                private_project_catalog: false,
+                private_allowed_roots: Vec::new(),
+            },
+            None,
+        ));
+    }
+    let (catalog, current) = integration::load_bound_catalog_with_fingerprint(
+        roots,
+        product,
+        fallback,
+        expected_integration_fingerprint,
+    )
+    .map_err(|err| match err.kind() {
+        integration::BoundCatalogErrorKind::Data => {
+            SessionFailure::data(err.code(), err.to_string())
+        }
+        integration::BoundCatalogErrorKind::Config => {
+            SessionFailure::config(err.code(), err.to_string())
+        }
+        integration::BoundCatalogErrorKind::Runtime => {
+            SessionFailure::runtime(err.code(), err.to_string())
+        }
+    })?;
+    Ok((catalog, Some(current)))
 }
 
 /// Verify a single required intent.
@@ -263,7 +563,8 @@ fn verify_intent(
     roots: &ResolvedRoots,
     product: Product,
     fallback: FallbackMode,
-    catalog: &LoadedCatalog,
+    catalog: &integration::EffectiveCatalog,
+    integration_fingerprint: Option<&str>,
 ) -> Result<(), SessionFailure> {
     let Some(phase) = phase else {
         let Some(stored) = record.active_intents.get(intent.as_str()) else {
@@ -272,7 +573,16 @@ fn verify_intent(
                 format!("intent `{intent}` is not active"),
             ));
         };
-        if !activation_matches(intent, None, stored, roots, product, fallback, catalog)? {
+        if !activation_matches(
+            intent,
+            None,
+            stored,
+            roots,
+            product,
+            fallback,
+            catalog,
+            integration_fingerprint,
+        )? {
             return Err(SessionFailure::data(
                 "stale-activation",
                 format!("activation for `{intent}` no longer matches the resolved catalog"),
@@ -302,12 +612,22 @@ fn verify_intent(
             product,
             fallback,
             catalog,
+            integration_fingerprint,
         )?
     {
         return Ok(());
     }
     if let Some(stored) = full_stored
-        && activation_matches(intent, None, stored, roots, product, fallback, catalog)?
+        && activation_matches(
+            intent,
+            None,
+            stored,
+            roots,
+            product,
+            fallback,
+            catalog,
+            integration_fingerprint,
+        )?
     {
         return Ok(());
     }
@@ -329,9 +649,10 @@ fn activation_matches(
     roots: &ResolvedRoots,
     product: Product,
     fallback: FallbackMode,
-    catalog: &LoadedCatalog,
+    catalog: &integration::EffectiveCatalog,
+    integration_fingerprint: Option<&str>,
 ) -> Result<bool, SessionFailure> {
-    let report = resolver::resolve_intent_with_catalog_for_scope(
+    let report = resolver::resolve_intent_with_effective_catalog_for_scope(
         intent,
         roots,
         Some(product),
@@ -341,7 +662,8 @@ fn activation_matches(
         true,
         catalog,
     );
-    Ok(!report.has_unsatisfied_required() && stored == fingerprint(&report, catalog)?)
+    Ok(!report.has_unsatisfied_required()
+        && stored == fingerprint(&report, catalog, fallback, integration_fingerprint)?)
 }
 
 fn parse_phase_arg(raw: Option<&str>) -> Result<Option<Phase>, SessionFailure> {
@@ -353,12 +675,17 @@ fn parse_phase_arg(raw: Option<&str>) -> Result<Option<Phase>, SessionFailure> {
     }
 }
 
-fn new_record(common: &SessionCommonArgs, project: &Path) -> SessionRecord {
+fn new_record(
+    common: &SessionCommonArgs,
+    project: &Path,
+    integration_fingerprint: Option<String>,
+) -> SessionRecord {
     SessionRecord {
         schema: RECORD_SCHEMA.to_string(),
         session_hash: digest(common.session_id.trim().as_bytes()),
         project_hash: project_hash(project),
         product: common.product.as_str().to_string(),
+        integration_fingerprint,
         active_intents: BTreeMap::new(),
         active_phase_intents: BTreeMap::new(),
         activated_at: jiff::Timestamp::now().to_string(),
@@ -447,13 +774,124 @@ fn project_hash(project: &Path) -> String {
     digest(canonical.to_string_lossy().as_bytes())
 }
 
-fn fingerprint<T: Serialize, C: Serialize>(
-    report: &T,
-    catalog: &C,
+fn fingerprint(
+    report: &PreflightReport,
+    catalog: &integration::EffectiveCatalog,
+    fallback: FallbackMode,
+    integration_fingerprint: Option<&str>,
 ) -> Result<String, SessionFailure> {
-    let bytes = serde_json::to_vec(&(report, catalog))
+    if catalog.private_project_catalog && integration_fingerprint.is_none() {
+        return Err(SessionFailure::runtime(
+            "fingerprint-producer-missing",
+            "private session activation is missing its trusted integration decision",
+        ));
+    }
+
+    let mut private_allowed_roots = catalog.private_allowed_roots.clone();
+    private_allowed_roots.sort();
+    let catalogs = catalog
+        .catalog
+        .in_load_order()
+        .into_iter()
+        .map(|scope| CatalogProducerInput {
+            source_scope: scope.source_scope.as_str(),
+            root: &scope.root,
+            file_path: &scope.file_path,
+            documents: scope
+                .documents
+                .iter()
+                .map(|document| CatalogDocumentFingerprintInput {
+                    context: document.context.as_str(),
+                    scope: document.scope.as_str(),
+                    path: &document.path,
+                    products: product_names(&document.products),
+                    phases: document.phases.iter().map(Phase::as_str).collect(),
+                    required: document.required,
+                    when: &document.when_raw,
+                    marker: document.marker.as_deref(),
+                    freshness_days: document.freshness_days,
+                })
+                .collect(),
+            validations: scope
+                .validations
+                .iter()
+                .map(|validation| CatalogValidationFingerprintInput {
+                    context: validation.context.as_str(),
+                    products: product_names(&validation.products),
+                    commands: &validation.commands,
+                    marker: validation.marker.as_deref(),
+                })
+                .collect(),
+        })
+        .collect();
+    let documents = report
+        .documents
+        .iter()
+        .map(|document| ResolvedDocumentFingerprintInput {
+            context: document.context.as_str(),
+            scope: document.scope.as_str(),
+            path: &document.path,
+            products: product_names(&document.products),
+            declared_required: document.declared_required,
+            required: document.required,
+            when: &document.when,
+            when_satisfied: document.when_satisfied,
+            status: document.status.as_str(),
+            exists: document.validation.exists,
+            non_empty: document.validation.non_empty,
+            marker_present: document.validation.marker_present,
+            freshness: document.validation.freshness.as_str(),
+            valid: document.validation.valid,
+            source: document.source.as_str(),
+            content_digest: document
+                .content
+                .as_deref()
+                .map(|content| digest(content.as_bytes())),
+        })
+        .collect();
+    let input = IntentFingerprintInput {
+        schema_version: INTENT_FINGERPRINT_SCHEMA,
+        trusted_producer: TrustedProducerInput {
+            kind: if integration_fingerprint.is_some() {
+                "integration-decision"
+            } else {
+                "catalog-roots"
+            },
+            binary: "agent-docs",
+            package_version: env!("CARGO_PKG_VERSION"),
+            integration_fingerprint,
+            private_project_catalog: catalog.private_project_catalog,
+            private_allowed_roots,
+            catalogs,
+        },
+        fallback: fallback.as_str(),
+        report_schema_version: report.schema_version,
+        intent: report.intent.as_str(),
+        product: report.product.map(Product::as_str),
+        phase: report.phase.as_ref().map(Phase::as_str),
+        strict: report.strict,
+        docs_home: &report.docs_home,
+        project_path: &report.project_path,
+        is_linked_worktree: report.is_linked_worktree,
+        documents,
+        validation: ValidationFingerprintInput {
+            context: report.validation.context.as_str(),
+            declared: report.validation.declared,
+            commands: &report.validation.commands,
+            marker: report.validation.marker.as_deref(),
+        },
+        required_total: report.summary.required_total,
+        satisfied_required: report.summary.satisfied_required,
+        missing_required: report.summary.missing_required,
+        invalid_required: report.summary.invalid_required,
+    };
+    let bytes = serde_json::to_vec(&input)
         .map_err(|err| SessionFailure::runtime("fingerprint-failed", err.to_string()))?;
     Ok(digest(&bytes))
+}
+
+fn product_names(products: &[Product]) -> Vec<&'static str> {
+    products.iter().copied().map(Product::as_str).collect()
 }
 
 fn digest(bytes: &[u8]) -> String {
@@ -468,7 +906,14 @@ fn digest(bytes: &[u8]) -> String {
 }
 
 fn read_record(path: &Path) -> Result<SessionRecord, SessionFailure> {
-    let raw = fs::read_to_string(path).map_err(|err| {
+    match decode_record(path)? {
+        DecodedRecord::Current(record) => Ok(*record),
+        DecodedRecord::LegacyV1 => Err(unsupported_record(LEGACY_RECORD_SCHEMA)),
+    }
+}
+
+fn decode_record(path: &Path) -> Result<DecodedRecord, SessionFailure> {
+    let raw = fs::read(path).map_err(|err| {
         let code = if err.kind() == std::io::ErrorKind::NotFound {
             "missing-activation"
         } else {
@@ -476,15 +921,22 @@ fn read_record(path: &Path) -> Result<SessionRecord, SessionFailure> {
         };
         SessionFailure::data(code, format!("session activation is unavailable: {err}"))
     })?;
-    let record: SessionRecord = serde_json::from_str(&raw)
+    let envelope: SessionRecordEnvelope = serde_json::from_slice(&raw)
         .map_err(|err| SessionFailure::runtime("record-parse-failed", err.to_string()))?;
-    if record.schema != RECORD_SCHEMA {
-        return Err(SessionFailure::data(
-            "unsupported-record",
-            format!("unsupported session schema `{}`", record.schema),
-        ));
+    match envelope.schema.as_str() {
+        RECORD_SCHEMA => serde_json::from_slice(&raw)
+            .map(|record| DecodedRecord::Current(Box::new(record)))
+            .map_err(|err| SessionFailure::runtime("record-parse-failed", err.to_string())),
+        LEGACY_RECORD_SCHEMA => Ok(DecodedRecord::LegacyV1),
+        unsupported => Err(unsupported_record(unsupported)),
     }
-    Ok(record)
+}
+
+fn unsupported_record(schema: &str) -> SessionFailure {
+    SessionFailure::data(
+        "unsupported-record",
+        format!("unsupported session schema `{schema}`"),
+    )
 }
 
 fn write_record(path: &Path, record: &SessionRecord) -> Result<(), SessionFailure> {
@@ -577,6 +1029,13 @@ impl SessionFailure {
             code,
             message: message.into(),
             exit_code: EXIT_DATA,
+        }
+    }
+    fn config(code: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            code,
+            message: message.into(),
+            exit_code: EXIT_CONFIG,
         }
     }
     fn runtime(code: &'static str, message: impl Into<String>) -> Self {

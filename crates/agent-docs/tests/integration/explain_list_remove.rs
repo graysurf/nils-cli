@@ -7,6 +7,9 @@ fn populated() -> TestEnv {
     env.write_home_catalog(
         "[[document]]\ncontext = \"project-dev\"\nscope = \"project\"\npath = \"DEVELOPMENT.md\"\nrequired = true\n\n[[validation]]\ncontext = \"project-dev\"\ncommands = [\"bash scripts/ci/all.sh\"]\n",
     );
+    env.write_project_catalog(
+        "[[document]]\ncontext = \"project-dev\"\nscope = \"project\"\npath = \"DEVELOPMENT.md\"\nrequired = true\n\n[[validation]]\ncontext = \"project-dev\"\ncommands = [\"bash scripts/ci/all.sh\"]\n",
+    );
     env.write_project_doc("DEVELOPMENT.md", "# Dev\n");
     env
 }
@@ -52,6 +55,9 @@ fn list_and_explain_filter_by_product() {
     let env = TestEnv::new();
     env.write_home_catalog(
         "[[document]]\ncontext = \"project-dev\"\nscope = \"home\"\npath = \"SHARED.md\"\n\n[[document]]\ncontext = \"project-dev\"\nscope = \"home\"\npath = \"CODEX.md\"\nproduct = \"codex\"\n\n[[document]]\ncontext = \"project-dev\"\nscope = \"home\"\npath = \"CLAUDE.md\"\nproduct = \"claude\"\n\n[[validation]]\ncontext = \"project-dev\"\ncommands = [\"shared-check\"]\n\n[[validation]]\ncontext = \"project-dev\"\ncommands = [\"codex-check\"]\nproduct = \"codex\"\n\n[[validation]]\ncontext = \"project-dev\"\ncommands = [\"claude-check\"]\nproduct = \"claude\"\n\n[[validation]]\ncontext = \"claude-only\"\ncommands = [\"claude-only-check\"]\nproduct = \"claude\"\n",
+    );
+    env.write_project_catalog(
+        "[[validation]]\ncontext = \"project-dev\"\ncommands = [\"shared-check\"]\n\n[[validation]]\ncontext = \"project-dev\"\ncommands = [\"codex-check\"]\nproduct = \"codex\"\n\n[[validation]]\ncontext = \"project-dev\"\ncommands = [\"claude-check\"]\nproduct = \"claude\"\n\n[[validation]]\ncontext = \"claude-only\"\ncommands = [\"claude-only-check\"]\nproduct = \"claude\"\n",
     );
     env.write_home_doc("SHARED.md", "# Shared\n");
     env.write_home_doc("CODEX.md", "# Codex\n");
