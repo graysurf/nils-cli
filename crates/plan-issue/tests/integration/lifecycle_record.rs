@@ -617,7 +617,7 @@ fn lifecycle_record_final_dashboard_prefers_plan_title_over_synthetic_target_sco
 }
 
 #[test]
-fn lifecycle_record_dashboard_recovers_legacy_plan_title_from_snapshot_content() {
+fn lifecycle_record_dashboard_recovers_historical_plan_title_from_snapshot_content() {
     let plan_body = lifecycle_record::render_record_snapshot_comment(
         plan_issue::commands::record::RecordProfile::Tracking,
         plan_issue::commands::record::LifecycleCommentKind::Plan,
@@ -676,7 +676,7 @@ fn lifecycle_record_dashboard_recovers_legacy_plan_title_from_snapshot_content()
 }
 
 #[test]
-fn lifecycle_record_dashboard_legacy_title_uses_selected_plan_comment_only() {
+fn lifecycle_record_dashboard_historical_title_uses_selected_plan_comment_only() {
     let snapshot = |title: &str| {
         lifecycle_record::render_record_snapshot_comment(
             plan_issue::commands::record::RecordProfile::Tracking,

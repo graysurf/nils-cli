@@ -534,7 +534,7 @@ fn write_atomic_at(
         }
         let _ = file.flush();
         // SAFETY: `file` owns a live descriptor and `mode` is a valid Unix mode.
-        if unsafe { libc::fchmod(file.as_raw_fd(), mode) } != 0 {
+        if unsafe { libc::fchmod(file.as_raw_fd(), mode as libc::mode_t) } != 0 {
             let source = io::Error::last_os_error();
             drop(file);
             unlinkat_file(parent, &temp_name);

@@ -1197,7 +1197,7 @@ fn tracking_run_update_closed_no_ops_do_not_rewrite_state_or_events() {
 }
 
 #[test]
-fn tracking_run_update_idempotent_closed_repairs_legacy_stale_task() {
+fn tracking_run_update_idempotent_closed_repairs_historical_stale_task() {
     let tmp = TempDir::new().expect("tmp");
     let run_state_path = tmp.path().join("run-state.json");
     let raw = serde_json::json!({
