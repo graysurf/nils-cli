@@ -77,6 +77,7 @@ context  = "project-dev"            # free-form intent identifier
 scope    = "project"                # home | project | global
 path     = "DEVELOPMENT.md"         # relative to the scope root
 product  = "codex"                  # optional: codex | claude | hermes | a list
+phase    = ["edit", "review"]       # optional: free-form phase name or a list
 required = true                     # default: false
 when     = "path-exists:Cargo.toml" # default: always (see grammar below)
 marker   = "## Validation"          # optional: content must contain this string
@@ -121,6 +122,27 @@ document and validation entry whose `context` equals `X`.
 single product string or a non-empty list of product strings. Supported values
 are `codex`, `claude`, and `hermes`. Unscoped entries apply to every product; scoped
 entries are included only when the requested `--product` matches.
+
+### Phases
+
+`phase` is optional on `[[document]]` (only — `[[validation]]` is intent-level
+and is not phase-scoped). It accepts a single phase string or a non-empty list of
+phase strings, mirroring `product`. Phase names are **free-form** (the same
+charset as a context: ASCII alphanumerics plus `-_./`); the binary hard-codes no
+phase vocabulary, so a consumer defines its own phases (for example `edit`,
+`review`, `delivery`) and adding a phase never needs a release.
+
+A document with **no** `phase` field applies to **every** phase (symmetric with
+"no `product` = all products"). `preflight --intent X --phase P` resolves the
+no-phase documents plus the documents whose declared phases include `P`, and
+excludes documents scoped to a different phase. Omitting `--phase` applies no
+phase filter and returns every document (today's behavior, byte-for-byte). A
+`--phase` value that matches only no-phase documents is **valid** — it returns
+the no-phase set rather than erroring — so a phase with no dedicated documents
+still works. A malformed `--phase` value is a usage error (exit `64`).
+
+`--phase` is accepted by `preflight`, `session prepare`, and `session verify`
+(one phase per call, "the current phase"; `--intent` stays repeatable).
 
 ### `when` grammar
 
@@ -210,6 +232,13 @@ Field notes:
   catalog `product` field are included; unscoped entries are always included.
 - `documents[].products` is empty for include-all entries, or lists the scoped
   product names from the catalog.
+- `phase` is **omitted** when no `--phase` filter was supplied (so a no-phase
+  call is byte-identical to the pre-phase shape); with `--phase P` it is the
+  requested phase string.
+- `documents[].phases` is **omitted** for a document that declares no phase
+  (applies to all phases); otherwise it lists the document's declared phase
+  names. Because these additions are omitted when absent, catalogs that use no
+  phases produce identical output and identical `session` fingerprints.
 - `documents[].content` is the full document body, emitted so a hook can inject
   the doc without re-reading the file. It is present only for resolved, present
   documents (omitted for missing ones).
@@ -236,6 +265,12 @@ Product-aware resolution is exposed through new resolver entrypoints such as
 `resolve_all_documents_for_product`, and
 `all_validation_contracts_for_product`. The pre-existing resolver functions
 remain available and behave as unfiltered calls.
+
+Phase-aware resolution adds `resolve_intent_with_catalog_for_scope`, which takes
+an optional `Product` and an optional `Phase`; the `_for_product` entrypoint
+delegates to it with `phase = None`, so existing callers are unaffected. Catalog
+entries carry `phases`, resolved documents report the catalog phases that
+matched, and preflight reports include the selected `phase`.
 
 The product dimension is also part of the public model types used by this crate:
 catalog entries carry `products`, resolved documents report the catalog
@@ -267,6 +302,27 @@ agent-docs session verify --session-id "$SESSION_ID" --product codex \
 
 Products without hooks may still use these shared CLI records, but the record
 does not claim that product-native hooks invoked activation.
+
+### Phase-scoped preparation
+
+`session prepare` / `session verify` accept an optional `--phase <PHASE>`. A
+`prepare --intent X --phase P` resolves and fingerprints the P-scoped document
+set and records a phase-qualified activation; a `verify --require-intent X
+--phase P` passes when the record holds a matching phase-scoped preparation
+**or** a matching full (no-phase) preparation, since a full prepare covers every
+phase's subset. Omitting `--phase` behaves exactly as before, and the no-phase
+record shape is unchanged — the phase qualifier and the `data.phase` field are
+stored/emitted only when a phase is supplied. A phase-scoped prepare whose
+required documents are unsatisfied fails with the `phase-unsatisfied` error code
+(the phase parallel of `preflight-unsatisfied`); a malformed `--phase` value
+fails with `invalid-phase`.
+
+```bash
+agent-docs session prepare --session-id "$SESSION_ID" --product codex \
+  --state-home "$STATE_HOME" --intent project-dev --phase edit --format json
+agent-docs session verify --session-id "$SESSION_ID" --product codex \
+  --state-home "$STATE_HOME" --require-intent project-dev --phase edit --format json
+```
 
 In text mode, the guarded failure is written to stderr:
 

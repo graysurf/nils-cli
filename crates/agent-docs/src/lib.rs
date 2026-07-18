@@ -17,7 +17,7 @@ use clap::Parser;
 use cli::{Cli, Command};
 use config::load_catalog_from_roots;
 use env::{PathOverrides, ResolvedRoots, resolve_roots};
-use model::{ConfigErrorKind, ConfigLoadError, Context, InitMode, ListReport};
+use model::{ConfigErrorKind, ConfigLoadError, Context, InitMode, ListReport, Phase};
 use output::{
     ExplainIntent, ExplainIntents, render_audit, render_explain_intent, render_explain_intents,
     render_init, render_list, render_preflight, render_remove, render_undeclared_intent_error,
@@ -97,6 +97,10 @@ fn dispatch(cli: Cli) -> i32 {
                 Ok(intent) => intent,
                 Err(code) => return code,
             };
+            let phase = match parse_phase(args.phase.as_deref()) {
+                Ok(phase) => phase,
+                Err(code) => return code,
+            };
             let roots = match resolve_roots_or_exit(&overrides) {
                 Ok(roots) => roots,
                 Err(code) => return code,
@@ -108,10 +112,11 @@ fn dispatch(cli: Cli) -> i32 {
                     return config_error_exit_code(&err);
                 }
             };
-            let report = resolver::resolve_intent_with_catalog_for_product(
+            let report = resolver::resolve_intent_with_catalog_for_scope(
                 &intent,
                 &roots,
                 args.product,
+                phase,
                 args.strict,
                 fallback_mode,
                 true,
@@ -274,6 +279,16 @@ fn parse_intent(raw: &str) -> Result<Context, i32> {
         eprintln!("error: invalid --intent/--context: {message}");
         EXIT_USAGE
     })
+}
+
+fn parse_phase(raw: Option<&str>) -> Result<Option<Phase>, i32> {
+    match raw {
+        None => Ok(None),
+        Some(raw) => Phase::parse(raw).map(Some).map_err(|message| {
+            eprintln!("error: invalid --phase: {message}");
+            EXIT_USAGE
+        }),
+    }
 }
 
 fn resolve_roots_or_exit(overrides: &PathOverrides) -> Result<ResolvedRoots, i32> {

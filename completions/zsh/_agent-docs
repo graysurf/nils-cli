@@ -49,6 +49,7 @@ _arguments "${_arguments_options[@]}" : \
 '--intent=[Intent to resolve (for example project-dev)]:INTENT:_default' \
 '--format=[Output format]:FORMAT:(text json)' \
 '--product=[Filter documents and validation by product]:PRODUCT:(codex claude hermes)' \
+'--phase=[Filter documents to a workflow phase (no-phase docs always apply)]:PHASE:_default' \
 '--docs-home=[Override the docs-home root (otherwise derived from the install symlink)]:PATH:_files' \
 '--project-path=[Override the project root path]:PATH:_files' \
 '--worktree-fallback=[Project worktree fallback mode]:MODE:(auto local-only)' \
@@ -131,6 +132,7 @@ _arguments "${_arguments_options[@]}" : \
 '--state-home=[]:DIR:_files' \
 '--format=[]:FORMAT:(text json)' \
 '*--intent=[]:INTENT:_default' \
+'--phase=[Scope preparation to a workflow phase (no-phase docs always apply)]:PHASE:_default' \
 '--docs-home=[Override the docs-home root (otherwise derived from the install symlink)]:PATH:_files' \
 '--project-path=[Override the project root path]:PATH:_files' \
 '--worktree-fallback=[Project worktree fallback mode]:MODE:(auto local-only)' \
@@ -145,6 +147,7 @@ _arguments "${_arguments_options[@]}" : \
 '--state-home=[]:DIR:_files' \
 '--format=[]:FORMAT:(text json)' \
 '*--intent=[]:INTENT:_default' \
+'--phase=[Scope preparation to a workflow phase (no-phase docs always apply)]:PHASE:_default' \
 '--docs-home=[Override the docs-home root (otherwise derived from the install symlink)]:PATH:_files' \
 '--project-path=[Override the project root path]:PATH:_files' \
 '--worktree-fallback=[Project worktree fallback mode]:MODE:(auto local-only)' \
@@ -172,6 +175,7 @@ _arguments "${_arguments_options[@]}" : \
 '--state-home=[]:DIR:_files' \
 '--format=[]:FORMAT:(text json)' \
 '*--require-intent=[]:INTENT:_default' \
+'--phase=[Verify a phase-scoped or full preparation for the required intents]:PHASE:_default' \
 '--docs-home=[Override the docs-home root (otherwise derived from the install symlink)]:PATH:_files' \
 '--project-path=[Override the project root path]:PATH:_files' \
 '--worktree-fallback=[Project worktree fallback mode]:MODE:(auto local-only)' \
