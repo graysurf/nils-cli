@@ -131,10 +131,8 @@ fn linked_worktree_subdirectory_fallback_preserves_the_relative_path() {
 
     assert_eq!(out.code, 0, "stdout={} stderr={}", out.stdout, out.stderr);
     let document = &out.json()["documents"][0];
-    assert_eq!(
-        document["path"],
-        fx.kit_path.join("nested/POLICY.md").to_str().unwrap()
-    );
+    let expected_path = fs::canonicalize(fx.kit_path.join("nested/POLICY.md")).unwrap();
+    assert_eq!(document["path"], expected_path.to_str().unwrap());
     assert_eq!(document["content"], PRIMARY_NESTED);
     assert!(!out.stdout.contains(PRIMARY_ROOT));
     assert!(!out.stdout.contains(LINKED_ROOT));
