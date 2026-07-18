@@ -5234,12 +5234,12 @@ mod tests {
         );
 
         for normalized_event in normalized {
-            let serialized = serde_json::to_string(
-                normalized_event
-                    .as_ref()
-                    .expect("recognized continuation signal"),
-            )
-            .expect("continuation event json");
+            let normalized_event = normalized_event.expect("recognized continuation signal");
+            assert_eq!(normalized_event.confidence, Confidence::Observed);
+            assert_eq!(normalized_event.source_kind, SourceKind::ProviderHook);
+            assert_eq!(normalized_event.provider, "claude");
+            let serialized =
+                serde_json::to_string(&normalized_event).expect("continuation event json");
             for forbidden in [
                 "tool-secret",
                 "discarded",
@@ -5263,13 +5263,12 @@ mod tests {
             assert_eq!(document.state.phase, TurnPhase::Waiting);
             assert!(document.state.current_turn.is_none());
 
-            reduce(
-                &mut document,
-                &normalized_event.expect("recognized continuation signal"),
-                "2026-07-18T00:00:03Z",
-            );
+            reduce(&mut document, &normalized_event, "2026-07-18T00:00:03Z");
             assert_eq!(document.state.phase, TurnPhase::Working);
             assert!(document.state.current_turn.is_some());
+            assert_eq!(document.state.source.kind, SourceKind::ProviderHook);
+            assert_eq!(document.state.source.provider.as_deref(), Some("claude"));
+            assert_eq!(document.state.source.confidence, Confidence::Observed);
         }
     }
 
