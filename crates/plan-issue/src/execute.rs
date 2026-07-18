@@ -9373,7 +9373,7 @@ fn create_temp_markdown_file(dir: &TempMarkdownDir, file_name: &OsStr) -> std::i
         libc::openat(
             dir.descriptor.as_raw_fd(),
             name.as_ptr(),
-            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL,
+            libc::O_RDWR | libc::O_CREAT | libc::O_EXCL,
             0o600,
         )
     };
