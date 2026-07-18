@@ -152,3 +152,66 @@ fn invalid_product_field_is_a_precise_error() {
         out.stderr
     );
 }
+
+#[test]
+fn phase_field_accepts_string_and_list_forms() {
+    let env = TestEnv::new();
+    env.write_home_catalog(
+        "[[document]]\ncontext = \"project-dev\"\nscope = \"home\"\npath = \"ONE.md\"\nphase = \"edit\"\n\n[[document]]\ncontext = \"project-dev\"\nscope = \"home\"\npath = \"MANY.md\"\nphase = [\"edit\", \"review\"]\n",
+    );
+    env.write_home_doc("ONE.md", "# One\n");
+    env.write_home_doc("MANY.md", "# Many\n");
+
+    let out = env.run(&["list", "--format", "json"]);
+    assert!(out.success(), "stderr: {}", out.stderr);
+    let json = out.json();
+    let docs = json["documents"].as_array().unwrap();
+    let one = docs
+        .iter()
+        .find(|doc| doc["path"].as_str().unwrap().ends_with("ONE.md"))
+        .unwrap();
+    assert_eq!(one["phases"][0], "edit", "{json}");
+    let many = docs
+        .iter()
+        .find(|doc| doc["path"].as_str().unwrap().ends_with("MANY.md"))
+        .unwrap();
+    assert_eq!(
+        many["phases"],
+        serde_json::json!(["edit", "review"]),
+        "{json}"
+    );
+}
+
+#[test]
+fn no_phase_document_omits_phases_field() {
+    let env = TestEnv::new();
+    env.write_home_catalog(
+        "[[document]]\ncontext = \"project-dev\"\nscope = \"home\"\npath = \"PLAIN.md\"\n",
+    );
+    env.write_home_doc("PLAIN.md", "# Plain\n");
+
+    let out = env.run(&["list", "--format", "json"]);
+    assert!(out.success(), "stderr: {}", out.stderr);
+    let json = out.json();
+    let doc = &json["documents"][0];
+    assert!(
+        doc.get("phases").is_none(),
+        "a document with no phase must omit the phases field: {json}"
+    );
+}
+
+#[test]
+fn invalid_phase_field_is_a_precise_error() {
+    let env = TestEnv::new();
+    env.write_home_catalog(
+        "[[document]]\ncontext = \"project-dev\"\nscope = \"home\"\npath = \"BAD.md\"\nphase = \"bad phase\"\n",
+    );
+
+    let out = env.run(&["list"]);
+    assert_eq!(out.code, EXIT_CONFIG, "stderr: {}", out.stderr);
+    assert!(
+        out.stderr.contains("document[0].phase") && out.stderr.contains("unsupported character"),
+        "stderr: {}",
+        out.stderr
+    );
+}

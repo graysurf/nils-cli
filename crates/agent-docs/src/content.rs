@@ -121,6 +121,7 @@ mod tests {
             scope: Scope::Project,
             path: PathBuf::from("DEVELOPMENT.md"),
             products: Vec::new(),
+            phases: Vec::new(),
             required: true,
             when: When::Always,
             when_raw: "always".to_string(),

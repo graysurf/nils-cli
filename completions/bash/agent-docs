@@ -251,7 +251,7 @@ _agent-docs() {
             return 0
             ;;
         agent__docs__preflight)
-            opts="-h --intent --format --strict --product --require-declared-intent --docs-home --project-path --worktree-fallback --help"
+            opts="-h --intent --format --strict --product --phase --require-declared-intent --docs-home --project-path --worktree-fallback --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -267,6 +267,10 @@ _agent-docs() {
                     ;;
                 --product)
                     COMPREPLY=($(compgen -W "codex claude hermes" -- "${cur}"))
+                    return 0
+                    ;;
+                --phase)
+                    COMPREPLY=($(compgen -f "${cur}"))
                     return 0
                     ;;
                 --docs-home)
@@ -357,7 +361,7 @@ _agent-docs() {
             return 0
             ;;
         agent__docs__session__activate)
-            opts="-h --session-id --product --state-home --format --intent --docs-home --project-path --worktree-fallback --help"
+            opts="-h --session-id --product --state-home --format --intent --phase --docs-home --project-path --worktree-fallback --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -380,6 +384,10 @@ _agent-docs() {
                     return 0
                     ;;
                 --intent)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --phase)
                     COMPREPLY=($(compgen -f "${cur}"))
                     return 0
                     ;;
@@ -403,7 +411,7 @@ _agent-docs() {
             return 0
             ;;
         agent__docs__session__prepare)
-            opts="-h --session-id --product --state-home --format --intent --docs-home --project-path --worktree-fallback --help"
+            opts="-h --session-id --product --state-home --format --intent --phase --docs-home --project-path --worktree-fallback --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -426,6 +434,10 @@ _agent-docs() {
                     return 0
                     ;;
                 --intent)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --phase)
                     COMPREPLY=($(compgen -f "${cur}"))
                     return 0
                     ;;
@@ -491,7 +503,7 @@ _agent-docs() {
             return 0
             ;;
         agent__docs__session__verify)
-            opts="-h --session-id --product --state-home --format --require-intent --docs-home --project-path --worktree-fallback --help"
+            opts="-h --session-id --product --state-home --format --require-intent --phase --docs-home --project-path --worktree-fallback --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -514,6 +526,10 @@ _agent-docs() {
                     return 0
                     ;;
                 --require-intent)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --phase)
                     COMPREPLY=($(compgen -f "${cur}"))
                     return 0
                     ;;

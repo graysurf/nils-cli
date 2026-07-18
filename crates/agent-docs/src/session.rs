@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::thread;
@@ -12,8 +12,8 @@ use crate::cli::{
     SessionActivateArgs, SessionArgs, SessionCommand, SessionCommonArgs, SessionVerifyArgs,
 };
 use crate::config::load_catalog_from_roots;
-use crate::env::{PathOverrides, resolve_roots};
-use crate::model::{Context, FallbackMode, OutputFormat};
+use crate::env::{PathOverrides, ResolvedRoots, resolve_roots};
+use crate::model::{Context, FallbackMode, LoadedCatalog, OutputFormat, Phase, Product};
 use crate::resolver;
 
 const RECORD_SCHEMA: &str = "agent-docs.session.v1";
@@ -32,6 +32,11 @@ struct SessionRecord {
     project_hash: String,
     product: String,
     active_intents: BTreeMap<String, String>,
+    /// Phase-scoped activations: intent -> { phase -> fingerprint }. Skipped
+    /// when empty so a no-phase record serializes byte-identically to a
+    /// pre-phase record (and keeps its fingerprint stable across the upgrade).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    active_phase_intents: BTreeMap<String, BTreeMap<String, String>>,
     activated_at: String,
     producer_version: String,
 }
@@ -39,6 +44,10 @@ struct SessionRecord {
 #[derive(Debug, Serialize)]
 struct SessionData {
     product: String,
+    /// The phase this result was scoped to, when `--phase` was supplied. Absent
+    /// for no-phase calls so their stable output shape is unchanged.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    phase: Option<String>,
     active_intents: Vec<String>,
     record_file: String,
     verified: bool,
@@ -64,6 +73,7 @@ fn activate(args: SessionActivateArgs, overrides: PathOverrides, fallback: Fallb
     let common = &args.common;
     let result = (|| -> Result<SessionData, SessionFailure> {
         validate_common(common)?;
+        let phase = parse_phase_arg(args.phase.as_deref())?;
         let roots = resolve_roots(&overrides)
             .map_err(|err| SessionFailure::runtime("root-resolution-failed", err.to_string()))?;
         let catalog = load_catalog_from_roots(&roots)
@@ -76,15 +86,7 @@ fn activate(args: SessionActivateArgs, overrides: PathOverrides, fallback: Fallb
             validate_record_context(common, &roots.project_path, &record)?;
             record
         } else {
-            SessionRecord {
-                schema: RECORD_SCHEMA.to_string(),
-                session_hash: digest(common.session_id.trim().as_bytes()),
-                project_hash: project_hash(&roots.project_path),
-                product: common.product.as_str().to_string(),
-                active_intents: BTreeMap::new(),
-                activated_at: jiff::Timestamp::now().to_string(),
-                producer_version: env!("CARGO_PKG_VERSION").to_string(),
-            }
+            new_record(common, &roots.project_path)
         };
         for raw in &args.intent {
             let intent =
@@ -95,10 +97,11 @@ fn activate(args: SessionActivateArgs, overrides: PathOverrides, fallback: Fallb
                     format!("intent `{intent}` is not declared"),
                 ));
             }
-            let report = resolver::resolve_intent_with_catalog_for_product(
+            let report = resolver::resolve_intent_with_catalog_for_scope(
                 &intent,
                 &roots,
                 Some(common.product),
+                phase.clone(),
                 true,
                 fallback,
                 true,
@@ -106,17 +109,22 @@ fn activate(args: SessionActivateArgs, overrides: PathOverrides, fallback: Fallb
             );
             if report.has_unsatisfied_required() {
                 return Err(SessionFailure::data(
-                    "preflight-unsatisfied",
+                    unsatisfied_code(phase.as_ref()),
                     format!("strict preflight failed for `{intent}`"),
                 ));
             }
-            record
-                .active_intents
-                .insert(intent.to_string(), fingerprint(&report, &catalog)?);
+            store_activation(
+                &mut record,
+                &intent,
+                phase.as_ref(),
+                fingerprint(&report, &catalog)?,
+            );
         }
         record.activated_at = jiff::Timestamp::now().to_string();
         write_record(&path, &record)?;
-        data(&path, &common.state_home, &record, true)
+        let mut out = data(&path, &common.state_home, &record, true)?;
+        out.phase = phase.as_ref().map(|p| p.to_string());
+        Ok(out)
     })();
     render(common.format, "activate", result)
 }
@@ -131,6 +139,7 @@ fn prepare(args: SessionActivateArgs, overrides: PathOverrides, fallback: Fallba
     let common = &args.common;
     let result = (|| -> Result<SessionData, SessionFailure> {
         validate_common(common)?;
+        let phase = parse_phase_arg(args.phase.as_deref())?;
         let roots = resolve_roots(&overrides)
             .map_err(|err| SessionFailure::runtime("root-resolution-failed", err.to_string()))?;
         let catalog = load_catalog_from_roots(&roots)
@@ -143,15 +152,7 @@ fn prepare(args: SessionActivateArgs, overrides: PathOverrides, fallback: Fallba
             validate_record_context(common, &roots.project_path, &record)?;
             record
         } else {
-            SessionRecord {
-                schema: RECORD_SCHEMA.to_string(),
-                session_hash: digest(common.session_id.trim().as_bytes()),
-                project_hash: project_hash(&roots.project_path),
-                product: common.product.as_str().to_string(),
-                active_intents: BTreeMap::new(),
-                activated_at: jiff::Timestamp::now().to_string(),
-                producer_version: env!("CARGO_PKG_VERSION").to_string(),
-            }
+            new_record(common, &roots.project_path)
         };
         let mut prepared: Vec<String> = Vec::new();
         for raw in &args.intent {
@@ -163,10 +164,11 @@ fn prepare(args: SessionActivateArgs, overrides: PathOverrides, fallback: Fallba
                     format!("intent `{intent}` is not declared"),
                 ));
             }
-            let report = resolver::resolve_intent_with_catalog_for_product(
+            let report = resolver::resolve_intent_with_catalog_for_scope(
                 &intent,
                 &roots,
                 Some(common.product),
+                phase.clone(),
                 true,
                 fallback,
                 true,
@@ -174,24 +176,20 @@ fn prepare(args: SessionActivateArgs, overrides: PathOverrides, fallback: Fallba
             );
             if report.has_unsatisfied_required() {
                 return Err(SessionFailure::data(
-                    "preflight-unsatisfied",
+                    unsatisfied_code(phase.as_ref()),
                     format!("strict preflight failed for `{intent}`"),
                 ));
             }
             let fingerprint = fingerprint(&report, &catalog)?;
-            let key = intent.to_string();
-            let is_new = match record.active_intents.get(&key) {
-                Some(existing) => existing != &fingerprint,
-                None => true,
-            };
+            let is_new = store_activation(&mut record, &intent, phase.as_ref(), fingerprint);
             if is_new {
-                prepared.push(key.clone());
+                prepared.push(intent.to_string());
             }
-            record.active_intents.insert(key, fingerprint);
         }
         record.activated_at = jiff::Timestamp::now().to_string();
         write_record(&path, &record)?;
         let mut out = data(&path, &common.state_home, &record, true)?;
+        out.phase = phase.as_ref().map(|p| p.to_string());
         out.reason = Some(
             if prepared.is_empty() {
                 "already-current"
@@ -223,6 +221,7 @@ fn verify(args: SessionVerifyArgs, overrides: PathOverrides, fallback: FallbackM
     let common = &args.common;
     let result = (|| -> Result<SessionData, SessionFailure> {
         validate_common(common)?;
+        let phase = parse_phase_arg(args.phase.as_deref())?;
         let roots = resolve_roots(&overrides)
             .map_err(|err| SessionFailure::runtime("root-resolution-failed", err.to_string()))?;
         let catalog = load_catalog_from_roots(&roots)
@@ -233,31 +232,172 @@ fn verify(args: SessionVerifyArgs, overrides: PathOverrides, fallback: FallbackM
         for raw in &args.require_intent {
             let intent =
                 Context::parse(raw).map_err(|err| SessionFailure::data("invalid-intent", err))?;
-            let Some(stored) = record.active_intents.get(intent.as_str()) else {
-                return Err(SessionFailure::data(
-                    "missing-intent",
-                    format!("intent `{intent}` is not active"),
-                ));
-            };
-            let report = resolver::resolve_intent_with_catalog_for_product(
+            verify_intent(
                 &intent,
+                phase.as_ref(),
+                &record,
                 &roots,
-                Some(common.product),
-                true,
+                common.product,
                 fallback,
-                true,
                 &catalog,
-            );
-            if report.has_unsatisfied_required() || *stored != fingerprint(&report, &catalog)? {
-                return Err(SessionFailure::data(
-                    "stale-activation",
-                    format!("activation for `{intent}` no longer matches the resolved catalog"),
-                ));
-            }
+            )?;
         }
-        data(&path, &common.state_home, &record, true)
+        let mut out = data(&path, &common.state_home, &record, true)?;
+        out.phase = phase.as_ref().map(|p| p.to_string());
+        Ok(out)
     })();
     render(common.format, "verify", result)
+}
+
+/// Verify a single required intent.
+///
+/// With no phase, the intent must have a matching full activation (today's
+/// behavior). With a phase, verification passes on a matching phase-scoped
+/// activation OR a matching full (no-phase) activation, since a full prepare
+/// covers every phase's subset.
+#[allow(clippy::too_many_arguments)]
+fn verify_intent(
+    intent: &Context,
+    phase: Option<&Phase>,
+    record: &SessionRecord,
+    roots: &ResolvedRoots,
+    product: Product,
+    fallback: FallbackMode,
+    catalog: &LoadedCatalog,
+) -> Result<(), SessionFailure> {
+    let Some(phase) = phase else {
+        let Some(stored) = record.active_intents.get(intent.as_str()) else {
+            return Err(SessionFailure::data(
+                "missing-intent",
+                format!("intent `{intent}` is not active"),
+            ));
+        };
+        if !activation_matches(intent, None, stored, roots, product, fallback, catalog)? {
+            return Err(SessionFailure::data(
+                "stale-activation",
+                format!("activation for `{intent}` no longer matches the resolved catalog"),
+            ));
+        }
+        return Ok(());
+    };
+
+    let phase_stored = record
+        .active_phase_intents
+        .get(intent.as_str())
+        .and_then(|phases| phases.get(phase.as_str()));
+    let full_stored = record.active_intents.get(intent.as_str());
+    if phase_stored.is_none() && full_stored.is_none() {
+        return Err(SessionFailure::data(
+            "missing-intent",
+            format!("intent `{intent}` is not active for phase `{phase}`"),
+        ));
+    }
+
+    if let Some(stored) = phase_stored
+        && activation_matches(
+            intent,
+            Some(phase),
+            stored,
+            roots,
+            product,
+            fallback,
+            catalog,
+        )?
+    {
+        return Ok(());
+    }
+    if let Some(stored) = full_stored
+        && activation_matches(intent, None, stored, roots, product, fallback, catalog)?
+    {
+        return Ok(());
+    }
+    Err(SessionFailure::data(
+        "stale-activation",
+        format!(
+            "activation for `{intent}` no longer matches the resolved catalog for phase `{phase}`"
+        ),
+    ))
+}
+
+/// Whether a stored fingerprint still matches a freshly resolved, satisfied
+/// report for the intent at the given phase scope.
+#[allow(clippy::too_many_arguments)]
+fn activation_matches(
+    intent: &Context,
+    phase: Option<&Phase>,
+    stored: &str,
+    roots: &ResolvedRoots,
+    product: Product,
+    fallback: FallbackMode,
+    catalog: &LoadedCatalog,
+) -> Result<bool, SessionFailure> {
+    let report = resolver::resolve_intent_with_catalog_for_scope(
+        intent,
+        roots,
+        Some(product),
+        phase.cloned(),
+        true,
+        fallback,
+        true,
+        catalog,
+    );
+    Ok(!report.has_unsatisfied_required() && stored == fingerprint(&report, catalog)?)
+}
+
+fn parse_phase_arg(raw: Option<&str>) -> Result<Option<Phase>, SessionFailure> {
+    match raw {
+        None => Ok(None),
+        Some(raw) => Phase::parse(raw)
+            .map(Some)
+            .map_err(|err| SessionFailure::data("invalid-phase", err)),
+    }
+}
+
+fn new_record(common: &SessionCommonArgs, project: &Path) -> SessionRecord {
+    SessionRecord {
+        schema: RECORD_SCHEMA.to_string(),
+        session_hash: digest(common.session_id.trim().as_bytes()),
+        project_hash: project_hash(project),
+        product: common.product.as_str().to_string(),
+        active_intents: BTreeMap::new(),
+        active_phase_intents: BTreeMap::new(),
+        activated_at: jiff::Timestamp::now().to_string(),
+        producer_version: env!("CARGO_PKG_VERSION").to_string(),
+    }
+}
+
+/// Store an activation fingerprint for `intent` at the given phase scope and
+/// return whether it was newly added or refreshed. A no-phase activation lives
+/// in `active_intents` (byte-compatible with pre-phase records); a phase-scoped
+/// activation lives in `active_phase_intents[intent][phase]`.
+fn store_activation(
+    record: &mut SessionRecord,
+    intent: &Context,
+    phase: Option<&Phase>,
+    fingerprint: String,
+) -> bool {
+    let key = intent.to_string();
+    match phase {
+        Some(phase) => {
+            let phases = record.active_phase_intents.entry(key).or_default();
+            let is_new = phases.get(phase.as_str()) != Some(&fingerprint);
+            phases.insert(phase.as_str().to_string(), fingerprint);
+            is_new
+        }
+        None => {
+            let is_new = record.active_intents.get(&key) != Some(&fingerprint);
+            record.active_intents.insert(key, fingerprint);
+            is_new
+        }
+    }
+}
+
+fn unsatisfied_code(phase: Option<&Phase>) -> &'static str {
+    if phase.is_some() {
+        "phase-unsatisfied"
+    } else {
+        "preflight-unsatisfied"
+    }
 }
 
 fn validate_common(common: &SessionCommonArgs) -> Result<(), SessionFailure> {
@@ -367,9 +507,15 @@ fn data(
             "session record path is outside the configured state home",
         )
     })?;
+    // The active-intent list is the union of full and phase-scoped activations.
+    // For a no-phase record `active_phase_intents` is empty, so the set reduces
+    // to the sorted `active_intents` keys and the output stays byte-identical.
+    let mut active: BTreeSet<String> = record.active_intents.keys().cloned().collect();
+    active.extend(record.active_phase_intents.keys().cloned());
     Ok(SessionData {
         product: record.product.clone(),
-        active_intents: record.active_intents.keys().cloned().collect(),
+        phase: None,
+        active_intents: active.into_iter().collect(),
         record_file: record_file.to_string_lossy().replace('\\', "/"),
         verified,
         prepared_intents: None,
