@@ -105,6 +105,13 @@ const AGENT_LAUNCH_PROFILE_READINESS_TIMEOUT: Duration = Duration::from_secs(2);
 std::thread_local! {
     static PANIC_AGENT_LAUNCH_PROFILE_READINESS_PROBE: std::cell::Cell<bool> =
         const { std::cell::Cell::new(false) };
+    static BLOCK_AGENT_LAUNCH_PROFILE_READINESS_PROBE: std::cell::RefCell<Option<(
+        std::sync::mpsc::SyncSender<()>,
+        std::sync::mpsc::Receiver<()>,
+    )>> = const { std::cell::RefCell::new(None) };
+    static SIGNAL_AGENT_LAUNCH_PROFILE_READINESS_WAITER: std::cell::RefCell<
+        Option<std::sync::mpsc::SyncSender<()>>,
+    > = const { std::cell::RefCell::new(None) };
 }
 const ATTACH_SCHEMA_VERSION: &str = "agent-session.attach.v1";
 const ATTACH_EVENT_SCHEMA_VERSION: &str = "agent-session.attach.event.v1";
@@ -359,6 +366,14 @@ impl AgentLaunchProfiles {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if state.refreshing {
             let generation = state.generation;
+            #[cfg(test)]
+            SIGNAL_AGENT_LAUNCH_PROFILE_READINESS_WAITER.with(|signal| {
+                if let Some(signal) = signal.borrow_mut().take() {
+                    signal
+                        .send(())
+                        .expect("readiness waiter observer should remain connected");
+                }
+            });
             while state.refreshing && state.generation == generation {
                 state = completed
                     .wait(state)
@@ -381,12 +396,22 @@ impl AgentLaunchProfiles {
 
     fn probe_ready_summaries(&self) -> Vec<AgentLaunchProfileSummary> {
         #[cfg(test)]
-        PANIC_AGENT_LAUNCH_PROFILE_READINESS_PROBE.with(|panic_next| {
-            assert!(
-                !panic_next.replace(false),
-                "injected launch profile readiness panic"
-            );
+        BLOCK_AGENT_LAUNCH_PROFILE_READINESS_PROBE.with(|block| {
+            if let Some((claimed, release)) = block.borrow_mut().take() {
+                claimed
+                    .send(())
+                    .expect("readiness owner observer should remain connected");
+                release
+                    .recv()
+                    .expect("readiness owner release should remain connected");
+            }
         });
+        #[cfg(test)]
+        assert!(
+            !PANIC_AGENT_LAUNCH_PROFILE_READINESS_PROBE
+                .with(|panic_next| panic_next.replace(false)),
+            "injected launch profile readiness panic"
+        );
         std::thread::scope(|scope| {
             self.entries
                 .iter()
@@ -6249,24 +6274,78 @@ mod tests {
 
     #[test]
     fn launch_profile_readiness_unwind_releases_single_flight_owner() {
-        let profiles = AgentLaunchProfiles::default();
-        PANIC_AGENT_LAUNCH_PROFILE_READINESS_PROBE.with(|panic_next| panic_next.set(true));
+        let profiles = AgentLaunchProfiles::from_json(
+            &json!([{
+                "id":"claude-gpt",
+                "label":"Claude GPT",
+                "agent":"claude",
+                "agent_bin":"/bin/true",
+            }])
+            .to_string(),
+        )
+        .unwrap();
+        assert_eq!(profiles.ready_summaries().len(), 1);
 
+        let (owner_claimed_tx, owner_claimed_rx) = std::sync::mpsc::sync_channel(0);
+        let (release_owner_tx, release_owner_rx) = std::sync::mpsc::sync_channel(0);
+        let owner_profiles = profiles.clone();
+        let owner = std::thread::spawn(move || {
+            PANIC_AGENT_LAUNCH_PROFILE_READINESS_PROBE.with(|panic_next| panic_next.set(true));
+            BLOCK_AGENT_LAUNCH_PROFILE_READINESS_PROBE.with(|block| {
+                *block.borrow_mut() = Some((owner_claimed_tx, release_owner_rx));
+            });
+            assert!(
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    owner_profiles.ready_summaries()
+                }))
+                .is_err()
+            );
+        });
+        owner_claimed_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("readiness owner should claim the single-flight refresh");
+
+        let (waiter_waiting_tx, waiter_waiting_rx) = std::sync::mpsc::sync_channel(0);
+        let (waiter_done_tx, waiter_done_rx) = std::sync::mpsc::sync_channel(0);
+        let waiter_profiles = profiles.clone();
+        let waiter = std::thread::spawn(move || {
+            SIGNAL_AGENT_LAUNCH_PROFILE_READINESS_WAITER.with(|signal| {
+                *signal.borrow_mut() = Some(waiter_waiting_tx);
+            });
+            waiter_done_tx
+                .send(waiter_profiles.ready_summaries())
+                .expect("readiness waiter result should remain connected");
+        });
+        waiter_waiting_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("a second caller should wait behind the refresh owner");
+        release_owner_tx
+            .send(())
+            .expect("readiness owner should remain connected");
+
+        let summaries = waiter_done_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("the unwind guard should wake the readiness waiter");
+        owner.join().unwrap();
+        waiter.join().unwrap();
         assert!(
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                profiles.ready_summaries()
-            }))
-            .is_err()
+            summaries.is_empty(),
+            "a waiter released after unwind must not receive stale readiness"
         );
         let (readiness, _) = &*profiles.readiness_probe;
+        let state = readiness
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         assert!(
-            !readiness
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .refreshing,
-            "a panicking probe must release single-flight ownership"
+            !state.refreshing,
+            "a panicking probe must release ownership"
         );
-        assert!(profiles.ready_summaries().is_empty());
+        assert!(
+            state.summaries.is_empty(),
+            "unwind must clear cached readiness"
+        );
+        drop(state);
+        assert_eq!(profiles.ready_summaries().len(), 1);
     }
 
     #[test]
