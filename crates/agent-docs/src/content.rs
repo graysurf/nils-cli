@@ -15,14 +15,17 @@ pub fn validate(path: &Path, entry: &DocumentEntry) -> DocumentValidation {
     let Ok(raw) = std::fs::read_to_string(path) else {
         return DocumentValidation::missing();
     };
+    validate_content(&raw, entry)
+}
 
+pub fn validate_content(raw: &str, entry: &DocumentEntry) -> DocumentValidation {
     let non_empty = !raw.trim().is_empty();
 
     let marker_present = entry.marker.as_deref().map(|marker| raw.contains(marker));
 
     let freshness = match entry.freshness_days {
         None => FreshnessCheck::NotDeclared,
-        Some(window_days) => evaluate_freshness(&raw, window_days),
+        Some(window_days) => evaluate_freshness(raw, window_days),
     };
 
     let marker_ok = marker_present.unwrap_or(true);

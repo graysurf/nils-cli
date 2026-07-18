@@ -1,5 +1,6 @@
 #![allow(dead_code)]
 
+use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -14,6 +15,8 @@ pub struct TestEnv {
     _temp: TempDir,
     pub docs_home: PathBuf,
     pub project: PathBuf,
+    home: PathBuf,
+    xdg: PathBuf,
 }
 
 #[derive(Debug)]
@@ -43,12 +46,18 @@ impl TestEnv {
         let temp = TempDir::new().expect("create temp dir");
         let docs_home = temp.path().join("docs-home");
         let project = temp.path().join("project");
+        let home = temp.path().join("home");
+        let xdg = temp.path().join("xdg");
         fs::create_dir_all(&docs_home).expect("create docs-home");
         fs::create_dir_all(&project).expect("create project");
+        fs::create_dir_all(&home).expect("create home");
+        fs::create_dir_all(&xdg).expect("create xdg");
         Self {
             _temp: temp,
             docs_home,
             project,
+            home,
+            xdg,
         }
     }
 
@@ -88,7 +97,13 @@ impl TestEnv {
         full.extend_from_slice(args);
         let options = cmd::CmdOptions::default()
             .with_cwd(&self.project)
-            .with_env_remove("AGENT_DOCS_HOME");
+            .with_env("HOME", self.home.to_str().expect("utf-8 home"))
+            .with_env(
+                "XDG_CONFIG_HOME",
+                self.xdg.to_str().expect("utf-8 xdg config home"),
+            )
+            .with_env_remove("AGENT_DOCS_HOME")
+            .with_env_remove("PROJECT_PATH");
         run_cli(&full, &options)
     }
 }
@@ -109,6 +124,16 @@ pub fn write(path: &Path, body: &str) {
 /// Low-level invocation with full control over args / cwd / env (no auto flags).
 pub fn run_cli(args: &[&str], options: &cmd::CmdOptions) -> CliOutput {
     let output = cmd::run_resolved("agent-docs", args, options);
+    CliOutput {
+        code: output.code,
+        stdout: output.stdout_text(),
+        stderr: output.stderr_text(),
+    }
+}
+
+/// Low-level invocation with platform-native args for non-UTF path coverage.
+pub fn run_cli_os(args: &[&OsStr], options: &cmd::CmdOptions) -> CliOutput {
+    let output = cmd::run_resolved_os("agent-docs", args, options);
     CliOutput {
         code: output.code,
         stdout: output.stdout_text(),
