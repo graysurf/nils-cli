@@ -10406,7 +10406,7 @@ mod tests {
         }
 
         let error = supervise_process_with_owner(
-            OsString::from("/bin/true"),
+            OsString::from(true_executable()),
             &[],
             &mut CleanupFailingOwner,
             None,
