@@ -7143,6 +7143,70 @@ printf '%s\n' '{"schema_version":"agent-session.codex-auth-broker.v1","account":
     }
 
     #[tokio::test]
+    async fn submit_prompt_rejects_response_without_acknowledged_turn_id() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let socket_path = tmp.path().join("missing-turn-id.sock");
+        let listener = tokio::net::UnixListener::bind(&socket_path).unwrap();
+        let context = CliContext {
+            state_dir: tmp.path().join("state"),
+            host: None,
+        };
+        let record = record_with_runtime("missing-turn-id", &socket_path);
+        fs::create_dir_all(crate::session_dir(&context, &record.id)).unwrap();
+        crate::write_session_record(&context, &record).unwrap();
+        bind_thread(&record, "thread-missing-turn-id").unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let initialize = receive_json(&mut socket).await;
+            respond(&mut socket, &initialize, json!({})).await;
+            assert_eq!(receive_json(&mut socket).await["method"], "initialized");
+            let loaded = receive_json(&mut socket).await;
+            assert_eq!(loaded["method"], "thread/loaded/list");
+            respond(
+                &mut socket,
+                &loaded,
+                json!({ "data": ["thread-missing-turn-id"], "nextCursor": null }),
+            )
+            .await;
+            let resume = receive_json(&mut socket).await;
+            assert_eq!(resume["method"], "thread/resume");
+            respond(&mut socket, &resume, json!({})).await;
+            let usage = receive_json(&mut socket).await;
+            assert_eq!(usage["method"], "account/rateLimits/read");
+            respond(
+                &mut socket,
+                &usage,
+                json!({ "rateLimits": { "primary": { "usedPercent": 1 } } }),
+            )
+            .await;
+            let prompt = receive_json(&mut socket).await;
+            assert_eq!(prompt["method"], "turn/start");
+            respond(
+                &mut socket,
+                &prompt,
+                json!({ "turn": { "status": "inProgress" } }),
+            )
+            .await;
+        });
+        let (handle, commands) = control_channel();
+        let control = tokio::spawn(run_control(context, record, commands));
+
+        let error = handle
+            .submit_prompt("must require an acknowledged turn id")
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error,
+            "Codex turn/start response omitted the acknowledged turn id"
+        );
+        server.await.unwrap();
+        drop(handle);
+        control.abort();
+        let _ = control.await;
+    }
+
+    #[tokio::test]
     async fn failed_reconnect_waits_for_explicit_rebind_before_thread_discovery() {
         let lock = GlobalStateLock::new();
         let tmp = tempfile::TempDir::new().unwrap();

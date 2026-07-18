@@ -292,8 +292,14 @@ is no second state model.
   `PUT /sessions/{id}/account`,
   `PUT /sessions/{id}/auto-resume`, `DELETE /sessions/{id}/auto-resume`,
   `POST /sessions/{id}/attachments?filename=...`, `DELETE /sessions/{id}` — writes, require a bearer token.
-- `POST /sessions/{id}/prompt` submits exact prompt text through a supported provider control plane. This versioned mutation never
-  sends multiline text through terminal keys; unsupported or not-yet-ready sessions fail closed.
+- `POST /sessions/{id}/prompt` submits exact prompt text through a supported provider control plane. The compatibility route accepts
+  `{ "text": "...", "expected_session_incarnation": "launch-id" }`; the incarnation is optional for older clients, and
+  a new daemon validates it against the authoritative runtime under the session-record lock before provider dispatch.
+  Clients that require a cross-version fence use `POST /sessions/{id}/prompt/v2`, which requires both fields, rejects
+  unknown fields, and is absent from older daemons so they fail before provider dispatch. A replacement returns HTTP 409
+  `session-incarnation-conflict` without submitting. Success returns `submitted: true` plus the locked
+  `session_incarnation`, while the provider turn id remains private. These mutations never send multiline text through
+  terminal keys; unsupported or not-yet-ready sessions fail closed.
 - `PUT /sessions/{id}/account` accepts
   `{ "account": "nickname", "expected_session_incarnation": "launch-id" }`
   only for
