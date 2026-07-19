@@ -1,7 +1,7 @@
 //! Integration coverage for `agent-runtime doctor --class version-alignment`.
 
 use agent_runtime::doctor::version_alignment::{
-    AlignmentInputs, NilsCliPin, PinManifest, VersionAlignmentError, evaluate,
+    AlignmentInputs, NilsCliPin, PinManifest, VersionAlignmentError, check, evaluate,
 };
 use nils_test_support::bin;
 use nils_test_support::cmd::{self, CmdOutput};
@@ -78,6 +78,7 @@ fn version_alignment_public_v1_input_api_remains_constructible() {
         expected: 1,
         found: 99,
     };
+    assert_eq!(error.supported_schema_versions(), Some(&[1, 2][..]));
     let (kind, expected): (&str, u32) = match error {
         VersionAlignmentError::MissingPin => ("missing-pin", 0),
         VersionAlignmentError::Missing { .. } => ("missing", 0),
@@ -110,6 +111,20 @@ fn write_pin(tmp: &TempDir, body: &str) -> String {
     let path = tmp.path().join("pin.yaml");
     write(&path, body);
     path.to_string_lossy().into_owned()
+}
+
+#[test]
+fn version_alignment_schema_v2_rust_report_does_not_alias_validated_as_pin() {
+    let mmp = host_mmp();
+    let tag = format!("v{mmp}");
+    let tmp = TempDir::new().unwrap();
+    let pin = write_pin(&tmp, &version_policy_manifest(&tag, &tag, &[]));
+
+    let report = check(Path::new(&pin), &mmp).unwrap();
+
+    assert_eq!(report.pinned_tag, "");
+    assert_eq!(report.validated_tag(), Some(tag.as_str()));
+    assert_eq!(report.minimum_supported_tag(), Some(tag.as_str()));
 }
 
 #[test]

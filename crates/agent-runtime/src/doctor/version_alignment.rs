@@ -18,6 +18,7 @@ use thiserror::Error;
 pub const CLASS: &str = "version-alignment";
 pub const PIN_SCHEMA_VERSION: u32 = 1;
 pub const VERSION_POLICY_SCHEMA_VERSION: u32 = 2;
+pub const SUPPORTED_SCHEMA_VERSIONS: &[u32] = &[PIN_SCHEMA_VERSION, VERSION_POLICY_SCHEMA_VERSION];
 pub const HOST_CHECK: &str = "version-alignment.host";
 pub const MINIMUM_CHECK: &str = "version-alignment.minimum";
 pub const VALIDATED_CHECK: &str = "version-alignment.validated";
@@ -98,6 +99,8 @@ pub struct AlignmentInputs<'a> {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VersionAlignmentReport {
+    /// Exact schema-v1 pin. Empty for schema v2; use [`Self::validated_tag`]
+    /// and [`Self::minimum_supported_tag`] for compatibility policies.
     pub pinned_tag: String,
     pub host_observed: Option<String>,
     pub items: Vec<AlignmentItem>,
@@ -212,7 +215,7 @@ fn evaluate_normalized(inputs: &NormalizedAlignmentInputs) -> VersionAlignmentRe
     let host = Version::parse(inputs.host_raw);
     let host_observed = host.map(|v| v.to_string());
 
-    let (pinned_tag, _minimum_supported_tag, validated_tag) = match &manifest.nils_cli {
+    let pinned_tag = match &manifest.nils_cli {
         NilsCliPolicy::Exact { pinned_tag } => {
             let pinned = Version::parse(pinned_tag);
             let (severity, message) = match (pinned, host) {
@@ -248,7 +251,7 @@ fn evaluate_normalized(inputs: &NormalizedAlignmentInputs) -> VersionAlignmentRe
                     "host", HOST_CHECK, None, None, message,
                 ));
             }
-            (Some(pinned_tag.clone()), None, None)
+            Some(pinned_tag.clone())
         }
         NilsCliPolicy::Compatibility {
             minimum_supported_tag,
@@ -357,11 +360,7 @@ fn evaluate_normalized(inputs: &NormalizedAlignmentInputs) -> VersionAlignmentRe
                 )),
             }
 
-            (
-                None,
-                Some(minimum_supported_tag.clone()),
-                Some(validated_tag.clone()),
-            )
+            None
         }
     };
 
@@ -418,9 +417,7 @@ fn evaluate_normalized(inputs: &NormalizedAlignmentInputs) -> VersionAlignmentRe
     }
 
     VersionAlignmentReport {
-        pinned_tag: pinned_tag
-            .or(validated_tag)
-            .expect("normalized policies always carry one version role"),
+        pinned_tag: pinned_tag.unwrap_or_default(),
         host_observed,
         items,
         findings,
@@ -449,9 +446,19 @@ pub enum VersionAlignmentError {
     #[error("schema_version mismatch in {path}: supported schema versions 1 and 2, got {found}")]
     SchemaVersion {
         path: PathBuf,
+        /// Historical schema-v1 scalar retained for source compatibility.
+        /// Use [`VersionAlignmentError::supported_schema_versions`] for the
+        /// complete accepted set.
         expected: u32,
         found: u32,
     },
+}
+
+impl VersionAlignmentError {
+    /// Returns the complete accepted schema set for schema-version errors.
+    pub fn supported_schema_versions(&self) -> Option<&'static [u32]> {
+        matches!(self, Self::SchemaVersion { .. }).then_some(SUPPORTED_SCHEMA_VERSIONS)
+    }
 }
 
 /// Read + parse the pin manifest (YAML or JSON), gather `<bin> --version`
