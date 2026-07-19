@@ -96,21 +96,81 @@ pub struct AlignmentInputs<'a> {
     pub required_raw: &'a BTreeMap<String, String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VersionAlignmentReport {
-    pub policy_schema_version: u32,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub pinned_tag: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub minimum_supported_tag: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub validated_tag: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pinned_tag: String,
     pub host_observed: Option<String>,
     pub items: Vec<AlignmentItem>,
     pub findings: Vec<DoctorFinding>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub acceptance_boundary: Option<String>,
+}
+
+impl VersionAlignmentReport {
+    pub fn policy_schema_version(&self) -> u32 {
+        if self
+            .items
+            .iter()
+            .any(|item| matches!(item.check, MINIMUM_CHECK | VALIDATED_CHECK))
+        {
+            VERSION_POLICY_SCHEMA_VERSION
+        } else {
+            PIN_SCHEMA_VERSION
+        }
+    }
+
+    pub fn schema_pinned_tag(&self) -> Option<&str> {
+        (self.policy_schema_version() == PIN_SCHEMA_VERSION).then_some(self.pinned_tag.as_str())
+    }
+
+    pub fn minimum_supported_tag(&self) -> Option<&str> {
+        self.items
+            .iter()
+            .find(|item| item.check == MINIMUM_CHECK)
+            .and_then(|item| item.expected.strip_prefix(">= "))
+    }
+
+    pub fn validated_tag(&self) -> Option<&str> {
+        self.items
+            .iter()
+            .find(|item| item.check == VALIDATED_CHECK)
+            .map(|item| item.expected.as_str())
+    }
+}
+
+#[derive(Serialize)]
+struct VersionAlignmentReportWire<'a> {
+    policy_schema_version: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pinned_tag: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    minimum_supported_tag: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    validated_tag: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    host_observed: Option<&'a str>,
+    items: &'a [AlignmentItem],
+    findings: &'a [DoctorFinding],
+    #[serde(skip_serializing_if = "Option::is_none")]
+    acceptance_boundary: Option<&'a str>,
+}
+
+impl Serialize for VersionAlignmentReport {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        VersionAlignmentReportWire {
+            policy_schema_version: self.policy_schema_version(),
+            pinned_tag: self.schema_pinned_tag(),
+            minimum_supported_tag: self.minimum_supported_tag(),
+            validated_tag: self.validated_tag(),
+            host_observed: self.host_observed.as_deref(),
+            items: &self.items,
+            findings: &self.findings,
+            acceptance_boundary: self.acceptance_boundary.as_deref(),
+        }
+        .serialize(serializer)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -152,7 +212,7 @@ fn evaluate_normalized(inputs: &NormalizedAlignmentInputs) -> VersionAlignmentRe
     let host = Version::parse(inputs.host_raw);
     let host_observed = host.map(|v| v.to_string());
 
-    let (pinned_tag, minimum_supported_tag, validated_tag) = match &manifest.nils_cli {
+    let (pinned_tag, _minimum_supported_tag, validated_tag) = match &manifest.nils_cli {
         NilsCliPolicy::Exact { pinned_tag } => {
             let pinned = Version::parse(pinned_tag);
             let (severity, message) = match (pinned, host) {
@@ -358,10 +418,9 @@ fn evaluate_normalized(inputs: &NormalizedAlignmentInputs) -> VersionAlignmentRe
     }
 
     VersionAlignmentReport {
-        policy_schema_version: manifest.schema_version,
-        pinned_tag,
-        minimum_supported_tag,
-        validated_tag,
+        pinned_tag: pinned_tag
+            .or(validated_tag)
+            .expect("normalized policies always carry one version role"),
         host_observed,
         items,
         findings,
@@ -387,10 +446,10 @@ pub enum VersionAlignmentError {
         #[source]
         source: serde_yaml_ng::Error,
     },
-    #[error("schema_version mismatch in {path}: expected one of {expected}, got {found}")]
+    #[error("schema_version mismatch in {path}: expected {expected}, got {found}")]
     SchemaVersion {
         path: PathBuf,
-        expected: &'static str,
+        expected: u32,
         found: u32,
     },
     #[error("invalid version policy in {path}: {message}")]
@@ -449,7 +508,7 @@ pub fn check(
         }
         found => Err(VersionAlignmentError::SchemaVersion {
             path: pin_path.to_path_buf(),
-            expected: "1, 2",
+            expected: PIN_SCHEMA_VERSION,
             found,
         }),
     }

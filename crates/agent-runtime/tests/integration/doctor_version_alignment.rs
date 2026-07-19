@@ -1,7 +1,7 @@
 //! Integration coverage for `agent-runtime doctor --class version-alignment`.
 
 use agent_runtime::doctor::version_alignment::{
-    AlignmentInputs, NilsCliPin, PinManifest, evaluate,
+    AlignmentInputs, NilsCliPin, PinManifest, VersionAlignmentError, evaluate,
 };
 use nils_test_support::bin;
 use nils_test_support::cmd::{self, CmdOutput};
@@ -65,11 +65,24 @@ fn version_alignment_legacy_public_input_api_remains_constructible() {
     };
     let required_raw = BTreeMap::new();
 
-    let _ = evaluate(&AlignmentInputs {
+    let report = evaluate(&AlignmentInputs {
         manifest: &manifest,
         host_raw: "1.2.3",
         required_raw: &required_raw,
     });
+    let pinned_tag: String = report.pinned_tag;
+    assert_eq!(pinned_tag, "v1.2.3");
+
+    let error = VersionAlignmentError::SchemaVersion {
+        path: PathBuf::from("pin.yaml"),
+        expected: 1,
+        found: 99,
+    };
+    let expected: u32 = match error {
+        VersionAlignmentError::SchemaVersion { expected, .. } => expected,
+        _ => unreachable!(),
+    };
+    assert_eq!(expected, 1);
 }
 
 fn version_policy_manifest(
