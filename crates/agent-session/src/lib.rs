@@ -4,6 +4,7 @@ mod cli;
 mod codex_account;
 mod codex_app_server;
 pub mod completion;
+mod coordination;
 mod maintenance;
 mod provider_prompt;
 mod serve;
@@ -105,6 +106,8 @@ const DELETE_TMUX_PRIOR_IDENTITIES_KEY: &str = "delete_tmux_prior_identities";
 const DELETE_TMUX_TERMINATION_STATE_KEY: &str = "delete_tmux_termination_state";
 const TMUX_RUNTIME_NEVER_LAUNCHED_KEY: &str = "tmux_runtime_never_launched";
 const TMUX_RUNTIME_IDENTITY_CHANGED_OUTPUT: &str = "agent-session-runtime-identity-changed";
+const COORDINATION_LAUNCH_GATE: &str = "launch-ready";
+const HELD_LAUNCH_SCRIPT: &str = "gate=$1; heartbeat=$2; capability=$3; incarnation=$4; generation=$5; broker_bin=$6; shift 6; done_file=\"${heartbeat}.done.$$\"; umask 077; \"$broker_bin\" --state-dir \"$AGENT_SESSION_STATE_DIR\" broker heartbeat --session \"$AGENT_SESSION_ID\" --incarnation \"$incarnation\" --generation \"$generation\" --capability-file \"$capability\" --format json >/dev/null 2>&1 & broker_pid=$!; while [ ! -f \"$gate\" ]; do sleep 0.01; done; (\"$@\"; status=$?; printf '%s\\n' \"$status\" > \"$done_file\"; exit \"$status\") & child=$!; wait \"$child\"; status=$?; kill \"$broker_pid\" >/dev/null 2>&1 || true; wait \"$broker_pid\" >/dev/null 2>&1 || true; \"$broker_bin\" --state-dir \"$AGENT_SESSION_STATE_DIR\" broker stop --session \"$AGENT_SESSION_ID\" --capability-file \"$capability\" --format json >/dev/null 2>&1 || true; rm -f \"$done_file\" \"$capability\"; exit \"$status\"";
 
 pub fn run() -> i32 {
     run_with_args(env::args_os())
@@ -136,6 +139,9 @@ where
                 _ => "parse-error",
             };
             let message = render_clap_message(&err);
+            if let Some(command) = coordination_leaf_from_raw_args(&raw_args) {
+                return render_error(command, format, CliError::usage(code, message, None));
+            }
             return emit_parse_error(BINARY, format, code, &message);
         }
     };
@@ -152,7 +158,11 @@ fn dispatch(cli: Cli) -> i32 {
     let context = match CliContext::resolve(cli.state_dir, cli.host) {
         Ok(context) => context,
         Err(err) => {
-            return render_error("error", format, err);
+            return render_error(
+                coordination_command_name(&cli.command).unwrap_or("error"),
+                format,
+                err,
+            );
         }
     };
 
@@ -167,11 +177,73 @@ fn dispatch(cli: Cli) -> i32 {
         Command::Glance(args) => run_glance(&context, args),
         Command::Resume(args) => run_resume(&context, args),
         Command::Activity(args) => run_activity(&context, args),
+        Command::WorkContext(args) => coordination::run_work_context(&context, args),
+        Command::Broker(args) => coordination::run_broker(&context, args),
+        Command::Message(args) => coordination::run_message(&context, args),
         Command::Serve(args) => serve::run_serve(&context, args),
         Command::CodexAppServerProxy(args) => codex_app_server::run_proxy(&context, args),
         Command::Delete(args) => run_delete(&context, args),
         Command::Completion(_) => unreachable!("completion is handled before context resolution"),
     }
+}
+
+fn coordination_command_name(command: &Command) -> Option<&'static str> {
+    match command {
+        Command::WorkContext(args) => Some(match &args.command {
+            cli::WorkContextCommand::Claim(_) => "work-context-claim",
+            cli::WorkContextCommand::Show(_) => "work-context-show",
+            cli::WorkContextCommand::Check(_) => "work-context-check",
+            cli::WorkContextCommand::Renew(_) => "work-context-renew",
+            cli::WorkContextCommand::Release(_) => "work-context-release",
+            cli::WorkContextCommand::Admit(_) => "work-context-admit",
+            cli::WorkContextCommand::Complete(_) => "work-context-complete",
+            cli::WorkContextCommand::Reconcile(_) => "work-context-reconcile",
+        }),
+        Command::Broker(args) => Some(match &args.command {
+            cli::BrokerCommand::Status(_) => "broker-status",
+            cli::BrokerCommand::Adopt(_) => "broker-adopt",
+            cli::BrokerCommand::Reconcile(_) => "broker-reconcile",
+            cli::BrokerCommand::Stop(_) => "broker-stop",
+            cli::BrokerCommand::Heartbeat(_) => "broker-heartbeat",
+        }),
+        Command::Message(args) => Some(match &args.command {
+            cli::MessageCommand::Send(_) => "message-send",
+            cli::MessageCommand::Inbox(_) => "message-inbox",
+            cli::MessageCommand::Show(_) => "message-show",
+            cli::MessageCommand::Ack(_) => "message-ack",
+            cli::MessageCommand::Reply(_) => "message-reply",
+            cli::MessageCommand::Wait(_) => "message-wait",
+        }),
+        _ => None,
+    }
+}
+
+fn coordination_leaf_from_raw_args(args: &[OsString]) -> Option<&'static str> {
+    args.windows(2).find_map(|pair| {
+        let group = pair[0].to_str()?;
+        let leaf = pair[1].to_str()?;
+        match (group, leaf) {
+            ("work-context", "claim") => Some("work-context-claim"),
+            ("work-context", "show") => Some("work-context-show"),
+            ("work-context", "check") => Some("work-context-check"),
+            ("work-context", "renew") => Some("work-context-renew"),
+            ("work-context", "release") => Some("work-context-release"),
+            ("work-context", "admit") => Some("work-context-admit"),
+            ("work-context", "complete") => Some("work-context-complete"),
+            ("work-context", "reconcile") => Some("work-context-reconcile"),
+            ("broker", "status") => Some("broker-status"),
+            ("broker", "adopt") => Some("broker-adopt"),
+            ("broker", "reconcile") => Some("broker-reconcile"),
+            ("broker", "stop") => Some("broker-stop"),
+            ("message", "send") => Some("message-send"),
+            ("message", "inbox") => Some("message-inbox"),
+            ("message", "show") => Some("message-show"),
+            ("message", "ack") => Some("message-ack"),
+            ("message", "reply") => Some("message-reply"),
+            ("message", "wait") => Some("message-wait"),
+            _ => None,
+        }
+    })
 }
 
 fn command_format(command: &Command) -> OutputFormat {
@@ -190,6 +262,30 @@ fn command_format(command: &Command) -> OutputFormat {
             cli::ActivityCommand::Hook(_) | cli::ActivityCommand::Notify(_) => OutputFormat::Text,
             cli::ActivityCommand::Doctor(args) => args.format,
             cli::ActivityCommand::Setup(args) => args.format,
+        },
+        Command::WorkContext(args) => match &args.command {
+            cli::WorkContextCommand::Claim(args) => args.format,
+            cli::WorkContextCommand::Show(args) => args.format,
+            cli::WorkContextCommand::Check(args) => args.format,
+            cli::WorkContextCommand::Renew(args) => args.format,
+            cli::WorkContextCommand::Release(args) => args.format,
+            cli::WorkContextCommand::Admit(args) => args.format,
+            cli::WorkContextCommand::Complete(args) => args.format,
+            cli::WorkContextCommand::Reconcile(args) => args.format,
+        },
+        Command::Broker(args) => match &args.command {
+            cli::BrokerCommand::Status(args) => args.format,
+            cli::BrokerCommand::Adopt(args) | cli::BrokerCommand::Reconcile(args) => args.format,
+            cli::BrokerCommand::Stop(args) => args.format,
+            cli::BrokerCommand::Heartbeat(args) => args.format,
+        },
+        Command::Message(args) => match &args.command {
+            cli::MessageCommand::Send(args) => args.format,
+            cli::MessageCommand::Inbox(args) => args.format,
+            cli::MessageCommand::Show(args) => args.format,
+            cli::MessageCommand::Ack(args) => args.format,
+            cli::MessageCommand::Reply(args) => args.format,
+            cli::MessageCommand::Wait(args) => args.format,
         },
         Command::Delete(args) => args.format,
         Command::Attach(_)
@@ -1128,6 +1224,8 @@ struct SessionView {
     startup: Option<StartupProjection>,
     auto_resume: auto_resume::AutoResumeView,
     codex_account: codex_account::CodexAccountView,
+    #[serde(flatten)]
+    coordination: coordination::CoordinationSummary,
 }
 
 #[derive(Debug)]
@@ -1230,6 +1328,8 @@ struct GlanceResult {
     #[serde(skip_serializing_if = "Option::is_none")]
     startup: Option<StartupProjection>,
     auto_resume: auto_resume::AutoResumeView,
+    #[serde(flatten)]
+    coordination: coordination::CoordinationSummary,
 }
 
 #[derive(Debug, Serialize)]
@@ -1465,6 +1565,28 @@ fn start_session(
         cleanup_created_record(context, &created);
         return Err(err);
     }
+    if let Err(err) = establish_coordination_broker(context, &created.record) {
+        recover_failed_tmux_launch(
+            context,
+            &mut created.record,
+            &tmux_bin,
+            Some(&launch_identity),
+            SessionTerminationOperation::FailedLaunch,
+        )?;
+        cleanup_created_record(context, &created);
+        return Err(err);
+    }
+    if let Err(err) = release_held_runtime(context, &created.record) {
+        recover_failed_tmux_launch(
+            context,
+            &mut created.record,
+            &tmux_bin,
+            Some(&launch_identity),
+            SessionTerminationOperation::FailedLaunch,
+        )?;
+        cleanup_created_record(context, &created);
+        return Err(err);
+    }
     let _ = advance_owned_startup_stage(context, &mut created.record, "runtime");
     if created.prompt_file.is_some() {
         if args.paste_delay_ms > 0 {
@@ -1580,6 +1702,28 @@ fn start_run_session(context: &CliContext, args: cli::RunArgs) -> Result<StartVi
         cleanup_created_record(context, &created);
         return Err(err);
     }
+    if let Err(err) = establish_coordination_broker(context, &created.record) {
+        recover_failed_tmux_launch(
+            context,
+            &mut created.record,
+            &tmux_bin,
+            Some(&launch_identity),
+            SessionTerminationOperation::FailedLaunch,
+        )?;
+        cleanup_created_record(context, &created);
+        return Err(err);
+    }
+    if let Err(err) = release_held_runtime(context, &created.record) {
+        recover_failed_tmux_launch(
+            context,
+            &mut created.record,
+            &tmux_bin,
+            Some(&launch_identity),
+            SessionTerminationOperation::FailedLaunch,
+        )?;
+        cleanup_created_record(context, &created);
+        return Err(err);
+    }
 
     let result = session_view(
         context,
@@ -1682,6 +1826,28 @@ pub(crate) fn start_provider_resume_session(
     };
     if let Err(err) = persist_launched_tmux_identity(context, &mut created.record, &launch_identity)
     {
+        recover_failed_tmux_launch(
+            context,
+            &mut created.record,
+            &tmux_bin,
+            Some(&launch_identity),
+            SessionTerminationOperation::FailedLaunch,
+        )?;
+        cleanup_created_record(context, &created);
+        return Err(err);
+    }
+    if let Err(err) = establish_coordination_broker(context, &created.record) {
+        recover_failed_tmux_launch(
+            context,
+            &mut created.record,
+            &tmux_bin,
+            Some(&launch_identity),
+            SessionTerminationOperation::FailedLaunch,
+        )?;
+        cleanup_created_record(context, &created);
+        return Err(err);
+    }
+    if let Err(err) = release_held_runtime(context, &created.record) {
         recover_failed_tmux_launch(
             context,
             &mut created.record,
@@ -1857,6 +2023,10 @@ fn create_record(request: RecordRequest<'_>) -> Result<CreatedRecord, CliError> 
         let _ = fs::remove_dir_all(&session_dir);
         return Err(err);
     }
+    if let Err(err) = coordination::prepare(request.context, &record) {
+        let _ = fs::remove_dir_all(&session_dir);
+        return Err(err);
+    }
     Ok(CreatedRecord {
         record,
         prompt_file,
@@ -1866,6 +2036,7 @@ fn create_record(request: RecordRequest<'_>) -> Result<CreatedRecord, CliError> 
 }
 
 fn cleanup_created_record(context: &CliContext, created: &CreatedRecord) {
+    let _ = coordination::revoke(context, &created.record);
     let _ = codex_app_server::cleanup_runtime_files(context, &created.record);
     let _ = fs::remove_dir_all(&created.session_dir);
 }
@@ -2243,7 +2414,7 @@ fn start_interactive_tmux(
         .arg("-c")
         .arg(&record.cwd);
     add_runtime_tmux_environment(&mut command, state_dir, record)?;
-    command.arg("--");
+    begin_held_runtime(&mut command, state_dir, record)?;
 
     if agent == AgentKind::Codex && codex_app_server::runtime_is_supported(record) {
         let socket = codex_app_server::socket_path(record).ok_or_else(|| {
@@ -2383,7 +2554,8 @@ fn start_run_tmux(
         .arg("-c")
         .arg(&record.cwd);
     add_runtime_tmux_environment(&mut command, state_dir, record)?;
-    command.arg("--").arg("sh").arg("-lc").arg(script);
+    begin_held_runtime(&mut command, state_dir, record)?;
+    command.arg("sh").arg("-lc").arg(script);
     run_tmux_new_session(command, record)
 }
 
@@ -3097,6 +3269,7 @@ fn glance_session(context: &CliContext, args: cli::GlanceArgs) -> Result<GlanceR
         turn_state: activity::state_for_view(context, &record),
         startup: startup_projection_for_view(&record),
         auto_resume: auto_resume::view_for_record(context, &record),
+        coordination: coordination::public_summary(context, &record.id),
     })
 }
 
@@ -3629,6 +3802,12 @@ fn resume_session_locked(
     record.updated_at = now.timestamp().to_string();
     write_session_record(context, &record)?;
     activity::activate_runtime(context, &record)?;
+    if let Err(error) = coordination::prepare(context, &record) {
+        let _ = write_session_record(context, &previous_record);
+        let _ = activity::restore_snapshot(context, &record.id, &previous_activity);
+        let _ = startup_artifacts.restore();
+        return Err(error);
+    }
     let launch = if app_server_managed {
         start_interactive_tmux(
             tmux_bin,
@@ -3664,6 +3843,34 @@ fn resume_session_locked(
                         return Err(termination_err);
                     }
                 }
+            } else if let Err(err) = establish_coordination_broker(context, &record) {
+                match recover_failed_tmux_launch(
+                    context,
+                    &mut record,
+                    tmux_bin,
+                    Some(&identity),
+                    SessionTerminationOperation::Resume,
+                ) {
+                    Ok(()) => Some(err),
+                    Err(termination_err) => {
+                        startup_artifacts.discard();
+                        return Err(termination_err);
+                    }
+                }
+            } else if let Err(err) = release_held_runtime(context, &record) {
+                match recover_failed_tmux_launch(
+                    context,
+                    &mut record,
+                    tmux_bin,
+                    Some(&identity),
+                    SessionTerminationOperation::Resume,
+                ) {
+                    Ok(()) => Some(err),
+                    Err(termination_err) => {
+                        startup_artifacts.discard();
+                        return Err(termination_err);
+                    }
+                }
             } else {
                 None
             }
@@ -3686,16 +3893,22 @@ fn resume_session_locked(
         Err(err) => Some(err),
     };
     if let Some(launch_err) = launch_error {
+        let coordination_revoke = coordination::revoke(context, &record);
         let record_restore = write_session_record(context, &previous_record);
         let activity_restore = activity::restore_snapshot(context, &record.id, &previous_activity);
         let artifact_restore = startup_artifacts.restore();
-        if record_restore.is_err() || activity_restore.is_err() || artifact_restore.is_err() {
+        if coordination_revoke.is_err()
+            || record_restore.is_err()
+            || activity_restore.is_err()
+            || artifact_restore.is_err()
+        {
             return Err(CliError::runtime(
                 "resume-launch-rollback-failed",
                 "provider resume launch failed and the prior durable runtime could not be fully restored",
                 Some(json!({
                     "id": record.id,
                     "launch_error": launch_err.code(),
+                    "new_coordination_revoked": coordination_revoke.is_ok(),
                     "record_restored": record_restore.is_ok(),
                     "activity_restored": activity_restore.is_ok(),
                     "startup_artifacts_restored": artifact_restore.is_ok()
@@ -3741,12 +3954,115 @@ fn start_resume_tmux(
         .arg("-c")
         .arg(&record.cwd);
     add_runtime_tmux_environment(&mut command, state_dir, record)?;
+    begin_held_runtime(&mut command, state_dir, record)?;
     command
-        .arg("--")
         .arg(agent_bin)
         .args(resume_args)
         .args(&record.agent_args);
     run_tmux_new_session(command, record)
+}
+
+fn launch_gate_path(state_dir: &Path, record: &SessionRecord) -> PathBuf {
+    state_dir
+        .join("sessions")
+        .join(&record.id)
+        .join("coordination")
+        .join(COORDINATION_LAUNCH_GATE)
+}
+
+fn begin_held_runtime(
+    command: &mut ProcessCommand,
+    state_dir: &Path,
+    record: &SessionRecord,
+) -> Result<(), CliError> {
+    let gate = launch_gate_path(state_dir, record);
+    let broker_bin = std::env::current_exe().map_err(|_| {
+        CliError::runtime(
+            "coordination-unavailable",
+            "failed to resolve the coordination broker executable",
+            None,
+        )
+    })?;
+    match fs::remove_file(&gate) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(_) => {
+            return Err(CliError::runtime(
+                "coordination-unavailable",
+                "failed to reset the held launch gate",
+                None,
+            ));
+        }
+    }
+    command
+        .arg("--")
+        .arg("sh")
+        .arg("-c")
+        .arg(HELD_LAUNCH_SCRIPT)
+        .arg("agent-session-held-launch")
+        .arg(gate)
+        .arg(coordination::heartbeat_path(state_dir, &record.id))
+        .arg(coordination::capability_path_for_state(
+            state_dir,
+            &record.id,
+            record
+                .runtime
+                .as_ref()
+                .map(|runtime| runtime.launch_id.as_str())
+                .unwrap_or_default(),
+        ))
+        .arg(
+            record
+                .runtime
+                .as_ref()
+                .map(|runtime| runtime.launch_id.as_str())
+                .unwrap_or_default(),
+        )
+        .arg(
+            record
+                .runtime
+                .as_ref()
+                .map(|runtime| runtime.generation)
+                .unwrap_or_default()
+                .to_string(),
+        )
+        .arg(broker_bin);
+    Ok(())
+}
+
+fn release_held_runtime(context: &CliContext, record: &SessionRecord) -> Result<(), CliError> {
+    let incarnation = coordination::incarnation(record)?;
+    let capability = coordination::capability_path(context, &record.id, &incarnation);
+    let metadata = fs::metadata(&capability).map_err(|_| {
+        CliError::runtime(
+            "coordination-broker-start-timeout",
+            "coordination capability was not ready before agent launch",
+            None,
+        )
+    })?;
+    if !metadata.is_file() || metadata.permissions().mode() & 0o077 != 0 {
+        return Err(CliError::runtime(
+            "coordination-broker-start-timeout",
+            "coordination capability was not private before agent launch",
+            None,
+        ));
+    }
+    coordination::ensure_ready(context, record)?;
+    write_private_file(&launch_gate_path(&context.state_dir, record), b"ready\n").map_err(|_| {
+        CliError::runtime(
+            "coordination-broker-start-timeout",
+            "held agent runtime could not be released",
+            None,
+        )
+    })
+}
+
+fn establish_coordination_broker(
+    context: &CliContext,
+    record: &SessionRecord,
+) -> Result<(), CliError> {
+    coordination::provision(context, record)?;
+    coordination::activate_ready(context, record)
 }
 
 fn add_runtime_tmux_environment(
@@ -3770,6 +4086,13 @@ fn add_runtime_tmux_environment(
         format!("AGENT_SESSION_ID={}", record.id),
         format!("AGENT_SESSION_STATE_DIR={}", display_path(state_dir)),
         format!("AGENT_SESSION_RUNTIME_ID={runtime_id}"),
+        format!(
+            "{}={}",
+            coordination::CAPABILITY_ENV,
+            display_path(&coordination::capability_path_for_state(
+                state_dir, &record.id, runtime_id
+            ))
+        ),
         format!(
             "{}={}",
             codex_app_server::ATTENTION_AUTHORITY_ENV,
@@ -5088,6 +5411,7 @@ fn session_view_from_parts(
         startup: startup_projection_for_view(record),
         auto_resume: auto_resume::view_for_record(context, record),
         codex_account: codex_account::view_for_record(record),
+        coordination: coordination::public_summary(context, &record.id),
     }
 }
 
@@ -5482,6 +5806,7 @@ fn delete_session_locked_with_timeouts(
     .map_err(|reason| {
         session_termination_error(&record, reason, SessionTerminationOperation::Delete)
     })?;
+    coordination::revoke(context, &record)?;
     codex_app_server::cleanup_runtime_files(context, &record)?;
     let cleanup_pending = commit_session_directory_delete(context, &record.id, &session_dir)?;
     Ok(DeleteResult {
@@ -6822,6 +7147,73 @@ enum ProcessGroupStatus {
     Running,
     Stopped,
     Unknown,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CoordinationRuntimeStatus {
+    Running,
+    Stopped,
+    Unknown,
+}
+
+pub(crate) struct CoordinationRuntimeEvidence {
+    pub(crate) identity_digest: String,
+    pub(crate) identity: Value,
+    pub(crate) status: CoordinationRuntimeStatus,
+}
+
+pub(crate) fn coordination_runtime_evidence(
+    record: &SessionRecord,
+) -> Result<CoordinationRuntimeEvidence, CliError> {
+    let identity = persisted_tmux_runtime_identity(record)
+        .map_err(|_| {
+            CliError::runtime(
+                "coordination-runtime-unverified",
+                "persisted runtime identity is unavailable or invalid",
+                None,
+            )
+        })?
+        .ok_or_else(|| {
+            CliError::runtime(
+                "coordination-runtime-unverified",
+                "persisted runtime identity is unavailable",
+                None,
+            )
+        })?;
+    let bytes = serde_json::to_vec(&identity).map_err(|_| {
+        CliError::runtime(
+            "coordination-runtime-unverified",
+            "persisted runtime identity could not be canonicalized",
+            None,
+        )
+    })?;
+    let status = match process_runtime_status(&identity) {
+        ProcessGroupStatus::Running => CoordinationRuntimeStatus::Running,
+        ProcessGroupStatus::Stopped => CoordinationRuntimeStatus::Stopped,
+        ProcessGroupStatus::Unknown => CoordinationRuntimeStatus::Unknown,
+    };
+    Ok(CoordinationRuntimeEvidence {
+        identity_digest: coordination::digest_bytes(&bytes),
+        identity: serde_json::to_value(identity).map_err(|_| {
+            CliError::runtime(
+                "coordination-runtime-unverified",
+                "persisted runtime identity could not be serialized",
+                None,
+            )
+        })?,
+        status,
+    })
+}
+
+pub(crate) fn coordination_runtime_status_for_identity(value: &Value) -> CoordinationRuntimeStatus {
+    let Ok(identity) = serde_json::from_value::<TmuxRuntimeIdentity>(value.clone()) else {
+        return CoordinationRuntimeStatus::Unknown;
+    };
+    match process_runtime_status(&identity) {
+        ProcessGroupStatus::Running => CoordinationRuntimeStatus::Running,
+        ProcessGroupStatus::Stopped => CoordinationRuntimeStatus::Stopped,
+        ProcessGroupStatus::Unknown => CoordinationRuntimeStatus::Unknown,
+    }
 }
 
 fn process_group_status(process_group_id: libc::pid_t) -> ProcessGroupStatus {
@@ -9253,6 +9645,25 @@ mod tests {
         session_dir, strip_trailing_blank_lines, tmux_launch_may_have_created_runtime,
         try_acquire_session_record_lock, write_session_record,
     };
+
+    #[test]
+    fn coordination_review_held_launch_starts_persistent_broker_before_the_gate() {
+        let heartbeat = super::HELD_LAUNCH_SCRIPT
+            .find("broker heartbeat")
+            .expect("broker sidecar setup");
+        let gate = super::HELD_LAUNCH_SCRIPT
+            .find("while [ ! -f \"$gate\" ]")
+            .expect("gate wait");
+        assert!(heartbeat < gate);
+        assert!(super::HELD_LAUNCH_SCRIPT.contains("\"$capability\""));
+        assert!(!super::HELD_LAUNCH_SCRIPT.contains("heartbeat_once"));
+    }
+
+    #[test]
+    fn coordination_review_round2_held_launch_uses_child_lifecycle_not_pid_polling() {
+        assert!(!super::HELD_LAUNCH_SCRIPT.contains("kill -0"));
+        assert!(super::HELD_LAUNCH_SCRIPT.contains("wait \"$child\""));
+    }
     use pretty_assertions::assert_eq;
     #[cfg(target_os = "linux")]
     use std::env;

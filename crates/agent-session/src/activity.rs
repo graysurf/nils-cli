@@ -548,7 +548,7 @@ pub(crate) struct ActivitySnapshot {
 }
 
 #[derive(Debug)]
-struct ActivityLock(fs::File);
+pub(crate) struct ActivityLock(fs::File);
 
 impl Drop for ActivityLock {
     fn drop(&mut self) {
@@ -602,6 +602,13 @@ pub(crate) fn acquire_runtime_health_fence(
 
 fn acquire_lock(dir: &Path) -> Result<ActivityLock, CliError> {
     acquire_lock_with_mode(dir, ActivityLockMode::Blocking)
+}
+
+pub(crate) fn acquire_coordination_activity_lock(
+    context: &CliContext,
+    session_id: &str,
+) -> Result<ActivityLock, CliError> {
+    acquire_lock_with_timeout(&session_dir(context, session_id), Duration::from_secs(2))
 }
 
 fn acquire_lock_nonblocking(dir: &Path) -> Result<ActivityLock, CliError> {

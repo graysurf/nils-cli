@@ -50,9 +50,11 @@ use serde_json::{Value, json};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, broadcast, mpsc, watch};
 use tokio::task::JoinSet;
 
+use crate::activity;
 use crate::auto_resume::{self, UsageSnapshot};
 use crate::cli::{self, AgentKind, SpecialKey};
 use crate::codex_app_server::{self, ControlHandle};
+use crate::coordination::server as coordination_server;
 use crate::maintenance::{self, MaintenanceActionRequest, MaintenanceOperation};
 use crate::provider_prompt::{
     MAX_LAST_PROMPT_TAIL_BYTES, MAX_PROVIDER_PROMPT_BYTES, PROVIDER_PROMPT_CAPABILITY,
@@ -125,6 +127,7 @@ const ACTIVITY_STREAM_DEBOUNCE: Duration = Duration::from_millis(25);
 const ACTIVITY_STREAM_MAX_REFRESH_CADENCE: Duration = Duration::from_millis(250);
 const ACTIVITY_STREAM_OVERSIZED_REASON: &str = "oversized_snapshot";
 const SESSION_DELETE_TOMBSTONE_CLEANUP_LIMIT: usize = 64;
+const COORDINATION_WAIT_WORKER_LIMIT: usize = 16;
 const RESET_AT_KEYS: &[&str] = &["reset_at", "resetAt", "resets_at", "resetsAt"];
 const RESET_AT_EPOCH_KEYS: &[&str] = &[
     "reset_at_epoch",
@@ -153,6 +156,20 @@ struct ServeState {
     codex_account_switches: CodexAccountSwitchRegistry,
     session_collector: SessionCollector,
     launch_profiles: AgentLaunchProfiles,
+    coordination_wait_workers: Arc<tokio::sync::Semaphore>,
+}
+
+#[derive(Clone)]
+struct CoordinationNotificationFence {
+    message_id: String,
+    target_incarnation: String,
+}
+
+#[derive(Default)]
+struct StructuredPromptGuards<'a> {
+    expected_session_incarnation: Option<&'a str>,
+    expected_binding: Option<(&'a str, u64)>,
+    notification: Option<CoordinationNotificationFence>,
 }
 
 #[derive(Clone)]
@@ -643,6 +660,9 @@ pub fn run_serve(context: &CliContext, args: cli::ServeArgs) -> i32 {
             codex_account_switches: CodexAccountSwitchRegistry::default(),
             session_collector,
             launch_profiles,
+            coordination_wait_workers: Arc::new(tokio::sync::Semaphore::new(
+                COORDINATION_WAIT_WORKER_LIMIT,
+            )),
         });
         let listener = match bind_listener_and_start_delete_tombstone_cleanup(context, bind).await {
             Ok(listener) => listener,
@@ -686,6 +706,71 @@ fn router(state: Arc<ServeState>) -> Router {
         .route("/workdirs", get(workdirs_handler))
         .route("/repos/remote-url", get(repo_remote_url_handler))
         .route("/sessions/{id}/glance", get(glance_handler))
+        .route(
+            "/sessions/{id}/work-context/v1",
+            get(coordination_context_show_handler),
+        )
+        .route(
+            "/sessions/{id}/work-context/check/v1",
+            post(coordination_context_check_handler),
+        )
+        .route(
+            "/coordination/work-context/check/v1",
+            post(coordination_registry_context_check_handler),
+        )
+        .route(
+            "/sessions/{id}/work-context/claim/v1",
+            post(coordination_context_claim_handler),
+        )
+        .route(
+            "/sessions/{id}/work-context/renew/v1",
+            post(coordination_context_renew_handler),
+        )
+        .route(
+            "/sessions/{id}/work-context/release/v1",
+            post(coordination_context_release_handler),
+        )
+        .route(
+            "/sessions/{id}/work-context/admit/v1",
+            post(coordination_context_admit_handler),
+        )
+        .route(
+            "/sessions/{id}/work-context/complete/v1",
+            post(coordination_context_complete_handler),
+        )
+        .route(
+            "/sessions/{id}/work-context/reconcile/v1",
+            post(coordination_context_reconcile_handler),
+        )
+        .route("/sessions/{id}/broker/v1", get(coordination_broker_handler))
+        .route(
+            "/sessions/{id}/broker/adopt/v1",
+            post(coordination_broker_adopt_handler),
+        )
+        .route(
+            "/sessions/{id}/broker/reconcile/v1",
+            post(coordination_broker_reconcile_handler),
+        )
+        .route(
+            "/sessions/{id}/messages/v1",
+            get(coordination_inbox_handler).post(coordination_send_handler),
+        )
+        .route(
+            "/sessions/{id}/messages/{message_id}/v1",
+            get(coordination_message_show_handler),
+        )
+        .route(
+            "/sessions/{id}/messages/{message_id}/ack/v1",
+            post(coordination_ack_handler),
+        )
+        .route(
+            "/sessions/{id}/messages/{message_id}/reply/v1",
+            post(coordination_reply_handler),
+        )
+        .route(
+            "/sessions/{id}/messages/{message_id}/wait/v1",
+            get(coordination_wait_handler),
+        )
         .route("/sessions/{id}/buffer", get(buffer_handler))
         .route("/sessions/{id}/send", post(send_handler))
         .route("/sessions/{id}/prompt", post(structured_prompt_handler))
@@ -1778,13 +1863,21 @@ fn envelope_ok(data: Value) -> Response {
 fn envelope_err(err: CliError) -> Response {
     let data = err.into_inner();
     let status = match data.code.as_str() {
-        "session-not-found" => StatusCode::NOT_FOUND,
+        "session-not-found" | "message-not-found" => StatusCode::NOT_FOUND,
+        "coordination-unauthorized" => StatusCode::UNAUTHORIZED,
+        "rate-limited" => StatusCode::TOO_MANY_REQUESTS,
+        "wait-timeout" => StatusCode::REQUEST_TIMEOUT,
         "session-exists"
         | "title-revision-conflict"
         | "title-state-conflict"
         | "session-incarnation-conflict"
         | "maintenance-preview-stale"
         | "maintenance-session-busy"
+        | "claim-conflict"
+        | "claim-revision-conflict"
+        | "operation-revision-conflict"
+        | "message-revision-conflict"
+        | "idempotency-conflict"
         | "codex-account-session-incarnation-conflict"
         | "codex-account-session-busy" => StatusCode::CONFLICT,
         _ => match data.exit_code {
@@ -2856,6 +2949,536 @@ async fn glance_handler(
     }
 }
 
+#[allow(clippy::result_large_err)]
+fn coordination_authority(state: &ServeState, headers: &HeaderMap) -> Result<String, Response> {
+    if let Some(response) = deny_unauthorized(state, headers) {
+        return Err(response);
+    }
+    coordination_server::capability_from_headers(headers)
+        .map(str::to_string)
+        .map_err(envelope_err)
+}
+
+fn coordination_ok(state: &ServeState, value: Value) -> Response {
+    envelope_ok(json!({ "machine": state.machine, "coordination": value }))
+}
+
+async fn coordination_context_show_handler(
+    State(state): State<Arc<ServeState>>,
+    headers: HeaderMap,
+    AxPath(id): AxPath<String>,
+) -> Response {
+    if let Some(response) = deny_unauthorized(&state, &headers) {
+        return response;
+    }
+    let context = state.context.clone();
+    match tokio::task::spawn_blocking(move || coordination_server::show(&context, &id)).await {
+        Ok(Ok(value)) => coordination_ok(&state, value),
+        Ok(Err(error)) => envelope_err(error),
+        Err(_) => join_err(),
+    }
+}
+
+async fn coordination_context_check_handler(
+    State(state): State<Arc<ServeState>>,
+    headers: HeaderMap,
+    AxPath(id): AxPath<String>,
+    body: Result<Json<coordination_server::CheckBody>, JsonRejection>,
+) -> Response {
+    if let Some(response) = deny_unauthorized(&state, &headers) {
+        return response;
+    }
+    let body = match coordination_json(body) {
+        Ok(body) => body,
+        Err(response) => return response,
+    };
+    let capability = coordination_server::capability_from_headers(&headers)
+        .ok()
+        .map(str::to_string);
+    let context = state.context.clone();
+    match tokio::task::spawn_blocking(move || {
+        coordination_server::check(&context, &id, capability.as_deref(), body)
+    })
+    .await
+    {
+        Ok(Ok(value)) => coordination_ok(&state, value),
+        Ok(Err(error)) => envelope_err(error),
+        Err(_) => join_err(),
+    }
+}
+
+async fn coordination_registry_context_check_handler(
+    State(state): State<Arc<ServeState>>,
+    headers: HeaderMap,
+    body: Result<Json<coordination_server::CheckBody>, JsonRejection>,
+) -> Response {
+    if let Some(response) = deny_unauthorized(&state, &headers) {
+        return response;
+    }
+    let body = match coordination_json(body) {
+        Ok(body) => body,
+        Err(response) => return response,
+    };
+    let context = state.context.clone();
+    match tokio::task::spawn_blocking(move || coordination_server::check_candidate(&context, body))
+        .await
+    {
+        Ok(Ok(value)) => coordination_ok(&state, value),
+        Ok(Err(error)) => envelope_err(error),
+        Err(_) => join_err(),
+    }
+}
+
+async fn coordination_context_claim_handler(
+    State(state): State<Arc<ServeState>>,
+    headers: HeaderMap,
+    AxPath(id): AxPath<String>,
+    body: Result<Json<coordination_server::ClaimBody>, JsonRejection>,
+) -> Response {
+    let body = match coordination_json(body) {
+        Ok(body) => body,
+        Err(response) => return response,
+    };
+    let token = match coordination_authority(&state, &headers) {
+        Ok(token) => token,
+        Err(response) => return response,
+    };
+    let context = state.context.clone();
+    match tokio::task::spawn_blocking(move || {
+        coordination_server::claim(&context, &id, &token, body)
+    })
+    .await
+    {
+        Ok(Ok(value)) => coordination_ok(&state, value),
+        Ok(Err(error)) => envelope_err(error),
+        Err(_) => join_err(),
+    }
+}
+
+async fn coordination_context_renew_handler(
+    State(state): State<Arc<ServeState>>,
+    headers: HeaderMap,
+    AxPath(id): AxPath<String>,
+    body: Result<Json<coordination_server::ClaimMutationBody>, JsonRejection>,
+) -> Response {
+    let body = match coordination_json(body) {
+        Ok(body) => body,
+        Err(response) => return response,
+    };
+    coordination_context_claim_mutation(state, headers, id, body, false).await
+}
+
+async fn coordination_context_release_handler(
+    State(state): State<Arc<ServeState>>,
+    headers: HeaderMap,
+    AxPath(id): AxPath<String>,
+    body: Result<Json<coordination_server::ClaimMutationBody>, JsonRejection>,
+) -> Response {
+    let body = match coordination_json(body) {
+        Ok(body) => body,
+        Err(response) => return response,
+    };
+    coordination_context_claim_mutation(state, headers, id, body, true).await
+}
+
+async fn coordination_context_claim_mutation(
+    state: Arc<ServeState>,
+    headers: HeaderMap,
+    id: String,
+    body: coordination_server::ClaimMutationBody,
+    release: bool,
+) -> Response {
+    let token = match coordination_authority(&state, &headers) {
+        Ok(token) => token,
+        Err(response) => return response,
+    };
+    let context = state.context.clone();
+    match tokio::task::spawn_blocking(move || {
+        coordination_server::claim_mutation(&context, &id, &token, body, release)
+    })
+    .await
+    {
+        Ok(Ok(value)) => coordination_ok(&state, value),
+        Ok(Err(error)) => envelope_err(error),
+        Err(_) => join_err(),
+    }
+}
+
+async fn coordination_context_admit_handler(
+    State(state): State<Arc<ServeState>>,
+    headers: HeaderMap,
+    AxPath(id): AxPath<String>,
+    body: Result<Json<coordination_server::AdmitBody>, JsonRejection>,
+) -> Response {
+    let body = match coordination_json(body) {
+        Ok(body) => body,
+        Err(response) => return response,
+    };
+    let token = match coordination_authority(&state, &headers) {
+        Ok(token) => token,
+        Err(response) => return response,
+    };
+    let context = state.context.clone();
+    match tokio::task::spawn_blocking(move || {
+        coordination_server::admit(&context, &id, &token, body)
+    })
+    .await
+    {
+        Ok(Ok(value)) => coordination_ok(&state, value),
+        Ok(Err(error)) => envelope_err(error),
+        Err(_) => join_err(),
+    }
+}
+
+async fn coordination_context_complete_handler(
+    State(state): State<Arc<ServeState>>,
+    headers: HeaderMap,
+    AxPath(id): AxPath<String>,
+    body: Result<Json<coordination_server::CompleteBody>, JsonRejection>,
+) -> Response {
+    let body = match coordination_json(body) {
+        Ok(body) => body,
+        Err(response) => return response,
+    };
+    let token = match coordination_authority(&state, &headers) {
+        Ok(token) => token,
+        Err(response) => return response,
+    };
+    let context = state.context.clone();
+    match tokio::task::spawn_blocking(move || {
+        coordination_server::complete(&context, &id, &token, body)
+    })
+    .await
+    {
+        Ok(Ok(value)) => coordination_ok(&state, value),
+        Ok(Err(error)) => envelope_err(error),
+        Err(_) => join_err(),
+    }
+}
+
+async fn coordination_context_reconcile_handler(
+    State(state): State<Arc<ServeState>>,
+    headers: HeaderMap,
+    AxPath(id): AxPath<String>,
+    body: Result<Json<coordination_server::ReconcileBody>, JsonRejection>,
+) -> Response {
+    let body = match coordination_json(body) {
+        Ok(body) => body,
+        Err(response) => return response,
+    };
+    let token = match coordination_authority(&state, &headers) {
+        Ok(token) => token,
+        Err(response) => return response,
+    };
+    let context = state.context.clone();
+    match tokio::task::spawn_blocking(move || {
+        coordination_server::reconcile(&context, &id, &token, body)
+    })
+    .await
+    {
+        Ok(Ok(value)) => coordination_ok(&state, value),
+        Ok(Err(error)) => envelope_err(error),
+        Err(_) => join_err(),
+    }
+}
+
+async fn coordination_broker_handler(
+    State(state): State<Arc<ServeState>>,
+    headers: HeaderMap,
+    AxPath(id): AxPath<String>,
+) -> Response {
+    if let Some(response) = deny_unauthorized(&state, &headers) {
+        return response;
+    }
+    let context = state.context.clone();
+    match tokio::task::spawn_blocking(move || coordination_server::broker_status(&context, &id))
+        .await
+    {
+        Ok(Ok(value)) => coordination_ok(&state, value),
+        Ok(Err(error)) => envelope_err(error),
+        Err(_) => join_err(),
+    }
+}
+
+async fn coordination_broker_adopt_handler(
+    State(state): State<Arc<ServeState>>,
+    headers: HeaderMap,
+    AxPath(id): AxPath<String>,
+    body: Result<Json<coordination_server::BrokerRecoveryBody>, JsonRejection>,
+) -> Response {
+    let body = match coordination_json(body) {
+        Ok(body) => body,
+        Err(response) => return response,
+    };
+    coordination_broker_recovery_handler(state, headers, id, body, false).await
+}
+
+async fn coordination_broker_reconcile_handler(
+    State(state): State<Arc<ServeState>>,
+    headers: HeaderMap,
+    AxPath(id): AxPath<String>,
+    body: Result<Json<coordination_server::BrokerRecoveryBody>, JsonRejection>,
+) -> Response {
+    let body = match coordination_json(body) {
+        Ok(body) => body,
+        Err(response) => return response,
+    };
+    coordination_broker_recovery_handler(state, headers, id, body, true).await
+}
+
+async fn coordination_broker_recovery_handler(
+    state: Arc<ServeState>,
+    headers: HeaderMap,
+    id: String,
+    body: coordination_server::BrokerRecoveryBody,
+    reconcile: bool,
+) -> Response {
+    if let Some(response) = deny_unauthorized(&state, &headers) {
+        return response;
+    }
+    let context = state.context.clone();
+    match tokio::task::spawn_blocking(move || {
+        coordination_server::broker_recover(&context, &id, body, reconcile)
+    })
+    .await
+    {
+        Ok(Ok(value)) => coordination_ok(&state, value),
+        Ok(Err(error)) => envelope_err(error),
+        Err(_) => join_err(),
+    }
+}
+
+async fn coordination_inbox_handler(
+    State(state): State<Arc<ServeState>>,
+    headers: HeaderMap,
+    AxPath(id): AxPath<String>,
+    query: Result<Query<coordination_server::InboxQuery>, QueryRejection>,
+) -> Response {
+    let query = match coordination_query(query) {
+        Ok(query) => query,
+        Err(response) => return response,
+    };
+    let token = match coordination_authority(&state, &headers) {
+        Ok(token) => token,
+        Err(response) => return response,
+    };
+    let context = state.context.clone();
+    match tokio::task::spawn_blocking(move || {
+        coordination_server::inbox(&context, &id, &token, query)
+    })
+    .await
+    {
+        Ok(Ok(value)) => coordination_ok(&state, value),
+        Ok(Err(error)) => envelope_err(error),
+        Err(_) => join_err(),
+    }
+}
+
+async fn coordination_send_handler(
+    State(state): State<Arc<ServeState>>,
+    headers: HeaderMap,
+    AxPath(id): AxPath<String>,
+    body: Result<Json<coordination_server::SendBody>, JsonRejection>,
+) -> Response {
+    let body = match coordination_json(body) {
+        Ok(body) => body,
+        Err(response) => return response,
+    };
+    let token = match coordination_authority(&state, &headers) {
+        Ok(token) => token,
+        Err(response) => return response,
+    };
+    let context = state.context.clone();
+    match tokio::task::spawn_blocking(move || {
+        coordination_server::send(&context, &id, &token, body)
+    })
+    .await
+    {
+        Ok(Ok(value)) => {
+            attempt_coordination_notification(state.clone(), &value).await;
+            coordination_ok(&state, value)
+        }
+        Ok(Err(error)) => envelope_err(error),
+        Err(_) => join_err(),
+    }
+}
+
+#[allow(clippy::result_large_err)]
+fn coordination_json<T>(body: Result<Json<T>, JsonRejection>) -> Result<T, Response> {
+    body.map(|Json(value)| value).map_err(|_| {
+        envelope_err(CliError::usage(
+            "invalid-json-body",
+            "coordination request body is invalid",
+            None,
+        ))
+    })
+}
+
+#[allow(clippy::result_large_err)]
+fn coordination_query<T>(query: Result<Query<T>, QueryRejection>) -> Result<T, Response> {
+    query.map(|Query(value)| value).map_err(|_| {
+        envelope_err(CliError::usage(
+            "invalid-query",
+            "coordination request query is invalid",
+            None,
+        ))
+    })
+}
+
+async fn attempt_coordination_notification(state: Arc<ServeState>, sent: &Value) {
+    let Some(message_id) = sent.get("message_id").and_then(Value::as_str) else {
+        return;
+    };
+    let context = state.context.clone();
+    let message_id_owned = message_id.to_string();
+    let candidate = tokio::task::spawn_blocking(move || {
+        crate::coordination::notification_candidate(&context, &message_id_owned)
+    })
+    .await;
+    let Ok(Ok(Some((target_session_id, target_incarnation)))) = candidate else {
+        return;
+    };
+    let prompt = crate::coordination::notification_prompt(message_id, &target_session_id);
+    let _ = submit_structured_prompt_handler_with_fence(
+        state,
+        target_session_id,
+        prompt,
+        Some(target_incarnation.clone()),
+        Some(CoordinationNotificationFence {
+            message_id: message_id.to_string(),
+            target_incarnation,
+        }),
+    )
+    .await;
+}
+
+async fn coordination_message_show_handler(
+    State(state): State<Arc<ServeState>>,
+    headers: HeaderMap,
+    AxPath((id, message_id)): AxPath<(String, String)>,
+) -> Response {
+    let token = match coordination_authority(&state, &headers) {
+        Ok(token) => token,
+        Err(response) => return response,
+    };
+    let context = state.context.clone();
+    match tokio::task::spawn_blocking(move || {
+        coordination_server::message_show(&context, &id, &message_id, &token)
+    })
+    .await
+    {
+        Ok(Ok(value)) => coordination_ok(&state, value),
+        Ok(Err(error)) => envelope_err(error),
+        Err(_) => join_err(),
+    }
+}
+
+async fn coordination_ack_handler(
+    State(state): State<Arc<ServeState>>,
+    headers: HeaderMap,
+    AxPath((id, message_id)): AxPath<(String, String)>,
+    body: Result<Json<coordination_server::AckBody>, JsonRejection>,
+) -> Response {
+    let body = match coordination_json(body) {
+        Ok(body) => body,
+        Err(response) => return response,
+    };
+    let token = match coordination_authority(&state, &headers) {
+        Ok(token) => token,
+        Err(response) => return response,
+    };
+    let context = state.context.clone();
+    match tokio::task::spawn_blocking(move || {
+        coordination_server::ack(&context, &id, &message_id, &token, body)
+    })
+    .await
+    {
+        Ok(Ok(value)) => coordination_ok(&state, value),
+        Ok(Err(error)) => envelope_err(error),
+        Err(_) => join_err(),
+    }
+}
+
+async fn coordination_reply_handler(
+    State(state): State<Arc<ServeState>>,
+    headers: HeaderMap,
+    AxPath((id, message_id)): AxPath<(String, String)>,
+    body: Result<Json<coordination_server::ReplyBody>, JsonRejection>,
+) -> Response {
+    let body = match coordination_json(body) {
+        Ok(body) => body,
+        Err(response) => return response,
+    };
+    let token = match coordination_authority(&state, &headers) {
+        Ok(token) => token,
+        Err(response) => return response,
+    };
+    let context = state.context.clone();
+    match tokio::task::spawn_blocking(move || {
+        coordination_server::reply(&context, &id, &message_id, &token, body)
+    })
+    .await
+    {
+        Ok(Ok(value)) => coordination_ok(&state, value),
+        Ok(Err(error)) => envelope_err(error),
+        Err(_) => join_err(),
+    }
+}
+
+async fn coordination_wait_handler(
+    State(state): State<Arc<ServeState>>,
+    headers: HeaderMap,
+    AxPath((id, message_id)): AxPath<(String, String)>,
+    body: Result<Query<coordination_server::WaitBody>, QueryRejection>,
+) -> Response {
+    let body = match coordination_query(body) {
+        Ok(body) => body,
+        Err(response) => return response,
+    };
+    let token = match coordination_authority(&state, &headers) {
+        Ok(token) => token,
+        Err(response) => return response,
+    };
+    let permit = match state.coordination_wait_workers.clone().try_acquire_owned() {
+        Ok(permit) => permit,
+        Err(_) => {
+            return status_json(
+                StatusCode::TOO_MANY_REQUESTS,
+                "rate-limited",
+                "coordination wait worker limit reached",
+            );
+        }
+    };
+    let context = state.context.clone();
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let _cancellation = CoordinationWaitCancellation(cancelled.clone());
+    match tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        coordination_server::wait_with_cancellation(
+            &context,
+            &id,
+            &message_id,
+            &token,
+            body,
+            Some(cancelled.as_ref()),
+        )
+    })
+    .await
+    {
+        Ok(Ok(value)) => coordination_ok(&state, value),
+        Ok(Err(error)) => envelope_err(error),
+        Err(_) => join_err(),
+    }
+}
+
+struct CoordinationWaitCancellation(Arc<AtomicBool>);
+
+impl Drop for CoordinationWaitCancellation {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Release);
+    }
+}
+
 // Return the session server's tmux paste buffer (`tmux show-buffer`) — the text a
 // mouse-selection-copying TUI (e.g. Claude Code) placed there. Read-only, open on
 // loopback like `glance`; the browser edge uses it so a right-click Copy can reach
@@ -3107,8 +3730,10 @@ async fn create_handler(
                         &state,
                         &view.result.id,
                         &launch_id,
-                        None,
-                        Some((requested_account, 1)),
+                        StructuredPromptGuards {
+                            expected_binding: Some((requested_account, 1)),
+                            ..Default::default()
+                        },
                         &handle,
                         &prompt,
                     )
@@ -3305,17 +3930,18 @@ async fn submit_structured_prompt_locked(
     state: &ServeState,
     id: &str,
     launch_id: &str,
-    expected_session_incarnation: Option<&str>,
-    expected_binding: Option<(&str, u64)>,
+    guards: StructuredPromptGuards<'_>,
     handle: &ControlHandle,
     text: &str,
 ) -> Result<String, Response> {
     let lock_context = state.context.clone();
     let lock_id = id.to_string();
     let expected_launch_id = launch_id.to_string();
-    let expected_session_incarnation = expected_session_incarnation.map(str::to_string);
-    let expected_binding =
-        expected_binding.map(|(account, revision)| (account.to_string(), revision));
+    let expected_session_incarnation = guards.expected_session_incarnation.map(str::to_string);
+    let expected_binding = guards
+        .expected_binding
+        .map(|(account, revision)| (account.to_string(), revision));
+    let notification_fence = guards.notification;
     let (record_lock, session_incarnation) = match tokio::task::spawn_blocking(move || {
         let record_lock = crate::acquire_session_record_lock(&lock_context, &lock_id)?;
         let mut current = load_session_record(&lock_context, &lock_id)?;
@@ -3363,6 +3989,26 @@ async fn submit_structured_prompt_locked(
             &jiff::Timestamp::now().to_string(),
         )?;
         crate::codex_account::ensure_input_allowed(&current)?;
+        if let Some(fence) = notification_fence {
+            let eligible = actual_launch_id == fence.target_incarnation
+                && codex_app_server::runtime_is_supported(&current)
+                && activity::state_for_view(&lock_context, &current)
+                    .is_some_and(|state| state.phase == activity::TurnPhase::Waiting);
+            if !eligible
+                || !crate::coordination::begin_notification_attempt(
+                    &lock_context,
+                    &fence.message_id,
+                    &current.id,
+                    &fence.target_incarnation,
+                )?
+            {
+                return Err(CliError::data(
+                    "coordination-notification-superseded",
+                    "notification eligibility changed before locked prompt submission",
+                    None,
+                ));
+            }
+        }
         Ok::<_, CliError>((record_lock, actual_launch_id))
     })
     .await
@@ -3596,6 +4242,17 @@ async fn submit_structured_prompt_handler(
     text: String,
     expected_session_incarnation: Option<String>,
 ) -> Response {
+    submit_structured_prompt_handler_with_fence(state, id, text, expected_session_incarnation, None)
+        .await
+}
+
+async fn submit_structured_prompt_handler_with_fence(
+    state: Arc<ServeState>,
+    id: String,
+    text: String,
+    expected_session_incarnation: Option<String>,
+    notification_fence: Option<CoordinationNotificationFence>,
+) -> Response {
     if text.trim().is_empty() {
         return status_json(
             StatusCode::BAD_REQUEST,
@@ -3670,8 +4327,11 @@ async fn submit_structured_prompt_handler(
         &state,
         &record.id,
         &launch_id,
-        expected_session_incarnation,
-        None,
+        StructuredPromptGuards {
+            expected_session_incarnation,
+            notification: notification_fence,
+            ..Default::default()
+        },
         &handle,
         &text,
     )
@@ -8317,14 +8977,75 @@ mod tests {
             codex_account_switches: CodexAccountSwitchRegistry::default(),
             session_collector,
             launch_profiles: AgentLaunchProfiles::default(),
+            coordination_wait_workers: Arc::new(tokio::sync::Semaphore::new(
+                COORDINATION_WAIT_WORKER_LIMIT,
+            )),
         })
+    }
+
+    #[tokio::test]
+    async fn coordination_json_routes_share_the_versioned_error_envelope() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let state = state(tmp.path(), Some(TOKEN), minimal_tmux(tmp.path()));
+        for path in [
+            "/sessions/example/work-context/check/v1",
+            "/coordination/work-context/check/v1",
+            "/sessions/example/work-context/claim/v1",
+            "/sessions/example/work-context/renew/v1",
+            "/sessions/example/work-context/release/v1",
+            "/sessions/example/work-context/admit/v1",
+            "/sessions/example/work-context/complete/v1",
+            "/sessions/example/work-context/reconcile/v1",
+            "/sessions/example/broker/adopt/v1",
+            "/sessions/example/broker/reconcile/v1",
+            "/sessions/example/messages/v1",
+            "/sessions/example/messages/message/ack/v1",
+            "/sessions/example/messages/message/reply/v1",
+        ] {
+            let request = Request::builder()
+                .method("POST")
+                .uri(path)
+                .header(AUTHORIZATION, format!("Bearer {TOKEN}"))
+                .header("content-type", "application/json")
+                .body(Body::from("{"))
+                .expect("request");
+            let (status, body) = call(router(state.clone()), request).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "path={path} body={body}");
+            assert_eq!(body["ok"], false, "path={path} body={body}");
+            assert_eq!(
+                body["error"]["code"], "invalid-json-body",
+                "path={path} body={body}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn coordination_query_routes_share_the_versioned_error_envelope() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let state = state(tmp.path(), Some(TOKEN), minimal_tmux(tmp.path()));
+        for path in [
+            "/sessions/example/messages/v1?limit=not-a-number",
+            "/sessions/example/messages/message/wait/v1?if_revision=not-a-number&timeout=1s",
+        ] {
+            let (status, body) = call(
+                router(state.clone()),
+                get_coordination(path, "private-capability"),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "path={path} body={body}");
+            assert_eq!(body["ok"], false, "path={path} body={body}");
+            assert_eq!(
+                body["error"]["code"], "invalid-query",
+                "path={path} body={body}"
+            );
+        }
     }
 
     fn minimal_tmux(dir: &Path) -> PathBuf {
         let bin = dir.join("tmux");
         std::fs::write(
             &bin,
-            "#!/usr/bin/env sh\ncase \"$1\" in\n  has-session) exit 0 ;;\n  new-session) printf '%s\\t%s\\t%s\\n' '$77' '%77' \"$$\"; exit 0 ;;\n  capture-pane) printf 'pane\\n'; exit 0 ;;\n  show-buffer) printf 'buffered selection\\n'; exit 0 ;;\n  *) exit 0 ;;\nesac\n",
+            "#!/usr/bin/env sh\ncase \"$1\" in\n  has-session) exit 0 ;;\n  new-session) heartbeat=''; slot=0; for arg in \"$@\"; do if [ \"$slot\" = 2 ]; then incarnation=\"$arg\"; break; elif [ \"$slot\" = 1 ]; then slot=2; else case \"$arg\" in */coordination/heartbeat) heartbeat=\"$arg\"; slot=1 ;; esac; fi; done; if [ -n \"$heartbeat\" ] && [ -n \"$incarnation\" ]; then mkdir -p \"$(dirname \"$heartbeat\")\"; printf '%s:%s\\n' \"$incarnation\" \"$(date +%s)\" > \"$heartbeat\"; chmod 600 \"$heartbeat\"; fi; printf '%s\\t%s\\t%s\\n' '$77' '%77' \"$$\"; exit 0 ;;\n  capture-pane) printf 'pane\\n'; exit 0 ;;\n  show-buffer) printf 'buffered selection\\n'; exit 0 ;;\n  *) exit 0 ;;\nesac\n",
         )
         .unwrap();
         let mut perms = std::fs::metadata(&bin).unwrap().permissions();
@@ -8617,7 +9338,7 @@ esac
         executable(
             &dir.join("tmux"),
             &format!(
-                "#!/usr/bin/env sh\nprintf '%s\\n' \"$*\" >> {}\ncase \"$1\" in\n  has-session) exit 1 ;;\n  new-session) printf '%s\\t%s\\t%s\\n' '$77' '%77' \"$$\"; exit 0 ;;\n  *) exit 0 ;;\nesac\n",
+                "#!/usr/bin/env sh\nprintf '%s\\n' \"$*\" >> {}\ncase \"$1\" in\n  has-session) exit 1 ;;\n  new-session) heartbeat=''; slot=0; for arg in \"$@\"; do if [ \"$slot\" = 2 ]; then incarnation=\"$arg\"; break; elif [ \"$slot\" = 1 ]; then slot=2; else case \"$arg\" in */coordination/heartbeat) heartbeat=\"$arg\"; slot=1 ;; esac; fi; done; if [ -n \"$heartbeat\" ] && [ -n \"$incarnation\" ]; then mkdir -p \"$(dirname \"$heartbeat\")\"; printf '%s:%s\\n' \"$incarnation\" \"$(date +%s)\" > \"$heartbeat\"; chmod 600 \"$heartbeat\"; fi; printf '%s\\t%s\\t%s\\n' '$77' '%77' \"$$\"; exit 0 ;;\n  *) exit 0 ;;\nesac\n",
                 shell_words::quote(&log.to_string_lossy())
             ),
         )
@@ -9131,6 +9852,27 @@ esac
             builder = builder.header("authorization", format!("Bearer {token}"));
         }
         builder
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap()
+    }
+
+    fn get_coordination(uri: &str, capability: &str) -> Request<Body> {
+        Request::builder()
+            .method("GET")
+            .uri(uri)
+            .header("authorization", format!("Bearer {TOKEN}"))
+            .header("x-agent-session-capability", capability)
+            .body(Body::empty())
+            .unwrap()
+    }
+
+    fn post_coordination(uri: &str, capability: &str, body: Value) -> Request<Body> {
+        Request::builder()
+            .method("POST")
+            .uri(uri)
+            .header("authorization", format!("Bearer {TOKEN}"))
+            .header("x-agent-session-capability", capability)
+            .header("content-type", "application/json")
             .body(Body::from(serde_json::to_vec(&body).unwrap()))
             .unwrap()
     }
@@ -11628,6 +12370,19 @@ case "$1" in
   new-session)
     printf '%s\n' {transcript_line} > {transcript}
     : > {running}
+    heartbeat=''
+    slot=0
+    for arg in "$@"; do
+      if [ "$slot" = 2 ]; then incarnation="$arg"; break
+      elif [ "$slot" = 1 ]; then slot=2
+      else case "$arg" in */coordination/heartbeat) heartbeat="$arg"; slot=1 ;; esac
+      fi
+    done
+    if [ -n "$heartbeat" ] && [ -n "$incarnation" ]; then
+      mkdir -p "$(dirname "$heartbeat")"
+      printf '%s:%s\n' "$incarnation" "$(date +%s)" > "$heartbeat"
+      chmod 600 "$heartbeat"
+    fi
     printf '%s\t%s\t%s\n' '$77' '%77' "$(cat {pane_pid})"
     ;;
   *) exit 0 ;;
@@ -11678,6 +12433,8 @@ esac
         );
 
         drop(first_pane);
+        let stopped_record = load_session_record(&st.context, "fresh-profile").unwrap();
+        crate::coordination::revoke(&st.context, &stopped_record).unwrap();
         fs::remove_file(&running).unwrap();
         let (list_status, list_body) = call(router(st.clone()), get("/sessions")).await;
         assert_eq!(list_status, StatusCode::OK, "body={list_body}");
@@ -12651,8 +13408,10 @@ esac
             &st,
             "structured-final-fence",
             &launch_id,
-            Some(&launch_id),
-            None,
+            StructuredPromptGuards {
+                expected_session_incarnation: Some(&launch_id),
+                ..Default::default()
+            },
             &handle,
             "must not cross the final locked recheck",
         )
@@ -12672,6 +13431,66 @@ esac
             commands.try_recv(),
             Err(tokio::sync::mpsc::error::TryRecvError::Empty)
         ));
+    }
+
+    #[tokio::test]
+    async fn coordination_review_notification_final_lock_rejects_nonwaiting_activity() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let launch_id = seed_codex_app_server_session(tmp.path(), "notification-final-fence");
+        let st = state(tmp.path(), Some(TOKEN), minimal_tmux(tmp.path()));
+        let (handle, mut commands) = codex_app_server::control_channel();
+        let response = submit_structured_prompt_locked(
+            &st,
+            "notification-final-fence",
+            &launch_id,
+            StructuredPromptGuards {
+                expected_session_incarnation: Some(&launch_id),
+                notification: Some(CoordinationNotificationFence {
+                    message_id: "message".to_string(),
+                    target_incarnation: launch_id.clone(),
+                }),
+                ..Default::default()
+            },
+            &handle,
+            "fixed coordination notification",
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            body["error"]["code"],
+            "coordination-notification-superseded"
+        );
+        assert!(matches!(
+            commands.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[tokio::test]
+    async fn coordination_review_wait_workers_are_strictly_bounded() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let st = state(tmp.path(), Some(TOKEN), minimal_tmux(tmp.path()));
+        let mut permits = Vec::new();
+        for _ in 0..COORDINATION_WAIT_WORKER_LIMIT {
+            permits.push(
+                st.coordination_wait_workers
+                    .clone()
+                    .try_acquire_owned()
+                    .expect("bounded permit"),
+            );
+        }
+        assert!(
+            st.coordination_wait_workers
+                .clone()
+                .try_acquire_owned()
+                .is_err()
+        );
+        drop(permits);
     }
 
     #[tokio::test]
@@ -12936,8 +13755,10 @@ esac
             &st,
             &record.id,
             &launch_id,
-            None,
-            Some(("gamania", 1)),
+            StructuredPromptGuards {
+                expected_binding: Some(("gamania", 1)),
+                ..Default::default()
+            },
             &handle,
             "must not reach superseding account",
         )
@@ -15502,7 +16323,7 @@ esac
         let tmux = executable(
             &tmp.path().join("tmux-resume-lock"),
             &format!(
-                "#!/usr/bin/env sh\ncase \"$1\" in\n  has-session) [ -f {running} ] ;;\n  new-session) : > {started}; while [ ! -f {release} ]; do sleep 0.01; done; : > {running}; printf '%s\\t%s\\t%s\\n' '$77' '%77' \"$$\"; exit 0 ;;\n  *) exit 0 ;;\nesac\n",
+                "#!/usr/bin/env sh\ncase \"$1\" in\n  has-session) [ -f {running} ] ;;\n  new-session) : > {started}; while [ ! -f {release} ]; do sleep 0.01; done; : > {running}; heartbeat=''; slot=0; for arg in \"$@\"; do if [ \"$slot\" = 2 ]; then incarnation=\"$arg\"; break; elif [ \"$slot\" = 1 ]; then slot=2; else case \"$arg\" in */coordination/heartbeat) heartbeat=\"$arg\"; slot=1 ;; esac; fi; done; if [ -n \"$heartbeat\" ] && [ -n \"$incarnation\" ]; then mkdir -p \"$(dirname \"$heartbeat\")\"; printf '%s:%s\\n' \"$incarnation\" \"$(date +%s)\" > \"$heartbeat\"; chmod 600 \"$heartbeat\"; fi; printf '%s\\t%s\\t%s\\n' '$77' '%77' \"$$\"; exit 0 ;;\n  *) exit 0 ;;\nesac\n",
                 started = shell_words::quote(&started.to_string_lossy()),
                 release = shell_words::quote(&release.to_string_lossy()),
                 running = shell_words::quote(&running.to_string_lossy()),
@@ -18027,7 +18848,7 @@ exit 0
         std::fs::write(
             &bin,
             format!(
-                "#!/usr/bin/env sh\nprintf '%s\\n' \"$*\" >> {}\ncase \"$1\" in\n  has-session) exit 0 ;;\n  new-session) printf '%s\\t%s\\t%s\\n' '$77' '%77' \"$$\"; exit 0 ;;\n  capture-pane) printf 'pane\\n'; exit 0 ;;\n  *) exit 0 ;;\nesac\n",
+                "#!/usr/bin/env sh\nprintf '%s\\n' \"$*\" >> {}\ncase \"$1\" in\n  has-session) exit 0 ;;\n  new-session) heartbeat=''; slot=0; for arg in \"$@\"; do if [ \"$slot\" = 2 ]; then incarnation=\"$arg\"; break; elif [ \"$slot\" = 1 ]; then slot=2; else case \"$arg\" in */coordination/heartbeat) heartbeat=\"$arg\"; slot=1 ;; esac; fi; done; if [ -n \"$heartbeat\" ] && [ -n \"$incarnation\" ]; then mkdir -p \"$(dirname \"$heartbeat\")\"; printf '%s:%s\\n' \"$incarnation\" \"$(date +%s)\" > \"$heartbeat\"; chmod 600 \"$heartbeat\"; fi; printf '%s\\t%s\\t%s\\n' '$77' '%77' \"$$\"; exit 0 ;;\n  capture-pane) printf 'pane\\n'; exit 0 ;;\n  *) exit 0 ;;\nesac\n",
                 shell_words::quote(&log.to_string_lossy())
             ),
         )
@@ -18036,6 +18857,40 @@ exit 0
         perms.set_mode(0o755);
         std::fs::set_permissions(&bin, perms).unwrap();
         bin
+    }
+
+    fn provision_ready_coordination_fixture(
+        context: &CliContext,
+        record: &crate::SessionRecord,
+    ) -> String {
+        let capability_path =
+            crate::coordination::provision(context, record).expect("provision fixture");
+        let incarnation = record
+            .runtime
+            .as_ref()
+            .map(|runtime| runtime.launch_id.as_str())
+            .expect("fixture incarnation");
+        let now = crate::coordination::now_epoch();
+        let heartbeat = crate::coordination::heartbeat_path(&context.state_dir, &record.id);
+        std::fs::write(&heartbeat, format!("{incarnation}:{now}\n")).expect("heartbeat fixture");
+        std::fs::set_permissions(&heartbeat, std::fs::Permissions::from_mode(0o600))
+            .expect("heartbeat mode");
+        let registry_path = context.state_dir.join("coordination/registry.json");
+        let mut registry: Value = serde_json::from_slice(
+            &std::fs::read(&registry_path).expect("coordination registry fixture"),
+        )
+        .expect("coordination registry json");
+        registry["brokers"][&record.id]["state"] = json!("ready");
+        registry["brokers"][&record.id]["heartbeat_at"] = json!("2030-01-01T00:00:00Z");
+        registry["brokers"][&record.id]["heartbeat_epoch"] = json!(now);
+        std::fs::write(
+            &registry_path,
+            serde_json::to_vec_pretty(&registry).expect("registry json"),
+        )
+        .expect("registry fixture");
+        std::fs::set_permissions(&registry_path, std::fs::Permissions::from_mode(0o600))
+            .expect("registry mode");
+        std::fs::read_to_string(capability_path).expect("capability fixture")
     }
 
     /// tmux stub that logs every invocation to `calls` and, on `load-buffer`,
@@ -18059,6 +18914,199 @@ exit 0
         perms.set_mode(0o755);
         std::fs::set_permissions(&bin, perms).unwrap();
         bin
+    }
+
+    #[tokio::test]
+    async fn coordination_mutations_require_session_authority_while_reads_are_operator_public() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        seed_session_with_runtime(tmp.path(), "alpha", "codex", "hs-codex-alpha");
+        let state = state(tmp.path(), Some(TOKEN), minimal_tmux(tmp.path()));
+        let record = load_session_record(&state.context, "alpha").expect("session");
+        let capability = provision_ready_coordination_fixture(&state.context, &record);
+
+        let candidate = json!({
+            "schema_version": "agent-session.work-context-input.v1",
+            "intent": "implementation",
+            "tier": "L2",
+            "repositories": ["example/repository"],
+            "worktrees": [],
+            "provider_refs": [],
+            "plan_refs": [],
+            "scopes": [{
+                "kind": "path-prefix",
+                "repository": "example/repository",
+                "value": "src"
+            }],
+            "summary": "HTTP parity fixture"
+        });
+        let (status, body) = call(
+            router(state.clone()),
+            post_coordination(
+                "/sessions/alpha/work-context/claim/v1",
+                capability.trim(),
+                json!({
+                    "candidate": candidate,
+                    "idempotency_key": "http-claim-alpha-0001",
+                    "if_revision": null
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(
+            body["data"]["coordination"]["context"]["schema_version"],
+            "agent-session.work-context.v1"
+        );
+        assert!(!body.to_string().contains(capability.trim()));
+
+        let (status, shown) = call(
+            router(state.clone()),
+            get_coordination("/sessions/alpha/work-context/v1", capability.trim()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{shown}");
+        assert_eq!(
+            shown["data"]["coordination"]["claim_id"],
+            body["data"]["coordination"]["context"]["claim_id"]
+        );
+
+        let (status, denied) = call(
+            router(state),
+            get_coordination(
+                "/sessions/alpha/work-context/v1",
+                "wrong-capability-material",
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{denied}");
+        assert_eq!(
+            denied["data"]["coordination"]["claim_id"],
+            body["data"]["coordination"]["context"]["claim_id"]
+        );
+    }
+
+    #[tokio::test]
+    async fn coordination_message_routes_keep_body_out_of_send_and_inbox() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        seed_session_with_runtime(tmp.path(), "alpha", "codex", "hs-codex-alpha");
+        seed_session_with_runtime(tmp.path(), "beta", "codex", "hs-codex-beta");
+        let state = state(tmp.path(), Some(TOKEN), minimal_tmux(tmp.path()));
+        let alpha = load_session_record(&state.context, "alpha").expect("alpha");
+        let beta = load_session_record(&state.context, "beta").expect("beta");
+        let alpha_capability = provision_ready_coordination_fixture(&state.context, &alpha);
+        let beta_capability = provision_ready_coordination_fixture(&state.context, &beta);
+        let canary = "HTTP-PRIVATE-MESSAGE-CANARY";
+
+        let (status, sent) = call(
+            router(state.clone()),
+            post_coordination(
+                "/sessions/beta/messages/v1",
+                alpha_capability.trim(),
+                json!({
+                    "body": canary,
+                    "idempotency_key": "http-message-alpha-0001",
+                    "reply_to": null,
+                    "expires_in": null
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{sent}");
+        assert!(!sent.to_string().contains(canary));
+        let message_id = sent["data"]["coordination"]["message_id"]
+            .as_str()
+            .expect("message id")
+            .to_string();
+
+        let (status, inbox) = call(
+            router(state.clone()),
+            get_coordination("/sessions/beta/messages/v1", beta_capability.trim()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{inbox}");
+        assert!(!inbox.to_string().contains(canary));
+
+        let (status, shown) = call(
+            router(state),
+            get_coordination(
+                &format!("/sessions/beta/messages/{message_id}/v1"),
+                beta_capability.trim(),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{shown}");
+        assert_eq!(
+            shown["data"]["coordination"]["body"]["classification"],
+            "untrusted_peer_data"
+        );
+        assert_eq!(shown["data"]["coordination"]["body"]["text"], canary);
+    }
+
+    #[tokio::test]
+    async fn coordination_wait_cancellation_releases_the_bounded_worker() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        seed_session_with_runtime(tmp.path(), "alpha", "codex", "hs-codex-alpha");
+        seed_session_with_runtime(tmp.path(), "beta", "codex", "hs-codex-beta");
+        let state = state(tmp.path(), Some(TOKEN), minimal_tmux(tmp.path()));
+        let alpha = load_session_record(&state.context, "alpha").expect("alpha");
+        let beta = load_session_record(&state.context, "beta").expect("beta");
+        let alpha_capability = provision_ready_coordination_fixture(&state.context, &alpha);
+        let beta_capability = provision_ready_coordination_fixture(&state.context, &beta);
+        let (status, sent) = call(
+            router(state.clone()),
+            post_coordination(
+                "/sessions/beta/messages/v1",
+                alpha_capability.trim(),
+                json!({
+                    "body": "wait-cancellation-fixture",
+                    "idempotency_key": "http-wait-cancel-0001",
+                    "reply_to": null,
+                    "expires_in": null
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{sent}");
+        let message_id = sent["data"]["coordination"]["message_id"]
+            .as_str()
+            .expect("message id")
+            .to_string();
+        let waiting_state = state.clone();
+        let wait_path =
+            format!("/sessions/beta/messages/{message_id}/wait/v1?if_revision=1&timeout=60s");
+        let wait_capability = beta_capability.trim().to_string();
+        let request = tokio::spawn(async move {
+            call(
+                router(waiting_state),
+                get_coordination(&wait_path, &wait_capability),
+            )
+            .await
+        });
+        for _ in 0..50 {
+            if state.coordination_wait_workers.available_permits()
+                == COORDINATION_WAIT_WORKER_LIMIT - 1
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            state.coordination_wait_workers.available_permits(),
+            COORDINATION_WAIT_WORKER_LIMIT - 1
+        );
+        request.abort();
+        let _ = request.await;
+        for _ in 0..50 {
+            if state.coordination_wait_workers.available_permits() == COORDINATION_WAIT_WORKER_LIMIT
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            state.coordination_wait_workers.available_permits(),
+            COORDINATION_WAIT_WORKER_LIMIT
+        );
     }
 
     fn test_record(id: &str, tmux_session: &str) -> crate::SessionRecord {
