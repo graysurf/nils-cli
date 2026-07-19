@@ -89,9 +89,12 @@ claim, operation, and message identifiers are selectors and revision fences,
 not credentials. Start, run, provider import, and resume create a held tmux pane;
 the provider command is released only after the exact runtime identity and
 private capability are durable. A sidecar heartbeat survives launcher exit,
-rotates on resume, and removes its incarnation-specific capability after target
-exit. Delete revokes the capability and releases active coordination state
-before removing the session.
+requires that capability as private launch authority, rotates on resume, and
+removes its incarnation-specific capability after positively observed target
+exit. Runtime uncertainty degrades without releasing conflict fences. Broker
+recovery remains non-ready until reconciliation and its idempotency receipt are
+committed atomically. Delete revokes the capability and releases active
+coordination state before removing the session.
 
 `work-context claim|show|check|renew|release` manages an authenticated
 30-minute structured claim. Claims contain canonical repositories, private-keyed
@@ -103,10 +106,12 @@ admit|complete|reconcile` binds covered filesystem/provider mutation targets to
 an execution token, exact activity/descendant evidence, and the persisted
 runtime identity. Releasing or replacing the claim is rejected while that
 operation is active or uncertain; a matching activity or descendant renews the
-30-minute lease. Completion first enters a bounded durable broker queue so a
-lost PostTool response can be retried; missed completion needs exact stopped-runtime proof or two
-quiescent observations at least five seconds apart. Opaque, unbound-checkout,
-or uncovered targets fail closed.
+30-minute lease. Completion first enters a bounded durable broker queue that
+the heartbeat sidecar drains, including across the exact safety-TTL transition,
+so a lost PostTool response does not require the caller to survive; missed
+completion needs exact stopped-runtime proof or two quiescent observations at
+least five seconds apart. Opaque, unbound-checkout, or uncovered targets fail
+closed.
 Peer summaries remain untrusted metadata and cannot authorize commands.
 
 `message send|inbox|show|ack|reply|wait` provides the private bounded mailbox.
@@ -118,7 +123,8 @@ registry, 30-pair/minute with burst 10, opaque bounded cursors, 50/100-page,
 60-second wait, and depth-16 reply limits.
 Acknowledged entries retain metadata for 24 hours; expired entries have bounded
 terminal retention, and the HTTP
-surface admits at most 16 blocking waits at once.
+surface admits at most 16 blocking waits at once and releases a worker promptly
+when its request is cancelled.
 The authoritative result is always queued mail. When the serve controller sees
 an exact idle prompt-v2 target, it durably records one attempt before submitting
 the fixed body-free notification; busy, replaced, unsupported, failed, and

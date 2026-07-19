@@ -1723,6 +1723,40 @@ fn coordination_review_round3_reply_binding_and_revision_are_in_the_receipt() {
         changed_revision.stdout_json()["error"]["code"],
         "idempotency-key-reused"
     );
+    rewrite_registry(&state_dir, |registry| {
+        registry["messages"]
+            .as_array_mut()
+            .expect("messages")
+            .retain(|message| message["message_id"] != parent);
+    });
+    let replayed = run(
+        tmp.path(),
+        &[
+            "--state-dir",
+            state_dir.to_str().expect("state"),
+            "message",
+            "reply",
+            "--session",
+            "beta",
+            "--message",
+            &parent,
+            "--if-revision",
+            "1",
+            "--body-file",
+            body.to_str().expect("body"),
+            "--capability-file",
+            &capability(&state_dir, "beta"),
+            "--idempotency-key",
+            "round3-reply-cas-0001",
+            "--format",
+            "json",
+        ],
+    );
+    assert_eq!(replayed.code, 0, "stderr={}", replayed.stderr_text());
+    assert_eq!(
+        data(&replayed)["message_id"],
+        data(&first_reply)["message_id"]
+    );
 }
 
 #[test]

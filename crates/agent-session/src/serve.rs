@@ -3252,8 +3252,12 @@ async fn coordination_inbox_handler(
     State(state): State<Arc<ServeState>>,
     headers: HeaderMap,
     AxPath(id): AxPath<String>,
-    Query(query): Query<coordination_server::InboxQuery>,
+    query: Result<Query<coordination_server::InboxQuery>, QueryRejection>,
 ) -> Response {
+    let query = match coordination_query(query) {
+        Ok(query) => query,
+        Err(response) => return response,
+    };
     let token = match coordination_authority(&state, &headers) {
         Ok(token) => token,
         Err(response) => return response,
@@ -3305,6 +3309,17 @@ fn coordination_json<T>(body: Result<Json<T>, JsonRejection>) -> Result<T, Respo
         envelope_err(CliError::usage(
             "invalid-json-body",
             "coordination request body is invalid",
+            None,
+        ))
+    })
+}
+
+#[allow(clippy::result_large_err)]
+fn coordination_query<T>(query: Result<Query<T>, QueryRejection>) -> Result<T, Response> {
+    query.map(|Query(value)| value).map_err(|_| {
+        envelope_err(CliError::usage(
+            "invalid-query",
+            "coordination request query is invalid",
             None,
         ))
     })
@@ -3414,8 +3429,12 @@ async fn coordination_wait_handler(
     State(state): State<Arc<ServeState>>,
     headers: HeaderMap,
     AxPath((id, message_id)): AxPath<(String, String)>,
-    Query(body): Query<coordination_server::WaitBody>,
+    body: Result<Query<coordination_server::WaitBody>, QueryRejection>,
 ) -> Response {
+    let body = match coordination_query(body) {
+        Ok(body) => body,
+        Err(response) => return response,
+    };
     let token = match coordination_authority(&state, &headers) {
         Ok(token) => token,
         Err(response) => return response,
@@ -3431,15 +3450,32 @@ async fn coordination_wait_handler(
         }
     };
     let context = state.context.clone();
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let _cancellation = CoordinationWaitCancellation(cancelled.clone());
     match tokio::task::spawn_blocking(move || {
         let _permit = permit;
-        coordination_server::wait(&context, &id, &message_id, &token, body)
+        coordination_server::wait_with_cancellation(
+            &context,
+            &id,
+            &message_id,
+            &token,
+            body,
+            Some(cancelled.as_ref()),
+        )
     })
     .await
     {
         Ok(Ok(value)) => coordination_ok(&state, value),
         Ok(Err(error)) => envelope_err(error),
         Err(_) => join_err(),
+    }
+}
+
+struct CoordinationWaitCancellation(Arc<AtomicBool>);
+
+impl Drop for CoordinationWaitCancellation {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Release);
     }
 }
 
@@ -8978,6 +9014,28 @@ mod tests {
             assert_eq!(body["ok"], false, "path={path} body={body}");
             assert_eq!(
                 body["error"]["code"], "invalid-json-body",
+                "path={path} body={body}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn coordination_query_routes_share_the_versioned_error_envelope() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let state = state(tmp.path(), Some(TOKEN), minimal_tmux(tmp.path()));
+        for path in [
+            "/sessions/example/messages/v1?limit=not-a-number",
+            "/sessions/example/messages/message/wait/v1?if_revision=not-a-number&timeout=1s",
+        ] {
+            let (status, body) = call(
+                router(state.clone()),
+                get_coordination(path, "private-capability"),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "path={path} body={body}");
+            assert_eq!(body["ok"], false, "path={path} body={body}");
+            assert_eq!(
+                body["error"]["code"], "invalid-query",
                 "path={path} body={body}"
             );
         }
@@ -18982,6 +19040,73 @@ exit 0
             "untrusted_peer_data"
         );
         assert_eq!(shown["data"]["coordination"]["body"]["text"], canary);
+    }
+
+    #[tokio::test]
+    async fn coordination_wait_cancellation_releases_the_bounded_worker() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        seed_session_with_runtime(tmp.path(), "alpha", "codex", "hs-codex-alpha");
+        seed_session_with_runtime(tmp.path(), "beta", "codex", "hs-codex-beta");
+        let state = state(tmp.path(), Some(TOKEN), minimal_tmux(tmp.path()));
+        let alpha = load_session_record(&state.context, "alpha").expect("alpha");
+        let beta = load_session_record(&state.context, "beta").expect("beta");
+        let alpha_capability = provision_ready_coordination_fixture(&state.context, &alpha);
+        let beta_capability = provision_ready_coordination_fixture(&state.context, &beta);
+        let (status, sent) = call(
+            router(state.clone()),
+            post_coordination(
+                "/sessions/beta/messages/v1",
+                alpha_capability.trim(),
+                json!({
+                    "body": "wait-cancellation-fixture",
+                    "idempotency_key": "http-wait-cancel-0001",
+                    "reply_to": null,
+                    "expires_in": null
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{sent}");
+        let message_id = sent["data"]["coordination"]["message_id"]
+            .as_str()
+            .expect("message id")
+            .to_string();
+        let waiting_state = state.clone();
+        let wait_path =
+            format!("/sessions/beta/messages/{message_id}/wait/v1?if_revision=1&timeout=60s");
+        let wait_capability = beta_capability.trim().to_string();
+        let request = tokio::spawn(async move {
+            call(
+                router(waiting_state),
+                get_coordination(&wait_path, &wait_capability),
+            )
+            .await
+        });
+        for _ in 0..50 {
+            if state.coordination_wait_workers.available_permits()
+                == COORDINATION_WAIT_WORKER_LIMIT - 1
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            state.coordination_wait_workers.available_permits(),
+            COORDINATION_WAIT_WORKER_LIMIT - 1
+        );
+        request.abort();
+        let _ = request.await;
+        for _ in 0..50 {
+            if state.coordination_wait_workers.available_permits() == COORDINATION_WAIT_WORKER_LIMIT
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            state.coordination_wait_workers.available_permits(),
+            COORDINATION_WAIT_WORKER_LIMIT
+        );
     }
 
     fn test_record(id: &str, tmux_session: &str) -> crate::SessionRecord {

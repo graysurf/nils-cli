@@ -496,15 +496,16 @@ pub(crate) fn reply(
     })
 }
 
-pub(crate) fn wait(
+pub(crate) fn wait_with_cancellation(
     context: &CliContext,
     id: &str,
     message: &str,
     token: &str,
     body: WaitBody,
+    cancelled: Option<&std::sync::atomic::AtomicBool>,
 ) -> Result<Value, CliError> {
     let server_capability = authorize(context, id, token)?;
-    mailbox::wait(
+    mailbox::wait_with_cancellation(
         context,
         cli::MessageWaitArgs {
             session: id.to_string(),
@@ -514,6 +515,7 @@ pub(crate) fn wait(
             capability_file: Some(server_capability.path.clone()),
             format: nils_common::cli_contract::OutputFormat::Json,
         },
+        cancelled,
     )
 }
 

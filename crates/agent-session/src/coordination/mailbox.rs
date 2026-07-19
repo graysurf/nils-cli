@@ -121,6 +121,7 @@ pub(crate) fn send(context: &CliContext, args: MessageSendArgs) -> Result<Value,
         None,
         None,
         None,
+        None,
     )
 }
 
@@ -370,8 +371,33 @@ pub(crate) fn reply(context: &CliContext, args: MessageReplyArgs) -> Result<Valu
     let (record, sender_incarnation) =
         authenticate_from_file(context, &args.session, Some(&capability_file))?;
     let body = read_body(&args.body_file)?;
+    let digest = reply_request_digest(&record.id, &args.message, &body, args.if_revision);
+    let _sender_lock = crate::acquire_session_record_lock(context, &record.id)
+        .map_err(|_| super::unauthorized())?;
+    let sender =
+        crate::load_session_record(context, &record.id).map_err(|_| super::unauthorized())?;
     let mut locked = lock_registry(context)?;
     let registry_changed = clean_expired(&mut locked.registry, now_epoch());
+    revalidate_capability_file(
+        context,
+        &locked.registry,
+        &sender,
+        &sender_incarnation,
+        &capability_file,
+    )?;
+    if let Some(replay) = idempotency_replay(
+        &locked.registry,
+        &args.idempotency_key,
+        &record.id,
+        &sender_incarnation,
+        "message-reply",
+        &digest,
+    )? {
+        if registry_changed {
+            locked.save()?;
+        }
+        return Ok(replay);
+    }
     let original = locked
         .registry
         .messages
@@ -386,6 +412,7 @@ pub(crate) fn reply(context: &CliContext, args: MessageReplyArgs) -> Result<Valu
         locked.save()?;
     }
     drop(locked);
+    drop(_sender_lock);
     let original = original.ok_or_else(message_not_found)?;
     if original.state == "expired" {
         return Err(message_expired());
@@ -411,16 +438,49 @@ pub(crate) fn reply(context: &CliContext, args: MessageReplyArgs) -> Result<Valu
         Some(original.reply_depth.saturating_add(1)),
         Some(&original.sender_incarnation),
         Some(args.if_revision),
+        Some(digest),
+    )
+}
+
+fn reply_request_digest(
+    sender_session_id: &str,
+    message_id: &str,
+    body: &str,
+    if_revision: u64,
+) -> String {
+    request_digest(
+        "message-reply",
+        &json!({
+            "sender": sender_session_id,
+            "reply_to": message_id,
+            "body_digest": super::digest_bytes(body.as_bytes()),
+            "if_revision": if_revision,
+        }),
     )
 }
 
 pub(crate) fn wait(context: &CliContext, args: MessageWaitArgs) -> Result<Value, CliError> {
+    wait_with_cancellation(context, args, None)
+}
+
+pub(crate) fn wait_with_cancellation(
+    context: &CliContext,
+    args: MessageWaitArgs,
+    cancelled: Option<&std::sync::atomic::AtomicBool>,
+) -> Result<Value, CliError> {
     let capability_file = resolve_capability_file(args.capability_file.as_deref())?;
     let (record, recipient_incarnation) =
         authenticate_from_file(context, &args.session, Some(&capability_file))?;
     let timeout = parse_wait(&args.timeout)?;
     let started = Instant::now();
     loop {
+        if cancelled.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Acquire)) {
+            return Err(CliError::runtime(
+                "wait-cancelled",
+                "message wait was cancelled",
+                None,
+            ));
+        }
         let mut locked = lock_registry(context)?;
         let registry_changed = clean_expired(&mut locked.registry, now_epoch());
         revalidate_capability_file(
@@ -495,6 +555,7 @@ fn send_authenticated(
     explicit_reply_depth: Option<u8>,
     expected_recipient_incarnation: Option<&str>,
     expected_parent_revision: Option<u64>,
+    request_digest_override: Option<String>,
 ) -> Result<Value, CliError> {
     if sender_session_id == recipient_session_id && reply_to.is_some() {
         return Err(CliError::data(
@@ -504,17 +565,19 @@ fn send_authenticated(
         ));
     }
     let expiry_secs = parse_expiry(expires_in)?;
-    let digest = request_digest(
-        operation,
-        &json!({
-            "sender": sender_session_id,
-            "recipient": recipient_session_id,
-            "body_digest": super::digest_bytes(body.as_bytes()),
-            "reply_to": reply_to,
-            "expiry_secs": expiry_secs,
-            "if_revision": expected_parent_revision,
-        }),
-    );
+    let digest = request_digest_override.unwrap_or_else(|| {
+        request_digest(
+            operation,
+            &json!({
+                "sender": sender_session_id,
+                "recipient": recipient_session_id,
+                "body_digest": super::digest_bytes(body.as_bytes()),
+                "reply_to": reply_to,
+                "expiry_secs": expiry_secs,
+                "if_revision": expected_parent_revision,
+            }),
+        )
+    });
     {
         let _sender_lock = crate::acquire_session_record_lock(context, sender_session_id)
             .map_err(|_| super::unauthorized())?;
@@ -966,5 +1029,16 @@ mod tests {
         assert_eq!(parse_expiry(Some("7d")).expect("maximum"), 604_800);
         assert!(parse_expiry(Some("8d")).is_err());
         assert!(parse_wait("61s").is_err());
+    }
+
+    #[test]
+    fn coordination_review_reply_digest_does_not_depend_on_retained_parent_metadata() {
+        let first = reply_request_digest("sender", "message", "body", 1);
+        let retry = reply_request_digest("sender", "message", "body", 1);
+        assert_eq!(first, retry);
+        assert_ne!(
+            first,
+            reply_request_digest("sender", "message", "changed", 1)
+        );
     }
 }

@@ -468,6 +468,8 @@ pub struct BrokerHeartbeatArgs {
     pub incarnation: String,
     #[arg(long)]
     pub generation: u64,
+    #[arg(long, value_name = "PATH", value_hint = ValueHint::FilePath)]
+    pub capability_file: PathBuf,
     #[arg(long, value_enum, default_value_t = OutputFormat::Json)]
     pub format: OutputFormat,
 }

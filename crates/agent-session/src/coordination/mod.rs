@@ -723,19 +723,19 @@ pub(crate) fn clean_expired(registry: &mut Registry, now: i64) -> bool {
                     "active" | "completing" | "reconcile_pending"
                 )
         });
-        let owner_runtime_live = registry
+        let owner_runtime_stopped = registry
             .brokers
             .get(&claim.session_id)
             .filter(|broker| broker.incarnation == claim.session_incarnation)
             .and_then(|broker| broker.runtime_identity.as_ref())
             .is_some_and(|identity| {
                 crate::coordination_runtime_status_for_identity(identity)
-                    == crate::CoordinationRuntimeStatus::Running
+                    == crate::CoordinationRuntimeStatus::Stopped
             });
         if claim.state == "active"
             && claim.expires_at_epoch <= now
             && !bound_operation
-            && !owner_runtime_live
+            && owner_runtime_stopped
         {
             claim.state = "expired".to_string();
             claim.revision = claim.revision.saturating_add(1);
@@ -1290,5 +1290,48 @@ mod tests {
         .expect("registry");
         clean_expired(&mut registry, now);
         assert_eq!(registry.messages.len(), 1);
+    }
+
+    #[test]
+    fn coordination_review_unknown_runtime_retains_expired_conflict_fence() {
+        let mut registry: Registry = serde_json::from_value(json!({
+            "schema_version": REGISTRY_VERSION,
+            "brokers": {
+                "session": {
+                    "session_id": "session",
+                    "incarnation": "incarnation",
+                    "capability_digest": "digest",
+                    "generation": 1,
+                    "state": "degraded",
+                    "heartbeat_at": "2030-01-01T00:00:00Z",
+                    "heartbeat_epoch": 1,
+                    "runtime_identity": {"malformed": true},
+                    "runtime_identity_digest": "runtime"
+                }
+            },
+            "claims": [{
+                "schema_version": "agent-session.work-context.v1",
+                "session_id": "session",
+                "session_incarnation": "incarnation",
+                "claim_id": "claim",
+                "revision": 1,
+                "state": "active",
+                "intent": "implementation",
+                "tier": "L2",
+                "repositories": ["example/repository"],
+                "worktrees": [],
+                "provider_refs": [],
+                "plan_refs": [],
+                "scopes": [{"kind": "repository", "repository": "example/repository", "value": ""}],
+                "summary": "fixture",
+                "updated_at": "2030-01-01T00:00:00Z",
+                "expires_at": "2030-01-01T00:00:01Z",
+                "expires_at_epoch": 1
+            }]
+        }))
+        .expect("registry");
+
+        clean_expired(&mut registry, 2);
+        assert_eq!(registry.claims[0].state, "active");
     }
 }

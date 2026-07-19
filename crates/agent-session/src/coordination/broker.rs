@@ -558,7 +558,7 @@ pub(crate) fn recover(
             None,
         ));
     }
-    let locked = lock_registry(context)?;
+    let mut locked = lock_registry(context)?;
     if let Some(replay) = idempotency_replay(
         &locked.registry,
         &args.idempotency_key,
@@ -612,17 +612,47 @@ pub(crate) fn recover(
             None,
         ));
     }
+    let sidecar_already_running = broker_snapshot.state == "recovering"
+        && heartbeat_fresh(context, &record.id, &record_incarnation, 0);
+    if broker_snapshot.state != "recovering" {
+        let broker = locked
+            .registry
+            .brokers
+            .get_mut(&record.id)
+            .filter(|broker| {
+                broker.incarnation == record_incarnation
+                    && broker.generation == record_generation
+                    && broker.runtime_identity_digest == runtime.identity_digest
+            })
+            .ok_or_else(unavailable)?;
+        broker.state = "recovering".to_string();
+        broker.lost_since_epoch.get_or_insert(now_epoch());
+        locked.save()?;
+    }
     drop(locked);
     let heartbeat = super::heartbeat_path(&context.state_dir, &record.id);
-    match fs::remove_file(&heartbeat) {
-        Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(_) => return Err(unavailable()),
+    let heartbeat_before = fs::metadata(&heartbeat)
+        .and_then(|metadata| metadata.modified())
+        .ok();
+    if !sidecar_already_running {
+        match fs::remove_file(&heartbeat) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => return Err(unavailable()),
+        }
     }
-    spawn_heartbeat_sidecar(context, &record.id, &record_incarnation, record_generation)?;
+    spawn_heartbeat_sidecar(
+        context,
+        &record.id,
+        &record_incarnation,
+        record_generation,
+        &capability_path(context, &record.id, &record_incarnation),
+    )?;
     let started = Instant::now();
-    while !heartbeat_fresh(context, &record.id, &record_incarnation, 0) {
-        if started.elapsed() >= Duration::from_secs(2) {
+    while !heartbeat_fresh(context, &record.id, &record_incarnation, 0)
+        || !heartbeat_advanced_since(&heartbeat, heartbeat_before)
+    {
+        if started.elapsed() >= Duration::from_secs(4) {
             return Err(CliError::runtime(
                 "coordination-broker-start-timeout",
                 "recovered broker sidecar did not become ready",
@@ -667,6 +697,7 @@ pub(crate) fn recover(
         .filter(|broker| {
             broker.incarnation == record_incarnation
                 && broker.generation == record_generation
+                && broker.state == "recovering"
                 && broker.runtime_identity_digest == runtime.identity_digest
         })
         .ok_or_else(unavailable)?;
@@ -713,6 +744,7 @@ fn spawn_heartbeat_sidecar(
     session_id: &str,
     incarnation: &str,
     generation: u64,
+    capability_file: &std::path::Path,
 ) -> Result<(), CliError> {
     let executable = std::env::current_exe().map_err(|_| unavailable())?;
     let mut command = Command::new(executable);
@@ -727,6 +759,8 @@ fn spawn_heartbeat_sidecar(
         .arg(incarnation)
         .arg("--generation")
         .arg(generation.to_string())
+        .arg("--capability-file")
+        .arg(capability_file)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
@@ -748,6 +782,9 @@ pub(crate) fn run_heartbeat_sidecar(
     context: &CliContext,
     args: BrokerHeartbeatArgs,
 ) -> Result<Value, CliError> {
+    if !heartbeat_owner_authorized(context, &args) {
+        return Err(super::unauthorized());
+    }
     let directory = super::coordination_dir(context, &args.session);
     let lock_path = directory.join(format!(
         "broker-{}.lock",
@@ -771,6 +808,8 @@ pub(crate) fn run_heartbeat_sidecar(
         ));
     }
     let started = Instant::now();
+    let mut established_owner = false;
+    let mut observed_stopped = false;
     loop {
         let record = match crate::load_session_record(context, &args.session) {
             Ok(record) => record,
@@ -788,14 +827,29 @@ pub(crate) fn run_heartbeat_sidecar(
         if !matches {
             break;
         }
-        let _runtime = match crate::coordination_runtime_evidence(&record) {
-            Ok(runtime) if runtime.status == crate::CoordinationRuntimeStatus::Running => runtime,
+        if !heartbeat_owner_authorized(context, &args) {
+            break;
+        }
+        established_owner = true;
+        match crate::coordination_runtime_evidence(&record) {
+            Ok(runtime) if runtime.status == crate::CoordinationRuntimeStatus::Running => {}
+            Ok(runtime)
+                if runtime.status == crate::CoordinationRuntimeStatus::Stopped
+                    && started.elapsed() >= Duration::from_secs(5) =>
+            {
+                observed_stopped = true;
+                break;
+            }
             Ok(_) | Err(_) if started.elapsed() < Duration::from_secs(5) => {
                 thread::sleep(Duration::from_millis(20));
                 continue;
             }
-            Ok(_) | Err(_) => break,
-        };
+            Ok(_) | Err(_) => {
+                mark_degraded(context, &args);
+                break;
+            }
+        }
+        let _ = super::claims::drain_completion_events(context);
         let now = now_epoch();
         write_atomic(
             &super::heartbeat_path(&context.state_dir, &args.session),
@@ -805,8 +859,14 @@ pub(crate) fn run_heartbeat_sidecar(
         .map_err(|_| unavailable())?;
         thread::sleep(Duration::from_secs(2));
     }
-    if let Ok(record) = crate::load_session_record(context, &args.session)
+    if established_owner
+        && observed_stopped
+        && let Ok(record) = crate::load_session_record(context, &args.session)
         && incarnation(&record).is_ok_and(|value| value == args.incarnation)
+        && record
+            .runtime
+            .as_ref()
+            .is_some_and(|runtime| runtime.generation == args.generation)
     {
         let _ = revoke(context, &record);
     }
@@ -815,6 +875,53 @@ pub(crate) fn run_heartbeat_sidecar(
         "session_id": args.session,
         "state": "stopped"
     }))
+}
+
+fn heartbeat_advanced_since(
+    heartbeat: &std::path::Path,
+    previous: Option<std::time::SystemTime>,
+) -> bool {
+    let Ok(current) = fs::metadata(heartbeat).and_then(|metadata| metadata.modified()) else {
+        return false;
+    };
+    previous.is_none_or(|previous| current > previous)
+}
+
+fn heartbeat_owner_authorized(context: &CliContext, args: &BrokerHeartbeatArgs) -> bool {
+    let Ok(token) = read_private_capability(&args.capability_file) else {
+        return false;
+    };
+    let Ok(locked) = lock_registry(context) else {
+        return false;
+    };
+    locked
+        .registry
+        .brokers
+        .get(&args.session)
+        .is_some_and(|broker| {
+            broker.incarnation == args.incarnation
+                && broker.generation == args.generation
+                && matches!(broker.state.as_str(), "starting" | "recovering" | "ready")
+                && super::digest_eq(
+                    &broker.capability_digest,
+                    &digest_bytes(token.trim().as_bytes()),
+                )
+        })
+}
+
+fn mark_degraded(context: &CliContext, args: &BrokerHeartbeatArgs) {
+    let Ok(mut locked) = lock_registry(context) else {
+        return;
+    };
+    let Some(broker) = locked.registry.brokers.get_mut(&args.session) else {
+        return;
+    };
+    if broker.incarnation != args.incarnation || broker.generation != args.generation {
+        return;
+    }
+    broker.state = "degraded".to_string();
+    broker.lost_since_epoch.get_or_insert(now_epoch());
+    let _ = locked.save();
 }
 
 fn unavailable() -> CliError {
@@ -914,6 +1021,7 @@ pub(crate) fn heartbeat_fresh(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::Parser;
     use serde_json::json;
 
     #[test]
@@ -957,5 +1065,37 @@ mod tests {
             "operator_token": "raw-secret"
         });
         assert!(serde_json::from_value::<RecoveryProof>(value).is_err());
+    }
+
+    #[test]
+    fn coordination_review_heartbeat_requires_private_launch_authority() {
+        let missing = crate::cli::Cli::try_parse_from([
+            "agent-session",
+            "broker",
+            "heartbeat",
+            "--session",
+            "session",
+            "--incarnation",
+            "incarnation",
+            "--generation",
+            "1",
+        ]);
+        assert!(missing.is_err());
+        assert!(
+            crate::cli::Cli::try_parse_from([
+                "agent-session",
+                "broker",
+                "heartbeat",
+                "--session",
+                "session",
+                "--incarnation",
+                "incarnation",
+                "--generation",
+                "1",
+                "--capability-file",
+                "/private/capability",
+            ])
+            .is_ok()
+        );
     }
 }

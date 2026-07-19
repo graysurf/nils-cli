@@ -683,68 +683,100 @@ pub(crate) fn complete(
     }
     drop(locked);
 
-    let mut locked = lock_registry(context)?;
-    if let Some(replay) = idempotency_replay(
+    drain_completion_events(context)?;
+    let locked = lock_registry(context)?;
+    idempotency_replay(
         &locked.registry,
         &args.idempotency_key,
         &record.id,
         &incarnation,
         "work-context-complete",
         &digest,
-    )? {
-        return Ok(replay);
+    )?
+    .ok_or_else(operation_unavailable)
+}
+
+pub(crate) fn drain_completion_events(context: &CliContext) -> Result<usize, CliError> {
+    let now = now_epoch();
+    let mut locked = lock_registry(context)?;
+    let cleaned = clean_expired(&mut locked.registry, now);
+    let drained = drain_completion_events_in_registry(&mut locked.registry, now)?;
+    if cleaned || drained > 0 {
+        locked.save()?;
     }
-    let event = locked
-        .registry
+    Ok(drained)
+}
+
+fn drain_completion_events_in_registry(
+    registry: &mut Registry,
+    now: i64,
+) -> Result<usize, CliError> {
+    let event_ids: Vec<_> = registry
         .completion_events
         .iter()
-        .find(|event| event.event_id == event_id)
-        .cloned()
-        .ok_or_else(operation_unavailable)?;
-    let lease = locked
-        .registry
-        .operations
-        .iter_mut()
-        .find(|lease| {
+        .map(|event| event.event_id.clone())
+        .collect();
+    let mut drained = 0;
+    for event_id in event_ids {
+        let Some(event) = registry
+            .completion_events
+            .iter()
+            .find(|event| event.event_id == event_id)
+            .cloned()
+        else {
+            continue;
+        };
+        let Some(index) = registry.operations.iter().position(|lease| {
             lease.session_id == event.session_id
                 && lease.session_incarnation == event.session_incarnation
                 && lease.lease_id == event.lease_id
-        })
-        .ok_or_else(operation_unavailable)?;
-    if lease.revision != event.if_revision
-        || lease.execution_token_digest != event.execution_token_digest
-        || !matches!(
-            lease.state.as_str(),
-            "active" | "completing" | "reconcile_pending"
+        }) else {
+            continue;
+        };
+        let lease = &registry.operations[index];
+        let revision_matches = lease.revision == event.if_revision
+            || (lease.state == "completing"
+                && lease.revision == event.if_revision.saturating_add(1));
+        if !revision_matches
+            || lease.execution_token_digest != event.execution_token_digest
+            || !matches!(
+                lease.state.as_str(),
+                "active" | "completing" | "reconcile_pending"
+            )
+        {
+            continue;
+        }
+        let mut completed = lease.clone();
+        completed.revision = completed.revision.saturating_add(1);
+        completed.state = if event.outcome == "pass" {
+            "completed".to_string()
+        } else {
+            "failed".to_string()
+        };
+        completed.outcome = Some(event.outcome.clone());
+        completed.terminal_at_epoch = Some(now);
+        let outcome = public_lease(&completed)?;
+        if store_receipt(
+            registry,
+            event.idempotency_key,
+            event.session_id,
+            event.session_incarnation,
+            "work-context-complete".to_string(),
+            event.request_digest,
+            outcome,
+            now,
         )
-    {
-        return Err(revision_conflict("operation-revision-conflict"));
+        .is_err()
+        {
+            continue;
+        }
+        registry.operations[index] = completed;
+        registry
+            .completion_events
+            .retain(|candidate| candidate.event_id != event_id);
+        drained += 1;
     }
-    lease.revision = lease.revision.saturating_add(1);
-    lease.state = if event.outcome == "pass" {
-        "completed".to_string()
-    } else {
-        "failed".to_string()
-    };
-    lease.outcome = Some(event.outcome.clone());
-    lease.terminal_at_epoch = Some(now);
-    let outcome = public_lease(lease)?;
-    store_receipt(
-        &mut locked.registry,
-        event.idempotency_key,
-        event.session_id,
-        event.session_incarnation,
-        "work-context-complete".to_string(),
-        event.request_digest,
-        outcome.clone(),
-        now,
-    )?;
-    locked
-        .registry
-        .completion_events
-        .retain(|candidate| candidate.event_id != event_id);
-    locked.save()?;
-    Ok(outcome)
+    Ok(drained)
 }
 
 pub(crate) fn reconcile(
@@ -1111,15 +1143,10 @@ fn controller_observed_quiescent(
     let Some(activity) = crate::activity::state_for_view(context, record) else {
         return false;
     };
-    let identity_changed = activity_identity_digest(&activity) != lease.activity_identity_digest
-        || activity.revision > lease.activity_revision;
+    let identity_changed = activity_identity_digest(&activity) != lease.activity_identity_digest;
     identity_changed
-        && matches!(
-            activity.phase,
-            crate::activity::TurnPhase::Waiting
-                | crate::activity::TurnPhase::NeedsInput
-                | crate::activity::TurnPhase::Working
-        )
+        && activity.phase == crate::activity::TurnPhase::Waiting
+        && activity.current_turn.is_none()
 }
 
 pub(crate) fn operator_reconcile_in_registry(
@@ -1170,11 +1197,22 @@ pub(crate) fn operator_reconcile_in_registry(
 }
 
 pub(crate) fn activity_identity_digest(activity: &crate::activity::TurnState) -> String {
-    let identity = activity
-        .current_turn
-        .as_ref()
-        .and_then(|turn| turn.provider_turn_id.as_deref())
-        .unwrap_or_default();
+    let identity = if let Some(turn) = activity.current_turn.as_ref() {
+        format!(
+            "turn:{}",
+            turn.provider_turn_id
+                .as_deref()
+                .unwrap_or(turn.started_at.as_str())
+        )
+    } else if let Some(turn) = activity.last_turn.as_ref() {
+        format!(
+            "idle:{}:{}",
+            turn.provider_turn_id.as_deref().unwrap_or_default(),
+            turn.completed_at
+        )
+    } else {
+        "idle:initial".to_string()
+    };
     digest_bytes(identity.as_bytes())
 }
 
@@ -1279,6 +1317,7 @@ fn operation_in_progress() -> CliError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn operation_private_proofs_are_never_serialized() {
@@ -1313,5 +1352,84 @@ mod tests {
         assert!(!value.to_string().contains("canary"));
         assert!(value.get("activity_identity_digest").is_none());
         assert!(value.get("descendant").is_none());
+    }
+
+    #[test]
+    fn coordination_review_idless_activity_identity_tracks_turn_generation_not_progress() {
+        let turn = |started_at: &str, revision: u64| {
+            serde_json::from_value::<crate::activity::TurnState>(json!({
+                "schema_version": "agent-session.turn-state.v1",
+                "phase": "working",
+                "phase_changed_at": started_at,
+                "revision": revision,
+                "source": {
+                    "kind": "provider_hook",
+                    "provider": "codex",
+                    "confidence": "authoritative"
+                },
+                "current_turn": {
+                    "started_at": started_at,
+                    "last_progress_at": started_at
+                }
+            }))
+            .expect("turn state")
+        };
+        let original = turn("2030-01-01T00:00:00Z", 1);
+        let same_turn_progress = turn("2030-01-01T00:00:00Z", 2);
+        let next_turn = turn("2030-01-01T00:01:00Z", 3);
+        assert_eq!(
+            activity_identity_digest(&original),
+            activity_identity_digest(&same_turn_progress)
+        );
+        assert_ne!(
+            activity_identity_digest(&original),
+            activity_identity_digest(&next_turn)
+        );
+    }
+
+    #[test]
+    fn coordination_review_durable_completion_survives_safety_ttl_transition() {
+        let mut registry: Registry = serde_json::from_value(json!({
+            "schema_version": super::super::REGISTRY_VERSION,
+            "operations": [{
+                "schema_version": OPERATION_LEASE_VERSION,
+                "lease_id": "lease",
+                "session_id": "session",
+                "session_incarnation": "incarnation",
+                "claim_id": "claim",
+                "claim_revision": 1,
+                "operation": "edit",
+                "targets": [],
+                "state": "completing",
+                "revision": 2,
+                "started_at": "2030-01-01T00:00:00Z",
+                "expires_at": "2030-01-01T00:00:01Z",
+                "expires_at_epoch": 1,
+                "execution_token_digest": "token"
+            }],
+            "completion_events": [{
+                "schema_version": "agent-session.operation-completion-event.v1",
+                "event_id": "event",
+                "session_id": "session",
+                "session_incarnation": "incarnation",
+                "lease_id": "lease",
+                "if_revision": 1,
+                "execution_token_digest": "token",
+                "outcome": "pass",
+                "idempotency_key": "completion-key",
+                "request_digest": "request",
+                "created_at_epoch": 1
+            }]
+        }))
+        .expect("registry");
+
+        assert_eq!(
+            drain_completion_events_in_registry(&mut registry, 2).expect("drain"),
+            1
+        );
+        assert!(registry.completion_events.is_empty());
+        assert_eq!(registry.operations[0].state, "completed");
+        assert_eq!(registry.operations[0].revision, 3);
+        assert_eq!(registry.receipts.len(), 1);
     }
 }

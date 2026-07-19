@@ -148,8 +148,10 @@ Public views omit all private proof material.
 Checkout paths and descendant identity are private admission proof and never
 enter public output. `descendant` is optional and is accepted only where the
 platform can verify exact PID/start-time identity; unsupported verification
-fails closed. Filesystem targets require a matching checkout binding. A
-provider-only operation may omit `targets` and `checkouts`.
+fails closed. Filesystem targets require a matching checkout binding. When the
+operation names exactly one repository, an omitted binding uses the managed
+session record's canonical cwd; multi-repository operations require explicit
+bindings. A provider-only operation may omit `targets` and `checkouts`.
 
 Authenticated operation reconcile reads
 `agent-session.operation-reconcile-proof.v1` with exact fields
@@ -279,8 +281,11 @@ States are `active`, `completing`, `reconcile_pending`, `completed`, `failed`, a
 - A matching working activity identity or exact live descendant renews the
   operation. Pane/process-group liveness by itself never renews it.
 - `complete` is idempotent from `active`, `completing`, or
-  `reconcile_pending` and records the terminal tool result without raw
-  stdout/stderr.
+  `reconcile_pending` and first persists the terminal tool result in a bounded
+  broker-owned queue without raw stdout/stderr. The authenticated heartbeat
+  sidecar drains that queue after caller loss; an event accepted before the
+  safety TTL remains valid across the exact `active` to `completing` revision
+  transition.
 - `reconcile` repairs a missed completion only when the token digest matches and
   controller-owned state proves the unchanged exact persisted runtime stopped,
   or when two quiescent activity/no-descendant observations at least five
@@ -320,8 +325,9 @@ Message states are `unread`, `read`, `acknowledged`, `expired`, and `deleted`.
 Send, ack, and reply are idempotent. Inbox ordering is `(created_at,
 message_id)` and cursors are opaque, query-bound, principal-bound, and bounded.
 Wait is cancellable, bounded, and returns on state/revision change
-without busy looping. Cleanup never evicts live unread mail to admit new data;
-quota exhaustion returns a typed error.
+without busy looping. HTTP cancellation releases its bounded wait worker rather
+than leaving a detached 60-second task. Cleanup never evicts live unread mail
+to admit new data; quota exhaustion returns a typed error.
 
 Self-recursive/cyclic reply chains, invalid UTF-8, controls forbidden by the
 JSON contract, stale target incarnation, permission drift, corrupt state,
@@ -355,8 +361,9 @@ Start, run, resume, provider-import, and HTTP create follow one transaction:
 2. create the tmux pane in a held state that cannot exec the agent;
 3. persist and read back the exact tmux/runtime identity;
 4. start the runtime-owned heartbeat sidecar before the held gate;
-5. create the private per-incarnation capability under the registry lock and
-   wait at most 2 seconds for exact identity-bound readiness;
+5. create the private per-incarnation capability under the registry lock; the
+   hidden sidecar command requires that credential as launch authority and
+   waits at most 2 seconds for exact identity-bound readiness;
 6. only then release the held pane to exec the agent.
 
 Failure at any boundary revokes credentials, stops the broker, terminates only
@@ -364,7 +371,12 @@ the exact held runtime, and preserves bounded startup diagnostics. Launcher exit
 does not stop an established broker. Resume creates a replacement incarnation
 and capability. Broker loss blocks new coordination operations. `broker adopt`
 requires an unchanged, live, exactly matched runtime and never trusts a PID or
-pane name alone. Natural target exit immediately removes its
+pane name alone. Recovery first persists a non-ready `recovering` state; the
+sidecar may heartbeat while fenced, but readiness, operation reconciliation,
+and the idempotency receipt become visible only in one final registry commit.
+Runtime uncertainty moves the broker to `degraded` without releasing claims or
+operations; only positive stopped-runtime evidence may revoke them. Natural
+target exit immediately removes its
 incarnation-specific capability; a replacement uses a different path, so a
 stale runtime can never read the new credential. Delete also releases terminal
 coordination state before session removal is reported complete.
