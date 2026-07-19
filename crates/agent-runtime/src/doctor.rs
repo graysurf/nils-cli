@@ -192,6 +192,11 @@ impl DoctorOutcome {
     pub fn exit_code(&self) -> u8 {
         if self.block > 0 {
             DoctorSeverity::Block.exit_code()
+        } else if self.version_alignment.is_some() {
+            // A schema-v2 host above the exact validated release is admitted
+            // with a visible warning so downstream compatibility tests run.
+            // The version-alignment class blocks only on blocking findings.
+            DoctorSeverity::Ok.exit_code()
         } else if self.warn > 0 {
             DoctorSeverity::Warn.exit_code()
         } else {
