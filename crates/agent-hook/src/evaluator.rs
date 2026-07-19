@@ -1,6 +1,6 @@
 use std::collections::BTreeSet;
 use std::fs;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -483,19 +483,26 @@ fn run_bounded(mut command: Command, input: &[u8]) -> Result<std::process::Outpu
     let mut child = command
         .spawn()
         .map_err(|_| HookError::runtime("capability-unavailable", "capability could not start"))?;
-    if let Some(mut stdin) = child.stdin.take() {
-        stdin.write_all(input).map_err(|_| {
-            HookError::runtime("capability-input-failed", "capability input failed")
-        })?;
-    }
+    let input = input.to_vec();
+    let input_handle = child.stdin.take().map(|mut stdin| {
+        thread::spawn(move || {
+            stdin.write_all(&input).map_err(|_| {
+                HookError::runtime("capability-input-failed", "capability input failed")
+            })
+        })
+    });
+    let stdout_handle = child
+        .stdout
+        .take()
+        .map(|stdout| thread::spawn(move || read_capped(stdout, MAX_HANDLER_OUTPUT + 1)));
+    let stderr_handle = child
+        .stderr
+        .take()
+        .map(|stderr| thread::spawn(move || read_capped(stderr, MAX_HANDLER_OUTPUT + 1)));
     let started = Instant::now();
-    loop {
+    let status = loop {
         match child.try_wait() {
-            Ok(Some(_)) => {
-                return child.wait_with_output().map_err(|_| {
-                    HookError::runtime("capability-output-failed", "capability output failed")
-                });
-            }
+            Ok(Some(status)) => break status,
             Ok(None) if started.elapsed() < HANDLER_TIMEOUT => {
                 thread::sleep(Duration::from_millis(10));
             }
@@ -516,5 +523,86 @@ fn run_bounded(mut command: Command, input: &[u8]) -> Result<std::process::Outpu
                 ));
             }
         }
+    };
+    if let Some(handle) = input_handle {
+        handle.join().map_err(|_| {
+            HookError::runtime("capability-input-failed", "capability input failed")
+        })??;
+    }
+    let stdout = join_capped(stdout_handle)?;
+    let stderr = join_capped(stderr_handle)?;
+    Ok(std::process::Output {
+        status,
+        stdout,
+        stderr,
+    })
+}
+
+fn read_capped(mut pipe: impl Read, limit: usize) -> Result<Vec<u8>, HookError> {
+    let mut retained = Vec::new();
+    let mut buffer = [0_u8; 8192];
+    loop {
+        let read = pipe.read(&mut buffer).map_err(|_| {
+            HookError::runtime("capability-output-failed", "capability output failed")
+        })?;
+        if read == 0 {
+            return Ok(retained);
+        }
+        let remaining = limit.saturating_sub(retained.len());
+        retained.extend_from_slice(&buffer[..read.min(remaining)]);
+    }
+}
+
+fn join_capped(
+    handle: Option<thread::JoinHandle<Result<Vec<u8>, HookError>>>,
+) -> Result<Vec<u8>, HookError> {
+    match handle {
+        Some(handle) => handle.join().map_err(|_| {
+            HookError::runtime("capability-output-failed", "capability output failed")
+        })?,
+        None => Ok(Vec::new()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bounded_runner_drains_overflowing_stdout_and_stderr_without_deadlock() {
+        let mut command = Command::new("sh");
+        command
+            .args([
+                "-c",
+                "head -c 307200 /dev/zero; head -c 307200 /dev/zero >&2",
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+
+        let started = Instant::now();
+        let output = run_bounded(command, &[]).expect("bounded output");
+
+        assert!(output.status.success());
+        assert_eq!(output.stdout.len(), MAX_HANDLER_OUTPUT + 1);
+        assert_eq!(output.stderr.len(), MAX_HANDLER_OUTPUT + 1);
+        assert!(started.elapsed() < HANDLER_TIMEOUT);
+    }
+
+    #[test]
+    fn bounded_runner_handles_child_exit_before_stdin_is_consumed() {
+        let mut command = Command::new("sh");
+        command
+            .args(["-c", "exit 0"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+
+        let started = Instant::now();
+        let error = run_bounded(command, &vec![b'x'; 1024 * 1024])
+            .expect_err("closed child stdin must be reported");
+
+        assert_eq!(error.code, "capability-input-failed");
+        assert!(started.elapsed() < HANDLER_TIMEOUT);
     }
 }

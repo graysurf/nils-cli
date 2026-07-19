@@ -27,6 +27,7 @@ These tools are required for common command paths. Each row is anchored to at le
 | `curl` | `gemini-cli` auth refresh + rate-limit client; locked Peekaboo asset download for `macos-agent backend install` | Required for those flows | Usually preinstalled (`brew install curl`) |
 | `/bin/ps` | `claude-cli` nested CLI usage-probe timeout cleanup on non-Linux Unix | Required for reliable descendant cleanup on macOS/BSD; Linux reads `/proc` directly | Usually preinstalled |
 | `tmux` | `agent-session` start/run/resume/attach/glance/send/delete/serve flows | Required for tmux-backed `agent-session` runtime | `brew install tmux` |
+| `agent-session` | `agent-hook` policies using `agent-session.activity.v1` | Required only when the selected policy records managed session activity; invoked through the metadata-only `activity event` contract | Install the matching `nils-agent-session` package |
 | `sops` | `secrets pull/add/edit` encryption and decryption flows | Required for `secrets` runtime | `brew install sops` |
 | `security` | `claude-cli prompt-segment` Keychain credential lookup | Required on macOS unless `CLAUDE_PROMPT_SEGMENT_ACCESS_TOKEN` / `CLAUDE_PROMPT_SEGMENT_CREDENTIALS_JSON` is supplied | Preinstalled on macOS |
 | `docker` | `docker-tools container *`, `docker-tools run *`, and Docker Compose v2 resolution for `docker-tools compose down` | Required for `docker-tools` Docker-backed commands | `brew install docker` |

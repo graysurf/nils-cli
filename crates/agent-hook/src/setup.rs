@@ -118,7 +118,7 @@ pub fn run(
     let requires_review = plan.legacy_before > 0 || plan.drifted;
     let apply_allowed =
         !requires_review || expected_plan_digest.is_some_and(|expected| expected == plan_digest);
-    if !matches!(action, SetupAction::DryRun) && requires_review && !apply_allowed {
+    if !matches!(action, SetupAction::DryRun) && requires_review && expected_plan_digest.is_none() {
         return Err(HookError::data(
             "setup-plan-digest-required",
             "legacy or drifted provider state requires the exact reviewed plan digest",
@@ -424,11 +424,7 @@ fn inspect_toml_handlers(document: &DocumentMut) -> (usize, usize) {
                 continue;
             };
             for handler in handlers {
-                let command = handler
-                    .get("command")
-                    .and_then(TomlItem::as_str)
-                    .unwrap_or_default();
-                if legacy_command(command) {
+                if legacy_toml_handler(handler) {
                     legacy += 1;
                 } else {
                     unrelated += 1;
@@ -458,19 +454,15 @@ fn remove_legacy_toml_handlers(document: &mut DocumentMut) {
                     .get_mut("hooks")
                     .and_then(TomlItem::as_array_of_tables_mut)
                 {
-                    handlers.retain(|handler| {
-                        !handler
-                            .get("command")
-                            .and_then(TomlItem::as_str)
-                            .is_some_and(legacy_command)
-                    });
+                    handlers.retain(|handler| !legacy_toml_handler(handler));
                 }
             }
             groups.retain(|group| {
-                group
-                    .get("hooks")
-                    .and_then(TomlItem::as_array_of_tables)
-                    .is_none_or(|handlers| !handlers.is_empty())
+                toml_group_has_user_metadata(group)
+                    || group
+                        .get("hooks")
+                        .and_then(TomlItem::as_array_of_tables)
+                        .is_none_or(|handlers| !handlers.is_empty())
             });
             remove_event = groups.is_empty();
         }
@@ -521,14 +513,10 @@ fn inspect_json_handlers(
                     HookError::data("provider-config-invalid", "provider hook group is invalid")
                 })?;
             for handler in handlers {
-                let command = handler
-                    .get("command")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default();
                 if owned_json_handler(handler, product) {
                     owned += 1;
                     owned_groups.insert((event.clone(), matcher.clone()));
-                } else if legacy_command_for_policy(command, loaded) {
+                } else if legacy_json_handler(handler, loaded) {
                     legacy += 1;
                 } else {
                     unrelated += 1;
@@ -577,18 +565,15 @@ fn remove_owned_and_legacy_json(
                     HookError::data("provider-config-invalid", "provider hook group is invalid")
                 })?;
             handlers.retain(|handler| {
-                let command = handler
-                    .get("command")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default();
-                !owned_json_handler(handler, product) && !legacy_command_for_policy(command, loaded)
+                !owned_json_handler(handler, product) && !legacy_json_handler(handler, loaded)
             });
         }
         groups.retain(|group| {
-            group
-                .get("hooks")
-                .and_then(Value::as_array)
-                .is_some_and(|handlers| !handlers.is_empty())
+            json_group_has_user_metadata(group)
+                || group
+                    .get("hooks")
+                    .and_then(Value::as_array)
+                    .is_some_and(|handlers| !handlers.is_empty())
         });
         if groups.is_empty() {
             hooks.remove(&event);
@@ -646,6 +631,40 @@ fn owned_json_handler(handler: &Value, product: Product) -> bool {
         && handler.get("command").and_then(Value::as_str)
             == Some(dispatch_command(product).as_str())
         && handler.get("timeout").and_then(Value::as_i64) == Some(DISPATCH_TIMEOUT_SECONDS)
+}
+
+fn legacy_json_handler(handler: &Value, loaded: &LoadedPolicy) -> bool {
+    handler.as_object().is_some_and(|object| object.len() == 3)
+        && handler.get("type").and_then(Value::as_str) == Some("command")
+        && handler.get("timeout").and_then(Value::as_i64) == Some(5)
+        && handler
+            .get("command")
+            .and_then(Value::as_str)
+            .is_some_and(|command| legacy_command_for_policy(command, loaded))
+}
+
+fn legacy_toml_handler(handler: &toml_edit::Table) -> bool {
+    handler.len() == 3
+        && handler.get("type").and_then(TomlItem::as_str) == Some("command")
+        && handler.get("timeout").and_then(TomlItem::as_integer) == Some(5)
+        && handler
+            .get("command")
+            .and_then(TomlItem::as_str)
+            .is_some_and(legacy_command)
+}
+
+fn json_group_has_user_metadata(group: &Value) -> bool {
+    group.as_object().is_some_and(|object| {
+        object
+            .keys()
+            .any(|key| !matches!(key.as_str(), "matcher" | "hooks"))
+    })
+}
+
+fn toml_group_has_user_metadata(group: &toml_edit::Table) -> bool {
+    group
+        .iter()
+        .any(|(key, _)| !matches!(key, "matcher" | "hooks"))
 }
 
 fn legacy_command(command: &str) -> bool {
@@ -861,5 +880,40 @@ fn setup_lock(layout: &Layout) -> Result<SetupLock, HookError> {
             ));
         }
         std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn apply_rejects_a_concurrent_provider_change_without_overwriting_it() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let path = temp.path().join("provider.json");
+        fs::write(&path, b"reviewed").expect("reviewed config");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).expect("private mode");
+        let layout = Layout {
+            config_path: temp.path().join("config.toml"),
+            state_root: temp.path().join("state"),
+        };
+        let plan = Plan {
+            product: Product::Claude,
+            path: path.clone(),
+            original: Some(b"reviewed".to_vec()),
+            candidate: Some(b"candidate".to_vec()),
+            groups: Vec::new(),
+            owned_before: 0,
+            owned_after: 0,
+            legacy_before: 0,
+            unrelated_before: 0,
+            drifted: false,
+        };
+        fs::write(&path, b"concurrent").expect("concurrent config");
+
+        let error = apply_plan(&layout, &plan).expect_err("concurrent change");
+
+        assert_eq!(error.code, "provider-config-drift");
+        assert_eq!(fs::read(&path).expect("preserved config"), b"concurrent");
     }
 }

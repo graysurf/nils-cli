@@ -53,7 +53,7 @@ handling.
   policy digests.
 - `agent-hook.trace.v1`: timing, rule IDs, disposition classes, and digests;
   never raw payload, paths, identities, message content, or capabilities.
-- `agent-hook.setup-plan.v1`: product, action, owned event/matcher groups,
+- `agent-hook.setup-plan.v1`: product, owned event/matcher groups,
   before/after digests, exact plan digest, drift state, and whether apply is
   permitted. Provider hook argv content is omitted.
 - `agent-hook.doctor.v1`: product status (`missing`, `legacy`, `dual`,

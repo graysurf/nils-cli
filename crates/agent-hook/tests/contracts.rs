@@ -174,3 +174,29 @@ fn forged_payload_conflict_is_ignored_but_registry_conflict_blocks() {
     assert_eq!(backed.code, 1, "stderr={}", backed.stderr_text());
     assert_eq!(backed.stdout_json()["result"]["action"], "block");
 }
+
+#[test]
+fn cli_help_version_and_completion_surface_are_complete() {
+    let fixture = Fixture::new(POLICY);
+    let help = fixture.run(&["--help"], None);
+    assert_eq!(help.code, 0, "stderr={}", help.stderr_text());
+    let help_text = help.stdout_text();
+    for required in [
+        "dispatch", "validate", "inventory", "doctor", "setup", "recovery", "completion",
+        "-V, --version",
+    ] {
+        assert!(help_text.contains(required), "missing {required}: {help_text}");
+    }
+
+    let version = fixture.run(&["--version"], None);
+    assert_eq!(version.code, 0, "stderr={}", version.stderr_text());
+    assert!(version.stdout_text().starts_with("agent-hook "));
+
+    for shell in ["bash", "zsh"] {
+        let completion = fixture.run(&["completion", shell], None);
+        assert_eq!(completion.code, 0, "shell={shell}");
+        let script = completion.stdout_text();
+        assert!(script.contains("dispatch"), "shell={shell}");
+        assert!(script.contains("--expected-plan-digest"), "shell={shell}");
+    }
+}

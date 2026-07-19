@@ -1,0 +1,298 @@
+#compdef agent-hook
+
+autoload -U is-at-least
+
+_agent-hook() {
+    typeset -A opt_args
+    typeset -a _arguments_options
+    local ret=1
+
+    if is-at-least 5.2; then
+        _arguments_options=(-s -S -C)
+    else
+        _arguments_options=(-s -C)
+    fi
+
+    local context curcontext="$curcontext" state line
+    _arguments "${_arguments_options[@]}" : \
+'--config=[Override the strict user config path]:PATH:_files' \
+'--policy=[Override the selected versioned policy bundle path]:PATH:_files' \
+'--state-dir=[Override the private state root]:PATH:_files -/' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+'-V[Print version]' \
+'--version[Print version]' \
+":: :_agent-hook_commands" \
+"*::: :->agent-hook" \
+&& ret=0
+    case $state in
+    (agent-hook)
+        words=($line[1] "${words[@]}")
+        (( CURRENT += 1 ))
+        curcontext="${curcontext%:*:*}:agent-hook-command-$line[1]:"
+        case $line[1] in
+            (dispatch)
+_arguments "${_arguments_options[@]}" : \
+'--product=[Provider whose bounded JSON request is read from stdin]:PRODUCT:(codex claude hermes)' \
+'--event=[Provider event when the request does not carry one]:EVENT:_default' \
+'--capability-file=[Private exact recovery capability file]:PATH:_files' \
+'--format=[Output contract. Provider is the hook-ingress default]:FORMAT:((provider\:"Provider-native output for hook ingress"
+text\:"Human-readable normalized decision"
+json\:"Versioned service JSON envelope"))' \
+'--config=[Override the strict user config path]:PATH:_files' \
+'--policy=[Override the selected versioned policy bundle path]:PATH:_files' \
+'--state-dir=[Override the private state root]:PATH:_files -/' \
+'--shadow[Evaluate every selected rule as side-effect-free shadow]' \
+'--trace[Append a redacted bounded trace entry]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+&& ret=0
+;;
+(validate)
+_arguments "${_arguments_options[@]}" : \
+'--format=[Output format]:FORMAT:((text\:"Human-readable text output (default)"
+json\:"Single-record JSON envelope (snake_case)"))' \
+'--config=[Override the strict user config path]:PATH:_files' \
+'--policy=[Override the selected versioned policy bundle path]:PATH:_files' \
+'--state-dir=[Override the private state root]:PATH:_files -/' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+&& ret=0
+;;
+(inventory)
+_arguments "${_arguments_options[@]}" : \
+'--format=[Output format]:FORMAT:((text\:"Human-readable text output (default)"
+json\:"Single-record JSON envelope (snake_case)"))' \
+'--config=[Override the strict user config path]:PATH:_files' \
+'--policy=[Override the selected versioned policy bundle path]:PATH:_files' \
+'--state-dir=[Override the private state root]:PATH:_files -/' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+&& ret=0
+;;
+(doctor)
+_arguments "${_arguments_options[@]}" : \
+'(--all)--product=[Limit provider diagnostics]:PRODUCT:(codex claude hermes)' \
+'--format=[Output format]:FORMAT:((text\:"Human-readable text output (default)"
+json\:"Single-record JSON envelope (snake_case)"))' \
+'--config=[Override the strict user config path]:PATH:_files' \
+'--policy=[Override the selected versioned policy bundle path]:PATH:_files' \
+'--state-dir=[Override the private state root]:PATH:_files -/' \
+'--all[Inspect every provider, including truthful unsupported surfaces]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+&& ret=0
+;;
+(setup)
+_arguments "${_arguments_options[@]}" : \
+'--product=[Provider whose exact owned ingress is managed]:PRODUCT:(codex claude hermes)' \
+'--expected-plan-digest=[Digest from the reviewed preview; required for drift, legacy, or dual state]:SHA256:_default' \
+'--format=[Output format]:FORMAT:((text\:"Human-readable text output (default)"
+json\:"Single-record JSON envelope (snake_case)"))' \
+'--config=[Override the strict user config path]:PATH:_files' \
+'--policy=[Override the selected versioned policy bundle path]:PATH:_files' \
+'--state-dir=[Override the private state root]:PATH:_files -/' \
+'(--apply --repair --remove)--dry-run[Preview the exact plan without changing files]' \
+'(--dry-run --repair --remove)--apply[Apply an additive or reviewed migration plan]' \
+'(--dry-run --apply --remove)--repair[Restore missing exact owned ingress]' \
+'(--dry-run --apply --repair)--remove[Remove only exact agent-hook-owned ingress]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+&& ret=0
+;;
+(recovery)
+_arguments "${_arguments_options[@]}" : \
+'--config=[Override the strict user config path]:PATH:_files' \
+'--policy=[Override the selected versioned policy bundle path]:PATH:_files' \
+'--state-dir=[Override the private state root]:PATH:_files -/' \
+'-h[Print help]' \
+'--help[Print help]' \
+":: :_agent-hook__subcmd__recovery_commands" \
+"*::: :->recovery" \
+&& ret=0
+
+    case $state in
+    (recovery)
+        words=($line[1] "${words[@]}")
+        (( CURRENT += 1 ))
+        curcontext="${curcontext%:*:*}:agent-hook-recovery-command-$line[1]:"
+        case $line[1] in
+            (challenge)
+_arguments "${_arguments_options[@]}" : \
+'--product=[]:PRODUCT:(codex claude hermes)' \
+'--event=[]:EVENT:_default' \
+'--target-digest=[]:TARGET_DIGEST:_default' \
+'--command-digest=[]:COMMAND_DIGEST:_default' \
+'--snapshot-digest=[]:SNAPSHOT_DIGEST:_default' \
+'--scope=[]:SCOPE:(one-shot repair-window)' \
+'*--rule=[]:RULES:_default' \
+'--ttl-seconds=[]:TTL_SECONDS:_default' \
+'--out=[]:PATH:_files' \
+'--format=[]:FORMAT:((text\:"Human-readable text output (default)"
+json\:"Single-record JSON envelope (snake_case)"))' \
+'--config=[Override the strict user config path]:PATH:_files' \
+'--policy=[Override the selected versioned policy bundle path]:PATH:_files' \
+'--state-dir=[Override the private state root]:PATH:_files -/' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+&& ret=0
+;;
+(authorize)
+_arguments "${_arguments_options[@]}" : \
+'--challenge-file=[]:PATH:_files' \
+'--expected-challenge-digest=[]:SHA256:_default' \
+'--out=[]:PATH:_files' \
+'--format=[]:FORMAT:((text\:"Human-readable text output (default)"
+json\:"Single-record JSON envelope (snake_case)"))' \
+'--config=[Override the strict user config path]:PATH:_files' \
+'--policy=[Override the selected versioned policy bundle path]:PATH:_files' \
+'--state-dir=[Override the private state root]:PATH:_files -/' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+&& ret=0
+;;
+(consume)
+_arguments "${_arguments_options[@]}" : \
+'--capability-file=[]:PATH:_files' \
+'--product=[]:PRODUCT:(codex claude hermes)' \
+'--event=[]:EVENT:_default' \
+'--target-digest=[]:TARGET_DIGEST:_default' \
+'--command-digest=[]:COMMAND_DIGEST:_default' \
+'--snapshot-digest=[]:SNAPSHOT_DIGEST:_default' \
+'--format=[]:FORMAT:((text\:"Human-readable text output (default)"
+json\:"Single-record JSON envelope (snake_case)"))' \
+'--config=[Override the strict user config path]:PATH:_files' \
+'--policy=[Override the selected versioned policy bundle path]:PATH:_files' \
+'--state-dir=[Override the private state root]:PATH:_files -/' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+&& ret=0
+;;
+(status)
+_arguments "${_arguments_options[@]}" : \
+'--capability-id=[]:CAPABILITY_ID:_default' \
+'--format=[]:FORMAT:((text\:"Human-readable text output (default)"
+json\:"Single-record JSON envelope (snake_case)"))' \
+'--config=[Override the strict user config path]:PATH:_files' \
+'--policy=[Override the selected versioned policy bundle path]:PATH:_files' \
+'--state-dir=[Override the private state root]:PATH:_files -/' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+&& ret=0
+;;
+(revoke)
+_arguments "${_arguments_options[@]}" : \
+'--capability-id=[]:CAPABILITY_ID:_default' \
+'--format=[]:FORMAT:((text\:"Human-readable text output (default)"
+json\:"Single-record JSON envelope (snake_case)"))' \
+'--config=[Override the strict user config path]:PATH:_files' \
+'--policy=[Override the selected versioned policy bundle path]:PATH:_files' \
+'--state-dir=[Override the private state root]:PATH:_files -/' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+&& ret=0
+;;
+        esac
+    ;;
+esac
+;;
+(completion)
+_arguments "${_arguments_options[@]}" : \
+'--config=[Override the strict user config path]:PATH:_files' \
+'--policy=[Override the selected versioned policy bundle path]:PATH:_files' \
+'--state-dir=[Override the private state root]:PATH:_files -/' \
+'-h[Print help]' \
+'--help[Print help]' \
+':shell:(bash zsh)' \
+&& ret=0
+;;
+        esac
+    ;;
+esac
+}
+
+(( $+functions[_agent-hook_commands] )) ||
+_agent-hook_commands() {
+    local commands; commands=(
+'dispatch:Normalize one provider request, evaluate policy, and render one decision' \
+'validate:Validate strict config, selected policy, overrides, and digests' \
+'inventory:List public rule metadata and effective modes' \
+'doctor:Inspect policy, provider registrations, legacy residue, and recovery state' \
+'setup:Preview, apply, repair, or remove exact owned provider ingress' \
+'recovery:Create, authorize, inspect, consume, or revoke governed recovery' \
+'completion:Print a shell completion script' \
+    )
+    _describe -t commands 'agent-hook commands' commands "$@"
+}
+(( $+functions[_agent-hook__subcmd__completion_commands] )) ||
+_agent-hook__subcmd__completion_commands() {
+    local commands; commands=()
+    _describe -t commands 'agent-hook completion commands' commands "$@"
+}
+(( $+functions[_agent-hook__subcmd__dispatch_commands] )) ||
+_agent-hook__subcmd__dispatch_commands() {
+    local commands; commands=()
+    _describe -t commands 'agent-hook dispatch commands' commands "$@"
+}
+(( $+functions[_agent-hook__subcmd__doctor_commands] )) ||
+_agent-hook__subcmd__doctor_commands() {
+    local commands; commands=()
+    _describe -t commands 'agent-hook doctor commands' commands "$@"
+}
+(( $+functions[_agent-hook__subcmd__inventory_commands] )) ||
+_agent-hook__subcmd__inventory_commands() {
+    local commands; commands=()
+    _describe -t commands 'agent-hook inventory commands' commands "$@"
+}
+(( $+functions[_agent-hook__subcmd__recovery_commands] )) ||
+_agent-hook__subcmd__recovery_commands() {
+    local commands; commands=(
+'challenge:Create a private exact recovery challenge' \
+'authorize:Authorize a reviewed challenge for the current OS principal' \
+'consume:Validate and atomically consume one exact capability' \
+'status:Inspect redacted recovery state' \
+'revoke:Revoke a capability or repair window by public ID' \
+    )
+    _describe -t commands 'agent-hook recovery commands' commands "$@"
+}
+(( $+functions[_agent-hook__subcmd__recovery__subcmd__authorize_commands] )) ||
+_agent-hook__subcmd__recovery__subcmd__authorize_commands() {
+    local commands; commands=()
+    _describe -t commands 'agent-hook recovery authorize commands' commands "$@"
+}
+(( $+functions[_agent-hook__subcmd__recovery__subcmd__challenge_commands] )) ||
+_agent-hook__subcmd__recovery__subcmd__challenge_commands() {
+    local commands; commands=()
+    _describe -t commands 'agent-hook recovery challenge commands' commands "$@"
+}
+(( $+functions[_agent-hook__subcmd__recovery__subcmd__consume_commands] )) ||
+_agent-hook__subcmd__recovery__subcmd__consume_commands() {
+    local commands; commands=()
+    _describe -t commands 'agent-hook recovery consume commands' commands "$@"
+}
+(( $+functions[_agent-hook__subcmd__recovery__subcmd__revoke_commands] )) ||
+_agent-hook__subcmd__recovery__subcmd__revoke_commands() {
+    local commands; commands=()
+    _describe -t commands 'agent-hook recovery revoke commands' commands "$@"
+}
+(( $+functions[_agent-hook__subcmd__recovery__subcmd__status_commands] )) ||
+_agent-hook__subcmd__recovery__subcmd__status_commands() {
+    local commands; commands=()
+    _describe -t commands 'agent-hook recovery status commands' commands "$@"
+}
+(( $+functions[_agent-hook__subcmd__setup_commands] )) ||
+_agent-hook__subcmd__setup_commands() {
+    local commands; commands=()
+    _describe -t commands 'agent-hook setup commands' commands "$@"
+}
+(( $+functions[_agent-hook__subcmd__validate_commands] )) ||
+_agent-hook__subcmd__validate_commands() {
+    local commands; commands=()
+    _describe -t commands 'agent-hook validate commands' commands "$@"
+}
+
+if [ "$funcstack[1]" = "_agent-hook" ]; then
+    _agent-hook "$@"
+else
+    compdef _agent-hook agent-hook
+fi
