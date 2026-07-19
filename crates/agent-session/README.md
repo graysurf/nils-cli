@@ -112,7 +112,21 @@ Ordinary `--dry-run`, `--apply`, `--repair`, and `--remove` also support
 is Codex-only and rejects other providers. Setup merges exact agent-session-owned
 handlers into existing provider configuration, repeated apply/repair is
 idempotent, and removal preserves unrelated hooks. Provider setup also refuses
-an observed concurrent config change. For Codex, setup adds
+an observed concurrent config change. For Codex, setup selects the lifecycle
+representation already active in the user layer: JSON-only installs stay in
+`~/.codex/hooks.json`, while existing inline `[[hooks.<Event>]]` groups cause
+exact agent-session handlers to migrate into a separate marker-bounded block in
+`~/.codex/config.toml`. An owned-only JSON source is deleted; unrelated content
+is preserved. User-owned lifecycle handlers in both sources produce a
+content-free conflict and block dry-run/apply/repair migration without mutation;
+`--remove` may still clean exact agent-session handlers from both sources without
+moving user content. Setup and doctor report representation, migration,
+conflict, and the active hook path. Migrated definitions have new
+Codex trust identities, so review them with `/hooks` and verify a fresh session
+does not emit the dual-representation warning. Fields added to an otherwise
+matching Codex command handler are user-owned:
+dry-run/apply/repair fail closed instead of replacing them, while `--remove`
+preserves that complete handler. Setup also adds
 the official `agent-turn-complete` notify argv to `~/.codex/config.toml` when
 `notify` is absent, recognizes exact ownership idempotently, or wraps a safe
 user-owned singular argv in an agent-session-owned fan-out. The fan-out invokes
@@ -127,8 +141,8 @@ a sanitized terminal code on timeout or failure. Setup composes
 only when simulated removal proves the complete original TOML bytes can be
 restored. Unsafe, oversized,
 non-string, recursive, or non-reversible values are preserved and reported as
-conflicts. Both Codex files are parsed and planned before either is
-written; if the guarded second write fails, the first write is restored or a
+conflicts. Both Codex files are parsed and planned before either is written or
+deleted; if the guarded second write fails, the first mutation is restored or a
 loud rollback error identifies the partial state. The repair preview returns a
 content-free plan digest over the current and proposed
 bytes of both Codex files. Applying repair requires that exact digest and fails
