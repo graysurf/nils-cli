@@ -511,7 +511,7 @@ fn emit_error(command: &str, error: &HookError, json: bool) -> i32 {
             error: ErrorBody {
                 code: &error.code,
                 message: &error.message,
-                details: error.details.as_ref(),
+                details: error.details.as_deref(),
             },
         };
         println!(

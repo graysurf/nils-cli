@@ -5,7 +5,7 @@ use serde_json::Value;
 pub struct HookError {
     pub code: String,
     pub message: String,
-    pub details: Option<Value>,
+    pub details: Option<Box<Value>>,
     pub exit_code: i32,
 }
 
@@ -19,7 +19,7 @@ impl HookError {
     }
 
     pub fn data_with(code: impl Into<String>, message: impl Into<String>, details: Value) -> Self {
-        Self::new(code, message, Some(details), 65)
+        Self::new(code, message, Some(Box::new(details)), 65)
     }
 
     pub fn runtime(code: impl Into<String>, message: impl Into<String>) -> Self {
@@ -37,7 +37,7 @@ impl HookError {
     fn new(
         code: impl Into<String>,
         message: impl Into<String>,
-        details: Option<Value>,
+        details: Option<Box<Value>>,
         exit_code: i32,
     ) -> Self {
         Self {
