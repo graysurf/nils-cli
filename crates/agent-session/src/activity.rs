@@ -4904,7 +4904,7 @@ fn codex_json_permission_source_guard(path: &Path) -> bool {
     };
     let mut guarded = 0_usize;
     for group in groups {
-        let matcher = group.get("matcher").and_then(Value::as_str);
+        let matcher_is_absent = group.get("matcher").is_none();
         let Some(handlers) = group.get("hooks").and_then(Value::as_array) else {
             return false;
         };
@@ -4918,7 +4918,7 @@ fn codex_json_permission_source_guard(path: &Path) -> bool {
             if !codex_permission_reporter_command(command) {
                 continue;
             }
-            if matcher.is_none()
+            if matcher_is_absent
                 && command == expected
                 && json_codex_handler_is_owned("PermissionRequest", handler)
             {
@@ -4951,7 +4951,6 @@ fn codex_toml_permission_source_guard(path: &Path) -> bool {
     };
     let mut guarded = 0_usize;
     for group in groups.iter() {
-        let matcher = group.get("matcher").and_then(TomlItem::as_str);
         let Some(handlers) = group.get("hooks").and_then(TomlItem::as_array_of_tables) else {
             return false;
         };
@@ -4965,8 +4964,13 @@ fn codex_toml_permission_source_guard(path: &Path) -> bool {
             if !codex_permission_reporter_command(command) {
                 continue;
             }
-            if matcher.is_none_or(str::is_empty)
-                && command == expected
+            if toml_hook_matcher_is_exact(
+                group,
+                ProviderSpec {
+                    event: "PermissionRequest",
+                    matcher: None,
+                },
+            ) && command == expected
                 && toml_handler_command_is_owned("PermissionRequest", handler)
             {
                 guarded += 1;
@@ -7972,7 +7976,7 @@ mod tests {
     }
 
     #[test]
-    fn codex_inline_permission_source_guard_rejects_duplicate_reporters() {
+    fn codex_inline_permission_source_guard_rejects_noncanonical_reporters() {
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let config_path = tmp.path().join("config.toml");
         fs::write(&config_path, render_owned_codex_toml_hook_block()).expect("owned inline hooks");
@@ -7990,10 +7994,23 @@ mod tests {
             fs::write(&config_path, duplicate).expect("duplicate reporter");
             assert!(!codex_toml_permission_source_guard(&config_path));
         }
+
+        for matcher in ["5", "false", "[]", "{}"] {
+            let malformed = render_owned_codex_toml_hook_block().replacen(
+                "[[hooks.PermissionRequest]]",
+                &format!("[[hooks.PermissionRequest]]\nmatcher = {matcher}"),
+                1,
+            );
+            fs::write(&config_path, malformed).expect("malformed matcher");
+            assert!(
+                !codex_toml_permission_source_guard(&config_path),
+                "matcher {matcher} must fail closed"
+            );
+        }
     }
 
     #[test]
-    fn codex_json_permission_source_guard_rejects_agent_equals_reporter() {
+    fn codex_json_permission_source_guard_rejects_noncanonical_reporters() {
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let path = tmp.path().join("hooks.json");
         let plan =
@@ -8001,8 +8018,20 @@ mod tests {
         apply_provider_config_plan(&plan).expect("JSON hooks");
         assert!(codex_json_permission_source_guard(&path));
 
-        let mut value: Value =
+        let canonical: Value =
             serde_json::from_slice(&fs::read(&path).expect("JSON hooks")).expect("JSON document");
+        for matcher in [Value::Null, json!(5), json!(false), json!([]), json!({})] {
+            let mut malformed = canonical.clone();
+            malformed["hooks"]["PermissionRequest"][0]["matcher"] = matcher;
+            fs::write(
+                &path,
+                serde_json::to_vec_pretty(&malformed).expect("JSON bytes"),
+            )
+            .expect("malformed matcher");
+            assert!(!codex_json_permission_source_guard(&path));
+        }
+
+        let mut value = canonical;
         value["hooks"]["PermissionRequest"][0]["hooks"]
             .as_array_mut()
             .expect("PermissionRequest handlers")
