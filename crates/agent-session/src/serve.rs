@@ -246,6 +246,7 @@ struct AgentLaunchProfile {
     provider_config_dir: Option<PathBuf>,
     readiness_args: Vec<String>,
     auto_resume_supported: bool,
+    codex_usage_account: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -260,6 +261,11 @@ struct AgentLaunchProfileConfig {
     readiness_args: Vec<String>,
     #[serde(default)]
     auto_resume_supported: bool,
+    /// Optional authoritative Codex usage account nickname for a `claude`
+    /// profile that runs on a Codex/GPT backend. Absent leaves behavior
+    /// unchanged (auto-resume keys off native Claude usage).
+    #[serde(default)]
+    codex_usage_account: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -336,6 +342,15 @@ impl AgentLaunchProfiles {
                     "launch profile readiness arguments exceed safe bounds",
                 ));
             }
+            if config
+                .codex_usage_account
+                .as_ref()
+                .is_some_and(|nick| nick.trim().is_empty() || nick.chars().any(char::is_control))
+            {
+                return Err(invalid_agent_launch_profiles(
+                    "launch profile codex_usage_account must be a non-empty nickname",
+                ));
+            }
             entries.push(AgentLaunchProfile {
                 id: config.id,
                 label: label.to_string(),
@@ -344,6 +359,9 @@ impl AgentLaunchProfiles {
                 provider_config_dir: config.provider_config_dir,
                 readiness_args: config.readiness_args,
                 auto_resume_supported: config.auto_resume_supported,
+                codex_usage_account: config
+                    .codex_usage_account
+                    .map(|nick| nick.trim().to_string()),
             });
         }
         Ok(Self {
@@ -1927,6 +1945,83 @@ fn collect_claude_usage(timeout: Duration) -> UsageProvider {
     }
 }
 
+/// Multi-account Codex rate-limit source, one entry per account keyed by
+/// nickname. Used to key a `claude` launch profile's auto-resume off its
+/// authoritative Codex account instead of native Claude usage.
+const CODEX_ACCOUNT_USAGE_ARGS: &[&str] = &[
+    "diag",
+    "rate-limits",
+    "--all",
+    "--format",
+    "json",
+    "--no-refresh-auth",
+];
+
+fn non_authoritative_usage_snapshot() -> UsageSnapshot {
+    UsageSnapshot {
+        authoritative: false,
+        has_exhausted_windows: false,
+        exhausted_reset_epochs: Vec::new(),
+    }
+}
+
+/// Build a per-account [`UsageSnapshot`] for a `claude` launch
+/// profile backed by a Codex account, from `codex-cli diag rate-limits --all`
+/// output FILTERED to `account`'s nickname.
+///
+/// Fail safe: any parse failure, a missing nickname, a non-ok entry, or an
+/// entry with no windows degrades to a non-authoritative snapshot so the
+/// auto-resume loop retries rather than acting on the wrong quota. It never
+/// falls back to native Claude usage.
+fn codex_account_usage_snapshot(output: &UsageHelperOutput, account: &str) -> UsageSnapshot {
+    if output.timed_out {
+        return non_authoritative_usage_snapshot();
+    }
+    let value: Value = match serde_json::from_slice(&output.stdout) {
+        Ok(value) => value,
+        Err(_) => return non_authoritative_usage_snapshot(),
+    };
+    let Some(entry) = value
+        .get("results")
+        .and_then(Value::as_array)
+        .and_then(|results| {
+            results
+                .iter()
+                .find(|result| result.get("name").and_then(Value::as_str) == Some(account))
+        })
+    else {
+        // Nickname missing from the diag output.
+        return non_authoritative_usage_snapshot();
+    };
+    // Mirror the Codex path's ok classification (see `map_codex_diag_result`
+    // in the infra usage reader): success requires both `ok` and `status`.
+    let ok = entry.get("ok").and_then(Value::as_bool) == Some(true)
+        && entry.get("status").and_then(Value::as_str) == Some("ok");
+    if !ok {
+        return non_authoritative_usage_snapshot();
+    }
+    let mut windows = windows_from_value(entry, None);
+    if windows.is_empty()
+        && let Some(summary) = entry.get("summary")
+    {
+        windows = windows_from_codex_summary(summary);
+    }
+    if windows.is_empty() {
+        // A successful read with no windows cannot confirm the quota state;
+        // degrade rather than resume against an unknown quota.
+        return non_authoritative_usage_snapshot();
+    }
+    UsageSnapshot {
+        authoritative: true,
+        has_exhausted_windows: windows.iter().any(|window| window.used_percent >= 100),
+        exhausted_reset_epochs: windows
+            .iter()
+            .filter(|window| window.used_percent >= 100)
+            .filter_map(|window| window.reset_at_epoch)
+            .collect(),
+    }
+}
+
 fn claude_inner_timeout_seconds(timeout: Duration, explicit: Option<&str>) -> u64 {
     let max_inner_seconds = timeout
         .checked_sub(Duration::from_secs(CLAUDE_USAGE_CLEANUP_SLACK_SECONDS))
@@ -2855,6 +2950,9 @@ async fn create_handler(
             profile_auto_resume_supported: launch_profile
                 .as_ref()
                 .map(|profile| profile.auto_resume_supported),
+            codex_usage_account: launch_profile
+                .as_ref()
+                .and_then(|profile| profile.codex_usage_account.clone()),
             agent_args: body.agent_args,
             format: nils_common::cli_contract::OutputFormat::Json,
         };
@@ -2888,6 +2986,9 @@ async fn create_handler(
         initial_profile_auto_resume_supported: launch_profile
             .as_ref()
             .map(|profile| profile.auto_resume_supported),
+        initial_codex_usage_account: launch_profile
+            .as_ref()
+            .and_then(|profile| profile.codex_usage_account.clone()),
         agent,
         cwd: body.cwd.map(PathBuf::from),
         title,
@@ -3652,12 +3753,20 @@ async fn auto_resume_loop(state: Arc<ServeState>) {
             .await;
         }
         if !pending.usage_ids.is_empty() {
-            let (codex_ids, claude_ids) =
-                partition_auto_resume_ids(&state, pending.usage_ids).await;
-            if !codex_ids.is_empty() {
-                process_codex_auto_resume_ids(state.clone(), codex_ids).await;
+            let partition = partition_auto_resume_ids(&state, pending.usage_ids).await;
+            if !partition.codex.is_empty() {
+                process_codex_auto_resume_ids(state.clone(), partition.codex).await;
             }
-            if claude_ids.is_empty() {
+            // `claude` launch profiles backed by a Codex account key auto-resume
+            // off that account's rate limits, not native Claude usage.
+            if !partition.codex_account_claude.is_empty() {
+                process_codex_account_auto_resume_ids(
+                    state.clone(),
+                    partition.codex_account_claude,
+                )
+                .await;
+            }
+            if partition.claude.is_empty() {
                 tokio::time::sleep(POLL_INTERVAL).await;
                 continue;
             }
@@ -3678,7 +3787,7 @@ async fn auto_resume_loop(state: Arc<ServeState>) {
                     .filter_map(|window| window.reset_at_epoch)
                     .collect(),
             };
-            process_auto_resume_ids(state.clone(), claude_ids, usage).await;
+            process_auto_resume_ids(state.clone(), partition.claude, usage).await;
         }
         tokio::time::sleep(POLL_INTERVAL).await;
     }
@@ -3691,33 +3800,59 @@ struct CodexAutoResumeTarget {
     binding: crate::codex_account::BindingSnapshot,
 }
 
-async fn partition_auto_resume_ids(
-    state: &ServeState,
-    ids: Vec<String>,
-) -> (Vec<CodexAutoResumeTarget>, Vec<String>) {
+/// A `claude` auto-resume session whose launch profile declares an
+/// authoritative Codex usage account. The loop keys its usage snapshot off the
+/// Codex account's rate limits instead of native Claude usage.
+#[derive(Clone)]
+struct CodexAccountAutoResumeTarget {
+    id: String,
+    account: String,
+}
+
+#[derive(Default)]
+struct AutoResumePartition {
+    /// Codex sessions launched through the app-server v2 protocol.
+    codex: Vec<CodexAutoResumeTarget>,
+    /// `claude` sessions backed by an authoritative Codex usage account.
+    codex_account_claude: Vec<CodexAccountAutoResumeTarget>,
+    /// Everything else (native Claude, or sessions we could not classify).
+    claude: Vec<String>,
+}
+
+async fn partition_auto_resume_ids(state: &ServeState, ids: Vec<String>) -> AutoResumePartition {
     let context = state.context.clone();
     tokio::task::spawn_blocking(move || {
-        let mut codex = Vec::new();
-        let mut other = Vec::new();
+        let mut partition = AutoResumePartition::default();
         for id in ids {
-            let target = load_session_record(&context, &id)
-                .ok()
-                .filter(codex_app_server::runtime_is_supported)
-                .and_then(|record| {
-                    let binding = crate::codex_account::binding_snapshot(&record);
-                    record.runtime.map(|runtime| CodexAutoResumeTarget {
+            let Ok(record) = load_session_record(&context, &id) else {
+                partition.claude.push(id);
+                continue;
+            };
+            if codex_app_server::runtime_is_supported(&record) {
+                let binding = crate::codex_account::binding_snapshot(&record);
+                match record.runtime {
+                    Some(runtime) => partition.codex.push(CodexAutoResumeTarget {
                         id: record.id,
                         launch_id: runtime.launch_id,
                         binding,
-                    })
-                });
-            if let Some(target) = target {
-                codex.push(target);
-            } else {
-                other.push(id);
+                    }),
+                    None => partition.claude.push(id),
+                }
+                continue;
+            }
+            match crate::session_codex_usage_account(&record) {
+                Some(account) => {
+                    partition
+                        .codex_account_claude
+                        .push(CodexAccountAutoResumeTarget {
+                            id: record.id,
+                            account,
+                        });
+                }
+                None => partition.claude.push(id),
             }
         }
-        (codex, other)
+        partition
     })
     .await
     .unwrap_or_default()
@@ -4001,11 +4136,21 @@ fn discover_codex_controls_from_snapshots(
 }
 
 async fn process_auto_resume_ids(state: Arc<ServeState>, ids: Vec<String>, usage: UsageSnapshot) {
+    let items = ids.into_iter().map(|id| (id, usage.clone())).collect();
+    process_auto_resume_ids_with_usage(state, items).await;
+}
+
+/// Tick each `(id, usage)` pair, letting every session carry its own usage
+/// snapshot. Codex-account-backed `claude` sessions each get a snapshot built
+/// from their own Codex account's rate limits.
+async fn process_auto_resume_ids_with_usage(
+    state: Arc<ServeState>,
+    items: Vec<(String, UsageSnapshot)>,
+) {
     let mut tasks = JoinSet::new();
-    for id in ids {
+    for (id, usage) in items {
         let context = state.context.clone();
         let tmux = state.tmux_bin.clone();
-        let usage = usage.clone();
         tasks.spawn_blocking(move || {
             let now_epoch = jiff::Timestamp::now().as_second();
             if let Err(err) = auto_resume::tick(&context, &id, now_epoch, &usage, |record| {
@@ -4029,6 +4174,37 @@ async fn process_auto_resume_ids(state: Arc<ServeState>, ids: Vec<String>, usage
     while !tasks.is_empty() {
         report_auto_resume_join(tasks.join_next().await);
     }
+}
+
+/// Resolve one shared `codex-cli diag rate-limits --all` read, then hand each
+/// Codex-account-backed `claude` session the snapshot filtered to its own
+/// account nickname. A failed read degrades every target to non-authoritative.
+async fn process_codex_account_auto_resume_ids(
+    state: Arc<ServeState>,
+    targets: Vec<CodexAccountAutoResumeTarget>,
+) {
+    let timeout = usage_timeout();
+    let output = tokio::task::spawn_blocking(move || {
+        run_usage_helper("codex-cli", CODEX_ACCOUNT_USAGE_ARGS, &[], timeout)
+    })
+    .await;
+    let output = match output {
+        Ok(Ok(output)) => Some(output),
+        // Fail safe: never fall back to native-Claude quota for a Codex-account
+        // profile. A missing/failed read degrades to non-authoritative retry.
+        _ => None,
+    };
+    let items = targets
+        .into_iter()
+        .map(|target| {
+            let usage = match output.as_ref() {
+                Some(output) => codex_account_usage_snapshot(output, &target.account),
+                None => non_authoritative_usage_snapshot(),
+            };
+            (target.id, usage)
+        })
+        .collect();
+    process_auto_resume_ids_with_usage(state, items).await;
 }
 
 fn report_auto_resume_join(result: Option<Result<(), tokio::task::JoinError>>) {
@@ -6370,6 +6546,188 @@ mod tests {
         ])
         .to_string();
         assert!(AgentLaunchProfiles::from_json(&duplicate).is_err());
+    }
+
+    #[test]
+    fn launch_profile_config_round_trips_codex_usage_account() {
+        let with_account = AgentLaunchProfiles::from_json(
+            &json!([{
+                "id":"claude-gpt",
+                "label":"Claude GPT",
+                "agent":"claude",
+                "agent_bin":"/bin/false",
+                "codex_usage_account":"gpt-team",
+            }])
+            .to_string(),
+        )
+        .unwrap();
+        assert_eq!(
+            with_account.get("claude-gpt").unwrap().codex_usage_account,
+            Some("gpt-team".to_string())
+        );
+
+        // Absent leaves behavior unchanged.
+        let without = AgentLaunchProfiles::from_json(
+            &json!([{
+                "id":"claude-gpt",
+                "label":"Claude GPT",
+                "agent":"claude",
+                "agent_bin":"/bin/false",
+            }])
+            .to_string(),
+        )
+        .unwrap();
+        assert_eq!(without.get("claude-gpt").unwrap().codex_usage_account, None);
+
+        // Present-but-empty is rejected like the other optional fields.
+        let empty = json!([{
+            "id":"claude-gpt",
+            "label":"Claude GPT",
+            "agent":"claude",
+            "agent_bin":"/bin/false",
+            "codex_usage_account":"  ",
+        }])
+        .to_string();
+        assert!(AgentLaunchProfiles::from_json(&empty).is_err());
+    }
+
+    fn codex_diag_all_output(stdout: &[u8], timed_out: bool) -> UsageHelperOutput {
+        UsageHelperOutput {
+            status_code: Some(if timed_out { 1 } else { 0 }),
+            stdout: stdout.to_vec(),
+            stderr: Vec::new(),
+            timed_out,
+        }
+    }
+
+    #[test]
+    fn codex_account_usage_snapshot_keys_off_the_named_account() {
+        // Two accounts; `gpt-team` is exhausted, `other` is healthy. The
+        // snapshot must reflect ONLY the requested account and derive its
+        // authority/exhaustion from the Codex diag source, not native Claude.
+        let output = codex_diag_all_output(
+            br#"{
+  "schema_version": "codex-cli.diag.rate-limits.v1",
+  "command": "diag rate-limits",
+  "mode": "all",
+  "ok": true,
+  "results": [
+    {
+      "name": "other",
+      "provider": "codex",
+      "status": "ok",
+      "ok": true,
+      "windows": [
+        {"label": "5h", "used_percent": 10, "remaining_percent": 90, "reset_at_epoch": 1893456000}
+      ]
+    },
+    {
+      "name": "gpt-team",
+      "provider": "codex",
+      "status": "ok",
+      "ok": true,
+      "windows": [
+        {"label": "5h", "used_percent": 100, "remaining_percent": 0, "reset_at_epoch": 1893456300},
+        {"label": "Weekly", "used_percent": 100, "remaining_percent": 0, "reset_at_epoch": 1893456900},
+        {"label": "Month", "used_percent": 40, "remaining_percent": 60, "reset_at_epoch": 1893460000}
+      ]
+    }
+  ]
+}"#,
+            false,
+        );
+
+        let exhausted = codex_account_usage_snapshot(&output, "gpt-team");
+        assert!(
+            exhausted.authoritative,
+            "successful named read is authoritative"
+        );
+        assert!(exhausted.has_exhausted_windows);
+        let mut resets = exhausted.exhausted_reset_epochs.clone();
+        resets.sort_unstable();
+        assert_eq!(resets, vec![1_893_456_300, 1_893_456_900]);
+
+        let healthy = codex_account_usage_snapshot(&output, "other");
+        assert!(healthy.authoritative);
+        assert!(!healthy.has_exhausted_windows);
+        assert!(healthy.exhausted_reset_epochs.is_empty());
+    }
+
+    #[test]
+    fn codex_account_usage_snapshot_supports_summary_only_accounts() {
+        let output = codex_diag_all_output(
+            br#"{
+  "schema_version": "codex-cli.diag.rate-limits.v1",
+  "command": "diag rate-limits",
+  "mode": "all",
+  "ok": true,
+  "results": [
+    {
+      "name": "gpt-team",
+      "provider": "codex",
+      "status": "ok",
+      "ok": true,
+      "summary": {"non_weekly_label": "5h", "non_weekly_remaining": 0, "non_weekly_reset_epoch": 1893456300, "weekly_remaining": 30, "weekly_reset_epoch": 1893460000}
+    }
+  ]
+}"#,
+            false,
+        );
+        let snapshot = codex_account_usage_snapshot(&output, "gpt-team");
+        assert!(snapshot.authoritative);
+        assert!(snapshot.has_exhausted_windows);
+        assert_eq!(snapshot.exhausted_reset_epochs, vec![1_893_456_300]);
+    }
+
+    #[test]
+    fn codex_account_usage_snapshot_fails_safe_without_native_fallback() {
+        let ok_body = br#"{
+  "schema_version": "codex-cli.diag.rate-limits.v1",
+  "command": "diag rate-limits",
+  "mode": "all",
+  "ok": true,
+  "results": [
+    {"name": "gpt-team", "provider": "codex", "status": "ok", "ok": true,
+     "windows": [{"label": "5h", "used_percent": 100, "remaining_percent": 0, "reset_at_epoch": 1893456300}]}
+  ]
+}"#;
+
+        // Missing nickname -> non-authoritative (never native-Claude fallback).
+        let missing =
+            codex_account_usage_snapshot(&codex_diag_all_output(ok_body, false), "absent");
+        assert!(!missing.authoritative);
+        assert!(!missing.has_exhausted_windows);
+        assert!(missing.exhausted_reset_epochs.is_empty());
+
+        // Timed-out read -> non-authoritative.
+        let timed_out =
+            codex_account_usage_snapshot(&codex_diag_all_output(ok_body, true), "gpt-team");
+        assert!(!timed_out.authoritative);
+
+        // Invalid JSON -> non-authoritative.
+        let invalid =
+            codex_account_usage_snapshot(&codex_diag_all_output(b"not json", false), "gpt-team");
+        assert!(!invalid.authoritative);
+
+        // Named entry present but errored -> non-authoritative.
+        let errored = codex_account_usage_snapshot(
+            &codex_diag_all_output(
+                br#"{"results": [{"name": "gpt-team", "status": "error", "ok": false, "reason_code": "auth_required"}]}"#,
+                false,
+            ),
+            "gpt-team",
+        );
+        assert!(!errored.authoritative);
+
+        // Named entry ok but no windows -> non-authoritative (cannot verify state).
+        let no_windows = codex_account_usage_snapshot(
+            &codex_diag_all_output(
+                br#"{"results": [{"name": "gpt-team", "status": "ok", "ok": true, "windows": []}]}"#,
+                false,
+            ),
+            "gpt-team",
+        );
+        assert!(!no_windows.authoritative);
     }
 
     #[tokio::test]
@@ -11084,6 +11442,94 @@ esac
             Some(config_dir)
         );
         assert!(!crate::session_profile_auto_resume_supported(&record));
+    }
+
+    #[tokio::test]
+    async fn create_persists_the_profile_codex_usage_account() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cwd = tmp.path().join("repo");
+        let config_dir = tmp.path().join(".claude-gpt");
+        fs::create_dir_all(&cwd).unwrap();
+        fs::create_dir_all(&config_dir).unwrap();
+        let launcher = fake_agent(tmp.path(), "claude-gpt");
+        let profiles = AgentLaunchProfiles::from_json(
+            &json!([{
+                "id":"claude-gpt",
+                "label":"Claude GPT",
+                "agent":"claude",
+                "agent_bin":launcher,
+                "provider_config_dir":config_dir,
+                "readiness_args":["--check"],
+                "auto_resume_supported":true,
+                "codex_usage_account":"gpt-team",
+            }])
+            .to_string(),
+        )
+        .unwrap();
+        let log = tmp.path().join("tmux.log");
+        let tmux = logging_tmux(tmp.path(), &log);
+        let mut st = state(tmp.path(), Some(TOKEN), tmux);
+        Arc::get_mut(&mut st).unwrap().launch_profiles = profiles;
+
+        let (status, body) = call(
+            router(st),
+            post_json(
+                "/sessions",
+                Some(TOKEN),
+                json!({
+                    "agent":"claude",
+                    "agent_profile":"claude-gpt",
+                    "id":"profiled-claude-gpt",
+                    "cwd":cwd,
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "body={body}");
+
+        let record = load_session_record(
+            &CliContext {
+                state_dir: tmp.path().to_path_buf(),
+                host: None,
+            },
+            "profiled-claude-gpt",
+        )
+        .unwrap();
+        assert_eq!(
+            crate::session_codex_usage_account(&record),
+            Some("gpt-team".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn partition_routes_codex_account_backed_claude_to_its_own_usage_source() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let state_dir = tmp.path().join("state");
+        // A `claude` session whose launch profile declares a Codex usage account.
+        seed_session_with_runtime(&state_dir, "gpt-claude", "claude", "hs-gpt-claude");
+        let record_path = state_dir.join("sessions/gpt-claude/session.json");
+        let mut record: Value =
+            serde_json::from_str(&std::fs::read_to_string(&record_path).unwrap()).unwrap();
+        // `RuntimeInfo::extra` is `#[serde(flatten)]`, so the profile keys live
+        // at the runtime object's top level.
+        record["runtime"]["agent_profile"] = json!("claude-gpt");
+        record["runtime"]["agent_profile_codex_usage_account"] = json!("gpt-team");
+        std::fs::write(&record_path, serde_json::to_vec_pretty(&record).unwrap()).unwrap();
+        // A plain native-Claude session with no Codex account.
+        seed_session_with_runtime(&state_dir, "native-claude", "claude", "hs-native-claude");
+
+        let st = state(&state_dir, Some(TOKEN), minimal_tmux(tmp.path()));
+        let partition = partition_auto_resume_ids(
+            &st,
+            vec!["gpt-claude".to_string(), "native-claude".to_string()],
+        )
+        .await;
+
+        assert!(partition.codex.is_empty());
+        assert_eq!(partition.claude, vec!["native-claude".to_string()]);
+        assert_eq!(partition.codex_account_claude.len(), 1);
+        assert_eq!(partition.codex_account_claude[0].id, "gpt-claude");
+        assert_eq!(partition.codex_account_claude[0].account, "gpt-team");
     }
 
     #[tokio::test]
