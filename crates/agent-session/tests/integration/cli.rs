@@ -687,6 +687,48 @@ fn activity_setup_repair_preview_is_codex_only_in_matrix_help_and_completion() {
 }
 
 #[test]
+fn activity_setup_forwards_single_registration_ownership_to_agent_hook() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let home = tmp.path().join("home");
+    fs::create_dir_all(&home).expect("home dir");
+    let hook = tmp.path().join("agent-hook");
+    let log = tmp.path().join("agent-hook.log");
+    write_executable(
+        &hook,
+        r#"#!/usr/bin/env sh
+: "${AGENT_HOOK_FORWARD_LOG:?}"
+printf '%s\n' "$*" > "$AGENT_HOOK_FORWARD_LOG"
+printf '%s\n' '{"schema_version":"cli.agent-hook-setup.v1","command":"agent-hook setup","ok":true,"result":{"schema_version":"agent-hook.setup-result.v1","product":"codex","action":"dry-run","changed":false,"would_change":true,"configured":false,"would_configure":true,"apply_allowed":true,"owned_events":["UserPromptSubmit"],"trust":"review the agent-hook setup plan"}}'
+"#,
+    );
+    let home = home.to_string_lossy().into_owned();
+    let hook = hook.to_string_lossy().into_owned();
+    let log_arg = log.to_string_lossy().into_owned();
+
+    let output = run(
+        tmp.path(),
+        &[
+            "activity", "setup", "--agent", "codex", "--dry-run", "--format", "json",
+        ],
+        &[
+            ("HOME", home.as_str()),
+            ("AGENT_HOOK_BIN", hook.as_str()),
+            ("AGENT_HOOK_FORWARD_LOG", log_arg.as_str()),
+        ],
+    );
+
+    assert_eq!(output.code, 0, "stderr={}", output.stderr_text());
+    assert_eq!(
+        fs::read_to_string(&log).expect("agent-hook forward log"),
+        "setup --product codex --dry-run --format json\n"
+    );
+    assert_eq!(
+        data(&output.stdout_json())["compatibility_owner"],
+        "agent-hook"
+    );
+}
+
+#[test]
 fn standalone_start_keeps_codex_raw_without_a_serve_owned_control_plane() {
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let state_dir = tmp.path().join("state");
