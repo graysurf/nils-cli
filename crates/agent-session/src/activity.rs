@@ -4075,6 +4075,88 @@ struct CodexTomlHookAnalysis {
     document: TomlDocument,
     stripped_raw: String,
     marker_layout: CodexTomlHookMarkerLayout,
+    overlaps_foreign_managed_block: bool,
+}
+
+fn codex_hook_block_overlaps_foreign_managed_block(
+    raw: &str,
+    document: &TomlDocument,
+    owned_start: usize,
+    owned_end: usize,
+    multiline_value_lines: &[usize],
+) -> bool {
+    let mut foreign_starts = Vec::new();
+    let mut foreign_ends = Vec::new();
+    let mut offset = 0_usize;
+    for line in raw.split_inclusive('\n') {
+        let start = offset;
+        offset += line.len();
+        if multiline_value_lines.binary_search(&start).is_ok() {
+            continue;
+        }
+        let without_newline = line.strip_suffix('\n').unwrap_or(line);
+        let content = without_newline
+            .strip_suffix('\r')
+            .unwrap_or(without_newline);
+        if let Some(owner) = content
+            .strip_prefix("# >>> ")
+            .and_then(|value| value.strip_suffix(" >>>"))
+            .filter(|owner| *owner != "agent-session:codex-hooks")
+        {
+            foreign_starts.push((owner, start));
+        }
+        if let Some(owner) = content
+            .strip_prefix("# <<< ")
+            .and_then(|value| value.strip_suffix(" <<<"))
+            .filter(|owner| *owner != "agent-session:codex-hooks")
+        {
+            foreign_ends.push((owner, offset));
+        }
+    }
+    let foreign_ranges = foreign_starts
+        .iter()
+        .filter_map(|(owner, start)| {
+            foreign_ends
+                .iter()
+                .find(|(end_owner, end)| end_owner == owner && *end > *start)
+                .map(|(_, end)| *start..*end)
+        })
+        .collect::<Vec<_>>();
+    if foreign_ranges.is_empty() {
+        return false;
+    }
+    let overlaps_foreign = |range: &std::ops::Range<usize>| {
+        foreign_ranges
+            .iter()
+            .any(|foreign| range.start < foreign.end && foreign.start < range.end)
+    };
+    if overlaps_foreign(&(owned_start..owned_end)) {
+        return true;
+    }
+
+    let Some(hooks) = document.get("hooks").and_then(TomlItem::as_table) else {
+        return false;
+    };
+    provider_specs(AgentKind::Codex).into_iter().any(|spec| {
+        hooks
+            .get(spec.event)
+            .and_then(TomlItem::as_array_of_tables)
+            .is_some_and(|groups| {
+                groups.iter().any(|group| {
+                    let Some(handlers) = group.get("hooks").and_then(TomlItem::as_array_of_tables)
+                    else {
+                        return false;
+                    };
+                    handlers.iter().any(|handler| {
+                        if !toml_handler_command_matches_owned(spec.event, handler) {
+                            return false;
+                        }
+                        group.span().is_none_or(|range| overlaps_foreign(&range))
+                            || handler.span().is_none_or(|range| overlaps_foreign(&range))
+                    })
+                })
+            })
+    })
 }
 
 fn analyze_codex_toml_hooks(path: &Path, raw: &str) -> Result<CodexTomlHookAnalysis, CliError> {
@@ -4102,6 +4184,7 @@ fn analyze_codex_toml_hooks(path: &Path, raw: &str) -> Result<CodexTomlHookAnaly
             document,
             stripped_raw: raw.to_string(),
             marker_layout: CodexTomlHookMarkerLayout::Absent,
+            overlaps_foreign_managed_block: false,
         });
     }
     if starts.len() > 1 || ends.len() > 1 {
@@ -4131,6 +4214,7 @@ fn analyze_codex_toml_hooks(path: &Path, raw: &str) -> Result<CodexTomlHookAnaly
             document,
             stripped_raw: stripped,
             marker_layout,
+            overlaps_foreign_managed_block: false,
         });
     };
     if end_begin < start_begin {
@@ -4144,10 +4228,18 @@ fn analyze_codex_toml_hooks(path: &Path, raw: &str) -> Result<CodexTomlHookAnaly
         let mut stripped = String::with_capacity(raw.len() - (end_end - start_begin));
         stripped.push_str(&raw[..start_begin]);
         stripped.push_str(&raw[end_end..]);
+        let overlaps_foreign_managed_block = codex_hook_block_overlaps_foreign_managed_block(
+            raw,
+            &document,
+            start_begin,
+            end_end,
+            &multiline_value_lines,
+        );
         return Ok(CodexTomlHookAnalysis {
             document,
             stripped_raw: stripped,
             marker_layout: CodexTomlHookMarkerLayout::Complete,
+            overlaps_foreign_managed_block,
         });
     }
     let mut stripped =
@@ -4155,10 +4247,18 @@ fn analyze_codex_toml_hooks(path: &Path, raw: &str) -> Result<CodexTomlHookAnaly
     stripped.push_str(&raw[..start_begin]);
     stripped.push_str(&raw[start_end..end_begin]);
     stripped.push_str(&raw[end_end..]);
+    let overlaps_foreign_managed_block = codex_hook_block_overlaps_foreign_managed_block(
+        raw,
+        &document,
+        start_begin,
+        end_end,
+        &multiline_value_lines,
+    );
     Ok(CodexTomlHookAnalysis {
         document,
         stripped_raw: stripped,
         marker_layout: CodexTomlHookMarkerLayout::Complete,
+        overlaps_foreign_managed_block,
     })
 }
 
@@ -4185,6 +4285,7 @@ fn plan_inline_codex_hooks(
     if action != SetupAction::Remove
         && analysis.marker_layout == CodexTomlHookMarkerLayout::Complete
         && analysis.stripped_raw != raw
+        && !analysis.overlaps_foreign_managed_block
         && toml_codex_hooks_exactly_configured(&analysis.document)
     {
         return Ok(true);
