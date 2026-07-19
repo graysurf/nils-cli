@@ -93,7 +93,14 @@ Supported canonical events are:
 
 The adapter accepts the event from `--event` or the provider's documented
 `hook_event_name`/`event` field and rejects a mismatch. Matcher values are
-normalized only from documented provider fields. Oversized input, invalid
+normalized only from documented provider fields. A policy matcher is either
+one literal token or an anchored alternation expression such as
+`Write|Edit|NotebookEdit|MultiEdit|apply_patch`; each atom is compared to the
+entire normalized matcher. The only expression operator is `|`. Empty atoms,
+duplicates, more than 64 atoms, and regex/glob/grouping/escape constructs are
+invalid. Setup renders the original validated expression as one provider group
+matcher, preserving registration grouping and order; it does not explode the
+expression into per-tool rules. Oversized input, invalid
 UTF-8/JSON, unsupported events, duplicate object keys, or unknown normalized
 fields fail according to the matching rule's declared failure posture; when no
 rule can be loaded they fail closed except for an exact valid recovery
@@ -247,6 +254,17 @@ Crash, missing Stop, child exit, restart, stale heartbeat, key rotation,
 concurrent contenders, and recreated-target evidence must not silently turn an
 active/unknown owner into clear. Mailbox contents, raw session identity, host,
 checkout path, and capability values never enter dispatch output or trace.
+
+Semantic conflict is never accepted from a Codex or Claude payload field.
+`agent-session.semantic-conflict.v1` derives its classification from the
+private, owner/mode-validated #676 registry, the current managed principal's
+ready/fresh broker incarnation, and active work-context claims. Exact worktree,
+provider-reference, or overlapping scope evidence is definite; an incomplete
+registry, missing authenticated current claim, stale peer universe, or only
+repository-level uncertainty is `unknown`/`potential` and advisory. Only a
+definite authenticated conflict blocks. A forged provider field named
+`semantic_conflict` is ignored and never upgrades or downgrades the derived
+classification.
 
 ## Exit codes
 

@@ -18,4 +18,7 @@ for capability in \
   grep -Fq "\`$capability\`" "$spec"
 done
 grep -Fq 'capability = { id = "runtime-kit.handler.v1", handler_id = "session-start-healthcheck" }' "$spec"
-
+grep -Fq '`Write|Edit|NotebookEdit|MultiEdit|apply_patch`' "$spec"
+grep -Fq 'The only expression operator is `|`.' "$spec"
+grep -Fq 'Semantic conflict is never accepted from a Codex or Claude payload field.' "$spec"
+grep -Fq 'Only a definite authenticated conflict blocks.' "$spec"
