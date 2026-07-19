@@ -18,6 +18,13 @@ const AUTO_RESUME_SCHEMA_VERSION: &str = "agent-session.auto-resume.v1";
 const AUTO_RESUME_FILE: &str = "auto-resume.json";
 const MAX_TRANSIENT_ATTEMPTS: u32 = 5;
 const RETRY_DELAYS_SECONDS: [i64; 5] = [30, 60, 120, 300, 600];
+// Upper bound on consecutive authoritative-arming fallback wakes (Claude
+// "session limit": armed by an authoritative rate-limit but no usage window
+// reaches `used_percent >= 100`). Each re-arm that lands in the fallback path
+// consumes one; the budget is preserved across re-arms and only cleared by a
+// normal exhausted-window schedule or a manual re-enable, so a session that
+// resumes and is immediately re-blocked cannot loop forever.
+const MAX_FALLBACK_SCHEDULES: u32 = 8;
 const PROTOCOL_STATE_LOCK_TIMEOUT: Duration = Duration::from_secs(1);
 
 pub(crate) const CONTINUATION_MESSAGE: &str = "Continue the interrupted task from where you stopped. First inspect the current session and repository state, then continue toward the existing objective. Do not repeat completed work.";
@@ -42,6 +49,14 @@ struct DurableAutoResume {
     attempt: u32,
     #[serde(default)]
     ever_scheduled: bool,
+    // Number of consecutive fallback wakes scheduled off a usage-window reset
+    // while the session was armed by an authoritative provider rate-limit but
+    // no usage window reported `used_percent >= 100` (the Claude "session
+    // limit" case). Bounds a session that keeps re-arming without any usage
+    // window ever reaching exhaustion. Preserved across re-arms; reset when a
+    // normal exhausted-window schedule succeeds or the control is re-enabled.
+    #[serde(default)]
+    fallback_schedules: u32,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -61,6 +76,14 @@ pub(crate) struct UsageSnapshot {
     pub(crate) authoritative: bool,
     pub(crate) has_exhausted_windows: bool,
     pub(crate) exhausted_reset_epochs: Vec<i64>,
+    // Soonest reset epoch across ALL present usage windows (exhausted or not).
+    // Used only to schedule a single fallback wake when a session was armed by
+    // an authoritative provider rate-limit signal but no usage window reports
+    // `used_percent >= 100` — the Claude "session limit" case, where the
+    // provider throttles a session while its percentage windows stay below
+    // 100% and no structured reset time is exposed by the stop hook. `None`
+    // disables the fallback and keeps the historical fail-closed behavior.
+    pub(crate) soonest_reset_epoch: Option<i64>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -101,6 +124,7 @@ fn default_state(now: &str) -> DurableAutoResume {
         blocked_revision: None,
         attempt: 0,
         ever_scheduled: false,
+        fallback_schedules: 0,
     }
 }
 
@@ -242,6 +266,7 @@ pub(crate) fn set_enabled(
     state.blocked_revision = None;
     state.attempt = 0;
     state.ever_scheduled = false;
+    state.fallback_schedules = 0;
     write_state(context, &record.id, &state)?;
     Ok(view(&record, state))
 }
@@ -761,18 +786,50 @@ where
         state.next_check_at = None;
         state.failure_reason = None;
         state.ever_scheduled = true;
+        // A real percentage-window exhaustion drove this schedule, so the
+        // authoritative-arming fallback below is no longer in play; clear its
+        // budget.
+        state.fallback_schedules = 0;
         write_state(context, &record.id, &state)?;
         return Ok(TickOutcome::Scheduled);
     }
 
     if !state.ever_scheduled {
-        return record_retry(
-            context,
-            &record,
-            state,
-            now_epoch,
-            "usage_window_not_exhausted",
-        );
+        // The session was armed by an authoritative provider rate-limit signal
+        // (see `arm_usage_exhaustion`), yet no usage window reports
+        // `used_percent >= 100`. This is the Claude "session limit" case: the
+        // provider throttles the session while its percentage windows stay
+        // below 100%, and the stop hook exposes no structured reset time. Fail
+        // closed only when we cannot derive a wake time; otherwise trust the
+        // authoritative arming and schedule a single fallback wake at the
+        // soonest usage-window reset, re-verifying eligibility at wake before
+        // submitting. `fallback_schedules` bounds a session that keeps
+        // re-arming without any window ever reaching exhaustion.
+        let fallback_reset = usage
+            .soonest_reset_epoch
+            .filter(|reset| *reset > now_epoch)
+            .filter(|_| state.fallback_schedules < MAX_FALLBACK_SCHEDULES);
+        let Some(reset) = fallback_reset else {
+            return record_retry(
+                context,
+                &record,
+                state,
+                now_epoch,
+                "usage_window_not_exhausted",
+            );
+        };
+        let wake_epoch = reset
+            + bounded_jitter_seconds(&record.id, state.blocked_turn_id.as_deref().unwrap_or(""));
+        state.state = "scheduled".to_string();
+        state.updated_at = now;
+        state.scheduled_at = Some(epoch_string(wake_epoch)?);
+        state.next_check_at = None;
+        state.failure_reason = None;
+        state.attempt = 0;
+        state.ever_scheduled = true;
+        state.fallback_schedules = state.fallback_schedules.saturating_add(1);
+        write_state(context, &record.id, &state)?;
+        return Ok(TickOutcome::Scheduled);
     }
 
     let activity = crate::activity::state_for_view(context, &record);
@@ -1013,6 +1070,7 @@ mod tests {
                 authoritative: true,
                 has_exhausted_windows: true,
                 exhausted_reset_epochs: vec![base + 300, base + 900],
+                soonest_reset_epoch: None,
             },
             |_| panic!("must not submit while blocked"),
         )
@@ -1032,6 +1090,7 @@ mod tests {
                 authoritative: true,
                 has_exhausted_windows: false,
                 exhausted_reset_epochs: Vec::new(),
+                soonest_reset_epoch: None,
             },
             |_| {
                 submissions += 1;
@@ -1048,6 +1107,7 @@ mod tests {
                 authoritative: true,
                 has_exhausted_windows: false,
                 exhausted_reset_epochs: Vec::new(),
+                soonest_reset_epoch: None,
             },
             |_| {
                 submissions += 1;
@@ -1057,6 +1117,160 @@ mod tests {
         .unwrap();
         assert_eq!(duplicate, TickOutcome::Unchanged);
         assert_eq!(submissions, 1);
+    }
+
+    #[test]
+    fn authoritative_arming_without_exhaustion_schedules_off_soonest_reset() {
+        // Claude "session limit": armed by an authoritative rate-limit, but no
+        // usage window reports `used_percent >= 100`. The scheduler must trust
+        // the authoritative arming and wake at the soonest usage-window reset
+        // instead of failing closed on `usage_window_not_exhausted`.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (context, record) = seed_session(&tmp);
+        set_enabled(&context, &record.id, true, "2030-01-01T00:00:00Z").unwrap();
+        let revision = waiting_revision(&context, &record);
+        arm_usage_exhaustion(
+            &context,
+            &record.id,
+            "turn-1".to_string(),
+            revision,
+            "2030-01-01T00:00:01Z",
+        )
+        .unwrap();
+
+        let base = 1_893_456_000;
+        let scheduled = tick(
+            &context,
+            &record.id,
+            base,
+            &UsageSnapshot {
+                authoritative: true,
+                has_exhausted_windows: false,
+                exhausted_reset_epochs: Vec::new(),
+                soonest_reset_epoch: Some(base + 300),
+            },
+            |_| panic!("must not submit before the fallback wake"),
+        )
+        .unwrap();
+        assert_eq!(scheduled, TickOutcome::Scheduled);
+
+        let state = read_state(&context, &record.id, "ignored").unwrap();
+        let wake = epoch_from_string(state.scheduled_at.as_deref().unwrap()).unwrap();
+        assert!(wake >= base + 300);
+        assert!(state.ever_scheduled);
+        assert_eq!(state.fallback_schedules, 1);
+        assert!(state.failure_reason.is_none());
+
+        // At the fallback wake the session is still Waiting at the blocked
+        // revision, so the continuation is submitted exactly once.
+        let mut submissions = 0;
+        let resumed = tick(
+            &context,
+            &record.id,
+            wake,
+            &UsageSnapshot {
+                authoritative: true,
+                has_exhausted_windows: false,
+                exhausted_reset_epochs: Vec::new(),
+                soonest_reset_epoch: Some(base + 300),
+            },
+            |_| {
+                submissions += 1;
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(resumed, TickOutcome::Resumed);
+        assert_eq!(submissions, 1);
+    }
+
+    #[test]
+    fn authoritative_arming_without_reset_epoch_stays_fail_closed() {
+        // Without any usage window reset epoch there is no wake time to trust,
+        // so the historical retry-then-terminal fail-closed behavior is kept.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (context, record) = seed_session(&tmp);
+        set_enabled(&context, &record.id, true, "2030-01-01T00:00:00Z").unwrap();
+        let revision = waiting_revision(&context, &record);
+        arm_usage_exhaustion(
+            &context,
+            &record.id,
+            "turn-1".to_string(),
+            revision,
+            "2030-01-01T00:00:01Z",
+        )
+        .unwrap();
+
+        let base = 1_893_456_000;
+        let outcome = tick(
+            &context,
+            &record.id,
+            base,
+            &UsageSnapshot {
+                authoritative: true,
+                has_exhausted_windows: false,
+                exhausted_reset_epochs: Vec::new(),
+                soonest_reset_epoch: None,
+            },
+            |_| panic!("must not submit without a reset epoch"),
+        )
+        .unwrap();
+        assert_eq!(outcome, TickOutcome::Retrying);
+        let state = read_state(&context, &record.id, "ignored").unwrap();
+        assert_eq!(
+            state.failure_reason.as_deref(),
+            Some("usage_window_not_exhausted")
+        );
+        assert!(!state.ever_scheduled);
+        assert_eq!(state.fallback_schedules, 0);
+    }
+
+    #[test]
+    fn fallback_scheduling_is_bounded_across_rearms() {
+        // A session that keeps re-arming without any usage window ever reaching
+        // exhaustion (e.g. resume immediately re-blocked) must not schedule
+        // fallback wakes forever; after the budget it fails closed.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (context, record) = seed_session(&tmp);
+        set_enabled(&context, &record.id, true, "2030-01-01T00:00:00Z").unwrap();
+        let base = 1_893_456_000;
+        let snap = UsageSnapshot {
+            authoritative: true,
+            has_exhausted_windows: false,
+            exhausted_reset_epochs: Vec::new(),
+            soonest_reset_epoch: Some(base + 300),
+        };
+
+        for i in 0..MAX_FALLBACK_SCHEDULES {
+            let revision = waiting_revision(&context, &record);
+            arm_usage_exhaustion(
+                &context,
+                &record.id,
+                format!("turn-{i}"),
+                revision,
+                "2030-01-01T00:00:01Z",
+            )
+            .unwrap();
+            let outcome = tick(&context, &record.id, base, &snap, |_| Ok(())).unwrap();
+            assert_eq!(outcome, TickOutcome::Scheduled, "arm {i} should schedule");
+        }
+
+        let revision = waiting_revision(&context, &record);
+        arm_usage_exhaustion(
+            &context,
+            &record.id,
+            "turn-final".to_string(),
+            revision,
+            "2030-01-01T00:00:01Z",
+        )
+        .unwrap();
+        let outcome = tick(&context, &record.id, base, &snap, |_| Ok(())).unwrap();
+        assert_eq!(outcome, TickOutcome::Retrying);
+        let state = read_state(&context, &record.id, "ignored").unwrap();
+        assert_eq!(
+            state.failure_reason.as_deref(),
+            Some("usage_window_not_exhausted")
+        );
     }
 
     #[test]
@@ -1082,6 +1296,7 @@ mod tests {
                 authoritative: true,
                 has_exhausted_windows: true,
                 exhausted_reset_epochs: vec![base + 900],
+                soonest_reset_epoch: None,
             },
             |_| panic!("must not submit while blocked"),
         )
@@ -1128,6 +1343,7 @@ mod tests {
                     authoritative: true,
                     has_exhausted_windows: true,
                     exhausted_reset_epochs: vec![base + 900],
+                    soonest_reset_epoch: None,
                 },
                 |_| panic!("must not submit while exhausted"),
             )
@@ -1156,6 +1372,7 @@ mod tests {
                     authoritative: true,
                     has_exhausted_windows: false,
                     exhausted_reset_epochs: Vec::new(),
+                    soonest_reset_epoch: None,
                 },
                 |_| {
                     submissions += 1;
@@ -1250,6 +1467,7 @@ mod tests {
                 authoritative: true,
                 has_exhausted_windows: false,
                 exhausted_reset_epochs: Vec::new(),
+                soonest_reset_epoch: None,
             },
             |_| panic!("cancelled state must not submit"),
         )
@@ -1309,6 +1527,7 @@ mod tests {
                 authoritative: true,
                 has_exhausted_windows: true,
                 exhausted_reset_epochs: vec![base + 300],
+                soonest_reset_epoch: None,
             },
             |_| panic!("must not submit while blocked"),
         )
@@ -1338,6 +1557,7 @@ mod tests {
                 authoritative: false,
                 has_exhausted_windows: false,
                 exhausted_reset_epochs: Vec::new(),
+                soonest_reset_epoch: None,
             },
             |_| panic!("stale or policy-blocked usage must never submit"),
         )
@@ -1375,6 +1595,7 @@ mod tests {
                 authoritative: true,
                 has_exhausted_windows: true,
                 exhausted_reset_epochs: vec![base + 60],
+                soonest_reset_epoch: None,
             },
             |_| panic!("must not submit while blocked"),
         )
@@ -1393,6 +1614,7 @@ mod tests {
                 authoritative: true,
                 has_exhausted_windows: true,
                 exhausted_reset_epochs: Vec::new(),
+                soonest_reset_epoch: None,
             },
             |_| panic!("an exhausted window without reset must never submit"),
         )
@@ -1440,6 +1662,7 @@ mod tests {
                 authoritative: true,
                 has_exhausted_windows: false,
                 exhausted_reset_epochs: Vec::new(),
+                soonest_reset_epoch: None,
             },
             |_| panic!("an unconfirmed durable claim must never be replayed"),
         )
@@ -1475,6 +1698,7 @@ mod tests {
                 authoritative: true,
                 has_exhausted_windows: true,
                 exhausted_reset_epochs: vec![base + 60],
+                soonest_reset_epoch: None,
             },
             |_| panic!("must not submit while blocked"),
         )
@@ -1495,6 +1719,7 @@ mod tests {
                 authoritative: true,
                 has_exhausted_windows: false,
                 exhausted_reset_epochs: Vec::new(),
+                soonest_reset_epoch: None,
             },
             |_| {
                 submissions += 1;
@@ -1511,6 +1736,7 @@ mod tests {
                 authoritative: true,
                 has_exhausted_windows: false,
                 exhausted_reset_epochs: Vec::new(),
+                soonest_reset_epoch: None,
             },
             |_| {
                 submissions += 1;
