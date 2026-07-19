@@ -9010,6 +9010,21 @@ fn render_doctor_text(result: &activity::DoctorResult) -> String {
         if let Some(mode) = provider.notification_mode.as_deref() {
             text.push_str(&format!("  notification: {mode}\n"));
         }
+        if let Some(representation) = provider.hook_representation.as_deref() {
+            text.push_str(&format!(
+                "  hooks: {representation} (migration required: {}; conflict: {})\n",
+                if provider.hook_migration_required == Some(true) {
+                    "yes"
+                } else {
+                    "no"
+                },
+                if provider.representation_conflict == Some(true) {
+                    "yes"
+                } else {
+                    "no"
+                }
+            ));
+        }
         text.push_str(&format!(
             "  attention: {}\n",
             provider.attention_correlation
@@ -9020,6 +9035,23 @@ fn render_doctor_text(result: &activity::DoctorResult) -> String {
 }
 
 fn render_setup_text(result: &activity::SetupResult) -> String {
+    let hook_state = result
+        .hook_representation
+        .as_deref()
+        .zip(result.hook_migration.as_deref())
+        .map(|(representation, migration)| {
+            let conflict = result.representation_conflict == Some(true);
+            let next = if conflict {
+                "; next: converge user-owned lifecycle hooks onto one source"
+            } else {
+                ""
+            };
+            format!(
+                "; hooks: {representation}; migration: {migration}; conflict: {}{next}",
+                if conflict { "yes" } else { "no" }
+            )
+        })
+        .unwrap_or_default();
     if result.action == "repair-preview" {
         let preview_digest = result
             .preview_digest
@@ -9031,7 +9063,7 @@ fn render_setup_text(result: &activity::SetupResult) -> String {
                 .as_ref()
                 .expect("a blocked setup preview has notification metadata");
             return format!(
-                "{} activity setup repair preview: blocked by {} (plan: {}; notifier argv: {} args, {}; config unchanged)\n",
+                "{} activity setup repair preview: blocked by {} (plan: {}; notifier argv: {} args, {}; config unchanged{})\n",
                 result.provider,
                 notification
                     .blocker_code
@@ -9042,11 +9074,12 @@ fn render_setup_text(result: &activity::SetupResult) -> String {
                 notification
                     .forwarded_argv_sha256
                     .as_deref()
-                    .unwrap_or("hash unavailable")
+                    .unwrap_or("hash unavailable"),
+                hook_state
             );
         }
         return format!(
-            "{} activity setup repair preview: {} (configured now: {}; would configure: {}; plan: {})\n",
+            "{} activity setup repair preview: {} (configured now: {}; would configure: {}; plan: {}{})\n",
             result.provider,
             if result.would_change {
                 "changes required"
@@ -9055,12 +9088,13 @@ fn render_setup_text(result: &activity::SetupResult) -> String {
             },
             if result.configured { "yes" } else { "no" },
             if result.would_configure { "yes" } else { "no" },
-            preview_digest
+            preview_digest,
+            hook_state
         );
     }
     if result.action == "dry-run" {
         return format!(
-            "{} activity setup preview: {} (configured now: {}; would configure: {})\n",
+            "{} activity setup preview: {} (configured now: {}; would configure: {}{})\n",
             result.provider,
             if result.would_change {
                 "changes required"
@@ -9068,11 +9102,12 @@ fn render_setup_text(result: &activity::SetupResult) -> String {
                 "no change"
             },
             if result.configured { "yes" } else { "no" },
-            if result.would_configure { "yes" } else { "no" }
+            if result.would_configure { "yes" } else { "no" },
+            hook_state
         );
     }
     format!(
-        "{} activity setup {}: {} (configured: {})\n",
+        "{} activity setup {}: {} (configured: {}{})\n",
         result.provider,
         result.action,
         if result.changed {
@@ -9080,7 +9115,8 @@ fn render_setup_text(result: &activity::SetupResult) -> String {
         } else {
             "no change"
         },
-        if result.configured { "yes" } else { "no" }
+        if result.configured { "yes" } else { "no" },
+        hook_state
     )
 }
 
@@ -9186,8 +9222,8 @@ mod tests {
         TmuxProcessIdentity, TmuxRuntimeIdentity, acquire_session_record_lock,
         acquire_session_record_lock_timed, create_record, delete_session_with_timeouts,
         kill_tmux_session_with_timeout, live_status_with_timeout, load_session_record,
-        persist_tmux_runtime_identity, render_delete_text, resolve_session_id, session_dir,
-        strip_trailing_blank_lines, tmux_launch_may_have_created_runtime,
+        persist_tmux_runtime_identity, render_delete_text, render_setup_text, resolve_session_id,
+        session_dir, strip_trailing_blank_lines, tmux_launch_may_have_created_runtime,
         try_acquire_session_record_lock, write_session_record,
     };
     use pretty_assertions::assert_eq;
@@ -9216,6 +9252,30 @@ mod tests {
             state_dir: state_dir.to_path_buf(),
             host: None,
         }
+    }
+
+    #[test]
+    fn setup_text_reports_a_detected_representation_conflict() {
+        let text = render_setup_text(&super::activity::SetupResult {
+            provider: "codex".to_string(),
+            action: "remove".to_string(),
+            changed: true,
+            would_change: true,
+            configured: false,
+            would_configure: false,
+            apply_allowed: true,
+            preview_digest: None,
+            config_path: "/home/user/.codex/config.toml".to_string(),
+            hook_representation: Some("inline_toml".to_string()),
+            hook_migration: Some("not_needed".to_string()),
+            representation_conflict: Some(true),
+            notification_config_path: Some("/home/user/.codex/config.toml".to_string()),
+            notification_preview: None,
+            owned_events: Vec::new(),
+            trust: "review".to_string(),
+        });
+
+        assert!(text.contains("conflict: yes"), "text={text}");
     }
 
     #[test]

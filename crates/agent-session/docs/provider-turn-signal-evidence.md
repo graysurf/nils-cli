@@ -307,9 +307,17 @@ unrelated config keys are preserved; removal deletes only the exact
 agent-session-owned command entries. Setup refuses an observed concurrent
 source-file change instead of replacing the newer configuration.
 
-Codex setup owns two distinct files. Hooks remain an additive JSON merge in
-`~/.codex/hooks.json`. Completion uses the provider's singular top-level TOML
-`notify` argv in `~/.codex/config.toml`. Setup inserts only
+Codex setup plans both user-layer hook sources before selecting one lifecycle
+representation. If `config.toml` already contains actual `[[hooks.<Event>]]`
+groups, setup owns a separate marker-bounded inline block outside other owners'
+marker blocks, migrates exact agent-session handlers out of `hooks.json`, and
+deletes that JSON file only when no user-owned content remains. A
+`[hooks.state]` table alone does not select inline hooks. JSON-only installs
+remain additive in `~/.codex/hooks.json`. If inline hooks are active and
+`hooks.json` also contains non-agent-session lifecycle handlers, setup fails
+closed without mutation and doctor reports the representation conflict for a
+manual ownership decision. Completion continues to use the provider's singular
+top-level TOML `notify` argv in `~/.codex/config.toml`. Setup inserts only
 `["agent-session", "activity", "notify", "--agent", "codex"]`, recognizes that
 exact argv idempotently, and removes only that exact argv. A safe user-owned
 string argv is encoded into the owned command only after a simulated removal
@@ -333,13 +341,21 @@ non-reversible serialization remains blocked; the preview does not authorize or
 perform normalization. The preview's separate plan digest binds the exact
 current and candidate bytes for both files. Applying repair requires it via
 `--expected-preview-digest`; any missing, malformed, or stale digest fails
-before mutation.
+before mutation. Setup and doctor report the selected representation, pending
+migration, conflict state, and active hook path. Inline migration changes Codex
+hook source identities, so operators review the new definitions through
+`/hooks` and verify the absence of the dual-representation warning in a fresh
+session.
 Claude and Hermes do not have this two-file reviewed-plan contract, so the same
 combined flags reject with `provider-repair-preview-unsupported`; ordinary
 dry-run and repair remain separate supported actions for those providers.
-Apply/repair/remove parse and plan both files before either mutation; a guarded
-second-write failure restores the first write, while a rollback race surfaces an
-explicit error naming both metadata-only paths.
+Apply/repair/remove parse and plan both physical files before either mutation;
+the reviewed digest binds file creation, replacement, and deletion candidates.
+A guarded second-write failure restores the first write, including an already
+deleted owned-only JSON source, while a rollback race surfaces an explicit error
+naming both metadata-only paths. Remove discovers JSON versus inline ownership,
+removes only exact agent-session handlers plus notify, and never recreates
+`hooks.json` after inline convergence.
 
 Claude setup adds a general `PreToolUse` progress hook plus exact
 `AskUserQuestion` matcher groups for `PreToolUse`, `PostToolUse`, and

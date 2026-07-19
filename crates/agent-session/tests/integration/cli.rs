@@ -1540,6 +1540,470 @@ fn assert_managed_claude_hook(settings: &Value, event: &str, matcher: Option<&st
 }
 
 #[test]
+fn codex_activity_setup_migrates_owned_json_hooks_to_active_inline_toml() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let home = tmp.path().join("home");
+    fs::create_dir_all(home.join(".codex")).expect("codex dir");
+    let hooks_path = home.join(".codex/hooks.json");
+    let config_path = home.join(".codex/config.toml");
+    let home_arg = home.to_string_lossy().to_string();
+    let envs = [("HOME", home_arg.as_str())];
+
+    let initial = run(
+        tmp.path(),
+        &[
+            "activity", "setup", "--agent", "codex", "--apply", "--format", "json",
+        ],
+        &envs,
+    );
+    assert_eq!(initial.code, 0, "stderr={}", initial.stderr_text());
+
+    let runtime_kit_block = r##"
+note = "# >>> agent-session:codex-hooks >>>private# <<< agent-session:codex-hooks <<<"
+
+# >>> agent-runtime-kit:hooks >>>
+[[hooks.UserPromptSubmit]]
+matcher = ""
+
+[[hooks.UserPromptSubmit.hooks]]
+type = "command"
+command = "runtime-kit-user-prompt"
+timeout = 10
+
+[[hooks.Stop]]
+matcher = ""
+
+[[hooks.Stop.hooks]]
+type = "command"
+command = "runtime-kit-stop"
+timeout = 20
+# <<< agent-runtime-kit:hooks <<<
+"##;
+    let mut mixed_config = fs::read_to_string(&config_path).expect("notify config");
+    mixed_config.push_str(runtime_kit_block);
+    fs::write(&config_path, &mixed_config).expect("mixed config");
+    let hooks_before = fs::read(&hooks_path).expect("owned JSON hooks");
+    let config_before = fs::read(&config_path).expect("mixed TOML config");
+
+    let preview = run(
+        tmp.path(),
+        &[
+            "activity",
+            "setup",
+            "--agent",
+            "codex",
+            "--repair",
+            "--dry-run",
+            "--format",
+            "json",
+        ],
+        &envs,
+    );
+    assert_eq!(preview.code, 0, "stderr={}", preview.stderr_text());
+    let preview_json = preview.stdout_json();
+    let preview_result = data(&preview_json);
+    assert_eq!(preview_result["hook_representation"], "inline_toml");
+    assert_eq!(preview_result["hook_migration"], "json_to_inline_toml");
+    assert_eq!(preview_result["representation_conflict"], false);
+    assert_eq!(preview_result["would_change"], true);
+    assert_eq!(preview_result["would_configure"], true);
+    assert_eq!(fs::read(&hooks_path).expect("dry-run JSON"), hooks_before);
+    assert_eq!(fs::read(&config_path).expect("dry-run TOML"), config_before);
+    let preview_digest = preview_result["preview_digest"]
+        .as_str()
+        .expect("preview digest")
+        .to_string();
+
+    let migrated = run(
+        tmp.path(),
+        &[
+            "activity",
+            "setup",
+            "--agent",
+            "codex",
+            "--repair",
+            "--expected-preview-digest",
+            &preview_digest,
+            "--format",
+            "json",
+        ],
+        &envs,
+    );
+    assert_eq!(migrated.code, 0, "stderr={}", migrated.stderr_text());
+    let migrated_json = migrated.stdout_json();
+    let migrated_result = data(&migrated_json);
+    assert_eq!(migrated_result["hook_representation"], "inline_toml");
+    assert_eq!(migrated_result["hook_migration"], "json_to_inline_toml");
+    assert_eq!(migrated_result["configured"], true);
+    assert!(
+        !hooks_path.exists(),
+        "owned-only hooks.json must be removed"
+    );
+    let converged = fs::read_to_string(&config_path).expect("converged config");
+    assert!(converged.contains(runtime_kit_block));
+    assert!(converged.contains(
+        r##"note = "# >>> agent-session:codex-hooks >>>private# <<< agent-session:codex-hooks <<<""##
+    ));
+    for event in [
+        "UserPromptSubmit",
+        "PermissionRequest",
+        "PostToolUse",
+        "Stop",
+    ] {
+        assert!(
+            converged.contains(&format!("[[hooks.{event}]]")),
+            "missing inline {event}: {converged}"
+        );
+    }
+    assert!(converged.contains("AGENT_SESSION_ATTENTION_AUTHORITY"));
+
+    let steady = run(
+        tmp.path(),
+        &[
+            "activity", "setup", "--agent", "codex", "--apply", "--format", "json",
+        ],
+        &envs,
+    );
+    assert_eq!(steady.code, 0, "stderr={}", steady.stderr_text());
+    assert_eq!(data(&steady.stdout_json())["changed"], false);
+    assert_eq!(
+        data(&steady.stdout_json())["hook_representation"],
+        "inline_toml"
+    );
+    assert!(!hooks_path.exists(), "steady state must not recreate JSON");
+}
+
+#[test]
+fn codex_activity_setup_fails_closed_for_user_hooks_in_both_representations() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let home = tmp.path().join("home");
+    fs::create_dir_all(home.join(".codex")).expect("codex dir");
+    let hooks_path = home.join(".codex/hooks.json");
+    let config_path = home.join(".codex/config.toml");
+    let home_arg = home.to_string_lossy().to_string();
+    let envs = [("HOME", home_arg.as_str())];
+
+    let initial = run(
+        tmp.path(),
+        &[
+            "activity", "setup", "--agent", "codex", "--apply", "--format", "json",
+        ],
+        &envs,
+    );
+    assert_eq!(initial.code, 0, "stderr={}", initial.stderr_text());
+    let mut hooks: Value =
+        serde_json::from_slice(&fs::read(&hooks_path).expect("hooks")).expect("hooks json");
+    hooks["hooks"]["Stop"]
+        .as_array_mut()
+        .expect("Stop groups")
+        .push(json!({
+            "hooks": [{
+                "type": "command",
+                "command": "user-json-stop",
+                "timeout": 7
+            }]
+        }));
+    fs::write(
+        &hooks_path,
+        serde_json::to_vec_pretty(&hooks).expect("hooks bytes"),
+    )
+    .expect("user JSON hook");
+    let mut config = fs::read_to_string(&config_path).expect("config");
+    config.push_str(
+        r#"
+[[hooks.Stop]]
+
+[[hooks.Stop.hooks]]
+type = "command"
+command = "user-toml-stop"
+timeout = 9
+"#,
+    );
+    fs::write(&config_path, config).expect("user TOML hook");
+    let hooks_before = fs::read(&hooks_path).expect("hooks before");
+    let config_before = fs::read(&config_path).expect("config before");
+
+    let repair = run(
+        tmp.path(),
+        &[
+            "activity",
+            "setup",
+            "--agent",
+            "codex",
+            "--repair",
+            "--dry-run",
+            "--format",
+            "json",
+        ],
+        &envs,
+    );
+    assert_ne!(repair.code, 0);
+    assert_eq!(
+        repair.stdout_json()["error"]["code"],
+        "provider-hook-representation-conflict"
+    );
+    assert_eq!(fs::read(&hooks_path).expect("hooks after"), hooks_before);
+    assert_eq!(fs::read(&config_path).expect("config after"), config_before);
+
+    let doctor = run(
+        tmp.path(),
+        &["activity", "doctor", "--agent", "codex", "--format", "json"],
+        &envs,
+    );
+    assert_eq!(doctor.code, 0, "stderr={}", doctor.stderr_text());
+    let doctor_json = doctor.stdout_json();
+    let provider = &data(&doctor_json)["providers"][0];
+    assert_eq!(provider["configured"], false);
+    assert_eq!(provider["hook_representation"], "inline_toml");
+    assert_eq!(provider["hook_migration_required"], true);
+    assert_eq!(provider["representation_conflict"], true);
+    assert_eq!(
+        provider["config_path"],
+        config_path.to_string_lossy().as_ref()
+    );
+}
+
+#[test]
+fn codex_activity_setup_rejects_partial_inline_and_mismatched_json_ownership() {
+    let scenarios = [
+        (
+            r#"{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"user-json-stop","timeout":7}]}]}}"#,
+            r#"
+[[hooks.UserPromptSubmit]]
+
+[[hooks.UserPromptSubmit.hooks]]
+type = "command"
+command = "agent-session activity hook --agent codex"
+timeout = 5
+"#,
+        ),
+        (
+            r#"{"hooks":{"UserPromptSubmit":[{"matcher":"Bash","hooks":[{"type":"command","command":"agent-session activity hook --agent codex","timeout":5}]}]}}"#,
+            r#"
+[[hooks.Stop]]
+
+[[hooks.Stop.hooks]]
+type = "command"
+command = "user-toml-stop"
+timeout = 9
+"#,
+        ),
+    ];
+    for (hooks_fixture, config_fixture) in scenarios {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let home = tmp.path().join("home");
+        fs::create_dir_all(home.join(".codex")).expect("codex dir");
+        let hooks_path = home.join(".codex/hooks.json");
+        let config_path = home.join(".codex/config.toml");
+        fs::write(&hooks_path, hooks_fixture).expect("hooks fixture");
+        fs::write(&config_path, config_fixture).expect("config fixture");
+        let hooks_before = fs::read(&hooks_path).expect("hooks before");
+        let config_before = fs::read(&config_path).expect("config before");
+        let home_arg = home.to_string_lossy().to_string();
+
+        let preview = run(
+            tmp.path(),
+            &[
+                "activity",
+                "setup",
+                "--agent",
+                "codex",
+                "--repair",
+                "--dry-run",
+                "--format",
+                "json",
+            ],
+            &[("HOME", home_arg.as_str())],
+        );
+        assert_ne!(preview.code, 0);
+        assert_eq!(
+            preview.stdout_json()["error"]["code"],
+            "provider-hook-representation-conflict"
+        );
+        assert_eq!(fs::read(&hooks_path).expect("hooks after"), hooks_before);
+        assert_eq!(fs::read(&config_path).expect("config after"), config_before);
+    }
+}
+
+#[test]
+fn codex_activity_remove_cleans_owned_hooks_even_during_representation_conflict() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let home = tmp.path().join("home");
+    fs::create_dir_all(home.join(".codex")).expect("codex dir");
+    let hooks_path = home.join(".codex/hooks.json");
+    let config_path = home.join(".codex/config.toml");
+    let home_arg = home.to_string_lossy().to_string();
+    let envs = [("HOME", home_arg.as_str())];
+    let initial = run(
+        tmp.path(),
+        &[
+            "activity", "setup", "--agent", "codex", "--apply", "--format", "json",
+        ],
+        &envs,
+    );
+    assert_eq!(initial.code, 0, "stderr={}", initial.stderr_text());
+
+    let mut hooks: Value =
+        serde_json::from_slice(&fs::read(&hooks_path).expect("hooks")).expect("hooks json");
+    hooks["hooks"]["Stop"]
+        .as_array_mut()
+        .expect("Stop groups")
+        .push(json!({
+            "hooks": [{"type": "command", "command": "user-json-stop", "timeout": 7}]
+        }));
+    fs::write(
+        &hooks_path,
+        serde_json::to_vec_pretty(&hooks).expect("hooks bytes"),
+    )
+    .expect("user JSON hook");
+    let mut config = fs::read_to_string(&config_path).expect("config");
+    config.push_str(
+        r#"
+[[hooks.Stop]]
+
+[[hooks.Stop.hooks]]
+type = "command"
+command = "user-toml-stop"
+timeout = 9
+"#,
+    );
+    fs::write(&config_path, config).expect("user TOML hook");
+
+    let removed = run(
+        tmp.path(),
+        &[
+            "activity", "setup", "--agent", "codex", "--remove", "--format", "json",
+        ],
+        &envs,
+    );
+    assert_eq!(removed.code, 0, "stderr={}", removed.stderr_text());
+    assert_eq!(
+        data(&removed.stdout_json())["representation_conflict"],
+        true
+    );
+    let hooks = fs::read_to_string(&hooks_path).expect("preserved JSON config");
+    let config = fs::read_to_string(&config_path).expect("preserved TOML config");
+    assert!(hooks.contains("user-json-stop"));
+    assert!(config.contains("user-toml-stop"));
+    assert!(!hooks.contains("agent-session activity hook"));
+    assert!(!config.contains("agent-session activity hook"));
+    assert!(!config.contains("agent-session activity notify"));
+}
+
+#[test]
+fn codex_activity_remove_discovers_inline_hooks_and_does_not_recreate_json() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let home = tmp.path().join("home");
+    fs::create_dir_all(home.join(".codex")).expect("codex dir");
+    let hooks_path = home.join(".codex/hooks.json");
+    let config_path = home.join(".codex/config.toml");
+    let home_arg = home.to_string_lossy().to_string();
+    let envs = [("HOME", home_arg.as_str())];
+
+    let initial = run(
+        tmp.path(),
+        &[
+            "activity", "setup", "--agent", "codex", "--apply", "--format", "json",
+        ],
+        &envs,
+    );
+    assert_eq!(initial.code, 0, "stderr={}", initial.stderr_text());
+    let user_block = r#"
+[[hooks.Stop]]
+
+[[hooks.Stop.hooks]]
+type = "command"
+command = "user-toml-stop"
+timeout = 9
+"#;
+    let mut config = fs::read_to_string(&config_path).expect("config");
+    config.push_str(user_block);
+    fs::write(&config_path, config).expect("inline config");
+
+    let preview = run(
+        tmp.path(),
+        &[
+            "activity",
+            "setup",
+            "--agent",
+            "codex",
+            "--repair",
+            "--dry-run",
+            "--format",
+            "json",
+        ],
+        &envs,
+    );
+    assert_eq!(preview.code, 0, "stderr={}", preview.stderr_text());
+    let digest = data(&preview.stdout_json())["preview_digest"]
+        .as_str()
+        .expect("preview digest")
+        .to_string();
+    let migrated = run(
+        tmp.path(),
+        &[
+            "activity",
+            "setup",
+            "--agent",
+            "codex",
+            "--repair",
+            "--expected-preview-digest",
+            &digest,
+            "--format",
+            "json",
+        ],
+        &envs,
+    );
+    assert_eq!(migrated.code, 0, "stderr={}", migrated.stderr_text());
+    assert!(!hooks_path.exists());
+
+    let removed = run(
+        tmp.path(),
+        &[
+            "activity", "setup", "--agent", "codex", "--remove", "--format", "json",
+        ],
+        &envs,
+    );
+    assert_eq!(removed.code, 0, "stderr={}", removed.stderr_text());
+    assert_eq!(
+        data(&removed.stdout_json())["hook_representation"],
+        "inline_toml"
+    );
+    assert!(!hooks_path.exists(), "remove must not recreate hooks.json");
+    let config = fs::read_to_string(&config_path).expect("removed config");
+    assert!(config.contains(user_block));
+    assert!(!config.contains("agent-session:codex-hooks"));
+    assert!(!config.contains("agent-session activity hook --agent codex"));
+    assert!(!config.contains("agent-session activity notify --agent codex"));
+}
+
+#[test]
+fn codex_hooks_state_table_does_not_select_inline_lifecycle_representation() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let home = tmp.path().join("home");
+    fs::create_dir_all(home.join(".codex")).expect("codex dir");
+    let hooks_path = home.join(".codex/hooks.json");
+    let config_path = home.join(".codex/config.toml");
+    fs::write(&config_path, "[hooks.state]\ntrusted = true\n").expect("hooks state");
+    let home_arg = home.to_string_lossy().to_string();
+    let applied = run(
+        tmp.path(),
+        &[
+            "activity", "setup", "--agent", "codex", "--apply", "--format", "json",
+        ],
+        &[("HOME", home_arg.as_str())],
+    );
+    assert_eq!(applied.code, 0, "stderr={}", applied.stderr_text());
+    assert_eq!(data(&applied.stdout_json())["hook_representation"], "json");
+    assert!(hooks_path.is_file());
+    assert!(
+        fs::read_to_string(config_path)
+            .expect("config")
+            .contains("[hooks.state]")
+    );
+}
+
+#[test]
 fn activity_setup_is_dry_run_first_additive_idempotent_and_reversible() {
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let home = tmp.path().join("home");
