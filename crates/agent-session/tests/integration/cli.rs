@@ -1747,6 +1747,169 @@ trust_level = "trusted"
 }
 
 #[test]
+fn codex_repair_rehomes_owned_block_that_overlaps_foreign_markers() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let home = tmp.path().join("home");
+    fs::create_dir_all(home.join(".codex")).expect("codex dir");
+    let config_path = home.join(".codex/config.toml");
+    let foreign_block = r#"# >>> agent-runtime-kit:hooks >>>
+[[hooks.PreToolUse]]
+
+[[hooks.PreToolUse.hooks]]
+type = "command"
+command = "runtime-kit-pre-tool"
+timeout = 5
+
+[[hooks.UserPromptSubmit]]
+
+[[hooks.UserPromptSubmit.hooks]]
+type = "command"
+command = "runtime-kit-prompt"
+timeout = 5
+# <<< agent-runtime-kit:hooks <<<"#;
+    let overlapped = r##"model = "gpt-5"
+notify = ["agent-session", "activity", "notify", "--agent", "codex"]
+# >>> agent-runtime-kit:hooks >>>
+[[hooks.PreToolUse]]
+
+[[hooks.PreToolUse.hooks]]
+type = "command"
+command = "runtime-kit-pre-tool"
+timeout = 5
+
+[[hooks.UserPromptSubmit]]
+
+[[hooks.UserPromptSubmit.hooks]]
+type = "command"
+command = "runtime-kit-prompt"
+timeout = 5
+
+# >>> agent-session:codex-hooks >>>
+[[hooks.UserPromptSubmit]]
+
+[[hooks.UserPromptSubmit.hooks]]
+type = "command"
+command = "agent-session activity hook --agent codex"
+timeout = 5
+
+[[hooks.PermissionRequest]]
+
+[[hooks.PermissionRequest.hooks]]
+type = "command"
+command = """sh -c 'if [ "${AGENT_SESSION_ATTENTION_AUTHORITY:-hook}" = protocol ]; then exit 0; fi; exec agent-session activity hook --agent codex'"""
+timeout = 5
+
+[[hooks.PostToolUse]]
+
+[[hooks.PostToolUse.hooks]]
+type = "command"
+command = "agent-session activity hook --agent codex"
+timeout = 5
+# <<< agent-runtime-kit:hooks <<<
+
+[hooks.state]
+
+[hooks.state."config.toml:pre_tool_use:0:0"]
+trusted_hash = "sha256:runtime-kit"
+enabled = true
+
+[[hooks.Stop]]
+
+[[hooks.Stop.hooks]]
+type = "command"
+command = "agent-session activity hook --agent codex"
+timeout = 5
+
+# <<< agent-session:codex-hooks <<<
+"##
+    .to_string();
+    fs::write(&config_path, &overlapped).expect("overlapped config");
+    let home_arg = home.to_string_lossy().to_string();
+    let envs = [("HOME", home_arg.as_str())];
+
+    let preview = run(
+        tmp.path(),
+        &[
+            "activity",
+            "setup",
+            "--agent",
+            "codex",
+            "--repair",
+            "--dry-run",
+            "--format",
+            "json",
+        ],
+        &envs,
+    );
+    assert_eq!(preview.code, 0, "stderr={}", preview.stderr_text());
+    let preview_json = preview.stdout_json();
+    let preview_result = data(&preview_json);
+    assert_eq!(preview_result["hook_representation"], "inline_toml");
+    assert_eq!(preview_result["would_change"], true);
+    assert_eq!(
+        fs::read_to_string(&config_path).expect("dry-run config"),
+        overlapped,
+        "preview must not mutate the overlapped config"
+    );
+    let preview_digest = preview_result["preview_digest"]
+        .as_str()
+        .expect("preview digest")
+        .to_string();
+
+    let repaired = run(
+        tmp.path(),
+        &[
+            "activity",
+            "setup",
+            "--agent",
+            "codex",
+            "--repair",
+            "--expected-preview-digest",
+            &preview_digest,
+            "--format",
+            "json",
+        ],
+        &envs,
+    );
+    assert_eq!(repaired.code, 0, "stderr={}", repaired.stderr_text());
+    assert_eq!(data(&repaired.stdout_json())["configured"], true);
+
+    let converged = fs::read_to_string(&config_path).expect("converged config");
+    assert!(converged.contains(foreign_block));
+    let foreign_end = converged
+        .find("# <<< agent-runtime-kit:hooks <<<")
+        .expect("foreign end marker");
+    let owned_start = converged
+        .find("# >>> agent-session:codex-hooks >>>")
+        .expect("owned start marker");
+    let owned_end = converged
+        .find("# <<< agent-session:codex-hooks <<<")
+        .expect("owned end marker");
+    assert!(
+        foreign_end < owned_start && owned_start < owned_end,
+        "owned block must be fully outside the foreign marker pair: {converged}"
+    );
+    assert!(converged.contains("sha256:runtime-kit"));
+
+    let steady = run(
+        tmp.path(),
+        &[
+            "activity",
+            "setup",
+            "--agent",
+            "codex",
+            "--repair",
+            "--dry-run",
+            "--format",
+            "json",
+        ],
+        &envs,
+    );
+    assert_eq!(steady.code, 0, "stderr={}", steady.stderr_text());
+    assert_eq!(data(&steady.stdout_json())["would_change"], false);
+}
+
+#[test]
 fn codex_repair_recovers_one_orphan_owned_marker_after_trust_save() {
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let home = tmp.path().join("home");

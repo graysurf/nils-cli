@@ -4075,6 +4075,49 @@ struct CodexTomlHookAnalysis {
     document: TomlDocument,
     stripped_raw: String,
     marker_layout: CodexTomlHookMarkerLayout,
+    overlaps_foreign_managed_block: bool,
+}
+
+fn codex_hook_block_overlaps_foreign_managed_block(
+    raw: &str,
+    owned_start: usize,
+    owned_end: usize,
+    multiline_value_lines: &[usize],
+) -> bool {
+    let mut foreign_starts = Vec::new();
+    let mut foreign_ends = Vec::new();
+    let mut offset = 0_usize;
+    for line in raw.split_inclusive('\n') {
+        let start = offset;
+        offset += line.len();
+        if multiline_value_lines.binary_search(&start).is_ok() {
+            continue;
+        }
+        let without_newline = line.strip_suffix('\n').unwrap_or(line);
+        let content = without_newline
+            .strip_suffix('\r')
+            .unwrap_or(without_newline);
+        if let Some(owner) = content
+            .strip_prefix("# >>> ")
+            .and_then(|value| value.strip_suffix(" >>>"))
+            .filter(|owner| *owner != "agent-session:codex-hooks")
+        {
+            foreign_starts.push((owner, start));
+        }
+        if let Some(owner) = content
+            .strip_prefix("# <<< ")
+            .and_then(|value| value.strip_suffix(" <<<"))
+            .filter(|owner| *owner != "agent-session:codex-hooks")
+        {
+            foreign_ends.push((owner, offset));
+        }
+    }
+    foreign_starts.iter().any(|(owner, start)| {
+        foreign_ends
+            .iter()
+            .find(|(end_owner, end)| end_owner == owner && *end > *start)
+            .is_some_and(|(_, end)| *start < owned_end && owned_start < *end)
+    })
 }
 
 fn analyze_codex_toml_hooks(path: &Path, raw: &str) -> Result<CodexTomlHookAnalysis, CliError> {
@@ -4102,6 +4145,7 @@ fn analyze_codex_toml_hooks(path: &Path, raw: &str) -> Result<CodexTomlHookAnaly
             document,
             stripped_raw: raw.to_string(),
             marker_layout: CodexTomlHookMarkerLayout::Absent,
+            overlaps_foreign_managed_block: false,
         });
     }
     if starts.len() > 1 || ends.len() > 1 {
@@ -4131,6 +4175,7 @@ fn analyze_codex_toml_hooks(path: &Path, raw: &str) -> Result<CodexTomlHookAnaly
             document,
             stripped_raw: stripped,
             marker_layout,
+            overlaps_foreign_managed_block: false,
         });
     };
     if end_begin < start_begin {
@@ -4148,6 +4193,12 @@ fn analyze_codex_toml_hooks(path: &Path, raw: &str) -> Result<CodexTomlHookAnaly
             document,
             stripped_raw: stripped,
             marker_layout: CodexTomlHookMarkerLayout::Complete,
+            overlaps_foreign_managed_block: codex_hook_block_overlaps_foreign_managed_block(
+                raw,
+                start_begin,
+                end_end,
+                &multiline_value_lines,
+            ),
         });
     }
     let mut stripped =
@@ -4159,6 +4210,12 @@ fn analyze_codex_toml_hooks(path: &Path, raw: &str) -> Result<CodexTomlHookAnaly
         document,
         stripped_raw: stripped,
         marker_layout: CodexTomlHookMarkerLayout::Complete,
+        overlaps_foreign_managed_block: codex_hook_block_overlaps_foreign_managed_block(
+            raw,
+            start_begin,
+            end_end,
+            &multiline_value_lines,
+        ),
     })
 }
 
@@ -4185,6 +4242,7 @@ fn plan_inline_codex_hooks(
     if action != SetupAction::Remove
         && analysis.marker_layout == CodexTomlHookMarkerLayout::Complete
         && analysis.stripped_raw != raw
+        && !analysis.overlaps_foreign_managed_block
         && toml_codex_hooks_exactly_configured(&analysis.document)
     {
         return Ok(true);
