@@ -1851,6 +1851,155 @@ timeout = 5
 }
 
 #[test]
+fn codex_repair_recovers_marker_only_layout_without_creating_json_hooks() {
+    for marker_layout in [
+        "# >>> agent-session:codex-hooks >>>",
+        "# <<< agent-session:codex-hooks <<<",
+        "# >>> agent-session:codex-hooks >>>\n# <<< agent-session:codex-hooks <<<",
+    ] {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let home = tmp.path().join("home");
+        fs::create_dir_all(home.join(".codex")).expect("codex dir");
+        let config_path = home.join(".codex/config.toml");
+        let hooks_path = home.join(".codex/hooks.json");
+        let damaged = format!("model = \"gpt-5\"\n{marker_layout}\n");
+        fs::write(&config_path, &damaged).expect("marker-only config");
+        let home_arg = home.to_string_lossy().to_string();
+        let envs = [("HOME", home_arg.as_str())];
+
+        let preview = run(
+            tmp.path(),
+            &[
+                "activity",
+                "setup",
+                "--agent",
+                "codex",
+                "--repair",
+                "--dry-run",
+                "--format",
+                "json",
+            ],
+            &envs,
+        );
+        assert_eq!(preview.code, 0, "stderr={}", preview.stderr_text());
+        let preview_json = preview.stdout_json();
+        let preview_result = data(&preview_json);
+        assert_eq!(preview_result["hook_representation"], "inline_toml");
+        assert_eq!(preview_result["would_change"], true);
+        assert_eq!(
+            fs::read_to_string(&config_path).expect("dry-run config"),
+            damaged,
+            "preview must preserve the orphan marker"
+        );
+        assert!(!hooks_path.exists(), "preview must not create hooks.json");
+        let preview_digest = preview_result["preview_digest"]
+            .as_str()
+            .expect("preview digest")
+            .to_string();
+
+        let repaired = run(
+            tmp.path(),
+            &[
+                "activity",
+                "setup",
+                "--agent",
+                "codex",
+                "--repair",
+                "--expected-preview-digest",
+                &preview_digest,
+                "--format",
+                "json",
+            ],
+            &envs,
+        );
+        assert_eq!(repaired.code, 0, "stderr={}", repaired.stderr_text());
+        let repaired_config = fs::read_to_string(&config_path).expect("repaired config");
+        assert_eq!(
+            repaired_config
+                .matches("# >>> agent-session:codex-hooks >>>")
+                .count(),
+            1
+        );
+        assert_eq!(
+            repaired_config
+                .matches("# <<< agent-session:codex-hooks <<<")
+                .count(),
+            1
+        );
+        assert!(repaired_config.contains("agent-session activity hook"));
+        assert!(!hooks_path.exists(), "repair must not create hooks.json");
+
+        let steady = run(
+            tmp.path(),
+            &[
+                "activity",
+                "setup",
+                "--agent",
+                "codex",
+                "--repair",
+                "--dry-run",
+                "--format",
+                "json",
+            ],
+            &envs,
+        );
+        assert_eq!(steady.code, 0, "stderr={}", steady.stderr_text());
+        assert_eq!(data(&steady.stdout_json())["would_change"], false);
+        assert!(
+            !hooks_path.exists(),
+            "steady state must not create hooks.json"
+        );
+    }
+}
+
+#[test]
+fn codex_marker_only_duplicate_or_reversed_layout_fails_before_writes() {
+    for marker_layout in [
+        "# >>> agent-session:codex-hooks >>>\n# >>> agent-session:codex-hooks >>>\n",
+        "# <<< agent-session:codex-hooks <<<\n# <<< agent-session:codex-hooks <<<\n",
+        "# <<< agent-session:codex-hooks <<<\n# >>> agent-session:codex-hooks >>>\n",
+    ] {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let home = tmp.path().join("home");
+        fs::create_dir_all(home.join(".codex")).expect("codex dir");
+        let config_path = home.join(".codex/config.toml");
+        let hooks_path = home.join(".codex/hooks.json");
+        let invalid = format!("model = \"gpt-5\"\n{marker_layout}");
+        fs::write(&config_path, &invalid).expect("invalid marker-only config");
+        let home_arg = home.to_string_lossy().to_string();
+        let envs = [("HOME", home_arg.as_str())];
+
+        let preview = run(
+            tmp.path(),
+            &[
+                "activity",
+                "setup",
+                "--agent",
+                "codex",
+                "--repair",
+                "--dry-run",
+                "--format",
+                "json",
+            ],
+            &envs,
+        );
+        assert_ne!(preview.code, 0);
+        assert_eq!(
+            preview.stdout_json()["error"]["code"],
+            "provider-config-invalid"
+        );
+        assert_eq!(
+            fs::read_to_string(&config_path).expect("unchanged invalid config"),
+            invalid
+        );
+        assert!(
+            !hooks_path.exists(),
+            "invalid preview must not create hooks.json"
+        );
+    }
+}
+
+#[test]
 fn codex_repair_restores_one_missing_marker_around_intact_hooks() {
     for missing_marker in [
         "# >>> agent-session:codex-hooks >>>\n",

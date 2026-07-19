@@ -4059,6 +4059,7 @@ fn toml_multiline_value_line_starts(raw: &str) -> Vec<usize> {
 #[derive(Debug)]
 struct StrippedCodexTomlHookBlock {
     raw: String,
+    marker_evidence: bool,
     complete_marker_pair: bool,
 }
 
@@ -4088,6 +4089,7 @@ fn strip_owned_codex_toml_hook_block(
     if starts.is_empty() && ends.is_empty() {
         return Ok(StrippedCodexTomlHookBlock {
             raw: raw.to_string(),
+            marker_evidence: false,
             complete_marker_pair: false,
         });
     }
@@ -4111,6 +4113,7 @@ fn strip_owned_codex_toml_hook_block(
         stripped.push_str(&raw[orphan_end..]);
         return Ok(StrippedCodexTomlHookBlock {
             raw: stripped,
+            marker_evidence: true,
             complete_marker_pair: false,
         });
     };
@@ -4127,6 +4130,7 @@ fn strip_owned_codex_toml_hook_block(
         stripped.push_str(&raw[end_end..]);
         return Ok(StrippedCodexTomlHookBlock {
             raw: stripped,
+            marker_evidence: true,
             complete_marker_pair: true,
         });
     }
@@ -4137,6 +4141,7 @@ fn strip_owned_codex_toml_hook_block(
     stripped.push_str(&raw[end_end..]);
     Ok(StrippedCodexTomlHookBlock {
         raw: stripped,
+        marker_evidence: true,
         complete_marker_pair: true,
     })
 }
@@ -4321,8 +4326,12 @@ fn plan_codex_json_cleanup(
     Ok(plan)
 }
 
-fn codex_hook_status_from_documents(json: &Value, config: &TomlDocument) -> CodexHookStatus {
-    let inline_active = toml_inline_has_lifecycle_hooks(config);
+fn codex_hook_status_from_documents(
+    json: &Value,
+    config: &TomlDocument,
+    inline_marker_evidence: bool,
+) -> CodexHookStatus {
+    let inline_active = inline_marker_evidence || toml_inline_has_lifecycle_hooks(config);
     let representation = if inline_active {
         CodexHookRepresentation::InlineToml
     } else {
@@ -4369,7 +4378,13 @@ fn codex_hook_status(json_path: &Path, config_path: &Path) -> Result<CodexHookSt
     } else {
         parse_codex_notification_config(config_path, &config_raw)?
     };
-    Ok(codex_hook_status_from_documents(&json, &config))
+    let marker_evidence =
+        strip_owned_codex_toml_hook_block(config_path, &config_raw)?.marker_evidence;
+    Ok(codex_hook_status_from_documents(
+        &json,
+        &config,
+        marker_evidence,
+    ))
 }
 
 fn setup_codex_provider(
@@ -4404,7 +4419,9 @@ fn setup_codex_provider(
     } else {
         parse_codex_notification_config(notification_path, config_raw)?
     };
-    let status = codex_hook_status_from_documents(&json, &config);
+    let marker_evidence =
+        strip_owned_codex_toml_hook_block(notification_path, config_raw)?.marker_evidence;
+    let status = codex_hook_status_from_documents(&json, &config, marker_evidence);
     if status.conflict && action != SetupAction::Remove {
         return Err(CliError::data(
             "provider-hook-representation-conflict",
@@ -8147,7 +8164,7 @@ mod tests {
         );
         let document = parse_codex_notification_config(&config_path, &config).expect("TOML");
 
-        let status = codex_hook_status_from_documents(&json, &document);
+        let status = codex_hook_status_from_documents(&json, &document, false);
         assert!(status.conflict, "additive group metadata is user-owned");
 
         let json_bytes = serde_json::to_vec_pretty(&json).expect("JSON bytes");
