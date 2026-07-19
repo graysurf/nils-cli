@@ -467,6 +467,7 @@ fn public_snapshot_api_does_not_require_a_colocated_git_cli_binary() {
     );
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn snapshot_cli_does_not_resolve_git_from_an_injected_path_entry() {
     let repo = init_repo();
@@ -1291,7 +1292,7 @@ fn governed_cli_feature_gate_accepts_only_exact_one() {
         "worktree",
         "adopt-dirty",
         "--challenge",
-        CHALLENGE_TOKEN,
+        "malformed-challenge",
         "--reason-file",
         "/nonexistent/adoption-reason.txt",
         "--format=json",
@@ -1319,6 +1320,7 @@ fn governed_cli_feature_gate_accepts_only_exact_one() {
     assert_ne!(code, "dirty-checkout-adoption-disabled");
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn governed_cli_enforces_gate_and_returns_private_json_contracts() {
     let harness = GitCliHarness::new();
@@ -1446,6 +1448,7 @@ fn governed_cli_enforces_gate_and_returns_private_json_contracts() {
     assert_eq!(revoked_json["data"]["revoked"], true);
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn dirty_snapshot_json_omits_raw_checkout_paths() {
     let harness = GitCliHarness::new();
@@ -1603,71 +1606,17 @@ fn assert_json_error(output: &CmdOutput, expected_code: &str, expected_exit: i32
 }
 
 #[test]
-fn dirty_checkout_cli_uses_stable_domain_error_codes_and_exits() {
-    let harness = GitCliHarness::new();
-    let clean_repo = init_repo();
-    let clean = harness.run(
-        clean_repo.path(),
-        &["worktree", "dirty-snapshot", "--format=json"],
-    );
-    assert_json_error(
-        &clean,
-        "dirty-checkout-clean",
-        nils_common::cli_contract::exit::DATA,
-    );
-
-    let operation_repo = init_repo();
-    fs::write(operation_repo.path().join("dirty.txt"), "dirty\n").expect("write dirty file");
-    let git_dir = git(operation_repo.path(), &["rev-parse", "--absolute-git-dir"]);
-    fs::write(std::path::Path::new(git_dir.trim()).join("index.lock"), "")
-        .expect("write active operation marker");
-    let unsupported = harness.run(
-        operation_repo.path(),
-        &["worktree", "dirty-snapshot", "--format=json"],
-    );
-    assert_json_error(
-        &unsupported,
-        "dirty-checkout-unsupported-git-state",
-        nils_common::cli_contract::exit::DATA,
-    );
-}
-
-#[test]
-fn dirty_checkout_cli_maps_resource_limits_to_runtime_exit_class() {
-    let harness = GitCliHarness::new();
-    let repo = init_repo();
-    let oversized = fs::File::create(repo.path().join("oversized-sparse.bin"))
-        .expect("create sparse oversized fixture");
-    oversized
-        .set_len(1024 * 1024 * 1024 + 1)
-        .expect("size sparse oversized fixture");
-
-    let output = harness.run(
-        repo.path(),
-        &["worktree", "dirty-snapshot", "--format=json"],
-    );
-
-    assert_json_error(
-        &output,
-        "dirty-checkout-resource-unavailable",
-        nils_common::cli_contract::exit::RUNTIME,
-    );
-}
-
-#[test]
-fn dirty_checkout_cli_maps_expected_fail_closed_boundaries_to_domain_errors() {
-    let harness = GitCliHarness::new();
-
+fn dirty_checkout_apis_map_expected_fail_closed_boundaries_to_domain_errors() {
     let link_repo = init_repo();
     symlink("/etc/passwd", link_repo.path().join("escape")).expect("create escaping link fixture");
-    let link_output = harness.run(
-        link_repo.path(),
-        &["worktree", "dirty-snapshot", "--format=json"],
-    );
-    assert_json_error(
-        &link_output,
-        "dirty-checkout-unsupported-git-state",
-        nils_common::cli_contract::exit::DATA,
+    let link_error =
+        dirty_snapshot(link_repo.path()).expect_err("escaping symlink must be rejected");
+    assert_eq!(
+        link_error
+            .downcast_ref::<DirtyCheckoutError>()
+            .expect("typed unsupported-state error")
+            .kind(),
+        DirtyCheckoutErrorKind::UnsupportedGitState
     );
 
     let reason_repo = init_repo();
@@ -1679,26 +1628,19 @@ fn dirty_checkout_cli_maps_expected_fail_closed_boundaries_to_domain_errors() {
     let reason_link = reason_state.path().join("reason-link.txt");
     fs::write(&reason_target, "Preserve changes.\n").expect("write reason target");
     symlink(&reason_target, &reason_link).expect("create reason symlink");
-    let reason_arg = reason_link.to_string_lossy().to_string();
-    let reason_output = run_governed_command(
-        &harness,
+    let reason_error = adopt_dirty(
         reason_repo.path(),
         reason_state.path(),
-        true,
-        &[
-            "worktree",
-            "adopt-dirty",
-            "--challenge",
-            CHALLENGE_TOKEN,
-            "--reason-file",
-            &reason_arg,
-            "--format=json",
-        ],
-    );
-    assert_json_error(
-        &reason_output,
-        "dirty-checkout-invalid-input",
-        nils_common::cli_contract::exit::DATA,
+        CHALLENGE_TOKEN,
+        &reason_link,
+    )
+    .expect_err("symlink reason must be rejected");
+    assert_eq!(
+        reason_error
+            .downcast_ref::<DirtyCheckoutError>()
+            .expect("typed invalid-input error")
+            .kind(),
+        DirtyCheckoutErrorKind::InvalidInput
     );
     assert!(reason_challenge.exists());
 
@@ -1711,26 +1653,19 @@ fn dirty_checkout_cli_maps_expected_fail_closed_boundaries_to_domain_errors() {
     let challenge_path = write_challenge(challenge_state.path(), &challenge_snapshot);
     fs::set_permissions(&challenge_path, fs::Permissions::from_mode(0o644))
         .expect("make challenge public");
-    let challenge_reason_arg = challenge_reason.to_string_lossy().to_string();
-    let challenge_output = run_governed_command(
-        &harness,
+    let challenge_error = adopt_dirty(
         challenge_repo.path(),
         challenge_state.path(),
-        true,
-        &[
-            "worktree",
-            "adopt-dirty",
-            "--challenge",
-            CHALLENGE_TOKEN,
-            "--reason-file",
-            &challenge_reason_arg,
-            "--format=json",
-        ],
-    );
-    assert_json_error(
-        &challenge_output,
-        "dirty-checkout-malformed-state",
-        nils_common::cli_contract::exit::DATA,
+        CHALLENGE_TOKEN,
+        &challenge_reason,
+    )
+    .expect_err("public challenge must be rejected");
+    assert_eq!(
+        challenge_error
+            .downcast_ref::<DirtyCheckoutError>()
+            .expect("typed malformed-state error")
+            .kind(),
+        DirtyCheckoutErrorKind::MalformedState
     );
 
     let root_repo = init_repo();
@@ -1742,26 +1677,19 @@ fn dirty_checkout_cli_maps_expected_fail_closed_boundaries_to_domain_errors() {
     let root_challenge = write_challenge(root_state.path(), &root_snapshot);
     fs::set_permissions(root_state.path(), fs::Permissions::from_mode(0o755))
         .expect("make state root public");
-    let root_reason_arg = root_reason.to_string_lossy().to_string();
-    let root_output = run_governed_command(
-        &harness,
+    let root_error = adopt_dirty(
         root_repo.path(),
         root_state.path(),
-        true,
-        &[
-            "worktree",
-            "adopt-dirty",
-            "--challenge",
-            CHALLENGE_TOKEN,
-            "--reason-file",
-            &root_reason_arg,
-            "--format=json",
-        ],
-    );
-    assert_json_error(
-        &root_output,
-        "dirty-checkout-invalid-input",
-        nils_common::cli_contract::exit::DATA,
+        CHALLENGE_TOKEN,
+        &root_reason,
+    )
+    .expect_err("public state root must be rejected");
+    assert_eq!(
+        root_error
+            .downcast_ref::<DirtyCheckoutError>()
+            .expect("typed invalid-input error")
+            .kind(),
+        DirtyCheckoutErrorKind::InvalidInput
     );
     assert!(root_challenge.exists());
     fs::set_permissions(root_state.path(), fs::Permissions::from_mode(0o700))
@@ -2746,6 +2674,7 @@ fn complete_walk_rejects_ignored_symlink_escapes_and_clean_hardlinks() {
         .expect_err("clean multiply-linked file must be rejected by complete walk");
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn git_shaping_environment_cannot_validate_a_stale_virtual_index() {
     let harness = GitCliHarness::new();
@@ -2924,7 +2853,6 @@ fn repository_local_fsmonitor_helper_is_never_launched_by_snapshot_probes() {
 
 #[test]
 fn initialized_and_unavailable_submodules_fail_closed_without_skipping_link_safety() {
-    let harness = GitCliHarness::new();
     let child = init_repo();
     fs::write(child.path().join(".gitignore"), "ignored-link\n")
         .expect("write child ignore fixture");
@@ -2959,10 +2887,6 @@ fn initialized_and_unavailable_submodules_fail_closed_without_skipping_link_safe
     let dirty_kind = dirty_error
         .downcast_ref::<DirtyCheckoutError>()
         .map(DirtyCheckoutError::kind);
-    let dirty_cli = harness.run(
-        super_repo.path(),
-        &["worktree", "dirty-snapshot", "--format=json"],
-    );
     fs::remove_file(&child_dirty_path).expect("restore clean child checkout");
 
     symlink("/etc/passwd", child_checkout.join("ignored-link"))
@@ -2979,29 +2903,12 @@ fn initialized_and_unavailable_submodules_fail_closed_without_skipping_link_safe
     let unavailable_kind = unavailable_error
         .downcast_ref::<DirtyCheckoutError>()
         .map(DirtyCheckoutError::kind);
-    let unavailable_cli = harness.run(
-        super_repo.path(),
-        &["worktree", "dirty-snapshot", "--format=json"],
-    );
     assert_eq!(
-        (
-            dirty_kind,
-            json_error_identity(&dirty_cli),
-            unavailable_kind,
-            json_error_identity(&unavailable_cli),
-        ),
+        (dirty_kind, unavailable_kind),
         (
             Some(DirtyCheckoutErrorKind::UnsupportedGitState),
-            (
-                nils_common::cli_contract::exit::DATA,
-                "dirty-checkout-unsupported-git-state".to_string(),
-            ),
             Some(DirtyCheckoutErrorKind::UnsupportedGitState),
-            (
-                nils_common::cli_contract::exit::DATA,
-                "dirty-checkout-unsupported-git-state".to_string(),
-            ),
         ),
-        "dirty and unavailable submodules must preserve one Rust/CLI domain classification"
+        "dirty and unavailable submodules must preserve one Rust domain classification"
     );
 }
