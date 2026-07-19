@@ -5299,7 +5299,7 @@ fn start_creates_session_state_without_printing_prompt() {
             "--".to_string(),
             "sh".to_string(),
             "-c".to_string(),
-            "gate=$1; broker_gate=$2; heartbeat=$3; capability=$4; incarnation=$5; generation=$6; broker_bin=$7; shift 7; done_file=\"${heartbeat}.done.$$\"; umask 077; while [ ! -f \"$broker_gate\" ]; do sleep 0.01; done; \"$broker_bin\" --state-dir \"$AGENT_SESSION_STATE_DIR\" broker heartbeat --session \"$AGENT_SESSION_ID\" --incarnation \"$incarnation\" --generation \"$generation\" --capability-file \"$capability\" --format json >/dev/null 2>&1 & broker_pid=$!; while [ ! -f \"$gate\" ]; do sleep 0.01; done; \"$@\"; status=$?; printf '%s\\n' \"$status\" > \"$done_file\"; kill \"$broker_pid\" >/dev/null 2>&1 || true; wait \"$broker_pid\" >/dev/null 2>&1 || true; \"$broker_bin\" --state-dir \"$AGENT_SESSION_STATE_DIR\" broker stop --session \"$AGENT_SESSION_ID\" --capability-file \"$capability\" --format json >/dev/null 2>&1 || true; rm -f \"$done_file\" \"$capability\" \"$broker_gate\"; exit \"$status\"".to_string(),
+            "gate=$1; broker_gate=$2; heartbeat=$3; capability=$4; incarnation=$5; generation=$6; broker_bin=$7; shift 7; done_file=\"${heartbeat}.done.$$\"; umask 077; while [ ! -f \"$broker_gate\" ]; do sleep 0.01; done; \"$broker_bin\" --state-dir \"$AGENT_SESSION_STATE_DIR\" broker heartbeat --session \"$AGENT_SESSION_ID\" --incarnation \"$incarnation\" --generation \"$generation\" --capability-file \"$capability\" --format json >/dev/null 2>&1 & broker_pid=$!; while [ ! -f \"$gate\" ]; do sleep 0.01; done; \"$@\"; status=$?; printf '%s\\n' \"$status\" > \"$done_file\"; kill \"$broker_pid\" >/dev/null 2>&1 || true; wait \"$broker_pid\" >/dev/null 2>&1 || true; \"$broker_bin\" --state-dir \"$AGENT_SESSION_STATE_DIR\" broker stop --session \"$AGENT_SESSION_ID\" --capability-file \"$capability\" --format json >/dev/null 2>&1 || true; rm -f \"$done_file\" \"$capability\" \"$broker_gate\" \"$gate\"; exit \"$status\"".to_string(),
             "agent-session-held-launch".to_string(),
             state_dir
                 .join("sessions")
@@ -7450,6 +7450,14 @@ fn run_and_logs_cover_json_contract_and_file_fallback() {
         .iter()
         .find(|call| call.first().is_some_and(|arg| arg == "new-session"))
         .expect("new-session call");
+    let held_launch = new_session
+        .iter()
+        .position(|arg| arg.contains("gate=$1; broker_gate=$2"))
+        .expect("run must use the shared held-launch wrapper");
+    assert_eq!(new_session[held_launch - 2], "sh");
+    assert_eq!(new_session[held_launch - 1], "-c");
+    assert_eq!(new_session[held_launch + 1], "agent-session-held-launch");
+    assert!(new_session[held_launch].contains("; \"$@\"; status=$?;"));
     let script = new_session.last().expect("script");
     assert!(
         script.contains("$(cat "),
@@ -9576,7 +9584,7 @@ fn resume_recreates_tmux_runtime_from_exact_provider_identity() {
             "--".to_string(),
             "sh".to_string(),
             "-c".to_string(),
-            "gate=$1; broker_gate=$2; heartbeat=$3; capability=$4; incarnation=$5; generation=$6; broker_bin=$7; shift 7; done_file=\"${heartbeat}.done.$$\"; umask 077; while [ ! -f \"$broker_gate\" ]; do sleep 0.01; done; \"$broker_bin\" --state-dir \"$AGENT_SESSION_STATE_DIR\" broker heartbeat --session \"$AGENT_SESSION_ID\" --incarnation \"$incarnation\" --generation \"$generation\" --capability-file \"$capability\" --format json >/dev/null 2>&1 & broker_pid=$!; while [ ! -f \"$gate\" ]; do sleep 0.01; done; \"$@\"; status=$?; printf '%s\\n' \"$status\" > \"$done_file\"; kill \"$broker_pid\" >/dev/null 2>&1 || true; wait \"$broker_pid\" >/dev/null 2>&1 || true; \"$broker_bin\" --state-dir \"$AGENT_SESSION_STATE_DIR\" broker stop --session \"$AGENT_SESSION_ID\" --capability-file \"$capability\" --format json >/dev/null 2>&1 || true; rm -f \"$done_file\" \"$capability\" \"$broker_gate\"; exit \"$status\"".to_string(),
+            "gate=$1; broker_gate=$2; heartbeat=$3; capability=$4; incarnation=$5; generation=$6; broker_bin=$7; shift 7; done_file=\"${heartbeat}.done.$$\"; umask 077; while [ ! -f \"$broker_gate\" ]; do sleep 0.01; done; \"$broker_bin\" --state-dir \"$AGENT_SESSION_STATE_DIR\" broker heartbeat --session \"$AGENT_SESSION_ID\" --incarnation \"$incarnation\" --generation \"$generation\" --capability-file \"$capability\" --format json >/dev/null 2>&1 & broker_pid=$!; while [ ! -f \"$gate\" ]; do sleep 0.01; done; \"$@\"; status=$?; printf '%s\\n' \"$status\" > \"$done_file\"; kill \"$broker_pid\" >/dev/null 2>&1 || true; wait \"$broker_pid\" >/dev/null 2>&1 || true; \"$broker_bin\" --state-dir \"$AGENT_SESSION_STATE_DIR\" broker stop --session \"$AGENT_SESSION_ID\" --capability-file \"$capability\" --format json >/dev/null 2>&1 || true; rm -f \"$done_file\" \"$capability\" \"$broker_gate\" \"$gate\"; exit \"$status\"".to_string(),
             "agent-session-held-launch".to_string(),
             state_dir
                 .join("sessions/recoverable/coordination/launch-ready")
