@@ -46,7 +46,6 @@ const MAX_FILE_BYTES: u64 = 1024 * 1024 * 1024;
 const MAX_TOTAL_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 const SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(30);
 const GIT_TIMEOUT: Duration = Duration::from_secs(10);
-const LOCK_WAIT: Duration = Duration::from_secs(2);
 const LOCK_POLL: Duration = Duration::from_millis(50);
 const DEFAULT_LEASE_TTL_SECONDS: u64 = 8 * 60 * 60;
 const MAX_LEASE_TTL_SECONDS: u64 = 7 * 24 * 60 * 60;
@@ -5558,6 +5557,17 @@ struct LeaseLock(File);
 
 impl LeaseLock {
     fn acquire_until(directory: &Path, transaction_deadline: Instant) -> Result<Self> {
+        Self::acquire_until_with(directory, transaction_deadline, || {})
+    }
+
+    fn acquire_until_with<F>(
+        directory: &Path,
+        transaction_deadline: Instant,
+        mut on_contention: F,
+    ) -> Result<Self>
+    where
+        F: FnMut(),
+    {
         ensure_deadline(transaction_deadline)?;
         let path = directory.join("lease.lock");
         let file = OpenOptions::new()
@@ -5588,7 +5598,6 @@ impl LeaseLock {
                 "checkout lease lock is not a private owner-controlled regular file",
             ));
         }
-        let started = Instant::now();
         loop {
             let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
             if result == 0 {
@@ -5601,7 +5610,8 @@ impl LeaseLock {
                     format!("checkout lease lock failed: {error}"),
                 ));
             }
-            if started.elapsed() >= LOCK_WAIT || Instant::now() >= transaction_deadline {
+            on_contention();
+            if Instant::now() >= transaction_deadline {
                 return Err(domain_error(
                     DirtyCheckoutErrorKind::Timeout,
                     "checkout lease lock timed out",
@@ -12618,6 +12628,76 @@ mod tests {
             checkout_dir.join("lease.json").exists(),
             "deadline observation must complete a real adoption transition"
         );
+    }
+
+    #[test]
+    fn lease_lock_waits_for_active_transaction_until_shared_deadline() {
+        let legacy_lock_wait = Duration::from_secs(2);
+        let state_dir = tempfile::TempDir::new().expect("lease-lock state directory");
+        let held_lock = LeaseLock::acquire_until(
+            state_dir.path(),
+            deadline_after(Duration::from_secs(1)).expect("initial lock deadline"),
+        )
+        .expect("acquire initial lease lock");
+        let worker_directory = state_dir.path().to_path_buf();
+        let (waiting_sender, waiting_receiver) = std::sync::mpsc::sync_channel(1);
+
+        let worker = std::thread::spawn(move || {
+            let mut notified = false;
+            LeaseLock::acquire_until_with(
+                &worker_directory,
+                deadline_after(legacy_lock_wait + Duration::from_secs(2))
+                    .expect("contending lock deadline"),
+                || {
+                    if !notified {
+                        waiting_sender
+                            .send(())
+                            .expect("report real lease-lock contention");
+                        notified = true;
+                    }
+                },
+            )
+        });
+
+        waiting_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("contending worker must reach the real lock boundary");
+        std::thread::sleep(legacy_lock_wait + LOCK_POLL);
+        drop(held_lock);
+
+        let result = worker.join().expect("contending lease-lock worker");
+        if let Err(error) = result {
+            panic!(
+                "an active transaction must be allowed to finish within the shared deadline: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn lease_lock_times_out_at_shared_transaction_deadline() {
+        let state_dir = tempfile::TempDir::new().expect("lease-lock state directory");
+        let held_lock = LeaseLock::acquire_until(
+            state_dir.path(),
+            deadline_after(Duration::from_secs(1)).expect("initial lock deadline"),
+        )
+        .expect("acquire initial lease lock");
+
+        let error = match LeaseLock::acquire_until(
+            state_dir.path(),
+            deadline_after(Duration::from_millis(100)).expect("contending lock deadline"),
+        ) {
+            Ok(_) => panic!("contending lock acquisition must honor the shared deadline"),
+            Err(error) => error,
+        };
+
+        assert_eq!(
+            error
+                .downcast_ref::<DirtyCheckoutError>()
+                .expect("typed lease-lock timeout")
+                .kind(),
+            DirtyCheckoutErrorKind::Timeout
+        );
+        drop(held_lock);
     }
 
     #[test]
