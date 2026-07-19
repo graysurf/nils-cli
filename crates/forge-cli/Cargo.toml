@@ -1,6 +1,6 @@
 [package]
 name = "nils-forge-cli"
-version = "1.24.5"
+version = "1.25.0"
 edition.workspace = true
 license.workspace = true
 
@@ -20,10 +20,10 @@ clap = { workspace = true }
 clap_complete = { workspace = true }
 chrono = { version = "0.4", default-features = false, features = ["std"] }
 jiff = { workspace = true }
-nils-build-info = { version = "1.24.5", path = "../nils-build-info" }
+nils-build-info = { version = "1.25.0", path = "../nils-build-info" }
 libc = "0.2"
-nils-common = { version = "1.24.5", path = "../nils-common", package = "nils-common" }
-agent-workflow-primitives = { version = "1.24.5", path = "../agent-workflow-primitives", package = "nils-agent-workflow-primitives" }
+nils-common = { version = "1.25.0", path = "../nils-common", package = "nils-common" }
+agent-workflow-primitives = { version = "1.25.0", path = "../agent-workflow-primitives", package = "nils-agent-workflow-primitives" }
 serde = { workspace = true }
 serde_json = { workspace = true, features = ["preserve_order"] }
 serde_yaml_ng = { workspace = true }
@@ -32,5 +32,5 @@ thiserror = { workspace = true }
 toml = { workspace = true }
 
 [dev-dependencies]
-nils-test-support = { version = "1.24.5", path = "../nils-test-support" }
+nils-test-support = { version = "1.25.0", path = "../nils-test-support" }
 pretty_assertions = { workspace = true }
