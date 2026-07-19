@@ -4056,18 +4056,29 @@ fn toml_multiline_value_line_starts(raw: &str) -> Vec<usize> {
     starts
 }
 
-#[derive(Debug)]
-struct StrippedCodexTomlHookBlock {
-    raw: String,
-    marker_evidence: bool,
-    complete_marker_pair: bool,
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CodexTomlHookMarkerLayout {
+    Absent,
+    OrphanStart,
+    OrphanEnd,
+    Complete,
 }
 
-fn strip_owned_codex_toml_hook_block(
-    path: &Path,
-    raw: &str,
-) -> Result<StrippedCodexTomlHookBlock, CliError> {
-    parse_codex_notification_config(path, raw)?;
+impl CodexTomlHookMarkerLayout {
+    fn has_evidence(self) -> bool {
+        self != Self::Absent
+    }
+}
+
+#[derive(Debug)]
+struct CodexTomlHookAnalysis {
+    document: TomlDocument,
+    stripped_raw: String,
+    marker_layout: CodexTomlHookMarkerLayout,
+}
+
+fn analyze_codex_toml_hooks(path: &Path, raw: &str) -> Result<CodexTomlHookAnalysis, CliError> {
+    let document = parse_codex_notification_config(path, raw)?;
     let multiline_value_lines = toml_multiline_value_line_starts(raw);
     let marker_lines = |marker: &str| {
         let mut offset = 0_usize;
@@ -4087,10 +4098,10 @@ fn strip_owned_codex_toml_hook_block(
     let starts = marker_lines(CODEX_HOOK_BLOCK_START);
     let ends = marker_lines(CODEX_HOOK_BLOCK_END);
     if starts.is_empty() && ends.is_empty() {
-        return Ok(StrippedCodexTomlHookBlock {
-            raw: raw.to_string(),
-            marker_evidence: false,
-            complete_marker_pair: false,
+        return Ok(CodexTomlHookAnalysis {
+            document,
+            stripped_raw: raw.to_string(),
+            marker_layout: CodexTomlHookMarkerLayout::Absent,
         });
     }
     if starts.len() > 1 || ends.len() > 1 {
@@ -4111,10 +4122,15 @@ fn strip_owned_codex_toml_hook_block(
         let mut stripped = String::with_capacity(raw.len() - (orphan_end - orphan_begin));
         stripped.push_str(&raw[..orphan_begin]);
         stripped.push_str(&raw[orphan_end..]);
-        return Ok(StrippedCodexTomlHookBlock {
-            raw: stripped,
-            marker_evidence: true,
-            complete_marker_pair: false,
+        let marker_layout = if starts.is_empty() {
+            CodexTomlHookMarkerLayout::OrphanEnd
+        } else {
+            CodexTomlHookMarkerLayout::OrphanStart
+        };
+        return Ok(CodexTomlHookAnalysis {
+            document,
+            stripped_raw: stripped,
+            marker_layout,
         });
     };
     if end_begin < start_begin {
@@ -4128,10 +4144,10 @@ fn strip_owned_codex_toml_hook_block(
         let mut stripped = String::with_capacity(raw.len() - (end_end - start_begin));
         stripped.push_str(&raw[..start_begin]);
         stripped.push_str(&raw[end_end..]);
-        return Ok(StrippedCodexTomlHookBlock {
-            raw: stripped,
-            marker_evidence: true,
-            complete_marker_pair: true,
+        return Ok(CodexTomlHookAnalysis {
+            document,
+            stripped_raw: stripped,
+            marker_layout: CodexTomlHookMarkerLayout::Complete,
         });
     }
     let mut stripped =
@@ -4139,10 +4155,10 @@ fn strip_owned_codex_toml_hook_block(
     stripped.push_str(&raw[..start_begin]);
     stripped.push_str(&raw[start_end..end_begin]);
     stripped.push_str(&raw[end_end..]);
-    Ok(StrippedCodexTomlHookBlock {
-        raw: stripped,
-        marker_evidence: true,
-        complete_marker_pair: true,
+    Ok(CodexTomlHookAnalysis {
+        document,
+        stripped_raw: stripped,
+        marker_layout: CodexTomlHookMarkerLayout::Complete,
     })
 }
 
@@ -4165,16 +4181,16 @@ fn plan_inline_codex_hooks(
             None,
         )
     })?;
-    let document = parse_codex_notification_config(&notification.config.path, &raw)?;
-    let stripped = strip_owned_codex_toml_hook_block(&notification.config.path, &raw)?;
+    let analysis = analyze_codex_toml_hooks(&notification.config.path, &raw)?;
     if action != SetupAction::Remove
-        && stripped.complete_marker_pair
-        && stripped.raw != raw
-        && toml_codex_hooks_exactly_configured(&document)
+        && analysis.marker_layout == CodexTomlHookMarkerLayout::Complete
+        && analysis.stripped_raw != raw
+        && toml_codex_hooks_exactly_configured(&analysis.document)
     {
         return Ok(true);
     }
-    let mut document = parse_codex_notification_config(&notification.config.path, &stripped.raw)?;
+    let mut document =
+        parse_codex_notification_config(&notification.config.path, &analysis.stripped_raw)?;
     remove_owned_toml_hooks(&mut document);
     let mut rendered = document.to_string();
     if action != SetupAction::Remove {
@@ -4326,12 +4342,12 @@ fn plan_codex_json_cleanup(
     Ok(plan)
 }
 
-fn codex_hook_status_from_documents(
+fn codex_hook_status_from_analysis(
     json: &Value,
-    config: &TomlDocument,
-    inline_marker_evidence: bool,
+    config: &CodexTomlHookAnalysis,
 ) -> CodexHookStatus {
-    let inline_active = inline_marker_evidence || toml_inline_has_lifecycle_hooks(config);
+    let inline_active =
+        config.marker_layout.has_evidence() || toml_inline_has_lifecycle_hooks(&config.document);
     let representation = if inline_active {
         CodexHookRepresentation::InlineToml
     } else {
@@ -4339,7 +4355,7 @@ fn codex_hook_status_from_documents(
     };
     let conflict = inline_active && json_has_non_owned_lifecycle_hooks(json);
     let ownership_conflict = json_has_owned_handler_metadata_conflict(json)
-        || toml_has_owned_handler_metadata_conflict(config);
+        || toml_has_owned_handler_metadata_conflict(&config.document);
     let migration_required = inline_active && json_has_owned_codex_hooks(json);
     let configured = !conflict
         && !ownership_conflict
@@ -4347,7 +4363,7 @@ fn codex_hook_status_from_documents(
             CodexHookRepresentation::Json => provider_specs(AgentKind::Codex)
                 .into_iter()
                 .all(|spec| json_has_spec(json, AgentKind::Codex, spec)),
-            CodexHookRepresentation::InlineToml => toml_codex_hooks_configured(config),
+            CodexHookRepresentation::InlineToml => toml_codex_hooks_configured(&config.document),
         };
     CodexHookStatus {
         representation,
@@ -4373,18 +4389,8 @@ fn codex_hook_status(json_path: &Path, config_path: &Path) -> Result<CodexHookSt
         })
         .transpose()?
         .unwrap_or_default();
-    let config = if config_raw.is_empty() {
-        TomlDocument::new()
-    } else {
-        parse_codex_notification_config(config_path, &config_raw)?
-    };
-    let marker_evidence =
-        strip_owned_codex_toml_hook_block(config_path, &config_raw)?.marker_evidence;
-    Ok(codex_hook_status_from_documents(
-        &json,
-        &config,
-        marker_evidence,
-    ))
+    let config = analyze_codex_toml_hooks(config_path, &config_raw)?;
+    Ok(codex_hook_status_from_analysis(&json, &config))
 }
 
 fn setup_codex_provider(
@@ -4414,14 +4420,8 @@ fn setup_codex_provider(
         })
         .transpose()?
         .unwrap_or_default();
-    let config = if config_raw.is_empty() {
-        TomlDocument::new()
-    } else {
-        parse_codex_notification_config(notification_path, config_raw)?
-    };
-    let marker_evidence =
-        strip_owned_codex_toml_hook_block(notification_path, config_raw)?.marker_evidence;
-    let status = codex_hook_status_from_documents(&json, &config, marker_evidence);
+    let config = analyze_codex_toml_hooks(notification_path, config_raw)?;
+    let status = codex_hook_status_from_analysis(&json, &config);
     if status.conflict && action != SetupAction::Remove {
         return Err(CliError::data(
             "provider-hook-representation-conflict",
@@ -7924,12 +7924,9 @@ mod tests {
                 "note = {quotes}\n{CODEX_HOOK_BLOCK_START}\nprivate\n{CODEX_HOOK_BLOCK_END}\n{quotes}\n"
             );
 
-            assert_eq!(
-                strip_owned_codex_toml_hook_block(&path, &raw)
-                    .expect("marker-shaped value")
-                    .raw,
-                raw
-            );
+            let analysis = analyze_codex_toml_hooks(&path, &raw).expect("marker-shaped value");
+            assert_eq!(analysis.stripped_raw, raw);
+            assert_eq!(analysis.marker_layout, CodexTomlHookMarkerLayout::Absent);
         }
     }
 
@@ -7937,14 +7934,17 @@ mod tests {
     fn codex_single_orphan_marker_is_an_owned_repair_fragment() {
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let path = tmp.path().join("config.toml");
-        for marker in [CODEX_HOOK_BLOCK_START, CODEX_HOOK_BLOCK_END] {
+        for (marker, expected_layout) in [
+            (
+                CODEX_HOOK_BLOCK_START,
+                CodexTomlHookMarkerLayout::OrphanStart,
+            ),
+            (CODEX_HOOK_BLOCK_END, CodexTomlHookMarkerLayout::OrphanEnd),
+        ] {
             let raw = format!("keep = true\n{marker}\n");
-            assert_eq!(
-                strip_owned_codex_toml_hook_block(&path, &raw)
-                    .expect("owned orphan marker")
-                    .raw,
-                "keep = true\n"
-            );
+            let analysis = analyze_codex_toml_hooks(&path, &raw).expect("owned orphan marker");
+            assert_eq!(analysis.stripped_raw, "keep = true\n");
+            assert_eq!(analysis.marker_layout, expected_layout);
         }
     }
 
@@ -7958,7 +7958,7 @@ mod tests {
             format!("{CODEX_HOOK_BLOCK_END}\n{CODEX_HOOK_BLOCK_START}\n"),
         ] {
             assert_eq!(
-                strip_owned_codex_toml_hook_block(&path, &raw)
+                analyze_codex_toml_hooks(&path, &raw)
                     .expect_err("ambiguous marker layout")
                     .code(),
                 "provider-config-invalid"
@@ -8162,9 +8162,10 @@ mod tests {
             "[[hooks.Stop]]\ndescription = \"keep-toml-metadata\"\n\n[[hooks.Stop.hooks]]\ntype = \"command\"\ncommand = {}\ntimeout = 5\n",
             TomlValue::from(owned_command(AgentKind::Codex, Some("Stop")))
         );
-        let document = parse_codex_notification_config(&config_path, &config).expect("TOML");
+        let config_analysis =
+            analyze_codex_toml_hooks(&config_path, &config).expect("TOML analysis");
 
-        let status = codex_hook_status_from_documents(&json, &document, false);
+        let status = codex_hook_status_from_analysis(&json, &config_analysis);
         assert!(status.conflict, "additive group metadata is user-owned");
 
         let json_bytes = serde_json::to_vec_pretty(&json).expect("JSON bytes");
