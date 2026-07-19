@@ -868,6 +868,9 @@ fn adopt_dirty_rejects_a_live_foreign_v1_lease() {
     let snapshot = dirty_snapshot(repo.path()).expect("snapshot dirty checkout");
     let _challenge_path = write_challenge(state_home.path(), &snapshot);
     let state_dir = checkout_state_dir(state_home.path(), &snapshot);
+    let checkout_root = fs::canonicalize(repo.path()).expect("canonical checkout root");
+    let checkout_git_dir =
+        fs::canonicalize(repo.path().join(".git")).expect("canonical checkout Git directory");
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("system time")
@@ -876,8 +879,8 @@ fn adopt_dirty_rejects_a_live_foreign_v1_lease() {
         "schema": "agent-runtime.checkout-lease.v1",
         "session_key": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
         "checkout_instance": &snapshot.checkout_instance,
-        "checkout_root": repo.path(),
-        "checkout_git_dir": repo.path().join(".git"),
+        "checkout_root": checkout_root,
+        "checkout_git_dir": checkout_git_dir,
         "acquired_at": now,
         "refreshed_at": now,
         "expires_at": now + 3600,
