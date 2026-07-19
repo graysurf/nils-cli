@@ -107,7 +107,8 @@ const DELETE_TMUX_TERMINATION_STATE_KEY: &str = "delete_tmux_termination_state";
 const TMUX_RUNTIME_NEVER_LAUNCHED_KEY: &str = "tmux_runtime_never_launched";
 const TMUX_RUNTIME_IDENTITY_CHANGED_OUTPUT: &str = "agent-session-runtime-identity-changed";
 const COORDINATION_LAUNCH_GATE: &str = "launch-ready";
-const HELD_LAUNCH_SCRIPT: &str = "gate=$1; heartbeat=$2; capability=$3; incarnation=$4; generation=$5; broker_bin=$6; shift 6; done_file=\"${heartbeat}.done.$$\"; umask 077; \"$broker_bin\" --state-dir \"$AGENT_SESSION_STATE_DIR\" broker heartbeat --session \"$AGENT_SESSION_ID\" --incarnation \"$incarnation\" --generation \"$generation\" --capability-file \"$capability\" --format json >/dev/null 2>&1 & broker_pid=$!; while [ ! -f \"$gate\" ]; do sleep 0.01; done; (\"$@\"; status=$?; printf '%s\\n' \"$status\" > \"$done_file\"; exit \"$status\") & child=$!; wait \"$child\"; status=$?; kill \"$broker_pid\" >/dev/null 2>&1 || true; wait \"$broker_pid\" >/dev/null 2>&1 || true; \"$broker_bin\" --state-dir \"$AGENT_SESSION_STATE_DIR\" broker stop --session \"$AGENT_SESSION_ID\" --capability-file \"$capability\" --format json >/dev/null 2>&1 || true; rm -f \"$done_file\" \"$capability\"; exit \"$status\"";
+const COORDINATION_BROKER_GATE: &str = "broker-provisioned";
+const HELD_LAUNCH_SCRIPT: &str = "gate=$1; broker_gate=$2; heartbeat=$3; capability=$4; incarnation=$5; generation=$6; broker_bin=$7; shift 7; done_file=\"${heartbeat}.done.$$\"; umask 077; while [ ! -f \"$broker_gate\" ]; do sleep 0.01; done; \"$broker_bin\" --state-dir \"$AGENT_SESSION_STATE_DIR\" broker heartbeat --session \"$AGENT_SESSION_ID\" --incarnation \"$incarnation\" --generation \"$generation\" --capability-file \"$capability\" --format json >/dev/null 2>&1 & broker_pid=$!; while [ ! -f \"$gate\" ]; do sleep 0.01; done; \"$@\"; status=$?; printf '%s\\n' \"$status\" > \"$done_file\"; kill \"$broker_pid\" >/dev/null 2>&1 || true; wait \"$broker_pid\" >/dev/null 2>&1 || true; \"$broker_bin\" --state-dir \"$AGENT_SESSION_STATE_DIR\" broker stop --session \"$AGENT_SESSION_ID\" --capability-file \"$capability\" --format json >/dev/null 2>&1 || true; rm -f \"$done_file\" \"$capability\" \"$broker_gate\"; exit \"$status\"";
 
 pub fn run() -> i32 {
     run_with_args(env::args_os())
@@ -3970,12 +3971,21 @@ fn launch_gate_path(state_dir: &Path, record: &SessionRecord) -> PathBuf {
         .join(COORDINATION_LAUNCH_GATE)
 }
 
+fn broker_gate_path(state_dir: &Path, record: &SessionRecord) -> PathBuf {
+    state_dir
+        .join("sessions")
+        .join(&record.id)
+        .join("coordination")
+        .join(COORDINATION_BROKER_GATE)
+}
+
 fn begin_held_runtime(
     command: &mut ProcessCommand,
     state_dir: &Path,
     record: &SessionRecord,
 ) -> Result<(), CliError> {
     let gate = launch_gate_path(state_dir, record);
+    let broker_gate = broker_gate_path(state_dir, record);
     let broker_bin = std::env::current_exe().map_err(|_| {
         CliError::runtime(
             "coordination-unavailable",
@@ -3983,15 +3993,17 @@ fn begin_held_runtime(
             None,
         )
     })?;
-    match fs::remove_file(&gate) {
-        Ok(()) => {}
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-        Err(_) => {
-            return Err(CliError::runtime(
-                "coordination-unavailable",
-                "failed to reset the held launch gate",
-                None,
-            ));
+    for path in [&gate, &broker_gate] {
+        match fs::remove_file(path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(_) => {
+                return Err(CliError::runtime(
+                    "coordination-unavailable",
+                    "failed to reset a held launch gate",
+                    None,
+                ));
+            }
         }
     }
     command
@@ -4001,6 +4013,7 @@ fn begin_held_runtime(
         .arg(HELD_LAUNCH_SCRIPT)
         .arg("agent-session-held-launch")
         .arg(gate)
+        .arg(broker_gate)
         .arg(coordination::heartbeat_path(state_dir, &record.id))
         .arg(coordination::capability_path_for_state(
             state_dir,
@@ -4062,6 +4075,15 @@ fn establish_coordination_broker(
     record: &SessionRecord,
 ) -> Result<(), CliError> {
     coordination::provision(context, record)?;
+    write_private_file(&broker_gate_path(&context.state_dir, record), b"ready\n").map_err(
+        |_| {
+            CliError::runtime(
+                "coordination-unavailable",
+                "failed to release the coordination broker launch gate",
+                None,
+            )
+        },
+    )?;
     coordination::activate_ready(context, record)
 }
 
@@ -9660,9 +9682,27 @@ mod tests {
     }
 
     #[test]
-    fn coordination_review_round2_held_launch_uses_child_lifecycle_not_pid_polling() {
+    fn held_launch_waits_for_broker_provision_before_starting_heartbeat() {
+        let provision = super::HELD_LAUNCH_SCRIPT
+            .find("while [ ! -f \"$broker_gate\" ]; do sleep 0.01; done")
+            .expect("broker provision wait");
+        let heartbeat = super::HELD_LAUNCH_SCRIPT
+            .find("broker heartbeat")
+            .expect("broker sidecar setup");
+        let gate = super::HELD_LAUNCH_SCRIPT
+            .find("while [ ! -f \"$gate\" ]")
+            .expect("gate wait");
+
+        assert!(provision < heartbeat);
+        assert!(heartbeat < gate);
+    }
+
+    #[test]
+    fn held_launch_keeps_provider_in_foreground_and_tracks_broker_lifecycle() {
         assert!(!super::HELD_LAUNCH_SCRIPT.contains("kill -0"));
-        assert!(super::HELD_LAUNCH_SCRIPT.contains("wait \"$child\""));
+        assert!(!super::HELD_LAUNCH_SCRIPT.contains("child=$!"));
+        assert!(super::HELD_LAUNCH_SCRIPT.contains("broker_pid=$!"));
+        assert!(super::HELD_LAUNCH_SCRIPT.contains("; \"$@\"; status=$?;"));
     }
     use pretty_assertions::assert_eq;
     #[cfg(target_os = "linux")]
