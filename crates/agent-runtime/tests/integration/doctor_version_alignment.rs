@@ -78,10 +78,14 @@ fn version_alignment_legacy_public_input_api_remains_constructible() {
         expected: 1,
         found: 99,
     };
-    let expected: u32 = match error {
-        VersionAlignmentError::SchemaVersion { expected, .. } => expected,
-        _ => unreachable!(),
+    let (kind, expected): (&str, u32) = match error {
+        VersionAlignmentError::MissingPin => ("missing-pin", 0),
+        VersionAlignmentError::Missing { .. } => ("missing", 0),
+        VersionAlignmentError::Io { .. } => ("io", 0),
+        VersionAlignmentError::Parse { .. } => ("parse", 0),
+        VersionAlignmentError::SchemaVersion { expected, .. } => ("schema-version", expected),
     };
+    assert_eq!(kind, "schema-version");
     assert_eq!(expected, 1);
 }
 
@@ -278,8 +282,34 @@ fn version_alignment_schema_mismatch_errors() {
 
     assert_ne!(output.code, 0, "schema mismatch should error");
     assert!(
-        output.stderr_text().contains("schema_version"),
-        "stderr should name schema_version: {}",
+        output
+            .stderr_text()
+            .contains("supported schema versions 1 and 2"),
+        "stderr should name both supported schema versions: {}",
+        output.stderr_text()
+    );
+}
+
+#[test]
+fn version_alignment_schema_v1_rejects_argument_injection_in_required_cli_name() {
+    let mmp = host_mmp();
+    let tmp = TempDir::new().unwrap();
+    let pin = write_pin(
+        &tmp,
+        &format!(
+            "schema_version: 1\nnils_cli:\n  pinned_tag: \"v{mmp}\"\nrequired_clis:\n  - bin: \"echo 999.0.0\"\n    min: \"999.0.0\"\n"
+        ),
+    );
+
+    let output = run(&["doctor", "--class", "version-alignment", "--pin", &pin]);
+
+    assert_ne!(
+        output.code, 0,
+        "schema-v1 executable names with injected arguments must fail closed"
+    );
+    assert!(
+        output.stderr_text().contains("non-empty executable name"),
+        "stderr should identify the unsafe executable name: {}",
         output.stderr_text()
     );
 }

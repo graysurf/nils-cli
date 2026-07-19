@@ -446,14 +446,12 @@ pub enum VersionAlignmentError {
         #[source]
         source: serde_yaml_ng::Error,
     },
-    #[error("schema_version mismatch in {path}: expected {expected}, got {found}")]
+    #[error("schema_version mismatch in {path}: supported schema versions 1 and 2, got {found}")]
     SchemaVersion {
         path: PathBuf,
         expected: u32,
         found: u32,
     },
-    #[error("invalid version policy in {path}: {message}")]
-    InvalidPolicy { path: PathBuf, message: String },
 }
 
 /// Read + parse the pin manifest (YAML or JSON), gather `<bin> --version`
@@ -485,6 +483,8 @@ pub fn check(
                     path: pin_path.to_path_buf(),
                     source,
                 })?;
+            validate_required_cli_names(&manifest.required_clis)
+                .map_err(|message| invalid_policy_error(pin_path, message))?;
             let required_raw = probe_required_clis(&manifest.required_clis);
             Ok(evaluate(&AlignmentInputs {
                 manifest: &manifest,
@@ -528,10 +528,7 @@ fn normalize_version_policy(
     raw: RawVersionPolicyManifest,
     path: &Path,
 ) -> Result<NormalizedPinManifest, VersionAlignmentError> {
-    let invalid = |message: String| VersionAlignmentError::InvalidPolicy {
-        path: path.to_path_buf(),
-        message,
-    };
+    let invalid = |message: String| invalid_policy_error(path, message);
     validate_required_clis(&raw.required_clis).map_err(&invalid)?;
 
     debug_assert_eq!(raw.schema_version, VERSION_POLICY_SCHEMA_VERSION);
@@ -567,6 +564,15 @@ fn normalize_version_policy(
         },
         required_clis: raw.required_clis,
     })
+}
+
+fn invalid_policy_error(path: &Path, message: String) -> VersionAlignmentError {
+    VersionAlignmentError::Parse {
+        path: path.to_path_buf(),
+        source: <serde_yaml_ng::Error as serde::de::Error>::custom(format!(
+            "invalid version policy: {message}"
+        )),
+    }
 }
 
 fn parse_stable_tag(field: &str, raw: &str) -> Result<Version, String> {
@@ -619,7 +625,18 @@ fn validate_release_digests(digests: Option<&BTreeMap<String, String>>) -> Resul
 }
 
 fn validate_required_clis(required: &[RequiredCli]) -> Result<(), String> {
+    validate_required_cli_names(required)?;
     let mut seen = BTreeSet::new();
+    for cli in required {
+        if !seen.insert(cli.bin.as_str()) {
+            return Err(format!("duplicate required_clis entry for `{}`", cli.bin));
+        }
+        parse_required_floor(&cli.bin, &cli.min)?;
+    }
+    Ok(())
+}
+
+fn validate_required_cli_names(required: &[RequiredCli]) -> Result<(), String> {
     for cli in required {
         if cli.bin.is_empty()
             || !cli
@@ -632,10 +649,6 @@ fn validate_required_clis(required: &[RequiredCli]) -> Result<(), String> {
                 cli.bin
             ));
         }
-        if !seen.insert(cli.bin.as_str()) {
-            return Err(format!("duplicate required_clis entry for `{}`", cli.bin));
-        }
-        parse_required_floor(&cli.bin, &cli.min)?;
     }
     Ok(())
 }
