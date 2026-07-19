@@ -235,7 +235,7 @@ fn version_alignment_schema_v1_keeps_prefixed_required_cli_floor() {
     let tmp = TempDir::new().unwrap();
     let pin = write_pin(
         &tmp,
-        &pin_manifest(&format!("v{mmp}"), &[("plan-issue", "v0.0.0")]),
+        &pin_manifest(&format!("v{mmp}"), &[("rustc", "v0.0.0")]),
     );
 
     let output = run(&[
