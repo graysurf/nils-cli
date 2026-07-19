@@ -123,7 +123,10 @@ content-free conflict and block dry-run/apply/repair migration without mutation;
 moving user content. Setup and doctor report representation, migration,
 conflict, and the active hook path. Migrated definitions have new
 Codex trust identities, so review them with `/hooks` and verify a fresh session
-does not emit the dual-representation warning. Setup also adds
+does not emit the dual-representation warning. Fields added to an otherwise
+matching Codex command handler are user-owned:
+dry-run/apply/repair fail closed instead of replacing them, while `--remove`
+preserves that complete handler. Setup also adds
 the official `agent-turn-complete` notify argv to `~/.codex/config.toml` when
 `notify` is absent, recognizes exact ownership idempotently, or wraps a safe
 user-owned singular argv in an agent-session-owned fan-out. The fan-out invokes

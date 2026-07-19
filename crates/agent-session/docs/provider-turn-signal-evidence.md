@@ -318,7 +318,10 @@ remain additive in `~/.codex/hooks.json`. If inline hooks are active and
 apply, and repair fail closed without mutation, and doctor reports the
 representation conflict for a manual ownership decision. `--remove` remains
 permitted to clean exact agent-session handlers from both sources without moving
-user content. Completion continues to use the provider's singular
+user content. Extra fields on an otherwise matching command handler make the
+complete handler user-owned: dry-run/apply/repair fail closed, and remove
+preserves it even when it appears between the agent-session TOML marker lines.
+Completion continues to use the provider's singular
 top-level TOML `notify` argv in `~/.codex/config.toml`. Setup inserts only
 `["agent-session", "activity", "notify", "--agent", "codex"]`, recognizes that
 exact argv idempotently, and removes only that exact argv. A safe user-owned

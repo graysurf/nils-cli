@@ -3327,6 +3327,7 @@ struct CodexHookStatus {
     configured: bool,
     migration_required: bool,
     conflict: bool,
+    ownership_conflict: bool,
 }
 
 fn provider_specs(agent: AgentKind) -> Vec<ProviderSpec> {
@@ -3791,7 +3792,7 @@ fn toml_hook_matcher_matches(group: &toml_edit::Table, spec: ProviderSpec) -> bo
     }
 }
 
-fn toml_handler_command_is_owned(event: &str, handler: &toml_edit::Table) -> bool {
+fn toml_handler_command_matches_owned(event: &str, handler: &toml_edit::Table) -> bool {
     handler.get("type").and_then(TomlItem::as_str) == Some("command")
         && handler
             .get("command")
@@ -3802,10 +3803,41 @@ fn toml_handler_command_is_owned(event: &str, handler: &toml_edit::Table) -> boo
             })
 }
 
+fn toml_handler_command_is_owned(event: &str, handler: &toml_edit::Table) -> bool {
+    toml_handler_command_matches_owned(event, handler)
+        && handler.len() == 3
+        && handler.get("timeout").and_then(TomlItem::as_integer) == Some(5)
+}
+
 fn toml_hook_group_has_user_metadata(group: &toml_edit::Table) -> bool {
     group
         .iter()
         .any(|(key, _)| !matches!(key, "matcher" | "hooks"))
+}
+
+fn toml_has_owned_handler_metadata_conflict(document: &TomlDocument) -> bool {
+    let Some(hooks) = document.get("hooks").and_then(TomlItem::as_table) else {
+        return false;
+    };
+    provider_specs(AgentKind::Codex).into_iter().any(|spec| {
+        hooks
+            .get(spec.event)
+            .and_then(TomlItem::as_array_of_tables)
+            .is_some_and(|groups| {
+                groups.iter().any(|group| {
+                    toml_hook_matcher_matches(group, spec)
+                        && group
+                            .get("hooks")
+                            .and_then(TomlItem::as_array_of_tables)
+                            .is_some_and(|handlers| {
+                                handlers.iter().any(|handler| {
+                                    toml_handler_command_matches_owned(spec.event, handler)
+                                        && !toml_handler_command_is_owned(spec.event, handler)
+                                })
+                            })
+                })
+            })
+    })
 }
 
 fn toml_inline_has_lifecycle_hooks(document: &TomlDocument) -> bool {
@@ -3834,14 +3866,12 @@ fn toml_has_spec(document: &TomlDocument, spec: ProviderSpec) -> bool {
                         .and_then(TomlItem::as_array_of_tables)
                         .is_some_and(|handlers| {
                             handlers.iter().any(|handler| {
-                                handler.get("type").and_then(TomlItem::as_str) == Some("command")
+                                toml_handler_command_is_owned(spec.event, handler)
                                     && handler.get("command").and_then(TomlItem::as_str)
                                         == Some(
                                             owned_command(AgentKind::Codex, Some(spec.event))
                                                 .as_str(),
                                         )
-                                    && handler.get("timeout").and_then(TomlItem::as_integer)
-                                        == Some(5)
                             })
                         })
             })
@@ -4014,11 +4044,19 @@ fn strip_owned_codex_toml_hook_block(path: &Path, raw: &str) -> Result<String, C
             Some(json!({ "path": display_path(path) })),
         ));
     }
-    let start = starts[0].0;
-    let end = ends[0].1;
-    let mut stripped = String::with_capacity(raw.len() - (end - start));
-    stripped.push_str(&raw[..start]);
-    stripped.push_str(&raw[end..]);
+    let (start_begin, start_end) = starts[0];
+    let (end_begin, end_end) = ends[0];
+    if raw[start_begin..end_end] == render_owned_codex_toml_hook_block() {
+        let mut stripped = String::with_capacity(raw.len() - (end_end - start_begin));
+        stripped.push_str(&raw[..start_begin]);
+        stripped.push_str(&raw[end_end..]);
+        return Ok(stripped);
+    }
+    let mut stripped =
+        String::with_capacity(raw.len() - (start_end - start_begin) - (end_end - end_begin));
+    stripped.push_str(&raw[..start_begin]);
+    stripped.push_str(&raw[start_end..end_begin]);
+    stripped.push_str(&raw[end_end..]);
     Ok(stripped)
 }
 
@@ -4071,15 +4109,26 @@ fn json_handler_is_owned_for_group(event: &str, group: &Value, handler: &Value) 
     }) else {
         return false;
     };
-    if handler.get("type").and_then(Value::as_str) != Some("command") {
-        return false;
-    }
-    let Some(command) = handler.get("command").and_then(Value::as_str) else {
-        return false;
-    };
-    !json_hook_group_has_user_metadata(group)
-        && (command == owned_command(AgentKind::Codex, Some(spec.event))
-            || command == owned_command(AgentKind::Codex, None))
+    !json_hook_group_has_user_metadata(group) && json_codex_handler_is_owned(spec.event, handler)
+}
+
+fn json_codex_handler_command_matches_owned(event: &str, handler: &Value) -> bool {
+    handler.get("type").and_then(Value::as_str) == Some("command")
+        && handler
+            .get("command")
+            .and_then(Value::as_str)
+            .is_some_and(|command| {
+                command == owned_command(AgentKind::Codex, Some(event))
+                    || command == owned_command(AgentKind::Codex, None)
+            })
+}
+
+fn json_codex_handler_is_owned(event: &str, handler: &Value) -> bool {
+    json_codex_handler_command_matches_owned(event, handler)
+        && handler
+            .as_object()
+            .is_some_and(|handler| handler.len() == 3)
+        && handler.get("timeout").and_then(Value::as_u64) == Some(5)
 }
 
 fn json_hook_group_has_user_metadata(group: &Value) -> bool {
@@ -4087,6 +4136,31 @@ fn json_hook_group_has_user_metadata(group: &Value) -> bool {
         group
             .keys()
             .any(|key| !matches!(key.as_str(), "matcher" | "hooks"))
+    })
+}
+
+fn json_has_owned_handler_metadata_conflict(value: &Value) -> bool {
+    let Some(hooks) = value.get("hooks").and_then(Value::as_object) else {
+        return false;
+    };
+    provider_specs(AgentKind::Codex).into_iter().any(|spec| {
+        hooks
+            .get(spec.event)
+            .and_then(Value::as_array)
+            .is_some_and(|groups| {
+                groups.iter().any(|group| {
+                    group.get("matcher").and_then(Value::as_str) == spec.matcher
+                        && group
+                            .get("hooks")
+                            .and_then(Value::as_array)
+                            .is_some_and(|handlers| {
+                                handlers.iter().any(|handler| {
+                                    json_codex_handler_command_matches_owned(spec.event, handler)
+                                        && !json_codex_handler_is_owned(spec.event, handler)
+                                })
+                            })
+                })
+            })
     })
 }
 
@@ -4166,8 +4240,11 @@ fn codex_hook_status_from_documents(json: &Value, config: &TomlDocument) -> Code
         CodexHookRepresentation::Json
     };
     let conflict = inline_active && json_has_non_owned_lifecycle_hooks(json);
+    let ownership_conflict = json_has_owned_handler_metadata_conflict(json)
+        || toml_has_owned_handler_metadata_conflict(config);
     let migration_required = inline_active && json_has_owned_codex_hooks(json);
     let configured = !conflict
+        && !ownership_conflict
         && match representation {
             CodexHookRepresentation::Json => provider_specs(AgentKind::Codex)
                 .into_iter()
@@ -4179,6 +4256,7 @@ fn codex_hook_status_from_documents(json: &Value, config: &TomlDocument) -> Code
         configured,
         migration_required,
         conflict,
+        ownership_conflict,
     }
 }
 
@@ -4246,6 +4324,17 @@ fn setup_codex_provider(
                 "hooks_path": display_path(hooks_path),
                 "config_path": display_path(notification_path),
                 "next": "converge user-owned lifecycle hooks onto one Codex representation, then review a fresh repair preview"
+            })),
+        ));
+    }
+    if status.ownership_conflict && action != SetupAction::Remove {
+        return Err(CliError::data(
+            "provider-hook-ownership-conflict",
+            "Codex has an agent-session command handler with user-owned fields; no files were changed because replacing those fields would change user configuration",
+            Some(json!({
+                "hooks_path": display_path(hooks_path),
+                "config_path": display_path(notification_path),
+                "next": "remove or rename the user-owned handler fields, then review a fresh repair preview"
             })),
         ));
     }
@@ -4740,7 +4829,7 @@ pub(crate) fn codex_protocol_attention_source_guard_configured() -> bool {
     let Ok(status) = codex_hook_status(&json_path, &config_path) else {
         return false;
     };
-    if status.conflict {
+    if status.conflict || status.ownership_conflict {
         return false;
     }
     match status.representation {
@@ -4782,7 +4871,7 @@ fn codex_json_permission_source_guard(path: &Path) -> bool {
             }
             if matcher.is_none()
                 && command == expected
-                && handler.get("timeout").and_then(Value::as_u64) == Some(5)
+                && json_codex_handler_is_owned("PermissionRequest", handler)
             {
                 guarded += 1;
             } else {
@@ -4829,7 +4918,7 @@ fn codex_toml_permission_source_guard(path: &Path) -> bool {
             }
             if matcher.is_none_or(str::is_empty)
                 && command == expected
-                && handler.get("timeout").and_then(TomlItem::as_integer) == Some(5)
+                && toml_handler_command_is_owned("PermissionRequest", handler)
             {
                 guarded += 1;
             } else {
@@ -5002,13 +5091,17 @@ fn mutate_json_spec(
         }
         if let Some(handlers) = group.get_mut("hooks").and_then(Value::as_array_mut) {
             handlers.retain(|handler| {
-                !(handler.get("type").and_then(Value::as_str) == Some("command")
-                    && handler
-                        .get("command")
-                        .and_then(Value::as_str)
-                        .is_some_and(|candidate| {
-                            candidate == command || candidate == legacy_command
-                        }))
+                let command_matches =
+                    handler.get("type").and_then(Value::as_str) == Some("command")
+                        && handler.get("command").and_then(Value::as_str).is_some_and(
+                            |candidate| candidate == command || candidate == legacy_command,
+                        );
+                let owned = if agent == AgentKind::Codex {
+                    json_codex_handler_is_owned(spec.event, handler)
+                } else {
+                    command_matches
+                };
+                !owned
             });
         }
     }
@@ -7934,6 +8027,75 @@ mod tests {
         .expect("UTF-8 TOML");
         assert!(cleaned_toml.contains("keep-toml-metadata"));
         assert!(!cleaned_toml.contains("agent-session activity hook"));
+    }
+
+    #[test]
+    fn codex_json_handler_metadata_is_user_owned_and_preserved_by_remove() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let hooks_path = tmp.path().join("hooks.json");
+        let config_path = tmp.path().join("config.toml");
+        let json = json!({
+            "hooks": {
+                "Stop": [{
+                    "hooks": [{
+                        "type": "command",
+                        "command": owned_command(AgentKind::Codex, Some("Stop")),
+                        "timeout": 5,
+                        "async": true,
+                        "statusMessage": "keep-json-handler-metadata"
+                    }]
+                }]
+            }
+        });
+        fs::write(
+            &hooks_path,
+            serde_json::to_vec_pretty(&json).expect("JSON bytes"),
+        )
+        .expect("JSON fixture");
+
+        let error =
+            setup_codex_provider(&hooks_path, &config_path, SetupAction::RepairPreview, None)
+                .expect_err("repair must not replace a metadata-bearing handler");
+        assert_eq!(error.code(), "provider-hook-ownership-conflict");
+
+        setup_codex_provider(&hooks_path, &config_path, SetupAction::Remove, None)
+            .expect("remove preserves user-owned handler metadata");
+        let cleaned: Value =
+            serde_json::from_slice(&fs::read(&hooks_path).expect("metadata-bearing JSON remains"))
+                .expect("cleaned JSON");
+        let handler = &cleaned["hooks"]["Stop"][0]["hooks"][0];
+        assert_eq!(handler["async"], true);
+        assert_eq!(handler["statusMessage"], "keep-json-handler-metadata");
+        assert_eq!(
+            handler["command"],
+            owned_command(AgentKind::Codex, Some("Stop"))
+        );
+    }
+
+    #[test]
+    fn codex_toml_handler_metadata_is_user_owned_and_preserved_by_remove() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let hooks_path = tmp.path().join("hooks.json");
+        let config_path = tmp.path().join("config.toml");
+        let config = format!(
+            "{CODEX_HOOK_BLOCK_START}\n[[hooks.Stop]]\n\n[[hooks.Stop.hooks]]\ntype = \"command\"\ncommand = {}\ntimeout = 5\nasync = true\nstatusMessage = \"keep-toml-handler-metadata\"\n{CODEX_HOOK_BLOCK_END}\n",
+            TomlValue::from(owned_command(AgentKind::Codex, Some("Stop")))
+        );
+        fs::write(&config_path, config).expect("TOML fixture");
+
+        let error =
+            setup_codex_provider(&hooks_path, &config_path, SetupAction::RepairPreview, None)
+                .expect_err("repair must not replace a metadata-bearing handler");
+        assert_eq!(error.code(), "provider-hook-ownership-conflict");
+
+        setup_codex_provider(&hooks_path, &config_path, SetupAction::Remove, None)
+            .expect("remove preserves user-owned handler metadata");
+        let cleaned = fs::read_to_string(&config_path).expect("metadata-bearing TOML remains");
+        assert!(cleaned.contains("async = true"));
+        assert!(cleaned.contains("statusMessage = \"keep-toml-handler-metadata\""));
+        assert!(cleaned.contains("agent-session activity hook"));
+        assert!(!cleaned.contains(CODEX_HOOK_BLOCK_START));
+        assert!(!cleaned.contains(CODEX_HOOK_BLOCK_END));
     }
 
     #[test]
