@@ -8226,10 +8226,10 @@ mod tests {
         control.signal(process, libc::SIGKILL).map(|_| ())
     }
 
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[cfg(target_os = "linux")]
     struct PublishedPidCleanup(Option<PinnedProcess>);
 
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[cfg(target_os = "linux")]
     impl PublishedPidCleanup {
         fn new(identity: ProcessIdentity) -> Self {
             let mut control = SystemProcessControl;
@@ -8256,7 +8256,7 @@ mod tests {
         }
     }
 
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[cfg(target_os = "linux")]
     impl Drop for PublishedPidCleanup {
         fn drop(&mut self) {
             let _ = self.terminate_and_wait();
@@ -8283,7 +8283,7 @@ mod tests {
             .expect("bounded fixture deadline")
     }
 
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[cfg(target_os = "linux")]
     fn spawn_authenticated_supervisor_fixture(
         scenario: &str,
         pid_path: &Path,
@@ -11455,6 +11455,8 @@ mod tests {
         assert_process_absent(pid, "target after supervisor deadline");
     }
 
+    // macOS hosted runners cannot reliably start this four-process kqueue fixture; see #1290.
+    #[cfg(target_os = "linux")]
     #[test]
     fn successful_git_output_reaps_a_surviving_process_group_child() {
         let root = tempfile::TempDir::new().expect("surviving child root");
