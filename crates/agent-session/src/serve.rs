@@ -1962,6 +1962,7 @@ fn non_authoritative_usage_snapshot() -> UsageSnapshot {
         authoritative: false,
         has_exhausted_windows: false,
         exhausted_reset_epochs: Vec::new(),
+        soonest_reset_epoch: None,
     }
 }
 
@@ -2019,6 +2020,10 @@ fn codex_account_usage_snapshot(output: &UsageHelperOutput, account: &str) -> Us
             .filter(|window| window.used_percent >= 100)
             .filter_map(|window| window.reset_at_epoch)
             .collect(),
+        soonest_reset_epoch: windows
+            .iter()
+            .filter_map(|window| window.reset_at_epoch)
+            .min(),
     }
 }
 
@@ -3790,6 +3795,7 @@ async fn auto_resume_loop(state: Arc<ServeState>) {
                     authoritative: false,
                     has_exhausted_windows: false,
                     exhausted_reset_epochs: Vec::new(),
+                    soonest_reset_epoch: None,
                 },
             )
             .await;
@@ -3828,6 +3834,11 @@ async fn auto_resume_loop(state: Arc<ServeState>) {
                     .filter(|window| window.used_percent >= 100)
                     .filter_map(|window| window.reset_at_epoch)
                     .collect(),
+                soonest_reset_epoch: provider
+                    .windows
+                    .iter()
+                    .filter_map(|window| window.reset_at_epoch)
+                    .min(),
             };
             process_auto_resume_ids(state.clone(), partition.claude, usage).await;
         }
@@ -10878,6 +10889,7 @@ esac
                 authoritative: false,
                 has_exhausted_windows: false,
                 exhausted_reset_epochs: Vec::new(),
+                soonest_reset_epoch: None,
             }));
         });
         let scheduler = tokio::spawn(process_codex_auto_resume_ids(
@@ -10961,6 +10973,7 @@ esac
                     authoritative: true,
                     has_exhausted_windows: true,
                     exhausted_reset_epochs: vec![1_893_456_600],
+                    soonest_reset_epoch: None,
                 },
                 |_| panic!("blocked usage must not submit"),
             )
@@ -13046,6 +13059,7 @@ esac
                 authoritative: true,
                 has_exhausted_windows: false,
                 exhausted_reset_epochs: Vec::new(),
+                soonest_reset_epoch: None,
             },
             |_| {
                 submissions += 1;

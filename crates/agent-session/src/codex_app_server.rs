@@ -1617,6 +1617,7 @@ pub(crate) fn usage_snapshot(result: &Value) -> UsageSnapshot {
             authoritative: false,
             has_exhausted_windows: false,
             exhausted_reset_epochs: Vec::new(),
+            soonest_reset_epoch: None,
         };
     };
     let mut exhausted_reset_epochs = Vec::new();
@@ -1631,6 +1632,7 @@ pub(crate) fn usage_snapshot(result: &Value) -> UsageSnapshot {
                 authoritative: false,
                 has_exhausted_windows: false,
                 exhausted_reset_epochs: Vec::new(),
+                soonest_reset_epoch: None,
             };
         }
     }
@@ -1640,6 +1642,7 @@ pub(crate) fn usage_snapshot(result: &Value) -> UsageSnapshot {
                 authoritative: false,
                 has_exhausted_windows: false,
                 exhausted_reset_epochs: Vec::new(),
+                soonest_reset_epoch: None,
             };
         }
         for key in ["primary", "secondary"] {
@@ -1651,6 +1654,7 @@ pub(crate) fn usage_snapshot(result: &Value) -> UsageSnapshot {
                     authoritative: false,
                     has_exhausted_windows: false,
                     exhausted_reset_epochs: Vec::new(),
+                    soonest_reset_epoch: None,
                 };
             };
             observed_window = true;
@@ -1668,6 +1672,7 @@ pub(crate) fn usage_snapshot(result: &Value) -> UsageSnapshot {
         authoritative: observed_window,
         has_exhausted_windows,
         exhausted_reset_epochs,
+        soonest_reset_epoch: None,
     }
 }
 
@@ -3806,6 +3811,7 @@ async fn process_live_message(
                 authoritative: false,
                 has_exhausted_windows: false,
                 exhausted_reset_epochs: Vec::new(),
+                soonest_reset_epoch: None,
             });
         wake_from_open_usage(context, record, &snapshot).await?;
     }
@@ -6761,6 +6767,7 @@ printf '%s\n' '{"schema_version":"agent-session.codex-auth-broker.v1","account":
                 authoritative: true,
                 has_exhausted_windows: false,
                 exhausted_reset_epochs: Vec::new(),
+                soonest_reset_epoch: None,
             },
         )
         .await
@@ -7450,6 +7457,7 @@ printf '%s\n' '{"schema_version":"agent-session.codex-auth-broker.v1","account":
                     authoritative: true,
                     has_exhausted_windows: true,
                     exhausted_reset_epochs: vec![1_893_456_600],
+                    soonest_reset_epoch: None,
                 },
                 |_| panic!("blocked usage must not submit"),
             )
@@ -8741,6 +8749,7 @@ printf '%s\n' '{"schema_version":"agent-session.codex-auth-broker.v1","account":
                 authoritative: true,
                 has_exhausted_windows: true,
                 exhausted_reset_epochs: vec![1_893_456_600],
+                soonest_reset_epoch: None,
             },
             |_| panic!("blocked usage must not submit"),
         )
