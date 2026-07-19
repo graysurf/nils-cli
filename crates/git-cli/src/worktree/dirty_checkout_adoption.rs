@@ -1340,8 +1340,6 @@ fn snapshot_worker_executable() -> Result<SnapshotWorkerExecutable> {
     let digest = cached_worker_file_digest(&file, &metadata)?;
     let command_path = if cfg!(target_os = "linux") {
         PathBuf::from(format!("/proc/self/fd/{}", file.as_raw_fd()))
-    } else if cfg!(target_os = "macos") {
-        PathBuf::from(format!("/dev/fd/{}", file.as_raw_fd()))
     } else {
         candidate.clone()
     };
