@@ -28,6 +28,9 @@ agent-session activity doctor --format json
 agent-session activity setup --agent codex --dry-run
 agent-session activity setup --agent codex --repair --dry-run
 agent-session activity setup --agent codex --repair --expected-preview-digest sha256:<reviewed-plan-digest>
+agent-session work-context claim --session <id> --file context.json --idempotency-key <key>
+agent-session work-context check --session <id>
+agent-session message inbox --session <id>
 printf '%s' "$AGENT_SESSION_TOKEN" | agent-session serve --bind 127.0.0.1:8781 --token-stdin
 agent-session command <id>
 agent-session attach <id>
@@ -77,6 +80,72 @@ For a stopped session without a one-shot run log, `agent-session logs <id>` fall
 diagnostic. Codex sessions retain that diagnostic after a startup failure or non-zero provider-client exit; a clean exit
 after readiness discards it.
 `--agent hermes` launches `hermes chat` interactively (one-shot `run` mode is codex/claude only).
+
+## Session coordination
+
+Every new managed runtime receives a private per-incarnation capability through
+the 0600 file named by `AGENT_SESSION_CAPABILITY_FILE`. Session, incarnation,
+claim, operation, and message identifiers are selectors and revision fences,
+not credentials. Start, run, provider import, and resume create a held tmux pane;
+the provider command is released only after the exact runtime identity and
+private capability are durable. A sidecar heartbeat survives launcher exit,
+requires that capability as private launch authority, rotates on resume, and
+removes its incarnation-specific capability after positively observed target
+exit. Runtime uncertainty degrades without releasing conflict fences. Broker
+recovery remains non-ready until reconciliation and its idempotency receipt are
+committed atomically. Delete revokes the capability and releases active
+coordination state before removing the session.
+
+`work-context claim|show|check|renew|release` manages an authenticated
+30-minute structured claim. Claims contain canonical repositories, private-keyed
+worktree fingerprints, provider and plan references, and closed
+`repository|path-exact|path-prefix` scopes. `check` is advisory;
+`claim` evaluates and acquires under one bounded registry lock, so concurrent
+definite contenders cannot both succeed. `work-context
+admit|complete|reconcile` binds covered filesystem/provider mutation targets to
+an execution token, exact activity/descendant evidence, and the persisted
+runtime identity. Releasing or replacing the claim is rejected while that
+operation is active or uncertain; a matching activity or descendant renews the
+30-minute lease. Completion first enters a bounded durable broker queue that
+the heartbeat sidecar drains, including across the exact safety-TTL transition,
+and wins over a concurrent reconcile-pending transition, so a lost PostTool
+response does not require the caller to survive; missed completion needs exact
+stopped-runtime proof or two observations of a superseding controller activity
+identity with no live descendant at least five seconds apart. Opaque,
+unbound-checkout, or uncovered targets fail closed.
+Peer summaries remain untrusted metadata and cannot authorize commands.
+
+`message send|inbox|show|ack|reply|wait` provides the private bounded mailbox.
+Only the authenticated recipient can read a body, returned as
+`body.classification: "untrusted_peer_data"`; send results, inbox rows, errors,
+list, and glance never contain it. V1 enforces the documented 16 KiB body,
+24-hour default/7-day maximum expiry, 256-message/4 MiB per-session, 64 MiB
+registry, 30-pair/minute with burst 10, opaque bounded cursors, 50/100-page,
+60-second wait, and depth-16 reply limits.
+Acknowledged entries retain metadata for 24 hours; expired entries have bounded
+terminal retention, and the HTTP
+surface admits at most 16 blocking waits at once and releases a worker promptly
+when its request is cancelled.
+The authoritative result is always queued mail. When the serve controller sees
+an exact idle prompt-v2 target, it durably records one attempt before submitting
+the fixed body-free notification; busy, replaced, unsupported, failed, and
+rate-limited targets remain queue-only without raw terminal input or retries.
+
+The complete schemas, scope truth table, state machines, error codes, and route
+matrix are in
+[`docs/specs/session-coordination-v1.md`](docs/specs/session-coordination-v1.md).
+Managed calls normally use the capability path from the environment; external
+CLI mutations pass `--capability-file`. HTTP public work-context/broker reads
+require the serve bearer token; owner and mailbox mutations additionally require
+`X-Agent-Session-Capability`, keeping operator and session authority separate.
+For HTTP send, `/sessions/{id}/messages/v1` names the recipient and the
+capability names the sender; request JSON has no independent `to` selector.
+Claim/check clients use `agent-session.work-context-input.v1`, admission clients
+use `agent-session.operation-targets.v1`, and the exact checkout, descendant,
+operation-reconcile, and broker-recovery shapes are frozen in the linked spec.
+List and glance add only claim state/id/expiry, unread
+count, conflict severity, and coordination availability fields; the existing
+`cwd` field remains unchanged.
 
 ## Durable turn state
 
