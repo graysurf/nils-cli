@@ -21,5 +21,13 @@ retries = 2
 filter = 'package(nils-git-cli) & test(/(supervisor|output_cleanup|detached_double_fork|successful_git_output|signal_terminated_target)/)'
 threads-required = "num-test-threads"
 
+# This end-to-end malformed-state case launches the authenticated process
+# supervisor through the copied CLI and deterministically exhausts macOS kqueue
+# tracking when it overlaps the full workspace. Keep the typed exit contract
+# test isolated rather than weakening fail-closed process containment.
+[[profile.ci.overrides]]
+filter = 'package(nils-git-cli) & test(adopt_dirty_treats_an_empty_existing_lease_as_malformed_state)'
+threads-required = "num-test-threads"
+
 [profile.ci.junit]
 path = "junit.xml"

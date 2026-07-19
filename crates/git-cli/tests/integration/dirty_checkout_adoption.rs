@@ -1593,17 +1593,13 @@ fn json_error_identity(output: &CmdOutput) -> (i32, String) {
 }
 
 fn assert_json_error(output: &CmdOutput, expected_code: &str, expected_exit: i32) {
-    assert_eq!(
-        output.code,
-        expected_exit,
-        "stderr: {}",
-        output.stderr_text()
-    );
     assert_eq!(output.stderr_text(), "");
     let value: serde_json::Value =
         serde_json::from_str(output.stdout_text().trim()).expect("JSON error envelope");
     assert_eq!(value["ok"], false);
-    assert_eq!(value["error"]["code"], expected_code);
+    let actual_code = value["error"]["code"].as_str().expect("JSON error code");
+    assert_eq!(output.code, expected_exit, "JSON error code: {actual_code}");
+    assert_eq!(actual_code, expected_code);
 }
 
 #[test]
