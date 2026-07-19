@@ -25,6 +25,24 @@ const SESSION_KEY: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
 const AUTHORIZATION_TURN_DIGEST: &str =
     "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
 
+fn private_state_home() -> tempfile::TempDir {
+    let parent = fs::canonicalize(std::env::temp_dir()).expect("canonicalize platform temp root");
+    tempfile::Builder::new()
+        .prefix("git-cli-dirty-checkout-state-")
+        .tempdir_in(parent)
+        .expect("create private state home")
+}
+
+#[test]
+fn dirty_checkout_state_home_fixture_is_canonical() {
+    let state_home = private_state_home();
+
+    assert_eq!(
+        fs::canonicalize(state_home.path()).expect("canonical state home"),
+        state_home.path()
+    );
+}
+
 fn checkout_state_dir(
     state_root: &std::path::Path,
     snapshot: &DirtySnapshot,
@@ -242,7 +260,7 @@ fn adoption_supports_a_non_utf8_checkout_root_on_linux() {
         &["status", "--porcelain=v1", "--untracked-files=all"],
     );
     let snapshot = dirty_snapshot(&checkout).expect("snapshot non-UTF-8 checkout root");
-    let state_home = tempfile::TempDir::new().expect("state home");
+    let state_home = private_state_home();
     let reason_file = state_home.path().join("reason.txt");
     fs::write(&reason_file, "Preserve the dirty checkout.\n").expect("write reason");
     let _challenge_path = write_challenge(state_home.path(), &snapshot);
@@ -292,7 +310,7 @@ fn real_cli_worker_lifecycle_supports_a_non_utf8_checkout_root() {
         &["status", "--porcelain=v1", "--untracked-files=all"],
     );
     let harness = GitCliHarness::new();
-    let state_home = tempfile::TempDir::new().expect("CLI state home");
+    let state_home = private_state_home();
     let reason_file = state_home.path().join("reason.txt");
     fs::write(&reason_file, b"Preserve the native checkout.\n").expect("write CLI reason");
 
@@ -817,7 +835,7 @@ fn dirty_snapshot_rejects_active_git_operation_state() {
 #[test]
 fn adopt_dirty_rejects_a_stale_snapshot_challenge() {
     let repo = init_repo();
-    let state_home = tempfile::TempDir::new().expect("state home");
+    let state_home = private_state_home();
     let dirty_path = repo.path().join("dirty.txt");
     let reason_file = state_home.path().join("adoption-reason.txt");
     fs::write(&dirty_path, "first dirty state\n").expect("write dirty file");
@@ -843,7 +861,7 @@ fn adopt_dirty_rejects_a_stale_snapshot_challenge() {
 #[test]
 fn adopt_dirty_rejects_a_live_foreign_v1_lease() {
     let repo = init_repo();
-    let state_home = tempfile::TempDir::new().expect("state home");
+    let state_home = private_state_home();
     let reason_file = state_home.path().join("adoption-reason.txt");
     fs::write(repo.path().join("dirty.txt"), "user-owned dirty state\n").expect("write dirty file");
     fs::write(&reason_file, "Need to preserve user-owned changes.\n").expect("write reason file");
@@ -886,7 +904,7 @@ fn adopt_dirty_rejects_a_live_foreign_v1_lease() {
 #[test]
 fn adoption_returns_opaque_receipt_and_revocation_is_receipt_bound() {
     let repo = init_repo();
-    let state_home = tempfile::TempDir::new().expect("state home");
+    let state_home = private_state_home();
     let dirty_path = repo.path().join("dirty.txt");
     let reason_file = state_home.path().join("adoption-reason.txt");
     fs::write(&dirty_path, "user-owned dirty state\n").expect("write dirty file");
@@ -1036,7 +1054,7 @@ fn adoption_returns_opaque_receipt_and_revocation_is_receipt_bound() {
 #[test]
 fn identical_lost_response_retry_returns_the_committed_receipt() {
     let repo = init_repo();
-    let state_home = tempfile::TempDir::new().expect("state home");
+    let state_home = private_state_home();
     let reason_file = state_home.path().join("reason.txt");
     fs::write(repo.path().join("dirty.txt"), "dirty\n").expect("write dirty file");
     fs::write(&reason_file, "Preserve the dirty checkout.\n").expect("write reason");
@@ -1065,7 +1083,7 @@ fn identical_lost_response_retry_returns_the_committed_receipt() {
 fn committed_retry_revalidates_exact_artifacts_and_current_snapshot() {
     for tamper in ["receipt", "spent-challenge", "checkout"] {
         let repo = init_repo();
-        let state_home = tempfile::TempDir::new().expect("state home");
+        let state_home = private_state_home();
         let reason_file = state_home.path().join("reason.txt");
         let dirty_path = repo.path().join("dirty.txt");
         fs::write(&dirty_path, "dirty\n").expect("write dirty file");
@@ -1191,7 +1209,7 @@ fn dirty_snapshot_binds_staged_index_content() {
 #[test]
 fn adopt_dirty_rejects_expired_and_non_private_challenges() {
     let expired_repo = init_repo();
-    let expired_state = tempfile::TempDir::new().expect("expired state home");
+    let expired_state = private_state_home();
     let expired_reason = expired_state.path().join("reason.txt");
     fs::write(expired_repo.path().join("dirty.txt"), "dirty\n").expect("write dirty file");
     fs::write(&expired_reason, "Preserve these changes.\n").expect("write reason file");
@@ -1216,7 +1234,7 @@ fn adopt_dirty_rejects_expired_and_non_private_challenges() {
     assert!(expired_error.to_string().contains("expired"));
 
     let public_repo = init_repo();
-    let public_state = tempfile::TempDir::new().expect("public state home");
+    let public_state = private_state_home();
     let public_reason = public_state.path().join("reason.txt");
     fs::write(public_repo.path().join("dirty.txt"), "dirty\n").expect("write dirty file");
     fs::write(&public_reason, "Preserve these changes.\n").expect("write reason file");
@@ -1237,7 +1255,7 @@ fn adopt_dirty_rejects_expired_and_non_private_challenges() {
 #[test]
 fn adopt_dirty_rejects_symlink_reason_files() {
     let repo = init_repo();
-    let state_home = tempfile::TempDir::new().expect("state home");
+    let state_home = private_state_home();
     fs::write(repo.path().join("dirty.txt"), "dirty\n").expect("write dirty file");
     let reason_target = state_home.path().join("reason-target.txt");
     let reason_link = state_home.path().join("reason-link.txt");
@@ -1264,7 +1282,7 @@ fn adopt_dirty_rejects_symlink_reason_files() {
 fn governed_cli_feature_gate_accepts_only_exact_one() {
     let harness = GitCliHarness::new();
     let repo = init_repo();
-    let state_home = tempfile::TempDir::new().expect("state home");
+    let state_home = private_state_home();
     let state_root = state_home.path().to_string_lossy().to_string();
     let args = [
         "worktree",
@@ -1302,7 +1320,7 @@ fn governed_cli_feature_gate_accepts_only_exact_one() {
 fn governed_cli_enforces_gate_and_returns_private_json_contracts() {
     let harness = GitCliHarness::new();
     let repo = init_repo();
-    let state_home = tempfile::TempDir::new().expect("state home");
+    let state_home = private_state_home();
     let reason_file = state_home.path().join("adoption-reason.txt");
     let reason_text = "Preserve these user-owned changes.\n";
     fs::write(repo.path().join("dirty.txt"), "dirty state\n").expect("write dirty file");
@@ -1429,7 +1447,7 @@ fn governed_cli_enforces_gate_and_returns_private_json_contracts() {
 fn dirty_snapshot_json_omits_raw_checkout_paths() {
     let harness = GitCliHarness::new();
     let repo = init_repo();
-    let state_home = tempfile::TempDir::new().expect("state home");
+    let state_home = private_state_home();
     fs::write(repo.path().join("dirty.txt"), "dirty\n").expect("write dirty file");
 
     let output = run_governed_command(
@@ -1654,7 +1672,7 @@ fn dirty_checkout_cli_maps_expected_fail_closed_boundaries_to_domain_errors() {
     );
 
     let reason_repo = init_repo();
-    let reason_state = tempfile::TempDir::new().expect("reason state home");
+    let reason_state = private_state_home();
     fs::write(reason_repo.path().join("dirty.txt"), "dirty\n").expect("write dirty fixture");
     let reason_snapshot = dirty_snapshot(reason_repo.path()).expect("reason snapshot");
     let reason_challenge = write_challenge(reason_state.path(), &reason_snapshot);
@@ -1686,7 +1704,7 @@ fn dirty_checkout_cli_maps_expected_fail_closed_boundaries_to_domain_errors() {
     assert!(reason_challenge.exists());
 
     let challenge_repo = init_repo();
-    let challenge_state = tempfile::TempDir::new().expect("challenge state home");
+    let challenge_state = private_state_home();
     let challenge_reason = challenge_state.path().join("reason.txt");
     fs::write(challenge_repo.path().join("dirty.txt"), "dirty\n").expect("write dirty fixture");
     fs::write(&challenge_reason, "Preserve changes.\n").expect("write reason");
@@ -1717,7 +1735,7 @@ fn dirty_checkout_cli_maps_expected_fail_closed_boundaries_to_domain_errors() {
     );
 
     let root_repo = init_repo();
-    let root_state = tempfile::TempDir::new().expect("root state home");
+    let root_state = private_state_home();
     let root_reason = root_state.path().join("reason.txt");
     fs::write(root_repo.path().join("dirty.txt"), "dirty\n").expect("write dirty fixture");
     fs::write(&root_reason, "Preserve changes.\n").expect("write reason");
@@ -1832,7 +1850,7 @@ fn revoke_dirty_argument_errors_never_reflect_receipt_format_or_stray_values() {
 #[test]
 fn adopt_dirty_requires_nonempty_utf8_reason_before_state_transition() {
     let repo = init_repo();
-    let state_home = tempfile::TempDir::new().expect("state home");
+    let state_home = private_state_home();
     fs::write(repo.path().join("dirty.txt"), "dirty\n").expect("write dirty file");
     let snapshot = dirty_snapshot(repo.path()).expect("snapshot dirty checkout");
     let challenge_path = write_challenge(state_home.path(), &snapshot);
@@ -1860,7 +1878,7 @@ fn adopt_dirty_requires_nonempty_utf8_reason_before_state_transition() {
 fn adopt_dirty_treats_an_empty_existing_lease_as_malformed_state() {
     let harness = GitCliHarness::new();
     let repo = init_repo();
-    let state_home = tempfile::TempDir::new().expect("state home");
+    let state_home = private_state_home();
     let reason_file = state_home.path().join("reason.txt");
     fs::write(repo.path().join("dirty.txt"), "dirty\n").expect("write dirty file");
     fs::write(&reason_file, "Preserve the dirty checkout.\n").expect("write reason");
@@ -1903,7 +1921,7 @@ fn adopt_dirty_treats_an_empty_existing_lease_as_malformed_state() {
 #[test]
 fn adopt_dirty_strictly_rejects_unknown_v1_lease_fields() {
     let repo = init_repo();
-    let state_home = tempfile::TempDir::new().expect("state home");
+    let state_home = private_state_home();
     let reason_file = state_home.path().join("reason.txt");
     fs::write(repo.path().join("dirty.txt"), "dirty\n").expect("write dirty file");
     fs::write(&reason_file, "Preserve the dirty checkout.\n").expect("write reason");
@@ -1943,7 +1961,7 @@ fn adopt_dirty_strictly_rejects_unknown_v1_lease_fields() {
 #[test]
 fn revoke_dirty_rejects_v2_raw_paths_that_disagree_with_text_paths() {
     let repo = init_repo();
-    let state_home = tempfile::TempDir::new().expect("state home");
+    let state_home = private_state_home();
     let reason_file = state_home.path().join("reason.txt");
     fs::write(repo.path().join("dirty.txt"), "dirty\n").expect("write dirty file");
     fs::write(&reason_file, "Preserve the dirty checkout.\n").expect("write reason");
@@ -1974,7 +1992,7 @@ fn replacing_an_expired_adoption_cleans_its_exact_predecessor_state() {
     const SECOND_DIGEST: &str = "d91323a5298f3b9f814db29efaa271f24fbdccedfdd062491b8abc8e07b7fb69";
 
     let repo = init_repo();
-    let state_home = tempfile::TempDir::new().expect("state home");
+    let state_home = private_state_home();
     let reason_file = state_home.path().join("reason.txt");
     let dirty_path = repo.path().join("dirty.txt");
     fs::write(&dirty_path, "first dirty state\n").expect("write dirty file");
@@ -2035,7 +2053,7 @@ fn assert_expired_predecessor_cleanup_resumes(missing_artifact: &str) {
     const SECOND_DIGEST: &str = "d91323a5298f3b9f814db29efaa271f24fbdccedfdd062491b8abc8e07b7fb69";
 
     let repo = init_repo();
-    let state_home = tempfile::TempDir::new().expect("state home");
+    let state_home = private_state_home();
     let reason_file = state_home.path().join("reason.txt");
     let dirty_path = repo.path().join("dirty.txt");
     fs::write(&dirty_path, "first dirty state\n").expect("write dirty file");
@@ -2105,7 +2123,7 @@ fn predecessor_cleanup_resumes_after_spent_challenge_deletion() {
 #[test]
 fn concurrent_adoption_consumes_a_challenge_exactly_once() {
     let repo = init_repo();
-    let state_home = tempfile::TempDir::new().expect("state home");
+    let state_home = private_state_home();
     let reason_file = state_home.path().join("reason.txt");
     fs::write(repo.path().join("dirty.txt"), "dirty\n").expect("write dirty file");
     fs::write(&reason_file, "Preserve the dirty checkout.\n").expect("write reason");
@@ -2218,7 +2236,7 @@ fn assert_revocation_resumes_after_tombstone(
     fault_boundary: &str,
 ) {
     let repo = init_repo();
-    let state_home = tempfile::TempDir::new().expect("state home");
+    let state_home = private_state_home();
     let reason_file = state_home.path().join("reason.txt");
     fs::write(repo.path().join("dirty.txt"), "dirty\n").expect("write dirty file");
     fs::write(&reason_file, "Preserve the dirty checkout.\n").expect("write reason");
@@ -2300,7 +2318,7 @@ fn revocation_retry_is_idempotent_after_artifact_cleanup_and_sync_faults() {
 #[test]
 fn revocation_crash_state_never_restores_a_consumed_challenge() {
     let repo = init_repo();
-    let state_home = tempfile::TempDir::new().expect("state home");
+    let state_home = private_state_home();
     let reason_file = state_home.path().join("reason.txt");
     fs::write(repo.path().join("dirty.txt"), "dirty\n").expect("write dirty file");
     fs::write(&reason_file, "Preserve the dirty checkout.\n").expect("write reason");
@@ -2403,7 +2421,7 @@ fn state_root_rejection_is_verify_only_and_does_not_create_transition_files() {
 #[test]
 fn public_state_root_is_rejected_without_permission_repair_or_mutation() {
     let repo = init_repo();
-    let state_home = tempfile::TempDir::new().expect("state home");
+    let state_home = private_state_home();
     let reason_file = state_home.path().join("reason.txt");
     fs::write(repo.path().join("dirty.txt"), "dirty\n").expect("write dirty file");
     fs::write(&reason_file, "Preserve the dirty checkout.\n").expect("write reason");
@@ -2434,6 +2452,41 @@ fn public_state_root_is_rejected_without_permission_repair_or_mutation() {
     assert!(!state_dir.join("lease.lock").exists());
     fs::set_permissions(state_home.path(), fs::Permissions::from_mode(0o700))
         .expect("restore tempdir permissions");
+}
+
+#[test]
+fn symlinked_state_root_ancestor_is_rejected_without_transition_mutation() {
+    let repo = init_repo();
+    let state_home = private_state_home();
+    let alias_home = private_state_home();
+    let state_alias = alias_home.path().join("state-root");
+    let reason_file = state_home.path().join("reason.txt");
+    fs::write(repo.path().join("dirty.txt"), "dirty\n").expect("write dirty file");
+    fs::write(&reason_file, "Preserve the dirty checkout.\n").expect("write reason");
+    let snapshot = dirty_snapshot(repo.path()).expect("snapshot dirty checkout");
+    let challenge_path = write_challenge(state_home.path(), &snapshot);
+    let state_dir = checkout_state_dir(state_home.path(), &snapshot);
+    symlink(state_home.path(), &state_alias).expect("create state-root symlink");
+
+    let error = adopt_dirty(repo.path(), &state_alias, CHALLENGE_TOKEN, &reason_file)
+        .expect_err("symlinked state root must be rejected");
+
+    assert_eq!(
+        error
+            .downcast_ref::<DirtyCheckoutError>()
+            .expect("typed state-root error")
+            .kind(),
+        DirtyCheckoutErrorKind::InvalidInput
+    );
+    assert!(error.to_string().contains("symlink component"));
+    assert!(challenge_path.exists());
+    for forbidden in ["lease.lock", "lease.json"] {
+        assert!(
+            !state_dir.join(forbidden).exists(),
+            "state-root rejection created {forbidden}"
+        );
+    }
+    assert!(!state_dir.join("receipts").exists());
 }
 
 #[test]
@@ -2578,7 +2631,7 @@ fn adopt_dirty_rejects_top_level_worktree_redirect_without_touching_target_state
     fs::write(target.path().join("dirty.txt"), "target dirty\n")
         .expect("write target dirty anchor");
 
-    let state_home = tempfile::TempDir::new().expect("redirect state home");
+    let state_home = private_state_home();
     let reason_file = state_home.path().join("reason.txt");
     fs::write(&reason_file, "Preserve the dirty checkout.\n").expect("write reason");
     let target_snapshot = dirty_snapshot(target.path()).expect("snapshot redirect target");
@@ -2706,7 +2759,7 @@ fn complete_walk_rejects_ignored_symlink_escapes_and_clean_hardlinks() {
 fn git_shaping_environment_cannot_validate_a_stale_virtual_index() {
     let harness = GitCliHarness::new();
     let repo = init_repo();
-    let state_home = tempfile::TempDir::new().expect("state home");
+    let state_home = private_state_home();
     let tracked = repo.path().join("tracked.txt");
     let reason_file = state_home.path().join("reason.txt");
     fs::write(&tracked, "original\n").expect("write tracked file");
@@ -2777,7 +2830,7 @@ fn dirty_unborn_repository_snapshot_and_adoption_are_supported() {
     assert_eq!(snapshot.tracked_entries, 1);
     assert_eq!(snapshot.untracked_entries, 1);
 
-    let state_home = tempfile::TempDir::new().expect("state home");
+    let state_home = private_state_home();
     let reason_file = state_home.path().join("reason.txt");
     fs::write(&reason_file, "Preserve the dirty unborn checkout.\n").expect("write reason");
     let _challenge_path = write_challenge(state_home.path(), &snapshot);
