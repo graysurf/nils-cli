@@ -339,61 +339,22 @@ agent-session activity setup --agent <provider> --remove
 agent-session activity doctor [--agent <provider>] --format json
 ```
 
-Setup is explicit, additive, idempotent, and reversible. It preserves unrelated
-provider config, detects an observed concurrent modification before replacement,
-and never auto-accepts Codex trust or Hermes consent. Codex setup additionally
-owns the exact `agent-session activity notify --agent codex` argv in the
-singular top-level `notify` field of `~/.codex/config.toml`: it inserts the argv
-when absent, recognizes it idempotently, and composes a bounded safe user-owned
-argv through the hidden `--forward-notify-argv-json` transport. Composition
-executes the original argv directly without a shell, passes the provider JSON
-as its final argument, suppresses child output, and kills it after two seconds.
-The helper marks fan-out depth, rejects nested forwarding metadata, and uses a
-non-blocking activity lock so local state contention cannot delay the preserved
-notifier. On contention, the normalized metadata-only completion is piped to a
-detached `activity event` retry that waits for the same transaction lock, so the
-single-shot authoritative signal survives transient contention without holding
-up Codex. The retry has a five-second lock deadline, clears diagnostics after
-durable success, and records a sanitized timeout or ingest failure instead of
-accumulating an unbounded worker. Remove deletes an exact owned value or restores
-the original full
-config bytes; setup accepts composition only when that byte-exact reversal is
-proven in memory. Unsafe, oversized, non-string, recursive, and non-reversible
-values fail closed before hooks mutation. The two
-Codex files are fully planned before mutation and the first guarded write is
-rolled back if the second guarded write fails. Doctor scans session records
-once, probes provider versions concurrently with a two-second bound per
-provider, and reports installed version or a bounded probe error, audited
-classification, config status or sanitized configuration error, Codex
-`notification_mode`, finality and correlation limits, `exact_attention`, the
-provider-specific `attention_authority` policy, trust requirements, and repair
-guidance without emitting provider config content.
-Configured status requires every exact owned hook command/timeout and, for
-Codex, an exact owned or valid composed notify argv; helper health resolves the bare `agent-session`
-command on PATH. Every start and resume passes the current daemon `PATH` as a
-session-scoped `tmux new-session` environment value, so a durable tmux server
-cannot supply an older helper path after a staged daemon upgrade. The service
-launcher remains responsible for putting the selected daemon directory first.
-Hook/notification diagnostics are bound to the active
-launch id/generation and the newest current-runtime diagnostic is selected
-deterministically across sessions.
+`activity setup` always forwards to the shared `agent-hook setup` owner, using
+`AGENT_HOOK_BIN` when explicitly set and otherwise resolving `agent-hook` on
+`PATH`. It maps the legacy provider and digest options, requests the versioned
+JSON contract, and adds `compatibility_owner: "agent-hook"` to the returned
+result. It never writes provider configuration itself.
 
-The combined `--repair --dry-run` reviewed-plan action is Codex-only because its
-digest binds Codex's two-file repair transaction. Claude and Hermes reject that
-combination with `provider-repair-preview-unsupported`; their ordinary
-`--dry-run` and `--repair` actions remain supported independently.
+If `agent-hook` is absent or cannot be started, setup returns the typed
+`agent-hook-setup-unavailable` error with install-and-repeat-preview guidance.
+There is no embedded registration fallback, including for `--apply`,
+`--repair`, or `--remove`, so a mixed-version installation cannot reactivate a
+second writer.
 
-Codex repair preview (`--repair --dry-run`) is non-destructive even when a safe
-foreign notifier cannot pass byte-exact reversal. It reports only the
-current/candidate mode, argument count, reversibility, a blocker code, and
-SHA-256 of compact JSON argv plus one LF. It also returns a separate content-free
-plan digest that binds the presence and exact current/proposed bytes of both
-`hooks.json` and `config.toml`. It never emits argv or configuration values.
-Codex `--repair` requires that digest through `--expected-preview-digest` and
-recomputes it before either write. Missing, malformed, or stale digests fail
-closed; a blocked preview does not weaken repair, and both files remain exact.
-
-Setup JSON distinguishes current and prospective state: `configured` and
-`changed` describe the file after the command, while `would_configure` and
-`would_change` describe the requested transformation. Dry-run never reports a
-file change and leaves `configured` at the current value.
+`activity doctor` remains a read-only compatibility diagnostic. It recognizes
+exact legacy `agent-session` hook and Codex notify shapes, reports conflicts
+without provider content, probes provider versions with bounded timeouts, and
+selects the newest current-runtime diagnostic deterministically. The retained
+`activity hook` and `activity notify` commands continue to ingest already
+installed legacy callbacks fail-open while provider registration converges on
+`agent-hook`.

@@ -14,10 +14,7 @@ use nils_common::fs::{SECRET_FILE_MODE, display_path, home_dir, write_atomic};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
-use toml_edit::{
-    Array as TomlArray, DocumentMut as TomlDocument, Item as TomlItem, Value as TomlValue,
-    value as toml_value,
-};
+use toml_edit::{DocumentMut as TomlDocument, Item as TomlItem};
 
 use crate::cli::AgentKind;
 use crate::{
@@ -438,15 +435,6 @@ pub(crate) fn stream_projection(state: &TurnState) -> StreamTurnState {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum SetupAction {
-    DryRun,
-    RepairPreview,
-    Apply,
-    Remove,
-    Repair,
-}
-
 #[derive(Clone, Debug, Serialize)]
 pub(crate) struct ProviderDoctor {
     pub(crate) provider: String,
@@ -484,45 +472,6 @@ pub(crate) struct ProviderDoctor {
 #[derive(Clone, Debug, Serialize)]
 pub(crate) struct DoctorResult {
     pub(crate) providers: Vec<ProviderDoctor>,
-}
-
-#[derive(Clone, Debug, Serialize)]
-pub(crate) struct SetupResult {
-    pub(crate) provider: String,
-    pub(crate) action: String,
-    pub(crate) changed: bool,
-    pub(crate) would_change: bool,
-    pub(crate) configured: bool,
-    pub(crate) would_configure: bool,
-    pub(crate) apply_allowed: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) preview_digest: Option<String>,
-    pub(crate) config_path: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) hook_representation: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) hook_migration: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) representation_conflict: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) notification_config_path: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) notification_preview: Option<CodexNotificationPreview>,
-    pub(crate) owned_events: Vec<String>,
-    pub(crate) trust: String,
-}
-
-#[derive(Clone, Debug, Serialize)]
-pub(crate) struct CodexNotificationPreview {
-    current_mode: String,
-    candidate_mode: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) forwarded_argc: Option<usize>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) forwarded_argv_sha256: Option<String>,
-    reversible: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) blocker_code: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -3041,118 +2990,6 @@ fn latest_provider_activity(context: &CliContext) -> BTreeMap<String, ProviderAc
     activity
 }
 
-pub(crate) fn setup(
-    agent: AgentKind,
-    action: SetupAction,
-    expected_preview_digest: Option<&str>,
-) -> Result<SetupResult, CliError> {
-    if action == SetupAction::RepairPreview && agent != AgentKind::Codex {
-        return Err(CliError::usage(
-            "provider-repair-preview-unsupported",
-            "--repair --dry-run is a Codex-only reviewed-plan workflow; use --dry-run or --repair separately for this provider",
-            Some(json!({ "agent": agent.as_str() })),
-        ));
-    }
-    if agent == AgentKind::Codex && action == SetupAction::Repair {
-        let Some(expected) = expected_preview_digest else {
-            return Err(CliError::data(
-                "provider-config-preview-digest-required",
-                "Codex repair requires the digest from a reviewed --repair --dry-run preview",
-                None,
-            ));
-        };
-        validate_preview_digest(expected)?;
-    } else if expected_preview_digest.is_some() {
-        return Err(CliError::data(
-            "provider-config-preview-digest-unsupported",
-            "an expected preview digest is accepted only when applying Codex repair",
-            None,
-        ));
-    }
-    let path = provider_config_path(agent)?;
-    let notification_path = (agent == AgentKind::Codex)
-        .then(codex_notification_config_path)
-        .transpose()?;
-    let configured_before = provider_configured(agent, &path)?;
-    let outcome = match agent {
-        AgentKind::Codex => {
-            let notify_path = notification_path.as_deref().expect("Codex notify path");
-            setup_codex_provider(&path, notify_path, action, expected_preview_digest)?
-        }
-        AgentKind::Claude => {
-            let (would_change, would_configure) = setup_json_provider(agent, &path, action)?;
-            ProviderSetupOutcome {
-                would_change,
-                would_configure,
-                apply_allowed: true,
-                notification_preview: None,
-                preview_digest: None,
-                hook_config_path: None,
-                hook_representation: None,
-                hook_migration: None,
-                representation_conflict: None,
-            }
-        }
-        AgentKind::Hermes => {
-            let (would_change, would_configure) = setup_hermes(&path, action)?;
-            ProviderSetupOutcome {
-                would_change,
-                would_configure,
-                apply_allowed: true,
-                notification_preview: None,
-                preview_digest: None,
-                hook_config_path: None,
-                hook_representation: None,
-                hook_migration: None,
-                representation_conflict: None,
-            }
-        }
-    };
-    let action_name = match action {
-        SetupAction::DryRun => "dry-run",
-        SetupAction::RepairPreview => "repair-preview",
-        SetupAction::Apply => "apply",
-        SetupAction::Remove => "remove",
-        SetupAction::Repair => "repair",
-    };
-    Ok(SetupResult {
-        provider: agent.as_str().to_string(),
-        action: action_name.to_string(),
-        changed: !matches!(action, SetupAction::DryRun | SetupAction::RepairPreview)
-            && outcome.would_change,
-        would_change: outcome.would_change,
-        configured: if matches!(action, SetupAction::DryRun | SetupAction::RepairPreview) {
-            configured_before
-        } else {
-            outcome.would_configure
-        },
-        would_configure: outcome.would_configure,
-        apply_allowed: outcome.apply_allowed,
-        preview_digest: outcome.preview_digest,
-        config_path: display_path(outcome.hook_config_path.as_deref().unwrap_or(&path)),
-        hook_representation: outcome.hook_representation,
-        hook_migration: outcome.hook_migration,
-        representation_conflict: outcome.representation_conflict,
-        notification_config_path: notification_path.as_deref().map(display_path),
-        notification_preview: outcome.notification_preview,
-        owned_events: provider_specs(agent)
-            .into_iter()
-            .map(|spec| spec.event.to_string())
-            .chain((agent == AgentKind::Codex).then(|| "agent-turn-complete".to_string()))
-            .collect(),
-        trust: match agent {
-            AgentKind::Codex => {
-                "approve the exact new Codex hook definitions; a safe singular user notify argv is preserved through bounded direct-argv fan-out without a shell"
-            }
-            AgentKind::Claude => "review the additive settings entries before apply",
-            AgentKind::Hermes => {
-                "approve each new (event, command) pair or use Hermes' explicit hook-consent flow"
-            }
-        }
-        .to_string(),
-    })
-}
-
 fn provider_version(agent: AgentKind) -> VersionProbe {
     probe_version_command(
         crate::resolve_agent_bin(agent, None),
@@ -3282,35 +3119,6 @@ fn codex_notification_config_path() -> Result<std::path::PathBuf, CliError> {
 struct ProviderSpec {
     event: &'static str,
     matcher: Option<&'static str>,
-}
-
-#[derive(Debug)]
-struct ProviderConfigPlan {
-    path: PathBuf,
-    original_bytes: Option<Vec<u8>>,
-    updated_bytes: Option<Vec<u8>>,
-    changed: bool,
-    configured: bool,
-}
-
-#[derive(Debug)]
-struct CodexNotificationPlan {
-    config: ProviderConfigPlan,
-    preview: CodexNotificationPreview,
-    apply_allowed: bool,
-}
-
-#[derive(Debug)]
-struct ProviderSetupOutcome {
-    would_change: bool,
-    would_configure: bool,
-    apply_allowed: bool,
-    notification_preview: Option<CodexNotificationPreview>,
-    preview_digest: Option<String>,
-    hook_config_path: Option<PathBuf>,
-    hook_representation: Option<String>,
-    hook_migration: Option<String>,
-    representation_conflict: Option<bool>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -3577,217 +3385,6 @@ fn codex_notify_mode_name(mode: &CodexNotifyMode) -> &'static str {
     }
 }
 
-fn codex_forward_argv_sha256(argv: &[String]) -> Result<String, CliError> {
-    let mut encoded = serde_json::to_vec(argv).map_err(|_| {
-        CliError::data(
-            "provider-notification-config-invalid",
-            "Codex user-owned notify argv could not be encoded for safe preview",
-            None,
-        )
-    })?;
-    // Match the operational comparison contract: compact JSON argv followed by
-    // one LF, so an operator can compare this content-free digest with a
-    // separately decoded composed notifier without exposing argv values.
-    encoded.push(b'\n');
-    let mut digest = Sha256::new();
-    digest.update(encoded);
-    Ok(format!("sha256:{}", hex_digest(digest.finalize())))
-}
-
-fn validate_preview_digest(value: &str) -> Result<(), CliError> {
-    let valid = value.strip_prefix("sha256:").is_some_and(|digest| {
-        digest.len() == 64
-            && digest
-                .bytes()
-                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
-    });
-    if valid {
-        Ok(())
-    } else {
-        Err(CliError::data(
-            "provider-config-preview-digest-invalid",
-            "expected preview digest must use sha256 followed by 64 lowercase hexadecimal characters",
-            None,
-        ))
-    }
-}
-
-fn update_plan_digest(digest: &mut Sha256, role: &[u8], plan: &ProviderConfigPlan) {
-    digest.update(role);
-    digest.update(b"\0");
-    match plan.original_bytes.as_deref() {
-        Some(bytes) => {
-            digest.update([1]);
-            digest.update((bytes.len() as u64).to_be_bytes());
-            digest.update(bytes);
-        }
-        None => digest.update([0]),
-    }
-    match plan.updated_bytes.as_deref() {
-        Some(bytes) => {
-            digest.update([1]);
-            digest.update((bytes.len() as u64).to_be_bytes());
-            digest.update(bytes);
-        }
-        None => digest.update([0]),
-    }
-}
-
-fn codex_provider_preview_digest(
-    hooks: &ProviderConfigPlan,
-    notification: &ProviderConfigPlan,
-) -> String {
-    let mut digest = Sha256::new();
-    digest.update(b"agent-session.codex-provider-repair-plan.v1\0");
-    update_plan_digest(&mut digest, b"hooks", hooks);
-    update_plan_digest(&mut digest, b"notification", notification);
-    format!("sha256:{}", hex_digest(digest.finalize()))
-}
-
-fn plan_codex_notification(
-    path: &Path,
-    action: SetupAction,
-) -> Result<CodexNotificationPlan, CliError> {
-    let original_bytes = if path.is_file() {
-        Some(
-            fs::read(path)
-                .map_err(|err| activity_io_error("provider-config-read-failed", path, err))?,
-        )
-    } else {
-        None
-    };
-    let raw = original_bytes
-        .as_ref()
-        .map(|bytes| {
-            String::from_utf8(bytes.clone()).map_err(|_| {
-                CliError::data(
-                    "provider-config-invalid",
-                    format!("{} is not valid UTF-8 TOML", path.display()),
-                    None,
-                )
-            })
-        })
-        .transpose()?
-        .unwrap_or_default();
-    let mut document = if raw.is_empty() {
-        TomlDocument::new()
-    } else {
-        parse_codex_notification_config(path, &raw)?
-    };
-    let mode = codex_notify_mode(&document);
-    let current_mode = codex_notify_mode_name(&mode).to_string();
-    let forwarded_preview = match &mode {
-        CodexNotifyMode::Composed(forwarded) | CodexNotifyMode::Foreign(forwarded)
-            if codex_forward_argv_is_safe(forwarded) =>
-        {
-            Some((forwarded.len(), codex_forward_argv_sha256(forwarded)?))
-        }
-        _ => None,
-    };
-    let mut reversible = true;
-    let mut blocker_code = None;
-    let mut apply_allowed = true;
-    let remove = action == SetupAction::Remove;
-    if remove {
-        match mode {
-            CodexNotifyMode::Owned => {
-                document.remove("notify");
-            }
-            CodexNotifyMode::Composed(forwarded) => {
-                let mut argv = TomlArray::new();
-                argv.extend(forwarded);
-                document["notify"] = toml_value(argv);
-            }
-            CodexNotifyMode::Absent | CodexNotifyMode::Foreign(_) | CodexNotifyMode::Invalid => {}
-        }
-    } else {
-        match mode {
-            CodexNotifyMode::Absent => {
-                let mut argv = TomlArray::new();
-                argv.extend(CODEX_NOTIFY_ARGV);
-                document["notify"] = toml_value(argv);
-            }
-            CodexNotifyMode::Owned | CodexNotifyMode::Composed(_) => {}
-            CodexNotifyMode::Foreign(forwarded) if codex_forward_argv_is_safe(&forwarded) => {
-                let encoded = serde_json::to_string(&forwarded).map_err(|_| {
-                    CliError::data(
-                        "provider-notification-config-invalid",
-                        "Codex user-owned notify argv could not be encoded for safe composition",
-                        Some(json!({ "path": display_path(path) })),
-                    )
-                })?;
-                if encoded.len() > MAX_CODEX_FORWARD_ARGV_BYTES {
-                    return Err(CliError::data(
-                        "provider-notification-config-conflict",
-                        "Codex user-owned notify argv expands beyond the safe composition limit; it was preserved and activity setup made no changes",
-                        Some(json!({ "path": display_path(path) })),
-                    ));
-                }
-                let mut argv = TomlArray::new();
-                argv.extend(CODEX_NOTIFY_ARGV);
-                argv.push(CODEX_NOTIFY_FORWARD_FLAG);
-                argv.push(encoded);
-                document["notify"] = toml_value(argv);
-
-                let mut restored = document.clone();
-                let mut restored_argv = TomlArray::new();
-                restored_argv.extend(forwarded);
-                restored["notify"] = toml_value(restored_argv);
-                if Some(restored.to_string().as_bytes()) != original_bytes.as_deref() {
-                    if action == SetupAction::RepairPreview {
-                        reversible = false;
-                        apply_allowed = false;
-                        blocker_code =
-                            Some("provider-notification-config-nonreversible".to_string());
-                    } else {
-                        return Err(CliError::data(
-                            "provider-notification-config-conflict",
-                            "Codex user-owned notify argv cannot be composed with byte-exact removal; it was preserved and activity setup made no changes",
-                            Some(json!({ "path": display_path(path) })),
-                        ));
-                    }
-                }
-            }
-            CodexNotifyMode::Foreign(_) | CodexNotifyMode::Invalid => {
-                return Err(CliError::data(
-                    "provider-notification-config-conflict",
-                    "Codex config has a notify command that cannot be composed safely; it was preserved and activity setup made no changes",
-                    Some(json!({ "path": display_path(path) })),
-                ));
-            }
-        }
-    }
-    let rendered = document.to_string().into_bytes();
-    let original_rendered = original_bytes.as_deref().unwrap_or_default();
-    let changed = rendered != original_rendered;
-    let candidate_mode = codex_notify_mode(&document);
-    let candidate_configured = matches!(
-        candidate_mode,
-        CodexNotifyMode::Owned | CodexNotifyMode::Composed(_)
-    );
-    let (forwarded_argc, forwarded_argv_sha256) = forwarded_preview
-        .map(|(argc, hash)| (Some(argc), Some(hash)))
-        .unwrap_or((None, None));
-    Ok(CodexNotificationPlan {
-        config: ProviderConfigPlan {
-            path: path.to_path_buf(),
-            original_bytes,
-            updated_bytes: Some(rendered),
-            changed,
-            configured: candidate_configured,
-        },
-        preview: CodexNotificationPreview {
-            current_mode,
-            candidate_mode: codex_notify_mode_name(&candidate_mode).to_string(),
-            forwarded_argc,
-            forwarded_argv_sha256,
-            reversible,
-            blocker_code,
-        },
-        apply_allowed,
-    })
-}
-
 const CODEX_HOOK_BLOCK_START: &str = "# >>> agent-session:codex-hooks >>>";
 const CODEX_HOOK_BLOCK_END: &str = "# <<< agent-session:codex-hooks <<<";
 
@@ -3823,12 +3420,6 @@ fn toml_handler_command_is_owned(event: &str, handler: &toml_edit::Table) -> boo
     toml_handler_command_matches_owned(event, handler)
         && handler.len() == 3
         && handler.get("timeout").and_then(TomlItem::as_integer) == Some(5)
-}
-
-fn toml_hook_group_has_user_metadata(group: &toml_edit::Table) -> bool {
-    group
-        .iter()
-        .any(|(key, _)| !matches!(key, "matcher" | "hooks"))
 }
 
 fn toml_has_owned_handler_metadata_conflict(document: &TomlDocument) -> bool {
@@ -3898,93 +3489,6 @@ fn toml_codex_hooks_configured(document: &TomlDocument) -> bool {
     provider_specs(AgentKind::Codex)
         .into_iter()
         .all(|spec| toml_has_spec(document, spec))
-}
-
-fn toml_codex_hooks_exactly_configured(document: &TomlDocument) -> bool {
-    let Some(hooks) = document.get("hooks").and_then(TomlItem::as_table) else {
-        return false;
-    };
-    provider_specs(AgentKind::Codex).into_iter().all(|spec| {
-        let expected = owned_command(AgentKind::Codex, Some(spec.event));
-        let Some(groups) = hooks.get(spec.event).and_then(TomlItem::as_array_of_tables) else {
-            return false;
-        };
-        let mut exact = 0_usize;
-        for group in groups.iter() {
-            let Some(handlers) = group.get("hooks").and_then(TomlItem::as_array_of_tables) else {
-                continue;
-            };
-            for handler in handlers.iter() {
-                if !toml_handler_command_matches_owned(spec.event, handler) {
-                    continue;
-                }
-                if !toml_hook_matcher_is_exact(group, spec)
-                    || toml_hook_group_has_user_metadata(group)
-                    || handlers.len() != 1
-                    || !toml_handler_command_is_owned(spec.event, handler)
-                    || handler.get("command").and_then(TomlItem::as_str) != Some(expected.as_str())
-                {
-                    return false;
-                }
-                exact += 1;
-            }
-        }
-        exact == 1
-    })
-}
-
-fn remove_owned_toml_hooks(document: &mut TomlDocument) {
-    let Some(hooks) = document.get_mut("hooks").and_then(TomlItem::as_table_mut) else {
-        return;
-    };
-    for spec in provider_specs(AgentKind::Codex) {
-        let mut remove_event = false;
-        if let Some(groups) = hooks
-            .get_mut(spec.event)
-            .and_then(TomlItem::as_array_of_tables_mut)
-        {
-            for group in groups.iter_mut() {
-                if !toml_hook_matcher_matches(group, spec) {
-                    continue;
-                }
-                if let Some(handlers) = group
-                    .get_mut("hooks")
-                    .and_then(TomlItem::as_array_of_tables_mut)
-                {
-                    handlers.retain(|handler| !toml_handler_command_is_owned(spec.event, handler));
-                }
-            }
-            groups.retain(|group| {
-                toml_hook_group_has_user_metadata(group)
-                    || group
-                        .get("hooks")
-                        .and_then(TomlItem::as_array_of_tables)
-                        .is_none_or(|handlers| !handlers.is_empty())
-            });
-            remove_event = groups.is_empty();
-        }
-        if remove_event {
-            hooks.remove(spec.event);
-        }
-    }
-    if hooks.is_empty() {
-        document.remove("hooks");
-    }
-}
-
-fn render_owned_codex_toml_hook_block() -> String {
-    let mut block = String::from(CODEX_HOOK_BLOCK_START);
-    block.push('\n');
-    for spec in provider_specs(AgentKind::Codex) {
-        let command = TomlValue::from(owned_command(AgentKind::Codex, Some(spec.event)));
-        block.push_str(&format!(
-            "[[hooks.{event}]]\n\n[[hooks.{event}.hooks]]\ntype = \"command\"\ncommand = {command}\ntimeout = 5\n\n",
-            event = spec.event,
-        ));
-    }
-    block.push_str(CODEX_HOOK_BLOCK_END);
-    block.push('\n');
-    block
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -4080,90 +3584,7 @@ impl CodexTomlHookMarkerLayout {
 #[derive(Debug)]
 struct CodexTomlHookAnalysis {
     document: TomlDocument,
-    stripped_raw: String,
     marker_layout: CodexTomlHookMarkerLayout,
-    overlaps_foreign_managed_block: bool,
-}
-
-fn codex_hook_block_overlaps_foreign_managed_block(
-    raw: &str,
-    document: &TomlDocument,
-    owned_start: usize,
-    owned_end: usize,
-    multiline_value_lines: &[usize],
-) -> bool {
-    let mut foreign_starts = Vec::new();
-    let mut foreign_ends = Vec::new();
-    let mut offset = 0_usize;
-    for line in raw.split_inclusive('\n') {
-        let start = offset;
-        offset += line.len();
-        if multiline_value_lines.binary_search(&start).is_ok() {
-            continue;
-        }
-        let without_newline = line.strip_suffix('\n').unwrap_or(line);
-        let content = without_newline
-            .strip_suffix('\r')
-            .unwrap_or(without_newline);
-        if let Some(owner) = content
-            .strip_prefix("# >>> ")
-            .and_then(|value| value.strip_suffix(" >>>"))
-            .filter(|owner| *owner != "agent-session:codex-hooks")
-        {
-            foreign_starts.push((owner, start));
-        }
-        if let Some(owner) = content
-            .strip_prefix("# <<< ")
-            .and_then(|value| value.strip_suffix(" <<<"))
-            .filter(|owner| *owner != "agent-session:codex-hooks")
-        {
-            foreign_ends.push((owner, offset));
-        }
-    }
-    let foreign_ranges = foreign_starts
-        .iter()
-        .filter_map(|(owner, start)| {
-            foreign_ends
-                .iter()
-                .find(|(end_owner, end)| end_owner == owner && *end > *start)
-                .map(|(_, end)| *start..*end)
-        })
-        .collect::<Vec<_>>();
-    if foreign_ranges.is_empty() {
-        return false;
-    }
-    let overlaps_foreign = |range: &std::ops::Range<usize>| {
-        foreign_ranges
-            .iter()
-            .any(|foreign| range.start < foreign.end && foreign.start < range.end)
-    };
-    if overlaps_foreign(&(owned_start..owned_end)) {
-        return true;
-    }
-
-    let Some(hooks) = document.get("hooks").and_then(TomlItem::as_table) else {
-        return false;
-    };
-    provider_specs(AgentKind::Codex).into_iter().any(|spec| {
-        hooks
-            .get(spec.event)
-            .and_then(TomlItem::as_array_of_tables)
-            .is_some_and(|groups| {
-                groups.iter().any(|group| {
-                    let Some(handlers) = group.get("hooks").and_then(TomlItem::as_array_of_tables)
-                    else {
-                        return false;
-                    };
-                    handlers.iter().any(|handler| {
-                        if !toml_handler_command_matches_owned(spec.event, handler) {
-                            return false;
-                        }
-                        group.span().is_none_or(|range| overlaps_foreign(&range))
-                            || handler.span().is_none_or(|range| overlaps_foreign(&range))
-                    })
-                })
-            })
-    })
 }
 
 fn analyze_codex_toml_hooks(path: &Path, raw: &str) -> Result<CodexTomlHookAnalysis, CliError> {
@@ -4189,9 +3610,7 @@ fn analyze_codex_toml_hooks(path: &Path, raw: &str) -> Result<CodexTomlHookAnaly
     if starts.is_empty() && ends.is_empty() {
         return Ok(CodexTomlHookAnalysis {
             document,
-            stripped_raw: raw.to_string(),
             marker_layout: CodexTomlHookMarkerLayout::Absent,
-            overlaps_foreign_managed_block: false,
         });
     }
     if starts.len() > 1 || ends.len() > 1 {
@@ -4201,17 +3620,7 @@ fn analyze_codex_toml_hooks(path: &Path, raw: &str) -> Result<CodexTomlHookAnaly
             Some(json!({ "path": display_path(path) })),
         ));
     }
-    let (Some(&(start_begin, start_end)), Some(&(end_begin, end_end))) =
-        (starts.first(), ends.first())
-    else {
-        let (orphan_begin, orphan_end) = starts
-            .first()
-            .or_else(|| ends.first())
-            .copied()
-            .expect("at least one marker exists");
-        let mut stripped = String::with_capacity(raw.len() - (orphan_end - orphan_begin));
-        stripped.push_str(&raw[..orphan_begin]);
-        stripped.push_str(&raw[orphan_end..]);
+    let (Some(&(start_begin, _)), Some(&(end_begin, _))) = (starts.first(), ends.first()) else {
         let marker_layout = if starts.is_empty() {
             CodexTomlHookMarkerLayout::OrphanEnd
         } else {
@@ -4219,9 +3628,7 @@ fn analyze_codex_toml_hooks(path: &Path, raw: &str) -> Result<CodexTomlHookAnaly
         };
         return Ok(CodexTomlHookAnalysis {
             document,
-            stripped_raw: stripped,
             marker_layout,
-            overlaps_foreign_managed_block: false,
         });
     };
     if end_begin < start_begin {
@@ -4231,94 +3638,10 @@ fn analyze_codex_toml_hooks(path: &Path, raw: &str) -> Result<CodexTomlHookAnaly
             Some(json!({ "path": display_path(path) })),
         ));
     }
-    if raw[start_begin..end_end] == render_owned_codex_toml_hook_block() {
-        let mut stripped = String::with_capacity(raw.len() - (end_end - start_begin));
-        stripped.push_str(&raw[..start_begin]);
-        stripped.push_str(&raw[end_end..]);
-        let overlaps_foreign_managed_block = codex_hook_block_overlaps_foreign_managed_block(
-            raw,
-            &document,
-            start_begin,
-            end_end,
-            &multiline_value_lines,
-        );
-        return Ok(CodexTomlHookAnalysis {
-            document,
-            stripped_raw: stripped,
-            marker_layout: CodexTomlHookMarkerLayout::Complete,
-            overlaps_foreign_managed_block,
-        });
-    }
-    let mut stripped =
-        String::with_capacity(raw.len() - (start_end - start_begin) - (end_end - end_begin));
-    stripped.push_str(&raw[..start_begin]);
-    stripped.push_str(&raw[start_end..end_begin]);
-    stripped.push_str(&raw[end_end..]);
-    let overlaps_foreign_managed_block = codex_hook_block_overlaps_foreign_managed_block(
-        raw,
-        &document,
-        start_begin,
-        end_end,
-        &multiline_value_lines,
-    );
     Ok(CodexTomlHookAnalysis {
         document,
-        stripped_raw: stripped,
         marker_layout: CodexTomlHookMarkerLayout::Complete,
-        overlaps_foreign_managed_block,
     })
-}
-
-fn plan_inline_codex_hooks(
-    notification: &mut CodexNotificationPlan,
-    action: SetupAction,
-) -> Result<bool, CliError> {
-    let candidate = notification
-        .config
-        .updated_bytes
-        .as_deref()
-        .expect("notification config always has a rendered candidate");
-    let raw = String::from_utf8(candidate.to_vec()).map_err(|_| {
-        CliError::data(
-            "provider-config-invalid",
-            format!(
-                "{} is not valid UTF-8 TOML",
-                notification.config.path.display()
-            ),
-            None,
-        )
-    })?;
-    let analysis = analyze_codex_toml_hooks(&notification.config.path, &raw)?;
-    if action != SetupAction::Remove
-        && analysis.marker_layout == CodexTomlHookMarkerLayout::Complete
-        && analysis.stripped_raw != raw
-        && !analysis.overlaps_foreign_managed_block
-        && toml_codex_hooks_exactly_configured(&analysis.document)
-    {
-        return Ok(true);
-    }
-    let mut document =
-        parse_codex_notification_config(&notification.config.path, &analysis.stripped_raw)?;
-    remove_owned_toml_hooks(&mut document);
-    let mut rendered = document.to_string();
-    if action != SetupAction::Remove {
-        if !rendered.is_empty() && !rendered.ends_with('\n') {
-            rendered.push('\n');
-        }
-        if !rendered.is_empty() && !rendered.ends_with("\n\n") {
-            rendered.push('\n');
-        }
-        rendered.push_str(&render_owned_codex_toml_hook_block());
-    }
-    let rendered_bytes = rendered.into_bytes();
-    notification.config.changed =
-        notification.config.original_bytes.as_deref() != Some(rendered_bytes.as_slice());
-    notification.config.updated_bytes = Some(rendered_bytes.clone());
-    let candidate_document = parse_codex_notification_config(
-        &notification.config.path,
-        std::str::from_utf8(&rendered_bytes).expect("rendered TOML is UTF-8"),
-    )?;
-    Ok(action != SetupAction::Remove && toml_codex_hooks_configured(&candidate_document))
 }
 
 fn json_handler_is_owned_for_group(event: &str, group: &Value, handler: &Value) -> bool {
@@ -4427,29 +3750,6 @@ fn json_has_non_owned_lifecycle_hooks(value: &Value) -> bool {
         })
 }
 
-fn plan_codex_json_cleanup(
-    path: &Path,
-    original_bytes: Option<Vec<u8>>,
-) -> Result<ProviderConfigPlan, CliError> {
-    let mut plan = plan_json_provider_from_original(
-        AgentKind::Codex,
-        path,
-        SetupAction::Remove,
-        original_bytes,
-    )?;
-    let candidate = plan
-        .updated_bytes
-        .as_deref()
-        .and_then(|bytes| serde_json::from_slice::<Value>(bytes).ok())
-        .expect("JSON provider plan always renders an object");
-    if candidate.as_object().is_some_and(Map::is_empty) {
-        plan.changed = plan.original_bytes.is_some();
-        plan.updated_bytes = None;
-    }
-    plan.configured = true;
-    Ok(plan)
-}
-
 fn codex_hook_status_from_analysis(
     json: &Value,
     config: &CodexTomlHookAnalysis,
@@ -4499,515 +3799,6 @@ fn codex_hook_status(json_path: &Path, config_path: &Path) -> Result<CodexHookSt
         .unwrap_or_default();
     let config = analyze_codex_toml_hooks(config_path, &config_raw)?;
     Ok(codex_hook_status_from_analysis(&json, &config))
-}
-
-fn setup_codex_provider(
-    hooks_path: &Path,
-    notification_path: &Path,
-    action: SetupAction,
-    expected_preview_digest: Option<&str>,
-) -> Result<ProviderSetupOutcome, CliError> {
-    // Parse and render both files before either can change. This makes invalid
-    // or conflicting notification configuration a preflight failure for apply,
-    // repair, and remove alike.
-    let mut notification = plan_codex_notification(notification_path, action)?;
-    let json_original = read_optional_provider_config(hooks_path)?;
-    let json = parse_json_provider_config(hooks_path, json_original.as_deref())?;
-    let config_raw = notification
-        .config
-        .original_bytes
-        .as_deref()
-        .map(|bytes| {
-            std::str::from_utf8(bytes).map_err(|_| {
-                CliError::data(
-                    "provider-config-invalid",
-                    format!("{} is not valid UTF-8 TOML", notification_path.display()),
-                    None,
-                )
-            })
-        })
-        .transpose()?
-        .unwrap_or_default();
-    let config = analyze_codex_toml_hooks(notification_path, config_raw)?;
-    let status = codex_hook_status_from_analysis(&json, &config);
-    if status.conflict && action != SetupAction::Remove {
-        return Err(CliError::data(
-            "provider-hook-representation-conflict",
-            "Codex has non-agent-session lifecycle hooks in both hooks.json and config.toml; no files were changed because moving user-owned hooks requires a manual representation decision",
-            Some(json!({
-                "hooks_path": display_path(hooks_path),
-                "config_path": display_path(notification_path),
-                "next": "converge user-owned lifecycle hooks onto one Codex representation, then review a fresh repair preview"
-            })),
-        ));
-    }
-    if status.ownership_conflict && action != SetupAction::Remove {
-        return Err(CliError::data(
-            "provider-hook-ownership-conflict",
-            "Codex has an agent-session command handler with user-owned fields; no files were changed because replacing those fields would change user configuration",
-            Some(json!({
-                "hooks_path": display_path(hooks_path),
-                "config_path": display_path(notification_path),
-                "next": "remove or rename the user-owned handler fields, then review a fresh repair preview"
-            })),
-        ));
-    }
-    let migration = if status.migration_required && action != SetupAction::Remove {
-        "json_to_inline_toml"
-    } else {
-        "not_needed"
-    };
-    let (hooks, hooks_configured, hook_config_path) = match status.representation {
-        CodexHookRepresentation::Json => {
-            let hooks = plan_json_provider_from_original(
-                AgentKind::Codex,
-                hooks_path,
-                action,
-                json_original,
-            )?;
-            let configured = hooks.configured;
-            (hooks, configured, hooks_path.to_path_buf())
-        }
-        CodexHookRepresentation::InlineToml => {
-            let hooks = plan_codex_json_cleanup(hooks_path, json_original)?;
-            let configured = plan_inline_codex_hooks(&mut notification, action)?;
-            (hooks, configured, notification_path.to_path_buf())
-        }
-    };
-    let plan_digest = codex_provider_preview_digest(&hooks, &notification.config);
-    let changed = hooks.changed || notification.config.changed;
-    let configured =
-        hooks_configured && notification.config.configured && notification.apply_allowed;
-    let preview = (action == SetupAction::RepairPreview).then(|| notification.preview.clone());
-    if matches!(action, SetupAction::DryRun | SetupAction::RepairPreview) {
-        return Ok(ProviderSetupOutcome {
-            would_change: changed,
-            would_configure: configured,
-            apply_allowed: notification.apply_allowed,
-            notification_preview: preview,
-            preview_digest: (action == SetupAction::RepairPreview).then_some(plan_digest),
-            hook_config_path: Some(hook_config_path),
-            hook_representation: Some(status.representation.as_str().to_string()),
-            hook_migration: Some(migration.to_string()),
-            representation_conflict: Some(status.conflict),
-        });
-    }
-    if action == SetupAction::Repair && expected_preview_digest != Some(plan_digest.as_str()) {
-        return Err(CliError::data(
-            "provider-config-preview-digest-mismatch",
-            "provider configuration changed after preview; review a fresh repair preview before retrying",
-            None,
-        ));
-    }
-
-    apply_codex_provider_plans(&hooks, &notification.config)?;
-    Ok(ProviderSetupOutcome {
-        would_change: changed,
-        would_configure: configured,
-        apply_allowed: true,
-        notification_preview: None,
-        preview_digest: None,
-        hook_config_path: Some(hook_config_path),
-        hook_representation: Some(status.representation.as_str().to_string()),
-        hook_migration: Some(migration.to_string()),
-        representation_conflict: Some(status.conflict),
-    })
-}
-
-fn apply_codex_provider_plans(
-    hooks: &ProviderConfigPlan,
-    notification: &ProviderConfigPlan,
-) -> Result<(), CliError> {
-    apply_codex_provider_plans_with_rollback(hooks, notification, rollback_provider_config_plan)
-}
-
-fn apply_codex_provider_plans_with_rollback(
-    hooks: &ProviderConfigPlan,
-    notification: &ProviderConfigPlan,
-    rollback: impl FnOnce(&ProviderConfigPlan) -> Result<(), CliError>,
-) -> Result<(), CliError> {
-    apply_provider_config_plan(hooks)?;
-    if let Err(apply_error) = apply_provider_config_plan(notification) {
-        if hooks.changed
-            && let Err(rollback_error) = rollback(hooks)
-        {
-            return Err(CliError::runtime(
-                "provider-config-rollback-failed",
-                "Codex lifecycle setup could not apply both configuration files and could not restore the first file; inspect both paths before retrying",
-                Some(json!({
-                    "apply_error": apply_error.code(),
-                    "rollback_error": rollback_error.code(),
-                    "rollback_error_details": rollback_error.0.details.clone(),
-                    "config_path": display_path(&hooks.path),
-                    "notification_config_path": display_path(&notification.path)
-                })),
-            ));
-        }
-        return Err(apply_error);
-    }
-    Ok(())
-}
-
-fn apply_provider_config_plan(plan: &ProviderConfigPlan) -> Result<(), CliError> {
-    if !plan.changed {
-        let current = match fs::read(&plan.path) {
-            Ok(bytes) => Some(bytes),
-            Err(err) if err.kind() == io::ErrorKind::NotFound => None,
-            Err(err) => {
-                return Err(activity_io_error(
-                    "provider-config-read-failed",
-                    &plan.path,
-                    err,
-                ));
-            }
-        };
-        if current != plan.original_bytes {
-            return Err(CliError::runtime(
-                "provider-config-concurrent-modification",
-                "provider config changed while activity setup was preparing an update; retry after reviewing the newer file",
-                Some(json!({ "path": display_path(&plan.path) })),
-            ));
-        }
-        return Ok(());
-    }
-    match plan.updated_bytes.as_deref() {
-        Some(updated) => {
-            write_provider_config_if_unchanged(&plan.path, updated, plan.original_bytes.as_deref())
-        }
-        None => remove_provider_config_if_unchanged(&plan.path, plan.original_bytes.as_deref()),
-    }
-}
-
-fn rollback_provider_config_plan(plan: &ProviderConfigPlan) -> Result<(), CliError> {
-    rollback_provider_config_plan_after_capture(plan, || {})
-}
-
-fn rollback_provider_config_plan_after_capture(
-    plan: &ProviderConfigPlan,
-    after_capture: impl FnOnce(),
-) -> Result<(), CliError> {
-    rollback_provider_config_plan_after_capture_with_restore(
-        plan,
-        after_capture,
-        restore_provider_config_if_absent,
-    )
-}
-
-fn rollback_provider_config_plan_after_capture_with_restore(
-    plan: &ProviderConfigPlan,
-    after_capture: impl FnOnce(),
-    restore: impl FnOnce(&Path, &[u8], &str) -> Result<(), CliError>,
-) -> Result<(), CliError> {
-    if !plan.changed {
-        return Ok(());
-    }
-    let mut after_capture = Some(after_capture);
-    let mut restore = Some(restore);
-    match plan.updated_bytes.as_deref() {
-        Some(updated) => {
-            let (quarantine, captured) =
-                quarantine_provider_config(&plan.path, "rollback-capture")?;
-            after_capture.take().expect("single rollback hook")();
-            if captured != updated {
-                restore_quarantined_provider_config(&plan.path, &quarantine)?;
-                return Err(provider_config_concurrent_error(
-                    "provider-config-rollback-concurrent-modification",
-                    "provider config changed after activity setup wrote it; refusing to overwrite the newer file during rollback",
-                    &plan.path,
-                ));
-            }
-            let restore_result = match plan.original_bytes.as_deref() {
-                Some(original) => restore.take().expect("single restore hook")(
-                    &plan.path,
-                    original,
-                    "rollback-restore",
-                ),
-                None if provider_config_path_exists(&plan.path)? => {
-                    Err(provider_config_concurrent_error(
-                        "provider-config-rollback-concurrent-modification",
-                        "provider config changed while activity setup was rolling back; the newer file was preserved",
-                        &plan.path,
-                    ))
-                }
-                None => Ok(()),
-            };
-            match restore_result {
-                Ok(()) => fs::remove_file(&quarantine).map_err(|err| {
-                    activity_io_error("provider-config-rollback-remove-failed", &quarantine, err)
-                }),
-                Err(error) => Err(provider_config_recovery_error(
-                    error,
-                    &plan.path,
-                    "captured_candidate",
-                    &quarantine,
-                )),
-            }
-        }
-        None => {
-            after_capture.take().expect("single rollback hook")();
-            let Some(original) = plan.original_bytes.as_deref() else {
-                return Ok(());
-            };
-            restore.take().expect("single restore hook")(&plan.path, original, "rollback-restore")
-        }
-    }
-}
-
-fn provider_config_recovery_error(
-    mut error: CliError,
-    path: &Path,
-    role: &str,
-    recovery_path: &Path,
-) -> CliError {
-    let mut details = match error.0.details.take() {
-        Some(Value::Object(details)) => details,
-        Some(details) => {
-            let mut wrapped = Map::new();
-            wrapped.insert("upstream_details".to_string(), details);
-            wrapped
-        }
-        None => Map::new(),
-    };
-    details.insert("path".to_string(), json!(display_path(path)));
-    let recovery_paths = details
-        .entry("recovery_paths".to_string())
-        .or_insert_with(|| Value::Array(Vec::new()));
-    if !recovery_paths.is_array() {
-        *recovery_paths = Value::Array(Vec::new());
-    }
-    let recovery_paths = recovery_paths
-        .as_array_mut()
-        .expect("recovery_paths was normalized to an array");
-    let recovery = json!({
-        "role": role,
-        "path": display_path(recovery_path)
-    });
-    if !recovery_paths.contains(&recovery) {
-        recovery_paths.push(recovery);
-    }
-    error.0.details = Some(Value::Object(details));
-    error.0.message.push_str(&format!(
-        "; {role} recovery bytes were preserved at {}",
-        recovery_path.display(),
-    ));
-    error
-}
-
-fn remove_provider_config_if_unchanged(
-    path: &Path,
-    expected: Option<&[u8]>,
-) -> Result<(), CliError> {
-    remove_provider_config_if_unchanged_after_capture(path, expected, || {})
-}
-
-fn remove_provider_config_if_unchanged_after_capture(
-    path: &Path,
-    expected: Option<&[u8]>,
-    after_capture: impl FnOnce(),
-) -> Result<(), CliError> {
-    let Some(expected) = expected else {
-        return if provider_config_path_exists(path)? {
-            Err(provider_config_concurrent_error(
-                "provider-config-concurrent-modification",
-                "provider config appeared while activity setup was preparing its deletion; the newer file was preserved",
-                path,
-            ))
-        } else {
-            Ok(())
-        };
-    };
-    let (quarantine, captured) = quarantine_provider_config(path, "delete-capture")?;
-    after_capture();
-    if captured != expected {
-        restore_quarantined_provider_config(path, &quarantine)?;
-        return Err(provider_config_concurrent_error(
-            "provider-config-concurrent-modification",
-            "provider config changed while activity setup was preparing an update; retry after reviewing the newer file",
-            path,
-        ));
-    }
-    if provider_config_path_exists(path)? {
-        fs::remove_file(&quarantine)
-            .map_err(|err| activity_io_error("provider-config-remove-failed", &quarantine, err))?;
-        return Err(provider_config_concurrent_error(
-            "provider-config-concurrent-modification",
-            "provider config was replaced while activity setup was deleting the reviewed file; the replacement was preserved",
-            path,
-        ));
-    }
-    fs::remove_file(&quarantine)
-        .map_err(|err| activity_io_error("provider-config-remove-failed", &quarantine, err))
-}
-
-fn provider_config_concurrent_error(code: &str, message: &str, path: &Path) -> CliError {
-    CliError::runtime(code, message, Some(json!({ "path": display_path(path) })))
-}
-
-fn provider_config_path_exists(path: &Path) -> Result<bool, CliError> {
-    match fs::symlink_metadata(path) {
-        Ok(_) => Ok(true),
-        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(false),
-        Err(err) => Err(activity_io_error("provider-config-read-failed", path, err)),
-    }
-}
-
-fn reserve_provider_config_temp(
-    path: &Path,
-    purpose: &str,
-) -> Result<(PathBuf, fs::File), CliError> {
-    let parent = path.parent().ok_or_else(|| {
-        CliError::runtime(
-            "provider-config-temp-failed",
-            "provider config path has no parent directory for a transactional update",
-            Some(json!({ "path": display_path(path) })),
-        )
-    })?;
-    let name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("provider-config");
-    for _ in 0..8 {
-        let candidate = parent.join(format!(
-            ".{name}.agent-session-{purpose}-{}",
-            uuid::Uuid::new_v4()
-        ));
-        match OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(SECRET_FILE_MODE)
-            .open(&candidate)
-        {
-            Ok(file) => return Ok((candidate, file)),
-            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => continue,
-            Err(err) => {
-                return Err(activity_io_error(
-                    "provider-config-temp-failed",
-                    &candidate,
-                    err,
-                ));
-            }
-        }
-    }
-    Err(CliError::runtime(
-        "provider-config-temp-failed",
-        "could not reserve a unique same-directory provider config transaction file",
-        Some(json!({ "path": display_path(path) })),
-    ))
-}
-
-fn quarantine_provider_config(path: &Path, purpose: &str) -> Result<(PathBuf, Vec<u8>), CliError> {
-    let (quarantine, reservation) = reserve_provider_config_temp(path, purpose)?;
-    drop(reservation);
-    if let Err(err) = fs::rename(path, &quarantine) {
-        let _ = fs::remove_file(&quarantine);
-        return Err(if err.kind() == io::ErrorKind::NotFound {
-            provider_config_concurrent_error(
-                "provider-config-concurrent-modification",
-                "provider config disappeared during a transactional update",
-                path,
-            )
-        } else {
-            activity_io_error("provider-config-quarantine-failed", path, err)
-        });
-    }
-    match fs::read(&quarantine) {
-        Ok(bytes) => Ok((quarantine, bytes)),
-        Err(err) => {
-            let _ = restore_quarantined_provider_config(path, &quarantine);
-            Err(activity_io_error(
-                "provider-config-quarantine-read-failed",
-                &quarantine,
-                err,
-            ))
-        }
-    }
-}
-
-fn restore_quarantined_provider_config(path: &Path, quarantine: &Path) -> Result<(), CliError> {
-    restore_quarantined_provider_config_with_link(path, quarantine, |source, target| {
-        fs::hard_link(source, target)
-    })
-}
-
-fn restore_quarantined_provider_config_with_link(
-    path: &Path,
-    quarantine: &Path,
-    link: impl FnOnce(&Path, &Path) -> io::Result<()>,
-) -> Result<(), CliError> {
-    match link(quarantine, path) {
-        Ok(()) => fs::remove_file(quarantine).map_err(|err| {
-            activity_io_error("provider-config-quarantine-remove-failed", quarantine, err)
-        }),
-        Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {
-            Err(provider_config_recovery_error(
-                CliError::runtime(
-                    "provider-config-rollback-concurrent-modification",
-                    "provider config changed during transactional recovery; the newer path and captured file were both preserved",
-                    Some(json!({ "path": display_path(path) })),
-                ),
-                path,
-                "captured_config",
-                quarantine,
-            ))
-        }
-        Err(err) => Err(provider_config_recovery_error(
-            activity_io_error("provider-config-quarantine-restore-failed", path, err),
-            path,
-            "captured_config",
-            quarantine,
-        )),
-    }
-}
-
-fn restore_provider_config_if_absent(
-    path: &Path,
-    bytes: &[u8],
-    purpose: &str,
-) -> Result<(), CliError> {
-    restore_provider_config_if_absent_with_link(path, bytes, purpose, |source, target| {
-        fs::hard_link(source, target)
-    })
-}
-
-fn restore_provider_config_if_absent_with_link(
-    path: &Path,
-    bytes: &[u8],
-    purpose: &str,
-    link: impl FnOnce(&Path, &Path) -> io::Result<()>,
-) -> Result<(), CliError> {
-    let (temporary, mut file) = reserve_provider_config_temp(path, purpose)?;
-    let staged = file
-        .write_all(bytes)
-        .and_then(|()| file.sync_all())
-        .map_err(|err| activity_io_error("provider-config-rollback-write-failed", &temporary, err));
-    drop(file);
-    if let Err(err) = staged {
-        let _ = fs::remove_file(&temporary);
-        return Err(err);
-    }
-    match link(&temporary, path) {
-        Ok(()) => fs::remove_file(&temporary).map_err(|err| {
-            activity_io_error("provider-config-rollback-remove-failed", &temporary, err)
-        }),
-        Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {
-            Err(provider_config_recovery_error(
-                provider_config_concurrent_error(
-                    "provider-config-rollback-concurrent-modification",
-                    "provider config changed during rollback; the newer file was preserved",
-                    path,
-                ),
-                path,
-                "staged_original",
-                &temporary,
-            ))
-        }
-        Err(err) => Err(provider_config_recovery_error(
-            activity_io_error("provider-config-rollback-write-failed", path, err),
-            path,
-            "staged_original",
-            &temporary,
-        )),
-    }
 }
 
 fn json_provider_configured(agent: AgentKind, path: &Path) -> Result<bool, CliError> {
@@ -5159,27 +3950,6 @@ fn codex_permission_reporter_command(command: &str) -> bool {
         .any(|words| words == ["agent-session", "activity", "hook"])
 }
 
-fn setup_json_provider(
-    agent: AgentKind,
-    path: &Path,
-    action: SetupAction,
-) -> Result<(bool, bool), CliError> {
-    let plan = plan_json_provider(agent, path, action)?;
-    if !matches!(action, SetupAction::DryRun | SetupAction::RepairPreview) {
-        apply_provider_config_plan(&plan)?;
-    }
-    Ok((plan.changed, plan.configured))
-}
-
-fn plan_json_provider(
-    agent: AgentKind,
-    path: &Path,
-    action: SetupAction,
-) -> Result<ProviderConfigPlan, CliError> {
-    let original_bytes = read_optional_provider_config(path)?;
-    plan_json_provider_from_original(agent, path, action, original_bytes)
-}
-
 fn read_optional_provider_config(path: &Path) -> Result<Option<Vec<u8>>, CliError> {
     match fs::read(path) {
         Ok(bytes) => Ok(Some(bytes)),
@@ -5213,44 +3983,6 @@ fn parse_json_provider_config(
     Ok(original)
 }
 
-fn plan_json_provider_from_original(
-    agent: AgentKind,
-    path: &Path,
-    action: SetupAction,
-    original_bytes: Option<Vec<u8>>,
-) -> Result<ProviderConfigPlan, CliError> {
-    let original = parse_json_provider_config(path, original_bytes.as_deref())?;
-    let mut updated = original.clone();
-    let remove = action == SetupAction::Remove;
-    for spec in retired_provider_specs(agent) {
-        remove_retired_json_spec(&mut updated, agent, spec)?;
-    }
-    for spec in provider_specs(agent) {
-        mutate_json_spec(&mut updated, agent, spec, remove)?;
-    }
-    let changed = updated != original;
-    let updated_bytes = serde_json::to_vec_pretty(&updated).map_err(|err| {
-        CliError::runtime(
-            "provider-config-render-failed",
-            format!("failed to render provider config: {err}"),
-            None,
-        )
-    })?;
-    let configured = provider_specs(agent)
-        .iter()
-        .all(|spec| json_has_spec(&updated, agent, *spec))
-        && retired_provider_specs(agent)
-            .iter()
-            .all(|spec| !json_has_spec(&updated, agent, *spec));
-    Ok(ProviderConfigPlan {
-        path: path.to_path_buf(),
-        original_bytes,
-        updated_bytes: Some(updated_bytes),
-        changed,
-        configured,
-    })
-}
-
 fn json_has_spec(value: &Value, agent: AgentKind, spec: ProviderSpec) -> bool {
     value
         .get("hooks")
@@ -5272,136 +4004,6 @@ fn json_has_spec(value: &Value, agent: AgentKind, spec: ProviderSpec) -> bool {
                         })
             })
         })
-}
-
-fn mutate_json_spec(
-    root: &mut Value,
-    agent: AgentKind,
-    spec: ProviderSpec,
-    remove: bool,
-) -> Result<(), CliError> {
-    let root = root.as_object_mut().expect("validated object");
-    let hooks = root
-        .entry("hooks")
-        .or_insert_with(|| Value::Object(Map::new()));
-    let Some(hooks) = hooks.as_object_mut() else {
-        return Err(CliError::data(
-            "provider-config-invalid",
-            "provider hooks must be an object",
-            None,
-        ));
-    };
-    let groups = hooks
-        .entry(spec.event)
-        .or_insert_with(|| Value::Array(Vec::new()));
-    let Some(groups) = groups.as_array_mut() else {
-        return Err(CliError::data(
-            "provider-config-invalid",
-            format!("provider hook event {} must be an array", spec.event),
-            None,
-        ));
-    };
-    let command = owned_command(agent, Some(spec.event));
-    let legacy_command = owned_command(agent, None);
-    for group in groups.iter_mut() {
-        if group.get("matcher").and_then(Value::as_str) != spec.matcher {
-            continue;
-        }
-        if let Some(handlers) = group.get_mut("hooks").and_then(Value::as_array_mut) {
-            handlers.retain(|handler| {
-                let command_matches =
-                    handler.get("type").and_then(Value::as_str) == Some("command")
-                        && handler.get("command").and_then(Value::as_str).is_some_and(
-                            |candidate| candidate == command || candidate == legacy_command,
-                        );
-                let owned = if agent == AgentKind::Codex {
-                    json_codex_handler_is_owned(spec.event, handler)
-                } else {
-                    command_matches
-                };
-                !owned
-            });
-        }
-    }
-    groups.retain(|group| {
-        json_hook_group_has_user_metadata(group)
-            || group
-                .get("hooks")
-                .and_then(Value::as_array)
-                .is_none_or(|handlers| !handlers.is_empty())
-    });
-    if !remove {
-        let mut group = Map::new();
-        if let Some(matcher) = spec.matcher {
-            group.insert("matcher".to_string(), Value::String(matcher.to_string()));
-        }
-        group.insert(
-            "hooks".to_string(),
-            json!([{ "type": "command", "command": command, "timeout": 5 }]),
-        );
-        groups.push(Value::Object(group));
-    }
-    if groups.is_empty() {
-        hooks.remove(spec.event);
-    }
-    if hooks.is_empty() {
-        root.remove("hooks");
-    }
-    Ok(())
-}
-
-fn remove_retired_json_spec(
-    root: &mut Value,
-    agent: AgentKind,
-    spec: ProviderSpec,
-) -> Result<(), CliError> {
-    let root = root.as_object_mut().expect("validated object");
-    let Some(hooks) = root.get_mut("hooks") else {
-        return Ok(());
-    };
-    let Some(hooks) = hooks.as_object_mut() else {
-        return Err(CliError::data(
-            "provider-config-invalid",
-            "provider hooks must be an object",
-            None,
-        ));
-    };
-    let Some(groups) = hooks.get_mut(spec.event) else {
-        return Ok(());
-    };
-    let Some(groups) = groups.as_array_mut() else {
-        return Err(CliError::data(
-            "provider-config-invalid",
-            format!("provider hook event {} must be an array", spec.event),
-            None,
-        ));
-    };
-    let command = owned_command(agent, Some(spec.event));
-    for group in groups.iter_mut() {
-        if group.get("matcher").and_then(Value::as_str) != spec.matcher {
-            continue;
-        }
-        if let Some(handlers) = group.get_mut("hooks").and_then(Value::as_array_mut) {
-            handlers.retain(|handler| {
-                !(handler.get("type").and_then(Value::as_str) == Some("command")
-                    && handler.get("command").and_then(Value::as_str) == Some(command.as_str())
-                    && handler.get("timeout").and_then(Value::as_u64) == Some(5))
-            });
-        }
-    }
-    groups.retain(|group| {
-        group
-            .get("hooks")
-            .and_then(Value::as_array)
-            .is_none_or(|handlers| !handlers.is_empty())
-    });
-    if groups.is_empty() {
-        hooks.remove(spec.event);
-    }
-    if hooks.is_empty() {
-        root.remove("hooks");
-    }
-    Ok(())
 }
 
 fn hermes_configured(path: &Path) -> Result<bool, CliError> {
@@ -5444,143 +4046,6 @@ fn yaml_has_spec(value: &serde_yaml_ng::Value, spec: ProviderSpec) -> bool {
         })
 }
 
-fn setup_hermes(path: &Path, action: SetupAction) -> Result<(bool, bool), CliError> {
-    let original_bytes = if path.is_file() {
-        Some(
-            fs::read(path)
-                .map_err(|err| activity_io_error("provider-config-read-failed", path, err))?,
-        )
-    } else {
-        None
-    };
-    let original = if let Some(bytes) = original_bytes.as_deref() {
-        serde_yaml_ng::from_slice::<serde_yaml_ng::Value>(bytes).map_err(|err| {
-            CliError::data(
-                "provider-config-invalid",
-                format!("failed to parse {}: {err}", path.display()),
-                None,
-            )
-        })?
-    } else {
-        serde_yaml_ng::Value::Mapping(Default::default())
-    };
-    let mut updated = original.clone();
-    let Some(root) = updated.as_mapping_mut() else {
-        return Err(CliError::data(
-            "provider-config-invalid",
-            "Hermes config root must be a mapping",
-            None,
-        ));
-    };
-    let hooks_key = serde_yaml_ng::Value::String("hooks".to_string());
-    if !root.contains_key(&hooks_key) {
-        root.insert(
-            hooks_key.clone(),
-            serde_yaml_ng::Value::Mapping(Default::default()),
-        );
-    }
-    let hooks = root
-        .get_mut(&hooks_key)
-        .and_then(serde_yaml_ng::Value::as_mapping_mut)
-        .ok_or_else(|| {
-            CliError::data(
-                "provider-config-invalid",
-                "Hermes hooks must be a mapping",
-                None,
-            )
-        })?;
-    let remove = action == SetupAction::Remove;
-    for spec in provider_specs(AgentKind::Hermes) {
-        let key = serde_yaml_ng::Value::String(spec.event.to_string());
-        if !hooks.contains_key(&key) {
-            hooks.insert(key.clone(), serde_yaml_ng::Value::Sequence(Vec::new()));
-        }
-        let handlers = hooks
-            .get_mut(&key)
-            .and_then(serde_yaml_ng::Value::as_sequence_mut)
-            .ok_or_else(|| {
-                CliError::data(
-                    "provider-config-invalid",
-                    format!("Hermes hook {} must be a sequence", spec.event),
-                    None,
-                )
-            })?;
-        let command = owned_command(AgentKind::Hermes, Some(spec.event));
-        handlers.retain(|handler| {
-            handler
-                .get("command")
-                .and_then(serde_yaml_ng::Value::as_str)
-                != Some(command.as_str())
-        });
-        if !remove {
-            let mut handler = serde_yaml_ng::Mapping::new();
-            handler.insert(
-                serde_yaml_ng::Value::String("command".to_string()),
-                serde_yaml_ng::Value::String(command),
-            );
-            handler.insert(
-                serde_yaml_ng::Value::String("timeout".to_string()),
-                serde_yaml_ng::Value::Number(5.into()),
-            );
-            handlers.push(serde_yaml_ng::Value::Mapping(handler));
-        }
-        if handlers.is_empty() {
-            hooks.remove(&key);
-        }
-    }
-    if hooks.is_empty() {
-        root.remove(&hooks_key);
-    }
-    let changed = updated != original;
-    if changed && !matches!(action, SetupAction::DryRun | SetupAction::RepairPreview) {
-        let rendered = serde_yaml_ng::to_string(&updated).map_err(|err| {
-            CliError::runtime(
-                "provider-config-render-failed",
-                format!("failed to render Hermes config: {err}"),
-                None,
-            )
-        })?;
-        write_provider_config_if_unchanged(path, rendered.as_bytes(), original_bytes.as_deref())?;
-    }
-    let configured = provider_specs(AgentKind::Hermes)
-        .iter()
-        .all(|spec| yaml_has_spec(&updated, *spec));
-    Ok((changed, configured))
-}
-
-fn write_provider_config_if_unchanged(
-    path: &Path,
-    bytes: &[u8],
-    expected_original: Option<&[u8]>,
-) -> Result<(), CliError> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .map_err(|err| activity_io_error("provider-config-dir-failed", parent, err))?;
-        fs::set_permissions(parent, fs::Permissions::from_mode(0o700)).map_err(|err| {
-            activity_io_error("provider-config-dir-permission-failed", parent, err)
-        })?;
-    }
-    let current = match fs::read(path) {
-        Ok(bytes) => Some(bytes),
-        Err(err) if err.kind() == io::ErrorKind::NotFound => None,
-        Err(err) => return Err(activity_io_error("provider-config-read-failed", path, err)),
-    };
-    if current.as_deref() != expected_original {
-        return Err(CliError::runtime(
-            "provider-config-concurrent-modification",
-            "provider config changed while activity setup was preparing an update; retry after reviewing the newer file",
-            Some(json!({ "path": display_path(path) })),
-        ));
-    }
-    write_atomic(path, bytes, SECRET_FILE_MODE).map_err(|err| {
-        CliError::runtime(
-            "provider-config-write-failed",
-            format!("failed to write provider config {}: {err}", path.display()),
-            Some(json!({ "path": display_path(path) })),
-        )
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5588,20 +4053,6 @@ mod tests {
     use pretty_assertions::assert_eq;
     use std::collections::BTreeMap;
     use std::sync::{Arc, Barrier};
-
-    fn recovery_path_for_role(details: &Value, role: &str) -> PathBuf {
-        let recovery_paths = details["recovery_paths"]
-            .as_array()
-            .expect("recovery paths");
-        PathBuf::from(
-            recovery_paths
-                .iter()
-                .find(|recovery| recovery["role"] == role)
-                .unwrap_or_else(|| panic!("missing {role} recovery"))["path"]
-                .as_str()
-                .expect("recovery path"),
-        )
-    }
 
     fn event(kind: TurnEventKind, event_id: &str) -> TurnEvent {
         TurnEvent {
@@ -7179,17 +5630,6 @@ mod tests {
     }
 
     #[test]
-    fn provider_config_write_rejects_a_changed_source() {
-        let tmp = tempfile::TempDir::new().expect("tempdir");
-        let path = tmp.path().join("settings.json");
-        fs::write(&path, b"newer").expect("concurrent provider config");
-        let error = write_provider_config_if_unchanged(&path, b"owned", Some(b"older"))
-            .expect_err("stale update must fail");
-        assert_eq!(error.code(), "provider-config-concurrent-modification");
-        assert_eq!(fs::read(&path).expect("preserved config"), b"newer");
-    }
-
-    #[test]
     fn provider_version_parser_handles_audited_cli_formats() {
         assert_eq!(
             parse_version_triplet("codex-cli 0.144.1"),
@@ -7847,183 +6287,6 @@ mod tests {
     }
 
     #[test]
-    fn codex_provider_plans_rollback_when_the_second_file_changes() {
-        let tmp = tempfile::TempDir::new().expect("tempdir");
-        let hooks_path = tmp.path().join("hooks.json");
-        let notification_path = tmp.path().join("config.toml");
-        let hooks = plan_json_provider(AgentKind::Codex, &hooks_path, SetupAction::Apply)
-            .expect("hooks plan");
-        let notification = plan_codex_notification(&notification_path, SetupAction::Apply)
-            .expect("notification plan");
-
-        let concurrent = b"notify = [\"user-notifier\"]\n";
-        fs::write(&notification_path, concurrent).expect("concurrent notification config");
-        let error = apply_codex_provider_plans(&hooks, &notification.config)
-            .expect_err("second-file change must fail the transaction");
-
-        assert_eq!(error.code(), "provider-config-concurrent-modification");
-        assert!(!hooks_path.exists(), "first-file write must be rolled back");
-        assert_eq!(
-            fs::read(&notification_path).expect("concurrent config retained"),
-            concurrent
-        );
-    }
-
-    #[test]
-    fn codex_provider_plans_guard_an_unchanged_second_file() {
-        let tmp = tempfile::TempDir::new().expect("tempdir");
-        let hooks_path = tmp.path().join("hooks.json");
-        let notification_path = tmp.path().join("config.toml");
-        fs::write(
-            &notification_path,
-            "notify = [\"agent-session\", \"activity\", \"notify\", \"--agent\", \"codex\"]\n",
-        )
-        .expect("owned notification config");
-        let hooks = plan_json_provider(AgentKind::Codex, &hooks_path, SetupAction::Apply)
-            .expect("hooks plan");
-        let notification = plan_codex_notification(&notification_path, SetupAction::Apply)
-            .expect("notification plan");
-        assert!(!notification.config.changed);
-
-        let concurrent = b"notify = [\"user-notifier\"]\n";
-        fs::write(&notification_path, concurrent).expect("concurrent notification config");
-        let error = apply_codex_provider_plans(&hooks, &notification.config)
-            .expect_err("unchanged second-file plan must still verify its snapshot");
-
-        assert_eq!(error.code(), "provider-config-concurrent-modification");
-        assert!(!hooks_path.exists(), "first-file write must be rolled back");
-        assert_eq!(
-            fs::read(&notification_path).expect("concurrent config retained"),
-            concurrent
-        );
-    }
-
-    #[test]
-    fn codex_provider_plan_failure_reports_the_retained_recovery_path() {
-        let tmp = tempfile::TempDir::new().expect("tempdir");
-        let hooks_path = tmp.path().join("hooks.json");
-        let notification_path = tmp.path().join("config.toml");
-        fs::write(&hooks_path, "{}\n").expect("original hooks config");
-        let hooks = plan_json_provider(AgentKind::Codex, &hooks_path, SetupAction::Apply)
-            .expect("hooks plan");
-        let notification = plan_codex_notification(&notification_path, SetupAction::Apply)
-            .expect("notification plan");
-        fs::write(&notification_path, "notify = [\"concurrent\"]\n")
-            .expect("concurrent notification config");
-
-        let error =
-            apply_codex_provider_plans_with_rollback(&hooks, &notification.config, |plan| {
-                rollback_provider_config_plan_after_capture_with_restore(
-                    plan,
-                    || {},
-                    |path, bytes, purpose| {
-                        restore_provider_config_if_absent_with_link(path, bytes, purpose, |_, _| {
-                            Err(io::Error::new(
-                                io::ErrorKind::PermissionDenied,
-                                "injected hard-link failure",
-                            ))
-                        })
-                    },
-                )
-            })
-            .expect_err("two-file failure must surface rollback recovery metadata");
-
-        assert_eq!(error.code(), "provider-config-rollback-failed");
-        let rollback_details =
-            &error.0.details.as_ref().expect("error details")["rollback_error_details"];
-        let candidate_path = recovery_path_for_role(rollback_details, "captured_candidate");
-        let original_path = recovery_path_for_role(rollback_details, "staged_original");
-        assert!(candidate_path.is_file());
-        assert!(original_path.is_file());
-        assert_eq!(
-            fs::read(candidate_path).expect("captured candidate"),
-            hooks.updated_bytes.clone().expect("candidate bytes")
-        );
-        assert_eq!(fs::read(original_path).expect("staged original"), b"{}\n");
-    }
-
-    #[test]
-    fn codex_inline_migration_restores_deleted_json_when_config_changes() {
-        let tmp = tempfile::TempDir::new().expect("tempdir");
-        let hooks_path = tmp.path().join("hooks.json");
-        let config_path = tmp.path().join("config.toml");
-        let initial = plan_json_provider(AgentKind::Codex, &hooks_path, SetupAction::Apply)
-            .expect("initial JSON plan");
-        apply_provider_config_plan(&initial).expect("initial JSON config");
-        let hooks_before = fs::read(&hooks_path).expect("hooks before migration");
-        fs::write(
-            &config_path,
-            "[[hooks.Stop]]\n\n[[hooks.Stop.hooks]]\ntype = \"command\"\ncommand = \"user-stop\"\ntimeout = 9\n",
-        )
-        .expect("inline config");
-
-        let hooks = plan_codex_json_cleanup(
-            &hooks_path,
-            read_optional_provider_config(&hooks_path).expect("hooks snapshot"),
-        )
-        .expect("JSON cleanup plan");
-        assert!(hooks.changed);
-        assert!(hooks.updated_bytes.is_none());
-        let mut notification =
-            plan_codex_notification(&config_path, SetupAction::Apply).expect("config plan");
-        assert!(
-            plan_inline_codex_hooks(&mut notification, SetupAction::Apply)
-                .expect("inline hook plan")
-        );
-
-        let concurrent = b"model = \"concurrent\"\n";
-        fs::write(&config_path, concurrent).expect("concurrent config");
-        let error = apply_codex_provider_plans(&hooks, &notification.config)
-            .expect_err("second-file change must roll back the JSON deletion");
-
-        assert_eq!(error.code(), "provider-config-concurrent-modification");
-        assert_eq!(fs::read(&hooks_path).expect("restored hooks"), hooks_before);
-        assert_eq!(
-            fs::read(&config_path).expect("concurrent config retained"),
-            concurrent
-        );
-    }
-
-    #[test]
-    fn provider_config_delete_preserves_a_replacement_created_after_capture() {
-        let tmp = tempfile::TempDir::new().expect("tempdir");
-        let path = tmp.path().join("hooks.json");
-        let reviewed = b"reviewed-owned-config";
-        let replacement = b"concurrent-user-config";
-        fs::write(&path, reviewed).expect("reviewed config");
-
-        let error =
-            remove_provider_config_if_unchanged_after_capture(&path, Some(reviewed), || {
-                fs::write(&path, replacement).expect("concurrent replacement")
-            })
-            .expect_err("replacement must make deletion fail closed");
-
-        assert_eq!(error.code(), "provider-config-concurrent-modification");
-        assert_eq!(fs::read(&path).expect("replacement retained"), replacement);
-    }
-
-    #[test]
-    fn provider_config_rollback_preserves_a_replacement_created_after_capture() {
-        let tmp = tempfile::TempDir::new().expect("tempdir");
-        let path = tmp.path().join("hooks.json");
-        let plan =
-            plan_json_provider(AgentKind::Codex, &path, SetupAction::Apply).expect("create plan");
-        apply_provider_config_plan(&plan).expect("created config");
-        let replacement = b"concurrent-user-config";
-
-        let error = rollback_provider_config_plan_after_capture(&plan, || {
-            fs::write(&path, replacement).expect("concurrent replacement");
-        })
-        .expect_err("replacement must make rollback fail closed");
-
-        assert_eq!(
-            error.code(),
-            "provider-config-rollback-concurrent-modification"
-        );
-        assert_eq!(fs::read(&path).expect("replacement retained"), replacement);
-    }
-
-    #[test]
     fn codex_marker_lines_inside_multiline_strings_are_not_owned_blocks() {
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let path = tmp.path().join("config.toml");
@@ -8033,7 +6296,6 @@ mod tests {
             );
 
             let analysis = analyze_codex_toml_hooks(&path, &raw).expect("marker-shaped value");
-            assert_eq!(analysis.stripped_raw, raw);
             assert_eq!(analysis.marker_layout, CodexTomlHookMarkerLayout::Absent);
         }
     }
@@ -8051,7 +6313,6 @@ mod tests {
         ] {
             let raw = format!("keep = true\n{marker}\n");
             let analysis = analyze_codex_toml_hooks(&path, &raw).expect("owned orphan marker");
-            assert_eq!(analysis.stripped_raw, "keep = true\n");
             assert_eq!(analysis.marker_layout, expected_layout);
         }
     }
@@ -8075,128 +6336,31 @@ mod tests {
     }
 
     #[test]
-    fn provider_config_restore_failure_preserves_the_staged_original() {
-        let tmp = tempfile::TempDir::new().expect("tempdir");
-        let path = tmp.path().join("hooks.json");
-        let original = b"original-user-config";
-
-        let error = restore_provider_config_if_absent_with_link(
-            &path,
-            original,
-            "rollback-restore",
-            |_, _| {
-                Err(io::Error::new(
-                    io::ErrorKind::PermissionDenied,
-                    "injected hard-link failure",
-                ))
-            },
-        )
-        .expect_err("unexpected hard-link failure must retain recovery bytes");
-
-        assert_eq!(error.code(), "provider-config-rollback-write-failed");
-        let recovery_path = recovery_path_for_role(
-            error.0.details.as_ref().expect("error details"),
-            "staged_original",
-        );
-        assert_eq!(fs::read(recovery_path).expect("staged original"), original);
-        assert!(!path.exists());
-    }
-
-    #[test]
-    fn provider_config_rollback_failure_preserves_the_captured_candidate() {
-        let tmp = tempfile::TempDir::new().expect("tempdir");
-        let path = tmp.path().join("hooks.json");
-        let original = b"original-user-config".to_vec();
-        let candidate = b"applied-agent-config".to_vec();
-        fs::write(&path, &candidate).expect("candidate config");
-        let plan = ProviderConfigPlan {
-            path: path.clone(),
-            original_bytes: Some(original),
-            updated_bytes: Some(candidate.clone()),
-            changed: true,
-            configured: true,
-        };
-
-        let error = rollback_provider_config_plan_after_capture_with_restore(
-            &plan,
-            || {},
-            |_, _, _| {
-                Err(CliError::runtime(
-                    "provider-config-rollback-write-failed",
-                    "injected restore failure",
-                    None,
-                ))
-            },
-        )
-        .expect_err("restore failure must retain the captured candidate");
-
-        assert_eq!(error.code(), "provider-config-rollback-write-failed");
-        assert!(!path.exists());
-        let recoveries = fs::read_dir(tmp.path())
-            .expect("recovery directory")
-            .map(|entry| entry.expect("recovery entry").path())
-            .filter(|entry| {
-                entry
-                    .file_name()
-                    .is_some_and(|name| name.to_string_lossy().contains("rollback-capture"))
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(recoveries.len(), 1);
-        assert_eq!(
-            fs::read(&recoveries[0]).expect("captured candidate"),
-            candidate
-        );
-    }
-
-    #[test]
-    fn provider_config_quarantine_restore_failure_reports_the_captured_path() {
-        let tmp = tempfile::TempDir::new().expect("tempdir");
-        let path = tmp.path().join("hooks.json");
-        let quarantine = tmp.path().join("captured-hooks.json");
-        fs::write(&quarantine, b"captured-config").expect("captured config");
-
-        let error = restore_quarantined_provider_config_with_link(&path, &quarantine, |_, _| {
-            Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "injected hard-link failure",
-            ))
-        })
-        .expect_err("restore failure must report the retained capture");
-
-        let recovery_paths = error.0.details.as_ref().expect("error details")["recovery_paths"]
-            .as_array()
-            .expect("recovery paths");
-        assert_eq!(recovery_paths.len(), 1);
-        assert_eq!(recovery_paths[0]["role"], "captured_config");
-        assert_eq!(recovery_paths[0]["path"], display_path(&quarantine));
-        assert_eq!(
-            fs::read(&quarantine).expect("retained capture"),
-            b"captured-config"
-        );
-    }
-
-    #[test]
     fn codex_inline_permission_source_guard_rejects_noncanonical_reporters() {
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let config_path = tmp.path().join("config.toml");
-        fs::write(&config_path, render_owned_codex_toml_hook_block()).expect("owned inline hooks");
+        let canonical = format!(
+            "[[hooks.PermissionRequest]]\n\n[[hooks.PermissionRequest.hooks]]\ntype = \"command\"\ncommand = {}\ntimeout = 5\n",
+            toml_edit::Value::from(owned_command(AgentKind::Codex, Some("PermissionRequest")))
+        );
+        fs::write(&config_path, &canonical).expect("owned inline hooks");
         assert!(codex_toml_permission_source_guard(&config_path));
 
         for command in [
             owned_command(AgentKind::Codex, Some("PermissionRequest")),
             "agent-session activity hook --agent=codex".to_string(),
         ] {
-            let mut duplicate = render_owned_codex_toml_hook_block();
+            let mut duplicate = canonical.clone();
             duplicate.push_str(&format!(
                 "\n[[hooks.PermissionRequest]]\n\n[[hooks.PermissionRequest.hooks]]\ntype = \"command\"\ncommand = {}\ntimeout = 5\n",
-                TomlValue::from(command)
+                toml_edit::Value::from(command)
             ));
             fs::write(&config_path, duplicate).expect("duplicate reporter");
             assert!(!codex_toml_permission_source_guard(&config_path));
         }
 
         for matcher in ["5", "false", "[]", "{}"] {
-            let malformed = render_owned_codex_toml_hook_block().replacen(
+            let malformed = canonical.replacen(
                 "[[hooks.PermissionRequest]]",
                 &format!("[[hooks.PermissionRequest]]\nmatcher = {matcher}"),
                 1,
@@ -8213,13 +6377,24 @@ mod tests {
     fn codex_json_permission_source_guard_rejects_noncanonical_reporters() {
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let path = tmp.path().join("hooks.json");
-        let plan =
-            plan_json_provider(AgentKind::Codex, &path, SetupAction::Apply).expect("JSON plan");
-        apply_provider_config_plan(&plan).expect("JSON hooks");
+        let canonical = json!({
+            "hooks": {
+                "PermissionRequest": [{
+                    "hooks": [{
+                        "type": "command",
+                        "command": owned_command(AgentKind::Codex, Some("PermissionRequest")),
+                        "timeout": 5
+                    }]
+                }]
+            }
+        });
+        fs::write(
+            &path,
+            serde_json::to_vec_pretty(&canonical).expect("JSON bytes"),
+        )
+        .expect("JSON hooks");
         assert!(codex_json_permission_source_guard(&path));
 
-        let canonical: Value =
-            serde_json::from_slice(&fs::read(&path).expect("JSON hooks")).expect("JSON document");
         for matcher in [Value::Null, json!(5), json!(false), json!([]), json!({})] {
             let mut malformed = canonical.clone();
             malformed["hooks"]["PermissionRequest"][0]["matcher"] = matcher;
@@ -8247,134 +6422,6 @@ mod tests {
         .expect("duplicate reporter");
 
         assert!(!codex_json_permission_source_guard(&path));
-    }
-
-    #[test]
-    fn codex_hook_group_metadata_is_user_owned_and_preserved_by_remove() {
-        let tmp = tempfile::TempDir::new().expect("tempdir");
-        let hooks_path = tmp.path().join("hooks.json");
-        let config_path = tmp.path().join("config.toml");
-        let json = json!({
-            "hooks": {
-                "Stop": [{
-                    "description": "keep-json-metadata",
-                    "hooks": [{
-                        "type": "command",
-                        "command": owned_command(AgentKind::Codex, Some("Stop")),
-                        "timeout": 5
-                    }]
-                }]
-            }
-        });
-        let config = format!(
-            "[[hooks.Stop]]\ndescription = \"keep-toml-metadata\"\n\n[[hooks.Stop.hooks]]\ntype = \"command\"\ncommand = {}\ntimeout = 5\n",
-            TomlValue::from(owned_command(AgentKind::Codex, Some("Stop")))
-        );
-        let config_analysis =
-            analyze_codex_toml_hooks(&config_path, &config).expect("TOML analysis");
-
-        let status = codex_hook_status_from_analysis(&json, &config_analysis);
-        assert!(status.conflict, "additive group metadata is user-owned");
-
-        let json_bytes = serde_json::to_vec_pretty(&json).expect("JSON bytes");
-        let cleanup =
-            plan_codex_json_cleanup(&hooks_path, Some(json_bytes)).expect("JSON cleanup plan");
-        let cleaned_json: Value = serde_json::from_slice(
-            cleanup
-                .updated_bytes
-                .as_deref()
-                .expect("user metadata keeps the JSON file"),
-        )
-        .expect("cleaned JSON");
-        assert_eq!(
-            cleaned_json["hooks"]["Stop"][0]["description"],
-            "keep-json-metadata"
-        );
-        assert_eq!(cleaned_json["hooks"]["Stop"][0]["hooks"], json!([]));
-
-        fs::write(&config_path, config).expect("config fixture");
-        let mut notification =
-            plan_codex_notification(&config_path, SetupAction::Remove).expect("TOML plan");
-        plan_inline_codex_hooks(&mut notification, SetupAction::Remove).expect("inline cleanup");
-        let cleaned_toml = std::str::from_utf8(
-            notification
-                .config
-                .updated_bytes
-                .as_deref()
-                .expect("TOML candidate"),
-        )
-        .expect("UTF-8 TOML");
-        assert!(cleaned_toml.contains("keep-toml-metadata"));
-        assert!(!cleaned_toml.contains("agent-session activity hook"));
-    }
-
-    #[test]
-    fn codex_json_handler_metadata_is_user_owned_and_preserved_by_remove() {
-        let tmp = tempfile::TempDir::new().expect("tempdir");
-        let hooks_path = tmp.path().join("hooks.json");
-        let config_path = tmp.path().join("config.toml");
-        let json = json!({
-            "hooks": {
-                "Stop": [{
-                    "hooks": [{
-                        "type": "command",
-                        "command": owned_command(AgentKind::Codex, Some("Stop")),
-                        "timeout": 5,
-                        "async": true,
-                        "statusMessage": "keep-json-handler-metadata"
-                    }]
-                }]
-            }
-        });
-        fs::write(
-            &hooks_path,
-            serde_json::to_vec_pretty(&json).expect("JSON bytes"),
-        )
-        .expect("JSON fixture");
-
-        let error =
-            setup_codex_provider(&hooks_path, &config_path, SetupAction::RepairPreview, None)
-                .expect_err("repair must not replace a metadata-bearing handler");
-        assert_eq!(error.code(), "provider-hook-ownership-conflict");
-
-        setup_codex_provider(&hooks_path, &config_path, SetupAction::Remove, None)
-            .expect("remove preserves user-owned handler metadata");
-        let cleaned: Value =
-            serde_json::from_slice(&fs::read(&hooks_path).expect("metadata-bearing JSON remains"))
-                .expect("cleaned JSON");
-        let handler = &cleaned["hooks"]["Stop"][0]["hooks"][0];
-        assert_eq!(handler["async"], true);
-        assert_eq!(handler["statusMessage"], "keep-json-handler-metadata");
-        assert_eq!(
-            handler["command"],
-            owned_command(AgentKind::Codex, Some("Stop"))
-        );
-    }
-
-    #[test]
-    fn codex_toml_handler_metadata_is_user_owned_and_preserved_by_remove() {
-        let tmp = tempfile::TempDir::new().expect("tempdir");
-        let hooks_path = tmp.path().join("hooks.json");
-        let config_path = tmp.path().join("config.toml");
-        let config = format!(
-            "{CODEX_HOOK_BLOCK_START}\n[[hooks.Stop]]\n\n[[hooks.Stop.hooks]]\ntype = \"command\"\ncommand = {}\ntimeout = 5\nasync = true\nstatusMessage = \"keep-toml-handler-metadata\"\n{CODEX_HOOK_BLOCK_END}\n",
-            TomlValue::from(owned_command(AgentKind::Codex, Some("Stop")))
-        );
-        fs::write(&config_path, config).expect("TOML fixture");
-
-        let error =
-            setup_codex_provider(&hooks_path, &config_path, SetupAction::RepairPreview, None)
-                .expect_err("repair must not replace a metadata-bearing handler");
-        assert_eq!(error.code(), "provider-hook-ownership-conflict");
-
-        setup_codex_provider(&hooks_path, &config_path, SetupAction::Remove, None)
-            .expect("remove preserves user-owned handler metadata");
-        let cleaned = fs::read_to_string(&config_path).expect("metadata-bearing TOML remains");
-        assert!(cleaned.contains("async = true"));
-        assert!(cleaned.contains("statusMessage = \"keep-toml-handler-metadata\""));
-        assert!(cleaned.contains("agent-session activity hook"));
-        assert!(!cleaned.contains(CODEX_HOOK_BLOCK_START));
-        assert!(!cleaned.contains(CODEX_HOOK_BLOCK_END));
     }
 
     #[test]

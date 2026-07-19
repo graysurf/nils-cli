@@ -164,67 +164,26 @@ fields, distinguishing `starting`, `working`, `waiting`, `needs_input`, and
 `unknown` without storing prompt, assistant, terminal, command, tool, or
 transcript content.
 
-Provider setup is explicit and reversible. Preview it first, then apply only
-after reviewing the provider trust/consent boundary:
+Provider registration is owned by `agent-hook`. The retained
+`agent-session activity setup` command is only a compatibility forwarder:
 
 ```bash
 agent-session activity setup --agent codex --dry-run
-agent-session activity setup --agent codex --repair --dry-run
 agent-session activity setup --agent codex --repair --expected-preview-digest sha256:<reviewed-plan-digest>
-agent-session activity setup --agent codex --apply
-agent-session activity doctor --agent codex --format json
 agent-session activity setup --agent codex --remove
 ```
 
-Ordinary `--dry-run`, `--apply`, `--repair`, and `--remove` also support
-`claude` and `hermes`; the combined `--repair --dry-run` reviewed-plan workflow
-is Codex-only and rejects other providers. Setup merges exact agent-session-owned
-handlers into existing provider configuration, repeated apply/repair is
-idempotent, and removal preserves unrelated hooks. Provider setup also refuses
-an observed concurrent config change. For Codex, setup selects the lifecycle
-representation already active in the user layer: JSON-only installs stay in
-`~/.codex/hooks.json`, while existing inline `[[hooks.<Event>]]` groups cause
-exact agent-session handlers to migrate into a separate marker-bounded block in
-`~/.codex/config.toml`. An owned-only JSON source is deleted; unrelated content
-is preserved. User-owned lifecycle handlers in both sources produce a
-content-free conflict and block dry-run/apply/repair migration without mutation;
-`--remove` may still clean exact agent-session handlers from both sources without
-moving user content. Setup and doctor report representation, migration,
-conflict, and the active hook path. Migrated definitions have new
-Codex trust identities, so review them with `/hooks` and verify a fresh session
-does not emit the dual-representation warning. Fields added to an otherwise
-matching Codex command handler are user-owned:
-dry-run/apply/repair fail closed instead of replacing them, while `--remove`
-preserves that complete handler. Setup also adds
-the official `agent-turn-complete` notify argv to `~/.codex/config.toml` when
-`notify` is absent, recognizes exact ownership idempotently, or wraps a safe
-user-owned singular argv in an agent-session-owned fan-out. The fan-out invokes
-the preserved argv directly without a shell, suppresses its output, and kills
-it after a two-second bound. A depth marker prevents nested fan-out, and
-activity lock contention cannot delay the preserved notifier; downstream or
-telemetry failure never blocks Codex. A contended authoritative completion is
-handed to a detached metadata-only `activity event` retry that waits up to five
-seconds for the same durable transaction lock without retaining provider
-content. The worker clears diagnostics only after durable ingestion and records
-a sanitized terminal code on timeout or failure. Setup composes
-only when simulated removal proves the complete original TOML bytes can be
-restored. Unsafe, oversized,
-non-string, recursive, or non-reversible values are preserved and reported as
-conflicts. Both Codex files are parsed and planned before either is written or
-deleted; if the guarded second write fails, the first mutation is restored or a
-loud rollback error identifies the partial state. The repair preview returns a
-content-free plan digest over the current and proposed
-bytes of both Codex files. Applying repair requires that exact digest and fails
-before either write if either file changed after review. That provider-authored
-notification must match the exact open runtime/thread/turn and is the
-authoritative completion input. Raw Codex
-`Stop` remains non-final observation. Hook/notification failure is fail-open and
-old/unsupported providers retain the activity fallback. Doctor scans local
-session evidence once and probes provider versions concurrently with a bounded
-timeout, verifies the exact owned hook timeout and owned/composed Codex notify
-argv, reports `notification_mode` as `absent`, `owned`, `composed`, `conflict`,
-or `invalid`, surfaces sanitized configuration errors, and checks that the
-configured helper resolves to an executable on the provider PATH.
+It invokes `agent-hook setup`, maps the legacy provider and digest flags, and
+reports `compatibility_owner: "agent-hook"`. If the matching `agent-hook`
+binary is absent, setup returns `agent-hook-setup-unavailable` and does not
+write provider configuration. Install the binary and rerun the reviewed
+dry-run; there is no embedded registration fallback.
+
+`activity doctor` remains read-only and recognizes exact legacy
+`agent-session` registrations so an operator can diagnose and migrate older
+installations. Existing `activity hook` and `activity notify` ingestion paths
+also remain as fail-open runtime compatibility while `agent-hook` becomes the
+single provider-registration owner.
 
 Hermes 0.18.2 approval shell hooks are normalized from their nested `extra`
 envelope. A non-empty tool-call id is projected into an exact runtime-scoped

@@ -101,6 +101,7 @@ const DELETE_TERMINATION_VERIFY_POLL_INTERVAL: Duration = Duration::from_millis(
 const DELETE_TERMINATION_PROBE_TIMEOUT: Duration = Duration::from_millis(100);
 const DELETE_TERMINATION_IDENTITY_RETRY_LIMIT: usize = 3;
 const DELETE_TMUX_PROBE_MAX_OUTPUT_BYTES: usize = 4 * 1024;
+const AGENT_HOOK_SETUP_MAX_OUTPUT_BYTES: usize = 1024 * 1024;
 const DELETE_TMUX_IDENTITY_KEY: &str = "delete_tmux_identity";
 const DELETE_TMUX_PRIOR_IDENTITIES_KEY: &str = "delete_tmux_prior_identities";
 const DELETE_TMUX_TERMINATION_STATE_KEY: &str = "delete_tmux_termination_state";
@@ -503,29 +504,124 @@ fn run_activity(context: &CliContext, args: cli::ActivityArgs) -> i32 {
             ),
             Err(err) => render_error(ACTIVITY_DOCTOR_COMMAND, args.format, err),
         },
-        cli::ActivityCommand::Setup(args) => {
-            let action = if args.dry_run && args.repair {
-                activity::SetupAction::RepairPreview
-            } else if args.dry_run {
-                activity::SetupAction::DryRun
-            } else if args.apply {
-                activity::SetupAction::Apply
-            } else if args.remove {
-                activity::SetupAction::Remove
-            } else {
-                activity::SetupAction::Repair
-            };
-            match activity::setup(args.agent, action, args.expected_preview_digest.as_deref()) {
-                Ok(result) => render_single_success(
-                    ACTIVITY_SETUP_COMMAND,
-                    args.format,
-                    &result,
-                    render_setup_text,
-                ),
-                Err(err) => render_error(ACTIVITY_SETUP_COMMAND, args.format, err),
-            }
-        }
+        cli::ActivityCommand::Setup(args) => match forward_activity_setup_to_agent_hook(&args) {
+            Ok(result) => render_single_success(
+                ACTIVITY_SETUP_COMMAND,
+                args.format,
+                &result,
+                render_forwarded_setup_text,
+            ),
+            Err(err) => render_error(ACTIVITY_SETUP_COMMAND, args.format, err),
+        },
     }
+}
+
+fn forward_activity_setup_to_agent_hook(args: &cli::ActivitySetupArgs) -> Result<Value, CliError> {
+    let explicit_binary = std::env::var_os("AGENT_HOOK_BIN");
+    let binary = explicit_binary
+        .clone()
+        .unwrap_or_else(|| OsString::from("agent-hook"));
+    let action = if args.dry_run {
+        "--dry-run"
+    } else if args.apply {
+        "--apply"
+    } else if args.remove {
+        "--remove"
+    } else {
+        "--repair"
+    };
+    let mut command = ProcessCommand::new(binary);
+    command.args([
+        "setup",
+        "--product",
+        args.agent.as_str(),
+        action,
+        "--format",
+        "json",
+    ]);
+    if let Some(digest) = args.expected_preview_digest.as_deref() {
+        command.args(["--expected-plan-digest", digest]);
+    }
+    let output = match run_output_with_timeout_and_cap(
+        command,
+        Duration::from_secs(10),
+        AGENT_HOOK_SETUP_MAX_OUTPUT_BYTES,
+    ) {
+        Ok(output) => output,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Err(CliError::runtime(
+                "agent-hook-setup-unavailable",
+                "agent-hook is required for provider setup; install the matching nils-agent-hook binary, then rerun the same dry-run before any apply, repair, or remove",
+                Some(json!({
+                    "compatibility_owner": "agent-hook",
+                    "action": "install-agent-hook-and-repeat-reviewed-preview"
+                })),
+            ));
+        }
+        Err(error) => {
+            return Err(CliError::runtime(
+                "agent-hook-setup-unavailable",
+                format!("agent-hook setup compatibility forward failed: {error}"),
+                Some(json!({
+                    "compatibility_owner": "agent-hook",
+                    "action": "inspect-agent-hook-installation-and-repeat-reviewed-preview"
+                })),
+            ));
+        }
+    };
+    let envelope: Value = match serde_json::from_slice(&output.stdout) {
+        Ok(value) => value,
+        Err(_) => {
+            return Err(CliError::data(
+                "agent-hook-setup-output-invalid",
+                "agent-hook setup returned invalid JSON",
+                None,
+            ));
+        }
+    };
+    if !output.status.success() || envelope.get("ok").and_then(Value::as_bool) != Some(true) {
+        let code = envelope
+            .pointer("/error/code")
+            .and_then(Value::as_str)
+            .unwrap_or("agent-hook-setup-failed");
+        let message = envelope
+            .pointer("/error/message")
+            .and_then(Value::as_str)
+            .unwrap_or("agent-hook setup rejected the compatibility request");
+        let details = envelope.pointer("/error/details").cloned();
+        return Err(CliError::data(code, message, details));
+    }
+    let mut result = match envelope.get("result").cloned() {
+        Some(Value::Object(result)) => result,
+        _ => {
+            return Err(CliError::data(
+                "agent-hook-setup-output-invalid",
+                "agent-hook setup omitted its result object",
+                None,
+            ));
+        }
+    };
+    result.insert(
+        "compatibility_owner".to_string(),
+        Value::String("agent-hook".to_string()),
+    );
+    Ok(Value::Object(result))
+}
+
+fn render_forwarded_setup_text(result: &Value) -> String {
+    let product = result
+        .get("product")
+        .and_then(Value::as_str)
+        .unwrap_or("provider");
+    let action = result
+        .get("action")
+        .and_then(Value::as_str)
+        .unwrap_or("setup");
+    let status = result
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or("reported");
+    format!("{product} activity {action}: {status} (owner: agent-hook)\n")
 }
 
 fn run_delete(context: &CliContext, args: cli::DeleteArgs) -> i32 {
@@ -8855,8 +8951,16 @@ fn run_status_with_timeout(
 }
 
 fn run_output_with_timeout(
+    command: ProcessCommand,
+    timeout: Duration,
+) -> io::Result<std::process::Output> {
+    run_output_with_timeout_and_cap(command, timeout, DELETE_TMUX_PROBE_MAX_OUTPUT_BYTES)
+}
+
+fn run_output_with_timeout_and_cap(
     mut command: ProcessCommand,
     timeout: Duration,
+    max_output_bytes: usize,
 ) -> io::Result<std::process::Output> {
     command
         .stdin(Stdio::null())
@@ -8875,10 +8979,10 @@ fn run_output_with_timeout(
     let (output_tx, output_rx) = std::sync::mpsc::channel();
     let stdout_tx = output_tx.clone();
     thread::spawn(move || {
-        let _ = stdout_tx.send((true, read_capped_output(stdout)));
+        let _ = stdout_tx.send((true, read_capped_output(stdout, max_output_bytes)));
     });
     thread::spawn(move || {
-        let _ = output_tx.send((false, read_capped_output(stderr)));
+        let _ = output_tx.send((false, read_capped_output(stderr, max_output_bytes)));
     });
     let started_at = Instant::now();
     let mut status = None;
@@ -8929,7 +9033,7 @@ fn run_output_with_timeout(
     }
 }
 
-fn read_capped_output(mut pipe: impl Read) -> io::Result<Vec<u8>> {
+fn read_capped_output(mut pipe: impl Read, max_output_bytes: usize) -> io::Result<Vec<u8>> {
     let mut retained = Vec::new();
     let mut buffer = [0_u8; 1024];
     loop {
@@ -8937,7 +9041,7 @@ fn read_capped_output(mut pipe: impl Read) -> io::Result<Vec<u8>> {
         if read == 0 {
             return Ok(retained);
         }
-        let remaining = DELETE_TMUX_PROBE_MAX_OUTPUT_BYTES.saturating_sub(retained.len());
+        let remaining = max_output_bytes.saturating_sub(retained.len());
         retained.extend_from_slice(&buffer[..read.min(remaining)]);
     }
 }
@@ -9453,92 +9557,6 @@ fn render_doctor_text(result: &activity::DoctorResult) -> String {
     text
 }
 
-fn render_setup_text(result: &activity::SetupResult) -> String {
-    let hook_state = result
-        .hook_representation
-        .as_deref()
-        .zip(result.hook_migration.as_deref())
-        .map(|(representation, migration)| {
-            let conflict = result.representation_conflict == Some(true);
-            let next = if conflict {
-                "; next: converge user-owned lifecycle hooks onto one source"
-            } else {
-                ""
-            };
-            format!(
-                "; hooks: {representation}; migration: {migration}; conflict: {}{next}",
-                if conflict { "yes" } else { "no" }
-            )
-        })
-        .unwrap_or_default();
-    if result.action == "repair-preview" {
-        let preview_digest = result
-            .preview_digest
-            .as_deref()
-            .expect("Codex repair preview always has a plan digest");
-        if !result.apply_allowed {
-            let notification = result
-                .notification_preview
-                .as_ref()
-                .expect("a blocked setup preview has notification metadata");
-            return format!(
-                "{} activity setup repair preview: blocked by {} (plan: {}; notifier argv: {} args, {}; config unchanged{})\n",
-                result.provider,
-                notification
-                    .blocker_code
-                    .as_deref()
-                    .unwrap_or("provider-config-preview-blocked"),
-                preview_digest,
-                notification.forwarded_argc.unwrap_or_default(),
-                notification
-                    .forwarded_argv_sha256
-                    .as_deref()
-                    .unwrap_or("hash unavailable"),
-                hook_state
-            );
-        }
-        return format!(
-            "{} activity setup repair preview: {} (configured now: {}; would configure: {}; plan: {}{})\n",
-            result.provider,
-            if result.would_change {
-                "changes required"
-            } else {
-                "no change"
-            },
-            if result.configured { "yes" } else { "no" },
-            if result.would_configure { "yes" } else { "no" },
-            preview_digest,
-            hook_state
-        );
-    }
-    if result.action == "dry-run" {
-        return format!(
-            "{} activity setup preview: {} (configured now: {}; would configure: {}{})\n",
-            result.provider,
-            if result.would_change {
-                "changes required"
-            } else {
-                "no change"
-            },
-            if result.configured { "yes" } else { "no" },
-            if result.would_configure { "yes" } else { "no" },
-            hook_state
-        );
-    }
-    format!(
-        "{} activity setup {}: {} (configured: {}{})\n",
-        result.provider,
-        result.action,
-        if result.changed {
-            "updated"
-        } else {
-            "no change"
-        },
-        if result.configured { "yes" } else { "no" },
-        hook_state
-    )
-}
-
 fn render_delete_text(result: &DeleteResult) -> String {
     format!(
         "deleted {} (tmux stopped: {})\n",
@@ -9641,8 +9659,8 @@ mod tests {
         TmuxProcessIdentity, TmuxRuntimeIdentity, acquire_session_record_lock,
         acquire_session_record_lock_timed, create_record, delete_session_with_timeouts,
         kill_tmux_session_with_timeout, live_status_with_timeout, load_session_record,
-        persist_tmux_runtime_identity, render_delete_text, render_setup_text, resolve_session_id,
-        session_dir, strip_trailing_blank_lines, tmux_launch_may_have_created_runtime,
+        persist_tmux_runtime_identity, render_delete_text, resolve_session_id, session_dir,
+        strip_trailing_blank_lines, tmux_launch_may_have_created_runtime,
         try_acquire_session_record_lock, write_session_record,
     };
 
@@ -9690,30 +9708,6 @@ mod tests {
             state_dir: state_dir.to_path_buf(),
             host: None,
         }
-    }
-
-    #[test]
-    fn setup_text_reports_a_detected_representation_conflict() {
-        let text = render_setup_text(&super::activity::SetupResult {
-            provider: "codex".to_string(),
-            action: "remove".to_string(),
-            changed: true,
-            would_change: true,
-            configured: false,
-            would_configure: false,
-            apply_allowed: true,
-            preview_digest: None,
-            config_path: "/home/user/.codex/config.toml".to_string(),
-            hook_representation: Some("inline_toml".to_string()),
-            hook_migration: Some("not_needed".to_string()),
-            representation_conflict: Some(true),
-            notification_config_path: Some("/home/user/.codex/config.toml".to_string()),
-            notification_preview: None,
-            owned_events: Vec::new(),
-            trust: "review".to_string(),
-        });
-
-        assert!(text.contains("conflict: yes"), "text={text}");
     }
 
     #[test]
