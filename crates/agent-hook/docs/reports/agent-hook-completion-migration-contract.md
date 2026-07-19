@@ -55,4 +55,3 @@ cargo run -p nils-agent-hook -- completion zsh | rg -- "--help|--version|--"
 zsh -f tests/zsh/completion.test.zsh
 bash scripts/ci/completion-freshness-audit.sh --strict --bin agent-hook
 ```
-
