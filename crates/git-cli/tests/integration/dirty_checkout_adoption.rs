@@ -100,6 +100,7 @@ fn write_challenge(state_root: &std::path::Path, snapshot: &DirtySnapshot) -> st
     write_challenge_window(state_root, snapshot, issued_at, issued_at + 300)
 }
 
+#[cfg(target_os = "linux")]
 fn run_governed_command(
     harness: &GitCliHarness,
     cwd: &std::path::Path,
@@ -1568,6 +1569,7 @@ fn sha256_hex(bytes: &[u8]) -> String {
         .collect()
 }
 
+#[cfg(target_os = "linux")]
 fn assert_exact_json_keys(value: &serde_json::Value, expected: &[&str], label: &str) {
     let mut actual: Vec<_> = value
         .as_object()

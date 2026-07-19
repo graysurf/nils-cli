@@ -21,5 +21,11 @@ retries = 2
 filter = 'package(nils-git-cli) & test(/(supervisor|output_cleanup|detached_double_fork|successful_git_output|signal_terminated_target)/)'
 threads-required = "num-test-threads"
 
+# This fixture deliberately queues two adoption workers behind one lease lock.
+# Keep unrelated suite load from consuming the bounded lock-wait window.
+[[profile.ci.overrides]]
+filter = 'package(nils-git-cli) & test(concurrent_adoption_consumes_a_challenge_exactly_once)'
+threads-required = "num-test-threads"
+
 [profile.ci.junit]
 path = "junit.xml"
