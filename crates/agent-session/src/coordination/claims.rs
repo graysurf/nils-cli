@@ -1264,11 +1264,11 @@ fn validate_descendant(descendant: Option<&DescendantIdentity>) -> Result<(), Cl
     }
     #[cfg(not(target_os = "linux"))]
     {
-        return Err(CliError::runtime(
+        Err(CliError::runtime(
             "coordination-unavailable",
             "exact descendant identity is unsupported on this platform",
             None,
-        ));
+        ))
     }
     #[cfg(target_os = "linux")]
     {
