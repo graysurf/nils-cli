@@ -57,6 +57,13 @@ pub enum Command {
     Resume(ResumeArgs),
     /// Inspect or ingest metadata-only agent turn lifecycle events.
     Activity(ActivityArgs),
+    /// Manage authenticated structured work context and mutation leases.
+    #[command(name = "work-context")]
+    WorkContext(WorkContextArgs),
+    /// Inspect or recover the per-session coordination broker.
+    Broker(BrokerArgs),
+    /// Exchange bounded private coordination mailbox messages.
+    Message(MessageArgs),
     /// Serve the control plane (HTTP) and PTY attach (WebSocket) over loopback.
     Serve(ServeArgs),
     /// Internal metadata-only bridge for a managed Codex remote TUI.
@@ -215,6 +222,336 @@ pub struct RunArgs {
 #[derive(Debug, Args)]
 pub struct ListArgs {
     /// Output format.
+    #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
+    pub format: OutputFormat,
+}
+
+#[derive(Debug, Args)]
+pub struct WorkContextArgs {
+    #[command(subcommand)]
+    pub command: WorkContextCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum WorkContextCommand {
+    /// Atomically evaluate conflicts and acquire a structured work claim.
+    Claim(WorkContextClaimArgs),
+    /// Show the authenticated session's current public work context.
+    Show(WorkContextShowArgs),
+    /// Evaluate a candidate or the authenticated session without acquiring.
+    Check(WorkContextCheckArgs),
+    /// Renew an active work claim using revision compare-and-swap.
+    Renew(WorkContextRenewArgs),
+    /// Release an active work claim using revision compare-and-swap.
+    Release(WorkContextReleaseArgs),
+    /// Admit one mutation operation whose targets are covered by the claim.
+    Admit(WorkContextAdmitArgs),
+    /// Complete an admitted mutation operation.
+    Complete(WorkContextCompleteArgs),
+    /// Reconcile a missed operation completion from bounded proof.
+    Reconcile(WorkContextReconcileArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct WorkContextClaimArgs {
+    #[arg(long)]
+    pub session: String,
+    #[arg(long, value_name = "PATH", value_hint = ValueHint::FilePath)]
+    pub file: PathBuf,
+    #[arg(long, value_name = "PATH", value_hint = ValueHint::FilePath)]
+    pub capability_file: Option<PathBuf>,
+    #[arg(long)]
+    pub idempotency_key: String,
+    #[arg(long)]
+    pub if_revision: Option<u64>,
+    #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
+    pub format: OutputFormat,
+}
+
+#[derive(Debug, Args)]
+pub struct WorkContextShowArgs {
+    #[arg(long)]
+    pub session: String,
+    #[arg(long, value_name = "PATH", value_hint = ValueHint::FilePath)]
+    pub capability_file: Option<PathBuf>,
+    #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
+    pub format: OutputFormat,
+}
+
+#[derive(Debug, Args)]
+pub struct WorkContextCheckArgs {
+    #[arg(long)]
+    pub session: String,
+    #[arg(long, value_name = "PATH", value_hint = ValueHint::FilePath)]
+    pub capability_file: Option<PathBuf>,
+    #[arg(long, value_name = "PATH", value_hint = ValueHint::FilePath)]
+    pub candidate: Option<PathBuf>,
+    #[arg(long)]
+    pub allow_incomplete: bool,
+    #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
+    pub format: OutputFormat,
+}
+
+#[derive(Debug, Args)]
+pub struct WorkContextRenewArgs {
+    #[arg(long)]
+    pub session: String,
+    #[arg(long)]
+    pub claim: String,
+    #[arg(long)]
+    pub if_revision: u64,
+    #[arg(long, value_name = "PATH", value_hint = ValueHint::FilePath)]
+    pub capability_file: Option<PathBuf>,
+    #[arg(long)]
+    pub idempotency_key: String,
+    #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
+    pub format: OutputFormat,
+}
+
+#[derive(Debug, Args)]
+pub struct WorkContextReleaseArgs {
+    #[arg(long)]
+    pub session: String,
+    #[arg(long)]
+    pub claim: String,
+    #[arg(long)]
+    pub if_revision: u64,
+    #[arg(long, value_name = "PATH", value_hint = ValueHint::FilePath)]
+    pub capability_file: Option<PathBuf>,
+    #[arg(long)]
+    pub idempotency_key: String,
+    #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
+    pub format: OutputFormat,
+}
+
+#[derive(Debug, Args)]
+pub struct WorkContextAdmitArgs {
+    #[arg(long)]
+    pub session: String,
+    #[arg(long)]
+    pub claim: String,
+    #[arg(long)]
+    pub if_revision: u64,
+    #[arg(long, value_name = "PATH", value_hint = ValueHint::FilePath)]
+    pub targets_file: PathBuf,
+    #[arg(long)]
+    pub operation: String,
+    #[arg(long)]
+    pub execution_token: String,
+    #[arg(long, value_name = "PATH", value_hint = ValueHint::FilePath)]
+    pub capability_file: Option<PathBuf>,
+    #[arg(long)]
+    pub idempotency_key: String,
+    #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
+    pub format: OutputFormat,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+#[value(rename_all = "kebab-case")]
+pub enum OperationOutcome {
+    Pass,
+    Fail,
+}
+
+impl OperationOutcome {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Pass => "pass",
+            Self::Fail => "fail",
+        }
+    }
+}
+
+#[derive(Debug, Args)]
+pub struct WorkContextCompleteArgs {
+    #[arg(long)]
+    pub session: String,
+    #[arg(long)]
+    pub lease: String,
+    #[arg(long)]
+    pub if_revision: u64,
+    #[arg(long)]
+    pub execution_token: String,
+    #[arg(long, value_enum)]
+    pub outcome: OperationOutcome,
+    #[arg(long, value_name = "PATH", value_hint = ValueHint::FilePath)]
+    pub capability_file: Option<PathBuf>,
+    #[arg(long)]
+    pub idempotency_key: String,
+    #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
+    pub format: OutputFormat,
+}
+
+#[derive(Debug, Args)]
+pub struct WorkContextReconcileArgs {
+    #[arg(long)]
+    pub session: String,
+    #[arg(long)]
+    pub lease: String,
+    #[arg(long)]
+    pub if_revision: u64,
+    #[arg(long, value_name = "PATH", value_hint = ValueHint::FilePath)]
+    pub proof_file: PathBuf,
+    #[arg(long, value_name = "PATH", value_hint = ValueHint::FilePath)]
+    pub capability_file: Option<PathBuf>,
+    #[arg(long)]
+    pub idempotency_key: String,
+    #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
+    pub format: OutputFormat,
+}
+
+#[derive(Debug, Args)]
+pub struct BrokerArgs {
+    #[command(subcommand)]
+    pub command: BrokerCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum BrokerCommand {
+    /// Show privacy-safe broker readiness and claim/operation summaries.
+    Status(BrokerStatusArgs),
+    /// Adopt an unchanged live runtime after validating recovery proof.
+    Adopt(BrokerRecoveryArgs),
+    /// Reconcile broker and registry state from validated recovery proof.
+    Reconcile(BrokerRecoveryArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct BrokerStatusArgs {
+    #[arg(long)]
+    pub session: String,
+    #[arg(long, value_name = "PATH", value_hint = ValueHint::FilePath)]
+    pub capability_file: Option<PathBuf>,
+    #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
+    pub format: OutputFormat,
+}
+
+#[derive(Debug, Args)]
+pub struct BrokerRecoveryArgs {
+    #[arg(long)]
+    pub session: String,
+    #[arg(long, value_name = "PATH", value_hint = ValueHint::FilePath)]
+    pub proof_file: PathBuf,
+    #[arg(long)]
+    pub idempotency_key: String,
+    #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
+    pub format: OutputFormat,
+}
+
+#[derive(Debug, Args)]
+pub struct MessageArgs {
+    #[command(subcommand)]
+    pub command: MessageCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum MessageCommand {
+    /// Send one bounded private message as an authenticated session.
+    Send(MessageSendArgs),
+    /// List bounded private mailbox metadata for the authenticated recipient.
+    Inbox(MessageInboxArgs),
+    /// Read one private message body as its authenticated recipient.
+    Show(MessageShowArgs),
+    /// Acknowledge one private message using revision compare-and-swap.
+    Ack(MessageAckArgs),
+    /// Reply to one private message as its authenticated recipient.
+    Reply(MessageReplyArgs),
+    /// Wait a bounded duration for one message revision change.
+    Wait(MessageWaitArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct MessageSendArgs {
+    #[arg(long = "from")]
+    pub from_session: String,
+    #[arg(long = "to")]
+    pub to_session: String,
+    #[arg(long, value_name = "PATH", value_hint = ValueHint::FilePath)]
+    pub body_file: PathBuf,
+    #[arg(long, value_name = "PATH", value_hint = ValueHint::FilePath)]
+    pub capability_file: Option<PathBuf>,
+    #[arg(long)]
+    pub idempotency_key: String,
+    #[arg(long)]
+    pub reply_to: Option<String>,
+    #[arg(long, value_name = "DURATION")]
+    pub expires_in: Option<String>,
+    #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
+    pub format: OutputFormat,
+}
+
+#[derive(Debug, Args)]
+pub struct MessageInboxArgs {
+    #[arg(long)]
+    pub session: String,
+    #[arg(long, value_name = "PATH", value_hint = ValueHint::FilePath)]
+    pub capability_file: Option<PathBuf>,
+    #[arg(long)]
+    pub state: Option<String>,
+    #[arg(long)]
+    pub cursor: Option<String>,
+    #[arg(long)]
+    pub limit: Option<usize>,
+    #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
+    pub format: OutputFormat,
+}
+
+#[derive(Debug, Args)]
+pub struct MessageShowArgs {
+    #[arg(long)]
+    pub session: String,
+    #[arg(long)]
+    pub message: String,
+    #[arg(long, value_name = "PATH", value_hint = ValueHint::FilePath)]
+    pub capability_file: Option<PathBuf>,
+    #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
+    pub format: OutputFormat,
+}
+
+#[derive(Debug, Args)]
+pub struct MessageAckArgs {
+    #[arg(long)]
+    pub session: String,
+    #[arg(long)]
+    pub message: String,
+    #[arg(long)]
+    pub if_revision: u64,
+    #[arg(long, value_name = "PATH", value_hint = ValueHint::FilePath)]
+    pub capability_file: Option<PathBuf>,
+    #[arg(long)]
+    pub idempotency_key: String,
+    #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
+    pub format: OutputFormat,
+}
+
+#[derive(Debug, Args)]
+pub struct MessageReplyArgs {
+    #[arg(long)]
+    pub session: String,
+    #[arg(long)]
+    pub message: String,
+    #[arg(long, value_name = "PATH", value_hint = ValueHint::FilePath)]
+    pub body_file: PathBuf,
+    #[arg(long, value_name = "PATH", value_hint = ValueHint::FilePath)]
+    pub capability_file: Option<PathBuf>,
+    #[arg(long)]
+    pub idempotency_key: String,
+    #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
+    pub format: OutputFormat,
+}
+
+#[derive(Debug, Args)]
+pub struct MessageWaitArgs {
+    #[arg(long)]
+    pub session: String,
+    #[arg(long)]
+    pub message: String,
+    #[arg(long)]
+    pub if_revision: u64,
+    #[arg(long, value_name = "DURATION")]
+    pub timeout: String,
+    #[arg(long, value_name = "PATH", value_hint = ValueHint::FilePath)]
+    pub capability_file: Option<PathBuf>,
     #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
     pub format: OutputFormat,
 }
@@ -455,6 +792,8 @@ pub struct ActivitySetupArgs {
 
 #[derive(Debug, Args)]
 pub struct ServeArgs {
+    /// Versioned work-context (`work-context/v1`) and mailbox (`messages/v1`)
+    /// routes share the same loopback control plane and library contracts.
     /// Address to bind. Defaults to loopback; a non-loopback address is refused
     /// unless --allow-non-loopback is passed (it exposes a remote shell).
     #[arg(long, value_name = "ADDR", default_value = "127.0.0.1:8781")]

@@ -4966,10 +4966,36 @@ fn start_creates_session_state_without_printing_prompt() {
             "-e".to_string(),
             format!("AGENT_SESSION_RUNTIME_ID={runtime_id}"),
             "-e".to_string(),
+            format!(
+                "AGENT_SESSION_CAPABILITY_FILE={}",
+                state_dir
+                    .join("sessions")
+                    .join(id)
+                    .join("coordination/capability")
+                    .display()
+            ),
+            "-e".to_string(),
             "AGENT_SESSION_ATTENTION_AUTHORITY=hook".to_string(),
             "-e".to_string(),
             format!("PATH={inherited_path}"),
             "--".to_string(),
+            "sh".to_string(),
+            "-c".to_string(),
+            "gate=$1; heartbeat=$2; incarnation=$3; shift 3; while [ ! -f \"$gate\" ]; do sleep 0.01; done; owner=$$; umask 077; (while kill -0 \"$owner\" 2>/dev/null; do printf '%s:%s\\n' \"$incarnation\" \"$(date +%s)\" > \"$heartbeat\"; sleep 10; done) & exec \"$@\"".to_string(),
+            "agent-session-held-launch".to_string(),
+            state_dir
+                .join("sessions")
+                .join(id)
+                .join("coordination/launch-ready")
+                .to_string_lossy()
+                .to_string(),
+            state_dir
+                .join("sessions")
+                .join(id)
+                .join("coordination/heartbeat")
+                .to_string_lossy()
+                .to_string(),
+            runtime_id.to_string(),
             codex_arg.clone(),
             "--cd".to_string(),
             cwd_arg.clone(),
@@ -9199,10 +9225,30 @@ fn resume_recreates_tmux_runtime_from_exact_provider_identity() {
             "-e".to_string(),
             format!("AGENT_SESSION_RUNTIME_ID={runtime_id}"),
             "-e".to_string(),
+            format!(
+                "AGENT_SESSION_CAPABILITY_FILE={}",
+                state_dir
+                    .join("sessions/recoverable/coordination/capability")
+                    .display()
+            ),
+            "-e".to_string(),
             "AGENT_SESSION_ATTENTION_AUTHORITY=hook".to_string(),
             "-e".to_string(),
             format!("PATH={inherited_path}"),
             "--".to_string(),
+            "sh".to_string(),
+            "-c".to_string(),
+            "gate=$1; heartbeat=$2; incarnation=$3; shift 3; while [ ! -f \"$gate\" ]; do sleep 0.01; done; owner=$$; umask 077; (while kill -0 \"$owner\" 2>/dev/null; do printf '%s:%s\\n' \"$incarnation\" \"$(date +%s)\" > \"$heartbeat\"; sleep 10; done) & exec \"$@\"".to_string(),
+            "agent-session-held-launch".to_string(),
+            state_dir
+                .join("sessions/recoverable/coordination/launch-ready")
+                .to_string_lossy()
+                .to_string(),
+            state_dir
+                .join("sessions/recoverable/coordination/heartbeat")
+                .to_string_lossy()
+                .to_string(),
+            runtime_id.to_string(),
             codex_arg.clone(),
             "resume".to_string(),
             "resume-session-id".to_string(),
