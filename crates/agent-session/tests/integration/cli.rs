@@ -1674,6 +1674,601 @@ timeout = 20
 }
 
 #[test]
+fn codex_reordered_foreign_tables_inside_owned_marker_remain_steady() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let home = tmp.path().join("home");
+    fs::create_dir_all(home.join(".codex")).expect("codex dir");
+    let config_path = home.join(".codex/config.toml");
+    fs::write(
+        &config_path,
+        r#"[[hooks.PreToolUse]]
+
+[[hooks.PreToolUse.hooks]]
+type = "command"
+command = "runtime-kit-pre-tool"
+timeout = 5
+"#,
+    )
+    .expect("inline config");
+    let home_arg = home.to_string_lossy().to_string();
+    let envs = [("HOME", home_arg.as_str())];
+
+    let initial = run(
+        tmp.path(),
+        &[
+            "activity", "setup", "--agent", "codex", "--apply", "--format", "json",
+        ],
+        &envs,
+    );
+    assert_eq!(initial.code, 0, "stderr={}", initial.stderr_text());
+    assert_eq!(
+        data(&initial.stdout_json())["hook_representation"],
+        "inline_toml"
+    );
+
+    let converged = fs::read_to_string(&config_path).expect("converged config");
+    let reordered = converged.replacen(
+        "[[hooks.Stop]]",
+        r#"[projects."/foreign/project"]
+trust_level = "trusted"
+
+[[hooks.Stop]]"#,
+        1,
+    );
+    assert_ne!(reordered, converged, "expected a managed Stop hook");
+    fs::write(&config_path, &reordered).expect("Codex-reordered config");
+
+    let preview = run(
+        tmp.path(),
+        &[
+            "activity",
+            "setup",
+            "--agent",
+            "codex",
+            "--repair",
+            "--dry-run",
+            "--format",
+            "json",
+        ],
+        &envs,
+    );
+    assert_eq!(preview.code, 0, "stderr={}", preview.stderr_text());
+    let preview_json = preview.stdout_json();
+    let result = data(&preview_json);
+    assert_eq!(result["configured"], true);
+    assert_eq!(result["hook_representation"], "inline_toml");
+    assert_eq!(result["hook_migration"], "not_needed");
+    assert_eq!(result["would_change"], false);
+    assert_eq!(
+        fs::read_to_string(&config_path).expect("steady config"),
+        reordered,
+        "dry-run must preserve the Codex-reordered bytes"
+    );
+}
+
+#[test]
+fn codex_repair_recovers_one_orphan_owned_marker_after_trust_save() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let home = tmp.path().join("home");
+    fs::create_dir_all(home.join(".codex")).expect("codex dir");
+    let config_path = home.join(".codex/config.toml");
+    fs::write(
+        &config_path,
+        r#"[[hooks.PreToolUse]]
+
+[[hooks.PreToolUse.hooks]]
+type = "command"
+command = "runtime-kit-pre-tool"
+timeout = 5
+"#,
+    )
+    .expect("inline config");
+    let home_arg = home.to_string_lossy().to_string();
+    let envs = [("HOME", home_arg.as_str())];
+
+    let initial = run(
+        tmp.path(),
+        &[
+            "activity", "setup", "--agent", "codex", "--apply", "--format", "json",
+        ],
+        &envs,
+    );
+    assert_eq!(initial.code, 0, "stderr={}", initial.stderr_text());
+
+    let converged = fs::read_to_string(&config_path).expect("converged config");
+    let block_start = converged
+        .find("# >>> agent-session:codex-hooks >>>")
+        .expect("owned block start");
+    let block_end = converged
+        .find("# <<< agent-session:codex-hooks <<<")
+        .expect("owned block end");
+    let trust_saved = format!("{}{}", &converged[..block_start], &converged[block_end..]);
+    fs::write(&config_path, &trust_saved).expect("trust-saved config");
+
+    let preview = run(
+        tmp.path(),
+        &[
+            "activity",
+            "setup",
+            "--agent",
+            "codex",
+            "--repair",
+            "--dry-run",
+            "--format",
+            "json",
+        ],
+        &envs,
+    );
+    assert_eq!(preview.code, 0, "stderr={}", preview.stderr_text());
+    let preview_json = preview.stdout_json();
+    let preview_result = data(&preview_json);
+    assert_eq!(preview_result["hook_representation"], "inline_toml");
+    assert_eq!(preview_result["would_change"], true);
+    assert_eq!(
+        fs::read_to_string(&config_path).expect("dry-run config"),
+        trust_saved,
+        "dry-run must not remove the orphan marker"
+    );
+    let preview_digest = preview_result["preview_digest"]
+        .as_str()
+        .expect("preview digest")
+        .to_string();
+
+    let repaired = run(
+        tmp.path(),
+        &[
+            "activity",
+            "setup",
+            "--agent",
+            "codex",
+            "--repair",
+            "--expected-preview-digest",
+            &preview_digest,
+            "--format",
+            "json",
+        ],
+        &envs,
+    );
+    assert_eq!(repaired.code, 0, "stderr={}", repaired.stderr_text());
+    assert_eq!(data(&repaired.stdout_json())["configured"], true);
+
+    let steady = run(
+        tmp.path(),
+        &[
+            "activity",
+            "setup",
+            "--agent",
+            "codex",
+            "--repair",
+            "--dry-run",
+            "--format",
+            "json",
+        ],
+        &envs,
+    );
+    assert_eq!(steady.code, 0, "stderr={}", steady.stderr_text());
+    assert_eq!(data(&steady.stdout_json())["would_change"], false);
+}
+
+#[test]
+fn codex_repair_recovers_marker_only_layout_without_creating_json_hooks() {
+    for marker_layout in [
+        "# >>> agent-session:codex-hooks >>>",
+        "# <<< agent-session:codex-hooks <<<",
+        "# >>> agent-session:codex-hooks >>>\n# <<< agent-session:codex-hooks <<<",
+    ] {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let home = tmp.path().join("home");
+        fs::create_dir_all(home.join(".codex")).expect("codex dir");
+        let config_path = home.join(".codex/config.toml");
+        let hooks_path = home.join(".codex/hooks.json");
+        let damaged = format!("model = \"gpt-5\"\n{marker_layout}\n");
+        fs::write(&config_path, &damaged).expect("marker-only config");
+        let home_arg = home.to_string_lossy().to_string();
+        let envs = [("HOME", home_arg.as_str())];
+
+        let preview = run(
+            tmp.path(),
+            &[
+                "activity",
+                "setup",
+                "--agent",
+                "codex",
+                "--repair",
+                "--dry-run",
+                "--format",
+                "json",
+            ],
+            &envs,
+        );
+        assert_eq!(preview.code, 0, "stderr={}", preview.stderr_text());
+        let preview_json = preview.stdout_json();
+        let preview_result = data(&preview_json);
+        assert_eq!(preview_result["hook_representation"], "inline_toml");
+        assert_eq!(preview_result["would_change"], true);
+        assert_eq!(
+            fs::read_to_string(&config_path).expect("dry-run config"),
+            damaged,
+            "preview must preserve the orphan marker"
+        );
+        assert!(!hooks_path.exists(), "preview must not create hooks.json");
+        let preview_digest = preview_result["preview_digest"]
+            .as_str()
+            .expect("preview digest")
+            .to_string();
+
+        let repaired = run(
+            tmp.path(),
+            &[
+                "activity",
+                "setup",
+                "--agent",
+                "codex",
+                "--repair",
+                "--expected-preview-digest",
+                &preview_digest,
+                "--format",
+                "json",
+            ],
+            &envs,
+        );
+        assert_eq!(repaired.code, 0, "stderr={}", repaired.stderr_text());
+        let repaired_config = fs::read_to_string(&config_path).expect("repaired config");
+        assert_eq!(
+            repaired_config
+                .matches("# >>> agent-session:codex-hooks >>>")
+                .count(),
+            1
+        );
+        assert_eq!(
+            repaired_config
+                .matches("# <<< agent-session:codex-hooks <<<")
+                .count(),
+            1
+        );
+        assert!(repaired_config.contains("agent-session activity hook"));
+        assert!(!hooks_path.exists(), "repair must not create hooks.json");
+
+        let steady = run(
+            tmp.path(),
+            &[
+                "activity",
+                "setup",
+                "--agent",
+                "codex",
+                "--repair",
+                "--dry-run",
+                "--format",
+                "json",
+            ],
+            &envs,
+        );
+        assert_eq!(steady.code, 0, "stderr={}", steady.stderr_text());
+        assert_eq!(data(&steady.stdout_json())["would_change"], false);
+        assert!(
+            !hooks_path.exists(),
+            "steady state must not create hooks.json"
+        );
+    }
+}
+
+#[test]
+fn codex_marker_only_duplicate_or_reversed_layout_fails_before_writes() {
+    for marker_layout in [
+        "# >>> agent-session:codex-hooks >>>\n# >>> agent-session:codex-hooks >>>\n",
+        "# <<< agent-session:codex-hooks <<<\n# <<< agent-session:codex-hooks <<<\n",
+        "# <<< agent-session:codex-hooks <<<\n# >>> agent-session:codex-hooks >>>\n",
+    ] {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let home = tmp.path().join("home");
+        fs::create_dir_all(home.join(".codex")).expect("codex dir");
+        let config_path = home.join(".codex/config.toml");
+        let hooks_path = home.join(".codex/hooks.json");
+        let invalid = format!("model = \"gpt-5\"\n{marker_layout}");
+        fs::write(&config_path, &invalid).expect("invalid marker-only config");
+        let home_arg = home.to_string_lossy().to_string();
+        let envs = [("HOME", home_arg.as_str())];
+
+        let preview = run(
+            tmp.path(),
+            &[
+                "activity",
+                "setup",
+                "--agent",
+                "codex",
+                "--repair",
+                "--dry-run",
+                "--format",
+                "json",
+            ],
+            &envs,
+        );
+        assert_ne!(preview.code, 0);
+        assert_eq!(
+            preview.stdout_json()["error"]["code"],
+            "provider-config-invalid"
+        );
+        assert_eq!(
+            fs::read_to_string(&config_path).expect("unchanged invalid config"),
+            invalid
+        );
+        assert!(
+            !hooks_path.exists(),
+            "invalid preview must not create hooks.json"
+        );
+    }
+}
+
+#[test]
+fn codex_repair_restores_one_missing_marker_around_intact_hooks() {
+    for missing_marker in [
+        "# >>> agent-session:codex-hooks >>>\n",
+        "# <<< agent-session:codex-hooks <<<\n",
+    ] {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let home = tmp.path().join("home");
+        fs::create_dir_all(home.join(".codex")).expect("codex dir");
+        let config_path = home.join(".codex/config.toml");
+        fs::write(
+            &config_path,
+            r#"[[hooks.PreToolUse]]
+
+[[hooks.PreToolUse.hooks]]
+type = "command"
+command = "runtime-kit-pre-tool"
+timeout = 5
+"#,
+        )
+        .expect("inline config");
+        let home_arg = home.to_string_lossy().to_string();
+        let envs = [("HOME", home_arg.as_str())];
+
+        let initial = run(
+            tmp.path(),
+            &[
+                "activity", "setup", "--agent", "codex", "--apply", "--format", "json",
+            ],
+            &envs,
+        );
+        assert_eq!(initial.code, 0, "stderr={}", initial.stderr_text());
+
+        let converged = fs::read_to_string(&config_path).expect("converged config");
+        let damaged = converged.replacen(missing_marker, "", 1);
+        assert_ne!(damaged, converged, "marker fixture must change config");
+        fs::write(&config_path, &damaged).expect("marker-damaged config");
+
+        let preview = run(
+            tmp.path(),
+            &[
+                "activity",
+                "setup",
+                "--agent",
+                "codex",
+                "--repair",
+                "--dry-run",
+                "--format",
+                "json",
+            ],
+            &envs,
+        );
+        assert_eq!(preview.code, 0, "stderr={}", preview.stderr_text());
+        let preview_json = preview.stdout_json();
+        let preview_result = data(&preview_json);
+        assert_eq!(
+            preview_result["would_change"], true,
+            "missing marker must require repair: {missing_marker}"
+        );
+        assert_eq!(
+            fs::read_to_string(&config_path).expect("dry-run config"),
+            damaged,
+            "preview must preserve the damaged candidate"
+        );
+        let preview_digest = preview_result["preview_digest"]
+            .as_str()
+            .expect("preview digest")
+            .to_string();
+
+        let repaired = run(
+            tmp.path(),
+            &[
+                "activity",
+                "setup",
+                "--agent",
+                "codex",
+                "--repair",
+                "--expected-preview-digest",
+                &preview_digest,
+                "--format",
+                "json",
+            ],
+            &envs,
+        );
+        assert_eq!(repaired.code, 0, "stderr={}", repaired.stderr_text());
+        assert_eq!(data(&repaired.stdout_json())["configured"], true);
+        let repaired_config = fs::read_to_string(&config_path).expect("repaired config");
+        assert_eq!(
+            repaired_config
+                .matches("# >>> agent-session:codex-hooks >>>")
+                .count(),
+            1
+        );
+        assert_eq!(
+            repaired_config
+                .matches("# <<< agent-session:codex-hooks <<<")
+                .count(),
+            1
+        );
+        assert!(repaired_config.contains("runtime-kit-pre-tool"));
+
+        let steady = run(
+            tmp.path(),
+            &[
+                "activity",
+                "setup",
+                "--agent",
+                "codex",
+                "--repair",
+                "--dry-run",
+                "--format",
+                "json",
+            ],
+            &envs,
+        );
+        assert_eq!(steady.code, 0, "stderr={}", steady.stderr_text());
+        assert_eq!(data(&steady.stdout_json())["would_change"], false);
+    }
+}
+
+#[test]
+fn codex_repair_converges_noncanonical_owned_hook_shapes() {
+    for fixture_kind in [
+        "current-duplicate",
+        "generic-duplicate",
+        "non-string-matcher",
+    ] {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let home = tmp.path().join("home");
+        fs::create_dir_all(home.join(".codex")).expect("codex dir");
+        let config_path = home.join(".codex/config.toml");
+        fs::write(
+            &config_path,
+            r#"[[hooks.PreToolUse]]
+
+[[hooks.PreToolUse.hooks]]
+type = "command"
+command = "runtime-kit-pre-tool"
+timeout = 5
+"#,
+        )
+        .expect("inline config");
+        let home_arg = home.to_string_lossy().to_string();
+        let envs = [("HOME", home_arg.as_str())];
+
+        let initial = run(
+            tmp.path(),
+            &[
+                "activity", "setup", "--agent", "codex", "--apply", "--format", "json",
+            ],
+            &envs,
+        );
+        assert_eq!(initial.code, 0, "stderr={}", initial.stderr_text());
+
+        let converged = fs::read_to_string(&config_path).expect("converged config");
+        let candidate = match fixture_kind {
+            "current-duplicate" => {
+                let start = converged
+                    .find("[[hooks.PermissionRequest]]")
+                    .expect("PermissionRequest start");
+                let end = converged[start..]
+                    .find("[[hooks.PostToolUse]]")
+                    .map(|offset| start + offset)
+                    .expect("PermissionRequest end");
+                converged.replacen(
+                    "# <<< agent-session:codex-hooks <<<",
+                    &format!(
+                        "{}# <<< agent-session:codex-hooks <<<",
+                        &converged[start..end]
+                    ),
+                    1,
+                )
+            }
+            "generic-duplicate" => {
+                let duplicate = r#"[[hooks.PermissionRequest]]
+
+[[hooks.PermissionRequest.hooks]]
+type = "command"
+command = "agent-session activity hook --agent codex"
+timeout = 5
+
+"#;
+                converged.replacen(
+                    "# <<< agent-session:codex-hooks <<<",
+                    &format!("{duplicate}# <<< agent-session:codex-hooks <<<"),
+                    1,
+                )
+            }
+            "non-string-matcher" => converged.replacen(
+                "[[hooks.PermissionRequest]]",
+                "[[hooks.PermissionRequest]]\nmatcher = 5",
+                1,
+            ),
+            _ => unreachable!(),
+        };
+        fs::write(&config_path, candidate).expect("noncanonical config");
+
+        let preview = run(
+            tmp.path(),
+            &[
+                "activity",
+                "setup",
+                "--agent",
+                "codex",
+                "--repair",
+                "--dry-run",
+                "--format",
+                "json",
+            ],
+            &envs,
+        );
+        assert_eq!(preview.code, 0, "stderr={}", preview.stderr_text());
+        let preview_json = preview.stdout_json();
+        let preview_result = data(&preview_json);
+        assert_eq!(
+            preview_result["would_change"], true,
+            "{fixture_kind} must require repair"
+        );
+        let preview_digest = preview_result["preview_digest"]
+            .as_str()
+            .expect("preview digest")
+            .to_string();
+
+        let repaired = run(
+            tmp.path(),
+            &[
+                "activity",
+                "setup",
+                "--agent",
+                "codex",
+                "--repair",
+                "--expected-preview-digest",
+                &preview_digest,
+                "--format",
+                "json",
+            ],
+            &envs,
+        );
+        assert_eq!(repaired.code, 0, "stderr={}", repaired.stderr_text());
+        assert_eq!(data(&repaired.stdout_json())["configured"], true);
+        let repaired_config = fs::read_to_string(&config_path).expect("repaired config");
+        assert_eq!(
+            repaired_config
+                .matches("[[hooks.PermissionRequest]]")
+                .count(),
+            1,
+            "{fixture_kind} must converge to one reporter"
+        );
+        assert!(!repaired_config.contains("matcher = 5"));
+
+        let steady = run(
+            tmp.path(),
+            &[
+                "activity",
+                "setup",
+                "--agent",
+                "codex",
+                "--repair",
+                "--dry-run",
+                "--format",
+                "json",
+            ],
+            &envs,
+        );
+        assert_eq!(steady.code, 0, "stderr={}", steady.stderr_text());
+        assert_eq!(data(&steady.stdout_json())["would_change"], false);
+    }
+}
+
+#[test]
 fn codex_activity_setup_fails_closed_for_user_hooks_in_both_representations() {
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let home = tmp.path().join("home");
