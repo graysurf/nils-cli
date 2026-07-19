@@ -183,11 +183,18 @@ is no second state model.
   Sessions report
   `running`, `stopped`, or `unknown` live status plus a boolean `resumable` field and best-effort `repo_name` derived from
   the recorded `cwd`. New interactive records also expose optional
-  `runtime_started_at`, `turn_state`, and `startup`; a profiled session also
+  `runtime_started_at`, `turn_state`, `last_prompt`, and `startup`; a profiled
+  session also
   exposes its safe `agent_profile` id. When a known profile drift would make a
   stopped session fail resume, the daemon sets `resumable: false` plus one
   bounded `resume_blocked_reason` code. Old records and daemons omit the
   additive fields.
+  `data.capabilities.last_prompt` advertises the list `last_prompt` preview: the
+  most recent user prompt for a running Codex/Claude session, resolved on demand
+  from the provider transcript so it reflects prompts submitted through any input
+  path (web console, SSH/Termius, or raw `tmux attach`). The text is returned in
+  the response only and is never logged or persisted by the daemon; it is omitted
+  when no recent prompt falls within the bounded tail window read.
   `startup` is the metadata-only `agent-session.startup.v1` projection shared by
   create, list, and glance responses. Its state is `starting`, `ready`, or
   `failed`; its bounded stage is `record`, `tmux`, `runtime`, `app_server`,

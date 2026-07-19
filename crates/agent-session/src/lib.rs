@@ -1118,6 +1118,11 @@ struct SessionView {
     runtime_started_at: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     turn_state: Option<activity::TurnState>,
+    /// Most recent user prompt, populated on demand by the list handler from the
+    /// provider transcript (never persisted). Absent unless the daemon advertises
+    /// the `last_prompt` capability and a preview was resolved.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_prompt: Option<provider_prompt::LastPrompt>,
     #[serde(skip_serializing_if = "Option::is_none")]
     startup: Option<StartupProjection>,
     auto_resume: auto_resume::AutoResumeView,
@@ -5066,6 +5071,9 @@ fn session_view_from_parts(
             .as_ref()
             .map(|runtime| runtime.started_at.clone()),
         turn_state: activity::state_for_view(context, record),
+        // Populated on demand by the list handler; never computed in the shared
+        // collector so the expensive transcript path stays out of the hot build.
+        last_prompt: None,
         startup: startup_projection_for_view(record),
         auto_resume: auto_resume::view_for_record(context, record),
         codex_account: codex_account::view_for_record(record),
