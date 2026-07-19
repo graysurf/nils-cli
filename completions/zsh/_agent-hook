@@ -86,7 +86,7 @@ json\:"Single-record JSON envelope (snake_case)"))' \
 (setup)
 _arguments "${_arguments_options[@]}" : \
 '--product=[Provider whose exact owned ingress is managed]:PRODUCT:(codex claude hermes)' \
-'--expected-plan-digest=[Digest from the reviewed preview; required for drift, legacy, or dual state]:SHA256:_default' \
+'--expected-plan-digest=[Digest from the reviewed preview; required for drift, compatibility, or dual state]:SHA256:_default' \
 '--format=[Output format]:FORMAT:((text\:"Human-readable text output (default)"
 json\:"Single-record JSON envelope (snake_case)"))' \
 '--config=[Override the strict user config path]:PATH:_files' \
@@ -217,7 +217,7 @@ _agent-hook_commands() {
 'dispatch:Normalize one provider request, evaluate policy, and render one decision' \
 'validate:Validate strict config, selected policy, overrides, and digests' \
 'inventory:List public rule metadata and effective modes' \
-'doctor:Inspect policy, provider registrations, legacy residue, and recovery state' \
+'doctor:Inspect policy, provider registrations, compatibility residue, and recovery state' \
 'setup:Preview, apply, repair, or remove exact owned provider ingress' \
 'recovery:Create, authorize, inspect, consume, or revoke governed recovery' \
 'completion:Print a shell completion script' \
