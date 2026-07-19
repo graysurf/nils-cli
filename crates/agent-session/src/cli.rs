@@ -254,6 +254,7 @@ pub enum WorkContextCommand {
 
 #[derive(Debug, Args)]
 pub struct WorkContextClaimArgs {
+    /// Managed session id that owns the claim.
     #[arg(long)]
     pub session: String,
     #[arg(long, value_name = "PATH", value_hint = ValueHint::FilePath)]
@@ -270,6 +271,7 @@ pub struct WorkContextClaimArgs {
 
 #[derive(Debug, Args)]
 pub struct WorkContextShowArgs {
+    /// Managed session id whose authenticated context is shown.
     #[arg(long)]
     pub session: String,
     #[arg(long, value_name = "PATH", value_hint = ValueHint::FilePath)]
@@ -280,6 +282,7 @@ pub struct WorkContextShowArgs {
 
 #[derive(Debug, Args)]
 pub struct WorkContextCheckArgs {
+    /// Existing managed session id selected for the advisory check.
     #[arg(long)]
     pub session: Option<String>,
     #[arg(long = "self")]
@@ -296,6 +299,7 @@ pub struct WorkContextCheckArgs {
 
 #[derive(Debug, Args)]
 pub struct WorkContextRenewArgs {
+    /// Managed session id that owns the claim.
     #[arg(long)]
     pub session: String,
     #[arg(long)]
@@ -312,6 +316,7 @@ pub struct WorkContextRenewArgs {
 
 #[derive(Debug, Args)]
 pub struct WorkContextReleaseArgs {
+    /// Managed session id that owns the claim.
     #[arg(long)]
     pub session: String,
     #[arg(long)]
@@ -328,6 +333,7 @@ pub struct WorkContextReleaseArgs {
 
 #[derive(Debug, Args)]
 pub struct WorkContextAdmitArgs {
+    /// Managed session id that owns the operation.
     #[arg(long)]
     pub session: String,
     #[arg(long)]
@@ -366,6 +372,7 @@ impl OperationOutcome {
 
 #[derive(Debug, Args)]
 pub struct WorkContextCompleteArgs {
+    /// Managed session id that owns the operation.
     #[arg(long)]
     pub session: String,
     #[arg(long)]
@@ -386,6 +393,7 @@ pub struct WorkContextCompleteArgs {
 
 #[derive(Debug, Args)]
 pub struct WorkContextReconcileArgs {
+    /// Managed session id that owns the operation.
     #[arg(long)]
     pub session: String,
     #[arg(long)]
@@ -424,6 +432,7 @@ pub enum BrokerCommand {
 
 #[derive(Debug, Args)]
 pub struct BrokerStatusArgs {
+    /// Managed session id whose broker status is shown.
     #[arg(long)]
     pub session: String,
     #[arg(long, value_name = "PATH", value_hint = ValueHint::FilePath)]
@@ -434,6 +443,7 @@ pub struct BrokerStatusArgs {
 
 #[derive(Debug, Args)]
 pub struct BrokerRecoveryArgs {
+    /// Managed session id whose broker is being recovered.
     #[arg(long)]
     pub session: String,
     #[arg(long, value_name = "PATH", value_hint = ValueHint::FilePath)]
@@ -452,6 +462,7 @@ pub struct BrokerRecoveryArgs {
 
 #[derive(Debug, Args)]
 pub struct BrokerStopArgs {
+    /// Managed session id whose broker is being stopped.
     #[arg(long)]
     pub session: String,
     #[arg(long, value_name = "PATH", value_hint = ValueHint::FilePath)]
@@ -462,6 +473,7 @@ pub struct BrokerStopArgs {
 
 #[derive(Debug, Args)]
 pub struct BrokerHeartbeatArgs {
+    /// Managed session id owned by this heartbeat sidecar.
     #[arg(long)]
     pub session: String,
     #[arg(long)]
@@ -498,6 +510,7 @@ pub enum MessageCommand {
 
 #[derive(Debug, Args)]
 pub struct MessageSendArgs {
+    /// Authenticated managed session id sending the message.
     #[arg(long = "from")]
     pub from_session: String,
     #[arg(long = "to")]
@@ -518,6 +531,7 @@ pub struct MessageSendArgs {
 
 #[derive(Debug, Args)]
 pub struct MessageInboxArgs {
+    /// Authenticated recipient session id.
     #[arg(long)]
     pub session: String,
     #[arg(long, value_name = "PATH", value_hint = ValueHint::FilePath)]
@@ -534,6 +548,7 @@ pub struct MessageInboxArgs {
 
 #[derive(Debug, Args)]
 pub struct MessageShowArgs {
+    /// Authenticated recipient session id.
     #[arg(long)]
     pub session: String,
     #[arg(long)]
@@ -546,6 +561,7 @@ pub struct MessageShowArgs {
 
 #[derive(Debug, Args)]
 pub struct MessageAckArgs {
+    /// Authenticated recipient session id.
     #[arg(long)]
     pub session: String,
     #[arg(long)]
@@ -562,6 +578,7 @@ pub struct MessageAckArgs {
 
 #[derive(Debug, Args)]
 pub struct MessageReplyArgs {
+    /// Authenticated recipient session id sending the reply.
     #[arg(long)]
     pub session: String,
     #[arg(long)]
@@ -580,6 +597,7 @@ pub struct MessageReplyArgs {
 
 #[derive(Debug, Args)]
 pub struct MessageWaitArgs {
+    /// Authenticated recipient session id.
     #[arg(long)]
     pub session: String,
     #[arg(long)]
