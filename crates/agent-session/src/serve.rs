@@ -2983,13 +2983,23 @@ async fn coordination_context_check_handler(
     State(state): State<Arc<ServeState>>,
     headers: HeaderMap,
     AxPath(id): AxPath<String>,
-    Json(body): Json<coordination_server::CheckBody>,
+    body: Result<Json<coordination_server::CheckBody>, JsonRejection>,
 ) -> Response {
     if let Some(response) = deny_unauthorized(&state, &headers) {
         return response;
     }
+    let body = match coordination_json(body) {
+        Ok(body) => body,
+        Err(response) => return response,
+    };
+    let capability = coordination_server::capability_from_headers(&headers)
+        .ok()
+        .map(str::to_string);
     let context = state.context.clone();
-    match tokio::task::spawn_blocking(move || coordination_server::check(&context, &id, body)).await
+    match tokio::task::spawn_blocking(move || {
+        coordination_server::check(&context, &id, capability.as_deref(), body)
+    })
+    .await
     {
         Ok(Ok(value)) => coordination_ok(&state, value),
         Ok(Err(error)) => envelope_err(error),
@@ -3000,11 +3010,15 @@ async fn coordination_context_check_handler(
 async fn coordination_registry_context_check_handler(
     State(state): State<Arc<ServeState>>,
     headers: HeaderMap,
-    Json(body): Json<coordination_server::CheckBody>,
+    body: Result<Json<coordination_server::CheckBody>, JsonRejection>,
 ) -> Response {
     if let Some(response) = deny_unauthorized(&state, &headers) {
         return response;
     }
+    let body = match coordination_json(body) {
+        Ok(body) => body,
+        Err(response) => return response,
+    };
     let context = state.context.clone();
     match tokio::task::spawn_blocking(move || coordination_server::check_candidate(&context, body))
         .await
@@ -3019,8 +3033,12 @@ async fn coordination_context_claim_handler(
     State(state): State<Arc<ServeState>>,
     headers: HeaderMap,
     AxPath(id): AxPath<String>,
-    Json(body): Json<coordination_server::ClaimBody>,
+    body: Result<Json<coordination_server::ClaimBody>, JsonRejection>,
 ) -> Response {
+    let body = match coordination_json(body) {
+        Ok(body) => body,
+        Err(response) => return response,
+    };
     let token = match coordination_authority(&state, &headers) {
         Ok(token) => token,
         Err(response) => return response,
@@ -3041,8 +3059,12 @@ async fn coordination_context_renew_handler(
     State(state): State<Arc<ServeState>>,
     headers: HeaderMap,
     AxPath(id): AxPath<String>,
-    Json(body): Json<coordination_server::ClaimMutationBody>,
+    body: Result<Json<coordination_server::ClaimMutationBody>, JsonRejection>,
 ) -> Response {
+    let body = match coordination_json(body) {
+        Ok(body) => body,
+        Err(response) => return response,
+    };
     coordination_context_claim_mutation(state, headers, id, body, false).await
 }
 
@@ -3050,8 +3072,12 @@ async fn coordination_context_release_handler(
     State(state): State<Arc<ServeState>>,
     headers: HeaderMap,
     AxPath(id): AxPath<String>,
-    Json(body): Json<coordination_server::ClaimMutationBody>,
+    body: Result<Json<coordination_server::ClaimMutationBody>, JsonRejection>,
 ) -> Response {
+    let body = match coordination_json(body) {
+        Ok(body) => body,
+        Err(response) => return response,
+    };
     coordination_context_claim_mutation(state, headers, id, body, true).await
 }
 
@@ -3082,8 +3108,12 @@ async fn coordination_context_admit_handler(
     State(state): State<Arc<ServeState>>,
     headers: HeaderMap,
     AxPath(id): AxPath<String>,
-    Json(body): Json<coordination_server::AdmitBody>,
+    body: Result<Json<coordination_server::AdmitBody>, JsonRejection>,
 ) -> Response {
+    let body = match coordination_json(body) {
+        Ok(body) => body,
+        Err(response) => return response,
+    };
     let token = match coordination_authority(&state, &headers) {
         Ok(token) => token,
         Err(response) => return response,
@@ -3104,8 +3134,12 @@ async fn coordination_context_complete_handler(
     State(state): State<Arc<ServeState>>,
     headers: HeaderMap,
     AxPath(id): AxPath<String>,
-    Json(body): Json<coordination_server::CompleteBody>,
+    body: Result<Json<coordination_server::CompleteBody>, JsonRejection>,
 ) -> Response {
+    let body = match coordination_json(body) {
+        Ok(body) => body,
+        Err(response) => return response,
+    };
     let token = match coordination_authority(&state, &headers) {
         Ok(token) => token,
         Err(response) => return response,
@@ -3126,8 +3160,12 @@ async fn coordination_context_reconcile_handler(
     State(state): State<Arc<ServeState>>,
     headers: HeaderMap,
     AxPath(id): AxPath<String>,
-    Json(body): Json<coordination_server::ReconcileBody>,
+    body: Result<Json<coordination_server::ReconcileBody>, JsonRejection>,
 ) -> Response {
+    let body = match coordination_json(body) {
+        Ok(body) => body,
+        Err(response) => return response,
+    };
     let token = match coordination_authority(&state, &headers) {
         Ok(token) => token,
         Err(response) => return response,
@@ -3166,8 +3204,12 @@ async fn coordination_broker_adopt_handler(
     State(state): State<Arc<ServeState>>,
     headers: HeaderMap,
     AxPath(id): AxPath<String>,
-    Json(body): Json<coordination_server::BrokerRecoveryBody>,
+    body: Result<Json<coordination_server::BrokerRecoveryBody>, JsonRejection>,
 ) -> Response {
+    let body = match coordination_json(body) {
+        Ok(body) => body,
+        Err(response) => return response,
+    };
     coordination_broker_recovery_handler(state, headers, id, body, false).await
 }
 
@@ -3175,8 +3217,12 @@ async fn coordination_broker_reconcile_handler(
     State(state): State<Arc<ServeState>>,
     headers: HeaderMap,
     AxPath(id): AxPath<String>,
-    Json(body): Json<coordination_server::BrokerRecoveryBody>,
+    body: Result<Json<coordination_server::BrokerRecoveryBody>, JsonRejection>,
 ) -> Response {
+    let body = match coordination_json(body) {
+        Ok(body) => body,
+        Err(response) => return response,
+    };
     coordination_broker_recovery_handler(state, headers, id, body, true).await
 }
 
@@ -3228,8 +3274,12 @@ async fn coordination_send_handler(
     State(state): State<Arc<ServeState>>,
     headers: HeaderMap,
     AxPath(id): AxPath<String>,
-    Json(body): Json<coordination_server::SendBody>,
+    body: Result<Json<coordination_server::SendBody>, JsonRejection>,
 ) -> Response {
+    let body = match coordination_json(body) {
+        Ok(body) => body,
+        Err(response) => return response,
+    };
     let token = match coordination_authority(&state, &headers) {
         Ok(token) => token,
         Err(response) => return response,
@@ -3247,6 +3297,17 @@ async fn coordination_send_handler(
         Ok(Err(error)) => envelope_err(error),
         Err(_) => join_err(),
     }
+}
+
+#[allow(clippy::result_large_err)]
+fn coordination_json<T>(body: Result<Json<T>, JsonRejection>) -> Result<T, Response> {
+    body.map(|Json(value)| value).map_err(|_| {
+        envelope_err(CliError::usage(
+            "invalid-json-body",
+            "coordination request body is invalid",
+            None,
+        ))
+    })
 }
 
 async fn attempt_coordination_notification(state: Arc<ServeState>, sent: &Value) {
@@ -3301,8 +3362,12 @@ async fn coordination_ack_handler(
     State(state): State<Arc<ServeState>>,
     headers: HeaderMap,
     AxPath((id, message_id)): AxPath<(String, String)>,
-    Json(body): Json<coordination_server::AckBody>,
+    body: Result<Json<coordination_server::AckBody>, JsonRejection>,
 ) -> Response {
+    let body = match coordination_json(body) {
+        Ok(body) => body,
+        Err(response) => return response,
+    };
     let token = match coordination_authority(&state, &headers) {
         Ok(token) => token,
         Err(response) => return response,
@@ -3323,8 +3388,12 @@ async fn coordination_reply_handler(
     State(state): State<Arc<ServeState>>,
     headers: HeaderMap,
     AxPath((id, message_id)): AxPath<(String, String)>,
-    Json(body): Json<coordination_server::ReplyBody>,
+    body: Result<Json<coordination_server::ReplyBody>, JsonRejection>,
 ) -> Response {
+    let body = match coordination_json(body) {
+        Ok(body) => body,
+        Err(response) => return response,
+    };
     let token = match coordination_authority(&state, &headers) {
         Ok(token) => token,
         Err(response) => return response,
@@ -8876,6 +8945,42 @@ mod tests {
                 COORDINATION_WAIT_WORKER_LIMIT,
             )),
         })
+    }
+
+    #[tokio::test]
+    async fn coordination_json_routes_share_the_versioned_error_envelope() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let state = state(tmp.path(), Some(TOKEN), minimal_tmux(tmp.path()));
+        for path in [
+            "/sessions/example/work-context/check/v1",
+            "/coordination/work-context/check/v1",
+            "/sessions/example/work-context/claim/v1",
+            "/sessions/example/work-context/renew/v1",
+            "/sessions/example/work-context/release/v1",
+            "/sessions/example/work-context/admit/v1",
+            "/sessions/example/work-context/complete/v1",
+            "/sessions/example/work-context/reconcile/v1",
+            "/sessions/example/broker/adopt/v1",
+            "/sessions/example/broker/reconcile/v1",
+            "/sessions/example/messages/v1",
+            "/sessions/example/messages/message/ack/v1",
+            "/sessions/example/messages/message/reply/v1",
+        ] {
+            let request = Request::builder()
+                .method("POST")
+                .uri(path)
+                .header(AUTHORIZATION, format!("Bearer {TOKEN}"))
+                .header("content-type", "application/json")
+                .body(Body::from("{"))
+                .expect("request");
+            let (status, body) = call(router(state.clone()), request).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "path={path} body={body}");
+            assert_eq!(body["ok"], false, "path={path} body={body}");
+            assert_eq!(
+                body["error"]["code"], "invalid-json-body",
+                "path={path} body={body}"
+            );
+        }
     }
 
     fn minimal_tmux(dir: &Path) -> PathBuf {
@@ -18837,10 +18942,9 @@ exit 0
         let (status, sent) = call(
             router(state.clone()),
             post_coordination(
-                "/sessions/alpha/messages/v1",
+                "/sessions/beta/messages/v1",
                 alpha_capability.trim(),
                 json!({
-                    "to": "beta",
                     "body": canary,
                     "idempotency_key": "http-message-alpha-0001",
                     "reply_to": null,

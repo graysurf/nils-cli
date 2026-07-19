@@ -85,6 +85,26 @@ Input omits controller-owned fields: `session_id`, `session_incarnation`,
 to the authenticated live session. Unknown fields and unsupported schema
 versions fail closed.
 
+The exact claim/check input schema is `agent-session.work-context-input.v1`:
+
+```json
+{
+  "schema_version": "agent-session.work-context-input.v1",
+  "intent": "implementation",
+  "tier": "L2",
+  "repositories": ["owner/repository"],
+  "worktrees": [],
+  "provider_refs": [{"kind": "issue", "repository": "owner/repository", "number": 123}],
+  "plan_refs": ["docs/plans/2026-07-19-topic/topic-plan.md"],
+  "scopes": [{"kind": "path-prefix", "repository": "owner/repository", "value": "src"}],
+  "summary": "Implement session coordination"
+}
+```
+
+`summary` is bounded to 240 UTF-8 bytes. Collection limits are 8 repositories,
+8 worktree fingerprints, 16 provider references, 16 plan references, and 32
+scopes.
+
 ### Conflict result
 
 Conflict evaluation uses `agent-session.conflict-evaluation.v1` and returns one
@@ -112,6 +132,32 @@ random lease ID, owning claim and revision, operation kind, canonical target
 set, controller-observed activity revision, exact persisted runtime identity
 digest, state, revision, start/expiry timestamps, and an execution token digest.
 Public views omit all private proof material.
+
+`admit` reads `agent-session.operation-targets.v1`:
+
+```json
+{
+  "schema_version": "agent-session.operation-targets.v1",
+  "targets": [{"kind": "path-exact", "repository": "owner/repository", "value": "src/lib.rs"}],
+  "provider_refs": [{"kind": "issue", "repository": "owner/repository", "number": 123}],
+  "checkouts": [{"repository": "owner/repository", "path": "/canonical/private/checkout"}],
+  "descendant": {"pid": 12345, "start_time": 987654}
+}
+```
+
+Checkout paths and descendant identity are private admission proof and never
+enter public output. `descendant` is optional and is accepted only where the
+platform can verify exact PID/start-time identity; unsupported verification
+fails closed. Filesystem targets require a matching checkout binding. A
+provider-only operation may omit `targets` and `checkouts`.
+
+Authenticated operation reconcile reads
+`agent-session.operation-reconcile-proof.v1` with exact fields
+`schema_version`, `execution_token`, and `outcome` (`pass` or `fail`). Broker
+adopt/reconcile reads `agent-session.coordination-recovery-proof.v1` with exact
+fields `schema_version`, `session_incarnation`, and `generation`; it never
+contains an operator token. Broker reconcile additionally requires the CLI or
+HTTP selectors `operation`, `if_revision`, and `attest_inactive: true`.
 
 ### Message
 
@@ -349,7 +395,7 @@ agent-session work-context reconcile --session ID --lease UUID --if-revision N -
 
 agent-session broker status --session ID [--capability-file FILE]
 agent-session broker adopt --session ID --proof-file JSON --idempotency-key KEY
-agent-session broker reconcile --session ID --proof-file JSON --idempotency-key KEY
+agent-session broker reconcile --session ID --proof-file JSON --operation UUID --if-revision N --attest-inactive --idempotency-key KEY
 
 agent-session message send --from ID --to ID --body-file FILE --capability-file FILE --idempotency-key KEY [--reply-to UUID] [--expires-in DURATION]
 agent-session message inbox --session ID --capability-file FILE [--state unread] [--cursor CURSOR] [--limit N]
@@ -393,6 +439,13 @@ idempotency, error codes, limits, and privacy projection. HTTP public reads
 require only the server operator bearer; owner/mailbox mutations additionally
 require the exact session capability. Conflicting selectors are rejected. Wait
 cancellation closes without changing message state.
+
+For `POST /sessions/{id}/messages/v1`, `{id}` is the recipient. The required
+`X-Agent-Session-Capability` determines the sender; the JSON body contains only
+`body`, `idempotency_key`, optional `reply_to`, and optional `expires_in`, and
+rejects a `to` redirect selector. The session check body contains only
+`self_selector` (default false) and `allow_incomplete`; candidates are accepted
+only by the registry-level check route.
 
 ## Public list and glance additions
 

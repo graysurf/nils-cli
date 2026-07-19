@@ -103,7 +103,8 @@ admit|complete|reconcile` binds covered filesystem/provider mutation targets to
 an execution token, exact activity/descendant evidence, and the persisted
 runtime identity. Releasing or replacing the claim is rejected while that
 operation is active or uncertain; a matching activity or descendant renews the
-30-minute lease, and missed completion needs exact stopped-runtime proof or two
+30-minute lease. Completion first enters a bounded durable broker queue so a
+lost PostTool response can be retried; missed completion needs exact stopped-runtime proof or two
 quiescent observations at least five seconds apart. Opaque, unbound-checkout,
 or uncovered targets fail closed.
 Peer summaries remain untrusted metadata and cannot authorize commands.
@@ -130,6 +131,11 @@ Managed calls normally use the capability path from the environment; external
 CLI mutations pass `--capability-file`. HTTP public work-context/broker reads
 require the serve bearer token; owner and mailbox mutations additionally require
 `X-Agent-Session-Capability`, keeping operator and session authority separate.
+For HTTP send, `/sessions/{id}/messages/v1` names the recipient and the
+capability names the sender; request JSON has no independent `to` selector.
+Claim/check clients use `agent-session.work-context-input.v1`, admission clients
+use `agent-session.operation-targets.v1`, and the exact checkout, descendant,
+operation-reconcile, and broker-recovery shapes are frozen in the linked spec.
 List and glance add only claim state/id/expiry, unread
 count, conflict severity, and coordination availability fields; the existing
 `cwd` field remains unchanged.

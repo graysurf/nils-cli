@@ -59,6 +59,21 @@ pub(crate) struct OperationLease {
     pub outcome: Option<String>,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub(crate) struct CompletionEvent {
+    pub schema_version: String,
+    pub event_id: String,
+    pub session_id: String,
+    pub session_incarnation: String,
+    pub lease_id: String,
+    pub if_revision: u64,
+    pub execution_token_digest: String,
+    pub outcome: String,
+    pub idempotency_key: String,
+    pub request_digest: String,
+    pub created_at_epoch: i64,
+}
+
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct OperationTargetsInput {
@@ -208,7 +223,7 @@ pub(crate) fn claim(context: &CliContext, args: WorkContextClaimArgs) -> Result<
         digest,
         outcome.clone(),
         now,
-    );
+    )?;
     locked.save()?;
     Ok(outcome)
 }
@@ -325,7 +340,7 @@ pub(crate) fn renew(context: &CliContext, args: WorkContextRenewArgs) -> Result<
         digest,
         outcome.clone(),
         now,
-    );
+    )?;
     locked.save()?;
     Ok(outcome)
 }
@@ -390,7 +405,7 @@ pub(crate) fn release(
         digest,
         outcome.clone(),
         now,
-    );
+    )?;
     locked.save()?;
     Ok(outcome)
 }
@@ -411,6 +426,7 @@ pub(crate) fn admit(context: &CliContext, args: WorkContextAdmitArgs) -> Result<
             None,
         ));
     }
+    validate_descendant(input.descendant.as_ref())?;
     let targets = canonicalize_targets(input.targets)?;
     let provider_targets = canonicalize_provider_refs(input.provider_refs)?;
     if targets.is_empty() && provider_targets.is_empty() {
@@ -559,7 +575,7 @@ pub(crate) fn admit(context: &CliContext, args: WorkContextAdmitArgs) -> Result<
         digest,
         outcome.clone(),
         now,
-    );
+    )?;
     locked.save()?;
     Ok(outcome)
 }
@@ -601,7 +617,7 @@ pub(crate) fn complete(
     let lease = locked
         .registry
         .operations
-        .iter_mut()
+        .iter()
         .find(|lease| {
             lease.session_id == record.id
                 && lease.session_incarnation == incarnation
@@ -619,25 +635,114 @@ pub(crate) fn complete(
     if lease.execution_token_digest != token_digest {
         return Err(super::unauthorized());
     }
+    let event_id = request_digest(
+        "operation-completion-event",
+        &(&record.id, &incarnation, &args.lease, &args.idempotency_key),
+    );
+    let pending = locked
+        .registry
+        .completion_events
+        .iter()
+        .find(|event| event.event_id == event_id);
+    if pending.is_some_and(|event| event.request_digest != digest) {
+        return Err(CliError::data(
+            "idempotency-key-reused",
+            "idempotency key is already bound to another request",
+            None,
+        ));
+    }
+    if pending.is_none() {
+        if locked
+            .registry
+            .completion_events
+            .iter()
+            .filter(|event| event.session_id == record.id)
+            .count()
+            >= 256
+        {
+            return Err(CliError::data(
+                "quota-exceeded",
+                "operation completion queue quota exceeded",
+                None,
+            ));
+        }
+        locked.registry.completion_events.push(CompletionEvent {
+            schema_version: "agent-session.operation-completion-event.v1".to_string(),
+            event_id: event_id.clone(),
+            session_id: record.id.clone(),
+            session_incarnation: incarnation.clone(),
+            lease_id: args.lease.clone(),
+            if_revision: args.if_revision,
+            execution_token_digest: token_digest,
+            outcome: args.outcome.as_str().to_string(),
+            idempotency_key: args.idempotency_key.clone(),
+            request_digest: digest.clone(),
+            created_at_epoch: now,
+        });
+        locked.save()?;
+    }
+    drop(locked);
+
+    let mut locked = lock_registry(context)?;
+    if let Some(replay) = idempotency_replay(
+        &locked.registry,
+        &args.idempotency_key,
+        &record.id,
+        &incarnation,
+        "work-context-complete",
+        &digest,
+    )? {
+        return Ok(replay);
+    }
+    let event = locked
+        .registry
+        .completion_events
+        .iter()
+        .find(|event| event.event_id == event_id)
+        .cloned()
+        .ok_or_else(operation_unavailable)?;
+    let lease = locked
+        .registry
+        .operations
+        .iter_mut()
+        .find(|lease| {
+            lease.session_id == event.session_id
+                && lease.session_incarnation == event.session_incarnation
+                && lease.lease_id == event.lease_id
+        })
+        .ok_or_else(operation_unavailable)?;
+    if lease.revision != event.if_revision
+        || lease.execution_token_digest != event.execution_token_digest
+        || !matches!(
+            lease.state.as_str(),
+            "active" | "completing" | "reconcile_pending"
+        )
+    {
+        return Err(revision_conflict("operation-revision-conflict"));
+    }
     lease.revision = lease.revision.saturating_add(1);
-    lease.state = if args.outcome.as_str() == "pass" {
+    lease.state = if event.outcome == "pass" {
         "completed".to_string()
     } else {
         "failed".to_string()
     };
-    lease.outcome = Some(args.outcome.as_str().to_string());
+    lease.outcome = Some(event.outcome.clone());
     lease.terminal_at_epoch = Some(now);
     let outcome = public_lease(lease)?;
     store_receipt(
         &mut locked.registry,
-        args.idempotency_key,
-        record.id,
-        incarnation,
+        event.idempotency_key,
+        event.session_id,
+        event.session_incarnation,
         "work-context-complete".to_string(),
-        digest,
+        event.request_digest,
         outcome.clone(),
         now,
-    );
+    )?;
+    locked
+        .registry
+        .completion_events
+        .retain(|candidate| candidate.event_id != event_id);
     locked.save()?;
     Ok(outcome)
 }
@@ -648,6 +753,12 @@ pub(crate) fn reconcile(
 ) -> Result<Value, CliError> {
     let (record, incarnation) =
         authenticate_from_file(context, &args.session, args.capability_file.as_deref())?;
+    let _session_fence = crate::acquire_session_record_lock(context, &record.id)?;
+    let record = crate::load_session_record(context, &record.id)?;
+    if super::incarnation(&record)? != incarnation {
+        return Err(super::unauthorized());
+    }
+    let _activity_fence = crate::activity::acquire_coordination_activity_lock(context, &record.id)?;
     let proof: ReconcileProof =
         read_bounded_json(&args.proof_file, 16 * 1024, "invalid-reconcile-proof")?;
     if proof.schema_version != "agent-session.operation-reconcile-proof.v1"
@@ -741,7 +852,7 @@ pub(crate) fn reconcile(
                 digest,
                 outcome.clone(),
                 now,
-            );
+            )?;
             locked.save()?;
             return Ok(outcome);
         }
@@ -779,7 +890,7 @@ pub(crate) fn reconcile(
         digest,
         outcome.clone(),
         now,
-    );
+    )?;
     locked.save()?;
     Ok(outcome)
 }
@@ -862,6 +973,40 @@ fn input_from_record(claim: &WorkContextRecord) -> WorkContextInput {
     }
 }
 
+pub(crate) fn conflict_severity_for_session(
+    context: &CliContext,
+    registry: &Registry,
+    session_id: &str,
+) -> Option<String> {
+    let broker = registry.brokers.get(session_id)?;
+    let claim = registry.claims.iter().find(|claim| {
+        claim.session_id == session_id
+            && claim.session_incarnation == broker.incarnation
+            && claim.state == "active"
+    })?;
+    let candidate = input_from_record(claim);
+    let complete =
+        complete_relevant_universe(context, registry, Some((session_id, &broker.incarnation)));
+    let classification = evaluate(
+        Some((session_id, &broker.incarnation)),
+        &candidate,
+        &registry.claims,
+        complete,
+        false,
+    )
+    .classification;
+    Some(
+        match classification {
+            ConflictClassification::Conflict => "conflict",
+            ConflictClassification::PotentialConflict => "potential_conflict",
+            ConflictClassification::Unknown => "unknown",
+            ConflictClassification::NoKnownConflict => "no_known_conflict",
+            ConflictClassification::Clear => "clear",
+        }
+        .to_string(),
+    )
+}
+
 fn public_context(claim: &WorkContextRecord) -> Result<Value, CliError> {
     let mut value = json_value(claim)?;
     let object = value
@@ -881,7 +1026,9 @@ fn public_lease(lease: &OperationLease) -> Result<Value, CliError> {
     object.remove("terminal_at_epoch");
     object.remove("execution_token_digest");
     object.remove("activity_revision");
+    object.remove("activity_identity_digest");
     object.remove("runtime_identity_digest");
+    object.remove("descendant");
     Ok(value)
 }
 
@@ -919,8 +1066,18 @@ fn complete_relevant_universe(
         let Some(broker) = registry.brokers.get(&id) else {
             return false;
         };
-        if broker.state != "ready" {
+        if broker.state == "stopped" {
             continue;
+        }
+        if broker.state != "ready"
+            || !super::broker::heartbeat_fresh(
+                context,
+                &id,
+                &broker.incarnation,
+                broker.heartbeat_epoch,
+            )
+        {
+            return false;
         }
         if !registry.claims.iter().any(|claim| {
             claim.session_id == id
@@ -954,10 +1111,62 @@ fn controller_observed_quiescent(
     let Some(activity) = crate::activity::state_for_view(context, record) else {
         return false;
     };
-    matches!(
-        activity.phase,
-        crate::activity::TurnPhase::Waiting | crate::activity::TurnPhase::NeedsInput
-    ) && activity_identity_digest(&activity) != lease.activity_identity_digest
+    let identity_changed = activity_identity_digest(&activity) != lease.activity_identity_digest
+        || activity.revision > lease.activity_revision;
+    identity_changed
+        && matches!(
+            activity.phase,
+            crate::activity::TurnPhase::Waiting
+                | crate::activity::TurnPhase::NeedsInput
+                | crate::activity::TurnPhase::Working
+        )
+}
+
+pub(crate) fn operator_reconcile_in_registry(
+    context: &CliContext,
+    registry: &mut Registry,
+    record: &crate::SessionRecord,
+    lease_id: &str,
+    if_revision: u64,
+    now: i64,
+) -> Result<Value, CliError> {
+    let incarnation = super::incarnation(record)?;
+    let snapshot = registry
+        .operations
+        .iter()
+        .find(|lease| {
+            lease.lease_id == lease_id
+                && lease.session_id == record.id
+                && lease.session_incarnation == incarnation
+        })
+        .cloned()
+        .ok_or_else(operation_unavailable)?;
+    if snapshot.revision != if_revision
+        || !matches!(
+            snapshot.state.as_str(),
+            "active" | "completing" | "reconcile_pending"
+        )
+    {
+        return Err(revision_conflict("operation-revision-conflict"));
+    }
+    if !controller_observed_quiescent(context, record, &snapshot) {
+        return Err(CliError::data(
+            "operation-still-running",
+            "operator reconciliation could not prove the operation inactive",
+            None,
+        ));
+    }
+    let lease = registry
+        .operations
+        .iter_mut()
+        .find(|lease| lease.lease_id == lease_id)
+        .ok_or_else(operation_unavailable)?;
+    lease.state = "abandoned".to_string();
+    lease.revision = lease.revision.saturating_add(1);
+    lease.terminal_at_epoch = Some(now);
+    lease.reconcile_observed_at_epoch = None;
+    lease.outcome = Some("operator-attested-inactive".to_string());
+    public_lease(lease)
 }
 
 pub(crate) fn activity_identity_digest(activity: &crate::activity::TurnState) -> String {
@@ -984,7 +1193,32 @@ pub(crate) fn descendant_is_live(descendant: &DescendantIdentity) -> bool {
     #[cfg(not(target_os = "linux"))]
     {
         let _ = descendant;
-        false
+        true
+    }
+}
+
+fn validate_descendant(descendant: Option<&DescendantIdentity>) -> Result<(), CliError> {
+    let Some(descendant) = descendant else {
+        return Ok(());
+    };
+    if descendant.pid <= 1 || descendant.start_time == 0 {
+        return Err(CliError::data(
+            "invalid-scope",
+            "descendant identity requires a positive non-system PID and start time",
+            None,
+        ));
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        return Err(CliError::runtime(
+            "coordination-unavailable",
+            "exact descendant identity is unsupported on this platform",
+            None,
+        ));
+    }
+    #[cfg(target_os = "linux")]
+    {
+        Ok(())
     }
 }
 
@@ -1047,7 +1281,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn operation_tokens_are_never_serialized() {
+    fn operation_private_proofs_are_never_serialized() {
         let lease = OperationLease {
             schema_version: OPERATION_LEASE_VERSION.to_string(),
             lease_id: "lease".to_string(),
@@ -1068,11 +1302,16 @@ mod tests {
             activity_revision: 1,
             activity_identity_digest: "activity".to_string(),
             runtime_identity_digest: "runtime".to_string(),
-            descendant: None,
+            descendant: Some(DescendantIdentity {
+                pid: 42,
+                start_time: 99,
+            }),
             reconcile_observed_at_epoch: None,
             outcome: None,
         };
         let value = public_lease(&lease).expect("serialize");
         assert!(!value.to_string().contains("canary"));
+        assert!(value.get("activity_identity_digest").is_none());
+        assert!(value.get("descendant").is_none());
     }
 }

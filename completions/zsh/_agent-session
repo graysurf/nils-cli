@@ -298,6 +298,7 @@ _arguments "${_arguments_options[@]}" : \
 json\:"Single-record JSON envelope (snake_case)"))' \
 '--state-dir=[State directory. Defaults to AGENT_SESSION_STATE_DIR, XDG_STATE_HOME/agent-session, or ~/.local/state/agent-session]:PATH:_files -/' \
 '--host=[Hostname used in generated ssh attach commands]:HOST:_default' \
+'--self[]' \
 '--allow-incomplete[]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
@@ -421,10 +422,13 @@ _arguments "${_arguments_options[@]}" : \
 '--session=[]:SESSION:_default' \
 '--proof-file=[]:PATH:_files' \
 '--idempotency-key=[]:IDEMPOTENCY_KEY:_default' \
+'--operation=[]:OPERATION:_default' \
+'--if-revision=[]:IF_REVISION:_default' \
 '--format=[]:FORMAT:((text\:"Human-readable text output (default)"
 json\:"Single-record JSON envelope (snake_case)"))' \
 '--state-dir=[State directory. Defaults to AGENT_SESSION_STATE_DIR, XDG_STATE_HOME/agent-session, or ~/.local/state/agent-session]:PATH:_files -/' \
 '--host=[Hostname used in generated ssh attach commands]:HOST:_default' \
+'--attest-inactive[]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
 && ret=0
@@ -434,10 +438,13 @@ _arguments "${_arguments_options[@]}" : \
 '--session=[]:SESSION:_default' \
 '--proof-file=[]:PATH:_files' \
 '--idempotency-key=[]:IDEMPOTENCY_KEY:_default' \
+'--operation=[]:OPERATION:_default' \
+'--if-revision=[]:IF_REVISION:_default' \
 '--format=[]:FORMAT:((text\:"Human-readable text output (default)"
 json\:"Single-record JSON envelope (snake_case)"))' \
 '--state-dir=[State directory. Defaults to AGENT_SESSION_STATE_DIR, XDG_STATE_HOME/agent-session, or ~/.local/state/agent-session]:PATH:_files -/' \
 '--host=[Hostname used in generated ssh attach commands]:HOST:_default' \
+'--attest-inactive[]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
 && ret=0
@@ -446,6 +453,19 @@ json\:"Single-record JSON envelope (snake_case)"))' \
 _arguments "${_arguments_options[@]}" : \
 '--session=[]:SESSION:_default' \
 '--capability-file=[]:PATH:_files' \
+'--format=[]:FORMAT:((text\:"Human-readable text output (default)"
+json\:"Single-record JSON envelope (snake_case)"))' \
+'--state-dir=[State directory. Defaults to AGENT_SESSION_STATE_DIR, XDG_STATE_HOME/agent-session, or ~/.local/state/agent-session]:PATH:_files -/' \
+'--host=[Hostname used in generated ssh attach commands]:HOST:_default' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+&& ret=0
+;;
+(heartbeat)
+_arguments "${_arguments_options[@]}" : \
+'--session=[]:SESSION:_default' \
+'--incarnation=[]:INCARNATION:_default' \
+'--generation=[]:GENERATION:_default' \
 '--format=[]:FORMAT:((text\:"Human-readable text output (default)"
 json\:"Single-record JSON envelope (snake_case)"))' \
 '--state-dir=[State directory. Defaults to AGENT_SESSION_STATE_DIR, XDG_STATE_HOME/agent-session, or ~/.local/state/agent-session]:PATH:_files -/' \
@@ -697,6 +717,7 @@ _agent-session__subcmd__broker_commands() {
 'adopt:Adopt an unchanged live runtime after validating recovery proof' \
 'reconcile:Reconcile broker and registry state from validated recovery proof' \
 'stop:' \
+'heartbeat:' \
     )
     _describe -t commands 'agent-session broker commands' commands "$@"
 }
@@ -704,6 +725,11 @@ _agent-session__subcmd__broker_commands() {
 _agent-session__subcmd__broker__subcmd__adopt_commands() {
     local commands; commands=()
     _describe -t commands 'agent-session broker adopt commands' commands "$@"
+}
+(( $+functions[_agent-session__subcmd__broker__subcmd__heartbeat_commands] )) ||
+_agent-session__subcmd__broker__subcmd__heartbeat_commands() {
+    local commands; commands=()
+    _describe -t commands 'agent-session broker heartbeat commands' commands "$@"
 }
 (( $+functions[_agent-session__subcmd__broker__subcmd__reconcile_commands] )) ||
 _agent-session__subcmd__broker__subcmd__reconcile_commands() {

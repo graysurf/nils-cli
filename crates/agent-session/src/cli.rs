@@ -418,6 +418,8 @@ pub enum BrokerCommand {
     Reconcile(BrokerRecoveryArgs),
     #[command(hide = true)]
     Stop(BrokerStopArgs),
+    #[command(hide = true)]
+    Heartbeat(BrokerHeartbeatArgs),
 }
 
 #[derive(Debug, Args)]
@@ -438,6 +440,12 @@ pub struct BrokerRecoveryArgs {
     pub proof_file: PathBuf,
     #[arg(long)]
     pub idempotency_key: String,
+    #[arg(long)]
+    pub operation: Option<String>,
+    #[arg(long)]
+    pub if_revision: Option<u64>,
+    #[arg(long)]
+    pub attest_inactive: bool,
     #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
     pub format: OutputFormat,
 }
@@ -449,6 +457,18 @@ pub struct BrokerStopArgs {
     #[arg(long, value_name = "PATH", value_hint = ValueHint::FilePath)]
     pub capability_file: Option<PathBuf>,
     #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
+    pub format: OutputFormat,
+}
+
+#[derive(Debug, Args)]
+pub struct BrokerHeartbeatArgs {
+    #[arg(long)]
+    pub session: String,
+    #[arg(long)]
+    pub incarnation: String,
+    #[arg(long)]
+    pub generation: u64,
+    #[arg(long, value_enum, default_value_t = OutputFormat::Json)]
     pub format: OutputFormat,
 }
 

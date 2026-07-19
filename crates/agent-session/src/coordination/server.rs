@@ -23,6 +23,8 @@ pub(crate) struct ClaimBody {
 pub(crate) struct CheckBody {
     pub candidate: Option<Value>,
     #[serde(default)]
+    pub self_selector: bool,
+    #[serde(default)]
     pub allow_incomplete: bool,
 }
 
@@ -67,7 +69,6 @@ pub(crate) struct ReconcileBody {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct SendBody {
-    pub to: String,
     pub body: String,
     pub idempotency_key: String,
     pub reply_to: Option<String>,
@@ -101,6 +102,10 @@ pub(crate) struct WaitBody {
 pub(crate) struct BrokerRecoveryBody {
     pub proof: Value,
     pub idempotency_key: String,
+    pub operation: Option<String>,
+    pub if_revision: Option<u64>,
+    #[serde(default)]
+    pub attest_inactive: bool,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -122,29 +127,51 @@ pub(crate) fn show(context: &CliContext, id: &str) -> Result<Value, CliError> {
     )
 }
 
-pub(crate) fn check(context: &CliContext, id: &str, body: CheckBody) -> Result<Value, CliError> {
-    with_optional_json(
+pub(crate) fn check(
+    context: &CliContext,
+    id: &str,
+    token: Option<&str>,
+    body: CheckBody,
+) -> Result<Value, CliError> {
+    validate_session_check_body(&body)?;
+    let capability = if body.self_selector {
+        let token = token.ok_or_else(super::unauthorized)?;
+        Some(authorize(context, id, token)?)
+    } else {
+        None
+    };
+    claims::check(
         context,
-        id,
-        "candidate",
-        body.candidate.as_ref(),
-        |candidate| {
-            claims::check(
-                context,
-                cli::WorkContextCheckArgs {
-                    session: candidate.is_none().then(|| id.to_string()),
-                    self_selector: false,
-                    capability_file: None,
-                    candidate,
-                    allow_incomplete: body.allow_incomplete,
-                    format: nils_common::cli_contract::OutputFormat::Json,
-                },
-            )
+        cli::WorkContextCheckArgs {
+            session: (!body.self_selector).then(|| id.to_string()),
+            self_selector: body.self_selector,
+            capability_file: capability.as_ref().map(|value| value.path.clone()),
+            candidate: None,
+            allow_incomplete: body.allow_incomplete,
+            format: nils_common::cli_contract::OutputFormat::Json,
         },
     )
 }
 
+fn validate_session_check_body(body: &CheckBody) -> Result<(), CliError> {
+    if body.candidate.is_some() {
+        return Err(CliError::usage(
+            "invalid-check-selector",
+            "session-level checks accept only the path session or authenticated self",
+            None,
+        ));
+    }
+    Ok(())
+}
+
 pub(crate) fn check_candidate(context: &CliContext, body: CheckBody) -> Result<Value, CliError> {
+    if body.self_selector {
+        return Err(CliError::usage(
+            "invalid-check-selector",
+            "registry-level checks accept only an explicit candidate",
+            None,
+        ));
+    }
     let candidate = body.candidate.as_ref().ok_or_else(|| {
         CliError::usage(
             "invalid-check-selector",
@@ -351,6 +378,9 @@ pub(crate) fn broker_recover(
                     session: id.to_string(),
                     proof_file,
                     idempotency_key: body.idempotency_key,
+                    operation: body.operation,
+                    if_revision: body.if_revision,
+                    attest_inactive: body.attest_inactive,
                     format: nils_common::cli_contract::OutputFormat::Json,
                 },
                 reconcile,
@@ -385,13 +415,13 @@ pub(crate) fn send(
     token: &str,
     body: SendBody,
 ) -> Result<Value, CliError> {
-    let server_capability = authorize(context, id, token)?;
-    with_text(context, id, "body", &body.body, |body_file| {
+    let (sender, server_capability) = authorize_any(context, token)?;
+    with_text(context, &sender.id, "body", &body.body, |body_file| {
         mailbox::send(
             context,
             cli::MessageSendArgs {
-                from_session: id.to_string(),
-                to_session: body.to,
+                from_session: sender.id.clone(),
+                to_session: id.to_string(),
                 body_file,
                 capability_file: Some(server_capability.path.clone()),
                 idempotency_key: body.idempotency_key,
@@ -519,17 +549,24 @@ fn authorize(context: &CliContext, id: &str, token: &str) -> Result<ServerCapabi
     Ok(ServerCapability { path })
 }
 
-fn with_optional_json<T>(
+fn authorize_any(
     context: &CliContext,
-    id: &str,
-    label: &str,
-    value: Option<&Value>,
-    operation: impl FnOnce(Option<PathBuf>) -> Result<T, CliError>,
-) -> Result<T, CliError> {
-    match value {
-        Some(value) => with_json(context, id, label, value, |path| operation(Some(path))),
-        None => operation(None),
-    }
+    token: &str,
+) -> Result<(crate::SessionRecord, ServerCapability), CliError> {
+    let (record, _) = super::authenticate_any_token(context, token)?;
+    let directory = super::coordination_dir(context, &record.id);
+    let path = directory.join(format!(
+        ".server-capability-{}.request",
+        uuid::Uuid::new_v4()
+    ));
+    write_atomic(&path, token.as_bytes(), SECRET_FILE_MODE).map_err(|_| {
+        CliError::runtime(
+            "coordination-unavailable",
+            "server capability staging failed",
+            None,
+        )
+    })?;
+    Ok((record, ServerCapability { path }))
 }
 
 fn with_json<T>(
@@ -600,4 +637,46 @@ pub(crate) fn capability_from_headers(headers: &axum::http::HeaderMap) -> Result
         .and_then(|value| value.to_str().ok())
         .filter(|value| !value.is_empty())
         .ok_or_else(super::unauthorized)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn send_body_uses_path_recipient_and_contains_no_redirect_selector() {
+        let parsed = serde_json::from_value::<SendBody>(json!({
+            "body": "hello",
+            "idempotency_key": "send-key-0001",
+            "reply_to": null,
+            "expires_in": null
+        }));
+        assert!(
+            parsed.is_ok(),
+            "recipient must come only from the route path"
+        );
+        assert!(
+            serde_json::from_value::<SendBody>(json!({
+                "to": "redirect-target",
+                "body": "hello",
+                "idempotency_key": "send-key-0002",
+                "reply_to": null,
+                "expires_in": null
+            }))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn session_check_rejects_a_candidate_selector() {
+        let body = CheckBody {
+            candidate: Some(json!({"schema_version": "agent-session.work-context-input.v1"})),
+            self_selector: false,
+            allow_incomplete: false,
+        };
+        let error = validate_session_check_body(&body)
+            .expect_err("candidate belongs only on the registry route");
+        assert_eq!(error.code(), "invalid-check-selector");
+    }
 }

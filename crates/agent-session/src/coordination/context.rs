@@ -673,7 +673,7 @@ fn reject_duplicates<T: Ord + Clone>(values: &[T], kind: &str) -> Result<(), Cli
 fn bounded_text(name: &str, value: String, max: usize) -> Result<String, CliError> {
     let value = value.trim().to_string();
     if value.is_empty()
-        || value.chars().count() > max
+        || value.len() > max
         || value.chars().any(|character| character.is_control())
     {
         return Err(invalid_context(&format!(
@@ -759,6 +759,24 @@ mod tests {
             &prefix,
             &scope(ScopeKind::PathExact, "tests/lib.rs")
         ));
+    }
+
+    #[test]
+    fn summary_limit_is_measured_in_utf8_bytes() {
+        let mut input = WorkContextInput {
+            schema_version: WORK_CONTEXT_INPUT_VERSION.to_string(),
+            intent: "implementation".to_string(),
+            tier: "L2".to_string(),
+            repositories: vec!["example/repo".to_string()],
+            worktrees: Vec::new(),
+            provider_refs: Vec::new(),
+            plan_refs: Vec::new(),
+            scopes: vec![scope(ScopeKind::Repository, ".")],
+            summary: "界".repeat(81),
+        };
+        assert!(input.clone().validate_and_canonicalize().is_err());
+        input.summary = "a".repeat(240);
+        assert!(input.validate_and_canonicalize().is_ok());
     }
 
     #[test]

@@ -32,6 +32,8 @@ const REGISTRY_LOCK: &str = "registry.lock";
 const LOCK_TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_REGISTRY_BYTES: u64 = 68 * 1024 * 1024;
 const RECEIPT_TTL_SECS: i64 = 24 * 60 * 60;
+const MAX_RECEIPTS_PER_PRINCIPAL: usize = 4_096;
+const MAX_RECEIPTS_GLOBAL: usize = 32_768;
 const TERMINAL_RETENTION_SECS: i64 = 5 * 60;
 const ACKNOWLEDGED_MESSAGE_RETENTION_SECS: i64 = 24 * 60 * 60;
 pub(crate) const CAPABILITY_ENV: &str = "AGENT_SESSION_CAPABILITY_FILE";
@@ -45,6 +47,7 @@ pub(crate) struct Registry {
     brokers: BTreeMap<String, BrokerRecord>,
     claims: Vec<context::WorkContextRecord>,
     operations: Vec<claims::OperationLease>,
+    completion_events: Vec<claims::CompletionEvent>,
     messages: Vec<mailbox::StoredMessage>,
     cursors: BTreeMap<String, mailbox::InboxCursor>,
     receipts: BTreeMap<String, IdempotencyReceipt>,
@@ -170,6 +173,11 @@ pub(crate) fn run_broker(context: &CliContext, args: cli::BrokerArgs) -> i32 {
             broker::recover(context, args, true),
         ),
         BrokerCommand::Stop(args) => ("broker-stop", args.format, broker::stop(context, args)),
+        BrokerCommand::Heartbeat(args) => (
+            "broker-heartbeat",
+            args.format,
+            broker::run_heartbeat_sidecar(context, args),
+        ),
     };
     render_coordination(command, format, result)
 }
@@ -374,6 +382,43 @@ pub(crate) fn authenticate_token(
         ));
     }
     Ok((record, incarnation))
+}
+
+pub(crate) fn authenticate_any_token(
+    context: &CliContext,
+    token: &str,
+) -> Result<(SessionRecord, String), CliError> {
+    if token.len() < 32 || token.len() > 256 || !token.is_ascii() {
+        return Err(unauthorized());
+    }
+    let digest = digest_bytes(token.as_bytes());
+    let locked = lock_registry(context)?;
+    let mut matches = locked.registry.brokers.values().filter(|broker| {
+        broker.state == "ready"
+            && digest_eq(&broker.capability_digest, &digest)
+            && broker::capability_available(
+                context,
+                &broker.session_id,
+                &broker.incarnation,
+                &broker.capability_digest,
+            )
+            && broker::heartbeat_fresh(
+                context,
+                &broker.session_id,
+                &broker.incarnation,
+                broker.heartbeat_epoch,
+            )
+    });
+    let broker = matches.next().cloned().ok_or_else(unauthorized)?;
+    if matches.next().is_some() {
+        return Err(unauthorized());
+    }
+    drop(locked);
+    let record = load_session_record(context, &broker.session_id).map_err(|_| unauthorized())?;
+    if incarnation(&record)? != broker.incarnation {
+        return Err(unauthorized());
+    }
+    Ok((record, broker.incarnation))
 }
 
 pub(crate) fn revalidate_capability_file(
@@ -678,7 +723,20 @@ pub(crate) fn clean_expired(registry: &mut Registry, now: i64) -> bool {
                     "active" | "completing" | "reconcile_pending"
                 )
         });
-        if claim.state == "active" && claim.expires_at_epoch <= now && !bound_operation {
+        let owner_runtime_live = registry
+            .brokers
+            .get(&claim.session_id)
+            .filter(|broker| broker.incarnation == claim.session_incarnation)
+            .and_then(|broker| broker.runtime_identity.as_ref())
+            .is_some_and(|identity| {
+                crate::coordination_runtime_status_for_identity(identity)
+                    == crate::CoordinationRuntimeStatus::Running
+            });
+        if claim.state == "active"
+            && claim.expires_at_epoch <= now
+            && !bound_operation
+            && !owner_runtime_live
+        {
             claim.state = "expired".to_string();
             claim.revision = claim.revision.saturating_add(1);
             claim.terminal_at_epoch = Some(now);
@@ -730,6 +788,7 @@ pub(crate) fn clean_expired(registry: &mut Registry, now: i64) -> bool {
     let claim_count = registry.claims.len();
     let receipt_count = registry.receipts.len();
     let cursor_count = registry.cursors.len();
+    let completion_event_count = registry.completion_events.len();
     registry
         .messages
         .retain(|message| !removed_messages.contains(&message.message_id));
@@ -752,6 +811,17 @@ pub(crate) fn clean_expired(registry: &mut Registry, now: i64) -> bool {
     registry
         .cursors
         .retain(|_, cursor| cursor.expires_at_epoch > now);
+    let operations = &registry.operations;
+    registry.completion_events.retain(|event| {
+        event.created_at_epoch > now.saturating_sub(RECEIPT_TTL_SECS)
+            && operations.iter().any(|operation| {
+                operation.lease_id == event.lease_id
+                    && matches!(
+                        operation.state.as_str(),
+                        "active" | "completing" | "reconcile_pending"
+                    )
+            })
+    });
     changed
         || registry.messages.len() != message_count
         || registry.notifications.len() != notification_count
@@ -759,6 +829,7 @@ pub(crate) fn clean_expired(registry: &mut Registry, now: i64) -> bool {
         || registry.claims.len() != claim_count
         || registry.receipts.len() != receipt_count
         || registry.cursors.len() != cursor_count
+        || registry.completion_events.len() != completion_event_count
 }
 
 pub(crate) fn idempotency_replay(
@@ -798,8 +869,23 @@ pub(crate) fn store_receipt(
     digest: String,
     outcome: Value,
     now: i64,
-) {
+) -> Result<(), CliError> {
     let receipt_key = receipt_key(&principal, &incarnation, &operation, &key);
+    if !registry.receipts.contains_key(&receipt_key)
+        && (registry.receipts.len() >= MAX_RECEIPTS_GLOBAL
+            || registry
+                .receipts
+                .values()
+                .filter(|receipt| receipt.principal == principal)
+                .count()
+                >= MAX_RECEIPTS_PER_PRINCIPAL)
+    {
+        return Err(CliError::data(
+            "quota-exceeded",
+            "coordination idempotency receipt quota exceeded",
+            None,
+        ));
+    }
     registry.receipts.insert(
         receipt_key,
         IdempotencyReceipt {
@@ -811,6 +897,7 @@ pub(crate) fn store_receipt(
             expires_at_epoch: now.saturating_add(RECEIPT_TTL_SECS),
         },
     );
+    Ok(())
 }
 
 fn receipt_key(principal: &str, incarnation: &str, operation: &str, key: &str) -> String {
@@ -1000,7 +1087,11 @@ pub(crate) fn public_summary(context: &CliContext, session_id: &str) -> Coordina
                 message.recipient_session_id == session_id && message.state == "unread"
             })
             .count(),
-        coordination_conflict_severity: None,
+        coordination_conflict_severity: claims::conflict_severity_for_session(
+            context,
+            &locked.registry,
+            session_id,
+        ),
         coordination_available: locked
             .registry
             .brokers

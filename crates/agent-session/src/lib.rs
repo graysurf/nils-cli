@@ -107,7 +107,7 @@ const DELETE_TMUX_TERMINATION_STATE_KEY: &str = "delete_tmux_termination_state";
 const TMUX_RUNTIME_NEVER_LAUNCHED_KEY: &str = "tmux_runtime_never_launched";
 const TMUX_RUNTIME_IDENTITY_CHANGED_OUTPUT: &str = "agent-session-runtime-identity-changed";
 const COORDINATION_LAUNCH_GATE: &str = "launch-ready";
-const HELD_LAUNCH_SCRIPT: &str = "gate=$1; heartbeat=$2; capability=$3; incarnation=$4; broker_bin=$5; shift 5; done_file=\"${heartbeat}.done.$$\"; umask 077; heartbeat_once() { tmp=\"${heartbeat}.tmp.$$\"; printf '%s:%s\\n' \"$incarnation\" \"$(date +%s)\" > \"$tmp\" && chmod 600 \"$tmp\" && mv -f \"$tmp\" \"$heartbeat\"; }; heartbeat_once; while [ ! -f \"$gate\" ]; do sleep 0.01; done; (\"$@\"; status=$?; printf '%s\\n' \"$status\" > \"$done_file\"; exit \"$status\") & child=$!; while [ ! -f \"$done_file\" ]; do heartbeat_once; sleep 2; done; wait \"$child\"; status=$?; \"$broker_bin\" --state-dir \"$AGENT_SESSION_STATE_DIR\" broker stop --session \"$AGENT_SESSION_ID\" --capability-file \"$capability\" --format json >/dev/null 2>&1 || true; rm -f \"$done_file\" \"$capability\"; exit \"$status\"";
+const HELD_LAUNCH_SCRIPT: &str = "gate=$1; heartbeat=$2; capability=$3; incarnation=$4; generation=$5; broker_bin=$6; shift 6; done_file=\"${heartbeat}.done.$$\"; umask 077; \"$broker_bin\" --state-dir \"$AGENT_SESSION_STATE_DIR\" broker heartbeat --session \"$AGENT_SESSION_ID\" --incarnation \"$incarnation\" --generation \"$generation\" --format json >/dev/null 2>&1 & broker_pid=$!; while [ ! -f \"$gate\" ]; do sleep 0.01; done; (\"$@\"; status=$?; printf '%s\\n' \"$status\" > \"$done_file\"; exit \"$status\") & child=$!; wait \"$child\"; status=$?; kill \"$broker_pid\" >/dev/null 2>&1 || true; wait \"$broker_pid\" >/dev/null 2>&1 || true; \"$broker_bin\" --state-dir \"$AGENT_SESSION_STATE_DIR\" broker stop --session \"$AGENT_SESSION_ID\" --capability-file \"$capability\" --format json >/dev/null 2>&1 || true; rm -f \"$done_file\" \"$capability\"; exit \"$status\"";
 
 pub fn run() -> i32 {
     run_with_args(env::args_os())
@@ -204,6 +204,7 @@ fn coordination_command_name(command: &Command) -> Option<&'static str> {
             cli::BrokerCommand::Adopt(_) => "broker-adopt",
             cli::BrokerCommand::Reconcile(_) => "broker-reconcile",
             cli::BrokerCommand::Stop(_) => "broker-stop",
+            cli::BrokerCommand::Heartbeat(_) => "broker-heartbeat",
         }),
         Command::Message(args) => Some(match &args.command {
             cli::MessageCommand::Send(_) => "message-send",
@@ -276,6 +277,7 @@ fn command_format(command: &Command) -> OutputFormat {
             cli::BrokerCommand::Status(args) => args.format,
             cli::BrokerCommand::Adopt(args) | cli::BrokerCommand::Reconcile(args) => args.format,
             cli::BrokerCommand::Stop(args) => args.format,
+            cli::BrokerCommand::Heartbeat(args) => args.format,
         },
         Command::Message(args) => match &args.command {
             cli::MessageCommand::Send(args) => args.format,
@@ -4015,6 +4017,14 @@ fn begin_held_runtime(
                 .as_ref()
                 .map(|runtime| runtime.launch_id.as_str())
                 .unwrap_or_default(),
+        )
+        .arg(
+            record
+                .runtime
+                .as_ref()
+                .map(|runtime| runtime.generation)
+                .unwrap_or_default()
+                .to_string(),
         )
         .arg(broker_bin);
     Ok(())
@@ -9637,15 +9647,16 @@ mod tests {
     };
 
     #[test]
-    fn coordination_review_held_launch_heartbeats_before_waiting_on_the_gate() {
+    fn coordination_review_held_launch_starts_persistent_broker_before_the_gate() {
         let heartbeat = super::HELD_LAUNCH_SCRIPT
-            .find("heartbeat_once;")
-            .expect("heartbeat setup");
+            .find("broker heartbeat")
+            .expect("broker sidecar setup");
         let gate = super::HELD_LAUNCH_SCRIPT
             .find("while [ ! -f \"$gate\" ]")
             .expect("gate wait");
         assert!(heartbeat < gate);
         assert!(super::HELD_LAUNCH_SCRIPT.contains("\"$capability\""));
+        assert!(!super::HELD_LAUNCH_SCRIPT.contains("heartbeat_once"));
     }
 
     #[test]

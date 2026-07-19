@@ -125,8 +125,9 @@ pub(crate) fn send(context: &CliContext, args: MessageSendArgs) -> Result<Value,
 }
 
 pub(crate) fn inbox(context: &CliContext, args: MessageInboxArgs) -> Result<Value, CliError> {
+    let capability_file = resolve_capability_file(args.capability_file.as_deref())?;
     let (record, recipient_incarnation) =
-        authenticate_from_file(context, &args.session, args.capability_file.as_deref())?;
+        authenticate_from_file(context, &args.session, Some(&capability_file))?;
     let limit = args.limit.unwrap_or(DEFAULT_PAGE);
     if limit == 0 || limit > MAX_PAGE {
         return Err(CliError::usage(
@@ -149,6 +150,13 @@ pub(crate) fn inbox(context: &CliContext, args: MessageInboxArgs) -> Result<Valu
     let now = now_epoch();
     let mut locked = lock_registry(context)?;
     clean_expired(&mut locked.registry, now);
+    revalidate_capability_file(
+        context,
+        &locked.registry,
+        &record,
+        &recipient_incarnation,
+        &capability_file,
+    )?;
     let mut messages: Vec<_> = locked
         .registry
         .messages
@@ -196,25 +204,55 @@ pub(crate) fn inbox(context: &CliContext, args: MessageInboxArgs) -> Result<Valu
     let page: Vec<_> = messages.into_iter().skip(start).take(limit).collect();
     let next_cursor = if start.saturating_add(page.len()) < total {
         let last = page.last().expect("a remaining page has a predecessor");
-        if locked.registry.cursors.len() >= MAX_CURSORS {
-            return Err(CliError::data(
-                "quota-exceeded",
-                "coordination cursor quota exceeded",
-                None,
-            ));
-        }
-        let opaque = uuid::Uuid::new_v4().simple().to_string();
-        locked.registry.cursors.insert(
-            opaque.clone(),
-            InboxCursor {
-                recipient_session_id: record.id.clone(),
-                recipient_incarnation: recipient_incarnation.clone(),
-                state: args.state.clone(),
-                after_created_at_epoch: last.created_at_epoch,
-                after_message_id: last.message_id.clone(),
-                expires_at_epoch: now.saturating_add(CURSOR_TTL_SECS),
-            },
-        );
+        let desired = InboxCursor {
+            recipient_session_id: record.id.clone(),
+            recipient_incarnation: recipient_incarnation.clone(),
+            state: args.state.clone(),
+            after_created_at_epoch: last.created_at_epoch,
+            after_message_id: last.message_id.clone(),
+            expires_at_epoch: now.saturating_add(CURSOR_TTL_SECS),
+        };
+        let existing = locked
+            .registry
+            .cursors
+            .iter()
+            .find(|(_, cursor)| {
+                cursor.recipient_session_id == desired.recipient_session_id
+                    && cursor.recipient_incarnation == desired.recipient_incarnation
+                    && cursor.state == desired.state
+                    && cursor.after_created_at_epoch == desired.after_created_at_epoch
+                    && cursor.after_message_id == desired.after_message_id
+            })
+            .map(|(key, _)| key.clone());
+        let opaque = if let Some(existing) = existing {
+            locked
+                .registry
+                .cursors
+                .get_mut(&existing)
+                .expect("existing cursor remains present")
+                .expires_at_epoch = desired.expires_at_epoch;
+            existing
+        } else {
+            let principal_cursors = locked
+                .registry
+                .cursors
+                .values()
+                .filter(|cursor| {
+                    cursor.recipient_session_id == record.id
+                        && cursor.recipient_incarnation == recipient_incarnation
+                })
+                .count();
+            if locked.registry.cursors.len() >= MAX_CURSORS || principal_cursors >= 128 {
+                return Err(CliError::data(
+                    "quota-exceeded",
+                    "coordination cursor quota exceeded",
+                    None,
+                ));
+            }
+            let opaque = uuid::Uuid::new_v4().simple().to_string();
+            locked.registry.cursors.insert(opaque.clone(), desired);
+            opaque
+        };
         Some(opaque)
     } else {
         None
@@ -229,11 +267,19 @@ pub(crate) fn inbox(context: &CliContext, args: MessageInboxArgs) -> Result<Valu
 }
 
 pub(crate) fn show(context: &CliContext, args: MessageShowArgs) -> Result<Value, CliError> {
+    let capability_file = resolve_capability_file(args.capability_file.as_deref())?;
     let (record, recipient_incarnation) =
-        authenticate_from_file(context, &args.session, args.capability_file.as_deref())?;
+        authenticate_from_file(context, &args.session, Some(&capability_file))?;
     let now = now_epoch();
     let mut locked = lock_registry(context)?;
     clean_expired(&mut locked.registry, now);
+    revalidate_capability_file(
+        context,
+        &locked.registry,
+        &record,
+        &recipient_incarnation,
+        &capability_file,
+    )?;
     let message = find_recipient_message_mut(
         &mut locked.registry,
         &record.id,
@@ -259,8 +305,9 @@ pub(crate) fn show(context: &CliContext, args: MessageShowArgs) -> Result<Value,
 }
 
 pub(crate) fn ack(context: &CliContext, args: MessageAckArgs) -> Result<Value, CliError> {
+    let capability_file = resolve_capability_file(args.capability_file.as_deref())?;
     let (record, recipient_incarnation) =
-        authenticate_from_file(context, &args.session, args.capability_file.as_deref())?;
+        authenticate_from_file(context, &args.session, Some(&capability_file))?;
     let digest = request_digest(
         "message-ack",
         &json!({
@@ -271,6 +318,13 @@ pub(crate) fn ack(context: &CliContext, args: MessageAckArgs) -> Result<Value, C
     let now = now_epoch();
     let mut locked = lock_registry(context)?;
     clean_expired(&mut locked.registry, now);
+    revalidate_capability_file(
+        context,
+        &locked.registry,
+        &record,
+        &recipient_incarnation,
+        &capability_file,
+    )?;
     if let Some(replay) = idempotency_replay(
         &locked.registry,
         &args.idempotency_key,
@@ -306,7 +360,7 @@ pub(crate) fn ack(context: &CliContext, args: MessageAckArgs) -> Result<Value, C
         digest,
         outcome.clone(),
         now,
-    );
+    )?;
     locked.save()?;
     Ok(outcome)
 }
@@ -361,13 +415,21 @@ pub(crate) fn reply(context: &CliContext, args: MessageReplyArgs) -> Result<Valu
 }
 
 pub(crate) fn wait(context: &CliContext, args: MessageWaitArgs) -> Result<Value, CliError> {
+    let capability_file = resolve_capability_file(args.capability_file.as_deref())?;
     let (record, recipient_incarnation) =
-        authenticate_from_file(context, &args.session, args.capability_file.as_deref())?;
+        authenticate_from_file(context, &args.session, Some(&capability_file))?;
     let timeout = parse_wait(&args.timeout)?;
     let started = Instant::now();
     loop {
         let mut locked = lock_registry(context)?;
         let registry_changed = clean_expired(&mut locked.registry, now_epoch());
+        revalidate_capability_file(
+            context,
+            &locked.registry,
+            &record,
+            &recipient_incarnation,
+            &capability_file,
+        )?;
         let message = locked
             .registry
             .messages
@@ -441,6 +503,43 @@ fn send_authenticated(
             None,
         ));
     }
+    let expiry_secs = parse_expiry(expires_in)?;
+    let digest = request_digest(
+        operation,
+        &json!({
+            "sender": sender_session_id,
+            "recipient": recipient_session_id,
+            "body_digest": super::digest_bytes(body.as_bytes()),
+            "reply_to": reply_to,
+            "expiry_secs": expiry_secs,
+            "if_revision": expected_parent_revision,
+        }),
+    );
+    {
+        let _sender_lock = crate::acquire_session_record_lock(context, sender_session_id)
+            .map_err(|_| super::unauthorized())?;
+        let sender = crate::load_session_record(context, sender_session_id)
+            .map_err(|_| super::unauthorized())?;
+        let mut locked = lock_registry(context)?;
+        clean_expired(&mut locked.registry, now_epoch());
+        revalidate_capability_file(
+            context,
+            &locked.registry,
+            &sender,
+            sender_incarnation,
+            capability_file,
+        )?;
+        if let Some(replay) = idempotency_replay(
+            &locked.registry,
+            &idempotency_key,
+            sender_session_id,
+            sender_incarnation,
+            operation,
+            &digest,
+        )? {
+            return Ok(replay);
+        }
+    }
     let mut lifecycle_ids = vec![sender_session_id, recipient_session_id];
     lifecycle_ids.sort_unstable();
     lifecycle_ids.dedup();
@@ -463,18 +562,6 @@ fn send_authenticated(
             None,
         ));
     }
-    let expiry_secs = parse_expiry(expires_in)?;
-    let digest = request_digest(
-        operation,
-        &json!({
-            "sender": sender_session_id,
-            "recipient": recipient.id,
-            "body_digest": super::digest_bytes(body.as_bytes()),
-            "reply_to": reply_to,
-            "expiry_secs": expiry_secs,
-            "if_revision": expected_parent_revision,
-        }),
-    );
     let now = now_epoch();
     let mut locked = lock_registry(context)?;
     clean_expired(&mut locked.registry, now);
@@ -485,6 +572,16 @@ fn send_authenticated(
         sender_incarnation,
         capability_file,
     )?;
+    if let Some(replay) = idempotency_replay(
+        &locked.registry,
+        &idempotency_key,
+        sender_session_id,
+        sender_incarnation,
+        operation,
+        &digest,
+    )? {
+        return Ok(replay);
+    }
     let broker = locked
         .registry
         .brokers
@@ -513,16 +610,6 @@ fn send_authenticated(
             )
         })?;
     let recipient_incarnation = broker.incarnation.clone();
-    if let Some(replay) = idempotency_replay(
-        &locked.registry,
-        &idempotency_key,
-        sender_session_id,
-        sender_incarnation,
-        operation,
-        &digest,
-    )? {
-        return Ok(replay);
-    }
     let pair_recent = locked
         .registry
         .messages
@@ -664,7 +751,7 @@ fn send_authenticated(
         digest,
         outcome.clone(),
         now,
-    );
+    )?;
     locked.save()?;
     Ok(outcome)
 }

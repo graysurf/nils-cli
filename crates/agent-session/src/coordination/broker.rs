@@ -2,7 +2,9 @@ use std::fs::{self, OpenOptions};
 use std::io::Read;
 use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
+use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -10,7 +12,7 @@ use nils_common::fs::{SECRET_FILE_MODE, write_atomic};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use crate::cli::{BrokerRecoveryArgs, BrokerStatusArgs, BrokerStopArgs};
+use crate::cli::{BrokerHeartbeatArgs, BrokerRecoveryArgs, BrokerStatusArgs, BrokerStopArgs};
 use crate::{CliContext, CliError, SessionRecord};
 
 use super::{
@@ -465,7 +467,49 @@ pub(crate) fn recover(
     } else {
         "broker-adopt"
     };
-    let digest = request_digest(operation, &proof);
+    let reconcile_selector = if reconcile {
+        if !args.attest_inactive {
+            return Err(CliError::usage(
+                "invalid-recovery-proof",
+                "broker reconcile requires --attest-inactive",
+                None,
+            ));
+        }
+        Some((
+            args.operation.as_deref().ok_or_else(|| {
+                CliError::usage(
+                    "invalid-recovery-proof",
+                    "broker reconcile requires --operation",
+                    None,
+                )
+            })?,
+            args.if_revision.ok_or_else(|| {
+                CliError::usage(
+                    "invalid-recovery-proof",
+                    "broker reconcile requires --if-revision",
+                    None,
+                )
+            })?,
+        ))
+    } else {
+        if args.operation.is_some() || args.if_revision.is_some() || args.attest_inactive {
+            return Err(CliError::usage(
+                "invalid-recovery-proof",
+                "broker adopt does not accept operation reconciliation selectors",
+                None,
+            ));
+        }
+        None
+    };
+    let digest = request_digest(
+        operation,
+        &json!({
+            "proof": proof,
+            "operation": args.operation,
+            "if_revision": args.if_revision,
+            "attest_inactive": args.attest_inactive,
+        }),
+    );
     {
         let locked = lock_registry(context)?;
         if let Some(replay) = idempotency_replay(
@@ -514,8 +558,7 @@ pub(crate) fn recover(
             None,
         ));
     }
-    let now = now_epoch();
-    let mut locked = lock_registry(context)?;
+    let locked = lock_registry(context)?;
     if let Some(replay) = idempotency_replay(
         &locked.registry,
         &args.idempotency_key,
@@ -569,27 +612,87 @@ pub(crate) fn recover(
             None,
         ));
     }
-    write_atomic(
-        &super::heartbeat_path(&context.state_dir, &record.id),
-        format!("{}:{}\n", record_incarnation, now).as_bytes(),
-        SECRET_FILE_MODE,
-    )
-    .map_err(|_| unavailable())?;
+    drop(locked);
+    let heartbeat = super::heartbeat_path(&context.state_dir, &record.id);
+    match fs::remove_file(&heartbeat) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(_) => return Err(unavailable()),
+    }
+    spawn_heartbeat_sidecar(context, &record.id, &record_incarnation, record_generation)?;
+    let started = Instant::now();
+    while !heartbeat_fresh(context, &record.id, &record_incarnation, 0) {
+        if started.elapsed() >= Duration::from_secs(2) {
+            return Err(CliError::runtime(
+                "coordination-broker-start-timeout",
+                "recovered broker sidecar did not become ready",
+                None,
+            ));
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    let runtime = crate::coordination_runtime_evidence(&record)?;
+    if runtime.status != crate::CoordinationRuntimeStatus::Running
+        || runtime.identity_digest != broker_snapshot.runtime_identity_digest
+    {
+        return Err(CliError::runtime(
+            "coordination-runtime-unverified",
+            "the recovered runtime changed before broker commit",
+            None,
+        ));
+    }
+    let _activity_fence = if reconcile {
+        Some(crate::activity::acquire_coordination_activity_lock(
+            context, &record.id,
+        )?)
+    } else {
+        None
+    };
+    let now = now_epoch();
+    let mut locked = lock_registry(context)?;
+    if let Some(replay) = idempotency_replay(
+        &locked.registry,
+        &args.idempotency_key,
+        &record.id,
+        &record_incarnation,
+        operation,
+        &digest,
+    )? {
+        return Ok(replay);
+    }
     let broker = locked
         .registry
         .brokers
         .get_mut(&record.id)
+        .filter(|broker| {
+            broker.incarnation == record_incarnation
+                && broker.generation == record_generation
+                && broker.runtime_identity_digest == runtime.identity_digest
+        })
         .ok_or_else(unavailable)?;
     broker.state = "ready".to_string();
     broker.heartbeat_at = timestamp(now);
     broker.heartbeat_epoch = now;
     broker.lost_since_epoch = None;
+    let operation_reconciliation = reconcile_selector
+        .map(|(lease_id, revision)| {
+            super::claims::operator_reconcile_in_registry(
+                context,
+                &mut locked.registry,
+                &record,
+                lease_id,
+                revision,
+                now,
+            )
+        })
+        .transpose()?;
     let result = json!({
         "schema_version": BROKER_VERSION,
         "session_id": record.id,
         "state": "ready",
         "generation": record_generation,
-        "recovery": if reconcile { "reconciled" } else { "adopted" }
+        "recovery": if reconcile { "reconciled" } else { "adopted" },
+        "operation_reconciliation": operation_reconciliation,
     });
     store_receipt(
         &mut locked.registry,
@@ -600,9 +703,118 @@ pub(crate) fn recover(
         digest,
         result.clone(),
         now,
-    );
+    )?;
     locked.save()?;
     Ok(result)
+}
+
+fn spawn_heartbeat_sidecar(
+    context: &CliContext,
+    session_id: &str,
+    incarnation: &str,
+    generation: u64,
+) -> Result<(), CliError> {
+    let executable = std::env::current_exe().map_err(|_| unavailable())?;
+    let mut command = Command::new(executable);
+    command
+        .arg("--state-dir")
+        .arg(&context.state_dir)
+        .arg("broker")
+        .arg("heartbeat")
+        .arg("--session")
+        .arg(session_id)
+        .arg("--incarnation")
+        .arg(incarnation)
+        .arg("--generation")
+        .arg(generation.to_string())
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    // SAFETY: the child performs only async-signal-safe `setsid` before exec.
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setsid() < 0 {
+                Err(std::io::Error::last_os_error())
+            } else {
+                Ok(())
+            }
+        });
+    }
+    command.spawn().map_err(|_| unavailable())?;
+    Ok(())
+}
+
+pub(crate) fn run_heartbeat_sidecar(
+    context: &CliContext,
+    args: BrokerHeartbeatArgs,
+) -> Result<Value, CliError> {
+    let directory = super::coordination_dir(context, &args.session);
+    let lock_path = directory.join(format!(
+        "broker-{}.lock",
+        digest_bytes(args.incarnation.as_bytes())
+    ));
+    let lock = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .mode(SECRET_FILE_MODE)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(lock_path)
+        .map_err(|_| unavailable())?;
+    use std::os::fd::AsRawFd;
+    // SAFETY: `lock` owns a valid descriptor for the lifetime of the loop.
+    if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        return Err(CliError::data(
+            "coordination-broker-not-lost",
+            "an exact broker heartbeat owner already exists",
+            None,
+        ));
+    }
+    let started = Instant::now();
+    loop {
+        let record = match crate::load_session_record(context, &args.session) {
+            Ok(record) => record,
+            Err(_) if started.elapsed() < Duration::from_secs(2) => {
+                thread::sleep(Duration::from_millis(20));
+                continue;
+            }
+            Err(_) => break,
+        };
+        let matches = incarnation(&record).is_ok_and(|value| value == args.incarnation)
+            && record
+                .runtime
+                .as_ref()
+                .is_some_and(|runtime| runtime.generation == args.generation);
+        if !matches {
+            break;
+        }
+        let _runtime = match crate::coordination_runtime_evidence(&record) {
+            Ok(runtime) if runtime.status == crate::CoordinationRuntimeStatus::Running => runtime,
+            Ok(_) | Err(_) if started.elapsed() < Duration::from_secs(5) => {
+                thread::sleep(Duration::from_millis(20));
+                continue;
+            }
+            Ok(_) | Err(_) => break,
+        };
+        let now = now_epoch();
+        write_atomic(
+            &super::heartbeat_path(&context.state_dir, &args.session),
+            format!("{}:{}\n", args.incarnation, now).as_bytes(),
+            SECRET_FILE_MODE,
+        )
+        .map_err(|_| unavailable())?;
+        thread::sleep(Duration::from_secs(2));
+    }
+    if let Ok(record) = crate::load_session_record(context, &args.session)
+        && incarnation(&record).is_ok_and(|value| value == args.incarnation)
+    {
+        let _ = revoke(context, &record);
+    }
+    Ok(json!({
+        "schema_version": BROKER_VERSION,
+        "session_id": args.session,
+        "state": "stopped"
+    }))
 }
 
 fn unavailable() -> CliError {

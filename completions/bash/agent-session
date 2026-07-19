@@ -88,6 +88,9 @@ _agent-session() {
             agent__session__broker,adopt)
                 cmd="agent__session__broker__adopt"
                 ;;
+            agent__session__broker,heartbeat)
+                cmd="agent__session__broker__heartbeat"
+                ;;
             agent__session__broker,reconcile)
                 cmd="agent__session__broker__reconcile"
                 ;;
@@ -430,7 +433,7 @@ _agent-session() {
             return 0
             ;;
         agent__session__broker)
-            opts="-h --state-dir --host --help status adopt reconcile stop"
+            opts="-h --state-dir --host --help status adopt reconcile stop heartbeat"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -455,7 +458,7 @@ _agent-session() {
             return 0
             ;;
         agent__session__broker__adopt)
-            opts="-h --session --proof-file --idempotency-key --format --state-dir --host --help"
+            opts="-h --session --proof-file --idempotency-key --operation --if-revision --attest-inactive --format --state-dir --host --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -481,6 +484,55 @@ _agent-session() {
                     return 0
                     ;;
                 --idempotency-key)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --operation)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --if-revision)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --format)
+                    COMPREPLY=($(compgen -W "text json" -- "${cur}"))
+                    return 0
+                    ;;
+                --state-dir)
+                    COMPREPLY=()
+                    if [[ "${BASH_VERSINFO[0]}" -ge 4 ]]; then
+                        compopt -o plusdirs
+                    fi
+                    return 0
+                    ;;
+                --host)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        agent__session__broker__heartbeat)
+            opts="-h --session --incarnation --generation --format --state-dir --host --help"
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                --session)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --incarnation)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --generation)
                     COMPREPLY=($(compgen -f "${cur}"))
                     return 0
                     ;;
@@ -507,7 +559,7 @@ _agent-session() {
             return 0
             ;;
         agent__session__broker__reconcile)
-            opts="-h --session --proof-file --idempotency-key --format --state-dir --host --help"
+            opts="-h --session --proof-file --idempotency-key --operation --if-revision --attest-inactive --format --state-dir --host --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -533,6 +585,14 @@ _agent-session() {
                     return 0
                     ;;
                 --idempotency-key)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --operation)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --if-revision)
                     COMPREPLY=($(compgen -f "${cur}"))
                     return 0
                     ;;
@@ -1821,7 +1881,7 @@ _agent-session() {
             return 0
             ;;
         agent__session__work__context__check)
-            opts="-h --session --capability-file --candidate --allow-incomplete --format --state-dir --host --help"
+            opts="-h --session --self --capability-file --candidate --allow-incomplete --format --state-dir --host --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
