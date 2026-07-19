@@ -4967,6 +4967,9 @@ fn start_creates_session_state_without_printing_prompt() {
     )
     .expect("session json");
     let runtime_id = record["runtime"]["launch_id"].as_str().expect("runtime id");
+    let agent_session_bin = nils_test_support::bin::resolve("agent-session")
+        .to_string_lossy()
+        .to_string();
 
     let calls = tmux_calls(&tmux_log);
     let new_session = calls
@@ -5008,7 +5011,7 @@ fn start_creates_session_state_without_printing_prompt() {
             "--".to_string(),
             "sh".to_string(),
             "-c".to_string(),
-            "gate=$1; heartbeat=$2; capability=$3; incarnation=$4; shift 4; owner=$$; umask 077; (while kill -0 \"$owner\" 2>/dev/null; do tmp=\"${heartbeat}.tmp.$$\"; printf '%s:%s\\n' \"$incarnation\" \"$(date +%s)\" > \"$tmp\" && chmod 600 \"$tmp\" && mv -f \"$tmp\" \"$heartbeat\"; sleep 2; done; rm -f \"$capability\") & while [ ! -f \"$gate\" ]; do sleep 0.01; done; exec \"$@\"".to_string(),
+            "gate=$1; heartbeat=$2; capability=$3; incarnation=$4; broker_bin=$5; shift 5; done_file=\"${heartbeat}.done.$$\"; umask 077; heartbeat_once() { tmp=\"${heartbeat}.tmp.$$\"; printf '%s:%s\\n' \"$incarnation\" \"$(date +%s)\" > \"$tmp\" && chmod 600 \"$tmp\" && mv -f \"$tmp\" \"$heartbeat\"; }; heartbeat_once; while [ ! -f \"$gate\" ]; do sleep 0.01; done; (\"$@\"; status=$?; printf '%s\\n' \"$status\" > \"$done_file\"; exit \"$status\") & child=$!; while [ ! -f \"$done_file\" ]; do heartbeat_once; sleep 2; done; wait \"$child\"; status=$?; \"$broker_bin\" --state-dir \"$AGENT_SESSION_STATE_DIR\" broker stop --session \"$AGENT_SESSION_ID\" --capability-file \"$capability\" --format json >/dev/null 2>&1 || true; rm -f \"$done_file\" \"$capability\"; exit \"$status\"".to_string(),
             "agent-session-held-launch".to_string(),
             state_dir
                 .join("sessions")
@@ -5029,6 +5032,7 @@ fn start_creates_session_state_without_printing_prompt() {
                 .to_string_lossy()
                 .to_string(),
             runtime_id.to_string(),
+            agent_session_bin,
             codex_arg.clone(),
             "--cd".to_string(),
             cwd_arg.clone(),
@@ -9238,6 +9242,9 @@ fn resume_recreates_tmux_runtime_from_exact_provider_identity() {
         .expect("new-session call");
     let record: Value = serde_json::from_str(&fs::read_to_string(&record_path).unwrap()).unwrap();
     let runtime_id = record["runtime"]["launch_id"].as_str().expect("runtime id");
+    let agent_session_bin = nils_test_support::bin::resolve("agent-session")
+        .to_string_lossy()
+        .to_string();
     let inherited_path = std::env::var("PATH").expect("test PATH");
     assert_eq!(
         new_session,
@@ -9274,7 +9281,7 @@ fn resume_recreates_tmux_runtime_from_exact_provider_identity() {
             "--".to_string(),
             "sh".to_string(),
             "-c".to_string(),
-            "gate=$1; heartbeat=$2; capability=$3; incarnation=$4; shift 4; owner=$$; umask 077; (while kill -0 \"$owner\" 2>/dev/null; do tmp=\"${heartbeat}.tmp.$$\"; printf '%s:%s\\n' \"$incarnation\" \"$(date +%s)\" > \"$tmp\" && chmod 600 \"$tmp\" && mv -f \"$tmp\" \"$heartbeat\"; sleep 2; done; rm -f \"$capability\") & while [ ! -f \"$gate\" ]; do sleep 0.01; done; exec \"$@\"".to_string(),
+            "gate=$1; heartbeat=$2; capability=$3; incarnation=$4; broker_bin=$5; shift 5; done_file=\"${heartbeat}.done.$$\"; umask 077; heartbeat_once() { tmp=\"${heartbeat}.tmp.$$\"; printf '%s:%s\\n' \"$incarnation\" \"$(date +%s)\" > \"$tmp\" && chmod 600 \"$tmp\" && mv -f \"$tmp\" \"$heartbeat\"; }; heartbeat_once; while [ ! -f \"$gate\" ]; do sleep 0.01; done; (\"$@\"; status=$?; printf '%s\\n' \"$status\" > \"$done_file\"; exit \"$status\") & child=$!; while [ ! -f \"$done_file\" ]; do heartbeat_once; sleep 2; done; wait \"$child\"; status=$?; \"$broker_bin\" --state-dir \"$AGENT_SESSION_STATE_DIR\" broker stop --session \"$AGENT_SESSION_ID\" --capability-file \"$capability\" --format json >/dev/null 2>&1 || true; rm -f \"$done_file\" \"$capability\"; exit \"$status\"".to_string(),
             "agent-session-held-launch".to_string(),
             state_dir
                 .join("sessions/recoverable/coordination/launch-ready")
@@ -9292,6 +9299,7 @@ fn resume_recreates_tmux_runtime_from_exact_provider_identity() {
                 .to_string_lossy()
                 .to_string(),
             runtime_id.to_string(),
+            agent_session_bin,
             codex_arg.clone(),
             "resume".to_string(),
             "resume-session-id".to_string(),

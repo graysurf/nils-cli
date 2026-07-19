@@ -112,7 +112,8 @@ Only the authenticated recipient can read a body, returned as
 list, and glance never contain it. V1 enforces the documented 16 KiB body,
 24-hour default/7-day maximum expiry, 256-message/4 MiB per-session, 64 MiB
 registry, 30-pair/minute, 50/100-page, 60-second wait, and depth-16 reply limits.
-Acknowledged and expired entries have bounded terminal retention, and the HTTP
+Acknowledged entries retain metadata for 24 hours; expired entries have bounded
+terminal retention, and the HTTP
 surface admits at most 16 blocking waits at once.
 The authoritative result is always queued mail. When the serve controller sees
 an exact idle prompt-v2 target, it durably records one attempt before submitting

@@ -100,6 +100,7 @@ pub(crate) fn send(context: &CliContext, args: MessageSendArgs) -> Result<Value,
         "message-send",
         None,
         None,
+        None,
     )
 }
 
@@ -293,6 +294,7 @@ pub(crate) fn reply(context: &CliContext, args: MessageReplyArgs) -> Result<Valu
         "message-reply",
         Some(original.reply_depth.saturating_add(1)),
         Some(&original.sender_incarnation),
+        Some(args.if_revision),
     )
 }
 
@@ -367,6 +369,7 @@ fn send_authenticated(
     operation: &'static str,
     explicit_reply_depth: Option<u8>,
     expected_recipient_incarnation: Option<&str>,
+    expected_parent_revision: Option<u64>,
 ) -> Result<Value, CliError> {
     if sender_session_id == recipient_session_id && reply_to.is_some() {
         return Err(CliError::data(
@@ -375,6 +378,8 @@ fn send_authenticated(
             None,
         ));
     }
+    let _recipient_lifecycle = crate::acquire_session_record_lock(context, recipient_session_id)
+        .map_err(|_| message_not_found())?;
     let recipient = crate::load_session_record(context, recipient_session_id)
         .map_err(|_| message_not_found())?;
     let recipient_incarnation = incarnation(&recipient).map_err(|_| message_not_found())?;
@@ -406,6 +411,12 @@ fn send_authenticated(
         .filter(|broker| {
             broker.incarnation == recipient_incarnation
                 && broker.state == "ready"
+                && super::broker::capability_available(
+                    context,
+                    &recipient.id,
+                    &recipient_incarnation,
+                    &broker.capability_digest,
+                )
                 && super::broker::heartbeat_fresh(
                     context,
                     &recipient.id,
@@ -483,8 +494,18 @@ fn send_authenticated(
                 .registry
                 .messages
                 .iter()
-                .find(|message| message.message_id == parent_id)
+                .find(|message| {
+                    message.message_id == parent_id
+                        && message.recipient_session_id == sender_session_id
+                        && message.recipient_incarnation == sender_incarnation
+                })
                 .ok_or_else(message_not_found)?;
+            if parent.state == "expired" || parent.expires_at_epoch <= now {
+                return Err(message_expired());
+            }
+            if expected_parent_revision.is_some_and(|revision| parent.revision != revision) {
+                return Err(message_revision_conflict());
+            }
             let expected =
                 explicit_reply_depth.unwrap_or_else(|| parent.reply_depth.saturating_add(1));
             if expected > MAX_REPLY_DEPTH {

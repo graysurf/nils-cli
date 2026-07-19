@@ -336,8 +336,8 @@ pub struct WorkContextAdmitArgs {
     pub targets_file: PathBuf,
     #[arg(long)]
     pub operation: String,
-    #[arg(long)]
-    pub execution_token: String,
+    #[arg(long, value_name = "PATH", value_hint = ValueHint::FilePath)]
+    pub execution_token_file: PathBuf,
     #[arg(long, value_name = "PATH", value_hint = ValueHint::FilePath)]
     pub capability_file: Option<PathBuf>,
     #[arg(long)]
@@ -370,8 +370,8 @@ pub struct WorkContextCompleteArgs {
     pub lease: String,
     #[arg(long)]
     pub if_revision: u64,
-    #[arg(long)]
-    pub execution_token: String,
+    #[arg(long, value_name = "PATH", value_hint = ValueHint::FilePath)]
+    pub execution_token_file: PathBuf,
     #[arg(long, value_enum)]
     pub outcome: OperationOutcome,
     #[arg(long, value_name = "PATH", value_hint = ValueHint::FilePath)]
@@ -414,6 +414,8 @@ pub enum BrokerCommand {
     Adopt(BrokerRecoveryArgs),
     /// Reconcile broker and registry state from validated recovery proof.
     Reconcile(BrokerRecoveryArgs),
+    #[command(hide = true)]
+    Stop(BrokerStopArgs),
 }
 
 #[derive(Debug, Args)]
@@ -434,6 +436,16 @@ pub struct BrokerRecoveryArgs {
     pub proof_file: PathBuf,
     #[arg(long)]
     pub idempotency_key: String,
+    #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
+    pub format: OutputFormat,
+}
+
+#[derive(Debug, Args)]
+pub struct BrokerStopArgs {
+    #[arg(long)]
+    pub session: String,
+    #[arg(long, value_name = "PATH", value_hint = ValueHint::FilePath)]
+    pub capability_file: Option<PathBuf>,
     #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
     pub format: OutputFormat,
 }
@@ -530,6 +542,8 @@ pub struct MessageReplyArgs {
     pub session: String,
     #[arg(long)]
     pub message: String,
+    #[arg(long)]
+    pub if_revision: u64,
     #[arg(long, value_name = "PATH", value_hint = ValueHint::FilePath)]
     pub body_file: PathBuf,
     #[arg(long, value_name = "PATH", value_hint = ValueHint::FilePath)]

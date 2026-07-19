@@ -340,7 +340,7 @@ _arguments "${_arguments_options[@]}" : \
 '--if-revision=[]:IF_REVISION:_default' \
 '--targets-file=[]:PATH:_files' \
 '--operation=[]:OPERATION:_default' \
-'--execution-token=[]:EXECUTION_TOKEN:_default' \
+'--execution-token-file=[]:PATH:_files' \
 '--capability-file=[]:PATH:_files' \
 '--idempotency-key=[]:IDEMPOTENCY_KEY:_default' \
 '--format=[]:FORMAT:((text\:"Human-readable text output (default)"
@@ -356,7 +356,7 @@ _arguments "${_arguments_options[@]}" : \
 '--session=[]:SESSION:_default' \
 '--lease=[]:LEASE:_default' \
 '--if-revision=[]:IF_REVISION:_default' \
-'--execution-token=[]:EXECUTION_TOKEN:_default' \
+'--execution-token-file=[]:PATH:_files' \
 '--outcome=[]:OUTCOME:(pass fail)' \
 '--capability-file=[]:PATH:_files' \
 '--idempotency-key=[]:IDEMPOTENCY_KEY:_default' \
@@ -434,6 +434,18 @@ _arguments "${_arguments_options[@]}" : \
 '--session=[]:SESSION:_default' \
 '--proof-file=[]:PATH:_files' \
 '--idempotency-key=[]:IDEMPOTENCY_KEY:_default' \
+'--format=[]:FORMAT:((text\:"Human-readable text output (default)"
+json\:"Single-record JSON envelope (snake_case)"))' \
+'--state-dir=[State directory. Defaults to AGENT_SESSION_STATE_DIR, XDG_STATE_HOME/agent-session, or ~/.local/state/agent-session]:PATH:_files -/' \
+'--host=[Hostname used in generated ssh attach commands]:HOST:_default' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+&& ret=0
+;;
+(stop)
+_arguments "${_arguments_options[@]}" : \
+'--session=[]:SESSION:_default' \
+'--capability-file=[]:PATH:_files' \
 '--format=[]:FORMAT:((text\:"Human-readable text output (default)"
 json\:"Single-record JSON envelope (snake_case)"))' \
 '--state-dir=[State directory. Defaults to AGENT_SESSION_STATE_DIR, XDG_STATE_HOME/agent-session, or ~/.local/state/agent-session]:PATH:_files -/' \
@@ -526,6 +538,7 @@ json\:"Single-record JSON envelope (snake_case)"))' \
 _arguments "${_arguments_options[@]}" : \
 '--session=[]:SESSION:_default' \
 '--message=[]:MESSAGE:_default' \
+'--if-revision=[]:IF_REVISION:_default' \
 '--body-file=[]:PATH:_files' \
 '--capability-file=[]:PATH:_files' \
 '--idempotency-key=[]:IDEMPOTENCY_KEY:_default' \
@@ -683,6 +696,7 @@ _agent-session__subcmd__broker_commands() {
 'status:Show privacy-safe broker readiness and claim/operation summaries' \
 'adopt:Adopt an unchanged live runtime after validating recovery proof' \
 'reconcile:Reconcile broker and registry state from validated recovery proof' \
+'stop:' \
     )
     _describe -t commands 'agent-session broker commands' commands "$@"
 }
@@ -700,6 +714,11 @@ _agent-session__subcmd__broker__subcmd__reconcile_commands() {
 _agent-session__subcmd__broker__subcmd__status_commands() {
     local commands; commands=()
     _describe -t commands 'agent-session broker status commands' commands "$@"
+}
+(( $+functions[_agent-session__subcmd__broker__subcmd__stop_commands] )) ||
+_agent-session__subcmd__broker__subcmd__stop_commands() {
+    local commands; commands=()
+    _describe -t commands 'agent-session broker stop commands' commands "$@"
 }
 (( $+functions[_agent-session__subcmd__codex-app-server-proxy_commands] )) ||
 _agent-session__subcmd__codex-app-server-proxy_commands() {

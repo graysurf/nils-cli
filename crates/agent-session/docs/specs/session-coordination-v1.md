@@ -232,9 +232,9 @@ States are `active`, `completing`, `completed`, `failed`, and `abandoned`;
 - `complete` is idempotent and records the terminal tool result without raw
   stdout/stderr.
 - `reconcile` repairs a missed completion only when the token digest matches and
-  controller-owned evidence shows either a later `waiting` activity revision on
-  the unchanged exact runtime or that exact persisted runtime has stopped.
-  Caller-supplied idle or descendant booleans are not accepted as proof.
+  controller-owned state proves that the unchanged exact persisted runtime has
+  stopped. Activity events and caller-supplied idle or descendant booleans are
+  not accepted as terminal proof.
 - Uncertain heartbeat or proof blocks later owner operations and competing
   admission until validated recovery; it does not silently expire an active
   mutation.
@@ -336,8 +336,8 @@ agent-session work-context show --session ID --capability-file FILE
 agent-session work-context check --session ID --capability-file FILE [--candidate JSON] [--allow-incomplete]
 agent-session work-context renew --session ID --claim UUID --if-revision N --capability-file FILE --idempotency-key KEY
 agent-session work-context release --session ID --claim UUID --if-revision N --capability-file FILE --idempotency-key KEY
-agent-session work-context admit --session ID --claim UUID --if-revision N --targets-file JSON --operation KIND --execution-token TOKEN --capability-file FILE --idempotency-key KEY
-agent-session work-context complete --session ID --lease UUID --if-revision N --execution-token TOKEN --outcome pass|fail --capability-file FILE --idempotency-key KEY
+agent-session work-context admit --session ID --claim UUID --if-revision N --targets-file JSON --operation KIND --execution-token-file FILE --capability-file FILE --idempotency-key KEY
+agent-session work-context complete --session ID --lease UUID --if-revision N --execution-token-file FILE --outcome pass|fail --capability-file FILE --idempotency-key KEY
 agent-session work-context reconcile --session ID --lease UUID --if-revision N --proof-file JSON --capability-file FILE --idempotency-key KEY
 
 agent-session broker status --session ID [--capability-file FILE]
@@ -348,7 +348,7 @@ agent-session message send --from ID --to ID --body-file FILE --capability-file 
 agent-session message inbox --session ID --capability-file FILE [--state unread] [--cursor CURSOR] [--limit N]
 agent-session message show --session ID --message UUID --capability-file FILE
 agent-session message ack --session ID --message UUID --if-revision N --capability-file FILE --idempotency-key KEY
-agent-session message reply --session ID --message UUID --body-file FILE --capability-file FILE --idempotency-key KEY
+agent-session message reply --session ID --message UUID --if-revision N --body-file FILE --capability-file FILE --idempotency-key KEY
 agent-session message wait --session ID --message UUID --if-revision N --timeout DURATION --capability-file FILE
 ```
 

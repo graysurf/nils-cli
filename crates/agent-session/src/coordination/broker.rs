@@ -1,4 +1,6 @@
-use std::fs;
+use std::fs::{self, OpenOptions};
+use std::io::Read;
+use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::PathBuf;
 use std::thread;
@@ -8,7 +10,7 @@ use nils_common::fs::{SECRET_FILE_MODE, write_atomic};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use crate::cli::{BrokerRecoveryArgs, BrokerStatusArgs};
+use crate::cli::{BrokerRecoveryArgs, BrokerStatusArgs, BrokerStopArgs};
 use crate::{CliContext, CliError, SessionRecord};
 
 use super::{
@@ -93,11 +95,44 @@ pub(crate) fn provision(context: &CliContext, record: &SessionRecord) -> Result<
     let path = capability_path(context, &record.id, &incarnation);
     let now = now_epoch();
     let mut locked = lock_registry(context)?;
-    let previous_capability = locked
+    let previous_broker = locked
         .registry
         .brokers
         .get(&record.id)
         .filter(|broker| broker.incarnation != incarnation)
+        .cloned();
+    if let Some(previous) = previous_broker.as_ref() {
+        let previous_live = capability_available(
+            context,
+            &record.id,
+            &previous.incarnation,
+            &previous.capability_digest,
+        ) || heartbeat_fresh(
+            context,
+            &record.id,
+            &previous.incarnation,
+            previous.heartbeat_epoch,
+        );
+        if previous_live {
+            return Err(CliError::data(
+                "session-incarnation-conflict",
+                "the prior coordination incarnation is still live",
+                None,
+            ));
+        }
+    } else if locked.registry.operations.iter().any(|lease| {
+        lease.session_id == record.id
+            && lease.session_incarnation != incarnation
+            && matches!(lease.state.as_str(), "active" | "completing")
+    }) {
+        return Err(CliError::data(
+            "operation-in-progress",
+            "an unresolved prior operation has no terminal runtime evidence",
+            None,
+        ));
+    }
+    let previous_capability = previous_broker
+        .as_ref()
         .map(|broker| capability_path(context, &record.id, &broker.incarnation));
     write_atomic(&path, token.as_bytes(), SECRET_FILE_MODE).map_err(|_| unavailable())?;
     ensure_fingerprint_key(&mut locked.registry);
@@ -107,8 +142,9 @@ pub(crate) fn provision(context: &CliContext, record: &SessionRecord) -> Result<
             && claim.session_incarnation != incarnation
             && claim.state == "active"
         {
-            claim.state = "stale".to_string();
+            claim.state = "released".to_string();
             claim.revision = claim.revision.saturating_add(1);
+            claim.updated_at = timestamp(now);
             claim.terminal_at_epoch = Some(now);
         }
     }
@@ -238,6 +274,17 @@ pub(crate) fn revoke(context: &CliContext, record: &SessionRecord) -> Result<(),
         let _ = fs::remove_file(capability_path(context, &record.id, current));
     }
     Ok(())
+}
+
+pub(crate) fn stop(context: &CliContext, args: BrokerStopArgs) -> Result<Value, CliError> {
+    let (record, _) =
+        authenticate_from_file(context, &args.session, args.capability_file.as_deref())?;
+    revoke(context, &record)?;
+    Ok(json!({
+        "schema_version": BROKER_VERSION,
+        "session_id": record.id,
+        "state": "stopped"
+    }))
 }
 
 pub(crate) fn status(context: &CliContext, args: BrokerStatusArgs) -> Result<Value, CliError> {
@@ -421,12 +468,17 @@ fn unavailable() -> CliError {
 }
 
 fn read_private_capability(path: &std::path::Path) -> Result<String, CliError> {
-    let metadata = fs::symlink_metadata(path).map_err(|_| unavailable())?;
-    if metadata.file_type().is_symlink()
-        || !metadata.is_file()
+    let mut file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)
+        .map_err(|_| unavailable())?;
+    let metadata = file.metadata().map_err(|_| unavailable())?;
+    if !metadata.is_file()
         || metadata.len() > 512
         || metadata.mode() & 0o077 != 0
         || metadata.uid() != unsafe { libc::geteuid() }
+        || metadata.nlink() != 1
     {
         return Err(CliError::runtime(
             "coordination-store-untrusted",
@@ -434,7 +486,15 @@ fn read_private_capability(path: &std::path::Path) -> Result<String, CliError> {
             None,
         ));
     }
-    fs::read_to_string(path).map_err(|_| unavailable())
+    let mut token = String::new();
+    file.by_ref()
+        .take(513)
+        .read_to_string(&mut token)
+        .map_err(|_| unavailable())?;
+    if token.len() > 512 {
+        return Err(unavailable());
+    }
+    Ok(token)
 }
 
 pub(crate) fn capability_available(
@@ -459,20 +519,28 @@ pub(crate) fn heartbeat_fresh(
 ) -> bool {
     let now = now_epoch();
     let path = super::heartbeat_path(&context.state_dir, session_id);
-    let Ok(metadata) = fs::symlink_metadata(&path) else {
+    let Ok(mut file) = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(&path)
+    else {
         return false;
     };
-    if metadata.file_type().is_symlink()
-        || !metadata.is_file()
+    let Ok(metadata) = file.metadata() else {
+        return false;
+    };
+    if !metadata.is_file()
         || metadata.len() > 256
         || metadata.mode() & 0o077 != 0
         || metadata.uid() != unsafe { libc::geteuid() }
+        || metadata.nlink() != 1
     {
         return false;
     }
-    let Ok(value) = fs::read_to_string(path) else {
+    let mut value = String::new();
+    if file.by_ref().take(257).read_to_string(&mut value).is_err() || value.len() > 256 {
         return false;
-    };
+    }
     let Some((observed_incarnation, observed_epoch)) = value.trim().rsplit_once(':') else {
         return false;
     };

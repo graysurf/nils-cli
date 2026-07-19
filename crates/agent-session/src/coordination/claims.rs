@@ -11,12 +11,12 @@ use crate::{CliContext, CliError};
 
 use super::context::{
     ConflictClassification, Scope, WORK_CONTEXT_VERSION, WorkContextInput, WorkContextRecord,
-    canonicalize_targets, evaluate, scope_covers,
+    canonicalize_targets, evaluate, fingerprint_epoch, scope_covers, validate_physical_targets,
 };
 use super::{
     Registry, authenticate_from_file, clean_expired, digest_bytes, ensure_fingerprint_key,
-    idempotency_replay, json_value, lock_registry, now_epoch, read_bounded_json, request_digest,
-    store_receipt, timestamp, worktree_fingerprint,
+    idempotency_replay, json_value, lock_registry, now_epoch, read_bounded_json, read_private_text,
+    request_digest, store_receipt, timestamp, worktree_fingerprint,
 };
 
 const CLAIM_TTL_SECS: i64 = 30 * 60;
@@ -287,6 +287,9 @@ pub(crate) fn release(
     );
     let now = now_epoch();
     let mut locked = lock_registry(context)?;
+    if clean_expired(&mut locked.registry, now) {
+        locked.save()?;
+    }
     if let Some(replay) = idempotency_replay(
         &locked.registry,
         &args.idempotency_key,
@@ -338,7 +341,9 @@ pub(crate) fn admit(context: &CliContext, args: WorkContextAdmitArgs) -> Result<
     let (record, incarnation) =
         authenticate_from_file(context, &args.session, args.capability_file.as_deref())?;
     validate_operation_kind(&args.operation)?;
-    validate_execution_token(&args.execution_token)?;
+    let execution_token =
+        read_private_text(&args.execution_token_file, 256, "invalid-execution-token")?;
+    validate_execution_token(&execution_token)?;
     let input: OperationTargetsInput =
         read_bounded_json(&args.targets_file, 64 * 1024, "invalid-scope")?;
     if input.schema_version != "agent-session.operation-targets.v1" {
@@ -356,7 +361,7 @@ pub(crate) fn admit(context: &CliContext, args: WorkContextAdmitArgs) -> Result<
             "if_revision": args.if_revision,
             "operation": args.operation,
             "targets": targets,
-            "execution_token_digest": digest_bytes(args.execution_token.as_bytes()),
+            "execution_token_digest": digest_bytes(execution_token.as_bytes()),
         }),
     );
     let now = now_epoch();
@@ -396,6 +401,7 @@ pub(crate) fn admit(context: &CliContext, args: WorkContextAdmitArgs) -> Result<
             None,
         ));
     }
+    validate_physical_targets(&record.cwd, &targets)?;
     let candidate = input_from_record(claim);
     let complete = complete_relevant_universe(context, &locked.registry, &record.id, &incarnation);
     let evaluation = evaluate(
@@ -450,7 +456,7 @@ pub(crate) fn admit(context: &CliContext, args: WorkContextAdmitArgs) -> Result<
         expires_at: timestamp(now.saturating_add(OPERATION_TTL_SECS)),
         expires_at_epoch: now.saturating_add(OPERATION_TTL_SECS),
         terminal_at_epoch: None,
-        execution_token_digest: digest_bytes(args.execution_token.as_bytes()),
+        execution_token_digest: digest_bytes(execution_token.as_bytes()),
         activity_revision: activity.revision,
         runtime_identity_digest: runtime.identity_digest,
         outcome: None,
@@ -477,8 +483,10 @@ pub(crate) fn complete(
 ) -> Result<Value, CliError> {
     let (record, incarnation) =
         authenticate_from_file(context, &args.session, args.capability_file.as_deref())?;
-    validate_execution_token(&args.execution_token)?;
-    let token_digest = digest_bytes(args.execution_token.as_bytes());
+    let execution_token =
+        read_private_text(&args.execution_token_file, 256, "invalid-execution-token")?;
+    validate_execution_token(&execution_token)?;
+    let token_digest = digest_bytes(execution_token.as_bytes());
     let digest = request_digest(
         "work-context-complete",
         &json!({
@@ -490,6 +498,9 @@ pub(crate) fn complete(
     );
     let now = now_epoch();
     let mut locked = lock_registry(context)?;
+    if clean_expired(&mut locked.registry, now) {
+        locked.save()?;
+    }
     if let Some(replay) = idempotency_replay(
         &locked.registry,
         &args.idempotency_key,
@@ -774,17 +785,6 @@ fn complete_relevant_universe(
     true
 }
 
-fn fingerprint_epoch(value: &str) -> Option<u64> {
-    let mut fields = value.splitn(3, ':');
-    let algorithm = fields.next()?;
-    let epoch = fields.next()?.parse().ok()?;
-    let digest = fields.next()?;
-    (algorithm == "hmac-sha256"
-        && digest.len() == 64
-        && digest.bytes().all(|byte| byte.is_ascii_hexdigit()))
-    .then_some(epoch)
-}
-
 fn has_nonterminal_operation(registry: &Registry, claim_id: &str) -> bool {
     registry.operations.iter().any(|operation| {
         operation.claim_id == claim_id
@@ -793,7 +793,7 @@ fn has_nonterminal_operation(registry: &Registry, claim_id: &str) -> bool {
 }
 
 fn controller_observed_terminal(
-    context: &CliContext,
+    _context: &CliContext,
     record: &crate::SessionRecord,
     lease: &OperationLease,
 ) -> bool {
@@ -803,16 +803,7 @@ fn controller_observed_terminal(
     if runtime.identity_digest != lease.runtime_identity_digest {
         return false;
     }
-    match runtime.status {
-        crate::CoordinationRuntimeStatus::Stopped => true,
-        crate::CoordinationRuntimeStatus::Running => {
-            crate::activity::state_for_view(context, record).is_some_and(|activity| {
-                activity.phase == crate::activity::TurnPhase::Waiting
-                    && activity.revision > lease.activity_revision
-            })
-        }
-        crate::CoordinationRuntimeStatus::Unknown => false,
-    }
+    matches!(runtime.status, crate::CoordinationRuntimeStatus::Stopped)
 }
 
 fn validate_operation_kind(value: &str) -> Result<(), CliError> {

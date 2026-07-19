@@ -12213,6 +12213,8 @@ esac
         );
 
         drop(first_pane);
+        let stopped_record = load_session_record(&st.context, "fresh-profile").unwrap();
+        crate::coordination::revoke(&st.context, &stopped_record).unwrap();
         fs::remove_file(&running).unwrap();
         let (list_status, list_body) = call(router(st.clone()), get("/sessions")).await;
         assert_eq!(list_status, StatusCode::OK, "body={list_body}");

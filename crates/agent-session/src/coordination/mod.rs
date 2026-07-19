@@ -7,7 +7,7 @@ pub(crate) mod server;
 
 use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
-use std::io;
+use std::io::{self, Read};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
@@ -33,6 +33,7 @@ const LOCK_TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_REGISTRY_BYTES: u64 = 68 * 1024 * 1024;
 const RECEIPT_TTL_SECS: i64 = 24 * 60 * 60;
 const TERMINAL_RETENTION_SECS: i64 = 5 * 60;
+const ACKNOWLEDGED_MESSAGE_RETENTION_SECS: i64 = 24 * 60 * 60;
 pub(crate) const CAPABILITY_ENV: &str = "AGENT_SESSION_CAPABILITY_FILE";
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -161,6 +162,7 @@ pub(crate) fn run_broker(context: &CliContext, args: cli::BrokerArgs) -> i32 {
             args.format,
             broker::recover(context, args, true),
         ),
+        BrokerCommand::Stop(args) => ("broker-stop", args.format, broker::stop(context, args)),
     };
     render_coordination(command, format, result)
 }
@@ -280,16 +282,8 @@ fn authenticate_from_file(
         .map(PathBuf::from)
         .or_else(|| std::env::var_os(CAPABILITY_ENV).map(PathBuf::from))
         .ok_or_else(unauthorized)?;
-    let metadata = fs::symlink_metadata(&path).map_err(|_| unauthorized())?;
-    if metadata.file_type().is_symlink()
-        || !metadata.is_file()
-        || metadata.len() > 512
-        || metadata.mode() & 0o077 != 0
-        || metadata.uid() != unsafe { libc::geteuid() }
-    {
-        return Err(unauthorized());
-    }
-    let token = fs::read_to_string(&path).map_err(|_| unauthorized())?;
+    let token = read_private_file(&path, 512).map_err(|_| unauthorized())?;
+    let token = String::from_utf8(token).map_err(|_| unauthorized())?;
     authenticate_token(context, session_id, token.trim())
 }
 
@@ -392,17 +386,8 @@ pub(crate) fn lock_registry(context: &CliContext) -> Result<LockedRegistry, CliE
         thread::sleep(Duration::from_millis(10));
     }
     let path = root.join(REGISTRY_FILE);
-    let mut registry = match fs::symlink_metadata(&path) {
-        Ok(metadata) => {
-            if metadata.file_type().is_symlink()
-                || !metadata.is_file()
-                || metadata.len() > MAX_REGISTRY_BYTES
-                || metadata.mode() & 0o077 != 0
-                || metadata.uid() != unsafe { libc::geteuid() }
-            {
-                return Err(store_untrusted());
-            }
-            let bytes = fs::read(&path).map_err(|_| store_unavailable())?;
+    let mut registry = match read_private_file(&path, MAX_REGISTRY_BYTES) {
+        Ok(bytes) => {
             let registry: Registry = serde_json::from_slice(&bytes).map_err(|_| store_corrupt())?;
             if !registry.schema_version.is_empty() && registry.schema_version != REGISTRY_VERSION {
                 return Err(store_corrupt());
@@ -426,6 +411,12 @@ pub(crate) fn lock_registry(context: &CliContext) -> Result<LockedRegistry, CliE
         };
         if broker.incarnation == claim.session_incarnation
             && broker.state == "ready"
+            && broker::capability_available(
+                context,
+                &claim.session_id,
+                &claim.session_incarnation,
+                &broker.capability_digest,
+            )
             && broker::heartbeat_fresh(
                 context,
                 &claim.session_id,
@@ -433,8 +424,6 @@ pub(crate) fn lock_registry(context: &CliContext) -> Result<LockedRegistry, CliE
                 broker.heartbeat_epoch,
             )
         {
-            claim.revision = claim.revision.saturating_add(1);
-            claim.updated_at = timestamp(now);
             claim.expires_at_epoch = now.saturating_add(30 * 60);
             claim.expires_at = timestamp(claim.expires_at_epoch);
             renewed = true;
@@ -471,6 +460,48 @@ fn coordination_root(context: &CliContext) -> Result<PathBuf, CliError> {
         return Err(store_untrusted());
     }
     Ok(root)
+}
+
+fn read_private_file(path: &Path, max_bytes: u64) -> io::Result<Vec<u8>> {
+    let mut file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file()
+        || metadata.len() > max_bytes
+        || metadata.mode() & 0o077 != 0
+        || metadata.uid() != unsafe { libc::geteuid() }
+        || metadata.nlink() != 1
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "private coordination file is untrusted",
+        ));
+    }
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    file.by_ref()
+        .take(max_bytes.saturating_add(1))
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > max_bytes {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "private coordination file is oversized",
+        ));
+    }
+    Ok(bytes)
+}
+
+pub(crate) fn read_private_text(
+    path: &Path,
+    max_bytes: u64,
+    code: &'static str,
+) -> Result<String, CliError> {
+    let bytes = read_private_file(path, max_bytes)
+        .map_err(|_| CliError::data(code, "private coordination input is invalid", None))?;
+    let value = String::from_utf8(bytes)
+        .map_err(|_| CliError::data(code, "private coordination input is invalid", None))?;
+    Ok(value.trim().to_string())
 }
 
 pub(crate) fn clean_expired(registry: &mut Registry, now: i64) -> bool {
@@ -530,9 +561,14 @@ pub(crate) fn clean_expired(registry: &mut Registry, now: i64) -> bool {
         .messages
         .iter()
         .filter(|message| {
-            message
-                .terminal_at_epoch
-                .is_some_and(|terminal| terminal <= now.saturating_sub(TERMINAL_RETENTION_SECS))
+            message.terminal_at_epoch.is_some_and(|terminal| {
+                let retention = if message.state == "acknowledged" {
+                    ACKNOWLEDGED_MESSAGE_RETENTION_SECS
+                } else {
+                    TERMINAL_RETENTION_SECS
+                };
+                terminal <= now.saturating_sub(retention)
+            })
         })
         .map(|message| message.message_id.clone())
         .collect();
@@ -961,8 +997,41 @@ mod tests {
             }
         }))
         .expect("registry");
-        assert!(clean_expired(&mut registry, TERMINAL_RETENTION_SECS + 2));
+        assert!(clean_expired(
+            &mut registry,
+            ACKNOWLEDGED_MESSAGE_RETENTION_SECS + 2
+        ));
         assert!(registry.messages.is_empty());
         assert!(registry.notifications.is_empty());
+    }
+
+    #[test]
+    fn coordination_review_round2_acknowledged_mail_is_retained_for_24_hours() {
+        let now = 24 * 60 * 60;
+        let mut registry: Registry = serde_json::from_value(json!({
+            "schema_version": REGISTRY_VERSION,
+            "messages": [{
+                "schema_version": "agent-session.message.v1",
+                "message_id": "acknowledged-message",
+                "sender_session_id": "sender",
+                "sender_incarnation": "sender-incarnation",
+                "recipient_session_id": "recipient",
+                "recipient_incarnation": "recipient-incarnation",
+                "state": "acknowledged",
+                "revision": 2,
+                "reply_to": null,
+                "reply_depth": 0,
+                "created_at": "2030-01-01T00:00:00Z",
+                "created_at_epoch": 0,
+                "expires_at": "2030-01-08T00:00:00Z",
+                "expires_at_epoch": i64::MAX,
+                "terminal_at_epoch": now - 6 * 60,
+                "body_bytes": 4,
+                "body": "body"
+            }]
+        }))
+        .expect("registry");
+        clean_expired(&mut registry, now);
+        assert_eq!(registry.messages.len(), 1);
     }
 }

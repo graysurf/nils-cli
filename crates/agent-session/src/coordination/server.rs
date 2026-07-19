@@ -85,6 +85,7 @@ pub(crate) struct AckBody {
 #[serde(deny_unknown_fields)]
 pub(crate) struct ReplyBody {
     pub body: String,
+    pub if_revision: u64,
     pub idempotency_key: String,
 }
 
@@ -208,18 +209,26 @@ pub(crate) fn admit(
 ) -> Result<Value, CliError> {
     let server_capability = authorize(context, id, token)?;
     with_json(context, id, "targets", &body.targets, |targets_file| {
-        claims::admit(
+        with_text(
             context,
-            cli::WorkContextAdmitArgs {
-                session: id.to_string(),
-                claim: body.claim,
-                if_revision: body.if_revision,
-                targets_file,
-                operation: body.operation,
-                execution_token: body.execution_token,
-                capability_file: Some(server_capability.path.clone()),
-                idempotency_key: body.idempotency_key,
-                format: nils_common::cli_contract::OutputFormat::Json,
+            id,
+            "execution-token",
+            &body.execution_token,
+            |execution_token_file| {
+                claims::admit(
+                    context,
+                    cli::WorkContextAdmitArgs {
+                        session: id.to_string(),
+                        claim: body.claim,
+                        if_revision: body.if_revision,
+                        targets_file,
+                        operation: body.operation,
+                        execution_token_file,
+                        capability_file: Some(server_capability.path.clone()),
+                        idempotency_key: body.idempotency_key,
+                        format: nils_common::cli_contract::OutputFormat::Json,
+                    },
+                )
             },
         )
     })
@@ -243,17 +252,25 @@ pub(crate) fn complete(
             ));
         }
     };
-    claims::complete(
+    with_text(
         context,
-        cli::WorkContextCompleteArgs {
-            session: id.to_string(),
-            lease: body.lease,
-            if_revision: body.if_revision,
-            execution_token: body.execution_token,
-            outcome,
-            capability_file: Some(server_capability.path.clone()),
-            idempotency_key: body.idempotency_key,
-            format: nils_common::cli_contract::OutputFormat::Json,
+        id,
+        "execution-token",
+        &body.execution_token,
+        |execution_token_file| {
+            claims::complete(
+                context,
+                cli::WorkContextCompleteArgs {
+                    session: id.to_string(),
+                    lease: body.lease,
+                    if_revision: body.if_revision,
+                    execution_token_file,
+                    outcome,
+                    capability_file: Some(server_capability.path.clone()),
+                    idempotency_key: body.idempotency_key,
+                    format: nils_common::cli_contract::OutputFormat::Json,
+                },
+            )
         },
     )
 }
@@ -394,6 +411,7 @@ pub(crate) fn reply(
             cli::MessageReplyArgs {
                 session: id.to_string(),
                 message: message.to_string(),
+                if_revision: body.if_revision,
                 body_file,
                 capability_file: Some(server_capability.path.clone()),
                 idempotency_key: body.idempotency_key,

@@ -107,7 +107,7 @@ const DELETE_TMUX_TERMINATION_STATE_KEY: &str = "delete_tmux_termination_state";
 const TMUX_RUNTIME_NEVER_LAUNCHED_KEY: &str = "tmux_runtime_never_launched";
 const TMUX_RUNTIME_IDENTITY_CHANGED_OUTPUT: &str = "agent-session-runtime-identity-changed";
 const COORDINATION_LAUNCH_GATE: &str = "launch-ready";
-const HELD_LAUNCH_SCRIPT: &str = "gate=$1; heartbeat=$2; capability=$3; incarnation=$4; shift 4; owner=$$; umask 077; (while kill -0 \"$owner\" 2>/dev/null; do tmp=\"${heartbeat}.tmp.$$\"; printf '%s:%s\\n' \"$incarnation\" \"$(date +%s)\" > \"$tmp\" && chmod 600 \"$tmp\" && mv -f \"$tmp\" \"$heartbeat\"; sleep 2; done; rm -f \"$capability\") & while [ ! -f \"$gate\" ]; do sleep 0.01; done; exec \"$@\"";
+const HELD_LAUNCH_SCRIPT: &str = "gate=$1; heartbeat=$2; capability=$3; incarnation=$4; broker_bin=$5; shift 5; done_file=\"${heartbeat}.done.$$\"; umask 077; heartbeat_once() { tmp=\"${heartbeat}.tmp.$$\"; printf '%s:%s\\n' \"$incarnation\" \"$(date +%s)\" > \"$tmp\" && chmod 600 \"$tmp\" && mv -f \"$tmp\" \"$heartbeat\"; }; heartbeat_once; while [ ! -f \"$gate\" ]; do sleep 0.01; done; (\"$@\"; status=$?; printf '%s\\n' \"$status\" > \"$done_file\"; exit \"$status\") & child=$!; while [ ! -f \"$done_file\" ]; do heartbeat_once; sleep 2; done; wait \"$child\"; status=$?; \"$broker_bin\" --state-dir \"$AGENT_SESSION_STATE_DIR\" broker stop --session \"$AGENT_SESSION_ID\" --capability-file \"$capability\" --format json >/dev/null 2>&1 || true; rm -f \"$done_file\" \"$capability\"; exit \"$status\"";
 
 pub fn run() -> i32 {
     run_with_args(env::args_os())
@@ -139,6 +139,9 @@ where
                 _ => "parse-error",
             };
             let message = render_clap_message(&err);
+            if let Some(command) = coordination_leaf_from_raw_args(&raw_args) {
+                return render_error(command, format, CliError::usage(code, message, None));
+            }
             return emit_parse_error(BINARY, format, code, &message);
         }
     };
@@ -155,7 +158,11 @@ fn dispatch(cli: Cli) -> i32 {
     let context = match CliContext::resolve(cli.state_dir, cli.host) {
         Ok(context) => context,
         Err(err) => {
-            return render_error("error", format, err);
+            return render_error(
+                coordination_command_name(&cli.command).unwrap_or("error"),
+                format,
+                err,
+            );
         }
     };
 
@@ -178,6 +185,64 @@ fn dispatch(cli: Cli) -> i32 {
         Command::Delete(args) => run_delete(&context, args),
         Command::Completion(_) => unreachable!("completion is handled before context resolution"),
     }
+}
+
+fn coordination_command_name(command: &Command) -> Option<&'static str> {
+    match command {
+        Command::WorkContext(args) => Some(match &args.command {
+            cli::WorkContextCommand::Claim(_) => "work-context-claim",
+            cli::WorkContextCommand::Show(_) => "work-context-show",
+            cli::WorkContextCommand::Check(_) => "work-context-check",
+            cli::WorkContextCommand::Renew(_) => "work-context-renew",
+            cli::WorkContextCommand::Release(_) => "work-context-release",
+            cli::WorkContextCommand::Admit(_) => "work-context-admit",
+            cli::WorkContextCommand::Complete(_) => "work-context-complete",
+            cli::WorkContextCommand::Reconcile(_) => "work-context-reconcile",
+        }),
+        Command::Broker(args) => Some(match &args.command {
+            cli::BrokerCommand::Status(_) => "broker-status",
+            cli::BrokerCommand::Adopt(_) => "broker-adopt",
+            cli::BrokerCommand::Reconcile(_) => "broker-reconcile",
+            cli::BrokerCommand::Stop(_) => "broker-stop",
+        }),
+        Command::Message(args) => Some(match &args.command {
+            cli::MessageCommand::Send(_) => "message-send",
+            cli::MessageCommand::Inbox(_) => "message-inbox",
+            cli::MessageCommand::Show(_) => "message-show",
+            cli::MessageCommand::Ack(_) => "message-ack",
+            cli::MessageCommand::Reply(_) => "message-reply",
+            cli::MessageCommand::Wait(_) => "message-wait",
+        }),
+        _ => None,
+    }
+}
+
+fn coordination_leaf_from_raw_args(args: &[OsString]) -> Option<&'static str> {
+    args.windows(2).find_map(|pair| {
+        let group = pair[0].to_str()?;
+        let leaf = pair[1].to_str()?;
+        match (group, leaf) {
+            ("work-context", "claim") => Some("work-context-claim"),
+            ("work-context", "show") => Some("work-context-show"),
+            ("work-context", "check") => Some("work-context-check"),
+            ("work-context", "renew") => Some("work-context-renew"),
+            ("work-context", "release") => Some("work-context-release"),
+            ("work-context", "admit") => Some("work-context-admit"),
+            ("work-context", "complete") => Some("work-context-complete"),
+            ("work-context", "reconcile") => Some("work-context-reconcile"),
+            ("broker", "status") => Some("broker-status"),
+            ("broker", "adopt") => Some("broker-adopt"),
+            ("broker", "reconcile") => Some("broker-reconcile"),
+            ("broker", "stop") => Some("broker-stop"),
+            ("message", "send") => Some("message-send"),
+            ("message", "inbox") => Some("message-inbox"),
+            ("message", "show") => Some("message-show"),
+            ("message", "ack") => Some("message-ack"),
+            ("message", "reply") => Some("message-reply"),
+            ("message", "wait") => Some("message-wait"),
+            _ => None,
+        }
+    })
 }
 
 fn command_format(command: &Command) -> OutputFormat {
@@ -210,6 +275,7 @@ fn command_format(command: &Command) -> OutputFormat {
         Command::Broker(args) => match &args.command {
             cli::BrokerCommand::Status(args) => args.format,
             cli::BrokerCommand::Adopt(args) | cli::BrokerCommand::Reconcile(args) => args.format,
+            cli::BrokerCommand::Stop(args) => args.format,
         },
         Command::Message(args) => match &args.command {
             cli::MessageCommand::Send(args) => args.format,
@@ -3907,6 +3973,13 @@ fn begin_held_runtime(
     record: &SessionRecord,
 ) -> Result<(), CliError> {
     let gate = launch_gate_path(state_dir, record);
+    let broker_bin = std::env::current_exe().map_err(|_| {
+        CliError::runtime(
+            "coordination-unavailable",
+            "failed to resolve the coordination broker executable",
+            None,
+        )
+    })?;
     match fs::remove_file(&gate) {
         Ok(()) => {}
         Err(error) if error.kind() == io::ErrorKind::NotFound => {}
@@ -3941,7 +4014,8 @@ fn begin_held_runtime(
                 .as_ref()
                 .map(|runtime| runtime.launch_id.as_str())
                 .unwrap_or_default(),
-        );
+        )
+        .arg(broker_bin);
     Ok(())
 }
 
@@ -9545,13 +9619,19 @@ mod tests {
     #[test]
     fn coordination_review_held_launch_heartbeats_before_waiting_on_the_gate() {
         let heartbeat = super::HELD_LAUNCH_SCRIPT
-            .find("owner=$$")
+            .find("heartbeat_once;")
             .expect("heartbeat setup");
         let gate = super::HELD_LAUNCH_SCRIPT
             .find("while [ ! -f \"$gate\" ]")
             .expect("gate wait");
         assert!(heartbeat < gate);
-        assert!(super::HELD_LAUNCH_SCRIPT.contains("rm -f \"$capability\""));
+        assert!(super::HELD_LAUNCH_SCRIPT.contains("\"$capability\""));
+    }
+
+    #[test]
+    fn coordination_review_round2_held_launch_uses_child_lifecycle_not_pid_polling() {
+        assert!(!super::HELD_LAUNCH_SCRIPT.contains("kill -0"));
+        assert!(super::HELD_LAUNCH_SCRIPT.contains("wait \"$child\""));
     }
     use pretty_assertions::assert_eq;
     #[cfg(target_os = "linux")]

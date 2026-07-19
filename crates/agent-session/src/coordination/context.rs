@@ -1,4 +1,6 @@
 use std::collections::BTreeSet;
+use std::fs;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -8,6 +10,7 @@ use crate::CliError;
 pub const WORK_CONTEXT_INPUT_VERSION: &str = "agent-session.work-context-input.v1";
 pub const WORK_CONTEXT_VERSION: &str = "agent-session.work-context.v1";
 pub const CONFLICT_EVALUATION_VERSION: &str = "agent-session.conflict-evaluation.v1";
+pub const WORKTREE_FINGERPRINT_EPOCH: u64 = 1;
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(rename_all = "kebab-case")]
@@ -201,7 +204,17 @@ pub fn evaluate(
         }
         let mut peer_conflict = false;
         let mut peer_potential = false;
-        if intersects(&candidate.worktrees, &peer.worktrees) {
+        let candidate_worktrees_comparable = candidate
+            .worktrees
+            .iter()
+            .all(|fingerprint| fingerprint_epoch(fingerprint) == Some(WORKTREE_FINGERPRINT_EPOCH));
+        let peer_worktrees_comparable = peer
+            .worktrees
+            .iter()
+            .all(|fingerprint| fingerprint_epoch(fingerprint) == Some(WORKTREE_FINGERPRINT_EPOCH));
+        if !candidate_worktrees_comparable || !peer_worktrees_comparable {
+            effective_complete = false;
+        } else if intersects(&candidate.worktrees, &peer.worktrees) {
             reasons.push(reason("same-worktree", peer, None));
             peer_conflict = true;
         }
@@ -419,6 +432,50 @@ pub fn canonicalize_targets(mut targets: Vec<Scope>) -> Result<Vec<Scope>, CliEr
     Ok(targets)
 }
 
+pub fn validate_physical_targets(cwd: &str, targets: &[Scope]) -> Result<(), CliError> {
+    let cwd = fs::canonicalize(cwd).map_err(|_| physical_target_unavailable())?;
+    let root = repository_root(&cwd).ok_or_else(physical_target_unavailable)?;
+    let root = fs::canonicalize(root).map_err(|_| physical_target_unavailable())?;
+    for target in targets
+        .iter()
+        .filter(|target| matches!(target.kind, ScopeKind::PathExact | ScopeKind::PathPrefix))
+    {
+        let relative = target.value.trim_end_matches('/');
+        let mut current = PathBuf::from(&root);
+        for component in Path::new(relative).components() {
+            current.push(component);
+            match fs::symlink_metadata(&current) {
+                Ok(metadata) => {
+                    if metadata.file_type().is_symlink() {
+                        return Err(physical_target_unavailable());
+                    }
+                    let resolved =
+                        fs::canonicalize(&current).map_err(|_| physical_target_unavailable())?;
+                    if !resolved.starts_with(&root) {
+                        return Err(physical_target_unavailable());
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
+                Err(_) => return Err(physical_target_unavailable()),
+            }
+        }
+    }
+    Ok(())
+}
+
+fn repository_root(path: &Path) -> Option<&Path> {
+    path.ancestors()
+        .find(|ancestor| ancestor.join(".git").exists())
+}
+
+fn physical_target_unavailable() -> CliError {
+    CliError::data(
+        "uncovered-mutation-scope",
+        "operation target could not be proven inside the physical checkout boundary",
+        None,
+    )
+}
+
 fn canonical_repository(value: String) -> Result<String, CliError> {
     let value = value.trim().to_ascii_lowercase();
     let mut parts = value.split('/');
@@ -445,6 +502,14 @@ fn canonical_worktree(value: String) -> Result<String, CliError> {
         ));
     }
     Ok(value.to_ascii_lowercase())
+}
+
+pub fn fingerprint_epoch(value: &str) -> Option<u64> {
+    let mut parts = value.splitn(3, ':');
+    (parts.next()? == "hmac-sha256").then_some(())?;
+    let epoch = parts.next()?.parse().ok()?;
+    let digest = parts.next()?;
+    (digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit())).then_some(epoch)
 }
 
 fn canonical_plan_ref(value: String) -> Result<String, CliError> {
@@ -605,5 +670,20 @@ mod tests {
             &prefix,
             &scope(ScopeKind::PathExact, "tests/lib.rs")
         ));
+    }
+
+    #[test]
+    fn coordination_review_round2_physical_target_validation_rejects_symlink_escape() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let root = tmp.path().join("checkout");
+        let outside = tmp.path().join("outside");
+        fs::create_dir_all(root.join("src")).expect("checkout");
+        fs::create_dir(root.join(".git")).expect("git marker");
+        fs::create_dir(&outside).expect("outside");
+        std::os::unix::fs::symlink(&outside, root.join("src/link")).expect("symlink");
+        let escaped = scope(ScopeKind::PathExact, "src/link/file.rs");
+        assert!(validate_physical_targets(root.to_str().expect("root"), &[escaped]).is_err());
+        let inside = scope(ScopeKind::PathExact, "src/new.rs");
+        assert!(validate_physical_targets(root.to_str().expect("root"), &[inside]).is_ok());
     }
 }
