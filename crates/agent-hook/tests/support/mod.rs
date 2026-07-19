@@ -1,8 +1,9 @@
 #![allow(dead_code)]
 
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 
 use nils_test_support::cmd::{CmdOptions, CmdOutput, run_resolved};
 use sha2::{Digest, Sha256};
@@ -35,6 +36,7 @@ impl Fixture {
         fs::create_dir_all(&home).expect("home");
         let policy_path = policy_dir.join("policy.toml");
         fs::write(&policy_path, policy).expect("policy");
+        Self::set_private(&policy_path);
         let digest = sha256(policy.as_bytes());
         let config_path = config_dir.join("config.toml");
         fs::write(
@@ -46,6 +48,7 @@ impl Fixture {
             ),
         )
         .expect("config");
+        Self::set_private(&config_path);
         Self {
             _temp: temp,
             root,
@@ -106,6 +109,39 @@ pub fn sha256(bytes: &[u8]) -> String {
             .map(|byte| format!("{byte:02x}"))
             .collect::<String>()
     )
+}
+
+pub fn target_binding_digest(path: &Path) -> String {
+    let mut start = path;
+    while !start.is_dir() {
+        start = start.parent().expect("target ancestor");
+    }
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(start)
+        .args(["rev-parse", "--show-toplevel"])
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .expect("git lookup");
+    let binding_root = if output.status.success() {
+        PathBuf::from(
+            std::str::from_utf8(&output.stdout)
+                .expect("git root UTF-8")
+                .trim(),
+        )
+    } else {
+        start.to_path_buf()
+    };
+    let canonical = fs::canonicalize(&binding_root).expect("canonical binding root");
+    let metadata = fs::metadata(&canonical).expect("binding metadata");
+    let mut material = b"agent-hook.target-binding.v2\0".to_vec();
+    material.extend_from_slice(path.as_os_str().as_encoded_bytes());
+    material.push(0);
+    material.extend_from_slice(canonical.as_os_str().as_encoded_bytes());
+    material.extend_from_slice(&metadata.dev().to_le_bytes());
+    material.extend_from_slice(&metadata.ino().to_le_bytes());
+    sha256(&material)
 }
 
 pub fn toml_string(path: &Path) -> String {

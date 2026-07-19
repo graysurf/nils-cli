@@ -11,22 +11,24 @@ pub mod recovery;
 pub mod setup;
 mod trace;
 
-use std::collections::BTreeSet;
+use std::collections::BTreeMap;
 use std::env;
 use std::ffi::OsString;
 use std::time::Instant;
 
 use clap::Parser;
 use clap::error::ErrorKind;
-use nils_common::cli_contract::OutputFormat;
+use nils_common::cli_contract::{
+    Envelope, EnvelopeError, OutputFormat, emit_parse_error, schema_version_for,
+};
 use serde::Serialize;
 use serde_json::json;
 
 use cli::{Cli, Command, DispatchFormat, RecoveryCommand};
-use error::{ErrorBody, ErrorEnvelope, HookError, SuccessEnvelope, schema};
+use error::HookError;
 use model::{
     Capability, DECISION_VERSION, DecisionAction, DecisionReason, NormalizedDecision, Product,
-    SetupAction,
+    RuleMode, SetupAction,
 };
 use paths::Layout;
 
@@ -44,7 +46,8 @@ where
     let raw = args.into_iter().map(Into::into).collect::<Vec<_>>();
     let json_requested = raw
         .windows(2)
-        .any(|pair| pair[0] == "--format" && pair[1] == "json");
+        .any(|pair| pair[0] == "--format" && pair[1] == "json")
+        || raw.iter().any(|argument| argument == "--format=json");
     let cli = match Cli::try_parse_from(raw) {
         Ok(cli) => cli,
         Err(error) => {
@@ -57,10 +60,11 @@ where
                 return code;
             }
             if json_requested {
-                return emit_error(
+                return emit_parse_error(
                     "agent-hook",
-                    &HookError::usage("invalid-arguments", "command arguments are invalid"),
-                    true,
+                    OutputFormat::Json,
+                    "invalid-arguments",
+                    "command arguments are invalid",
                 );
             }
             let _ = error.print();
@@ -120,13 +124,24 @@ fn dispatch(layout: Layout, policy_override: Option<&std::path::Path>, command: 
                 .rules
                 .iter()
                 .map(|rule| {
+                    let effective_modes = rule
+                        .products
+                        .iter()
+                        .map(|product| {
+                            (
+                                product.as_str(),
+                                contract::effective_mode_for_product(&loaded, *product, rule),
+                            )
+                        })
+                        .collect::<BTreeMap<_, _>>();
                     json!({
                         "id": rule.id,
                         "products": rule.products,
                         "events": rule.events,
                         "matcher": rule.matcher,
                         "priority": rule.priority,
-                        "mode": contract::effective_mode(&loaded, &rule.id, rule.mode),
+                        "base_mode": rule.mode,
+                        "effective_modes": effective_modes,
                         "failure_posture": rule.failure_posture,
                         "override_class": rule.override_class,
                         "capability_id": capability_id(&rule.capability),
@@ -227,7 +242,7 @@ fn dispatch(layout: Layout, policy_override: Option<&std::path::Path>, command: 
                 ),
             }
         }
-        Command::Recovery(args) => run_recovery(&layout, args.command),
+        Command::Recovery(args) => run_recovery(&layout, policy_override, args.command),
     }
 }
 
@@ -239,32 +254,53 @@ fn run_dispatch(
     let started = Instant::now();
     let raw = match adapter::read_stdin() {
         Ok(raw) => raw,
-        Err(error) => return emit_dispatch_error(args.format, &error),
+        Err(error) => return emit_dispatch_error(args.format, &error, None),
     };
     let mut request = match adapter::normalize(args.product, args.event.as_deref(), &raw) {
         Ok(request) => request,
-        Err(error) => return emit_dispatch_error(args.format, &error),
+        Err(error) => return emit_dispatch_error(args.format, &error, None),
     };
-    request.semantic_conflict = Some(liveness::derive_semantic_conflict(&request));
     let grant = match recovery::consume_for_dispatch(
         &layout.state_root,
         args.capability_file.as_deref(),
         &request,
     ) {
         Ok(grant) => grant,
-        Err(error) => return emit_dispatch_error(args.format, &error),
+        Err(error) => return emit_dispatch_error(args.format, &error, Some(&request)),
     };
     let loaded = match contract::load(layout, policy_override) {
         Ok(loaded) => loaded,
         Err(_error) if !grant.rules.is_empty() => {
-            let decision = emergency_decision(&request, grant.rules);
+            let decision = match emergency_decision(&request, &grant) {
+                Ok(decision) => decision,
+                Err(error) => return emit_dispatch_error(args.format, &error, Some(&request)),
+            };
             return emit_decision(args.format, &decision);
         }
-        Err(error) => return emit_dispatch_error(args.format, &error),
+        Err(error) => return emit_dispatch_error(args.format, &error, Some(&request)),
     };
-    let decision = match evaluator::evaluate(&loaded, &request, &raw, args.shadow, &grant.rules) {
+    let coordination =
+        if evaluator::needs_coordination(&loaded, &request, args.shadow, &grant.rules) {
+            match liveness::load_snapshot() {
+                Ok(snapshot) => snapshot,
+                Err(error) => return emit_dispatch_error(args.format, &error, Some(&request)),
+            }
+        } else {
+            None
+        };
+    request.semantic_conflict = coordination
+        .as_ref()
+        .map(|snapshot| liveness::derive_semantic_conflict(&request, Some(snapshot)));
+    let decision = match evaluator::evaluate(
+        &loaded,
+        &request,
+        &raw,
+        args.shadow,
+        &grant.rules,
+        coordination.as_ref(),
+    ) {
         Ok(decision) => decision,
-        Err(error) => return emit_dispatch_error(args.format, &error),
+        Err(error) => return emit_dispatch_error(args.format, &error, Some(&request)),
     };
     if args.trace
         && let Err(error) = trace::append(
@@ -274,12 +310,16 @@ fn run_dispatch(
             started.elapsed().as_micros(),
         )
     {
-        return emit_dispatch_error(args.format, &error);
+        return emit_dispatch_error(args.format, &error, Some(&request));
     }
     emit_decision(args.format, &decision)
 }
 
-fn run_recovery(layout: &Layout, command: RecoveryCommand) -> i32 {
+fn run_recovery(
+    layout: &Layout,
+    policy_override: Option<&std::path::Path>,
+    command: RecoveryCommand,
+) -> i32 {
     match command {
         RecoveryCommand::Challenge(args) => {
             if !contract::supported_event(args.product, &args.event) {
@@ -292,6 +332,35 @@ fn run_recovery(layout: &Layout, command: RecoveryCommand) -> i32 {
                     args.format == OutputFormat::Json,
                 );
             }
+            let loaded = match contract::load(layout, policy_override) {
+                Ok(loaded) => loaded,
+                Err(error) => {
+                    return emit_error(
+                        "agent-hook recovery challenge",
+                        &error,
+                        args.format == OutputFormat::Json,
+                    );
+                }
+            };
+            let manifest = recovery::RecoveryManifest {
+                schema_version: "agent-hook.recovery-manifest.v1".to_string(),
+                product: args.product,
+                event: args.event.clone(),
+                config_digest: loaded.config_digest.clone(),
+                policy_digest: loaded.policy_digest.clone(),
+                rules: loaded
+                    .bundle
+                    .rules
+                    .iter()
+                    .filter(|rule| {
+                        rule.products.contains(&args.product)
+                            && rule.events.contains(&args.event)
+                            && contract::effective_mode_for_product(&loaded, args.product, rule)
+                                == RuleMode::Enforce
+                    })
+                    .cloned()
+                    .collect(),
+            };
             let input = recovery::ChallengeInput {
                 product: args.product,
                 event: &args.event,
@@ -299,6 +368,7 @@ fn run_recovery(layout: &Layout, command: RecoveryCommand) -> i32 {
                 command_digest: &args.command_digest,
                 snapshot_digest: &args.snapshot_digest,
                 rules: &args.rules,
+                manifest,
                 scope: args.scope,
                 ttl_seconds: args.ttl_seconds,
                 out: &args.out,
@@ -409,34 +479,102 @@ fn run_recovery(layout: &Layout, command: RecoveryCommand) -> i32 {
 
 fn emergency_decision(
     request: &model::NormalizedRequest,
-    rules: BTreeSet<String>,
-) -> NormalizedDecision {
-    NormalizedDecision {
+    grant: &recovery::RecoveryGrant,
+) -> Result<NormalizedDecision, HookError> {
+    let manifest = grant.manifest.as_ref().ok_or_else(|| {
+        HookError::data(
+            "recovery-manifest-unavailable",
+            "recovery capability has no independently verifiable rule manifest",
+        )
+    })?;
+    let mut rules = manifest
+        .rules
+        .iter()
+        .filter(|rule| {
+            rule.matcher.as_deref().is_none_or(|matcher| {
+                request.matcher.as_deref().is_some_and(|candidate| {
+                    contract::matcher_expression_matches(matcher, candidate)
+                })
+            })
+        })
+        .collect::<Vec<_>>();
+    rules.sort_by(|left, right| {
+        left.priority
+            .cmp(&right.priority)
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    let mut action = DecisionAction::Allow;
+    let mut reasons = Vec::new();
+    for rule in rules {
+        let (candidate, code) = if grant.rules.contains(&rule.id) {
+            (DecisionAction::Allow, "recovery-exact-bypass")
+        } else {
+            match &rule.capability {
+                Capability::Allow { .. } => (DecisionAction::Allow, "recovery-manifest-allow"),
+                Capability::Warn { .. } => (DecisionAction::Warn, "recovery-manifest-warn"),
+                Capability::Block { .. } => (DecisionAction::Block, "recovery-manifest-block"),
+                Capability::Context { .. } => {
+                    (DecisionAction::Context, "recovery-manifest-context")
+                }
+                Capability::Transform { .. } => {
+                    (DecisionAction::Transform, "recovery-manifest-transform")
+                }
+                Capability::SessionActivity { .. }
+                | Capability::OwnerLiveness { .. }
+                | Capability::SemanticConflict { .. }
+                | Capability::RuntimeKitHandler { .. } => match rule.failure_posture {
+                    model::FailurePosture::Open => {
+                        (DecisionAction::Allow, "recovery-manifest-failure-open")
+                    }
+                    model::FailurePosture::Warn => {
+                        (DecisionAction::Warn, "recovery-manifest-failure-warn")
+                    }
+                    model::FailurePosture::Closed => {
+                        (DecisionAction::Block, "recovery-manifest-failure-closed")
+                    }
+                },
+            }
+        };
+        if emergency_action_rank(candidate) > emergency_action_rank(action) {
+            action = candidate;
+        }
+        reasons.push(DecisionReason {
+            rule_id: rule.id.clone(),
+            code: code.to_string(),
+            disposition: action_name(candidate).to_string(),
+        });
+    }
+    Ok(NormalizedDecision {
         schema_version: DECISION_VERSION.to_string(),
         request_id: request.request_id.clone(),
         product: request.product,
         event: request.event.clone(),
-        action: DecisionAction::Allow,
-        reasons: rules
-            .into_iter()
-            .map(|rule_id| DecisionReason {
-                rule_id,
-                code: "recovery-config-independent".to_string(),
-                disposition: "allow".to_string(),
-            })
-            .collect(),
+        action,
+        reasons,
         context: None,
         replacement: None,
         shadow: Vec::new(),
-        config_digest: "unavailable".to_string(),
-        policy_digest: "unavailable".to_string(),
+        config_digest: manifest.config_digest.clone(),
+        policy_digest: manifest.policy_digest.clone(),
         recovery_applied: true,
         provider_output: None,
+    })
+}
+
+fn emergency_action_rank(action: DecisionAction) -> u8 {
+    match action {
+        DecisionAction::Allow => 0,
+        DecisionAction::Warn => 1,
+        DecisionAction::Context => 2,
+        DecisionAction::Transform => 3,
+        DecisionAction::Block => 4,
     }
 }
 
 fn emit_decision(format: DispatchFormat, decision: &NormalizedDecision) -> i32 {
-    let code = if decision.action == DecisionAction::Block {
+    let code = if decision.action == DecisionAction::Block
+        && !matches!(format, DispatchFormat::Provider)
+    {
         1
     } else {
         0
@@ -444,7 +582,7 @@ fn emit_decision(format: DispatchFormat, decision: &NormalizedDecision) -> i32 {
     match format {
         DispatchFormat::Provider => match adapter::render_provider(decision) {
             Ok(output) => println!("{output}"),
-            Err(error) => return emit_dispatch_error(format, &error),
+            Err(error) => return emit_dispatch_error(format, &error, None),
         },
         DispatchFormat::Json => print_json_success("agent-hook dispatch", decision),
         DispatchFormat::Text => {
@@ -461,16 +599,28 @@ fn emit_decision(format: DispatchFormat, decision: &NormalizedDecision) -> i32 {
     code
 }
 
-fn emit_dispatch_error(format: DispatchFormat, error: &HookError) -> i32 {
+fn emit_dispatch_error(
+    format: DispatchFormat,
+    error: &HookError,
+    request: Option<&model::NormalizedRequest>,
+) -> i32 {
     match format {
         DispatchFormat::Json => emit_error("agent-hook dispatch", error, true),
         DispatchFormat::Provider => {
-            let output = json!({
-                "continue": false,
-                "stopReason": format!("agent-hook:{}", error.code),
-            });
-            println!("{output}");
-            error.exit_code
+            if let Some(request) = request {
+                match adapter::render_provider_error(request.product, &request.event, &error.code) {
+                    Ok(output) => println!("{output}"),
+                    Err(_) => return error.exit_code,
+                }
+                0
+            } else {
+                let output = json!({
+                    "continue": false,
+                    "stopReason": format!("agent-hook:{}", error.code),
+                });
+                println!("{output}");
+                error.exit_code
+            }
         }
         DispatchFormat::Text => emit_error("agent-hook dispatch", error, false),
     }
@@ -490,12 +640,7 @@ fn emit_success<T: Serialize>(
 }
 
 fn print_json_success<T: Serialize>(command: &str, result: &T) {
-    let envelope = SuccessEnvelope {
-        schema_version: schema(command),
-        command,
-        ok: true,
-        result,
-    };
+    let envelope = Envelope::success(command_schema(command), result);
     println!(
         "{}",
         serde_json::to_string(&envelope).expect("serializable success envelope")
@@ -504,16 +649,11 @@ fn print_json_success<T: Serialize>(command: &str, result: &T) {
 
 fn emit_error(command: &str, error: &HookError, json: bool) -> i32 {
     if json {
-        let envelope = ErrorEnvelope {
-            schema_version: schema(command),
-            command,
-            ok: false,
-            error: ErrorBody {
-                code: &error.code,
-                message: &error.message,
-                details: error.details.as_deref(),
-            },
-        };
+        let mut body = EnvelopeError::new(&error.code, &error.message);
+        if let Some(details) = error.details.as_deref() {
+            body = body.with_details(details.clone());
+        }
+        let envelope: Envelope<()> = Envelope::failure(command_schema(command), body);
         println!(
             "{}",
             serde_json::to_string(&envelope).expect("serializable error envelope")
@@ -522,6 +662,19 @@ fn emit_error(command: &str, error: &HookError, json: bool) -> i32 {
         eprintln!("agent-hook: {}: {}", error.code, error.message);
     }
     error.exit_code
+}
+
+fn command_schema(command: &str) -> String {
+    let command = command
+        .strip_prefix("agent-hook")
+        .unwrap_or(command)
+        .trim()
+        .replace(' ', "-");
+    schema_version_for(
+        "agent-hook",
+        if command.is_empty() { "root" } else { &command },
+        1,
+    )
 }
 
 fn capability_id(capability: &Capability) -> &'static str {

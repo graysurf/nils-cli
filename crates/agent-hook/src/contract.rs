@@ -1,6 +1,7 @@
 use std::collections::BTreeSet;
-use std::fs;
-use std::os::unix::fs::MetadataExt;
+use std::fs::OpenOptions;
+use std::io::Read;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::Path;
 
 use serde::Serialize;
@@ -10,7 +11,7 @@ use sha2::{Digest, Sha256};
 use crate::error::HookError;
 use crate::model::{
     CONFIG_VERSION, Capability, Config, FailurePosture, LoadedPolicy, OverrideClass,
-    POLICY_VERSION, PolicyBundle, Product, ProviderMode, RuleMode,
+    POLICY_VERSION, PolicyBundle, PolicyRule, Product, ProviderMode, RuleMode,
 };
 use crate::paths::Layout;
 
@@ -55,16 +56,32 @@ pub fn load(layout: &Layout, policy_override: Option<&Path>) -> Result<LoadedPol
 }
 
 pub fn read_regular(path: &Path, limit: u64, role: &str) -> Result<Vec<u8>, HookError> {
-    let metadata = fs::symlink_metadata(path).map_err(|error| {
+    let mut file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)
+        .map_err(|error| {
+            let code = if error.raw_os_error() == Some(libc::ELOOP) {
+                format!("{role}-untrusted")
+            } else {
+                format!("{role}-unavailable")
+            };
+            HookError::data(code, format!("{role} file is unavailable: {error}"))
+        })?;
+    let metadata = file.metadata().map_err(|error| {
         HookError::data(
             format!("{role}-unavailable"),
-            format!("{role} file is unavailable: {error}"),
+            format!("{role} file metadata is unavailable: {error}"),
         )
     })?;
-    if metadata.file_type().is_symlink() || !metadata.is_file() {
+    if !metadata.is_file()
+        || metadata.uid() != unsafe { libc::geteuid() }
+        || metadata.permissions().mode() & 0o022 != 0
+        || metadata.nlink() != 1
+    {
         return Err(HookError::data(
             format!("{role}-untrusted"),
-            format!("{role} path must be a regular non-symlink file"),
+            format!("{role} file type, owner, link count, or write mode is untrusted"),
         ));
     }
     if metadata.len() > limit {
@@ -73,18 +90,23 @@ pub fn read_regular(path: &Path, limit: u64, role: &str) -> Result<Vec<u8>, Hook
             format!("{role} file exceeds its byte limit"),
         ));
     }
-    if metadata.uid() != unsafe { libc::geteuid() } {
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    file.by_ref()
+        .take(limit + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| {
+            HookError::runtime(
+                format!("{role}-read-failed"),
+                format!("failed to read {role} file: {error}"),
+            )
+        })?;
+    if bytes.len() as u64 > limit {
         return Err(HookError::data(
-            format!("{role}-untrusted"),
-            format!("{role} file is not owned by the current user"),
+            format!("{role}-too-large"),
+            format!("{role} file exceeds its byte limit"),
         ));
     }
-    fs::read(path).map_err(|error| {
-        HookError::runtime(
-            format!("{role}-read-failed"),
-            format!("failed to read {role} file: {error}"),
-        )
-    })
+    Ok(bytes)
 }
 
 pub fn digest(bytes: &[u8]) -> String {
@@ -287,7 +309,15 @@ fn validate_capability(capability: &Capability) -> Result<(), HookError> {
             replacement,
         } => {
             validate_id("reason code", reason_code)?;
-            validate_bounded("replacement", replacement, MAX_TEXT)
+            if !replacement.is_object()
+                || serde_json::to_vec(replacement).map_or(true, |bytes| bytes.len() > MAX_TEXT)
+            {
+                return Err(HookError::data(
+                    "replacement-invalid",
+                    "transform replacement must be an object no larger than 16 KiB",
+                ));
+            }
+            Ok(())
         }
         Capability::OwnerLiveness {
             reason_code,
@@ -314,42 +344,25 @@ fn validate_capability(capability: &Capability) -> Result<(), HookError> {
     }
 }
 
-pub fn effective_mode(loaded: &LoadedPolicy, rule_id: &str, base: RuleMode) -> RuleMode {
-    let provider_mode = ProviderMode::Enforce;
-    let mode = loaded
-        .config
-        .overrides
-        .get(rule_id)
-        .map_or(base, |override_value| override_value.mode);
-    match provider_mode {
-        ProviderMode::Enforce => mode,
-        ProviderMode::Shadow => {
-            if mode == RuleMode::Disabled {
-                mode
-            } else {
-                RuleMode::Shadow
-            }
-        }
-        ProviderMode::Disabled => RuleMode::Disabled,
-    }
-}
-
 pub fn effective_mode_for_product(
     loaded: &LoadedPolicy,
     product: Product,
-    rule_id: &str,
-    base: RuleMode,
+    rule: &PolicyRule,
 ) -> RuleMode {
-    let provider_mode = loaded
-        .config
-        .providers
-        .get(product.as_str())
-        .map_or(ProviderMode::Enforce, |provider| provider.mode);
+    let provider_mode = if rule.override_class == OverrideClass::Locked {
+        ProviderMode::Enforce
+    } else {
+        loaded
+            .config
+            .providers
+            .get(product.as_str())
+            .map_or(ProviderMode::Enforce, |provider| provider.mode)
+    };
     let mode = loaded
         .config
         .overrides
-        .get(rule_id)
-        .map_or(base, |override_value| override_value.mode);
+        .get(&rule.id)
+        .map_or(rule.mode, |override_value| override_value.mode);
     match provider_mode {
         ProviderMode::Enforce => mode,
         ProviderMode::Shadow => {
@@ -364,23 +377,37 @@ pub fn effective_mode_for_product(
 }
 
 pub fn supported_event(product: Product, event: &str) -> bool {
-    const BASE: &[&str] = &[
-        "SessionStart",
-        "UserPromptSubmit",
-        "PermissionRequest",
-        "PreToolUse",
-        "PostToolUse",
-        "PostToolUseFailure",
-        "Stop",
-        "StopFailure",
-        "Notification",
-    ];
     match product {
-        Product::Codex => BASE.contains(&event),
-        Product::Claude => {
-            BASE.contains(&event)
-                || matches!(event, "SubagentStop" | "Elicitation" | "ElicitationResult")
-        }
+        Product::Codex => matches!(
+            event,
+            "SessionStart"
+                | "UserPromptSubmit"
+                | "PermissionRequest"
+                | "PreToolUse"
+                | "PostToolUse"
+                | "PreCompact"
+                | "PostCompact"
+                | "SubagentStart"
+                | "SubagentStop"
+                | "Stop"
+        ),
+        Product::Claude => matches!(
+            event,
+            "SessionStart"
+                | "UserPromptSubmit"
+                | "PermissionRequest"
+                | "PreToolUse"
+                | "PostToolUse"
+                | "PostToolUseFailure"
+                | "PreCompact"
+                | "SubagentStart"
+                | "SubagentStop"
+                | "Stop"
+                | "StopFailure"
+                | "Notification"
+                | "Elicitation"
+                | "ElicitationResult"
+        ),
         Product::Hermes => matches!(
             event,
             "pre_llm_call" | "post_llm_call" | "pre_approval_request" | "post_approval_response"

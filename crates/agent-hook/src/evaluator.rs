@@ -2,6 +2,7 @@ use std::collections::BTreeSet;
 use std::fs;
 use std::io::{Read, Write};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
@@ -23,14 +24,66 @@ const MAX_AGGREGATE_CONTEXT: usize = 16 * 1024;
 const MAX_REASONS: usize = 64;
 const MAX_HANDLER_OUTPUT: usize = 256 * 1024;
 const HANDLER_TIMEOUT: Duration = Duration::from_secs(5);
+const MAX_EXECUTABLE_CAPABILITIES: usize = 16;
+const MAX_DISPATCH_CHILD_OUTPUT: usize = 512 * 1024;
+const DISPATCH_CHILD_DEADLINE: Duration = Duration::from_secs(2);
 
 #[derive(Debug)]
 struct RuleOutcome {
     action: DecisionAction,
     code: String,
     context: Option<String>,
-    replacement: Option<String>,
+    replacement: Option<Value>,
     provider_output: Option<Value>,
+}
+
+#[derive(Debug)]
+struct ExecutionBudget {
+    started: Instant,
+    children: usize,
+    retained_output: usize,
+}
+
+impl ExecutionBudget {
+    fn new() -> Self {
+        Self {
+            started: Instant::now(),
+            children: 0,
+            retained_output: 0,
+        }
+    }
+
+    fn reserve_child(&mut self) -> Result<(Duration, usize), HookError> {
+        let elapsed = self.started.elapsed();
+        if elapsed >= DISPATCH_CHILD_DEADLINE {
+            return Err(HookError::data(
+                "dispatch-deadline-exceeded",
+                "dispatch executable capability deadline exceeded",
+            ));
+        }
+        if self.children >= MAX_EXECUTABLE_CAPABILITIES {
+            return Err(HookError::data(
+                "dispatch-child-budget-exceeded",
+                "dispatch executable capability count exceeds 16",
+            ));
+        }
+        self.children += 1;
+        Ok((
+            HANDLER_TIMEOUT.min(DISPATCH_CHILD_DEADLINE - elapsed),
+            MAX_DISPATCH_CHILD_OUTPUT.saturating_sub(self.retained_output),
+        ))
+    }
+
+    fn retain_output(&mut self, bytes: usize) -> Result<(), HookError> {
+        self.retained_output = self.retained_output.saturating_add(bytes);
+        if self.retained_output > MAX_DISPATCH_CHILD_OUTPUT {
+            return Err(HookError::data(
+                "dispatch-output-budget-exceeded",
+                "dispatch executable capability output exceeds 512 KiB",
+            ));
+        }
+        Ok(())
+    }
 }
 
 pub fn evaluate(
@@ -39,6 +92,7 @@ pub fn evaluate(
     raw: &[u8],
     all_shadow: bool,
     recovery_rules: &BTreeSet<String>,
+    coordination: Option<&liveness::Snapshot>,
 ) -> Result<NormalizedDecision, HookError> {
     let mut selected = loaded
         .bundle
@@ -61,20 +115,40 @@ pub fn evaluate(
             .then_with(|| left.id.cmp(&right.id))
     });
 
+    let executable_count = selected
+        .iter()
+        .filter(|rule| !recovery_rules.contains(&rule.id))
+        .filter(|rule| {
+            let mode = effective_mode_for_product(loaded, request.product, rule);
+            !all_shadow && mode == RuleMode::Enforce
+        })
+        .filter(|rule| {
+            matches!(
+                rule.capability,
+                Capability::SessionActivity { .. } | Capability::RuntimeKitHandler { .. }
+            )
+        })
+        .count();
+    if executable_count > MAX_EXECUTABLE_CAPABILITIES {
+        return Err(HookError::data(
+            "dispatch-child-budget-exceeded",
+            "dispatch executable capability count exceeds 16",
+        ));
+    }
+
     let mut enforced = Vec::new();
     let mut shadow = Vec::new();
     let mut recovery_applied = false;
+    let mut execution_budget = ExecutionBudget::new();
     for rule in selected {
         let mode = if all_shadow {
-            if effective_mode_for_product(loaded, request.product, &rule.id, rule.mode)
-                == RuleMode::Disabled
-            {
+            if effective_mode_for_product(loaded, request.product, rule) == RuleMode::Disabled {
                 RuleMode::Disabled
             } else {
                 RuleMode::Shadow
             }
         } else {
-            effective_mode_for_product(loaded, request.product, &rule.id, rule.mode)
+            effective_mode_for_product(loaded, request.product, rule)
         };
         if mode == RuleMode::Disabled {
             continue;
@@ -102,14 +176,46 @@ pub fn evaluate(
             ));
             continue;
         }
-        let outcome = match evaluate_capability(&rule.capability, request, raw) {
+        let outcome = match evaluate_capability(
+            &rule.capability,
+            request,
+            raw,
+            &mut execution_budget,
+            coordination,
+        ) {
             Ok(outcome) => outcome,
+            Err(error) if error.code.starts_with("dispatch-") => return Err(error),
             Err(_) => failure_outcome(rule.failure_posture, &rule.id),
         };
         enforced.push((rule.id.clone(), outcome));
     }
 
     aggregate(loaded, request, enforced, shadow, recovery_applied)
+}
+
+pub fn needs_coordination(
+    loaded: &LoadedPolicy,
+    request: &NormalizedRequest,
+    all_shadow: bool,
+    recovery_rules: &BTreeSet<String>,
+) -> bool {
+    !all_shadow
+        && loaded.bundle.rules.iter().any(|rule| {
+            rule.products.contains(&request.product)
+                && rule.events.iter().any(|event| event == &request.event)
+                && rule.matcher.as_deref().is_none_or(|matcher| {
+                    request
+                        .matcher
+                        .as_deref()
+                        .is_some_and(|candidate| matcher_expression_matches(matcher, candidate))
+                })
+                && !recovery_rules.contains(&rule.id)
+                && effective_mode_for_product(loaded, request.product, rule) == RuleMode::Enforce
+                && matches!(
+                    rule.capability,
+                    Capability::SemanticConflict { .. } | Capability::OwnerLiveness { .. }
+                )
+        })
 }
 
 fn evaluate_shadow(capability: &Capability) -> RuleOutcome {
@@ -131,6 +237,8 @@ fn evaluate_capability(
     capability: &Capability,
     request: &NormalizedRequest,
     raw: &[u8],
+    execution_budget: &mut ExecutionBudget,
+    coordination: Option<&liveness::Snapshot>,
 ) -> Result<RuleOutcome, HookError> {
     Ok(match capability {
         Capability::Allow { reason_code } => simple(DecisionAction::Allow, reason_code),
@@ -182,15 +290,15 @@ fn evaluate_capability(
             reason_code: _,
             legacy_ttl_seconds,
         } => {
-            let outcome = liveness::classify(request, *legacy_ttl_seconds);
+            let outcome = liveness::classify(request, *legacy_ttl_seconds, coordination);
             simple(outcome.action, &outcome.reason_code)
         }
         Capability::SessionActivity { reason_code } => {
-            run_session_activity(request, raw)?;
+            run_session_activity(request, raw, execution_budget)?;
             simple(DecisionAction::Allow, reason_code)
         }
         Capability::RuntimeKitHandler { handler_id } => {
-            run_runtime_handler(request.product, handler_id, raw)?
+            run_runtime_handler(request.product, handler_id, raw, execution_budget)?
         }
     })
 }
@@ -232,8 +340,9 @@ fn aggregate(
     let mut action = DecisionAction::Allow;
     let mut reasons = Vec::new();
     let mut contexts = Vec::new();
-    let mut replacement: Option<String> = None;
+    let mut replacement: Option<Value> = None;
     let mut provider_output = None;
+    let mut transform_conflicted = false;
     for (rule_id, outcome) in outcomes {
         if reasons.len() >= MAX_REASONS {
             return Err(HookError::data(
@@ -253,9 +362,10 @@ fn aggregate(
                 });
                 replacement = None;
                 provider_output = None;
+                transform_conflicted = true;
                 continue;
             }
-            if replacement.is_none() {
+            if !transform_conflicted && replacement.is_none() {
                 replacement = outcome.replacement.clone();
             }
         }
@@ -326,7 +436,11 @@ fn disposition(action: DecisionAction) -> &'static str {
     }
 }
 
-fn run_session_activity(request: &NormalizedRequest, raw: &[u8]) -> Result<(), HookError> {
+fn run_session_activity(
+    request: &NormalizedRequest,
+    raw: &[u8],
+    execution_budget: &mut ExecutionBudget,
+) -> Result<(), HookError> {
     let Some(session_id) = std::env::var("AGENT_SESSION_ID")
         .ok()
         .filter(|value| !value.trim().is_empty())
@@ -349,7 +463,7 @@ fn run_session_activity(request: &NormalizedRequest, raw: &[u8]) -> Result<(), H
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
-    let output = run_bounded(command, &event)?;
+    let output = run_with_budget(command, &event, execution_budget)?;
     if output.status.success() {
         Ok(())
     } else {
@@ -364,6 +478,7 @@ fn run_runtime_handler(
     product: Product,
     handler_id: &str,
     raw: &[u8],
+    execution_budget: &mut ExecutionBudget,
 ) -> Result<RuleOutcome, HookError> {
     let filename = runtime_handler_filename(handler_id).ok_or_else(|| {
         HookError::data(
@@ -379,7 +494,7 @@ fn run_runtime_handler(
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
-    let output = run_bounded(command, raw)?;
+    let output = run_with_budget(command, raw, execution_budget)?;
     if output.stdout.len() > MAX_HANDLER_OUTPUT {
         return Err(HookError::data(
             "handler-output-too-large",
@@ -410,8 +525,8 @@ fn run_runtime_handler(
     let replacement = value
         .pointer("/hookSpecificOutput/updatedInput")
         .or_else(|| value.get("updatedInput"))
-        .and_then(Value::as_str)
-        .map(|value| value.chars().take(16 * 1024).collect());
+        .filter(|value| value.is_object())
+        .cloned();
     Ok(RuleOutcome {
         action,
         code: handler_id.to_string(),
@@ -479,7 +594,26 @@ fn validate_handler(path: &Path) -> Result<(), HookError> {
     Ok(())
 }
 
-fn run_bounded(mut command: Command, input: &[u8]) -> Result<std::process::Output, HookError> {
+fn run_with_budget(
+    command: Command,
+    input: &[u8],
+    budget: &mut ExecutionBudget,
+) -> Result<std::process::Output, HookError> {
+    let (timeout, output_limit) = budget.reserve_child()?;
+    let output = run_bounded(command, input, timeout, output_limit, true)?;
+    budget.retain_output(output.stdout.len().saturating_add(output.stderr.len()))?;
+    Ok(output)
+}
+
+fn run_bounded(
+    mut command: Command,
+    input: &[u8],
+    timeout: Duration,
+    output_limit: usize,
+    dispatch_deadline: bool,
+) -> Result<std::process::Output, HookError> {
+    command.process_group(0);
+    let deadline = Instant::now() + timeout;
     let mut child = command
         .spawn()
         .map_err(|_| HookError::runtime("capability-unavailable", "capability could not start"))?;
@@ -494,29 +628,33 @@ fn run_bounded(mut command: Command, input: &[u8]) -> Result<std::process::Outpu
     let stdout_handle = child
         .stdout
         .take()
-        .map(|stdout| thread::spawn(move || read_capped(stdout, MAX_HANDLER_OUTPUT + 1)));
+        .map(|stdout| thread::spawn(move || read_capped(stdout, output_limit + 1)));
     let stderr_handle = child
         .stderr
         .take()
-        .map(|stderr| thread::spawn(move || read_capped(stderr, MAX_HANDLER_OUTPUT + 1)));
-    let started = Instant::now();
+        .map(|stderr| thread::spawn(move || read_capped(stderr, output_limit + 1)));
     let status = loop {
         match child.try_wait() {
             Ok(Some(status)) => break status,
-            Ok(None) if started.elapsed() < HANDLER_TIMEOUT => {
+            Ok(None) if Instant::now() < deadline => {
                 thread::sleep(Duration::from_millis(10));
             }
             Ok(None) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(HookError::runtime(
-                    "capability-timeout",
-                    "capability exceeded its fixed timeout",
-                ));
+                terminate_process_group(&mut child);
+                return Err(if dispatch_deadline {
+                    HookError::data(
+                        "dispatch-deadline-exceeded",
+                        "dispatch executable capability deadline exceeded",
+                    )
+                } else {
+                    HookError::runtime(
+                        "capability-timeout",
+                        "capability exceeded its fixed timeout",
+                    )
+                });
             }
             Err(_) => {
-                let _ = child.kill();
-                let _ = child.wait();
+                terminate_process_group(&mut child);
                 return Err(HookError::runtime(
                     "capability-wait-failed",
                     "capability state could not be read",
@@ -524,13 +662,15 @@ fn run_bounded(mut command: Command, input: &[u8]) -> Result<std::process::Outpu
             }
         }
     };
+    terminate_descendants(child.id());
     if let Some(handle) = input_handle {
+        wait_for_thread(&handle, deadline)?;
         handle.join().map_err(|_| {
             HookError::runtime("capability-input-failed", "capability input failed")
         })??;
     }
-    let stdout = join_capped(stdout_handle)?;
-    let stderr = join_capped(stderr_handle)?;
+    let stdout = join_capped(stdout_handle, deadline)?;
+    let stderr = join_capped(stderr_handle, deadline)?;
     Ok(std::process::Output {
         status,
         stdout,
@@ -555,13 +695,43 @@ fn read_capped(mut pipe: impl Read, limit: usize) -> Result<Vec<u8>, HookError> 
 
 fn join_capped(
     handle: Option<thread::JoinHandle<Result<Vec<u8>, HookError>>>,
+    deadline: Instant,
 ) -> Result<Vec<u8>, HookError> {
     match handle {
-        Some(handle) => handle.join().map_err(|_| {
-            HookError::runtime("capability-output-failed", "capability output failed")
-        })?,
+        Some(handle) => {
+            wait_for_thread(&handle, deadline)?;
+            handle.join().map_err(|_| {
+                HookError::runtime("capability-output-failed", "capability output failed")
+            })?
+        }
         None => Ok(Vec::new()),
     }
+}
+
+fn wait_for_thread<T>(handle: &thread::JoinHandle<T>, deadline: Instant) -> Result<(), HookError> {
+    while !handle.is_finished() {
+        if Instant::now() >= deadline {
+            return Err(HookError::data(
+                "dispatch-deadline-exceeded",
+                "dispatch executable capability deadline exceeded while draining pipes",
+            ));
+        }
+        thread::sleep(Duration::from_millis(5));
+    }
+    Ok(())
+}
+
+fn terminate_descendants(process_group: u32) {
+    let process_group = process_group as libc::pid_t;
+    unsafe {
+        libc::kill(-process_group, libc::SIGKILL);
+    }
+}
+
+fn terminate_process_group(child: &mut std::process::Child) {
+    terminate_descendants(child.id());
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 #[cfg(test)]
@@ -581,7 +751,8 @@ mod tests {
             .stderr(Stdio::piped());
 
         let started = Instant::now();
-        let output = run_bounded(command, &[]).expect("bounded output");
+        let output = run_bounded(command, &[], HANDLER_TIMEOUT, MAX_HANDLER_OUTPUT, false)
+            .expect("bounded output");
 
         assert!(output.status.success());
         assert_eq!(output.stdout.len(), MAX_HANDLER_OUTPUT + 1);
@@ -599,8 +770,14 @@ mod tests {
             .stderr(Stdio::piped());
 
         let started = Instant::now();
-        let error = run_bounded(command, &vec![b'x'; 1024 * 1024])
-            .expect_err("closed child stdin must be reported");
+        let error = run_bounded(
+            command,
+            &vec![b'x'; 1024 * 1024],
+            HANDLER_TIMEOUT,
+            MAX_HANDLER_OUTPUT,
+            false,
+        )
+        .expect_err("closed child stdin must be reported");
 
         assert_eq!(error.code, "capability-input-failed");
         assert!(started.elapsed() < HANDLER_TIMEOUT);

@@ -40,10 +40,10 @@ fn strict_policy_accepts_grouped_matcher_and_inventory_hides_parameters() {
     let validate = fixture.run(&["validate", "--format", "json"], None);
     assert_eq!(validate.code, 0, "stderr={}", validate.stderr_text());
     let envelope = validate.stdout_json();
-    assert_eq!(envelope["schema_version"], "cli.agent-hook-validate.v1");
-    assert_eq!(envelope["command"], "agent-hook validate");
+    assert_eq!(envelope["schema_version"], "cli.agent-hook.validate.v1");
+    assert!(envelope.get("command").is_none());
     assert_eq!(envelope["ok"], true);
-    assert_eq!(envelope["result"]["rule_count"], 2);
+    assert_eq!(envelope["data"]["rule_count"], 2);
 
     let inventory = fixture.run(&["inventory", "--format", "json"], None);
     assert_eq!(inventory.code, 0);
@@ -93,7 +93,7 @@ capability = { id = "decision.allow.v1", reason_code = "session-start-known" }
         );
         assert_eq!(known.code, 0, "stderr={}", known.stderr_text());
         assert_eq!(
-            known.stdout_json()["result"]["reasons"][0]["code"],
+            known.stdout_json()["data"]["reasons"][0]["code"],
             "session-start-known"
         );
 
@@ -102,7 +102,7 @@ capability = { id = "decision.allow.v1", reason_code = "session-start-known" }
             Some(r#"{"hook_event_name":"SessionStart","source":"future-source"}"#),
         );
         assert_eq!(unknown.code, 0, "stderr={}", unknown.stderr_text());
-        assert_eq!(unknown.stdout_json()["result"]["reasons"], json!([]));
+        assert_eq!(unknown.stdout_json()["data"]["reasons"], json!([]));
     }
 }
 
@@ -121,7 +121,7 @@ fn forged_payload_conflict_is_ignored_but_registry_conflict_blocks() {
         Some(&payload),
     );
     assert_eq!(forged.code, 0, "stderr={}", forged.stderr_text());
-    assert_eq!(forged.stdout_json()["result"]["action"], "warn");
+    assert_eq!(forged.stdout_json()["data"]["action"], "warn");
 
     let coordination = fixture.session_state.join("coordination");
     fs::create_dir_all(&coordination).expect("coordination dir");
@@ -137,8 +137,8 @@ fn forged_payload_conflict_is_ignored_but_registry_conflict_blocks() {
             "peer": {"session_id":"peer","incarnation":"inc-peer","state":"ready","heartbeat_epoch":now}
         },
         "claims": [
-            {"session_id":"current","session_incarnation":"inc-current","state":"active","worktrees":["hmac-sha256:1:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"],"repositories":["owner/repo"],"provider_refs":[],"scopes":[],"expires_at_epoch":now+300},
-            {"session_id":"peer","session_incarnation":"inc-peer","state":"active","worktrees":["hmac-sha256:1:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"],"repositories":["owner/repo"],"provider_refs":[],"scopes":[],"expires_at_epoch":now+300}
+            {"schema_version":"agent-session.work-context.v1","session_id":"current","session_incarnation":"inc-current","state":"active","worktrees":["hmac-sha256:1:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"],"repositories":["owner/repo"],"provider_refs":[],"scopes":[],"expires_at_epoch":now+300},
+            {"schema_version":"agent-session.work-context.v1","session_id":"peer","session_incarnation":"inc-peer","state":"active","worktrees":["hmac-sha256:1:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"],"repositories":["owner/repo"],"provider_refs":[],"scopes":[],"expires_at_epoch":now+300}
         ]
     });
     let registry_path = coordination.join("registry.json");
@@ -148,6 +148,17 @@ fn forged_payload_conflict_is_ignored_but_registry_conflict_blocks() {
     )
     .expect("registry");
     Fixture::set_private(&registry_path);
+    for (session, incarnation) in [("current", "inc-current"), ("peer", "inc-peer")] {
+        let heartbeat = fixture
+            .session_state
+            .join("sessions")
+            .join(session)
+            .join("coordination/heartbeat");
+        fs::create_dir_all(heartbeat.parent().expect("heartbeat parent"))
+            .expect("heartbeat directory");
+        fs::write(&heartbeat, format!("{incarnation}:{now}\n")).expect("heartbeat");
+        Fixture::set_private(&heartbeat);
+    }
 
     let options = nils_test_support::cmd::CmdOptions::new()
         .with_cwd(&fixture.root)
@@ -172,7 +183,7 @@ fn forged_payload_conflict_is_ignored_but_registry_conflict_blocks() {
         &options,
     );
     assert_eq!(backed.code, 1, "stderr={}", backed.stderr_text());
-    assert_eq!(backed.stdout_json()["result"]["action"], "block");
+    assert_eq!(backed.stdout_json()["data"]["action"], "block");
 }
 
 #[test]

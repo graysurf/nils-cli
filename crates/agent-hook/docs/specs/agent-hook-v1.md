@@ -53,9 +53,9 @@ handling.
   policy digests.
 - `agent-hook.trace.v1`: timing, rule IDs, disposition classes, and digests;
   never raw payload, paths, identities, message content, or capabilities.
-- `agent-hook.setup-plan.v1`: product, owned event/matcher groups,
-  before/after digests, exact plan digest, drift state, and whether apply is
-  permitted. Provider hook argv content is omitted.
+- `agent-hook.setup-plan.v2`: product, owned event/matcher groups, role-tagged
+  before/after digests for every provider source, exact plan digest, drift
+  state, and whether apply is permitted. Provider hook argv content is omitted.
 - `agent-hook.doctor.v1`: product status (missing, compatibility-only, `dual`,
   `drifted`, `converged`, `unsupported`, or `unrelated`), owned counts,
   compatibility residue count, digests, policy availability, and recovery health.
@@ -63,7 +63,8 @@ handling.
   capability parameters and private paths are omitted.
 - `agent-hook.recovery-challenge.v1`: random challenge ID, exact product/event,
   target/command/snapshot digests, requested rule IDs, scope, issue/expiry time,
-  and state revision.
+  state revision, and a digest-bound `agent-hook.recovery-manifest.v1` projection
+  of every enforceable rule for that product/event.
 - `agent-hook.recovery-capability.v1`: capability ID, challenge digest, exact
   binding, scope, expiry, nonce, state revision, and authorization proof digest.
   The capability file is the bearer and is never printed.
@@ -71,8 +72,8 @@ handling.
   `orphaned`, `unknown`, or `unclaimed`), semantic conflict class, and
   content-free reason codes.
 
-Service JSON uses the workspace envelope: `schema_version`, `command`, `ok`,
-then `result`/`results`; failures contain `error.code`, `error.message`, and
+Service JSON uses the workspace envelope: `schema_version`, `ok`, then `data`;
+failures contain `error.code`, `error.message`, and
 optional redacted `error.details`. Text is the human default except `dispatch`,
 whose default is provider output so the documented ingress command is usable.
 `--format json` always selects the service envelope.
@@ -86,9 +87,11 @@ native setup until a compatible runner exists.
 Supported canonical events are:
 
 - Codex: `SessionStart`, `UserPromptSubmit`, `PermissionRequest`, `PreToolUse`,
-  `PostToolUse`, `PostToolUseFailure`, `Stop`, `StopFailure`, and
-  `Notification`.
-- Claude: the Codex set plus `SubagentStop`, `Elicitation`, and
+  `PostToolUse`, `PreCompact`, `PostCompact`, `SubagentStart`, `SubagentStop`,
+  and `Stop`.
+- Claude: `SessionStart`, `UserPromptSubmit`, `PermissionRequest`, `PreToolUse`,
+  `PostToolUse`, `PostToolUseFailure`, `PreCompact`, `Stop`, `StopFailure`,
+  `Notification`, `SubagentStart`, `SubagentStop`, `Elicitation`, and
   `ElicitationResult`.
 
 The adapter accepts the event from `--event` or the provider's documented
@@ -100,11 +103,11 @@ entire normalized matcher. The only expression operator is `|`. Empty atoms,
 duplicates, more than 64 atoms, and regex/glob/grouping/escape constructs are
 invalid. Setup renders the original validated expression as one provider group
 matcher, preserving registration grouping and order; it does not explode the
-expression into per-tool rules. Oversized input, invalid
-UTF-8/JSON, unsupported events, duplicate object keys, or unknown normalized
-fields fail according to the matching rule's declared failure posture; when no
-rule can be loaded they fail closed except for an exact valid recovery
-capability.
+expression into per-tool rules. Oversized input, invalid UTF-8/JSON,
+unsupported events, duplicate object keys, or unknown normalized fields fail
+before rule evaluation. When ordinary config cannot be loaded, an exact valid
+recovery capability evaluates its signed rule manifest and preserves every
+ungranted rule instead of producing a global allow.
 
 Provider rendering maps one normalized aggregate result to the provider's
 native allow, warning/context, block, or input-replacement shape and stable exit
@@ -165,8 +168,12 @@ The v1 allowlist is:
 
 Handler resolution selects the compiled `.py` or `.sh` suffix, rejects
 symlinks/non-regular files and owner/permission drift, passes the original
-bounded provider JSON on standard input, uses a fixed timeout, and preserves
-the handler's provider output/exit semantics. The policy cannot specify a path,
+bounded provider JSON on standard input, and preserves the handler's provider
+output/exit semantics. One dispatch starts at most 16 executable capabilities,
+retains at most 512 KiB of aggregate child output, and shares a two-second
+absolute deadline. Each child leads an isolated process group; timeout or
+direct-child exit terminates descendants before bounded pipe draining. The
+policy cannot specify a path,
 interpreter, argv, environment assignment, shell fragment, timeout, or digest.
 Shadow mode never invokes it. Adding another handler requires a new nils-cli
 release or a new versioned capability ID.
@@ -201,24 +208,32 @@ Override classes:
 
 `agent-hook setup --product <provider>` is dry-run-first. `--apply`, `--repair`,
 and `--remove` are mutually exclusive. Mutation requires an exact reviewed
-plan digest when drift, compatibility, or dual ownership is present. Setup parses and
-renders all files before mutation, locks provider state, re-reads the reviewed
-before digest, writes atomically, and restores the prior bytes on partial
-failure. Symlinks, non-regular files, unsafe permissions, concurrent drift, and
-malformed provider roots fail without mutation.
+plan digest when drift, compatibility, or dual ownership is present. Setup
+parses and renders all files before mutation, locks by a stable provider-path
+identity independent of `--state-dir`, re-reads every reviewed byte state,
+writes atomically, and restores all prior bytes and file-presence states on any
+partial or post-replacement failure. Symlinks, non-regular files, unsafe
+permissions, concurrent drift, and malformed provider roots fail without
+mutation.
 
-Owned groups are marked and contain exactly one dispatcher command for each
-required event/matcher. Install, upgrade, repair, remove, and rollback preserve
+For Codex, `config.toml` and compatibility `hooks.json` are one transaction.
+The managed `config.toml` representation also owns the authoritative
+`agent-session activity notify --agent codex` argv: a safe singular user
+notifier is composed by direct argv, and remove restores it byte-for-byte.
+Owned groups contain exactly one dispatcher command for each required
+event/matcher. Install, upgrade, repair, remove, and rollback preserve
 unrelated hooks, comments, formatting, provider metadata, and unsupported
-surface truth. Removal deletes only an exact owned representation. Pre-dispatch
+surface truth. A no-op remove preserves both bytes and file presence; removal
+deletes only an exact owned representation. Pre-dispatch
 `agent-session activity setup` forwards to this API and cannot install a second
 managed representation. Compatibility handlers are reported as compatibility-only or `dual`
 until the reviewed migration removes them.
 
 ## Governed recovery
 
-Recovery bootstrap resolves and validates state before loading ordinary config
-or policy. A challenge binds the exact product, event, target digest, command
+Recovery state paths are validated without following symlinks before any
+chmod, creation, or write. A challenge loads the current strict policy and
+binds the exact product, event, target digest, command
 digest, snapshot digest, requested rules, scope, state revision, and expiry.
 Authorization requires the same effective OS user, a private regular challenge
 file, explicit digest confirmation, and a fresh state revision. It produces a
@@ -232,7 +247,10 @@ permission/owner mismatch, product/event/session/target/command/snapshot drift,
 target recreation, or key rotation. No environment variable or persistent
 config enables bypass.
 
-An exact capability may recover from malformed config or missing policy. It
+An exact capability may recover from malformed config or missing policy by
+evaluating its signed, versioned rule manifest. Unknown/non-recoverable IDs are
+rejected before authorization, and ungranted rules retain their action or
+failure posture. It
 does not bypass OS/provider authorization, unrelated hooks, nils-cli
 transaction/privacy invariants, or a scope not explicitly bound in the
 capability. Traces and output expose only a reason code and capability digest,
@@ -240,8 +258,11 @@ never the bearer or private identity.
 
 ## Coordination and writer liveness
 
-The built-in `owner-liveness` capability reads the #676 coordination registry
-and heartbeat evidence read-only. It validates ownership and permissions and
+The built-in `owner-liveness` capability lazily reads one bounded #676
+coordination projection only when a selected enforced rule needs it. The
+projection and heartbeat/fingerprint verifier live in `nils-common` and are
+shared with the producer. Sidecar heartbeat evidence, not the registry's
+projection timestamp, authenticates freshness. It validates ownership and permissions and
 returns only public classifications. Active foreign writers and definite
 semantic conflicts block. Stale clean ownership may be reclaimed atomically by
 the owning coordination primitive. Dirty ownership requires governed adoption
@@ -271,4 +292,5 @@ classification.
 - `1`: runtime failure or provider block.
 - `64`: invalid CLI use.
 - `65`: invalid config, policy, provider input, drift, or recovery data.
+- `69`: required provider/setup resource or lock is temporarily unavailable.
 - `75`: concurrency/lock contention suitable for bounded retry.

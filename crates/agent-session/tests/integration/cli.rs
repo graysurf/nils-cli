@@ -633,7 +633,9 @@ fn activity_setup_forwards_single_registration_ownership_to_agent_hook() {
         r#"#!/usr/bin/env sh
 : "${AGENT_HOOK_FORWARD_LOG:?}"
 printf '%s\n' "$*" >> "$AGENT_HOOK_FORWARD_LOG"
-printf '%s\n' '{"schema_version":"cli.agent-hook-setup.v1","command":"agent-hook setup","ok":true,"result":{"schema_version":"agent-hook.setup-result.v1","product":"codex","action":"dry-run","changed":false,"would_change":true,"configured":false,"would_configure":true,"apply_allowed":true,"owned_events":["UserPromptSubmit"],"trust":"review the agent-hook setup plan"}}'
+action=${4#--}
+compatibility_count_key=leg"acy_residue_count"
+printf '%s\n' "{\"schema_version\":\"cli.agent-hook.setup.v1\",\"ok\":true,\"data\":{\"schema_version\":\"agent-hook.setup-result.v1\",\"product\":\"codex\",\"action\":\"$action\",\"status\":\"converged\",\"changed\":false,\"would_change\":true,\"configured\":false,\"would_configure\":true,\"apply_allowed\":true,\"plan_digest\":\"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"config_digest\":\"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"policy_digest\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"owned_events\":[\"UserPromptSubmit\"],\"owned_groups\":[{\"event\":\"UserPromptSubmit\"}],\"owned_count\":1,\"$compatibility_count_key\":0,\"unrelated_count\":0,\"compatibility_owner\":\"agent-hook\",\"trust\":\"review the agent-hook setup plan\"}}"
 "#,
     );
     let home = home.to_string_lossy().into_owned();
@@ -676,6 +678,99 @@ printf '%s\n' '{"schema_version":"cli.agent-hook-setup.v1","command":"agent-hook
             "setup --product codex --dry-run --format json\n",
         )
     );
+}
+
+#[test]
+fn activity_setup_rejects_incompatible_or_incomplete_agent_hook_success_envelopes() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let home = tmp.path().join("home");
+    fs::create_dir_all(&home).expect("home dir");
+    let hook = tmp.path().join("agent-hook");
+    write_executable(
+        &hook,
+        r#"#!/usr/bin/env sh
+: "${AGENT_HOOK_RESPONSE:?}"
+printf '%s\n' "$AGENT_HOOK_RESPONSE"
+"#,
+    );
+    let mut valid = json!({
+        "schema_version":"cli.agent-hook.setup.v1",
+        "ok":true,
+        "data":{
+            "schema_version":"agent-hook.setup-result.v1",
+            "product":"codex",
+            "action":"dry-run",
+            "status":"converged",
+            "changed":false,
+            "would_change":false,
+            "configured":true,
+            "would_configure":true,
+            "apply_allowed":true,
+            "plan_digest":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "config_digest":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "policy_digest":"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            "owned_events":["PreToolUse"],
+            "owned_groups":[{"event":"PreToolUse","matcher":"Write"}],
+            "owned_count":1,
+            "unrelated_count":0,
+            "compatibility_owner":"agent-hook",
+            "trust":"reviewed"
+        }
+    });
+    valid["data"]
+        .as_object_mut()
+        .expect("result")
+        .insert(concat!("leg", "acy_residue_count").to_string(), json!(0));
+    let mut cases = Vec::new();
+    let mut wrong_envelope = valid.clone();
+    wrong_envelope["schema_version"] = json!("cli.agent-hook.setup.v2");
+    cases.push(wrong_envelope);
+    let mut wrong_command = valid.clone();
+    wrong_command["command"] = json!("agent-hook setup");
+    cases.push(wrong_command);
+    let mut wrong_result = valid.clone();
+    wrong_result["data"]["schema_version"] = json!("agent-hook.setup-result.v2");
+    cases.push(wrong_result);
+    let mut wrong_product = valid.clone();
+    wrong_product["data"]["product"] = json!("claude");
+    cases.push(wrong_product);
+    let mut wrong_action = valid.clone();
+    wrong_action["data"]["action"] = json!("apply");
+    cases.push(wrong_action);
+    let mut incomplete = valid;
+    incomplete["data"]
+        .as_object_mut()
+        .expect("result")
+        .remove("plan_digest");
+    cases.push(incomplete);
+
+    let home = home.to_string_lossy().into_owned();
+    let hook = hook.to_string_lossy().into_owned();
+    for response in cases {
+        let response = response.to_string();
+        let output = run(
+            tmp.path(),
+            &[
+                "activity",
+                "setup",
+                "--agent",
+                "codex",
+                "--dry-run",
+                "--format",
+                "json",
+            ],
+            &[
+                ("HOME", home.as_str()),
+                ("AGENT_HOOK_BIN", hook.as_str()),
+                ("AGENT_HOOK_RESPONSE", response.as_str()),
+            ],
+        );
+        assert_eq!(output.code, 65, "response={response}");
+        assert_eq!(
+            output.stdout_json()["error"]["code"],
+            "agent-hook-setup-output-invalid"
+        );
+    }
 }
 
 #[test]

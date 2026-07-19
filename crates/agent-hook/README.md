@@ -50,13 +50,21 @@ owned dispatcher entries. Hermes policy can be validated and inspected, but
 native setup truthfully reports `unsupported` until Hermes exposes a compatible
 runner.
 
+Codex `config.toml`, compatibility `hooks.json`, the managed dispatcher, and
+the authoritative `agent-session activity notify --agent codex` argv are one
+reviewed transaction. A singular safe user notifier is composed without a
+shell; rollback and remove restore the exact prior bytes and file-presence
+state.
+
 `agent-session.activity.v1` emits only a normalized metadata event to
 `agent-session activity event`; it never forwards raw provider JSON. Shadow
 evaluation skips every side-effecting capability.
 
 Recovery uses a private challenge/authorize/consume lifecycle. Capability
-files are exact, expiring, state-bound bearers and must never be printed or
-placed in persistent config.
+files are exact, expiring, state-bound bearers. Each challenge binds a signed
+rule manifest, so recovery from an unavailable config or policy still evaluates
+all ungranted rules instead of becoming a global allow. Bearers must never be
+printed or placed in persistent config.
 
 See the [v1 contract](docs/specs/agent-hook-v1.md) for schemas, limits,
 aggregation, setup ownership, liveness, and recovery invariants.

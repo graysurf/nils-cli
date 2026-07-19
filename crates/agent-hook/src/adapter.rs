@@ -1,8 +1,11 @@
 use std::io::Read;
-use std::path::PathBuf;
+use std::os::unix::fs::MetadataExt;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 
 use serde::Serialize;
-use serde_json::{Map, Value, json};
+use serde::de::{Deserialize, Deserializer, MapAccess, SeqAccess, Visitor};
+use serde_json::{Map, Number, Value, json};
 use sha2::{Digest, Sha256};
 
 use crate::contract::{digest, supported_event};
@@ -63,12 +66,7 @@ pub fn normalize(
             "provider hook input must be JSON",
         ));
     }
-    let raw: Value = serde_json::from_slice(input).map_err(|_| {
-        HookError::data(
-            "provider-input-invalid",
-            "provider hook input is not valid bounded JSON",
-        )
-    })?;
+    let raw = parse_provider_json(input)?;
     let object = raw.as_object().ok_or_else(|| {
         HookError::data(
             "provider-input-invalid",
@@ -99,19 +97,23 @@ pub fn normalize(
         ));
     }
 
-    let matcher_keys: &[&str] = if event == "SessionStart" {
-        &["matcher", "source"]
-    } else {
-        &["matcher", "tool_name", "notification_type"]
+    let matcher_keys: &[&str] = match event.as_str() {
+        "SessionStart" => &["matcher", "source"],
+        "SubagentStart" | "SubagentStop" => &["matcher", "agent_type"],
+        "Notification" => &["matcher", "notification_type"],
+        "PermissionRequest" | "PreToolUse" | "PostToolUse" | "PostToolUseFailure" => {
+            &["matcher", "tool_name"]
+        }
+        _ => &["matcher"],
     };
     let matcher = string_at(object, matcher_keys)
         .map(str::to_string)
         .filter(|value| value.len() <= 128);
-    let target_path = target_path(object);
+    let (target_path, execution_path) = target_paths(object, matcher.as_deref())?;
     let target_material = target_path
-        .as_ref()
-        .map(|path| path.as_os_str().as_encoded_bytes())
-        .unwrap_or(b"target-unavailable");
+        .as_deref()
+        .map(target_binding_material)
+        .unwrap_or_else(|| b"target-unavailable".to_vec());
     let command_material = command_text(object)
         .unwrap_or("command-unavailable")
         .as_bytes();
@@ -123,7 +125,7 @@ pub fn normalize(
         product,
         event,
         matcher,
-        target_digest: digest(target_material),
+        target_digest: digest(&target_material),
         command_digest: digest(command_material),
         snapshot_digest,
         worktree_fingerprint: None,
@@ -131,6 +133,7 @@ pub fn normalize(
         // dispatcher replaces this with a #676 registry-derived projection.
         semantic_conflict: None,
         target_path,
+        execution_path,
     })
 }
 
@@ -151,6 +154,12 @@ pub fn render_provider(decision: &NormalizedDecision) -> Result<String, HookErro
         .join(",");
     let output = match decision.action {
         DecisionAction::Allow => json!({}),
+        DecisionAction::Block
+            if matches!(decision.product, Product::Codex | Product::Claude)
+                && matches!(decision.event.as_str(), "PreToolUse" | "PermissionRequest") =>
+        {
+            provider_denial(decision.product, &decision.event, &reason)
+        }
         DecisionAction::Block => json!({
             "continue": false,
             "stopReason": format!("agent-hook:{reason}"),
@@ -176,18 +185,42 @@ pub fn render_provider(decision: &NormalizedDecision) -> Result<String, HookErro
     })
 }
 
+pub fn render_provider_error(
+    product: Product,
+    event: &str,
+    reason: &str,
+) -> Result<String, HookError> {
+    serde_json::to_string(&provider_denial(product, event, reason)).map_err(|_| {
+        HookError::runtime(
+            "provider-output-render-failed",
+            "provider error output could not be rendered",
+        )
+    })
+}
+
+fn provider_denial(product: Product, event: &str, reason: &str) -> Value {
+    match (product, event) {
+        (Product::Codex | Product::Claude, "PreToolUse" | "PermissionRequest") => json!({
+            "hookSpecificOutput": {
+                "hookEventName": event,
+                "permissionDecision": "deny",
+                "permissionDecisionReason": format!("agent-hook:{reason}"),
+            }
+        }),
+        _ => json!({
+            "continue": false,
+            "stopReason": format!("agent-hook:{reason}"),
+        }),
+    }
+}
+
 pub fn normalize_activity_event(
     request: &NormalizedRequest,
     input: &[u8],
     runtime_id: &str,
 ) -> Result<Option<Vec<u8>>, HookError> {
     validate_provider_id("runtime_id", runtime_id)?;
-    let raw: Value = serde_json::from_slice(input).map_err(|_| {
-        HookError::data(
-            "provider-input-invalid",
-            "provider hook input is not valid bounded JSON",
-        )
-    })?;
+    let raw = parse_provider_json(input)?;
     let object = raw.as_object().ok_or_else(|| {
         HookError::data(
             "provider-input-invalid",
@@ -344,11 +377,87 @@ fn string_at<'a>(object: &'a Map<String, Value>, keys: &[&str]) -> Option<&'a st
         .find_map(|key| object.get(*key).and_then(Value::as_str))
 }
 
-fn target_path(object: &Map<String, Value>) -> Option<PathBuf> {
-    string_at(object, &["cwd", "working_directory"])
-        .or_else(|| nested_string(object, "tool_input", &["path", "file_path", "cwd"]))
+fn target_paths(
+    object: &Map<String, Value>,
+    matcher: Option<&str>,
+) -> Result<(Option<PathBuf>, Option<PathBuf>), HookError> {
+    let execution = string_at(object, &["cwd", "working_directory"])
         .map(PathBuf::from)
-        .filter(|path| path.is_absolute())
+        .filter(|path| path.is_absolute());
+    let nested = object.get("tool_input").and_then(Value::as_object);
+    let path_value = nested.and_then(|input| input.get("path").or_else(|| input.get("file_path")));
+    let target =
+        match path_value {
+            Some(Value::String(value)) if !value.is_empty() => {
+                let path = PathBuf::from(value);
+                if path.is_absolute() {
+                    Some(path)
+                } else {
+                    Some(execution.as_ref().map(|cwd| cwd.join(path)).ok_or_else(|| {
+                    HookError::data(
+                        "provider-target-untrusted",
+                        "relative mutation target requires an absolute execution directory",
+                    )
+                })?)
+                }
+            }
+            Some(_) => {
+                return Err(HookError::data(
+                    "provider-target-untrusted",
+                    "path-bearing mutation target must be a non-empty string",
+                ));
+            }
+            None => execution.clone(),
+        };
+    if matches!(
+        matcher,
+        Some("Write" | "Edit" | "NotebookEdit" | "MultiEdit")
+    ) && target.is_none()
+    {
+        return Err(HookError::data(
+            "provider-target-untrusted",
+            "path-bearing mutation could not be mapped to an absolute target",
+        ));
+    }
+    Ok((target, execution))
+}
+
+fn target_binding_material(path: &Path) -> Vec<u8> {
+    let binding_root = checkout_root(path).unwrap_or_else(|| path.to_path_buf());
+    let canonical = std::fs::canonicalize(&binding_root).unwrap_or(binding_root);
+    let mut material = b"agent-hook.target-binding.v2\0".to_vec();
+    material.extend_from_slice(path.as_os_str().as_encoded_bytes());
+    material.push(0);
+    material.extend_from_slice(canonical.as_os_str().as_encoded_bytes());
+    if let Ok(metadata) = std::fs::metadata(&canonical) {
+        material.extend_from_slice(&metadata.dev().to_le_bytes());
+        material.extend_from_slice(&metadata.ino().to_le_bytes());
+    }
+    material
+}
+
+fn checkout_root(path: &Path) -> Option<PathBuf> {
+    let mut start = path;
+    while !start.is_dir() {
+        start = start.parent()?;
+    }
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(start)
+        .args(["rev-parse", "--show-toplevel"])
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .ok();
+    if let Some(output) = output.filter(|output| output.status.success())
+        && let Ok(value) = std::str::from_utf8(&output.stdout)
+    {
+        let root = PathBuf::from(value.trim());
+        if root.is_absolute() {
+            return Some(root);
+        }
+    }
+    Some(start.to_path_buf())
 }
 
 fn command_text(object: &Map<String, Value>) -> Option<&str> {
@@ -427,4 +536,115 @@ fn nested_string<'a>(
 ) -> Option<&'a str> {
     let nested = object.get(parent)?.as_object()?;
     string_at(nested, keys)
+}
+
+fn parse_provider_json(input: &[u8]) -> Result<Value, HookError> {
+    serde_json::from_slice::<StrictValue>(input)
+        .map(|value| value.0)
+        .map_err(|error| {
+            if error.to_string().contains("duplicate object key") {
+                HookError::data(
+                    "provider-input-duplicate-key",
+                    "provider hook input contains a duplicate object key",
+                )
+            } else {
+                HookError::data(
+                    "provider-input-invalid",
+                    "provider hook input is not valid bounded JSON",
+                )
+            }
+        })
+}
+
+struct StrictValue(Value);
+
+impl<'de> Deserialize<'de> for StrictValue {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_any(StrictValueVisitor)
+    }
+}
+
+struct StrictValueVisitor;
+
+impl<'de> Visitor<'de> for StrictValueVisitor {
+    type Value = StrictValue;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("strict JSON without duplicate object keys")
+    }
+
+    fn visit_bool<E>(self, value: bool) -> Result<Self::Value, E> {
+        Ok(StrictValue(Value::Bool(value)))
+    }
+
+    fn visit_i64<E>(self, value: i64) -> Result<Self::Value, E> {
+        Ok(StrictValue(Value::Number(Number::from(value))))
+    }
+
+    fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E> {
+        Ok(StrictValue(Value::Number(Number::from(value))))
+    }
+
+    fn visit_f64<E>(self, value: f64) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        Number::from_f64(value)
+            .map(|value| StrictValue(Value::Number(value)))
+            .ok_or_else(|| E::custom("non-finite JSON number"))
+    }
+
+    fn visit_str<E>(self, value: &str) -> Result<Self::Value, E> {
+        Ok(StrictValue(Value::String(value.to_string())))
+    }
+
+    fn visit_string<E>(self, value: String) -> Result<Self::Value, E> {
+        Ok(StrictValue(Value::String(value)))
+    }
+
+    fn visit_none<E>(self) -> Result<Self::Value, E> {
+        Ok(StrictValue(Value::Null))
+    }
+
+    fn visit_unit<E>(self) -> Result<Self::Value, E> {
+        Ok(StrictValue(Value::Null))
+    }
+
+    fn visit_some<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        StrictValue::deserialize(deserializer)
+    }
+
+    fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        let mut values = Vec::new();
+        while let Some(value) = sequence.next_element::<StrictValue>()? {
+            values.push(value.0);
+        }
+        Ok(StrictValue(Value::Array(values)))
+    }
+
+    fn visit_map<A>(self, mut entries: A) -> Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        let mut object = Map::new();
+        while let Some(key) = entries.next_key::<String>()? {
+            if object.contains_key(&key) {
+                return Err(serde::de::Error::custom(format!(
+                    "duplicate object key: {key}"
+                )));
+            }
+            let value = entries.next_value::<StrictValue>()?;
+            object.insert(key, value.0);
+        }
+        Ok(StrictValue(Value::Object(object)))
+    }
 }

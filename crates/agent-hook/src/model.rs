@@ -168,7 +168,7 @@ pub enum Capability {
     #[serde(rename = "decision.transform.v1")]
     Transform {
         reason_code: String,
-        replacement: String,
+        replacement: serde_json::Value,
     },
     #[serde(rename = "agent-session.activity.v1")]
     SessionActivity { reason_code: String },
@@ -206,6 +206,8 @@ pub struct NormalizedRequest {
     pub semantic_conflict: Option<SemanticConflict>,
     #[serde(skip)]
     pub target_path: Option<PathBuf>,
+    #[serde(skip)]
+    pub execution_path: Option<PathBuf>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -255,7 +257,7 @@ pub struct NormalizedDecision {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub context: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub replacement: Option<String>,
+    pub replacement: Option<serde_json::Value>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub shadow: Vec<ShadowObservation>,
     pub config_digest: String,

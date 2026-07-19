@@ -8,7 +8,7 @@ use std::time::Duration;
 use pretty_assertions::assert_eq;
 use serde_json::json;
 
-use support::{Fixture, sha256};
+use support::{Fixture, sha256, target_binding_digest};
 
 const POLICY: &str = r#"schema_version = "agent-hook.policy.v1"
 bundle_id = "runtime-kit"
@@ -23,6 +23,31 @@ mode = "enforce"
 failure_posture = "closed"
 override_class = "locked"
 capability = { id = "decision.block.v1", reason_code = "locked-block", message = "blocked" }
+"#;
+
+const TWO_BLOCK_POLICY: &str = r#"schema_version = "agent-hook.policy.v1"
+bundle_id = "runtime-kit"
+version = "2026.07.20.1"
+
+[[rules]]
+id = "runtime.locked-block"
+products = ["codex"]
+events = ["PreToolUse"]
+priority = 10
+mode = "enforce"
+failure_posture = "closed"
+override_class = "locked"
+capability = { id = "decision.block.v1", reason_code = "first", message = "first" }
+
+[[rules]]
+id = "runtime.second-block"
+products = ["codex"]
+events = ["PreToolUse"]
+priority = 20
+mode = "enforce"
+failure_posture = "closed"
+override_class = "locked"
+capability = { id = "decision.block.v1", reason_code = "second", message = "second" }
 "#;
 
 struct Authorized {
@@ -40,14 +65,25 @@ fn authorize(
     ttl_seconds: &str,
     envs: &[(&str, &str)],
 ) -> Authorized {
+    authorize_for_target(fixture, name, scope, ttl_seconds, &fixture.root, envs)
+}
+
+fn authorize_for_target(
+    fixture: &Fixture,
+    name: &str,
+    scope: &str,
+    ttl_seconds: &str,
+    target_path: &std::path::Path,
+    envs: &[(&str, &str)],
+) -> Authorized {
     let payload = json!({
         "hook_event_name": "PreToolUse",
         "tool_name": "Write",
-        "cwd": fixture.root,
+        "cwd": target_path,
         "tool_input": {"command": "edit"}
     })
     .to_string();
-    let target = sha256(fixture.root.as_os_str().as_encoded_bytes());
+    let target = target_binding_digest(target_path);
     let command = sha256(b"edit");
     let snapshot = sha256(payload.as_bytes());
     let challenge_file = fixture.root.join(format!("{name}-challenge.json"));
@@ -80,8 +116,14 @@ fn authorize(
         None,
         envs,
     );
-    assert_eq!(challenge.code, 0, "stderr={}", challenge.stderr_text());
-    let challenge_digest = challenge.stdout_json()["result"]["challenge_digest"]
+    assert_eq!(
+        challenge.code,
+        0,
+        "stdout={} stderr={}",
+        challenge.stdout_text(),
+        challenge.stderr_text()
+    );
+    let challenge_digest = challenge.stdout_json()["data"]["challenge_digest"]
         .as_str()
         .expect("challenge digest")
         .to_string();
@@ -107,7 +149,7 @@ fn authorize(
         command,
         snapshot,
         capability_file,
-        capability_id: authorized.stdout_json()["result"]["capability_id"]
+        capability_id: authorized.stdout_json()["data"]["capability_id"]
             .as_str()
             .expect("capability id")
             .to_string(),
@@ -147,7 +189,7 @@ fn exact_one_shot_works_with_broken_config_and_rejects_replay() {
         "tool_input": {"command": "edit"}
     })
     .to_string();
-    let target = sha256(fixture.root.as_os_str().as_encoded_bytes());
+    let target = target_binding_digest(&fixture.root);
     let command = sha256(b"edit");
     let snapshot = sha256(payload.as_bytes());
     let challenge_file = fixture.root.join("challenge.json");
@@ -175,8 +217,14 @@ fn exact_one_shot_works_with_broken_config_and_rejects_replay() {
         ],
         None,
     );
-    assert_eq!(challenge.code, 0, "stderr={}", challenge.stderr_text());
-    let challenge_digest = challenge.stdout_json()["result"]["challenge_digest"]
+    assert_eq!(
+        challenge.code,
+        0,
+        "stdout={} stderr={}",
+        challenge.stdout_text(),
+        challenge.stderr_text()
+    );
+    let challenge_digest = challenge.stdout_json()["data"]["challenge_digest"]
         .as_str()
         .expect("challenge digest")
         .to_string();
@@ -211,7 +259,7 @@ fn exact_one_shot_works_with_broken_config_and_rejects_replay() {
         Some(&payload),
     );
     assert_eq!(allowed.code, 0, "stderr={}", allowed.stderr_text());
-    assert_eq!(allowed.stdout_json()["result"]["recovery_applied"], true);
+    assert_eq!(allowed.stdout_json()["data"]["recovery_applied"], true);
 
     let replay = fixture.run(
         &[
@@ -229,6 +277,61 @@ fn exact_one_shot_works_with_broken_config_and_rejects_replay() {
     assert_eq!(
         replay.stdout_json()["error"]["code"],
         "capability-replay-or-revoked"
+    );
+}
+
+#[test]
+fn emergency_recovery_preserves_ungranted_rules_and_rejects_unknown_ids() {
+    let fixture = Fixture::new(TWO_BLOCK_POLICY);
+    let authorized = authorize(&fixture, "scoped", "one-shot", "300", &[]);
+    fs::write(&fixture.config, "not valid toml = [").expect("break config");
+
+    let blocked = dispatch(&fixture, &authorized, &[]);
+
+    assert_eq!(blocked.code, 1, "stderr={}", blocked.stderr_text());
+    assert_eq!(blocked.stdout_json()["data"]["action"], "block");
+    assert_eq!(
+        blocked.stdout_json()["data"]["reasons"][1]["rule_id"],
+        "runtime.second-block"
+    );
+    assert_eq!(
+        blocked.stdout_json()["data"]["reasons"][1]["code"],
+        "recovery-manifest-block"
+    );
+
+    let clean = Fixture::new(POLICY);
+    let digest = sha256(b"binding");
+    let challenge = clean.run(
+        &[
+            "recovery",
+            "challenge",
+            "--product",
+            "codex",
+            "--event",
+            "PreToolUse",
+            "--target-digest",
+            &digest,
+            "--command-digest",
+            &digest,
+            "--snapshot-digest",
+            &digest,
+            "--rule",
+            "runtime.unknown",
+            "--out",
+            clean
+                .root
+                .join("unknown.json")
+                .to_str()
+                .expect("challenge path"),
+            "--format",
+            "json",
+        ],
+        None,
+    );
+    assert_eq!(challenge.code, 65, "stderr={}", challenge.stderr_text());
+    assert_eq!(
+        challenge.stdout_json()["error"]["code"],
+        "recovery-rule-unknown"
     );
 }
 
@@ -326,6 +429,37 @@ fn one_shot_rejects_binding_drift_revocation_expiry_key_rotation_and_unsafe_mode
 }
 
 #[test]
+fn one_shot_rejects_recreated_target_at_the_same_absolute_path_without_consuming() {
+    let fixture = Fixture::new(POLICY);
+    let target = fixture.root.join("recreated-target");
+    fs::create_dir_all(&target).expect("target");
+    let capability = authorize_for_target(&fixture, "recreated", "one-shot", "300", &target, &[]);
+
+    fs::remove_dir(&target).expect("remove target");
+    fs::create_dir(&target).expect("recreate target");
+    let rejected = dispatch(&fixture, &capability, &[]);
+    assert_eq!(rejected.code, 65, "stderr={}", rejected.stderr_text());
+    assert_eq!(
+        rejected.stdout_json()["error"]["code"],
+        "capability-binding-mismatch"
+    );
+
+    let status = fixture.run(
+        &[
+            "recovery",
+            "status",
+            "--capability-id",
+            &capability.capability_id,
+            "--format",
+            "json",
+        ],
+        None,
+    );
+    assert_eq!(status.code, 0);
+    assert_eq!(status.stdout_json()["data"]["status"], "authorized");
+}
+
+#[test]
 fn repair_window_is_session_bound_reusable_and_works_without_policy() {
     let fixture = Fixture::new(POLICY);
     let window = authorize(
@@ -347,7 +481,7 @@ fn repair_window_is_session_bound_reusable_and_works_without_policy() {
     for _ in 0..2 {
         let allowed = dispatch(&fixture, &window, &[("AGENT_SESSION_ID", "session-a")]);
         assert_eq!(allowed.code, 0, "stderr={}", allowed.stderr_text());
-        assert_eq!(allowed.stdout_json()["result"]["recovery_applied"], true);
+        assert_eq!(allowed.stdout_json()["data"]["recovery_applied"], true);
     }
 }
 

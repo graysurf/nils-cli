@@ -1,5 +1,4 @@
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 
 use jiff::Timestamp;
@@ -34,10 +33,7 @@ pub fn append(
     decision: &NormalizedDecision,
     elapsed_micros: u128,
 ) -> Result<(), HookError> {
-    fs::create_dir_all(state_root)
-        .map_err(|_| HookError::runtime("trace-dir-failed", "trace directory create failed"))?;
-    fs::set_permissions(state_root, fs::Permissions::from_mode(0o700))
-        .map_err(|_| HookError::runtime("trace-dir-mode-failed", "trace directory mode failed"))?;
+    crate::paths::ensure_private_state_dir(state_root, "trace-dir")?;
     let path = state_root.join("trace.jsonl");
     let mut lines = match fs::read(&path) {
         Ok(bytes) if bytes.len() <= MAX_TRACE_BYTES => bytes

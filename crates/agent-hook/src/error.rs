@@ -1,4 +1,3 @@
-use serde::Serialize;
 use serde_json::Value;
 
 #[derive(Clone, Debug)]
@@ -27,7 +26,12 @@ impl HookError {
     }
 
     pub fn unavailable(code: impl Into<String>, message: impl Into<String>) -> Self {
-        Self::new(code, message, None, 75)
+        Self::new(
+            code,
+            message,
+            None,
+            nils_common::cli_contract::exit::UNAVAILABLE,
+        )
     }
 
     pub fn blocked(code: impl Into<String>, message: impl Into<String>) -> Self {
@@ -56,31 +60,3 @@ impl std::fmt::Display for HookError {
 }
 
 impl std::error::Error for HookError {}
-
-#[derive(Debug, Serialize)]
-pub struct ErrorBody<'a> {
-    pub code: &'a str,
-    pub message: &'a str,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub details: Option<&'a Value>,
-}
-
-#[derive(Debug, Serialize)]
-pub struct ErrorEnvelope<'a> {
-    pub schema_version: String,
-    pub command: &'a str,
-    pub ok: bool,
-    pub error: ErrorBody<'a>,
-}
-
-#[derive(Debug, Serialize)]
-pub struct SuccessEnvelope<'a, T: Serialize> {
-    pub schema_version: String,
-    pub command: &'a str,
-    pub ok: bool,
-    pub result: &'a T,
-}
-
-pub fn schema(command: &str) -> String {
-    format!("cli.{}.v1", command.replace(' ', "-"))
-}

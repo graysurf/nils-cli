@@ -10,9 +10,9 @@ use jiff::Timestamp;
 use nils_common::fs::{SECRET_FILE_MODE, write_atomic};
 use serde::{Deserialize, Serialize};
 
-use crate::contract::{digest, valid_digest};
+use crate::contract::{digest, digest_serializable, valid_digest};
 use crate::error::HookError;
-use crate::model::{NormalizedRequest, Product, RecoveryScope};
+use crate::model::{NormalizedRequest, PolicyRule, Product, RecoveryScope};
 
 const CHALLENGE_VERSION: &str = "agent-hook.recovery-challenge.v1";
 const CAPABILITY_VERSION: &str = "agent-hook.recovery-capability.v1";
@@ -31,6 +31,7 @@ pub struct Challenge {
     pub command_digest: String,
     pub snapshot_digest: String,
     pub rules: Vec<String>,
+    pub manifest: RecoveryManifest,
     pub scope: RecoveryScope,
     pub issued_at: String,
     pub issued_at_epoch: i64,
@@ -51,6 +52,7 @@ pub struct CapabilityFile {
     pub command_digest: String,
     pub snapshot_digest: String,
     pub rules: Vec<String>,
+    pub manifest: RecoveryManifest,
     pub scope: RecoveryScope,
     pub expires_at: String,
     pub expires_at_epoch: i64,
@@ -71,6 +73,7 @@ struct RecoveryRecord {
     challenge_digest: String,
     scope: RecoveryScope,
     rules: Vec<String>,
+    manifest_digest: String,
     expires_at_epoch: i64,
     state_revision: u64,
     principal_digest: String,
@@ -126,6 +129,18 @@ pub struct StatusResult {
 pub struct RecoveryGrant {
     pub capability_id: Option<String>,
     pub rules: BTreeSet<String>,
+    pub manifest: Option<RecoveryManifest>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RecoveryManifest {
+    pub schema_version: String,
+    pub product: Product,
+    pub event: String,
+    pub config_digest: String,
+    pub policy_digest: String,
+    pub rules: Vec<PolicyRule>,
 }
 
 pub struct ChallengeInput<'a> {
@@ -135,6 +150,7 @@ pub struct ChallengeInput<'a> {
     pub command_digest: &'a str,
     pub snapshot_digest: &'a str,
     pub rules: &'a [String],
+    pub manifest: RecoveryManifest,
     pub scope: RecoveryScope,
     pub ttl_seconds: u64,
     pub out: &'a Path,
@@ -165,6 +181,7 @@ pub fn create_challenge(
     let revision = next_revision(state_root)?;
     let now = now_epoch();
     let expires = now.saturating_add(input.ttl_seconds as i64);
+    validate_manifest(&input.manifest, input.product, input.event, input.rules)?;
     let challenge = Challenge {
         schema_version: CHALLENGE_VERSION.to_string(),
         challenge_id: uuid::Uuid::new_v4().to_string(),
@@ -174,6 +191,7 @@ pub fn create_challenge(
         command_digest: input.command_digest.to_string(),
         snapshot_digest: input.snapshot_digest.to_string(),
         rules: canonical_rules(input.rules)?,
+        manifest: input.manifest,
         scope: input.scope,
         issued_at: timestamp(now),
         issued_at_epoch: now,
@@ -260,6 +278,7 @@ pub fn authorize(
         command_digest: challenge.command_digest.clone(),
         snapshot_digest: challenge.snapshot_digest.clone(),
         rules: challenge.rules.clone(),
+        manifest: challenge.manifest.clone(),
         scope: challenge.scope,
         expires_at: challenge.expires_at.clone(),
         expires_at_epoch: challenge.expires_at_epoch,
@@ -286,6 +305,7 @@ pub fn authorize(
         challenge_digest: expected_digest.to_string(),
         scope: capability.scope,
         rules: capability.rules.clone(),
+        manifest_digest: digest_serializable(&capability.manifest)?,
         expires_at_epoch: capability.expires_at_epoch,
         state_revision: revision,
         principal_digest,
@@ -341,6 +361,7 @@ pub fn consume_exact(
         || record.challenge_digest != capability.challenge_digest
         || record.key_digest != capability.key_digest
         || record.principal_digest != capability.principal_digest
+        || record.manifest_digest != digest_serializable(&capability.manifest)?
     {
         return Err(HookError::data(
             "capability-state-drift",
@@ -392,6 +413,7 @@ pub fn consume_exact(
     let grant = RecoveryGrant {
         capability_id: Some(capability.capability_id),
         rules: capability.rules.into_iter().collect(),
+        manifest: Some(capability.manifest),
     };
     Ok((result, grant))
 }
@@ -514,6 +536,12 @@ fn validate_challenge(challenge: &Challenge) -> Result<(), HookError> {
         &challenge.command_digest,
         &challenge.snapshot_digest,
         &challenge.rules,
+    )?;
+    validate_manifest(
+        &challenge.manifest,
+        challenge.product,
+        &challenge.event,
+        &challenge.rules,
     )
 }
 
@@ -534,7 +562,47 @@ fn validate_capability(capability: &CapabilityFile) -> Result<(), HookError> {
         &capability.command_digest,
         &capability.snapshot_digest,
         &capability.rules,
+    )?;
+    validate_manifest(
+        &capability.manifest,
+        capability.product,
+        &capability.event,
+        &capability.rules,
     )
+}
+
+fn validate_manifest(
+    manifest: &RecoveryManifest,
+    product: Product,
+    event: &str,
+    requested_rules: &[String],
+) -> Result<(), HookError> {
+    if manifest.schema_version != "agent-hook.recovery-manifest.v1"
+        || manifest.product != product
+        || manifest.event != event
+        || !valid_digest(&manifest.config_digest)
+        || !valid_digest(&manifest.policy_digest)
+    {
+        return Err(HookError::data(
+            "recovery-manifest-invalid",
+            "recovery manifest is invalid or does not match the binding",
+        ));
+    }
+    let manifest_ids = manifest
+        .rules
+        .iter()
+        .map(|rule| rule.id.as_str())
+        .collect::<BTreeSet<_>>();
+    if requested_rules
+        .iter()
+        .any(|rule| !manifest_ids.contains(rule.as_str()))
+    {
+        return Err(HookError::data(
+            "recovery-rule-unknown",
+            "recovery requested an unknown or non-recoverable rule",
+        ));
+    }
+    Ok(())
 }
 
 fn principal_digest(scope: RecoveryScope) -> Result<String, HookError> {
@@ -655,7 +723,21 @@ fn write_new_private(path: &Path, bytes: &[u8]) -> Result<(), HookError> {
     let parent = path.parent().ok_or_else(|| {
         HookError::usage("recovery-output-invalid", "recovery output has no parent")
     })?;
-    ensure_private_dir(parent)?;
+    let metadata = fs::symlink_metadata(parent).map_err(|_| {
+        HookError::runtime(
+            "recovery-output-parent-unavailable",
+            "recovery output parent is unavailable",
+        )
+    })?;
+    if metadata.file_type().is_symlink()
+        || !metadata.is_dir()
+        || metadata.uid() != unsafe { libc::geteuid() }
+    {
+        return Err(HookError::data(
+            "recovery-output-parent-untrusted",
+            "recovery output parent owner or type is untrusted",
+        ));
+    }
     let mut file = OpenOptions::new()
         .create_new(true)
         .write(true)
@@ -708,10 +790,11 @@ impl Drop for StateLock {
 }
 
 fn lock(state_root: &Path) -> Result<StateLock, HookError> {
+    crate::paths::ensure_private_state_dir(state_root, "recovery-state-dir")?;
     let root = state_root.join("recovery");
-    ensure_private_dir(&root)?;
-    ensure_private_dir(&root.join("challenges"))?;
-    ensure_private_dir(&root.join("records"))?;
+    ensure_private_dir(&root, "recovery-root")?;
+    ensure_private_dir(&root.join("challenges"), "recovery-challenges-dir")?;
+    ensure_private_dir(&root.join("records"), "recovery-records-dir")?;
     let path = root.join("lock");
     let file = OpenOptions::new()
         .read(true)
@@ -760,30 +843,8 @@ fn next_revision(state_root: &Path) -> Result<u64, HookError> {
     Ok(current.saturating_add(1))
 }
 
-fn ensure_private_dir(path: &Path) -> Result<(), HookError> {
-    fs::create_dir_all(path).map_err(|_| {
-        HookError::runtime(
-            "recovery-dir-create-failed",
-            "recovery directory create failed",
-        )
-    })?;
-    fs::set_permissions(path, fs::Permissions::from_mode(0o700)).map_err(|_| {
-        HookError::runtime("recovery-dir-mode-failed", "recovery directory mode failed")
-    })?;
-    let metadata = fs::symlink_metadata(path).map_err(|_| {
-        HookError::runtime("recovery-dir-unavailable", "recovery directory unavailable")
-    })?;
-    if metadata.file_type().is_symlink()
-        || !metadata.is_dir()
-        || metadata.uid() != unsafe { libc::geteuid() }
-        || metadata.permissions().mode() & 0o077 != 0
-    {
-        return Err(HookError::data(
-            "recovery-dir-untrusted",
-            "recovery directory owner, mode, or type is untrusted",
-        ));
-    }
-    Ok(())
+fn ensure_private_dir(path: &Path, role: &str) -> Result<(), HookError> {
+    crate::paths::ensure_private_state_dir(path, role)
 }
 
 fn challenge_path(state_root: &Path, challenge_id: &str) -> PathBuf {

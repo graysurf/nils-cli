@@ -1,5 +1,7 @@
 use std::env;
-use std::path::PathBuf;
+use std::fs;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::path::{Path, PathBuf};
 
 use crate::error::HookError;
 
@@ -31,6 +33,80 @@ pub fn agent_session_state_root() -> Result<PathBuf, HookError> {
         return absolute("AGENT_SESSION_STATE_DIR", PathBuf::from(value));
     }
     Ok(state_home()?.join("agent-session"))
+}
+
+pub fn ensure_private_state_dir(path: &Path, role: &str) -> Result<(), HookError> {
+    for ancestor in path.ancestors().collect::<Vec<_>>().into_iter().rev() {
+        if ancestor.as_os_str().is_empty() {
+            continue;
+        }
+        match fs::symlink_metadata(ancestor) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(HookError::data(
+                    format!("{role}-untrusted"),
+                    format!("{role} path contains a symlink"),
+                ));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => {
+                return Err(HookError::runtime(
+                    format!("{role}-unavailable"),
+                    format!("{role} path metadata is unavailable"),
+                ));
+            }
+        }
+    }
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            if !metadata.is_dir()
+                || metadata.uid() != unsafe { libc::geteuid() }
+                || metadata.permissions().mode() & 0o077 != 0
+            {
+                return Err(HookError::data(
+                    format!("{role}-untrusted"),
+                    format!("{role} directory owner, mode, or type is untrusted"),
+                ));
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            fs::create_dir_all(path).map_err(|_| {
+                HookError::runtime(
+                    format!("{role}-create-failed"),
+                    format!("{role} directory create failed"),
+                )
+            })?;
+            fs::set_permissions(path, fs::Permissions::from_mode(0o700)).map_err(|_| {
+                HookError::runtime(
+                    format!("{role}-mode-failed"),
+                    format!("{role} directory mode failed"),
+                )
+            })?;
+            let metadata = fs::symlink_metadata(path).map_err(|_| {
+                HookError::runtime(
+                    format!("{role}-unavailable"),
+                    format!("{role} directory metadata is unavailable"),
+                )
+            })?;
+            if metadata.file_type().is_symlink()
+                || !metadata.is_dir()
+                || metadata.uid() != unsafe { libc::geteuid() }
+                || metadata.permissions().mode() & 0o077 != 0
+            {
+                return Err(HookError::data(
+                    format!("{role}-untrusted"),
+                    format!("{role} directory owner, mode, or type is untrusted"),
+                ));
+            }
+        }
+        Err(_) => {
+            return Err(HookError::runtime(
+                format!("{role}-unavailable"),
+                format!("{role} directory metadata is unavailable"),
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn config_home() -> Result<PathBuf, HookError> {

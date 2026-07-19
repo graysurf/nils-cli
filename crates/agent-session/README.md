@@ -173,8 +173,11 @@ agent-session activity setup --agent codex --repair --expected-preview-digest sh
 agent-session activity setup --agent codex --remove
 ```
 
-It invokes `agent-hook setup`, maps the compatibility provider and digest flags, and
-reports `compatibility_owner: "agent-hook"`. If the matching `agent-hook`
+It invokes `agent-hook setup`, maps the compatibility provider and digest flags,
+and validates the typed response, including schema, product, action, plan
+digest, and `compatibility_owner: "agent-hook"`. The owner covers the lifecycle
+sources and authoritative Codex `activity notify` path as one transaction. If
+the matching `agent-hook`
 binary is absent, setup returns `agent-hook-setup-unavailable` and does not
 write provider configuration. Install the binary and rerun the reviewed
 dry-run; there is no embedded registration fallback.

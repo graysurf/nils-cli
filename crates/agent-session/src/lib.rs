@@ -569,7 +569,7 @@ fn forward_activity_setup_to_agent_hook(args: &cli::ActivitySetupArgs) -> Result
             ));
         }
     };
-    let envelope: Value = match serde_json::from_slice(&output.stdout) {
+    let envelope: Envelope<Value> = match serde_json::from_slice(&output.stdout) {
         Ok(value) => value,
         Err(_) => {
             return Err(CliError::data(
@@ -579,28 +579,65 @@ fn forward_activity_setup_to_agent_hook(args: &cli::ActivitySetupArgs) -> Result
             ));
         }
     };
-    if !output.status.success() || envelope.get("ok").and_then(Value::as_bool) != Some(true) {
-        let code = envelope
-            .pointer("/error/code")
-            .and_then(Value::as_str)
-            .unwrap_or("agent-hook-setup-failed");
-        let message = envelope
-            .pointer("/error/message")
-            .and_then(Value::as_str)
-            .unwrap_or("agent-hook setup rejected the compatibility request");
-        let details = envelope.pointer("/error/details").cloned();
+    if envelope.schema_version != "cli.agent-hook.setup.v1" {
+        return Err(CliError::data(
+            "agent-hook-setup-output-invalid",
+            "agent-hook setup returned an unsupported envelope schema",
+            None,
+        ));
+    }
+    if !output.status.success() || !envelope.ok {
+        let (code, message, details) = envelope.error.map_or_else(
+            || {
+                (
+                    "agent-hook-setup-failed".to_string(),
+                    "agent-hook setup rejected the compatibility request".to_string(),
+                    None,
+                )
+            },
+            |error| (error.code, error.message, error.details),
+        );
         return Err(CliError::data(code, message, details));
     }
-    let mut result = match envelope.get("result").cloned() {
-        Some(Value::Object(result)) => result,
-        _ => {
-            return Err(CliError::data(
+    let typed: Envelope<agent_hook::setup::SetupResult> = serde_json::from_slice(&output.stdout)
+        .map_err(|_| {
+            CliError::data(
                 "agent-hook-setup-output-invalid",
-                "agent-hook setup omitted its result object",
+                "agent-hook setup returned an incomplete success contract",
                 None,
-            ));
-        }
-    };
+            )
+        })?;
+    let result = typed.data.ok_or_else(|| {
+        CliError::data(
+            "agent-hook-setup-output-invalid",
+            "agent-hook setup omitted its data object",
+            None,
+        )
+    })?;
+    if result.schema_version != "agent-hook.setup-result.v1"
+        || result.product != args.agent.as_str()
+        || result.action != action.trim_start_matches("--")
+        || result.compatibility_owner != "agent-hook"
+        || !valid_sha256(&result.plan_digest)
+        || !valid_sha256(&result.config_digest)
+        || !valid_sha256(&result.policy_digest)
+    {
+        return Err(CliError::data(
+            "agent-hook-setup-output-invalid",
+            "agent-hook setup response does not match the requested operation",
+            None,
+        ));
+    }
+    let mut result = serde_json::to_value(result)
+        .ok()
+        .and_then(|value| value.as_object().cloned())
+        .ok_or_else(|| {
+            CliError::data(
+                "agent-hook-setup-output-invalid",
+                "agent-hook setup result could not be projected",
+                None,
+            )
+        })?;
     result.insert(
         "compatibility_owner".to_string(),
         Value::String("agent-hook".to_string()),
@@ -622,6 +659,15 @@ fn render_forwarded_setup_text(result: &Value) -> String {
         .and_then(Value::as_str)
         .unwrap_or("reported");
     format!("{product} activity {action}: {status} (owner: agent-hook)\n")
+}
+
+fn valid_sha256(value: &str) -> bool {
+    value.strip_prefix("sha256:").is_some_and(|hex| {
+        hex.len() == 64
+            && hex
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    })
 }
 
 fn run_delete(context: &CliContext, args: cli::DeleteArgs) -> i32 {

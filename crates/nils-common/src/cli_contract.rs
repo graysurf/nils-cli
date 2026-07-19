@@ -12,7 +12,7 @@
 
 use std::io::{self, Write};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 /// Canonical output-format flag value for every workspace CLI.
 ///
@@ -47,7 +47,8 @@ impl OutputFormat {
 /// `ok` is a boolean success flag, `data` carries the per-subcommand payload,
 /// `warnings` collects non-fatal diagnostics (so JSON consumers see what text
 /// mode would print to stderr), and `error` carries a structured failure.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct Envelope<T: Serialize> {
     pub schema_version: String,
     pub ok: bool,
@@ -100,7 +101,8 @@ impl<T: Serialize> Envelope<T> {
 }
 
 /// Structured error rendered inside the JSON envelope's `error` field.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct EnvelopeError {
     pub code: String,
     pub message: String,

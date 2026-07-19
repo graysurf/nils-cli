@@ -1,19 +1,20 @@
-use std::collections::BTreeMap;
 use std::fs;
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use nils_common::coordination_projection::{self, RegistryProjection};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 
 use crate::error::HookError;
 use crate::model::{DecisionAction, NormalizedRequest, SemanticConflict};
 use crate::paths::agent_session_state_root;
 
-const MAX_REGISTRY_BYTES: u64 = 68 * 1024 * 1024;
-const HEARTBEAT_FRESH_SECONDS: i64 = 30;
+#[derive(Debug)]
+pub struct Snapshot {
+    state_root: PathBuf,
+    registry: RegistryProjection,
+}
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -36,61 +37,39 @@ pub struct OwnerLiveness {
     pub dirty: Option<bool>,
 }
 
-#[derive(Debug, Deserialize)]
-struct Registry {
-    #[serde(default)]
-    fingerprint_epoch: u64,
-    #[serde(default)]
-    fingerprint_key: String,
-    #[serde(default)]
-    brokers: BTreeMap<String, Broker>,
-    #[serde(default)]
-    claims: Vec<Claim>,
+pub fn load_snapshot() -> Result<Option<Snapshot>, HookError> {
+    let state_root = agent_session_state_root()?;
+    coordination_projection::load(&state_root)
+        .map(|registry| {
+            registry.map(|registry| Snapshot {
+                state_root,
+                registry,
+            })
+        })
+        .map_err(|error| match error {
+            coordination_projection::ReadError::Unavailable => HookError::runtime(
+                "coordination-unavailable",
+                "coordination registry is unavailable",
+            ),
+            coordination_projection::ReadError::Untrusted => HookError::data(
+                "coordination-untrusted",
+                "coordination registry ownership, mode, or type is untrusted",
+            ),
+            coordination_projection::ReadError::Invalid => HookError::data(
+                "coordination-invalid",
+                "coordination registry schema or projection is invalid",
+            ),
+        })
 }
 
-#[derive(Debug, Deserialize)]
-struct Broker {
-    session_id: String,
-    incarnation: String,
-    state: String,
-    heartbeat_epoch: i64,
-}
-
-#[derive(Debug, Deserialize)]
-struct Claim {
-    session_id: String,
-    session_incarnation: String,
-    state: String,
-    #[serde(default)]
-    worktrees: Vec<String>,
-    #[serde(default)]
-    repositories: Vec<String>,
-    #[serde(default)]
-    provider_refs: Vec<ProviderRef>,
-    #[serde(default)]
-    scopes: Vec<Scope>,
-    expires_at_epoch: i64,
-}
-
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
-struct ProviderRef {
-    kind: String,
-    repository: String,
-    number: u64,
-}
-
-#[derive(Clone, Debug, Deserialize)]
-struct Scope {
-    kind: String,
-    repository: String,
-    #[serde(default)]
-    value: String,
-}
-
-pub fn derive_semantic_conflict(request: &NormalizedRequest) -> SemanticConflict {
-    let Ok(Some(registry)) = load_registry() else {
+pub fn derive_semantic_conflict(
+    request: &NormalizedRequest,
+    snapshot: Option<&Snapshot>,
+) -> SemanticConflict {
+    let Some(snapshot) = snapshot else {
         return SemanticConflict::Unknown;
     };
+    let registry = &snapshot.registry;
     let Some(current_session) = std::env::var("AGENT_SESSION_ID")
         .ok()
         .filter(|value| !value.is_empty())
@@ -101,7 +80,12 @@ pub fn derive_semantic_conflict(request: &NormalizedRequest) -> SemanticConflict
     let Some(current_broker) = registry.brokers.get(&current_session).filter(|broker| {
         broker.session_id == current_session
             && broker.state == "ready"
-            && now.saturating_sub(broker.heartbeat_epoch) <= HEARTBEAT_FRESH_SECONDS
+            && coordination_projection::heartbeat_fresh(
+                &snapshot.state_root,
+                &current_session,
+                &broker.incarnation,
+                now,
+            )
     }) else {
         return SemanticConflict::Unknown;
     };
@@ -132,7 +116,12 @@ pub fn derive_semantic_conflict(request: &NormalizedRequest) -> SemanticConflict
                 broker.session_id == peer.session_id
                     && broker.incarnation == peer.session_incarnation
                     && broker.state == "ready"
-                    && now.saturating_sub(broker.heartbeat_epoch) <= HEARTBEAT_FRESH_SECONDS
+                    && coordination_projection::heartbeat_fresh(
+                        &snapshot.state_root,
+                        &peer.session_id,
+                        &broker.incarnation,
+                        now,
+                    )
             });
         if !peer_fresh {
             incomplete = true;
@@ -160,14 +149,16 @@ pub fn derive_semantic_conflict(request: &NormalizedRequest) -> SemanticConflict
     } else if potential {
         SemanticConflict::Potential
     } else {
-        // A trusted target binding with no matching peer remains clear. The
-        // request path is not serialized or exposed.
         let _ = request;
         SemanticConflict::Clear
     }
 }
 
-pub fn classify(request: &NormalizedRequest, legacy_ttl_seconds: u64) -> OwnerLiveness {
+pub fn classify(
+    request: &NormalizedRequest,
+    legacy_ttl_seconds: u64,
+    snapshot: Option<&Snapshot>,
+) -> OwnerLiveness {
     if matches!(request.semantic_conflict, Some(SemanticConflict::Definite)) {
         return result(
             LivenessClass::Active,
@@ -189,25 +180,40 @@ pub fn classify(request: &NormalizedRequest, legacy_ttl_seconds: u64) -> OwnerLi
     let Some(target) = request.target_path.as_deref() else {
         return unknown("owner-target-unavailable");
     };
-    match load_registry() {
-        Ok(Some(registry)) => classify_registry(request, target, &registry),
-        Ok(None) => legacy_classify(target, legacy_ttl_seconds),
-        Err(_) => unknown("coordination-evidence-untrusted"),
+    let Some(snapshot) = snapshot else {
+        return legacy_classify(target, legacy_ttl_seconds);
+    };
+    let target_outcome = classify_registry_path(request, target, snapshot);
+    let Some(execution) = request.execution_path.as_deref() else {
+        return target_outcome;
+    };
+    if checkout_root(execution) == checkout_root(target) {
+        return target_outcome;
+    }
+    let execution_outcome = classify_registry_path(request, execution, snapshot);
+    if action_rank(target_outcome.action) >= action_rank(execution_outcome.action) {
+        target_outcome
+    } else {
+        execution_outcome
     }
 }
 
-fn classify_registry(
+fn classify_registry_path(
     request: &NormalizedRequest,
     target: &Path,
-    registry: &Registry,
+    snapshot: &Snapshot,
 ) -> OwnerLiveness {
-    if registry.fingerprint_epoch == 0 || registry.fingerprint_key.len() < 32 {
+    let checkout = target_binding_root(target);
+    let Some(fingerprint) = coordination_projection::worktree_fingerprint(
+        snapshot.registry.fingerprint_epoch,
+        &snapshot.registry.fingerprint_key,
+        &checkout,
+    ) else {
         return unknown("coordination-registry-invalid");
-    }
-    let fingerprint = worktree_fingerprint(registry, target);
+    };
     let now = now_epoch();
     let current_session = std::env::var("AGENT_SESSION_ID").ok();
-    let mut matching = registry.claims.iter().filter(|claim| {
+    let mut matching = snapshot.registry.claims.iter().filter(|claim| {
         claim.state == "active"
             && claim.expires_at_epoch >= now
             && claim.worktrees.iter().any(|value| value == &fingerprint)
@@ -224,17 +230,28 @@ fn classify_registry(
     if matching.next().is_some() {
         return unknown("coordination-owner-ambiguous");
     }
-    let dirty = checkout_dirty(target);
+    let dirty = checkout_dirty(&checkout);
     let own = current_session
         .as_deref()
         .is_some_and(|session| session == claim.session_id);
-    let broker = registry.brokers.get(&claim.session_id).filter(|broker| {
-        broker.session_id == claim.session_id
-            && broker.incarnation == claim.session_incarnation
-            && broker.state == "ready"
-    });
+    let broker = snapshot
+        .registry
+        .brokers
+        .get(&claim.session_id)
+        .filter(|broker| {
+            broker.session_id == claim.session_id
+                && broker.incarnation == claim.session_incarnation
+                && broker.state == "ready"
+        });
     match broker {
-        Some(broker) if now.saturating_sub(broker.heartbeat_epoch) <= HEARTBEAT_FRESH_SECONDS => {
+        Some(broker)
+            if coordination_projection::heartbeat_fresh(
+                &snapshot.state_root,
+                &claim.session_id,
+                &broker.incarnation,
+                now,
+            ) =>
+        {
             result(
                 LivenessClass::Active,
                 semantic_name(request.semantic_conflict),
@@ -269,9 +286,45 @@ fn classify_registry(
     }
 }
 
+fn checkout_root(path: &Path) -> Option<PathBuf> {
+    let start = if path.is_dir() {
+        path
+    } else {
+        path.parent().unwrap_or(path)
+    };
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(start)
+        .args(["rev-parse", "--show-toplevel"])
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    PathBuf::from(String::from_utf8_lossy(&output.stdout).trim())
+        .canonicalize()
+        .ok()
+}
+
+fn target_binding_root(path: &Path) -> PathBuf {
+    checkout_root(path).unwrap_or_else(|| {
+        let candidate = if path.is_dir() {
+            path
+        } else {
+            path.parent().unwrap_or(path)
+        };
+        candidate
+            .canonicalize()
+            .unwrap_or_else(|_| candidate.to_path_buf())
+    })
+}
+
 fn legacy_classify(target: &Path, legacy_ttl_seconds: u64) -> OwnerLiveness {
-    let dirty = checkout_dirty(target);
-    let age = fs::metadata(target)
+    let checkout = target_binding_root(target);
+    let dirty = checkout_dirty(&checkout);
+    let age = fs::metadata(&checkout)
         .and_then(|metadata| metadata.modified())
         .ok()
         .and_then(|modified| SystemTime::now().duration_since(modified).ok())
@@ -345,7 +398,10 @@ fn intersects(left: &[String], right: &[String]) -> bool {
     left.iter().any(|value| right.contains(value))
 }
 
-fn scopes_overlap(left: &[Scope], right: &[Scope]) -> bool {
+fn scopes_overlap(
+    left: &[coordination_projection::ScopeProjection],
+    right: &[coordination_projection::ScopeProjection],
+) -> bool {
     left.iter().any(|left| {
         right.iter().any(|right| {
             if left.repository != right.repository {
@@ -373,82 +429,6 @@ fn path_in_prefix(path: &str, prefix: &str) -> bool {
             .is_some_and(|suffix| suffix.starts_with('/'))
 }
 
-fn load_registry() -> Result<Option<Registry>, HookError> {
-    let path = agent_session_state_root()?.join("coordination/registry.json");
-    let metadata = match fs::symlink_metadata(&path) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(_) => {
-            return Err(HookError::runtime(
-                "coordination-unavailable",
-                "coordination registry is unavailable",
-            ));
-        }
-    };
-    if metadata.file_type().is_symlink()
-        || !metadata.is_file()
-        || metadata.len() > MAX_REGISTRY_BYTES
-        || metadata.uid() != unsafe { libc::geteuid() }
-        || metadata.permissions().mode() & 0o077 != 0
-    {
-        return Err(HookError::data(
-            "coordination-untrusted",
-            "coordination registry ownership, mode, or type is untrusted",
-        ));
-    }
-    let bytes = fs::read(path).map_err(|_| {
-        HookError::runtime(
-            "coordination-unavailable",
-            "coordination registry could not be read",
-        )
-    })?;
-    let registry = serde_json::from_slice(&bytes).map_err(|_| {
-        HookError::data(
-            "coordination-invalid",
-            "coordination registry could not be classified",
-        )
-    })?;
-    Ok(Some(registry))
-}
-
-fn worktree_fingerprint(registry: &Registry, checkout: &Path) -> String {
-    let canonical = fs::canonicalize(checkout).unwrap_or_else(|_| checkout.to_path_buf());
-    let hash = hmac_sha256(
-        registry.fingerprint_key.as_bytes(),
-        canonical.as_os_str().as_encoded_bytes(),
-    );
-    let mut output = format!("hmac-sha256:{}:", registry.fingerprint_epoch);
-    for byte in hash {
-        use std::fmt::Write as _;
-        let _ = write!(output, "{byte:02x}");
-    }
-    output
-}
-
-fn hmac_sha256(key: &[u8], message: &[u8]) -> [u8; 32] {
-    const BLOCK: usize = 64;
-    let mut normalized = [0_u8; BLOCK];
-    if key.len() > BLOCK {
-        normalized[..32].copy_from_slice(&Sha256::digest(key));
-    } else {
-        normalized[..key.len()].copy_from_slice(key);
-    }
-    let mut inner_pad = [0x36_u8; BLOCK];
-    let mut outer_pad = [0x5c_u8; BLOCK];
-    for index in 0..BLOCK {
-        inner_pad[index] ^= normalized[index];
-        outer_pad[index] ^= normalized[index];
-    }
-    let mut inner = Sha256::new();
-    inner.update(inner_pad);
-    inner.update(message);
-    let inner = inner.finalize();
-    let mut outer = Sha256::new();
-    outer.update(outer_pad);
-    outer.update(inner);
-    outer.finalize().into()
-}
-
 fn checkout_dirty(path: &Path) -> Option<bool> {
     let output = Command::new("git")
         .arg("-C")
@@ -459,6 +439,16 @@ fn checkout_dirty(path: &Path) -> Option<bool> {
         .output()
         .ok()?;
     output.status.success().then_some(!output.stdout.is_empty())
+}
+
+fn action_rank(action: DecisionAction) -> u8 {
+    match action {
+        DecisionAction::Allow => 0,
+        DecisionAction::Warn => 1,
+        DecisionAction::Context => 2,
+        DecisionAction::Transform => 3,
+        DecisionAction::Block => 4,
+    }
 }
 
 fn now_epoch() -> i64 {

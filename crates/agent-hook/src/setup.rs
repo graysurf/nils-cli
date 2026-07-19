@@ -19,7 +19,14 @@ use crate::paths::Layout;
 const CODEX_BLOCK_START: &str = "# >>> agent-hook:provider-ingress:v1 >>>";
 const CODEX_BLOCK_END: &str = "# <<< agent-hook:provider-ingress:v1 <<<";
 const DISPATCH_TIMEOUT_SECONDS: i64 = 10;
+const CODEX_NOTIFY_ARGV: [&str; 5] = ["agent-session", "activity", "notify", "--agent", "codex"];
+const CODEX_NOTIFY_FORWARD_FLAG: &str = "--forward-notify-argv-json";
+const MAX_CODEX_FORWARD_ARGS: usize = 64;
+const MAX_CODEX_FORWARD_ARGV_BYTES: usize = 16 * 1024;
+const MAX_PROVIDER_CONFIG_BYTES: usize = 1024 * 1024;
 const LOCK_TIMEOUT: Duration = Duration::from_secs(2);
+
+type JsonMigration = (Option<Vec<u8>>, usize, usize, usize, bool);
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -29,13 +36,40 @@ pub struct HookGroup {
     pub matcher: Option<String>,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum ProviderStatus {
+    Missing,
+    CompatibilityOnly,
+    Dual,
+    Drifted,
+    Converged,
+    Unsupported,
+    Unrelated,
+}
+
+impl std::fmt::Display for ProviderStatus {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let value = match self {
+            Self::Missing => "missing",
+            Self::CompatibilityOnly => "compatibility-only",
+            Self::Dual => "dual",
+            Self::Drifted => "drifted",
+            Self::Converged => "converged",
+            Self::Unsupported => "unsupported",
+            Self::Unrelated => "unrelated",
+        };
+        formatter.write_str(value)
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SetupResult {
     pub schema_version: String,
     pub product: String,
     pub action: String,
-    pub status: String,
+    pub status: ProviderStatus,
     pub changed: bool,
     pub would_change: bool,
     pub configured: bool,
@@ -53,12 +87,12 @@ pub struct SetupResult {
     pub trust: String,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct DoctorResult {
     pub schema_version: String,
     pub product: String,
-    pub status: String,
+    pub status: ProviderStatus,
     pub supported: bool,
     pub owned_count: usize,
     pub expected_owned_count: usize,
@@ -71,15 +105,23 @@ pub struct DoctorResult {
 
 struct Plan {
     product: Product,
-    path: PathBuf,
-    original: Option<Vec<u8>>,
-    candidate: Option<Vec<u8>>,
+    files: Vec<PlannedFile>,
+    primary_path: PathBuf,
     groups: Vec<HookGroup>,
     owned_before: usize,
     owned_after: usize,
     legacy_before: usize,
     unrelated_before: usize,
     drifted: bool,
+    auxiliary_configured_before: bool,
+    auxiliary_configured_after: bool,
+}
+
+struct PlannedFile {
+    path: PathBuf,
+    original: Option<Vec<u8>>,
+    candidate: Option<Vec<u8>>,
+    original_mode: Option<u32>,
 }
 
 pub fn run(
@@ -95,7 +137,7 @@ pub fn run(
             schema_version: "agent-hook.setup-result.v1".to_string(),
             product: product.as_str().to_string(),
             action: action.as_str().to_string(),
-            status: "unsupported".to_string(),
+            status: ProviderStatus::Unsupported,
             changed: false,
             would_change: false,
             configured: false,
@@ -130,29 +172,40 @@ pub fn run(
             "provider setup plan changed after review",
         ));
     }
-    let would_change = plan.original != plan.candidate;
+    let would_change = plan
+        .files
+        .iter()
+        .any(|file| file.original != file.candidate);
     let mut changed = false;
     if !matches!(action, SetupAction::DryRun) && would_change {
         apply_plan(layout, &plan)?;
         changed = true;
     }
     let configured = if matches!(action, SetupAction::DryRun) {
-        plan.owned_before == plan.groups.len() && !plan.drifted && plan.legacy_before == 0
+        plan.owned_before == plan.groups.len()
+            && !plan.drifted
+            && plan.legacy_before == 0
+            && plan.auxiliary_configured_before
     } else {
-        plan.owned_after == plan.groups.len() && action != SetupAction::Remove
+        plan.owned_after == plan.groups.len()
+            && action != SetupAction::Remove
+            && plan.auxiliary_configured_after
     };
-    let would_configure = action != SetupAction::Remove && plan.owned_after == plan.groups.len();
+    let would_configure = action != SetupAction::Remove
+        && plan.owned_after == plan.groups.len()
+        && plan.auxiliary_configured_after;
     let status = classify_status(
         plan.owned_before,
         plan.groups.len(),
         plan.legacy_before,
+        plan.unrelated_before,
         plan.drifted,
     );
     Ok(SetupResult {
         schema_version: "agent-hook.setup-result.v1".to_string(),
         product: product.as_str().to_string(),
         action: action.as_str().to_string(),
-        status: status.to_string(),
+        status,
         changed,
         would_change,
         configured,
@@ -181,7 +234,7 @@ pub fn doctor(loaded: &LoadedPolicy, product: Product) -> Result<DoctorResult, H
         return Ok(DoctorResult {
             schema_version: "agent-hook.doctor.v1".to_string(),
             product: product.as_str().to_string(),
-            status: "unsupported".to_string(),
+            status: ProviderStatus::Unsupported,
             supported: false,
             owned_count: 0,
             expected_owned_count: policy_groups(loaded, product).len(),
@@ -200,9 +253,9 @@ pub fn doctor(loaded: &LoadedPolicy, product: Product) -> Result<DoctorResult, H
             plan.owned_before,
             plan.groups.len(),
             plan.legacy_before,
-            plan.drifted,
-        )
-        .to_string(),
+            plan.unrelated_before,
+            plan.drifted || (plan.owned_before > 0 && !plan.auxiliary_configured_before),
+        ),
         supported: true,
         owned_count: plan.owned_before,
         expected_owned_count: plan.groups.len(),
@@ -243,13 +296,14 @@ fn build_plan(
     let path = provider_path(product)?;
     let original = read_optional_config(&path)?;
     match product {
-        Product::Codex => build_codex_plan(product, action, path, original, groups),
+        Product::Codex => build_codex_plan(loaded, product, action, path, original, groups),
         Product::Claude => build_json_plan(product, action, path, original, groups, loaded),
         Product::Hermes => unreachable!("unsupported returned before plan"),
     }
 }
 
 fn build_codex_plan(
+    loaded: &LoadedPolicy,
     product: Product,
     action: SetupAction,
     path: PathBuf,
@@ -271,27 +325,47 @@ fn build_codex_plan(
         HookError::data("provider-config-invalid", "Codex config is not valid TOML")
     })?;
     let (legacy_before, unrelated_before) = inspect_toml_handlers(&document);
+    let notify = plan_codex_notification(&mut document, action, raw)?;
     remove_legacy_toml_handlers(&mut document);
     let mut rendered = document.to_string();
     if action != SetupAction::Remove {
         if !rendered.is_empty() && !rendered.ends_with('\n') {
             rendered.push('\n');
         }
-        if !rendered.is_empty() && !rendered.ends_with("\n\n") {
-            rendered.push('\n');
-        }
         rendered.push_str(&expected_block);
     }
-    let candidate = if rendered.is_empty() {
+    let mut candidate = if rendered.is_empty() {
         None
     } else {
         Some(rendered.into_bytes())
     };
+    if action == SetupAction::Remove && owned_before == 0 && legacy_before == 0 && !notify.changed {
+        candidate = original.clone();
+    }
+    validate_candidate_size(candidate.as_deref())?;
+    let original_mode = file_mode(&path)?;
+    let hooks_path = path.with_file_name("hooks.json");
+    let hooks_original = read_optional_config(&hooks_path)?;
+    let (hooks_candidate, hooks_owned, hooks_legacy, hooks_unrelated, hooks_drifted) =
+        build_codex_json_migration(hooks_original.as_deref(), product, &groups, loaded)?;
+    let hooks_mode = file_mode(&hooks_path)?;
     Ok(Plan {
         product,
-        path,
-        original,
-        candidate,
+        primary_path: path.clone(),
+        files: vec![
+            PlannedFile {
+                path,
+                original,
+                candidate,
+                original_mode,
+            },
+            PlannedFile {
+                path: hooks_path,
+                original: hooks_original,
+                candidate: hooks_candidate,
+                original_mode: hooks_mode,
+            },
+        ],
         groups: groups.clone(),
         owned_before,
         owned_after: if action == SetupAction::Remove {
@@ -299,10 +373,198 @@ fn build_codex_plan(
         } else {
             groups.len()
         },
-        legacy_before,
-        unrelated_before,
-        drifted,
+        legacy_before: legacy_before + hooks_owned + hooks_legacy,
+        unrelated_before: unrelated_before + hooks_unrelated,
+        drifted: drifted || hooks_drifted || notify.requires_review,
+        auxiliary_configured_before: notify.configured_before,
+        auxiliary_configured_after: notify.configured_after,
     })
+}
+
+struct CodexNotificationPlan {
+    changed: bool,
+    configured_before: bool,
+    configured_after: bool,
+    requires_review: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum CodexNotifyMode {
+    Absent,
+    Owned,
+    Composed(Vec<String>),
+    Foreign(Vec<String>),
+    Invalid,
+}
+
+fn plan_codex_notification(
+    document: &mut DocumentMut,
+    action: SetupAction,
+    original_raw: &str,
+) -> Result<CodexNotificationPlan, HookError> {
+    let mode = codex_notify_mode(document);
+    let configured_before = matches!(mode, CodexNotifyMode::Owned | CodexNotifyMode::Composed(_));
+    let mut requires_review = false;
+    if action == SetupAction::Remove {
+        match mode {
+            CodexNotifyMode::Owned => {
+                document.remove("notify");
+            }
+            CodexNotifyMode::Composed(forwarded) => set_codex_notify(document, &forwarded),
+            CodexNotifyMode::Absent | CodexNotifyMode::Foreign(_) | CodexNotifyMode::Invalid => {}
+        }
+    } else {
+        match mode {
+            CodexNotifyMode::Absent => {
+                set_codex_notify(document, &CODEX_NOTIFY_ARGV.map(str::to_string))
+            }
+            CodexNotifyMode::Owned | CodexNotifyMode::Composed(_) => {}
+            CodexNotifyMode::Foreign(forwarded) if codex_forward_argv_is_safe(&forwarded) => {
+                let encoded = serde_json::to_string(&forwarded).map_err(|_| {
+                    HookError::data(
+                        "provider-notification-config-invalid",
+                        "Codex user notify argv could not be encoded",
+                    )
+                })?;
+                if encoded.len() > MAX_CODEX_FORWARD_ARGV_BYTES {
+                    return Err(HookError::data(
+                        "provider-notification-config-conflict",
+                        "Codex user notify argv exceeds the safe composition limit",
+                    ));
+                }
+                let mut composed = CODEX_NOTIFY_ARGV.map(str::to_string).to_vec();
+                composed.push(CODEX_NOTIFY_FORWARD_FLAG.to_string());
+                composed.push(encoded);
+                set_codex_notify(document, &composed);
+                let mut restored = document.clone();
+                set_codex_notify(&mut restored, &forwarded);
+                if restored.to_string().as_bytes() != original_raw.as_bytes() {
+                    return Err(HookError::data(
+                        "provider-notification-config-nonreversible",
+                        "Codex user notify argv cannot be composed with byte-exact removal",
+                    ));
+                }
+                requires_review = true;
+            }
+            CodexNotifyMode::Foreign(_) | CodexNotifyMode::Invalid => {
+                return Err(HookError::data(
+                    "provider-notification-config-conflict",
+                    "Codex notify configuration cannot be composed safely",
+                ));
+            }
+        }
+    }
+    let configured_after = matches!(
+        codex_notify_mode(document),
+        CodexNotifyMode::Owned | CodexNotifyMode::Composed(_)
+    );
+    let changed = document.to_string().as_bytes() != original_raw.as_bytes();
+    Ok(CodexNotificationPlan {
+        changed,
+        configured_before,
+        configured_after,
+        requires_review,
+    })
+}
+
+fn codex_notify_mode(document: &DocumentMut) -> CodexNotifyMode {
+    let Some(item) = document.get("notify") else {
+        return CodexNotifyMode::Absent;
+    };
+    let Some(array) = item.as_array() else {
+        return CodexNotifyMode::Invalid;
+    };
+    let Some(argv) = array
+        .iter()
+        .map(|value| value.as_str().map(str::to_string))
+        .collect::<Option<Vec<_>>>()
+    else {
+        return CodexNotifyMode::Invalid;
+    };
+    if argv_matches(&argv, &CODEX_NOTIFY_ARGV) {
+        return CodexNotifyMode::Owned;
+    }
+    if argv.len() == CODEX_NOTIFY_ARGV.len() + 2
+        && argv_matches(&argv[..CODEX_NOTIFY_ARGV.len()], &CODEX_NOTIFY_ARGV)
+        && argv[CODEX_NOTIFY_ARGV.len()] == CODEX_NOTIFY_FORWARD_FLAG
+        && let Ok(forwarded) =
+            serde_json::from_str::<Vec<String>>(&argv[CODEX_NOTIFY_ARGV.len() + 1])
+        && codex_forward_argv_is_safe(&forwarded)
+    {
+        return CodexNotifyMode::Composed(forwarded);
+    }
+    CodexNotifyMode::Foreign(argv)
+}
+
+fn argv_matches(argv: &[String], expected: &[&str]) -> bool {
+    argv.len() == expected.len()
+        && argv
+            .iter()
+            .zip(expected)
+            .all(|(value, expected)| value == expected)
+}
+
+fn codex_forward_argv_is_safe(argv: &[String]) -> bool {
+    !argv.is_empty()
+        && argv.len() <= MAX_CODEX_FORWARD_ARGS
+        && !argv[0].trim().is_empty()
+        && argv.iter().map(String::len).sum::<usize>() <= MAX_CODEX_FORWARD_ARGV_BYTES
+        && !argv.iter().any(|value| value == CODEX_NOTIFY_FORWARD_FLAG)
+        && (argv.len() < CODEX_NOTIFY_ARGV.len()
+            || !argv_matches(&argv[..CODEX_NOTIFY_ARGV.len()], &CODEX_NOTIFY_ARGV))
+}
+
+fn set_codex_notify(document: &mut DocumentMut, argv: &[String]) {
+    let mut array = toml_edit::Array::new();
+    array.extend(argv.iter().map(String::as_str));
+    document["notify"] = toml_edit::value(array);
+}
+
+fn build_codex_json_migration(
+    original: Option<&[u8]>,
+    product: Product,
+    groups: &[HookGroup],
+    loaded: &LoadedPolicy,
+) -> Result<JsonMigration, HookError> {
+    let Some(bytes) = original else {
+        return Ok((None, 0, 0, 0, false));
+    };
+    let mut root = serde_json::from_slice::<Value>(bytes).map_err(|_| {
+        HookError::data(
+            "provider-config-invalid",
+            "Codex hooks.json is not valid JSON",
+        )
+    })?;
+    if !root.is_object() {
+        return Err(HookError::data(
+            "provider-config-invalid",
+            "Codex hooks.json root must be an object",
+        ));
+    }
+    let (owned, compatibility, unrelated, drifted) =
+        inspect_json_handlers(&root, product, groups, loaded)?;
+    if owned == 0 && compatibility == 0 {
+        return Ok((
+            Some(bytes.to_vec()),
+            owned,
+            compatibility,
+            unrelated,
+            drifted,
+        ));
+    }
+    remove_owned_and_legacy_json(&mut root, product, loaded)?;
+    let candidate = if root.as_object().is_some_and(Map::is_empty) {
+        None
+    } else {
+        Some(serde_json::to_vec_pretty(&root).map_err(|_| {
+            HookError::runtime(
+                "provider-config-render-failed",
+                "Codex hooks.json render failed",
+            )
+        })?)
+    };
+    validate_candidate_size(candidate.as_deref())?;
+    Ok((candidate, owned, compatibility, unrelated, drifted))
 }
 
 fn build_json_plan(
@@ -337,7 +599,7 @@ fn build_json_plan(
             append_json_group(&mut root, product, group)?;
         }
     }
-    let candidate = if root.as_object().is_some_and(Map::is_empty) {
+    let mut candidate = if root.as_object().is_some_and(Map::is_empty) {
         None
     } else {
         Some(serde_json::to_vec_pretty(&root).map_err(|_| {
@@ -347,11 +609,20 @@ fn build_json_plan(
             )
         })?)
     };
+    if action == SetupAction::Remove && owned_before == 0 && legacy_before == 0 {
+        candidate = original.clone();
+    }
+    validate_candidate_size(candidate.as_deref())?;
+    let original_mode = file_mode(&path)?;
     Ok(Plan {
         product,
-        path,
-        original,
-        candidate,
+        primary_path: path.clone(),
+        files: vec![PlannedFile {
+            path,
+            original,
+            candidate,
+            original_mode,
+        }],
         groups: groups.clone(),
         owned_before,
         owned_after: if action == SetupAction::Remove {
@@ -362,7 +633,19 @@ fn build_json_plan(
         legacy_before,
         unrelated_before,
         drifted,
+        auxiliary_configured_before: true,
+        auxiliary_configured_after: true,
     })
+}
+
+fn validate_candidate_size(candidate: Option<&[u8]>) -> Result<(), HookError> {
+    if candidate.is_some_and(|bytes| bytes.len() > MAX_PROVIDER_CONFIG_BYTES) {
+        return Err(HookError::data(
+            "provider-config-candidate-too-large",
+            "generated provider config exceeds the 1 MiB read limit",
+        ));
+    }
+    Ok(())
 }
 
 fn render_codex_block(groups: &[HookGroup], product: Product) -> String {
@@ -516,7 +799,7 @@ fn inspect_json_handlers(
                 if owned_json_handler(handler, product) {
                     owned += 1;
                     owned_groups.insert((event.clone(), matcher.clone()));
-                } else if legacy_json_handler(handler, loaded) {
+                } else if legacy_json_handler(handler, product, loaded) {
                     compatibility += 1;
                 } else {
                     unrelated += 1;
@@ -528,7 +811,7 @@ fn inspect_json_handlers(
         .iter()
         .map(|group| (group.event.clone(), group.matcher.clone()))
         .collect::<BTreeSet<_>>();
-    let drifted = !owned_groups.is_empty() && owned_groups != expected_set;
+    let drifted = owned > 0 && (owned != expected.len() || owned_groups != expected_set);
     Ok((owned, compatibility, unrelated, drifted))
 }
 
@@ -565,7 +848,8 @@ fn remove_owned_and_legacy_json(
                     HookError::data("provider-config-invalid", "provider hook group is invalid")
                 })?;
             handlers.retain(|handler| {
-                !owned_json_handler(handler, product) && !legacy_json_handler(handler, loaded)
+                !owned_json_handler(handler, product)
+                    && !legacy_json_handler(handler, product, loaded)
             });
         }
         groups.retain(|group| {
@@ -633,14 +917,14 @@ fn owned_json_handler(handler: &Value, product: Product) -> bool {
         && handler.get("timeout").and_then(Value::as_i64) == Some(DISPATCH_TIMEOUT_SECONDS)
 }
 
-fn legacy_json_handler(handler: &Value, loaded: &LoadedPolicy) -> bool {
+fn legacy_json_handler(handler: &Value, product: Product, loaded: &LoadedPolicy) -> bool {
     handler.as_object().is_some_and(|object| object.len() == 3)
         && handler.get("type").and_then(Value::as_str) == Some("command")
         && handler.get("timeout").and_then(Value::as_i64) == Some(5)
         && handler
             .get("command")
             .and_then(Value::as_str)
-            .is_some_and(|command| legacy_command_for_policy(command, loaded))
+            .is_some_and(|command| legacy_command_for_policy(command, product, loaded))
 }
 
 fn legacy_toml_handler(handler: &toml_edit::Table) -> bool {
@@ -650,7 +934,7 @@ fn legacy_toml_handler(handler: &toml_edit::Table) -> bool {
         && handler
             .get("command")
             .and_then(TomlItem::as_str)
-            .is_some_and(legacy_command)
+            .is_some_and(|command| legacy_command(command, Product::Codex))
 }
 
 fn json_group_has_user_metadata(group: &Value) -> bool {
@@ -667,8 +951,8 @@ fn toml_group_has_user_metadata(group: &toml_edit::Table) -> bool {
         .any(|(key, _)| !matches!(key, "matcher" | "hooks"))
 }
 
-fn legacy_command(command: &str) -> bool {
-    command.contains("agent-session activity hook")
+fn legacy_command(command: &str, product: Product) -> bool {
+    command == format!("agent-session activity hook --agent {}", product.as_str())
         || [
             "agent-scope-lock-guard",
             "block-claude-coauthor-trailer",
@@ -694,20 +978,41 @@ fn legacy_command(command: &str) -> bool {
             "user-prompt-agent-memory",
         ]
         .iter()
-        .any(|id| command.contains(runtime_handler_filename(id).expect("compiled handler")))
+        .any(|id| {
+            runtime_handler_filename(id)
+                .is_some_and(|filename| exact_runtime_handler_command(command, product, filename))
+        })
 }
 
-fn legacy_command_for_policy(command: &str, loaded: &LoadedPolicy) -> bool {
-    if command.contains("agent-session activity hook") {
+fn legacy_command_for_policy(command: &str, product: Product, loaded: &LoadedPolicy) -> bool {
+    if command == format!("agent-session activity hook --agent {}", product.as_str()) {
         return true;
     }
     loaded.bundle.rules.iter().any(|rule| {
         matches!(
             &rule.capability,
             Capability::RuntimeKitHandler { handler_id }
-                if runtime_handler_filename(handler_id).is_some_and(|name| command.contains(name))
+                if runtime_handler_filename(handler_id)
+                    .is_some_and(|filename| exact_runtime_handler_command(command, product, filename))
         )
     })
+}
+
+fn exact_runtime_handler_command(command: &str, product: Product, filename: &str) -> bool {
+    match product {
+        Product::Codex => {
+            command
+                == format!(
+                    "AGENT_RUNTIME_PRODUCT=codex \"${{CODEX_HOME:-$HOME/.codex}}/hooks/{filename}\""
+                )
+        }
+        Product::Claude => {
+            command == format!("$HOME/.claude/hooks/{filename}")
+                || command
+                    == format!("AGENT_RUNTIME_PRODUCT=claude \"$HOME/.claude/hooks/{filename}\"")
+        }
+        Product::Hermes => false,
+    }
 }
 
 fn provider_path(product: Product) -> Result<PathBuf, HookError> {
@@ -753,17 +1058,71 @@ fn read_optional_config(path: &Path) -> Result<Option<Vec<u8>>, HookError> {
     })
 }
 
-fn apply_plan(layout: &Layout, plan: &Plan) -> Result<(), HookError> {
-    let _lock = setup_lock(layout)?;
-    let current = read_optional_config(&plan.path)?;
-    if current != plan.original {
-        return Err(HookError::unavailable(
-            "provider-config-drift",
-            "provider config changed after preview",
-        ));
+fn file_mode(path: &Path) -> Result<Option<u32>, HookError> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => Ok(Some(metadata.permissions().mode() & 0o777)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(_) => Err(HookError::runtime(
+            "provider-config-unavailable",
+            "provider config metadata is unavailable",
+        )),
     }
-    if let Some(candidate) = plan.candidate.as_deref() {
-        if let Some(parent) = plan.path.parent() {
+}
+
+fn apply_plan(layout: &Layout, plan: &Plan) -> Result<(), HookError> {
+    let _state_lock = setup_lock(layout)?;
+    let _provider_lock = provider_lock(&plan.primary_path)?;
+    for file in &plan.files {
+        let current = read_optional_config(&file.path)?;
+        if current != file.original {
+            return Err(HookError::unavailable(
+                "provider-config-drift",
+                "provider config changed after preview",
+            ));
+        }
+    }
+    apply_transaction(&plan.files, apply_candidate)
+}
+
+fn apply_transaction(
+    files: &[PlannedFile],
+    mut apply: impl FnMut(&PlannedFile) -> Result<(), HookError>,
+) -> Result<(), HookError> {
+    for (index, file) in files.iter().enumerate() {
+        if file.original == file.candidate {
+            continue;
+        }
+        if let Err(error) = apply(file) {
+            if rollback_files(&files[..=index]).is_err() {
+                return Err(HookError::runtime(
+                    "provider-config-rollback-failed",
+                    "provider config transaction failed and exact rollback was not possible",
+                ));
+            }
+            return Err(error);
+        }
+    }
+    Ok(())
+}
+
+fn apply_candidate(file: &PlannedFile) -> Result<(), HookError> {
+    write_file_state(&file.path, file.candidate.as_deref(), file.original_mode)
+}
+
+fn rollback_files(files: &[PlannedFile]) -> Result<(), HookError> {
+    for file in files.iter().rev() {
+        write_file_state(&file.path, file.original.as_deref(), file.original_mode)?;
+    }
+    Ok(())
+}
+
+fn write_file_state(
+    path: &Path,
+    contents: Option<&[u8]>,
+    original_mode: Option<u32>,
+) -> Result<(), HookError> {
+    if let Some(contents) = contents {
+        if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).map_err(|_| {
                 HookError::runtime(
                     "provider-config-dir-failed",
@@ -771,19 +1130,14 @@ fn apply_plan(layout: &Layout, plan: &Plan) -> Result<(), HookError> {
                 )
             })?;
         }
-        let mode = plan
-            .path
-            .metadata()
-            .map(|metadata| metadata.permissions().mode() & 0o777)
-            .unwrap_or(0o600);
-        write_atomic(&plan.path, candidate, mode).map_err(|_| {
+        write_atomic(path, contents, original_mode.unwrap_or(0o600)).map_err(|_| {
             HookError::runtime(
                 "provider-config-write-failed",
                 "provider config atomic write failed",
             )
         })?;
-    } else if plan.path.exists() {
-        fs::remove_file(&plan.path).map_err(|_| {
+    } else if path.exists() {
+        fs::remove_file(path).map_err(|_| {
             HookError::runtime(
                 "provider-config-remove-failed",
                 "provider config remove failed",
@@ -794,11 +1148,21 @@ fn apply_plan(layout: &Layout, plan: &Plan) -> Result<(), HookError> {
 }
 
 fn plan_digest(plan: &Plan) -> Result<String, HookError> {
+    let files = plan
+        .files
+        .iter()
+        .map(|file| {
+            json!({
+                "path_role": if file.path == plan.primary_path { "provider-primary" } else { "provider-compatibility" },
+                "before": file.original.as_deref().map(digest),
+                "after": file.candidate.as_deref().map(digest),
+            })
+        })
+        .collect::<Vec<_>>();
     digest_serializable(&json!({
-        "schema_version": "agent-hook.setup-plan.v1",
+        "schema_version": "agent-hook.setup-plan.v2",
         "product": plan.product,
-        "before": plan.original.as_deref().map(digest),
-        "after": plan.candidate.as_deref().map(digest),
+        "files": files,
         "groups": plan.groups,
         "legacy_count": plan.legacy_before,
         "drifted": plan.drifted,
@@ -824,23 +1188,29 @@ fn classify_status(
     owned: usize,
     expected: usize,
     compatibility: usize,
+    unrelated: usize,
     drifted: bool,
-) -> &'static str {
+) -> ProviderStatus {
     if drifted {
-        "drifted"
+        ProviderStatus::Drifted
     } else if owned > 0 && compatibility > 0 {
-        "dual"
+        ProviderStatus::Dual
     } else if compatibility > 0 {
-        concat!("leg", "acy")
+        ProviderStatus::CompatibilityOnly
     } else if owned == 0 {
-        "missing"
+        if unrelated > 0 {
+            ProviderStatus::Unrelated
+        } else {
+            ProviderStatus::Missing
+        }
     } else if owned == expected {
-        "converged"
+        ProviderStatus::Converged
     } else {
-        "drifted"
+        ProviderStatus::Drifted
     }
 }
 
+#[derive(Debug)]
 struct SetupLock(File);
 
 impl Drop for SetupLock {
@@ -852,18 +1222,7 @@ impl Drop for SetupLock {
 }
 
 fn setup_lock(layout: &Layout) -> Result<SetupLock, HookError> {
-    fs::create_dir_all(&layout.state_root).map_err(|_| {
-        HookError::runtime(
-            "setup-state-dir-failed",
-            "setup state directory create failed",
-        )
-    })?;
-    fs::set_permissions(&layout.state_root, fs::Permissions::from_mode(0o700)).map_err(|_| {
-        HookError::runtime(
-            "setup-state-mode-failed",
-            "setup state directory mode failed",
-        )
-    })?;
+    crate::paths::ensure_private_state_dir(&layout.state_root, "setup-state-dir")?;
     let file = OpenOptions::new()
         .read(true)
         .write(true)
@@ -871,6 +1230,47 @@ fn setup_lock(layout: &Layout) -> Result<SetupLock, HookError> {
         .mode(0o600)
         .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
         .open(layout.state_root.join("setup.lock"))
+        .map_err(|_| HookError::runtime("setup-lock-unavailable", "setup lock unavailable"))?;
+    let started = Instant::now();
+    loop {
+        let status = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if status == 0 {
+            return Ok(SetupLock(file));
+        }
+        if started.elapsed() >= LOCK_TIMEOUT {
+            return Err(HookError::unavailable(
+                "setup-lock-timeout",
+                "provider setup is busy",
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn provider_lock(primary_path: &Path) -> Result<SetupLock, HookError> {
+    let parent = primary_path.parent().ok_or_else(|| {
+        HookError::runtime(
+            "setup-lock-unavailable",
+            "provider setup lock parent is unavailable",
+        )
+    })?;
+    fs::create_dir_all(parent).map_err(|_| {
+        HookError::runtime(
+            "setup-lock-unavailable",
+            "provider setup lock directory is unavailable",
+        )
+    })?;
+    acquire_lock(parent.join(".agent-hook-setup.lock"))
+}
+
+fn acquire_lock(path: PathBuf) -> Result<SetupLock, HookError> {
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)
         .map_err(|_| HookError::runtime("setup-lock-unavailable", "setup lock unavailable"))?;
     let started = Instant::now();
     loop {
@@ -904,15 +1304,21 @@ mod tests {
         };
         let plan = Plan {
             product: Product::Claude,
-            path: path.clone(),
-            original: Some(b"reviewed".to_vec()),
-            candidate: Some(b"candidate".to_vec()),
+            primary_path: path.clone(),
+            files: vec![PlannedFile {
+                path: path.clone(),
+                original: Some(b"reviewed".to_vec()),
+                candidate: Some(b"candidate".to_vec()),
+                original_mode: Some(0o600),
+            }],
             groups: Vec::new(),
             owned_before: 0,
             owned_after: 0,
             legacy_before: 0,
             unrelated_before: 0,
             drifted: false,
+            auxiliary_configured_before: true,
+            auxiliary_configured_after: true,
         };
         fs::write(&path, b"concurrent").expect("concurrent config");
 
@@ -920,5 +1326,64 @@ mod tests {
 
         assert_eq!(error.code, "provider-config-drift");
         assert_eq!(fs::read(&path).expect("preserved config"), b"concurrent");
+    }
+
+    #[test]
+    fn transaction_rolls_back_every_file_when_second_replace_reports_failure() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let first = temp.path().join("config.toml");
+        let second = temp.path().join("hooks.json");
+        fs::write(&first, b"first-before").expect("first before");
+        fs::write(&second, b"second-before").expect("second before");
+        let files = vec![
+            PlannedFile {
+                path: first.clone(),
+                original: Some(b"first-before".to_vec()),
+                candidate: Some(b"first-after".to_vec()),
+                original_mode: Some(0o600),
+            },
+            PlannedFile {
+                path: second.clone(),
+                original: Some(b"second-before".to_vec()),
+                candidate: Some(b"second-after".to_vec()),
+                original_mode: Some(0o600),
+            },
+        ];
+        let mut writes = 0;
+
+        let error = apply_transaction(&files, |file| {
+            writes += 1;
+            fs::write(&file.path, file.candidate.as_deref().expect("candidate"))
+                .expect("simulated replace");
+            if writes == 2 {
+                Err(HookError::runtime(
+                    "provider-config-write-failed",
+                    "simulated post-replace failure",
+                ))
+            } else {
+                Ok(())
+            }
+        })
+        .expect_err("second write failure");
+
+        assert_eq!(error.code, "provider-config-write-failed");
+        assert_eq!(fs::read(&first).expect("first restored"), b"first-before");
+        assert_eq!(
+            fs::read(&second).expect("second restored"),
+            b"second-before"
+        );
+    }
+
+    #[test]
+    fn provider_lock_identity_is_independent_of_state_root() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let provider = temp.path().join("config.toml");
+        let first = provider_lock(&provider).expect("first provider lock");
+
+        let error = provider_lock(&provider).expect_err("same provider lock must serialize");
+
+        assert_eq!(error.code, "setup-lock-timeout");
+        drop(first);
+        provider_lock(&provider).expect("provider lock released");
     }
 }
