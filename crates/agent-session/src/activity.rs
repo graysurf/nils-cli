@@ -4080,6 +4080,7 @@ struct CodexTomlHookAnalysis {
 
 fn codex_hook_block_overlaps_foreign_managed_block(
     raw: &str,
+    document: &TomlDocument,
     owned_start: usize,
     owned_end: usize,
     multiline_value_lines: &[usize],
@@ -4112,11 +4113,49 @@ fn codex_hook_block_overlaps_foreign_managed_block(
             foreign_ends.push((owner, offset));
         }
     }
-    foreign_starts.iter().any(|(owner, start)| {
-        foreign_ends
+    let foreign_ranges = foreign_starts
+        .iter()
+        .filter_map(|(owner, start)| {
+            foreign_ends
+                .iter()
+                .find(|(end_owner, end)| end_owner == owner && *end > *start)
+                .map(|(_, end)| *start..*end)
+        })
+        .collect::<Vec<_>>();
+    if foreign_ranges.is_empty() {
+        return false;
+    }
+    let overlaps_foreign = |range: &std::ops::Range<usize>| {
+        foreign_ranges
             .iter()
-            .find(|(end_owner, end)| end_owner == owner && *end > *start)
-            .is_some_and(|(_, end)| *start < owned_end && owned_start < *end)
+            .any(|foreign| range.start < foreign.end && foreign.start < range.end)
+    };
+    if overlaps_foreign(&(owned_start..owned_end)) {
+        return true;
+    }
+
+    let Some(hooks) = document.get("hooks").and_then(TomlItem::as_table) else {
+        return false;
+    };
+    provider_specs(AgentKind::Codex).into_iter().any(|spec| {
+        hooks
+            .get(spec.event)
+            .and_then(TomlItem::as_array_of_tables)
+            .is_some_and(|groups| {
+                groups.iter().any(|group| {
+                    let Some(handlers) = group.get("hooks").and_then(TomlItem::as_array_of_tables)
+                    else {
+                        return false;
+                    };
+                    handlers.iter().any(|handler| {
+                        if !toml_handler_command_matches_owned(spec.event, handler) {
+                            return false;
+                        }
+                        group.span().is_none_or(|range| overlaps_foreign(&range))
+                            || handler.span().is_none_or(|range| overlaps_foreign(&range))
+                    })
+                })
+            })
     })
 }
 
@@ -4189,16 +4228,18 @@ fn analyze_codex_toml_hooks(path: &Path, raw: &str) -> Result<CodexTomlHookAnaly
         let mut stripped = String::with_capacity(raw.len() - (end_end - start_begin));
         stripped.push_str(&raw[..start_begin]);
         stripped.push_str(&raw[end_end..]);
+        let overlaps_foreign_managed_block = codex_hook_block_overlaps_foreign_managed_block(
+            raw,
+            &document,
+            start_begin,
+            end_end,
+            &multiline_value_lines,
+        );
         return Ok(CodexTomlHookAnalysis {
             document,
             stripped_raw: stripped,
             marker_layout: CodexTomlHookMarkerLayout::Complete,
-            overlaps_foreign_managed_block: codex_hook_block_overlaps_foreign_managed_block(
-                raw,
-                start_begin,
-                end_end,
-                &multiline_value_lines,
-            ),
+            overlaps_foreign_managed_block,
         });
     }
     let mut stripped =
@@ -4206,16 +4247,18 @@ fn analyze_codex_toml_hooks(path: &Path, raw: &str) -> Result<CodexTomlHookAnaly
     stripped.push_str(&raw[..start_begin]);
     stripped.push_str(&raw[start_end..end_begin]);
     stripped.push_str(&raw[end_end..]);
+    let overlaps_foreign_managed_block = codex_hook_block_overlaps_foreign_managed_block(
+        raw,
+        &document,
+        start_begin,
+        end_end,
+        &multiline_value_lines,
+    );
     Ok(CodexTomlHookAnalysis {
         document,
         stripped_raw: stripped,
         marker_layout: CodexTomlHookMarkerLayout::Complete,
-        overlaps_foreign_managed_block: codex_hook_block_overlaps_foreign_managed_block(
-            raw,
-            start_begin,
-            end_end,
-            &multiline_value_lines,
-        ),
+        overlaps_foreign_managed_block,
     })
 }
 
