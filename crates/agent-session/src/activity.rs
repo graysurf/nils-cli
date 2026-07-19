@@ -4079,15 +4079,33 @@ fn strip_owned_codex_toml_hook_block(path: &Path, raw: &str) -> Result<String, C
     if starts.is_empty() && ends.is_empty() {
         return Ok(raw.to_string());
     }
-    if starts.len() != 1 || ends.len() != 1 || ends[0].0 < starts[0].0 {
+    if starts.len() > 1 || ends.len() > 1 {
         return Err(CliError::data(
             "provider-config-invalid",
-            "Codex config has an incomplete or duplicate agent-session hook marker block",
+            "Codex config has a duplicate agent-session hook marker",
             Some(json!({ "path": display_path(path) })),
         ));
     }
-    let (start_begin, start_end) = starts[0];
-    let (end_begin, end_end) = ends[0];
+    let (Some(&(start_begin, start_end)), Some(&(end_begin, end_end))) =
+        (starts.first(), ends.first())
+    else {
+        let (orphan_begin, orphan_end) = starts
+            .first()
+            .or_else(|| ends.first())
+            .copied()
+            .expect("at least one marker exists");
+        let mut stripped = String::with_capacity(raw.len() - (orphan_end - orphan_begin));
+        stripped.push_str(&raw[..orphan_begin]);
+        stripped.push_str(&raw[orphan_end..]);
+        return Ok(stripped);
+    };
+    if end_begin < start_begin {
+        return Err(CliError::data(
+            "provider-config-invalid",
+            "Codex config has a reversed agent-session hook marker block",
+            Some(json!({ "path": display_path(path) })),
+        ));
+    }
     if raw[start_begin..end_end] == render_owned_codex_toml_hook_block() {
         let mut stripped = String::with_capacity(raw.len() - (end_end - start_begin));
         stripped.push_str(&raw[..start_begin]);
@@ -7870,6 +7888,37 @@ mod tests {
             assert_eq!(
                 strip_owned_codex_toml_hook_block(&path, &raw).expect("marker-shaped value"),
                 raw
+            );
+        }
+    }
+
+    #[test]
+    fn codex_single_orphan_marker_is_an_owned_repair_fragment() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let path = tmp.path().join("config.toml");
+        for marker in [CODEX_HOOK_BLOCK_START, CODEX_HOOK_BLOCK_END] {
+            let raw = format!("keep = true\n{marker}\n");
+            assert_eq!(
+                strip_owned_codex_toml_hook_block(&path, &raw).expect("owned orphan marker"),
+                "keep = true\n"
+            );
+        }
+    }
+
+    #[test]
+    fn codex_duplicate_or_reversed_markers_remain_ambiguous() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let path = tmp.path().join("config.toml");
+        for raw in [
+            format!("{CODEX_HOOK_BLOCK_START}\n{CODEX_HOOK_BLOCK_START}\n"),
+            format!("{CODEX_HOOK_BLOCK_END}\n{CODEX_HOOK_BLOCK_END}\n"),
+            format!("{CODEX_HOOK_BLOCK_END}\n{CODEX_HOOK_BLOCK_START}\n"),
+        ] {
+            assert_eq!(
+                strip_owned_codex_toml_hook_block(&path, &raw)
+                    .expect_err("ambiguous marker layout")
+                    .code(),
+                "provider-config-invalid"
             );
         }
     }

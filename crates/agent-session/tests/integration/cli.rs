@@ -1747,6 +1747,110 @@ trust_level = "trusted"
 }
 
 #[test]
+fn codex_repair_recovers_one_orphan_owned_marker_after_trust_save() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let home = tmp.path().join("home");
+    fs::create_dir_all(home.join(".codex")).expect("codex dir");
+    let config_path = home.join(".codex/config.toml");
+    fs::write(
+        &config_path,
+        r#"[[hooks.PreToolUse]]
+
+[[hooks.PreToolUse.hooks]]
+type = "command"
+command = "runtime-kit-pre-tool"
+timeout = 5
+"#,
+    )
+    .expect("inline config");
+    let home_arg = home.to_string_lossy().to_string();
+    let envs = [("HOME", home_arg.as_str())];
+
+    let initial = run(
+        tmp.path(),
+        &[
+            "activity", "setup", "--agent", "codex", "--apply", "--format", "json",
+        ],
+        &envs,
+    );
+    assert_eq!(initial.code, 0, "stderr={}", initial.stderr_text());
+
+    let converged = fs::read_to_string(&config_path).expect("converged config");
+    let block_start = converged
+        .find("# >>> agent-session:codex-hooks >>>")
+        .expect("owned block start");
+    let block_end = converged
+        .find("# <<< agent-session:codex-hooks <<<")
+        .expect("owned block end");
+    let trust_saved = format!("{}{}", &converged[..block_start], &converged[block_end..]);
+    fs::write(&config_path, &trust_saved).expect("trust-saved config");
+
+    let preview = run(
+        tmp.path(),
+        &[
+            "activity",
+            "setup",
+            "--agent",
+            "codex",
+            "--repair",
+            "--dry-run",
+            "--format",
+            "json",
+        ],
+        &envs,
+    );
+    assert_eq!(preview.code, 0, "stderr={}", preview.stderr_text());
+    let preview_json = preview.stdout_json();
+    let preview_result = data(&preview_json);
+    assert_eq!(preview_result["hook_representation"], "inline_toml");
+    assert_eq!(preview_result["would_change"], true);
+    assert_eq!(
+        fs::read_to_string(&config_path).expect("dry-run config"),
+        trust_saved,
+        "dry-run must not remove the orphan marker"
+    );
+    let preview_digest = preview_result["preview_digest"]
+        .as_str()
+        .expect("preview digest")
+        .to_string();
+
+    let repaired = run(
+        tmp.path(),
+        &[
+            "activity",
+            "setup",
+            "--agent",
+            "codex",
+            "--repair",
+            "--expected-preview-digest",
+            &preview_digest,
+            "--format",
+            "json",
+        ],
+        &envs,
+    );
+    assert_eq!(repaired.code, 0, "stderr={}", repaired.stderr_text());
+    assert_eq!(data(&repaired.stdout_json())["configured"], true);
+
+    let steady = run(
+        tmp.path(),
+        &[
+            "activity",
+            "setup",
+            "--agent",
+            "codex",
+            "--repair",
+            "--dry-run",
+            "--format",
+            "json",
+        ],
+        &envs,
+    );
+    assert_eq!(steady.code, 0, "stderr={}", steady.stderr_text());
+    assert_eq!(data(&steady.stdout_json())["would_change"], false);
+}
+
+#[test]
 fn codex_repair_converges_noncanonical_owned_hook_shapes() {
     for fixture_kind in [
         "current-duplicate",
