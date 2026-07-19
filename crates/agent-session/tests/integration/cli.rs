@@ -1889,7 +1889,17 @@ timeout = 5
         foreign_end < owned_start && owned_start < owned_end,
         "owned block must be fully outside the foreign marker pair: {converged}"
     );
-    assert!(converged.contains("sha256:runtime-kit"));
+    let parsed = converged
+        .parse::<toml_edit::DocumentMut>()
+        .expect("converged TOML");
+    let trusted_hook = parsed["hooks"]["state"]["config.toml:pre_tool_use:0:0"]
+        .as_table()
+        .expect("runtime-kit trust state");
+    assert_eq!(
+        trusted_hook["trusted_hash"].as_str(),
+        Some("sha256:runtime-kit")
+    );
+    assert_eq!(trusted_hook["enabled"].as_bool(), Some(true));
 
     let steady = run(
         tmp.path(),
