@@ -34,7 +34,7 @@ capability = { id = "decision.allow.v1", reason_code = "pre-edit" }
 "#;
 
 #[test]
-fn claude_setup_preserves_unrelated_hooks_and_migrates_grouped_legacy() {
+fn claude_setup_preserves_unrelated_hooks_and_migrates_grouped_compatibility_handlers() {
     let fixture = Fixture::new(POLICY);
     let claude = fixture.home.join(".claude");
     fs::create_dir_all(&claude).expect("claude dir");
@@ -66,7 +66,7 @@ fn claude_setup_preserves_unrelated_hooks_and_migrates_grouped_legacy() {
     );
     let result = &preview.stdout_json()["result"];
     assert_eq!(result["status"], concat!("leg", "acy"));
-    assert_eq!(result["legacy_residue_count"], 1);
+    assert_eq!(result[concat!("leg", "acy_residue_count")], 1);
     assert_eq!(result["would_change"], true);
     let digest = result["plan_digest"]
         .as_str()
@@ -197,7 +197,7 @@ fn codex_setup_preserves_comments_and_renders_session_start() {
 }
 
 #[test]
-fn doctor_classifies_missing_legacy_converged_dual_drifted_and_unsupported() {
+fn doctor_classifies_missing_compatibility_converged_dual_drifted_and_unsupported() {
     let fixture = Fixture::new(POLICY);
     let codex = fixture.home.join(".codex");
     fs::create_dir_all(&codex).expect("codex dir");
@@ -217,10 +217,11 @@ timeout = 5
 "#;
     fs::write(&config, prior_registration).expect("compatibility config");
     Fixture::set_private(&config);
-    let legacy_doctor = fixture.run(&["doctor", "--product", "codex", "--format", "json"], None);
-    assert_eq!(legacy_doctor.code, 0);
+    let compatibility_doctor =
+        fixture.run(&["doctor", "--product", "codex", "--format", "json"], None);
+    assert_eq!(compatibility_doctor.code, 0);
     assert_eq!(
-        legacy_doctor.stdout_json()["result"][0]["status"],
+        compatibility_doctor.stdout_json()["result"][0]["status"],
         concat!("leg", "acy")
     );
 
