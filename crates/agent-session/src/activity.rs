@@ -4056,7 +4056,16 @@ fn toml_multiline_value_line_starts(raw: &str) -> Vec<usize> {
     starts
 }
 
-fn strip_owned_codex_toml_hook_block(path: &Path, raw: &str) -> Result<String, CliError> {
+#[derive(Debug)]
+struct StrippedCodexTomlHookBlock {
+    raw: String,
+    complete_marker_pair: bool,
+}
+
+fn strip_owned_codex_toml_hook_block(
+    path: &Path,
+    raw: &str,
+) -> Result<StrippedCodexTomlHookBlock, CliError> {
     parse_codex_notification_config(path, raw)?;
     let multiline_value_lines = toml_multiline_value_line_starts(raw);
     let marker_lines = |marker: &str| {
@@ -4077,7 +4086,10 @@ fn strip_owned_codex_toml_hook_block(path: &Path, raw: &str) -> Result<String, C
     let starts = marker_lines(CODEX_HOOK_BLOCK_START);
     let ends = marker_lines(CODEX_HOOK_BLOCK_END);
     if starts.is_empty() && ends.is_empty() {
-        return Ok(raw.to_string());
+        return Ok(StrippedCodexTomlHookBlock {
+            raw: raw.to_string(),
+            complete_marker_pair: false,
+        });
     }
     if starts.len() > 1 || ends.len() > 1 {
         return Err(CliError::data(
@@ -4097,7 +4109,10 @@ fn strip_owned_codex_toml_hook_block(path: &Path, raw: &str) -> Result<String, C
         let mut stripped = String::with_capacity(raw.len() - (orphan_end - orphan_begin));
         stripped.push_str(&raw[..orphan_begin]);
         stripped.push_str(&raw[orphan_end..]);
-        return Ok(stripped);
+        return Ok(StrippedCodexTomlHookBlock {
+            raw: stripped,
+            complete_marker_pair: false,
+        });
     };
     if end_begin < start_begin {
         return Err(CliError::data(
@@ -4110,14 +4125,20 @@ fn strip_owned_codex_toml_hook_block(path: &Path, raw: &str) -> Result<String, C
         let mut stripped = String::with_capacity(raw.len() - (end_end - start_begin));
         stripped.push_str(&raw[..start_begin]);
         stripped.push_str(&raw[end_end..]);
-        return Ok(stripped);
+        return Ok(StrippedCodexTomlHookBlock {
+            raw: stripped,
+            complete_marker_pair: true,
+        });
     }
     let mut stripped =
         String::with_capacity(raw.len() - (start_end - start_begin) - (end_end - end_begin));
     stripped.push_str(&raw[..start_begin]);
     stripped.push_str(&raw[start_end..end_begin]);
     stripped.push_str(&raw[end_end..]);
-    Ok(stripped)
+    Ok(StrippedCodexTomlHookBlock {
+        raw: stripped,
+        complete_marker_pair: true,
+    })
 }
 
 fn plan_inline_codex_hooks(
@@ -4142,12 +4163,13 @@ fn plan_inline_codex_hooks(
     let document = parse_codex_notification_config(&notification.config.path, &raw)?;
     let stripped = strip_owned_codex_toml_hook_block(&notification.config.path, &raw)?;
     if action != SetupAction::Remove
-        && stripped != raw
+        && stripped.complete_marker_pair
+        && stripped.raw != raw
         && toml_codex_hooks_exactly_configured(&document)
     {
         return Ok(true);
     }
-    let mut document = parse_codex_notification_config(&notification.config.path, &stripped)?;
+    let mut document = parse_codex_notification_config(&notification.config.path, &stripped.raw)?;
     remove_owned_toml_hooks(&mut document);
     let mut rendered = document.to_string();
     if action != SetupAction::Remove {
@@ -7886,7 +7908,9 @@ mod tests {
             );
 
             assert_eq!(
-                strip_owned_codex_toml_hook_block(&path, &raw).expect("marker-shaped value"),
+                strip_owned_codex_toml_hook_block(&path, &raw)
+                    .expect("marker-shaped value")
+                    .raw,
                 raw
             );
         }
@@ -7899,7 +7923,9 @@ mod tests {
         for marker in [CODEX_HOOK_BLOCK_START, CODEX_HOOK_BLOCK_END] {
             let raw = format!("keep = true\n{marker}\n");
             assert_eq!(
-                strip_owned_codex_toml_hook_block(&path, &raw).expect("owned orphan marker"),
+                strip_owned_codex_toml_hook_block(&path, &raw)
+                    .expect("owned orphan marker")
+                    .raw,
                 "keep = true\n"
             );
         }
