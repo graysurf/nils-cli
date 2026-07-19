@@ -4079,7 +4079,11 @@ fn plan_inline_codex_hooks(
             None,
         )
     })?;
+    let document = parse_codex_notification_config(&notification.config.path, &raw)?;
     let stripped = strip_owned_codex_toml_hook_block(&notification.config.path, &raw)?;
+    if action != SetupAction::Remove && stripped != raw && toml_codex_hooks_configured(&document) {
+        return Ok(true);
+    }
     let mut document = parse_codex_notification_config(&notification.config.path, &stripped)?;
     remove_owned_toml_hooks(&mut document);
     let mut rendered = document.to_string();

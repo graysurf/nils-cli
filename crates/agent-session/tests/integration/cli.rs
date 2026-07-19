@@ -1674,6 +1674,79 @@ timeout = 20
 }
 
 #[test]
+fn codex_reordered_foreign_tables_inside_owned_marker_remain_steady() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let home = tmp.path().join("home");
+    fs::create_dir_all(home.join(".codex")).expect("codex dir");
+    let config_path = home.join(".codex/config.toml");
+    fs::write(
+        &config_path,
+        r#"[[hooks.PreToolUse]]
+
+[[hooks.PreToolUse.hooks]]
+type = "command"
+command = "runtime-kit-pre-tool"
+timeout = 5
+"#,
+    )
+    .expect("inline config");
+    let home_arg = home.to_string_lossy().to_string();
+    let envs = [("HOME", home_arg.as_str())];
+
+    let initial = run(
+        tmp.path(),
+        &[
+            "activity", "setup", "--agent", "codex", "--apply", "--format", "json",
+        ],
+        &envs,
+    );
+    assert_eq!(initial.code, 0, "stderr={}", initial.stderr_text());
+    assert_eq!(
+        data(&initial.stdout_json())["hook_representation"],
+        "inline_toml"
+    );
+
+    let converged = fs::read_to_string(&config_path).expect("converged config");
+    let reordered = converged.replacen(
+        "[[hooks.Stop]]",
+        r#"[projects."/foreign/project"]
+trust_level = "trusted"
+
+[[hooks.Stop]]"#,
+        1,
+    );
+    assert_ne!(reordered, converged, "expected a managed Stop hook");
+    fs::write(&config_path, &reordered).expect("Codex-reordered config");
+
+    let preview = run(
+        tmp.path(),
+        &[
+            "activity",
+            "setup",
+            "--agent",
+            "codex",
+            "--repair",
+            "--dry-run",
+            "--format",
+            "json",
+        ],
+        &envs,
+    );
+    assert_eq!(preview.code, 0, "stderr={}", preview.stderr_text());
+    let preview_json = preview.stdout_json();
+    let result = data(&preview_json);
+    assert_eq!(result["configured"], true);
+    assert_eq!(result["hook_representation"], "inline_toml");
+    assert_eq!(result["hook_migration"], "not_needed");
+    assert_eq!(result["would_change"], false);
+    assert_eq!(
+        fs::read_to_string(&config_path).expect("steady config"),
+        reordered,
+        "dry-run must preserve the Codex-reordered bytes"
+    );
+}
+
+#[test]
 fn codex_activity_setup_fails_closed_for_user_hooks_in_both_representations() {
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let home = tmp.path().join("home");
