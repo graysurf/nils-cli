@@ -8163,14 +8163,14 @@ mod tests {
         }
     }
 
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[cfg(target_os = "linux")]
     struct SupervisorFixture {
         child: Child,
         completion_channel: Option<std::os::unix::net::UnixStream>,
         reaped: bool,
     }
 
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[cfg(target_os = "linux")]
     impl SupervisorFixture {
         #[cfg(target_os = "linux")]
         fn id(&self) -> u32 {
@@ -8196,7 +8196,7 @@ mod tests {
         }
     }
 
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[cfg(target_os = "linux")]
     impl Drop for SupervisorFixture {
         fn drop(&mut self) {
             if self.reaped {
@@ -8295,7 +8295,7 @@ mod tests {
         )
     }
 
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[cfg(target_os = "linux")]
     fn spawn_authenticated_supervisor_fixture_with_timeout(
         scenario: &str,
         pid_path: &Path,
@@ -8309,7 +8309,7 @@ mod tests {
         )
     }
 
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[cfg(target_os = "linux")]
     fn spawn_authenticated_supervisor_fixture_with_timeout_and_delay(
         scenario: &str,
         pid_path: &Path,
@@ -11378,7 +11378,8 @@ mod tests {
         assert_process_absent(child_pid, "timed-out snapshot worker child");
     }
 
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    // macOS hosted runners cannot reliably start this real-supervisor kqueue fixture; see #1290.
+    #[cfg(target_os = "linux")]
     #[test]
     fn supervisor_ownership_eof_terminates_the_target_before_the_original_deadline() {
         let root = tempfile::TempDir::new().expect("ownership EOF root");
@@ -11418,7 +11419,8 @@ mod tests {
         assert_process_absent(pid, "target after supervisor ownership loss");
     }
 
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    // macOS hosted runners cannot reliably start this real-supervisor kqueue fixture; see #1290.
+    #[cfg(target_os = "linux")]
     #[test]
     fn supervisor_retains_the_original_absolute_deadline_after_spawn() {
         let root = tempfile::TempDir::new().expect("supervisor deadline root");
