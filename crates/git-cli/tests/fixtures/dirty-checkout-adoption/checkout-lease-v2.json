@@ -1,0 +1,23 @@
+{
+  "schema": "agent-runtime.checkout-lease.v2",
+  "session_key": "2222222222222222222222222222222222222222222222222222222222222222",
+  "checkout_instance": "cccccccccccccccccccccccccccccccc",
+  "checkout_root": "/workspace/agent-runtime-kit",
+  "checkout_git_dir": "/workspace/agent-runtime-kit/.git/worktrees/dirty-adoption",
+  "checkout_root_bytes": "2f776f726b73706163652f6167656e742d72756e74696d652d6b6974",
+  "checkout_git_dir_bytes": "2f776f726b73706163652f6167656e742d72756e74696d652d6b69742f2e6769742f776f726b74726565732f64697274792d61646f7074696f6e",
+  "acquired_at": 1700000100,
+  "refreshed_at": 1700000100,
+  "expires_at": 1700003700,
+  "adoption": {
+    "schema": "agent-runtime.dirty-checkout-adoption.v1",
+    "receipt_schema": "agent-runtime.dirty-checkout-receipt.v1",
+    "receipt_id": "4444444444444444444444444444444444444444444444444444444444444444",
+    "snapshot_id": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+    "authorization_turn_digest": "3333333333333333333333333333333333333333333333333333333333333333",
+    "reason_digest": "5555555555555555555555555555555555555555555555555555555555555555",
+    "adopted_at": 1700000100,
+    "challenge_issued_at": 1700000000,
+    "challenge_digest": "045675a9b69e383395fde11414945a3b7f466c0f133a54c604f7e87589600b5e"
+  }
+}

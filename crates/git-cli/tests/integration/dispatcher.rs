@@ -105,6 +105,21 @@ fn open_group_usage_prints_help_for_group() {
 }
 
 #[test]
+fn worktree_group_help_exposes_governed_dirty_commands() {
+    let harness = GitCliHarness::new();
+    let dir = tempfile::TempDir::new().expect("tempdir");
+
+    let output = harness.run(dir.path(), &["worktree", "--help"]);
+
+    assert_eq!(output.code, 0);
+    assert_eq!(output.stderr_text(), "");
+    let stdout = output.stdout_text();
+    assert_contains(&stdout, "dirty-snapshot");
+    assert_contains(&stdout, "adopt-dirty");
+    assert_contains(&stdout, "revoke-dirty");
+}
+
+#[test]
 fn unknown_command_prints_error_and_group_usage() {
     let harness = GitCliHarness::new();
     let dir = tempfile::TempDir::new().expect("tempdir");

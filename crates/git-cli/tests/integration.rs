@@ -13,6 +13,8 @@ mod commit;
 pub mod common;
 #[path = "integration/completion_outside_repo.rs"]
 mod completion_outside_repo;
+#[path = "integration/dirty_checkout_adoption.rs"]
+mod dirty_checkout_adoption;
 #[path = "integration/dispatcher.rs"]
 mod dispatcher;
 #[path = "integration/open.rs"]

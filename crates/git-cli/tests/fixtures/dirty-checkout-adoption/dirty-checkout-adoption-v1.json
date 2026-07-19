@@ -1,0 +1,11 @@
+{
+  "schema": "agent-runtime.dirty-checkout-adoption.v1",
+  "receipt_schema": "agent-runtime.dirty-checkout-receipt.v1",
+  "receipt_id": "4444444444444444444444444444444444444444444444444444444444444444",
+  "snapshot_id": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+  "authorization_turn_digest": "3333333333333333333333333333333333333333333333333333333333333333",
+  "reason_digest": "5555555555555555555555555555555555555555555555555555555555555555",
+  "adopted_at": 1700000100,
+  "challenge_issued_at": 1700000000,
+  "challenge_digest": "045675a9b69e383395fde11414945a3b7f466c0f133a54c604f7e87589600b5e"
+}

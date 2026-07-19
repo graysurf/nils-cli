@@ -154,12 +154,24 @@ struct WorktreeGroup {
 enum WorktreeCommand {
     #[command(about = "Create a managed agent worktree")]
     Add(RawArgs),
+    #[command(
+        name = "adopt-dirty",
+        about = "Adopt one challenged dirty checkout snapshot"
+    )]
+    AdoptDirty(RawArgs),
+    #[command(
+        name = "dirty-snapshot",
+        about = "Hash the current dirty checkout state"
+    )]
+    DirtySnapshot(RawArgs),
     #[command(about = "List git worktrees")]
     List(RawArgs),
     #[command(about = "Remove a managed worktree by slug or path")]
     Remove(RawArgs),
     #[command(about = "Prune stale git worktree metadata")]
     Prune(RawArgs),
+    #[command(name = "revoke-dirty", about = "Revoke a receipt-bound dirty adoption")]
+    RevokeDirty(RawArgs),
     #[command(about = "Resolve a worktree path to cd into")]
     Go(RawArgs),
     #[command(about = "Display help message for worktree")]
@@ -241,6 +253,12 @@ struct RawArgs {
 }
 
 pub fn run() -> i32 {
+    if let Some(status) = worktree::dirty_checkout_adoption::run_internal_process_supervisor() {
+        return status;
+    }
+    if let Some(status) = worktree::dirty_checkout_adoption::run_internal_snapshot_worker() {
+        return status;
+    }
     // Short-circuit `COMPLETE=<shell> git-cli ...` dynamic-completion requests
     // before the hand-rolled dispatch. No-op when `COMPLETE` is unset, so
     // ordinary invocations are unaffected.
@@ -336,6 +354,12 @@ fn run_worktree(group: WorktreeGroup) -> i32 {
         Some(WorktreeCommand::Add(raw)) => {
             worktree::dispatch("add", &raw.args).unwrap_or(exit::USAGE)
         }
+        Some(WorktreeCommand::AdoptDirty(raw)) => {
+            worktree::dispatch("adopt-dirty", &raw.args).unwrap_or(exit::USAGE)
+        }
+        Some(WorktreeCommand::DirtySnapshot(raw)) => {
+            worktree::dispatch("dirty-snapshot", &raw.args).unwrap_or(exit::USAGE)
+        }
         Some(WorktreeCommand::List(raw)) => {
             worktree::dispatch("list", &raw.args).unwrap_or(exit::USAGE)
         }
@@ -344,6 +368,9 @@ fn run_worktree(group: WorktreeGroup) -> i32 {
         }
         Some(WorktreeCommand::Prune(raw)) => {
             worktree::dispatch("prune", &raw.args).unwrap_or(exit::USAGE)
+        }
+        Some(WorktreeCommand::RevokeDirty(raw)) => {
+            worktree::dispatch("revoke-dirty", &raw.args).unwrap_or(exit::USAGE)
         }
         Some(WorktreeCommand::Go(raw)) => {
             worktree::dispatch("go", &raw.args).unwrap_or(exit::USAGE)

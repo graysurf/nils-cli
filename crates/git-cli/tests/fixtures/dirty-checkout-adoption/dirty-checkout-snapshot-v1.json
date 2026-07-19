@@ -1,0 +1,12 @@
+{
+  "schema": "agent-runtime.dirty-checkout-snapshot.v1",
+  "repository_key": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "checkout_key": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+  "checkout_instance": "cccccccccccccccccccccccccccccccc",
+  "snapshot_id": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+  "head_oid": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+  "branch_ref_digest": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+  "tracked_entries": 2,
+  "untracked_entries": 1,
+  "hashed_bytes": 4096
+}

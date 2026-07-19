@@ -1,0 +1,10 @@
+{
+  "schema": "agent-runtime.checkout-lease.v1",
+  "session_key": "2222222222222222222222222222222222222222222222222222222222222222",
+  "checkout_instance": "cccccccccccccccccccccccccccccccc",
+  "checkout_root": "/workspace/agent-runtime-kit",
+  "checkout_git_dir": "/workspace/agent-runtime-kit/.git/worktrees/dirty-adoption",
+  "acquired_at": 1699999000,
+  "refreshed_at": 1700000000,
+  "expires_at": 1700003600
+}

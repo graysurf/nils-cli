@@ -1,0 +1,14 @@
+{
+  "schema": "agent-runtime.dirty-checkout-challenge.v1",
+  "token_digest": "1111111111111111111111111111111111111111111111111111111111111111",
+  "session_key": "2222222222222222222222222222222222222222222222222222222222222222",
+  "repository_key": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "checkout_key": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+  "checkout_instance": "cccccccccccccccccccccccccccccccc",
+  "snapshot_id": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+  "head_oid": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+  "branch_ref_digest": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+  "authorization_turn_digest": "3333333333333333333333333333333333333333333333333333333333333333",
+  "issued_at": 1700000000,
+  "expires_at": 1700000300
+}
