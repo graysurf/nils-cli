@@ -24,16 +24,24 @@ pub const VALIDATED_CHECK: &str = "version-alignment.validated";
 pub const REQUIRED_CLI_CHECK: &str = "version-alignment.required-cli";
 pub const ACCEPTANCE_BOUNDARY: &str = "version-number gate only; does not diff surfaces between tags or query a registry for newer releases";
 
-/// Normalized version policy parsed from a schema-v1 or schema-v2 manifest.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Schema-v1 pin manifest retained as the stable public evaluation input.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct PinManifest {
     pub schema_version: u32,
-    pub nils_cli: NilsCliPolicy,
+    pub nils_cli: NilsCliPin,
+    #[serde(default)]
     pub required_clis: Vec<RequiredCli>,
 }
 
+/// Schema-v1 nils-cli pin retained for source compatibility with published
+/// `nils-agent-runtime` consumers.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct NilsCliPin {
+    pub pinned_tag: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum NilsCliPolicy {
+enum NilsCliPolicy {
     Exact {
         pinned_tag: String,
     },
@@ -43,6 +51,13 @@ pub enum NilsCliPolicy {
     },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct NormalizedPinManifest {
+    schema_version: u32,
+    nils_cli: NilsCliPolicy,
+    required_clis: Vec<RequiredCli>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct RequiredCli {
     pub bin: String,
@@ -50,7 +65,13 @@ pub struct RequiredCli {
 }
 
 #[derive(Debug, Deserialize)]
-struct RawPinManifest {
+struct SchemaHeader {
+    schema_version: u32,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawVersionPolicyManifest {
     schema_version: u32,
     nils_cli: RawNilsCliPolicy,
     #[serde(default)]
@@ -104,6 +125,27 @@ pub struct AlignmentItem {
 
 /// Classify host + required-CLI alignment. Pure; no process spawning or I/O.
 pub fn evaluate(inputs: &AlignmentInputs) -> VersionAlignmentReport {
+    let manifest = NormalizedPinManifest {
+        schema_version: inputs.manifest.schema_version,
+        nils_cli: NilsCliPolicy::Exact {
+            pinned_tag: inputs.manifest.nils_cli.pinned_tag.clone(),
+        },
+        required_clis: inputs.manifest.required_clis.clone(),
+    };
+    evaluate_normalized(&NormalizedAlignmentInputs {
+        manifest: &manifest,
+        host_raw: inputs.host_raw,
+        required_raw: inputs.required_raw,
+    })
+}
+
+struct NormalizedAlignmentInputs<'a> {
+    manifest: &'a NormalizedPinManifest,
+    host_raw: &'a str,
+    required_raw: &'a BTreeMap<String, String>,
+}
+
+fn evaluate_normalized(inputs: &NormalizedAlignmentInputs) -> VersionAlignmentReport {
     let manifest = inputs.manifest;
     let mut items = Vec::new();
     let mut findings = Vec::new();
@@ -216,6 +258,12 @@ pub fn evaluate(inputs: &AlignmentInputs) -> VersionAlignmentReport {
                 (Some(validated), Some(found)) if found == validated => (
                     DoctorSeverity::Ok,
                     format!("host {found} is the exact validated release {validated_tag}"),
+                ),
+                (Some(_), Some(found)) if minimum_severity == DoctorSeverity::Block => (
+                    DoctorSeverity::Ok,
+                    format!(
+                        "host {found} is below validated {validated_tag}; compatibility admission is blocked by the minimum check"
+                    ),
                 ),
                 (Some(_), Some(found)) => (
                     DoctorSeverity::Ok,
@@ -351,7 +399,8 @@ pub enum VersionAlignmentError {
 
 /// Read + parse the pin manifest (YAML or JSON), gather `<bin> --version`
 /// for each `required_clis[]` entry from PATH, then classify alignment of
-/// `host_version` and those binaries via [`evaluate`].
+/// `host_version` and those binaries. Schema v1 routes through the stable
+/// public [`evaluate`] contract; schema v2 uses a private normalized policy.
 pub fn check(
     pin_path: &Path,
     host_version: &str,
@@ -365,91 +414,98 @@ pub fn check(
         path: pin_path.to_path_buf(),
         source,
     })?;
-    let raw_manifest: RawPinManifest =
+    let header: SchemaHeader =
         serde_yaml_ng::from_str(&raw).map_err(|source| VersionAlignmentError::Parse {
             path: pin_path.to_path_buf(),
             source,
         })?;
-    if ![PIN_SCHEMA_VERSION, VERSION_POLICY_SCHEMA_VERSION].contains(&raw_manifest.schema_version) {
-        return Err(VersionAlignmentError::SchemaVersion {
+    match header.schema_version {
+        PIN_SCHEMA_VERSION => {
+            let manifest: PinManifest =
+                serde_yaml_ng::from_str(&raw).map_err(|source| VersionAlignmentError::Parse {
+                    path: pin_path.to_path_buf(),
+                    source,
+                })?;
+            let required_raw = probe_required_clis(&manifest.required_clis);
+            Ok(evaluate(&AlignmentInputs {
+                manifest: &manifest,
+                host_raw: host_version,
+                required_raw: &required_raw,
+            }))
+        }
+        VERSION_POLICY_SCHEMA_VERSION => {
+            let raw_manifest: RawVersionPolicyManifest =
+                serde_yaml_ng::from_str(&raw).map_err(|source| VersionAlignmentError::Parse {
+                    path: pin_path.to_path_buf(),
+                    source,
+                })?;
+            let manifest = normalize_version_policy(raw_manifest, pin_path)?;
+            let required_raw = probe_required_clis(&manifest.required_clis);
+            Ok(evaluate_normalized(&NormalizedAlignmentInputs {
+                manifest: &manifest,
+                host_raw: host_version,
+                required_raw: &required_raw,
+            }))
+        }
+        found => Err(VersionAlignmentError::SchemaVersion {
             path: pin_path.to_path_buf(),
             expected: "1, 2",
-            found: raw_manifest.schema_version,
-        });
+            found,
+        }),
     }
-    let manifest = normalize_manifest(raw_manifest, pin_path)?;
-
-    let mut required_raw = BTreeMap::new();
-    for cli in &manifest.required_clis {
-        let raw = super::version::run_probe_command(&format!("{} --version", cli.bin));
-        required_raw.insert(cli.bin.clone(), raw);
-    }
-
-    Ok(evaluate(&AlignmentInputs {
-        manifest: &manifest,
-        host_raw: host_version,
-        required_raw: &required_raw,
-    }))
 }
 
-fn normalize_manifest(
-    raw: RawPinManifest,
+fn probe_required_clis(required_clis: &[RequiredCli]) -> BTreeMap<String, String> {
+    required_clis
+        .iter()
+        .map(|cli| {
+            let raw = super::version::run_probe_command(&format!("{} --version", cli.bin));
+            (cli.bin.clone(), raw)
+        })
+        .collect()
+}
+
+fn normalize_version_policy(
+    raw: RawVersionPolicyManifest,
     path: &Path,
-) -> Result<PinManifest, VersionAlignmentError> {
+) -> Result<NormalizedPinManifest, VersionAlignmentError> {
     let invalid = |message: String| VersionAlignmentError::InvalidPolicy {
         path: path.to_path_buf(),
         message,
     };
     validate_required_clis(&raw.required_clis).map_err(&invalid)?;
 
-    let nils_cli = match raw.schema_version {
-        PIN_SCHEMA_VERSION => {
-            if raw.nils_cli.minimum_supported_tag.is_some() || raw.nils_cli.validated_tag.is_some()
-            {
-                return Err(invalid(
-                    "schema v1 accepts only nils_cli.pinned_tag".to_string(),
-                ));
-            }
-            let pinned_tag = raw
-                .nils_cli
-                .pinned_tag
-                .ok_or_else(|| invalid("schema v1 requires nils_cli.pinned_tag".to_string()))?;
-            NilsCliPolicy::Exact { pinned_tag }
-        }
-        VERSION_POLICY_SCHEMA_VERSION => {
-            if raw.nils_cli.pinned_tag.is_some() {
-                return Err(invalid(
-                    "schema v2 replaces nils_cli.pinned_tag with minimum_supported_tag and validated_tag"
-                        .to_string(),
-                ));
-            }
-            let minimum_supported_tag = raw.nils_cli.minimum_supported_tag.ok_or_else(|| {
-                invalid("schema v2 requires nils_cli.minimum_supported_tag".to_string())
-            })?;
-            let validated_tag = raw
-                .nils_cli
-                .validated_tag
-                .ok_or_else(|| invalid("schema v2 requires nils_cli.validated_tag".to_string()))?;
-            let minimum = parse_stable_tag("minimum_supported_tag", &minimum_supported_tag)
-                .map_err(&invalid)?;
-            let validated = parse_stable_tag("validated_tag", &validated_tag).map_err(&invalid)?;
-            if minimum > validated {
-                return Err(invalid(format!(
-                    "minimum_supported_tag {minimum_supported_tag} must not exceed validated_tag {validated_tag}"
-                )));
-            }
-            validate_release_digests(raw.nils_cli.release_sha256.as_ref()).map_err(&invalid)?;
-            NilsCliPolicy::Compatibility {
-                minimum_supported_tag,
-                validated_tag,
-            }
-        }
-        _ => unreachable!("schema version checked before normalization"),
-    };
+    debug_assert_eq!(raw.schema_version, VERSION_POLICY_SCHEMA_VERSION);
+    if raw.nils_cli.pinned_tag.is_some() {
+        return Err(invalid(
+            "schema v2 replaces nils_cli.pinned_tag with minimum_supported_tag and validated_tag"
+                .to_string(),
+        ));
+    }
+    let minimum_supported_tag = raw
+        .nils_cli
+        .minimum_supported_tag
+        .ok_or_else(|| invalid("schema v2 requires nils_cli.minimum_supported_tag".to_string()))?;
+    let validated_tag = raw
+        .nils_cli
+        .validated_tag
+        .ok_or_else(|| invalid("schema v2 requires nils_cli.validated_tag".to_string()))?;
+    let minimum =
+        parse_stable_tag("minimum_supported_tag", &minimum_supported_tag).map_err(&invalid)?;
+    let validated = parse_stable_tag("validated_tag", &validated_tag).map_err(&invalid)?;
+    if minimum > validated {
+        return Err(invalid(format!(
+            "minimum_supported_tag {minimum_supported_tag} must not exceed validated_tag {validated_tag}"
+        )));
+    }
+    validate_release_digests(raw.nils_cli.release_sha256.as_ref()).map_err(&invalid)?;
 
-    Ok(PinManifest {
+    Ok(NormalizedPinManifest {
         schema_version: raw.schema_version,
-        nils_cli,
+        nils_cli: NilsCliPolicy::Compatibility {
+            minimum_supported_tag,
+            validated_tag,
+        },
         required_clis: raw.required_clis,
     })
 }
@@ -532,7 +588,7 @@ mod tests {
     fn manifest(pinned: &str, required: &[(&str, &str)]) -> PinManifest {
         PinManifest {
             schema_version: PIN_SCHEMA_VERSION,
-            nils_cli: NilsCliPolicy::Exact {
+            nils_cli: NilsCliPin {
                 pinned_tag: pinned.to_string(),
             },
             required_clis: required
@@ -549,8 +605,8 @@ mod tests {
         minimum_supported_tag: &str,
         validated_tag: &str,
         required: &[(&str, &str)],
-    ) -> PinManifest {
-        PinManifest {
+    ) -> NormalizedPinManifest {
+        NormalizedPinManifest {
             schema_version: VERSION_POLICY_SCHEMA_VERSION,
             nils_cli: NilsCliPolicy::Compatibility {
                 minimum_supported_tag: minimum_supported_tag.to_string(),
@@ -572,6 +628,22 @@ mod tests {
             .map(|(bin, raw)| (bin.to_string(), raw.to_string()))
             .collect();
         evaluate(&AlignmentInputs {
+            manifest: m,
+            host_raw,
+            required_raw: &required_raw,
+        })
+    }
+
+    fn eval_compatibility(
+        m: &NormalizedPinManifest,
+        host_raw: &str,
+        reqs: &[(&str, &str)],
+    ) -> VersionAlignmentReport {
+        let required_raw: BTreeMap<String, String> = reqs
+            .iter()
+            .map(|(bin, raw)| (bin.to_string(), raw.to_string()))
+            .collect();
+        evaluate_normalized(&NormalizedAlignmentInputs {
             manifest: m,
             host_raw,
             required_raw: &required_raw,
@@ -621,7 +693,7 @@ mod tests {
     #[test]
     fn compatibility_host_ahead_warns_without_blocking() {
         let m = compatibility_manifest("v1.20.0", "v1.24.3", &[]);
-        let report = eval(&m, "agent-runtime 1.24.4 (v1.24.4)", &[]);
+        let report = eval_compatibility(&m, "agent-runtime 1.24.4 (v1.24.4)", &[]);
         assert_eq!(report.items.len(), 2);
         assert_eq!(report.items[0].check, MINIMUM_CHECK);
         assert_eq!(report.items[0].severity, DoctorSeverity::Ok);
@@ -634,7 +706,7 @@ mod tests {
     #[test]
     fn compatibility_host_between_minimum_and_validated_is_ok() {
         let m = compatibility_manifest("v1.20.0", "v1.24.3", &[]);
-        let report = eval(&m, "agent-runtime 1.22.0", &[]);
+        let report = eval_compatibility(&m, "agent-runtime 1.22.0", &[]);
         assert!(
             report
                 .items
@@ -649,7 +721,7 @@ mod tests {
     #[test]
     fn compatibility_host_below_minimum_blocks() {
         let m = compatibility_manifest("v1.20.0", "v1.24.3", &[]);
-        let report = eval(&m, "agent-runtime 1.19.9", &[]);
+        let report = eval_compatibility(&m, "agent-runtime 1.19.9", &[]);
         assert_eq!(report.items[0].check, MINIMUM_CHECK);
         assert_eq!(report.items[0].severity, DoctorSeverity::Block);
         assert_eq!(report.findings.len(), 1);

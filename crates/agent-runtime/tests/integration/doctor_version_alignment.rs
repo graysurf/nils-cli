@@ -1,8 +1,12 @@
 //! Integration coverage for `agent-runtime doctor --class version-alignment`.
 
+use agent_runtime::doctor::version_alignment::{
+    AlignmentInputs, NilsCliPin, PinManifest, evaluate,
+};
 use nils_test_support::bin;
 use nils_test_support::cmd::{self, CmdOutput};
 use serde_json::Value;
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use tempfile::TempDir;
@@ -48,6 +52,24 @@ fn pin_manifest(pinned_tag: &str, required: &[(&str, &str)]) -> String {
         }
     }
     body
+}
+
+#[test]
+fn version_alignment_legacy_public_input_api_remains_constructible() {
+    let manifest = PinManifest {
+        schema_version: 1,
+        nils_cli: NilsCliPin {
+            pinned_tag: "v1.2.3".to_string(),
+        },
+        required_clis: vec![],
+    };
+    let required_raw = BTreeMap::new();
+
+    let _ = evaluate(&AlignmentInputs {
+        manifest: &manifest,
+        host_raw: "1.2.3",
+        required_raw: &required_raw,
+    });
 }
 
 fn version_policy_manifest(
@@ -176,6 +198,62 @@ fn version_alignment_missing_required_cli_blocks() {
 }
 
 #[test]
+fn version_alignment_schema_v1_keeps_prefixed_required_cli_floor() {
+    let mmp = host_mmp();
+    let tmp = TempDir::new().unwrap();
+    let pin = write_pin(
+        &tmp,
+        &pin_manifest(&format!("v{mmp}"), &[("plan-issue", "v0.0.0")]),
+    );
+
+    let output = run(&[
+        "doctor",
+        "--class",
+        "version-alignment",
+        "--pin",
+        &pin,
+        "--format",
+        "json",
+    ]);
+
+    assert_eq!(
+        output.code,
+        0,
+        "schema-v1 prefixed floor was previously accepted: {}",
+        output.stderr_text()
+    );
+}
+
+#[test]
+fn version_alignment_schema_v1_keeps_ignoring_additive_nils_cli_fields() {
+    let mmp = host_mmp();
+    let tmp = TempDir::new().unwrap();
+    let pin = write_pin(
+        &tmp,
+        &format!(
+            "schema_version: 1\nnils_cli:\n  pinned_tag: \"v{mmp}\"\n  future_note: ignored-by-v1\n"
+        ),
+    );
+
+    let output = run(&[
+        "doctor",
+        "--class",
+        "version-alignment",
+        "--pin",
+        &pin,
+        "--format",
+        "json",
+    ]);
+
+    assert_eq!(
+        output.code,
+        0,
+        "schema-v1 ignored additive nested fields before schema v2: {}",
+        output.stderr_text()
+    );
+}
+
+#[test]
 fn version_alignment_schema_mismatch_errors() {
     let tmp = TempDir::new().unwrap();
     let pin = write_pin(
@@ -294,6 +372,15 @@ fn version_alignment_schema_v2_below_minimum_blocks() {
     assert!(json["findings"].as_array().unwrap().iter().any(|finding| {
         finding["check"] == "version-alignment.minimum" && finding["severity"] == "block"
     }));
+    assert!(
+        json["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|finding| finding["message"].as_str())
+            .all(|message| !message.contains("within the supported range")),
+        "below-minimum output must not claim compatibility admission: {json}"
+    );
 }
 
 #[test]
@@ -382,6 +469,80 @@ fn version_alignment_schema_v2_requires_validated_release_digests() {
     assert!(
         output.stderr_text().contains("release_sha256"),
         "stderr should name validated-release digest ownership: {}",
+        output.stderr_text()
+    );
+}
+
+#[test]
+fn version_alignment_schema_v2_rejects_missing_or_malformed_release_digests() {
+    let cases = [
+        (
+            "missing-arm64",
+            "linux_amd64: \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"",
+            "linux_arm64",
+        ),
+        (
+            "short-amd64",
+            "linux_amd64: \"abcd\"\n    linux_arm64: \"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"",
+            "linux_amd64",
+        ),
+        (
+            "non-hex-arm64",
+            "linux_amd64: \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"\n    linux_arm64: \"gggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggg\"",
+            "linux_arm64",
+        ),
+    ];
+
+    for (name, digests, expected_field) in cases {
+        let tmp = TempDir::new().unwrap();
+        let pin = write_pin(
+            &tmp,
+            &format!(
+                "schema_version: 2\nnils_cli:\n  minimum_supported_tag: \"v1.2.3\"\n  validated_tag: \"v1.2.3\"\n  release_sha256:\n    {digests}\n"
+            ),
+        );
+        let output = run(&["doctor", "--class", "version-alignment", "--pin", &pin]);
+
+        assert_ne!(output.code, 0, "{name} should fail closed");
+        assert!(
+            output.stderr_text().contains(expected_field),
+            "{name} should identify {expected_field}: {}",
+            output.stderr_text()
+        );
+    }
+}
+
+#[test]
+fn version_alignment_schema_v2_rejects_unsafe_required_cli_names() {
+    for bin in ["", "bad name", "../plan-issue"] {
+        let tmp = TempDir::new().unwrap();
+        let body = version_policy_manifest("v1.2.3", "v1.2.3", &[(bin, "1.0.0")]);
+        let pin = write_pin(&tmp, &body);
+        let output = run(&["doctor", "--class", "version-alignment", "--pin", &pin]);
+
+        assert_ne!(output.code, 0, "unsafe executable name `{bin}` should fail");
+        assert!(
+            output.stderr_text().contains("non-empty executable name"),
+            "stderr should identify unsafe executable name `{bin}`: {}",
+            output.stderr_text()
+        );
+    }
+}
+
+#[test]
+fn version_alignment_schema_v2_rejects_unknown_top_level_fields() {
+    let tmp = TempDir::new().unwrap();
+    let pin = write_pin(
+        &tmp,
+        "schema_version: 2\nnils_cli:\n  minimum_supported_tag: \"v1.2.3\"\n  validated_tag: \"v1.2.3\"\n  release_sha256:\n    linux_amd64: \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"\n    linux_arm64: \"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"\nrequired_cli:\n  - bin: missing-tool\n    min: \"999.0.0\"\n",
+    );
+
+    let output = run(&["doctor", "--class", "version-alignment", "--pin", &pin]);
+
+    assert_ne!(output.code, 0, "unknown required_cli typo must fail closed");
+    assert!(
+        output.stderr_text().contains("required_cli"),
+        "stderr should identify the unknown field: {}",
         output.stderr_text()
     );
 }
