@@ -281,7 +281,9 @@ pub struct WorkContextShowArgs {
 #[derive(Debug, Args)]
 pub struct WorkContextCheckArgs {
     #[arg(long)]
-    pub session: String,
+    pub session: Option<String>,
+    #[arg(long = "self")]
+    pub self_selector: bool,
     #[arg(long, value_name = "PATH", value_hint = ValueHint::FilePath)]
     pub capability_file: Option<PathBuf>,
     #[arg(long, value_name = "PATH", value_hint = ValueHint::FilePath)]

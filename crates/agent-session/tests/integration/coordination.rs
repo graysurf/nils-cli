@@ -148,7 +148,7 @@ fn candidate(path: &Path, prefix: &str, summary: &str) {
             "scopes": [{
                 "kind": "path-prefix",
                 "repository": "example/repository",
-                "value": prefix
+                "value": prefix.trim_end_matches('/')
             }],
             "summary": summary
         }))
@@ -995,7 +995,7 @@ fn coordination_review_recovery_rejects_a_healthy_exact_broker() {
 }
 
 #[test]
-fn coordination_review_target_exit_revokes_copied_capability() {
+fn coordination_review_target_exit_revokes_copied_capability_without_hiding_public_status() {
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let state_dir = tmp.path().join("state");
     fs::create_dir(&state_dir).expect("state");
@@ -1029,11 +1029,8 @@ fn coordination_review_target_exit_revokes_copied_capability() {
             "json",
         ],
     );
-    assert_ne!(status.code, 0);
-    assert_eq!(
-        status.stdout_json()["error"]["code"],
-        "coordination-unauthorized"
-    );
+    assert_eq!(status.code, 0, "stderr={}", status.stderr_text());
+    assert_eq!(data(&status)["capability_available"], false);
 }
 
 #[test]
@@ -1356,4 +1353,528 @@ fn coordination_review_round2_reply_revalidates_parent_revision_in_final_transac
         replied.stdout_json()["error"]["code"],
         "message-revision-conflict"
     );
+}
+
+#[test]
+fn coordination_review_round3_frozen_v1_scope_grammar_and_limits_are_exact() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let state_dir = tmp.path().join("state");
+    fs::create_dir(&state_dir).expect("state");
+    seed_brokers(
+        &state_dir,
+        &[
+            ("alpha", "inc-alpha", "alpha-private-capability-material"),
+            ("beta", "inc-beta", "beta-private-capability-material"),
+            ("gamma", "inc-gamma", "gamma-private-capability-material"),
+        ],
+    );
+    let write_context = |path: &Path, repositories: Vec<String>, scopes: serde_json::Value| {
+        fs::write(
+            path,
+            serde_json::to_vec_pretty(&json!({
+                "schema_version": "agent-session.work-context-input.v1",
+                "intent": "implementation",
+                "tier": "L2",
+                "repositories": repositories,
+                "worktrees": [],
+                "provider_refs": [],
+                "plan_refs": [],
+                "scopes": scopes,
+                "summary": "round three frozen contract"
+            }))
+            .expect("context json"),
+        )
+        .expect("write context");
+    };
+    let capability_scope = tmp.path().join("capability.json");
+    write_context(
+        &capability_scope,
+        vec!["example/repository".to_string()],
+        json!([{"kind":"capability","repository":"example/repository","value":"deploy"}]),
+    );
+    let too_many = tmp.path().join("too-many.json");
+    write_context(
+        &too_many,
+        (0..9)
+            .map(|index| format!("example/repository-{index}"))
+            .collect(),
+        json!([]),
+    );
+    let glob = tmp.path().join("glob.json");
+    write_context(
+        &glob,
+        vec!["example/repository".to_string()],
+        json!([{"kind":"path-exact","repository":"example/repository","value":"src/*.rs"}]),
+    );
+    let attempt = |session: &str, file: &Path, key: &str| {
+        run(
+            tmp.path(),
+            &[
+                "--state-dir",
+                state_dir.to_str().expect("state"),
+                "work-context",
+                "claim",
+                "--session",
+                session,
+                "--file",
+                file.to_str().expect("context"),
+                "--capability-file",
+                &capability(&state_dir, session),
+                "--idempotency-key",
+                key,
+                "--format",
+                "json",
+            ],
+        )
+    };
+    let results = [
+        attempt("alpha", &capability_scope, "round3-scope-capability-0001"),
+        attempt("beta", &too_many, "round3-scope-limits-0001"),
+        attempt("gamma", &glob, "round3-scope-glob-0001"),
+    ];
+    assert!(results.iter().all(|output| output.code != 0));
+    assert_eq!(
+        results[0].stdout_json()["error"]["code"],
+        "invalid-work-context"
+    );
+    assert_eq!(
+        results[1].stdout_json()["error"]["code"],
+        "invalid-work-context"
+    );
+    assert_eq!(results[2].stdout_json()["error"]["code"], "invalid-scope");
+}
+
+#[test]
+fn coordination_review_round3_public_check_selectors_do_not_suppress_candidates() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let state_dir = tmp.path().join("state");
+    fs::create_dir(&state_dir).expect("state");
+    seed_brokers(
+        &state_dir,
+        &[("alpha", "inc-alpha", "alpha-private-capability-material")],
+    );
+    let context_file = tmp.path().join("context.json");
+    candidate(&context_file, "src", "public context");
+    let claimed = run(
+        tmp.path(),
+        &[
+            "--state-dir",
+            state_dir.to_str().expect("state"),
+            "work-context",
+            "claim",
+            "--session",
+            "alpha",
+            "--file",
+            context_file.to_str().expect("context"),
+            "--capability-file",
+            &capability(&state_dir, "alpha"),
+            "--idempotency-key",
+            "round3-public-claim-0001",
+            "--format",
+            "json",
+        ],
+    );
+    assert_eq!(claimed.code, 0, "stderr={}", claimed.stderr_text());
+    let shown = run(
+        tmp.path(),
+        &[
+            "--state-dir",
+            state_dir.to_str().expect("state"),
+            "work-context",
+            "show",
+            "--session",
+            "alpha",
+            "--format",
+            "json",
+        ],
+    );
+    let candidate_check = run(
+        tmp.path(),
+        &[
+            "--state-dir",
+            state_dir.to_str().expect("state"),
+            "work-context",
+            "check",
+            "--candidate",
+            context_file.to_str().expect("context"),
+            "--format",
+            "json",
+        ],
+    );
+    let selected_check = run(
+        tmp.path(),
+        &[
+            "--state-dir",
+            state_dir.to_str().expect("state"),
+            "work-context",
+            "check",
+            "--session",
+            "alpha",
+            "--format",
+            "json",
+        ],
+    );
+    assert_eq!(shown.code, 0, "stderr={}", shown.stderr_text());
+    assert_eq!(
+        candidate_check.code,
+        0,
+        "stderr={}",
+        candidate_check.stderr_text()
+    );
+    assert_eq!(
+        data(&candidate_check)["classification"],
+        "conflict",
+        "candidate must compare against every persisted record"
+    );
+    assert_eq!(
+        selected_check.code,
+        0,
+        "stderr={}",
+        selected_check.stderr_text()
+    );
+    assert_eq!(data(&selected_check)["classification"], "clear");
+}
+
+#[test]
+fn coordination_review_round3_idempotency_keys_are_principal_scoped() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let state_dir = tmp.path().join("state");
+    fs::create_dir(&state_dir).expect("state");
+    seed_brokers(
+        &state_dir,
+        &[
+            ("alpha", "inc-alpha", "alpha-private-capability-material"),
+            ("beta", "inc-beta", "beta-private-capability-material"),
+        ],
+    );
+    rewrite_registry(&state_dir, |_| {});
+    let beta_record_path = state_dir.join("sessions/beta/session.json");
+    let mut beta_record: serde_json::Value =
+        serde_json::from_slice(&fs::read(&beta_record_path).expect("beta record")).expect("json");
+    beta_record["cwd"] = json!("/fixture/repository-beta");
+    fs::write(
+        &beta_record_path,
+        serde_json::to_vec_pretty(&beta_record).expect("json"),
+    )
+    .expect("write beta");
+    fs::set_permissions(&beta_record_path, fs::Permissions::from_mode(0o600)).expect("mode");
+    let write_context = |path: &Path, repository: &str| {
+        fs::write(
+            path,
+            serde_json::to_vec_pretty(&json!({
+                "schema_version": "agent-session.work-context-input.v1",
+                "intent": "implementation",
+                "tier": "L2",
+                "repositories": [repository],
+                "worktrees": [],
+                "provider_refs": [],
+                "plan_refs": [],
+                "scopes": [{"kind":"path-prefix","repository":repository,"value":"src"}],
+                "summary": repository
+            }))
+            .expect("context"),
+        )
+        .expect("write context");
+    };
+    let alpha_file = tmp.path().join("alpha.json");
+    let beta_file = tmp.path().join("beta.json");
+    write_context(&alpha_file, "example/alpha");
+    write_context(&beta_file, "example/beta");
+    for (session, file) in [("alpha", alpha_file), ("beta", beta_file)] {
+        let output = run(
+            tmp.path(),
+            &[
+                "--state-dir",
+                state_dir.to_str().expect("state"),
+                "work-context",
+                "claim",
+                "--session",
+                session,
+                "--file",
+                file.to_str().expect("context"),
+                "--capability-file",
+                &capability(&state_dir, session),
+                "--idempotency-key",
+                "round3-shared-idempotency-key",
+                "--format",
+                "json",
+            ],
+        );
+        assert_eq!(
+            output.code,
+            0,
+            "session={session} stderr={}",
+            output.stderr_text()
+        );
+    }
+}
+
+#[test]
+fn coordination_review_round3_reply_binding_and_revision_are_in_the_receipt() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let state_dir = tmp.path().join("state");
+    fs::create_dir(&state_dir).expect("state");
+    seed_brokers(
+        &state_dir,
+        &[
+            ("alpha", "inc-alpha", "alpha-private-capability-material"),
+            ("beta", "inc-beta", "beta-private-capability-material"),
+            ("gamma", "inc-gamma", "gamma-private-capability-material"),
+        ],
+    );
+    let body = tmp.path().join("body.txt");
+    fs::write(&body, "body").expect("body");
+    let sent = run(
+        tmp.path(),
+        &[
+            "--state-dir",
+            state_dir.to_str().expect("state"),
+            "message",
+            "send",
+            "--from",
+            "alpha",
+            "--to",
+            "beta",
+            "--body-file",
+            body.to_str().expect("body"),
+            "--capability-file",
+            &capability(&state_dir, "alpha"),
+            "--idempotency-key",
+            "round3-parent-send-0001",
+            "--format",
+            "json",
+        ],
+    );
+    assert_eq!(sent.code, 0, "stderr={}", sent.stderr_text());
+    let parent = data(&sent)["message_id"].as_str().expect("id").to_string();
+    let forged = run(
+        tmp.path(),
+        &[
+            "--state-dir",
+            state_dir.to_str().expect("state"),
+            "message",
+            "send",
+            "--from",
+            "beta",
+            "--to",
+            "gamma",
+            "--reply-to",
+            &parent,
+            "--body-file",
+            body.to_str().expect("body"),
+            "--capability-file",
+            &capability(&state_dir, "beta"),
+            "--idempotency-key",
+            "round3-forged-reply-0001",
+            "--format",
+            "json",
+        ],
+    );
+    assert_ne!(forged.code, 0);
+    let first_reply = run(
+        tmp.path(),
+        &[
+            "--state-dir",
+            state_dir.to_str().expect("state"),
+            "message",
+            "reply",
+            "--session",
+            "beta",
+            "--message",
+            &parent,
+            "--if-revision",
+            "1",
+            "--body-file",
+            body.to_str().expect("body"),
+            "--capability-file",
+            &capability(&state_dir, "beta"),
+            "--idempotency-key",
+            "round3-reply-cas-0001",
+            "--format",
+            "json",
+        ],
+    );
+    assert_eq!(first_reply.code, 0, "stderr={}", first_reply.stderr_text());
+    let changed_revision = run(
+        tmp.path(),
+        &[
+            "--state-dir",
+            state_dir.to_str().expect("state"),
+            "message",
+            "reply",
+            "--session",
+            "beta",
+            "--message",
+            &parent,
+            "--if-revision",
+            "2",
+            "--body-file",
+            body.to_str().expect("body"),
+            "--capability-file",
+            &capability(&state_dir, "beta"),
+            "--idempotency-key",
+            "round3-reply-cas-0001",
+            "--format",
+            "json",
+        ],
+    );
+    assert_ne!(changed_revision.code, 0);
+    assert_eq!(
+        changed_revision.stdout_json()["error"]["code"],
+        "idempotency-key-reused"
+    );
+}
+
+#[test]
+fn coordination_review_round3_mailbox_burst_and_cursor_are_bounded() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let state_dir = tmp.path().join("state");
+    fs::create_dir(&state_dir).expect("state");
+    seed_brokers(
+        &state_dir,
+        &[
+            ("alpha", "inc-alpha", "alpha-private-capability-material"),
+            ("beta", "inc-beta", "beta-private-capability-material"),
+        ],
+    );
+    let body = tmp.path().join("body.txt");
+    fs::write(&body, "body").expect("body");
+    let mut sent_ids = Vec::new();
+    let mut eleventh = None;
+    for index in 0..11 {
+        let key = format!("round3-burst-{index:04}");
+        let output = run(
+            tmp.path(),
+            &[
+                "--state-dir",
+                state_dir.to_str().expect("state"),
+                "message",
+                "send",
+                "--from",
+                "alpha",
+                "--to",
+                "beta",
+                "--body-file",
+                body.to_str().expect("body"),
+                "--capability-file",
+                &capability(&state_dir, "alpha"),
+                "--idempotency-key",
+                &key,
+                "--format",
+                "json",
+            ],
+        );
+        if index < 10 {
+            assert_eq!(
+                output.code,
+                0,
+                "index={index} stderr={}",
+                output.stderr_text()
+            );
+            sent_ids.push(
+                data(&output)["message_id"]
+                    .as_str()
+                    .expect("id")
+                    .to_string(),
+            );
+        } else {
+            eleventh = Some(output);
+        }
+    }
+    let eleventh = eleventh.expect("eleventh");
+    assert_ne!(eleventh.code, 0);
+    assert_eq!(eleventh.stdout_json()["error"]["code"], "rate-limited");
+    let inbox = run(
+        tmp.path(),
+        &[
+            "--state-dir",
+            state_dir.to_str().expect("state"),
+            "message",
+            "inbox",
+            "--session",
+            "beta",
+            "--capability-file",
+            &capability(&state_dir, "beta"),
+            "--limit",
+            "1",
+            "--format",
+            "json",
+        ],
+    );
+    assert_eq!(inbox.code, 0, "stderr={}", inbox.stderr_text());
+    let inbox_data = data(&inbox);
+    let cursor = inbox_data["next_cursor"].as_str().expect("cursor");
+    assert!(!sent_ids.iter().any(|message_id| message_id == cursor));
+}
+
+#[test]
+fn coordination_review_round4_completion_can_close_an_uncertain_lease() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let state_dir = tmp.path().join("state");
+    fs::create_dir(&state_dir).expect("state");
+    seed_brokers(
+        &state_dir,
+        &[("alpha", "inc-alpha", "alpha-private-capability-material")],
+    );
+    let execution_token = tmp.path().join("execution-token");
+    fs::write(&execution_token, "round-four-execution-token").expect("token");
+    fs::set_permissions(&execution_token, fs::Permissions::from_mode(0o600)).expect("token mode");
+    let registry_path = state_dir.join("coordination/registry.json");
+    let mut registry: serde_json::Value =
+        serde_json::from_slice(&fs::read(&registry_path).expect("registry")).expect("json");
+    registry["operations"]
+        .as_array_mut()
+        .expect("operations")
+        .push(json!({
+            "schema_version": "agent-session.operation-lease.v1",
+            "lease_id": "round-four-lease",
+            "session_id": "alpha",
+            "session_incarnation": "inc-alpha",
+            "claim_id": "round-four-claim",
+            "claim_revision": 1,
+            "operation": "edit",
+            "targets": [{"kind":"path-exact","repository":"example/repository","value":"src/lib.rs"}],
+            "state": "completing",
+            "revision": 2,
+            "started_at": "2030-01-01T00:00:00Z",
+            "expires_at": "2030-01-01T00:30:00Z",
+            "expires_at_epoch": i64::MAX,
+            "execution_token_digest": digest("round-four-execution-token"),
+            "activity_revision": 1,
+            "runtime_identity_digest": "runtime"
+        }));
+    fs::write(
+        &registry_path,
+        serde_json::to_vec_pretty(&registry).expect("registry json"),
+    )
+    .expect("write registry");
+    fs::set_permissions(&registry_path, fs::Permissions::from_mode(0o600)).expect("registry mode");
+
+    let completed = run(
+        tmp.path(),
+        &[
+            "--state-dir",
+            state_dir.to_str().expect("state"),
+            "work-context",
+            "complete",
+            "--session",
+            "alpha",
+            "--lease",
+            "round-four-lease",
+            "--if-revision",
+            "2",
+            "--execution-token-file",
+            execution_token.to_str().expect("token"),
+            "--outcome",
+            "pass",
+            "--capability-file",
+            &capability(&state_dir, "alpha"),
+            "--idempotency-key",
+            "round4-complete-0001",
+            "--format",
+            "json",
+        ],
+    );
+    assert_eq!(completed.code, 0, "stderr={}", completed.stderr_text());
+    assert_eq!(data(&completed)["state"], "completed");
 }

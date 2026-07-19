@@ -46,6 +46,7 @@ pub(crate) struct Registry {
     claims: Vec<context::WorkContextRecord>,
     operations: Vec<claims::OperationLease>,
     messages: Vec<mailbox::StoredMessage>,
+    cursors: BTreeMap<String, mailbox::InboxCursor>,
     receipts: BTreeMap<String, IdempotencyReceipt>,
     notifications: BTreeMap<String, notification::NotificationReceipt>,
 }
@@ -59,6 +60,12 @@ pub(crate) struct BrokerRecord {
     pub state: String,
     pub heartbeat_at: String,
     pub heartbeat_epoch: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_identity: Option<Value>,
+    #[serde(default)]
+    pub runtime_identity_digest: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lost_since_epoch: Option<i64>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -287,6 +294,50 @@ fn authenticate_from_file(
     authenticate_token(context, session_id, token.trim())
 }
 
+pub(crate) fn authenticate_any_from_file(
+    context: &CliContext,
+    capability_file: Option<&Path>,
+) -> Result<(SessionRecord, String), CliError> {
+    let path = capability_file
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os(CAPABILITY_ENV).map(PathBuf::from))
+        .ok_or_else(unauthorized)?;
+    let token = read_private_file(&path, 512).map_err(|_| unauthorized())?;
+    let token = String::from_utf8(token).map_err(|_| unauthorized())?;
+    let token = token.trim();
+    if token.len() < 32 || token.len() > 256 || !token.is_ascii() {
+        return Err(unauthorized());
+    }
+    let digest = digest_bytes(token.as_bytes());
+    let locked = lock_registry(context)?;
+    let mut matches = locked.registry.brokers.values().filter(|broker| {
+        broker.state == "ready"
+            && digest_eq(&broker.capability_digest, &digest)
+            && broker::capability_available(
+                context,
+                &broker.session_id,
+                &broker.incarnation,
+                &broker.capability_digest,
+            )
+            && broker::heartbeat_fresh(
+                context,
+                &broker.session_id,
+                &broker.incarnation,
+                broker.heartbeat_epoch,
+            )
+    });
+    let broker = matches.next().cloned().ok_or_else(unauthorized)?;
+    if matches.next().is_some() {
+        return Err(unauthorized());
+    }
+    drop(locked);
+    let record = load_session_record(context, &broker.session_id).map_err(|_| unauthorized())?;
+    if incarnation(&record)? != broker.incarnation {
+        return Err(unauthorized());
+    }
+    Ok((record, broker.incarnation))
+}
+
 pub(crate) fn authenticate_token(
     context: &CliContext,
     session_id: &str,
@@ -323,6 +374,46 @@ pub(crate) fn authenticate_token(
         ));
     }
     Ok((record, incarnation))
+}
+
+pub(crate) fn revalidate_capability_file(
+    context: &CliContext,
+    registry: &Registry,
+    record: &SessionRecord,
+    expected_incarnation: &str,
+    capability_file: &Path,
+) -> Result<(), CliError> {
+    if incarnation(record)? != expected_incarnation {
+        return Err(unauthorized());
+    }
+    let token = read_private_file(capability_file, 512).map_err(|_| unauthorized())?;
+    let token = String::from_utf8(token).map_err(|_| unauthorized())?;
+    let broker = registry
+        .brokers
+        .get(&record.id)
+        .filter(|broker| {
+            broker.incarnation == expected_incarnation
+                && broker.state == "ready"
+                && digest_eq(
+                    &broker.capability_digest,
+                    &digest_bytes(token.trim().as_bytes()),
+                )
+                && broker::capability_available(
+                    context,
+                    &record.id,
+                    expected_incarnation,
+                    &broker.capability_digest,
+                )
+                && broker::heartbeat_fresh(
+                    context,
+                    &record.id,
+                    expected_incarnation,
+                    broker.heartbeat_epoch,
+                )
+        })
+        .ok_or_else(unauthorized)?;
+    let _ = broker;
+    Ok(())
 }
 
 pub(crate) fn incarnation(record: &SessionRecord) -> Result<String, CliError> {
@@ -429,6 +520,64 @@ pub(crate) fn lock_registry(context: &CliContext) -> Result<LockedRegistry, CliE
             renewed = true;
         }
     }
+    let operation_snapshots: Vec<_> = registry
+        .operations
+        .iter()
+        .enumerate()
+        .filter(|(_, lease)| {
+            matches!(
+                lease.state.as_str(),
+                "active" | "completing" | "reconcile_pending"
+            ) && lease.expires_at_epoch <= now.saturating_add(15 * 60)
+        })
+        .map(|(index, lease)| (index, lease.clone()))
+        .collect();
+    for (index, lease) in operation_snapshots {
+        let Some(broker) = registry.brokers.get(&lease.session_id) else {
+            continue;
+        };
+        if broker.incarnation != lease.session_incarnation
+            || broker.state != "ready"
+            || !broker::capability_available(
+                context,
+                &lease.session_id,
+                &lease.session_incarnation,
+                &broker.capability_digest,
+            )
+            || !broker::heartbeat_fresh(
+                context,
+                &lease.session_id,
+                &lease.session_incarnation,
+                broker.heartbeat_epoch,
+            )
+        {
+            continue;
+        }
+        let Ok(record) = load_session_record(context, &lease.session_id) else {
+            continue;
+        };
+        let runtime_matches = crate::coordination_runtime_evidence(&record).is_ok_and(|runtime| {
+            runtime.status == crate::CoordinationRuntimeStatus::Running
+                && runtime.identity_digest == lease.runtime_identity_digest
+        });
+        let activity_matches =
+            crate::activity::state_for_view(context, &record).is_some_and(|activity| {
+                activity.phase == crate::activity::TurnPhase::Working
+                    && claims::activity_identity_digest(&activity) == lease.activity_identity_digest
+            });
+        let descendant_matches = lease
+            .descendant
+            .as_ref()
+            .is_some_and(claims::descendant_is_live);
+        if runtime_matches && (activity_matches || descendant_matches) {
+            let current = &mut registry.operations[index];
+            current.state = "active".to_string();
+            current.reconcile_observed_at_epoch = None;
+            current.expires_at_epoch = now.saturating_add(30 * 60);
+            current.expires_at = timestamp(current.expires_at_epoch);
+            renewed = true;
+        }
+    }
     if renewed {
         let bytes = serde_json::to_vec_pretty(&registry).map_err(|_| store_corrupt())?;
         write_atomic(&path, &bytes, SECRET_FILE_MODE).map_err(|_| store_unavailable())?;
@@ -524,7 +673,10 @@ pub(crate) fn clean_expired(registry: &mut Registry, now: i64) -> bool {
     for claim in &mut registry.claims {
         let bound_operation = registry.operations.iter().any(|operation| {
             operation.claim_id == claim.claim_id
-                && matches!(operation.state.as_str(), "active" | "completing")
+                && matches!(
+                    operation.state.as_str(),
+                    "active" | "completing" | "reconcile_pending"
+                )
         });
         if claim.state == "active" && claim.expires_at_epoch <= now && !bound_operation {
             claim.state = "expired".to_string();
@@ -577,6 +729,7 @@ pub(crate) fn clean_expired(registry: &mut Registry, now: i64) -> bool {
     let operation_count = registry.operations.len();
     let claim_count = registry.claims.len();
     let receipt_count = registry.receipts.len();
+    let cursor_count = registry.cursors.len();
     registry
         .messages
         .retain(|message| !removed_messages.contains(&message.message_id));
@@ -596,12 +749,16 @@ pub(crate) fn clean_expired(registry: &mut Registry, now: i64) -> bool {
     registry
         .receipts
         .retain(|_, receipt| receipt.expires_at_epoch > now);
+    registry
+        .cursors
+        .retain(|_, cursor| cursor.expires_at_epoch > now);
     changed
         || registry.messages.len() != message_count
         || registry.notifications.len() != notification_count
         || registry.operations.len() != operation_count
         || registry.claims.len() != claim_count
         || registry.receipts.len() != receipt_count
+        || registry.cursors.len() != cursor_count
 }
 
 pub(crate) fn idempotency_replay(
@@ -613,7 +770,8 @@ pub(crate) fn idempotency_replay(
     digest: &str,
 ) -> Result<Option<Value>, CliError> {
     validate_idempotency_key(key)?;
-    let Some(receipt) = registry.receipts.get(key) else {
+    let receipt_key = receipt_key(principal, incarnation, operation, key);
+    let Some(receipt) = registry.receipts.get(&receipt_key) else {
         return Ok(None);
     };
     if receipt.principal == principal
@@ -624,7 +782,7 @@ pub(crate) fn idempotency_replay(
         return Ok(Some(receipt.outcome.clone()));
     }
     Err(CliError::data(
-        "idempotency-conflict",
+        "idempotency-key-reused",
         "idempotency key is already bound to another request",
         None,
     ))
@@ -641,8 +799,9 @@ pub(crate) fn store_receipt(
     outcome: Value,
     now: i64,
 ) {
+    let receipt_key = receipt_key(&principal, &incarnation, &operation, &key);
     registry.receipts.insert(
-        key,
+        receipt_key,
         IdempotencyReceipt {
             principal,
             incarnation,
@@ -652,6 +811,13 @@ pub(crate) fn store_receipt(
             expires_at_epoch: now.saturating_add(RECEIPT_TTL_SECS),
         },
     );
+}
+
+fn receipt_key(principal: &str, incarnation: &str, operation: &str, key: &str) -> String {
+    request_digest(
+        "idempotency-receipt-key",
+        &(principal, incarnation, operation, key),
+    )
 }
 
 fn validate_idempotency_key(key: &str) -> Result<(), CliError> {

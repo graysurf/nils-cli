@@ -10,17 +10,19 @@ use crate::cli::{
 use crate::{CliContext, CliError};
 
 use super::context::{
-    ConflictClassification, Scope, WORK_CONTEXT_VERSION, WorkContextInput, WorkContextRecord,
-    canonicalize_targets, evaluate, fingerprint_epoch, scope_covers, validate_physical_targets,
+    CheckoutBinding, ConflictClassification, ProviderRef, Scope, WORK_CONTEXT_VERSION,
+    WorkContextInput, WorkContextRecord, canonicalize_provider_refs, canonicalize_targets,
+    evaluate, fingerprint_epoch, scope_covers, validate_physical_targets,
 };
 use super::{
-    Registry, authenticate_from_file, clean_expired, digest_bytes, ensure_fingerprint_key,
-    idempotency_replay, json_value, lock_registry, now_epoch, read_bounded_json, read_private_text,
-    request_digest, store_receipt, timestamp, worktree_fingerprint,
+    Registry, authenticate_any_from_file, authenticate_from_file, clean_expired, digest_bytes,
+    ensure_fingerprint_key, idempotency_replay, json_value, lock_registry, now_epoch,
+    read_bounded_json, read_private_text, request_digest, store_receipt, timestamp,
+    worktree_fingerprint,
 };
 
 const CLAIM_TTL_SECS: i64 = 30 * 60;
-const OPERATION_TTL_SECS: i64 = 7 * 24 * 60 * 60;
+const OPERATION_TTL_SECS: i64 = 30 * 60;
 const OPERATION_LEASE_VERSION: &str = "agent-session.operation-lease.v1";
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -33,6 +35,8 @@ pub(crate) struct OperationLease {
     pub claim_revision: u64,
     pub operation: String,
     pub targets: Vec<Scope>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub provider_targets: Vec<ProviderRef>,
     pub state: String,
     pub revision: u64,
     pub started_at: String,
@@ -44,7 +48,13 @@ pub(crate) struct OperationLease {
     #[serde(default)]
     pub activity_revision: u64,
     #[serde(default)]
+    pub activity_identity_digest: String,
+    #[serde(default)]
     pub runtime_identity_digest: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub descendant: Option<DescendantIdentity>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reconcile_observed_at_epoch: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub outcome: Option<String>,
 }
@@ -53,7 +63,21 @@ pub(crate) struct OperationLease {
 #[serde(deny_unknown_fields)]
 struct OperationTargetsInput {
     schema_version: String,
+    #[serde(default)]
     targets: Vec<Scope>,
+    #[serde(default)]
+    provider_refs: Vec<ProviderRef>,
+    #[serde(default)]
+    checkouts: Vec<CheckoutBinding>,
+    #[serde(default)]
+    descendant: Option<DescendantIdentity>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct DescendantIdentity {
+    pub pid: u32,
+    pub start_time: u64,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -68,7 +92,7 @@ pub(crate) fn claim(context: &CliContext, args: WorkContextClaimArgs) -> Result<
     let (record, incarnation) =
         authenticate_from_file(context, &args.session, args.capability_file.as_deref())?;
     let candidate: WorkContextInput =
-        read_bounded_json(&args.file, 64 * 1024, "invalid-work-context")?;
+        read_bounded_json(&args.file, 16 * 1024, "invalid-work-context")?;
     let mut candidate = candidate.validate_and_canonicalize()?;
     let now = now_epoch();
     let mut locked = lock_registry(context)?;
@@ -76,7 +100,7 @@ pub(crate) fn claim(context: &CliContext, args: WorkContextClaimArgs) -> Result<
     let checkout_fingerprint =
         worktree_fingerprint(&locked.registry, std::path::Path::new(&record.cwd))?;
     if !candidate.worktrees.contains(&checkout_fingerprint) {
-        if candidate.worktrees.len() >= 16 {
+        if candidate.worktrees.len() >= 8 {
             return Err(CliError::data(
                 "invalid-work-context",
                 "work context exceeds the worktree fingerprint limit",
@@ -126,10 +150,10 @@ pub(crate) fn claim(context: &CliContext, args: WorkContextClaimArgs) -> Result<
         return Err(revision_conflict("claim-revision-conflict"));
     }
 
-    let complete = complete_relevant_universe(context, &locked.registry, &record.id, &incarnation);
+    let complete =
+        complete_relevant_universe(context, &locked.registry, Some((&record.id, &incarnation)));
     let evaluation = evaluate(
-        &record.id,
-        &incarnation,
+        Some((&record.id, &incarnation)),
         &candidate,
         &locked.registry.claims,
         complete,
@@ -162,6 +186,13 @@ pub(crate) fn claim(context: &CliContext, args: WorkContextClaimArgs) -> Result<
         expires_at_epoch: now.saturating_add(CLAIM_TTL_SECS),
         terminal_at_epoch: None,
     };
+    if serde_json::to_vec(&claim).map_or(true, |bytes| bytes.len() > 16 * 1024) {
+        return Err(CliError::data(
+            "invalid-work-context",
+            "public work context exceeds 16 KiB",
+            None,
+        ));
+    }
     locked.registry.claims.push(claim.clone());
     let outcome = json!({
         "schema_version": "agent-session.work-context-claim-result.v1",
@@ -183,31 +214,58 @@ pub(crate) fn claim(context: &CliContext, args: WorkContextClaimArgs) -> Result<
 }
 
 pub(crate) fn show(context: &CliContext, args: WorkContextShowArgs) -> Result<Value, CliError> {
-    let (record, incarnation) =
-        authenticate_from_file(context, &args.session, args.capability_file.as_deref())?;
     let locked = lock_registry(context)?;
-    let claim = active_claim(&locked.registry, &record.id, &incarnation)?;
+    let claim = active_claim_for_session(&locked.registry, &args.session)?;
     public_context(claim)
 }
 
 pub(crate) fn check(context: &CliContext, args: WorkContextCheckArgs) -> Result<Value, CliError> {
-    let (record, incarnation) =
-        authenticate_from_file(context, &args.session, args.capability_file.as_deref())?;
-    let candidate = match args.candidate.as_deref() {
-        Some(path) => {
-            read_bounded_json::<WorkContextInput>(path, 64 * 1024, "invalid-work-context")?
-                .validate_and_canonicalize()?
-        }
-        None => {
-            let locked = lock_registry(context)?;
-            input_from_record(active_claim(&locked.registry, &record.id, &incarnation)?)
-        }
+    let selector_count = usize::from(args.self_selector)
+        + usize::from(args.session.is_some())
+        + usize::from(args.candidate.is_some());
+    if selector_count != 1 {
+        return Err(CliError::usage(
+            "invalid-check-selector",
+            "work-context check requires exactly one of --self, --session, or --candidate",
+            None,
+        ));
+    }
+    let (candidate, excluded): (WorkContextInput, Option<(String, String)>) = if args.self_selector
+    {
+        let (record, incarnation) =
+            authenticate_any_from_file(context, args.capability_file.as_deref())?;
+        let locked = lock_registry(context)?;
+        (
+            input_from_record(active_claim(&locked.registry, &record.id, &incarnation)?),
+            Some((record.id, incarnation)),
+        )
+    } else if let Some(session) = args.session.as_deref() {
+        let locked = lock_registry(context)?;
+        let claim = active_claim_for_session(&locked.registry, session)?;
+        (
+            input_from_record(claim),
+            Some((claim.session_id.clone(), claim.session_incarnation.clone())),
+        )
+    } else {
+        let path = args.candidate.as_deref().expect("selector checked");
+        (
+            read_bounded_json::<WorkContextInput>(path, 16 * 1024, "invalid-work-context")?
+                .validate_and_canonicalize()?,
+            None,
+        )
     };
     let locked = lock_registry(context)?;
-    let complete = complete_relevant_universe(context, &locked.registry, &record.id, &incarnation);
+    let complete = complete_relevant_universe(
+        context,
+        &locked.registry,
+        excluded
+            .as_ref()
+            .map(|(session, incarnation)| (session.as_str(), incarnation.as_str())),
+    );
     json_value(evaluate(
-        &record.id,
-        &incarnation,
+        excluded
+            .as_ref()
+            .map(|(session, incarnation)| (session.as_str(), incarnation.as_str())),
         &candidate,
         &locked.registry.claims,
         complete,
@@ -354,6 +412,14 @@ pub(crate) fn admit(context: &CliContext, args: WorkContextAdmitArgs) -> Result<
         ));
     }
     let targets = canonicalize_targets(input.targets)?;
+    let provider_targets = canonicalize_provider_refs(input.provider_refs)?;
+    if targets.is_empty() && provider_targets.is_empty() {
+        return Err(CliError::data(
+            "invalid-scope",
+            "operation targets must name at least one filesystem or provider mutation",
+            None,
+        ));
+    }
     let digest = request_digest(
         "work-context-admit",
         &json!({
@@ -361,6 +427,9 @@ pub(crate) fn admit(context: &CliContext, args: WorkContextAdmitArgs) -> Result<
             "if_revision": args.if_revision,
             "operation": args.operation,
             "targets": targets,
+            "provider_targets": provider_targets,
+            "checkouts": input.checkouts,
+            "descendant": input.descendant,
             "execution_token_digest": digest_bytes(execution_token.as_bytes()),
         }),
     );
@@ -379,7 +448,11 @@ pub(crate) fn admit(context: &CliContext, args: WorkContextAdmitArgs) -> Result<
     }
     ensure_current_broker(context, &locked.registry, &record.id, &incarnation)?;
     if locked.registry.operations.iter().any(|lease| {
-        lease.session_id == record.id && matches!(lease.state.as_str(), "active" | "completing")
+        lease.session_id == record.id
+            && matches!(
+                lease.state.as_str(),
+                "active" | "completing" | "reconcile_pending"
+            )
     }) {
         return Err(CliError::data(
             "coordination-unavailable",
@@ -401,12 +474,22 @@ pub(crate) fn admit(context: &CliContext, args: WorkContextAdmitArgs) -> Result<
             None,
         ));
     }
-    validate_physical_targets(&record.cwd, &targets)?;
+    if provider_targets
+        .iter()
+        .any(|target| !claim.provider_refs.contains(target))
+    {
+        return Err(CliError::data(
+            "uncovered-mutation-scope",
+            "provider mutation target is not covered by the active claim",
+            None,
+        ));
+    }
+    validate_physical_targets(&record.cwd, &targets, &input.checkouts)?;
     let candidate = input_from_record(claim);
-    let complete = complete_relevant_universe(context, &locked.registry, &record.id, &incarnation);
+    let complete =
+        complete_relevant_universe(context, &locked.registry, Some((&record.id, &incarnation)));
     let evaluation = evaluate(
-        &record.id,
-        &incarnation,
+        Some((&record.id, &incarnation)),
         &candidate,
         &locked.registry.claims,
         complete,
@@ -450,6 +533,7 @@ pub(crate) fn admit(context: &CliContext, args: WorkContextAdmitArgs) -> Result<
         claim_revision: claim.revision,
         operation: args.operation,
         targets,
+        provider_targets,
         state: "active".to_string(),
         revision: 1,
         started_at: timestamp(now),
@@ -458,7 +542,10 @@ pub(crate) fn admit(context: &CliContext, args: WorkContextAdmitArgs) -> Result<
         terminal_at_epoch: None,
         execution_token_digest: digest_bytes(execution_token.as_bytes()),
         activity_revision: activity.revision,
+        activity_identity_digest: activity_identity_digest(&activity),
         runtime_identity_digest: runtime.identity_digest,
+        descendant: input.descendant,
+        reconcile_observed_at_epoch: None,
         outcome: None,
     };
     locked.registry.operations.push(lease.clone());
@@ -521,7 +608,12 @@ pub(crate) fn complete(
                 && lease.lease_id == args.lease
         })
         .ok_or_else(operation_unavailable)?;
-    if lease.revision != args.if_revision || lease.state != "active" {
+    if lease.revision != args.if_revision
+        || !matches!(
+            lease.state.as_str(),
+            "active" | "completing" | "reconcile_pending"
+        )
+    {
         return Err(revision_conflict("operation-revision-conflict"));
     }
     if lease.execution_token_digest != token_digest {
@@ -604,15 +696,63 @@ pub(crate) fn reconcile(
     {
         return Err(revision_conflict("operation-revision-conflict"));
     }
-    if !matches!(lease_snapshot.state.as_str(), "active" | "completing") {
+    if !matches!(
+        lease_snapshot.state.as_str(),
+        "active" | "completing" | "reconcile_pending"
+    ) {
         return Err(revision_conflict("operation-revision-conflict"));
     }
-    if !controller_observed_terminal(context, &record, &lease_snapshot) {
-        return Err(CliError::data(
-            "operation-still-running",
-            "controller-owned state does not prove the exact operation runtime is terminal",
+    let runtime = crate::coordination_runtime_evidence(&record)?;
+    if runtime.identity_digest != lease_snapshot.runtime_identity_digest
+        || runtime.status == crate::CoordinationRuntimeStatus::Unknown
+    {
+        return Err(CliError::runtime(
+            "coordination-runtime-unverified",
+            "the exact operation runtime could not be verified",
             None,
         ));
+    }
+    let runtime_stopped = runtime.status == crate::CoordinationRuntimeStatus::Stopped;
+    if !runtime_stopped && !controller_observed_quiescent(context, &record, &lease_snapshot) {
+        return Err(CliError::data(
+            "operation-still-running",
+            "controller-owned activity or descendant evidence still identifies the operation as live",
+            None,
+        ));
+    }
+    if !runtime_stopped {
+        if lease_snapshot.state != "reconcile_pending" {
+            let lease = locked
+                .registry
+                .operations
+                .iter_mut()
+                .find(|lease| lease.lease_id == lease_snapshot.lease_id)
+                .ok_or_else(operation_unavailable)?;
+            lease.state = "reconcile_pending".to_string();
+            lease.revision = lease.revision.saturating_add(1);
+            lease.reconcile_observed_at_epoch = Some(now);
+            let outcome = public_lease(lease)?;
+            store_receipt(
+                &mut locked.registry,
+                args.idempotency_key,
+                record.id,
+                incarnation,
+                "work-context-reconcile".to_string(),
+                digest,
+                outcome.clone(),
+                now,
+            );
+            locked.save()?;
+            return Ok(outcome);
+        }
+        let observed = lease_snapshot.reconcile_observed_at_epoch.unwrap_or(now);
+        if observed > now.saturating_sub(5) {
+            return Err(CliError::data(
+                "operation-reconcile-pending",
+                "operation quiescence requires a second observation after five seconds",
+                Some(json!({ "lease": args.lease, "revision": lease_snapshot.revision })),
+            ));
+        }
     }
     let lease = locked
         .registry
@@ -628,6 +768,7 @@ pub(crate) fn reconcile(
     };
     lease.outcome = Some(proof.outcome);
     lease.terminal_at_epoch = Some(now);
+    lease.reconcile_observed_at_epoch = None;
     let outcome = public_lease(lease)?;
     store_receipt(
         &mut locked.registry,
@@ -696,6 +837,17 @@ fn active_claim<'a>(
         .ok_or_else(claim_unavailable)
 }
 
+fn active_claim_for_session<'a>(
+    registry: &'a Registry,
+    session_id: &str,
+) -> Result<&'a WorkContextRecord, CliError> {
+    let broker = registry
+        .brokers
+        .get(session_id)
+        .ok_or_else(claim_unavailable)?;
+    active_claim(registry, session_id, &broker.incarnation)
+}
+
 fn input_from_record(claim: &WorkContextRecord) -> WorkContextInput {
     WorkContextInput {
         schema_version: super::context::WORK_CONTEXT_INPUT_VERSION.to_string(),
@@ -736,8 +888,7 @@ fn public_lease(lease: &OperationLease) -> Result<Value, CliError> {
 fn complete_relevant_universe(
     context: &CliContext,
     registry: &Registry,
-    subject_id: &str,
-    subject_incarnation: &str,
+    excluded_principal: Option<(&str, &str)>,
 ) -> bool {
     if registry.claims.iter().any(|claim| {
         claim.state == "active"
@@ -762,16 +913,13 @@ fn complete_relevant_universe(
         let Some(id) = entry.file_name().to_str().map(str::to_string) else {
             return false;
         };
-        if id == subject_id {
+        if excluded_principal.is_some_and(|(subject_id, _)| id == subject_id) {
             continue;
         }
         let Some(broker) = registry.brokers.get(&id) else {
             return false;
         };
         if broker.state != "ready" {
-            continue;
-        }
-        if id == subject_id && broker.incarnation == subject_incarnation {
             continue;
         }
         if !registry.claims.iter().any(|claim| {
@@ -788,22 +936,56 @@ fn complete_relevant_universe(
 fn has_nonterminal_operation(registry: &Registry, claim_id: &str) -> bool {
     registry.operations.iter().any(|operation| {
         operation.claim_id == claim_id
-            && matches!(operation.state.as_str(), "active" | "completing")
+            && matches!(
+                operation.state.as_str(),
+                "active" | "completing" | "reconcile_pending"
+            )
     })
 }
 
-fn controller_observed_terminal(
-    _context: &CliContext,
+fn controller_observed_quiescent(
+    context: &CliContext,
     record: &crate::SessionRecord,
     lease: &OperationLease,
 ) -> bool {
-    let Ok(runtime) = crate::coordination_runtime_evidence(record) else {
-        return false;
-    };
-    if runtime.identity_digest != lease.runtime_identity_digest {
+    if lease.descendant.as_ref().is_some_and(descendant_is_live) {
         return false;
     }
-    matches!(runtime.status, crate::CoordinationRuntimeStatus::Stopped)
+    let Some(activity) = crate::activity::state_for_view(context, record) else {
+        return false;
+    };
+    matches!(
+        activity.phase,
+        crate::activity::TurnPhase::Waiting | crate::activity::TurnPhase::NeedsInput
+    ) && activity_identity_digest(&activity) != lease.activity_identity_digest
+}
+
+pub(crate) fn activity_identity_digest(activity: &crate::activity::TurnState) -> String {
+    let identity = activity
+        .current_turn
+        .as_ref()
+        .and_then(|turn| turn.provider_turn_id.as_deref())
+        .unwrap_or_default();
+    digest_bytes(identity.as_bytes())
+}
+
+pub(crate) fn descendant_is_live(descendant: &DescendantIdentity) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        let Ok(stat) = fs::read_to_string(format!("/proc/{}/stat", descendant.pid)) else {
+            return false;
+        };
+        let Some(end) = stat.rfind(')') else {
+            return false;
+        };
+        let fields: Vec<_> = stat[end + 1..].split_whitespace().collect();
+        fields.get(19).and_then(|value| value.parse::<u64>().ok()) == Some(descendant.start_time)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = descendant;
+        false
+    }
 }
 
 fn validate_operation_kind(value: &str) -> Result<(), CliError> {
@@ -875,6 +1057,7 @@ mod tests {
             claim_revision: 1,
             operation: "edit".to_string(),
             targets: Vec::new(),
+            provider_targets: Vec::new(),
             state: "active".to_string(),
             revision: 1,
             started_at: "time".to_string(),
@@ -883,7 +1066,10 @@ mod tests {
             terminal_at_epoch: None,
             execution_token_digest: "canary".to_string(),
             activity_revision: 1,
+            activity_identity_digest: "activity".to_string(),
             runtime_identity_digest: "runtime".to_string(),
+            descendant: None,
+            reconcile_observed_at_epoch: None,
             outcome: None,
         };
         let value = public_lease(&lease).expect("serialize");

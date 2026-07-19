@@ -715,6 +715,10 @@ fn router(state: Arc<ServeState>) -> Router {
             post(coordination_context_check_handler),
         )
         .route(
+            "/coordination/work-context/check/v1",
+            post(coordination_registry_context_check_handler),
+        )
+        .route(
             "/sessions/{id}/work-context/claim/v1",
             post(coordination_context_claim_handler),
         )
@@ -738,9 +742,14 @@ fn router(state: Arc<ServeState>) -> Router {
             "/sessions/{id}/work-context/reconcile/v1",
             post(coordination_context_reconcile_handler),
         )
+        .route("/sessions/{id}/broker/v1", get(coordination_broker_handler))
         .route(
-            "/sessions/{id}/coordination-broker/v1",
-            get(coordination_broker_handler),
+            "/sessions/{id}/broker/adopt/v1",
+            post(coordination_broker_adopt_handler),
+        )
+        .route(
+            "/sessions/{id}/broker/reconcile/v1",
+            post(coordination_broker_reconcile_handler),
         )
         .route(
             "/sessions/{id}/messages/v1",
@@ -760,7 +769,7 @@ fn router(state: Arc<ServeState>) -> Router {
         )
         .route(
             "/sessions/{id}/messages/{message_id}/wait/v1",
-            post(coordination_wait_handler),
+            get(coordination_wait_handler),
         )
         .route("/sessions/{id}/buffer", get(buffer_handler))
         .route("/sessions/{id}/send", post(send_handler))
@@ -2959,14 +2968,11 @@ async fn coordination_context_show_handler(
     headers: HeaderMap,
     AxPath(id): AxPath<String>,
 ) -> Response {
-    let token = match coordination_authority(&state, &headers) {
-        Ok(token) => token,
-        Err(response) => return response,
-    };
+    if let Some(response) = deny_unauthorized(&state, &headers) {
+        return response;
+    }
     let context = state.context.clone();
-    match tokio::task::spawn_blocking(move || coordination_server::show(&context, &id, &token))
-        .await
-    {
+    match tokio::task::spawn_blocking(move || coordination_server::show(&context, &id)).await {
         Ok(Ok(value)) => coordination_ok(&state, value),
         Ok(Err(error)) => envelope_err(error),
         Err(_) => join_err(),
@@ -2979,15 +2985,29 @@ async fn coordination_context_check_handler(
     AxPath(id): AxPath<String>,
     Json(body): Json<coordination_server::CheckBody>,
 ) -> Response {
-    let token = match coordination_authority(&state, &headers) {
-        Ok(token) => token,
-        Err(response) => return response,
-    };
+    if let Some(response) = deny_unauthorized(&state, &headers) {
+        return response;
+    }
     let context = state.context.clone();
-    match tokio::task::spawn_blocking(move || {
-        coordination_server::check(&context, &id, &token, body)
-    })
-    .await
+    match tokio::task::spawn_blocking(move || coordination_server::check(&context, &id, body)).await
+    {
+        Ok(Ok(value)) => coordination_ok(&state, value),
+        Ok(Err(error)) => envelope_err(error),
+        Err(_) => join_err(),
+    }
+}
+
+async fn coordination_registry_context_check_handler(
+    State(state): State<Arc<ServeState>>,
+    headers: HeaderMap,
+    Json(body): Json<coordination_server::CheckBody>,
+) -> Response {
+    if let Some(response) = deny_unauthorized(&state, &headers) {
+        return response;
+    }
+    let context = state.context.clone();
+    match tokio::task::spawn_blocking(move || coordination_server::check_candidate(&context, body))
+        .await
     {
         Ok(Ok(value)) => coordination_ok(&state, value),
         Ok(Err(error)) => envelope_err(error),
@@ -3129,13 +3149,50 @@ async fn coordination_broker_handler(
     headers: HeaderMap,
     AxPath(id): AxPath<String>,
 ) -> Response {
-    let token = match coordination_authority(&state, &headers) {
-        Ok(token) => token,
-        Err(response) => return response,
-    };
+    if let Some(response) = deny_unauthorized(&state, &headers) {
+        return response;
+    }
+    let context = state.context.clone();
+    match tokio::task::spawn_blocking(move || coordination_server::broker_status(&context, &id))
+        .await
+    {
+        Ok(Ok(value)) => coordination_ok(&state, value),
+        Ok(Err(error)) => envelope_err(error),
+        Err(_) => join_err(),
+    }
+}
+
+async fn coordination_broker_adopt_handler(
+    State(state): State<Arc<ServeState>>,
+    headers: HeaderMap,
+    AxPath(id): AxPath<String>,
+    Json(body): Json<coordination_server::BrokerRecoveryBody>,
+) -> Response {
+    coordination_broker_recovery_handler(state, headers, id, body, false).await
+}
+
+async fn coordination_broker_reconcile_handler(
+    State(state): State<Arc<ServeState>>,
+    headers: HeaderMap,
+    AxPath(id): AxPath<String>,
+    Json(body): Json<coordination_server::BrokerRecoveryBody>,
+) -> Response {
+    coordination_broker_recovery_handler(state, headers, id, body, true).await
+}
+
+async fn coordination_broker_recovery_handler(
+    state: Arc<ServeState>,
+    headers: HeaderMap,
+    id: String,
+    body: coordination_server::BrokerRecoveryBody,
+    reconcile: bool,
+) -> Response {
+    if let Some(response) = deny_unauthorized(&state, &headers) {
+        return response;
+    }
     let context = state.context.clone();
     match tokio::task::spawn_blocking(move || {
-        coordination_server::broker_status(&context, &id, &token)
+        coordination_server::broker_recover(&context, &id, body, reconcile)
     })
     .await
     {
@@ -3288,7 +3345,7 @@ async fn coordination_wait_handler(
     State(state): State<Arc<ServeState>>,
     headers: HeaderMap,
     AxPath((id, message_id)): AxPath<(String, String)>,
-    Json(body): Json<coordination_server::WaitBody>,
+    Query(body): Query<coordination_server::WaitBody>,
 ) -> Response {
     let token = match coordination_authority(&state, &headers) {
         Ok(token) => token,
@@ -18697,7 +18754,7 @@ exit 0
     }
 
     #[tokio::test]
-    async fn coordination_routes_require_both_operator_and_session_authority() {
+    async fn coordination_mutations_require_session_authority_while_reads_are_operator_public() {
         let tmp = tempfile::TempDir::new().expect("tempdir");
         seed_session_with_runtime(tmp.path(), "alpha", "codex", "hs-codex-alpha");
         let state = state(tmp.path(), Some(TOKEN), minimal_tmux(tmp.path()));
@@ -18715,7 +18772,7 @@ exit 0
             "scopes": [{
                 "kind": "path-prefix",
                 "repository": "example/repository",
-                "value": "src/"
+                "value": "src"
             }],
             "summary": "HTTP parity fixture"
         });
@@ -18758,8 +18815,11 @@ exit 0
             ),
         )
         .await;
-        assert_eq!(status, StatusCode::UNAUTHORIZED, "{denied}");
-        assert_eq!(denied["error"]["code"], "coordination-unauthorized");
+        assert_eq!(status, StatusCode::OK, "{denied}");
+        assert_eq!(
+            denied["data"]["coordination"]["claim_id"],
+            body["data"]["coordination"]["context"]["claim_id"]
+        );
     }
 
     #[tokio::test]

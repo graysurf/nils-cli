@@ -3891,14 +3891,14 @@ fn resume_session_locked(
         Err(err) => Some(err),
     };
     if let Some(launch_err) = launch_error {
+        let coordination_revoke = coordination::revoke(context, &record);
         let record_restore = write_session_record(context, &previous_record);
         let activity_restore = activity::restore_snapshot(context, &record.id, &previous_activity);
         let artifact_restore = startup_artifacts.restore();
-        let coordination_restore = coordination::revoke(context, &previous_record);
-        if record_restore.is_err()
+        if coordination_revoke.is_err()
+            || record_restore.is_err()
             || activity_restore.is_err()
             || artifact_restore.is_err()
-            || coordination_restore.is_err()
         {
             return Err(CliError::runtime(
                 "resume-launch-rollback-failed",
@@ -3906,6 +3906,7 @@ fn resume_session_locked(
                 Some(json!({
                     "id": record.id,
                     "launch_error": launch_err.code(),
+                    "new_coordination_revoked": coordination_revoke.is_ok(),
                     "record_restored": record_restore.is_ok(),
                     "activity_restored": activity_restore.is_ok(),
                     "startup_artifacts_restored": artifact_restore.is_ok()
@@ -7147,6 +7148,7 @@ pub(crate) enum CoordinationRuntimeStatus {
 
 pub(crate) struct CoordinationRuntimeEvidence {
     pub(crate) identity_digest: String,
+    pub(crate) identity: Value,
     pub(crate) status: CoordinationRuntimeStatus,
 }
 
@@ -7182,8 +7184,26 @@ pub(crate) fn coordination_runtime_evidence(
     };
     Ok(CoordinationRuntimeEvidence {
         identity_digest: coordination::digest_bytes(&bytes),
+        identity: serde_json::to_value(identity).map_err(|_| {
+            CliError::runtime(
+                "coordination-runtime-unverified",
+                "persisted runtime identity could not be serialized",
+                None,
+            )
+        })?,
         status,
     })
+}
+
+pub(crate) fn coordination_runtime_status_for_identity(value: &Value) -> CoordinationRuntimeStatus {
+    let Ok(identity) = serde_json::from_value::<TmuxRuntimeIdentity>(value.clone()) else {
+        return CoordinationRuntimeStatus::Unknown;
+    };
+    match process_runtime_status(&identity) {
+        ProcessGroupStatus::Running => CoordinationRuntimeStatus::Running,
+        ProcessGroupStatus::Stopped => CoordinationRuntimeStatus::Stopped,
+        ProcessGroupStatus::Unknown => CoordinationRuntimeStatus::Unknown,
+    }
 }
 
 fn process_group_status(process_group_id: libc::pid_t) -> ProcessGroupStatus {

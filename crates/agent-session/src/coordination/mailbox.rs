@@ -1,6 +1,9 @@
-use std::fs;
+use std::fs::OpenOptions;
+use std::io::Read;
+use std::os::unix::fs::OpenOptionsExt;
+use std::path::{Path, PathBuf};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -13,7 +16,7 @@ use crate::{CliContext, CliError};
 
 use super::{
     Registry, authenticate_from_file, clean_expired, idempotency_replay, incarnation, json_value,
-    lock_registry, now_epoch, request_digest, store_receipt, timestamp,
+    lock_registry, now_epoch, request_digest, revalidate_capability_file, store_receipt, timestamp,
 };
 
 const MESSAGE_VERSION: &str = "agent-session.message.v1";
@@ -24,6 +27,9 @@ const MAX_SESSION_MESSAGES: usize = 256;
 const MAX_SESSION_BYTES: usize = 4 * 1024 * 1024;
 const MAX_REGISTRY_BYTES: usize = 64 * 1024 * 1024;
 const PAIR_RATE_PER_MINUTE: usize = 30;
+const PAIR_BURST: usize = 10;
+const CURSOR_TTL_SECS: i64 = 60 * 60;
+const MAX_CURSORS: usize = 4_096;
 const DEFAULT_PAGE: usize = 50;
 const MAX_PAGE: usize = 100;
 const MAX_WAIT_SECS: u64 = 60;
@@ -43,12 +49,24 @@ pub(crate) struct StoredMessage {
     pub reply_depth: u8,
     pub created_at: String,
     pub created_at_epoch: i64,
+    #[serde(default)]
+    pub created_at_epoch_millis: i64,
     pub expires_at: String,
     pub expires_at_epoch: i64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub terminal_at_epoch: Option<i64>,
     pub body_bytes: usize,
     pub body: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub(crate) struct InboxCursor {
+    pub recipient_session_id: String,
+    pub recipient_incarnation: String,
+    pub state: Option<String>,
+    pub after_created_at_epoch: i64,
+    pub after_message_id: String,
+    pub expires_at_epoch: i64,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -85,8 +103,9 @@ struct UntrustedBody {
 }
 
 pub(crate) fn send(context: &CliContext, args: MessageSendArgs) -> Result<Value, CliError> {
+    let capability_file = resolve_capability_file(args.capability_file.as_deref())?;
     let (record, sender_incarnation) =
-        authenticate_from_file(context, &args.from_session, args.capability_file.as_deref())?;
+        authenticate_from_file(context, &args.from_session, Some(&capability_file))?;
     let body = read_body(&args.body_file)?;
     send_authenticated(
         context,
@@ -98,6 +117,7 @@ pub(crate) fn send(context: &CliContext, args: MessageSendArgs) -> Result<Value,
         args.expires_in.as_deref(),
         args.idempotency_key,
         "message-send",
+        &capability_file,
         None,
         None,
         None,
@@ -146,20 +166,60 @@ pub(crate) fn inbox(context: &CliContext, args: MessageInboxArgs) -> Result<Valu
         (left.created_at_epoch, &left.message_id).cmp(&(right.created_at_epoch, &right.message_id))
     });
     let start = match args.cursor.as_deref() {
-        Some(cursor) => messages
-            .iter()
-            .position(|message| message.message_id == cursor)
-            .map(|index| index + 1)
-            .ok_or_else(|| CliError::data("cursor-invalid", "inbox cursor is invalid", None))?,
+        Some(cursor) => {
+            let cursor =
+                locked.registry.cursors.get(cursor).ok_or_else(|| {
+                    CliError::data("cursor-invalid", "inbox cursor is invalid", None)
+                })?;
+            if cursor.recipient_session_id != record.id
+                || cursor.recipient_incarnation != recipient_incarnation
+                || cursor.state != args.state
+                || cursor.expires_at_epoch <= now
+            {
+                return Err(CliError::data(
+                    "cursor-invalid",
+                    "inbox cursor is invalid",
+                    None,
+                ));
+            }
+            messages
+                .iter()
+                .position(|message| {
+                    (message.created_at_epoch, &message.message_id)
+                        > (cursor.after_created_at_epoch, &cursor.after_message_id)
+                })
+                .unwrap_or(messages.len())
+        }
         None => 0,
     };
-    let rows: Vec<_> = messages
-        .into_iter()
-        .skip(start)
-        .take(limit)
-        .map(metadata)
-        .collect();
-    let next_cursor = rows.last().map(|row| row.message_id.clone());
+    let total = messages.len();
+    let page: Vec<_> = messages.into_iter().skip(start).take(limit).collect();
+    let next_cursor = if start.saturating_add(page.len()) < total {
+        let last = page.last().expect("a remaining page has a predecessor");
+        if locked.registry.cursors.len() >= MAX_CURSORS {
+            return Err(CliError::data(
+                "quota-exceeded",
+                "coordination cursor quota exceeded",
+                None,
+            ));
+        }
+        let opaque = uuid::Uuid::new_v4().simple().to_string();
+        locked.registry.cursors.insert(
+            opaque.clone(),
+            InboxCursor {
+                recipient_session_id: record.id.clone(),
+                recipient_incarnation: recipient_incarnation.clone(),
+                state: args.state.clone(),
+                after_created_at_epoch: last.created_at_epoch,
+                after_message_id: last.message_id.clone(),
+                expires_at_epoch: now.saturating_add(CURSOR_TTL_SECS),
+            },
+        );
+        Some(opaque)
+    } else {
+        None
+    };
+    let rows: Vec<_> = page.into_iter().map(metadata).collect();
     locked.save()?;
     Ok(json!({
         "schema_version": "agent-session.message-inbox.v1",
@@ -252,8 +312,9 @@ pub(crate) fn ack(context: &CliContext, args: MessageAckArgs) -> Result<Value, C
 }
 
 pub(crate) fn reply(context: &CliContext, args: MessageReplyArgs) -> Result<Value, CliError> {
+    let capability_file = resolve_capability_file(args.capability_file.as_deref())?;
     let (record, sender_incarnation) =
-        authenticate_from_file(context, &args.session, args.capability_file.as_deref())?;
+        authenticate_from_file(context, &args.session, Some(&capability_file))?;
     let body = read_body(&args.body_file)?;
     let mut locked = lock_registry(context)?;
     let registry_changed = clean_expired(&mut locked.registry, now_epoch());
@@ -292,6 +353,7 @@ pub(crate) fn reply(context: &CliContext, args: MessageReplyArgs) -> Result<Valu
         None,
         args.idempotency_key,
         "message-reply",
+        &capability_file,
         Some(original.reply_depth.saturating_add(1)),
         Some(&original.sender_incarnation),
         Some(args.if_revision),
@@ -367,6 +429,7 @@ fn send_authenticated(
     expires_in: Option<&str>,
     idempotency_key: String,
     operation: &'static str,
+    capability_file: &Path,
     explicit_reply_depth: Option<u8>,
     expected_recipient_incarnation: Option<&str>,
     expected_parent_revision: Option<u64>,
@@ -378,8 +441,18 @@ fn send_authenticated(
             None,
         ));
     }
-    let _recipient_lifecycle = crate::acquire_session_record_lock(context, recipient_session_id)
-        .map_err(|_| message_not_found())?;
+    let mut lifecycle_ids = vec![sender_session_id, recipient_session_id];
+    lifecycle_ids.sort_unstable();
+    lifecycle_ids.dedup();
+    let mut _lifecycle_locks = Vec::with_capacity(lifecycle_ids.len());
+    for session_id in lifecycle_ids {
+        _lifecycle_locks.push(
+            crate::acquire_session_record_lock(context, session_id)
+                .map_err(|_| message_not_found())?,
+        );
+    }
+    let sender = crate::load_session_record(context, sender_session_id)
+        .map_err(|_| super::unauthorized())?;
     let recipient = crate::load_session_record(context, recipient_session_id)
         .map_err(|_| message_not_found())?;
     let recipient_incarnation = incarnation(&recipient).map_err(|_| message_not_found())?;
@@ -399,11 +472,19 @@ fn send_authenticated(
             "body_digest": super::digest_bytes(body.as_bytes()),
             "reply_to": reply_to,
             "expiry_secs": expiry_secs,
+            "if_revision": expected_parent_revision,
         }),
     );
     let now = now_epoch();
     let mut locked = lock_registry(context)?;
     clean_expired(&mut locked.registry, now);
+    revalidate_capability_file(
+        context,
+        &locked.registry,
+        &sender,
+        sender_incarnation,
+        capability_file,
+    )?;
     let broker = locked
         .registry
         .brokers
@@ -459,6 +540,24 @@ fn send_authenticated(
             None,
         ));
     }
+    let now_millis = now_epoch_millis();
+    let pair_burst = locked
+        .registry
+        .messages
+        .iter()
+        .filter(|message| {
+            message.sender_session_id == sender_session_id
+                && message.recipient_session_id == recipient.id
+                && message.created_at_epoch_millis > now_millis.saturating_sub(1_000)
+        })
+        .count();
+    if pair_burst >= PAIR_BURST {
+        return Err(CliError::data(
+            "rate-limited",
+            "coordination message burst limit exceeded",
+            None,
+        ));
+    }
     let live_for_recipient: Vec<_> = locked
         .registry
         .messages
@@ -506,6 +605,11 @@ fn send_authenticated(
             if expected_parent_revision.is_some_and(|revision| parent.revision != revision) {
                 return Err(message_revision_conflict());
             }
+            if parent.sender_session_id != recipient.id
+                || parent.sender_incarnation != recipient_incarnation
+            {
+                return Err(message_not_found());
+            }
             let expected =
                 explicit_reply_depth.unwrap_or_else(|| parent.reply_depth.saturating_add(1));
             if expected > MAX_REPLY_DEPTH {
@@ -532,6 +636,7 @@ fn send_authenticated(
         reply_depth,
         created_at: timestamp(now),
         created_at_epoch: now,
+        created_at_epoch_millis: now_millis,
         expires_at: timestamp(now.saturating_add(expiry_secs)),
         expires_at_epoch: now.saturating_add(expiry_secs),
         terminal_at_epoch: None,
@@ -564,8 +669,13 @@ fn send_authenticated(
     Ok(outcome)
 }
 
-fn read_body(path: &std::path::Path) -> Result<String, CliError> {
-    let metadata = fs::metadata(path).map_err(|_| body_invalid())?;
+fn read_body(path: &Path) -> Result<String, CliError> {
+    let mut file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)
+        .map_err(|_| body_invalid())?;
+    let metadata = file.metadata().map_err(|_| body_invalid())?;
     if !metadata.is_file() || metadata.len() as usize > BODY_MAX_BYTES {
         return Err(if metadata.len() as usize > BODY_MAX_BYTES {
             CliError::data(
@@ -577,7 +687,18 @@ fn read_body(path: &std::path::Path) -> Result<String, CliError> {
             body_invalid()
         });
     }
-    let bytes = fs::read(path).map_err(|_| body_invalid())?;
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    file.by_ref()
+        .take((BODY_MAX_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
+        .map_err(|_| body_invalid())?;
+    if bytes.len() > BODY_MAX_BYTES {
+        return Err(CliError::data(
+            "mailbox-body-too-large",
+            "coordination message body exceeds 16 KiB",
+            None,
+        ));
+    }
     let body = String::from_utf8(bytes).map_err(|_| body_invalid())?;
     if body.is_empty()
         || body.contains('\0')
@@ -588,6 +709,12 @@ fn read_body(path: &std::path::Path) -> Result<String, CliError> {
         return Err(body_invalid());
     }
     Ok(body)
+}
+
+fn resolve_capability_file(path: Option<&Path>) -> Result<PathBuf, CliError> {
+    path.map(PathBuf::from)
+        .or_else(|| std::env::var_os(super::CAPABILITY_ENV).map(PathBuf::from))
+        .ok_or_else(super::unauthorized)
 }
 
 fn metadata(message: &StoredMessage) -> MessageMetadata {
@@ -697,6 +824,15 @@ fn message_expired() -> CliError {
     CliError::data("message-expired", "coordination message has expired", None)
 }
 
+fn now_epoch_millis() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .try_into()
+        .unwrap_or(i64::MAX)
+}
+
 fn message_revision_conflict() -> CliError {
     CliError::data(
         "message-revision-conflict",
@@ -724,6 +860,7 @@ mod tests {
             reply_depth: 0,
             created_at: "time".to_string(),
             created_at_epoch: 0,
+            created_at_epoch_millis: 0,
             expires_at: "time".to_string(),
             expires_at_epoch: 1,
             terminal_at_epoch: None,

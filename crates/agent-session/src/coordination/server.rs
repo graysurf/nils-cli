@@ -96,6 +96,13 @@ pub(crate) struct WaitBody {
     pub timeout: String,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct BrokerRecoveryBody {
+    pub proof: Value,
+    pub idempotency_key: String,
+}
+
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct InboxQuery {
@@ -104,25 +111,18 @@ pub(crate) struct InboxQuery {
     pub limit: Option<usize>,
 }
 
-pub(crate) fn show(context: &CliContext, id: &str, token: &str) -> Result<Value, CliError> {
-    let server_capability = authorize(context, id, token)?;
+pub(crate) fn show(context: &CliContext, id: &str) -> Result<Value, CliError> {
     claims::show(
         context,
         cli::WorkContextShowArgs {
             session: id.to_string(),
-            capability_file: Some(server_capability.path.clone()),
+            capability_file: None,
             format: nils_common::cli_contract::OutputFormat::Json,
         },
     )
 }
 
-pub(crate) fn check(
-    context: &CliContext,
-    id: &str,
-    token: &str,
-    body: CheckBody,
-) -> Result<Value, CliError> {
-    let server_capability = authorize(context, id, token)?;
+pub(crate) fn check(context: &CliContext, id: &str, body: CheckBody) -> Result<Value, CliError> {
     with_optional_json(
         context,
         id,
@@ -132,8 +132,9 @@ pub(crate) fn check(
             claims::check(
                 context,
                 cli::WorkContextCheckArgs {
-                    session: id.to_string(),
-                    capability_file: Some(server_capability.path.clone()),
+                    session: candidate.is_none().then(|| id.to_string()),
+                    self_selector: false,
+                    capability_file: None,
                     candidate,
                     allow_incomplete: body.allow_incomplete,
                     format: nils_common::cli_contract::OutputFormat::Json,
@@ -141,6 +142,29 @@ pub(crate) fn check(
             )
         },
     )
+}
+
+pub(crate) fn check_candidate(context: &CliContext, body: CheckBody) -> Result<Value, CliError> {
+    let candidate = body.candidate.as_ref().ok_or_else(|| {
+        CliError::usage(
+            "invalid-check-selector",
+            "registry-level conflict checks require a candidate",
+            None,
+        )
+    })?;
+    with_json(context, "registry", "candidate", candidate, |candidate| {
+        claims::check(
+            context,
+            cli::WorkContextCheckArgs {
+                session: None,
+                self_selector: false,
+                capability_file: None,
+                candidate: Some(candidate),
+                allow_incomplete: body.allow_incomplete,
+                format: nils_common::cli_contract::OutputFormat::Json,
+            },
+        )
+    })
 }
 
 pub(crate) fn claim(
@@ -298,18 +322,39 @@ pub(crate) fn reconcile(
     })
 }
 
-pub(crate) fn broker_status(
-    context: &CliContext,
-    id: &str,
-    token: &str,
-) -> Result<Value, CliError> {
-    let server_capability = authorize(context, id, token)?;
+pub(crate) fn broker_status(context: &CliContext, id: &str) -> Result<Value, CliError> {
     super::broker::status(
         context,
         cli::BrokerStatusArgs {
             session: id.to_string(),
-            capability_file: Some(server_capability.path.clone()),
+            capability_file: None,
             format: nils_common::cli_contract::OutputFormat::Json,
+        },
+    )
+}
+
+pub(crate) fn broker_recover(
+    context: &CliContext,
+    id: &str,
+    body: BrokerRecoveryBody,
+    reconcile: bool,
+) -> Result<Value, CliError> {
+    with_json(
+        context,
+        id,
+        "broker-recovery-proof",
+        &body.proof,
+        |proof_file| {
+            super::broker::recover(
+                context,
+                cli::BrokerRecoveryArgs {
+                    session: id.to_string(),
+                    proof_file,
+                    idempotency_key: body.idempotency_key,
+                    format: nils_common::cli_contract::OutputFormat::Json,
+                },
+                reconcile,
+            )
         },
     )
 }
@@ -454,7 +499,12 @@ impl Drop for ServerCapability {
 
 fn authorize(context: &CliContext, id: &str, token: &str) -> Result<ServerCapability, CliError> {
     authenticate_token(context, id, token)?;
-    let directory = super::coordination_dir(context, id);
+    let directory = if id == "registry" {
+        drop(super::lock_registry(context)?);
+        context.state_dir.join("coordination")
+    } else {
+        super::coordination_dir(context, id)
+    };
     let path = directory.join(format!(
         ".server-capability-{}.request",
         uuid::Uuid::new_v4()
@@ -510,7 +560,12 @@ fn with_bytes<T>(
     bytes: &[u8],
     operation: impl FnOnce(PathBuf) -> Result<T, CliError>,
 ) -> Result<T, CliError> {
-    let directory = super::coordination_dir(context, id);
+    let directory = if id == "registry" {
+        drop(super::lock_registry(context)?);
+        context.state_dir.join("coordination")
+    } else {
+        super::coordination_dir(context, id)
+    };
     let path = directory.join(format!(".{label}-{}.request", uuid::Uuid::new_v4()));
     write_atomic(&path, bytes, SECRET_FILE_MODE).map_err(|_| {
         CliError::runtime(

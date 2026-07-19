@@ -72,7 +72,7 @@ Public claims use `agent-session.work-context.v1`:
   ],
   "plan_refs": ["docs/plans/2026-07-19-topic/topic-plan.md"],
   "scopes": [
-    {"kind": "path-prefix", "repository": "owner/repository", "value": "src/"}
+    {"kind": "path-prefix", "repository": "owner/repository", "value": "src"}
   ],
   "summary": "Implement session coordination",
   "updated_at": "2030-01-01T00:00:00Z",
@@ -138,10 +138,9 @@ V1 scope kinds are closed:
 
 | Kind | Value | Overlap rule |
 | --- | --- | --- |
-| `repository` | empty | Conflicts with every scope in the same repository. |
+| `repository` | fixed value `.` | Conflicts with every scope in the same repository. |
 | `path-exact` | normalized repo-relative file/path | Conflicts with the same exact path and a covering prefix. |
-| `path-prefix` | normalized repo-relative directory ending `/` | Conflicts with equal, ancestor, or descendant prefixes and contained exact paths. |
-| `capability` | lower-kebab identifier | Same repository plus exact capability name conflicts. |
+| `path-prefix` | normalized repo-relative path without a trailing `/` | Conflicts with equal, ancestor, or descendant prefixes and contained exact paths at `/` boundaries. |
 
 Unknown kinds are rejected. Empty, absolute, host-qualified, home-relative,
 symlink-escaped, and dot-segment path values are rejected. Canonicalization is
@@ -149,8 +148,7 @@ byte-stable across CLI and HTTP.
 
 Worktree values are non-reversible HMAC-SHA256 fingerprints using a private
 registry key and a public key epoch. Raw checkout paths never enter the
-registry projection. Key rotation keeps bounded prior epochs for comparison;
-an unknown epoch is incomparable rather than clear.
+registry projection. An unknown epoch is incomparable rather than clear.
 
 ### Conflict truth table
 
@@ -186,11 +184,12 @@ receive an admitted claim.
 
 | Operation | Required authority |
 | --- | --- |
-| self show/check/claim/renew/release | matching session capability and incarnation |
+| work-context show/session check/candidate check | public registry read; HTTP additionally requires the server operator token |
+| self check/claim/renew/release | matching session capability and incarnation |
 | operation admit/complete/reconcile | matching session capability, active claim, and execution token/proof |
 | message send | matching sender capability |
 | inbox/show/ack/reply/wait | matching recipient capability |
-| broker status | matching owner capability or server operator read |
+| broker status | public registry read; HTTP additionally requires the server operator token |
 | broker adopt/reconcile | local lifecycle lock plus proof selectors matching an unchanged, live, exact persisted runtime whose broker is demonstrably lost |
 | HTTP registry-wide candidate check | server operator token; explicit subject/candidate rules still apply |
 
@@ -213,28 +212,34 @@ States are `active`, `stale`, `released`, and `expired`.
   broker. Heartbeat occurs before half the TTL.
 - `release` is idempotent for the same principal/request and never affects a
   different incarnation. Release or replacement is rejected while a bound
-  operation remains `active` or `completing`.
+  operation remains `active`, `completing`, or `reconcile_pending`.
 - Broker loss marks the owner unavailable for new operations and eventually
   stales the claim. Pane liveness alone cannot renew a claim.
 
 ## Operation lease state machine
 
-States are `active`, `completing`, `completed`, `failed`, and `abandoned`;
+States are `active`, `completing`, `reconcile_pending`, `completed`, `failed`, and `abandoned`;
 `expired` is accepted only as a retained backward-compatible terminal state.
 
-- `admit` re-evaluates peers atomically and proves every canonical mutation
-  target is a subset of the authenticated active claim before creating a lease.
+- `admit` re-evaluates peers atomically and proves every canonical filesystem
+  scope and provider reference is a subset of the authenticated active claim
+  before creating a 30-minute lease. Filesystem targets bind each repository to
+  a canonical checkout whose `origin` matches the declared repository.
 - Opaque repository effects require an explicit repository scope. Symlink,
   multi-target, and normalized path checks apply to every target.
 - A 30-minute claim does not release a known long operation. Reaching the
   operation safety TTL moves `active` to fail-closed `completing`; it never
   asserts terminality or removes the bound claim's exclusion.
-- `complete` is idempotent and records the terminal tool result without raw
+- A matching working activity identity or exact live descendant renews the
+  operation. Pane/process-group liveness by itself never renews it.
+- `complete` is idempotent from `active`, `completing`, or
+  `reconcile_pending` and records the terminal tool result without raw
   stdout/stderr.
 - `reconcile` repairs a missed completion only when the token digest matches and
-  controller-owned state proves that the unchanged exact persisted runtime has
-  stopped. Activity events and caller-supplied idle or descendant booleans are
-  not accepted as terminal proof.
+  controller-owned state proves the unchanged exact persisted runtime stopped,
+  or when two quiescent activity/no-descendant observations at least five
+  seconds apart move `reconcile_pending` to terminal. Caller-supplied idle or
+  descendant booleans are not accepted as proof.
 - Uncertain heartbeat or proof blocks later owner operations and competing
   admission until validated recovery; it does not silently expire an active
   mutation.
@@ -246,8 +251,9 @@ bytes. Receipts bind principal, incarnation, operation, canonical request
 digest, and outcome for 24 hours.
 
 - Same key and same digest returns the original outcome.
-- Same key with different request, principal, incarnation, or operation returns
-  `idempotency-conflict` with no request content.
+- Same key with a different request under the same principal, incarnation, and
+  operation returns `idempotency-key-reused` with no request content. The same
+  raw key in another principal/incarnation/operation namespace is independent.
 - Receipt cleanup is bounded and never removes a live claim, operation, or
   unread message needed to explain the retained outcome.
 
@@ -259,14 +265,15 @@ Limits are normative:
 - expiry: 24 hours default, 7 days maximum;
 - per session: 256 messages and 4 MiB stored bytes;
 - per registry: 64 MiB stored bytes;
-- send rate: 30 messages per sender-recipient pair per minute;
+- send rate: 30 messages per sender-recipient pair per minute, burst 10;
 - inbox page: 50 default, 100 maximum;
 - wait: 60 seconds maximum;
 - reply depth: 16 maximum.
 
 Message states are `unread`, `read`, `acknowledged`, `expired`, and `deleted`.
 Send, ack, and reply are idempotent. Inbox ordering is `(created_at,
-message_id)`. Wait is cancellable, bounded, and returns on state/revision change
+message_id)` and cursors are opaque, query-bound, principal-bound, and bounded.
+Wait is cancellable, bounded, and returns on state/revision change
 without busy looping. Cleanup never evicts live unread mail to admit new data;
 quota exhaustion returns a typed error.
 
@@ -332,8 +339,8 @@ Every leaf command has its own CLI envelope identity, for example
 
 ```text
 agent-session work-context claim --session ID --file JSON --capability-file FILE --idempotency-key KEY [--if-revision N]
-agent-session work-context show --session ID --capability-file FILE
-agent-session work-context check --session ID --capability-file FILE [--candidate JSON] [--allow-incomplete]
+agent-session work-context show --session ID
+agent-session work-context check (--self --capability-file FILE | --session ID | --candidate JSON) [--allow-incomplete]
 agent-session work-context renew --session ID --claim UUID --if-revision N --capability-file FILE --idempotency-key KEY
 agent-session work-context release --session ID --claim UUID --if-revision N --capability-file FILE --idempotency-key KEY
 agent-session work-context admit --session ID --claim UUID --if-revision N --targets-file JSON --operation KIND --execution-token-file FILE --capability-file FILE --idempotency-key KEY
@@ -363,24 +370,29 @@ The loopback server exposes the same library operations and schemas:
 ```text
 GET  /sessions/{id}/work-context/v1
 POST /sessions/{id}/work-context/check/v1
+POST /coordination/work-context/check/v1
 POST /sessions/{id}/work-context/claim/v1
 POST /sessions/{id}/work-context/renew/v1
 POST /sessions/{id}/work-context/release/v1
 POST /sessions/{id}/work-context/admit/v1
 POST /sessions/{id}/work-context/complete/v1
 POST /sessions/{id}/work-context/reconcile/v1
-GET  /sessions/{id}/coordination-broker/v1
+GET  /sessions/{id}/broker/v1
+POST /sessions/{id}/broker/adopt/v1
+POST /sessions/{id}/broker/reconcile/v1
 GET  /sessions/{id}/messages/v1
 POST /sessions/{id}/messages/v1
 GET  /sessions/{id}/messages/{message_id}/v1
 POST /sessions/{id}/messages/{message_id}/ack/v1
 POST /sessions/{id}/messages/{message_id}/reply/v1
-POST /sessions/{id}/messages/{message_id}/wait/v1
+GET  /sessions/{id}/messages/{message_id}/wait/v1
 ```
 
 CLI and HTTP share one implementation, canonicalization, authorization,
-idempotency, error codes, limits, and privacy projection. Conflicting selectors
-are rejected. Wait cancellation closes without changing message state.
+idempotency, error codes, limits, and privacy projection. HTTP public reads
+require only the server operator bearer; owner/mailbox mutations additionally
+require the exact session capability. Conflicting selectors are rejected. Wait
+cancellation closes without changing message state.
 
 ## Public list and glance additions
 
@@ -407,7 +419,9 @@ The v1 surface distinguishes at least:
   `claim-revision-conflict`, `message-revision-conflict`;
 - `unsupported-work-context-version`, `invalid-work-context`,
   `invalid-scope`, `uncovered-mutation-scope`, `incomplete-conflict-view`;
-- `claim-conflict`, `idempotency-conflict`, `quota-exceeded`, `rate-limited`,
+- `claim-conflict`, `idempotency-key-reused`, `operation-in-progress`,
+  `operation-reconcile-pending`, `broker-replacement-grace`,
+  `quota-exceeded`, `rate-limited`,
   `cursor-invalid`, `wait-timeout`, `wait-cancelled`;
 - `mailbox-body-invalid`, `mailbox-body-too-large`, `reply-depth-exceeded`,
   `message-expired`, `message-not-found`;

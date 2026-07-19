@@ -96,14 +96,16 @@ before removing the session.
 `work-context claim|show|check|renew|release` manages an authenticated
 30-minute structured claim. Claims contain canonical repositories, private-keyed
 worktree fingerprints, provider and plan references, and closed
-`repository|path-exact|path-prefix|capability` scopes. `check` is advisory;
+`repository|path-exact|path-prefix` scopes. `check` is advisory;
 `claim` evaluates and acquires under one bounded registry lock, so concurrent
 definite contenders cannot both succeed. `work-context
-admit|complete|reconcile` binds a covered mutation target set to an execution
-token, the controller-observed activity revision, and the exact persisted
+admit|complete|reconcile` binds covered filesystem/provider mutation targets to
+an execution token, exact activity/descendant evidence, and the persisted
 runtime identity. Releasing or replacing the claim is rejected while that
-operation is active or uncertain; reconciliation derives terminality from
-controller-owned state rather than caller booleans. Opaque or uncovered targets fail closed.
+operation is active or uncertain; a matching activity or descendant renews the
+30-minute lease, and missed completion needs exact stopped-runtime proof or two
+quiescent observations at least five seconds apart. Opaque, unbound-checkout,
+or uncovered targets fail closed.
 Peer summaries remain untrusted metadata and cannot authorize commands.
 
 `message send|inbox|show|ack|reply|wait` provides the private bounded mailbox.
@@ -111,7 +113,8 @@ Only the authenticated recipient can read a body, returned as
 `body.classification: "untrusted_peer_data"`; send results, inbox rows, errors,
 list, and glance never contain it. V1 enforces the documented 16 KiB body,
 24-hour default/7-day maximum expiry, 256-message/4 MiB per-session, 64 MiB
-registry, 30-pair/minute, 50/100-page, 60-second wait, and depth-16 reply limits.
+registry, 30-pair/minute with burst 10, opaque bounded cursors, 50/100-page,
+60-second wait, and depth-16 reply limits.
 Acknowledged entries retain metadata for 24 hours; expired entries have bounded
 terminal retention, and the HTTP
 surface admits at most 16 blocking waits at once.
@@ -124,9 +127,10 @@ The complete schemas, scope truth table, state machines, error codes, and route
 matrix are in
 [`docs/specs/session-coordination-v1.md`](docs/specs/session-coordination-v1.md).
 Managed calls normally use the capability path from the environment; external
-CLI calls pass `--capability-file`. HTTP coordination routes require both the
-serve bearer token and `X-Agent-Session-Capability`, keeping operator and session
-authority separate. List and glance add only claim state/id/expiry, unread
+CLI mutations pass `--capability-file`. HTTP public work-context/broker reads
+require the serve bearer token; owner and mailbox mutations additionally require
+`X-Agent-Session-Capability`, keeping operator and session authority separate.
+List and glance add only claim state/id/expiry, unread
 count, conflict severity, and coordination availability fields; the existing
 `cwd` field remains unchanged.
 

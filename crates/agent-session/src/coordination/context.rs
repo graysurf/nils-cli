@@ -1,6 +1,7 @@
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -18,7 +19,6 @@ pub enum ScopeKind {
     Repository,
     PathExact,
     PathPrefix,
-    Capability,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq, PartialOrd, Ord)]
@@ -36,6 +36,13 @@ pub struct ProviderRef {
     pub kind: String,
     pub repository: String,
     pub number: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(deny_unknown_fields)]
+pub struct CheckoutBinding {
+    pub repository: String,
+    pub path: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -136,10 +143,10 @@ impl WorkContextInput {
             return Err(invalid_context("tier must be L0, L1, L2, or L3"));
         }
         self.summary = bounded_text("summary", self.summary, 240)?;
-        canonicalize_unique(&mut self.repositories, 16, canonical_repository)?;
-        canonicalize_unique(&mut self.worktrees, 16, canonical_worktree)?;
-        canonicalize_unique(&mut self.plan_refs, 32, canonical_plan_ref)?;
-        if self.provider_refs.len() > 32 || self.scopes.len() > 64 {
+        canonicalize_unique(&mut self.repositories, 8, canonical_repository)?;
+        canonicalize_unique(&mut self.worktrees, 8, canonical_worktree)?;
+        canonicalize_unique(&mut self.plan_refs, 16, canonical_plan_ref)?;
+        if self.provider_refs.len() > 16 || self.scopes.len() > 32 {
             return Err(invalid_context("work context exceeds collection limits"));
         }
         for reference in &mut self.provider_refs {
@@ -157,14 +164,13 @@ impl WorkContextInput {
             scope.repository = canonical_repository(scope.repository.clone())?;
             scope.value = match scope.kind {
                 ScopeKind::Repository => {
-                    if !scope.value.trim().is_empty() {
-                        return Err(invalid_scope("repository scope value must be empty"));
+                    if scope.value.trim() != "." {
+                        return Err(invalid_scope("repository scope value must be ."));
                     }
-                    String::new()
+                    ".".to_string()
                 }
                 ScopeKind::PathExact => canonical_relative_path(&scope.value, false)?,
-                ScopeKind::PathPrefix => canonical_relative_path(&scope.value, true)?,
-                ScopeKind::Capability => bounded_slug("capability scope", &scope.value, 64)?,
+                ScopeKind::PathPrefix => canonical_relative_path(&scope.value, false)?,
             };
             if !self.repositories.contains(&scope.repository) {
                 return Err(invalid_scope(
@@ -179,8 +185,7 @@ impl WorkContextInput {
 }
 
 pub fn evaluate(
-    candidate_session: &str,
-    candidate_incarnation: &str,
+    excluded_principal: Option<(&str, &str)>,
     candidate: &WorkContextInput,
     active: &[WorkContextRecord],
     complete_registry: bool,
@@ -191,8 +196,9 @@ pub fn evaluate(
     let mut potential = false;
     let mut effective_complete = complete_registry;
     for peer in active {
-        if peer.session_id == candidate_session && peer.session_incarnation == candidate_incarnation
-        {
+        if excluded_principal.is_some_and(|(session, incarnation)| {
+            peer.session_id == session && peer.session_incarnation == incarnation
+        }) {
             continue;
         }
         if peer.state != "active" {
@@ -334,8 +340,7 @@ mod review_tests {
         }))
         .expect("peer");
         let evaluation = evaluate(
-            "candidate",
-            "candidate-incarnation",
+            Some(("candidate", "candidate-incarnation")),
             &candidate,
             &[peer],
             true,
@@ -377,13 +382,11 @@ pub fn scopes_overlap(left: &Scope, right: &Scope) -> bool {
     }
     match (&left.kind, &right.kind) {
         (ScopeKind::Repository, _) | (_, ScopeKind::Repository) => true,
-        (ScopeKind::Capability, ScopeKind::Capability) => left.value == right.value,
-        (ScopeKind::Capability, _) | (_, ScopeKind::Capability) => false,
         (ScopeKind::PathExact, ScopeKind::PathExact) => left.value == right.value,
-        (ScopeKind::PathExact, ScopeKind::PathPrefix) => left.value.starts_with(&right.value),
-        (ScopeKind::PathPrefix, ScopeKind::PathExact) => right.value.starts_with(&left.value),
+        (ScopeKind::PathExact, ScopeKind::PathPrefix) => path_is_within(&left.value, &right.value),
+        (ScopeKind::PathPrefix, ScopeKind::PathExact) => path_is_within(&right.value, &left.value),
         (ScopeKind::PathPrefix, ScopeKind::PathPrefix) => {
-            left.value.starts_with(&right.value) || right.value.starts_with(&left.value)
+            path_is_within(&left.value, &right.value) || path_is_within(&right.value, &left.value)
         }
     }
 }
@@ -396,15 +399,25 @@ pub fn scope_covers(claim: &Scope, target: &Scope) -> bool {
         (ScopeKind::Repository, _) => true,
         (ScopeKind::PathExact, ScopeKind::PathExact) => claim.value == target.value,
         (ScopeKind::PathPrefix, ScopeKind::PathExact)
-        | (ScopeKind::PathPrefix, ScopeKind::PathPrefix) => target.value.starts_with(&claim.value),
-        (ScopeKind::Capability, ScopeKind::Capability) => claim.value == target.value,
+        | (ScopeKind::PathPrefix, ScopeKind::PathPrefix) => {
+            path_is_within(&target.value, &claim.value)
+        }
         _ => false,
     }
 }
 
+fn path_is_within(path: &str, prefix: &str) -> bool {
+    path == prefix
+        || path
+            .strip_prefix(prefix)
+            .is_some_and(|suffix| suffix.starts_with('/'))
+}
+
 pub fn canonicalize_targets(mut targets: Vec<Scope>) -> Result<Vec<Scope>, CliError> {
-    if targets.is_empty() || targets.len() > 64 {
-        return Err(invalid_scope("operation targets must contain 1-64 scopes"));
+    if targets.len() > 32 {
+        return Err(invalid_scope(
+            "operation targets may contain at most 32 scopes",
+        ));
     }
     let repositories: BTreeSet<_> = targets
         .iter()
@@ -414,14 +427,13 @@ pub fn canonicalize_targets(mut targets: Vec<Scope>) -> Result<Vec<Scope>, CliEr
         target.repository = canonical_repository(target.repository.clone())?;
         target.value = match target.kind {
             ScopeKind::Repository => {
-                if !target.value.trim().is_empty() {
-                    return Err(invalid_scope("repository target value must be empty"));
+                if target.value.trim() != "." {
+                    return Err(invalid_scope("repository target value must be ."));
                 }
-                String::new()
+                ".".to_string()
             }
             ScopeKind::PathExact => canonical_relative_path(&target.value, false)?,
-            ScopeKind::PathPrefix => canonical_relative_path(&target.value, true)?,
-            ScopeKind::Capability => bounded_slug("capability target", &target.value, 64)?,
+            ScopeKind::PathPrefix => canonical_relative_path(&target.value, false)?,
         };
         if !repositories.contains(&target.repository) {
             return Err(invalid_scope("operation target repository is invalid"));
@@ -432,35 +444,120 @@ pub fn canonicalize_targets(mut targets: Vec<Scope>) -> Result<Vec<Scope>, CliEr
     Ok(targets)
 }
 
-pub fn validate_physical_targets(cwd: &str, targets: &[Scope]) -> Result<(), CliError> {
-    let cwd = fs::canonicalize(cwd).map_err(|_| physical_target_unavailable())?;
-    let root = repository_root(&cwd).ok_or_else(physical_target_unavailable)?;
-    let root = fs::canonicalize(root).map_err(|_| physical_target_unavailable())?;
-    for target in targets
+pub fn canonicalize_provider_refs(
+    mut references: Vec<ProviderRef>,
+) -> Result<Vec<ProviderRef>, CliError> {
+    if references.len() > 16 {
+        return Err(invalid_scope(
+            "operation targets exceed the provider reference limit",
+        ));
+    }
+    for reference in &mut references {
+        reference.kind = bounded_slug("provider reference kind", &reference.kind, 32)?;
+        reference.repository = canonical_repository(reference.repository.clone())?;
+        if reference.number == 0 {
+            return Err(invalid_scope("provider reference number must be positive"));
+        }
+    }
+    references.sort();
+    reject_duplicates(&references, "provider reference")?;
+    Ok(references)
+}
+
+pub fn validate_physical_targets(
+    cwd: &str,
+    targets: &[Scope],
+    bindings: &[CheckoutBinding],
+) -> Result<(), CliError> {
+    let repositories: BTreeSet<_> = targets
         .iter()
-        .filter(|target| matches!(target.kind, ScopeKind::PathExact | ScopeKind::PathPrefix))
-    {
-        let relative = target.value.trim_end_matches('/');
-        let mut current = PathBuf::from(&root);
-        for component in Path::new(relative).components() {
-            current.push(component);
-            match fs::symlink_metadata(&current) {
-                Ok(metadata) => {
-                    if metadata.file_type().is_symlink() {
-                        return Err(physical_target_unavailable());
-                    }
-                    let resolved =
-                        fs::canonicalize(&current).map_err(|_| physical_target_unavailable())?;
-                    if !resolved.starts_with(&root) {
-                        return Err(physical_target_unavailable());
-                    }
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
-                Err(_) => return Err(physical_target_unavailable()),
-            }
+        .map(|target| target.repository.as_str())
+        .collect();
+    let mut roots = std::collections::BTreeMap::new();
+    for binding in bindings {
+        let repository = canonical_repository(binding.repository.clone())?;
+        if !repositories.contains(repository.as_str()) {
+            return Err(physical_target_unavailable());
+        }
+        if roots.contains_key(&repository) {
+            return Err(physical_target_unavailable());
+        }
+        roots.insert(repository, checkout_root(Path::new(&binding.path))?);
+    }
+    if repositories.len() == 1 {
+        let repository = (*repositories.first().expect("single repository")).to_string();
+        if let std::collections::btree_map::Entry::Vacant(entry) = roots.entry(repository) {
+            entry.insert(checkout_root(Path::new(cwd))?);
+        }
+    }
+    for repository in &repositories {
+        let root = roots
+            .get(*repository)
+            .ok_or_else(physical_target_unavailable)?;
+        if repository_for_checkout(root).as_deref() != Some(*repository) {
+            return Err(physical_target_unavailable());
+        }
+        for target in targets.iter().filter(|target| {
+            target.repository == **repository
+                && matches!(target.kind, ScopeKind::PathExact | ScopeKind::PathPrefix)
+        }) {
+            validate_target_path(root, &target.value)?;
         }
     }
     Ok(())
+}
+
+fn checkout_root(path: &Path) -> Result<PathBuf, CliError> {
+    let metadata = fs::symlink_metadata(path).map_err(|_| physical_target_unavailable())?;
+    if metadata.file_type().is_symlink() {
+        return Err(physical_target_unavailable());
+    }
+    let canonical = fs::canonicalize(path).map_err(|_| physical_target_unavailable())?;
+    let root = repository_root(&canonical).ok_or_else(physical_target_unavailable)?;
+    fs::canonicalize(root).map_err(|_| physical_target_unavailable())
+}
+
+fn validate_target_path(root: &Path, relative: &str) -> Result<(), CliError> {
+    let mut current = PathBuf::from(root);
+    for component in Path::new(relative).components() {
+        current.push(component);
+        match fs::symlink_metadata(&current) {
+            Ok(metadata) => {
+                if metadata.file_type().is_symlink() {
+                    return Err(physical_target_unavailable());
+                }
+                let resolved =
+                    fs::canonicalize(&current).map_err(|_| physical_target_unavailable())?;
+                if !resolved.starts_with(root) {
+                    return Err(physical_target_unavailable());
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
+            Err(_) => return Err(physical_target_unavailable()),
+        }
+    }
+    Ok(())
+}
+
+fn repository_for_checkout(root: &Path) -> Option<String> {
+    let output = Command::new("git")
+        .args(["-C", root.to_str()?, "remote", "get-url", "origin"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let remote = String::from_utf8(output.stdout).ok()?;
+    let remote = remote.trim().trim_end_matches(".git");
+    let path = remote
+        .rsplit_once(':')
+        .filter(|(prefix, _)| !prefix.contains('/'))
+        .map_or(remote, |(_, path)| path)
+        .trim_end_matches('/');
+    let mut parts = path.rsplit('/');
+    let repository = parts.next()?;
+    let owner = parts.next()?;
+    canonical_repository(format!("{owner}/{repository}")).ok()
 }
 
 fn repository_root(path: &Path) -> Option<&Path> {
@@ -476,7 +573,7 @@ fn physical_target_unavailable() -> CliError {
     )
 }
 
-fn canonical_repository(value: String) -> Result<String, CliError> {
+pub(crate) fn canonical_repository(value: String) -> Result<String, CliError> {
     let value = value.trim().to_ascii_lowercase();
     let mut parts = value.split('/');
     let owner = parts.next().unwrap_or_default();
@@ -516,38 +613,30 @@ fn canonical_plan_ref(value: String) -> Result<String, CliError> {
     canonical_relative_path(&value, false)
 }
 
-fn canonical_relative_path(value: &str, require_trailing_slash: bool) -> Result<String, CliError> {
+fn canonical_relative_path(value: &str, _require_trailing_slash: bool) -> Result<String, CliError> {
     let value = value.trim().replace('\\', "/");
     if value.is_empty()
         || value.starts_with('/')
         || value.starts_with('~')
         || value.contains('\0')
+        || value.contains(['*', '?', '[', ']', '{', '}', '!'])
         || value.chars().any(char::is_control)
     {
         return Err(invalid_scope(
             "path scope must be a safe repository-relative path",
         ));
     }
-    let trailing = value.ends_with('/');
-    if require_trailing_slash != trailing {
-        return Err(invalid_scope(if require_trailing_slash {
-            "path-prefix scope must end with /"
-        } else {
-            "exact path must not end with /"
-        }));
+    if value.ends_with('/') {
+        return Err(invalid_scope("path scope must not end with /"));
     }
-    let components: Vec<_> = value.trim_end_matches('/').split('/').collect();
+    let components: Vec<_> = value.split('/').collect();
     if components
         .iter()
         .any(|component| component.is_empty() || *component == "." || *component == "..")
     {
         return Err(invalid_scope("path scope contains an invalid component"));
     }
-    Ok(if trailing {
-        format!("{}/", components.join("/"))
-    } else {
-        components.join("/")
-    })
+    Ok(components.join("/"))
 }
 
 fn canonicalize_unique<F>(
@@ -644,7 +733,7 @@ mod tests {
 
     #[test]
     fn closed_scope_overlap_is_symmetric_and_boundary_safe() {
-        let prefix = scope(ScopeKind::PathPrefix, "src/");
+        let prefix = scope(ScopeKind::PathPrefix, "src");
         assert!(scopes_overlap(
             &prefix,
             &scope(ScopeKind::PathExact, "src/lib.rs")
@@ -654,14 +743,14 @@ mod tests {
             &scope(ScopeKind::PathExact, "src2/lib.rs")
         ));
         assert!(scopes_overlap(
-            &scope(ScopeKind::Repository, ""),
-            &scope(ScopeKind::Capability, "release")
+            &scope(ScopeKind::Repository, "."),
+            &scope(ScopeKind::PathExact, "release")
         ));
     }
 
     #[test]
     fn a_prefix_claim_covers_only_descendant_targets() {
-        let prefix = scope(ScopeKind::PathPrefix, "src/");
+        let prefix = scope(ScopeKind::PathPrefix, "src");
         assert!(scope_covers(
             &prefix,
             &scope(ScopeKind::PathExact, "src/lib.rs")
@@ -678,12 +767,32 @@ mod tests {
         let root = tmp.path().join("checkout");
         let outside = tmp.path().join("outside");
         fs::create_dir_all(root.join("src")).expect("checkout");
-        fs::create_dir(root.join(".git")).expect("git marker");
+        assert!(
+            Command::new("git")
+                .args(["init", root.to_str().expect("root")])
+                .status()
+                .expect("git init")
+                .success()
+        );
+        assert!(
+            Command::new("git")
+                .args([
+                    "-C",
+                    root.to_str().expect("root"),
+                    "remote",
+                    "add",
+                    "origin",
+                    "https://github.com/example/repo.git"
+                ])
+                .status()
+                .expect("git remote")
+                .success()
+        );
         fs::create_dir(&outside).expect("outside");
         std::os::unix::fs::symlink(&outside, root.join("src/link")).expect("symlink");
         let escaped = scope(ScopeKind::PathExact, "src/link/file.rs");
-        assert!(validate_physical_targets(root.to_str().expect("root"), &[escaped]).is_err());
+        assert!(validate_physical_targets(root.to_str().expect("root"), &[escaped], &[]).is_err());
         let inside = scope(ScopeKind::PathExact, "src/new.rs");
-        assert!(validate_physical_targets(root.to_str().expect("root"), &[inside]).is_ok());
+        assert!(validate_physical_targets(root.to_str().expect("root"), &[inside], &[]).is_ok());
     }
 }

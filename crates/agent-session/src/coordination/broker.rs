@@ -82,6 +82,7 @@ pub(crate) fn prepare(context: &CliContext, record: &SessionRecord) -> Result<()
 pub(crate) fn provision(context: &CliContext, record: &SessionRecord) -> Result<PathBuf, CliError> {
     prepare(context, record)?;
     let incarnation = incarnation(record)?;
+    let runtime = crate::coordination_runtime_evidence(record).ok();
     let generation = record
         .runtime
         .as_ref()
@@ -102,28 +103,84 @@ pub(crate) fn provision(context: &CliContext, record: &SessionRecord) -> Result<
         .filter(|broker| broker.incarnation != incarnation)
         .cloned();
     if let Some(previous) = previous_broker.as_ref() {
-        let previous_live = capability_available(
-            context,
-            &record.id,
-            &previous.incarnation,
-            &previous.capability_digest,
-        ) || heartbeat_fresh(
+        let heartbeat_live = heartbeat_fresh(
             context,
             &record.id,
             &previous.incarnation,
             previous.heartbeat_epoch,
         );
-        if previous_live {
+        let previous_runtime_status = previous
+            .runtime_identity
+            .as_ref()
+            .map(crate::coordination_runtime_status_for_identity)
+            .unwrap_or(crate::CoordinationRuntimeStatus::Unknown);
+        if heartbeat_live || previous_runtime_status == crate::CoordinationRuntimeStatus::Running {
+            if previous.lost_since_epoch.is_some() {
+                if let Some(previous) = locked.registry.brokers.get_mut(&record.id) {
+                    previous.lost_since_epoch = None;
+                }
+                locked.save()?;
+            }
             return Err(CliError::data(
                 "session-incarnation-conflict",
                 "the prior coordination incarnation is still live",
                 None,
             ));
         }
+        if previous_runtime_status == crate::CoordinationRuntimeStatus::Unknown {
+            return Err(CliError::runtime(
+                "coordination-runtime-unverified",
+                "the prior coordination runtime identity cannot be proven stopped",
+                None,
+            ));
+        }
+        let previous_operation = locked.registry.operations.iter().any(|lease| {
+            lease.session_id == record.id
+                && lease.session_incarnation == previous.incarnation
+                && matches!(
+                    lease.state.as_str(),
+                    "active" | "completing" | "reconcile_pending"
+                )
+        });
+        if previous_operation {
+            let unexpired = locked.registry.operations.iter().any(|lease| {
+                lease.session_id == record.id
+                    && lease.session_incarnation == previous.incarnation
+                    && matches!(
+                        lease.state.as_str(),
+                        "active" | "completing" | "reconcile_pending"
+                    )
+                    && lease.expires_at_epoch > now
+            });
+            if unexpired {
+                return Err(CliError::data(
+                    "operation-in-progress",
+                    "an unexpired operation remains bound to the prior incarnation",
+                    None,
+                ));
+            }
+            let lost_since = previous.lost_since_epoch.unwrap_or(now);
+            if previous.lost_since_epoch.is_none() {
+                if let Some(previous) = locked.registry.brokers.get_mut(&record.id) {
+                    previous.lost_since_epoch = Some(now);
+                }
+                locked.save()?;
+            }
+            if lost_since > now.saturating_sub(10 * 60) {
+                return Err(CliError::data(
+                    "broker-replacement-grace",
+                    "expired prior operations require ten minutes of continuously stopped runtime evidence",
+                    Some(json!({ "retry_after_epoch": lost_since.saturating_add(10 * 60) })),
+                ));
+            }
+        }
     } else if locked.registry.operations.iter().any(|lease| {
         lease.session_id == record.id
             && lease.session_incarnation != incarnation
-            && matches!(lease.state.as_str(), "active" | "completing")
+            && matches!(
+                lease.state.as_str(),
+                "active" | "completing" | "reconcile_pending"
+            )
     }) {
         return Err(CliError::data(
             "operation-in-progress",
@@ -151,7 +208,10 @@ pub(crate) fn provision(context: &CliContext, record: &SessionRecord) -> Result<
     for lease in &mut locked.registry.operations {
         if lease.session_id == record.id
             && lease.session_incarnation != incarnation
-            && matches!(lease.state.as_str(), "active" | "completing")
+            && matches!(
+                lease.state.as_str(),
+                "active" | "completing" | "reconcile_pending"
+            )
         {
             lease.state = "abandoned".to_string();
             lease.revision = lease.revision.saturating_add(1);
@@ -168,6 +228,12 @@ pub(crate) fn provision(context: &CliContext, record: &SessionRecord) -> Result<
             state: "starting".to_string(),
             heartbeat_at: String::new(),
             heartbeat_epoch: 0,
+            runtime_identity: runtime.as_ref().map(|runtime| runtime.identity.clone()),
+            runtime_identity_digest: runtime
+                .as_ref()
+                .map(|runtime| runtime.identity_digest.clone())
+                .unwrap_or_default(),
+            lost_since_epoch: None,
         },
     );
     if let Err(error) = locked.save() {
@@ -253,7 +319,12 @@ pub(crate) fn revoke(context: &CliContext, record: &SessionRecord) -> Result<(),
         broker.capability_digest.clear();
     }
     for claim in &mut locked.registry.claims {
-        if claim.session_id == record.id && claim.state == "active" {
+        if claim.session_id == record.id
+            && current_incarnation
+                .as_deref()
+                .is_some_and(|current| current == claim.session_incarnation)
+            && claim.state == "active"
+        {
             claim.state = "released".to_string();
             claim.revision = claim.revision.saturating_add(1);
             claim.updated_at = timestamp(now);
@@ -262,7 +333,13 @@ pub(crate) fn revoke(context: &CliContext, record: &SessionRecord) -> Result<(),
     }
     for operation in &mut locked.registry.operations {
         if operation.session_id == record.id
-            && matches!(operation.state.as_str(), "active" | "completing")
+            && current_incarnation
+                .as_deref()
+                .is_some_and(|current| current == operation.session_incarnation)
+            && matches!(
+                operation.state.as_str(),
+                "active" | "completing" | "reconcile_pending"
+            )
         {
             operation.state = "abandoned".to_string();
             operation.revision = operation.revision.saturating_add(1);
@@ -288,21 +365,19 @@ pub(crate) fn stop(context: &CliContext, args: BrokerStopArgs) -> Result<Value, 
 }
 
 pub(crate) fn status(context: &CliContext, args: BrokerStatusArgs) -> Result<Value, CliError> {
-    let (record, incarnation) =
-        authenticate_from_file(context, &args.session, args.capability_file.as_deref())?;
     let locked = lock_registry(context)?;
     let broker = locked
         .registry
         .brokers
-        .get(&record.id)
-        .filter(|broker| broker.incarnation == incarnation)
+        .get(&args.session)
         .ok_or_else(unavailable)?;
+    let incarnation = broker.incarnation.clone();
     let claim = locked
         .registry
         .claims
         .iter()
         .find(|claim| {
-            claim.session_id == record.id
+            claim.session_id == args.session
                 && claim.session_incarnation == incarnation
                 && claim.state == "active"
         })
@@ -318,7 +393,7 @@ pub(crate) fn status(context: &CliContext, args: BrokerStatusArgs) -> Result<Val
             .operations
             .iter()
             .filter(|lease| {
-                lease.session_id == record.id
+                lease.session_id == args.session
                     && lease.session_incarnation == incarnation
                     && lease.state == "active"
             })
@@ -328,24 +403,29 @@ pub(crate) fn status(context: &CliContext, args: BrokerStatusArgs) -> Result<Val
             .operations
             .iter()
             .filter(|lease| {
-                lease.session_id == record.id
+                lease.session_id == args.session
                     && lease.session_incarnation == incarnation
-                    && lease.state == "completing"
+                    && matches!(lease.state.as_str(), "completing" | "reconcile_pending")
             })
             .count(),
     };
     json_value(BrokerStatus {
         schema_version: BROKER_VERSION.to_string(),
-        session_id: record.id.clone(),
+        session_id: args.session.clone(),
         state: broker.state.clone(),
         generation: broker.generation,
         capability_available: capability_available(
             context,
-            &record.id,
+            &args.session,
             &incarnation,
             &broker.capability_digest,
         ),
-        heartbeat_fresh: heartbeat_fresh(context, &record.id, &incarnation, broker.heartbeat_epoch),
+        heartbeat_fresh: heartbeat_fresh(
+            context,
+            &args.session,
+            &incarnation,
+            broker.heartbeat_epoch,
+        ),
         claim,
         operation,
     })
@@ -386,7 +466,6 @@ pub(crate) fn recover(
         "broker-adopt"
     };
     let digest = request_digest(operation, &proof);
-    let now = now_epoch();
     {
         let locked = lock_registry(context)?;
         if let Some(replay) = idempotency_replay(
@@ -435,8 +514,76 @@ pub(crate) fn recover(
             None,
         ));
     }
-    let _path = provision(context, &record)?;
-    activate_ready(context, &record)?;
+    let now = now_epoch();
+    let mut locked = lock_registry(context)?;
+    if let Some(replay) = idempotency_replay(
+        &locked.registry,
+        &args.idempotency_key,
+        &record.id,
+        &record_incarnation,
+        operation,
+        &digest,
+    )? {
+        return Ok(replay);
+    }
+    let broker_snapshot = locked
+        .registry
+        .brokers
+        .get(&record.id)
+        .filter(|broker| {
+            broker.incarnation == record_incarnation && broker.generation == record_generation
+        })
+        .cloned()
+        .ok_or_else(unavailable)?;
+    if broker_snapshot.state == "ready"
+        && capability_available(
+            context,
+            &record.id,
+            &record_incarnation,
+            &broker_snapshot.capability_digest,
+        )
+        && heartbeat_fresh(
+            context,
+            &record.id,
+            &record_incarnation,
+            broker_snapshot.heartbeat_epoch,
+        )
+    {
+        return Err(CliError::data(
+            "coordination-broker-not-lost",
+            "the exact coordination broker is still healthy",
+            None,
+        ));
+    }
+    if broker_snapshot.runtime_identity_digest != runtime.identity_digest
+        || !capability_available(
+            context,
+            &record.id,
+            &record_incarnation,
+            &broker_snapshot.capability_digest,
+        )
+    {
+        return Err(CliError::runtime(
+            "coordination-runtime-unverified",
+            "recovery evidence does not match the persisted broker identity and capability",
+            None,
+        ));
+    }
+    write_atomic(
+        &super::heartbeat_path(&context.state_dir, &record.id),
+        format!("{}:{}\n", record_incarnation, now).as_bytes(),
+        SECRET_FILE_MODE,
+    )
+    .map_err(|_| unavailable())?;
+    let broker = locked
+        .registry
+        .brokers
+        .get_mut(&record.id)
+        .ok_or_else(unavailable)?;
+    broker.state = "ready".to_string();
+    broker.heartbeat_at = timestamp(now);
+    broker.heartbeat_epoch = now;
+    broker.lost_since_epoch = None;
     let result = json!({
         "schema_version": BROKER_VERSION,
         "session_id": record.id,
@@ -444,7 +591,6 @@ pub(crate) fn recover(
         "generation": record_generation,
         "recovery": if reconcile { "reconciled" } else { "adopted" }
     });
-    let mut locked = lock_registry(context)?;
     store_receipt(
         &mut locked.registry,
         args.idempotency_key,
