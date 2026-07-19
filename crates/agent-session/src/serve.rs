@@ -55,8 +55,8 @@ use crate::cli::{self, AgentKind, SpecialKey};
 use crate::codex_app_server::{self, ControlHandle};
 use crate::maintenance::{self, MaintenanceActionRequest, MaintenanceOperation};
 use crate::provider_prompt::{
-    MAX_PROVIDER_PROMPT_BYTES, PROVIDER_PROMPT_CAPABILITY, ProviderKind, ProviderPromptEvent,
-    ProviderPromptSource, ProviderPromptTail,
+    MAX_LAST_PROMPT_TAIL_BYTES, MAX_PROVIDER_PROMPT_BYTES, PROVIDER_PROMPT_CAPABILITY,
+    ProviderKind, ProviderPromptEvent, ProviderPromptSource, ProviderPromptTail, read_last_prompt,
 };
 use crate::{
     BINARY, CliContext, CliError, ProviderResumeImportArgs, SessionRecord, SessionRegistryFence,
@@ -2700,19 +2700,61 @@ async fn list_handler(State(state): State<Arc<ServeState>>) -> Response {
     })
     .await
     {
-        Ok(Ok((sessions, agent_profiles))) => envelope_ok(json!({
-            "machine": state.machine,
-            "observed_at": activity_observed_at(),
-            "sessions": sessions,
-            "agent_profiles": agent_profiles,
-            "capabilities": {
-                "profile_resume_import": true,
-                "managed_resume_command": false,
-                "resume_blocked_reason": true,
-            },
-        })),
+        Ok(Ok((mut sessions, agent_profiles))) => {
+            enrich_last_prompts(&state, &mut sessions).await;
+            envelope_ok(json!({
+                "machine": state.machine,
+                "observed_at": activity_observed_at(),
+                "sessions": sessions,
+                "agent_profiles": agent_profiles,
+                "capabilities": {
+                    "profile_resume_import": true,
+                    "managed_resume_command": false,
+                    "resume_blocked_reason": true,
+                    "last_prompt": true,
+                },
+            }))
+        }
         Ok(Err(err)) => envelope_err(err),
         Err(_) => join_err(),
+    }
+}
+
+/// Best-effort enrichment: attach each running Codex/Claude session's most recent
+/// user prompt to the list projection.
+///
+/// The prompt is read on demand from the provider transcript — the source of
+/// truth for every input path (console HTTP, Termius SSH, raw `tmux attach`) — and
+/// returned in the response only; it is never persisted by the daemon. The
+/// transcript path resolves through the bounded, backed-off discovery registry so
+/// a cold lookup never triggers an unbounded per-poll scan, and a turn that writes
+/// more than `MAX_LAST_PROMPT_TAIL_BYTES` after its prompt is a tolerated miss (the
+/// preview is simply omitted for that poll).
+async fn enrich_last_prompts(state: &Arc<ServeState>, sessions: &mut [SessionView]) {
+    for session in sessions.iter_mut() {
+        if session.status == "stopped" || !matches!(session.agent.as_str(), "codex" | "claude") {
+            continue;
+        }
+        let context = state.context.clone();
+        let id = session.id.clone();
+        let Ok(Ok(record)) =
+            tokio::task::spawn_blocking(move || load_session_record(&context, &id)).await
+        else {
+            continue;
+        };
+        let Some(source) = state
+            .provider_prompt_discovery
+            .resolve_source(&record)
+            .await
+        else {
+            continue;
+        };
+        session.last_prompt = tokio::task::spawn_blocking(move || {
+            read_last_prompt(&source, MAX_LAST_PROMPT_TAIL_BYTES)
+        })
+        .await
+        .ok()
+        .flatten();
     }
 }
 
@@ -11407,6 +11449,7 @@ esac
             list_body["data"]["capabilities"]["managed_resume_command"],
             false
         );
+        assert_eq!(list_body["data"]["capabilities"]["last_prompt"], true);
 
         let (status, body) = call(
             router(st),

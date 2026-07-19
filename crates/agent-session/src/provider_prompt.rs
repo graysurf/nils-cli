@@ -4,6 +4,7 @@ use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use serde::Serialize;
 use serde_json::Value;
 use uuid::Uuid;
 
@@ -19,6 +20,12 @@ const MAX_PROVIDER_LINE_BYTES: usize = 256 * 1024;
 const MAX_PROVIDER_READ_BYTES: usize = 64 * 1024;
 const PROVIDER_CONTINUITY_BYTES: usize = 4 * 1024;
 const CLAUDE_FALLBACK_DELAY: Duration = Duration::from_millis(750);
+/// Bytes read from the tail of a provider transcript when resolving the most
+/// recent user prompt for the list projection. The transcript is read on demand
+/// and the prompt is never persisted by the daemon. A turn that writes more than
+/// this many bytes after its prompt is a best-effort miss: the preview is simply
+/// omitted for that poll rather than triggering an unbounded scan.
+pub(crate) const MAX_LAST_PROMPT_TAIL_BYTES: usize = 256 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ProviderKind {
@@ -40,6 +47,16 @@ pub(crate) struct ProviderPromptEvent {
     pub(crate) id: String,
     pub(crate) prompt: String,
     pub(crate) submitted_at: String,
+    pub(crate) truncated: bool,
+}
+
+/// The most recent user prompt for a session, surfaced in the list projection.
+/// Serialized into the HTTP response only; never written to daemon storage.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct LastPrompt {
+    pub(crate) text: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) submitted_at: Option<String>,
     pub(crate) truncated: bool,
 }
 
@@ -417,6 +434,68 @@ fn bounded_prompt(prompt: &str) -> Option<ParsedPrompt> {
         truncated: true,
         submitted_at: None,
         turn_id: None,
+    })
+}
+
+/// Extract the most recent user prompt from a raw transcript byte window.
+///
+/// Lines are parsed with the same per-provider parsers used by the live tail;
+/// the last matching line wins. For Claude both a canonical `last-prompt` record
+/// and a plain `user` prompt are considered, so whichever is later in the file
+/// (i.e. newer) is returned. Invalid, foreign-session, or partial lines —
+/// including a torn leading line when the window starts mid-file — are skipped.
+fn extract_last_prompt(
+    buffer: &[u8],
+    provider: ProviderKind,
+    session_id: &str,
+) -> Option<ParsedPrompt> {
+    let mut last: Option<ParsedPrompt> = None;
+    for raw_line in buffer.split(|&byte| byte == b'\n') {
+        let raw_line = match raw_line.last() {
+            Some(b'\r') => &raw_line[..raw_line.len() - 1],
+            _ => raw_line,
+        };
+        let Ok(line) = std::str::from_utf8(raw_line) else {
+            continue;
+        };
+        if line.is_empty() {
+            continue;
+        }
+        let parsed = match provider {
+            ProviderKind::Codex => parse_codex_prompt(line),
+            ProviderKind::Claude => parse_claude_last_prompt(line, session_id)
+                .or_else(|| parse_claude_user_prompt(line, session_id)),
+        };
+        if parsed.is_some() {
+            last = parsed;
+        }
+    }
+    last
+}
+
+/// Read up to `max_bytes` from the tail of a regular transcript file.
+fn read_tail_window(path: &Path, max_bytes: usize) -> io::Result<Vec<u8>> {
+    let (mut file, metadata) = open_regular_file(path)?;
+    let start = metadata.len().saturating_sub(max_bytes as u64);
+    file.seek(SeekFrom::Start(start))?;
+    let mut buffer = Vec::new();
+    file.read_to_end(&mut buffer)?;
+    Ok(buffer)
+}
+
+/// Resolve the most recent user prompt for a discovered transcript source by
+/// reading a bounded tail window. The prompt text is returned to the caller and
+/// never persisted by the daemon.
+pub(crate) fn read_last_prompt(
+    source: &ProviderPromptSource,
+    max_bytes: usize,
+) -> Option<LastPrompt> {
+    let buffer = read_tail_window(&source.path, max_bytes).ok()?;
+    let parsed = extract_last_prompt(&buffer, source.provider, &source.session_id)?;
+    Some(LastPrompt {
+        text: parsed.prompt,
+        submitted_at: parsed.submitted_at,
+        truncated: parsed.truncated,
     })
 }
 
@@ -1104,6 +1183,93 @@ mod tests {
                 "lastPrompt":prompt
             })
         )
+    }
+
+    fn codex_agent_line(message: &str) -> String {
+        format!(
+            "{}\n",
+            json!({"type":"event_msg","payload":{"type":"agent_message","message":message}})
+        )
+    }
+
+    #[test]
+    fn extract_last_prompt_returns_latest_codex_user_message() {
+        let buffer = format!(
+            "{}{}{}",
+            codex_line("first prompt"),
+            codex_agent_line("assistant output"),
+            codex_line("latest prompt"),
+        );
+        let parsed = extract_last_prompt(buffer.as_bytes(), ProviderKind::Codex, "codex-id")
+            .expect("prompt");
+        assert_eq!(parsed.prompt, "latest prompt");
+        assert!(!parsed.truncated);
+    }
+
+    #[test]
+    fn extract_last_prompt_prefers_canonical_claude_last_prompt_within_a_turn() {
+        let buffer = format!(
+            "{}{}",
+            claude_user("claude-id", "typed draft"),
+            claude_last_prompt("claude-id", "leaf", "canonical final"),
+        );
+        let parsed = extract_last_prompt(buffer.as_bytes(), ProviderKind::Claude, "claude-id")
+            .expect("prompt");
+        assert_eq!(parsed.prompt, "canonical final");
+    }
+
+    #[test]
+    fn extract_last_prompt_returns_newer_user_line_after_a_prior_last_prompt() {
+        let buffer = format!(
+            "{}{}",
+            claude_last_prompt("claude-id", "leaf-a", "old turn"),
+            claude_user("claude-id", "new turn"),
+        );
+        let parsed = extract_last_prompt(buffer.as_bytes(), ProviderKind::Claude, "claude-id")
+            .expect("prompt");
+        assert_eq!(parsed.prompt, "new turn");
+    }
+
+    #[test]
+    fn extract_last_prompt_skips_torn_leading_line_and_foreign_sessions() {
+        let buffer = format!(
+            "{}{}{}",
+            "sionId\":\"claude-id\",\"lastPrompt\":\"torn}\n",
+            claude_user("other-id", "different session"),
+            claude_user("claude-id", "mine"),
+        );
+        let parsed = extract_last_prompt(buffer.as_bytes(), ProviderKind::Claude, "claude-id")
+            .expect("prompt");
+        assert_eq!(parsed.prompt, "mine");
+    }
+
+    #[test]
+    fn extract_last_prompt_returns_none_without_a_match() {
+        let buffer = b"not json\n{\"type\":\"assistant\"}\n";
+        assert_eq!(
+            extract_last_prompt(buffer, ProviderKind::Codex, "codex-id"),
+            None
+        );
+    }
+
+    #[test]
+    fn read_last_prompt_reads_tail_and_reports_window_miss() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let transcript = tmp.path().join("codex.jsonl");
+        fs::write(&transcript, codex_line("real prompt")).expect("write");
+        let source = ProviderPromptSource {
+            provider: ProviderKind::Codex,
+            session_id: "codex-id".to_string(),
+            path: transcript.clone(),
+        };
+        let found = read_last_prompt(&source, MAX_LAST_PROMPT_TAIL_BYTES).expect("prompt");
+        assert_eq!(found.text, "real prompt");
+        assert!(!found.truncated);
+
+        // A window that lands entirely after the only prompt line misses it and
+        // degrades to no preview rather than scanning further back.
+        append(&transcript, vec![b' '; 4096].as_slice());
+        assert_eq!(read_last_prompt(&source, 16), None);
     }
 
     fn record(agent: &str, session_id: &str) -> SessionRecord {
