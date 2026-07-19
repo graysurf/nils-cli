@@ -14,7 +14,7 @@ use crate::model::{Product, RecoveryScope};
     long_about = "Validate and dispatch one strict cross-provider hook policy, manage its exact provider ingress, inspect convergence, and operate governed recovery.",
     arg_required_else_help = true,
     disable_help_subcommand = true,
-    after_help = "ENVIRONMENT:\n  XDG_CONFIG_HOME  Parent for agent-hook/config.toml.\n  XDG_DATA_HOME    Parent for installed policy bundles.\n  XDG_STATE_HOME   Parent for private trace, setup, and recovery state.\n  HOME             Absolute fallback for XDG roots.\n  AGENT_SESSION_STATE_DIR  Optional #676 coordination state root.\n\nEXIT CODES:\n  0   success or provider allow/warn/context\n  1   runtime failure or provider block\n  64  invalid command usage\n  65  invalid config, policy, input, drift, or recovery data\n  69  required provider/setup resource or lock is unavailable\n  75  concurrent state mutation; bounded retry may succeed"
+    after_help = "ENVIRONMENT:\n  XDG_CONFIG_HOME  Parent for agent-hook/config.toml.\n  XDG_DATA_HOME    Parent for installed policy bundles.\n  XDG_STATE_HOME   Parent for private trace, setup, and recovery state.\n  HOME             Absolute fallback for XDG roots.\n  AGENT_SESSION_STATE_DIR  Optional #676 coordination state root.\n\nEXIT CODES:\n  0   success or provider-native decision rendered\n  1   runtime failure or service-format provider block\n  2   provider-native blocking fallback when the event cannot be recovered\n  64  invalid command usage\n  65  invalid config, policy, input, drift, or recovery data\n  69  required provider/setup resource or lock is unavailable\n  75  concurrent state mutation; bounded retry may succeed"
 )]
 pub struct Cli {
     /// Override the strict user config path.

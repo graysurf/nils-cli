@@ -241,6 +241,16 @@ fn validate_policy(bundle: &PolicyBundle, config: &Config) -> Result<(), HookErr
         }
         if let Some(matcher) = rule.matcher.as_deref() {
             validate_matcher_expression(matcher)?;
+            for event in &rule.events {
+                for product in &rule.products {
+                    if matcher_input_field(*product, event).is_none() {
+                        return Err(HookError::data(
+                            "policy-matcher-unsupported",
+                            "policy matcher selects an event without native matcher support",
+                        ));
+                    }
+                }
+            }
         }
         validate_capability(&rule.capability)?;
         if matches!(rule.override_class, OverrideClass::Locked)
@@ -412,6 +422,22 @@ pub fn supported_event(product: Product, event: &str) -> bool {
             event,
             "pre_llm_call" | "post_llm_call" | "pre_approval_request" | "post_approval_response"
         ),
+    }
+}
+
+pub fn matcher_input_field(product: Product, event: &str) -> Option<&'static str> {
+    match (product, event) {
+        (Product::Codex | Product::Claude, "SessionStart") => Some("source"),
+        (Product::Codex | Product::Claude, "PermissionRequest" | "PreToolUse" | "PostToolUse")
+        | (Product::Claude, "PostToolUseFailure") => Some("tool_name"),
+        (Product::Codex | Product::Claude, "PreCompact") | (Product::Codex, "PostCompact") => {
+            Some("trigger")
+        }
+        (Product::Codex | Product::Claude, "SubagentStart" | "SubagentStop") => Some("agent_type"),
+        (Product::Claude, "Notification") => Some("notification_type"),
+        (Product::Claude, "Elicitation" | "ElicitationResult") => Some("mcp_server_name"),
+        (Product::Claude, "StopFailure") => Some("error_type"),
+        _ => None,
     }
 }
 

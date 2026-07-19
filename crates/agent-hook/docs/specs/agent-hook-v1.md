@@ -28,14 +28,18 @@ The CLI resolves only absolute XDG roots and rejects relative roots.
 | rule inventory | one policy bundle | 512 rules, unique IDs |
 | reason metadata | one aggregate decision | 64 reasons, 256 bytes per code/message |
 
-Unknown fields are rejected in every persisted/input schema. Identifiers are
-ASCII kebab-case, at most 128 bytes. Policy/config digests are lowercase
-`sha256:<64 hex>` values over canonical serialized bytes.
+Unknown fields are rejected in every persisted/input schema. Service response
+envelopes are the compatibility exception: consumers accept additive envelope,
+error, and command-result metadata within the same schema version while still
+requiring the exact schema version, success state, and mandatory result fields.
+Identifiers are ASCII kebab-case, at most 128 bytes. Policy/config digests are
+lowercase `sha256:<64 hex>` values over canonical serialized bytes.
 
 ## Versioned schemas
 
-Every schema has a literal `schema_version` and uses strict unknown-field
-handling.
+Every persisted/input schema has a literal `schema_version` and uses strict
+unknown-field handling. Service responses use the additive compatibility rule
+above.
 
 - `agent-hook.config.v1`: selected policy path and digest, per-provider mode,
   and rule overrides. It cannot contain commands, bearer material, environment
@@ -96,7 +100,20 @@ Supported canonical events are:
 
 The adapter accepts the event from `--event` or the provider's documented
 `hook_event_name`/`event` field and rejects a mismatch. Matcher values are
-normalized only from documented provider fields. A policy matcher is either
+normalized only from documented provider fields:
+
+| Provider events | Matcher input field |
+| --- | --- |
+| Codex/Claude `SessionStart` | `source` |
+| Codex/Claude `PermissionRequest`, `PreToolUse`, `PostToolUse`; Claude `PostToolUseFailure` | `tool_name` |
+| Codex/Claude `PreCompact`; Codex `PostCompact` | `trigger` |
+| Codex/Claude `SubagentStart`, `SubagentStop` | `agent_type` |
+| Claude `Notification` | `notification_type` |
+| Claude `Elicitation`, `ElicitationResult` | `mcp_server_name` |
+| Claude `StopFailure` | `error_type` |
+
+A matcher on any other product/event pair is rejected during policy validation.
+A policy matcher is either
 one literal token or an anchored alternation expression such as
 `Write|Edit|NotebookEdit|MultiEdit|apply_patch`; each atom is compared to the
 entire normalized matcher. The only expression operator is `|`. Empty atoms,
@@ -109,10 +126,16 @@ before rule evaluation. When ordinary config cannot be loaded, an exact valid
 recovery capability evaluates its signed rule manifest and preserves every
 ungranted rule instead of producing a global allow.
 
-Provider rendering maps one normalized aggregate result to the provider's
-native allow, warning/context, block, or input-replacement shape and stable exit
-behavior. `dispatch --format json` returns the normalized decision envelope and
-does not return raw provider content.
+Provider rendering maps one normalized aggregate result to the event-native
+output algebra. `PreToolUse` transforms render `permissionDecision = "allow"`
+with `updatedInput`; `PermissionRequest` decisions render
+`decision.behavior = "allow" | "deny"`; and blocking events use the provider's
+documented event-appropriate decision shape. Provider payloads that cannot be
+normalized safely produce no stdout, a concise stderr diagnostic, and exit `2`
+so the provider applies its native blocking fallback. Runtime or service-format
+failures use exit `1`; successful provider-native decisions use exit `0`.
+`dispatch --format json` returns the normalized decision envelope and does not
+return raw provider content.
 
 ## Serialized policy and capability registry
 

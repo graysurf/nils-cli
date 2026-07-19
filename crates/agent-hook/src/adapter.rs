@@ -8,7 +8,7 @@ use serde::de::{Deserialize, Deserializer, MapAccess, SeqAccess, Visitor};
 use serde_json::{Map, Number, Value, json};
 use sha2::{Digest, Sha256};
 
-use crate::contract::{digest, supported_event};
+use crate::contract::{digest, matcher_input_field, supported_event};
 use crate::error::HookError;
 use crate::model::{
     DecisionAction, NormalizedDecision, NormalizedRequest, Product, REQUEST_VERSION,
@@ -97,16 +97,9 @@ pub fn normalize(
         ));
     }
 
-    let matcher_keys: &[&str] = match event.as_str() {
-        "SessionStart" => &["matcher", "source"],
-        "SubagentStart" | "SubagentStop" => &["matcher", "agent_type"],
-        "Notification" => &["matcher", "notification_type"],
-        "PermissionRequest" | "PreToolUse" | "PostToolUse" | "PostToolUseFailure" => {
-            &["matcher", "tool_name"]
-        }
-        _ => &["matcher"],
-    };
-    let matcher = string_at(object, matcher_keys)
+    let matcher = matcher_input_field(product, &event)
+        .and_then(|field| object.get(field))
+        .and_then(Value::as_str)
         .map(str::to_string)
         .filter(|value| value.len() <= 128);
     let (target_path, execution_path) = target_paths(object, matcher.as_deref())?;
@@ -154,22 +147,18 @@ pub fn render_provider(decision: &NormalizedDecision) -> Result<String, HookErro
         .join(",");
     let output = match decision.action {
         DecisionAction::Allow => json!({}),
-        DecisionAction::Block
-            if matches!(decision.product, Product::Codex | Product::Claude)
-                && matches!(decision.event.as_str(), "PreToolUse" | "PermissionRequest") =>
-        {
+        DecisionAction::Block if matches!(decision.product, Product::Codex | Product::Claude) => {
             provider_denial(decision.product, &decision.event, &reason)
         }
         DecisionAction::Block => json!({
             "continue": false,
             "stopReason": format!("agent-hook:{reason}"),
         }),
-        DecisionAction::Transform => json!({
-            "hookSpecificOutput": {
-                "hookEventName": decision.event,
-                "updatedInput": decision.replacement,
-            }
-        }),
+        DecisionAction::Transform => provider_transform(
+            decision.product,
+            &decision.event,
+            decision.replacement.as_ref(),
+        ),
         DecisionAction::Context | DecisionAction::Warn => json!({
             "hookSpecificOutput": {
                 "hookEventName": decision.event,
@@ -200,16 +189,60 @@ pub fn render_provider_error(
 
 fn provider_denial(product: Product, event: &str, reason: &str) -> Value {
     match (product, event) {
-        (Product::Codex | Product::Claude, "PreToolUse" | "PermissionRequest") => json!({
+        (Product::Codex | Product::Claude, "PreToolUse") => json!({
             "hookSpecificOutput": {
                 "hookEventName": event,
                 "permissionDecision": "deny",
                 "permissionDecisionReason": format!("agent-hook:{reason}"),
             }
         }),
+        (Product::Codex | Product::Claude, "PermissionRequest") => json!({
+            "hookSpecificOutput": {
+                "hookEventName": event,
+                "decision": {
+                    "behavior": "deny",
+                    "message": format!("agent-hook:{reason}"),
+                }
+            }
+        }),
+        (
+            Product::Codex | Product::Claude,
+            "UserPromptSubmit" | "PostToolUse" | "PostToolUseFailure" | "SubagentStop" | "Stop",
+        )
+        | (Product::Claude, "PreCompact") => json!({
+            "decision": "block",
+            "reason": format!("agent-hook:{reason}"),
+        }),
         _ => json!({
             "continue": false,
             "stopReason": format!("agent-hook:{reason}"),
+        }),
+    }
+}
+
+fn provider_transform(product: Product, event: &str, replacement: Option<&Value>) -> Value {
+    match (product, event) {
+        (Product::Codex | Product::Claude, "PreToolUse") => json!({
+            "hookSpecificOutput": {
+                "hookEventName": event,
+                "permissionDecision": "allow",
+                "updatedInput": replacement,
+            }
+        }),
+        (Product::Codex | Product::Claude, "PermissionRequest") => json!({
+            "hookSpecificOutput": {
+                "hookEventName": event,
+                "decision": {
+                    "behavior": "allow",
+                    "updatedInput": replacement,
+                }
+            }
+        }),
+        _ => json!({
+            "hookSpecificOutput": {
+                "hookEventName": event,
+                "updatedInput": replacement,
+            }
         }),
     }
 }

@@ -102,11 +102,22 @@ fn codex_pre_tool_and_permission_blocks_use_supported_denial_output() {
         );
         let rendered = output.stdout_json();
         assert_eq!(rendered["hookSpecificOutput"]["hookEventName"], event);
-        assert_eq!(rendered["hookSpecificOutput"]["permissionDecision"], "deny");
-        assert_eq!(
-            rendered["hookSpecificOutput"]["permissionDecisionReason"],
-            "agent-hook:locked-block"
-        );
+        if event == "PreToolUse" {
+            assert_eq!(rendered["hookSpecificOutput"]["permissionDecision"], "deny");
+            assert_eq!(
+                rendered["hookSpecificOutput"]["permissionDecisionReason"],
+                "agent-hook:locked-block"
+            );
+        } else {
+            assert_eq!(
+                rendered["hookSpecificOutput"]["decision"]["behavior"],
+                "deny"
+            );
+            assert_eq!(
+                rendered["hookSpecificOutput"]["decision"]["message"],
+                "agent-hook:locked-block"
+            );
+        }
         assert!(rendered.get("continue").is_none());
         assert!(rendered.get("stopReason").is_none());
     }

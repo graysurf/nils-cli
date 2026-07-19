@@ -64,7 +64,6 @@ impl std::fmt::Display for ProviderStatus {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
 pub struct SetupResult {
     pub schema_version: String,
     pub product: String,

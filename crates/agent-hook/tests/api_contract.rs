@@ -36,12 +36,32 @@ fn workspace_json_envelope_parse_and_unavailable_exit_contract_is_canonical() {
     assert!(envelope.get("result").is_none());
     assert!(envelope.get("command").is_none());
 
-    let parse = fixture.run(&["--format=json", "not-a-command"], None);
-    assert_eq!(parse.code, 64);
-    let envelope = parse.stdout_json();
-    assert_eq!(envelope["schema_version"], "cli.agent-hook.error.v1");
-    assert_eq!(envelope["ok"], false);
-    assert_eq!(envelope["error"]["code"], "invalid-arguments");
+    for args in [
+        vec!["not-a-command", "--format=json"],
+        vec!["not-a-command", "--format", "json"],
+    ] {
+        let parse = fixture.run(&args, None);
+        assert_eq!(parse.code, 64);
+        let envelope = parse.stdout_json();
+        assert_eq!(envelope["schema_version"], "cli.agent-hook.error.v1");
+        assert_eq!(envelope["ok"], false);
+        assert_eq!(envelope["error"]["code"], "unknown-subcommand");
+    }
+
+    for args in [
+        vec!["dispatch", "--product", "invalid", "--format=json"],
+        vec!["validate", "--format", "json", "--invalid-option"],
+    ] {
+        let parse = fixture.run(&args, None);
+        assert_eq!(parse.code, 64);
+        assert_eq!(parse.stdout_json()["error"]["code"], "parse-error");
+    }
+
+    let root_help = fixture.run(&[], None);
+    assert_eq!(root_help.code, 2);
+    assert!(
+        root_help.stdout_text().contains("Usage:") || root_help.stderr_text().contains("Usage:")
+    );
 
     let state_root = fixture.state_home.join("agent-hook");
     fs::create_dir_all(&state_root).expect("state root");
@@ -187,6 +207,16 @@ mode = "enforce"
 failure_posture = "closed"
 override_class = "locked"
 capability = { id = "decision.transform.v1", reason_code = "rewrite", replacement = { path = "rewritten.txt", command = "safe" } }
+
+[[rules]]
+id = "runtime.block"
+products = ["codex", "claude"]
+events = ["PermissionRequest", "SubagentStop", "Stop"]
+priority = 20
+mode = "enforce"
+failure_posture = "closed"
+override_class = "locked"
+capability = { id = "decision.block.v1", reason_code = "native-block", message = "blocked" }
 "#;
     let fixture = Fixture::new(policy);
     let payload = json!({
@@ -211,7 +241,63 @@ capability = { id = "decision.transform.v1", reason_code = "rewrite", replacemen
             transformed.stdout_json()["hookSpecificOutput"]["updatedInput"],
             json!({"path":"rewritten.txt","command":"safe"})
         );
+        assert_eq!(
+            transformed.stdout_json()["hookSpecificOutput"]["permissionDecision"],
+            "allow"
+        );
     }
+
+    for product in ["codex", "claude"] {
+        let permission = json!({
+            "hook_event_name":"PermissionRequest",
+            "tool_name":"Write",
+            "cwd":fixture.root,
+            "tool_input":{"path":fixture.root.join("target.txt")}
+        })
+        .to_string();
+        let denied = fixture.run(
+            &["dispatch", "--product", product, "--format", "provider"],
+            Some(&permission),
+        );
+        assert_eq!(denied.code, 0, "product={product}");
+        let native = denied.stdout_json();
+        assert_eq!(
+            native["hookSpecificOutput"]["hookEventName"],
+            "PermissionRequest"
+        );
+        assert_eq!(native["hookSpecificOutput"]["decision"]["behavior"], "deny");
+        assert_eq!(
+            native["hookSpecificOutput"]["decision"]["message"],
+            "agent-hook:native-block"
+        );
+        assert!(
+            native["hookSpecificOutput"]
+                .get("permissionDecision")
+                .is_none()
+        );
+
+        for event in ["Stop", "SubagentStop"] {
+            let payload = json!({"hook_event_name":event,"cwd":fixture.root}).to_string();
+            let blocked = fixture.run(
+                &["dispatch", "--product", product, "--format", "provider"],
+                Some(&payload),
+            );
+            assert_eq!(blocked.code, 0, "product={product} event={event}");
+            let native = blocked.stdout_json();
+            assert_eq!(native["decision"], "block");
+            assert_eq!(native["reason"], "agent-hook:native-block");
+            assert!(native.get("continue").is_none());
+            assert!(native.get("stopReason").is_none());
+        }
+    }
+
+    let malformed = fixture.run(
+        &["dispatch", "--product", "codex", "--format", "provider"],
+        Some("{"),
+    );
+    assert_eq!(malformed.code, 2);
+    assert!(malformed.stdout_text().is_empty());
+    assert!(malformed.stderr_text().contains("provider-input-invalid"));
 
     fs::remove_file(&fixture.policy).expect("remove policy");
     for product in ["codex", "claude"] {
@@ -225,4 +311,103 @@ capability = { id = "decision.transform.v1", reason_code = "rewrite", replacemen
             "deny"
         );
     }
+}
+
+#[test]
+fn provider_matchers_use_documented_native_fields_and_reject_unsupported_events() {
+    let policy = r#"schema_version = "agent-hook.policy.v1"
+bundle_id = "runtime-kit"
+version = "2026.07.20.1"
+
+[[rules]]
+id = "codex.pre-compact"
+products = ["codex"]
+events = ["PreCompact"]
+matcher = "manual"
+priority = 10
+mode = "enforce"
+failure_posture = "closed"
+override_class = "locked"
+capability = { id = "decision.block.v1", reason_code = "codex-pre", message = "blocked" }
+
+[[rules]]
+id = "codex.post-compact"
+products = ["codex"]
+events = ["PostCompact"]
+matcher = "auto"
+priority = 20
+mode = "enforce"
+failure_posture = "closed"
+override_class = "locked"
+capability = { id = "decision.block.v1", reason_code = "codex-post", message = "blocked" }
+
+[[rules]]
+id = "claude.pre-compact"
+products = ["claude"]
+events = ["PreCompact"]
+matcher = "manual"
+priority = 30
+mode = "enforce"
+failure_posture = "closed"
+override_class = "locked"
+capability = { id = "decision.block.v1", reason_code = "claude-pre", message = "blocked" }
+
+[[rules]]
+id = "claude.elicitation"
+products = ["claude"]
+events = ["Elicitation", "ElicitationResult"]
+matcher = "registry"
+priority = 40
+mode = "enforce"
+failure_posture = "closed"
+override_class = "locked"
+capability = { id = "decision.block.v1", reason_code = "claude-elicit", message = "blocked" }
+"#;
+    let fixture = Fixture::new(policy);
+    for (product, event, field, value) in [
+        ("codex", "PreCompact", "trigger", "manual"),
+        ("codex", "PostCompact", "trigger", "auto"),
+        ("claude", "PreCompact", "trigger", "manual"),
+        ("claude", "Elicitation", "mcp_server_name", "registry"),
+        ("claude", "ElicitationResult", "mcp_server_name", "registry"),
+    ] {
+        let mut payload = json!({"hook_event_name":event,"cwd":fixture.root});
+        payload[field] = json!(value);
+        if event == "ElicitationResult" {
+            payload["elicitation_id"] = json!("request-1");
+        }
+        let output = fixture.run(
+            &["dispatch", "--product", product, "--format", "json"],
+            Some(&payload.to_string()),
+        );
+        assert_eq!(
+            output.code,
+            1,
+            "product={product} event={event} stderr={}",
+            output.stderr_text()
+        );
+        assert_eq!(output.stdout_json()["data"]["action"], "block");
+    }
+
+    let unsupported = r#"schema_version = "agent-hook.policy.v1"
+bundle_id = "runtime-kit"
+version = "2026.07.20.1"
+
+[[rules]]
+id = "codex.stop-filter"
+products = ["codex"]
+events = ["Stop"]
+matcher = "ignored"
+priority = 10
+mode = "enforce"
+failure_posture = "closed"
+override_class = "locked"
+capability = { id = "decision.block.v1", reason_code = "invalid", message = "blocked" }
+"#;
+    let invalid = Fixture::new(unsupported).run(&["validate", "--format", "json"], None);
+    assert_eq!(invalid.code, 65);
+    assert_eq!(
+        invalid.stdout_json()["error"]["code"],
+        "policy-matcher-unsupported"
+    );
 }

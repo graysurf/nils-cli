@@ -44,31 +44,36 @@ where
     T: Into<OsString> + Clone,
 {
     let raw = args.into_iter().map(Into::into).collect::<Vec<_>>();
-    let json_requested = raw
-        .windows(2)
-        .any(|pair| pair[0] == "--format" && pair[1] == "json")
-        || raw.iter().any(|argument| argument == "--format=json");
+    let json_requested = detect_format_from_args(&raw) == OutputFormat::Json;
     let cli = match Cli::try_parse_from(raw) {
         Ok(cli) => cli,
         Err(error) => {
+            let kind = error.kind();
             if matches!(
-                error.kind(),
-                ErrorKind::DisplayHelp | ErrorKind::DisplayVersion
+                kind,
+                ErrorKind::DisplayHelp
+                    | ErrorKind::DisplayVersion
+                    | ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
             ) {
                 let code = error.exit_code();
                 let _ = error.print();
                 return code;
             }
-            if json_requested {
-                return emit_parse_error(
-                    "agent-hook",
-                    OutputFormat::Json,
-                    "invalid-arguments",
-                    "command arguments are invalid",
-                );
-            }
-            let _ = error.print();
-            return 64;
+            let code = if kind == ErrorKind::InvalidSubcommand {
+                "unknown-subcommand"
+            } else {
+                "parse-error"
+            };
+            return emit_parse_error(
+                "agent-hook",
+                if json_requested {
+                    OutputFormat::Json
+                } else {
+                    OutputFormat::Text
+                },
+                code,
+                &render_clap_message(&error),
+            );
         }
     };
     let layout = match Layout::resolve(cli.config, cli.state_dir) {
@@ -76,6 +81,45 @@ where
         Err(error) => return emit_error("agent-hook", &error, json_requested),
     };
     dispatch(layout, cli.policy.as_deref(), cli.command)
+}
+
+fn detect_format_from_args(args: &[OsString]) -> OutputFormat {
+    let mut iter = args.iter().skip(1);
+    while let Some(argument) = iter.next() {
+        let Some(argument) = argument.to_str() else {
+            continue;
+        };
+        if argument == "--format"
+            && iter
+                .next()
+                .and_then(|value| value.to_str())
+                .is_some_and(|value| value.eq_ignore_ascii_case("json"))
+        {
+            return OutputFormat::Json;
+        }
+        if argument
+            .strip_prefix("--format=")
+            .is_some_and(|value| value.eq_ignore_ascii_case("json"))
+        {
+            return OutputFormat::Json;
+        }
+    }
+    OutputFormat::Text
+}
+
+fn render_clap_message(error: &clap::Error) -> String {
+    error
+        .to_string()
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .map(|line| {
+            let line = line.trim();
+            line.strip_prefix("error:")
+                .map(str::trim)
+                .unwrap_or(line)
+                .to_string()
+        })
+        .unwrap_or_else(|| "command-line parse failed".to_string())
 }
 
 fn dispatch(layout: Layout, policy_override: Option<&std::path::Path>, command: Command) -> i32 {
@@ -614,12 +658,8 @@ fn emit_dispatch_error(
                 }
                 0
             } else {
-                let output = json!({
-                    "continue": false,
-                    "stopReason": format!("agent-hook:{}", error.code),
-                });
-                println!("{output}");
-                error.exit_code
+                eprintln!("agent-hook:{}: {}", error.code, error.message);
+                2
             }
         }
         DispatchFormat::Text => emit_error("agent-hook dispatch", error, false),

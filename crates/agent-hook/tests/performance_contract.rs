@@ -175,7 +175,6 @@ capability = { id = "runtime-kit.handler.v1", handler_id = "session-start-health
 fn setup_never_emits_a_provider_candidate_larger_than_its_own_read_limit() {
     let events = [
         "SessionStart",
-        "UserPromptSubmit",
         "PermissionRequest",
         "PreToolUse",
         "PostToolUse",
@@ -183,7 +182,6 @@ fn setup_never_emits_a_provider_candidate_larger_than_its_own_read_limit() {
         "PostCompact",
         "SubagentStart",
         "SubagentStop",
-        "Stop",
     ];
     let mut policy = String::from(
         "schema_version = \"agent-hook.policy.v1\"\nbundle_id = \"runtime-kit\"\nversion = \"2026.07.20.1\"\n",

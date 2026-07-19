@@ -725,9 +725,6 @@ printf '%s\n' "$AGENT_HOOK_RESPONSE"
     let mut wrong_envelope = valid.clone();
     wrong_envelope["schema_version"] = json!("cli.agent-hook.setup.v2");
     cases.push(wrong_envelope);
-    let mut wrong_command = valid.clone();
-    wrong_command["command"] = json!("agent-hook setup");
-    cases.push(wrong_command);
     let mut wrong_result = valid.clone();
     wrong_result["data"]["schema_version"] = json!("agent-hook.setup-result.v2");
     cases.push(wrong_result);
@@ -771,6 +768,106 @@ printf '%s\n' "$AGENT_HOOK_RESPONSE"
             "agent-hook-setup-output-invalid"
         );
     }
+}
+
+#[test]
+fn activity_setup_accepts_additive_v1_fields_but_keeps_required_bridge_fields_strict() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let home = tmp.path().join("home");
+    fs::create_dir_all(&home).expect("home dir");
+    let hook = tmp.path().join("agent-hook");
+    write_executable(
+        &hook,
+        r#"#!/usr/bin/env sh
+: "${AGENT_HOOK_RESPONSE:?}"
+printf '%s\n' "$AGENT_HOOK_RESPONSE"
+"#,
+    );
+    let mut success = json!({
+        "schema_version":"cli.agent-hook.setup.v1",
+        "ok":true,
+        "data":{
+            "schema_version":"agent-hook.setup-result.v1",
+            "product":"codex",
+            "action":"dry-run",
+            "status":"converged",
+            "changed":false,
+            "would_change":false,
+            "configured":true,
+            "would_configure":true,
+            "apply_allowed":true,
+            "plan_digest":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "config_digest":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "policy_digest":"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            "owned_events":["PreToolUse"],
+            "owned_groups":[{"event":"PreToolUse","matcher":"Write"}],
+            "owned_count":1,
+            "legacy_residue_count":0,
+            "unrelated_count":0,
+            "compatibility_owner":"agent-hook",
+            "trust":"reviewed",
+            "future_result_metadata":{"generation":2}
+        },
+        "future_envelope_metadata":{"producer":"agent-hook"}
+    });
+
+    let home = home.to_string_lossy().into_owned();
+    let hook = hook.to_string_lossy().into_owned();
+    let run_response = |response: &serde_json::Value| {
+        let response = response.to_string();
+        run(
+            tmp.path(),
+            &[
+                "activity",
+                "setup",
+                "--agent",
+                "codex",
+                "--dry-run",
+                "--format",
+                "json",
+            ],
+            &[
+                ("HOME", home.as_str()),
+                ("AGENT_HOOK_BIN", hook.as_str()),
+                ("AGENT_HOOK_RESPONSE", response.as_str()),
+            ],
+        )
+    };
+
+    let accepted = run_response(&success);
+    assert_eq!(accepted.code, 0, "stderr={}", accepted.stderr_text());
+    assert_eq!(
+        data(&accepted.stdout_json())["compatibility_owner"],
+        "agent-hook"
+    );
+
+    success["data"]
+        .as_object_mut()
+        .expect("result")
+        .remove("plan_digest");
+    let missing_required = run_response(&success);
+    assert_eq!(missing_required.code, 65);
+    assert_eq!(
+        missing_required.stdout_json()["error"]["code"],
+        "agent-hook-setup-output-invalid"
+    );
+
+    let upstream_failure = json!({
+        "schema_version":"cli.agent-hook.setup.v1",
+        "ok":false,
+        "error":{
+            "code":"agent-hook-upstream-busy",
+            "message":"retry later",
+            "future_error_metadata":{"retry_after_seconds":1}
+        },
+        "future_envelope_metadata":{"producer":"agent-hook"}
+    });
+    let failure = run_response(&upstream_failure);
+    assert_eq!(failure.code, 65);
+    assert_eq!(
+        failure.stdout_json()["error"]["code"],
+        "agent-hook-upstream-busy"
+    );
 }
 
 #[test]
