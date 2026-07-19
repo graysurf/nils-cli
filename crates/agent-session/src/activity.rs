@@ -3884,6 +3884,39 @@ fn toml_codex_hooks_configured(document: &TomlDocument) -> bool {
         .all(|spec| toml_has_spec(document, spec))
 }
 
+fn toml_codex_hooks_exactly_configured(document: &TomlDocument) -> bool {
+    let Some(hooks) = document.get("hooks").and_then(TomlItem::as_table) else {
+        return false;
+    };
+    provider_specs(AgentKind::Codex).into_iter().all(|spec| {
+        let expected = owned_command(AgentKind::Codex, Some(spec.event));
+        let Some(groups) = hooks.get(spec.event).and_then(TomlItem::as_array_of_tables) else {
+            return false;
+        };
+        let mut exact = 0_usize;
+        for group in groups.iter() {
+            let Some(handlers) = group.get("hooks").and_then(TomlItem::as_array_of_tables) else {
+                continue;
+            };
+            for handler in handlers.iter() {
+                if !toml_handler_command_matches_owned(spec.event, handler) {
+                    continue;
+                }
+                if !toml_hook_matcher_matches(group, spec)
+                    || toml_hook_group_has_user_metadata(group)
+                    || handlers.len() != 1
+                    || !toml_handler_command_is_owned(spec.event, handler)
+                    || handler.get("command").and_then(TomlItem::as_str) != Some(expected.as_str())
+                {
+                    return false;
+                }
+                exact += 1;
+            }
+        }
+        exact == 1
+    })
+}
+
 fn remove_owned_toml_hooks(document: &mut TomlDocument) {
     let Some(hooks) = document.get_mut("hooks").and_then(TomlItem::as_table_mut) else {
         return;
@@ -4081,7 +4114,10 @@ fn plan_inline_codex_hooks(
     })?;
     let document = parse_codex_notification_config(&notification.config.path, &raw)?;
     let stripped = strip_owned_codex_toml_hook_block(&notification.config.path, &raw)?;
-    if action != SetupAction::Remove && stripped != raw && toml_codex_hooks_configured(&document) {
+    if action != SetupAction::Remove
+        && stripped != raw
+        && toml_codex_hooks_exactly_configured(&document)
+    {
         return Ok(true);
     }
     let mut document = parse_codex_notification_config(&notification.config.path, &stripped)?;

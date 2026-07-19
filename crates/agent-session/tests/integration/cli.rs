@@ -1747,6 +1747,137 @@ trust_level = "trusted"
 }
 
 #[test]
+fn codex_repair_converges_duplicate_and_generic_owned_reporters() {
+    for duplicate_kind in ["current", "generic"] {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let home = tmp.path().join("home");
+        fs::create_dir_all(home.join(".codex")).expect("codex dir");
+        let config_path = home.join(".codex/config.toml");
+        fs::write(
+            &config_path,
+            r#"[[hooks.PreToolUse]]
+
+[[hooks.PreToolUse.hooks]]
+type = "command"
+command = "runtime-kit-pre-tool"
+timeout = 5
+"#,
+        )
+        .expect("inline config");
+        let home_arg = home.to_string_lossy().to_string();
+        let envs = [("HOME", home_arg.as_str())];
+
+        let initial = run(
+            tmp.path(),
+            &[
+                "activity", "setup", "--agent", "codex", "--apply", "--format", "json",
+            ],
+            &envs,
+        );
+        assert_eq!(initial.code, 0, "stderr={}", initial.stderr_text());
+
+        let converged = fs::read_to_string(&config_path).expect("converged config");
+        let duplicate = match duplicate_kind {
+            "current" => {
+                let start = converged
+                    .find("[[hooks.PermissionRequest]]")
+                    .expect("PermissionRequest start");
+                let end = converged[start..]
+                    .find("[[hooks.PostToolUse]]")
+                    .map(|offset| start + offset)
+                    .expect("PermissionRequest end");
+                converged[start..end].to_string()
+            }
+            "generic" => r#"[[hooks.PermissionRequest]]
+
+[[hooks.PermissionRequest.hooks]]
+type = "command"
+command = "agent-session activity hook --agent codex"
+timeout = 5
+
+"#
+            .to_string(),
+            _ => unreachable!(),
+        };
+        let duplicated = converged.replacen(
+            "# <<< agent-session:codex-hooks <<<",
+            &format!("{duplicate}# <<< agent-session:codex-hooks <<<"),
+            1,
+        );
+        fs::write(&config_path, duplicated).expect("duplicated config");
+
+        let preview = run(
+            tmp.path(),
+            &[
+                "activity",
+                "setup",
+                "--agent",
+                "codex",
+                "--repair",
+                "--dry-run",
+                "--format",
+                "json",
+            ],
+            &envs,
+        );
+        assert_eq!(preview.code, 0, "stderr={}", preview.stderr_text());
+        let preview_json = preview.stdout_json();
+        let preview_result = data(&preview_json);
+        assert_eq!(
+            preview_result["would_change"], true,
+            "{duplicate_kind} duplicate must require repair"
+        );
+        let preview_digest = preview_result["preview_digest"]
+            .as_str()
+            .expect("preview digest")
+            .to_string();
+
+        let repaired = run(
+            tmp.path(),
+            &[
+                "activity",
+                "setup",
+                "--agent",
+                "codex",
+                "--repair",
+                "--expected-preview-digest",
+                &preview_digest,
+                "--format",
+                "json",
+            ],
+            &envs,
+        );
+        assert_eq!(repaired.code, 0, "stderr={}", repaired.stderr_text());
+        assert_eq!(data(&repaired.stdout_json())["configured"], true);
+        let repaired_config = fs::read_to_string(&config_path).expect("repaired config");
+        assert_eq!(
+            repaired_config
+                .matches("[[hooks.PermissionRequest]]")
+                .count(),
+            1,
+            "{duplicate_kind} duplicate must be removed"
+        );
+
+        let steady = run(
+            tmp.path(),
+            &[
+                "activity",
+                "setup",
+                "--agent",
+                "codex",
+                "--repair",
+                "--dry-run",
+                "--format",
+                "json",
+            ],
+            &envs,
+        );
+        assert_eq!(steady.code, 0, "stderr={}", steady.stderr_text());
+        assert_eq!(data(&steady.stdout_json())["would_change"], false);
+    }
+}
+
+#[test]
 fn codex_activity_setup_fails_closed_for_user_hooks_in_both_representations() {
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let home = tmp.path().join("home");
