@@ -89,8 +89,9 @@ claim, operation, and message identifiers are selectors and revision fences,
 not credentials. Start, run, provider import, and resume create a held tmux pane;
 the provider command is released only after the exact runtime identity and
 private capability are durable. A sidecar heartbeat survives launcher exit,
-rotates on resume, and becomes unavailable after target exit. Delete revokes the
-capability and releases active coordination state before removing the session.
+rotates on resume, and removes its incarnation-specific capability after target
+exit. Delete revokes the capability and releases active coordination state
+before removing the session.
 
 `work-context claim|show|check|renew|release` manages an authenticated
 30-minute structured claim. Claims contain canonical repositories, private-keyed
@@ -99,7 +100,10 @@ worktree fingerprints, provider and plan references, and closed
 `claim` evaluates and acquires under one bounded registry lock, so concurrent
 definite contenders cannot both succeed. `work-context
 admit|complete|reconcile` binds a covered mutation target set to an execution
-token and revisioned operation lease. Opaque or uncovered targets fail closed.
+token, the controller-observed activity revision, and the exact persisted
+runtime identity. Releasing or replacing the claim is rejected while that
+operation is active or uncertain; reconciliation derives terminality from
+controller-owned state rather than caller booleans. Opaque or uncovered targets fail closed.
 Peer summaries remain untrusted metadata and cannot authorize commands.
 
 `message send|inbox|show|ack|reply|wait` provides the private bounded mailbox.
@@ -108,6 +112,8 @@ Only the authenticated recipient can read a body, returned as
 list, and glance never contain it. V1 enforces the documented 16 KiB body,
 24-hour default/7-day maximum expiry, 256-message/4 MiB per-session, 64 MiB
 registry, 30-pair/minute, 50/100-page, 60-second wait, and depth-16 reply limits.
+Acknowledged and expired entries have bounded terminal retention, and the HTTP
+surface admits at most 16 blocking waits at once.
 The authoritative result is always queued mail. When the serve controller sees
 an exact idle prompt-v2 target, it durably records one attempt before submitting
 the fixed body-free notification; busy, replaced, unsupported, failed, and

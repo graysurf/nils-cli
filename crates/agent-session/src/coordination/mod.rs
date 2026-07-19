@@ -32,6 +32,7 @@ const REGISTRY_LOCK: &str = "registry.lock";
 const LOCK_TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_REGISTRY_BYTES: u64 = 68 * 1024 * 1024;
 const RECEIPT_TTL_SECS: i64 = 24 * 60 * 60;
+const TERMINAL_RETENTION_SECS: i64 = 5 * 60;
 pub(crate) const CAPABILITY_ENV: &str = "AGENT_SESSION_CAPABILITY_FILE";
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -100,41 +101,84 @@ impl LockedRegistry {
 }
 
 pub(crate) fn run_work_context(context: &CliContext, args: cli::WorkContextArgs) -> i32 {
-    let format = work_context_format(&args.command);
-    let result = match args.command {
-        WorkContextCommand::Claim(args) => claims::claim(context, args),
-        WorkContextCommand::Show(args) => claims::show(context, args),
-        WorkContextCommand::Check(args) => claims::check(context, args),
-        WorkContextCommand::Renew(args) => claims::renew(context, args),
-        WorkContextCommand::Release(args) => claims::release(context, args),
-        WorkContextCommand::Admit(args) => claims::admit(context, args),
-        WorkContextCommand::Complete(args) => claims::complete(context, args),
-        WorkContextCommand::Reconcile(args) => claims::reconcile(context, args),
+    let (command, format, result) = match args.command {
+        WorkContextCommand::Claim(args) => (
+            "work-context-claim",
+            args.format,
+            claims::claim(context, args),
+        ),
+        WorkContextCommand::Show(args) => (
+            "work-context-show",
+            args.format,
+            claims::show(context, args),
+        ),
+        WorkContextCommand::Check(args) => (
+            "work-context-check",
+            args.format,
+            claims::check(context, args),
+        ),
+        WorkContextCommand::Renew(args) => (
+            "work-context-renew",
+            args.format,
+            claims::renew(context, args),
+        ),
+        WorkContextCommand::Release(args) => (
+            "work-context-release",
+            args.format,
+            claims::release(context, args),
+        ),
+        WorkContextCommand::Admit(args) => (
+            "work-context-admit",
+            args.format,
+            claims::admit(context, args),
+        ),
+        WorkContextCommand::Complete(args) => (
+            "work-context-complete",
+            args.format,
+            claims::complete(context, args),
+        ),
+        WorkContextCommand::Reconcile(args) => (
+            "work-context-reconcile",
+            args.format,
+            claims::reconcile(context, args),
+        ),
     };
-    render_coordination("work-context", format, result)
+    render_coordination(command, format, result)
 }
 
 pub(crate) fn run_broker(context: &CliContext, args: cli::BrokerArgs) -> i32 {
-    let format = broker_format(&args.command);
-    let result = match args.command {
-        BrokerCommand::Status(args) => broker::status(context, args),
-        BrokerCommand::Adopt(args) => broker::recover(context, args, false),
-        BrokerCommand::Reconcile(args) => broker::recover(context, args, true),
+    let (command, format, result) = match args.command {
+        BrokerCommand::Status(args) => {
+            ("broker-status", args.format, broker::status(context, args))
+        }
+        BrokerCommand::Adopt(args) => (
+            "broker-adopt",
+            args.format,
+            broker::recover(context, args, false),
+        ),
+        BrokerCommand::Reconcile(args) => (
+            "broker-reconcile",
+            args.format,
+            broker::recover(context, args, true),
+        ),
     };
-    render_coordination("broker", format, result)
+    render_coordination(command, format, result)
 }
 
 pub(crate) fn run_message(context: &CliContext, args: cli::MessageArgs) -> i32 {
-    let format = message_format(&args.command);
-    let result = match args.command {
-        MessageCommand::Send(args) => mailbox::send(context, args),
-        MessageCommand::Inbox(args) => mailbox::inbox(context, args),
-        MessageCommand::Show(args) => mailbox::show(context, args),
-        MessageCommand::Ack(args) => mailbox::ack(context, args),
-        MessageCommand::Reply(args) => mailbox::reply(context, args),
-        MessageCommand::Wait(args) => mailbox::wait(context, args),
+    let (command, format, result) = match args.command {
+        MessageCommand::Send(args) => ("message-send", args.format, mailbox::send(context, args)),
+        MessageCommand::Inbox(args) => {
+            ("message-inbox", args.format, mailbox::inbox(context, args))
+        }
+        MessageCommand::Show(args) => ("message-show", args.format, mailbox::show(context, args)),
+        MessageCommand::Ack(args) => ("message-ack", args.format, mailbox::ack(context, args)),
+        MessageCommand::Reply(args) => {
+            ("message-reply", args.format, mailbox::reply(context, args))
+        }
+        MessageCommand::Wait(args) => ("message-wait", args.format, mailbox::wait(context, args)),
     };
-    render_coordination("message", format, result)
+    render_coordination(command, format, result)
 }
 
 fn render_coordination(
@@ -152,39 +196,20 @@ fn render_value_text(value: &Value) -> String {
     serde_json::to_string_pretty(value).unwrap_or_else(|_| "{}".to_string()) + "\n"
 }
 
-fn work_context_format(command: &WorkContextCommand) -> nils_common::cli_contract::OutputFormat {
-    match command {
-        WorkContextCommand::Claim(args) => args.format,
-        WorkContextCommand::Show(args) => args.format,
-        WorkContextCommand::Check(args) => args.format,
-        WorkContextCommand::Renew(args) => args.format,
-        WorkContextCommand::Release(args) => args.format,
-        WorkContextCommand::Admit(args) => args.format,
-        WorkContextCommand::Complete(args) => args.format,
-        WorkContextCommand::Reconcile(args) => args.format,
-    }
-}
-
-fn broker_format(command: &BrokerCommand) -> nils_common::cli_contract::OutputFormat {
-    match command {
-        BrokerCommand::Status(args) => args.format,
-        BrokerCommand::Adopt(args) | BrokerCommand::Reconcile(args) => args.format,
-    }
-}
-
-fn message_format(command: &MessageCommand) -> nils_common::cli_contract::OutputFormat {
-    match command {
-        MessageCommand::Send(args) => args.format,
-        MessageCommand::Inbox(args) => args.format,
-        MessageCommand::Show(args) => args.format,
-        MessageCommand::Ack(args) => args.format,
-        MessageCommand::Reply(args) => args.format,
-        MessageCommand::Wait(args) => args.format,
-    }
-}
-
 pub(crate) fn provision(context: &CliContext, record: &SessionRecord) -> Result<PathBuf, CliError> {
     broker::provision(context, record)
+}
+
+pub(crate) fn prepare(context: &CliContext, record: &SessionRecord) -> Result<(), CliError> {
+    broker::prepare(context, record)
+}
+
+pub(crate) fn activate_ready(context: &CliContext, record: &SessionRecord) -> Result<(), CliError> {
+    broker::activate_ready(context, record)
+}
+
+pub(crate) fn ensure_ready(context: &CliContext, record: &SessionRecord) -> Result<(), CliError> {
+    broker::ensure_ready(context, record)
 }
 
 pub(crate) fn revoke(context: &CliContext, record: &SessionRecord) -> Result<(), CliError> {
@@ -211,10 +236,31 @@ pub(crate) fn notification_prompt(message_id: &str, session_id: &str) -> String 
     notification::fixed_prompt(message_id, session_id)
 }
 
-pub(crate) fn capability_path(context: &CliContext, session_id: &str) -> PathBuf {
-    session_dir(context, session_id)
+pub(crate) fn coordination_dir(context: &CliContext, session_id: &str) -> PathBuf {
+    session_dir(context, session_id).join("coordination")
+}
+
+pub(crate) fn capability_path(
+    context: &CliContext,
+    session_id: &str,
+    incarnation: &str,
+) -> PathBuf {
+    capability_path_for_state(&context.state_dir, session_id, incarnation)
+}
+
+pub(crate) fn capability_path_for_state(
+    state_dir: &Path,
+    session_id: &str,
+    incarnation: &str,
+) -> PathBuf {
+    state_dir
+        .join("sessions")
+        .join(session_id)
         .join("coordination")
-        .join("capability")
+        .join(format!(
+            "capability-{}",
+            digest_bytes(incarnation.as_bytes())
+        ))
 }
 
 pub(crate) fn heartbeat_path(state_dir: &Path, session_id: &str) -> PathBuf {
@@ -266,6 +312,12 @@ pub(crate) fn authenticate_token(
     if broker.state != "ready"
         || broker.incarnation != incarnation
         || !digest_eq(&broker.capability_digest, &digest_bytes(token.as_bytes()))
+        || !broker::capability_available(
+            context,
+            &record.id,
+            &incarnation,
+            &broker.capability_digest,
+        )
     {
         return Err(unauthorized());
     }
@@ -303,10 +355,25 @@ pub(crate) fn lock_registry(context: &CliContext) -> Result<LockedRegistry, CliE
         .write(true)
         .create(true)
         .mode(SECRET_FILE_MODE)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
         .open(&lock_path)
+        .map_err(|error| {
+            if error.raw_os_error() == Some(libc::ELOOP) {
+                store_untrusted()
+            } else {
+                store_unavailable()
+            }
+        })?;
+    lock.set_permissions(fs::Permissions::from_mode(SECRET_FILE_MODE))
         .map_err(|_| store_unavailable())?;
-    fs::set_permissions(&lock_path, fs::Permissions::from_mode(SECRET_FILE_MODE))
-        .map_err(|_| store_unavailable())?;
+    let lock_metadata = lock.metadata().map_err(|_| store_unavailable())?;
+    if !lock_metadata.is_file()
+        || lock_metadata.uid() != unsafe { libc::geteuid() }
+        || lock_metadata.mode() & 0o077 != 0
+        || lock_metadata.nlink() != 1
+    {
+        return Err(store_untrusted());
+    }
     let started = Instant::now();
     loop {
         // SAFETY: flock is called with a valid, owned file descriptor.
@@ -406,17 +473,38 @@ fn coordination_root(context: &CliContext) -> Result<PathBuf, CliError> {
     Ok(root)
 }
 
-pub(crate) fn clean_expired(registry: &mut Registry, now: i64) {
-    for claim in &mut registry.claims {
-        if claim.state == "active" && claim.expires_at_epoch <= now {
-            claim.state = "expired".to_string();
-            claim.revision = claim.revision.saturating_add(1);
-        }
-    }
+pub(crate) fn clean_expired(registry: &mut Registry, now: i64) -> bool {
+    let mut changed = false;
     for operation in &mut registry.operations {
         if operation.state == "active" && operation.expires_at_epoch <= now {
-            operation.state = "expired".to_string();
+            operation.state = "completing".to_string();
             operation.revision = operation.revision.saturating_add(1);
+            changed = true;
+        }
+        if matches!(
+            operation.state.as_str(),
+            "completed" | "failed" | "abandoned"
+        ) && operation.terminal_at_epoch.is_none()
+        {
+            operation.terminal_at_epoch = Some(now);
+            changed = true;
+        }
+    }
+    for claim in &mut registry.claims {
+        let bound_operation = registry.operations.iter().any(|operation| {
+            operation.claim_id == claim.claim_id
+                && matches!(operation.state.as_str(), "active" | "completing")
+        });
+        if claim.state == "active" && claim.expires_at_epoch <= now && !bound_operation {
+            claim.state = "expired".to_string();
+            claim.revision = claim.revision.saturating_add(1);
+            claim.terminal_at_epoch = Some(now);
+            changed = true;
+        } else if matches!(claim.state.as_str(), "released" | "expired" | "stale")
+            && claim.terminal_at_epoch.is_none()
+        {
+            claim.terminal_at_epoch = Some(now);
+            changed = true;
         }
     }
     for message in &mut registry.messages {
@@ -427,11 +515,57 @@ pub(crate) fn clean_expired(registry: &mut Registry, now: i64) {
         {
             message.state = "expired".to_string();
             message.revision = message.revision.saturating_add(1);
+            message.terminal_at_epoch = Some(now);
+            changed = true;
+        } else if matches!(
+            message.state.as_str(),
+            "acknowledged" | "expired" | "deleted"
+        ) && message.terminal_at_epoch.is_none()
+        {
+            message.terminal_at_epoch = Some(now);
+            changed = true;
         }
     }
+    let removed_messages: std::collections::BTreeSet<_> = registry
+        .messages
+        .iter()
+        .filter(|message| {
+            message
+                .terminal_at_epoch
+                .is_some_and(|terminal| terminal <= now.saturating_sub(TERMINAL_RETENTION_SECS))
+        })
+        .map(|message| message.message_id.clone())
+        .collect();
+    let message_count = registry.messages.len();
+    let notification_count = registry.notifications.len();
+    let operation_count = registry.operations.len();
+    let claim_count = registry.claims.len();
+    let receipt_count = registry.receipts.len();
+    registry
+        .messages
+        .retain(|message| !removed_messages.contains(&message.message_id));
+    registry
+        .notifications
+        .retain(|message_id, _| !removed_messages.contains(message_id));
+    registry.operations.retain(|operation| {
+        operation
+            .terminal_at_epoch
+            .is_none_or(|terminal| terminal > now.saturating_sub(TERMINAL_RETENTION_SECS))
+    });
+    registry.claims.retain(|claim| {
+        claim
+            .terminal_at_epoch
+            .is_none_or(|terminal| terminal > now.saturating_sub(TERMINAL_RETENTION_SECS))
+    });
     registry
         .receipts
         .retain(|_, receipt| receipt.expires_at_epoch > now);
+    changed
+        || registry.messages.len() != message_count
+        || registry.notifications.len() != notification_count
+        || registry.operations.len() != operation_count
+        || registry.claims.len() != claim_count
+        || registry.receipts.len() != receipt_count
 }
 
 pub(crate) fn idempotency_replay(
@@ -669,7 +803,21 @@ pub(crate) fn public_summary(context: &CliContext, session_id: &str) -> Coordina
             .registry
             .brokers
             .get(session_id)
-            .is_some_and(|broker| broker.state == "ready"),
+            .is_some_and(|broker| {
+                broker.state == "ready"
+                    && broker::capability_available(
+                        context,
+                        session_id,
+                        &broker.incarnation,
+                        &broker.capability_digest,
+                    )
+                    && broker::heartbeat_fresh(
+                        context,
+                        session_id,
+                        &broker.incarnation,
+                        broker.heartbeat_epoch,
+                    )
+            }),
     }
 }
 
@@ -716,6 +864,7 @@ pub(crate) fn read_bounded_json<T: for<'de> Deserialize<'de>>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn digest_comparison_is_exact() {
@@ -731,5 +880,89 @@ mod tests {
             hex(&digest),
             "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7"
         );
+    }
+
+    #[test]
+    fn coordination_review_expired_operation_and_bound_claim_remain_fail_closed() {
+        let mut registry: Registry = serde_json::from_value(json!({
+            "schema_version": REGISTRY_VERSION,
+            "claims": [{
+                "schema_version": "agent-session.work-context.v1",
+                "session_id": "session",
+                "session_incarnation": "incarnation",
+                "claim_id": "claim",
+                "revision": 1,
+                "state": "active",
+                "intent": "implementation",
+                "tier": "L2",
+                "repositories": ["example/repository"],
+                "worktrees": [],
+                "provider_refs": [],
+                "plan_refs": [],
+                "scopes": [{"kind": "repository", "repository": "example/repository", "value": ""}],
+                "summary": "fixture",
+                "updated_at": "2030-01-01T00:00:00Z",
+                "expires_at": "2030-01-01T00:00:01Z",
+                "expires_at_epoch": 1
+            }],
+            "operations": [{
+                "schema_version": "agent-session.operation-lease.v1",
+                "lease_id": "lease",
+                "session_id": "session",
+                "session_incarnation": "incarnation",
+                "claim_id": "claim",
+                "claim_revision": 1,
+                "operation": "edit",
+                "targets": [{"kind": "repository", "repository": "example/repository", "value": ""}],
+                "state": "active",
+                "revision": 1,
+                "started_at": "2030-01-01T00:00:00Z",
+                "expires_at": "2030-01-01T00:00:01Z",
+                "expires_at_epoch": 1,
+                "execution_token_digest": "digest"
+            }]
+        })).expect("registry");
+        clean_expired(&mut registry, 2);
+        assert_eq!(registry.operations[0].state, "completing");
+        assert_eq!(registry.claims[0].state, "active");
+    }
+
+    #[test]
+    fn coordination_review_terminal_retention_reclaims_mail_and_notifications() {
+        let mut registry: Registry = serde_json::from_value(json!({
+            "schema_version": REGISTRY_VERSION,
+            "messages": [{
+                "schema_version": "agent-session.message.v1",
+                "message_id": "message",
+                "sender_session_id": "sender",
+                "sender_incarnation": "sender-incarnation",
+                "recipient_session_id": "recipient",
+                "recipient_incarnation": "recipient-incarnation",
+                "state": "acknowledged",
+                "revision": 2,
+                "reply_to": null,
+                "reply_depth": 0,
+                "created_at": "2030-01-01T00:00:00Z",
+                "created_at_epoch": 0,
+                "expires_at": "2030-01-01T00:00:01Z",
+                "expires_at_epoch": 1,
+                "terminal_at_epoch": 1,
+                "body_bytes": 4,
+                "body": "body"
+            }],
+            "notifications": {
+                "message": {
+                    "message_id": "message",
+                    "target_session_id": "recipient",
+                    "target_incarnation": "recipient-incarnation",
+                    "state": "queued",
+                    "attempted_at_epoch": 1
+                }
+            }
+        }))
+        .expect("registry");
+        assert!(clean_expired(&mut registry, TERMINAL_RETENTION_SECS + 2));
+        assert!(registry.messages.is_empty());
+        assert!(registry.notifications.is_empty());
     }
 }

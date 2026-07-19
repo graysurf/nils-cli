@@ -107,7 +107,7 @@ const DELETE_TMUX_TERMINATION_STATE_KEY: &str = "delete_tmux_termination_state";
 const TMUX_RUNTIME_NEVER_LAUNCHED_KEY: &str = "tmux_runtime_never_launched";
 const TMUX_RUNTIME_IDENTITY_CHANGED_OUTPUT: &str = "agent-session-runtime-identity-changed";
 const COORDINATION_LAUNCH_GATE: &str = "launch-ready";
-const HELD_LAUNCH_SCRIPT: &str = "gate=$1; heartbeat=$2; incarnation=$3; shift 3; while [ ! -f \"$gate\" ]; do sleep 0.01; done; owner=$$; umask 077; (while kill -0 \"$owner\" 2>/dev/null; do printf '%s:%s\\n' \"$incarnation\" \"$(date +%s)\" > \"$heartbeat\"; sleep 10; done) & exec \"$@\"";
+const HELD_LAUNCH_SCRIPT: &str = "gate=$1; heartbeat=$2; capability=$3; incarnation=$4; shift 4; owner=$$; umask 077; (while kill -0 \"$owner\" 2>/dev/null; do tmp=\"${heartbeat}.tmp.$$\"; printf '%s:%s\\n' \"$incarnation\" \"$(date +%s)\" > \"$tmp\" && chmod 600 \"$tmp\" && mv -f \"$tmp\" \"$heartbeat\"; sleep 2; done; rm -f \"$capability\") & while [ ! -f \"$gate\" ]; do sleep 0.01; done; exec \"$@\"";
 
 pub fn run() -> i32 {
     run_with_args(env::args_os())
@@ -1497,6 +1497,17 @@ fn start_session(
         cleanup_created_record(context, &created);
         return Err(err);
     }
+    if let Err(err) = establish_coordination_broker(context, &created.record) {
+        recover_failed_tmux_launch(
+            context,
+            &mut created.record,
+            &tmux_bin,
+            Some(&launch_identity),
+            SessionTerminationOperation::FailedLaunch,
+        )?;
+        cleanup_created_record(context, &created);
+        return Err(err);
+    }
     if let Err(err) = release_held_runtime(context, &created.record) {
         recover_failed_tmux_launch(
             context,
@@ -1623,6 +1634,17 @@ fn start_run_session(context: &CliContext, args: cli::RunArgs) -> Result<StartVi
         cleanup_created_record(context, &created);
         return Err(err);
     }
+    if let Err(err) = establish_coordination_broker(context, &created.record) {
+        recover_failed_tmux_launch(
+            context,
+            &mut created.record,
+            &tmux_bin,
+            Some(&launch_identity),
+            SessionTerminationOperation::FailedLaunch,
+        )?;
+        cleanup_created_record(context, &created);
+        return Err(err);
+    }
     if let Err(err) = release_held_runtime(context, &created.record) {
         recover_failed_tmux_launch(
             context,
@@ -1736,6 +1758,17 @@ pub(crate) fn start_provider_resume_session(
     };
     if let Err(err) = persist_launched_tmux_identity(context, &mut created.record, &launch_identity)
     {
+        recover_failed_tmux_launch(
+            context,
+            &mut created.record,
+            &tmux_bin,
+            Some(&launch_identity),
+            SessionTerminationOperation::FailedLaunch,
+        )?;
+        cleanup_created_record(context, &created);
+        return Err(err);
+    }
+    if let Err(err) = establish_coordination_broker(context, &created.record) {
         recover_failed_tmux_launch(
             context,
             &mut created.record,
@@ -1922,7 +1955,7 @@ fn create_record(request: RecordRequest<'_>) -> Result<CreatedRecord, CliError> 
         let _ = fs::remove_dir_all(&session_dir);
         return Err(err);
     }
-    if let Err(err) = coordination::provision(request.context, &record) {
+    if let Err(err) = coordination::prepare(request.context, &record) {
         let _ = fs::remove_dir_all(&session_dir);
         return Err(err);
     }
@@ -3701,11 +3734,10 @@ fn resume_session_locked(
     record.updated_at = now.timestamp().to_string();
     write_session_record(context, &record)?;
     activity::activate_runtime(context, &record)?;
-    if let Err(error) = coordination::provision(context, &record) {
+    if let Err(error) = coordination::prepare(context, &record) {
         let _ = write_session_record(context, &previous_record);
         let _ = activity::restore_snapshot(context, &record.id, &previous_activity);
         let _ = startup_artifacts.restore();
-        let _ = coordination::provision(context, &previous_record);
         return Err(error);
     }
     let launch = if app_server_managed {
@@ -3730,6 +3762,20 @@ fn resume_session_locked(
     let launch_error = match launch {
         Ok(identity) => {
             if let Err(err) = persist_launched_tmux_identity(context, &mut record, &identity) {
+                match recover_failed_tmux_launch(
+                    context,
+                    &mut record,
+                    tmux_bin,
+                    Some(&identity),
+                    SessionTerminationOperation::Resume,
+                ) {
+                    Ok(()) => Some(err),
+                    Err(termination_err) => {
+                        startup_artifacts.discard();
+                        return Err(termination_err);
+                    }
+                }
+            } else if let Err(err) = establish_coordination_broker(context, &record) {
                 match recover_failed_tmux_launch(
                     context,
                     &mut record,
@@ -3782,7 +3828,7 @@ fn resume_session_locked(
         let record_restore = write_session_record(context, &previous_record);
         let activity_restore = activity::restore_snapshot(context, &record.id, &previous_activity);
         let artifact_restore = startup_artifacts.restore();
-        let coordination_restore = coordination::provision(context, &previous_record);
+        let coordination_restore = coordination::revoke(context, &previous_record);
         if record_restore.is_err()
             || activity_restore.is_err()
             || artifact_restore.is_err()
@@ -3880,6 +3926,15 @@ fn begin_held_runtime(
         .arg("agent-session-held-launch")
         .arg(gate)
         .arg(coordination::heartbeat_path(state_dir, &record.id))
+        .arg(coordination::capability_path_for_state(
+            state_dir,
+            &record.id,
+            record
+                .runtime
+                .as_ref()
+                .map(|runtime| runtime.launch_id.as_str())
+                .unwrap_or_default(),
+        ))
         .arg(
             record
                 .runtime
@@ -3891,7 +3946,8 @@ fn begin_held_runtime(
 }
 
 fn release_held_runtime(context: &CliContext, record: &SessionRecord) -> Result<(), CliError> {
-    let capability = coordination::capability_path(context, &record.id);
+    let incarnation = coordination::incarnation(record)?;
+    let capability = coordination::capability_path(context, &record.id, &incarnation);
     let metadata = fs::metadata(&capability).map_err(|_| {
         CliError::runtime(
             "coordination-broker-start-timeout",
@@ -3906,6 +3962,7 @@ fn release_held_runtime(context: &CliContext, record: &SessionRecord) -> Result<
             None,
         ));
     }
+    coordination::ensure_ready(context, record)?;
     write_private_file(&launch_gate_path(&context.state_dir, record), b"ready\n").map_err(|_| {
         CliError::runtime(
             "coordination-broker-start-timeout",
@@ -3913,6 +3970,14 @@ fn release_held_runtime(context: &CliContext, record: &SessionRecord) -> Result<
             None,
         )
     })
+}
+
+fn establish_coordination_broker(
+    context: &CliContext,
+    record: &SessionRecord,
+) -> Result<(), CliError> {
+    coordination::provision(context, record)?;
+    coordination::activate_ready(context, record)
 }
 
 fn add_runtime_tmux_environment(
@@ -3939,13 +4004,9 @@ fn add_runtime_tmux_environment(
         format!(
             "{}={}",
             coordination::CAPABILITY_ENV,
-            display_path(
-                &state_dir
-                    .join("sessions")
-                    .join(&record.id)
-                    .join("coordination")
-                    .join("capability")
-            )
+            display_path(&coordination::capability_path_for_state(
+                state_dir, &record.id, runtime_id
+            ))
         ),
         format!(
             "{}={}",
@@ -7003,6 +7064,54 @@ enum ProcessGroupStatus {
     Unknown,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CoordinationRuntimeStatus {
+    Running,
+    Stopped,
+    Unknown,
+}
+
+pub(crate) struct CoordinationRuntimeEvidence {
+    pub(crate) identity_digest: String,
+    pub(crate) status: CoordinationRuntimeStatus,
+}
+
+pub(crate) fn coordination_runtime_evidence(
+    record: &SessionRecord,
+) -> Result<CoordinationRuntimeEvidence, CliError> {
+    let identity = persisted_tmux_runtime_identity(record)
+        .map_err(|_| {
+            CliError::runtime(
+                "coordination-runtime-unverified",
+                "persisted runtime identity is unavailable or invalid",
+                None,
+            )
+        })?
+        .ok_or_else(|| {
+            CliError::runtime(
+                "coordination-runtime-unverified",
+                "persisted runtime identity is unavailable",
+                None,
+            )
+        })?;
+    let bytes = serde_json::to_vec(&identity).map_err(|_| {
+        CliError::runtime(
+            "coordination-runtime-unverified",
+            "persisted runtime identity could not be canonicalized",
+            None,
+        )
+    })?;
+    let status = match process_runtime_status(&identity) {
+        ProcessGroupStatus::Running => CoordinationRuntimeStatus::Running,
+        ProcessGroupStatus::Stopped => CoordinationRuntimeStatus::Stopped,
+        ProcessGroupStatus::Unknown => CoordinationRuntimeStatus::Unknown,
+    };
+    Ok(CoordinationRuntimeEvidence {
+        identity_digest: coordination::digest_bytes(&bytes),
+        status,
+    })
+}
+
 fn process_group_status(process_group_id: libc::pid_t) -> ProcessGroupStatus {
     if unsafe { libc::kill(-process_group_id, 0) } == 0 {
         return ProcessGroupStatus::Running;
@@ -9432,6 +9541,18 @@ mod tests {
         session_dir, strip_trailing_blank_lines, tmux_launch_may_have_created_runtime,
         try_acquire_session_record_lock, write_session_record,
     };
+
+    #[test]
+    fn coordination_review_held_launch_heartbeats_before_waiting_on_the_gate() {
+        let heartbeat = super::HELD_LAUNCH_SCRIPT
+            .find("owner=$$")
+            .expect("heartbeat setup");
+        let gate = super::HELD_LAUNCH_SCRIPT
+            .find("while [ ! -f \"$gate\" ]")
+            .expect("gate wait");
+        assert!(heartbeat < gate);
+        assert!(super::HELD_LAUNCH_SCRIPT.contains("rm -f \"$capability\""));
+    }
     use pretty_assertions::assert_eq;
     #[cfg(target_os = "linux")]
     use std::env;

@@ -38,7 +38,13 @@ pub(crate) struct OperationLease {
     pub started_at: String,
     pub expires_at: String,
     pub expires_at_epoch: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_at_epoch: Option<i64>,
     pub execution_token_digest: String,
+    #[serde(default)]
+    pub activity_revision: u64,
+    #[serde(default)]
+    pub runtime_identity_digest: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub outcome: Option<String>,
 }
@@ -55,8 +61,6 @@ struct OperationTargetsInput {
 struct ReconcileProof {
     schema_version: String,
     execution_token: String,
-    token_idle: bool,
-    descendant_running: bool,
     outcome: String,
 }
 
@@ -101,17 +105,23 @@ pub(crate) fn claim(context: &CliContext, args: WorkContextClaimArgs) -> Result<
     )? {
         return Ok(replay);
     }
-    if let Some(existing) = locked.registry.claims.iter_mut().find(|claim| {
+    if let Some(existing_index) = locked.registry.claims.iter().position(|claim| {
         claim.session_id == record.id
             && claim.session_incarnation == incarnation
             && claim.state == "active"
     }) {
+        let existing_claim_id = locked.registry.claims[existing_index].claim_id.clone();
+        if has_nonterminal_operation(&locked.registry, &existing_claim_id) {
+            return Err(operation_in_progress());
+        }
+        let existing = &mut locked.registry.claims[existing_index];
         if args.if_revision != Some(existing.revision) {
             return Err(revision_conflict("claim-revision-conflict"));
         }
         existing.state = "released".to_string();
         existing.revision = existing.revision.saturating_add(1);
         existing.updated_at = timestamp(now);
+        existing.terminal_at_epoch = Some(now);
     } else if args.if_revision.is_some() {
         return Err(revision_conflict("claim-revision-conflict"));
     }
@@ -150,6 +160,7 @@ pub(crate) fn claim(context: &CliContext, args: WorkContextClaimArgs) -> Result<
         updated_at: timestamp(now),
         expires_at: timestamp(now.saturating_add(CLAIM_TTL_SECS)),
         expires_at_epoch: now.saturating_add(CLAIM_TTL_SECS),
+        terminal_at_epoch: None,
     };
     locked.registry.claims.push(claim.clone());
     let outcome = json!({
@@ -286,23 +297,28 @@ pub(crate) fn release(
     )? {
         return Ok(replay);
     }
-    let claim = locked
+    let claim_index = locked
         .registry
         .claims
-        .iter_mut()
-        .find(|claim| {
+        .iter()
+        .position(|claim| {
             claim.session_id == record.id
                 && claim.session_incarnation == incarnation
                 && claim.claim_id == args.claim
                 && claim.state == "active"
         })
         .ok_or_else(claim_unavailable)?;
+    if has_nonterminal_operation(&locked.registry, &args.claim) {
+        return Err(operation_in_progress());
+    }
+    let claim = &mut locked.registry.claims[claim_index];
     if claim.revision != args.if_revision {
         return Err(revision_conflict("claim-revision-conflict"));
     }
     claim.state = "released".to_string();
     claim.revision = claim.revision.saturating_add(1);
     claim.updated_at = timestamp(now);
+    claim.terminal_at_epoch = Some(now);
     let outcome = public_context(claim)?;
     store_receipt(
         &mut locked.registry,
@@ -397,6 +413,28 @@ pub(crate) fn admit(context: &CliContext, args: WorkContextAdmitArgs) -> Result<
             Some(json!({ "evaluation": evaluation })),
         ));
     }
+    let activity = crate::activity::state_for_view(context, &record).ok_or_else(|| {
+        CliError::runtime(
+            "coordination-unavailable",
+            "controller-owned activity state is unavailable for operation admission",
+            None,
+        )
+    })?;
+    if activity.phase != crate::activity::TurnPhase::Working {
+        return Err(CliError::data(
+            "operation-not-working",
+            "mutation operation admission requires controller-observed working state",
+            None,
+        ));
+    }
+    let runtime = crate::coordination_runtime_evidence(&record)?;
+    if runtime.status != crate::CoordinationRuntimeStatus::Running {
+        return Err(CliError::runtime(
+            "coordination-unavailable",
+            "the exact persisted runtime is not confirmed running",
+            None,
+        ));
+    }
     let lease = OperationLease {
         schema_version: OPERATION_LEASE_VERSION.to_string(),
         lease_id: uuid::Uuid::new_v4().to_string(),
@@ -411,7 +449,10 @@ pub(crate) fn admit(context: &CliContext, args: WorkContextAdmitArgs) -> Result<
         started_at: timestamp(now),
         expires_at: timestamp(now.saturating_add(OPERATION_TTL_SECS)),
         expires_at_epoch: now.saturating_add(OPERATION_TTL_SECS),
+        terminal_at_epoch: None,
         execution_token_digest: digest_bytes(args.execution_token.as_bytes()),
+        activity_revision: activity.revision,
+        runtime_identity_digest: runtime.identity_digest,
         outcome: None,
     };
     locked.registry.operations.push(lease.clone());
@@ -482,6 +523,7 @@ pub(crate) fn complete(
         "failed".to_string()
     };
     lease.outcome = Some(args.outcome.as_str().to_string());
+    lease.terminal_at_epoch = Some(now);
     let outcome = public_lease(lease)?;
     store_receipt(
         &mut locked.registry,
@@ -506,8 +548,6 @@ pub(crate) fn reconcile(
     let proof: ReconcileProof =
         read_bounded_json(&args.proof_file, 16 * 1024, "invalid-reconcile-proof")?;
     if proof.schema_version != "agent-session.operation-reconcile-proof.v1"
-        || !proof.token_idle
-        || proof.descendant_running
         || !matches!(proof.outcome.as_str(), "pass" | "fail")
     {
         return Err(CliError::data(
@@ -537,22 +577,38 @@ pub(crate) fn reconcile(
     )? {
         return Ok(replay);
     }
-    let lease = locked
+    let lease_snapshot = locked
         .registry
         .operations
-        .iter_mut()
+        .iter()
         .find(|lease| {
             lease.session_id == record.id
                 && lease.session_incarnation == incarnation
                 && lease.lease_id == args.lease
         })
+        .cloned()
         .ok_or_else(operation_unavailable)?;
-    if lease.revision != args.if_revision || lease.execution_token_digest != token_digest {
+    if lease_snapshot.revision != args.if_revision
+        || lease_snapshot.execution_token_digest != token_digest
+    {
         return Err(revision_conflict("operation-revision-conflict"));
     }
-    if !matches!(lease.state.as_str(), "active" | "completing" | "expired") {
+    if !matches!(lease_snapshot.state.as_str(), "active" | "completing") {
         return Err(revision_conflict("operation-revision-conflict"));
     }
+    if !controller_observed_terminal(context, &record, &lease_snapshot) {
+        return Err(CliError::data(
+            "operation-still-running",
+            "controller-owned state does not prove the exact operation runtime is terminal",
+            None,
+        ));
+    }
+    let lease = locked
+        .registry
+        .operations
+        .iter_mut()
+        .find(|lease| lease.lease_id == lease_snapshot.lease_id)
+        .ok_or_else(operation_unavailable)?;
     lease.revision = lease.revision.saturating_add(1);
     lease.state = if proof.outcome == "pass" {
         "completed".to_string()
@@ -560,6 +616,7 @@ pub(crate) fn reconcile(
         "failed".to_string()
     };
     lease.outcome = Some(proof.outcome);
+    lease.terminal_at_epoch = Some(now);
     let outcome = public_lease(lease)?;
     store_receipt(
         &mut locked.registry,
@@ -644,10 +701,11 @@ fn input_from_record(claim: &WorkContextRecord) -> WorkContextInput {
 
 fn public_context(claim: &WorkContextRecord) -> Result<Value, CliError> {
     let mut value = json_value(claim)?;
-    value
+    let object = value
         .as_object_mut()
-        .expect("work context serializes as an object")
-        .remove("expires_at_epoch");
+        .expect("work context serializes as an object");
+    object.remove("expires_at_epoch");
+    object.remove("terminal_at_epoch");
     Ok(value)
 }
 
@@ -657,7 +715,10 @@ fn public_lease(lease: &OperationLease) -> Result<Value, CliError> {
         .as_object_mut()
         .expect("operation lease serializes as an object");
     object.remove("expires_at_epoch");
+    object.remove("terminal_at_epoch");
     object.remove("execution_token_digest");
+    object.remove("activity_revision");
+    object.remove("runtime_identity_digest");
     Ok(value)
 }
 
@@ -667,6 +728,15 @@ fn complete_relevant_universe(
     subject_id: &str,
     subject_incarnation: &str,
 ) -> bool {
+    if registry.claims.iter().any(|claim| {
+        claim.state == "active"
+            && (claim.schema_version != WORK_CONTEXT_VERSION
+                || claim.worktrees.iter().any(|fingerprint| {
+                    fingerprint_epoch(fingerprint) != Some(registry.fingerprint_epoch)
+                }))
+    }) {
+        return false;
+    }
     let sessions = context.state_dir.join("sessions");
     let Ok(entries) = fs::read_dir(sessions) else {
         return false;
@@ -702,6 +772,47 @@ fn complete_relevant_universe(
         }
     }
     true
+}
+
+fn fingerprint_epoch(value: &str) -> Option<u64> {
+    let mut fields = value.splitn(3, ':');
+    let algorithm = fields.next()?;
+    let epoch = fields.next()?.parse().ok()?;
+    let digest = fields.next()?;
+    (algorithm == "hmac-sha256"
+        && digest.len() == 64
+        && digest.bytes().all(|byte| byte.is_ascii_hexdigit()))
+    .then_some(epoch)
+}
+
+fn has_nonterminal_operation(registry: &Registry, claim_id: &str) -> bool {
+    registry.operations.iter().any(|operation| {
+        operation.claim_id == claim_id
+            && matches!(operation.state.as_str(), "active" | "completing")
+    })
+}
+
+fn controller_observed_terminal(
+    context: &CliContext,
+    record: &crate::SessionRecord,
+    lease: &OperationLease,
+) -> bool {
+    let Ok(runtime) = crate::coordination_runtime_evidence(record) else {
+        return false;
+    };
+    if runtime.identity_digest != lease.runtime_identity_digest {
+        return false;
+    }
+    match runtime.status {
+        crate::CoordinationRuntimeStatus::Stopped => true,
+        crate::CoordinationRuntimeStatus::Running => {
+            crate::activity::state_for_view(context, record).is_some_and(|activity| {
+                activity.phase == crate::activity::TurnPhase::Waiting
+                    && activity.revision > lease.activity_revision
+            })
+        }
+        crate::CoordinationRuntimeStatus::Unknown => false,
+    }
 }
 
 fn validate_operation_kind(value: &str) -> Result<(), CliError> {
@@ -750,6 +861,14 @@ fn operation_unavailable() -> CliError {
     CliError::data("operation-not-found", "operation lease was not found", None)
 }
 
+fn operation_in_progress() -> CliError {
+    CliError::data(
+        "operation-in-progress",
+        "the claim remains bound to an active or uncertain mutation operation",
+        None,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -770,7 +889,10 @@ mod tests {
             started_at: "time".to_string(),
             expires_at: "time".to_string(),
             expires_at_epoch: 0,
+            terminal_at_epoch: None,
             execution_token_digest: "canary".to_string(),
+            activity_revision: 1,
+            runtime_identity_digest: "runtime".to_string(),
             outcome: None,
         };
         let value = public_lease(&lease).expect("serialize");

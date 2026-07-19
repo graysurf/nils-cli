@@ -8,7 +8,7 @@ use serde_json::Value;
 use crate::cli;
 use crate::{CliContext, CliError};
 
-use super::{authenticate_token, capability_path, claims, mailbox};
+use super::{authenticate_token, claims, mailbox};
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -436,8 +436,7 @@ impl Drop for ServerCapability {
 
 fn authorize(context: &CliContext, id: &str, token: &str) -> Result<ServerCapability, CliError> {
     authenticate_token(context, id, token)?;
-    let capability = capability_path(context, id);
-    let directory = capability.parent().expect("capability path has parent");
+    let directory = super::coordination_dir(context, id);
     let path = directory.join(format!(
         ".server-capability-{}.request",
         uuid::Uuid::new_v4()
@@ -493,8 +492,7 @@ fn with_bytes<T>(
     bytes: &[u8],
     operation: impl FnOnce(PathBuf) -> Result<T, CliError>,
 ) -> Result<T, CliError> {
-    let capability = capability_path(context, id);
-    let directory = capability.parent().expect("capability path has parent");
+    let directory = super::coordination_dir(context, id);
     let path = directory.join(format!(".{label}-{}.request", uuid::Uuid::new_v4()));
     write_atomic(&path, bytes, SECRET_FILE_MODE).map_err(|_| {
         CliError::runtime(

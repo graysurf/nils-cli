@@ -72,10 +72,14 @@ fn seed_brokers(state_dir: &Path, sessions: &[(&str, &str, &str)]) {
         fs::create_dir(&capability_dir).expect("capability directory");
         fs::set_permissions(&capability_dir, fs::Permissions::from_mode(0o700))
             .expect("capability dir mode");
-        let capability_path = capability_dir.join("capability");
+        let capability_path = capability_dir.join(format!("capability-{}", digest(incarnation)));
         fs::write(&capability_path, capability).expect("capability");
         fs::set_permissions(&capability_path, fs::Permissions::from_mode(0o600))
             .expect("capability mode");
+        let heartbeat_path = capability_dir.join("heartbeat");
+        fs::write(&heartbeat_path, format!("{incarnation}:{now}\n")).expect("heartbeat");
+        fs::set_permissions(&heartbeat_path, fs::Permissions::from_mode(0o600))
+            .expect("heartbeat mode");
         brokers.insert(
             (*id).to_string(),
             json!({
@@ -114,10 +118,18 @@ fn seed_brokers(state_dir: &Path, sessions: &[(&str, &str, &str)]) {
 }
 
 fn capability(state_dir: &Path, id: &str) -> String {
+    let record: serde_json::Value = serde_json::from_slice(
+        &fs::read(state_dir.join("sessions").join(id).join("session.json"))
+            .expect("session record"),
+    )
+    .expect("session json");
+    let incarnation = record["runtime"]["launch_id"]
+        .as_str()
+        .expect("session incarnation");
     state_dir
         .join("sessions")
         .join(id)
-        .join("coordination/capability")
+        .join(format!("coordination/capability-{}", digest(incarnation)))
         .to_string_lossy()
         .to_string()
 }
@@ -627,5 +639,382 @@ fn mailbox_is_private_bounded_and_recipient_authenticated() {
             .mode()
             & 0o777,
         0o700
+    );
+}
+
+#[test]
+fn coordination_review_envelopes_identify_the_exact_operation() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let state_dir = tmp.path().join("state");
+    fs::create_dir(&state_dir).expect("state");
+    seed_brokers(
+        &state_dir,
+        &[(
+            "alpha",
+            "incarnation-alpha",
+            "alpha-private-capability-material",
+        )],
+    );
+    let output = run(
+        tmp.path(),
+        &[
+            "--state-dir",
+            state_dir.to_str().expect("state"),
+            "message",
+            "inbox",
+            "--session",
+            "alpha",
+            "--capability-file",
+            &capability(&state_dir, "alpha"),
+            "--format",
+            "json",
+        ],
+    );
+    assert_eq!(output.code, 0, "stderr={}", output.stderr_text());
+    assert_eq!(
+        output.stdout_json()["schema_version"],
+        "cli.agent-session.message-inbox.v1"
+    );
+}
+
+#[test]
+fn coordination_review_wait_processes_message_expiry() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let state_dir = tmp.path().join("state");
+    fs::create_dir(&state_dir).expect("state");
+    seed_brokers(
+        &state_dir,
+        &[
+            (
+                "alpha",
+                "incarnation-alpha",
+                "alpha-private-capability-material",
+            ),
+            (
+                "beta",
+                "incarnation-beta",
+                "beta-private-capability-material",
+            ),
+        ],
+    );
+    let body = tmp.path().join("body.txt");
+    fs::write(&body, "expires shortly").expect("body");
+    let sent = run(
+        tmp.path(),
+        &[
+            "--state-dir",
+            state_dir.to_str().expect("state"),
+            "message",
+            "send",
+            "--from",
+            "alpha",
+            "--to",
+            "beta",
+            "--body-file",
+            body.to_str().expect("body"),
+            "--expires-in",
+            "1s",
+            "--capability-file",
+            &capability(&state_dir, "alpha"),
+            "--idempotency-key",
+            "message-expiry-review-0001",
+            "--format",
+            "json",
+        ],
+    );
+    assert_eq!(sent.code, 0, "stderr={}", sent.stderr_text());
+    let message_id = data(&sent)["message_id"]
+        .as_str()
+        .expect("message id")
+        .to_string();
+    std::thread::sleep(std::time::Duration::from_millis(1_100));
+    let waited = run(
+        tmp.path(),
+        &[
+            "--state-dir",
+            state_dir.to_str().expect("state"),
+            "message",
+            "wait",
+            "--session",
+            "beta",
+            "--message",
+            &message_id,
+            "--if-revision",
+            "1",
+            "--timeout",
+            "1s",
+            "--capability-file",
+            &capability(&state_dir, "beta"),
+            "--format",
+            "json",
+        ],
+    );
+    assert_ne!(waited.code, 0);
+    assert_eq!(waited.stdout_json()["error"]["code"], "message-expired");
+}
+
+#[test]
+fn coordination_review_registry_lock_rejects_symlinks_without_chmod() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let state_dir = tmp.path().join("state");
+    fs::create_dir(&state_dir).expect("state");
+    seed_brokers(
+        &state_dir,
+        &[(
+            "alpha",
+            "incarnation-alpha",
+            "alpha-private-capability-material",
+        )],
+    );
+    let lock_path = state_dir.join("coordination/registry.lock");
+    let sentinel = tmp.path().join("sentinel");
+    fs::write(&sentinel, "do not touch").expect("sentinel");
+    fs::set_permissions(&sentinel, fs::Permissions::from_mode(0o644)).expect("sentinel mode");
+    std::os::unix::fs::symlink(&sentinel, &lock_path).expect("lock symlink");
+
+    let output = run(
+        tmp.path(),
+        &[
+            "--state-dir",
+            state_dir.to_str().expect("state"),
+            "message",
+            "inbox",
+            "--session",
+            "alpha",
+            "--capability-file",
+            &capability(&state_dir, "alpha"),
+            "--format",
+            "json",
+        ],
+    );
+    assert_ne!(output.code, 0);
+    assert_eq!(
+        output.stdout_json()["error"]["code"],
+        "coordination-store-untrusted"
+    );
+    assert_eq!(
+        fs::metadata(&sentinel)
+            .expect("sentinel metadata")
+            .permissions()
+            .mode()
+            & 0o777,
+        0o644
+    );
+}
+
+#[test]
+fn coordination_review_bound_operation_blocks_claim_release_and_replacement() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let state_dir = tmp.path().join("state");
+    fs::create_dir(&state_dir).expect("state");
+    seed_brokers(
+        &state_dir,
+        &[(
+            "alpha",
+            "incarnation-alpha",
+            "alpha-private-capability-material",
+        )],
+    );
+    let context_file = tmp.path().join("context.json");
+    candidate(&context_file, "src/", "claim with active operation");
+    let common = state_dir.to_string_lossy();
+    let cap = capability(&state_dir, "alpha");
+    let claimed = run(
+        tmp.path(),
+        &[
+            "--state-dir",
+            &common,
+            "work-context",
+            "claim",
+            "--session",
+            "alpha",
+            "--file",
+            context_file.to_str().expect("context"),
+            "--capability-file",
+            &cap,
+            "--idempotency-key",
+            "review-bound-claim-0001",
+            "--format",
+            "json",
+        ],
+    );
+    assert_eq!(claimed.code, 0, "stderr={}", claimed.stderr_text());
+    let claim_id = data(&claimed)["context"]["claim_id"]
+        .as_str()
+        .expect("claim id")
+        .to_string();
+    let registry_path = state_dir.join("coordination/registry.json");
+    let mut registry: serde_json::Value =
+        serde_json::from_slice(&fs::read(&registry_path).expect("registry")).expect("json");
+    registry["operations"]
+        .as_array_mut()
+        .expect("operations")
+        .push(json!({
+            "schema_version": "agent-session.operation-lease.v1",
+            "lease_id": "review-lease",
+            "session_id": "alpha",
+            "session_incarnation": "incarnation-alpha",
+            "claim_id": claim_id,
+            "claim_revision": 1,
+            "operation": "edit",
+            "targets": [{"kind": "path-exact", "repository": "example/repository", "value": "src/lib.rs"}],
+            "state": "active",
+            "revision": 1,
+            "started_at": "2030-01-01T00:00:00Z",
+            "expires_at": "2030-01-08T00:00:00Z",
+            "expires_at_epoch": i64::MAX,
+            "execution_token_digest": "digest",
+            "activity_revision": 1,
+            "runtime_identity_digest": "runtime"
+        }));
+    fs::write(
+        &registry_path,
+        serde_json::to_vec_pretty(&registry).expect("registry json"),
+    )
+    .expect("write registry");
+    fs::set_permissions(&registry_path, fs::Permissions::from_mode(0o600)).expect("registry mode");
+
+    let released = run(
+        tmp.path(),
+        &[
+            "--state-dir",
+            &common,
+            "work-context",
+            "release",
+            "--session",
+            "alpha",
+            "--claim",
+            &claim_id,
+            "--if-revision",
+            "1",
+            "--capability-file",
+            &cap,
+            "--idempotency-key",
+            "review-bound-release-0001",
+            "--format",
+            "json",
+        ],
+    );
+    assert_ne!(released.code, 0);
+    assert_eq!(
+        released.stdout_json()["error"]["code"],
+        "operation-in-progress"
+    );
+
+    let replaced = run(
+        tmp.path(),
+        &[
+            "--state-dir",
+            &common,
+            "work-context",
+            "claim",
+            "--session",
+            "alpha",
+            "--file",
+            context_file.to_str().expect("context"),
+            "--if-revision",
+            "1",
+            "--capability-file",
+            &cap,
+            "--idempotency-key",
+            "review-bound-replace-0001",
+            "--format",
+            "json",
+        ],
+    );
+    assert_ne!(replaced.code, 0);
+    assert_eq!(
+        replaced.stdout_json()["error"]["code"],
+        "operation-in-progress"
+    );
+}
+
+#[test]
+fn coordination_review_recovery_rejects_a_healthy_exact_broker() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let state_dir = tmp.path().join("state");
+    fs::create_dir(&state_dir).expect("state");
+    seed_brokers(
+        &state_dir,
+        &[(
+            "alpha",
+            "incarnation-alpha",
+            "alpha-private-capability-material",
+        )],
+    );
+    let proof = tmp.path().join("proof.json");
+    fs::write(
+        &proof,
+        serde_json::to_vec_pretty(&json!({
+            "schema_version": "agent-session.coordination-recovery-proof.v1",
+            "session_incarnation": "incarnation-alpha",
+            "generation": 1
+        }))
+        .expect("proof json"),
+    )
+    .expect("proof");
+    let recovered = run(
+        tmp.path(),
+        &[
+            "--state-dir",
+            state_dir.to_str().expect("state"),
+            "broker",
+            "adopt",
+            "--session",
+            "alpha",
+            "--proof-file",
+            proof.to_str().expect("proof"),
+            "--idempotency-key",
+            "review-healthy-recovery-0001",
+            "--format",
+            "json",
+        ],
+    );
+    assert_ne!(recovered.code, 0);
+    assert_eq!(
+        recovered.stdout_json()["error"]["code"],
+        "coordination-broker-not-lost"
+    );
+}
+
+#[test]
+fn coordination_review_target_exit_revokes_copied_capability() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let state_dir = tmp.path().join("state");
+    fs::create_dir(&state_dir).expect("state");
+    seed_brokers(
+        &state_dir,
+        &[(
+            "alpha",
+            "incarnation-alpha",
+            "alpha-private-capability-material",
+        )],
+    );
+    let live_capability = capability(&state_dir, "alpha");
+    let copied_capability = tmp.path().join("copied-capability");
+    fs::copy(&live_capability, &copied_capability).expect("copy capability");
+    fs::set_permissions(&copied_capability, fs::Permissions::from_mode(0o600))
+        .expect("copied capability mode");
+    fs::remove_file(&live_capability).expect("simulate target exit revocation");
+
+    let status = run(
+        tmp.path(),
+        &[
+            "--state-dir",
+            state_dir.to_str().expect("state"),
+            "broker",
+            "status",
+            "--session",
+            "alpha",
+            "--capability-file",
+            copied_capability.to_str().expect("copied capability"),
+            "--format",
+            "json",
+        ],
+    );
+    assert_ne!(status.code, 0);
+    assert_eq!(
+        status.stdout_json()["error"]["code"],
+        "coordination-unauthorized"
     );
 }

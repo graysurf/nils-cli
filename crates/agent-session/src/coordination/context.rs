@@ -73,6 +73,8 @@ pub struct WorkContextRecord {
     pub updated_at: String,
     pub expires_at: String,
     pub expires_at_epoch: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_at_epoch: Option<i64>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq, PartialOrd, Ord)]
@@ -184,12 +186,17 @@ pub fn evaluate(
     let mut reasons = Vec::new();
     let mut peers = Vec::new();
     let mut potential = false;
+    let mut effective_complete = complete_registry;
     for peer in active {
         if peer.session_id == candidate_session && peer.session_incarnation == candidate_incarnation
         {
             continue;
         }
-        if peer.state != "active" || peer.schema_version != WORK_CONTEXT_VERSION {
+        if peer.state != "active" {
+            continue;
+        }
+        if peer.schema_version != WORK_CONTEXT_VERSION {
+            effective_complete = false;
             continue;
         }
         let mut peer_conflict = false;
@@ -259,9 +266,9 @@ pub fn evaluate(
         ConflictClassification::Conflict
     } else if potential {
         ConflictClassification::PotentialConflict
-    } else if !complete_registry && allow_incomplete {
+    } else if !effective_complete && allow_incomplete {
         ConflictClassification::NoKnownConflict
-    } else if !complete_registry {
+    } else if !effective_complete {
         ConflictClassification::Unknown
     } else {
         ConflictClassification::Clear
@@ -269,9 +276,60 @@ pub fn evaluate(
     ConflictEvaluation {
         schema_version: CONFLICT_EVALUATION_VERSION.to_string(),
         classification,
-        complete: complete_registry,
+        complete: effective_complete,
         reasons,
         peers,
+    }
+}
+
+#[cfg(test)]
+mod review_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn coordination_review_unsupported_peer_schema_makes_the_universe_incomplete() {
+        let candidate: WorkContextInput = serde_json::from_value(json!({
+            "schema_version": "agent-session.work-context-input.v1",
+            "intent": "implementation",
+            "tier": "L2",
+            "repositories": ["example/repository"],
+            "worktrees": ["hmac-sha256:1:candidate"],
+            "provider_refs": [],
+            "plan_refs": [],
+            "scopes": [{"kind": "path-prefix", "repository": "example/repository", "value": "src/"}],
+            "summary": "candidate"
+        })).expect("candidate");
+        let peer: WorkContextRecord = serde_json::from_value(json!({
+            "schema_version": "agent-session.work-context.v999",
+            "session_id": "peer",
+            "session_incarnation": "peer-incarnation",
+            "claim_id": "peer-claim",
+            "revision": 1,
+            "state": "active",
+            "intent": "implementation",
+            "tier": "L2",
+            "repositories": ["other/repository"],
+            "worktrees": ["hmac-sha256:999:unknown"],
+            "provider_refs": [],
+            "plan_refs": [],
+            "scopes": [{"kind": "path-prefix", "repository": "other/repository", "value": "src/"}],
+            "summary": "peer",
+            "updated_at": "2030-01-01T00:00:00Z",
+            "expires_at": "2030-01-01T01:00:00Z",
+            "expires_at_epoch": 1
+        }))
+        .expect("peer");
+        let evaluation = evaluate(
+            "candidate",
+            "candidate-incarnation",
+            &candidate,
+            &[peer],
+            true,
+            false,
+        );
+        assert_eq!(evaluation.classification, ConflictClassification::Unknown);
+        assert!(!evaluation.complete);
     }
 }
 

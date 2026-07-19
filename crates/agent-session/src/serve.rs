@@ -127,6 +127,7 @@ const ACTIVITY_STREAM_DEBOUNCE: Duration = Duration::from_millis(25);
 const ACTIVITY_STREAM_MAX_REFRESH_CADENCE: Duration = Duration::from_millis(250);
 const ACTIVITY_STREAM_OVERSIZED_REASON: &str = "oversized_snapshot";
 const SESSION_DELETE_TOMBSTONE_CLEANUP_LIMIT: usize = 64;
+const COORDINATION_WAIT_WORKER_LIMIT: usize = 16;
 const RESET_AT_KEYS: &[&str] = &["reset_at", "resetAt", "resets_at", "resetsAt"];
 const RESET_AT_EPOCH_KEYS: &[&str] = &[
     "reset_at_epoch",
@@ -155,6 +156,20 @@ struct ServeState {
     codex_account_switches: CodexAccountSwitchRegistry,
     session_collector: SessionCollector,
     launch_profiles: AgentLaunchProfiles,
+    coordination_wait_workers: Arc<tokio::sync::Semaphore>,
+}
+
+#[derive(Clone)]
+struct CoordinationNotificationFence {
+    message_id: String,
+    target_incarnation: String,
+}
+
+#[derive(Default)]
+struct StructuredPromptGuards<'a> {
+    expected_session_incarnation: Option<&'a str>,
+    expected_binding: Option<(&'a str, u64)>,
+    notification: Option<CoordinationNotificationFence>,
 }
 
 #[derive(Clone)]
@@ -645,6 +660,9 @@ pub fn run_serve(context: &CliContext, args: cli::ServeArgs) -> i32 {
             codex_account_switches: CodexAccountSwitchRegistry::default(),
             session_collector,
             launch_profiles,
+            coordination_wait_workers: Arc::new(tokio::sync::Semaphore::new(
+                COORDINATION_WAIT_WORKER_LIMIT,
+            )),
         });
         let listener = match bind_listener_and_start_delete_tombstone_cleanup(context, bind).await {
             Ok(listener) => listener,
@@ -3187,48 +3205,16 @@ async fn attempt_coordination_notification(state: Arc<ServeState>, sent: &Value)
     let Ok(Ok(Some((target_session_id, target_incarnation)))) = candidate else {
         return;
     };
-    let context = state.context.clone();
-    let target_for_load = target_session_id.clone();
-    let target_incarnation_for_load = target_incarnation.clone();
-    let eligible = tokio::task::spawn_blocking(move || {
-        let record = load_session_record(&context, &target_for_load)?;
-        let exact_incarnation = record
-            .runtime
-            .as_ref()
-            .map(|runtime| runtime.launch_id.as_str())
-            .is_some_and(|incarnation| incarnation == target_incarnation_for_load);
-        let idle = activity::state_for_view(&context, &record)
-            .is_some_and(|state| state.phase == activity::TurnPhase::Waiting);
-        Ok::<_, CliError>(
-            exact_incarnation && idle && codex_app_server::runtime_is_supported(&record),
-        )
-    })
-    .await;
-    if !matches!(eligible, Ok(Ok(true))) {
-        return;
-    }
-    let context = state.context.clone();
-    let message_for_attempt = message_id.to_string();
-    let target_for_attempt = target_session_id.clone();
-    let incarnation_for_attempt = target_incarnation.clone();
-    let attempting = tokio::task::spawn_blocking(move || {
-        crate::coordination::begin_notification_attempt(
-            &context,
-            &message_for_attempt,
-            &target_for_attempt,
-            &incarnation_for_attempt,
-        )
-    })
-    .await;
-    if !matches!(attempting, Ok(Ok(true))) {
-        return;
-    }
     let prompt = crate::coordination::notification_prompt(message_id, &target_session_id);
-    let _ = submit_structured_prompt_handler(
+    let _ = submit_structured_prompt_handler_with_fence(
         state,
         target_session_id,
         prompt,
-        Some(target_incarnation),
+        Some(target_incarnation.clone()),
+        Some(CoordinationNotificationFence {
+            message_id: message_id.to_string(),
+            target_incarnation,
+        }),
     )
     .await;
 }
@@ -3308,8 +3294,19 @@ async fn coordination_wait_handler(
         Ok(token) => token,
         Err(response) => return response,
     };
+    let permit = match state.coordination_wait_workers.clone().try_acquire_owned() {
+        Ok(permit) => permit,
+        Err(_) => {
+            return status_json(
+                StatusCode::TOO_MANY_REQUESTS,
+                "rate-limited",
+                "coordination wait worker limit reached",
+            );
+        }
+    };
     let context = state.context.clone();
     match tokio::task::spawn_blocking(move || {
+        let _permit = permit;
         coordination_server::wait(&context, &id, &message_id, &token, body)
     })
     .await
@@ -3571,8 +3568,10 @@ async fn create_handler(
                         &state,
                         &view.result.id,
                         &launch_id,
-                        None,
-                        Some((requested_account, 1)),
+                        StructuredPromptGuards {
+                            expected_binding: Some((requested_account, 1)),
+                            ..Default::default()
+                        },
                         &handle,
                         &prompt,
                     )
@@ -3769,17 +3768,18 @@ async fn submit_structured_prompt_locked(
     state: &ServeState,
     id: &str,
     launch_id: &str,
-    expected_session_incarnation: Option<&str>,
-    expected_binding: Option<(&str, u64)>,
+    guards: StructuredPromptGuards<'_>,
     handle: &ControlHandle,
     text: &str,
 ) -> Result<String, Response> {
     let lock_context = state.context.clone();
     let lock_id = id.to_string();
     let expected_launch_id = launch_id.to_string();
-    let expected_session_incarnation = expected_session_incarnation.map(str::to_string);
-    let expected_binding =
-        expected_binding.map(|(account, revision)| (account.to_string(), revision));
+    let expected_session_incarnation = guards.expected_session_incarnation.map(str::to_string);
+    let expected_binding = guards
+        .expected_binding
+        .map(|(account, revision)| (account.to_string(), revision));
+    let notification_fence = guards.notification;
     let (record_lock, session_incarnation) = match tokio::task::spawn_blocking(move || {
         let record_lock = crate::acquire_session_record_lock(&lock_context, &lock_id)?;
         let mut current = load_session_record(&lock_context, &lock_id)?;
@@ -3827,6 +3827,26 @@ async fn submit_structured_prompt_locked(
             &jiff::Timestamp::now().to_string(),
         )?;
         crate::codex_account::ensure_input_allowed(&current)?;
+        if let Some(fence) = notification_fence {
+            let eligible = actual_launch_id == fence.target_incarnation
+                && codex_app_server::runtime_is_supported(&current)
+                && activity::state_for_view(&lock_context, &current)
+                    .is_some_and(|state| state.phase == activity::TurnPhase::Waiting);
+            if !eligible
+                || !crate::coordination::begin_notification_attempt(
+                    &lock_context,
+                    &fence.message_id,
+                    &current.id,
+                    &fence.target_incarnation,
+                )?
+            {
+                return Err(CliError::data(
+                    "coordination-notification-superseded",
+                    "notification eligibility changed before locked prompt submission",
+                    None,
+                ));
+            }
+        }
         Ok::<_, CliError>((record_lock, actual_launch_id))
     })
     .await
@@ -4060,6 +4080,17 @@ async fn submit_structured_prompt_handler(
     text: String,
     expected_session_incarnation: Option<String>,
 ) -> Response {
+    submit_structured_prompt_handler_with_fence(state, id, text, expected_session_incarnation, None)
+        .await
+}
+
+async fn submit_structured_prompt_handler_with_fence(
+    state: Arc<ServeState>,
+    id: String,
+    text: String,
+    expected_session_incarnation: Option<String>,
+    notification_fence: Option<CoordinationNotificationFence>,
+) -> Response {
     if text.trim().is_empty() {
         return status_json(
             StatusCode::BAD_REQUEST,
@@ -4134,8 +4165,11 @@ async fn submit_structured_prompt_handler(
         &state,
         &record.id,
         &launch_id,
-        expected_session_incarnation,
-        None,
+        StructuredPromptGuards {
+            expected_session_incarnation,
+            notification: notification_fence,
+            ..Default::default()
+        },
         &handle,
         &text,
     )
@@ -8781,6 +8815,9 @@ mod tests {
             codex_account_switches: CodexAccountSwitchRegistry::default(),
             session_collector,
             launch_profiles: AgentLaunchProfiles::default(),
+            coordination_wait_workers: Arc::new(tokio::sync::Semaphore::new(
+                COORDINATION_WAIT_WORKER_LIMIT,
+            )),
         })
     }
 
@@ -8788,7 +8825,7 @@ mod tests {
         let bin = dir.join("tmux");
         std::fs::write(
             &bin,
-            "#!/usr/bin/env sh\ncase \"$1\" in\n  has-session) exit 0 ;;\n  new-session) printf '%s\\t%s\\t%s\\n' '$77' '%77' \"$$\"; exit 0 ;;\n  capture-pane) printf 'pane\\n'; exit 0 ;;\n  show-buffer) printf 'buffered selection\\n'; exit 0 ;;\n  *) exit 0 ;;\nesac\n",
+            "#!/usr/bin/env sh\ncase \"$1\" in\n  has-session) exit 0 ;;\n  new-session) heartbeat=''; slot=0; for arg in \"$@\"; do if [ \"$slot\" = 2 ]; then incarnation=\"$arg\"; break; elif [ \"$slot\" = 1 ]; then slot=2; else case \"$arg\" in */coordination/heartbeat) heartbeat=\"$arg\"; slot=1 ;; esac; fi; done; if [ -n \"$heartbeat\" ] && [ -n \"$incarnation\" ]; then mkdir -p \"$(dirname \"$heartbeat\")\"; printf '%s:%s\\n' \"$incarnation\" \"$(date +%s)\" > \"$heartbeat\"; chmod 600 \"$heartbeat\"; fi; printf '%s\\t%s\\t%s\\n' '$77' '%77' \"$$\"; exit 0 ;;\n  capture-pane) printf 'pane\\n'; exit 0 ;;\n  show-buffer) printf 'buffered selection\\n'; exit 0 ;;\n  *) exit 0 ;;\nesac\n",
         )
         .unwrap();
         let mut perms = std::fs::metadata(&bin).unwrap().permissions();
@@ -9081,7 +9118,7 @@ esac
         executable(
             &dir.join("tmux"),
             &format!(
-                "#!/usr/bin/env sh\nprintf '%s\\n' \"$*\" >> {}\ncase \"$1\" in\n  has-session) exit 1 ;;\n  new-session) printf '%s\\t%s\\t%s\\n' '$77' '%77' \"$$\"; exit 0 ;;\n  *) exit 0 ;;\nesac\n",
+                "#!/usr/bin/env sh\nprintf '%s\\n' \"$*\" >> {}\ncase \"$1\" in\n  has-session) exit 1 ;;\n  new-session) heartbeat=''; slot=0; for arg in \"$@\"; do if [ \"$slot\" = 2 ]; then incarnation=\"$arg\"; break; elif [ \"$slot\" = 1 ]; then slot=2; else case \"$arg\" in */coordination/heartbeat) heartbeat=\"$arg\"; slot=1 ;; esac; fi; done; if [ -n \"$heartbeat\" ] && [ -n \"$incarnation\" ]; then mkdir -p \"$(dirname \"$heartbeat\")\"; printf '%s:%s\\n' \"$incarnation\" \"$(date +%s)\" > \"$heartbeat\"; chmod 600 \"$heartbeat\"; fi; printf '%s\\t%s\\t%s\\n' '$77' '%77' \"$$\"; exit 0 ;;\n  *) exit 0 ;;\nesac\n",
                 shell_words::quote(&log.to_string_lossy())
             ),
         )
@@ -12113,6 +12150,19 @@ case "$1" in
   new-session)
     printf '%s\n' {transcript_line} > {transcript}
     : > {running}
+    heartbeat=''
+    slot=0
+    for arg in "$@"; do
+      if [ "$slot" = 2 ]; then incarnation="$arg"; break
+      elif [ "$slot" = 1 ]; then slot=2
+      else case "$arg" in */coordination/heartbeat) heartbeat="$arg"; slot=1 ;; esac
+      fi
+    done
+    if [ -n "$heartbeat" ] && [ -n "$incarnation" ]; then
+      mkdir -p "$(dirname "$heartbeat")"
+      printf '%s:%s\n' "$incarnation" "$(date +%s)" > "$heartbeat"
+      chmod 600 "$heartbeat"
+    fi
     printf '%s\t%s\t%s\n' '$77' '%77' "$(cat {pane_pid})"
     ;;
   *) exit 0 ;;
@@ -13136,8 +13186,10 @@ esac
             &st,
             "structured-final-fence",
             &launch_id,
-            Some(&launch_id),
-            None,
+            StructuredPromptGuards {
+                expected_session_incarnation: Some(&launch_id),
+                ..Default::default()
+            },
             &handle,
             "must not cross the final locked recheck",
         )
@@ -13157,6 +13209,66 @@ esac
             commands.try_recv(),
             Err(tokio::sync::mpsc::error::TryRecvError::Empty)
         ));
+    }
+
+    #[tokio::test]
+    async fn coordination_review_notification_final_lock_rejects_nonwaiting_activity() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let launch_id = seed_codex_app_server_session(tmp.path(), "notification-final-fence");
+        let st = state(tmp.path(), Some(TOKEN), minimal_tmux(tmp.path()));
+        let (handle, mut commands) = codex_app_server::control_channel();
+        let response = submit_structured_prompt_locked(
+            &st,
+            "notification-final-fence",
+            &launch_id,
+            StructuredPromptGuards {
+                expected_session_incarnation: Some(&launch_id),
+                notification: Some(CoordinationNotificationFence {
+                    message_id: "message".to_string(),
+                    target_incarnation: launch_id.clone(),
+                }),
+                ..Default::default()
+            },
+            &handle,
+            "fixed coordination notification",
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            body["error"]["code"],
+            "coordination-notification-superseded"
+        );
+        assert!(matches!(
+            commands.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[tokio::test]
+    async fn coordination_review_wait_workers_are_strictly_bounded() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let st = state(tmp.path(), Some(TOKEN), minimal_tmux(tmp.path()));
+        let mut permits = Vec::new();
+        for _ in 0..COORDINATION_WAIT_WORKER_LIMIT {
+            permits.push(
+                st.coordination_wait_workers
+                    .clone()
+                    .try_acquire_owned()
+                    .expect("bounded permit"),
+            );
+        }
+        assert!(
+            st.coordination_wait_workers
+                .clone()
+                .try_acquire_owned()
+                .is_err()
+        );
+        drop(permits);
     }
 
     #[tokio::test]
@@ -13421,8 +13533,10 @@ esac
             &st,
             &record.id,
             &launch_id,
-            None,
-            Some(("gamania", 1)),
+            StructuredPromptGuards {
+                expected_binding: Some(("gamania", 1)),
+                ..Default::default()
+            },
             &handle,
             "must not reach superseding account",
         )
@@ -15987,7 +16101,7 @@ esac
         let tmux = executable(
             &tmp.path().join("tmux-resume-lock"),
             &format!(
-                "#!/usr/bin/env sh\ncase \"$1\" in\n  has-session) [ -f {running} ] ;;\n  new-session) : > {started}; while [ ! -f {release} ]; do sleep 0.01; done; : > {running}; printf '%s\\t%s\\t%s\\n' '$77' '%77' \"$$\"; exit 0 ;;\n  *) exit 0 ;;\nesac\n",
+                "#!/usr/bin/env sh\ncase \"$1\" in\n  has-session) [ -f {running} ] ;;\n  new-session) : > {started}; while [ ! -f {release} ]; do sleep 0.01; done; : > {running}; heartbeat=''; slot=0; for arg in \"$@\"; do if [ \"$slot\" = 2 ]; then incarnation=\"$arg\"; break; elif [ \"$slot\" = 1 ]; then slot=2; else case \"$arg\" in */coordination/heartbeat) heartbeat=\"$arg\"; slot=1 ;; esac; fi; done; if [ -n \"$heartbeat\" ] && [ -n \"$incarnation\" ]; then mkdir -p \"$(dirname \"$heartbeat\")\"; printf '%s:%s\\n' \"$incarnation\" \"$(date +%s)\" > \"$heartbeat\"; chmod 600 \"$heartbeat\"; fi; printf '%s\\t%s\\t%s\\n' '$77' '%77' \"$$\"; exit 0 ;;\n  *) exit 0 ;;\nesac\n",
                 started = shell_words::quote(&started.to_string_lossy()),
                 release = shell_words::quote(&release.to_string_lossy()),
                 running = shell_words::quote(&running.to_string_lossy()),
@@ -18512,7 +18626,7 @@ exit 0
         std::fs::write(
             &bin,
             format!(
-                "#!/usr/bin/env sh\nprintf '%s\\n' \"$*\" >> {}\ncase \"$1\" in\n  has-session) exit 0 ;;\n  new-session) printf '%s\\t%s\\t%s\\n' '$77' '%77' \"$$\"; exit 0 ;;\n  capture-pane) printf 'pane\\n'; exit 0 ;;\n  *) exit 0 ;;\nesac\n",
+                "#!/usr/bin/env sh\nprintf '%s\\n' \"$*\" >> {}\ncase \"$1\" in\n  has-session) exit 0 ;;\n  new-session) heartbeat=''; slot=0; for arg in \"$@\"; do if [ \"$slot\" = 2 ]; then incarnation=\"$arg\"; break; elif [ \"$slot\" = 1 ]; then slot=2; else case \"$arg\" in */coordination/heartbeat) heartbeat=\"$arg\"; slot=1 ;; esac; fi; done; if [ -n \"$heartbeat\" ] && [ -n \"$incarnation\" ]; then mkdir -p \"$(dirname \"$heartbeat\")\"; printf '%s:%s\\n' \"$incarnation\" \"$(date +%s)\" > \"$heartbeat\"; chmod 600 \"$heartbeat\"; fi; printf '%s\\t%s\\t%s\\n' '$77' '%77' \"$$\"; exit 0 ;;\n  capture-pane) printf 'pane\\n'; exit 0 ;;\n  *) exit 0 ;;\nesac\n",
                 shell_words::quote(&log.to_string_lossy())
             ),
         )
@@ -18521,6 +18635,40 @@ exit 0
         perms.set_mode(0o755);
         std::fs::set_permissions(&bin, perms).unwrap();
         bin
+    }
+
+    fn provision_ready_coordination_fixture(
+        context: &CliContext,
+        record: &crate::SessionRecord,
+    ) -> String {
+        let capability_path =
+            crate::coordination::provision(context, record).expect("provision fixture");
+        let incarnation = record
+            .runtime
+            .as_ref()
+            .map(|runtime| runtime.launch_id.as_str())
+            .expect("fixture incarnation");
+        let now = crate::coordination::now_epoch();
+        let heartbeat = crate::coordination::heartbeat_path(&context.state_dir, &record.id);
+        std::fs::write(&heartbeat, format!("{incarnation}:{now}\n")).expect("heartbeat fixture");
+        std::fs::set_permissions(&heartbeat, std::fs::Permissions::from_mode(0o600))
+            .expect("heartbeat mode");
+        let registry_path = context.state_dir.join("coordination/registry.json");
+        let mut registry: Value = serde_json::from_slice(
+            &std::fs::read(&registry_path).expect("coordination registry fixture"),
+        )
+        .expect("coordination registry json");
+        registry["brokers"][&record.id]["state"] = json!("ready");
+        registry["brokers"][&record.id]["heartbeat_at"] = json!("2030-01-01T00:00:00Z");
+        registry["brokers"][&record.id]["heartbeat_epoch"] = json!(now);
+        std::fs::write(
+            &registry_path,
+            serde_json::to_vec_pretty(&registry).expect("registry json"),
+        )
+        .expect("registry fixture");
+        std::fs::set_permissions(&registry_path, std::fs::Permissions::from_mode(0o600))
+            .expect("registry mode");
+        std::fs::read_to_string(capability_path).expect("capability fixture")
     }
 
     /// tmux stub that logs every invocation to `calls` and, on `load-buffer`,
@@ -18552,9 +18700,7 @@ exit 0
         seed_session_with_runtime(tmp.path(), "alpha", "codex", "hs-codex-alpha");
         let state = state(tmp.path(), Some(TOKEN), minimal_tmux(tmp.path()));
         let record = load_session_record(&state.context, "alpha").expect("session");
-        let capability_path =
-            crate::coordination::provision(&state.context, &record).expect("provision");
-        let capability = std::fs::read_to_string(capability_path).expect("capability");
+        let capability = provision_ready_coordination_fixture(&state.context, &record);
 
         let candidate = json!({
             "schema_version": "agent-session.work-context-input.v1",
@@ -18622,14 +18768,8 @@ exit 0
         let state = state(tmp.path(), Some(TOKEN), minimal_tmux(tmp.path()));
         let alpha = load_session_record(&state.context, "alpha").expect("alpha");
         let beta = load_session_record(&state.context, "beta").expect("beta");
-        let alpha_capability = std::fs::read_to_string(
-            crate::coordination::provision(&state.context, &alpha).expect("alpha provision"),
-        )
-        .expect("alpha capability");
-        let beta_capability = std::fs::read_to_string(
-            crate::coordination::provision(&state.context, &beta).expect("beta provision"),
-        )
-        .expect("beta capability");
+        let alpha_capability = provision_ready_coordination_fixture(&state.context, &alpha);
+        let beta_capability = provision_ready_coordination_fixture(&state.context, &beta);
         let canary = "HTTP-PRIVATE-MESSAGE-CANARY";
 
         let (status, sent) = call(

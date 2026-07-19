@@ -45,6 +45,8 @@ pub(crate) struct StoredMessage {
     pub created_at_epoch: i64,
     pub expires_at: String,
     pub expires_at_epoch: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_at_epoch: Option<i64>,
     pub body_bytes: usize,
     pub body: String,
 }
@@ -232,6 +234,7 @@ pub(crate) fn ack(context: &CliContext, args: MessageAckArgs) -> Result<Value, C
     }
     message.state = "acknowledged".to_string();
     message.revision = message.revision.saturating_add(1);
+    message.terminal_at_epoch = Some(now);
     let outcome = json_value(metadata(message))?;
     store_receipt(
         &mut locked.registry,
@@ -251,7 +254,8 @@ pub(crate) fn reply(context: &CliContext, args: MessageReplyArgs) -> Result<Valu
     let (record, sender_incarnation) =
         authenticate_from_file(context, &args.session, args.capability_file.as_deref())?;
     let body = read_body(&args.body_file)?;
-    let locked = lock_registry(context)?;
+    let mut locked = lock_registry(context)?;
+    let registry_changed = clean_expired(&mut locked.registry, now_epoch());
     let original = locked
         .registry
         .messages
@@ -261,9 +265,12 @@ pub(crate) fn reply(context: &CliContext, args: MessageReplyArgs) -> Result<Valu
                 && message.recipient_session_id == record.id
                 && message.recipient_incarnation == sender_incarnation
         })
-        .cloned()
-        .ok_or_else(message_not_found)?;
+        .cloned();
+    if registry_changed {
+        locked.save()?;
+    }
     drop(locked);
+    let original = original.ok_or_else(message_not_found)?;
     if original.state == "expired" {
         return Err(message_expired());
     }
@@ -295,7 +302,8 @@ pub(crate) fn wait(context: &CliContext, args: MessageWaitArgs) -> Result<Value,
     let timeout = parse_wait(&args.timeout)?;
     let started = Instant::now();
     loop {
-        let locked = lock_registry(context)?;
+        let mut locked = lock_registry(context)?;
+        let registry_changed = clean_expired(&mut locked.registry, now_epoch());
         let message = locked
             .registry
             .messages
@@ -305,18 +313,34 @@ pub(crate) fn wait(context: &CliContext, args: MessageWaitArgs) -> Result<Value,
                     && message.recipient_session_id == record.id
                     && message.recipient_incarnation == recipient_incarnation
             })
-            .ok_or_else(message_not_found)?;
-        if message.revision != args.if_revision {
-            if message.state == "expired" {
-                return Err(message_expired());
+            .cloned();
+        let Some(message) = message else {
+            if registry_changed {
+                locked.save()?;
             }
-            return json_value(MessageBodyView {
-                metadata: metadata(message),
+            return Err(message_not_found());
+        };
+        if message.state == "expired" {
+            if registry_changed {
+                locked.save()?;
+            }
+            return Err(message_expired());
+        }
+        if message.revision != args.if_revision {
+            let result = json_value(MessageBodyView {
+                metadata: metadata(&message),
                 body: UntrustedBody {
                     classification: "untrusted_peer_data",
                     text: message.body.clone(),
                 },
             });
+            if registry_changed {
+                locked.save()?;
+            }
+            return result;
+        }
+        if registry_changed {
+            locked.save()?;
         }
         drop(locked);
         if started.elapsed() >= timeout {
@@ -489,6 +513,7 @@ fn send_authenticated(
         created_at_epoch: now,
         expires_at: timestamp(now.saturating_add(expiry_secs)),
         expires_at_epoch: now.saturating_add(expiry_secs),
+        terminal_at_epoch: None,
         body_bytes: body.len(),
         body,
     };
@@ -680,6 +705,7 @@ mod tests {
             created_at_epoch: 0,
             expires_at: "time".to_string(),
             expires_at_epoch: 1,
+            terminal_at_epoch: None,
             body_bytes: 6,
             body: "canary".to_string(),
         };

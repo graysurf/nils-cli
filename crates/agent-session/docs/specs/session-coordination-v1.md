@@ -109,9 +109,9 @@ permissive projection for an incomplete comparison; it is never promoted to
 
 Mutation admission uses `agent-session.operation-lease.v1`. A lease includes a
 random lease ID, owning claim and revision, operation kind, canonical target
-set, product turn/tool token, optional observed descendant identity, state,
-revision, start/heartbeat/expiry timestamps, and an execution token. Public
-views omit private proof material.
+set, controller-observed activity revision, exact persisted runtime identity
+digest, state, revision, start/expiry timestamps, and an execution token digest.
+Public views omit all private proof material.
 
 ### Message
 
@@ -191,12 +191,14 @@ receive an admitted claim.
 | message send | matching sender capability |
 | inbox/show/ack/reply/wait | matching recipient capability |
 | broker status | matching owner capability or server operator read |
-| broker adopt/reconcile | validated unchanged runtime identity plus server/operator recovery authority |
+| broker adopt/reconcile | local lifecycle lock plus proof selectors matching an unchanged, live, exact persisted runtime whose broker is demonstrably lost |
 | HTTP registry-wide candidate check | server operator token; explicit subject/candidate rules still apply |
 
 Capabilities rotate on resume/replacement and are revoked on delete/target exit.
 Wrong principal, stale incarnation, wrong revision, wrong operation token, or
 cross-principal idempotency reuse fails without revealing the expected value.
+Recovery proof files contain only schema, incarnation, and generation selectors;
+they never embed the server/operator token.
 
 ## Claim state machine
 
@@ -210,27 +212,29 @@ States are `active`, `stale`, `released`, and `expired`.
 - `renew` requires claim ID, current revision, same incarnation, and a live
   broker. Heartbeat occurs before half the TTL.
 - `release` is idempotent for the same principal/request and never affects a
-  different incarnation.
+  different incarnation. Release or replacement is rejected while a bound
+  operation remains `active` or `completing`.
 - Broker loss marks the owner unavailable for new operations and eventually
   stales the claim. Pane liveness alone cannot renew a claim.
 
 ## Operation lease state machine
 
-States are `active`, `completing`, `completed`, `failed`, `abandoned`, and
-`expired`.
+States are `active`, `completing`, `completed`, `failed`, and `abandoned`;
+`expired` is accepted only as a retained backward-compatible terminal state.
 
 - `admit` re-evaluates peers atomically and proves every canonical mutation
   target is a subset of the authenticated active claim before creating a lease.
 - Opaque repository effects require an explicit repository scope. Symlink,
   multi-target, and normalized path checks apply to every target.
-- A 30-minute claim does not limit a known long operation. The broker renews an
-  active lease while the bound execution token remains active or a validated
-  descendant still runs.
+- A 30-minute claim does not release a known long operation. Reaching the
+  operation safety TTL moves `active` to fail-closed `completing`; it never
+  asserts terminality or removes the bound claim's exclusion.
 - `complete` is idempotent and records the terminal tool result without raw
   stdout/stderr.
-- `reconcile` repairs a missed completion only after the exact execution token
-  is idle or superseded and no bound descendant remains. General pane liveness
-  is insufficient proof.
+- `reconcile` repairs a missed completion only when the token digest matches and
+  controller-owned evidence shows either a later `waiting` activity revision on
+  the unchanged exact runtime or that exact persisted runtime has stopped.
+  Caller-supplied idle or descendant booleans are not accepted as proof.
 - Uncertain heartbeat or proof blocks later owner operations and competing
   admission until validated recovery; it does not silently expire an active
   mutation.
@@ -283,7 +287,8 @@ Coordination message <message-id> is available; run agent-session message show -
 
 The body, reply body, summary, title, prompt, or peer text is never interpolated.
 Before any external submission, the controller persists a
-`notification_attempting` receipt. No retry occurs after that transition,
+`notification_attempting` receipt while holding the same session lifecycle
+lock used for its final idle/incarnation recheck and prompt submission. No retry occurs after that transition,
 including an unknown crash result. Limit is one attempt per target per minute.
 Busy, rate-limited, replaced, unmanaged, unsupported, and failed targets remain
 queue-only. Ack, reply, forwarding, and notifications do not recursively
@@ -296,9 +301,9 @@ Start, run, resume, provider-import, and HTTP create follow one transaction:
 1. reserve the session record and hold its lifecycle lock;
 2. create the tmux pane in a held state that cannot exec the agent;
 3. persist and read back the exact tmux/runtime identity;
-4. create the private per-incarnation capability;
-5. spawn the persistent broker and wait at most 2 seconds for identity-bound
-   readiness;
+4. start the runtime-owned heartbeat sidecar before the held gate;
+5. create the private per-incarnation capability under the registry lock and
+   wait at most 2 seconds for exact identity-bound readiness;
 6. only then release the held pane to exec the agent.
 
 Failure at any boundary revokes credentials, stops the broker, terminates only
@@ -306,7 +311,9 @@ the exact held runtime, and preserves bounded startup diagnostics. Launcher exit
 does not stop an established broker. Resume creates a replacement incarnation
 and capability. Broker loss blocks new coordination operations. `broker adopt`
 requires an unchanged, live, exactly matched runtime and never trusts a PID or
-pane name alone. Delete and target exit revoke credentials and release terminal
+pane name alone. Natural target exit immediately removes its
+incarnation-specific capability; a replacement uses a different path, so a
+stale runtime can never read the new credential. Delete also releases terminal
 coordination state before session removal is reported complete.
 
 The optional HTTP server is not the heartbeat owner and is not required for
@@ -318,6 +325,10 @@ All commands support the global `--state-dir` and command-local `--format
 text|json`. Owner commands accept `--session`; managed self calls may default it
 from trusted runtime projection. `--capability-file` defaults only from the
 trusted managed environment.
+
+Every leaf command has its own CLI envelope identity, for example
+`cli.agent-session.message-inbox.v1`, `cli.agent-session.broker-status.v1`, and
+`cli.agent-session.work-context-admit.v1`.
 
 ```text
 agent-session work-context claim --session ID --file JSON --capability-file FILE --idempotency-key KEY [--if-revision N]
