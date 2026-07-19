@@ -107,7 +107,8 @@ const DELETE_TMUX_TERMINATION_STATE_KEY: &str = "delete_tmux_termination_state";
 const TMUX_RUNTIME_NEVER_LAUNCHED_KEY: &str = "tmux_runtime_never_launched";
 const TMUX_RUNTIME_IDENTITY_CHANGED_OUTPUT: &str = "agent-session-runtime-identity-changed";
 const COORDINATION_LAUNCH_GATE: &str = "launch-ready";
-const HELD_LAUNCH_SCRIPT: &str = "gate=$1; heartbeat=$2; capability=$3; incarnation=$4; generation=$5; broker_bin=$6; shift 6; done_file=\"${heartbeat}.done.$$\"; umask 077; \"$broker_bin\" --state-dir \"$AGENT_SESSION_STATE_DIR\" broker heartbeat --session \"$AGENT_SESSION_ID\" --incarnation \"$incarnation\" --generation \"$generation\" --capability-file \"$capability\" --format json >/dev/null 2>&1 & broker_pid=$!; while [ ! -f \"$gate\" ]; do sleep 0.01; done; (\"$@\"; status=$?; printf '%s\\n' \"$status\" > \"$done_file\"; exit \"$status\") & child=$!; wait \"$child\"; status=$?; kill \"$broker_pid\" >/dev/null 2>&1 || true; wait \"$broker_pid\" >/dev/null 2>&1 || true; \"$broker_bin\" --state-dir \"$AGENT_SESSION_STATE_DIR\" broker stop --session \"$AGENT_SESSION_ID\" --capability-file \"$capability\" --format json >/dev/null 2>&1 || true; rm -f \"$done_file\" \"$capability\"; exit \"$status\"";
+const COORDINATION_BROKER_GATE: &str = "broker-provisioned";
+const HELD_LAUNCH_SCRIPT: &str = "gate=$1; broker_gate=$2; heartbeat=$3; capability=$4; incarnation=$5; generation=$6; broker_bin=$7; shift 7; done_file=\"${heartbeat}.done.$$\"; umask 077; while [ ! -f \"$broker_gate\" ]; do sleep 0.01; done; \"$broker_bin\" --state-dir \"$AGENT_SESSION_STATE_DIR\" broker heartbeat --session \"$AGENT_SESSION_ID\" --incarnation \"$incarnation\" --generation \"$generation\" --capability-file \"$capability\" --format json >/dev/null 2>&1 & broker_pid=$!; while [ ! -f \"$gate\" ]; do sleep 0.01; done; \"$@\"; status=$?; printf '%s\\n' \"$status\" > \"$done_file\"; kill \"$broker_pid\" >/dev/null 2>&1 || true; wait \"$broker_pid\" >/dev/null 2>&1 || true; \"$broker_bin\" --state-dir \"$AGENT_SESSION_STATE_DIR\" broker stop --session \"$AGENT_SESSION_ID\" --capability-file \"$capability\" --format json >/dev/null 2>&1 || true; rm -f \"$done_file\" \"$capability\" \"$broker_gate\" \"$gate\"; exit \"$status\"";
 
 pub fn run() -> i32 {
     run_with_args(env::args_os())
@@ -3970,12 +3971,21 @@ fn launch_gate_path(state_dir: &Path, record: &SessionRecord) -> PathBuf {
         .join(COORDINATION_LAUNCH_GATE)
 }
 
+fn broker_gate_path(state_dir: &Path, record: &SessionRecord) -> PathBuf {
+    state_dir
+        .join("sessions")
+        .join(&record.id)
+        .join("coordination")
+        .join(COORDINATION_BROKER_GATE)
+}
+
 fn begin_held_runtime(
     command: &mut ProcessCommand,
     state_dir: &Path,
     record: &SessionRecord,
 ) -> Result<(), CliError> {
     let gate = launch_gate_path(state_dir, record);
+    let broker_gate = broker_gate_path(state_dir, record);
     let broker_bin = std::env::current_exe().map_err(|_| {
         CliError::runtime(
             "coordination-unavailable",
@@ -3983,15 +3993,17 @@ fn begin_held_runtime(
             None,
         )
     })?;
-    match fs::remove_file(&gate) {
-        Ok(()) => {}
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-        Err(_) => {
-            return Err(CliError::runtime(
-                "coordination-unavailable",
-                "failed to reset the held launch gate",
-                None,
-            ));
+    for path in [&gate, &broker_gate] {
+        match fs::remove_file(path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(_) => {
+                return Err(CliError::runtime(
+                    "coordination-unavailable",
+                    "failed to reset a held launch gate",
+                    None,
+                ));
+            }
         }
     }
     command
@@ -4001,6 +4013,7 @@ fn begin_held_runtime(
         .arg(HELD_LAUNCH_SCRIPT)
         .arg("agent-session-held-launch")
         .arg(gate)
+        .arg(broker_gate)
         .arg(coordination::heartbeat_path(state_dir, &record.id))
         .arg(coordination::capability_path_for_state(
             state_dir,
@@ -4062,6 +4075,15 @@ fn establish_coordination_broker(
     record: &SessionRecord,
 ) -> Result<(), CliError> {
     coordination::provision(context, record)?;
+    write_private_file(&broker_gate_path(&context.state_dir, record), b"ready\n").map_err(
+        |_| {
+            CliError::runtime(
+                "coordination-unavailable",
+                "failed to release the coordination broker launch gate",
+                None,
+            )
+        },
+    )?;
     coordination::activate_ready(context, record)
 }
 
@@ -9660,9 +9682,168 @@ mod tests {
     }
 
     #[test]
-    fn coordination_review_round2_held_launch_uses_child_lifecycle_not_pid_polling() {
+    fn held_launch_waits_for_broker_provision_before_starting_heartbeat() {
+        let provision = super::HELD_LAUNCH_SCRIPT
+            .find("while [ ! -f \"$broker_gate\" ]; do sleep 0.01; done")
+            .expect("broker provision wait");
+        let heartbeat = super::HELD_LAUNCH_SCRIPT
+            .find("broker heartbeat")
+            .expect("broker sidecar setup");
+        let gate = super::HELD_LAUNCH_SCRIPT
+            .find("while [ ! -f \"$gate\" ]")
+            .expect("gate wait");
+
+        assert!(provision < heartbeat);
+        assert!(heartbeat < gate);
+    }
+
+    #[test]
+    fn held_launch_keeps_provider_in_foreground_and_tracks_broker_lifecycle() {
         assert!(!super::HELD_LAUNCH_SCRIPT.contains("kill -0"));
-        assert!(super::HELD_LAUNCH_SCRIPT.contains("wait \"$child\""));
+        assert!(!super::HELD_LAUNCH_SCRIPT.contains("child=$!"));
+        assert!(super::HELD_LAUNCH_SCRIPT.contains("broker_pid=$!"));
+        assert!(super::HELD_LAUNCH_SCRIPT.contains("; \"$@\"; status=$?;"));
+    }
+
+    #[test]
+    fn held_launch_executes_broker_and_provider_lifecycle_under_terminal() {
+        use std::fs::File;
+        use std::os::fd::FromRawFd;
+        use std::process::Stdio;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let gate = tmp.path().join("launch-ready");
+        let broker_gate = tmp.path().join("broker-provisioned");
+        let heartbeat = tmp.path().join("heartbeat");
+        let capability = tmp.path().join("capability");
+        let events = tmp.path().join("events");
+        let broker = tmp.path().join("broker");
+        let provider = tmp.path().join("provider");
+        fs::write(&capability, "capability\n").unwrap();
+        fs::write(
+            &broker,
+            r#"#!/bin/sh
+case " $* " in
+  *" broker heartbeat "*)
+    printf 'heartbeat\n' >> "$HELD_LAUNCH_EVENTS"
+    while :; do sleep 0.05; done
+    ;;
+  *" broker stop "*)
+    printf 'stop\n' >> "$HELD_LAUNCH_EVENTS"
+    ;;
+  *) exit 64 ;;
+esac
+"#,
+        )
+        .unwrap();
+        fs::write(
+            &provider,
+            r#"#!/bin/sh
+if [ -t 0 ]; then
+  printf 'provider-tty\n' >> "$HELD_LAUNCH_EVENTS"
+  exit 23
+fi
+printf 'provider-no-tty\n' >> "$HELD_LAUNCH_EVENTS"
+exit 97
+"#,
+        )
+        .unwrap();
+        for executable in [&broker, &provider] {
+            fs::set_permissions(executable, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+
+        let mut master_fd = -1;
+        let mut slave_fd = -1;
+        // SAFETY: openpty initializes both descriptors; each successful descriptor is
+        // immediately transferred into exactly one File and closed by its owner.
+        let openpty_status = unsafe {
+            libc::openpty(
+                &mut master_fd,
+                &mut slave_fd,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        };
+        assert_eq!(openpty_status, 0, "openpty: {}", io::Error::last_os_error());
+        // SAFETY: openpty returned two fresh, owned descriptors above.
+        let _pty_master = unsafe { File::from_raw_fd(master_fd) };
+        // SAFETY: openpty returned two fresh, owned descriptors above.
+        let pty_slave = unsafe { File::from_raw_fd(slave_fd) };
+
+        let mut command = Command::new("sh");
+        command
+            .arg("-c")
+            .arg(super::HELD_LAUNCH_SCRIPT)
+            .arg("agent-session-held-launch")
+            .arg(&gate)
+            .arg(&broker_gate)
+            .arg(&heartbeat)
+            .arg(&capability)
+            .arg("incarnation")
+            .arg("7")
+            .arg(&broker)
+            .arg(&provider)
+            .env("AGENT_SESSION_STATE_DIR", tmp.path())
+            .env("AGENT_SESSION_ID", "held-launch-test")
+            .env("HELD_LAUNCH_EVENTS", &events)
+            .stdin(Stdio::from(pty_slave))
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let mut child = command.spawn().unwrap();
+
+        thread::sleep(Duration::from_millis(100));
+        let before_provision = fs::read_to_string(&events).unwrap_or_default();
+        if !before_provision.is_empty() {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("heartbeat ran before broker provisioning: {before_provision:?}");
+        }
+
+        fs::write(&broker_gate, "ready\n").unwrap();
+        let heartbeat_deadline = Instant::now() + Duration::from_secs(2);
+        while !fs::read_to_string(&events)
+            .unwrap_or_default()
+            .contains("heartbeat\n")
+        {
+            if Instant::now() >= heartbeat_deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("heartbeat did not start after broker provisioning");
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(fs::read_to_string(&events).unwrap(), "heartbeat\n");
+
+        fs::write(&gate, "ready\n").unwrap();
+        let exit_deadline = Instant::now() + Duration::from_secs(2);
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break status;
+            }
+            if Instant::now() >= exit_deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("held launch did not exit after the provider completed");
+            }
+            thread::sleep(Duration::from_millis(10));
+        };
+
+        assert_eq!(status.code(), Some(23));
+        assert_eq!(
+            fs::read_to_string(&events).unwrap(),
+            "heartbeat\nprovider-tty\nstop\n"
+        );
+        assert!(!capability.exists());
+        assert!(!broker_gate.exists());
+        assert!(!gate.exists());
+        assert!(!fs::read_dir(tmp.path()).unwrap().any(|entry| {
+            entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with("heartbeat.done.")
+        }));
     }
     use pretty_assertions::assert_eq;
     #[cfg(target_os = "linux")]
