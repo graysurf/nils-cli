@@ -735,7 +735,7 @@ fn drain_completion_events_in_registry(
         };
         let lease = &registry.operations[index];
         let revision_matches = lease.revision == event.if_revision
-            || (lease.state == "completing"
+            || (matches!(lease.state.as_str(), "completing" | "reconcile_pending")
                 && lease.revision == event.if_revision.saturating_add(1));
         if !revision_matches
             || lease.execution_token_digest != event.execution_token_digest
@@ -822,6 +822,9 @@ pub(crate) fn reconcile(
         &digest,
     )? {
         return Ok(replay);
+    }
+    if drain_completion_events_in_registry(&mut locked.registry, now)? > 0 {
+        locked.save()?;
     }
     let lease_snapshot = locked
         .registry
@@ -1143,10 +1146,23 @@ fn controller_observed_quiescent(
     let Some(activity) = crate::activity::state_for_view(context, record) else {
         return false;
     };
-    let identity_changed = activity_identity_digest(&activity) != lease.activity_identity_digest;
-    identity_changed
-        && activity.phase == crate::activity::TurnPhase::Waiting
-        && activity.current_turn.is_none()
+    controller_activity_supersedes_lease(&activity, &lease.activity_identity_digest)
+}
+
+fn controller_activity_supersedes_lease(
+    activity: &crate::activity::TurnState,
+    lease_activity_identity_digest: &str,
+) -> bool {
+    if activity_identity_digest(activity) == lease_activity_identity_digest {
+        return false;
+    }
+    match activity.phase {
+        crate::activity::TurnPhase::Waiting => activity.current_turn.is_none(),
+        crate::activity::TurnPhase::Starting
+        | crate::activity::TurnPhase::Working
+        | crate::activity::TurnPhase::NeedsInput => activity.current_turn.is_some(),
+        crate::activity::TurnPhase::Unknown => false,
+    }
 }
 
 pub(crate) fn operator_reconcile_in_registry(
@@ -1388,6 +1404,34 @@ mod tests {
     }
 
     #[test]
+    fn coordination_review_new_working_turn_supersedes_prior_operation_activity() {
+        let turn = |started_at: &str, revision: u64| {
+            serde_json::from_value::<crate::activity::TurnState>(json!({
+                "schema_version": "agent-session.turn-state.v1",
+                "phase": "working",
+                "phase_changed_at": started_at,
+                "revision": revision,
+                "source": {
+                    "kind": "provider_hook",
+                    "provider": "codex",
+                    "confidence": "authoritative"
+                },
+                "current_turn": {
+                    "started_at": started_at,
+                    "last_progress_at": started_at
+                }
+            }))
+            .expect("turn state")
+        };
+        let original = turn("2030-01-01T00:00:00Z", 1);
+        let next_working_turn = turn("2030-01-01T00:01:00Z", 2);
+        assert!(controller_activity_supersedes_lease(
+            &next_working_turn,
+            &activity_identity_digest(&original)
+        ));
+    }
+
+    #[test]
     fn coordination_review_durable_completion_survives_safety_ttl_transition() {
         let mut registry: Registry = serde_json::from_value(json!({
             "schema_version": super::super::REGISTRY_VERSION,
@@ -1431,5 +1475,50 @@ mod tests {
         assert_eq!(registry.operations[0].state, "completed");
         assert_eq!(registry.operations[0].revision, 3);
         assert_eq!(registry.receipts.len(), 1);
+    }
+
+    #[test]
+    fn coordination_review_durable_completion_survives_reconcile_pending_transition() {
+        let mut registry: Registry = serde_json::from_value(json!({
+            "schema_version": super::super::REGISTRY_VERSION,
+            "operations": [{
+                "schema_version": OPERATION_LEASE_VERSION,
+                "lease_id": "lease",
+                "session_id": "session",
+                "session_incarnation": "incarnation",
+                "claim_id": "claim",
+                "claim_revision": 1,
+                "operation": "edit",
+                "targets": [],
+                "state": "reconcile_pending",
+                "revision": 2,
+                "started_at": "2030-01-01T00:00:00Z",
+                "expires_at": "2030-01-01T00:00:01Z",
+                "expires_at_epoch": 1,
+                "execution_token_digest": "token"
+            }],
+            "completion_events": [{
+                "schema_version": "agent-session.operation-completion-event.v1",
+                "event_id": "event",
+                "session_id": "session",
+                "session_incarnation": "incarnation",
+                "lease_id": "lease",
+                "if_revision": 1,
+                "execution_token_digest": "token",
+                "outcome": "pass",
+                "idempotency_key": "completion-key",
+                "request_digest": "request",
+                "created_at_epoch": 1
+            }]
+        }))
+        .expect("registry");
+
+        assert_eq!(
+            drain_completion_events_in_registry(&mut registry, 2).expect("drain"),
+            1
+        );
+        assert!(registry.completion_events.is_empty());
+        assert_eq!(registry.operations[0].state, "completed");
+        assert_eq!(registry.operations[0].revision, 3);
     }
 }

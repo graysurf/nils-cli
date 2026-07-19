@@ -285,12 +285,16 @@ States are `active`, `completing`, `reconcile_pending`, `completed`, `failed`, a
   broker-owned queue without raw stdout/stderr. The authenticated heartbeat
   sidecar drains that queue after caller loss; an event accepted before the
   safety TTL remains valid across the exact `active` to `completing` revision
-  transition.
+  transition and across the exact original revision to `reconcile_pending`
+  transition. Reconcile drains already-persisted completion events before it
+  may advance an operation lease.
 - `reconcile` repairs a missed completion only when the token digest matches and
   controller-owned state proves the unchanged exact persisted runtime stopped,
-  or when two quiescent activity/no-descendant observations at least five
-  seconds apart move `reconcile_pending` to terminal. Caller-supplied idle or
-  descendant booleans are not accepted as proof.
+  or when two superseding-activity/no-descendant observations at least five
+  seconds apart move `reconcile_pending` to terminal. A newer controller turn
+  identity is superseding even while that new turn is working; progress within
+  the same turn is not. Unknown activity and caller-supplied idle or descendant
+  booleans are not accepted as proof.
 - Uncertain heartbeat or proof blocks later owner operations and competing
   admission until validated recovery; it does not silently expire an active
   mutation.

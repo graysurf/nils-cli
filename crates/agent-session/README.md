@@ -108,10 +108,11 @@ runtime identity. Releasing or replacing the claim is rejected while that
 operation is active or uncertain; a matching activity or descendant renews the
 30-minute lease. Completion first enters a bounded durable broker queue that
 the heartbeat sidecar drains, including across the exact safety-TTL transition,
-so a lost PostTool response does not require the caller to survive; missed
-completion needs exact stopped-runtime proof or two quiescent observations at
-least five seconds apart. Opaque, unbound-checkout, or uncovered targets fail
-closed.
+and wins over a concurrent reconcile-pending transition, so a lost PostTool
+response does not require the caller to survive; missed completion needs exact
+stopped-runtime proof or two observations of a superseding controller activity
+identity with no live descendant at least five seconds apart. Opaque,
+unbound-checkout, or uncovered targets fail closed.
 Peer summaries remain untrusted metadata and cannot authorize commands.
 
 `message send|inbox|show|ack|reply|wait` provides the private bounded mailbox.
