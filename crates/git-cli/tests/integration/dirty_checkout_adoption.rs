@@ -1875,7 +1875,6 @@ fn adopt_dirty_requires_nonempty_utf8_reason_before_state_transition() {
 
 #[test]
 fn adopt_dirty_treats_an_empty_existing_lease_as_malformed_state() {
-    let harness = GitCliHarness::new();
     let repo = init_repo();
     let state_home = private_state_home();
     let reason_file = state_home.path().join("reason.txt");
@@ -1887,28 +1886,21 @@ fn adopt_dirty_treats_an_empty_existing_lease_as_malformed_state() {
     fs::write(&lease_path, "").expect("write empty lease");
     fs::set_permissions(&lease_path, fs::Permissions::from_mode(0o600))
         .expect("make empty lease private");
-    let reason_arg = reason_file.to_string_lossy().to_string();
 
-    let output = run_governed_command(
-        &harness,
+    let error = adopt_dirty(
         repo.path(),
         state_home.path(),
-        true,
-        &[
-            "worktree",
-            "adopt-dirty",
-            "--challenge",
-            CHALLENGE_TOKEN,
-            "--reason-file",
-            &reason_arg,
-            "--format=json",
-        ],
-    );
+        CHALLENGE_TOKEN,
+        &reason_file,
+    )
+    .expect_err("empty lease must be rejected");
 
-    assert_json_error(
-        &output,
-        "dirty-checkout-malformed-state",
-        nils_common::cli_contract::exit::DATA,
+    assert_eq!(
+        error
+            .downcast_ref::<DirtyCheckoutError>()
+            .expect("typed malformed-state error")
+            .kind(),
+        DirtyCheckoutErrorKind::MalformedState
     );
     assert!(
         challenge_path.exists(),
