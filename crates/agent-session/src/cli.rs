@@ -37,7 +37,7 @@ pub struct Cli {
 #[derive(Debug, Subcommand)]
 pub enum Command {
     /// Start an interactive tmux-backed agent session.
-    Start(StartArgs),
+    Start(Box<StartArgs>),
     /// Run a one-shot agent task in a tmux session and write output to a log file.
     Run(RunArgs),
     /// List recorded agent sessions.
@@ -108,6 +108,13 @@ pub struct StartArgs {
     /// Internal: whether the selected profile has authoritative auto-resume usage.
     #[arg(skip)]
     pub initial_profile_auto_resume_supported: Option<bool>,
+
+    /// Internal: authoritative Codex usage account nickname for a `claude`
+    /// launch profile that actually runs on a Codex/GPT backend. When set, the
+    /// auto-resume loop keys off this Codex account's rate limits instead of
+    /// native Claude usage.
+    #[arg(skip)]
+    pub initial_codex_usage_account: Option<String>,
 
     /// Agent to run.
     #[arg(long, value_enum)]

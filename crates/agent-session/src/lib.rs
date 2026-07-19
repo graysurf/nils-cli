@@ -61,6 +61,7 @@ const STARTUP_EXTRA_KEY: &str = "startup";
 const AGENT_PROFILE_RUNTIME_KEY: &str = "agent_profile";
 const AGENT_PROFILE_PROVIDER_CONFIG_DIR_RUNTIME_KEY: &str = "agent_profile_provider_config_dir";
 const AGENT_PROFILE_AUTO_RESUME_SUPPORTED_RUNTIME_KEY: &str = "agent_profile_auto_resume_supported";
+const AGENT_PROFILE_CODEX_USAGE_ACCOUNT_RUNTIME_KEY: &str = "agent_profile_codex_usage_account";
 const STARTUP_STAGE_FILE: &str = ".startup-stage";
 const STARTUP_FAILURE_FILE: &str = ".startup-failure";
 const STARTUP_DIAGNOSTIC_FILE: &str = ".startup-diagnostic.log";
@@ -156,7 +157,7 @@ fn dispatch(cli: Cli) -> i32 {
     };
 
     match cli.command {
-        Command::Start(args) => run_start(&context, args),
+        Command::Start(args) => run_start(&context, *args),
         Command::Run(args) => run_one_shot(&context, args),
         Command::List(args) => run_list(&context, args),
         Command::Show(args) => run_command(&context, args),
@@ -1141,6 +1142,7 @@ pub(crate) struct ProviderResumeImportArgs {
     pub(crate) agent_profile: Option<String>,
     pub(crate) provider_config_dir: Option<PathBuf>,
     pub(crate) profile_auto_resume_supported: Option<bool>,
+    pub(crate) codex_usage_account: Option<String>,
     pub(crate) agent_args: Vec<String>,
     pub(crate) format: OutputFormat,
 }
@@ -1348,6 +1350,7 @@ fn start_session(
         args.initial_agent_profile.as_deref(),
         args.initial_provider_config_dir.as_deref(),
         args.initial_profile_auto_resume_supported,
+        args.initial_codex_usage_account.as_deref(),
     )?;
     if let Err(err) = codex_account::set_initial_binding(
         &mut created.record,
@@ -1643,6 +1646,7 @@ pub(crate) fn start_provider_resume_session(
         args.agent_profile.as_deref(),
         args.provider_config_dir.as_deref(),
         args.profile_auto_resume_supported,
+        args.codex_usage_account.as_deref(),
     )?;
 
     advance_owned_startup_stage(context, &mut created.record, "tmux")?;
@@ -1701,6 +1705,7 @@ fn persist_initial_profile_context(
     agent_profile: Option<&str>,
     provider_config_dir: Option<&Path>,
     profile_auto_resume_supported: Option<bool>,
+    codex_usage_account: Option<&str>,
 ) -> Result<(), CliError> {
     let Some(agent_profile) = agent_profile else {
         return Ok(());
@@ -1726,6 +1731,12 @@ fn persist_initial_profile_context(
         runtime.extra.insert(
             AGENT_PROFILE_AUTO_RESUME_SUPPORTED_RUNTIME_KEY.to_string(),
             json!(supported),
+        );
+    }
+    if let Some(account) = codex_usage_account {
+        runtime.extra.insert(
+            AGENT_PROFILE_CODEX_USAGE_ACCOUNT_RUNTIME_KEY.to_string(),
+            json!(account),
         );
     }
     if let Err(err) = write_session_record(context, &created.record) {
@@ -5087,6 +5098,14 @@ pub(crate) fn session_agent_profile(record: &SessionRecord) -> Option<&str> {
 
 pub(crate) fn session_provider_config_dir(record: &SessionRecord) -> Option<PathBuf> {
     runtime_extra_string(record, AGENT_PROFILE_PROVIDER_CONFIG_DIR_RUNTIME_KEY).map(PathBuf::from)
+}
+
+/// Authoritative Codex usage account nickname persisted for a `claude` launch
+/// profile that runs on a Codex/GPT backend. Present only when the launch
+/// profile declared `codex_usage_account`; the auto-resume loop keys off this
+/// account's rate limits instead of native Claude usage.
+pub(crate) fn session_codex_usage_account(record: &SessionRecord) -> Option<String> {
+    runtime_extra_string(record, AGENT_PROFILE_CODEX_USAGE_ACCOUNT_RUNTIME_KEY).map(str::to_string)
 }
 
 pub(crate) fn session_profile_auto_resume_setting(record: &SessionRecord) -> Option<bool> {
