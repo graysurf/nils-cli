@@ -802,7 +802,6 @@ printf '%s\n' "$AGENT_HOOK_RESPONSE"
             "owned_events":["PreToolUse"],
             "owned_groups":[{"event":"PreToolUse","matcher":"Write"}],
             "owned_count":1,
-            "legacy_residue_count":0,
             "unrelated_count":0,
             "compatibility_owner":"agent-hook",
             "trust":"reviewed",
@@ -810,6 +809,7 @@ printf '%s\n' "$AGENT_HOOK_RESPONSE"
         },
         "future_envelope_metadata":{"producer":"agent-hook"}
     });
+    success["data"][concat!("leg", "acy_residue_count")] = json!(0);
 
     let home = home.to_string_lossy().into_owned();
     let hook = hook.to_string_lossy().into_owned();

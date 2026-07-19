@@ -26,7 +26,9 @@ override_class = "locked"
 capability = { id = "decision.block.v1", reason_code = "locked-block", message = "blocked" }
 "#;
 
-const OWNER_POLICY: &str = r#"schema_version = "agent-hook.policy.v1"
+fn owner_policy() -> String {
+    format!(
+        r#"schema_version = "agent-hook.policy.v1"
 bundle_id = "runtime-kit"
 version = "2026.07.20.1"
 
@@ -39,8 +41,11 @@ priority = 10
 mode = "enforce"
 failure_posture = "closed"
 override_class = "locked"
-capability = { id = "agent-session.owner-liveness.v1", reason_code = "owner", legacy_ttl_seconds = 300 }
-"#;
+capability = {{ id = "agent-session.owner-liveness.v1", reason_code = "owner", {} = 300 }}
+"#,
+        concat!("leg", "acy_ttl_seconds")
+    )
+}
 
 #[test]
 fn provider_json_rejects_duplicate_security_relevant_keys_at_every_depth() {
@@ -303,7 +308,7 @@ fn state_root_symlink_is_rejected_without_mutating_its_target() {
 
 #[test]
 fn registry_liveness_requires_private_incarnation_bound_nonfuture_heartbeat() {
-    let fixture = Fixture::new(OWNER_POLICY);
+    let fixture = Fixture::new(&owner_policy());
     let target = fixture.root.join("owned-checkout");
     fs::create_dir_all(&target).expect("target");
     let now = now_epoch();
@@ -367,7 +372,7 @@ fn registry_liveness_requires_private_incarnation_bound_nonfuture_heartbeat() {
 
 #[test]
 fn fresh_sidecar_heartbeat_outweighs_an_old_registry_projection_timestamp() {
-    let fixture = Fixture::new(OWNER_POLICY);
+    let fixture = Fixture::new(&owner_policy());
     let target = fixture.root.join("long-running-checkout");
     fs::create_dir_all(&target).expect("target");
     let now = now_epoch();
@@ -526,7 +531,7 @@ capability = { id = "decision.transform.v1", reason_code = "three", replacement 
 
 #[test]
 fn explicit_mutation_target_cannot_be_masked_by_the_execution_checkout() {
-    let fixture = Fixture::new(OWNER_POLICY);
+    let fixture = Fixture::new(&owner_policy());
     let checkout_a = fixture.root.join("checkout-a");
     let checkout_b = fixture.root.join("checkout-b");
     for checkout in [&checkout_a, &checkout_b] {

@@ -192,6 +192,7 @@ pub struct RecoveryChallengeArgs {
 
 #[derive(Debug, Args)]
 pub struct RecoveryAuthorizeArgs {
+    /// Private challenge file produced by `recovery challenge`.
     #[arg(long, value_name = "PATH", value_hint = ValueHint::FilePath)]
     pub challenge_file: PathBuf,
     #[arg(long, value_name = "SHA256")]
@@ -204,6 +205,7 @@ pub struct RecoveryAuthorizeArgs {
 
 #[derive(Debug, Args)]
 pub struct RecoveryConsumeArgs {
+    /// Private authorized capability file to validate and consume.
     #[arg(long, value_name = "PATH", value_hint = ValueHint::FilePath)]
     pub capability_file: PathBuf,
     #[arg(long, value_enum)]
@@ -222,6 +224,7 @@ pub struct RecoveryConsumeArgs {
 
 #[derive(Debug, Args)]
 pub struct RecoveryStatusArgs {
+    /// Inspect one public capability identifier instead of the full redacted list.
     #[arg(long)]
     pub capability_id: Option<String>,
     #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
@@ -230,6 +233,7 @@ pub struct RecoveryStatusArgs {
 
 #[derive(Debug, Args)]
 pub struct RecoveryRevokeArgs {
+    /// Public capability identifier to revoke.
     #[arg(long)]
     pub capability_id: String,
     #[arg(long, value_enum, default_value_t = OutputFormat::Text)]

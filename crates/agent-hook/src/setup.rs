@@ -1294,12 +1294,13 @@ mod tests {
     #[test]
     fn apply_rejects_a_concurrent_provider_change_without_overwriting_it() {
         let temp = tempfile::TempDir::new().expect("tempdir");
-        let path = temp.path().join("provider.json");
+        let root = fs::canonicalize(temp.path()).expect("canonical tempdir");
+        let path = root.join("provider.json");
         fs::write(&path, b"reviewed").expect("reviewed config");
         fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).expect("private mode");
         let layout = Layout {
-            config_path: temp.path().join("config.toml"),
-            state_root: temp.path().join("state"),
+            config_path: root.join("config.toml"),
+            state_root: root.join("state"),
         };
         let plan = Plan {
             product: Product::Claude,

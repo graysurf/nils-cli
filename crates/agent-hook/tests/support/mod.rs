@@ -22,7 +22,7 @@ pub struct Fixture {
 impl Fixture {
     pub fn new(policy: &str) -> Self {
         let temp = tempfile::TempDir::new().expect("tempdir");
-        let root = temp.path().to_path_buf();
+        let root = fs::canonicalize(temp.path()).expect("canonical tempdir");
         let home = root.join("home");
         let config_home = root.join("config");
         let state_home = root.join("state");

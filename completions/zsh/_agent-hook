@@ -139,7 +139,7 @@ json\:"Single-record JSON envelope (snake_case)"))' \
 ;;
 (authorize)
 _arguments "${_arguments_options[@]}" : \
-'--challenge-file=[]:PATH:_files' \
+'--challenge-file=[Private challenge file produced by \`recovery challenge\`]:PATH:_files' \
 '--expected-challenge-digest=[]:SHA256:_default' \
 '--out=[]:PATH:_files' \
 '--format=[]:FORMAT:((text\:"Human-readable text output (default)"
@@ -153,7 +153,7 @@ json\:"Single-record JSON envelope (snake_case)"))' \
 ;;
 (consume)
 _arguments "${_arguments_options[@]}" : \
-'--capability-file=[]:PATH:_files' \
+'--capability-file=[Private authorized capability file to validate and consume]:PATH:_files' \
 '--product=[]:PRODUCT:(codex claude hermes)' \
 '--event=[]:EVENT:_default' \
 '--target-digest=[]:TARGET_DIGEST:_default' \
@@ -170,7 +170,7 @@ json\:"Single-record JSON envelope (snake_case)"))' \
 ;;
 (status)
 _arguments "${_arguments_options[@]}" : \
-'--capability-id=[]:CAPABILITY_ID:_default' \
+'--capability-id=[Inspect one public capability identifier instead of the full redacted list]:CAPABILITY_ID:_default' \
 '--format=[]:FORMAT:((text\:"Human-readable text output (default)"
 json\:"Single-record JSON envelope (snake_case)"))' \
 '--config=[Override the strict user config path]:PATH:_files' \
@@ -182,7 +182,7 @@ json\:"Single-record JSON envelope (snake_case)"))' \
 ;;
 (revoke)
 _arguments "${_arguments_options[@]}" : \
-'--capability-id=[]:CAPABILITY_ID:_default' \
+'--capability-id=[Public capability identifier to revoke]:CAPABILITY_ID:_default' \
 '--format=[]:FORMAT:((text\:"Human-readable text output (default)"
 json\:"Single-record JSON envelope (snake_case)"))' \
 '--config=[Override the strict user config path]:PATH:_files' \
