@@ -55,7 +55,7 @@ fn pin_manifest(pinned_tag: &str, required: &[(&str, &str)]) -> String {
 }
 
 #[test]
-fn version_alignment_legacy_public_input_api_remains_constructible() {
+fn version_alignment_public_v1_input_api_remains_constructible() {
     let manifest = PinManifest {
         schema_version: 1,
         nils_cli: NilsCliPin {
