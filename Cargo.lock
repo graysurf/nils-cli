@@ -1909,6 +1909,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "nils-agent-hook"
+version = "1.24.4"
+dependencies = [
+ "clap",
+ "clap_complete",
+ "jiff",
+ "libc",
+ "nils-build-info",
+ "nils-common",
+ "nils-test-support",
+ "pretty_assertions",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "toml",
+ "toml_edit",
+ "uuid",
+]
+
+[[package]]
 name = "nils-agent-memory"
 version = "1.24.4"
 dependencies = [

@@ -708,7 +708,13 @@ printf '%s\n' '{"schema_version":"cli.agent-hook-setup.v1","command":"agent-hook
     let output = run(
         tmp.path(),
         &[
-            "activity", "setup", "--agent", "codex", "--dry-run", "--format", "json",
+            "activity",
+            "setup",
+            "--agent",
+            "codex",
+            "--dry-run",
+            "--format",
+            "json",
         ],
         &[
             ("HOME", home.as_str()),
