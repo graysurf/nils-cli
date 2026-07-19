@@ -9761,8 +9761,8 @@ exit 97
                 &mut master_fd,
                 &mut slave_fd,
                 std::ptr::null_mut(),
-                std::ptr::null(),
-                std::ptr::null(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
             )
         };
         assert_eq!(openpty_status, 0, "openpty: {}", io::Error::last_os_error());
