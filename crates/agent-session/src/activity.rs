@@ -3802,6 +3802,12 @@ fn toml_handler_command_is_owned(event: &str, handler: &toml_edit::Table) -> boo
             })
 }
 
+fn toml_hook_group_has_user_metadata(group: &toml_edit::Table) -> bool {
+    group
+        .iter()
+        .any(|(key, _)| !matches!(key, "matcher" | "hooks"))
+}
+
 fn toml_inline_has_lifecycle_hooks(document: &TomlDocument) -> bool {
     document
         .get("hooks")
@@ -3870,10 +3876,11 @@ fn remove_owned_toml_hooks(document: &mut TomlDocument) {
                 }
             }
             groups.retain(|group| {
-                group
-                    .get("hooks")
-                    .and_then(TomlItem::as_array_of_tables)
-                    .is_none_or(|handlers| !handlers.is_empty())
+                toml_hook_group_has_user_metadata(group)
+                    || group
+                        .get("hooks")
+                        .and_then(TomlItem::as_array_of_tables)
+                        .is_none_or(|handlers| !handlers.is_empty())
             });
             remove_event = groups.is_empty();
         }
@@ -4070,8 +4077,17 @@ fn json_handler_is_owned_for_group(event: &str, group: &Value, handler: &Value) 
     let Some(command) = handler.get("command").and_then(Value::as_str) else {
         return false;
     };
-    command == owned_command(AgentKind::Codex, Some(spec.event))
-        || command == owned_command(AgentKind::Codex, None)
+    !json_hook_group_has_user_metadata(group)
+        && (command == owned_command(AgentKind::Codex, Some(spec.event))
+            || command == owned_command(AgentKind::Codex, None))
+}
+
+fn json_hook_group_has_user_metadata(group: &Value) -> bool {
+    group.as_object().is_some_and(|group| {
+        group
+            .keys()
+            .any(|key| !matches!(key.as_str(), "matcher" | "hooks"))
+    })
 }
 
 fn json_has_owned_codex_hooks(value: &Value) -> bool {
@@ -4419,6 +4435,7 @@ fn rollback_provider_config_plan_after_capture_with_restore(
                 Err(error) => Err(provider_config_recovery_error(
                     error,
                     &plan.path,
+                    "captured_candidate",
                     &quarantine,
                 )),
             }
@@ -4436,19 +4453,39 @@ fn rollback_provider_config_plan_after_capture_with_restore(
 fn provider_config_recovery_error(
     mut error: CliError,
     path: &Path,
+    role: &str,
     recovery_path: &Path,
 ) -> CliError {
-    let details = error.0.details.get_or_insert_with(|| json!({}));
-    if let Some(details) = details.as_object_mut() {
-        details.insert("path".to_string(), json!(display_path(path)));
-        details.insert(
-            "recovery_path".to_string(),
-            json!(display_path(recovery_path)),
-        );
+    let mut details = match error.0.details.take() {
+        Some(Value::Object(details)) => details,
+        Some(details) => {
+            let mut wrapped = Map::new();
+            wrapped.insert("upstream_details".to_string(), details);
+            wrapped
+        }
+        None => Map::new(),
+    };
+    details.insert("path".to_string(), json!(display_path(path)));
+    let recovery_paths = details
+        .entry("recovery_paths".to_string())
+        .or_insert_with(|| Value::Array(Vec::new()));
+    if !recovery_paths.is_array() {
+        *recovery_paths = Value::Array(Vec::new());
     }
+    let recovery_paths = recovery_paths
+        .as_array_mut()
+        .expect("recovery_paths was normalized to an array");
+    let recovery = json!({
+        "role": role,
+        "path": display_path(recovery_path)
+    });
+    if !recovery_paths.contains(&recovery) {
+        recovery_paths.push(recovery);
+    }
+    error.0.details = Some(Value::Object(details));
     error.0.message.push_str(&format!(
-        "; recovery bytes were preserved at {}",
-        recovery_path.display()
+        "; {role} recovery bytes were preserved at {}",
+        recovery_path.display(),
     ));
     error
 }
@@ -4584,22 +4621,37 @@ fn quarantine_provider_config(path: &Path, purpose: &str) -> Result<(PathBuf, Ve
 }
 
 fn restore_quarantined_provider_config(path: &Path, quarantine: &Path) -> Result<(), CliError> {
-    match fs::hard_link(quarantine, path) {
+    restore_quarantined_provider_config_with_link(path, quarantine, |source, target| {
+        fs::hard_link(source, target)
+    })
+}
+
+fn restore_quarantined_provider_config_with_link(
+    path: &Path,
+    quarantine: &Path,
+    link: impl FnOnce(&Path, &Path) -> io::Result<()>,
+) -> Result<(), CliError> {
+    match link(quarantine, path) {
         Ok(()) => fs::remove_file(quarantine).map_err(|err| {
             activity_io_error("provider-config-quarantine-remove-failed", quarantine, err)
         }),
-        Err(err) if err.kind() == io::ErrorKind::AlreadyExists => Err(CliError::runtime(
-            "provider-config-rollback-concurrent-modification",
-            "provider config changed during transactional recovery; the newer path and captured file were both preserved",
-            Some(json!({
-                "path": display_path(path),
-                "captured_path": display_path(quarantine)
-            })),
-        )),
-        Err(err) => Err(activity_io_error(
-            "provider-config-quarantine-restore-failed",
+        Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {
+            Err(provider_config_recovery_error(
+                CliError::runtime(
+                    "provider-config-rollback-concurrent-modification",
+                    "provider config changed during transactional recovery; the newer path and captured file were both preserved",
+                    Some(json!({ "path": display_path(path) })),
+                ),
+                path,
+                "captured_config",
+                quarantine,
+            ))
+        }
+        Err(err) => Err(provider_config_recovery_error(
+            activity_io_error("provider-config-quarantine-restore-failed", path, err),
             path,
-            err,
+            "captured_config",
+            quarantine,
         )),
     }
 }
@@ -4642,12 +4694,14 @@ fn restore_provider_config_if_absent_with_link(
                     path,
                 ),
                 path,
+                "staged_original",
                 &temporary,
             ))
         }
         Err(err) => Err(provider_config_recovery_error(
             activity_io_error("provider-config-rollback-write-failed", path, err),
             path,
+            "staged_original",
             &temporary,
         )),
     }
@@ -4959,10 +5013,11 @@ fn mutate_json_spec(
         }
     }
     groups.retain(|group| {
-        group
-            .get("hooks")
-            .and_then(Value::as_array)
-            .is_none_or(|handlers| !handlers.is_empty())
+        json_hook_group_has_user_metadata(group)
+            || group
+                .get("hooks")
+                .and_then(Value::as_array)
+                .is_none_or(|handlers| !handlers.is_empty())
     });
     if !remove {
         let mut group = Map::new();
@@ -5222,6 +5277,20 @@ mod tests {
     use pretty_assertions::assert_eq;
     use std::collections::BTreeMap;
     use std::sync::{Arc, Barrier};
+
+    fn recovery_path_for_role(details: &Value, role: &str) -> PathBuf {
+        let recovery_paths = details["recovery_paths"]
+            .as_array()
+            .expect("recovery paths");
+        PathBuf::from(
+            recovery_paths
+                .iter()
+                .find(|recovery| recovery["role"] == role)
+                .unwrap_or_else(|| panic!("missing {role} recovery"))["path"]
+                .as_str()
+                .expect("recovery path"),
+        )
+    }
 
     fn event(kind: TurnEventKind, event_id: &str) -> TurnEvent {
         TurnEvent {
@@ -7536,29 +7605,30 @@ mod tests {
                 rollback_provider_config_plan_after_capture_with_restore(
                     plan,
                     || {},
-                    |_, _, _| {
-                        Err(CliError::runtime(
-                            "provider-config-rollback-write-failed",
-                            "injected restore failure",
-                            None,
-                        ))
+                    |path, bytes, purpose| {
+                        restore_provider_config_if_absent_with_link(path, bytes, purpose, |_, _| {
+                            Err(io::Error::new(
+                                io::ErrorKind::PermissionDenied,
+                                "injected hard-link failure",
+                            ))
+                        })
                     },
                 )
             })
             .expect_err("two-file failure must surface rollback recovery metadata");
 
         assert_eq!(error.code(), "provider-config-rollback-failed");
-        let recovery_path = PathBuf::from(
-            error.0.details.as_ref().expect("error details")["rollback_error_details"]
-                ["recovery_path"]
-                .as_str()
-                .expect("recovery path"),
-        );
-        assert!(recovery_path.is_file());
+        let rollback_details =
+            &error.0.details.as_ref().expect("error details")["rollback_error_details"];
+        let candidate_path = recovery_path_for_role(rollback_details, "captured_candidate");
+        let original_path = recovery_path_for_role(rollback_details, "staged_original");
+        assert!(candidate_path.is_file());
+        assert!(original_path.is_file());
         assert_eq!(
-            fs::read(recovery_path).expect("captured candidate"),
+            fs::read(candidate_path).expect("captured candidate"),
             hooks.updated_bytes.clone().expect("candidate bytes")
         );
+        assert_eq!(fs::read(original_path).expect("staged original"), b"{}\n");
     }
 
     #[test]
@@ -7678,10 +7748,9 @@ mod tests {
         .expect_err("unexpected hard-link failure must retain recovery bytes");
 
         assert_eq!(error.code(), "provider-config-rollback-write-failed");
-        let recovery_path = PathBuf::from(
-            error.0.details.as_ref().expect("error details")["recovery_path"]
-                .as_str()
-                .expect("recovery path"),
+        let recovery_path = recovery_path_for_role(
+            error.0.details.as_ref().expect("error details"),
+            "staged_original",
         );
         assert_eq!(fs::read(recovery_path).expect("staged original"), original);
         assert!(!path.exists());
@@ -7734,6 +7803,33 @@ mod tests {
     }
 
     #[test]
+    fn provider_config_quarantine_restore_failure_reports_the_captured_path() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let path = tmp.path().join("hooks.json");
+        let quarantine = tmp.path().join("captured-hooks.json");
+        fs::write(&quarantine, b"captured-config").expect("captured config");
+
+        let error = restore_quarantined_provider_config_with_link(&path, &quarantine, |_, _| {
+            Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "injected hard-link failure",
+            ))
+        })
+        .expect_err("restore failure must report the retained capture");
+
+        let recovery_paths = error.0.details.as_ref().expect("error details")["recovery_paths"]
+            .as_array()
+            .expect("recovery paths");
+        assert_eq!(recovery_paths.len(), 1);
+        assert_eq!(recovery_paths[0]["role"], "captured_config");
+        assert_eq!(recovery_paths[0]["path"], display_path(&quarantine));
+        assert_eq!(
+            fs::read(&quarantine).expect("retained capture"),
+            b"captured-config"
+        );
+    }
+
+    #[test]
     fn codex_inline_permission_source_guard_rejects_duplicate_reporters() {
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let config_path = tmp.path().join("config.toml");
@@ -7780,6 +7876,64 @@ mod tests {
         .expect("duplicate reporter");
 
         assert!(!codex_json_permission_source_guard(&path));
+    }
+
+    #[test]
+    fn codex_hook_group_metadata_is_user_owned_and_preserved_by_remove() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let hooks_path = tmp.path().join("hooks.json");
+        let config_path = tmp.path().join("config.toml");
+        let json = json!({
+            "hooks": {
+                "Stop": [{
+                    "description": "keep-json-metadata",
+                    "hooks": [{
+                        "type": "command",
+                        "command": owned_command(AgentKind::Codex, Some("Stop")),
+                        "timeout": 5
+                    }]
+                }]
+            }
+        });
+        let config = format!(
+            "[[hooks.Stop]]\ndescription = \"keep-toml-metadata\"\n\n[[hooks.Stop.hooks]]\ntype = \"command\"\ncommand = {}\ntimeout = 5\n",
+            TomlValue::from(owned_command(AgentKind::Codex, Some("Stop")))
+        );
+        let document = parse_codex_notification_config(&config_path, &config).expect("TOML");
+
+        let status = codex_hook_status_from_documents(&json, &document);
+        assert!(status.conflict, "additive group metadata is user-owned");
+
+        let json_bytes = serde_json::to_vec_pretty(&json).expect("JSON bytes");
+        let cleanup =
+            plan_codex_json_cleanup(&hooks_path, Some(json_bytes)).expect("JSON cleanup plan");
+        let cleaned_json: Value = serde_json::from_slice(
+            cleanup
+                .updated_bytes
+                .as_deref()
+                .expect("user metadata keeps the JSON file"),
+        )
+        .expect("cleaned JSON");
+        assert_eq!(
+            cleaned_json["hooks"]["Stop"][0]["description"],
+            "keep-json-metadata"
+        );
+        assert_eq!(cleaned_json["hooks"]["Stop"][0]["hooks"], json!([]));
+
+        fs::write(&config_path, config).expect("config fixture");
+        let mut notification =
+            plan_codex_notification(&config_path, SetupAction::Remove).expect("TOML plan");
+        plan_inline_codex_hooks(&mut notification, SetupAction::Remove).expect("inline cleanup");
+        let cleaned_toml = std::str::from_utf8(
+            notification
+                .config
+                .updated_bytes
+                .as_deref()
+                .expect("TOML candidate"),
+        )
+        .expect("UTF-8 TOML");
+        assert!(cleaned_toml.contains("keep-toml-metadata"));
+        assert!(!cleaned_toml.contains("agent-session activity hook"));
     }
 
     #[test]

@@ -118,8 +118,10 @@ representation already active in the user layer: JSON-only installs stay in
 exact agent-session handlers to migrate into a separate marker-bounded block in
 `~/.codex/config.toml`. An owned-only JSON source is deleted; unrelated content
 is preserved. User-owned lifecycle handlers in both sources produce a
-content-free conflict and no mutation. Setup and doctor report representation,
-migration, conflict, and the active hook path. Migrated definitions have new
+content-free conflict and block dry-run/apply/repair migration without mutation;
+`--remove` may still clean exact agent-session handlers from both sources without
+moving user content. Setup and doctor report representation, migration,
+conflict, and the active hook path. Migrated definitions have new
 Codex trust identities, so review them with `/hooks` and verify a fresh session
 does not emit the dual-representation warning. Setup also adds
 the official `agent-turn-complete` notify argv to `~/.codex/config.toml` when
