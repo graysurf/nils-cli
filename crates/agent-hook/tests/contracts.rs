@@ -182,10 +182,19 @@ fn cli_help_version_and_completion_surface_are_complete() {
     assert_eq!(help.code, 0, "stderr={}", help.stderr_text());
     let help_text = help.stdout_text();
     for required in [
-        "dispatch", "validate", "inventory", "doctor", "setup", "recovery", "completion",
+        "dispatch",
+        "validate",
+        "inventory",
+        "doctor",
+        "setup",
+        "recovery",
+        "completion",
         "-V, --version",
     ] {
-        assert!(help_text.contains(required), "missing {required}: {help_text}");
+        assert!(
+            help_text.contains(required),
+            "missing {required}: {help_text}"
+        );
     }
 
     let version = fixture.run(&["--version"], None);

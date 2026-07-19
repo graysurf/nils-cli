@@ -261,8 +261,7 @@ private, owner/mode-validated #676 registry, the current managed principal's
 ready/fresh broker incarnation, and active work-context claims. Exact worktree,
 provider-reference, or overlapping scope evidence is definite; an incomplete
 registry, missing authenticated current claim, stale peer universe, or only
-repository-level uncertainty is `unknown`/`potential` and advisory. Only a
-definite authenticated conflict blocks. A forged provider field named
+repository-level uncertainty is `unknown`/`potential` and advisory. Only a definite authenticated conflict blocks. A forged provider field named
 `semantic_conflict` is ignored and never upgrades or downgrades the derived
 classification.
 
