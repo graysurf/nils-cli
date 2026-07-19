@@ -1747,8 +1747,12 @@ trust_level = "trusted"
 }
 
 #[test]
-fn codex_repair_converges_duplicate_and_generic_owned_reporters() {
-    for duplicate_kind in ["current", "generic"] {
+fn codex_repair_converges_noncanonical_owned_hook_shapes() {
+    for fixture_kind in [
+        "current-duplicate",
+        "generic-duplicate",
+        "non-string-matcher",
+    ] {
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let home = tmp.path().join("home");
         fs::create_dir_all(home.join(".codex")).expect("codex dir");
@@ -1777,8 +1781,8 @@ timeout = 5
         assert_eq!(initial.code, 0, "stderr={}", initial.stderr_text());
 
         let converged = fs::read_to_string(&config_path).expect("converged config");
-        let duplicate = match duplicate_kind {
-            "current" => {
+        let candidate = match fixture_kind {
+            "current-duplicate" => {
                 let start = converged
                     .find("[[hooks.PermissionRequest]]")
                     .expect("PermissionRequest start");
@@ -1786,25 +1790,38 @@ timeout = 5
                     .find("[[hooks.PostToolUse]]")
                     .map(|offset| start + offset)
                     .expect("PermissionRequest end");
-                converged[start..end].to_string()
+                converged.replacen(
+                    "# <<< agent-session:codex-hooks <<<",
+                    &format!(
+                        "{}# <<< agent-session:codex-hooks <<<",
+                        &converged[start..end]
+                    ),
+                    1,
+                )
             }
-            "generic" => r#"[[hooks.PermissionRequest]]
+            "generic-duplicate" => {
+                let duplicate = r#"[[hooks.PermissionRequest]]
 
 [[hooks.PermissionRequest.hooks]]
 type = "command"
 command = "agent-session activity hook --agent codex"
 timeout = 5
 
-"#
-            .to_string(),
+"#;
+                converged.replacen(
+                    "# <<< agent-session:codex-hooks <<<",
+                    &format!("{duplicate}# <<< agent-session:codex-hooks <<<"),
+                    1,
+                )
+            }
+            "non-string-matcher" => converged.replacen(
+                "[[hooks.PermissionRequest]]",
+                "[[hooks.PermissionRequest]]\nmatcher = 5",
+                1,
+            ),
             _ => unreachable!(),
         };
-        let duplicated = converged.replacen(
-            "# <<< agent-session:codex-hooks <<<",
-            &format!("{duplicate}# <<< agent-session:codex-hooks <<<"),
-            1,
-        );
-        fs::write(&config_path, duplicated).expect("duplicated config");
+        fs::write(&config_path, candidate).expect("noncanonical config");
 
         let preview = run(
             tmp.path(),
@@ -1825,7 +1842,7 @@ timeout = 5
         let preview_result = data(&preview_json);
         assert_eq!(
             preview_result["would_change"], true,
-            "{duplicate_kind} duplicate must require repair"
+            "{fixture_kind} must require repair"
         );
         let preview_digest = preview_result["preview_digest"]
             .as_str()
@@ -1855,8 +1872,9 @@ timeout = 5
                 .matches("[[hooks.PermissionRequest]]")
                 .count(),
             1,
-            "{duplicate_kind} duplicate must be removed"
+            "{fixture_kind} must converge to one reporter"
         );
+        assert!(!repaired_config.contains("matcher = 5"));
 
         let steady = run(
             tmp.path(),

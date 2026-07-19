@@ -3792,6 +3792,15 @@ fn toml_hook_matcher_matches(group: &toml_edit::Table, spec: ProviderSpec) -> bo
     }
 }
 
+fn toml_hook_matcher_is_exact(group: &toml_edit::Table, spec: ProviderSpec) -> bool {
+    match (group.get("matcher"), spec.matcher) {
+        (None, None) => true,
+        (Some(matcher), None) => matcher.as_str() == Some(""),
+        (Some(matcher), Some(expected)) => matcher.as_str() == Some(expected),
+        (None, Some(_)) => false,
+    }
+}
+
 fn toml_handler_command_matches_owned(event: &str, handler: &toml_edit::Table) -> bool {
     handler.get("type").and_then(TomlItem::as_str) == Some("command")
         && handler
@@ -3902,7 +3911,7 @@ fn toml_codex_hooks_exactly_configured(document: &TomlDocument) -> bool {
                 if !toml_handler_command_matches_owned(spec.event, handler) {
                     continue;
                 }
-                if !toml_hook_matcher_matches(group, spec)
+                if !toml_hook_matcher_is_exact(group, spec)
                     || toml_hook_group_has_user_metadata(group)
                     || handlers.len() != 1
                     || !toml_handler_command_is_owned(spec.event, handler)
