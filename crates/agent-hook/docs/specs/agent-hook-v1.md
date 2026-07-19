@@ -42,7 +42,8 @@ handling.
   assignments, executable paths, or recovery state.
 - `agent-hook.policy.v1`: bundle ID/version and ordered typed rules. A rule has
   stable ID, products, events, optional matcher, priority, mode, failure
-  posture, override class, and one built-in capability binding.
+  posture, override class, and one built-in capability binding. The concrete
+  TOML serialization is frozen below.
 - `agent-hook.normalized-request.v1`: request ID, product, canonical event,
   optional matcher, bounded target/command/snapshot digests, and public boolean
   facts. Raw prompts, tool input, command strings, paths, session IDs, mailbox
@@ -84,8 +85,9 @@ native setup until a compatible runner exists.
 
 Supported canonical events are:
 
-- Codex: `UserPromptSubmit`, `PermissionRequest`, `PreToolUse`, `PostToolUse`,
-  `PostToolUseFailure`, `Stop`, `StopFailure`, and `Notification`.
+- Codex: `SessionStart`, `UserPromptSubmit`, `PermissionRequest`, `PreToolUse`,
+  `PostToolUse`, `PostToolUseFailure`, `Stop`, `StopFailure`, and
+  `Notification`.
 - Claude: the Codex set plus `SubagentStop`, `Elicitation`, and
   `ElicitationResult`.
 
@@ -101,6 +103,66 @@ Provider rendering maps one normalized aggregate result to the provider's
 native allow, warning/context, block, or input-replacement shape and stable exit
 behavior. `dispatch --format json` returns the normalized decision envelope and
 does not return raw provider content.
+
+## Serialized policy and capability registry
+
+Policy bundles are strict TOML. This is the canonical serialized v1 shape;
+unknown keys at every level are errors. Products/events are arrays so the same
+stable rule can cover overlapping provider ingress. Capability-specific keys
+live in the inline `capability` table and are rejected for a different ID.
+
+```toml
+schema_version = "agent-hook.policy.v1"
+bundle_id = "runtime-kit"
+version = "2026.07.20.1"
+
+[[rules]]
+id = "runtime.session-start-healthcheck"
+products = ["codex", "claude"]
+events = ["SessionStart"]
+priority = 100
+mode = "enforce"
+failure_posture = "closed"
+override_class = "locked"
+capability = { id = "runtime-kit.handler.v1", handler_id = "session-start-healthcheck" }
+```
+
+The stable built-in capability ID set for policy v1 is closed:
+
+- `decision.allow.v1` (`reason_code`)
+- `decision.warn.v1` (`reason_code`, `message`)
+- `decision.block.v1` (`reason_code`, `message`)
+- `decision.context.v1` (`reason_code`, `text`)
+- `decision.transform.v1` (`reason_code`, `replacement`)
+- `agent-session.activity.v1` (`reason_code`)
+- `agent-session.owner-liveness.v1` (`reason_code`, optional
+  `legacy_ttl_seconds`, maximum 900)
+- `agent-session.semantic-conflict.v1` (`reason_code`)
+- `runtime-kit.handler.v1` (`handler_id` from the compiled v1 allowlist)
+
+`runtime-kit.handler.v1` is not arbitrary execution. The binary maps the
+handler ID through a compiled allowlist to one exact runtime-kit-owned handler
+basename and resolves it only below the active provider's owned hook directory.
+The v1 allowlist is:
+
+`agent-scope-lock-guard`, `block-claude-coauthor-trailer`,
+`block-direct-git-commit`, `block-direct-git-worktree`,
+`block-direct-pr-create`, `block-direct-python`,
+`block-project-memory-write`, `block-unsafe-default-delivery`,
+`checkout-lease-guard`, `finish-line-record`, `forge-label-reminder`,
+`mcp-secret-scan`, `memory-write-principle-reminder`,
+`portable-paths-scan`, `pre-edit-intent-gate`,
+`semantic-commit-body-gate`, `session-start-healthcheck`,
+`skill-usage-reminder`, `stop-finish-line-gate`, `stop-pre-pr-reminder`,
+`user-prompt-agent-docs`, and `user-prompt-agent-memory`.
+
+Handler resolution selects the compiled `.py` or `.sh` suffix, rejects
+symlinks/non-regular files and owner/permission drift, passes the original
+bounded provider JSON on standard input, uses a fixed timeout, and preserves
+the handler's provider output/exit semantics. The policy cannot specify a path,
+interpreter, argv, environment assignment, shell fragment, timeout, or digest.
+Shadow mode never invokes it. Adding another handler requires a new nils-cli
+release or a new versioned capability ID.
 
 ## Deterministic evaluation
 
@@ -193,4 +255,3 @@ checkout path, and capability values never enter dispatch output or trace.
 - `64`: invalid CLI use.
 - `65`: invalid config, policy, provider input, drift, or recovery data.
 - `75`: concurrency/lock contention suitable for bounded retry.
-
