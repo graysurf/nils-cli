@@ -337,14 +337,17 @@ fn parse_codex_prompt(line: &str) -> Option<ParsedPrompt> {
 }
 
 fn parse_claude_last_prompt(line: &str, session_id: &str) -> Option<ParsedPrompt> {
-    let value: Value = serde_json::from_str(line).ok()?;
+    parse_claude_last_prompt_value(&serde_json::from_str(line).ok()?, session_id)
+}
+
+fn parse_claude_last_prompt_value(value: &Value, session_id: &str) -> Option<ParsedPrompt> {
     if value.get("type").and_then(Value::as_str) != Some("last-prompt")
-        || !claude_session_matches(&value, session_id)
+        || !claude_session_matches(value, session_id)
     {
         return None;
     }
     let mut prompt = bounded_prompt(value.get("lastPrompt").and_then(Value::as_str)?)?;
-    prompt.submitted_at = provider_timestamp(&value);
+    prompt.submitted_at = provider_timestamp(value);
     prompt.turn_id = value
         .get("leafUuid")
         .or_else(|| value.get("leaf_uuid"))
@@ -354,9 +357,12 @@ fn parse_claude_last_prompt(line: &str, session_id: &str) -> Option<ParsedPrompt
 }
 
 fn parse_claude_user_prompt(line: &str, session_id: &str) -> Option<ParsedPrompt> {
-    let value: Value = serde_json::from_str(line).ok()?;
+    parse_claude_user_prompt_value(&serde_json::from_str(line).ok()?, session_id)
+}
+
+fn parse_claude_user_prompt_value(value: &Value, session_id: &str) -> Option<ParsedPrompt> {
     if value.get("type").and_then(Value::as_str) != Some("user")
-        || !claude_session_matches(&value, session_id)
+        || !claude_session_matches(value, session_id)
         || value.get("isSidechain").and_then(Value::as_bool) == Some(true)
         || value.get("isMeta").and_then(Value::as_bool) == Some(true)
         || value.get("isCompactSummary").and_then(Value::as_bool) == Some(true)
@@ -386,7 +392,7 @@ fn parse_claude_user_prompt(line: &str, session_id: &str) -> Option<ParsedPrompt
             .join("\n")
     };
     let mut prompt = bounded_prompt(&text)?;
-    prompt.submitted_at = provider_timestamp(&value);
+    prompt.submitted_at = provider_timestamp(value);
     prompt.turn_id = value
         .get("uuid")
         .or_else(|| value.get("messageUuid"))
@@ -411,6 +417,19 @@ fn claude_session_matches(value: &Value, session_id: &str) -> bool {
         .or_else(|| value.get("session_id"))
         .and_then(Value::as_str)
         == Some(session_id)
+}
+
+/// Whether a Claude transcript `user` record is a prompt the human actually
+/// submitted, as opposed to a tool result, an interrupt, a slash-command echo,
+/// or a system injection. Claude Code tags genuine input with an explicit
+/// `promptSource`; only these values denote human input. Records without the tag
+/// (older transcripts, tool traffic) return `false` so callers fall back to the
+/// historical heuristics rather than trusting an ambiguous line.
+fn claude_prompt_is_human_submitted(value: &Value) -> bool {
+    matches!(
+        value.get("promptSource").and_then(Value::as_str),
+        Some("typed" | "queued" | "suggestion_accepted")
+    )
 }
 
 fn bounded_prompt(prompt: &str) -> Option<ParsedPrompt> {
@@ -439,17 +458,25 @@ fn bounded_prompt(prompt: &str) -> Option<ParsedPrompt> {
 
 /// Extract the most recent user prompt from a raw transcript byte window.
 ///
-/// Lines are parsed with the same per-provider parsers used by the live tail;
-/// the last matching line wins. For Claude both a canonical `last-prompt` record
-/// and a plain `user` prompt are considered, so whichever is later in the file
-/// (i.e. newer) is returned. Invalid, foreign-session, or partial lines —
-/// including a torn leading line when the window starts mid-file — are skipped.
+/// Invalid, foreign-session, or partial lines — including a torn leading line
+/// when the window starts mid-file — are skipped.
+///
+/// For Claude the last matching line does *not* simply win. Claude Code re-emits
+/// a canonical `last-prompt` marker near EOF whose text can lag a turn behind (it
+/// freezes on the first prompt in some sessions), so a positionally-later marker
+/// would mask a newer prompt the user actually typed. When any record is tagged
+/// as human-submitted (`promptSource: typed`/`queued`/…), the most recent such
+/// prompt wins. Only when no tagged prompt is present — older transcripts, or
+/// autonomous sessions whose lone prompt scrolled out of the window — do we fall
+/// back to the historical "last matching line (marker or user record) wins"
+/// behavior, so no session regresses.
 fn extract_last_prompt(
     buffer: &[u8],
     provider: ProviderKind,
     session_id: &str,
 ) -> Option<ParsedPrompt> {
-    let mut last: Option<ParsedPrompt> = None;
+    let mut human: Option<ParsedPrompt> = None;
+    let mut fallback: Option<ParsedPrompt> = None;
     for raw_line in buffer.split(|&byte| byte == b'\n') {
         let raw_line = match raw_line.last() {
             Some(b'\r') => &raw_line[..raw_line.len() - 1],
@@ -461,16 +488,30 @@ fn extract_last_prompt(
         if line.is_empty() {
             continue;
         }
-        let parsed = match provider {
-            ProviderKind::Codex => parse_codex_prompt(line),
-            ProviderKind::Claude => parse_claude_last_prompt(line, session_id)
-                .or_else(|| parse_claude_user_prompt(line, session_id)),
-        };
-        if parsed.is_some() {
-            last = parsed;
+        match provider {
+            ProviderKind::Codex => {
+                if let Some(prompt) = parse_codex_prompt(line) {
+                    fallback = Some(prompt);
+                }
+            }
+            ProviderKind::Claude => {
+                let Ok(value) = serde_json::from_str::<Value>(line) else {
+                    continue;
+                };
+                let Some(prompt) = parse_claude_last_prompt_value(&value, session_id)
+                    .or_else(|| parse_claude_user_prompt_value(&value, session_id))
+                else {
+                    continue;
+                };
+                if claude_prompt_is_human_submitted(&value) {
+                    human = Some(prompt);
+                } else {
+                    fallback = Some(prompt);
+                }
+            }
         }
     }
-    last
+    human.or(fallback)
 }
 
 /// Read up to `max_bytes` from the tail of a regular transcript file.
@@ -1185,6 +1226,26 @@ mod tests {
         )
     }
 
+    fn claude_user_with_source(
+        session_id: &str,
+        uuid: &str,
+        prompt_source: &str,
+        prompt: &str,
+    ) -> String {
+        format!(
+            "{}\n",
+            json!({
+                "type":"user",
+                "uuid":uuid,
+                "sessionId":session_id,
+                "promptSource":prompt_source,
+                "cwd":"/repo",
+                "timestamp":"2099-01-01T00:00:00Z",
+                "message":{"role":"user","content":prompt}
+            })
+        )
+    }
+
     fn codex_agent_line(message: &str) -> String {
         format!(
             "{}\n",
@@ -1241,6 +1302,69 @@ mod tests {
         let parsed = extract_last_prompt(buffer.as_bytes(), ProviderKind::Claude, "claude-id")
             .expect("prompt");
         assert_eq!(parsed.prompt, "mine");
+    }
+
+    #[test]
+    fn extract_last_prompt_prefers_human_typed_prompt_over_a_stale_trailing_marker() {
+        // Regression for the Claude staleness bug: Claude Code re-emits a
+        // `last-prompt` marker near EOF that can still carry an older turn's text.
+        // A newer human-typed prompt in the same window must win even though the
+        // marker line is positionally later.
+        let buffer = format!(
+            "{}{}",
+            claude_user_with_source("claude-id", "turn-2", "typed", "the newest question"),
+            claude_last_prompt("claude-id", "turn-1", "an older frozen prompt"),
+        );
+        let parsed = extract_last_prompt(buffer.as_bytes(), ProviderKind::Claude, "claude-id")
+            .expect("prompt");
+        assert_eq!(parsed.prompt, "the newest question");
+    }
+
+    #[test]
+    fn extract_last_prompt_ignores_untagged_noise_after_a_human_prompt() {
+        // An interrupt / command echo carries no `promptSource`; it must not
+        // replace the genuine typed prompt even when it lands after it.
+        let buffer = format!(
+            "{}{}",
+            claude_user_with_source("claude-id", "turn-1", "queued", "the real request"),
+            claude_user("claude-id", "[Request interrupted by user]"),
+        );
+        let parsed = extract_last_prompt(buffer.as_bytes(), ProviderKind::Claude, "claude-id")
+            .expect("prompt");
+        assert_eq!(parsed.prompt, "the real request");
+    }
+
+    #[test]
+    fn extract_last_prompt_without_prompt_source_keeps_last_match_fallback() {
+        // Older transcripts have no `promptSource` tag. Behaviour is unchanged:
+        // the canonical marker / last matching line still wins, so no session
+        // regresses when the human signal is absent.
+        let buffer = format!(
+            "{}{}",
+            claude_user("claude-id", "untagged draft"),
+            claude_last_prompt("claude-id", "leaf", "canonical final"),
+        );
+        let parsed = extract_last_prompt(buffer.as_bytes(), ProviderKind::Claude, "claude-id")
+            .expect("prompt");
+        assert_eq!(parsed.prompt, "canonical final");
+    }
+
+    #[test]
+    fn claude_prompt_is_human_submitted_only_accepts_explicit_input_sources() {
+        let human = |source: &str| {
+            claude_prompt_is_human_submitted(
+                &serde_json::from_str(&claude_user_with_source("s", "u", source, "hi")).unwrap(),
+            )
+        };
+        assert!(human("typed"));
+        assert!(human("queued"));
+        assert!(human("suggestion_accepted"));
+        assert!(!human("system"));
+        assert!(!human("sdk"));
+        // A plain user record (tool result, interrupt) carries no tag.
+        assert!(!claude_prompt_is_human_submitted(
+            &serde_json::from_str(&claude_user("s", "no tag")).unwrap()
+        ));
     }
 
     #[test]
