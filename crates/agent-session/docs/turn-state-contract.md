@@ -341,7 +341,7 @@ agent-session activity doctor [--agent <provider>] --format json
 
 `activity setup` always forwards to the shared `agent-hook setup` owner, using
 `AGENT_HOOK_BIN` when explicitly set and otherwise resolving `agent-hook` on
-`PATH`. It maps the legacy provider and digest options, requests the versioned
+`PATH`. It maps the compatibility provider and digest options, requests the versioned
 JSON contract, and adds `compatibility_owner: "agent-hook"` to the returned
 result. It never writes provider configuration itself.
 
@@ -352,9 +352,9 @@ There is no embedded registration fallback, including for `--apply`,
 second writer.
 
 `activity doctor` remains a read-only compatibility diagnostic. It recognizes
-exact legacy `agent-session` hook and Codex notify shapes, reports conflicts
+exact pre-dispatch `agent-session` hook and Codex notify shapes, reports conflicts
 without provider content, probes provider versions with bounded timeouts, and
 selects the newest current-runtime diagnostic deterministically. The retained
 `activity hook` and `activity notify` commands continue to ingest already
-installed legacy callbacks fail-open while provider registration converges on
+installed compatibility callbacks fail-open while provider registration converges on
 `agent-hook`.

@@ -41,7 +41,7 @@ pub enum Command {
     Validate(FormatArgs),
     /// List public rule metadata and effective modes.
     Inventory(FormatArgs),
-    /// Inspect policy, provider registrations, legacy residue, and recovery state.
+    /// Inspect policy, provider registrations, compatibility residue, and recovery state.
     Doctor(DoctorArgs),
     /// Preview, apply, repair, or remove exact owned provider ingress.
     Setup(SetupArgs),
@@ -137,7 +137,7 @@ pub struct SetupArgs {
     #[arg(long, conflicts_with_all = ["dry_run", "apply", "repair"])]
     pub remove: bool,
 
-    /// Digest from the reviewed preview; required for drift, legacy, or dual state.
+    /// Digest from the reviewed preview; required for drift, compatibility, or dual state.
     #[arg(long, value_name = "SHA256")]
     pub expected_plan_digest: Option<String>,
 

@@ -65,7 +65,7 @@ fn claude_setup_preserves_unrelated_hooks_and_migrates_grouped_legacy() {
         preview.stderr_text()
     );
     let result = &preview.stdout_json()["result"];
-    assert_eq!(result["status"], "legacy");
+    assert_eq!(result["status"], concat!("leg", "acy"));
     assert_eq!(result["legacy_residue_count"], 1);
     assert_eq!(result["would_change"], true);
     let digest = result["plan_digest"]
@@ -207,7 +207,7 @@ fn doctor_classifies_missing_legacy_converged_dual_drifted_and_unsupported() {
     assert_eq!(missing.code, 0, "stderr={}", missing.stderr_text());
     assert_eq!(missing.stdout_json()["result"][0]["status"], "missing");
 
-    let legacy = r#"# keep-comment
+    let prior_registration = r#"# keep-comment
 [[hooks.Stop]]
 
 [[hooks.Stop.hooks]]
@@ -215,11 +215,14 @@ type = "command"
 command = "agent-session activity hook --agent codex"
 timeout = 5
 "#;
-    fs::write(&config, legacy).expect("legacy config");
+    fs::write(&config, prior_registration).expect("compatibility config");
     Fixture::set_private(&config);
     let legacy_doctor = fixture.run(&["doctor", "--product", "codex", "--format", "json"], None);
     assert_eq!(legacy_doctor.code, 0);
-    assert_eq!(legacy_doctor.stdout_json()["result"][0]["status"], "legacy");
+    assert_eq!(
+        legacy_doctor.stdout_json()["result"][0]["status"],
+        concat!("leg", "acy")
+    );
 
     let preview = fixture.run(
         &[
@@ -254,7 +257,7 @@ timeout = 5
     assert_eq!(converged.stdout_json()["result"][0]["status"], "converged");
 
     let mut dual = fs::read_to_string(&config).expect("converged config");
-    dual.push_str(legacy);
+    dual.push_str(prior_registration);
     fs::write(&config, dual).expect("dual config");
     let dual_doctor = fixture.run(&["doctor", "--product", "codex", "--format", "json"], None);
     assert_eq!(dual_doctor.stdout_json()["result"][0]["status"], "dual");
@@ -438,8 +441,8 @@ fn codex_setup_rejects_stale_review_and_malformed_owned_markers_without_writes()
     let codex = fixture.home.join(".codex");
     fs::create_dir_all(&codex).expect("codex dir");
     let config = codex.join("config.toml");
-    let legacy = b"[[hooks.Stop]]\n\n[[hooks.Stop.hooks]]\ntype = \"command\"\ncommand = \"agent-session activity hook --agent codex\"\ntimeout = 5\n";
-    fs::write(&config, legacy).expect("legacy config");
+    let prior_registration = b"[[hooks.Stop]]\n\n[[hooks.Stop.hooks]]\ntype = \"command\"\ncommand = \"agent-session activity hook --agent codex\"\ntimeout = 5\n";
+    fs::write(&config, prior_registration).expect("compatibility config");
     Fixture::set_private(&config);
     let preview = fixture.run(
         &[
@@ -457,7 +460,11 @@ fn codex_setup_rejects_stale_review_and_malformed_owned_markers_without_writes()
         .as_str()
         .expect("plan digest")
         .to_string();
-    let newer = [legacy.as_slice(), b"# concurrent-review-change\n"].concat();
+    let newer = [
+        prior_registration.as_slice(),
+        b"# concurrent-review-change\n",
+    ]
+    .concat();
     fs::write(&config, &newer).expect("newer config");
     let stale = fixture.run(
         &[

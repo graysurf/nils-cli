@@ -173,13 +173,13 @@ agent-session activity setup --agent codex --repair --expected-preview-digest sh
 agent-session activity setup --agent codex --remove
 ```
 
-It invokes `agent-hook setup`, maps the legacy provider and digest flags, and
+It invokes `agent-hook setup`, maps the compatibility provider and digest flags, and
 reports `compatibility_owner: "agent-hook"`. If the matching `agent-hook`
 binary is absent, setup returns `agent-hook-setup-unavailable` and does not
 write provider configuration. Install the binary and rerun the reviewed
 dry-run; there is no embedded registration fallback.
 
-`activity doctor` remains read-only and recognizes exact legacy
+`activity doctor` remains read-only and recognizes exact pre-dispatch
 `agent-session` registrations so an operator can diagnose and migrate older
 installations. Existing `activity hook` and `activity notify` ingestion paths
 also remain as fail-open runtime compatibility while `agent-hook` becomes the

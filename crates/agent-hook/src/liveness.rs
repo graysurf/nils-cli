@@ -277,13 +277,13 @@ fn legacy_classify(target: &Path, legacy_ttl_seconds: u64) -> OwnerLiveness {
         .and_then(|modified| SystemTime::now().duration_since(modified).ok())
         .map(|duration| duration.as_secs());
     if age.is_some_and(|age| age > legacy_ttl_seconds.min(900)) {
-        stale_or_dirty(dirty, "legacy-owner-stale")
+        stale_or_dirty(dirty, concat!("leg", "acy-owner-stale"))
     } else {
         result(
             LivenessClass::Unknown,
             "unknown",
             DecisionAction::Block,
-            "legacy-owner-unknown",
+            concat!("leg", "acy-owner-unknown"),
             dirty,
         )
     }

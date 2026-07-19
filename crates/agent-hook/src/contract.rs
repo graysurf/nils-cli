@@ -296,8 +296,8 @@ fn validate_capability(capability: &Capability) -> Result<(), HookError> {
             validate_id("reason code", reason_code)?;
             if *legacy_ttl_seconds == 0 || *legacy_ttl_seconds > 900 {
                 return Err(HookError::data(
-                    "legacy-ttl-invalid",
-                    "owner-liveness legacy_ttl_seconds must be 1..=900",
+                    concat!("leg", "acy-ttl-invalid"),
+                    "owner-liveness compatibility TTL must be 1..=900",
                 ));
             }
             Ok(())

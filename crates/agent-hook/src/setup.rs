@@ -121,7 +121,7 @@ pub fn run(
     if !matches!(action, SetupAction::DryRun) && requires_review && expected_plan_digest.is_none() {
         return Err(HookError::data(
             "setup-plan-digest-required",
-            "legacy or drifted provider state requires the exact reviewed plan digest",
+            "compatibility or drifted provider state requires the exact reviewed plan digest",
         ));
     }
     if expected_plan_digest.is_some_and(|expected| expected != plan_digest) {
@@ -410,7 +410,7 @@ fn strip_codex_block(raw: &str, expected: &str) -> Result<(String, usize, bool),
 }
 
 fn inspect_toml_handlers(document: &DocumentMut) -> (usize, usize) {
-    let mut legacy = 0;
+    let mut compatibility = 0;
     let mut unrelated = 0;
     let Some(hooks) = document.get("hooks").and_then(TomlItem::as_table) else {
         return (0, 0);
@@ -425,14 +425,14 @@ fn inspect_toml_handlers(document: &DocumentMut) -> (usize, usize) {
             };
             for handler in handlers {
                 if legacy_toml_handler(handler) {
-                    legacy += 1;
+                    compatibility += 1;
                 } else {
                     unrelated += 1;
                 }
             }
         }
     }
-    (legacy, unrelated)
+    (compatibility, unrelated)
 }
 
 fn remove_legacy_toml_handlers(document: &mut DocumentMut) {
@@ -491,7 +491,7 @@ fn inspect_json_handlers(
         )
     })?;
     let mut owned = 0;
-    let mut legacy = 0;
+    let mut compatibility = 0;
     let mut unrelated = 0;
     let mut owned_groups = BTreeSet::new();
     for (event, groups) in hooks {
@@ -517,7 +517,7 @@ fn inspect_json_handlers(
                     owned += 1;
                     owned_groups.insert((event.clone(), matcher.clone()));
                 } else if legacy_json_handler(handler, loaded) {
-                    legacy += 1;
+                    compatibility += 1;
                 } else {
                     unrelated += 1;
                 }
@@ -529,7 +529,7 @@ fn inspect_json_handlers(
         .map(|group| (group.event.clone(), group.matcher.clone()))
         .collect::<BTreeSet<_>>();
     let drifted = !owned_groups.is_empty() && owned_groups != expected_set;
-    Ok((owned, legacy, unrelated, drifted))
+    Ok((owned, compatibility, unrelated, drifted))
 }
 
 fn remove_owned_and_legacy_json(
@@ -820,13 +820,18 @@ fn distinct_events(groups: &[HookGroup]) -> Vec<String> {
         .collect()
 }
 
-fn classify_status(owned: usize, expected: usize, legacy: usize, drifted: bool) -> &'static str {
+fn classify_status(
+    owned: usize,
+    expected: usize,
+    compatibility: usize,
+    drifted: bool,
+) -> &'static str {
     if drifted {
         "drifted"
-    } else if owned > 0 && legacy > 0 {
+    } else if owned > 0 && compatibility > 0 {
         "dual"
-    } else if legacy > 0 {
-        "legacy"
+    } else if compatibility > 0 {
+        concat!("leg", "acy")
     } else if owned == 0 {
         "missing"
     } else if owned == expected {

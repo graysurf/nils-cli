@@ -56,9 +56,9 @@ handling.
 - `agent-hook.setup-plan.v1`: product, owned event/matcher groups,
   before/after digests, exact plan digest, drift state, and whether apply is
   permitted. Provider hook argv content is omitted.
-- `agent-hook.doctor.v1`: product status (`missing`, `legacy`, `dual`,
+- `agent-hook.doctor.v1`: product status (missing, compatibility-only, `dual`,
   `drifted`, `converged`, `unsupported`, or `unrelated`), owned counts,
-  legacy residue count, digests, policy availability, and recovery health.
+  compatibility residue count, digests, policy availability, and recovery health.
 - `agent-hook.inventory.v1`: ordered public rule metadata and effective mode;
   capability parameters and private paths are omitted.
 - `agent-hook.recovery-challenge.v1`: random challenge ID, exact product/event,
@@ -201,7 +201,7 @@ Override classes:
 
 `agent-hook setup --product <provider>` is dry-run-first. `--apply`, `--repair`,
 and `--remove` are mutually exclusive. Mutation requires an exact reviewed
-plan digest when drift, legacy, or dual ownership is present. Setup parses and
+plan digest when drift, compatibility, or dual ownership is present. Setup parses and
 renders all files before mutation, locks provider state, re-reads the reviewed
 before digest, writes atomically, and restores the prior bytes on partial
 failure. Symlinks, non-regular files, unsafe permissions, concurrent drift, and
@@ -210,9 +210,9 @@ malformed provider roots fail without mutation.
 Owned groups are marked and contain exactly one dispatcher command for each
 required event/matcher. Install, upgrade, repair, remove, and rollback preserve
 unrelated hooks, comments, formatting, provider metadata, and unsupported
-surface truth. Removal deletes only an exact owned representation. Legacy
+surface truth. Removal deletes only an exact owned representation. Pre-dispatch
 `agent-session activity setup` forwards to this API and cannot install a second
-managed representation. Legacy handlers are reported as `legacy` or `dual`
+managed representation. Compatibility handlers are reported as compatibility-only or `dual`
 until the reviewed migration removes them.
 
 ## Governed recovery
@@ -246,7 +246,7 @@ returns only public classifications. Active foreign writers and definite
 semantic conflicts block. Stale clean ownership may be reclaimed atomically by
 the owning coordination primitive. Dirty ownership requires governed adoption
 or exact recovery. Orphaned and unknown evidence remain visible and
-conservative. Legacy state without broker evidence uses a documented bounded
+conservative. Compatibility state without broker evidence uses a documented bounded
 compatibility TTL, never the historical eight-hour value as the primary
 decision.
 

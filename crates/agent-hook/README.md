@@ -43,9 +43,9 @@ printf '%s' "$PROVIDER_HOOK_JSON" | agent-hook dispatch --product codex
 agent-hook completion zsh
 ```
 
-Apply requires the preview `plan_digest` when legacy or drifted managed state
+Apply requires the preview `plan_digest` when compatibility or drifted managed state
 is present. Setup preserves unrelated hooks and provider metadata, migrates
-recognized legacy `agent-session`/runtime-kit handlers, and removes only exact
+recognized pre-dispatch `agent-session`/runtime-kit handlers, and removes only exact
 owned dispatcher entries. Hermes policy can be validated and inspected, but
 native setup truthfully reports `unsupported` until Hermes exposes a compatible
 runner.
@@ -60,4 +60,3 @@ placed in persistent config.
 
 See the [v1 contract](docs/specs/agent-hook-v1.md) for schemas, limits,
 aggregation, setup ownership, liveness, and recovery invariants.
-
