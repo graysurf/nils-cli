@@ -367,6 +367,17 @@ repository-level uncertainty is `unknown`/`potential` and advisory. Only a defin
 `semantic_conflict` is ignored and never upgrades or downgrades the derived
 classification.
 
+For a managed current principal, both coordination capabilities honor the
+durable session mode. `advisory` downgrades coordination blocks to warnings,
+`enforce` retains typed denial, and `off` does not participate. A downgrade is
+accepted only when the private session record matches the current session and
+runtime incarnation, its mode matches the fresh broker projection when one is
+available, and any exported `AGENT_SESSION_COORDINATION_MODE` value agrees.
+The environment value is a consistency hint, never downgrade authority by
+itself. Missing, malformed, stale, or mismatched authority retains the
+fail-closed/enforce behavior; a trusted durable advisory/off record may still
+apply its non-denying failure posture when the registry is unavailable.
+
 ## Exit codes
 
 - `0`: successful operation or provider allow/warn/context result.

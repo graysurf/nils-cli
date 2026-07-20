@@ -329,6 +329,7 @@ fn run_dispatch(
         if evaluator::needs_coordination(&loaded, &request, args.shadow, &grant.rules) {
             match liveness::load_snapshot() {
                 Ok(snapshot) => snapshot,
+                Err(_) if liveness::tolerates_coordination_failure() => None,
                 Err(error) => return emit_dispatch_error(args.format, &error, Some(&request)),
             }
         } else {

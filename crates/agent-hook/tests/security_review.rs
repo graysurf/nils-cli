@@ -419,6 +419,72 @@ fn fresh_sidecar_heartbeat_outweighs_an_old_registry_projection_timestamp() {
 }
 
 #[test]
+fn forged_advisory_environment_cannot_downgrade_untrusted_coordination_state() {
+    let fixture = Fixture::new(&owner_policy());
+    let coordination = fixture.session_state.join("coordination");
+    fs::create_dir_all(&coordination).expect("coordination directory");
+    let registry = coordination.join("registry.json");
+    fs::write(&registry, b"{").expect("malformed registry");
+    Fixture::set_private(&registry);
+    let payload = json!({
+        "hook_event_name":"PreToolUse",
+        "tool_name":"Write",
+        "cwd":fixture.root,
+        "tool_input":{"path":fixture.root.join("file.txt")}
+    })
+    .to_string();
+
+    for mode in ["advisory", "off"] {
+        let output = fixture.run_with_env(
+            &["dispatch", "--product", "codex", "--format", "json"],
+            Some(&payload),
+            &[
+                ("AGENT_SESSION_ID", "forged"),
+                ("AGENT_SESSION_RUNTIME_ID", "forged-incarnation"),
+                ("AGENT_SESSION_COORDINATION_MODE", mode),
+            ],
+        );
+        assert_eq!(
+            output.code,
+            65,
+            "mode={mode} stdout={}",
+            output.stdout_text()
+        );
+        assert_eq!(
+            output.stdout_json()["error"]["code"],
+            "coordination-invalid"
+        );
+    }
+
+    let session = fixture.session_state.join("sessions/trusted");
+    fs::create_dir_all(&session).expect("session directory");
+    let record = session.join("session.json");
+    fs::write(
+        &record,
+        serde_json::to_vec(&json!({
+            "schema_version":"agent-session.session.v1",
+            "id":"trusted",
+            "coordination_mode":"advisory",
+            "runtime":{"launch_id":"trusted-incarnation"}
+        }))
+        .expect("session JSON"),
+    )
+    .expect("session record");
+    Fixture::set_private(&record);
+    let trusted = fixture.run_with_env(
+        &["dispatch", "--product", "codex", "--format", "json"],
+        Some(&payload),
+        &[
+            ("AGENT_SESSION_ID", "trusted"),
+            ("AGENT_SESSION_RUNTIME_ID", "trusted-incarnation"),
+            ("AGENT_SESSION_COORDINATION_MODE", "advisory"),
+        ],
+    );
+    assert_eq!(trusted.code, 0, "stdout={}", trusted.stdout_text());
+    assert_eq!(trusted.stdout_json()["data"]["action"], "warn");
+}
+
+#[test]
 fn inventory_and_runtime_share_provider_specific_effective_modes() {
     let policy = r#"schema_version = "agent-hook.policy.v1"
 bundle_id = "runtime-kit"

@@ -1080,6 +1080,8 @@ fn activity_events_are_runtime_bound_private_and_deterministic() {
             &tmux_arg,
             "--agent-bin",
             &codex_arg,
+            "--coordination-mode",
+            "enforce",
             "--paste-delay-ms",
             "0",
             "--format",
@@ -1125,6 +1127,11 @@ fn activity_events_are_runtime_bound_private_and_deterministic() {
         new_session
             .windows(2)
             .any(|pair| { pair == ["-e", &format!("AGENT_SESSION_RUNTIME_ID={runtime_id}")] })
+    );
+    assert!(
+        new_session
+            .windows(2)
+            .any(|pair| { pair == ["-e", "AGENT_SESSION_COORDINATION_MODE=enforce"] })
     );
     let inherited_path = std::env::var("PATH").expect("test PATH");
     assert!(
@@ -3232,6 +3239,8 @@ fn start_creates_session_state_without_printing_prompt() {
             format!("AGENT_SESSION_STATE_DIR={}", state_dir.display()),
             "-e".to_string(),
             format!("AGENT_SESSION_RUNTIME_ID={runtime_id}"),
+            "-e".to_string(),
+            "AGENT_SESSION_COORDINATION_MODE=advisory".to_string(),
             "-e".to_string(),
             format!(
                 "AGENT_SESSION_CAPABILITY_FILE={}",
@@ -7516,6 +7525,8 @@ fn resume_recreates_tmux_runtime_from_exact_provider_identity() {
             format!("AGENT_SESSION_STATE_DIR={}", state_dir.display()),
             "-e".to_string(),
             format!("AGENT_SESSION_RUNTIME_ID={runtime_id}"),
+            "-e".to_string(),
+            "AGENT_SESSION_COORDINATION_MODE=advisory".to_string(),
             "-e".to_string(),
             format!(
                 "AGENT_SESSION_CAPABILITY_FILE={}",

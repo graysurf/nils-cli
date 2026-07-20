@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use nils_common::coordination_projection::{self, RegistryProjection};
+use nils_common::coordination_projection::{self, CoordinationMode, RegistryProjection};
 use serde::{Deserialize, Serialize};
 
 use crate::error::HookError;
@@ -62,6 +62,53 @@ pub fn load_snapshot() -> Result<Option<Snapshot>, HookError> {
         })
 }
 
+fn runtime_mode_hint() -> Option<CoordinationMode> {
+    match std::env::var("AGENT_SESSION_COORDINATION_MODE")
+        .ok()?
+        .as_str()
+    {
+        "advisory" => Some(CoordinationMode::Advisory),
+        "enforce" => Some(CoordinationMode::Enforce),
+        "off" => Some(CoordinationMode::Off),
+        _ => None,
+    }
+}
+
+pub fn tolerates_coordination_failure() -> bool {
+    let Ok(state_root) = agent_session_state_root() else {
+        return false;
+    };
+    matches!(
+        trusted_runtime_mode(&state_root, None),
+        Some(CoordinationMode::Advisory | CoordinationMode::Off)
+    )
+}
+
+pub fn semantic_conflict_action(
+    conflict: Option<SemanticConflict>,
+    snapshot: Option<&Snapshot>,
+) -> DecisionAction {
+    match effective_mode(snapshot) {
+        Some(CoordinationMode::Off) => DecisionAction::Allow,
+        Some(CoordinationMode::Advisory) => match conflict {
+            Some(SemanticConflict::Clear) => DecisionAction::Allow,
+            Some(
+                SemanticConflict::Definite
+                | SemanticConflict::Potential
+                | SemanticConflict::Unknown,
+            )
+            | None => DecisionAction::Warn,
+        },
+        Some(CoordinationMode::Enforce) | None => match conflict {
+            Some(SemanticConflict::Definite) => DecisionAction::Block,
+            Some(SemanticConflict::Potential | SemanticConflict::Unknown) | None => {
+                DecisionAction::Warn
+            }
+            Some(SemanticConflict::Clear) => DecisionAction::Allow,
+        },
+    }
+}
+
 pub fn derive_semantic_conflict(
     request: &NormalizedRequest,
     snapshot: Option<&Snapshot>,
@@ -77,18 +124,12 @@ pub fn derive_semantic_conflict(
         return SemanticConflict::Unknown;
     };
     let now = now_epoch();
-    let Some(current_broker) = registry.brokers.get(&current_session).filter(|broker| {
-        broker.session_id == current_session
-            && broker.state == "ready"
-            && coordination_projection::heartbeat_fresh(
-                &snapshot.state_root,
-                &current_session,
-                &broker.incarnation,
-                now,
-            )
-    }) else {
+    let Some(current_broker) = current_broker(snapshot, &current_session, now) else {
         return SemanticConflict::Unknown;
     };
+    if effective_mode(Some(snapshot)) == Some(CoordinationMode::Off) {
+        return SemanticConflict::Clear;
+    }
     let mut own_claims = registry.claims.iter().filter(|claim| {
         claim.session_id == current_session
             && claim.session_incarnation == current_broker.incarnation
@@ -109,20 +150,22 @@ pub fn derive_semantic_conflict(
             && claim.state == "active"
             && claim.expires_at_epoch >= now
     }) {
-        let peer_fresh = registry
-            .brokers
-            .get(&peer.session_id)
-            .is_some_and(|broker| {
-                broker.session_id == peer.session_id
-                    && broker.incarnation == peer.session_incarnation
-                    && broker.state == "ready"
-                    && coordination_projection::heartbeat_fresh(
-                        &snapshot.state_root,
-                        &peer.session_id,
-                        &broker.incarnation,
-                        now,
-                    )
-            });
+        let Some(peer_broker) = registry.brokers.get(&peer.session_id) else {
+            incomplete = true;
+            continue;
+        };
+        if peer_broker.coordination_mode == CoordinationMode::Off {
+            continue;
+        }
+        let peer_fresh = peer_broker.session_id == peer.session_id
+            && peer_broker.incarnation == peer.session_incarnation
+            && peer_broker.state == "ready"
+            && coordination_projection::heartbeat_fresh(
+                &snapshot.state_root,
+                &peer.session_id,
+                &peer_broker.incarnation,
+                now,
+            );
         if !peer_fresh {
             incomplete = true;
             continue;
@@ -159,32 +202,51 @@ pub fn classify(
     legacy_ttl_seconds: u64,
     snapshot: Option<&Snapshot>,
 ) -> OwnerLiveness {
-    if matches!(request.semantic_conflict, Some(SemanticConflict::Definite)) {
+    let mode = effective_mode(snapshot);
+    if mode == Some(CoordinationMode::Off) {
         return result(
+            LivenessClass::Unclaimed,
+            "clear",
+            DecisionAction::Allow,
+            "coordination-off",
+            Some(false),
+        );
+    }
+    let outcome = if matches!(request.semantic_conflict, Some(SemanticConflict::Definite)) {
+        result(
             LivenessClass::Active,
             "definite",
             DecisionAction::Block,
             "semantic-conflict-definite",
             None,
-        );
-    }
-    let potential =
-        matches!(request.semantic_conflict, Some(SemanticConflict::Potential)).then(|| {
-            result(
-                LivenessClass::Unknown,
-                "potential",
-                DecisionAction::Warn,
-                "semantic-conflict-potential",
-                None,
-            )
-        });
+        )
+    } else {
+        let potential = matches!(request.semantic_conflict, Some(SemanticConflict::Potential))
+            .then(|| {
+                result(
+                    LivenessClass::Unknown,
+                    "potential",
+                    DecisionAction::Warn,
+                    "semantic-conflict-potential",
+                    None,
+                )
+            });
 
-    let path_outcomes = request.binding_roots.iter().map(|root| match snapshot {
-        Some(snapshot) => classify_registry_root(request, root, snapshot),
-        None => legacy_classify(root, legacy_ttl_seconds),
-    });
-    strongest_outcome(potential.into_iter().chain(path_outcomes))
-        .unwrap_or_else(|| unknown("owner-target-unavailable"))
+        let path_outcomes = request.binding_roots.iter().map(|root| match snapshot {
+            Some(snapshot) => classify_registry_root(request, root, snapshot),
+            None => legacy_classify(root, legacy_ttl_seconds),
+        });
+        strongest_outcome(potential.into_iter().chain(path_outcomes))
+            .unwrap_or_else(|| unknown("owner-target-unavailable"))
+    };
+    apply_mode(outcome, mode)
+}
+
+fn apply_mode(mut outcome: OwnerLiveness, mode: Option<CoordinationMode>) -> OwnerLiveness {
+    if mode == Some(CoordinationMode::Advisory) && outcome.action == DecisionAction::Block {
+        outcome.action = DecisionAction::Warn;
+    }
+    outcome
 }
 
 fn strongest_outcome(outcomes: impl Iterator<Item = OwnerLiveness>) -> Option<OwnerLiveness> {
@@ -230,6 +292,11 @@ fn classify_registry_root(
         claim.state == "active"
             && claim.expires_at_epoch >= now
             && claim.worktrees.iter().any(|value| value == &fingerprint)
+            && snapshot
+                .registry
+                .brokers
+                .get(&claim.session_id)
+                .is_none_or(|broker| broker.coordination_mode != CoordinationMode::Off)
     });
     let Some(claim) = matching.next() else {
         return result(
@@ -297,6 +364,66 @@ fn classify_registry_root(
             )
         }
     }
+}
+
+fn effective_mode(snapshot: Option<&Snapshot>) -> Option<CoordinationMode> {
+    let state_root = snapshot
+        .map(|snapshot| snapshot.state_root.clone())
+        .or_else(|| agent_session_state_root().ok())?;
+    let broker = snapshot.and_then(|snapshot| {
+        let current_session = std::env::var("AGENT_SESSION_ID")
+            .ok()
+            .filter(|value| !value.is_empty())?;
+        current_broker(snapshot, &current_session, now_epoch())
+    });
+    trusted_runtime_mode(&state_root, broker)
+}
+
+fn trusted_runtime_mode(
+    state_root: &Path,
+    broker: Option<&coordination_projection::BrokerProjection>,
+) -> Option<CoordinationMode> {
+    let session_id = std::env::var("AGENT_SESSION_ID")
+        .ok()
+        .filter(|value| !value.is_empty())?;
+    let incarnation = std::env::var("AGENT_SESSION_RUNTIME_ID")
+        .ok()
+        .filter(|value| !value.is_empty())?;
+    if broker
+        .is_some_and(|broker| broker.session_id != session_id || broker.incarnation != incarnation)
+    {
+        return None;
+    }
+    let mode =
+        coordination_projection::session_coordination_mode(state_root, &session_id, &incarnation)
+            .ok()?;
+    if broker.is_some_and(|broker| broker.coordination_mode != mode)
+        || runtime_mode_hint().is_some_and(|hint| hint != mode)
+    {
+        return None;
+    }
+    Some(mode)
+}
+
+fn current_broker<'a>(
+    snapshot: &'a Snapshot,
+    current_session: &str,
+    now: i64,
+) -> Option<&'a coordination_projection::BrokerProjection> {
+    snapshot
+        .registry
+        .brokers
+        .get(current_session)
+        .filter(|broker| {
+            broker.session_id == current_session
+                && broker.state == "ready"
+                && coordination_projection::heartbeat_fresh(
+                    &snapshot.state_root,
+                    current_session,
+                    &broker.incarnation,
+                    now,
+                )
+        })
 }
 
 fn legacy_classify(checkout: &Path, legacy_ttl_seconds: u64) -> OwnerLiveness {

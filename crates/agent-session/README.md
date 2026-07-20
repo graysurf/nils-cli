@@ -28,8 +28,11 @@ agent-session activity doctor --format json
 agent-session activity setup --agent codex --dry-run
 agent-session activity setup --agent codex --repair --dry-run
 agent-session activity setup --agent codex --repair --expected-preview-digest sha256:<reviewed-plan-digest>
-agent-session work-context claim --session <id> --file context.json --idempotency-key <key>
-agent-session work-context check --session <id>
+agent-session work-context status --format json
+agent-session work-context set --tier L2 --issue 123 --summary "Implement the tracked fix"
+agent-session work-context advise --format json
+agent-session work-context acknowledge --for 30m
+agent-session work-context clear
 agent-session message inbox --session <id>
 printf '%s' "$AGENT_SESSION_TOKEN" | agent-session serve --bind 127.0.0.1:8781 --token-stdin
 agent-session command <id>
@@ -83,6 +86,16 @@ after readiness discards it.
 
 ## Session coordination
 
+Session coordination is collision awareness by default, not a prerequisite for
+agent work. `start`, `run`, provider import, and HTTP create accept
+`--coordination-mode advisory|enforce|off`; `advisory` is the default and is
+also the compatibility default for older session records. Managed broker
+liveness automatically publishes privacy-safe presence. The default hook
+consumer can therefore warn about the same worktree, provider/task/path
+overlap, or the same repository in another worktree without requiring a claim.
+`off` opts out of these warnings. Processes launched directly outside
+`agent-session` have no managed identity and do not participate.
+
 Every new managed runtime receives a private per-incarnation capability through
 the 0600 file named by `AGENT_SESSION_CAPABILITY_FILE`. Session, incarnation,
 claim, operation, and message identifiers are selectors and revision fences,
@@ -96,11 +109,25 @@ recovery remains non-ready until reconciliation and its idempotency receipt are
 committed atomically. Delete revokes the capability and releases active
 coordination state before removing the session.
 
-`work-context claim|show|check|renew|release` manages an authenticated
+`work-context status|set|clear|advise|acknowledge` is the normal self-targeting
+surface. It infers the session ID, capability, incarnation, checkout origin,
+worktree fingerprint, revision, and idempotent replacement behavior from the
+managed runtime. `set` accepts a concise summary plus optional tier,
+repository-relative paths, issue/PR numbers, and plan references; it does not
+require a hand-authored private JSON file. Context is optional in advisory
+mode, automatically renewed while the broker remains live, and released with
+the broker. `acknowledge` suppresses only the exact overlap most recently
+observed by that session, for at most eight hours; a changed peer,
+incarnation, reason, repository, or availability warns again. Moving between
+targets covered by the same known overlap does not create warning spam. It
+never hides overlap from `advise` output.
+
+The raw `work-context claim|show|check|renew|release` family remains available
+for compatibility and explicit enforce workflows. It manages an authenticated
 30-minute structured claim. Claims contain canonical repositories, private-keyed
 worktree fingerprints, provider and plan references, and closed
 `repository|path-exact|path-prefix` scopes. `check` is advisory;
-`claim` evaluates and acquires under one bounded registry lock, so concurrent
+Raw `claim` evaluates and acquires under one bounded registry lock, so concurrent
 definite contenders cannot both succeed. `work-context
 admit|complete|reconcile` binds covered filesystem/provider mutation targets to
 an execution token, exact activity/descendant evidence, and the persisted
@@ -143,9 +170,9 @@ capability names the sender; request JSON has no independent `to` selector.
 Claim/check clients use `agent-session.work-context-input.v1`, admission clients
 use `agent-session.operation-targets.v1`, and the exact checkout, descendant,
 operation-reconcile, and broker-recovery shapes are frozen in the linked spec.
-List and glance add only claim state/id/expiry, unread
-count, conflict severity, and coordination availability fields; the existing
-`cwd` field remains unchanged.
+List and glance add coordination mode plus claim state/id/expiry, unread count,
+conflict severity, and coordination availability fields; the existing `cwd`
+field remains unchanged.
 
 ## Durable turn state
 

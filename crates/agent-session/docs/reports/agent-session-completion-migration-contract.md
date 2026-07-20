@@ -22,6 +22,10 @@
 | `agent-session` | `crates/agent-session/src/cli.rs` | root flags + top-level subcommands | `--state-dir`, `--host`, `-h`, `-V` |
 | `agent-session start` | `crates/agent-session/src/cli.rs` | agent enum, path hints, format enum, prompt flags | default interactive handoff path |
 | `agent-session run` | `crates/agent-session/src/cli.rs` | agent enum, path hints, format enum, prompt flags | one-shot task path |
+| `agent-session work-context` | `crates/agent-session/src/cli.rs` | self-targeting advisory commands plus raw enforce primitives | managed coordination and compatibility path |
+| `agent-session work-context set` | `crates/agent-session/src/cli.rs` | tier, repository, path, issue/PR, plan reference, and format flags | optional public context without a private JSON file |
+| `agent-session work-context advise` | `crates/agent-session/src/cli.rs` | optional operation-targets path and format enum | privacy-safe overlap evaluation |
+| `agent-session work-context acknowledge` | `crates/agent-session/src/cli.rs` | bounded duration and format enum | warning suppression escape hatch |
 | `agent-session list` | `crates/agent-session/src/cli.rs` | format enum | service-readable inventory |
 | `agent-session command` | `crates/agent-session/src/cli.rs` | session id + format enum | prints attach commands |
 | `agent-session attach` | `crates/agent-session/src/cli.rs` | session id + tmux binary path hint | local tmux attach |
@@ -41,6 +45,7 @@ Checklist:
 | argument or flag | provider type | source location | context-aware behavior | tests |
 | --- | --- | --- | --- | --- |
 | `--agent` | `ValueEnum` | `crates/agent-session/src/cli.rs` | static `codex`, `claude` values | completion freshness/flag parity |
+| `--coordination-mode` | `ValueEnum` | `crates/agent-session/src/cli.rs` | static `advisory`, `enforce`, `off` values | completion freshness/flag parity |
 | `--format` | `ValueEnum` | `nils_common::cli_contract::OutputFormat` | static `text`, `json` values | completion freshness/flag parity |
 | `completion <shell>` | `ValueEnum` | `crates/agent-session/src/completion.rs` | static `bash`, `zsh` values | completion freshness/flag parity |
 | path flags | `ValueHint` | `crates/agent-session/src/cli.rs` | shell path completion | completion freshness/flag parity |

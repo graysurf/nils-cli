@@ -41,6 +41,9 @@ _arguments "${_arguments_options[@]}" : \
 '--tmux-bin=[tmux binary override]:PATH:_files' \
 '--agent-bin=[Agent binary override]:PATH:_files' \
 '*--agent-arg=[Extra argument passed to the underlying agent command]:ARG:_default' \
+'--coordination-mode=[Session collision coordination mode]:COORDINATION_MODE:((advisory\:"Warn about overlapping managed sessions without blocking work"
+enforce\:"Require authenticated claims and mutation admission leases"
+off\:"Disable agent-session collision warnings and admission"))' \
 '--paste-delay-ms=[Delay before pasting the initial prompt into the tmux pane]:PASTE_DELAY_MS:_default' \
 '--format=[Output format]:FORMAT:((text\:"Human-readable text output (default)"
 json\:"Single-record JSON envelope (snake_case)"))' \
@@ -62,6 +65,9 @@ _arguments "${_arguments_options[@]}" : \
 '--tmux-bin=[tmux binary override]:PATH:_files' \
 '--agent-bin=[Agent binary override]:PATH:_files' \
 '*--agent-arg=[Extra argument passed to the underlying agent command]:ARG:_default' \
+'--coordination-mode=[Session collision coordination mode]:COORDINATION_MODE:((advisory\:"Warn about overlapping managed sessions without blocking work"
+enforce\:"Require authenticated claims and mutation admission leases"
+off\:"Disable agent-session collision warnings and admission"))' \
 '--format=[Output format]:FORMAT:((text\:"Human-readable text output (default)"
 json\:"Single-record JSON envelope (snake_case)"))' \
 '--state-dir=[State directory. Defaults to AGENT_SESSION_STATE_DIR, XDG_STATE_HOME/agent-session, or ~/.local/state/agent-session]:PATH:_files -/' \
@@ -262,7 +268,67 @@ _arguments "${_arguments_options[@]}" : \
         (( CURRENT += 1 ))
         curcontext="${curcontext%:*:*}:agent-session-work-context-command-$line[1]:"
         case $line[1] in
-            (claim)
+            (status)
+_arguments "${_arguments_options[@]}" : \
+'--format=[]:FORMAT:((text\:"Human-readable text output (default)"
+json\:"Single-record JSON envelope (snake_case)"))' \
+'--state-dir=[State directory. Defaults to AGENT_SESSION_STATE_DIR, XDG_STATE_HOME/agent-session, or ~/.local/state/agent-session]:PATH:_files -/' \
+'--host=[Hostname used in generated ssh attach commands]:HOST:_default' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+&& ret=0
+;;
+(set)
+_arguments "${_arguments_options[@]}" : \
+'--summary=[Short public description of the current work]:TEXT:_default' \
+'--intent=[Work intent label]:INTENT:_default' \
+'--tier=[Tracking tier (L0, L1, L2, or L3)]:TIER:_default' \
+'--repository=[Canonical owner/repository. Defaults to the current checkout'\''s origin]:OWNER/REPO:_default' \
+'*--path=[Repository-relative exact or prefix path to declare. Repeatable]:PATH:_default' \
+'*--issue=[Issue number in the inferred repository. Repeatable]:NUMBER:_default' \
+'*--pr=[Pull/merge request number in the inferred repository. Repeatable]:NUMBER:_default' \
+'*--plan-ref=[Public plan reference. Repeatable]:REF:_default' \
+'--format=[]:FORMAT:((text\:"Human-readable text output (default)"
+json\:"Single-record JSON envelope (snake_case)"))' \
+'--state-dir=[State directory. Defaults to AGENT_SESSION_STATE_DIR, XDG_STATE_HOME/agent-session, or ~/.local/state/agent-session]:PATH:_files -/' \
+'--host=[Hostname used in generated ssh attach commands]:HOST:_default' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+&& ret=0
+;;
+(clear)
+_arguments "${_arguments_options[@]}" : \
+'--format=[]:FORMAT:((text\:"Human-readable text output (default)"
+json\:"Single-record JSON envelope (snake_case)"))' \
+'--state-dir=[State directory. Defaults to AGENT_SESSION_STATE_DIR, XDG_STATE_HOME/agent-session, or ~/.local/state/agent-session]:PATH:_files -/' \
+'--host=[Hostname used in generated ssh attach commands]:HOST:_default' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+&& ret=0
+;;
+(advise)
+_arguments "${_arguments_options[@]}" : \
+'--targets-file=[Optional operation-targets JSON used to refine this advisory check]:PATH:_files' \
+'--format=[]:FORMAT:((text\:"Human-readable text output (default)"
+json\:"Single-record JSON envelope (snake_case)"))' \
+'--state-dir=[State directory. Defaults to AGENT_SESSION_STATE_DIR, XDG_STATE_HOME/agent-session, or ~/.local/state/agent-session]:PATH:_files -/' \
+'--host=[Hostname used in generated ssh attach commands]:HOST:_default' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+&& ret=0
+;;
+(acknowledge)
+_arguments "${_arguments_options[@]}" : \
+'--for=[Bounded suppression duration such as 30m or 2h (maximum 8h)]:DURATION:_default' \
+'--format=[]:FORMAT:((text\:"Human-readable text output (default)"
+json\:"Single-record JSON envelope (snake_case)"))' \
+'--state-dir=[State directory. Defaults to AGENT_SESSION_STATE_DIR, XDG_STATE_HOME/agent-session, or ~/.local/state/agent-session]:PATH:_files -/' \
+'--host=[Hostname used in generated ssh attach commands]:HOST:_default' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+&& ret=0
+;;
+(claim)
 _arguments "${_arguments_options[@]}" : \
 '--session=[Managed session id that owns the claim]:SESSION:_default' \
 '--file=[]:PATH:_files' \
@@ -852,6 +918,11 @@ _agent-session__subcmd__start_commands() {
 (( $+functions[_agent-session__subcmd__work-context_commands] )) ||
 _agent-session__subcmd__work-context_commands() {
     local commands; commands=(
+'status:Show automatic presence, mode, and the optional declared context for this session' \
+'set:Declare or replace this session'\''s optional context using inferred identity and repository data' \
+'clear:Clear this session'\''s optional declared context' \
+'advise:Evaluate privacy-safe managed-session overlap without blocking work' \
+'acknowledge:Suppress repeated advisory warnings for a bounded period' \
 'claim:Atomically evaluate conflicts and acquire a structured work claim' \
 'show:Show the authenticated session'\''s current public work context' \
 'check:Evaluate a candidate or the authenticated session without acquiring' \
@@ -863,10 +934,20 @@ _agent-session__subcmd__work-context_commands() {
     )
     _describe -t commands 'agent-session work-context commands' commands "$@"
 }
+(( $+functions[_agent-session__subcmd__work-context__subcmd__acknowledge_commands] )) ||
+_agent-session__subcmd__work-context__subcmd__acknowledge_commands() {
+    local commands; commands=()
+    _describe -t commands 'agent-session work-context acknowledge commands' commands "$@"
+}
 (( $+functions[_agent-session__subcmd__work-context__subcmd__admit_commands] )) ||
 _agent-session__subcmd__work-context__subcmd__admit_commands() {
     local commands; commands=()
     _describe -t commands 'agent-session work-context admit commands' commands "$@"
+}
+(( $+functions[_agent-session__subcmd__work-context__subcmd__advise_commands] )) ||
+_agent-session__subcmd__work-context__subcmd__advise_commands() {
+    local commands; commands=()
+    _describe -t commands 'agent-session work-context advise commands' commands "$@"
 }
 (( $+functions[_agent-session__subcmd__work-context__subcmd__check_commands] )) ||
 _agent-session__subcmd__work-context__subcmd__check_commands() {
@@ -877,6 +958,11 @@ _agent-session__subcmd__work-context__subcmd__check_commands() {
 _agent-session__subcmd__work-context__subcmd__claim_commands() {
     local commands; commands=()
     _describe -t commands 'agent-session work-context claim commands' commands "$@"
+}
+(( $+functions[_agent-session__subcmd__work-context__subcmd__clear_commands] )) ||
+_agent-session__subcmd__work-context__subcmd__clear_commands() {
+    local commands; commands=()
+    _describe -t commands 'agent-session work-context clear commands' commands "$@"
 }
 (( $+functions[_agent-session__subcmd__work-context__subcmd__complete_commands] )) ||
 _agent-session__subcmd__work-context__subcmd__complete_commands() {
@@ -898,10 +984,20 @@ _agent-session__subcmd__work-context__subcmd__renew_commands() {
     local commands; commands=()
     _describe -t commands 'agent-session work-context renew commands' commands "$@"
 }
+(( $+functions[_agent-session__subcmd__work-context__subcmd__set_commands] )) ||
+_agent-session__subcmd__work-context__subcmd__set_commands() {
+    local commands; commands=()
+    _describe -t commands 'agent-session work-context set commands' commands "$@"
+}
 (( $+functions[_agent-session__subcmd__work-context__subcmd__show_commands] )) ||
 _agent-session__subcmd__work-context__subcmd__show_commands() {
     local commands; commands=()
     _describe -t commands 'agent-session work-context show commands' commands "$@"
+}
+(( $+functions[_agent-session__subcmd__work-context__subcmd__status_commands] )) ||
+_agent-session__subcmd__work-context__subcmd__status_commands() {
+    local commands; commands=()
+    _describe -t commands 'agent-session work-context status commands' commands "$@"
 }
 
 if [ "$funcstack[1]" = "_agent-session" ]; then

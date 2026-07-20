@@ -13,7 +13,9 @@ pub const REGISTRY_VERSION: &str = "agent-session.coordination-registry.v1";
 pub const CLAIM_VERSION: &str = "agent-session.work-context.v1";
 const MAX_REGISTRY_BYTES: u64 = 68 * 1024 * 1024;
 const MAX_HEARTBEAT_BYTES: u64 = 256;
+const MAX_SESSION_BYTES: u64 = 2 * 1024 * 1024;
 const HEARTBEAT_FRESH_SECONDS: i64 = 30;
+const SESSION_VERSION: &str = "agent-session.session.v1";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ReadError {
@@ -39,7 +41,32 @@ pub struct BrokerProjection {
     pub incarnation: String,
     pub state: String,
     #[serde(default)]
+    pub coordination_mode: CoordinationMode,
+    #[serde(default)]
     pub heartbeat_epoch: i64,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum CoordinationMode {
+    #[default]
+    Advisory,
+    Enforce,
+    Off,
+}
+
+#[derive(Debug, Deserialize)]
+struct SessionProjection {
+    schema_version: String,
+    id: String,
+    #[serde(default)]
+    coordination_mode: CoordinationMode,
+    runtime: Option<RuntimeProjection>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RuntimeProjection {
+    launch_id: String,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -122,6 +149,44 @@ pub fn heartbeat_fresh(
         return false;
     };
     (0..=HEARTBEAT_FRESH_SECONDS).contains(&now_epoch.saturating_sub(observed_epoch))
+}
+
+pub fn session_coordination_mode(
+    state_dir: &Path,
+    session_id: &str,
+    incarnation: &str,
+) -> Result<CoordinationMode, ReadError> {
+    if session_id.is_empty()
+        || incarnation.is_empty()
+        || !session_id
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_')
+    {
+        return Err(ReadError::Invalid);
+    }
+    let path = state_dir
+        .join("sessions")
+        .join(session_id)
+        .join("session.json");
+    let bytes = read_private(&path, MAX_SESSION_BYTES).map_err(|error| {
+        if error.kind() == io::ErrorKind::PermissionDenied {
+            ReadError::Untrusted
+        } else {
+            ReadError::Unavailable
+        }
+    })?;
+    let projection: SessionProjection =
+        serde_json::from_slice(&bytes).map_err(|_| ReadError::Invalid)?;
+    if projection.schema_version != SESSION_VERSION
+        || projection.id != session_id
+        || projection
+            .runtime
+            .as_ref()
+            .is_none_or(|runtime| runtime.launch_id != incarnation)
+    {
+        return Err(ReadError::Invalid);
+    }
+    Ok(projection.coordination_mode)
 }
 
 pub fn heartbeat_path(state_dir: &Path, session_id: &str) -> PathBuf {

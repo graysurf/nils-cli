@@ -225,6 +225,7 @@ pub(crate) fn provision(context: &CliContext, record: &SessionRecord) -> Result<
         BrokerRecord {
             session_id: record.id.clone(),
             incarnation,
+            coordination_mode: record.coordination_mode,
             capability_digest: digest_bytes(token.as_bytes()),
             generation,
             state: "starting".to_string(),
@@ -348,11 +349,35 @@ pub(crate) fn revoke(context: &CliContext, record: &SessionRecord) -> Result<(),
             operation.terminal_at_epoch = Some(now);
         }
     }
+    if let Some(current) = current_incarnation.as_deref() {
+        remove_advisory_state_for_incarnation(&mut locked.registry, &record.id, current);
+    }
     locked.save()?;
     if let Some(current) = current_incarnation.as_deref() {
         let _ = fs::remove_file(capability_path(context, &record.id, current));
     }
     Ok(())
+}
+
+fn remove_advisory_state_for_incarnation(
+    registry: &mut super::Registry,
+    session_id: &str,
+    session_incarnation: &str,
+) {
+    if registry
+        .advisory_acknowledgements
+        .get(session_id)
+        .is_some_and(|acknowledgement| acknowledgement.session_incarnation == session_incarnation)
+    {
+        registry.advisory_acknowledgements.remove(session_id);
+    }
+    if registry
+        .advisory_observations
+        .get(session_id)
+        .is_some_and(|observation| observation.session_incarnation == session_incarnation)
+    {
+        registry.advisory_observations.remove(session_id);
+    }
 }
 
 pub(crate) fn stop(context: &CliContext, args: BrokerStopArgs) -> Result<Value, CliError> {
@@ -1069,5 +1094,35 @@ mod tests {
             ])
             .is_ok()
         );
+    }
+
+    #[test]
+    fn stale_revoke_preserves_replacement_advisory_state() {
+        let mut registry = super::super::Registry::default();
+        registry.advisory_acknowledgements.insert(
+            "session".to_string(),
+            crate::coordination::advisory::AdvisoryAcknowledgement {
+                session_incarnation: "replacement".to_string(),
+                advisory_digest: "digest".to_string(),
+                expires_at: "2030-01-01T00:00:00Z".to_string(),
+                expires_at_epoch: i64::MAX,
+            },
+        );
+        registry.advisory_observations.insert(
+            "session".to_string(),
+            crate::coordination::advisory::AdvisoryObservation {
+                session_incarnation: "replacement".to_string(),
+                advisory_digest: "digest".to_string(),
+                observed_at_epoch: i64::MAX,
+            },
+        );
+
+        remove_advisory_state_for_incarnation(&mut registry, "session", "stale");
+        assert!(registry.advisory_acknowledgements.contains_key("session"));
+        assert!(registry.advisory_observations.contains_key("session"));
+
+        remove_advisory_state_for_incarnation(&mut registry, "session", "replacement");
+        assert!(!registry.advisory_acknowledgements.contains_key("session"));
+        assert!(!registry.advisory_observations.contains_key("session"));
     }
 }

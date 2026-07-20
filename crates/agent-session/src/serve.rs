@@ -2642,6 +2642,8 @@ struct MaintenanceQuery {
 #[derive(Debug, Deserialize)]
 struct CreateBody {
     agent: String,
+    #[serde(default)]
+    coordination_mode: cli::CoordinationMode,
     agent_profile: Option<String>,
     cwd: Option<String>,
     #[serde(default, deserialize_with = "deserialize_create_title")]
@@ -3609,6 +3611,7 @@ async fn create_handler(
             title,
             title_state,
             id: body.id,
+            coordination_mode: body.coordination_mode,
             tmux_bin: Some(state.tmux_bin.clone()),
             agent_bin: launch_profile
                 .as_ref()
@@ -3675,6 +3678,7 @@ async fn create_handler(
             .as_ref()
             .map(|profile| profile.agent_bin.clone()),
         agent_args: body.agent_args,
+        coordination_mode: body.coordination_mode,
         paste_delay_ms: cli::DEFAULT_PASTE_DELAY_MS,
         format: nils_common::cli_contract::OutputFormat::Json,
     };
@@ -19115,6 +19119,7 @@ exit 0
             id: id.to_string(),
             agent: "codex".to_string(),
             mode: "interactive".to_string(),
+            coordination_mode: crate::cli::CoordinationMode::Advisory,
             title: None,
             title_state: None,
             title_revision: 0,

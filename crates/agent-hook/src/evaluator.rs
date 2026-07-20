@@ -17,7 +17,7 @@ use crate::error::HookError;
 use crate::liveness;
 use crate::model::{
     Capability, DECISION_VERSION, DecisionAction, DecisionReason, FailurePosture, LoadedPolicy,
-    NormalizedDecision, NormalizedRequest, Product, RuleMode, SemanticConflict, ShadowObservation,
+    NormalizedDecision, NormalizedRequest, Product, RuleMode, ShadowObservation,
 };
 
 const MAX_AGGREGATE_CONTEXT: usize = 16 * 1024;
@@ -279,13 +279,10 @@ fn evaluate_capability(
             replacement: Some(replacement.clone()),
             provider_output: None,
         },
-        Capability::SemanticConflict { reason_code } => match request.semantic_conflict {
-            Some(SemanticConflict::Definite) => simple(DecisionAction::Block, reason_code),
-            Some(SemanticConflict::Potential | SemanticConflict::Unknown) | None => {
-                simple(DecisionAction::Warn, reason_code)
-            }
-            Some(SemanticConflict::Clear) => simple(DecisionAction::Allow, reason_code),
-        },
+        Capability::SemanticConflict { reason_code } => simple(
+            liveness::semantic_conflict_action(request.semantic_conflict, coordination),
+            reason_code,
+        ),
         Capability::OwnerLiveness {
             reason_code: _,
             legacy_ttl_seconds,

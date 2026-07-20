@@ -4,12 +4,36 @@ use crate::SessionTitleState;
 
 use clap::{Args, Parser, Subcommand, ValueEnum, ValueHint};
 use nils_common::cli_contract::OutputFormat;
+use serde::{Deserialize, Serialize};
 
 /// Default delay before pasting the initial prompt (ms). Shared by `start`'s
 /// `--paste-delay-ms` default and the serve create endpoint.
 pub const DEFAULT_PASTE_DELAY_MS: u64 = 1200;
 /// Default number of pane lines captured by `glance` (CLI and serve).
 pub const DEFAULT_GLANCE_TAIL: usize = 40;
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize, ValueEnum)]
+#[serde(rename_all = "kebab-case")]
+#[value(rename_all = "kebab-case")]
+pub enum CoordinationMode {
+    /// Warn about overlapping managed sessions without blocking work.
+    #[default]
+    Advisory,
+    /// Require authenticated claims and mutation admission leases.
+    Enforce,
+    /// Disable agent-session collision warnings and admission.
+    Off,
+}
+
+impl CoordinationMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Advisory => "advisory",
+            Self::Enforce => "enforce",
+            Self::Off => "off",
+        }
+    }
+}
 
 #[derive(Debug, Parser)]
 #[command(
@@ -163,6 +187,10 @@ pub struct StartArgs {
     #[arg(long = "agent-arg", value_name = "ARG")]
     pub agent_args: Vec<String>,
 
+    /// Session collision coordination mode.
+    #[arg(long, value_enum, default_value_t = CoordinationMode::Advisory)]
+    pub coordination_mode: CoordinationMode,
+
     /// Delay before pasting the initial prompt into the tmux pane.
     #[arg(long = "paste-delay-ms", default_value_t = DEFAULT_PASTE_DELAY_MS)]
     pub paste_delay_ms: u64,
@@ -214,6 +242,10 @@ pub struct RunArgs {
     #[arg(long = "agent-arg", value_name = "ARG")]
     pub agent_args: Vec<String>,
 
+    /// Session collision coordination mode.
+    #[arg(long, value_enum, default_value_t = CoordinationMode::Advisory)]
+    pub coordination_mode: CoordinationMode,
+
     /// Output format.
     #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
     pub format: OutputFormat,
@@ -234,6 +266,16 @@ pub struct WorkContextArgs {
 
 #[derive(Debug, Subcommand)]
 pub enum WorkContextCommand {
+    /// Show automatic presence, mode, and the optional declared context for this session.
+    Status(WorkContextStatusArgs),
+    /// Declare or replace this session's optional context using inferred identity and repository data.
+    Set(WorkContextSetArgs),
+    /// Clear this session's optional declared context.
+    Clear(WorkContextClearArgs),
+    /// Evaluate privacy-safe managed-session overlap without blocking work.
+    Advise(WorkContextAdviseArgs),
+    /// Suppress repeated advisory warnings for a bounded period.
+    Acknowledge(WorkContextAcknowledgeArgs),
     /// Atomically evaluate conflicts and acquire a structured work claim.
     Claim(WorkContextClaimArgs),
     /// Show the authenticated session's current public work context.
@@ -250,6 +292,66 @@ pub enum WorkContextCommand {
     Complete(WorkContextCompleteArgs),
     /// Reconcile a missed operation completion from bounded proof.
     Reconcile(WorkContextReconcileArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct WorkContextStatusArgs {
+    #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
+    pub format: OutputFormat,
+}
+
+#[derive(Debug, Args)]
+pub struct WorkContextSetArgs {
+    /// Short public description of the current work.
+    #[arg(long, value_name = "TEXT")]
+    pub summary: Option<String>,
+    /// Work intent label.
+    #[arg(long, default_value = "implementation")]
+    pub intent: String,
+    /// Tracking tier (L0, L1, L2, or L3).
+    #[arg(long, default_value = "L0")]
+    pub tier: String,
+    /// Canonical owner/repository. Defaults to the current checkout's origin.
+    #[arg(long, value_name = "OWNER/REPO")]
+    pub repository: Option<String>,
+    /// Repository-relative exact or prefix path to declare. Repeatable.
+    #[arg(long = "path", value_name = "PATH")]
+    pub paths: Vec<String>,
+    /// Issue number in the inferred repository. Repeatable.
+    #[arg(long, value_name = "NUMBER")]
+    pub issue: Vec<u64>,
+    /// Pull/merge request number in the inferred repository. Repeatable.
+    #[arg(long, value_name = "NUMBER")]
+    pub pr: Vec<u64>,
+    /// Public plan reference. Repeatable.
+    #[arg(long = "plan-ref", value_name = "REF")]
+    pub plan_refs: Vec<String>,
+    #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
+    pub format: OutputFormat,
+}
+
+#[derive(Debug, Args)]
+pub struct WorkContextClearArgs {
+    #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
+    pub format: OutputFormat,
+}
+
+#[derive(Debug, Args)]
+pub struct WorkContextAdviseArgs {
+    /// Optional operation-targets JSON used to refine this advisory check.
+    #[arg(long, value_name = "PATH", value_hint = ValueHint::FilePath)]
+    pub targets_file: Option<PathBuf>,
+    #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
+    pub format: OutputFormat,
+}
+
+#[derive(Debug, Args)]
+pub struct WorkContextAcknowledgeArgs {
+    /// Bounded suppression duration such as 30m or 2h (maximum 8h).
+    #[arg(long = "for", default_value = "30m", value_name = "DURATION")]
+    pub duration: String,
+    #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
+    pub format: OutputFormat,
 }
 
 #[derive(Debug, Args)]

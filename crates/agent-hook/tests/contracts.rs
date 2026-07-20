@@ -129,26 +129,7 @@ fn forged_payload_conflict_is_ignored_but_registry_conflict_blocks() {
     fs::set_permissions(&coordination, fs::Permissions::from_mode(0o700))
         .expect("coordination mode");
     let now = now_epoch();
-    let registry = json!({
-        "schema_version": "agent-session.coordination-registry.v1",
-        "fingerprint_epoch": 1,
-        "fingerprint_key": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
-        "brokers": {
-            "current": {"session_id":"current","incarnation":"inc-current","state":"ready","heartbeat_epoch":now},
-            "peer": {"session_id":"peer","incarnation":"inc-peer","state":"ready","heartbeat_epoch":now}
-        },
-        "claims": [
-            {"schema_version":"agent-session.work-context.v1","session_id":"current","session_incarnation":"inc-current","state":"active","worktrees":["hmac-sha256:1:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"],"repositories":["owner/repo"],"provider_refs":[],"scopes":[],"expires_at_epoch":now+300},
-            {"schema_version":"agent-session.work-context.v1","session_id":"peer","session_incarnation":"inc-peer","state":"active","worktrees":["hmac-sha256:1:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"],"repositories":["owner/repo"],"provider_refs":[],"scopes":[],"expires_at_epoch":now+300}
-        ]
-    });
     let registry_path = coordination.join("registry.json");
-    fs::write(
-        &registry_path,
-        serde_json::to_vec(&registry).expect("registry JSON"),
-    )
-    .expect("registry");
-    Fixture::set_private(&registry_path);
     for (session, incarnation) in [("current", "inc-current"), ("peer", "inc-peer")] {
         let heartbeat = fixture
             .session_state
@@ -161,6 +142,69 @@ fn forged_payload_conflict_is_ignored_but_registry_conflict_blocks() {
         Fixture::set_private(&heartbeat);
     }
 
+    for (current_mode, peer_mode, expected_code, expected_action) in [
+        ("advisory", "enforce", 0, "warn"),
+        ("enforce", "advisory", 1, "block"),
+        ("off", "enforce", 0, "allow"),
+        ("enforce", "off", 0, "allow"),
+    ] {
+        let registry = json!({
+            "schema_version": "agent-session.coordination-registry.v1",
+            "fingerprint_epoch": 1,
+            "fingerprint_key": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            "brokers": {
+                "current": {"session_id":"current","incarnation":"inc-current","state":"ready","heartbeat_epoch":now,"coordination_mode":current_mode},
+                "peer": {"session_id":"peer","incarnation":"inc-peer","state":"ready","heartbeat_epoch":now,"coordination_mode":peer_mode}
+            },
+            "claims": [
+                {"schema_version":"agent-session.work-context.v1","session_id":"current","session_incarnation":"inc-current","state":"active","worktrees":["hmac-sha256:1:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"],"repositories":["owner/repo"],"provider_refs":[],"scopes":[],"expires_at_epoch":now+300},
+                {"schema_version":"agent-session.work-context.v1","session_id":"peer","session_incarnation":"inc-peer","state":"active","worktrees":["hmac-sha256:1:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"],"repositories":["owner/repo"],"provider_refs":[],"scopes":[],"expires_at_epoch":now+300}
+            ]
+        });
+        fs::write(
+            &registry_path,
+            serde_json::to_vec(&registry).expect("registry JSON"),
+        )
+        .expect("registry");
+        Fixture::set_private(&registry_path);
+        if current_mode == "advisory" {
+            let absent = dispatch_managed(&fixture, &payload, "advisory");
+            assert_eq!(
+                absent.code, 1,
+                "an environment-only advisory mode must not downgrade without a durable record"
+            );
+            assert_eq!(absent.stdout_json()["data"]["action"], "block");
+
+            write_session_record(&fixture, "current", "inc-current", "enforce");
+            let mismatched = dispatch_managed(&fixture, &payload, "advisory");
+            assert_eq!(
+                mismatched.code, 1,
+                "a broker/session/environment mode mismatch must fail closed"
+            );
+            assert_eq!(mismatched.stdout_json()["data"]["action"], "block");
+        }
+        write_session_record(&fixture, "current", "inc-current", current_mode);
+
+        let backed = dispatch_managed(&fixture, &payload, current_mode);
+        assert_eq!(
+            backed.code,
+            expected_code,
+            "current={current_mode} peer={peer_mode} stderr={}",
+            backed.stderr_text()
+        );
+        assert_eq!(
+            backed.stdout_json()["data"]["action"],
+            expected_action,
+            "current={current_mode} peer={peer_mode}"
+        );
+    }
+}
+
+fn dispatch_managed(
+    fixture: &Fixture,
+    payload: &str,
+    mode: &str,
+) -> nils_test_support::cmd::CmdOutput {
     let options = nils_test_support::cmd::CmdOptions::new()
         .with_cwd(&fixture.root)
         .with_env("HOME", fixture.home.to_str().expect("home"))
@@ -177,14 +221,32 @@ fn forged_payload_conflict_is_ignored_but_registry_conflict_blocks() {
             fixture.session_state.to_str().expect("session"),
         )
         .with_env("AGENT_SESSION_ID", "current")
-        .with_stdin_str(&payload);
-    let backed = nils_test_support::cmd::run_resolved(
+        .with_env("AGENT_SESSION_RUNTIME_ID", "inc-current")
+        .with_env("AGENT_SESSION_COORDINATION_MODE", mode)
+        .with_stdin_str(payload);
+    nils_test_support::cmd::run_resolved(
         "agent-hook",
         &["dispatch", "--product", "codex", "--format", "json"],
         &options,
-    );
-    assert_eq!(backed.code, 1, "stderr={}", backed.stderr_text());
-    assert_eq!(backed.stdout_json()["data"]["action"], "block");
+    )
+}
+
+fn write_session_record(fixture: &Fixture, session: &str, incarnation: &str, mode: &str) {
+    let directory = fixture.session_state.join("sessions").join(session);
+    fs::create_dir_all(&directory).expect("session directory");
+    let path = directory.join("session.json");
+    fs::write(
+        &path,
+        serde_json::to_vec(&json!({
+            "schema_version": "agent-session.session.v1",
+            "id": session,
+            "coordination_mode": mode,
+            "runtime": {"launch_id": incarnation}
+        }))
+        .expect("session JSON"),
+    )
+    .expect("session record");
+    Fixture::set_private(&path);
 }
 
 #[test]
