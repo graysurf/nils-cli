@@ -107,10 +107,23 @@ prefixes; overlapping work warns without blocking unless the session starts
 with `--coordination-mode enforce`. Session IDs and claim IDs are selectors,
 not credentials. Owner operations use the private per-incarnation capability.
 
+Coordination does not grant or revoke user authorization, repository
+permission, provider consent, or workflow authority. In default `advisory`
+mode, missing context, unavailable coordination, and overlap reports remain
+non-blocking. `work-context set` adds optional public task metadata so warnings
+are more precise; it is not a permission request. Only a launch that explicitly
+selects `--coordination-mode enforce` turns claims, admission, and physical
+checkout leases into mutation requirements.
+
 Use [Work coordination](docs/runbooks/work-coordination.md) for the operator
 workflow and path syntax. The normative schemas, state machines, authorization
 rules, limits, error codes, and HTTP coverage live in
 [Session coordination v1](docs/specs/session-coordination-v1.md).
+
+The canonical agent-facing policy, including how an agent responds to overlap
+advice, lives in agent-runtime-kit's
+[`session-coordination.md`](https://github.com/graysurf/agent-runtime-kit/blob/main/core/policies/session-coordination.md).
+This README defines CLI and operator semantics only.
 
 ## Turn-state integration
 

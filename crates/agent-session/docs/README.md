@@ -30,3 +30,12 @@ or integrating a specific subsystem.
   versions and lifecycle-signal evidence behind the turn-state integration.
 - [Completion migration contract](reports/agent-session-completion-migration-contract.md):
   clap-first completion coverage and verification record.
+
+This index and the CLI README define CLI, operator, and protocol contracts. For
+global agent-facing policy and collision response, use agent-runtime-kit's
+canonical
+[`session-coordination.md`](https://github.com/graysurf/agent-runtime-kit/blob/main/core/policies/session-coordination.md).
+Work context and presence provide collision awareness; they do not grant user
+or repository authorization. Default `advisory` and unmanaged sessions never
+require a claim, while explicit `enforce` retains the strict claim and admission
+protocol defined by the v1 contract.
