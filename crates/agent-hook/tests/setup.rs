@@ -701,6 +701,122 @@ fn codex_foreign_marker_scan_rejects_later_malformed_ranges_for_every_action() {
 }
 
 #[test]
+fn codex_first_install_rejects_malformed_foreign_markers_for_every_action() {
+    let malformed_layouts = [
+        ("orphaned", "# >>> orphaned-manager:hooks >>>\n"),
+        (
+            "reversed",
+            "# <<< reversed-manager:hooks <<<\n# >>> reversed-manager:hooks >>>\n",
+        ),
+        (
+            "crossed",
+            "# >>> crossed-a:hooks >>>\n# >>> crossed-b:hooks >>>\n# <<< crossed-a:hooks <<<\n# <<< crossed-b:hooks <<<\n",
+        ),
+        (
+            "duplicate",
+            "# >>> duplicate-manager:hooks >>>\n# <<< duplicate-manager:hooks <<<\n# >>> duplicate-manager:hooks >>>\n# <<< duplicate-manager:hooks <<<\n",
+        ),
+        (
+            "partial",
+            "# >>> partial-a:hooks >>>\n# <<< partial-b:hooks <<<\n",
+        ),
+    ];
+    for (layout_name, malformed) in malformed_layouts {
+        for action in ["--dry-run", "--apply", "--repair", "--remove"] {
+            let fixture = Fixture::new(POLICY);
+            let codex = fixture.home.join(".codex");
+            fs::create_dir_all(&codex).expect("codex dir");
+            let config = codex.join("config.toml");
+            let original = format!("model = \"gpt-test\"\n{malformed}");
+            fs::write(&config, &original).expect("unowned malformed foreign layout");
+            Fixture::set_private(&config);
+
+            let rejected = fixture.run(
+                &["setup", "--product", "codex", action, "--format", "json"],
+                None,
+            );
+            assert_eq!(
+                rejected.code,
+                65,
+                "layout={layout_name} action={action} stdout={} stderr={}",
+                rejected.stdout_text(),
+                rejected.stderr_text()
+            );
+            assert_eq!(
+                rejected.stdout_json()["error"]["code"],
+                "provider-config-invalid",
+                "layout={layout_name} action={action}"
+            );
+            assert_eq!(
+                fs::read_to_string(&config).expect("malformed foreign bytes retained"),
+                original,
+                "layout={layout_name} action={action}"
+            );
+        }
+    }
+}
+
+#[test]
+fn codex_first_install_preserves_balanced_foreign_block_and_remains_removable() {
+    let fixture = Fixture::new(POLICY);
+    let codex = fixture.home.join(".codex");
+    fs::create_dir_all(&codex).expect("codex dir");
+    let config = codex.join("config.toml");
+    let foreign = concat!(
+        "# >>> balanced-manager:hooks >>>\n",
+        "# foreign-owned-metadata\n",
+        "# <<< balanced-manager:hooks <<<\n",
+    );
+    let original = format!("model = \"gpt-test\"\n{foreign}");
+    fs::write(&config, &original).expect("balanced foreign block");
+    Fixture::set_private(&config);
+
+    let applied = fixture.run(
+        &["setup", "--product", "codex", "--apply", "--format", "json"],
+        None,
+    );
+    assert_eq!(
+        applied.code,
+        0,
+        "stdout={} stderr={}",
+        applied.stdout_text(),
+        applied.stderr_text()
+    );
+    let installed = fs::read_to_string(&config).expect("installed config");
+    assert!(installed.contains(foreign));
+    let foreign_end = installed
+        .find("# <<< balanced-manager:hooks <<<")
+        .expect("foreign end");
+    let owned_start = installed
+        .find("# >>> agent-hook:provider-ingress:v1 >>>")
+        .expect("owned start");
+    assert!(foreign_end < owned_start);
+
+    let removed = fixture.run(
+        &[
+            "setup",
+            "--product",
+            "codex",
+            "--remove",
+            "--format",
+            "json",
+        ],
+        None,
+    );
+    assert_eq!(
+        removed.code,
+        0,
+        "stdout={} stderr={}",
+        removed.stdout_text(),
+        removed.stderr_text()
+    );
+    assert_eq!(
+        fs::read_to_string(&config).expect("removed config"),
+        original
+    );
+}
+
+#[test]
 fn provider_setup_rejects_duplicate_json_keys_recursively_for_every_action() {
     let fixtures = [
         ("root", br#"{"keep":1,"keep":2}"#.as_slice()),

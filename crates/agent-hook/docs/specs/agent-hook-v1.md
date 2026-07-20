@@ -294,11 +294,13 @@ TOML following that suffix fail closed before mutation.
 The `agent-hook:provider-ingress:v1` ownership markers are recognized only as
 an exact ordered pair of standalone lines outside basic and literal multiline
 TOML values. Setup validates the complete foreign-manager marker layout before
-classifying overlap. An owned block wholly inside a valid foreign-manager range
-is drifted and requires the exact reviewed plan digest before it is moved
-outside that range. A foreign range inside or partially crossing the owned span
-cannot be preserved by regeneration and fails closed, as do orphaned, reversed,
-crossed, or duplicate foreign markers anywhere in the document.
+the first-install no-owned path or any owned-span overlap classification; each
+foreign owner may identify exactly one balanced range. An owned block wholly
+inside a valid foreign-manager range is drifted and requires the exact reviewed
+plan digest before it is moved outside that range. A foreign range inside or
+partially crossing the owned span cannot be preserved by regeneration and fails
+closed, as do orphaned, reversed, crossed, partial, or duplicate foreign markers
+anywhere in the document.
 Owned groups contain exactly one dispatcher command for each required
 event/matcher. Install, upgrade, repair, remove, and rollback preserve
 unrelated hooks, comments, formatting, provider metadata, and unsupported

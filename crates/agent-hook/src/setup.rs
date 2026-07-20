@@ -940,12 +940,10 @@ enum ForeignManagedMarker {
     End { owner: String, end: usize },
 }
 
-fn codex_owned_block_overlaps_foreign_manager(
+fn codex_foreign_manager_ranges(
     raw: &str,
-    owned_begin: usize,
-    owned_end: usize,
     multiline_value_lines: &[usize],
-) -> Result<bool, HookError> {
+) -> Result<Vec<std::ops::Range<usize>>, HookError> {
     let owned_owner = "agent-hook:provider-ingress:v1";
     let mut markers = Vec::new();
     let mut offset = 0_usize;
@@ -979,11 +977,12 @@ fn codex_owned_block_overlaps_foreign_manager(
 
     let mut open = Vec::<(String, usize)>::new();
     let mut ranges = Vec::new();
+    let mut seen_owners = BTreeSet::new();
     let mut malformed = false;
     for marker in markers {
         match marker {
             ForeignManagedMarker::Start { owner, begin } => {
-                if open.iter().any(|(candidate, _)| candidate == &owner) {
+                if !seen_owners.insert(owner.clone()) {
                     malformed = true;
                 }
                 open.push((owner, begin));
@@ -1009,9 +1008,16 @@ fn codex_owned_block_overlaps_foreign_manager(
             "Codex config has an ambiguous foreign managed marker layout",
         ));
     }
+    Ok(ranges)
+}
 
+fn codex_owned_block_overlaps_foreign_manager(
+    owned_begin: usize,
+    owned_end: usize,
+    foreign_ranges: &[std::ops::Range<usize>],
+) -> Result<bool, HookError> {
     let mut owned_is_inside_foreign = false;
-    for foreign in ranges {
+    for foreign in foreign_ranges {
         if foreign.start >= owned_end || owned_begin >= foreign.end {
             continue;
         }
@@ -1031,6 +1037,7 @@ fn strip_codex_block(raw: &str, expected: &str) -> Result<(String, usize, bool),
     let multiline_value_lines = toml_multiline_value_line_starts(raw);
     let starts = toml_marker_line_ranges(raw, CODEX_BLOCK_START, &multiline_value_lines);
     let ends = toml_marker_line_ranges(raw, CODEX_BLOCK_END, &multiline_value_lines);
+    let foreign_ranges = codex_foreign_manager_ranges(raw, &multiline_value_lines)?;
     if starts.is_empty() && ends.is_empty() {
         return Ok((raw.to_string(), 0, false));
     }
@@ -1043,8 +1050,7 @@ fn strip_codex_block(raw: &str, expected: &str) -> Result<(String, usize, bool),
     let begin = starts[0].0;
     let end = ends[0].1;
     let block = &raw[begin..end];
-    let overlaps_foreign =
-        codex_owned_block_overlaps_foreign_manager(raw, begin, end, &multiline_value_lines)?;
+    let overlaps_foreign = codex_owned_block_overlaps_foreign_manager(begin, end, &foreign_ranges)?;
     let drifted = block != expected || overlaps_foreign;
     let owned = block.matches("command = \"agent-hook dispatch").count();
     let mut stripped = String::with_capacity(raw.len() - (end - begin));
