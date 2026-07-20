@@ -14,7 +14,8 @@ pub struct TargetBinding {
 }
 
 pub fn resolve_target_bindings(paths: &[PathBuf]) -> Result<Vec<TargetBinding>, HookError> {
-    let mut root_cache = BTreeMap::<PathBuf, Option<PathBuf>>::new();
+    reject_repository_selection_environment()?;
+    let mut root_cache = BTreeMap::<PathBuf, PathBuf>::new();
     paths
         .iter()
         .map(|path| {
@@ -35,10 +36,17 @@ pub fn resolve_target_bindings(paths: &[PathBuf]) -> Result<Vec<TargetBinding>, 
             };
             let cache_key = checkout_cache_key(&checkout_start);
             let repository_root = match root_cache.get(&cache_key) {
-                Some(root) => root.clone(),
+                Some(root) if checkout_start.starts_with(root) => Some(root.clone()),
+                Some(_) => {
+                    return Err(untrusted(
+                        "mutation target does not belong to its cached repository root",
+                    ));
+                }
                 None => {
                     let root = repository_root(&checkout_start)?;
-                    root_cache.insert(cache_key, root.clone());
+                    if let Some(root) = root.as_ref() {
+                        root_cache.insert(cache_key, root.clone());
+                    }
                     root
                 }
             };
@@ -48,6 +56,27 @@ pub fn resolve_target_bindings(paths: &[PathBuf]) -> Result<Vec<TargetBinding>, 
             })
         })
         .collect()
+}
+
+fn reject_repository_selection_environment() -> Result<(), HookError> {
+    const REPOSITORY_SELECTION_VARIABLES: [&str; 7] = [
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_COMMON_DIR",
+        "GIT_CEILING_DIRECTORIES",
+        "GIT_DISCOVERY_ACROSS_FILESYSTEM",
+        "GIT_CONFIG_PARAMETERS",
+        "GIT_CONFIG_COUNT",
+    ];
+    if REPOSITORY_SELECTION_VARIABLES
+        .iter()
+        .any(|variable| std::env::var_os(variable).is_some())
+    {
+        return Err(untrusted(
+            "mutation target repository selection environment is ambiguous",
+        ));
+    }
+    Ok(())
 }
 
 fn checkout_cache_key(start: &Path) -> PathBuf {

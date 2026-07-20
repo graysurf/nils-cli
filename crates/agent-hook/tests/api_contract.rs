@@ -3,6 +3,7 @@ mod support;
 use std::fs::{self, OpenOptions};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::process::Command;
 
 use pretty_assertions::assert_eq;
 use serde_json::json;
@@ -23,6 +24,107 @@ failure_posture = "closed"
 override_class = "locked"
 capability = { id = "decision.allow.v1", reason_code = "allowed" }
 "#;
+
+#[test]
+fn inherited_git_worktree_selection_cannot_make_target_validation_order_dependent() {
+    let fixture = Fixture::new(ALLOW_POLICY);
+    fs::remove_file(&fixture.config).expect("remove config after fixture setup");
+    let agent_hook = fs::canonicalize(env!("CARGO_MANIFEST_DIR")).expect("agent-hook root");
+    let project_root = agent_hook
+        .parent()
+        .and_then(std::path::Path::parent)
+        .expect("project root");
+    let agent_session = project_root.join("crates/agent-session");
+    let git_dir_output = Command::new("git")
+        .arg("-C")
+        .arg(project_root)
+        .args(["rev-parse", "--absolute-git-dir"])
+        .output()
+        .expect("git dir lookup");
+    assert!(git_dir_output.status.success());
+    let git_dir = std::str::from_utf8(&git_dir_output.stdout)
+        .expect("git dir UTF-8")
+        .trim();
+    let git_work_tree = agent_hook.to_string_lossy();
+    let targets = [
+        agent_hook.join("Cargo.toml"),
+        agent_session.join("Cargo.toml"),
+    ];
+    let mut selection_override = Vec::new();
+
+    for order in [[0, 1], [1, 0]] {
+        let payload = two_target_apply_patch_payload(project_root, &targets, order);
+        let output = fixture.run_with_env(
+            &["dispatch", "--product", "codex", "--format", "json"],
+            Some(&payload),
+            &[
+                ("GIT_DIR", git_dir),
+                ("GIT_WORK_TREE", git_work_tree.as_ref()),
+            ],
+        );
+        selection_override.push((
+            order,
+            output.code,
+            output.stdout_json()["error"]["code"].clone(),
+        ));
+    }
+
+    let mut discovery_ceiling = Vec::new();
+    for order in [[0, 1], [1, 0]] {
+        let payload = two_target_apply_patch_payload(project_root, &targets, order);
+        let output = fixture.run_with_env(
+            &["dispatch", "--product", "codex", "--format", "json"],
+            Some(&payload),
+            &[("GIT_CEILING_DIRECTORIES", git_work_tree.as_ref())],
+        );
+        discovery_ceiling.push((
+            order,
+            output.code,
+            output.stdout_json()["error"]["code"].clone(),
+        ));
+    }
+
+    eprintln!(
+        "inherited repository selection outcomes: selection_override={selection_override:?} discovery_ceiling={discovery_ceiling:?}"
+    );
+
+    assert_eq!(
+        (selection_override, discovery_ceiling),
+        (
+            vec![
+                ([0, 1], 65, json!("provider-target-untrusted")),
+                ([1, 0], 65, json!("provider-target-untrusted")),
+            ],
+            vec![
+                ([0, 1], 65, json!("provider-target-untrusted")),
+                ([1, 0], 65, json!("provider-target-untrusted")),
+            ],
+        ),
+        "repository-selection environment must fail closed independently of target order"
+    );
+}
+
+fn two_target_apply_patch_payload(
+    project_root: &std::path::Path,
+    targets: &[std::path::PathBuf; 2],
+    order: [usize; 2],
+) -> String {
+    let mut patch = String::from("*** Begin Patch\n");
+    for index in order {
+        patch.push_str(&format!(
+            "*** Update File: {}\n@@\n-old\n+new\n",
+            targets[index].display()
+        ));
+    }
+    patch.push_str("*** End Patch");
+    json!({
+        "hook_event_name":"PreToolUse",
+        "tool_name":"apply_patch",
+        "cwd":project_root,
+        "tool_input":{"command":patch}
+    })
+    .to_string()
+}
 
 #[test]
 fn workspace_json_envelope_parse_and_unavailable_exit_contract_is_canonical() {
