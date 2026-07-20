@@ -354,6 +354,24 @@ pub(crate) fn compute_pending_snapshot<R: BackendRunner>(
     ctx: &ProviderContext,
     review_id: &str,
 ) -> Result<Option<PendingReviewSnapshot>, ForgeError> {
+    compute_review_snapshot_for_state(runner, ctx, review_id, "PENDING")
+}
+
+pub(crate) fn compute_submitted_review_snapshot<R: BackendRunner>(
+    runner: &R,
+    ctx: &ProviderContext,
+    review_id: &str,
+    expected_state: &str,
+) -> Result<Option<PendingReviewSnapshot>, ForgeError> {
+    compute_review_snapshot_for_state(runner, ctx, review_id, expected_state)
+}
+
+fn compute_review_snapshot_for_state<R: BackendRunner>(
+    runner: &R,
+    ctx: &ProviderContext,
+    review_id: &str,
+    expected_state: &str,
+) -> Result<Option<PendingReviewSnapshot>, ForgeError> {
     ensure_github(ctx)?;
     let mut cursor = None;
     let mut seen_cursors = BTreeSet::new();
@@ -366,7 +384,8 @@ pub(crate) fn compute_pending_snapshot<R: BackendRunner>(
             review_id,
             cursor.as_deref(),
         ))?;
-        let Some(mut page) = parse_github_pending_review_snapshot_page(&output)? else {
+        let Some(mut page) = parse_github_pending_review_snapshot_page(&output, expected_state)?
+        else {
             return if snapshot.is_none() {
                 Ok(None)
             } else {
@@ -889,6 +908,7 @@ fn parse_github_pending_review_target(
 
 fn parse_github_pending_review_snapshot_page(
     output: &BackendSuccess,
+    expected_state: &str,
 ) -> Result<Option<PendingReviewSnapshotPage>, ForgeError> {
     let value: serde_json::Value = serde_json::from_str(output.stdout.trim()).map_err(|err| {
         ForgeError::software(
@@ -913,7 +933,7 @@ fn parse_github_pending_review_snapshot_page(
     let node = value.pointer("/data/node").ok_or_else(|| {
         snapshot_incomplete("pending review snapshot response is missing node", None)
     })?;
-    if node.is_null() || required_review_state(node)? != "PENDING" {
+    if node.is_null() || required_review_state(node)? != expected_state {
         return Ok(None);
     }
     let comments = node.pointer("/comments").ok_or_else(|| {

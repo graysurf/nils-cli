@@ -740,7 +740,7 @@ case "$1 $2" in
         printf '%s\n' '{{"data":{{"viewer":{{"login":"review-bot"}},"repository":{{"pullRequest":{{"comments":{{"nodes":{ledger},"pageInfo":{{"hasNextPage":false,"endCursor":"state-tip"}}}}}}}}}}}}'
         ;;
       *"node(id: \$review)"*)
-        printf '%s\n' '{{"data":{{"node":null}}}}'
+        printf '%s\n' '{{"data":{{"node":{{"id":"PRR_pending","url":"https://github.com/acme/widgets/pull/7#pullrequestreview-102","author":{{"login":"review-bot"}},"state":"COMMENTED","commit":{{"oid":"head-abc"}},"body":"Summary\n<!-- forge-cli:review-run:v1 run={review_run_id} -->","viewerDidAuthor":true,"viewerCanDelete":false,"comments":{{"totalCount":0,"nodes":[],"pageInfo":{{"hasNextPage":false,"endCursor":null}}}},"pullRequest":{{"number":7,"url":"https://github.com/acme/widgets/pull/7","headRefOid":"head-abc"}}}}}}}}'
         ;;
       *"reviews(first: 100"*)
         printf '%s\n' '{{"data":{{"viewer":{{"login":"review-bot"}},"repository":{{"pullRequest":{{"headRefOid":"head-abc","reviews":{{"nodes":[{{"id":"PRR_pending","databaseId":102,"url":"https://github.com/acme/widgets/pull/7#pullrequestreview-102","author":{{"login":"review-bot"}},"state":"COMMENTED","commit":{{"oid":"head-abc"}},"submittedAt":"2026-07-20T12:05:00Z","body":"Summary\n<!-- forge-cli:review-run:v1 run={review_run_id} -->","viewerDidAuthor":true}}],"pageInfo":{{"hasNextPage":false,"endCursor":null}}}}}}}}}}}}'
@@ -801,6 +801,132 @@ esac
     assert_eq!(envelope["data"]["review_id"], "PRR_pending");
     assert_eq!(envelope["data"]["review_run_id"], review_run_id);
     assert_eq!(envelope["data"]["submitted"], true);
+    let calls = fs::read_to_string(capture).expect("read calls");
+    assert!(!calls.contains("submitPullRequestReview(input:"), "{calls}");
+    assert!(!calls.contains("deletePullRequestReview(input:"), "{calls}");
+}
+
+#[test]
+fn pr_pending_review_already_submitted_rejects_a_missing_receipt_finding() {
+    let stub = StubEnv::new();
+    let capture = stub
+        .tempdir
+        .path()
+        .join("already-submitted-missing-finding-calls.log");
+    let summary_digest = sha256_digest(b"Summary");
+    let manifest = vec![ReviewCommentManifestItem {
+        index: 0,
+        path: "src/lib.rs".to_string(),
+        line: Some(42),
+        side: "RIGHT".to_string(),
+        start_line: None,
+        start_side: None,
+        subject_type: "LINE".to_string(),
+        body_digest: sha256_digest(b"Required finding"),
+    }];
+    let review_run_id = compute_review_run_id(
+        "acme/widgets",
+        7,
+        "head-abc",
+        0,
+        &[],
+        "comments-only",
+        &summary_digest,
+        &manifest,
+    )
+    .expect("review run id");
+    let receipt = ReviewRunReceipt {
+        review_run_id: review_run_id.clone(),
+        route_lenses: Vec::new(),
+        decision: "comments-only".to_string(),
+        expected_head: "head-abc".to_string(),
+        round: 0,
+        summary_digest,
+        inline_manifest: manifest,
+    };
+    let marker = ReviewStateRecord::new(
+        "acme/widgets",
+        7,
+        "head-abc",
+        0,
+        None,
+        ReviewStatePayload::ReviewRunReceipt { receipt },
+    )
+    .expect("review-state record")
+    .marker()
+    .expect("review-state marker");
+    let ledger = serde_json::json!([{
+        "author": {"login": "review-bot"},
+        "body": marker
+    }])
+    .to_string();
+    let script = format!(
+        r#"#!/bin/sh
+set -eu
+printf '%s\n' "$*" >> {capture:?}
+case "$1 $2" in
+  "pr view")
+    printf '%s\n' '{{"number":7,"url":"https://github.com/acme/widgets/pull/7","state":"OPEN","isDraft":false,"baseRefName":"main","headRefName":"feat/reviews","headRefOid":"head-abc","title":"feat: reviews","body":""}}'
+    ;;
+  "api graphql")
+    case "$*" in
+      *"pullRequest(number: \$pr) {{ comments(first: 100"*)
+        printf '%s\n' '{{"data":{{"viewer":{{"login":"review-bot"}},"repository":{{"pullRequest":{{"comments":{{"nodes":{ledger},"pageInfo":{{"hasNextPage":false,"endCursor":"state-tip"}}}}}}}}}}}}'
+        ;;
+      *"node(id: \$review)"*)
+        printf '%s\n' '{{"data":{{"node":{{"id":"PRR_pending","url":"https://github.com/acme/widgets/pull/7#pullrequestreview-102","author":{{"login":"review-bot"}},"state":"COMMENTED","commit":{{"oid":"head-abc"}},"body":"Summary\n<!-- forge-cli:review-run:v1 run={review_run_id} -->","viewerDidAuthor":true,"viewerCanDelete":false,"comments":{{"totalCount":0,"nodes":[],"pageInfo":{{"hasNextPage":false,"endCursor":null}}}},"pullRequest":{{"number":7,"url":"https://github.com/acme/widgets/pull/7","headRefOid":"head-abc"}}}}}}}}'
+        ;;
+      *"reviews(first: 100"*)
+        printf '%s\n' '{{"data":{{"viewer":{{"login":"review-bot"}},"repository":{{"pullRequest":{{"headRefOid":"head-abc","reviews":{{"nodes":[{{"id":"PRR_pending","databaseId":102,"url":"https://github.com/acme/widgets/pull/7#pullrequestreview-102","author":{{"login":"review-bot"}},"state":"COMMENTED","commit":{{"oid":"head-abc"}},"submittedAt":"2026-07-20T12:05:00Z","body":"Summary\n<!-- forge-cli:review-run:v1 run={review_run_id} -->","viewerDidAuthor":true}}],"pageInfo":{{"hasNextPage":false,"endCursor":null}}}}}}}}}}}}'
+        ;;
+      *)
+        echo "unexpected graphql args: $*" >&2
+        exit 99
+        ;;
+    esac
+    ;;
+  *)
+    echo "unexpected gh args: $*" >&2
+    exit 99
+    ;;
+esac
+"#
+    );
+    let stub = stub.gh_stub(&script);
+
+    let output = run_forge_cli(
+        &stub,
+        &[
+            "--provider",
+            "github",
+            "--repo",
+            "acme/widgets",
+            "--format",
+            "json",
+            "pr",
+            "pending-review",
+            "resume-submit",
+            "7",
+            "--review",
+            "PRR_pending",
+            "--review-run-id",
+            &review_run_id,
+            "--expected-head",
+            "head-abc",
+            "--expected-commit",
+            "head-abc",
+            "--expected-snapshot",
+            "sha256:inspected-before-submit",
+            "--decision",
+            "comments-only",
+        ],
+    );
+
+    assert_eq!(output.code, 65, "{}", output.stdout);
+    assert_eq!(
+        parse_envelope(&output.stdout)["error"]["code"],
+        "pending_review_manifest_mismatch"
+    );
     let calls = fs::read_to_string(capture).expect("read calls");
     assert!(!calls.contains("submitPullRequestReview(input:"), "{calls}");
     assert!(!calls.contains("deletePullRequestReview(input:"), "{calls}");

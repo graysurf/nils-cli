@@ -571,7 +571,44 @@ fn emit_already_submitted<R: BackendRunner>(
             ),
         ));
     }
-    validate_review_run_receipt(runner, ctx, &view, review_run_id, expected_head, decision)?;
+    let receipt =
+        validate_review_run_receipt(runner, ctx, &view, review_run_id, expected_head, decision)?;
+    let submitted_snapshot =
+        pr_reviews::compute_submitted_review_snapshot(runner, ctx, review_id, expected_state)?
+            .ok_or_else(|| {
+                expected_mismatch(
+                    "pending_review_manifest_mismatch",
+                    "the submitted review content snapshot is unavailable",
+                    format!("review_id={review_id}; expected_state={expected_state}"),
+                )
+            })?;
+    if submitted_snapshot.number != view.number
+        || submitted_snapshot.pr_url != view.url
+        || submitted_snapshot.review_id != submitted.id
+        || submitted_snapshot.review_url != submitted.url
+        || submitted_snapshot.head_sha != expected_head
+        || submitted_snapshot.commit_sha.as_deref() != Some(expected_commit)
+        || !submitted_snapshot.viewer_did_author
+        || submitted_snapshot.author != reviews.viewer_login
+        || submitted_snapshot.review_run_id.as_deref() != Some(review_run_id)
+    {
+        return Err(expected_mismatch(
+            "pending_review_manifest_mismatch",
+            "the submitted review content does not match the requested recovery transaction",
+            format!(
+                "expected_review={review_id}; provider_review={}; expected_head={expected_head}; provider_head={}; expected_commit={expected_commit}; provider_commit={}; expected_viewer={}; provider_author={}",
+                submitted_snapshot.review_id,
+                submitted_snapshot.head_sha,
+                submitted_snapshot
+                    .commit_sha
+                    .as_deref()
+                    .unwrap_or("<missing>"),
+                reviews.viewer_login,
+                submitted_snapshot.author,
+            ),
+        ));
+    }
+    validate_snapshot_against_receipt(&submitted_snapshot, &receipt)?;
     let payload = PrPendingReviewSubmitPayload {
         provider: ctx.provider.as_str(),
         number: view.number,
