@@ -71,6 +71,21 @@ Desktop session with `$HOME/.agents` absent and legacy skill environment
 variables unset. Rationale: see the archived plan bundle
 `agent-plan-archive:plans/github.com/sympoies/nils-cli/2026-05-23-codex-skill-surface-primitives/`.
 
+### 2.2 `agent-session` coordination changes
+
+Before changing coordination behavior, read the crate-local
+[`agent-session` documentation index](crates/agent-session/docs/README.md) and
+the [Session Coordination V1 contract](crates/agent-session/docs/specs/session-coordination-v1.md).
+This repository owns the CLI, automatic presence, work-context, and protocol
+contracts. `graysurf/agent-runtime-kit` owns the global agent policy and hook
+consumer behavior.
+
+Keep work authorization distinct from collision awareness: default `advisory`
+coordination and unmanaged sessions require no claim and never deny work;
+`work-context set` only improves overlap metadata; strict claim/admission
+semantics apply only to an explicit `enforce` launch. Changes to that boundary
+require coupled nils-cli/runtime-kit validation.
+
 ## 3. Canonical validation flows
 
 Local development defaults to changed-scope validation. The full workspace test
