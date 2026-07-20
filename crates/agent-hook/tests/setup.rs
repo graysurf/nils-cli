@@ -362,6 +362,78 @@ fn claude_removal_preview_digest_preserves_unrelated_hooks_and_restores() {
 }
 
 #[test]
+fn codex_setup_preserves_coordination_hook_when_capability_is_absent() {
+    let fixture = Fixture::new(POLICY);
+    let codex = fixture.home.join(".codex");
+    fs::create_dir_all(&codex).expect("codex dir");
+    let config = codex.join("config.toml");
+    fs::write(
+        &config,
+        r#"[[hooks.PreToolUse]]
+matcher = "Write"
+
+[[hooks.PreToolUse.hooks]]
+type = "command"
+command = "AGENT_RUNTIME_PRODUCT=codex \"${CODEX_HOME:-$HOME/.codex}/hooks/session-coordination-guard.py\""
+timeout = 60
+statusMessage = "agent-runtime-kit: Admit managed session mutation"
+"#,
+    )
+    .expect("coordination config");
+    Fixture::set_private(&config);
+    let original = fs::read(&config).expect("original config");
+
+    let preview = fixture.run(
+        &[
+            "setup",
+            "--product",
+            "codex",
+            "--dry-run",
+            "--format",
+            "json",
+        ],
+        None,
+    );
+    assert_eq!(preview.code, 0, "stderr={}", preview.stderr_text());
+    assert_eq!(preview.stdout_json()["data"]["status"], "unrelated");
+    assert_eq!(preview.stdout_json()["data"]["unrelated_count"], 1);
+    assert_eq!(fs::read(&config).expect("preview config"), original);
+
+    let applied = fixture.run(
+        &["setup", "--product", "codex", "--apply", "--format", "json"],
+        None,
+    );
+    assert_eq!(applied.code, 0, "stderr={}", applied.stderr_text());
+    let installed = fs::read_to_string(&config).expect("installed config");
+    assert_eq!(
+        installed.matches("session-coordination-guard.py").count(),
+        1
+    );
+    assert_eq!(
+        installed
+            .matches("agent-hook dispatch --product codex")
+            .count(),
+        2
+    );
+
+    let removed = fixture.run(
+        &[
+            "setup",
+            "--product",
+            "codex",
+            "--remove",
+            "--format",
+            "json",
+        ],
+        None,
+    );
+    assert_eq!(removed.code, 0, "stderr={}", removed.stderr_text());
+    let removed = fs::read_to_string(&config).expect("removed config");
+    assert_eq!(removed.matches("session-coordination-guard.py").count(), 1);
+    assert!(!removed.contains("agent-hook dispatch"));
+}
+
+#[test]
 fn codex_setup_migrates_coordination_into_one_exact_owned_ingress() {
     let fixture = Fixture::new(COORDINATION_POLICY);
     let codex = fixture.home.join(".codex");

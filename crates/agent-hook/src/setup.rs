@@ -334,9 +334,9 @@ fn build_codex_plan(
     let mut document = stripped.parse::<DocumentMut>().map_err(|_| {
         HookError::data("provider-config-invalid", "Codex config is not valid TOML")
     })?;
-    let (legacy_before, unrelated_before) = inspect_toml_handlers(&document);
+    let (legacy_before, unrelated_before) = inspect_toml_handlers(&document, loaded);
     let notify = plan_codex_notification(&mut document, &path, action, &stripped)?;
-    remove_legacy_toml_handlers(&mut document);
+    remove_legacy_toml_handlers(&mut document, loaded);
     let mut rendered = document.to_string();
     if !action.is_remove() {
         if !rendered.is_empty() && !rendered.ends_with('\n') {
@@ -1313,7 +1313,7 @@ fn strip_codex_block(raw: &str, expected: &str) -> Result<(String, usize, bool),
     Ok((stripped, owned, drifted))
 }
 
-fn inspect_toml_handlers(document: &DocumentMut) -> (usize, usize) {
+fn inspect_toml_handlers(document: &DocumentMut, loaded: &LoadedPolicy) -> (usize, usize) {
     let mut compatibility = 0;
     let mut unrelated = 0;
     let Some(hooks) = document.get("hooks").and_then(TomlItem::as_table) else {
@@ -1328,7 +1328,7 @@ fn inspect_toml_handlers(document: &DocumentMut) -> (usize, usize) {
                 continue;
             };
             for handler in handlers {
-                if legacy_toml_handler(handler) {
+                if legacy_toml_handler(handler, loaded) {
                     compatibility += 1;
                 } else {
                     unrelated += 1;
@@ -1339,7 +1339,7 @@ fn inspect_toml_handlers(document: &DocumentMut) -> (usize, usize) {
     (compatibility, unrelated)
 }
 
-fn remove_legacy_toml_handlers(document: &mut DocumentMut) {
+fn remove_legacy_toml_handlers(document: &mut DocumentMut, loaded: &LoadedPolicy) {
     let Some(hooks) = document.get_mut("hooks").and_then(TomlItem::as_table_mut) else {
         return;
     };
@@ -1358,7 +1358,7 @@ fn remove_legacy_toml_handlers(document: &mut DocumentMut) {
                     .get_mut("hooks")
                     .and_then(TomlItem::as_array_of_tables_mut)
                 {
-                    handlers.retain(|handler| !legacy_toml_handler(handler));
+                    handlers.retain(|handler| !legacy_toml_handler(handler, loaded));
                 }
             }
             groups.retain(|group| {
@@ -1581,19 +1581,15 @@ fn legacy_json_handler(handler: &Value, product: Product, loaded: &LoadedPolicy)
     historical || coordination
 }
 
-fn legacy_toml_handler(handler: &toml_edit::Table) -> bool {
+fn legacy_toml_handler(handler: &toml_edit::Table, loaded: &LoadedPolicy) -> bool {
     let Some(command) = handler.get("command").and_then(TomlItem::as_str) else {
         return false;
     };
-    if handler.get("type").and_then(TomlItem::as_str) != Some("command")
-        || !legacy_command(command, Product::Codex)
-    {
+    if handler.get("type").and_then(TomlItem::as_str) != Some("command") {
         return false;
     }
-    let historical =
-        handler.len() == 3 && handler.get("timeout").and_then(TomlItem::as_integer) == Some(5);
-    let coordination =
-        exact_runtime_handler_command(command, Product::Codex, SESSION_COORDINATION_HANDLER)
+    if exact_runtime_handler_command(command, Product::Codex, SESSION_COORDINATION_HANDLER) {
+        return policy_has_session_coordination(loaded, Product::Codex)
             && handler
                 .iter()
                 .all(|(key, _)| matches!(key, "type" | "command" | "timeout" | "statusMessage"))
@@ -1601,7 +1597,17 @@ fn legacy_toml_handler(handler: &toml_edit::Table) -> bool {
             && handler
                 .get("statusMessage")
                 .is_none_or(|value| value.is_str());
-    historical || coordination
+    }
+    legacy_command(command, Product::Codex)
+        && handler.len() == 3
+        && handler.get("timeout").and_then(TomlItem::as_integer) == Some(5)
+}
+
+fn policy_has_session_coordination(loaded: &LoadedPolicy, product: Product) -> bool {
+    loaded.bundle.rules.iter().any(|rule| {
+        rule.products.contains(&product)
+            && matches!(&rule.capability, Capability::SessionCoordination { .. })
+    })
 }
 
 fn json_group_has_user_metadata(group: &Value) -> bool {
