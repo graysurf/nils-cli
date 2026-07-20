@@ -531,6 +531,190 @@ timeout = 7
 }
 
 #[test]
+fn codex_setup_migration_does_not_orphan_retired_manager_markers() {
+    let fixture = Fixture::new(COORDINATION_POLICY);
+    let codex = fixture.home.join(".codex");
+    fs::create_dir_all(&codex).expect("codex dir");
+    let config = codex.join("config.toml");
+    fs::write(
+        &config,
+        r#"# >>> agent-session:codex-hooks >>>
+[[hooks.UserPromptSubmit]]
+
+[[hooks.UserPromptSubmit.hooks]]
+type = "command"
+command = "agent-session activity hook --agent codex"
+timeout = 5
+# <<< agent-session:codex-hooks <<<
+"#,
+    )
+    .expect("managed compatibility config");
+    Fixture::set_private(&config);
+
+    let preview = fixture.run(
+        &[
+            "setup",
+            "--product",
+            "codex",
+            "--dry-run",
+            "--format",
+            "json",
+        ],
+        None,
+    );
+    assert_eq!(preview.code, 0, "stderr={}", preview.stderr_text());
+    let plan_digest = preview.stdout_json()["data"]["plan_digest"]
+        .as_str()
+        .expect("plan digest")
+        .to_string();
+
+    let applied = fixture.run(
+        &[
+            "setup",
+            "--product",
+            "codex",
+            "--apply",
+            "--expected-plan-digest",
+            &plan_digest,
+            "--format",
+            "json",
+        ],
+        None,
+    );
+    assert_eq!(applied.code, 0, "stderr={}", applied.stderr_text());
+
+    let installed = fs::read(&config).expect("installed config");
+    assert!(
+        !String::from_utf8_lossy(&installed).contains("# >>> agent-session:codex-hooks >>>"),
+        "retired manager opening marker must be removed"
+    );
+    assert!(
+        !String::from_utf8_lossy(&installed).contains("# <<< agent-session:codex-hooks <<<"),
+        "retired manager closing marker must be removed"
+    );
+
+    let second_preview = fixture.run(
+        &[
+            "setup",
+            "--product",
+            "codex",
+            "--dry-run",
+            "--format",
+            "json",
+        ],
+        None,
+    );
+    assert_eq!(
+        second_preview.code,
+        0,
+        "stdout={} stderr={}",
+        second_preview.stdout_text(),
+        second_preview.stderr_text()
+    );
+    assert_eq!(
+        second_preview.stdout_json()["data"]["would_change"],
+        false,
+        "second setup preview must be idempotent"
+    );
+    assert_eq!(
+        fs::read(&config).expect("idempotent config"),
+        installed,
+        "second setup preview must preserve provider bytes"
+    );
+
+    fs::write(
+        &config,
+        [
+            b"# <<< agent-session:codex-hooks <<<\n".as_slice(),
+            installed.as_slice(),
+        ]
+        .concat(),
+    )
+    .expect("v1.25.5 orphaned marker fixture");
+    let recovery_preview = fixture.run(
+        &[
+            "setup",
+            "--product",
+            "codex",
+            "--dry-run",
+            "--format",
+            "json",
+        ],
+        None,
+    );
+    assert_eq!(
+        recovery_preview.code,
+        0,
+        "stdout={} stderr={}",
+        recovery_preview.stdout_text(),
+        recovery_preview.stderr_text()
+    );
+    let recovery_digest = recovery_preview.stdout_json()["data"]["plan_digest"]
+        .as_str()
+        .expect("recovery plan digest")
+        .to_string();
+    let recovered = fixture.run(
+        &[
+            "setup",
+            "--product",
+            "codex",
+            "--apply",
+            "--expected-plan-digest",
+            &recovery_digest,
+            "--format",
+            "json",
+        ],
+        None,
+    );
+    assert_eq!(recovered.code, 0, "stderr={}", recovered.stderr_text());
+    assert!(
+        !fs::read_to_string(&config)
+            .expect("recovered config")
+            .contains("# <<< agent-session:codex-hooks <<<")
+    );
+
+    let malformed_layouts = [
+        "# >>> agent-session:codex-hooks >>>\n[model]\nname = \"fixture\"\n",
+        "# <<< agent-session:codex-hooks <<<\n# >>> agent-session:codex-hooks >>>\n[model]\nname = \"fixture\"\n",
+        "# >>> agent-session:codex-hooks >>>\n# >>> agent-session:codex-hooks >>>\n[model]\nname = \"fixture\"\n# <<< agent-session:codex-hooks <<<\n",
+        "# >>> agent-session:codex-hooks >>>\n[model]\nname = \"fixture\"\n# <<< agent-session:codex-hooks <<<\n# <<< agent-session:codex-hooks <<<\n",
+    ];
+    for malformed in malformed_layouts {
+        let malformed_fixture = Fixture::new(COORDINATION_POLICY);
+        let malformed_codex = malformed_fixture.home.join(".codex");
+        fs::create_dir_all(&malformed_codex).expect("malformed codex dir");
+        let malformed_config = malformed_codex.join("config.toml");
+        fs::write(&malformed_config, malformed).expect("malformed config");
+        Fixture::set_private(&malformed_config);
+        let before = fs::read(&malformed_config).expect("malformed bytes before");
+
+        let rejected = malformed_fixture.run(
+            &[
+                "setup",
+                "--product",
+                "codex",
+                "--dry-run",
+                "--format",
+                "json",
+            ],
+            None,
+        );
+        assert_eq!(
+            rejected.code,
+            65,
+            "stdout={} stderr={}",
+            rejected.stdout_text(),
+            rejected.stderr_text()
+        );
+        assert_eq!(
+            fs::read(&malformed_config).expect("malformed bytes after"),
+            before,
+            "malformed marker rejection must not mutate provider bytes"
+        );
+    }
+}
+
+#[test]
 fn claude_setup_preserves_unrelated_hooks_and_migrates_grouped_compatibility_handlers() {
     let fixture = Fixture::new(POLICY);
     let claude = fixture.home.join(".claude");
