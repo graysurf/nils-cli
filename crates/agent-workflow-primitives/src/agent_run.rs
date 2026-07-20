@@ -9,6 +9,11 @@ use clap::{Args, Parser, Subcommand, ValueEnum, ValueHint};
 use serde::Serialize;
 use serde_json::{Value, json};
 
+use nils_common::cli_contract::{Envelope, exit, schema_version_for};
+use nils_common::execution_effect::{
+    Effect, OperationEffectDescriptor, OperationEffectInput, ProviderEffect, canonical_target,
+};
+
 use crate::common::{
     CliError, EXIT_RUNTIME, EXIT_UNAVAILABLE, OutputFormat, absolute_path, display_path,
     render_error, render_success,
@@ -17,8 +22,49 @@ use crate::completion::{self, CompletionShell};
 
 const DOCTOR_COMMAND: &str = "agent-run doctor";
 const ENV_COMMAND: &str = "agent-run env";
+const INSPECT_CHILD_ARG: &str = "__inspect-child";
 const DOCTOR_SCHEMA_VERSION: &str = "cli.agent-run.doctor.v1";
 const ENV_SCHEMA_VERSION: &str = "cli.agent-run.env.v1";
+
+#[cfg(target_os = "linux")]
+mod inspect;
+
+#[cfg(not(target_os = "linux"))]
+mod inspect {
+    use std::ffi::OsString;
+    use std::path::Path;
+
+    use nils_common::execution_effect::OsEnforcement;
+
+    use crate::common::EXIT_UNAVAILABLE;
+
+    #[derive(Debug)]
+    pub(super) struct InspectError {
+        pub(super) code: &'static str,
+        pub(super) message: String,
+        pub(super) exit_code: i32,
+    }
+
+    fn unsupported() -> InspectError {
+        InspectError {
+            code: "sandbox-backend-unavailable",
+            message: "agent-run inspect is not supported on this operating system".to_string(),
+            exit_code: EXIT_UNAVAILABLE,
+        }
+    }
+
+    pub(super) fn run(_cwd: &Path, _argv: &[OsString]) -> Result<i32, InspectError> {
+        Err(unsupported())
+    }
+
+    pub(super) fn probe_enforcement(_cwd: &Path) -> Result<OsEnforcement, InspectError> {
+        Err(unsupported())
+    }
+
+    pub(super) fn run_child(_argv: &[OsString]) -> i32 {
+        EXIT_UNAVAILABLE
+    }
+}
 
 pub fn run() -> i32 {
     run_with_args(env::args_os())
@@ -30,6 +76,9 @@ where
     T: Into<OsString> + Clone,
 {
     let argv: Vec<OsString> = args.into_iter().map(Into::into).collect();
+    if argv.get(1).is_some_and(|arg| arg == INSPECT_CHILD_ARG) {
+        return inspect::run_child(&argv[2..]);
+    }
     let cli = match Cli::try_parse_from(argv.clone()) {
         Ok(cli) => cli,
         Err(err) => return crate::common::handle_parse_error("agent-run", argv, err),
@@ -37,10 +86,155 @@ where
 
     match cli.command {
         Command::Exec(args) => run_exec(args),
+        Command::Inspect(args) => run_inspect(args),
         Command::Doctor(args) => run_doctor(args),
         Command::Env(args) => run_env(args),
         Command::Completion(args) => completion::run::<Cli>(args.shell, "agent-run"),
+        Command::OperationEffect(args) => run_operation_effect(args),
     }
+}
+
+fn run_inspect(args: InspectArgs) -> i32 {
+    if args.command.is_empty() {
+        eprintln!("agent-run inspect: error[missing-command]: command after `--` is required");
+        return crate::common::EXIT_USAGE;
+    }
+    let cwd = match resolve_cwd(&args.cwd) {
+        Ok(cwd) => cwd,
+        Err(error) => {
+            eprintln!(
+                "agent-run inspect: error[{}]: {}",
+                error.code, error.message
+            );
+            return error.exit_code;
+        }
+    };
+    match inspect::run(&cwd, &args.command) {
+        Ok(code) => code,
+        Err(error) => {
+            eprintln!(
+                "agent-run inspect: error[{}]: {}",
+                error.code, error.message
+            );
+            error.exit_code
+        }
+    }
+}
+
+fn run_operation_effect(args: OperationEffectArgs) -> i32 {
+    let format = args.format;
+    let mut parsed_argv = Vec::with_capacity(args.argv.len() + 1);
+    parsed_argv.push(OsString::from("agent-run"));
+    parsed_argv.extend(args.argv.iter().cloned());
+    let parsed = match Cli::try_parse_from(parsed_argv) {
+        Ok(parsed) => parsed,
+        Err(error) => {
+            return nils_common::cli_contract::emit_parse_error(
+                "agent-run",
+                format,
+                "operation-effect-parse-error",
+                error
+                    .to_string()
+                    .lines()
+                    .find(|line| !line.trim().is_empty())
+                    .unwrap_or("operation argv did not parse"),
+            );
+        }
+    };
+    let Command::Inspect(inspect_args) = parsed.command else {
+        return emit_non_inspection_effect(&args.argv, format);
+    };
+    let cwd = match resolve_cwd(&inspect_args.cwd) {
+        Ok(cwd) => cwd,
+        Err(error) => {
+            return render_error(
+                "cli.agent-run.operation-effect.v1",
+                "agent-run operation-effect",
+                format,
+                error.into_cli_error(),
+            );
+        }
+    };
+    let enforcement = match inspect::probe_enforcement(&cwd) {
+        Ok(enforcement) => enforcement,
+        Err(error) => {
+            return render_error(
+                "cli.agent-run.operation-effect.v1",
+                "agent-run operation-effect",
+                format,
+                CliError::unavailable(error.code, error.message, None),
+            );
+        }
+    };
+    let targets = vec![canonical_target(cwd)];
+    let descriptor = match OperationEffectDescriptor::for_current_process_os(
+        OperationEffectInput {
+            tool: "agent-run",
+            release: env!("CARGO_PKG_VERSION"),
+            operation: "inspect",
+            effect: Effect::ReadOnly,
+            provider_effect: ProviderEffect::None,
+            managed_state_reads: Vec::new(),
+            argv: &args.argv,
+            targets: &targets,
+        },
+        enforcement,
+    ) {
+        Ok(descriptor) => descriptor,
+        Err(error) => {
+            return render_error(
+                "cli.agent-run.operation-effect.v1",
+                "agent-run operation-effect",
+                format,
+                CliError::unavailable("operation-effect-binding-failed", error, None),
+            );
+        }
+    };
+    emit_operation_effect(format, descriptor)
+}
+
+fn emit_non_inspection_effect(argv: &[OsString], format: OutputFormat) -> i32 {
+    let descriptor = match OperationEffectDescriptor::for_current_process(OperationEffectInput {
+        tool: "agent-run",
+        release: env!("CARGO_PKG_VERSION"),
+        operation: "non-inspection",
+        effect: Effect::Mutation,
+        provider_effect: ProviderEffect::None,
+        managed_state_reads: Vec::new(),
+        argv,
+        targets: &[],
+    }) {
+        Ok(descriptor) => descriptor,
+        Err(error) => {
+            return render_error(
+                "cli.agent-run.operation-effect.v1",
+                "agent-run operation-effect",
+                format,
+                CliError::unavailable("operation-effect-binding-failed", error, None),
+            );
+        }
+    };
+    emit_operation_effect(format, descriptor)
+}
+
+fn emit_operation_effect(format: OutputFormat, descriptor: OperationEffectDescriptor) -> i32 {
+    match format {
+        OutputFormat::Json => {
+            let envelope = Envelope::success(
+                schema_version_for("agent-run", "operation-effect", 1),
+                descriptor,
+            );
+            match serde_json::to_string(&envelope) {
+                Ok(json) => println!("{json}"),
+                Err(_) => return exit::SOFTWARE,
+            }
+        }
+        OutputFormat::Text => println!(
+            "agent-run operation-effect: {} {:?}",
+            descriptor.operation, descriptor.effect
+        ),
+    }
+    exit::SUCCESS
 }
 
 fn run_exec(args: ExecArgs) -> i32 {
@@ -419,7 +613,7 @@ fn display_os(value: &OsStr) -> String {
     about = "Run agent commands through a normalized project environment.",
     long_about = "Run project build, test, and validation commands through a normalized project environment, including direnv when a project env file applies.",
     disable_help_subcommand = true,
-    after_help = "EXAMPLES:\n  agent-run exec --cwd . -- cargo test\n  agent-run exec --cwd . --direnv require -- npm test\n  agent-run doctor --cwd . --format json\n  agent-run env --cwd . --format json\n  agent-run completion zsh\n\nENVIRONMENT:\n  PATH  Used to locate direnv and the child command.\n\nEXIT CODES:\n  0   success\n  1   runtime error\n  64  command-line usage error\n  69  required project environment unavailable\n  N   child command exit code when the child starts and exits normally"
+    after_help = "EXAMPLES:\n  agent-run exec --cwd . -- cargo test\n  agent-run inspect --cwd . -- sh -c 'rg TODO | head'\n  agent-run exec --cwd . --direnv require -- npm test\n  agent-run doctor --cwd . --format json\n  agent-run env --cwd . --format json\n  agent-run completion zsh\n\nENVIRONMENT:\n  PATH  Used to locate direnv and the child command.\n\nEXIT CODES:\n  0   success\n  1   runtime error\n  64  command-line usage error\n  69  required project environment or sandbox backend unavailable\n  70  sandbox bound or cleanup failure\n  N   child command exit code when the child starts and exits normally"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -431,12 +625,16 @@ struct Cli {
 enum Command {
     /// Execute a command in the selected project environment.
     Exec(ExecArgs),
+    /// Execute a local inspection command in a read-only, network-denied OS sandbox.
+    Inspect(InspectArgs),
     /// Report project environment readiness.
     Doctor(DoctorArgs),
     /// Emit machine-readable project environment status.
     Env(EnvArgs),
     /// Print shell completion script.
     Completion(CompletionArgs),
+    #[command(hide = true)]
+    OperationEffect(OperationEffectArgs),
 }
 
 #[derive(Debug, Args)]
@@ -457,6 +655,36 @@ struct ExecArgs {
         value_name = "COMMAND"
     )]
     command: Vec<OsString>,
+}
+
+#[derive(Debug, Args)]
+struct InspectArgs {
+    /// Working directory visible read-only to the inspection command.
+    #[arg(long, value_name = "DIR", default_value = ".", value_hint = ValueHint::DirPath)]
+    cwd: PathBuf,
+
+    /// Exact command argv to execute in the enforced sandbox. Pass after `--`.
+    #[arg(
+        required = true,
+        trailing_var_arg = true,
+        allow_hyphen_values = true,
+        value_name = "COMMAND"
+    )]
+    command: Vec<OsString>,
+}
+
+#[derive(Debug, Args)]
+struct OperationEffectArgs {
+    #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
+    format: OutputFormat,
+
+    #[arg(
+        required = true,
+        trailing_var_arg = true,
+        allow_hyphen_values = true,
+        value_name = "COMMAND"
+    )]
+    argv: Vec<OsString>,
 }
 
 #[derive(Debug, Args)]

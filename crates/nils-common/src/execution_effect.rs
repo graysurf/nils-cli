@@ -42,6 +42,108 @@ pub enum ProviderEffect {
     NetworkWrite,
 }
 
+pub const OS_ENFORCEMENT_MAX_WALL_TIME_MS: u64 = 30_000;
+pub const OS_ENFORCEMENT_MAX_OUTPUT_BYTES: u64 = 8 * 1024 * 1024;
+pub const OS_ENFORCEMENT_MAX_PROCESSES: u32 = 64;
+pub const OS_ENFORCEMENT_MAX_MEMORY_BYTES: u64 = 1024 * 1024 * 1024;
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct BackendIdentity {
+    pub kind: String,
+    pub release: String,
+    pub executable_digest: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ExecutionLimits {
+    pub wall_time_ms: u64,
+    pub output_bytes: u64,
+    pub process_count: u32,
+    pub memory_bytes: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct OsEnforcement {
+    pub backend: BackendIdentity,
+    pub durable_roots_read_only: bool,
+    pub network_denied: bool,
+    pub private_ephemeral_roots: Vec<String>,
+    pub inherited_credentials_cleared: bool,
+    pub inherited_writable_fds_closed: bool,
+    pub descendants_contained: bool,
+    pub limits: ExecutionLimits,
+}
+
+impl OsEnforcement {
+    pub fn strict_v1(backend: BackendIdentity) -> Self {
+        Self {
+            backend,
+            durable_roots_read_only: true,
+            network_denied: true,
+            private_ephemeral_roots: [
+                "home",
+                "tmp",
+                "xdg_cache",
+                "xdg_config",
+                "xdg_data",
+                "xdg_runtime",
+                "xdg_state",
+            ]
+            .into_iter()
+            .map(str::to_string)
+            .collect(),
+            inherited_credentials_cleared: true,
+            inherited_writable_fds_closed: true,
+            descendants_contained: true,
+            limits: ExecutionLimits {
+                wall_time_ms: OS_ENFORCEMENT_MAX_WALL_TIME_MS,
+                output_bytes: OS_ENFORCEMENT_MAX_OUTPUT_BYTES,
+                process_count: OS_ENFORCEMENT_MAX_PROCESSES,
+                memory_bytes: OS_ENFORCEMENT_MAX_MEMORY_BYTES,
+            },
+        }
+    }
+
+    pub fn satisfies_strict_v1(&self) -> bool {
+        let expected_roots = [
+            "home",
+            "tmp",
+            "xdg_cache",
+            "xdg_config",
+            "xdg_data",
+            "xdg_runtime",
+            "xdg_state",
+        ];
+        matches!(
+            self.backend.kind.as_str(),
+            "linux.bubblewrap-systemd.v1" | "macos.sandbox-exec.v1"
+        ) && !self.backend.release.is_empty()
+            && self.backend.release.len() <= 192
+            && valid_digest(&self.backend.executable_digest)
+            && self.durable_roots_read_only
+            && self.network_denied
+            && self.inherited_credentials_cleared
+            && self.inherited_writable_fds_closed
+            && self.descendants_contained
+            && self
+                .private_ephemeral_roots
+                .iter()
+                .map(String::as_str)
+                .eq(expected_roots)
+            && self.limits.wall_time_ms > 0
+            && self.limits.wall_time_ms <= OS_ENFORCEMENT_MAX_WALL_TIME_MS
+            && self.limits.output_bytes > 0
+            && self.limits.output_bytes <= OS_ENFORCEMENT_MAX_OUTPUT_BYTES
+            && self.limits.process_count > 0
+            && self.limits.process_count <= OS_ENFORCEMENT_MAX_PROCESSES
+            && self.limits.memory_bytes > 0
+            && self.limits.memory_bytes <= OS_ENFORCEMENT_MAX_MEMORY_BYTES
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ProducerIdentity {
@@ -68,6 +170,8 @@ pub struct OperationEffectDescriptor {
     pub effect: Effect,
     pub provider_effect: ProviderEffect,
     pub managed_state_reads: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub os_enforcement: Option<OsEnforcement>,
     pub binding: InvocationBinding,
     pub issued_at_epoch: i64,
 }
@@ -85,6 +189,24 @@ pub struct OperationEffectInput<'a> {
 
 impl OperationEffectDescriptor {
     pub fn for_current_process(input: OperationEffectInput<'_>) -> Result<Self, String> {
+        Self::for_current_process_with(input, CapabilityClass::ToolContract, None)
+    }
+
+    pub fn for_current_process_os(
+        input: OperationEffectInput<'_>,
+        enforcement: OsEnforcement,
+    ) -> Result<Self, String> {
+        if !enforcement.satisfies_strict_v1() {
+            return Err("OS enforcement does not satisfy the strict v1 contract".to_string());
+        }
+        Self::for_current_process_with(input, CapabilityClass::OsEnforced, Some(enforcement))
+    }
+
+    fn for_current_process_with(
+        input: OperationEffectInput<'_>,
+        capability_class: CapabilityClass,
+        os_enforcement: Option<OsEnforcement>,
+    ) -> Result<Self, String> {
         let executable = std::env::current_exe()
             .and_then(fs::canonicalize)
             .map_err(|error| format!("failed to resolve current executable: {error}"))?;
@@ -97,7 +219,7 @@ impl OperationEffectDescriptor {
 
         Ok(Self {
             schema_version: OPERATION_EFFECT_VERSION.to_string(),
-            capability_class: CapabilityClass::ToolContract,
+            capability_class,
             producer: ProducerIdentity {
                 tool: input.tool.to_string(),
                 release: input.release.to_string(),
@@ -107,6 +229,7 @@ impl OperationEffectDescriptor {
             effect: input.effect,
             provider_effect: input.provider_effect,
             managed_state_reads: input.managed_state_reads,
+            os_enforcement,
             binding: InvocationBinding {
                 argv_digest: argv_digest(input.argv),
                 cwd_digest: digest_parts([cwd.as_os_str().as_encoded_bytes()]),
@@ -115,6 +238,15 @@ impl OperationEffectDescriptor {
             issued_at_epoch: jiff::Timestamp::now().as_second(),
         })
     }
+}
+
+fn valid_digest(value: &str) -> bool {
+    value.strip_prefix("sha256:").is_some_and(|digest| {
+        digest.len() == 64
+            && digest
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+    })
 }
 
 pub fn executable_digest(path: &std::path::Path) -> Result<String, String> {

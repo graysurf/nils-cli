@@ -65,6 +65,8 @@ path = "src/bin/test-first-evidence.rs"
 clap = { workspace = true }
 clap_complete = { workspace = true }
 jiff = { workspace = true }
+getrandom = { workspace = true }
+libc = { workspace = true }
 nils-build-info = { version = "1.25.6", path = "../nils-build-info" }
 nils-agent-out = { version = "1.25.6", path = "../agent-out" }
 nils-agent-docs = { version = "1.25.6", path = "../agent-docs" }
