@@ -57,6 +57,8 @@ tracked separately in the [Crate Top-Level README Inventory](#crate-top-level-re
 below; the canonical `find` glob `crates/*/README.md` excludes any `README.md` under a crate root
 because BSD-style `-path` lets `*` cross slash boundaries.
 
+- `crates/agent-hook/docs/reports/agent-hook-completion-migration-contract.md`
+- `crates/agent-hook/docs/specs/agent-hook-v1.md`
 - `crates/agent-runtime/docs/determinism.md`
 - `crates/agent-session/docs/provider-turn-signal-evidence.md`
 - `crates/agent-session/docs/reports/agent-session-completion-migration-contract.md`
@@ -107,9 +109,10 @@ as the GitHub crate-directory landing page) and a `docs/README.md` index for cra
 These files are excluded from the canonical Crate-Local Inventory `find` pattern, so they are
 tracked here.
 
-Top-level crate READMEs (one per workspace member, 45 total):
+Top-level crate READMEs (one per workspace member, 46 total):
 
 - `crates/agent-docs/README.md`
+- `crates/agent-hook/README.md`
 - `crates/agent-memory/README.md`
 - `crates/agent-out/README.md`
 - `crates/agent-runtime/README.md`
@@ -155,9 +158,10 @@ Top-level crate READMEs (one per workspace member, 45 total):
 - `crates/web-evidence/README.md`
 - `crates/zsh-kit/README.md`
 
-Crate `docs/README.md` index files (one per workspace member, 45 total):
+Crate `docs/README.md` index files (one per workspace member, 46 total):
 
 - `crates/agent-docs/docs/README.md`
+- `crates/agent-hook/docs/README.md`
 - `crates/agent-memory/docs/README.md`
 - `crates/agent-out/docs/README.md`
 - `crates/agent-runtime/docs/README.md`
