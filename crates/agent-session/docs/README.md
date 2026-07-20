@@ -1,8 +1,30 @@
-# agent-session Docs
+# agent-session Documentation
 
-Crate-local documentation for the `agent-session` CLI.
+Use the crate [README](../README.md) for the product overview, command examples,
+and the complete current surface map. Use the documents below when operating or
+integrating a specific subsystem.
 
-- [README](../README.md)
-- [Activity stream v1 contract](specs/activity-stream-v1.md)
-- [Session maintenance v1 contract](specs/session-maintenance-v1.md)
-- [Completion migration contract](reports/agent-session-completion-migration-contract.md)
+## Operator runbooks
+
+- [Work coordination](runbooks/work-coordination.md): coordination modes,
+  declared paths, authority boundaries, advisory flow, and enforce flow.
+- [Serve daemon operations](runbooks/serve-daemon.md): safe startup,
+  authentication boundaries, HTTP session creation, and restart survival.
+
+## Stable contracts
+
+- [Session coordination v1](specs/session-coordination-v1.md): normative
+  schemas, state machines, authorization, routes, limits, and failure codes.
+- [Turn-state contract](turn-state-contract.md): runtime-bound activity state,
+  privacy projection, replay, and provider setup behavior.
+- [Activity stream v1](specs/activity-stream-v1.md): SSE stream, replay,
+  reset, flow control, and privacy contract.
+- [Session maintenance v1](specs/session-maintenance-v1.md): repair and
+  maintenance operation contract.
+
+## Evidence and migration reports
+
+- [Provider turn-signal evidence](provider-turn-signal-evidence.md): provider
+  versions and lifecycle-signal evidence behind the turn-state integration.
+- [Completion migration contract](reports/agent-session-completion-migration-contract.md):
+  clap-first completion coverage and verification record.

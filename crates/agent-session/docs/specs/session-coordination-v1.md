@@ -501,9 +501,13 @@ JSON uses the existing `cli.agent-session.<command>.v1` success/error envelope
 convention. Errors never echo body, capability, request JSON, local private
 paths, or peer summary.
 
-## HTTP parity
+## HTTP coverage
 
-The loopback server exposes the same library operations and schemas:
+The loopback server exposes the raw work-context, broker, and mailbox library
+operations below. The high-level self-targeting CLI conveniences
+`work-context status|set|clear|advise|acknowledge` are CLI-only; they derive
+trusted session and checkout state from the managed runtime and do not have
+one-for-one HTTP routes.
 
 ```text
 GET  /sessions/{id}/work-context/v1
@@ -526,11 +530,12 @@ POST /sessions/{id}/messages/{message_id}/reply/v1
 GET  /sessions/{id}/messages/{message_id}/wait/v1
 ```
 
-CLI and HTTP share one implementation, canonicalization, authorization,
-idempotency, error codes, limits, and privacy projection. HTTP public reads
-require only the server operator bearer; owner/mailbox mutations additionally
-require the exact session capability. Conflicting selectors are rejected. Wait
-cancellation closes without changing message state.
+For the raw operations that both transports expose, CLI and HTTP share one
+implementation, canonicalization, authorization, idempotency, error codes,
+limits, and privacy projection. HTTP public reads require only the server
+operator bearer; owner/mailbox mutations additionally require the exact session
+capability. Conflicting selectors are rejected. Wait cancellation closes
+without changing message state.
 
 For `POST /sessions/{id}/messages/v1`, `{id}` is the recipient. The required
 `X-Agent-Session-Capability` determines the sender; the JSON body contains only
@@ -595,8 +600,9 @@ Release readiness requires:
 - capability, incarnation, revision, idempotency, and target-subset negatives;
 - fake-clock/process coverage for long operations, broker loss/adoption,
   missed completion, replacement, and cleanup;
-- CLI/HTTP parity for every operation, selector combination, error, wait, and
-  cancellation outcome;
+- CLI/HTTP parity for every shared raw operation, selector combination, error,
+  wait, and cancellation outcome, plus explicit coverage that self-targeting
+  conveniences remain CLI-only;
 - mailbox permissions, limits, rate, pagination, retention, flood/restart, and
   privacy canaries;
 - held-launch crash injection at record, pane, identity, credential, broker

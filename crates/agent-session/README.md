@@ -13,6 +13,20 @@ prompt, then return a short tmux attach command for the user to continue from Te
 | Package name | `nils-agent-session` |
 | Binary name  | `agent-session`      |
 
+## Documentation map
+
+- Start here for commands and the complete surface overview: this README.
+- Operate collision awareness and work permissions:
+  [Work coordination](docs/runbooks/work-coordination.md).
+- Deploy the HTTP/WebSocket control plane:
+  [Serve daemon operations](docs/runbooks/serve-daemon.md).
+- Integrate stable schemas and state machines:
+  [Session coordination v1](docs/specs/session-coordination-v1.md),
+  [turn-state contract](docs/turn-state-contract.md), and
+  [activity stream v1](docs/specs/activity-stream-v1.md).
+- Browse every crate-local document by purpose:
+  [agent-session documentation](docs/README.md).
+
 ## Usage
 
 ```bash
@@ -87,9 +101,10 @@ after readiness discards it.
 ## Session coordination
 
 Session coordination is collision awareness by default, not a prerequisite for
-agent work. `start`, `run`, provider import, and HTTP create accept
-`--coordination-mode advisory|enforce|off`; `advisory` is the default and is
-also the compatibility default for older session records. Managed broker
+agent work. CLI `start` and `run` accept
+`--coordination-mode advisory|enforce|off`; provider import and HTTP create use
+the JSON field `coordination_mode`. `advisory` is the default and is also the
+compatibility default for older session records. Managed broker
 liveness automatically publishes privacy-safe presence. The default hook
 consumer can therefore warn about the same worktree, provider/task/path
 overlap, or the same repository in another worktree without requiring a claim.
@@ -116,7 +131,10 @@ managed runtime. `set` accepts a concise summary plus optional tier,
 repository-relative paths, issue/PR numbers, and plan references; it does not
 require a hand-authored private JSON file. Context is optional in advisory
 mode, automatically renewed while the broker remains live, and released with
-the broker. `acknowledge` suppresses only the exact overlap most recently
+the broker. A `--path` ending in `/` declares a `path-prefix`; without the
+trailing slash it declares a `path-exact`. See the
+[work coordination runbook](docs/runbooks/work-coordination.md#path-scope-syntax)
+for examples. `acknowledge` suppresses only the exact overlap most recently
 observed by that session, for at most eight hours; a changed peer,
 incarnation, reason, repository, or availability warns again. Moving between
 targets covered by the same known overlap does not create warning spam. It
@@ -437,8 +455,10 @@ is no second state model.
   Prompt, terminal-input, and auto-resume submission paths fail closed while a
   selected binding is `pending` or `failed`, so the next accepted prompt uses
   the newly selected account.
-- `POST /sessions` normally creates a fresh session from `agent`, optional `cwd`, `title`, `id`, `prompt`, and
-  `agent_args`. A fresh create may add an advertised `agent_profile`; the id
+- `POST /sessions` normally creates a fresh session from `agent`, optional
+  `cwd`, `title`, `title_state`, `id`, `prompt`, `coordination_mode`, and
+  `agent_args`. `coordination_mode` accepts `advisory`, `enforce`, or `off` and
+  defaults to `advisory`. A fresh create may add an advertised `agent_profile`; the id
   must match the supplied base `agent` and be ready when the request arrives.
   A profile whose summary reports `provider_resume_import_supported: true` may
   also be selected with `provider_resume_id`; discovery is then confined to
