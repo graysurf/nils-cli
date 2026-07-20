@@ -198,6 +198,221 @@ fn codex_setup_preserves_comments_and_renders_session_start() {
 }
 
 #[test]
+fn codex_runtime_kit_trust_boundary_repair_requires_review_and_preserves_tables() {
+    let fixture = Fixture::new(POLICY);
+    let codex = fixture.home.join(".codex");
+    fs::create_dir_all(&codex).expect("codex dir");
+    let config = codex.join("config.toml");
+    let original = r#"# >>> agent-runtime-kit:hooks >>>
+[[hooks.Stop]]
+
+[[hooks.Stop.hooks]]
+type = "command"
+command = "keep-user-hook"
+timeout = 7
+
+[hooks.state]
+
+[hooks.state."config.toml:stop:1:0"]
+trusted_hash = "sha256:trusted"
+
+[projects."/foreign/project"]
+trust_level = "trusted"
+# <<< agent-runtime-kit:hooks <<<
+"#;
+    fs::write(&config, original).expect("trust-saved config");
+    Fixture::set_private(&config);
+
+    let preview = fixture.run(
+        &[
+            "setup",
+            "--product",
+            "codex",
+            "--dry-run",
+            "--format",
+            "json",
+        ],
+        None,
+    );
+    assert_eq!(preview.code, 0, "stderr={}", preview.stderr_text());
+    let preview_result = &preview.stdout_json()["data"];
+    assert_eq!(preview_result["status"], "drifted");
+    assert_eq!(preview_result["would_change"], true);
+    assert_eq!(preview_result["apply_allowed"], false);
+    assert_eq!(
+        fs::read_to_string(&config).expect("preview retains config"),
+        original
+    );
+    let digest = preview_result["plan_digest"]
+        .as_str()
+        .expect("plan digest")
+        .to_string();
+
+    let unreviewed = fixture.run(
+        &["setup", "--product", "codex", "--apply", "--format", "json"],
+        None,
+    );
+    assert_eq!(unreviewed.code, 65);
+    assert_eq!(
+        unreviewed.stdout_json()["error"]["code"],
+        "setup-plan-digest-required"
+    );
+    assert_eq!(
+        fs::read_to_string(&config).expect("unreviewed config retained"),
+        original
+    );
+
+    let repaired = fixture.run(
+        &[
+            "setup",
+            "--product",
+            "codex",
+            "--apply",
+            "--expected-plan-digest",
+            &digest,
+            "--format",
+            "json",
+        ],
+        None,
+    );
+    assert_eq!(repaired.code, 0, "stderr={}", repaired.stderr_text());
+    let repaired = fs::read_to_string(&config).expect("repaired config");
+    let runtime_end = repaired
+        .find("# <<< agent-runtime-kit:hooks <<<")
+        .expect("runtime-kit closing marker");
+    let hooks_state = repaired.find("[hooks.state]").expect("hooks trust table");
+    let projects = repaired
+        .find("[projects.\"/foreign/project\"]")
+        .expect("project trust table");
+    assert!(runtime_end < hooks_state);
+    assert!(hooks_state < projects);
+    assert!(
+        repaired
+            .contains("[hooks.state.\"config.toml:stop:1:0\"]\ntrusted_hash = \"sha256:trusted\"")
+    );
+    assert!(repaired.contains("[projects.\"/foreign/project\"]\ntrust_level = \"trusted\""));
+    assert!(repaired.contains("command = \"keep-user-hook\""));
+    assert!(repaired.contains("agent-hook dispatch --product codex"));
+
+    let repeated = fixture.run(
+        &["setup", "--product", "codex", "--apply", "--format", "json"],
+        None,
+    );
+    assert_eq!(repeated.code, 0, "stderr={}", repeated.stderr_text());
+    assert_eq!(repeated.stdout_json()["data"]["changed"], false);
+}
+
+#[test]
+fn codex_runtime_kit_trust_boundary_rejects_ambiguous_markers_without_writes() {
+    let runtime_start = "# >>> agent-runtime-kit:hooks >>>";
+    let runtime_end = "# <<< agent-runtime-kit:hooks <<<";
+    for (name, marker_layout) in [
+        ("orphan-start", format!("{runtime_start}\n")),
+        ("orphan-end", format!("{runtime_end}\n")),
+        (
+            "duplicate-start",
+            format!("{runtime_start}\n{runtime_start}\n{runtime_end}\n"),
+        ),
+        (
+            "duplicate-end",
+            format!("{runtime_start}\n{runtime_end}\n{runtime_end}\n"),
+        ),
+        ("reversed", format!("{runtime_end}\n{runtime_start}\n")),
+    ] {
+        let fixture = Fixture::new(POLICY);
+        let codex = fixture.home.join(".codex");
+        fs::create_dir_all(&codex).expect("codex dir");
+        let config = codex.join("config.toml");
+        let invalid = format!(
+            "{marker_layout}[hooks.state]\n\n[hooks.state.\"config.toml:stop:1:0\"]\ntrusted_hash = \"sha256:trusted\"\n"
+        );
+        fs::write(&config, &invalid).expect("ambiguous config");
+        Fixture::set_private(&config);
+
+        let preview = fixture.run(
+            &[
+                "setup",
+                "--product",
+                "codex",
+                "--dry-run",
+                "--format",
+                "json",
+            ],
+            None,
+        );
+        assert_eq!(
+            preview.code,
+            65,
+            "case={name} stderr={}",
+            preview.stderr_text()
+        );
+        assert_eq!(
+            preview.stdout_json()["error"]["code"],
+            "provider-config-invalid",
+            "case={name}"
+        );
+        assert_eq!(
+            fs::read_to_string(&config).expect("invalid config retained"),
+            invalid,
+            "case={name}"
+        );
+    }
+}
+
+#[test]
+fn codex_runtime_kit_trust_boundary_rejects_unsafe_suffixes_without_writes() {
+    let cases = [
+        (
+            "noncanonical-project-header",
+            "[\"projects\".\"/foreign/project\"]\ntrust_level = \"trusted\"\n",
+        ),
+        (
+            "non-trust-table-after-trust",
+            "[projects.\"/foreign/project\"]\ntrust_level = \"trusted\"\n\n[[hooks.Stop]]\n\n[[hooks.Stop.hooks]]\ntype = \"command\"\ncommand = \"keep-user-hook\"\ntimeout = 7\n",
+        ),
+    ];
+    for (name, suffix) in cases {
+        let fixture = Fixture::new(POLICY);
+        let codex = fixture.home.join(".codex");
+        fs::create_dir_all(&codex).expect("codex dir");
+        let config = codex.join("config.toml");
+        let invalid = format!(
+            "# >>> agent-runtime-kit:hooks >>>\n[[hooks.PreToolUse]]\n\n[[hooks.PreToolUse.hooks]]\ntype = \"command\"\ncommand = \"keep-user-hook\"\ntimeout = 7\n\n{suffix}# <<< agent-runtime-kit:hooks <<<\n"
+        );
+        fs::write(&config, &invalid).expect("unsafe trust suffix");
+        Fixture::set_private(&config);
+
+        let preview = fixture.run(
+            &[
+                "setup",
+                "--product",
+                "codex",
+                "--dry-run",
+                "--format",
+                "json",
+            ],
+            None,
+        );
+        assert_eq!(
+            preview.code,
+            65,
+            "case={name} stderr={}",
+            preview.stderr_text()
+        );
+        assert_eq!(
+            preview.stdout_json()["error"]["code"],
+            "provider-config-invalid",
+            "case={name}"
+        );
+        assert_eq!(
+            fs::read_to_string(&config).expect("unsafe config retained"),
+            invalid,
+            "case={name}"
+        );
+    }
+}
+
+#[test]
 fn doctor_classifies_missing_compatibility_converged_dual_drifted_and_unsupported() {
     let fixture = Fixture::new(POLICY);
     let codex = fixture.home.join(".codex");

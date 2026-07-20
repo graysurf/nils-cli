@@ -283,6 +283,13 @@ For Codex, `config.toml` and compatibility `hooks.json` are one transaction.
 The managed `config.toml` representation also owns the authoritative
 `agent-session activity notify --agent codex` argv: a safe singular user
 notifier is composed by direct argv, and remove restores it byte-for-byte.
+Prior `agent-runtime-kit:hooks` marker lines are validated as an exact ordered
+pair outside TOML multiline values. When Codex has saved trailing `[projects]`
+or `[hooks.state]` trust tables inside that marker pair, setup classifies the
+boundary as drift and an exact reviewed plan digest may move only the closing
+marker ahead of the byte-preserved trust-table suffix. Ambiguous marker layouts,
+noncanonical trust headers that cannot be moved byte-for-byte, and non-trust
+TOML following that suffix fail closed before mutation.
 Owned groups contain exactly one dispatcher command for each required
 event/matcher. Install, upgrade, repair, remove, and rollback preserve
 unrelated hooks, comments, formatting, provider metadata, and unsupported

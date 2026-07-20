@@ -18,6 +18,8 @@ use crate::paths::Layout;
 
 const CODEX_BLOCK_START: &str = "# >>> agent-hook:provider-ingress:v1 >>>";
 const CODEX_BLOCK_END: &str = "# <<< agent-hook:provider-ingress:v1 <<<";
+const RUNTIME_KIT_BLOCK_START: &str = "# >>> agent-runtime-kit:hooks >>>";
+const RUNTIME_KIT_BLOCK_END: &str = "# <<< agent-runtime-kit:hooks <<<";
 const DISPATCH_TIMEOUT_SECONDS: i64 = 10;
 const CODEX_NOTIFY_ARGV: [&str; 5] = ["agent-session", "activity", "notify", "--agent", "codex"];
 const CODEX_NOTIFY_FORWARD_FLAG: &str = "--forward-notify-argv-json";
@@ -314,16 +316,18 @@ fn build_codex_plan(
         .transpose()
         .map_err(|_| HookError::data("provider-config-invalid", "Codex config is not UTF-8"))?
         .unwrap_or_default();
-    raw.parse::<DocumentMut>().map_err(|_| {
+    let (boundary_repaired_raw, trust_boundary_repaired) = repair_codex_trust_boundary(raw)?;
+    boundary_repaired_raw.parse::<DocumentMut>().map_err(|_| {
         HookError::data("provider-config-invalid", "Codex config is not valid TOML")
     })?;
     let expected_block = render_codex_block(&groups, product);
-    let (stripped, owned_before, drifted) = strip_codex_block(raw, &expected_block)?;
+    let (stripped, owned_before, drifted) =
+        strip_codex_block(&boundary_repaired_raw, &expected_block)?;
     let mut document = stripped.parse::<DocumentMut>().map_err(|_| {
         HookError::data("provider-config-invalid", "Codex config is not valid TOML")
     })?;
     let (legacy_before, unrelated_before) = inspect_toml_handlers(&document);
-    let notify = plan_codex_notification(&mut document, action, raw)?;
+    let notify = plan_codex_notification(&mut document, action, &stripped)?;
     remove_legacy_toml_handlers(&mut document);
     let mut rendered = document.to_string();
     if action != SetupAction::Remove {
@@ -337,7 +341,12 @@ fn build_codex_plan(
     } else {
         Some(rendered.into_bytes())
     };
-    if action == SetupAction::Remove && owned_before == 0 && legacy_before == 0 && !notify.changed {
+    if action == SetupAction::Remove
+        && owned_before == 0
+        && legacy_before == 0
+        && !notify.changed
+        && !trust_boundary_repaired
+    {
         candidate = original.clone();
     }
     validate_candidate_size(candidate.as_deref())?;
@@ -373,7 +382,7 @@ fn build_codex_plan(
         },
         legacy_before: legacy_before + hooks_owned + hooks_legacy,
         unrelated_before: unrelated_before + hooks_unrelated,
-        drifted: drifted || hooks_drifted || notify.requires_review,
+        drifted: drifted || hooks_drifted || notify.requires_review || trust_boundary_repaired,
         auxiliary_configured_before: notify.configured_before,
         auxiliary_configured_after: notify.configured_after,
     })
@@ -644,6 +653,259 @@ fn validate_candidate_size(candidate: Option<&[u8]>) -> Result<(), HookError> {
         ));
     }
     Ok(())
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TomlMultilineString {
+    None,
+    Basic,
+    Literal,
+}
+
+fn toml_multiline_value_line_starts(raw: &str) -> Vec<usize> {
+    let mut starts = Vec::new();
+    let mut state = TomlMultilineString::None;
+    let mut offset = 0_usize;
+    for line in raw.split_inclusive('\n') {
+        if state != TomlMultilineString::None {
+            starts.push(offset);
+        }
+        let bytes = line.as_bytes();
+        let mut index = 0_usize;
+        while index < bytes.len() {
+            match state {
+                TomlMultilineString::None => match bytes[index] {
+                    b'#' => break,
+                    b'"' if bytes[index..].starts_with(b"\"\"\"") => {
+                        state = TomlMultilineString::Basic;
+                        index += 3;
+                    }
+                    b'\'' if bytes[index..].starts_with(b"'''") => {
+                        state = TomlMultilineString::Literal;
+                        index += 3;
+                    }
+                    b'"' => {
+                        index += 1;
+                        while index < bytes.len() {
+                            match bytes[index] {
+                                b'\\' => index = (index + 2).min(bytes.len()),
+                                b'"' => {
+                                    index += 1;
+                                    break;
+                                }
+                                _ => index += 1,
+                            }
+                        }
+                    }
+                    b'\'' => {
+                        index += 1;
+                        while index < bytes.len() && bytes[index] != b'\'' {
+                            index += 1;
+                        }
+                        index = (index + 1).min(bytes.len());
+                    }
+                    _ => index += 1,
+                },
+                TomlMultilineString::Basic => {
+                    if bytes[index..].starts_with(b"\"\"\"") {
+                        state = TomlMultilineString::None;
+                        index += 3;
+                    } else if bytes[index] == b'\\' {
+                        index = (index + 2).min(bytes.len());
+                    } else {
+                        index += 1;
+                    }
+                }
+                TomlMultilineString::Literal => {
+                    if bytes[index..].starts_with(b"'''") {
+                        state = TomlMultilineString::None;
+                        index += 3;
+                    } else {
+                        index += 1;
+                    }
+                }
+            }
+        }
+        offset += line.len();
+    }
+    starts
+}
+
+fn toml_marker_line_ranges(
+    raw: &str,
+    marker: &str,
+    multiline_value_lines: &[usize],
+) -> Vec<(usize, usize)> {
+    let mut offset = 0_usize;
+    raw.split_inclusive('\n')
+        .filter_map(|line| {
+            let start = offset;
+            offset += line.len();
+            let without_newline = line.strip_suffix('\n').unwrap_or(line);
+            let content = without_newline
+                .strip_suffix('\r')
+                .unwrap_or(without_newline);
+            (content == marker && multiline_value_lines.binary_search(&start).is_err())
+                .then_some((start, offset))
+        })
+        .collect()
+}
+
+fn collect_explicit_toml_table_paths(
+    table: &toml_edit::Table,
+    path: &mut Vec<String>,
+    paths: &mut Vec<Vec<String>>,
+) {
+    for (key, item) in table.iter() {
+        path.push(key.to_string());
+        if let Some(child) = item.as_table() {
+            if !child.is_implicit() {
+                paths.push(path.clone());
+            }
+            collect_explicit_toml_table_paths(child, path, paths);
+        } else if let Some(children) = item.as_array_of_tables() {
+            for child in children.iter() {
+                paths.push(path.clone());
+                collect_explicit_toml_table_paths(child, path, paths);
+            }
+        }
+        path.pop();
+    }
+}
+
+fn toml_table_header_path(content: &str) -> Option<Vec<String>> {
+    if !content.trim_start().starts_with('[') {
+        return None;
+    }
+    let document = format!("{content}\n").parse::<DocumentMut>().ok()?;
+    let mut paths = Vec::new();
+    collect_explicit_toml_table_paths(document.as_table(), &mut Vec::new(), &mut paths);
+    (paths.len() == 1).then(|| paths.remove(0))
+}
+
+fn is_codex_trust_table_path(path: &[String]) -> bool {
+    path.first().is_some_and(|key| key == "projects")
+        || (path.first().is_some_and(|key| key == "hooks")
+            && path.get(1).is_some_and(|key| key == "state"))
+}
+
+fn is_byte_preserving_codex_trust_table_header(content: &str) -> bool {
+    let content = content.trim_start();
+    content == "[projects]"
+        || content.starts_with("[projects.")
+        || content == "[hooks.state]"
+        || content.starts_with("[hooks.state.")
+}
+
+#[derive(Clone, Copy)]
+struct RuntimeKitMarkerRange {
+    start_end: usize,
+    end_begin: usize,
+    end_end: usize,
+}
+
+fn runtime_kit_marker_range(
+    raw: &str,
+    multiline_value_lines: &[usize],
+) -> Result<Option<RuntimeKitMarkerRange>, HookError> {
+    let starts = toml_marker_line_ranges(raw, RUNTIME_KIT_BLOCK_START, multiline_value_lines);
+    let ends = toml_marker_line_ranges(raw, RUNTIME_KIT_BLOCK_END, multiline_value_lines);
+    if starts.is_empty() && ends.is_empty() {
+        return Ok(None);
+    }
+    if starts.len() != 1 || ends.len() != 1 {
+        return Err(HookError::data(
+            "provider-config-invalid",
+            "Codex config has an ambiguous agent-runtime-kit hook marker layout",
+        ));
+    }
+    let (start_begin, start_end) = starts[0];
+    let (end_begin, end_end) = ends[0];
+    if end_begin < start_begin {
+        return Err(HookError::data(
+            "provider-config-invalid",
+            "Codex config has a reversed agent-runtime-kit hook marker block",
+        ));
+    }
+    Ok(Some(RuntimeKitMarkerRange {
+        start_end,
+        end_begin,
+        end_end,
+    }))
+}
+
+fn repair_codex_trust_boundary(raw: &str) -> Result<(String, bool), HookError> {
+    let multiline_value_lines = toml_multiline_value_line_starts(raw);
+    let Some(RuntimeKitMarkerRange {
+        start_end,
+        end_begin,
+        end_end,
+    }) = runtime_kit_marker_range(raw, &multiline_value_lines)?
+    else {
+        return Ok((raw.to_string(), false));
+    };
+
+    let mut offset = start_end;
+    let mut blank_run_start = None;
+    let mut trust_boundary = None;
+    for line in raw[start_end..end_begin].split_inclusive('\n') {
+        let line_start = offset;
+        offset += line.len();
+        if multiline_value_lines.binary_search(&line_start).is_ok() {
+            blank_run_start = None;
+            continue;
+        }
+        let without_newline = line.strip_suffix('\n').unwrap_or(line);
+        let content = without_newline
+            .strip_suffix('\r')
+            .unwrap_or(without_newline);
+        if content.trim().is_empty() {
+            blank_run_start.get_or_insert(line_start);
+        } else if let Some(table_path) = toml_table_header_path(content) {
+            if is_codex_trust_table_path(&table_path) {
+                if !is_byte_preserving_codex_trust_table_header(content) {
+                    return Err(HookError::data(
+                        "provider-config-invalid",
+                        "Codex trust table syntax inside the agent-runtime-kit hook marker block cannot be migrated byte-for-byte",
+                    ));
+                }
+                trust_boundary.get_or_insert(blank_run_start.unwrap_or(line_start));
+            } else if trust_boundary.is_some() {
+                return Err(HookError::data(
+                    "provider-config-invalid",
+                    "Codex trust tables are followed by non-trust TOML inside the agent-runtime-kit hook marker block",
+                ));
+            }
+            blank_run_start = None;
+        } else {
+            blank_run_start = None;
+        }
+    }
+    let Some(trust_boundary) = trust_boundary else {
+        return Ok((raw.to_string(), false));
+    };
+
+    let close_line = &raw[end_begin..end_end];
+    let moved_suffix = &raw[trust_boundary..end_begin];
+    let (moved_suffix, separator) = if close_line.ends_with('\n') {
+        (moved_suffix, "")
+    } else if let Some(suffix) = moved_suffix.strip_suffix("\r\n") {
+        (suffix, "\r\n")
+    } else if let Some(suffix) = moved_suffix.strip_suffix('\n') {
+        (suffix, "\n")
+    } else {
+        return Err(HookError::data(
+            "provider-config-invalid",
+            "Codex trust tables and the agent-runtime-kit closing marker do not have a reusable line separator",
+        ));
+    };
+    let mut repaired = String::with_capacity(raw.len());
+    repaired.push_str(&raw[..trust_boundary]);
+    repaired.push_str(close_line);
+    repaired.push_str(separator);
+    repaired.push_str(moved_suffix);
+    repaired.push_str(&raw[end_end..]);
+    Ok((repaired, true))
 }
 
 fn render_codex_block(groups: &[HookGroup], product: Product) -> String {
@@ -1289,6 +1551,47 @@ fn acquire_lock(path: PathBuf) -> Result<SetupLock, HookError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pretty_assertions::assert_eq;
+
+    #[test]
+    fn runtime_kit_trust_boundary_reuses_eof_newlines_byte_exactly() {
+        for newline in ["\n", "\r\n"] {
+            let prefix = format!("{RUNTIME_KIT_BLOCK_START}{newline}[[hooks.PreToolUse]]{newline}");
+            let trust = format!(
+                "[projects.\"/foreign/project\"]{newline}trust_level = \"trusted\"{newline}"
+            );
+            let trust_at_eof = trust.strip_suffix(newline).expect("trust newline");
+            let raw = format!("{prefix}{newline}{trust}{RUNTIME_KIT_BLOCK_END}");
+            let expected =
+                format!("{prefix}{RUNTIME_KIT_BLOCK_END}{newline}{newline}{trust_at_eof}");
+            assert_eq!(
+                repair_codex_trust_boundary(&raw).expect("byte-exact EOF repair"),
+                (expected, true)
+            );
+
+            let no_separator = format!("{prefix}{trust}{RUNTIME_KIT_BLOCK_END}");
+            assert_eq!(
+                repair_codex_trust_boundary(&no_separator)
+                    .expect("EOF repair reuses the trailing trust separator"),
+                (
+                    format!("{prefix}{RUNTIME_KIT_BLOCK_END}{newline}{trust_at_eof}"),
+                    true
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn runtime_kit_marker_lines_inside_multiline_values_are_not_boundaries() {
+        let raw = format!(
+            "prompt = \"\"\"\n{RUNTIME_KIT_BLOCK_START}\n[projects.\\\"/foreign/project\\\"]\n{RUNTIME_KIT_BLOCK_END}\n\"\"\"\n"
+        );
+
+        assert_eq!(
+            repair_codex_trust_boundary(&raw).expect("multiline marker text is unrelated"),
+            (raw, false)
+        );
+    }
 
     #[test]
     fn apply_rejects_a_concurrent_provider_change_without_overwriting_it() {
