@@ -367,12 +367,13 @@ is no second state model.
 
 ## Response and authentication
 
-Ordinary JSON HTTP responses use the `cli.agent-session.serve.v1` envelope and
-carry a `machine` identity (`--machine` / `AGENT_SESSION_MACHINE` / `--host` /
-hostname) so an edge can aggregate several machines. The activity SSE stream
-uses [activity-stream-v1](activity-stream-v1.md), while WebSocket attach uses
-the binary/control and optional event frames documented above; neither
-streaming transport uses the ordinary JSON envelope. Auth is a bearer token
+Ordinary JSON HTTP responses use the `cli.agent-session.serve.v1` envelope.
+Successful responses carry a `machine` identity in `data.machine` (`--machine`
+/ `AGENT_SESSION_MACHINE` / `--host` / hostname) so an edge can aggregate
+several machines; current error envelopes omit the machine field. The activity
+SSE stream uses [activity-stream-v1](activity-stream-v1.md), while WebSocket
+attach uses the binary/control and optional event frames documented above;
+neither streaming transport uses the ordinary JSON envelope. Auth is a bearer token
 (`--token-stdin`, `--token`, or `AGENT_SESSION_TOKEN`) on the activity stream plus all write and attach endpoints, compared without an early-exit
 on the token bytes; when no token is configured (or it is empty) those endpoints fail closed (503). Prefer
 `--token-stdin` for launcher integrations so token material does not appear in process arguments. It reads one trimmed
@@ -424,9 +425,12 @@ binary and transcript discovery survive daemon restarts. Both daemon-managed
 and standalone `agent-session resume <managed-id>` launches pin the persisted
 provider root, when present, in the provider-specific environment before
 invoking the durable launcher. The daemon resume endpoint additionally requires
-the same id, base agent, executable, optional config root, auto-resume
-capability, and readiness contract to remain present in the current server
-registry; removing or changing a profile revokes resume through that endpoint.
+the same id, base agent, executable, optional config root, and auto-resume
+capability to remain present in the current server registry. It runs the
+readiness argv from the current profile and requires that probe to succeed, but
+does not persist or compare the launch-time readiness argv. Removing the profile
+or changing a persisted identity field revokes resume through that endpoint;
+changing only the readiness argv is accepted when the new probe succeeds.
 Because standalone resume cannot enforce the live registry, the daemon does not
 advertise it as a managed copy action. Set
 `auto_resume_supported` only when the profile has authoritative usage semantics

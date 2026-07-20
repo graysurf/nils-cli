@@ -104,11 +104,11 @@ The main endpoint groups are:
 - WebSocket PTY attach;
 - raw work-context, broker recovery, and mailbox operations.
 
-Ordinary JSON HTTP responses use the `cli.agent-session.serve.v1` envelope and
-include a machine identity selected by `--machine`,
-`AGENT_SESSION_MACHINE`, `--host`, or the hostname fallback. The activity SSE
-stream and WebSocket attach use their own streaming protocols rather than that
-JSON envelope.
+Ordinary JSON HTTP responses use the `cli.agent-session.serve.v1` envelope.
+Successful responses include the machine identity in `data.machine`, selected
+by `--machine`, `AGENT_SESSION_MACHINE`, `--host`, or the hostname fallback;
+current error envelopes omit it. The activity SSE stream and WebSocket attach
+use their own streaming protocols rather than that JSON envelope.
 
 Use `POST /sessions/{id}/prompt/v2` when a client needs a cross-version fence.
 It requires both exact prompt text and the expected session incarnation,
