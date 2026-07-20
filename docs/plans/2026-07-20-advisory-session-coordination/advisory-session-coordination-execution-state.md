@@ -93,6 +93,9 @@
 | `bash scripts/ci/nils-cli-checks-entrypoint.sh --local-fast` | pass | Docs, formatting, clippy, all 7,023 workspace tests, and doctests passed. | local |
 | `NILS_CLI_REPO=<checkout> scripts/dev/with-nils-version.sh src:6b3ec998 -- bash scripts/ci/all.sh` | pass | All 17 runtime-kit CI positions passed; 311 shared-hook tests and context budgets were green. | runtime-kit local |
 | specialist maintainability/security/testing/API/migration/performance plus red-team | pass | All concrete findings fixed; final testing and red-team follow-ups returned `NO_FINDINGS`. | local review |
+| v1.25.3 release-and-deploy | pass | GitHub Release, Homebrew tap, sympoies, and the fixed macOS fleet converged from nils-cli `29c19f86210c805b82c5fbd2a1986fd0afa8183c`. | [release](https://github.com/sympoies/nils-cli/releases/tag/v1.25.3), [request](https://github.com/serenvia/sympoies-infra/actions/runs/29725086204), [broker](https://github.com/serenvia/sympoies-infra/actions/runs/29725098487) |
+| installed runtime sync and disposable fresh sessions | pass | Codex doctor 21/21, Claude doctor 23/23, prompt-input, installed coupled matrix, fresh managed Codex/Claude, and fresh unmanaged Codex passed; all nine Codex plugins were restored. | [validation evidence](https://github.com/sympoies/nils-cli/issues/1318#issuecomment-5020059110), [terminal state](https://github.com/sympoies/nils-cli/issues/1318#issuecomment-5020174434) |
+| strict tracking closeout and visible audit | pass | `close-ready` returned no blockers, #1318 closed with merged PR evidence, and the final visible audit passed with `Next task: none`. | [closeout](https://github.com/sympoies/nils-cli/issues/1318#issuecomment-5020069780), [terminal state](https://github.com/sympoies/nils-cli/issues/1318#issuecomment-5020174434) |
 
 ## Handoff
 
