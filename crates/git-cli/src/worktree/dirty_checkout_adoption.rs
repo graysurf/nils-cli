@@ -1131,8 +1131,6 @@ struct SnapshotWorkerExecutable {
     file: File,
     metadata: Metadata,
     digest: [u8; 32],
-    #[cfg(test)]
-    _private_root: Option<tempfile::TempDir>,
 }
 
 struct WorkerDigestCache {
@@ -1262,50 +1260,232 @@ fn cached_worker_file_digest(file: &File, metadata: &Metadata) -> Result<[u8; 32
 }
 
 #[cfg(test)]
-fn private_test_worker_executable(
-    candidate: PathBuf,
-) -> Result<(PathBuf, Option<tempfile::TempDir>)> {
+static PRIVATE_TEST_WORKER: OnceLock<Mutex<Option<PathBuf>>> = OnceLock::new();
+
+/// Age past which an orphaned staging copy is assumed to belong to a crashed
+/// install rather than a live one — installs complete in well under a second.
+#[cfg(test)]
+const PRIVATE_TEST_WORKER_STAGING_TTL: Duration = Duration::from_secs(600);
+
+/// Provide a hardened private copy of the worker binary for tests.
+///
+/// Under the shared-dev umask the on-disk `git-cli` binary is group-writable,
+/// so production's descriptor validation rejects it and tests need a hardened
+/// (`0o500`) copy. This helper historically minted a fresh `tempfile::TempDir`
+/// per call; when a test process was killed or aborted before `Drop` ran
+/// (nextest timeouts, `panic = "abort"`, coverage) the ~17 MB copy leaked into
+/// `/tmp`, and tens of thousands accumulated on one host. Install the copy once
+/// at a stable, per-source path and reuse it across calls, processes, and runs
+/// so at most one copy per source binary ever exists on disk. See issue #1323.
+///
+/// Trust is fail-closed: a hostile pre-created per-user directory (foreign
+/// owner, group/other writable, or a symlink) makes this error out rather than
+/// adopt untrusted state. Adopt-first keeps concurrent reinstalls bounded to
+/// cold start; the resulting shared-path rewrite window can only be observed by
+/// the non-Linux (`command_path == candidate`) re-stat in
+/// [`snapshot_worker_executable`], and never on CI: the Linux runner execs via
+/// `/proc/self/fd`, and the macOS runners build under a `0o22` umask so the
+/// binary is not group-writable and this copy path is skipped entirely.
+#[cfg(test)]
+fn private_test_worker_executable(candidate: PathBuf) -> Result<PathBuf> {
     let source = File::open(&candidate)
         .context("dirty snapshot worker test executable could not be opened")?;
     let source_metadata = source
         .metadata()
         .context("dirty snapshot worker test executable metadata is unavailable")?;
     if source_metadata.mode() & 0o022 == 0 || source_metadata.uid() != unsafe { libc::geteuid() } {
-        return Ok((candidate, None));
+        return Ok(candidate);
     }
 
-    let private_root = tempfile::TempDir::new()
-        .context("private dirty snapshot worker test root could not be created")?;
-    let private_candidate = private_root.path().join("git-cli");
-    let mut private_file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o700)
-        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
-        .open(&private_candidate)
-        .context("private dirty snapshot worker test executable could not be created")?;
-    io::copy(&mut &source, &mut private_file)
-        .context("dirty snapshot worker test executable could not be copied")?;
-    private_file
-        .sync_all()
-        .context("private dirty snapshot worker test executable could not be synced")?;
-    private_file
-        .set_permissions(fs::Permissions::from_mode(0o500))
-        .context("private dirty snapshot worker test executable could not be hardened")?;
-    let current_source_metadata = source
+    let cache = PRIVATE_TEST_WORKER.get_or_init(|| Mutex::new(None));
+    let mut cache = cache.lock().map_err(|_| {
+        domain_error(
+            DirtyCheckoutErrorKind::ResourceUnavailable,
+            "private dirty snapshot worker test cache is unavailable",
+        )
+    })?;
+
+    let private_dir = private_test_worker_dir()?;
+    let private_candidate = private_dir.join(private_test_worker_name(&candidate));
+    // Fast path: this process already installed and validated the reusable copy.
+    if cache.as_deref() == Some(private_candidate.as_path()) {
+        return Ok(private_candidate);
+    }
+
+    // Off the fast path (first touch this process, adopt, or reinstall) reclaim
+    // staging files orphaned by an earlier crashed install; steady-state reuse
+    // stays on the fast path above and skips this.
+    prune_stale_private_test_worker_staging(&private_dir);
+
+    let source_len = source_metadata.len();
+    let source_digest = worker_file_digest(&source, source_len)?;
+    let hashed_metadata = source
         .metadata()
-        .context("dirty snapshot worker test executable could not be revalidated")?;
-    let source_path_metadata = fs::metadata(&candidate)
-        .context("dirty snapshot worker test executable path is unavailable")?;
-    if !same_metadata(&source_metadata, &current_source_metadata)
-        || !same_metadata(&current_source_metadata, &source_path_metadata)
+        .context("dirty snapshot worker test executable could not be revalidated after hashing")?;
+    if !same_metadata(&source_metadata, &hashed_metadata) {
+        return Err(domain_error(
+            DirtyCheckoutErrorKind::ResourceUnavailable,
+            "dirty snapshot worker test executable changed during private installation",
+        ));
+    }
+
+    // Adopt an already-installed copy (this run or a prior one) when it still
+    // matches the current binary; reinstall only when it is missing or stale so
+    // concurrent readers keep observing a stable inode.
+    if !private_test_worker_is_current(&private_candidate, source_len, &source_digest)? {
+        install_private_test_worker(&private_candidate, &source, source_len, &source_digest)?;
+    }
+    *cache = Some(private_candidate.clone());
+    Ok(private_candidate)
+}
+
+/// Trusted per-user directory holding reusable private worker copies. Created
+/// `0o700`; a pre-existing directory that is group/other writable or not owned
+/// by the effective user is rejected as untrusted.
+#[cfg(test)]
+fn private_test_worker_dir() -> Result<PathBuf> {
+    let euid = unsafe { libc::geteuid() };
+    let directory = env::temp_dir().join(format!("git-cli-test-worker.{euid}"));
+    match fs::DirBuilder::new().mode(0o700).create(&directory) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+        Err(error) => {
+            return Err(error)
+                .context("private dirty snapshot worker test root could not be created");
+        }
+    }
+    let metadata = fs::symlink_metadata(&directory)
+        .context("private dirty snapshot worker test root metadata is unavailable")?;
+    if !metadata.file_type().is_dir() || metadata.uid() != euid || metadata.mode() & 0o022 != 0 {
+        return Err(domain_error(
+            DirtyCheckoutErrorKind::ResourceUnavailable,
+            "private dirty snapshot worker test root is not trusted",
+        ));
+    }
+    Ok(directory)
+}
+
+/// Stable, collision-resistant file name derived from the source path so
+/// distinct source binaries (the real target binary, test fixtures) never share
+/// a copy, while re-runs of the same binary reuse and overwrite one file.
+#[cfg(test)]
+fn private_test_worker_name(source: &Path) -> String {
+    use std::fmt::Write as _;
+    let mut hasher = Sha256::new();
+    hasher.update(source.as_os_str().as_bytes());
+    let digest = hasher.finalize();
+    let mut name = String::from("git-cli.");
+    for byte in &digest[..16] {
+        let _ = write!(name, "{byte:02x}");
+    }
+    name
+}
+
+/// Whether a previously installed copy is still a faithful, hardened copy of the
+/// current source binary.
+#[cfg(test)]
+fn private_test_worker_is_current(
+    path: &Path,
+    source_len: u64,
+    source_digest: &[u8; 32],
+) -> Result<bool> {
+    let file = match OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+        .open(path)
+    {
+        Ok(file) => file,
+        Err(_) => return Ok(false),
+    };
+    let metadata = file
+        .metadata()
+        .context("private dirty snapshot worker test copy metadata is unavailable")?;
+    if !metadata.file_type().is_file()
+        || metadata.uid() != unsafe { libc::geteuid() }
+        || metadata.mode() & 0o777 != 0o500
+        || metadata.len() != source_len
+    {
+        return Ok(false);
+    }
+    Ok(&worker_file_digest(&file, source_len)? == source_digest)
+}
+
+/// Atomically install a hardened private copy at `destination`, replacing any
+/// stale copy. Staging happens in the same directory so the publishing rename is
+/// atomic, and the copy is verified against the validated source before being
+/// hardened and published.
+#[cfg(test)]
+fn install_private_test_worker(
+    destination: &Path,
+    source: &File,
+    source_len: u64,
+    source_digest: &[u8; 32],
+) -> Result<()> {
+    let directory = destination
+        .parent()
+        .context("private dirty snapshot worker test copy has no parent directory")?;
+    let mut staged = tempfile::Builder::new()
+        .prefix(".git-cli.")
+        .suffix(".tmp")
+        .tempfile_in(directory)
+        .context("private dirty snapshot worker test copy could not be staged")?;
+    let mut reader: &File = source;
+    io::copy(&mut reader, staged.as_file_mut())
+        .context("dirty snapshot worker test executable could not be copied")?;
+    staged
+        .as_file()
+        .sync_all()
+        .context("private dirty snapshot worker test copy could not be synced")?;
+    let staged_len = staged
+        .as_file()
+        .metadata()
+        .context("private dirty snapshot worker test copy metadata is unavailable")?
+        .len();
+    if staged_len != source_len
+        || &worker_file_digest(staged.as_file(), staged_len)? != source_digest
     {
         return Err(domain_error(
             DirtyCheckoutErrorKind::ResourceUnavailable,
             "dirty snapshot worker test executable changed during private installation",
         ));
     }
-    Ok((private_candidate, Some(private_root)))
+    staged
+        .as_file()
+        .set_permissions(fs::Permissions::from_mode(0o500))
+        .context("private dirty snapshot worker test copy could not be hardened")?;
+    staged
+        .persist(destination)
+        .map_err(|error| error.error)
+        .context("private dirty snapshot worker test copy could not be installed")?;
+    Ok(())
+}
+
+/// Remove `.git-cli.*.tmp` staging files left by a crashed install. Called off
+/// the reuse fast path (first touch, adopt, or reinstall). Only files older
+/// than the staging TTL are removed, so a concurrent in-progress install is
+/// never disturbed, and the published `git-cli.<hash>` copies are left intact.
+#[cfg(test)]
+fn prune_stale_private_test_worker_staging(directory: &Path) {
+    let Ok(entries) = fs::read_dir(directory) else {
+        return;
+    };
+    let now = SystemTime::now();
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if !name.starts_with(".git-cli.") || !name.ends_with(".tmp") {
+            continue;
+        }
+        let stale = entry
+            .metadata()
+            .and_then(|metadata| metadata.modified())
+            .ok()
+            .and_then(|modified| now.duration_since(modified).ok())
+            .is_some_and(|age| age >= PRIVATE_TEST_WORKER_STAGING_TTL);
+        if stale {
+            let _ = fs::remove_file(entry.path());
+        }
+    }
 }
 
 fn snapshot_worker_executable() -> Result<SnapshotWorkerExecutable> {
@@ -1329,7 +1509,7 @@ fn snapshot_worker_executable() -> Result<SnapshotWorkerExecutable> {
             .context("dirty snapshot worker executable is unavailable")?
     };
     #[cfg(test)]
-    let (candidate, private_root) = private_test_worker_executable(candidate)?;
+    let candidate = private_test_worker_executable(candidate)?;
     let file = File::open(&candidate)
         .context("dirty snapshot worker executable descriptor could not be opened")?;
     let metadata = file
@@ -1359,8 +1539,6 @@ fn snapshot_worker_executable() -> Result<SnapshotWorkerExecutable> {
         file,
         metadata,
         digest,
-        #[cfg(test)]
-        _private_root: private_root,
     })
 }
 
@@ -9084,6 +9262,227 @@ mod tests {
         }
     }
 
+    /// Removes a file on drop so a shared-fixture copy is cleaned up even when
+    /// an assertion panics mid-test.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    struct RemoveOnDrop(PathBuf);
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    impl Drop for RemoveOnDrop {
+        fn drop(&mut self) {
+            let _ = fs::remove_file(&self.0);
+        }
+    }
+
+    /// A group-writable, effective-user-owned source binary that forces the
+    /// hardened private-copy path regardless of the ambient umask.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn writable_worker_source(payload: &[u8]) -> (tempfile::TempDir, PathBuf) {
+        let root = tempfile::TempDir::new().expect("worker source root");
+        let source = root.path().join("git-cli");
+        fs::write(&source, payload).expect("write worker source");
+        fs::set_permissions(&source, fs::Permissions::from_mode(0o770))
+            .expect("make worker source group writable");
+        (root, source)
+    }
+
+    #[test]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn private_test_worker_executable_reuses_a_single_stable_copy() {
+        let payload = b"fake git-cli worker payload";
+        let (_root, source) = writable_worker_source(payload);
+
+        let first =
+            private_test_worker_executable(source.clone()).expect("first private worker install");
+        let _cleanup = RemoveOnDrop(first.clone());
+        let installed_ino = fs::metadata(&first).expect("installed copy metadata").ino();
+
+        // Reuse must not re-copy the ~17 MB binary: the path stays stable AND the
+        // on-disk inode never changes across calls (a re-install-every-call
+        // regression — the exact #1323 cost — would change the inode).
+        let second =
+            private_test_worker_executable(source.clone()).expect("second private worker install");
+        let third =
+            private_test_worker_executable(source.clone()).expect("third private worker install");
+        assert_eq!(first, second, "the private worker copy path must be stable");
+        assert_eq!(first, third, "reuse must survive across repeated calls");
+        assert_eq!(
+            fs::metadata(&second).expect("reused copy metadata").ino(),
+            installed_ino,
+            "reuse must not re-install the copy on every call"
+        );
+
+        // The copy is a faithful, hardened stand-in for the source binary.
+        let metadata = fs::metadata(&first).expect("private worker copy metadata");
+        assert_eq!(
+            metadata.mode() & 0o777,
+            0o500,
+            "the private copy must be hardened to 0o500"
+        );
+        assert_eq!(
+            metadata.uid(),
+            unsafe { libc::geteuid() },
+            "the private copy must be owned by the effective user"
+        );
+        assert_eq!(
+            fs::read(&first).expect("read private worker copy"),
+            payload,
+            "the private copy content must match the source binary"
+        );
+
+        // No accumulation: exactly one copy exists for this source binary.
+        let name = private_test_worker_name(&source);
+        let directory = private_test_worker_dir().expect("private worker directory");
+        assert_eq!(
+            first,
+            directory.join(&name),
+            "the copy must live at the derived stable path"
+        );
+        let matching = fs::read_dir(&directory)
+            .expect("read private worker directory")
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy() == name)
+            .count();
+        assert_eq!(
+            matching, 1,
+            "only one private copy may exist per source binary"
+        );
+    }
+
+    #[test]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn private_test_worker_executable_adopts_an_existing_current_copy() {
+        // Cross-process/cross-run reuse depends on the slow-path *adopt* branch,
+        // not the in-memory fast path. Install a copy, evict the single-slot
+        // process cache with a second source, then re-request the first source so
+        // it misses the cache and must adopt the still-current on-disk copy.
+        let payload = b"adoptable git-cli worker payload";
+        let (_root, source) = writable_worker_source(payload);
+        let first =
+            private_test_worker_executable(source.clone()).expect("initial private worker install");
+        let _cleanup = RemoveOnDrop(first.clone());
+        let installed_ino = fs::metadata(&first).expect("installed copy metadata").ino();
+
+        let (_evict_root, evict_source) = writable_worker_source(b"cache-evicting source");
+        let evicted = private_test_worker_executable(evict_source.clone())
+            .expect("evicting private worker install");
+        let _evict_cleanup = RemoveOnDrop(evicted);
+
+        let adopted = private_test_worker_executable(source.clone())
+            .expect("adopt existing private worker copy");
+        assert_eq!(
+            first, adopted,
+            "adoption must resolve to the same stable path"
+        );
+        assert_eq!(
+            fs::metadata(&adopted).expect("adopted copy metadata").ino(),
+            installed_ino,
+            "a current on-disk copy must be adopted, not re-installed"
+        );
+    }
+
+    #[test]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn private_test_worker_executable_reinstalls_a_stale_copy() {
+        let payload = b"authoritative git-cli worker payload";
+        let (_root, source) = writable_worker_source(payload);
+        let name = private_test_worker_name(&source);
+        let directory = private_test_worker_dir().expect("private worker directory");
+        let destination = directory.join(&name);
+        let _cleanup = RemoveOnDrop(destination.clone());
+
+        // Pre-seed a stale copy (different content/length) at the derived path.
+        fs::write(&destination, b"stale").expect("write stale worker copy");
+        fs::set_permissions(&destination, fs::Permissions::from_mode(0o500))
+            .expect("harden stale worker copy");
+        let stale_ino = fs::metadata(&destination)
+            .expect("stale copy metadata")
+            .ino();
+
+        let resolved = private_test_worker_executable(source.clone())
+            .expect("reinstall stale private worker copy");
+        assert_eq!(
+            resolved, destination,
+            "reinstall must reuse the derived path"
+        );
+        assert_eq!(
+            fs::read(&destination).expect("read reinstalled copy"),
+            payload,
+            "a stale copy must be reinstalled with the current binary's content"
+        );
+        let reinstalled = fs::metadata(&destination).expect("reinstalled copy metadata");
+        assert_eq!(
+            reinstalled.mode() & 0o777,
+            0o500,
+            "the reinstalled copy must be hardened to 0o500"
+        );
+        assert_ne!(
+            reinstalled.ino(),
+            stale_ino,
+            "reinstall must atomically replace the stale copy"
+        );
+    }
+
+    #[test]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn prune_stale_private_test_worker_staging_removes_only_aged_staging_files() {
+        use std::fs::FileTimes;
+
+        let directory = private_test_worker_dir().expect("private worker directory");
+        // Distinctive names so this never collides with concurrent installs
+        // (whose staging files use random `tempfile` names) or their copies.
+        let fresh = directory.join(".git-cli.prune-fresh-fixture.tmp");
+        let aged = directory.join(".git-cli.prune-aged-fixture.tmp");
+        let published = directory.join("git-cli.prune-published-fixture");
+        let _fresh_cleanup = RemoveOnDrop(fresh.clone());
+        let _aged_cleanup = RemoveOnDrop(aged.clone());
+        let _published_cleanup = RemoveOnDrop(published.clone());
+
+        fs::write(&fresh, b"fresh").expect("write fresh staging fixture");
+        fs::write(&published, b"published").expect("write published fixture");
+        fs::write(&aged, b"aged").expect("write aged staging fixture");
+        let backdated =
+            SystemTime::now() - PRIVATE_TEST_WORKER_STAGING_TTL - Duration::from_secs(60);
+        OpenOptions::new()
+            .write(true)
+            .open(&aged)
+            .expect("open aged staging fixture")
+            .set_times(FileTimes::new().set_modified(backdated))
+            .expect("backdate aged staging fixture");
+
+        prune_stale_private_test_worker_staging(&directory);
+
+        assert!(
+            fresh.exists(),
+            "a recent staging file must be left in place"
+        );
+        assert!(
+            !aged.exists(),
+            "a staging file older than the TTL must be removed"
+        );
+        assert!(
+            published.exists(),
+            "a published `git-cli.<hash>` copy must never be pruned"
+        );
+    }
+
+    #[test]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn private_test_worker_executable_uses_a_trusted_source_in_place() {
+        let root = tempfile::TempDir::new().expect("worker source root");
+        let source = root.path().join("git-cli");
+        fs::write(&source, b"trusted worker").expect("write worker source");
+        fs::set_permissions(&source, fs::Permissions::from_mode(0o755))
+            .expect("set non-writable worker mode");
+
+        let resolved = private_test_worker_executable(source.clone())
+            .expect("a non-writable source needs no private copy");
+        assert_eq!(
+            resolved, source,
+            "a source that is neither group- nor other-writable is used in place"
+        );
+    }
+
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     fn descriptor_backed_worker(path: &Path) -> SnapshotWorkerExecutable {
         let file = File::open(path).expect("open worker fixture descriptor");
@@ -9100,7 +9499,6 @@ mod tests {
             file,
             metadata,
             digest,
-            _private_root: None,
         }
     }
 
