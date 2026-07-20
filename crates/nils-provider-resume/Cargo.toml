@@ -1,6 +1,6 @@
 [package]
 name = "nils-provider-resume"
-version = "1.25.4"
+version = "1.25.5"
 edition.workspace = true
 license.workspace = true
 
@@ -14,7 +14,7 @@ path = "src/lib.rs"
 [dependencies]
 jiff = { workspace = true }
 serde_json = { workspace = true }
-nils-common = { version = "1.25.4", path = "../nils-common", package = "nils-common" }
+nils-common = { version = "1.25.5", path = "../nils-common", package = "nils-common" }
 
 [dev-dependencies]
 tempfile = "3"
