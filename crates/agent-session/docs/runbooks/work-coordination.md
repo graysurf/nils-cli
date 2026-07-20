@@ -1,9 +1,11 @@
 # Work Coordination
 
-This runbook explains how an operator or managed agent should use
-`agent-session` collision awareness, declared work context, and mutation
-admission. The normative schemas, state machines, and failure codes remain in
-[Session coordination v1](../specs/session-coordination-v1.md).
+This runbook owns the CLI and operator mechanics for `agent-session` collision
+awareness, declared work context, and mutation admission. The normative
+schemas, state machines, and failure codes remain in
+[Session coordination v1](../specs/session-coordination-v1.md). The canonical
+agent-facing decision and overlap-response policy lives in agent-runtime-kit's
+[`session-coordination.md`](https://github.com/graysurf/agent-runtime-kit/blob/main/core/policies/session-coordination.md).
 
 ## Choose a coordination mode
 
@@ -20,6 +22,12 @@ records default to `advisory`.
 
 Coordination applies only to runtimes managed by `agent-session`. A process
 launched directly outside it has no managed identity and does not participate.
+Coordination does not grant or revoke user authorization, repository
+permission, provider consent, or workflow authority. `work-context set` adds
+optional public task metadata so warnings are more precise; it is not a
+permission request. Default `advisory` and unmanaged sessions never require a
+claim. Only a launch that explicitly selects `enforce` turns claims, admission,
+and physical checkout leases into mutation requirements.
 
 ## Declare work in a managed session
 
