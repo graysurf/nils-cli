@@ -28,6 +28,8 @@ mod help_snapshot;
 mod home_project_scope;
 #[path = "integration/init.rs"]
 mod init;
+#[path = "integration/operation_effect.rs"]
+mod operation_effect;
 #[path = "integration/preflight.rs"]
 mod preflight;
 #[path = "integration/resolution.rs"]

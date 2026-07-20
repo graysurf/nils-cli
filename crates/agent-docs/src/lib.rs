@@ -6,6 +6,7 @@ pub mod content;
 pub mod env;
 mod integration;
 pub mod model;
+mod operation_effect;
 pub mod output;
 pub mod path_classes;
 pub mod paths;
@@ -112,6 +113,9 @@ fn render_clap_message(err: &clap::Error) -> String {
 }
 
 fn dispatch(cli: Cli, output_format: nils_common::cli_contract::OutputFormat) -> i32 {
+    if let Command::OperationEffect(args) = &cli.command {
+        return operation_effect::run(args.command.clone(), args.format);
+    }
     if cli.user_config
         && !matches!(
             &cli.command,
@@ -424,6 +428,7 @@ fn dispatch(cli: Cli, output_format: nils_common::cli_contract::OutputFormat) ->
             integration_fingerprint,
         ),
         Command::Completion(args) => completion::run(args.shell),
+        Command::OperationEffect(_) => unreachable!("operation-effect returned before dispatch"),
     }
 }
 

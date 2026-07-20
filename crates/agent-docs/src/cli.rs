@@ -1,3 +1,4 @@
+use std::ffi::OsString;
 use std::path::PathBuf;
 
 use clap::{Args, Parser, Subcommand};
@@ -82,8 +83,19 @@ pub enum Command {
     Integration(IntegrationArgs),
     /// Manage durable selective intent activation scoped to a session, project, and product.
     Session(SessionArgs),
+    /// Describe the effect of one exact typed agent-docs invocation.
+    #[command(hide = true)]
+    OperationEffect(OperationEffectArgs),
     /// Generate shell completion scripts.
     Completion(CompletionArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct OperationEffectArgs {
+    #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
+    pub format: OutputFormat,
+    #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
+    pub command: Vec<OsString>,
 }
 
 #[derive(Debug, Args)]

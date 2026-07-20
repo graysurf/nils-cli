@@ -27,6 +27,7 @@ pub mod clipboard;
 pub mod coordination_projection;
 pub mod diag_output;
 pub mod env;
+pub mod execution_effect;
 pub mod fs;
 pub mod git;
 pub mod markdown;

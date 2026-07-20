@@ -15,6 +15,7 @@ mod integration {
     mod label_ops;
     mod local_ops;
     mod local_path_guard;
+    mod operation_effect;
     mod parity;
     mod pr_checks_github;
     mod pr_checks_gitlab;

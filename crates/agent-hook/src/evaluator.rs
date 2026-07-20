@@ -41,9 +41,15 @@ struct RuleOutcome {
 
 #[derive(Debug)]
 struct ExecutionBudget {
-    started: Instant,
+    started: Option<Instant>,
     children: usize,
     retained_output: usize,
+}
+
+#[derive(Debug)]
+struct ExecutionBudgets {
+    enforced: ExecutionBudget,
+    shadow: ExecutionBudget,
 }
 
 #[derive(Debug)]
@@ -69,14 +75,14 @@ impl PreparedEvaluation<'_> {
 impl ExecutionBudget {
     fn new() -> Self {
         Self {
-            started: Instant::now(),
+            started: None,
             children: 0,
             retained_output: 0,
         }
     }
 
     fn reserve_child(&mut self) -> Result<(Duration, usize), HookError> {
-        let elapsed = self.started.elapsed();
+        let elapsed = self.started.get_or_insert_with(Instant::now).elapsed();
         if elapsed >= DISPATCH_CHILD_DEADLINE {
             return Err(HookError::data(
                 "dispatch-deadline-exceeded",
@@ -105,6 +111,15 @@ impl ExecutionBudget {
             ));
         }
         Ok(())
+    }
+}
+
+impl ExecutionBudgets {
+    fn new() -> Self {
+        Self {
+            enforced: ExecutionBudget::new(),
+            shadow: ExecutionBudget::new(),
+        }
     }
 }
 
@@ -176,12 +191,19 @@ pub fn prepare<'a>(
 
     let executable_count = rules
         .iter()
-        .filter(|prepared| prepared.mode == RuleMode::Enforce && !prepared.recovery)
-        .filter(|prepared| {
-            matches!(
+        .filter(|prepared| !prepared.recovery)
+        .filter(|prepared| match prepared.mode {
+            RuleMode::Enforce => matches!(
                 prepared.rule.capability,
                 Capability::SessionActivity { .. } | Capability::RuntimeKitHandler { .. }
-            )
+            ),
+            RuleMode::Shadow => {
+                matches!(
+                    prepared.rule.capability,
+                    Capability::ExecutionReadOnly { .. }
+                )
+            }
+            RuleMode::Disabled => false,
         })
         .count();
     if executable_count > MAX_EXECUTABLE_CAPABILITIES {
@@ -261,11 +283,16 @@ fn evaluate_with_io(
     let mut enforced = Vec::new();
     let mut shadow = Vec::new();
     let mut recovery_applied = false;
-    let mut execution_budget = ExecutionBudget::new();
+    let mut execution_budgets = ExecutionBudgets::new();
     for prepared_rule in &prepared.rules {
         let rule = prepared_rule.rule;
         if prepared_rule.mode == RuleMode::Shadow {
-            let outcome = evaluate_shadow(&rule.capability);
+            let outcome = evaluate_shadow(
+                &rule.capability,
+                request,
+                raw,
+                &mut execution_budgets.shadow,
+            );
             shadow.push(ShadowObservation {
                 rule_id: rule.id.clone(),
                 action: outcome.action,
@@ -294,7 +321,7 @@ fn evaluate_with_io(
             &rule.capability,
             request,
             raw,
-            &mut execution_budget,
+            &mut execution_budgets.enforced,
             liveness.as_ref(),
         ) {
             Ok(outcome) => outcome,
@@ -308,7 +335,12 @@ fn evaluate_with_io(
     apply_session_coordination(decision, request, raw, prepared.session_coordination)
 }
 
-fn evaluate_shadow(capability: &Capability) -> RuleOutcome {
+fn evaluate_shadow(
+    capability: &Capability,
+    request: &NormalizedRequest,
+    raw: &[u8],
+    execution_budget: &mut ExecutionBudget,
+) -> RuleOutcome {
     match capability {
         Capability::Allow { reason_code } => simple(DecisionAction::Allow, reason_code),
         Capability::Warn { reason_code, .. } => simple(DecisionAction::Warn, reason_code),
@@ -317,11 +349,30 @@ fn evaluate_shadow(capability: &Capability) -> RuleOutcome {
         Capability::Transform { reason_code, .. } => simple(DecisionAction::Transform, reason_code),
         Capability::SemanticConflict { reason_code } => simple(DecisionAction::Warn, reason_code),
         Capability::OwnerLiveness { reason_code, .. } => simple(DecisionAction::Warn, reason_code),
+        Capability::ExecutionReadOnly { reason_code } => {
+            evaluate_read_only_shadow(request, raw, execution_budget, reason_code)
+        }
         Capability::SessionActivity { .. }
         | Capability::SessionCoordination { .. }
         | Capability::RuntimeKitHandler { .. } => {
             simple(DecisionAction::Allow, "shadow-side-effect-skipped")
         }
+    }
+}
+
+fn evaluate_read_only_shadow(
+    request: &NormalizedRequest,
+    raw: &[u8],
+    execution_budget: &mut ExecutionBudget,
+    reason_code: &str,
+) -> RuleOutcome {
+    let verified = crate::read_only::candidate(raw, request).and_then(|candidate| {
+        let output = run_with_budget(candidate.descriptor_command(), &[], execution_budget)?;
+        crate::read_only::verify_output(&candidate, &output)
+    });
+    match verified {
+        Ok(()) => simple(DecisionAction::Allow, reason_code),
+        Err(error) => simple(DecisionAction::Block, &error.code),
     }
 }
 
@@ -397,6 +448,10 @@ fn evaluate_capability(
         }
         Capability::SessionCoordination { .. } => {
             unreachable!("session coordination is evaluated after aggregate policy")
+        }
+        Capability::ExecutionReadOnly { reason_code } => {
+            let _ = reason_code;
+            unreachable!("validated execution.read-only.v1 rules are shadow-only")
         }
         Capability::RuntimeKitHandler { handler_id } => {
             run_runtime_handler(request.product, handler_id, raw, execution_budget)?
@@ -1198,5 +1253,23 @@ mod tests {
 
         assert_eq!(error.code, "capability-input-failed");
         assert!(started.elapsed() < HANDLER_TIMEOUT);
+    }
+
+    #[test]
+    fn shadow_child_budget_cannot_exhaust_enforced_budget() {
+        let mut budgets = ExecutionBudgets::new();
+        let shared_start = Instant::now() - DISPATCH_CHILD_DEADLINE;
+        budgets.shadow.started = Some(shared_start);
+
+        assert_eq!(
+            budgets
+                .shadow
+                .reserve_child()
+                .expect_err("shadow budget exhausted")
+                .code,
+            "dispatch-deadline-exceeded"
+        );
+        assert!(budgets.enforced.reserve_child().is_ok());
+        assert!(budgets.enforced.started.is_some());
     }
 }

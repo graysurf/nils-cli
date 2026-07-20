@@ -15,6 +15,7 @@ pub mod error;
 pub mod glab_version;
 pub mod local;
 pub mod macros;
+mod operation_effect;
 pub mod ops;
 pub mod provider;
 pub mod rate_limit;

@@ -657,7 +657,7 @@ fn target_binding_material(binding: &TargetBinding) -> Result<Vec<u8>, HookError
     Ok(material)
 }
 
-fn command_text(object: &Map<String, Value>) -> Option<&str> {
+pub(crate) fn command_text(object: &Map<String, Value>) -> Option<&str> {
     string_at(object, &["command"])
         .or_else(|| nested_string(object, "tool_input", &["command", "cmd"]))
 }
