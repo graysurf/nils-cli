@@ -145,6 +145,14 @@ response. If the matching `agent-hook` binary is absent, setup returns
 `activity hook`, `activity notify`, and read-only `activity doctor` paths remain
 for runtime compatibility and migration diagnostics.
 
+`activity doctor` remains read-only and recognizes exact pre-dispatch
+`agent-session` registrations, including an audited Computer Use outer wrapper
+at the fixed executable path under the active Codex config root, so an operator
+can diagnose and migrate older installations. Existing `activity hook` and
+`activity notify` ingestion paths
+also remain as fail-open runtime compatibility while `agent-hook` becomes the
+single provider-registration owner.
+
 Use the [turn-state contract](docs/turn-state-contract.md) for persistence,
 privacy, registration ownership, setup, repair, migration, and provider
 behavior. The evidence behind supported provider signals is recorded in

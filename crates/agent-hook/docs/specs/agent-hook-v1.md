@@ -284,6 +284,17 @@ For Codex, `config.toml` and compatibility `hooks.json` are one transaction.
 The managed `config.toml` representation also owns the authoritative
 `agent-session activity notify --agent codex` argv: a safe singular user
 notifier is composed by direct argv, and remove restores it byte-for-byte.
+An exact Computer Use `turn-ended --previous-notify <JSON argv>` wrapper is
+treated as composed only when its bounded chain reaches that exact owned argv
+and the helper is the executable regular file at the fixed path below the
+active Codex config root, with no symlink in any relative path component.
+Alternating Computer Use/agent-session wrapper growth is drift: preview does
+not authorize mutation, and an exact reviewed plan digest is required to
+normalize it to one Computer Use wrapper plus one owned notifier. This
+normalization is semantic rather than byte-reversible. Remove performs no
+helper execution and may structurally strip exact owned layers at the fixed
+path even when the helper is missing or no longer executable; unknown shapes
+retain the ordinary foreign-notifier rules.
 Prior `agent-runtime-kit:hooks` marker lines are validated as an exact ordered
 pair outside TOML multiline values. When Codex has saved trailing `[projects]`
 or `[hooks.state]` trust tables inside that marker pair, setup classifies the
