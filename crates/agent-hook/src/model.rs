@@ -205,7 +205,7 @@ pub struct NormalizedRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub semantic_conflict: Option<SemanticConflict>,
     #[serde(skip)]
-    pub target_path: Option<PathBuf>,
+    pub target_paths: Vec<PathBuf>,
     #[serde(skip)]
     pub execution_path: Option<PathBuf>,
 }

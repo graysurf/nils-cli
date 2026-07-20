@@ -36,7 +36,7 @@ version = "2026.07.20.1"
 id = "runtime.owner"
 products = ["codex"]
 events = ["PreToolUse"]
-matcher = "Write"
+matcher = "Write|NotebookEdit|apply_patch"
 priority = 10
 mode = "enforce"
 failure_posture = "closed"
@@ -169,7 +169,8 @@ fn config_and_policy_reject_group_or_world_writable_opened_files() {
         let payload = json!({
             "hook_event_name": "PreToolUse",
             "tool_name": "Write",
-            "cwd": fixture.root
+            "cwd": fixture.root,
+            "tool_input": {"path": fixture.root.join("target.txt")}
         })
         .to_string();
         let commands: [(&[&str], Option<&str>); 4] = [
@@ -448,7 +449,8 @@ capability = { id = "decision.allow.v1", reason_code = "shared-allow" }
         let payload = json!({
             "hook_event_name":"PreToolUse",
             "tool_name":"Write",
-            "cwd":fixture.root
+            "cwd":fixture.root,
+            "tool_input":{"path":fixture.root.join("target.txt")}
         })
         .to_string();
         let output = fixture.run(
@@ -506,7 +508,8 @@ capability = { id = "decision.transform.v1", reason_code = "three", replacement 
     let payload = json!({
         "hook_event_name":"PreToolUse",
         "tool_name":"Write",
-        "cwd":fixture.root
+        "cwd":fixture.root,
+        "tool_input":{"path":fixture.root.join("target.txt")}
     })
     .to_string();
     let output = fixture.run(
@@ -531,6 +534,80 @@ capability = { id = "decision.transform.v1", reason_code = "three", replacement 
 
 #[test]
 fn explicit_mutation_target_cannot_be_masked_by_the_execution_checkout() {
+    let (fixture, checkout_a, checkout_b) = foreign_owner_fixture();
+    assert_foreign_target_blocks(
+        &fixture,
+        &checkout_a,
+        "Write",
+        json!({"path":checkout_b.join("foreign.txt")}),
+    );
+}
+
+#[test]
+fn notebook_edit_uses_notebook_path_for_owner_liveness() {
+    let (fixture, checkout_a, checkout_b) = foreign_owner_fixture();
+    assert_foreign_target_blocks(
+        &fixture,
+        &checkout_a,
+        "NotebookEdit",
+        json!({"notebook_path":checkout_b.join("foreign.ipynb")}),
+    );
+}
+
+#[test]
+fn apply_patch_checks_single_and_every_multi_file_target() {
+    let (fixture, checkout_a, checkout_b) = foreign_owner_fixture();
+    for patch in [
+        format!(
+            "*** Begin Patch\n*** Update File: {}\n@@\n-old\n+new\n*** End Patch",
+            checkout_b.join("foreign.txt").display()
+        ),
+        format!(
+            "*** Begin Patch\n*** Add File: {}\n+new\n*** End Patch",
+            checkout_b.join("foreign-add.txt").display()
+        ),
+        format!(
+            "*** Begin Patch\n*** Delete File: {}\n*** End Patch",
+            checkout_b.join("foreign-delete.txt").display()
+        ),
+        format!(
+            "*** Begin Patch\n*** Update File: {}\n*** Move to: {}\n@@\n-old\n+new\n*** End Patch",
+            checkout_a.join("self.txt").display(),
+            checkout_b.join("foreign-move.txt").display()
+        ),
+        format!(
+            "*** Begin Patch\n*** Update File: {}\n@@\n-old\n+new\n*** Update File: {}\n@@\n-old\n+new\n*** End Patch",
+            checkout_a.join("self.txt").display(),
+            checkout_b.join("foreign.txt").display()
+        ),
+    ] {
+        assert_foreign_target_blocks(&fixture, &checkout_a, "apply_patch", json!({"patch":patch}));
+    }
+}
+
+#[test]
+fn incomplete_apply_patch_target_mapping_fails_closed() {
+    let (fixture, checkout_a, _) = foreign_owner_fixture();
+    let payload = json!({
+        "hook_event_name":"PreToolUse",
+        "tool_name":"apply_patch",
+        "cwd":checkout_a,
+        "tool_input":{"patch":"*** Begin Patch\n*** Update File:\n@@\n-old\n+new\n*** End Patch"}
+    })
+    .to_string();
+    let output = fixture.run_with_env(
+        &["dispatch", "--product", "codex", "--format", "json"],
+        Some(&payload),
+        &[("AGENT_SESSION_ID", "current")],
+    );
+    assert_eq!(output.code, 65);
+    assert_eq!(
+        output.stdout_json()["error"]["code"],
+        "provider-target-untrusted"
+    );
+}
+
+fn foreign_owner_fixture() -> (Fixture, std::path::PathBuf, std::path::PathBuf) {
     let fixture = Fixture::new(&owner_policy());
     let checkout_a = fixture.root.join("checkout-a");
     let checkout_b = fixture.root.join("checkout-b");
@@ -563,11 +640,20 @@ fn explicit_mutation_target_cannot_be_masked_by_the_execution_checkout() {
         fs::write(&heartbeat, format!("{incarnation}:{now}\n")).expect("heartbeat");
         fs::set_permissions(&heartbeat, fs::Permissions::from_mode(0o600)).expect("heartbeat mode");
     }
+    (fixture, checkout_a, checkout_b)
+}
+
+fn assert_foreign_target_blocks(
+    fixture: &Fixture,
+    execution: &Path,
+    tool_name: &str,
+    tool_input: Value,
+) {
     let payload = json!({
         "hook_event_name":"PreToolUse",
-        "tool_name":"Write",
-        "cwd":checkout_a,
-        "tool_input":{"path":checkout_b.join("foreign.txt")}
+        "tool_name":tool_name,
+        "cwd":execution,
+        "tool_input":tool_input
     })
     .to_string();
     let output = fixture.run_with_env(
@@ -575,10 +661,16 @@ fn explicit_mutation_target_cannot_be_masked_by_the_execution_checkout() {
         Some(&payload),
         &[("AGENT_SESSION_ID", "current")],
     );
-    assert_eq!(output.code, 1, "stderr={}", output.stderr_text());
-    assert_eq!(output.stdout_json()["data"]["action"], "block");
     assert_eq!(
-        output.stdout_json()["data"]["reasons"][0]["code"],
+        output.code,
+        1,
+        "tool={tool_name} stderr={}",
+        output.stderr_text()
+    );
+    let decision = output.stdout_json();
+    assert_eq!(decision["data"]["action"], "block");
+    assert_eq!(
+        decision["data"]["reasons"][0]["code"],
         "owner-active-foreign"
     );
 }

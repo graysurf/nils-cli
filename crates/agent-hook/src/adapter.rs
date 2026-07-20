@@ -16,6 +16,8 @@ use crate::model::{
 
 pub const MAX_PROVIDER_BYTES: usize = 1024 * 1024;
 const MAX_PROVIDER_ID_CHARS: usize = 256;
+const MAX_MUTATION_TARGETS: usize = 256;
+const MAX_MUTATION_TARGET_BYTES: usize = 4096;
 
 #[derive(Debug, Serialize)]
 struct ActivityEvent {
@@ -102,11 +104,8 @@ pub fn normalize(
         .and_then(Value::as_str)
         .map(str::to_string)
         .filter(|value| value.len() <= 128);
-    let (target_path, execution_path) = target_paths(object, matcher.as_deref())?;
-    let target_material = target_path
-        .as_deref()
-        .map(target_binding_material)
-        .unwrap_or_else(|| b"target-unavailable".to_vec());
+    let (target_paths, execution_path) = target_paths(object, matcher.as_deref())?;
+    let target_material = target_set_binding_material(&target_paths);
     let command_material = command_text(object)
         .unwrap_or("command-unavailable")
         .as_bytes();
@@ -125,7 +124,7 @@ pub fn normalize(
         // Provider payload fields are untrusted and deliberately ignored. The
         // dispatcher replaces this with a #676 registry-derived projection.
         semantic_conflict: None,
-        target_path,
+        target_paths,
         execution_path,
     })
 }
@@ -413,46 +412,169 @@ fn string_at<'a>(object: &'a Map<String, Value>, keys: &[&str]) -> Option<&'a st
 fn target_paths(
     object: &Map<String, Value>,
     matcher: Option<&str>,
-) -> Result<(Option<PathBuf>, Option<PathBuf>), HookError> {
+) -> Result<(Vec<PathBuf>, Option<PathBuf>), HookError> {
     let execution = string_at(object, &["cwd", "working_directory"])
         .map(PathBuf::from)
         .filter(|path| path.is_absolute());
     let nested = object.get("tool_input").and_then(Value::as_object);
-    let path_value = nested.and_then(|input| input.get("path").or_else(|| input.get("file_path")));
-    let target =
-        match path_value {
-            Some(Value::String(value)) if !value.is_empty() => {
-                let path = PathBuf::from(value);
-                if path.is_absolute() {
-                    Some(path)
-                } else {
-                    Some(execution.as_ref().map(|cwd| cwd.join(path)).ok_or_else(|| {
-                    HookError::data(
-                        "provider-target-untrusted",
-                        "relative mutation target requires an absolute execution directory",
-                    )
-                })?)
+    let mut targets = match matcher {
+        Some("Write" | "Edit" | "MultiEdit") => {
+            let input = mutation_input(nested)?;
+            let path = exactly_one_path(input, &["path", "file_path"])?;
+            vec![resolve_mutation_target(path, execution.as_deref())?]
+        }
+        Some("NotebookEdit") => {
+            let input = mutation_input(nested)?;
+            let path = required_string(input.get("notebook_path"))?;
+            vec![resolve_mutation_target(path, execution.as_deref())?]
+        }
+        Some("apply_patch") => {
+            let input = mutation_input(nested)?;
+            let patch = match input.get("patch") {
+                Some(Value::String(patch)) if !patch.is_empty() => patch.as_str(),
+                _ => {
+                    return Err(untrusted_target(
+                        "apply_patch mutation must contain a non-empty patch string",
+                    ));
                 }
-            }
-            Some(_) => {
-                return Err(HookError::data(
-                    "provider-target-untrusted",
-                    "path-bearing mutation target must be a non-empty string",
-                ));
-            }
-            None => execution.clone(),
-        };
-    if matches!(
-        matcher,
-        Some("Write" | "Edit" | "NotebookEdit" | "MultiEdit")
-    ) && target.is_none()
-    {
-        return Err(HookError::data(
-            "provider-target-untrusted",
-            "path-bearing mutation could not be mapped to an absolute target",
+            };
+            parse_apply_patch_targets(patch, execution.as_deref())?
+        }
+        _ => execution.iter().cloned().collect(),
+    };
+    deduplicate_targets(&mut targets);
+    Ok((targets, execution))
+}
+
+fn mutation_input(nested: Option<&Map<String, Value>>) -> Result<&Map<String, Value>, HookError> {
+    nested.ok_or_else(|| untrusted_target("path-bearing mutation is missing tool_input"))
+}
+
+fn exactly_one_path<'a>(
+    input: &'a Map<String, Value>,
+    keys: &[&str],
+) -> Result<&'a str, HookError> {
+    let mut values = keys.iter().filter_map(|key| input.get(*key));
+    let Some(value) = values.next() else {
+        return Err(untrusted_target(
+            "path-bearing mutation is missing its provider path field",
+        ));
+    };
+    if values.next().is_some() {
+        return Err(untrusted_target(
+            "path-bearing mutation has ambiguous provider path fields",
         ));
     }
-    Ok((target, execution))
+    required_string(Some(value))
+}
+
+fn required_string(value: Option<&Value>) -> Result<&str, HookError> {
+    match value {
+        Some(Value::String(value))
+            if !value.is_empty()
+                && !value.contains('\0')
+                && value.len() <= MAX_MUTATION_TARGET_BYTES =>
+        {
+            Ok(value)
+        }
+        _ => Err(untrusted_target(
+            "path-bearing mutation target must be a bounded non-empty string",
+        )),
+    }
+}
+
+fn resolve_mutation_target(value: &str, execution: Option<&Path>) -> Result<PathBuf, HookError> {
+    let path = PathBuf::from(value);
+    if path.is_absolute() {
+        return Ok(path);
+    }
+    execution.map(|cwd| cwd.join(path)).ok_or_else(|| {
+        untrusted_target("relative mutation target requires an absolute execution directory")
+    })
+}
+
+fn parse_apply_patch_targets(
+    patch: &str,
+    execution: Option<&Path>,
+) -> Result<Vec<PathBuf>, HookError> {
+    let lines = patch.lines().collect::<Vec<_>>();
+    if lines.first() != Some(&"*** Begin Patch") || lines.last() != Some(&"*** End Patch") {
+        return Err(untrusted_target(
+            "apply_patch input must have exact begin and end markers",
+        ));
+    }
+
+    let mut targets = Vec::new();
+    for line in &lines[1..lines.len() - 1] {
+        let path = [
+            "*** Add File: ",
+            "*** Update File: ",
+            "*** Delete File: ",
+            "*** Move to: ",
+        ]
+        .iter()
+        .find_map(|prefix| line.strip_prefix(prefix));
+        if let Some(path) = path {
+            if path.is_empty() || path.contains('\0') || path.len() > MAX_MUTATION_TARGET_BYTES {
+                return Err(untrusted_target(
+                    "apply_patch target must be a bounded non-empty path",
+                ));
+            }
+            targets.push(resolve_mutation_target(path, execution)?);
+            if targets.len() > MAX_MUTATION_TARGETS {
+                return Err(untrusted_target("apply_patch input has too many targets"));
+            }
+        } else if line.starts_with("*** Add File:")
+            || line.starts_with("*** Update File:")
+            || line.starts_with("*** Delete File:")
+            || line.starts_with("*** Move to:")
+            || matches!(*line, "*** Begin Patch" | "*** End Patch")
+            || (line.starts_with("*** ") && *line != "*** End of File")
+        {
+            return Err(untrusted_target(
+                "apply_patch input contains an incomplete target directive",
+            ));
+        }
+    }
+    if targets.is_empty() {
+        return Err(untrusted_target(
+            "apply_patch input does not contain a mapped mutation target",
+        ));
+    }
+    deduplicate_targets(&mut targets);
+    Ok(targets)
+}
+
+fn deduplicate_targets(targets: &mut Vec<PathBuf>) {
+    let mut index = 0;
+    while index < targets.len() {
+        if targets[..index].contains(&targets[index]) {
+            targets.remove(index);
+        } else {
+            index += 1;
+        }
+    }
+}
+
+fn untrusted_target(message: &str) -> HookError {
+    HookError::data("provider-target-untrusted", message)
+}
+
+fn target_set_binding_material(paths: &[PathBuf]) -> Vec<u8> {
+    match paths {
+        [] => b"target-unavailable".to_vec(),
+        [path] => target_binding_material(path),
+        paths => {
+            let mut material = b"agent-hook.target-set-binding.v1\0".to_vec();
+            material.extend_from_slice(&(paths.len() as u64).to_le_bytes());
+            for path in paths {
+                let binding = target_binding_material(path);
+                material.extend_from_slice(&(binding.len() as u64).to_le_bytes());
+                material.extend_from_slice(&binding);
+            }
+            material
+        }
+    }
 }
 
 fn target_binding_material(path: &Path) -> Vec<u8> {

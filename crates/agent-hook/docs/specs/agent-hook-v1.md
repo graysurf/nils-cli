@@ -112,6 +112,22 @@ normalized only from documented provider fields:
 | Claude `Elicitation`, `ElicitationResult` | `mcp_server_name` |
 | Claude `StopFailure` | `error_type` |
 
+Path-bearing mutation inputs are normalized before rule evaluation. `Write`,
+`Edit`, and `MultiEdit` require exactly one non-empty `path` or `file_path`;
+`NotebookEdit` requires `notebook_path`; and `apply_patch` requires a bounded,
+structurally complete patch whose `Add File`, `Update File`, `Delete File`, and
+`Move to` directives are all mapped. Relative targets require an absolute
+provider execution directory. Missing, ambiguous, malformed, oversized, or
+only partially mapped targets fail closed as `provider-target-untrusted` rather
+than falling back to the execution checkout. Multi-target requests retain every
+distinct target for owner-liveness evaluation and bind recovery to a
+deterministic target-set digest; the existing single-target digest remains
+unchanged. Raw target paths are never serialized in the normalized request,
+decision, trace, or recovery artifact. Owner-liveness evaluates every distinct
+target checkout plus the execution checkout and returns the strongest result;
+an active foreign owner therefore cannot be masked by a self-owned or
+unclaimed target.
+
 A matcher on any other product/event pair is rejected during policy validation.
 A policy matcher is either
 one literal token or an anchored alternation expression such as

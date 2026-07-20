@@ -1,7 +1,7 @@
 mod support;
 
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::thread;
 use std::time::Duration;
 
@@ -80,7 +80,7 @@ fn authorize_for_target(
         "hook_event_name": "PreToolUse",
         "tool_name": "Write",
         "cwd": target_path,
-        "tool_input": {"command": "edit"}
+        "tool_input": {"path": target_path, "command": "edit"}
     })
     .to_string();
     let target = target_binding_digest(target_path);
@@ -186,7 +186,7 @@ fn exact_one_shot_works_with_broken_config_and_rejects_replay() {
         "hook_event_name": "PreToolUse",
         "tool_name": "Write",
         "cwd": fixture.root,
-        "tool_input": {"command": "edit"}
+        "tool_input": {"path": fixture.root, "command": "edit"}
     })
     .to_string();
     let target = target_binding_digest(&fixture.root);
@@ -433,10 +433,17 @@ fn one_shot_rejects_recreated_target_at_the_same_absolute_path_without_consuming
     let fixture = Fixture::new(POLICY);
     let target = fixture.root.join("recreated-target");
     fs::create_dir_all(&target).expect("target");
+    let original_target = fs::File::open(&target).expect("open original target");
+    let original_inode = original_target.metadata().expect("original metadata").ino();
     let capability = authorize_for_target(&fixture, "recreated", "one-shot", "300", &target, &[]);
 
     fs::remove_dir(&target).expect("remove target");
     fs::create_dir(&target).expect("recreate target");
+    assert_ne!(
+        fs::metadata(&target).expect("replacement metadata").ino(),
+        original_inode,
+        "the test must retain the removed inode while creating its replacement"
+    );
     let rejected = dispatch(&fixture, &capability, &[]);
     assert_eq!(rejected.code, 65, "stderr={}", rejected.stderr_text());
     assert_eq!(

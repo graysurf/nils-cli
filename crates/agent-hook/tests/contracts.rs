@@ -113,6 +113,7 @@ fn forged_payload_conflict_is_ignored_but_registry_conflict_blocks() {
         "hook_event_name": "PreToolUse",
         "tool_name": "Write",
         "cwd": fixture.root,
+        "tool_input": {"path": fixture.root.join("target.txt")},
         "semantic_conflict": "definite"
     })
     .to_string();

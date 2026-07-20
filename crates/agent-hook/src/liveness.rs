@@ -177,25 +177,56 @@ pub fn classify(
             None,
         );
     }
-    let Some(target) = request.target_path.as_deref() else {
+    if request.target_paths.is_empty() {
         return unknown("owner-target-unavailable");
-    };
-    let Some(snapshot) = snapshot else {
-        return legacy_classify(target, legacy_ttl_seconds);
-    };
-    let target_outcome = classify_registry_path(request, target, snapshot);
-    let Some(execution) = request.execution_path.as_deref() else {
-        return target_outcome;
-    };
-    if checkout_root(execution) == checkout_root(target) {
-        return target_outcome;
     }
-    let execution_outcome = classify_registry_path(request, execution, snapshot);
-    if action_rank(target_outcome.action) >= action_rank(execution_outcome.action) {
-        target_outcome
+
+    let mut paths = request
+        .target_paths
+        .iter()
+        .map(PathBuf::as_path)
+        .collect::<Vec<_>>();
+    if let Some(execution) = request.execution_path.as_deref() {
+        paths.push(execution);
+    }
+    let mut classified_roots = Vec::new();
+    let outcomes = paths.into_iter().filter_map(|path| {
+        let root = target_binding_root(path);
+        if classified_roots.contains(&root) {
+            return None;
+        }
+        classified_roots.push(root);
+        Some(match snapshot {
+            Some(snapshot) => classify_registry_path(request, path, snapshot),
+            None => legacy_classify(path, legacy_ttl_seconds),
+        })
+    });
+    strongest_outcome(outcomes).unwrap_or_else(|| unknown("owner-target-unavailable"))
+}
+
+fn strongest_outcome(outcomes: impl Iterator<Item = OwnerLiveness>) -> Option<OwnerLiveness> {
+    outcomes.reduce(|strongest, candidate| {
+        if outcome_rank(&candidate) > outcome_rank(&strongest) {
+            candidate
+        } else {
+            strongest
+        }
+    })
+}
+
+fn outcome_rank(outcome: &OwnerLiveness) -> (u8, u8) {
+    let specificity = if outcome.reason_code == "owner-active-foreign" {
+        5
     } else {
-        execution_outcome
-    }
+        match outcome.classification {
+            LivenessClass::Active => 4,
+            LivenessClass::Orphaned => 3,
+            LivenessClass::Stale => 2,
+            LivenessClass::Unknown => 1,
+            LivenessClass::Unclaimed => 0,
+        }
+    };
+    (action_rank(outcome.action), specificity)
 }
 
 fn classify_registry_path(
@@ -287,11 +318,10 @@ fn classify_registry_path(
 }
 
 fn checkout_root(path: &Path) -> Option<PathBuf> {
-    let start = if path.is_dir() {
-        path
-    } else {
-        path.parent().unwrap_or(path)
-    };
+    let mut start = path;
+    while !start.is_dir() {
+        start = start.parent()?;
+    }
     let output = Command::new("git")
         .arg("-C")
         .arg(start)
@@ -310,11 +340,13 @@ fn checkout_root(path: &Path) -> Option<PathBuf> {
 
 fn target_binding_root(path: &Path) -> PathBuf {
     checkout_root(path).unwrap_or_else(|| {
-        let candidate = if path.is_dir() {
-            path
-        } else {
-            path.parent().unwrap_or(path)
-        };
+        let mut candidate = path;
+        while !candidate.is_dir() {
+            let Some(parent) = candidate.parent() else {
+                break;
+            };
+            candidate = parent;
+        }
         candidate
             .canonicalize()
             .unwrap_or_else(|_| candidate.to_path_buf())
