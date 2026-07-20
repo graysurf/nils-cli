@@ -114,8 +114,8 @@ is no second state model.
   from the helpers' allowlisted structured field.
 - `GET /repos/remote-url?cwd=...` — authenticated repository lookup. `cwd` is
   required. The ordinary serve envelope returns `data.url` as a normalized
-  HTTPS GitHub or GitLab repository URL, or `null` when the directory has no
-  supported remote.
+  credential-free HTTPS URL for any parseable Git origin host, or `null` when
+  the directory has no supported remote.
 - `GET /sessions/{id}/buffer` — open on loopback. Returns the tmux server's
   latest global clipboard buffer after using `id` only to verify that the
   requested session exists. The buffer is not scoped to that session.
