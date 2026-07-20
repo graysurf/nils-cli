@@ -935,6 +935,11 @@ fn managed_marker_owner(content: &str, prefix: &str, suffix: &str) -> Option<Str
         .map(str::to_string)
 }
 
+enum ForeignManagedMarker {
+    Start { owner: String, begin: usize },
+    End { owner: String, end: usize },
+}
+
 fn codex_owned_block_overlaps_foreign_manager(
     raw: &str,
     owned_begin: usize,
@@ -942,7 +947,7 @@ fn codex_owned_block_overlaps_foreign_manager(
     multiline_value_lines: &[usize],
 ) -> Result<bool, HookError> {
     let owned_owner = "agent-hook:provider-ingress:v1";
-    let mut open = Vec::<(String, usize)>::new();
+    let mut markers = Vec::new();
     let mut offset = 0_usize;
     for line in raw.split_inclusive('\n') {
         let line_begin = offset;
@@ -956,7 +961,10 @@ fn codex_owned_block_overlaps_foreign_manager(
             .unwrap_or(without_newline);
         if let Some(owner) = managed_marker_owner(content, "# >>> ", " >>>") {
             if owner != owned_owner {
-                open.push((owner, line_begin));
+                markers.push(ForeignManagedMarker::Start {
+                    owner,
+                    begin: line_begin,
+                });
             }
             continue;
         }
@@ -966,27 +974,57 @@ fn codex_owned_block_overlaps_foreign_manager(
         if owner == owned_owner {
             continue;
         }
-        let Some(index) = open.iter().rposition(|(candidate, _)| candidate == &owner) else {
-            if offset > owned_begin {
-                return Err(HookError::data(
-                    "provider-config-invalid",
-                    "Codex config has an ambiguous foreign managed marker boundary overlapping agent-hook ingress",
-                ));
+        markers.push(ForeignManagedMarker::End { owner, end: offset });
+    }
+
+    let mut open = Vec::<(String, usize)>::new();
+    let mut ranges = Vec::new();
+    let mut malformed = false;
+    for marker in markers {
+        match marker {
+            ForeignManagedMarker::Start { owner, begin } => {
+                if open.iter().any(|(candidate, _)| candidate == &owner) {
+                    malformed = true;
+                }
+                open.push((owner, begin));
             }
-            continue;
-        };
-        let (_, foreign_begin) = open.remove(index);
-        if foreign_begin < owned_end && owned_begin < offset {
-            return Ok(true);
+            ForeignManagedMarker::End { owner, end } => {
+                let Some(index) = open.iter().rposition(|(candidate, _)| candidate == &owner)
+                else {
+                    malformed = true;
+                    continue;
+                };
+                if index + 1 != open.len() {
+                    malformed = true;
+                }
+                let (_, begin) = open.remove(index);
+                ranges.push(begin..end);
+            }
         }
     }
-    if open.iter().any(|(_, begin)| *begin < owned_end) {
+    malformed |= !open.is_empty();
+    if malformed {
         return Err(HookError::data(
             "provider-config-invalid",
-            "Codex config has an ambiguous foreign managed marker boundary overlapping agent-hook ingress",
+            "Codex config has an ambiguous foreign managed marker layout",
         ));
     }
-    Ok(false)
+
+    let mut owned_is_inside_foreign = false;
+    for foreign in ranges {
+        if foreign.start >= owned_end || owned_begin >= foreign.end {
+            continue;
+        }
+        if foreign.start <= owned_begin && owned_end <= foreign.end {
+            owned_is_inside_foreign = true;
+            continue;
+        }
+        return Err(HookError::data(
+            "provider-config-invalid",
+            "Codex agent-hook ingress contains or crosses foreign managed bytes that cannot be regenerated safely",
+        ));
+    }
+    Ok(owned_is_inside_foreign)
 }
 
 fn strip_codex_block(raw: &str, expected: &str) -> Result<(String, usize, bool), HookError> {

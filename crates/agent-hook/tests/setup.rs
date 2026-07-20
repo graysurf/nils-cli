@@ -592,6 +592,114 @@ fn codex_owned_block_nested_in_foreign_manager_requires_review_and_preserves_byt
     );
 }
 
+fn seed_codex_owned_config(fixture: &Fixture) -> (std::path::PathBuf, String) {
+    let codex = fixture.home.join(".codex");
+    fs::create_dir_all(&codex).expect("codex dir");
+    let config = codex.join("config.toml");
+    let seeded = fixture.run(
+        &["setup", "--product", "codex", "--apply", "--format", "json"],
+        None,
+    );
+    assert_eq!(seeded.code, 0, "stderr={}", seeded.stderr_text());
+    let seeded = fs::read_to_string(&config).expect("seeded config");
+    (config, seeded)
+}
+
+#[test]
+fn codex_foreign_manager_block_inside_owned_span_fails_closed_for_every_action() {
+    for action in ["--dry-run", "--apply", "--repair", "--remove"] {
+        let fixture = Fixture::new(POLICY);
+        let (config, seeded) = seed_codex_owned_config(&fixture);
+        let owned_end = seeded
+            .find("# <<< agent-hook:provider-ingress:v1 <<<")
+            .expect("owned end");
+        let foreign = concat!(
+            "# >>> foreign-manager:hooks >>>\n",
+            "foreign_metadata = \"must-survive\"\n",
+            "# <<< foreign-manager:hooks <<<\n",
+        );
+        let original = format!("{}{foreign}{}", &seeded[..owned_end], &seeded[owned_end..]);
+        fs::write(&config, &original).expect("inverse-contained foreign block");
+
+        let rejected = fixture.run(
+            &["setup", "--product", "codex", action, "--format", "json"],
+            None,
+        );
+        assert_eq!(
+            rejected.code,
+            65,
+            "action={action} stdout={} stderr={}",
+            rejected.stdout_text(),
+            rejected.stderr_text()
+        );
+        assert_eq!(
+            rejected.stdout_json()["error"]["code"],
+            "provider-config-invalid",
+            "action={action}"
+        );
+        assert_eq!(
+            fs::read_to_string(&config).expect("foreign bytes retained"),
+            original,
+            "action={action}"
+        );
+    }
+}
+
+#[test]
+fn codex_foreign_marker_scan_rejects_later_malformed_ranges_for_every_action() {
+    let malformed_layouts = [
+        ("orphan", "# >>> later-orphan:hooks >>>\n"),
+        (
+            "reversed",
+            "# <<< later-reversed:hooks <<<\n# >>> later-reversed:hooks >>>\n",
+        ),
+        (
+            "duplicate",
+            "# >>> later-duplicate:hooks >>>\n# >>> later-duplicate:hooks >>>\n# <<< later-duplicate:hooks <<<\n",
+        ),
+    ];
+    for (layout_name, malformed) in malformed_layouts {
+        for action in ["--dry-run", "--apply", "--repair", "--remove"] {
+            let fixture = Fixture::new(POLICY);
+            let (config, seeded) = seed_codex_owned_config(&fixture);
+            let owned_start = seeded
+                .find("# >>> agent-hook:provider-ingress:v1 >>>")
+                .expect("owned start");
+            let owned_end = seeded
+                .find("# <<< agent-hook:provider-ingress:v1 <<<")
+                .expect("owned end")
+                + "# <<< agent-hook:provider-ingress:v1 <<<\n".len();
+            let owned = &seeded[owned_start..owned_end];
+            let original = format!(
+                "# >>> completed-foreign:hooks >>>\n{owned}# <<< completed-foreign:hooks <<<\n{malformed}"
+            );
+            fs::write(&config, &original).expect("later malformed foreign markers");
+
+            let rejected = fixture.run(
+                &["setup", "--product", "codex", action, "--format", "json"],
+                None,
+            );
+            assert_eq!(
+                rejected.code,
+                65,
+                "layout={layout_name} action={action} stdout={} stderr={}",
+                rejected.stdout_text(),
+                rejected.stderr_text()
+            );
+            assert_eq!(
+                rejected.stdout_json()["error"]["code"],
+                "provider-config-invalid",
+                "layout={layout_name} action={action}"
+            );
+            assert_eq!(
+                fs::read_to_string(&config).expect("malformed layout retained"),
+                original,
+                "layout={layout_name} action={action}"
+            );
+        }
+    }
+}
+
 #[test]
 fn provider_setup_rejects_duplicate_json_keys_recursively_for_every_action() {
     let fixtures = [
