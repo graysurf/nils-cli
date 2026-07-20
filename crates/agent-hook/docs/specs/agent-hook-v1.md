@@ -246,6 +246,15 @@ interpreter, argv, environment assignment, shell fragment, timeout, or digest.
 Shadow mode never invokes it. Adding another handler requires a new nils-cli
 release or a new versioned capability ID.
 
+For Codex and Claude, `doctor` resolves every policy-referenced
+`runtime-kit.handler.v1` and `agent-session.coordination.v1` handler before an
+otherwise converged provider is reported healthy. Activation health and
+immediate pre-execution validation share one trust predicate: the resolved
+handler must be a regular file, executable by its effective-user owner, and
+have no group/world write bits. Any failures are collected before returning a
+typed `handler-unavailable` or `handler-untrusted` error; the diagnostic names
+each affected handler without exposing its private resolved path.
+
 `agent-session.coordination.v1` is a separate typed after-policy capability,
 not another configurable handler ID. It resolves only the exact
 `session-coordination-guard.py` consumer below the active provider's owned hook
