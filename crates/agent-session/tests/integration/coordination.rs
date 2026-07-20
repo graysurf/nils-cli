@@ -13,7 +13,31 @@ fn run(dir: &Path, args: &[&str]) -> CmdOutput {
     run_resolved("agent-session", args, &CmdOptions::new().with_cwd(dir))
 }
 
+fn run_with_env(dir: &Path, args: &[&str], envs: &[(&str, &str)]) -> CmdOutput {
+    run_resolved(
+        "agent-session",
+        args,
+        &CmdOptions::new().with_cwd(dir).with_envs(envs),
+    )
+}
+
 fn seed_session(state_dir: &Path, id: &str, incarnation: &str) {
+    seed_session_at(
+        state_dir,
+        id,
+        incarnation,
+        Path::new("/fixture/repository"),
+        None,
+    );
+}
+
+fn seed_session_at(
+    state_dir: &Path,
+    id: &str,
+    incarnation: &str,
+    cwd: &Path,
+    coordination_mode: Option<&str>,
+) {
     let session_dir = state_dir.join("sessions").join(id);
     fs::create_dir_all(&session_dir).expect("session directory");
     fs::set_permissions(state_dir, fs::Permissions::from_mode(0o700)).expect("state mode");
@@ -23,14 +47,14 @@ fn seed_session(state_dir: &Path, id: &str, incarnation: &str) {
     )
     .expect("sessions mode");
     fs::set_permissions(&session_dir, fs::Permissions::from_mode(0o700)).expect("session mode");
-    let record = json!({
+    let mut record = json!({
         "schema_version": "agent-session.session.v1",
         "id": id,
         "agent": "codex",
         "mode": "interactive",
         "title": "coordination fixture",
         "title_revision": 0,
-        "cwd": "/fixture/repository",
+        "cwd": cwd,
         "tmux_session": format!("hs-codex-{id}"),
         "prompt_file": null,
         "log_file": null,
@@ -44,6 +68,9 @@ fn seed_session(state_dir: &Path, id: &str, incarnation: &str) {
             "launch_id": incarnation
         }
     });
+    if let Some(mode) = coordination_mode {
+        record["coordination_mode"] = json!(mode);
+    }
     let path = session_dir.join("session.json");
     fs::write(
         &path,
@@ -51,6 +78,22 @@ fn seed_session(state_dir: &Path, id: &str, incarnation: &str) {
     )
     .expect("write session");
     fs::set_permissions(path, fs::Permissions::from_mode(0o600)).expect("record mode");
+}
+
+fn init_checkout(path: &Path, remote: &str) {
+    fs::create_dir_all(path).expect("checkout directory");
+    let init = Command::new("git")
+        .current_dir(path)
+        .args(["init", "--quiet", "--initial-branch", "main"])
+        .status()
+        .expect("git init");
+    assert!(init.success());
+    let remote_add = Command::new("git")
+        .current_dir(path)
+        .args(["remote", "add", "origin", remote])
+        .status()
+        .expect("git remote add");
+    assert!(remote_add.success());
 }
 
 fn digest(value: &str) -> String {
@@ -61,13 +104,29 @@ fn digest(value: &str) -> String {
 }
 
 fn seed_brokers(state_dir: &Path, sessions: &[(&str, &str, &str)]) {
+    let sessions = sessions
+        .iter()
+        .map(|(id, incarnation, capability)| {
+            (
+                *id,
+                *incarnation,
+                *capability,
+                Path::new("/fixture/repository"),
+                None,
+            )
+        })
+        .collect::<Vec<_>>();
+    seed_brokers_at(state_dir, &sessions);
+}
+
+fn seed_brokers_at(state_dir: &Path, sessions: &[(&str, &str, &str, &Path, Option<&str>)]) {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .expect("clock")
         .as_secs();
     let mut brokers = serde_json::Map::new();
-    for (id, incarnation, capability) in sessions {
-        seed_session(state_dir, id, incarnation);
+    for (id, incarnation, capability, cwd, coordination_mode) in sessions {
+        seed_session_at(state_dir, id, incarnation, cwd, *coordination_mode);
         let capability_dir = state_dir.join("sessions").join(id).join("coordination");
         fs::create_dir(&capability_dir).expect("capability directory");
         fs::set_permissions(&capability_dir, fs::Permissions::from_mode(0o700))
@@ -187,6 +246,11 @@ fn coordination_help_exposes_closed_work_context_and_mailbox_command_families() 
     );
     let work_context_help = work_context.stdout_text();
     for command in [
+        "status",
+        "set",
+        "clear",
+        "advise",
+        "acknowledge",
         "claim",
         "show",
         "check",
@@ -201,6 +265,13 @@ fn coordination_help_exposes_closed_work_context_and_mailbox_command_families() 
             "missing work-context command {command}: {work_context_help}"
         );
     }
+
+    let start = run(tmp.path(), &["start", "--help"]);
+    assert_eq!(start.code, 0, "stderr={}", start.stderr_text());
+    assert!(start.stdout_text().contains("--coordination-mode"));
+    assert!(start.stdout_text().contains("advisory"));
+    assert!(start.stdout_text().contains("enforce"));
+    assert!(start.stdout_text().contains("off"));
 
     let broker = run(tmp.path(), &["broker", "--help"]);
     assert_eq!(broker.code, 0, "stderr={}", broker.stderr_text());
@@ -221,6 +292,746 @@ fn coordination_help_exposes_closed_work_context_and_mailbox_command_families() 
             "missing message command {command}: {message_help}"
         );
     }
+}
+
+#[test]
+fn advisory_presence_defaults_for_legacy_sessions_and_classifies_overlap_without_claims() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let state_dir = tmp.path().join("state");
+    fs::create_dir(&state_dir).expect("state");
+    let checkout = tmp.path().join("checkout");
+    init_checkout(&checkout, "https://github.com/example/repository.git");
+    seed_brokers_at(
+        &state_dir,
+        &[
+            (
+                "alpha",
+                "incarnation-alpha",
+                "alpha-private-capability-material",
+                checkout.as_path(),
+                None,
+            ),
+            (
+                "beta",
+                "incarnation-beta",
+                "beta-private-capability-material",
+                checkout.as_path(),
+                Some("advisory"),
+            ),
+        ],
+    );
+    let state = state_dir.to_string_lossy();
+    let alpha_cap = capability(&state_dir, "alpha");
+    let managed_env = [
+        ("AGENT_SESSION_ID", "alpha"),
+        ("AGENT_SESSION_CAPABILITY_FILE", alpha_cap.as_str()),
+        ("AGENT_SESSION_STATE_DIR", state.as_ref()),
+    ];
+
+    let status = run_with_env(
+        tmp.path(),
+        &["work-context", "status", "--format", "json"],
+        &managed_env,
+    );
+    assert_eq!(status.code, 0, "stderr={}", status.stderr_text());
+    assert_eq!(data(&status)["managed"], true);
+    assert_eq!(data(&status)["mode"], "advisory");
+    assert_eq!(data(&status)["presence"]["state"], "active");
+    assert!(data(&status)["context"].is_null());
+
+    let advised = run_with_env(
+        tmp.path(),
+        &["work-context", "advise", "--format", "json"],
+        &managed_env,
+    );
+    assert_eq!(advised.code, 0, "stderr={}", advised.stderr_text());
+    assert_eq!(data(&advised)["mode"], "advisory");
+    assert_eq!(data(&advised)["severity"], "warning");
+    assert_eq!(data(&advised)["suppressed"], false);
+    assert_eq!(data(&advised)["reasons"][0]["code"], "same-worktree");
+    assert_eq!(data(&advised)["peers"][0]["session_id"], "beta");
+    assert!(
+        !advised
+            .stdout_text()
+            .contains(checkout.to_string_lossy().as_ref())
+    );
+    assert!(
+        !advised
+            .stdout_text()
+            .contains("beta-private-capability-material")
+    );
+}
+
+#[test]
+fn advisory_presence_distinguishes_same_repository_from_same_worktree() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let state_dir = tmp.path().join("state");
+    fs::create_dir(&state_dir).expect("state");
+    let alpha_checkout = tmp.path().join("alpha-checkout");
+    let beta_checkout = tmp.path().join("beta-checkout");
+    init_checkout(&alpha_checkout, "git@github.com:example/repository.git");
+    init_checkout(&beta_checkout, "https://github.com/example/repository.git");
+    seed_brokers_at(
+        &state_dir,
+        &[
+            (
+                "alpha",
+                "incarnation-alpha",
+                "alpha-private-capability-material",
+                alpha_checkout.as_path(),
+                Some("advisory"),
+            ),
+            (
+                "beta",
+                "incarnation-beta",
+                "beta-private-capability-material",
+                beta_checkout.as_path(),
+                Some("advisory"),
+            ),
+        ],
+    );
+    let state = state_dir.to_string_lossy();
+    let alpha_cap = capability(&state_dir, "alpha");
+    let managed_env = [
+        ("AGENT_SESSION_ID", "alpha"),
+        ("AGENT_SESSION_CAPABILITY_FILE", alpha_cap.as_str()),
+        ("AGENT_SESSION_STATE_DIR", state.as_ref()),
+    ];
+    let advised = run_with_env(
+        tmp.path(),
+        &["work-context", "advise", "--format", "json"],
+        &managed_env,
+    );
+    assert_eq!(advised.code, 0, "stderr={}", advised.stderr_text());
+    assert_eq!(data(&advised)["severity"], "info");
+    assert_eq!(data(&advised)["reasons"][0]["code"], "same-repository");
+}
+
+#[test]
+fn unmanaged_and_off_sessions_are_explicit_nonparticipants() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let unmanaged = run_with_env(
+        tmp.path(),
+        &["work-context", "advise", "--format", "json"],
+        &[
+            ("AGENT_SESSION_ID", ""),
+            ("AGENT_SESSION_CAPABILITY_FILE", ""),
+            ("AGENT_SESSION_STATE_DIR", ""),
+        ],
+    );
+    assert_eq!(unmanaged.code, 0, "stderr={}", unmanaged.stderr_text());
+    assert_eq!(data(&unmanaged)["managed"], false);
+    assert_eq!(data(&unmanaged)["mode"], "off");
+    assert_eq!(data(&unmanaged)["severity"], "none");
+
+    let state_dir = tmp.path().join("state");
+    fs::create_dir(&state_dir).expect("state");
+    let checkout = tmp.path().join("checkout");
+    init_checkout(&checkout, "https://github.com/example/repository.git");
+    seed_brokers_at(
+        &state_dir,
+        &[(
+            "alpha",
+            "incarnation-alpha",
+            "alpha-private-capability-material",
+            checkout.as_path(),
+            Some("off"),
+        )],
+    );
+    let state = state_dir.to_string_lossy();
+    let alpha_cap = capability(&state_dir, "alpha");
+    let off = run_with_env(
+        &checkout,
+        &["work-context", "advise", "--format", "json"],
+        &[
+            ("AGENT_SESSION_ID", "alpha"),
+            ("AGENT_SESSION_CAPABILITY_FILE", alpha_cap.as_str()),
+            ("AGENT_SESSION_STATE_DIR", state.as_ref()),
+        ],
+    );
+    assert_eq!(off.code, 0, "stderr={}", off.stderr_text());
+    assert_eq!(data(&off)["managed"], true);
+    assert_eq!(data(&off)["mode"], "off");
+    assert_eq!(data(&off)["severity"], "none");
+}
+
+#[test]
+fn advisory_targets_require_the_exact_v1_schema() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let state_dir = tmp.path().join("state");
+    fs::create_dir(&state_dir).expect("state");
+    let checkout = tmp.path().join("checkout");
+    init_checkout(&checkout, "https://github.com/example/repository.git");
+    seed_brokers_at(
+        &state_dir,
+        &[(
+            "alpha",
+            "incarnation-alpha",
+            "alpha-private-capability-material",
+            checkout.as_path(),
+            Some("advisory"),
+        )],
+    );
+    let state = state_dir.to_string_lossy();
+    let alpha_cap = capability(&state_dir, "alpha");
+    let env = [
+        ("AGENT_SESSION_ID", "alpha"),
+        ("AGENT_SESSION_CAPABILITY_FILE", alpha_cap.as_str()),
+        ("AGENT_SESSION_STATE_DIR", state.as_ref()),
+    ];
+    let cases = [
+        (
+            "valid",
+            json!({
+                "schema_version": "agent-session.operation-targets.v1",
+                "targets": [],
+                "provider_refs": [],
+                "checkouts": [],
+                "descendant": null
+            }),
+            true,
+        ),
+        (
+            "missing",
+            json!({ "targets": [], "provider_refs": [] }),
+            false,
+        ),
+        (
+            "future",
+            json!({
+                "schema_version": "agent-session.operation-targets.v2",
+                "targets": [],
+                "provider_refs": []
+            }),
+            false,
+        ),
+        (
+            "misspelled",
+            json!({
+                "schema_version": "agent-session.operation-targets.v1",
+                "tragets": [],
+                "provider_refs": []
+            }),
+            false,
+        ),
+    ];
+    for (name, body, succeeds) in cases {
+        let path = tmp.path().join(format!("{name}.json"));
+        fs::write(
+            &path,
+            serde_json::to_vec_pretty(&body).expect("targets json"),
+        )
+        .expect("write targets");
+        let output = run_with_env(
+            &checkout,
+            &[
+                "work-context",
+                "advise",
+                "--targets-file",
+                path.to_str().expect("target path"),
+                "--format",
+                "json",
+            ],
+            &env,
+        );
+        assert_eq!(
+            output.code == 0,
+            succeeds,
+            "case={name} stdout={} stderr={}",
+            output.stdout_text(),
+            output.stderr_text()
+        );
+        if !succeeds {
+            assert_eq!(
+                output.stdout_json()["schema_version"],
+                "cli.agent-session.work-context-advise.v1"
+            );
+            assert_eq!(
+                output.stdout_json()["error"]["code"],
+                "invalid-operation-targets"
+            );
+        }
+    }
+}
+
+#[test]
+fn clear_advisories_do_not_rewrite_the_registry_for_target_churn() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let state_dir = tmp.path().join("state");
+    fs::create_dir(&state_dir).expect("state");
+    let checkout = tmp.path().join("checkout");
+    init_checkout(&checkout, "https://github.com/example/repository.git");
+    seed_brokers_at(
+        &state_dir,
+        &[(
+            "alpha",
+            "incarnation-alpha",
+            "alpha-private-capability-material",
+            checkout.as_path(),
+            Some("advisory"),
+        )],
+    );
+    let state = state_dir.to_string_lossy();
+    let alpha_cap = capability(&state_dir, "alpha");
+    let env = [
+        ("AGENT_SESSION_ID", "alpha"),
+        ("AGENT_SESSION_CAPABILITY_FILE", alpha_cap.as_str()),
+        ("AGENT_SESSION_STATE_DIR", state.as_ref()),
+    ];
+    let registry = state_dir.join("coordination/registry.json");
+    let before = fs::read(&registry).expect("registry before");
+    for target in ["src/one.rs", "src/two.rs"] {
+        let path = tmp.path().join(target.replace('/', "-"));
+        fs::write(
+            &path,
+            serde_json::to_vec_pretty(&json!({
+                "schema_version": "agent-session.operation-targets.v1",
+                "targets": [{
+                    "kind": "path-exact",
+                    "repository": "example/repository",
+                    "value": target
+                }],
+                "provider_refs": [],
+                "checkouts": []
+            }))
+            .expect("targets json"),
+        )
+        .expect("write targets");
+        let advised = run_with_env(
+            &checkout,
+            &[
+                "work-context",
+                "advise",
+                "--targets-file",
+                path.to_str().expect("target path"),
+                "--format",
+                "json",
+            ],
+            &env,
+        );
+        assert_eq!(advised.code, 0, "stderr={}", advised.stderr_text());
+        assert_eq!(data(&advised)["severity"], "none");
+    }
+    assert_eq!(fs::read(&registry).expect("registry after"), before);
+}
+
+#[test]
+fn self_targeting_context_set_clear_and_acknowledge_hide_mechanical_inputs() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let state_dir = tmp.path().join("state");
+    fs::create_dir(&state_dir).expect("state");
+    let checkout = tmp.path().join("checkout");
+    init_checkout(&checkout, "https://github.com/example/repository.git");
+    seed_brokers_at(
+        &state_dir,
+        &[
+            (
+                "alpha",
+                "incarnation-alpha",
+                "alpha-private-capability-material",
+                checkout.as_path(),
+                Some("advisory"),
+            ),
+            (
+                "beta",
+                "incarnation-beta",
+                "beta-private-capability-material",
+                checkout.as_path(),
+                Some("advisory"),
+            ),
+        ],
+    );
+    let state = state_dir.to_string_lossy();
+    let alpha_cap = capability(&state_dir, "alpha");
+    let beta_cap = capability(&state_dir, "beta");
+    let alpha_env = [
+        ("AGENT_SESSION_ID", "alpha"),
+        ("AGENT_SESSION_CAPABILITY_FILE", alpha_cap.as_str()),
+        ("AGENT_SESSION_STATE_DIR", state.as_ref()),
+    ];
+    let beta_env = [
+        ("AGENT_SESSION_ID", "beta"),
+        ("AGENT_SESSION_CAPABILITY_FILE", beta_cap.as_str()),
+        ("AGENT_SESSION_STATE_DIR", state.as_ref()),
+    ];
+
+    for (envs, summary) in [(&alpha_env, "alpha task"), (&beta_env, "beta task")] {
+        let set = run_with_env(
+            &checkout,
+            &[
+                "work-context",
+                "set",
+                "--tier",
+                "L2",
+                "--summary",
+                summary,
+                "--issue",
+                "1318",
+                "--pr",
+                "42",
+                "--plan-ref",
+                "issue:1318",
+                "--path",
+                "src/",
+                "--format",
+                "json",
+            ],
+            envs,
+        );
+        assert_eq!(
+            set.code,
+            0,
+            "stdout={} stderr={}",
+            set.stdout_text(),
+            set.stderr_text()
+        );
+        assert_eq!(data(&set)["mode"], "advisory");
+        assert_eq!(
+            data(&set)["context"]["repositories"][0],
+            "example/repository"
+        );
+        assert_eq!(data(&set)["context"]["provider_refs"][0]["kind"], "issue");
+        assert_eq!(data(&set)["context"]["provider_refs"][1]["kind"], "pr");
+        assert_eq!(data(&set)["context"]["plan_refs"][0], "issue:1318");
+        assert_eq!(data(&set)["context"]["scopes"][0]["kind"], "path-prefix");
+    }
+
+    let acknowledged = run_with_env(
+        &checkout,
+        &[
+            "work-context",
+            "acknowledge",
+            "--for",
+            "30m",
+            "--format",
+            "json",
+        ],
+        &alpha_env,
+    );
+    assert_eq!(
+        acknowledged.code,
+        0,
+        "stderr={}",
+        acknowledged.stderr_text()
+    );
+    let advised = run_with_env(
+        &checkout,
+        &["work-context", "advise", "--format", "json"],
+        &alpha_env,
+    );
+    assert_eq!(advised.code, 0, "stderr={}", advised.stderr_text());
+    assert_eq!(data(&advised)["severity"], "warning");
+    assert_eq!(data(&advised)["suppressed"], true);
+
+    let cleared = run_with_env(
+        &checkout,
+        &["work-context", "clear", "--format", "json"],
+        &alpha_env,
+    );
+    assert_eq!(cleared.code, 0, "stderr={}", cleared.stderr_text());
+    assert_eq!(data(&cleared)["released"], true);
+    let status = run_with_env(
+        &checkout,
+        &["work-context", "status", "--format", "json"],
+        &alpha_env,
+    );
+    assert_eq!(status.code, 0, "stderr={}", status.stderr_text());
+    assert!(data(&status)["context"].is_null());
+}
+
+#[test]
+fn advisory_lifecycle_skips_stopped_and_off_peers_but_preserves_known_overlap() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let state_dir = tmp.path().join("state");
+    fs::create_dir(&state_dir).expect("state");
+    let checkout = tmp.path().join("checkout");
+    init_checkout(&checkout, "https://github.com/example/repository.git");
+    seed_brokers_at(
+        &state_dir,
+        &[
+            (
+                "alpha",
+                "incarnation-alpha",
+                "alpha-private-capability-material",
+                checkout.as_path(),
+                Some("advisory"),
+            ),
+            (
+                "beta",
+                "incarnation-beta",
+                "beta-private-capability-material",
+                checkout.as_path(),
+                Some("advisory"),
+            ),
+            (
+                "gamma",
+                "incarnation-gamma",
+                "gamma-private-capability-material",
+                checkout.as_path(),
+                Some("off"),
+            ),
+        ],
+    );
+    let state = state_dir.to_string_lossy();
+    let alpha_cap = capability(&state_dir, "alpha");
+    let alpha_env = [
+        ("AGENT_SESSION_ID", "alpha"),
+        ("AGENT_SESSION_CAPABILITY_FILE", alpha_cap.as_str()),
+        ("AGENT_SESSION_STATE_DIR", state.as_ref()),
+    ];
+
+    rewrite_registry(&state_dir, |registry| {
+        registry["brokers"]["gamma"]["state"] = json!("starting");
+    });
+    let initial = run_with_env(
+        &checkout,
+        &["work-context", "advise", "--format", "json"],
+        &alpha_env,
+    );
+    assert_eq!(initial.code, 0, "stderr={}", initial.stderr_text());
+    assert_eq!(data(&initial)["available"], true);
+    assert_eq!(data(&initial)["severity"], "warning");
+    assert_eq!(data(&initial)["peers"].as_array().expect("peers").len(), 1);
+
+    let gamma_record = state_dir.join("sessions/gamma/session.json");
+    let mut gamma: serde_json::Value =
+        serde_json::from_slice(&fs::read(&gamma_record).expect("gamma record"))
+            .expect("gamma json");
+    gamma["coordination_mode"] = json!("advisory");
+    fs::write(
+        &gamma_record,
+        serde_json::to_vec_pretty(&gamma).expect("gamma json"),
+    )
+    .expect("write gamma");
+    let mixed = run_with_env(
+        &checkout,
+        &["work-context", "advise", "--format", "json"],
+        &alpha_env,
+    );
+    assert_eq!(mixed.code, 0, "stderr={}", mixed.stderr_text());
+    assert_eq!(data(&mixed)["available"], false);
+    assert_eq!(data(&mixed)["severity"], "warning");
+    assert_eq!(data(&mixed)["reasons"][0]["peer_session_id"], "beta");
+
+    rewrite_registry(&state_dir, |registry| {
+        registry["brokers"]["beta"]["state"] = json!("stopped");
+        registry["brokers"]["gamma"]["state"] = json!("stopped");
+    });
+    let stopped = run_with_env(
+        &checkout,
+        &["work-context", "advise", "--format", "json"],
+        &alpha_env,
+    );
+    assert_eq!(stopped.code, 0, "stderr={}", stopped.stderr_text());
+    assert_eq!(data(&stopped)["available"], true);
+    assert_eq!(data(&stopped)["severity"], "none");
+    assert!(
+        data(&stopped)["reasons"]
+            .as_array()
+            .expect("reasons")
+            .is_empty()
+    );
+}
+
+#[test]
+fn acknowledgement_is_bound_to_the_observed_overlap_and_expiry() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let state_dir = tmp.path().join("state");
+    fs::create_dir(&state_dir).expect("state");
+    let checkout = tmp.path().join("checkout");
+    init_checkout(&checkout, "https://github.com/example/repository.git");
+    seed_brokers_at(
+        &state_dir,
+        &[
+            (
+                "alpha",
+                "incarnation-alpha",
+                "alpha-private-capability-material",
+                checkout.as_path(),
+                Some("advisory"),
+            ),
+            (
+                "beta",
+                "incarnation-beta",
+                "beta-private-capability-material",
+                checkout.as_path(),
+                Some("advisory"),
+            ),
+            (
+                "gamma",
+                "incarnation-gamma",
+                "gamma-private-capability-material",
+                checkout.as_path(),
+                Some("off"),
+            ),
+        ],
+    );
+    let state = state_dir.to_string_lossy();
+    let alpha_cap = capability(&state_dir, "alpha");
+    let alpha_env = [
+        ("AGENT_SESSION_ID", "alpha"),
+        ("AGENT_SESSION_CAPABILITY_FILE", alpha_cap.as_str()),
+        ("AGENT_SESSION_STATE_DIR", state.as_ref()),
+    ];
+    let advise = || {
+        run_with_env(
+            &checkout,
+            &["work-context", "advise", "--format", "json"],
+            &alpha_env,
+        )
+    };
+
+    let first = advise();
+    assert_eq!(data(&first)["suppressed"], false);
+    let acknowledged = run_with_env(
+        &checkout,
+        &[
+            "work-context",
+            "acknowledge",
+            "--for",
+            "30m",
+            "--format",
+            "json",
+        ],
+        &alpha_env,
+    );
+    assert_eq!(
+        acknowledged.code,
+        0,
+        "stderr={}",
+        acknowledged.stderr_text()
+    );
+    assert_eq!(data(&advise())["suppressed"], true);
+
+    for target in ["src/one.rs", "src/two.rs"] {
+        let path = tmp.path().join(target.replace('/', "-"));
+        fs::write(
+            &path,
+            serde_json::to_vec_pretty(&json!({
+                "schema_version": "agent-session.operation-targets.v1",
+                "targets": [{
+                    "kind": "path-exact",
+                    "repository": "example/repository",
+                    "value": target
+                }],
+                "provider_refs": [],
+                "checkouts": []
+            }))
+            .expect("targets json"),
+        )
+        .expect("write targets");
+        let targeted = run_with_env(
+            &checkout,
+            &[
+                "work-context",
+                "advise",
+                "--targets-file",
+                path.to_str().expect("target path"),
+                "--format",
+                "json",
+            ],
+            &alpha_env,
+        );
+        assert_eq!(targeted.code, 0, "stderr={}", targeted.stderr_text());
+        assert_eq!(data(&targeted)["suppressed"], true);
+    }
+
+    let gamma_record = state_dir.join("sessions/gamma/session.json");
+    let mut gamma: serde_json::Value =
+        serde_json::from_slice(&fs::read(&gamma_record).expect("gamma record"))
+            .expect("gamma json");
+    gamma["coordination_mode"] = json!("advisory");
+    fs::write(
+        &gamma_record,
+        serde_json::to_vec_pretty(&gamma).expect("gamma json"),
+    )
+    .expect("write gamma");
+    let changed = advise();
+    assert_eq!(data(&changed)["severity"], "warning");
+    assert_eq!(data(&changed)["suppressed"], false);
+    assert_eq!(data(&changed)["peers"].as_array().expect("peers").len(), 2);
+
+    let acknowledged_again = run_with_env(
+        &checkout,
+        &["work-context", "acknowledge", "--format", "json"],
+        &alpha_env,
+    );
+    assert_eq!(
+        acknowledged_again.code,
+        0,
+        "stderr={}",
+        acknowledged_again.stderr_text()
+    );
+    assert_eq!(data(&advise())["suppressed"], true);
+    rewrite_registry(&state_dir, |registry| {
+        registry["advisory_acknowledgements"]["alpha"]["expires_at_epoch"] = json!(0);
+    });
+    assert_eq!(data(&advise())["suppressed"], false);
+}
+
+#[test]
+fn raw_claim_and_high_level_set_share_the_checkout_root_fingerprint() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let state_dir = tmp.path().join("state");
+    fs::create_dir(&state_dir).expect("state");
+    let checkout = tmp.path().join("checkout");
+    let nested = checkout.join("nested");
+    init_checkout(&checkout, "https://github.com/example/repository.git");
+    fs::create_dir(&nested).expect("nested checkout directory");
+    seed_brokers_at(
+        &state_dir,
+        &[(
+            "alpha",
+            "incarnation-alpha",
+            "alpha-private-capability-material",
+            nested.as_path(),
+            Some("enforce"),
+        )],
+    );
+    let context_file = tmp.path().join("context.json");
+    candidate(&context_file, "src/", "raw claim");
+    let state = state_dir.to_string_lossy();
+    let alpha_cap = capability(&state_dir, "alpha");
+    let raw = run(
+        &nested,
+        &[
+            "--state-dir",
+            &state,
+            "work-context",
+            "claim",
+            "--session",
+            "alpha",
+            "--file",
+            context_file.to_str().expect("context path"),
+            "--capability-file",
+            &alpha_cap,
+            "--idempotency-key",
+            "fingerprint-parity-raw",
+            "--format",
+            "json",
+        ],
+    );
+    assert_eq!(raw.code, 0, "stderr={}", raw.stderr_text());
+    let raw_fingerprint = data(&raw)["context"]["worktrees"][0].clone();
+    let alpha_env = [
+        ("AGENT_SESSION_ID", "alpha"),
+        ("AGENT_SESSION_CAPABILITY_FILE", alpha_cap.as_str()),
+        ("AGENT_SESSION_STATE_DIR", state.as_ref()),
+    ];
+    let declared = run_with_env(
+        &nested,
+        &[
+            "work-context",
+            "set",
+            "--summary",
+            "high-level declaration",
+            "--format",
+            "json",
+        ],
+        &alpha_env,
+    );
+    assert_eq!(declared.code, 0, "stderr={}", declared.stderr_text());
+    assert_eq!(data(&declared)["context"]["worktrees"][0], raw_fingerprint);
 }
 
 #[test]

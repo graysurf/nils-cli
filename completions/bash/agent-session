@@ -118,14 +118,23 @@ _agent-session() {
             agent__session__message,wait)
                 cmd="agent__session__message__wait"
                 ;;
+            agent__session__work__context,acknowledge)
+                cmd="agent__session__work__context__acknowledge"
+                ;;
             agent__session__work__context,admit)
                 cmd="agent__session__work__context__admit"
+                ;;
+            agent__session__work__context,advise)
+                cmd="agent__session__work__context__advise"
                 ;;
             agent__session__work__context,check)
                 cmd="agent__session__work__context__check"
                 ;;
             agent__session__work__context,claim)
                 cmd="agent__session__work__context__claim"
+                ;;
+            agent__session__work__context,clear)
+                cmd="agent__session__work__context__clear"
                 ;;
             agent__session__work__context,complete)
                 cmd="agent__session__work__context__complete"
@@ -139,8 +148,14 @@ _agent-session() {
             agent__session__work__context,renew)
                 cmd="agent__session__work__context__renew"
                 ;;
+            agent__session__work__context,set)
+                cmd="agent__session__work__context__set"
+                ;;
             agent__session__work__context,show)
                 cmd="agent__session__work__context__show"
+                ;;
+            agent__session__work__context,status)
+                cmd="agent__session__work__context__status"
                 ;;
             *)
                 ;;
@@ -1467,7 +1482,7 @@ _agent-session() {
             return 0
             ;;
         agent__session__run)
-            opts="-h --agent --cwd --title --id --prompt --prompt-file --prompt-stdin --tmux-bin --agent-bin --agent-arg --format --state-dir --host --help"
+            opts="-h --agent --cwd --title --id --prompt --prompt-file --prompt-stdin --tmux-bin --agent-bin --agent-arg --coordination-mode --format --state-dir --host --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -1543,6 +1558,10 @@ _agent-session() {
                     ;;
                 --agent-arg)
                     COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --coordination-mode)
+                    COMPREPLY=($(compgen -W "advisory enforce off" -- "${cur}"))
                     return 0
                     ;;
                 --format)
@@ -1672,7 +1691,7 @@ _agent-session() {
             return 0
             ;;
         agent__session__start)
-            opts="-h --agent --cwd --title --id --prompt --prompt-file --prompt-stdin --tmux-bin --agent-bin --agent-arg --paste-delay-ms --format --state-dir --host --help"
+            opts="-h --agent --cwd --title --id --prompt --prompt-file --prompt-stdin --tmux-bin --agent-bin --agent-arg --coordination-mode --paste-delay-ms --format --state-dir --host --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -1750,6 +1769,10 @@ _agent-session() {
                     COMPREPLY=($(compgen -f "${cur}"))
                     return 0
                     ;;
+                --coordination-mode)
+                    COMPREPLY=($(compgen -W "advisory enforce off" -- "${cur}"))
+                    return 0
+                    ;;
                 --paste-delay-ms)
                     COMPREPLY=($(compgen -f "${cur}"))
                     return 0
@@ -1777,12 +1800,45 @@ _agent-session() {
             return 0
             ;;
         agent__session__work__context)
-            opts="-h --state-dir --host --help claim show check renew release admit complete reconcile"
+            opts="-h --state-dir --host --help status set clear advise acknowledge claim show check renew release admit complete reconcile"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
             fi
             case "${prev}" in
+                --state-dir)
+                    COMPREPLY=()
+                    if [[ "${BASH_VERSINFO[0]}" -ge 4 ]]; then
+                        compopt -o plusdirs
+                    fi
+                    return 0
+                    ;;
+                --host)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        agent__session__work__context__acknowledge)
+            opts="-h --for --format --state-dir --host --help"
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                --for)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --format)
+                    COMPREPLY=($(compgen -W "text json" -- "${cur}"))
+                    return 0
+                    ;;
                 --state-dir)
                     COMPREPLY=()
                     if [[ "${BASH_VERSINFO[0]}" -ge 4 ]]; then
@@ -1871,6 +1927,50 @@ _agent-session() {
                     ;;
                 --idempotency-key)
                     COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --format)
+                    COMPREPLY=($(compgen -W "text json" -- "${cur}"))
+                    return 0
+                    ;;
+                --state-dir)
+                    COMPREPLY=()
+                    if [[ "${BASH_VERSINFO[0]}" -ge 4 ]]; then
+                        compopt -o plusdirs
+                    fi
+                    return 0
+                    ;;
+                --host)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        agent__session__work__context__advise)
+            opts="-h --targets-file --format --state-dir --host --help"
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                --targets-file)
+                    local oldifs
+                    if [ -n "${IFS+x}" ]; then
+                        oldifs="$IFS"
+                    fi
+                    IFS=$'\n'
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    if [ -n "${oldifs+x}" ]; then
+                        IFS="$oldifs"
+                    fi
+                    if [[ "${BASH_VERSINFO[0]}" -ge 4 ]]; then
+                        compopt -o filenames
+                    fi
                     return 0
                     ;;
                 --format)
@@ -2007,6 +2107,35 @@ _agent-session() {
                     COMPREPLY=($(compgen -f "${cur}"))
                     return 0
                     ;;
+                --format)
+                    COMPREPLY=($(compgen -W "text json" -- "${cur}"))
+                    return 0
+                    ;;
+                --state-dir)
+                    COMPREPLY=()
+                    if [[ "${BASH_VERSINFO[0]}" -ge 4 ]]; then
+                        compopt -o plusdirs
+                    fi
+                    return 0
+                    ;;
+                --host)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        agent__session__work__context__clear)
+            opts="-h --format --state-dir --host --help"
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
                 --format)
                     COMPREPLY=($(compgen -W "text json" -- "${cur}"))
                     return 0
@@ -2303,6 +2432,67 @@ _agent-session() {
             COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
             return 0
             ;;
+        agent__session__work__context__set)
+            opts="-h --summary --intent --tier --repository --path --issue --pr --plan-ref --format --state-dir --host --help"
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                --summary)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --intent)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --tier)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --repository)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --path)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --issue)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --pr)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --plan-ref)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --format)
+                    COMPREPLY=($(compgen -W "text json" -- "${cur}"))
+                    return 0
+                    ;;
+                --state-dir)
+                    COMPREPLY=()
+                    if [[ "${BASH_VERSINFO[0]}" -ge 4 ]]; then
+                        compopt -o plusdirs
+                    fi
+                    return 0
+                    ;;
+                --host)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
         agent__session__work__context__show)
             opts="-h --session --capability-file --format --state-dir --host --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
@@ -2329,6 +2519,35 @@ _agent-session() {
                     fi
                     return 0
                     ;;
+                --format)
+                    COMPREPLY=($(compgen -W "text json" -- "${cur}"))
+                    return 0
+                    ;;
+                --state-dir)
+                    COMPREPLY=()
+                    if [[ "${BASH_VERSINFO[0]}" -ge 4 ]]; then
+                        compopt -o plusdirs
+                    fi
+                    return 0
+                    ;;
+                --host)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        agent__session__work__context__status)
+            opts="-h --format --state-dir --host --help"
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
                 --format)
                     COMPREPLY=($(compgen -W "text json" -- "${cur}"))
                     return 0

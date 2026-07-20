@@ -1,3 +1,4 @@
+pub(crate) mod advisory;
 pub(crate) mod broker;
 pub(crate) mod claims;
 pub(crate) mod context;
@@ -52,6 +53,8 @@ pub(crate) struct Registry {
     cursors: BTreeMap<String, mailbox::InboxCursor>,
     receipts: BTreeMap<String, IdempotencyReceipt>,
     notifications: BTreeMap<String, notification::NotificationReceipt>,
+    advisory_acknowledgements: BTreeMap<String, advisory::AdvisoryAcknowledgement>,
+    advisory_observations: BTreeMap<String, advisory::AdvisoryObservation>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -113,6 +116,31 @@ impl LockedRegistry {
 
 pub(crate) fn run_work_context(context: &CliContext, args: cli::WorkContextArgs) -> i32 {
     let (command, format, result) = match args.command {
+        WorkContextCommand::Status(args) => (
+            "work-context-status",
+            args.format,
+            advisory::status(context, args),
+        ),
+        WorkContextCommand::Set(args) => (
+            "work-context-set",
+            args.format,
+            advisory::set(context, args),
+        ),
+        WorkContextCommand::Clear(args) => (
+            "work-context-clear",
+            args.format,
+            advisory::clear(context, args),
+        ),
+        WorkContextCommand::Advise(args) => (
+            "work-context-advise",
+            args.format,
+            advisory::advise(context, args),
+        ),
+        WorkContextCommand::Acknowledge(args) => (
+            "work-context-acknowledge",
+            args.format,
+            advisory::acknowledge(context, args),
+        ),
         WorkContextCommand::Claim(args) => (
             "work-context-claim",
             args.format,
@@ -789,6 +817,8 @@ pub(crate) fn clean_expired(registry: &mut Registry, now: i64) -> bool {
     let receipt_count = registry.receipts.len();
     let cursor_count = registry.cursors.len();
     let completion_event_count = registry.completion_events.len();
+    let acknowledgement_count = registry.advisory_acknowledgements.len();
+    let observation_count = registry.advisory_observations.len();
     registry
         .messages
         .retain(|message| !removed_messages.contains(&message.message_id));
@@ -811,6 +841,12 @@ pub(crate) fn clean_expired(registry: &mut Registry, now: i64) -> bool {
     registry
         .cursors
         .retain(|_, cursor| cursor.expires_at_epoch > now);
+    registry
+        .advisory_acknowledgements
+        .retain(|_, acknowledgement| acknowledgement.expires_at_epoch > now);
+    registry.advisory_observations.retain(|_, observation| {
+        observation.observed_at_epoch > now.saturating_sub(RECEIPT_TTL_SECS)
+    });
     let operations = &registry.operations;
     registry.completion_events.retain(|event| {
         event.created_at_epoch > now.saturating_sub(RECEIPT_TTL_SECS)
@@ -829,6 +865,8 @@ pub(crate) fn clean_expired(registry: &mut Registry, now: i64) -> bool {
         || registry.claims.len() != claim_count
         || registry.receipts.len() != receipt_count
         || registry.cursors.len() != cursor_count
+        || registry.advisory_acknowledgements.len() != acknowledgement_count
+        || registry.advisory_observations.len() != observation_count
         || registry.completion_events.len() != completion_event_count
 }
 

@@ -1,7 +1,9 @@
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -12,6 +14,7 @@ pub const WORK_CONTEXT_INPUT_VERSION: &str = "agent-session.work-context-input.v
 pub const WORK_CONTEXT_VERSION: &str = "agent-session.work-context.v1";
 pub const CONFLICT_EVALUATION_VERSION: &str = "agent-session.conflict-evaluation.v1";
 pub const WORKTREE_FINGERPRINT_EPOCH: u64 = 1;
+const GIT_REMOTE_TIMEOUT: Duration = Duration::from_millis(750);
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(rename_all = "kebab-case")]
@@ -45,7 +48,7 @@ pub struct CheckoutBinding {
     pub path: String,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct WorkContextInput {
     pub schema_version: String,
@@ -507,7 +510,7 @@ pub fn validate_physical_targets(
     Ok(())
 }
 
-fn checkout_root(path: &Path) -> Result<PathBuf, CliError> {
+pub(crate) fn checkout_root(path: &Path) -> Result<PathBuf, CliError> {
     let metadata = fs::symlink_metadata(path).map_err(|_| physical_target_unavailable())?;
     if metadata.file_type().is_symlink() {
         return Err(physical_target_unavailable());
@@ -539,11 +542,29 @@ fn validate_target_path(root: &Path, relative: &str) -> Result<(), CliError> {
     Ok(())
 }
 
-fn repository_for_checkout(root: &Path) -> Option<String> {
-    let output = Command::new("git")
+pub(crate) fn repository_for_checkout(root: &Path) -> Option<String> {
+    let mut child = Command::new("git")
         .args(["-C", root.to_str()?, "remote", "get-url", "origin"])
-        .output()
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
         .ok()?;
+    let deadline = Instant::now() + GIT_REMOTE_TIMEOUT;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) if Instant::now() < deadline => {
+                thread::sleep(Duration::from_millis(10));
+            }
+            Ok(None) | Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    }
+    let output = child.wait_with_output().ok()?;
     if !output.status.success() {
         return None;
     }

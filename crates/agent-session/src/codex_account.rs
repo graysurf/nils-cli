@@ -907,6 +907,7 @@ mod tests {
             id: "binding-fixture".to_string(),
             agent: "codex".to_string(),
             mode: "interactive".to_string(),
+            coordination_mode: crate::cli::CoordinationMode::Advisory,
             title: None,
             title_state: None,
             title_revision: 0,

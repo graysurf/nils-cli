@@ -1402,6 +1402,7 @@ mod tests {
             id: "session".to_string(),
             agent: agent.to_string(),
             mode: "interactive".to_string(),
+            coordination_mode: crate::cli::CoordinationMode::Advisory,
             title: None,
             title_state: None,
             title_revision: 0,

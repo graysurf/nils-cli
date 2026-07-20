@@ -9,11 +9,12 @@
   use coordination retain the current start, run, resume, list, glance, send,
   delete, activity, and serve contracts.
 
-This specification defines privacy-preserving coordination for managed agent
-sessions. Work context is explicit metadata. It is never inferred as
-authoritative from a title, working directory, prompt, transcript, log, glance,
-or assistant response. A mailbox is available only when metadata cannot resolve
-a material uncertainty. Formal delegated implementation still uses the
+This specification defines privacy-preserving collision awareness for managed
+agent sessions. Broker/session lifecycle automatically supplies presence and
+checkout identity. Optional declared work context refines that presence; it is
+never inferred from a prompt, transcript, log, glance, terminal bytes, or
+assistant response. A mailbox is available only when metadata cannot resolve a
+material uncertainty. Formal delegated implementation still uses the
 provider-backed dispatch workflow.
 
 ## Threat and trust model
@@ -48,6 +49,38 @@ Writes use atomic replace and fsync ordering suitable for crash recovery.
 
 The private store may contain bodies and capability digests. Public projections
 are separately constructed and never serialize those fields.
+
+## Coordination modes and automatic presence
+
+Every managed session has one additive `coordination_mode`:
+
+| Mode | Behavior |
+| --- | --- |
+| `advisory` | Default. Automatic presence and optional context produce privacy-safe warnings; overlap or coordination failure never denies work. |
+| `enforce` | Opt-in. Raw claim coverage, atomic operation admission, and exclusive checkout writer semantics may deny mutation. |
+| `off` | No agent-session collision warning or admission. Other safety, consent, delivery, intent, secret, and validation hooks are unaffected. |
+
+Older `agent-session.session.v1` records without the additive field deserialize
+as `advisory`. Managed tmux runtimes receive
+`AGENT_SESSION_COORDINATION_MODE` alongside their session ID, state directory,
+runtime ID, and capability path.
+
+A ready, heartbeat-fresh broker plus its matching session record is an active
+presence record. Presence begins during held launch, follows the exact runtime
+incarnation, survives launcher exit, rotates on resume, and becomes inactive on
+broker stop, target exit, or delete. No claim is required. A peer in `off` mode
+does not participate. A process launched outside `agent-session` has no managed
+identity and is outside this coordination universe.
+
+Presence derives only:
+
+- a private-keyed fingerprint of the canonical checkout root;
+- the canonical `owner/repository` origin when available;
+- the public managed session selector and mode; and
+- optional explicitly declared provider, plan, and path context.
+
+Raw checkout paths, capabilities, host/user identity, prompts, transcripts,
+logs, terminal bytes, and mailbox bodies are never projected.
 
 ## Versioned schemas
 
@@ -124,6 +157,21 @@ Precedence is:
 enumerated and every peer was comparable. `no_known_conflict` is the explicit
 permissive projection for an incomplete comparison; it is never promoted to
 `clear`.
+
+The high-level `work-context advise` result uses
+`agent-session.work-context-advisory.v1`. It reports managed state, mode,
+availability, severity (`none`, `info`, `warning`, or `degraded`), bounded
+suppression state, stably sorted reasons, and privacy-safe peers. Same physical
+worktree, provider ref, plan ref, or overlapping declared scope is `warning`;
+same repository in a different worktree is `info`; incomplete broker/peer
+evaluation with no stronger known overlap is `degraded`. These are descriptive
+severities, never admission results in advisory mode.
+
+`work-context status` uses `agent-session.work-context-status.v1` and returns
+managed state, current mode, automatic presence, the caller's optional public
+declared context, and acknowledgement expiry. `work-context set` and `clear`
+use additive high-level result schemas while retaining the public
+`agent-session.work-context.v1` context projection.
 
 ### Operation lease
 
@@ -224,7 +272,9 @@ incarnations are retained for bounded audit but are not active conflicts.
 Corrupt, oversize, future-schema, or partially upgraded peer records make the
 view incomplete; they do not disappear from classification.
 
-Standalone `check` is advisory. Only `claim` combines evaluation and acquisition
+Standalone `check` and `advise` are advisory. Automatic presence includes every
+ready managed peer even when no claim exists. Only raw `claim` combines
+claim-to-claim evaluation and acquisition
 under the same registry lock. Two concurrent definite contenders cannot both
 receive an admitted claim.
 
@@ -232,6 +282,8 @@ receive an admitted claim.
 
 | Operation | Required authority |
 | --- | --- |
+| status/advise | current managed session capability when managed; an invocation without managed identity returns an explicit non-participating result |
+| high-level set/clear/acknowledge | current managed session capability and incarnation, inferred from the environment |
 | work-context show/session check/candidate check | public registry read; HTTP additionally requires the server operator token |
 | self check/claim/renew/release | matching session capability and incarnation |
 | operation admit/complete/reconcile | matching session capability, active claim, and execution token/proof |
@@ -263,6 +315,22 @@ States are `active`, `stale`, `released`, and `expired`.
   operation remains `active`, `completing`, or `reconcile_pending`.
 - Broker loss marks the owner unavailable for new operations and eventually
   stales the claim. Pane liveness alone cannot renew a claim.
+
+High-level `set` owns the ordinary mechanics: it infers the current session and
+checkout, canonicalizes optional issue/PR/path/plan fields, reuses an unchanged
+active context idempotently, and replaces a changed context without requiring a
+caller-supplied file, revision, claim ID, or idempotency key. In advisory/off
+mode a definite overlap is returned but does not reject the declaration. In
+enforce mode it retains raw claim conflict rejection. High-level `clear` is
+idempotent and still refuses to orphan a nonterminal enforce operation.
+
+Acknowledgement is keyed to the exact session incarnation and the most recent
+canonical advisory observation, and expires after a caller-selected duration
+of at most eight hours. It suppresses repeated hook rendering only when peer
+incarnations, reasons, repositories, and availability are unchanged. Target
+churn covered by the same known overlap remains suppressed to avoid per-file
+warning spam; a target that changes the reason or repository warns again.
+`advise` continues to return the actual reasons and severity.
 
 ## Operation lease state machine
 
@@ -391,15 +459,23 @@ coordination after launch.
 ## CLI contract
 
 All commands support the global `--state-dir` and command-local `--format
-text|json`. Owner commands accept `--session`; managed self calls may default it
-from trusted runtime projection. `--capability-file` defaults only from the
-trusted managed environment.
+text|json`. `start` and `run` accept `--coordination-mode
+advisory|enforce|off`, defaulting to `advisory`. High-level commands infer the
+current session and capability only from trusted managed runtime projection.
+Raw owner commands retain explicit `--session`; `--capability-file` defaults
+only from the trusted managed environment.
 
 Every leaf command has its own CLI envelope identity, for example
 `cli.agent-session.message-inbox.v1`, `cli.agent-session.broker-status.v1`, and
 `cli.agent-session.work-context-admit.v1`.
 
 ```text
+agent-session work-context status
+agent-session work-context set [--summary TEXT] [--intent NAME] [--tier L0|L1|L2|L3] [--repository OWNER/REPO] [--path PATH]... [--issue N]... [--pr N]... [--plan-ref REF]...
+agent-session work-context clear
+agent-session work-context advise [--targets-file JSON]
+agent-session work-context acknowledge [--for DURATION]
+
 agent-session work-context claim --session ID --file JSON --capability-file FILE --idempotency-key KEY [--if-revision N]
 agent-session work-context show --session ID
 agent-session work-context check (--self --capability-file FILE | --session ID | --candidate JSON) [--allow-incomplete]
@@ -467,6 +543,7 @@ only by the registry-level check route.
 
 List and glance may add only:
 
+- `coordination_mode`;
 - `work_context_state`;
 - `claim_id`;
 - `claim_expires_at`;
@@ -495,6 +572,8 @@ The v1 surface distinguishes at least:
 - `mailbox-body-invalid`, `mailbox-body-too-large`, `reply-depth-exceeded`,
   `message-expired`, `message-not-found`;
 - `coordination-store-untrusted`, `coordination-store-corrupt`.
+- `session-not-managed`, `repository-unavailable`,
+  `invalid-acknowledgement-duration`.
 
 Usage errors exit 64, data/contract errors use the workspace data exit code,
 and runtime/storage failures use the runtime exit code.
@@ -503,6 +582,13 @@ and runtime/storage failures use the runtime exit code.
 
 Release readiness requires:
 
+- additive old-record coverage proving missing `coordination_mode` defaults to
+  advisory;
+- automatic presence coverage for same worktree, same repository/different
+  worktree, optional context, off peers, stale brokers, and target exit;
+- self-targeting status/set/clear/acknowledge coverage proving no manual session
+  ID, capability path, context file, revision, or idempotency key is needed;
+- advisory/enforce/off and unmanaged cross-product acceptance;
 - table/property coverage for canonicalization, closed scopes, peer selection,
   conflict precedence, and keyed fingerprint epochs;
 - concurrent process coverage proving exactly one definite claimant;

@@ -12,7 +12,7 @@ use crate::{CliContext, CliError};
 use super::context::{
     CheckoutBinding, ConflictClassification, ProviderRef, Scope, WORK_CONTEXT_VERSION,
     WorkContextInput, WorkContextRecord, canonicalize_provider_refs, canonicalize_targets,
-    evaluate, fingerprint_epoch, scope_covers, validate_physical_targets,
+    checkout_root, evaluate, fingerprint_epoch, scope_covers, validate_physical_targets,
 };
 use super::{
     Registry, authenticate_any_from_file, authenticate_from_file, clean_expired, digest_bytes,
@@ -112,8 +112,9 @@ pub(crate) fn claim(context: &CliContext, args: WorkContextClaimArgs) -> Result<
     let now = now_epoch();
     let mut locked = lock_registry(context)?;
     ensure_fingerprint_key(&mut locked.registry);
-    let checkout_fingerprint =
-        worktree_fingerprint(&locked.registry, std::path::Path::new(&record.cwd))?;
+    let record_cwd = std::path::Path::new(&record.cwd);
+    let checkout = checkout_root(record_cwd).unwrap_or_else(|_| record_cwd.to_path_buf());
+    let checkout_fingerprint = worktree_fingerprint(&locked.registry, &checkout)?;
     if !candidate.worktrees.contains(&checkout_fingerprint) {
         if candidate.worktrees.len() >= 8 {
             return Err(CliError::data(
@@ -226,6 +227,145 @@ pub(crate) fn claim(context: &CliContext, args: WorkContextClaimArgs) -> Result<
     )?;
     locked.save()?;
     Ok(outcome)
+}
+
+pub(crate) fn set_declared(
+    context: &CliContext,
+    record: &crate::SessionRecord,
+    incarnation: &str,
+    candidate: WorkContextInput,
+    reject_conflict: bool,
+) -> Result<Value, CliError> {
+    let mut candidate = candidate.validate_and_canonicalize()?;
+    let now = now_epoch();
+    let mut locked = lock_registry(context)?;
+    ensure_fingerprint_key(&mut locked.registry);
+    let checkout = checkout_root(std::path::Path::new(&record.cwd))?;
+    let checkout_fingerprint = worktree_fingerprint(&locked.registry, &checkout)?;
+    if !candidate.worktrees.contains(&checkout_fingerprint) {
+        if candidate.worktrees.len() >= 8 {
+            return Err(CliError::data(
+                "invalid-work-context",
+                "work context exceeds the worktree fingerprint limit",
+                None,
+            ));
+        }
+        candidate.worktrees.push(checkout_fingerprint);
+        candidate.worktrees.sort();
+    }
+    clean_expired(&mut locked.registry, now);
+    ensure_current_broker(context, &locked.registry, &record.id, incarnation)?;
+    let existing_index = locked.registry.claims.iter().position(|claim| {
+        claim.session_id == record.id
+            && claim.session_incarnation == incarnation
+            && claim.state == "active"
+    });
+    let complete =
+        complete_relevant_universe(context, &locked.registry, Some((&record.id, incarnation)));
+    let evaluation = evaluate(
+        Some((&record.id, incarnation)),
+        &candidate,
+        &locked.registry.claims,
+        complete,
+        !reject_conflict,
+    );
+    if reject_conflict && evaluation.classification == ConflictClassification::Conflict {
+        return Err(CliError::data(
+            "claim-conflict",
+            "work context conflicts with an active claim",
+            Some(json!({ "evaluation": evaluation })),
+        ));
+    }
+    if let Some(index) = existing_index {
+        let existing = &locked.registry.claims[index];
+        if input_from_record(existing) == candidate {
+            return Ok(json!({
+                "schema_version": "agent-session.work-context-set-result.v1",
+                "changed": false,
+                "context": public_context(existing)?,
+                "evaluation": evaluation,
+            }));
+        }
+        if has_nonterminal_operation(&locked.registry, &existing.claim_id) {
+            return Err(operation_in_progress());
+        }
+        let existing = &mut locked.registry.claims[index];
+        existing.state = "released".to_string();
+        existing.revision = existing.revision.saturating_add(1);
+        existing.updated_at = timestamp(now);
+        existing.terminal_at_epoch = Some(now);
+    }
+    let claim = WorkContextRecord {
+        schema_version: WORK_CONTEXT_VERSION.to_string(),
+        session_id: record.id.clone(),
+        session_incarnation: incarnation.to_string(),
+        claim_id: uuid::Uuid::new_v4().to_string(),
+        revision: 1,
+        state: "active".to_string(),
+        intent: candidate.intent,
+        tier: candidate.tier,
+        repositories: candidate.repositories,
+        worktrees: candidate.worktrees,
+        provider_refs: candidate.provider_refs,
+        plan_refs: candidate.plan_refs,
+        scopes: candidate.scopes,
+        summary: candidate.summary,
+        updated_at: timestamp(now),
+        expires_at: timestamp(now.saturating_add(CLAIM_TTL_SECS)),
+        expires_at_epoch: now.saturating_add(CLAIM_TTL_SECS),
+        terminal_at_epoch: None,
+    };
+    if serde_json::to_vec(&claim).map_or(true, |bytes| bytes.len() > 16 * 1024) {
+        return Err(CliError::data(
+            "invalid-work-context",
+            "public work context exceeds 16 KiB",
+            None,
+        ));
+    }
+    locked.registry.claims.push(claim.clone());
+    locked.save()?;
+    Ok(json!({
+        "schema_version": "agent-session.work-context-set-result.v1",
+        "changed": true,
+        "context": public_context(&claim)?,
+        "evaluation": evaluation,
+    }))
+}
+
+pub(crate) fn clear_declared(
+    context: &CliContext,
+    record: &crate::SessionRecord,
+    incarnation: &str,
+) -> Result<Value, CliError> {
+    let now = now_epoch();
+    let mut locked = lock_registry(context)?;
+    clean_expired(&mut locked.registry, now);
+    ensure_current_broker(context, &locked.registry, &record.id, incarnation)?;
+    let Some(index) = locked.registry.claims.iter().position(|claim| {
+        claim.session_id == record.id
+            && claim.session_incarnation == incarnation
+            && claim.state == "active"
+    }) else {
+        return Ok(json!({
+            "schema_version": "agent-session.work-context-clear-result.v1",
+            "released": false,
+        }));
+    };
+    let claim_id = locked.registry.claims[index].claim_id.clone();
+    if has_nonterminal_operation(&locked.registry, &claim_id) {
+        return Err(operation_in_progress());
+    }
+    let claim = &mut locked.registry.claims[index];
+    claim.state = "released".to_string();
+    claim.revision = claim.revision.saturating_add(1);
+    claim.updated_at = timestamp(now);
+    claim.terminal_at_epoch = Some(now);
+    locked.save()?;
+    Ok(json!({
+        "schema_version": "agent-session.work-context-clear-result.v1",
+        "released": true,
+        "claim_id": claim_id,
+    }))
 }
 
 pub(crate) fn show(context: &CliContext, args: WorkContextShowArgs) -> Result<Value, CliError> {
@@ -930,7 +1070,7 @@ pub(crate) fn reconcile(
     Ok(outcome)
 }
 
-fn ensure_current_broker(
+pub(crate) fn ensure_current_broker(
     context: &CliContext,
     registry: &Registry,
     session_id: &str,
@@ -967,7 +1107,7 @@ fn ensure_current_broker(
     Ok(())
 }
 
-fn active_claim<'a>(
+pub(crate) fn active_claim<'a>(
     registry: &'a Registry,
     session_id: &str,
     incarnation: &str,
@@ -994,7 +1134,7 @@ fn active_claim_for_session<'a>(
     active_claim(registry, session_id, &broker.incarnation)
 }
 
-fn input_from_record(claim: &WorkContextRecord) -> WorkContextInput {
+pub(crate) fn input_from_record(claim: &WorkContextRecord) -> WorkContextInput {
     WorkContextInput {
         schema_version: super::context::WORK_CONTEXT_INPUT_VERSION.to_string(),
         intent: claim.intent.clone(),
@@ -1042,7 +1182,7 @@ pub(crate) fn conflict_severity_for_session(
     )
 }
 
-fn public_context(claim: &WorkContextRecord) -> Result<Value, CliError> {
+pub(crate) fn public_context(claim: &WorkContextRecord) -> Result<Value, CliError> {
     let mut value = json_value(claim)?;
     let object = value
         .as_object_mut()
