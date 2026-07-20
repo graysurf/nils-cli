@@ -842,18 +842,81 @@ fn runtime_hook_root(product: Product) -> Result<PathBuf, HookError> {
     })
 }
 
+pub(crate) fn validate_policy_handlers(
+    loaded: &LoadedPolicy,
+    product: Product,
+) -> Result<(), HookError> {
+    let mut handlers = BTreeSet::new();
+    for rule in &loaded.bundle.rules {
+        if !rule.products.contains(&product) {
+            continue;
+        }
+        match &rule.capability {
+            Capability::RuntimeKitHandler { handler_id } => {
+                if let Some(filename) = runtime_handler_filename(handler_id) {
+                    handlers.insert((handler_id.clone(), filename));
+                }
+            }
+            Capability::SessionCoordination { .. } => {
+                handlers.insert((
+                    "session-coordination".to_string(),
+                    SESSION_COORDINATION_HANDLER,
+                ));
+            }
+            _ => {}
+        }
+    }
+
+    let root = runtime_hook_root(product)?;
+    let failures = handlers
+        .into_iter()
+        .filter_map(|(handler_id, filename)| {
+            validate_handler(&root.join(filename))
+                .err()
+                .map(|error| (handler_id, error.code))
+        })
+        .collect::<Vec<_>>();
+    if failures.is_empty() {
+        return Ok(());
+    }
+    let summary = failures
+        .iter()
+        .map(|(handler_id, code)| format!("{handler_id} ({code})"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    if failures.iter().any(|(_, code)| code == "handler-untrusted") {
+        Err(HookError::data(
+            "handler-untrusted",
+            format!(
+                "runtime-kit handlers are untrusted for {}: {summary}",
+                product.as_str()
+            ),
+        ))
+    } else {
+        Err(HookError::runtime(
+            "handler-unavailable",
+            format!(
+                "runtime-kit handlers are unavailable for {}: {summary}",
+                product.as_str()
+            ),
+        ))
+    }
+}
+
 fn validate_handler(path: &Path) -> Result<(), HookError> {
     let metadata = fs::symlink_metadata(path).map_err(|_| {
         HookError::runtime("handler-unavailable", "runtime-kit handler is unavailable")
     })?;
+    let mode = metadata.permissions().mode();
     if metadata.file_type().is_symlink()
         || !metadata.is_file()
         || metadata.uid() != unsafe { libc::geteuid() }
-        || metadata.permissions().mode() & 0o022 != 0
+        || mode & 0o100 == 0
+        || mode & 0o022 != 0
     {
         return Err(HookError::data(
             "handler-untrusted",
-            "runtime-kit handler type, owner, or mode is untrusted",
+            "runtime-kit handler type, executable bit, owner, or mode is untrusted",
         ));
     }
     Ok(())

@@ -256,16 +256,20 @@ pub fn doctor(loaded: &LoadedPolicy, product: Product) -> Result<DoctorResult, H
         });
     }
     let plan = build_plan(loaded, product, SetupAction::DryRun)?;
+    let status = classify_status(
+        plan.owned_before,
+        plan.groups.len(),
+        plan.legacy_before,
+        plan.unrelated_before,
+        plan.drifted || (plan.owned_before > 0 && !plan.auxiliary_configured_before),
+    );
+    if status == ProviderStatus::Converged {
+        crate::evaluator::validate_policy_handlers(loaded, product)?;
+    }
     Ok(DoctorResult {
         schema_version: "agent-hook.doctor.v1".to_string(),
         product: product.as_str().to_string(),
-        status: classify_status(
-            plan.owned_before,
-            plan.groups.len(),
-            plan.legacy_before,
-            plan.unrelated_before,
-            plan.drifted || (plan.owned_before > 0 && !plan.auxiliary_configured_before),
-        ),
+        status,
         supported: true,
         owned_count: plan.owned_before,
         expected_owned_count: plan.groups.len(),

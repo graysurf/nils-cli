@@ -54,6 +54,12 @@ and each provider file's exact before/after content or absence. Hermes policy
 can be validated and inspected, but native setup truthfully reports
 `unsupported` until Hermes exposes a compatible runner.
 
+Before `doctor` reports an enforceable provider as `converged`, it resolves
+every script-backed handler selected by that product's policy and applies the
+same regular-file, executable, effective-user-owner, and non-group/world-writable
+trust check used immediately before dispatch. Missing or unsafe handlers return
+typed `handler-unavailable` or `handler-untrusted` errors.
+
 Codex `config.toml`, compatibility `hooks.json`, the managed dispatcher, and
 the authoritative `agent-session activity notify --agent codex` argv are one
 reviewed transaction. A singular safe user notifier is composed without a

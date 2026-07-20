@@ -1685,6 +1685,7 @@ timeout = 5
         None,
     );
     assert_eq!(applied.code, 0, "stderr={}", applied.stderr_text());
+    write_runtime_handler(&codex.join("hooks"), 0o755);
     let converged = fixture.run(&["doctor", "--product", "codex", "--format", "json"], None);
     assert_eq!(converged.stdout_json()["data"][0]["status"], "converged");
 
@@ -1710,6 +1711,139 @@ timeout = 5
         "unsupported"
     );
     assert_eq!(unsupported.stdout_json()["data"][0]["supported"], false);
+}
+
+fn write_runtime_handler(hooks: &Path, mode: u32) {
+    fs::create_dir_all(hooks).expect("hooks dir");
+    let handler = hooks.join("session-start-healthcheck.sh");
+    fs::write(&handler, b"#!/bin/sh\nprintf '{}\\n'\n").expect("handler");
+    fs::set_permissions(&handler, fs::Permissions::from_mode(mode)).expect("handler mode");
+}
+
+fn install_shared_runtime_handler(fixture: &Fixture, mode: Option<u32>) -> PathBuf {
+    let shared_hooks = fixture.root.join("shared-hooks");
+    fs::create_dir_all(&shared_hooks).expect("shared hooks dir");
+    if let Some(mode) = mode {
+        write_runtime_handler(&shared_hooks, mode);
+    }
+    for product in ["codex", "claude"] {
+        let provider_home = fixture.home.join(format!(".{product}"));
+        fs::create_dir_all(&provider_home).expect("provider home");
+        symlink(&shared_hooks, provider_home.join("hooks")).expect("shared hooks link");
+    }
+    shared_hooks
+}
+
+fn install_provider_ingress(fixture: &Fixture, product: &str) {
+    let installed = fixture.run(
+        &["setup", "--product", product, "--apply", "--format", "json"],
+        None,
+    );
+    assert_eq!(
+        installed.code,
+        0,
+        "product={product} stdout={} stderr={}",
+        installed.stdout_text(),
+        installed.stderr_text()
+    );
+}
+
+#[test]
+fn doctor_rejects_group_writable_linked_shared_handlers_for_codex_and_claude() {
+    let fixture = Fixture::new(POLICY);
+    install_shared_runtime_handler(&fixture, Some(0o775));
+    for product in ["codex", "claude"] {
+        install_provider_ingress(&fixture, product);
+        let doctor = fixture.run(&["doctor", "--product", product, "--format", "json"], None);
+        assert_eq!(doctor.code, 65, "product={product}");
+        assert_eq!(
+            doctor.stdout_json()["error"]["code"],
+            "handler-untrusted",
+            "product={product}"
+        );
+    }
+}
+
+#[test]
+fn doctor_rejects_non_executable_linked_shared_handlers_for_codex_and_claude() {
+    let fixture = Fixture::new(POLICY);
+    install_shared_runtime_handler(&fixture, Some(0o644));
+    for product in ["codex", "claude"] {
+        install_provider_ingress(&fixture, product);
+        let doctor = fixture.run(&["doctor", "--product", product, "--format", "json"], None);
+        assert_eq!(doctor.code, 65, "product={product}");
+        assert_eq!(
+            doctor.stdout_json()["error"]["code"],
+            "handler-untrusted",
+            "product={product}"
+        );
+    }
+}
+
+#[test]
+fn doctor_rejects_unavailable_linked_shared_handlers_for_codex_and_claude() {
+    let fixture = Fixture::new(POLICY);
+    install_shared_runtime_handler(&fixture, None);
+    for product in ["codex", "claude"] {
+        install_provider_ingress(&fixture, product);
+        let doctor = fixture.run(&["doctor", "--product", product, "--format", "json"], None);
+        assert_eq!(doctor.code, 1, "product={product}");
+        assert_eq!(
+            doctor.stdout_json()["error"]["code"],
+            "handler-unavailable",
+            "product={product}"
+        );
+    }
+}
+
+#[test]
+fn doctor_accepts_trusted_linked_shared_handlers_for_codex_and_claude() {
+    let fixture = Fixture::new(POLICY);
+    install_shared_runtime_handler(&fixture, Some(0o755));
+    for product in ["codex", "claude"] {
+        install_provider_ingress(&fixture, product);
+        let doctor = fixture.run(&["doctor", "--product", product, "--format", "json"], None);
+        assert_eq!(
+            doctor.code,
+            0,
+            "product={product} stdout={} stderr={}",
+            doctor.stdout_text(),
+            doctor.stderr_text()
+        );
+        assert_eq!(
+            doctor.stdout_json()["data"][0]["status"],
+            "converged",
+            "product={product}"
+        );
+    }
+}
+
+#[test]
+fn dispatch_rechecks_handler_trust_after_activation_health_passes() {
+    let fixture = Fixture::new(POLICY);
+    let shared_hooks = install_shared_runtime_handler(&fixture, Some(0o755));
+    for product in ["codex", "claude"] {
+        install_provider_ingress(&fixture, product);
+        let doctor = fixture.run(&["doctor", "--product", product, "--format", "json"], None);
+        assert_eq!(doctor.code, 0, "product={product}");
+    }
+
+    let handler = shared_hooks.join("session-start-healthcheck.sh");
+    fs::set_permissions(&handler, fs::Permissions::from_mode(0o775))
+        .expect("drift handler mode after activation health check");
+    for product in ["codex", "claude"] {
+        let dispatch = fixture.run(
+            &["dispatch", "--product", product, "--format", "json"],
+            Some(r#"{"hook_event_name":"SessionStart","source":"startup"}"#),
+        );
+        assert_eq!(dispatch.code, 1, "product={product}");
+        assert_eq!(dispatch.stdout_json()["data"]["action"], "block");
+        assert_eq!(
+            dispatch.stdout_json()["data"]["reasons"][0]["code"],
+            "runtime.session-start:capability-failure-closed",
+            "product={product}"
+        );
+    }
 }
 
 #[test]
@@ -2126,6 +2260,7 @@ fn codex_json_only_install_migrates_atomically_to_one_managed_representation() {
         "notify = [\"agent-session\", \"activity\", \"notify\", \"--agent\", \"codex\"]"
     ));
 
+    write_runtime_handler(&codex.join("hooks"), 0o755);
     let doctor = fixture.run(&["doctor", "--product", "codex", "--format", "json"], None);
     assert_eq!(doctor.code, 0);
     assert_eq!(doctor.stdout_json()["data"][0]["status"], "converged");
