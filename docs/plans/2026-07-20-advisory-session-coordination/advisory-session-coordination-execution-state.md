@@ -3,7 +3,7 @@
 <!-- plan-issue-record:v2 role=state profile=tracking -->
 ## Execution State
 
-- Status: active; implementation complete, release-quality validation and PR delivery in progress
+- Status: active; implementation and release-quality validation complete, PR delivery in progress
 - Target scope: advisory-by-default nils-cli session coordination, automatic
   presence and work-context UX, agent-runtime-kit hook routing, two reviewed
   merged PRs, then approved release/runtime sync and fresh-session acceptance.
@@ -13,8 +13,10 @@
 - Current task: Task 3.1, deliver and merge nils-cli
 - Next task: Task 3.2, deliver and merge agent-runtime-kit
 - Last updated: 2026-07-20
-- Branch/commit/PR: nils-cli and runtime-kit
-  `fix/advisory-session-coordination`; commits and PRs pending final validation
+- Branch/commit/PR: nils-cli `fix/advisory-session-coordination` code commit
+  `6b3ec99828dde7784f3a80e2c3da9014d87c8d58`; runtime-kit
+  `fix/advisory-session-coordination` commit
+  `1d1a1bcbe94821e840100a39acabae80f3fbc658`; PRs pending
 - Source document: `docs/plans/2026-07-20-advisory-session-coordination/advisory-session-coordination-plan.md`
 - Implementation source: `docs/plans/2026-07-20-advisory-session-coordination/advisory-session-coordination-discussion-source.md`
 - Direct source-doc execution waiver: not applicable.
@@ -44,7 +46,7 @@
 | 2.1 | done | Lock hook mode routing with failing tests | runtime test-first evidence `20260720-122115-issue-1318-runtime-test-first`. | Default/advisory/off/unmanaged red captured before hook edits. |
 | 2.2 | done | Implement advisory, enforce, off, and unmanaged routing | Shared hook suite and fail-open/privacy/resource regression tests pass. | Advisory never blocks; enforce compatibility remains. |
 | 2.3 | done | Update policy and cross-product acceptance | Source-linked Codex/Claude acceptance passes against the nils worktree binary. | Includes first mutation, overlap, acknowledgement, degraded broker, enforce, off, and unmanaged. |
-| 3.1 | in_progress | Deliver and merge nils-cli | Final local-fast, commit, provider PR/checks/review pending. | Three specialist waves resolved; final red-team returned no findings. |
+| 3.1 | in-progress | Deliver and merge nils-cli | Full local-fast and test-first evidence pass; provider PR/checks/merge pending. | Three specialist waves resolved; final red-team returned no findings. |
 | 3.2 | pending | Deliver and merge agent-runtime-kit | Pending Tasks 2.3 and 3.1. | Independent review and provider checks required. |
 | 4.1 | pending | Prepare and obtain deployment preview approval | Pending both merges. | Exact version/base/commit/digest/config and rollback. |
 | 4.2 | pending | Release, sync, prove fresh sessions, and close #1318 | Pending explicit approval of Task 4.1. | Close only after installed managed/unmanaged acceptance. |
@@ -69,6 +71,12 @@
   waves found and resolved lifecycle, migration, privacy, API, test, and
   performance defects; the final red-team and follow-up review returned no
   findings.
+- 2026-07-20: Release-quality validation passed: nils-cli local-fast completed
+  7,023 workspace tests plus doctests, the agent-session package completed 693
+  tests, and all 17 runtime-kit CI positions passed against immutable nils-cli
+  `6b3ec998`. The coupled run also exposed and fixed source-build executable
+  permission hardening and kept the rendered Codex prompt within its reviewed
+  byte budget.
 
 ## Validation
 
@@ -81,6 +89,9 @@
 | `cargo test -p nils-agent-session coordination -- --nocapture` | pass | 70 focused unit/integration coordination tests passed after review fixes. | local |
 | `bash tests/hooks/run.sh` | pass | 311 shared hook tests passed; source-linked acceptance is opt-in. | runtime-kit local |
 | `AGENT_SESSION_COUPLED_ACCEPTANCE=1 python3 -m unittest ...test_session_coordination_source_linked_cross_product_acceptance` | pass | Actual source binary passed Codex/Claude, acknowledgement, degraded, enforce/off, and unmanaged acceptance. | runtime-kit local |
+| `cargo nextest run --profile ci -p nils-agent-session` | pass | All 693 agent-session unit and integration tests passed. | local |
+| `bash scripts/ci/nils-cli-checks-entrypoint.sh --local-fast` | pass | Docs, formatting, clippy, all 7,023 workspace tests, and doctests passed. | local |
+| `NILS_CLI_REPO=<checkout> scripts/dev/with-nils-version.sh src:6b3ec998 -- bash scripts/ci/all.sh` | pass | All 17 runtime-kit CI positions passed; 311 shared-hook tests and context budgets were green. | runtime-kit local |
 | specialist maintainability/security/testing/API/migration/performance plus red-team | pass | All concrete findings fixed; final testing and red-team follow-ups returned `NO_FINDINGS`. | local review |
 
 ## Handoff

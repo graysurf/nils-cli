@@ -214,4 +214,3 @@ Recommended execution state: docs/plans/2026-07-20-advisory-session-coordination
 - `agent-runtime-kit/core/hooks/shared/session-coordination-guard.py`
 - `agent-runtime-kit/core/hooks/shared/checkout-lease-guard.py`
 - `agent-runtime-kit/core/policies/session-coordination.md`
-

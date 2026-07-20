@@ -201,7 +201,7 @@ gates while keeping #1318 synchronized as the L2 tracker.
 - Commands: semantic commits, `forge-cli pr deliver --no-merge`, specialist
   reviews, thread/task sweeps, required checks, and `forge-cli pr merge`.
 - Verify: both merged heads contain the validated cross-product contract and
-  #1318 records current task/validation/review truth.
+  issue #1318 records current task/validation/review truth.
 
 ### Task 3.1: Deliver and merge nils-cli
 
@@ -326,4 +326,3 @@ close #1318 only after installed managed/unmanaged behavior is proven.
 - Before a fixed rollback release is available, set managed sessions to
   explicit `off` through the supported mode surface; do not disable unrelated
   safety hooks.
-
