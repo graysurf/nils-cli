@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -15,7 +16,7 @@ use super::context::{
     ConflictClassification, ProviderRef, Scope, ScopeKind, WORK_CONTEXT_INPUT_VERSION,
     WORK_CONTEXT_VERSION, WorkContextInput, WorkContextRecord, canonical_repository,
     canonicalize_provider_refs, canonicalize_targets, checkout_root, evaluate,
-    repository_for_checkout,
+    repository_for_checkout, repository_for_checkout_with_timeout,
 };
 use super::{
     Registry, authenticate_from_file, broker, clean_expired, incarnation, lock_registry, now_epoch,
@@ -28,6 +29,7 @@ const ACK_VERSION: &str = "agent-session.work-context-acknowledgement.v1";
 const OPERATION_TARGETS_VERSION: &str = "agent-session.operation-targets.v1";
 const MAX_ACKNOWLEDGEMENT_SECS: u64 = 8 * 60 * 60;
 const MAX_ADVISORY_PEERS: usize = 64;
+const ADVISORY_RESOLUTION_TIMEOUT: Duration = Duration::from_millis(750);
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub(crate) struct AdvisoryAcknowledgement {
@@ -74,6 +76,46 @@ struct AdvisoryEvaluation {
     reasons: Vec<AdvisoryReason>,
     peers: Vec<AdvisoryPeer>,
     digest: String,
+}
+
+#[derive(Clone)]
+struct PresenceResolution {
+    repository: Option<String>,
+    worktree: String,
+}
+
+struct PresenceResolver {
+    deadline: Instant,
+    by_checkout: BTreeMap<PathBuf, PresenceResolution>,
+}
+
+impl PresenceResolver {
+    fn new() -> Self {
+        Self {
+            deadline: Instant::now() + ADVISORY_RESOLUTION_TIMEOUT,
+            by_checkout: BTreeMap::new(),
+        }
+    }
+
+    fn resolve(&mut self, registry: &Registry, cwd: &Path) -> Result<PresenceResolution, CliError> {
+        let checkout = checkout_root(cwd).ok();
+        let fingerprint_path = checkout.as_deref().unwrap_or(cwd);
+        if let Some(resolution) = self.by_checkout.get(fingerprint_path) {
+            return Ok(resolution.clone());
+        }
+        let repository = checkout.as_deref().and_then(|root| {
+            self.deadline
+                .checked_duration_since(Instant::now())
+                .and_then(|remaining| repository_for_checkout_with_timeout(root, remaining))
+        });
+        let resolution = PresenceResolution {
+            repository,
+            worktree: worktree_fingerprint(registry, fingerprint_path)?,
+        };
+        self.by_checkout
+            .insert(fingerprint_path.to_path_buf(), resolution.clone());
+        Ok(resolution)
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -225,6 +267,7 @@ pub(crate) fn advise(context: &CliContext, args: WorkContextAdviseArgs) -> Resul
         &self_incarnation,
         args.targets_file.as_deref(),
     )?;
+    let snapshot_observation = registry.advisory_observations.get(&record.id).cloned();
     let observed_now = now_epoch();
     let suppressed = !evaluation.reasons.is_empty()
         && registry
@@ -236,38 +279,58 @@ pub(crate) fn advise(context: &CliContext, args: WorkContextAdviseArgs) -> Resul
                     && ack.advisory_digest == evaluation.digest
             });
     let observation_changed = if evaluation.reasons.is_empty() {
-        registry.advisory_observations.contains_key(&record.id)
+        snapshot_observation.is_some()
     } else {
         let observation = AdvisoryObservation {
             session_incarnation: self_incarnation.clone(),
             advisory_digest: evaluation.digest.clone(),
             observed_at_epoch: observed_now,
         };
-        registry
-            .advisory_observations
-            .get(&record.id)
-            .is_none_or(|prior| {
-                prior.session_incarnation != observation.session_incarnation
-                    || prior.advisory_digest != observation.advisory_digest
-            })
+        snapshot_observation.as_ref().is_none_or(|prior| {
+            prior.session_incarnation != observation.session_incarnation
+                || prior.advisory_digest != observation.advisory_digest
+        })
     };
     if observation_changed {
         let now = now_epoch();
         let mut locked = lock_registry(context)?;
-        clean_expired(&mut locked.registry, now);
-        if evaluation.reasons.is_empty() {
-            locked.registry.advisory_observations.remove(&record.id);
-        } else {
-            locked.registry.advisory_observations.insert(
-                record.id.clone(),
-                AdvisoryObservation {
-                    session_incarnation: self_incarnation.clone(),
-                    advisory_digest: evaluation.digest.clone(),
-                    observed_at_epoch: now,
-                },
-            );
+        let mut changed = clean_expired(&mut locked.registry, now);
+        let broker_matches = locked
+            .registry
+            .brokers
+            .get(&record.id)
+            .is_some_and(|broker| {
+                broker.state == "ready" && broker.incarnation == self_incarnation
+            });
+        let observation_matches =
+            locked.registry.advisory_observations.get(&record.id) == snapshot_observation.as_ref();
+        if broker_matches && observation_matches {
+            if evaluation.reasons.is_empty() {
+                if snapshot_observation
+                    .as_ref()
+                    .is_some_and(|observation| observation.session_incarnation == self_incarnation)
+                {
+                    locked.registry.advisory_observations.remove(&record.id);
+                    changed = true;
+                }
+            } else if snapshot_observation
+                .as_ref()
+                .is_none_or(|observation| observation.session_incarnation == self_incarnation)
+            {
+                locked.registry.advisory_observations.insert(
+                    record.id.clone(),
+                    AdvisoryObservation {
+                        session_incarnation: self_incarnation.clone(),
+                        advisory_digest: evaluation.digest.clone(),
+                        observed_at_epoch: now,
+                    },
+                );
+                changed = true;
+            }
         }
-        locked.save()?;
+        if changed {
+            locked.save()?;
+        }
     }
     Ok(json!({
         "schema_version": ADVISORY_VERSION,
@@ -288,7 +351,8 @@ fn evaluate_advisory(
     self_incarnation: &str,
     targets_file: Option<&Path>,
 ) -> Result<AdvisoryEvaluation, CliError> {
-    let mut candidate = presence_context(registry, record, self_incarnation)?;
+    let mut resolver = PresenceResolver::new();
+    let mut candidate = presence_context(registry, record, self_incarnation, &mut resolver)?;
     if let Some(path) = targets_file {
         merge_targets(&mut candidate, path)?;
     }
@@ -339,7 +403,12 @@ fn evaluate_advisory(
             complete = false;
             continue;
         }
-        match presence_record(registry, &peer_record, &peer_broker.incarnation) {
+        match presence_record(
+            registry,
+            &peer_record,
+            &peer_broker.incarnation,
+            &mut resolver,
+        ) {
             Ok(peer) => {
                 peer_modes.insert(
                     peer_broker.session_id.clone(),
@@ -593,6 +662,7 @@ fn presence_context(
     registry: &Registry,
     record: &SessionRecord,
     session_incarnation: &str,
+    resolver: &mut PresenceResolver,
 ) -> Result<WorkContextInput, CliError> {
     let mut context = active_claim(registry, &record.id, session_incarnation)
         .map(claims::input_from_record)
@@ -607,19 +677,15 @@ fn presence_context(
             scopes: Vec::new(),
             summary: "managed agent session".to_string(),
         });
-    let checkout = checkout_root(Path::new(&record.cwd)).ok();
-    if let Some(repository) = checkout.as_deref().and_then(repository_for_checkout)
+    let resolution = resolver.resolve(registry, Path::new(&record.cwd))?;
+    if let Some(repository) = resolution.repository
         && !context.repositories.contains(&repository)
     {
         context.repositories.push(repository);
         context.repositories.sort();
     }
-    let fingerprint_path = checkout
-        .as_deref()
-        .unwrap_or_else(|| Path::new(&record.cwd));
-    let fingerprint = worktree_fingerprint(registry, fingerprint_path)?;
-    if !context.worktrees.contains(&fingerprint) {
-        context.worktrees.push(fingerprint);
+    if !context.worktrees.contains(&resolution.worktree) {
+        context.worktrees.push(resolution.worktree);
         context.worktrees.sort();
     }
     Ok(context)
@@ -629,15 +695,16 @@ fn presence_record(
     registry: &Registry,
     record: &SessionRecord,
     session_incarnation: &str,
+    resolver: &mut PresenceResolver,
 ) -> Result<WorkContextRecord, CliError> {
     if let Some(claim) = active_claim(registry, &record.id, session_incarnation) {
         let mut claim = claim.clone();
-        let presence = presence_context(registry, record, session_incarnation)?;
+        let presence = presence_context(registry, record, session_incarnation, resolver)?;
         claim.repositories = presence.repositories;
         claim.worktrees = presence.worktrees;
         return Ok(claim);
     }
-    let presence = presence_context(registry, record, session_incarnation)?;
+    let presence = presence_context(registry, record, session_incarnation, resolver)?;
     Ok(WorkContextRecord {
         schema_version: WORK_CONTEXT_VERSION.to_string(),
         session_id: record.id.clone(),

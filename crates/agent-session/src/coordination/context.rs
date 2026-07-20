@@ -543,6 +543,17 @@ fn validate_target_path(root: &Path, relative: &str) -> Result<(), CliError> {
 }
 
 pub(crate) fn repository_for_checkout(root: &Path) -> Option<String> {
+    repository_for_checkout_with_timeout(root, GIT_REMOTE_TIMEOUT)
+}
+
+pub(crate) fn repository_for_checkout_with_timeout(
+    root: &Path,
+    timeout: Duration,
+) -> Option<String> {
+    let deadline = Instant::now().checked_add(timeout)?;
+    if timeout.is_zero() {
+        return None;
+    }
     let mut child = Command::new("git")
         .args(["-C", root.to_str()?, "remote", "get-url", "origin"])
         .stdin(Stdio::null())
@@ -550,7 +561,6 @@ pub(crate) fn repository_for_checkout(root: &Path) -> Option<String> {
         .stderr(Stdio::null())
         .spawn()
         .ok()?;
-    let deadline = Instant::now() + GIT_REMOTE_TIMEOUT;
     loop {
         match child.try_wait() {
             Ok(Some(_)) => break,

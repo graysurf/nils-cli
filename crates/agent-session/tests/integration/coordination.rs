@@ -834,6 +834,180 @@ fn advisory_lifecycle_skips_stopped_and_off_peers_but_preserves_known_overlap() 
 }
 
 #[test]
+fn advisory_commit_preserves_a_replacement_incarnation_observation() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let state_dir = tmp.path().join("state");
+    fs::create_dir(&state_dir).expect("state");
+    let checkout = tmp.path().join("checkout");
+    init_checkout(&checkout, "https://github.com/example/repository.git");
+    seed_brokers_at(
+        &state_dir,
+        &[
+            (
+                "alpha",
+                "incarnation-alpha",
+                "alpha-private-capability-material",
+                checkout.as_path(),
+                Some("advisory"),
+            ),
+            (
+                "beta",
+                "incarnation-beta",
+                "beta-private-capability-material",
+                checkout.as_path(),
+                Some("advisory"),
+            ),
+        ],
+    );
+    let fake_bin = tmp.path().join("fake-bin");
+    fs::create_dir(&fake_bin).expect("fake bin");
+    let started = tmp.path().join("git-started");
+    let release = tmp.path().join("git-release");
+    let git = fake_bin.join("git");
+    fs::write(
+        &git,
+        "#!/usr/bin/env bash\nset -euo pipefail\n: >\"$GIT_PROBE_STARTED\"\nwhile [ ! -e \"$GIT_PROBE_RELEASE\" ]; do sleep 0.01; done\nprintf '%s\\n' https://github.com/example/repository.git\n",
+    )
+    .expect("fake git");
+    fs::set_permissions(&git, fs::Permissions::from_mode(0o755)).expect("git mode");
+    let path = format!(
+        "{}:{}",
+        fake_bin.display(),
+        std::env::var("PATH").expect("PATH")
+    );
+    let capability = capability(&state_dir, "alpha");
+    let child = Command::new(bin::resolve("agent-session"))
+        .current_dir(&checkout)
+        .args(["work-context", "advise", "--format", "json"])
+        .env("AGENT_SESSION_ID", "alpha")
+        .env("AGENT_SESSION_CAPABILITY_FILE", &capability)
+        .env("AGENT_SESSION_STATE_DIR", &state_dir)
+        .env("GIT_PROBE_STARTED", &started)
+        .env("GIT_PROBE_RELEASE", &release)
+        .env("PATH", path)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn advise");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    while !started.exists() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert!(
+        started.exists(),
+        "advisory evaluation did not reach git probe"
+    );
+    let observed_at_epoch = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("current time")
+        .as_secs();
+    rewrite_registry(&state_dir, |registry| {
+        registry["brokers"]["alpha"]["incarnation"] = json!("incarnation-replacement");
+        registry["advisory_observations"]["alpha"] = json!({
+            "session_incarnation": "incarnation-replacement",
+            "advisory_digest": "replacement-observation-digest",
+            "observed_at_epoch": observed_at_epoch
+        });
+    });
+    fs::write(&release, b"release\n").expect("release git probe");
+    let output = child.wait_with_output().expect("wait advise");
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let registry: serde_json::Value = serde_json::from_slice(
+        &fs::read(state_dir.join("coordination/registry.json")).expect("registry"),
+    )
+    .expect("registry json");
+    assert_eq!(
+        registry["advisory_observations"]["alpha"]["session_incarnation"],
+        "incarnation-replacement"
+    );
+    assert_eq!(
+        registry["advisory_observations"]["alpha"]["advisory_digest"],
+        "replacement-observation-digest"
+    );
+}
+
+#[test]
+fn advisory_reuses_checkout_resolution_across_many_peers() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let state_dir = tmp.path().join("state");
+    fs::create_dir(&state_dir).expect("state");
+    let checkout = tmp.path().join("checkout");
+    init_checkout(&checkout, "https://github.com/example/repository.git");
+    let owned = (0..12)
+        .map(|index| {
+            let id = if index == 0 {
+                "alpha".to_string()
+            } else {
+                format!("peer-{index:02}")
+            };
+            (
+                id.clone(),
+                format!("incarnation-{id}"),
+                format!("{id}-private-capability-material-0123456789"),
+            )
+        })
+        .collect::<Vec<_>>();
+    let sessions = owned
+        .iter()
+        .map(|(id, incarnation, capability)| {
+            (
+                id.as_str(),
+                incarnation.as_str(),
+                capability.as_str(),
+                checkout.as_path(),
+                Some("advisory"),
+            )
+        })
+        .collect::<Vec<_>>();
+    seed_brokers_at(&state_dir, &sessions);
+    let fake_bin = tmp.path().join("fake-bin");
+    fs::create_dir(&fake_bin).expect("fake bin");
+    let counter = tmp.path().join("git-probe-count");
+    let git = fake_bin.join("git");
+    fs::write(
+        &git,
+        "#!/usr/bin/env bash\nset -euo pipefail\ncount=0\nif [ -f \"$GIT_PROBE_COUNT\" ]; then IFS= read -r count <\"$GIT_PROBE_COUNT\"; fi\nprintf '%s\\n' \"$((count + 1))\" >\"$GIT_PROBE_COUNT\"\nsleep 0.15\nprintf '%s\\n' https://github.com/example/repository.git\n",
+    )
+    .expect("fake git");
+    fs::set_permissions(&git, fs::Permissions::from_mode(0o755)).expect("git mode");
+    let path = format!(
+        "{}:{}",
+        fake_bin.display(),
+        std::env::var("PATH").expect("PATH")
+    );
+    let capability = capability(&state_dir, "alpha");
+    let state = state_dir.to_string_lossy();
+    let started = std::time::Instant::now();
+    let advised = run_with_env(
+        &checkout,
+        &["work-context", "advise", "--format", "json"],
+        &[
+            ("AGENT_SESSION_ID", "alpha"),
+            ("AGENT_SESSION_CAPABILITY_FILE", capability.as_str()),
+            ("AGENT_SESSION_STATE_DIR", state.as_ref()),
+            ("GIT_PROBE_COUNT", counter.to_str().expect("counter path")),
+            ("PATH", path.as_str()),
+        ],
+    );
+    assert_eq!(advised.code, 0, "stderr={}", advised.stderr_text());
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(1),
+        "advisory evaluation took {:?}",
+        started.elapsed()
+    );
+    assert_eq!(
+        fs::read_to_string(counter).expect("probe count").trim(),
+        "1"
+    );
+}
+
+#[test]
 fn acknowledgement_is_bound_to_the_observed_overlap_and_expiry() {
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let state_dir = tmp.path().join("state");
