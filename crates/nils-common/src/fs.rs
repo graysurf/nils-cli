@@ -101,7 +101,7 @@ pub enum AtomicWriteError {
         #[source]
         source: io::Error,
     },
-    #[error("failed to flush temporary file {path} to disk: {source}")]
+    #[error("failed to fsync temporary file {path}: {source}")]
     SyncTempFile {
         path: PathBuf,
         #[source]

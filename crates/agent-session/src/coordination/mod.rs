@@ -31,7 +31,9 @@ const REGISTRY_VERSION: &str = "agent-session.coordination-registry.v1";
 const REGISTRY_FILE: &str = "registry.json";
 const REGISTRY_LOCK: &str = "registry.lock";
 const LOCK_TIMEOUT: Duration = Duration::from_secs(2);
-const MAX_REGISTRY_BYTES: u64 = 68 * 1024 * 1024;
+// Single source of truth lives in nils-common; keep the projection reader and
+// this read/write path on the same whole-registry cap.
+const MAX_REGISTRY_BYTES: u64 = nils_common::coordination_projection::MAX_REGISTRY_BYTES;
 const RECEIPT_TTL_SECS: i64 = 24 * 60 * 60;
 const MAX_RECEIPTS_PER_PRINCIPAL: usize = 4_096;
 const MAX_RECEIPTS_GLOBAL: usize = 32_768;

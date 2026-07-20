@@ -388,7 +388,7 @@ Limits are normative:
 - body: 16 KiB UTF-8 maximum;
 - expiry: 24 hours default, 7 days maximum;
 - per session: 256 messages and 4 MiB stored bytes;
-- per registry: 64 MiB stored bytes;
+- per registry: 68 MiB stored bytes;
 - send rate: 30 messages per sender-recipient pair per minute, burst 10;
 - inbox page: 50 default, 100 maximum;
 - wait: 60 seconds maximum;

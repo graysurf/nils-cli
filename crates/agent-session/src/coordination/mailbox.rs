@@ -728,6 +728,8 @@ fn send_authenticated(
         .sum();
     if live_for_recipient.len() >= MAX_SESSION_MESSAGES
         || recipient_bytes.saturating_add(body.len()) > MAX_SESSION_BYTES
+        // Mirror the enforced whole-registry cap (`super::MAX_REGISTRY_BYTES`,
+        // 68 MiB) so a send is refused before the persisted registry can exceed it.
         || registry_bytes.saturating_add(body.len()) > super::MAX_REGISTRY_BYTES as usize
     {
         return Err(CliError::data(
