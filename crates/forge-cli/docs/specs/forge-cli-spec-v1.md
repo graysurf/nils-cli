@@ -121,7 +121,11 @@ Parity matrix (v1):
 | `pr review-threads resolve <id> --thread …` | `gh api graphql` (`addPullRequestReviewThreadReply` then `resolveReviewThread`)                                                              | unsupported in v1                                                      | GitHub-only seam                                                                                                         |
 | `pr review-threads reply <id> --thread …`   | `gh api graphql` (`addPullRequestReviewThreadReply`)                                                                                         | unsupported in v1                                                      | GitHub-only seam                                                                                                         |
 | `pr reviews <id>`                           | `gh api graphql` (native `reviews` connection plus `headRefOid`)                                                                             | unsupported in v1                                                      | GitHub-only normalized current-head/stale review snapshot                                                                |
-| `pr pending-review delete <id> --review …`  | PR view + complete pending-only membership snapshot + exact-target final read with content/viewer/comment guards + `deletePullRequestReview` | unsupported in v1                                                      | GitHub-only confirmed-abandoned recovery for one body-only pending review                                                |
+| `pr pending-review inspect <id> --review …` | PR view + exact-node complete paginated body/inline-comment snapshot                                                                         | unsupported in v1                                                      | GitHub-only receipt-aware read with stable snapshot digest                                                               |
+| `pr pending-review resume-submit <id> …`    | exact pending snapshot CAS + `submitPullRequestReview`, or submitted-review read-back                                                        | unsupported in v1                                                      | GitHub-only idempotent recovery for one receipt-bound transaction                                                        |
+| `pr pending-review submit <id> …`           | exact pending snapshot CAS + `submitPullRequestReview`                                                                                       | unsupported in v1                                                      | GitHub-only guarded unmarked adoption that preserves inline content                                                      |
+| `pr pending-review discard <id> …`          | exact pending snapshot CAS + `deletePullRequestReview`                                                                                       | unsupported in v1                                                      | GitHub-only destructive recovery with distinct inline-content-loss confirmation                                          |
+| `pr pending-review delete <id> --review …`  | PR view + complete pending-only membership snapshot + exact-target final read with content/viewer/comment guards + `deletePullRequestReview` | unsupported in v1                                                      | GitHub-only compatibility recovery for one confirmed-abandoned body-only pending review                                  |
 | `pr tasks <id>`                             | `gh pr view <id> --json number,url,body`                                                                                                     | `glab mr view <id> -F json` (`description`)                            | normalized task-list state                                                                                               |
 | `pr merge <id>`                             | `gh pr merge <id> --squash --delete-branch`                                                                                                  | `glab api --method PUT .../merge` after gates                          | exact (method honoured per repo cfg)                                                                                     |
 | `pr close <id>`                             | `gh pr close <id>`                                                                                                                           | `glab mr close <id>`                                                   | exact                                                                                                                    |
@@ -193,6 +197,10 @@ forge-cli
 │   │   └── reply
 │   ├── reviews
 │   ├── pending-review
+│   │   ├── inspect
+│   │   ├── resume-submit
+│   │   ├── submit
+│   │   ├── discard
 │   │   └── delete
 │   ├── ready
 │   ├── merge
@@ -479,15 +487,22 @@ backend mapping, validation rules, and output schema versions.
 
 - The `pr review-threads list <id>` read surface emits
   `cli.forge-cli.pr.review-threads.v1`. Each thread now carries an
-  `id` handle in addition to its state fields:
-  `data.threads[] = { id, resolved, outdated, author, path, created_at,
-  url, body }`. On GitHub `id` is the `reviewThreads` node id
+  `id` handle, complete ordered comment stream, and normalized diff anchor in
+  addition to its state fields:
+  `data.threads[] = { id, resolved, outdated, author, path, diff_side,
+  line, original_line, original_start_line, start_diff_side, start_line,
+  subject_type, created_at, url, body, comments }`. On GitHub `id` is the
+  `reviewThreads` node id
   (`PRRT_...`) — the single handle consumed by both write ops below
   (as `threadId` for resolve and `pullRequestReviewThreadId` for
   reply). On GitLab `id` is the discussion id. The field is additive;
   existing consumers are unaffected.
 - Text output includes the same thread id on each thread line so terminal users
   can copy the `--thread` value without switching to JSON.
+- GitHub thread and per-thread comment connections are independently paginated.
+  The PR head and thread identity must remain stable across the complete read;
+  partial GraphQL results, missing required anchor/state fields, cursor loops,
+  or head drift fail closed as `review_snapshot_incomplete`.
 - `--dry-run` emits the planned thread-list backend call without running the
   preliminary PR/MR view lookup or touching the provider network. It resolves
   the repo/project from `--repo` or the configured remote URL.
@@ -516,7 +531,70 @@ backend mapping, validation rules, and output schema versions.
   return `review_snapshot_incomplete` (`DATA 65`). The gate never treats a
   partial native-review snapshot as empty.
 
-### `pr pending-review delete`
+### Review transaction state and pending-review recovery
+
+- Threaded native reviews use the provider-visible, append-only
+  `forge-cli.review-loop.v1` state chain. A record requires `schema`,
+  `repository`, `pr`, `expected_head`, zero-based contiguous `generation`,
+  nullable `previous_digest`, typed `payload`, and `record_digest`. A
+  `review-run-receipt` payload requires `review_run_id`, portable
+  `route_lenses`, `decision`, `expected_head`, `round`, `summary_digest`, and an
+  ordered `inline_manifest[]` of `index`, `path`, optional line/range anchors,
+  side, subject type, and normalized `body_digest`.
+- Digests are lowercase SHA-256 values prefixed by `sha256:`. Their preimages
+  are compact UTF-8 JSON in the declared field order. `review_run_id` binds
+  repository, PR number, expected head, round, semantic route lenses, decision,
+  normalized summary digest, and ordered inline manifest. A record digest also
+  binds the prior record digest. Duplicate digests, forks, missing/unreachable
+  generations, target mismatches, malformed markers, or digest mismatches fail
+  as `review_state_conflict` before native-review mutation.
+- Provider marker grammar is versioned and deterministic:
+  `<!-- forge-cli:review-state:v1 <lowercase-hex-record-json> -->`,
+  `<!-- forge-cli:review-run:v1 run=<review_run_id> -->`, and
+  `<!-- forge-cli:review-finding:v1 run=<review_run_id> digest=<body_digest> -->`.
+  Owned markers remain in raw provider content but are removed before semantic
+  body comparison and digesting.
+- Receipt fields intentionally exclude authentication tokens, credentials,
+  environment-variable values, local paths, and private identity/profile names.
+  The durable identity route contains only portable lens names and the semantic
+  decision; environment-owned routing resolves the actor outside the receipt.
+- `pr pending-review inspect <id> --review <PRR_...>` emits
+  `cli.forge-cli.pr.pending-review.inspect.v1`. Its complete snapshot requires
+  PR/head/review identity, author, commit, raw and semantic body,
+  `viewerDidAuthor`, `viewerCanDelete`, provenance, every inline comment with
+  normalized body digest and anchor, and `snapshot_digest`. Every page must
+  repeat identical review metadata; partial data, cursor loops, count mismatch,
+  or head drift returns `review_snapshot_incomplete` instead of a partial
+  snapshot. Provenance is `receipt-bound` or `unmarked`; mixed, missing,
+  or digest-mismatched owned markers return `pending_review_manifest_mismatch`.
+- `pr pending-review resume-submit <id> --review <PRR_...> --review-run-id
+  <digest> --expected-head <sha> --expected-commit <sha> --expected-snapshot
+  <digest> --decision <decision>` emits
+  `cli.forge-cli.pr.pending-review.resume-submit.v1`. It submits only an exact
+  viewer-owned receipt-bound snapshot. If that review was already submitted,
+  the command reads submitted reviews, verifies the same run id, review id,
+  head, commit, and decision state, and returns the same successful envelope
+  without another mutation.
+- `pr pending-review submit <id> --review <PRR_...> --expected-head <sha>
+  --expected-commit <sha> --expected-snapshot <digest> --decision <decision>
+  --confirm-unmarked-submit` emits `cli.forge-cli.pr.pending-review.submit.v1`.
+  It accepts only `unmarked` provenance and preserves the exact body and
+  all inline comments while submitting. It never auto-adopts a unmarked draft.
+- `pr pending-review discard <id> --review <PRR_...> --expected-head <sha>
+  --expected-commit <sha> --expected-snapshot <digest> --confirm-discard`
+  emits `cli.forge-cli.pr.pending-review.discard.v1`. It is destructive and
+  requires the additional `--confirm-inline-content-loss` whenever the complete
+  snapshot contains an inline comment. No normal `pr review` recovery path
+  invokes discard or delete.
+- Live inspect data is required for these four commands, so their current v1
+  dry-run form fails with `pending_review_snapshot_required`. All mutating forms
+  perform the exact head/commit/snapshot and viewer-identity checks before the
+  mutation. Mismatches return `pending_review_head_changed`,
+  `pending_review_commit_mismatch`, `pending_review_manifest_mismatch`,
+  `pending_review_identity_mismatch`, `pending_review_pr_mismatch`, or
+  `pending_review_not_found` with no mutation.
+
+### `pr pending-review delete` compatibility surface
 
 - `pr pending-review delete <id> --review <PRR_...> --expected-head <sha>
   --expected-commit <sha> (--expected-body <text> | --expected-body-file <path>)
@@ -577,17 +655,19 @@ backend mapping, validation rules, and output schema versions.
   identity the inherited `gh` token carries, so a reviewer-bot token (for example
   via `FORGE_BOT_PROFILE`) yields a bot-authored review. A body is required for
   `COMMENT` and `REQUEST_CHANGES` and optional for `APPROVE` (a body-less approve
-  omits the `body` field). The same PR-existence guard runs first, followed by a
-  complete pending-only review snapshot. The provider head must still equal
+  omits the `body` field). The same PR-existence guard runs first. For a
+  summary-only native review it is followed by a complete pending-only review
+  snapshot; threaded reviews use the receipt transaction below. The provider
+  head must still equal
   `--expected-head`; drift returns `github_review_head_changed` (`DATA 65`)
   before any mutation. The successful payload exposes the bound head as
   `data.head_sha`. If the authenticated viewer already
-  owns a pending review, the command returns `github_pending_review_exists`
-  (`RUNTIME 1`) before any review mutation. Its detail includes the provider
-  head, viewer-owned pending count, and deletable count so callers can inspect
-  `pr reviews` and delete only the exact guarded node before retrying. Pending
-  reviews owned by other viewers do not block submission. The pending guard and
-  reviews POST are rendered in `--dry-run` as
+  owns a pending review during a summary-only submission, the command returns
+  `github_pending_review_exists` (`RUNTIME 1`) before any review mutation. Its
+  detail includes the provider head, viewer-owned pending count, and deletable
+  count so callers can inspect the exact node. Pending reviews owned by other
+  viewers do not block submission. The pending guard and reviews POST are
+  rendered in `--dry-run` as
   `data.pending_review_guard_plan` and `data.plan`. Omitting the expected head
   returns `expected_review_head_required` (`DATA 65`); supplying it without
   `--submit-review` returns `expected_review_head_requires_submit_review`
@@ -607,16 +687,25 @@ backend mapping, validation rules, and output schema versions.
   while line comments use `subjectType=LINE`. The thread file is capped at
   256 KiB, 50 specs, 1024-byte paths, and 16 KiB bodies; put lower-priority
   findings in the summary body or split them into a later review. `--thread-file`
-  requires `--submit-review`; omit it for a summary-only review. A live GitHub run first
-  looks up the PR node id, creates a pending review bound to
-  `--expected-head` through `commitOID`, adds each thread with
-  `addPullRequestReviewThread`, then publishes the review with
-  `submitPullRequestReview`. Before creating threads it reads the PR's
-  existing review threads and skips any finding whose `(path, body)` already
-  has a live (non-resolved, non-outdated) thread on the current head —
-  cross-run idempotency, so re-running delivery on an unchanged head neither
-  duplicates threads nor re-submits an equivalent review, and never deletes or
-  mutates a prior thread/review; an outdated match is posted fresh.
+  requires `--submit-review`; omit it for a summary-only review. A live GitHub
+  run first reads complete native reviews and review threads, skips findings
+  whose semantic `(path, body)` already has a live non-resolved/non-outdated
+  thread, computes a deterministic `review_run_id`, and appends an immutable
+  `forge-cli.review-loop.v1` receipt before native-review mutation. It then
+  selects only an exact viewer-owned receipt-bound pending review, or creates a
+  new review bound to `--expected-head` through `commitOID`. The review body and
+  every finding carry owned run/digest markers. An exact pending manifest must
+  be an ordered prefix of the receipt manifest; the command adds only the
+  missing suffix and performs a final complete snapshot before
+  `submitPullRequestReview`.
+
+  Every interrupted stage is resumable: a lost create response, any lost inline
+  comment response, a pre-submit failure, and a lost submit response preserve
+  completed content. Re-running the same immutable inputs resumes or returns an
+  already-submitted review by `review_run_id`; no automatic path deletes a
+  draft. A unmarked, ambiguous, different-head/commit/identity, or manifest-mismatched
+  pending review fails closed before mutation. An outdated semantic thread match
+  is posted fresh.
   `data.threads_skipped_idempotent` reports the number skipped, and when every
   finding is already threaded the review event itself is skipped
   (`submitted_review` is `false`). JSON output includes
@@ -626,12 +715,10 @@ backend mapping, validation rules, and output schema versions.
   `data.planned_review_threads`. If GitHub rejects an individual thread mutation
   with HTTP 422 because the path/line is not commentable on the diff, the command
   returns `github_review_thread_rejected` (`RUNTIME 1`) with the raw backend
-  detail and the failed spec index/path/line after attempting pending-review
-  cleanup. If any other thread mutation or final review submit fails after the
-  pending review is created, the command attempts a best-effort
-  `deletePullRequestReview` cleanup before returning the original failure; if
-  cleanup also fails, error details include the pending review id/url and cleanup
-  failure. Malformed or oversized
+  detail and the failed spec index/path/line while preserving the pending
+  review. Other interruption points return
+  `pending_review_transaction_incomplete` (`DATA 65`) with the pending review
+  intact and an identical rerun as the recovery action. Malformed or oversized
   specs return `invalid_review_thread_spec` (`DATA 65`); `--thread-file` without
   `--submit-review` returns `thread_file_requires_submit_review` (`DATA 65`);
   GitLab / Local return `provider_unsupported` (`USAGE 64`) before any backend
@@ -991,21 +1078,21 @@ backend implementations cannot diverge.
     positional PR's review threads and confirming `--thread <id>` is present
     before posting a reply or resolving. `--dry-run` remains offline and skips
     this lookup.
-16. **Pending-review recovery ownership and content binding.**
-    `pr pending-review delete` requires `--confirm-abandoned`, exact expected PR
-    head and review commit values, plus an expected body or body file. It reads
-    the target PR's complete pending-review membership snapshot, then re-fetches
-    the exact `--review` node immediately before mutation. Both reads must still
-    show a matching `PENDING` body-only review on the named PR with
-    `viewerDidAuthor: true` and `viewerCanDelete: true`; head, commit, normalized
-    body, and PR membership are revalidated, and any inline comment requires
-    manual provider recovery. Expected and provider bodies must not exceed 64
-    KiB; file and stdin inputs are read with that bound, and complete pagination
-    retains only the target body. These provider-native viewer fields support
-    both user and GitHub App installation actors without relying on the
-    user-only `GET /user` endpoint. GitHub exposes no content CAS on the delete
-    mutation, so the documented final-read-to-delete race remains after these
-    guards.
+16. **Pending-review recovery ownership and content binding.** `inspect`,
+    `resume-submit`, guarded unmarked `submit`, and `discard` read the exact
+    `--review` node plus every inline-comment page and bind mutations to the
+    resulting snapshot digest, PR head, review commit, PR membership, and
+    provider-native viewer identity. Receipt-bound automatic recovery adds only
+    a missing ordered manifest suffix and never deletes a draft; an
+    already-submitted matching run is idempotent success. Unmarked submit and all
+    discard paths require explicit confirmation, with a distinct confirmation
+    for inline-content loss. The compatibility `delete` additionally requires
+    `--confirm-abandoned` and an exact bounded body/body-file value, retains only
+    the target during complete membership pagination, re-fetches the exact node,
+    and refuses any inline comment. These provider-native viewer fields support
+    both user and GitHub App installation actors without `GET /user`. GitHub
+    exposes no content CAS on delete/discard, so the documented
+    final-read-to-delete race remains after exact snapshot guards.
 
 Violations map to `DATA 65` with one of these `data.error.kind` values:
 

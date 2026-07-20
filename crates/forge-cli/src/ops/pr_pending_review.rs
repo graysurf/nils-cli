@@ -7,7 +7,11 @@ use nils_common::cli_contract::{OutputFormat, schema_version_for};
 use serde::Serialize;
 
 use crate::backend::{BackendRunner, BackendSuccess};
-use crate::cli::{BINARY, GlobalFlags, PrPendingReviewDeleteArgs};
+use crate::cli::{
+    BINARY, GlobalFlags, PrPendingReviewDeleteArgs, PrPendingReviewDiscardArgs,
+    PrPendingReviewInspectArgs, PrPendingReviewResumeSubmitArgs, PrPendingReviewSubmitArgs,
+    PrReviewDecision,
+};
 use crate::envelope::emit_success;
 use crate::error::ForgeError;
 use crate::ops::{pr_review, pr_reviews, pr_view};
@@ -16,6 +20,42 @@ use crate::rate_limit::default_runner;
 
 const SCHEMA: &str = "pr.pending-review.delete";
 const SCHEMA_VERSION: u32 = 1;
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct PrPendingReviewInspectPayload {
+    pub provider: &'static str,
+    pub number: u64,
+    pub url: String,
+    pub snapshot: pr_reviews::PendingReviewSnapshot,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct PrPendingReviewSubmitPayload {
+    pub provider: &'static str,
+    pub number: u64,
+    pub url: String,
+    pub review_id: String,
+    pub review_url: String,
+    pub head_sha: String,
+    pub commit_sha: String,
+    pub snapshot_digest: String,
+    pub review_run_id: Option<String>,
+    pub submitted: bool,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct PrPendingReviewDiscardPayload {
+    pub provider: &'static str,
+    pub number: u64,
+    pub url: String,
+    pub review_id: String,
+    pub review_url: String,
+    pub head_sha: String,
+    pub commit_sha: String,
+    pub snapshot_digest: String,
+    pub inline_comment_count: usize,
+    pub discarded: bool,
+}
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct PrPendingReviewDeletePayload {
@@ -43,6 +83,247 @@ struct PrPendingReviewDeleteDryRunPayload {
     snapshot_plan: Vec<String>,
     target_plan: Vec<String>,
     delete_plan: Vec<String>,
+}
+
+pub fn run_inspect(
+    global: &GlobalFlags,
+    args: PrPendingReviewInspectArgs,
+    format: OutputFormat,
+) -> Result<i32, ForgeError> {
+    let runner = default_runner();
+    run_inspect_with(&runner, global, args, format, git_remote_url)
+}
+
+pub fn run_inspect_with<R: BackendRunner, F: Fn(&str) -> Option<String>>(
+    runner: &R,
+    global: &GlobalFlags,
+    args: PrPendingReviewInspectArgs,
+    format: OutputFormat,
+    remote_url_lookup: F,
+) -> Result<i32, ForgeError> {
+    let (ctx, view, snapshot) =
+        load_pending_snapshot(runner, global, args.id, &args.review, &remote_url_lookup)?;
+    Ok(emit_success(
+        schema_version_for(BINARY, "pr.pending-review.inspect", 1),
+        PrPendingReviewInspectPayload {
+            provider: ctx.provider.as_str(),
+            number: view.number,
+            url: view.url,
+            snapshot,
+        },
+        format,
+        |payload| {
+            println!(
+                "pending review {review} on #{number}: {comments} inline comment(s) [{provenance}]\n  {url}",
+                review = payload.snapshot.review_id,
+                number = payload.number,
+                comments = payload.snapshot.inline_comments.len(),
+                provenance = payload.snapshot.provenance,
+                url = payload.snapshot.review_url,
+            );
+        },
+    ))
+}
+
+pub fn run_resume_submit(
+    global: &GlobalFlags,
+    args: PrPendingReviewResumeSubmitArgs,
+    format: OutputFormat,
+) -> Result<i32, ForgeError> {
+    let runner = default_runner();
+    run_resume_submit_with(&runner, global, args, format, git_remote_url)
+}
+
+pub fn run_resume_submit_with<R: BackendRunner, F: Fn(&str) -> Option<String>>(
+    runner: &R,
+    global: &GlobalFlags,
+    args: PrPendingReviewResumeSubmitArgs,
+    format: OutputFormat,
+    remote_url_lookup: F,
+) -> Result<i32, ForgeError> {
+    let (ctx, view, snapshot) =
+        load_pending_snapshot_optional(runner, global, args.id, &args.review, &remote_url_lookup)?;
+    let Some(snapshot) = snapshot else {
+        return emit_already_submitted(
+            runner,
+            &ctx,
+            view,
+            &args.review,
+            &args.review_run_id,
+            &args.expected_head,
+            &args.expected_commit,
+            &args.expected_snapshot,
+            args.decision,
+            format,
+        );
+    };
+    validate_snapshot_cas(
+        &snapshot,
+        &args.expected_head,
+        &args.expected_commit,
+        &args.expected_snapshot,
+    )?;
+    if snapshot.provenance != "receipt-bound"
+        || snapshot.review_run_id.as_deref() != Some(args.review_run_id.as_str())
+    {
+        return Err(ForgeError::validation(
+            schema_err(),
+            "pending_review_manifest_mismatch",
+            "the pending review is not bound to the requested review transaction",
+            Some(format!(
+                "expected_run={}; observed_run={}",
+                args.review_run_id,
+                snapshot.review_run_id.as_deref().unwrap_or("<unmarked>")
+            )),
+        ));
+    }
+    validate_review_run_receipt(
+        runner,
+        &ctx,
+        &view,
+        &args.review_run_id,
+        &args.expected_head,
+        args.decision,
+    )?;
+    submit_snapshot(
+        runner,
+        &ctx,
+        view,
+        snapshot,
+        args.decision,
+        "pr.pending-review.resume-submit",
+        format,
+    )
+}
+
+pub fn run_submit(
+    global: &GlobalFlags,
+    args: PrPendingReviewSubmitArgs,
+    format: OutputFormat,
+) -> Result<i32, ForgeError> {
+    let runner = default_runner();
+    run_submit_with(&runner, global, args, format, git_remote_url)
+}
+
+pub fn run_submit_with<R: BackendRunner, F: Fn(&str) -> Option<String>>(
+    runner: &R,
+    global: &GlobalFlags,
+    args: PrPendingReviewSubmitArgs,
+    format: OutputFormat,
+    remote_url_lookup: F,
+) -> Result<i32, ForgeError> {
+    let (ctx, view, snapshot) =
+        load_pending_snapshot(runner, global, args.id, &args.review, &remote_url_lookup)?;
+    validate_snapshot_cas(
+        &snapshot,
+        &args.expected_head,
+        &args.expected_commit,
+        &args.expected_snapshot,
+    )?;
+    if snapshot.provenance != "unmarked" {
+        return Err(ForgeError::validation(
+            schema_err(),
+            "pending_review_manifest_mismatch",
+            "guarded unmarked submit accepts only an unmarked pending review",
+            Some(format!("provenance={}", snapshot.provenance)),
+        ));
+    }
+    submit_snapshot(
+        runner,
+        &ctx,
+        view,
+        snapshot,
+        args.decision,
+        "pr.pending-review.submit",
+        format,
+    )
+}
+
+pub fn run_discard(
+    global: &GlobalFlags,
+    args: PrPendingReviewDiscardArgs,
+    format: OutputFormat,
+) -> Result<i32, ForgeError> {
+    let runner = default_runner();
+    run_discard_with(&runner, global, args, format, git_remote_url)
+}
+
+pub fn run_discard_with<R: BackendRunner, F: Fn(&str) -> Option<String>>(
+    runner: &R,
+    global: &GlobalFlags,
+    args: PrPendingReviewDiscardArgs,
+    format: OutputFormat,
+    remote_url_lookup: F,
+) -> Result<i32, ForgeError> {
+    let (ctx, view, snapshot) =
+        load_pending_snapshot(runner, global, args.id, &args.review, &remote_url_lookup)?;
+    validate_snapshot_cas(
+        &snapshot,
+        &args.expected_head,
+        &args.expected_commit,
+        &args.expected_snapshot,
+    )?;
+    if !snapshot.viewer_did_author || !snapshot.viewer_can_delete {
+        return Err(ForgeError::validation(
+            schema_err(),
+            "pending_review_identity_mismatch",
+            "the invoking GitHub identity cannot discard this pending review",
+            Some(format!("review_id={}", snapshot.review_id)),
+        ));
+    }
+    if !snapshot.inline_comments.is_empty() && !args.confirm_inline_content_loss {
+        return Err(ForgeError::validation(
+            schema_err(),
+            "pending_review_inline_discard_approval_required",
+            "discarding inline review content requires --confirm-inline-content-loss",
+            Some(format!(
+                "review_id={}; inline_comment_count={}",
+                snapshot.review_id,
+                snapshot.inline_comments.len()
+            )),
+        ));
+    }
+    let output = runner.run(&pr_review::build_github_delete_pending_review_call(
+        &ctx,
+        &snapshot.review_id,
+    ))?;
+    let (deleted_id, deleted_url) = parse_deleted_review(&output)?;
+    if deleted_id != snapshot.review_id {
+        return Err(ForgeError::software(
+            schema_err(),
+            "GitHub returned a different review after pending-review discard",
+            Some(format!(
+                "expected_review_id={}; provider_review_id={deleted_id}",
+                snapshot.review_id
+            )),
+        ));
+    }
+    let commit_sha = snapshot.commit_sha.clone().expect("CAS checked commit");
+    let inline_comment_count = snapshot.inline_comments.len();
+    Ok(emit_success(
+        schema_version_for(BINARY, "pr.pending-review.discard", 1),
+        PrPendingReviewDiscardPayload {
+            provider: ctx.provider.as_str(),
+            number: view.number,
+            url: view.url,
+            review_id: snapshot.review_id,
+            review_url: deleted_url,
+            head_sha: snapshot.head_sha,
+            commit_sha,
+            snapshot_digest: snapshot.snapshot_digest,
+            inline_comment_count,
+            discarded: true,
+        },
+        format,
+        |payload| {
+            println!(
+                "discarded pending review {review} from #{number}\n  {url}",
+                review = payload.review_id,
+                number = payload.number,
+                url = payload.review_url
+            );
+        },
+    ))
 }
 
 pub fn run_delete(
@@ -153,6 +434,315 @@ pub fn run_delete_with<R: BackendRunner, F: Fn(&str) -> Option<String>>(
         deleted: true,
     };
     Ok(emit_success(schema_ok(), payload, format, render_text))
+}
+
+fn load_pending_snapshot<R: BackendRunner, F: Fn(&str) -> Option<String>>(
+    runner: &R,
+    global: &GlobalFlags,
+    number: u64,
+    review_id: &str,
+    remote_url_lookup: &F,
+) -> Result<
+    (
+        ProviderContext,
+        pr_view::PrViewPayload,
+        pr_reviews::PendingReviewSnapshot,
+    ),
+    ForgeError,
+> {
+    let (ctx, view, snapshot) =
+        load_pending_snapshot_optional(runner, global, number, review_id, remote_url_lookup)?;
+    let snapshot = snapshot.ok_or_else(|| pending_not_found(number, review_id))?;
+    Ok((ctx, view, snapshot))
+}
+
+fn load_pending_snapshot_optional<R: BackendRunner, F: Fn(&str) -> Option<String>>(
+    runner: &R,
+    global: &GlobalFlags,
+    number: u64,
+    review_id: &str,
+    remote_url_lookup: &F,
+) -> Result<
+    (
+        ProviderContext,
+        pr_view::PrViewPayload,
+        Option<pr_reviews::PendingReviewSnapshot>,
+    ),
+    ForgeError,
+> {
+    let ctx = detect(
+        global.provider_hint(),
+        &global.remote,
+        global.repo.as_deref(),
+        remote_url_lookup,
+    )?;
+    ensure_github(&ctx)?;
+    if global.dry_run {
+        return Err(ForgeError::validation(
+            schema_err(),
+            "pending_review_snapshot_required",
+            "pending-review recovery dry-run requires a live inspect snapshot; run pr pending-review inspect first",
+            Some(format!("pr={number}; review_id={review_id}")),
+        ));
+    }
+    let view_output = runner.run(&pr_view::build_view_call(&ctx, &number.to_string()))?;
+    let view = pr_view::parse_view_output(&ctx, &view_output)?;
+    let snapshot = pr_reviews::compute_pending_snapshot(runner, &ctx, review_id)?;
+    if let Some(snapshot) = snapshot.as_ref()
+        && (snapshot.number != view.number
+            || snapshot.pr_url != view.url
+            || snapshot.review_id != review_id)
+    {
+        return Err(ForgeError::validation(
+            schema_err(),
+            "pending_review_pr_mismatch",
+            "the pending review target does not belong to the named pull request",
+            Some(format!(
+                "expected_pr={}; provider_pr={}; review_id={review_id}",
+                view.number, snapshot.number
+            )),
+        ));
+    }
+    Ok((ctx, view, snapshot))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_already_submitted<R: BackendRunner>(
+    runner: &R,
+    ctx: &ProviderContext,
+    view: pr_view::PrViewPayload,
+    review_id: &str,
+    review_run_id: &str,
+    expected_head: &str,
+    expected_commit: &str,
+    expected_snapshot: &str,
+    decision: PrReviewDecision,
+    format: OutputFormat,
+) -> Result<i32, ForgeError> {
+    let reviews = pr_reviews::compute_for_pr(runner, ctx, view.number, &view.url)?;
+    if reviews.head_sha != expected_head {
+        return Err(expected_mismatch(
+            "pending_review_head_changed",
+            "the pull-request head changed before pending-review recovery",
+            format!(
+                "expected_head={expected_head}; provider_head={}",
+                reviews.head_sha
+            ),
+        ));
+    }
+    let mut matches = reviews
+        .current_head_reviews
+        .iter()
+        .chain(reviews.stale_reviews.iter())
+        .filter(|review| {
+            crate::ops::review_state::parse_review_run_id(&review.summary).as_deref()
+                == Some(review_run_id)
+        });
+    let submitted = matches
+        .next()
+        .ok_or_else(|| pending_not_found(view.number, review_id))?;
+    if matches.next().is_some() {
+        return Err(ForgeError::validation(
+            schema_err(),
+            "review_state_conflict",
+            "multiple submitted reviews claim the same review-run id",
+            Some(format!("review_run_id={review_run_id}")),
+        ));
+    }
+    let expected_state = match decision {
+        PrReviewDecision::CommentsOnly => "COMMENTED",
+        PrReviewDecision::Approve => "APPROVED",
+        PrReviewDecision::RequestChanges => "CHANGES_REQUESTED",
+    };
+    if submitted.id != review_id
+        || submitted.commit_sha != expected_commit
+        || submitted.state != expected_state
+    {
+        return Err(expected_mismatch(
+            "pending_review_manifest_mismatch",
+            "the submitted review does not match the requested recovery transaction",
+            format!(
+                "expected_review={review_id}; provider_review={}; expected_commit={expected_commit}; provider_commit={}; expected_state={expected_state}; provider_state={}",
+                submitted.id, submitted.commit_sha, submitted.state
+            ),
+        ));
+    }
+    validate_review_run_receipt(runner, ctx, &view, review_run_id, expected_head, decision)?;
+    let payload = PrPendingReviewSubmitPayload {
+        provider: ctx.provider.as_str(),
+        number: view.number,
+        url: view.url,
+        review_id: submitted.id.clone(),
+        review_url: submitted.url.clone(),
+        head_sha: reviews.head_sha,
+        commit_sha: submitted.commit_sha.clone(),
+        snapshot_digest: expected_snapshot.to_string(),
+        review_run_id: Some(review_run_id.to_string()),
+        submitted: true,
+    };
+    Ok(emit_success(
+        schema_version_for(BINARY, "pr.pending-review.resume-submit", 1),
+        payload,
+        format,
+        |payload| {
+            println!(
+                "pending review {review} was already submitted on #{number}\n  {url}",
+                review = payload.review_id,
+                number = payload.number,
+                url = payload.review_url
+            );
+        },
+    ))
+}
+
+fn validate_review_run_receipt<R: BackendRunner>(
+    runner: &R,
+    ctx: &ProviderContext,
+    view: &pr_view::PrViewPayload,
+    review_run_id: &str,
+    expected_head: &str,
+    decision: PrReviewDecision,
+) -> Result<(), ForgeError> {
+    let repository =
+        crate::ops::pr_comments::github_repo_slug_from_url(&view.url).ok_or_else(|| {
+            ForgeError::software(
+                schema_err(),
+                "unable to derive GitHub owner/repo from PR url",
+                Some(format!("url={}", view.url)),
+            )
+        })?;
+    let chain = pr_review::read_review_state_chain(runner, ctx, &repository, view.number)?;
+    let receipts = chain
+        .records
+        .iter()
+        .filter_map(|record| match &record.payload {
+            crate::ops::review_state::ReviewStatePayload::ReviewRunReceipt { receipt }
+                if receipt.review_run_id == review_run_id =>
+            {
+                Some(receipt)
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    if receipts.len() != 1 {
+        return Err(ForgeError::validation(
+            schema_err(),
+            "review_state_conflict",
+            "the review does not have exactly one immutable review-run receipt",
+            Some(format!(
+                "review_run_id={review_run_id}; receipt_count={}",
+                receipts.len()
+            )),
+        ));
+    }
+    let receipt = receipts[0];
+    if receipt.expected_head != expected_head || receipt.decision != decision.as_str() {
+        return Err(expected_mismatch(
+            "pending_review_manifest_mismatch",
+            "the review receipt differs from the requested recovery transaction",
+            format!(
+                "expected_head={expected_head}; receipt_head={}; expected_decision={}; receipt_decision={}",
+                receipt.expected_head,
+                decision.as_str(),
+                receipt.decision
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_snapshot_cas(
+    snapshot: &pr_reviews::PendingReviewSnapshot,
+    expected_head: &str,
+    expected_commit: &str,
+    expected_snapshot: &str,
+) -> Result<(), ForgeError> {
+    if snapshot.head_sha != expected_head {
+        return Err(expected_mismatch(
+            "pending_review_head_changed",
+            "the pull-request head changed before pending-review recovery",
+            format!(
+                "expected_head={expected_head}; provider_head={}",
+                snapshot.head_sha
+            ),
+        ));
+    }
+    if snapshot.commit_sha.as_deref() != Some(expected_commit) {
+        return Err(expected_mismatch(
+            "pending_review_commit_mismatch",
+            "the pending review is bound to a different commit",
+            format!(
+                "expected_commit={expected_commit}; provider_commit={}",
+                snapshot.commit_sha.as_deref().unwrap_or("<missing>")
+            ),
+        ));
+    }
+    if snapshot.snapshot_digest != expected_snapshot {
+        return Err(expected_mismatch(
+            "pending_review_manifest_mismatch",
+            "the pending review snapshot changed before recovery",
+            format!(
+                "expected_snapshot={expected_snapshot}; provider_snapshot={}",
+                snapshot.snapshot_digest
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn submit_snapshot<R: BackendRunner>(
+    runner: &R,
+    ctx: &ProviderContext,
+    view: pr_view::PrViewPayload,
+    snapshot: pr_reviews::PendingReviewSnapshot,
+    decision: PrReviewDecision,
+    schema: &str,
+    format: OutputFormat,
+) -> Result<i32, ForgeError> {
+    if !snapshot.viewer_did_author {
+        return Err(ForgeError::validation(
+            schema_err(),
+            "pending_review_identity_mismatch",
+            "the invoking GitHub identity is not the pending review author",
+            Some(format!(
+                "review_id={}; review_author={}",
+                snapshot.review_id, snapshot.author
+            )),
+        ));
+    }
+    let output = runner.run(&pr_review::build_github_submit_review_call(
+        ctx,
+        &snapshot.review_id,
+        decision.to_github_event(),
+        Some(snapshot.body.as_str()),
+    ))?;
+    let review_url = pr_review::parse_submitted_review_url(&output)
+        .unwrap_or_else(|| snapshot.review_url.clone());
+    let commit_sha = snapshot.commit_sha.clone().expect("CAS checked commit");
+    Ok(emit_success(
+        schema_version_for(BINARY, schema, 1),
+        PrPendingReviewSubmitPayload {
+            provider: ctx.provider.as_str(),
+            number: view.number,
+            url: view.url,
+            review_id: snapshot.review_id,
+            review_url,
+            head_sha: snapshot.head_sha,
+            commit_sha,
+            snapshot_digest: snapshot.snapshot_digest,
+            review_run_id: snapshot.review_run_id,
+            submitted: true,
+        },
+        format,
+        |payload| {
+            println!(
+                "submitted pending review {review} on #{number}\n  {url}",
+                review = payload.review_id,
+                number = payload.number,
+                url = payload.review_url
+            );
+        },
+    ))
 }
 
 fn validate_pending_guard(
@@ -267,7 +857,7 @@ fn ensure_github(ctx: &ProviderContext) -> Result<(), ForgeError> {
     Err(ForgeError::provider_unsupported(
         schema_err(),
         format!(
-            "pr pending-review delete is GitHub-only in v1 (provider: {})",
+            "pr pending-review recovery is GitHub-only in v1 (provider: {})",
             ctx.provider.as_str()
         ),
         None,

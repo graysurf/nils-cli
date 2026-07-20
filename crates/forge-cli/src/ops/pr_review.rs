@@ -21,7 +21,7 @@ use crate::cli::{
 };
 use crate::envelope::emit_success;
 use crate::error::ForgeError;
-use crate::ops::{pr_comment, pr_review_threads, pr_reviews};
+use crate::ops::{pr_comment, pr_comments, pr_review_threads, pr_reviews, review_state};
 use crate::provider::{Provider, ProviderContext, detect, git_remote_url};
 use crate::rate_limit::default_runner;
 use crate::validations::{no_escaped_control_markdown, no_local_path};
@@ -41,7 +41,7 @@ const REVIEW_THREAD_BODY_MAX_BYTES: usize = 16 * 1024;
 const MIRROR_URL_PENDING: &str = "<pending>";
 
 const GITHUB_REVIEW_TARGET_QUERY: &str = "query($owner: String!, $name: String!, $number: Int!) { repository(owner: $owner, name: $name) { pullRequest(number: $number) { id url } } }";
-const GITHUB_ADD_PENDING_REVIEW_MUTATION: &str = "mutation($pullRequestId: ID!, $commitOID: GitObjectID!) { addPullRequestReview(input: {pullRequestId: $pullRequestId, commitOID: $commitOID}) { pullRequestReview { id url } } }";
+const GITHUB_ADD_PENDING_REVIEW_MUTATION: &str = "mutation($pullRequestId: ID!, $commitOID: GitObjectID!, $body: String) { addPullRequestReview(input: {pullRequestId: $pullRequestId, commitOID: $commitOID, body: $body}) { pullRequestReview { id url } } }";
 const GITHUB_ADD_REVIEW_THREAD_MUTATION: &str = "mutation($reviewId: ID!, $path: String!, $body: String!, $line: Int, $side: DiffSide!, $startLine: Int, $startSide: DiffSide, $subjectType: PullRequestReviewThreadSubjectType!) { addPullRequestReviewThread(input: {pullRequestReviewId: $reviewId, path: $path, body: $body, line: $line, side: $side, startLine: $startLine, startSide: $startSide, subjectType: $subjectType}) { thread { id path line subjectType comments(first: 1) { nodes { url } } } } }";
 const GITHUB_SUBMIT_REVIEW_MUTATION: &str = "mutation($reviewId: ID!, $event: PullRequestReviewEvent!, $body: String) { submitPullRequestReview(input: {pullRequestReviewId: $reviewId, event: $event, body: $body}) { pullRequestReview { url } } }";
 const GITHUB_DELETE_PENDING_REVIEW_MUTATION: &str = "mutation($reviewId: ID!) { deletePullRequestReview(input: {pullRequestReviewId: $reviewId}) { pullRequestReview { id url } } }";
@@ -429,6 +429,7 @@ pub fn run_with<R: BackendRunner, F: Fn(&str) -> Option<String>>(
                     &ctx,
                     "<pull-request-id>",
                     expected_review_head.expect("validated native review head"),
+                    body_present.then_some(body.as_str()),
                 ),
                 Some(build_github_review_target_call(&ctx, owner, name, id).plan_argv()),
                 Some(
@@ -536,7 +537,7 @@ pub fn run_with<R: BackendRunner, F: Fn(&str) -> Option<String>>(
     // is GitHub-only.
     if ctx.provider == Provider::GitHub {
         ensure_github_pull_request(runner, &ctx, id)?;
-        if args.submit_review {
+        if args.submit_review && thread_specs.is_empty() {
             ensure_no_viewer_pending_github_review(
                 runner,
                 &ctx,
@@ -579,11 +580,14 @@ pub fn run_with<R: BackendRunner, F: Fn(&str) -> Option<String>>(
             let submission = submit_github_review_with_threads(
                 runner,
                 &ctx,
-                id,
-                args.decision,
-                expected_review_head.expect("validated native review head"),
-                body_present.then_some(body.as_str()),
-                &thread_specs,
+                GithubReviewThreadSubmissionRequest {
+                    number: id,
+                    decision: args.decision,
+                    expected_head: expected_review_head.expect("validated native review head"),
+                    body: body_present.then_some(body.as_str()),
+                    specs: &thread_specs,
+                    route_lenses: &args.lenses,
+                },
             )?;
             let review_skipped_idempotent = submission.review_url.is_none();
             (
@@ -1228,15 +1232,28 @@ struct GithubReviewSubmission {
     skipped: usize,
 }
 
+struct GithubReviewThreadSubmissionRequest<'a> {
+    number: u64,
+    decision: PrReviewDecision,
+    expected_head: &'a str,
+    body: Option<&'a str>,
+    specs: &'a [PreparedReviewThreadSpec],
+    route_lenses: &'a [String],
+}
+
 fn submit_github_review_with_threads<R: BackendRunner>(
     runner: &R,
     ctx: &ProviderContext,
-    number: u64,
-    decision: PrReviewDecision,
-    expected_head: &str,
-    body: Option<&str>,
-    specs: &[PreparedReviewThreadSpec],
+    request: GithubReviewThreadSubmissionRequest<'_>,
 ) -> Result<GithubReviewSubmission, ForgeError> {
+    let GithubReviewThreadSubmissionRequest {
+        number,
+        decision,
+        expected_head,
+        body,
+        specs,
+        route_lenses,
+    } = request;
     let (owner, name) = github_owner_name(ctx)?;
     let target_output = runner.run(&build_github_review_target_call(ctx, owner, name, number))?;
     let target = parse_github_review_target(&target_output)?;
@@ -1271,15 +1288,145 @@ fn submit_github_review_with_threads<R: BackendRunner>(
         });
     }
 
-    let pending_output = runner.run(&build_github_pending_review_call(
-        ctx,
-        &target.pull_request_id,
+    let repository = format!("{owner}/{name}");
+    let summary = review_state::strip_owned_markers(body.unwrap_or(""));
+    let summary_digest = review_state::sha256_digest(summary.as_bytes());
+    let manifest = to_post
+        .iter()
+        .copied()
+        .enumerate()
+        .map(|(index, spec)| review_manifest_item(index, spec))
+        .collect::<Vec<_>>();
+    let review_run_id = review_state::compute_review_run_id(
+        &repository,
+        number,
         expected_head,
-    ))?;
-    let pending = parse_github_pending_review(&pending_output)?;
+        0,
+        route_lenses,
+        decision.as_str(),
+        &summary_digest,
+        &manifest,
+    )?;
+    let receipt = review_state::ReviewRunReceipt {
+        review_run_id: review_run_id.clone(),
+        route_lenses: route_lenses.to_vec(),
+        decision: decision.as_str().to_string(),
+        expected_head: expected_head.to_string(),
+        round: 0,
+        summary_digest,
+        inline_manifest: manifest.clone(),
+    };
+    if let Some(review_url) =
+        find_submitted_review_run(runner, ctx, number, &target.url, &review_run_id)?
+    {
+        let chain = read_review_state_chain(runner, ctx, &repository, number)?;
+        if !receipt_is_recorded(&chain, &receipt)? {
+            return Err(ForgeError::validation(
+                schema_err(),
+                "review_state_conflict",
+                "a submitted review marker has no immutable review-run receipt",
+                Some(format!("review_run_id={review_run_id}")),
+            ));
+        }
+        return Ok(GithubReviewSubmission {
+            review_url: Some(review_url),
+            created: Vec::new(),
+            skipped,
+        });
+    }
 
-    let mut review_threads = Vec::with_capacity(to_post.len());
-    for (idx, spec) in to_post.iter().copied().enumerate() {
+    let marked_body = marked_review_body(&summary, &review_run_id);
+    let marked_specs = to_post
+        .iter()
+        .copied()
+        .enumerate()
+        .map(|(index, spec)| marked_review_thread_spec(spec, &review_run_id, &manifest[index]))
+        .collect::<Vec<_>>();
+    let guards = pr_reviews::compute_pending_guards_for_pr(runner, ctx, number, &target.url)?;
+    if guards.head_sha != expected_head {
+        return Err(ForgeError::validation(
+            schema_err(),
+            "pending_review_head_changed",
+            "the pull-request head changed before pending-review recovery",
+            Some(format!(
+                "expected_head={expected_head}; provider_head={}",
+                guards.head_sha
+            )),
+        ));
+    }
+    let viewer_pending = guards
+        .reviews
+        .iter()
+        .filter(|pending| pending.viewer_did_author)
+        .collect::<Vec<_>>();
+    if viewer_pending.len() > 1 {
+        return Err(ForgeError::validation(
+            schema_err(),
+            "pending_review_ambiguous",
+            "multiple viewer-owned pending reviews prevent automatic recovery",
+            Some(format!(
+                "pr={number}; pending_review_count={}",
+                viewer_pending.len()
+            )),
+        ));
+    }
+
+    let (pending, existing_count) = if let Some(existing) = viewer_pending.first() {
+        let snapshot = pr_reviews::compute_pending_snapshot(runner, ctx, &existing.id)?
+            .ok_or_else(|| {
+                pending_transaction_incomplete(
+                    &review_run_id,
+                    Some(existing.id.as_str()),
+                    "the pending review disappeared before recovery",
+                    None,
+                )
+            })?;
+        validate_receipt_bound_snapshot(
+            &snapshot,
+            number,
+            expected_head,
+            &summary,
+            &review_run_id,
+            &manifest,
+        )?;
+        ensure_review_run_receipt(runner, ctx, &repository, number, &receipt)?;
+        (
+            GitHubPendingReview {
+                review_id: snapshot.review_id,
+                url: snapshot.review_url,
+            },
+            snapshot.inline_comments.len(),
+        )
+    } else {
+        ensure_review_run_receipt(runner, ctx, &repository, number, &receipt)?;
+        let pending_output = runner
+            .run(&build_github_pending_review_call(
+                ctx,
+                &target.pull_request_id,
+                expected_head,
+                Some(&marked_body),
+            ))
+            .map_err(|error| {
+                pending_transaction_incomplete(
+                    &review_run_id,
+                    None,
+                    "pending review creation did not return a confirmed result",
+                    Some(error),
+                )
+            })?;
+        let pending = parse_github_pending_review(&pending_output).map_err(|error| {
+            pending_transaction_incomplete(
+                &review_run_id,
+                None,
+                "pending review creation response was incomplete",
+                Some(error),
+            )
+        })?;
+        (pending, 0)
+    };
+
+    let mut review_threads = Vec::with_capacity(marked_specs.len() - existing_count);
+    for (idx, spec) in marked_specs.iter().enumerate().skip(existing_count) {
         let output = match runner.run(&build_github_add_review_thread_call(
             ctx,
             &pending.review_id,
@@ -1288,26 +1435,87 @@ fn submit_github_review_with_threads<R: BackendRunner>(
             Ok(output) => output,
             Err(err) => {
                 let err = map_github_review_thread_error(idx + 1, spec, err);
-                return Err(cleanup_pending_github_review(runner, ctx, &pending, err));
+                return Err(pending_transaction_incomplete(
+                    &review_run_id,
+                    Some(&pending.review_id),
+                    "pending review retained after inline comment mutation failed",
+                    Some(err),
+                ));
             }
         };
         let thread = match parse_created_review_thread(&output, spec) {
             Ok(thread) => thread,
-            Err(err) => return Err(cleanup_pending_github_review(runner, ctx, &pending, err)),
+            Err(err) => {
+                return Err(pending_transaction_incomplete(
+                    &review_run_id,
+                    Some(&pending.review_id),
+                    "pending review retained because inline comment creation was not confirmed",
+                    Some(err),
+                ));
+            }
         };
         review_threads.push(thread);
+    }
+
+    let final_snapshot = pr_reviews::compute_pending_snapshot(runner, ctx, &pending.review_id)?
+        .ok_or_else(|| {
+            pending_transaction_incomplete(
+                &review_run_id,
+                Some(&pending.review_id),
+                "pending review disappeared before final submit",
+                None,
+            )
+        })?;
+    validate_receipt_bound_snapshot(
+        &final_snapshot,
+        number,
+        expected_head,
+        &summary,
+        &review_run_id,
+        &manifest,
+    )?;
+    if final_snapshot.inline_comments.len() != manifest.len() {
+        return Err(pending_transaction_incomplete(
+            &review_run_id,
+            Some(&pending.review_id),
+            "pending review manifest is not complete",
+            Some(ForgeError::validation(
+                schema_err(),
+                "pending_review_manifest_mismatch",
+                "the pending review is missing one or more receipt-bound inline comments",
+                Some(format!(
+                    "expected_comments={}; observed_comments={}",
+                    manifest.len(),
+                    final_snapshot.inline_comments.len()
+                )),
+            )),
+        ));
     }
 
     let submit_output = match runner.run(&build_github_submit_review_call(
         ctx,
         &pending.review_id,
         decision.to_github_event(),
-        body,
+        Some(&marked_body),
     )) {
         Ok(output) => output,
         Err(err) => {
             let err = map_github_native_review_submit_error(decision, err);
-            return Err(cleanup_pending_github_review(runner, ctx, &pending, err));
+            if let Some(review_url) =
+                find_submitted_review_run(runner, ctx, number, &target.url, &review_run_id)?
+            {
+                return Ok(GithubReviewSubmission {
+                    review_url: Some(review_url),
+                    created: review_threads,
+                    skipped,
+                });
+            }
+            return Err(pending_transaction_incomplete(
+                &review_run_id,
+                Some(&pending.review_id),
+                "pending review submit result is unknown; content was preserved",
+                Some(err),
+            ));
         }
     };
     let review_url = parse_submitted_review_url(&submit_output).unwrap_or(pending.url);
@@ -1316,6 +1524,288 @@ fn submit_github_review_with_threads<R: BackendRunner>(
         created: review_threads,
         skipped,
     })
+}
+
+fn review_manifest_item(
+    index: usize,
+    spec: &PreparedReviewThreadSpec,
+) -> review_state::ReviewCommentManifestItem {
+    review_state::ReviewCommentManifestItem {
+        index,
+        path: spec.path.clone(),
+        line: spec.line,
+        side: spec.side.as_str().to_string(),
+        start_line: spec.start_line,
+        start_side: spec.start_side.map(|side| side.as_str().to_string()),
+        subject_type: spec.subject_type.as_str().to_string(),
+        body_digest: review_state::sha256_digest(
+            review_state::strip_owned_markers(&spec.body).as_bytes(),
+        ),
+    }
+}
+
+fn marked_review_body(body: &str, review_run_id: &str) -> String {
+    let marker = review_state::review_run_marker(review_run_id);
+    if body.is_empty() {
+        marker
+    } else {
+        format!("{marker}\n{body}")
+    }
+}
+
+fn marked_review_thread_spec(
+    spec: &PreparedReviewThreadSpec,
+    review_run_id: &str,
+    manifest: &review_state::ReviewCommentManifestItem,
+) -> PreparedReviewThreadSpec {
+    let mut marked = spec.clone();
+    marked.body = format!(
+        "{}\n{}",
+        review_state::finding_marker(review_run_id, &manifest.body_digest),
+        review_state::strip_owned_markers(&spec.body)
+    );
+    marked
+}
+
+fn validate_receipt_bound_snapshot(
+    snapshot: &pr_reviews::PendingReviewSnapshot,
+    number: u64,
+    expected_head: &str,
+    expected_summary: &str,
+    review_run_id: &str,
+    manifest: &[review_state::ReviewCommentManifestItem],
+) -> Result<(), ForgeError> {
+    if snapshot.number != number
+        || snapshot.head_sha != expected_head
+        || snapshot.commit_sha.as_deref() != Some(expected_head)
+    {
+        return Err(ForgeError::validation(
+            schema_err(),
+            "pending_review_head_changed",
+            "the pending review no longer matches the receipt-bound pull-request head",
+            Some(format!(
+                "expected_pr={number}; provider_pr={}; expected_head={expected_head}; provider_head={}; provider_commit={}",
+                snapshot.number,
+                snapshot.head_sha,
+                snapshot.commit_sha.as_deref().unwrap_or("<missing>")
+            )),
+        ));
+    }
+    if !snapshot.viewer_did_author {
+        return Err(ForgeError::validation(
+            schema_err(),
+            "pending_review_identity_mismatch",
+            "the invoking GitHub identity is not the receipt-bound pending review author",
+            Some(format!("review_id={}", snapshot.review_id)),
+        ));
+    }
+    if snapshot.provenance != "receipt-bound"
+        || snapshot.review_run_id.as_deref() != Some(review_run_id)
+        || snapshot.semantic_body != expected_summary
+    {
+        return Err(ForgeError::validation(
+            schema_err(),
+            "pending_review_manifest_mismatch",
+            "the pending review body or provenance differs from the immutable receipt",
+            Some(format!(
+                "review_id={}; expected_run={review_run_id}; observed_run={}; provenance={}",
+                snapshot.review_id,
+                snapshot.review_run_id.as_deref().unwrap_or("<unmarked>"),
+                snapshot.provenance
+            )),
+        ));
+    }
+    if snapshot.inline_comments.len() > manifest.len() {
+        return Err(ForgeError::validation(
+            schema_err(),
+            "pending_review_manifest_mismatch",
+            "the pending review contains more inline comments than the immutable receipt",
+            Some(format!(
+                "review_id={}; expected_comments={}; observed_comments={}",
+                snapshot.review_id,
+                manifest.len(),
+                snapshot.inline_comments.len()
+            )),
+        ));
+    }
+    for (comment, expected) in snapshot.inline_comments.iter().zip(manifest) {
+        if comment.review_run_id.as_deref() != Some(review_run_id)
+            || comment.path != expected.path
+            || comment.line != expected.line
+            || comment.start_line != expected.start_line
+            || comment.subject_type != expected.subject_type
+            || comment.body_digest != expected.body_digest
+        {
+            return Err(ForgeError::validation(
+                schema_err(),
+                "pending_review_manifest_mismatch",
+                "an existing inline comment differs from the immutable receipt",
+                Some(format!(
+                    "review_id={}; comment_id={}; manifest_index={}",
+                    snapshot.review_id, comment.id, expected.index
+                )),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn pending_transaction_incomplete(
+    review_run_id: &str,
+    pending_review_id: Option<&str>,
+    message: &str,
+    cause: Option<ForgeError>,
+) -> ForgeError {
+    let mut detail = vec![
+        format!("review_run_id={review_run_id}"),
+        format!(
+            "pending_review_id={}",
+            pending_review_id.unwrap_or("<unknown>")
+        ),
+        "recovery=rerun the identical pr review command or inspect the pending review".to_string(),
+    ];
+    if let Some(cause) = cause {
+        detail.push(format!("cause_kind={}", cause.kind()));
+        detail.push(format!("cause_message={}", cause.message()));
+        if let Some(cause_detail) = cause.detail().filter(|value| !value.is_empty()) {
+            detail.push(format!("cause_detail={cause_detail}"));
+        }
+    }
+    ForgeError::validation(
+        schema_err(),
+        "pending_review_transaction_incomplete",
+        message,
+        Some(detail.join("; ")),
+    )
+}
+
+fn ensure_review_run_receipt<R: BackendRunner>(
+    runner: &R,
+    ctx: &ProviderContext,
+    repository: &str,
+    number: u64,
+    receipt: &review_state::ReviewRunReceipt,
+) -> Result<(), ForgeError> {
+    let chain = read_review_state_chain(runner, ctx, repository, number)?;
+    if receipt_is_recorded(&chain, receipt)? {
+        return Ok(());
+    }
+    let record = review_state::ReviewStateRecord::new(
+        repository,
+        number,
+        &receipt.expected_head,
+        chain.records.len() as u64,
+        chain.tip_digest,
+        review_state::ReviewStatePayload::ReviewRunReceipt {
+            receipt: receipt.clone(),
+        },
+    )?;
+    let marker = record.marker()?;
+    let append_result = runner.run(&build_issue_comment_call(ctx, number, &marker));
+    let observed = read_review_state_chain(runner, ctx, repository, number)?;
+    if receipt_is_recorded(&observed, receipt)? {
+        return Ok(());
+    }
+    Err(match append_result {
+        Ok(_) => ForgeError::validation(
+            schema_err(),
+            "review_state_conflict",
+            "the review-run receipt was not visible after provider write",
+            Some(format!(
+                "review_run_id={}; record_digest={}",
+                receipt.review_run_id, record.record_digest
+            )),
+        ),
+        Err(error) => error,
+    })
+}
+
+fn receipt_is_recorded(
+    chain: &review_state::ReviewStateChain,
+    expected: &review_state::ReviewRunReceipt,
+) -> Result<bool, ForgeError> {
+    let mut found = false;
+    for record in &chain.records {
+        let review_state::ReviewStatePayload::ReviewRunReceipt { receipt } = &record.payload else {
+            continue;
+        };
+        if receipt.review_run_id != expected.review_run_id {
+            continue;
+        }
+        if receipt != expected {
+            return Err(ForgeError::validation(
+                schema_err(),
+                "review_state_conflict",
+                "a review-run id is bound to different immutable receipt content",
+                Some(format!("review_run_id={}", expected.review_run_id)),
+            ));
+        }
+        found = true;
+    }
+    Ok(found)
+}
+
+pub(crate) fn read_review_state_chain<R: BackendRunner>(
+    runner: &R,
+    ctx: &ProviderContext,
+    repository: &str,
+    number: u64,
+) -> Result<review_state::ReviewStateChain, ForgeError> {
+    let output = runner.run(&build_github_review_state_comments_call(
+        ctx, repository, number,
+    ))?;
+    let chunks = pr_comments::split_concatenated_arrays(&output.stdout)?;
+    let mut bodies = Vec::new();
+    for chunk in chunks {
+        let items = chunk.as_array().cloned().unwrap_or_else(|| vec![chunk]);
+        for item in items {
+            if let Some(body) = item.get("body").and_then(|value| value.as_str()) {
+                bodies.push(body.to_string());
+            }
+        }
+    }
+    review_state::parse_chain(bodies.iter().map(String::as_str), repository, number)
+}
+
+fn build_github_review_state_comments_call(
+    ctx: &ProviderContext,
+    repository: &str,
+    number: u64,
+) -> BackendCall {
+    let mut argv = vec![OsString::from("api")];
+    ctx.push_github_api_hostname(&mut argv);
+    argv.push(OsString::from(format!(
+        "repos/{repository}/issues/{number}/comments?per_page=100"
+    )));
+    argv.push(OsString::from("--paginate"));
+    BackendCall::new(BackendProgram::Gh, argv).with_host(Provider::GitHub, &ctx.host)
+}
+
+fn find_submitted_review_run<R: BackendRunner>(
+    runner: &R,
+    ctx: &ProviderContext,
+    number: u64,
+    pr_url: &str,
+    review_run_id: &str,
+) -> Result<Option<String>, ForgeError> {
+    let reviews = pr_reviews::compute_for_pr(runner, ctx, number, pr_url)?;
+    let mut matches = reviews
+        .current_head_reviews
+        .iter()
+        .chain(reviews.stale_reviews.iter())
+        .filter(|review| {
+            review_state::parse_review_run_id(&review.summary).as_deref() == Some(review_run_id)
+        });
+    let found = matches.next().map(|review| review.url.clone());
+    if matches.next().is_some() {
+        return Err(ForgeError::validation(
+            schema_err(),
+            "review_state_conflict",
+            "multiple submitted reviews claim the same review-run id",
+            Some(format!("review_run_id={review_run_id}")),
+        ));
+    }
+    Ok(found)
 }
 
 fn map_github_review_thread_error(
@@ -1446,6 +1936,7 @@ fn build_github_pending_review_call(
     ctx: &ProviderContext,
     pull_request_id: &str,
     expected_head: &str,
+    body: Option<&str>,
 ) -> BackendCall {
     let mut argv = vec![OsString::from("api"), OsString::from("graphql")];
     ctx.push_github_api_hostname(&mut argv);
@@ -1457,6 +1948,9 @@ fn build_github_pending_review_call(
         OsString::from("-f"),
         OsString::from(format!("commitOID={expected_head}")),
     ]);
+    if let Some(body) = body {
+        argv.extend([OsString::from("-f"), OsString::from(format!("body={body}"))]);
+    }
     BackendCall::new(BackendProgram::Gh, argv)
 }
 
@@ -1502,7 +1996,7 @@ fn build_github_add_review_thread_call(
     BackendCall::new(BackendProgram::Gh, argv)
 }
 
-fn build_github_submit_review_call(
+pub(crate) fn build_github_submit_review_call(
     ctx: &ProviderContext,
     review_id: &str,
     event: &str,
@@ -1537,79 +2031,6 @@ pub(crate) fn build_github_delete_pending_review_call(
         OsString::from(format!("reviewId={review_id}")),
     ]);
     BackendCall::new(BackendProgram::Gh, argv)
-}
-
-fn cleanup_pending_github_review<R: BackendRunner>(
-    runner: &R,
-    ctx: &ProviderContext,
-    pending: &GitHubPendingReview,
-    cause: ForgeError,
-) -> ForgeError {
-    match runner.run(&build_github_delete_pending_review_call(
-        ctx,
-        &pending.review_id,
-    )) {
-        Ok(_) => cause,
-        Err(cleanup_err) => with_cleanup_detail(cause, pending, cleanup_err),
-    }
-}
-
-fn with_cleanup_detail(
-    cause: ForgeError,
-    pending: &GitHubPendingReview,
-    cleanup_err: ForgeError,
-) -> ForgeError {
-    let cleanup_detail = format!(
-        "pending_review_id={id}; pending_review_url={url}; cleanup_error_kind={cleanup_kind}; cleanup_error_message={cleanup_message}; cleanup_error_detail={cleanup_detail}",
-        id = pending.review_id,
-        url = pending.url,
-        cleanup_kind = cleanup_err.kind(),
-        cleanup_message = cleanup_err.message(),
-        cleanup_detail = cleanup_err.detail().unwrap_or(""),
-    );
-    let merged_detail = match cause.detail() {
-        Some(detail) if !detail.is_empty() => format!("{detail}; {cleanup_detail}"),
-        _ => cleanup_detail,
-    };
-    match cause {
-        ForgeError::NotImplemented {
-            schema_version,
-            message,
-        } => ForgeError::not_implemented(schema_version, message),
-        ForgeError::BackendUnavailable {
-            schema_version,
-            kind,
-            message,
-            ..
-        } => ForgeError::unavailable(schema_version, kind, message, Some(merged_detail)),
-        ForgeError::BackendError {
-            schema_version,
-            message,
-            ..
-        } => ForgeError::backend_error(schema_version, message, Some(merged_detail)),
-        ForgeError::ProviderUnsupported {
-            schema_version,
-            message,
-            ..
-        } => ForgeError::provider_unsupported(schema_version, message, Some(merged_detail)),
-        ForgeError::SoftwareError {
-            schema_version,
-            message,
-            ..
-        } => ForgeError::software(schema_version, message, Some(merged_detail)),
-        ForgeError::Validation {
-            schema_version,
-            kind,
-            message,
-            ..
-        } => ForgeError::validation(schema_version, kind, message, Some(merged_detail)),
-        ForgeError::RuntimeFailure {
-            schema_version,
-            kind,
-            message,
-            ..
-        } => ForgeError::runtime_failure(schema_version, kind, message, Some(merged_detail)),
-    }
 }
 
 fn parse_github_review_target(
@@ -1657,7 +2078,9 @@ fn parse_created_review_thread(
     })
 }
 
-fn parse_submitted_review_url(output: &crate::backend::BackendSuccess) -> Option<String> {
+pub(crate) fn parse_submitted_review_url(
+    output: &crate::backend::BackendSuccess,
+) -> Option<String> {
     let value: serde_json::Value = serde_json::from_str(output.stdout.trim()).ok()?;
     optional_pointer_str(
         &value,

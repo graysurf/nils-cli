@@ -736,8 +736,74 @@ pub struct PrPendingReviewArgs {
 /// Authenticated recovery actions for provider-valid pending reviews.
 #[derive(Subcommand, Debug, Clone)]
 pub enum PrPendingReviewCommand {
+    /// Read one complete pending-review snapshot and immutable digest.
+    Inspect(PrPendingReviewInspectArgs),
+    /// Resume and submit an exact receipt-bound review transaction.
+    ResumeSubmit(PrPendingReviewResumeSubmitArgs),
+    /// Guardedly submit an unmarked pending review.
+    Submit(PrPendingReviewSubmitArgs),
+    /// Destructively discard one exact pending review.
+    Discard(PrPendingReviewDiscardArgs),
     /// Verify and delete one exact pending review node.
     Delete(PrPendingReviewDeleteArgs),
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct PrPendingReviewInspectArgs {
+    pub id: u64,
+    #[arg(long, value_name = "REVIEW_ID", value_parser = clap::builder::NonEmptyStringValueParser::new())]
+    pub review: String,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct PrPendingReviewResumeSubmitArgs {
+    pub id: u64,
+    #[arg(long, value_name = "REVIEW_ID", value_parser = clap::builder::NonEmptyStringValueParser::new())]
+    pub review: String,
+    #[arg(long = "review-run-id", value_name = "DIGEST", value_parser = clap::builder::NonEmptyStringValueParser::new())]
+    pub review_run_id: String,
+    #[arg(long = "expected-head", value_name = "SHA", value_parser = clap::builder::NonEmptyStringValueParser::new())]
+    pub expected_head: String,
+    #[arg(long = "expected-commit", value_name = "SHA", value_parser = clap::builder::NonEmptyStringValueParser::new())]
+    pub expected_commit: String,
+    #[arg(long = "expected-snapshot", value_name = "DIGEST", value_parser = clap::builder::NonEmptyStringValueParser::new())]
+    pub expected_snapshot: String,
+    #[arg(long, value_enum)]
+    pub decision: PrReviewDecision,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct PrPendingReviewSubmitArgs {
+    pub id: u64,
+    #[arg(long, value_name = "REVIEW_ID", value_parser = clap::builder::NonEmptyStringValueParser::new())]
+    pub review: String,
+    #[arg(long = "expected-head", value_name = "SHA", value_parser = clap::builder::NonEmptyStringValueParser::new())]
+    pub expected_head: String,
+    #[arg(long = "expected-commit", value_name = "SHA", value_parser = clap::builder::NonEmptyStringValueParser::new())]
+    pub expected_commit: String,
+    #[arg(long = "expected-snapshot", value_name = "DIGEST", value_parser = clap::builder::NonEmptyStringValueParser::new())]
+    pub expected_snapshot: String,
+    #[arg(long, value_enum)]
+    pub decision: PrReviewDecision,
+    #[arg(long = "confirm-unmarked-submit", action = ArgAction::SetTrue, required = true)]
+    pub confirm_unmarked_submit: bool,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct PrPendingReviewDiscardArgs {
+    pub id: u64,
+    #[arg(long, value_name = "REVIEW_ID", value_parser = clap::builder::NonEmptyStringValueParser::new())]
+    pub review: String,
+    #[arg(long = "expected-head", value_name = "SHA", value_parser = clap::builder::NonEmptyStringValueParser::new())]
+    pub expected_head: String,
+    #[arg(long = "expected-commit", value_name = "SHA", value_parser = clap::builder::NonEmptyStringValueParser::new())]
+    pub expected_commit: String,
+    #[arg(long = "expected-snapshot", value_name = "DIGEST", value_parser = clap::builder::NonEmptyStringValueParser::new())]
+    pub expected_snapshot: String,
+    #[arg(long = "confirm-discard", action = ArgAction::SetTrue, required = true)]
+    pub confirm_discard: bool,
+    #[arg(long = "confirm-inline-content-loss", action = ArgAction::SetTrue)]
+    pub confirm_inline_content_loss: bool,
 }
 
 /// `pr pending-review delete` arguments.
@@ -1628,6 +1694,18 @@ pub fn dispatch(args: Vec<OsString>) -> i32 {
         Some(Command::Pr(PrArgs {
             command: Some(PrCommand::PendingReview(args)),
         })) => match args.command {
+            PrPendingReviewCommand::Inspect(inspect_args) => {
+                ops::pr_pending_review::run_inspect(&global, inspect_args, format)
+            }
+            PrPendingReviewCommand::ResumeSubmit(resume_args) => {
+                ops::pr_pending_review::run_resume_submit(&global, resume_args, format)
+            }
+            PrPendingReviewCommand::Submit(submit_args) => {
+                ops::pr_pending_review::run_submit(&global, submit_args, format)
+            }
+            PrPendingReviewCommand::Discard(discard_args) => {
+                ops::pr_pending_review::run_discard(&global, discard_args, format)
+            }
             PrPendingReviewCommand::Delete(delete_args) => {
                 ops::pr_pending_review::run_delete(&global, delete_args, format)
             }
@@ -1877,7 +1955,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_legacy_json_boolean_flag() {
+    fn rejects_unmarked_json_boolean_flag() {
         let result = parse(&["--json", "repo", "view"]);
         assert!(result.is_err(), "--json must not be accepted");
     }
@@ -2112,6 +2190,108 @@ mod tests {
             }
             other => panic!("expected pending-review delete, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn pr_pending_review_recovery_subcommands_parse() {
+        let inspect = parse(&[
+            "pr",
+            "pending-review",
+            "inspect",
+            "7",
+            "--review",
+            "PRR_pending",
+        ])
+        .expect("pending-review inspect parses");
+        assert!(matches!(
+            inspect.command,
+            Some(Command::Pr(PrArgs {
+                command: Some(PrCommand::PendingReview(PrPendingReviewArgs {
+                    command: PrPendingReviewCommand::Inspect(_),
+                })),
+            }))
+        ));
+
+        let resume = parse(&[
+            "pr",
+            "pending-review",
+            "resume-submit",
+            "7",
+            "--review",
+            "PRR_pending",
+            "--review-run-id",
+            "run-1",
+            "--expected-head",
+            "head-1",
+            "--expected-commit",
+            "head-1",
+            "--expected-snapshot",
+            "sha256:snapshot",
+            "--decision",
+            "comments-only",
+        ])
+        .expect("pending-review resume-submit parses");
+        assert!(matches!(
+            resume.command,
+            Some(Command::Pr(PrArgs {
+                command: Some(PrCommand::PendingReview(PrPendingReviewArgs {
+                    command: PrPendingReviewCommand::ResumeSubmit(_),
+                })),
+            }))
+        ));
+
+        let submit = parse(&[
+            "pr",
+            "pending-review",
+            "submit",
+            "7",
+            "--review",
+            "PRR_pending",
+            "--expected-head",
+            "head-1",
+            "--expected-commit",
+            "head-1",
+            "--expected-snapshot",
+            "sha256:snapshot",
+            "--decision",
+            "comments-only",
+            "--confirm-unmarked-submit",
+        ])
+        .expect("pending-review submit parses");
+        assert!(matches!(
+            submit.command,
+            Some(Command::Pr(PrArgs {
+                command: Some(PrCommand::PendingReview(PrPendingReviewArgs {
+                    command: PrPendingReviewCommand::Submit(_),
+                })),
+            }))
+        ));
+
+        let discard = parse(&[
+            "pr",
+            "pending-review",
+            "discard",
+            "7",
+            "--review",
+            "PRR_pending",
+            "--expected-head",
+            "head-1",
+            "--expected-commit",
+            "head-1",
+            "--expected-snapshot",
+            "sha256:snapshot",
+            "--confirm-discard",
+            "--confirm-inline-content-loss",
+        ])
+        .expect("pending-review discard parses");
+        assert!(matches!(
+            discard.command,
+            Some(Command::Pr(PrArgs {
+                command: Some(PrCommand::PendingReview(PrPendingReviewArgs {
+                    command: PrPendingReviewCommand::Discard(_),
+                })),
+            }))
+        ));
     }
 
     #[test]

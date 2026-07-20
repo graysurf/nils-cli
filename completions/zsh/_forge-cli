@@ -413,7 +413,90 @@ json\:"Single-record JSON envelope (snake_case)"))' \
         (( CURRENT += 1 ))
         curcontext="${curcontext%:*:*}:forge-cli-pr-pending-review-command-$line[1]:"
         case $line[1] in
-            (delete)
+            (inspect)
+_arguments "${_arguments_options[@]}" : \
+'--review=[]:REVIEW_ID:_default' \
+'--format=[Output format (defaults to text)]:FORMAT:((text\:"Human-readable text output (default)"
+json\:"Single-record JSON envelope (snake_case)"))' \
+'--remote=[Git remote whose URL feeds provider detection (default\: \`origin\`)]:REMOTE:_default' \
+'--provider=[Override auto-detected provider]:PROVIDER:(github gitlab local)' \
+'--host=[Override the forge authority (\`hostname\` or \`hostname\:port\`). With \`--provider\`, a syntactically valid custom authority is accepted unless it is positively identified as the other provider. Without \`--provider\`, the authority must identify a supported provider]:HOST:_default' \
+'--repo=[Override the remote-derived repository path. Accepted shapes\: GitHub \`owner/name\`; GitLab \`group\[/subgroup...\]/project\`; Local \`local\:<slug>\` or \`<slug>\`]:REPOSITORY:_default' \
+'--store-root=[Root directory of the file-backed store used by \`--provider local\`. Overrides the \`FORGE_CLI_LOCAL_STORE\` env var]:path:_files' \
+'--dry-run[Validate and describe the planned operation without applying its mutation. Read-only preflight calls may still run]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+':id:_default' \
+&& ret=0
+;;
+(resume-submit)
+_arguments "${_arguments_options[@]}" : \
+'--review=[]:REVIEW_ID:_default' \
+'--review-run-id=[]:DIGEST:_default' \
+'--expected-head=[]:SHA:_default' \
+'--expected-commit=[]:SHA:_default' \
+'--expected-snapshot=[]:DIGEST:_default' \
+'--decision=[]:DECISION:((comments-only\:"Post an informational review outcome comment only"
+approve\:"Record an approval outcome in the posted review comment"
+request-changes\:"Record a request-changes outcome in the posted review comment"))' \
+'--format=[Output format (defaults to text)]:FORMAT:((text\:"Human-readable text output (default)"
+json\:"Single-record JSON envelope (snake_case)"))' \
+'--remote=[Git remote whose URL feeds provider detection (default\: \`origin\`)]:REMOTE:_default' \
+'--provider=[Override auto-detected provider]:PROVIDER:(github gitlab local)' \
+'--host=[Override the forge authority (\`hostname\` or \`hostname\:port\`). With \`--provider\`, a syntactically valid custom authority is accepted unless it is positively identified as the other provider. Without \`--provider\`, the authority must identify a supported provider]:HOST:_default' \
+'--repo=[Override the remote-derived repository path. Accepted shapes\: GitHub \`owner/name\`; GitLab \`group\[/subgroup...\]/project\`; Local \`local\:<slug>\` or \`<slug>\`]:REPOSITORY:_default' \
+'--store-root=[Root directory of the file-backed store used by \`--provider local\`. Overrides the \`FORGE_CLI_LOCAL_STORE\` env var]:path:_files' \
+'--dry-run[Validate and describe the planned operation without applying its mutation. Read-only preflight calls may still run]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+':id:_default' \
+&& ret=0
+;;
+(submit)
+_arguments "${_arguments_options[@]}" : \
+'--review=[]:REVIEW_ID:_default' \
+'--expected-head=[]:SHA:_default' \
+'--expected-commit=[]:SHA:_default' \
+'--expected-snapshot=[]:DIGEST:_default' \
+'--decision=[]:DECISION:((comments-only\:"Post an informational review outcome comment only"
+approve\:"Record an approval outcome in the posted review comment"
+request-changes\:"Record a request-changes outcome in the posted review comment"))' \
+'--format=[Output format (defaults to text)]:FORMAT:((text\:"Human-readable text output (default)"
+json\:"Single-record JSON envelope (snake_case)"))' \
+'--remote=[Git remote whose URL feeds provider detection (default\: \`origin\`)]:REMOTE:_default' \
+'--provider=[Override auto-detected provider]:PROVIDER:(github gitlab local)' \
+'--host=[Override the forge authority (\`hostname\` or \`hostname\:port\`). With \`--provider\`, a syntactically valid custom authority is accepted unless it is positively identified as the other provider. Without \`--provider\`, the authority must identify a supported provider]:HOST:_default' \
+'--repo=[Override the remote-derived repository path. Accepted shapes\: GitHub \`owner/name\`; GitLab \`group\[/subgroup...\]/project\`; Local \`local\:<slug>\` or \`<slug>\`]:REPOSITORY:_default' \
+'--store-root=[Root directory of the file-backed store used by \`--provider local\`. Overrides the \`FORGE_CLI_LOCAL_STORE\` env var]:path:_files' \
+'--confirm-unmarked-submit[]' \
+'--dry-run[Validate and describe the planned operation without applying its mutation. Read-only preflight calls may still run]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+':id:_default' \
+&& ret=0
+;;
+(discard)
+_arguments "${_arguments_options[@]}" : \
+'--review=[]:REVIEW_ID:_default' \
+'--expected-head=[]:SHA:_default' \
+'--expected-commit=[]:SHA:_default' \
+'--expected-snapshot=[]:DIGEST:_default' \
+'--format=[Output format (defaults to text)]:FORMAT:((text\:"Human-readable text output (default)"
+json\:"Single-record JSON envelope (snake_case)"))' \
+'--remote=[Git remote whose URL feeds provider detection (default\: \`origin\`)]:REMOTE:_default' \
+'--provider=[Override auto-detected provider]:PROVIDER:(github gitlab local)' \
+'--host=[Override the forge authority (\`hostname\` or \`hostname\:port\`). With \`--provider\`, a syntactically valid custom authority is accepted unless it is positively identified as the other provider. Without \`--provider\`, the authority must identify a supported provider]:HOST:_default' \
+'--repo=[Override the remote-derived repository path. Accepted shapes\: GitHub \`owner/name\`; GitLab \`group\[/subgroup...\]/project\`; Local \`local\:<slug>\` or \`<slug>\`]:REPOSITORY:_default' \
+'--store-root=[Root directory of the file-backed store used by \`--provider local\`. Overrides the \`FORGE_CLI_LOCAL_STORE\` env var]:path:_files' \
+'--confirm-discard[]' \
+'--confirm-inline-content-loss[]' \
+'--dry-run[Validate and describe the planned operation without applying its mutation. Read-only preflight calls may still run]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+':id:_default' \
+&& ret=0
+;;
+(delete)
 _arguments "${_arguments_options[@]}" : \
 '--review=[Pending review node id (\`PRR_...\`) returned by \`pr reviews\`]:REVIEW_ID:_default' \
 '--expected-head=[Pull-request head that must still be current immediately before deletion]:SHA:_default' \
@@ -446,7 +529,23 @@ _arguments "${_arguments_options[@]}" : \
         (( CURRENT += 1 ))
         curcontext="${curcontext%:*:*}:forge-cli-pr-pending-review-help-command-$line[1]:"
         case $line[1] in
-            (delete)
+            (inspect)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(resume-submit)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(submit)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(discard)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(delete)
 _arguments "${_arguments_options[@]}" : \
 && ret=0
 ;;
@@ -689,7 +788,23 @@ _arguments "${_arguments_options[@]}" : \
         (( CURRENT += 1 ))
         curcontext="${curcontext%:*:*}:forge-cli-pr-help-pending-review-command-$line[1]:"
         case $line[1] in
-            (delete)
+            (inspect)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(resume-submit)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(submit)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(discard)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(delete)
 _arguments "${_arguments_options[@]}" : \
 && ret=0
 ;;
@@ -1704,7 +1819,23 @@ _arguments "${_arguments_options[@]}" : \
         (( CURRENT += 1 ))
         curcontext="${curcontext%:*:*}:forge-cli-help-pr-pending-review-command-$line[1]:"
         case $line[1] in
-            (delete)
+            (inspect)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(resume-submit)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(submit)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(discard)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(delete)
 _arguments "${_arguments_options[@]}" : \
 && ret=0
 ;;
@@ -2315,6 +2446,10 @@ _forge-cli__subcmd__help__subcmd__pr__subcmd__merge_commands() {
 (( $+functions[_forge-cli__subcmd__help__subcmd__pr__subcmd__pending-review_commands] )) ||
 _forge-cli__subcmd__help__subcmd__pr__subcmd__pending-review_commands() {
     local commands; commands=(
+'inspect:Read one complete pending-review snapshot and immutable digest' \
+'resume-submit:Resume and submit an exact receipt-bound review transaction' \
+'submit:Guardedly submit an unmarked pending review' \
+'discard:Destructively discard one exact pending review' \
 'delete:Verify and delete one exact pending review node' \
     )
     _describe -t commands 'forge-cli help pr pending-review commands' commands "$@"
@@ -2323,6 +2458,26 @@ _forge-cli__subcmd__help__subcmd__pr__subcmd__pending-review_commands() {
 _forge-cli__subcmd__help__subcmd__pr__subcmd__pending-review__subcmd__delete_commands() {
     local commands; commands=()
     _describe -t commands 'forge-cli help pr pending-review delete commands' commands "$@"
+}
+(( $+functions[_forge-cli__subcmd__help__subcmd__pr__subcmd__pending-review__subcmd__discard_commands] )) ||
+_forge-cli__subcmd__help__subcmd__pr__subcmd__pending-review__subcmd__discard_commands() {
+    local commands; commands=()
+    _describe -t commands 'forge-cli help pr pending-review discard commands' commands "$@"
+}
+(( $+functions[_forge-cli__subcmd__help__subcmd__pr__subcmd__pending-review__subcmd__inspect_commands] )) ||
+_forge-cli__subcmd__help__subcmd__pr__subcmd__pending-review__subcmd__inspect_commands() {
+    local commands; commands=()
+    _describe -t commands 'forge-cli help pr pending-review inspect commands' commands "$@"
+}
+(( $+functions[_forge-cli__subcmd__help__subcmd__pr__subcmd__pending-review__subcmd__resume-submit_commands] )) ||
+_forge-cli__subcmd__help__subcmd__pr__subcmd__pending-review__subcmd__resume-submit_commands() {
+    local commands; commands=()
+    _describe -t commands 'forge-cli help pr pending-review resume-submit commands' commands "$@"
+}
+(( $+functions[_forge-cli__subcmd__help__subcmd__pr__subcmd__pending-review__subcmd__submit_commands] )) ||
+_forge-cli__subcmd__help__subcmd__pr__subcmd__pending-review__subcmd__submit_commands() {
+    local commands; commands=()
+    _describe -t commands 'forge-cli help pr pending-review submit commands' commands "$@"
 }
 (( $+functions[_forge-cli__subcmd__help__subcmd__pr__subcmd__ready_commands] )) ||
 _forge-cli__subcmd__help__subcmd__pr__subcmd__ready_commands() {
@@ -2776,6 +2931,10 @@ _forge-cli__subcmd__pr__subcmd__help__subcmd__merge_commands() {
 (( $+functions[_forge-cli__subcmd__pr__subcmd__help__subcmd__pending-review_commands] )) ||
 _forge-cli__subcmd__pr__subcmd__help__subcmd__pending-review_commands() {
     local commands; commands=(
+'inspect:Read one complete pending-review snapshot and immutable digest' \
+'resume-submit:Resume and submit an exact receipt-bound review transaction' \
+'submit:Guardedly submit an unmarked pending review' \
+'discard:Destructively discard one exact pending review' \
 'delete:Verify and delete one exact pending review node' \
     )
     _describe -t commands 'forge-cli pr help pending-review commands' commands "$@"
@@ -2784,6 +2943,26 @@ _forge-cli__subcmd__pr__subcmd__help__subcmd__pending-review_commands() {
 _forge-cli__subcmd__pr__subcmd__help__subcmd__pending-review__subcmd__delete_commands() {
     local commands; commands=()
     _describe -t commands 'forge-cli pr help pending-review delete commands' commands "$@"
+}
+(( $+functions[_forge-cli__subcmd__pr__subcmd__help__subcmd__pending-review__subcmd__discard_commands] )) ||
+_forge-cli__subcmd__pr__subcmd__help__subcmd__pending-review__subcmd__discard_commands() {
+    local commands; commands=()
+    _describe -t commands 'forge-cli pr help pending-review discard commands' commands "$@"
+}
+(( $+functions[_forge-cli__subcmd__pr__subcmd__help__subcmd__pending-review__subcmd__inspect_commands] )) ||
+_forge-cli__subcmd__pr__subcmd__help__subcmd__pending-review__subcmd__inspect_commands() {
+    local commands; commands=()
+    _describe -t commands 'forge-cli pr help pending-review inspect commands' commands "$@"
+}
+(( $+functions[_forge-cli__subcmd__pr__subcmd__help__subcmd__pending-review__subcmd__resume-submit_commands] )) ||
+_forge-cli__subcmd__pr__subcmd__help__subcmd__pending-review__subcmd__resume-submit_commands() {
+    local commands; commands=()
+    _describe -t commands 'forge-cli pr help pending-review resume-submit commands' commands "$@"
+}
+(( $+functions[_forge-cli__subcmd__pr__subcmd__help__subcmd__pending-review__subcmd__submit_commands] )) ||
+_forge-cli__subcmd__pr__subcmd__help__subcmd__pending-review__subcmd__submit_commands() {
+    local commands; commands=()
+    _describe -t commands 'forge-cli pr help pending-review submit commands' commands "$@"
 }
 (( $+functions[_forge-cli__subcmd__pr__subcmd__help__subcmd__ready_commands] )) ||
 _forge-cli__subcmd__pr__subcmd__help__subcmd__ready_commands() {
@@ -2859,6 +3038,10 @@ _forge-cli__subcmd__pr__subcmd__merge_commands() {
 (( $+functions[_forge-cli__subcmd__pr__subcmd__pending-review_commands] )) ||
 _forge-cli__subcmd__pr__subcmd__pending-review_commands() {
     local commands; commands=(
+'inspect:Read one complete pending-review snapshot and immutable digest' \
+'resume-submit:Resume and submit an exact receipt-bound review transaction' \
+'submit:Guardedly submit an unmarked pending review' \
+'discard:Destructively discard one exact pending review' \
 'delete:Verify and delete one exact pending review node' \
 'help:Print this message or the help of the given subcommand(s)' \
     )
@@ -2869,9 +3052,18 @@ _forge-cli__subcmd__pr__subcmd__pending-review__subcmd__delete_commands() {
     local commands; commands=()
     _describe -t commands 'forge-cli pr pending-review delete commands' commands "$@"
 }
+(( $+functions[_forge-cli__subcmd__pr__subcmd__pending-review__subcmd__discard_commands] )) ||
+_forge-cli__subcmd__pr__subcmd__pending-review__subcmd__discard_commands() {
+    local commands; commands=()
+    _describe -t commands 'forge-cli pr pending-review discard commands' commands "$@"
+}
 (( $+functions[_forge-cli__subcmd__pr__subcmd__pending-review__subcmd__help_commands] )) ||
 _forge-cli__subcmd__pr__subcmd__pending-review__subcmd__help_commands() {
     local commands; commands=(
+'inspect:Read one complete pending-review snapshot and immutable digest' \
+'resume-submit:Resume and submit an exact receipt-bound review transaction' \
+'submit:Guardedly submit an unmarked pending review' \
+'discard:Destructively discard one exact pending review' \
 'delete:Verify and delete one exact pending review node' \
 'help:Print this message or the help of the given subcommand(s)' \
     )
@@ -2882,10 +3074,45 @@ _forge-cli__subcmd__pr__subcmd__pending-review__subcmd__help__subcmd__delete_com
     local commands; commands=()
     _describe -t commands 'forge-cli pr pending-review help delete commands' commands "$@"
 }
+(( $+functions[_forge-cli__subcmd__pr__subcmd__pending-review__subcmd__help__subcmd__discard_commands] )) ||
+_forge-cli__subcmd__pr__subcmd__pending-review__subcmd__help__subcmd__discard_commands() {
+    local commands; commands=()
+    _describe -t commands 'forge-cli pr pending-review help discard commands' commands "$@"
+}
 (( $+functions[_forge-cli__subcmd__pr__subcmd__pending-review__subcmd__help__subcmd__help_commands] )) ||
 _forge-cli__subcmd__pr__subcmd__pending-review__subcmd__help__subcmd__help_commands() {
     local commands; commands=()
     _describe -t commands 'forge-cli pr pending-review help help commands' commands "$@"
+}
+(( $+functions[_forge-cli__subcmd__pr__subcmd__pending-review__subcmd__help__subcmd__inspect_commands] )) ||
+_forge-cli__subcmd__pr__subcmd__pending-review__subcmd__help__subcmd__inspect_commands() {
+    local commands; commands=()
+    _describe -t commands 'forge-cli pr pending-review help inspect commands' commands "$@"
+}
+(( $+functions[_forge-cli__subcmd__pr__subcmd__pending-review__subcmd__help__subcmd__resume-submit_commands] )) ||
+_forge-cli__subcmd__pr__subcmd__pending-review__subcmd__help__subcmd__resume-submit_commands() {
+    local commands; commands=()
+    _describe -t commands 'forge-cli pr pending-review help resume-submit commands' commands "$@"
+}
+(( $+functions[_forge-cli__subcmd__pr__subcmd__pending-review__subcmd__help__subcmd__submit_commands] )) ||
+_forge-cli__subcmd__pr__subcmd__pending-review__subcmd__help__subcmd__submit_commands() {
+    local commands; commands=()
+    _describe -t commands 'forge-cli pr pending-review help submit commands' commands "$@"
+}
+(( $+functions[_forge-cli__subcmd__pr__subcmd__pending-review__subcmd__inspect_commands] )) ||
+_forge-cli__subcmd__pr__subcmd__pending-review__subcmd__inspect_commands() {
+    local commands; commands=()
+    _describe -t commands 'forge-cli pr pending-review inspect commands' commands "$@"
+}
+(( $+functions[_forge-cli__subcmd__pr__subcmd__pending-review__subcmd__resume-submit_commands] )) ||
+_forge-cli__subcmd__pr__subcmd__pending-review__subcmd__resume-submit_commands() {
+    local commands; commands=()
+    _describe -t commands 'forge-cli pr pending-review resume-submit commands' commands "$@"
+}
+(( $+functions[_forge-cli__subcmd__pr__subcmd__pending-review__subcmd__submit_commands] )) ||
+_forge-cli__subcmd__pr__subcmd__pending-review__subcmd__submit_commands() {
+    local commands; commands=()
+    _describe -t commands 'forge-cli pr pending-review submit commands' commands "$@"
 }
 (( $+functions[_forge-cli__subcmd__pr__subcmd__ready_commands] )) ||
 _forge-cli__subcmd__pr__subcmd__ready_commands() {
