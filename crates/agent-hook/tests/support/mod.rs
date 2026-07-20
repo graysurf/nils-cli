@@ -112,13 +112,10 @@ pub fn sha256(bytes: &[u8]) -> String {
 }
 
 pub fn target_binding_digest(path: &Path) -> String {
-    let mut start = path;
-    while !start.is_dir() {
-        start = start.parent().expect("target ancestor");
-    }
+    let (effective, start) = effective_target_and_start(path);
     let output = Command::new("git")
         .arg("-C")
-        .arg(start)
+        .arg(&start)
         .args(["rev-parse", "--show-toplevel"])
         .stdin(Stdio::null())
         .stderr(Stdio::null())
@@ -131,17 +128,51 @@ pub fn target_binding_digest(path: &Path) -> String {
                 .trim(),
         )
     } else {
-        start.to_path_buf()
+        start
     };
     let canonical = fs::canonicalize(&binding_root).expect("canonical binding root");
     let metadata = fs::metadata(&canonical).expect("binding metadata");
     let mut material = b"agent-hook.target-binding.v2\0".to_vec();
-    material.extend_from_slice(path.as_os_str().as_encoded_bytes());
+    material.extend_from_slice(effective.as_os_str().as_encoded_bytes());
     material.push(0);
     material.extend_from_slice(canonical.as_os_str().as_encoded_bytes());
     material.extend_from_slice(&metadata.dev().to_le_bytes());
     material.extend_from_slice(&metadata.ino().to_le_bytes());
     sha256(&material)
+}
+
+fn effective_target_and_start(path: &Path) -> (PathBuf, PathBuf) {
+    let mut ancestor = path;
+    let mut suffix = Vec::new();
+    loop {
+        match fs::symlink_metadata(ancestor) {
+            Ok(_) => break,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                suffix.push(
+                    ancestor
+                        .file_name()
+                        .expect("missing target component")
+                        .to_os_string(),
+                );
+                ancestor = ancestor.parent().expect("target ancestor");
+            }
+            Err(error) => panic!("target metadata: {error}"),
+        }
+    }
+    let existing_ancestor = fs::canonicalize(ancestor).expect("effective target ancestor");
+    let mut effective = existing_ancestor.clone();
+    for component in suffix.iter().rev() {
+        effective.push(component);
+    }
+    let start = if !suffix.is_empty() || existing_ancestor.is_dir() {
+        existing_ancestor
+    } else {
+        existing_ancestor
+            .parent()
+            .expect("effective target parent")
+            .to_path_buf()
+    };
+    (effective, start)
 }
 
 pub fn toml_string(path: &Path) -> String {

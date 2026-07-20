@@ -1,7 +1,6 @@
 use std::io::Read;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
 
 use serde::Serialize;
 use serde::de::{Deserialize, Deserializer, MapAccess, SeqAccess, Visitor};
@@ -13,6 +12,7 @@ use crate::error::HookError;
 use crate::model::{
     DecisionAction, NormalizedDecision, NormalizedRequest, Product, REQUEST_VERSION,
 };
+use crate::path_binding::{TargetBinding, resolve_target_binding};
 
 pub const MAX_PROVIDER_BYTES: usize = 1024 * 1024;
 const MAX_PROVIDER_ID_CHARS: usize = 256;
@@ -105,7 +105,16 @@ pub fn normalize(
         .map(str::to_string)
         .filter(|value| value.len() <= 128);
     let (target_paths, execution_path) = target_paths(product, object, matcher.as_deref())?;
-    let target_material = target_set_binding_material(&target_paths);
+    let mut target_bindings = target_paths
+        .iter()
+        .map(|path| resolve_target_binding(path))
+        .collect::<Result<Vec<_>, _>>()?;
+    deduplicate_target_bindings(&mut target_bindings);
+    let target_material = target_set_binding_material(&target_bindings)?;
+    let target_paths = target_bindings
+        .into_iter()
+        .map(|binding| binding.effective_path)
+        .collect();
     let command_material = command_text(object)
         .unwrap_or("command-unavailable")
         .as_bytes();
@@ -574,63 +583,51 @@ fn deduplicate_targets(targets: &mut Vec<PathBuf>) {
     }
 }
 
+fn deduplicate_target_bindings(bindings: &mut Vec<TargetBinding>) {
+    let mut index = 0;
+    while index < bindings.len() {
+        if bindings[..index]
+            .iter()
+            .any(|binding| binding.effective_path == bindings[index].effective_path)
+        {
+            bindings.remove(index);
+        } else {
+            index += 1;
+        }
+    }
+}
+
 fn untrusted_target(message: &str) -> HookError {
     HookError::data("provider-target-untrusted", message)
 }
 
-fn target_set_binding_material(paths: &[PathBuf]) -> Vec<u8> {
-    match paths {
-        [] => b"target-unavailable".to_vec(),
-        [path] => target_binding_material(path),
-        paths => {
+fn target_set_binding_material(bindings: &[TargetBinding]) -> Result<Vec<u8>, HookError> {
+    match bindings {
+        [] => Ok(b"target-unavailable".to_vec()),
+        [binding] => target_binding_material(binding),
+        bindings => {
             let mut material = b"agent-hook.target-set-binding.v1\0".to_vec();
-            material.extend_from_slice(&(paths.len() as u64).to_le_bytes());
-            for path in paths {
-                let binding = target_binding_material(path);
-                material.extend_from_slice(&(binding.len() as u64).to_le_bytes());
-                material.extend_from_slice(&binding);
+            material.extend_from_slice(&(bindings.len() as u64).to_le_bytes());
+            for binding in bindings {
+                let item = target_binding_material(binding)?;
+                material.extend_from_slice(&(item.len() as u64).to_le_bytes());
+                material.extend_from_slice(&item);
             }
-            material
+            Ok(material)
         }
     }
 }
 
-fn target_binding_material(path: &Path) -> Vec<u8> {
-    let binding_root = checkout_root(path).unwrap_or_else(|| path.to_path_buf());
-    let canonical = std::fs::canonicalize(&binding_root).unwrap_or(binding_root);
+fn target_binding_material(binding: &TargetBinding) -> Result<Vec<u8>, HookError> {
+    let metadata = std::fs::metadata(&binding.binding_root)
+        .map_err(|_| untrusted_target("mutation target binding root is unavailable"))?;
     let mut material = b"agent-hook.target-binding.v2\0".to_vec();
-    material.extend_from_slice(path.as_os_str().as_encoded_bytes());
+    material.extend_from_slice(binding.effective_path.as_os_str().as_encoded_bytes());
     material.push(0);
-    material.extend_from_slice(canonical.as_os_str().as_encoded_bytes());
-    if let Ok(metadata) = std::fs::metadata(&canonical) {
-        material.extend_from_slice(&metadata.dev().to_le_bytes());
-        material.extend_from_slice(&metadata.ino().to_le_bytes());
-    }
-    material
-}
-
-fn checkout_root(path: &Path) -> Option<PathBuf> {
-    let mut start = path;
-    while !start.is_dir() {
-        start = start.parent()?;
-    }
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(start)
-        .args(["rev-parse", "--show-toplevel"])
-        .stdin(Stdio::null())
-        .stderr(Stdio::null())
-        .output()
-        .ok();
-    if let Some(output) = output.filter(|output| output.status.success())
-        && let Ok(value) = std::str::from_utf8(&output.stdout)
-    {
-        let root = PathBuf::from(value.trim());
-        if root.is_absolute() {
-            return Some(root);
-        }
-    }
-    Some(start.to_path_buf())
+    material.extend_from_slice(binding.binding_root.as_os_str().as_encoded_bytes());
+    material.extend_from_slice(&metadata.dev().to_le_bytes());
+    material.extend_from_slice(&metadata.ino().to_le_bytes());
+    Ok(material)
 }
 
 fn command_text(object: &Map<String, Value>) -> Option<&str> {

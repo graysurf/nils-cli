@@ -1,7 +1,7 @@
 mod support;
 
 use std::fs;
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
 use std::thread;
 use std::time::Duration;
 
@@ -445,6 +445,56 @@ fn one_shot_rejects_recreated_target_at_the_same_absolute_path_without_consuming
         "the test must retain the removed inode while creating its replacement"
     );
     let rejected = dispatch(&fixture, &capability, &[]);
+    assert_eq!(rejected.code, 65, "stderr={}", rejected.stderr_text());
+    assert_eq!(
+        rejected.stdout_json()["error"]["code"],
+        "capability-binding-mismatch"
+    );
+
+    let status = fixture.run(
+        &[
+            "recovery",
+            "status",
+            "--capability-id",
+            &capability.capability_id,
+            "--format",
+            "json",
+        ],
+        None,
+    );
+    assert_eq!(status.code, 0);
+    assert_eq!(status.stdout_json()["data"]["status"], "authorized");
+}
+
+#[test]
+fn recovery_binding_tracks_the_effective_symlink_target() {
+    let fixture = Fixture::new(POLICY);
+    let first_root = fixture.root.join("effective-first");
+    let second_root = fixture.root.join("effective-second");
+    fs::create_dir(&first_root).expect("first root");
+    fs::create_dir(&second_root).expect("second root");
+    let first_target = first_root.join("target.txt");
+    let second_target = second_root.join("target.txt");
+    fs::write(&first_target, "first\n").expect("first target");
+    fs::write(&second_target, "second\n").expect("second target");
+    let target_link = fixture.root.join("target-link");
+    symlink(&first_target, &target_link).expect("first target symlink");
+
+    let capability = authorize_for_target(
+        &fixture,
+        "symlink-target",
+        "repair-window",
+        "300",
+        &target_link,
+        &[("AGENT_SESSION_ID", "session-a")],
+    );
+    let allowed = dispatch(&fixture, &capability, &[("AGENT_SESSION_ID", "session-a")]);
+    assert_eq!(allowed.code, 0, "stderr={}", allowed.stderr_text());
+    assert_eq!(allowed.stdout_json()["data"]["recovery_applied"], true);
+
+    fs::remove_file(&target_link).expect("remove first symlink");
+    symlink(&second_target, &target_link).expect("second target symlink");
+    let rejected = dispatch(&fixture, &capability, &[("AGENT_SESSION_ID", "session-a")]);
     assert_eq!(rejected.code, 65, "stderr={}", rejected.stderr_text());
     assert_eq!(
         rejected.stdout_json()["error"]["code"],

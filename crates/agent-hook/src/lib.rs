@@ -6,6 +6,7 @@ mod error;
 mod evaluator;
 mod liveness;
 mod model;
+mod path_binding;
 mod paths;
 pub mod recovery;
 pub mod setup;

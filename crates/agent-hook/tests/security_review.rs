@@ -1,7 +1,7 @@
 mod support;
 
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::Path;
 use std::process::Command;
 
@@ -36,7 +36,7 @@ version = "2026.07.20.1"
 id = "runtime.owner"
 products = ["codex"]
 events = ["PreToolUse"]
-matcher = "Write|NotebookEdit|apply_patch"
+matcher = "Write|Edit|NotebookEdit|apply_patch"
 priority = 10
 mode = "enforce"
 failure_posture = "closed"
@@ -555,6 +555,72 @@ fn notebook_edit_uses_notebook_path_for_owner_liveness() {
 }
 
 #[test]
+fn symlinked_mutation_targets_resolve_to_the_effective_foreign_owner() {
+    let (fixture, checkout_a, checkout_b) = same_repository_foreign_owner_fixture();
+    let foreign_file = checkout_b.join("foreign.txt");
+    let foreign_notebook = checkout_b.join("foreign.ipynb");
+    let foreign_directory = checkout_b.join("foreign-directory");
+    fs::write(&foreign_file, "foreign\n").expect("foreign file");
+    fs::write(&foreign_notebook, "{}\n").expect("foreign notebook");
+    fs::create_dir(&foreign_directory).expect("foreign directory");
+
+    let file_link = checkout_a.join("file-link");
+    let notebook_link = checkout_a.join("notebook-link");
+    let directory_link = checkout_a.join("directory-link");
+    symlink(&foreign_file, &file_link).expect("file symlink");
+    symlink(&foreign_notebook, &notebook_link).expect("notebook symlink");
+    symlink(&foreign_directory, &directory_link).expect("directory symlink");
+
+    for (tool_name, tool_input) in [
+        ("Write", json!({"path":file_link})),
+        ("Edit", json!({"file_path":file_link})),
+        ("NotebookEdit", json!({"notebook_path":notebook_link})),
+        (
+            "Write",
+            json!({"path":directory_link.join("new-directory/not-yet-created.txt")}),
+        ),
+        (
+            "apply_patch",
+            json!({"command":format!(
+                "*** Begin Patch\n*** Update File: {}\n@@\n-old\n+new\n*** End Patch",
+                file_link.display()
+            )}),
+        ),
+    ] {
+        assert_foreign_target_blocks(&fixture, &checkout_a, tool_name, tool_input);
+    }
+}
+
+#[test]
+fn ambiguous_symlink_targets_fail_closed_before_policy_evaluation() {
+    let (fixture, checkout_a, _) = same_repository_foreign_owner_fixture();
+    let dangling = checkout_a.join("dangling-link");
+    let cyclic = checkout_a.join("cyclic-link");
+    symlink(checkout_a.join("missing-target"), &dangling).expect("dangling symlink");
+    symlink(&cyclic, &cyclic).expect("cyclic symlink");
+
+    for target in [dangling, cyclic] {
+        let payload = json!({
+            "hook_event_name":"PreToolUse",
+            "tool_name":"Write",
+            "cwd":checkout_a,
+            "tool_input":{"path":target}
+        })
+        .to_string();
+        let output = fixture.run_with_env(
+            &["dispatch", "--product", "codex", "--format", "json"],
+            Some(&payload),
+            &[("AGENT_SESSION_ID", "current")],
+        );
+        assert_eq!(output.code, 65, "stderr={}", output.stderr_text());
+        assert_eq!(
+            output.stdout_json()["error"]["code"],
+            "provider-target-untrusted"
+        );
+    }
+}
+
+#[test]
 fn apply_patch_checks_single_and_every_multi_file_target() {
     let (fixture, checkout_a, checkout_b) = same_repository_foreign_owner_fixture();
     for patch in [
@@ -696,7 +762,8 @@ fn assert_foreign_target_blocks(
     assert_eq!(
         output.code,
         1,
-        "tool={tool_name} stderr={}",
+        "tool={tool_name} stdout={} stderr={}",
+        output.stdout_text(),
         output.stderr_text()
     );
     let decision = output.stdout_json();

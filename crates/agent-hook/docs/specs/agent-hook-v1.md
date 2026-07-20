@@ -121,10 +121,16 @@ are all mapped. The undocumented `tool_input.patch` alias is not accepted.
 Relative targets require an absolute provider execution directory. Missing,
 ambiguous, malformed, oversized, or only partially mapped targets fail closed
 as `provider-target-untrusted` rather than falling back to the execution
-checkout. Multi-target requests retain every distinct target for owner-liveness
-evaluation and bind recovery to a deterministic target-set digest; the existing
-single-target digest remains unchanged. Raw target paths are never serialized
-in the normalized request, decision, trace, or recovery artifact.
+checkout. Existing targets and the nearest existing ancestor of a new target
+are resolved through one fail-closed binding resolver before ownership and
+recovery evaluation. This includes final and intermediate symlinks: a path in
+one checkout that resolves into another checkout is classified and bound to
+the effective checkout, while dangling, cyclic, or otherwise ambiguous links
+are rejected. Multi-target requests retain every distinct effective target for
+owner-liveness evaluation and bind recovery to a deterministic target-set
+digest. The v2 binding domain and ordinary canonical non-symlink single-target
+digests remain unchanged. Raw target paths are never serialized in the
+normalized request, decision, trace, or recovery artifact.
 Owner-liveness evaluates every distinct target checkout plus the execution
 checkout and returns the strongest result; an active foreign owner therefore
 cannot be masked by a self-owned or unclaimed target.

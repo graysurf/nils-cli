@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::HookError;
 use crate::model::{DecisionAction, NormalizedRequest, SemanticConflict};
+use crate::path_binding::resolve_target_binding;
 use crate::paths::agent_session_state_root;
 
 #[derive(Debug)]
@@ -189,14 +190,18 @@ pub fn classify(
     }
     let mut classified_roots = Vec::new();
     let path_outcomes = paths.into_iter().filter_map(|path| {
-        let root = target_binding_root(path);
+        let binding = match resolve_target_binding(path) {
+            Ok(binding) => binding,
+            Err(_) => return Some(unknown("owner-target-untrusted")),
+        };
+        let root = binding.binding_root;
         if classified_roots.contains(&root) {
             return None;
         }
-        classified_roots.push(root);
+        classified_roots.push(root.clone());
         Some(match snapshot {
-            Some(snapshot) => classify_registry_path(request, path, snapshot),
-            None => legacy_classify(path, legacy_ttl_seconds),
+            Some(snapshot) => classify_registry_root(request, &root, snapshot),
+            None => legacy_classify(&root, legacy_ttl_seconds),
         })
     });
     strongest_outcome(potential.into_iter().chain(path_outcomes))
@@ -228,16 +233,15 @@ fn outcome_rank(outcome: &OwnerLiveness) -> (u8, u8) {
     (action_rank(outcome.action), specificity)
 }
 
-fn classify_registry_path(
+fn classify_registry_root(
     request: &NormalizedRequest,
-    target: &Path,
+    checkout: &Path,
     snapshot: &Snapshot,
 ) -> OwnerLiveness {
-    let checkout = target_binding_root(target);
     let Some(fingerprint) = coordination_projection::worktree_fingerprint(
         snapshot.registry.fingerprint_epoch,
         &snapshot.registry.fingerprint_key,
-        &checkout,
+        checkout,
     ) else {
         return unknown("coordination-registry-invalid");
     };
@@ -260,7 +264,7 @@ fn classify_registry_path(
     if matching.next().is_some() {
         return unknown("coordination-owner-ambiguous");
     }
-    let dirty = checkout_dirty(&checkout);
+    let dirty = checkout_dirty(checkout);
     let own = current_session
         .as_deref()
         .is_some_and(|session| session == claim.session_id);
@@ -316,46 +320,9 @@ fn classify_registry_path(
     }
 }
 
-fn checkout_root(path: &Path) -> Option<PathBuf> {
-    let mut start = path;
-    while !start.is_dir() {
-        start = start.parent()?;
-    }
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(start)
-        .args(["rev-parse", "--show-toplevel"])
-        .stdin(Stdio::null())
-        .stderr(Stdio::null())
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    PathBuf::from(String::from_utf8_lossy(&output.stdout).trim())
-        .canonicalize()
-        .ok()
-}
-
-fn target_binding_root(path: &Path) -> PathBuf {
-    checkout_root(path).unwrap_or_else(|| {
-        let mut candidate = path;
-        while !candidate.is_dir() {
-            let Some(parent) = candidate.parent() else {
-                break;
-            };
-            candidate = parent;
-        }
-        candidate
-            .canonicalize()
-            .unwrap_or_else(|_| candidate.to_path_buf())
-    })
-}
-
-fn legacy_classify(target: &Path, legacy_ttl_seconds: u64) -> OwnerLiveness {
-    let checkout = target_binding_root(target);
-    let dirty = checkout_dirty(&checkout);
-    let age = fs::metadata(&checkout)
+fn legacy_classify(checkout: &Path, legacy_ttl_seconds: u64) -> OwnerLiveness {
+    let dirty = checkout_dirty(checkout);
+    let age = fs::metadata(checkout)
         .and_then(|metadata| metadata.modified())
         .ok()
         .and_then(|modified| SystemTime::now().duration_since(modified).ok())
