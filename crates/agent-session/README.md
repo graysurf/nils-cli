@@ -96,6 +96,21 @@ overlap, or the same repository in another worktree without requiring a claim.
 `off` opts out of these warnings. Processes launched directly outside
 `agent-session` have no managed identity and do not participate.
 
+### Work authorization and coordination modes
+
+Coordination does not grant or revoke user authorization, repository
+permission, provider consent, or workflow authority. In default `advisory`
+mode, missing context, unavailable coordination, and overlap reports remain
+non-blocking. `work-context set` adds optional public task metadata so warnings
+are more precise; it is not a permission request. Only a launch that explicitly
+selects `--coordination-mode enforce` turns claims, admission, and physical
+checkout leases into mutation requirements.
+
+The canonical agent-facing policy, including how an agent responds to overlap
+advice, lives in agent-runtime-kit's
+[`session-coordination.md`](https://github.com/graysurf/agent-runtime-kit/blob/main/core/policies/session-coordination.md).
+This README defines CLI and operator semantics only.
+
 Every new managed runtime receives a private per-incarnation capability through
 the 0600 file named by `AGENT_SESSION_CAPABILITY_FILE`. Session, incarnation,
 claim, operation, and message identifiers are selectors and revision fences,
