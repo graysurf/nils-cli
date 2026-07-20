@@ -20,12 +20,10 @@ const MAX_PROVIDER_LINE_BYTES: usize = 256 * 1024;
 const MAX_PROVIDER_READ_BYTES: usize = 64 * 1024;
 const PROVIDER_CONTINUITY_BYTES: usize = 4 * 1024;
 const CLAUDE_FALLBACK_DELAY: Duration = Duration::from_millis(750);
-/// Bytes read from the tail of a provider transcript when resolving the most
-/// recent user prompt for the list projection. The transcript is read on demand
-/// and the prompt is never persisted by the daemon. A turn that writes more than
-/// this many bytes after its prompt is a best-effort miss: the preview is simply
-/// omitted for that poll rather than triggering an unbounded scan.
-pub(crate) const MAX_LAST_PROMPT_TAIL_BYTES: usize = 256 * 1024;
+/// Maximum cold-read window used once when a list-projection tracker opens.
+/// Later polls consume only appended bytes through `ProviderPromptTail`.
+pub(crate) const MAX_LAST_PROMPT_RECOVERY_BYTES: usize = 64 * 1024 * 1024;
+const MAX_LAST_PROMPT_INCREMENTAL_POLLS: usize = 16;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ProviderKind {
@@ -58,6 +56,12 @@ pub(crate) struct LastPrompt {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) submitted_at: Option<String>,
     pub(crate) truncated: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ProviderLastPromptRefresh {
+    Current(Option<LastPrompt>),
+    Invalidated,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -99,6 +103,19 @@ pub(crate) struct ProviderPromptTail {
     pending_claude: VecDeque<PendingClaudePrompt>,
     claude_fallback_delay: Duration,
     disabled: bool,
+}
+
+#[derive(Debug)]
+struct ProviderPromptPoll {
+    events: Vec<ProviderPromptEvent>,
+    advanced: usize,
+    invalidated: bool,
+}
+
+#[derive(Debug)]
+pub(crate) struct ProviderLastPromptTracker {
+    tail: ProviderPromptTail,
+    last_prompt: Option<LastPrompt>,
 }
 
 impl ProviderPromptTail {
@@ -175,8 +192,16 @@ impl ProviderPromptTail {
     }
 
     pub(crate) fn poll(&mut self) -> io::Result<Vec<ProviderPromptEvent>> {
+        self.poll_status().map(|status| status.events)
+    }
+
+    fn poll_status(&mut self) -> io::Result<ProviderPromptPoll> {
         if self.disabled {
-            return Ok(Vec::new());
+            return Ok(ProviderPromptPoll {
+                events: Vec::new(),
+                advanced: 0,
+                invalidated: true,
+            });
         }
 
         let (mut file, metadata) = open_regular_file(&self.source.path)?;
@@ -191,7 +216,11 @@ impl ProviderPromptTail {
             {
                 self.disabled = true;
             }
-            return Ok(Vec::new());
+            return Ok(ProviderPromptPoll {
+                events: Vec::new(),
+                advanced: 0,
+                invalidated: true,
+            });
         }
 
         let available = metadata.len().saturating_sub(self.offset);
@@ -199,10 +228,12 @@ impl ProviderPromptTail {
             .unwrap_or(usize::MAX)
             .min(MAX_PROVIDER_READ_BYTES);
         let mut events = Vec::new();
+        let mut advanced = 0;
         if read_len > 0 {
             file.seek(SeekFrom::Start(self.offset))?;
             let mut bytes = vec![0u8; read_len];
             let read = file.read(&mut bytes)?;
+            advanced = read;
             self.offset = self.offset.saturating_add(read as u64);
             update_continuity(&mut self.continuity, &bytes[..read]);
             self.consume(&bytes[..read], &mut events);
@@ -211,7 +242,11 @@ impl ProviderPromptTail {
         if self.source.provider == ProviderKind::Claude {
             self.drain_ready_claude(&mut events);
         }
-        Ok(events)
+        Ok(ProviderPromptPoll {
+            events,
+            advanced,
+            invalidated: false,
+        })
     }
 
     fn reset_to_eof(
@@ -308,6 +343,75 @@ impl ProviderPromptTail {
                 .expect("ready candidate exists");
             events.push(provider_event(candidate.prompt));
         }
+    }
+}
+
+impl ProviderLastPromptTracker {
+    pub(crate) fn open_source(source: ProviderPromptSource) -> Option<Self> {
+        Self::open_source_with_validation(source, true)
+    }
+
+    fn open_source_with_validation(
+        source: ProviderPromptSource,
+        validate_source_identity: bool,
+    ) -> Option<Self> {
+        // Establish the append offset before the cold read. Any bytes written
+        // during recovery remain after this offset and are consumed by refresh.
+        let tail = ProviderPromptTail::open_source(
+            source.clone(),
+            CLAUDE_FALLBACK_DELAY,
+            true,
+            validate_source_identity,
+        )
+        .ok()?;
+        let last_prompt = read_last_prompt(&source, MAX_LAST_PROMPT_RECOVERY_BYTES);
+        if validate_source_identity
+            && (!source_still_matches(&source)
+                || !opened_file_still_current(&source.path, tail.identity))
+        {
+            return None;
+        }
+        Some(Self { tail, last_prompt })
+    }
+
+    #[cfg(test)]
+    fn open_path(
+        provider: ProviderKind,
+        session_id: &str,
+        path: PathBuf,
+        claude_fallback_delay: Duration,
+    ) -> Option<Self> {
+        let source = ProviderPromptSource {
+            provider,
+            session_id: session_id.to_string(),
+            path,
+        };
+        let mut tracker = Self::open_source_with_validation(source, false)?;
+        tracker.tail.claude_fallback_delay = claude_fallback_delay;
+        Some(tracker)
+    }
+
+    pub(crate) fn refresh(&mut self) -> ProviderLastPromptRefresh {
+        for _ in 0..MAX_LAST_PROMPT_INCREMENTAL_POLLS {
+            let Ok(status) = self.tail.poll_status() else {
+                return ProviderLastPromptRefresh::Invalidated;
+            };
+            if status.invalidated {
+                self.last_prompt = None;
+                return ProviderLastPromptRefresh::Invalidated;
+            }
+            for event in status.events {
+                self.last_prompt = Some(LastPrompt {
+                    text: event.prompt,
+                    submitted_at: Some(event.submitted_at),
+                    truncated: event.truncated,
+                });
+            }
+            if status.advanced < MAX_PROVIDER_READ_BYTES {
+                break;
+            }
+        }
+        ProviderLastPromptRefresh::Current(self.last_prompt.clone())
     }
 }
 
@@ -520,7 +624,7 @@ fn read_tail_window(path: &Path, max_bytes: usize) -> io::Result<Vec<u8>> {
     let start = metadata.len().saturating_sub(max_bytes as u64);
     file.seek(SeekFrom::Start(start))?;
     let mut buffer = Vec::new();
-    file.read_to_end(&mut buffer)?;
+    file.take(max_bytes as u64).read_to_end(&mut buffer)?;
     Ok(buffer)
 }
 
@@ -1386,7 +1490,7 @@ mod tests {
             session_id: "codex-id".to_string(),
             path: transcript.clone(),
         };
-        let found = read_last_prompt(&source, MAX_LAST_PROMPT_TAIL_BYTES).expect("prompt");
+        let found = read_last_prompt(&source, 256 * 1024).expect("prompt");
         assert_eq!(found.text, "real prompt");
         assert!(!found.truncated);
 
@@ -1394,6 +1498,80 @@ mod tests {
         // degrades to no preview rather than scanning further back.
         append(&transcript, vec![b' '; 4096].as_slice());
         assert_eq!(read_last_prompt(&source, 16), None);
+    }
+
+    #[test]
+    fn last_prompt_recovery_window_covers_long_codex_turn() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let transcript = tmp.path().join("codex.jsonl");
+        fs::write(&transcript, codex_line("prompt before a long turn")).expect("write prompt");
+        append(
+            &transcript,
+            format!("{}\n", " ".repeat(1024 * 1024)).as_bytes(),
+        );
+        let mut tracker = ProviderLastPromptTracker::open_path(
+            ProviderKind::Codex,
+            "codex-id",
+            transcript,
+            Duration::ZERO,
+        )
+        .expect("tracker");
+
+        let ProviderLastPromptRefresh::Current(Some(recovered)) = tracker.refresh() else {
+            panic!("bounded recovery should retain the latest prompt");
+        };
+        assert_eq!(recovered.text, "prompt before a long turn");
+    }
+
+    #[test]
+    fn last_prompt_tracker_consumes_appends_without_recovering_again() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let transcript = tmp.path().join("codex.jsonl");
+        fs::write(&transcript, codex_line("cold prompt")).expect("write prompt");
+        let mut tracker = ProviderLastPromptTracker::open_path(
+            ProviderKind::Codex,
+            "codex-id",
+            transcript.clone(),
+            Duration::ZERO,
+        )
+        .expect("tracker");
+        assert!(matches!(
+            tracker.refresh(),
+            ProviderLastPromptRefresh::Current(Some(LastPrompt { ref text, .. }))
+                if text == "cold prompt"
+        ));
+
+        append(&transcript, codex_line("appended prompt").as_bytes());
+        append(
+            &transcript,
+            format!("{}\n", " ".repeat(1024 * 1024)).as_bytes(),
+        );
+        assert!(matches!(
+            tracker.refresh(),
+            ProviderLastPromptRefresh::Current(Some(LastPrompt { ref text, .. }))
+                if text == "appended prompt"
+        ));
+    }
+
+    #[test]
+    fn last_prompt_tracker_invalidates_stale_prompt_after_truncation() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let transcript = tmp.path().join("codex.jsonl");
+        fs::write(&transcript, codex_line("must not survive")).expect("write prompt");
+        let mut tracker = ProviderLastPromptTracker::open_path(
+            ProviderKind::Codex,
+            "codex-id",
+            transcript.clone(),
+            Duration::ZERO,
+        )
+        .expect("tracker");
+        assert!(matches!(
+            tracker.refresh(),
+            ProviderLastPromptRefresh::Current(Some(_))
+        ));
+
+        fs::write(&transcript, "").expect("truncate");
+        assert_eq!(tracker.refresh(), ProviderLastPromptRefresh::Invalidated);
     }
 
     fn record(agent: &str, session_id: &str) -> SessionRecord {

@@ -8,20 +8,20 @@
 - Source document: `docs/plans/2026-07-20-codex-last-prompt-recovery/codex-last-prompt-recovery-plan.md`
 - Implementation source: `docs/plans/2026-07-20-codex-last-prompt-recovery/codex-last-prompt-recovery-discussion-source.md`
 - Direct source-doc execution waiver: not applicable.
-- Tracking issue: pending
+- Tracking issue: <https://github.com/sympoies/nils-cli/issues/1340>
 - Branch: `fix/codex-last-prompt-recovery`
 - Worktree: managed by `git-cli worktree`
-- Active task: 1.1
-- Last checkpoint: implementation prepared; regression test not yet written
+- Active task: 2.1
+- Last checkpoint: Sprint 1 complete; focused tests and docs-only validation pass
 
 ## Task ledger
 
 | Task | State | Evidence |
 | --- | --- | --- |
-| 1.1 Meaningful red test | active | pending |
-| 1.2 Bounded recovery and tracking | pending | blocked by 1.1 |
-| 1.3 Runtime contract docs | pending | blocked by 1.2 |
-| 2.1 Validate, review, merge | pending | blocked by Sprint 1 |
+| 1.1 Meaningful red test | done | Retained test-first failure evidence |
+| 1.2 Bounded recovery and tracking | done | Provider-prompt focused suite passes |
+| 1.3 Runtime contract docs | done | Docs-only gate passes |
+| 2.1 Validate, review, merge | active | Finish-line validation pending |
 | 2.2 Release, deploy, live verify | pending | blocked by 2.1 and release consent |
 
 ## Scope decisions

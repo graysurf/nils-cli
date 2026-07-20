@@ -57,8 +57,9 @@ use crate::codex_app_server::{self, ControlHandle};
 use crate::coordination::server as coordination_server;
 use crate::maintenance::{self, MaintenanceActionRequest, MaintenanceOperation};
 use crate::provider_prompt::{
-    MAX_LAST_PROMPT_TAIL_BYTES, MAX_PROVIDER_PROMPT_BYTES, PROVIDER_PROMPT_CAPABILITY,
-    ProviderKind, ProviderPromptEvent, ProviderPromptSource, ProviderPromptTail, read_last_prompt,
+    LastPrompt, MAX_PROVIDER_PROMPT_BYTES, PROVIDER_PROMPT_CAPABILITY, ProviderKind,
+    ProviderLastPromptRefresh, ProviderLastPromptTracker, ProviderPromptEvent,
+    ProviderPromptSource, ProviderPromptTail,
 };
 use crate::{
     BINARY, CliContext, CliError, ProviderResumeImportArgs, SessionRecord, SessionRegistryFence,
@@ -2823,13 +2824,10 @@ async fn list_handler(State(state): State<Arc<ServeState>>) -> Response {
 /// Best-effort enrichment: attach each running Codex/Claude session's most recent
 /// user prompt to the list projection.
 ///
-/// The prompt is read on demand from the provider transcript — the source of
-/// truth for every input path (console HTTP, Termius SSH, raw `tmux attach`) — and
-/// returned in the response only; it is never persisted by the daemon. The
-/// transcript path resolves through the bounded, backed-off discovery registry so
-/// a cold lookup never triggers an unbounded per-poll scan, and a turn that writes
-/// more than `MAX_LAST_PROMPT_TAIL_BYTES` after its prompt is a tolerated miss (the
-/// preview is simply omitted for that poll).
+/// The prompt is recovered from a bounded provider-transcript window when the
+/// exact source is first discovered, then refreshed from appended bytes only.
+/// The latest value remains process-local and is returned in the response only;
+/// it is never persisted by the daemon.
 async fn enrich_last_prompts(state: &Arc<ServeState>, sessions: &mut [SessionView]) {
     for session in sessions.iter_mut() {
         if session.status == "stopped" || !matches!(session.agent.as_str(), "codex" | "claude") {
@@ -2842,19 +2840,7 @@ async fn enrich_last_prompts(state: &Arc<ServeState>, sessions: &mut [SessionVie
         else {
             continue;
         };
-        let Some(source) = state
-            .provider_prompt_discovery
-            .resolve_source(&record)
-            .await
-        else {
-            continue;
-        };
-        session.last_prompt = tokio::task::spawn_blocking(move || {
-            read_last_prompt(&source, MAX_LAST_PROMPT_TAIL_BYTES)
-        })
-        .await
-        .ok()
-        .flatten();
+        session.last_prompt = state.provider_prompt_discovery.last_prompt(&record).await;
     }
 }
 
@@ -5534,6 +5520,7 @@ struct ProviderPromptDiscoveryKey {
 
 struct ProviderPromptDiscoverySlot {
     source: Option<ProviderPromptSource>,
+    last_prompt_tracker: Arc<StdMutex<Option<ProviderLastPromptTracker>>>,
     in_flight: bool,
     progress: tokio::sync::watch::Sender<u64>,
     next_scan_at: Option<Instant>,
@@ -5602,6 +5589,7 @@ impl Default for ProviderPromptDiscoverySlot {
         let (progress, _) = tokio::sync::watch::channel(0);
         Self {
             source: None,
+            last_prompt_tracker: Arc::new(StdMutex::new(None)),
             in_flight: false,
             progress,
             next_scan_at: None,
@@ -5724,6 +5712,48 @@ impl ProviderPromptDiscoveryRegistry {
         }
     }
 
+    async fn last_prompt(&self, record: &crate::SessionRecord) -> Option<LastPrompt> {
+        let key = ProviderPromptDiscoveryKey::from_record(record)?;
+        let source = self.resolve_source(record).await?;
+        let tracker_cell = {
+            let slot = self.entries.lock().await.get(&key).cloned()?;
+            slot.lock().await.last_prompt_tracker.clone()
+        };
+        let task_cell = tracker_cell.clone();
+        let refresh = tokio::task::spawn_blocking(move || {
+            let Ok(mut tracker) = task_cell.lock() else {
+                return ProviderLastPromptRefresh::Invalidated;
+            };
+            if tracker.is_none() {
+                *tracker = ProviderLastPromptTracker::open_source(source);
+            }
+            let Some(tracker) = tracker.as_mut() else {
+                return ProviderLastPromptRefresh::Invalidated;
+            };
+            tracker.refresh()
+        })
+        .await
+        .unwrap_or(ProviderLastPromptRefresh::Invalidated);
+
+        let tracker_is_current = {
+            let slot = self.entries.lock().await.get(&key).cloned();
+            match slot {
+                Some(slot) => Arc::ptr_eq(&slot.lock().await.last_prompt_tracker, &tracker_cell),
+                None => false,
+            }
+        };
+        if !tracker_is_current {
+            return None;
+        }
+        match refresh {
+            ProviderLastPromptRefresh::Current(prompt) => prompt,
+            ProviderLastPromptRefresh::Invalidated => {
+                self.invalidate_source(record).await;
+                None
+            }
+        }
+    }
+
     async fn invalidate_source(&self, record: &crate::SessionRecord) {
         let Some(key) = ProviderPromptDiscoveryKey::from_record(record) else {
             return;
@@ -5732,6 +5762,7 @@ impl ProviderPromptDiscoveryRegistry {
         if let Some(slot) = slot {
             let mut state = slot.lock().await;
             state.source = None;
+            state.last_prompt_tracker = Arc::new(StdMutex::new(None));
             state.next_scan_at = None;
             state.backoff = PROVIDER_PROMPT_PENDING_POLL_INTERVAL;
         }
@@ -7863,6 +7894,87 @@ mod tests {
         assert_eq!(registry.scan_attempts(&record).await, 1);
         assert!(registry.resolve_source(&record).await.is_none());
         assert_eq!(registry.scan_attempts(&record).await, 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn provider_prompt_discovery_recovers_and_tracks_long_codex_turns() {
+        let lock = GlobalStateLock::new();
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let codex_home = tmp.path().join("codex-home");
+        let transcript = codex_home.join("sessions/2026/07/session.jsonl");
+        std::fs::create_dir_all(transcript.parent().expect("transcript parent"))
+            .expect("transcript dir");
+        let provider_id = "long-codex-provider";
+        let metadata = format!(
+            "{}\n",
+            json!({
+                "type":"session_meta",
+                "payload":{
+                    "id":provider_id,
+                    "session_id":provider_id,
+                    "cwd":"/tmp",
+                    "source":"cli",
+                    "timestamp":"2099-01-01T00:00:00Z"
+                }
+            })
+        );
+        let prompt_line = |text: &str| {
+            format!(
+                "{}\n",
+                json!({
+                    "type":"event_msg",
+                    "payload":{"type":"user_message","message":text}
+                })
+            )
+        };
+        let long_output = format!("{}\n", " ".repeat(1024 * 1024));
+        std::fs::write(
+            &transcript,
+            format!("{metadata}{}{}", prompt_line("cold prompt"), long_output),
+        )
+        .expect("transcript");
+        let _codex_home = EnvGuard::set(&lock, "CODEX_HOME", codex_home.to_str().unwrap());
+        let mut record = provider_discovery_record("long-codex", "hs-long-codex", "launch", 1);
+        record.agent = "codex".to_string();
+        let resume = record.provider_resume.as_mut().expect("provider resume");
+        resume.provider = "codex".to_string();
+        resume.session_id = provider_id.to_string();
+        let registry = ProviderPromptDiscoveryRegistry::default();
+
+        assert_eq!(
+            registry
+                .last_prompt(&record)
+                .await
+                .map(|prompt| prompt.text),
+            Some("cold prompt".to_string())
+        );
+        OpenOptions::new()
+            .append(true)
+            .open(&transcript)
+            .expect("append transcript")
+            .write_all(prompt_line("appended prompt").as_bytes())
+            .expect("append prompt");
+        assert_eq!(
+            registry
+                .last_prompt(&record)
+                .await
+                .map(|prompt| prompt.text),
+            Some("appended prompt".to_string())
+        );
+
+        std::fs::write(
+            &transcript,
+            format!("{metadata}{}", prompt_line("replacement prompt")),
+        )
+        .expect("replace transcript");
+        assert_eq!(registry.last_prompt(&record).await, None);
+        assert_eq!(
+            registry
+                .last_prompt(&record)
+                .await
+                .map(|prompt| prompt.text),
+            Some("replacement prompt".to_string())
+        );
     }
 
     #[tokio::test]

@@ -60,6 +60,27 @@ Browser WebSocket clients cannot set an `Authorization` header. The edge must
 proxy the attach and inject the bearer server-side; never put the token in a
 WebSocket URL or query string.
 
+## Prompt preview lifecycle
+
+`GET /sessions` may return a running Codex or Claude session's `last_prompt`
+only when the record carries an exact provider resume identity and the matching
+regular transcript can be validated. On first discovery the daemon establishes
+an append offset, cold-recovers from at most the final 64 MiB, then retains only
+the latest bounded preview in process memory. Later list requests process bounded
+appended chunks instead of repeating the cold scan.
+
+The preview cache is not daemon state: it is never written to the session record,
+logs, or diagnostics, and a daemon restart reconstructs it from the provider
+transcript. Transcript rotation, truncation, replacement, or identity drift
+clears the cached value and requires exact rediscovery; one list response may
+therefore omit the preview during recovery. A missing provider resume identity
+remains an intentional omission, not permission to scan for a likely transcript.
+
+Because `GET /sessions` is open on the loopback bind, treat prompt previews as
+sensitive local-user data. Aggregate health checks should count preview presence
+by provider without printing prompt text, session ids, resume ids, or transcript
+paths.
+
 ## Create a session
 
 `POST /sessions` accepts JSON. For example:
