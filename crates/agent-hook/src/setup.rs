@@ -21,6 +21,8 @@ const CODEX_BLOCK_START: &str = "# >>> agent-hook:provider-ingress:v1 >>>";
 const CODEX_BLOCK_END: &str = "# <<< agent-hook:provider-ingress:v1 <<<";
 const RUNTIME_KIT_BLOCK_START: &str = "# >>> agent-runtime-kit:hooks >>>";
 const RUNTIME_KIT_BLOCK_END: &str = "# <<< agent-runtime-kit:hooks <<<";
+const AGENT_SESSION_BLOCK_START: &str = "# >>> agent-session:codex-hooks >>>";
+const AGENT_SESSION_BLOCK_END: &str = "# <<< agent-session:codex-hooks <<<";
 const DISPATCH_TIMEOUT_SECONDS: i64 = 60;
 const PRIOR_DISPATCH_TIMEOUT_SECONDS: i64 = 10;
 const SESSION_COORDINATION_HANDLER: &str = "session-coordination-guard.py";
@@ -325,12 +327,14 @@ fn build_codex_plan(
         .map_err(|_| HookError::data("provider-config-invalid", "Codex config is not UTF-8"))?
         .unwrap_or_default();
     let (boundary_repaired_raw, trust_boundary_repaired) = repair_codex_trust_boundary(raw)?;
-    boundary_repaired_raw.parse::<DocumentMut>().map_err(|_| {
+    let (marker_repaired_raw, legacy_markers_repaired) =
+        repair_retired_agent_session_markers(&boundary_repaired_raw)?;
+    marker_repaired_raw.parse::<DocumentMut>().map_err(|_| {
         HookError::data("provider-config-invalid", "Codex config is not valid TOML")
     })?;
     let expected_block = render_codex_block(&groups, product);
     let (stripped, owned_before, drifted) =
-        strip_codex_block(&boundary_repaired_raw, &expected_block)?;
+        strip_codex_block(&marker_repaired_raw, &expected_block)?;
     let mut document = stripped.parse::<DocumentMut>().map_err(|_| {
         HookError::data("provider-config-invalid", "Codex config is not valid TOML")
     })?;
@@ -354,6 +358,7 @@ fn build_codex_plan(
         && legacy_before == 0
         && !notify.changed
         && !trust_boundary_repaired
+        && !legacy_markers_repaired
     {
         candidate = original.clone();
     }
@@ -1005,6 +1010,39 @@ fn toml_marker_line_ranges(
                 .then_some((start, offset))
         })
         .collect()
+}
+
+fn repair_retired_agent_session_markers(raw: &str) -> Result<(String, bool), HookError> {
+    let multiline_value_lines = toml_multiline_value_line_starts(raw);
+    let starts = toml_marker_line_ranges(raw, AGENT_SESSION_BLOCK_START, &multiline_value_lines);
+    let ends = toml_marker_line_ranges(raw, AGENT_SESSION_BLOCK_END, &multiline_value_lines);
+    if starts.is_empty() && ends.is_empty() {
+        return Ok((raw.to_string(), false));
+    }
+
+    let ranges = match (starts.as_slice(), ends.as_slice()) {
+        ([(start_begin, start_end)], [(end_begin, end_end)]) if start_begin < end_begin => {
+            vec![(*start_begin, *start_end), (*end_begin, *end_end)]
+        }
+        ([], [(end_begin, end_end)]) => {
+            // v1.25.5 serialized away the opening marker when every handler in
+            // the retired agent-session block was migrated. Accept only that
+            // exact orphaned closing line so a subsequent setup can recover.
+            vec![(*end_begin, *end_end)]
+        }
+        _ => {
+            return Err(HookError::data(
+                "provider-config-invalid",
+                "Codex config has an ambiguous retired agent-session marker layout",
+            ));
+        }
+    };
+
+    let mut repaired = raw.to_string();
+    for (begin, end) in ranges.into_iter().rev() {
+        repaired.replace_range(begin..end, "");
+    }
+    Ok((repaired, true))
 }
 
 fn collect_explicit_toml_table_paths(

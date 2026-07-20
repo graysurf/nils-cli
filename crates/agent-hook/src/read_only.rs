@@ -638,10 +638,11 @@ mod tests {
     #[test]
     fn descriptor_command_uses_the_request_bound_cwd() {
         let (temp, candidate, _) = fixture();
+        let expected = temp.path().canonicalize().expect("canonical fixture cwd");
 
         assert_eq!(
             candidate.descriptor_command().get_current_dir(),
-            Some(temp.path())
+            Some(expected.as_path())
         );
     }
 }
