@@ -27,6 +27,7 @@ pub mod pr_merge;
 pub mod pr_pending_review;
 pub mod pr_ready;
 pub mod pr_review;
+pub mod pr_review_loop;
 pub mod pr_review_thread_reply;
 pub mod pr_review_thread_resolve;
 pub mod pr_review_threads;

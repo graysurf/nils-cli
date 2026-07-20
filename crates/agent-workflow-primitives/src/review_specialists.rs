@@ -95,6 +95,8 @@ struct PrCommentView {
 
 const FINDINGS_SCHEMA: &str = "review-specialists.findings.v1";
 const MERGED_SCHEMA: &str = "review-specialists.merged.v1";
+const DELIVERY_FINDINGS_SCHEMA: &str = "review-specialists.findings.v2";
+const DELIVERY_MERGED_SCHEMA: &str = "review-specialists.merged.v2";
 const SCOPE_SCHEMA: &str = "review-specialists.scope.v1";
 const VALIDATE_SCHEMA_VERSION: &str = "cli.review-specialists.validate.v1";
 const MERGE_SCHEMA_VERSION: &str = "cli.review-specialists.merge.v1";
@@ -154,7 +156,7 @@ where
 
 fn command_validate(args: ValidateArgs) -> i32 {
     let format = args.common.format;
-    match validate_inputs(&args.inputs, path_policy(&args)) {
+    match validate_inputs(&args.inputs, path_policy(&args), args.mode) {
         Ok(result) => render_success(
             VALIDATE_SCHEMA_VERSION,
             VALIDATE_COMMAND,
@@ -168,7 +170,7 @@ fn command_validate(args: ValidateArgs) -> i32 {
 
 fn command_merge(args: MergeArgs) -> i32 {
     let format = args.common.format;
-    match merge_from_inputs(&args.inputs, args.display_threshold) {
+    match merge_from_inputs(&args.inputs, args.display_threshold, args.mode) {
         Ok(result) => {
             if let Some(summary_out) = &args.summary_out
                 && let Err(err) = write_text(
@@ -262,6 +264,7 @@ fn path_policy(args: &ValidateArgs) -> PathPolicy {
 fn validate_inputs(
     inputs: &[PathBuf],
     path_policy: PathPolicy,
+    mode: ReviewMode,
 ) -> Result<ValidateResult, CliError> {
     if inputs.is_empty() {
         return Err(CliError::usage(
@@ -274,7 +277,7 @@ fn validate_inputs(
     let mut findings = Vec::new();
     let mut errors = Vec::new();
     for input in inputs {
-        match parse_jsonl(input, &path_policy) {
+        match parse_jsonl(input, &path_policy, mode) {
             Ok(mut parsed) => findings.append(&mut parsed),
             Err(mut parsed_errors) => errors.append(&mut parsed_errors),
         }
@@ -285,25 +288,48 @@ fn validate_inputs(
     }
 
     Ok(ValidateResult {
-        schema: FINDINGS_SCHEMA.to_string(),
+        schema: match mode {
+            ReviewMode::Advisory => FINDINGS_SCHEMA,
+            ReviewMode::Delivery => DELIVERY_FINDINGS_SCHEMA,
+        }
+        .to_string(),
         input_files: inputs.iter().map(|path| display_path(path)).collect(),
         findings_count: findings.len(),
         findings,
     })
 }
 
-fn merge_from_inputs(inputs: &[PathBuf], display_threshold: f64) -> Result<MergeResult, CliError> {
+fn merge_from_inputs(
+    inputs: &[PathBuf],
+    display_threshold: f64,
+    mode: ReviewMode,
+) -> Result<MergeResult, CliError> {
     validate_threshold(display_threshold)?;
-    let validated = validate_inputs(inputs, PathPolicy::default())?;
-    Ok(merge_validated(validated, display_threshold))
+    let validated = validate_inputs(inputs, PathPolicy::default(), mode)?;
+    validate_delivery_collisions(&validated.findings, mode)?;
+    Ok(merge_validated(validated, display_threshold, mode))
 }
 
-fn merge_validated(validated: ValidateResult, display_threshold: f64) -> MergeResult {
+fn merge_validated(
+    validated: ValidateResult,
+    display_threshold: f64,
+    mode: ReviewMode,
+) -> MergeResult {
     let mut by_fingerprint: BTreeMap<String, MergedFindingBuilder> = BTreeMap::new();
     for finding in &validated.findings {
+        let lifecycle_fingerprint = match mode {
+            ReviewMode::Advisory => finding.fingerprint.clone(),
+            ReviewMode::Delivery => finding
+                .root_cause_fingerprint
+                .as_ref()
+                .unwrap_or(&finding.fingerprint)
+                .clone(),
+        };
         by_fingerprint
-            .entry(finding.fingerprint.clone())
-            .or_insert_with(|| MergedFindingBuilder::new(finding.clone()))
+            .entry(lifecycle_fingerprint.clone())
+            .or_insert_with(|| {
+                MergedFindingBuilder::new(finding.clone(), lifecycle_fingerprint, mode)
+            })
             .push(finding.clone());
     }
 
@@ -326,7 +352,11 @@ fn merge_validated(validated: ValidateResult, display_threshold: f64) -> MergeRe
     let red_team = red_team_from_findings(&findings);
 
     MergeResult {
-        schema: MERGED_SCHEMA.to_string(),
+        schema: match mode {
+            ReviewMode::Advisory => MERGED_SCHEMA,
+            ReviewMode::Delivery => DELIVERY_MERGED_SCHEMA,
+        }
+        .to_string(),
         input_files: validated.input_files,
         display_threshold,
         counts: FindingCounts {
@@ -344,8 +374,9 @@ fn merge_validated(validated: ValidateResult, display_threshold: f64) -> MergeRe
 
 fn build_bundle(args: &BundleArgs) -> Result<BundleResult, CliError> {
     validate_threshold(args.display_threshold)?;
-    let validated = validate_inputs(&args.inputs, PathPolicy::default())?;
-    let merged = merge_validated(validated.clone(), args.display_threshold);
+    let validated = validate_inputs(&args.inputs, PathPolicy::default(), args.mode)?;
+    validate_delivery_collisions(&validated.findings, args.mode)?;
+    let merged = merge_validated(validated.clone(), args.display_threshold, args.mode);
     let report = render_report(
         &merged,
         RenderContext::from_args(
@@ -406,6 +437,7 @@ fn build_bundle(args: &BundleArgs) -> Result<BundleResult, CliError> {
 fn parse_jsonl(
     input: &Path,
     path_policy: &PathPolicy,
+    mode: ReviewMode,
 ) -> Result<Vec<NormalizedFinding>, Vec<RowError>> {
     let body = match fs::read_to_string(input) {
         Ok(body) => body,
@@ -425,7 +457,7 @@ fn parse_jsonl(
         if line.trim().is_empty() {
             continue;
         }
-        match parse_finding_line(input, line_number, line, path_policy) {
+        match parse_finding_line(input, line_number, line, path_policy, mode) {
             Ok(finding) => findings.push(finding),
             Err(error) => errors.push(error),
         }
@@ -443,6 +475,7 @@ fn parse_finding_line(
     line_number: usize,
     line: &str,
     path_policy: &PathPolicy,
+    mode: ReviewMode,
 ) -> Result<NormalizedFinding, RowError> {
     let source_file = display_path(input);
     let value: Value = serde_json::from_str(line).map_err(|err| {
@@ -470,6 +503,7 @@ fn parse_finding_line(
         "evidence",
         "recommendation",
         "fingerprint",
+        "root_cause_fingerprint",
         "specialist",
         "test_suggestion",
     ]
@@ -541,6 +575,40 @@ fn parse_finding_line(
     )?;
     let explicit_fingerprint =
         optional_string(object.get("fingerprint"), "fingerprint", input, line_number)?;
+    let root_cause_fingerprint = optional_string(
+        object.get("root_cause_fingerprint"),
+        "root_cause_fingerprint",
+        input,
+        line_number,
+    )?;
+    if mode == ReviewMode::Delivery && explicit_fingerprint.is_none() {
+        return Err(RowError::typed(
+            display_path(input),
+            line_number,
+            "review_fingerprint_required",
+            "delivery findings require an explicit stable fingerprint",
+        ));
+    }
+    if mode == ReviewMode::Delivery
+        && let Some(fingerprint) = explicit_fingerprint.as_deref()
+    {
+        validate_stable_fingerprint(fingerprint, "fingerprint", input, line_number)?;
+        if fingerprint.split(':').next() != Some(category.as_str()) {
+            return Err(RowError::typed(
+                display_path(input),
+                line_number,
+                "review_fingerprint_collision",
+                format!(
+                    "fingerprint category must match finding category: fingerprint={fingerprint}; category={category}"
+                ),
+            ));
+        }
+    }
+    if mode == ReviewMode::Delivery
+        && let Some(root) = root_cause_fingerprint.as_deref()
+    {
+        validate_stable_fingerprint(root, "root_cause_fingerprint", input, line_number)?;
+    }
     let fingerprint = explicit_fingerprint
         .unwrap_or_else(|| computed_fingerprint(&path, line_value, &category, &summary));
 
@@ -556,6 +624,7 @@ fn parse_finding_line(
         evidence,
         recommendation,
         fingerprint,
+        root_cause_fingerprint,
         specialist,
         test_suggestion,
         source_file: display_path(input),
@@ -737,11 +806,75 @@ fn validate_path_policy(
 }
 
 fn validation_error(errors: Vec<RowError>) -> CliError {
+    let typed_code = errors
+        .iter()
+        .find_map(|error| error.code.as_deref())
+        .unwrap_or("invalid-findings");
     CliError::data(
-        "invalid-findings",
+        typed_code,
         format!("{} finding row(s) failed validation", errors.len()),
         Some(json!({ "errors": errors })),
     )
+}
+
+fn validate_stable_fingerprint(
+    fingerprint: &str,
+    field: &str,
+    input: &Path,
+    line_number: usize,
+) -> Result<(), RowError> {
+    let parts = fingerprint.split(':').collect::<Vec<_>>();
+    let valid = parts.len() == 3 && parts.iter().all(|part| stable_fingerprint_part(part));
+    if valid {
+        return Ok(());
+    }
+    Err(RowError::typed(
+        display_path(input),
+        line_number,
+        "review_fingerprint_collision",
+        format!("{field} must have stable <category>:<component>:<invariant> form: {fingerprint}"),
+    ))
+}
+
+fn stable_fingerprint_part(part: &str) -> bool {
+    !part.is_empty()
+        && !part.starts_with('-')
+        && !part.ends_with('-')
+        && part
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+}
+
+fn validate_delivery_collisions(
+    findings: &[NormalizedFinding],
+    mode: ReviewMode,
+) -> Result<(), CliError> {
+    if mode != ReviewMode::Delivery {
+        return Ok(());
+    }
+    let mut identities: BTreeMap<&str, (&str, Option<&str>)> = BTreeMap::new();
+    for finding in findings {
+        let identity = (
+            finding.category.as_str(),
+            finding.root_cause_fingerprint.as_deref(),
+        );
+        if let Some(previous) = identities.insert(finding.fingerprint.as_str(), identity)
+            && previous != identity
+        {
+            return Err(CliError::data(
+                "review_fingerprint_collision",
+                "one lifecycle fingerprint describes incompatible category or root-cause identities",
+                Some(json!({
+                    "fingerprint": finding.fingerprint,
+                    "previous_category": previous.0,
+                    "observed_category": identity.0,
+                    "previous_root_cause_fingerprint": previous.1,
+                    "observed_root_cause_fingerprint": identity.1,
+                })),
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn validate_threshold(threshold: f64) -> Result<(), CliError> {
@@ -1462,6 +1595,10 @@ struct ValidateArgs {
     #[command(flatten)]
     common: CommonArgs,
 
+    /// Fingerprint policy. Delivery requires stable lifecycle identities.
+    #[arg(long, value_enum, default_value_t = ReviewMode::Advisory)]
+    mode: ReviewMode,
+
     /// Specialist finding JSONL input file.
     #[arg(long = "input", value_name = "FILE", required = true, value_hint = ValueHint::FilePath)]
     inputs: Vec<PathBuf>,
@@ -1483,6 +1620,10 @@ struct ValidateArgs {
 struct MergeArgs {
     #[command(flatten)]
     common: CommonArgs,
+
+    /// Fingerprint policy. Delivery requires stable lifecycle identities.
+    #[arg(long, value_enum, default_value_t = ReviewMode::Advisory)]
+    mode: ReviewMode,
 
     /// Specialist finding JSONL input file.
     #[arg(long = "input", value_name = "FILE", required = true, value_hint = ValueHint::FilePath)]
@@ -1531,6 +1672,10 @@ struct RenderArgs {
 struct BundleArgs {
     #[command(flatten)]
     common: CommonArgs,
+
+    /// Fingerprint policy. Delivery requires stable lifecycle identities.
+    #[arg(long, value_enum, default_value_t = ReviewMode::Advisory)]
+    mode: ReviewMode,
 
     /// Specialist finding JSONL input file.
     #[arg(long = "input", value_name = "FILE", required = true, value_hint = ValueHint::FilePath)]
@@ -1625,6 +1770,15 @@ enum RenderProfile {
     Evidence,
 }
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize, ValueEnum)]
+#[serde(rename_all = "kebab-case")]
+#[value(rename_all = "kebab-case")]
+enum ReviewMode {
+    #[default]
+    Advisory,
+    Delivery,
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 enum Severity {
@@ -1660,6 +1814,8 @@ struct NormalizedFinding {
     evidence: String,
     recommendation: String,
     fingerprint: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    root_cause_fingerprint: Option<String>,
     specialist: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     test_suggestion: Option<String>,
@@ -1670,6 +1826,8 @@ struct NormalizedFinding {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 struct MergedFinding {
     fingerprint: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    lifecycle_fingerprint: Option<String>,
     primary: NormalizedFinding,
     confirming_specialists: Vec<String>,
     confirming_count: usize,
@@ -1823,6 +1981,8 @@ impl ScopeResult {
 struct RowError {
     source_file: String,
     source_line: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    code: Option<String>,
     message: String,
 }
 
@@ -1831,7 +1991,22 @@ impl RowError {
         Self {
             source_file,
             source_line,
+            code: None,
             message,
+        }
+    }
+
+    fn typed(
+        source_file: String,
+        source_line: usize,
+        code: impl Into<String>,
+        message: impl Into<String>,
+    ) -> Self {
+        Self {
+            source_file,
+            source_line,
+            code: Some(code.into()),
+            message: message.into(),
         }
     }
 }
@@ -1846,13 +2021,17 @@ struct PathPolicy {
 #[derive(Debug)]
 struct MergedFindingBuilder {
     primary: NormalizedFinding,
+    lifecycle_fingerprint: String,
+    mode: ReviewMode,
     rows: Vec<NormalizedFinding>,
 }
 
 impl MergedFindingBuilder {
-    fn new(primary: NormalizedFinding) -> Self {
+    fn new(primary: NormalizedFinding, lifecycle_fingerprint: String, mode: ReviewMode) -> Self {
         Self {
             primary,
+            lifecycle_fingerprint,
+            mode,
             rows: Vec::new(),
         }
     }
@@ -1884,6 +2063,8 @@ impl MergedFindingBuilder {
         });
         MergedFinding {
             fingerprint: self.primary.fingerprint.clone(),
+            lifecycle_fingerprint: (self.mode == ReviewMode::Delivery)
+                .then_some(self.lifecycle_fingerprint),
             primary: self.primary,
             confirming_specialists: confirming.iter().cloned().collect(),
             confirming_count: confirming.len(),
@@ -2121,6 +2302,7 @@ mod tests {
             evidence: format!("evidence for {summary}"),
             recommendation: recommendation.to_string(),
             fingerprint: computed_fingerprint(path, line, specialist, summary),
+            root_cause_fingerprint: None,
             specialist: specialist.to_string(),
             test_suggestion: None,
             source_file: "fixture.jsonl".to_string(),
@@ -2129,6 +2311,7 @@ mod tests {
         let fingerprint = primary.fingerprint.clone();
         MergedFinding {
             fingerprint,
+            lifecycle_fingerprint: None,
             primary,
             confirming_specialists: vec![specialist.to_string()],
             confirming_count: 1,

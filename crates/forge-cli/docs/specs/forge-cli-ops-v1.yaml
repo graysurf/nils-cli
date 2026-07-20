@@ -146,7 +146,7 @@ provider_resolution:
 
 review_state_contract:
   schema: forge-cli.review-loop.v1
-  storage: "append-only provider-visible PR issue comments authored by the currently authenticated viewer; marker-shaped comments from other actors are ignored"
+  storage: "append-only provider-visible PR issue comments authored by the current viewer or an OWNER/MEMBER/COLLABORATOR; marker-shaped comments from unprivileged actors are ignored"
   provider_marker_limit: "64 KiB per encoded state marker, validated before provider mutation"
   canonical_digest: "sha256:<lowercase hex> over compact UTF-8 JSON in declared field order"
   record:
@@ -333,7 +333,7 @@ operations:
         - { program: gh, argv: [api, graphql, -f, "query=<pending reviews with viewer ownership>", -f, "owner={owner}", -f, "name={repo}", -F, "pr={id}"] } # summary-only --submit-review: a viewer-owned pending review returns github_pending_review_exists. Threaded transactions use this as the complete membership read before exact-node inspection/resume.
         - { program: gh, argv: [api, "repos/{repo}/pulls/{id}/reviews", --method, POST, --raw-field, "body={comment_or_file}", --raw-field, "event={EVENT}", --raw-field, "commit_id={expected_head}", --jq, ".html_url"] } # with --submit-review (native review event); body field omitted for a body-less APPROVE; commit_id binds the mutation to --expected-head; review authored by the inherited gh token's identity
         - { program: gh, argv: [api, graphql, -f, "query=<pull request id lookup>", -f, "owner={owner}", -f, "name={repo}", -F, "number={id}"] } # with --thread-file: resolve the PR node id
-        - { program: gh, argv: [api, graphql, -f, "query=<authenticated viewer plus paginated PR issue comments>", -f, "owner={owner}", -f, "name={repo}", -F, "pr={id}", "-f after={cursor}?"] } # with --thread-file: retain only the authenticated viewer's comments, then read and validate the forge-cli.review-loop.v1 append-only state chain
+        - { program: gh, argv: [api, graphql, -f, "query=<authenticated viewer plus paginated PR issue comments with author association>", -f, "owner={owner}", -f, "name={repo}", -F, "pr={id}", "-f after={cursor}?"] } # with --thread-file: retain the current viewer's and privileged collaborators' comments, then read and validate the forge-cli.review-loop.v1 append-only state chain
         - { program: gh, argv: [api, "repos/{repo}/issues/{id}/comments", --method, POST, --raw-field, "body=<immutable review-run receipt marker>", --jq, ".html_url"] } # append one provider-bounded receipt before native-review mutation, then verify from the prior cursor/tail; semantically identical append retries and reruns reuse it
         - { program: gh, argv: [api, graphql, -f, "query=<complete submitted native reviews plus authenticated viewer>", -f, "owner={owner}", -f, "name={repo}", -F, "pr={id}", "-f after={cursor}?"] } # only when an exact receipt exists: idempotent success and lost-submit response detection require viewer author, expected head/state, untruncated marker, and complete receipt-bound thread manifest
         - { program: gh, argv: [api, graphql, -f, "query=<complete exact pending review and inline-comment manifest>", -f, "review={review_id}", "-f after={cursor}?"] } # exact receipt/body/head/commit/identity/manifest validation before any resumed mutation
@@ -671,6 +671,74 @@ operations:
         deleted: boolean
     notes: "destructive recovery requires an explicit --confirm-abandoned acknowledgement plus exact expected PR head, review commit, and review body. Expected and provider bodies are limited to 64 KiB; file and stdin inputs use bounded reads. The live command reads and validates a complete paginated pending-only membership snapshot while retaining only the target body, then re-fetches the exact target node immediately before mutation and revalidates PR membership, PENDING state, head, commit, normalized body, viewerDidAuthor, and viewerCanDelete. Inline draft comments fail with pending_review_inline_comments_present and require manual provider recovery. Body values and body-file paths are never emitted; dry-run validates a named body file and includes the exact-target plan. Only the revalidated node id is passed to deletePullRequestReview. GitHub exposes no content CAS for that mutation, so a small final-read-to-delete race remains despite the explicit confirmation and guards."
 
+  - id: pr.review-loop.inspect
+    schema_version: cli.forge-cli.pr.review-loop.inspect.v1
+    summary: Inspect the validated provider-visible review-loop chain and latest typed round state.
+    inputs:
+      - { name: <id>, type: integer, required: true }
+    backends:
+      github:
+        - { program: gh, argv: [pr, view, "{id}", --json, "number,url,...,headRefOid"] }
+        - { program: gh, argv: [api, graphql, -f, "query=<complete privileged review-state comments>", -f, "owner={owner}", -f, "name={repo}", -F, "pr={id}", "-f after={cursor}?"] }
+      gitlab: unsupported
+      local: unsupported
+    output:
+      data: object<{provider,number,url,state_tip_digest?,generation?,state?,appended:false}>
+    notes: "The append-only forge-cli.review-loop.v1 chain is completely paginated, hash-validated, and fork-checked. ReviewRunReceipt and ReviewLoop records share one chain; no second provider store is created."
+
+  - id: pr.review-loop.observe
+    schema_version: cli.forge-cli.pr.review-loop.observe.v1
+    summary: Observe one exact reviewed head and append an idempotent typed ledger transition.
+    inputs:
+      - { name: <id>, type: integer, required: true }
+      - { name: --expected-head, type: string, required: true }
+      - { name: --findings-file, type: path, required: true }
+      - { name: --expected-state, type: string, required: conditional }
+    validations:
+      - review_state_conflict
+      - review_fingerprint_collision
+      - review_finding_reopened
+      - review_no_progress
+      - review_round_limit_exceeded
+    backends:
+      github:
+        - { program: gh, argv: [pr, view, "{id}", --json, "number,url,...,headRefOid"] }
+        - { program: gh, argv: [api, graphql, -f, "query=<complete privileged review-state comments>", -F, "pr={id}"] }
+        - { program: gh, argv: [api, "repos/{repo}/issues/{id}/comments", --method, POST, --raw-field, "body=<canonical state marker>"] }
+        - { program: gh, argv: [api, graphql, -f, "query=<complete privileged review-state comments>", -F, "pr={id}"] }
+      gitlab: unsupported
+      local: unsupported
+    output:
+      data: object<{provider,number,url,state_tip_digest,generation,state,appended}>
+    notes: "Defaults are five repair rounds, two consecutive no-progress rounds, and zero automatic reopens. Same-head/same-finding retries append nothing; a same-head subset cannot clear an open finding. Observation rows may carry status/disposition open|fixed|accepted|preference|follow-up, with terminal dispositions recorded non-blocking. A new head advances one round; strict cardinality shrink is the only mechanical progress signal. Extendable terminal errors append a durable hard-stop receipt before returning the exact extension proposal; they never approve, resolve, or merge."
+
+  - id: pr.review-loop.extend
+    schema_version: cli.forge-cli.pr.review-loop.extend.v1
+    summary: Consume one exact post-stop maintainer approval and append one budget extension.
+    inputs:
+      - { name: <id>, type: integer, required: true }
+      - { name: --expected-head, type: string, required: true }
+      - { name: --expected-state, type: string, required: true }
+      - { name: --stop-code, type: string, required: true }
+      - { name: --budget-field, type: enum<max_repair_rounds|max_no_progress_rounds|max_auto_reopens_per_fingerprint>, required: true }
+      - { name: --increment, type: integer, default: 1 }
+      - { name: --proposal-digest, type: string, required: true }
+      - { name: --approval-comment, type: integer, required: true }
+    validations:
+      - review_state_conflict
+      - review_extension_invalid
+      - review_extension_replayed
+      - review_extension_approval_invalid
+    backends:
+      github:
+        - { program: gh, argv: [api, "repos/{repo}/issues/comments/{approval_comment}"] }
+        - { program: gh, argv: [api, "repos/{repo}/issues/{id}/comments", --method, POST, --raw-field, "body=<canonical state marker>"] }
+      gitlab: unsupported
+      local: unsupported
+    output:
+      data: object<{provider,number,url,state_tip_digest,generation,state,appended:true}>
+    notes: "This command is separate from delivery retry paths. It requires an active durable hard-stop receipt, the canonical stop-code/budget-field pair and exact one-step proposal, plus an OWNER/MEMBER/COLLABORATOR approval comment on the same PR that is newer than the stopped state tip and carries the exact marker. One proposal can be consumed once."
+
   - id: pr.tasks
     schema_version: cli.forge-cli.pr.tasks.v1
     summary: List GFM task-list items in the PR/MR description with their state.
@@ -711,6 +779,7 @@ operations:
       - merge_method_supported
       - keep_branch_conflict
       - review_convergence # only when explicit/repo/global require resolves true; requires a non-empty initial provider head; GitHub-only in v1; dry-run and live validate provider parity; final complete snapshot is re-read immediately before provider merge
+      - review_loop # when review convergence is enabled and a ledger exists: exact-head/no-open-findings gate plus unchanged-tip recheck immediately before merge
       - review_threads_resolved
       - tasklist_complete
     backends:
@@ -726,7 +795,8 @@ operations:
         unchecked_tasks_override_reason?: string # present only when --allow-unchecked-tasks bypass was used
         unresolved_threads_override_reason?: string # present only when --allow-unresolved-threads bypass was used
         stale_thread_dispositions?: 'list<{ thread_id: string, author: string, path: string, summary: string, disposition: "stale", rationale: string }>' # outdated unresolved threads dispositioned stale at rule 13; omitted when none
-        review_convergence: optional<{required, head_sha, observed_reviews, stale_reviews, unresolved_threads, changes_requested_by, missing_reviewers, latest_activity_at?, quiet_until?, quiet_period_ms, timeout_ms, waited_ms, bots}>
+        review_convergence: optional<{required, head_sha, observed_reviews, stale_reviews, semantic_activity, semantic_digest, unresolved_threads, changes_requested_by, missing_reviewers, latest_activity_at?, quiet_until?, quiet_period_ms, timeout_ms, waited_ms, bots}>
+        review_loop: optional<{state_tip_digest,head_sha,round,no_progress_rounds,open_blocking_findings}>
       dry_run_data:
         review_convergence: resolved<{require, quiet_period, timeout, bots}>
 

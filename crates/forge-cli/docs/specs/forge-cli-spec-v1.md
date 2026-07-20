@@ -555,9 +555,11 @@ backend mapping, validation rules, and output schema versions.
   `<!-- forge-cli:review-run:v1 run=<review_run_id> -->`, and
   `<!-- forge-cli:review-finding:v1 run=<review_run_id> digest=<body_digest> -->`.
   Owned markers remain in raw provider content but are removed before semantic
-  body comparison and digesting. State reads bind the authenticated viewer and
-  retain only that viewer's PR issue comments; marker-shaped comments from
-  other actors cannot extend or poison the transaction chain.
+  body comparison and digesting. State reads retain comments authored by the
+  authenticated viewer or a provider-classified `OWNER`, `MEMBER`, or
+  `COLLABORATOR`; marker-shaped comments from unprivileged actors cannot extend
+  or poison the transaction chain. This lets a later authorized session resume
+  the same provider-visible chain without a machine-local ledger.
 - Receipt fields intentionally exclude authentication tokens, credentials,
   environment-variable values, local paths, and private identity/profile names.
   The durable identity route contains only portable lens names and the semantic
@@ -600,6 +602,36 @@ backend mapping, validation rules, and output schema versions.
   `pending_review_commit_mismatch`, `pending_review_manifest_mismatch`,
   `pending_review_identity_mismatch`, `pending_review_pr_mismatch`, or
   `pending_review_not_found` with no mutation.
+
+### `pr review-loop inspect` / `observe` / `extend`
+
+- These GitHub-only commands make the repair/re-review loop resumable from the
+  append-only `forge-cli.review-loop.v1` chain. `inspect <id>` validates the
+  complete chain and emits its typed latest state. `observe <id>
+  --expected-head <sha> --findings-file <path> [--expected-state <digest>]`
+  accepts either a delivery-mode `review-specialists merge` envelope or a
+  finding-observation array, evaluates one deterministic transition, and uses
+  both the exact PR head and state tip as compare-and-swap inputs.
+- Observation-array rows may include `status` or `disposition` with `open`,
+  `fixed`, `accepted`, `preference`, or `follow-up`. Terminal dispositions are
+  durable and non-blocking. Omitting an open finding or changing its blocking
+  bit on the same head is not a disposition and fails closed.
+- The default budget is five repair rounds, two consecutive no-progress rounds,
+  and zero automatic reopens for a previously fixed lifecycle fingerprint.
+  Same-head/same-findings retries append nothing. Only a new reviewed head
+  advances a round, and only a strict reduction in open-finding cardinality is
+  mechanical progress. Stable-fingerprint collisions, reopens, no progress,
+  and the round limit fail closed as typed terminal errors. An extendable error
+  first appends a durable hard-stop receipt, so a restart returns the same stop.
+- A durable terminal budget error includes an exact extension proposal, but
+  never extends itself. `extend` is a separate action requiring the stopped state tip,
+  expected head, proposal digest, field/increment, stop code, and a newer
+  comment on the same PR from an `OWNER`, `MEMBER`, or `COLLABORATOR` carrying
+  the exact approval marker. The stop code must map to its canonical budget
+  field and the proposal must match the active receipt. Each proposal is
+  consumable once; retry and delivery paths cannot silently increase a budget.
+- All three commands emit their own `cli.forge-cli.pr.review-loop.*.v1` schema.
+  Dry-run is offline and reports the command-specific read/transition plan.
 
 ### `pr pending-review delete` compatibility surface
 
@@ -848,6 +880,12 @@ backend mapping, validation rules, and output schema versions.
     stayed quiet for the resolved quiet period; the initial provider view must
     also expose a non-empty head OID or the merge fails closed with
     `review_convergence_head_missing`;
+  - existing review-loop ledgers are gated independently of the quiet-
+    convergence override: the latest typed state is bound to the exact merge
+    head, has no active hard stop, and has no open blocking findings. Enabling
+    review convergence requires an explicit genesis observation when no ledger
+    exists. The chain tip must remain unchanged through the final pre-merge
+    recheck; there is no force/rationale bypass for existing state;
   - no non-outdated unresolved review threads (outdated unresolved threads
     are mechanically dispositioned `stale` and recorded, not blocking) OR
     the remaining live threads explicitly bypassed via
@@ -864,9 +902,10 @@ backend mapping, validation rules, and output schema versions.
   must still expose that exact head or the command returns
   `test_first_evidence_provider_head_mismatch` before any merge mutation. The
   same reviewed head remains bound through the provider merge compare-and-swap.
-- With convergence enabled, a complete native-review snapshot is fetched once
-  more after the thread/task gates and immediately before the provider merge.
-  A late request blocks; any other observed activity change returns
+- With convergence enabled, complete native-review and review-thread/comment
+  snapshots are fetched once more after the thread/task gates and immediately
+  before the provider merge. A late request blocks; any semantic digest change,
+  including removal or cleanup after the quiet snapshot, returns
   `review_convergence_activity_changed` so the caller can rerun convergence.
 - `--dry-run` validates the same enabled-policy provider contract as live
   merge and includes the resolved policy in `data.review_convergence`. GitLab
@@ -885,7 +924,7 @@ backend mapping, validation rules, and output schema versions.
 - Output schema: `cli.forge-cli.pr.merge.v1`,
   `data = { number, url, merge_sha, method, deleted_branch,
   unchecked_tasks_override_reason?, unresolved_threads_override_reason?,
-  stale_thread_dispositions?, review_convergence? }`.
+  stale_thread_dispositions?, review_convergence?, review_loop? }`.
   `unchecked_tasks_override_reason` / `unresolved_threads_override_reason` are
   present only when the matching bypass was used; `stale_thread_dispositions`
   lists the outdated threads dispositioned `stale` at rule 13 (omitted when
@@ -1044,8 +1083,11 @@ backend implementations cannot diverge.
     `pr deliver` resolve `--review-convergence[=true|false]` over repo and
     global config. The default is off. In v1, configured bots use `observed`:
     an absent bot never waits or fails, while already-observed current-head
-    activity must stay quiet for `quiet_period`. New activity restarts that
-    window; `timeout` bounds the complete active wait, including provider
+    review, live non-outdated thread, or unowned comment activity must stay quiet
+    for `quiet_period`. New semantic activity restarts that window; marker-only
+    forge-cli disposition replies, empty `COMMENTED` reviews, provider ids and
+    timestamps, and resolve/outdated transitions do not. Reopening a live thread
+    does restart the window. `timeout` bounds the complete active wait, including provider
     calls and rate-limit waits. Polling occurs at most once every 10 seconds.
     Current-head native `CHANGES_REQUESTED` fails with
     `review_changes_requested`; `COMMENTED`
@@ -1053,8 +1095,8 @@ backend implementations cannot diverge.
     stale evidence. A head change during an active wait fails closed with
     `review_convergence_head_changed`; a missing initial provider head fails
     with `review_convergence_head_missing` before review collection. The
-    complete paginated snapshot is read
-    again immediately before merge; late activity fails with
+    complete paginated review plus thread/comment snapshot is read
+    again immediately before merge; any digest drift fails with
     `review_convergence_activity_changed`, and incomplete or unknown provider
     data fails with `review_snapshot_incomplete`. Every review must carry a
     non-empty `commit.oid` before current-head/stale classification. For each

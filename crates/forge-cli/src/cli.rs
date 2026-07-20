@@ -742,6 +742,61 @@ pub struct PrPendingReviewArgs {
     pub command: PrPendingReviewCommand,
 }
 
+/// Durable provider-visible review-loop ledger operations.
+#[derive(Args, Debug, Clone)]
+pub struct PrReviewLoopArgs {
+    #[command(subcommand)]
+    pub command: PrReviewLoopCommand,
+}
+
+#[derive(Subcommand, Debug, Clone)]
+pub enum PrReviewLoopCommand {
+    /// Inspect the validated ledger tip and current round state.
+    Inspect(PrReviewLoopInspectArgs),
+    /// Observe one reviewed head and append the resulting state transition.
+    Observe(PrReviewLoopObserveArgs),
+    /// Consume an exact provider-visible approval to extend one budget.
+    Extend(PrReviewLoopExtendArgs),
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct PrReviewLoopInspectArgs {
+    pub id: u64,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct PrReviewLoopObserveArgs {
+    pub id: u64,
+    #[arg(long = "expected-head", value_name = "SHA", value_parser = clap::builder::NonEmptyStringValueParser::new())]
+    pub expected_head: String,
+    /// Delivery-mode review-specialists merge envelope or observation array.
+    #[arg(long = "findings-file", value_name = "PATH")]
+    pub findings_file: String,
+    /// Exact current provider-visible state-chain tip; omit only for genesis.
+    #[arg(long = "expected-state", value_name = "DIGEST")]
+    pub expected_state: Option<String>,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct PrReviewLoopExtendArgs {
+    pub id: u64,
+    #[arg(long = "expected-head", value_name = "SHA", value_parser = clap::builder::NonEmptyStringValueParser::new())]
+    pub expected_head: String,
+    #[arg(long = "expected-state", value_name = "DIGEST", value_parser = clap::builder::NonEmptyStringValueParser::new())]
+    pub expected_state: String,
+    #[arg(long = "stop-code", value_name = "CODE", value_parser = clap::builder::NonEmptyStringValueParser::new())]
+    pub stop_code: String,
+    #[arg(long = "budget-field", value_name = "FIELD", value_parser = ["max_repair_rounds", "max_no_progress_rounds", "max_auto_reopens_per_fingerprint"])]
+    pub budget_field: String,
+    #[arg(long, default_value_t = 1)]
+    pub increment: u32,
+    #[arg(long = "proposal-digest", value_name = "DIGEST", value_parser = clap::builder::NonEmptyStringValueParser::new())]
+    pub proposal_digest: String,
+    /// Numeric GitHub issue-comment id carrying the exact approval marker.
+    #[arg(long = "approval-comment", value_name = "COMMENT_ID")]
+    pub approval_comment: u64,
+}
+
 /// Authenticated recovery actions for provider-valid pending reviews.
 #[derive(Subcommand, Debug, Clone)]
 pub enum PrPendingReviewCommand {
@@ -1047,6 +1102,8 @@ pub enum PrCommand {
     Reviews(PrReviewsArgs),
     /// Recover an authenticated actor's pending native review.
     PendingReview(PrPendingReviewArgs),
+    /// Inspect and advance the durable review-loop ledger.
+    ReviewLoop(PrReviewLoopArgs),
     /// List GFM task-list items in the PR / MR description with their state.
     Tasks(PrTasksArgs),
     /// Merge a ready PR / MR.
@@ -1724,6 +1781,19 @@ pub fn dispatch(args: Vec<OsString>) -> i32 {
             }
         },
         Some(Command::Pr(PrArgs {
+            command: Some(PrCommand::ReviewLoop(args)),
+        })) => match args.command {
+            PrReviewLoopCommand::Inspect(inspect_args) => {
+                ops::pr_review_loop::run_inspect(&global, inspect_args, format)
+            }
+            PrReviewLoopCommand::Observe(observe_args) => {
+                ops::pr_review_loop::run_observe(&global, observe_args, format)
+            }
+            PrReviewLoopCommand::Extend(extend_args) => {
+                ops::pr_review_loop::run_extend(&global, extend_args, format)
+            }
+        },
+        Some(Command::Pr(PrArgs {
             command: Some(PrCommand::Tasks(args)),
         })) => ops::pr_tasks::run(&global, args, format),
         Some(Command::Pr(PrArgs {
@@ -2050,6 +2120,7 @@ mod tests {
             "ready",
             "review-threads",
             "pending-review",
+            "review-loop",
             "tasks",
             "merge",
             "close",
@@ -2075,6 +2146,7 @@ mod tests {
                     "abandoned draft",
                     "--confirm-abandoned",
                 ]),
+                "review-loop" => argv.extend(["inspect", "1"]),
                 "edit" | "comment" | "comments" | "ready" | "tasks" | "merge" | "close" => {
                     argv.push("1")
                 }
@@ -2088,6 +2160,74 @@ mod tests {
             }
             let result = parse(&argv);
             assert!(result.is_ok(), "pr {sub} should parse, got {result:?}");
+        }
+    }
+
+    #[test]
+    fn parses_review_loop_observe_and_extend() {
+        let observe = parse(&[
+            "pr",
+            "review-loop",
+            "observe",
+            "7",
+            "--expected-head",
+            "abc123",
+            "--expected-state",
+            "sha256:tip",
+            "--findings-file",
+            "findings.json",
+        ])
+        .expect("review-loop observe parses");
+        match observe.command {
+            Some(Command::Pr(PrArgs {
+                command:
+                    Some(PrCommand::ReviewLoop(PrReviewLoopArgs {
+                        command: PrReviewLoopCommand::Observe(args),
+                    })),
+                ..
+            })) => {
+                assert_eq!(args.id, 7);
+                assert_eq!(args.expected_head, "abc123");
+                assert_eq!(args.expected_state.as_deref(), Some("sha256:tip"));
+                assert_eq!(args.findings_file, "findings.json");
+            }
+            other => panic!("expected review-loop observe, got {other:?}"),
+        }
+
+        let extend = parse(&[
+            "pr",
+            "review-loop",
+            "extend",
+            "7",
+            "--expected-head",
+            "abc123",
+            "--expected-state",
+            "sha256:tip",
+            "--stop-code",
+            "review_no_progress",
+            "--budget-field",
+            "max_no_progress_rounds",
+            "--increment",
+            "2",
+            "--proposal-digest",
+            "sha256:proposal",
+            "--approval-comment",
+            "42",
+        ])
+        .expect("review-loop extend parses");
+        match extend.command {
+            Some(Command::Pr(PrArgs {
+                command:
+                    Some(PrCommand::ReviewLoop(PrReviewLoopArgs {
+                        command: PrReviewLoopCommand::Extend(args),
+                    })),
+                ..
+            })) => {
+                assert_eq!(args.increment, 2);
+                assert_eq!(args.approval_comment, 42);
+                assert_eq!(args.budget_field, "max_no_progress_rounds");
+            }
+            other => panic!("expected review-loop extend, got {other:?}"),
         }
     }
 
