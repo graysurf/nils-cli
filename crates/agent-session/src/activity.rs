@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::os::fd::AsRawFd;
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, Stdio};
@@ -3483,17 +3483,20 @@ struct CodexNotificationStatus {
 }
 
 fn codex_notification_status(path: &Path) -> Result<CodexNotificationStatus, CliError> {
-    if !path.is_file() {
+    let Some(bytes) = read_optional_provider_config(path)? else {
         return Ok(CodexNotificationStatus {
             configured: false,
             mode: "absent".to_string(),
         });
-    }
-    let document = parse_codex_notification_config(
-        path,
-        &fs::read_to_string(path)
-            .map_err(|err| activity_io_error("provider-config-read-failed", path, err))?,
-    )?;
+    };
+    let raw = String::from_utf8(bytes).map_err(|_| {
+        CliError::data(
+            "provider-config-invalid",
+            format!("{} is not valid UTF-8 TOML", path.display()),
+            None,
+        )
+    })?;
+    let document = parse_codex_notification_config(path, &raw)?;
     let mode = codex_notify_mode(&document);
     Ok(CodexNotificationStatus {
         configured: matches!(mode, CodexNotifyMode::Owned | CodexNotifyMode::Composed(_)),
@@ -3648,14 +3651,7 @@ fn plan_codex_notification(
     path: &Path,
     action: SetupAction,
 ) -> Result<CodexNotificationPlan, CliError> {
-    let original_bytes = if path.is_file() {
-        Some(
-            fs::read(path)
-                .map_err(|err| activity_io_error("provider-config-read-failed", path, err))?,
-        )
-    } else {
-        None
-    };
+    let original_bytes = read_optional_provider_config(path)?;
     let raw = original_bytes
         .as_ref()
         .map(|bytes| {
@@ -3790,6 +3786,8 @@ fn plan_codex_notification(
 
 const CODEX_HOOK_BLOCK_START: &str = "# >>> agent-session:codex-hooks >>>";
 const CODEX_HOOK_BLOCK_END: &str = "# <<< agent-session:codex-hooks <<<";
+const RUNTIME_KIT_HOOK_BLOCK_START: &str = "# >>> agent-runtime-kit:hooks >>>";
+const RUNTIME_KIT_HOOK_BLOCK_END: &str = "# <<< agent-runtime-kit:hooks <<<";
 
 fn toml_hook_matcher_matches(group: &toml_edit::Table, spec: ProviderSpec) -> bool {
     let matcher = group.get("matcher").and_then(TomlItem::as_str);
@@ -4083,6 +4081,193 @@ struct CodexTomlHookAnalysis {
     stripped_raw: String,
     marker_layout: CodexTomlHookMarkerLayout,
     overlaps_foreign_managed_block: bool,
+    repaired_foreign_marker_boundary: bool,
+}
+
+fn toml_marker_line_ranges(
+    raw: &str,
+    marker: &str,
+    multiline_value_lines: &[usize],
+) -> Vec<(usize, usize)> {
+    let mut offset = 0_usize;
+    raw.split_inclusive('\n')
+        .filter_map(|line| {
+            let start = offset;
+            offset += line.len();
+            let without_newline = line.strip_suffix('\n').unwrap_or(line);
+            let content = without_newline
+                .strip_suffix('\r')
+                .unwrap_or(without_newline);
+            (content == marker && multiline_value_lines.binary_search(&start).is_err())
+                .then_some((start, offset))
+        })
+        .collect()
+}
+
+fn collect_explicit_toml_table_paths(
+    table: &toml_edit::Table,
+    path: &mut Vec<String>,
+    paths: &mut Vec<Vec<String>>,
+) {
+    for (key, item) in table.iter() {
+        path.push(key.to_string());
+        if let Some(child) = item.as_table() {
+            if !child.is_implicit() {
+                paths.push(path.clone());
+            }
+            collect_explicit_toml_table_paths(child, path, paths);
+        } else if let Some(children) = item.as_array_of_tables() {
+            for child in children.iter() {
+                paths.push(path.clone());
+                collect_explicit_toml_table_paths(child, path, paths);
+            }
+        }
+        path.pop();
+    }
+}
+
+fn toml_table_header_path(content: &str) -> Option<Vec<String>> {
+    if !content.trim_start().starts_with('[') {
+        return None;
+    }
+    let document = format!("{content}\n").parse::<TomlDocument>().ok()?;
+    let mut paths = Vec::new();
+    collect_explicit_toml_table_paths(document.as_table(), &mut Vec::new(), &mut paths);
+    (paths.len() == 1).then(|| paths.remove(0))
+}
+
+fn is_codex_trust_table_path(path: &[String]) -> bool {
+    path.first().is_some_and(|key| key == "projects")
+        || (path.first().is_some_and(|key| key == "hooks")
+            && path.get(1).is_some_and(|key| key == "state"))
+}
+
+fn is_byte_preserving_codex_trust_table_header(content: &str) -> bool {
+    let content = content.trim_start();
+    content == "[projects]"
+        || content.starts_with("[projects.")
+        || content == "[hooks.state]"
+        || content.starts_with("[hooks.state.")
+}
+
+#[derive(Clone, Copy, Debug)]
+struct RuntimeKitHookMarkerRange {
+    start_end: usize,
+    end_begin: usize,
+    end_end: usize,
+}
+
+fn runtime_kit_hook_marker_range(
+    path: &Path,
+    raw: &str,
+    multiline_value_lines: &[usize],
+) -> Result<Option<RuntimeKitHookMarkerRange>, CliError> {
+    let starts = toml_marker_line_ranges(raw, RUNTIME_KIT_HOOK_BLOCK_START, multiline_value_lines);
+    let ends = toml_marker_line_ranges(raw, RUNTIME_KIT_HOOK_BLOCK_END, multiline_value_lines);
+    if starts.is_empty() && ends.is_empty() {
+        return Ok(None);
+    }
+    if starts.len() != 1 || ends.len() != 1 {
+        return Err(CliError::data(
+            "provider-config-invalid",
+            "Codex config has an ambiguous agent-runtime-kit hook marker layout",
+            Some(json!({ "path": display_path(path) })),
+        ));
+    }
+    let (start_begin, start_end) = starts[0];
+    let (end_begin, end_end) = ends[0];
+    if end_begin < start_begin {
+        return Err(CliError::data(
+            "provider-config-invalid",
+            "Codex config has a reversed agent-runtime-kit hook marker block",
+            Some(json!({ "path": display_path(path) })),
+        ));
+    }
+    Ok(Some(RuntimeKitHookMarkerRange {
+        start_end,
+        end_begin,
+        end_end,
+    }))
+}
+
+fn rehome_codex_trust_tables_outside_runtime_kit_hook_block(
+    path: &Path,
+    raw: &str,
+) -> Result<(String, bool), CliError> {
+    let multiline_value_lines = toml_multiline_value_line_starts(raw);
+    let Some(RuntimeKitHookMarkerRange {
+        start_end,
+        end_begin,
+        end_end,
+    }) = runtime_kit_hook_marker_range(path, raw, &multiline_value_lines)?
+    else {
+        return Ok((raw.to_string(), false));
+    };
+
+    let mut offset = start_end;
+    let mut blank_run_start = None;
+    let mut trust_boundary = None;
+    for line in raw[start_end..end_begin].split_inclusive('\n') {
+        let line_start = offset;
+        offset += line.len();
+        if multiline_value_lines.binary_search(&line_start).is_ok() {
+            blank_run_start = None;
+            continue;
+        }
+        let without_newline = line.strip_suffix('\n').unwrap_or(line);
+        let content = without_newline
+            .strip_suffix('\r')
+            .unwrap_or(without_newline);
+        if content.trim().is_empty() {
+            blank_run_start.get_or_insert(line_start);
+        } else if let Some(table_path) = toml_table_header_path(content) {
+            if is_codex_trust_table_path(&table_path) {
+                if !is_byte_preserving_codex_trust_table_header(content) {
+                    return Err(CliError::data(
+                        "provider-config-invalid",
+                        "Codex trust table syntax inside the agent-runtime-kit hook marker block cannot be migrated byte-for-byte",
+                        Some(json!({ "path": display_path(path) })),
+                    ));
+                }
+                trust_boundary.get_or_insert(blank_run_start.unwrap_or(line_start));
+            } else if trust_boundary.is_some() {
+                return Err(CliError::data(
+                    "provider-config-invalid",
+                    "Codex trust tables are followed by non-trust TOML inside the agent-runtime-kit hook marker block",
+                    Some(json!({ "path": display_path(path) })),
+                ));
+            }
+            blank_run_start = None;
+        } else {
+            blank_run_start = None;
+        }
+    }
+    let Some(trust_boundary) = trust_boundary else {
+        return Ok((raw.to_string(), false));
+    };
+
+    let close_line = &raw[end_begin..end_end];
+    let moved_suffix = &raw[trust_boundary..end_begin];
+    let (moved_suffix, separator) = if close_line.ends_with('\n') {
+        (moved_suffix, "")
+    } else if let Some(suffix) = moved_suffix.strip_suffix("\r\n") {
+        (suffix, "\r\n")
+    } else if let Some(suffix) = moved_suffix.strip_suffix('\n') {
+        (suffix, "\n")
+    } else {
+        return Err(CliError::data(
+            "provider-config-invalid",
+            "Codex trust tables and the agent-runtime-kit closing marker do not have a reusable line separator",
+            Some(json!({ "path": display_path(path) })),
+        ));
+    };
+    let mut repaired = String::with_capacity(raw.len());
+    repaired.push_str(&raw[..trust_boundary]);
+    repaired.push_str(close_line);
+    repaired.push_str(separator);
+    repaired.push_str(moved_suffix);
+    repaired.push_str(&raw[end_end..]);
+    Ok((repaired, true))
 }
 
 fn codex_hook_block_overlaps_foreign_managed_block(
@@ -4169,29 +4354,18 @@ fn codex_hook_block_overlaps_foreign_managed_block(
 fn analyze_codex_toml_hooks(path: &Path, raw: &str) -> Result<CodexTomlHookAnalysis, CliError> {
     let document = parse_codex_notification_config(path, raw)?;
     let multiline_value_lines = toml_multiline_value_line_starts(raw);
-    let marker_lines = |marker: &str| {
-        let mut offset = 0_usize;
-        raw.split_inclusive('\n')
-            .filter_map(|line| {
-                let start = offset;
-                offset += line.len();
-                let without_newline = line.strip_suffix('\n').unwrap_or(line);
-                let content = without_newline
-                    .strip_suffix('\r')
-                    .unwrap_or(without_newline);
-                (content == marker && multiline_value_lines.binary_search(&start).is_err())
-                    .then_some((start, offset))
-            })
-            .collect::<Vec<_>>()
-    };
-    let starts = marker_lines(CODEX_HOOK_BLOCK_START);
-    let ends = marker_lines(CODEX_HOOK_BLOCK_END);
+    runtime_kit_hook_marker_range(path, raw, &multiline_value_lines)?;
+    let starts = toml_marker_line_ranges(raw, CODEX_HOOK_BLOCK_START, &multiline_value_lines);
+    let ends = toml_marker_line_ranges(raw, CODEX_HOOK_BLOCK_END, &multiline_value_lines);
     if starts.is_empty() && ends.is_empty() {
+        let (stripped_raw, repaired_foreign_marker_boundary) =
+            rehome_codex_trust_tables_outside_runtime_kit_hook_block(path, raw)?;
         return Ok(CodexTomlHookAnalysis {
             document,
-            stripped_raw: raw.to_string(),
+            stripped_raw,
             marker_layout: CodexTomlHookMarkerLayout::Absent,
             overlaps_foreign_managed_block: false,
+            repaired_foreign_marker_boundary,
         });
     }
     if starts.len() > 1 || ends.len() > 1 {
@@ -4217,11 +4391,14 @@ fn analyze_codex_toml_hooks(path: &Path, raw: &str) -> Result<CodexTomlHookAnaly
         } else {
             CodexTomlHookMarkerLayout::OrphanStart
         };
+        let (stripped, repaired_foreign_marker_boundary) =
+            rehome_codex_trust_tables_outside_runtime_kit_hook_block(path, &stripped)?;
         return Ok(CodexTomlHookAnalysis {
             document,
             stripped_raw: stripped,
             marker_layout,
             overlaps_foreign_managed_block: false,
+            repaired_foreign_marker_boundary,
         });
     };
     if end_begin < start_begin {
@@ -4242,11 +4419,14 @@ fn analyze_codex_toml_hooks(path: &Path, raw: &str) -> Result<CodexTomlHookAnaly
             end_end,
             &multiline_value_lines,
         );
+        let (stripped, repaired_foreign_marker_boundary) =
+            rehome_codex_trust_tables_outside_runtime_kit_hook_block(path, &stripped)?;
         return Ok(CodexTomlHookAnalysis {
             document,
             stripped_raw: stripped,
             marker_layout: CodexTomlHookMarkerLayout::Complete,
             overlaps_foreign_managed_block,
+            repaired_foreign_marker_boundary,
         });
     }
     let mut stripped =
@@ -4261,11 +4441,14 @@ fn analyze_codex_toml_hooks(path: &Path, raw: &str) -> Result<CodexTomlHookAnaly
         end_end,
         &multiline_value_lines,
     );
+    let (stripped, repaired_foreign_marker_boundary) =
+        rehome_codex_trust_tables_outside_runtime_kit_hook_block(path, &stripped)?;
     Ok(CodexTomlHookAnalysis {
         document,
         stripped_raw: stripped,
         marker_layout: CodexTomlHookMarkerLayout::Complete,
         overlaps_foreign_managed_block,
+        repaired_foreign_marker_boundary,
     })
 }
 
@@ -4289,10 +4472,20 @@ fn plan_inline_codex_hooks(
         )
     })?;
     let analysis = analyze_codex_toml_hooks(&notification.config.path, &raw)?;
+    if analysis.repaired_foreign_marker_boundary
+        && !matches!(action, SetupAction::RepairPreview | SetupAction::Repair)
+    {
+        return Err(CliError::data(
+            "provider-config-repair-preview-required",
+            "Codex trust tables cross an agent-runtime-kit hook marker; review and apply an activity repair preview before other setup actions",
+            Some(json!({ "path": display_path(&notification.config.path) })),
+        ));
+    }
     if action != SetupAction::Remove
         && analysis.marker_layout == CodexTomlHookMarkerLayout::Complete
         && analysis.stripped_raw != raw
         && !analysis.overlaps_foreign_managed_block
+        && !analysis.repaired_foreign_marker_boundary
         && toml_codex_hooks_exactly_configured(&analysis.document)
     {
         return Ok(true);
@@ -4650,17 +4843,7 @@ fn apply_codex_provider_plans_with_rollback(
 
 fn apply_provider_config_plan(plan: &ProviderConfigPlan) -> Result<(), CliError> {
     if !plan.changed {
-        let current = match fs::read(&plan.path) {
-            Ok(bytes) => Some(bytes),
-            Err(err) if err.kind() == io::ErrorKind::NotFound => None,
-            Err(err) => {
-                return Err(activity_io_error(
-                    "provider-config-read-failed",
-                    &plan.path,
-                    err,
-                ));
-            }
-        };
+        let current = read_optional_provider_config(&plan.path)?;
         if current != plan.original_bytes {
             return Err(CliError::runtime(
                 "provider-config-concurrent-modification",
@@ -4895,6 +5078,211 @@ fn reserve_provider_config_temp(
     ))
 }
 
+fn stage_provider_config_candidate(
+    path: &Path,
+    candidate: &Path,
+    bytes: &[u8],
+) -> Result<(), CliError> {
+    stage_provider_config_candidate_with_sync(path, candidate, bytes, sync_provider_config_parent)
+}
+
+fn stage_provider_config_candidate_with_sync(
+    path: &Path,
+    candidate: &Path,
+    bytes: &[u8],
+    sync_parent: impl FnOnce(&Path) -> Result<(), CliError>,
+) -> Result<(), CliError> {
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(SECRET_FILE_MODE)
+        .open(candidate)
+        .map_err(|err| activity_io_error("provider-config-write-failed", candidate, err))?;
+    let staged = file
+        .write_all(bytes)
+        .and_then(|()| file.sync_all())
+        .map_err(|err| activity_io_error("provider-config-write-failed", candidate, err));
+    drop(file);
+    if let Err(err) = staged {
+        return Err(cleanup_failed_provider_config_candidate(
+            path, candidate, err,
+        ));
+    }
+    if let Err(err) = fs::set_permissions(candidate, fs::Permissions::from_mode(SECRET_FILE_MODE))
+        .map_err(|err| activity_io_error("provider-config-write-failed", candidate, err))
+    {
+        return Err(cleanup_failed_provider_config_candidate(
+            path, candidate, err,
+        ));
+    }
+    sync_parent(path).map_err(|err| cleanup_failed_provider_config_candidate(path, candidate, err))
+}
+
+fn cleanup_failed_provider_config_candidate(
+    path: &Path,
+    candidate: &Path,
+    error: CliError,
+) -> CliError {
+    match fs::remove_file(candidate) {
+        Ok(()) => {
+            let _ = sync_provider_config_parent(path);
+            error
+        }
+        Err(err) if err.kind() == io::ErrorKind::NotFound => error,
+        Err(_) => provider_config_recovery_error(error, path, "staged_candidate", candidate),
+    }
+}
+
+#[derive(Debug)]
+struct ProviderConfigWriteLock(fs::File);
+
+impl Drop for ProviderConfigWriteLock {
+    fn drop(&mut self) {
+        // SAFETY: flock only observes the valid file descriptor owned by self.
+        unsafe {
+            libc::flock(self.0.as_raw_fd(), libc::LOCK_UN);
+        }
+    }
+}
+
+fn provider_config_write_artifact_paths(
+    path: &Path,
+) -> Result<(PathBuf, PathBuf, PathBuf), CliError> {
+    let parent = path.parent().ok_or_else(|| {
+        CliError::runtime(
+            "provider-config-temp-failed",
+            "provider config path has no parent directory for a transactional update",
+            Some(json!({ "path": display_path(path) })),
+        )
+    })?;
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("provider-config");
+    Ok((
+        parent.join(format!(".{name}.agent-session-write-candidate")),
+        parent.join(format!(".{name}.agent-session-write-capture")),
+        parent.join(format!(".{name}.agent-session-write.lock")),
+    ))
+}
+
+fn acquire_provider_config_write_lock(path: &Path) -> Result<ProviderConfigWriteLock, CliError> {
+    let (_, _, lock_path) = provider_config_write_artifact_paths(path)?;
+    let file = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .mode(SECRET_FILE_MODE)
+        .open(&lock_path)
+        .map_err(|err| activity_io_error("provider-config-lock-open-failed", &lock_path, err))?;
+    fs::set_permissions(&lock_path, fs::Permissions::from_mode(SECRET_FILE_MODE)).map_err(
+        |err| activity_io_error("provider-config-lock-permission-failed", &lock_path, err),
+    )?;
+    // SAFETY: flock only observes the valid file descriptor owned by file.
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
+        return Err(activity_io_error(
+            "provider-config-lock-failed",
+            &lock_path,
+            io::Error::last_os_error(),
+        ));
+    }
+    Ok(ProviderConfigWriteLock(file))
+}
+
+fn sync_provider_config_parent(path: &Path) -> Result<(), CliError> {
+    let Some(parent) = path.parent() else {
+        return Ok(());
+    };
+    fs::File::open(parent)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|err| activity_io_error("provider-config-directory-sync-failed", parent, err))
+}
+
+fn paths_share_inode(left: &Path, right: &Path) -> Result<bool, CliError> {
+    let left = fs::symlink_metadata(left)
+        .map_err(|err| activity_io_error("provider-config-read-failed", left, err))?;
+    let right = fs::symlink_metadata(right)
+        .map_err(|err| activity_io_error("provider-config-read-failed", right, err))?;
+    Ok(left.dev() == right.dev() && left.ino() == right.ino())
+}
+
+fn recover_interrupted_provider_config_write(path: &Path) -> Result<(), CliError> {
+    recover_interrupted_provider_config_write_with_sync(path, sync_provider_config_parent)
+}
+
+fn recover_interrupted_provider_config_write_with_sync(
+    path: &Path,
+    mut sync_parent: impl FnMut(&Path) -> Result<(), CliError>,
+) -> Result<(), CliError> {
+    let (candidate, capture, _) = provider_config_write_artifact_paths(path)?;
+    let canonical_exists = provider_config_path_exists(path)?;
+    let candidate_exists = provider_config_path_exists(&candidate)?;
+    let capture_exists = provider_config_path_exists(&capture)?;
+
+    if capture_exists && !canonical_exists {
+        restore_quarantined_provider_config(path, &capture)?;
+        let _ = fs::remove_file(&candidate);
+        let _ = sync_parent(path);
+        return Ok(());
+    }
+    if capture_exists && canonical_exists {
+        if candidate_exists && paths_share_inode(path, &candidate)? {
+            sync_parent(path)?;
+            fs::remove_file(&capture).map_err(|err| {
+                activity_io_error("provider-config-recovery-cleanup-failed", &capture, err)
+            })?;
+            let _ = fs::remove_file(&candidate);
+            let _ = sync_parent(path);
+            return Ok(());
+        }
+        if paths_share_inode(path, &capture)? {
+            sync_parent(path)?;
+            fs::remove_file(&capture).map_err(|err| {
+                activity_io_error("provider-config-recovery-cleanup-failed", &capture, err)
+            })?;
+            let _ = fs::remove_file(&candidate);
+            let _ = sync_parent(path);
+            return Ok(());
+        }
+        let error = provider_config_recovery_error(
+            CliError::runtime(
+                "provider-config-recovery-required",
+                "provider config recovery found both a canonical path and a captured original; inspect both before retrying",
+                Some(json!({ "path": display_path(path) })),
+            ),
+            path,
+            "captured_original",
+            &capture,
+        );
+        return Err(if candidate_exists {
+            provider_config_recovery_error(error, path, "staged_candidate", &candidate)
+        } else {
+            error
+        });
+    }
+    if candidate_exists && canonical_exists {
+        sync_parent(path)?;
+        fs::remove_file(&candidate).map_err(|err| {
+            activity_io_error("provider-config-recovery-cleanup-failed", &candidate, err)
+        })?;
+        let _ = sync_parent(path);
+        return Ok(());
+    }
+    if candidate_exists {
+        return Err(provider_config_recovery_error(
+            CliError::runtime(
+                "provider-config-recovery-required",
+                "provider config recovery found a staged candidate without a canonical path or captured original",
+                Some(json!({ "path": display_path(path) })),
+            ),
+            path,
+            "staged_candidate",
+            &candidate,
+        ));
+    }
+    Ok(())
+}
+
 fn quarantine_provider_config(path: &Path, purpose: &str) -> Result<(PathBuf, Vec<u8>), CliError> {
     let (quarantine, reservation) = reserve_provider_config_temp(path, purpose)?;
     drop(reservation);
@@ -4934,21 +5322,59 @@ fn restore_quarantined_provider_config_with_link(
     quarantine: &Path,
     link: impl FnOnce(&Path, &Path) -> io::Result<()>,
 ) -> Result<(), CliError> {
+    restore_quarantined_provider_config_with_link_and_sync(
+        path,
+        quarantine,
+        link,
+        sync_provider_config_parent,
+    )
+}
+
+fn restore_quarantined_provider_config_with_link_and_sync(
+    path: &Path,
+    quarantine: &Path,
+    link: impl FnOnce(&Path, &Path) -> io::Result<()>,
+    mut sync_parent: impl FnMut(&Path) -> Result<(), CliError>,
+) -> Result<(), CliError> {
     match link(quarantine, path) {
-        Ok(()) => fs::remove_file(quarantine).map_err(|err| {
-            activity_io_error("provider-config-quarantine-remove-failed", quarantine, err)
-        }),
+        Ok(()) => {
+            if let Err(error) = sync_parent(path) {
+                return Err(provider_config_recovery_error(
+                    error,
+                    path,
+                    "captured_config",
+                    quarantine,
+                ));
+            }
+            let _ = fs::remove_file(quarantine);
+            let _ = sync_parent(path);
+            Ok(())
+        }
         Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {
-            Err(provider_config_recovery_error(
-                CliError::runtime(
-                    "provider-config-rollback-concurrent-modification",
-                    "provider config changed during transactional recovery; the newer path and captured file were both preserved",
-                    Some(json!({ "path": display_path(path) })),
-                ),
-                path,
-                "captured_config",
-                quarantine,
-            ))
+            if paths_share_inode(path, quarantine)? {
+                if let Err(error) = sync_parent(path) {
+                    return Err(provider_config_recovery_error(
+                        error,
+                        path,
+                        "captured_config",
+                        quarantine,
+                    ));
+                }
+                let _ = fs::remove_file(quarantine);
+                let _ = sync_parent(path);
+                Ok(())
+            } else {
+                Err(provider_config_recovery_error(
+                    CliError::runtime(
+                        "provider-config-rollback-concurrent-modification",
+                        "provider config changed during transactional recovery; the newer path and captured file were both preserved",
+                        Some(json!({ "path": display_path(path) })),
+                    ),
+                    path,
+                    "captured_config",
+                    quarantine,
+                ))
+            }
         }
         Err(err) => Err(provider_config_recovery_error(
             activity_io_error("provider-config-quarantine-restore-failed", path, err),
@@ -5011,14 +5437,10 @@ fn restore_provider_config_if_absent_with_link(
 }
 
 fn json_provider_configured(agent: AgentKind, path: &Path) -> Result<bool, CliError> {
-    if !path.is_file() {
+    let Some(bytes) = read_optional_provider_config(path)? else {
         return Ok(false);
-    }
-    let value: Value = serde_json::from_slice(
-        &fs::read(path)
-            .map_err(|err| activity_io_error("provider-config-read-failed", path, err))?,
-    )
-    .map_err(|err| {
+    };
+    let value: Value = serde_json::from_slice(&bytes).map_err(|err| {
         CliError::data(
             "provider-config-invalid",
             format!("failed to parse {}: {err}", path.display()),
@@ -5053,7 +5475,7 @@ pub(crate) fn codex_protocol_attention_source_guard_configured() -> bool {
 }
 
 fn codex_json_permission_source_guard(path: &Path) -> bool {
-    let Ok(bytes) = fs::read(path) else {
+    let Ok(Some(bytes)) = read_optional_provider_config(path) else {
         return false;
     };
     let Ok(value) = serde_json::from_slice::<Value>(&bytes) else {
@@ -5099,7 +5521,10 @@ fn codex_json_permission_source_guard(path: &Path) -> bool {
 }
 
 fn codex_toml_permission_source_guard(path: &Path) -> bool {
-    let Ok(raw) = fs::read_to_string(path) else {
+    let Ok(Some(bytes)) = read_optional_provider_config(path) else {
+        return false;
+    };
+    let Ok(raw) = String::from_utf8(bytes) else {
         return false;
     };
     let Ok(document) = parse_codex_notification_config(path, &raw) else {
@@ -5181,8 +5606,33 @@ fn plan_json_provider(
 }
 
 fn read_optional_provider_config(path: &Path) -> Result<Option<Vec<u8>>, CliError> {
+    let parent_exists = path.parent().is_some_and(Path::is_dir);
+    let artifact_evidence = if parent_exists {
+        let (candidate, capture, _) = provider_config_write_artifact_paths(path)?;
+        provider_config_path_exists(&candidate)? || provider_config_path_exists(&capture)?
+    } else {
+        false
+    };
+    let _lock = if artifact_evidence {
+        let lock = acquire_provider_config_write_lock(path)?;
+        recover_interrupted_provider_config_write(path)?;
+        Some(lock)
+    } else {
+        None
+    };
     match fs::read(path) {
         Ok(bytes) => Ok(Some(bytes)),
+        Err(err) if err.kind() == io::ErrorKind::NotFound && parent_exists && _lock.is_none() => {
+            let lock = acquire_provider_config_write_lock(path)?;
+            recover_interrupted_provider_config_write(path)?;
+            let result = match fs::read(path) {
+                Ok(bytes) => Ok(Some(bytes)),
+                Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(None),
+                Err(err) => Err(activity_io_error("provider-config-read-failed", path, err)),
+            };
+            drop(lock);
+            result
+        }
         Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(None),
         Err(err) => Err(activity_io_error("provider-config-read-failed", path, err)),
     }
@@ -5405,14 +5855,10 @@ fn remove_retired_json_spec(
 }
 
 fn hermes_configured(path: &Path) -> Result<bool, CliError> {
-    if !path.is_file() {
+    let Some(bytes) = read_optional_provider_config(path)? else {
         return Ok(false);
-    }
-    let value: serde_yaml_ng::Value = serde_yaml_ng::from_slice(
-        &fs::read(path)
-            .map_err(|err| activity_io_error("provider-config-read-failed", path, err))?,
-    )
-    .map_err(|err| {
+    };
+    let value: serde_yaml_ng::Value = serde_yaml_ng::from_slice(&bytes).map_err(|err| {
         CliError::data(
             "provider-config-invalid",
             format!("failed to parse {}: {err}", path.display()),
@@ -5445,14 +5891,7 @@ fn yaml_has_spec(value: &serde_yaml_ng::Value, spec: ProviderSpec) -> bool {
 }
 
 fn setup_hermes(path: &Path, action: SetupAction) -> Result<(bool, bool), CliError> {
-    let original_bytes = if path.is_file() {
-        Some(
-            fs::read(path)
-                .map_err(|err| activity_io_error("provider-config-read-failed", path, err))?,
-        )
-    } else {
-        None
-    };
+    let original_bytes = read_optional_provider_config(path)?;
     let original = if let Some(bytes) = original_bytes.as_deref() {
         serde_yaml_ng::from_slice::<serde_yaml_ng::Value>(bytes).map_err(|err| {
             CliError::data(
@@ -5553,6 +5992,31 @@ fn write_provider_config_if_unchanged(
     bytes: &[u8],
     expected_original: Option<&[u8]>,
 ) -> Result<(), CliError> {
+    write_provider_config_if_unchanged_after_capture(path, bytes, expected_original, || {})
+}
+
+fn write_provider_config_if_unchanged_after_capture(
+    path: &Path,
+    bytes: &[u8],
+    expected_original: Option<&[u8]>,
+    after_capture: impl FnOnce(),
+) -> Result<(), CliError> {
+    write_provider_config_if_unchanged_after_capture_with_sync(
+        path,
+        bytes,
+        expected_original,
+        after_capture,
+        sync_provider_config_parent,
+    )
+}
+
+fn write_provider_config_if_unchanged_after_capture_with_sync(
+    path: &Path,
+    bytes: &[u8],
+    expected_original: Option<&[u8]>,
+    after_capture: impl FnOnce(),
+    mut post_commit_sync: impl FnMut(&Path) -> Result<(), CliError>,
+) -> Result<(), CliError> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
             .map_err(|err| activity_io_error("provider-config-dir-failed", parent, err))?;
@@ -5560,25 +6024,111 @@ fn write_provider_config_if_unchanged(
             activity_io_error("provider-config-dir-permission-failed", parent, err)
         })?;
     }
-    let current = match fs::read(path) {
-        Ok(bytes) => Some(bytes),
-        Err(err) if err.kind() == io::ErrorKind::NotFound => None,
-        Err(err) => return Err(activity_io_error("provider-config-read-failed", path, err)),
+    let _lock = acquire_provider_config_write_lock(path)?;
+    recover_interrupted_provider_config_write(path)?;
+    let (candidate, capture, _) = provider_config_write_artifact_paths(path)?;
+    stage_provider_config_candidate(path, &candidate, bytes)?;
+    let mut after_capture = Some(after_capture);
+    let captured_original = if let Some(expected) = expected_original {
+        if let Err(err) = fs::rename(path, &capture) {
+            let _ = fs::remove_file(&candidate);
+            return Err(if err.kind() == io::ErrorKind::NotFound {
+                provider_config_concurrent_error(
+                    "provider-config-concurrent-modification",
+                    "provider config disappeared during a transactional update",
+                    path,
+                )
+            } else {
+                activity_io_error("provider-config-quarantine-failed", path, err)
+            });
+        }
+        if let Err(error) = sync_provider_config_parent(path) {
+            let _ = restore_quarantined_provider_config(path, &capture);
+            let _ = fs::remove_file(&candidate);
+            return Err(error);
+        }
+        after_capture.take().expect("single write hook")();
+        let captured = fs::read(&capture).map_err(|err| {
+            provider_config_recovery_error(
+                activity_io_error("provider-config-quarantine-read-failed", &capture, err),
+                path,
+                "captured_original",
+                &capture,
+            )
+        })?;
+        if captured != expected {
+            let _ = fs::remove_file(&candidate);
+            let error = provider_config_concurrent_error(
+                "provider-config-concurrent-modification",
+                "provider config changed while activity setup was preparing an update; retry after reviewing the newer file",
+                path,
+            );
+            let replacement_exists = provider_config_path_exists(path).map_err(|read_error| {
+                provider_config_recovery_error(read_error, path, "captured_original", &capture)
+            })?;
+            return if replacement_exists {
+                Err(provider_config_recovery_error(
+                    error,
+                    path,
+                    "captured_original",
+                    &capture,
+                ))
+            } else {
+                restore_quarantined_provider_config(path, &capture)?;
+                sync_provider_config_parent(path)?;
+                Err(error)
+            };
+        }
+        Some(capture.clone())
+    } else {
+        after_capture.take().expect("single write hook")();
+        None
     };
-    if current.as_deref() != expected_original {
-        return Err(CliError::runtime(
-            "provider-config-concurrent-modification",
-            "provider config changed while activity setup was preparing an update; retry after reviewing the newer file",
-            Some(json!({ "path": display_path(path) })),
-        ));
+
+    match fs::hard_link(&candidate, path) {
+        Ok(()) => {
+            if let Err(error) = post_commit_sync(path) {
+                let error =
+                    provider_config_recovery_error(error, path, "staged_candidate", &candidate);
+                return Err(if let Some(capture) = captured_original {
+                    provider_config_recovery_error(error, path, "captured_original", &capture)
+                } else {
+                    error
+                });
+            }
+            let capture_removed = captured_original.is_none_or(|capture| {
+                fs::remove_file(&capture)
+                    .map(|()| true)
+                    .unwrap_or_else(|err| err.kind() == io::ErrorKind::NotFound)
+            });
+            if capture_removed {
+                let _ = fs::remove_file(&candidate);
+            }
+            let _ = post_commit_sync(path);
+            Ok(())
+        }
+        Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {
+            let _ = fs::remove_file(&candidate);
+            let error = provider_config_concurrent_error(
+                "provider-config-concurrent-modification",
+                "provider config was replaced while activity setup was installing the reviewed update; the replacement was preserved",
+                path,
+            );
+            Err(if let Some(capture) = captured_original {
+                provider_config_recovery_error(error, path, "captured_original", &capture)
+            } else {
+                error
+            })
+        }
+        Err(err) => {
+            let _ = fs::remove_file(&candidate);
+            if let Some(capture) = captured_original {
+                restore_quarantined_provider_config(path, &capture)?;
+                sync_provider_config_parent(path)?;
+            }
+            Err(activity_io_error("provider-config-write-failed", path, err))
+        }
     }
-    write_atomic(path, bytes, SECRET_FILE_MODE).map_err(|err| {
-        CliError::runtime(
-            "provider-config-write-failed",
-            format!("failed to write provider config {}: {err}", path.display()),
-            Some(json!({ "path": display_path(path) })),
-        )
-    })
 }
 
 #[cfg(test)]
@@ -7190,6 +7740,411 @@ mod tests {
     }
 
     #[test]
+    fn provider_config_write_preserves_a_replacement_created_after_capture() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let path = tmp.path().join("settings.json");
+        let reviewed = b"reviewed-provider-config";
+        let replacement = b"concurrent-codex-trust-save";
+        fs::write(&path, reviewed).expect("reviewed config");
+
+        let error = write_provider_config_if_unchanged_after_capture(
+            &path,
+            b"agent-session-candidate",
+            Some(reviewed),
+            || fs::write(&path, replacement).expect("concurrent replacement"),
+        )
+        .expect_err("replacement must make the write fail closed");
+
+        assert_eq!(error.code(), "provider-config-concurrent-modification");
+        assert_eq!(fs::read(&path).expect("replacement retained"), replacement);
+        let captured = recovery_path_for_role(
+            error.0.details.as_ref().expect("recovery details"),
+            "captured_original",
+        );
+        assert_eq!(
+            fs::read(captured).expect("captured reviewed bytes"),
+            reviewed
+        );
+    }
+
+    #[test]
+    fn interrupted_provider_config_write_recovers_original_before_read() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let path = tmp.path().join("settings.json");
+        let reviewed = b"reviewed-provider-config";
+        fs::write(&path, reviewed).expect("reviewed config");
+        let (candidate, capture, _) = provider_config_write_artifact_paths(&path).expect("paths");
+        fs::write(&candidate, b"agent-session-candidate").expect("staged candidate");
+        fs::rename(&path, &capture).expect("simulated crash after capture");
+
+        assert_eq!(
+            read_optional_provider_config(&path).expect("recovered read"),
+            Some(reviewed.to_vec())
+        );
+        assert_eq!(fs::read(&path).expect("restored canonical"), reviewed);
+        assert!(!capture.exists(), "capture must be consumed by recovery");
+        assert!(!candidate.exists(), "stale candidate must be removed");
+    }
+
+    #[test]
+    fn committed_provider_config_write_finishes_cleanup_before_read() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let path = tmp.path().join("settings.json");
+        let reviewed = b"reviewed-provider-config";
+        let updated = b"agent-session-candidate";
+        fs::write(&path, reviewed).expect("reviewed config");
+        let (candidate, capture, _) = provider_config_write_artifact_paths(&path).expect("paths");
+        fs::write(&candidate, updated).expect("staged candidate");
+        fs::rename(&path, &capture).expect("captured original");
+        fs::hard_link(&candidate, &path).expect("simulated committed candidate");
+
+        assert_eq!(
+            read_optional_provider_config(&path).expect("recovered read"),
+            Some(updated.to_vec())
+        );
+        assert_eq!(fs::read(&path).expect("committed canonical"), updated);
+        assert!(!capture.exists(), "committed capture must be removed");
+        assert!(
+            !candidate.exists(),
+            "committed staging link must be removed"
+        );
+    }
+
+    #[test]
+    fn provider_config_recovery_fails_closed_for_ambiguous_artifact_states() {
+        for candidate_present in [true, false] {
+            let tmp = tempfile::TempDir::new().expect("tempdir");
+            let path = tmp.path().join("settings.json");
+            let (candidate, capture, _) =
+                provider_config_write_artifact_paths(&path).expect("paths");
+            fs::write(&path, b"unrelated-canonical").expect("canonical");
+            fs::write(&capture, b"captured-original").expect("capture");
+            if candidate_present {
+                fs::write(&candidate, b"staged-candidate").expect("candidate");
+            }
+
+            let error = read_optional_provider_config(&path)
+                .expect_err("ambiguous recovery state must fail closed");
+
+            assert_eq!(error.code(), "provider-config-recovery-required");
+            assert_eq!(
+                fs::read(&path).expect("canonical retained"),
+                b"unrelated-canonical"
+            );
+            let details = error.0.details.as_ref().expect("recovery details");
+            assert_eq!(
+                recovery_path_for_role(details, "captured_original"),
+                capture
+            );
+            assert_eq!(
+                fs::read(&capture).expect("capture retained"),
+                b"captured-original"
+            );
+            if candidate_present {
+                assert_eq!(
+                    recovery_path_for_role(details, "staged_candidate"),
+                    candidate
+                );
+                assert_eq!(
+                    fs::read(&candidate).expect("candidate retained"),
+                    b"staged-candidate"
+                );
+            } else {
+                assert!(!candidate.exists(), "missing candidate must remain absent");
+            }
+        }
+
+        let candidate_only = tempfile::TempDir::new().expect("candidate-only tempdir");
+        let candidate_only_path = candidate_only.path().join("settings.json");
+        let (candidate, capture, _) =
+            provider_config_write_artifact_paths(&candidate_only_path).expect("paths");
+        fs::write(&candidate, b"staged-candidate").expect("candidate");
+
+        let error = read_optional_provider_config(&candidate_only_path)
+            .expect_err("candidate-only recovery state must fail closed");
+        assert_eq!(error.code(), "provider-config-recovery-required");
+        assert_eq!(
+            recovery_path_for_role(
+                error.0.details.as_ref().expect("recovery details"),
+                "staged_candidate",
+            ),
+            candidate
+        );
+        assert_eq!(
+            fs::read(&candidate).expect("candidate retained"),
+            b"staged-candidate"
+        );
+        assert!(!capture.exists(), "capture must remain absent");
+        assert!(
+            !candidate_only_path.exists(),
+            "canonical must remain absent"
+        );
+
+        let stale_candidate = tempfile::TempDir::new().expect("stale-candidate tempdir");
+        let stale_candidate_path = stale_candidate.path().join("settings.json");
+        let (candidate, capture, _) =
+            provider_config_write_artifact_paths(&stale_candidate_path).expect("paths");
+        fs::write(&stale_candidate_path, b"canonical").expect("canonical");
+        fs::write(&candidate, b"stale-candidate").expect("candidate");
+
+        assert_eq!(
+            read_optional_provider_config(&stale_candidate_path).expect("recovered read"),
+            Some(b"canonical".to_vec())
+        );
+        assert_eq!(
+            fs::read(&stale_candidate_path).expect("canonical retained"),
+            b"canonical"
+        );
+        assert!(!candidate.exists(), "stale candidate must be removed");
+        assert!(!capture.exists(), "capture must remain absent");
+    }
+
+    #[test]
+    fn provider_config_write_retains_recovery_artifacts_when_commit_sync_fails() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let path = tmp.path().join("settings.json");
+        let reviewed = b"reviewed-provider-config";
+        let updated = b"agent-session-candidate";
+        fs::write(&path, reviewed).expect("reviewed config");
+
+        let error = write_provider_config_if_unchanged_after_capture_with_sync(
+            &path,
+            updated,
+            Some(reviewed),
+            || {},
+            |_| {
+                Err(CliError::runtime(
+                    "provider-config-directory-sync-failed",
+                    "injected commit sync failure",
+                    None,
+                ))
+            },
+        )
+        .expect_err("commit sync failure must be reported");
+
+        assert_eq!(error.code(), "provider-config-directory-sync-failed");
+        assert_eq!(fs::read(&path).expect("installed canonical"), updated);
+        let details = error.0.details.as_ref().expect("recovery details");
+        let candidate = recovery_path_for_role(details, "staged_candidate");
+        let capture = recovery_path_for_role(details, "captured_original");
+        assert_eq!(fs::read(&candidate).expect("candidate retained"), updated);
+        assert_eq!(fs::read(&capture).expect("capture retained"), reviewed);
+        assert!(paths_share_inode(&path, &candidate).expect("inode comparison"));
+
+        assert_eq!(
+            read_optional_provider_config(&path).expect("idempotent recovery"),
+            Some(updated.to_vec())
+        );
+        assert!(!candidate.exists(), "candidate must be cleaned on retry");
+        assert!(!capture.exists(), "capture must be cleaned on retry");
+    }
+
+    #[test]
+    fn provider_config_write_keeps_committed_success_on_cleanup_sync_failure() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let path = tmp.path().join("settings.json");
+        let reviewed = b"reviewed-provider-config";
+        let updated = b"agent-session-candidate";
+        fs::write(&path, reviewed).expect("reviewed config");
+        let sync_calls = std::cell::Cell::new(0_u8);
+
+        write_provider_config_if_unchanged_after_capture_with_sync(
+            &path,
+            updated,
+            Some(reviewed),
+            || {},
+            |_| {
+                let call = sync_calls.get() + 1;
+                sync_calls.set(call);
+                if call == 2 {
+                    Err(CliError::runtime(
+                        "provider-config-directory-sync-failed",
+                        "injected cleanup sync failure",
+                        None,
+                    ))
+                } else {
+                    Ok(())
+                }
+            },
+        )
+        .expect("cleanup sync failure must not roll back a committed write");
+
+        assert_eq!(sync_calls.get(), 2);
+        assert_eq!(fs::read(&path).expect("installed canonical"), updated);
+        assert_eq!(
+            read_optional_provider_config(&path).expect("idempotent read"),
+            Some(updated.to_vec())
+        );
+    }
+
+    #[test]
+    fn provider_config_staging_cleans_candidate_when_parent_sync_fails() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let path = tmp.path().join("settings.json");
+        let (candidate, capture, _) = provider_config_write_artifact_paths(&path).expect("paths");
+
+        let error = stage_provider_config_candidate_with_sync(
+            &path,
+            &candidate,
+            b"agent-session-candidate",
+            |_| {
+                Err(CliError::runtime(
+                    "provider-config-directory-sync-failed",
+                    "injected staging sync failure",
+                    None,
+                ))
+            },
+        )
+        .expect_err("staging sync failure must be reported");
+
+        assert_eq!(error.code(), "provider-config-directory-sync-failed");
+        assert!(!candidate.exists(), "failed candidate must be removed");
+        assert!(!capture.exists(), "capture must remain absent");
+        assert_eq!(
+            read_optional_provider_config(&path).expect("uninterrupted absent config"),
+            None
+        );
+    }
+
+    #[test]
+    fn provider_config_restore_retains_capture_until_canonical_is_durable() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let path = tmp.path().join("settings.json");
+        let capture = tmp.path().join("captured-settings.json");
+        fs::write(&capture, b"captured-config").expect("capture");
+
+        let error = restore_quarantined_provider_config_with_link_and_sync(
+            &path,
+            &capture,
+            |source, target| fs::hard_link(source, target),
+            |_| {
+                Err(CliError::runtime(
+                    "provider-config-directory-sync-failed",
+                    "injected restore sync failure",
+                    None,
+                ))
+            },
+        )
+        .expect_err("restore sync failure must retain the capture");
+
+        assert_eq!(error.code(), "provider-config-directory-sync-failed");
+        assert_eq!(
+            fs::read(&path).expect("restored canonical"),
+            b"captured-config"
+        );
+        assert_eq!(
+            fs::read(&capture).expect("capture retained"),
+            b"captured-config"
+        );
+        assert!(paths_share_inode(&path, &capture).expect("inode comparison"));
+        assert_eq!(
+            recovery_path_for_role(
+                error.0.details.as_ref().expect("recovery details"),
+                "captured_config",
+            ),
+            capture
+        );
+
+        let retry_error = restore_quarantined_provider_config_with_link_and_sync(
+            &path,
+            &capture,
+            |source, target| fs::hard_link(source, target),
+            |_| {
+                Err(CliError::runtime(
+                    "provider-config-directory-sync-failed",
+                    "injected retry sync failure",
+                    None,
+                ))
+            },
+        )
+        .expect_err("retry sync failure must still retain the capture");
+        assert_eq!(retry_error.code(), "provider-config-directory-sync-failed");
+        assert!(path.exists(), "canonical must remain present");
+        assert!(capture.exists(), "capture must remain present");
+
+        restore_quarantined_provider_config(&path, &capture)
+            .expect("retry must finish cleanup idempotently");
+        assert_eq!(
+            fs::read(&path).expect("canonical retained"),
+            b"captured-config"
+        );
+        assert!(!capture.exists(), "capture must be cleaned after retry");
+    }
+
+    #[test]
+    fn provider_config_recovery_syncs_committed_links_before_cleanup() {
+        for captured_original in [true, false] {
+            let tmp = tempfile::TempDir::new().expect("tempdir");
+            let path = tmp.path().join("settings.json");
+            let (candidate, capture, _) =
+                provider_config_write_artifact_paths(&path).expect("paths");
+            fs::write(&candidate, b"agent-session-candidate").expect("candidate");
+            fs::hard_link(&candidate, &path).expect("committed canonical");
+            if captured_original {
+                fs::write(&capture, b"captured-original").expect("capture");
+            }
+
+            let error = recover_interrupted_provider_config_write_with_sync(&path, |_| {
+                Err(CliError::runtime(
+                    "provider-config-directory-sync-failed",
+                    "injected recovery sync failure",
+                    None,
+                ))
+            })
+            .expect_err("recovery sync failure must retain durable artifacts");
+
+            assert_eq!(error.code(), "provider-config-directory-sync-failed");
+            assert!(path.exists(), "canonical must remain present");
+            assert!(candidate.exists(), "candidate must remain present");
+            assert_eq!(
+                capture.exists(),
+                captured_original,
+                "capture presence must be preserved"
+            );
+
+            assert_eq!(
+                read_optional_provider_config(&path).expect("idempotent recovery"),
+                Some(b"agent-session-candidate".to_vec())
+            );
+            assert!(!candidate.exists(), "candidate must be cleaned after retry");
+            assert!(!capture.exists(), "capture must be cleaned after retry");
+        }
+
+        for candidate_present in [true, false] {
+            let tmp = tempfile::TempDir::new().expect("tempdir");
+            let path = tmp.path().join("settings.json");
+            let (candidate, capture, _) =
+                provider_config_write_artifact_paths(&path).expect("paths");
+            fs::write(&capture, b"captured-original").expect("capture");
+            fs::hard_link(&capture, &path).expect("restored canonical");
+            if candidate_present {
+                fs::write(&candidate, b"agent-session-candidate").expect("candidate");
+            }
+
+            let error = recover_interrupted_provider_config_write_with_sync(&path, |_| {
+                Err(CliError::runtime(
+                    "provider-config-directory-sync-failed",
+                    "injected restored-original sync failure",
+                    None,
+                ))
+            })
+            .expect_err("recovery sync failure must retain restored-original artifacts");
+
+            assert_eq!(error.code(), "provider-config-directory-sync-failed");
+            assert!(path.exists(), "canonical must remain present");
+            assert!(capture.exists(), "capture must remain present");
+            assert_eq!(candidate.exists(), candidate_present);
+
+            assert_eq!(
+                read_optional_provider_config(&path).expect("idempotent recovery"),
+                Some(b"captured-original".to_vec())
+            );
+            assert!(!candidate.exists(), "candidate must be cleaned after retry");
+            assert!(!capture.exists(), "capture must be cleaned after retry");
+        }
+    }
+
+    #[test]
     fn provider_version_parser_handles_audited_cli_formats() {
         assert_eq!(
             parse_version_triplet("codex-cli 0.144.1"),
@@ -8035,6 +8990,38 @@ mod tests {
             let analysis = analyze_codex_toml_hooks(&path, &raw).expect("marker-shaped value");
             assert_eq!(analysis.stripped_raw, raw);
             assert_eq!(analysis.marker_layout, CodexTomlHookMarkerLayout::Absent);
+        }
+    }
+
+    #[test]
+    fn runtime_marker_rehome_reuses_eof_newlines_byte_exactly() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let path = tmp.path().join("config.toml");
+        for newline in ["\n", "\r\n"] {
+            let prefix =
+                format!("{RUNTIME_KIT_HOOK_BLOCK_START}{newline}[[hooks.PreToolUse]]{newline}");
+            let trust = format!(
+                "[projects.\"/foreign/project\"]{newline}trust_level = \"trusted\"{newline}"
+            );
+            let trust_at_eof = trust.strip_suffix(newline).expect("trust newline");
+            let raw = format!("{prefix}{newline}{trust}{RUNTIME_KIT_HOOK_BLOCK_END}");
+            let expected =
+                format!("{prefix}{RUNTIME_KIT_HOOK_BLOCK_END}{newline}{newline}{trust_at_eof}");
+            assert_eq!(
+                rehome_codex_trust_tables_outside_runtime_kit_hook_block(&path, &raw)
+                    .expect("byte-exact EOF repair"),
+                (expected, true)
+            );
+
+            let no_separator = format!("{prefix}{trust}{RUNTIME_KIT_HOOK_BLOCK_END}");
+            assert_eq!(
+                rehome_codex_trust_tables_outside_runtime_kit_hook_block(&path, &no_separator)
+                    .expect("EOF repair reuses the trailing trust separator"),
+                (
+                    format!("{prefix}{RUNTIME_KIT_HOOK_BLOCK_END}{newline}{trust_at_eof}"),
+                    true
+                )
+            );
         }
     }
 
