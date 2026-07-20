@@ -104,7 +104,7 @@ pub fn normalize(
         .and_then(Value::as_str)
         .map(str::to_string)
         .filter(|value| value.len() <= 128);
-    let (target_paths, execution_path) = target_paths(object, matcher.as_deref())?;
+    let (target_paths, execution_path) = target_paths(product, object, matcher.as_deref())?;
     let target_material = target_set_binding_material(&target_paths);
     let command_material = command_text(object)
         .unwrap_or("command-unavailable")
@@ -204,6 +204,12 @@ fn provider_denial(product: Product, event: &str, reason: &str) -> Value {
                 }
             }
         }),
+        (Product::Claude, "Elicitation" | "ElicitationResult") => json!({
+            "hookSpecificOutput": {
+                "hookEventName": event,
+                "action": "decline",
+            }
+        }),
         (
             Product::Codex | Product::Claude,
             "UserPromptSubmit" | "PostToolUse" | "PostToolUseFailure" | "SubagentStop" | "Stop",
@@ -235,6 +241,12 @@ fn provider_transform(product: Product, event: &str, replacement: Option<&Value>
                     "behavior": "allow",
                     "updatedInput": replacement,
                 }
+            }
+        }),
+        (Product::Claude, "PostToolUse") => json!({
+            "hookSpecificOutput": {
+                "hookEventName": event,
+                "updatedToolOutput": replacement,
             }
         }),
         _ => json!({
@@ -410,6 +422,7 @@ fn string_at<'a>(object: &'a Map<String, Value>, keys: &[&str]) -> Option<&'a st
 }
 
 fn target_paths(
+    product: Product,
     object: &Map<String, Value>,
     matcher: Option<&str>,
 ) -> Result<(Vec<PathBuf>, Option<PathBuf>), HookError> {
@@ -428,17 +441,22 @@ fn target_paths(
             let path = required_string(input.get("notebook_path"))?;
             vec![resolve_mutation_target(path, execution.as_deref())?]
         }
-        Some("apply_patch") => {
+        Some("apply_patch") if product == Product::Codex => {
             let input = mutation_input(nested)?;
-            let patch = match input.get("patch") {
+            let patch = match input.get("command") {
                 Some(Value::String(patch)) if !patch.is_empty() => patch.as_str(),
                 _ => {
                     return Err(untrusted_target(
-                        "apply_patch mutation must contain a non-empty patch string",
+                        "Codex apply_patch mutation must contain a non-empty command string",
                     ));
                 }
             };
             parse_apply_patch_targets(patch, execution.as_deref())?
+        }
+        Some("apply_patch") => {
+            return Err(untrusted_target(
+                "apply_patch mutation has no documented native mapping for this provider",
+            ));
         }
         _ => execution.iter().cloned().collect(),
     };

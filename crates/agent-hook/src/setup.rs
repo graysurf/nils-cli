@@ -29,7 +29,6 @@ const LOCK_TIMEOUT: Duration = Duration::from_secs(2);
 type JsonMigration = (Option<Vec<u8>>, usize, usize, usize, bool);
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
 pub struct HookGroup {
     pub event: String,
     #[serde(skip_serializing_if = "Option::is_none")]

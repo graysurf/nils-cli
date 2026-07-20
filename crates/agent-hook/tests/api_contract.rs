@@ -314,6 +314,101 @@ capability = { id = "decision.block.v1", reason_code = "native-block", message =
 }
 
 #[test]
+fn documented_claude_transform_and_elicitation_outputs_are_native() {
+    let policy = r#"schema_version = "agent-hook.policy.v1"
+bundle_id = "runtime-kit"
+version = "2026.07.20.1"
+
+[[rules]]
+id = "claude.permission-transform"
+products = ["claude"]
+events = ["PermissionRequest"]
+priority = 10
+mode = "enforce"
+failure_posture = "closed"
+override_class = "locked"
+capability = { id = "decision.transform.v1", reason_code = "permission-rewrite", replacement = { command = "safe" } }
+
+[[rules]]
+id = "claude.output-transform"
+products = ["claude"]
+events = ["PostToolUse"]
+priority = 20
+mode = "enforce"
+failure_posture = "closed"
+override_class = "locked"
+capability = { id = "decision.transform.v1", reason_code = "output-rewrite", replacement = { stdout = "redacted" } }
+
+[[rules]]
+id = "claude.elicitation-decline"
+products = ["claude"]
+events = ["Elicitation", "ElicitationResult"]
+priority = 30
+mode = "enforce"
+failure_posture = "closed"
+override_class = "locked"
+capability = { id = "decision.block.v1", reason_code = "elicitation-declined", message = "declined" }
+"#;
+    let fixture = Fixture::new(policy);
+    for (event, output_field, expected) in [
+        (
+            "PermissionRequest",
+            "updatedInput",
+            json!({"command":"safe"}),
+        ),
+        (
+            "PostToolUse",
+            "updatedToolOutput",
+            json!({"stdout":"redacted"}),
+        ),
+    ] {
+        let payload = json!({"hook_event_name":event,"cwd":fixture.root}).to_string();
+        let output = fixture.run(
+            &["dispatch", "--product", "claude", "--format", "provider"],
+            Some(&payload),
+        );
+        assert_eq!(
+            output.code,
+            0,
+            "event={event} stderr={}",
+            output.stderr_text()
+        );
+        let native = output.stdout_json();
+        assert_eq!(native["hookSpecificOutput"]["hookEventName"], event);
+        if event == "PermissionRequest" {
+            assert_eq!(
+                native["hookSpecificOutput"]["decision"]["behavior"],
+                "allow"
+            );
+            assert_eq!(
+                native["hookSpecificOutput"]["decision"][output_field],
+                expected
+            );
+        } else {
+            assert_eq!(native["hookSpecificOutput"][output_field], expected);
+        }
+    }
+
+    for event in ["Elicitation", "ElicitationResult"] {
+        let payload = json!({"hook_event_name":event,"cwd":fixture.root}).to_string();
+        let output = fixture.run(
+            &["dispatch", "--product", "claude", "--format", "provider"],
+            Some(&payload),
+        );
+        assert_eq!(
+            output.code,
+            0,
+            "event={event} stderr={}",
+            output.stderr_text()
+        );
+        let native = output.stdout_json();
+        assert_eq!(native["hookSpecificOutput"]["hookEventName"], event);
+        assert_eq!(native["hookSpecificOutput"]["action"], "decline");
+        assert!(native.get("continue").is_none());
+    }
+}
+
+#[test]
 fn provider_matchers_use_documented_native_fields_and_reject_unsupported_events() {
     let policy = r#"schema_version = "agent-hook.policy.v1"
 bundle_id = "runtime-kit"
@@ -410,4 +505,213 @@ capability = { id = "decision.block.v1", reason_code = "invalid", message = "blo
         invalid.stdout_json()["error"]["code"],
         "policy-matcher-unsupported"
     );
+}
+
+#[test]
+fn claude_stop_failure_matcher_uses_native_error_field_only() {
+    let policy = r#"schema_version = "agent-hook.policy.v1"
+bundle_id = "runtime-kit"
+version = "2026.07.20.1"
+
+[[rules]]
+id = "claude.stop-failure"
+products = ["claude"]
+events = ["StopFailure"]
+matcher = "rate_limit"
+priority = 10
+mode = "enforce"
+failure_posture = "closed"
+override_class = "locked"
+capability = { id = "decision.allow.v1", reason_code = "rate-limited" }
+"#;
+    let fixture = Fixture::new(policy);
+    let native = fixture.run(
+        &["dispatch", "--product", "claude", "--format", "json"],
+        Some(r#"{"hook_event_name":"StopFailure","error":"rate_limit"}"#),
+    );
+    assert_eq!(native.code, 0, "stderr={}", native.stderr_text());
+    assert_eq!(
+        native.stdout_json()["data"]["reasons"][0]["code"],
+        "rate-limited"
+    );
+
+    let undocumented_alias = fixture.run(
+        &["dispatch", "--product", "claude", "--format", "json"],
+        Some(r#"{"hook_event_name":"StopFailure","error_type":"rate_limit"}"#),
+    );
+    assert_eq!(undocumented_alias.code, 0);
+    assert_eq!(
+        undocumented_alias.stdout_json()["data"]["reasons"],
+        json!([])
+    );
+}
+
+#[test]
+fn provider_event_capability_matrix_rejects_unenforceable_actions() {
+    let products = [
+        (
+            "codex",
+            &[
+                "SessionStart",
+                "UserPromptSubmit",
+                "PermissionRequest",
+                "PreToolUse",
+                "PostToolUse",
+                "PreCompact",
+                "PostCompact",
+                "SubagentStart",
+                "SubagentStop",
+                "Stop",
+            ][..],
+        ),
+        (
+            "claude",
+            &[
+                "SessionStart",
+                "UserPromptSubmit",
+                "PermissionRequest",
+                "PreToolUse",
+                "PostToolUse",
+                "PostToolUseFailure",
+                "PreCompact",
+                "SubagentStart",
+                "SubagentStop",
+                "Stop",
+                "StopFailure",
+                "Notification",
+                "Elicitation",
+                "ElicitationResult",
+            ][..],
+        ),
+    ];
+    let capabilities = [
+        (
+            "allow",
+            r#"{ id = "decision.allow.v1", reason_code = "allowed" }"#,
+        ),
+        (
+            "warn",
+            r#"{ id = "decision.warn.v1", reason_code = "warned", message = "warning" }"#,
+        ),
+        (
+            "block",
+            r#"{ id = "decision.block.v1", reason_code = "blocked", message = "blocked" }"#,
+        ),
+        (
+            "context",
+            r#"{ id = "decision.context.v1", reason_code = "context", text = "context" }"#,
+        ),
+        (
+            "transform",
+            r#"{ id = "decision.transform.v1", reason_code = "transformed", replacement = { value = "replacement" } }"#,
+        ),
+        (
+            "activity",
+            r#"{ id = "agent-session.activity.v1", reason_code = "activity" }"#,
+        ),
+        (
+            "owner-liveness",
+            r#"{ id = "agent-session.owner-liveness.v1", reason_code = "owner" }"#,
+        ),
+        (
+            "semantic-conflict",
+            r#"{ id = "agent-session.semantic-conflict.v1", reason_code = "conflict" }"#,
+        ),
+        (
+            "runtime-handler",
+            r#"{ id = "runtime-kit.handler.v1", handler_id = "session-start-healthcheck" }"#,
+        ),
+    ];
+    let mut mismatches = Vec::new();
+    for (product, events) in products {
+        for event in events {
+            for &(capability, capability_toml) in &capabilities {
+                let expected = capability_is_compatible(product, event, capability);
+                let policy = format!(
+                    r#"schema_version = "agent-hook.policy.v1"
+bundle_id = "runtime-kit"
+version = "2026.07.20.1"
+
+[[rules]]
+id = "matrix.rule"
+products = ["{product}"]
+events = ["{event}"]
+priority = 10
+mode = "enforce"
+failure_posture = "closed"
+override_class = "locked"
+capability = {capability_toml}
+"#,
+                );
+                let output = Fixture::new(&policy).run(&["validate", "--format", "json"], None);
+                let actual = output.code == 0;
+                if actual != expected {
+                    mismatches.push(format!(
+                        "{product}/{event}/{capability}: expected {expected}, code={} body={}",
+                        output.code,
+                        output.stdout_text()
+                    ));
+                } else if !expected {
+                    assert_eq!(
+                        output.stdout_json()["error"]["code"],
+                        "policy-capability-event-unsupported"
+                    );
+                }
+            }
+        }
+    }
+    assert!(mismatches.is_empty(), "{}", mismatches.join("\n"));
+}
+
+fn capability_is_compatible(product: &str, event: &str, capability: &str) -> bool {
+    if matches!(capability, "allow" | "activity" | "runtime-handler") {
+        return true;
+    }
+    let context = match product {
+        "codex" => matches!(
+            event,
+            "SessionStart" | "UserPromptSubmit" | "PreToolUse" | "PostToolUse" | "SubagentStart"
+        ),
+        "claude" => matches!(
+            event,
+            "SessionStart"
+                | "UserPromptSubmit"
+                | "PreToolUse"
+                | "PostToolUse"
+                | "PostToolUseFailure"
+                | "SubagentStart"
+                | "SubagentStop"
+                | "Stop"
+        ),
+        _ => false,
+    };
+    let block = match product {
+        "codex" => !matches!(event, "SubagentStart"),
+        "claude" => matches!(
+            event,
+            "UserPromptSubmit"
+                | "PermissionRequest"
+                | "PreToolUse"
+                | "PostToolUse"
+                | "PostToolUseFailure"
+                | "PreCompact"
+                | "SubagentStop"
+                | "Stop"
+                | "Elicitation"
+                | "ElicitationResult"
+        ),
+        _ => false,
+    };
+    let transform = match product {
+        "codex" => event == "PreToolUse",
+        "claude" => matches!(event, "PreToolUse" | "PermissionRequest" | "PostToolUse"),
+        _ => false,
+    };
+    match capability {
+        "warn" | "context" => context,
+        "block" => block,
+        "transform" => transform,
+        "owner-liveness" | "semantic-conflict" => context && block,
+        _ => false,
+    }
 }

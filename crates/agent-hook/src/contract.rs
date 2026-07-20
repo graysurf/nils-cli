@@ -253,6 +253,11 @@ fn validate_policy(bundle: &PolicyBundle, config: &Config) -> Result<(), HookErr
             }
         }
         validate_capability(&rule.capability)?;
+        for product in &rule.products {
+            for event in &rule.events {
+                validate_capability_binding(*product, event, &rule.capability)?;
+            }
+        }
         if matches!(rule.override_class, OverrideClass::Locked)
             && !matches!(rule.failure_posture, FailurePosture::Closed)
         {
@@ -292,6 +297,95 @@ fn validate_policy(bundle: &PolicyBundle, config: &Config) -> Result<(), HookErr
         }
     }
     Ok(())
+}
+
+fn validate_capability_binding(
+    product: Product,
+    event: &str,
+    capability: &Capability,
+) -> Result<(), HookError> {
+    if !product.enforceable() {
+        return Ok(());
+    }
+    let compatible = match capability {
+        Capability::Allow { .. }
+        | Capability::SessionActivity { .. }
+        | Capability::RuntimeKitHandler { .. } => true,
+        Capability::Warn { .. } | Capability::Context { .. } => supports_context(product, event),
+        Capability::Block { .. } => supports_block(product, event),
+        Capability::Transform { .. } => supports_transform(product, event),
+        Capability::OwnerLiveness { .. } | Capability::SemanticConflict { .. } => {
+            supports_context(product, event) && supports_block(product, event)
+        }
+    };
+    if compatible {
+        Ok(())
+    } else {
+        Err(HookError::data(
+            "policy-capability-event-unsupported",
+            "policy capability can produce an action unsupported by the selected provider event",
+        ))
+    }
+}
+
+fn supports_context(product: Product, event: &str) -> bool {
+    match product {
+        Product::Codex => matches!(
+            event,
+            "SessionStart" | "UserPromptSubmit" | "PreToolUse" | "PostToolUse" | "SubagentStart"
+        ),
+        Product::Claude => matches!(
+            event,
+            "SessionStart"
+                | "UserPromptSubmit"
+                | "PreToolUse"
+                | "PostToolUse"
+                | "PostToolUseFailure"
+                | "SubagentStart"
+                | "SubagentStop"
+                | "Stop"
+        ),
+        Product::Hermes => false,
+    }
+}
+
+fn supports_block(product: Product, event: &str) -> bool {
+    match product {
+        Product::Codex => matches!(
+            event,
+            "SessionStart"
+                | "UserPromptSubmit"
+                | "PermissionRequest"
+                | "PreToolUse"
+                | "PostToolUse"
+                | "PreCompact"
+                | "PostCompact"
+                | "SubagentStop"
+                | "Stop"
+        ),
+        Product::Claude => matches!(
+            event,
+            "UserPromptSubmit"
+                | "PermissionRequest"
+                | "PreToolUse"
+                | "PostToolUse"
+                | "PostToolUseFailure"
+                | "PreCompact"
+                | "SubagentStop"
+                | "Stop"
+                | "Elicitation"
+                | "ElicitationResult"
+        ),
+        Product::Hermes => false,
+    }
+}
+
+fn supports_transform(product: Product, event: &str) -> bool {
+    match product {
+        Product::Codex => event == "PreToolUse",
+        Product::Claude => matches!(event, "PreToolUse" | "PermissionRequest" | "PostToolUse"),
+        Product::Hermes => false,
+    }
 }
 
 fn validate_capability(capability: &Capability) -> Result<(), HookError> {
@@ -436,7 +530,7 @@ pub fn matcher_input_field(product: Product, event: &str) -> Option<&'static str
         (Product::Codex | Product::Claude, "SubagentStart" | "SubagentStop") => Some("agent_type"),
         (Product::Claude, "Notification") => Some("notification_type"),
         (Product::Claude, "Elicitation" | "ElicitationResult") => Some("mcp_server_name"),
-        (Product::Claude, "StopFailure") => Some("error_type"),
+        (Product::Claude, "StopFailure") => Some("error"),
         _ => None,
     }
 }

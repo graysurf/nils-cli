@@ -110,23 +110,24 @@ normalized only from documented provider fields:
 | Codex/Claude `SubagentStart`, `SubagentStop` | `agent_type` |
 | Claude `Notification` | `notification_type` |
 | Claude `Elicitation`, `ElicitationResult` | `mcp_server_name` |
-| Claude `StopFailure` | `error_type` |
+| Claude `StopFailure` | `error` |
 
 Path-bearing mutation inputs are normalized before rule evaluation. `Write`,
 `Edit`, and `MultiEdit` require exactly one non-empty `path` or `file_path`;
-`NotebookEdit` requires `notebook_path`; and `apply_patch` requires a bounded,
-structurally complete patch whose `Add File`, `Update File`, `Delete File`, and
-`Move to` directives are all mapped. Relative targets require an absolute
-provider execution directory. Missing, ambiguous, malformed, oversized, or
-only partially mapped targets fail closed as `provider-target-untrusted` rather
-than falling back to the execution checkout. Multi-target requests retain every
-distinct target for owner-liveness evaluation and bind recovery to a
-deterministic target-set digest; the existing single-target digest remains
-unchanged. Raw target paths are never serialized in the normalized request,
-decision, trace, or recovery artifact. Owner-liveness evaluates every distinct
-target checkout plus the execution checkout and returns the strongest result;
-an active foreign owner therefore cannot be masked by a self-owned or
-unclaimed target.
+`NotebookEdit` requires `notebook_path`; and Codex `apply_patch` requires its
+native `tool_input.command` string to contain a bounded, structurally complete
+patch whose `Add File`, `Update File`, `Delete File`, and `Move to` directives
+are all mapped. The undocumented `tool_input.patch` alias is not accepted.
+Relative targets require an absolute provider execution directory. Missing,
+ambiguous, malformed, oversized, or only partially mapped targets fail closed
+as `provider-target-untrusted` rather than falling back to the execution
+checkout. Multi-target requests retain every distinct target for owner-liveness
+evaluation and bind recovery to a deterministic target-set digest; the existing
+single-target digest remains unchanged. Raw target paths are never serialized
+in the normalized request, decision, trace, or recovery artifact.
+Owner-liveness evaluates every distinct target checkout plus the execution
+checkout and returns the strongest result; an active foreign owner therefore
+cannot be masked by a self-owned or unclaimed target.
 
 A matcher on any other product/event pair is rejected during policy validation.
 A policy matcher is either
@@ -144,14 +145,31 @@ ungranted rule instead of producing a global allow.
 
 Provider rendering maps one normalized aggregate result to the event-native
 output algebra. `PreToolUse` transforms render `permissionDecision = "allow"`
-with `updatedInput`; `PermissionRequest` decisions render
-`decision.behavior = "allow" | "deny"`; and blocking events use the provider's
-documented event-appropriate decision shape. Provider payloads that cannot be
-normalized safely produce no stdout, a concise stderr diagnostic, and exit `2`
-so the provider applies its native blocking fallback. Runtime or service-format
+with `updatedInput`; Claude `PermissionRequest` transforms use
+`decision.updatedInput`; Claude `PostToolUse` transforms use
+`updatedToolOutput`; `PermissionRequest` decisions render
+`decision.behavior = "allow" | "deny"`; Claude elicitation blocks render
+`action = "decline"`; and other blocking events use the provider's documented
+event-appropriate decision shape. Provider payloads that cannot be normalized
+safely produce no stdout, a concise stderr diagnostic, and exit `2` so the
+provider applies its native blocking fallback. Runtime or service-format
 failures use exit `1`; successful provider-native decisions use exit `0`.
 `dispatch --format json` returns the normalized decision envelope and does not
 return raw provider content.
+
+Policy validation also checks the complete provider/event/capability binding,
+not only each component in isolation. `decision.warn.v1` and
+`decision.context.v1` require an event with native model-context semantics;
+`decision.block.v1` requires native block, continuation, feedback, or decline
+semantics; and `decision.transform.v1` is limited to Codex `PreToolUse` plus
+Claude `PreToolUse`, `PermissionRequest`, and `PostToolUse`.
+`agent-session.owner-liveness.v1` and
+`agent-session.semantic-conflict.v1` require both context and block semantics
+because their result is data-dependent. Neutral `decision.allow.v1`, metadata
+side effects through `agent-session.activity.v1`, and trusted provider-native
+`runtime-kit.handler.v1` remain valid for every supported event. This preserves
+notification and failure logging without pretending that events such as
+Claude `Notification` or `StopFailure` can enforce a decision.
 
 ## Serialized policy and capability registry
 

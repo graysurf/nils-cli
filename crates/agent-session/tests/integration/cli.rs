@@ -800,7 +800,11 @@ printf '%s\n' "$AGENT_HOOK_RESPONSE"
             "config_digest":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
             "policy_digest":"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
             "owned_events":["PreToolUse"],
-            "owned_groups":[{"event":"PreToolUse","matcher":"Write"}],
+            "owned_groups":[{
+                "event":"PreToolUse",
+                "matcher":"Write",
+                "future_group_metadata":{"source":"provider"}
+            }],
             "owned_count":1,
             "unrelated_count":0,
             "compatibility_owner":"agent-hook",
@@ -839,6 +843,27 @@ printf '%s\n' "$AGENT_HOOK_RESPONSE"
     assert_eq!(
         data(&accepted.stdout_json())["compatibility_owner"],
         "agent-hook"
+    );
+
+    let mut missing_event = success.clone();
+    missing_event["data"]["owned_groups"][0]
+        .as_object_mut()
+        .expect("owned group")
+        .remove("event");
+    let missing_event = run_response(&missing_event);
+    assert_eq!(missing_event.code, 65);
+    assert_eq!(
+        missing_event.stdout_json()["error"]["code"],
+        "agent-hook-setup-output-invalid"
+    );
+
+    let mut invalid_matcher = success.clone();
+    invalid_matcher["data"]["owned_groups"][0]["matcher"] = json!(["Write"]);
+    let invalid_matcher = run_response(&invalid_matcher);
+    assert_eq!(invalid_matcher.code, 65);
+    assert_eq!(
+        invalid_matcher.stdout_json()["error"]["code"],
+        "agent-hook-setup-output-invalid"
     );
 
     success["data"]

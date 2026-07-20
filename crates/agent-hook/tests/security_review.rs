@@ -581,7 +581,12 @@ fn apply_patch_checks_single_and_every_multi_file_target() {
             checkout_b.join("foreign-move.txt").display()
         ),
     ] {
-        assert_foreign_target_blocks(&fixture, &checkout_a, "apply_patch", json!({"patch":patch}));
+        assert_foreign_target_blocks(
+            &fixture,
+            &checkout_a,
+            "apply_patch",
+            json!({"command":patch}),
+        );
     }
 }
 
@@ -592,7 +597,34 @@ fn incomplete_apply_patch_target_mapping_fails_closed() {
         "hook_event_name":"PreToolUse",
         "tool_name":"apply_patch",
         "cwd":checkout_a,
-        "tool_input":{"patch":"*** Begin Patch\n*** Update File:\n@@\n-old\n+new\n*** End Patch"}
+        "tool_input":{"command":"*** Begin Patch\n*** Update File:\n@@\n-old\n+new\n*** End Patch"}
+    })
+    .to_string();
+    let output = fixture.run_with_env(
+        &["dispatch", "--product", "codex", "--format", "json"],
+        Some(&payload),
+        &[("AGENT_SESSION_ID", "current")],
+    );
+    assert_eq!(output.code, 65);
+    assert_eq!(
+        output.stdout_json()["error"]["code"],
+        "provider-target-untrusted"
+    );
+}
+
+#[test]
+fn undocumented_codex_apply_patch_alias_fails_closed() {
+    let (fixture, checkout_a, checkout_b) = same_repository_foreign_owner_fixture();
+    let payload = json!({
+        "hook_event_name":"PreToolUse",
+        "tool_name":"apply_patch",
+        "cwd":checkout_a,
+        "tool_input":{
+            "patch":format!(
+                "*** Begin Patch\n*** Update File: {}\n@@\n-old\n+new\n*** End Patch",
+                checkout_b.join("foreign.txt").display()
+            )
+        }
     })
     .to_string();
     let output = fixture.run_with_env(
