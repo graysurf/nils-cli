@@ -346,7 +346,10 @@ JSON contract, and adds `compatibility_owner: "agent-hook"` to the returned
 result. It never writes provider configuration itself.
 
 If `agent-hook` is absent or cannot be started, setup returns the typed
-`agent-hook-setup-unavailable` error with install-and-repeat-preview guidance.
+`agent-hook-setup-unavailable` error with shared unavailable exit `69` and
+install-and-repeat-preview guidance. A valid child error envelope preserves
+the shared `1`, `64`, `65`, `69`, or `70` exit class returned by `agent-hook`;
+malformed or unsupported child output remains a data-contract failure.
 There is no embedded registration fallback, including for `--apply`,
 `--repair`, or `--remove`, so a mixed-version installation cannot reactivate a
 second writer.

@@ -3,8 +3,7 @@ use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
 use serde::Serialize;
-use serde::de::{Deserialize, Deserializer, MapAccess, SeqAccess, Visitor};
-use serde_json::{Map, Number, Value, json};
+use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 
 use crate::contract::{digest, matcher_input_field, supported_event};
@@ -13,6 +12,7 @@ use crate::model::{
     DecisionAction, NormalizedDecision, NormalizedRequest, Product, REQUEST_VERSION,
 };
 use crate::path_binding::{TargetBinding, resolve_target_binding};
+use crate::strict_json;
 
 pub const MAX_PROVIDER_BYTES: usize = 1024 * 1024;
 const MAX_PROVIDER_ID_CHARS: usize = 256;
@@ -709,112 +709,17 @@ fn nested_string<'a>(
 }
 
 fn parse_provider_json(input: &[u8]) -> Result<Value, HookError> {
-    serde_json::from_slice::<StrictValue>(input)
-        .map(|value| value.0)
-        .map_err(|error| {
-            if error.to_string().contains("duplicate object key") {
-                HookError::data(
-                    "provider-input-duplicate-key",
-                    "provider hook input contains a duplicate object key",
-                )
-            } else {
-                HookError::data(
-                    "provider-input-invalid",
-                    "provider hook input is not valid bounded JSON",
-                )
-            }
-        })
-}
-
-struct StrictValue(Value);
-
-impl<'de> Deserialize<'de> for StrictValue {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        deserializer.deserialize_any(StrictValueVisitor)
-    }
-}
-
-struct StrictValueVisitor;
-
-impl<'de> Visitor<'de> for StrictValueVisitor {
-    type Value = StrictValue;
-
-    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str("strict JSON without duplicate object keys")
-    }
-
-    fn visit_bool<E>(self, value: bool) -> Result<Self::Value, E> {
-        Ok(StrictValue(Value::Bool(value)))
-    }
-
-    fn visit_i64<E>(self, value: i64) -> Result<Self::Value, E> {
-        Ok(StrictValue(Value::Number(Number::from(value))))
-    }
-
-    fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E> {
-        Ok(StrictValue(Value::Number(Number::from(value))))
-    }
-
-    fn visit_f64<E>(self, value: f64) -> Result<Self::Value, E>
-    where
-        E: serde::de::Error,
-    {
-        Number::from_f64(value)
-            .map(|value| StrictValue(Value::Number(value)))
-            .ok_or_else(|| E::custom("non-finite JSON number"))
-    }
-
-    fn visit_str<E>(self, value: &str) -> Result<Self::Value, E> {
-        Ok(StrictValue(Value::String(value.to_string())))
-    }
-
-    fn visit_string<E>(self, value: String) -> Result<Self::Value, E> {
-        Ok(StrictValue(Value::String(value)))
-    }
-
-    fn visit_none<E>(self) -> Result<Self::Value, E> {
-        Ok(StrictValue(Value::Null))
-    }
-
-    fn visit_unit<E>(self) -> Result<Self::Value, E> {
-        Ok(StrictValue(Value::Null))
-    }
-
-    fn visit_some<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        StrictValue::deserialize(deserializer)
-    }
-
-    fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
-    where
-        A: SeqAccess<'de>,
-    {
-        let mut values = Vec::new();
-        while let Some(value) = sequence.next_element::<StrictValue>()? {
-            values.push(value.0);
+    strict_json::from_slice(input).map_err(|error| {
+        if error.to_string().contains("duplicate object key") {
+            HookError::data(
+                "provider-input-duplicate-key",
+                "provider hook input contains a duplicate object key",
+            )
+        } else {
+            HookError::data(
+                "provider-input-invalid",
+                "provider hook input is not valid bounded JSON",
+            )
         }
-        Ok(StrictValue(Value::Array(values)))
-    }
-
-    fn visit_map<A>(self, mut entries: A) -> Result<Self::Value, A::Error>
-    where
-        A: MapAccess<'de>,
-    {
-        let mut object = Map::new();
-        while let Some(key) = entries.next_key::<String>()? {
-            if object.contains_key(&key) {
-                return Err(serde::de::Error::custom(format!(
-                    "duplicate object key: {key}"
-                )));
-            }
-            let value = entries.next_value::<StrictValue>()?;
-            object.insert(key, value.0);
-        }
-        Ok(StrictValue(Value::Object(object)))
-    }
+    })
 }

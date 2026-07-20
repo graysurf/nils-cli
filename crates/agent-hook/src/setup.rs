@@ -15,6 +15,7 @@ use crate::contract::{digest, digest_serializable, runtime_handler_filename};
 use crate::error::HookError;
 use crate::model::{Capability, LoadedPolicy, Product, SetupAction};
 use crate::paths::Layout;
+use crate::strict_json;
 
 const CODEX_BLOCK_START: &str = "# >>> agent-hook:provider-ingress:v1 >>>";
 const CODEX_BLOCK_END: &str = "# <<< agent-hook:provider-ingress:v1 <<<";
@@ -536,7 +537,7 @@ fn build_codex_json_migration(
     let Some(bytes) = original else {
         return Ok((None, 0, 0, 0, false));
     };
-    let mut root = serde_json::from_slice::<Value>(bytes).map_err(|_| {
+    let mut root = strict_json::from_slice(bytes).map_err(|_| {
         HookError::data(
             "provider-config-invalid",
             "Codex hooks.json is not valid JSON",
@@ -583,7 +584,7 @@ fn build_json_plan(
     loaded: &LoadedPolicy,
 ) -> Result<Plan, HookError> {
     let mut root = if let Some(bytes) = original.as_deref() {
-        serde_json::from_slice::<Value>(bytes).map_err(|_| {
+        strict_json::from_slice(bytes).map_err(|_| {
             HookError::data(
                 "provider-config-invalid",
                 "Claude settings are not valid JSON",
@@ -926,9 +927,72 @@ fn render_codex_block(groups: &[HookGroup], product: Product) -> String {
     block
 }
 
+fn managed_marker_owner(content: &str, prefix: &str, suffix: &str) -> Option<String> {
+    content
+        .strip_prefix(prefix)
+        .and_then(|value| value.strip_suffix(suffix))
+        .filter(|owner| !owner.is_empty())
+        .map(str::to_string)
+}
+
+fn codex_owned_block_overlaps_foreign_manager(
+    raw: &str,
+    owned_begin: usize,
+    owned_end: usize,
+    multiline_value_lines: &[usize],
+) -> Result<bool, HookError> {
+    let owned_owner = "agent-hook:provider-ingress:v1";
+    let mut open = Vec::<(String, usize)>::new();
+    let mut offset = 0_usize;
+    for line in raw.split_inclusive('\n') {
+        let line_begin = offset;
+        offset += line.len();
+        if multiline_value_lines.binary_search(&line_begin).is_ok() {
+            continue;
+        }
+        let without_newline = line.strip_suffix('\n').unwrap_or(line);
+        let content = without_newline
+            .strip_suffix('\r')
+            .unwrap_or(without_newline);
+        if let Some(owner) = managed_marker_owner(content, "# >>> ", " >>>") {
+            if owner != owned_owner {
+                open.push((owner, line_begin));
+            }
+            continue;
+        }
+        let Some(owner) = managed_marker_owner(content, "# <<< ", " <<<") else {
+            continue;
+        };
+        if owner == owned_owner {
+            continue;
+        }
+        let Some(index) = open.iter().rposition(|(candidate, _)| candidate == &owner) else {
+            if offset > owned_begin {
+                return Err(HookError::data(
+                    "provider-config-invalid",
+                    "Codex config has an ambiguous foreign managed marker boundary overlapping agent-hook ingress",
+                ));
+            }
+            continue;
+        };
+        let (_, foreign_begin) = open.remove(index);
+        if foreign_begin < owned_end && owned_begin < offset {
+            return Ok(true);
+        }
+    }
+    if open.iter().any(|(_, begin)| *begin < owned_end) {
+        return Err(HookError::data(
+            "provider-config-invalid",
+            "Codex config has an ambiguous foreign managed marker boundary overlapping agent-hook ingress",
+        ));
+    }
+    Ok(false)
+}
+
 fn strip_codex_block(raw: &str, expected: &str) -> Result<(String, usize, bool), HookError> {
-    let starts = raw.match_indices(CODEX_BLOCK_START).collect::<Vec<_>>();
-    let ends = raw.match_indices(CODEX_BLOCK_END).collect::<Vec<_>>();
+    let multiline_value_lines = toml_multiline_value_line_starts(raw);
+    let starts = toml_marker_line_ranges(raw, CODEX_BLOCK_START, &multiline_value_lines);
+    let ends = toml_marker_line_ranges(raw, CODEX_BLOCK_END, &multiline_value_lines);
     if starts.is_empty() && ends.is_empty() {
         return Ok((raw.to_string(), 0, false));
     }
@@ -939,12 +1003,11 @@ fn strip_codex_block(raw: &str, expected: &str) -> Result<(String, usize, bool),
         ));
     }
     let begin = starts[0].0;
-    let mut end = ends[0].0 + CODEX_BLOCK_END.len();
-    if raw.as_bytes().get(end) == Some(&b'\n') {
-        end += 1;
-    }
+    let end = ends[0].1;
     let block = &raw[begin..end];
-    let drifted = block != expected;
+    let overlaps_foreign =
+        codex_owned_block_overlaps_foreign_manager(raw, begin, end, &multiline_value_lines)?;
+    let drifted = block != expected || overlaps_foreign;
     let owned = block.matches("command = \"agent-hook dispatch").count();
     let mut stripped = String::with_capacity(raw.len() - (end - begin));
     stripped.push_str(&raw[..begin]);

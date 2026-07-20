@@ -905,33 +905,81 @@ fn activity_setup_missing_agent_hook_is_typed_and_never_mutates_provider_config(
     let original = b"# user-owned\nmodel = \"gpt-test\"\n";
     fs::write(&config, original).expect("provider config");
     let missing = tmp.path().join("missing-agent-hook");
+    let unstartable = tmp.path().join("unstartable-agent-hook");
+    fs::write(&unstartable, "#!/usr/bin/env sh\nexit 0\n").expect("unstartable hook");
     let home_arg = home.to_string_lossy().into_owned();
-    let missing_arg = missing.to_string_lossy().into_owned();
+    for hook in [missing, unstartable] {
+        let hook_arg = hook.to_string_lossy().into_owned();
+        let output = run(
+            tmp.path(),
+            &[
+                "activity", "setup", "--agent", "codex", "--apply", "--format", "json",
+            ],
+            &[
+                ("HOME", home_arg.as_str()),
+                ("AGENT_HOOK_BIN", hook_arg.as_str()),
+            ],
+        );
 
-    let output = run(
-        tmp.path(),
-        &[
-            "activity", "setup", "--agent", "codex", "--apply", "--format", "json",
-        ],
-        &[
-            ("HOME", home_arg.as_str()),
-            ("AGENT_HOOK_BIN", missing_arg.as_str()),
-        ],
-    );
+        assert_eq!(output.code, 69, "hook={}", hook.display());
+        let envelope = output.stdout_json();
+        assert_eq!(envelope["error"]["code"], "agent-hook-setup-unavailable");
+        assert_eq!(
+            envelope["error"]["details"]["compatibility_owner"],
+            "agent-hook"
+        );
+        assert!(
+            envelope["error"]["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("rerun the same dry-run")
+                    || message.contains("compatibility forward failed"))
+        );
+        assert_eq!(fs::read(&config).expect("provider config"), original);
+    }
+}
 
-    assert_ne!(output.code, 0);
-    let envelope = output.stdout_json();
-    assert_eq!(envelope["error"]["code"], "agent-hook-setup-unavailable");
-    assert_eq!(
-        envelope["error"]["details"]["compatibility_owner"],
-        "agent-hook"
+#[test]
+fn activity_setup_preserves_supported_agent_hook_failure_exit_classes() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let home = tmp.path().join("home");
+    fs::create_dir_all(&home).expect("home dir");
+    let hook = tmp.path().join("agent-hook");
+    write_executable(
+        &hook,
+        r#"#!/usr/bin/env sh
+: "${AGENT_HOOK_EXIT_CODE:?}"
+printf '%s\n' '{"schema_version":"cli.agent-hook.setup.v1","ok":false,"error":{"code":"agent-hook-forwarded-failure","message":"forwarded failure"}}'
+exit "$AGENT_HOOK_EXIT_CODE"
+"#,
     );
-    assert!(
-        envelope["error"]["message"]
-            .as_str()
-            .is_some_and(|message| message.contains("rerun the same dry-run"))
-    );
-    assert_eq!(fs::read(&config).expect("provider config"), original);
+    let home_arg = home.to_string_lossy().into_owned();
+    let hook_arg = hook.to_string_lossy().into_owned();
+
+    for expected in [1, 64, 65, 69, 70] {
+        let expected_arg = expected.to_string();
+        let output = run(
+            tmp.path(),
+            &[
+                "activity",
+                "setup",
+                "--agent",
+                "codex",
+                "--dry-run",
+                "--format",
+                "json",
+            ],
+            &[
+                ("HOME", home_arg.as_str()),
+                ("AGENT_HOOK_BIN", hook_arg.as_str()),
+                ("AGENT_HOOK_EXIT_CODE", expected_arg.as_str()),
+            ],
+        );
+        assert_eq!(output.code, expected, "expected child exit {expected}");
+        assert_eq!(
+            output.stdout_json()["error"]["code"],
+            "agent-hook-forwarded-failure"
+        );
+    }
 }
 
 #[test]

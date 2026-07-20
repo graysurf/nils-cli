@@ -413,6 +413,243 @@ fn codex_runtime_kit_trust_boundary_rejects_unsafe_suffixes_without_writes() {
 }
 
 #[test]
+fn codex_owned_marker_text_inside_multiline_values_is_unrelated_and_byte_exact() {
+    for quotes in ["\"\"\"", "'''"] {
+        let fixture = Fixture::new(POLICY);
+        let codex = fixture.home.join(".codex");
+        fs::create_dir_all(&codex).expect("codex dir");
+        let config = codex.join("config.toml");
+        let original = format!(
+            "note = {quotes}\n# >>> agent-hook:provider-ingress:v1 >>>\n[[hooks.SessionStart]]\n# <<< agent-hook:provider-ingress:v1 <<<\n{quotes}\n"
+        );
+        fs::write(&config, &original).expect("multiline config");
+        Fixture::set_private(&config);
+
+        let preview = fixture.run(
+            &[
+                "setup",
+                "--product",
+                "codex",
+                "--dry-run",
+                "--format",
+                "json",
+            ],
+            None,
+        );
+        assert_eq!(
+            preview.code,
+            0,
+            "quotes={quotes} stdout={} stderr={}",
+            preview.stdout_text(),
+            preview.stderr_text()
+        );
+        assert_eq!(
+            fs::read_to_string(&config).expect("preview bytes"),
+            original
+        );
+
+        let applied = fixture.run(
+            &["setup", "--product", "codex", "--apply", "--format", "json"],
+            None,
+        );
+        assert_eq!(applied.code, 0, "quotes={quotes}");
+        assert!(
+            fs::read_to_string(&config)
+                .expect("applied config")
+                .contains(&original),
+            "multiline user value must remain byte-exact"
+        );
+
+        let removed = fixture.run(
+            &[
+                "setup",
+                "--product",
+                "codex",
+                "--remove",
+                "--format",
+                "json",
+            ],
+            None,
+        );
+        assert_eq!(removed.code, 0, "quotes={quotes}");
+        assert_eq!(
+            fs::read_to_string(&config).expect("removed config"),
+            original
+        );
+    }
+}
+
+#[test]
+fn codex_owned_block_nested_in_foreign_manager_requires_review_and_preserves_bytes() {
+    let fixture = Fixture::new(POLICY);
+    let codex = fixture.home.join(".codex");
+    fs::create_dir_all(&codex).expect("codex dir");
+    let config = codex.join("config.toml");
+
+    let seeded = fixture.run(
+        &["setup", "--product", "codex", "--apply", "--format", "json"],
+        None,
+    );
+    assert_eq!(seeded.code, 0, "stderr={}", seeded.stderr_text());
+    let seeded = fs::read_to_string(&config).expect("seeded config");
+    let start = seeded
+        .find("# >>> agent-hook:provider-ingress:v1 >>>")
+        .expect("owned start");
+    let end = seeded
+        .find("# <<< agent-hook:provider-ingress:v1 <<<")
+        .expect("owned end")
+        + "# <<< agent-hook:provider-ingress:v1 <<<\n".len();
+    let owned = &seeded[start..end];
+    let original = format!(
+        "# >>> foreign-manager:hooks >>>\n# foreign-owned-metadata\n{owned}# <<< foreign-manager:hooks <<<\n"
+    );
+    fs::write(&config, &original).expect("foreign managed config");
+
+    let preview = fixture.run(
+        &[
+            "setup",
+            "--product",
+            "codex",
+            "--dry-run",
+            "--format",
+            "json",
+        ],
+        None,
+    );
+    assert_eq!(preview.code, 0, "stderr={}", preview.stderr_text());
+    assert_eq!(preview.stdout_json()["data"]["status"], "drifted");
+    assert_eq!(preview.stdout_json()["data"]["apply_allowed"], false);
+    assert_eq!(
+        fs::read_to_string(&config).expect("preview config"),
+        original
+    );
+    let digest = preview.stdout_json()["data"]["plan_digest"]
+        .as_str()
+        .expect("plan digest")
+        .to_string();
+
+    let unreviewed = fixture.run(
+        &["setup", "--product", "codex", "--apply", "--format", "json"],
+        None,
+    );
+    assert_eq!(unreviewed.code, 65);
+    assert_eq!(
+        unreviewed.stdout_json()["error"]["code"],
+        "setup-plan-digest-required"
+    );
+    assert_eq!(
+        fs::read_to_string(&config).expect("blocked config"),
+        original
+    );
+
+    let repaired = fixture.run(
+        &[
+            "setup",
+            "--product",
+            "codex",
+            "--apply",
+            "--expected-plan-digest",
+            &digest,
+            "--format",
+            "json",
+        ],
+        None,
+    );
+    assert_eq!(repaired.code, 0, "stderr={}", repaired.stderr_text());
+    let repaired = fs::read_to_string(&config).expect("repaired config");
+    let foreign_end = repaired
+        .find("# <<< foreign-manager:hooks <<<")
+        .expect("foreign end");
+    let owned_start = repaired
+        .find("# >>> agent-hook:provider-ingress:v1 >>>")
+        .expect("owned start");
+    assert!(foreign_end < owned_start);
+    assert!(repaired.contains(
+        "# >>> foreign-manager:hooks >>>\n# foreign-owned-metadata\n# <<< foreign-manager:hooks <<<"
+    ));
+
+    let ambiguous = original.replace("# <<< foreign-manager:hooks <<<\n", "");
+    fs::write(&config, &ambiguous).expect("ambiguous foreign boundary");
+    let rejected = fixture.run(
+        &[
+            "setup",
+            "--product",
+            "codex",
+            "--dry-run",
+            "--format",
+            "json",
+        ],
+        None,
+    );
+    assert_eq!(rejected.code, 65);
+    assert_eq!(
+        rejected.stdout_json()["error"]["code"],
+        "provider-config-invalid"
+    );
+    assert_eq!(
+        fs::read_to_string(&config).expect("ambiguous config retained"),
+        ambiguous
+    );
+}
+
+#[test]
+fn provider_setup_rejects_duplicate_json_keys_recursively_for_every_action() {
+    let fixtures = [
+        ("root", br#"{"keep":1,"keep":2}"#.as_slice()),
+        (
+            "nested",
+            br#"{"metadata":{"keep":1,"keep":2}}"#.as_slice(),
+        ),
+        (
+            "hooks-array",
+            br#"{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"keep-user-hook","command":"shadow-user-hook"}]}]}}"#
+                .as_slice(),
+        ),
+    ];
+    for product in ["claude", "codex"] {
+        for (fixture_name, duplicate) in fixtures {
+            for action in ["--dry-run", "--apply", "--repair", "--remove"] {
+                let fixture = Fixture::new(POLICY);
+                let provider_home = fixture.home.join(format!(".{product}"));
+                fs::create_dir_all(&provider_home).expect("provider dir");
+                let config = provider_home.join(if product == "claude" {
+                    "settings.json"
+                } else {
+                    "hooks.json"
+                });
+                fs::write(&config, duplicate).expect("duplicate JSON");
+                Fixture::set_private(&config);
+
+                let rejected = fixture.run(
+                    &["setup", "--product", product, action, "--format", "json"],
+                    None,
+                );
+                assert_eq!(
+                    rejected.code,
+                    65,
+                    "product={product} fixture={fixture_name} action={action} stdout={} stderr={}",
+                    rejected.stdout_text(),
+                    rejected.stderr_text()
+                );
+                assert_eq!(
+                    rejected.stdout_json()["error"]["code"],
+                    "provider-config-invalid",
+                    "product={product} fixture={fixture_name} action={action}"
+                );
+                assert_eq!(
+                    fs::read(&config).expect("unchanged duplicate JSON"),
+                    duplicate,
+                    "product={product} fixture={fixture_name} action={action}"
+                );
+                if product == "codex" {
+                    assert!(!provider_home.join("config.toml").exists());
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn doctor_classifies_missing_compatibility_converged_dual_drifted_and_unsupported() {
     let fixture = Fixture::new(POLICY);
     let codex = fixture.home.join(".codex");

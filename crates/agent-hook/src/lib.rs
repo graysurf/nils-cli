@@ -10,6 +10,7 @@ mod path_binding;
 mod paths;
 pub mod recovery;
 pub mod setup;
+mod strict_json;
 mod trace;
 
 use std::collections::BTreeMap;

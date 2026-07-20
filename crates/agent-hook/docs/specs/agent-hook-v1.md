@@ -277,7 +277,8 @@ identity independent of `--state-dir`, re-reads every reviewed byte state,
 writes atomically, and restores all prior bytes and file-presence states on any
 partial or post-replacement failure. Symlinks, non-regular files, unsafe
 permissions, concurrent drift, and malformed provider roots fail without
-mutation.
+mutation. JSON provider configuration is decoded with recursive duplicate-key
+rejection before every plan, apply, repair, or remove path.
 
 For Codex, `config.toml` and compatibility `hooks.json` are one transaction.
 The managed `config.toml` representation also owns the authoritative
@@ -290,6 +291,11 @@ boundary as drift and an exact reviewed plan digest may move only the closing
 marker ahead of the byte-preserved trust-table suffix. Ambiguous marker layouts,
 noncanonical trust headers that cannot be moved byte-for-byte, and non-trust
 TOML following that suffix fail closed before mutation.
+The `agent-hook:provider-ingress:v1` ownership markers are recognized only as
+an exact ordered pair of standalone lines outside basic and literal multiline
+TOML values. An owned block that overlaps another manager's marker range is
+drifted and requires the exact reviewed plan digest before it is moved outside
+that range; malformed foreign overlap fails closed.
 Owned groups contain exactly one dispatcher command for each required
 event/matcher. Install, upgrade, repair, remove, and rollback preserve
 unrelated hooks, comments, formatting, provider metadata, and unsupported

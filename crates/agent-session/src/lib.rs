@@ -550,7 +550,7 @@ fn forward_activity_setup_to_agent_hook(args: &cli::ActivitySetupArgs) -> Result
     ) {
         Ok(output) => output,
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            return Err(CliError::runtime(
+            return Err(CliError::unavailable(
                 "agent-hook-setup-unavailable",
                 "agent-hook is required for provider setup; install the matching nils-agent-hook binary, then rerun the same dry-run before any apply, repair, or remove",
                 Some(json!({
@@ -560,7 +560,7 @@ fn forward_activity_setup_to_agent_hook(args: &cli::ActivitySetupArgs) -> Result
             ));
         }
         Err(error) => {
-            return Err(CliError::runtime(
+            return Err(CliError::unavailable(
                 "agent-hook-setup-unavailable",
                 format!("agent-hook setup compatibility forward failed: {error}"),
                 Some(json!({
@@ -598,7 +598,17 @@ fn forward_activity_setup_to_agent_hook(args: &cli::ActivitySetupArgs) -> Result
             },
             |error| (error.code, error.message, error.details),
         );
-        return Err(CliError::data(code, message, details));
+        let child_exit = output
+            .status
+            .code()
+            .filter(|code| {
+                matches!(
+                    *code,
+                    exit::RUNTIME | exit::USAGE | exit::DATA | exit::UNAVAILABLE | exit::SOFTWARE
+                )
+            })
+            .unwrap_or(exit::DATA);
+        return Err(CliError::with_exit_code(code, message, details, child_exit));
     }
     let typed: Envelope<agent_hook::setup::SetupResult> = serde_json::from_slice(&output.stdout)
         .map_err(|_| {
@@ -1552,6 +1562,28 @@ impl CliError {
             message: message.into(),
             details,
             exit_code: exit::DATA,
+        }))
+    }
+
+    fn unavailable(
+        code: impl Into<String>,
+        message: impl Into<String>,
+        details: Option<Value>,
+    ) -> Self {
+        Self::with_exit_code(code, message, details, exit::UNAVAILABLE)
+    }
+
+    fn with_exit_code(
+        code: impl Into<String>,
+        message: impl Into<String>,
+        details: Option<Value>,
+        exit_code: i32,
+    ) -> Self {
+        Self(Box::new(CliErrorData {
+            code: code.into(),
+            message: message.into(),
+            details,
+            exit_code,
         }))
     }
 
