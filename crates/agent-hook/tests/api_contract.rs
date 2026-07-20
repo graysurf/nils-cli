@@ -104,6 +104,149 @@ fn inherited_git_worktree_selection_cannot_make_target_validation_order_dependen
     );
 }
 
+#[test]
+fn inherited_git_repository_environment_does_not_reject_targetless_events() {
+    let policy = r#"schema_version = "agent-hook.policy.v1"
+bundle_id = "runtime-kit"
+version = "2026.07.20.1"
+
+[[rules]]
+id = "targetless.session-start"
+products = ["codex", "claude"]
+events = ["SessionStart"]
+matcher = "resume"
+priority = 10
+mode = "enforce"
+failure_posture = "closed"
+override_class = "locked"
+capability = { id = "decision.allow.v1", reason_code = "session-start-known" }
+
+[[rules]]
+id = "targetless.stop-failure"
+products = ["claude"]
+events = ["StopFailure"]
+matcher = "rate_limit"
+priority = 10
+mode = "enforce"
+failure_posture = "closed"
+override_class = "locked"
+capability = { id = "decision.allow.v1", reason_code = "rate-limited" }
+"#;
+    let fixture = Fixture::new(policy);
+    let inherited = inherited_git_repository_environment(&fixture.root);
+    let mut actual = Vec::new();
+    let mut expected = Vec::new();
+
+    for (variable, value) in &inherited {
+        for product in ["codex", "claude"] {
+            let output = fixture.run_with_env(
+                &["dispatch", "--product", product, "--format", "json"],
+                Some(r#"{"hook_event_name":"SessionStart","source":"resume"}"#),
+                &[(variable, value)],
+            );
+            let envelope = output.stdout_json();
+            actual.push((
+                *variable,
+                product,
+                "SessionStart",
+                output.code,
+                if output.code == 0 {
+                    envelope["data"]["reasons"][0]["code"].clone()
+                } else {
+                    envelope["error"]["code"].clone()
+                },
+            ));
+            expected.push((
+                *variable,
+                product,
+                "SessionStart",
+                0,
+                json!("session-start-known"),
+            ));
+        }
+
+        let output = fixture.run_with_env(
+            &["dispatch", "--product", "claude", "--format", "json"],
+            Some(r#"{"hook_event_name":"StopFailure","error":"rate_limit"}"#),
+            &[(variable, value)],
+        );
+        let envelope = output.stdout_json();
+        actual.push((
+            *variable,
+            "claude",
+            "StopFailure",
+            output.code,
+            if output.code == 0 {
+                envelope["data"]["reasons"][0]["code"].clone()
+            } else {
+                envelope["error"]["code"].clone()
+            },
+        ));
+        expected.push((*variable, "claude", "StopFailure", 0, json!("rate-limited")));
+    }
+
+    eprintln!("targetless inherited Git environment outcomes: {actual:?}");
+    assert_eq!(actual, expected);
+}
+
+#[test]
+fn inherited_git_repository_environment_still_rejects_execution_binding() {
+    let fixture = Fixture::new(ALLOW_POLICY);
+    let payload = json!({
+        "hook_event_name":"SessionStart",
+        "source":"resume",
+        "cwd":fixture.root,
+    })
+    .to_string();
+    let mut outcomes = Vec::new();
+
+    for (variable, value) in inherited_git_repository_environment(&fixture.root) {
+        let output = fixture.run_with_env(
+            &["dispatch", "--product", "codex", "--format", "json"],
+            Some(&payload),
+            &[(variable, value.as_str())],
+        );
+        outcomes.push((
+            variable,
+            output.code,
+            output.stdout_json()["error"]["code"].clone(),
+        ));
+    }
+
+    assert_eq!(
+        outcomes,
+        [
+            "GIT_DIR",
+            "GIT_WORK_TREE",
+            "GIT_COMMON_DIR",
+            "GIT_CEILING_DIRECTORIES",
+            "GIT_DISCOVERY_ACROSS_FILESYSTEM",
+            "GIT_CONFIG_PARAMETERS",
+            "GIT_CONFIG_COUNT",
+        ]
+        .map(|variable| (variable, 65, json!("provider-target-untrusted")))
+    );
+}
+
+fn inherited_git_repository_environment(root: &std::path::Path) -> [(&'static str, String); 7] {
+    let git_path = root.join("inherited-git-dir");
+    [
+        ("GIT_DIR", git_path.to_string_lossy().into_owned()),
+        ("GIT_WORK_TREE", root.to_string_lossy().into_owned()),
+        ("GIT_COMMON_DIR", git_path.to_string_lossy().into_owned()),
+        (
+            "GIT_CEILING_DIRECTORIES",
+            root.to_string_lossy().into_owned(),
+        ),
+        ("GIT_DISCOVERY_ACROSS_FILESYSTEM", "0".to_string()),
+        (
+            "GIT_CONFIG_PARAMETERS",
+            "'agent-hook.targetless=true'".to_string(),
+        ),
+        ("GIT_CONFIG_COUNT", "0".to_string()),
+    ]
+}
+
 fn two_target_apply_patch_payload(
     project_root: &std::path::Path,
     targets: &[std::path::PathBuf; 2],

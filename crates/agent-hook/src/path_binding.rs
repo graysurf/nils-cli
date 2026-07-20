@@ -14,6 +14,9 @@ pub struct TargetBinding {
 }
 
 pub fn resolve_target_bindings(paths: &[PathBuf]) -> Result<Vec<TargetBinding>, HookError> {
+    if paths.is_empty() {
+        return Ok(Vec::new());
+    }
     reject_repository_selection_environment()?;
     let mut root_cache = BTreeMap::<PathBuf, PathBuf>::new();
     paths
