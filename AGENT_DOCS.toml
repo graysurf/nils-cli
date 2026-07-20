@@ -30,6 +30,14 @@ required = true
 when = "always"
 notes = "Crate docs placement policy for project development tasks"
 
+[[document]]
+context = "session-coordination"
+scope = "project"
+path = "crates/agent-session/docs/README.md"
+required = true
+when = "always"
+notes = "Project-local index for the agent-session coordination CLI and protocol; work context is collision metadata, not work authorization."
+
 # Finish-line validation contract: code edits in this workspace must run the
 # local-fast CI gate before a project-dev task is declared done (agent-docs
 # v0.30+). The Stop hook blocks finishing until this command has run since the
