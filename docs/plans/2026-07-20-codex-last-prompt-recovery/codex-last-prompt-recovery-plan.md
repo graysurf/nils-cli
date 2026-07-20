@@ -119,7 +119,7 @@ Replace the fixed 256 KiB best-effort lookup used by the session list with a bou
 - **Validation**:
   - Canonical release helper output
   - `systemctl --user show agent-console-serve.service --property=KillMode --property=ActiveState --property=SubState --property=Result`
-  - `/home/terry/Project/serenvia/sympoies-infra/scripts/smoke-agent-console.sh`
+  - `$HOME/Project/serenvia/sympoies-infra/scripts/smoke-agent-console.sh`
   - Aggregate authenticated `/sessions` capability/provider coverage check with content redacted
 
 ## Testing Strategy
