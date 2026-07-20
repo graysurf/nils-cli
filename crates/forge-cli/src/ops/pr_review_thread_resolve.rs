@@ -23,7 +23,7 @@ use crate::cli::{BINARY, GlobalFlags, PrReviewThreadResolveArgs};
 use crate::envelope::emit_success;
 use crate::error::ForgeError;
 use crate::ops::pr_comment::read_body_with_file_flag;
-use crate::ops::pr_review_threads;
+use crate::ops::{pr_review_threads, review_state};
 use crate::provider::{Provider, ProviderContext, detect, git_remote_url};
 use crate::rate_limit::default_runner;
 use crate::validations::no_local_path;
@@ -83,7 +83,11 @@ pub fn run_with<R: BackendRunner, F: Fn(&str) -> Option<String>>(
         None
     } else {
         no_local_path(&note, "note")?;
-        Some(note)
+        Some(format!(
+            "{}\n{}",
+            note.trim_end(),
+            review_state::thread_disposition_marker(&args.thread)
+        ))
     };
 
     let reply_call = note

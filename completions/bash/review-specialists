@@ -55,7 +55,7 @@ _review-specialists() {
             return 0
             ;;
         review__specialists__bundle)
-            opts="-h --format --input --out-dir --display-threshold --profile --repo --ref --link-base --help"
+            opts="-h --format --mode --input --out-dir --display-threshold --profile --repo --ref --link-base --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -63,6 +63,10 @@ _review-specialists() {
             case "${prev}" in
                 --format)
                     COMPREPLY=($(compgen -W "text json" -- "${cur}"))
+                    return 0
+                    ;;
+                --mode)
+                    COMPREPLY=($(compgen -W "advisory delivery" -- "${cur}"))
                     return 0
                     ;;
                 --input)
@@ -129,7 +133,7 @@ _review-specialists() {
             return 0
             ;;
         review__specialists__merge)
-            opts="-h --format --input --display-threshold --summary-out --help"
+            opts="-h --format --mode --input --display-threshold --summary-out --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -137,6 +141,10 @@ _review-specialists() {
             case "${prev}" in
                 --format)
                     COMPREPLY=($(compgen -W "text json" -- "${cur}"))
+                    return 0
+                    ;;
+                --mode)
+                    COMPREPLY=($(compgen -W "advisory delivery" -- "${cur}"))
                     return 0
                     ;;
                 --input)
@@ -274,7 +282,7 @@ _review-specialists() {
             return 0
             ;;
         review__specialists__validate)
-            opts="-h --format --input --repo --validate-paths --validate-lines --help"
+            opts="-h --format --mode --input --repo --validate-paths --validate-lines --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -282,6 +290,10 @@ _review-specialists() {
             case "${prev}" in
                 --format)
                     COMPREPLY=($(compgen -W "text json" -- "${cur}"))
+                    return 0
+                    ;;
+                --mode)
+                    COMPREPLY=($(compgen -W "advisory delivery" -- "${cur}"))
                     return 0
                     ;;
                 --input)

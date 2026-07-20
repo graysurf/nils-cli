@@ -28,7 +28,7 @@ Each finding is one JSON object per line:
 
 Required fields are `severity`, `confidence`, `path`, `summary`, `evidence`,
 `recommendation`, and `specialist`. Optional fields are `line`, `category`,
-`fingerprint`, and `test_suggestion`.
+`fingerprint`, `root_cause_fingerprint`, and `test_suggestion`.
 
 Severity aliases normalize to `critical`, `high`, `medium`, `low`, and `info`.
 Confidence must be `0.0..=1.0`. Unknown fields are rejected so fixture drift is
@@ -40,6 +40,7 @@ visible during validation.
 review-specialists scope --base main --format json
 review-specialists validate --input findings.jsonl --format json
 review-specialists merge --input findings.jsonl --summary-out review.md
+review-specialists merge --mode delivery --input findings.jsonl --format json
 review-specialists render --profile issue-body --input findings.merged.json \
   --repo sympoies/nils-cli --ref HEAD --out issue.md
 review-specialists bundle --input findings.jsonl --out-dir target/review-specialists/bundle \
@@ -50,10 +51,25 @@ review-specialists bundle --input findings.jsonl --out-dir target/review-special
 stack signals, test framework signals, suggested specialists, forced
 specialists, small-diff skip metadata, and red-team trigger metadata.
 
-`merge` deduplicates by explicit `fingerprint` when present. Otherwise it
-computes a stable fingerprint from `path`, `line`, `category`, and `summary`.
-The highest-confidence row becomes the primary finding, with confirming
-specialists retained in deterministic order.
+`validate`, `merge`, and `bundle` default to advisory mode. Advisory mode keeps
+the compatibility behavior: it deduplicates by explicit `fingerprint` when
+present and otherwise computes one from `path`, `line`, `category`, and
+`summary`.
+
+Delivery mode requires every row to declare a stable
+`<category>:<component>:<invariant>` fingerprint. Its first segment must match
+the finding category. An optional `root_cause_fingerprint` groups multiple lens
+observations under one lifecycle identity without dropping their `source_rows`.
+Incompatible reuse fails as `review_fingerprint_collision`; missing explicit
+identity fails as `review_fingerprint_required`. Delivery output uses the v2
+finding/merge schemas and exposes `lifecycle_fingerprint` for the downstream
+review-loop ledger. The highest-confidence row becomes the primary finding,
+with confirming specialists retained in deterministic order.
+
+The downstream observation array may attach an explicit `status` or
+`disposition` of `open`, `fixed`, `accepted`, `preference`, or `follow-up` to a
+lifecycle fingerprint. Omitting a previously open finding on the same head is
+not a disposition; `forge-cli` requires the explicit field or a repaired head.
 
 `bundle` writes:
 

@@ -47,7 +47,7 @@ const GITHUB_ADD_PENDING_REVIEW_MUTATION: &str = "mutation($pullRequestId: ID!, 
 const GITHUB_ADD_REVIEW_THREAD_MUTATION: &str = "mutation($reviewId: ID!, $path: String!, $body: String!, $line: Int, $side: DiffSide!, $startLine: Int, $startSide: DiffSide, $subjectType: PullRequestReviewThreadSubjectType!) { addPullRequestReviewThread(input: {pullRequestReviewId: $reviewId, path: $path, body: $body, line: $line, side: $side, startLine: $startLine, startSide: $startSide, subjectType: $subjectType}) { thread { id path line subjectType comments(first: 1) { nodes { url } } } } }";
 const GITHUB_SUBMIT_REVIEW_MUTATION: &str = "mutation($reviewId: ID!, $event: PullRequestReviewEvent!, $body: String) { submitPullRequestReview(input: {pullRequestReviewId: $reviewId, event: $event, body: $body}) { pullRequestReview { url } } }";
 const GITHUB_DELETE_PENDING_REVIEW_MUTATION: &str = "mutation($reviewId: ID!) { deletePullRequestReview(input: {pullRequestReviewId: $reviewId}) { pullRequestReview { id url } } }";
-const GITHUB_REVIEW_STATE_COMMENTS_QUERY: &str = "query($owner: String!, $name: String!, $pr: Int!, $after: String) { viewer { login } repository(owner: $owner, name: $name) { pullRequest(number: $pr) { comments(first: 100, after: $after) { nodes { author { login } body } pageInfo { hasNextPage endCursor } } } } }";
+const GITHUB_REVIEW_STATE_COMMENTS_QUERY: &str = "query($owner: String!, $name: String!, $pr: Int!, $after: String) { viewer { login } repository(owner: $owner, name: $name) { pullRequest(number: $pr) { comments(first: 100, after: $after) { nodes { author { login } authorAssociation body createdAt } pageInfo { hasNextPage endCursor } } } } }";
 
 /// Which `glab` review-note form to emit for a GitLab `pr review`, resolved by
 /// probing the local `glab` build (see [`glab_note_form`]). Covers every glab
@@ -1819,7 +1819,7 @@ fn ensure_review_run_receipt<R: BackendRunner>(
         number,
         state.end_cursor.as_deref(),
         Some(&state.viewer_login),
-        state.trusted_bodies.clone(),
+        state.trusted_comments.clone(),
     )?;
     if receipt_is_recorded(&observed.chain, receipt)? {
         return Ok(());
@@ -1873,15 +1873,101 @@ pub(crate) fn read_review_state_chain<R: BackendRunner>(
 }
 
 #[derive(Debug, Clone)]
+pub(crate) struct ReviewLoopStateView {
+    pub chain: review_state::ReviewStateChain,
+    pub tip_created_at: Option<String>,
+}
+
+pub(crate) fn read_review_loop_state_view<R: BackendRunner>(
+    runner: &R,
+    ctx: &ProviderContext,
+    repository: &str,
+    number: u64,
+) -> Result<ReviewLoopStateView, ForgeError> {
+    let snapshot = read_review_state_snapshot(runner, ctx, repository, number)?;
+    let tip_created_at = snapshot.chain.tip_digest.as_deref().and_then(|tip| {
+        snapshot.trusted_comments.iter().find_map(|comment| {
+            review_state::parse_state_marker(&comment.body)
+                .ok()
+                .flatten()
+                .filter(|record| record.record_digest == tip)
+                .map(|_| comment.created_at.clone())
+        })
+    });
+    Ok(ReviewLoopStateView {
+        chain: snapshot.chain,
+        tip_created_at,
+    })
+}
+
+pub(crate) fn append_review_loop_state<R: BackendRunner>(
+    runner: &R,
+    ctx: &ProviderContext,
+    repository: &str,
+    number: u64,
+    expected_head: &str,
+    expected_tip: Option<&str>,
+    state: review_state::ReviewLoopState,
+) -> Result<review_state::ReviewStateChain, ForgeError> {
+    let before = read_review_state_snapshot(runner, ctx, repository, number)?;
+    if before.chain.tip_digest.as_deref() != expected_tip {
+        return Err(ForgeError::validation(
+            schema_err(),
+            "review_state_conflict",
+            "the review-state tip changed before append",
+            Some(format!(
+                "expected_tip={}; provider_tip={}",
+                expected_tip.unwrap_or("<genesis>"),
+                before.chain.tip_digest.as_deref().unwrap_or("<genesis>")
+            )),
+        ));
+    }
+    let record = review_state::ReviewStateRecord::new(
+        repository,
+        number,
+        expected_head,
+        before.chain.records.len() as u64,
+        before.chain.tip_digest.clone(),
+        review_state::ReviewStatePayload::ReviewLoop { state },
+    )?;
+    let marker = record.marker()?;
+    let append_result = runner.run(&build_issue_comment_call(ctx, number, &marker));
+    let after = read_review_state_snapshot(runner, ctx, repository, number)?;
+    if after
+        .chain
+        .records
+        .iter()
+        .any(|observed| observed.record_digest == record.record_digest)
+    {
+        return Ok(after.chain);
+    }
+    Err(match append_result {
+        Ok(_) => ForgeError::validation(
+            schema_err(),
+            "review_state_conflict",
+            "the review-loop state was not visible after provider write",
+            Some(format!("record_digest={}", record.record_digest)),
+        ),
+        Err(error) => error,
+    })
+}
+
+#[derive(Debug, Clone)]
 struct ReviewStateSnapshot {
     chain: review_state::ReviewStateChain,
-    trusted_bodies: Vec<String>,
+    trusted_comments: Vec<ReviewStateComment>,
     viewer_login: String,
     end_cursor: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ReviewStateComment {
+    body: String,
+    created_at: String,
+}
+
 struct ReviewStatePage {
-    trusted_bodies: Vec<String>,
+    trusted_comments: Vec<ReviewStateComment>,
     viewer_login: String,
     has_next_page: bool,
     end_cursor: Option<String>,
@@ -1903,7 +1989,7 @@ fn read_review_state_after<R: BackendRunner>(
     number: u64,
     initial_cursor: Option<&str>,
     expected_viewer: Option<&str>,
-    mut trusted_bodies: Vec<String>,
+    mut trusted_comments: Vec<ReviewStateComment>,
 ) -> Result<ReviewStateSnapshot, ForgeError> {
     let mut cursor = initial_cursor.map(str::to_string);
     let mut seen_cursors = BTreeSet::new();
@@ -1929,16 +2015,16 @@ fn read_review_state_after<R: BackendRunner>(
             ));
         }
         viewer_login.get_or_insert(page.viewer_login);
-        trusted_bodies.extend(page.trusted_bodies);
+        trusted_comments.extend(page.trusted_comments);
         if !page.has_next_page {
             let chain = review_state::parse_chain(
-                trusted_bodies.iter().map(String::as_str),
+                trusted_comments.iter().map(|comment| comment.body.as_str()),
                 repository,
                 number,
             )?;
             return Ok(ReviewStateSnapshot {
                 chain,
-                trusted_bodies,
+                trusted_comments,
                 viewer_login: viewer_login.unwrap_or_default(),
                 end_cursor: page.end_cursor,
             });
@@ -2036,14 +2122,24 @@ fn parse_review_state_page(
                 None,
             )
         })?;
-    let trusted_bodies = nodes
+    let trusted_comments = nodes
         .iter()
         .filter(|node| {
-            node.pointer("/author/login").and_then(|item| item.as_str())
-                == Some(viewer_login.as_str())
+            let author = node.pointer("/author/login").and_then(|item| item.as_str());
+            let association = node.get("authorAssociation").and_then(|item| item.as_str());
+            author == Some(viewer_login.as_str())
+                || matches!(association, Some("OWNER" | "MEMBER" | "COLLABORATOR"))
         })
-        .filter_map(|node| node.get("body").and_then(|item| item.as_str()))
-        .map(str::to_string)
+        .filter_map(|node| {
+            Some(ReviewStateComment {
+                body: node.get("body")?.as_str()?.to_string(),
+                created_at: node
+                    .get("createdAt")
+                    .and_then(|item| item.as_str())
+                    .unwrap_or_default()
+                    .to_string(),
+            })
+        })
         .collect();
     let page_info = comments.get("pageInfo").ok_or_else(|| {
         ForgeError::validation(
@@ -2070,7 +2166,7 @@ fn parse_review_state_page(
         .filter(|item| !item.is_empty())
         .map(str::to_string);
     Ok(ReviewStatePage {
-        trusted_bodies,
+        trusted_comments,
         viewer_login,
         has_next_page,
         end_cursor,
@@ -3179,15 +3275,16 @@ mod tests {
     }
 
     #[test]
-    fn review_state_pages_ignore_foreign_markers_but_keep_viewer_markers_fail_closed() {
+    fn review_state_pages_ignore_unprivileged_markers_and_keep_cross_session_collaborators() {
         let output = crate::backend::BackendSuccess {
             stdout: serde_json::json!({
                 "data": {
                     "viewer": {"login": "review-bot"},
                     "repository": {"pullRequest": {"comments": {
                         "nodes": [
-                            {"author": {"login": "attacker"}, "body": "<!-- forge-cli:review-state:v1 xyz -->"},
-                            {"author": {"login": "review-bot"}, "body": "ordinary comment"}
+                            {"author": {"login": "attacker"}, "authorAssociation": "NONE", "body": "<!-- forge-cli:review-state:v1 xyz -->", "createdAt": "2026-07-20T00:00:00Z"},
+                            {"author": {"login": "review-bot"}, "authorAssociation": "NONE", "body": "ordinary comment", "createdAt": "2026-07-20T00:00:01Z"},
+                            {"author": {"login": "maintainer"}, "authorAssociation": "MEMBER", "body": "cross-session comment", "createdAt": "2026-07-20T00:00:02Z"}
                         ],
                         "pageInfo": {"hasNextPage": false, "endCursor": null}
                     }}}
@@ -3197,10 +3294,13 @@ mod tests {
             stderr: String::new(),
         };
         let page = parse_review_state_page(&output).expect("trusted page");
-        assert_eq!(page.trusted_bodies, vec!["ordinary comment"]);
+        assert_eq!(page.trusted_comments[0].body, "ordinary comment");
+        assert_eq!(page.trusted_comments[1].body, "cross-session comment");
         assert!(
             review_state::parse_chain(
-                page.trusted_bodies.iter().map(String::as_str),
+                page.trusted_comments
+                    .iter()
+                    .map(|comment| comment.body.as_str()),
                 "acme/widgets",
                 44,
             )
@@ -3217,12 +3317,102 @@ mod tests {
         };
         let page = parse_review_state_page(&trusted_malformed).expect("trusted page");
         let error = review_state::parse_chain(
-            page.trusted_bodies.iter().map(String::as_str),
+            page.trusted_comments
+                .iter()
+                .map(|comment| comment.body.as_str()),
             "acme/widgets",
             44,
         )
         .expect_err("a malformed viewer-owned marker must fail closed");
         assert_eq!(error.kind(), "review_state_conflict");
+    }
+
+    #[test]
+    fn review_loop_append_rechecks_tip_and_reads_back_a_privileged_cross_session_record() {
+        let observation = review_state::ReviewFindingObservation {
+            fingerprint: "correctness:review-loop:typed-state".to_string(),
+            root_cause_fingerprint: None,
+            blocking: true,
+            status: review_state::ReviewFindingStatus::Open,
+            threads: vec!["PRRT_1".to_string()],
+        };
+        let state = review_state::observe_review_loop(None, "head-44", &[observation])
+            .expect("genesis transition")
+            .state;
+        let record = review_state::ReviewStateRecord::new(
+            "acme/widgets",
+            44,
+            "head-44",
+            0,
+            None,
+            review_state::ReviewStatePayload::ReviewLoop {
+                state: state.clone(),
+            },
+        )
+        .expect("record");
+        let marker = record.marker().expect("marker");
+        let empty_snapshot = crate::backend::BackendSuccess {
+            stdout: serde_json::json!({
+                "data": {
+                    "viewer": {"login": "next-session-bot"},
+                    "repository": {"pullRequest": {"comments": {
+                        "nodes": [],
+                        "pageInfo": {"hasNextPage": false, "endCursor": null}
+                    }}}
+                }
+            })
+            .to_string(),
+            stderr: String::new(),
+        };
+        let appended_snapshot = crate::backend::BackendSuccess {
+            stdout: serde_json::json!({
+                "data": {
+                    "viewer": {"login": "next-session-bot"},
+                    "repository": {"pullRequest": {"comments": {
+                        "nodes": [{
+                            "author": {"login": "prior-session-bot"},
+                            "authorAssociation": "COLLABORATOR",
+                            "body": marker,
+                            "createdAt": "2026-07-20T00:00:01Z"
+                        }],
+                        "pageInfo": {"hasNextPage": false, "endCursor": "tip"}
+                    }}}
+                }
+            })
+            .to_string(),
+            stderr: String::new(),
+        };
+        let runner = ReceiptRunner {
+            outputs: RefCell::new(vec![
+                empty_snapshot,
+                crate::backend::BackendSuccess {
+                    stdout: "https://github.com/acme/widgets/issues/44#issuecomment-1".to_string(),
+                    stderr: String::new(),
+                },
+                appended_snapshot,
+            ]),
+            calls: RefCell::new(Vec::new()),
+        };
+
+        let chain = append_review_loop_state(
+            &runner,
+            &ctx(Some("acme/widgets")),
+            "acme/widgets",
+            44,
+            "head-44",
+            None,
+            state,
+        )
+        .expect("append and read back");
+
+        assert_eq!(chain.records.len(), 1);
+        assert_eq!(
+            chain.tip_digest.as_deref(),
+            Some(record.record_digest.as_str())
+        );
+        let calls = runner.calls.borrow();
+        assert_eq!(calls.len(), 3);
+        assert!(calls[1].contains("issues/44/comments"), "{}", calls[1]);
     }
 
     #[test]
@@ -3251,7 +3441,10 @@ mod tests {
         let state = ReviewStateSnapshot {
             chain: review_state::parse_chain([prior_marker.as_str()], "acme/widgets", 44)
                 .expect("prior chain"),
-            trusted_bodies: vec![prior_marker],
+            trusted_comments: vec![ReviewStateComment {
+                body: prior_marker,
+                created_at: "2026-07-20T00:00:00Z".to_string(),
+            }],
             viewer_login: "review-bot".to_string(),
             end_cursor: Some("state-tip".to_string()),
         };
@@ -3289,7 +3482,8 @@ mod tests {
                             "repository": {"pullRequest": {"comments": {
                                 "nodes": [{
                                     "author": {"login": "review-bot"},
-                                    "body": next_marker
+                                    "body": next_marker,
+                                    "createdAt": "2026-07-20T00:00:01Z"
                                 }],
                                 "pageInfo": {"hasNextPage": false, "endCursor": "state-next"}
                             }}}

@@ -32,6 +32,7 @@ _review-specialists() {
 _arguments "${_arguments_options[@]}" : \
 '--format=[Output format]:FORMAT:((text\:"Human-readable text output (default)"
 json\:"Single-record JSON envelope (snake_case)"))' \
+'--mode=[Fingerprint policy. Delivery requires stable lifecycle identities]:MODE:(advisory delivery)' \
 '*--input=[Specialist finding JSONL input file]:FILE:_files' \
 '--repo=[Repository root for optional path or line validation]:DIR:_files -/' \
 '--validate-paths[Check that finding paths exist under --repo]' \
@@ -44,6 +45,7 @@ json\:"Single-record JSON envelope (snake_case)"))' \
 _arguments "${_arguments_options[@]}" : \
 '--format=[Output format]:FORMAT:((text\:"Human-readable text output (default)"
 json\:"Single-record JSON envelope (snake_case)"))' \
+'--mode=[Fingerprint policy. Delivery requires stable lifecycle identities]:MODE:(advisory delivery)' \
 '*--input=[Specialist finding JSONL input file]:FILE:_files' \
 '--display-threshold=[Minimum confidence for displayed findings]:DISPLAY_THRESHOLD:_default' \
 '--summary-out=[Optional Markdown report path to write]:FILE:_files' \
@@ -69,6 +71,7 @@ json\:"Single-record JSON envelope (snake_case)"))' \
 _arguments "${_arguments_options[@]}" : \
 '--format=[Output format]:FORMAT:((text\:"Human-readable text output (default)"
 json\:"Single-record JSON envelope (snake_case)"))' \
+'--mode=[Fingerprint policy. Delivery requires stable lifecycle identities]:MODE:(advisory delivery)' \
 '*--input=[Specialist finding JSONL input file]:FILE:_files' \
 '--out-dir=[Bundle output directory]:DIR:_files -/' \
 '--display-threshold=[Minimum confidence for displayed findings]:DISPLAY_THRESHOLD:_default' \
