@@ -143,7 +143,8 @@ fn io_error_from_atomic_write(err: nils_common::fs::AtomicWriteError) -> io::Err
         | nils_common::fs::AtomicWriteError::CreateTempFile { source, .. }
         | nils_common::fs::AtomicWriteError::WriteTempFile { source, .. }
         | nils_common::fs::AtomicWriteError::SetPermissions { source, .. }
-        | nils_common::fs::AtomicWriteError::ReplaceFile { source, .. } => source,
+        | nils_common::fs::AtomicWriteError::ReplaceFile { source, .. }
+        | nils_common::fs::AtomicWriteError::SyncTempFile { source, .. } => source,
         nils_common::fs::AtomicWriteError::TempPathExhausted { target, .. } => io::Error::new(
             io::ErrorKind::AlreadyExists,
             format!("failed to create unique temp file for {}", target.display()),

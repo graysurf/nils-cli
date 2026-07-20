@@ -101,6 +101,12 @@ pub enum AtomicWriteError {
         #[source]
         source: io::Error,
     },
+    #[error("failed to flush temporary file {path} to disk: {source}")]
+    SyncTempFile {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
     #[error("failed to set permissions on {path}: {source}")]
     SetPermissions {
         path: PathBuf,
@@ -220,7 +226,15 @@ pub fn write_atomic(path: &Path, contents: &[u8], mode: u32) -> Result<(), Atomi
                         path: tmp_path.clone(),
                         source,
                     })?;
-                let _ = file.flush();
+                // Durably persist the temp file's data and metadata before the
+                // rename so a crash after `replace_file` returns cannot expose a
+                // truncated or empty destination. The previous `flush()` neither
+                // fsynced nor propagated its error.
+                file.sync_all()
+                    .map_err(|source| AtomicWriteError::SyncTempFile {
+                        path: tmp_path.clone(),
+                        source,
+                    })?;
                 set_permissions(&tmp_path, mode).map_err(|source| {
                     AtomicWriteError::SetPermissions {
                         path: tmp_path.clone(),
@@ -238,6 +252,9 @@ pub fn write_atomic(path: &Path, contents: &[u8], mode: u32) -> Result<(), Atomi
                     path: path.to_path_buf(),
                     source,
                 })?;
+                // Best-effort fsync of the destination directory so the rename
+                // entry itself survives a crash.
+                sync_parent_dir(path);
                 return Ok(());
             }
             Err(source) if source.kind() == io::ErrorKind::AlreadyExists => {
@@ -258,6 +275,24 @@ pub fn write_atomic(path: &Path, contents: &[u8], mode: u32) -> Result<(), Atomi
         }
     }
 }
+
+/// Best-effort `fsync` of a file's parent directory so a preceding rename is
+/// durable across a crash. Ignored when the directory cannot be opened or its
+/// `fsync` is rejected (some filesystems do), and a no-op on non-Unix targets
+/// where a directory handle is not flushed this way.
+#[cfg(unix)]
+fn sync_parent_dir(path: &Path) {
+    let parent = match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
+    };
+    if let Ok(dir) = File::open(parent) {
+        let _ = dir.sync_all();
+    }
+}
+
+#[cfg(not(unix))]
+fn sync_parent_dir(_path: &Path) {}
 
 /// Persist a timestamp line.
 ///
