@@ -14,15 +14,15 @@
 - Active task: 2.1
 - Last checkpoint: Sprint 1 complete; focused tests and docs-only validation pass
 
-## Task ledger
+## Task Ledger
 
-| Task | State | Evidence |
-| --- | --- | --- |
-| 1.1 Meaningful red test | done | Retained test-first failure evidence |
-| 1.2 Bounded recovery and tracking | done | Provider-prompt focused suite passes |
-| 1.3 Runtime contract docs | done | Docs-only gate passes |
-| 2.1 Validate, review, merge | active | Finish-line validation pending |
-| 2.2 Release, deploy, live verify | pending | blocked by 2.1 and release consent |
+| ID | Status | Task | Evidence | Notes |
+| --- | --- | --- | --- | --- |
+| 1.1 | done | Meaningful red test | Retained test-first failure evidence | Legacy 256 KiB miss reproduced. |
+| 1.2 | done | Bounded recovery and tracking | Provider-prompt focused suite passes | Exact identity remains required. |
+| 1.3 | done | Runtime contract docs | Docs-only gate passes | API and runbook updated. |
+| 2.1 | active | Validate, review, merge | Finish-line validation passes | Independent review pending. |
+| 2.2 | pending | Release, deploy, live verify | none | Blocked by 2.1 and release consent. |
 
 ## Scope decisions
 
