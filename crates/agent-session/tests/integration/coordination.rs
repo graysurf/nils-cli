@@ -295,7 +295,7 @@ fn coordination_help_exposes_closed_work_context_and_mailbox_command_families() 
 }
 
 #[test]
-fn advisory_presence_defaults_for_legacy_sessions_and_classifies_overlap_without_claims() {
+fn advisory_presence_defaults_for_unclaimed_sessions_and_classifies_overlap() {
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let state_dir = tmp.path().join("state");
     fs::create_dir(&state_dir).expect("state");
