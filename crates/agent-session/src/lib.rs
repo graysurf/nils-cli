@@ -191,6 +191,11 @@ fn dispatch(cli: Cli) -> i32 {
 fn coordination_command_name(command: &Command) -> Option<&'static str> {
     match command {
         Command::WorkContext(args) => Some(match &args.command {
+            cli::WorkContextCommand::Status(_) => "work-context-status",
+            cli::WorkContextCommand::Set(_) => "work-context-set",
+            cli::WorkContextCommand::Clear(_) => "work-context-clear",
+            cli::WorkContextCommand::Advise(_) => "work-context-advise",
+            cli::WorkContextCommand::Acknowledge(_) => "work-context-acknowledge",
             cli::WorkContextCommand::Claim(_) => "work-context-claim",
             cli::WorkContextCommand::Show(_) => "work-context-show",
             cli::WorkContextCommand::Check(_) => "work-context-check",
@@ -224,6 +229,11 @@ fn coordination_leaf_from_raw_args(args: &[OsString]) -> Option<&'static str> {
         let group = pair[0].to_str()?;
         let leaf = pair[1].to_str()?;
         match (group, leaf) {
+            ("work-context", "status") => Some("work-context-status"),
+            ("work-context", "set") => Some("work-context-set"),
+            ("work-context", "clear") => Some("work-context-clear"),
+            ("work-context", "advise") => Some("work-context-advise"),
+            ("work-context", "acknowledge") => Some("work-context-acknowledge"),
             ("work-context", "claim") => Some("work-context-claim"),
             ("work-context", "show") => Some("work-context-show"),
             ("work-context", "check") => Some("work-context-check"),
@@ -265,6 +275,11 @@ fn command_format(command: &Command) -> OutputFormat {
             cli::ActivityCommand::Setup(args) => args.format,
         },
         Command::WorkContext(args) => match &args.command {
+            cli::WorkContextCommand::Status(args) => args.format,
+            cli::WorkContextCommand::Set(args) => args.format,
+            cli::WorkContextCommand::Clear(args) => args.format,
+            cli::WorkContextCommand::Advise(args) => args.format,
+            cli::WorkContextCommand::Acknowledge(args) => args.format,
             cli::WorkContextCommand::Claim(args) => args.format,
             cli::WorkContextCommand::Show(args) => args.format,
             cli::WorkContextCommand::Check(args) => args.format,
@@ -565,6 +580,8 @@ struct SessionRecord {
     id: String,
     agent: String,
     mode: String,
+    #[serde(default)]
+    coordination_mode: cli::CoordinationMode,
     title: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     title_state: Option<SessionTitleState>,
@@ -1188,6 +1205,7 @@ struct SessionView {
     #[serde(skip)]
     profile_resume_context: Result<Option<DurableProfileResumeContext>, CliError>,
     mode: String,
+    coordination_mode: cli::CoordinationMode,
     title: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     title_state: Option<SessionTitleStateView>,
@@ -1241,6 +1259,7 @@ pub(crate) struct ProviderResumeImportArgs {
     pub(crate) title: Option<String>,
     pub(crate) title_state: Option<SessionTitleState>,
     pub(crate) id: Option<String>,
+    pub(crate) coordination_mode: cli::CoordinationMode,
     pub(crate) tmux_bin: Option<PathBuf>,
     pub(crate) agent_bin: Option<PathBuf>,
     pub(crate) agent_profile: Option<String>,
@@ -1440,6 +1459,7 @@ fn start_session(
         context,
         agent: args.agent,
         mode: "interactive",
+        coordination_mode: args.coordination_mode,
         title: args.title.as_deref(),
         title_state: args.initial_title_state,
         explicit_id: args.id.as_deref(),
@@ -1653,6 +1673,7 @@ fn start_run_session(context: &CliContext, args: cli::RunArgs) -> Result<StartVi
         context,
         agent: args.agent,
         mode: "run",
+        coordination_mode: args.coordination_mode,
         title: args.title.as_deref(),
         title_state: None,
         explicit_id: args.id.as_deref(),
@@ -1779,6 +1800,7 @@ pub(crate) fn start_provider_resume_session(
         context,
         agent: args.agent,
         mode: "interactive",
+        coordination_mode: args.coordination_mode,
         title: args.title.as_deref(),
         title_state: args.title_state,
         explicit_id: args.id.as_deref(),
@@ -1935,6 +1957,7 @@ struct RecordRequest<'a> {
     context: &'a CliContext,
     agent: AgentKind,
     mode: &'a str,
+    coordination_mode: cli::CoordinationMode,
     title: Option<&'a str>,
     title_state: Option<SessionTitleState>,
     explicit_id: Option<&'a str>,
@@ -1985,6 +2008,7 @@ fn create_record(request: RecordRequest<'_>) -> Result<CreatedRecord, CliError> 
         id,
         agent: request.agent.as_str().to_string(),
         mode: request.mode.to_string(),
+        coordination_mode: request.coordination_mode,
         title,
         title_state,
         title_revision: 0,
@@ -4109,6 +4133,10 @@ fn add_runtime_tmux_environment(
         format!("AGENT_SESSION_STATE_DIR={}", display_path(state_dir)),
         format!("AGENT_SESSION_RUNTIME_ID={runtime_id}"),
         format!(
+            "AGENT_SESSION_COORDINATION_MODE={}",
+            record.coordination_mode.as_str()
+        ),
+        format!(
             "{}={}",
             coordination::CAPABILITY_ENV,
             display_path(&coordination::capability_path_for_state(
@@ -5392,6 +5420,7 @@ fn session_view_from_parts(
         agent_profile: session_agent_profile(record).map(str::to_string),
         profile_resume_context,
         mode: record.mode.clone(),
+        coordination_mode: record.coordination_mode,
         title: record.title.clone(),
         title_state: effective_session_title_state(record),
         title_state_supported: true,
@@ -9669,6 +9698,36 @@ mod tests {
     };
 
     #[test]
+    fn explicit_coordination_mode_is_in_the_first_durable_record() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let context = CliContext {
+            state_dir: tmp.path().join("state"),
+            host: None,
+        };
+        let created = create_record(RecordRequest {
+            context: &context,
+            agent: AgentKind::Codex,
+            mode: "interactive",
+            coordination_mode: crate::cli::CoordinationMode::Enforce,
+            title: None,
+            title_state: None,
+            explicit_id: Some("explicit-enforce"),
+            cwd: Path::new("/repo"),
+            prompt: None,
+            log_file_name: None,
+            provider_resume: None,
+            agent_args: Vec::new(),
+            agent_bin: None,
+        })
+        .expect("create record");
+        let durable = load_session_record(&context, &created.record.id).expect("durable record");
+        assert_eq!(
+            durable.coordination_mode,
+            crate::cli::CoordinationMode::Enforce
+        );
+    }
+
+    #[test]
     fn coordination_review_held_launch_starts_persistent_broker_before_the_gate() {
         let heartbeat = super::HELD_LAUNCH_SCRIPT
             .find("broker heartbeat")
@@ -9963,6 +10022,7 @@ exit 97
             context: &context,
             agent: AgentKind::Codex,
             mode: "interactive",
+            coordination_mode: crate::cli::CoordinationMode::Advisory,
             title: Some(canonical_title),
             title_state: Some(state),
             explicit_id: Some("v122-compatible-title-boundary"),
@@ -10097,6 +10157,7 @@ exit 97
             context: &context,
             agent: AgentKind::Codex,
             mode: "interactive",
+            coordination_mode: crate::cli::CoordinationMode::Advisory,
             title: Some("Unrelated title"),
             title_state: Some(super::SessionTitleState {
                 topic: Some("Canonical topic".to_string()),
@@ -10130,6 +10191,7 @@ exit 97
             context: &context,
             agent: AgentKind::Codex,
             mode: "interactive",
+            coordination_mode: crate::cli::CoordinationMode::Advisory,
             title: Some("  padded title-only input  "),
             title_state: None,
             explicit_id: Some("padded-title-only"),
@@ -10152,6 +10214,7 @@ exit 97
             context: &context,
             agent: AgentKind::Codex,
             mode: "interactive",
+            coordination_mode: crate::cli::CoordinationMode::Advisory,
             title: Some(&long_title),
             title_state: None,
             explicit_id: Some("long-title-only"),
@@ -10174,6 +10237,7 @@ exit 97
             context: &context,
             agent: AgentKind::Codex,
             mode: "interactive",
+            coordination_mode: crate::cli::CoordinationMode::Advisory,
             title: Some("Topic"),
             title_state: Some(super::SessionTitleState {
                 topic: Some("Topic".to_string()),
@@ -10226,6 +10290,7 @@ exit 97
             context,
             agent,
             mode: "interactive",
+            coordination_mode: crate::cli::CoordinationMode::Advisory,
             title,
             title_state: None,
             explicit_id,
@@ -12048,6 +12113,7 @@ fi
             context: &context,
             agent: AgentKind::Codex,
             mode: "interactive",
+            coordination_mode: crate::cli::CoordinationMode::Advisory,
             title: None,
             title_state: None,
             explicit_id: Some("profiled-codex-root"),
@@ -12092,6 +12158,7 @@ fi
             context: &context,
             agent: AgentKind::Codex,
             mode: "interactive",
+            coordination_mode: crate::cli::CoordinationMode::Advisory,
             title: None,
             title_state: None,
             explicit_id: Some("malformed-startup"),
@@ -12154,6 +12221,7 @@ fi
             context: &context,
             agent: AgentKind::Codex,
             mode: "interactive",
+            coordination_mode: crate::cli::CoordinationMode::Advisory,
             title: None,
             title_state: None,
             explicit_id: Some("provider-stage"),
@@ -12201,6 +12269,7 @@ fi
             context: &context,
             agent: AgentKind::Codex,
             mode: "interactive",
+            coordination_mode: crate::cli::CoordinationMode::Advisory,
             title: None,
             title_state: None,
             explicit_id: Some("reconcile-race"),
@@ -12292,6 +12361,7 @@ fi
             context: &context,
             agent: AgentKind::Codex,
             mode: "interactive",
+            coordination_mode: crate::cli::CoordinationMode::Advisory,
             title: None,
             title_state: None,
             explicit_id: Some("startup-future-fields"),
@@ -12345,6 +12415,7 @@ fi
                 context: &context,
                 agent: AgentKind::Codex,
                 mode: "interactive",
+                coordination_mode: crate::cli::CoordinationMode::Advisory,
                 title: None,
                 title_state: None,
                 explicit_id: Some(id),
