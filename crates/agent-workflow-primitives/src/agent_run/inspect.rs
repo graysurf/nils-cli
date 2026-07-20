@@ -652,11 +652,7 @@ fn install_network_seccomp() -> Result<(), InspectError> {
             bpf_stmt(BPF_RET_K, SECCOMP_RET_KILL_PROCESS),
         ]);
     }
-    for syscall in [
-        libc::SYS_socket,
-        libc::SYS_socketpair,
-        libc::SYS_io_uring_setup,
-    ] {
+    for syscall in network_seccomp_syscalls() {
         filter.extend([
             bpf_jump(BPF_JMP_JEQ_K, syscall as u32, 0, 1),
             bpf_stmt(BPF_RET_K, SECCOMP_RET_ERRNO | libc::EPERM as u32),
@@ -695,6 +691,14 @@ fn install_network_seccomp() -> Result<(), InspectError> {
             std::io::Error::last_os_error().to_string(),
         ))
     }
+}
+
+fn network_seccomp_syscalls() -> [libc::c_long; 3] {
+    [
+        libc::SYS_socket,
+        libc::SYS_socketpair,
+        libc::SYS_io_uring_setup,
+    ]
 }
 
 fn bpf_stmt(code: u16, value: u32) -> libc::sock_filter {
@@ -942,6 +946,11 @@ fn terminate_process_group(child: &mut std::process::Child) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn network_seccomp_filter_denies_io_uring_setup() {
+        assert!(network_seccomp_syscalls().contains(&libc::SYS_io_uring_setup));
+    }
 
     #[test]
     fn missing_and_untrusted_backend_components_fail_closed() {

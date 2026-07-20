@@ -112,6 +112,21 @@ fn candidate_from_command(
             "provider payload has no verifiable command",
         ));
     }
+    if words.first().map(String::as_str) != Some("builtin")
+        || words.get(1).map(String::as_str) != Some("command")
+    {
+        return Err(rejected(
+            "read-only-command-unsupported",
+            "operation-effect producer must use the `builtin command` dispatch prefix",
+        ));
+    }
+    words.drain(..2);
+    if words.is_empty() {
+        return Err(rejected(
+            "read-only-command-unavailable",
+            "provider payload has no verifiable command",
+        ));
+    }
     let program = words.remove(0);
     let program_path = Path::new(&program);
     if program_path.components().count() == 1 {
@@ -511,7 +526,7 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
     use std::os::unix::process::ExitStatusExt;
     use std::path::Path;
-    use std::process::{ExitStatus, Output};
+    use std::process::{Command, ExitStatus, Output};
 
     use nils_common::execution_effect::{
         CapabilityClass, Effect, InvocationBinding, OPERATION_EFFECT_VERSION,
@@ -535,7 +550,10 @@ mod tests {
         fs::write(&producer, b"producer").expect("producer file");
         fs::set_permissions(&hook, fs::Permissions::from_mode(0o700)).expect("hook mode");
         fs::set_permissions(&producer, fs::Permissions::from_mode(0o700)).expect("producer mode");
-        let command = format!("{} preflight --intent project-dev", producer.display());
+        let command = format!(
+            "builtin command {} preflight --intent project-dev",
+            producer.display()
+        );
         let candidate =
             candidate_from_command(&command, &hook, &[], temp.path()).expect("candidate");
         let now = jiff::Timestamp::now().as_second();
@@ -675,6 +693,37 @@ mod tests {
     }
 
     #[test]
+    fn requires_a_dispatch_stable_prefix_for_explicit_producer_paths() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let hook = temp.path().join("agent-hook");
+        let producer = temp.path().join("agent-docs");
+        fs::write(&hook, b"hook").expect("hook file");
+        fs::write(&producer, b"#!/bin/sh\nprintf external").expect("producer file");
+        fs::set_permissions(&hook, fs::Permissions::from_mode(0o700)).expect("hook mode");
+        fs::set_permissions(&producer, fs::Permissions::from_mode(0o700)).expect("producer mode");
+
+        let direct = format!("{} preflight", producer.display());
+        let stable = format!("builtin command {} preflight", producer.display());
+        for shell in ["bash", "zsh"] {
+            let function = format!("function {} {{ printf shadow; }}", producer.display());
+            for (command, expected) in [(&direct, "shadow"), (&stable, "external")] {
+                let output = Command::new(shell)
+                    .args(["-fc", &format!("{function}\n{command}")])
+                    .output()
+                    .expect(shell);
+                assert!(output.status.success(), "{shell}: {command}");
+                assert_eq!(String::from_utf8_lossy(&output.stdout), expected, "{shell}");
+            }
+        }
+
+        let error = candidate_from_command(&direct, &hook, &[], temp.path())
+            .expect_err("direct explicit path remains function-shadowable");
+        assert_eq!(error.code, "read-only-command-unsupported");
+        candidate_from_command(&stable, &hook, &[], temp.path())
+            .expect("builtin command prefix must bind shell dispatch");
+    }
+
+    #[test]
     fn descriptor_command_uses_the_request_bound_cwd() {
         let (temp, candidate, _) = fixture();
         let expected = temp.path().canonicalize().expect("canonical fixture cwd");
@@ -697,7 +746,7 @@ mod tests {
         fs::set_permissions(&hook, fs::Permissions::from_mode(0o700)).expect("hook mode");
         fs::set_permissions(&producer, fs::Permissions::from_mode(0o700)).expect("producer mode");
         let command = format!(
-            "{} inspect --cwd {} -- rg TODO",
+            "builtin command {} inspect --cwd {} -- rg TODO",
             producer.display(),
             temp.path().display()
         );
