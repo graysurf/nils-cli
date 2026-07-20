@@ -340,6 +340,7 @@ fn codex_native_event_matrix_accepts_only_documented_events() {
         "PermissionRequest",
         "PreToolUse",
         "PostToolUse",
+        "PostToolUseFailure",
         "PreCompact",
         "PostCompact",
         "SubagentStart",
@@ -384,7 +385,7 @@ fn codex_native_event_matrix_accepts_only_documented_events() {
         );
     }
 
-    for rejected in ["PostToolUseFailure", "StopFailure", "Notification"] {
+    for rejected in ["StopFailure", "Notification"] {
         let payload = json!({"hook_event_name":rejected,"cwd":fixture.root}).to_string();
         let output = fixture.run(
             &["dispatch", "--product", "codex", "--format", "json"],
@@ -802,6 +803,7 @@ fn provider_event_capability_matrix_rejects_unenforceable_actions() {
                 "PermissionRequest",
                 "PreToolUse",
                 "PostToolUse",
+                "PostToolUseFailure",
                 "PreCompact",
                 "PostCompact",
                 "SubagentStart",
@@ -863,6 +865,10 @@ fn provider_event_capability_matrix_rejects_unenforceable_actions() {
             r#"{ id = "agent-session.semantic-conflict.v1", reason_code = "conflict" }"#,
         ),
         (
+            "session-coordination",
+            r#"{ id = "agent-session.coordination.v1", reason_code = "coordination" }"#,
+        ),
+        (
             "runtime-handler",
             r#"{ id = "runtime-kit.handler.v1", handler_id = "session-start-healthcheck" }"#,
         ),
@@ -912,10 +918,21 @@ fn capability_is_compatible(product: &str, event: &str, capability: &str) -> boo
     if matches!(capability, "allow" | "activity" | "runtime-handler") {
         return true;
     }
+    if capability == "session-coordination" {
+        return matches!(
+            event,
+            "PreToolUse" | "PostToolUse" | "PostToolUseFailure" | "Stop"
+        );
+    }
     let context = match product {
         "codex" => matches!(
             event,
-            "SessionStart" | "UserPromptSubmit" | "PreToolUse" | "PostToolUse" | "SubagentStart"
+            "SessionStart"
+                | "UserPromptSubmit"
+                | "PreToolUse"
+                | "PostToolUse"
+                | "PostToolUseFailure"
+                | "SubagentStart"
         ),
         "claude" => matches!(
             event,

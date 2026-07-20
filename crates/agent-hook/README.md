@@ -38,7 +38,9 @@ agent-hook inventory --format json
 agent-hook doctor --all --format json
 agent-hook setup --product codex --dry-run --format json
 agent-hook setup --product codex --apply --format json
-agent-hook setup --product claude --remove --format json
+agent-hook setup --product claude --remove --dry-run --format json
+agent-hook setup --product claude --remove \
+  --expected-plan-digest sha256:<digest> --format json
 printf '%s' "$PROVIDER_HOOK_JSON" | agent-hook dispatch --product codex
 agent-hook completion zsh
 ```
@@ -46,15 +48,25 @@ agent-hook completion zsh
 Apply requires the preview `plan_digest` when compatibility or drifted managed state
 is present. Setup preserves unrelated hooks and provider metadata, migrates
 recognized pre-dispatch `agent-session`/runtime-kit handlers, and removes only exact
-owned dispatcher entries. Hermes policy can be validated and inspected, but
-native setup truthfully reports `unsupported` until Hermes exposes a compatible
-runner.
+owned dispatcher entries. `--remove --dry-run` returns the
+`remove-dry-run` action without writes; its digest binds the remove operation
+and each provider file's exact before/after content or absence. Hermes policy
+can be validated and inspected, but native setup truthfully reports
+`unsupported` until Hermes exposes a compatible runner.
 
 Codex `config.toml`, compatibility `hooks.json`, the managed dispatcher, and
 the authoritative `agent-session activity notify --agent codex` argv are one
 reviewed transaction. A singular safe user notifier is composed without a
 shell; rollback and remove restore the exact prior bytes and file-presence
 state.
+
+The locked `agent-session.coordination.v1` capability runs inside that same
+dispatcher ingress. Ordinary policy aggregation runs first; only an allowed
+mutation is admitted, while terminal PostTool/Stop delivery still completes or
+preserves reconciliation for an already admitted operation. Its fixed
+`session-coordination-guard.py` consumer cannot be replaced through config,
+shadow never invokes it, and governed recovery cannot bypass the underlying
+issue #676 transaction.
 
 `agent-session.activity.v1` emits only a normalized metadata event to
 `agent-session activity event`; it never forwards raw provider JSON. Shadow

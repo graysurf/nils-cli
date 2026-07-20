@@ -602,6 +602,18 @@ fn validate_manifest(
             "recovery requested an unknown or non-recoverable rule",
         ));
     }
+    if manifest.rules.iter().any(|rule| {
+        requested_rules.contains(&rule.id)
+            && matches!(
+                rule.capability,
+                crate::model::Capability::SessionCoordination { .. }
+            )
+    }) {
+        return Err(HookError::data(
+            "recovery-rule-locked-invariant",
+            "session coordination transactions cannot be bypassed by recovery",
+        ));
+    }
     Ok(())
 }
 

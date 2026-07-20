@@ -253,6 +253,16 @@ fn validate_policy(bundle: &PolicyBundle, config: &Config) -> Result<(), HookErr
             }
         }
         validate_capability(&rule.capability)?;
+        if matches!(rule.capability, Capability::SessionCoordination { .. })
+            && (!matches!(rule.mode, RuleMode::Enforce)
+                || !matches!(rule.failure_posture, FailurePosture::Closed)
+                || !matches!(rule.override_class, OverrideClass::Locked))
+        {
+            return Err(HookError::data(
+                "coordination-rule-not-locked",
+                "session coordination rules must be enforce, fail closed, and locked",
+            ));
+        }
         for product in &rule.products {
             for event in &rule.events {
                 validate_capability_binding(*product, event, &rule.capability)?;
@@ -304,6 +314,12 @@ fn validate_capability_binding(
     event: &str,
     capability: &Capability,
 ) -> Result<(), HookError> {
+    if matches!(capability, Capability::SessionCoordination { .. }) && !product.enforceable() {
+        return Err(HookError::data(
+            "policy-capability-event-unsupported",
+            "session coordination requires an enforceable provider hook runner",
+        ));
+    }
     if !product.enforceable() {
         return Ok(());
     }
@@ -311,6 +327,10 @@ fn validate_capability_binding(
         Capability::Allow { .. }
         | Capability::SessionActivity { .. }
         | Capability::RuntimeKitHandler { .. } => true,
+        Capability::SessionCoordination { .. } => matches!(
+            event,
+            "PreToolUse" | "PostToolUse" | "PostToolUseFailure" | "Stop"
+        ),
         Capability::Warn { .. } | Capability::Context { .. } => supports_context(product, event),
         Capability::Block { .. } => supports_block(product, event),
         Capability::Transform { .. } => supports_transform(product, event),
@@ -332,7 +352,12 @@ fn supports_context(product: Product, event: &str) -> bool {
     match product {
         Product::Codex => matches!(
             event,
-            "SessionStart" | "UserPromptSubmit" | "PreToolUse" | "PostToolUse" | "SubagentStart"
+            "SessionStart"
+                | "UserPromptSubmit"
+                | "PreToolUse"
+                | "PostToolUse"
+                | "PostToolUseFailure"
+                | "SubagentStart"
         ),
         Product::Claude => matches!(
             event,
@@ -358,6 +383,7 @@ fn supports_block(product: Product, event: &str) -> bool {
                 | "PermissionRequest"
                 | "PreToolUse"
                 | "PostToolUse"
+                | "PostToolUseFailure"
                 | "PreCompact"
                 | "PostCompact"
                 | "SubagentStop"
@@ -392,7 +418,10 @@ fn validate_capability(capability: &Capability) -> Result<(), HookError> {
     match capability {
         Capability::Allow { reason_code }
         | Capability::SessionActivity { reason_code }
-        | Capability::SemanticConflict { reason_code } => validate_id("reason code", reason_code),
+        | Capability::SemanticConflict { reason_code }
+        | Capability::SessionCoordination { reason_code } => {
+            validate_id("reason code", reason_code)
+        }
         Capability::Warn {
             reason_code,
             message,
@@ -489,6 +518,7 @@ pub fn supported_event(product: Product, event: &str) -> bool {
                 | "PermissionRequest"
                 | "PreToolUse"
                 | "PostToolUse"
+                | "PostToolUseFailure"
                 | "PreCompact"
                 | "PostCompact"
                 | "SubagentStart"
@@ -522,8 +552,10 @@ pub fn supported_event(product: Product, event: &str) -> bool {
 pub fn matcher_input_field(product: Product, event: &str) -> Option<&'static str> {
     match (product, event) {
         (Product::Codex | Product::Claude, "SessionStart") => Some("source"),
-        (Product::Codex | Product::Claude, "PermissionRequest" | "PreToolUse" | "PostToolUse")
-        | (Product::Claude, "PostToolUseFailure") => Some("tool_name"),
+        (
+            Product::Codex | Product::Claude,
+            "PermissionRequest" | "PreToolUse" | "PostToolUse" | "PostToolUseFailure",
+        ) => Some("tool_name"),
         (Product::Codex | Product::Claude, "PreCompact") | (Product::Codex, "PostCompact") => {
             Some("trigger")
         }
