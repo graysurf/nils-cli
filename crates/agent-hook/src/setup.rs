@@ -24,8 +24,12 @@ const RUNTIME_KIT_BLOCK_END: &str = "# <<< agent-runtime-kit:hooks <<<";
 const DISPATCH_TIMEOUT_SECONDS: i64 = 10;
 const CODEX_NOTIFY_ARGV: [&str; 5] = ["agent-session", "activity", "notify", "--agent", "codex"];
 const CODEX_NOTIFY_FORWARD_FLAG: &str = "--forward-notify-argv-json";
+const CODEX_COMPUTER_USE_NOTIFY_EVENT: &str = "turn-ended";
+const CODEX_COMPUTER_USE_PREVIOUS_NOTIFY_FLAG: &str = "--previous-notify";
+const CODEX_COMPUTER_USE_NOTIFY_RELATIVE_PATH: &str = "computer-use/Codex Computer Use.app/Contents/SharedSupport/SkyComputerUseClient.app/Contents/MacOS/SkyComputerUseClient";
 const MAX_CODEX_FORWARD_ARGS: usize = 64;
 const MAX_CODEX_FORWARD_ARGV_BYTES: usize = 16 * 1024;
+const MAX_CODEX_NOTIFY_WRAPPER_DEPTH: usize = 8;
 const MAX_PROVIDER_CONFIG_BYTES: usize = 1024 * 1024;
 const LOCK_TIMEOUT: Duration = Duration::from_secs(2);
 
@@ -328,7 +332,7 @@ fn build_codex_plan(
         HookError::data("provider-config-invalid", "Codex config is not valid TOML")
     })?;
     let (legacy_before, unrelated_before) = inspect_toml_handlers(&document);
-    let notify = plan_codex_notification(&mut document, action, &stripped)?;
+    let notify = plan_codex_notification(&mut document, &path, action, &stripped)?;
     remove_legacy_toml_handlers(&mut document);
     let mut rendered = document.to_string();
     if action != SetupAction::Remove {
@@ -401,24 +405,59 @@ enum CodexNotifyMode {
     Absent,
     Owned,
     Composed(Vec<String>),
+    ComputerUseWrappedOwned(CodexComputerUseWrappedOwned),
     Foreign(Vec<String>),
     Invalid,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CodexNotificationOwnership {
+    Owned,
+    Composed,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum CodexOwnedNotify {
+    Owned,
+    Composed(Vec<String>),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CodexStrippedNotify {
+    restored: Option<Vec<String>>,
+    owned_layers: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CodexComputerUseWrappedOwned {
+    normalized: Option<Vec<String>>,
+    restored: Vec<String>,
+}
+
 fn plan_codex_notification(
     document: &mut DocumentMut,
+    config_path: &Path,
     action: SetupAction,
     original_raw: &str,
 ) -> Result<CodexNotificationPlan, HookError> {
-    let mode = codex_notify_mode(document);
-    let configured_before = matches!(mode, CodexNotifyMode::Owned | CodexNotifyMode::Composed(_));
+    let remove = action == SetupAction::Remove;
+    let mode = codex_notify_mode(document, config_path, !remove);
+    let configured_before = matches!(
+        mode,
+        CodexNotifyMode::Owned
+            | CodexNotifyMode::Composed(_)
+            | CodexNotifyMode::ComputerUseWrappedOwned(_)
+    );
     let mut requires_review = false;
-    if action == SetupAction::Remove {
+    if remove {
         match mode {
             CodexNotifyMode::Owned => {
                 document.remove("notify");
             }
             CodexNotifyMode::Composed(forwarded) => set_codex_notify(document, &forwarded),
+            CodexNotifyMode::ComputerUseWrappedOwned(wrapped) => {
+                set_codex_notify(document, &wrapped.restored)
+            }
             CodexNotifyMode::Absent | CodexNotifyMode::Foreign(_) | CodexNotifyMode::Invalid => {}
         }
     } else {
@@ -426,7 +465,19 @@ fn plan_codex_notification(
             CodexNotifyMode::Absent => {
                 set_codex_notify(document, &CODEX_NOTIFY_ARGV.map(str::to_string))
             }
-            CodexNotifyMode::Owned | CodexNotifyMode::Composed(_) => {}
+            CodexNotifyMode::Owned
+            | CodexNotifyMode::Composed(_)
+            | CodexNotifyMode::ComputerUseWrappedOwned(CodexComputerUseWrappedOwned {
+                normalized: None,
+                ..
+            }) => {}
+            CodexNotifyMode::ComputerUseWrappedOwned(CodexComputerUseWrappedOwned {
+                normalized: Some(normalized),
+                ..
+            }) => {
+                set_codex_notify(document, &normalized);
+                requires_review = true;
+            }
             CodexNotifyMode::Foreign(forwarded) if codex_forward_argv_is_safe(&forwarded) => {
                 let encoded = serde_json::to_string(&forwarded).map_err(|_| {
                     HookError::data(
@@ -463,8 +514,10 @@ fn plan_codex_notification(
         }
     }
     let configured_after = matches!(
-        codex_notify_mode(document),
-        CodexNotifyMode::Owned | CodexNotifyMode::Composed(_)
+        codex_notify_mode(document, config_path, true),
+        CodexNotifyMode::Owned
+            | CodexNotifyMode::Composed(_)
+            | CodexNotifyMode::ComputerUseWrappedOwned(_)
     );
     let changed = document.to_string().as_bytes() != original_raw.as_bytes();
     Ok(CodexNotificationPlan {
@@ -475,7 +528,11 @@ fn plan_codex_notification(
     })
 }
 
-fn codex_notify_mode(document: &DocumentMut) -> CodexNotifyMode {
+fn codex_notify_mode(
+    document: &DocumentMut,
+    config_path: &Path,
+    require_computer_use_executable: bool,
+) -> CodexNotifyMode {
     let Some(item) = document.get("notify") else {
         return CodexNotifyMode::Absent;
     };
@@ -489,8 +546,23 @@ fn codex_notify_mode(document: &DocumentMut) -> CodexNotifyMode {
     else {
         return CodexNotifyMode::Invalid;
     };
-    if argv_matches(&argv, &CODEX_NOTIFY_ARGV) {
-        return CodexNotifyMode::Owned;
+    if let Some(owned) = codex_owned_notify(&argv) {
+        return match owned {
+            CodexOwnedNotify::Owned => CodexNotifyMode::Owned,
+            CodexOwnedNotify::Composed(forwarded) => CodexNotifyMode::Composed(forwarded),
+        };
+    }
+    if let Some(wrapped) =
+        codex_computer_use_wrapped_owned(&argv, config_path, require_computer_use_executable)
+    {
+        return CodexNotifyMode::ComputerUseWrappedOwned(wrapped);
+    }
+    CodexNotifyMode::Foreign(argv)
+}
+
+fn codex_owned_notify(argv: &[String]) -> Option<CodexOwnedNotify> {
+    if argv_matches(argv, &CODEX_NOTIFY_ARGV) {
+        return Some(CodexOwnedNotify::Owned);
     }
     if argv.len() == CODEX_NOTIFY_ARGV.len() + 2
         && argv_matches(&argv[..CODEX_NOTIFY_ARGV.len()], &CODEX_NOTIFY_ARGV)
@@ -499,9 +571,191 @@ fn codex_notify_mode(document: &DocumentMut) -> CodexNotifyMode {
             serde_json::from_str::<Vec<String>>(&argv[CODEX_NOTIFY_ARGV.len() + 1])
         && codex_forward_argv_is_safe(&forwarded)
     {
-        return CodexNotifyMode::Composed(forwarded);
+        return Some(CodexOwnedNotify::Composed(forwarded));
     }
-    CodexNotifyMode::Foreign(argv)
+    None
+}
+
+fn codex_computer_use_path_matches(
+    config_path: &Path,
+    executable: &str,
+    require_executable: bool,
+) -> bool {
+    let Some(config_dir) = config_path.parent() else {
+        return false;
+    };
+    let expected = config_dir.join(CODEX_COMPUTER_USE_NOTIFY_RELATIVE_PATH);
+    if Path::new(executable) != expected {
+        return false;
+    }
+    if !require_executable {
+        return true;
+    }
+
+    let mut current = config_dir.to_path_buf();
+    let mut final_metadata = None;
+    for component in Path::new(CODEX_COMPUTER_USE_NOTIFY_RELATIVE_PATH).components() {
+        current.push(component.as_os_str());
+        let Ok(metadata) = fs::symlink_metadata(&current) else {
+            return false;
+        };
+        if metadata.file_type().is_symlink() {
+            return false;
+        }
+        final_metadata = Some(metadata);
+    }
+    final_metadata.is_some_and(|metadata| {
+        metadata.file_type().is_file() && metadata.permissions().mode() & 0o111 != 0
+    })
+}
+
+fn codex_computer_use_base(
+    argv: &[String],
+    config_path: &Path,
+    require_executable: bool,
+) -> Option<Vec<String>> {
+    (argv.len() == 2
+        && codex_computer_use_path_matches(config_path, &argv[0], require_executable)
+        && argv[1] == CODEX_COMPUTER_USE_NOTIFY_EVENT)
+        .then(|| argv.to_vec())
+}
+
+fn codex_computer_use_previous(
+    argv: &[String],
+    config_path: &Path,
+    require_executable: bool,
+) -> Option<(Vec<String>, Vec<String>)> {
+    if argv.len() != 4
+        || !codex_computer_use_path_matches(config_path, &argv[0], require_executable)
+        || argv[1] != CODEX_COMPUTER_USE_NOTIFY_EVENT
+        || argv[2] != CODEX_COMPUTER_USE_PREVIOUS_NOTIFY_FLAG
+        || !codex_notify_argv_is_bounded(argv)
+    {
+        return None;
+    }
+    let previous = serde_json::from_str::<Vec<String>>(&argv[3]).ok()?;
+    codex_notify_argv_is_bounded(&previous).then(|| (argv[..2].to_vec(), previous))
+}
+
+fn codex_strip_owned_notify_layers(
+    argv: &[String],
+    config_path: &Path,
+    depth: usize,
+    require_executable: bool,
+) -> Option<CodexStrippedNotify> {
+    if depth > MAX_CODEX_NOTIFY_WRAPPER_DEPTH || !codex_notify_argv_is_bounded(argv) {
+        return None;
+    }
+    if let Some(owned) = codex_owned_notify(argv) {
+        return match owned {
+            CodexOwnedNotify::Composed(forwarded) => {
+                let stripped = codex_strip_owned_notify_layers(
+                    &forwarded,
+                    config_path,
+                    depth + 1,
+                    require_executable,
+                )?;
+                Some(CodexStrippedNotify {
+                    restored: stripped.restored,
+                    owned_layers: stripped.owned_layers + 1,
+                })
+            }
+            CodexOwnedNotify::Owned => Some(CodexStrippedNotify {
+                restored: None,
+                owned_layers: 1,
+            }),
+        };
+    }
+    if codex_computer_use_base(argv, config_path, require_executable).is_some() {
+        return Some(CodexStrippedNotify {
+            restored: Some(argv.to_vec()),
+            owned_layers: 0,
+        });
+    }
+    if let Some((base, previous)) =
+        codex_computer_use_previous(argv, config_path, require_executable)
+    {
+        let stripped =
+            codex_strip_owned_notify_layers(&previous, config_path, depth + 1, require_executable)?;
+        let restored = match stripped.restored {
+            None => base,
+            Some(previous) if previous == base => base,
+            Some(previous) => {
+                let mut restored = base;
+                restored.push(CODEX_COMPUTER_USE_PREVIOUS_NOTIFY_FLAG.to_string());
+                restored.push(serde_json::to_string(&previous).ok()?);
+                restored
+            }
+        };
+        return codex_notify_argv_is_bounded(&restored).then_some(CodexStrippedNotify {
+            restored: Some(restored),
+            owned_layers: stripped.owned_layers,
+        });
+    }
+    Some(CodexStrippedNotify {
+        restored: Some(argv.to_vec()),
+        owned_layers: 0,
+    })
+}
+
+fn codex_computer_use_wrapped_owned(
+    argv: &[String],
+    config_path: &Path,
+    require_executable: bool,
+) -> Option<CodexComputerUseWrappedOwned> {
+    let (base, previous) = codex_computer_use_previous(argv, config_path, require_executable)?;
+    let owned = codex_owned_notify(&previous)?;
+    let stripped = codex_strip_owned_notify_layers(argv, config_path, 0, require_executable)?;
+    let restored = stripped.restored?;
+    if stripped.owned_layers == 0 {
+        return None;
+    }
+
+    let normalized = match owned {
+        CodexOwnedNotify::Composed(forwarded) => {
+            let stripped_forwarded =
+                codex_strip_owned_notify_layers(&forwarded, config_path, 1, require_executable)?;
+            if stripped_forwarded.restored.as_ref() == Some(&base) {
+                let mut normalized = base;
+                normalized.push(CODEX_COMPUTER_USE_PREVIOUS_NOTIFY_FLAG.to_string());
+                normalized.push(serde_json::to_string(&CODEX_NOTIFY_ARGV).ok()?);
+                (normalized != argv).then_some(normalized)
+            } else {
+                None
+            }
+        }
+        CodexOwnedNotify::Owned => None,
+    };
+    Some(CodexComputerUseWrappedOwned {
+        normalized,
+        restored,
+    })
+}
+
+/// Classifies the exact notifier shapes owned or safely composed by the shared
+/// Codex registration contract.
+pub fn codex_notification_ownership(
+    config_path: &Path,
+    argv: &[String],
+) -> Option<CodexNotificationOwnership> {
+    match codex_owned_notify(argv) {
+        Some(CodexOwnedNotify::Owned) => Some(CodexNotificationOwnership::Owned),
+        Some(CodexOwnedNotify::Composed(_)) => Some(CodexNotificationOwnership::Composed),
+        None if codex_computer_use_wrapped_owned(argv, config_path, true).is_some() => {
+            Some(CodexNotificationOwnership::Composed)
+        }
+        None => None,
+    }
+}
+
+/// Decodes a bounded safe forwarded notifier using the same grammar setup uses
+/// before it writes the composed Codex argv.
+pub fn decode_codex_forward_notify_argv(encoded: &str) -> Option<Vec<String>> {
+    if encoded.len() > MAX_CODEX_FORWARD_ARGV_BYTES {
+        return None;
+    }
+    let argv = serde_json::from_str::<Vec<String>>(encoded).ok()?;
+    codex_forward_argv_is_safe(&argv).then_some(argv)
 }
 
 fn argv_matches(argv: &[String], expected: &[&str]) -> bool {
@@ -513,13 +767,17 @@ fn argv_matches(argv: &[String], expected: &[&str]) -> bool {
 }
 
 fn codex_forward_argv_is_safe(argv: &[String]) -> bool {
+    codex_notify_argv_is_bounded(argv)
+        && !argv.iter().any(|value| value == CODEX_NOTIFY_FORWARD_FLAG)
+        && (argv.len() < CODEX_NOTIFY_ARGV.len()
+            || !argv_matches(&argv[..CODEX_NOTIFY_ARGV.len()], &CODEX_NOTIFY_ARGV))
+}
+
+fn codex_notify_argv_is_bounded(argv: &[String]) -> bool {
     !argv.is_empty()
         && argv.len() <= MAX_CODEX_FORWARD_ARGS
         && !argv[0].trim().is_empty()
         && argv.iter().map(String::len).sum::<usize>() <= MAX_CODEX_FORWARD_ARGV_BYTES
-        && !argv.iter().any(|value| value == CODEX_NOTIFY_FORWARD_FLAG)
-        && (argv.len() < CODEX_NOTIFY_ARGV.len()
-            || !argv_matches(&argv[..CODEX_NOTIFY_ARGV.len()], &CODEX_NOTIFY_ARGV))
 }
 
 fn set_codex_notify(document: &mut DocumentMut, argv: &[String]) {

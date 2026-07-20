@@ -355,7 +355,9 @@ There is no embedded registration fallback, including for `--apply`,
 second writer.
 
 `activity doctor` remains a read-only compatibility diagnostic. It recognizes
-exact pre-dispatch `agent-session` hook and Codex notify shapes, reports conflicts
+exact pre-dispatch `agent-session` hook and Codex notify shapes, including a
+bounded audited Computer Use outer wrapper whose exact helper path is a regular
+executable with no symlink below the active config root. It reports conflicts
 without provider content, probes provider versions with bounded timeouts, and
 selects the newest current-runtime diagnostic deterministically. The retained
 `activity hook` and `activity notify` commands continue to ingest already

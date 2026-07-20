@@ -2,6 +2,7 @@ mod support;
 
 use std::fs;
 use std::os::unix::fs::{PermissionsExt, symlink};
+use std::path::{Path, PathBuf};
 
 use pretty_assertions::assert_eq;
 use serde_json::json;
@@ -1519,4 +1520,356 @@ fn codex_user_notify_is_composed_and_restored_exactly_on_remove() {
     );
     assert_eq!(removed.code, 0, "stderr={}", removed.stderr_text());
     assert_eq!(fs::read(&config).expect("restored config"), original);
+}
+
+fn computer_use_notify_path(home: &Path) -> PathBuf {
+    home.join(
+        ".codex/computer-use/Codex Computer Use.app/Contents/SharedSupport/SkyComputerUseClient.app/Contents/MacOS/SkyComputerUseClient",
+    )
+}
+
+fn computer_use_wrapper(base: &[String], previous: &[String]) -> Vec<String> {
+    let mut wrapper = base.to_vec();
+    wrapper.push("--previous-notify".to_string());
+    wrapper.push(serde_json::to_string(previous).expect("previous notify JSON"));
+    wrapper
+}
+
+fn accumulated_computer_use_chain(base: &[String], pairs: usize) -> Vec<String> {
+    let owned = ["agent-session", "activity", "notify", "--agent", "codex"]
+        .map(str::to_string)
+        .to_vec();
+    let mut chain = base.to_vec();
+    for _ in 0..pairs {
+        let mut composed = owned.clone();
+        composed.push("--forward-notify-argv-json".to_string());
+        composed.push(serde_json::to_string(&chain).expect("forwarded notify JSON"));
+        chain = computer_use_wrapper(base, &composed);
+    }
+    chain
+}
+
+fn write_codex_notify(path: &Path, notify: &[String]) {
+    let mut document = toml_edit::DocumentMut::new();
+    let mut array = toml_edit::Array::new();
+    array.extend(notify.iter().map(String::as_str));
+    document["notify"] = toml_edit::value(array);
+    fs::write(path, document.to_string()).expect("Codex notify config");
+    Fixture::set_private(path);
+}
+
+fn read_codex_notify(path: &Path) -> Vec<String> {
+    let document = fs::read_to_string(path)
+        .expect("Codex config")
+        .parse::<toml_edit::DocumentMut>()
+        .expect("Codex TOML");
+    document["notify"]
+        .as_array()
+        .expect("notify array")
+        .iter()
+        .map(|value| value.as_str().expect("notify string").to_string())
+        .collect()
+}
+
+#[test]
+fn codex_computer_use_owned_chain_is_normalized_idempotently() {
+    let fixture = Fixture::new(POLICY);
+    let codex = fixture.home.join(".codex");
+    fs::create_dir_all(&codex).expect("Codex directory");
+    let config = codex.join("config.toml");
+    let helper = computer_use_notify_path(&fixture.home);
+    fs::create_dir_all(helper.parent().expect("Computer Use helper parent"))
+        .expect("Computer Use helper directory");
+    fs::write(&helper, "#!/usr/bin/env sh\nexit 0\n").expect("Computer Use helper");
+    fs::set_permissions(&helper, fs::Permissions::from_mode(0o755))
+        .expect("executable Computer Use helper");
+    let base = vec![
+        helper.to_string_lossy().into_owned(),
+        "turn-ended".to_string(),
+    ];
+    write_codex_notify(&config, &accumulated_computer_use_chain(&base, 2));
+
+    let preview = fixture.run(
+        &[
+            "setup",
+            "--product",
+            "codex",
+            "--dry-run",
+            "--format",
+            "json",
+        ],
+        None,
+    );
+    assert_eq!(preview.code, 0, "stderr={}", preview.stderr_text());
+    assert_eq!(preview.stdout_json()["data"]["status"], "drifted");
+    assert_eq!(preview.stdout_json()["data"]["apply_allowed"], false);
+    let digest = preview.stdout_json()["data"]["plan_digest"]
+        .as_str()
+        .expect("plan digest")
+        .to_string();
+
+    let repaired = fixture.run(
+        &[
+            "setup",
+            "--product",
+            "codex",
+            "--repair",
+            "--expected-plan-digest",
+            &digest,
+            "--format",
+            "json",
+        ],
+        None,
+    );
+    assert_eq!(repaired.code, 0, "stderr={}", repaired.stderr_text());
+    assert_eq!(repaired.stdout_json()["data"]["apply_allowed"], true);
+    let owned = ["agent-session", "activity", "notify", "--agent", "codex"]
+        .map(str::to_string)
+        .to_vec();
+    assert_eq!(
+        read_codex_notify(&config),
+        computer_use_wrapper(&base, &owned)
+    );
+
+    let repeated = fixture.run(
+        &[
+            "setup",
+            "--product",
+            "codex",
+            "--repair",
+            "--format",
+            "json",
+        ],
+        None,
+    );
+    assert_eq!(repeated.code, 0, "stderr={}", repeated.stderr_text());
+    assert_eq!(repeated.stdout_json()["data"]["changed"], false);
+
+    let removed = fixture.run(
+        &[
+            "setup",
+            "--product",
+            "codex",
+            "--remove",
+            "--format",
+            "json",
+        ],
+        None,
+    );
+    assert_eq!(removed.code, 0, "stderr={}", removed.stderr_text());
+    assert_eq!(read_codex_notify(&config), base);
+}
+
+#[test]
+fn codex_computer_use_owned_remove_does_not_require_a_live_helper() {
+    for helper_state in ["missing", "non-executable"] {
+        let fixture = Fixture::new(POLICY);
+        let codex = fixture.home.join(".codex");
+        fs::create_dir_all(&codex).expect("Codex directory");
+        let config = codex.join("config.toml");
+        let helper = computer_use_notify_path(&fixture.home);
+        if helper_state == "non-executable" {
+            fs::create_dir_all(helper.parent().expect("Computer Use helper parent"))
+                .expect("Computer Use helper directory");
+            fs::write(&helper, "#!/usr/bin/env sh\nexit 0\n")
+                .expect("non-executable Computer Use helper");
+        }
+        let base = vec![
+            helper.to_string_lossy().into_owned(),
+            "turn-ended".to_string(),
+        ];
+        let owned = ["agent-session", "activity", "notify", "--agent", "codex"]
+            .map(str::to_string)
+            .to_vec();
+        write_codex_notify(&config, &computer_use_wrapper(&base, &owned));
+
+        let removed = fixture.run(
+            &[
+                "setup",
+                "--product",
+                "codex",
+                "--remove",
+                "--format",
+                "json",
+            ],
+            None,
+        );
+        assert_eq!(
+            removed.code,
+            0,
+            "state={helper_state} stderr={}",
+            removed.stderr_text()
+        );
+        assert_eq!(read_codex_notify(&config), base, "state={helper_state}");
+    }
+}
+
+#[test]
+fn codex_computer_use_owned_audit_rejects_a_symlinked_ancestor() {
+    let fixture = Fixture::new(POLICY);
+    let codex = fixture.home.join(".codex");
+    fs::create_dir_all(&codex).expect("Codex directory");
+    let config = codex.join("config.toml");
+    let helper = computer_use_notify_path(&fixture.home);
+    let external_root = fixture.root.join("external-computer-use");
+    let external_helper = external_root.join(
+        "Codex Computer Use.app/Contents/SharedSupport/SkyComputerUseClient.app/Contents/MacOS/SkyComputerUseClient",
+    );
+    fs::create_dir_all(external_helper.parent().expect("external helper parent"))
+        .expect("external helper directory");
+    fs::write(&external_helper, "#!/usr/bin/env sh\nexit 0\n").expect("external helper");
+    fs::set_permissions(&external_helper, fs::Permissions::from_mode(0o755))
+        .expect("executable external helper");
+    symlink(&external_root, codex.join("computer-use")).expect("Computer Use root symlink");
+    let base = vec![
+        helper.to_string_lossy().into_owned(),
+        "turn-ended".to_string(),
+    ];
+    let owned = ["agent-session", "activity", "notify", "--agent", "codex"]
+        .map(str::to_string)
+        .to_vec();
+    write_codex_notify(&config, &computer_use_wrapper(&base, &owned));
+
+    let untrusted = fixture.run(
+        &[
+            "setup",
+            "--product",
+            "codex",
+            "--dry-run",
+            "--format",
+            "json",
+        ],
+        None,
+    );
+    assert_eq!(untrusted.code, 0, "stderr={}", untrusted.stderr_text());
+    assert_eq!(untrusted.stdout_json()["data"]["apply_allowed"], false);
+
+    fs::remove_file(codex.join("computer-use")).expect("remove Computer Use root symlink");
+    fs::create_dir_all(helper.parent().expect("Computer Use helper parent"))
+        .expect("Computer Use helper directory");
+    fs::write(&helper, "#!/usr/bin/env sh\nexit 0\n").expect("Computer Use helper");
+    fs::set_permissions(&helper, fs::Permissions::from_mode(0o755))
+        .expect("executable Computer Use helper");
+    let trusted = fixture.run(
+        &[
+            "setup",
+            "--product",
+            "codex",
+            "--dry-run",
+            "--format",
+            "json",
+        ],
+        None,
+    );
+    assert_eq!(trusted.code, 0, "stderr={}", trusted.stderr_text());
+    assert_eq!(trusted.stdout_json()["data"]["apply_allowed"], true);
+}
+
+#[test]
+fn codex_computer_use_owned_audit_bounds_wrapper_depth_and_size() {
+    for (pairs, normalized) in [(4, true), (5, false)] {
+        let fixture = Fixture::new(POLICY);
+        let codex = fixture.home.join(".codex");
+        fs::create_dir_all(&codex).expect("Codex directory");
+        let config = codex.join("config.toml");
+        let helper = computer_use_notify_path(&fixture.home);
+        fs::create_dir_all(helper.parent().expect("Computer Use helper parent"))
+            .expect("Computer Use helper directory");
+        fs::write(&helper, "#!/usr/bin/env sh\nexit 0\n").expect("Computer Use helper");
+        fs::set_permissions(&helper, fs::Permissions::from_mode(0o755))
+            .expect("executable Computer Use helper");
+        let base = vec![
+            helper.to_string_lossy().into_owned(),
+            "turn-ended".to_string(),
+        ];
+        write_codex_notify(&config, &accumulated_computer_use_chain(&base, pairs));
+        let preview = fixture.run(
+            &[
+                "setup",
+                "--product",
+                "codex",
+                "--dry-run",
+                "--format",
+                "json",
+            ],
+            None,
+        );
+        if !normalized {
+            assert_eq!(preview.code, 65, "pairs={pairs}");
+            assert_eq!(
+                preview.stdout_json()["error"]["code"],
+                "provider-notification-config-conflict"
+            );
+            continue;
+        }
+        assert_eq!(preview.code, 0, "stderr={}", preview.stderr_text());
+        let digest = preview.stdout_json()["data"]["plan_digest"]
+            .as_str()
+            .expect("plan digest")
+            .to_string();
+        let repaired = fixture.run(
+            &[
+                "setup",
+                "--product",
+                "codex",
+                "--repair",
+                "--expected-plan-digest",
+                &digest,
+                "--format",
+                "json",
+            ],
+            None,
+        );
+        assert_eq!(repaired.code, 0, "stderr={}", repaired.stderr_text());
+        let notify = read_codex_notify(&config);
+        assert_eq!(notify[0], base[0]);
+        assert_eq!(notify.len(), 4);
+    }
+}
+
+#[test]
+fn codex_computer_use_owned_audit_rejects_a_shallow_oversized_chain() {
+    let fixture = Fixture::new(POLICY);
+    let codex = fixture.home.join(".codex");
+    fs::create_dir_all(&codex).expect("Codex directory");
+    let config = codex.join("config.toml");
+    let helper = computer_use_notify_path(&fixture.home);
+    fs::create_dir_all(helper.parent().expect("Computer Use helper parent"))
+        .expect("Computer Use helper directory");
+    fs::write(&helper, "#!/usr/bin/env sh\nexit 0\n").expect("Computer Use helper");
+    fs::set_permissions(&helper, fs::Permissions::from_mode(0o755))
+        .expect("executable Computer Use helper");
+    let base = vec![
+        helper.to_string_lossy().into_owned(),
+        "turn-ended".to_string(),
+    ];
+    let mut owned = ["agent-session", "activity", "notify", "--agent", "codex"]
+        .map(str::to_string)
+        .to_vec();
+    owned.push("--forward-notify-argv-json".to_string());
+    let oversized_argument = "x".repeat(17 * 1024);
+    owned.push(
+        serde_json::to_string(&["user-notifier", oversized_argument.as_str()])
+            .expect("oversized forwarded notify JSON"),
+    );
+    write_codex_notify(&config, &computer_use_wrapper(&base, &owned));
+    let before = fs::read(&config).expect("config before preview");
+
+    let preview = fixture.run(
+        &[
+            "setup",
+            "--product",
+            "codex",
+            "--dry-run",
+            "--format",
+            "json",
+        ],
+        None,
+    );
+    assert_eq!(preview.code, 65);
+    assert_eq!(
+        preview.stdout_json()["error"]["code"],
+        "provider-notification-config-conflict"
+    );
+    assert_eq!(fs::read(&config).expect("config after preview"), before);
 }
