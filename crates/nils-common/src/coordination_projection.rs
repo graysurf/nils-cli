@@ -11,7 +11,9 @@ use sha2::{Digest, Sha256};
 
 pub const REGISTRY_VERSION: &str = "agent-session.coordination-registry.v1";
 pub const CLAIM_VERSION: &str = "agent-session.work-context.v1";
-const MAX_REGISTRY_BYTES: u64 = 68 * 1024 * 1024;
+/// Canonical whole-registry byte cap, shared by this projection reader and the
+/// agent-session coordination read/write path (which references this constant).
+pub const MAX_REGISTRY_BYTES: u64 = 68 * 1024 * 1024;
 const MAX_HEARTBEAT_BYTES: u64 = 256;
 const MAX_SESSION_BYTES: u64 = 2 * 1024 * 1024;
 const HEARTBEAT_FRESH_SECONDS: i64 = 30;
