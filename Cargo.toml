@@ -10,6 +10,7 @@ members = [
   "crates/cli-template",
   "crates/agent-runtime",
   "crates/agent-memory",
+  "crates/agent-hook",
   "crates/memo",
   "crates/agent-session",
   "crates/claude-cli",
@@ -52,7 +53,7 @@ resolver = "2"
 # edition.
 edition = "2024"
 license = "MIT"
-version = "1.25.3"
+version = "1.25.4"
 
 [workspace.dependencies]
 anyhow = "1"

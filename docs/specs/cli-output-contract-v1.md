@@ -78,6 +78,11 @@ Rules:
 - `warnings` is omitted when empty. JSON consumers see what text mode
   would print to stderr.
 - `error` (failure only) is described below.
+- Consumers MUST accept additive envelope, error, and command-result fields
+  within the same `schema_version`. They MUST still validate the exact schema
+  version, `ok` state, and every field their operation requires. Producers do
+  not remove, rename, or change the meaning of an existing field without a new
+  schema version.
 
 Failure envelope:
 

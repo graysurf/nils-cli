@@ -63,7 +63,8 @@ Every managed session has one additive `coordination_mode`:
 Older `agent-session.session.v1` records without the additive field deserialize
 as `advisory`. Managed tmux runtimes receive
 `AGENT_SESSION_COORDINATION_MODE` alongside their session ID, state directory,
-runtime ID, and capability path.
+runtime ID, and capability path. Each broker projection persists the same mode;
+older broker projections without the field default to `advisory`.
 
 A ready, heartbeat-fresh broker plus its matching session record is an active
 presence record. Presence begins during held launch, follows the exact runtime

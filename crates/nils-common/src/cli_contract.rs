@@ -12,7 +12,7 @@
 
 use std::io::{self, Write};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 /// Canonical output-format flag value for every workspace CLI.
 ///
@@ -47,7 +47,10 @@ impl OutputFormat {
 /// `ok` is a boolean success flag, `data` carries the per-subcommand payload,
 /// `warnings` collects non-fatal diagnostics (so JSON consumers see what text
 /// mode would print to stderr), and `error` carries a structured failure.
-#[derive(Debug, Clone, Serialize)]
+/// Deserialization accepts additive fields so same-version producers can add
+/// metadata without breaking consumers; callers still validate the required
+/// schema version, success state, and command-specific payload fields.
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Envelope<T: Serialize> {
     pub schema_version: String,
     pub ok: bool,
@@ -100,7 +103,7 @@ impl<T: Serialize> Envelope<T> {
 }
 
 /// Structured error rendered inside the JSON envelope's `error` field.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct EnvelopeError {
     pub code: String,
     pub message: String,
@@ -264,6 +267,24 @@ mod tests {
             json,
             "{\"schema_version\":\"cli.cli-template.error.v1\",\"ok\":false,\"error\":{\"code\":\"parse-error\",\"message\":\"missing required argument <name>\",\"hint\":\"see --help\"}}"
         );
+    }
+
+    #[test]
+    fn envelope_deserialization_accepts_additive_metadata() {
+        let envelope: Envelope<serde_json::Value> = serde_json::from_str(
+            r#"{
+                "schema_version":"cli.agent-hook.setup.v1",
+                "ok":true,
+                "data":{"product":"codex","future_result_metadata":true},
+                "warnings":[],
+                "error":null,
+                "future_envelope_metadata":{"source":"newer-producer"}
+            }"#,
+        )
+        .expect("same-version additive metadata remains compatible");
+
+        assert!(envelope.ok);
+        assert_eq!(envelope.data.expect("data")["product"], "codex");
     }
 
     #[test]

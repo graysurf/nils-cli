@@ -144,6 +144,7 @@ fn seed_brokers_at(state_dir: &Path, sessions: &[(&str, &str, &str, &Path, Optio
             json!({
                 "session_id": id,
                 "incarnation": incarnation,
+                "coordination_mode": coordination_mode.unwrap_or("advisory"),
                 "capability_digest": digest(capability),
                 "generation": 1,
                 "state": "ready",

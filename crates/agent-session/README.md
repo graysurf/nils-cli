@@ -128,17 +128,26 @@ This README defines CLI and operator semantics only.
 ## Turn-state integration
 
 Supported provider hooks project metadata-only lifecycle events into a private,
-runtime-bound activity snapshot. Setup is explicit and reversible:
+runtime-bound activity snapshot. Provider registration is owned by
+`agent-hook`; the retained `agent-session activity setup` command is a
+compatibility forwarder:
 
 ```bash
 agent-session activity setup --agent codex --dry-run
-agent-session activity setup --agent codex --apply
+agent-session activity setup --agent codex --repair --expected-preview-digest sha256:<reviewed-plan-digest>
+agent-session activity setup --agent codex --remove
 agent-session activity doctor --agent codex --format json
 ```
 
+The forwarder maps compatibility flags and validates the typed `agent-hook`
+response. If the matching `agent-hook` binary is absent, setup returns
+`agent-hook-setup-unavailable` without writing provider configuration. Existing
+`activity hook`, `activity notify`, and read-only `activity doctor` paths remain
+for runtime compatibility and migration diagnostics.
+
 Use the [turn-state contract](docs/turn-state-contract.md) for persistence,
-privacy, setup, repair, and provider behavior. The evidence behind supported
-provider signals is recorded in
+privacy, registration ownership, setup, repair, migration, and provider
+behavior. The evidence behind supported provider signals is recorded in
 [provider turn-signal evidence](docs/provider-turn-signal-evidence.md).
 
 ## Serve daemon
