@@ -7,8 +7,8 @@ use nils_common::execution_effect::{
 
 use crate::cli::{
     ActivityArgs, AuthArgs, AuthCommand, Cli, Command, InboxArgs, InboxCommand, IssueArgs,
-    IssueCommand, LabelArgs, LabelCommand, PrArgs, PrCommand, RepoArgs, RepoCommand,
-    ReviewThreadsCommand, SearchArgs,
+    IssueCommand, LabelArgs, LabelCommand, PrArgs, PrCommand, PrPendingReviewCommand,
+    PrReviewCommand, RepoArgs, RepoCommand, ReviewThreadsCommand, SearchArgs,
 };
 
 pub fn run(argv: Vec<OsString>, format: OutputFormat) -> i32 {
@@ -66,6 +66,33 @@ fn classify(cli: &Cli) -> (&'static str, Effect, ProviderEffect, Vec<&'static st
                 if matches!(&args.command, ReviewThreadsCommand::List { .. }) =>
             {
                 ("pr.review-threads.list", read, network, vec!["provider"])
+            }
+            PrCommand::Review(args) => match &args.command {
+                Some(PrReviewCommand::Validate(validate)) => (
+                    "pr.review.validate",
+                    read,
+                    if validate.check_diff {
+                        network
+                    } else {
+                        ProviderEffect::LocalRead
+                    },
+                    if validate.check_diff {
+                        vec!["local_inputs", "provider"]
+                    } else {
+                        vec!["local_inputs"]
+                    },
+                ),
+                None => (
+                    "pr.review.post",
+                    mutation,
+                    ProviderEffect::NetworkWrite,
+                    Vec::new(),
+                ),
+            },
+            PrCommand::PendingReview(args)
+                if matches!(&args.command, PrPendingReviewCommand::Inspect(_)) =>
+            {
+                ("pr.pending-review.inspect", read, network, vec!["provider"])
             }
             _ => (
                 "pr.mutation",

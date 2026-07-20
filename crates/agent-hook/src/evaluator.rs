@@ -41,9 +41,15 @@ struct RuleOutcome {
 
 #[derive(Debug)]
 struct ExecutionBudget {
-    started: Instant,
+    started: Option<Instant>,
     children: usize,
     retained_output: usize,
+}
+
+#[derive(Debug)]
+struct ExecutionBudgets {
+    enforced: ExecutionBudget,
+    shadow: ExecutionBudget,
 }
 
 #[derive(Debug)]
@@ -69,14 +75,14 @@ impl PreparedEvaluation<'_> {
 impl ExecutionBudget {
     fn new() -> Self {
         Self {
-            started: Instant::now(),
+            started: None,
             children: 0,
             retained_output: 0,
         }
     }
 
     fn reserve_child(&mut self) -> Result<(Duration, usize), HookError> {
-        let elapsed = self.started.elapsed();
+        let elapsed = self.started.get_or_insert_with(Instant::now).elapsed();
         if elapsed >= DISPATCH_CHILD_DEADLINE {
             return Err(HookError::data(
                 "dispatch-deadline-exceeded",
@@ -105,6 +111,15 @@ impl ExecutionBudget {
             ));
         }
         Ok(())
+    }
+}
+
+impl ExecutionBudgets {
+    fn new() -> Self {
+        Self {
+            enforced: ExecutionBudget::new(),
+            shadow: ExecutionBudget::new(),
+        }
     }
 }
 
@@ -268,11 +283,16 @@ fn evaluate_with_io(
     let mut enforced = Vec::new();
     let mut shadow = Vec::new();
     let mut recovery_applied = false;
-    let mut execution_budget = ExecutionBudget::new();
+    let mut execution_budgets = ExecutionBudgets::new();
     for prepared_rule in &prepared.rules {
         let rule = prepared_rule.rule;
         if prepared_rule.mode == RuleMode::Shadow {
-            let outcome = evaluate_shadow(&rule.capability, request, raw, &mut execution_budget);
+            let outcome = evaluate_shadow(
+                &rule.capability,
+                request,
+                raw,
+                &mut execution_budgets.shadow,
+            );
             shadow.push(ShadowObservation {
                 rule_id: rule.id.clone(),
                 action: outcome.action,
@@ -301,7 +321,7 @@ fn evaluate_with_io(
             &rule.capability,
             request,
             raw,
-            &mut execution_budget,
+            &mut execution_budgets.enforced,
             liveness.as_ref(),
         ) {
             Ok(outcome) => outcome,
@@ -1233,5 +1253,23 @@ mod tests {
 
         assert_eq!(error.code, "capability-input-failed");
         assert!(started.elapsed() < HANDLER_TIMEOUT);
+    }
+
+    #[test]
+    fn shadow_child_budget_cannot_exhaust_enforced_budget() {
+        let mut budgets = ExecutionBudgets::new();
+        let shared_start = Instant::now() - DISPATCH_CHILD_DEADLINE;
+        budgets.shadow.started = Some(shared_start);
+
+        assert_eq!(
+            budgets
+                .shadow
+                .reserve_child()
+                .expect_err("shadow budget exhausted")
+                .code,
+            "dispatch-deadline-exceeded"
+        );
+        assert!(budgets.enforced.reserve_child().is_ok());
+        assert!(budgets.enforced.started.is_some());
     }
 }

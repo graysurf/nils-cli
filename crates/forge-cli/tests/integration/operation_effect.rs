@@ -126,3 +126,42 @@ fn inbox_requires_explicit_no_cache_to_avoid_managed_state_writes() {
         "read_only"
     );
 }
+
+#[test]
+fn nested_pr_query_variants_are_read_only_but_posting_remains_mutation() {
+    let stub = StubEnv::new();
+    let cases: &[(&[&str], &str)] = &[
+        (&["pr", "review", "validate"], "read_only"),
+        (
+            &[
+                "pr",
+                "pending-review",
+                "inspect",
+                "42",
+                "--review",
+                "PRR_test",
+            ],
+            "read_only",
+        ),
+        (
+            &["pr", "review", "42", "--comment", "review outcome"],
+            "mutation",
+        ),
+    ];
+
+    for (command, expected) in cases {
+        let mut args = vec!["operation-effect", "--format", "json", "--"];
+        args.extend_from_slice(command);
+        let output = run_forge_cli(&stub, &args);
+        assert_eq!(
+            output.code, 0,
+            "command={command:?}; stderr={}",
+            output.stderr
+        );
+        assert_eq!(
+            parse_envelope(&output.stdout)["data"]["effect"],
+            *expected,
+            "command={command:?}"
+        );
+    }
+}

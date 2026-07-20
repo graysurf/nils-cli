@@ -25,6 +25,7 @@ pub(crate) struct Candidate {
     executable: PathBuf,
     tool: String,
     argv: Vec<OsString>,
+    cwd: PathBuf,
 }
 
 impl Candidate {
@@ -34,6 +35,7 @@ impl Candidate {
             .arg("operation-effect")
             .args(["--format", "json", "--"])
             .args(&self.argv)
+            .current_dir(&self.cwd)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -83,10 +85,17 @@ pub(crate) fn candidate(raw: &[u8], request: &NormalizedRequest) -> Result<Candi
             "current agent-hook executable is unavailable",
         )
     })?;
+    let execution_path = request.execution_path.as_deref().ok_or_else(|| {
+        rejected(
+            "read-only-binding-mismatch",
+            "request execution directory is unavailable for descriptor binding",
+        )
+    })?;
     candidate_from_command(
         command,
         &current_executable,
         request.binding_roots.as_slice(),
+        execution_path,
     )
 }
 
@@ -94,6 +103,7 @@ fn candidate_from_command(
     command: &str,
     current_executable: &Path,
     binding_roots: &[PathBuf],
+    execution_path: &Path,
 ) -> Result<Candidate, HookError> {
     let mut words = parse_simple_command(command)?;
     if words.is_empty() {
@@ -139,6 +149,18 @@ fn candidate_from_command(
             "operation-effect producer metadata is unavailable",
         )
     })?;
+    let cwd = fs::canonicalize(execution_path).map_err(|_| {
+        rejected(
+            "read-only-binding-mismatch",
+            "request execution directory is unavailable for descriptor binding",
+        )
+    })?;
+    if !cwd.is_dir() {
+        return Err(rejected(
+            "read-only-binding-mismatch",
+            "request execution directory is not a directory",
+        ));
+    }
     if !metadata.is_file()
         || metadata.uid() != unsafe { libc::geteuid() }
         || metadata.permissions().mode() & 0o111 == 0
@@ -157,6 +179,7 @@ fn candidate_from_command(
         executable,
         tool,
         argv: words.into_iter().map(OsString::from).collect(),
+        cwd,
     })
 }
 
@@ -172,13 +195,12 @@ fn resolve_executable(program: &Path) -> Option<PathBuf> {
 }
 
 pub(crate) fn verify_output(candidate: &Candidate, output: &Output) -> Result<(), HookError> {
-    let cwd = std::env::current_dir().map_err(|_| {
-        rejected(
-            "read-only-binding-mismatch",
-            "current directory is unavailable for descriptor binding",
-        )
-    })?;
-    verify_output_at(candidate, output, &cwd, jiff::Timestamp::now().as_second())
+    verify_output_at(
+        candidate,
+        output,
+        &candidate.cwd,
+        jiff::Timestamp::now().as_second(),
+    )
 }
 
 fn verify_output_at(
@@ -495,7 +517,8 @@ mod tests {
         fs::set_permissions(&hook, fs::Permissions::from_mode(0o700)).expect("hook mode");
         fs::set_permissions(&producer, fs::Permissions::from_mode(0o700)).expect("producer mode");
         let command = format!("{} preflight --intent project-dev", producer.display());
-        let candidate = candidate_from_command(&command, &hook, &[]).expect("candidate");
+        let candidate =
+            candidate_from_command(&command, &hook, &[], temp.path()).expect("candidate");
         let now = jiff::Timestamp::now().as_second();
         let descriptor = OperationEffectDescriptor {
             schema_version: OPERATION_EFFECT_VERSION.to_string(),
@@ -610,5 +633,15 @@ mod tests {
                 "read-only-command-unsupported"
             );
         }
+    }
+
+    #[test]
+    fn descriptor_command_uses_the_request_bound_cwd() {
+        let (temp, candidate, _) = fixture();
+
+        assert_eq!(
+            candidate.descriptor_command().get_current_dir(),
+            Some(temp.path())
+        );
     }
 }
