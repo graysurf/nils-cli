@@ -400,7 +400,10 @@ timeout = 7
         None,
     );
     assert_eq!(preview.code, 0, "stderr={}", preview.stderr_text());
-    assert_eq!(preview.stdout_json()["data"]["legacy_residue_count"], 1);
+    assert_eq!(
+        preview.stdout_json()["data"]["status"],
+        "compatibility-only"
+    );
     assert_eq!(
         preview.stdout_json()["data"]["owned_groups"]
             .as_array()
