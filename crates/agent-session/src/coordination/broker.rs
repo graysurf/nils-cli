@@ -225,6 +225,7 @@ pub(crate) fn provision(context: &CliContext, record: &SessionRecord) -> Result<
         BrokerRecord {
             session_id: record.id.clone(),
             incarnation,
+            coordination_mode: record.coordination_mode,
             capability_digest: digest_bytes(token.as_bytes()),
             generation,
             state: "starting".to_string(),
@@ -1006,40 +1007,12 @@ pub(crate) fn heartbeat_fresh(
     incarnation: &str,
     _registry_heartbeat_epoch: i64,
 ) -> bool {
-    let now = now_epoch();
-    let path = super::heartbeat_path(&context.state_dir, session_id);
-    let Ok(mut file) = OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-        .open(&path)
-    else {
-        return false;
-    };
-    let Ok(metadata) = file.metadata() else {
-        return false;
-    };
-    if !metadata.is_file()
-        || metadata.len() > 256
-        || metadata.mode() & 0o077 != 0
-        || metadata.uid() != unsafe { libc::geteuid() }
-        || metadata.nlink() != 1
-    {
-        return false;
-    }
-    let mut value = String::new();
-    if file.by_ref().take(257).read_to_string(&mut value).is_err() || value.len() > 256 {
-        return false;
-    }
-    let Some((observed_incarnation, observed_epoch)) = value.trim().rsplit_once(':') else {
-        return false;
-    };
-    if observed_incarnation != incarnation {
-        return false;
-    }
-    let Ok(observed_epoch) = observed_epoch.parse::<i64>() else {
-        return false;
-    };
-    (0..=30).contains(&now.saturating_sub(observed_epoch))
+    nils_common::coordination_projection::heartbeat_fresh(
+        &context.state_dir,
+        session_id,
+        incarnation,
+        now_epoch(),
+    )
 }
 
 #[cfg(test)]

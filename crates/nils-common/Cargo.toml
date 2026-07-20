@@ -11,9 +11,11 @@ anyhow = { workspace = true }
 base64 = "0.22"
 clap = { workspace = true }
 jiff = { workspace = true }
+libc = { workspace = true }
 regex = "1"
 serde = { workspace = true }
 serde_json = { workspace = true }
+sha2 = { workspace = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]

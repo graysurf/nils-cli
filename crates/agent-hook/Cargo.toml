@@ -1,0 +1,35 @@
+[package]
+name = "nils-agent-hook"
+version = "1.25.3"
+edition.workspace = true
+license.workspace = true
+
+description = "CLI crate for nils-agent-hook in the nils-cli workspace."
+repository = "https://github.com/sympoies/nils-cli"
+
+[lib]
+name = "agent_hook"
+path = "src/lib.rs"
+
+[[bin]]
+name = "agent-hook"
+path = "src/main.rs"
+
+[dependencies]
+clap = { workspace = true }
+clap_complete = { workspace = true }
+jiff = { workspace = true }
+libc = { workspace = true }
+nils-build-info = { version = "1.25.3", path = "../nils-build-info" }
+nils-common = { version = "1.25.3", path = "../nils-common", package = "nils-common" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+toml = { workspace = true }
+toml_edit = "0.25"
+uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+nils-test-support = { version = "1.25.3", path = "../nils-test-support" }
+pretty_assertions = { workspace = true }
+tempfile = "3"

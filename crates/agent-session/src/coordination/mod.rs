@@ -61,6 +61,8 @@ pub(crate) struct Registry {
 pub(crate) struct BrokerRecord {
     pub session_id: String,
     pub incarnation: String,
+    #[serde(default)]
+    pub coordination_mode: crate::cli::CoordinationMode,
     pub capability_digest: String,
     pub generation: u64,
     pub state: String,
@@ -989,18 +991,15 @@ pub(crate) fn worktree_fingerprint(
     if registry.fingerprint_epoch == 0 || registry.fingerprint_key.len() < 32 {
         return Err(store_corrupt());
     }
-    let canonical = fs::canonicalize(checkout).unwrap_or_else(|_| checkout.to_path_buf());
-    let digest = hmac_sha256(
-        registry.fingerprint_key.as_bytes(),
-        canonical.as_os_str().as_encoded_bytes(),
-    );
-    Ok(format!(
-        "hmac-sha256:{}:{}",
+    nils_common::coordination_projection::worktree_fingerprint(
         registry.fingerprint_epoch,
-        hex(&digest)
-    ))
+        &registry.fingerprint_key,
+        checkout,
+    )
+    .ok_or_else(store_corrupt)
 }
 
+#[cfg(test)]
 fn hmac_sha256(key: &[u8], message: &[u8]) -> [u8; 32] {
     const BLOCK: usize = 64;
     let mut normalized = [0_u8; BLOCK];
@@ -1368,6 +1367,10 @@ mod tests {
             }]
         }))
         .expect("registry");
+        assert_eq!(
+            registry.brokers["session"].coordination_mode,
+            crate::cli::CoordinationMode::Advisory
+        );
 
         clean_expired(&mut registry, 2);
         assert_eq!(registry.claims[0].state, "active");

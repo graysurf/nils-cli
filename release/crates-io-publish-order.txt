@@ -5,6 +5,7 @@ nils-provider-resume
 nils-agent-docs
 nils-agent-memory
 nils-agent-out
+nils-agent-hook
 nils-agent-session
 nils-agent-scope-lock
 nils-term
