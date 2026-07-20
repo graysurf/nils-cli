@@ -5,9 +5,9 @@
 - CLI binary: `agent-session`
 - Owning crate: `crates/agent-session`
 - Contract owner: Codex
-- Target PR: pending
+- Target PR: [#1326](https://github.com/sympoies/nils-cli/pull/1326)
 - Status: done
-- Last updated: 2026-07-03
+- Last updated: 2026-07-20
 - Completion enforcement metadata tuple from matrix row:
   - `completion_mode=clap-first`
   - `completion_mode_toggles=forbidden`
@@ -34,7 +34,7 @@
 | `agent-session activity status` | `crates/agent-session/src/cli.rs` | session id, format enum | durable turn-state read |
 | `agent-session activity doctor` | `crates/agent-session/src/cli.rs` | optional provider enum, format enum | provider integration diagnostics |
 | `agent-session activity setup` | `crates/agent-session/src/cli.rs` | provider enum, setup mode flags, digest and path values, format enum | preview/apply/repair/remove lifecycle setup |
-| `agent-session activity hook` | `crates/agent-session/src/cli.rs` | provider/event enums and stdin flags | hidden provider hook bridge |
+| `agent-session activity hook` | `crates/agent-session/src/cli.rs` | provider enum and optional hidden free-form event name; payload is read from stdin implicitly | hidden provider hook bridge |
 | `agent-session activity notify` | `crates/agent-session/src/cli.rs` | provider enum and notifier argv values | hidden provider notification bridge |
 | `agent-session work-context` | `crates/agent-session/src/cli.rs` | nested advisory and enforce commands | managed coordination group |
 | `agent-session work-context status` | `crates/agent-session/src/cli.rs` | format enum | self-targeting presence/context read |
@@ -78,9 +78,11 @@ Checklist:
 
 | argument or flag | provider type | source location | context-aware behavior | tests |
 | --- | --- | --- | --- | --- |
-| `--agent` | `ValueEnum` | `crates/agent-session/src/cli.rs` | static `codex`, `claude` values | completion freshness/flag parity |
+| `--agent` | `ValueEnum` | `crates/agent-session/src/cli.rs` | static `codex`, `claude`, `hermes` values | completion freshness/flag parity |
 | `--coordination-mode` | `ValueEnum` | `crates/agent-session/src/cli.rs` | static `advisory`, `enforce`, `off` values | completion freshness/flag parity |
 | `--format` | `ValueEnum` | `nils_common::cli_contract::OutputFormat` | static `text`, `json` values | completion freshness/flag parity |
+| `send --key` | `ValueEnum` | `crates/agent-session/src/cli.rs` | static `enter`, `escape`, `backspace`, `c-c`, `up`, `down`, `left`, `right`, `tab` values | completion freshness/flag parity |
+| `work-context complete --outcome` | `ValueEnum` | `crates/agent-session/src/cli.rs` | static `pass`, `fail` values | completion freshness/flag parity |
 | `completion <shell>` | `ValueEnum` | `crates/agent-session/src/completion.rs` | static `bash`, `zsh` values | completion freshness/flag parity |
 | path flags | `ValueHint` | `crates/agent-session/src/cli.rs` | shell path completion | completion freshness/flag parity |
 
@@ -89,7 +91,7 @@ No dynamic runtime value provider is used.
 Checklist:
 
 - [x] No global candidate dump behavior remains.
-- [x] Cursor-position filtering is documented for dynamic value paths.
+- [x] Dynamic cursor-position filtering is not applicable to this static completion surface.
 
 ## alias map
 

@@ -1,8 +1,8 @@
 # agent-session Documentation
 
-Use the crate [README](../README.md) for the product overview, command examples,
-and the complete current surface map. Use the documents below when operating or
-integrating a specific subsystem.
+Use the crate [README](../README.md) for the non-normative product overview,
+common commands, and document routing. Use the documents below when operating
+or integrating a specific subsystem.
 
 ## Operator runbooks
 
@@ -13,6 +13,8 @@ integrating a specific subsystem.
 
 ## Stable contracts
 
+- [Serve API v1](specs/serve-api-v1.md): HTTP and WebSocket endpoints,
+  response/authentication rules, launch profiles, and session survival.
 - [Session coordination v1](specs/session-coordination-v1.md): normative
   schemas, state machines, authorization, routes, limits, and failure codes.
 - [Turn-state contract](turn-state-contract.md): runtime-bound activity state,

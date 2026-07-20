@@ -7,13 +7,16 @@ HTTP and WebSocket while reusing the same lifecycle implementation as the CLI.
 ## Start safely
 
 Bind to loopback and pass the bearer token on stdin so it does not appear in
-process arguments:
+process arguments or the daemon environment. In this interactive example the
+temporary shell variable must remain unexported:
 
 ```bash
-printf '%s' "$AGENT_SESSION_TOKEN" | \
+read -r -s AGENT_SESSION_SERVE_TOKEN
+printf '%s' "$AGENT_SESSION_SERVE_TOKEN" | \
   agent-session serve \
     --bind 127.0.0.1:8781 \
     --token-stdin
+unset AGENT_SESSION_SERVE_TOKEN
 ```
 
 The daemon refuses a non-loopback bind unless `--allow-non-loopback` is
@@ -22,17 +25,32 @@ an authenticated edge in front of the loopback daemon. Expose the edge, not the
 raw serve port.
 
 `--token-stdin` accepts one non-empty token of at most 8192 bytes and conflicts
-with `--token`. `AGENT_SESSION_TOKEN` is the environment alternative. When no
-non-empty token is configured, authenticated endpoints fail closed.
+with `--token`. The CLI still accepts `--token` and `AGENT_SESSION_TOKEN` for
+compatibility, but do not use the environment form for a daemon that creates
+managed sessions: the current child-launch path can inherit that variable and
+thereby grant a provider the machine-operator bearer. Prefer a private
+credential source connected to stdin. When no non-empty token is configured,
+authenticated endpoints fail closed.
 
 ## Authentication boundaries
 
-| Endpoint class | Authentication |
+| Endpoint class | Authentication and exposure |
 | --- | --- |
-| Loopback health and ordinary session projections such as `/healthz`, `/sessions`, session glance, and `/usage` | Open on the bind address. |
+| `GET /healthz` | Open on the bind address; health metadata only. |
+| `GET /sessions` | Open; may include working directories and recent prompt previews. |
+| `GET /usage` | Open; returns provider usage projections. |
+| `GET /sessions/{id}/glance` | Open; returns recent live pane content. |
+| `GET /sessions/{id}/buffer` | Open; returns the tmux server's latest global clipboard buffer after only checking that the session exists. |
+| `GET /sessions/{id}/auto-resume` | Open; returns that session's auto-resume state. |
 | Path-bearing reads, account inventory, activity stream, writes, and WebSocket attach | Bearer token. |
 | Public coordination and broker reads | Bearer token. |
 | Session-owner coordination and mailbox mutations | Bearer token plus `X-Agent-Session-Capability`. |
+
+Loopback prevents remote network access; it does not authenticate local
+processes or users. Run the raw daemon only on a trusted single-user host or
+behind a local access-control boundary that prevents untrusted same-host
+principals from reaching the port. Any local caller that can connect can read
+the open prompt, pane, path, usage, clipboard, and auto-resume projections.
 
 The bearer token is machine-operator authority. The session capability is
 per-incarnation owner authority. Session IDs and other request selectors do not
@@ -83,9 +101,11 @@ The main endpoint groups are:
 - WebSocket PTY attach;
 - raw work-context, broker recovery, and mailbox operations.
 
-All responses use the `cli.agent-session.serve.v1` envelope and include a
-machine identity selected by `--machine`, `AGENT_SESSION_MACHINE`, `--host`, or
-the hostname fallback.
+Ordinary JSON HTTP responses use the `cli.agent-session.serve.v1` envelope and
+include a machine identity selected by `--machine`,
+`AGENT_SESSION_MACHINE`, `--host`, or the hostname fallback. The activity SSE
+stream and WebSocket attach use their own streaming protocols rather than that
+JSON envelope.
 
 Use `POST /sessions/{id}/prompt/v2` when a client needs a cross-version fence.
 It requires both exact prompt text and the expected session incarnation,
@@ -138,6 +158,6 @@ the serve service for defense in depth.
 7. Restart the daemon and confirm expected tmux survival before relying on the
    service configuration.
 
-The crate [README](../../README.md#serve-daemon) remains the complete current
-surface overview. Wire-level activity, coordination, turn-state, and
-maintenance contracts are indexed in the crate [documentation map](../README.md).
+The normative endpoint surface is in [Serve API v1](../specs/serve-api-v1.md).
+Wire-level activity, coordination, turn-state, and maintenance contracts are
+indexed in the crate [documentation map](../README.md).
