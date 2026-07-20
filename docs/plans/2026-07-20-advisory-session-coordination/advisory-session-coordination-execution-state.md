@@ -3,20 +3,20 @@
 <!-- plan-issue-record:v2 role=state profile=tracking -->
 ## Execution State
 
-- Status: active; implementation and release-quality validation complete, PR delivery in progress
+- Status: complete
 - Target scope: advisory-by-default nils-cli session coordination, automatic
   presence and work-context UX, agent-runtime-kit hook routing, two reviewed
   merged PRs, then approved release/runtime sync and fresh-session acceptance.
 - Execution window: Sprint 1 (nils-cli contract) -> Sprint 2 (runtime hooks) ->
   Sprint 3 (review/PR/merge) -> Sprint 4 (preview consent/deployment), serial
   across cross-repository dependencies.
-- Current task: Task 3.1, deliver and merge nils-cli
-- Next task: Task 3.2, deliver and merge agent-runtime-kit
+- Current task: complete
+- Next task: none
 - Last updated: 2026-07-20
-- Branch/commit/PR: nils-cli `fix/advisory-session-coordination` code commit
-  `6b3ec99828dde7784f3a80e2c3da9014d87c8d58`; runtime-kit
-  `fix/advisory-session-coordination` commit
-  `1d1a1bcbe94821e840100a39acabae80f3fbc658`; PRs pending
+- Branch/commit/PR: sympoies/nils-cli#1320 merged
+  (<https://github.com/sympoies/nils-cli/pull/1320>); agent-runtime-kit#699
+  merged (<https://github.com/graysurf/agent-runtime-kit/pull/699>); released
+  as nils-cli v1.25.3.
 - Source document: `docs/plans/2026-07-20-advisory-session-coordination/advisory-session-coordination-plan.md`
 - Implementation source: `docs/plans/2026-07-20-advisory-session-coordination/advisory-session-coordination-discussion-source.md`
 - Direct source-doc execution waiver: not applicable.
@@ -46,10 +46,10 @@
 | 2.1 | done | Lock hook mode routing with failing tests | runtime test-first evidence `20260720-122115-issue-1318-runtime-test-first`. | Default/advisory/off/unmanaged red captured before hook edits. |
 | 2.2 | done | Implement advisory, enforce, off, and unmanaged routing | Shared hook suite and fail-open/privacy/resource regression tests pass. | Advisory never blocks; enforce compatibility remains. |
 | 2.3 | done | Update policy and cross-product acceptance | Source-linked Codex/Claude acceptance passes against the nils worktree binary. | Includes first mutation, overlap, acknowledgement, degraded broker, enforce, off, and unmanaged. |
-| 3.1 | in-progress | Deliver and merge nils-cli | Full local-fast and test-first evidence pass; provider PR/checks/merge pending. | Three specialist waves resolved; final red-team returned no findings. |
-| 3.2 | pending | Deliver and merge agent-runtime-kit | Pending Tasks 2.3 and 3.1. | Independent review and provider checks required. |
-| 4.1 | pending | Prepare and obtain deployment preview approval | Pending both merges. | Exact version/base/commit/digest/config and rollback. |
-| 4.2 | pending | Release, sync, prove fresh sessions, and close #1318 | Pending explicit approval of Task 4.1. | Close only after installed managed/unmanaged acceptance. |
+| 3.1 | done | Deliver and merge nils-cli | PR #1320 merged at `29c19f86210c805b82c5fbd2a1986fd0afa8183c` after required checks and review convergence. | Released in v1.25.3. |
+| 3.2 | done | Deliver and merge agent-runtime-kit | PR #699 merged at `09fe56f7e1e63bc1479d3b7dadeb2ae162ee2a77` after required checks and review convergence. | Installed runtime surfaces synchronized from merged main. |
+| 4.1 | done | Prepare and obtain deployment preview approval | Maintainer approved the exact v1.25.3 release-and-deploy command and immutable nils-cli base `29c19f86210c805b82c5fbd2a1986fd0afa8183c`. | Two-stage consent boundary satisfied. |
+| 4.2 | done | Release, sync, prove fresh sessions, and close #1318 | v1.25.3 release and fleet deployment succeeded; runtime sync restored all nine Codex plugins; installed coupled matrix, doctor, prompt-input, fresh managed Codex and Claude, and fresh unmanaged Codex passed. | Strict controller closeout passed and #1318 is closed. |
 
 ## Session Log
 
@@ -96,6 +96,5 @@
 
 ## Handoff
 
-- Finish Task 3.1 and Task 3.2 through provider review/checks/merge. Do not
-  release or sync installed runtime surfaces until Task 4.1 has been reported
-  with exact immutable inputs and explicitly approved.
+- Tracking issue <https://github.com/sympoies/nils-cli/issues/1318> is closed;
+  terminal execution state is synchronized. No closeout or merge action remains.
