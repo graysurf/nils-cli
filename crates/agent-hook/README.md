@@ -58,7 +58,12 @@ Codex `config.toml`, compatibility `hooks.json`, the managed dispatcher, and
 the authoritative `agent-session activity notify --agent codex` argv are one
 reviewed transaction. A singular safe user notifier is composed without a
 shell; rollback and remove restore the exact prior bytes and file-presence
-state.
+state. An audited Codex Computer Use `turn-ended --previous-notify` wrapper
+that reaches the exact owned notifier is also composed. Accumulated alternating
+wrappers are drift: dry-run keeps `apply_allowed: false`, and only the matching
+plan digest may normalize them to one Computer Use wrapper plus one owned
+notifier. The successful repair reports `apply_allowed: true`, repeat repair is
+a no-op, and remove restores one semantic Computer Use base notifier.
 
 The locked `agent-session.coordination.v1` capability runs inside that same
 dispatcher ingress. Ordinary policy aggregation runs first; only an allowed

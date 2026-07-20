@@ -2193,6 +2193,57 @@ fn codex_activity_doctor_surfaces_notification_config_errors() {
 }
 
 #[test]
+fn codex_activity_doctor_recognizes_audited_computer_use_owned_notify() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let home = tmp.path().join("home");
+    let codex = home.join(".codex");
+    fs::create_dir_all(&codex).expect("Codex directory");
+    fs::write(codex.join("hooks.json"), r#"{"hooks":{}}"#).expect("hooks config");
+    let helper = codex.join(
+        "computer-use/Codex Computer Use.app/Contents/SharedSupport/SkyComputerUseClient.app/Contents/MacOS/SkyComputerUseClient",
+    );
+    fs::create_dir_all(helper.parent().expect("Computer Use helper parent"))
+        .expect("Computer Use helper directory");
+    write_executable(&helper, "#!/usr/bin/env sh\nexit 0\n");
+    let owned = ["agent-session", "activity", "notify", "--agent", "codex"];
+    let notify = [
+        helper.to_string_lossy().into_owned(),
+        "turn-ended".to_string(),
+        "--previous-notify".to_string(),
+        serde_json::to_string(&owned).expect("owned notify JSON"),
+    ];
+    let mut document = toml_edit::DocumentMut::new();
+    let mut array = toml_edit::Array::new();
+    array.extend(notify.iter().map(String::as_str));
+    document["notify"] = toml_edit::value(array);
+    fs::write(codex.join("config.toml"), document.to_string()).expect("Codex config");
+    let home_arg = home.to_string_lossy().to_string();
+
+    let doctor = run(
+        tmp.path(),
+        &["activity", "doctor", "--agent", "codex", "--format", "json"],
+        &[("HOME", home_arg.as_str())],
+    );
+    assert_eq!(doctor.code, 0, "stderr={}", doctor.stderr_text());
+    assert_eq!(
+        data(&doctor.stdout_json())["providers"][0]["notification_mode"],
+        "composed"
+    );
+
+    fs::remove_file(&helper).expect("remove Computer Use helper");
+    let unavailable = run(
+        tmp.path(),
+        &["activity", "doctor", "--agent", "codex", "--format", "json"],
+        &[("HOME", home_arg.as_str())],
+    );
+    assert_eq!(unavailable.code, 0, "stderr={}", unavailable.stderr_text());
+    assert_eq!(
+        data(&unavailable.stdout_json())["providers"][0]["notification_mode"],
+        "conflict"
+    );
+}
+
+#[test]
 fn activity_doctor_reports_exact_attention_capability_and_authority() {
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let home = tmp.path().join("home");

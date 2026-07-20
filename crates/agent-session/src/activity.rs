@@ -42,12 +42,8 @@ const REPLAY_HEADER_BYTES: usize = 64;
 const REPLAY_MAGIC: &[u8; 16] = b"agent-session-r1";
 const MAX_PENDING_ATTENTION: usize = 64;
 const MAX_ID_CHARS: usize = 256;
-const CODEX_NOTIFY_ARGV: [&str; 5] = ["agent-session", "activity", "notify", "--agent", "codex"];
-const CODEX_NOTIFY_FORWARD_FLAG: &str = "--forward-notify-argv-json";
 const CODEX_NOTIFY_FORWARD_ACTIVE_ENV: &str = "AGENT_SESSION_CODEX_NOTIFY_FANOUT_ACTIVE";
 pub(crate) const ACTIVITY_RETRY_PROVIDER_ENV: &str = "AGENT_SESSION_ACTIVITY_RETRY_PROVIDER";
-const MAX_CODEX_FORWARD_ARGS: usize = 64;
-const MAX_CODEX_FORWARD_ARGV_BYTES: usize = 16 * 1024;
 const CODEX_FORWARD_TIMEOUT: Duration = Duration::from_secs(2);
 const CODEX_COMPLETION_RETRY_TIMEOUT: Duration = Duration::from_secs(5);
 const RUNTIME_UNHEALTHY_LOCK_TIMEOUT: Duration = Duration::from_millis(250);
@@ -2269,15 +2265,9 @@ pub(crate) fn forward_provider_notification_fail_open(
     let Some(encoded_argv) = encoded_argv else {
         return;
     };
-    if encoded_argv.len() > MAX_CODEX_FORWARD_ARGV_BYTES {
-        return;
-    }
-    let Ok(argv) = serde_json::from_str::<Vec<String>>(encoded_argv) else {
+    let Some(argv) = agent_hook::setup::decode_codex_forward_notify_argv(encoded_argv) else {
         return;
     };
-    if !codex_forward_argv_is_safe(&argv) {
-        return;
-    }
 
     let mut command = ProcessCommand::new(&argv[0]);
     command
@@ -3302,7 +3292,7 @@ fn codex_notification_status(path: &Path) -> Result<CodexNotificationStatus, Cli
         &fs::read_to_string(path)
             .map_err(|err| activity_io_error("provider-config-read-failed", path, err))?,
     )?;
-    let mode = codex_notify_mode(&document);
+    let mode = codex_notify_mode(&document, path);
     Ok(CodexNotificationStatus {
         configured: matches!(mode, CodexNotifyMode::Owned | CodexNotifyMode::Composed(_)),
         mode: codex_notify_mode_name(&mode).to_string(),
@@ -3328,7 +3318,7 @@ enum CodexNotifyMode {
     Invalid,
 }
 
-fn codex_notify_mode(document: &TomlDocument) -> CodexNotifyMode {
+fn codex_notify_mode(document: &TomlDocument, config_path: &Path) -> CodexNotifyMode {
     let Some(item) = document.get("notify") else {
         return CodexNotifyMode::Absent;
     };
@@ -3342,37 +3332,13 @@ fn codex_notify_mode(document: &TomlDocument) -> CodexNotifyMode {
     else {
         return CodexNotifyMode::Invalid;
     };
-    if argv_matches(&argv, &CODEX_NOTIFY_ARGV) {
-        return CodexNotifyMode::Owned;
+    match agent_hook::setup::codex_notification_ownership(config_path, &argv) {
+        Some(agent_hook::setup::CodexNotificationOwnership::Owned) => CodexNotifyMode::Owned,
+        Some(agent_hook::setup::CodexNotificationOwnership::Composed) => {
+            CodexNotifyMode::Composed(argv)
+        }
+        None => CodexNotifyMode::Foreign(argv),
     }
-    if argv.len() == CODEX_NOTIFY_ARGV.len() + 2
-        && argv_matches(&argv[..CODEX_NOTIFY_ARGV.len()], &CODEX_NOTIFY_ARGV)
-        && argv[CODEX_NOTIFY_ARGV.len()] == CODEX_NOTIFY_FORWARD_FLAG
-        && let Ok(forwarded) =
-            serde_json::from_str::<Vec<String>>(&argv[CODEX_NOTIFY_ARGV.len() + 1])
-        && codex_forward_argv_is_safe(&forwarded)
-    {
-        return CodexNotifyMode::Composed(forwarded);
-    }
-    CodexNotifyMode::Foreign(argv)
-}
-
-fn argv_matches(argv: &[String], expected: &[&str]) -> bool {
-    argv.len() == expected.len()
-        && argv
-            .iter()
-            .zip(expected)
-            .all(|(value, expected)| value == expected)
-}
-
-fn codex_forward_argv_is_safe(argv: &[String]) -> bool {
-    !argv.is_empty()
-        && argv.len() <= MAX_CODEX_FORWARD_ARGS
-        && !argv[0].trim().is_empty()
-        && argv.iter().map(String::len).sum::<usize>() <= MAX_CODEX_FORWARD_ARGV_BYTES
-        && !argv.iter().any(|value| value == CODEX_NOTIFY_FORWARD_FLAG)
-        && (argv.len() < CODEX_NOTIFY_ARGV.len()
-            || !argv_matches(&argv[..CODEX_NOTIFY_ARGV.len()], &CODEX_NOTIFY_ARGV))
 }
 
 fn codex_notify_mode_name(mode: &CodexNotifyMode) -> &'static str {
