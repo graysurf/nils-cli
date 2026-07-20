@@ -930,6 +930,9 @@ case "$*" in
     extract_field body "$@" > "$receipt"
     printf '%s\n' 'https://github.com/acme/widgets/pull/44#issuecomment-receipt'
     ;;
+  *"repos/acme/widgets/issues/101/comments --method POST"*)
+    printf '%s\n' 'https://github.com/acme/widgets/issues/101#issuecomment-review'
+    ;;
   *"reviewThreads(first: 100"*)
     if [ -f "$submitted" ] && [ -f "$finding_body_0" ]; then
       body=$(json_escape "$finding_body_0")
@@ -1505,7 +1508,7 @@ fn pr_review_transaction_is_idempotent_across_sessions() {
     assert_eq!(second.code, 0, "{}", second.stdout);
     let first_envelope = parse_envelope(&first.stdout);
     let second_envelope = parse_envelope(&second.stdout);
-    assert_eq!(second_envelope["data"]["submitted_review"], true);
+    assert_eq!(second_envelope["data"]["submitted_review"], false);
     assert_eq!(
         second_envelope["data"]["pr_comment_url"], first_envelope["data"]["pr_comment_url"],
         "an exact rerun must preserve the submitted review identity"
@@ -1522,6 +1525,80 @@ fn pr_review_transaction_is_idempotent_across_sessions() {
         calls.matches("issues/44/comments --method POST").count(),
         1,
         "the immutable receipt must not be duplicated: {calls}"
+    );
+}
+
+#[test]
+fn pr_review_completed_rerun_does_not_duplicate_issue_mirror() {
+    let stub = StubEnv::new();
+    let capture = stub.tempdir.path().join("idempotent-mirror-gh-args.log");
+    let thread_file = stub.tempdir.path().join("idempotent-mirror-threads.json");
+    fs::write(
+        &thread_file,
+        r#"[{"path":"src/lib.rs","line":42,"body":"Thread body"}]"#,
+    )
+    .expect("write thread specs");
+    let stub = stub.gh_stub(&github_resumable_thread_stub(
+        &capture.to_string_lossy(),
+        false,
+        false,
+        false,
+        "none",
+        false,
+    ));
+    let run = |stub: &StubEnv| {
+        run_forge_cli(
+            stub,
+            &[
+                "--provider",
+                "github",
+                "--repo",
+                "acme/widgets",
+                "--format",
+                "json",
+                "pr",
+                "review",
+                "44",
+                "--decision",
+                "comments-only",
+                "--submit-review",
+                "--expected-head",
+                "head-44",
+                "--comment",
+                "Summary body",
+                "--thread-file",
+                thread_file.to_str().expect("utf8 path"),
+                "--issue",
+                "101",
+                "--mirror-issue",
+            ],
+        )
+    };
+
+    let first = run(&stub);
+    let second = run(&stub);
+    assert_eq!(first.code, 0, "{}", first.stdout);
+    assert_eq!(second.code, 0, "{}", second.stdout);
+    let first_envelope = parse_envelope(&first.stdout);
+    let second_envelope = parse_envelope(&second.stdout);
+    assert_eq!(first_envelope["data"]["submitted_review"], true);
+    assert_eq!(second_envelope["data"]["submitted_review"], false);
+    assert_eq!(
+        second_envelope["data"]["issue_comment_url"],
+        serde_json::Value::Null
+    );
+    assert_eq!(
+        second_envelope["data"]["pr_comment_url"], first_envelope["data"]["pr_comment_url"],
+        "the skipped rerun must still report the original review identity"
+    );
+
+    let calls = fs::read_to_string(capture).expect("read captured calls");
+    assert_eq!(
+        calls
+            .matches("repos/acme/widgets/issues/101/comments --method POST")
+            .count(),
+        1,
+        "the completed rerun must not duplicate issue activity: {calls}"
     );
 }
 

@@ -648,7 +648,7 @@ pub fn run_with<R: BackendRunner, F: Fn(&str) -> Option<String>>(
                     route_lenses: &args.lenses,
                 },
             )?;
-            let review_skipped_idempotent = submission.review_url.is_none();
+            let review_skipped_idempotent = !submission.submitted;
             (
                 submission.review_url.unwrap_or_default(),
                 submission.created,
@@ -1282,11 +1282,12 @@ fn review_thread_range_not_in_diff_err(
     )
 }
 
-/// Result of the GitHub native-review-with-threads submission. `review_url` is
-/// `None` when the review was skipped entirely because every finding already
-/// had a live thread on the current head (cross-run idempotency).
+/// Result of the GitHub native-review-with-threads submission. A recovered
+/// completed transaction retains its original `review_url` while `submitted`
+/// remains false so callers do not duplicate downstream issue activity.
 struct GithubReviewSubmission {
     review_url: Option<String>,
+    submitted: bool,
     created: Vec<CreatedReviewThread>,
     skipped: usize,
 }
@@ -1388,12 +1389,14 @@ fn submit_github_review_with_threads<R: BackendRunner>(
         {
             return Ok(GithubReviewSubmission {
                 review_url: Some(review_url),
+                submitted: false,
                 created: Vec::new(),
                 skipped,
             });
         }
         return Ok(GithubReviewSubmission {
             review_url: None,
+            submitted: false,
             created: Vec::new(),
             skipped,
         });
@@ -1432,6 +1435,7 @@ fn submit_github_review_with_threads<R: BackendRunner>(
     {
         return Ok(GithubReviewSubmission {
             review_url: Some(review_url),
+            submitted: false,
             created: Vec::new(),
             skipped,
         });
@@ -1608,6 +1612,7 @@ fn submit_github_review_with_threads<R: BackendRunner>(
             {
                 return Ok(GithubReviewSubmission {
                     review_url: Some(review_url),
+                    submitted: true,
                     created: review_threads,
                     skipped,
                 });
@@ -1623,6 +1628,7 @@ fn submit_github_review_with_threads<R: BackendRunner>(
     let review_url = parse_submitted_review_url(&submit_output).unwrap_or(pending.url);
     Ok(GithubReviewSubmission {
         review_url: Some(review_url),
+        submitted: true,
         created: review_threads,
         skipped,
     })
@@ -2943,8 +2949,22 @@ fn render_text(payload: &PrReviewPayload) {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::RefCell;
+
     use super::*;
     use crate::provider::DetectionSource;
+
+    struct ReceiptRunner {
+        outputs: RefCell<Vec<crate::backend::BackendSuccess>>,
+        calls: RefCell<Vec<String>>,
+    }
+
+    impl BackendRunner for ReceiptRunner {
+        fn run(&self, call: &BackendCall) -> Result<crate::backend::BackendSuccess, ForgeError> {
+            self.calls.borrow_mut().push(call.plan_argv().join(" "));
+            Ok(self.outputs.borrow_mut().remove(0))
+        }
+    }
 
     fn ctx(repo: Option<&str>) -> ProviderContext {
         ProviderContext {
@@ -3203,5 +3223,98 @@ mod tests {
         )
         .expect_err("a malformed viewer-owned marker must fail closed");
         assert_eq!(error.kind(), "review_state_conflict");
+    }
+
+    #[test]
+    fn receipt_append_verification_starts_after_the_prior_state_cursor() {
+        let prior_receipt = review_state::ReviewRunReceipt {
+            review_run_id: "sha256:prior".to_string(),
+            route_lenses: Vec::new(),
+            decision: "comments-only".to_string(),
+            expected_head: "head-44".to_string(),
+            round: 0,
+            summary_digest: "sha256:prior-summary".to_string(),
+            inline_manifest: Vec::new(),
+        };
+        let prior_record = review_state::ReviewStateRecord::new(
+            "acme/widgets",
+            44,
+            "head-44",
+            0,
+            None,
+            review_state::ReviewStatePayload::ReviewRunReceipt {
+                receipt: prior_receipt,
+            },
+        )
+        .expect("prior record");
+        let prior_marker = prior_record.marker().expect("prior marker");
+        let state = ReviewStateSnapshot {
+            chain: review_state::parse_chain([prior_marker.as_str()], "acme/widgets", 44)
+                .expect("prior chain"),
+            trusted_bodies: vec![prior_marker],
+            viewer_login: "review-bot".to_string(),
+            end_cursor: Some("state-tip".to_string()),
+        };
+        let receipt = review_state::ReviewRunReceipt {
+            review_run_id: "sha256:next".to_string(),
+            route_lenses: vec!["security".to_string()],
+            decision: "comments-only".to_string(),
+            expected_head: "head-44".to_string(),
+            round: 1,
+            summary_digest: "sha256:next-summary".to_string(),
+            inline_manifest: Vec::new(),
+        };
+        let next_record = review_state::ReviewStateRecord::new(
+            "acme/widgets",
+            44,
+            "head-44",
+            1,
+            state.chain.tip_digest.clone(),
+            review_state::ReviewStatePayload::ReviewRunReceipt {
+                receipt: receipt.clone(),
+            },
+        )
+        .expect("next record");
+        let next_marker = next_record.marker().expect("next marker");
+        let runner = ReceiptRunner {
+            outputs: RefCell::new(vec![
+                crate::backend::BackendSuccess {
+                    stdout: "https://github.com/acme/widgets/issues/44#issuecomment-2".to_string(),
+                    stderr: String::new(),
+                },
+                crate::backend::BackendSuccess {
+                    stdout: serde_json::json!({
+                        "data": {
+                            "viewer": {"login": "review-bot"},
+                            "repository": {"pullRequest": {"comments": {
+                                "nodes": [{
+                                    "author": {"login": "review-bot"},
+                                    "body": next_marker
+                                }],
+                                "pageInfo": {"hasNextPage": false, "endCursor": "state-next"}
+                            }}}
+                        }
+                    })
+                    .to_string(),
+                    stderr: String::new(),
+                },
+            ]),
+            calls: RefCell::new(Vec::new()),
+        };
+
+        ensure_review_run_receipt(
+            &runner,
+            &ctx(Some("acme/widgets")),
+            "acme/widgets",
+            44,
+            &state,
+            &receipt,
+        )
+        .expect("receipt append verified from cursor tail");
+
+        let calls = runner.calls.borrow();
+        assert_eq!(calls.len(), 2);
+        assert!(calls[0].contains("issues/44/comments"), "{}", calls[0]);
+        assert!(calls[1].contains("after=state-tip"), "{}", calls[1]);
     }
 }

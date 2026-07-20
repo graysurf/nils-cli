@@ -718,7 +718,9 @@ backend mapping, validation rules, and output schema versions.
   is posted fresh.
   `data.threads_skipped_idempotent` reports the number skipped, and when every
   finding is already threaded the review event itself is skipped
-  (`submitted_review` is `false`). JSON output includes
+  (`submitted_review` is `false`). An exact completed rerun also reports
+  `submitted_review: false` while retaining the original submitted review URL;
+  it does not emit another issue mirror activity entry. JSON output includes
   `data.review_threads[] = { id, url, path, line, subject_type }`, where `id` is
   the `PRRT_...` handle consumed by `pr review-threads resolve`. Dry-run output
   includes `data.target_plan`, `data.thread_plan[]`, `data.submit_plan`,

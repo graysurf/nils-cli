@@ -258,6 +258,130 @@ esac
     .replace("@STATE_MARKER@", &state_marker)
 }
 
+fn two_page_pending_snapshot_script(capture: &str, second_body: &str) -> String {
+    let page = |id: &str, body: &str, has_next_page: bool, end_cursor: Option<&str>| {
+        serde_json::json!({
+            "data": {"node": {
+                "id": "PRR_pending",
+                "url": "https://github.com/acme/widgets/pull/42#pullrequestreview-102",
+                "author": {"login": "review-bot"},
+                "state": "PENDING",
+                "commit": {"oid": "head-new"},
+                "body": "Summary",
+                "viewerDidAuthor": true,
+                "viewerCanDelete": true,
+                "comments": {
+                    "totalCount": 2,
+                    "nodes": [{
+                        "id": id,
+                        "url": format!("https://github.com/acme/widgets/pull/42#discussion_{id}"),
+                        "author": {"login": "review-bot"},
+                        "body": body,
+                        "createdAt": "2026-07-20T12:00:00Z",
+                        "path": format!("src/{id}.rs"),
+                        "line": 10,
+                        "originalLine": 10,
+                        "diffSide": "RIGHT",
+                        "startLine": null,
+                        "originalStartLine": null,
+                        "startDiffSide": null,
+                        "subjectType": "LINE"
+                    }],
+                    "pageInfo": {
+                        "hasNextPage": has_next_page,
+                        "endCursor": end_cursor
+                    }
+                },
+                "pullRequest": {
+                    "number": 42,
+                    "url": "https://github.com/acme/widgets/pull/42",
+                    "headRefOid": "head-new"
+                }
+            }}
+        })
+        .to_string()
+    };
+    let first_page = page("PRRC_1", "first-page finding", true, Some("cursor-1"));
+    let second_page = page("PRRC_2", second_body, false, None);
+    r#"#!/bin/sh
+set -eu
+printf '%s\n' "$*" >> "@CAPTURE@"
+case "$1 $2" in
+  "pr view")
+    printf '%s\n' '{"number":42,"url":"https://github.com/acme/widgets/pull/42","state":"OPEN","isDraft":false,"baseRefName":"main","headRefName":"feat/reviews","headRefOid":"head-new","title":"feat: reviews","body":""}'
+    ;;
+  "api graphql")
+    case "$*" in
+      *"after=cursor-1"*)
+        printf '%s\n' '@SECOND_PAGE@'
+        ;;
+      *)
+        printf '%s\n' '@FIRST_PAGE@'
+        ;;
+    esac
+    ;;
+  *)
+    echo "unexpected gh args: $*" >&2
+    exit 99
+    ;;
+esac
+"#
+    .replace("@CAPTURE@", capture)
+    .replace("@FIRST_PAGE@", &first_page)
+    .replace("@SECOND_PAGE@", &second_page)
+}
+
+#[test]
+fn pr_pending_review_inspect_digests_later_comment_pages() {
+    let mut digests = Vec::new();
+    for second_body in ["second-page finding A", "second-page finding B"] {
+        let stub = StubEnv::new();
+        let capture = stub.tempdir.path().join("inspect-two-page-calls.log");
+        let script = two_page_pending_snapshot_script(&capture.to_string_lossy(), second_body);
+        let stub = stub.gh_stub(&script);
+        let out = run_forge_cli(
+            &stub,
+            &[
+                "--provider",
+                "github",
+                "--repo",
+                "acme/widgets",
+                "--format",
+                "json",
+                "pr",
+                "pending-review",
+                "inspect",
+                "42",
+                "--review",
+                "PRR_pending",
+            ],
+        );
+
+        assert_eq!(out.code, 0, "stdout={}\nstderr={}", out.stdout, out.stderr);
+        let envelope = parse_envelope(&out.stdout);
+        assert_eq!(
+            envelope["data"]["snapshot"]["inline_comments"]
+                .as_array()
+                .expect("inline comment manifest")
+                .len(),
+            2
+        );
+        digests.push(
+            envelope["data"]["snapshot"]["snapshot_digest"]
+                .as_str()
+                .expect("snapshot digest")
+                .to_string(),
+        );
+        let calls = fs::read_to_string(capture).expect("read gh calls");
+        assert!(calls.contains("after=cursor-1"), "{calls}");
+    }
+
+    assert_ne!(
+        digests[0], digests[1],
+        "changing only a later-page inline comment must change the snapshot digest"
+    );
+}
+
 #[test]
 fn pr_pending_review_inspect_returns_a_complete_receipt_aware_snapshot() {
     let stub = StubEnv::new();

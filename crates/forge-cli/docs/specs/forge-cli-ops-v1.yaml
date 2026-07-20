@@ -356,7 +356,7 @@ operations:
         provider: enum<github|gitlab>
         number: integer
         decision: enum<comments-only|approve|request-changes>
-        submitted_review: bool # true when a native review event was submitted (--submit-review); then pr_comment_url is the #pullrequestreview- URL
+        submitted_review: bool # true only when this invocation submitted a native review event. An exact completed rerun is false but retains the original #pullrequestreview- pr_comment_url
         head_sha?: string # present with --submit-review; the caller-reviewed head bound to preflight and mutation
         pending_review_guard_plan?: list<string> # dry-run only, with --submit-review: pending-only GraphQL preflight argv
         review_state_plan?: list<string> # dry-run only with --thread-file: authenticated provider-state read
