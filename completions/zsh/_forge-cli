@@ -600,7 +600,7 @@ json\:"Single-record JSON envelope (snake_case)"))' \
 ;;
 (observe)
 _arguments "${_arguments_options[@]}" : \
-'--expected-head=[]:SHA:_default' \
+'--expected-head=[Exact provider head SHA whose review observation is being appended]:SHA:_default' \
 '--findings-file=[Delivery-mode review-specialists merge envelope or observation array]:PATH:_default' \
 '--expected-state=[Exact current provider-visible state-chain tip; omit only for genesis]:DIGEST:_default' \
 '--format=[Output format (defaults to text)]:FORMAT:((text\:"Human-readable text output (default)"
@@ -618,7 +618,7 @@ json\:"Single-record JSON envelope (snake_case)"))' \
 ;;
 (extend)
 _arguments "${_arguments_options[@]}" : \
-'--expected-head=[]:SHA:_default' \
+'--expected-head=[Exact provider head SHA whose active hard stop is being extended]:SHA:_default' \
 '--expected-state=[]:DIGEST:_default' \
 '--stop-code=[]:CODE:_default' \
 '--budget-field=[]:FIELD:(max_repair_rounds max_no_progress_rounds max_auto_reopens_per_fingerprint)' \

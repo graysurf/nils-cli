@@ -767,6 +767,7 @@ pub struct PrReviewLoopInspectArgs {
 #[derive(Args, Debug, Clone)]
 pub struct PrReviewLoopObserveArgs {
     pub id: u64,
+    /// Exact provider head SHA whose review observation is being appended.
     #[arg(long = "expected-head", value_name = "SHA", value_parser = clap::builder::NonEmptyStringValueParser::new())]
     pub expected_head: String,
     /// Delivery-mode review-specialists merge envelope or observation array.
@@ -780,6 +781,7 @@ pub struct PrReviewLoopObserveArgs {
 #[derive(Args, Debug, Clone)]
 pub struct PrReviewLoopExtendArgs {
     pub id: u64,
+    /// Exact provider head SHA whose active hard stop is being extended.
     #[arg(long = "expected-head", value_name = "SHA", value_parser = clap::builder::NonEmptyStringValueParser::new())]
     pub expected_head: String,
     #[arg(long = "expected-state", value_name = "DIGEST", value_parser = clap::builder::NonEmptyStringValueParser::new())]
