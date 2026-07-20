@@ -1,8 +1,9 @@
 use std::collections::BTreeSet;
 use std::env;
-use std::ffi::OsString;
+use std::ffi::{CString, OsString};
 use std::fs;
 use std::io::{Read, Write};
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -26,6 +27,19 @@ const SYSTEMCTL: &str = "/usr/bin/systemctl";
 const DEFAULT_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 const CLEANUP_TIMEOUT: Duration = Duration::from_secs(2);
+const INSPECT_CHILD_ARG: &str = "__inspect-child";
+const MOUNTINFO: &str = "/proc/self/mountinfo";
+
+const BPF_LD_W_ABS: u16 = 0x20;
+const BPF_JMP_JEQ_K: u16 = 0x15;
+const BPF_JMP_JSET_K: u16 = 0x45;
+const BPF_RET_K: u16 = 0x06;
+const SECCOMP_DATA_NR_OFFSET: u32 = 0;
+const SECCOMP_DATA_ARCH_OFFSET: u32 = 4;
+const SECCOMP_RET_KILL_PROCESS: u32 = 0x8000_0000;
+const SECCOMP_RET_ERRNO: u32 = 0x0005_0000;
+const SECCOMP_RET_ALLOW: u32 = 0x7fff_0000;
+const X32_SYSCALL_BIT: u32 = 0x4000_0000;
 
 #[derive(Debug)]
 pub(super) struct InspectError {
@@ -98,6 +112,30 @@ pub(super) fn run(cwd: &Path, argv: &[OsString]) -> Result<i32, InspectError> {
     Ok(output.status.code().unwrap_or(EXIT_SOFTWARE))
 }
 
+pub(super) fn run_child(argv: &[OsString]) -> i32 {
+    if argv.is_empty() {
+        eprintln!("agent-run inspect: error[missing-command]: sandbox command is unavailable");
+        return EXIT_SOFTWARE;
+    }
+    if let Err(error) = audit_durable_mounts_read_only() {
+        eprintln!(
+            "agent-run inspect: error[{}]: {}",
+            error.code, error.message
+        );
+        return error.exit_code;
+    }
+    if let Err(error) = install_network_seccomp() {
+        eprintln!(
+            "agent-run inspect: error[{}]: {}",
+            error.code, error.message
+        );
+        return error.exit_code;
+    }
+    let error = Command::new(&argv[0]).args(&argv[1..]).exec();
+    eprintln!("agent-run inspect: error[sandbox-exec-failed]: {error}");
+    EXIT_SOFTWARE
+}
+
 pub(super) fn probe_enforcement(cwd: &Path) -> Result<OsEnforcement, InspectError> {
     let backend = Backend::discover()?;
     let output = backend.execute(cwd, &[OsString::from("/usr/bin/true")], RunLimits::probe())?;
@@ -165,9 +203,16 @@ impl Backend {
         limits: RunLimits,
     ) -> Result<std::process::Output, InspectError> {
         let unit = unique_unit()?;
+        let launcher = fs::canonicalize(env::current_exe().map_err(|error| {
+            InspectError::unavailable("sandbox-launcher-unavailable", error.to_string())
+        })?)
+        .map_err(|error| {
+            InspectError::unavailable("sandbox-launcher-unavailable", error.to_string())
+        })?;
+        let mount_plan = inherited_mount_plan()?;
         let mut command = self.systemd_command(&unit, limits);
         command.arg(&self.bwrap);
-        append_bwrap_args(&mut command, cwd, argv);
+        append_bwrap_args(&mut command, cwd, argv, &launcher, &mount_plan);
         let output = run_bounded(command, limits, || self.stop_unit(&unit))?;
         self.ensure_unit_inactive(&unit)?;
         Ok(output)
@@ -263,7 +308,13 @@ impl Backend {
     }
 }
 
-fn append_bwrap_args(command: &mut Command, cwd: &Path, argv: &[OsString]) {
+fn append_bwrap_args(
+    command: &mut Command,
+    cwd: &Path,
+    argv: &[OsString],
+    launcher: &Path,
+    mount_plan: &MountPlan,
+) {
     command.args([
         "--unshare-all",
         "--unshare-user",
@@ -276,6 +327,18 @@ fn append_bwrap_args(command: &mut Command, cwd: &Path, argv: &[OsString]) {
         "--ro-bind",
         "/",
         "/",
+    ]);
+    for path in &mount_plan.masks {
+        command
+            .arg("--tmpfs")
+            .arg(path)
+            .arg("--remount-ro")
+            .arg(path);
+    }
+    for path in &mount_plan.remounts {
+        command.arg("--remount-ro").arg(path);
+    }
+    command.args([
         "--tmpfs",
         "/run",
         "--proc",
@@ -311,7 +374,360 @@ fn append_bwrap_args(command: &mut Command, cwd: &Path, argv: &[OsString]) {
     ] {
         command.args(["--dir", path, "--chmod", "0700", path]);
     }
-    command.arg("--chdir").arg(cwd).arg("--").args(argv);
+    command
+        .arg("--chdir")
+        .arg(cwd)
+        .arg("--")
+        .arg(launcher)
+        .arg(INSPECT_CHILD_ARG)
+        .args(argv);
+}
+
+#[derive(Debug)]
+struct MountRecord {
+    mount_id: u64,
+    mountpoint: PathBuf,
+    writable: bool,
+}
+
+#[derive(Debug)]
+struct MountPlan {
+    masks: Vec<PathBuf>,
+    remounts: Vec<PathBuf>,
+}
+
+enum MountReachability {
+    Reachable,
+    Mask(PathBuf),
+    Absent,
+}
+
+fn inherited_mount_plan() -> Result<MountPlan, InspectError> {
+    let mut mask_candidates = BTreeSet::new();
+    let mut remount_candidates = BTreeSet::new();
+    for record in parse_mountinfo()?
+        .into_iter()
+        .filter(|record| record.writable && !is_private_mount(&record.mountpoint))
+    {
+        match mount_reachability(&record.mountpoint)? {
+            MountReachability::Reachable => {
+                remount_candidates.insert(record.mountpoint);
+            }
+            MountReachability::Mask(path) => {
+                mask_candidates.insert(path);
+            }
+            MountReachability::Absent => {}
+        }
+    }
+    let masks = mask_candidates
+        .iter()
+        .filter(|candidate| {
+            !mask_candidates
+                .iter()
+                .any(|other| other != *candidate && candidate.starts_with(other))
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    let remounts = remount_candidates
+        .into_iter()
+        .filter(|candidate| !masks.iter().any(|mask| candidate.starts_with(mask)))
+        .collect();
+    Ok(MountPlan { masks, remounts })
+}
+
+fn mount_reachability(path: &Path) -> Result<MountReachability, InspectError> {
+    let mut current = PathBuf::from("/");
+    for component in path.components() {
+        let std::path::Component::Normal(component) = component else {
+            continue;
+        };
+        current.push(component);
+        match fs::metadata(&current) {
+            Ok(metadata) if metadata.is_dir() => match directory_searchable(&current)? {
+                true => {}
+                false => return Ok(MountReachability::Mask(current)),
+            },
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+                return Ok(MountReachability::Mask(current));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(MountReachability::Absent);
+            }
+            Err(error) => {
+                return Err(InspectError::unavailable(
+                    "sandbox-mount-audit-failed",
+                    format!("{}: {error}", current.display()),
+                ));
+            }
+        }
+    }
+    Ok(MountReachability::Reachable)
+}
+
+fn directory_searchable(path: &Path) -> Result<bool, InspectError> {
+    let path = CString::new(path.as_os_str().as_bytes()).map_err(|_| {
+        InspectError::unavailable(
+            "sandbox-mount-audit-failed",
+            "sandbox mountpoint contained an interior NUL",
+        )
+    })?;
+    let result = unsafe { libc::access(path.as_ptr(), libc::X_OK) };
+    if result == 0 {
+        return Ok(true);
+    }
+    let error = std::io::Error::last_os_error();
+    if error.raw_os_error() == Some(libc::EACCES) {
+        Ok(false)
+    } else {
+        Err(InspectError::unavailable(
+            "sandbox-mount-audit-failed",
+            error.to_string(),
+        ))
+    }
+}
+
+fn audit_durable_mounts_read_only() -> Result<(), InspectError> {
+    let mut writable = Vec::new();
+    for record in parse_mountinfo()?
+        .into_iter()
+        .filter(|record| record.writable && !is_private_mount(&record.mountpoint))
+    {
+        if visible_mount_id(&record.mountpoint)? == Some(record.mount_id) {
+            writable.push(record.mountpoint);
+        }
+    }
+    if writable.is_empty() {
+        Ok(())
+    } else {
+        Err(InspectError::unavailable(
+            "sandbox-mount-audit-failed",
+            format!(
+                "{} durable sandbox mounts remained writable: {}",
+                writable.len(),
+                writable
+                    .iter()
+                    .map(|path| path.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        ))
+    }
+}
+
+fn visible_mount_id(path: &Path) -> Result<Option<u64>, InspectError> {
+    let path = CString::new(path.as_os_str().as_bytes()).map_err(|_| {
+        InspectError::unavailable(
+            "sandbox-mount-audit-failed",
+            "sandbox mountpoint contained an interior NUL",
+        )
+    })?;
+    let mut status = std::mem::MaybeUninit::<libc::statx>::zeroed();
+    let result = unsafe {
+        libc::statx(
+            libc::AT_FDCWD,
+            path.as_ptr(),
+            0,
+            libc::STATX_MNT_ID,
+            status.as_mut_ptr(),
+        )
+    };
+    if result == 0 {
+        let status = unsafe { status.assume_init() };
+        if status.stx_mask & libc::STATX_MNT_ID == 0 {
+            return Err(InspectError::unavailable(
+                "sandbox-mount-audit-failed",
+                "statx did not report the visible mount identity",
+            ));
+        }
+        return Ok(Some(status.stx_mnt_id));
+    }
+    let error = std::io::Error::last_os_error();
+    if matches!(
+        error.raw_os_error(),
+        Some(libc::EACCES) | Some(libc::ENOENT) | Some(libc::ENOTDIR)
+    ) {
+        Ok(None)
+    } else {
+        Err(InspectError::unavailable(
+            "sandbox-mount-audit-failed",
+            error.to_string(),
+        ))
+    }
+}
+
+fn parse_mountinfo() -> Result<Vec<MountRecord>, InspectError> {
+    let bytes = fs::read(MOUNTINFO).map_err(|error| {
+        InspectError::unavailable("sandbox-mount-audit-failed", error.to_string())
+    })?;
+    bytes
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !line.is_empty())
+        .map(|line| {
+            let fields = line.split(|byte| *byte == b' ').take(6).collect::<Vec<_>>();
+            if fields.len() != 6 {
+                return Err(InspectError::unavailable(
+                    "sandbox-mount-audit-failed",
+                    "mountinfo contained an incomplete record",
+                ));
+            }
+            let mount_id = std::str::from_utf8(fields[0])
+                .ok()
+                .and_then(|value| value.parse::<u64>().ok())
+                .ok_or_else(|| {
+                    InspectError::unavailable(
+                        "sandbox-mount-audit-failed",
+                        "mountinfo contained an invalid mount identity",
+                    )
+                })?;
+            let mountpoint = decode_mountinfo_field(fields[4])?;
+            if !mountpoint.is_absolute() {
+                return Err(InspectError::unavailable(
+                    "sandbox-mount-audit-failed",
+                    "mountinfo contained a non-absolute mountpoint",
+                ));
+            }
+            let writable = fields[5]
+                .split(|byte| *byte == b',')
+                .any(|option| option == b"rw");
+            Ok(MountRecord {
+                mount_id,
+                mountpoint,
+                writable,
+            })
+        })
+        .collect()
+}
+
+fn decode_mountinfo_field(field: &[u8]) -> Result<PathBuf, InspectError> {
+    let mut decoded = Vec::with_capacity(field.len());
+    let mut index = 0;
+    while index < field.len() {
+        if field[index] == b'\\' {
+            if index + 3 >= field.len()
+                || !field[index + 1..=index + 3]
+                    .iter()
+                    .all(|byte| matches!(byte, b'0'..=b'7'))
+            {
+                return Err(InspectError::unavailable(
+                    "sandbox-mount-audit-failed",
+                    "mountinfo contained an invalid escaped mountpoint",
+                ));
+            }
+            let value = (field[index + 1] - b'0') * 64
+                + (field[index + 2] - b'0') * 8
+                + (field[index + 3] - b'0');
+            decoded.push(value);
+            index += 4;
+        } else {
+            decoded.push(field[index]);
+            index += 1;
+        }
+    }
+    Ok(PathBuf::from(OsString::from_vec(decoded)))
+}
+
+fn is_private_mount(path: &Path) -> bool {
+    [Path::new("/run"), Path::new("/proc"), Path::new("/dev")]
+        .iter()
+        .any(|root| path == *root || path.starts_with(root))
+}
+
+fn install_network_seccomp() -> Result<(), InspectError> {
+    let audit_arch = audit_arch().ok_or_else(|| {
+        InspectError::unavailable(
+            "sandbox-seccomp-unavailable",
+            "the Linux architecture has no inspection seccomp contract",
+        )
+    })?;
+    let mut filter = vec![
+        bpf_stmt(BPF_LD_W_ABS, SECCOMP_DATA_ARCH_OFFSET),
+        bpf_jump(BPF_JMP_JEQ_K, audit_arch, 1, 0),
+        bpf_stmt(BPF_RET_K, SECCOMP_RET_KILL_PROCESS),
+        bpf_stmt(BPF_LD_W_ABS, SECCOMP_DATA_NR_OFFSET),
+    ];
+    if cfg!(target_arch = "x86_64") {
+        filter.extend([
+            bpf_jump(BPF_JMP_JSET_K, X32_SYSCALL_BIT, 0, 1),
+            bpf_stmt(BPF_RET_K, SECCOMP_RET_KILL_PROCESS),
+        ]);
+    }
+    for syscall in [
+        libc::SYS_socket,
+        libc::SYS_socketpair,
+        libc::SYS_io_uring_setup,
+    ] {
+        filter.extend([
+            bpf_jump(BPF_JMP_JEQ_K, syscall as u32, 0, 1),
+            bpf_stmt(BPF_RET_K, SECCOMP_RET_ERRNO | libc::EPERM as u32),
+        ]);
+    }
+    filter.push(bpf_stmt(BPF_RET_K, SECCOMP_RET_ALLOW));
+    let mut program = libc::sock_fprog {
+        len: u16::try_from(filter.len()).map_err(|_| {
+            InspectError::unavailable(
+                "sandbox-seccomp-unavailable",
+                "the inspection seccomp filter is too large",
+            )
+        })?,
+        filter: filter.as_mut_ptr(),
+    };
+    let no_new_privileges = unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) };
+    if no_new_privileges != 0 {
+        return Err(InspectError::unavailable(
+            "sandbox-seccomp-unavailable",
+            std::io::Error::last_os_error().to_string(),
+        ));
+    }
+    let installed = unsafe {
+        libc::syscall(
+            libc::SYS_seccomp,
+            libc::SECCOMP_SET_MODE_FILTER,
+            0,
+            &mut program as *mut libc::sock_fprog,
+        )
+    };
+    if installed == 0 {
+        Ok(())
+    } else {
+        Err(InspectError::unavailable(
+            "sandbox-seccomp-unavailable",
+            std::io::Error::last_os_error().to_string(),
+        ))
+    }
+}
+
+fn bpf_stmt(code: u16, value: u32) -> libc::sock_filter {
+    libc::sock_filter {
+        code,
+        jt: 0,
+        jf: 0,
+        k: value,
+    }
+}
+
+fn bpf_jump(code: u16, value: u32, jt: u8, jf: u8) -> libc::sock_filter {
+    libc::sock_filter {
+        code,
+        jt,
+        jf,
+        k: value,
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+fn audit_arch() -> Option<u32> {
+    Some(0xc000_003e)
+}
+
+#[cfg(target_arch = "aarch64")]
+fn audit_arch() -> Option<u32> {
+    Some(0xc000_00b7)
+}
+
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+fn audit_arch() -> Option<u32> {
+    None
 }
 
 fn trusted_system_executable(path: &str) -> Result<PathBuf, InspectError> {

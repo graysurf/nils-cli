@@ -2,6 +2,7 @@
 
 use std::fs::{self, OpenOptions};
 use std::net::TcpListener;
+use std::os::unix::net::{UnixDatagram, UnixListener};
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -148,6 +149,126 @@ fn inspect_denies_host_network_even_when_a_listener_exists() {
     drop(listener);
     assert_eq!(output.code, 0, "stderr={}", output.stderr_text());
     assert_eq!(output.stdout_text(), "denied");
+}
+
+#[test]
+fn inspect_denies_host_unix_stream_and_datagram_sockets() {
+    let temp = tempfile::TempDir::new().expect("tempdir");
+    let cwd = temp.path().join("repo");
+    fs::create_dir(&cwd).expect("repo");
+    let stream_path = temp.path().join("host-stream.sock");
+    let datagram_path = temp.path().join("host-datagram.sock");
+    let stream = UnixListener::bind(&stream_path).expect("stream listener");
+    let datagram = UnixDatagram::bind(&datagram_path).expect("datagram listener");
+    let cwd_arg = arg(&cwd);
+    let stream_arg = arg(&stream_path);
+    let datagram_arg = arg(&datagram_path);
+    let script = r#"import socket, sys
+escaped = []
+for kind, path in [
+    (socket.SOCK_STREAM, sys.argv[1]),
+    (socket.SOCK_DGRAM, sys.argv[2]),
+]:
+    sock = None
+    try:
+        sock = socket.socket(socket.AF_UNIX, kind)
+        if kind == socket.SOCK_STREAM:
+            sock.connect(path)
+        else:
+            sock.sendto(b"sandbox-write", path)
+    except OSError:
+        pass
+    else:
+        escaped.append(path)
+    finally:
+        if sock is not None:
+            sock.close()
+if escaped:
+    print("escaped:" + ",".join(escaped), end="")
+    sys.exit(31)
+print("denied", end="")
+"#;
+    let output = run(
+        &[
+            "inspect",
+            "--cwd",
+            &cwd_arg,
+            "--",
+            "/usr/bin/python3",
+            "-c",
+            script,
+            &stream_arg,
+            &datagram_arg,
+        ],
+        &CmdOptions::new(),
+    );
+
+    drop(stream);
+    drop(datagram);
+    assert_eq!(output.code, 0, "stderr={}", output.stderr_text());
+    assert_eq!(output.stdout_text(), "denied");
+}
+
+#[test]
+fn inspect_leaves_only_private_mounts_writable() {
+    let temp = tempfile::TempDir::new().expect("tempdir");
+    let cwd_arg = arg(temp.path());
+    let script = r#"import os, sys
+
+def unescape_mount_path(value):
+    return (value.replace(r'\040', ' ')
+                 .replace(r'\011', '\t')
+                 .replace(r'\012', '\n')
+                 .replace(r'\134', '\\'))
+
+def visible_mount_id(path):
+    try:
+        descriptor = os.open(path, os.O_PATH | os.O_CLOEXEC)
+    except (FileNotFoundError, NotADirectoryError, PermissionError):
+        return None
+    try:
+        with open(f'/proc/self/fdinfo/{descriptor}', encoding='utf-8') as fdinfo:
+            for line in fdinfo:
+                if line.startswith('mnt_id:'):
+                    return int(line.split(':', 1)[1])
+    finally:
+        os.close(descriptor)
+    raise RuntimeError('fdinfo omitted mnt_id')
+
+unexpected = []
+with open('/proc/self/mountinfo', encoding='utf-8') as mountinfo:
+    for line in mountinfo:
+        fields = line.split(' - ', 1)[0].split()
+        mount_id = int(fields[0])
+        mountpoint = unescape_mount_path(fields[4])
+        options = fields[5].split(',')
+        private = any(
+            mountpoint == root or mountpoint.startswith(root + '/')
+            for root in ('/run', '/proc', '/dev')
+        )
+        if ('rw' in options and not private
+                and visible_mount_id(mountpoint) == mount_id):
+            unexpected.append(mountpoint)
+if unexpected:
+    print('writable:' + ','.join(unexpected), end='')
+    sys.exit(43)
+print('audited', end='')
+"#;
+    let output = run(
+        &[
+            "inspect",
+            "--cwd",
+            &cwd_arg,
+            "--",
+            "/usr/bin/python3",
+            "-c",
+            script,
+        ],
+        &CmdOptions::new(),
+    );
+
+    assert_eq!(output.code, 0, "stderr={}", output.stderr_text());
+    assert_eq!(output.stdout_text(), "audited");
 }
 
 #[test]

@@ -22,6 +22,7 @@ use crate::completion::{self, CompletionShell};
 
 const DOCTOR_COMMAND: &str = "agent-run doctor";
 const ENV_COMMAND: &str = "agent-run env";
+const INSPECT_CHILD_ARG: &str = "__inspect-child";
 const DOCTOR_SCHEMA_VERSION: &str = "cli.agent-run.doctor.v1";
 const ENV_SCHEMA_VERSION: &str = "cli.agent-run.env.v1";
 
@@ -59,6 +60,10 @@ mod inspect {
     pub(super) fn probe_enforcement(_cwd: &Path) -> Result<OsEnforcement, InspectError> {
         Err(unsupported())
     }
+
+    pub(super) fn run_child(_argv: &[OsString]) -> i32 {
+        EXIT_UNAVAILABLE
+    }
 }
 
 pub fn run() -> i32 {
@@ -71,6 +76,9 @@ where
     T: Into<OsString> + Clone,
 {
     let argv: Vec<OsString> = args.into_iter().map(Into::into).collect();
+    if argv.get(1).is_some_and(|arg| arg == INSPECT_CHILD_ARG) {
+        return inspect::run_child(&argv[2..]);
+    }
     let cli = match Cli::try_parse_from(argv.clone()) {
         Ok(cli) => cli,
         Err(err) => return crate::common::handle_parse_error("agent-run", argv, err),

@@ -114,6 +114,12 @@ fn candidate_from_command(
     }
     let program = words.remove(0);
     let program_path = Path::new(&program);
+    if program_path.components().count() == 1 {
+        return Err(rejected(
+            "read-only-command-unsupported",
+            "operation-effect producer must use an explicit executable path",
+        ));
+    }
     let tool = program_path
         .file_name()
         .and_then(OsStr::to_str)
@@ -125,12 +131,15 @@ fn candidate_from_command(
             )
         })?
         .to_string();
-    let executable = resolve_executable(program_path).ok_or_else(|| {
-        rejected(
-            "read-only-producer-unavailable",
-            "operation-effect producer is unavailable",
-        )
-    })?;
+    let executable = program_path
+        .is_file()
+        .then(|| program_path.to_path_buf())
+        .ok_or_else(|| {
+            rejected(
+                "read-only-producer-unavailable",
+                "operation-effect producer is unavailable",
+            )
+        })?;
     let current_executable = fs::canonicalize(current_executable).map_err(|_| {
         rejected(
             "read-only-producer-untrusted",
@@ -181,17 +190,6 @@ fn candidate_from_command(
         argv: words.into_iter().map(OsString::from).collect(),
         cwd,
     })
-}
-
-fn resolve_executable(program: &Path) -> Option<PathBuf> {
-    if program.components().count() > 1 || program.is_absolute() {
-        return program.is_file().then(|| program.to_path_buf());
-    }
-    std::env::var_os("PATH")
-        .into_iter()
-        .flat_map(|path| std::env::split_paths(&path).collect::<Vec<_>>())
-        .map(|directory| directory.join(program))
-        .find(|candidate| candidate.is_file())
 }
 
 pub(crate) fn verify_output(candidate: &Candidate, output: &Output) -> Result<(), HookError> {
@@ -512,6 +510,7 @@ mod tests {
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
     use std::os::unix::process::ExitStatusExt;
+    use std::path::Path;
     use std::process::{ExitStatus, Output};
 
     use nils_common::execution_effect::{
@@ -653,6 +652,25 @@ mod tests {
                 parse_simple_command(command).expect_err(command).code,
                 "read-only-command-unsupported"
             );
+        }
+    }
+
+    #[test]
+    fn rejects_bare_producer_tokens_that_shells_can_shadow() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        for command in [
+            "agent-docs preflight --intent project-dev",
+            "agent-run inspect --cwd . -- rg TODO",
+            "forge-cli issue view 670",
+        ] {
+            let error = candidate_from_command(
+                command,
+                Path::new("/unavailable/agent-hook"),
+                &[],
+                temp.path(),
+            )
+            .expect_err(command);
+            assert_eq!(error.code, "read-only-command-unsupported", "{command}");
         }
     }
 
