@@ -37,6 +37,14 @@ _arguments "${_arguments_options[@]}" : \
 '*::command -- Command argv to execute. Pass after `--`:_default' \
 && ret=0
 ;;
+(inspect)
+_arguments "${_arguments_options[@]}" : \
+'--cwd=[Working directory visible read-only to the inspection command]:DIR:_files -/' \
+'-h[Print help]' \
+'--help[Print help]' \
+'*::command -- Exact command argv to execute in the enforced sandbox. Pass after `--`:_default' \
+&& ret=0
+;;
 (doctor)
 _arguments "${_arguments_options[@]}" : \
 '--cwd=[Working directory for env discovery]:DIR:_files -/' \
@@ -64,6 +72,15 @@ _arguments "${_arguments_options[@]}" : \
 ':shell -- Shell to generate completion script for:(bash zsh)' \
 && ret=0
 ;;
+(operation-effect)
+_arguments "${_arguments_options[@]}" : \
+'--format=[]:FORMAT:((text\:"Human-readable text output (default)"
+json\:"Single-record JSON envelope (snake_case)"))' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+'*::argv:_default' \
+&& ret=0
+;;
         esac
     ;;
 esac
@@ -73,9 +90,11 @@ esac
 _agent-run_commands() {
     local commands; commands=(
 'exec:Execute a command in the selected project environment' \
+'inspect:Execute a local inspection command in a read-only, network-denied OS sandbox' \
 'doctor:Report project environment readiness' \
 'env:Emit machine-readable project environment status' \
 'completion:Print shell completion script' \
+'operation-effect:' \
     )
     _describe -t commands 'agent-run commands' commands "$@"
 }
@@ -98,6 +117,16 @@ _agent-run__subcmd__env_commands() {
 _agent-run__subcmd__exec_commands() {
     local commands; commands=()
     _describe -t commands 'agent-run exec commands' commands "$@"
+}
+(( $+functions[_agent-run__subcmd__inspect_commands] )) ||
+_agent-run__subcmd__inspect_commands() {
+    local commands; commands=()
+    _describe -t commands 'agent-run inspect commands' commands "$@"
+}
+(( $+functions[_agent-run__subcmd__operation-effect_commands] )) ||
+_agent-run__subcmd__operation-effect_commands() {
+    local commands; commands=()
+    _describe -t commands 'agent-run operation-effect commands' commands "$@"
 }
 
 if [ "$funcstack[1]" = "_agent-run" ]; then

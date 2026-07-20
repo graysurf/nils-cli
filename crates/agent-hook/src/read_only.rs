@@ -662,7 +662,12 @@ mod tests {
 
         assert_eq!(
             candidate.descriptor_command().get_current_dir(),
-            Some(temp.path())
+            Some(
+                temp.path()
+                    .canonicalize()
+                    .expect("canonical tempdir")
+                    .as_path()
+            )
         );
     }
 

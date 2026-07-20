@@ -28,6 +28,12 @@ _agent-run() {
             agent__run,exec)
                 cmd="agent__run__exec"
                 ;;
+            agent__run,inspect)
+                cmd="agent__run__inspect"
+                ;;
+            agent__run,operation-effect)
+                cmd="agent__run__operation__effect"
+                ;;
             *)
                 ;;
         esac
@@ -35,7 +41,7 @@ _agent-run() {
 
     case "${cmd}" in
         agent__run)
-            opts="-h -V --help --version exec doctor env completion"
+            opts="-h -V --help --version exec inspect doctor env completion operation-effect"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 1 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -136,6 +142,45 @@ _agent-run() {
                     ;;
                 --direnv)
                     COMPREPLY=($(compgen -W "auto require off" -- "${cur}"))
+                    return 0
+                    ;;
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        agent__run__inspect)
+            opts="-h --cwd --help"
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                --cwd)
+                    COMPREPLY=()
+                    if [[ "${BASH_VERSINFO[0]}" -ge 4 ]]; then
+                        compopt -o plusdirs
+                    fi
+                    return 0
+                    ;;
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        agent__run__operation__effect)
+            opts="-h --format --help"
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                --format)
+                    COMPREPLY=($(compgen -W "text json" -- "${cur}"))
                     return 0
                     ;;
                 *)
