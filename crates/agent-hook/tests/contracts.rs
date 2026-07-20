@@ -1,7 +1,8 @@
 mod support;
 
+use std::ffi::OsStr;
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::{ffi::OsStrExt, fs::PermissionsExt};
 
 use pretty_assertions::assert_eq;
 use serde_json::json;
@@ -197,6 +198,101 @@ fn forged_payload_conflict_is_ignored_but_registry_conflict_blocks() {
             expected_action,
             "current={current_mode} peer={peer_mode}"
         );
+
+        if matches!(current_mode, "advisory" | "off") {
+            let missing = dispatch_managed_without_hint(&fixture, &payload);
+            assert_eq!(
+                missing.code, expected_code,
+                "a truly missing hint must preserve durable mode current={current_mode}"
+            );
+            assert_eq!(
+                missing.stdout_json()["data"]["action"],
+                expected_action,
+                "missing hint current={current_mode}"
+            );
+
+            for invalid_hint in ["unsupported", "advisory "] {
+                let invalid = dispatch_managed(&fixture, &payload, invalid_hint);
+                assert_eq!(
+                    invalid.code, 1,
+                    "present invalid Unicode hint must fail closed current={current_mode} hint={invalid_hint:?}"
+                );
+                assert_eq!(
+                    invalid.stdout_json()["data"]["action"],
+                    "block",
+                    "present invalid Unicode hint current={current_mode} hint={invalid_hint:?}"
+                );
+            }
+
+            let invalid = dispatch_managed_with_non_unicode_hint(&fixture, &payload);
+            assert_eq!(
+                invalid.code, 1,
+                "present non-Unicode hint must fail closed current={current_mode}"
+            );
+            assert_eq!(
+                invalid.stdout_json()["data"]["action"],
+                "block",
+                "present non-Unicode hint current={current_mode}"
+            );
+        }
+    }
+}
+
+#[test]
+fn invalid_runtime_mode_hint_never_tolerates_coordination_store_failure() {
+    let fixture = Fixture::new(POLICY);
+    let coordination = fixture.session_state.join("coordination");
+    fs::create_dir_all(&coordination).expect("coordination directory");
+    let registry = coordination.join("registry.json");
+    fs::write(&registry, b"{").expect("malformed registry");
+    Fixture::set_private(&registry);
+    let payload = json!({
+        "hook_event_name": "PreToolUse",
+        "tool_name": "Write",
+        "cwd": fixture.root,
+        "tool_input": {"path": fixture.root.join("target.txt")}
+    })
+    .to_string();
+
+    for (mode, expected_action) in [("advisory", "warn"), ("off", "allow")] {
+        write_session_record(&fixture, "current", "inc-current", mode);
+
+        for trusted in [
+            dispatch_managed_without_hint(&fixture, &payload),
+            dispatch_managed(&fixture, &payload, mode),
+        ] {
+            assert_eq!(
+                trusted.code, 0,
+                "missing and exact hints must preserve trusted durable mode={mode}"
+            );
+            assert_eq!(
+                trusted.stdout_json()["data"]["action"],
+                expected_action,
+                "trusted durable mode={mode}"
+            );
+        }
+
+        for invalid_hint in ["unsupported", "off\n"] {
+            let invalid = dispatch_managed(&fixture, &payload, invalid_hint);
+            assert_eq!(
+                invalid.code, 65,
+                "invalid Unicode hint must not tolerate malformed coordination state mode={mode} hint={invalid_hint:?}"
+            );
+            assert_eq!(
+                invalid.stdout_json()["error"]["code"],
+                "coordination-invalid"
+            );
+        }
+
+        let invalid = dispatch_managed_with_non_unicode_hint(&fixture, &payload);
+        assert_eq!(
+            invalid.code, 65,
+            "non-Unicode hint must not tolerate malformed coordination state mode={mode}"
+        );
+        assert_eq!(
+            invalid.stdout_json()["error"]["code"],
+            "coordination-invalid"
+        );
     }
 }
 
@@ -205,7 +301,37 @@ fn dispatch_managed(
     payload: &str,
     mode: &str,
 ) -> nils_test_support::cmd::CmdOutput {
-    let options = nils_test_support::cmd::CmdOptions::new()
+    run_managed(
+        payload,
+        managed_options(fixture).with_env("AGENT_SESSION_COORDINATION_MODE", mode),
+    )
+}
+
+fn dispatch_managed_without_hint(
+    fixture: &Fixture,
+    payload: &str,
+) -> nils_test_support::cmd::CmdOutput {
+    run_managed(
+        payload,
+        managed_options(fixture).with_env_remove("AGENT_SESSION_COORDINATION_MODE"),
+    )
+}
+
+fn dispatch_managed_with_non_unicode_hint(
+    fixture: &Fixture,
+    payload: &str,
+) -> nils_test_support::cmd::CmdOutput {
+    run_managed(
+        payload,
+        managed_options(fixture).with_env_os(
+            OsStr::new("AGENT_SESSION_COORDINATION_MODE"),
+            OsStr::from_bytes(b"advisory\xff"),
+        ),
+    )
+}
+
+fn managed_options(fixture: &Fixture) -> nils_test_support::cmd::CmdOptions {
+    nils_test_support::cmd::CmdOptions::new()
         .with_cwd(&fixture.root)
         .with_env("HOME", fixture.home.to_str().expect("home"))
         .with_env(
@@ -222,8 +348,13 @@ fn dispatch_managed(
         )
         .with_env("AGENT_SESSION_ID", "current")
         .with_env("AGENT_SESSION_RUNTIME_ID", "inc-current")
-        .with_env("AGENT_SESSION_COORDINATION_MODE", mode)
-        .with_stdin_str(payload);
+}
+
+fn run_managed(
+    payload: &str,
+    options: nils_test_support::cmd::CmdOptions,
+) -> nils_test_support::cmd::CmdOutput {
+    let options = options.with_stdin_str(payload);
     nils_test_support::cmd::run_resolved(
         "agent-hook",
         &["dispatch", "--product", "codex", "--format", "json"],

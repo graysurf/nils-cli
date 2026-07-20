@@ -62,15 +62,22 @@ pub fn load_snapshot() -> Result<Option<Snapshot>, HookError> {
         })
 }
 
-fn runtime_mode_hint() -> Option<CoordinationMode> {
-    match std::env::var("AGENT_SESSION_COORDINATION_MODE")
-        .ok()?
-        .as_str()
-    {
-        "advisory" => Some(CoordinationMode::Advisory),
-        "enforce" => Some(CoordinationMode::Enforce),
-        "off" => Some(CoordinationMode::Off),
-        _ => None,
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RuntimeModeHint {
+    Missing,
+    Valid(CoordinationMode),
+    Invalid,
+}
+
+fn runtime_mode_hint() -> RuntimeModeHint {
+    let Some(value) = std::env::var_os("AGENT_SESSION_COORDINATION_MODE") else {
+        return RuntimeModeHint::Missing;
+    };
+    match value.to_str() {
+        Some("advisory") => RuntimeModeHint::Valid(CoordinationMode::Advisory),
+        Some("enforce") => RuntimeModeHint::Valid(CoordinationMode::Enforce),
+        Some("off") => RuntimeModeHint::Valid(CoordinationMode::Off),
+        Some(_) | None => RuntimeModeHint::Invalid,
     }
 }
 
@@ -397,10 +404,13 @@ fn trusted_runtime_mode(
     let mode =
         coordination_projection::session_coordination_mode(state_root, &session_id, &incarnation)
             .ok()?;
-    if broker.is_some_and(|broker| broker.coordination_mode != mode)
-        || runtime_mode_hint().is_some_and(|hint| hint != mode)
-    {
+    if broker.is_some_and(|broker| broker.coordination_mode != mode) {
         return None;
+    }
+    match runtime_mode_hint() {
+        RuntimeModeHint::Missing => {}
+        RuntimeModeHint::Valid(hint) if hint == mode => {}
+        RuntimeModeHint::Valid(_) | RuntimeModeHint::Invalid => return None,
     }
     Some(mode)
 }
