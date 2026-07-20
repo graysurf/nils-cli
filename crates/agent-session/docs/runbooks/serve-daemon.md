@@ -81,10 +81,13 @@ The required field is `agent`. Fresh creation may also use `cwd`, `title`,
 `coordination_mode` accepts `advisory`, `enforce`, or `off` and defaults to
 `advisory`.
 
-Provider import uses `provider_resume_id` (compatibility alias: `resume_id`)
-with an advertised profile that supports import. In import mode, omit `cwd`,
-`prompt`, `agent_args`, and `codex_account`; the daemon resolves the original
-working directory and exact provider metadata from the selected local profile.
+Provider import uses `provider_resume_id` (compatibility alias: `resume_id`).
+When `agent_profile` is omitted, discovery uses the daemon's default provider
+history. When a profile is selected, it must advertise import support and
+discovery is confined to that profile's provider root. In either import mode,
+omit `cwd`, `prompt`, `agent_args`, and `codex_account`; the daemon resolves the
+original working directory and exact provider metadata from the selected
+history source.
 
 The server owns executable paths, provider configuration roots, readiness
 commands, and auto-resume capability. Clients select only advertised safe IDs

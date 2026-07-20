@@ -4,7 +4,43 @@ This specification owns the current HTTP and WebSocket surface exposed by
 `agent-session serve`. The crate README is a non-normative product entrypoint;
 the operations runbook owns deployment procedure.
 
-## Endpoints
+## Route ownership
+
+This index covers every route literal registered by the daemon. Braced
+comma-separated route segments below are exact alternatives, not wildcards.
+`Bearer + capability` means the server bearer plus
+`X-Agent-Session-Capability`.
+
+| Method and path | Authentication | Canonical contract |
+| --- | --- | --- |
+| `GET /healthz` | Open | This specification |
+| `GET /sessions` | Open | This specification |
+| `POST /sessions` | Bearer | This specification |
+| `GET /codex/accounts` | Bearer | This specification |
+| `GET /activity/events` | Bearer | [Activity stream v1](activity-stream-v1.md) |
+| `GET /usage` | Open | This specification |
+| `GET /workdirs` | Bearer | This specification |
+| `GET /repos/remote-url` | Bearer | This specification |
+| `GET /sessions/{id}/glance` | Open | This specification |
+| `GET /sessions/{id}/work-context/v1` | Bearer | [Coordination HTTP coverage](session-coordination-v1.md#http-coverage) |
+| `POST /sessions/{id}/work-context/check/v1` and `POST /coordination/work-context/check/v1` | Bearer; session capability optional where supported | [Coordination HTTP coverage](session-coordination-v1.md#http-coverage) |
+| `POST /sessions/{id}/work-context/{claim,renew,release,admit,complete,reconcile}/v1` | Bearer + capability | [Coordination HTTP coverage](session-coordination-v1.md#http-coverage) |
+| `GET /sessions/{id}/broker/v1` and `POST /sessions/{id}/broker/{adopt,reconcile}/v1` | Bearer; recovery proof is in the request body | [Coordination HTTP coverage](session-coordination-v1.md#http-coverage) |
+| `GET and POST /sessions/{id}/messages/v1` | Bearer + capability | [Coordination HTTP coverage](session-coordination-v1.md#http-coverage) |
+| `GET /sessions/{id}/messages/{message_id}/v1` | Bearer + capability | [Coordination HTTP coverage](session-coordination-v1.md#http-coverage) |
+| `POST /sessions/{id}/messages/{message_id}/{ack,reply}/v1` | Bearer + capability | [Coordination HTTP coverage](session-coordination-v1.md#http-coverage) |
+| `GET /sessions/{id}/messages/{message_id}/wait/v1` | Bearer + capability | [Coordination HTTP coverage](session-coordination-v1.md#http-coverage) |
+| `GET /sessions/{id}/buffer` | Open | This specification |
+| `POST /sessions/{id}/{send,prompt,prompt/v2,resume}` | Bearer | This specification |
+| `GET /sessions/{id}/maintenance` and `POST /sessions/{id}/maintenance/actions` | Bearer | [Session maintenance v1](session-maintenance-v1.md#authentication-and-endpoints) |
+| `PUT /sessions/{id}/account` | Bearer | This specification |
+| `GET /sessions/{id}/auto-resume` | Open | This specification |
+| `PUT and DELETE /sessions/{id}/auto-resume` | Bearer | This specification |
+| `POST /sessions/{id}/attachments` | Bearer | This specification |
+| `GET /sessions/{id}/attach` | Bearer | This specification |
+| `PATCH and DELETE /sessions/{id}` | Bearer | This specification |
+
+## Endpoint contracts
 
 `agent-session serve` exposes the session control plane over loopback HTTP for a per-machine edge (e.g. the agent-console
 web console). It builds its own tokio runtime and reuses the synchronous lifecycle functions via `spawn_blocking`, so there
@@ -76,6 +112,10 @@ is no second state model.
   `subscription_inactive`, `organization_disabled`, `permission_denied`,
   `rate_limited`, `service_unavailable`, `timeout`, or `unknown`) copied only
   from the helpers' allowlisted structured field.
+- `GET /repos/remote-url?cwd=...` — authenticated repository lookup. `cwd` is
+  required. The ordinary serve envelope returns `data.url` as a normalized
+  HTTPS GitHub or GitLab repository URL, or `null` when the directory has no
+  supported remote.
 - `GET /sessions/{id}/buffer` — open on loopback. Returns the tmux server's
   latest global clipboard buffer after using `id` only to verify that the
   requested session exists. The buffer is not scoped to that session.
@@ -189,10 +229,11 @@ is no second state model.
   `provider_resume` metadata, and starts tmux with the canonical resume command. In resume-id mode, omit `cwd`, `prompt`,
   and `agent_args`; invalid, missing, ambiguous, or unsupported provider ids return structured errors.
   For a fresh serve-managed Codex session, `agent-session` probes bounded
-  `codex --version` and `codex app-server --help` process groups. The audited
-  versions are exactly Codex `0.144.1` and `0.144.3`, and help must advertise
-  Unix `--listen` support. A
-  matching CLI is launched as a remote TUI over a private short socket below an
+  `codex --version` and `codex app-server --help` process groups. App-server
+  transport requires Codex `>= 0.144.1` and advertised Unix `--listen` support.
+  Exact protocol-attention authority is audited only for Codex `0.144.1` and
+  `0.144.3`; newer transport-compatible versions fall back to hook authority.
+  An eligible CLI is launched as a remote TUI over a private short socket below an
   owned, non-symlinked mode-`0700` `XDG_RUNTIME_DIR`; otherwise auto mode
   degrades to the existing raw TUI. `AGENT_SESSION_CODEX_RUNTIME=raw` forces
   the fallback and `AGENT_SESSION_CODEX_RUNTIME=app-server` requires both the
