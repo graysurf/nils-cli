@@ -168,18 +168,16 @@ pub fn classify(
             None,
         );
     }
-    if matches!(request.semantic_conflict, Some(SemanticConflict::Potential)) {
-        return result(
-            LivenessClass::Unknown,
-            "potential",
-            DecisionAction::Warn,
-            "semantic-conflict-potential",
-            None,
-        );
-    }
-    if request.target_paths.is_empty() {
-        return unknown("owner-target-unavailable");
-    }
+    let potential =
+        matches!(request.semantic_conflict, Some(SemanticConflict::Potential)).then(|| {
+            result(
+                LivenessClass::Unknown,
+                "potential",
+                DecisionAction::Warn,
+                "semantic-conflict-potential",
+                None,
+            )
+        });
 
     let mut paths = request
         .target_paths
@@ -190,7 +188,7 @@ pub fn classify(
         paths.push(execution);
     }
     let mut classified_roots = Vec::new();
-    let outcomes = paths.into_iter().filter_map(|path| {
+    let path_outcomes = paths.into_iter().filter_map(|path| {
         let root = target_binding_root(path);
         if classified_roots.contains(&root) {
             return None;
@@ -201,7 +199,8 @@ pub fn classify(
             None => legacy_classify(path, legacy_ttl_seconds),
         })
     });
-    strongest_outcome(outcomes).unwrap_or_else(|| unknown("owner-target-unavailable"))
+    strongest_outcome(potential.into_iter().chain(path_outcomes))
+        .unwrap_or_else(|| unknown("owner-target-unavailable"))
 }
 
 fn strongest_outcome(outcomes: impl Iterator<Item = OwnerLiveness>) -> Option<OwnerLiveness> {

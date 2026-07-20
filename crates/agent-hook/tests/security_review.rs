@@ -534,7 +534,7 @@ capability = { id = "decision.transform.v1", reason_code = "three", replacement 
 
 #[test]
 fn explicit_mutation_target_cannot_be_masked_by_the_execution_checkout() {
-    let (fixture, checkout_a, checkout_b) = foreign_owner_fixture();
+    let (fixture, checkout_a, checkout_b) = same_repository_foreign_owner_fixture();
     assert_foreign_target_blocks(
         &fixture,
         &checkout_a,
@@ -545,7 +545,7 @@ fn explicit_mutation_target_cannot_be_masked_by_the_execution_checkout() {
 
 #[test]
 fn notebook_edit_uses_notebook_path_for_owner_liveness() {
-    let (fixture, checkout_a, checkout_b) = foreign_owner_fixture();
+    let (fixture, checkout_a, checkout_b) = same_repository_foreign_owner_fixture();
     assert_foreign_target_blocks(
         &fixture,
         &checkout_a,
@@ -556,8 +556,13 @@ fn notebook_edit_uses_notebook_path_for_owner_liveness() {
 
 #[test]
 fn apply_patch_checks_single_and_every_multi_file_target() {
-    let (fixture, checkout_a, checkout_b) = foreign_owner_fixture();
+    let (fixture, checkout_a, checkout_b) = same_repository_foreign_owner_fixture();
     for patch in [
+        format!(
+            "*** Begin Patch\n*** Update File: {}\n@@\n-old\n+new\n*** Update File: {}\n@@\n-old\n+new\n*** End Patch",
+            checkout_a.join("self.txt").display(),
+            checkout_b.join("foreign.txt").display()
+        ),
         format!(
             "*** Begin Patch\n*** Update File: {}\n@@\n-old\n+new\n*** End Patch",
             checkout_b.join("foreign.txt").display()
@@ -575,11 +580,6 @@ fn apply_patch_checks_single_and_every_multi_file_target() {
             checkout_a.join("self.txt").display(),
             checkout_b.join("foreign-move.txt").display()
         ),
-        format!(
-            "*** Begin Patch\n*** Update File: {}\n@@\n-old\n+new\n*** Update File: {}\n@@\n-old\n+new\n*** End Patch",
-            checkout_a.join("self.txt").display(),
-            checkout_b.join("foreign.txt").display()
-        ),
     ] {
         assert_foreign_target_blocks(&fixture, &checkout_a, "apply_patch", json!({"patch":patch}));
     }
@@ -587,7 +587,7 @@ fn apply_patch_checks_single_and_every_multi_file_target() {
 
 #[test]
 fn incomplete_apply_patch_target_mapping_fails_closed() {
-    let (fixture, checkout_a, _) = foreign_owner_fixture();
+    let (fixture, checkout_a, _) = same_repository_foreign_owner_fixture();
     let payload = json!({
         "hook_event_name":"PreToolUse",
         "tool_name":"apply_patch",
@@ -607,7 +607,7 @@ fn incomplete_apply_patch_target_mapping_fails_closed() {
     );
 }
 
-fn foreign_owner_fixture() -> (Fixture, std::path::PathBuf, std::path::PathBuf) {
+fn same_repository_foreign_owner_fixture() -> (Fixture, std::path::PathBuf, std::path::PathBuf) {
     let fixture = Fixture::new(&owner_policy());
     let checkout_a = fixture.root.join("checkout-a");
     let checkout_b = fixture.root.join("checkout-b");
@@ -630,8 +630,8 @@ fn foreign_owner_fixture() -> (Fixture, std::path::PathBuf, std::path::PathBuf) 
             "peer": {"session_id":"peer","incarnation":"inc-peer","state":"ready","heartbeat_epoch":now}
         }),
         json!([
-            {"schema_version":"agent-session.work-context.v1","session_id":"current","session_incarnation":"inc-current","state":"active","worktrees":[fingerprint(key,1,&checkout_a)],"repositories":["owner/a"],"provider_refs":[],"scopes":[],"expires_at_epoch":now+300},
-            {"schema_version":"agent-session.work-context.v1","session_id":"peer","session_incarnation":"inc-peer","state":"active","worktrees":[fingerprint(key,1,&checkout_b)],"repositories":["owner/b"],"provider_refs":[],"scopes":[],"expires_at_epoch":now+300}
+            {"schema_version":"agent-session.work-context.v1","session_id":"current","session_incarnation":"inc-current","state":"active","worktrees":[fingerprint(key,1,&checkout_a)],"repositories":["owner/repo"],"provider_refs":[],"scopes":[],"expires_at_epoch":now+300},
+            {"schema_version":"agent-session.work-context.v1","session_id":"peer","session_incarnation":"inc-peer","state":"active","worktrees":[fingerprint(key,1,&checkout_b)],"repositories":["owner/repo"],"provider_refs":[],"scopes":[],"expires_at_epoch":now+300}
         ]),
     );
     for (session, incarnation) in [("current", "inc-current"), ("peer", "inc-peer")] {
