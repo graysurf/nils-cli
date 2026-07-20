@@ -25,7 +25,6 @@ const DEFAULT_EXPIRY_SECS: i64 = 24 * 60 * 60;
 const MAX_EXPIRY_SECS: i64 = 7 * 24 * 60 * 60;
 const MAX_SESSION_MESSAGES: usize = 256;
 const MAX_SESSION_BYTES: usize = 4 * 1024 * 1024;
-const MAX_REGISTRY_BYTES: usize = 64 * 1024 * 1024;
 const PAIR_RATE_PER_MINUTE: usize = 30;
 const PAIR_BURST: usize = 10;
 const CURSOR_TTL_SECS: i64 = 60 * 60;
@@ -729,7 +728,7 @@ fn send_authenticated(
         .sum();
     if live_for_recipient.len() >= MAX_SESSION_MESSAGES
         || recipient_bytes.saturating_add(body.len()) > MAX_SESSION_BYTES
-        || registry_bytes.saturating_add(body.len()) > MAX_REGISTRY_BYTES
+        || registry_bytes.saturating_add(body.len()) > super::MAX_REGISTRY_BYTES as usize
     {
         return Err(CliError::data(
             "quota-exceeded",
