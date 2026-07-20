@@ -27,6 +27,8 @@ const HANDLER_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_EXECUTABLE_CAPABILITIES: usize = 16;
 const MAX_DISPATCH_CHILD_OUTPUT: usize = 512 * 1024;
 const DISPATCH_CHILD_DEADLINE: Duration = Duration::from_secs(2);
+const SESSION_COORDINATION_HANDLER: &str = "session-coordination-guard.py";
+const SESSION_COORDINATION_TIMEOUT: Duration = Duration::from_secs(55);
 
 #[derive(Debug)]
 struct RuleOutcome {
@@ -55,6 +57,7 @@ struct PreparedRule<'a> {
 pub struct PreparedEvaluation<'a> {
     rules: Vec<PreparedRule<'a>>,
     needs_coordination: bool,
+    session_coordination: Option<&'a crate::model::PolicyRule>,
 }
 
 impl PreparedEvaluation<'_> {
@@ -147,10 +150,29 @@ pub fn prepare<'a>(
             (mode != RuleMode::Disabled).then(|| PreparedRule {
                 rule,
                 mode,
-                recovery: recovery_rules.contains(&rule.id),
+                recovery: recovery_rules.contains(&rule.id)
+                    && !matches!(rule.capability, Capability::SessionCoordination { .. }),
             })
         })
         .collect::<Vec<_>>();
+
+    let mut session_coordination = rules
+        .iter()
+        .filter(|prepared| prepared.mode == RuleMode::Enforce)
+        .filter(|prepared| {
+            matches!(
+                prepared.rule.capability,
+                Capability::SessionCoordination { .. }
+            )
+        })
+        .map(|prepared| prepared.rule);
+    let session_coordination_rule = session_coordination.next();
+    if session_coordination.next().is_some() {
+        return Err(HookError::data(
+            "coordination-capability-ambiguous",
+            "one dispatch may select at most one session coordination rule",
+        ));
+    }
 
     let executable_count = rules
         .iter()
@@ -192,6 +214,7 @@ pub fn prepare<'a>(
     Ok(PreparedEvaluation {
         rules,
         needs_coordination,
+        session_coordination: session_coordination_rule,
     })
 }
 
@@ -264,6 +287,9 @@ fn evaluate_with_io(
             ));
             continue;
         }
+        if matches!(rule.capability, Capability::SessionCoordination { .. }) {
+            continue;
+        }
         let outcome = match evaluate_capability(
             &rule.capability,
             request,
@@ -278,7 +304,8 @@ fn evaluate_with_io(
         enforced.push((rule.id.clone(), outcome));
     }
 
-    aggregate(loaded, request, enforced, shadow, recovery_applied)
+    let decision = aggregate(loaded, request, enforced, shadow, recovery_applied)?;
+    apply_session_coordination(decision, request, raw, prepared.session_coordination)
 }
 
 fn evaluate_shadow(capability: &Capability) -> RuleOutcome {
@@ -290,7 +317,9 @@ fn evaluate_shadow(capability: &Capability) -> RuleOutcome {
         Capability::Transform { reason_code, .. } => simple(DecisionAction::Transform, reason_code),
         Capability::SemanticConflict { reason_code } => simple(DecisionAction::Warn, reason_code),
         Capability::OwnerLiveness { reason_code, .. } => simple(DecisionAction::Warn, reason_code),
-        Capability::SessionActivity { .. } | Capability::RuntimeKitHandler { .. } => {
+        Capability::SessionActivity { .. }
+        | Capability::SessionCoordination { .. }
+        | Capability::RuntimeKitHandler { .. } => {
             simple(DecisionAction::Allow, "shadow-side-effect-skipped")
         }
     }
@@ -366,10 +395,87 @@ fn evaluate_capability(
             run_session_activity(request, raw, execution_budget)?;
             simple(DecisionAction::Allow, reason_code)
         }
+        Capability::SessionCoordination { .. } => {
+            unreachable!("session coordination is evaluated after aggregate policy")
+        }
         Capability::RuntimeKitHandler { handler_id } => {
             run_runtime_handler(request.product, handler_id, raw, execution_budget)?
         }
     })
+}
+
+pub fn apply_session_coordination(
+    mut decision: NormalizedDecision,
+    request: &NormalizedRequest,
+    raw: &[u8],
+    rule: Option<&crate::model::PolicyRule>,
+) -> Result<NormalizedDecision, HookError> {
+    let Some(rule) = rule else {
+        return Ok(decision);
+    };
+    if decision.action == DecisionAction::Block
+        && !matches!(
+            request.event.as_str(),
+            "PostToolUse" | "PostToolUseFailure" | "Stop"
+        )
+    {
+        return Ok(decision);
+    }
+    let Capability::SessionCoordination { reason_code } = &rule.capability else {
+        unreachable!("prepared coordination rule has the typed capability")
+    };
+    let outcome = match run_session_coordination(request.product, raw) {
+        Ok(mut outcome) => {
+            if outcome.code == SESSION_COORDINATION_HANDLER {
+                outcome.code.clone_from(reason_code);
+            }
+            outcome
+        }
+        Err(_) => failure_outcome(rule.failure_posture, &rule.id),
+    };
+    merge_coordination_outcome(&mut decision, &rule.id, outcome)?;
+    Ok(decision)
+}
+
+fn merge_coordination_outcome(
+    decision: &mut NormalizedDecision,
+    rule_id: &str,
+    outcome: RuleOutcome,
+) -> Result<(), HookError> {
+    if decision.reasons.len() >= MAX_REASONS {
+        return Err(HookError::data(
+            "decision-reason-limit",
+            "aggregate decision exceeds the reason limit",
+        ));
+    }
+    if let Some(context) = outcome.context {
+        let joined = match decision.context.take() {
+            Some(existing) => format!("{existing}\n{context}"),
+            None => context,
+        };
+        if joined.len() > MAX_AGGREGATE_CONTEXT {
+            return Err(HookError::data(
+                "decision-context-too-large",
+                "aggregate decision context exceeds 16 KiB",
+            ));
+        }
+        decision.context = Some(joined);
+    }
+    if rank(outcome.action) > rank(decision.action) {
+        decision.action = outcome.action;
+        decision.provider_output = outcome.provider_output;
+    } else if rank(outcome.action) == rank(decision.action)
+        && decision.provider_output.is_none()
+        && outcome.provider_output.is_some()
+    {
+        decision.provider_output = outcome.provider_output;
+    }
+    decision.reasons.push(DecisionReason {
+        rule_id: rule_id.to_string(),
+        code: outcome.code,
+        disposition: disposition(outcome.action).to_string(),
+    });
+    Ok(())
 }
 
 fn failure_outcome(posture: FailurePosture, rule_id: &str) -> RuleOutcome {
@@ -576,10 +682,45 @@ fn run_runtime_handler(
             "runtime-kit handler returned failure",
         ));
     }
-    if output.stdout.is_empty() {
+    handler_outcome(handler_id, &output.stdout)
+}
+
+fn run_session_coordination(product: Product, raw: &[u8]) -> Result<RuleOutcome, HookError> {
+    let path = runtime_hook_root(product)?.join(SESSION_COORDINATION_HANDLER);
+    validate_handler(&path)?;
+    let mut command = Command::new(&path);
+    command
+        .env("AGENT_RUNTIME_PRODUCT", product.as_str())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    let output = run_bounded(
+        command,
+        raw,
+        SESSION_COORDINATION_TIMEOUT,
+        MAX_HANDLER_OUTPUT,
+        false,
+    )?;
+    if output.stdout.len() > MAX_HANDLER_OUTPUT {
+        return Err(HookError::data(
+            "handler-output-too-large",
+            "session coordination handler output exceeds 256 KiB",
+        ));
+    }
+    if !output.status.success() {
+        return Err(HookError::runtime(
+            "handler-failed",
+            "session coordination handler returned failure",
+        ));
+    }
+    handler_outcome(SESSION_COORDINATION_HANDLER, &output.stdout)
+}
+
+fn handler_outcome(handler_id: &str, stdout: &[u8]) -> Result<RuleOutcome, HookError> {
+    if stdout.is_empty() {
         return Ok(simple(DecisionAction::Allow, handler_id));
     }
-    let value: Value = serde_json::from_slice(&output.stdout).map_err(|_| {
+    let value: Value = serde_json::from_slice(stdout).map_err(|_| {
         HookError::data(
             "handler-output-invalid",
             "runtime-kit handler output is not JSON",

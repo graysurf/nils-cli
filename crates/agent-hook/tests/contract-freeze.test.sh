@@ -14,6 +14,7 @@ for capability in \
   agent-session.activity.v1 \
   agent-session.owner-liveness.v1 \
   agent-session.semantic-conflict.v1 \
+  agent-session.coordination.v1 \
   runtime-kit.handler.v1; do
   grep -Fq "\`$capability\`" "$spec"
 done

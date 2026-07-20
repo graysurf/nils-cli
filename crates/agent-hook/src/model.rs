@@ -180,6 +180,8 @@ pub enum Capability {
     },
     #[serde(rename = "agent-session.semantic-conflict.v1")]
     SemanticConflict { reason_code: String },
+    #[serde(rename = "agent-session.coordination.v1")]
+    SessionCoordination { reason_code: String },
     #[serde(rename = "runtime-kit.handler.v1")]
     RuntimeKitHandler { handler_id: String },
 }
@@ -282,6 +284,7 @@ pub struct LoadedPolicy {
 #[serde(rename_all = "snake_case")]
 pub enum SetupAction {
     DryRun,
+    RemoveDryRun,
     Apply,
     Repair,
     Remove,
@@ -291,9 +294,18 @@ impl SetupAction {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::DryRun => "dry-run",
+            Self::RemoveDryRun => "remove-dry-run",
             Self::Apply => "apply",
             Self::Repair => "repair",
             Self::Remove => "remove",
         }
+    }
+
+    pub(crate) fn is_preview(self) -> bool {
+        matches!(self, Self::DryRun | Self::RemoveDryRun)
+    }
+
+    pub(crate) fn is_remove(self) -> bool {
+        matches!(self, Self::Remove | Self::RemoveDryRun)
     }
 }

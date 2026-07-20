@@ -21,7 +21,9 @@ const CODEX_BLOCK_START: &str = "# >>> agent-hook:provider-ingress:v1 >>>";
 const CODEX_BLOCK_END: &str = "# <<< agent-hook:provider-ingress:v1 <<<";
 const RUNTIME_KIT_BLOCK_START: &str = "# >>> agent-runtime-kit:hooks >>>";
 const RUNTIME_KIT_BLOCK_END: &str = "# <<< agent-runtime-kit:hooks <<<";
-const DISPATCH_TIMEOUT_SECONDS: i64 = 10;
+const DISPATCH_TIMEOUT_SECONDS: i64 = 60;
+const PRIOR_DISPATCH_TIMEOUT_SECONDS: i64 = 10;
+const SESSION_COORDINATION_HANDLER: &str = "session-coordination-guard.py";
 const CODEX_NOTIFY_ARGV: [&str; 5] = ["agent-session", "activity", "notify", "--agent", "codex"];
 const CODEX_NOTIFY_FORWARD_FLAG: &str = "--forward-notify-argv-json";
 const CODEX_COMPUTER_USE_NOTIFY_EVENT: &str = "turn-ended";
@@ -110,6 +112,7 @@ pub struct DoctorResult {
 
 struct Plan {
     product: Product,
+    removal: bool,
     files: Vec<PlannedFile>,
     primary_path: PathBuf,
     groups: Vec<HookGroup>,
@@ -165,7 +168,7 @@ pub fn run(
     let requires_review = plan.legacy_before > 0 || plan.drifted;
     let apply_allowed =
         !requires_review || expected_plan_digest.is_some_and(|expected| expected == plan_digest);
-    if !matches!(action, SetupAction::DryRun) && requires_review && expected_plan_digest.is_none() {
+    if !action.is_preview() && requires_review && expected_plan_digest.is_none() {
         return Err(HookError::data(
             "setup-plan-digest-required",
             "compatibility or drifted provider state requires the exact reviewed plan digest",
@@ -182,21 +185,21 @@ pub fn run(
         .iter()
         .any(|file| file.original != file.candidate);
     let mut changed = false;
-    if !matches!(action, SetupAction::DryRun) && would_change {
+    if !action.is_preview() && would_change {
         apply_plan(layout, &plan)?;
         changed = true;
     }
-    let configured = if matches!(action, SetupAction::DryRun) {
+    let configured = if action.is_preview() {
         plan.owned_before == plan.groups.len()
             && !plan.drifted
             && plan.legacy_before == 0
             && plan.auxiliary_configured_before
     } else {
         plan.owned_after == plan.groups.len()
-            && action != SetupAction::Remove
+            && !action.is_remove()
             && plan.auxiliary_configured_after
     };
-    let would_configure = action != SetupAction::Remove
+    let would_configure = !action.is_remove()
         && plan.owned_after == plan.groups.len()
         && plan.auxiliary_configured_after;
     let status = classify_status(
@@ -221,7 +224,7 @@ pub fn run(
         policy_digest: loaded.policy_digest.clone(),
         owned_events: distinct_events(&plan.groups),
         owned_groups: plan.groups,
-        owned_count: if matches!(action, SetupAction::DryRun) {
+        owned_count: if action.is_preview() {
             plan.owned_before
         } else {
             plan.owned_after
@@ -331,11 +334,11 @@ fn build_codex_plan(
     let mut document = stripped.parse::<DocumentMut>().map_err(|_| {
         HookError::data("provider-config-invalid", "Codex config is not valid TOML")
     })?;
-    let (legacy_before, unrelated_before) = inspect_toml_handlers(&document);
+    let (legacy_before, unrelated_before) = inspect_toml_handlers(&document, loaded);
     let notify = plan_codex_notification(&mut document, &path, action, &stripped)?;
-    remove_legacy_toml_handlers(&mut document);
+    remove_legacy_toml_handlers(&mut document, loaded);
     let mut rendered = document.to_string();
-    if action != SetupAction::Remove {
+    if !action.is_remove() {
         if !rendered.is_empty() && !rendered.ends_with('\n') {
             rendered.push('\n');
         }
@@ -346,7 +349,7 @@ fn build_codex_plan(
     } else {
         Some(rendered.into_bytes())
     };
-    if action == SetupAction::Remove
+    if action.is_remove()
         && owned_before == 0
         && legacy_before == 0
         && !notify.changed
@@ -363,6 +366,7 @@ fn build_codex_plan(
     let hooks_mode = file_mode(&hooks_path)?;
     Ok(Plan {
         product,
+        removal: action.is_remove(),
         primary_path: path.clone(),
         files: vec![
             PlannedFile {
@@ -380,11 +384,7 @@ fn build_codex_plan(
         ],
         groups: groups.clone(),
         owned_before,
-        owned_after: if action == SetupAction::Remove {
-            0
-        } else {
-            groups.len()
-        },
+        owned_after: if action.is_remove() { 0 } else { groups.len() },
         legacy_before: legacy_before + hooks_owned + hooks_legacy,
         unrelated_before: unrelated_before + hooks_unrelated,
         drifted: drifted || hooks_drifted || notify.requires_review || trust_boundary_repaired,
@@ -440,7 +440,7 @@ fn plan_codex_notification(
     action: SetupAction,
     original_raw: &str,
 ) -> Result<CodexNotificationPlan, HookError> {
-    let remove = action == SetupAction::Remove;
+    let remove = action.is_remove();
     let mode = codex_notify_mode(document, config_path, !remove);
     let configured_before = matches!(
         mode,
@@ -860,7 +860,7 @@ fn build_json_plan(
     let (owned_before, legacy_before, unrelated_before, drifted) =
         inspect_json_handlers(&root, product, &groups, loaded)?;
     remove_owned_and_legacy_json(&mut root, product, loaded)?;
-    if action != SetupAction::Remove {
+    if !action.is_remove() {
         for group in &groups {
             append_json_group(&mut root, product, group)?;
         }
@@ -875,13 +875,14 @@ fn build_json_plan(
             )
         })?)
     };
-    if action == SetupAction::Remove && owned_before == 0 && legacy_before == 0 {
+    if action.is_remove() && owned_before == 0 && legacy_before == 0 {
         candidate = original.clone();
     }
     validate_candidate_size(candidate.as_deref())?;
     let original_mode = file_mode(&path)?;
     Ok(Plan {
         product,
+        removal: action.is_remove(),
         primary_path: path.clone(),
         files: vec![PlannedFile {
             path,
@@ -891,11 +892,7 @@ fn build_json_plan(
         }],
         groups: groups.clone(),
         owned_before,
-        owned_after: if action == SetupAction::Remove {
-            0
-        } else {
-            groups.len()
-        },
+        owned_after: if action.is_remove() { 0 } else { groups.len() },
         legacy_before,
         unrelated_before,
         drifted,
@@ -1316,7 +1313,7 @@ fn strip_codex_block(raw: &str, expected: &str) -> Result<(String, usize, bool),
     Ok((stripped, owned, drifted))
 }
 
-fn inspect_toml_handlers(document: &DocumentMut) -> (usize, usize) {
+fn inspect_toml_handlers(document: &DocumentMut, loaded: &LoadedPolicy) -> (usize, usize) {
     let mut compatibility = 0;
     let mut unrelated = 0;
     let Some(hooks) = document.get("hooks").and_then(TomlItem::as_table) else {
@@ -1331,7 +1328,7 @@ fn inspect_toml_handlers(document: &DocumentMut) -> (usize, usize) {
                 continue;
             };
             for handler in handlers {
-                if legacy_toml_handler(handler) {
+                if legacy_toml_handler(handler, loaded) {
                     compatibility += 1;
                 } else {
                     unrelated += 1;
@@ -1342,7 +1339,7 @@ fn inspect_toml_handlers(document: &DocumentMut) -> (usize, usize) {
     (compatibility, unrelated)
 }
 
-fn remove_legacy_toml_handlers(document: &mut DocumentMut) {
+fn remove_legacy_toml_handlers(document: &mut DocumentMut, loaded: &LoadedPolicy) {
     let Some(hooks) = document.get_mut("hooks").and_then(TomlItem::as_table_mut) else {
         return;
     };
@@ -1361,7 +1358,7 @@ fn remove_legacy_toml_handlers(document: &mut DocumentMut) {
                     .get_mut("hooks")
                     .and_then(TomlItem::as_array_of_tables_mut)
                 {
-                    handlers.retain(|handler| !legacy_toml_handler(handler));
+                    handlers.retain(|handler| !legacy_toml_handler(handler, loaded));
                 }
             }
             groups.retain(|group| {
@@ -1401,6 +1398,7 @@ fn inspect_json_handlers(
     let mut compatibility = 0;
     let mut unrelated = 0;
     let mut owned_groups = BTreeSet::new();
+    let mut prior_owned = false;
     for (event, groups) in hooks {
         let groups = groups.as_array().ok_or_else(|| {
             HookError::data(
@@ -1423,6 +1421,10 @@ fn inspect_json_handlers(
                 if owned_json_handler(handler, product) {
                     owned += 1;
                     owned_groups.insert((event.clone(), matcher.clone()));
+                } else if prior_owned_json_handler(handler, product) {
+                    owned += 1;
+                    owned_groups.insert((event.clone(), matcher.clone()));
+                    prior_owned = true;
                 } else if legacy_json_handler(handler, product, loaded) {
                     compatibility += 1;
                 } else {
@@ -1435,7 +1437,8 @@ fn inspect_json_handlers(
         .iter()
         .map(|group| (group.event.clone(), group.matcher.clone()))
         .collect::<BTreeSet<_>>();
-    let drifted = owned > 0 && (owned != expected.len() || owned_groups != expected_set);
+    let drifted =
+        prior_owned || (owned > 0 && (owned != expected.len() || owned_groups != expected_set));
     Ok((owned, compatibility, unrelated, drifted))
 }
 
@@ -1473,6 +1476,7 @@ fn remove_owned_and_legacy_json(
                 })?;
             handlers.retain(|handler| {
                 !owned_json_handler(handler, product)
+                    && !prior_owned_json_handler(handler, product)
                     && !legacy_json_handler(handler, product, loaded)
             });
         }
@@ -1541,24 +1545,69 @@ fn owned_json_handler(handler: &Value, product: Product) -> bool {
         && handler.get("timeout").and_then(Value::as_i64) == Some(DISPATCH_TIMEOUT_SECONDS)
 }
 
-fn legacy_json_handler(handler: &Value, product: Product, loaded: &LoadedPolicy) -> bool {
+fn prior_owned_json_handler(handler: &Value, product: Product) -> bool {
     handler.as_object().is_some_and(|object| object.len() == 3)
         && handler.get("type").and_then(Value::as_str) == Some("command")
-        && handler.get("timeout").and_then(Value::as_i64) == Some(5)
-        && handler
-            .get("command")
-            .and_then(Value::as_str)
-            .is_some_and(|command| legacy_command_for_policy(command, product, loaded))
+        && handler.get("command").and_then(Value::as_str)
+            == Some(dispatch_command(product).as_str())
+        && handler.get("timeout").and_then(Value::as_i64) == Some(PRIOR_DISPATCH_TIMEOUT_SECONDS)
 }
 
-fn legacy_toml_handler(handler: &toml_edit::Table) -> bool {
-    handler.len() == 3
-        && handler.get("type").and_then(TomlItem::as_str) == Some("command")
+fn legacy_json_handler(handler: &Value, product: Product, loaded: &LoadedPolicy) -> bool {
+    let Some(object) = handler.as_object() else {
+        return false;
+    };
+    let Some(command) = handler.get("command").and_then(Value::as_str) else {
+        return false;
+    };
+    if handler.get("type").and_then(Value::as_str) != Some("command")
+        || !legacy_command_for_policy(command, product, loaded)
+    {
+        return false;
+    }
+    let historical = object.len() == 3 && handler.get("timeout").and_then(Value::as_i64) == Some(5);
+    let coordination =
+        exact_runtime_handler_command(command, product, SESSION_COORDINATION_HANDLER)
+            && object.keys().all(|key| {
+                matches!(
+                    key.as_str(),
+                    "type" | "command" | "timeout" | "statusMessage"
+                )
+            })
+            && handler.get("timeout").and_then(Value::as_i64) == Some(60)
+            && handler
+                .get("statusMessage")
+                .is_none_or(|value| value.is_string());
+    historical || coordination
+}
+
+fn legacy_toml_handler(handler: &toml_edit::Table, loaded: &LoadedPolicy) -> bool {
+    let Some(command) = handler.get("command").and_then(TomlItem::as_str) else {
+        return false;
+    };
+    if handler.get("type").and_then(TomlItem::as_str) != Some("command") {
+        return false;
+    }
+    if exact_runtime_handler_command(command, Product::Codex, SESSION_COORDINATION_HANDLER) {
+        return policy_has_session_coordination(loaded, Product::Codex)
+            && handler
+                .iter()
+                .all(|(key, _)| matches!(key, "type" | "command" | "timeout" | "statusMessage"))
+            && handler.get("timeout").and_then(TomlItem::as_integer) == Some(60)
+            && handler
+                .get("statusMessage")
+                .is_none_or(|value| value.is_str());
+    }
+    legacy_command(command, Product::Codex)
+        && handler.len() == 3
         && handler.get("timeout").and_then(TomlItem::as_integer) == Some(5)
-        && handler
-            .get("command")
-            .and_then(TomlItem::as_str)
-            .is_some_and(|command| legacy_command(command, Product::Codex))
+}
+
+fn policy_has_session_coordination(loaded: &LoadedPolicy, product: Product) -> bool {
+    loaded.bundle.rules.iter().any(|rule| {
+        rule.products.contains(&product)
+            && matches!(&rule.capability, Capability::SessionCoordination { .. })
+    })
 }
 
 fn json_group_has_user_metadata(group: &Value) -> bool {
@@ -1577,6 +1626,7 @@ fn toml_group_has_user_metadata(group: &toml_edit::Table) -> bool {
 
 fn legacy_command(command: &str, product: Product) -> bool {
     command == format!("agent-session activity hook --agent {}", product.as_str())
+        || exact_runtime_handler_command(command, product, SESSION_COORDINATION_HANDLER)
         || [
             "agent-scope-lock-guard",
             "block-claude-coauthor-trailer",
@@ -1612,14 +1662,18 @@ fn legacy_command_for_policy(command: &str, product: Product, loaded: &LoadedPol
     if command == format!("agent-session activity hook --agent {}", product.as_str()) {
         return true;
     }
-    loaded.bundle.rules.iter().any(|rule| {
-        matches!(
-            &rule.capability,
-            Capability::RuntimeKitHandler { handler_id }
-                if runtime_handler_filename(handler_id)
-                    .is_some_and(|filename| exact_runtime_handler_command(command, product, filename))
-        )
-    })
+    loaded
+        .bundle
+        .rules
+        .iter()
+        .any(|rule| match &rule.capability {
+            Capability::RuntimeKitHandler { handler_id } => runtime_handler_filename(handler_id)
+                .is_some_and(|filename| exact_runtime_handler_command(command, product, filename)),
+            Capability::SessionCoordination { .. } => {
+                exact_runtime_handler_command(command, product, SESSION_COORDINATION_HANDLER)
+            }
+            _ => false,
+        })
 }
 
 fn exact_runtime_handler_command(command: &str, product: Product, filename: &str) -> bool {
@@ -1786,6 +1840,7 @@ fn plan_digest(plan: &Plan) -> Result<String, HookError> {
     digest_serializable(&json!({
         "schema_version": "agent-hook.setup-plan.v2",
         "product": plan.product,
+        "operation": if plan.removal { "remove" } else { "install" },
         "files": files,
         "groups": plan.groups,
         "legacy_count": plan.legacy_before,
@@ -1970,6 +2025,7 @@ mod tests {
         };
         let plan = Plan {
             product: Product::Claude,
+            removal: false,
             primary_path: path.clone(),
             files: vec![PlannedFile {
                 path: path.clone(),

@@ -35,6 +35,501 @@ override_class = "locked"
 capability = { id = "decision.allow.v1", reason_code = "pre-edit" }
 "#;
 
+const COORDINATION_POLICY: &str = r#"schema_version = "agent-hook.policy.v1"
+bundle_id = "runtime-kit"
+version = "2026.07.20.2"
+
+[[rules]]
+id = "runtime.pre-edit"
+products = ["codex"]
+events = ["PreToolUse"]
+matcher = "Write"
+priority = 10
+mode = "enforce"
+failure_posture = "closed"
+override_class = "locked"
+capability = { id = "decision.allow.v1", reason_code = "pre-edit" }
+
+[[rules]]
+id = "runtime.pre-edit-coordination"
+products = ["codex"]
+events = ["PreToolUse"]
+matcher = "Write"
+priority = 20
+mode = "enforce"
+failure_posture = "closed"
+override_class = "locked"
+capability = { id = "agent-session.coordination.v1", reason_code = "coordination-admitted" }
+"#;
+
+#[test]
+fn codex_removal_preview_digest_is_fresh_and_restores_from_a_new_setup_preview() {
+    let fixture = Fixture::new(POLICY);
+    let install_preview = fixture.run(
+        &[
+            "setup",
+            "--product",
+            "codex",
+            "--dry-run",
+            "--format",
+            "json",
+        ],
+        None,
+    );
+    assert_eq!(
+        install_preview.code,
+        0,
+        "stderr={}",
+        install_preview.stderr_text()
+    );
+    let install_digest = install_preview.stdout_json()["data"]["plan_digest"]
+        .as_str()
+        .expect("install digest")
+        .to_string();
+    let installed = fixture.run(
+        &[
+            "setup",
+            "--product",
+            "codex",
+            "--apply",
+            "--expected-plan-digest",
+            &install_digest,
+            "--format",
+            "json",
+        ],
+        None,
+    );
+    assert_eq!(installed.code, 0, "stderr={}", installed.stderr_text());
+
+    let codex = fixture.home.join(".codex");
+    let config = codex.join("config.toml");
+    let mut config_bytes = fs::read(&config).expect("installed config");
+    config_bytes.extend_from_slice(
+        b"\n[[hooks.Stop]]\n\n[[hooks.Stop.hooks]]\ntype = \"command\"\ncommand = \"keep-user-hook\"\ntimeout = 7\n",
+    );
+    fs::write(&config, &config_bytes).expect("config with unrelated hook");
+    let compatibility = codex.join("hooks.json");
+    fs::write(
+        &compatibility,
+        r#"{"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"agent-hook dispatch --product codex","timeout":60}]}]}}"#,
+    )
+    .expect("compatibility config");
+    Fixture::set_private(&compatibility);
+
+    let preview = fixture.run(
+        &[
+            "setup",
+            "--product",
+            "codex",
+            "--remove",
+            "--dry-run",
+            "--format",
+            "json",
+        ],
+        None,
+    );
+    assert_eq!(preview.code, 0, "stderr={}", preview.stderr_text());
+    let data = &preview.stdout_json()["data"];
+    assert_eq!(data["action"], "remove-dry-run");
+    assert_eq!(data["changed"], false);
+    assert_eq!(data["would_change"], true);
+    assert_eq!(data["apply_allowed"], false);
+    assert_eq!(fs::read(&config).expect("preview config"), config_bytes);
+    assert!(compatibility.is_file());
+    let removal_digest = data["plan_digest"]
+        .as_str()
+        .expect("removal digest")
+        .to_string();
+    assert_ne!(removal_digest, install_digest);
+
+    config_bytes.extend_from_slice(b"# keep-concurrent-comment\n");
+    fs::write(&config, &config_bytes).expect("concurrent provider edit");
+    let stale = fixture.run(
+        &[
+            "setup",
+            "--product",
+            "codex",
+            "--remove",
+            "--expected-plan-digest",
+            &removal_digest,
+            "--format",
+            "json",
+        ],
+        None,
+    );
+    assert_eq!(stale.code, 65, "stderr={}", stale.stderr_text());
+    assert_eq!(
+        stale.stdout_json()["error"]["code"],
+        "setup-plan-digest-mismatch"
+    );
+    assert_eq!(fs::read(&config).expect("stale config"), config_bytes);
+    assert!(compatibility.is_file());
+
+    let fresh = fixture.run(
+        &[
+            "setup",
+            "--product",
+            "codex",
+            "--remove",
+            "--dry-run",
+            "--format",
+            "json",
+        ],
+        None,
+    );
+    assert_eq!(fresh.code, 0, "stderr={}", fresh.stderr_text());
+    let fresh_digest = fresh.stdout_json()["data"]["plan_digest"]
+        .as_str()
+        .expect("fresh removal digest")
+        .to_string();
+    assert_ne!(fresh_digest, removal_digest);
+    let removed = fixture.run(
+        &[
+            "setup",
+            "--product",
+            "codex",
+            "--remove",
+            "--expected-plan-digest",
+            &fresh_digest,
+            "--format",
+            "json",
+        ],
+        None,
+    );
+    assert_eq!(removed.code, 0, "stderr={}", removed.stderr_text());
+    let removed_config = fs::read_to_string(&config).expect("removed config");
+    assert!(removed_config.contains("keep-user-hook"));
+    assert!(removed_config.contains("# keep-concurrent-comment"));
+    assert!(!removed_config.contains("agent-hook dispatch"));
+    assert!(!compatibility.exists());
+
+    let restore_preview = fixture.run(
+        &[
+            "setup",
+            "--product",
+            "codex",
+            "--dry-run",
+            "--format",
+            "json",
+        ],
+        None,
+    );
+    assert_eq!(
+        restore_preview.code,
+        0,
+        "stderr={}",
+        restore_preview.stderr_text()
+    );
+    let restore_digest = restore_preview.stdout_json()["data"]["plan_digest"]
+        .as_str()
+        .expect("restore digest")
+        .to_string();
+    let restored = fixture.run(
+        &[
+            "setup",
+            "--product",
+            "codex",
+            "--apply",
+            "--expected-plan-digest",
+            &restore_digest,
+            "--format",
+            "json",
+        ],
+        None,
+    );
+    assert_eq!(restored.code, 0, "stderr={}", restored.stderr_text());
+    let restored = fs::read_to_string(&config).expect("restored config");
+    assert!(restored.contains("keep-user-hook"));
+    assert!(restored.contains("agent-hook dispatch --product codex"));
+}
+
+#[test]
+fn claude_removal_preview_digest_preserves_unrelated_hooks_and_restores() {
+    let fixture = Fixture::new(POLICY);
+    let installed = fixture.run(
+        &[
+            "setup",
+            "--product",
+            "claude",
+            "--apply",
+            "--format",
+            "json",
+        ],
+        None,
+    );
+    assert_eq!(installed.code, 0, "stderr={}", installed.stderr_text());
+    let settings = fixture.home.join(".claude/settings.json");
+    let mut value: serde_json::Value =
+        serde_json::from_slice(&fs::read(&settings).expect("settings")).expect("JSON");
+    let hooks = value["hooks"].as_object_mut().expect("hooks object");
+    hooks
+        .get_mut("SessionStart")
+        .and_then(serde_json::Value::as_array_mut)
+        .expect("session start groups")
+        .push(json!({"hooks":[{
+            "type":"command",
+            "command":"$HOME/.claude/hooks/session-start-healthcheck.sh",
+            "timeout":5
+        }]}));
+    hooks.insert(
+        "Stop".to_string(),
+        json!([{"hooks":[{"type":"command","command":"keep-user-hook","timeout":7}]}]),
+    );
+    let original = serde_json::to_vec_pretty(&value).expect("render settings");
+    fs::write(&settings, &original).expect("settings with compatibility and unrelated hooks");
+
+    let preview = fixture.run(
+        &[
+            "setup",
+            "--product",
+            "claude",
+            "--remove",
+            "--dry-run",
+            "--format",
+            "json",
+        ],
+        None,
+    );
+    assert_eq!(preview.code, 0, "stderr={}", preview.stderr_text());
+    let data = &preview.stdout_json()["data"];
+    assert_eq!(data["action"], "remove-dry-run");
+    assert_eq!(data["changed"], false);
+    assert_eq!(data["would_change"], true);
+    assert_eq!(data["apply_allowed"], false);
+    assert_eq!(fs::read(&settings).expect("preview settings"), original);
+    let removal_digest = data["plan_digest"]
+        .as_str()
+        .expect("removal digest")
+        .to_string();
+
+    let removed = fixture.run(
+        &[
+            "setup",
+            "--product",
+            "claude",
+            "--remove",
+            "--expected-plan-digest",
+            &removal_digest,
+            "--format",
+            "json",
+        ],
+        None,
+    );
+    assert_eq!(removed.code, 0, "stderr={}", removed.stderr_text());
+    let removed_text = fs::read_to_string(&settings).expect("removed settings");
+    assert!(removed_text.contains("keep-user-hook"));
+    assert!(!removed_text.contains("agent-hook dispatch"));
+    assert!(!removed_text.contains("session-start-healthcheck.sh"));
+
+    let restore_preview = fixture.run(
+        &[
+            "setup",
+            "--product",
+            "claude",
+            "--dry-run",
+            "--format",
+            "json",
+        ],
+        None,
+    );
+    assert_eq!(
+        restore_preview.code,
+        0,
+        "stderr={}",
+        restore_preview.stderr_text()
+    );
+    let restore_digest = restore_preview.stdout_json()["data"]["plan_digest"]
+        .as_str()
+        .expect("restore digest")
+        .to_string();
+    let restored = fixture.run(
+        &[
+            "setup",
+            "--product",
+            "claude",
+            "--apply",
+            "--expected-plan-digest",
+            &restore_digest,
+            "--format",
+            "json",
+        ],
+        None,
+    );
+    assert_eq!(restored.code, 0, "stderr={}", restored.stderr_text());
+    let restored = fs::read_to_string(&settings).expect("restored settings");
+    assert!(restored.contains("keep-user-hook"));
+    assert!(restored.contains("agent-hook dispatch --product claude"));
+}
+
+#[test]
+fn codex_setup_preserves_coordination_hook_when_capability_is_absent() {
+    let fixture = Fixture::new(POLICY);
+    let codex = fixture.home.join(".codex");
+    fs::create_dir_all(&codex).expect("codex dir");
+    let config = codex.join("config.toml");
+    fs::write(
+        &config,
+        r#"[[hooks.PreToolUse]]
+matcher = "Write"
+
+[[hooks.PreToolUse.hooks]]
+type = "command"
+command = "AGENT_RUNTIME_PRODUCT=codex \"${CODEX_HOME:-$HOME/.codex}/hooks/session-coordination-guard.py\""
+timeout = 60
+statusMessage = "agent-runtime-kit: Admit managed session mutation"
+"#,
+    )
+    .expect("coordination config");
+    Fixture::set_private(&config);
+    let original = fs::read(&config).expect("original config");
+
+    let preview = fixture.run(
+        &[
+            "setup",
+            "--product",
+            "codex",
+            "--dry-run",
+            "--format",
+            "json",
+        ],
+        None,
+    );
+    assert_eq!(preview.code, 0, "stderr={}", preview.stderr_text());
+    assert_eq!(preview.stdout_json()["data"]["status"], "unrelated");
+    assert_eq!(preview.stdout_json()["data"]["unrelated_count"], 1);
+    assert_eq!(fs::read(&config).expect("preview config"), original);
+
+    let applied = fixture.run(
+        &["setup", "--product", "codex", "--apply", "--format", "json"],
+        None,
+    );
+    assert_eq!(applied.code, 0, "stderr={}", applied.stderr_text());
+    let installed = fs::read_to_string(&config).expect("installed config");
+    assert_eq!(
+        installed.matches("session-coordination-guard.py").count(),
+        1
+    );
+    assert_eq!(
+        installed
+            .matches("agent-hook dispatch --product codex")
+            .count(),
+        2
+    );
+
+    let removed = fixture.run(
+        &[
+            "setup",
+            "--product",
+            "codex",
+            "--remove",
+            "--format",
+            "json",
+        ],
+        None,
+    );
+    assert_eq!(removed.code, 0, "stderr={}", removed.stderr_text());
+    let removed = fs::read_to_string(&config).expect("removed config");
+    assert_eq!(removed.matches("session-coordination-guard.py").count(), 1);
+    assert!(!removed.contains("agent-hook dispatch"));
+}
+
+#[test]
+fn codex_setup_migrates_coordination_into_one_exact_owned_ingress() {
+    let fixture = Fixture::new(COORDINATION_POLICY);
+    let codex = fixture.home.join(".codex");
+    fs::create_dir_all(&codex).expect("codex dir");
+    let config = codex.join("config.toml");
+    fs::write(
+        &config,
+        r#"# keep-comment
+[[hooks.PreToolUse]]
+matcher = "Write"
+
+[[hooks.PreToolUse.hooks]]
+type = "command"
+command = "AGENT_RUNTIME_PRODUCT=codex \"${CODEX_HOME:-$HOME/.codex}/hooks/session-coordination-guard.py\""
+timeout = 60
+statusMessage = "agent-runtime-kit: Admit managed session mutation"
+
+[[hooks.PreToolUse.hooks]]
+type = "command"
+command = "keep-user-hook"
+timeout = 7
+"#,
+    )
+    .expect("compatibility coordination config");
+    Fixture::set_private(&config);
+
+    let preview = fixture.run(
+        &[
+            "setup",
+            "--product",
+            "codex",
+            "--dry-run",
+            "--format",
+            "json",
+        ],
+        None,
+    );
+    assert_eq!(preview.code, 0, "stderr={}", preview.stderr_text());
+    assert_eq!(
+        preview.stdout_json()["data"]["status"],
+        "compatibility-only"
+    );
+    assert_eq!(
+        preview.stdout_json()["data"]["owned_groups"]
+            .as_array()
+            .map(Vec::len),
+        Some(1)
+    );
+    let plan_digest = preview.stdout_json()["data"]["plan_digest"]
+        .as_str()
+        .expect("plan digest")
+        .to_string();
+
+    let applied = fixture.run(
+        &[
+            "setup",
+            "--product",
+            "codex",
+            "--apply",
+            "--expected-plan-digest",
+            &plan_digest,
+            "--format",
+            "json",
+        ],
+        None,
+    );
+    assert_eq!(applied.code, 0, "stderr={}", applied.stderr_text());
+    let installed = fs::read_to_string(&config).expect("installed config");
+    assert!(installed.contains("keep-user-hook"));
+    assert!(!installed.contains("session-coordination-guard.py"));
+    assert_eq!(
+        installed
+            .matches("agent-hook dispatch --product codex")
+            .count(),
+        1
+    );
+    assert!(installed.contains("timeout = 60"));
+
+    let removed = fixture.run(
+        &[
+            "setup",
+            "--product",
+            "codex",
+            "--remove",
+            "--format",
+            "json",
+        ],
+        None,
+    );
+    assert_eq!(removed.code, 0, "stderr={}", removed.stderr_text());
+    let removed = fs::read_to_string(&config).expect("removed config");
+    assert!(removed.contains("keep-user-hook"));
+    assert!(!removed.contains("agent-hook dispatch"));
+    assert!(!removed.contains("session-coordination-guard.py"));
+}
+
 #[test]
 fn claude_setup_preserves_unrelated_hooks_and_migrates_grouped_compatibility_handlers() {
     let fixture = Fixture::new(POLICY);
@@ -141,6 +636,80 @@ fn claude_setup_preserves_unrelated_hooks_and_migrates_grouped_compatibility_han
         removed.stderr_text()
     );
     let text = fs::read_to_string(&settings).expect("settings");
+    assert!(text.contains("keep-user-hook"));
+    assert!(!text.contains("agent-hook dispatch"));
+}
+
+#[test]
+fn claude_setup_upgrades_the_exact_prior_owned_ingress_without_duplicates() {
+    let fixture = Fixture::new(POLICY);
+    let claude = fixture.home.join(".claude");
+    fs::create_dir_all(&claude).expect("claude dir");
+    let settings = claude.join("settings.json");
+    fs::write(
+        &settings,
+        r#"{"keep":"metadata","hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"agent-hook dispatch --product claude","timeout":10}]}],"PreToolUse":[{"matcher":"Write|Edit|NotebookEdit|MultiEdit|apply_patch","hooks":[{"type":"command","command":"agent-hook dispatch --product claude","timeout":10}]}],"Stop":[{"hooks":[{"type":"command","command":"keep-user-hook","timeout":7}]}]}}"#,
+    )
+    .expect("prior settings");
+    Fixture::set_private(&settings);
+
+    let preview = fixture.run(
+        &[
+            "setup",
+            "--product",
+            "claude",
+            "--dry-run",
+            "--format",
+            "json",
+        ],
+        None,
+    );
+    assert_eq!(preview.code, 0, "stderr={}", preview.stderr_text());
+    assert_eq!(preview.stdout_json()["data"]["status"], "drifted");
+    assert_eq!(preview.stdout_json()["data"]["owned_count"], 2);
+    assert_eq!(preview.stdout_json()["data"]["unrelated_count"], 1);
+    let digest = preview.stdout_json()["data"]["plan_digest"]
+        .as_str()
+        .expect("plan digest")
+        .to_string();
+
+    let applied = fixture.run(
+        &[
+            "setup",
+            "--product",
+            "claude",
+            "--apply",
+            "--expected-plan-digest",
+            &digest,
+            "--format",
+            "json",
+        ],
+        None,
+    );
+    assert_eq!(applied.code, 0, "stderr={}", applied.stderr_text());
+    let value: serde_json::Value =
+        serde_json::from_slice(&fs::read(&settings).expect("settings")).expect("JSON");
+    let text = value.to_string();
+    assert_eq!(
+        text.matches("agent-hook dispatch --product claude").count(),
+        2
+    );
+    assert_eq!(text.matches(r#""timeout":60"#).count(), 2);
+    assert!(text.contains("keep-user-hook"));
+
+    let removed = fixture.run(
+        &[
+            "setup",
+            "--product",
+            "claude",
+            "--remove",
+            "--format",
+            "json",
+        ],
+        None,
+    );
+    assert_eq!(removed.code, 0, "stderr={}", removed.stderr_text());
+    let text = fs::read_to_string(&settings).expect("removed settings");
     assert!(text.contains("keep-user-hook"));
     assert!(!text.contains("agent-hook dispatch"));
 }
@@ -942,8 +1511,8 @@ timeout = 5
     assert_eq!(dual_doctor.stdout_json()["data"][0]["status"], "dual");
 
     let drifted = fs::read_to_string(&config).expect("dual config").replacen(
-        "timeout = 10",
-        "timeout = 9",
+        "timeout = 60",
+        "timeout = 59",
         1,
     );
     fs::write(&config, drifted).expect("drifted config");

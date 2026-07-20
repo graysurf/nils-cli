@@ -92,10 +92,10 @@ json\:"Single-record JSON envelope (snake_case)"))' \
 '--config=[Override the strict user config path]:PATH:_files' \
 '--policy=[Override the selected versioned policy bundle path]:PATH:_files' \
 '--state-dir=[Override the private state root]:PATH:_files -/' \
-'(--apply --repair --remove)--dry-run[Preview the exact plan without changing files]' \
+'(--apply --repair)--dry-run[Preview the exact plan without changing files]' \
 '(--dry-run --repair --remove)--apply[Apply an additive or reviewed migration plan]' \
 '(--dry-run --apply --remove)--repair[Restore missing exact owned ingress]' \
-'(--dry-run --apply --repair)--remove[Remove only exact agent-hook-owned ingress]' \
+'(--apply --repair)--remove[Remove only exact agent-hook-owned ingress]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
 && ret=0

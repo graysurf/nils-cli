@@ -57,9 +57,10 @@ above.
   policy digests.
 - `agent-hook.trace.v1`: timing, rule IDs, disposition classes, and digests;
   never raw payload, paths, identities, message content, or capabilities.
-- `agent-hook.setup-plan.v2`: product, owned event/matcher groups, role-tagged
-  before/after digests for every provider source, exact plan digest, drift
-  state, and whether apply is permitted. Provider hook argv content is omitted.
+- `agent-hook.setup-plan.v2`: product, install/remove operation, owned
+  event/matcher groups, role-tagged before/after digests or file absence for
+  every provider source, exact plan digest, drift state, and whether apply is
+  permitted. Provider hook argv content is omitted.
 - `agent-hook.doctor.v1`: product status (missing, compatibility-only, `dual`,
   `drifted`, `converged`, `unsupported`, or `unrelated`), owned counts,
   compatibility residue count, digests, policy availability, and recovery health.
@@ -91,8 +92,8 @@ native setup until a compatible runner exists.
 Supported canonical events are:
 
 - Codex: `SessionStart`, `UserPromptSubmit`, `PermissionRequest`, `PreToolUse`,
-  `PostToolUse`, `PreCompact`, `PostCompact`, `SubagentStart`, `SubagentStop`,
-  and `Stop`.
+  `PostToolUse`, `PostToolUseFailure`, `PreCompact`, `PostCompact`,
+  `SubagentStart`, `SubagentStop`, and `Stop`.
 - Claude: `SessionStart`, `UserPromptSubmit`, `PermissionRequest`, `PreToolUse`,
   `PostToolUse`, `PostToolUseFailure`, `PreCompact`, `Stop`, `StopFailure`,
   `Notification`, `SubagentStart`, `SubagentStop`, `Elicitation`, and
@@ -105,7 +106,7 @@ normalized only from documented provider fields:
 | Provider events | Matcher input field |
 | --- | --- |
 | Codex/Claude `SessionStart` | `source` |
-| Codex/Claude `PermissionRequest`, `PreToolUse`, `PostToolUse`; Claude `PostToolUseFailure` | `tool_name` |
+| Codex/Claude `PermissionRequest`, `PreToolUse`, `PostToolUse`, `PostToolUseFailure` | `tool_name` |
 | Codex/Claude `PreCompact`; Codex `PostCompact` | `trigger` |
 | Codex/Claude `SubagentStart`, `SubagentStop` | `agent_type` |
 | Claude `Notification` | `notification_type` |
@@ -176,6 +177,9 @@ side effects through `agent-session.activity.v1`, and trusted provider-native
 `runtime-kit.handler.v1` remain valid for every supported event. This preserves
 notification and failure logging without pretending that events such as
 Claude `Notification` or `StopFailure` can enforce a decision.
+`agent-session.coordination.v1` is limited to enforceable
+`PreToolUse`, `PostToolUse`, `PostToolUseFailure`, and `Stop` events and must be
+an `enforce`, fail-closed, locked rule.
 
 ## Serialized policy and capability registry
 
@@ -211,6 +215,7 @@ The stable built-in capability ID set for policy v1 is closed:
 - `agent-session.owner-liveness.v1` (`reason_code`, optional
   `legacy_ttl_seconds`, maximum 900)
 - `agent-session.semantic-conflict.v1` (`reason_code`)
+- `agent-session.coordination.v1` (`reason_code`)
 - `runtime-kit.handler.v1` (`handler_id` from the compiled v1 allowlist)
 
 `runtime-kit.handler.v1` is not arbitrary execution. The binary maps the
@@ -241,6 +246,17 @@ interpreter, argv, environment assignment, shell fragment, timeout, or digest.
 Shadow mode never invokes it. Adding another handler requires a new nils-cli
 release or a new versioned capability ID.
 
+`agent-session.coordination.v1` is a separate typed after-policy capability,
+not another configurable handler ID. It resolves only the exact
+`session-coordination-guard.py` consumer below the active provider's owned hook
+directory, applies the same type/owner/mode/output protections, and passes the
+original bounded provider payload on standard input. A dispatch can select at
+most one such rule. The fixed consumer has a 55-second process bound under the
+owned provider ingress's 60-second timeout so the #676 admit/complete/reconcile
+transaction is not forced through the ordinary two-second handler budget. The
+policy cannot select another command, path, arguments, environment assignment,
+or timeout through this capability.
+
 ## Deterministic evaluation
 
 Rules select by product, event, and matcher, then sort by `(priority asc,
@@ -258,6 +274,15 @@ only a redacted observation: it cannot affect exit status/output authority,
 rewrite input, mutate capability/rule/session state, perform reclaim/adoption,
 or consume recovery. Policy order and results are deterministic across
 providers for overlapping capabilities.
+
+Ordinary selected rules are evaluated and aggregated before the typed session
+coordination phase. A blocking `PreToolUse` aggregate returns without invoking
+coordination; an allowing aggregate invokes the exact #676 consumer and merges
+its typed result without weakening the earlier decision. Terminal
+`PostToolUse`, `PostToolUseFailure`, and `Stop` deliveries invoke the consumer
+after ordinary aggregation even when that aggregate blocks, because an already
+admitted operation must persist its outcome and complete or remain explicitly
+reconcile-pending. Shadow evaluation never invokes the consumer.
 
 Override classes:
 
@@ -316,10 +341,21 @@ Owned groups contain exactly one dispatcher command for each required
 event/matcher. Install, upgrade, repair, remove, and rollback preserve
 unrelated hooks, comments, formatting, provider metadata, and unsupported
 surface truth. A no-op remove preserves both bytes and file presence; removal
-deletes only an exact owned representation. Pre-dispatch
+deletes only an exact owned representation. The `--remove --dry-run` setup
+combination is the removal-specific no-write preview. It returns
+`action: "remove-dry-run"`, `changed: false`, `would_change`, `apply_allowed`,
+and the reviewed `plan_digest`; `--remove --expected-plan-digest <digest>`
+accepts that digest only while the exact before/after bytes and file-presence
+plan remains current. Pre-dispatch
 `agent-session activity setup` forwards to this API and cannot install a second
 managed representation. Compatibility handlers are reported as compatibility-only or `dual`
 until the reviewed migration removes them.
+The exact historical `session-coordination-guard.py` command at its fixed
+60-second timeout is recognized as compatibility state only when the selected
+policy contains the typed coordination capability. The reviewed setup plan
+removes that sibling handler and renders one 60-second `agent-hook dispatch`
+entry in each required event/matcher group; arbitrary lookalikes remain
+unrelated.
 
 ## Governed recovery
 
@@ -347,6 +383,10 @@ does not bypass OS/provider authorization, unrelated hooks, nils-cli
 transaction/privacy invariants, or a scope not explicitly bound in the
 capability. Traces and output expose only a reason code and capability digest,
 never the bearer or private identity.
+The typed session coordination rule is present in the signed emergency
+manifest but is never a recoverable rule ID. Config-independent recovery still
+invokes it after the recovered aggregate allows, so break-glass cannot bypass
+the #676 transaction.
 
 ## Coordination and writer liveness
 

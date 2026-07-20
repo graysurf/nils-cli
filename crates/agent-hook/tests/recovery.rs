@@ -50,6 +50,33 @@ override_class = "locked"
 capability = { id = "decision.block.v1", reason_code = "second", message = "second" }
 "#;
 
+const COORDINATION_RECOVERY_POLICY: &str = r#"schema_version = "agent-hook.policy.v1"
+bundle_id = "runtime-kit"
+version = "2026.07.20.2"
+
+[[rules]]
+id = "runtime.locked-block"
+products = ["codex"]
+events = ["PreToolUse"]
+matcher = "Write"
+priority = 10
+mode = "enforce"
+failure_posture = "closed"
+override_class = "locked"
+capability = { id = "decision.block.v1", reason_code = "locked-block", message = "blocked" }
+
+[[rules]]
+id = "runtime.coordination"
+products = ["codex"]
+events = ["PreToolUse"]
+matcher = "Write"
+priority = 20
+mode = "enforce"
+failure_posture = "closed"
+override_class = "locked"
+capability = { id = "agent-session.coordination.v1", reason_code = "coordination-admitted" }
+"#;
+
 struct Authorized {
     payload: String,
     command: String,
@@ -332,6 +359,73 @@ fn emergency_recovery_preserves_ungranted_rules_and_rejects_unknown_ids() {
     assert_eq!(
         challenge.stdout_json()["error"]["code"],
         "recovery-rule-unknown"
+    );
+}
+
+#[test]
+fn recovery_cannot_bypass_the_coordination_transaction() {
+    let fixture = Fixture::new(COORDINATION_RECOVERY_POLICY);
+    let hooks = fixture.home.join(".codex/hooks");
+    fs::create_dir_all(&hooks).expect("hook directory");
+    let handler = hooks.join("session-coordination-guard.py");
+    fs::write(
+        &handler,
+        "#!/bin/sh\nset -eu\ndd of=\"$COORDINATION_CAPTURE\" status=none\n",
+    )
+    .expect("coordination handler");
+    fs::set_permissions(&handler, fs::Permissions::from_mode(0o700)).expect("handler mode");
+
+    let authorized = authorize(&fixture, "coordination", "one-shot", "300", &[]);
+    fs::write(&fixture.config, "not valid toml = [").expect("break config");
+    let capture = fixture.root.join("coordination-capture.json");
+    let allowed = dispatch(
+        &fixture,
+        &authorized,
+        &[(
+            "COORDINATION_CAPTURE",
+            capture.to_str().expect("capture path"),
+        )],
+    );
+    assert_eq!(allowed.code, 0, "stderr={}", allowed.stderr_text());
+    assert_eq!(allowed.stdout_json()["data"]["recovery_applied"], true);
+    assert!(
+        capture.is_file(),
+        "recovery must retain coordination admission"
+    );
+
+    let fixture = Fixture::new(COORDINATION_RECOVERY_POLICY);
+    let digest = sha256(b"binding");
+    let rejected = fixture.run(
+        &[
+            "recovery",
+            "challenge",
+            "--product",
+            "codex",
+            "--event",
+            "PreToolUse",
+            "--target-digest",
+            &digest,
+            "--command-digest",
+            &digest,
+            "--snapshot-digest",
+            &digest,
+            "--rule",
+            "runtime.coordination",
+            "--out",
+            fixture
+                .root
+                .join("coordination-challenge.json")
+                .to_str()
+                .expect("challenge path"),
+            "--format",
+            "json",
+        ],
+        None,
+    );
+    assert_eq!(rejected.code, 65, "stderr={}", rejected.stderr_text());
+    assert_eq!(
+        rejected.stdout_json()["error"]["code"],
+        "recovery-rule-locked-invariant"
     );
 }
 

@@ -255,7 +255,9 @@ fn dispatch(layout: Layout, policy_override: Option<&std::path::Path>, command: 
                     );
                 }
             };
-            let action = if args.apply {
+            let action = if args.remove && args.dry_run {
+                SetupAction::RemoveDryRun
+            } else if args.apply {
                 SetupAction::Apply
             } else if args.repair {
                 SetupAction::Repair
@@ -317,7 +319,16 @@ fn run_dispatch(
     let loaded = match contract::load(layout, policy_override) {
         Ok(loaded) => loaded,
         Err(_error) if !grant.rules.is_empty() => {
-            let decision = match emergency_decision(&request, &grant) {
+            let (decision, coordination_rule) = match emergency_decision(&request, &grant) {
+                Ok(result) => result,
+                Err(error) => return emit_dispatch_error(args.format, &error, Some(&request)),
+            };
+            let decision = match evaluator::apply_session_coordination(
+                decision,
+                &request,
+                &raw,
+                coordination_rule,
+            ) {
                 Ok(decision) => decision,
                 Err(error) => return emit_dispatch_error(args.format, &error, Some(&request)),
             };
@@ -530,10 +541,10 @@ fn run_recovery(
     }
 }
 
-fn emergency_decision(
+fn emergency_decision<'a>(
     request: &model::NormalizedRequest,
-    grant: &recovery::RecoveryGrant,
-) -> Result<NormalizedDecision, HookError> {
+    grant: &'a recovery::RecoveryGrant,
+) -> Result<(NormalizedDecision, Option<&'a model::PolicyRule>), HookError> {
     let manifest = grant.manifest.as_ref().ok_or_else(|| {
         HookError::data(
             "recovery-manifest-unavailable",
@@ -558,7 +569,17 @@ fn emergency_decision(
     });
     let mut action = DecisionAction::Allow;
     let mut reasons = Vec::new();
+    let mut coordination_rule = None;
     for rule in rules {
+        if matches!(rule.capability, Capability::SessionCoordination { .. }) {
+            if coordination_rule.replace(rule).is_some() {
+                return Err(HookError::data(
+                    "coordination-capability-ambiguous",
+                    "one dispatch may select at most one session coordination rule",
+                ));
+            }
+            continue;
+        }
         let (candidate, code) = if grant.rules.contains(&rule.id) {
             (DecisionAction::Allow, "recovery-exact-bypass")
         } else {
@@ -571,6 +592,9 @@ fn emergency_decision(
                 }
                 Capability::Transform { .. } => {
                     (DecisionAction::Transform, "recovery-manifest-transform")
+                }
+                Capability::SessionCoordination { .. } => {
+                    unreachable!("session coordination is deferred above")
                 }
                 Capability::SessionActivity { .. }
                 | Capability::OwnerLiveness { .. }
@@ -597,21 +621,24 @@ fn emergency_decision(
             disposition: action_name(candidate).to_string(),
         });
     }
-    Ok(NormalizedDecision {
-        schema_version: DECISION_VERSION.to_string(),
-        request_id: request.request_id.clone(),
-        product: request.product,
-        event: request.event.clone(),
-        action,
-        reasons,
-        context: None,
-        replacement: None,
-        shadow: Vec::new(),
-        config_digest: manifest.config_digest.clone(),
-        policy_digest: manifest.policy_digest.clone(),
-        recovery_applied: true,
-        provider_output: None,
-    })
+    Ok((
+        NormalizedDecision {
+            schema_version: DECISION_VERSION.to_string(),
+            request_id: request.request_id.clone(),
+            product: request.product,
+            event: request.event.clone(),
+            action,
+            reasons,
+            context: None,
+            replacement: None,
+            shadow: Vec::new(),
+            config_digest: manifest.config_digest.clone(),
+            policy_digest: manifest.policy_digest.clone(),
+            recovery_applied: true,
+            provider_output: None,
+        },
+        coordination_rule,
+    ))
 }
 
 fn emergency_action_rank(action: DecisionAction) -> u8 {
@@ -736,6 +763,7 @@ fn capability_id(capability: &Capability) -> &'static str {
         Capability::SessionActivity { .. } => "agent-session.activity.v1",
         Capability::OwnerLiveness { .. } => "agent-session.owner-liveness.v1",
         Capability::SemanticConflict { .. } => "agent-session.semantic-conflict.v1",
+        Capability::SessionCoordination { .. } => "agent-session.coordination.v1",
         Capability::RuntimeKitHandler { .. } => "runtime-kit.handler.v1",
     }
 }

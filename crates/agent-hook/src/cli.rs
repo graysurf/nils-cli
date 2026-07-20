@@ -121,7 +121,7 @@ pub struct SetupArgs {
     #[arg(
         long,
         required_unless_present_any = ["apply", "repair", "remove"],
-        conflicts_with_all = ["apply", "repair", "remove"]
+        conflicts_with_all = ["apply", "repair"]
     )]
     pub dry_run: bool,
 
@@ -134,7 +134,7 @@ pub struct SetupArgs {
     pub repair: bool,
 
     /// Remove only exact agent-hook-owned ingress.
-    #[arg(long, conflicts_with_all = ["dry_run", "apply", "repair"])]
+    #[arg(long, conflicts_with_all = ["apply", "repair"])]
     pub remove: bool,
 
     /// Digest from the reviewed preview; required for drift, compatibility, or dual state.
