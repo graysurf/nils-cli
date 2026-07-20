@@ -132,6 +132,129 @@ fn review_specialists_merge_dedupes_and_writes_summary() {
 }
 
 #[test]
+fn review_specialists_delivery_requires_a_stable_lifecycle_fingerprint() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let input = path_arg(&fixture("findings.valid.jsonl"));
+
+    let output = run(
+        "review-specialists",
+        tmp.path(),
+        &[
+            "merge", "--mode", "delivery", "--input", &input, "--format", "json",
+        ],
+    );
+
+    assert_eq!(output.code, exit::DATA, "stderr={}", output.stderr_text());
+    assert!(output.stdout_text().contains("review_fingerprint_required"));
+}
+
+#[test]
+fn review_specialists_delivery_merges_distinct_lenses_by_root_cause() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let input = tmp.path().join("findings.jsonl");
+    fs::write(
+        &input,
+        concat!(
+            r#"{"severity":"high","confidence":0.9,"path":"src/lib.rs","line":10,"category":"correctness","summary":"First lens","evidence":"evidence","recommendation":"fix","specialist":"testing","fingerprint":"correctness:review-loop:typed-state","root_cause_fingerprint":"correctness:review-loop:shared-root"}"#,
+            "\n",
+            r#"{"severity":"medium","confidence":0.8,"path":"src/lib.rs","line":12,"category":"correctness","summary":"Second lens","evidence":"evidence","recommendation":"fix","specialist":"maintainability","fingerprint":"correctness:review-loop:maintainable-state","root_cause_fingerprint":"correctness:review-loop:shared-root"}"#,
+            "\n",
+        ),
+    )
+    .expect("write findings");
+    let input_arg = path_arg(&input);
+
+    let output = run(
+        "review-specialists",
+        tmp.path(),
+        &[
+            "merge", "--mode", "delivery", "--input", &input_arg, "--format", "json",
+        ],
+    );
+
+    assert_eq!(output.code, 0, "stderr={}", output.stderr_text());
+    let value = output.stdout_json();
+    assert_eq!(value["data"]["schema"], "review-specialists.merged.v2");
+    assert_eq!(value["data"]["counts"]["merged"], 1);
+    assert_eq!(
+        value["data"]["findings"][0]["lifecycle_fingerprint"],
+        "correctness:review-loop:shared-root"
+    );
+    assert_eq!(
+        value["data"]["findings"][0]["source_rows"]
+            .as_array()
+            .expect("source rows")
+            .len(),
+        2
+    );
+}
+
+#[test]
+fn review_specialists_delivery_identity_survives_line_and_prose_drift() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let input = tmp.path().join("findings.jsonl");
+    fs::write(
+        &input,
+        concat!(
+            r#"{"severity":"high","confidence":0.9,"path":"src/old.rs","line":10,"category":"correctness","summary":"Original prose","evidence":"evidence","recommendation":"fix","specialist":"testing","fingerprint":"correctness:review-loop:typed-state"}"#,
+            "\n",
+            r#"{"severity":"high","confidence":0.8,"path":"src/new.rs","line":24,"category":"correctness","summary":"Reworded after the code moved","evidence":"new evidence","recommendation":"same fix","specialist":"maintainability","fingerprint":"correctness:review-loop:typed-state"}"#,
+            "\n",
+        ),
+    )
+    .expect("write findings");
+    let input_arg = path_arg(&input);
+
+    let output = run(
+        "review-specialists",
+        tmp.path(),
+        &[
+            "merge", "--mode", "delivery", "--input", &input_arg, "--format", "json",
+        ],
+    );
+
+    assert_eq!(output.code, 0, "stderr={}", output.stderr_text());
+    let value = output.stdout_json();
+    assert_eq!(value["data"]["counts"]["merged"], 1);
+    assert_eq!(
+        value["data"]["findings"][0]["lifecycle_fingerprint"],
+        "correctness:review-loop:typed-state"
+    );
+}
+
+#[test]
+fn review_specialists_delivery_rejects_incompatible_root_reuse() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let input = tmp.path().join("findings.jsonl");
+    fs::write(
+        &input,
+        concat!(
+            r#"{"severity":"high","confidence":0.9,"path":"src/lib.rs","category":"correctness","summary":"First","evidence":"evidence","recommendation":"fix","specialist":"testing","fingerprint":"correctness:review-loop:typed-state","root_cause_fingerprint":"correctness:review-loop:first-root"}"#,
+            "\n",
+            r#"{"severity":"high","confidence":0.8,"path":"src/lib.rs","category":"correctness","summary":"Second","evidence":"evidence","recommendation":"fix","specialist":"maintainability","fingerprint":"correctness:review-loop:typed-state","root_cause_fingerprint":"correctness:review-loop:second-root"}"#,
+            "\n",
+        ),
+    )
+    .expect("write findings");
+    let input_arg = path_arg(&input);
+
+    let output = run(
+        "review-specialists",
+        tmp.path(),
+        &[
+            "merge", "--mode", "delivery", "--input", &input_arg, "--format", "json",
+        ],
+    );
+
+    assert_eq!(output.code, exit::DATA, "stderr={}", output.stderr_text());
+    assert!(
+        output
+            .stdout_text()
+            .contains("review_fingerprint_collision")
+    );
+}
+
+#[test]
 fn review_specialists_render_issue_body_uses_github_links_from_envelope() {
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let input = path_arg(&fixture("findings.duplicates.jsonl"));

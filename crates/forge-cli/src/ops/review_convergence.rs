@@ -10,8 +10,12 @@ use crate::backend::BackendRunner;
 use crate::cli::BINARY;
 use crate::config::{ReviewBotMode, ReviewConvergenceBot, ReviewConvergencePolicy};
 use crate::error::ForgeError;
+use crate::ops::pr_review_threads::{
+    PrReviewThreadSummary, PrReviewThreadsPayload, compute_for_pr as compute_threads_for_pr,
+};
 use crate::ops::pr_reviews::{NativeReviewSummary, PrReviewsPayload, compute_for_pr_with_timeout};
 use crate::ops::pr_wait_checks::Clock;
+use crate::ops::review_state;
 use crate::provider::ProviderContext;
 
 const POLL_INTERVAL: Duration = Duration::from_secs(10);
@@ -25,6 +29,8 @@ pub struct ReviewConvergenceSnapshot {
     pub head_sha: String,
     pub observed_reviews: Vec<NativeReviewSummary>,
     pub stale_reviews: Vec<NativeReviewSummary>,
+    pub semantic_activity: Vec<String>,
+    pub semantic_digest: String,
     pub unresolved_threads: usize,
     pub changes_requested_by: Vec<String>,
     pub missing_reviewers: Vec<String>,
@@ -59,7 +65,10 @@ pub fn converge<R: BackendRunner, C: Clock>(
         let reviews = compute_for_pr_with_timeout(runner, ctx, number, pr_url, Some(remaining))
             .map_err(|err| map_provider_timeout(err, policy, expected_head_sha))?;
         ensure_expected_head(expected_head_sha, &reviews)?;
-        let mut snapshot = build_snapshot(policy, reviews, elapsed_ms(started, clock.now()));
+        let threads = compute_threads_for_pr(runner, ctx, pr_url, number)?;
+        ensure_thread_head(&reviews, &threads)?;
+        let mut snapshot =
+            build_snapshot(policy, reviews, threads, elapsed_ms(started, clock.now()));
 
         if clock.now() >= deadline {
             return Err(timeout_error(policy, Some(&snapshot.head_sha)));
@@ -72,17 +81,20 @@ pub fn converge<R: BackendRunner, C: Clock>(
         // `observed` is intentionally absence-tolerant: no configured bot
         // review means no wait, no missing reviewer, and no timeout budget is
         // consumed merely to discover whether a bot might run later.
-        if snapshot.observed_reviews.is_empty() || policy.quiet_period.is_zero() {
+        if snapshot.semantic_activity.is_empty() || policy.quiet_period.is_zero() {
             return Ok(snapshot);
         }
 
-        let fingerprint = activity_fingerprint(&snapshot.observed_reviews);
+        let fingerprint = snapshot.semantic_activity.clone();
         let now = clock.now();
-        if last_fingerprint.as_ref() != Some(&fingerprint) {
+        if last_fingerprint
+            .as_ref()
+            .is_none_or(|previous| has_new_activity(previous, &fingerprint))
+        {
             quiet_started = Some(now);
             quiet_until = wall_clock_quiet_until(policy.quiet_period);
-            last_fingerprint = Some(fingerprint);
         }
+        last_fingerprint = Some(fingerprint);
         snapshot.quiet_until = quiet_until.clone();
 
         let quiet_elapsed = quiet_started
@@ -119,18 +131,21 @@ pub fn recheck_before_merge<R: BackendRunner>(
         .map_err(|err| map_provider_timeout(err, policy, expected_head_sha))?;
     ensure_expected_head(expected_head_sha, &reviews)?;
     ensure_expected_head(Some(&previous.head_sha), &reviews)?;
-    let mut snapshot = build_snapshot(policy, reviews, previous.waited_ms);
+    let threads = compute_threads_for_pr(runner, ctx, pr_url, number)?;
+    ensure_thread_head(&reviews, &threads)?;
+    let mut snapshot = build_snapshot(policy, reviews, threads, previous.waited_ms);
     if !snapshot.changes_requested_by.is_empty() {
         return Err(changes_requested_error(&snapshot));
     }
-    if activity_fingerprint(&snapshot.observed_reviews)
-        != activity_fingerprint(&previous.observed_reviews)
-    {
+    if previous.semantic_digest != snapshot.semantic_digest {
         return Err(ForgeError::validation(
             schema_err(),
             "review_convergence_activity_changed",
-            "native review activity changed after convergence and before merge",
-            Some(format!("head_sha={}", snapshot.head_sha)),
+            "the combined semantic review/thread snapshot changed after convergence and before merge",
+            Some(format!(
+                "head_sha={}; previous_digest={}; current_digest={}",
+                snapshot.head_sha, previous.semantic_digest, snapshot.semantic_digest
+            )),
         ));
     }
     snapshot.quiet_until = previous.quiet_until.clone();
@@ -141,6 +156,7 @@ pub fn recheck_before_merge<R: BackendRunner>(
 fn build_snapshot(
     policy: &ReviewConvergencePolicy,
     reviews: PrReviewsPayload,
+    threads: PrReviewThreadsPayload,
     waited_ms: u64,
 ) -> ReviewConvergenceSnapshot {
     let observed_reviews = reviews
@@ -155,10 +171,34 @@ fn build_snapshot(
         .filter(|review| is_observed_login(&review.author, &policy.bots))
         .collect::<Vec<_>>();
     let changes_requested_by = effective_changes_requested_by(&reviews.current_head_reviews);
-    let latest_activity_at = observed_reviews
+    let semantic_activity =
+        combined_activity_fingerprint(&observed_reviews, &threads.threads, &policy.bots);
+    let semantic_digest = review_state::sha256_digest(
+        serde_json::to_string(&semantic_activity)
+            .expect("semantic activity serializes")
+            .as_bytes(),
+    );
+    let latest_review_activity = observed_reviews
         .iter()
+        .filter(|review| review_is_semantic(review))
         .map(|review| review.submitted_at.as_str())
         .filter(|submitted| !submitted.is_empty())
+        .max();
+    let latest_thread_activity = threads
+        .threads
+        .iter()
+        .filter(|thread| !thread.resolved && !thread.outdated)
+        .flat_map(|thread| thread.comments.iter())
+        .filter(|comment| {
+            is_observed_login(&comment.author, &policy.bots)
+                && meaningful_thread_comment(&comment.body)
+        })
+        .map(|comment| comment.created_at.as_str())
+        .filter(|created| !created.is_empty())
+        .max();
+    let latest_activity_at = latest_review_activity
+        .into_iter()
+        .chain(latest_thread_activity)
         .max()
         .map(str::to_string);
 
@@ -167,7 +207,13 @@ fn build_snapshot(
         head_sha: reviews.head_sha,
         observed_reviews,
         stale_reviews,
-        unresolved_threads: 0,
+        semantic_activity,
+        semantic_digest,
+        unresolved_threads: threads
+            .threads
+            .iter()
+            .filter(|thread| !thread.resolved && !thread.outdated)
+            .count(),
         changes_requested_by,
         missing_reviewers: Vec::new(),
         latest_activity_at,
@@ -249,20 +295,111 @@ fn normalized_login(login: &str) -> String {
 fn activity_fingerprint(reviews: &[NativeReviewSummary]) -> Vec<String> {
     let mut fingerprint = reviews
         .iter()
-        .map(|review| {
-            format!(
-                "{}:{}:{}:{}:{}:{}",
-                review.id,
+        .filter_map(|review| {
+            let summary = review_state::strip_owned_markers(&review.summary);
+            let opinionated = matches!(
+                review.state.as_str(),
+                "APPROVED" | "CHANGES_REQUESTED" | "DISMISSED"
+            );
+            if !opinionated && summary.trim().is_empty() {
+                return None;
+            }
+            Some(format!(
+                "review:{}:{}:{}:{}:{}",
+                normalized_login(&review.author),
                 review.state,
                 review.commit_sha,
-                review.submitted_at,
                 review.summary_truncated,
-                review.summary,
-            )
+                summary,
+            ))
         })
         .collect::<Vec<_>>();
     fingerprint.sort();
+    fingerprint.dedup();
     fingerprint
+}
+
+fn combined_activity_fingerprint(
+    reviews: &[NativeReviewSummary],
+    threads: &[PrReviewThreadSummary],
+    bots: &[ReviewConvergenceBot],
+) -> Vec<String> {
+    let mut fingerprint = activity_fingerprint(reviews);
+    for thread in threads
+        .iter()
+        .filter(|thread| !thread.resolved && !thread.outdated)
+    {
+        let meaningful_comments = thread
+            .comments
+            .iter()
+            .filter(|comment| {
+                is_observed_login(&comment.author, bots) && meaningful_thread_comment(&comment.body)
+            })
+            .map(|comment| {
+                format!(
+                    "{}:{}",
+                    normalized_login(&comment.author),
+                    review_state::strip_owned_markers(&comment.body)
+                )
+            })
+            .collect::<Vec<_>>();
+        if meaningful_comments.is_empty() {
+            continue;
+        }
+        fingerprint.push(format!(
+            "thread:{}:{}:{:?}:{:?}:{:?}:{}",
+            thread.id,
+            thread.path,
+            thread.diff_side,
+            thread.line,
+            thread.start_line,
+            meaningful_comments.join("|")
+        ));
+    }
+    fingerprint.sort();
+    fingerprint.dedup();
+    fingerprint
+}
+
+fn meaningful_thread_comment(body: &str) -> bool {
+    !review_state::has_thread_disposition_marker(body)
+        && !review_state::strip_owned_markers(body).trim().is_empty()
+}
+
+fn review_is_semantic(review: &NativeReviewSummary) -> bool {
+    matches!(
+        review.state.as_str(),
+        "APPROVED" | "CHANGES_REQUESTED" | "DISMISSED"
+    ) || !review_state::strip_owned_markers(&review.summary)
+        .trim()
+        .is_empty()
+}
+
+fn has_new_activity(previous: &[String], current: &[String]) -> bool {
+    let previous = previous
+        .iter()
+        .map(String::as_str)
+        .collect::<std::collections::BTreeSet<_>>();
+    current.iter().any(|item| !previous.contains(item.as_str()))
+}
+
+fn ensure_thread_head(
+    reviews: &PrReviewsPayload,
+    threads: &PrReviewThreadsPayload,
+) -> Result<(), ForgeError> {
+    if threads.head_sha.as_deref() == Some(reviews.head_sha.as_str()) {
+        return Ok(());
+    }
+    Err(ForgeError::validation(
+        schema_err(),
+        "review_convergence_head_changed",
+        "native review and thread snapshots are not bound to the same provider head",
+        Some(format!(
+            "review_head={}; thread_head={}",
+            reviews.head_sha,
+            threads.head_sha.as_deref().unwrap_or("<missing>")
+        )),
+    ))
 }
 
 fn changes_requested_error(snapshot: &ReviewConvergenceSnapshot) -> ForgeError {
@@ -355,6 +492,7 @@ mod tests {
     struct QueueRunner {
         outputs: RefCell<VecDeque<String>>,
         calls: Cell<usize>,
+        last_head: RefCell<String>,
     }
 
     impl QueueRunner {
@@ -362,12 +500,23 @@ mod tests {
             Self {
                 outputs: RefCell::new(outputs.into_iter().collect()),
                 calls: Cell::new(0),
+                last_head: RefCell::new("head".to_string()),
             }
         }
     }
 
     impl BackendRunner for QueueRunner {
-        fn run(&self, _call: &BackendCall) -> Result<BackendSuccess, ForgeError> {
+        fn run(&self, call: &BackendCall) -> Result<BackendSuccess, ForgeError> {
+            if call
+                .argv
+                .iter()
+                .any(|arg| arg.to_string_lossy().contains("reviewThreads(first"))
+            {
+                return Ok(BackendSuccess {
+                    stdout: threads_json(&self.last_head.borrow(), ""),
+                    stderr: String::new(),
+                });
+            }
             self.calls.set(self.calls.get() + 1);
             let mut outputs = self.outputs.borrow_mut();
             let value = if outputs.len() > 1 {
@@ -375,6 +524,17 @@ mod tests {
             } else {
                 outputs.front().cloned().expect("queued review output")
             };
+            if let Some(head) = serde_json::from_str::<serde_json::Value>(&value)
+                .ok()
+                .and_then(|value| {
+                    value
+                        .pointer("/data/repository/pullRequest/headRefOid")
+                        .and_then(|head| head.as_str())
+                        .map(str::to_string)
+                })
+            {
+                *self.last_head.borrow_mut() = head;
+            }
             Ok(BackendSuccess {
                 stdout: value,
                 stderr: String::new(),
@@ -474,6 +634,12 @@ mod tests {
         )
     }
 
+    fn threads_json(head: &str, threads: &str) -> String {
+        format!(
+            r#"{{"data":{{"repository":{{"pullRequest":{{"headRefOid":"{head}","reviewThreads":{{"nodes":[{threads}],"pageInfo":{{"hasNextPage":false,"endCursor":null}}}}}}}}}}}}"#
+        )
+    }
+
     fn review(id: &str, state: &str, submitted_at: &str) -> String {
         format!(
             r#"{{"id":"{id}","databaseId":1,"url":"https://github.com/acme/widgets/pull/7#pullrequestreview-1","author":{{"login":"example-review-bot[bot]"}},"state":"{state}","commit":{{"oid":"head"}},"submittedAt":"{submitted_at}","body":"summary"}}"#
@@ -507,6 +673,78 @@ mod tests {
         assert_eq!(
             activity_fingerprint(&[review("b"), review("a")]),
             activity_fingerprint(&[review("a"), review("b")])
+        );
+    }
+
+    #[test]
+    fn empty_cleanup_commented_review_does_not_reset_semantic_quiet() {
+        let review = NativeReviewSummary {
+            id: "cleanup".into(),
+            database_id: None,
+            url: String::new(),
+            author: "example-review-bot[bot]".into(),
+            state: "COMMENTED".into(),
+            commit_sha: "head".into(),
+            submitted_at: "2026-07-14T04:00:00Z".into(),
+            summary: "<!-- forge-cli:review-run:v1 run=sha256:abc -->".into(),
+            summary_truncated: false,
+        };
+
+        assert!(activity_fingerprint(&[review]).is_empty());
+    }
+
+    fn thread(resolved: bool, outdated: bool, body: &str) -> PrReviewThreadSummary {
+        PrReviewThreadSummary {
+            id: "PRRT_1".into(),
+            resolved,
+            outdated,
+            author: "example-review-bot[bot]".into(),
+            path: "src/lib.rs".into(),
+            diff_side: Some("RIGHT".into()),
+            line: Some(10),
+            original_line: Some(10),
+            original_start_line: None,
+            start_diff_side: None,
+            start_line: None,
+            subject_type: Some("LINE".into()),
+            created_at: "2026-07-14T04:00:00Z".into(),
+            url: String::new(),
+            body: body.into(),
+            comments: vec![crate::ops::pr_review_threads::PrReviewThreadComment {
+                id: "PRRC_1".into(),
+                author: "example-review-bot[bot]".into(),
+                body: body.into(),
+                created_at: "2026-07-14T04:00:00Z".into(),
+                url: String::new(),
+            }],
+        }
+    }
+
+    #[test]
+    fn combined_activity_counts_live_inline_findings_but_not_cleanup_transitions() {
+        let bots = policy(2, 20).bots;
+        let live = thread(false, false, "inline-only defect");
+        let live_activity = combined_activity_fingerprint(&[], std::slice::from_ref(&live), &bots);
+        assert_eq!(live_activity.len(), 1);
+
+        let resolved_activity =
+            combined_activity_fingerprint(&[], &[thread(true, false, "inline-only defect")], &bots);
+        assert!(!has_new_activity(&live_activity, &resolved_activity));
+
+        let reopened_activity = combined_activity_fingerprint(&[], &[live], &bots);
+        assert!(has_new_activity(&resolved_activity, &reopened_activity));
+
+        let disposition = format!(
+            "fixed\n{}",
+            review_state::thread_disposition_marker("PRRT_1")
+        );
+        assert!(
+            combined_activity_fingerprint(&[], &[thread(false, false, &disposition)], &bots)
+                .is_empty()
+        );
+        assert!(
+            combined_activity_fingerprint(&[], &[thread(false, true, "outdated finding")], &bots)
+                .is_empty()
         );
     }
 
@@ -615,7 +853,8 @@ mod tests {
     #[test]
     fn new_observed_activity_restarts_the_quiet_period() {
         let first = review("PRR_1", "COMMENTED", "2026-07-14T04:00:00Z");
-        let second = review("PRR_2", "COMMENTED", "2026-07-14T04:00:01Z");
+        let second = review("PRR_2", "COMMENTED", "2026-07-14T04:00:01Z")
+            .replace("\"body\":\"summary\"", "\"body\":\"new finding\"");
         let both = format!("{first},{second}");
         let runner = QueueRunner::new([
             reviews_json("head", &first),

@@ -34,6 +34,7 @@ use crate::config::{ForgeConfig, MergeMethod, ReviewConvergencePolicy};
 use crate::envelope::emit_success;
 use crate::error::ForgeError;
 use crate::ops::gitlab_api;
+use crate::ops::pr_review_loop::{self, ReviewLoopMergeGate};
 use crate::ops::pr_review_threads;
 use crate::ops::pr_tasks;
 use crate::ops::pr_view;
@@ -76,6 +77,10 @@ pub struct PrMergePayload {
     /// enabled for this invocation.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub review_convergence: Option<ReviewConvergenceSnapshot>,
+    /// Present when this PR has a durable review-loop ledger. The exact tip is
+    /// re-read immediately before the provider merge.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub review_loop: Option<ReviewLoopMergeGate>,
 }
 
 pub fn run(
@@ -359,6 +364,32 @@ fn run_lockdown_chain<R: BackendRunner, C: Clock>(
     // Rule 8 — TTL-zero required-check re-check.
     ensure_required_checks_green(runner, global, ctx, &args.id.to_string())?;
 
+    // Durable review-loop gate. Existing ledgers are never bypassed by the
+    // independent quiet-convergence flag. Enforced convergence additionally
+    // requires an explicit genesis observation before merge.
+    let mut review_loop = if ctx.provider == Provider::GitHub
+        && (pr.head_sha.is_some() || settings.review_policy.require)
+    {
+        let head = pr.head_sha.as_deref().ok_or_else(|| {
+            ForgeError::validation(
+                schema_err(),
+                "review_state_conflict",
+                "a bounded GitHub merge requires a provider head for review-loop CAS",
+                None,
+            )
+        })?;
+        pr_review_loop::ensure_merge_ready(
+            runner,
+            ctx,
+            &pr.url,
+            args.id,
+            head,
+            settings.review_policy.require,
+        )?
+    } else {
+        None
+    };
+
     // Rule 12 — optional native-review convergence. The first v1 mode is
     // absence-tolerant `observed`: configured bots do not become required, but
     // any current-head activity that already exists must settle for the quiet
@@ -411,8 +442,7 @@ fn run_lockdown_chain<R: BackendRunner, C: Clock>(
     // read. Provider-side branch protection remains the atomic enforcement
     // layer for activity racing this final read and the merge mutation.
     if let Some(previous) = review_snapshot.as_ref() {
-        let unresolved_threads = previous.unresolved_threads;
-        let mut final_snapshot = review_convergence::recheck_before_merge(
+        let final_snapshot = review_convergence::recheck_before_merge(
             runner,
             ctx,
             args.id,
@@ -421,8 +451,25 @@ fn run_lockdown_chain<R: BackendRunner, C: Clock>(
             settings.review_policy,
             previous,
         )?;
-        final_snapshot.unresolved_threads = unresolved_threads;
         review_snapshot = Some(final_snapshot);
+    }
+
+    if let Some(previous) = review_loop.as_ref() {
+        review_loop = Some(pr_review_loop::recheck_merge_ready(
+            runner,
+            ctx,
+            &pr.url,
+            args.id,
+            pr.head_sha.as_deref().ok_or_else(|| {
+                ForgeError::validation(
+                    schema_err(),
+                    "review_state_conflict",
+                    "the provider head disappeared before review-loop recheck",
+                    None,
+                )
+            })?,
+            previous,
+        )?);
     }
 
     // All gates clear — invoke the backend.
@@ -454,6 +501,7 @@ fn run_lockdown_chain<R: BackendRunner, C: Clock>(
         },
         stale_thread_dispositions,
         review_convergence: review_snapshot,
+        review_loop,
     })
 }
 

@@ -61,6 +61,7 @@ browser-session init --out /tmp/browser --target http://localhost:3000 --goal "v
 review-evidence init --out /tmp/review --subject "PR #123"
 review-specialists validate --input findings.jsonl --format json
 review-specialists merge --input findings.jsonl --summary-out review.md
+review-specialists merge --mode delivery --input findings.jsonl --format json
 model-cross-check init --out /tmp/cross-check --prompt "review patch" --primary-model gpt-5.4 --checker-model gpt-5.5
 skill-usage init --out /tmp/skill --skill tools/devex/review-evidence --intent "record review" --user-request-summary "review this PR"
 skill-usage init --out /tmp/workflow --owner-kind workflow --owner-id deliver-pr --intent "deliver change" --user-request-summary "deliver this PR"
@@ -108,6 +109,15 @@ schema, normalizes severity and confidence, deduplicates by stable fingerprint,
 renders local Markdown/JSON profiles, writes small artifact bundles, and
 classifies Git diffs for specialist routing. It does not run LLM prompts, spawn
 subagents, post comments, open issues, merge PRs, or close issues.
+
+For delivery workflows, pass `--mode delivery` to `validate`, `merge`, or
+`bundle`. Delivery mode requires an explicit stable
+`<category>:<component>:<invariant>` fingerprint per finding, supports an
+optional `root_cause_fingerprint` for cross-lens grouping, preserves all source
+rows, and emits lifecycle identities consumable by `forge-cli pr review-loop`.
+The review-loop observation array may then record an explicit `status` or
+`disposition` (`open`, `fixed`, `accepted`, `preference`, or `follow-up`) for
+auditable agent or maintainer judgement.
 
 ```bash
 review-specialists scope --base main --format json

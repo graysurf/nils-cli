@@ -5,6 +5,7 @@
 //! `pr_deliver.rs` module; this one pins the lock-step ordering and
 //! short-circuit behaviour against real subprocess wiring.
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -18,6 +19,9 @@ use forge_cli::cli::{GlobalFlags, MergeMethodFlag, PrDeliverArgs, PrKindFlag, Pr
 use forge_cli::error::ForgeError;
 use forge_cli::macros::pr_deliver;
 use forge_cli::ops::pr_wait_checks::SystemClock;
+use forge_cli::ops::review_state::{
+    ReviewLoopBudget, ReviewLoopState, ReviewStatePayload, ReviewStateRecord,
+};
 use nils_common::cli_contract::OutputFormat;
 use nils_test_support::fixtures::SubjectBoundEvidenceFixture;
 
@@ -30,6 +34,37 @@ const FIXTURE_PENDING_CHECKS_JSON: &str =
 const FIXTURE_FAILED_CHECKS_JSON: &str =
     include_str!("../fixtures/github/pr_checks/mixed_failure_required.json");
 const FIXTURE_EMPTY_CHECKS_JSON: &str = include_str!("../fixtures/github/pr_checks/empty.json");
+
+fn clean_review_loop_comment(repository: &str, pr: u64, head: &str) -> String {
+    let marker = ReviewStateRecord::new(
+        repository,
+        pr,
+        head,
+        0,
+        None,
+        ReviewStatePayload::ReviewLoop {
+            state: ReviewLoopState {
+                head_sha: head.to_string(),
+                round: 0,
+                no_progress_rounds: 0,
+                budget: ReviewLoopBudget::default(),
+                findings: BTreeMap::new(),
+                extensions: Vec::new(),
+                hard_stop: None,
+            },
+        },
+    )
+    .expect("review-loop record")
+    .marker()
+    .expect("review-loop marker");
+    serde_json::json!({
+        "author": {"login": "testuser-gh"},
+        "authorAssociation": "MEMBER",
+        "body": marker,
+        "createdAt": "2026-07-20T12:00:00Z"
+    })
+    .to_string()
+}
 
 /// Full pr.view JSON used by every step that re-fetches the PR. The fixture
 /// at `tests/fixtures/github/pr_create/view_response.json` was designed for
@@ -504,6 +539,7 @@ fn write_chain_stub_with_check_transition(
         .ok()
         .and_then(|value| value["headRefOid"].as_str().map(str::to_string))
         .unwrap_or_else(|| "head123".to_string());
+    let review_state_node = clean_review_loop_comment("sympoies/nils-cli", 123, &thread_head_sha);
     let merge_branch = if merge_exits_one {
         format!(
             "    echo \"$*\" > {merge_args}\n    touch {sentinel}\n    echo 'X stderr warning after merge' >&2\n    exit 1\n",
@@ -589,6 +625,9 @@ EOF
     ;;
   "api graphql")
     case "$*" in
+      *"authorAssociation body createdAt"*)
+        printf '%s\n' '{{"data":{{"viewer":{{"login":"testuser-gh"}},"repository":{{"pullRequest":{{"comments":{{"nodes":[{review_state_node}],"pageInfo":{{"hasNextPage":false,"endCursor":null}}}}}}}}}}}}'
+        ;;
       *"reviews(first:"*)
         if [ ! -f {review_response} ]; then
           echo "stub: unexpected native-review query" >&2
@@ -643,6 +682,7 @@ esac
         required_checks = required_checks,
         checks_calls = checks_calls.display(),
         review_response = review_response.display(),
+        review_state_node = review_state_node,
         merge_branch = merge_branch,
         sentinel = sentinel.display(),
     );
@@ -676,6 +716,7 @@ fn write_adopt_chain_stub(stub: &StubEnv, pre_view: &str) -> PathBuf {
         .map(|sha| view_with_head_oid(MERGED_PR_VIEW_JSON, sha))
         .unwrap_or_else(|| MERGED_PR_VIEW_JSON.to_string());
     let thread_head_sha = head_sha.as_deref().unwrap_or("head123");
+    let review_state_node = clean_review_loop_comment("sympoies/nils-cli", 123, thread_head_sha);
     let body = format!(
         r#"#!/bin/sh
 set -e
@@ -719,9 +760,16 @@ EOF
     touch {ready_sentinel}
     ;;
   "api graphql")
-    cat <<'EOF'
+    case "$*" in
+      *"authorAssociation body createdAt"*)
+        printf '%s\n' '{{"data":{{"viewer":{{"login":"testuser-gh"}},"repository":{{"pullRequest":{{"comments":{{"nodes":[{review_state_node}],"pageInfo":{{"hasNextPage":false,"endCursor":null}}}}}}}}}}}}'
+        ;;
+      *)
+        cat <<'EOF'
 {{ "data": {{ "repository": {{ "pullRequest": {{ "headRefOid": "{thread_head_sha}", "reviewThreads": {{ "nodes": [], "pageInfo": {{ "hasNextPage": false, "endCursor": null }} }} }} }} }} }}
 EOF
+        ;;
+    esac
     ;;
   "pr merge")
     echo "$*" > {merge_args}
@@ -766,6 +814,7 @@ esac
         ready_sentinel = ready_sentinel.display(),
         merge_sentinel = merge_sentinel.display(),
         merge_args = merge_args.display(),
+        review_state_node = review_state_node,
     );
     let path = stub.tempdir.path().join("gh");
     fs::write(&path, body).expect("write gh stub");

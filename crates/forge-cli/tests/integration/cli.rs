@@ -168,6 +168,7 @@ fn pr_help_lists_every_v1_subcommand() {
         "review-threads",
         "reviews",
         "pending-review",
+        "review-loop",
         "ready",
         "merge",
         "close",
@@ -180,6 +181,68 @@ fn pr_help_lists_every_v1_subcommand() {
             "pr --help missing {sub}: stdout={}",
             out.stdout
         );
+    }
+}
+
+#[test]
+fn pr_review_loop_dry_run_uses_each_command_specific_schema_without_backend_calls() {
+    let stub = StubEnv::new();
+    let cases = [
+        (
+            vec!["pr", "review-loop", "inspect", "7"],
+            "cli.forge-cli.pr.review-loop.inspect.v1",
+        ),
+        (
+            vec![
+                "pr",
+                "review-loop",
+                "observe",
+                "7",
+                "--expected-head",
+                "abc123",
+                "--findings-file",
+                "findings.json",
+            ],
+            "cli.forge-cli.pr.review-loop.observe.v1",
+        ),
+        (
+            vec![
+                "pr",
+                "review-loop",
+                "extend",
+                "7",
+                "--expected-head",
+                "abc123",
+                "--expected-state",
+                "sha256:tip",
+                "--stop-code",
+                "review_no_progress",
+                "--budget-field",
+                "max_no_progress_rounds",
+                "--proposal-digest",
+                "sha256:proposal",
+                "--approval-comment",
+                "42",
+            ],
+            "cli.forge-cli.pr.review-loop.extend.v1",
+        ),
+    ];
+
+    for (command, schema) in cases {
+        let mut args = vec![
+            "--format",
+            "json",
+            "--dry-run",
+            "--provider",
+            "github",
+            "--repo",
+            "acme/widgets",
+        ];
+        args.extend(command);
+        let out = run_forge_cli(&stub, &args);
+        assert_eq!(out.code, 0, "stderr={}", out.stderr);
+        let envelope = parse_envelope(&out.stdout);
+        assert_eq!(envelope["schema_version"], schema);
     }
 }
 

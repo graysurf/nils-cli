@@ -19,6 +19,7 @@ const STATE_MARKER_CLOSE: &str = " -->";
 const MAX_PROVIDER_STATE_MARKER_BYTES: usize = 64 * 1024;
 const REVIEW_RUN_MARKER_PREFIX: &str = "<!-- forge-cli:review-run:v1 run=";
 const FINDING_MARKER_PREFIX: &str = "<!-- forge-cli:review-finding:v1 run=";
+const THREAD_DISPOSITION_MARKER_PREFIX: &str = "<!-- forge-cli:thread-disposition:v1 thread=";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ReviewCommentManifestItem {
@@ -44,10 +45,109 @@ pub struct ReviewRunReceipt {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ReviewLoopBudget {
+    pub max_repair_rounds: u32,
+    pub max_no_progress_rounds: u32,
+    pub max_auto_reopens_per_fingerprint: u32,
+}
+
+impl Default for ReviewLoopBudget {
+    fn default() -> Self {
+        Self {
+            max_repair_rounds: 5,
+            max_no_progress_rounds: 2,
+            max_auto_reopens_per_fingerprint: 0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum ReviewFindingStatus {
+    Open,
+    Fixed,
+    Accepted,
+    Preference,
+    FollowUp,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ReviewLoopFinding {
+    pub root_cause_fingerprint: Option<String>,
+    pub status: ReviewFindingStatus,
+    pub blocking: bool,
+    pub first_seen_head: String,
+    pub last_seen_head: String,
+    pub seen_count: u32,
+    #[serde(default)]
+    pub reopen_count: u32,
+    #[serde(default)]
+    pub threads: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ReviewLoopExtension {
+    pub proposal_digest: String,
+    pub approval_reference: String,
+    pub budget_field: String,
+    pub increment: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ReviewLoopState {
+    pub head_sha: String,
+    pub round: u32,
+    pub no_progress_rounds: u32,
+    pub budget: ReviewLoopBudget,
+    #[serde(default)]
+    pub findings: BTreeMap<String, ReviewLoopFinding>,
+    #[serde(default)]
+    pub extensions: Vec<ReviewLoopExtension>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hard_stop: Option<ReviewLoopHardStop>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ReviewFindingObservation {
+    pub fingerprint: String,
+    pub root_cause_fingerprint: Option<String>,
+    #[serde(default = "default_true")]
+    pub blocking: bool,
+    #[serde(default = "default_open_status")]
+    pub status: ReviewFindingStatus,
+    #[serde(default)]
+    pub threads: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ReviewLoopHardStop {
+    pub code: String,
+    pub budget_field: String,
+    pub increment: u32,
+    pub proposal_digest: String,
+    pub attempted_head_sha: String,
+    pub observation_digest: String,
+    #[serde(default)]
+    pub extension_applied: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReviewLoopTransition {
+    pub state: ReviewLoopState,
+    pub changed: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
 pub enum ReviewStatePayload {
     ReviewRunReceipt { receipt: ReviewRunReceipt },
-    ReviewLoop { state: serde_json::Value },
+    ReviewLoop { state: ReviewLoopState },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -186,6 +286,22 @@ pub fn parse_chain<'a>(
                 Some(format!("record_digest={}", record.record_digest)),
             ));
         }
+        if let ReviewStatePayload::ReviewLoop { state } = &record.payload {
+            validate_review_loop_state(state)?;
+            let stopped_head_matches = state
+                .hard_stop
+                .as_ref()
+                .is_some_and(|stop| stop.attempted_head_sha == record.expected_head);
+            if state.head_sha != record.expected_head && !stopped_head_matches {
+                return Err(state_conflict(
+                    "review-loop state head differs from its enclosing record",
+                    Some(format!(
+                        "record_head={}; state_head={}",
+                        record.expected_head, state.head_sha
+                    )),
+                ));
+            }
+        }
         if let Some(existing) = by_digest.get(&record.record_digest) {
             if **existing == *record {
                 continue;
@@ -280,12 +396,596 @@ pub fn parse_state_marker(body: &str) -> Result<Option<ReviewStateRecord>, Forge
     })
 }
 
+pub fn latest_review_loop_state(chain: &ReviewStateChain) -> Option<&ReviewLoopState> {
+    chain
+        .records
+        .iter()
+        .rev()
+        .find_map(|record| match &record.payload {
+            ReviewStatePayload::ReviewLoop { state } => Some(state),
+            ReviewStatePayload::ReviewRunReceipt { .. } => None,
+        })
+}
+
+pub fn observe_review_loop(
+    previous: Option<&ReviewLoopState>,
+    expected_head: &str,
+    observations: &[ReviewFindingObservation],
+) -> Result<ReviewLoopTransition, ForgeError> {
+    if expected_head.trim().is_empty() {
+        return Err(state_conflict(
+            "review-loop observation head is empty",
+            None,
+        ));
+    }
+    let current = canonical_observations(observations)?;
+    let Some(previous) = previous else {
+        let findings = current
+            .into_iter()
+            .map(|(fingerprint, observation)| {
+                (
+                    fingerprint,
+                    ReviewLoopFinding {
+                        root_cause_fingerprint: observation.root_cause_fingerprint,
+                        status: observation.status,
+                        blocking: observation.status == ReviewFindingStatus::Open
+                            && observation.blocking,
+                        first_seen_head: expected_head.to_string(),
+                        last_seen_head: expected_head.to_string(),
+                        seen_count: 1,
+                        reopen_count: 0,
+                        threads: observation.threads,
+                    },
+                )
+            })
+            .collect();
+        return Ok(ReviewLoopTransition {
+            state: ReviewLoopState {
+                head_sha: expected_head.to_string(),
+                round: 0,
+                no_progress_rounds: 0,
+                budget: ReviewLoopBudget::default(),
+                findings,
+                extensions: Vec::new(),
+                hard_stop: None,
+            },
+            changed: true,
+        });
+    };
+
+    validate_review_loop_state(previous)?;
+    let resumed_previous = if let Some(stop) = previous.hard_stop.as_ref() {
+        let observation_digest = review_observation_digest(expected_head, &current)?;
+        if stop.attempted_head_sha != expected_head || stop.observation_digest != observation_digest
+        {
+            return Err(state_conflict(
+                "a different observation cannot replace the durable review hard stop",
+                Some(format!(
+                    "stop_head={}; attempted_head={expected_head}; stop_observation={}; attempted_observation={observation_digest}",
+                    stop.attempted_head_sha, stop.observation_digest
+                )),
+            ));
+        }
+        if !stop.extension_applied {
+            return Err(hard_stop_error(stop));
+        }
+        let mut resumed = previous.clone();
+        resumed.hard_stop = None;
+        Some(resumed)
+    } else {
+        None
+    };
+    let previous = resumed_previous.as_ref().unwrap_or(previous);
+    let head_changed = previous.head_sha != expected_head;
+    if !head_changed && observation_matches_state(previous, &current) {
+        return Ok(ReviewLoopTransition {
+            state: previous.clone(),
+            changed: false,
+        });
+    }
+    if !head_changed {
+        for (fingerprint, finding) in &previous.findings {
+            if finding.status != ReviewFindingStatus::Open {
+                continue;
+            }
+            let Some(observation) = current.get(fingerprint) else {
+                return Err(state_conflict(
+                    "same-head observation cannot omit an open finding",
+                    Some(format!("fingerprint={fingerprint}; head={expected_head}")),
+                ));
+            };
+            if observation.status == ReviewFindingStatus::Fixed
+                || (finding.blocking
+                    && observation.status == ReviewFindingStatus::Open
+                    && !observation.blocking)
+            {
+                return Err(state_conflict(
+                    "same-head observation cannot implicitly clear an open blocking finding",
+                    Some(format!("fingerprint={fingerprint}; head={expected_head}")),
+                ));
+            }
+        }
+    }
+    let next_round = previous.round + u32::from(head_changed);
+    if next_round > previous.budget.max_repair_rounds {
+        return Err(review_stop(
+            "review_round_limit_exceeded",
+            "review repair-round budget is exhausted",
+            format!(
+                "round={next_round}; max_repair_rounds={}",
+                previous.budget.max_repair_rounds
+            ),
+        ));
+    }
+
+    let previous_blocking = previous
+        .findings
+        .values()
+        .filter(|finding| finding.status == ReviewFindingStatus::Open && finding.blocking)
+        .count();
+    let current_blocking = current
+        .values()
+        .filter(|finding| finding.status == ReviewFindingStatus::Open && finding.blocking)
+        .count();
+    let next_no_progress = if head_changed && current_blocking >= previous_blocking {
+        previous.no_progress_rounds.saturating_add(1)
+    } else if head_changed {
+        0
+    } else {
+        previous.no_progress_rounds
+    };
+    if next_no_progress > previous.budget.max_no_progress_rounds {
+        return Err(review_stop(
+            "review_no_progress",
+            "the blocking finding set did not shrink within the configured budget",
+            format!(
+                "previous_blocking={previous_blocking}; current_blocking={current_blocking}; no_progress_rounds={next_no_progress}; max_no_progress_rounds={}",
+                previous.budget.max_no_progress_rounds
+            ),
+        ));
+    }
+
+    let observed_fingerprints = current.keys().cloned().collect::<BTreeSet<_>>();
+    let mut findings = previous.findings.clone();
+    for (fingerprint, observation) in current {
+        match findings.get_mut(&fingerprint) {
+            Some(finding) => {
+                if finding.root_cause_fingerprint != observation.root_cause_fingerprint {
+                    return Err(review_stop(
+                        "review_fingerprint_collision",
+                        "a lifecycle fingerprint changed root-cause identity",
+                        format!("fingerprint={fingerprint}"),
+                    ));
+                }
+                if finding.status == ReviewFindingStatus::Fixed
+                    && observation.status == ReviewFindingStatus::Open
+                {
+                    let reopen_count = finding.reopen_count.saturating_add(1);
+                    if reopen_count > previous.budget.max_auto_reopens_per_fingerprint {
+                        return Err(review_stop(
+                            "review_finding_reopened",
+                            "a fixed lifecycle finding reappeared",
+                            format!(
+                                "fingerprint={fingerprint}; reopen_count={reopen_count}; max_auto_reopens_per_fingerprint={}",
+                                previous.budget.max_auto_reopens_per_fingerprint
+                            ),
+                        ));
+                    }
+                    finding.reopen_count = reopen_count;
+                }
+                if observation.status == ReviewFindingStatus::Fixed && !head_changed {
+                    return Err(state_conflict(
+                        "a fixed disposition requires a repaired head",
+                        Some(format!("fingerprint={fingerprint}; head={expected_head}")),
+                    ));
+                }
+                finding.status = observation.status;
+                finding.blocking =
+                    observation.status == ReviewFindingStatus::Open && observation.blocking;
+                finding.last_seen_head = expected_head.to_string();
+                finding.seen_count = finding.seen_count.saturating_add(1);
+                finding.threads.extend(observation.threads);
+                finding.threads.sort();
+                finding.threads.dedup();
+            }
+            None => {
+                findings.insert(
+                    fingerprint,
+                    ReviewLoopFinding {
+                        root_cause_fingerprint: observation.root_cause_fingerprint,
+                        status: observation.status,
+                        blocking: observation.status == ReviewFindingStatus::Open
+                            && observation.blocking,
+                        first_seen_head: expected_head.to_string(),
+                        last_seen_head: expected_head.to_string(),
+                        seen_count: 1,
+                        reopen_count: 0,
+                        threads: observation.threads,
+                    },
+                );
+            }
+        }
+    }
+    for (fingerprint, finding) in &mut findings {
+        if head_changed
+            && !observed_fingerprints.contains(fingerprint)
+            && finding.status == ReviewFindingStatus::Open
+        {
+            finding.status = ReviewFindingStatus::Fixed;
+        }
+    }
+
+    let state = ReviewLoopState {
+        head_sha: expected_head.to_string(),
+        round: next_round,
+        no_progress_rounds: next_no_progress,
+        budget: previous.budget.clone(),
+        findings,
+        extensions: previous.extensions.clone(),
+        hard_stop: None,
+    };
+    Ok(ReviewLoopTransition {
+        changed: state != *previous,
+        state,
+    })
+}
+
+pub fn extension_proposal_digest(
+    state_tip_digest: &str,
+    stop_code: &str,
+    budget_field: &str,
+    increment: u32,
+) -> Result<String, ForgeError> {
+    if increment == 0 || increment > 100 {
+        return Err(ForgeError::validation(
+            error_schema(),
+            "review_extension_invalid",
+            "review budget extension increment must be between 1 and 100",
+            Some(format!("increment={increment}")),
+        ));
+    }
+    if !matches!(
+        budget_field,
+        "max_repair_rounds" | "max_no_progress_rounds" | "max_auto_reopens_per_fingerprint"
+    ) {
+        return Err(ForgeError::validation(
+            error_schema(),
+            "review_extension_invalid",
+            "unknown review budget field",
+            Some(format!("budget_field={budget_field}")),
+        ));
+    }
+    let bytes = serde_json::to_vec(&(
+        REVIEW_STATE_SCHEMA,
+        state_tip_digest,
+        stop_code,
+        budget_field,
+        increment,
+    ))
+    .map_err(|error| {
+        ForgeError::software(
+            error_schema(),
+            "failed to serialize review extension proposal",
+            Some(error.to_string()),
+        )
+    })?;
+    Ok(sha256_digest(&bytes))
+}
+
+pub fn record_review_loop_hard_stop(
+    previous: &ReviewLoopState,
+    attempted_head: &str,
+    observations: &[ReviewFindingObservation],
+    state_tip_digest: &str,
+    error: &ForgeError,
+) -> Result<ReviewLoopState, ForgeError> {
+    let budget_field = stop_budget_field(error.kind()).ok_or_else(|| {
+        state_conflict(
+            "only a budget hard stop can be recorded for extension",
+            Some(format!("error={}", error.kind())),
+        )
+    })?;
+    let current = canonical_observations(observations)?;
+    let increment = 1;
+    let proposal_digest =
+        extension_proposal_digest(state_tip_digest, error.kind(), budget_field, increment)?;
+    let mut state = previous.clone();
+    state.hard_stop = Some(ReviewLoopHardStop {
+        code: error.kind().to_string(),
+        budget_field: budget_field.to_string(),
+        increment,
+        proposal_digest,
+        attempted_head_sha: attempted_head.to_string(),
+        observation_digest: review_observation_digest(attempted_head, &current)?,
+        extension_applied: false,
+    });
+    Ok(state)
+}
+
+pub fn apply_review_loop_extension(
+    previous: &ReviewLoopState,
+    proposal_digest: String,
+    approval_reference: String,
+    stop_code: &str,
+    budget_field: &str,
+    increment: u32,
+) -> Result<ReviewLoopState, ForgeError> {
+    let hard_stop = previous.hard_stop.as_ref().ok_or_else(|| {
+        ForgeError::validation(
+            error_schema(),
+            "review_extension_invalid",
+            "review budget extension requires a durable hard-stop record",
+            None,
+        )
+    })?;
+    if hard_stop.extension_applied
+        || hard_stop.code != stop_code
+        || hard_stop.budget_field != budget_field
+        || hard_stop.increment != increment
+        || hard_stop.proposal_digest != proposal_digest
+        || stop_budget_field(stop_code) != Some(budget_field)
+    {
+        return Err(ForgeError::validation(
+            error_schema(),
+            "review_extension_invalid",
+            "the extension does not match the current durable hard stop",
+            Some(format!(
+                "stop_code={}; budget_field={}; increment={}; proposal_digest={}",
+                hard_stop.code,
+                hard_stop.budget_field,
+                hard_stop.increment,
+                hard_stop.proposal_digest
+            )),
+        ));
+    }
+    if previous
+        .extensions
+        .iter()
+        .any(|extension| extension.proposal_digest == proposal_digest)
+    {
+        return Err(ForgeError::validation(
+            error_schema(),
+            "review_extension_replayed",
+            "the review budget extension proposal was already consumed",
+            Some(format!("proposal_digest={proposal_digest}")),
+        ));
+    }
+    let mut state = previous.clone();
+    let target = match budget_field {
+        "max_repair_rounds" => &mut state.budget.max_repair_rounds,
+        "max_no_progress_rounds" => &mut state.budget.max_no_progress_rounds,
+        "max_auto_reopens_per_fingerprint" => &mut state.budget.max_auto_reopens_per_fingerprint,
+        _ => {
+            return Err(ForgeError::validation(
+                error_schema(),
+                "review_extension_invalid",
+                "unknown review budget field",
+                Some(format!("budget_field={budget_field}")),
+            ));
+        }
+    };
+    if increment == 0 || increment > 100 {
+        return Err(ForgeError::validation(
+            error_schema(),
+            "review_extension_invalid",
+            "review budget extension increment must be between 1 and 100",
+            Some(format!("increment={increment}")),
+        ));
+    }
+    *target = target.checked_add(increment).ok_or_else(|| {
+        ForgeError::validation(
+            error_schema(),
+            "review_extension_invalid",
+            "review budget extension overflowed",
+            None,
+        )
+    })?;
+    state.extensions.push(ReviewLoopExtension {
+        proposal_digest,
+        approval_reference,
+        budget_field: budget_field.to_string(),
+        increment,
+    });
+    state
+        .hard_stop
+        .as_mut()
+        .expect("validated hard stop exists")
+        .extension_applied = true;
+    Ok(state)
+}
+
+fn canonical_observations(
+    observations: &[ReviewFindingObservation],
+) -> Result<BTreeMap<String, ReviewFindingObservation>, ForgeError> {
+    let mut result = BTreeMap::new();
+    for observation in observations {
+        validate_lifecycle_fingerprint(&observation.fingerprint)?;
+        if let Some(root) = observation.root_cause_fingerprint.as_deref() {
+            validate_lifecycle_fingerprint(root)?;
+        }
+        let lifecycle = observation
+            .root_cause_fingerprint
+            .as_deref()
+            .unwrap_or(&observation.fingerprint)
+            .to_string();
+        let mut observation = observation.clone();
+        if observation.status != ReviewFindingStatus::Open {
+            observation.blocking = false;
+        }
+        observation.threads.sort();
+        observation.threads.dedup();
+        if let Some(previous) = result.insert(lifecycle.clone(), observation.clone())
+            && previous != observation
+        {
+            return Err(review_stop(
+                "review_fingerprint_collision",
+                "one lifecycle identity describes incompatible observations",
+                format!("fingerprint={lifecycle}"),
+            ));
+        }
+    }
+    Ok(result)
+}
+
+fn observation_matches_state(
+    state: &ReviewLoopState,
+    observations: &BTreeMap<String, ReviewFindingObservation>,
+) -> bool {
+    let active = state
+        .findings
+        .iter()
+        .filter(|(_, finding)| finding.last_seen_head == state.head_sha)
+        .collect::<BTreeMap<_, _>>();
+    active.len() == observations.len()
+        && observations.iter().all(|(fingerprint, observation)| {
+            active.get(fingerprint).is_some_and(|finding| {
+                finding.root_cause_fingerprint == observation.root_cause_fingerprint
+                    && finding.status == observation.status
+                    && finding.blocking == observation.blocking
+                    && finding.threads == observation.threads
+            })
+        })
+}
+
+fn validate_review_loop_state(state: &ReviewLoopState) -> Result<(), ForgeError> {
+    if state.head_sha.is_empty() {
+        return Err(state_conflict("review-loop state head is empty", None));
+    }
+    for (fingerprint, finding) in &state.findings {
+        validate_lifecycle_fingerprint(fingerprint)?;
+        if let Some(root) = finding.root_cause_fingerprint.as_deref() {
+            validate_lifecycle_fingerprint(root)?;
+            if root != fingerprint {
+                return Err(state_conflict(
+                    "review-loop finding map key differs from its root-cause identity",
+                    Some(format!("key={fingerprint}; root={root}")),
+                ));
+            }
+        }
+        if finding.first_seen_head.is_empty()
+            || finding.last_seen_head.is_empty()
+            || finding.seen_count == 0
+        {
+            return Err(state_conflict(
+                "review-loop finding lifecycle counters are invalid",
+                Some(format!("fingerprint={fingerprint}")),
+            ));
+        }
+    }
+    if let Some(stop) = state.hard_stop.as_ref()
+        && (stop_budget_field(&stop.code) != Some(stop.budget_field.as_str())
+            || stop.increment != 1
+            || stop.proposal_digest.is_empty()
+            || stop.attempted_head_sha.is_empty()
+            || stop.observation_digest.is_empty())
+    {
+        return Err(state_conflict(
+            "review-loop hard-stop record is invalid",
+            Some(format!("code={}", stop.code)),
+        ));
+    }
+    Ok(())
+}
+
+fn review_observation_digest(
+    expected_head: &str,
+    observations: &BTreeMap<String, ReviewFindingObservation>,
+) -> Result<String, ForgeError> {
+    let bytes = serde_json::to_vec(&(REVIEW_STATE_SCHEMA, expected_head, observations)).map_err(
+        |error| {
+            ForgeError::software(
+                error_schema(),
+                "failed to serialize review-loop observation digest",
+                Some(error.to_string()),
+            )
+        },
+    )?;
+    Ok(sha256_digest(&bytes))
+}
+
+pub fn stop_budget_field(code: &str) -> Option<&'static str> {
+    match code {
+        "review_round_limit_exceeded" => Some("max_repair_rounds"),
+        "review_no_progress" => Some("max_no_progress_rounds"),
+        "review_finding_reopened" => Some("max_auto_reopens_per_fingerprint"),
+        _ => None,
+    }
+}
+
+fn hard_stop_error(stop: &ReviewLoopHardStop) -> ForgeError {
+    let code = match stop.code.as_str() {
+        "review_round_limit_exceeded" => "review_round_limit_exceeded",
+        "review_no_progress" => "review_no_progress",
+        "review_finding_reopened" => "review_finding_reopened",
+        _ => "review_state_conflict",
+    };
+    ForgeError::validation(
+        error_schema(),
+        code,
+        "the durable review-loop hard stop is still active",
+        Some(format!(
+            "attempted_head={}; observation_digest={}; proposal_digest={}; budget_field={}; increment={}",
+            stop.attempted_head_sha,
+            stop.observation_digest,
+            stop.proposal_digest,
+            stop.budget_field,
+            stop.increment
+        )),
+    )
+}
+
+fn validate_lifecycle_fingerprint(fingerprint: &str) -> Result<(), ForgeError> {
+    let parts = fingerprint.split(':').collect::<Vec<_>>();
+    if parts.len() == 3 && parts.iter().all(|part| stable_part(part)) {
+        return Ok(());
+    }
+    Err(review_stop(
+        "review_fingerprint_collision",
+        "lifecycle fingerprint must have <category>:<component>:<invariant> form",
+        format!("fingerprint={fingerprint}"),
+    ))
+}
+
+fn stable_part(part: &str) -> bool {
+    !part.is_empty()
+        && !part.starts_with('-')
+        && !part.ends_with('-')
+        && part
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+}
+
+fn review_stop(code: &'static str, message: &'static str, detail: String) -> ForgeError {
+    ForgeError::validation(error_schema(), code, message, Some(detail))
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_open_status() -> ReviewFindingStatus {
+    ReviewFindingStatus::Open
+}
+
 pub fn review_run_marker(review_run_id: &str) -> String {
     format!("{REVIEW_RUN_MARKER_PREFIX}{review_run_id} -->")
 }
 
 pub fn finding_marker(review_run_id: &str, body_digest: &str) -> String {
     format!("{FINDING_MARKER_PREFIX}{review_run_id} digest={body_digest} -->")
+}
+
+pub fn thread_disposition_marker(thread_id: &str) -> String {
+    format!("{THREAD_DISPOSITION_MARKER_PREFIX}{thread_id} -->")
+}
+
+pub fn has_thread_disposition_marker(body: &str) -> bool {
+    body.lines().any(|line| {
+        line.trim()
+            .strip_prefix(THREAD_DISPOSITION_MARKER_PREFIX)
+            .and_then(|rest| rest.strip_suffix(" -->"))
+            .is_some_and(|thread| !thread.is_empty())
+    })
 }
 
 pub fn parse_review_run_id(body: &str) -> Option<String> {
@@ -316,6 +1016,7 @@ pub fn strip_owned_markers(body: &str) -> String {
             let line = line.trim();
             !line.starts_with(REVIEW_RUN_MARKER_PREFIX)
                 && !line.starts_with(FINDING_MARKER_PREFIX)
+                && !line.starts_with(THREAD_DISPOSITION_MARKER_PREFIX)
                 && !line.starts_with(STATE_MARKER_OPEN)
         })
         .collect::<Vec<_>>()
@@ -431,6 +1132,18 @@ mod tests {
         }
     }
 
+    fn fixture_loop_state(round: u32) -> ReviewLoopState {
+        ReviewLoopState {
+            head_sha: "head".to_string(),
+            round,
+            no_progress_rounds: 0,
+            budget: ReviewLoopBudget::default(),
+            findings: BTreeMap::new(),
+            extensions: Vec::new(),
+            hard_stop: None,
+        }
+    }
+
     #[test]
     fn markers_round_trip_without_changing_semantic_body() {
         let run = "sha256:abc";
@@ -451,7 +1164,7 @@ mod tests {
             0,
             None,
             ReviewStatePayload::ReviewLoop {
-                state: serde_json::json!({"round": 0}),
+                state: fixture_loop_state(0),
             },
         )
         .expect("genesis");
@@ -462,7 +1175,7 @@ mod tests {
             1,
             Some(genesis.record_digest.clone()),
             ReviewStatePayload::ReviewLoop {
-                state: serde_json::json!({"round": 1}),
+                state: fixture_loop_state(1),
             },
         )
         .expect("child a");
@@ -473,7 +1186,7 @@ mod tests {
             1,
             Some(genesis.record_digest.clone()),
             ReviewStatePayload::ReviewLoop {
-                state: serde_json::json!({"round": 2}),
+                state: fixture_loop_state(2),
             },
         )
         .expect("child b");
@@ -564,6 +1277,204 @@ mod tests {
             let err = parse_state_marker(marker).expect_err("malformed marker must fail");
             assert_eq!(err.kind(), "review_state_conflict");
         }
+    }
+
+    #[test]
+    fn untyped_review_loop_state_is_rejected() {
+        let body = r#"{"schema":"forge-cli.review-loop.v1","repository":"acme/widgets","pr":7,"expected_head":"head","generation":0,"previous_digest":null,"payload":{"kind":"review-loop","state":{"round":1}},"record_digest":"sha256:invalid"}"#;
+        let marker = format!(
+            "{STATE_MARKER_OPEN}{}{STATE_MARKER_CLOSE}",
+            hex_encode(body.as_bytes())
+        );
+
+        let err = parse_state_marker(&marker).expect_err("partial loop state must fail closed");
+        assert_eq!(err.kind(), "review_state_conflict");
+    }
+
+    fn observation(fingerprint: &str) -> ReviewFindingObservation {
+        ReviewFindingObservation {
+            fingerprint: fingerprint.to_string(),
+            root_cause_fingerprint: None,
+            blocking: true,
+            status: ReviewFindingStatus::Open,
+            threads: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn same_head_same_findings_is_an_idempotent_observation() {
+        let initial = observe_review_loop(
+            None,
+            "head-a",
+            &[observation("correctness:review-loop:typed-state")],
+        )
+        .expect("genesis");
+
+        let retry = observe_review_loop(
+            Some(&initial.state),
+            "head-a",
+            &[observation("correctness:review-loop:typed-state")],
+        )
+        .expect("retry");
+
+        assert!(!retry.changed);
+        assert_eq!(retry.state, initial.state);
+    }
+
+    #[test]
+    fn same_head_observation_cannot_omit_an_open_blocking_finding() {
+        let initial = observe_review_loop(
+            None,
+            "head-a",
+            &[observation("correctness:review-loop:typed-state")],
+        )
+        .expect("genesis");
+
+        let error = observe_review_loop(Some(&initial.state), "head-a", &[])
+            .expect_err("same-head omission must not disposition a blocking finding");
+
+        assert_eq!(error.kind(), "review_state_conflict");
+        assert_eq!(
+            initial.state.findings["correctness:review-loop:typed-state"].status,
+            ReviewFindingStatus::Open
+        );
+    }
+
+    #[test]
+    fn explicit_same_head_disposition_is_auditable_and_non_blocking() {
+        let initial = observe_review_loop(
+            None,
+            "head-a",
+            &[observation("correctness:review-loop:typed-state")],
+        )
+        .expect("genesis");
+        let mut accepted = observation("correctness:review-loop:typed-state");
+        accepted.status = ReviewFindingStatus::Accepted;
+
+        let transition = observe_review_loop(Some(&initial.state), "head-a", &[accepted])
+            .expect("explicit disposition");
+        let finding = &transition.state.findings["correctness:review-loop:typed-state"];
+
+        assert_eq!(finding.status, ReviewFindingStatus::Accepted);
+        assert!(!finding.blocking);
+        assert_eq!(transition.state.round, 0);
+    }
+
+    #[test]
+    fn extension_requires_and_consumes_the_exact_durable_hard_stop() {
+        let mut state = observe_review_loop(
+            None,
+            "head-a",
+            &[observation("correctness:review-loop:typed-state")],
+        )
+        .expect("genesis")
+        .state;
+        state.budget.max_repair_rounds = 0;
+        let attempted = [observation("correctness:review-loop:typed-state")];
+        let error = observe_review_loop(Some(&state), "head-b", &attempted)
+            .expect_err("round budget exhausted");
+        let stopped =
+            record_review_loop_hard_stop(&state, "head-b", &attempted, "sha256:state-tip", &error)
+                .expect("durable stop");
+        let stop = stopped.hard_stop.as_ref().expect("stop receipt");
+
+        let restarted = observe_review_loop(Some(&stopped), "head-b", &attempted)
+            .expect_err("restart returns the same stop");
+        assert_eq!(restarted.kind(), "review_round_limit_exceeded");
+        assert!(
+            restarted
+                .detail()
+                .unwrap_or_default()
+                .contains(&stop.proposal_digest)
+        );
+
+        let wrong_field = apply_review_loop_extension(
+            &stopped,
+            stop.proposal_digest.clone(),
+            "https://github.com/acme/widgets/pull/7#issuecomment-9".into(),
+            "review_round_limit_exceeded",
+            "max_no_progress_rounds",
+            1,
+        )
+        .expect_err("stop code and field must match");
+        assert_eq!(wrong_field.kind(), "review_extension_invalid");
+
+        let extended = apply_review_loop_extension(
+            &stopped,
+            stop.proposal_digest.clone(),
+            "https://github.com/acme/widgets/pull/7#issuecomment-9".into(),
+            "review_round_limit_exceeded",
+            "max_repair_rounds",
+            1,
+        )
+        .expect("exact extension");
+        let resumed = observe_review_loop(Some(&extended), "head-b", &attempted)
+            .expect("one approved round resumes");
+        assert_eq!(resumed.state.round, 1);
+        assert!(resumed.state.hard_stop.is_none());
+    }
+
+    #[test]
+    fn fixed_finding_reappearance_stops_without_mutating_prior_state() {
+        let initial = observe_review_loop(
+            None,
+            "head-a",
+            &[observation("correctness:review-loop:typed-state")],
+        )
+        .expect("genesis");
+        let fixed = observe_review_loop(Some(&initial.state), "head-b", &[])
+            .expect("finding fixed on repaired head");
+
+        let error = observe_review_loop(
+            Some(&fixed.state),
+            "head-c",
+            &[observation("correctness:review-loop:typed-state")],
+        )
+        .expect_err("zero automatic reopens must stop");
+
+        assert_eq!(error.kind(), "review_finding_reopened");
+        assert_eq!(
+            fixed.state.findings["correctness:review-loop:typed-state"].status,
+            ReviewFindingStatus::Fixed
+        );
+    }
+
+    #[test]
+    fn no_progress_and_round_limits_are_derived_from_durable_state() {
+        let mut state = observe_review_loop(
+            None,
+            "head-a",
+            &[observation("correctness:review-loop:typed-state")],
+        )
+        .expect("genesis")
+        .state;
+        state.budget.max_repair_rounds = 2;
+        state.budget.max_no_progress_rounds = 1;
+
+        let round_one = observe_review_loop(
+            Some(&state),
+            "head-b",
+            &[observation("correctness:review-loop:typed-state")],
+        )
+        .expect("first no-progress round");
+        let no_progress = observe_review_loop(
+            Some(&round_one.state),
+            "head-c",
+            &[observation("correctness:review-loop:typed-state")],
+        )
+        .expect_err("second no-progress round exceeds the configured maximum");
+        assert_eq!(no_progress.kind(), "review_no_progress");
+
+        let mut round_limited = round_one.state;
+        round_limited.budget.max_no_progress_rounds = 10;
+        round_limited.round = 2;
+        let round_limit = observe_review_loop(
+            Some(&round_limited),
+            "head-z",
+            &[observation("correctness:review-loop:typed-state")],
+        )
+        .expect_err("round three exceeds a two-round budget");
+        assert_eq!(round_limit.kind(), "review_round_limit_exceeded");
     }
 
     #[test]
