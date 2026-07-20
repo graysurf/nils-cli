@@ -21,10 +21,18 @@ struct TraceEntry<'a> {
     action: &'static str,
     rule_ids: Vec<&'a str>,
     shadow_rule_ids: Vec<&'a str>,
+    shadow: Vec<ShadowTrace<'a>>,
     config_digest: &'a str,
     policy_digest: &'a str,
     recovery_applied: bool,
     elapsed_micros: u128,
+}
+
+#[derive(Serialize)]
+struct ShadowTrace<'a> {
+    rule_id: &'a str,
+    action: &'static str,
+    code: &'a str,
 }
 
 pub fn append(
@@ -66,6 +74,15 @@ pub fn append(
             .shadow
             .iter()
             .map(|observation| observation.rule_id.as_str())
+            .collect(),
+        shadow: decision
+            .shadow
+            .iter()
+            .map(|observation| ShadowTrace {
+                rule_id: &observation.rule_id,
+                action: action_name(observation.action),
+                code: &observation.code,
+            })
             .collect(),
         config_digest: &decision.config_digest,
         policy_digest: &decision.policy_digest,

@@ -170,8 +170,17 @@ pub enum Command {
     Repo(RepoArgs),
     /// Backend authentication helpers.
     Auth(AuthArgs),
+    /// Describe the effect of one exact typed forge-cli invocation.
+    #[command(hide = true)]
+    OperationEffect(OperationEffectArgs),
     /// Emit shell-completion scripts.
     Completion(CompletionArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct OperationEffectArgs {
+    #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
+    pub command: Vec<OsString>,
 }
 
 #[derive(Args, Debug)]
@@ -1630,6 +1639,10 @@ pub fn dispatch(args: Vec<OsString>) -> i32 {
     let global: GlobalFlags = (&cli).into();
     let format = global.output_format();
 
+    if let Some(Command::OperationEffect(args)) = &cli.command {
+        return crate::operation_effect::run(args.command.clone(), format);
+    }
+
     // `--provider local` only models a subset of the command tree; reject the
     // rest up front so they never fall through to a real backend spawn.
     if global.is_local() && !crate::local::command_supported(&cli.command) {
@@ -1774,6 +1787,9 @@ pub fn dispatch(args: Vec<OsString>) -> i32 {
             command: Some(command),
         })) => ops::search::run(&global, command, format),
         Some(Command::Completion(CompletionArgs { shell })) => emit_completion(shell),
+        Some(Command::OperationEffect(_)) => {
+            unreachable!("operation-effect returned before dispatch")
+        }
         None
         | Some(Command::Auth(AuthArgs { command: None }))
         | Some(Command::Repo(RepoArgs { command: None }))
@@ -1807,7 +1823,7 @@ pub fn dispatch(args: Vec<OsString>) -> i32 {
 /// Parse argv, gracefully routing parse errors through the workspace
 /// contract's `emit_parse_error` helper so `--format json` works at the parse
 /// layer too.
-fn parse_or_exit(args: Vec<OsString>) -> Result<Cli, i32> {
+pub(crate) fn parse_or_exit(args: Vec<OsString>) -> Result<Cli, i32> {
     let mut argv: Vec<OsString> = Vec::with_capacity(args.len() + 1);
     argv.push(OsString::from("forge-cli"));
     argv.extend(args);

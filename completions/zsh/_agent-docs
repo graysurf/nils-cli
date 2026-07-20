@@ -339,6 +339,19 @@ _arguments "${_arguments_options[@]}" : \
     ;;
 esac
 ;;
+(operation-effect)
+_arguments "${_arguments_options[@]}" : \
+'--format=[]:FORMAT:(text json)' \
+'--docs-home=[Override the docs-home root (otherwise derived from the install symlink)]:PATH:_files' \
+'--project-path=[Override the project root path]:PATH:_files' \
+'--worktree-fallback=[Project worktree fallback mode]:MODE:(auto local-only)' \
+'--integration-fingerprint=[Require the current integration decision to match this fingerprint]:SHA256:_default' \
+'--user-config[Select the effective private user catalog for this operation]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+'*::command:_default' \
+&& ret=0
+;;
 (completion)
 _arguments "${_arguments_options[@]}" : \
 '--docs-home=[Override the docs-home root (otherwise derived from the install symlink)]:PATH:_files' \
@@ -368,6 +381,7 @@ _agent-docs_commands() {
 'config:Manage exact user-local project enrollment and exclusion rules' \
 'integration:Resolve the typed automatic integration decision for this checkout' \
 'session:Manage durable selective intent activation scoped to a session, project, and product' \
+'operation-effect:Describe the effect of one exact typed agent-docs invocation' \
 'completion:Generate shell completion scripts' \
     )
     _describe -t commands 'agent-docs commands' commands "$@"
@@ -444,6 +458,11 @@ _agent-docs__subcmd__integration__subcmd__resolve_commands() {
 _agent-docs__subcmd__list_commands() {
     local commands; commands=()
     _describe -t commands 'agent-docs list commands' commands "$@"
+}
+(( $+functions[_agent-docs__subcmd__operation-effect_commands] )) ||
+_agent-docs__subcmd__operation-effect_commands() {
+    local commands; commands=()
+    _describe -t commands 'agent-docs operation-effect commands' commands "$@"
 }
 (( $+functions[_agent-docs__subcmd__preflight_commands] )) ||
 _agent-docs__subcmd__preflight_commands() {

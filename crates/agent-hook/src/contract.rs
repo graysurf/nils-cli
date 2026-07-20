@@ -253,6 +253,14 @@ fn validate_policy(bundle: &PolicyBundle, config: &Config) -> Result<(), HookErr
             }
         }
         validate_capability(&rule.capability)?;
+        if matches!(rule.capability, Capability::ExecutionReadOnly { .. })
+            && !matches!(rule.mode, RuleMode::Shadow)
+        {
+            return Err(HookError::data(
+                "read-only-capability-not-shadow",
+                "execution.read-only.v1 remains shadow-only until runtime cutover",
+            ));
+        }
         if matches!(rule.capability, Capability::SessionCoordination { .. })
             && (!matches!(rule.mode, RuleMode::Enforce)
                 || !matches!(rule.failure_posture, FailurePosture::Closed)
@@ -327,6 +335,7 @@ fn validate_capability_binding(
         Capability::Allow { .. }
         | Capability::SessionActivity { .. }
         | Capability::RuntimeKitHandler { .. } => true,
+        Capability::ExecutionReadOnly { .. } => event == "PreToolUse",
         Capability::SessionCoordination { .. } => matches!(
             event,
             "PreToolUse" | "PostToolUse" | "PostToolUseFailure" | "Stop"
@@ -419,9 +428,8 @@ fn validate_capability(capability: &Capability) -> Result<(), HookError> {
         Capability::Allow { reason_code }
         | Capability::SessionActivity { reason_code }
         | Capability::SemanticConflict { reason_code }
-        | Capability::SessionCoordination { reason_code } => {
-            validate_id("reason code", reason_code)
-        }
+        | Capability::SessionCoordination { reason_code }
+        | Capability::ExecutionReadOnly { reason_code } => validate_id("reason code", reason_code),
         Capability::Warn {
             reason_code,
             message,

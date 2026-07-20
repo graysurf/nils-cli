@@ -8,6 +8,7 @@ mod liveness;
 mod model;
 mod path_binding;
 mod paths;
+mod read_only;
 pub mod recovery;
 pub mod setup;
 mod strict_json;
@@ -599,6 +600,7 @@ fn emergency_decision<'a>(
                 Capability::SessionActivity { .. }
                 | Capability::OwnerLiveness { .. }
                 | Capability::SemanticConflict { .. }
+                | Capability::ExecutionReadOnly { .. }
                 | Capability::RuntimeKitHandler { .. } => match rule.failure_posture {
                     model::FailurePosture::Open => {
                         (DecisionAction::Allow, "recovery-manifest-failure-open")
@@ -764,6 +766,7 @@ fn capability_id(capability: &Capability) -> &'static str {
         Capability::OwnerLiveness { .. } => "agent-session.owner-liveness.v1",
         Capability::SemanticConflict { .. } => "agent-session.semantic-conflict.v1",
         Capability::SessionCoordination { .. } => "agent-session.coordination.v1",
+        Capability::ExecutionReadOnly { .. } => "execution.read-only.v1",
         Capability::RuntimeKitHandler { .. } => "runtime-kit.handler.v1",
     }
 }
