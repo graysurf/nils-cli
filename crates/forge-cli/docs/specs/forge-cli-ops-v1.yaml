@@ -146,11 +146,12 @@ provider_resolution:
 
 review_state_contract:
   schema: forge-cli.review-loop.v1
-  storage: "append-only provider-visible PR issue comments"
+  storage: "append-only provider-visible PR issue comments authored by the currently authenticated viewer; marker-shaped comments from other actors are ignored"
+  provider_marker_limit: "64 KiB per encoded state marker, validated before provider mutation"
   canonical_digest: "sha256:<lowercase hex> over compact UTF-8 JSON in declared field order"
   record:
     required: [schema, repository, pr, expected_head, generation, previous_digest, payload, record_digest]
-    chain: "one genesis; zero-based contiguous generations; previous_digest binds the unique prior record; duplicate, forked, stale, missing, or unreachable records fail as review_state_conflict"
+    chain: "one genesis; zero-based contiguous generations; previous_digest binds the unique prior record; byte-identical append retries are deduplicated, while conflicting duplicates, forks, stale, missing, or unreachable records fail as review_state_conflict"
   review_run_receipt:
     required: [review_run_id, route_lenses, decision, expected_head, round, summary_digest, inline_manifest]
     review_run_preimage: [repository, pr, expected_head, round, route_lenses, decision, summary_digest, inline_manifest]
@@ -332,9 +333,9 @@ operations:
         - { program: gh, argv: [api, graphql, -f, "query=<pending reviews with viewer ownership>", -f, "owner={owner}", -f, "name={repo}", -F, "pr={id}"] } # summary-only --submit-review: a viewer-owned pending review returns github_pending_review_exists. Threaded transactions use this as the complete membership read before exact-node inspection/resume.
         - { program: gh, argv: [api, "repos/{repo}/pulls/{id}/reviews", --method, POST, --raw-field, "body={comment_or_file}", --raw-field, "event={EVENT}", --raw-field, "commit_id={expected_head}", --jq, ".html_url"] } # with --submit-review (native review event); body field omitted for a body-less APPROVE; commit_id binds the mutation to --expected-head; review authored by the inherited gh token's identity
         - { program: gh, argv: [api, graphql, -f, "query=<pull request id lookup>", -f, "owner={owner}", -f, "name={repo}", -F, "number={id}"] } # with --thread-file: resolve the PR node id
-        - { program: gh, argv: [api, "repos/{repo}/issues/{id}/comments?per_page=100", --paginate] } # with --thread-file: read and validate the forge-cli.review-loop.v1 append-only state chain
-        - { program: gh, argv: [api, "repos/{repo}/issues/{id}/comments", --method, POST, --raw-field, "body=<immutable review-run receipt marker>", --jq, ".html_url"] } # append one receipt before native-review mutation, then read the complete chain back; semantically identical reruns reuse it
-        - { program: gh, argv: [api, graphql, -f, "query=<complete submitted native reviews>", -f, "owner={owner}", -f, "name={repo}", -F, "pr={id}", "-f after={cursor}?"] } # idempotent success and lost-submit response detection by review_run_id
+        - { program: gh, argv: [api, graphql, -f, "query=<authenticated viewer plus paginated PR issue comments>", -f, "owner={owner}", -f, "name={repo}", -F, "pr={id}", "-f after={cursor}?"] } # with --thread-file: retain only the authenticated viewer's comments, then read and validate the forge-cli.review-loop.v1 append-only state chain
+        - { program: gh, argv: [api, "repos/{repo}/issues/{id}/comments", --method, POST, --raw-field, "body=<immutable review-run receipt marker>", --jq, ".html_url"] } # append one provider-bounded receipt before native-review mutation, then verify from the prior cursor/tail; semantically identical append retries and reruns reuse it
+        - { program: gh, argv: [api, graphql, -f, "query=<complete submitted native reviews plus authenticated viewer>", -f, "owner={owner}", -f, "name={repo}", -F, "pr={id}", "-f after={cursor}?"] } # only when an exact receipt exists: idempotent success and lost-submit response detection require viewer author, expected head/state, untruncated marker, and complete receipt-bound thread manifest
         - { program: gh, argv: [api, graphql, -f, "query=<complete exact pending review and inline-comment manifest>", -f, "review={review_id}", "-f after={cursor}?"] } # exact receipt/body/head/commit/identity/manifest validation before any resumed mutation
         - { program: gh, argv: [api, graphql, -f, "query=<addPullRequestReview>", -f, "pullRequestId={pull_request_id}", -f, "commitOID={expected_head}", -f, "body={summary plus review-run marker}"] } # create only when no viewer-owned draft exists
         - { program: gh, argv: [api, graphql, -f, "query=<addPullRequestReviewThread>", -f, "reviewId={review_id}", -f, "path={path}", -f, "body={finding marker plus semantic body}", -F, "line={line}", -f, "side={LEFT|RIGHT}", -f, "subjectType={LINE|FILE}"] } # add only the missing ordered manifest suffix; never delete completed inline content
@@ -358,6 +359,9 @@ operations:
         submitted_review: bool # true when a native review event was submitted (--submit-review); then pr_comment_url is the #pullrequestreview- URL
         head_sha?: string # present with --submit-review; the caller-reviewed head bound to preflight and mutation
         pending_review_guard_plan?: list<string> # dry-run only, with --submit-review: pending-only GraphQL preflight argv
+        review_state_plan?: list<string> # dry-run only with --thread-file: authenticated provider-state read
+        review_receipt_plan?: list<string> # dry-run only with --thread-file: immutable receipt append
+        review_state_verify_plan?: list<string> # dry-run only with --thread-file: post-append state verification
         pr_comment_url: string
         issue_number: integer?
         issue_comment_url: string?
@@ -502,6 +506,7 @@ operations:
         number: integer
         url: string
         head_sha: string
+        viewer_login: string # additive authenticated-viewer identity used by transaction recovery; may be empty only on generic reads from older provider responses
         current_head_reviews: list<{id, database_id?, url, author, state, commit_sha, submitted_at, summary, summary_truncated}>
         stale_reviews: list<{id, database_id?, url, author, state, commit_sha, submitted_at, summary, summary_truncated}>
         pending_reviews: list<{id, database_id?, url, author, state, commit_sha?, summary, summary_truncated}>
@@ -529,8 +534,8 @@ operations:
         provider: enum<github>
         number: integer
         url: string
-        snapshot: object<{number,pr_url,head_sha,review_id,review_url,author,commit_sha?,body,semantic_body,viewer_did_author,viewer_can_delete,review_run_id?,provenance,inline_comments:list<{id,url,author,body,semantic_body,created_at,path,line?,original_line?,start_line?,original_start_line?,subject_type,body_digest,review_run_id?}>,snapshot_digest}>
-    notes: "The read is complete and fail-closed: every inline-comment page repeats the same review, PR, head, commit, author, body, and viewer-capability identity. Owned versioned markers are removed only from semantic_body; raw provider content remains visible in the snapshot. provenance is receipt-bound or unmarked, while mixed or digest-mismatched markers return pending_review_manifest_mismatch."
+        snapshot: object<{number,pr_url,head_sha,review_id,review_url,author,commit_sha?,body,semantic_body,viewer_did_author,viewer_can_delete,review_run_id?,provenance,inline_comments:list<{id,url,author,body,semantic_body,created_at,path,line?,original_line?,diff_side?,start_line?,original_start_line?,start_diff_side?,subject_type,body_digest,review_run_id?}>,snapshot_digest}>
+    notes: "The read is complete and fail-closed: every inline-comment page repeats the same review, PR, head, commit, author, body, and viewer-capability identity. The snapshot and digest preserve diff_side and start_diff_side as well as line/range anchors. Owned versioned markers are removed only from semantic_body; raw provider content remains visible in the snapshot. provenance is receipt-bound or unmarked, while mixed or digest-mismatched markers return pending_review_manifest_mismatch."
 
   - id: pr.pending-review.resume-submit
     schema_version: cli.forge-cli.pr.pending-review.resume-submit.v1
@@ -560,7 +565,7 @@ operations:
       local: unsupported
     output:
       data: object<{provider,number,url,review_id,review_url,head_sha,commit_sha,snapshot_digest,review_run_id,submitted}>
-    notes: "The exact receipt-bound pending snapshot is submitted once. If submission already completed, a complete submitted-review read-back with the same review_run_id, review id, current head, commit, and decision state returns idempotent success without another mutation."
+    notes: "The exact receipt-bound pending snapshot is submitted once, after recomputing the immutable review_run_id and comparing summary digest plus every path/line/side/range/subject/body manifest field. If submission already completed, a complete submitted-review read-back authored by the authenticated viewer with the same review_run_id, review id, current head, commit, decision state, and complete receipt-bound thread manifest returns idempotent success without another mutation."
 
   - id: pr.pending-review.submit
     schema_version: cli.forge-cli.pr.pending-review.submit.v1

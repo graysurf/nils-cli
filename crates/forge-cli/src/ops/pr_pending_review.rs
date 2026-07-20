@@ -177,7 +177,7 @@ pub fn run_resume_submit_with<R: BackendRunner, F: Fn(&str) -> Option<String>>(
             )),
         ));
     }
-    validate_review_run_receipt(
+    let receipt = validate_review_run_receipt(
         runner,
         &ctx,
         &view,
@@ -185,6 +185,7 @@ pub fn run_resume_submit_with<R: BackendRunner, F: Fn(&str) -> Option<String>>(
         &args.expected_head,
         args.decision,
     )?;
+    validate_snapshot_against_receipt(&snapshot, &receipt)?;
     submit_snapshot(
         runner,
         &ctx,
@@ -535,8 +536,11 @@ fn emit_already_submitted<R: BackendRunner>(
         .iter()
         .chain(reviews.stale_reviews.iter())
         .filter(|review| {
-            crate::ops::review_state::parse_review_run_id(&review.summary).as_deref()
-                == Some(review_run_id)
+            !reviews.viewer_login.is_empty()
+                && review.author == reviews.viewer_login
+                && !review.summary_truncated
+                && crate::ops::review_state::parse_review_run_id(&review.summary).as_deref()
+                    == Some(review_run_id)
         });
     let submitted = matches
         .next()
@@ -602,7 +606,7 @@ fn validate_review_run_receipt<R: BackendRunner>(
     review_run_id: &str,
     expected_head: &str,
     decision: PrReviewDecision,
-) -> Result<(), ForgeError> {
+) -> Result<crate::ops::review_state::ReviewRunReceipt, ForgeError> {
     let repository =
         crate::ops::pr_comments::github_repo_slug_from_url(&view.url).ok_or_else(|| {
             ForgeError::software(
@@ -647,6 +651,75 @@ fn validate_review_run_receipt<R: BackendRunner>(
                 receipt.decision
             ),
         ));
+    }
+    let computed_run_id = crate::ops::review_state::compute_review_run_id(
+        &repository,
+        view.number,
+        &receipt.expected_head,
+        receipt.round,
+        &receipt.route_lenses,
+        &receipt.decision,
+        &receipt.summary_digest,
+        &receipt.inline_manifest,
+    )?;
+    if computed_run_id != receipt.review_run_id {
+        return Err(ForgeError::validation(
+            schema_err(),
+            "review_state_conflict",
+            "the immutable review receipt has an invalid review-run id",
+            Some(format!(
+                "expected_run={computed_run_id}; receipt_run={}",
+                receipt.review_run_id
+            )),
+        ));
+    }
+    Ok(receipt.clone())
+}
+
+fn validate_snapshot_against_receipt(
+    snapshot: &pr_reviews::PendingReviewSnapshot,
+    receipt: &crate::ops::review_state::ReviewRunReceipt,
+) -> Result<(), ForgeError> {
+    let summary_digest = crate::ops::review_state::sha256_digest(snapshot.semantic_body.as_bytes());
+    if summary_digest != receipt.summary_digest
+        || snapshot.inline_comments.len() != receipt.inline_manifest.len()
+    {
+        return Err(expected_mismatch(
+            "pending_review_manifest_mismatch",
+            "the pending review summary or inline-comment count differs from the immutable receipt",
+            format!(
+                "expected_summary_digest={}; observed_summary_digest={summary_digest}; expected_comments={}; observed_comments={}",
+                receipt.summary_digest,
+                receipt.inline_manifest.len(),
+                snapshot.inline_comments.len()
+            ),
+        ));
+    }
+    for (index, (comment, expected)) in snapshot
+        .inline_comments
+        .iter()
+        .zip(&receipt.inline_manifest)
+        .enumerate()
+    {
+        let matches = expected.index == index
+            && comment.review_run_id.as_deref() == Some(receipt.review_run_id.as_str())
+            && comment.path == expected.path
+            && comment.line == expected.line
+            && comment.diff_side.as_deref() == Some(expected.side.as_str())
+            && comment.start_line == expected.start_line
+            && comment.start_diff_side == expected.start_side
+            && comment.subject_type == expected.subject_type
+            && comment.body_digest == expected.body_digest;
+        if !matches {
+            return Err(expected_mismatch(
+                "pending_review_manifest_mismatch",
+                "an inline pending-review comment differs from the immutable receipt",
+                format!(
+                    "review_id={}; comment_id={}; manifest_index={index}",
+                    snapshot.review_id, comment.id
+                ),
+            ));
+        }
     }
     Ok(())
 }

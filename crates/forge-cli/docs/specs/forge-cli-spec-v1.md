@@ -545,15 +545,19 @@ backend mapping, validation rules, and output schema versions.
   are compact UTF-8 JSON in the declared field order. `review_run_id` binds
   repository, PR number, expected head, round, semantic route lenses, decision,
   normalized summary digest, and ordered inline manifest. A record digest also
-  binds the prior record digest. Duplicate digests, forks, missing/unreachable
-  generations, target mismatches, malformed markers, or digest mismatches fail
-  as `review_state_conflict` before native-review mutation.
+  binds the prior record digest. Byte-identical append retries are deduplicated;
+  conflicting duplicates, forks, missing/unreachable generations, target
+  mismatches, malformed markers, or digest mismatches fail as
+  `review_state_conflict` before native-review mutation. Encoded state markers
+  are limited to 64 KiB before provider mutation.
 - Provider marker grammar is versioned and deterministic:
   `<!-- forge-cli:review-state:v1 <lowercase-hex-record-json> -->`,
   `<!-- forge-cli:review-run:v1 run=<review_run_id> -->`, and
   `<!-- forge-cli:review-finding:v1 run=<review_run_id> digest=<body_digest> -->`.
   Owned markers remain in raw provider content but are removed before semantic
-  body comparison and digesting.
+  body comparison and digesting. State reads bind the authenticated viewer and
+  retain only that viewer's PR issue comments; marker-shaped comments from
+  other actors cannot extend or poison the transaction chain.
 - Receipt fields intentionally exclude authentication tokens, credentials,
   environment-variable values, local paths, and private identity/profile names.
   The durable identity route contains only portable lens names and the semantic
@@ -562,7 +566,8 @@ backend mapping, validation rules, and output schema versions.
   `cli.forge-cli.pr.pending-review.inspect.v1`. Its complete snapshot requires
   PR/head/review identity, author, commit, raw and semantic body,
   `viewerDidAuthor`, `viewerCanDelete`, provenance, every inline comment with
-  normalized body digest and anchor, and `snapshot_digest`. Every page must
+  normalized body digest plus `diffSide`/`startDiffSide` and line/range anchors,
+  and `snapshot_digest`. Every page must
   repeat identical review metadata; partial data, cursor loops, count mismatch,
   or head drift returns `review_snapshot_incomplete` instead of a partial
   snapshot. Provenance is `receipt-bound` or `unmarked`; mixed, missing,
@@ -571,10 +576,12 @@ backend mapping, validation rules, and output schema versions.
   <digest> --expected-head <sha> --expected-commit <sha> --expected-snapshot
   <digest> --decision <decision>` emits
   `cli.forge-cli.pr.pending-review.resume-submit.v1`. It submits only an exact
-  viewer-owned receipt-bound snapshot. If that review was already submitted,
-  the command reads submitted reviews, verifies the same run id, review id,
-  head, commit, and decision state, and returns the same successful envelope
-  without another mutation.
+  viewer-owned receipt-bound snapshot after recomputing the run id and matching
+  the summary plus every immutable inline-manifest field. If that review was
+  already submitted, the command reads submitted reviews and threads, verifies
+  the authenticated author, same run id, review id, head, commit, decision
+  state, and complete receipt-bound manifest, and returns the same successful
+  envelope without another mutation.
 - `pr pending-review submit <id> --review <PRR_...> --expected-head <sha>
   --expected-commit <sha> --expected-snapshot <digest> --decision <decision>
   --confirm-unmarked-submit` emits `cli.forge-cli.pr.pending-review.submit.v1`.
@@ -688,7 +695,8 @@ backend mapping, validation rules, and output schema versions.
   256 KiB, 50 specs, 1024-byte paths, and 16 KiB bodies; put lower-priority
   findings in the summary body or split them into a later review. `--thread-file`
   requires `--submit-review`; omit it for a summary-only review. A live GitHub
-  run first reads complete native reviews and review threads, skips findings
+  run first reads a lightweight, fully paginated root-comment fingerprint of
+  review threads, skips findings
   whose semantic `(path, body)` already has a live non-resolved/non-outdated
   thread, computes a deterministic `review_run_id`, and appends an immutable
   `forge-cli.review-loop.v1` receipt before native-review mutation. It then
@@ -701,8 +709,10 @@ backend mapping, validation rules, and output schema versions.
 
   Every interrupted stage is resumable: a lost create response, any lost inline
   comment response, a pre-submit failure, and a lost submit response preserve
-  completed content. Re-running the same immutable inputs resumes or returns an
-  already-submitted review by `review_run_id`; no automatic path deletes a
+  completed content. Re-running the same immutable inputs resumes or returns
+  the authenticated viewer's already-submitted review by `review_run_id`;
+  submitted-review history is scanned only when the exact immutable receipt
+  already exists, and no automatic path deletes a
   draft. A unmarked, ambiguous, different-head/commit/identity, or manifest-mismatched
   pending review fails closed before mutation. An outdated semantic thread match
   is posted fresh.
@@ -711,8 +721,10 @@ backend mapping, validation rules, and output schema versions.
   (`submitted_review` is `false`). JSON output includes
   `data.review_threads[] = { id, url, path, line, subject_type }`, where `id` is
   the `PRRT_...` handle consumed by `pr review-threads resolve`. Dry-run output
-  includes `data.target_plan`, `data.thread_plan[]`, `data.submit_plan`, and
-  `data.planned_review_threads`. If GitHub rejects an individual thread mutation
+  includes `data.target_plan`, `data.thread_plan[]`, `data.submit_plan`,
+  `data.review_state_plan`, `data.review_receipt_plan`,
+  `data.review_state_verify_plan`, and `data.planned_review_threads`. If GitHub
+  rejects an individual thread mutation
   with HTTP 422 because the path/line is not commentable on the diff, the command
   returns `github_review_thread_rejected` (`RUNTIME 1`) with the raw backend
   detail and the failed spec index/path/line while preserving the pending

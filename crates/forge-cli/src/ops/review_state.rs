@@ -16,6 +16,7 @@ use crate::error::ForgeError;
 pub const REVIEW_STATE_SCHEMA: &str = "forge-cli.review-loop.v1";
 const STATE_MARKER_OPEN: &str = "<!-- forge-cli:review-state:v1 ";
 const STATE_MARKER_CLOSE: &str = " -->";
+const MAX_PROVIDER_STATE_MARKER_BYTES: usize = 64 * 1024;
 const REVIEW_RUN_MARKER_PREFIX: &str = "<!-- forge-cli:review-run:v1 run=";
 const FINDING_MARKER_PREFIX: &str = "<!-- forge-cli:review-finding:v1 run=";
 
@@ -129,10 +130,22 @@ impl ReviewStateRecord {
                 Some(error.to_string()),
             )
         })?;
-        Ok(format!(
+        let marker = format!(
             "{STATE_MARKER_OPEN}{}{STATE_MARKER_CLOSE}",
             hex_encode(json.as_bytes())
-        ))
+        );
+        if marker.len() > MAX_PROVIDER_STATE_MARKER_BYTES {
+            return Err(ForgeError::validation(
+                error_schema(),
+                "review_state_record_too_large",
+                "the provider-visible review-state record exceeds the safe comment-body limit",
+                Some(format!(
+                    "marker_bytes={}; max_bytes={MAX_PROVIDER_STATE_MARKER_BYTES}",
+                    marker.len()
+                )),
+            ));
+        }
+        Ok(marker)
     }
 }
 
@@ -163,7 +176,7 @@ pub fn parse_chain<'a>(
         });
     }
 
-    let mut by_digest = BTreeMap::new();
+    let mut by_digest: BTreeMap<String, &ReviewStateRecord> = BTreeMap::new();
     let mut children: BTreeMap<Option<String>, BTreeSet<String>> = BTreeMap::new();
     for record in &records {
         if record.schema != REVIEW_STATE_SCHEMA || record.compute_digest()? != record.record_digest
@@ -173,15 +186,16 @@ pub fn parse_chain<'a>(
                 Some(format!("record_digest={}", record.record_digest)),
             ));
         }
-        if by_digest
-            .insert(record.record_digest.clone(), record)
-            .is_some()
-        {
+        if let Some(existing) = by_digest.get(&record.record_digest) {
+            if **existing == *record {
+                continue;
+            }
             return Err(state_conflict(
-                "review-state chain contains a duplicate digest",
+                "review-state chain contains conflicting records with one digest",
                 Some(format!("record_digest={}", record.record_digest)),
             ));
         }
+        by_digest.insert(record.record_digest.clone(), record);
         children
             .entry(record.previous_digest.clone())
             .or_default()
@@ -225,7 +239,7 @@ pub fn parse_chain<'a>(
             .get(&Some(digest))
             .and_then(|children| children.iter().next().cloned());
     }
-    if ordered.len() != records.len() {
+    if ordered.len() != by_digest.len() {
         return Err(state_conflict(
             "review-state chain contains unreachable records",
             Some(format!(
@@ -471,6 +485,59 @@ mod tests {
         let err = parse_chain(comments.iter().map(String::as_str), "acme/widgets", 7)
             .expect_err("fork must fail");
         assert_eq!(err.kind(), "review_state_conflict");
+    }
+
+    #[test]
+    fn chain_deduplicates_byte_identical_retry_records() {
+        let genesis = ReviewStateRecord::new(
+            "acme/widgets",
+            7,
+            "head",
+            0,
+            None,
+            ReviewStatePayload::ReviewRunReceipt {
+                receipt: fixture_receipt(),
+            },
+        )
+        .expect("genesis");
+        let marker = genesis.marker().expect("marker");
+
+        let chain = parse_chain([marker.as_str(), marker.as_str()], "acme/widgets", 7)
+            .expect("an identical lost-response retry is one logical append");
+
+        assert_eq!(chain.records, vec![genesis.clone()]);
+        assert_eq!(chain.tip_digest, Some(genesis.record_digest));
+    }
+
+    #[test]
+    fn state_marker_rejects_a_provider_oversized_receipt_before_post() {
+        let mut receipt = fixture_receipt();
+        receipt.inline_manifest = (0..50)
+            .map(|index| ReviewCommentManifestItem {
+                index,
+                path: "x".repeat(1024),
+                line: Some(10),
+                side: "RIGHT".to_string(),
+                start_line: None,
+                start_side: None,
+                subject_type: "LINE".to_string(),
+                body_digest: "sha256:finding".to_string(),
+            })
+            .collect();
+        let record = ReviewStateRecord::new(
+            "acme/widgets",
+            7,
+            "head",
+            0,
+            None,
+            ReviewStatePayload::ReviewRunReceipt { receipt },
+        )
+        .expect("record");
+
+        let err = record
+            .marker()
+            .expect_err("oversized provider-visible state must fail before mutation");
+        assert_eq!(err.kind(), "review_state_record_too_large");
     }
 
     #[test]

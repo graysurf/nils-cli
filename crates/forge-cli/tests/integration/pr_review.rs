@@ -918,12 +918,12 @@ case "$*" in
   *"repos/acme/widgets/pulls/44 --jq .number"*)
     echo "44"
     ;;
-  *"repos/acme/widgets/issues/44/comments?per_page=100"*)
+  *"pullRequest(number: \$pr) { comments(first: 100"*)
     if [ -f "$receipt" ]; then
       body=$(json_escape "$receipt")
-      printf '[{"body":"%s"}]\n' "$body"
+      printf '{"data":{"viewer":{"login":"review-bot"},"repository":{"pullRequest":{"comments":{"nodes":[{"author":{"login":"review-bot"},"body":"%s"}],"pageInfo":{"hasNextPage":false,"endCursor":"state-tip"}}}}}}\n' "$body"
     else
-      printf '[]\n'
+      printf '%s\n' '{"data":{"viewer":{"login":"review-bot"},"repository":{"pullRequest":{"comments":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}}}'
     fi
     ;;
   *"repos/acme/widgets/issues/44/comments --method POST"*)
@@ -931,7 +931,13 @@ case "$*" in
     printf '%s\n' 'https://github.com/acme/widgets/pull/44#issuecomment-receipt'
     ;;
   *"reviewThreads(first: 100"*)
-    if [ "@EXISTING_THREAD@" = "true" ]; then
+    if [ -f "$submitted" ] && [ -f "$finding_body_0" ]; then
+      body=$(json_escape "$finding_body_0")
+      path=$(json_escape "$finding_path_0")
+      line=$(sed -n '1p' "$finding_line_0")
+      [ -n "$line" ] || line=null
+      printf '{"data":{"repository":{"pullRequest":{"headRefOid":"head-44","reviewThreads":{"nodes":[{"id":"PRRT_created","isResolved":false,"isOutdated":false,"path":"%s","diffSide":"RIGHT","line":%s,"originalLine":%s,"originalStartLine":null,"startDiffSide":null,"startLine":null,"subjectType":"LINE","comments":{"nodes":[{"id":"PRRC_created","author":{"login":"review-bot"},"body":"%s","createdAt":"2026-07-20T12:00:00Z","url":"https://github.com/acme/widgets/pull/44#discussion_r42"}],"pageInfo":{"hasNextPage":false,"endCursor":null}}}],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}}}\n' "$path" "$line" "$line" "$body"
+    elif [ "@EXISTING_THREAD@" = "true" ]; then
       printf '%s\n' '{"data":{"repository":{"pullRequest":{"headRefOid":"head-44","reviewThreads":{"nodes":[{"id":"PRRT_existing","isResolved":@EXISTING_RESOLVED@,"isOutdated":@EXISTING_OUTDATED@,"path":"src/lib.rs","diffSide":"RIGHT","line":42,"originalLine":42,"originalStartLine":null,"startDiffSide":null,"startLine":null,"subjectType":"LINE","comments":{"nodes":[{"id":"PRRC_existing","author":{"login":"quality-bot"},"body":"Duplicate finding body.","createdAt":"2026-07-14T04:00:00Z","url":"https://github.com/acme/widgets/pull/44#discussion_r1"}],"pageInfo":{"hasNextPage":false,"endCursor":null}}}],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}}}'
     else
       printf '%s\n' '{"data":{"repository":{"pullRequest":{"headRefOid":"head-44","reviewThreads":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}}}'
@@ -948,7 +954,7 @@ case "$*" in
   *"reviews(first: 100"*)
     if [ -f "$submitted" ]; then
       body=$(json_escape "$pending_body")
-      printf '{"data":{"repository":{"pullRequest":{"headRefOid":"head-44","reviews":{"nodes":[{"id":"PRR_kwDOpending","databaseId":9900,"url":"https://github.com/acme/widgets/pull/44#pullrequestreview-9900","author":{"login":"review-bot"},"state":"COMMENTED","commit":{"oid":"head-44"},"submittedAt":"2026-07-20T12:00:00Z","body":"%s"}],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}}}\n' "$body"
+      printf '{"data":{"viewer":{"login":"review-bot"},"repository":{"pullRequest":{"headRefOid":"head-44","reviews":{"nodes":[{"id":"PRR_kwDOpending","databaseId":9900,"url":"https://github.com/acme/widgets/pull/44#pullrequestreview-9900","author":{"login":"review-bot"},"state":"COMMENTED","commit":{"oid":"head-44"},"submittedAt":"2026-07-20T12:00:00Z","body":"%s","viewerDidAuthor":true}],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}}}\n' "$body"
     else
       printf '%s\n' '{"data":{"repository":{"pullRequest":{"headRefOid":"head-44","reviews":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}}}'
     fi
@@ -966,7 +972,7 @@ case "$*" in
       path=$(json_escape "$finding_path_0")
       line=$(sed -n '1p' "$finding_line_0")
       [ -n "$line" ] || line=null
-      comments=$(printf '{"id":"PRRC_created_0","url":"https://github.com/acme/widgets/pull/44#discussion_r42","author":{"login":"review-bot"},"body":"%s","createdAt":"2026-07-20T12:00:00Z","path":"%s","line":%s,"originalLine":%s,"startLine":null,"originalStartLine":null}' "$comment" "$path" "$line" "$line")
+      comments=$(printf '{"id":"PRRC_created_0","url":"https://github.com/acme/widgets/pull/44#discussion_r42","author":{"login":"review-bot"},"body":"%s","createdAt":"2026-07-20T12:00:00Z","path":"%s","line":%s,"originalLine":%s,"diffSide":"RIGHT","startLine":null,"originalStartLine":null,"startDiffSide":null,"subjectType":"LINE"}' "$comment" "$path" "$line" "$line")
       total=1
     fi
     if [ -f "$finding_body_1" ]; then
@@ -974,7 +980,7 @@ case "$*" in
       path=$(json_escape "$finding_path_1")
       line=$(sed -n '1p' "$finding_line_1")
       [ -n "$line" ] || line=null
-      next=$(printf '{"id":"PRRC_created_1","url":"https://github.com/acme/widgets/pull/44#discussion_r43","author":{"login":"review-bot"},"body":"%s","createdAt":"2026-07-20T12:00:01Z","path":"%s","line":%s,"originalLine":%s,"startLine":null,"originalStartLine":null}' "$comment" "$path" "$line" "$line")
+      next=$(printf '{"id":"PRRC_created_1","url":"https://github.com/acme/widgets/pull/44#discussion_r43","author":{"login":"review-bot"},"body":"%s","createdAt":"2026-07-20T12:00:01Z","path":"%s","line":%s,"originalLine":%s,"diffSide":"RIGHT","startLine":null,"originalStartLine":null,"startDiffSide":null,"subjectType":"LINE"}' "$comment" "$path" "$line" "$line")
       if [ -n "$comments" ]; then
         comments="$comments,$next"
       else
@@ -1489,9 +1495,21 @@ fn pr_review_transaction_is_idempotent_across_sessions() {
     ));
 
     let first = run_resumable_thread_review(&stub, &thread_file);
+    let first_calls = fs::read_to_string(&capture).expect("read first-run calls");
+    assert!(
+        !first_calls.contains("submittedAt body viewerDidAuthor"),
+        "a fresh transaction without a pre-existing receipt must not scan submitted-review history: {first_calls}"
+    );
     let second = run_resumable_thread_review(&stub, &thread_file);
     assert_eq!(first.code, 0, "{}", first.stdout);
     assert_eq!(second.code, 0, "{}", second.stdout);
+    let first_envelope = parse_envelope(&first.stdout);
+    let second_envelope = parse_envelope(&second.stdout);
+    assert_eq!(second_envelope["data"]["submitted_review"], true);
+    assert_eq!(
+        second_envelope["data"]["pr_comment_url"], first_envelope["data"]["pr_comment_url"],
+        "an exact rerun must preserve the submitted review identity"
+    );
 
     let calls = fs::read_to_string(capture).expect("read captured calls");
     assert_eq!(calls.matches("addPullRequestReview(input:").count(), 1);
@@ -1875,6 +1893,23 @@ fn pr_review_thread_file_dry_run_renders_thread_creation_plan() {
         pending_guard_plan.contains("states: [PENDING]"),
         "threaded dry-run must render the pending-review guard: {pending_guard_plan}"
     );
+    for field in [
+        "review_state_plan",
+        "review_receipt_plan",
+        "review_state_verify_plan",
+    ] {
+        let plan = env["data"][field]
+            .as_array()
+            .unwrap_or_else(|| panic!("{field} present in threaded dry-run"))
+            .iter()
+            .map(|value| value.as_str().unwrap_or_default())
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(
+            plan.contains("graphql") || plan.contains("issues/44/comments"),
+            "{field}: {plan}"
+        );
+    }
 }
 
 #[test]
