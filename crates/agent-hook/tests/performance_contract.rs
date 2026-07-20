@@ -2,6 +2,8 @@ mod support;
 
 use std::fs;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::time::{Duration, Instant};
 
 use pretty_assertions::assert_eq;
@@ -23,6 +25,234 @@ failure_posture = "closed"
 override_class = "locked"
 capability = { id = "decision.allow.v1", reason_code = "allowed" }
 "#;
+
+fn owner_policy() -> String {
+    format!(
+        r#"schema_version = "agent-hook.policy.v1"
+bundle_id = "runtime-kit"
+version = "2026.07.20.1"
+
+[[rules]]
+id = "runtime.owner"
+products = ["codex"]
+events = ["PreToolUse"]
+matcher = "apply_patch"
+priority = 10
+mode = "enforce"
+failure_posture = "closed"
+override_class = "locked"
+capability = {{ id = "agent-session.owner-liveness.v1", reason_code = "owner", {} = 300 }}
+"#,
+        concat!("leg", "acy_ttl_seconds")
+    )
+}
+
+const TARGET_CARDINALITIES: [usize; 4] = [1, 16, 64, 256];
+
+#[test]
+fn codex_apply_patch_resolves_each_unique_checkout_once_and_reuses_it_for_liveness() {
+    let fixture = Fixture::new(&owner_policy());
+    init_repository(&fixture.root);
+    let shim = fixture.root.join("shim");
+    fs::create_dir(&shim).expect("shim dir");
+    let log = fixture.root.join("git-root-lookups.log");
+    fs::write(&log, "").expect("lookup log");
+    let git = shim.join("git");
+    fs::write(
+        &git,
+        b"#!/bin/sh\ncase \"$*\" in\n  *\"rev-parse --show-toplevel\"*) printf 'root\\n' >> \"$AGENT_HOOK_GIT_ROOT_LOG\" ;;\nesac\nexec \"$AGENT_HOOK_REAL_GIT\" \"$@\"\n",
+    )
+    .expect("git shim");
+    fs::set_permissions(&git, fs::Permissions::from_mode(0o755)).expect("git shim mode");
+    let real_git = resolve_program("git");
+    let path = prepend_path(&shim);
+    let log_arg = log.to_string_lossy().into_owned();
+    let real_git_arg = real_git.to_string_lossy().into_owned();
+    let mut observed = Vec::new();
+
+    for cardinality in TARGET_CARDINALITIES {
+        fs::write(&log, "").expect("reset lookup log");
+        let payload = apply_patch_payload(&fixture.root, cardinality);
+        let output = fixture.run_with_env(
+            &["dispatch", "--product", "codex", "--format", "json"],
+            Some(&payload),
+            &[
+                ("PATH", path.as_str()),
+                ("AGENT_HOOK_REAL_GIT", real_git_arg.as_str()),
+                ("AGENT_HOOK_GIT_ROOT_LOG", log_arg.as_str()),
+            ],
+        );
+        assert!(
+            matches!(output.code, 0 | 1),
+            "targets={cardinality} stdout={} stderr={}",
+            output.stdout_text(),
+            output.stderr_text()
+        );
+        observed.push((
+            cardinality,
+            fs::read_to_string(&log)
+                .expect("lookup log")
+                .lines()
+                .count(),
+        ));
+    }
+
+    eprintln!("Codex apply_patch root lookups: {observed:?}");
+    assert_eq!(
+        observed,
+        vec![(1, 1), (16, 1), (64, 1), (256, 1)],
+        "target binding must perform one root lookup per unique checkout and owner-liveness must reuse it"
+    );
+}
+
+#[test]
+fn codex_apply_patch_target_binding_meets_dispatch_latency_budget() {
+    let fixture = Fixture::new(ALLOW_POLICY);
+    init_repository(&fixture.root);
+    let payloads = TARGET_CARDINALITIES
+        .into_iter()
+        .map(|cardinality| (cardinality, apply_patch_payload(&fixture.root, cardinality)))
+        .collect::<Vec<_>>();
+    let warmup = fixture.run(
+        &["dispatch", "--product", "codex", "--format", "json"],
+        Some(&payloads[0].1),
+    );
+    assert_eq!(warmup.code, 0, "stderr={}", warmup.stderr_text());
+
+    let mut p95 = Vec::new();
+    for (cardinality, payload) in payloads {
+        let mut samples = Vec::with_capacity(20);
+        for _ in 0..20 {
+            let started = Instant::now();
+            let output = fixture.run(
+                &["dispatch", "--product", "codex", "--format", "json"],
+                Some(&payload),
+            );
+            samples.push(started.elapsed());
+            assert_eq!(
+                output.code,
+                0,
+                "targets={cardinality} stderr={}",
+                output.stderr_text()
+            );
+        }
+        samples.sort_unstable();
+        p95.push((cardinality, samples[18]));
+    }
+
+    let limits = [
+        (1, Duration::from_millis(25)),
+        (16, Duration::from_millis(25)),
+        (64, Duration::from_millis(50)),
+        (256, Duration::from_millis(100)),
+    ];
+    eprintln!("Codex apply_patch dispatch p95: {p95:?}");
+    let violations = p95
+        .iter()
+        .zip(limits)
+        .filter_map(|((cardinality, observed), (expected_cardinality, limit))| {
+            assert_eq!(*cardinality, expected_cardinality);
+            (*observed > limit).then_some((*cardinality, *observed, limit))
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        violations.is_empty(),
+        "Codex apply_patch p95 latency exceeded budgets: observed={p95:?} violations={violations:?}"
+    );
+}
+
+#[test]
+fn codex_foreign_marker_validation_rejects_near_limit_reverse_close_linearly() {
+    let fixture = Fixture::new(ALLOW_POLICY);
+    let codex = fixture.home.join(".codex");
+    fs::create_dir_all(&codex).expect("codex dir");
+    let config = codex.join("config.toml");
+    let mut malformed = String::from("model = \"gpt-test\"\n");
+    for index in 0..17_000 {
+        malformed.push_str(&format!("# >>> foreign-{index}:hooks >>>\n"));
+    }
+    for index in 0..17_000 {
+        malformed.push_str(&format!("# <<< foreign-{index}:hooks <<<\n"));
+    }
+    assert!(
+        (900 * 1024..1024 * 1024).contains(&malformed.len()),
+        "fixture bytes={}",
+        malformed.len()
+    );
+    fs::write(&config, &malformed).expect("malformed Codex config");
+    Fixture::set_private(&config);
+
+    let started = Instant::now();
+    let output = fixture.run(
+        &[
+            "setup",
+            "--product",
+            "codex",
+            "--dry-run",
+            "--format",
+            "json",
+        ],
+        None,
+    );
+    let elapsed = started.elapsed();
+    eprintln!(
+        "Codex reverse-close marker rejection: bytes={} elapsed={elapsed:?}",
+        malformed.len()
+    );
+
+    assert_eq!(output.code, 65, "stderr={}", output.stderr_text());
+    assert_eq!(
+        output.stdout_json()["error"]["code"],
+        "provider-config-invalid"
+    );
+    assert!(
+        elapsed <= Duration::from_millis(500),
+        "near-limit reverse-close marker validation took {elapsed:?} for {} bytes",
+        malformed.len()
+    );
+}
+
+fn init_repository(root: &Path) {
+    let status = Command::new("git")
+        .args(["init", "-q"])
+        .arg(root)
+        .status()
+        .expect("git init");
+    assert!(status.success());
+}
+
+fn apply_patch_payload(root: &Path, cardinality: usize) -> String {
+    let mut patch = String::from("*** Begin Patch\n");
+    for index in 0..cardinality {
+        patch.push_str(&format!("*** Add File: target-{index}.txt\n+value\n"));
+    }
+    patch.push_str("*** End Patch");
+    json!({
+        "hook_event_name":"PreToolUse",
+        "tool_name":"apply_patch",
+        "cwd":root,
+        "tool_input":{"command":patch}
+    })
+    .to_string()
+}
+
+fn resolve_program(program: &str) -> PathBuf {
+    std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
+        .map(|directory| directory.join(program))
+        .find(|candidate| candidate.is_file())
+        .and_then(|candidate| fs::canonicalize(candidate).ok())
+        .unwrap_or_else(|| panic!("{program} is unavailable"))
+}
+
+fn prepend_path(directory: &Path) -> String {
+    let mut paths =
+        std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()).collect::<Vec<_>>();
+    paths.insert(0, directory.to_path_buf());
+    std::env::join_paths(paths)
+        .expect("join PATH")
+        .to_string_lossy()
+        .into_owned()
+}
 
 #[test]
 fn coordination_irrelevant_dispatch_does_not_read_the_registry() {

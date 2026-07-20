@@ -8,7 +8,6 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::HookError;
 use crate::model::{DecisionAction, NormalizedRequest, SemanticConflict};
-use crate::path_binding::resolve_target_binding;
 use crate::paths::agent_session_state_root;
 
 #[derive(Debug)]
@@ -180,29 +179,9 @@ pub fn classify(
             )
         });
 
-    let mut paths = request
-        .target_paths
-        .iter()
-        .map(PathBuf::as_path)
-        .collect::<Vec<_>>();
-    if let Some(execution) = request.execution_path.as_deref() {
-        paths.push(execution);
-    }
-    let mut classified_roots = Vec::new();
-    let path_outcomes = paths.into_iter().filter_map(|path| {
-        let binding = match resolve_target_binding(path) {
-            Ok(binding) => binding,
-            Err(_) => return Some(unknown("owner-target-untrusted")),
-        };
-        let root = binding.binding_root;
-        if classified_roots.contains(&root) {
-            return None;
-        }
-        classified_roots.push(root.clone());
-        Some(match snapshot {
-            Some(snapshot) => classify_registry_root(request, &root, snapshot),
-            None => legacy_classify(&root, legacy_ttl_seconds),
-        })
+    let path_outcomes = request.binding_roots.iter().map(|root| match snapshot {
+        Some(snapshot) => classify_registry_root(request, root, snapshot),
+        None => legacy_classify(root, legacy_ttl_seconds),
     });
     strongest_outcome(potential.into_iter().chain(path_outcomes))
         .unwrap_or_else(|| unknown("owner-target-unavailable"))

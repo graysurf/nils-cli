@@ -11,7 +11,7 @@ use crate::error::HookError;
 use crate::model::{
     DecisionAction, NormalizedDecision, NormalizedRequest, Product, REQUEST_VERSION,
 };
-use crate::path_binding::{TargetBinding, resolve_target_binding};
+use crate::path_binding::{TargetBinding, resolve_target_bindings};
 use crate::strict_json;
 
 pub const MAX_PROVIDER_BYTES: usize = 1024 * 1024;
@@ -105,12 +105,27 @@ pub fn normalize(
         .map(str::to_string)
         .filter(|value| value.len() <= 128);
     let (target_paths, execution_path) = target_paths(product, object, matcher.as_deref())?;
-    let mut target_bindings = target_paths
-        .iter()
-        .map(|path| resolve_target_binding(path))
-        .collect::<Result<Vec<_>, _>>()?;
+    let target_count = target_paths.len();
+    let mut binding_paths = target_paths;
+    if let Some(execution_path) = execution_path.as_ref() {
+        binding_paths.push(execution_path.clone());
+    }
+    let mut resolved_bindings = resolve_target_bindings(&binding_paths)?;
+    let execution_binding = execution_path
+        .as_ref()
+        .and_then(|_| resolved_bindings.pop());
+    debug_assert_eq!(resolved_bindings.len(), target_count);
+    let mut target_bindings = resolved_bindings;
     deduplicate_target_bindings(&mut target_bindings);
     let target_material = target_set_binding_material(&target_bindings)?;
+    let mut binding_roots = target_bindings
+        .iter()
+        .map(|binding| binding.binding_root.clone())
+        .collect::<Vec<_>>();
+    if let Some(binding) = execution_binding {
+        binding_roots.push(binding.binding_root);
+    }
+    deduplicate_paths(&mut binding_roots);
     let target_paths = target_bindings
         .into_iter()
         .map(|binding| binding.effective_path)
@@ -135,6 +150,7 @@ pub fn normalize(
         semantic_conflict: None,
         target_paths,
         execution_path,
+        binding_roots,
     })
 }
 
@@ -591,6 +607,17 @@ fn deduplicate_target_bindings(bindings: &mut Vec<TargetBinding>) {
             .any(|binding| binding.effective_path == bindings[index].effective_path)
         {
             bindings.remove(index);
+        } else {
+            index += 1;
+        }
+    }
+}
+
+fn deduplicate_paths(paths: &mut Vec<PathBuf>) {
+    let mut index = 0;
+    while index < paths.len() {
+        if paths[..index].contains(&paths[index]) {
+            paths.remove(index);
         } else {
             index += 1;
         }

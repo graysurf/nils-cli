@@ -208,6 +208,8 @@ pub struct NormalizedRequest {
     pub target_paths: Vec<PathBuf>,
     #[serde(skip)]
     pub execution_path: Option<PathBuf>,
+    #[serde(skip)]
+    pub binding_roots: Vec<PathBuf>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]

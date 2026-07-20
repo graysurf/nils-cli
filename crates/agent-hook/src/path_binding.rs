@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::fs;
 use std::io::ErrorKind;
@@ -12,26 +13,49 @@ pub struct TargetBinding {
     pub binding_root: PathBuf,
 }
 
-pub fn resolve_target_binding(path: &Path) -> Result<TargetBinding, HookError> {
-    if !path.is_absolute() {
-        return Err(untrusted(
-            "mutation target binding requires an absolute path",
-        ));
-    }
-    let (effective_path, existing_ancestor, existing_is_directory) = resolve_effective_path(path)?;
-    let checkout_start = if effective_path != existing_ancestor || existing_is_directory {
-        existing_ancestor.clone()
-    } else {
-        existing_ancestor
-            .parent()
-            .map(Path::to_path_buf)
-            .ok_or_else(|| untrusted("mutation target has no resolvable parent"))?
-    };
-    let binding_root = repository_root(&checkout_start)?.unwrap_or(checkout_start);
-    Ok(TargetBinding {
-        effective_path,
-        binding_root,
-    })
+pub fn resolve_target_bindings(paths: &[PathBuf]) -> Result<Vec<TargetBinding>, HookError> {
+    let mut root_cache = BTreeMap::<PathBuf, Option<PathBuf>>::new();
+    paths
+        .iter()
+        .map(|path| {
+            if !path.is_absolute() {
+                return Err(untrusted(
+                    "mutation target binding requires an absolute path",
+                ));
+            }
+            let (effective_path, existing_ancestor, existing_is_directory) =
+                resolve_effective_path(path)?;
+            let checkout_start = if effective_path != existing_ancestor || existing_is_directory {
+                existing_ancestor.clone()
+            } else {
+                existing_ancestor
+                    .parent()
+                    .map(Path::to_path_buf)
+                    .ok_or_else(|| untrusted("mutation target has no resolvable parent"))?
+            };
+            let cache_key = checkout_cache_key(&checkout_start);
+            let repository_root = match root_cache.get(&cache_key) {
+                Some(root) => root.clone(),
+                None => {
+                    let root = repository_root(&checkout_start)?;
+                    root_cache.insert(cache_key, root.clone());
+                    root
+                }
+            };
+            Ok(TargetBinding {
+                effective_path,
+                binding_root: repository_root.unwrap_or(checkout_start),
+            })
+        })
+        .collect()
+}
+
+fn checkout_cache_key(start: &Path) -> PathBuf {
+    start
+        .ancestors()
+        .find(|ancestor| fs::symlink_metadata(ancestor.join(".git")).is_ok())
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| start.to_path_buf())
 }
 
 fn resolve_effective_path(path: &Path) -> Result<(PathBuf, PathBuf, bool), HookError> {

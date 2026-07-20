@@ -988,15 +988,14 @@ fn codex_foreign_manager_ranges(
                 open.push((owner, begin));
             }
             ForeignManagedMarker::End { owner, end } => {
-                let Some(index) = open.iter().rposition(|(candidate, _)| candidate == &owner)
-                else {
+                let Some((candidate, begin)) = open.pop() else {
                     malformed = true;
                     continue;
                 };
-                if index + 1 != open.len() {
+                if candidate != owner {
                     malformed = true;
+                    continue;
                 }
-                let (_, begin) = open.remove(index);
                 ranges.push(begin..end);
             }
         }
