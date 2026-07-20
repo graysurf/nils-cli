@@ -1008,6 +1008,75 @@ fn advisory_reuses_checkout_resolution_across_many_peers() {
 }
 
 #[test]
+fn advisory_budget_exhaustion_marks_later_repository_resolution_incomplete() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let state_dir = tmp.path().join("state");
+    fs::create_dir(&state_dir).expect("state");
+    let alpha_checkout = tmp.path().join("alpha-checkout");
+    let slow_checkout = tmp.path().join("peer-a-slow-checkout");
+    let overlap_checkout = tmp.path().join("peer-z-overlap-checkout");
+    init_checkout(&alpha_checkout, "https://github.com/example/shared.git");
+    init_checkout(&slow_checkout, "https://github.com/example/unrelated.git");
+    init_checkout(&overlap_checkout, "https://github.com/example/shared.git");
+    seed_brokers_at(
+        &state_dir,
+        &[
+            (
+                "alpha",
+                "incarnation-alpha",
+                "alpha-private-capability-material",
+                alpha_checkout.as_path(),
+                Some("advisory"),
+            ),
+            (
+                "peer-a-slow",
+                "incarnation-peer-a-slow",
+                "peer-a-slow-private-capability-material",
+                slow_checkout.as_path(),
+                Some("advisory"),
+            ),
+            (
+                "peer-z-overlap",
+                "incarnation-peer-z-overlap",
+                "peer-z-overlap-private-capability-material",
+                overlap_checkout.as_path(),
+                Some("advisory"),
+            ),
+        ],
+    );
+    let fake_bin = tmp.path().join("fake-bin");
+    fs::create_dir(&fake_bin).expect("fake bin");
+    let git = fake_bin.join("git");
+    fs::write(
+        &git,
+        "#!/usr/bin/env bash\nset -euo pipefail\ncase \"$2\" in\n  *peer-a-slow-checkout) sleep 1; printf '%s\\n' https://github.com/example/unrelated.git ;;\n  *) printf '%s\\n' https://github.com/example/shared.git ;;\nesac\n",
+    )
+    .expect("fake git");
+    fs::set_permissions(&git, fs::Permissions::from_mode(0o755)).expect("git mode");
+    let path = format!(
+        "{}:{}",
+        fake_bin.display(),
+        std::env::var("PATH").expect("PATH")
+    );
+    let capability = capability(&state_dir, "alpha");
+    let state = state_dir.to_string_lossy();
+    let advised = run_with_env(
+        &alpha_checkout,
+        &["work-context", "advise", "--format", "json"],
+        &[
+            ("AGENT_SESSION_ID", "alpha"),
+            ("AGENT_SESSION_CAPABILITY_FILE", capability.as_str()),
+            ("AGENT_SESSION_STATE_DIR", state.as_ref()),
+            ("PATH", path.as_str()),
+        ],
+    );
+    assert_eq!(advised.code, 0, "stderr={}", advised.stderr_text());
+    let body = data(&advised);
+    assert_eq!(body["available"], false);
+    assert_eq!(body["severity"], "degraded");
+}
+
+#[test]
 fn acknowledgement_is_bound_to_the_observed_overlap_and_expiry() {
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let state_dir = tmp.path().join("state");

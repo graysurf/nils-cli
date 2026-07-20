@@ -87,6 +87,7 @@ struct PresenceResolution {
 struct PresenceResolver {
     deadline: Instant,
     by_checkout: BTreeMap<PathBuf, PresenceResolution>,
+    complete: bool,
 }
 
 impl PresenceResolver {
@@ -94,6 +95,7 @@ impl PresenceResolver {
         Self {
             deadline: Instant::now() + ADVISORY_RESOLUTION_TIMEOUT,
             by_checkout: BTreeMap::new(),
+            complete: true,
         }
     }
 
@@ -103,11 +105,23 @@ impl PresenceResolver {
         if let Some(resolution) = self.by_checkout.get(fingerprint_path) {
             return Ok(resolution.clone());
         }
-        let repository = checkout.as_deref().and_then(|root| {
-            self.deadline
-                .checked_duration_since(Instant::now())
-                .and_then(|remaining| repository_for_checkout_with_timeout(root, remaining))
-        });
+        let repository = if let Some(root) = checkout.as_deref() {
+            match self.deadline.checked_duration_since(Instant::now()) {
+                Some(remaining) if !remaining.is_zero() => {
+                    let repository = repository_for_checkout_with_timeout(root, remaining);
+                    if repository.is_none() && Instant::now() >= self.deadline {
+                        self.complete = false;
+                    }
+                    repository
+                }
+                Some(_) | None => {
+                    self.complete = false;
+                    None
+                }
+            }
+        } else {
+            None
+        };
         let resolution = PresenceResolution {
             repository,
             worktree: worktree_fingerprint(registry, fingerprint_path)?,
@@ -423,6 +437,7 @@ fn evaluate_advisory(
             Err(_) => complete = false,
         }
     }
+    complete &= resolver.complete;
     let evaluation = evaluate(
         Some((&record.id, self_incarnation)),
         &candidate,
