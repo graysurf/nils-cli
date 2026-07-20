@@ -500,6 +500,10 @@ fn write_chain_stub_with_check_transition(
     let merge_args = stub.tempdir.path().join("merge-args");
     let checks_calls = stub.tempdir.path().join("checks-calls");
     let review_response = stub.tempdir.path().join("review-response.json");
+    let thread_head_sha = serde_json::from_str::<serde_json::Value>(pre_view)
+        .ok()
+        .and_then(|value| value["headRefOid"].as_str().map(str::to_string))
+        .unwrap_or_else(|| "head123".to_string());
     let merge_branch = if merge_exits_one {
         format!(
             "    echo \"$*\" > {merge_args}\n    touch {sentinel}\n    echo 'X stderr warning after merge' >&2\n    exit 1\n",
@@ -595,7 +599,7 @@ EOF
       *)
         # Merge lock-down review-thread sweep; all resolved.
         cat <<'EOF'
-{{ "data": {{ "repository": {{ "pullRequest": {{ "reviewThreads": {{ "nodes": [] }} }} }} }} }}
+{{ "data": {{ "repository": {{ "pullRequest": {{ "headRefOid": "{thread_head_sha}", "reviewThreads": {{ "nodes": [], "pageInfo": {{ "hasNextPage": false, "endCursor": null }} }} }} }} }} }}
 EOF
         ;;
     esac
@@ -671,6 +675,7 @@ fn write_adopt_chain_stub(stub: &StubEnv, pre_view: &str) -> PathBuf {
         .as_deref()
         .map(|sha| view_with_head_oid(MERGED_PR_VIEW_JSON, sha))
         .unwrap_or_else(|| MERGED_PR_VIEW_JSON.to_string());
+    let thread_head_sha = head_sha.as_deref().unwrap_or("head123");
     let body = format!(
         r#"#!/bin/sh
 set -e
@@ -715,7 +720,7 @@ EOF
     ;;
   "api graphql")
     cat <<'EOF'
-{{ "data": {{ "repository": {{ "pullRequest": {{ "reviewThreads": {{ "nodes": [] }} }} }} }} }}
+{{ "data": {{ "repository": {{ "pullRequest": {{ "headRefOid": "{thread_head_sha}", "reviewThreads": {{ "nodes": [], "pageInfo": {{ "hasNextPage": false, "endCursor": null }} }} }} }} }} }}
 EOF
     ;;
   "pr merge")
@@ -790,6 +795,7 @@ fn write_closeout_chain_stub(
     } else {
         "    :\n"
     };
+    let thread_head_sha = "head123";
     let body = format!(
         r#"#!/bin/sh
 set -e
@@ -832,7 +838,7 @@ EOF
     ;;
   "api graphql")
     cat <<'EOF'
-{{ "data": {{ "repository": {{ "pullRequest": {{ "reviewThreads": {{ "nodes": [] }} }} }} }} }}
+{{ "data": {{ "repository": {{ "pullRequest": {{ "headRefOid": "{thread_head_sha}", "reviewThreads": {{ "nodes": [], "pageInfo": {{ "hasNextPage": false, "endCursor": null }} }} }} }} }} }}
 EOF
     ;;
   "pr merge")

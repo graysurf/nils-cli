@@ -1,0 +1,24 @@
+{
+  "schema": "forge-cli.review-loop.v1",
+  "repository": "acme/widgets",
+  "pr": 7,
+  "expected_head": "head-abc",
+  "generation": 0,
+  "previous_digest": null,
+  "payload": {
+    "kind": "review-run-receipt",
+    "receipt": {
+      "review_run_id": "sha256:run",
+      "route_lenses": [
+        "testing",
+        "maintainability"
+      ],
+      "decision": "comments-only",
+      "expected_head": "head-abc",
+      "round": 0,
+      "summary_digest": "sha256:summary",
+      "inline_manifest": []
+    }
+  },
+  "record_digest": "sha256:ccb2c1a18e580fc9b0edc7b19df1958cb1d03d3fa5c15b939d029b361baa965a"
+}

@@ -136,7 +136,7 @@ case "$1 $2" in
   "api graphql")
     case "$*" in
       *"reviews(first:"*) {review_query} ;;
-      *"reviewThreads(first: 100)"*) printf '%s\n' '{{"data":{{"repository":{{"pullRequest":{{"reviewThreads":{{"nodes":[{thread_nodes}]}}}}}}}}}}' ;;
+      *"reviewThreads(first: 100"*) printf '%s\n' '{{"data":{{"repository":{{"pullRequest":{{"headRefOid":"head123","reviewThreads":{{"nodes":[{thread_nodes}],"pageInfo":{{"hasNextPage":false,"endCursor":null}}}}}}}}}}}}' ;;
       *) echo "unexpected graphql args: $*" >&2; exit 99 ;;
     esac
     ;;
@@ -1101,7 +1101,7 @@ mode = "observed"
 fn pr_merge_review_convergence_keeps_unresolved_thread_gate_authoritative() {
     let tempdir = make_github_repo(None);
     let repo_path = tempdir.path().join("repo");
-    let thread = r#"{"id":"PRRT_1","isResolved":false,"isOutdated":false,"path":"src/lib.rs","comments":{"nodes":[{"author":{"login":"reviewer"},"body":"please address","createdAt":"2026-07-14T04:00:00Z","url":"https://github.com/acme/widgets/pull/7#discussion_r1"}]}}"#;
+    let thread = r#"{"id":"PRRT_1","isResolved":false,"isOutdated":false,"path":"src/lib.rs","diffSide":"RIGHT","line":10,"originalLine":10,"originalStartLine":null,"startDiffSide":null,"startLine":null,"subjectType":"LINE","comments":{"nodes":[{"id":"PRRC_1","author":{"login":"reviewer"},"body":"please address","createdAt":"2026-07-14T04:00:00Z","url":"https://github.com/acme/widgets/pull/7#discussion_r1"}],"pageInfo":{"hasNextPage":false,"endCursor":null}}}"#;
     let stub = StubEnv::new();
     let body = github_merge_stub(&stub, "", thread, false);
     let stub = stub.gh_stub(&body);
@@ -1135,7 +1135,7 @@ fn pr_merge_github_outdated_thread_is_dispositioned_stale_and_merges() {
     // and block forever" loop (nils-cli#1272).
     let tempdir = make_github_repo(None);
     let repo_path = tempdir.path().join("repo");
-    let thread = r#"{"id":"PRRT_stale","isResolved":false,"isOutdated":true,"path":"src/lib.rs","comments":{"nodes":[{"author":{"login":"quality-bot"},"body":"nit: rename this local","createdAt":"2026-07-14T04:00:00Z","url":"https://github.com/acme/widgets/pull/7#discussion_r9"}]}}"#;
+    let thread = r#"{"id":"PRRT_stale","isResolved":false,"isOutdated":true,"path":"src/lib.rs","diffSide":"RIGHT","line":10,"originalLine":10,"originalStartLine":null,"startDiffSide":null,"startLine":null,"subjectType":"LINE","comments":{"nodes":[{"id":"PRRC_9","author":{"login":"quality-bot"},"body":"nit: rename this local","createdAt":"2026-07-14T04:00:00Z","url":"https://github.com/acme/widgets/pull/7#discussion_r9"}],"pageInfo":{"hasNextPage":false,"endCursor":null}}}"#;
     let stub = StubEnv::new();
     let body = github_merge_stub(&stub, "", thread, false);
     let stub = stub.gh_stub(&body);
@@ -1191,8 +1191,8 @@ fn pr_merge_github_mixed_outdated_and_live_thread_still_blocks() {
     // thread is present: stale disposition must not weaken the live gate.
     let tempdir = make_github_repo(None);
     let repo_path = tempdir.path().join("repo");
-    let outdated = r#"{"id":"PRRT_stale","isResolved":false,"isOutdated":true,"path":"src/lib.rs","comments":{"nodes":[{"author":{"login":"quality-bot"},"body":"nit: moved code","createdAt":"2026-07-14T04:00:00Z","url":"https://github.com/acme/widgets/pull/7#discussion_r9"}]}}"#;
-    let live = r#"{"id":"PRRT_live","isResolved":false,"isOutdated":false,"path":"src/main.rs","comments":{"nodes":[{"author":{"login":"reviewer"},"body":"please address this","createdAt":"2026-07-14T05:00:00Z","url":"https://github.com/acme/widgets/pull/7#discussion_r10"}]}}"#;
+    let outdated = r#"{"id":"PRRT_stale","isResolved":false,"isOutdated":true,"path":"src/lib.rs","diffSide":"RIGHT","line":10,"originalLine":10,"originalStartLine":null,"startDiffSide":null,"startLine":null,"subjectType":"LINE","comments":{"nodes":[{"id":"PRRC_9","author":{"login":"quality-bot"},"body":"nit: moved code","createdAt":"2026-07-14T04:00:00Z","url":"https://github.com/acme/widgets/pull/7#discussion_r9"}],"pageInfo":{"hasNextPage":false,"endCursor":null}}}"#;
+    let live = r#"{"id":"PRRT_live","isResolved":false,"isOutdated":false,"path":"src/main.rs","diffSide":"RIGHT","line":20,"originalLine":20,"originalStartLine":null,"startDiffSide":null,"startLine":null,"subjectType":"LINE","comments":{"nodes":[{"id":"PRRC_10","author":{"login":"reviewer"},"body":"please address this","createdAt":"2026-07-14T05:00:00Z","url":"https://github.com/acme/widgets/pull/7#discussion_r10"}],"pageInfo":{"hasNextPage":false,"endCursor":null}}}"#;
     let thread_nodes = format!("{outdated},{live}");
     let stub = StubEnv::new();
     let body = github_merge_stub(&stub, "", &thread_nodes, false);

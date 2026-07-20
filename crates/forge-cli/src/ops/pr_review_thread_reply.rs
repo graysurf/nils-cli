@@ -291,13 +291,13 @@ mod tests {
             .iter()
             .map(|id| {
                 format!(
-                    r#"{{"id":"{id}","isResolved":false,"isOutdated":false,"path":"src/lib.rs","comments":{{"nodes":[{{"author":{{"login":"reviewer"}},"body":"finding","createdAt":"t","url":"https://github.com/acme/widgets/pull/7#discussion_r1"}}]}}}}"#
+                    r#"{{"id":"{id}","isResolved":false,"isOutdated":false,"path":"src/lib.rs","diffSide":"RIGHT","line":10,"originalLine":10,"originalStartLine":null,"startDiffSide":null,"startLine":null,"subjectType":"LINE","comments":{{"nodes":[{{"id":"PRRC_1","author":{{"login":"reviewer"}},"body":"finding","createdAt":"t","url":"https://github.com/acme/widgets/pull/7#discussion_r1"}}],"pageInfo":{{"hasNextPage":false,"endCursor":null}}}}}}"#
                 )
             })
             .collect();
         BackendSuccess {
             stdout: format!(
-                r#"{{"data":{{"repository":{{"pullRequest":{{"reviewThreads":{{"nodes":[{}]}}}}}}}}}}"#,
+                r#"{{"data":{{"repository":{{"pullRequest":{{"headRefOid":"head-7","reviewThreads":{{"nodes":[{}],"pageInfo":{{"hasNextPage":false,"endCursor":null}}}}}}}}}}}}"#,
                 nodes.join(",")
             ),
             stderr: String::new(),

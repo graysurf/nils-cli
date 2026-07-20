@@ -7,7 +7,7 @@ use std::{fs, path::Path};
 use pretty_assertions::assert_eq;
 
 use super::support::{
-    StubEnv, parse_envelope, run_forge_cli, run_forge_cli_in, run_forge_cli_with_stdin,
+    CmdOutput, StubEnv, parse_envelope, run_forge_cli, run_forge_cli_in, run_forge_cli_with_stdin,
 };
 
 fn assert_backend_not_invoked(capture: &Path) {
@@ -797,8 +797,8 @@ case "$2" in
     ;;
   graphql)
     case "$*" in
-      *"reviewThreads(first: 100)"*)
-        printf '%s\n' '{{"data":{{"repository":{{"pullRequest":{{"reviewThreads":{{"nodes":[]}}}}}}}}}}'
+      *"reviewThreads(first: 100"*)
+        printf '%s\n' '{{"data":{{"repository":{{"pullRequest":{{"headRefOid":"head-44","reviewThreads":{{"nodes":[],"pageInfo":{{"hasNextPage":false,"endCursor":null}}}}}}}}}}}}'
         ;;
       *"states: [PENDING]"*)
         printf '%s\n' '{{"data":{{"repository":{{"pullRequest":{{"headRefOid":"head-44","reviews":{{"nodes":[],"pageInfo":{{"hasNextPage":false,"endCursor":null}}}}}}}}}}}}'
@@ -862,52 +862,230 @@ esac
     )
 }
 
-fn github_review_thread_submit_stub(capture: &str) -> String {
-    format!(
-        r#"#!/bin/sh
+fn github_resumable_thread_stub(
+    capture: &str,
+    existing_thread: bool,
+    existing_resolved: bool,
+    existing_outdated: bool,
+    failure: &str,
+    unmarked_pending: bool,
+) -> String {
+    r#"#!/bin/sh
 set -eu
-printf '%s\n' "$*" >> {capture:?}
+capture="@CAPTURE@"
+receipt="$capture.receipt"
+pending_body="$capture.pending-body"
+finding_body_0="$capture.finding-body-0"
+finding_path_0="$capture.finding-path-0"
+finding_line_0="$capture.finding-line-0"
+finding_body_1="$capture.finding-body-1"
+finding_path_1="$capture.finding-path-1"
+finding_line_1="$capture.finding-line-1"
+submitted="$capture.submitted"
+failed_once="$capture.failed-once"
+failure="@FAILURE@"
+
+extract_field() {
+  name=$1
+  shift
+  for arg in "$@"; do
+    case "$arg" in
+      "$name="*) printf '%s' "${arg#*=}"; return 0 ;;
+    esac
+  done
+  return 1
+}
+
+json_escape() {
+  awk 'BEGIN { ORS=""; first=1 } {
+    if (!first) printf "\\n";
+    printf "%s", $0;
+    first=0
+  }' "$1"
+}
+
+if [ "@UNMARKED_PENDING@" = "true" ] && [ ! -f "$pending_body" ]; then
+  printf '%s' 'Pending review' > "$pending_body"
+fi
+
+printf '%s\n' "$*" >> "$capture"
 if [ "$1" != "api" ]; then
   echo "stub: unexpected gh command: $*" >&2
   exit 99
 fi
-case "$2" in
-  repos/acme/widgets/pulls/44)
+
+case "$*" in
+  *"repos/acme/widgets/pulls/44 --jq .number"*)
     echo "44"
     ;;
-  graphql)
-    case "$*" in
-      *"reviewThreads(first: 100)"*)
-        printf '%s\n' '{{"data":{{"repository":{{"pullRequest":{{"reviewThreads":{{"nodes":[]}}}}}}}}}}'
-        ;;
-      *"states: [PENDING]"*)
-        printf '%s\n' '{{"data":{{"repository":{{"pullRequest":{{"headRefOid":"head-44","reviews":{{"nodes":[],"pageInfo":{{"hasNextPage":false,"endCursor":null}}}}}}}}}}}}'
-        ;;
-      *"repository(owner:"*)
-        printf '%s\n' '{{"data":{{"repository":{{"pullRequest":{{"id":"PR_kwDOabc","url":"https://github.com/acme/widgets/pull/44"}}}}}}}}'
-        ;;
-      *"addPullRequestReview(input:"*)
-        printf '%s\n' '{{"data":{{"addPullRequestReview":{{"pullRequestReview":{{"id":"PRR_kwDOpending","url":"https://github.com/acme/widgets/pull/44#pullrequestreview-9900"}}}}}}}}'
-        ;;
-      *"addPullRequestReviewThread(input:"*)
-        printf '%s\n' '{{"data":{{"addPullRequestReviewThread":{{"thread":{{"id":"PRRT_kwDOthread","path":"src/lib.rs","line":42,"subjectType":"LINE","comments":{{"nodes":[{{"url":"https://github.com/acme/widgets/pull/44#discussion_r42"}}]}}}}}}}}}}'
-        ;;
-      *"submitPullRequestReview(input:"*)
-        printf '%s\n' '{{"data":{{"submitPullRequestReview":{{"pullRequestReview":{{"url":"https://github.com/acme/widgets/pull/44#pullrequestreview-9900"}}}}}}}}'
-        ;;
-      *)
-        echo "stub: unexpected graphql payload: $*" >&2
-        exit 99
-        ;;
-    esac
+  *"pullRequest(number: \$pr) { comments(first: 100"*)
+    if [ -f "$receipt" ]; then
+      body=$(json_escape "$receipt")
+      printf '{"data":{"viewer":{"login":"review-bot"},"repository":{"pullRequest":{"comments":{"nodes":[{"author":{"login":"review-bot"},"body":"%s"}],"pageInfo":{"hasNextPage":false,"endCursor":"state-tip"}}}}}}\n' "$body"
+    else
+      printf '%s\n' '{"data":{"viewer":{"login":"review-bot"},"repository":{"pullRequest":{"comments":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}}}'
+    fi
+    ;;
+  *"repos/acme/widgets/issues/44/comments --method POST"*)
+    extract_field body "$@" > "$receipt"
+    printf '%s\n' 'https://github.com/acme/widgets/pull/44#issuecomment-receipt'
+    ;;
+  *"repos/acme/widgets/issues/101/comments --method POST"*)
+    printf '%s\n' 'https://github.com/acme/widgets/issues/101#issuecomment-review'
+    ;;
+  *"reviewThreads(first: 100"*)
+    if [ -f "$submitted" ] && [ -f "$finding_body_0" ]; then
+      body=$(json_escape "$finding_body_0")
+      path=$(json_escape "$finding_path_0")
+      line=$(sed -n '1p' "$finding_line_0")
+      [ -n "$line" ] || line=null
+      printf '{"data":{"repository":{"pullRequest":{"headRefOid":"head-44","reviewThreads":{"nodes":[{"id":"PRRT_created","isResolved":false,"isOutdated":false,"path":"%s","diffSide":"RIGHT","line":%s,"originalLine":%s,"originalStartLine":null,"startDiffSide":null,"startLine":null,"subjectType":"LINE","comments":{"nodes":[{"id":"PRRC_created","author":{"login":"review-bot"},"body":"%s","createdAt":"2026-07-20T12:00:00Z","url":"https://github.com/acme/widgets/pull/44#discussion_r42"}],"pageInfo":{"hasNextPage":false,"endCursor":null}}}],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}}}\n' "$path" "$line" "$line" "$body"
+    elif [ "@EXISTING_THREAD@" = "true" ]; then
+      printf '%s\n' '{"data":{"repository":{"pullRequest":{"headRefOid":"head-44","reviewThreads":{"nodes":[{"id":"PRRT_existing","isResolved":@EXISTING_RESOLVED@,"isOutdated":@EXISTING_OUTDATED@,"path":"src/lib.rs","diffSide":"RIGHT","line":42,"originalLine":42,"originalStartLine":null,"startDiffSide":null,"startLine":null,"subjectType":"LINE","comments":{"nodes":[{"id":"PRRC_existing","author":{"login":"quality-bot"},"body":"Duplicate finding body.","createdAt":"2026-07-14T04:00:00Z","url":"https://github.com/acme/widgets/pull/44#discussion_r1"}],"pageInfo":{"hasNextPage":false,"endCursor":null}}}],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}}}'
+    else
+      printf '%s\n' '{"data":{"repository":{"pullRequest":{"headRefOid":"head-44","reviewThreads":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}}}'
+    fi
+    ;;
+  *"states: [PENDING]"*)
+    if [ -f "$pending_body" ] && [ ! -f "$submitted" ]; then
+      body=$(json_escape "$pending_body")
+      printf '{"data":{"repository":{"pullRequest":{"headRefOid":"head-44","reviews":{"nodes":[{"id":"PRR_kwDOpending","url":"https://github.com/acme/widgets/pull/44#pullrequestreview-9900","author":{"login":"review-bot"},"state":"PENDING","commit":{"oid":"head-44"},"body":"%s","viewerDidAuthor":true,"viewerCanDelete":true}],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}}}\n' "$body"
+    else
+      printf '%s\n' '{"data":{"repository":{"pullRequest":{"headRefOid":"head-44","reviews":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}}}'
+    fi
+    ;;
+  *"reviews(first: 100"*)
+    if [ -f "$submitted" ]; then
+      body=$(json_escape "$pending_body")
+      printf '{"data":{"viewer":{"login":"review-bot"},"repository":{"pullRequest":{"headRefOid":"head-44","reviews":{"nodes":[{"id":"PRR_kwDOpending","databaseId":9900,"url":"https://github.com/acme/widgets/pull/44#pullrequestreview-9900","author":{"login":"review-bot"},"state":"COMMENTED","commit":{"oid":"head-44"},"submittedAt":"2026-07-20T12:00:00Z","body":"%s","viewerDidAuthor":true}],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}}}\n' "$body"
+    else
+      printf '%s\n' '{"data":{"repository":{"pullRequest":{"headRefOid":"head-44","reviews":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}}}'
+    fi
+    ;;
+  *"query(\$review: ID!"*)
+    if [ ! -f "$pending_body" ] || [ -f "$submitted" ]; then
+      printf '%s\n' '{"data":{"node":null}}'
+      exit 0
+    fi
+    body=$(json_escape "$pending_body")
+    comments=''
+    total=0
+    if [ -f "$finding_body_0" ]; then
+      comment=$(json_escape "$finding_body_0")
+      path=$(json_escape "$finding_path_0")
+      line=$(sed -n '1p' "$finding_line_0")
+      [ -n "$line" ] || line=null
+      comments=$(printf '{"id":"PRRC_created_0","url":"https://github.com/acme/widgets/pull/44#discussion_r42","author":{"login":"review-bot"},"body":"%s","createdAt":"2026-07-20T12:00:00Z","path":"%s","line":%s,"originalLine":%s,"diffSide":"RIGHT","startLine":null,"originalStartLine":null,"startDiffSide":null,"subjectType":"LINE"}' "$comment" "$path" "$line" "$line")
+      total=1
+    fi
+    if [ -f "$finding_body_1" ]; then
+      comment=$(json_escape "$finding_body_1")
+      path=$(json_escape "$finding_path_1")
+      line=$(sed -n '1p' "$finding_line_1")
+      [ -n "$line" ] || line=null
+      next=$(printf '{"id":"PRRC_created_1","url":"https://github.com/acme/widgets/pull/44#discussion_r43","author":{"login":"review-bot"},"body":"%s","createdAt":"2026-07-20T12:00:01Z","path":"%s","line":%s,"originalLine":%s,"diffSide":"RIGHT","startLine":null,"originalStartLine":null,"startDiffSide":null,"subjectType":"LINE"}' "$comment" "$path" "$line" "$line")
+      if [ -n "$comments" ]; then
+        comments="$comments,$next"
+      else
+        comments="$next"
+      fi
+      total=2
+    fi
+    printf '{"data":{"node":{"id":"PRR_kwDOpending","url":"https://github.com/acme/widgets/pull/44#pullrequestreview-9900","author":{"login":"review-bot"},"state":"PENDING","commit":{"oid":"head-44"},"body":"%s","viewerDidAuthor":true,"viewerCanDelete":true,"comments":{"totalCount":%s,"nodes":[%s],"pageInfo":{"hasNextPage":false,"endCursor":null}},"pullRequest":{"number":44,"url":"https://github.com/acme/widgets/pull/44","headRefOid":"head-44"}}}}\n' "$body" "$total" "$comments"
+    ;;
+  *"query(\$owner: String!, \$name: String!, \$number: Int!"*)
+    printf '%s\n' '{"data":{"repository":{"pullRequest":{"id":"PR_kwDOabc","url":"https://github.com/acme/widgets/pull/44"}}}}'
+    ;;
+  *"addPullRequestReview(input:"*)
+    extract_field body "$@" > "$pending_body"
+    if [ "$failure" = "pending-create-once" ] && [ ! -f "$failed_once" ]; then
+      : > "$failed_once"
+      echo "connection lost after pending review creation" >&2
+      exit 42
+    fi
+    printf '%s\n' '{"data":{"addPullRequestReview":{"pullRequestReview":{"id":"PRR_kwDOpending","url":"https://github.com/acme/widgets/pull/44#pullrequestreview-9900"}}}}'
+    ;;
+  *"addPullRequestReviewThread(input:"*)
+    if [ ! -f "$finding_body_0" ]; then
+      finding_body="$finding_body_0"
+      finding_path="$finding_path_0"
+      finding_line="$finding_line_0"
+      finding_index=0
+    else
+      finding_body="$finding_body_1"
+      finding_path="$finding_path_1"
+      finding_line="$finding_line_1"
+      finding_index=1
+    fi
+    extract_field body "$@" > "$finding_body"
+    extract_field path "$@" > "$finding_path"
+    extract_field line "$@" > "$finding_line" || printf '' > "$finding_line"
+    if [ "$failure" = "lost-thread-$finding_index-once" ] && [ ! -f "$failed_once" ]; then
+      : > "$failed_once"
+      echo "connection lost after inline comment index $finding_index" >&2
+      exit 42
+    fi
+    if [ "$failure" = "lost-thread-once" ] && [ ! -f "$failed_once" ]; then
+      : > "$failed_once"
+      echo "connection lost after inline comment creation" >&2
+      exit 42
+    fi
+    if [ "$failure" = "thread-error" ]; then
+      echo "could not map review thread to diff" >&2
+      exit 42
+    fi
+    if [ "$failure" = "thread-422" ]; then
+      echo "gh: line must be part of the diff (HTTP 422)" >&2
+      exit 1
+    fi
+    path=$(sed -n '1p' "$finding_path")
+    line=$(sed -n '1p' "$finding_line")
+    [ -n "$line" ] || line=null
+    printf '{"data":{"addPullRequestReviewThread":{"thread":{"id":"PRRT_kwDOthread","path":"%s","line":%s,"subjectType":"LINE","comments":{"nodes":[{"url":"https://github.com/acme/widgets/pull/44#discussion_r42"}]}}}}}\n' "$path" "$line"
+    ;;
+  *"submitPullRequestReview(input:"*)
+    if [ "$failure" = "before-submit-once" ] && [ ! -f "$failed_once" ]; then
+      : > "$failed_once"
+      echo "connection lost before submit confirmation" >&2
+      exit 42
+    fi
+    if [ "$failure" = "submit-error" ]; then
+      echo "review submit failed" >&2
+      exit 42
+    fi
+    if [ "$failure" = "submit-422" ]; then
+      echo "gh: Only users with explicit access can approve pull requests (HTTP 422)" >&2
+      exit 1
+    fi
+    : > "$submitted"
+    if [ "$failure" = "lost-submit" ]; then
+      echo "connection lost after submit" >&2
+      exit 42
+    fi
+    printf '%s\n' '{"data":{"submitPullRequestReview":{"pullRequestReview":{"url":"https://github.com/acme/widgets/pull/44#pullrequestreview-9900"}}}}'
     ;;
   *)
-    echo "stub: unexpected gh api endpoint: $2" >&2
+    echo "stub: unexpected gh api endpoint: $*" >&2
     exit 99
     ;;
 esac
 "#
+    .replace("@CAPTURE@", capture)
+    .replace("@FAILURE@", failure)
+    .replace("@EXISTING_THREAD@", if existing_thread { "true" } else { "false" })
+    .replace(
+        "@EXISTING_RESOLVED@",
+        if existing_resolved { "true" } else { "false" },
     )
+    .replace(
+        "@EXISTING_OUTDATED@",
+        if existing_outdated { "true" } else { "false" },
+    )
+    .replace("@UNMARKED_PENDING@", if unmarked_pending { "true" } else { "false" })
+}
+
+fn github_review_thread_submit_stub(capture: &str) -> String {
+    github_resumable_thread_stub(capture, false, false, false, "none", false)
 }
 
 /// Like [`github_review_thread_submit_stub`] but the `reviewThreads` read
@@ -920,104 +1098,18 @@ fn github_review_thread_idempotent_stub(
     existing_resolved: bool,
     existing_outdated: bool,
 ) -> String {
-    format!(
-        r#"#!/bin/sh
-set -eu
-printf '%s\n' "$*" >> {capture:?}
-if [ "$1" != "api" ]; then
-  echo "stub: unexpected gh command: $*" >&2
-  exit 99
-fi
-case "$2" in
-  repos/acme/widgets/pulls/44)
-    echo "44"
-    ;;
-  graphql)
-    case "$*" in
-      *"reviewThreads(first: 100)"*)
-        printf '%s\n' '{{"data":{{"repository":{{"pullRequest":{{"reviewThreads":{{"nodes":[{{"id":"PRRT_existing","isResolved":{existing_resolved},"isOutdated":{existing_outdated},"path":"src/lib.rs","comments":{{"nodes":[{{"author":{{"login":"quality-bot"}},"body":"Duplicate finding body.","createdAt":"2026-07-14T04:00:00Z","url":"https://github.com/acme/widgets/pull/44#discussion_r1"}}]}}}}]}}}}}}}}}}'
-        ;;
-      *"states: [PENDING]"*)
-        printf '%s\n' '{{"data":{{"repository":{{"pullRequest":{{"headRefOid":"head-44","reviews":{{"nodes":[],"pageInfo":{{"hasNextPage":false,"endCursor":null}}}}}}}}}}}}'
-        ;;
-      *"repository(owner:"*)
-        printf '%s\n' '{{"data":{{"repository":{{"pullRequest":{{"id":"PR_kwDOabc","url":"https://github.com/acme/widgets/pull/44"}}}}}}}}'
-        ;;
-      *"addPullRequestReview(input:"*)
-        printf '%s\n' '{{"data":{{"addPullRequestReview":{{"pullRequestReview":{{"id":"PRR_kwDOpending","url":"https://github.com/acme/widgets/pull/44#pullrequestreview-9900"}}}}}}}}'
-        ;;
-      *"addPullRequestReviewThread(input:"*)
-        printf '%s\n' '{{"data":{{"addPullRequestReviewThread":{{"thread":{{"id":"PRRT_kwDOthread","path":"src/lib.rs","line":42,"subjectType":"LINE","comments":{{"nodes":[{{"url":"https://github.com/acme/widgets/pull/44#discussion_r42"}}]}}}}}}}}}}'
-        ;;
-      *"submitPullRequestReview(input:"*)
-        printf '%s\n' '{{"data":{{"submitPullRequestReview":{{"pullRequestReview":{{"url":"https://github.com/acme/widgets/pull/44#pullrequestreview-9900"}}}}}}}}'
-        ;;
-      *)
-        echo "stub: unexpected graphql payload: $*" >&2
-        exit 99
-        ;;
-    esac
-    ;;
-  *)
-    echo "stub: unexpected gh api endpoint: $2" >&2
-    exit 99
-    ;;
-esac
-"#
+    github_resumable_thread_stub(
+        capture,
+        true,
+        existing_resolved,
+        existing_outdated,
+        "none",
+        false,
     )
 }
 
 fn github_review_thread_fail_after_pending_stub(capture: &str) -> String {
-    format!(
-        r#"#!/bin/sh
-set -eu
-printf '%s\n' "$*" >> {capture:?}
-if [ "$1" != "api" ]; then
-  echo "stub: unexpected gh command: $*" >&2
-  exit 99
-fi
-case "$2" in
-  repos/acme/widgets/pulls/44)
-    echo "44"
-    ;;
-  graphql)
-    case "$*" in
-      *"reviewThreads(first: 100)"*)
-        printf '%s\n' '{{"data":{{"repository":{{"pullRequest":{{"reviewThreads":{{"nodes":[]}}}}}}}}}}'
-        ;;
-      *"states: [PENDING]"*)
-        printf '%s\n' '{{"data":{{"repository":{{"pullRequest":{{"headRefOid":"head-44","reviews":{{"nodes":[],"pageInfo":{{"hasNextPage":false,"endCursor":null}}}}}}}}}}}}'
-        ;;
-      *"repository(owner:"*)
-        printf '%s\n' '{{"data":{{"repository":{{"pullRequest":{{"id":"PR_kwDOabc","url":"https://github.com/acme/widgets/pull/44"}}}}}}}}'
-        ;;
-      *"addPullRequestReview(input:"*)
-        printf '%s\n' '{{"data":{{"addPullRequestReview":{{"pullRequestReview":{{"id":"PRR_kwDOpending","url":"https://github.com/acme/widgets/pull/44#pullrequestreview-9900"}}}}}}}}'
-        ;;
-      *"addPullRequestReviewThread(input:"*)
-        echo "could not map review thread to diff" >&2
-        exit 42
-        ;;
-      *"deletePullRequestReview(input:"*)
-        printf '%s\n' '{{"data":{{"deletePullRequestReview":{{"pullRequestReview":{{"id":"PRR_kwDOpending","url":"https://github.com/acme/widgets/pull/44#pullrequestreview-9900"}}}}}}}}'
-        ;;
-      *"submitPullRequestReview(input:"*)
-        echo "submit should not run after thread failure" >&2
-        exit 99
-        ;;
-      *)
-        echo "stub: unexpected graphql payload: $*" >&2
-        exit 99
-        ;;
-    esac
-    ;;
-  *)
-    echo "stub: unexpected gh api endpoint: $2" >&2
-    exit 99
-    ;;
-esac
-"#
-    )
+    github_resumable_thread_stub(capture, false, false, false, "thread-error", false)
 }
 
 fn github_review_thread_diff_mapping_stub(capture: &str) -> String {
@@ -1105,154 +1197,40 @@ esac
 }
 
 fn github_review_thread_rejected_stub(capture: &str) -> String {
-    format!(
-        r#"#!/bin/sh
-set -eu
-printf '%s\n' "$*" >> {capture:?}
-if [ "$1" != "api" ]; then
-  echo "stub: unexpected gh command: $*" >&2
-  exit 99
-fi
-case "$*" in
-  *"states: [PENDING]"*)
-    printf '%s\n' '{{"data":{{"repository":{{"pullRequest":{{"headRefOid":"head-44","reviews":{{"nodes":[],"pageInfo":{{"hasNextPage":false,"endCursor":null}}}}}}}}}}}}'
-    ;;
-  *"repos/acme/widgets/pulls/44"*)
-    printf '%s\n' '44'
-    ;;
-  *"reviewThreads(first: 100)"*)
-    printf '%s\n' '{{"data":{{"repository":{{"pullRequest":{{"reviewThreads":{{"nodes":[]}}}}}}}}}}'
-    ;;
-  *"repository(owner:"*)
-    printf '%s\n' '{{"data":{{"repository":{{"pullRequest":{{"id":"PR_kwDOtarget","url":"https://github.com/acme/widgets/pull/44"}}}}}}}}'
-    ;;
-  *"addPullRequestReview(input:"*)
-    printf '%s\n' '{{"data":{{"addPullRequestReview":{{"pullRequestReview":{{"id":"PRR_kwDOpending","url":"https://github.com/acme/widgets/pull/44#pullrequestreview-9900"}}}}}}}}'
-    ;;
-  *"addPullRequestReviewThread(input:"*)
-    cat >&2 <<'ERR'
-gh: Could not resolve to a node with the global id of 'bad line' (HTTP 422)
-{{"errors":[{{"type":"UNPROCESSABLE","message":"line must be part of the diff"}}]}}
-ERR
-    exit 1
-    ;;
-  *"deletePullRequestReview(input:"*)
-    printf '%s\n' '{{"data":{{"deletePullRequestReview":{{"pullRequestReview":{{"id":"PRR_kwDOpending","url":"https://github.com/acme/widgets/pull/44#pullrequestreview-9900"}}}}}}}}'
-    ;;
-  *)
-    echo "stub: unexpected gh api endpoint: $*" >&2
-    exit 99
-    ;;
-esac
-"#,
-        capture = capture
-    )
+    github_resumable_thread_stub(capture, false, false, false, "thread-422", false)
 }
 
 fn github_review_thread_fail_on_submit_stub(capture: &str) -> String {
-    format!(
-        r#"#!/bin/sh
-set -eu
-printf '%s\n' "$*" >> {capture:?}
-if [ "$1" != "api" ]; then
-  echo "stub: unexpected gh command: $*" >&2
-  exit 99
-fi
-case "$2" in
-  repos/acme/widgets/pulls/44)
-    echo "44"
-    ;;
-  graphql)
-    case "$*" in
-      *"reviewThreads(first: 100)"*)
-        printf '%s\n' '{{"data":{{"repository":{{"pullRequest":{{"reviewThreads":{{"nodes":[]}}}}}}}}}}'
-        ;;
-      *"states: [PENDING]"*)
-        printf '%s\n' '{{"data":{{"repository":{{"pullRequest":{{"headRefOid":"head-44","reviews":{{"nodes":[],"pageInfo":{{"hasNextPage":false,"endCursor":null}}}}}}}}}}}}'
-        ;;
-      *"repository(owner:"*)
-        printf '%s\n' '{{"data":{{"repository":{{"pullRequest":{{"id":"PR_kwDOabc","url":"https://github.com/acme/widgets/pull/44"}}}}}}}}'
-        ;;
-      *"addPullRequestReview(input:"*)
-        printf '%s\n' '{{"data":{{"addPullRequestReview":{{"pullRequestReview":{{"id":"PRR_kwDOpending","url":"https://github.com/acme/widgets/pull/44#pullrequestreview-9900"}}}}}}}}'
-        ;;
-      *"addPullRequestReviewThread(input:"*)
-        printf '%s\n' '{{"data":{{"addPullRequestReviewThread":{{"thread":{{"id":"PRRT_kwDOthread","path":"src/lib.rs","line":42,"subjectType":"LINE","comments":{{"nodes":[{{"url":"https://github.com/acme/widgets/pull/44#discussion_r42"}}]}}}}}}}}}}'
-        ;;
-      *"submitPullRequestReview(input:"*)
-        echo "review submit failed" >&2
-        exit 42
-        ;;
-      *"deletePullRequestReview(input:"*)
-        printf '%s\n' '{{"data":{{"deletePullRequestReview":{{"pullRequestReview":{{"id":"PRR_kwDOpending","url":"https://github.com/acme/widgets/pull/44#pullrequestreview-9900"}}}}}}}}'
-        ;;
-      *)
-        echo "stub: unexpected graphql payload: $*" >&2
-        exit 99
-        ;;
-    esac
-    ;;
-  *)
-    echo "stub: unexpected gh api endpoint: $2" >&2
-    exit 99
-    ;;
-esac
-"#
-    )
+    github_resumable_thread_stub(capture, false, false, false, "submit-error", false)
 }
 
 fn github_review_thread_approval_422_on_submit_stub(capture: &str) -> String {
-    format!(
-        r#"#!/bin/sh
-set -eu
-printf '%s\n' "$*" >> {capture:?}
-if [ "$1" != "api" ]; then
-  echo "stub: unexpected gh command: $*" >&2
-  exit 99
-fi
-case "$2" in
-  repos/acme/widgets/pulls/44)
-    echo "44"
-    ;;
-  graphql)
-    case "$*" in
-      *"reviewThreads(first: 100)"*)
-        printf '%s\n' '{{"data":{{"repository":{{"pullRequest":{{"reviewThreads":{{"nodes":[]}}}}}}}}}}'
-        ;;
-      *"states: [PENDING]"*)
-        printf '%s\n' '{{"data":{{"repository":{{"pullRequest":{{"headRefOid":"head-44","reviews":{{"nodes":[],"pageInfo":{{"hasNextPage":false,"endCursor":null}}}}}}}}}}}}'
-        ;;
-      *"repository(owner:"*)
-        printf '%s\n' '{{"data":{{"repository":{{"pullRequest":{{"id":"PR_kwDOabc","url":"https://github.com/acme/widgets/pull/44"}}}}}}}}'
-        ;;
-      *"addPullRequestReview(input:"*)
-        printf '%s\n' '{{"data":{{"addPullRequestReview":{{"pullRequestReview":{{"id":"PRR_kwDOpending","url":"https://github.com/acme/widgets/pull/44#pullrequestreview-9900"}}}}}}}}'
-        ;;
-      *"addPullRequestReviewThread(input:"*)
-        printf '%s\n' '{{"data":{{"addPullRequestReviewThread":{{"thread":{{"id":"PRRT_kwDOthread","path":"src/lib.rs","line":42,"subjectType":"LINE","comments":{{"nodes":[{{"url":"https://github.com/acme/widgets/pull/44#discussion_r42"}}]}}}}}}}}}}'
-        ;;
-      *"submitPullRequestReview(input:"*)
-        cat >&2 <<'ERR'
-gh: Unprocessable Entity (HTTP 422)
-{{"message":"Validation Failed","errors":[{{"resource":"PullRequestReview","code":"custom","message":"Only users with explicit access can approve pull requests"}}]}}
-ERR
-        exit 1
-        ;;
-      *"deletePullRequestReview(input:"*)
-        printf '%s\n' '{{"data":{{"deletePullRequestReview":{{"pullRequestReview":{{"id":"PRR_kwDOpending","url":"https://github.com/acme/widgets/pull/44#pullrequestreview-9900"}}}}}}}}'
-        ;;
-      *)
-        echo "stub: unexpected graphql payload: $*" >&2
-        exit 99
-        ;;
-    esac
-    ;;
-  *)
-    echo "stub: unexpected gh api endpoint: $2" >&2
-    exit 99
-    ;;
-esac
-"#
+    github_resumable_thread_stub(capture, false, false, false, "submit-422", false)
+}
+
+fn run_resumable_thread_review(stub: &StubEnv, thread_file: &Path) -> CmdOutput {
+    run_forge_cli(
+        stub,
+        &[
+            "--provider",
+            "github",
+            "--repo",
+            "acme/widgets",
+            "--format",
+            "json",
+            "pr",
+            "review",
+            "44",
+            "--decision",
+            "comments-only",
+            "--submit-review",
+            "--expected-head",
+            "head-44",
+            "--comment",
+            "Summary body",
+            "--thread-file",
+            thread_file.to_str().expect("utf8 path"),
+        ],
     )
 }
 
@@ -1346,8 +1324,281 @@ fn pr_review_thread_file_creates_resolvable_github_review_thread() {
     assert!(calls.contains("line=42"), "{calls}");
     assert!(calls.contains("side=RIGHT"), "{calls}");
     assert!(
-        calls.contains("body=Add coverage for the rejected profile URL path."),
+        calls.contains("forge-cli:review-finding:v1")
+            && calls.contains("Add coverage for the rejected profile URL path."),
         "{calls}"
+    );
+}
+
+#[test]
+fn pr_review_transaction_resumes_after_each_interruption_point() {
+    for failure in [
+        "pending-create-once",
+        "lost-thread-once",
+        "before-submit-once",
+    ] {
+        let stub = StubEnv::new();
+        let capture = stub.tempdir.path().join(format!("{failure}-gh-args.log"));
+        let thread_file = stub.tempdir.path().join(format!("{failure}-threads.json"));
+        fs::write(
+            &thread_file,
+            r#"[{"path":"src/lib.rs","line":42,"body":"Thread body"}]"#,
+        )
+        .expect("write thread specs");
+        let stub = stub.gh_stub(&github_resumable_thread_stub(
+            &capture.to_string_lossy(),
+            false,
+            false,
+            false,
+            failure,
+            false,
+        ));
+
+        let interrupted = run_resumable_thread_review(&stub, &thread_file);
+        assert_eq!(
+            interrupted.code, 65,
+            "failure={failure}; stdout={}; stderr={}",
+            interrupted.stdout, interrupted.stderr
+        );
+        let interrupted_envelope = parse_envelope(&interrupted.stdout);
+        assert_eq!(
+            interrupted_envelope["error"]["code"], "pending_review_transaction_incomplete",
+            "failure={failure}"
+        );
+
+        let resumed = run_resumable_thread_review(&stub, &thread_file);
+        assert_eq!(
+            resumed.code, 0,
+            "failure={failure}; stdout={}; stderr={}",
+            resumed.stdout, resumed.stderr
+        );
+        let resumed_envelope = parse_envelope(&resumed.stdout);
+        assert_eq!(resumed_envelope["data"]["submitted_review"], true);
+
+        let calls = fs::read_to_string(&capture).expect("read captured calls");
+        assert_eq!(
+            calls.matches("addPullRequestReview(input:").count(),
+            1,
+            "the same pending review must be reused after {failure}: {calls}"
+        );
+        assert_eq!(
+            calls.matches("addPullRequestReviewThread(input:").count(),
+            1,
+            "the same inline comment must be reused after {failure}: {calls}"
+        );
+        assert!(
+            !calls.contains("deletePullRequestReview(input:"),
+            "interrupted content must never be deleted after {failure}: {calls}"
+        );
+    }
+}
+
+#[test]
+fn pr_review_transaction_resumes_after_every_inline_comment_index() {
+    for failure in ["lost-thread-0-once", "lost-thread-1-once"] {
+        let stub = StubEnv::new();
+        let capture = stub.tempdir.path().join(format!("{failure}-gh-args.log"));
+        let thread_file = stub.tempdir.path().join(format!("{failure}-threads.json"));
+        fs::write(
+            &thread_file,
+            r#"[{"path":"src/lib.rs","line":42,"body":"First finding"},{"path":"src/other.rs","line":7,"body":"Second finding"}]"#,
+        )
+        .expect("write thread specs");
+        let stub = stub.gh_stub(&github_resumable_thread_stub(
+            &capture.to_string_lossy(),
+            false,
+            false,
+            false,
+            failure,
+            false,
+        ));
+
+        let interrupted = run_resumable_thread_review(&stub, &thread_file);
+        assert_eq!(
+            interrupted.code, 65,
+            "failure={failure}; stdout={}; stderr={}",
+            interrupted.stdout, interrupted.stderr
+        );
+        let resumed = run_resumable_thread_review(&stub, &thread_file);
+        assert_eq!(
+            resumed.code, 0,
+            "failure={failure}; stdout={}; stderr={}",
+            resumed.stdout, resumed.stderr
+        );
+
+        let calls = fs::read_to_string(&capture).expect("read captured calls");
+        assert_eq!(
+            calls.matches("addPullRequestReviewThread(input:").count(),
+            2,
+            "each manifest entry must be created exactly once after {failure}: {calls}"
+        );
+        assert!(
+            !calls.contains("deletePullRequestReview(input:"),
+            "inline progress must remain intact after {failure}: {calls}"
+        );
+    }
+}
+
+#[test]
+fn pr_review_transaction_recovers_a_lost_submit_response() {
+    let stub = StubEnv::new();
+    let capture = stub.tempdir.path().join("lost-submit-gh-args.log");
+    let thread_file = stub.tempdir.path().join("lost-submit-threads.json");
+    fs::write(
+        &thread_file,
+        r#"[{"path":"src/lib.rs","line":42,"body":"Thread body"}]"#,
+    )
+    .expect("write thread specs");
+    let stub = stub.gh_stub(&github_resumable_thread_stub(
+        &capture.to_string_lossy(),
+        false,
+        false,
+        false,
+        "lost-submit",
+        false,
+    ));
+
+    let output = run_resumable_thread_review(&stub, &thread_file);
+    assert_eq!(
+        output.code, 0,
+        "stdout={}\nstderr={}",
+        output.stdout, output.stderr
+    );
+    let envelope = parse_envelope(&output.stdout);
+    assert_eq!(envelope["data"]["submitted_review"], true);
+    assert_eq!(
+        envelope["data"]["pr_comment_url"],
+        "https://github.com/acme/widgets/pull/44#pullrequestreview-9900"
+    );
+    let calls = fs::read_to_string(capture).expect("read captured calls");
+    assert_eq!(calls.matches("submitPullRequestReview(input:").count(), 1);
+    assert!(
+        calls.matches("reviews(first: 100").count() >= 2,
+        "the lost response must be reconciled through submitted-review read-back: {calls}"
+    );
+}
+
+#[test]
+fn pr_review_transaction_is_idempotent_across_sessions() {
+    let stub = StubEnv::new();
+    let capture = stub.tempdir.path().join("idempotent-gh-args.log");
+    let thread_file = stub.tempdir.path().join("idempotent-threads.json");
+    fs::write(
+        &thread_file,
+        r#"[{"path":"src/lib.rs","line":42,"body":"Thread body"}]"#,
+    )
+    .expect("write thread specs");
+    let stub = stub.gh_stub(&github_resumable_thread_stub(
+        &capture.to_string_lossy(),
+        false,
+        false,
+        false,
+        "none",
+        false,
+    ));
+
+    let first = run_resumable_thread_review(&stub, &thread_file);
+    let first_calls = fs::read_to_string(&capture).expect("read first-run calls");
+    assert!(
+        !first_calls.contains("submittedAt body viewerDidAuthor"),
+        "a fresh transaction without a pre-existing receipt must not scan submitted-review history: {first_calls}"
+    );
+    let second = run_resumable_thread_review(&stub, &thread_file);
+    assert_eq!(first.code, 0, "{}", first.stdout);
+    assert_eq!(second.code, 0, "{}", second.stdout);
+    let first_envelope = parse_envelope(&first.stdout);
+    let second_envelope = parse_envelope(&second.stdout);
+    assert_eq!(second_envelope["data"]["submitted_review"], false);
+    assert_eq!(
+        second_envelope["data"]["pr_comment_url"], first_envelope["data"]["pr_comment_url"],
+        "an exact rerun must preserve the submitted review identity"
+    );
+
+    let calls = fs::read_to_string(capture).expect("read captured calls");
+    assert_eq!(calls.matches("addPullRequestReview(input:").count(), 1);
+    assert_eq!(
+        calls.matches("addPullRequestReviewThread(input:").count(),
+        1
+    );
+    assert_eq!(calls.matches("submitPullRequestReview(input:").count(), 1);
+    assert_eq!(
+        calls.matches("issues/44/comments --method POST").count(),
+        1,
+        "the immutable receipt must not be duplicated: {calls}"
+    );
+}
+
+#[test]
+fn pr_review_completed_rerun_does_not_duplicate_issue_mirror() {
+    let stub = StubEnv::new();
+    let capture = stub.tempdir.path().join("idempotent-mirror-gh-args.log");
+    let thread_file = stub.tempdir.path().join("idempotent-mirror-threads.json");
+    fs::write(
+        &thread_file,
+        r#"[{"path":"src/lib.rs","line":42,"body":"Thread body"}]"#,
+    )
+    .expect("write thread specs");
+    let stub = stub.gh_stub(&github_resumable_thread_stub(
+        &capture.to_string_lossy(),
+        false,
+        false,
+        false,
+        "none",
+        false,
+    ));
+    let run = |stub: &StubEnv| {
+        run_forge_cli(
+            stub,
+            &[
+                "--provider",
+                "github",
+                "--repo",
+                "acme/widgets",
+                "--format",
+                "json",
+                "pr",
+                "review",
+                "44",
+                "--decision",
+                "comments-only",
+                "--submit-review",
+                "--expected-head",
+                "head-44",
+                "--comment",
+                "Summary body",
+                "--thread-file",
+                thread_file.to_str().expect("utf8 path"),
+                "--issue",
+                "101",
+                "--mirror-issue",
+            ],
+        )
+    };
+
+    let first = run(&stub);
+    let second = run(&stub);
+    assert_eq!(first.code, 0, "{}", first.stdout);
+    assert_eq!(second.code, 0, "{}", second.stdout);
+    let first_envelope = parse_envelope(&first.stdout);
+    let second_envelope = parse_envelope(&second.stdout);
+    assert_eq!(first_envelope["data"]["submitted_review"], true);
+    assert_eq!(second_envelope["data"]["submitted_review"], false);
+    assert_eq!(
+        second_envelope["data"]["issue_comment_url"],
+        serde_json::Value::Null
+    );
+    assert_eq!(
+        second_envelope["data"]["pr_comment_url"], first_envelope["data"]["pr_comment_url"],
+        "the skipped rerun must still report the original review identity"
+    );
+
+    let calls = fs::read_to_string(capture).expect("read captured calls");
+    assert_eq!(
+        calls
+            .matches("repos/acme/widgets/issues/101/comments --method POST")
+            .count(),
+        1,
+        "the completed rerun must not duplicate issue activity: {calls}"
     );
 }
 
@@ -1403,7 +1654,7 @@ fn pr_review_skips_duplicate_thread_on_unchanged_head() {
     assert_eq!(out.code, 0, "stdout={}\nstderr={}", out.stdout, out.stderr);
     let calls = fs::read_to_string(&capture).expect("read captured calls");
     assert!(
-        calls.contains("reviewThreads(first: 100)"),
+        calls.contains("reviewThreads(first: 100"),
         "existing threads must be read to dedup: {calls}"
     );
     assert!(
@@ -1719,6 +1970,23 @@ fn pr_review_thread_file_dry_run_renders_thread_creation_plan() {
         pending_guard_plan.contains("states: [PENDING]"),
         "threaded dry-run must render the pending-review guard: {pending_guard_plan}"
     );
+    for field in [
+        "review_state_plan",
+        "review_receipt_plan",
+        "review_state_verify_plan",
+    ] {
+        let plan = env["data"][field]
+            .as_array()
+            .unwrap_or_else(|| panic!("{field} present in threaded dry-run"))
+            .iter()
+            .map(|value| value.as_str().unwrap_or_default())
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(
+            plan.contains("graphql") || plan.contains("issues/44/comments"),
+            "{field}: {plan}"
+        );
+    }
 }
 
 #[test]
@@ -2581,7 +2849,7 @@ fn pr_review_thread_file_rejects_oversized_stdin_before_backend() {
 }
 
 #[test]
-fn pr_review_thread_file_cleans_up_pending_review_after_thread_failure() {
+fn pr_review_thread_file_preserves_pending_review_after_thread_failure() {
     let stub = StubEnv::new();
     let capture = stub.tempdir.path().join("gh-args.log");
     let thread_file = stub.tempdir.path().join("review-threads.json");
@@ -2618,11 +2886,14 @@ fn pr_review_thread_file_cleans_up_pending_review_after_thread_failure() {
         ],
     );
 
-    assert_eq!(out.code, 1, "stdout={}\nstderr={}", out.stdout, out.stderr);
+    assert_eq!(out.code, 65, "stdout={}\nstderr={}", out.stdout, out.stderr);
     let env = parse_envelope(&out.stdout);
     assert_eq!(env["schema_version"], "cli.forge-cli.error.v1");
     assert_eq!(env["ok"], false);
-    assert_eq!(env["error"]["code"], "backend_error");
+    assert_eq!(
+        env["error"]["code"],
+        "pending_review_transaction_incomplete"
+    );
 
     let calls = fs::read_to_string(capture).expect("read captured calls");
     assert!(calls.contains("addPullRequestReview(input:"), "{calls}");
@@ -2631,8 +2902,8 @@ fn pr_review_thread_file_cleans_up_pending_review_after_thread_failure() {
         "{calls}"
     );
     assert!(
-        calls.contains("deletePullRequestReview(input:"),
-        "pending review cleanup mutation should run after thread failure: {calls}"
+        !calls.contains("deletePullRequestReview(input:"),
+        "interrupted inline review content must remain resumable: {calls}"
     );
     assert!(
         !calls.contains("submitPullRequestReview(input:"),
@@ -2641,7 +2912,7 @@ fn pr_review_thread_file_cleans_up_pending_review_after_thread_failure() {
 }
 
 #[test]
-fn pr_review_thread_file_maps_github_diff_failure_to_typed_error_and_cleans_up() {
+fn pr_review_thread_file_preserves_pending_review_after_github_diff_failure() {
     let stub = StubEnv::new();
     let capture = stub.tempdir.path().join("gh-args.log");
     let thread_file = stub.tempdir.path().join("review-threads.json");
@@ -2678,11 +2949,14 @@ fn pr_review_thread_file_maps_github_diff_failure_to_typed_error_and_cleans_up()
         ],
     );
 
-    assert_eq!(out.code, 1, "stdout={}\nstderr={}", out.stdout, out.stderr);
+    assert_eq!(out.code, 65, "stdout={}\nstderr={}", out.stdout, out.stderr);
     let env = parse_envelope(&out.stdout);
     assert_eq!(env["schema_version"], "cli.forge-cli.error.v1");
     assert_eq!(env["ok"], false);
-    assert_eq!(env["error"]["code"], "github_review_thread_rejected");
+    assert_eq!(
+        env["error"]["code"],
+        "pending_review_transaction_incomplete"
+    );
     let detail = env["error"]["details"]["detail"]
         .as_str()
         .expect("detail is preserved");
@@ -2698,8 +2972,8 @@ fn pr_review_thread_file_maps_github_diff_failure_to_typed_error_and_cleans_up()
         "{calls}"
     );
     assert!(
-        calls.contains("deletePullRequestReview(input:"),
-        "pending review cleanup mutation should run after thread failure: {calls}"
+        !calls.contains("deletePullRequestReview(input:"),
+        "rejected inline content must remain available for recovery: {calls}"
     );
     assert!(
         !calls.contains("submitPullRequestReview(input:"),
@@ -2708,7 +2982,7 @@ fn pr_review_thread_file_maps_github_diff_failure_to_typed_error_and_cleans_up()
 }
 
 #[test]
-fn pr_review_thread_file_cleans_up_pending_review_after_submit_failure() {
+fn pr_review_thread_file_preserves_pending_review_after_submit_failure() {
     let stub = StubEnv::new();
     let capture = stub.tempdir.path().join("gh-args.log");
     let thread_file = stub.tempdir.path().join("review-threads.json");
@@ -2745,11 +3019,14 @@ fn pr_review_thread_file_cleans_up_pending_review_after_submit_failure() {
         ],
     );
 
-    assert_eq!(out.code, 1, "stdout={}\nstderr={}", out.stdout, out.stderr);
+    assert_eq!(out.code, 65, "stdout={}\nstderr={}", out.stdout, out.stderr);
     let env = parse_envelope(&out.stdout);
     assert_eq!(env["schema_version"], "cli.forge-cli.error.v1");
     assert_eq!(env["ok"], false);
-    assert_eq!(env["error"]["code"], "backend_error");
+    assert_eq!(
+        env["error"]["code"],
+        "pending_review_transaction_incomplete"
+    );
 
     let calls = fs::read_to_string(capture).expect("read captured calls");
     assert!(calls.contains("addPullRequestReview(input:"), "{calls}");
@@ -2762,13 +3039,13 @@ fn pr_review_thread_file_cleans_up_pending_review_after_submit_failure() {
         "submit should have been attempted after thread creation: {calls}"
     );
     assert!(
-        calls.contains("deletePullRequestReview(input:"),
-        "pending review cleanup mutation should run after submit failure: {calls}"
+        !calls.contains("deletePullRequestReview(input:"),
+        "an unknown submit result must preserve the pending review: {calls}"
     );
 }
 
 #[test]
-fn pr_review_thread_file_submit_422_is_actionable_and_cleans_up() {
+fn pr_review_thread_file_submit_422_is_actionable_and_preserves_content() {
     let stub = StubEnv::new();
     let capture = stub.tempdir.path().join("gh-args.log");
     let thread_file = stub.tempdir.path().join("review-threads.json");
@@ -2805,11 +3082,14 @@ fn pr_review_thread_file_submit_422_is_actionable_and_cleans_up() {
         ],
     );
 
-    assert_eq!(out.code, 1, "stdout={}\nstderr={}", out.stdout, out.stderr);
+    assert_eq!(out.code, 65, "stdout={}\nstderr={}", out.stdout, out.stderr);
     let env = parse_envelope(&out.stdout);
     assert_eq!(env["schema_version"], "cli.forge-cli.error.v1");
     assert_eq!(env["ok"], false);
-    assert_eq!(env["error"]["code"], "github_native_review_rejected");
+    assert_eq!(
+        env["error"]["code"],
+        "pending_review_transaction_incomplete"
+    );
     let detail = env["error"]["details"]["detail"]
         .as_str()
         .expect("detail is preserved");
@@ -2831,8 +3111,8 @@ fn pr_review_thread_file_submit_422_is_actionable_and_cleans_up() {
         "submit should have been attempted after thread creation: {calls}"
     );
     assert!(
-        calls.contains("deletePullRequestReview(input:"),
-        "pending review cleanup mutation should run after submit failure: {calls}"
+        !calls.contains("deletePullRequestReview(input:"),
+        "a rejected submit must preserve the pending review: {calls}"
     );
 }
 
@@ -3147,7 +3427,7 @@ fn pr_review_submit_native_rejects_viewer_owned_pending_review_before_mutation()
 }
 
 #[test]
-fn pr_review_thread_file_rejects_viewer_owned_pending_review_before_mutation() {
+fn pr_review_thread_file_preserves_unmarked_pending_review_before_mutation() {
     let stub = StubEnv::new();
     let capture = stub.tempdir.path().join("gh-args.log");
     let thread_file = stub.tempdir.path().join("review-threads.json");
@@ -3156,8 +3436,13 @@ fn pr_review_thread_file_rejects_viewer_owned_pending_review_before_mutation() {
         r#"[{"path":"src/lib.rs","line":42,"body":"Thread body"}]"#,
     )
     .expect("write thread specs");
-    let stub = stub.gh_stub(&github_review_submit_pending_conflict_stub(
+    let stub = stub.gh_stub(&github_resumable_thread_stub(
         &capture.to_string_lossy(),
+        false,
+        false,
+        false,
+        "none",
+        true,
     ));
 
     let out = run_forge_cli(
@@ -3184,14 +3469,18 @@ fn pr_review_thread_file_rejects_viewer_owned_pending_review_before_mutation() {
         ],
     );
 
-    assert_eq!(out.code, 1, "stdout={}\nstderr={}", out.stdout, out.stderr);
+    assert_eq!(out.code, 65, "stdout={}\nstderr={}", out.stdout, out.stderr);
     let env = parse_envelope(&out.stdout);
-    assert_eq!(env["error"]["code"], "github_pending_review_exists");
+    assert_eq!(env["error"]["code"], "pending_review_manifest_mismatch");
     let calls = fs::read_to_string(capture).expect("read captured calls");
     assert!(calls.contains("states: [PENDING]"), "{calls}");
     assert!(
         !calls.contains("addPullRequestReview(input:"),
         "threaded review must not create a second pending review: {calls}"
+    );
+    assert!(
+        !calls.contains("issues/44/comments --method POST"),
+        "a unmarked mismatch must not append a receipt: {calls}"
     );
 }
 

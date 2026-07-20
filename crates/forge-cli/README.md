@@ -26,6 +26,8 @@ cargo run -p nils-forge-cli -- pr review validate --comment-file review.md --thr
 cargo run -p nils-forge-cli -- pr review validate 123 --check-diff --comment-file review.md --thread-file review-threads.json --format json
 cargo run -p nils-forge-cli -- pr review 123 --decision comments-only --submit-review --expected-head <sha> --comment-file review.md --thread-file review-threads.json --format json
 cargo run -p nils-forge-cli -- pr reviews 123 --format json
+cargo run -p nils-forge-cli -- pr pending-review inspect 123 --review PRR_pending --format json
+cargo run -p nils-forge-cli -- pr pending-review resume-submit 123 --review PRR_pending --review-run-id <digest> --expected-head <sha> --expected-commit <sha> --expected-snapshot <digest> --decision comments-only --format json
 cargo run -p nils-forge-cli -- pr pending-review delete 123 --review PRR_pending --expected-head <sha> --expected-commit <sha> --expected-body-file review.md --confirm-abandoned --dry-run --format json
 cargo run -p nils-forge-cli -- pr merge 123 --expected-head <reviewed-sha> --review-convergence --format json
 cargo run -p nils-forge-cli -- repo push-default --expected-base <sha> --reason-file reason.md --dry-run --format json
@@ -71,31 +73,34 @@ independent merge gate. See the contract for config precedence, duration
 bounds, and the JSON snapshot.
 
 Provider-valid pending reviews are listed separately under
-`pr reviews data.pending_reviews`; they are not submitted review activity. To
-recover a confirmed abandoned draft, copy its `PRR_...` id, head, commit, and
-body into `pr pending-review delete` and pass `--confirm-abandoned`. The command
-reads the complete pending membership snapshot, then re-fetches the exact node
-and verifies those content guards, PR membership, `PENDING` state,
-provider-native `viewerDidAuthor`, and `viewerCanDelete` immediately before
-deleting it. Drafts with inline comments fail closed and require manual provider
-recovery. It works for GitHub App installation actors without relying on the
-user-only `GET /user` endpoint. The pending body and body-file path are never
-emitted by the delete command. Expected and provider bodies are limited to 64
-KiB, file and stdin inputs use bounded reads, and complete pagination retains
-only the target body. GitHub provides no content CAS for the deletion, so an
-unavoidable small race remains between the final exact-node read and the
-mutation.
+`pr reviews data.pending_reviews`; they are not submitted review activity.
+`pr pending-review inspect` reads the exact draft plus every inline-comment page
+and returns a stable snapshot digest and `receipt-bound` or `unmarked`
+provenance. Use `resume-submit` for an exact receipt-bound transaction; it adds
+no duplicate content and also succeeds idempotently when submission completed
+but its response was lost. Use guarded `submit --confirm-unmarked-submit` only
+after inspecting an unmarked draft. `discard` is destructive and needs a
+second `--confirm-inline-content-loss` when the snapshot contains inline
+comments. None of these recovery paths deletes and recreates inline content.
+
+The older `pending-review delete` remains a body-only compatibility surface for
+a confirmed abandoned draft. It verifies exact head, commit, body, PR
+membership, `PENDING` state, `viewerDidAuthor`, and `viewerCanDelete`; any inline
+comment fails closed. It works for GitHub App installation actors without the
+user-only `GET /user` endpoint. GitHub provides no content CAS for deletion, so
+a small final-read-to-mutation race remains.
 
 Direct `pr merge` callers can pass `--expected-head <sha>` to bind the merge to
 the head they reviewed. Provider drift then fails before the merge mutation;
 `pr deliver` uses the same compare-and-swap internally.
 
-`pr review --submit-review` requires `--expected-head <sha>`, performs the same
-pending-only ownership preflight, and compares the provider head before any
-native review mutation. A viewer-owned draft returns the typed
-`github_pending_review_exists` error with the provider head and counts; head
-drift returns `github_review_head_changed`; drafts owned by other viewers remain
-non-blocking. The expected head is also bound to the provider mutation.
+`pr review --submit-review` requires `--expected-head <sha>` and compares the
+provider head before any native review mutation. Summary-only reviews keep the
+pending-only ownership guard. Threaded reviews first append an immutable
+`forge-cli.review-loop.v1` receipt, then create or resume the exact marked draft,
+add only the missing ordered inline-comment suffix, and submit after one final
+complete snapshot. Any interruption preserves the pending review; rerunning the
+same command resumes it, and an already-submitted run returns idempotent success.
 
 ## Inbox discovery
 

@@ -226,6 +226,18 @@ _forge-cli() {
             forge__cli__help__pr__pending__review,delete)
                 cmd="forge__cli__help__pr__pending__review__delete"
                 ;;
+            forge__cli__help__pr__pending__review,discard)
+                cmd="forge__cli__help__pr__pending__review__discard"
+                ;;
+            forge__cli__help__pr__pending__review,inspect)
+                cmd="forge__cli__help__pr__pending__review__inspect"
+                ;;
+            forge__cli__help__pr__pending__review,resume-submit)
+                cmd="forge__cli__help__pr__pending__review__resume__submit"
+                ;;
+            forge__cli__help__pr__pending__review,submit)
+                cmd="forge__cli__help__pr__pending__review__submit"
+                ;;
             forge__cli__help__pr__review,validate)
                 cmd="forge__cli__help__pr__review__validate"
                 ;;
@@ -460,6 +472,18 @@ _forge-cli() {
             forge__cli__pr__help__pending__review,delete)
                 cmd="forge__cli__pr__help__pending__review__delete"
                 ;;
+            forge__cli__pr__help__pending__review,discard)
+                cmd="forge__cli__pr__help__pending__review__discard"
+                ;;
+            forge__cli__pr__help__pending__review,inspect)
+                cmd="forge__cli__pr__help__pending__review__inspect"
+                ;;
+            forge__cli__pr__help__pending__review,resume-submit)
+                cmd="forge__cli__pr__help__pending__review__resume__submit"
+                ;;
+            forge__cli__pr__help__pending__review,submit)
+                cmd="forge__cli__pr__help__pending__review__submit"
+                ;;
             forge__cli__pr__help__review,validate)
                 cmd="forge__cli__pr__help__review__validate"
                 ;;
@@ -475,14 +499,38 @@ _forge-cli() {
             forge__cli__pr__pending__review,delete)
                 cmd="forge__cli__pr__pending__review__delete"
                 ;;
+            forge__cli__pr__pending__review,discard)
+                cmd="forge__cli__pr__pending__review__discard"
+                ;;
             forge__cli__pr__pending__review,help)
                 cmd="forge__cli__pr__pending__review__help"
+                ;;
+            forge__cli__pr__pending__review,inspect)
+                cmd="forge__cli__pr__pending__review__inspect"
+                ;;
+            forge__cli__pr__pending__review,resume-submit)
+                cmd="forge__cli__pr__pending__review__resume__submit"
+                ;;
+            forge__cli__pr__pending__review,submit)
+                cmd="forge__cli__pr__pending__review__submit"
                 ;;
             forge__cli__pr__pending__review__help,delete)
                 cmd="forge__cli__pr__pending__review__help__delete"
                 ;;
+            forge__cli__pr__pending__review__help,discard)
+                cmd="forge__cli__pr__pending__review__help__discard"
+                ;;
             forge__cli__pr__pending__review__help,help)
                 cmd="forge__cli__pr__pending__review__help__help"
+                ;;
+            forge__cli__pr__pending__review__help,inspect)
+                cmd="forge__cli__pr__pending__review__help__inspect"
+                ;;
+            forge__cli__pr__pending__review__help,resume-submit)
+                cmd="forge__cli__pr__pending__review__help__resume__submit"
+                ;;
+            forge__cli__pr__pending__review__help,submit)
+                cmd="forge__cli__pr__pending__review__help__submit"
                 ;;
             forge__cli__pr__review,help)
                 cmd="forge__cli__pr__review__help"
@@ -1581,7 +1629,7 @@ _forge-cli() {
             return 0
             ;;
         forge__cli__help__pr__pending__review)
-            opts="delete"
+            opts="inspect resume-submit submit discard delete"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -1595,6 +1643,62 @@ _forge-cli() {
             return 0
             ;;
         forge__cli__help__pr__pending__review__delete)
+            opts=""
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 5 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        forge__cli__help__pr__pending__review__discard)
+            opts=""
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 5 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        forge__cli__help__pr__pending__review__inspect)
+            opts=""
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 5 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        forge__cli__help__pr__pending__review__resume__submit)
+            opts=""
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 5 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        forge__cli__help__pr__pending__review__submit)
             opts=""
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 5 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
@@ -3549,7 +3653,7 @@ _forge-cli() {
             return 0
             ;;
         forge__cli__pr__help__pending__review)
-            opts="delete"
+            opts="inspect resume-submit submit discard delete"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -3563,6 +3667,62 @@ _forge-cli() {
             return 0
             ;;
         forge__cli__pr__help__pending__review__delete)
+            opts=""
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 5 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        forge__cli__pr__help__pending__review__discard)
+            opts=""
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 5 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        forge__cli__pr__help__pending__review__inspect)
+            opts=""
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 5 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        forge__cli__pr__help__pending__review__resume__submit)
+            opts=""
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 5 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        forge__cli__pr__help__pending__review__submit)
             opts=""
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 5 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
@@ -3843,7 +4003,7 @@ _forge-cli() {
             return 0
             ;;
         forge__cli__pr__pending__review)
-            opts="-h --format --remote --provider --host --repo --store-root --dry-run --help delete help"
+            opts="-h --format --remote --provider --host --repo --store-root --dry-run --help inspect resume-submit submit discard delete help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -3938,8 +4098,62 @@ _forge-cli() {
             COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
             return 0
             ;;
+        forge__cli__pr__pending__review__discard)
+            opts="-h --review --expected-head --expected-commit --expected-snapshot --confirm-discard --confirm-inline-content-loss --format --remote --provider --host --repo --store-root --dry-run --help"
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                --review)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --expected-head)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --expected-commit)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --expected-snapshot)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --format)
+                    COMPREPLY=($(compgen -W "text json" -- "${cur}"))
+                    return 0
+                    ;;
+                --remote)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --provider)
+                    COMPREPLY=($(compgen -W "github gitlab local" -- "${cur}"))
+                    return 0
+                    ;;
+                --host)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --repo)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --store-root)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
         forge__cli__pr__pending__review__help)
-            opts="delete help"
+            opts="inspect resume-submit submit discard delete help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -3966,6 +4180,20 @@ _forge-cli() {
             COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
             return 0
             ;;
+        forge__cli__pr__pending__review__help__discard)
+            opts=""
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 5 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
         forge__cli__pr__pending__review__help__help)
             opts=""
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 5 ]] ; then
@@ -3973,6 +4201,210 @@ _forge-cli() {
                 return 0
             fi
             case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        forge__cli__pr__pending__review__help__inspect)
+            opts=""
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 5 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        forge__cli__pr__pending__review__help__resume__submit)
+            opts=""
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 5 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        forge__cli__pr__pending__review__help__submit)
+            opts=""
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 5 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        forge__cli__pr__pending__review__inspect)
+            opts="-h --review --format --remote --provider --host --repo --store-root --dry-run --help"
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                --review)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --format)
+                    COMPREPLY=($(compgen -W "text json" -- "${cur}"))
+                    return 0
+                    ;;
+                --remote)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --provider)
+                    COMPREPLY=($(compgen -W "github gitlab local" -- "${cur}"))
+                    return 0
+                    ;;
+                --host)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --repo)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --store-root)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        forge__cli__pr__pending__review__resume__submit)
+            opts="-h --review --review-run-id --expected-head --expected-commit --expected-snapshot --decision --format --remote --provider --host --repo --store-root --dry-run --help"
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                --review)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --review-run-id)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --expected-head)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --expected-commit)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --expected-snapshot)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --decision)
+                    COMPREPLY=($(compgen -W "comments-only approve request-changes" -- "${cur}"))
+                    return 0
+                    ;;
+                --format)
+                    COMPREPLY=($(compgen -W "text json" -- "${cur}"))
+                    return 0
+                    ;;
+                --remote)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --provider)
+                    COMPREPLY=($(compgen -W "github gitlab local" -- "${cur}"))
+                    return 0
+                    ;;
+                --host)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --repo)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --store-root)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        forge__cli__pr__pending__review__submit)
+            opts="-h --review --expected-head --expected-commit --expected-snapshot --decision --confirm-unmarked-submit --format --remote --provider --host --repo --store-root --dry-run --help"
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                --review)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --expected-head)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --expected-commit)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --expected-snapshot)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --decision)
+                    COMPREPLY=($(compgen -W "comments-only approve request-changes" -- "${cur}"))
+                    return 0
+                    ;;
+                --format)
+                    COMPREPLY=($(compgen -W "text json" -- "${cur}"))
+                    return 0
+                    ;;
+                --remote)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --provider)
+                    COMPREPLY=($(compgen -W "github gitlab local" -- "${cur}"))
+                    return 0
+                    ;;
+                --host)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --repo)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --store-root)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
                 *)
                     COMPREPLY=()
                     ;;

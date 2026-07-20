@@ -13,6 +13,7 @@ use crate::envelope::emit_success;
 use crate::error::ForgeError;
 use crate::ops::pr_comments::github_repo_slug_from_url;
 use crate::ops::pr_view;
+use crate::ops::review_state;
 use crate::provider::{Provider, ProviderContext, detect, git_remote_url};
 use crate::rate_limit::default_runner;
 
@@ -22,11 +23,13 @@ const MAX_SUMMARY_BYTES: usize = 4096;
 const MAX_REVIEW_PAGES: usize = 100;
 pub(crate) const MAX_PENDING_REVIEW_BODY_BYTES: usize = 64 * 1024;
 
-const GITHUB_REVIEWS_QUERY: &str = "query($owner: String!, $name: String!, $pr: Int!, $after: String) { repository(owner: $owner, name: $name) { pullRequest(number: $pr) { headRefOid reviews(first: 100, after: $after) { nodes { id databaseId url author { login } state commit { oid } submittedAt body } pageInfo { hasNextPage endCursor } } } } }";
+const GITHUB_REVIEWS_QUERY: &str = "query($owner: String!, $name: String!, $pr: Int!, $after: String) { viewer { login } repository(owner: $owner, name: $name) { pullRequest(number: $pr) { headRefOid reviews(first: 100, after: $after) { nodes { id databaseId url author { login } state commit { oid } submittedAt body viewerDidAuthor } pageInfo { hasNextPage endCursor } } } } }";
 const GITHUB_PENDING_REVIEWS_QUERY: &str = "query($owner: String!, $name: String!, $pr: Int!, $after: String) { repository(owner: $owner, name: $name) { pullRequest(number: $pr) { headRefOid reviews(first: 100, after: $after, states: [PENDING]) { nodes { id url author { login } state commit { oid } body viewerDidAuthor viewerCanDelete } pageInfo { hasNextPage endCursor } } } } }";
 const GITHUB_PENDING_REVIEW_TARGET_QUERY: &str = "query($review: ID!) { node(id: $review) { ... on PullRequestReview { id url author { login } state commit { oid } body viewerDidAuthor viewerCanDelete comments(first: 1) { totalCount } pullRequest { number url headRefOid } } } }";
+const GITHUB_PENDING_REVIEW_SNAPSHOT_QUERY: &str = "query($review: ID!, $after: String) { node(id: $review) { ... on PullRequestReview { id url author { login } state commit { oid } body viewerDidAuthor viewerCanDelete comments(first: 100, after: $after) { totalCount nodes { id url author { login } body createdAt path line originalLine diffSide startLine originalStartLine startDiffSide subjectType } pageInfo { hasNextPage endCursor } } pullRequest { number url headRefOid } } } }";
 
 struct ReviewPage {
+    viewer_login: String,
     head_sha: String,
     reviews: Vec<NativeReviewSummary>,
     pending_reviews: Vec<PendingReviewSummary>,
@@ -97,6 +100,52 @@ pub(crate) struct PendingReviewTarget {
     pub review: PendingReviewGuard,
 }
 
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct PendingReviewInlineComment {
+    pub id: String,
+    pub url: String,
+    pub author: String,
+    pub body: String,
+    pub semantic_body: String,
+    pub created_at: String,
+    pub path: String,
+    pub line: Option<u32>,
+    pub original_line: Option<u32>,
+    pub diff_side: Option<String>,
+    pub start_line: Option<u32>,
+    pub original_start_line: Option<u32>,
+    pub start_diff_side: Option<String>,
+    pub subject_type: String,
+    pub body_digest: String,
+    pub review_run_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct PendingReviewSnapshot {
+    pub number: u64,
+    pub pr_url: String,
+    pub head_sha: String,
+    pub review_id: String,
+    pub review_url: String,
+    pub author: String,
+    pub commit_sha: Option<String>,
+    pub body: String,
+    pub semantic_body: String,
+    pub viewer_did_author: bool,
+    pub viewer_can_delete: bool,
+    pub review_run_id: Option<String>,
+    pub provenance: &'static str,
+    pub inline_comments: Vec<PendingReviewInlineComment>,
+    pub snapshot_digest: String,
+}
+
+struct PendingReviewSnapshotPage {
+    snapshot: PendingReviewSnapshot,
+    total_count: u64,
+    has_next_page: bool,
+    end_cursor: Option<String>,
+}
+
 /// Envelope payload for `cli.forge-cli.pr.reviews.v1`.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct PrReviewsPayload {
@@ -104,6 +153,7 @@ pub struct PrReviewsPayload {
     pub number: u64,
     pub url: String,
     pub head_sha: String,
+    pub viewer_login: String,
     pub current_head_reviews: Vec<NativeReviewSummary>,
     pub stale_reviews: Vec<NativeReviewSummary>,
     pub pending_reviews: Vec<PendingReviewSummary>,
@@ -296,6 +346,102 @@ pub(crate) fn compute_pending_target<R: BackendRunner>(
     parse_github_pending_review_target(&output)
 }
 
+/// Fetch one exact pending review including its complete inline-comment
+/// manifest. Every page repeats and revalidates the review/head metadata so the
+/// returned digest is safe to use as a recovery compare-and-swap input.
+pub(crate) fn compute_pending_snapshot<R: BackendRunner>(
+    runner: &R,
+    ctx: &ProviderContext,
+    review_id: &str,
+) -> Result<Option<PendingReviewSnapshot>, ForgeError> {
+    compute_review_snapshot_for_state(runner, ctx, review_id, "PENDING")
+}
+
+pub(crate) fn compute_submitted_review_snapshot<R: BackendRunner>(
+    runner: &R,
+    ctx: &ProviderContext,
+    review_id: &str,
+    expected_state: &str,
+) -> Result<Option<PendingReviewSnapshot>, ForgeError> {
+    compute_review_snapshot_for_state(runner, ctx, review_id, expected_state)
+}
+
+fn compute_review_snapshot_for_state<R: BackendRunner>(
+    runner: &R,
+    ctx: &ProviderContext,
+    review_id: &str,
+    expected_state: &str,
+) -> Result<Option<PendingReviewSnapshot>, ForgeError> {
+    ensure_github(ctx)?;
+    let mut cursor = None;
+    let mut seen_cursors = BTreeSet::new();
+    let mut snapshot: Option<PendingReviewSnapshot> = None;
+    let mut expected_total = None;
+
+    for page_index in 0..MAX_REVIEW_PAGES {
+        let output = runner.run(&build_github_pending_review_target_page_call(
+            ctx,
+            review_id,
+            cursor.as_deref(),
+        ))?;
+        let Some(mut page) = parse_github_pending_review_snapshot_page(&output, expected_state)?
+        else {
+            return if snapshot.is_none() {
+                Ok(None)
+            } else {
+                Err(snapshot_incomplete(
+                    "pending review disappeared while paginating inline comments",
+                    Some(format!("review_id={review_id}")),
+                ))
+            };
+        };
+        if let Some(existing) = snapshot.as_mut() {
+            validate_snapshot_page_identity(existing, &page.snapshot)?;
+            existing
+                .inline_comments
+                .append(&mut page.snapshot.inline_comments);
+        } else {
+            expected_total = Some(page.total_count);
+            snapshot = Some(page.snapshot);
+        }
+        if !page.has_next_page {
+            let mut snapshot = snapshot.expect("page created a snapshot");
+            if snapshot.inline_comments.len() as u64 != expected_total.unwrap_or(0) {
+                return Err(snapshot_incomplete(
+                    "pending review inline-comment snapshot is incomplete",
+                    Some(format!(
+                        "review_id={review_id}; expected_comments={}; observed_comments={}",
+                        expected_total.unwrap_or(0),
+                        snapshot.inline_comments.len()
+                    )),
+                ));
+            }
+            classify_pending_snapshot(&mut snapshot)?;
+            snapshot.snapshot_digest = pending_snapshot_digest(&snapshot)?;
+            return Ok(Some(snapshot));
+        }
+        let next = page.end_cursor.ok_or_else(|| {
+            snapshot_incomplete(
+                "pending review comment pagination is missing endCursor",
+                Some(format!("review_id={review_id}; page={}", page_index + 1)),
+            )
+        })?;
+        if !seen_cursors.insert(next.clone()) {
+            return Err(snapshot_incomplete(
+                "pending review comment pagination repeated a cursor",
+                Some(format!("review_id={review_id}; cursor={next}")),
+            ));
+        }
+        cursor = Some(next);
+    }
+    Err(snapshot_incomplete(
+        "pending review comment pagination exceeded the safety page limit",
+        Some(format!(
+            "review_id={review_id}; max_pages={MAX_REVIEW_PAGES}"
+        )),
+    ))
+}
+
 /// Deadline-aware variant used by merge convergence. The timeout covers the
 /// complete paginated snapshot, including rate-limit preflight and subprocess
 /// execution in deadline-aware runners.
@@ -319,6 +465,7 @@ pub fn compute_for_pr_with_timeout<R: BackendRunner>(
     let mut cursor = None;
     let mut seen_cursors = BTreeSet::new();
     let mut expected_head = None;
+    let mut expected_viewer = None;
     let mut current_head_reviews = Vec::new();
     let mut stale_reviews = Vec::new();
     let mut pending_reviews = Vec::new();
@@ -330,6 +477,16 @@ pub fn compute_for_pr_with_timeout<R: BackendRunner>(
             remaining,
         )?;
         let page = parse_github_review_page(&output)?;
+        if expected_viewer
+            .as_deref()
+            .is_some_and(|viewer| viewer != page.viewer_login)
+        {
+            return Err(snapshot_incomplete(
+                "the authenticated viewer changed while paginating native reviews",
+                None,
+            ));
+        }
+        expected_viewer.get_or_insert(page.viewer_login.clone());
         if expected_head
             .as_deref()
             .is_some_and(|head| head != page.head_sha)
@@ -358,6 +515,7 @@ pub fn compute_for_pr_with_timeout<R: BackendRunner>(
                 number,
                 url: pr_url.to_string(),
                 head_sha: expected_head.unwrap_or_default(),
+                viewer_login: expected_viewer.unwrap_or_default(),
                 current_head_reviews,
                 stale_reviews,
                 pending_reviews,
@@ -469,6 +627,28 @@ pub(crate) fn build_github_pending_review_target_call(
     BackendCall::new(BackendProgram::Gh, argv)
 }
 
+pub(crate) fn build_github_pending_review_target_page_call(
+    ctx: &ProviderContext,
+    review_id: &str,
+    after: Option<&str>,
+) -> BackendCall {
+    let mut argv = vec![OsString::from("api"), OsString::from("graphql")];
+    ctx.push_github_api_hostname(&mut argv);
+    argv.extend([
+        OsString::from("-f"),
+        OsString::from(format!("query={GITHUB_PENDING_REVIEW_SNAPSHOT_QUERY}")),
+        OsString::from("-f"),
+        OsString::from(format!("review={review_id}")),
+    ]);
+    if let Some(after) = after {
+        argv.extend([
+            OsString::from("-f"),
+            OsString::from(format!("after={after}")),
+        ]);
+    }
+    BackendCall::new(BackendProgram::Gh, argv)
+}
+
 fn parse_github_review_page(output: &BackendSuccess) -> Result<ReviewPage, ForgeError> {
     let value: serde_json::Value = serde_json::from_str(output.stdout.trim()).map_err(|err| {
         ForgeError::software(
@@ -494,6 +674,11 @@ fn parse_github_review_page(output: &BackendSuccess) -> Result<ReviewPage, Forge
         .pointer("/data/repository/pullRequest")
         .ok_or_else(|| snapshot_incomplete("reviews response is missing pullRequest", None))?;
     let head_sha = required_string(pull, "/headRefOid", "headRefOid")?;
+    // Older recorded fixtures and GitHub Enterprise responses may omit the
+    // additive viewer field. The generic read surface remains usable, while
+    // transaction recovery treats an empty viewer as untrusted and refuses to
+    // claim a submitted review.
+    let viewer_login = optional_string(&value, "/data/viewer/login").unwrap_or_default();
     let nodes = pull
         .pointer("/reviews/nodes")
         .and_then(|item| item.as_array())
@@ -553,6 +738,7 @@ fn parse_github_review_page(output: &BackendSuccess) -> Result<ReviewPage, Forge
     }
 
     Ok(ReviewPage {
+        viewer_login,
         head_sha,
         reviews,
         pending_reviews,
@@ -720,6 +906,236 @@ fn parse_github_pending_review_target(
     }))
 }
 
+fn parse_github_pending_review_snapshot_page(
+    output: &BackendSuccess,
+    expected_state: &str,
+) -> Result<Option<PendingReviewSnapshotPage>, ForgeError> {
+    let value: serde_json::Value = serde_json::from_str(output.stdout.trim()).map_err(|err| {
+        ForgeError::software(
+            schema_err(),
+            "pending review snapshot response is invalid JSON",
+            Some(err.to_string()),
+        )
+    })?;
+    if value
+        .get("errors")
+        .and_then(|errors| errors.as_array())
+        .is_some_and(|errors| !errors.is_empty())
+    {
+        return Err(snapshot_incomplete(
+            "GitHub returned partial pending-review snapshot data",
+            Some(format!(
+                "graphql_errors={}",
+                value["errors"].as_array().map_or(0, Vec::len)
+            )),
+        ));
+    }
+    let node = value.pointer("/data/node").ok_or_else(|| {
+        snapshot_incomplete("pending review snapshot response is missing node", None)
+    })?;
+    if node.is_null() || required_review_state(node)? != expected_state {
+        return Ok(None);
+    }
+    let comments = node.pointer("/comments").ok_or_else(|| {
+        snapshot_incomplete("pending review snapshot response is missing comments", None)
+    })?;
+    let comment_nodes = comments
+        .get("nodes")
+        .and_then(|nodes| nodes.as_array())
+        .ok_or_else(|| {
+            snapshot_incomplete(
+                "pending review snapshot response is missing comment nodes",
+                None,
+            )
+        })?;
+    let inline_comments = comment_nodes
+        .iter()
+        .map(|comment| {
+            let body = required_string_allow_empty(comment, "/body", "review.comment.body")?;
+            let semantic_body = review_state::strip_owned_markers(&body);
+            let body_digest = review_state::sha256_digest(semantic_body.as_bytes());
+            let line = optional_u32(comment, "/line");
+            Ok(PendingReviewInlineComment {
+                id: required_string(comment, "/id", "review.comment.id")?,
+                url: required_string(comment, "/url", "review.comment.url")?,
+                author: optional_string(comment, "/author/login")
+                    .unwrap_or_else(|| "<unknown>".to_string()),
+                review_run_id: review_state::parse_finding_marker(&body).map(|(run_id, _)| run_id),
+                body,
+                semantic_body,
+                created_at: required_string(comment, "/createdAt", "review.comment.createdAt")?,
+                path: optional_string(comment, "/path").unwrap_or_default(),
+                line,
+                original_line: optional_u32(comment, "/originalLine"),
+                diff_side: optional_string(comment, "/diffSide"),
+                start_line: optional_u32(comment, "/startLine"),
+                original_start_line: optional_u32(comment, "/originalStartLine"),
+                start_diff_side: optional_string(comment, "/startDiffSide"),
+                subject_type: optional_string(comment, "/subjectType")
+                    .unwrap_or_else(|| if line.is_some() { "LINE" } else { "FILE" }.to_string()),
+                body_digest,
+            })
+        })
+        .collect::<Result<Vec<_>, ForgeError>>()?;
+    let page_info = comments.get("pageInfo").ok_or_else(|| {
+        snapshot_incomplete(
+            "pending review snapshot response is missing comment pageInfo",
+            None,
+        )
+    })?;
+    let has_next_page = page_info
+        .get("hasNextPage")
+        .and_then(|value| value.as_bool())
+        .ok_or_else(|| {
+            snapshot_incomplete(
+                "pending review comment pageInfo is missing hasNextPage",
+                None,
+            )
+        })?;
+    let body = required_pending_review_body(node, &required_string(node, "/id", "review.id")?)?;
+    let semantic_body = review_state::strip_owned_markers(&body);
+    Ok(Some(PendingReviewSnapshotPage {
+        total_count: required_u64(node, "/comments/totalCount", "review.comments.totalCount")?,
+        has_next_page,
+        end_cursor: optional_string(page_info, "/endCursor"),
+        snapshot: PendingReviewSnapshot {
+            number: required_u64(node, "/pullRequest/number", "review.pullRequest.number")?,
+            pr_url: required_string(node, "/pullRequest/url", "review.pullRequest.url")?,
+            head_sha: required_string(
+                node,
+                "/pullRequest/headRefOid",
+                "review.pullRequest.headRefOid",
+            )?,
+            review_id: required_string(node, "/id", "review.id")?,
+            review_url: required_string(node, "/url", "review.url")?,
+            author: optional_string(node, "/author/login")
+                .unwrap_or_else(|| "<unknown>".to_string()),
+            commit_sha: optional_string(node, "/commit/oid"),
+            review_run_id: review_state::parse_review_run_id(&body),
+            body,
+            semantic_body,
+            viewer_did_author: required_bool(node, "/viewerDidAuthor", "review.viewerDidAuthor")?,
+            viewer_can_delete: required_bool(node, "/viewerCanDelete", "review.viewerCanDelete")?,
+            provenance: "unmarked",
+            inline_comments,
+            snapshot_digest: String::new(),
+        },
+    }))
+}
+
+fn validate_snapshot_page_identity(
+    expected: &PendingReviewSnapshot,
+    observed: &PendingReviewSnapshot,
+) -> Result<(), ForgeError> {
+    if expected.number == observed.number
+        && expected.pr_url == observed.pr_url
+        && expected.head_sha == observed.head_sha
+        && expected.review_id == observed.review_id
+        && expected.review_url == observed.review_url
+        && expected.author == observed.author
+        && expected.commit_sha == observed.commit_sha
+        && expected.body == observed.body
+        && expected.viewer_did_author == observed.viewer_did_author
+        && expected.viewer_can_delete == observed.viewer_can_delete
+    {
+        return Ok(());
+    }
+    Err(snapshot_incomplete(
+        "pending review metadata changed while paginating inline comments",
+        Some(format!("review_id={}", expected.review_id)),
+    ))
+}
+
+fn classify_pending_snapshot(snapshot: &mut PendingReviewSnapshot) -> Result<(), ForgeError> {
+    let body_run = review_state::parse_review_run_id(&snapshot.body);
+    let mut comment_runs = BTreeSet::new();
+    for comment in &snapshot.inline_comments {
+        if let Some((run_id, marker_digest)) = review_state::parse_finding_marker(&comment.body) {
+            if marker_digest != comment.body_digest {
+                return Err(ForgeError::validation(
+                    schema_err(),
+                    "pending_review_manifest_mismatch",
+                    "an inline review marker does not match its normalized body",
+                    Some(format!("comment_id={}", comment.id)),
+                ));
+            }
+            comment_runs.insert(run_id);
+        } else if body_run.is_some() {
+            return Err(ForgeError::validation(
+                schema_err(),
+                "pending_review_manifest_mismatch",
+                "a receipt-bound pending review contains an unmarked inline comment",
+                Some(format!("comment_id={}", comment.id)),
+            ));
+        }
+    }
+    match body_run {
+        Some(run_id)
+            if comment_runs.is_empty()
+                || (comment_runs.len() == 1 && comment_runs.contains(&run_id)) =>
+        {
+            snapshot.review_run_id = Some(run_id);
+            snapshot.provenance = "receipt-bound";
+            Ok(())
+        }
+        Some(run_id) => Err(ForgeError::validation(
+            schema_err(),
+            "pending_review_manifest_mismatch",
+            "pending review body and inline comments carry different review runs",
+            Some(format!("body_run={run_id}; comment_runs={comment_runs:?}")),
+        )),
+        None if comment_runs.is_empty() => {
+            snapshot.review_run_id = None;
+            snapshot.provenance = "unmarked";
+            Ok(())
+        }
+        None => Err(ForgeError::validation(
+            schema_err(),
+            "pending_review_manifest_mismatch",
+            "pending review inline comments are marked but the review body is not",
+            Some(format!("comment_runs={comment_runs:?}")),
+        )),
+    }
+}
+
+fn pending_snapshot_digest(snapshot: &PendingReviewSnapshot) -> Result<String, ForgeError> {
+    #[derive(Serialize)]
+    struct SnapshotPreimage<'a> {
+        number: u64,
+        pr_url: &'a str,
+        head_sha: &'a str,
+        review_id: &'a str,
+        review_url: &'a str,
+        author: &'a str,
+        commit_sha: &'a Option<String>,
+        body: &'a str,
+        viewer_did_author: bool,
+        viewer_can_delete: bool,
+        inline_comments: &'a [PendingReviewInlineComment],
+    }
+    let bytes = serde_json::to_vec(&SnapshotPreimage {
+        number: snapshot.number,
+        pr_url: &snapshot.pr_url,
+        head_sha: &snapshot.head_sha,
+        review_id: &snapshot.review_id,
+        review_url: &snapshot.review_url,
+        author: &snapshot.author,
+        commit_sha: &snapshot.commit_sha,
+        body: &snapshot.body,
+        viewer_did_author: snapshot.viewer_did_author,
+        viewer_can_delete: snapshot.viewer_can_delete,
+        inline_comments: &snapshot.inline_comments,
+    })
+    .map_err(|error| {
+        ForgeError::software(
+            schema_err(),
+            "failed to serialize pending-review snapshot digest",
+            Some(error.to_string()),
+        )
+    })?;
+    Ok(review_state::sha256_digest(&bytes))
+}
+
 fn required_pending_review_body(
     node: &serde_json::Value,
     review_id: &str,
@@ -825,6 +1241,13 @@ fn optional_string(value: &serde_json::Value, pointer: &str) -> Option<String> {
         .map(str::to_string)
 }
 
+fn optional_u32(value: &serde_json::Value, pointer: &str) -> Option<u32> {
+    value
+        .pointer(pointer)
+        .and_then(|item| item.as_u64())
+        .and_then(|item| u32::try_from(item).ok())
+}
+
 fn remaining_timeout(
     timeout: Option<Duration>,
     started: Instant,
@@ -917,8 +1340,199 @@ fn render_text(payload: &PrReviewsPayload) {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::RefCell;
+
     use super::*;
+    use crate::provider::DetectionSource;
     use pretty_assertions::assert_eq;
+
+    fn github_ctx() -> ProviderContext {
+        ProviderContext {
+            provider: Provider::GitHub,
+            host: "github.com".into(),
+            source: DetectionSource::Flag,
+            repo: Some("acme/widgets".into()),
+        }
+    }
+
+    struct ScriptedRunner {
+        outputs: RefCell<Vec<BackendSuccess>>,
+        calls: RefCell<Vec<String>>,
+    }
+
+    impl ScriptedRunner {
+        fn new(outputs: Vec<BackendSuccess>) -> Self {
+            Self {
+                outputs: RefCell::new(outputs),
+                calls: RefCell::new(Vec::new()),
+            }
+        }
+    }
+
+    impl BackendRunner for ScriptedRunner {
+        fn run(&self, call: &BackendCall) -> Result<BackendSuccess, ForgeError> {
+            self.calls.borrow_mut().push(call.plan_argv().join(" "));
+            Ok(self.outputs.borrow_mut().remove(0))
+        }
+    }
+
+    struct PendingSnapshotPageSpec<'a> {
+        head: &'a str,
+        id: &'a str,
+        path: &'a str,
+        line: u32,
+        diff_side: &'a str,
+        start_line: Option<u32>,
+        start_diff_side: Option<&'a str>,
+        has_next_page: bool,
+        end_cursor: Option<&'a str>,
+    }
+
+    fn pending_snapshot_page(spec: PendingSnapshotPageSpec<'_>) -> BackendSuccess {
+        let PendingSnapshotPageSpec {
+            head,
+            id,
+            path,
+            line,
+            diff_side,
+            start_line,
+            start_diff_side,
+            has_next_page,
+            end_cursor,
+        } = spec;
+        BackendSuccess {
+            stdout: serde_json::json!({
+                "data": {"node": {
+                    "id": "PRR_pending",
+                    "url": "https://github.com/acme/widgets/pull/7#pullrequestreview-9",
+                    "author": {"login": "review-bot"},
+                    "state": "PENDING",
+                    "commit": {"oid": head},
+                    "body": "Summary",
+                    "viewerDidAuthor": true,
+                    "viewerCanDelete": true,
+                    "comments": {
+                        "totalCount": 2,
+                        "nodes": [{
+                            "id": id,
+                            "url": format!("https://github.com/acme/widgets/pull/7#discussion_{id}"),
+                            "author": {"login": "review-bot"},
+                            "body": format!("finding {id}"),
+                            "createdAt": "2026-07-20T12:00:00Z",
+                            "path": path,
+                            "line": line,
+                            "originalLine": line,
+                            "diffSide": diff_side,
+                            "startLine": start_line,
+                            "originalStartLine": start_line,
+                            "startDiffSide": start_diff_side,
+                            "subjectType": "LINE"
+                        }],
+                        "pageInfo": {
+                            "hasNextPage": has_next_page,
+                            "endCursor": end_cursor
+                        }
+                    },
+                    "pullRequest": {
+                        "number": 7,
+                        "url": "https://github.com/acme/widgets/pull/7",
+                        "headRefOid": head
+                    }
+                }}
+            })
+            .to_string(),
+            stderr: String::new(),
+        }
+    }
+
+    #[test]
+    fn provider_queries_bind_viewer_identity_and_every_inline_anchor() {
+        let reviews = build_github_reviews_call(&github_ctx(), "acme", "widgets", 7, None)
+            .plan_argv()
+            .join(" ");
+        assert!(reviews.contains("viewerDidAuthor"), "{reviews}");
+
+        let pending =
+            build_github_pending_review_target_page_call(&github_ctx(), "PRR_pending", None)
+                .plan_argv()
+                .join(" ");
+        assert!(pending.contains("diffSide"), "{pending}");
+        assert!(pending.contains("startDiffSide"), "{pending}");
+    }
+
+    #[test]
+    fn pending_snapshot_paginates_left_range_anchors_and_detects_page_drift() {
+        let runner = ScriptedRunner::new(vec![
+            pending_snapshot_page(PendingSnapshotPageSpec {
+                head: "head-7",
+                id: "PRRC_1",
+                path: "src/old.rs",
+                line: 8,
+                diff_side: "LEFT",
+                start_line: Some(5),
+                start_diff_side: Some("LEFT"),
+                has_next_page: true,
+                end_cursor: Some("cursor-1"),
+            }),
+            pending_snapshot_page(PendingSnapshotPageSpec {
+                head: "head-7",
+                id: "PRRC_2",
+                path: "src/new.rs",
+                line: 20,
+                diff_side: "RIGHT",
+                start_line: None,
+                start_diff_side: None,
+                has_next_page: false,
+                end_cursor: None,
+            }),
+        ]);
+        let snapshot = compute_pending_snapshot(&runner, &github_ctx(), "PRR_pending")
+            .expect("complete snapshot")
+            .expect("pending review");
+        assert_eq!(snapshot.inline_comments.len(), 2);
+        assert_eq!(
+            snapshot.inline_comments[0].diff_side.as_deref(),
+            Some("LEFT")
+        );
+        assert_eq!(snapshot.inline_comments[0].start_line, Some(5));
+        assert_eq!(
+            snapshot.inline_comments[0].start_diff_side.as_deref(),
+            Some("LEFT")
+        );
+        assert!(snapshot.snapshot_digest.starts_with("sha256:"));
+        assert!(
+            runner.calls.borrow()[1].contains("after=cursor-1"),
+            "later comment pages must use the prior cursor"
+        );
+
+        let drifted = ScriptedRunner::new(vec![
+            pending_snapshot_page(PendingSnapshotPageSpec {
+                head: "head-7",
+                id: "PRRC_1",
+                path: "src/old.rs",
+                line: 8,
+                diff_side: "LEFT",
+                start_line: Some(5),
+                start_diff_side: Some("LEFT"),
+                has_next_page: true,
+                end_cursor: Some("cursor-1"),
+            }),
+            pending_snapshot_page(PendingSnapshotPageSpec {
+                head: "head-moved",
+                id: "PRRC_2",
+                path: "src/new.rs",
+                line: 20,
+                diff_side: "RIGHT",
+                start_line: None,
+                start_diff_side: None,
+                has_next_page: false,
+                end_cursor: None,
+            }),
+        ]);
+        let error = compute_pending_snapshot(&drifted, &github_ctx(), "PRR_pending")
+            .expect_err("metadata drift between pages must fail closed");
+        assert_eq!(error.kind(), "review_snapshot_incomplete");
+    }
 
     #[test]
     fn summary_is_truncated_on_a_utf8_boundary() {

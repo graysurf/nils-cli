@@ -19,6 +19,7 @@
 //! The local provider has no review-thread model: the atom returns an empty
 //! thread list and the merge gate passes trivially.
 
+use std::collections::BTreeSet;
 use std::ffi::OsString;
 
 use nils_common::cli_contract::{OutputFormat, schema_version_for};
@@ -39,10 +40,24 @@ use crate::rate_limit::default_runner;
 const SCHEMA: &str = "pr.review-threads";
 const SCHEMA_VERSION: u32 = 1;
 
-/// GitHub exposes thread resolution only through GraphQL. `first: 100` is far
-/// beyond practical thread counts for a single PR; the merge gate fails
-/// closed on what one page returns.
-const GITHUB_THREADS_QUERY: &str = "query($owner: String!, $name: String!, $pr: Int!) { repository(owner: $owner, name: $name) { pullRequest(number: $pr) { reviewThreads(first: 100) { nodes { id isResolved isOutdated path comments(first: 1) { nodes { author { login } body createdAt url } } } } } } }";
+const MAX_GITHUB_THREAD_PAGES: usize = 100;
+const MAX_GITHUB_THREAD_COMMENT_PAGES: usize = 100;
+
+/// GitHub exposes thread resolution only through GraphQL. Both the thread and
+/// per-thread comment connections are paginated because semantic convergence
+/// must not silently ignore a later reviewer reply.
+const GITHUB_THREADS_QUERY: &str = "query($owner: String!, $name: String!, $pr: Int!, $after: String) { repository(owner: $owner, name: $name) { pullRequest(number: $pr) { headRefOid reviewThreads(first: 100, after: $after) { nodes { id isResolved isOutdated path diffSide line originalLine originalStartLine startDiffSide startLine subjectType comments(first: 100) { nodes { id author { login } body createdAt url } pageInfo { hasNextPage endCursor } } } pageInfo { hasNextPage endCursor } } } } }";
+const GITHUB_THREAD_FINGERPRINTS_QUERY: &str = "query($owner: String!, $name: String!, $pr: Int!, $after: String) { repository(owner: $owner, name: $name) { pullRequest(number: $pr) { headRefOid reviewThreads(first: 100, after: $after) { nodes { id isResolved isOutdated path diffSide line originalLine originalStartLine startDiffSide startLine subjectType comments(first: 1) { nodes { id author { login } body createdAt url } pageInfo { hasNextPage endCursor } } } pageInfo { hasNextPage endCursor } } } } }";
+const GITHUB_THREAD_COMMENTS_QUERY: &str = "query($thread: ID!, $after: String) { node(id: $thread) { ... on PullRequestReviewThread { id comments(first: 100, after: $after) { nodes { id author { login } body createdAt url } pageInfo { hasNextPage endCursor } } } } }";
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct PrReviewThreadComment {
+    pub id: String,
+    pub author: String,
+    pub body: String,
+    pub created_at: String,
+    pub url: String,
+}
 
 /// One review thread, normalized across providers.
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -60,10 +75,20 @@ pub struct PrReviewThreadSummary {
     pub author: String,
     /// File the thread is anchored to; empty for non-inline threads.
     pub path: String,
+    pub diff_side: Option<String>,
+    pub line: Option<u32>,
+    pub original_line: Option<u32>,
+    pub original_start_line: Option<u32>,
+    pub start_diff_side: Option<String>,
+    pub start_line: Option<u32>,
+    pub subject_type: Option<String>,
     pub created_at: String,
     pub url: String,
     /// First comment of the thread.
     pub body: String,
+    /// Complete ordered comment stream for this thread. The first comment is
+    /// retained in the unmarked summary fields above for additive compatibility.
+    pub comments: Vec<PrReviewThreadComment>,
 }
 
 /// Envelope payload for `cli.forge-cli.pr.review-threads.v1`.
@@ -72,9 +97,31 @@ pub struct PrReviewThreadsPayload {
     pub provider: &'static str,
     pub number: u64,
     pub url: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub head_sha: Option<String>,
     pub total: usize,
     pub unresolved: usize,
     pub threads: Vec<PrReviewThreadSummary>,
+}
+
+struct GitHubThreadPage {
+    head_sha: String,
+    threads: Vec<GitHubThreadNode>,
+    has_next_page: bool,
+    end_cursor: Option<String>,
+}
+
+struct GitHubThreadNode {
+    summary: PrReviewThreadSummary,
+    comments_has_next_page: bool,
+    comments_end_cursor: Option<String>,
+}
+
+struct GitHubThreadCommentsPage {
+    thread_id: String,
+    comments: Vec<PrReviewThreadComment>,
+    has_next_page: bool,
+    end_cursor: Option<String>,
 }
 
 /// An outdated, unresolved review thread mechanically dispositioned `stale`
@@ -158,6 +205,7 @@ pub fn run_with<R: BackendRunner, F: Fn(&str) -> Option<String>>(
                 provider: ctx.provider.as_str(),
                 number: view.number,
                 url: view.url,
+                head_sha: None,
                 total: 0,
                 unresolved: 0,
                 threads: Vec::new(),
@@ -167,22 +215,10 @@ pub fn run_with<R: BackendRunner, F: Fn(&str) -> Option<String>>(
         ));
     }
 
-    let threads_call = build_threads_call(&ctx, &view.url, view.number)?;
-
-    let threads_output = runner.run(&threads_call)?;
-    let threads = parse_threads(&ctx, &threads_output, &view.url)?;
-    let unresolved = threads.iter().filter(|t| !t.resolved).count();
-
+    let payload = compute_for_pr(runner, &ctx, &view.url, view.number)?;
     Ok(emit_success(
         schema_version_for(BINARY, SCHEMA, SCHEMA_VERSION),
-        PrReviewThreadsPayload {
-            provider: ctx.provider.as_str(),
-            number: view.number,
-            url: view.url,
-            total: threads.len(),
-            unresolved,
-            threads,
-        },
+        payload,
         format,
         render_text,
     ))
@@ -220,10 +256,14 @@ pub fn compute_for_pr<R: BackendRunner>(
             provider: ctx.provider.as_str(),
             number,
             url: pr_url.to_string(),
+            head_sha: None,
             total: 0,
             unresolved: 0,
             threads: Vec::new(),
         });
+    }
+    if matches!(ctx.provider, Provider::GitHub) {
+        return compute_github_for_pr(runner, ctx, pr_url, number);
     }
     let call = build_threads_call(ctx, pr_url, number)?;
     let output = runner.run(&call)?;
@@ -233,10 +273,229 @@ pub fn compute_for_pr<R: BackendRunner>(
         provider: ctx.provider.as_str(),
         number,
         url: pr_url.to_string(),
+        head_sha: None,
         total: threads.len(),
         unresolved,
         threads,
     })
+}
+
+fn compute_github_for_pr<R: BackendRunner>(
+    runner: &R,
+    ctx: &ProviderContext,
+    pr_url: &str,
+    number: u64,
+) -> Result<PrReviewThreadsPayload, ForgeError> {
+    let slug = github_repo_slug_from_url(pr_url).ok_or_else(|| {
+        snapshot_incomplete(
+            "unable to derive GitHub owner/repo from PR url",
+            Some(format!("url={pr_url}")),
+        )
+    })?;
+    let (owner, name) = slug.split_once('/').ok_or_else(|| {
+        snapshot_incomplete(
+            "unable to split GitHub owner/repo slug",
+            Some(format!("slug={slug}")),
+        )
+    })?;
+    let mut cursor = None;
+    let mut seen_cursors = BTreeSet::new();
+    let mut expected_head = None;
+    let mut threads = Vec::new();
+
+    for page_index in 0..MAX_GITHUB_THREAD_PAGES {
+        let output = runner.run(&build_github_threads_page_call(
+            ctx,
+            owner,
+            name,
+            number,
+            cursor.as_deref(),
+        ))?;
+        let page = parse_github_thread_page(&output)?;
+        if expected_head
+            .as_deref()
+            .is_some_and(|head| head != page.head_sha)
+        {
+            return Err(snapshot_incomplete(
+                "the PR head changed while paginating review threads",
+                Some(format!(
+                    "expected_head={}; provider_head={}",
+                    expected_head.as_deref().unwrap_or("<missing>"),
+                    page.head_sha
+                )),
+            ));
+        }
+        expected_head.get_or_insert(page.head_sha);
+        for node in page.threads {
+            threads.push(complete_github_thread_comments(runner, ctx, node)?);
+        }
+        if !page.has_next_page {
+            let unresolved = threads.iter().filter(|thread| !thread.resolved).count();
+            return Ok(PrReviewThreadsPayload {
+                provider: ctx.provider.as_str(),
+                number,
+                url: pr_url.to_string(),
+                head_sha: expected_head,
+                total: threads.len(),
+                unresolved,
+                threads,
+            });
+        }
+        let next = page.end_cursor.ok_or_else(|| {
+            snapshot_incomplete(
+                "review-thread pagination is missing endCursor",
+                Some(format!("page={}", page_index + 1)),
+            )
+        })?;
+        if !seen_cursors.insert(next.clone()) {
+            return Err(snapshot_incomplete(
+                "review-thread pagination repeated a cursor",
+                Some(format!("page={}; cursor={next}", page_index + 1)),
+            ));
+        }
+        cursor = Some(next);
+    }
+    Err(snapshot_incomplete(
+        "review-thread pagination exceeded the safety page limit",
+        Some(format!("max_pages={MAX_GITHUB_THREAD_PAGES}")),
+    ))
+}
+
+/// Fetch only the root comment and anchor/status fields needed for review
+/// finding deduplication. Thread nodes remain completely paginated, but reply
+/// history is deliberately not hydrated on the mutation hot path.
+pub(crate) fn compute_fingerprints_for_pr<R: BackendRunner>(
+    runner: &R,
+    ctx: &ProviderContext,
+    pr_url: &str,
+    number: u64,
+) -> Result<PrReviewThreadsPayload, ForgeError> {
+    let slug = github_repo_slug_from_url(pr_url).ok_or_else(|| {
+        snapshot_incomplete(
+            "unable to derive GitHub owner/repo from PR url",
+            Some(format!("url={pr_url}")),
+        )
+    })?;
+    let (owner, name) = slug.split_once('/').ok_or_else(|| {
+        snapshot_incomplete(
+            "unable to split GitHub owner/repo slug",
+            Some(format!("slug={slug}")),
+        )
+    })?;
+    let mut cursor = None;
+    let mut seen_cursors = BTreeSet::new();
+    let mut expected_head = None;
+    let mut threads = Vec::new();
+
+    for page_index in 0..MAX_GITHUB_THREAD_PAGES {
+        let output = runner.run(&build_github_thread_fingerprints_page_call(
+            ctx,
+            owner,
+            name,
+            number,
+            cursor.as_deref(),
+        ))?;
+        let page = parse_github_thread_page(&output)?;
+        if expected_head
+            .as_deref()
+            .is_some_and(|head| head != page.head_sha)
+        {
+            return Err(snapshot_incomplete(
+                "the PR head changed while paginating review-thread fingerprints",
+                Some(format!(
+                    "expected_head={}; provider_head={}",
+                    expected_head.as_deref().unwrap_or("<missing>"),
+                    page.head_sha
+                )),
+            ));
+        }
+        expected_head.get_or_insert(page.head_sha);
+        threads.extend(page.threads.into_iter().map(|node| node.summary));
+        if !page.has_next_page {
+            let unresolved = threads.iter().filter(|thread| !thread.resolved).count();
+            return Ok(PrReviewThreadsPayload {
+                provider: ctx.provider.as_str(),
+                number,
+                url: pr_url.to_string(),
+                head_sha: expected_head,
+                total: threads.len(),
+                unresolved,
+                threads,
+            });
+        }
+        let next = page.end_cursor.ok_or_else(|| {
+            snapshot_incomplete(
+                "review-thread fingerprint pagination is missing endCursor",
+                Some(format!("page={}", page_index + 1)),
+            )
+        })?;
+        if !seen_cursors.insert(next.clone()) {
+            return Err(snapshot_incomplete(
+                "review-thread fingerprint pagination repeated a cursor",
+                Some(format!("page={}; cursor={next}", page_index + 1)),
+            ));
+        }
+        cursor = Some(next);
+    }
+    Err(snapshot_incomplete(
+        "review-thread fingerprint pagination exceeded the safety page limit",
+        Some(format!("max_pages={MAX_GITHUB_THREAD_PAGES}")),
+    ))
+}
+
+fn complete_github_thread_comments<R: BackendRunner>(
+    runner: &R,
+    ctx: &ProviderContext,
+    mut node: GitHubThreadNode,
+) -> Result<PrReviewThreadSummary, ForgeError> {
+    let mut cursor = node.comments_end_cursor.take();
+    let mut seen_cursors = BTreeSet::new();
+    for page_index in 0..MAX_GITHUB_THREAD_COMMENT_PAGES {
+        if !node.comments_has_next_page {
+            return Ok(node.summary);
+        }
+        let after = cursor.as_deref().ok_or_else(|| {
+            snapshot_incomplete(
+                "review-thread comment pagination is missing endCursor",
+                Some(format!(
+                    "thread_id={}; page={}",
+                    node.summary.id,
+                    page_index + 1
+                )),
+            )
+        })?;
+        if !seen_cursors.insert(after.to_string()) {
+            return Err(snapshot_incomplete(
+                "review-thread comment pagination repeated a cursor",
+                Some(format!("thread_id={}; cursor={after}", node.summary.id)),
+            ));
+        }
+        let output = runner.run(&build_github_thread_comments_call(
+            ctx,
+            &node.summary.id,
+            Some(after),
+        ))?;
+        let page = parse_github_thread_comments_page(&output)?;
+        if page.thread_id != node.summary.id {
+            return Err(snapshot_incomplete(
+                "review-thread comment page returned a different thread",
+                Some(format!(
+                    "expected_thread={}; provider_thread={}",
+                    node.summary.id, page.thread_id
+                )),
+            ));
+        }
+        node.summary.comments.extend(page.comments);
+        node.comments_has_next_page = page.has_next_page;
+        cursor = page.end_cursor;
+    }
+    Err(snapshot_incomplete(
+        "review-thread comment pagination exceeded the safety page limit",
+        Some(format!(
+            "thread_id={}; max_pages={MAX_GITHUB_THREAD_COMMENT_PAGES}",
+            node.summary.id
+        )),
+    ))
 }
 
 /// Apply the unresolved-thread merge gate to an already-fetched snapshot.
@@ -398,6 +657,16 @@ fn build_github_threads_call(
     name: &str,
     number: u64,
 ) -> BackendCall {
+    build_github_threads_page_call(ctx, owner, name, number, None)
+}
+
+fn build_github_threads_page_call(
+    ctx: &ProviderContext,
+    owner: &str,
+    name: &str,
+    number: u64,
+    after: Option<&str>,
+) -> BackendCall {
     let mut argv = vec![OsString::from("api"), OsString::from("graphql")];
     ctx.push_github_api_hostname(&mut argv);
     argv.extend([
@@ -410,6 +679,62 @@ fn build_github_threads_call(
         OsString::from("-F"),
         OsString::from(format!("pr={number}")),
     ]);
+    if let Some(after) = after {
+        argv.extend([
+            OsString::from("-f"),
+            OsString::from(format!("after={after}")),
+        ]);
+    }
+    BackendCall::new(BackendProgram::Gh, argv)
+}
+
+fn build_github_thread_fingerprints_page_call(
+    ctx: &ProviderContext,
+    owner: &str,
+    name: &str,
+    number: u64,
+    after: Option<&str>,
+) -> BackendCall {
+    let mut argv = vec![OsString::from("api"), OsString::from("graphql")];
+    ctx.push_github_api_hostname(&mut argv);
+    argv.extend([
+        OsString::from("-f"),
+        OsString::from(format!("query={GITHUB_THREAD_FINGERPRINTS_QUERY}")),
+        OsString::from("-f"),
+        OsString::from(format!("owner={owner}")),
+        OsString::from("-f"),
+        OsString::from(format!("name={name}")),
+        OsString::from("-F"),
+        OsString::from(format!("pr={number}")),
+    ]);
+    if let Some(after) = after {
+        argv.extend([
+            OsString::from("-f"),
+            OsString::from(format!("after={after}")),
+        ]);
+    }
+    BackendCall::new(BackendProgram::Gh, argv)
+}
+
+fn build_github_thread_comments_call(
+    ctx: &ProviderContext,
+    thread_id: &str,
+    after: Option<&str>,
+) -> BackendCall {
+    let mut argv = vec![OsString::from("api"), OsString::from("graphql")];
+    ctx.push_github_api_hostname(&mut argv);
+    argv.extend([
+        OsString::from("-f"),
+        OsString::from(format!("query={GITHUB_THREAD_COMMENTS_QUERY}")),
+        OsString::from("-f"),
+        OsString::from(format!("thread={thread_id}")),
+    ]);
+    if let Some(after) = after {
+        argv.extend([
+            OsString::from("-f"),
+            OsString::from(format!("after={after}")),
+        ]);
+    }
     BackendCall::new(BackendProgram::Gh, argv)
 }
 
@@ -453,10 +778,8 @@ pub(crate) fn ensure_thread_belongs_to_pr<R: BackendRunner>(
 ) -> Result<(), ForgeError> {
     let view_output = runner.run(&pr_view::build_view_call(ctx, &number.to_string()))?;
     let view = pr_view::parse_view_output(ctx, &view_output)?;
-    let threads_call = build_threads_call(ctx, &view.url, view.number)?;
-    let threads_output = runner.run(&threads_call)?;
-    let threads = parse_threads(ctx, &threads_output, &view.url)?;
-    if threads.iter().any(|thread| thread.id == thread_id) {
+    let snapshot = compute_for_pr(runner, ctx, &view.url, view.number)?;
+    if snapshot.threads.iter().any(|thread| thread.id == thread_id) {
         return Ok(());
     }
     Err(ForgeError::validation(
@@ -471,6 +794,14 @@ pub(crate) fn ensure_thread_belongs_to_pr<R: BackendRunner>(
 }
 
 fn parse_github_threads(output: &BackendSuccess) -> Result<Vec<PrReviewThreadSummary>, ForgeError> {
+    Ok(parse_github_thread_page(output)?
+        .threads
+        .into_iter()
+        .map(|node| node.summary)
+        .collect())
+}
+
+fn parse_github_thread_page(output: &BackendSuccess) -> Result<GitHubThreadPage, ForgeError> {
     let value: serde_json::Value = serde_json::from_str(output.stdout.trim()).map_err(|e| {
         ForgeError::software(
             schema_err(),
@@ -478,65 +809,266 @@ fn parse_github_threads(output: &BackendSuccess) -> Result<Vec<PrReviewThreadSum
             Some(e.to_string()),
         )
     })?;
-    let nodes = value
-        .pointer("/data/repository/pullRequest/reviewThreads/nodes")
+    reject_graphql_errors(&value, "review threads")?;
+    let pull = value
+        .pointer("/data/repository/pullRequest")
+        .ok_or_else(|| {
+            snapshot_incomplete("review-threads response is missing pullRequest", None)
+        })?;
+    let head_sha = required_json_string(pull, "/headRefOid", "headRefOid")?;
+    let connection = pull.pointer("/reviewThreads").ok_or_else(|| {
+        snapshot_incomplete("review-threads response is missing reviewThreads", None)
+    })?;
+    let nodes = connection
+        .pointer("/nodes")
         .and_then(|v| v.as_array())
         .cloned()
         .ok_or_else(|| {
-            ForgeError::software(
-                schema_err(),
+            snapshot_incomplete(
                 "review-threads response is missing reviewThreads nodes",
-                Some(format!("stdout={:?}", output.stdout)),
+                None,
             )
         })?;
-    let mut out = Vec::new();
+    let (has_next_page, end_cursor) = parse_page_info(connection, "reviewThreads")?;
+    let mut threads = Vec::new();
     for node in nodes {
-        let first = node
-            .pointer("/comments/nodes/0")
-            .cloned()
-            .unwrap_or(serde_json::Value::Null);
-        out.push(PrReviewThreadSummary {
-            id: node
-                .get("id")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string(),
-            resolved: node
-                .get("isResolved")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false),
-            outdated: node
-                .get("isOutdated")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false),
-            author: first
-                .pointer("/author/login")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string(),
-            path: node
-                .get("path")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string(),
-            created_at: first
-                .get("createdAt")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string(),
-            url: first
-                .get("url")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string(),
-            body: first
-                .get("body")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string(),
+        let id = required_json_string(&node, "/id", "reviewThread.id")?;
+        let comments_connection = node.pointer("/comments").ok_or_else(|| {
+            snapshot_incomplete(
+                "review-thread response is missing comments",
+                Some(format!("thread_id={id}")),
+            )
+        })?;
+        let comments = parse_github_thread_comments(comments_connection, &id)?;
+        let (comments_has_next_page, comments_end_cursor) =
+            parse_page_info(comments_connection, "reviewThread.comments")?;
+        let first = comments.first().cloned().unwrap_or(PrReviewThreadComment {
+            id: String::new(),
+            author: String::new(),
+            body: String::new(),
+            created_at: String::new(),
+            url: String::new(),
+        });
+        threads.push(GitHubThreadNode {
+            summary: PrReviewThreadSummary {
+                id,
+                resolved: required_json_bool(&node, "/isResolved", "reviewThread.isResolved")?,
+                outdated: required_json_bool(&node, "/isOutdated", "reviewThread.isOutdated")?,
+                author: first.author.clone(),
+                path: node
+                    .get("path")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+                diff_side: Some(required_json_string(
+                    &node,
+                    "/diffSide",
+                    "reviewThread.diffSide",
+                )?),
+                line: optional_json_u32(&node, "/line"),
+                original_line: optional_json_u32(&node, "/originalLine"),
+                original_start_line: optional_json_u32(&node, "/originalStartLine"),
+                start_diff_side: node
+                    .pointer("/startDiffSide")
+                    .and_then(|value| value.as_str())
+                    .map(str::to_string),
+                start_line: optional_json_u32(&node, "/startLine"),
+                subject_type: Some(required_json_string(
+                    &node,
+                    "/subjectType",
+                    "reviewThread.subjectType",
+                )?),
+                created_at: first.created_at.clone(),
+                url: first.url.clone(),
+                body: first.body.clone(),
+                comments,
+            },
+            comments_has_next_page,
+            comments_end_cursor,
         });
     }
-    Ok(out)
+    Ok(GitHubThreadPage {
+        head_sha,
+        threads,
+        has_next_page,
+        end_cursor,
+    })
+}
+
+fn parse_github_thread_comments_page(
+    output: &BackendSuccess,
+) -> Result<GitHubThreadCommentsPage, ForgeError> {
+    let value: serde_json::Value = serde_json::from_str(output.stdout.trim()).map_err(|e| {
+        ForgeError::software(
+            schema_err(),
+            "review-thread comments response is invalid JSON",
+            Some(e.to_string()),
+        )
+    })?;
+    reject_graphql_errors(&value, "review-thread comments")?;
+    let node = value.pointer("/data/node").ok_or_else(|| {
+        snapshot_incomplete("review-thread comments response is missing node", None)
+    })?;
+    let thread_id = required_json_string(node, "/id", "reviewThread.id")?;
+    let connection = node.pointer("/comments").ok_or_else(|| {
+        snapshot_incomplete(
+            "review-thread comments response is missing comments",
+            Some(format!("thread_id={thread_id}")),
+        )
+    })?;
+    let comments = parse_github_thread_comments(connection, &thread_id)?;
+    let (has_next_page, end_cursor) = parse_page_info(connection, "reviewThread.comments")?;
+    Ok(GitHubThreadCommentsPage {
+        thread_id,
+        comments,
+        has_next_page,
+        end_cursor,
+    })
+}
+
+fn parse_github_thread_comments(
+    connection: &serde_json::Value,
+    thread_id: &str,
+) -> Result<Vec<PrReviewThreadComment>, ForgeError> {
+    let nodes = connection
+        .get("nodes")
+        .and_then(|value| value.as_array())
+        .ok_or_else(|| {
+            snapshot_incomplete(
+                "review-thread comments response is missing nodes",
+                Some(format!("thread_id={thread_id}")),
+            )
+        })?;
+    nodes
+        .iter()
+        .map(|comment| {
+            Ok(PrReviewThreadComment {
+                id: required_json_string(comment, "/id", "reviewThread.comment.id")?,
+                author: comment
+                    .pointer("/author/login")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+                body: required_json_string_allow_empty(
+                    comment,
+                    "/body",
+                    "reviewThread.comment.body",
+                )?,
+                created_at: required_json_string(
+                    comment,
+                    "/createdAt",
+                    "reviewThread.comment.createdAt",
+                )?,
+                url: required_json_string(comment, "/url", "reviewThread.comment.url")?,
+            })
+        })
+        .collect()
+}
+
+fn reject_graphql_errors(value: &serde_json::Value, label: &str) -> Result<(), ForgeError> {
+    if value
+        .get("errors")
+        .and_then(|errors| errors.as_array())
+        .is_some_and(|errors| !errors.is_empty())
+    {
+        return Err(snapshot_incomplete(
+            "GitHub returned partial review-thread data",
+            Some(format!(
+                "surface={label}; graphql_errors={}",
+                value["errors"].as_array().map_or(0, Vec::len)
+            )),
+        ));
+    }
+    Ok(())
+}
+
+fn parse_page_info(
+    connection: &serde_json::Value,
+    label: &str,
+) -> Result<(bool, Option<String>), ForgeError> {
+    let page_info = connection.get("pageInfo").ok_or_else(|| {
+        snapshot_incomplete(
+            "review-thread response is missing pageInfo",
+            Some(format!("connection={label}")),
+        )
+    })?;
+    let has_next_page = page_info
+        .get("hasNextPage")
+        .and_then(|value| value.as_bool())
+        .ok_or_else(|| {
+            snapshot_incomplete(
+                "review-thread pageInfo is missing hasNextPage",
+                Some(format!("connection={label}")),
+            )
+        })?;
+    let end_cursor = page_info
+        .get("endCursor")
+        .and_then(|value| value.as_str())
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    Ok((has_next_page, end_cursor))
+}
+
+fn required_json_string(
+    value: &serde_json::Value,
+    pointer: &str,
+    field: &str,
+) -> Result<String, ForgeError> {
+    value
+        .pointer(pointer)
+        .and_then(|value| value.as_str())
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| {
+            snapshot_incomplete(
+                "review-thread response is missing a required field",
+                Some(format!("field={field}")),
+            )
+        })
+}
+
+fn required_json_string_allow_empty(
+    value: &serde_json::Value,
+    pointer: &str,
+    field: &str,
+) -> Result<String, ForgeError> {
+    value
+        .pointer(pointer)
+        .and_then(|value| value.as_str())
+        .map(str::to_string)
+        .ok_or_else(|| {
+            snapshot_incomplete(
+                "review-thread response is missing a required field",
+                Some(format!("field={field}")),
+            )
+        })
+}
+
+fn optional_json_u32(value: &serde_json::Value, pointer: &str) -> Option<u32> {
+    value
+        .pointer(pointer)
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|value| u32::try_from(value).ok())
+}
+
+fn required_json_bool(
+    value: &serde_json::Value,
+    pointer: &str,
+    field: &str,
+) -> Result<bool, ForgeError> {
+    value
+        .pointer(pointer)
+        .and_then(|value| value.as_bool())
+        .ok_or_else(|| {
+            snapshot_incomplete(
+                "review-thread response is missing a required field",
+                Some(format!("field={field}")),
+            )
+        })
+}
+
+fn snapshot_incomplete(message: &str, detail: Option<String>) -> ForgeError {
+    ForgeError::validation(schema_err(), "review_snapshot_incomplete", message, detail)
 }
 
 /// A GitLab discussion is a review thread when it has at least one
@@ -597,6 +1129,20 @@ fn parse_gitlab_discussions(
                     .and_then(|v| v.as_str())
                     .unwrap_or("")
                     .to_string(),
+                diff_side: None,
+                line: first
+                    .pointer("/position/new_line")
+                    .or_else(|| first.pointer("/position/old_line"))
+                    .and_then(serde_json::Value::as_u64)
+                    .and_then(|value| u32::try_from(value).ok()),
+                original_line: None,
+                original_start_line: None,
+                start_diff_side: None,
+                start_line: None,
+                subject_type: first
+                    .pointer("/position/position_type")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string),
                 created_at: first
                     .get("created_at")
                     .and_then(|v| v.as_str())
@@ -608,6 +1154,36 @@ fn parse_gitlab_discussions(
                     .and_then(|v| v.as_str())
                     .unwrap_or("")
                     .to_string(),
+                comments: resolvable
+                    .iter()
+                    .map(|note| PrReviewThreadComment {
+                        id: note
+                            .get("id")
+                            .and_then(|value| value.as_u64())
+                            .map(|value| value.to_string())
+                            .unwrap_or_default(),
+                        author: note
+                            .pointer("/author/username")
+                            .and_then(|value| value.as_str())
+                            .unwrap_or("")
+                            .to_string(),
+                        body: note
+                            .get("body")
+                            .and_then(|value| value.as_str())
+                            .unwrap_or("")
+                            .to_string(),
+                        created_at: note
+                            .get("created_at")
+                            .and_then(|value| value.as_str())
+                            .unwrap_or("")
+                            .to_string(),
+                        url: note
+                            .get("id")
+                            .and_then(|value| value.as_u64())
+                            .map(|id| format!("{mr_url}#note_{id}"))
+                            .unwrap_or_default(),
+                    })
+                    .collect(),
             });
         }
     }
@@ -729,14 +1305,15 @@ mod tests {
     fn github_threads_json(resolved_states: &[(bool, &str, &str)]) -> String {
         let nodes: Vec<String> = resolved_states
             .iter()
-            .map(|(resolved, author, path)| {
+            .enumerate()
+            .map(|(index, (resolved, author, path))| {
                 format!(
-                    r#"{{"isResolved":{resolved},"isOutdated":false,"path":"{path}","comments":{{"nodes":[{{"author":{{"login":"{author}"}},"body":"finding body\nsecond line","createdAt":"2026-06-11T04:49:36Z","url":"https://github.com/acme/widgets/pull/7#discussion_r1"}}]}}}}"#
+                    r#"{{"id":"PRRT_{index}","isResolved":{resolved},"isOutdated":false,"path":"{path}","diffSide":"RIGHT","line":10,"originalLine":10,"originalStartLine":null,"startDiffSide":null,"startLine":null,"subjectType":"LINE","comments":{{"nodes":[{{"id":"PRRC_{index}","author":{{"login":"{author}"}},"body":"finding body\nsecond line","createdAt":"2026-06-11T04:49:36Z","url":"https://github.com/acme/widgets/pull/7#discussion_r1"}}],"pageInfo":{{"hasNextPage":false,"endCursor":null}}}}}}"#
                 )
             })
             .collect();
         format!(
-            r#"{{"data":{{"repository":{{"pullRequest":{{"reviewThreads":{{"nodes":[{nodes}]}}}}}}}}}}"#,
+            r#"{{"data":{{"repository":{{"pullRequest":{{"headRefOid":"head-7","reviewThreads":{{"nodes":[{nodes}],"pageInfo":{{"hasNextPage":false,"endCursor":null}}}}}}}}}}}}"#,
             nodes = nodes.join(",")
         )
     }
@@ -760,6 +1337,63 @@ mod tests {
         assert!(argv.iter().any(|s| s == "name=widgets"));
         assert!(argv.iter().any(|s| s == "pr=7"));
         assert!(argv.iter().any(|s| s.contains("reviewThreads")));
+    }
+
+    #[test]
+    fn fingerprint_snapshot_reads_only_root_comments_without_reply_hydration() {
+        let output = BackendSuccess {
+            stdout: serde_json::json!({
+                "data": {"repository": {"pullRequest": {
+                    "headRefOid": "head-7",
+                    "reviewThreads": {
+                        "nodes": [{
+                            "id": "PRRT_1",
+                            "isResolved": false,
+                            "isOutdated": false,
+                            "path": "src/lib.rs",
+                            "diffSide": "RIGHT",
+                            "line": 10,
+                            "originalLine": 10,
+                            "originalStartLine": null,
+                            "startDiffSide": null,
+                            "startLine": null,
+                            "subjectType": "LINE",
+                            "comments": {
+                                "nodes": [{
+                                    "id": "PRRC_root",
+                                    "author": {"login": "review-bot"},
+                                    "body": "finding",
+                                    "createdAt": "2026-07-20T12:00:00Z",
+                                    "url": "https://github.com/acme/widgets/pull/7#discussion_r1"
+                                }],
+                                "pageInfo": {"hasNextPage": true, "endCursor": "reply-cursor"}
+                            }
+                        }],
+                        "pageInfo": {"hasNextPage": false, "endCursor": null}
+                    }
+                }}}
+            })
+            .to_string(),
+            stderr: String::new(),
+        };
+        let runner = ScriptedRunner::new(vec![output]);
+        let snapshot = compute_fingerprints_for_pr(
+            &runner,
+            &ctx(Provider::GitHub),
+            "https://github.com/acme/widgets/pull/7",
+            7,
+        )
+        .expect("fingerprint snapshot");
+        assert_eq!(snapshot.threads.len(), 1);
+        let calls = runner.calls();
+        assert_eq!(
+            calls.len(),
+            1,
+            "reply pages must not be hydrated: {calls:?}"
+        );
+        let query = calls[0].1.join(" ");
+        assert!(query.contains("comments(first: 1)"), "{query}");
+        assert!(!query.contains("thread=PRRT_1"), "{query}");
     }
 
     #[test]
@@ -804,8 +1438,38 @@ mod tests {
     #[test]
     fn parse_github_threads_populates_thread_node_id() {
         let output = BackendSuccess {
-            stdout: r#"{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[{"id":"PRRT_kwDOExample1","isResolved":false,"isOutdated":false,"path":"src/lib.rs","comments":{"nodes":[{"author":{"login":"quality-bot"},"body":"finding","createdAt":"t","url":"https://github.com/acme/widgets/pull/7#discussion_r1"}]}}]}}}}}"#
-                .into(),
+            stdout: serde_json::json!({
+                "data": {"repository": {"pullRequest": {
+                    "headRefOid": "head-7",
+                    "reviewThreads": {
+                        "nodes": [{
+                            "id": "PRRT_kwDOExample1",
+                            "isResolved": false,
+                            "isOutdated": false,
+                            "path": "src/lib.rs",
+                            "diffSide": "RIGHT",
+                            "line": 10,
+                            "originalLine": 10,
+                            "originalStartLine": null,
+                            "startDiffSide": null,
+                            "startLine": null,
+                            "subjectType": "LINE",
+                            "comments": {
+                                "nodes": [{
+                                    "id": "PRRC_1",
+                                    "author": {"login": "quality-bot"},
+                                    "body": "finding",
+                                    "createdAt": "t",
+                                    "url": "https://github.com/acme/widgets/pull/7#discussion_r1"
+                                }],
+                                "pageInfo": {"hasNextPage": false, "endCursor": null}
+                            }
+                        }],
+                        "pageInfo": {"hasNextPage": false, "endCursor": null}
+                    }
+                }}}
+            })
+            .to_string(),
             stderr: String::new(),
         };
         let threads = parse_github_threads(&output).expect("parse");
@@ -832,13 +1496,93 @@ mod tests {
     }
 
     #[test]
+    fn github_snapshot_includes_later_thread_comment_pages() {
+        let first_page = BackendSuccess {
+            stdout: serde_json::json!({
+                "data": {"repository": {"pullRequest": {
+                    "headRefOid": "head-7",
+                    "reviewThreads": {
+                    "nodes": [{
+                        "id": "PRRT_1",
+                        "isResolved": false,
+                        "isOutdated": false,
+                        "path": "src/lib.rs",
+                        "diffSide": "RIGHT",
+                        "line": 10,
+                        "originalLine": 10,
+                        "originalStartLine": null,
+                        "startDiffSide": null,
+                        "startLine": null,
+                        "subjectType": "LINE",
+                        "comments": {
+                            "nodes": [{
+                                "id": "PRRC_1",
+                                "author": {"login": "reviewer"},
+                                "body": "initial finding",
+                                "createdAt": "2026-07-20T12:00:00Z",
+                                "url": "https://github.com/acme/widgets/pull/7#discussion_r1"
+                            }],
+                            "pageInfo": {"hasNextPage": true, "endCursor": "comment-page-2"}
+                        }
+                    }],
+                    "pageInfo": {"hasNextPage": false, "endCursor": null}
+                }}}}
+            })
+            .to_string(),
+            stderr: String::new(),
+        };
+        let second_page = BackendSuccess {
+            stdout: serde_json::json!({
+                "data": {"node": {
+                    "id": "PRRT_1",
+                    "comments": {
+                        "nodes": [{
+                            "id": "PRRC_2",
+                            "author": {"login": "reviewer"},
+                            "body": "later blocking finding",
+                            "createdAt": "2026-07-20T12:01:00Z",
+                            "url": "https://github.com/acme/widgets/pull/7#discussion_r2"
+                        }],
+                        "pageInfo": {"hasNextPage": false, "endCursor": null}
+                    }
+                }}
+            })
+            .to_string(),
+            stderr: String::new(),
+        };
+        let runner = ScriptedRunner::new(vec![first_page, second_page]);
+
+        let payload = compute_for_pr(
+            &runner,
+            &ctx(Provider::GitHub),
+            "https://github.com/acme/widgets/pull/7",
+            7,
+        )
+        .expect("complete snapshot");
+        let value = serde_json::to_value(&payload).expect("serialize payload");
+
+        assert_eq!(
+            value["threads"][0]["comments"]
+                .as_array()
+                .expect("complete comment list")
+                .len(),
+            2
+        );
+        assert_eq!(
+            value["threads"][0]["comments"][1]["body"],
+            "later blocking finding"
+        );
+        assert_eq!(runner.calls().len(), 2);
+    }
+
+    #[test]
     fn parse_github_threads_errors_on_missing_nodes() {
         let output = BackendSuccess {
             stdout: r#"{"data":{"repository":{"pullRequest":null}}}"#.into(),
             stderr: String::new(),
         };
         let err = parse_github_threads(&output).expect_err("must fail");
-        assert_eq!(err.kind(), "software_error");
+        assert_eq!(err.kind(), "review_snapshot_incomplete");
     }
 
     #[test]
@@ -880,6 +1624,7 @@ mod tests {
             provider: "github",
             number: 7,
             url: "https://github.com/acme/widgets/pull/7".into(),
+            head_sha: Some("head-7".into()),
             total: 1,
             unresolved: 1,
             threads: vec![PrReviewThreadSummary {
@@ -888,9 +1633,17 @@ mod tests {
                 outdated: false,
                 author: "reviewer".into(),
                 path: "src/lib.rs".into(),
+                diff_side: Some("RIGHT".into()),
+                line: Some(10),
+                original_line: Some(10),
+                original_start_line: None,
+                start_diff_side: None,
+                start_line: None,
+                subject_type: Some("LINE".into()),
                 created_at: "t".into(),
                 url: "https://github.com/acme/widgets/pull/7#discussion_r1".into(),
                 body: "finding body\nsecond line".into(),
+                comments: Vec::new(),
             }],
         };
 
@@ -956,6 +1709,7 @@ mod tests {
             provider: "github",
             number: 7,
             url: "https://github.com/acme/widgets/pull/7".into(),
+            head_sha: Some("head-7".into()),
             total: 1,
             unresolved: 1,
             threads: vec![PrReviewThreadSummary {
@@ -964,9 +1718,17 @@ mod tests {
                 outdated: true,
                 author: "quality-bot".into(),
                 path: "src/lib.rs".into(),
+                diff_side: Some("RIGHT".into()),
+                line: Some(10),
+                original_line: Some(10),
+                original_start_line: None,
+                start_diff_side: None,
+                start_line: None,
+                subject_type: Some("LINE".into()),
                 created_at: "t".into(),
                 url: "https://github.com/acme/widgets/pull/7#discussion_r1".into(),
                 body: "nit: rename this local\nsecond line".into(),
+                comments: Vec::new(),
             }],
         };
         // An outdated unresolved thread must not block the gate...
@@ -1012,6 +1774,30 @@ mod tests {
         let calls = runner.calls();
         assert_eq!(calls.len(), 2);
         assert!(calls[1].1.iter().any(|s| s == "graphql"));
+    }
+
+    #[test]
+    fn ownership_validation_finds_a_thread_on_a_later_page() {
+        let view = BackendSuccess {
+            stdout: r#"{"number":7,"url":"https://github.com/acme/widgets/pull/7","state":"OPEN","isDraft":false,"title":"demo","headRefName":"feat/x","baseRefName":"main","mergeable":"MERGEABLE","mergedAt":null,"labels":[]}"#.into(),
+            stderr: String::new(),
+        };
+        let first_page = BackendSuccess {
+            stdout: r#"{"data":{"repository":{"pullRequest":{"headRefOid":"head-7","reviewThreads":{"nodes":[],"pageInfo":{"hasNextPage":true,"endCursor":"page-2"}}}}}}"#.into(),
+            stderr: String::new(),
+        };
+        let second_page = BackendSuccess {
+            stdout: github_threads_json(&[(false, "reviewer", "src/lib.rs")])
+                .replace("PRRT_0", "PRRT_target"),
+            stderr: String::new(),
+        };
+        let runner = ScriptedRunner::new(vec![view, first_page, second_page]);
+
+        ensure_thread_belongs_to_pr(&runner, &ctx(Provider::GitHub), 7, "PRRT_target")
+            .expect("later-page thread belongs to the PR");
+
+        assert_eq!(runner.calls().len(), 3);
+        assert!(runner.calls()[2].1.iter().any(|arg| arg == "after=page-2"));
     }
 
     #[test]

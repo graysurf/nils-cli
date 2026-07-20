@@ -144,6 +144,24 @@ provider_resolution:
   inbox_global_host: "reject global --host with provider_unsupported; --gitlab-host is the inbox-local GitLab authority control and GitHub Enterprise inbox is unsupported in v1"
   graphql_rate_limit: "bind probes to the triggering GitHub authority and key cached readings/invalidation by canonical authority"
 
+review_state_contract:
+  schema: forge-cli.review-loop.v1
+  storage: "append-only provider-visible PR issue comments authored by the currently authenticated viewer; marker-shaped comments from other actors are ignored"
+  provider_marker_limit: "64 KiB per encoded state marker, validated before provider mutation"
+  canonical_digest: "sha256:<lowercase hex> over compact UTF-8 JSON in declared field order"
+  record:
+    required: [schema, repository, pr, expected_head, generation, previous_digest, payload, record_digest]
+    chain: "one genesis; zero-based contiguous generations; previous_digest binds the unique prior record; byte-identical append retries are deduplicated, while conflicting duplicates, forks, stale, missing, or unreachable records fail as review_state_conflict"
+  review_run_receipt:
+    required: [review_run_id, route_lenses, decision, expected_head, round, summary_digest, inline_manifest]
+    review_run_preimage: [repository, pr, expected_head, round, route_lenses, decision, summary_digest, inline_manifest]
+    manifest_item_required: [index, path, line, side, start_line, start_side, subject_type, body_digest]
+  markers:
+    state: "<!-- forge-cli:review-state:v1 <lowercase-hex-record-json> -->"
+    review: "<!-- forge-cli:review-run:v1 run=<review_run_id> -->"
+    finding: "<!-- forge-cli:review-finding:v1 run=<review_run_id> digest=<body_digest> -->"
+  privacy_forbidden: [authentication_tokens, credentials, environment_values, local_paths, private_identity_profile_names]
+
 # ---------------------------------------------------------------------------
 # Atomic operations.
 # ---------------------------------------------------------------------------
@@ -300,22 +318,28 @@ operations:
     #   expected_review_head_requires_submit_review (DATA 65) — --expected-head without --submit-review
     #   github_review_head_changed (DATA 65) — the provider head differs from --expected-head; returned before native review mutation
     #   provider_unsupported (USAGE 64) — --submit-review or --thread-file on gitlab/local (native review/thread creation is GitHub-only in v1)
-    #   github_pending_review_exists (RUNTIME 1) — the authenticated GitHub viewer already owns a pending review; returned before any native review mutation, with provider head and pending/deletable counts for exact-node recovery
+    #   github_pending_review_exists (RUNTIME 1) — summary-only native review submission found a viewer-owned pending review. Threaded review transactions instead inspect an exact receipt-bound draft and resume it.
     #   github_native_review_rejected (RUNTIME 1) — GitHub rejected native review submission with HTTP 422; retry with an eligible reviewer identity or omit --submit-review for an outcome comment fallback
-    #   github_review_thread_rejected (RUNTIME 1) — GitHub rejected addPullRequestReviewThread for one spec; detail preserves the raw backend error plus spec index/path/line after best-effort pending-review cleanup.
+    #   pending_review_transaction_incomplete (DATA 65) — a receipt-bound pending review was created or updated but the next step was not confirmed. The draft and inline content are preserved; rerunning the identical command resumes it.
+    #   pending_review_manifest_mismatch (DATA 65) — the pending body, inline-comment prefix, run marker, decision inputs, or immutable manifest differs. No mutation follows.
+    #   pending_review_identity_mismatch (DATA 65) — the authenticated viewer does not own the receipt-bound pending review. No mutation follows.
+    #   review_state_conflict (DATA 65) — the append-only provider-visible receipt chain is malformed, forked, or binds one run id to different immutable inputs.
     # A non-404 guard failure (rate limit, 5xx, forbidden/SSO) surfaces as backend_error (RUNTIME 1),
     # not id_not_pull_request, since it may have hit a valid PR.
     backends:
       github:
         - { program: gh, argv: [api, "repos/{repo}/pulls/{id}", --jq, ".number"] } # PR-existence guard; <id> must be a pull request before posting (also rendered in --dry-run as guard_plan)
         - { program: gh, argv: [api, "repos/{repo}/issues/{id}/comments", --method, POST, --raw-field, "body={comment_or_file}", --jq, ".html_url"] } # default (outcome comment)
-        - { program: gh, argv: [api, graphql, -f, "query=<pending reviews with viewer ownership>", -f, "owner={owner}", -f, "name={repo}", -F, "pr={id}"] } # with --submit-review: complete pending-only preflight; a viewer-owned pending review returns github_pending_review_exists before mutation (rendered as pending_review_guard_plan)
+        - { program: gh, argv: [api, graphql, -f, "query=<pending reviews with viewer ownership>", -f, "owner={owner}", -f, "name={repo}", -F, "pr={id}"] } # summary-only --submit-review: a viewer-owned pending review returns github_pending_review_exists. Threaded transactions use this as the complete membership read before exact-node inspection/resume.
         - { program: gh, argv: [api, "repos/{repo}/pulls/{id}/reviews", --method, POST, --raw-field, "body={comment_or_file}", --raw-field, "event={EVENT}", --raw-field, "commit_id={expected_head}", --jq, ".html_url"] } # with --submit-review (native review event); body field omitted for a body-less APPROVE; commit_id binds the mutation to --expected-head; review authored by the inherited gh token's identity
         - { program: gh, argv: [api, graphql, -f, "query=<pull request id lookup>", -f, "owner={owner}", -f, "name={repo}", -F, "number={id}"] } # with --thread-file: resolve the PR node id
-        - { program: gh, argv: [api, graphql, -f, "query=<addPullRequestReview>", -f, "pullRequestId={pull_request_id}", -f, "commitOID={expected_head}"] } # with --thread-file: create a pending review bound to --expected-head
-        - { program: gh, argv: [api, graphql, -f, "query=<addPullRequestReviewThread>", -f, "reviewId={review_id}", -f, "path={path}", -f, "body={thread_body}", -F, "line={line}", -f, "side={LEFT|RIGHT}", -f, "subjectType={LINE|FILE}"] } # repeated for each actionable thread spec; returns PRRT_* id and comment URL
-        - { program: gh, argv: [api, graphql, -f, "query=<submitPullRequestReview>", -f, "reviewId={review_id}", -f, "event={EVENT}", -f, "body={comment_or_file}"] } # publishes the pending review created for --thread-file
-        - { program: gh, argv: [api, graphql, -f, "query=<deletePullRequestReview>", -f, "reviewId={review_id}"] } # best-effort cleanup only when a --thread-file run fails after pending review creation and before publish
+        - { program: gh, argv: [api, graphql, -f, "query=<authenticated viewer plus paginated PR issue comments>", -f, "owner={owner}", -f, "name={repo}", -F, "pr={id}", "-f after={cursor}?"] } # with --thread-file: retain only the authenticated viewer's comments, then read and validate the forge-cli.review-loop.v1 append-only state chain
+        - { program: gh, argv: [api, "repos/{repo}/issues/{id}/comments", --method, POST, --raw-field, "body=<immutable review-run receipt marker>", --jq, ".html_url"] } # append one provider-bounded receipt before native-review mutation, then verify from the prior cursor/tail; semantically identical append retries and reruns reuse it
+        - { program: gh, argv: [api, graphql, -f, "query=<complete submitted native reviews plus authenticated viewer>", -f, "owner={owner}", -f, "name={repo}", -F, "pr={id}", "-f after={cursor}?"] } # only when an exact receipt exists: idempotent success and lost-submit response detection require viewer author, expected head/state, untruncated marker, and complete receipt-bound thread manifest
+        - { program: gh, argv: [api, graphql, -f, "query=<complete exact pending review and inline-comment manifest>", -f, "review={review_id}", "-f after={cursor}?"] } # exact receipt/body/head/commit/identity/manifest validation before any resumed mutation
+        - { program: gh, argv: [api, graphql, -f, "query=<addPullRequestReview>", -f, "pullRequestId={pull_request_id}", -f, "commitOID={expected_head}", -f, "body={summary plus review-run marker}"] } # create only when no viewer-owned draft exists
+        - { program: gh, argv: [api, graphql, -f, "query=<addPullRequestReviewThread>", -f, "reviewId={review_id}", -f, "path={path}", -f, "body={finding marker plus semantic body}", -F, "line={line}", -f, "side={LEFT|RIGHT}", -f, "subjectType={LINE|FILE}"] } # add only the missing ordered manifest suffix; never delete completed inline content
+        - { program: gh, argv: [api, graphql, -f, "query=<submitPullRequestReview>", -f, "reviewId={review_id}", -f, "event={EVENT}", -f, "body={summary plus review-run marker}"] } # submit only after a final exact complete snapshot; failures trigger submitted-review read-back, not deletion
         - { program: gh, argv: [api, "repos/{repo}/issues/{issue}/comments", --method, POST, --raw-field, "body=<generated mirror>", --jq, ".html_url"] } # only with --mirror-issue
       gitlab:
         # One `glab mr note create --help` probe selects the form (covers every glab version class):
@@ -332,15 +356,18 @@ operations:
         provider: enum<github|gitlab>
         number: integer
         decision: enum<comments-only|approve|request-changes>
-        submitted_review: bool # true when a native review event was submitted (--submit-review); then pr_comment_url is the #pullrequestreview- URL
+        submitted_review: bool # true only when this invocation submitted a native review event. An exact completed rerun is false but retains the original #pullrequestreview- pr_comment_url
         head_sha?: string # present with --submit-review; the caller-reviewed head bound to preflight and mutation
         pending_review_guard_plan?: list<string> # dry-run only, with --submit-review: pending-only GraphQL preflight argv
+        review_state_plan?: list<string> # dry-run only with --thread-file: authenticated provider-state read
+        review_receipt_plan?: list<string> # dry-run only with --thread-file: immutable receipt append
+        review_state_verify_plan?: list<string> # dry-run only with --thread-file: post-append state verification
         pr_comment_url: string
         issue_number: integer?
         issue_comment_url: string?
         mirrored: bool
         lenses: list<string>
-        review_threads?: list<{ id: string, url: string, path: string, line?: integer, subject_type: enum<LINE|FILE> }>
+        review_threads?: "list<{ id: string, url: string, path: string, line?: integer, subject_type: enum<LINE|FILE> }>"
         threads_skipped_idempotent?: integer # cross-run duplicates skipped: findings whose (path, body) already had a live (non-resolved, non-outdated) thread on the current head; omitted when 0. When every finding is a duplicate the review event is skipped, so submitted_review is false
 
   - id: pr.review.validate
@@ -380,7 +407,7 @@ operations:
         review_threads:
           count: integer
           diff_checked: bool
-          specs: list<{ index: integer, path: string, line?: integer, side: enum<LEFT|RIGHT>, start_line?: integer, start_side?: enum<LEFT|RIGHT>, subject_type: enum<LINE|FILE>, body_bytes: integer }>
+          specs: 'list<{ index: integer, path: string, line?: integer, side: enum<LEFT|RIGHT>, start_line?: integer, start_side?: enum<LEFT|RIGHT>, subject_type: enum<LINE|FILE>, body_bytes: integer }>'
 
   - id: pr.ready
     schema_version: cli.forge-cli.pr.ready.v1
@@ -411,7 +438,7 @@ operations:
         url: string
         total: integer
         unresolved: integer
-        threads: list<{id, resolved, outdated, author, path, created_at, url, body}>
+        threads: list<{id,resolved,outdated,author,path,diff_side?,line?,original_line?,original_start_line?,start_diff_side?,start_line?,subject_type?,created_at,url,body,comments}>
 
   - id: pr.review-threads.resolve
     schema_version: cli.forge-cli.pr.review-threads.resolve.v1
@@ -479,10 +506,125 @@ operations:
         number: integer
         url: string
         head_sha: string
+        viewer_login: string # additive authenticated-viewer identity used by transaction recovery; may be empty only on generic reads from older provider responses
         current_head_reviews: list<{id, database_id?, url, author, state, commit_sha, submitted_at, summary, summary_truncated}>
         stale_reviews: list<{id, database_id?, url, author, state, commit_sha, submitted_at, summary, summary_truncated}>
         pending_reviews: list<{id, database_id?, url, author, state, commit_sha?, summary, summary_truncated}>
     notes: "all review pages are read (100 nodes/page, max 100 pages); provider-valid PENDING reviews have no submitted_at, may have no commit_sha, and are returned separately, never as convergence activity. Partial GraphQL data, missing required submitted-review fields, unknown states, head drift, or unsafe pagination return review_snapshot_incomplete. summary is bounded to 4096 UTF-8 bytes and is never parsed as a machine verdict; submitted commit_sha != head_sha is stale/informational."
+
+  - id: pr.pending-review.inspect
+    schema_version: cli.forge-cli.pr.pending-review.inspect.v1
+    summary: Read one complete pending GitHub review and its immutable snapshot digest.
+    inputs:
+      - { name: <id>, type: integer, required: true }
+      - { name: --review, type: string, required: true }
+    validations:
+      - pending_review_not_found
+      - pending_review_pr_mismatch
+      - review_snapshot_incomplete
+      - pending_review_manifest_mismatch
+    backends:
+      github:
+        - { program: gh, argv: [pr, view, "{id}", --json, "number,url,state,isDraft,baseRefName,headRefName,headRefOid,title,body"] }
+        - { program: gh, argv: [api, graphql, "--hostname <host when host != github.com>", -f, "query=<exact pending PullRequestReview plus complete paginated inline-comment manifest>", -f, "review={review_id}", "-f after={cursor}?"] }
+      gitlab: unsupported
+      local: unsupported
+    output:
+      data:
+        provider: enum<github>
+        number: integer
+        url: string
+        snapshot: object<{number,pr_url,head_sha,review_id,review_url,author,commit_sha?,body,semantic_body,viewer_did_author,viewer_can_delete,review_run_id?,provenance,inline_comments:list<{id,url,author,body,semantic_body,created_at,path,line?,original_line?,diff_side?,start_line?,original_start_line?,start_diff_side?,subject_type,body_digest,review_run_id?}>,snapshot_digest}>
+    notes: "The read is complete and fail-closed: every inline-comment page repeats the same review, PR, head, commit, author, body, and viewer-capability identity. The snapshot and digest preserve diff_side and start_diff_side as well as line/range anchors. Owned versioned markers are removed only from semantic_body; raw provider content remains visible in the snapshot. provenance is receipt-bound or unmarked, while mixed or digest-mismatched markers return pending_review_manifest_mismatch."
+
+  - id: pr.pending-review.resume-submit
+    schema_version: cli.forge-cli.pr.pending-review.resume-submit.v1
+    summary: Submit one exact receipt-bound pending review after final compare-and-swap validation.
+    inputs:
+      - { name: <id>, type: integer, required: true }
+      - { name: --review, type: string, required: true }
+      - { name: --review-run-id, type: string, required: true }
+      - { name: --expected-head, type: string, required: true }
+      - { name: --expected-commit, type: string, required: true }
+      - { name: --expected-snapshot, type: string, required: true }
+      - { name: --decision, type: enum<approve|request-changes|comments-only>, required: true }
+    validations:
+      - pending_review_not_found
+      - pending_review_pr_mismatch
+      - pending_review_head_changed
+      - pending_review_commit_mismatch
+      - pending_review_manifest_mismatch
+      - pending_review_identity_mismatch
+    backends:
+      github:
+        - { program: gh, argv: [pr, view, "{id}", --json, "number,url,state,isDraft,baseRefName,headRefName,headRefOid,title,body"] }
+        - { program: gh, argv: [api, graphql, -f, "query=<complete pending-review snapshot>", -f, "review={review_id}", -f, "after={cursor}?"] }
+        - { program: gh, argv: [api, graphql, "-f", "query=<submitPullRequestReview>", -f, "reviewId={review_id}", -f, "event={decision}", -f, "body={preserved_body}"] }
+        - { program: gh, argv: [api, graphql, -f, "query=<complete submitted native reviews>", -f, "owner={owner}", -f, "name={repo}", -F, "pr={id}", "-f after={cursor}?"] } # when the exact node is no longer pending, verify the same submitted run/review/head/commit/decision and return idempotent success without mutation
+      gitlab: unsupported
+      local: unsupported
+    output:
+      data: object<{provider,number,url,review_id,review_url,head_sha,commit_sha,snapshot_digest,review_run_id,submitted}>
+    notes: "The exact receipt-bound pending snapshot is submitted once, after recomputing the immutable review_run_id and comparing summary digest plus every path/line/side/range/subject/body manifest field. If submission already completed, a complete submitted-review read-back authored by the authenticated viewer with the same review_run_id, review id, current head, commit, decision state, and complete receipt-bound thread manifest returns idempotent success without another mutation."
+
+  - id: pr.pending-review.submit
+    schema_version: cli.forge-cli.pr.pending-review.submit.v1
+    summary: Guardedly submit one exact unmarked pending review without deleting inline content.
+    inputs:
+      - { name: <id>, type: integer, required: true }
+      - { name: --review, type: string, required: true }
+      - { name: --expected-head, type: string, required: true }
+      - { name: --expected-commit, type: string, required: true }
+      - { name: --expected-snapshot, type: string, required: true }
+      - { name: --decision, type: enum<approve|request-changes|comments-only>, required: true }
+      - { name: --confirm-unmarked-submit, type: bool, required: true }
+    validations:
+      - pending_review_not_found
+      - pending_review_pr_mismatch
+      - pending_review_head_changed
+      - pending_review_commit_mismatch
+      - pending_review_manifest_mismatch
+      - pending_review_identity_mismatch
+    backends:
+      github:
+        - { program: gh, argv: [pr, view, "{id}", --json, "number,url,state,isDraft,baseRefName,headRefName,headRefOid,title,body"] }
+        - { program: gh, argv: [api, graphql, -f, "query=<complete pending-review snapshot>", -f, "review={review_id}", -f, "after={cursor}?"] }
+        - { program: gh, argv: [api, graphql, "-f", "query=<submitPullRequestReview>", -f, "reviewId={review_id}", -f, "event={decision}", -f, "body={preserved_body}"] }
+      gitlab: unsupported
+      local: unsupported
+    output:
+      data: object<{provider,number,url,review_id,review_url,head_sha,commit_sha,snapshot_digest,review_run_id?,submitted}>
+    notes: "Only provenance=unmarked is eligible. The exact snapshot digest, head, commit, viewer identity, body, and every inline comment are re-read before submission; inline content is preserved."
+
+  - id: pr.pending-review.discard
+    schema_version: cli.forge-cli.pr.pending-review.discard.v1
+    summary: Destructively discard one exact pending review with separate inline-content approval.
+    inputs:
+      - { name: <id>, type: integer, required: true }
+      - { name: --review, type: string, required: true }
+      - { name: --expected-head, type: string, required: true }
+      - { name: --expected-commit, type: string, required: true }
+      - { name: --expected-snapshot, type: string, required: true }
+      - { name: --confirm-discard, type: bool, required: true }
+      - { name: --confirm-inline-content-loss, type: bool, required: conditional }
+    validations:
+      - pending_review_not_found
+      - pending_review_pr_mismatch
+      - pending_review_head_changed
+      - pending_review_commit_mismatch
+      - pending_review_manifest_mismatch
+      - pending_review_identity_mismatch
+      - pending_review_inline_discard_approval_required
+    backends:
+      github:
+        - { program: gh, argv: [pr, view, "{id}", --json, "number,url,state,isDraft,baseRefName,headRefName,headRefOid,title,body"] }
+        - { program: gh, argv: [api, graphql, -f, "query=<complete pending-review snapshot>", -f, "review={review_id}", -f, "after={cursor}?"] }
+        - { program: gh, argv: [api, graphql, "-f", "query=<deletePullRequestReview>", -f, "reviewId={review_id}"] }
+      gitlab: unsupported
+      local: unsupported
+    output:
+      data: object<{provider,number,url,review_id,review_url,head_sha,commit_sha,snapshot_digest,inline_comment_count,discarded}>
+    notes: "Deletion is never automatic. --confirm-inline-content-loss is additionally mandatory when the complete snapshot contains one or more inline comments."
 
   - id: pr.pending-review.delete
     schema_version: cli.forge-cli.pr.pending-review.delete.v1
@@ -583,7 +725,7 @@ operations:
         deleted_branch: bool
         unchecked_tasks_override_reason?: string # present only when --allow-unchecked-tasks bypass was used
         unresolved_threads_override_reason?: string # present only when --allow-unresolved-threads bypass was used
-        stale_thread_dispositions?: list<{ thread_id: string, author: string, path: string, summary: string, disposition: "stale", rationale: string }> # outdated unresolved threads dispositioned stale at rule 13; omitted when none
+        stale_thread_dispositions?: 'list<{ thread_id: string, author: string, path: string, summary: string, disposition: "stale", rationale: string }>' # outdated unresolved threads dispositioned stale at rule 13; omitted when none
         review_convergence: optional<{required, head_sha, observed_reviews, stale_reviews, unresolved_threads, changes_requested_by, missing_reviewers, latest_activity_at?, quiet_until?, quiet_period_ms, timeout_ms, waited_ms, bots}>
       dry_run_data:
         review_convergence: resolved<{require, quiet_period, timeout, bots}>
