@@ -21,7 +21,7 @@
 | 1.1 | done | Meaningful red test | Retained test-first failure evidence | Legacy 256 KiB miss reproduced. |
 | 1.2 | done | Bounded recovery and tracking | Provider-prompt focused suite passes | Exact identity remains required. |
 | 1.3 | done | Runtime contract docs | Docs-only gate passes | API and runbook updated. |
-| 2.1 | in_progress | Validate, review, merge | Finish-line validation passes | Independent review pending. |
+| 2.1 | in-progress | Validate, review, merge | Finish-line validation passes | Independent review pending. |
 | 2.2 | pending | Release, deploy, live verify | none | Blocked by 2.1 and release consent. |
 
 ## Scope decisions
