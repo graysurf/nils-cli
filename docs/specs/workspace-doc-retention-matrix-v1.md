@@ -57,12 +57,28 @@ tracked separately in the [Crate Top-Level README Inventory](#crate-top-level-re
 below; the canonical `find` glob `crates/*/README.md` excludes any `README.md` under a crate root
 because BSD-style `-path` lets `*` cross slash boundaries.
 
+- `crates/agent-hook/docs/reports/agent-hook-completion-migration-contract.md`
+- `crates/agent-hook/docs/specs/agent-hook-v1.md`
+- `crates/agent-runtime/docs/determinism.md`
+- `crates/agent-session/docs/provider-turn-signal-evidence.md`
+- `crates/agent-session/docs/reports/agent-session-completion-migration-contract.md`
+- `crates/agent-session/docs/runbooks/serve-daemon.md`
+- `crates/agent-session/docs/runbooks/work-coordination.md`
+- `crates/agent-session/docs/specs/activity-stream-v1.md`
+- `crates/agent-session/docs/specs/serve-api-v1.md`
+- `crates/agent-session/docs/specs/session-coordination-v1.md`
+- `crates/agent-session/docs/specs/session-maintenance-v1.md`
+- `crates/agent-session/docs/turn-state-contract.md`
 - `crates/api-websocket/docs/specs/websocket-cli-contract-v1.md`
 - `crates/api-websocket/docs/specs/websocket-request-schema-v1.md`
 - `crates/codex-cli/docs/runbooks/json-consumers.md`
 - `crates/codex-cli/docs/specs/codex-cli-diag-rate-limits-and-auth-json-contract-v1.md`
+- `crates/forge-cli/docs/specs/forge-cli-spec-v1.md`
 - `crates/gemini-cli/docs/runbooks/json-consumers.md`
 - `crates/gemini-cli/docs/specs/gemini-cli-diag-rate-limits-and-auth-json-contract-v1.md`
+- `crates/git-cli/docs/specs/dirty-checkout-adoption-json-contract-v1.md`
+- `crates/git-cli/docs/specs/git-cli-worktree-convention.md`
+- `crates/macos-agent/docs/specs/macos-agent-journal-v2.md`
 - `crates/memo/docs/runbooks/memo-agent-workflow.md`
 - `crates/memo/docs/specs/memo-command-contract-v1.md`
 - `crates/memo/docs/specs/memo-json-contract-v1.md`
@@ -70,9 +86,16 @@ because BSD-style `-path` lets `*` cross slash boundaries.
 - `crates/memo/docs/specs/memo-storage-schema-v1.md`
 - `crates/memo/docs/specs/memo-workflow-extension-contract-v1.md`
 - `crates/nils-common/docs/specs/markdown-helpers-contract-v1.md`
+- `crates/nils-markdown/CHANGELOG.md`
+- `crates/plan-issue/CHANGELOG.md`
+- `crates/plan-issue/docs/runbooks/provider-routing-runbook.md`
+- `crates/plan-issue/docs/specs/issue-backed-plan-record-contract-v2.md`
+- `crates/plan-issue/docs/specs/local-provider-contract-v1.md`
+- `crates/plan-issue/docs/specs/local-provider-service-feasibility.md`
 - `crates/plan-issue/docs/specs/plan-issue-contract-v2.md`
 - `crates/plan-issue/docs/specs/plan-issue-gate-matrix-v1.md`
 - `crates/plan-issue/docs/specs/plan-issue-state-machine-v1.md`
+- `crates/plan-issue/docs/specs/plan-issue-state-machine-v2.md`
 - `crates/plan-tooling/docs/runbooks/split-prs-build-task-spec-cutover.md`
 - `crates/plan-tooling/docs/specs/plan-source-bundle-contract-v1.md`
 - `crates/plan-tooling/docs/specs/split-prs-contract-v1.md`
@@ -86,63 +109,103 @@ as the GitHub crate-directory landing page) and a `docs/README.md` index for cra
 These files are excluded from the canonical Crate-Local Inventory `find` pattern, so they are
 tracked here.
 
-Top-level crate READMEs (one per workspace member, 25 total):
+Top-level crate READMEs (one per workspace member, 46 total):
 
 - `crates/agent-docs/README.md`
+- `crates/agent-hook/README.md`
+- `crates/agent-memory/README.md`
+- `crates/agent-out/README.md`
+- `crates/agent-runtime/README.md`
+- `crates/agent-scope-lock/README.md`
+- `crates/agent-session/README.md`
+- `crates/agent-workflow-primitives/README.md`
 - `crates/api-gql/README.md`
 - `crates/api-grpc/README.md`
 - `crates/api-rest/README.md`
 - `crates/api-test/README.md`
 - `crates/api-testing-core/README.md`
 - `crates/api-websocket/README.md`
+- `crates/claude-cli/README.md`
 - `crates/cli-template/README.md`
 - `crates/codex-cli/README.md`
+- `crates/docker-tools/README.md`
+- `crates/forge-cli/README.md`
 - `crates/fzf-cli/README.md`
 - `crates/gemini-cli/README.md`
-- `crates/opencode-cli/README.md`
 - `crates/git-cli/README.md`
 - `crates/git-lock/README.md`
 - `crates/git-scope/README.md`
 - `crates/git-summary/README.md`
+- `crates/github-app-cli/README.md`
 - `crates/image-processing/README.md`
 - `crates/macos-agent/README.md`
 - `crates/memo/README.md`
+- `crates/nils-build-info/README.md`
 - `crates/nils-common/README.md`
+- `crates/nils-evidence/README.md`
+- `crates/nils-markdown/README.md`
+- `crates/nils-provider-resume/README.md`
+- `crates/nils-scrub/README.md`
 - `crates/nils-term/README.md`
 - `crates/nils-test-support/README.md`
+- `crates/opencode-cli/README.md`
+- `crates/plan-archive/README.md`
 - `crates/plan-issue/README.md`
 - `crates/plan-tooling/README.md`
 - `crates/screen-record/README.md`
+- `crates/secrets/README.md`
 - `crates/semantic-commit/README.md`
+- `crates/web-evidence/README.md`
+- `crates/zsh-kit/README.md`
 
-Crate `docs/README.md` index files (one per workspace member, 25 total):
+Crate `docs/README.md` index files (one per workspace member, 46 total):
 
 - `crates/agent-docs/docs/README.md`
+- `crates/agent-hook/docs/README.md`
+- `crates/agent-memory/docs/README.md`
+- `crates/agent-out/docs/README.md`
+- `crates/agent-runtime/docs/README.md`
+- `crates/agent-scope-lock/docs/README.md`
+- `crates/agent-session/docs/README.md`
+- `crates/agent-workflow-primitives/docs/README.md`
 - `crates/api-gql/docs/README.md`
 - `crates/api-grpc/docs/README.md`
 - `crates/api-rest/docs/README.md`
 - `crates/api-test/docs/README.md`
 - `crates/api-testing-core/docs/README.md`
 - `crates/api-websocket/docs/README.md`
+- `crates/claude-cli/docs/README.md`
 - `crates/cli-template/docs/README.md`
 - `crates/codex-cli/docs/README.md`
+- `crates/docker-tools/docs/README.md`
+- `crates/forge-cli/docs/README.md`
 - `crates/fzf-cli/docs/README.md`
 - `crates/gemini-cli/docs/README.md`
-- `crates/opencode-cli/docs/README.md`
 - `crates/git-cli/docs/README.md`
 - `crates/git-lock/docs/README.md`
 - `crates/git-scope/docs/README.md`
 - `crates/git-summary/docs/README.md`
+- `crates/github-app-cli/docs/README.md`
 - `crates/image-processing/docs/README.md`
 - `crates/macos-agent/docs/README.md`
 - `crates/memo/docs/README.md`
+- `crates/nils-build-info/docs/README.md`
 - `crates/nils-common/docs/README.md`
+- `crates/nils-evidence/docs/README.md`
+- `crates/nils-markdown/docs/README.md`
+- `crates/nils-provider-resume/docs/README.md`
+- `crates/nils-scrub/docs/README.md`
 - `crates/nils-term/docs/README.md`
 - `crates/nils-test-support/docs/README.md`
+- `crates/opencode-cli/docs/README.md`
+- `crates/plan-archive/docs/README.md`
 - `crates/plan-issue/docs/README.md`
 - `crates/plan-tooling/docs/README.md`
 - `crates/screen-record/docs/README.md`
+- `crates/secrets/docs/README.md`
 - `crates/semantic-commit/docs/README.md`
+- `crates/web-evidence/docs/README.md`
+- `crates/zsh-kit/docs/README.md`
 
 ## Transient/Obsolete Inventory (Delete or Move)
 

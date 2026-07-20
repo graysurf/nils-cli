@@ -16,7 +16,7 @@ These tools are required for common command paths. Each row is anchored to at le
 
 | Tool | Used By | Requirement Level | Install (brew/linuxbrew) |
 |---|---|---|---|
-| `git` | `git-scope`, `git-cli`, `git-summary`, `git-lock`, `repo-retro`, `semantic-commit` (via `git-scope`), `codex-cli`, `gemini-cli`, `opencode-cli`, `fzf-cli git-*`, `zsh-kit setup`, `zsh-kit plugin *`, `heuristic-inbox deliver` | Required | `brew install git` |
+| `git` | `git-scope`, `git-cli`, `git-summary`, `git-lock`, `repo-retro`, `semantic-commit` (via `git-scope`), `agent-session` checkout-origin discovery, `codex-cli`, `gemini-cli`, `opencode-cli`, `fzf-cli git-*`, `zsh-kit setup`, `zsh-kit plugin *`, `heuristic-inbox deliver` | Required | `brew install git` |
 | `fzf` | `fzf-cli` interactive commands | Required (for `fzf-cli`) | `brew install fzf` |
 | `grpcurl` | `api-grpc` unary backend (via `api-testing-core::grpc::runner`); overridable with `GRPCURL_BIN` | Required (for `api-grpc call` / suite gRPC cases) | `brew install grpcurl` |
 | `ffmpeg` | `screen-record` on Linux (X11 + Wayland portal capture, audio mux) | Required on Linux | `brew install ffmpeg` |
@@ -27,6 +27,7 @@ These tools are required for common command paths. Each row is anchored to at le
 | `curl` | `gemini-cli` auth refresh + rate-limit client; locked Peekaboo asset download for `macos-agent backend install` | Required for those flows | Usually preinstalled (`brew install curl`) |
 | `/bin/ps` | `claude-cli` nested CLI usage-probe timeout cleanup on non-Linux Unix | Required for reliable descendant cleanup on macOS/BSD; Linux reads `/proc` directly | Usually preinstalled |
 | `tmux` | `agent-session` start/run/resume/attach/glance/send/delete/serve flows | Required for tmux-backed `agent-session` runtime | `brew install tmux` |
+| `agent-hook` | `agent-session activity setup` compatibility forwarder | Required only for provider registration through the retained setup command; override lookup with `AGENT_HOOK_BIN` | Install the matching `nils-agent-hook` package |
 | `agent-session` | `agent-hook` policies using `agent-session.activity.v1` | Required only when the selected policy records managed session activity; invoked through the metadata-only `activity event` contract | Install the matching `nils-agent-session` package |
 | `sops` | `secrets pull/add/edit` encryption and decryption flows | Required for `secrets` runtime | `brew install sops` |
 | `security` | `claude-cli prompt-segment` Keychain credential lookup | Required on macOS unless `CLAUDE_PROMPT_SEGMENT_ACCESS_TOKEN` / `CLAUDE_PROMPT_SEGMENT_CREDENTIALS_JSON` is supplied | Preinstalled on macOS |
