@@ -117,7 +117,7 @@ fn candidate_from_command(
     let tool = program_path
         .file_name()
         .and_then(OsStr::to_str)
-        .filter(|name| matches!(*name, "agent-docs" | "forge-cli"))
+        .filter(|name| matches!(*name, "agent-docs" | "agent-run" | "forge-cli"))
         .ok_or_else(|| {
             rejected(
                 "read-only-command-unsupported",
@@ -247,9 +247,29 @@ fn verify_descriptor(
     cwd: &Path,
     now_epoch: i64,
 ) -> Result<(), HookError> {
-    if descriptor.schema_version != OPERATION_EFFECT_VERSION
-        || descriptor.capability_class != CapabilityClass::ToolContract
-    {
+    if descriptor.schema_version != OPERATION_EFFECT_VERSION {
+        return Err(rejected(
+            "read-only-descriptor-unsupported",
+            "operation-effect descriptor schema or capability class is unsupported",
+        ));
+    }
+    let assurance_valid = match descriptor.capability_class {
+        CapabilityClass::ToolContract => {
+            candidate.tool != "agent-run" && descriptor.os_enforcement.is_none()
+        }
+        CapabilityClass::OsEnforced => {
+            candidate.tool == "agent-run"
+                && descriptor.operation == "inspect"
+                && descriptor.provider_effect == ProviderEffect::None
+                && descriptor.managed_state_reads.is_empty()
+                && descriptor
+                    .os_enforcement
+                    .as_ref()
+                    .is_some_and(|enforcement| enforcement.satisfies_strict_v1())
+        }
+        CapabilityClass::HostAttested => false,
+    };
+    if !assurance_valid {
         return Err(rejected(
             "read-only-descriptor-unsupported",
             "operation-effect descriptor schema or capability class is unsupported",
@@ -532,6 +552,7 @@ mod tests {
             effect: Effect::ReadOnly,
             provider_effect: ProviderEffect::LocalRead,
             managed_state_reads: vec!["catalog".to_string()],
+            os_enforcement: None,
             binding: InvocationBinding {
                 argv_digest: argv_digest(&candidate.argv),
                 cwd_digest: cwd_digest(temp.path()).expect("cwd digest"),
@@ -642,6 +663,76 @@ mod tests {
         assert_eq!(
             candidate.descriptor_command().get_current_dir(),
             Some(temp.path())
+        );
+    }
+
+    #[test]
+    fn accepts_strict_os_enforced_evidence_from_same_release_agent_run() {
+        use nils_common::execution_effect::{BackendIdentity, OsEnforcement};
+
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let hook = temp.path().join("agent-hook");
+        let producer = temp.path().join("agent-run");
+        fs::write(&hook, b"hook").expect("hook file");
+        fs::write(&producer, b"producer").expect("producer file");
+        fs::set_permissions(&hook, fs::Permissions::from_mode(0o700)).expect("hook mode");
+        fs::set_permissions(&producer, fs::Permissions::from_mode(0o700)).expect("producer mode");
+        let command = format!(
+            "{} inspect --cwd {} -- rg TODO",
+            producer.display(),
+            temp.path().display()
+        );
+        let candidate =
+            candidate_from_command(&command, &hook, &[], temp.path()).expect("agent-run candidate");
+        let now = jiff::Timestamp::now().as_second();
+        let descriptor = OperationEffectDescriptor {
+            schema_version: OPERATION_EFFECT_VERSION.to_string(),
+            capability_class: CapabilityClass::OsEnforced,
+            producer: ProducerIdentity {
+                tool: "agent-run".to_string(),
+                release: env!("CARGO_PKG_VERSION").to_string(),
+                executable_digest: executable_digest(&producer).expect("executable digest"),
+            },
+            operation: "inspect".to_string(),
+            effect: Effect::ReadOnly,
+            provider_effect: ProviderEffect::None,
+            managed_state_reads: Vec::new(),
+            os_enforcement: Some(OsEnforcement::strict_v1(BackendIdentity {
+                kind: "linux.bubblewrap-systemd.v1".to_string(),
+                release: "test backend".to_string(),
+                executable_digest: format!("sha256:{}", "a".repeat(64)),
+            })),
+            binding: InvocationBinding {
+                argv_digest: argv_digest(&candidate.argv),
+                cwd_digest: cwd_digest(temp.path()).expect("cwd digest"),
+                target_digest: digest_parts([temp.path().as_os_str().as_encoded_bytes()]),
+            },
+            issued_at_epoch: now,
+        };
+
+        verify_descriptor(&candidate, &descriptor, temp.path(), now)
+            .expect("strict OS enforcement must verify");
+
+        let mut missing = descriptor.clone();
+        missing.os_enforcement = None;
+        assert_eq!(
+            verify_descriptor(&candidate, &missing, temp.path(), now)
+                .expect_err("OS-enforced evidence must carry the enforcement record")
+                .code,
+            "read-only-descriptor-unsupported"
+        );
+
+        let mut weakened = descriptor;
+        weakened
+            .os_enforcement
+            .as_mut()
+            .expect("enforcement")
+            .network_denied = false;
+        assert_eq!(
+            verify_descriptor(&candidate, &weakened, temp.path(), now)
+                .expect_err("weakened OS enforcement must not verify")
+                .code,
+            "read-only-descriptor-unsupported"
         );
     }
 }

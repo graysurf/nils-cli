@@ -2,6 +2,8 @@
 
 #[path = "integration/agent_run.rs"]
 mod agent_run;
+#[path = "integration/agent_run_inspect.rs"]
+mod agent_run_inspect;
 #[path = "integration/cli.rs"]
 mod cli;
 #[path = "integration/control_plane.rs"]

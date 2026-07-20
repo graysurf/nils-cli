@@ -18,6 +18,7 @@ pub const EXIT_RUNTIME: i32 = exit::RUNTIME;
 pub const EXIT_USAGE: i32 = exit::USAGE;
 pub const EXIT_DATA: i32 = exit::DATA;
 pub const EXIT_UNAVAILABLE: i32 = exit::UNAVAILABLE;
+pub const EXIT_SOFTWARE: i32 = exit::SOFTWARE;
 
 #[derive(Debug)]
 pub struct CliError(Box<CliErrorData>);
