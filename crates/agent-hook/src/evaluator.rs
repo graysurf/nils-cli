@@ -44,6 +44,25 @@ struct ExecutionBudget {
     retained_output: usize,
 }
 
+#[derive(Debug)]
+struct PreparedRule<'a> {
+    rule: &'a crate::model::PolicyRule,
+    mode: RuleMode,
+    recovery: bool,
+}
+
+#[derive(Debug)]
+pub struct PreparedEvaluation<'a> {
+    rules: Vec<PreparedRule<'a>>,
+    needs_coordination: bool,
+}
+
+impl PreparedEvaluation<'_> {
+    pub fn needs_coordination(&self) -> bool {
+        self.needs_coordination
+    }
+}
+
 impl ExecutionBudget {
     fn new() -> Self {
         Self {
@@ -86,14 +105,12 @@ impl ExecutionBudget {
     }
 }
 
-pub fn evaluate(
-    loaded: &LoadedPolicy,
+pub fn prepare<'a>(
+    loaded: &'a LoadedPolicy,
     request: &NormalizedRequest,
-    raw: &[u8],
     all_shadow: bool,
     recovery_rules: &BTreeSet<String>,
-    coordination: Option<&liveness::Snapshot>,
-) -> Result<NormalizedDecision, HookError> {
+) -> Result<PreparedEvaluation<'a>, HookError> {
     let mut selected = loaded
         .bundle
         .rules
@@ -115,16 +132,32 @@ pub fn evaluate(
             .then_with(|| left.id.cmp(&right.id))
     });
 
-    let executable_count = selected
-        .iter()
-        .filter(|rule| !recovery_rules.contains(&rule.id))
-        .filter(|rule| {
-            let mode = effective_mode_for_product(loaded, request.product, rule);
-            !all_shadow && mode == RuleMode::Enforce
+    let rules = selected
+        .into_iter()
+        .filter_map(|rule| {
+            let mode = if all_shadow {
+                if effective_mode_for_product(loaded, request.product, rule) == RuleMode::Disabled {
+                    RuleMode::Disabled
+                } else {
+                    RuleMode::Shadow
+                }
+            } else {
+                effective_mode_for_product(loaded, request.product, rule)
+            };
+            (mode != RuleMode::Disabled).then(|| PreparedRule {
+                rule,
+                mode,
+                recovery: recovery_rules.contains(&rule.id),
+            })
         })
-        .filter(|rule| {
+        .collect::<Vec<_>>();
+
+    let executable_count = rules
+        .iter()
+        .filter(|prepared| prepared.mode == RuleMode::Enforce && !prepared.recovery)
+        .filter(|prepared| {
             matches!(
-                rule.capability,
+                prepared.rule.capability,
                 Capability::SessionActivity { .. } | Capability::RuntimeKitHandler { .. }
             )
         })
@@ -136,24 +169,79 @@ pub fn evaluate(
         ));
     }
 
+    let reason_count = rules
+        .iter()
+        .filter(|prepared| prepared.mode == RuleMode::Enforce)
+        .count();
+    if reason_count > MAX_REASONS {
+        return Err(HookError::data(
+            "decision-reason-limit",
+            "aggregate decision exceeds the reason limit",
+        ));
+    }
+
+    let needs_coordination = rules.iter().any(|prepared| {
+        prepared.mode == RuleMode::Enforce
+            && !prepared.recovery
+            && matches!(
+                prepared.rule.capability,
+                Capability::SemanticConflict { .. } | Capability::OwnerLiveness { .. }
+            )
+    });
+
+    Ok(PreparedEvaluation {
+        rules,
+        needs_coordination,
+    })
+}
+
+pub fn evaluate(
+    loaded: &LoadedPolicy,
+    request: &mut NormalizedRequest,
+    raw: &[u8],
+    prepared: &PreparedEvaluation<'_>,
+    coordination: Option<&liveness::Snapshot>,
+    coordination_mode_override: Option<nils_common::coordination_projection::CoordinationMode>,
+) -> Result<NormalizedDecision, HookError> {
+    evaluate_with_io(
+        loaded,
+        request,
+        raw,
+        prepared,
+        coordination,
+        coordination_mode_override,
+        liveness::system_io(),
+    )
+}
+
+fn evaluate_with_io(
+    loaded: &LoadedPolicy,
+    request: &mut NormalizedRequest,
+    raw: &[u8],
+    prepared: &PreparedEvaluation<'_>,
+    coordination: Option<&liveness::Snapshot>,
+    coordination_mode_override: Option<nils_common::coordination_projection::CoordinationMode>,
+    liveness_io: &dyn liveness::LivenessIo,
+) -> Result<NormalizedDecision, HookError> {
+    let liveness = prepared.needs_coordination.then(|| {
+        liveness::DispatchProjection::new(coordination, coordination_mode_override, liveness_io)
+    });
+    request.semantic_conflict = coordination.map(|_| {
+        liveness::derive_semantic_conflict(
+            request,
+            liveness
+                .as_ref()
+                .expect("coordination snapshot requires liveness projection"),
+        )
+    });
+
     let mut enforced = Vec::new();
     let mut shadow = Vec::new();
     let mut recovery_applied = false;
     let mut execution_budget = ExecutionBudget::new();
-    for rule in selected {
-        let mode = if all_shadow {
-            if effective_mode_for_product(loaded, request.product, rule) == RuleMode::Disabled {
-                RuleMode::Disabled
-            } else {
-                RuleMode::Shadow
-            }
-        } else {
-            effective_mode_for_product(loaded, request.product, rule)
-        };
-        if mode == RuleMode::Disabled {
-            continue;
-        }
-        if mode == RuleMode::Shadow {
+    for prepared_rule in &prepared.rules {
+        let rule = prepared_rule.rule;
+        if prepared_rule.mode == RuleMode::Shadow {
             let outcome = evaluate_shadow(&rule.capability);
             shadow.push(ShadowObservation {
                 rule_id: rule.id.clone(),
@@ -162,7 +250,7 @@ pub fn evaluate(
             });
             continue;
         }
-        if recovery_rules.contains(&rule.id) {
+        if prepared_rule.recovery {
             recovery_applied = true;
             enforced.push((
                 rule.id.clone(),
@@ -181,7 +269,7 @@ pub fn evaluate(
             request,
             raw,
             &mut execution_budget,
-            coordination,
+            liveness.as_ref(),
         ) {
             Ok(outcome) => outcome,
             Err(error) if error.code.starts_with("dispatch-") => return Err(error),
@@ -191,31 +279,6 @@ pub fn evaluate(
     }
 
     aggregate(loaded, request, enforced, shadow, recovery_applied)
-}
-
-pub fn needs_coordination(
-    loaded: &LoadedPolicy,
-    request: &NormalizedRequest,
-    all_shadow: bool,
-    recovery_rules: &BTreeSet<String>,
-) -> bool {
-    !all_shadow
-        && loaded.bundle.rules.iter().any(|rule| {
-            rule.products.contains(&request.product)
-                && rule.events.iter().any(|event| event == &request.event)
-                && rule.matcher.as_deref().is_none_or(|matcher| {
-                    request
-                        .matcher
-                        .as_deref()
-                        .is_some_and(|candidate| matcher_expression_matches(matcher, candidate))
-                })
-                && !recovery_rules.contains(&rule.id)
-                && effective_mode_for_product(loaded, request.product, rule) == RuleMode::Enforce
-                && matches!(
-                    rule.capability,
-                    Capability::SemanticConflict { .. } | Capability::OwnerLiveness { .. }
-                )
-        })
 }
 
 fn evaluate_shadow(capability: &Capability) -> RuleOutcome {
@@ -238,7 +301,7 @@ fn evaluate_capability(
     request: &NormalizedRequest,
     raw: &[u8],
     execution_budget: &mut ExecutionBudget,
-    coordination: Option<&liveness::Snapshot>,
+    liveness: Option<&liveness::DispatchProjection<'_, '_>>,
 ) -> Result<RuleOutcome, HookError> {
     Ok(match capability {
         Capability::Allow { reason_code } => simple(DecisionAction::Allow, reason_code),
@@ -280,14 +343,23 @@ fn evaluate_capability(
             provider_output: None,
         },
         Capability::SemanticConflict { reason_code } => simple(
-            liveness::semantic_conflict_action(request.semantic_conflict, coordination),
+            liveness::semantic_conflict_action(
+                request.semantic_conflict,
+                liveness.and_then(liveness::DispatchProjection::mode),
+            ),
             reason_code,
         ),
         Capability::OwnerLiveness {
             reason_code: _,
             legacy_ttl_seconds,
         } => {
-            let outcome = liveness::classify(request, *legacy_ttl_seconds, coordination);
+            let projection = liveness.ok_or_else(|| {
+                HookError::runtime(
+                    "coordination-unavailable",
+                    "owner liveness projection is unavailable",
+                )
+            })?;
+            let outcome = liveness::classify(request, *legacy_ttl_seconds, projection);
             simple(outcome.action, &outcome.reason_code)
         }
         Capability::SessionActivity { reason_code } => {
@@ -733,7 +805,214 @@ fn terminate_process_group(child: &mut std::process::Child) {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
+    use std::collections::BTreeMap;
+    use std::ffi::OsString;
+    use std::path::{Path, PathBuf};
+    use std::sync::Mutex;
+
+    use nils_common::coordination_projection::{CoordinationMode, ReadError};
+
     use super::*;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    #[derive(Default)]
+    struct CountingLivenessIo {
+        session_reads: Cell<usize>,
+        dirty_probes: Cell<usize>,
+        age_probes: Cell<usize>,
+        age_seconds: u64,
+    }
+
+    impl liveness::LivenessIo for CountingLivenessIo {
+        fn session_coordination_mode(
+            &self,
+            _state_root: &Path,
+            _session_id: &str,
+            _incarnation: &str,
+        ) -> Result<CoordinationMode, ReadError> {
+            self.session_reads.set(self.session_reads.get() + 1);
+            Ok(CoordinationMode::Enforce)
+        }
+
+        fn checkout_dirty(&self, _path: &Path) -> Option<bool> {
+            self.dirty_probes.set(self.dirty_probes.get() + 1);
+            Some(false)
+        }
+
+        fn checkout_age(&self, _path: &Path) -> Option<u64> {
+            self.age_probes.set(self.age_probes.get() + 1);
+            Some(self.age_seconds)
+        }
+    }
+
+    struct EnvRestore(Vec<(&'static str, Option<OsString>)>);
+
+    impl Drop for EnvRestore {
+        fn drop(&mut self) {
+            for (name, value) in self.0.drain(..) {
+                set_env(name, value);
+            }
+        }
+    }
+
+    #[test]
+    fn coordination_projection_reads_session_once_and_probes_each_root_once() {
+        let _env = ENV_LOCK.lock().expect("environment lock");
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let _restore = EnvRestore(vec![
+            ("AGENT_SESSION_ID", std::env::var_os("AGENT_SESSION_ID")),
+            (
+                "AGENT_SESSION_RUNTIME_ID",
+                std::env::var_os("AGENT_SESSION_RUNTIME_ID"),
+            ),
+            (
+                "AGENT_SESSION_STATE_DIR",
+                std::env::var_os("AGENT_SESSION_STATE_DIR"),
+            ),
+            (
+                "AGENT_SESSION_COORDINATION_MODE",
+                std::env::var_os("AGENT_SESSION_COORDINATION_MODE"),
+            ),
+        ]);
+        set_env("AGENT_SESSION_ID", Some("current".into()));
+        set_env("AGENT_SESSION_RUNTIME_ID", Some("inc-current".into()));
+        set_env(
+            "AGENT_SESSION_STATE_DIR",
+            Some(temp.path().as_os_str().to_os_string()),
+        );
+        set_env("AGENT_SESSION_COORDINATION_MODE", None);
+
+        for cardinality in [1, 16, 64] {
+            let loaded = owner_policy(cardinality);
+            let mut request = owner_request(temp.path());
+            let prepared = prepare(&loaded, &request, false, &BTreeSet::new())
+                .expect("valid reason cardinality");
+            let io = CountingLivenessIo::default();
+            let decision =
+                evaluate_with_io(&loaded, &mut request, b"{}", &prepared, None, None, &io)
+                    .expect("evaluate owner rules");
+            assert_eq!(decision.reasons.len(), cardinality);
+            assert_eq!(io.session_reads.get(), 1, "rules={cardinality}");
+            assert_eq!(io.dirty_probes.get(), 1, "rules={cardinality}");
+            assert_eq!(io.age_probes.get(), 1, "rules={cardinality}");
+        }
+
+        for cardinality in [65, 512] {
+            let loaded = owner_policy(cardinality);
+            let request = owner_request(temp.path());
+            let io = CountingLivenessIo::default();
+            let error = prepare(&loaded, &request, false, &BTreeSet::new())
+                .expect_err("over-limit reasons must fail before liveness projection");
+            assert_eq!(error.code, "decision-reason-limit");
+            assert_eq!(io.session_reads.get(), 0, "rules={cardinality}");
+            assert_eq!(io.dirty_probes.get(), 0, "rules={cardinality}");
+            assert_eq!(io.age_probes.get(), 0, "rules={cardinality}");
+        }
+
+        let mut loaded = owner_policy(2);
+        for (capability, ttl) in loaded
+            .bundle
+            .rules
+            .iter_mut()
+            .map(|rule| &mut rule.capability)
+            .zip([30, 300])
+        {
+            let Capability::OwnerLiveness {
+                legacy_ttl_seconds, ..
+            } = capability
+            else {
+                panic!("owner capability");
+            };
+            *legacy_ttl_seconds = ttl;
+        }
+        let mut request = owner_request(temp.path());
+        let prepared = prepare(&loaded, &request, false, &BTreeSet::new()).expect("TTL rules");
+        let io = CountingLivenessIo {
+            age_seconds: 60,
+            ..Default::default()
+        };
+        let decision = evaluate_with_io(&loaded, &mut request, b"{}", &prepared, None, None, &io)
+            .expect("evaluate TTL rules");
+        assert_eq!(
+            decision.reasons[0].code,
+            concat!("leg", "acy-owner-stale-clean-reclaim")
+        );
+        assert_eq!(
+            decision.reasons[1].code,
+            concat!("leg", "acy-owner-unknown")
+        );
+        assert_eq!(io.session_reads.get(), 1);
+        assert_eq!(io.dirty_probes.get(), 1);
+        assert_eq!(io.age_probes.get(), 1);
+    }
+
+    fn owner_policy(cardinality: usize) -> LoadedPolicy {
+        let rules = (0..cardinality)
+            .map(|index| crate::model::PolicyRule {
+                id: format!("runtime.owner-{index}"),
+                products: vec![Product::Codex],
+                events: vec!["PreToolUse".to_string()],
+                matcher: Some("Write".to_string()),
+                priority: index as i32,
+                mode: RuleMode::Enforce,
+                failure_posture: FailurePosture::Closed,
+                override_class: crate::model::OverrideClass::Locked,
+                capability: Capability::OwnerLiveness {
+                    reason_code: format!("owner-{index}"),
+                    legacy_ttl_seconds: 300,
+                },
+            })
+            .collect();
+        LoadedPolicy {
+            config: crate::model::Config {
+                schema_version: crate::model::CONFIG_VERSION.to_string(),
+                policy: crate::model::PolicySelection {
+                    path: PathBuf::from("/policy.toml"),
+                    digest: "sha256:test".to_string(),
+                },
+                providers: BTreeMap::new(),
+                overrides: BTreeMap::new(),
+            },
+            bundle: crate::model::PolicyBundle {
+                schema_version: crate::model::POLICY_VERSION.to_string(),
+                bundle_id: "runtime-kit".to_string(),
+                version: "2026.07.20.1".to_string(),
+                rules,
+            },
+            config_digest: "sha256:config".to_string(),
+            policy_digest: "sha256:policy".to_string(),
+        }
+    }
+
+    fn owner_request(root: &Path) -> NormalizedRequest {
+        NormalizedRequest {
+            schema_version: crate::model::REQUEST_VERSION.to_string(),
+            request_id: "request".to_string(),
+            product: Product::Codex,
+            event: "PreToolUse".to_string(),
+            matcher: Some("Write".to_string()),
+            target_digest: "sha256:target".to_string(),
+            command_digest: "sha256:command".to_string(),
+            snapshot_digest: "sha256:snapshot".to_string(),
+            worktree_fingerprint: None,
+            semantic_conflict: None,
+            target_paths: vec![root.join("target.txt")],
+            execution_path: Some(root.to_path_buf()),
+            binding_roots: vec![root.to_path_buf()],
+        }
+    }
+
+    fn set_env(name: &str, value: Option<OsString>) {
+        // SAFETY: this test serializes every environment mutation under ENV_LOCK and restores it.
+        unsafe {
+            match value {
+                Some(value) => std::env::set_var(name, value),
+                None => std::env::remove_var(name),
+            }
+        }
+    }
 
     #[test]
     fn bounded_runner_drains_overflowing_stdout_and_stderr_without_deadlock() {

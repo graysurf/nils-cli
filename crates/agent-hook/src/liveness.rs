@@ -1,3 +1,5 @@
+use std::cell::RefCell;
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -14,6 +16,122 @@ use crate::paths::agent_session_state_root;
 pub struct Snapshot {
     state_root: PathBuf,
     registry: RegistryProjection,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CurrentPrincipal {
+    session_id: String,
+    incarnation: String,
+}
+
+impl CurrentPrincipal {
+    fn from_env() -> Option<Self> {
+        Some(Self {
+            session_id: std::env::var("AGENT_SESSION_ID")
+                .ok()
+                .filter(|value| !value.is_empty())?,
+            incarnation: std::env::var("AGENT_SESSION_RUNTIME_ID")
+                .ok()
+                .filter(|value| !value.is_empty())?,
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct RootInputs {
+    dirty: Option<bool>,
+    age_seconds: Option<u64>,
+}
+
+pub(crate) trait LivenessIo {
+    fn session_coordination_mode(
+        &self,
+        state_root: &Path,
+        session_id: &str,
+        incarnation: &str,
+    ) -> Result<CoordinationMode, coordination_projection::ReadError>;
+
+    fn checkout_dirty(&self, path: &Path) -> Option<bool>;
+
+    fn checkout_age(&self, path: &Path) -> Option<u64>;
+}
+
+struct SystemLivenessIo;
+
+impl LivenessIo for SystemLivenessIo {
+    fn session_coordination_mode(
+        &self,
+        state_root: &Path,
+        session_id: &str,
+        incarnation: &str,
+    ) -> Result<CoordinationMode, coordination_projection::ReadError> {
+        coordination_projection::session_coordination_mode(state_root, session_id, incarnation)
+    }
+
+    fn checkout_dirty(&self, path: &Path) -> Option<bool> {
+        checkout_dirty(path)
+    }
+
+    fn checkout_age(&self, path: &Path) -> Option<u64> {
+        fs::metadata(path)
+            .and_then(|metadata| metadata.modified())
+            .ok()
+            .and_then(|modified| SystemTime::now().duration_since(modified).ok())
+            .map(|duration| duration.as_secs())
+    }
+}
+
+static SYSTEM_LIVENESS_IO: SystemLivenessIo = SystemLivenessIo;
+
+pub(crate) fn system_io() -> &'static dyn LivenessIo {
+    &SYSTEM_LIVENESS_IO
+}
+
+pub(crate) struct DispatchProjection<'snapshot, 'io> {
+    snapshot: Option<&'snapshot Snapshot>,
+    mode: Option<CoordinationMode>,
+    now: i64,
+    principal: Option<CurrentPrincipal>,
+    roots: RefCell<BTreeMap<PathBuf, RootInputs>>,
+    io: &'io dyn LivenessIo,
+}
+
+impl<'snapshot, 'io> DispatchProjection<'snapshot, 'io> {
+    pub(crate) fn new(
+        snapshot: Option<&'snapshot Snapshot>,
+        mode_override: Option<CoordinationMode>,
+        io: &'io dyn LivenessIo,
+    ) -> Self {
+        let now = now_epoch();
+        let principal = CurrentPrincipal::from_env();
+        let mode = mode_override.or_else(|| effective_mode(snapshot, principal.as_ref(), now, io));
+        Self {
+            snapshot,
+            mode,
+            now,
+            principal,
+            roots: RefCell::new(BTreeMap::new()),
+            io,
+        }
+    }
+
+    pub(crate) fn mode(&self) -> Option<CoordinationMode> {
+        self.mode
+    }
+
+    fn root_inputs(&self, checkout: &Path) -> RootInputs {
+        if let Some(inputs) = self.roots.borrow().get(checkout).copied() {
+            return inputs;
+        }
+        let inputs = RootInputs {
+            dirty: self.io.checkout_dirty(checkout),
+            age_seconds: self.io.checkout_age(checkout),
+        };
+        self.roots
+            .borrow_mut()
+            .insert(checkout.to_path_buf(), inputs);
+        inputs
+    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -81,21 +199,20 @@ fn runtime_mode_hint() -> RuntimeModeHint {
     }
 }
 
-pub fn tolerates_coordination_failure() -> bool {
+pub fn coordination_failure_mode() -> Option<CoordinationMode> {
     let Ok(state_root) = agent_session_state_root() else {
-        return false;
+        return None;
     };
-    matches!(
-        trusted_runtime_mode(&state_root, None),
-        Some(CoordinationMode::Advisory | CoordinationMode::Off)
-    )
+    let principal = CurrentPrincipal::from_env()?;
+    trusted_runtime_mode(&state_root, None, &principal, system_io())
+        .filter(|mode| matches!(mode, CoordinationMode::Advisory | CoordinationMode::Off))
 }
 
 pub fn semantic_conflict_action(
     conflict: Option<SemanticConflict>,
-    snapshot: Option<&Snapshot>,
+    mode: Option<CoordinationMode>,
 ) -> DecisionAction {
-    match effective_mode(snapshot) {
+    match mode {
         Some(CoordinationMode::Off) => DecisionAction::Allow,
         Some(CoordinationMode::Advisory) => match conflict {
             Some(SemanticConflict::Clear) => DecisionAction::Allow,
@@ -118,27 +235,26 @@ pub fn semantic_conflict_action(
 
 pub fn derive_semantic_conflict(
     request: &NormalizedRequest,
-    snapshot: Option<&Snapshot>,
+    projection: &DispatchProjection<'_, '_>,
 ) -> SemanticConflict {
-    let Some(snapshot) = snapshot else {
+    let Some(snapshot) = projection.snapshot else {
         return SemanticConflict::Unknown;
     };
     let registry = &snapshot.registry;
-    let Some(current_session) = std::env::var("AGENT_SESSION_ID")
-        .ok()
-        .filter(|value| !value.is_empty())
+    let Some(principal) = projection.principal.as_ref() else {
+        return SemanticConflict::Unknown;
+    };
+    let now = projection.now;
+    let Some(current_broker) = broker_for_session(snapshot, &principal.session_id, now)
+        .filter(|broker| broker.incarnation == principal.incarnation)
     else {
         return SemanticConflict::Unknown;
     };
-    let now = now_epoch();
-    let Some(current_broker) = current_broker(snapshot, &current_session, now) else {
-        return SemanticConflict::Unknown;
-    };
-    if effective_mode(Some(snapshot)) == Some(CoordinationMode::Off) {
+    if projection.mode == Some(CoordinationMode::Off) {
         return SemanticConflict::Clear;
     }
     let mut own_claims = registry.claims.iter().filter(|claim| {
-        claim.session_id == current_session
+        claim.session_id == principal.session_id
             && claim.session_incarnation == current_broker.incarnation
             && claim.state == "active"
             && claim.expires_at_epoch >= now
@@ -153,7 +269,7 @@ pub fn derive_semantic_conflict(
     let mut potential = false;
     let mut incomplete = false;
     for peer in registry.claims.iter().filter(|claim| {
-        claim.session_id != current_session
+        claim.session_id != principal.session_id
             && claim.state == "active"
             && claim.expires_at_epoch >= now
     }) {
@@ -207,9 +323,9 @@ pub fn derive_semantic_conflict(
 pub fn classify(
     request: &NormalizedRequest,
     legacy_ttl_seconds: u64,
-    snapshot: Option<&Snapshot>,
+    projection: &DispatchProjection<'_, '_>,
 ) -> OwnerLiveness {
-    let mode = effective_mode(snapshot);
+    let mode = projection.mode;
     if mode == Some(CoordinationMode::Off) {
         return result(
             LivenessClass::Unclaimed,
@@ -239,10 +355,13 @@ pub fn classify(
                 )
             });
 
-        let path_outcomes = request.binding_roots.iter().map(|root| match snapshot {
-            Some(snapshot) => classify_registry_root(request, root, snapshot),
-            None => legacy_classify(root, legacy_ttl_seconds),
-        });
+        let path_outcomes = request
+            .binding_roots
+            .iter()
+            .map(|root| match projection.snapshot {
+                Some(snapshot) => classify_registry_root(request, root, snapshot, projection),
+                None => legacy_classify(root, legacy_ttl_seconds, projection.root_inputs(root)),
+            });
         strongest_outcome(potential.into_iter().chain(path_outcomes))
             .unwrap_or_else(|| unknown("owner-target-unavailable"))
     };
@@ -285,6 +404,7 @@ fn classify_registry_root(
     request: &NormalizedRequest,
     checkout: &Path,
     snapshot: &Snapshot,
+    projection: &DispatchProjection<'_, '_>,
 ) -> OwnerLiveness {
     let Some(fingerprint) = coordination_projection::worktree_fingerprint(
         snapshot.registry.fingerprint_epoch,
@@ -293,8 +413,7 @@ fn classify_registry_root(
     ) else {
         return unknown("coordination-registry-invalid");
     };
-    let now = now_epoch();
-    let current_session = std::env::var("AGENT_SESSION_ID").ok();
+    let now = projection.now;
     let mut matching = snapshot.registry.claims.iter().filter(|claim| {
         claim.state == "active"
             && claim.expires_at_epoch >= now
@@ -317,10 +436,11 @@ fn classify_registry_root(
     if matching.next().is_some() {
         return unknown("coordination-owner-ambiguous");
     }
-    let dirty = checkout_dirty(checkout);
-    let own = current_session
-        .as_deref()
-        .is_some_and(|session| session == claim.session_id);
+    let dirty = projection.root_inputs(checkout).dirty;
+    let own = projection.principal.as_ref().is_some_and(|principal| {
+        principal.session_id == claim.session_id
+            && principal.incarnation == claim.session_incarnation
+    });
     let broker = snapshot
         .registry
         .brokers
@@ -373,37 +493,35 @@ fn classify_registry_root(
     }
 }
 
-fn effective_mode(snapshot: Option<&Snapshot>) -> Option<CoordinationMode> {
+fn effective_mode(
+    snapshot: Option<&Snapshot>,
+    principal: Option<&CurrentPrincipal>,
+    now: i64,
+    io: &dyn LivenessIo,
+) -> Option<CoordinationMode> {
+    let principal = principal?;
     let state_root = snapshot
         .map(|snapshot| snapshot.state_root.clone())
         .or_else(|| agent_session_state_root().ok())?;
-    let broker = snapshot.and_then(|snapshot| {
-        let current_session = std::env::var("AGENT_SESSION_ID")
-            .ok()
-            .filter(|value| !value.is_empty())?;
-        current_broker(snapshot, &current_session, now_epoch())
-    });
-    trusted_runtime_mode(&state_root, broker)
+    let broker =
+        snapshot.and_then(|snapshot| broker_for_session(snapshot, &principal.session_id, now));
+    trusted_runtime_mode(&state_root, broker, principal, io)
 }
 
 fn trusted_runtime_mode(
     state_root: &Path,
     broker: Option<&coordination_projection::BrokerProjection>,
+    principal: &CurrentPrincipal,
+    io: &dyn LivenessIo,
 ) -> Option<CoordinationMode> {
-    let session_id = std::env::var("AGENT_SESSION_ID")
-        .ok()
-        .filter(|value| !value.is_empty())?;
-    let incarnation = std::env::var("AGENT_SESSION_RUNTIME_ID")
-        .ok()
-        .filter(|value| !value.is_empty())?;
-    if broker
-        .is_some_and(|broker| broker.session_id != session_id || broker.incarnation != incarnation)
-    {
+    if broker.is_some_and(|broker| {
+        broker.session_id != principal.session_id || broker.incarnation != principal.incarnation
+    }) {
         return None;
     }
-    let mode =
-        coordination_projection::session_coordination_mode(state_root, &session_id, &incarnation)
-            .ok()?;
+    let mode = io
+        .session_coordination_mode(state_root, &principal.session_id, &principal.incarnation)
+        .ok()?;
     if broker.is_some_and(|broker| broker.coordination_mode != mode) {
         return None;
     }
@@ -415,34 +533,26 @@ fn trusted_runtime_mode(
     Some(mode)
 }
 
-fn current_broker<'a>(
+fn broker_for_session<'a>(
     snapshot: &'a Snapshot,
-    current_session: &str,
+    session_id: &str,
     now: i64,
 ) -> Option<&'a coordination_projection::BrokerProjection> {
-    snapshot
-        .registry
-        .brokers
-        .get(current_session)
-        .filter(|broker| {
-            broker.session_id == current_session
-                && broker.state == "ready"
-                && coordination_projection::heartbeat_fresh(
-                    &snapshot.state_root,
-                    current_session,
-                    &broker.incarnation,
-                    now,
-                )
-        })
+    snapshot.registry.brokers.get(session_id).filter(|broker| {
+        broker.session_id == session_id
+            && broker.state == "ready"
+            && coordination_projection::heartbeat_fresh(
+                &snapshot.state_root,
+                session_id,
+                &broker.incarnation,
+                now,
+            )
+    })
 }
 
-fn legacy_classify(checkout: &Path, legacy_ttl_seconds: u64) -> OwnerLiveness {
-    let dirty = checkout_dirty(checkout);
-    let age = fs::metadata(checkout)
-        .and_then(|metadata| metadata.modified())
-        .ok()
-        .and_then(|modified| SystemTime::now().duration_since(modified).ok())
-        .map(|duration| duration.as_secs());
+fn legacy_classify(_checkout: &Path, legacy_ttl_seconds: u64, inputs: RootInputs) -> OwnerLiveness {
+    let dirty = inputs.dirty;
+    let age = inputs.age_seconds;
     if age.is_some_and(|age| age > legacy_ttl_seconds.min(900)) {
         stale_or_dirty(dirty, concat!("leg", "acy-owner-stale"))
     } else {

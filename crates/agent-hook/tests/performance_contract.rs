@@ -47,6 +47,19 @@ capability = {{ id = "agent-session.owner-liveness.v1", reason_code = "owner", {
     )
 }
 
+fn owner_policy_with_rules(cardinality: usize) -> String {
+    let mut policy = String::from(
+        "schema_version = \"agent-hook.policy.v1\"\nbundle_id = \"runtime-kit\"\nversion = \"2026.07.20.1\"\n",
+    );
+    for index in 0..cardinality {
+        policy.push_str(&format!(
+            "\n[[rules]]\nid = \"runtime.owner-{index}\"\nproducts = [\"codex\"]\nevents = [\"PreToolUse\"]\nmatcher = \"Write\"\npriority = {index}\nmode = \"enforce\"\nfailure_posture = \"closed\"\noverride_class = \"locked\"\ncapability = {{ id = \"agent-session.owner-liveness.v1\", reason_code = \"owner-{index}\", {} = 300 }}\n",
+            concat!("leg", "acy_ttl_seconds")
+        ));
+    }
+    policy
+}
+
 const TARGET_CARDINALITIES: [usize; 4] = [1, 16, 64, 256];
 
 #[test]
@@ -103,6 +116,70 @@ fn codex_apply_patch_resolves_each_unique_checkout_once_and_reuses_it_for_livene
         vec![(1, 1), (16, 1), (64, 1), (256, 1)],
         "target binding must perform one root lookup per unique checkout and owner-liveness must reuse it"
     );
+}
+
+#[test]
+fn coordination_rule_cardinality_bounds_expensive_liveness_io() {
+    for (cardinality, expected_exit, expected_status_probes) in
+        [(1, 1, 1), (16, 1, 1), (64, 1, 1), (65, 65, 0), (512, 65, 0)]
+    {
+        let fixture = Fixture::new(&owner_policy_with_rules(cardinality));
+        init_repository(&fixture.root);
+        let shim = fixture.root.join("status-shim");
+        fs::create_dir(&shim).expect("shim dir");
+        let log = fixture.root.join("git-status.log");
+        fs::write(&log, "").expect("status log");
+        let git = shim.join("git");
+        fs::write(
+            &git,
+            b"#!/bin/sh\ncase \" $* \" in\n  *\" status --porcelain=v1 \"*) printf 'status\\n' >> \"$AGENT_HOOK_GIT_STATUS_LOG\" ;;\nesac\nexec \"$AGENT_HOOK_REAL_GIT\" \"$@\"\n",
+        )
+        .expect("git shim");
+        fs::set_permissions(&git, fs::Permissions::from_mode(0o755)).expect("git shim mode");
+        let real_git = resolve_program("git");
+        let path = prepend_path(&shim);
+        let log_arg = log.to_string_lossy().into_owned();
+        let real_git_arg = real_git.to_string_lossy().into_owned();
+        let payload = json!({
+            "hook_event_name":"PreToolUse",
+            "tool_name":"Write",
+            "cwd":fixture.root,
+            "tool_input":{"path":fixture.root.join("target.txt")}
+        })
+        .to_string();
+        let output = fixture.run_with_env(
+            &["dispatch", "--product", "codex", "--format", "json"],
+            Some(&payload),
+            &[
+                ("PATH", path.as_str()),
+                ("AGENT_HOOK_REAL_GIT", real_git_arg.as_str()),
+                ("AGENT_HOOK_GIT_STATUS_LOG", log_arg.as_str()),
+                ("AGENT_SESSION_ID", "current"),
+                ("AGENT_SESSION_RUNTIME_ID", "inc-current"),
+            ],
+        );
+        assert_eq!(
+            output.code,
+            expected_exit,
+            "rules={cardinality} stdout={} stderr={}",
+            output.stdout_text(),
+            output.stderr_text()
+        );
+        if cardinality > 64 {
+            assert_eq!(
+                output.stdout_json()["error"]["code"],
+                "decision-reason-limit"
+            );
+        }
+        let probes = fs::read_to_string(&log)
+            .expect("status log")
+            .lines()
+            .count();
+        assert_eq!(
+            probes, expected_status_probes,
+            "rules={cardinality} must not amplify git status per selected rule"
+        );
+    }
 }
 
 #[test]

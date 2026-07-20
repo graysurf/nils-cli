@@ -71,6 +71,16 @@ impl Fixture {
         stdin: Option<&str>,
         envs: &[(&str, &str)],
     ) -> CmdOutput {
+        self.run_with_env_and_removals(args, stdin, envs, &[])
+    }
+
+    pub fn run_with_env_and_removals(
+        &self,
+        args: &[&str],
+        stdin: Option<&str>,
+        envs: &[(&str, &str)],
+        removals: &[&str],
+    ) -> CmdOutput {
         let options = CmdOptions::new()
             .with_cwd(&self.root)
             .with_env_remove("CODEX_HOME")
@@ -88,6 +98,9 @@ impl Fixture {
                 self.session_state.to_str().expect("session state UTF-8"),
             )
             .with_envs(envs);
+        let options = removals
+            .iter()
+            .fold(options, |options, name| options.with_env_remove(name));
         let options = if let Some(stdin) = stdin {
             options.with_stdin_str(stdin)
         } else {

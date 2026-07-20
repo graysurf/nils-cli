@@ -372,6 +372,92 @@ fn registry_liveness_requires_private_incarnation_bound_nonfuture_heartbeat() {
 }
 
 #[test]
+fn matching_session_id_requires_exact_runtime_incarnation_for_self_ownership() {
+    let fixture = Fixture::new(&owner_policy());
+    let target = fixture.root.join("incarnation-owned-checkout");
+    fs::create_dir_all(&target).expect("target");
+    let now = now_epoch();
+    let key = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    write_registry(
+        &fixture,
+        key,
+        json!({
+            "current": {
+                "session_id":"current",
+                "incarnation":"inc-current",
+                "state":"ready",
+                "heartbeat_epoch":now
+            }
+        }),
+        json!([{
+            "schema_version":"agent-session.work-context.v1",
+            "session_id":"current",
+            "session_incarnation":"inc-current",
+            "state":"active",
+            "worktrees":[fingerprint(key, 1, &target)],
+            "repositories":["owner/repo"],
+            "provider_refs":[],
+            "scopes":[],
+            "expires_at_epoch":now+300
+        }]),
+    );
+    let heartbeat = heartbeat_path(&fixture, "current");
+    fs::create_dir_all(heartbeat.parent().expect("heartbeat parent")).expect("heartbeat dir");
+    fs::write(&heartbeat, format!("inc-current:{now}\n")).expect("heartbeat");
+    Fixture::set_private(&heartbeat);
+    let payload = json!({
+        "hook_event_name":"PreToolUse",
+        "tool_name":"Write",
+        "cwd":target,
+        "tool_input":{"path":target.join("file.txt")}
+    })
+    .to_string();
+
+    let exact = fixture.run_with_env(
+        &["dispatch", "--product", "codex", "--format", "json"],
+        Some(&payload),
+        &[
+            ("AGENT_SESSION_ID", "current"),
+            ("AGENT_SESSION_RUNTIME_ID", "inc-current"),
+        ],
+    );
+    assert_eq!(exact.code, 0, "stderr={}", exact.stderr_text());
+    assert_eq!(exact.stdout_json()["data"]["action"], "allow");
+    assert_eq!(
+        exact.stdout_json()["data"]["reasons"][0]["code"],
+        "owner-active-self"
+    );
+
+    let missing = fixture.run_with_env_and_removals(
+        &["dispatch", "--product", "codex", "--format", "json"],
+        Some(&payload),
+        &[("AGENT_SESSION_ID", "current")],
+        &["AGENT_SESSION_RUNTIME_ID"],
+    );
+    assert_eq!(missing.code, 1, "stderr={}", missing.stderr_text());
+    assert_eq!(missing.stdout_json()["data"]["action"], "block");
+    assert_eq!(
+        missing.stdout_json()["data"]["reasons"][0]["code"],
+        "owner-active-foreign"
+    );
+
+    let mismatched = fixture.run_with_env(
+        &["dispatch", "--product", "codex", "--format", "json"],
+        Some(&payload),
+        &[
+            ("AGENT_SESSION_ID", "current"),
+            ("AGENT_SESSION_RUNTIME_ID", "inc-other"),
+        ],
+    );
+    assert_eq!(mismatched.code, 1, "stderr={}", mismatched.stderr_text());
+    assert_eq!(mismatched.stdout_json()["data"]["action"], "block");
+    assert_eq!(
+        mismatched.stdout_json()["data"]["reasons"][0]["code"],
+        "owner-active-foreign"
+    );
+}
+
+#[test]
 fn fresh_sidecar_heartbeat_outweighs_an_old_registry_projection_timestamp() {
     let fixture = Fixture::new(&owner_policy());
     let target = fixture.root.join("long-running-checkout");

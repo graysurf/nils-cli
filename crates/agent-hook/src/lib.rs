@@ -325,26 +325,32 @@ fn run_dispatch(
         }
         Err(error) => return emit_dispatch_error(args.format, &error, Some(&request)),
     };
-    let coordination =
-        if evaluator::needs_coordination(&loaded, &request, args.shadow, &grant.rules) {
-            match liveness::load_snapshot() {
-                Ok(snapshot) => snapshot,
-                Err(_) if liveness::tolerates_coordination_failure() => None,
-                Err(error) => return emit_dispatch_error(args.format, &error, Some(&request)),
-            }
-        } else {
-            None
-        };
-    request.semantic_conflict = coordination
-        .as_ref()
-        .map(|snapshot| liveness::derive_semantic_conflict(&request, Some(snapshot)));
+    let prepared = match evaluator::prepare(&loaded, &request, args.shadow, &grant.rules) {
+        Ok(prepared) => prepared,
+        Err(error) => return emit_dispatch_error(args.format, &error, Some(&request)),
+    };
+    let mut coordination_mode_override = None;
+    let coordination = if prepared.needs_coordination() {
+        match liveness::load_snapshot() {
+            Ok(snapshot) => snapshot,
+            Err(error) => match liveness::coordination_failure_mode() {
+                Some(mode) => {
+                    coordination_mode_override = Some(mode);
+                    None
+                }
+                None => return emit_dispatch_error(args.format, &error, Some(&request)),
+            },
+        }
+    } else {
+        None
+    };
     let decision = match evaluator::evaluate(
         &loaded,
-        &request,
+        &mut request,
         &raw,
-        args.shadow,
-        &grant.rules,
+        &prepared,
         coordination.as_ref(),
+        coordination_mode_override,
     ) {
         Ok(decision) => decision,
         Err(error) => return emit_dispatch_error(args.format, &error, Some(&request)),
