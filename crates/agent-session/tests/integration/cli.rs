@@ -1774,6 +1774,419 @@ trust_level = "trusted"
 }
 
 #[test]
+fn codex_repair_rehomes_trust_table_outside_runtime_kit_hook_markers() {
+    let runtime_kit_end = "# <<< agent-runtime-kit:hooks <<<";
+    let runtime_kit_block = r#"# >>> agent-runtime-kit:hooks >>>
+[[hooks.PreToolUse]]
+
+[[hooks.PreToolUse.hooks]]
+type = "command"
+command = "runtime-kit-pre-tool"
+timeout = 5
+# <<< agent-runtime-kit:hooks <<<"#;
+    for (name, trust_tables) in [
+        (
+            "projects-only",
+            r#"[projects."/foreign/project"]
+trust_level = "trusted"
+"#,
+        ),
+        (
+            "hooks-state-only",
+            r#"[hooks.state]
+
+[hooks.state."config.toml:stop:1:0"]
+trusted_hash = "sha256:trusted"
+"#,
+        ),
+        (
+            "hooks-state-before-projects",
+            r#"[hooks.state]
+
+[hooks.state."config.toml:stop:1:0"]
+trusted_hash = "sha256:trusted"
+
+[projects."/foreign/project"]
+trust_level = "trusted"
+"#,
+        ),
+    ] {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let home = tmp.path().join("home");
+        fs::create_dir_all(home.join(".codex")).expect("codex dir");
+        let config_path = home.join(".codex/config.toml");
+        fs::write(&config_path, format!("{runtime_kit_block}\n")).expect("inline config");
+        let home_arg = home.to_string_lossy().to_string();
+        let envs = [("HOME", home_arg.as_str())];
+
+        let initial = run(
+            tmp.path(),
+            &[
+                "activity", "setup", "--agent", "codex", "--apply", "--format", "json",
+            ],
+            &envs,
+        );
+        assert_eq!(
+            initial.code,
+            0,
+            "case={name} stderr={}",
+            initial.stderr_text()
+        );
+
+        let converged = fs::read_to_string(&config_path).expect("converged config");
+        let misplaced = format!("\n{trust_tables}{runtime_kit_end}");
+        let trust_saved = converged.replacen(runtime_kit_end, &misplaced, 1);
+        assert_ne!(trust_saved, converged, "case={name}");
+        let trust_start = trust_saved.find(trust_tables).expect("trust tables");
+        let trust_boundary = trust_saved[..trust_start]
+            .rfind('\n')
+            .expect("blank line before trust tables");
+        let marker_start = trust_saved.find(runtime_kit_end).expect("runtime-kit end");
+        let marker_line_end = marker_start
+            + runtime_kit_end.len()
+            + usize::from(trust_saved[marker_start + runtime_kit_end.len()..].starts_with('\n'));
+        let expected = format!(
+            "{}{}{}{}",
+            &trust_saved[..trust_boundary],
+            &trust_saved[marker_start..marker_line_end],
+            &trust_saved[trust_boundary..marker_start],
+            &trust_saved[marker_line_end..]
+        );
+        fs::write(&config_path, &trust_saved).expect("Codex trust-saved config");
+
+        let preview = run(
+            tmp.path(),
+            &[
+                "activity",
+                "setup",
+                "--agent",
+                "codex",
+                "--repair",
+                "--dry-run",
+                "--format",
+                "json",
+            ],
+            &envs,
+        );
+        assert_eq!(
+            preview.code,
+            0,
+            "case={name} stderr={}",
+            preview.stderr_text()
+        );
+        let preview_json = preview.stdout_json();
+        let preview_result = data(&preview_json);
+        assert_eq!(preview_result["configured"], true, "case={name}");
+        assert_eq!(preview_result["would_change"], true, "case={name}");
+        assert_eq!(
+            fs::read_to_string(&config_path).expect("dry-run config"),
+            trust_saved,
+            "case={name}: preview must not mutate the trust-saved config"
+        );
+        let preview_digest = preview_result["preview_digest"]
+            .as_str()
+            .expect("preview digest")
+            .to_string();
+
+        let repair = run(
+            tmp.path(),
+            &[
+                "activity",
+                "setup",
+                "--agent",
+                "codex",
+                "--repair",
+                "--expected-preview-digest",
+                &preview_digest,
+                "--format",
+                "json",
+            ],
+            &envs,
+        );
+        assert_eq!(
+            repair.code,
+            0,
+            "case={name} stderr={}",
+            repair.stderr_text()
+        );
+        assert_eq!(
+            fs::read_to_string(&config_path).expect("repaired config"),
+            expected,
+            "case={name}: repair must only move the runtime-kit closing marker"
+        );
+        assert!(
+            expected.contains(runtime_kit_block),
+            "case={name}: runtime-kit must observe its canonical managed block"
+        );
+
+        let steady = run(
+            tmp.path(),
+            &[
+                "activity",
+                "setup",
+                "--agent",
+                "codex",
+                "--repair",
+                "--dry-run",
+                "--format",
+                "json",
+            ],
+            &envs,
+        );
+        assert_eq!(
+            steady.code,
+            0,
+            "case={name} stderr={}",
+            steady.stderr_text()
+        );
+        assert_eq!(
+            data(&steady.stdout_json())["would_change"],
+            false,
+            "case={name}"
+        );
+    }
+}
+
+#[test]
+fn codex_repair_rejects_noncanonical_trust_table_headers_before_writes() {
+    for trust_tables in [
+        "[\"projects\".\"/foreign/project\"]\ntrust_level = \"trusted\"\n",
+        "[\"hooks\" . \"state\"]\n\n[\"hooks\" . \"state\" . \"config.toml:stop:1:0\"]\ntrusted_hash = \"sha256:trusted\"\n",
+    ] {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let home = tmp.path().join("home");
+        fs::create_dir_all(home.join(".codex")).expect("codex dir");
+        let config_path = home.join(".codex/config.toml");
+        let runtime_end = "# <<< agent-runtime-kit:hooks <<<";
+        fs::write(
+            &config_path,
+            format!(
+                "# >>> agent-runtime-kit:hooks >>>\n[[hooks.PreToolUse]]\n\n[[hooks.PreToolUse.hooks]]\ntype = \"command\"\ncommand = \"runtime-kit-pre-tool\"\ntimeout = 5\n{runtime_end}\n"
+            ),
+        )
+        .expect("runtime-kit config");
+        let home_arg = home.to_string_lossy().to_string();
+        let envs = [("HOME", home_arg.as_str())];
+        let setup = run(
+            tmp.path(),
+            &[
+                "activity", "setup", "--agent", "codex", "--apply", "--format", "json",
+            ],
+            &envs,
+        );
+        assert_eq!(setup.code, 0, "stderr={}", setup.stderr_text());
+
+        let converged = fs::read_to_string(&config_path).expect("converged config");
+        let trust_saved =
+            converged.replacen(runtime_end, &format!("\n{trust_tables}{runtime_end}"), 1);
+        fs::write(&config_path, &trust_saved).expect("trust-saved config");
+        let preview = run(
+            tmp.path(),
+            &[
+                "activity",
+                "setup",
+                "--agent",
+                "codex",
+                "--repair",
+                "--dry-run",
+                "--format",
+                "json",
+            ],
+            &envs,
+        );
+        assert_ne!(preview.code, 0);
+        assert_eq!(
+            preview.stdout_json()["error"]["code"],
+            "provider-config-invalid"
+        );
+        assert_eq!(
+            fs::read_to_string(&config_path).expect("unchanged config"),
+            trust_saved
+        );
+    }
+}
+
+#[test]
+fn codex_repair_rejects_non_trust_suffix_inside_runtime_kit_hook_markers() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let home = tmp.path().join("home");
+    fs::create_dir_all(home.join(".codex")).expect("codex dir");
+    let config_path = home.join(".codex/config.toml");
+    let runtime_end = "# <<< agent-runtime-kit:hooks <<<";
+    let initial = format!(
+        "# >>> agent-runtime-kit:hooks >>>\n[[hooks.PreToolUse]]\n\n[[hooks.PreToolUse.hooks]]\ntype = \"command\"\ncommand = \"runtime-kit-pre-tool\"\ntimeout = 5\n{runtime_end}\n"
+    );
+    fs::write(&config_path, initial).expect("runtime-kit config");
+    let home_arg = home.to_string_lossy().to_string();
+    let envs = [("HOME", home_arg.as_str())];
+    let setup = run(
+        tmp.path(),
+        &[
+            "activity", "setup", "--agent", "codex", "--apply", "--format", "json",
+        ],
+        &envs,
+    );
+    assert_eq!(setup.code, 0, "stderr={}", setup.stderr_text());
+
+    let converged = fs::read_to_string(&config_path).expect("converged config");
+    let unsafe_suffix = r#"
+[hooks.state]
+
+[hooks.state."config.toml:stop:1:0"]
+trusted_hash = "sha256:trusted"
+
+[[hooks.Stop]]
+
+[[hooks.Stop.hooks]]
+type = "command"
+command = "runtime-kit-stop"
+timeout = 5
+"#;
+    let ambiguous = converged.replacen(runtime_end, &format!("{unsafe_suffix}{runtime_end}"), 1);
+    fs::write(&config_path, &ambiguous).expect("ambiguous trust suffix");
+
+    let preview = run(
+        tmp.path(),
+        &[
+            "activity",
+            "setup",
+            "--agent",
+            "codex",
+            "--repair",
+            "--dry-run",
+            "--format",
+            "json",
+        ],
+        &envs,
+    );
+    assert_ne!(preview.code, 0);
+    assert_eq!(
+        preview.stdout_json()["error"]["code"],
+        "provider-config-invalid"
+    );
+    assert_eq!(
+        fs::read_to_string(&config_path).expect("unchanged config"),
+        ambiguous
+    );
+}
+
+#[test]
+fn codex_trust_boundary_migration_requires_repair_preview_for_mutating_actions() {
+    for action in ["--apply", "--remove"] {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let home = tmp.path().join("home");
+        fs::create_dir_all(home.join(".codex")).expect("codex dir");
+        let config_path = home.join(".codex/config.toml");
+        let runtime_end = "# <<< agent-runtime-kit:hooks <<<";
+        fs::write(
+            &config_path,
+            format!(
+                "# >>> agent-runtime-kit:hooks >>>\n[[hooks.PreToolUse]]\n\n[[hooks.PreToolUse.hooks]]\ntype = \"command\"\ncommand = \"runtime-kit-pre-tool\"\ntimeout = 5\n{runtime_end}\n"
+            ),
+        )
+        .expect("runtime-kit config");
+        let home_arg = home.to_string_lossy().to_string();
+        let envs = [("HOME", home_arg.as_str())];
+        let setup = run(
+            tmp.path(),
+            &[
+                "activity", "setup", "--agent", "codex", "--apply", "--format", "json",
+            ],
+            &envs,
+        );
+        assert_eq!(setup.code, 0, "stderr={}", setup.stderr_text());
+
+        let converged = fs::read_to_string(&config_path).expect("converged config");
+        let trust_saved = converged.replacen(
+            runtime_end,
+            &format!("\n[projects.\"/foreign/project\"]\ntrust_level = \"trusted\"\n{runtime_end}"),
+            1,
+        );
+        fs::write(&config_path, &trust_saved).expect("trust-saved config");
+
+        let mutation = run(
+            tmp.path(),
+            &[
+                "activity", "setup", "--agent", "codex", action, "--format", "json",
+            ],
+            &envs,
+        );
+        assert_ne!(
+            mutation.code,
+            0,
+            "action={action} json={:?} stderr={}",
+            mutation.stdout_json(),
+            mutation.stderr_text()
+        );
+        assert_eq!(
+            mutation.stdout_json()["error"]["code"],
+            "provider-config-repair-preview-required",
+            "action={action}"
+        );
+        assert_eq!(
+            fs::read_to_string(&config_path).expect("unchanged config"),
+            trust_saved,
+            "action={action}"
+        );
+    }
+}
+
+#[test]
+fn codex_repair_rejects_ambiguous_runtime_kit_hook_markers_before_writes() {
+    let runtime_start = "# >>> agent-runtime-kit:hooks >>>";
+    let runtime_end = "# <<< agent-runtime-kit:hooks <<<";
+    for (name, marker_layout) in [
+        ("orphan-start", format!("{runtime_start}\n")),
+        ("orphan-end", format!("{runtime_end}\n")),
+        (
+            "duplicate-start",
+            format!("{runtime_start}\n{runtime_start}\n{runtime_end}\n"),
+        ),
+        (
+            "duplicate-end",
+            format!("{runtime_start}\n{runtime_end}\n{runtime_end}\n"),
+        ),
+        ("reversed", format!("{runtime_end}\n{runtime_start}\n")),
+    ] {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let home = tmp.path().join("home");
+        fs::create_dir_all(home.join(".codex")).expect("codex dir");
+        let config_path = home.join(".codex/config.toml");
+        let invalid = format!(
+            "{marker_layout}[hooks.state]\n\n[hooks.state.\"config.toml:stop:1:0\"]\ntrusted_hash = \"sha256:trusted\"\n"
+        );
+        fs::write(&config_path, &invalid).expect("ambiguous runtime-kit config");
+        let home_arg = home.to_string_lossy().to_string();
+        let envs = [("HOME", home_arg.as_str())];
+
+        for (action, dry_run) in [("preview", true), ("apply", false)] {
+            let mut args = vec!["activity", "setup", "--agent", "codex", "--repair"];
+            if dry_run {
+                args.push("--dry-run");
+            } else {
+                args.extend([
+                    "--expected-preview-digest",
+                    "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+                ]);
+            }
+            args.extend(["--format", "json"]);
+            let repair = run(tmp.path(), &args, &envs);
+            assert_ne!(repair.code, 0, "case={name} action={action}");
+            assert_eq!(
+                repair.stdout_json()["error"]["code"],
+                "provider-config-invalid",
+                "case={name} action={action}"
+            );
+            assert_eq!(
+                fs::read_to_string(&config_path).expect("unchanged invalid config"),
+                invalid,
+                "case={name} action={action}"
+            );
+        }
+    }
+}
+
+#[test]
 fn codex_repair_rehomes_owned_block_that_overlaps_foreign_markers() {
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let home = tmp.path().join("home");
