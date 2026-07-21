@@ -91,14 +91,131 @@ fn codex_and_claude_record_the_same_shadow_decision_for_equivalent_input() {
 }
 
 #[test]
-fn capability_cannot_be_enabled_before_the_cutover_contract_changes() {
+fn enforce_accepts_a_valid_same_release_read_only_descriptor() {
     let policy = POLICY.replace("mode = \"shadow\"", "mode = \"enforce\"");
-    let output = Fixture::new(&policy).run(&["validate", "--format", "json"], None);
+    let fixture = Fixture::new(&policy);
+    let producer = nils_test_support::bin::resolve("agent-docs")
+        .canonicalize()
+        .expect("canonical agent-docs binary");
+    let command = format!(
+        "builtin command {} --docs-home {} --project-path {} preflight --intent project-dev --format json",
+        producer.display(),
+        fixture.root.display(),
+        fixture.root.display()
+    );
+    let payload = serde_json::json!({
+        "hook_event_name": "PreToolUse",
+        "tool_name": "Bash",
+        "cwd": fixture.root,
+        "tool_input": {"command": command}
+    })
+    .to_string();
+    let output = fixture.run(
+        &["dispatch", "--product", "codex", "--format", "json"],
+        Some(&payload),
+    );
+
+    assert_eq!(
+        output.code,
+        0,
+        "stdout={} stderr={}",
+        output.stdout_text(),
+        output.stderr_text()
+    );
+    assert_eq!(output.stdout_json()["data"]["action"], "allow");
+    assert_eq!(
+        output.stdout_json()["data"]["reasons"],
+        serde_json::json!([{
+            "rule_id": "runtime.read-only",
+            "code": "read-only-capability",
+            "disposition": "allow"
+        }])
+    );
+    assert!(output.stdout_json()["data"]["shadow"].is_null());
+}
+
+#[test]
+fn enforce_rejects_unsupported_and_same_release_mutation_descriptors() {
+    let policy = POLICY.replace("mode = \"shadow\"", "mode = \"enforce\"");
+    let fixture = Fixture::new(&policy);
+    let producer = nils_test_support::bin::resolve("agent-docs")
+        .canonicalize()
+        .expect("canonical agent-docs binary");
+    let mutation = format!(
+        "builtin command {} --docs-home {} --project-path {} init --force",
+        producer.display(),
+        fixture.root.display(),
+        fixture.root.display()
+    );
+    for (command, expected_code) in [
+        (
+            "echo not-a-trusted-producer",
+            "read-only-command-unsupported",
+        ),
+        (mutation.as_str(), "read-only-effect-rejected"),
+    ] {
+        let payload = serde_json::json!({
+            "hook_event_name": "PreToolUse",
+            "tool_name": "Bash",
+            "cwd": fixture.root,
+            "tool_input": {"command": command}
+        })
+        .to_string();
+        let output = fixture.run(
+            &["dispatch", "--product", "claude", "--format", "json"],
+            Some(&payload),
+        );
+
+        assert_eq!(
+            output.code,
+            1,
+            "command={command}; stderr={}",
+            output.stderr_text()
+        );
+        assert_eq!(output.stdout_json()["data"]["action"], "block");
+        assert_eq!(
+            output.stdout_json()["data"]["reasons"][0]["code"],
+            expected_code,
+            "command={command}"
+        );
+        assert!(output.stdout_json()["data"]["shadow"].is_null());
+    }
+}
+
+#[test]
+fn enforce_read_only_rules_share_the_dispatch_child_budget() {
+    let rules = (0..17)
+        .map(|index| {
+            POLICY
+                .replace("runtime.read-only", &format!("runtime.read-only-{index}"))
+                .replace("priority = 10", &format!("priority = {index}"))
+                .replace("mode = \"shadow\"", "mode = \"enforce\"")
+                .replace(
+                    "schema_version = \"agent-hook.policy.v1\"\nbundle_id = \"runtime-kit\"\nversion = \"2026.07.20.1\"\n\n",
+                    "",
+                )
+        })
+        .collect::<String>();
+    let policy = format!(
+        "schema_version = \"agent-hook.policy.v1\"\nbundle_id = \"runtime-kit\"\nversion = \"2026.07.20.1\"\n\n{rules}"
+    );
+    let fixture = Fixture::new(&policy);
+    let payload = serde_json::json!({
+        "hook_event_name": "PreToolUse",
+        "tool_name": "Bash",
+        "cwd": fixture.root,
+        "tool_input": {"command": "echo unsupported"}
+    })
+    .to_string();
+    let output = fixture.run(
+        &["dispatch", "--product", "codex", "--format", "json"],
+        Some(&payload),
+    );
 
     assert_eq!(output.code, 65, "stderr={}", output.stderr_text());
     assert_eq!(
         output.stdout_json()["error"]["code"],
-        "read-only-capability-not-shadow"
+        "dispatch-child-budget-exceeded"
     );
 }
 
