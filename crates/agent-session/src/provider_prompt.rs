@@ -61,6 +61,7 @@ pub(crate) struct LastPrompt {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ProviderLastPromptRefresh {
     Current(Option<LastPrompt>),
+    Pending,
     Invalidated,
 }
 
@@ -86,6 +87,21 @@ pub(crate) struct ProviderPromptSource {
     path: PathBuf,
 }
 
+impl ProviderPromptSource {
+    #[cfg(test)]
+    pub(crate) fn test_path(
+        provider: ProviderKind,
+        session_id: impl Into<String>,
+        path: PathBuf,
+    ) -> Self {
+        Self {
+            provider,
+            session_id: session_id.into(),
+            path,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct FileIdentity {
     device: u64,
@@ -108,7 +124,7 @@ pub(crate) struct ProviderPromptTail {
 #[derive(Debug)]
 struct ProviderPromptPoll {
     events: Vec<ProviderPromptEvent>,
-    advanced: usize,
+    caught_up: bool,
     invalidated: bool,
 }
 
@@ -199,7 +215,7 @@ impl ProviderPromptTail {
         if self.disabled {
             return Ok(ProviderPromptPoll {
                 events: Vec::new(),
-                advanced: 0,
+                caught_up: false,
                 invalidated: true,
             });
         }
@@ -218,7 +234,7 @@ impl ProviderPromptTail {
             }
             return Ok(ProviderPromptPoll {
                 events: Vec::new(),
-                advanced: 0,
+                caught_up: false,
                 invalidated: true,
             });
         }
@@ -228,12 +244,10 @@ impl ProviderPromptTail {
             .unwrap_or(usize::MAX)
             .min(MAX_PROVIDER_READ_BYTES);
         let mut events = Vec::new();
-        let mut advanced = 0;
         if read_len > 0 {
             file.seek(SeekFrom::Start(self.offset))?;
             let mut bytes = vec![0u8; read_len];
             let read = file.read(&mut bytes)?;
-            advanced = read;
             self.offset = self.offset.saturating_add(read as u64);
             update_continuity(&mut self.continuity, &bytes[..read]);
             self.consume(&bytes[..read], &mut events);
@@ -244,7 +258,7 @@ impl ProviderPromptTail {
         }
         Ok(ProviderPromptPoll {
             events,
-            advanced,
+            caught_up: self.offset >= metadata.len(),
             invalidated: false,
         })
     }
@@ -392,6 +406,7 @@ impl ProviderLastPromptTracker {
     }
 
     pub(crate) fn refresh(&mut self) -> ProviderLastPromptRefresh {
+        let mut caught_up = false;
         for _ in 0..MAX_LAST_PROMPT_INCREMENTAL_POLLS {
             let Ok(status) = self.tail.poll_status() else {
                 return ProviderLastPromptRefresh::Invalidated;
@@ -407,9 +422,38 @@ impl ProviderLastPromptTracker {
                     truncated: event.truncated,
                 });
             }
-            if status.advanced < MAX_PROVIDER_READ_BYTES {
+            caught_up = status.caught_up;
+            if caught_up {
                 break;
             }
+        }
+        if caught_up {
+            ProviderLastPromptRefresh::Current(self.last_prompt.clone())
+        } else {
+            ProviderLastPromptRefresh::Pending
+        }
+    }
+
+    /// Return the cached prompt only when a bounded metadata/continuity check
+    /// proves that the append tail is still at the current end of the same
+    /// transcript. Expensive recovery and parsing stay outside request paths.
+    pub(crate) fn cached_refresh(&self) -> ProviderLastPromptRefresh {
+        if self.tail.disabled {
+            return ProviderLastPromptRefresh::Invalidated;
+        }
+        let Ok((mut file, metadata)) = open_regular_file(&self.tail.source.path) else {
+            return ProviderLastPromptRefresh::Invalidated;
+        };
+        let identity = file_identity(&metadata);
+        let continuous = identity == self.tail.identity
+            && metadata.len() >= self.tail.offset
+            && continuity_matches(&mut file, self.tail.offset, &self.tail.continuity)
+                .unwrap_or(false);
+        if !continuous {
+            return ProviderLastPromptRefresh::Invalidated;
+        }
+        if metadata.len() > self.tail.offset {
+            return ProviderLastPromptRefresh::Pending;
         }
         ProviderLastPromptRefresh::Current(self.last_prompt.clone())
     }
@@ -1524,7 +1568,7 @@ mod tests {
     }
 
     #[test]
-    fn last_prompt_tracker_consumes_appends_without_recovering_again() {
+    fn last_prompt_tracker_omits_stale_prompt_while_catching_up_appends() {
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let transcript = tmp.path().join("codex.jsonl");
         fs::write(&transcript, codex_line("cold prompt")).expect("write prompt");
@@ -1541,10 +1585,19 @@ mod tests {
                 if text == "cold prompt"
         ));
 
-        append(&transcript, codex_line("appended prompt").as_bytes());
         append(
             &transcript,
             format!("{}\n", " ".repeat(1024 * 1024)).as_bytes(),
+        );
+        append(&transcript, codex_line("appended prompt").as_bytes());
+        let first_refresh = tracker.refresh();
+        assert!(
+            !matches!(
+                first_refresh,
+                ProviderLastPromptRefresh::Current(Some(LastPrompt { ref text, .. }))
+                    if text == "cold prompt"
+            ),
+            "a tracker with known unread backlog must not expose its stale cached prompt"
         );
         assert!(matches!(
             tracker.refresh(),

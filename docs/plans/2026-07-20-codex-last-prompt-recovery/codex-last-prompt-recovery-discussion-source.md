@@ -4,8 +4,8 @@
 
 Implement the fix in `nils-cli`'s `agent-session` daemon. Keep the Agent Console
 UI and wire contract unchanged. For sessions with an exact provider transcript
-identity, recover the latest prompt from a bounded cold window and then track
-appended provider events incrementally in memory.
+identity, recover the latest prompt from a bounded cold window in the
+background and then track appended provider events incrementally in memory.
 
 ## Evidence
 
@@ -34,9 +34,14 @@ appended provider events incrementally in memory.
 ## Required behavior
 
 1. Recover a resolvable Codex prompt when it is outside the legacy 256 KiB tail but inside a 64 MiB bound.
-2. Open the append tail before cold recovery, then consume appended records
-   incrementally so prompts written during or after recovery are not lost.
-3. Retain only the latest bounded prompt in process memory and expose it only in the authenticated response.
+2. Open the append tail before background cold recovery, then consume appended
+   records incrementally so prompts written during or after recovery are not
+   lost. Cold recovery must be single-flight, concurrency-bounded, and outside
+   the synchronous `GET /sessions` response path.
+3. Retain only the latest bounded prompt in process memory and expose it only
+   through the intentionally open trusted-loopback `GET /sessions` response.
+   Omit `last_prompt` while recovery or known backlog catch-up is pending rather
+   than returning a known stale cached prompt.
 4. Clear or rebuild state when the transcript source changes, truncates, rotates, or becomes invalid.
 5. Continue omitting sessions that lack exact provider resume identity.
 6. Do not alter the Agent Console API schema or mobile card rendering.
