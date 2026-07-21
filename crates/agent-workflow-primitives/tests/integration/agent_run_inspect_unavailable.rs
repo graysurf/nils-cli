@@ -25,7 +25,7 @@ fn inspect_fails_closed_with_actionable_macos_diagnostic() {
     assert_eq!(output.stdout_text(), "");
     assert_eq!(
         output.stderr_text(),
-        "agent-run inspect: error[sandbox-backend-unavailable]: strict OS-enforced inspection is unavailable on macOS; prepare project-dev for the exact target and retry\n"
+        "agent-run inspect: error[sandbox-backend-unavailable]: strict OS-enforced inspection is unavailable on macOS; use project-dev preparation for the exact target instead\n"
     );
 }
 
@@ -54,7 +54,7 @@ fn operation_effect_reports_typed_macos_unavailability_without_descriptor() {
     assert_eq!(value["error"]["code"], "sandbox-backend-unavailable");
     assert_eq!(
         value["error"]["message"],
-        "strict OS-enforced inspection is unavailable on macOS; prepare project-dev for the exact target and retry"
+        "strict OS-enforced inspection is unavailable on macOS; use project-dev preparation for the exact target instead"
     );
     assert!(value.get("data").is_none());
 }
