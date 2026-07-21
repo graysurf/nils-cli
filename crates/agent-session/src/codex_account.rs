@@ -340,6 +340,7 @@ pub(crate) fn prepare_control_reconnect(
     let _lock = acquire_session_record_lock(context, id)?;
     let mut record = load_session_record(context, id)?;
     ensure_runtime(&record, expected_launch_id)?;
+    let mut changed = false;
     match decode_binding(&record) {
         DecodedBinding::Absent => {}
         DecodedBinding::Valid(DurableBinding { state, .. })
@@ -350,12 +351,22 @@ pub(crate) fn prepare_control_reconnect(
             binding.failure_reason = None;
             binding.updated_at = jiff::Timestamp::now().to_string();
             store_binding(&mut record, &binding)?;
-            record.updated_at = jiff::Timestamp::now().to_string();
-            write_session_record(context, &record)?;
+            changed = true;
         }
         // Preserve malformed state. Input remains fail-closed and the explicit
         // switch path is the only operation allowed to replace it.
         DecodedBinding::Invalid => {}
+    }
+    if matches!(
+        decode_next(&record),
+        DecodedNext::Valid(DurableNextAccount { ref state, .. }) if state == "applying"
+    ) {
+        recover_next_after_restart(&mut record)?;
+        changed = true;
+    }
+    if changed {
+        record.updated_at = jiff::Timestamp::now().to_string();
+        write_session_record(context, &record)?;
     }
     Ok(record)
 }
@@ -573,6 +584,10 @@ pub(crate) fn begin_switch_binding(
         Some(prior) => prior.revision.saturating_add(1).max(1),
         None => 1,
     };
+    // An immediate switch is authoritative over any queued, applying, failed,
+    // or malformed next intent. Clear it under the same record lock before
+    // publishing the pending binding so stale workers cannot win later.
+    clear_next(&mut record);
     store_binding(
         &mut record,
         &DurableBinding {
@@ -679,11 +694,6 @@ pub(crate) fn pending_next_apply(
         }
         DecodedNext::Valid(_) => Ok(None),
     }
-}
-
-/// True when a live or malformed next intent must fence the next prompt.
-pub(crate) fn has_pending_next(record: &SessionRecord) -> bool {
-    !matches!(decode_next(record), DecodedNext::Absent)
 }
 
 /// Queue a durable next-account intent while a turn is working. Selecting the
@@ -796,8 +806,8 @@ pub(crate) fn begin_next_apply(
     let mut next = match decode_next(&record) {
         DecodedNext::Absent => return Ok(None),
         DecodedNext::Invalid => return Err(invalid_next_error(&record)),
-        DecodedNext::Valid(next) if next.state == "failed" => return Ok(None),
-        DecodedNext::Valid(next) => next,
+        DecodedNext::Valid(next) if next.state == "queued" => next,
+        DecodedNext::Valid(_) => return Ok(None),
     };
     next.state = "applying".to_string();
     next.applying_runtime_id = Some(expected_launch_id.to_string());
@@ -1703,6 +1713,25 @@ wait "$child"
         load_session_record(context, id).unwrap()
     }
 
+    fn mark_waiting(context: &CliContext, record: &SessionRecord) {
+        for (event_id, kind) in [
+            ("next-account-turn-started", "turn_started"),
+            ("next-account-turn-completed", "turn_completed"),
+        ] {
+            let event = serde_json::from_value(json!({
+                "schema_version": crate::activity::TURN_EVENT_VERSION,
+                "event_id": event_id,
+                "runtime_id": "runtime-binding-fixture",
+                "provider": "codex",
+                "provider_turn_id": "turn-next-account",
+                "kind": kind,
+                "confidence": "authoritative"
+            }))
+            .unwrap();
+            crate::activity::ingest_event(context, &record.id, event).unwrap();
+        }
+    }
+
     #[test]
     fn next_intent_projection_is_absent_by_default() {
         let lock = GlobalStateLock::new();
@@ -1910,6 +1939,91 @@ wait "$child"
             pending_next_apply(&current).unwrap(),
             Some(("poies".to_string(), 1)),
             "a recovered intent is drainable again"
+        );
+    }
+
+    #[test]
+    fn control_reconnect_persists_in_flight_next_recovery() {
+        let lock = GlobalStateLock::new();
+        let _broker = EnvGuard::set(&lock, BROKER_ENV, r#"["/configured/broker"]"#);
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (context, record) = persisted_bound(&tmp);
+        queue_next_account(&context, &record.id, "runtime-binding-fixture", "poies").unwrap();
+        begin_next_apply(&context, &record.id, "runtime-binding-fixture").unwrap();
+
+        let prepared =
+            prepare_control_reconnect(&context, &record.id, "runtime-binding-fixture").unwrap();
+        assert_eq!(
+            view_for_record(&prepared)
+                .next
+                .expect("recovered next intent")
+                .state,
+            "queued"
+        );
+        let persisted = reload(&context, &record.id);
+        assert_eq!(
+            pending_next_apply(&persisted).unwrap(),
+            Some(("poies".to_string(), 1)),
+            "daemon reconnect must persist a drainable recovered intent"
+        );
+    }
+
+    #[test]
+    fn immediate_switch_supersedes_an_applying_next_intent() {
+        let lock = GlobalStateLock::new();
+        let _broker = EnvGuard::set(&lock, BROKER_ENV, r#"["/configured/broker"]"#);
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (context, record) = persisted_bound(&tmp);
+        queue_next_account(&context, &record.id, "runtime-binding-fixture", "poies").unwrap();
+        begin_next_apply(&context, &record.id, "runtime-binding-fixture").unwrap();
+        mark_waiting(&context, &record);
+
+        begin_switch_binding(&context, &record.id, "runtime-binding-fixture", "gamania").unwrap();
+        let current = reload(&context, &record.id);
+        assert!(
+            view_for_record(&current).next.is_none(),
+            "selecting the applied account supersedes an in-flight next intent"
+        );
+        assert_eq!(
+            finish_next_apply(
+                &context,
+                &record.id,
+                "runtime-binding-fixture",
+                "poies",
+                1,
+                Ok(()),
+            )
+            .unwrap_err()
+            .code(),
+            "codex-account-next-superseded"
+        );
+    }
+
+    #[test]
+    fn immediate_switch_clears_a_failed_next_intent() {
+        let lock = GlobalStateLock::new();
+        let _broker = EnvGuard::set(&lock, BROKER_ENV, r#"["/configured/broker"]"#);
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (context, record) = persisted_bound(&tmp);
+        queue_next_account(&context, &record.id, "runtime-binding-fixture", "poies").unwrap();
+        begin_next_apply(&context, &record.id, "runtime-binding-fixture").unwrap();
+        finish_next_apply(
+            &context,
+            &record.id,
+            "runtime-binding-fixture",
+            "poies",
+            1,
+            Err("refresh_failed"),
+        )
+        .unwrap();
+        mark_waiting(&context, &record);
+
+        begin_switch_binding(&context, &record.id, "runtime-binding-fixture", "gamania").unwrap();
+        assert!(
+            view_for_record(&reload(&context, &record.id))
+                .next
+                .is_none(),
+            "retrying the applied account explicitly repairs failed next state"
         );
     }
 

@@ -1896,12 +1896,10 @@ async fn apply_pending_next_account(
         {
             return None;
         }
-        if !crate::codex_account::has_pending_next(&current)
-            || !matches!(
-                crate::codex_account::pending_next_apply(&current),
-                Ok(Some(_))
-            )
-        {
+        if !matches!(
+            crate::codex_account::pending_next_apply(&current),
+            Ok(Some(_))
+        ) {
             return None;
         }
         crate::activity::state_for_view(&idle_context, &current).map(|state| state.phase)
@@ -2207,8 +2205,6 @@ pub(crate) async fn run_control(
         wake_from_open_usage(&context, &record, &initial_usage).await?;
     }
 
-    let mut next_apply_interval = tokio::time::interval(Duration::from_secs(1));
-    next_apply_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         tokio::select! {
             command = commands.recv() => {
@@ -2376,15 +2372,6 @@ pub(crate) async fn run_control(
                     continue;
                 }
                 process_live_message(&context, &record, &mut reducer, None, &value).await?;
-            }
-            _ = next_apply_interval.tick() => {
-                if let Some(applied) = apply_pending_next_account(
-                    &mut websocket, &context, &record, &mut request_id,
-                )
-                .await
-                {
-                    external_auth_account = Some(applied);
-                }
             }
         }
     }

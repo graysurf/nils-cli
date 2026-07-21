@@ -4739,7 +4739,10 @@ async fn codex_control_loop(state: Arc<ServeState>) {
                     .map(|entry| entry.handle.clone())
             });
             if let Some(handle) = running_handle {
-                if crate::codex_account::has_pending_next(&record) {
+                if matches!(
+                    crate::codex_account::pending_next_apply(&record),
+                    Ok(Some(_))
+                ) {
                     let _ = handle.apply_next().await;
                 }
                 continue;
