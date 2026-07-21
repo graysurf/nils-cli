@@ -38,7 +38,7 @@ jobs:
         include:
           - runs_on: ubuntu-latest
             target: x86_64-unknown-linux-gnu
-          - runs_on: ubuntu-latest
+          - runs_on: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
           - runs_on: macos-14
             target: x86_64-apple-darwin
@@ -88,19 +88,8 @@ jobs:
           bash scripts/generate-third-party-artifacts.sh --write
           bash scripts/generate-third-party-artifacts.sh --check
 
-      - name: Install cross
-        if: matrix.target == 'aarch64-unknown-linux-gnu'
-        uses: taiki-e/install-action@v2
-        with:
-          tool: cross
-
       - name: Build (release)
-        if: matrix.target != 'aarch64-unknown-linux-gnu'
         run: cargo build --release --workspace --locked --target ${{ matrix.target }}
-
-      - name: Build (release, cross)
-        if: matrix.target == 'aarch64-unknown-linux-gnu'
-        run: cross build --release --workspace --locked --target ${{ matrix.target }}
 
       - name: Package
         shell: bash
