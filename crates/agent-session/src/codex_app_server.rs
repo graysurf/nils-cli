@@ -1696,6 +1696,11 @@ pub(crate) enum ControlCommand {
         revision: u64,
         response: oneshot::Sender<Result<crate::codex_account::CodexAccountView, String>>,
     },
+    /// Drain and apply a queued next-account intent if the turn is idle. Used by
+    /// the periodic idle-boundary drive; a no-op when nothing is drainable.
+    ApplyNext {
+        response: oneshot::Sender<Result<(), String>>,
+    },
 }
 
 impl ControlHandle {
@@ -1772,11 +1777,69 @@ impl ControlHandle {
         .await
         .map_err(|_| "Codex account binding timed out".to_string())?
     }
+
+    pub(crate) async fn apply_next(&self) -> Result<(), String> {
+        let (response, receive) = oneshot::channel();
+        tokio::time::timeout(CONTROL_SUBMIT_TOTAL_TIMEOUT, async {
+            self.sender
+                .send(ControlCommand::ApplyNext { response })
+                .await
+                .map_err(|_| "codex control connection unavailable".to_string())?;
+            receive
+                .await
+                .map_err(|_| "codex control connection closed".to_string())?
+        })
+        .await
+        .map_err(|_| "Codex next-account apply timed out".to_string())?
+    }
 }
 
 pub(crate) fn control_channel() -> (ControlHandle, mpsc::Receiver<ControlCommand>) {
     let (sender, receive) = mpsc::channel(4);
     (ControlHandle { sender }, receive)
+}
+
+/// Resolve credentials and drive the app-server external-auth login for
+/// `account`. Mutates only the live app-server; never touches durable binding
+/// or next-intent state. Returns a fail-closed reason code on failure.
+async fn drive_external_auth_login(
+    websocket: &mut tokio_tungstenite::WebSocketStream<UnixStream>,
+    request_id: &mut u64,
+    account: &str,
+) -> Result<(), &'static str> {
+    let resolve_account = account.to_string();
+    let credentials = tokio::task::spawn_blocking(move || {
+        crate::codex_account::resolve_account(&resolve_account, false)
+    })
+    .await
+    .map_err(|_| "broker_failed")?
+    .map_err(|_| "broker_failed")?;
+
+    *request_id = request_id.saturating_add(1);
+    if send_json(
+        websocket,
+        external_auth_login_request(
+            *request_id,
+            &credentials.access_token,
+            &credentials.chatgpt_account_id,
+            credentials.chatgpt_plan_type.as_deref(),
+        ),
+    )
+    .await
+    .is_err()
+    {
+        return Err("apply_failed");
+    }
+    let result =
+        receive_response_with_timeout(websocket, *request_id, None, None, CONTROL_RESPONSE_TIMEOUT)
+            .await;
+    if !result
+        .as_ref()
+        .is_ok_and(|result| result.get("type").and_then(Value::as_str) == Some("chatgptAuthTokens"))
+    {
+        return Err("apply_failed");
+    }
+    Ok(())
 }
 
 async fn apply_account_binding(
@@ -1792,72 +1855,97 @@ async fn apply_account_binding(
         .as_ref()
         .map(|runtime| runtime.launch_id.clone())
         .ok_or_else(|| "Codex runtime identity is missing".to_string())?;
-    let resolve_account = account.to_string();
-    let credentials = tokio::task::spawn_blocking(move || {
-        crate::codex_account::resolve_account(&resolve_account, false)
+    match drive_external_auth_login(websocket, request_id, account).await {
+        Ok(()) => {
+            finish_account_binding(context, record, &launch_id, account, revision, Ok(())).await
+        }
+        Err(reason) => {
+            let _ =
+                finish_account_binding(context, record, &launch_id, account, revision, Err(reason))
+                    .await;
+            Err(format!("Codex external-auth login failed: {reason}"))
+        }
+    }
+}
+
+/// At the idle boundary, apply a queued next-account intent before the next
+/// prompt: transition it to `applying`, drive the app-server login, and record
+/// success (which flips the applied binding and clears the intent) or failure
+/// (which marks the intent failed and keeps the prompt fenced). Returns the
+/// account now applied to the live runtime, if it changed.
+async fn apply_pending_next_account(
+    websocket: &mut tokio_tungstenite::WebSocketStream<UnixStream>,
+    context: &CliContext,
+    record: &SessionRecord,
+    request_id: &mut u64,
+) -> Option<String> {
+    let launch_id = record
+        .runtime
+        .as_ref()
+        .map(|runtime| runtime.launch_id.clone())?;
+    // Only drain while the turn is authoritatively idle.
+    let idle_context = context.clone();
+    let idle_id = record.id.clone();
+    let idle_launch = launch_id.clone();
+    let idle = tokio::task::spawn_blocking(move || {
+        let current = crate::load_session_record(&idle_context, &idle_id).ok()?;
+        if current
+            .runtime
+            .as_ref()
+            .is_none_or(|runtime| runtime.launch_id != idle_launch)
+        {
+            return None;
+        }
+        if !matches!(
+            crate::codex_account::pending_next_apply(&current),
+            Ok(Some(_))
+        ) {
+            return None;
+        }
+        crate::activity::state_for_view(&idle_context, &current).map(|state| state.phase)
     })
     .await
-    .map_err(|_| "Codex account broker worker failed".to_string())?;
-    let credentials = match credentials {
-        Ok(credentials) => credentials,
-        Err(_) => {
-            let _ = finish_account_binding(
-                context,
-                record,
-                &launch_id,
-                account,
-                revision,
-                Err("broker_failed"),
-            )
-            .await;
-            return Err("Codex account broker failed".to_string());
-        }
+    .ok()
+    .flatten();
+    if idle != Some(crate::activity::TurnPhase::Waiting) {
+        return None;
+    }
+
+    let begin_context = context.clone();
+    let begin_id = record.id.clone();
+    let begin_launch = launch_id.clone();
+    let queued = tokio::task::spawn_blocking(move || {
+        crate::codex_account::begin_next_apply(&begin_context, &begin_id, &begin_launch)
+    })
+    .await
+    .ok()?;
+    let (account, revision) = match queued {
+        Ok(Some(pair)) => pair,
+        Ok(None) => return None,
+        Err(_) => return None, // malformed intent stays fenced for explicit repair
     };
 
-    *request_id = request_id.saturating_add(1);
-    if let Err(error) = send_json(
-        websocket,
-        external_auth_login_request(
-            *request_id,
-            &credentials.access_token,
-            &credentials.chatgpt_account_id,
-            credentials.chatgpt_plan_type.as_deref(),
-        ),
-    )
-    .await
-    {
-        let _ = finish_account_binding(
-            context,
-            record,
-            &launch_id,
-            account,
+    let outcome = drive_external_auth_login(websocket, request_id, &account).await;
+    let succeeded = outcome.is_ok();
+    let finish_context = context.clone();
+    let finish_id = record.id.clone();
+    let finish_launch = launch_id.clone();
+    let finish_account = account.clone();
+    let finished = tokio::task::spawn_blocking(move || {
+        crate::codex_account::finish_next_apply(
+            &finish_context,
+            &finish_id,
+            &finish_launch,
+            &finish_account,
             revision,
-            Err("apply_failed"),
+            outcome,
         )
-        .await;
-        return Err(error);
+    })
+    .await;
+    match finished {
+        Ok(Ok(_)) if succeeded => Some(account),
+        _ => None,
     }
-    let result =
-        receive_response_with_timeout(websocket, *request_id, None, None, CONTROL_RESPONSE_TIMEOUT)
-            .await;
-    if !result
-        .as_ref()
-        .is_ok_and(|result| result.get("type").and_then(Value::as_str) == Some("chatgptAuthTokens"))
-    {
-        let _ = finish_account_binding(
-            context,
-            record,
-            &launch_id,
-            account,
-            revision,
-            Err("apply_failed"),
-        )
-        .await;
-        return Err(result
-            .err()
-            .unwrap_or_else(|| "Codex external-auth response was malformed".to_string()));
-    }
-    finish_account_binding(context, record, &launch_id, account, revision, Ok(())).await
 }
 
 async fn finish_account_binding(
@@ -2022,6 +2110,11 @@ pub(crate) async fn run_control(
                 }
                 ControlCommand::Prompt { response, .. }
                 | ControlCommand::Continue { response, .. } => {
+                    let _ = response.send(Err(
+                        "Codex account binding is not ready; retry the account switch".to_string(),
+                    ));
+                }
+                ControlCommand::ApplyNext { response } => {
                     let _ = response.send(Err(
                         "Codex account binding is not ready; retry the account switch".to_string(),
                     ));
@@ -2252,6 +2345,16 @@ pub(crate) async fn run_control(
                             external_auth_account = Some(account);
                         }
                         let _ = response.send(result);
+                    }
+                    ControlCommand::ApplyNext { response } => {
+                        if let Some(applied) = apply_pending_next_account(
+                            &mut websocket, &context, &record, &mut request_id,
+                        )
+                        .await
+                        {
+                            external_auth_account = Some(applied);
+                        }
+                        let _ = response.send(Ok(()));
                     }
                 }
             }
@@ -7145,6 +7248,140 @@ printf '%s\n' '{"schema_version":"agent-session.codex-auth-broker.v1","account":
         let view = crate::codex_account::view_for_record(&persisted);
         assert_eq!(view.state, "bound");
         assert_eq!(view.selected_account.as_deref(), Some("gamania"));
+        drop(handle);
+        control.abort();
+        let _ = control.await;
+    }
+
+    #[tokio::test]
+    async fn apply_next_drains_a_queued_account_at_the_idle_boundary() {
+        let lock = GlobalStateLock::new();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let broker = tmp.path().join("broker");
+        fs::write(
+            &broker,
+            r#"#!/bin/sh
+account=""
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --account)
+      account="$2"
+      shift 2
+      ;;
+    *)
+      shift
+      ;;
+  esac
+done
+case "$account" in
+  gamania|sym) ;;
+  *) exit 2 ;;
+esac
+printf '%s\n' "{\"schema_version\":\"agent-session.codex-auth-broker.v1\",\"account\":\"$account\",\"access_token\":\"token-$account\",\"chatgpt_account_id\":\"workspace-$account\",\"plan\":\"team\"}"
+"#,
+        )
+        .unwrap();
+        fs::set_permissions(&broker, fs::Permissions::from_mode(0o700)).unwrap();
+        let _broker = EnvGuard::set(
+            &lock,
+            "AGENT_SESSION_CODEX_ACCOUNT_BROKER",
+            &serde_json::to_string(&vec![broker.to_string_lossy().into_owned()]).unwrap(),
+        );
+        let socket_path = tmp.path().join("apply-next.sock");
+        let listener = tokio::net::UnixListener::bind(&socket_path).unwrap();
+        let context = CliContext {
+            state_dir: tmp.path().join("state"),
+            host: None,
+        };
+        let mut record = record_with_runtime("apply-next", &socket_path);
+        crate::codex_account::set_initial_binding(&mut record, Some("gamania")).unwrap();
+        fs::create_dir_all(crate::session_dir(&context, &record.id)).unwrap();
+        crate::write_session_record(&context, &record).unwrap();
+        crate::activity::activate_runtime(&context, &record).unwrap();
+        let turn_started = serde_json::from_value(json!({
+            "schema_version": crate::activity::TURN_EVENT_VERSION,
+            "event_id": "apply-next-turn-start",
+            "runtime_id": "runtime-apply-next",
+            "provider": "codex",
+            "provider_turn_id": "turn-apply-next",
+            "kind": "turn_started",
+            "confidence": "authoritative"
+        }))
+        .unwrap();
+        crate::activity::ingest_event(&context, &record.id, turn_started).unwrap();
+        bind_thread(&record, "raw-thread-apply-next").unwrap();
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let initialize = receive_json(&mut socket).await;
+            respond(&mut socket, &initialize, json!({})).await;
+            assert_eq!(receive_json(&mut socket).await["method"], "initialized");
+            let first_login = receive_json(&mut socket).await;
+            assert_eq!(first_login["method"], "account/login/start");
+            assert_eq!(first_login["params"]["accessToken"], "token-gamania");
+            respond(
+                &mut socket,
+                &first_login,
+                json!({ "type": "chatgptAuthTokens" }),
+            )
+            .await;
+            let loaded = receive_json(&mut socket).await;
+            assert_eq!(loaded["method"], "thread/loaded/list");
+            respond(
+                &mut socket,
+                &loaded,
+                json!({ "data": ["raw-thread-apply-next"], "nextCursor": null }),
+            )
+            .await;
+            let resume = receive_json(&mut socket).await;
+            assert_eq!(resume["method"], "thread/resume");
+            respond(&mut socket, &resume, json!({})).await;
+            for _ in 0..2 {
+                let usage = receive_json(&mut socket).await;
+                assert_eq!(usage["method"], "account/rateLimits/read");
+                respond(
+                    &mut socket,
+                    &usage,
+                    json!({ "rateLimits": { "primary": { "usedPercent": 1 } } }),
+                )
+                .await;
+            }
+            let next_login = receive_json(&mut socket).await;
+            assert_eq!(next_login["method"], "account/login/start");
+            assert_eq!(next_login["params"]["accessToken"], "token-sym");
+            assert_eq!(next_login["params"]["chatgptAccountId"], "workspace-sym");
+            respond(
+                &mut socket,
+                &next_login,
+                json!({ "type": "chatgptAuthTokens" }),
+            )
+            .await;
+        });
+
+        let (handle, commands) = control_channel();
+        let control = tokio::spawn(run_control(context.clone(), record.clone(), commands));
+        assert!(handle.usage().await.unwrap().authoritative);
+        crate::codex_account::queue_next_account(&context, &record.id, "runtime-apply-next", "sym")
+            .unwrap();
+        let turn_completed = serde_json::from_value(json!({
+            "schema_version": crate::activity::TURN_EVENT_VERSION,
+            "event_id": "apply-next-turn-completed",
+            "runtime_id": "runtime-apply-next",
+            "provider": "codex",
+            "provider_turn_id": "turn-apply-next",
+            "kind": "turn_completed",
+            "confidence": "authoritative"
+        }))
+        .unwrap();
+        crate::activity::ingest_event(&context, &record.id, turn_completed).unwrap();
+
+        handle.apply_next().await.unwrap();
+        server.await.unwrap();
+        let persisted = crate::load_session_record(&context, &record.id).unwrap();
+        let view = crate::codex_account::view_for_record(&persisted);
+        assert_eq!(view.selected_account.as_deref(), Some("sym"));
+        assert!(view.next.is_none());
         drop(handle);
         control.abort();
         let _ = control.await;
