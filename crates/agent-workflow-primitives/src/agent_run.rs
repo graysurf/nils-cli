@@ -47,7 +47,7 @@ mod inspect {
 
     fn unsupported() -> InspectError {
         let message = if cfg!(target_os = "macos") {
-            "strict OS-enforced inspection is unavailable on macOS; prepare project-dev for the exact target and retry"
+            "strict OS-enforced inspection is unavailable on macOS; use project-dev preparation for the exact target instead"
         } else {
             "agent-run inspect is not supported on this operating system"
         };
