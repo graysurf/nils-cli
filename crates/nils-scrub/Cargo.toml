@@ -1,6 +1,6 @@
 [package]
 name = "nils-scrub"
-version = "1.25.7"
+version = "1.25.8"
 edition.workspace = true
 license.workspace = true
 
