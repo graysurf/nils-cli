@@ -277,6 +277,7 @@ fn validate_policy(bundle: &PolicyBundle, config: &Config) -> Result<(), HookErr
             ));
         }
     }
+    validate_read_only_fallbacks(bundle)?;
     for (rule_id, override_value) in &config.overrides {
         let rule = bundle
             .rules
@@ -304,6 +305,71 @@ fn validate_policy(bundle: &PolicyBundle, config: &Config) -> Result<(), HookErr
                 ));
             }
             OverrideClass::DowngradeOnly | OverrideClass::Free => {}
+        }
+    }
+    Ok(())
+}
+
+fn validate_read_only_fallbacks(bundle: &PolicyBundle) -> Result<(), HookError> {
+    let mut bindings = BTreeSet::new();
+    for rule in &bundle.rules {
+        let Capability::ExecutionReadOnly {
+            fallback_handler_id: Some(handler_id),
+            ..
+        } = &rule.capability
+        else {
+            continue;
+        };
+        if handler_id != "pre-edit-intent-gate" {
+            return Err(HookError::data(
+                "read-only-fallback-handler-unsupported",
+                "execution.read-only.v1 may fall back only to pre-edit-intent-gate",
+            ));
+        }
+        if !matches!(rule.mode, RuleMode::Enforce)
+            || !matches!(rule.failure_posture, FailurePosture::Closed)
+            || !matches!(rule.override_class, OverrideClass::Locked)
+        {
+            return Err(HookError::data(
+                "read-only-fallback-rule-not-locked",
+                "read-only fallback rules must be enforce, fail closed, and locked",
+            ));
+        }
+        for product in &rule.products {
+            for event in &rule.events {
+                let binding = (*product, event.clone(), rule.matcher.clone());
+                if !bindings.insert(binding) {
+                    return Err(HookError::data(
+                        "read-only-fallback-binding-ambiguous",
+                        "one read-only fallback rule may select each product, event, and matcher",
+                    ));
+                }
+                let pair_count = bundle
+                    .rules
+                    .iter()
+                    .filter(|candidate| {
+                        candidate.products.contains(product)
+                            && candidate.events.contains(event)
+                            && candidate.matcher == rule.matcher
+                            && candidate.priority > rule.priority
+                            && matches!(candidate.mode, RuleMode::Enforce)
+                            && matches!(candidate.failure_posture, FailurePosture::Closed)
+                            && matches!(candidate.override_class, OverrideClass::Locked)
+                            && matches!(
+                                &candidate.capability,
+                                Capability::RuntimeKitHandler {
+                                    handler_id: candidate_handler_id
+                                } if candidate_handler_id == handler_id
+                            )
+                    })
+                    .count();
+                if pair_count != 1 {
+                    return Err(HookError::data(
+                        "read-only-fallback-pair-invalid",
+                        "read-only fallback requires exactly one later locked handler for each binding",
+                    ));
+                }
+            }
         }
     }
     Ok(())
@@ -420,8 +486,19 @@ fn validate_capability(capability: &Capability) -> Result<(), HookError> {
         Capability::Allow { reason_code }
         | Capability::SessionActivity { reason_code }
         | Capability::SemanticConflict { reason_code }
-        | Capability::SessionCoordination { reason_code }
-        | Capability::ExecutionReadOnly { reason_code } => validate_id("reason code", reason_code),
+        | Capability::SessionCoordination { reason_code } => {
+            validate_id("reason code", reason_code)
+        }
+        Capability::ExecutionReadOnly {
+            reason_code,
+            fallback_handler_id,
+        } => {
+            validate_id("reason code", reason_code)?;
+            if let Some(handler_id) = fallback_handler_id {
+                validate_id("fallback handler id", handler_id)?;
+            }
+            Ok(())
+        }
         Capability::Warn {
             reason_code,
             message,
