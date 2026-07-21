@@ -183,7 +183,11 @@ pub enum Capability {
     #[serde(rename = "agent-session.coordination.v1")]
     SessionCoordination { reason_code: String },
     #[serde(rename = "execution.read-only.v1")]
-    ExecutionReadOnly { reason_code: String },
+    ExecutionReadOnly {
+        reason_code: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        fallback_handler_id: Option<String>,
+    },
     #[serde(rename = "runtime-kit.handler.v1")]
     RuntimeKitHandler { handler_id: String },
 }

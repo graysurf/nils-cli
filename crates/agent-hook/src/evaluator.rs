@@ -286,6 +286,7 @@ fn evaluate_with_io(
     let mut shadow = Vec::new();
     let mut recovery_applied = false;
     let mut execution_budgets = ExecutionBudgets::new();
+    let mut read_only_bypassed_rule_ids = BTreeSet::new();
     for prepared_rule in &prepared.rules {
         let rule = prepared_rule.rule;
         if prepared_rule.mode == RuleMode::Shadow {
@@ -317,6 +318,51 @@ fn evaluate_with_io(
             continue;
         }
         if matches!(rule.capability, Capability::SessionCoordination { .. }) {
+            continue;
+        }
+        if let Capability::ExecutionReadOnly {
+            reason_code,
+            fallback_handler_id: Some(handler_id),
+        } = &rule.capability
+        {
+            let outcome =
+                evaluate_read_only(request, raw, &mut execution_budgets.enforced, reason_code);
+            if outcome.action == DecisionAction::Allow {
+                let paired_rule = prepared
+                    .rules
+                    .iter()
+                    .find(|candidate| {
+                        candidate.mode == RuleMode::Enforce
+                            && candidate.rule.priority > rule.priority
+                            && candidate.rule.matcher == rule.matcher
+                            && matches!(
+                                &candidate.rule.capability,
+                                Capability::RuntimeKitHandler {
+                                    handler_id: candidate_handler_id
+                                } if candidate_handler_id == handler_id
+                            )
+                    })
+                    .expect("validated read-only fallback pair must be selected");
+                read_only_bypassed_rule_ids.insert(paired_rule.rule.id.clone());
+                enforced.push((rule.id.clone(), outcome));
+            } else {
+                enforced.push((
+                    rule.id.clone(),
+                    simple(
+                        DecisionAction::Allow,
+                        &format!("{}:project-dev-fallback", outcome.code),
+                    ),
+                ));
+            }
+            continue;
+        }
+        if matches!(rule.capability, Capability::RuntimeKitHandler { .. })
+            && read_only_bypassed_rule_ids.contains(&rule.id)
+        {
+            enforced.push((
+                rule.id.clone(),
+                simple(DecisionAction::Allow, "read-only-capability-bypass"),
+            ));
             continue;
         }
         let outcome = match evaluate_capability(
@@ -351,7 +397,7 @@ fn evaluate_shadow(
         Capability::Transform { reason_code, .. } => simple(DecisionAction::Transform, reason_code),
         Capability::SemanticConflict { reason_code } => simple(DecisionAction::Warn, reason_code),
         Capability::OwnerLiveness { reason_code, .. } => simple(DecisionAction::Warn, reason_code),
-        Capability::ExecutionReadOnly { reason_code } => {
+        Capability::ExecutionReadOnly { reason_code, .. } => {
             evaluate_read_only(request, raw, execution_budget, reason_code)
         }
         Capability::SessionActivity { .. }
@@ -451,7 +497,7 @@ fn evaluate_capability(
         Capability::SessionCoordination { .. } => {
             unreachable!("session coordination is evaluated after aggregate policy")
         }
-        Capability::ExecutionReadOnly { reason_code } => {
+        Capability::ExecutionReadOnly { reason_code, .. } => {
             evaluate_read_only(request, raw, execution_budget, reason_code)
         }
         Capability::RuntimeKitHandler { handler_id } => {

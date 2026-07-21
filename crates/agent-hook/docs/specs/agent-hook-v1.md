@@ -216,7 +216,7 @@ The stable built-in capability ID set for policy v1 is closed:
   `legacy_ttl_seconds`, maximum 900)
 - `agent-session.semantic-conflict.v1` (`reason_code`)
 - `agent-session.coordination.v1` (`reason_code`)
-- `execution.read-only.v1` (`reason_code`)
+- `execution.read-only.v1` (`reason_code`, optional `fallback_handler_id`)
 - `runtime-kit.handler.v1` (`handler_id` from the compiled v1 allowlist)
 
 `execution.read-only.v1` evaluates only `PreToolUse` requests through the
@@ -225,6 +225,16 @@ fresh descriptor whose producer, cwd, target, argv, provider effect, and
 OS-enforcement contract verify; missing, malformed, unsupported, mismatched,
 or mutation evidence blocks. Shadow mode runs the same verification but records
 only the redacted observation and cannot change admission.
+
+An enforce rule may set `fallback_handler_id = "pre-edit-intent-gate"` only
+when it is fail-closed and locked and each product/event/matcher binding has
+exactly one later-priority enforce, fail-closed, locked
+`runtime-kit.handler.v1` rule for that handler. A verified read-only operation
+then bypasses only that paired rule; every other selected rule still evaluates.
+Missing, malformed, unsupported, mismatched, or mutation evidence falls through
+to the paired project-development handler instead of creating an aggregate
+block. The paired handler's native result remains authoritative. No other
+handler ID or shadow/downgradable pairing is valid.
 
 `runtime-kit.handler.v1` is not arbitrary execution. The binary maps the
 handler ID through a compiled allowlist to one exact runtime-kit-owned handler
