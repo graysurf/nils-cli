@@ -385,8 +385,48 @@ fn fallback_policy_rejects_unsafe_or_missing_project_dev_pairs() {
 }
 
 #[test]
-fn enforce_read_only_rules_share_the_dispatch_child_budget() {
+fn seventeen_enforced_read_only_rules_fit_the_dispatch_child_budget() {
     let rules = (0..17)
+        .map(|index| {
+            POLICY
+                .replace("runtime.read-only", &format!("runtime.read-only-{index}"))
+                .replace("priority = 10", &format!("priority = {index}"))
+                .replace("mode = \"shadow\"", "mode = \"enforce\"")
+                .replace(
+                    "schema_version = \"agent-hook.policy.v1\"\nbundle_id = \"runtime-kit\"\nversion = \"2026.07.20.1\"\n\n",
+                    "",
+                )
+        })
+        .collect::<String>();
+    let policy = format!(
+        "schema_version = \"agent-hook.policy.v1\"\nbundle_id = \"runtime-kit\"\nversion = \"2026.07.20.1\"\n\n{rules}"
+    );
+    let fixture = Fixture::new(&policy);
+    let payload = serde_json::json!({
+        "hook_event_name": "PreToolUse",
+        "tool_name": "Bash",
+        "cwd": fixture.root,
+        "tool_input": {"command": "echo unsupported"}
+    })
+    .to_string();
+    let output = fixture.run(
+        &["dispatch", "--product", "codex", "--format", "json"],
+        Some(&payload),
+    );
+
+    assert_eq!(output.code, 1, "stderr={}", output.stderr_text());
+    assert_eq!(output.stdout_json()["data"]["action"], "block");
+    assert_eq!(
+        output.stdout_json()["data"]["reasons"]
+            .as_array()
+            .map(Vec::len),
+        Some(17)
+    );
+}
+
+#[test]
+fn eighteen_enforced_read_only_rules_exceed_the_dispatch_child_budget() {
+    let rules = (0..18)
         .map(|index| {
             POLICY
                 .replace("runtime.read-only", &format!("runtime.read-only-{index}"))

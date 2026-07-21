@@ -24,7 +24,7 @@ const MAX_AGGREGATE_CONTEXT: usize = 16 * 1024;
 const MAX_REASONS: usize = 64;
 const MAX_HANDLER_OUTPUT: usize = 256 * 1024;
 const HANDLER_TIMEOUT: Duration = Duration::from_secs(5);
-const MAX_EXECUTABLE_CAPABILITIES: usize = 16;
+const MAX_EXECUTABLE_CAPABILITIES: usize = 17;
 const MAX_DISPATCH_CHILD_OUTPUT: usize = 512 * 1024;
 const DISPATCH_CHILD_DEADLINE: Duration = Duration::from_secs(2);
 const SESSION_COORDINATION_HANDLER: &str = "session-coordination-guard.py";
@@ -92,7 +92,7 @@ impl ExecutionBudget {
         if self.children >= MAX_EXECUTABLE_CAPABILITIES {
             return Err(HookError::data(
                 "dispatch-child-budget-exceeded",
-                "dispatch executable capability count exceeds 16",
+                "dispatch executable capability count exceeds 17",
             ));
         }
         self.children += 1;
@@ -211,7 +211,7 @@ pub fn prepare<'a>(
     if executable_count > MAX_EXECUTABLE_CAPABILITIES {
         return Err(HookError::data(
             "dispatch-child-budget-exceeded",
-            "dispatch executable capability count exceeds 16",
+            "dispatch executable capability count exceeds 17",
         ));
     }
 

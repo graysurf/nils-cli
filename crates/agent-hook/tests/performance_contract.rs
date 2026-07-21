@@ -406,7 +406,7 @@ fn executable_capabilities_share_one_cardinality_and_deadline_budget() {
     );
     let starts = fs::read_to_string(&log).unwrap_or_default().lines().count();
     assert!(
-        starts <= 16,
+        starts <= 17,
         "started {starts} children after the dispatch budget"
     );
 }
