@@ -27,7 +27,7 @@ version = "2026.07.21.1"
 
 [[rules]]
 id = "runtime.read-only"
-products = ["codex"]
+products = ["codex", "claude"]
 events = ["PreToolUse"]
 matcher = "Bash"
 priority = 10
@@ -37,8 +37,19 @@ override_class = "locked"
 capability = { id = "execution.read-only.v1", reason_code = "read-only-capability", fallback_handler_id = "pre-edit-intent-gate" }
 
 [[rules]]
-id = "runtime.pre-edit"
+id = "runtime.codex.pre-edit"
 products = ["codex"]
+events = ["PreToolUse"]
+matcher = "Bash"
+priority = 20
+mode = "enforce"
+failure_posture = "closed"
+override_class = "locked"
+capability = { id = "runtime-kit.handler.v1", handler_id = "pre-edit-intent-gate" }
+
+[[rules]]
+id = "runtime.claude.pre-edit"
+products = ["claude"]
 events = ["PreToolUse"]
 matcher = "Bash"
 priority = 20
@@ -51,7 +62,7 @@ capability = { id = "runtime-kit.handler.v1", handler_id = "pre-edit-intent-gate
 const UNRELATED_HANDLER_RULE: &str = r#"
 [[rules]]
 id = "runtime.checkout-lease"
-products = ["codex"]
+products = ["codex", "claude"]
 events = ["PreToolUse"]
 matcher = "Bash"
 priority = 30
@@ -62,30 +73,34 @@ capability = { id = "runtime-kit.handler.v1", handler_id = "checkout-lease-guard
 "#;
 
 fn install_fallback_handler(fixture: &Fixture) {
-    let hooks = fixture.home.join(".codex/hooks");
-    fs::create_dir_all(&hooks).expect("hooks");
-    let handler = hooks.join("pre-edit-intent-gate.py");
-    fs::write(
-        &handler,
-        r#"#!/bin/sh
+    for hooks in [
+        fixture.home.join(".codex/hooks"),
+        fixture.home.join(".claude/hooks"),
+    ] {
+        fs::create_dir_all(&hooks).expect("hooks");
+        let handler = hooks.join("pre-edit-intent-gate.py");
+        fs::write(
+            &handler,
+            r#"#!/bin/sh
 printf invoked > "$HOME/pre-edit-invoked"
 if [ "${FALLBACK_HANDLER_BLOCK:-}" = 1 ]; then
   printf '%s\n' '{"decision":"block","reason":"project-dev-required"}'
 fi
 "#,
-    )
-    .expect("handler");
-    fs::set_permissions(&handler, fs::Permissions::from_mode(0o700)).expect("handler mode");
-    let unrelated = hooks.join("checkout-lease-guard.py");
-    fs::write(
-        &unrelated,
-        r#"#!/bin/sh
+        )
+        .expect("handler");
+        fs::set_permissions(&handler, fs::Permissions::from_mode(0o700)).expect("handler mode");
+        let unrelated = hooks.join("checkout-lease-guard.py");
+        fs::write(
+            &unrelated,
+            r#"#!/bin/sh
 printf invoked > "$HOME/checkout-lease-invoked"
 "#,
-    )
-    .expect("unrelated handler");
-    fs::set_permissions(&unrelated, fs::Permissions::from_mode(0o700))
-        .expect("unrelated handler mode");
+        )
+        .expect("unrelated handler");
+        fs::set_permissions(&unrelated, fs::Permissions::from_mode(0o700))
+            .expect("unrelated handler mode");
+    }
 }
 
 #[test]
@@ -253,54 +268,61 @@ fn enforce_rejects_unsupported_and_same_release_mutation_descriptors() {
 #[test]
 fn enforce_valid_read_only_bypasses_only_the_declared_fallback_handler() {
     let policy = format!("{FALLBACK_POLICY}{UNRELATED_HANDLER_RULE}");
-    let fixture = Fixture::new(&policy);
-    install_fallback_handler(&fixture);
-    let producer = nils_test_support::bin::resolve("agent-docs")
-        .canonicalize()
-        .expect("canonical agent-docs binary");
-    let command = format!(
-        "builtin command {} --docs-home {} --project-path {} preflight --intent project-dev --format json",
-        producer.display(),
-        fixture.root.display(),
-        fixture.root.display()
-    );
-    let payload = serde_json::json!({
-        "hook_event_name": "PreToolUse",
-        "tool_name": "Bash",
-        "cwd": fixture.root,
-        "tool_input": {"command": command}
-    })
-    .to_string();
-    let output = fixture.run_with_env(
-        &["dispatch", "--product", "codex", "--format", "json"],
-        Some(&payload),
-        &[("FALLBACK_HANDLER_BLOCK", "1")],
-    );
+    for product in ["codex", "claude"] {
+        let fixture = Fixture::new(&policy);
+        install_fallback_handler(&fixture);
+        let producer = nils_test_support::bin::resolve("agent-docs")
+            .canonicalize()
+            .expect("canonical agent-docs binary");
+        let command = format!(
+            "builtin command {} --docs-home {} --project-path {} preflight --intent project-dev --format json",
+            producer.display(),
+            fixture.root.display(),
+            fixture.root.display()
+        );
+        let payload = serde_json::json!({
+            "hook_event_name": "PreToolUse",
+            "tool_name": "Bash",
+            "cwd": fixture.root,
+            "tool_input": {"command": command}
+        })
+        .to_string();
+        let output = fixture.run_with_env(
+            &["dispatch", "--product", product, "--format", "json"],
+            Some(&payload),
+            &[("FALLBACK_HANDLER_BLOCK", "1")],
+        );
 
-    assert_eq!(output.code, 0, "stderr={}", output.stderr_text());
-    assert_eq!(output.stdout_json()["data"]["action"], "allow");
-    assert_eq!(
-        output.stdout_json()["data"]["reasons"],
-        serde_json::json!([
-            {
-                "rule_id": "runtime.read-only",
-                "code": "read-only-capability",
-                "disposition": "allow"
-            },
-            {
-                "rule_id": "runtime.pre-edit",
-                "code": "read-only-capability-bypass",
-                "disposition": "allow"
-            },
-            {
-                "rule_id": "runtime.checkout-lease",
-                "code": "checkout-lease-guard",
-                "disposition": "allow"
-            }
-        ])
-    );
-    assert!(!fixture.home.join("pre-edit-invoked").exists());
-    assert!(fixture.home.join("checkout-lease-invoked").is_file());
+        assert_eq!(
+            output.code,
+            0,
+            "product={product}; stderr={}",
+            output.stderr_text()
+        );
+        assert_eq!(output.stdout_json()["data"]["action"], "allow");
+        assert_eq!(
+            output.stdout_json()["data"]["reasons"],
+            serde_json::json!([
+                {
+                    "rule_id": "runtime.read-only",
+                    "code": "read-only-capability",
+                    "disposition": "allow"
+                },
+                {
+                    "rule_id": format!("runtime.{product}.pre-edit"),
+                    "code": "read-only-capability-bypass",
+                    "disposition": "allow"
+                },
+                {
+                    "rule_id": "runtime.checkout-lease",
+                    "code": "checkout-lease-guard",
+                    "disposition": "allow"
+                }
+            ])
+        );
+        assert!(!fixture.home.join("pre-edit-invoked").exists());
+        assert!(fixture.home.join("checkout-lease-invoked").is_file());
+    }
 }
 
 #[test]
@@ -340,7 +362,7 @@ fn enforce_non_read_only_falls_through_to_the_declared_project_dev_handler() {
         );
         assert_eq!(
             output.stdout_json()["data"]["reasons"][1]["rule_id"],
-            "runtime.pre-edit"
+            "runtime.codex.pre-edit"
         );
         assert!(fixture.home.join("pre-edit-invoked").is_file());
     }
