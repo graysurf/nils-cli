@@ -20,11 +20,31 @@ assert_contains() {
   echo "ok: $label"
 }
 
+assert_not_contains() {
+  local file="$1"
+  local pattern="$2"
+  local label="$3"
+  if rg -q --fixed-strings -- "$pattern" "$file"; then
+    echo "FAIL: $label" >&2
+    echo "  unexpected in $file: $pattern" >&2
+    exit 1
+  fi
+  echo "ok: $label"
+}
+
 assert_contains .github/workflows/release.yml \
   'require("./.github/scripts/release-ci-gate.cjs")' \
   "release workflow uses checked-in provenance gate"
 assert_contains .github/workflows/release.yml "pull-requests: read" \
   "release gate can verify the canonical merged PR"
+assert_contains .github/workflows/release.yml "- runs_on: ubuntu-24.04-arm" \
+  "Linux ARM64 release uses the native GitHub-hosted runner"
+assert_contains .github/workflows/release.yml 'run: cargo build --release --workspace --locked --target ${{ matrix.target }}' \
+  "release workflow uses the locked native cargo build"
+assert_not_contains .github/workflows/release.yml "tool: cross" \
+  "release workflow does not install cross"
+assert_not_contains .github/workflows/release.yml "cross build" \
+  "release workflow does not invoke cross"
 assert_contains .github/workflows/ci.yml "release_only:" \
   "CI publishes the release-only decision"
 assert_contains .github/workflows/ci.yml "scripts/ci/detect-release-only.sh" \
