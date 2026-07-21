@@ -4,6 +4,8 @@
 mod agent_run;
 #[path = "integration/agent_run_inspect.rs"]
 mod agent_run_inspect;
+#[path = "integration/agent_run_inspect_unavailable.rs"]
+mod agent_run_inspect_unavailable;
 #[path = "integration/cli.rs"]
 mod cli;
 #[path = "integration/control_plane.rs"]

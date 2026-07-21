@@ -46,9 +46,14 @@ mod inspect {
     }
 
     fn unsupported() -> InspectError {
+        let message = if cfg!(target_os = "macos") {
+            "strict OS-enforced inspection is unavailable on macOS; use project-dev preparation for the exact target instead"
+        } else {
+            "agent-run inspect is not supported on this operating system"
+        };
         InspectError {
             code: "sandbox-backend-unavailable",
-            message: "agent-run inspect is not supported on this operating system".to_string(),
+            message: message.to_string(),
             exit_code: EXIT_UNAVAILABLE,
         }
     }
