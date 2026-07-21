@@ -10,6 +10,7 @@ mod integration {
     mod exit_codes;
     mod exit_codes_full;
     mod fixture_lint;
+    mod forgejo_http;
     mod inbox;
     mod issue_atoms;
     mod label_ops;
@@ -27,7 +28,9 @@ mod integration {
     mod pr_review;
     mod pr_reviews;
     mod pr_wait_checks;
+    mod provider_registry;
     mod rate_limit_gate;
+    mod repo_bootstrap;
     mod repo_push_default;
     mod repo_view;
     mod required_check_gate;

@@ -12,12 +12,14 @@ pub mod cli;
 pub mod config;
 pub mod envelope;
 pub mod error;
+mod forgejo;
 pub mod glab_version;
 pub mod local;
 pub mod macros;
 mod operation_effect;
 pub mod ops;
 pub mod provider;
+pub mod provider_registry;
 pub mod rate_limit;
 pub mod validations;
 

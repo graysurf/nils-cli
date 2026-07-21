@@ -31,6 +31,9 @@ pub struct AuthStatusPayload {
 
 /// CLI entry point: dispatch using the real subprocess runner.
 pub fn run(global: &GlobalFlags, format: OutputFormat) -> Result<i32, ForgeError> {
+    if global.named_provider().is_some() {
+        return crate::forgejo::run_auth_status(global, format);
+    }
     let runner = default_runner();
     run_with(&runner, global, format, git_remote_url)
 }

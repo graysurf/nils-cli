@@ -51,6 +51,11 @@ pub enum ProviderHint {
     ForcedHost(Provider, String),
     /// Host was explicitly supplied and determines the provider.
     Host(String),
+    /// Named provider selected from the user registry.
+    Named(String),
+    /// Named providers bind their host through the registry and reject a
+    /// second command-line host override.
+    NamedHost(String, String),
 }
 
 /// Resolved provider context handed to every op.
@@ -175,6 +180,24 @@ fn detect_with_scope(
     let remote_repo = url.as_deref().and_then(parse_slug);
 
     match hint {
+        ProviderHint::Named(name) => {
+            let record = crate::provider_registry::get(&name)?;
+            Err(ForgeError::provider_unsupported(
+                schema(),
+                format!(
+                    "named provider '{name}' ({}) is registered but this operation is not implemented yet",
+                    record.kind.as_str()
+                ),
+                None,
+            ))
+        }
+        ProviderHint::NamedHost(name, _) => Err(ForgeError::provider_unsupported(
+            schema(),
+            format!(
+                "named provider '{name}' is already bound to its registered base URL; --host is not accepted"
+            ),
+            None,
+        )),
         ProviderHint::ForcedHost(provider, host) => {
             if provider == Provider::Local {
                 if host != "local" {

@@ -8,12 +8,15 @@
 
 use std::ffi::OsString;
 use std::path::PathBuf;
+use std::str::FromStr;
 use std::time::Duration;
 
+use clap::builder::{PossibleValue, TypedValueParser};
 use clap::{ArgAction, Args, Parser, Subcommand, ValueEnum};
 use clap_complete::Shell;
-use nils_common::cli_contract::{OutputFormat, emit_parse_error, exit};
+use nils_common::cli_contract::{OutputFormat, emit_parse_error, exit, schema_version_for};
 
+use crate::envelope::emit_success;
 use crate::error::ForgeError;
 use crate::ops;
 use crate::provider::ProviderHint;
@@ -39,7 +42,7 @@ pub struct Cli {
     pub remote: String,
 
     /// Override auto-detected provider.
-    #[arg(long, global = true, value_enum)]
+    #[arg(long, global = true, value_parser = ProviderValueParser)]
     pub provider: Option<ProviderFlag>,
 
     /// Override the forge authority (`hostname` or `hostname:port`). With
@@ -86,7 +89,7 @@ impl From<&Cli> for GlobalFlags {
         Self {
             format: cli.format,
             remote: cli.remote.clone(),
-            provider: cli.provider,
+            provider: cli.provider.clone(),
             host: cli.host.clone(),
             repo: cli.repo.clone(),
             store_root: cli.store_root.clone(),
@@ -103,7 +106,7 @@ impl GlobalFlags {
 
     /// Convert the optional `--provider` flag into the typed provider hint.
     pub fn provider_hint(&self) -> ProviderHint {
-        match (self.provider, self.host.as_deref()) {
+        match (self.provider.as_ref(), self.host.as_deref()) {
             (Some(ProviderFlag::Github), Some(host)) => {
                 ProviderHint::ForcedHost(crate::provider::Provider::GitHub, host.to_string())
             }
@@ -112,6 +115,9 @@ impl GlobalFlags {
             }
             (Some(ProviderFlag::Local), Some(host)) => {
                 ProviderHint::ForcedHost(crate::provider::Provider::Local, host.to_string())
+            }
+            (Some(ProviderFlag::Named(name)), Some(host)) => {
+                ProviderHint::NamedHost(name.clone(), host.to_string())
             }
             (Some(ProviderFlag::Github), None) => {
                 ProviderHint::Forced(crate::provider::Provider::GitHub)
@@ -122,6 +128,7 @@ impl GlobalFlags {
             (Some(ProviderFlag::Local), None) => {
                 ProviderHint::Forced(crate::provider::Provider::Local)
             }
+            (Some(ProviderFlag::Named(name)), None) => ProviderHint::Named(name.clone()),
             (None, Some(host)) => ProviderHint::Host(host.to_string()),
             (None, None) => ProviderHint::Auto,
         }
@@ -131,22 +138,87 @@ impl GlobalFlags {
     /// from the file-backed store via [`crate::local::LocalRunner`] instead of
     /// spawning a backend binary.
     pub fn is_local(&self) -> bool {
-        matches!(self.provider, Some(ProviderFlag::Local))
+        matches!(&self.provider, Some(ProviderFlag::Local))
+    }
+
+    pub fn named_provider(&self) -> Option<&str> {
+        match self.provider.as_ref() {
+            Some(ProviderFlag::Named(name)) => Some(name),
+            _ => None,
+        }
     }
 }
 
 /// Provider override for `--provider`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
-#[clap(rename_all = "lower")]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProviderFlag {
     Github,
     Gitlab,
     Local,
+    Named(String),
+}
+
+impl FromStr for ProviderFlag {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "github" => Ok(Self::Github),
+            "gitlab" => Ok(Self::Gitlab),
+            "local" => Ok(Self::Local),
+            name if valid_provider_selector(name) => Ok(Self::Named(name.to_string())),
+            _ => Err(
+                "provider must be github, gitlab, local, or a valid lowercase named provider"
+                    .to_string(),
+            ),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ProviderValueParser;
+
+impl TypedValueParser for ProviderValueParser {
+    type Value = ProviderFlag;
+
+    fn parse_ref(
+        &self,
+        command: &clap::Command,
+        _argument: Option<&clap::Arg>,
+        value: &std::ffi::OsStr,
+    ) -> Result<Self::Value, clap::Error> {
+        let value = value.to_str().ok_or_else(|| {
+            clap::Error::new(clap::error::ErrorKind::InvalidUtf8).with_cmd(command)
+        })?;
+        value.parse().map_err(|message: String| {
+            clap::Error::raw(clap::error::ErrorKind::InvalidValue, message).with_cmd(command)
+        })
+    }
+
+    fn possible_values(&self) -> Option<Box<dyn Iterator<Item = PossibleValue> + '_>> {
+        Some(Box::new(
+            ["github", "gitlab", "local"]
+                .into_iter()
+                .map(PossibleValue::new),
+        ))
+    }
+}
+
+fn valid_provider_selector(name: &str) -> bool {
+    (1..=64).contains(&name.len())
+        && name.as_bytes().first().is_some_and(u8::is_ascii_lowercase)
+        && name.bytes().enumerate().all(|(index, byte)| {
+            byte.is_ascii_lowercase()
+                || byte.is_ascii_digit()
+                || (index > 0 && matches!(byte, b'-' | b'_'))
+        })
 }
 
 /// Top-level subcommand tree.
 #[derive(Subcommand, Debug)]
 pub enum Command {
+    /// Manage named forge provider records.
+    Provider(ProviderArgs),
     /// Pull / merge request lifecycle.
     Pr(PrArgs),
     /// Issue lifecycle.
@@ -175,6 +247,43 @@ pub enum Command {
     OperationEffect(OperationEffectArgs),
     /// Emit shell-completion scripts.
     Completion(CompletionArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct ProviderArgs {
+    #[command(subcommand)]
+    pub command: Option<ProviderCommand>,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum ProviderCommand {
+    /// Add a named provider record without storing its token value.
+    Add(ProviderAddArgs),
+    /// List named provider records.
+    List,
+    /// View one named provider record.
+    View { name: String },
+}
+
+#[derive(Args, Debug)]
+pub struct ProviderAddArgs {
+    /// Stable provider name used by `--provider`.
+    pub name: String,
+    /// Provider implementation kind.
+    #[arg(long, value_enum)]
+    pub kind: ProviderKindFlag,
+    /// Absolute Forgejo base URL.
+    #[arg(long = "base-url")]
+    pub base_url: String,
+    /// Environment variable whose value supplies the provider token.
+    #[arg(long = "token-env")]
+    pub token_env: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+#[clap(rename_all = "lower")]
+pub enum ProviderKindFlag {
+    Forgejo,
 }
 
 #[derive(Args, Debug)]
@@ -237,6 +346,37 @@ pub struct RepoPushDefaultArgs {
     /// UTF-8 file describing the user's explicit direct-main authorization.
     #[arg(long = "reason-file", value_name = "PATH")]
     pub reason_file: PathBuf,
+}
+
+/// `repo bootstrap` arguments for a new private Forgejo repository.
+#[derive(Args, Debug, Clone)]
+pub struct RepoBootstrapArgs {
+    /// Whether the repository owner is the authenticated user or an organization.
+    #[arg(long = "owner-kind", value_enum)]
+    pub owner_kind: RepoBootstrapOwnerKind,
+    /// Exact branch name to create and establish as the remote default.
+    #[arg(long = "default-branch", value_name = "BRANCH")]
+    pub default_branch: String,
+    /// Regular file to copy into the repository root. Repeat for multiple files.
+    #[arg(long = "file", value_name = "PATH", required = true)]
+    pub files: Vec<PathBuf>,
+    /// Semantic Commit message for the signed zero-parent root commit.
+    #[arg(long, value_name = "TEXT")]
+    pub message: String,
+    /// UTF-8 file describing the user's explicit bootstrap authorization.
+    #[arg(long = "reason-file", value_name = "PATH")]
+    pub reason_file: PathBuf,
+    /// Resume an existing durable bootstrap receipt after exact read-back.
+    #[arg(long, action = ArgAction::SetTrue)]
+    pub resume: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, serde::Serialize, serde::Deserialize)]
+#[clap(rename_all = "lower")]
+#[serde(rename_all = "lowercase")]
+pub enum RepoBootstrapOwnerKind {
+    User,
+    Org,
 }
 
 #[derive(Args, Debug)]
@@ -1677,6 +1817,8 @@ pub struct IssueCommentArgs {
 pub enum RepoCommand {
     /// Resolve the repo slug, default branch, and supported merge methods.
     View,
+    /// Create and initialize one new private Forgejo repository under a durable receipt.
+    Bootstrap(RepoBootstrapArgs),
     /// Deliver one signed commit to the default branch with a normal fast-forward push.
     PushDefault(RepoPushDefaultArgs),
 }
@@ -1702,19 +1844,91 @@ pub fn dispatch(args: Vec<OsString>) -> i32 {
         return crate::operation_effect::run(args.command.clone(), format);
     }
 
+    if let Some(name) = global.named_provider()
+        && !matches!(&cli.command, Some(Command::Provider(_)))
+        && !named_provider_http_command(&cli.command)
+    {
+        return ForgeError::provider_unsupported(
+            schema_version_for(BINARY, "error", 1),
+            format!("named provider '{name}' does not support this operation"),
+            None,
+        )
+        .emit(format);
+    }
+
     // `--provider local` only models a subset of the command tree; reject the
     // rest up front so they never fall through to a real backend spawn.
-    if global.is_local() && !crate::local::command_supported(&cli.command) {
+    if global.is_local()
+        && !matches!(&cli.command, Some(Command::Provider(_)))
+        && !crate::local::command_supported(&cli.command)
+    {
         return crate::local::unsupported_command().emit(format);
     }
 
     let result = match cli.command {
+        Some(Command::Provider(ProviderArgs {
+            command: Some(ProviderCommand::Add(args)),
+        })) => {
+            let kind = match args.kind {
+                ProviderKindFlag::Forgejo => crate::provider_registry::ProviderKind::Forgejo,
+            };
+            crate::provider_registry::add(&args.name, kind, &args.base_url, &args.token_env).map(
+                |payload| {
+                    emit_success(
+                        schema_version_for(BINARY, "provider.add", 1),
+                        payload,
+                        format,
+                        |payload| {
+                            println!(
+                                "{} ({}) {} [token: ${}]",
+                                payload.name, payload.kind, payload.base_url, payload.token_env
+                            )
+                        },
+                    )
+                },
+            )
+        }
+        Some(Command::Provider(ProviderArgs {
+            command: Some(ProviderCommand::List),
+        })) => crate::provider_registry::list().map(|payload| {
+            emit_success(
+                schema_version_for(BINARY, "provider.list", 1),
+                payload,
+                format,
+                |payload| {
+                    for provider in &payload.providers {
+                        println!(
+                            "{} ({}) {} [token: ${}]",
+                            provider.name, provider.kind, provider.base_url, provider.token_env
+                        );
+                    }
+                },
+            )
+        }),
+        Some(Command::Provider(ProviderArgs {
+            command: Some(ProviderCommand::View { name }),
+        })) => crate::provider_registry::view(&name).map(|payload| {
+            emit_success(
+                schema_version_for(BINARY, "provider.view", 1),
+                payload,
+                format,
+                |payload| {
+                    println!(
+                        "{} ({}) {} [token: ${}]",
+                        payload.name, payload.kind, payload.base_url, payload.token_env
+                    )
+                },
+            )
+        }),
         Some(Command::Auth(AuthArgs {
             command: Some(AuthCommand::Status),
         })) => ops::auth_status::run(&global, format),
         Some(Command::Repo(RepoArgs {
             command: Some(RepoCommand::View),
         })) => ops::repo_view::run(&global, format),
+        Some(Command::Repo(RepoArgs {
+            command: Some(RepoCommand::Bootstrap(args)),
+        })) => ops::repo_bootstrap::run(&global, args, format),
         Some(Command::Repo(RepoArgs {
             command: Some(RepoCommand::PushDefault(args)),
         })) => ops::repo_push_default::run(&global, args, format),
@@ -1863,6 +2077,7 @@ pub fn dispatch(args: Vec<OsString>) -> i32 {
             unreachable!("operation-effect returned before dispatch")
         }
         None
+        | Some(Command::Provider(ProviderArgs { command: None }))
         | Some(Command::Auth(AuthArgs { command: None }))
         | Some(Command::Repo(RepoArgs { command: None }))
         | Some(Command::Pr(PrArgs { command: None }))
@@ -1890,6 +2105,19 @@ pub fn dispatch(args: Vec<OsString>) -> i32 {
         Ok(code) => code,
         Err(err) => err.emit(format),
     }
+}
+
+fn named_provider_http_command(command: &Option<Command>) -> bool {
+    matches!(
+        command,
+        Some(Command::Auth(AuthArgs {
+            command: Some(AuthCommand::Status),
+        })) | Some(Command::Repo(RepoArgs {
+            command: Some(RepoCommand::View | RepoCommand::Bootstrap(_)),
+        })) | Some(Command::Issue(IssueArgs {
+            command: Some(IssueCommand::List(_)),
+        }))
+    )
 }
 
 /// Parse argv, gracefully routing parse errors through the workspace
