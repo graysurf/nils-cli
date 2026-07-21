@@ -4120,6 +4120,32 @@ async fn codex_account_handler(
     .await
     {
         Ok(Ok(revision)) => revision,
+        Ok(Err(err)) if err.code() == "codex-account-session-busy" => {
+            // The turn is still working, so an immediate switch is unsafe.
+            // Durably queue the account for the next prompt instead; the daemon
+            // applies it at the idle boundary and the applied binding is left
+            // unchanged until then.
+            let queue_context = state.context.clone();
+            let queue_id = canonical_id.clone();
+            let queue_launch_id = launch_id.clone();
+            let queue_account = body.account.clone();
+            return match tokio::task::spawn_blocking(move || {
+                crate::codex_account::queue_next_account(
+                    &queue_context,
+                    &queue_id,
+                    &queue_launch_id,
+                    &queue_account,
+                )
+            })
+            .await
+            {
+                Ok(Ok(view)) => {
+                    envelope_ok(json!({ "machine": state.machine, "codex_account": view }))
+                }
+                Ok(Err(err)) => envelope_err(err),
+                Err(_) => join_err(),
+            };
+        }
         Ok(Err(err)) => return envelope_err(err),
         Err(_) => return join_err(),
     };
@@ -4706,12 +4732,16 @@ async fn codex_control_loop(state: Arc<ServeState>) {
             else {
                 continue;
             };
-            let already_running = state.codex_controls.lock().ok().is_some_and(|controls| {
+            let running_handle = state.codex_controls.lock().ok().and_then(|controls| {
                 controls
                     .get(&record.id)
-                    .is_some_and(|entry| entry.launch_id == launch_id)
+                    .filter(|entry| entry.launch_id == launch_id)
+                    .map(|entry| entry.handle.clone())
             });
-            if already_running {
+            if let Some(handle) = running_handle {
+                if crate::codex_account::has_pending_next(&record) {
+                    let _ = handle.apply_next().await;
+                }
                 continue;
             }
             let prepare_context = state.context.clone();
@@ -14076,6 +14106,7 @@ esac
                     revision: 1,
                     applied_runtime_id: Some(responder_launch_id),
                     failure_reason: None,
+                    next: None,
                 }))
                 .unwrap();
         });
@@ -14094,6 +14125,76 @@ esac
         assert_eq!(body["data"]["codex_account"]["selected_account"], "gamania");
         assert_eq!(body["data"]["codex_account"]["revision"], 1);
         responder.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn codex_account_switch_queues_during_a_working_turn_without_control_dispatch() {
+        let lock = GlobalStateLock::new();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let _broker = EnvGuard::set(
+            &lock,
+            "AGENT_SESSION_CODEX_ACCOUNT_BROKER",
+            r#"["/bin/false"]"#,
+        );
+        let launch_id = seed_codex_app_server_session(tmp.path(), "account-switch-queued");
+        let st = state(tmp.path(), Some(TOKEN), minimal_tmux(tmp.path()));
+        let mut record = load_session_record(&st.context, "account-switch-queued").unwrap();
+        crate::codex_account::set_initial_binding(&mut record, Some("gamania")).unwrap();
+        crate::write_session_record(&st.context, &record).unwrap();
+        crate::codex_account::finish_binding(
+            &st.context,
+            &record.id,
+            &launch_id,
+            "gamania",
+            1,
+            Ok(()),
+        )
+        .unwrap();
+        record = load_session_record(&st.context, &record.id).unwrap();
+        crate::activity::activate_runtime(&st.context, &record).unwrap();
+        let event = serde_json::from_value(json!({
+            "schema_version": crate::activity::TURN_EVENT_VERSION,
+            "event_id": "turn-start",
+            "runtime_id": launch_id,
+            "provider": "codex",
+            "provider_turn_id": "turn-account-switch-queued",
+            "kind": "turn_started",
+            "confidence": "authoritative"
+        }))
+        .unwrap();
+        crate::activity::ingest_event(&st.context, &record.id, event).unwrap();
+
+        let (handle, mut commands) = codex_app_server::control_channel();
+        st.codex_controls.lock().unwrap().insert(
+            record.id.clone(),
+            CodexControlEntry {
+                launch_id: launch_id.clone(),
+                handle,
+            },
+        );
+
+        let (status, body) = call(
+            router(st.clone()),
+            put_json(
+                "/sessions/account-switch-queued/account",
+                Some(TOKEN),
+                json!({ "account": "sym", "expected_session_incarnation": launch_id }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "body={body}");
+        assert_eq!(body["data"]["codex_account"]["selected_account"], "gamania");
+        assert_eq!(body["data"]["codex_account"]["next"]["account"], "sym");
+        assert_eq!(body["data"]["codex_account"]["next"]["state"], "queued");
+        assert!(matches!(
+            commands.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
+
+        let persisted = load_session_record(&st.context, &record.id).unwrap();
+        let view = crate::codex_account::view_for_record(&persisted);
+        assert_eq!(view.selected_account.as_deref(), Some("gamania"));
+        assert_eq!(view.next.unwrap().account.as_deref(), Some("sym"));
     }
 
     #[tokio::test]
@@ -14187,6 +14288,7 @@ esac
                 revision: first_revision,
                 applied_runtime_id: Some(launch_id.clone()),
                 failure_reason: None,
+                next: None,
             }))
             .unwrap();
         assert_eq!(first.await.unwrap().0, StatusCode::OK);
@@ -14212,6 +14314,7 @@ esac
                 revision: second_revision,
                 applied_runtime_id: Some(launch_id),
                 failure_reason: None,
+                next: None,
             }))
             .unwrap();
         assert_eq!(second.await.unwrap().0, StatusCode::OK);

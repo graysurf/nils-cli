@@ -3996,6 +3996,7 @@ fn resume_session_locked(
     );
     if app_server_managed {
         codex_account::mark_runtime_pending(&mut record)?;
+        codex_account::recover_next_after_restart(&mut record)?;
         codex_app_server::configure_runtime(context, &agent_bin, &mut record, true)?;
     }
     record.updated_at = now.timestamp().to_string();

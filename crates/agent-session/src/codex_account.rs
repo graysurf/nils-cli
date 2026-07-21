@@ -23,8 +23,10 @@ use crate::{
 pub(crate) const BROKER_SCHEMA_VERSION: &str = "agent-session.codex-auth-broker.v1";
 pub(crate) const BINDING_SCHEMA_VERSION: &str = "agent-session.codex-account-binding.v1";
 pub(crate) const VIEW_SCHEMA_VERSION: &str = "agent-session.codex-account.v1";
+pub(crate) const NEXT_SCHEMA_VERSION: &str = "agent-session.codex-account-next.v1";
 const BINDING_KEY: &str = "codex_account_binding";
 const INPUT_FENCE_KEY: &str = "codex_account_input_fence";
+const NEXT_KEY: &str = "codex_account_next";
 const BROKER_ENV: &str = "AGENT_SESSION_CODEX_ACCOUNT_BROKER";
 const BROKER_TIMEOUT: Duration = Duration::from_secs(10);
 // Codex 0.144.1 waits ten seconds for external-auth refresh. Leave transport
@@ -64,9 +66,31 @@ struct DurableInputFence {
     activity_revision: u64,
 }
 
+/// Durable, additive intent to apply a different Codex account before the next
+/// prompt. It never replaces `selected_account`: the applied binding stays
+/// authoritative until an apply succeeds. Credentials are never stored here.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+struct DurableNextAccount {
+    schema_version: String,
+    account: String,
+    revision: u64,
+    state: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    applying_runtime_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    failure_reason: Option<String>,
+    updated_at: String,
+}
+
 enum DecodedBinding {
     Absent,
     Valid(DurableBinding),
+    Invalid,
+}
+
+enum DecodedNext {
+    Absent,
+    Valid(DurableNextAccount),
     Invalid,
 }
 
@@ -87,6 +111,22 @@ pub(crate) struct CodexAccountView {
     pub(crate) revision: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) applied_runtime_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) failure_reason: Option<String>,
+    /// Additive queued next-account intent. Absent for old daemons, unsupported
+    /// sessions, and whenever no next account is queued.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) next: Option<CodexNextAccountView>,
+}
+
+/// Public projection of a queued next-account intent. Additive and secret-free:
+/// it exposes the desired nickname, its revision, and its lifecycle state only.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub(crate) struct CodexNextAccountView {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) account: Option<String>,
+    pub(crate) revision: u64,
+    pub(crate) state: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) failure_reason: Option<String>,
 }
@@ -146,6 +186,7 @@ pub(crate) fn view_for_record(record: &SessionRecord) -> CodexAccountView {
             },
             applied_runtime_id: None,
             failure_reason: None,
+            next: None,
         };
     }
     let binding = match decoded {
@@ -158,6 +199,7 @@ pub(crate) fn view_for_record(record: &SessionRecord) -> CodexAccountView {
                 revision: 0,
                 applied_runtime_id: None,
                 failure_reason: None,
+                next: next_view(record),
             };
         }
         DecodedBinding::Invalid => {
@@ -169,6 +211,7 @@ pub(crate) fn view_for_record(record: &SessionRecord) -> CodexAccountView {
                 revision: 0,
                 applied_runtime_id: None,
                 failure_reason: Some("binding_invalid".to_string()),
+                next: next_view(record),
             };
         }
         DecodedBinding::Valid(binding) => binding,
@@ -187,6 +230,7 @@ pub(crate) fn view_for_record(record: &SessionRecord) -> CodexAccountView {
         revision: binding.revision,
         applied_runtime_id: binding.applied_runtime_id,
         failure_reason: binding.failure_reason,
+        next: next_view(record),
     }
 }
 
@@ -418,6 +462,12 @@ pub(crate) fn finish_binding(
 }
 
 pub(crate) fn ensure_input_allowed(record: &SessionRecord) -> Result<(), CliError> {
+    // A queued, applying, failed, or malformed next-account intent fences the
+    // next prompt until it is applied or cancelled (fail closed on malformed).
+    match decode_next(record) {
+        DecodedNext::Absent => {}
+        DecodedNext::Valid(_) | DecodedNext::Invalid => return Err(next_pending_error(record)),
+    }
     let binding = match decode_binding(record) {
         DecodedBinding::Absent => return Ok(()),
         DecodedBinding::Invalid => return Err(not_bound_error(record, None)),
@@ -538,6 +588,310 @@ pub(crate) fn begin_switch_binding(
     record.updated_at = jiff::Timestamp::now().to_string();
     write_session_record(context, &record)?;
     Ok(revision)
+}
+
+fn decode_next(record: &SessionRecord) -> DecodedNext {
+    let Some(value) = record.extra.get(NEXT_KEY).cloned() else {
+        return DecodedNext::Absent;
+    };
+    let decoded: Result<DurableNextAccount, _> = serde_json::from_value(value);
+    match decoded {
+        Ok(next)
+            if next.schema_version == NEXT_SCHEMA_VERSION
+                && validate_account(&next.account).is_ok()
+                && next.revision > 0
+                && matches!(next.state.as_str(), "queued" | "applying" | "failed") =>
+        {
+            DecodedNext::Valid(next)
+        }
+        Ok(_) | Err(_) => DecodedNext::Invalid,
+    }
+}
+
+fn store_next(record: &mut SessionRecord, next: &DurableNextAccount) -> Result<(), CliError> {
+    let value = serde_json::to_value(next).map_err(|_| {
+        CliError::runtime(
+            "codex-account-next-encode-failed",
+            "failed to encode Codex next-account intent",
+            Some(json!({ "id": record.id })),
+        )
+    })?;
+    record.extra.insert(NEXT_KEY.to_string(), value);
+    Ok(())
+}
+
+fn clear_next(record: &mut SessionRecord) {
+    record.extra.remove(NEXT_KEY);
+}
+
+fn next_view(record: &SessionRecord) -> Option<CodexNextAccountView> {
+    match decode_next(record) {
+        DecodedNext::Absent => None,
+        DecodedNext::Invalid => Some(CodexNextAccountView {
+            account: None,
+            revision: 0,
+            state: "failed",
+            failure_reason: Some("next_invalid".to_string()),
+        }),
+        DecodedNext::Valid(next) => {
+            let state = match next.state.as_str() {
+                "queued" => "queued",
+                "applying" => "applying",
+                _ => "failed",
+            };
+            Some(CodexNextAccountView {
+                account: Some(next.account),
+                revision: next.revision,
+                state,
+                failure_reason: next.failure_reason,
+            })
+        }
+    }
+}
+
+fn next_pending_error(record: &SessionRecord) -> CliError {
+    CliError::runtime(
+        "codex-account-next-pending",
+        "apply or cancel the queued Codex account before submitting the next prompt",
+        Some(json!({ "id": record.id })),
+    )
+}
+
+fn invalid_next_error(record: &SessionRecord) -> CliError {
+    CliError::data(
+        "codex-account-next-invalid",
+        "Codex next-account intent state is invalid and must be repaired explicitly",
+        Some(json!({ "id": record.id })),
+    )
+}
+
+/// Return a queued next account ready to apply at the idle boundary, if any.
+/// Only a `queued` intent is drainable; `applying`/`failed` are not re-driven
+/// here, and a malformed intent fails closed.
+pub(crate) fn pending_next_apply(
+    record: &SessionRecord,
+) -> Result<Option<(String, u64)>, CliError> {
+    match decode_next(record) {
+        DecodedNext::Absent => Ok(None),
+        DecodedNext::Invalid => Err(invalid_next_error(record)),
+        DecodedNext::Valid(next) if next.state == "queued" => {
+            Ok(Some((next.account, next.revision)))
+        }
+        DecodedNext::Valid(_) => Ok(None),
+    }
+}
+
+/// True when a live or malformed next intent must fence the next prompt.
+pub(crate) fn has_pending_next(record: &SessionRecord) -> bool {
+    !matches!(decode_next(record), DecodedNext::Absent)
+}
+
+/// Queue a durable next-account intent while a turn is working. Selecting the
+/// current applied account cancels any queued intent. A different account
+/// supersedes a prior queued intent and cancels auto-resume so no automatic
+/// prompt races ahead under the current account. `selected_account` is never
+/// changed here; the applied binding stays authoritative until an apply
+/// succeeds.
+pub(crate) fn queue_next_account(
+    context: &CliContext,
+    id: &str,
+    expected_launch_id: &str,
+    account: &str,
+) -> Result<CodexAccountView, CliError> {
+    validate_account(account)?;
+    let _lock = acquire_session_record_lock(context, id)?;
+    let mut record = load_session_record(context, id)?;
+    ensure_runtime(&record, expected_launch_id).map_err(|_| {
+        CliError::data(
+            "codex-account-session-incarnation-conflict",
+            "session was replaced before its Codex account switch was applied",
+            Some(json!({ "id": id, "expected_session_incarnation": expected_launch_id })),
+        )
+    })?;
+    if !broker_is_configured() {
+        return Err(CliError::data(
+            "codex-account-unsupported",
+            "Codex account switching is not configured for this daemon",
+            Some(json!({ "id": id })),
+        ));
+    }
+    let current = match decode_binding(&record) {
+        DecodedBinding::Valid(binding) if binding.state == "bound" => binding,
+        DecodedBinding::Valid(_) | DecodedBinding::Absent | DecodedBinding::Invalid => {
+            return Err(not_bound_error(&record, None));
+        }
+    };
+    if current.selected_account == account {
+        // Selecting the current account cancels any queued intent.
+        clear_next(&mut record);
+        record.updated_at = jiff::Timestamp::now().to_string();
+        write_session_record(context, &record)?;
+        return Ok(view_for_record(&record));
+    }
+    // A different account cancels auto-resume so an automatic prompt cannot race
+    // ahead under the current account before the queued switch applies.
+    crate::auto_resume::cancel_for_account_switch_locked(
+        context,
+        &record.id,
+        &jiff::Timestamp::now().to_string(),
+    )?;
+    let revision = match decode_next(&record) {
+        DecodedNext::Valid(prior) => prior.revision.saturating_add(1).max(1),
+        DecodedNext::Absent | DecodedNext::Invalid => 1,
+    };
+    store_next(
+        &mut record,
+        &DurableNextAccount {
+            schema_version: NEXT_SCHEMA_VERSION.to_string(),
+            account: account.to_string(),
+            revision,
+            state: "queued".to_string(),
+            applying_runtime_id: None,
+            failure_reason: None,
+            updated_at: jiff::Timestamp::now().to_string(),
+        },
+    )?;
+    record.updated_at = jiff::Timestamp::now().to_string();
+    write_session_record(context, &record)?;
+    Ok(view_for_record(&record))
+}
+
+/// Explicitly cancel any queued next-account intent. Idempotent; the applied
+/// binding is never changed.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn cancel_next_account(
+    context: &CliContext,
+    id: &str,
+    expected_launch_id: &str,
+) -> Result<CodexAccountView, CliError> {
+    let _lock = acquire_session_record_lock(context, id)?;
+    let mut record = load_session_record(context, id)?;
+    ensure_runtime(&record, expected_launch_id).map_err(|_| {
+        CliError::data(
+            "codex-account-session-incarnation-conflict",
+            "session was replaced before its Codex account switch was applied",
+            Some(json!({ "id": id, "expected_session_incarnation": expected_launch_id })),
+        )
+    })?;
+    clear_next(&mut record);
+    record.updated_at = jiff::Timestamp::now().to_string();
+    write_session_record(context, &record)?;
+    Ok(view_for_record(&record))
+}
+
+/// Transition a queued intent to `applying` under the current incarnation and
+/// return the account + revision to apply. Returns `None` when nothing is
+/// drainable; a malformed intent fails closed.
+pub(crate) fn begin_next_apply(
+    context: &CliContext,
+    id: &str,
+    expected_launch_id: &str,
+) -> Result<Option<(String, u64)>, CliError> {
+    let _lock = acquire_session_record_lock(context, id)?;
+    let mut record = load_session_record(context, id)?;
+    ensure_runtime(&record, expected_launch_id)?;
+    if !broker_is_configured() || !crate::codex_app_server::runtime_is_supported(&record) {
+        return Ok(None);
+    }
+    let mut next = match decode_next(&record) {
+        DecodedNext::Absent => return Ok(None),
+        DecodedNext::Invalid => return Err(invalid_next_error(&record)),
+        DecodedNext::Valid(next) if next.state == "failed" => return Ok(None),
+        DecodedNext::Valid(next) => next,
+    };
+    next.state = "applying".to_string();
+    next.applying_runtime_id = Some(expected_launch_id.to_string());
+    next.failure_reason = None;
+    next.updated_at = jiff::Timestamp::now().to_string();
+    let outcome = (next.account.clone(), next.revision);
+    store_next(&mut record, &next)?;
+    record.updated_at = jiff::Timestamp::now().to_string();
+    write_session_record(context, &record)?;
+    Ok(Some(outcome))
+}
+
+/// Record the result of applying a queued next account. On success the account
+/// becomes the applied binding and the intent is cleared; on failure the intent
+/// is marked `failed`, the applied binding is untouched, and the next prompt
+/// stays fenced. A stale worker whose intent was superseded, cancelled, or
+/// re-queued is rejected without mutating newer state.
+pub(crate) fn finish_next_apply(
+    context: &CliContext,
+    id: &str,
+    expected_launch_id: &str,
+    account: &str,
+    revision: u64,
+    result: Result<(), &'static str>,
+) -> Result<CodexAccountView, CliError> {
+    let _lock = acquire_session_record_lock(context, id)?;
+    let mut record = load_session_record(context, id)?;
+    ensure_runtime(&record, expected_launch_id)?;
+    let next = match decode_next(&record) {
+        DecodedNext::Valid(next)
+            if next.state == "applying"
+                && next.account == account
+                && next.revision == revision
+                && next.applying_runtime_id.as_deref() == Some(expected_launch_id) =>
+        {
+            next
+        }
+        DecodedNext::Valid(_) | DecodedNext::Absent | DecodedNext::Invalid => {
+            return Err(CliError::runtime(
+                "codex-account-next-superseded",
+                "the queued Codex account changed while it was being applied",
+                Some(json!({ "id": id })),
+            ));
+        }
+    };
+    match result {
+        Ok(()) => {
+            let prior_revision = match decode_binding(&record) {
+                DecodedBinding::Valid(binding) => binding.revision,
+                DecodedBinding::Absent | DecodedBinding::Invalid => 0,
+            };
+            store_binding(
+                &mut record,
+                &DurableBinding {
+                    schema_version: BINDING_SCHEMA_VERSION.to_string(),
+                    selected_account: account.to_string(),
+                    revision: prior_revision.saturating_add(1).max(1),
+                    state: "bound".to_string(),
+                    applied_runtime_id: Some(expected_launch_id.to_string()),
+                    failure_reason: None,
+                    updated_at: jiff::Timestamp::now().to_string(),
+                },
+            )?;
+            clear_next(&mut record);
+        }
+        Err(reason) => {
+            let mut failed = next;
+            failed.state = "failed".to_string();
+            failed.applying_runtime_id = None;
+            failed.failure_reason = Some(reason.to_string());
+            failed.updated_at = jiff::Timestamp::now().to_string();
+            store_next(&mut record, &failed)?;
+        }
+    }
+    record.updated_at = jiff::Timestamp::now().to_string();
+    write_session_record(context, &record)?;
+    Ok(view_for_record(&record))
+}
+
+/// Recover a next intent after a runtime restart: an interrupted `applying`
+/// intent is re-queued so the fresh runtime re-applies it before the next
+/// prompt. `queued` and `failed` intents are preserved; malformed state is left
+/// for explicit repair. The caller persists the record.
+pub(crate) fn recover_next_after_restart(record: &mut SessionRecord) -> Result<(), CliError> {
+    match decode_next(record) {
+        DecodedNext::Valid(mut next) if next.state == "applying" => {
+            next.state = "queued".to_string();
+            next.applying_runtime_id = None;
+            next.failure_reason = None;
+            next.updated_at = jiff::Timestamp::now().to_string();
+            store_next(record, &next)
+        }
+        DecodedNext::Valid(_) | DecodedNext::Absent | DecodedNext::Invalid => Ok(()),
+    }
 }
 
 fn input_fence(record: &SessionRecord) -> Result<Option<DurableInputFence>, CliError> {
@@ -1339,5 +1693,289 @@ wait "$child"
             thread::sleep(Duration::from_millis(10));
         }
         assert_eq!(unsafe { libc::kill(child_pid, 0) }, -1);
+    }
+
+    fn persisted_bound(tmp: &tempfile::TempDir) -> (CliContext, SessionRecord) {
+        persist_record(tmp, valid_binding("bound"))
+    }
+
+    fn reload(context: &CliContext, id: &str) -> SessionRecord {
+        load_session_record(context, id).unwrap()
+    }
+
+    #[test]
+    fn next_intent_projection_is_absent_by_default() {
+        let lock = GlobalStateLock::new();
+        let _broker = EnvGuard::set(&lock, BROKER_ENV, r#"["/configured/broker"]"#);
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (_context, record) = persisted_bound(&tmp);
+        let view = view_for_record(&record);
+        assert_eq!(view.state, "bound");
+        assert!(view.next.is_none());
+        let json = serde_json::to_value(&view).unwrap();
+        assert!(
+            json.get("next").is_none(),
+            "the next field must be omitted when no intent is queued"
+        );
+    }
+
+    #[test]
+    fn queue_next_account_records_queued_without_changing_current() {
+        let lock = GlobalStateLock::new();
+        let _broker = EnvGuard::set(&lock, BROKER_ENV, r#"["/configured/broker"]"#);
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (context, record) = persisted_bound(&tmp);
+        let view =
+            queue_next_account(&context, &record.id, "runtime-binding-fixture", "poies").unwrap();
+        assert_eq!(view.state, "bound");
+        assert_eq!(view.selected_account.as_deref(), Some("gamania"));
+        let next = view.next.expect("queued next intent present");
+        assert_eq!(next.account.as_deref(), Some("poies"));
+        assert_eq!(next.state, "queued");
+        assert_eq!(next.revision, 1);
+        assert_eq!(
+            selected_account(&reload(&context, &record.id)).as_deref(),
+            Some("gamania"),
+            "the applied account stays authoritative while a next account is queued"
+        );
+    }
+
+    #[test]
+    fn selecting_current_account_cancels_queued_next() {
+        let lock = GlobalStateLock::new();
+        let _broker = EnvGuard::set(&lock, BROKER_ENV, r#"["/configured/broker"]"#);
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (context, record) = persisted_bound(&tmp);
+        queue_next_account(&context, &record.id, "runtime-binding-fixture", "poies").unwrap();
+        let view =
+            queue_next_account(&context, &record.id, "runtime-binding-fixture", "gamania").unwrap();
+        assert!(
+            view.next.is_none(),
+            "selecting the current account cancels the queued intent"
+        );
+        assert_eq!(view.selected_account.as_deref(), Some("gamania"));
+    }
+
+    #[test]
+    fn newer_choice_supersedes_queued_next() {
+        let lock = GlobalStateLock::new();
+        let _broker = EnvGuard::set(&lock, BROKER_ENV, r#"["/configured/broker"]"#);
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (context, record) = persisted_bound(&tmp);
+        queue_next_account(&context, &record.id, "runtime-binding-fixture", "poies").unwrap();
+        let view =
+            queue_next_account(&context, &record.id, "runtime-binding-fixture", "sym").unwrap();
+        let next = view.next.expect("superseding next intent present");
+        assert_eq!(next.account.as_deref(), Some("sym"));
+        assert_eq!(next.revision, 2);
+        assert_eq!(next.state, "queued");
+    }
+
+    #[test]
+    fn queued_next_fences_input_until_applied_or_cancelled() {
+        let lock = GlobalStateLock::new();
+        let _broker = EnvGuard::set(&lock, BROKER_ENV, r#"["/configured/broker"]"#);
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (context, record) = persisted_bound(&tmp);
+        assert!(ensure_input_allowed(&reload(&context, &record.id)).is_ok());
+        queue_next_account(&context, &record.id, "runtime-binding-fixture", "poies").unwrap();
+        assert_eq!(
+            ensure_input_allowed(&reload(&context, &record.id))
+                .unwrap_err()
+                .code(),
+            "codex-account-next-pending"
+        );
+        cancel_next_account(&context, &record.id, "runtime-binding-fixture").unwrap();
+        assert!(ensure_input_allowed(&reload(&context, &record.id)).is_ok());
+    }
+
+    #[test]
+    fn malformed_next_intent_fails_closed_and_is_visible() {
+        let lock = GlobalStateLock::new();
+        let _broker = EnvGuard::set(&lock, BROKER_ENV, r#"["/configured/broker"]"#);
+        let mut record = record_with_binding_value(valid_binding("bound"));
+        record.extra.insert(
+            NEXT_KEY.to_string(),
+            json!({
+                "schema_version": "agent-session.codex-account-next.v2",
+                "account": "poies",
+                "revision": 1,
+                "state": "queued",
+                "updated_at": "2030-01-01T00:00:00Z"
+            }),
+        );
+        let next = view_for_record(&record)
+            .next
+            .expect("malformed next intent surfaces as failed");
+        assert_eq!(next.state, "failed");
+        assert_eq!(next.failure_reason.as_deref(), Some("next_invalid"));
+        assert_eq!(
+            ensure_input_allowed(&record).unwrap_err().code(),
+            "codex-account-next-pending"
+        );
+    }
+
+    #[test]
+    fn apply_lifecycle_success_promotes_next_to_current_and_clears_it() {
+        let lock = GlobalStateLock::new();
+        let _broker = EnvGuard::set(&lock, BROKER_ENV, r#"["/configured/broker"]"#);
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (context, record) = persisted_bound(&tmp);
+        queue_next_account(&context, &record.id, "runtime-binding-fixture", "poies").unwrap();
+        let apply = begin_next_apply(&context, &record.id, "runtime-binding-fixture").unwrap();
+        assert_eq!(apply, Some(("poies".to_string(), 1)));
+        assert_eq!(
+            ensure_input_allowed(&reload(&context, &record.id))
+                .unwrap_err()
+                .code(),
+            "codex-account-next-pending",
+            "input stays fenced while the queued account is applying"
+        );
+        let view = finish_next_apply(
+            &context,
+            &record.id,
+            "runtime-binding-fixture",
+            "poies",
+            1,
+            Ok(()),
+        )
+        .unwrap();
+        assert_eq!(view.selected_account.as_deref(), Some("poies"));
+        assert_eq!(view.state, "bound");
+        assert_eq!(
+            view.revision, 8,
+            "the applied binding revision advances on apply"
+        );
+        assert!(view.next.is_none(), "a successful apply clears the intent");
+        assert!(ensure_input_allowed(&reload(&context, &record.id)).is_ok());
+    }
+
+    #[test]
+    fn apply_failure_is_visible_and_keeps_input_fenced() {
+        let lock = GlobalStateLock::new();
+        let _broker = EnvGuard::set(&lock, BROKER_ENV, r#"["/configured/broker"]"#);
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (context, record) = persisted_bound(&tmp);
+        queue_next_account(&context, &record.id, "runtime-binding-fixture", "poies").unwrap();
+        begin_next_apply(&context, &record.id, "runtime-binding-fixture").unwrap();
+        let view = finish_next_apply(
+            &context,
+            &record.id,
+            "runtime-binding-fixture",
+            "poies",
+            1,
+            Err("refresh_failed"),
+        )
+        .unwrap();
+        assert_eq!(
+            view.selected_account.as_deref(),
+            Some("gamania"),
+            "a failed apply never changes the applied account"
+        );
+        let next = view.next.expect("a failed intent stays visible");
+        assert_eq!(next.state, "failed");
+        assert_eq!(next.failure_reason.as_deref(), Some("refresh_failed"));
+        assert_eq!(
+            ensure_input_allowed(&reload(&context, &record.id))
+                .unwrap_err()
+                .code(),
+            "codex-account-next-pending"
+        );
+        assert_eq!(
+            begin_next_apply(&context, &record.id, "runtime-binding-fixture").unwrap(),
+            None,
+            "a failed intent is not re-driven without an explicit retry"
+        );
+    }
+
+    #[test]
+    fn restart_recovery_requeues_in_flight_apply() {
+        let lock = GlobalStateLock::new();
+        let _broker = EnvGuard::set(&lock, BROKER_ENV, r#"["/configured/broker"]"#);
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (context, record) = persisted_bound(&tmp);
+        queue_next_account(&context, &record.id, "runtime-binding-fixture", "poies").unwrap();
+        begin_next_apply(&context, &record.id, "runtime-binding-fixture").unwrap();
+        let mut current = reload(&context, &record.id);
+        assert_eq!(view_for_record(&current).next.unwrap().state, "applying");
+        recover_next_after_restart(&mut current).unwrap();
+        assert_eq!(
+            view_for_record(&current)
+                .next
+                .expect("recovered intent")
+                .state,
+            "queued"
+        );
+        assert_eq!(
+            pending_next_apply(&current).unwrap(),
+            Some(("poies".to_string(), 1)),
+            "a recovered intent is drainable again"
+        );
+    }
+
+    #[test]
+    fn stale_worker_cannot_finish_after_supersession() {
+        let lock = GlobalStateLock::new();
+        let _broker = EnvGuard::set(&lock, BROKER_ENV, r#"["/configured/broker"]"#);
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (context, record) = persisted_bound(&tmp);
+        queue_next_account(&context, &record.id, "runtime-binding-fixture", "poies").unwrap();
+        begin_next_apply(&context, &record.id, "runtime-binding-fixture").unwrap();
+        queue_next_account(&context, &record.id, "runtime-binding-fixture", "sym").unwrap();
+        let error = finish_next_apply(
+            &context,
+            &record.id,
+            "runtime-binding-fixture",
+            "poies",
+            1,
+            Ok(()),
+        )
+        .unwrap_err();
+        assert_eq!(error.code(), "codex-account-next-superseded");
+        let view = view_for_record(&reload(&context, &record.id));
+        assert_eq!(view.selected_account.as_deref(), Some("gamania"));
+        assert_eq!(view.next.unwrap().account.as_deref(), Some("sym"));
+    }
+
+    #[test]
+    fn stale_worker_cannot_finish_after_cancel_and_requeue() {
+        let lock = GlobalStateLock::new();
+        let _broker = EnvGuard::set(&lock, BROKER_ENV, r#"["/configured/broker"]"#);
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (context, record) = persisted_bound(&tmp);
+        queue_next_account(&context, &record.id, "runtime-binding-fixture", "poies").unwrap();
+        begin_next_apply(&context, &record.id, "runtime-binding-fixture").unwrap();
+        // Cancel by selecting the current account, then re-queue the same one.
+        queue_next_account(&context, &record.id, "runtime-binding-fixture", "gamania").unwrap();
+        queue_next_account(&context, &record.id, "runtime-binding-fixture", "poies").unwrap();
+        let error = finish_next_apply(
+            &context,
+            &record.id,
+            "runtime-binding-fixture",
+            "poies",
+            1,
+            Ok(()),
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.code(),
+            "codex-account-next-superseded",
+            "a stale worker cannot complete against a re-queued intent it does not own"
+        );
+    }
+
+    #[test]
+    fn stale_session_incarnation_cannot_queue_next() {
+        let lock = GlobalStateLock::new();
+        let _broker = EnvGuard::set(&lock, BROKER_ENV, r#"["/configured/broker"]"#);
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (context, record) = persisted_bound(&tmp);
+        let error = queue_next_account(&context, &record.id, "stale-launch", "poies").unwrap_err();
+        assert_eq!(error.code(), "codex-account-session-incarnation-conflict");
+        assert!(
+            view_for_record(&reload(&context, &record.id))
+                .next
+                .is_none()
+        );
     }
 }

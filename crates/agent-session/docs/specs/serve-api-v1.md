@@ -213,14 +213,22 @@ is no second state model.
   terminal keys; unsupported or not-yet-ready sessions fail closed.
 - `PUT /sessions/{id}/account` accepts
   `{ "account": "nickname", "expected_session_incarnation": "launch-id" }`
-  only for
-  an idle, serve-managed Codex app-server runtime. It does not recreate tmux or
-  resume the provider conversation. The daemon resolves credentials through the
-  host broker, sends Codex `account/login/start` with `chatgptAuthTokens`, and
-  returns only after the durable binding is `bound` to the current launch id.
-  Prompt, terminal-input, and auto-resume submission paths fail closed while a
-  selected binding is `pending` or `failed`, so the next accepted prompt uses
-  the newly selected account.
+  only for a serve-managed Codex app-server runtime. At the authoritative
+  `waiting` boundary, the daemon applies the account immediately without
+  recreating tmux or resuming the provider conversation. While a turn is
+  `working`, it instead stores an additive durable `next` intent and leaves
+  `selected_account` unchanged until that intent applies successfully. The
+  public `next` projection contains only the desired nickname, revision,
+  `queued` / `applying` / `failed` state, and a safe failure reason.
+  The control loop drains a queued intent when the turn becomes `waiting`,
+  resolves credentials through the host broker, and sends Codex
+  `account/login/start` with `chatgptAuthTokens`. Success flips the durable
+  binding and clears `next`; failure preserves the applied binding and marks
+  the intent failed. Prompt, terminal-input, and auto-resume submission paths
+  fail closed while a selected binding is `pending` or `failed`, or while
+  any live or malformed next intent exists, so the next accepted prompt uses
+  the newly selected account. An interrupted `applying` intent is re-queued
+  when the session runtime restarts.
 - `POST /sessions` normally creates a fresh session from `agent`, optional
   `cwd`, `title`, `title_state`, `id`, `prompt`, `coordination_mode`, and
   `agent_args`. `coordination_mode` accepts `advisory`, `enforce`, or `off` and
