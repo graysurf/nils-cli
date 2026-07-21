@@ -66,11 +66,21 @@ is no second state model.
   bounded `resume_blocked_reason` code. Old records and daemons omit the
   additive fields.
   `data.capabilities.last_prompt` advertises the list `last_prompt` preview: the
-  most recent user prompt for a running Codex/Claude session, resolved on demand
-  from the provider transcript so it reflects prompts submitted through any input
-  path (web console, SSH/Termius, or raw `tmux attach`). The text is returned in
-  the response only and is never logged or persisted by the daemon; it is omitted
-  when no recent prompt falls within the bounded tail window read.
+  most recent user prompt for a running Codex/Claude session, resolved from the
+  exact provider transcript so it reflects prompts submitted through any input
+  path (web console, SSH/Termius, or raw `tmux attach`). On first discovery the
+  daemon opens an append tail and queues one at-most-64-MiB cold recovery outside
+  the list-response path. Cold recovery and append catch-up are single-flight per
+  session and share a daemon-wide concurrency bound. A list response omits
+  `last_prompt` while that work is pending or while known unread backlog remains;
+  it never reports the known stale cached preview as current. Later list polls
+  use a bounded metadata/continuity check, retain the newest caught-up preview in
+  process memory, and avoid recurring cold scans when the stable registry is at
+  capacity. Rotation, truncation, or identity drift invalidates that memory and
+  forces exact rediscovery. The text is returned in the response only and is
+  never logged or persisted by the daemon. The field is omitted when the exact
+  provider identity or a prompt inside the cold-recovery bound is unavailable;
+  the daemon never guesses a transcript match.
   `startup` is the metadata-only `agent-session.startup.v1` projection shared by
   create, list, and glance responses. Its state is `starting`, `ready`, or
   `failed`; its bounded stage is `record`, `tmux`, `runtime`, `app_server`,

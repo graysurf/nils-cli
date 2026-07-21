@@ -57,8 +57,9 @@ use crate::codex_app_server::{self, ControlHandle};
 use crate::coordination::server as coordination_server;
 use crate::maintenance::{self, MaintenanceActionRequest, MaintenanceOperation};
 use crate::provider_prompt::{
-    MAX_LAST_PROMPT_TAIL_BYTES, MAX_PROVIDER_PROMPT_BYTES, PROVIDER_PROMPT_CAPABILITY,
-    ProviderKind, ProviderPromptEvent, ProviderPromptSource, ProviderPromptTail, read_last_prompt,
+    LastPrompt, MAX_PROVIDER_PROMPT_BYTES, PROVIDER_PROMPT_CAPABILITY, ProviderKind,
+    ProviderLastPromptRefresh, ProviderLastPromptTracker, ProviderPromptEvent,
+    ProviderPromptSource, ProviderPromptTail,
 };
 use crate::{
     BINARY, CliContext, CliError, ProviderResumeImportArgs, SessionRecord, SessionRegistryFence,
@@ -100,6 +101,7 @@ const CODEX_CREATE_PROMPT_CONTROL_WAIT: Duration = CODEX_ACCOUNT_BINDING_WAIT;
 const PROVIDER_PROMPT_DISCOVERY_MAX_BACKOFF: Duration = Duration::from_secs(30);
 const PROVIDER_PROMPT_DISCOVERY_MAX_ENTRIES: usize = 64;
 const PROVIDER_PROMPT_DISCOVERY_MAX_CONCURRENT_SCANS: usize = 4;
+const PROVIDER_PROMPT_RECOVERY_MAX_CONCURRENT_SCANS: usize = 2;
 const MAX_CONCURRENT_AUTO_RESUME_TICKS: usize = 4;
 const MAX_AGENT_LAUNCH_PROFILES: usize = 16;
 const AGENT_LAUNCH_PROFILE_READINESS_TIMEOUT: Duration = Duration::from_secs(2);
@@ -2823,13 +2825,11 @@ async fn list_handler(State(state): State<Arc<ServeState>>) -> Response {
 /// Best-effort enrichment: attach each running Codex/Claude session's most recent
 /// user prompt to the list projection.
 ///
-/// The prompt is read on demand from the provider transcript — the source of
-/// truth for every input path (console HTTP, Termius SSH, raw `tmux attach`) — and
-/// returned in the response only; it is never persisted by the daemon. The
-/// transcript path resolves through the bounded, backed-off discovery registry so
-/// a cold lookup never triggers an unbounded per-poll scan, and a turn that writes
-/// more than `MAX_LAST_PROMPT_TAIL_BYTES` after its prompt is a tolerated miss (the
-/// preview is simply omitted for that poll).
+/// Cold recovery and bounded backlog catch-up run in the background. While
+/// either is pending, the list projection omits `last_prompt` rather than
+/// returning a known-stale value. The latest caught-up value remains
+/// process-local and is returned in the response only; it is never persisted by
+/// the daemon.
 async fn enrich_last_prompts(state: &Arc<ServeState>, sessions: &mut [SessionView]) {
     for session in sessions.iter_mut() {
         if session.status == "stopped" || !matches!(session.agent.as_str(), "codex" | "claude") {
@@ -2842,19 +2842,7 @@ async fn enrich_last_prompts(state: &Arc<ServeState>, sessions: &mut [SessionVie
         else {
             continue;
         };
-        let Some(source) = state
-            .provider_prompt_discovery
-            .resolve_source(&record)
-            .await
-        else {
-            continue;
-        };
-        session.last_prompt = tokio::task::spawn_blocking(move || {
-            read_last_prompt(&source, MAX_LAST_PROMPT_TAIL_BYTES)
-        })
-        .await
-        .ok()
-        .flatten();
+        session.last_prompt = state.provider_prompt_discovery.last_prompt(&record).await;
     }
 }
 
@@ -5517,10 +5505,14 @@ struct ProviderPromptDiscoveryRegistry {
     >,
     resolver: Arc<ProviderPromptSourceResolver>,
     scan_permits: Arc<tokio::sync::Semaphore>,
+    tracker_opener: Arc<ProviderLastPromptTrackerOpener>,
+    recovery_permits: Arc<tokio::sync::Semaphore>,
 }
 
 type ProviderPromptSourceResolver =
     dyn Fn(&crate::SessionRecord) -> Option<ProviderPromptSource> + Send + Sync;
+type ProviderLastPromptTrackerOpener =
+    dyn Fn(ProviderPromptSource) -> Option<ProviderLastPromptTracker> + Send + Sync;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct ProviderPromptDiscoveryKey {
@@ -5534,6 +5526,8 @@ struct ProviderPromptDiscoveryKey {
 
 struct ProviderPromptDiscoverySlot {
     source: Option<ProviderPromptSource>,
+    last_prompt_tracker: Arc<StdMutex<Option<ProviderLastPromptTracker>>>,
+    last_prompt_in_flight: bool,
     in_flight: bool,
     progress: tokio::sync::watch::Sender<u64>,
     next_scan_at: Option<Instant>,
@@ -5602,6 +5596,8 @@ impl Default for ProviderPromptDiscoverySlot {
         let (progress, _) = tokio::sync::watch::channel(0);
         Self {
             source: None,
+            last_prompt_tracker: Arc::new(StdMutex::new(None)),
+            last_prompt_in_flight: false,
             in_flight: false,
             progress,
             next_scan_at: None,
@@ -5618,6 +5614,10 @@ impl Default for ProviderPromptDiscoveryRegistry {
             resolver: Arc::new(ProviderPromptTail::resolve_source),
             scan_permits: Arc::new(tokio::sync::Semaphore::new(
                 PROVIDER_PROMPT_DISCOVERY_MAX_CONCURRENT_SCANS,
+            )),
+            tracker_opener: Arc::new(ProviderLastPromptTracker::open_source),
+            recovery_permits: Arc::new(tokio::sync::Semaphore::new(
+                PROVIDER_PROMPT_RECOVERY_MAX_CONCURRENT_SCANS,
             )),
         }
     }
@@ -5650,6 +5650,29 @@ impl ProviderPromptDiscoveryRegistry {
             scan_permits: Arc::new(tokio::sync::Semaphore::new(
                 PROVIDER_PROMPT_DISCOVERY_MAX_CONCURRENT_SCANS,
             )),
+            tracker_opener: Arc::new(ProviderLastPromptTracker::open_source),
+            recovery_permits: Arc::new(tokio::sync::Semaphore::new(
+                PROVIDER_PROMPT_RECOVERY_MAX_CONCURRENT_SCANS,
+            )),
+        }
+    }
+
+    #[cfg(test)]
+    fn with_resolver_and_tracker_opener<F, G>(resolver: F, tracker_opener: G) -> Self
+    where
+        F: Fn(&crate::SessionRecord) -> Option<ProviderPromptSource> + Send + Sync + 'static,
+        G: Fn(ProviderPromptSource) -> Option<ProviderLastPromptTracker> + Send + Sync + 'static,
+    {
+        Self {
+            entries: tokio::sync::Mutex::new(HashMap::new()),
+            resolver: Arc::new(resolver),
+            scan_permits: Arc::new(tokio::sync::Semaphore::new(
+                PROVIDER_PROMPT_DISCOVERY_MAX_CONCURRENT_SCANS,
+            )),
+            tracker_opener: Arc::new(tracker_opener),
+            recovery_permits: Arc::new(tokio::sync::Semaphore::new(
+                PROVIDER_PROMPT_RECOVERY_MAX_CONCURRENT_SCANS,
+            )),
         }
     }
 
@@ -5660,12 +5683,9 @@ impl ProviderPromptDiscoveryRegistry {
             entries.retain(|existing, _| existing.session_id != key.session_id || existing == &key);
             if !entries.contains_key(&key) && entries.len() >= PROVIDER_PROMPT_DISCOVERY_MAX_ENTRIES
             {
-                let evicted = entries.iter().find_map(|(existing, slot)| {
-                    let state = slot.try_lock().ok()?;
-                    (!state.in_flight && existing != &key).then(|| existing.clone())
-                });
-                let evicted = evicted?;
-                entries.remove(&evicted);
+                // Stable admission avoids turning every list pass above the
+                // registry bound into another expensive cold-recovery scan.
+                return None;
             }
             entries
                 .entry(key.clone())
@@ -5724,6 +5744,119 @@ impl ProviderPromptDiscoveryRegistry {
         }
     }
 
+    async fn last_prompt(&self, record: &crate::SessionRecord) -> Option<LastPrompt> {
+        let key = ProviderPromptDiscoveryKey::from_record(record)?;
+        let source = self.resolve_source(record).await?;
+        let slot = self.entries.lock().await.get(&key).cloned()?;
+        let tracker_cell = {
+            let mut state = slot.lock().await;
+            if state.last_prompt_in_flight {
+                return None;
+            }
+            state.last_prompt_in_flight = true;
+            state.last_prompt_tracker.clone()
+        };
+        let task_cell = tracker_cell.clone();
+        let cached = tokio::task::spawn_blocking(move || {
+            let Ok(tracker) = task_cell.lock() else {
+                return ProviderLastPromptRefresh::Invalidated;
+            };
+            tracker
+                .as_ref()
+                .map_or(ProviderLastPromptRefresh::Pending, |tracker| {
+                    tracker.cached_refresh()
+                })
+        })
+        .await
+        .unwrap_or(ProviderLastPromptRefresh::Invalidated);
+        match cached {
+            ProviderLastPromptRefresh::Current(prompt) => {
+                let mut state = slot.lock().await;
+                if Arc::ptr_eq(&state.last_prompt_tracker, &tracker_cell) {
+                    state.last_prompt_in_flight = false;
+                    prompt
+                } else {
+                    None
+                }
+            }
+            ProviderLastPromptRefresh::Pending => {
+                self.spawn_last_prompt_refresh(slot, tracker_cell, source);
+                None
+            }
+            ProviderLastPromptRefresh::Invalidated => {
+                let mut state = slot.lock().await;
+                if Arc::ptr_eq(&state.last_prompt_tracker, &tracker_cell) {
+                    state.last_prompt_in_flight = false;
+                }
+                drop(state);
+                self.invalidate_source(record).await;
+                None
+            }
+        }
+    }
+
+    fn spawn_last_prompt_refresh(
+        &self,
+        slot: Arc<tokio::sync::Mutex<ProviderPromptDiscoverySlot>>,
+        tracker_cell: Arc<StdMutex<Option<ProviderLastPromptTracker>>>,
+        source: ProviderPromptSource,
+    ) {
+        let tracker_opener = self.tracker_opener.clone();
+        let recovery_permits = self.recovery_permits.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok(_permit) = recovery_permits.clone().acquire_owned().await else {
+                    let mut state = slot.lock().await;
+                    if Arc::ptr_eq(&state.last_prompt_tracker, &tracker_cell) {
+                        state.last_prompt_in_flight = false;
+                    }
+                    return;
+                };
+                let task_cell = tracker_cell.clone();
+                let task_source = source.clone();
+                let task_opener = tracker_opener.clone();
+                let refresh = tokio::task::spawn_blocking(move || {
+                    let Ok(mut tracker) = task_cell.lock() else {
+                        return ProviderLastPromptRefresh::Invalidated;
+                    };
+                    if tracker.is_none() {
+                        *tracker = task_opener(task_source);
+                    }
+                    let Some(tracker) = tracker.as_mut() else {
+                        return ProviderLastPromptRefresh::Invalidated;
+                    };
+                    tracker.refresh()
+                })
+                .await
+                .unwrap_or(ProviderLastPromptRefresh::Invalidated);
+                drop(_permit);
+
+                let mut state = slot.lock().await;
+                if !Arc::ptr_eq(&state.last_prompt_tracker, &tracker_cell) {
+                    return;
+                }
+                match refresh {
+                    ProviderLastPromptRefresh::Current(_) => {
+                        state.last_prompt_in_flight = false;
+                        return;
+                    }
+                    ProviderLastPromptRefresh::Pending => {
+                        drop(state);
+                        tokio::task::yield_now().await;
+                    }
+                    ProviderLastPromptRefresh::Invalidated => {
+                        state.source = None;
+                        state.last_prompt_tracker = Arc::new(StdMutex::new(None));
+                        state.last_prompt_in_flight = false;
+                        state.next_scan_at = None;
+                        state.backoff = PROVIDER_PROMPT_PENDING_POLL_INTERVAL;
+                        return;
+                    }
+                }
+            }
+        });
+    }
+
     async fn invalidate_source(&self, record: &crate::SessionRecord) {
         let Some(key) = ProviderPromptDiscoveryKey::from_record(record) else {
             return;
@@ -5732,6 +5865,8 @@ impl ProviderPromptDiscoveryRegistry {
         if let Some(slot) = slot {
             let mut state = slot.lock().await;
             state.source = None;
+            state.last_prompt_tracker = Arc::new(StdMutex::new(None));
+            state.last_prompt_in_flight = false;
             state.next_scan_at = None;
             state.backoff = PROVIDER_PROMPT_PENDING_POLL_INTERVAL;
         }
@@ -5764,6 +5899,14 @@ impl ProviderPromptDiscoveryRegistry {
     #[cfg(test)]
     async fn entry_count(&self) -> usize {
         self.entries.lock().await.len()
+    }
+
+    #[cfg(test)]
+    async fn contains_record(&self, record: &crate::SessionRecord) -> bool {
+        let Some(key) = ProviderPromptDiscoveryKey::from_record(record) else {
+            return false;
+        };
+        self.entries.lock().await.contains_key(&key)
     }
 
     #[cfg(test)]
@@ -7865,6 +8008,197 @@ mod tests {
         assert_eq!(registry.scan_attempts(&record).await, 1);
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn provider_prompt_recovery_is_single_flight_and_concurrency_bounded() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let transcript = tmp.path().join("prompt.jsonl");
+        std::fs::write(&transcript, "").expect("transcript");
+        let started = Arc::new(AtomicUsize::new(0));
+        let active = Arc::new(AtomicUsize::new(0));
+        let max_active = Arc::new(AtomicUsize::new(0));
+        let release = Arc::new(AtomicBool::new(false));
+        let registry = Arc::new(
+            ProviderPromptDiscoveryRegistry::with_resolver_and_tracker_opener(
+                {
+                    let transcript = transcript.clone();
+                    move |record| {
+                        Some(ProviderPromptSource::test_path(
+                            ProviderKind::Codex,
+                            record.id.clone(),
+                            transcript.clone(),
+                        ))
+                    }
+                },
+                {
+                    let started = started.clone();
+                    let active = active.clone();
+                    let max_active = max_active.clone();
+                    let release = release.clone();
+                    move |_| {
+                        started.fetch_add(1, Ordering::SeqCst);
+                        let current = active.fetch_add(1, Ordering::SeqCst) + 1;
+                        max_active.fetch_max(current, Ordering::SeqCst);
+                        while !release.load(Ordering::SeqCst) {
+                            std::thread::sleep(Duration::from_millis(5));
+                        }
+                        active.fetch_sub(1, Ordering::SeqCst);
+                        None
+                    }
+                },
+            ),
+        );
+        let records: Vec<_> = (0..6)
+            .map(|index| {
+                provider_discovery_record(
+                    &format!("recovery-{index}"),
+                    &format!("hs-recovery-{index}"),
+                    &format!("launch-recovery-{index}"),
+                    1,
+                )
+            })
+            .collect();
+
+        for record in &records {
+            assert!(registry.last_prompt(record).await.is_none());
+        }
+        while started.load(Ordering::SeqCst) < PROVIDER_PROMPT_RECOVERY_MAX_CONCURRENT_SCANS {
+            tokio::task::yield_now().await;
+        }
+        for record in &records {
+            assert!(registry.last_prompt(record).await.is_none());
+        }
+        assert_eq!(
+            started.load(Ordering::SeqCst),
+            PROVIDER_PROMPT_RECOVERY_MAX_CONCURRENT_SCANS,
+            "duplicate list polls must not start duplicate recoveries"
+        );
+        assert_eq!(
+            max_active.load(Ordering::SeqCst),
+            PROVIDER_PROMPT_RECOVERY_MAX_CONCURRENT_SCANS
+        );
+
+        release.store(true, Ordering::SeqCst);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if started.load(Ordering::SeqCst) == records.len()
+                    && active.load(Ordering::SeqCst) == 0
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("bounded recoveries complete");
+        assert!(max_active.load(Ordering::SeqCst) <= PROVIDER_PROMPT_RECOVERY_MAX_CONCURRENT_SCANS);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn provider_prompt_discovery_recovers_and_tracks_long_codex_turns() {
+        let lock = GlobalStateLock::new();
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let codex_home = tmp.path().join("codex-home");
+        let transcript = codex_home.join("sessions/2026/07/session.jsonl");
+        std::fs::create_dir_all(transcript.parent().expect("transcript parent"))
+            .expect("transcript dir");
+        let provider_id = "long-codex-provider";
+        let metadata = format!(
+            "{}\n",
+            json!({
+                "type":"session_meta",
+                "payload":{
+                    "id":provider_id,
+                    "session_id":provider_id,
+                    "cwd":"/tmp",
+                    "source":"cli",
+                    "timestamp":"2099-01-01T00:00:00Z"
+                }
+            })
+        );
+        let prompt_line = |text: &str| {
+            format!(
+                "{}\n",
+                json!({
+                    "type":"event_msg",
+                    "payload":{"type":"user_message","message":text}
+                })
+            )
+        };
+        let long_output = format!("{}\n", " ".repeat(1024 * 1024));
+        std::fs::write(
+            &transcript,
+            format!("{metadata}{}{}", prompt_line("cold prompt"), long_output),
+        )
+        .expect("transcript");
+        let _codex_home = EnvGuard::set(&lock, "CODEX_HOME", codex_home.to_str().unwrap());
+        let mut record = provider_discovery_record("long-codex", "hs-long-codex", "launch", 1);
+        record.agent = "codex".to_string();
+        let resume = record.provider_resume.as_mut().expect("provider resume");
+        resume.provider = "codex".to_string();
+        resume.session_id = provider_id.to_string();
+        let registry = ProviderPromptDiscoveryRegistry::default();
+
+        assert_eq!(
+            registry.last_prompt(&record).await,
+            None,
+            "cold recovery must warm outside the GET /sessions critical path"
+        );
+        let cold_prompt = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Some(prompt) = registry.last_prompt(&record).await {
+                    break prompt;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("cold prompt recovery")
+        .text;
+        assert_eq!(cold_prompt, "cold prompt");
+        OpenOptions::new()
+            .append(true)
+            .open(&transcript)
+            .expect("append transcript")
+            .write_all(prompt_line("appended prompt").as_bytes())
+            .expect("append prompt");
+        assert_eq!(
+            registry.last_prompt(&record).await,
+            None,
+            "a changed transcript must omit the cached prompt while refreshing"
+        );
+        let appended_prompt = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Some(prompt) = registry.last_prompt(&record).await {
+                    break prompt;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("appended prompt refresh")
+        .text;
+        assert_eq!(appended_prompt, "appended prompt");
+
+        std::fs::write(
+            &transcript,
+            format!("{metadata}{}", prompt_line("replacement prompt")),
+        )
+        .expect("replace transcript");
+        assert_eq!(registry.last_prompt(&record).await, None);
+        let replacement_prompt = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Some(prompt) = registry.last_prompt(&record).await {
+                    break prompt;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("replacement prompt recovery")
+        .text;
+        assert_eq!(replacement_prompt, "replacement prompt");
+    }
+
     #[tokio::test]
     async fn provider_prompt_discovery_prunes_old_runtimes_and_deleted_sessions() {
         let registry = ProviderPromptDiscoveryRegistry::with_resolver(|_| None);
@@ -7903,16 +8237,39 @@ mod tests {
     #[tokio::test]
     async fn provider_prompt_discovery_bounds_distinct_session_churn() {
         let registry = ProviderPromptDiscoveryRegistry::with_resolver(|_| None);
-        for index in 0..(PROVIDER_PROMPT_DISCOVERY_MAX_ENTRIES + 10) {
+        let retained: Vec<_> = (0..PROVIDER_PROMPT_DISCOVERY_MAX_ENTRIES)
+            .map(|index| {
+                let id = format!("discovery-churn-{index}");
+                provider_discovery_record(&id, &format!("hs-{id}"), &format!("launch-{index}"), 1)
+            })
+            .collect();
+        for record in &retained {
+            assert!(registry.resolve_source(record).await.is_none());
+        }
+        for index in 0..10 {
             let id = format!("discovery-churn-{index}");
-            let record =
-                provider_discovery_record(&id, &format!("hs-{id}"), &format!("launch-{index}"), 1);
+            let record = provider_discovery_record(
+                &format!("overflow-{id}"),
+                &format!("hs-overflow-{id}"),
+                &format!("overflow-launch-{index}"),
+                1,
+            );
             assert!(registry.resolve_source(&record).await.is_none());
+            assert!(
+                !registry.contains_record(&record).await,
+                "overflow sessions must not churn the stable recovery set"
+            );
         }
         assert_eq!(
             registry.entry_count().await,
             PROVIDER_PROMPT_DISCOVERY_MAX_ENTRIES
         );
+        for record in &retained {
+            assert!(
+                registry.contains_record(record).await,
+                "stable entries must survive repeated overflow attempts"
+            );
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -12166,6 +12523,134 @@ esac
         .await;
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(body["error"]["code"], "token-not-configured");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sessions_list_omits_last_prompt_while_background_recovery_is_pending() {
+        let lock = GlobalStateLock::new();
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let state_dir = tmp.path().join("state");
+        let codex_home = tmp.path().join("codex-home");
+        let transcript = codex_home.join("sessions/2026/07/session.jsonl");
+        std::fs::create_dir_all(transcript.parent().expect("transcript parent"))
+            .expect("transcript dir");
+        let provider_id = "list-background-recovery";
+        let metadata = format!(
+            "{}\n",
+            json!({
+                "type":"session_meta",
+                "payload":{
+                    "id":provider_id,
+                    "session_id":provider_id,
+                    "cwd":"/tmp",
+                    "source":"cli",
+                    "timestamp":"2099-01-01T00:00:00Z"
+                }
+            })
+        );
+        let prompt_line = |text: &str| {
+            format!(
+                "{}\n",
+                json!({
+                    "type":"event_msg",
+                    "payload":{"type":"user_message","message":text}
+                })
+            )
+        };
+        std::fs::write(
+            &transcript,
+            format!("{metadata}{}", prompt_line("cold prompt")),
+        )
+        .expect("transcript");
+        let _codex_home = EnvGuard::set(&lock, "CODEX_HOME", codex_home.to_str().unwrap());
+        seed_session_with_runtime(&state_dir, "prompt-list", "codex", "hs-prompt-list");
+        let record_path = state_dir.join("sessions/prompt-list/session.json");
+        let mut record: Value =
+            serde_json::from_slice(&std::fs::read(&record_path).expect("session record"))
+                .expect("session json");
+        record["provider_resume"] = json!({
+            "provider":"codex",
+            "session_id":provider_id,
+            "captured_at":"2099-01-01T00:00:00Z",
+            "capture_method":"codex-explicit-session-id",
+            "resume_args":["resume", provider_id]
+        });
+        std::fs::write(
+            &record_path,
+            serde_json::to_vec_pretty(&record).expect("session json"),
+        )
+        .expect("session record");
+        let tmux_calls = tmp.path().join("tmux.calls");
+        let tmux = failing_delete_tmux(tmp.path(), &state_dir, "prompt-list", 77, &tmux_calls);
+        let state = state(&state_dir, Some(TOKEN), tmux);
+        let persisted = load_session_record(&state.context, "prompt-list")
+            .expect("persisted prompt-list session");
+        assert!(
+            state
+                .provider_prompt_discovery
+                .resolve_source(&persisted)
+                .await
+                .is_some(),
+            "the HTTP fixture must provide one exact transcript identity"
+        );
+
+        let (status, first) = call(router(state.clone()), get("/sessions")).await;
+        assert_eq!(status, StatusCode::OK, "body={first}");
+        assert_eq!(
+            first["data"]["sessions"][0]["status"], "running",
+            "the fixture must enter prompt enrichment: body={first}"
+        );
+        assert!(
+            first["data"]["sessions"][0]
+                .as_object()
+                .is_some_and(|session| !session.contains_key("last_prompt")),
+            "the first response must not wait for or expose partial cold recovery"
+        );
+        let cold = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let (_, body) = call(router(state.clone()), get("/sessions")).await;
+                if let Some(text) = body["data"]["sessions"][0]["last_prompt"]["text"].as_str() {
+                    break text.to_string();
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("cold prompt warmup");
+        assert_eq!(cold, "cold prompt");
+
+        OpenOptions::new()
+            .append(true)
+            .open(&transcript)
+            .expect("append transcript")
+            .write_all(
+                format!(
+                    "{}\n{}",
+                    " ".repeat(1024 * 1024),
+                    prompt_line("appended prompt")
+                )
+                .as_bytes(),
+            )
+            .expect("append backlog and prompt");
+        let (_, catching_up) = call(router(state.clone()), get("/sessions")).await;
+        assert!(
+            catching_up["data"]["sessions"][0]
+                .as_object()
+                .is_some_and(|session| !session.contains_key("last_prompt")),
+            "known unread backlog must omit rather than expose the stale cached prompt"
+        );
+        let appended = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let (_, body) = call(router(state.clone()), get("/sessions")).await;
+                if let Some(text) = body["data"]["sessions"][0]["last_prompt"]["text"].as_str() {
+                    break text.to_string();
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("append catch-up");
+        assert_eq!(appended, "appended prompt");
     }
 
     #[tokio::test]
