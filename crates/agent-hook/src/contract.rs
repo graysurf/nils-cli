@@ -253,14 +253,6 @@ fn validate_policy(bundle: &PolicyBundle, config: &Config) -> Result<(), HookErr
             }
         }
         validate_capability(&rule.capability)?;
-        if matches!(rule.capability, Capability::ExecutionReadOnly { .. })
-            && !matches!(rule.mode, RuleMode::Shadow)
-        {
-            return Err(HookError::data(
-                "read-only-capability-not-shadow",
-                "execution.read-only.v1 remains shadow-only until runtime cutover",
-            ));
-        }
         if matches!(rule.capability, Capability::SessionCoordination { .. })
             && (!matches!(rule.mode, RuleMode::Enforce)
                 || !matches!(rule.failure_posture, FailurePosture::Closed)

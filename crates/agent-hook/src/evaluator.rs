@@ -195,7 +195,9 @@ pub fn prepare<'a>(
         .filter(|prepared| match prepared.mode {
             RuleMode::Enforce => matches!(
                 prepared.rule.capability,
-                Capability::SessionActivity { .. } | Capability::RuntimeKitHandler { .. }
+                Capability::SessionActivity { .. }
+                    | Capability::ExecutionReadOnly { .. }
+                    | Capability::RuntimeKitHandler { .. }
             ),
             RuleMode::Shadow => {
                 matches!(
@@ -350,7 +352,7 @@ fn evaluate_shadow(
         Capability::SemanticConflict { reason_code } => simple(DecisionAction::Warn, reason_code),
         Capability::OwnerLiveness { reason_code, .. } => simple(DecisionAction::Warn, reason_code),
         Capability::ExecutionReadOnly { reason_code } => {
-            evaluate_read_only_shadow(request, raw, execution_budget, reason_code)
+            evaluate_read_only(request, raw, execution_budget, reason_code)
         }
         Capability::SessionActivity { .. }
         | Capability::SessionCoordination { .. }
@@ -360,7 +362,7 @@ fn evaluate_shadow(
     }
 }
 
-fn evaluate_read_only_shadow(
+fn evaluate_read_only(
     request: &NormalizedRequest,
     raw: &[u8],
     execution_budget: &mut ExecutionBudget,
@@ -450,8 +452,7 @@ fn evaluate_capability(
             unreachable!("session coordination is evaluated after aggregate policy")
         }
         Capability::ExecutionReadOnly { reason_code } => {
-            let _ = reason_code;
-            unreachable!("validated execution.read-only.v1 rules are shadow-only")
+            evaluate_read_only(request, raw, execution_budget, reason_code)
         }
         Capability::RuntimeKitHandler { handler_id } => {
             run_runtime_handler(request.product, handler_id, raw, execution_budget)?

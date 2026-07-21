@@ -216,7 +216,15 @@ The stable built-in capability ID set for policy v1 is closed:
   `legacy_ttl_seconds`, maximum 900)
 - `agent-session.semantic-conflict.v1` (`reason_code`)
 - `agent-session.coordination.v1` (`reason_code`)
+- `execution.read-only.v1` (`reason_code`)
 - `runtime-kit.handler.v1` (`handler_id` from the compiled v1 allowlist)
+
+`execution.read-only.v1` evaluates only `PreToolUse` requests through the
+same-release operation-effect verifier. Enforce mode admits only an exact,
+fresh descriptor whose producer, cwd, target, argv, provider effect, and
+OS-enforcement contract verify; missing, malformed, unsupported, mismatched,
+or mutation evidence blocks. Shadow mode runs the same verification but records
+only the redacted observation and cannot change admission.
 
 `runtime-kit.handler.v1` is not arbitrary execution. The binary maps the
 handler ID through a compiled allowlist to one exact runtime-kit-owned handler

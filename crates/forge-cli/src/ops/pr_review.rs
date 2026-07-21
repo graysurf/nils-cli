@@ -2127,7 +2127,7 @@ fn parse_review_state_page(
         .filter(|node| {
             let author = node.pointer("/author/login").and_then(|item| item.as_str());
             let association = node.get("authorAssociation").and_then(|item| item.as_str());
-            author == Some(viewer_login.as_str())
+            author.is_some_and(|author| github_comment_author_is_viewer(author, &viewer_login))
                 || matches!(association, Some("OWNER" | "MEMBER" | "COLLABORATOR"))
         })
         .filter_map(|node| {
@@ -2171,6 +2171,13 @@ fn parse_review_state_page(
         has_next_page,
         end_cursor,
     })
+}
+
+fn github_comment_author_is_viewer(author: &str, viewer: &str) -> bool {
+    author == viewer
+        || viewer
+            .strip_suffix("[bot]")
+            .is_some_and(|canonical| !canonical.is_empty() && author == canonical)
 }
 
 fn build_github_review_state_comments_call(
@@ -3325,6 +3332,40 @@ mod tests {
         )
         .expect_err("a malformed viewer-owned marker must fail closed");
         assert_eq!(error.kind(), "review_state_conflict");
+    }
+
+    #[test]
+    fn review_state_pages_match_github_app_viewer_without_trusting_lookalikes() {
+        let output = crate::backend::BackendSuccess {
+            stdout: serde_json::json!({
+                "data": {
+                    "viewer": {"login": "review-bot[bot]"},
+                    "repository": {"pullRequest": {"comments": {
+                        "nodes": [
+                            {"author": {"login": "review-bot"}, "authorAssociation": "CONTRIBUTOR", "body": "app-owned", "createdAt": "2026-07-21T00:00:00Z"},
+                            {"author": {"login": "review-bot-lookalike"}, "authorAssociation": "CONTRIBUTOR", "body": "suffix-lookalike", "createdAt": "2026-07-21T00:00:01Z"},
+                            {"author": {"login": "review-bot[bot]-lookalike"}, "authorAssociation": "CONTRIBUTOR", "body": "bot-suffix-lookalike", "createdAt": "2026-07-21T00:00:02Z"},
+                            {"author": {"login": "unrelated-contributor"}, "authorAssociation": "CONTRIBUTOR", "body": "generic-contributor", "createdAt": "2026-07-21T00:00:03Z"},
+                            {"author": {"login": "repository-owner"}, "authorAssociation": "OWNER", "body": "owner", "createdAt": "2026-07-21T00:00:04Z"},
+                            {"author": {"login": "repository-member"}, "authorAssociation": "MEMBER", "body": "member", "createdAt": "2026-07-21T00:00:05Z"},
+                            {"author": {"login": "repository-collaborator"}, "authorAssociation": "COLLABORATOR", "body": "collaborator", "createdAt": "2026-07-21T00:00:06Z"}
+                        ],
+                        "pageInfo": {"hasNextPage": false, "endCursor": null}
+                    }}}
+                }
+            })
+            .to_string(),
+            stderr: String::new(),
+        };
+
+        let page = parse_review_state_page(&output).expect("trusted page");
+        assert_eq!(
+            page.trusted_comments
+                .iter()
+                .map(|comment| comment.body.as_str())
+                .collect::<Vec<_>>(),
+            ["app-owned", "owner", "member", "collaborator"]
+        );
     }
 
     #[test]

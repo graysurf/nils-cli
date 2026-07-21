@@ -557,9 +557,12 @@ backend mapping, validation rules, and output schema versions.
   Owned markers remain in raw provider content but are removed before semantic
   body comparison and digesting. State reads retain comments authored by the
   authenticated viewer or a provider-classified `OWNER`, `MEMBER`, or
-  `COLLABORATOR`; marker-shaped comments from unprivileged actors cannot extend
-  or poison the transaction chain. This lets a later authorized session resume
-  the same provider-visible chain without a machine-local ledger.
+  `COLLABORATOR`. For the self-author comparison only, a terminal GitHub App
+  `[bot]` suffix on the authenticated viewer is canonicalized to the comment
+  author form; no other login normalization occurs. Marker-shaped comments
+  from unprivileged actors cannot extend or poison the transaction chain. This
+  lets a later authorized session resume the same provider-visible chain
+  without a machine-local ledger.
 - Receipt fields intentionally exclude authentication tokens, credentials,
   environment-variable values, local paths, and private identity/profile names.
   The durable identity route contains only portable lens names and the semantic
