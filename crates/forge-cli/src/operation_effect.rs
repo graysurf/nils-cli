@@ -52,6 +52,14 @@ fn classify(cli: &Cli) -> (&'static str, Effect, ProviderEffect, Vec<&'static st
         Some(Command::Repo(RepoArgs {
             command: Some(RepoCommand::View),
         })) => ("repo.view", read, network, vec!["git_remote", "provider"]),
+        Some(Command::Repo(RepoArgs {
+            command: Some(RepoCommand::Bootstrap(_)),
+        })) => (
+            "repo.bootstrap",
+            mutation,
+            ProviderEffect::NetworkWrite,
+            vec!["provider", "user_config", "bootstrap_receipt"],
+        ),
         Some(Command::Pr(PrArgs {
             command: Some(command),
         })) => match command {

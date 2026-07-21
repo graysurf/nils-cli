@@ -789,6 +789,7 @@ fn resolve_targets(global: &GlobalFlags, gitlab_host: Option<&str>) -> Vec<Provi
         // The local provider is a per-repo file store with no cross-repo work
         // inbox, so it contributes no targets.
         Some(crate::cli::ProviderFlag::Local) => Vec::new(),
+        Some(crate::cli::ProviderFlag::Named(_)) => Vec::new(),
         None => vec![
             ProviderTarget {
                 provider: Provider::GitHub,

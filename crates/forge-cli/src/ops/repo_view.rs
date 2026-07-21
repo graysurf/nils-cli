@@ -38,6 +38,9 @@ pub struct RepoViewPayload {
 
 /// CLI entry point.
 pub fn run(global: &GlobalFlags, format: OutputFormat) -> Result<i32, ForgeError> {
+    if global.named_provider().is_some() {
+        return crate::forgejo::run_repo_view(global, format);
+    }
     let runner = default_runner();
     run_with(&runner, global, format, git_remote_url)
 }

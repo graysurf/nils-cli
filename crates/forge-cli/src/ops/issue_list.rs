@@ -51,6 +51,9 @@ pub fn run(
     args: IssueListArgs,
     format: OutputFormat,
 ) -> Result<i32, ForgeError> {
+    if global.named_provider().is_some() {
+        return crate::forgejo::run_issue_list(global, &args, format);
+    }
     if global.is_local() {
         let runner = crate::local::LocalRunner::from_global(global)?;
         return run_with(&runner, global, args, format, git_remote_url);
