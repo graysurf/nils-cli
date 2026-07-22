@@ -1,10 +1,10 @@
 //! `agent-runtime prune-stale` body.
 //!
 //! The command scans only install-map-owned runtime-home roots, then removes
-//! stale symlinks whose targets are lexically under the selected source root or
-//! an additional source root the caller explicitly marks as owned. Ambiguous
-//! user-owned files, non-empty directories, and foreign symlinks are reported
-//! but never deleted.
+//! stale symlinks whose targets are lexically under the canonical selected
+//! source root or an additional canonical source root the caller explicitly
+//! marks as owned. Ambiguous user-owned files, non-empty directories, and
+//! foreign symlinks are reported but never deleted.
 
 use crate::install::link_map::{LinkMap, LinkMapError};
 use crate::install::overlay::{self, LinkMapOverlay, OverlaySummary};
@@ -193,7 +193,7 @@ pub fn run(
     mode: Mode,
     options: &PruneOptions,
 ) -> Result<PruneOutcome, PruneError> {
-    let owned_source_roots = BTreeSet::from([normalize_absolute_path(source_root)]);
+    let owned_source_roots = BTreeSet::from([canonicalize_owned_source_root(source_root)]);
     run_inner(
         product,
         source_root,
@@ -262,12 +262,12 @@ fn collect_owned_source_roots(
     source_root: &Path,
     additional_owned_source_roots: &[PathBuf],
 ) -> Result<BTreeSet<PathBuf>, PruneWithOwnedRootsError> {
-    let mut roots = BTreeSet::from([normalize_absolute_path(source_root)]);
+    let mut roots = BTreeSet::from([canonicalize_owned_source_root(source_root)]);
     for root in additional_owned_source_roots {
         if !root.is_absolute() {
             return Err(PruneWithOwnedRootsError::RelativeOwnedSourceRoot { path: root.clone() });
         }
-        let root = normalize_absolute_path(root);
+        let root = canonicalize_owned_source_root(root);
         if root.parent().is_none() {
             return Err(PruneWithOwnedRootsError::FilesystemOwnedSourceRoot { path: root });
         }
@@ -628,6 +628,10 @@ fn symlink_target_is_owned(owned_source_roots: &BTreeSet<PathBuf>, target: &Path
     owned_source_roots
         .iter()
         .any(|source_root| target.starts_with(source_root))
+}
+
+fn canonicalize_owned_source_root(path: &Path) -> PathBuf {
+    fs::canonicalize(path).unwrap_or_else(|_| normalize_absolute_path(path))
 }
 
 fn normalize_absolute_path(path: &Path) -> PathBuf {
