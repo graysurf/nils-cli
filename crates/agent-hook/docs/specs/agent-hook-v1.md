@@ -255,9 +255,10 @@ The v1 allowlist is:
 Handler resolution selects the compiled `.py` or `.sh` suffix, rejects
 symlinks/non-regular files and owner/permission drift, passes the original
 bounded provider JSON on standard input, and preserves the handler's provider
-output/exit semantics. One dispatch starts at most 16 executable capabilities,
-retains at most 512 KiB of aggregate child output, and shares a two-second
-absolute deadline. Each child leads an isolated process group; timeout or
+output/exit semantics. One dispatch starts at most 17 executable capabilities,
+retains at most 512 KiB of aggregate child output, and shares a five-second
+absolute deadline aligned with the per-handler timeout. Each child leads an
+isolated process group; timeout or
 direct-child exit terminates descendants before bounded pipe draining. The
 policy cannot specify a path,
 interpreter, argv, environment assignment, shell fragment, timeout, or digest.
@@ -280,7 +281,7 @@ directory, applies the same type/owner/mode/output protections, and passes the
 original bounded provider payload on standard input. A dispatch can select at
 most one such rule. The fixed consumer has a 55-second process bound under the
 owned provider ingress's 60-second timeout so the #676 admit/complete/reconcile
-transaction is not forced through the ordinary two-second handler budget. The
+transaction is not forced through the ordinary five-second handler budget. The
 policy cannot select another command, path, arguments, environment assignment,
 or timeout through this capability.
 
