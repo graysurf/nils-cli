@@ -26,7 +26,7 @@ const MAX_HANDLER_OUTPUT: usize = 256 * 1024;
 const HANDLER_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_EXECUTABLE_CAPABILITIES: usize = 17;
 const MAX_DISPATCH_CHILD_OUTPUT: usize = 512 * 1024;
-const DISPATCH_CHILD_DEADLINE: Duration = Duration::from_secs(2);
+const DISPATCH_CHILD_DEADLINE: Duration = HANDLER_TIMEOUT;
 const SESSION_COORDINATION_HANDLER: &str = "session-coordination-guard.py";
 const SESSION_COORDINATION_TIMEOUT: Duration = Duration::from_secs(55);
 

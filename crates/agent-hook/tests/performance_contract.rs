@@ -425,7 +425,7 @@ fn child_deadline_is_dispatch_wide_and_below_provider_timeout() {
     let hooks = fixture.home.join(".codex/hooks");
     fs::create_dir_all(&hooks).expect("hooks");
     let handler = hooks.join("session-start-healthcheck.sh");
-    fs::write(&handler, b"#!/bin/sh\nsleep 1\nprintf '{}\\n'\n").expect("handler");
+    fs::write(&handler, b"#!/bin/sh\nsleep 2\nprintf '{}\\n'\n").expect("handler");
     fs::set_permissions(&handler, fs::Permissions::from_mode(0o755)).expect("handler mode");
     let started = Instant::now();
     let output = fixture.run(
@@ -437,7 +437,44 @@ fn child_deadline_is_dispatch_wide_and_below_provider_timeout() {
         output.stdout_json()["error"]["code"],
         "dispatch-deadline-exceeded"
     );
-    assert!(started.elapsed() < Duration::from_millis(2_800));
+    assert!(started.elapsed() < Duration::from_millis(5_800));
+}
+
+#[test]
+fn full_handler_set_tolerates_one_slow_probe_with_process_overhead() {
+    let mut policy = String::from(
+        "schema_version = \"agent-hook.policy.v1\"\nbundle_id = \"runtime-kit\"\nversion = \"2026.07.20.1\"\n",
+    );
+    for index in 0..17 {
+        policy.push_str(&format!(
+            "\n[[rules]]\nid = \"runtime.realistic-{index}\"\nproducts = [\"codex\"]\nevents = [\"SessionStart\"]\npriority = {index}\nmode = \"enforce\"\nfailure_posture = \"closed\"\noverride_class = \"locked\"\ncapability = {{ id = \"runtime-kit.handler.v1\", handler_id = \"session-start-healthcheck\" }}\n"
+        ));
+    }
+    let fixture = Fixture::new(&policy);
+    let hooks = fixture.home.join(".codex/hooks");
+    fs::create_dir_all(&hooks).expect("hooks");
+    let handler = hooks.join("session-start-healthcheck.sh");
+    fs::write(
+        &handler,
+        b"#!/bin/sh\nif [ ! -e \"$AGENT_HOOK_SLOW_MARKER\" ]; then\n  : > \"$AGENT_HOOK_SLOW_MARKER\"\n  sleep 1\nfi\nsleep 0.08\nprintf 'start\\n' >> \"$AGENT_HOOK_CHILD_LOG\"\nprintf '{}\\n'\n",
+    )
+    .expect("handler");
+    fs::set_permissions(&handler, fs::Permissions::from_mode(0o755)).expect("handler mode");
+    let log = fixture.root.join("child.log");
+    let marker = fixture.root.join("slow.marker");
+    let log_arg = log.to_string_lossy().into_owned();
+    let marker_arg = marker.to_string_lossy().into_owned();
+    let output = fixture.run_with_env(
+        &["dispatch", "--product", "codex", "--format", "json"],
+        Some(r#"{"hook_event_name":"SessionStart","source":"startup"}"#),
+        &[
+            ("AGENT_HOOK_CHILD_LOG", log_arg.as_str()),
+            ("AGENT_HOOK_SLOW_MARKER", marker_arg.as_str()),
+        ],
+    );
+    assert_eq!(output.code, 0, "stderr={}", output.stderr_text());
+    let starts = fs::read_to_string(&log).unwrap_or_default().lines().count();
+    assert_eq!(starts, 17, "every selected handler must complete");
 }
 
 #[test]
@@ -475,7 +512,7 @@ capability = { id = "runtime-kit.handler.v1", handler_id = "session-start-health
         output.stdout_text(),
         output.stderr_text()
     );
-    assert!(started.elapsed() < Duration::from_millis(2_800));
+    assert!(started.elapsed() < Duration::from_millis(5_800));
 }
 
 #[test]
