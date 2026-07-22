@@ -97,8 +97,10 @@ impl LocalDefaultReceipt {
             match data.remote.upstream.as_deref() {
                 Some(upstream)
                     if !upstream.is_empty()
-                        && data.remote.cached_relation_before == "aligned"
-                        && data.remote.cached_relation_after == "ahead-by-one" => {}
+                        && valid_upstream_relation_increment(
+                            &data.remote.cached_relation_before,
+                            &data.remote.cached_relation_after,
+                        ) => {}
                 None if data.remote.cached_relation_before == "untracked"
                     && data.remote.cached_relation_after == "untracked" => {}
                 _ => {
@@ -107,6 +109,31 @@ impl LocalDefaultReceipt {
             }
         }
         Ok(())
+    }
+}
+
+fn valid_upstream_relation_increment(before: &str, after: &str) -> bool {
+    let Some(before) = parse_upstream_ahead_count(before) else {
+        return false;
+    };
+    let Some(after) = parse_upstream_ahead_count(after) else {
+        return false;
+    };
+    before.checked_add(1) == Some(after)
+}
+
+fn parse_upstream_ahead_count(relation: &str) -> Option<usize> {
+    match relation {
+        "aligned" => Some(0),
+        "ahead-by-one" => Some(1),
+        _ => {
+            let count = relation.strip_prefix("ahead-by-")?;
+            if count.len() > 1 && count.starts_with('0') {
+                return None;
+            }
+            let count = count.parse::<usize>().ok()?;
+            (count >= 2).then_some(count)
+        }
     }
 }
 
@@ -175,7 +202,36 @@ mod tests {
     #[cfg(unix)]
     use std::os::unix::fs::{PermissionsExt, symlink};
 
-    use super::{MAX_RECEIPT_BYTES, private_receipt_access, read_strict, valid_object_id};
+    use super::{
+        MAX_RECEIPT_BYTES, private_receipt_access, read_strict, valid_object_id,
+        valid_upstream_relation_increment,
+    };
+
+    #[test]
+    fn upstream_relation_pairs_require_canonical_exact_increment() {
+        assert!(valid_upstream_relation_increment("aligned", "ahead-by-one"));
+        assert!(valid_upstream_relation_increment(
+            "ahead-by-one",
+            "ahead-by-2"
+        ));
+        assert!(valid_upstream_relation_increment(
+            "ahead-by-2",
+            "ahead-by-3"
+        ));
+        assert!(!valid_upstream_relation_increment("aligned", "ahead-by-2"));
+        assert!(!valid_upstream_relation_increment(
+            "ahead-by-2",
+            "ahead-by-4"
+        ));
+        assert!(!valid_upstream_relation_increment(
+            "ahead-by-01",
+            "ahead-by-2"
+        ));
+        assert!(!valid_upstream_relation_increment(
+            "ahead-by-1",
+            "ahead-by-2"
+        ));
+    }
 
     #[test]
     fn object_ids_are_full_lower_hex() {

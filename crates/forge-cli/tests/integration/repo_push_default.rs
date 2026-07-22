@@ -255,6 +255,7 @@ enum ReceiptMutation {
     Base,
     Tree,
     Repository,
+    RemoteGap,
 }
 
 fn run_with_local_default_receipt(dry_run: bool) -> (StubEnv, super::support::CmdOutput) {
@@ -331,6 +332,10 @@ fn run_with_local_default_receipt_location(
         ReceiptMutation::Tree => receipt.data.tree_sha = HEAD.to_string(),
         ReceiptMutation::Repository => {
             receipt.data.repository_fingerprint = digest_parts([b"another-repository".as_slice()]);
+        }
+        ReceiptMutation::RemoteGap => {
+            receipt.data.remote.cached_relation_before = "ahead-by-one".to_string();
+            receipt.data.remote.cached_relation_after = "ahead-by-2".to_string();
         }
     }
     fs::write(
@@ -734,6 +739,10 @@ fn push_default_revalidates_local_default_receipt_bindings() {
         (
             ReceiptMutation::Repository,
             "local_default_receipt_repository_mismatch",
+        ),
+        (
+            ReceiptMutation::RemoteGap,
+            "local_default_receipt_remote_gap_invalid",
         ),
     ] {
         let (_, out) = run_with_local_default_receipt_mutation(true, mutation);

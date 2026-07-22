@@ -69,6 +69,21 @@ fn configure_ssh_signing(repo: &std::path::Path) -> tempfile::TempDir {
     signing_dir
 }
 
+fn configure_cached_upstream(repo: &std::path::Path, sha: &str) {
+    common::git(
+        repo,
+        &[
+            "remote",
+            "add",
+            "origin",
+            "ssh://invalid.example.invalid/sympoies/demo.git",
+        ],
+    );
+    common::git(repo, &["update-ref", "refs/remotes/origin/main", sha]);
+    common::git(repo, &["config", "branch.main.remote", "origin"]);
+    common::git(repo, &["config", "branch.main.merge", "refs/heads/main"]);
+}
+
 #[test]
 fn top_level_help_exposes_local_default_as_a_distinct_command() {
     let repo = init_repo_with_head();
@@ -395,6 +410,227 @@ fn local_default_remote_mode_uses_only_cached_upstream_state() {
     assert_eq!(parsed.data.remote.cached_relation_before, "aligned");
     assert_eq!(parsed.data.remote.cached_relation_after, "ahead-by-one");
     assert!(!parsed.data.remote.network_observed);
+}
+
+#[test]
+fn local_default_accepts_ahead_only_cached_upstream_and_records_exact_counts() {
+    let repo = init_repo_with_head();
+    let _signing = configure_ssh_signing(repo.path());
+    let upstream_head = git_trim(repo.path(), &["rev-parse", "HEAD"]);
+    configure_cached_upstream(repo.path(), &upstream_head);
+
+    common::write_file(repo.path(), "local.txt", "local\n");
+    common::git(repo.path(), &["add", "local.txt"]);
+    common::git(
+        repo.path(),
+        &[
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-q",
+            "-m",
+            "docs: local change",
+        ],
+    );
+
+    common::write_file(repo.path(), "change.txt", "change\n");
+    common::git(repo.path(), &["add", "change.txt"]);
+    let old_head = git_trim(repo.path(), &["rev-parse", "HEAD"]);
+    let receipt_dir = tempfile::tempdir().expect("receipt dir");
+    let receipt = receipt_dir.path().join("receipt.json");
+
+    let output = common::run_semantic_commit_output(
+        repo.path(),
+        &[
+            "local-default",
+            "--message",
+            "docs(policy): update ahead-only contract",
+            "--expect-head",
+            &old_head,
+            "--expected-branch",
+            "main",
+            "--remote-mode",
+            "local-only",
+            "--receipt-out",
+            receipt.to_str().expect("receipt path"),
+            "--format",
+            "json",
+        ],
+        &[],
+        None,
+    );
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stderr was: {}",
+        as_str(&output.stderr)
+    );
+    let new_head = git_trim(repo.path(), &["rev-parse", "HEAD"]);
+    assert_eq!(git_trim(repo.path(), &["rev-parse", "HEAD^1"]), old_head);
+    assert_eq!(
+        git_trim(repo.path(), &["rev-list", "--count", "origin/main..HEAD"]),
+        "2"
+    );
+
+    let parsed = read_strict(&receipt).expect("strict receipt");
+    assert_eq!(parsed.data.old_head, old_head);
+    assert_eq!(parsed.data.new_head, new_head);
+    assert_eq!(parsed.data.remote.cached_relation_before, "ahead-by-one");
+    assert_eq!(parsed.data.remote.cached_relation_after, "ahead-by-2");
+    assert!(!parsed.data.remote.network_observed);
+    assert!(!parsed.data.remote.provider_mutated);
+    assert!(!parsed.data.completion.provider_delivered);
+}
+
+#[test]
+fn local_default_rejects_head_behind_cached_upstream() {
+    let repo = init_repo_with_head();
+    let local_head = git_trim(repo.path(), &["rev-parse", "HEAD"]);
+    common::write_file(repo.path(), "remote.txt", "remote\n");
+    common::git(repo.path(), &["add", "remote.txt"]);
+    common::git(
+        repo.path(),
+        &[
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-q",
+            "-m",
+            "docs: remote change",
+        ],
+    );
+    let upstream_head = git_trim(repo.path(), &["rev-parse", "HEAD"]);
+    common::git(repo.path(), &["reset", "--hard", &local_head]);
+    configure_cached_upstream(repo.path(), &upstream_head);
+    common::write_file(repo.path(), "change.txt", "change\n");
+    common::git(repo.path(), &["add", "change.txt"]);
+
+    let output = common::run_semantic_commit_output(
+        repo.path(),
+        &[
+            "local-default",
+            "--message",
+            "docs(policy): reject behind state",
+            "--expect-head",
+            &local_head,
+            "--expected-branch",
+            "main",
+            "--remote-mode",
+            "local-only",
+            "--validate-only",
+        ],
+        &[],
+        None,
+    );
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(as_str(&output.stderr).contains("behind relative to the cached upstream"));
+    assert_eq!(git_trim(repo.path(), &["rev-parse", "HEAD"]), local_head);
+}
+
+#[test]
+fn local_default_rejects_head_diverged_from_cached_upstream() {
+    let repo = init_repo_with_head();
+    let base = git_trim(repo.path(), &["rev-parse", "HEAD"]);
+    common::write_file(repo.path(), "remote.txt", "remote\n");
+    common::git(repo.path(), &["add", "remote.txt"]);
+    common::git(
+        repo.path(),
+        &[
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-q",
+            "-m",
+            "docs: remote change",
+        ],
+    );
+    let upstream_head = git_trim(repo.path(), &["rev-parse", "HEAD"]);
+    common::git(repo.path(), &["reset", "--hard", &base]);
+    common::write_file(repo.path(), "local.txt", "local\n");
+    common::git(repo.path(), &["add", "local.txt"]);
+    common::git(
+        repo.path(),
+        &[
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-q",
+            "-m",
+            "docs: local change",
+        ],
+    );
+    let local_head = git_trim(repo.path(), &["rev-parse", "HEAD"]);
+    configure_cached_upstream(repo.path(), &upstream_head);
+    common::write_file(repo.path(), "change.txt", "change\n");
+    common::git(repo.path(), &["add", "change.txt"]);
+
+    let output = common::run_semantic_commit_output(
+        repo.path(),
+        &[
+            "local-default",
+            "--message",
+            "docs(policy): reject diverged state",
+            "--expect-head",
+            &local_head,
+            "--expected-branch",
+            "main",
+            "--remote-mode",
+            "local-only",
+            "--validate-only",
+        ],
+        &[],
+        None,
+    );
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(as_str(&output.stderr).contains("diverged relative to the cached upstream"));
+    assert_eq!(git_trim(repo.path(), &["rev-parse", "HEAD"]), local_head);
+}
+
+#[test]
+fn local_default_rejects_configured_upstream_with_missing_cached_ref() {
+    let repo = init_repo_with_head();
+    common::git(
+        repo.path(),
+        &[
+            "remote",
+            "add",
+            "origin",
+            "ssh://invalid.example.invalid/sympoies/demo.git",
+        ],
+    );
+    common::git(repo.path(), &["config", "branch.main.remote", "origin"]);
+    common::git(
+        repo.path(),
+        &["config", "branch.main.merge", "refs/heads/main"],
+    );
+    common::write_file(repo.path(), "change.txt", "change\n");
+    common::git(repo.path(), &["add", "change.txt"]);
+    let local_head = git_trim(repo.path(), &["rev-parse", "HEAD"]);
+
+    let output = common::run_semantic_commit_output(
+        repo.path(),
+        &[
+            "local-default",
+            "--message",
+            "docs(policy): reject missing upstream ref",
+            "--expect-head",
+            &local_head,
+            "--expected-branch",
+            "main",
+            "--remote-mode",
+            "local-only",
+            "--validate-only",
+        ],
+        &[],
+        None,
+    );
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(as_str(&output.stderr).contains("cached ref cannot be resolved"));
+    assert_eq!(git_trim(repo.path(), &["rev-parse", "HEAD"]), local_head);
 }
 
 #[test]

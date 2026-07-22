@@ -53,7 +53,10 @@ only checked-out-default exception. It strictly parses the local receipt and
 revalidates the repository fingerprint, branch, exact head/parent/tree,
 signature, one-commit ancestry, live remote base, destination, compare-and-swap,
 and read-back. Receipt creation is not push authorization; provider delivery is
-a separate explicit action.
+a separate explicit action. Adoption is eligible only for an
+`aligned` to `ahead-by-one` receipt; a receipt created on top of an existing
+local-ahead chain remains valid local evidence but is rejected for provider
+delivery.
 
 `--thread-file` is for actionable findings only: max 50 threads, 16 KiB body
 each. Use `pr review validate` for local schema/privacy checks, and add
