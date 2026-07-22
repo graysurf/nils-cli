@@ -773,6 +773,52 @@ fn ambiguous_symlink_targets_fail_closed_before_policy_evaluation() {
 }
 
 #[test]
+fn symlinked_and_malformed_git_markers_fail_closed() {
+    let mut outcomes = Vec::new();
+    for marker in ["symlink", "malformed"] {
+        let fixture = Fixture::new(BLOCK_POLICY);
+        let checkout = fixture.root.join("checkout");
+        fs::create_dir(&checkout).expect("checkout");
+        let git_marker = checkout.join(".git");
+        match marker {
+            "symlink" => {
+                let git_admin = fixture.root.join("git-admin");
+                fs::create_dir(&git_admin).expect("git admin");
+                symlink(&git_admin, &git_marker).expect("symlinked .git marker");
+            }
+            "malformed" => {
+                fs::write(&git_marker, "not-a-gitdir-marker\n").expect("malformed .git marker")
+            }
+            _ => unreachable!(),
+        }
+        let payload = json!({
+            "hook_event_name":"PreToolUse",
+            "tool_name":"Write",
+            "cwd":checkout,
+            "tool_input":{"path":checkout.join("target.txt")}
+        })
+        .to_string();
+        let output = fixture.run(
+            &["dispatch", "--product", "codex", "--format", "json"],
+            Some(&payload),
+        );
+
+        outcomes.push((
+            marker,
+            output.code,
+            output.stdout_json()["error"]["code"].clone(),
+        ));
+    }
+    assert_eq!(
+        outcomes,
+        vec![
+            ("symlink", 65, json!("provider-target-untrusted")),
+            ("malformed", 65, json!("provider-target-untrusted")),
+        ]
+    );
+}
+
+#[test]
 fn apply_patch_checks_single_and_every_multi_file_target() {
     let (fixture, checkout_a, checkout_b) = same_repository_foreign_owner_fixture();
     for patch in [
