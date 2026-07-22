@@ -107,6 +107,35 @@ partial-failure flows, prefer extending `details` over inventing
 crate-specific top-level fields. Free-form text never belongs anywhere
 in the error envelope.
 
+### Optional recovery metadata
+
+Automation-facing failures MAY publish typed recovery metadata inside
+`error.details`. When a producer publishes this metadata,
+`details.retryable` and `details.next_action` MUST appear together:
+
+- `retryable: boolean` states whether the original operation may be retried
+  after the structured recovery has completed. It does not authorize unbounded
+  retries.
+- `next_action: stable-string` is a documented machine identifier whose value
+  and meaning remain stable within the schema version.
+- `recovery: object` is an optional bounded object containing typed command or
+  action identifiers plus only privacy-safe parameters. It MAY name reusable
+  input field names (for example `session_id` or `product`) without copying
+  their values, and MAY carry bounded identifier arrays, retry limits, or a
+  follow-up command.
+
+Recovery objects MUST NOT contain expanded argv, shell command dumps, raw
+authorization material, secrets, environment dumps, raw session identifiers,
+absolute local state/project paths, or private file content. Arrays and
+diagnostics MUST have producer-defined bounds. A recovery object describes the
+next operation; it does not grant permission for an otherwise unauthorized
+side effect.
+
+Automation MUST branch on `code` and typed `details`; it MUST NOT parse
+`message` or `hint`. Both prose fields remain human- and agent-readable
+explanations and MAY evolve additively without changing machine recovery
+semantics.
+
 Provider aggregation commands that support strict partial-failure modes SHOULD
 put provider status rows under `error.details.providers[]` when failing. This
 keeps the failure shape machine-readable without returning a success `data`

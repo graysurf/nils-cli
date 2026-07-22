@@ -8,6 +8,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 
+use nils_common::cli_contract::{Envelope, EnvelopeError};
+
 use crate::cli::{
     SessionActivateArgs, SessionArgs, SessionCommand, SessionCommonArgs, SessionVerifyArgs,
 };
@@ -30,6 +32,10 @@ const SECRET_MODE: u32 = 0o600;
 const LOCK_OWNER_FILE: &str = "owner.json";
 const LOCK_STALE_AFTER: Duration = Duration::from_secs(300);
 const LOCK_WAIT_TIMEOUT: Duration = Duration::from_secs(30);
+const MAX_AVAILABLE_INTENTS: usize = 32;
+const MAX_RECOVERY_INTENTS: usize = 16;
+const MAX_RECOVERY_IDENTIFIER_BYTES: usize = 128;
+const BOUNDED_RETRY_ATTEMPTS: u8 = 3;
 
 #[derive(Debug, Serialize, Deserialize)]
 struct SessionRecord {
@@ -76,6 +82,125 @@ struct SessionData {
     /// Stable reason code for a `prepare` result (`prepared` / `already-current`).
     #[serde(skip_serializing_if = "Option::is_none")]
     reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+enum NextAction {
+    FixArguments,
+    ListDeclaredIntents,
+    InspectPreflight,
+    PrepareIntent,
+    RefreshIntegrationDecision,
+    RepairCatalog,
+    RetryBounded,
+    InspectSessionState,
+    UpgradeAgentDocs,
+    ReportInvariant,
+}
+
+impl NextAction {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::FixArguments => "fix-arguments",
+            Self::ListDeclaredIntents => "list-declared-intents",
+            Self::InspectPreflight => "inspect-preflight",
+            Self::PrepareIntent => "prepare-intent",
+            Self::RefreshIntegrationDecision => "refresh-integration-decision",
+            Self::RepairCatalog => "repair-catalog",
+            Self::RetryBounded => "retry-bounded",
+            Self::InspectSessionState => "inspect-session-state",
+            Self::UpgradeAgentDocs => "upgrade-agent-docs",
+            Self::ReportInvariant => "report-invariant",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize)]
+enum RecoveryCommand {
+    #[serde(rename = "audit")]
+    Audit,
+    #[serde(rename = "integration.resolve")]
+    IntegrationResolve,
+    #[serde(rename = "list")]
+    List,
+    #[serde(rename = "preflight")]
+    Preflight,
+    #[serde(rename = "session.prepare")]
+    SessionPrepare,
+    #[serde(rename = "session.status")]
+    SessionStatus,
+}
+
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "kebab-case")]
+enum RecoveryAction {
+    FixArguments,
+    ReportInvariant,
+    RetryCommand,
+    UpgradeAgentDocs,
+}
+
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum ReuseField {
+    SessionId,
+    Product,
+    StateHome,
+    DocsHome,
+    ProjectPath,
+    UserConfig,
+}
+
+#[derive(Debug, Serialize)]
+struct SessionRecovery {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    command: Option<RecoveryCommand>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    action: Option<RecoveryAction>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    reuse_scope: Vec<ReuseField>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    intents: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    phase: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    refresh_integration_fingerprint: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    then: Option<RecoveryCommand>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    retry_original: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_attempts: Option<u8>,
+}
+
+#[derive(Debug, Serialize)]
+struct PreflightDiagnostics {
+    required_total: usize,
+    satisfied_required: usize,
+    missing_required: usize,
+    invalid_required: usize,
+}
+
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "kebab-case")]
+enum RecordRelation {
+    PriorVersionReplaceable,
+    Future,
+    Unrecognized,
+}
+
+#[derive(Debug, Serialize)]
+struct SessionFailureDetails {
+    retryable: bool,
+    next_action: NextAction,
+    recovery: SessionRecovery,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    available_intents: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    diagnostics: Option<PreflightDiagnostics>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    record_relation: Option<RecordRelation>,
 }
 
 #[derive(Serialize)]
@@ -250,13 +375,15 @@ fn activate(
             record.integration_fingerprint = integration_fingerprint.clone();
         }
         for raw in &args.intent {
-            let intent =
-                Context::parse(raw).map_err(|err| SessionFailure::data("invalid-intent", err))?;
+            let intent = Context::parse(raw).map_err(|err| {
+                SessionFailure::data("invalid-intent", err).with_available_intents(&available)
+            })?;
             if !available.iter().any(|item| item == intent.as_str()) {
                 return Err(SessionFailure::data(
                     "undeclared-intent",
                     format!("intent `{intent}` is not declared"),
-                ));
+                )
+                .with_available_intents(&available));
             }
             let report = resolver::resolve_intent_with_effective_catalog_for_scope(
                 &intent,
@@ -272,7 +399,8 @@ fn activate(
                 return Err(SessionFailure::data(
                     unsatisfied_code(phase.as_ref()),
                     format!("strict preflight failed for `{intent}`"),
-                ));
+                )
+                .with_preflight_context(&intent, phase.as_ref(), &report));
             }
             store_activation(
                 &mut record,
@@ -344,13 +472,15 @@ fn prepare(
         }
         let mut prepared: Vec<String> = Vec::new();
         for raw in &args.intent {
-            let intent =
-                Context::parse(raw).map_err(|err| SessionFailure::data("invalid-intent", err))?;
+            let intent = Context::parse(raw).map_err(|err| {
+                SessionFailure::data("invalid-intent", err).with_available_intents(&available)
+            })?;
             if !available.iter().any(|item| item == intent.as_str()) {
                 return Err(SessionFailure::data(
                     "undeclared-intent",
                     format!("intent `{intent}` is not declared"),
-                ));
+                )
+                .with_available_intents(&available));
             }
             let report = resolver::resolve_intent_with_effective_catalog_for_scope(
                 &intent,
@@ -366,7 +496,8 @@ fn prepare(
                 return Err(SessionFailure::data(
                     unsatisfied_code(phase.as_ref()),
                     format!("strict preflight failed for `{intent}`"),
-                ));
+                )
+                .with_preflight_context(&intent, phase.as_ref(), &report));
             }
             let fingerprint = fingerprint(
                 &report,
@@ -447,18 +578,30 @@ fn verify(
             use_user_config,
             expected_integration_fingerprint,
         )?;
+        let available = resolver::declared_intents(&roots, fallback, &catalog.catalog);
+        let recovery_intents = declared_requested_intents(&args.require_intent, &available);
         let path = record_path(common, &roots.project_path)?;
-        let record = read_record(&path)?;
+        let record = read_record(&path)
+            .map_err(|failure| failure.with_prepare_context(&recovery_intents, phase.as_ref()))?;
         validate_record_context(common, &roots.project_path, &record)?;
         if record.integration_fingerprint != integration_fingerprint {
             return Err(SessionFailure::data(
                 "stale-integration-decision",
                 "session activation does not match the current integration decision",
-            ));
+            )
+            .with_refresh_context(&recovery_intents, phase.as_ref()));
         }
         for raw in &args.require_intent {
-            let intent =
-                Context::parse(raw).map_err(|err| SessionFailure::data("invalid-intent", err))?;
+            let intent = Context::parse(raw).map_err(|err| {
+                SessionFailure::data("invalid-intent", err).with_available_intents(&available)
+            })?;
+            if !available.iter().any(|item| item == intent.as_str()) {
+                return Err(SessionFailure::data(
+                    "undeclared-intent",
+                    "the required intent is not declared",
+                )
+                .with_available_intents(&available));
+            }
             verify_intent(
                 &intent,
                 phase.as_ref(),
@@ -571,7 +714,8 @@ fn verify_intent(
             return Err(SessionFailure::data(
                 "missing-intent",
                 format!("intent `{intent}` is not active"),
-            ));
+            )
+            .with_prepare_intent(intent, None));
         };
         if !activation_matches(
             intent,
@@ -586,7 +730,8 @@ fn verify_intent(
             return Err(SessionFailure::data(
                 "stale-activation",
                 format!("activation for `{intent}` no longer matches the resolved catalog"),
-            ));
+            )
+            .with_prepare_intent(intent, None));
         }
         return Ok(());
     };
@@ -600,7 +745,8 @@ fn verify_intent(
         return Err(SessionFailure::data(
             "missing-intent",
             format!("intent `{intent}` is not active for phase `{phase}`"),
-        ));
+        )
+        .with_prepare_intent(intent, Some(phase)));
     }
 
     if let Some(stored) = phase_stored
@@ -636,7 +782,8 @@ fn verify_intent(
         format!(
             "activation for `{intent}` no longer matches the resolved catalog for phase `{phase}`"
         ),
-    ))
+    )
+    .with_prepare_intent(intent, Some(phase)))
 }
 
 /// Whether a stored fingerprint still matches a freshly resolved, satisfied
@@ -933,10 +1080,30 @@ fn decode_record(path: &Path) -> Result<DecodedRecord, SessionFailure> {
 }
 
 fn unsupported_record(schema: &str) -> SessionFailure {
-    SessionFailure::data(
-        "unsupported-record",
-        format!("unsupported session schema `{schema}`"),
-    )
+    let mut failure = SessionFailure::data("unsupported-record", "unsupported session schema");
+    if schema == LEGACY_RECORD_SCHEMA {
+        failure.message = "the v1 session record must be replaced".to_string();
+        failure.details = failure_details("missing-activation");
+        failure.details.record_relation = Some(RecordRelation::PriorVersionReplaceable);
+    } else if session_record_version(schema).is_some_and(|version| version > 2) {
+        failure.message = "the session record requires a newer agent-docs version".to_string();
+        failure.details.record_relation = Some(RecordRelation::Future);
+    } else {
+        failure.message = "the session record schema is unrecognized".to_string();
+        failure.details = failure_details("record-parse-failed");
+        failure.details.record_relation = Some(RecordRelation::Unrecognized);
+    }
+    failure.hint = Some(format!(
+        "Next action: `{}`.",
+        failure.details.next_action.as_str()
+    ));
+    failure
+}
+
+fn session_record_version(schema: &str) -> Option<u64> {
+    schema
+        .strip_prefix("agent-docs.session.v")
+        .and_then(|version| version.parse().ok())
 }
 
 fn write_record(path: &Path, record: &SessionRecord) -> Result<(), SessionFailure> {
@@ -1000,17 +1167,25 @@ fn render(format: OutputFormat, command: &str, result: Result<SessionData, Sessi
         }
         Err(failure) => {
             if format == OutputFormat::Json {
+                let details = serde_json::to_value(&failure.details)
+                    .expect("session failure details serialize");
+                let mut error =
+                    EnvelopeError::new(failure.code, &failure.message).with_details(details);
+                if let Some(hint) = &failure.hint {
+                    error = error.with_hint(hint);
+                }
+                let envelope: Envelope<SessionData> =
+                    Envelope::failure(format!("cli.agent-docs.session.{command}.v1"), error);
                 println!(
                     "{}",
-                    serde_json::to_string_pretty(&json!({
-                        "schema_version": format!("cli.agent-docs.session.{command}.v1"),
-                        "ok": false,
-                        "error": {"code": failure.code, "message": failure.message},
-                    }))
-                    .expect("session error serializes")
+                    serde_json::to_string_pretty(&envelope).expect("session error serializes")
                 );
             } else {
-                eprintln!("agent-docs session {command}: {}", failure.message);
+                eprintln!(
+                    "agent-docs session {command}: {}; next action: {}",
+                    failure.message,
+                    failure.details.next_action.as_str()
+                );
             }
             failure.exit_code
         }
@@ -1020,31 +1195,299 @@ fn render(format: OutputFormat, command: &str, result: Result<SessionData, Sessi
 struct SessionFailure {
     code: &'static str,
     message: String,
+    hint: Option<String>,
+    details: Box<SessionFailureDetails>,
     exit_code: i32,
 }
 
 impl SessionFailure {
-    fn data(code: &'static str, message: impl Into<String>) -> Self {
+    fn data(code: &'static str, _message: impl Into<String>) -> Self {
+        Self::classified(code, EXIT_DATA)
+    }
+
+    fn config(code: &'static str, _message: impl Into<String>) -> Self {
+        Self::classified(code, EXIT_CONFIG)
+    }
+
+    fn runtime(code: &'static str, _message: impl Into<String>) -> Self {
+        Self::classified(code, EXIT_RUNTIME)
+    }
+
+    fn classified(code: &'static str, exit_code: i32) -> Self {
+        let details = failure_details(code);
+        let hint = Some(format!("Next action: `{}`.", details.next_action.as_str()));
         Self {
             code,
-            message: message.into(),
-            exit_code: EXIT_DATA,
+            message: failure_message(code).to_string(),
+            hint,
+            details,
+            exit_code,
         }
     }
-    fn config(code: &'static str, message: impl Into<String>) -> Self {
-        Self {
-            code,
-            message: message.into(),
-            exit_code: EXIT_CONFIG,
-        }
+
+    fn with_available_intents(mut self, intents: &[String]) -> Self {
+        let mut bounded: Vec<String> = intents
+            .iter()
+            .filter(|intent| intent.len() <= MAX_RECOVERY_IDENTIFIER_BYTES)
+            .take(MAX_AVAILABLE_INTENTS)
+            .cloned()
+            .collect();
+        bounded.sort();
+        bounded.dedup();
+        self.details.available_intents = bounded;
+        self
     }
-    fn runtime(code: &'static str, message: impl Into<String>) -> Self {
-        Self {
-            code,
-            message: message.into(),
-            exit_code: EXIT_RUNTIME,
+
+    fn with_prepare_context(mut self, intents: &[String], phase: Option<&Phase>) -> Self {
+        if self.details.next_action == NextAction::PrepareIntent {
+            self.details.recovery.intents = bounded_intents(intents);
+            self.details.recovery.phase =
+                phase.and_then(|phase| bounded_identifier(phase.as_str()));
         }
+        self
     }
+
+    fn with_prepare_intent(self, intent: &Context, phase: Option<&Phase>) -> Self {
+        self.with_prepare_context(&[intent.to_string()], phase)
+    }
+
+    fn with_refresh_context(mut self, intents: &[String], phase: Option<&Phase>) -> Self {
+        if self.details.next_action == NextAction::RefreshIntegrationDecision {
+            self.details.recovery.intents = bounded_intents(intents);
+            self.details.recovery.phase =
+                phase.and_then(|phase| bounded_identifier(phase.as_str()));
+        }
+        self
+    }
+
+    fn with_preflight_context(
+        mut self,
+        intent: &Context,
+        phase: Option<&Phase>,
+        report: &PreflightReport,
+    ) -> Self {
+        self.details.recovery.intents = bounded_intents(&[intent.to_string()]);
+        self.details.recovery.phase = phase.and_then(|phase| bounded_identifier(phase.as_str()));
+        self.details.diagnostics = Some(PreflightDiagnostics {
+            required_total: report.summary.required_total,
+            satisfied_required: report.summary.satisfied_required,
+            missing_required: report.summary.missing_required,
+            invalid_required: report.summary.invalid_required,
+        });
+        self
+    }
+}
+
+fn failure_details(code: &str) -> Box<SessionFailureDetails> {
+    let (retryable, next_action, recovery) = match code {
+        "invalid-session-id"
+        | "invalid-state-home"
+        | "invalid-intent"
+        | "invalid-phase"
+        | "root-resolution-failed" => (
+            false,
+            NextAction::FixArguments,
+            recovery_action(RecoveryAction::FixArguments),
+        ),
+        "undeclared-intent" => (
+            false,
+            NextAction::ListDeclaredIntents,
+            recovery_command(RecoveryCommand::List, catalog_reuse_scope()),
+        ),
+        "preflight-unsatisfied" | "phase-unsatisfied" => (
+            false,
+            NextAction::InspectPreflight,
+            recovery_command(RecoveryCommand::Preflight, catalog_reuse_scope()),
+        ),
+        "missing-intent" | "stale-activation" | "missing-activation" => (
+            true,
+            NextAction::PrepareIntent,
+            SessionRecovery {
+                command: Some(RecoveryCommand::SessionPrepare),
+                action: None,
+                reuse_scope: session_reuse_scope(),
+                intents: Vec::new(),
+                phase: None,
+                refresh_integration_fingerprint: Some(false),
+                then: None,
+                retry_original: Some(true),
+                max_attempts: None,
+            },
+        ),
+        "stale-integration-decision" => (
+            true,
+            NextAction::RefreshIntegrationDecision,
+            SessionRecovery {
+                command: Some(RecoveryCommand::IntegrationResolve),
+                action: None,
+                reuse_scope: session_reuse_scope(),
+                intents: Vec::new(),
+                phase: None,
+                refresh_integration_fingerprint: Some(true),
+                then: Some(RecoveryCommand::SessionPrepare),
+                retry_original: Some(true),
+                max_attempts: None,
+            },
+        ),
+        "catalog-load-failed"
+        | "integration-catalog-not-selected"
+        | "integration-resolution-failed" => (
+            false,
+            NextAction::RepairCatalog,
+            recovery_command(RecoveryCommand::Audit, catalog_reuse_scope()),
+        ),
+        "lock-timeout" => (
+            true,
+            NextAction::RetryBounded,
+            SessionRecovery {
+                max_attempts: Some(BOUNDED_RETRY_ATTEMPTS),
+                ..recovery_action(RecoveryAction::RetryCommand)
+            },
+        ),
+        "fingerprint-producer-missing"
+        | "fingerprint-failed"
+        | "record-render-failed"
+        | "record-path-not-portable"
+        | "lock-owner-render-failed"
+        | "integration-catalog-invariant-failed" => (
+            false,
+            NextAction::ReportInvariant,
+            recovery_action(RecoveryAction::ReportInvariant),
+        ),
+        "unsupported-record" => (
+            false,
+            NextAction::UpgradeAgentDocs,
+            recovery_action(RecoveryAction::UpgradeAgentDocs),
+        ),
+        _ => (
+            false,
+            NextAction::InspectSessionState,
+            recovery_command(RecoveryCommand::SessionStatus, session_reuse_scope()),
+        ),
+    };
+    Box::new(SessionFailureDetails {
+        retryable,
+        next_action,
+        recovery,
+        available_intents: Vec::new(),
+        diagnostics: None,
+        record_relation: None,
+    })
+}
+
+fn failure_message(code: &str) -> &'static str {
+    match code {
+        "invalid-session-id" => "the session identifier is invalid",
+        "invalid-state-home" => "the session state location is invalid",
+        "invalid-intent" => "the intent identifier is invalid",
+        "invalid-phase" => "the phase identifier is invalid",
+        "undeclared-intent" => "the requested intent is not declared for this project",
+        "preflight-unsatisfied" => "required policy documents are not satisfied",
+        "phase-unsatisfied" => "required policy documents are not satisfied for this phase",
+        "missing-intent" => "the required intent has not been prepared",
+        "stale-activation" => "the prepared intent no longer matches current policy",
+        "missing-activation" => "no session activation exists for this scope",
+        "stale-integration-decision" => "the integration decision must be refreshed",
+        "unsupported-record" => "the session record schema is unsupported",
+        "context-mismatch" => "the session record belongs to a different scope",
+        "catalog-load-failed" => "the policy catalog could not be loaded",
+        "integration-catalog-not-selected" => "the integration decision does not select a catalog",
+        "integration-resolution-failed" => "the integration decision could not be resolved",
+        "root-resolution-failed" => "the configured documentation roots could not be resolved",
+        "record-read-failed" => "the session record could not be read",
+        "record-parse-failed" => "the session record is corrupt or unreadable",
+        "record-write-failed" => "the session record could not be written",
+        "lock-timeout" => "the session record remained locked",
+        "lock-parent-failed"
+        | "lock-failed"
+        | "lock-owner-write-failed"
+        | "stale-lock-remove-failed"
+        | "stale-lock-reclaim-failed" => "the session record lock could not be managed safely",
+        "fingerprint-producer-missing" | "fingerprint-failed" => {
+            "the session policy fingerprint could not be produced"
+        }
+        "record-render-failed" => "the session record could not be serialized",
+        "record-path-not-portable" => "the session record location violated an invariant",
+        "lock-owner-render-failed" => "the session lock owner could not be serialized",
+        "integration-catalog-invariant-failed" => {
+            "the integration catalog violated an internal invariant"
+        }
+        _ => "the session operation could not be completed safely",
+    }
+}
+
+fn recovery_command(command: RecoveryCommand, reuse_scope: Vec<ReuseField>) -> SessionRecovery {
+    SessionRecovery {
+        command: Some(command),
+        action: None,
+        reuse_scope,
+        intents: Vec::new(),
+        phase: None,
+        refresh_integration_fingerprint: None,
+        then: None,
+        retry_original: None,
+        max_attempts: None,
+    }
+}
+
+fn recovery_action(action: RecoveryAction) -> SessionRecovery {
+    SessionRecovery {
+        command: None,
+        action: Some(action),
+        reuse_scope: Vec::new(),
+        intents: Vec::new(),
+        phase: None,
+        refresh_integration_fingerprint: None,
+        then: None,
+        retry_original: None,
+        max_attempts: None,
+    }
+}
+
+fn catalog_reuse_scope() -> Vec<ReuseField> {
+    vec![
+        ReuseField::Product,
+        ReuseField::DocsHome,
+        ReuseField::ProjectPath,
+        ReuseField::UserConfig,
+    ]
+}
+
+fn session_reuse_scope() -> Vec<ReuseField> {
+    vec![
+        ReuseField::SessionId,
+        ReuseField::Product,
+        ReuseField::StateHome,
+        ReuseField::DocsHome,
+        ReuseField::ProjectPath,
+        ReuseField::UserConfig,
+    ]
+}
+
+fn bounded_intents(intents: &[String]) -> Vec<String> {
+    let mut bounded: Vec<String> = intents
+        .iter()
+        .filter(|intent| intent.len() <= MAX_RECOVERY_IDENTIFIER_BYTES)
+        .take(MAX_RECOVERY_INTENTS)
+        .cloned()
+        .collect();
+    bounded.sort();
+    bounded.dedup();
+    bounded
+}
+
+fn bounded_identifier(identifier: &str) -> Option<String> {
+    (identifier.len() <= MAX_RECOVERY_IDENTIFIER_BYTES).then(|| identifier.to_string())
+}
+
+fn declared_requested_intents(requested: &[String], available: &[String]) -> Vec<String> {
+    let available: BTreeSet<&str> = available.iter().map(String::as_str).collect();
+    let declared: Vec<String> = requested
+        .iter()
+        .filter(|intent| available.contains(intent.as_str()))
+        .cloned()
+        .collect();
+    bounded_intents(&declared)
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -1228,5 +1671,67 @@ mod tests {
 
         drop(acquired);
         assert!(!lock.exists());
+    }
+
+    #[test]
+    fn recovery_policy_distinguishes_bounded_retry_state_inspection_and_invariants() {
+        for (code, retryable, next_action) in [
+            ("lock-timeout", true, NextAction::RetryBounded),
+            (
+                "record-parse-failed",
+                false,
+                NextAction::InspectSessionState,
+            ),
+            ("fingerprint-failed", false, NextAction::ReportInvariant),
+        ] {
+            let failure = SessionFailure::runtime(code, "private diagnostic");
+            assert_eq!(failure.details.retryable, retryable, "code={code}");
+            assert_eq!(failure.details.next_action, next_action, "code={code}");
+        }
+        let lock_timeout = SessionFailure::runtime("lock-timeout", "private diagnostic");
+        assert_eq!(
+            lock_timeout.details.recovery.max_attempts,
+            Some(BOUNDED_RETRY_ATTEMPTS)
+        );
+    }
+
+    #[test]
+    fn recovery_arrays_are_bounded() {
+        let intents: Vec<String> = (0..64).map(|index| format!("intent-{index:02}")).collect();
+        let undeclared = SessionFailure::data("undeclared-intent", "private diagnostic")
+            .with_available_intents(&intents);
+        assert_eq!(
+            undeclared.details.available_intents.len(),
+            MAX_AVAILABLE_INTENTS
+        );
+
+        let missing = SessionFailure::data("missing-intent", "private diagnostic")
+            .with_prepare_context(&intents, None);
+        assert_eq!(missing.details.recovery.intents.len(), MAX_RECOVERY_INTENTS);
+
+        let oversized = vec!["x".repeat(MAX_RECOVERY_IDENTIFIER_BYTES + 1)];
+        let oversized_failure = SessionFailure::data("undeclared-intent", "private diagnostic")
+            .with_available_intents(&oversized);
+        assert!(oversized_failure.details.available_intents.is_empty());
+    }
+
+    #[test]
+    fn unrecognized_record_schema_is_inspected_without_echoing_private_content() {
+        let private_schema = "PRIVATE_RECORD_CONTENT_SENTINEL";
+        let failure = unsupported_record(private_schema);
+
+        assert_eq!(failure.details.next_action, NextAction::InspectSessionState);
+        assert!(matches!(
+            failure.details.record_relation,
+            Some(RecordRelation::Unrecognized)
+        ));
+        assert!(!failure.message.contains(private_schema));
+        assert!(
+            !failure
+                .hint
+                .as_deref()
+                .unwrap_or_default()
+                .contains(private_schema)
+        );
     }
 }
