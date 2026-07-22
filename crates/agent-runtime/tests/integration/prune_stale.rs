@@ -318,6 +318,74 @@ fn apply_removes_stale_symlinks_from_explicit_prior_source_roots() {
     );
 }
 
+#[cfg(target_os = "macos")]
+#[test]
+fn apply_canonicalizes_var_alias_for_explicit_owned_source_root() {
+    let tmp = TempDir::new().unwrap();
+    let source_root = build_claude_source_root(tmp.path());
+    let prior_source_root = tmp.path().join("prior-src");
+    fs::create_dir_all(prior_source_root.join("targets/claude")).unwrap();
+    fs::copy(
+        source_root.join("targets/claude/link-map.yaml"),
+        prior_source_root.join("targets/claude/link-map.yaml"),
+    )
+    .unwrap();
+    let prior_source_root = fs::canonicalize(prior_source_root).unwrap();
+    let prior_source_alias = Path::new("/").join(
+        prior_source_root
+            .strip_prefix("/private")
+            .expect("macOS temp directory should canonicalize below /private/var"),
+    );
+    assert!(prior_source_alias.starts_with("/var"));
+    assert_eq!(
+        fs::canonicalize(&prior_source_alias).unwrap(),
+        prior_source_root
+    );
+
+    let live_home = tmp.path().join("claude-home");
+    let stale = live_home.join("plugins/reporting/skills/old/scripts/tool.sh");
+    symlink(
+        &prior_source_root.join("build/claude/plugins/reporting/skills/old/scripts/tool.sh"),
+        &stale,
+    );
+
+    let source_arg = source_root.to_string_lossy().into_owned();
+    let prior_source_alias_arg = prior_source_alias.to_string_lossy().into_owned();
+    let prior_source_canonical_arg = prior_source_root.to_string_lossy().into_owned();
+    let live_arg = live_home.to_string_lossy().into_owned();
+    let output = run_cli(&[
+        "prune-stale",
+        "--source-root",
+        &source_arg,
+        "--owned-source-root",
+        &prior_source_alias_arg,
+        "--product",
+        "claude",
+        "--live-home",
+        &live_arg,
+        "--apply",
+        "--format",
+        "json",
+    ]);
+
+    assert_eq!(
+        output.code,
+        0,
+        "apply should accept the /var alias; stderr=\n{}",
+        output.stderr_text()
+    );
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let roots = json["data"]["owned_source_roots"].as_array().unwrap();
+    assert!(
+        roots.iter().any(|root| root == &prior_source_canonical_arg),
+        "owned source roots should report the canonical /private/var path"
+    );
+    assert!(
+        fs::symlink_metadata(&stale).is_err(),
+        "canonical target below /private/var should be owned by the /var alias root"
+    );
+}
+
 #[test]
 fn rejects_relative_owned_source_root_flag() {
     let tmp = TempDir::new().unwrap();
