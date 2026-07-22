@@ -1,6 +1,6 @@
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use nils_test_support::bin;
@@ -8,6 +8,8 @@ use nils_test_support::cmd::{CmdOptions, CmdOutput, run_resolved};
 use pretty_assertions::assert_eq;
 use serde_json::json;
 use sha2::{Digest, Sha256};
+
+use super::cli::{fake_agent, fake_tmux, tmux_calls};
 
 fn run(dir: &Path, args: &[&str]) -> CmdOutput {
     run_resolved("agent-session", args, &CmdOptions::new().with_cwd(dir))
@@ -3630,6 +3632,118 @@ fn main_agent_worker_start_replay_converges_a_persisted_start_without_duplicate_
         1,
         "replay must not launch a duplicate worker"
     );
+}
+
+#[test]
+fn main_agent_worker_start_binds_broker_to_same_release_agent_session_sibling() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let state_dir = tmp.path().join("state");
+    let checkout = tmp.path().join("checkout");
+    fs::create_dir(&state_dir).expect("state");
+    init_checkout(&checkout, "https://example.invalid/example/repository.git");
+    seed_brokers_at(
+        &state_dir,
+        &[(
+            "main-one",
+            "main-incarnation-one",
+            "main-private-capability-material-0000000001",
+            checkout.as_path(),
+            Some("enforce"),
+        )],
+    );
+    let main_capability = init_main_run(tmp.path(), &state_dir, &checkout, "main-one", "run-one");
+    let (tmux_bin, tmux_log) = fake_tmux(tmp.path());
+    let codex_bin = fake_agent(tmp.path(), "codex-worker");
+    let path_bin = tmp.path().join("path-bin");
+    fs::create_dir(&path_bin).expect("PATH fixture");
+    let path_agent_session =
+        path_bin.join(format!("agent-session{}", std::env::consts::EXE_SUFFIX));
+    fs::write(&path_agent_session, "#!/bin/sh\nexit 97\n").expect("PATH trap");
+    fs::set_permissions(&path_agent_session, fs::Permissions::from_mode(0o700))
+        .expect("PATH trap mode");
+    let inherited_path = std::env::var_os("PATH").unwrap_or_default();
+    let joined_path = std::env::join_paths(
+        std::iter::once(path_bin.as_path()).chain(
+            std::env::split_paths(&inherited_path)
+                .collect::<Vec<_>>()
+                .iter()
+                .map(PathBuf::as_path),
+        ),
+    )
+    .expect("joined PATH");
+
+    let assignment_path = tmp.path().join("assignment-facade-broker.json");
+    write_private_json(
+        &assignment_path,
+        &json!({
+            "schema_version": "main-agent.assignment-input.v1",
+            "assignment_id": "assignment-facade-broker",
+            "task_summary": "Exercise facade broker launch",
+            "task": {},
+            "launch": {
+                "agent": "codex",
+                "cwd": checkout,
+                "title": null,
+                "session_id": "worker-facade-broker",
+                "coordination_mode": "enforce",
+                "agent_args": []
+            },
+            "repository": "example/repository",
+            "worktree": null,
+            "base_ref": "main",
+            "scopes": ["crates/agent-session"],
+            "durable_refs": []
+        }),
+    );
+    let tmux_arg = tmux_bin.to_string_lossy().into_owned();
+    let tmux_log_arg = tmux_log.to_string_lossy().into_owned();
+    let codex_arg = codex_bin.to_string_lossy().into_owned();
+    let path_arg = joined_path.to_string_lossy().into_owned();
+    let started = run_main_agent(
+        &checkout,
+        &[
+            "--state-dir",
+            state_dir.to_str().expect("state dir"),
+            "worker",
+            "start",
+            "--assignment-file",
+            assignment_path.to_str().expect("assignment path"),
+            "--if-run-revision",
+            "1",
+            "--idempotency-key",
+            "worker-start-facade-broker-0001",
+            "--format",
+            "json",
+        ],
+        &[
+            ("AGENT_SESSION_CAPABILITY_FILE", &main_capability),
+            ("AGENT_SESSION_TMUX_BIN", &tmux_arg),
+            ("AGENT_SESSION_CODEX_BIN", &codex_arg),
+            ("AGENT_SESSION_FAKE_TMUX_LOG", &tmux_log_arg),
+            ("PATH", &path_arg),
+        ],
+    );
+    assert_eq!(started.code, 0, "stderr={}", started.stderr_text());
+
+    let main_agent = bin::resolve("main-agent");
+    let expected_broker = bin::resolve("agent-session");
+    assert_eq!(expected_broker.parent(), main_agent.parent());
+    let launch = tmux_calls(&tmux_log)
+        .into_iter()
+        .find(|call| call.first().is_some_and(|arg| arg == "new-session"))
+        .expect("worker tmux launch");
+    let held_launch = launch
+        .iter()
+        .position(|arg| arg.contains("gate=$1; broker_gate=$2"))
+        .expect("held launch script");
+    let broker = Path::new(
+        launch
+            .get(held_launch + 8)
+            .expect("held launch broker executable"),
+    );
+    assert_eq!(broker, expected_broker);
+    assert_ne!(broker, main_agent);
+    assert_ne!(broker, path_agent_session);
 }
 
 #[test]

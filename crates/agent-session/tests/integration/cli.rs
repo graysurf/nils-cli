@@ -37,7 +37,7 @@ fn sha256_hex(value: &str) -> String {
         .collect()
 }
 
-fn fake_tmux(tmp: &Path) -> (PathBuf, PathBuf) {
+pub(super) fn fake_tmux(tmp: &Path) -> (PathBuf, PathBuf) {
     let bin = tmp.join("tmux");
     let log = tmp.join("tmux.log");
     write_executable(
@@ -265,7 +265,7 @@ exit 0
     (bin, log)
 }
 
-fn fake_agent(tmp: &Path, name: &str) -> PathBuf {
+pub(super) fn fake_agent(tmp: &Path, name: &str) -> PathBuf {
     let bin = tmp.join(name);
     write_executable(
         &bin,
@@ -411,7 +411,7 @@ fn spawn_test_process_group() -> TestProcessGroup {
     }
 }
 
-fn tmux_calls(log: &Path) -> Vec<Vec<String>> {
+pub(super) fn tmux_calls(log: &Path) -> Vec<Vec<String>> {
     let text = fs::read_to_string(log).unwrap_or_default();
     text.split('\u{001e}')
         .filter(|call| !call.is_empty())

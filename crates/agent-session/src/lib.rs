@@ -2581,6 +2581,59 @@ fn new_session_command(tmux_bin: &Path, scope_runner: Option<&Path>) -> ProcessC
     }
 }
 
+pub(crate) fn resolve_agent_session_executable() -> io::Result<PathBuf> {
+    let current_executable = env::current_exe()?;
+    // Unit tests call launch helpers from the hashed `deps` harness; bind those
+    // calls to Cargo's same-profile binary without changing production lookup.
+    #[cfg(test)]
+    if current_executable
+        .parent()
+        .and_then(Path::file_name)
+        .is_some_and(|name| name == std::ffi::OsStr::new("deps"))
+    {
+        let profile_dir = current_executable
+            .parent()
+            .and_then(Path::parent)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "test executable has no Cargo profile directory",
+                )
+            })?;
+        let test_binary = profile_dir.join(format!("agent-session{}", env::consts::EXE_SUFFIX));
+        return resolve_agent_session_executable_from(&test_binary);
+    }
+    resolve_agent_session_executable_from(&current_executable)
+}
+
+fn resolve_agent_session_executable_from(current_executable: &Path) -> io::Result<PathBuf> {
+    let binary_name = format!("agent-session{}", env::consts::EXE_SUFFIX);
+    let executable = if current_executable
+        .file_name()
+        .is_some_and(|name| name == std::ffi::OsStr::new(&binary_name))
+    {
+        current_executable.to_path_buf()
+    } else {
+        current_executable
+            .parent()
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "current executable has no release directory",
+                )
+            })?
+            .join(binary_name)
+    };
+    let metadata = fs::symlink_metadata(&executable)?;
+    if !metadata.file_type().is_file() || metadata.permissions().mode() & 0o111 == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "agent-session executable is unavailable",
+        ));
+    }
+    Ok(executable)
+}
+
 fn current_runtime_helper() -> Result<PathBuf, CliError> {
     #[cfg(test)]
     let executable = env::var_os("AGENT_SESSION_TEST_RUNTIME_HELPER")
@@ -4201,7 +4254,7 @@ fn begin_held_runtime(
 ) -> Result<(), CliError> {
     let gate = launch_gate_path(state_dir, record);
     let broker_gate = broker_gate_path(state_dir, record);
-    let broker_bin = std::env::current_exe().map_err(|_| {
+    let broker_bin = resolve_agent_session_executable().map_err(|_| {
         CliError::runtime(
             "coordination-unavailable",
             "failed to resolve the coordination broker executable",
@@ -9808,10 +9861,74 @@ mod tests {
         TmuxProcessIdentity, TmuxRuntimeIdentity, acquire_session_record_lock,
         acquire_session_record_lock_timed, create_record, delete_session_with_timeouts,
         kill_tmux_session_with_timeout, live_status_with_timeout, load_session_record,
-        persist_tmux_runtime_identity, render_delete_text, resolve_session_id, session_dir,
-        strip_trailing_blank_lines, tmux_launch_may_have_created_runtime,
-        try_acquire_session_record_lock, write_session_record,
+        persist_tmux_runtime_identity, render_delete_text, resolve_agent_session_executable_from,
+        resolve_session_id, session_dir, strip_trailing_blank_lines,
+        tmux_launch_may_have_created_runtime, try_acquire_session_record_lock,
+        write_session_record,
     };
+
+    #[test]
+    fn agent_session_executable_resolves_facade_to_exact_release_sibling() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let main_agent = tmp
+            .path()
+            .join(format!("main-agent{}", std::env::consts::EXE_SUFFIX));
+        let agent_session = tmp
+            .path()
+            .join(format!("agent-session{}", std::env::consts::EXE_SUFFIX));
+        fs::write(&main_agent, "main-agent").expect("main-agent fixture");
+        fs::write(&agent_session, "agent-session").expect("agent-session fixture");
+        fs::set_permissions(&main_agent, fs::Permissions::from_mode(0o700))
+            .expect("main-agent mode");
+        fs::set_permissions(&agent_session, fs::Permissions::from_mode(0o700))
+            .expect("agent-session mode");
+
+        assert_eq!(
+            resolve_agent_session_executable_from(&main_agent).expect("sibling executable"),
+            agent_session
+        );
+    }
+
+    #[test]
+    fn agent_session_executable_preserves_direct_agent_session_recursion() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let agent_session = tmp
+            .path()
+            .join(format!("agent-session{}", std::env::consts::EXE_SUFFIX));
+        fs::write(&agent_session, "agent-session").expect("agent-session fixture");
+        fs::set_permissions(&agent_session, fs::Permissions::from_mode(0o700))
+            .expect("agent-session mode");
+
+        assert_eq!(
+            resolve_agent_session_executable_from(&agent_session).expect("current executable"),
+            agent_session
+        );
+    }
+
+    #[test]
+    fn agent_session_executable_fails_closed_for_missing_or_non_executable_sibling() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let main_agent = tmp
+            .path()
+            .join(format!("main-agent{}", std::env::consts::EXE_SUFFIX));
+        let agent_session = tmp
+            .path()
+            .join(format!("agent-session{}", std::env::consts::EXE_SUFFIX));
+        fs::write(&main_agent, "main-agent").expect("main-agent fixture");
+        fs::set_permissions(&main_agent, fs::Permissions::from_mode(0o700))
+            .expect("main-agent mode");
+
+        let missing = resolve_agent_session_executable_from(&main_agent)
+            .expect_err("missing sibling must fail");
+        assert_eq!(missing.kind(), io::ErrorKind::NotFound);
+
+        fs::write(&agent_session, "agent-session").expect("agent-session fixture");
+        fs::set_permissions(&agent_session, fs::Permissions::from_mode(0o600))
+            .expect("agent-session mode");
+        let non_executable = resolve_agent_session_executable_from(&main_agent)
+            .expect_err("non-executable sibling must fail");
+        assert_eq!(non_executable.kind(), io::ErrorKind::PermissionDenied);
+    }
 
     #[test]
     fn explicit_coordination_mode_is_in_the_first_durable_record() {
