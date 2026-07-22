@@ -73,6 +73,29 @@ struct BootstrapPayload {
     receipt: String,
 }
 
+#[derive(Debug, Serialize)]
+struct BootstrapDryRunFile {
+    name: String,
+    sha256: String,
+    bytes: u64,
+}
+
+#[derive(Debug, Serialize)]
+struct BootstrapDryRunPayload {
+    dry_run: bool,
+    provider: String,
+    repository: String,
+    owner_kind: RepoBootstrapOwnerKind,
+    private: bool,
+    auto_init: bool,
+    default_branch: String,
+    message: String,
+    authorization_validated: bool,
+    resume: bool,
+    files: Vec<BootstrapDryRunFile>,
+    steps: [&'static str; 5],
+}
+
 #[derive(Debug)]
 struct RepoSnapshot {
     clone_url: String,
@@ -106,6 +129,48 @@ pub fn run(
             None,
         )
     })?;
+    if global.dry_run {
+        let payload = BootstrapDryRunPayload {
+            dry_run: true,
+            provider: provider.to_string(),
+            repository,
+            owner_kind: args.owner_kind,
+            private: true,
+            auto_init: false,
+            default_branch: args.default_branch,
+            message: args.message,
+            authorization_validated: true,
+            resume: args.resume,
+            files: files
+                .into_iter()
+                .map(|file| BootstrapDryRunFile {
+                    name: file.name,
+                    sha256: file.sha256,
+                    bytes: file.bytes,
+                })
+                .collect(),
+            steps: [
+                "create_private_empty_repository",
+                "create_signed_zero_parent_root",
+                "push_exact_root_once",
+                "set_default_branch_after_push",
+                "verify_branch_and_signature",
+            ],
+        };
+        return Ok(emit_success(
+            schema_version_for(BINARY, "repo.bootstrap.dry-run", 1),
+            payload,
+            format,
+            |payload| {
+                println!(
+                    "would bootstrap private Forgejo repository {} on {} from {} file(s)",
+                    payload.repository,
+                    payload.default_branch,
+                    payload.files.len()
+                )
+            },
+        ));
+    }
     let state_dir = bootstrap_state_dir(provider, &owner, &repo)?;
     let receipt_path = state_dir.join("receipt.json");
     let checkout = state_dir.join("checkout");
@@ -213,12 +278,10 @@ pub fn run(
     )?;
     let existing_branch =
         branch_sha(client.branch_optional(&owner, &repo, &args.default_branch)?)?;
-    if receipt.local_sha.is_none()
-        && (!snapshot.empty || existing_branch.is_some() || !snapshot.default_branch.is_empty())
-    {
+    if receipt.local_sha.is_none() && (!snapshot.empty || existing_branch.is_some()) {
         return Err(validation(
             "repository_not_empty",
-            "Forgejo bootstrap requires an empty repository with no branch or default branch",
+            "Forgejo bootstrap requires an empty repository with no target branch",
             None,
         ));
     }

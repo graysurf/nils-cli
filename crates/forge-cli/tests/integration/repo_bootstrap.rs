@@ -7,6 +7,7 @@ use std::sync::{Arc, Mutex};
 
 use nils_test_support::http::{HttpResponse, RecordedRequest, TestServer};
 use pretty_assertions::{assert_eq, assert_ne};
+use sha2::{Digest, Sha256};
 
 use super::support::{CmdOutput, StubEnv, parse_envelope, run_forge_cli};
 
@@ -26,6 +27,7 @@ struct ForgeState {
     signature_verified: bool,
     legacy_top_level_signature: bool,
     receipt_seen_before_create: bool,
+    reported_empty: Option<bool>,
 }
 
 impl Default for ForgeState {
@@ -39,6 +41,7 @@ impl Default for ForgeState {
             signature_verified: true,
             legacy_top_level_signature: false,
             receipt_seen_before_create: false,
+            reported_empty: None,
         }
     }
 }
@@ -205,6 +208,14 @@ printf '{"schema_version":"cli.semantic-commit.commit.v1","ok":true,"commit":{"s
     }
 
     fn run(&self, owner_kind: &str, resume: bool) -> CmdOutput {
+        self.run_with_options(owner_kind, resume, false)
+    }
+
+    fn run_dry_run(&self, owner_kind: &str, resume: bool) -> CmdOutput {
+        self.run_with_options(owner_kind, resume, true)
+    }
+
+    fn run_with_options(&self, owner_kind: &str, resume: bool, dry_run: bool) -> CmdOutput {
         let mut args = vec![
             "--provider".to_string(),
             PROVIDER.to_string(),
@@ -227,6 +238,9 @@ printf '{"schema_version":"cli.semantic-commit.commit.v1","ok":true,"commit":{"s
             "--reason-file".to_string(),
             self.reason.to_string_lossy().into_owned(),
         ];
+        if dry_run {
+            args.push("--dry-run".to_string());
+        }
         if resume {
             args.push("--resume".to_string());
         }
@@ -237,6 +251,54 @@ printf '{"schema_version":"cli.semantic-commit.commit.v1","ok":true,"commit":{"s
     fn set_env(&mut self, key: &str, value: &str) {
         self.stub.envs.retain(|(candidate, _)| candidate != key);
         self.stub.envs.push((key.to_string(), value.to_string()));
+    }
+
+    fn seed_create_attempt_receipt(&self) {
+        fn file_entry(path: &Path) -> serde_json::Value {
+            let bytes = fs::read(path).expect("read receipt fixture");
+            let sha256 = Sha256::digest(&bytes)
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>();
+            serde_json::json!({
+                "source": fs::canonicalize(path)
+                    .expect("canonical receipt fixture")
+                    .to_string_lossy(),
+                "name": path.file_name().expect("fixture name").to_string_lossy(),
+                "sha256": sha256,
+                "bytes": bytes.len()
+            })
+        }
+
+        fs::create_dir_all(self.receipt.parent().expect("receipt parent"))
+            .expect("create receipt parent");
+        fs::write(
+            &self.receipt,
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "schema_version": "forge-cli.repo-bootstrap.receipt.v1",
+                "provider": PROVIDER,
+                "repository": format!("{}/widgets", self.owner),
+                "owner_kind": "user",
+                "default_branch": "main",
+                "message": "chore: initialize repository",
+                "reason": "Operator authorized private repository bootstrap.",
+                "files": [file_entry(&self.readme), file_entry(&self.license)],
+                "create_attempted": true,
+                "remote_created": false,
+                "local_sha": null,
+                "push_attempted": false,
+                "default_branch_set": false,
+                "complete": false,
+                "reconciled": false
+            }))
+            .expect("serialize receipt fixture"),
+        )
+        .expect("write receipt fixture");
+        let mut permissions = fs::metadata(&self.receipt)
+            .expect("receipt metadata")
+            .permissions();
+        permissions.set_mode(0o600);
+        fs::set_permissions(&self.receipt, permissions).expect("receipt permissions");
     }
 }
 
@@ -267,7 +329,7 @@ fn handle_forgejo(
                 "name": "widgets",
                 "owner": {"login": owner},
                 "private": true,
-                "empty": !remote_sha.exists(),
+                "empty": state.reported_empty.unwrap_or(!remote_sha.exists()),
                 "default_branch": state.default_branch,
                 "clone_url": format!("http://{host}/{owner}/widgets.git"),
                 "html_url": format!("http://{host}/{owner}/widgets")
@@ -331,6 +393,126 @@ fn handle_forgejo(
         404,
         format!("unexpected {} {}", request.method, request.path),
     )
+}
+
+#[test]
+fn forgejo_bootstrap_dry_run_is_offline_state_free_and_deterministic() {
+    let fixture = Fixture::new("alice");
+    assert!(fixture.server.take_requests().is_empty());
+
+    let first = fixture.run_dry_run("user", false);
+    assert_eq!(
+        first.code, 0,
+        "stdout={} stderr={}",
+        first.stdout, first.stderr
+    );
+    let second = fixture.run_dry_run("user", false);
+    assert_eq!(
+        second.code, 0,
+        "stdout={} stderr={}",
+        second.stdout, second.stderr
+    );
+    assert_eq!(second.stdout, first.stdout, "dry-run plan must be stable");
+
+    let envelope = parse_envelope(&first.stdout);
+    assert_eq!(
+        envelope["schema_version"],
+        "cli.forge-cli.repo.bootstrap.dry-run.v1"
+    );
+    assert_eq!(envelope["data"]["dry_run"], true);
+    assert_eq!(envelope["data"]["provider"], PROVIDER);
+    assert_eq!(envelope["data"]["repository"], "alice/widgets");
+    assert_eq!(envelope["data"]["owner_kind"], "user");
+    assert_eq!(envelope["data"]["private"], true);
+    assert_eq!(envelope["data"]["auto_init"], false);
+    assert_eq!(envelope["data"]["default_branch"], "main");
+    assert_eq!(envelope["data"]["message"], "chore: initialize repository");
+    assert_eq!(envelope["data"]["authorization_validated"], true);
+    assert_eq!(envelope["data"]["resume"], false);
+    assert_eq!(envelope["data"]["files"][0]["name"], "README.md");
+    assert_eq!(envelope["data"]["files"][0]["bytes"], 10);
+    assert_eq!(envelope["data"]["files"][1]["name"], "LICENSE");
+    assert_eq!(envelope["data"]["files"][1]["bytes"], 16);
+    assert_eq!(
+        envelope["data"]["steps"],
+        serde_json::json!([
+            "create_private_empty_repository",
+            "create_signed_zero_parent_root",
+            "push_exact_root_once",
+            "set_default_branch_after_push",
+            "verify_branch_and_signature"
+        ])
+    );
+
+    assert!(
+        fixture.server.take_requests().is_empty(),
+        "dry-run must not perform version discovery, authentication, repository reads, or writes"
+    );
+    assert!(!fixture.receipt.exists());
+    assert!(!fixture.checkout.exists());
+    assert!(!fixture.git_log.exists());
+    assert!(!fixture.semantic_log.exists());
+}
+
+#[test]
+fn forgejo_bootstrap_resume_accepts_configured_default_without_branch_and_rejects_drift() {
+    let fixture = Fixture::new("alice");
+    {
+        let mut state = fixture.state.lock().unwrap();
+        state.exists = true;
+        state.default_branch = "main".to_string();
+        state.reported_empty = Some(true);
+    }
+    fixture.seed_create_attempt_receipt();
+    let resumed = fixture.run("user", true);
+    assert_eq!(
+        resumed.code, 0,
+        "stdout={} stderr={}",
+        resumed.stdout, resumed.stderr
+    );
+    assert_eq!(
+        parse_envelope(&resumed.stdout)["data"]["default_branch"],
+        "main"
+    );
+    assert_eq!(fixture.state.lock().unwrap().create_calls, 0);
+    assert!(
+        !fixture
+            .server
+            .take_requests()
+            .iter()
+            .any(|request| request.method == "POST")
+    );
+
+    let nonempty = Fixture::new("alice");
+    {
+        let mut state = nonempty.state.lock().unwrap();
+        state.exists = true;
+        state.default_branch = "main".to_string();
+        state.reported_empty = Some(false);
+    }
+    nonempty.seed_create_attempt_receipt();
+    let rejected = nonempty.run("user", true);
+    assert_eq!(rejected.code, 65, "stdout={}", rejected.stdout);
+    assert_eq!(
+        parse_envelope(&rejected.stdout)["error"]["code"],
+        "repository_not_empty"
+    );
+
+    let existing_branch = Fixture::new("alice");
+    {
+        let mut state = existing_branch.state.lock().unwrap();
+        state.exists = true;
+        state.default_branch = "main".to_string();
+        state.reported_empty = Some(true);
+    }
+    existing_branch.seed_create_attempt_receipt();
+    fs::write(&existing_branch.remote_sha, format!("{DRIFT_SHA}\n")).expect("seed existing branch");
+    let rejected = existing_branch.run("user", true);
+    assert_eq!(rejected.code, 65, "stdout={}", rejected.stdout);
+    assert_eq!(
+        parse_envelope(&rejected.stdout)["error"]["code"],
+        "repository_not_empty"
+    );
 }
 
 #[test]

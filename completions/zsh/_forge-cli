@@ -1821,6 +1821,26 @@ json\:"Single-record JSON envelope (snake_case)"))' \
 '--help[Print help (see more with '\''--help'\'')]' \
 && ret=0
 ;;
+(bootstrap)
+_arguments "${_arguments_options[@]}" : \
+'--owner-kind=[Whether the repository owner is the authenticated user or an organization]:OWNER_KIND:(user org)' \
+'--default-branch=[Exact branch name to create and establish as the remote default]:BRANCH:_default' \
+'*--file=[Regular file to copy into the repository root. Repeat for multiple files]:PATH:_files' \
+'--message=[Semantic Commit message for the signed zero-parent root commit]:TEXT:_default' \
+'--reason-file=[UTF-8 file describing the user'\''s explicit bootstrap authorization]:PATH:_files' \
+'--format=[Output format (defaults to text)]:FORMAT:((text\:"Human-readable text output (default)"
+json\:"Single-record JSON envelope (snake_case)"))' \
+'--remote=[Git remote whose URL feeds provider detection (default\: \`origin\`)]:REMOTE:_default' \
+'--provider=[Override auto-detected provider]:PROVIDER:(github gitlab local)' \
+'--host=[Override the forge authority (\`hostname\` or \`hostname\:port\`). With \`--provider\`, a syntactically valid custom authority is accepted unless it is positively identified as the other provider. Without \`--provider\`, the authority must identify a supported provider]:HOST:_default' \
+'--repo=[Override the remote-derived repository path. Accepted shapes\: GitHub \`owner/name\`; GitLab \`group\[/subgroup...\]/project\`; Local \`local\:<slug>\` or \`<slug>\`]:REPOSITORY:_default' \
+'--store-root=[Root directory of the file-backed store used by \`--provider local\`. Overrides the \`FORGE_CLI_LOCAL_STORE\` env var]:path:_files' \
+'--resume[Resume an existing durable bootstrap receipt after exact read-back]' \
+'--dry-run[Validate and describe the planned operation without applying its mutation. Read-only preflight calls may still run]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+&& ret=0
+;;
 (push-default)
 _arguments "${_arguments_options[@]}" : \
 '--head=[Commit-ish to deliver. It must resolve to the currently checked-out HEAD]:HEAD:_default' \
@@ -1851,6 +1871,10 @@ _arguments "${_arguments_options[@]}" : \
         curcontext="${curcontext%:*:*}:forge-cli-repo-help-command-$line[1]:"
         case $line[1] in
             (view)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(bootstrap)
 _arguments "${_arguments_options[@]}" : \
 && ret=0
 ;;
@@ -2361,6 +2385,10 @@ _arguments "${_arguments_options[@]}" : \
         curcontext="${curcontext%:*:*}:forge-cli-help-repo-command-$line[1]:"
         case $line[1] in
             (view)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(bootstrap)
 _arguments "${_arguments_options[@]}" : \
 && ret=0
 ;;
@@ -2923,9 +2951,15 @@ _forge-cli__subcmd__help__subcmd__provider__subcmd__view_commands() {
 _forge-cli__subcmd__help__subcmd__repo_commands() {
     local commands; commands=(
 'view:Resolve the repo slug, default branch, and supported merge methods' \
+'bootstrap:Create and initialize one new private Forgejo repository under a durable receipt' \
 'push-default:Deliver one signed commit to the default branch with a normal fast-forward push' \
     )
     _describe -t commands 'forge-cli help repo commands' commands "$@"
+}
+(( $+functions[_forge-cli__subcmd__help__subcmd__repo__subcmd__bootstrap_commands] )) ||
+_forge-cli__subcmd__help__subcmd__repo__subcmd__bootstrap_commands() {
+    local commands; commands=()
+    _describe -t commands 'forge-cli help repo bootstrap commands' commands "$@"
 }
 (( $+functions[_forge-cli__subcmd__help__subcmd__repo__subcmd__push-default_commands] )) ||
 _forge-cli__subcmd__help__subcmd__repo__subcmd__push-default_commands() {
@@ -3749,19 +3783,31 @@ _forge-cli__subcmd__provider__subcmd__view_commands() {
 _forge-cli__subcmd__repo_commands() {
     local commands; commands=(
 'view:Resolve the repo slug, default branch, and supported merge methods' \
+'bootstrap:Create and initialize one new private Forgejo repository under a durable receipt' \
 'push-default:Deliver one signed commit to the default branch with a normal fast-forward push' \
 'help:Print this message or the help of the given subcommand(s)' \
     )
     _describe -t commands 'forge-cli repo commands' commands "$@"
 }
+(( $+functions[_forge-cli__subcmd__repo__subcmd__bootstrap_commands] )) ||
+_forge-cli__subcmd__repo__subcmd__bootstrap_commands() {
+    local commands; commands=()
+    _describe -t commands 'forge-cli repo bootstrap commands' commands "$@"
+}
 (( $+functions[_forge-cli__subcmd__repo__subcmd__help_commands] )) ||
 _forge-cli__subcmd__repo__subcmd__help_commands() {
     local commands; commands=(
 'view:Resolve the repo slug, default branch, and supported merge methods' \
+'bootstrap:Create and initialize one new private Forgejo repository under a durable receipt' \
 'push-default:Deliver one signed commit to the default branch with a normal fast-forward push' \
 'help:Print this message or the help of the given subcommand(s)' \
     )
     _describe -t commands 'forge-cli repo help commands' commands "$@"
+}
+(( $+functions[_forge-cli__subcmd__repo__subcmd__help__subcmd__bootstrap_commands] )) ||
+_forge-cli__subcmd__repo__subcmd__help__subcmd__bootstrap_commands() {
+    local commands; commands=()
+    _describe -t commands 'forge-cli repo help bootstrap commands' commands "$@"
 }
 (( $+functions[_forge-cli__subcmd__repo__subcmd__help__subcmd__help_commands] )) ||
 _forge-cli__subcmd__repo__subcmd__help__subcmd__help_commands() {
