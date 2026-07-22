@@ -1,15 +1,20 @@
-use std::fs;
+use std::ffi::OsString;
+use std::fs::{self, OpenOptions};
+use std::io::{self, Write};
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::Path;
 
 use jiff::Timestamp;
-use nils_common::fs::{SECRET_FILE_MODE, write_atomic};
+use nils_common::fs::SECRET_FILE_MODE;
 use serde::Serialize;
+use uuid::Uuid;
 
 use crate::error::HookError;
 use crate::model::{NormalizedDecision, NormalizedRequest};
 
 const MAX_TRACE_BYTES: usize = 256 * 1024;
 const MAX_TRACE_ENTRIES: usize = 256;
+const MAX_TRACE_TEMP_ATTEMPTS: usize = 10;
 
 #[derive(Serialize)]
 struct TraceEntry<'a> {
@@ -101,8 +106,51 @@ pub fn append(
         bytes.extend_from_slice(&line);
         bytes.push(b'\n');
     }
-    write_atomic(&path, &bytes, SECRET_FILE_MODE)
+    write_trace_atomic(&path, &bytes)
         .map_err(|_| HookError::runtime("trace-write-failed", "redacted trace write failed"))
+}
+
+fn write_trace_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    for _ in 0..MAX_TRACE_TEMP_ATTEMPTS {
+        let temp_path = trace_temp_path(path);
+        let mut file = match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(SECRET_FILE_MODE)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(&temp_path)
+        {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        };
+        if let Err(error) = file
+            .set_permissions(fs::Permissions::from_mode(SECRET_FILE_MODE))
+            .and_then(|()| file.write_all(bytes))
+        {
+            drop(file);
+            let _ = fs::remove_file(&temp_path);
+            return Err(error);
+        }
+        drop(file);
+        if let Err(error) = fs::rename(&temp_path, path) {
+            let _ = fs::remove_file(&temp_path);
+            return Err(error);
+        }
+        return Ok(());
+    }
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        "failed to allocate unique trace temporary file",
+    ))
+}
+
+fn trace_temp_path(path: &Path) -> std::path::PathBuf {
+    let mut name = OsString::from(".");
+    name.push(path.file_name().unwrap_or_default());
+    name.push(".tmp-");
+    name.push(Uuid::new_v4().simple().to_string());
+    path.with_file_name(name)
 }
 
 fn encoded_len(lines: &[Vec<u8>]) -> usize {
@@ -116,5 +164,59 @@ fn action_name(action: crate::model::DecisionAction) -> &'static str {
         crate::model::DecisionAction::Context => "context",
         crate::model::DecisionAction::Transform => "transform",
         crate::model::DecisionAction::Block => "block",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::ffi::OsString;
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+
+    use pretty_assertions::assert_eq;
+    use tempfile::TempDir;
+
+    use super::{SECRET_FILE_MODE, write_trace_atomic};
+
+    #[test]
+    fn write_trace_atomic_replaces_content_with_private_mode_without_temp_residue() {
+        let directory = TempDir::new().expect("temporary directory");
+        let path = directory.path().join("trace.jsonl");
+        fs::write(&path, b"stale\n").expect("seed trace");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).expect("seed mode");
+
+        write_trace_atomic(&path, b"replacement\n").expect("replace trace");
+
+        assert_eq!(fs::read(&path).expect("read trace"), b"replacement\n");
+        assert_eq!(
+            fs::metadata(&path)
+                .expect("trace metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            SECRET_FILE_MODE
+        );
+        assert_eq!(directory_entries(directory.path()), ["trace.jsonl"]);
+    }
+
+    #[test]
+    fn write_trace_atomic_cleans_temp_after_replace_error() {
+        let directory = TempDir::new().expect("temporary directory");
+        let path = directory.path().join("trace.jsonl");
+        fs::create_dir(&path).expect("blocking destination directory");
+
+        write_trace_atomic(&path, b"replacement\n").expect_err("replace must fail");
+
+        assert!(path.is_dir());
+        assert_eq!(directory_entries(directory.path()), ["trace.jsonl"]);
+    }
+
+    fn directory_entries(path: &std::path::Path) -> Vec<OsString> {
+        let mut entries = fs::read_dir(path)
+            .expect("read directory")
+            .map(|entry| entry.expect("directory entry").file_name())
+            .collect::<Vec<_>>();
+        entries.sort();
+        entries
     }
 }
