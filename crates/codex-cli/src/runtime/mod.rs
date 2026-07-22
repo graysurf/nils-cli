@@ -8,6 +8,14 @@ use crate::auth as codex_auth;
 use crate::auth::remote::{ENV_AUTH_REMOTE_NAME, ENV_AUTH_REMOTE_SSH};
 use crate::provider_profile::CODEX_PROVIDER_PROFILE;
 
+mod agent_mode;
+mod isolated;
+
+pub use agent_mode::{AgentCommandProfile, AgentRuntimeMode, AgentRuntimeOptions};
+pub use isolated::{
+    GeneratedCommitMessage, doctor_isolated, exec_isolated, generate_commit_message,
+};
+
 pub use nils_common::provider_runtime::ExecOptions;
 pub use nils_common::provider_runtime::{
     CoreError, CoreErrorCategory, ProviderCategoryHint, auth, json, jwt,
@@ -89,7 +97,7 @@ pub fn exec_dangerous_with_options(
     )
 }
 
-fn refresh_remote_auth_before_exec() {
+pub(crate) fn refresh_remote_auth_before_exec() {
     if std::env::var(ENV_AUTH_REMOTE_SSH)
         .ok()
         .filter(|value| !value.trim().is_empty())

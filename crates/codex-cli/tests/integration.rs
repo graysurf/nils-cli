@@ -7,6 +7,8 @@
 mod agent_commit;
 #[path = "integration/agent_exec.rs"]
 mod agent_exec;
+#[path = "integration/agent_isolation.rs"]
+mod agent_isolation;
 #[path = "integration/agent_prompt.rs"]
 mod agent_prompt;
 #[path = "integration/agent_resume.rs"]

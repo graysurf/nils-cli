@@ -53,7 +53,11 @@ fn main_agent_and_config_without_subcommand_print_help() {
 fn main_agent_prompt_is_gated_and_config_show_exits_zero() {
     let options = CmdOptions::default().with_env("CODEX_ALLOW_DANGEROUS_ENABLED", "false");
     let bin = codex_cli_bin();
-    let output = cmd::run_with(&bin, &["agent", "prompt", "hello"], &options);
+    let output = cmd::run_with(
+        &bin,
+        &["agent", "prompt", "--runtime", "inherited", "hello"],
+        &options,
+    );
     assert_exit(&output, 1);
     assert!(stderr(&output).contains("disabled (set CODEX_ALLOW_DANGEROUS_ENABLED=true)"));
 

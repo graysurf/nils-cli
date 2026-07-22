@@ -158,6 +158,7 @@ fn leaf_paths() -> Vec<Vec<&'static str>> {
         vec!["agent", "advice"],
         vec!["agent", "knowledge"],
         vec!["agent", "commit"],
+        vec!["agent", "doctor"],
         vec!["auth", "login"],
         vec!["auth", "use"],
         vec!["auth", "save"],

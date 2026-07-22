@@ -11,5 +11,7 @@ pub mod common;
 mod completion_outside_repo;
 #[path = "integration/exit_codes.rs"]
 mod exit_codes;
+#[path = "integration/local_default.rs"]
+mod local_default;
 #[path = "integration/staged_context.rs"]
 mod staged_context;

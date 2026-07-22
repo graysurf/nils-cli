@@ -11,7 +11,7 @@ use sha2::{Digest, Sha256};
 use crate::error::HookError;
 use crate::model::{
     CONFIG_VERSION, Capability, Config, FailurePosture, LoadedPolicy, OverrideClass,
-    POLICY_VERSION, PolicyBundle, PolicyRule, Product, ProviderMode, RuleMode,
+    POLICY_VERSION, PolicyBundle, PolicyRule, Product, ProviderMode, RuleMode, TimeoutPosture,
 };
 use crate::paths::Layout;
 
@@ -253,6 +253,16 @@ fn validate_policy(bundle: &PolicyBundle, config: &Config) -> Result<(), HookErr
             }
         }
         validate_capability(&rule.capability)?;
+        if matches!(rule.timeout_posture, TimeoutPosture::EffectGated)
+            && (!matches!(rule.capability, Capability::RuntimeKitHandler { .. })
+                || rule.events.iter().any(|event| event != "PreToolUse")
+                || rule.matcher.is_none())
+        {
+            return Err(HookError::data(
+                "timeout-effect-projection-invalid",
+                "effect_gated timeout posture requires a matched PreToolUse runtime handler",
+            ));
+        }
         if matches!(rule.capability, Capability::SessionCoordination { .. })
             && (!matches!(rule.mode, RuleMode::Enforce)
                 || !matches!(rule.failure_posture, FailurePosture::Closed)

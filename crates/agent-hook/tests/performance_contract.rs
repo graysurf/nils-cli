@@ -1,9 +1,10 @@
 mod support;
 
 use std::fs;
+use std::io::Write;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use pretty_assertions::assert_eq;
@@ -555,32 +556,350 @@ fn executable_capabilities_share_one_cardinality_and_deadline_budget() {
 }
 
 #[test]
-fn child_deadline_is_dispatch_wide_and_below_provider_timeout() {
-    let mut policy = String::from(
-        "schema_version = \"agent-hook.policy.v1\"\nbundle_id = \"runtime-kit\"\nversion = \"2026.07.20.1\"\n",
-    );
-    for index in 0..3 {
-        policy.push_str(&format!(
-            "\n[[rules]]\nid = \"runtime.slow-{index}\"\nproducts = [\"codex\"]\nevents = [\"SessionStart\"]\npriority = {index}\nmode = \"enforce\"\nfailure_posture = \"closed\"\noverride_class = \"locked\"\ncapability = {{ id = \"runtime-kit.handler.v1\", handler_id = \"session-start-healthcheck\" }}\n"
-        ));
-    }
-    let fixture = Fixture::new(&policy);
+fn rule_timeout_preserves_later_completed_block_and_records_degraded_incident() {
+    let policy = r#"schema_version = "agent-hook.policy.v1"
+bundle_id = "runtime-kit"
+version = "2026.07.23.1"
+
+[[rules]]
+id = "runtime.slow-advisory"
+products = ["codex"]
+events = ["SessionStart"]
+priority = 10
+mode = "enforce"
+failure_posture = "closed"
+timeout_posture = "warn"
+override_class = "locked"
+capability = { id = "runtime-kit.handler.v1", handler_id = "session-start-healthcheck" }
+
+[[rules]]
+id = "runtime.later-block"
+products = ["codex"]
+events = ["SessionStart"]
+priority = 20
+mode = "enforce"
+failure_posture = "closed"
+timeout_posture = "closed"
+override_class = "locked"
+capability = { id = "runtime-kit.handler.v1", handler_id = "user-prompt-agent-docs" }
+"#;
+    let fixture = Fixture::new(policy);
     let hooks = fixture.home.join(".codex/hooks");
     fs::create_dir_all(&hooks).expect("hooks");
-    let handler = hooks.join("session-start-healthcheck.sh");
-    fs::write(&handler, b"#!/bin/sh\nsleep 2\nprintf '{}\\n'\n").expect("handler");
-    fs::set_permissions(&handler, fs::Permissions::from_mode(0o755)).expect("handler mode");
+    let slow = hooks.join("session-start-healthcheck.sh");
+    fs::write(&slow, b"#!/bin/sh\nsleep 30\n").expect("slow handler");
+    fs::set_permissions(&slow, fs::Permissions::from_mode(0o755)).expect("slow handler mode");
+    let blocking = hooks.join("user-prompt-agent-docs.sh");
+    fs::write(&blocking, b"#!/bin/sh\nprintf '{\"continue\":false}\\n'\n")
+        .expect("blocking handler");
+    fs::set_permissions(&blocking, fs::Permissions::from_mode(0o755))
+        .expect("blocking handler mode");
     let started = Instant::now();
     let output = fixture.run(
         &["dispatch", "--product", "codex", "--format", "json"],
         Some(r#"{"hook_event_name":"SessionStart","source":"startup"}"#),
     );
-    assert_eq!(output.code, 65, "stderr={}", output.stderr_text());
     assert_eq!(
-        output.stdout_json()["error"]["code"],
-        "dispatch-deadline-exceeded"
+        output.code,
+        1,
+        "stdout={} stderr={}",
+        output.stdout_text(),
+        output.stderr_text()
+    );
+    assert_eq!(
+        output.stdout_json()["data"]["reasons"][0]["code"],
+        "runtime.slow-advisory:capability-timeout-warn"
+    );
+    assert_eq!(
+        output.stdout_json()["data"]["reasons"][1]["code"],
+        "user-prompt-agent-docs"
     );
     assert!(started.elapsed() < Duration::from_millis(5_800));
+    let degraded = fixture.state_home.join("agent-hook/degraded");
+    assert!(
+        fs::read_dir(&degraded)
+            .expect("degraded incident directory")
+            .any(|entry| entry
+                .expect("incident entry")
+                .path()
+                .extension()
+                .is_some_and(|ext| ext == "json")),
+        "timeout must leave a private incident record"
+    );
+}
+
+#[test]
+fn effect_gated_timeout_allows_local_reversible_write_with_incident_warning() {
+    let policy = r#"schema_version = "agent-hook.policy.v1"
+bundle_id = "runtime-kit"
+version = "2026.07.23.1"
+
+[[rules]]
+id = "runtime.pre-edit"
+products = ["codex"]
+events = ["PreToolUse"]
+matcher = "Write"
+priority = 10
+mode = "enforce"
+failure_posture = "closed"
+timeout_posture = "effect_gated"
+override_class = "locked"
+capability = { id = "runtime-kit.handler.v1", handler_id = "pre-edit-intent-gate" }
+"#;
+    let fixture = Fixture::new(policy);
+    init_repository(&fixture.root);
+    let hooks = fixture.home.join(".codex/hooks");
+    fs::create_dir_all(&hooks).expect("hooks");
+    let handler = hooks.join("pre-edit-intent-gate.py");
+    fs::write(&handler, b"#!/bin/sh\nsleep 30\n").expect("handler");
+    fs::set_permissions(&handler, fs::Permissions::from_mode(0o755)).expect("handler mode");
+    let payload = json!({
+        "hook_event_name":"PreToolUse",
+        "session_id":"session-timeout-correlation",
+        "tool_use_id":"tool-timeout-correlation",
+        "tool_name":"Write",
+        "cwd":fixture.root,
+        "tool_input":{"path":fixture.root.join("target.txt")}
+    })
+    .to_string();
+
+    let output = fixture.run(
+        &["dispatch", "--product", "codex", "--format", "json"],
+        Some(&payload),
+    );
+
+    assert_eq!(
+        output.code,
+        0,
+        "stdout={} stderr={}",
+        output.stdout_text(),
+        output.stderr_text()
+    );
+    assert_eq!(output.stdout_json()["data"]["action"], "warn");
+    assert_eq!(
+        output.stdout_json()["data"]["reasons"][0]["code"],
+        "runtime.pre-edit:capability-timeout-effect-gated"
+    );
+    let context = output.stdout_json()["data"]["context"]
+        .as_str()
+        .expect("warning context")
+        .to_string();
+    assert!(context.contains("The operation was allowed"));
+    assert!(context.contains("incident:sha256:"));
+
+    let degraded = fixture.state_home.join("agent-hook/degraded");
+    let records = fs::read_dir(&degraded)
+        .expect("incident directory")
+        .filter_map(|entry| {
+            let path = entry.expect("incident entry").path();
+            if path.extension().and_then(|value| value.to_str()) != Some("json") {
+                return None;
+            }
+            let value: serde_json::Value =
+                serde_json::from_slice(&fs::read(&path).expect("degraded record"))
+                    .expect("degraded JSON");
+            Some((path, value))
+        })
+        .collect::<Vec<_>>();
+    let (incident_path, pending) = records
+        .iter()
+        .find(|(_, value)| value["schema_version"] == "agent-hook.degraded-incident.v1")
+        .expect("incident record");
+    let (_, summary) = records
+        .iter()
+        .find(|(_, value)| value["schema_version"] == "agent-hook.degraded-summary.v1")
+        .expect("summary record");
+    assert_eq!(pending["completion"], "pending");
+    assert_eq!(summary["count"], 1);
+    assert_eq!(summary["latest_completion"], "pending");
+    assert_eq!(summary["most_recent_incident_id"], pending["incident_id"]);
+
+    let terminal = json!({
+        "hook_event_name":"PostToolUse",
+        "session_id":"session-timeout-correlation",
+        "tool_use_id":"tool-timeout-correlation",
+        "tool_name":"Write",
+        "cwd":fixture.root,
+        "tool_input":{"path":fixture.root.join("target.txt")}
+    })
+    .to_string();
+    let terminal_output = fixture.run(
+        &["dispatch", "--product", "codex", "--format", "json"],
+        Some(&terminal),
+    );
+    assert_eq!(
+        terminal_output.code,
+        0,
+        "stderr={}",
+        terminal_output.stderr_text()
+    );
+    let completed: serde_json::Value =
+        serde_json::from_slice(&fs::read(incident_path).expect("completed incident"))
+            .expect("completed JSON");
+    assert_eq!(completed["completion"], "succeeded");
+    let summary_path = records
+        .iter()
+        .find(|(_, value)| value["schema_version"] == "agent-hook.degraded-summary.v1")
+        .map(|(path, _)| path)
+        .expect("summary path");
+    let completed_summary: serde_json::Value =
+        serde_json::from_slice(&fs::read(summary_path).expect("completed summary"))
+            .expect("completed summary JSON");
+    assert_eq!(completed_summary["latest_completion"], "succeeded");
+}
+
+#[test]
+fn concurrent_timeout_processes_remain_warning_admitted_and_counted() {
+    const WRITERS: usize = 8;
+
+    let policy = r#"schema_version = "agent-hook.policy.v1"
+bundle_id = "runtime-kit"
+version = "2026.07.23.1"
+
+[[rules]]
+id = "runtime.pre-edit"
+products = ["codex"]
+events = ["PreToolUse"]
+matcher = "Write"
+priority = 10
+mode = "enforce"
+failure_posture = "closed"
+timeout_posture = "effect_gated"
+override_class = "locked"
+capability = { id = "runtime-kit.handler.v1", handler_id = "pre-edit-intent-gate" }
+"#;
+    let fixture = Fixture::new(policy);
+    init_repository(&fixture.root);
+    let hooks = fixture.home.join(".codex/hooks");
+    fs::create_dir_all(&hooks).expect("hooks");
+    let handler = hooks.join("pre-edit-intent-gate.py");
+    fs::write(&handler, b"#!/bin/sh\nsleep 30\n").expect("handler");
+    fs::set_permissions(&handler, fs::Permissions::from_mode(0o755)).expect("handler mode");
+
+    let mut children = (0..WRITERS)
+        .map(|index| {
+            let payload = json!({
+                "hook_event_name":"PreToolUse",
+                "session_id":format!("session-concurrent-timeout-{index}"),
+                "tool_use_id":format!("tool-concurrent-timeout-{index}"),
+                "tool_name":"Write",
+                "cwd":fixture.root,
+                "tool_input":{"path":fixture.root.join("target.txt")}
+            })
+            .to_string();
+            let mut child = Command::new(env!("CARGO_BIN_EXE_agent-hook"))
+                .args(["dispatch", "--product", "codex", "--format", "json"])
+                .current_dir(&fixture.root)
+                .env_remove("CODEX_HOME")
+                .env("HOME", &fixture.home)
+                .env("XDG_CONFIG_HOME", &fixture.config_home)
+                .env("XDG_STATE_HOME", &fixture.state_home)
+                .env("AGENT_SESSION_STATE_DIR", &fixture.session_state)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("concurrent agent-hook process");
+            child
+                .stdin
+                .take()
+                .expect("agent-hook stdin")
+                .write_all(payload.as_bytes())
+                .expect("agent-hook payload");
+            child
+        })
+        .collect::<Vec<_>>();
+
+    for child in children.drain(..) {
+        let output = child
+            .wait_with_output()
+            .expect("concurrent agent-hook output");
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let decision: serde_json::Value =
+            serde_json::from_slice(&output.stdout).expect("agent-hook decision JSON");
+        assert_eq!(decision["data"]["action"], "warn");
+    }
+
+    let degraded = fixture.state_home.join("agent-hook/degraded");
+    let summary = fs::read_dir(&degraded)
+        .expect("degraded incident directory")
+        .filter_map(|entry| {
+            let path = entry.expect("degraded entry").path();
+            if !path
+                .file_name()
+                .and_then(|value| value.to_str())
+                .is_some_and(|name| name.starts_with("summary-") && name.ends_with(".json"))
+            {
+                return None;
+            }
+            Some(
+                serde_json::from_slice::<serde_json::Value>(
+                    &fs::read(path).expect("degraded summary"),
+                )
+                .expect("degraded summary JSON"),
+            )
+        })
+        .next()
+        .expect("degraded summary record");
+    assert_eq!(summary["count"], WRITERS as u64);
+}
+
+#[test]
+fn effect_gated_timeout_keeps_external_delivery_closed() {
+    let policy = r#"schema_version = "agent-hook.policy.v1"
+bundle_id = "runtime-kit"
+version = "2026.07.23.1"
+
+[[rules]]
+id = "runtime.delivery"
+products = ["codex"]
+events = ["PreToolUse"]
+matcher = "Bash"
+priority = 10
+mode = "enforce"
+failure_posture = "closed"
+timeout_posture = "effect_gated"
+override_class = "locked"
+capability = { id = "runtime-kit.handler.v1", handler_id = "block-unsafe-default-delivery" }
+"#;
+    let fixture = Fixture::new(policy);
+    init_repository(&fixture.root);
+    let hooks = fixture.home.join(".codex/hooks");
+    fs::create_dir_all(&hooks).expect("hooks");
+    let handler = hooks.join("block-unsafe-default-delivery.py");
+    fs::write(&handler, b"#!/bin/sh\nsleep 30\n").expect("handler");
+    fs::set_permissions(&handler, fs::Permissions::from_mode(0o755)).expect("handler mode");
+    let payload = json!({
+        "hook_event_name":"PreToolUse",
+        "tool_name":"Bash",
+        "cwd":fixture.root,
+        "tool_input":{"command":"forge-cli repo push-default --expected-base aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa --reason-file reason.md"}
+    })
+    .to_string();
+
+    let output = fixture.run(
+        &["dispatch", "--product", "codex", "--format", "json"],
+        Some(&payload),
+    );
+
+    assert_eq!(
+        output.code,
+        1,
+        "stdout={} stderr={}",
+        output.stdout_text(),
+        output.stderr_text()
+    );
+    assert_eq!(output.stdout_json()["data"]["action"], "block");
+    assert_eq!(
+        output.stdout_json()["data"]["reasons"][0]["code"],
+        "runtime.delivery:capability-timeout-effect-unknown"
+    );
 }
 
 #[test]

@@ -55,34 +55,48 @@ fn run() -> i32 {
 
 fn handle_agent(args: &cli::AgentArgs) -> i32 {
     match &args.command {
-        Some(cli::AgentCommand::Prompt { prompt, ephemeral }) => agent::prompt_with_options(
+        Some(cli::AgentCommand::Prompt {
+            runtime,
             prompt,
-            agent::exec::ExecOptions {
+            ephemeral,
+        }) => agent::prompt_with_runtime_options(
+            prompt,
+            codex_cli::runtime::AgentRuntimeOptions {
+                runtime: *runtime,
                 ephemeral: *ephemeral,
             },
         ),
         Some(cli::AgentCommand::Advice {
+            runtime,
             question,
             ephemeral,
-        }) => agent::advice_with_options(
+        }) => agent::advice_with_runtime_options(
             question,
-            agent::exec::ExecOptions {
+            codex_cli::runtime::AgentRuntimeOptions {
+                runtime: *runtime,
                 ephemeral: *ephemeral,
             },
         ),
-        Some(cli::AgentCommand::Knowledge { concept, ephemeral }) => agent::knowledge_with_options(
+        Some(cli::AgentCommand::Knowledge {
+            runtime,
             concept,
-            agent::exec::ExecOptions {
+            ephemeral,
+        }) => agent::knowledge_with_runtime_options(
+            concept,
+            codex_cli::runtime::AgentRuntimeOptions {
+                runtime: *runtime,
                 ephemeral: *ephemeral,
             },
         ),
         Some(cli::AgentCommand::Commit {
+            runtime,
             push,
             auto_stage,
             ephemeral,
             extra,
         }) => {
             let options = agent::commit::CommitOptions {
+                runtime: *runtime,
                 push: *push,
                 auto_stage: *auto_stage,
                 ephemeral: *ephemeral,
@@ -95,6 +109,9 @@ fn handle_agent(args: &cli::AgentArgs) -> i32 {
                 session_id: session_id.clone(),
                 cwd: cd.clone(),
             })
+        }
+        Some(cli::AgentCommand::Doctor { output }) => {
+            codex_cli::runtime::doctor_isolated(output.is_json())
         }
         None => print_subcommand_help("agent"),
     }

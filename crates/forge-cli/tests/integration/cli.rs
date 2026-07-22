@@ -143,6 +143,7 @@ fn repo_push_default_help_exposes_guarded_contract_inputs() {
         "--head",
         "--expected-base",
         "--reason-file",
+        "--local-default-receipt",
         "normal fast-forward push",
     ] {
         assert!(

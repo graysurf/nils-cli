@@ -17,7 +17,8 @@ use crate::error::HookError;
 use crate::liveness;
 use crate::model::{
     Capability, DECISION_VERSION, DecisionAction, DecisionReason, FailurePosture, LoadedPolicy,
-    NormalizedDecision, NormalizedRequest, Product, RuleMode, ShadowObservation,
+    NormalizedDecision, NormalizedRequest, OperationEffectClass, Product, RuleMode,
+    ShadowObservation, TimeoutPosture,
 };
 
 const MAX_AGGREGATE_CONTEXT: usize = 16 * 1024;
@@ -26,9 +27,9 @@ const MAX_HANDLER_OUTPUT: usize = 256 * 1024;
 const HANDLER_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_EXECUTABLE_CAPABILITIES: usize = 17;
 const MAX_DISPATCH_CHILD_OUTPUT: usize = 512 * 1024;
-const DISPATCH_CHILD_DEADLINE: Duration = HANDLER_TIMEOUT;
+const RULE_CHILD_DEADLINE: Duration = HANDLER_TIMEOUT;
 const SESSION_COORDINATION_HANDLER: &str = "session-coordination-guard.py";
-const SESSION_COORDINATION_TIMEOUT: Duration = Duration::from_secs(55);
+const SESSION_COORDINATION_TIMEOUT: Duration = RULE_CHILD_DEADLINE;
 
 #[derive(Debug)]
 struct RuleOutcome {
@@ -41,7 +42,6 @@ struct RuleOutcome {
 
 #[derive(Debug)]
 struct ExecutionBudget {
-    started: Option<Instant>,
     children: usize,
     retained_output: usize,
 }
@@ -75,20 +75,12 @@ impl PreparedEvaluation<'_> {
 impl ExecutionBudget {
     fn new() -> Self {
         Self {
-            started: None,
             children: 0,
             retained_output: 0,
         }
     }
 
     fn reserve_child(&mut self) -> Result<(Duration, usize), HookError> {
-        let elapsed = self.started.get_or_insert_with(Instant::now).elapsed();
-        if elapsed >= DISPATCH_CHILD_DEADLINE {
-            return Err(HookError::data(
-                "dispatch-deadline-exceeded",
-                "dispatch executable capability deadline exceeded",
-            ));
-        }
         if self.children >= MAX_EXECUTABLE_CAPABILITIES {
             return Err(HookError::data(
                 "dispatch-child-budget-exceeded",
@@ -97,7 +89,7 @@ impl ExecutionBudget {
         }
         self.children += 1;
         Ok((
-            HANDLER_TIMEOUT.min(DISPATCH_CHILD_DEADLINE - elapsed),
+            HANDLER_TIMEOUT.min(RULE_CHILD_DEADLINE),
             MAX_DISPATCH_CHILD_OUTPUT.saturating_sub(self.retained_output),
         ))
     }
@@ -231,7 +223,9 @@ pub fn prepare<'a>(
             && !prepared.recovery
             && matches!(
                 prepared.rule.capability,
-                Capability::SemanticConflict { .. } | Capability::OwnerLiveness { .. }
+                Capability::SemanticConflict { .. }
+                    | Capability::OwnerLiveness { .. }
+                    | Capability::SessionCoordination { .. }
             )
     });
 
@@ -270,6 +264,8 @@ fn evaluate_with_io(
     coordination_mode_override: Option<nils_common::coordination_projection::CoordinationMode>,
     liveness_io: &dyn liveness::LivenessIo,
 ) -> Result<NormalizedDecision, HookError> {
+    // Terminal correlation is evidence maintenance, not an admission gate.
+    let _ = crate::degraded::complete_terminal(raw, request);
     let liveness = prepared.needs_coordination.then(|| {
         liveness::DispatchProjection::new(coordination, coordination_mode_override, liveness_io)
     });
@@ -286,6 +282,14 @@ fn evaluate_with_io(
     let mut shadow = Vec::new();
     let mut recovery_applied = false;
     let mut execution_budgets = ExecutionBudgets::new();
+    let operation_effect = if prepared.rules.iter().any(|prepared_rule| {
+        prepared_rule.mode == RuleMode::Enforce
+            && prepared_rule.rule.timeout_posture == TimeoutPosture::EffectGated
+    }) {
+        crate::effect::classify(raw, request)
+    } else {
+        OperationEffectClass::Unknown
+    };
     let mut read_only_bypassed_rule_ids = BTreeSet::new();
     for prepared_rule in &prepared.rules {
         let rule = prepared_rule.rule;
@@ -325,8 +329,23 @@ fn evaluate_with_io(
             fallback_handler_id: Some(handler_id),
         } = &rule.capability
         {
-            let outcome =
-                evaluate_read_only(request, raw, &mut execution_budgets.enforced, reason_code);
+            let outcome = match evaluate_read_only(
+                request,
+                raw,
+                &mut execution_budgets.enforced,
+                reason_code,
+            ) {
+                Ok(outcome) => outcome,
+                Err(error) if error.code == "capability-timeout" => timeout_outcome(
+                    loaded,
+                    request,
+                    rule,
+                    operation_effect,
+                    RULE_CHILD_DEADLINE,
+                    raw,
+                ),
+                Err(error) => simple(DecisionAction::Block, &error.code),
+            };
             if outcome.action == DecisionAction::Allow {
                 let paired_rule = prepared
                     .rules
@@ -373,6 +392,14 @@ fn evaluate_with_io(
             liveness.as_ref(),
         ) {
             Ok(outcome) => outcome,
+            Err(error) if error.code == "capability-timeout" => timeout_outcome(
+                loaded,
+                request,
+                rule,
+                operation_effect,
+                RULE_CHILD_DEADLINE,
+                raw,
+            ),
             Err(error) if error.code.starts_with("dispatch-") => return Err(error),
             Err(_) => failure_outcome(rule.failure_posture, &rule.id),
         };
@@ -380,7 +407,18 @@ fn evaluate_with_io(
     }
 
     let decision = aggregate(loaded, request, enforced, shadow, recovery_applied)?;
-    apply_session_coordination(decision, request, raw, prepared.session_coordination)
+    let coordination_mode = liveness
+        .as_ref()
+        .and_then(liveness::DispatchProjection::mode);
+    apply_session_coordination(
+        Some(loaded),
+        decision,
+        request,
+        raw,
+        prepared.session_coordination,
+        coordination_mode,
+        operation_effect,
+    )
 }
 
 fn evaluate_shadow(
@@ -399,6 +437,7 @@ fn evaluate_shadow(
         Capability::OwnerLiveness { reason_code, .. } => simple(DecisionAction::Warn, reason_code),
         Capability::ExecutionReadOnly { reason_code, .. } => {
             evaluate_read_only(request, raw, execution_budget, reason_code)
+                .unwrap_or_else(|error| simple(DecisionAction::Block, &error.code))
         }
         Capability::SessionActivity { .. }
         | Capability::SessionCoordination { .. }
@@ -413,15 +452,12 @@ fn evaluate_read_only(
     raw: &[u8],
     execution_budget: &mut ExecutionBudget,
     reason_code: &str,
-) -> RuleOutcome {
+) -> Result<RuleOutcome, HookError> {
     let verified = crate::read_only::candidate(raw, request).and_then(|candidate| {
         let output = run_with_budget(candidate.descriptor_command(), &[], execution_budget)?;
         crate::read_only::verify_output(&candidate, &output)
     });
-    match verified {
-        Ok(()) => simple(DecisionAction::Allow, reason_code),
-        Err(error) => simple(DecisionAction::Block, &error.code),
-    }
+    verified.map(|()| simple(DecisionAction::Allow, reason_code))
 }
 
 fn evaluate_capability(
@@ -498,7 +534,11 @@ fn evaluate_capability(
             unreachable!("session coordination is evaluated after aggregate policy")
         }
         Capability::ExecutionReadOnly { reason_code, .. } => {
-            evaluate_read_only(request, raw, execution_budget, reason_code)
+            match evaluate_read_only(request, raw, execution_budget, reason_code) {
+                Ok(outcome) => outcome,
+                Err(error) if error.code == "capability-timeout" => return Err(error),
+                Err(error) => simple(DecisionAction::Block, &error.code),
+            }
         }
         Capability::RuntimeKitHandler { handler_id } => {
             run_runtime_handler(request.product, handler_id, raw, execution_budget)?
@@ -507,10 +547,13 @@ fn evaluate_capability(
 }
 
 pub fn apply_session_coordination(
+    loaded: Option<&LoadedPolicy>,
     mut decision: NormalizedDecision,
     request: &NormalizedRequest,
     raw: &[u8],
     rule: Option<&crate::model::PolicyRule>,
+    coordination_mode: Option<nils_common::coordination_projection::CoordinationMode>,
+    operation_effect: OperationEffectClass,
 ) -> Result<NormalizedDecision, HookError> {
     let Some(rule) = rule else {
         return Ok(decision);
@@ -533,10 +576,74 @@ pub fn apply_session_coordination(
             }
             outcome
         }
+        Err(error) if error.code == "capability-timeout" => coordination_timeout_outcome(
+            loaded,
+            request,
+            rule,
+            coordination_mode,
+            operation_effect,
+            raw,
+        ),
         Err(_) => failure_outcome(rule.failure_posture, &rule.id),
     };
     merge_coordination_outcome(&mut decision, &rule.id, outcome)?;
     Ok(decision)
+}
+
+fn coordination_timeout_outcome(
+    loaded: Option<&LoadedPolicy>,
+    request: &NormalizedRequest,
+    rule: &crate::model::PolicyRule,
+    coordination_mode: Option<nils_common::coordination_projection::CoordinationMode>,
+    operation_effect: OperationEffectClass,
+    raw: &[u8],
+) -> RuleOutcome {
+    use nils_common::coordination_projection::CoordinationMode;
+
+    let allowed = matches!(
+        coordination_mode,
+        Some(CoordinationMode::Advisory | CoordinationMode::Off)
+    );
+    let disposition = if allowed {
+        "allow_with_warning"
+    } else {
+        "block"
+    };
+    let incident = loaded.map(|loaded| {
+        crate::degraded::record_timeout(
+            loaded,
+            request,
+            rule,
+            operation_effect,
+            disposition,
+            SESSION_COORDINATION_TIMEOUT.as_millis() as u64,
+            raw,
+        )
+    });
+    if allowed {
+        match incident {
+            Some(Ok(incident_id)) => RuleOutcome {
+                action: DecisionAction::Warn,
+                code: format!("{}:capability-timeout-warn", rule.id),
+                context: Some(format!(
+                    "agent-hook degraded admission: {} timed out in advisory coordination. The operation was allowed. Continue the task and report incident {} in the final response.",
+                    rule.id, incident_id
+                )),
+                replacement: None,
+                provider_output: None,
+            },
+            _ => simple(
+                DecisionAction::Block,
+                &format!("{}:degraded-incident-write-failed", rule.id),
+            ),
+        }
+    } else {
+        let _ = incident;
+        simple(
+            DecisionAction::Block,
+            &format!("{}:capability-timeout-closed", rule.id),
+        )
+    }
 }
 
 fn merge_coordination_outcome(
@@ -594,6 +701,74 @@ fn failure_outcome(posture: FailurePosture, rule_id: &str) -> RuleOutcome {
             DecisionAction::Block,
             &format!("{rule_id}:capability-failure-closed"),
         ),
+    }
+}
+
+fn timeout_outcome(
+    loaded: &LoadedPolicy,
+    request: &NormalizedRequest,
+    rule: &crate::model::PolicyRule,
+    effect: OperationEffectClass,
+    deadline: Duration,
+    raw: &[u8],
+) -> RuleOutcome {
+    let (action, code, disposition, allowed) = match rule.timeout_posture {
+        TimeoutPosture::Closed => (
+            DecisionAction::Block,
+            format!("{}:capability-timeout-closed", rule.id),
+            "block",
+            false,
+        ),
+        TimeoutPosture::Warn => (
+            DecisionAction::Warn,
+            format!("{}:capability-timeout-warn", rule.id),
+            "allow_with_warning",
+            true,
+        ),
+        TimeoutPosture::EffectGated if effect == OperationEffectClass::LocalReversible => (
+            DecisionAction::Warn,
+            format!("{}:capability-timeout-effect-gated", rule.id),
+            "allow_with_warning",
+            true,
+        ),
+        TimeoutPosture::EffectGated => (
+            DecisionAction::Block,
+            format!("{}:capability-timeout-effect-unknown", rule.id),
+            "block",
+            false,
+        ),
+    };
+    let incident = crate::degraded::record_timeout(
+        loaded,
+        request,
+        rule,
+        effect,
+        disposition,
+        deadline.as_millis() as u64,
+        raw,
+    );
+    if allowed {
+        match incident {
+            Ok(incident_id) => RuleOutcome {
+                action,
+                code,
+                context: Some(format!(
+                    "agent-hook degraded admission: {} timed out while evaluating a {} operation. The operation was allowed. Continue the task and report incident {} in the final response.",
+                    rule.id,
+                    effect.as_str().replace('_', "-"),
+                    incident_id
+                )),
+                replacement: None,
+                provider_output: None,
+            },
+            Err(_) => simple(
+                DecisionAction::Block,
+                &format!("{}:degraded-incident-write-failed", rule.id),
+            ),
+        }
+    } else {
+        let _ = incident;
+        simple(action, &code)
     }
 }
 
@@ -975,7 +1150,7 @@ fn run_with_budget(
     budget: &mut ExecutionBudget,
 ) -> Result<std::process::Output, HookError> {
     let (timeout, output_limit) = budget.reserve_child()?;
-    let output = run_bounded(command, input, timeout, output_limit, true)?;
+    let output = run_bounded(command, input, timeout, output_limit, false)?;
     budget.retain_output(output.stdout.len().saturating_add(output.stderr.len()))?;
     Ok(output)
 }
@@ -1017,10 +1192,7 @@ fn run_bounded(
             Ok(None) => {
                 terminate_process_group(&mut child);
                 return Err(if dispatch_deadline {
-                    HookError::data(
-                        "dispatch-deadline-exceeded",
-                        "dispatch executable capability deadline exceeded",
-                    )
+                    HookError::data("dispatch-deadline-exceeded", "dispatch deadline exceeded")
                 } else {
                     HookError::runtime(
                         "capability-timeout",
@@ -1086,9 +1258,9 @@ fn join_capped(
 fn wait_for_thread<T>(handle: &thread::JoinHandle<T>, deadline: Instant) -> Result<(), HookError> {
     while !handle.is_finished() {
         if Instant::now() >= deadline {
-            return Err(HookError::data(
-                "dispatch-deadline-exceeded",
-                "dispatch executable capability deadline exceeded while draining pipes",
+            return Err(HookError::runtime(
+                "capability-timeout",
+                "capability exceeded its deadline while draining pipes",
             ));
         }
         thread::sleep(Duration::from_millis(5));
@@ -1264,6 +1436,7 @@ mod tests {
                 priority: index as i32,
                 mode: RuleMode::Enforce,
                 failure_posture: FailurePosture::Closed,
+                timeout_posture: TimeoutPosture::Closed,
                 override_class: crate::model::OverrideClass::Locked,
                 capability: Capability::OwnerLiveness {
                     reason_code: format!("owner-{index}"),
@@ -1368,8 +1541,7 @@ mod tests {
     #[test]
     fn shadow_child_budget_cannot_exhaust_enforced_budget() {
         let mut budgets = ExecutionBudgets::new();
-        let shared_start = Instant::now() - DISPATCH_CHILD_DEADLINE;
-        budgets.shadow.started = Some(shared_start);
+        budgets.shadow.children = MAX_EXECUTABLE_CAPABILITIES;
 
         assert_eq!(
             budgets
@@ -1377,9 +1549,9 @@ mod tests {
                 .reserve_child()
                 .expect_err("shadow budget exhausted")
                 .code,
-            "dispatch-deadline-exceeded"
+            "dispatch-child-budget-exceeded"
         );
         assert!(budgets.enforced.reserve_child().is_ok());
-        assert!(budgets.enforced.started.is_some());
+        assert_eq!(budgets.enforced.children, 1);
     }
 }

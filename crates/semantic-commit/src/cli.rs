@@ -1,4 +1,4 @@
-use crate::{commit, completion, staged_context};
+use crate::{commit, completion, local_default, staged_context};
 use clap::error::ErrorKind;
 use clap::{Args, CommandFactory, Parser, Subcommand};
 use nils_common::cli_contract::exit;
@@ -25,6 +25,11 @@ enum Command {
     StagedContext(RawArgs),
     #[command(about = "Commit staged changes with a prepared commit message")]
     Commit(RawArgs),
+    #[command(
+        name = "local-default",
+        about = "Create one governed signed commit on the primary local default branch"
+    )]
+    LocalDefault(RawArgs),
     #[command(about = "Create a fixup! commit for staged changes")]
     Fixup(RawArgs),
     #[command(about = "Create a squash! commit for staged changes")]
@@ -59,6 +64,7 @@ where
     match cli.command {
         Some(Command::StagedContext(raw)) => staged_context::run(&raw.args),
         Some(Command::Commit(raw)) => commit::run(&raw.args),
+        Some(Command::LocalDefault(raw)) => local_default::run(&raw.args),
         Some(Command::Fixup(raw)) => commit::run_fixup(&raw.args),
         Some(Command::Squash(raw)) => commit::run_squash(&raw.args),
         Some(Command::Completion(raw)) => completion::run(&raw.args),
