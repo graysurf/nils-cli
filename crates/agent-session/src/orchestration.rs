@@ -276,14 +276,17 @@ pub(crate) fn session_projection(
         }));
     }
     if let Some(assignment) = registry.assignments.values().find(|assignment| {
-        assignment
-            .worker
-            .as_ref()
-            .is_some_and(|worker| session_ref_matches(worker, record, incarnation))
+        assignment.worker.as_ref().is_some_and(|worker| {
+            worker.session_id == record.id && worker.session_created_at == record.created_at
+        })
     }) {
         let Some(run) = registry.runs.get(&assignment.run_id) else {
             return Ok(None);
         };
+        let rebind_required = assignment
+            .worker
+            .as_ref()
+            .is_some_and(|worker| worker.session_incarnation != incarnation);
         let now = crate::coordination::now_epoch();
         let borrowed_by = assignment
             .borrowed_by
@@ -291,7 +294,9 @@ pub(crate) fn session_projection(
             .filter(|relationship| relationship.expires_at_epoch > now)
             .map(|relationship| relationship.session.clone())
             .collect::<Vec<_>>();
-        let relationship_state = if !controller_is_current(context, run) {
+        let relationship_state = if rebind_required {
+            Some("rebind_required".to_string())
+        } else if !controller_is_current(context, run) {
             Some("orphaned".to_string())
         } else if !borrowed_by.is_empty() {
             Some("borrowed".to_string())

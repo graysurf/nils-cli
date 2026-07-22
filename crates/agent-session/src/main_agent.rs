@@ -707,7 +707,7 @@ fn run_checkpoint(context: &CliContext, args: CheckpointArgs) -> Result<Value, C
         }
         Principal::Worker {
             assignment,
-            rebind_required: false,
+            rebind_required,
         } => {
             let current = locked
                 .registry
@@ -715,11 +715,33 @@ fn run_checkpoint(context: &CliContext, args: CheckpointArgs) -> Result<Value, C
                 .get_mut(&assignment.assignment_id)
                 .expect("assignment exists");
             ensure_revision(args.if_revision, current.revision, "assignment")?;
+            if rebind_required {
+                let previous_worker = current
+                    .worker
+                    .as_ref()
+                    .expect("resolved worker assignment has a worker");
+                if orchestration::session_ref_is_live(context, previous_worker) {
+                    return Err(CliError::data(
+                        "worker-incarnation-still-live",
+                        "prior worker incarnation is still live; continuity rebind refused",
+                        Some(json!({
+                            "assignment_id": current.assignment_id,
+                            "current_revision": current.revision
+                        })),
+                    ));
+                }
+                current.worker = Some(session_ref(context, &record, &incarnation));
+            }
             if let Some(state) = input.state {
                 if !matches!(state.as_str(), "working" | "blocked" | "submitted") {
                     return Err(invalid_input("worker checkpoint state is invalid"));
                 }
-                current.state = state;
+                if !matches!(
+                    current.state.as_str(),
+                    "submitted" | "accepted" | "released" | "cancelled"
+                ) {
+                    current.state = state;
+                }
             }
             current.revision = current.revision.saturating_add(1);
             current.checkpoint = Some(RunCheckpoint {
