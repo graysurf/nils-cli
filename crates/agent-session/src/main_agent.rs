@@ -27,6 +27,12 @@ use crate::{
 };
 
 const BINARY: &str = "main-agent";
+const IDEMPOTENCY_KEY_HELP: &str = "Retry an ambiguous outcome with the same idempotency key and the same logical request; use a new key for a changed request.";
+const ASSIGNMENT_REVISION_HELP: &str =
+    "Expected current assignment revision; stale values fail closed and report current_revision.";
+const RUN_REVISION_HELP: &str =
+    "Expected current run revision; stale values fail closed and report current_revision.";
+const MAIN_AGENT_AFTER_HELP: &str = "SAFE LIFECYCLE:\n  init -> rehydrate/status -> worker start -> worker self/checkpoint\n  accept -> release -> delete -> close\n\nREVISION AND RETRY RULES:\n  Read the current run or assignment revision before each mutation. Retry an\n  ambiguous outcome with the identical request and idempotency key. After a\n  confirmed revision conflict, re-read state and use a new key for the revised\n  request.\n\nEXAMPLES:\n  main-agent init --packet-file objective.json --if-absent --idempotency-key init-001 --format json\n  main-agent rehydrate --format markdown\n  main-agent worker start --assignment-file assignment.json --if-run-revision 1 --idempotency-key start-001 --format json\n  main-agent worker accept ASSIGNMENT_ID --if-revision 4 --idempotency-key accept-001 --format json\n\nOPERATOR RUNBOOK:\n  crates/agent-session/docs/runbooks/main-agent-orchestration.md\n\nEXIT CODES:\n  0   success\n  1   runtime error\n  64  command-line usage error\n  65  invalid or stale data\n  69  temporarily unavailable";
 
 #[derive(Debug, Parser)]
 #[command(
@@ -35,7 +41,7 @@ const BINARY: &str = "main-agent";
     long_version = nils_build_info::long_version(env!("CARGO_PKG_VERSION")),
     about = "Manage durable Main Agent orchestration runs and workers.",
     disable_help_subcommand = true,
-    after_help = "EXIT CODES:\n  0   success\n  1   runtime error\n  64  command-line usage error\n  65  invalid or stale data\n  69  temporarily unavailable"
+    after_help = MAIN_AGENT_AFTER_HELP
 )]
 struct MainAgentCli {
     /// agent-session state directory.
@@ -61,7 +67,7 @@ enum MainAgentCommand {
     Status(ReadArgs),
     /// Record a revision-fenced run or worker checkpoint.
     Checkpoint(CheckpointArgs),
-    /// Manage worker assignments.
+    /// Launch and manage interactive worker assignments.
     Worker(WorkerArgs),
     /// Add a non-authoritative collaborator relationship.
     Collaborate(RelationshipArgs),
@@ -82,12 +88,13 @@ struct InitArgs {
     /// Private objective packet JSON file.
     #[arg(long, value_name = "PATH", value_hint = ValueHint::FilePath)]
     packet_file: PathBuf,
+    /// Required absence fence for initial creation; existing continuity is returned or revision-fenced rebind is attempted.
     #[arg(long)]
     if_absent: bool,
-    /// Required only when continuity-rebinding a stopped prior incarnation.
+    /// Expected current run revision when continuity-rebinding a stopped prior incarnation.
     #[arg(long)]
     if_revision: Option<u64>,
-    #[arg(long)]
+    #[arg(long, help = IDEMPOTENCY_KEY_HELP)]
     idempotency_key: String,
     #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
     format: OutputFormat,
@@ -101,6 +108,7 @@ struct SelfGroupArgs {
 
 #[derive(Debug, Subcommand)]
 enum SelfCommand {
+    /// Show this authenticated session's private run or assignment identity.
     Show(ReadArgs),
 }
 
@@ -129,9 +137,10 @@ struct CheckpointArgs {
     /// Private checkpoint input JSON file.
     #[arg(long, value_name = "PATH", value_hint = ValueHint::FilePath)]
     file: PathBuf,
+    /// Expected current revision of the authenticated run or assignment; stale values fail closed and report current_revision.
     #[arg(long)]
     if_revision: u64,
-    #[arg(long)]
+    #[arg(long, help = IDEMPOTENCY_KEY_HELP)]
     idempotency_key: String,
     #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
     format: OutputFormat,
@@ -145,12 +154,19 @@ struct WorkerArgs {
 
 #[derive(Debug, Subcommand)]
 enum WorkerCommand {
+    /// Create an assignment and launch its interactive managed worker.
     Start(WorkerStartArgs),
+    /// List assignments owned by this Main Agent's active run.
     List(ReadArgs),
+    /// Show one assignment, including its private packet.
     Show(WorkerShowArgs),
+    /// Send a private mailbox message to an assignment's worker.
     Message(WorkerMessageArgs),
+    /// Accept a submitted worker result after Main Agent review.
     Accept(AssignmentMutationArgs),
+    /// Mark an accepted assignment terminal before worker deletion.
     Release(AssignmentMutationArgs),
+    /// Delete a released worker through guarded agent-session cleanup.
     Delete(AssignmentMutationArgs),
 }
 
@@ -159,9 +175,9 @@ struct WorkerStartArgs {
     /// Private assignment packet JSON file.
     #[arg(long, value_name = "PATH", value_hint = ValueHint::FilePath)]
     assignment_file: PathBuf,
-    #[arg(long)]
+    #[arg(long, help = RUN_REVISION_HELP)]
     if_run_revision: u64,
-    #[arg(long)]
+    #[arg(long, help = IDEMPOTENCY_KEY_HELP)]
     idempotency_key: String,
     #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
     format: OutputFormat,
@@ -180,7 +196,7 @@ struct WorkerMessageArgs {
     /// Private message body file.
     #[arg(long, value_name = "PATH", value_hint = ValueHint::FilePath)]
     body_file: PathBuf,
-    #[arg(long)]
+    #[arg(long, help = IDEMPOTENCY_KEY_HELP)]
     idempotency_key: String,
     #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
     format: OutputFormat,
@@ -189,10 +205,9 @@ struct WorkerMessageArgs {
 #[derive(Debug, Args)]
 struct AssignmentMutationArgs {
     assignment_id: String,
-    /// Expected current assignment revision.
-    #[arg(long)]
+    #[arg(long, help = ASSIGNMENT_REVISION_HELP)]
     if_revision: u64,
-    #[arg(long)]
+    #[arg(long, help = IDEMPOTENCY_KEY_HELP)]
     idempotency_key: String,
     #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
     format: OutputFormat,
@@ -204,9 +219,9 @@ struct RelationshipArgs {
     /// Exact live session ref, formatted as SESSION_ID@SESSION_INCARNATION.
     #[arg(long)]
     session: String,
-    #[arg(long)]
+    #[arg(long, help = ASSIGNMENT_REVISION_HELP)]
     if_revision: u64,
-    #[arg(long)]
+    #[arg(long, help = IDEMPOTENCY_KEY_HELP)]
     idempotency_key: String,
     #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
     format: OutputFormat,
@@ -220,9 +235,9 @@ struct BorrowArgs {
     session: String,
     #[arg(long, value_name = "DURATION")]
     duration: String,
-    #[arg(long)]
+    #[arg(long, help = ASSIGNMENT_REVISION_HELP)]
     if_revision: u64,
-    #[arg(long)]
+    #[arg(long, help = IDEMPOTENCY_KEY_HELP)]
     idempotency_key: String,
     #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
     format: OutputFormat,
@@ -234,9 +249,9 @@ struct HandoffArgs {
     /// Exact live Main Agent ref, formatted as SESSION_ID@SESSION_INCARNATION.
     #[arg(long = "to")]
     to_session: String,
-    #[arg(long)]
+    #[arg(long, help = ASSIGNMENT_REVISION_HELP)]
     if_revision: u64,
-    #[arg(long)]
+    #[arg(long, help = IDEMPOTENCY_KEY_HELP)]
     idempotency_key: String,
     #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
     format: OutputFormat,
@@ -244,10 +259,9 @@ struct HandoffArgs {
 
 #[derive(Debug, Args)]
 struct RunMutationArgs {
-    /// Expected current run revision.
-    #[arg(long)]
+    #[arg(long, help = RUN_REVISION_HELP)]
     if_revision: u64,
-    #[arg(long)]
+    #[arg(long, help = IDEMPOTENCY_KEY_HELP)]
     idempotency_key: String,
     #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
     format: OutputFormat,

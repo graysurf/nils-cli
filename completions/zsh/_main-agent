@@ -33,13 +33,13 @@ _main-agent() {
             (init)
 _arguments "${_arguments_options[@]}" : \
 '--packet-file=[Private objective packet JSON file]:PATH:_files' \
-'--if-revision=[Required only when continuity-rebinding a stopped prior incarnation]:IF_REVISION:_default' \
-'--idempotency-key=[]:IDEMPOTENCY_KEY:_default' \
+'--if-revision=[Expected current run revision when continuity-rebinding a stopped prior incarnation]:IF_REVISION:_default' \
+'--idempotency-key=[Retry an ambiguous outcome with the same idempotency key and the same logical request; use a new key for a changed request.]:IDEMPOTENCY_KEY:_default' \
 '--format=[]:FORMAT:((text\:"Human-readable text output (default)"
 json\:"Single-record JSON envelope (snake_case)"))' \
 '--state-dir=[agent-session state directory]:PATH:_files -/' \
 '--host=[Advisory machine label for public projections]:HOST:_default' \
-'--if-absent[]' \
+'--if-absent[Required absence fence for initial creation; existing continuity is returned or revision-fenced rebind is attempted]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
 && ret=0
@@ -96,8 +96,8 @@ json\:"Single-record JSON envelope (snake_case)"))' \
 (checkpoint)
 _arguments "${_arguments_options[@]}" : \
 '--file=[Private checkpoint input JSON file]:PATH:_files' \
-'--if-revision=[]:IF_REVISION:_default' \
-'--idempotency-key=[]:IDEMPOTENCY_KEY:_default' \
+'--if-revision=[Expected current revision of the authenticated run or assignment; stale values fail closed and report current_revision]:IF_REVISION:_default' \
+'--idempotency-key=[Retry an ambiguous outcome with the same idempotency key and the same logical request; use a new key for a changed request.]:IDEMPOTENCY_KEY:_default' \
 '--format=[]:FORMAT:((text\:"Human-readable text output (default)"
 json\:"Single-record JSON envelope (snake_case)"))' \
 '--state-dir=[agent-session state directory]:PATH:_files -/' \
@@ -125,8 +125,8 @@ _arguments "${_arguments_options[@]}" : \
             (start)
 _arguments "${_arguments_options[@]}" : \
 '--assignment-file=[Private assignment packet JSON file]:PATH:_files' \
-'--if-run-revision=[]:IF_RUN_REVISION:_default' \
-'--idempotency-key=[]:IDEMPOTENCY_KEY:_default' \
+'--if-run-revision=[Expected current run revision; stale values fail closed and report current_revision.]:IF_RUN_REVISION:_default' \
+'--idempotency-key=[Retry an ambiguous outcome with the same idempotency key and the same logical request; use a new key for a changed request.]:IDEMPOTENCY_KEY:_default' \
 '--format=[]:FORMAT:((text\:"Human-readable text output (default)"
 json\:"Single-record JSON envelope (snake_case)"))' \
 '--state-dir=[agent-session state directory]:PATH:_files -/' \
@@ -159,7 +159,7 @@ json\:"Single-record JSON envelope (snake_case)"))' \
 (message)
 _arguments "${_arguments_options[@]}" : \
 '--body-file=[Private message body file]:PATH:_files' \
-'--idempotency-key=[]:IDEMPOTENCY_KEY:_default' \
+'--idempotency-key=[Retry an ambiguous outcome with the same idempotency key and the same logical request; use a new key for a changed request.]:IDEMPOTENCY_KEY:_default' \
 '--format=[]:FORMAT:((text\:"Human-readable text output (default)"
 json\:"Single-record JSON envelope (snake_case)"))' \
 '--state-dir=[agent-session state directory]:PATH:_files -/' \
@@ -171,8 +171,8 @@ json\:"Single-record JSON envelope (snake_case)"))' \
 ;;
 (accept)
 _arguments "${_arguments_options[@]}" : \
-'--if-revision=[Expected current assignment revision]:IF_REVISION:_default' \
-'--idempotency-key=[]:IDEMPOTENCY_KEY:_default' \
+'--if-revision=[Expected current assignment revision; stale values fail closed and report current_revision.]:IF_REVISION:_default' \
+'--idempotency-key=[Retry an ambiguous outcome with the same idempotency key and the same logical request; use a new key for a changed request.]:IDEMPOTENCY_KEY:_default' \
 '--format=[]:FORMAT:((text\:"Human-readable text output (default)"
 json\:"Single-record JSON envelope (snake_case)"))' \
 '--state-dir=[agent-session state directory]:PATH:_files -/' \
@@ -184,8 +184,8 @@ json\:"Single-record JSON envelope (snake_case)"))' \
 ;;
 (release)
 _arguments "${_arguments_options[@]}" : \
-'--if-revision=[Expected current assignment revision]:IF_REVISION:_default' \
-'--idempotency-key=[]:IDEMPOTENCY_KEY:_default' \
+'--if-revision=[Expected current assignment revision; stale values fail closed and report current_revision.]:IF_REVISION:_default' \
+'--idempotency-key=[Retry an ambiguous outcome with the same idempotency key and the same logical request; use a new key for a changed request.]:IDEMPOTENCY_KEY:_default' \
 '--format=[]:FORMAT:((text\:"Human-readable text output (default)"
 json\:"Single-record JSON envelope (snake_case)"))' \
 '--state-dir=[agent-session state directory]:PATH:_files -/' \
@@ -197,8 +197,8 @@ json\:"Single-record JSON envelope (snake_case)"))' \
 ;;
 (delete)
 _arguments "${_arguments_options[@]}" : \
-'--if-revision=[Expected current assignment revision]:IF_REVISION:_default' \
-'--idempotency-key=[]:IDEMPOTENCY_KEY:_default' \
+'--if-revision=[Expected current assignment revision; stale values fail closed and report current_revision.]:IF_REVISION:_default' \
+'--idempotency-key=[Retry an ambiguous outcome with the same idempotency key and the same logical request; use a new key for a changed request.]:IDEMPOTENCY_KEY:_default' \
 '--format=[]:FORMAT:((text\:"Human-readable text output (default)"
 json\:"Single-record JSON envelope (snake_case)"))' \
 '--state-dir=[agent-session state directory]:PATH:_files -/' \
@@ -215,8 +215,8 @@ esac
 (collaborate)
 _arguments "${_arguments_options[@]}" : \
 '--session=[Exact live session ref, formatted as SESSION_ID@SESSION_INCARNATION]:SESSION:_default' \
-'--if-revision=[]:IF_REVISION:_default' \
-'--idempotency-key=[]:IDEMPOTENCY_KEY:_default' \
+'--if-revision=[Expected current assignment revision; stale values fail closed and report current_revision.]:IF_REVISION:_default' \
+'--idempotency-key=[Retry an ambiguous outcome with the same idempotency key and the same logical request; use a new key for a changed request.]:IDEMPOTENCY_KEY:_default' \
 '--format=[]:FORMAT:((text\:"Human-readable text output (default)"
 json\:"Single-record JSON envelope (snake_case)"))' \
 '--state-dir=[agent-session state directory]:PATH:_files -/' \
@@ -230,8 +230,8 @@ json\:"Single-record JSON envelope (snake_case)"))' \
 _arguments "${_arguments_options[@]}" : \
 '--session=[Exact live session ref, formatted as SESSION_ID@SESSION_INCARNATION]:SESSION:_default' \
 '--duration=[]:DURATION:_default' \
-'--if-revision=[]:IF_REVISION:_default' \
-'--idempotency-key=[]:IDEMPOTENCY_KEY:_default' \
+'--if-revision=[Expected current assignment revision; stale values fail closed and report current_revision.]:IF_REVISION:_default' \
+'--idempotency-key=[Retry an ambiguous outcome with the same idempotency key and the same logical request; use a new key for a changed request.]:IDEMPOTENCY_KEY:_default' \
 '--format=[]:FORMAT:((text\:"Human-readable text output (default)"
 json\:"Single-record JSON envelope (snake_case)"))' \
 '--state-dir=[agent-session state directory]:PATH:_files -/' \
@@ -244,8 +244,8 @@ json\:"Single-record JSON envelope (snake_case)"))' \
 (handoff)
 _arguments "${_arguments_options[@]}" : \
 '--to=[Exact live Main Agent ref, formatted as SESSION_ID@SESSION_INCARNATION]:TO_SESSION:_default' \
-'--if-revision=[]:IF_REVISION:_default' \
-'--idempotency-key=[]:IDEMPOTENCY_KEY:_default' \
+'--if-revision=[Expected current assignment revision; stale values fail closed and report current_revision.]:IF_REVISION:_default' \
+'--idempotency-key=[Retry an ambiguous outcome with the same idempotency key and the same logical request; use a new key for a changed request.]:IDEMPOTENCY_KEY:_default' \
 '--format=[]:FORMAT:((text\:"Human-readable text output (default)"
 json\:"Single-record JSON envelope (snake_case)"))' \
 '--state-dir=[agent-session state directory]:PATH:_files -/' \
@@ -257,8 +257,8 @@ json\:"Single-record JSON envelope (snake_case)"))' \
 ;;
 (adopt)
 _arguments "${_arguments_options[@]}" : \
-'--if-revision=[Expected current assignment revision]:IF_REVISION:_default' \
-'--idempotency-key=[]:IDEMPOTENCY_KEY:_default' \
+'--if-revision=[Expected current assignment revision; stale values fail closed and report current_revision.]:IF_REVISION:_default' \
+'--idempotency-key=[Retry an ambiguous outcome with the same idempotency key and the same logical request; use a new key for a changed request.]:IDEMPOTENCY_KEY:_default' \
 '--format=[]:FORMAT:((text\:"Human-readable text output (default)"
 json\:"Single-record JSON envelope (snake_case)"))' \
 '--state-dir=[agent-session state directory]:PATH:_files -/' \
@@ -270,8 +270,8 @@ json\:"Single-record JSON envelope (snake_case)"))' \
 ;;
 (close)
 _arguments "${_arguments_options[@]}" : \
-'--if-revision=[Expected current run revision]:IF_REVISION:_default' \
-'--idempotency-key=[]:IDEMPOTENCY_KEY:_default' \
+'--if-revision=[Expected current run revision; stale values fail closed and report current_revision.]:IF_REVISION:_default' \
+'--idempotency-key=[Retry an ambiguous outcome with the same idempotency key and the same logical request; use a new key for a changed request.]:IDEMPOTENCY_KEY:_default' \
 '--format=[]:FORMAT:((text\:"Human-readable text output (default)"
 json\:"Single-record JSON envelope (snake_case)"))' \
 '--state-dir=[agent-session state directory]:PATH:_files -/' \
@@ -302,7 +302,7 @@ _main-agent_commands() {
 'rehydrate:Recover the authenticated durable objective or assignment capsule' \
 'status:Show a bounded status capsule' \
 'checkpoint:Record a revision-fenced run or worker checkpoint' \
-'worker:Manage worker assignments' \
+'worker:Launch and manage interactive worker assignments' \
 'collaborate:Add a non-authoritative collaborator relationship' \
 'borrow:Add a bounded non-authoritative borrowing relationship' \
 'handoff:Transfer primary assignment routing after quiescence checks' \
@@ -360,7 +360,7 @@ _main-agent__subcmd__rehydrate_commands() {
 (( $+functions[_main-agent__subcmd__self_commands] )) ||
 _main-agent__subcmd__self_commands() {
     local commands; commands=(
-'show:' \
+'show:Show this authenticated session'\''s private run or assignment identity' \
     )
     _describe -t commands 'main-agent self commands' commands "$@"
 }
@@ -377,13 +377,13 @@ _main-agent__subcmd__status_commands() {
 (( $+functions[_main-agent__subcmd__worker_commands] )) ||
 _main-agent__subcmd__worker_commands() {
     local commands; commands=(
-'start:' \
-'list:' \
-'show:' \
-'message:' \
-'accept:' \
-'release:' \
-'delete:' \
+'start:Create an assignment and launch its interactive managed worker' \
+'list:List assignments owned by this Main Agent'\''s active run' \
+'show:Show one assignment, including its private packet' \
+'message:Send a private mailbox message to an assignment'\''s worker' \
+'accept:Accept a submitted worker result after Main Agent review' \
+'release:Mark an accepted assignment terminal before worker deletion' \
+'delete:Delete a released worker through guarded agent-session cleanup' \
     )
     _describe -t commands 'main-agent worker commands' commands "$@"
 }

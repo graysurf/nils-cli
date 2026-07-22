@@ -84,12 +84,36 @@ Every state mutation requires an active caller-owned claim, an expected
 revision/absence fence, and an idempotency key. Read-only discovery does not.
 Worker launch returns `pending-worker-checkpoint` until authenticated worker
 self-check/checkpoint evidence advances the assignment; transport is never
-reported as acceptance. After a provider resume, a revision-fenced checkpoint
-from the authenticated worker may atomically rebind the assignment to its new
-incarnation only when the session ID and original `created_at` still match and
-the prior incarnation is no longer live. A worker checkpoint cannot regress a
-`submitted`, `accepted`, `released`, or `cancelled` assignment to a pre-terminal
-worker state. Accept/release are explicit Main Agent transitions.
+reported as acceptance.
+
+### Interactive worker acceptance
+
+`worker start` MUST resolve the assignment to a real
+`agent-session.session.v1` record with `mode: "interactive"` and a tmux-backed
+provider runtime. The worker MUST be present in `agent-session list` and the
+serve `GET /sessions` projection with the matching orchestration relationship.
+While the worker is expected to be live, it MUST yield real terminal output and
+accept input through the bearer-protected WebSocket
+`GET /sessions/{id}/attach` route used by Agent Console.
+
+A metadata-only record, blank placeholder, unrelated/replaced incarnation, or
+non-attachable worker does not satisfy launch acceptance. The Main Agent MUST
+not infer readiness or task completion from
+`pending-worker-checkpoint`; that state proves transport only. It MUST require
+the worker's authenticated `self show`, revision-fenced checkpoint, and the
+task-specific review evidence before `worker accept`.
+
+After a provider resume, a revision-fenced checkpoint from the authenticated
+worker may atomically rebind the assignment to its new incarnation only when
+the session ID and original `created_at` still match and the prior incarnation
+is no longer live. A worker checkpoint cannot regress a `submitted`,
+`accepted`, `released`, or `cancelled` assignment to a pre-terminal worker
+state. Accept/release are explicit Main Agent transitions. The ordinary public
+V1 terminal path is `submitted -> accepted -> released`. `cancelled` is a
+reserved terminal state retained for compatible registry reads and a possible
+future transition; V1 exposes no `worker cancel` command or other public
+transition into it. Operators MUST NOT synthesize cancellation by editing the
+private registry.
 
 Collaborators and bounded borrowers are visible routing metadata, not write
 authority. Borrow expiry does not change primary ownership. Handoff requires a
