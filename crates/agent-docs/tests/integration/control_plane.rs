@@ -1,7 +1,9 @@
+use std::collections::BTreeSet;
 use std::fs;
 use std::path::Path;
 
-use super::common::TestEnv;
+use super::common::{TestEnv, run_cli, write};
+use nils_test_support::cmd;
 
 fn catalog() -> &'static str {
     r#"
@@ -46,6 +48,23 @@ fn session_activation_is_scoped_and_rejects_stale_catalog_state() {
     let json = activate.json();
     assert_eq!(json["schema_version"], "cli.agent-docs.session.activate.v1");
     assert_eq!(json["data"]["active_intents"][0], "project-dev");
+    assert_eq!(
+        json.as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>(),
+        BTreeSet::from(["data", "ok", "schema_version"])
+    );
+    assert_eq!(
+        json["data"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>(),
+        BTreeSet::from(["active_intents", "product", "record_file", "verified"])
+    );
 
     let status = env.run(&[
         "session",
@@ -172,6 +191,15 @@ fn session_records_are_product_isolated_and_context_bound() {
     ]);
     assert_eq!(claude.code, 65);
     assert_eq!(claude.json()["error"]["code"], "missing-activation");
+    assert_eq!(claude.json()["error"]["details"]["retryable"], true);
+    assert_eq!(
+        claude.json()["error"]["details"]["next_action"],
+        "prepare-intent"
+    );
+    assert_eq!(
+        claude.json()["error"]["details"]["recovery"]["command"],
+        "session.prepare"
+    );
 
     let record_file = activate.json()["data"]["record_file"]
         .as_str()
@@ -215,6 +243,87 @@ fn session_records_are_product_isolated_and_context_bound() {
             "field={field}"
         );
     }
+}
+
+#[test]
+fn one_session_id_prepares_distinct_repository_scopes_without_cross_verification() {
+    let temp = tempfile::TempDir::new().unwrap();
+    let docs_home = temp.path().join("docs-home");
+    let first_project = temp.path().join("first-project");
+    let second_project = temp.path().join("second-project");
+    let state_home = temp.path().join("state");
+    let home = temp.path().join("home");
+    let xdg = temp.path().join("xdg");
+    for path in [
+        &docs_home,
+        &first_project,
+        &second_project,
+        &state_home,
+        &home,
+        &xdg,
+    ] {
+        fs::create_dir_all(path).unwrap();
+    }
+    for project in [&first_project, &second_project] {
+        write(&project.join("AGENT_DOCS.toml"), catalog());
+        write(&project.join("DEVELOPMENT.md"), "# Development\n");
+    }
+    let run_for = |project: &Path, command: &str, intent_flag: &str| {
+        let args = vec![
+            "--docs-home",
+            docs_home.to_str().unwrap(),
+            "--project-path",
+            project.to_str().unwrap(),
+            "session",
+            command,
+            "--session-id",
+            "shared-session",
+            "--product",
+            "codex",
+            "--state-home",
+            state_home.to_str().unwrap(),
+            intent_flag,
+            "project-dev",
+            "--format",
+            "json",
+        ];
+        let options = cmd::CmdOptions::default()
+            .with_cwd(project)
+            .with_env("HOME", home.to_str().unwrap())
+            .with_env("XDG_CONFIG_HOME", xdg.to_str().unwrap())
+            .with_env_remove("AGENT_DOCS_HOME")
+            .with_env_remove("PROJECT_PATH");
+        run_cli(&args, &options)
+    };
+
+    let first = run_for(&first_project, "prepare", "--intent");
+    let second = run_for(&second_project, "prepare", "--intent");
+    assert_eq!(first.code, 0, "stderr={}", first.stderr);
+    assert_eq!(second.code, 0, "stderr={}", second.stderr);
+    let first_record = first.json()["data"]["record_file"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let second_record = second.json()["data"]["record_file"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_ne!(first_record, second_record);
+
+    let first_verify = run_for(&first_project, "verify", "--require-intent");
+    let second_verify = run_for(&second_project, "verify", "--require-intent");
+    assert_eq!(first_verify.code, 0, "stderr={}", first_verify.stderr);
+    assert_eq!(second_verify.code, 0, "stderr={}", second_verify.stderr);
+
+    let first_bytes = fs::read(state_home.join(&first_record)).unwrap();
+    fs::write(state_home.join(&second_record), first_bytes).unwrap();
+    let crossed = run_for(&second_project, "verify", "--require-intent");
+    assert_eq!(crossed.code, 65, "stdout={}", crossed.stdout);
+    assert_eq!(crossed.json()["error"]["code"], "context-mismatch");
+    assert_eq!(
+        crossed.json()["error"]["details"]["next_action"],
+        "inspect-session-state"
+    );
 }
 
 #[test]
@@ -378,6 +487,30 @@ fn session_prepare_activates_and_reports_stable_result() {
     assert_eq!(json["data"]["active_intents"][0], "project-dev");
     assert_eq!(json["data"]["prepared_intents"][0], "project-dev");
     assert_eq!(json["data"]["reason"], "prepared");
+    assert_eq!(
+        json.as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>(),
+        BTreeSet::from(["data", "ok", "schema_version"])
+    );
+    assert_eq!(
+        json["data"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>(),
+        BTreeSet::from([
+            "active_intents",
+            "prepared_intents",
+            "product",
+            "reason",
+            "record_file",
+            "verified",
+        ])
+    );
 
     // Re-preparing the same intent is idempotent and reported as already-current.
     let again = env.run(&[
@@ -440,6 +573,134 @@ fn session_prepare_activates_and_reports_stable_result() {
     ]);
     assert_eq!(undeclared.code, 65, "stderr: {}", undeclared.stderr);
     assert_eq!(undeclared.json()["error"]["code"], "undeclared-intent");
+}
+
+#[test]
+fn session_failure_recovery_is_structured_and_privacy_safe_in_both_modes() {
+    let env = TestEnv::new();
+    env.write_project_catalog(catalog()).write_project_doc(
+        "DEVELOPMENT.md",
+        "# Development\n\nPRIVATE_DOCUMENT_CONTENT_SENTINEL\n",
+    );
+    let state_home = env.project_path("ABSOLUTE_STATE_HOME_SENTINEL");
+    let state = state_home.to_str().unwrap();
+    let private_values = [
+        "RAW_SESSION_ID_SENTINEL",
+        "TOKEN_SECRET_FIXTURE_SENTINEL",
+        "PRIVATE_DOCUMENT_CONTENT_SENTINEL",
+        state,
+        env.project.to_str().unwrap(),
+    ];
+
+    let json_output = env.run(&[
+        "session",
+        "prepare",
+        "--session-id",
+        "RAW_SESSION_ID_SENTINEL",
+        "--product",
+        "codex",
+        "--state-home",
+        state,
+        "--intent",
+        "TOKEN_SECRET_FIXTURE_SENTINEL",
+        "--format",
+        "json",
+    ]);
+    assert_eq!(json_output.code, 65, "stderr: {}", json_output.stderr);
+    let json = json_output.json();
+    assert_eq!(json["error"]["code"], "undeclared-intent");
+    assert_eq!(json["error"]["details"]["retryable"], false);
+    assert_eq!(
+        json["error"]["details"]["next_action"],
+        "list-declared-intents"
+    );
+    assert_eq!(
+        json["error"]["details"]["available_intents"],
+        serde_json::json!(["project-dev"])
+    );
+    assert_eq!(json["error"]["details"]["recovery"]["command"], "list");
+    for private in private_values {
+        assert!(
+            !json_output.stdout.contains(private) && !json_output.stderr.contains(private),
+            "private value leaked in JSON failure: {private:?}\nstdout={}\nstderr={}",
+            json_output.stdout,
+            json_output.stderr
+        );
+    }
+
+    let text_output = env.run(&[
+        "session",
+        "prepare",
+        "--session-id",
+        "RAW_SESSION_ID_SENTINEL",
+        "--product",
+        "codex",
+        "--state-home",
+        state,
+        "--intent",
+        "TOKEN_SECRET_FIXTURE_SENTINEL",
+        "--format",
+        "text",
+    ]);
+    assert_eq!(text_output.code, 65, "stderr: {}", text_output.stderr);
+    assert!(
+        text_output.stdout.is_empty(),
+        "stdout={}",
+        text_output.stdout
+    );
+    assert_eq!(
+        text_output.stderr.lines().count(),
+        1,
+        "{}",
+        text_output.stderr
+    );
+    assert!(
+        text_output
+            .stderr
+            .contains("next action: list-declared-intents"),
+        "{}",
+        text_output.stderr
+    );
+    for private in private_values {
+        assert!(
+            !text_output.stdout.contains(private) && !text_output.stderr.contains(private),
+            "private value leaked in text failure: {private:?}\nstdout={}\nstderr={}",
+            text_output.stdout,
+            text_output.stderr
+        );
+    }
+}
+
+#[test]
+fn invalid_session_arguments_publish_a_machine_decidable_fix_action() {
+    let env = TestEnv::new();
+    let state_home = env.project_path(".state");
+    for (session_id, state, expected_code) in [
+        ("", state_home.to_str().unwrap(), "invalid-session-id"),
+        ("session", "relative-state", "invalid-state-home"),
+    ] {
+        let output = env.run(&[
+            "session",
+            "status",
+            "--session-id",
+            session_id,
+            "--product",
+            "codex",
+            "--state-home",
+            state,
+            "--format",
+            "json",
+        ]);
+        assert_eq!(output.code, 65, "stdout={}", output.stdout);
+        let json = output.json();
+        assert_eq!(json["error"]["code"], expected_code);
+        assert_eq!(json["error"]["details"]["retryable"], false);
+        assert_eq!(json["error"]["details"]["next_action"], "fix-arguments");
+        assert_eq!(
+            json["error"]["details"]["recovery"]["action"],
+            "fix-arguments"
+        );
+    }
 }
 
 fn phase_catalog() -> &'static str {
@@ -614,6 +875,23 @@ fn phase_prepare_does_not_satisfy_a_different_phase_verify() {
         verify.stdout, verify.stderr
     );
     assert_eq!(verify.json()["error"]["code"], "missing-intent");
+    assert_eq!(verify.json()["error"]["details"]["retryable"], true);
+    assert_eq!(
+        verify.json()["error"]["details"]["next_action"],
+        "prepare-intent"
+    );
+    assert_eq!(
+        verify.json()["error"]["details"]["recovery"]["intents"],
+        serde_json::json!(["project-dev"])
+    );
+    assert_eq!(
+        verify.json()["error"]["details"]["recovery"]["phase"],
+        "delivery"
+    );
+    assert_eq!(
+        verify.json()["error"]["details"]["recovery"]["retry_original"],
+        true
+    );
 }
 
 #[test]
@@ -647,6 +925,19 @@ fn phase_prepare_with_missing_phase_doc_is_phase_unsatisfied() {
         prepare.stdout, prepare.stderr
     );
     assert_eq!(prepare.json()["error"]["code"], "phase-unsatisfied");
+    let prepare_json = prepare.json();
+    let details = &prepare_json["error"]["details"];
+    assert_eq!(details["retryable"], false);
+    assert_eq!(details["next_action"], "inspect-preflight");
+    assert_eq!(details["recovery"]["command"], "preflight");
+    assert_eq!(
+        details["recovery"]["intents"],
+        serde_json::json!(["project-dev"])
+    );
+    assert_eq!(details["recovery"]["phase"], "edit");
+    assert_eq!(details["diagnostics"]["required_total"], 2);
+    assert_eq!(details["diagnostics"]["satisfied_required"], 1);
+    assert_eq!(details["diagnostics"]["missing_required"], 1);
 }
 
 #[test]
@@ -752,6 +1043,14 @@ fn phase_scoped_verify_detects_stale_activation() {
         stale.stdout, stale.stderr
     );
     assert_eq!(stale.json()["error"]["code"], "stale-activation");
+    assert_eq!(
+        stale.json()["error"]["details"]["next_action"],
+        "prepare-intent"
+    );
+    assert_eq!(
+        stale.json()["error"]["details"]["recovery"]["intents"],
+        serde_json::json!(["project-dev"])
+    );
 }
 
 #[test]

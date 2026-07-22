@@ -858,6 +858,14 @@ fn session_runtime_errors_exit_four() {
         "cli.agent-docs.session.status.v1",
         "record-parse-failed",
     );
+    assert_eq!(
+        status.json()["error"]["details"]["next_action"],
+        "inspect-session-state"
+    );
+    assert_eq!(
+        status.json()["error"]["details"]["recovery"]["command"],
+        "session.status"
+    );
 }
 
 #[test]
@@ -1544,6 +1552,19 @@ required = false
     ]);
     assert_eq!(stale.code, 65, "stderr={}", stale.stderr);
     assert_eq!(stale.json()["error"]["code"], "stale-integration-decision");
+    assert_eq!(stale.json()["error"]["details"]["retryable"], true);
+    assert_eq!(
+        stale.json()["error"]["details"]["next_action"],
+        "refresh-integration-decision"
+    );
+    assert_eq!(
+        stale.json()["error"]["details"]["recovery"]["command"],
+        "integration.resolve"
+    );
+    assert_eq!(
+        stale.json()["error"]["details"]["recovery"]["then"],
+        "session.prepare"
+    );
 }
 
 #[test]
@@ -2341,6 +2362,15 @@ fn explicit_reactivation_replaces_v1_session_record() {
     ]);
     assert_eq!(status.code, 65, "stderr={}", status.stderr);
     assert_eq!(status.json()["error"]["code"], "unsupported-record");
+    assert_eq!(status.json()["error"]["details"]["retryable"], true);
+    assert_eq!(
+        status.json()["error"]["details"]["next_action"],
+        "prepare-intent"
+    );
+    assert_eq!(
+        status.json()["error"]["details"]["record_relation"],
+        "prior-version-replaceable"
+    );
 
     let reactivate = env.run(&activation_args);
     assert_eq!(reactivate.code, 0, "stderr={}", reactivate.stderr);
@@ -2414,6 +2444,15 @@ fn future_session_reactivation_fails_stale_without_rewriting_record() {
         65,
         "cli.agent-docs.session.activate.v1",
         "unsupported-record",
+    );
+    assert_eq!(rejected.json()["error"]["details"]["retryable"], false);
+    assert_eq!(
+        rejected.json()["error"]["details"]["next_action"],
+        "upgrade-agent-docs"
+    );
+    assert_eq!(
+        rejected.json()["error"]["details"]["record_relation"],
+        "future"
     );
     assert_eq!(fs::read(record_path).unwrap(), future_bytes);
 }

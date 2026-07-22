@@ -8,6 +8,14 @@
 A Rust workspace of focused CLI binaries for API testing, Git operations, agent workflow evidence, provider automation, planning, and
 desktop/media utilities. Shared crates keep JSON contracts, terminal UX, and cross-CLI behavior consistent.
 
+## Automation-first contract
+
+Interactive human use remains supported, while agents and system automation are
+first-class consumers. Automation-facing commands publish versioned JSON
+envelopes, stable machine error codes, deterministic exit status, and bounded,
+privacy-safe diagnostics. Recoverable failures expose retryability and the next
+action structurally; callers never parse prose to choose recovery behavior.
+
 ## CLI surface map
 
 Start here when choosing a binary. The source of truth for the current installable binary list is:

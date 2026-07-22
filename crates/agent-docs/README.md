@@ -38,7 +38,7 @@ design in `graysurf/agent-runtime-kit`
 | `remove` | Remove a `[[document]]` entry from the project catalog. |
 | `config enroll/exclude/show/list/remove` | Preview or apply exact user-local enrollment and exclusion rules. |
 | `integration resolve` | Resolve a typed integration action and content-bound fingerprint. |
-| `session activate/status/verify` | Persist and verify intent activation scoped to a session, repository, product, and integration decision. |
+| `session activate/prepare/status/verify` | Persist and verify intent activation scoped to a session, repository, product, and integration decision. |
 | `completion` | Generate shell completion scripts. |
 
 There is no top-level `resolve` command. The retired `baseline` / `scaffold-*` /
@@ -416,11 +416,11 @@ relevant policy or selected-content change reports
 `stale-integration-decision`. Unrelated registry edits preserve validity.
 `session status --integration-fingerprint <value>` compares the requested
 fingerprint directly with the stored activation. Prior record schemas remain
-unsupported for status and verify; an explicit activate first validates the
-current catalog and then replaces a v1 record rather than silently carrying
-its intents forward. JSON responses expose `record_file` relative to
-`--state-home`; consumers that need the local file join the two paths without
-persisting a machine-specific state-home value.
+unsupported for status and verify; an explicit activate or prepare first
+validates the current catalog and then replaces a v1 record rather than
+silently carrying its intents forward. JSON responses expose `record_file`
+relative to `--state-home`; consumers that need the local file join the two
+paths without persisting a machine-specific state-home value.
 
 ```bash
 agent-docs --user-config session activate --session-id "$SESSION_ID" \
@@ -456,6 +456,50 @@ agent-docs session prepare --session-id "$SESSION_ID" --product codex \
 agent-docs session verify --session-id "$SESSION_ID" --product codex \
   --state-home "$STATE_HOME" --require-intent project-dev --phase edit --format json
 ```
+
+### Session failure recovery contract
+
+Automation consumes `agent-docs session ... --format json`. Session failure
+envelopes retain the existing `cli.agent-docs.session.<command>.v1` schemas and
+add typed recovery metadata under `error.details`:
+
+- `retryable` is a boolean;
+- `next_action` is one stable value from the closed vocabulary below;
+- `recovery` is a bounded object with a typed command or action, reusable input
+  field names, and only the safe parameters needed for the next step.
+
+The closed next-action vocabulary is:
+
+- `fix-arguments`
+- `list-declared-intents`
+- `inspect-preflight`
+- `prepare-intent`
+- `refresh-integration-decision`
+- `repair-catalog`
+- `retry-bounded`
+- `inspect-session-state`
+- `upgrade-agent-docs`
+- `report-invariant`
+
+For example, missing or stale intent activation points to `session.prepare`
+and identifies declared intents and phase when known. A stale integration
+decision points first to `integration.resolve`, then to `session.prepare`.
+Version 1 records are replaceable through prepare; future schemas require an
+`agent-docs` upgrade and are never overwritten. Unrecognized schemas, other
+corruption, and non-timeout lock or I/O failures require state inspection.
+Lock timeouts allow only a bounded retry.
+
+Recovery arrays and diagnostics are bounded. Failures never expose expanded
+argv, raw session IDs, absolute state-home/project paths, secrets, environment
+dumps, private catalog or document content, or raw command output. Text mode is
+a single-line rendering of the same typed failure model. Automation MUST use
+JSON `code` and `details`; it MUST NOT parse `message` or `hint`.
+
+### Required preflight undeclared-intent contract
+
+The separate `preflight --require-declared-intent` guard retains its existing
+failure contract below; the session-specific privacy and recovery rules above
+apply to `session` errors introduced or touched by this implementation.
 
 In text mode, the guarded failure is written to stderr:
 

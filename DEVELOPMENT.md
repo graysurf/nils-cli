@@ -86,6 +86,30 @@ coordination and unmanaged sessions require no claim and never deny work;
 semantics apply only to an explicit `enforce` launch. Changes to that boundary
 require coupled nils-cli/runtime-kit validation.
 
+### 2.3 Agent- and system-facing CLI UX
+
+Treat agents and system automation as first-class CLI consumers while keeping
+interactive text mode clear for humans. For new or touched automation-facing
+failures, contributors must:
+
+- preserve the exact versioned schema and evolve it additively within a schema
+  version;
+- publish a stable machine error code with deterministic exit status;
+- expose typed `error.details.retryable`, `error.details.next_action`, and a
+  bounded `error.details.recovery` object on recoverable touched paths;
+- derive clear text output from the same typed failure model;
+- bound and redact diagnostic fields, excluding secrets, raw session IDs,
+  absolute local state or project paths, private content, and command dumps;
+- require automation to branch on structured fields, never `message` or
+  `hint`;
+- cover representative failures, field types, exit status, and leakage in
+  contract tests.
+
+This contract applies to new or touched automation-facing failures. Existing
+CLIs are audited incrementally; the first bounded implementation covers
+`agent-docs session` errors rather than claiming a workspace-wide migration is
+already complete.
+
 ## 3. Canonical validation flows
 
 Local development defaults to changed-scope validation. The full workspace test
