@@ -42,6 +42,8 @@ struct RepositoryState {
     staged_file_count: usize,
     remote_count: usize,
     upstream: Option<String>,
+    upstream_sha: Option<String>,
+    ahead_before: usize,
     relation_before: String,
     fingerprint: String,
 }
@@ -360,7 +362,8 @@ fn preflight(options: &Options) -> Result<RepositoryState, String> {
             );
         }
     }
-    let (upstream, relation_before) = resolve_upstream(&root, &branch, &head)?;
+    let (upstream, upstream_sha, ahead_before, relation_before) =
+        resolve_upstream(&root, &branch, &head)?;
     let common = git_stdout(&root, ["rev-parse", "--git-common-dir"])?;
     let common = canonical_git_path(&root, &common)?;
     let object_format = git_stdout(&root, ["rev-parse", "--show-object-format"])?;
@@ -375,6 +378,8 @@ fn preflight(options: &Options) -> Result<RepositoryState, String> {
         staged_file_count,
         remote_count,
         upstream,
+        upstream_sha,
+        ahead_before,
         relation_before,
         fingerprint,
     })
@@ -442,7 +447,7 @@ fn resolve_upstream(
     root: &Path,
     branch: &str,
     head: &str,
-) -> Result<(Option<String>, String), String> {
+) -> Result<(Option<String>, Option<String>, usize, String), String> {
     match run_git(
         root,
         [
@@ -456,10 +461,19 @@ fn resolve_upstream(
             let upstream = String::from_utf8_lossy(&output.stdout).trim().to_string();
             let upstream_sha = git_stdout(root, ["rev-parse", "--verify", "@{upstream}^{commit}"])
                 .map_err(|_| "configured upstream cached ref cannot be resolved".to_string())?;
-            if upstream_sha != head {
-                return Err("cached upstream is not aligned with the current HEAD".to_string());
+            let (behind, ahead) = cached_relation_counts(root, &upstream_sha, head)?;
+            if behind > 0 {
+                let relation = if ahead > 0 { "diverged" } else { "behind" };
+                return Err(format!(
+                    "current HEAD is {relation} relative to the cached upstream"
+                ));
             }
-            Ok((Some(upstream), "aligned".to_string()))
+            Ok((
+                Some(upstream),
+                Some(upstream_sha),
+                ahead,
+                cached_relation_label(ahead),
+            ))
         }
         Err(_) => {
             let remote = git_config_optional(root, &format!("branch.{branch}.remote"))?;
@@ -467,8 +481,41 @@ fn resolve_upstream(
             if remote.is_some() || merge.is_some() {
                 return Err("configured upstream cached ref cannot be resolved".to_string());
             }
-            Ok((None, "untracked".to_string()))
+            Ok((None, None, 0, "untracked".to_string()))
         }
+    }
+}
+
+fn cached_relation_counts(
+    root: &Path,
+    upstream_sha: &str,
+    head: &str,
+) -> Result<(usize, usize), String> {
+    let range = format!("{upstream_sha}...{head}");
+    let counts = git_stdout(
+        root,
+        ["rev-list", "--left-right", "--count", range.as_str()],
+    )?;
+    let mut values = counts.split_whitespace();
+    let behind = values
+        .next()
+        .and_then(|value| value.parse::<usize>().ok())
+        .ok_or_else(|| "failed to parse cached upstream behind count".to_string())?;
+    let ahead = values
+        .next()
+        .and_then(|value| value.parse::<usize>().ok())
+        .ok_or_else(|| "failed to parse cached upstream ahead count".to_string())?;
+    if values.next().is_some() {
+        return Err("failed to parse cached upstream relation counts".to_string());
+    }
+    Ok((behind, ahead))
+}
+
+fn cached_relation_label(ahead: usize) -> String {
+    match ahead {
+        0 => "aligned".to_string(),
+        1 => "ahead-by-one".to_string(),
+        count => format!("ahead-by-{count}"),
     }
 }
 
@@ -541,19 +588,21 @@ fn verify_cached_relation_after(state: &RepositoryState, new_head: &str) -> Resu
                 &state.root,
                 ["rev-parse", "--verify", "@{upstream}^{commit}"],
             )?;
-            if upstream_sha != state.head {
+            if Some(upstream_sha.as_str()) != state.upstream_sha.as_deref() {
                 return Err("cached upstream changed after commit".to_string());
             }
-            let range = format!("{expected_upstream}...{new_head}");
-            let counts = git_stdout(
-                &state.root,
-                ["rev-list", "--left-right", "--count", range.as_str()],
-            )?;
-            let values = counts.split_whitespace().collect::<Vec<_>>();
-            if values.as_slice() != ["0", "1"] {
-                return Err("cached upstream relation after commit is not ahead-by-one".to_string());
+            let (behind, ahead) = cached_relation_counts(&state.root, &upstream_sha, new_head)?;
+            let expected_ahead = state
+                .ahead_before
+                .checked_add(1)
+                .ok_or_else(|| "cached upstream ahead count overflowed".to_string())?;
+            if behind != 0 || ahead != expected_ahead {
+                let expected_relation = cached_relation_label(expected_ahead);
+                return Err(format!(
+                    "cached upstream relation after commit is not the expected {expected_relation}"
+                ));
             }
-            Ok("ahead-by-one".to_string())
+            Ok(cached_relation_label(ahead))
         }
         None => {
             let remote =

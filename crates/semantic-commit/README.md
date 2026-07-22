@@ -120,8 +120,10 @@ configured, it also requires `--remote-mode local-only`. The command never
 contacts a remote.
 
 It requires staged changes with no unstaged or untracked paths, an attached
-matching branch, no in-progress Git operation, and an aligned cached upstream
-or no upstream. It verifies the created signature and parent/tree/clean-state
+matching branch, no in-progress Git operation, and a cached upstream that is
+aligned or strictly behind the local HEAD (ahead-only local state), or no
+upstream. Behind, diverged, and unresolved cached upstream state remains
+fail-closed. It verifies the created signature and parent/tree/clean-state
 postconditions, then atomically writes a
 `cli.semantic-commit.local-default.v1` receipt. A post-commit receipt failure
 is reported as partial success and never triggers an automatic reset.

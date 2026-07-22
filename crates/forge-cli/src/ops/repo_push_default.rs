@@ -594,6 +594,15 @@ fn validate_local_default_adoption<G: GitRunner>(
             None,
         ));
     }
+    if data.remote.cached_relation_before != "aligned"
+        || data.remote.cached_relation_after != "ahead-by-one"
+    {
+        return Err(validation(
+            "local_default_receipt_remote_gap_invalid",
+            "local-default receipt adoption requires an aligned-to-ahead-by-one cached upstream transition",
+            None,
+        ));
+    }
 
     let repository_root = git_capture(
         git,

@@ -6427,7 +6427,12 @@ fn drain_nonblocking<R: Read>(
     }
 }
 
-const PROCESS_CLEANUP_TIMEOUT: Duration = Duration::from_millis(250);
+// One cleanup phase may include macOS scheduler-delayed kqueue draining,
+// descendant discovery, identity-pinned termination, and reaping. Two seconds
+// gives those bounded phases practical headroom while keeping the supervised
+// fallback below the dirty-snapshot wrapper budget: 30s snapshot +
+// (2s + 25ms supervisor grace) + 2s fallback < 35s.
+const PROCESS_CLEANUP_TIMEOUT: Duration = Duration::from_secs(2);
 const PROCESS_SCAN_LIMITS: ProcessScanLimits = ProcessScanLimits {
     #[cfg(target_os = "linux")]
     process_entries: 32_768,
@@ -10827,6 +10832,41 @@ mod tests {
                 .expect("typed supervisor cleanup failure")
                 .kind(),
             DirtyCheckoutErrorKind::ResourceUnavailable
+        );
+    }
+
+    #[test]
+    fn process_cleanup_budget_allows_bounded_slow_discovery() {
+        const SLOW_DISCOVERY: Duration = Duration::from_millis(350);
+
+        struct SlowOwner;
+
+        impl OwnedProcessTracker for SlowOwner {
+            fn refresh(&mut self, deadline: Instant) -> Result<()> {
+                std::thread::sleep(SLOW_DISCOVERY);
+                ensure_deadline(deadline)
+            }
+
+            fn identities(&mut self, _deadline: Instant) -> Result<Vec<ProcessIdentity>> {
+                Ok(Vec::new())
+            }
+
+            fn known_identities(&self) -> Vec<ProcessIdentity> {
+                Vec::new()
+            }
+        }
+
+        let started = Instant::now();
+        let mut child = Command::new(true_executable())
+            .spawn()
+            .expect("spawn bounded slow-discovery child");
+
+        terminate_owned_processes(&mut SlowOwner, &mut child)
+            .expect("bounded process discovery must retain enough cleanup headroom");
+
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "bounded cleanup discovery must not turn into an unbounded wait"
         );
     }
 
