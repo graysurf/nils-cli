@@ -6,6 +6,11 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
 
+use nils_common::execution_effect::digest_parts;
+use nils_common::local_default_receipt::{
+    LocalDefaultCompletion, LocalDefaultData, LocalDefaultReceipt, LocalDefaultRemote,
+    SCHEMA_VERSION as LOCAL_DEFAULT_SCHEMA,
+};
 use pretty_assertions::assert_eq;
 
 use super::support::{StubEnv, parse_envelope, run_forge_cli_in};
@@ -105,10 +110,15 @@ fn glab_stub() -> String {
 }
 
 fn git_stub(state: &str, log: &str, scenario: GitScenario<'_>) -> String {
+    let common_dir = Path::new(state)
+        .parent()
+        .expect("state parent")
+        .to_string_lossy();
     format!(
         r#"#!/bin/sh
 state='{state}'
 log='{log}'
+common_dir='{common_dir}'
 printf '%s\n' "$*" >> "$log"
 if [ "$1" = "-C" ]; then
   shift 2
@@ -139,12 +149,31 @@ case "$1" in
     fi
     printf '%s\n' '{branch}'
     ;;
+  worktree)
+    printf 'worktree %s\nHEAD {head}\nbranch refs/heads/{branch}\n\n' '{common_dir}'
+    ;;
   rev-parse)
     candidate=''
     for arg in "$@"; do
       candidate="$arg"
     done
-    if [ "$candidate" = "HEAD^{{commit}}" ]; then
+    if [ "$candidate" = "--show-toplevel" ]; then
+      printf '%s\n' '{common_dir}'
+    elif [ "$candidate" = "--git-common-dir" ]; then
+      if [ "$PWD" = "$common_dir" ]; then
+        printf '%s\n' '.git'
+      elif [ "$PWD" = "$common_dir/nested" ]; then
+        printf '%s\n' '../.git'
+      else
+        printf '%s\n' "$common_dir/.git"
+      fi
+    elif [ "$candidate" = "--show-object-format" ]; then
+      printf '%s\n' 'sha1'
+    elif [ "$candidate" = "HEAD^1^{{commit}}" ]; then
+      printf '%s\n' '{base}'
+    elif [ "$candidate" = "HEAD^{{tree}}" ]; then
+      printf '%s\n' '{other}'
+    elif [ "$candidate" = "HEAD^{{commit}}" ]; then
       printf '%s\n' '{head}'
     else
       printf '%s\n' '{requested_head_sha}'
@@ -171,6 +200,9 @@ case "$1" in
     ;;
   log)
     printf '%s\n' '{signature}'
+    ;;
+  verify-commit)
+    exit 0
     ;;
   push)
     if [ '{push_sleep}' = true ]; then
@@ -208,7 +240,140 @@ esac
         push_exit = scenario.push_exit,
         push_sleep = scenario.push_sleep,
         remote_output_bytes = scenario.remote_output_bytes,
+        common_dir = common_dir,
+        base = BASE,
+        other = OTHER,
     )
+}
+
+#[derive(Clone, Copy)]
+enum ReceiptMutation {
+    None,
+    Schema,
+    Branch,
+    Head,
+    Base,
+    Tree,
+    Repository,
+}
+
+fn run_with_local_default_receipt(dry_run: bool) -> (StubEnv, super::support::CmdOutput) {
+    run_with_local_default_receipt_location(dry_run, ReceiptMutation::None, false)
+}
+
+fn run_with_local_default_receipt_mutation(
+    dry_run: bool,
+    mutation: ReceiptMutation,
+) -> (StubEnv, super::support::CmdOutput) {
+    run_with_local_default_receipt_location(dry_run, mutation, false)
+}
+
+fn run_with_local_default_receipt_location(
+    dry_run: bool,
+    mutation: ReceiptMutation,
+    from_subdirectory: bool,
+) -> (StubEnv, super::support::CmdOutput) {
+    let scenario = GitScenario {
+        branch: "main",
+        ..GitScenario::default()
+    };
+    let stub = StubEnv::new().gh_stub(&gh_stub());
+    let reason = stub.tempdir.path().join("reason.md");
+    let receipt_path = stub.tempdir.path().join("local-default.json");
+    let state = stub.tempdir.path().join("pushed");
+    let log = stub.tempdir.path().join("git.log");
+    fs::write(&reason, "Freshly authorized receipt adoption.").expect("reason");
+    let git_common_dir = stub.tempdir.path().join(".git");
+    fs::create_dir(&git_common_dir).expect("Git common directory");
+    let canonical_common = fs::canonicalize(&git_common_dir).expect("canonical Git common dir");
+    let fingerprint = digest_parts([
+        canonical_common.as_os_str().as_encoded_bytes(),
+        b"sha1".as_slice(),
+    ]);
+    let mut receipt = LocalDefaultReceipt {
+        schema_version: LOCAL_DEFAULT_SCHEMA.to_string(),
+        ok: true,
+        data: LocalDefaultData {
+            mode: "local-default".to_string(),
+            repository_fingerprint: fingerprint,
+            branch: "main".to_string(),
+            old_head: BASE.to_string(),
+            new_head: HEAD.to_string(),
+            parent_sha: BASE.to_string(),
+            tree_sha: OTHER.to_string(),
+            signature: "verified-good".to_string(),
+            staged_file_count: 1,
+            remote: LocalDefaultRemote {
+                configured_count: 1,
+                mode: "local-only".to_string(),
+                network_observed: false,
+                provider_mutated: false,
+                upstream: Some("origin/main".to_string()),
+                cached_relation_before: "aligned".to_string(),
+                cached_relation_after: "ahead-by-one".to_string(),
+            },
+            completion: LocalDefaultCompletion {
+                local_default_committed: true,
+                provider_delivered: false,
+                provider_reconciliation_required: true,
+            },
+        },
+    };
+    match mutation {
+        ReceiptMutation::None => {}
+        ReceiptMutation::Schema => receipt.schema_version = "unsupported.v1".to_string(),
+        ReceiptMutation::Branch => receipt.data.branch = "trunk".to_string(),
+        ReceiptMutation::Head => receipt.data.new_head = OTHER.to_string(),
+        ReceiptMutation::Base => {
+            receipt.data.old_head = OTHER.to_string();
+            receipt.data.parent_sha = OTHER.to_string();
+        }
+        ReceiptMutation::Tree => receipt.data.tree_sha = HEAD.to_string(),
+        ReceiptMutation::Repository => {
+            receipt.data.repository_fingerprint = digest_parts([b"another-repository".as_slice()]);
+        }
+    }
+    fs::write(
+        &receipt_path,
+        serde_json::to_vec(&receipt).expect("receipt json"),
+    )
+    .expect("receipt");
+    fs::set_permissions(&receipt_path, fs::Permissions::from_mode(0o600))
+        .expect("make receipt private");
+    let git_body = git_stub(&state.to_string_lossy(), &log.to_string_lossy(), scenario);
+    let stub = stub.git_stub(&git_body);
+    let reason = reason.to_string_lossy().into_owned();
+    let receipt_path = receipt_path.to_string_lossy().into_owned();
+    let mut args = vec![
+        "--provider",
+        "github",
+        "--repo",
+        "sympoies/demo",
+        "--format",
+        "json",
+        "repo",
+        "push-default",
+        "--head",
+        "HEAD",
+        "--expected-base",
+        BASE,
+        "--reason-file",
+        &reason,
+        "--local-default-receipt",
+        &receipt_path,
+    ];
+    if dry_run {
+        args.insert(0, "--dry-run");
+    }
+    let workdir = if from_subdirectory {
+        let subdirectory = stub.tempdir.path().join("nested");
+        fs::create_dir_all(&subdirectory).expect("nested repository directory");
+        subdirectory
+    } else {
+        stub.tempdir.path().to_path_buf()
+    };
+    let out = run_forge_cli_in(&stub, &args, Some(&workdir));
+    (stub, out)
 }
 
 fn run(scenario: GitScenario<'_>) -> (StubEnv, super::support::CmdOutput) {
@@ -531,6 +696,51 @@ fn push_default_dry_run_preflights_without_pushing() {
     let log = fs::read_to_string(stub.tempdir.path().join("git.log")).expect("git log");
     assert!(!log.lines().any(|line| line.contains("push --porcelain")));
     assert!(!stub.tempdir.path().join("pushed").exists());
+}
+
+#[test]
+fn push_default_adopts_valid_local_default_receipt_on_checked_default_branch() {
+    let (stub, out) = run_with_local_default_receipt(true);
+    assert_eq!(out.code, 0, "stdout={} stderr={}", out.stdout, out.stderr);
+    let envelope = parse_envelope(&out.stdout);
+    assert_eq!(envelope["data"]["authoring_branch"], "main");
+    assert_eq!(envelope["data"]["head_sha"], HEAD);
+    assert_eq!(envelope["data"]["expected_base"], BASE);
+    assert_eq!(envelope["data"]["pushed"], false);
+    let log = fs::read_to_string(stub.tempdir.path().join("git.log")).expect("git log");
+    assert!(!log.lines().any(|line| line.contains("push --porcelain")));
+}
+
+#[test]
+fn push_default_adopts_local_default_receipt_from_primary_checkout_subdirectory() {
+    let (_, out) = run_with_local_default_receipt_location(true, ReceiptMutation::None, true);
+    assert_eq!(out.code, 0, "stdout={} stderr={}", out.stdout, out.stderr);
+    let envelope = parse_envelope(&out.stdout);
+    assert_eq!(envelope["data"]["authoring_branch"], "main");
+    assert_eq!(envelope["data"]["pushed"], false);
+}
+
+#[test]
+fn push_default_revalidates_local_default_receipt_bindings() {
+    for (mutation, expected_code) in [
+        (ReceiptMutation::Schema, "local_default_receipt_invalid"),
+        (
+            ReceiptMutation::Branch,
+            "local_default_receipt_branch_mismatch",
+        ),
+        (ReceiptMutation::Head, "local_default_receipt_head_mismatch"),
+        (ReceiptMutation::Base, "local_default_receipt_base_mismatch"),
+        (ReceiptMutation::Tree, "local_default_receipt_tree_mismatch"),
+        (
+            ReceiptMutation::Repository,
+            "local_default_receipt_repository_mismatch",
+        ),
+    ] {
+        let (_, out) = run_with_local_default_receipt_mutation(true, mutation);
+        assert_eq!(out.code, 65, "stdout={} stderr={}", out.stdout, out.stderr);
+        let envelope = parse_envelope(&out.stdout);
+        assert_eq!(envelope["error"]["code"], expected_code);
+    }
 }
 
 #[test]

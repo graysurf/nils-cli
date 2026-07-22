@@ -92,7 +92,14 @@ fn agent_advice_substitutes_arguments() {
 
     let out_dir_str = out_dir.to_string_lossy().to_string();
     let output = run_with_path_prepend(
-        &["agent", "advice", "hello", "world"],
+        &[
+            "agent",
+            "advice",
+            "--runtime",
+            "inherited",
+            "hello",
+            "world",
+        ],
         &[
             ("CODEX_ALLOW_DANGEROUS_ENABLED", "true"),
             ("ZDOTDIR", &zdotdir_str),
@@ -122,7 +129,15 @@ fn agent_advice_ephemeral_flag_forwards_to_codex_exec() {
 
     let out_dir_str = out_dir.to_string_lossy().to_string();
     let output = run_with_path_prepend(
-        &["agent", "advice", "--ephemeral", "hello", "world"],
+        &[
+            "agent",
+            "advice",
+            "--runtime",
+            "inherited",
+            "--ephemeral",
+            "hello",
+            "world",
+        ],
         &[
             ("CODEX_ALLOW_DANGEROUS_ENABLED", "true"),
             ("ZDOTDIR", &zdotdir_str),

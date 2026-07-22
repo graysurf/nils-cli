@@ -346,6 +346,9 @@ pub struct RepoPushDefaultArgs {
     /// UTF-8 file describing the user's explicit direct-main authorization.
     #[arg(long = "reason-file", value_name = "PATH")]
     pub reason_file: PathBuf,
+    /// Governed local-default receipt authorizing checked-default adoption.
+    #[arg(long = "local-default-receipt", value_name = "PATH")]
+    pub local_default_receipt: Option<PathBuf>,
 }
 
 /// `repo bootstrap` arguments for a new private Forgejo repository.

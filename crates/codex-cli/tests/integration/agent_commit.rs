@@ -96,7 +96,11 @@ fn agent_commit_fallback_creates_commit() {
         .with_env("PATH", &stub_path)
         .with_stdin_bytes(b"\n\nmy subject\ny\n");
     let bin = codex_cli_bin();
-    let output = cmd::run_with(&bin, &["agent", "commit"], &options);
+    let output = cmd::run_with(
+        &bin,
+        &["agent", "commit", "--runtime", "inherited"],
+        &options,
+    );
     assert_exit(&output, 0);
     assert!(stderr(&output).contains("fallback mode"));
 
@@ -150,6 +154,8 @@ fn agent_commit_semantic_mode_executes_codex_with_template_and_push_note() {
         &[
             "agent",
             "commit",
+            "--runtime",
+            "inherited",
             "--ephemeral",
             "--push",
             "--auto-stage",

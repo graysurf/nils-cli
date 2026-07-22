@@ -372,7 +372,7 @@ fn valid_identifier(value: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_'))
 }
 
-fn parse_simple_command(command: &str) -> Result<Vec<String>, HookError> {
+pub(crate) fn parse_simple_command(command: &str) -> Result<Vec<String>, HookError> {
     if command.is_empty() || command.len() > MAX_COMMAND_BYTES {
         return Err(rejected(
             "read-only-command-unsupported",

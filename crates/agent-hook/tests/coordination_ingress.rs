@@ -59,6 +59,24 @@ fn install_coordination_handler_with(fixture: &Fixture, source: &str) {
     fs::set_permissions(&handler, fs::Permissions::from_mode(0o700)).expect("handler mode");
 }
 
+fn install_session_mode(fixture: &Fixture, mode: &str) {
+    let session = fixture.session_state.join("sessions/trusted");
+    fs::create_dir_all(&session).expect("session directory");
+    let record = session.join("session.json");
+    fs::write(
+        &record,
+        serde_json::to_vec(&json!({
+            "schema_version": "agent-session.session.v1",
+            "id": "trusted",
+            "coordination_mode": mode,
+            "runtime": {"launch_id": "trusted-incarnation"}
+        }))
+        .expect("session JSON"),
+    )
+    .expect("session record");
+    Fixture::set_private(&record);
+}
+
 #[test]
 fn terminal_failure_runs_coordination_after_policy_to_close_the_operation() {
     let policy = r#"schema_version = "agent-hook.policy.v1"
@@ -191,6 +209,64 @@ fn coordination_capability_has_no_configurable_command_or_advisory_mode() {
     let output = Fixture::new(&arbitrary).run(&["validate", "--format", "json"], None);
     assert_eq!(output.code, 65);
     assert_eq!(output.stdout_json()["error"]["code"], "policy-invalid");
+}
+
+#[test]
+fn coordination_timeout_warns_only_for_trusted_advisory_mode() {
+    for (mode, action, code) in [
+        (
+            "advisory",
+            "warn",
+            "runtime.pre-tool-coordination:capability-timeout-warn",
+        ),
+        (
+            "enforce",
+            "block",
+            "runtime.pre-tool-coordination:capability-timeout-closed",
+        ),
+    ] {
+        let fixture = Fixture::new(&policy("allow"));
+        install_coordination_handler_with(&fixture, "#!/bin/sh\nsleep 30\n");
+        install_session_mode(&fixture, mode);
+        let payload = json!({
+            "hook_event_name": "PreToolUse",
+            "session_id": "trusted",
+            "tool_use_id": "tool-call-timeout",
+            "tool_name": "Write",
+            "cwd": fixture.root,
+            "tool_input": {"path": fixture.root.join("target.txt")}
+        })
+        .to_string();
+        let output = fixture.run_with_env(
+            &["dispatch", "--product", "codex", "--format", "json"],
+            Some(&payload),
+            &[
+                ("AGENT_SESSION_ID", "trusted"),
+                ("AGENT_SESSION_RUNTIME_ID", "trusted-incarnation"),
+                ("AGENT_SESSION_COORDINATION_MODE", mode),
+            ],
+        );
+        assert_eq!(
+            output.stdout_json()["data"]["action"],
+            action,
+            "mode={mode}"
+        );
+        assert_eq!(
+            output.stdout_json()["data"]["reasons"][1]["code"],
+            code,
+            "mode={mode}"
+        );
+        if mode == "advisory" {
+            assert_eq!(output.code, 0, "stderr={}", output.stderr_text());
+            assert!(
+                output.stdout_json()["data"]["context"]
+                    .as_str()
+                    .is_some_and(|context| context.contains("incident:sha256:"))
+            );
+        } else {
+            assert_eq!(output.code, 1, "stderr={}", output.stderr_text());
+        }
+    }
 }
 
 fn pre_tool_payload(fixture: &Fixture) -> String {

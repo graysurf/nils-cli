@@ -7,6 +7,10 @@ pub fn show() -> i32 {
     println!("CODEX_CLI_MODEL={}", snapshot.model);
     println!("CODEX_CLI_REASONING={}", snapshot.reasoning);
     println!(
+        "CODEX_CLI_AGENT_RUNTIME={}",
+        std::env::var("CODEX_CLI_AGENT_RUNTIME").unwrap_or_default()
+    );
+    println!(
         "CODEX_CLI_EPHEMERAL_ENABLED={}",
         std::env::var("CODEX_CLI_EPHEMERAL_ENABLED").unwrap_or_default()
     );
@@ -80,6 +84,18 @@ pub fn set(key: &str, value: &str) -> i32 {
             );
             0
         }
+        "agent-runtime" | "agent_runtime" | "CODEX_CLI_AGENT_RUNTIME" => {
+            let lowered = value.trim().to_ascii_lowercase();
+            if lowered != "isolated" && lowered != "inherited" {
+                eprintln!(
+                    "codex-cli config: agent-runtime must be isolated|inherited (got: {})",
+                    value
+                );
+                return 64;
+            }
+            println!("export CODEX_CLI_AGENT_RUNTIME={}", lowered);
+            0
+        }
         "ephemeral" | "CODEX_CLI_EPHEMERAL_ENABLED" => {
             let lowered = value.trim().to_ascii_lowercase();
             if lowered != "true" && lowered != "false" {
@@ -135,7 +151,7 @@ pub fn set(key: &str, value: &str) -> i32 {
         _ => {
             eprintln!("codex-cli config: unknown key: {key}");
             eprintln!(
-                "codex-cli config: keys: model|reasoning|ephemeral|dangerous|remote-ssh|remote-name|remote-refresh"
+                "codex-cli config: keys: model|reasoning|agent-runtime|ephemeral|dangerous|remote-ssh|remote-name|remote-refresh"
             );
             64
         }

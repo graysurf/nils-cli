@@ -2,6 +2,8 @@ mod adapter;
 mod cli;
 mod completion;
 mod contract;
+mod degraded;
+mod effect;
 mod error;
 mod evaluator;
 mod liveness;
@@ -30,8 +32,8 @@ use serde_json::json;
 use cli::{Cli, Command, DispatchFormat, RecoveryCommand};
 use error::HookError;
 use model::{
-    Capability, DECISION_VERSION, DecisionAction, DecisionReason, NormalizedDecision, Product,
-    RuleMode, SetupAction,
+    Capability, DECISION_VERSION, DecisionAction, DecisionReason, NormalizedDecision,
+    OperationEffectClass, Product, RuleMode, SetupAction,
 };
 use paths::Layout;
 
@@ -190,6 +192,7 @@ fn dispatch(layout: Layout, policy_override: Option<&std::path::Path>, command: 
                         "base_mode": rule.mode,
                         "effective_modes": effective_modes,
                         "failure_posture": rule.failure_posture,
+                        "timeout_posture": rule.timeout_posture,
                         "override_class": rule.override_class,
                         "capability_id": capability_id(&rule.capability),
                     })
@@ -325,10 +328,13 @@ fn run_dispatch(
                 Err(error) => return emit_dispatch_error(args.format, &error, Some(&request)),
             };
             let decision = match evaluator::apply_session_coordination(
+                None,
                 decision,
                 &request,
                 &raw,
                 coordination_rule,
+                None,
+                OperationEffectClass::Unknown,
             ) {
                 Ok(decision) => decision,
                 Err(error) => return emit_dispatch_error(args.format, &error, Some(&request)),

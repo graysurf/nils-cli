@@ -6020,7 +6020,7 @@ _forge-cli() {
             return 0
             ;;
         forge__cli__repo__push__default)
-            opts="-h --head --expected-base --reason-file --format --remote --provider --host --repo --store-root --dry-run --help"
+            opts="-h --head --expected-base --reason-file --local-default-receipt --format --remote --provider --host --repo --store-root --dry-run --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -6035,6 +6035,10 @@ _forge-cli() {
                     return 0
                     ;;
                 --reason-file)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --local-default-receipt)
                     COMPREPLY=($(compgen -f "${cur}"))
                     return 0
                     ;;

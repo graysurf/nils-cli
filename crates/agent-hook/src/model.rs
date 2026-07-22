@@ -109,6 +109,8 @@ pub struct PolicyRule {
     #[serde(default)]
     pub mode: RuleMode,
     pub failure_posture: FailurePosture,
+    #[serde(default)]
+    pub timeout_posture: TimeoutPosture,
     pub override_class: OverrideClass,
     pub capability: Capability,
 }
@@ -138,6 +140,39 @@ pub enum FailurePosture {
     Open,
     Warn,
     Closed,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TimeoutPosture {
+    #[default]
+    Closed,
+    Warn,
+    EffectGated,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum OperationEffectClass {
+    ReadOnly,
+    LocalReversible,
+    LocalDestructive,
+    ExternalMutation,
+    SensitiveConfiguration,
+    Unknown,
+}
+
+impl OperationEffectClass {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ReadOnly => "read_only",
+            Self::LocalReversible => "local_reversible",
+            Self::LocalDestructive => "local_destructive",
+            Self::ExternalMutation => "external_mutation",
+            Self::SensitiveConfiguration => "sensitive_configuration",
+            Self::Unknown => "unknown",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]

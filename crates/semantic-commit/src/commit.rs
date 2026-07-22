@@ -229,6 +229,14 @@ impl Default for CommitOptions {
 }
 
 pub fn run(args: &[String]) -> i32 {
+    run_with_signing_policy(args, false)
+}
+
+pub(crate) fn run_forced_signing(args: &[String]) -> i32 {
+    run_with_signing_policy(args, true)
+}
+
+fn run_with_signing_policy(args: &[String], force_signing: bool) -> i32 {
     let mut options = match parse_args(args) {
         Ok(options) => options,
         Err(code) => return code,
@@ -370,7 +378,7 @@ pub fn run(args: &[String]) -> i32 {
         progress.tick();
     }
 
-    let status = git_commit(tmpfile.path(), &options, operation);
+    let status = git_commit(tmpfile.path(), &options, operation, force_signing);
 
     if let Some(progress) = &progress {
         progress.finish_and_clear();
@@ -1140,9 +1148,13 @@ fn git_commit(
     message_path: &Path,
     options: &CommitOptions,
     operation: CommitOperation,
+    force_signing: bool,
 ) -> anyhow::Result<std::process::ExitStatus> {
     let message_path = message_path.to_string_lossy();
     let mut args = vec!["commit".to_string()];
+    if force_signing {
+        args.push("-S".to_string());
+    }
     if matches!(
         operation,
         CommitOperation::Amend | CommitOperation::MessageOnlyAmend

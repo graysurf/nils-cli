@@ -19,6 +19,7 @@ Usage: semantic-commit [COMMAND]
 Commands:
   staged-context  Print staged change context for commit message generation
   commit          Commit staged changes with a prepared commit message
+  local-default   Create one governed signed commit on the primary local default branch
   fixup           Create a fixup! commit for staged changes
   squash          Create a squash! commit for staged changes
   completion      Export shell completion script
@@ -109,6 +110,21 @@ Message-construction options:
 - `--scope <scope>` - structured message scope
 - `--subject <subject>` - structured message subject
 - `--body-bullet <text>` - structured message body bullet; repeatable
+
+## `local-default`
+
+Create exactly one signed, local-only commit in the primary checkout. The
+mutating form requires `--expect-head <full-sha>`, `--expected-branch <name>`,
+and a new `--receipt-out <outside-repository-path>`. If any remote is
+configured, it also requires `--remote-mode local-only`. The command never
+contacts a remote.
+
+It requires staged changes with no unstaged or untracked paths, an attached
+matching branch, no in-progress Git operation, and an aligned cached upstream
+or no upstream. It verifies the created signature and parent/tree/clean-state
+postconditions, then atomically writes a
+`cli.semantic-commit.local-default.v1` receipt. A post-commit receipt failure
+is reported as partial success and never triggers an automatic reset.
 
 Examples:
 

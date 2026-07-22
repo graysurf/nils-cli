@@ -10,11 +10,13 @@
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, File};
 use std::io::Read;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
 use nils_common::cli_contract::{OutputFormat, schema_version_for};
+use nils_common::execution_effect::digest_parts;
+use nils_common::local_default_receipt::{LocalDefaultReceipt, read_strict};
 use serde::Serialize;
 
 use crate::backend::{
@@ -207,6 +209,18 @@ pub fn run_with<R: BackendRunner, G: GitRunner>(
 ) -> Result<i32, ForgeError> {
     let expected_base = validate_object_id(&args.expected_base)?;
     let reason = read_reason(&args.reason_file)?;
+    let local_default_receipt = args
+        .local_default_receipt
+        .as_deref()
+        .map(read_local_default_receipt)
+        .transpose()?;
+    if local_default_receipt.is_some() && args.head != "HEAD" {
+        return Err(validation(
+            "local_default_receipt_head_invalid",
+            "--local-default-receipt requires the default --head HEAD binding",
+            None,
+        ));
+    }
 
     let push_url_lookup = git.run(
         workdir,
@@ -309,7 +323,7 @@ pub fn run_with<R: BackendRunner, G: GitRunner>(
             None,
         ));
     }
-    if branch == repo.default_branch {
+    if branch == repo.default_branch && local_default_receipt.is_none() {
         return Err(validation(
             "default_branch_checkout",
             format!(
@@ -317,6 +331,13 @@ pub fn run_with<R: BackendRunner, G: GitRunner>(
                 repo.default_branch
             ),
             Some("create a managed worktree from the remote default branch".into()),
+        ));
+    }
+    if branch != repo.default_branch && local_default_receipt.is_some() {
+        return Err(validation(
+            "local_default_receipt_branch_invalid",
+            "--local-default-receipt may be adopted only from the checked-out provider default branch",
+            None,
         ));
     }
     let head_sha = git_capture(
@@ -348,6 +369,18 @@ pub fn run_with<R: BackendRunner, G: GitRunner>(
             ),
             Some(format!("checked-out branch: {branch}")),
         ));
+    }
+
+    if let Some(receipt) = local_default_receipt.as_ref() {
+        validate_local_default_adoption(
+            git,
+            workdir,
+            receipt,
+            &repo.default_branch,
+            &branch,
+            &head_sha,
+            &expected_base,
+        )?;
     }
 
     let observed_base = ls_remote_head(git, workdir, &push_url, &global.remote, &default_ref)?;
@@ -426,6 +459,16 @@ pub fn run_with<R: BackendRunner, G: GitRunner>(
             ),
             Some("commit through semantic-commit with signing enabled".into()),
         ));
+    }
+    if local_default_receipt.is_some() {
+        let verified = git.run(workdir, &os_args(&["verify-commit", &head_sha]))?;
+        if !verified.success {
+            return Err(validation(
+                "commit_signature_unverified",
+                "HEAD failed local signature verification during receipt adoption",
+                (!verified.stderr.is_empty()).then_some(verified.stderr),
+            ));
+        }
     }
 
     let push_refspec = format!("{head_sha}:{default_ref}");
@@ -508,6 +551,164 @@ pub fn run_with<R: BackendRunner, G: GitRunner>(
         observed_remote_sha,
     };
     Ok(emit_success(schema_success(), payload, format, render_text))
+}
+
+fn read_local_default_receipt(path: &Path) -> Result<LocalDefaultReceipt, ForgeError> {
+    read_strict(path).map_err(|message| {
+        validation(
+            "local_default_receipt_invalid",
+            "--local-default-receipt is not a valid governed local receipt",
+            Some(message),
+        )
+    })
+}
+
+fn validate_local_default_adoption<G: GitRunner>(
+    git: &G,
+    workdir: &Path,
+    receipt: &LocalDefaultReceipt,
+    default_branch: &str,
+    branch: &str,
+    head_sha: &str,
+    expected_base: &str,
+) -> Result<(), ForgeError> {
+    let data = &receipt.data;
+    if data.branch != default_branch || data.branch != branch {
+        return Err(validation(
+            "local_default_receipt_branch_mismatch",
+            "local-default receipt branch does not match the checked-out provider default branch",
+            None,
+        ));
+    }
+    if data.new_head != head_sha {
+        return Err(validation(
+            "local_default_receipt_head_mismatch",
+            "local-default receipt does not describe the checked-out HEAD",
+            None,
+        ));
+    }
+    if data.old_head != expected_base || data.parent_sha != expected_base {
+        return Err(validation(
+            "local_default_receipt_base_mismatch",
+            "local-default receipt base does not match --expected-base",
+            None,
+        ));
+    }
+
+    let repository_root = git_capture(
+        git,
+        workdir,
+        &["rev-parse", "--show-toplevel"],
+        "repository root resolution",
+    )?;
+    let repository_root = PathBuf::from(repository_root.trim());
+    let repository_root = if repository_root.is_absolute() {
+        repository_root
+    } else {
+        workdir.join(repository_root)
+    };
+    let repository_root = fs::canonicalize(repository_root).map_err(|error| {
+        ForgeError::software(
+            schema_error(),
+            "failed to canonicalize the repository root",
+            Some(error.to_string()),
+        )
+    })?;
+    let listing = git_capture(
+        git,
+        workdir,
+        &["worktree", "list", "--porcelain"],
+        "primary worktree resolution",
+    )?;
+    let primary = listing
+        .lines()
+        .find_map(|line| line.strip_prefix("worktree "))
+        .ok_or_else(|| {
+            validation(
+                "local_default_receipt_worktree_invalid",
+                "failed to resolve the repository primary worktree",
+                None,
+            )
+        })?;
+    let primary = fs::canonicalize(primary).map_err(|error| {
+        ForgeError::software(
+            schema_error(),
+            "failed to canonicalize the primary worktree",
+            Some(error.to_string()),
+        )
+    })?;
+    if repository_root != primary {
+        return Err(validation(
+            "local_default_receipt_worktree_invalid",
+            "receipt adoption requires the repository primary worktree",
+            None,
+        ));
+    }
+
+    let common = git_capture(
+        git,
+        workdir,
+        &["rev-parse", "--git-common-dir"],
+        "Git common directory resolution",
+    )?;
+    let common = PathBuf::from(common.trim());
+    let common = if common.is_absolute() {
+        common
+    } else {
+        workdir.join(common)
+    };
+    let common = fs::canonicalize(common).map_err(|error| {
+        ForgeError::software(
+            schema_error(),
+            "failed to canonicalize the Git common directory",
+            Some(error.to_string()),
+        )
+    })?;
+    let object_format = git_capture(
+        git,
+        workdir,
+        &["rev-parse", "--show-object-format"],
+        "Git object format resolution",
+    )?;
+    let fingerprint = digest_parts([
+        common.as_os_str().as_encoded_bytes(),
+        object_format.trim().as_bytes(),
+    ]);
+    if data.repository_fingerprint != fingerprint {
+        return Err(validation(
+            "local_default_receipt_repository_mismatch",
+            "local-default receipt belongs to a different repository",
+            None,
+        ));
+    }
+
+    let parent = git_capture(
+        git,
+        workdir,
+        &["rev-parse", "--verify", "HEAD^1^{commit}"],
+        "receipt parent resolution",
+    )?;
+    if parent.trim() != data.parent_sha {
+        return Err(validation(
+            "local_default_receipt_parent_mismatch",
+            "checked-out commit parent does not match the local-default receipt",
+            None,
+        ));
+    }
+    let tree = git_capture(
+        git,
+        workdir,
+        &["rev-parse", "--verify", "HEAD^{tree}"],
+        "receipt tree resolution",
+    )?;
+    if tree.trim() != data.tree_sha {
+        return Err(validation(
+            "local_default_receipt_tree_mismatch",
+            "checked-out commit tree does not match the local-default receipt",
+            None,
+        ));
+    }
+    Ok(())
 }
 
 fn read_reason(path: &Path) -> Result<String, ForgeError> {

@@ -15,7 +15,7 @@ Usage:
   codex-cli completion <shell>
 
 Groups:
-  agent           prompt | advice | knowledge | commit | resume
+  agent           prompt | advice | knowledge | commit | resume | doctor
   auth            login | use | save | remove | refresh | auto-refresh | status | current | sync | remote pull
   diag            rate-limits
   config          show | set
@@ -43,10 +43,13 @@ Help:
 
 ### agent
 
-- `prompt [--ephemeral] [PROMPT...]`: Run a raw prompt through `codex exec`.
-- `advice [--ephemeral] [QUESTION...]`: Request actionable engineering advice.
-- `knowledge [--ephemeral] [CONCEPT...]`: Request a concept explanation.
-- `commit [--ephemeral] [-p|--push] [-a|--auto-stage] [EXTRA...]`: Run the semantic-commit workflow.
+- `prompt [--runtime isolated|inherited] [--ephemeral] [PROMPT...]`: Run a raw prompt through `codex exec`.
+- `advice [--runtime isolated|inherited] [--ephemeral] [QUESTION...]`: Request actionable engineering advice.
+- `knowledge [--runtime isolated|inherited] [--ephemeral] [CONCEPT...]`: Request a concept explanation.
+- `commit [--runtime isolated|inherited] [--ephemeral] [-p|--push] [-a|--auto-stage] [EXTRA...]`: Run the semantic-commit workflow.
+- `doctor [--format text|json]`: Probe isolated-runtime flags, features,
+  temporary-home/auth bridging, instruction isolation, and hook isolation
+  without an API request.
 - `resume <SESSION_ID> [--cd <dir>]`: Resolve the session's recorded working directory from local Codex history and launch
   `codex resume <SESSION_ID> --cd <cwd> --no-alt-screen` there, propagating Codex's exit status. Run it from any directory. Fails without
   launching Codex (`65`) when the id is unknown or matches more than one recorded directory; pass `--cd` to override the resolved directory
@@ -54,7 +57,18 @@ Help:
 
 Agent flag notes:
 
-- `--ephemeral`: Forward `codex exec --ephemeral` so Codex does not persist session files for that run.
+- `--runtime isolated` is the default for one-shot commands. It creates a
+  temporary `CODEX_HOME` containing only an auth symlink, ignores user/project
+  rules, disables hooks/plugins/apps/memory/goals/subagents, and always runs
+  ephemerally without the dangerous bypass flag.
+- `--runtime inherited` explicitly restores the historical full-home executor and
+  its `CODEX_ALLOW_DANGEROUS_ENABLED=true` gate. `agent resume` is always inherited.
+- `--ephemeral` is a compatibility no-op in isolated mode and keeps its existing
+  forwarding behavior in inherited mode.
+- Isolated `agent commit` exposes only staged-context to the model, accepts
+  strict structured message fields, detects HEAD/index drift, and delegates the
+  commit exclusively to `semantic-commit`. The inherited path retains its
+  compatibility fallback.
 - `resume --cd <dir>`: Bypass automatic cwd resolution and resume in `<dir>` (must be an existing directory).
 
 ### auth
@@ -135,7 +149,8 @@ Auth examples:
 
 ## Environment
 
-- `CODEX_ALLOW_DANGEROUS_ENABLED`: gate for `agent` commands (default: `false`).
+- `CODEX_CLI_AGENT_RUNTIME`: `isolated` (default) or explicit `inherited` for one-shot agent commands.
+- `CODEX_ALLOW_DANGEROUS_ENABLED`: gate for inherited `agent` commands (default: `false`).
 - `CODEX_CLI_MODEL`: `codex exec` default model (default: `gpt-5.1-codex-mini`).
 - `CODEX_CLI_REASONING`: `codex exec` default reasoning level (default: `medium`).
 - `CODEX_CLI_EPHEMERAL_ENABLED`: append `--ephemeral` to `codex exec` for agent commands (default: `false`).
@@ -164,7 +179,8 @@ Auth examples:
 
 - `codex` is required for `agent` commands.
 - `git` is required for `agent commit`.
-- `semantic-commit` and `git-scope` are optional for `agent commit` (fallbacks apply).
+- `semantic-commit` is required for isolated `agent commit`; the inherited
+  compatibility path retains the old fallback. `git-scope` remains optional.
 - `ssh` is required for `auth remote pull`.
 - `agent resume` reads local Codex session history under `$CODEX_HOME/sessions` (default `~/.codex/sessions`); the shared resolver lives in
   `nils-provider-resume`.

@@ -10,7 +10,7 @@ EXAMPLES:
   codex-cli completion zsh
 
 ENVIRONMENT:
-  CODEX_CLI_MODEL, CODEX_CLI_REASONING, CODEX_ALLOW_DANGEROUS_ENABLED
+  CODEX_CLI_MODEL, CODEX_CLI_REASONING, CODEX_CLI_AGENT_RUNTIME, CODEX_ALLOW_DANGEROUS_ENABLED
   CODEX_SECRET_DIR, CODEX_AUTH_FILE, CODEX_SECRET_CACHE_DIR
   CODEX_AUTO_REFRESH_ENABLED, CODEX_AUTO_REFRESH_MIN_DAYS
   CODEX_AUTH_REMOTE_SSH, CODEX_AUTH_REMOTE_NAME, CODEX_AUTH_REMOTE_REFRESH
@@ -70,6 +70,9 @@ pub struct AgentArgs {
 pub enum AgentCommand {
     /// Run a raw prompt
     Prompt {
+        /// Child runtime (default: isolated; inherited loads the full Codex home)
+        #[arg(long = "runtime", value_enum, value_name = "mode")]
+        runtime: Option<codex_cli::runtime::AgentRuntimeMode>,
         /// Run without persisting Codex session files to disk
         #[arg(long = "ephemeral")]
         ephemeral: bool,
@@ -78,6 +81,9 @@ pub enum AgentCommand {
     },
     /// Get actionable engineering advice
     Advice {
+        /// Child runtime (default: isolated; inherited loads the full Codex home)
+        #[arg(long = "runtime", value_enum, value_name = "mode")]
+        runtime: Option<codex_cli::runtime::AgentRuntimeMode>,
         /// Run without persisting Codex session files to disk
         #[arg(long = "ephemeral")]
         ephemeral: bool,
@@ -86,6 +92,9 @@ pub enum AgentCommand {
     },
     /// Get an explanation for a concept
     Knowledge {
+        /// Child runtime (default: isolated; inherited loads the full Codex home)
+        #[arg(long = "runtime", value_enum, value_name = "mode")]
+        runtime: Option<codex_cli::runtime::AgentRuntimeMode>,
         /// Run without persisting Codex session files to disk
         #[arg(long = "ephemeral")]
         ephemeral: bool,
@@ -94,6 +103,9 @@ pub enum AgentCommand {
     },
     /// Run the semantic-commit workflow
     Commit {
+        /// Child runtime (default: isolated; inherited loads the full Codex home)
+        #[arg(long = "runtime", value_enum, value_name = "mode")]
+        runtime: Option<codex_cli::runtime::AgentRuntimeMode>,
         /// Push after committing
         #[arg(short = 'p', long = "push")]
         push: bool,
@@ -115,6 +127,11 @@ pub enum AgentCommand {
         /// Override the recorded working directory (for a moved repository)
         #[arg(long = "cd", value_name = "dir", value_hint = ValueHint::DirPath)]
         cd: Option<PathBuf>,
+    },
+    /// Check whether the isolated one-shot runtime is ready
+    Doctor {
+        #[command(flatten)]
+        output: OutputModeArgs,
     },
 }
 

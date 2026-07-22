@@ -31,6 +31,7 @@ cargo run -p nils-forge-cli -- pr pending-review resume-submit 123 --review PRR_
 cargo run -p nils-forge-cli -- pr pending-review delete 123 --review PRR_pending --expected-head <sha> --expected-commit <sha> --expected-body-file review.md --confirm-abandoned --dry-run --format json
 cargo run -p nils-forge-cli -- pr merge 123 --expected-head <reviewed-sha> --review-convergence --format json
 cargo run -p nils-forge-cli -- repo push-default --expected-base <sha> --reason-file reason.md --dry-run --format json
+cargo run -p nils-forge-cli -- repo push-default --local-default-receipt receipt.json --expected-base <sha> --reason-file reason.md --dry-run --format json
 ```
 
 `repo push-default` is a narrow, policy-driven exception to PR delivery. It
@@ -46,6 +47,13 @@ capture cap; provider metadata and every Git subprocess are bounded. The
 command exposes no caller-controlled force mode. Callers remain responsible for
 obtaining explicit user authorization and recording it in a regular
 `--reason-file`.
+
+`--local-default-receipt` adopts a prior governed local-default commit as the
+only checked-out-default exception. It strictly parses the local receipt and
+revalidates the repository fingerprint, branch, exact head/parent/tree,
+signature, one-commit ancestry, live remote base, destination, compare-and-swap,
+and read-back. Receipt creation is not push authorization; provider delivery is
+a separate explicit action.
 
 `--thread-file` is for actionable findings only: max 50 threads, 16 KiB body
 each. Use `pr review validate` for local schema/privacy checks, and add
