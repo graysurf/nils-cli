@@ -5955,6 +5955,114 @@ fn parse_context_data_and_session_reference_errors_follow_contract() {
     assert_eq!(value["error"]["code"], "session-path-escaped");
 }
 
+#[test]
+fn list_projects_main_agent_relationship_without_changing_legacy_sessions() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let state_dir = tmp.path().join("state");
+    let main_id = "main-agent-session";
+    let standalone_id = "standalone-session";
+    let main_record_dir =
+        write_session_record(&state_dir, main_id, "codex", "hs-codex-main-agent-session");
+    write_session_record(
+        &state_dir,
+        standalone_id,
+        "claude",
+        "hs-claude-standalone-session",
+    );
+
+    let main_record_path = main_record_dir.join("session.json");
+    let mut main_record: Value =
+        serde_json::from_slice(&fs::read(&main_record_path).expect("main session record"))
+            .expect("main session json");
+    main_record["runtime"] = json!({
+        "kind": "tmux",
+        "tmux_session": "hs-codex-main-agent-session",
+        "generation": 1,
+        "started_at": "2030-01-01T00:00:00Z",
+        "launch_id": "main-incarnation"
+    });
+    fs::write(
+        &main_record_path,
+        serde_json::to_vec_pretty(&main_record).expect("main session json"),
+    )
+    .expect("write main session");
+
+    let orchestration_root = state_dir.join("orchestration");
+    fs::create_dir_all(&orchestration_root).expect("orchestration root");
+    fs::set_permissions(&orchestration_root, fs::Permissions::from_mode(0o700))
+        .expect("orchestration mode");
+    let registry = orchestration_root.join("registry.json");
+    fs::write(
+        &registry,
+        serde_json::to_vec_pretty(&json!({
+            "schema_version": "agent-session.orchestration-registry.v1",
+            "runs": {
+                "run-one": {
+                    "schema_version": "agent-session.orchestration-run.v1",
+                    "run_id": "run-one",
+                    "revision": 4,
+                    "state": "active",
+                    "tier": "L0",
+                    "objective_summary": "Deliver durable Main Agent recovery",
+                    "objective_packet_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    "controller": {
+                        "machine": "sympoies",
+                        "session_id": main_id,
+                        "session_incarnation": "main-incarnation",
+                        "session_created_at": "2000-01-01T00:00:00Z"
+                    },
+                    "durable_refs": [],
+                    "checkpoint": null,
+                    "created_at": "2030-01-01T00:00:00Z",
+                    "updated_at": "2030-01-01T00:00:00Z"
+                }
+            },
+            "assignments": {},
+            "receipts": {}
+        }))
+        .expect("orchestration registry json"),
+    )
+    .expect("write orchestration registry");
+    fs::set_permissions(&registry, fs::Permissions::from_mode(0o600))
+        .expect("orchestration registry mode");
+
+    let state_arg = state_dir.to_string_lossy().into_owned();
+    let list = run(
+        tmp.path(),
+        &["--state-dir", &state_arg, "list", "--format", "json"],
+        &[],
+    );
+    assert_eq!(list.code, 0, "stderr={}", list.stderr_text());
+    let payload = list.stdout_json();
+    let sessions = data(&payload).as_array().expect("session list");
+    let main = sessions
+        .iter()
+        .find(|session| session["id"] == main_id)
+        .expect("main session");
+    let standalone = sessions
+        .iter()
+        .find(|session| session["id"] == standalone_id)
+        .expect("standalone session");
+
+    assert_eq!(
+        main["orchestration"]["schema_version"],
+        "agent-session.session-orchestration.v1"
+    );
+    assert_eq!(main["orchestration"]["run_id"], "run-one");
+    assert_eq!(main["orchestration"]["role"], "main");
+    assert_eq!(main["orchestration"]["relationship_revision"], 4);
+    assert_eq!(
+        main["orchestration"]["objective_summary"],
+        "Deliver durable Main Agent recovery"
+    );
+    assert!(
+        main["orchestration"]
+            .get("objective_packet_digest")
+            .is_none()
+    );
+    assert!(standalone.get("orchestration").is_none());
+}
+
 fn write_session_record(dir: &Path, id: &str, agent: &str, tmux_session: &str) -> PathBuf {
     write_session_record_with_cwd(dir, id, agent, tmux_session, Path::new("/tmp"))
 }

@@ -45,6 +45,7 @@ crates MUST NOT rely on these patterns.
 
 | Crate dir | Package name | Binary name(s) | Reason |
 | --- | --- | --- | --- |
+| `agent-session` | `nils-agent-session` | `main-agent` | Typed least-privilege orchestration facade over the same authenticated session engine |
 | `plan-issue` | `nils-plan-issue` | `plan-issue-local` | Second `plan-issue-local` binary diverges from `<bin> == <dir>` |
 | `nils-markdown` | `nils-markdown` | `md-render` | Published binary |
 | `agent-workflow-primitives` | `nils-agent-workflow-primitives` | multi-tool set (`agent-run`, `browser-session`, ...) | One crate, many primitive binaries |

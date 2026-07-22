@@ -5,7 +5,9 @@ mod codex_account;
 mod codex_app_server;
 pub mod completion;
 mod coordination;
+mod main_agent;
 mod maintenance;
+mod orchestration;
 mod provider_prompt;
 mod serve;
 
@@ -113,6 +115,18 @@ const HELD_LAUNCH_SCRIPT: &str = "gate=$1; broker_gate=$2; heartbeat=$3; capabil
 
 pub fn run() -> i32 {
     run_with_args(env::args_os())
+}
+
+pub fn run_main_agent() -> i32 {
+    main_agent::run()
+}
+
+pub fn run_main_agent_with_args<I, T>(args: I) -> i32
+where
+    I: IntoIterator<Item = T>,
+    T: Into<OsString> + Clone,
+{
+    main_agent::run_with_args(args)
 }
 
 pub fn run_with_args<I, T>(args: I) -> i32
@@ -1397,6 +1411,8 @@ struct SessionView {
     codex_account: codex_account::CodexAccountView,
     #[serde(flatten)]
     coordination: coordination::CoordinationSummary,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    orchestration: Option<orchestration::SessionOrchestrationProjection>,
 }
 
 #[derive(Debug)]
@@ -5638,6 +5654,9 @@ fn session_view_from_parts(
         auto_resume: auto_resume::view_for_record(context, record),
         codex_account: codex_account::view_for_record(record),
         coordination: coordination::public_summary(context, &record.id),
+        orchestration: orchestration::session_projection(context, record)
+            .ok()
+            .flatten(),
     }
 }
 

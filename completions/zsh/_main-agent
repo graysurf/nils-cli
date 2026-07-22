@@ -1,0 +1,430 @@
+#compdef main-agent
+
+autoload -U is-at-least
+
+_main-agent() {
+    typeset -A opt_args
+    typeset -a _arguments_options
+    local ret=1
+
+    if is-at-least 5.2; then
+        _arguments_options=(-s -S -C)
+    else
+        _arguments_options=(-s -C)
+    fi
+
+    local context curcontext="$curcontext" state line
+    _arguments "${_arguments_options[@]}" : \
+'--state-dir=[agent-session state directory]:PATH:_files -/' \
+'--host=[Advisory machine label for public projections]:HOST:_default' \
+'-h[Print help]' \
+'--help[Print help]' \
+'-V[Print version]' \
+'--version[Print version]' \
+":: :_main-agent_commands" \
+"*::: :->main-agent" \
+&& ret=0
+    case $state in
+    (main-agent)
+        words=($line[1] "${words[@]}")
+        (( CURRENT += 1 ))
+        curcontext="${curcontext%:*:*}:main-agent-command-$line[1]:"
+        case $line[1] in
+            (init)
+_arguments "${_arguments_options[@]}" : \
+'--packet-file=[Private objective packet JSON file]:PATH:_files' \
+'--if-revision=[Required only when continuity-rebinding a stopped prior incarnation]:IF_REVISION:_default' \
+'--idempotency-key=[]:IDEMPOTENCY_KEY:_default' \
+'--format=[]:FORMAT:((text\:"Human-readable text output (default)"
+json\:"Single-record JSON envelope (snake_case)"))' \
+'--state-dir=[agent-session state directory]:PATH:_files -/' \
+'--host=[Advisory machine label for public projections]:HOST:_default' \
+'--if-absent[]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+&& ret=0
+;;
+(self)
+_arguments "${_arguments_options[@]}" : \
+'--state-dir=[agent-session state directory]:PATH:_files -/' \
+'--host=[Advisory machine label for public projections]:HOST:_default' \
+'-h[Print help]' \
+'--help[Print help]' \
+":: :_main-agent__subcmd__self_commands" \
+"*::: :->self" \
+&& ret=0
+
+    case $state in
+    (self)
+        words=($line[1] "${words[@]}")
+        (( CURRENT += 1 ))
+        curcontext="${curcontext%:*:*}:main-agent-self-command-$line[1]:"
+        case $line[1] in
+            (show)
+_arguments "${_arguments_options[@]}" : \
+'--format=[]:FORMAT:((text\:"Human-readable text output (default)"
+json\:"Single-record JSON envelope (snake_case)"))' \
+'--state-dir=[agent-session state directory]:PATH:_files -/' \
+'--host=[Advisory machine label for public projections]:HOST:_default' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+&& ret=0
+;;
+        esac
+    ;;
+esac
+;;
+(rehydrate)
+_arguments "${_arguments_options[@]}" : \
+'--format=[Recovery capsule output format]:FORMAT:(json markdown)' \
+'--state-dir=[agent-session state directory]:PATH:_files -/' \
+'--host=[Advisory machine label for public projections]:HOST:_default' \
+'-h[Print help]' \
+'--help[Print help]' \
+&& ret=0
+;;
+(status)
+_arguments "${_arguments_options[@]}" : \
+'--format=[]:FORMAT:((text\:"Human-readable text output (default)"
+json\:"Single-record JSON envelope (snake_case)"))' \
+'--state-dir=[agent-session state directory]:PATH:_files -/' \
+'--host=[Advisory machine label for public projections]:HOST:_default' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+&& ret=0
+;;
+(checkpoint)
+_arguments "${_arguments_options[@]}" : \
+'--file=[Private checkpoint input JSON file]:PATH:_files' \
+'--if-revision=[]:IF_REVISION:_default' \
+'--idempotency-key=[]:IDEMPOTENCY_KEY:_default' \
+'--format=[]:FORMAT:((text\:"Human-readable text output (default)"
+json\:"Single-record JSON envelope (snake_case)"))' \
+'--state-dir=[agent-session state directory]:PATH:_files -/' \
+'--host=[Advisory machine label for public projections]:HOST:_default' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+&& ret=0
+;;
+(worker)
+_arguments "${_arguments_options[@]}" : \
+'--state-dir=[agent-session state directory]:PATH:_files -/' \
+'--host=[Advisory machine label for public projections]:HOST:_default' \
+'-h[Print help]' \
+'--help[Print help]' \
+":: :_main-agent__subcmd__worker_commands" \
+"*::: :->worker" \
+&& ret=0
+
+    case $state in
+    (worker)
+        words=($line[1] "${words[@]}")
+        (( CURRENT += 1 ))
+        curcontext="${curcontext%:*:*}:main-agent-worker-command-$line[1]:"
+        case $line[1] in
+            (start)
+_arguments "${_arguments_options[@]}" : \
+'--assignment-file=[Private assignment packet JSON file]:PATH:_files' \
+'--if-run-revision=[]:IF_RUN_REVISION:_default' \
+'--idempotency-key=[]:IDEMPOTENCY_KEY:_default' \
+'--format=[]:FORMAT:((text\:"Human-readable text output (default)"
+json\:"Single-record JSON envelope (snake_case)"))' \
+'--state-dir=[agent-session state directory]:PATH:_files -/' \
+'--host=[Advisory machine label for public projections]:HOST:_default' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+&& ret=0
+;;
+(list)
+_arguments "${_arguments_options[@]}" : \
+'--format=[]:FORMAT:((text\:"Human-readable text output (default)"
+json\:"Single-record JSON envelope (snake_case)"))' \
+'--state-dir=[agent-session state directory]:PATH:_files -/' \
+'--host=[Advisory machine label for public projections]:HOST:_default' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+&& ret=0
+;;
+(show)
+_arguments "${_arguments_options[@]}" : \
+'--format=[]:FORMAT:((text\:"Human-readable text output (default)"
+json\:"Single-record JSON envelope (snake_case)"))' \
+'--state-dir=[agent-session state directory]:PATH:_files -/' \
+'--host=[Advisory machine label for public projections]:HOST:_default' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+':assignment_id:_default' \
+&& ret=0
+;;
+(message)
+_arguments "${_arguments_options[@]}" : \
+'--body-file=[Private message body file]:PATH:_files' \
+'--idempotency-key=[]:IDEMPOTENCY_KEY:_default' \
+'--format=[]:FORMAT:((text\:"Human-readable text output (default)"
+json\:"Single-record JSON envelope (snake_case)"))' \
+'--state-dir=[agent-session state directory]:PATH:_files -/' \
+'--host=[Advisory machine label for public projections]:HOST:_default' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+':assignment_id:_default' \
+&& ret=0
+;;
+(accept)
+_arguments "${_arguments_options[@]}" : \
+'--if-revision=[Expected current assignment revision]:IF_REVISION:_default' \
+'--idempotency-key=[]:IDEMPOTENCY_KEY:_default' \
+'--format=[]:FORMAT:((text\:"Human-readable text output (default)"
+json\:"Single-record JSON envelope (snake_case)"))' \
+'--state-dir=[agent-session state directory]:PATH:_files -/' \
+'--host=[Advisory machine label for public projections]:HOST:_default' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+':assignment_id:_default' \
+&& ret=0
+;;
+(release)
+_arguments "${_arguments_options[@]}" : \
+'--if-revision=[Expected current assignment revision]:IF_REVISION:_default' \
+'--idempotency-key=[]:IDEMPOTENCY_KEY:_default' \
+'--format=[]:FORMAT:((text\:"Human-readable text output (default)"
+json\:"Single-record JSON envelope (snake_case)"))' \
+'--state-dir=[agent-session state directory]:PATH:_files -/' \
+'--host=[Advisory machine label for public projections]:HOST:_default' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+':assignment_id:_default' \
+&& ret=0
+;;
+(delete)
+_arguments "${_arguments_options[@]}" : \
+'--if-revision=[Expected current assignment revision]:IF_REVISION:_default' \
+'--idempotency-key=[]:IDEMPOTENCY_KEY:_default' \
+'--format=[]:FORMAT:((text\:"Human-readable text output (default)"
+json\:"Single-record JSON envelope (snake_case)"))' \
+'--state-dir=[agent-session state directory]:PATH:_files -/' \
+'--host=[Advisory machine label for public projections]:HOST:_default' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+':assignment_id:_default' \
+&& ret=0
+;;
+        esac
+    ;;
+esac
+;;
+(collaborate)
+_arguments "${_arguments_options[@]}" : \
+'--session=[Exact live session ref, formatted as SESSION_ID@SESSION_INCARNATION]:SESSION:_default' \
+'--if-revision=[]:IF_REVISION:_default' \
+'--idempotency-key=[]:IDEMPOTENCY_KEY:_default' \
+'--format=[]:FORMAT:((text\:"Human-readable text output (default)"
+json\:"Single-record JSON envelope (snake_case)"))' \
+'--state-dir=[agent-session state directory]:PATH:_files -/' \
+'--host=[Advisory machine label for public projections]:HOST:_default' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+':assignment_id:_default' \
+&& ret=0
+;;
+(borrow)
+_arguments "${_arguments_options[@]}" : \
+'--session=[Exact live session ref, formatted as SESSION_ID@SESSION_INCARNATION]:SESSION:_default' \
+'--duration=[]:DURATION:_default' \
+'--if-revision=[]:IF_REVISION:_default' \
+'--idempotency-key=[]:IDEMPOTENCY_KEY:_default' \
+'--format=[]:FORMAT:((text\:"Human-readable text output (default)"
+json\:"Single-record JSON envelope (snake_case)"))' \
+'--state-dir=[agent-session state directory]:PATH:_files -/' \
+'--host=[Advisory machine label for public projections]:HOST:_default' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+':assignment_id:_default' \
+&& ret=0
+;;
+(handoff)
+_arguments "${_arguments_options[@]}" : \
+'--to=[Exact live Main Agent ref, formatted as SESSION_ID@SESSION_INCARNATION]:TO_SESSION:_default' \
+'--if-revision=[]:IF_REVISION:_default' \
+'--idempotency-key=[]:IDEMPOTENCY_KEY:_default' \
+'--format=[]:FORMAT:((text\:"Human-readable text output (default)"
+json\:"Single-record JSON envelope (snake_case)"))' \
+'--state-dir=[agent-session state directory]:PATH:_files -/' \
+'--host=[Advisory machine label for public projections]:HOST:_default' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+':assignment_id:_default' \
+&& ret=0
+;;
+(adopt)
+_arguments "${_arguments_options[@]}" : \
+'--if-revision=[Expected current assignment revision]:IF_REVISION:_default' \
+'--idempotency-key=[]:IDEMPOTENCY_KEY:_default' \
+'--format=[]:FORMAT:((text\:"Human-readable text output (default)"
+json\:"Single-record JSON envelope (snake_case)"))' \
+'--state-dir=[agent-session state directory]:PATH:_files -/' \
+'--host=[Advisory machine label for public projections]:HOST:_default' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+':assignment_id:_default' \
+&& ret=0
+;;
+(close)
+_arguments "${_arguments_options[@]}" : \
+'--if-revision=[Expected current run revision]:IF_REVISION:_default' \
+'--idempotency-key=[]:IDEMPOTENCY_KEY:_default' \
+'--format=[]:FORMAT:((text\:"Human-readable text output (default)"
+json\:"Single-record JSON envelope (snake_case)"))' \
+'--state-dir=[agent-session state directory]:PATH:_files -/' \
+'--host=[Advisory machine label for public projections]:HOST:_default' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+&& ret=0
+;;
+(completion)
+_arguments "${_arguments_options[@]}" : \
+'--state-dir=[agent-session state directory]:PATH:_files -/' \
+'--host=[Advisory machine label for public projections]:HOST:_default' \
+'-h[Print help]' \
+'--help[Print help]' \
+':shell:(bash zsh)' \
+&& ret=0
+;;
+        esac
+    ;;
+esac
+}
+
+(( $+functions[_main-agent_commands] )) ||
+_main-agent_commands() {
+    local commands; commands=(
+'init:Create or continuity-rebind this Main Agent'\''s durable run' \
+'self:Inspect the authenticated Main Agent or worker identity' \
+'rehydrate:Recover the authenticated durable objective or assignment capsule' \
+'status:Show a bounded status capsule' \
+'checkpoint:Record a revision-fenced run or worker checkpoint' \
+'worker:Manage worker assignments' \
+'collaborate:Add a non-authoritative collaborator relationship' \
+'borrow:Add a bounded non-authoritative borrowing relationship' \
+'handoff:Transfer primary assignment routing after quiescence checks' \
+'adopt:Adopt an orphaned assignment into this Main Agent'\''s run' \
+'close:Close this run after all assignments are terminal' \
+'completion:Print shell completion script' \
+    )
+    _describe -t commands 'main-agent commands' commands "$@"
+}
+(( $+functions[_main-agent__subcmd__adopt_commands] )) ||
+_main-agent__subcmd__adopt_commands() {
+    local commands; commands=()
+    _describe -t commands 'main-agent adopt commands' commands "$@"
+}
+(( $+functions[_main-agent__subcmd__borrow_commands] )) ||
+_main-agent__subcmd__borrow_commands() {
+    local commands; commands=()
+    _describe -t commands 'main-agent borrow commands' commands "$@"
+}
+(( $+functions[_main-agent__subcmd__checkpoint_commands] )) ||
+_main-agent__subcmd__checkpoint_commands() {
+    local commands; commands=()
+    _describe -t commands 'main-agent checkpoint commands' commands "$@"
+}
+(( $+functions[_main-agent__subcmd__close_commands] )) ||
+_main-agent__subcmd__close_commands() {
+    local commands; commands=()
+    _describe -t commands 'main-agent close commands' commands "$@"
+}
+(( $+functions[_main-agent__subcmd__collaborate_commands] )) ||
+_main-agent__subcmd__collaborate_commands() {
+    local commands; commands=()
+    _describe -t commands 'main-agent collaborate commands' commands "$@"
+}
+(( $+functions[_main-agent__subcmd__completion_commands] )) ||
+_main-agent__subcmd__completion_commands() {
+    local commands; commands=()
+    _describe -t commands 'main-agent completion commands' commands "$@"
+}
+(( $+functions[_main-agent__subcmd__handoff_commands] )) ||
+_main-agent__subcmd__handoff_commands() {
+    local commands; commands=()
+    _describe -t commands 'main-agent handoff commands' commands "$@"
+}
+(( $+functions[_main-agent__subcmd__init_commands] )) ||
+_main-agent__subcmd__init_commands() {
+    local commands; commands=()
+    _describe -t commands 'main-agent init commands' commands "$@"
+}
+(( $+functions[_main-agent__subcmd__rehydrate_commands] )) ||
+_main-agent__subcmd__rehydrate_commands() {
+    local commands; commands=()
+    _describe -t commands 'main-agent rehydrate commands' commands "$@"
+}
+(( $+functions[_main-agent__subcmd__self_commands] )) ||
+_main-agent__subcmd__self_commands() {
+    local commands; commands=(
+'show:' \
+    )
+    _describe -t commands 'main-agent self commands' commands "$@"
+}
+(( $+functions[_main-agent__subcmd__self__subcmd__show_commands] )) ||
+_main-agent__subcmd__self__subcmd__show_commands() {
+    local commands; commands=()
+    _describe -t commands 'main-agent self show commands' commands "$@"
+}
+(( $+functions[_main-agent__subcmd__status_commands] )) ||
+_main-agent__subcmd__status_commands() {
+    local commands; commands=()
+    _describe -t commands 'main-agent status commands' commands "$@"
+}
+(( $+functions[_main-agent__subcmd__worker_commands] )) ||
+_main-agent__subcmd__worker_commands() {
+    local commands; commands=(
+'start:' \
+'list:' \
+'show:' \
+'message:' \
+'accept:' \
+'release:' \
+'delete:' \
+    )
+    _describe -t commands 'main-agent worker commands' commands "$@"
+}
+(( $+functions[_main-agent__subcmd__worker__subcmd__accept_commands] )) ||
+_main-agent__subcmd__worker__subcmd__accept_commands() {
+    local commands; commands=()
+    _describe -t commands 'main-agent worker accept commands' commands "$@"
+}
+(( $+functions[_main-agent__subcmd__worker__subcmd__delete_commands] )) ||
+_main-agent__subcmd__worker__subcmd__delete_commands() {
+    local commands; commands=()
+    _describe -t commands 'main-agent worker delete commands' commands "$@"
+}
+(( $+functions[_main-agent__subcmd__worker__subcmd__list_commands] )) ||
+_main-agent__subcmd__worker__subcmd__list_commands() {
+    local commands; commands=()
+    _describe -t commands 'main-agent worker list commands' commands "$@"
+}
+(( $+functions[_main-agent__subcmd__worker__subcmd__message_commands] )) ||
+_main-agent__subcmd__worker__subcmd__message_commands() {
+    local commands; commands=()
+    _describe -t commands 'main-agent worker message commands' commands "$@"
+}
+(( $+functions[_main-agent__subcmd__worker__subcmd__release_commands] )) ||
+_main-agent__subcmd__worker__subcmd__release_commands() {
+    local commands; commands=()
+    _describe -t commands 'main-agent worker release commands' commands "$@"
+}
+(( $+functions[_main-agent__subcmd__worker__subcmd__show_commands] )) ||
+_main-agent__subcmd__worker__subcmd__show_commands() {
+    local commands; commands=()
+    _describe -t commands 'main-agent worker show commands' commands "$@"
+}
+(( $+functions[_main-agent__subcmd__worker__subcmd__start_commands] )) ||
+_main-agent__subcmd__worker__subcmd__start_commands() {
+    local commands; commands=()
+    _describe -t commands 'main-agent worker start commands' commands "$@"
+}
+
+if [ "$funcstack[1]" = "_main-agent" ]; then
+    _main-agent "$@"
+else
+    compdef _main-agent main-agent
+fi

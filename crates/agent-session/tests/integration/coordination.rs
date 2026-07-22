@@ -21,6 +21,14 @@ fn run_with_env(dir: &Path, args: &[&str], envs: &[(&str, &str)]) -> CmdOutput {
     )
 }
 
+fn run_main_agent(dir: &Path, args: &[&str], envs: &[(&str, &str)]) -> CmdOutput {
+    run_resolved(
+        "main-agent",
+        args,
+        &CmdOptions::new().with_cwd(dir).with_envs(envs),
+    )
+}
+
 fn seed_session(state_dir: &Path, id: &str, incarnation: &str) {
     seed_session_at(
         state_dir,
@@ -219,6 +227,186 @@ fn candidate(path: &Path, prefix: &str, summary: &str) {
 
 fn data(output: &CmdOutput) -> serde_json::Value {
     output.stdout_json()["data"].clone()
+}
+
+fn orchestration_request_digest(operation: &str, value: &serde_json::Value) -> String {
+    let mut digest = Sha256::new();
+    digest.update(operation.as_bytes());
+    digest.update([0]);
+    digest.update(serde_json::to_vec(value).expect("request json"));
+    digest
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+#[derive(serde::Deserialize, serde::Serialize)]
+struct AssignmentDigestFixture {
+    schema_version: String,
+    assignment_id: Option<String>,
+    task_summary: String,
+    task: serde_json::Value,
+    launch: AssignmentLaunchDigestFixture,
+    repository: Option<String>,
+    worktree: Option<String>,
+    base_ref: Option<String>,
+    scopes: Vec<String>,
+    durable_refs: Vec<String>,
+}
+
+#[derive(serde::Deserialize, serde::Serialize)]
+struct AssignmentLaunchDigestFixture {
+    agent: String,
+    cwd: String,
+    title: Option<String>,
+    session_id: Option<String>,
+    coordination_mode: String,
+    agent_args: Vec<String>,
+}
+
+fn assignment_request_digest(value: &serde_json::Value) -> String {
+    let input: AssignmentDigestFixture =
+        serde_json::from_value(value.clone()).expect("assignment digest fixture");
+    let mut digest = Sha256::new();
+    digest.update(b"main-agent-worker-start");
+    digest.update([0]);
+    digest.update(serde_json::to_vec(&input).expect("assignment request json"));
+    digest
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn write_private_json(path: &Path, value: &serde_json::Value) {
+    fs::write(
+        path,
+        serde_json::to_vec_pretty(value).expect("private json"),
+    )
+    .expect("write private json");
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600)).expect("private json mode");
+}
+
+fn init_main_run(
+    tmp: &Path,
+    state_dir: &Path,
+    checkout: &Path,
+    session_id: &str,
+    run_id: &str,
+) -> String {
+    let objective_path = tmp.join(format!("objective-{session_id}.json"));
+    write_private_json(
+        &objective_path,
+        &json!({
+            "schema_version": "main-agent.objective-packet.v1",
+            "run_id": run_id,
+            "tier": "L0",
+            "objective_summary": "Exercise orchestration recovery",
+            "objective": {},
+            "done_criteria": ["Recovery converges"],
+            "constraints": ["Do not duplicate lifecycle effects"],
+            "durable_refs": [],
+            "work_context": {
+                "schema_version": "agent-session.work-context-input.v1",
+                "intent": "implementation",
+                "tier": "L0",
+                "repositories": ["example/repository"],
+                "worktrees": [],
+                "provider_refs": [],
+                "plan_refs": [],
+                "scopes": [{
+                    "kind": "path-prefix",
+                    "repository": "example/repository",
+                    "value": "crates/agent-session"
+                }],
+                "summary": "Exercise orchestration recovery"
+            },
+            "next_action": null
+        }),
+    );
+    let capability_file = capability(state_dir, session_id);
+    let initialized = run_main_agent(
+        checkout,
+        &[
+            "--state-dir",
+            state_dir.to_str().expect("state dir"),
+            "init",
+            "--packet-file",
+            objective_path.to_str().expect("objective path"),
+            "--if-absent",
+            "--idempotency-key",
+            &format!("init-{session_id}-0001"),
+            "--format",
+            "json",
+        ],
+        &[("AGENT_SESSION_CAPABILITY_FILE", &capability_file)],
+    );
+    assert_eq!(initialized.code, 0, "stderr={}", initialized.stderr_text());
+    capability_file
+}
+
+fn insert_orchestration_assignment(
+    state_dir: &Path,
+    assignment_id: &str,
+    mut assignment: serde_json::Value,
+    private_packet: &serde_json::Value,
+) {
+    let packet_bytes = serde_json::to_vec(private_packet).expect("assignment packet");
+    let packet_digest = format!(
+        "sha256:{}",
+        Sha256::digest(&packet_bytes)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+    );
+    let packets = state_dir.join("orchestration/packets");
+    fs::create_dir_all(&packets).expect("packet directory");
+    fs::set_permissions(&packets, fs::Permissions::from_mode(0o700)).expect("packet dir mode");
+    let packet_path = packets.join(packet_digest.trim_start_matches("sha256:"));
+    fs::write(&packet_path, packet_bytes).expect("assignment packet");
+    fs::set_permissions(&packet_path, fs::Permissions::from_mode(0o600))
+        .expect("assignment packet mode");
+    assignment["private_packet_digest"] = json!(packet_digest);
+    rewrite_orchestration_registry(state_dir, |registry| {
+        registry["assignments"][assignment_id] = assignment;
+    });
+}
+
+fn rewrite_orchestration_registry(state_dir: &Path, mutate: impl FnOnce(&mut serde_json::Value)) {
+    let path = state_dir.join("orchestration/registry.json");
+    let mut registry: serde_json::Value =
+        serde_json::from_slice(&fs::read(&path).expect("orchestration registry"))
+            .expect("orchestration registry json");
+    mutate(&mut registry);
+    write_private_json(&path, &registry);
+}
+
+fn seed_active_claim(state_dir: &Path, session_id: &str, incarnation: &str, claim_id: &str) {
+    rewrite_registry(state_dir, |registry| {
+        registry["claims"]
+            .as_array_mut()
+            .expect("claims")
+            .push(json!({
+                "schema_version": "agent-session.work-context.v1",
+                "session_id": session_id,
+                "session_incarnation": incarnation,
+                "claim_id": claim_id,
+                "revision": 1,
+                "state": "active",
+                "intent": "implementation",
+                "tier": "L0",
+                "repositories": [],
+                "worktrees": [],
+                "provider_refs": [],
+                "plan_refs": [],
+                "scopes": [],
+                "summary": "Main Agent lifecycle fixture",
+                "updated_at": "2030-01-01T00:00:00Z",
+                "expires_at": "9999-12-31T23:59:59Z",
+                "expires_at_epoch": i64::MAX
+            }));
+    });
 }
 
 fn rewrite_registry(state_dir: &Path, mutate: impl FnOnce(&mut serde_json::Value)) {
@@ -2966,4 +3154,1234 @@ fn coordination_review_round4_completion_can_close_an_uncertain_lease() {
     );
     assert_eq!(completed.code, 0, "stderr={}", completed.stderr_text());
     assert_eq!(data(&completed)["state"], "completed");
+}
+
+#[test]
+fn main_agent_init_rehydrate_and_checkpoint_are_private_revision_fenced_and_idempotent() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let state_dir = tmp.path().join("state");
+    let checkout = tmp.path().join("checkout");
+    fs::create_dir(&state_dir).expect("state");
+    init_checkout(&checkout, "https://example.invalid/example/repository.git");
+    seed_brokers_at(
+        &state_dir,
+        &[(
+            "main-one",
+            "main-incarnation-one",
+            "main-private-capability-material-0000000001",
+            checkout.as_path(),
+            Some("enforce"),
+        )],
+    );
+    let capability_file = capability(&state_dir, "main-one");
+    let state_arg = state_dir.to_string_lossy().into_owned();
+    let objective_path = tmp.path().join("objective.json");
+    let privacy_canary = "private-objective-canary-must-not-project";
+    fs::write(
+        &objective_path,
+        serde_json::to_vec_pretty(&json!({
+            "schema_version": "main-agent.objective-packet.v1",
+            "run_id": "run-one",
+            "tier": "L0",
+            "objective_summary": "Deliver durable orchestration",
+            "objective": { "private_note": privacy_canary },
+            "done_criteria": ["Focused acceptance passes"],
+            "constraints": ["Do not leak private packets"],
+            "durable_refs": ["local:contract"],
+            "work_context": {
+                "schema_version": "agent-session.work-context-input.v1",
+                "intent": "implementation",
+                "tier": "L0",
+                "repositories": ["example/repository"],
+                "worktrees": [],
+                "provider_refs": [],
+                "plan_refs": [],
+                "scopes": [{
+                    "kind": "path-prefix",
+                    "repository": "example/repository",
+                    "value": "crates/agent-session"
+                }],
+                "summary": "Deliver durable orchestration"
+            },
+            "next_action": "Record the first checkpoint"
+        }))
+        .expect("objective json"),
+    )
+    .expect("objective packet");
+    fs::set_permissions(&objective_path, fs::Permissions::from_mode(0o600))
+        .expect("objective mode");
+
+    let init = run_main_agent(
+        tmp.path(),
+        &[
+            "--state-dir",
+            &state_arg,
+            "--host",
+            "sympoies",
+            "init",
+            "--packet-file",
+            objective_path.to_str().expect("objective path"),
+            "--if-absent",
+            "--idempotency-key",
+            "main-init-0001",
+            "--format",
+            "json",
+        ],
+        &[("AGENT_SESSION_CAPABILITY_FILE", &capability_file)],
+    );
+    assert_eq!(init.code, 0, "stderr={}", init.stderr_text());
+    assert_eq!(data(&init)["run"]["run_id"], "run-one");
+    assert_eq!(data(&init)["run"]["revision"], 1);
+
+    let replay = run_main_agent(
+        tmp.path(),
+        &[
+            "--state-dir",
+            &state_arg,
+            "init",
+            "--packet-file",
+            objective_path.to_str().expect("objective path"),
+            "--if-absent",
+            "--idempotency-key",
+            "main-init-0001",
+            "--format",
+            "json",
+        ],
+        &[("AGENT_SESSION_CAPABILITY_FILE", &capability_file)],
+    );
+    assert_eq!(replay.code, 0, "stderr={}", replay.stderr_text());
+    assert_eq!(data(&replay), data(&init));
+
+    let status = run_main_agent(
+        tmp.path(),
+        &["--state-dir", &state_arg, "status", "--format", "json"],
+        &[("AGENT_SESSION_CAPABILITY_FILE", &capability_file)],
+    );
+    assert_eq!(status.code, 0, "stderr={}", status.stderr_text());
+    assert!(!status.stdout_text().contains(privacy_canary));
+    assert!(
+        status
+            .stdout_text()
+            .contains("Deliver durable orchestration")
+    );
+
+    let first_rehydrate = run_main_agent(
+        tmp.path(),
+        &["--state-dir", &state_arg, "rehydrate", "--format", "json"],
+        &[("AGENT_SESSION_CAPABILITY_FILE", &capability_file)],
+    );
+    let second_rehydrate = run_main_agent(
+        tmp.path(),
+        &["--state-dir", &state_arg, "rehydrate", "--format", "json"],
+        &[("AGENT_SESSION_CAPABILITY_FILE", &capability_file)],
+    );
+    assert_eq!(
+        first_rehydrate.code,
+        0,
+        "stderr={}",
+        first_rehydrate.stderr_text()
+    );
+    assert_eq!(
+        second_rehydrate.code,
+        0,
+        "stderr={}",
+        second_rehydrate.stderr_text()
+    );
+    assert_eq!(
+        data(&first_rehydrate)["durable"],
+        data(&second_rehydrate)["durable"]
+    );
+    assert!(first_rehydrate.stdout_text().contains(privacy_canary));
+
+    let checkpoint_path = tmp.path().join("checkpoint.json");
+    fs::write(
+        &checkpoint_path,
+        serde_json::to_vec_pretty(&json!({
+            "schema_version": "main-agent.checkpoint-input.v1",
+            "summary": "CLI contract implemented",
+            "next_action": "Run focused acceptance",
+            "state": "active"
+        }))
+        .expect("checkpoint json"),
+    )
+    .expect("checkpoint packet");
+    fs::set_permissions(&checkpoint_path, fs::Permissions::from_mode(0o600))
+        .expect("checkpoint mode");
+    let checkpoint = run_main_agent(
+        tmp.path(),
+        &[
+            "--state-dir",
+            &state_arg,
+            "checkpoint",
+            "--file",
+            checkpoint_path.to_str().expect("checkpoint path"),
+            "--if-revision",
+            "1",
+            "--idempotency-key",
+            "main-checkpoint-0001",
+            "--format",
+            "json",
+        ],
+        &[("AGENT_SESSION_CAPABILITY_FILE", &capability_file)],
+    );
+    assert_eq!(checkpoint.code, 0, "stderr={}", checkpoint.stderr_text());
+    assert_eq!(data(&checkpoint)["run"]["revision"], 2);
+
+    let stale = run_main_agent(
+        tmp.path(),
+        &[
+            "--state-dir",
+            &state_arg,
+            "checkpoint",
+            "--file",
+            checkpoint_path.to_str().expect("checkpoint path"),
+            "--if-revision",
+            "1",
+            "--idempotency-key",
+            "main-checkpoint-0002",
+            "--format",
+            "json",
+        ],
+        &[("AGENT_SESSION_CAPABILITY_FILE", &capability_file)],
+    );
+    assert_eq!(stale.code, 65);
+    assert_eq!(
+        stale.stdout_json()["error"]["code"],
+        "orchestration-revision-conflict"
+    );
+    assert_eq!(
+        stale.stdout_json()["error"]["details"]["current_revision"],
+        2
+    );
+
+    let orchestration_root = state_dir.join("orchestration");
+    assert_eq!(
+        fs::metadata(&orchestration_root)
+            .expect("root metadata")
+            .permissions()
+            .mode()
+            & 0o777,
+        0o700
+    );
+    assert_eq!(
+        fs::metadata(orchestration_root.join("registry.json"))
+            .expect("registry metadata")
+            .permissions()
+            .mode()
+            & 0o777,
+        0o600
+    );
+    for entry in fs::read_dir(orchestration_root.join("packets")).expect("packet directory") {
+        assert_eq!(
+            entry
+                .expect("packet entry")
+                .metadata()
+                .expect("packet metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+    }
+
+    let new_incarnation = "main-incarnation-two";
+    let new_capability = "main-private-capability-material-0000000002";
+    let session_path = state_dir.join("sessions/main-one/session.json");
+    let mut session: serde_json::Value =
+        serde_json::from_slice(&fs::read(&session_path).expect("session record"))
+            .expect("session json");
+    session["runtime"]["launch_id"] = json!(new_incarnation);
+    fs::write(
+        &session_path,
+        serde_json::to_vec_pretty(&session).expect("session json"),
+    )
+    .expect("updated session record");
+    fs::set_permissions(&session_path, fs::Permissions::from_mode(0o600)).expect("session mode");
+    let coordination_dir = state_dir.join("sessions/main-one/coordination");
+    let new_capability_file =
+        coordination_dir.join(format!("capability-{}", digest(new_incarnation)));
+    fs::write(&new_capability_file, new_capability).expect("new capability");
+    fs::set_permissions(&new_capability_file, fs::Permissions::from_mode(0o600))
+        .expect("new capability mode");
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_secs();
+    fs::write(
+        coordination_dir.join("heartbeat"),
+        format!("{new_incarnation}:{now}\n"),
+    )
+    .expect("new heartbeat");
+    rewrite_registry(&state_dir, |registry| {
+        registry["brokers"]["main-one"]["incarnation"] = json!(new_incarnation);
+        registry["brokers"]["main-one"]["capability_digest"] = json!(digest(new_capability));
+        registry["brokers"]["main-one"]["heartbeat_epoch"] = json!(now);
+        for claim in registry["claims"].as_array_mut().expect("claims") {
+            claim["state"] = json!("released");
+        }
+    });
+    let new_capability_arg = new_capability_file.to_string_lossy().into_owned();
+
+    let unfenced_rebind = run_main_agent(
+        tmp.path(),
+        &[
+            "--state-dir",
+            &state_arg,
+            "init",
+            "--packet-file",
+            objective_path.to_str().expect("objective path"),
+            "--if-absent",
+            "--idempotency-key",
+            "main-rebind-0001",
+            "--format",
+            "json",
+        ],
+        &[("AGENT_SESSION_CAPABILITY_FILE", &new_capability_arg)],
+    );
+    assert_eq!(unfenced_rebind.code, 65);
+    assert_eq!(
+        unfenced_rebind.stdout_json()["error"]["code"],
+        "orchestration-revision-required"
+    );
+
+    let rebound = run_main_agent(
+        tmp.path(),
+        &[
+            "--state-dir",
+            &state_arg,
+            "init",
+            "--packet-file",
+            objective_path.to_str().expect("objective path"),
+            "--if-absent",
+            "--if-revision",
+            "2",
+            "--idempotency-key",
+            "main-rebind-0002",
+            "--format",
+            "json",
+        ],
+        &[("AGENT_SESSION_CAPABILITY_FILE", &new_capability_arg)],
+    );
+    assert_eq!(rebound.code, 0, "stderr={}", rebound.stderr_text());
+    assert_eq!(data(&rebound)["rebound"], true);
+    assert_eq!(data(&rebound)["run"]["revision"], 3);
+    assert_eq!(
+        data(&rebound)["run"]["controller"]["session_incarnation"],
+        new_incarnation
+    );
+}
+
+#[test]
+fn main_agent_worker_start_replay_converges_a_persisted_start_without_duplicate_launch() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let state_dir = tmp.path().join("state");
+    let checkout = tmp.path().join("checkout");
+    fs::create_dir(&state_dir).expect("state");
+    init_checkout(&checkout, "https://example.invalid/example/repository.git");
+    let assignment_id = "assignment-auto-stable";
+    let worker_id = "worker-assignment-auto-stable";
+    seed_brokers_at(
+        &state_dir,
+        &[
+            (
+                "main-one",
+                "main-incarnation-one",
+                "main-private-capability-material-0000000001",
+                checkout.as_path(),
+                Some("enforce"),
+            ),
+            (
+                worker_id,
+                "worker-incarnation-one",
+                "worker-private-capability-material-0000000001",
+                checkout.as_path(),
+                Some("enforce"),
+            ),
+        ],
+    );
+    let main_capability = init_main_run(tmp.path(), &state_dir, &checkout, "main-one", "run-one");
+    let worker_prompt = state_dir.join(format!("sessions/{worker_id}/prompt.md"));
+    fs::write(
+        &worker_prompt,
+        format!(
+            "You are a managed worker for assignment {assignment_id}. Run `main-agent self show --format json`, then checkpoint state `working` before mutations."
+        ),
+    )
+    .expect("worker prompt");
+    fs::set_permissions(&worker_prompt, fs::Permissions::from_mode(0o600))
+        .expect("worker prompt mode");
+    let worker_record_path = state_dir.join(format!("sessions/{worker_id}/session.json"));
+    let mut worker_record: serde_json::Value =
+        serde_json::from_slice(&fs::read(&worker_record_path).expect("worker record"))
+            .expect("worker record json");
+    worker_record["prompt_file"] = json!(worker_prompt);
+    write_private_json(&worker_record_path, &worker_record);
+    let assignment_input = json!({
+        "schema_version": "main-agent.assignment-input.v1",
+        "assignment_id": null,
+        "task_summary": "Resume a durable worker launch",
+        "task": {},
+        "launch": {
+            "agent": "codex",
+            "cwd": checkout,
+            "title": null,
+            "session_id": null,
+            "coordination_mode": "enforce",
+            "agent_args": []
+        },
+        "repository": "example/repository",
+        "worktree": null,
+        "base_ref": "main",
+        "scopes": ["crates/agent-session"],
+        "durable_refs": []
+    });
+    insert_orchestration_assignment(
+        &state_dir,
+        assignment_id,
+        json!({
+            "schema_version": "agent-session.orchestration-assignment.v1",
+            "assignment_id": assignment_id,
+            "run_id": "run-one",
+            "revision": 1,
+            "state": "starting",
+            "task_summary": "Resume a durable worker launch",
+            "private_packet_digest": "replaced-by-fixture",
+            "primary_manager": {
+                "session_id": "main-one",
+                "session_incarnation": "main-incarnation-one",
+                "session_created_at": "2030-01-01T00:00:00Z"
+            },
+            "worker": null,
+            "collaborators": [],
+            "borrowed_by": [],
+            "repository": "example/repository",
+            "worktree": null,
+            "base_ref": "main",
+            "scopes": ["crates/agent-session"],
+            "durable_refs": [],
+            "checkpoint": null,
+            "result_summary": null,
+            "blocker_summary": null,
+            "created_at": "2030-01-01T00:00:01Z",
+            "updated_at": "2030-01-01T00:00:01Z"
+        }),
+        &assignment_input,
+    );
+    let idempotency_key = "worker-start-crash-0001";
+    let request_digest = assignment_request_digest(&assignment_input);
+    rewrite_orchestration_registry(&state_dir, |registry| {
+        registry["receipts"][format!("main-one:main-incarnation-one:{idempotency_key}")] = json!({
+            "principal_session_id": "main-one",
+            "principal_incarnation": "main-incarnation-one",
+            "operation": "worker-start",
+            "request_digest": request_digest,
+            "outcome": {
+                "schema_version": "main-agent.worker-start-result.v1",
+                "assignment_id": assignment_id,
+                "state": "starting",
+                "acceptance": "pending"
+            },
+            "created_at_epoch": 1
+        });
+    });
+    let assignment_path = tmp.path().join("assignment.json");
+    write_private_json(&assignment_path, &assignment_input);
+    let args = [
+        "--state-dir",
+        state_dir.to_str().expect("state dir"),
+        "worker",
+        "start",
+        "--assignment-file",
+        assignment_path.to_str().expect("assignment path"),
+        "--if-run-revision",
+        "1",
+        "--idempotency-key",
+        idempotency_key,
+        "--format",
+        "json",
+    ];
+    let resumed = run_main_agent(
+        &checkout,
+        &args,
+        &[("AGENT_SESSION_CAPABILITY_FILE", &main_capability)],
+    );
+    assert_eq!(resumed.code, 0, "stderr={}", resumed.stderr_text());
+    assert_eq!(data(&resumed)["assignment"]["assignment_id"], assignment_id);
+    assert_eq!(data(&resumed)["assignment"]["revision"], 2);
+    assert_eq!(data(&resumed)["worker"]["session_id"], worker_id);
+    assert_eq!(
+        data(&resumed)["acceptance"]["state"],
+        "pending-worker-checkpoint"
+    );
+
+    let replay = run_main_agent(
+        &checkout,
+        &args,
+        &[("AGENT_SESSION_CAPABILITY_FILE", &main_capability)],
+    );
+    assert_eq!(replay.code, 0, "stderr={}", replay.stderr_text());
+    assert_eq!(replay.stdout_text(), resumed.stdout_text());
+    assert_eq!(
+        fs::read_dir(state_dir.join("sessions"))
+            .expect("sessions")
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_name() == worker_id)
+            .count(),
+        1,
+        "replay must not launch a duplicate worker"
+    );
+}
+
+#[test]
+fn main_agent_worker_delete_replay_converges_post_tombstone_and_is_exact() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let state_dir = tmp.path().join("state");
+    let checkout = tmp.path().join("checkout");
+    fs::create_dir(&state_dir).expect("state");
+    init_checkout(&checkout, "https://example.invalid/example/repository.git");
+    seed_brokers_at(
+        &state_dir,
+        &[
+            (
+                "main-one",
+                "main-incarnation-one",
+                "main-private-capability-material-0000000001",
+                checkout.as_path(),
+                Some("enforce"),
+            ),
+            (
+                "worker-one",
+                "worker-incarnation-one",
+                "worker-private-capability-material-0000000001",
+                checkout.as_path(),
+                Some("enforce"),
+            ),
+        ],
+    );
+    let main_capability = init_main_run(tmp.path(), &state_dir, &checkout, "main-one", "run-one");
+    let private_packet = json!({
+        "schema_version": "main-agent.assignment-input.v1",
+        "assignment_id": "assignment-one",
+        "task_summary": "Delete a released worker",
+        "task": {},
+        "launch": {
+            "agent": "codex",
+            "cwd": checkout,
+            "title": null,
+            "session_id": "worker-one",
+            "coordination_mode": "enforce",
+            "agent_args": []
+        },
+        "repository": "example/repository",
+        "worktree": null,
+        "base_ref": "main",
+        "scopes": ["crates/agent-session"],
+        "durable_refs": []
+    });
+    insert_orchestration_assignment(
+        &state_dir,
+        "assignment-one",
+        json!({
+            "schema_version": "agent-session.orchestration-assignment.v1",
+            "assignment_id": "assignment-one",
+            "run_id": "run-one",
+            "revision": 2,
+            "state": "submitted",
+            "task_summary": "Delete a released worker",
+            "private_packet_digest": "replaced-by-fixture",
+            "primary_manager": {
+                "session_id": "main-one",
+                "session_incarnation": "main-incarnation-one",
+                "session_created_at": "2030-01-01T00:00:00Z"
+            },
+            "worker": {
+                "session_id": "worker-one",
+                "session_incarnation": "worker-incarnation-one",
+                "session_created_at": "2030-01-01T00:00:00Z"
+            },
+            "collaborators": [],
+            "borrowed_by": [],
+            "repository": "example/repository",
+            "worktree": null,
+            "base_ref": "main",
+            "scopes": ["crates/agent-session"],
+            "durable_refs": [],
+            "checkpoint": null,
+            "result_summary": null,
+            "blocker_summary": null,
+            "created_at": "2030-01-01T00:00:01Z",
+            "updated_at": "2030-01-01T00:00:02Z"
+        }),
+        &private_packet,
+    );
+    let accepted = run_main_agent(
+        &checkout,
+        &[
+            "--state-dir",
+            state_dir.to_str().expect("state dir"),
+            "worker",
+            "accept",
+            "assignment-one",
+            "--if-revision",
+            "2",
+            "--idempotency-key",
+            "worker-accept-lifecycle-0001",
+            "--format",
+            "json",
+        ],
+        &[("AGENT_SESSION_CAPABILITY_FILE", &main_capability)],
+    );
+    assert_eq!(accepted.code, 0, "stderr={}", accepted.stderr_text());
+    assert_eq!(data(&accepted)["assignment"]["state"], "accepted");
+    assert_eq!(data(&accepted)["assignment"]["revision"], 3);
+    let released = run_main_agent(
+        &checkout,
+        &[
+            "--state-dir",
+            state_dir.to_str().expect("state dir"),
+            "worker",
+            "release",
+            "assignment-one",
+            "--if-revision",
+            "3",
+            "--idempotency-key",
+            "worker-release-lifecycle-0001",
+            "--format",
+            "json",
+        ],
+        &[("AGENT_SESSION_CAPABILITY_FILE", &main_capability)],
+    );
+    assert_eq!(released.code, 0, "stderr={}", released.stderr_text());
+    assert_eq!(data(&released)["assignment"]["state"], "released");
+    assert_eq!(data(&released)["assignment"]["revision"], 4);
+    let idempotency_key = "worker-delete-crash-0001";
+    let request = json!({ "assignment_id": "assignment-one", "if_revision": 4 });
+    let request_digest = orchestration_request_digest("worker-delete", &request);
+    rewrite_orchestration_registry(&state_dir, |registry| {
+        registry["receipts"][format!("main-one:main-incarnation-one:{idempotency_key}")] = json!({
+            "principal_session_id": "main-one",
+            "principal_incarnation": "main-incarnation-one",
+            "operation": "worker-delete",
+            "request_digest": request_digest,
+            "outcome": {
+                "schema_version": "main-agent.worker-delete-pending.v1",
+                "assignment_id": "assignment-one",
+                "worker": {
+                    "session_id": "worker-one",
+                    "session_incarnation": "worker-incarnation-one",
+                    "session_created_at": "2030-01-01T00:00:00Z"
+                }
+            },
+            "created_at_epoch": 1
+        });
+    });
+    let tombstone_root = state_dir.join("session-delete-tombstones");
+    fs::create_dir(&tombstone_root).expect("tombstone root");
+    fs::set_permissions(&tombstone_root, fs::Permissions::from_mode(0o700))
+        .expect("tombstone root mode");
+    let stale_tombstone = tombstone_root.join("worker-one-000-stale");
+    fs::create_dir(&stale_tombstone).expect("stale tombstone");
+    fs::set_permissions(&stale_tombstone, fs::Permissions::from_mode(0o700))
+        .expect("stale tombstone mode");
+    let mut stale_record: serde_json::Value = serde_json::from_slice(
+        &fs::read(state_dir.join("sessions/worker-one/session.json")).expect("worker record"),
+    )
+    .expect("worker record json");
+    stale_record["runtime"]["launch_id"] = json!("worker-incarnation-stale");
+    write_private_json(&stale_tombstone.join("session.json"), &stale_record);
+    let tombstone = tombstone_root.join("worker-one-fixture");
+    fs::rename(state_dir.join("sessions/worker-one"), &tombstone)
+        .expect("persist logical delete tombstone");
+
+    let args = [
+        "--state-dir",
+        state_dir.to_str().expect("state dir"),
+        "worker",
+        "delete",
+        "assignment-one",
+        "--if-revision",
+        "4",
+        "--idempotency-key",
+        idempotency_key,
+        "--format",
+        "json",
+    ];
+    let recovered = run_main_agent(
+        &checkout,
+        &args,
+        &[("AGENT_SESSION_CAPABILITY_FILE", &main_capability)],
+    );
+    assert_eq!(recovered.code, 0, "stderr={}", recovered.stderr_text());
+    assert_eq!(data(&recovered)["assignment"]["revision"], 5);
+    assert_eq!(data(&recovered)["deleted"], true);
+    assert_eq!(data(&recovered)["cleanup_pending"], true);
+
+    let replay = run_main_agent(
+        &checkout,
+        &args,
+        &[("AGENT_SESSION_CAPABILITY_FILE", &main_capability)],
+    );
+    assert_eq!(replay.code, 0, "stderr={}", replay.stderr_text());
+    assert_eq!(replay.stdout_text(), recovered.stdout_text());
+    assert!(
+        tombstone.exists(),
+        "replay must not repeat physical cleanup"
+    );
+    assert!(!state_dir.join("sessions/worker-one").exists());
+}
+
+#[test]
+fn main_agent_borrow_prunes_all_expired_relationships_before_enforcing_the_limit() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let state_dir = tmp.path().join("state");
+    let checkout = tmp.path().join("checkout");
+    fs::create_dir(&state_dir).expect("state");
+    init_checkout(&checkout, "https://example.invalid/example/repository.git");
+    seed_brokers_at(
+        &state_dir,
+        &[
+            (
+                "main-one",
+                "main-incarnation-one",
+                "main-private-capability-material-0000000001",
+                checkout.as_path(),
+                Some("enforce"),
+            ),
+            (
+                "borrower-new",
+                "borrower-incarnation-new",
+                "borrower-private-capability-material-0000000001",
+                checkout.as_path(),
+                Some("advisory"),
+            ),
+        ],
+    );
+    let main_capability = init_main_run(tmp.path(), &state_dir, &checkout, "main-one", "run-one");
+    let expired = (0..16)
+        .map(|index| {
+            json!({
+                "session": {
+                    "session_id": format!("expired-borrower-{index:02}"),
+                    "session_incarnation": format!("expired-incarnation-{index:02}"),
+                    "session_created_at": "2030-01-01T00:00:00Z"
+                },
+                "expires_at": "1970-01-01T00:00:01Z",
+                "expires_at_epoch": 1
+            })
+        })
+        .collect::<Vec<_>>();
+    let private_packet = json!({
+        "schema_version": "main-agent.assignment-input.v1",
+        "assignment_id": "assignment-one",
+        "task_summary": "Prune expired borrowers",
+        "task": {},
+        "launch": {
+            "agent": "codex",
+            "cwd": checkout,
+            "title": null,
+            "session_id": null,
+            "coordination_mode": "enforce",
+            "agent_args": []
+        },
+        "repository": "example/repository",
+        "worktree": null,
+        "base_ref": "main",
+        "scopes": ["crates/agent-session"],
+        "durable_refs": []
+    });
+    insert_orchestration_assignment(
+        &state_dir,
+        "assignment-one",
+        json!({
+            "schema_version": "agent-session.orchestration-assignment.v1",
+            "assignment_id": "assignment-one",
+            "run_id": "run-one",
+            "revision": 1,
+            "state": "assigned",
+            "task_summary": "Prune expired borrowers",
+            "private_packet_digest": "replaced-by-fixture",
+            "primary_manager": {
+                "session_id": "main-one",
+                "session_incarnation": "main-incarnation-one",
+                "session_created_at": "2030-01-01T00:00:00Z"
+            },
+            "worker": null,
+            "collaborators": [],
+            "borrowed_by": expired,
+            "repository": "example/repository",
+            "worktree": null,
+            "base_ref": "main",
+            "scopes": ["crates/agent-session"],
+            "durable_refs": [],
+            "checkpoint": null,
+            "result_summary": null,
+            "blocker_summary": null,
+            "created_at": "2030-01-01T00:00:01Z",
+            "updated_at": "2030-01-01T00:00:01Z"
+        }),
+        &private_packet,
+    );
+    let borrowed = run_main_agent(
+        &checkout,
+        &[
+            "--state-dir",
+            state_dir.to_str().expect("state dir"),
+            "borrow",
+            "assignment-one",
+            "--session",
+            "borrower-new@borrower-incarnation-new",
+            "--duration",
+            "1h",
+            "--if-revision",
+            "1",
+            "--idempotency-key",
+            "borrow-prune-0001",
+            "--format",
+            "json",
+        ],
+        &[("AGENT_SESSION_CAPABILITY_FILE", &main_capability)],
+    );
+    assert_eq!(borrowed.code, 0, "stderr={}", borrowed.stderr_text());
+    let projected_borrowers = data(&borrowed)["assignment"]["borrowed_by"]
+        .as_array()
+        .expect("projected borrowers")
+        .clone();
+    assert_eq!(projected_borrowers.len(), 1);
+    assert_eq!(projected_borrowers[0]["session_id"], "borrower-new");
+    assert_eq!(
+        projected_borrowers[0]["session_incarnation"],
+        "borrower-incarnation-new"
+    );
+    let registry: serde_json::Value = serde_json::from_slice(
+        &fs::read(state_dir.join("orchestration/registry.json")).expect("registry"),
+    )
+    .expect("registry json");
+    assert_eq!(
+        registry["assignments"]["assignment-one"]["borrowed_by"]
+            .as_array()
+            .expect("borrowers")
+            .len(),
+        1
+    );
+}
+
+#[test]
+fn main_agent_worker_self_checkpoint_and_collaborator_visibility_are_durable() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let state_dir = tmp.path().join("state");
+    let checkout = tmp.path().join("checkout");
+    fs::create_dir(&state_dir).expect("state");
+    init_checkout(&checkout, "https://example.invalid/example/repository.git");
+    seed_brokers_at(
+        &state_dir,
+        &[
+            (
+                "main-one",
+                "main-incarnation-one",
+                "main-private-capability-material-0000000001",
+                checkout.as_path(),
+                Some("enforce"),
+            ),
+            (
+                "worker-one",
+                "worker-incarnation-one",
+                "worker-private-capability-material-0000000001",
+                checkout.as_path(),
+                Some("enforce"),
+            ),
+            (
+                "collaborator-one",
+                "collaborator-incarnation-one",
+                "collaborator-private-capability-material-0000001",
+                checkout.as_path(),
+                Some("advisory"),
+            ),
+        ],
+    );
+    let main_capability = init_main_run(tmp.path(), &state_dir, &checkout, "main-one", "run-one");
+    seed_active_claim(
+        &state_dir,
+        "worker-one",
+        "worker-incarnation-one",
+        "worker-claim-one",
+    );
+    let private_packet = json!({
+        "schema_version": "main-agent.assignment-input.v1",
+        "assignment_id": "assignment-one",
+        "task_summary": "Checkpoint worker acceptance",
+        "task": {"private_note": "worker-private-canary"},
+        "launch": {
+            "agent": "codex",
+            "cwd": checkout,
+            "title": null,
+            "session_id": "worker-one",
+            "coordination_mode": "enforce",
+            "agent_args": []
+        },
+        "repository": "example/repository",
+        "worktree": null,
+        "base_ref": "main",
+        "scopes": ["crates/agent-session"],
+        "durable_refs": []
+    });
+    insert_orchestration_assignment(
+        &state_dir,
+        "assignment-one",
+        json!({
+            "schema_version": "agent-session.orchestration-assignment.v1",
+            "assignment_id": "assignment-one",
+            "run_id": "run-one",
+            "revision": 2,
+            "state": "starting",
+            "task_summary": "Checkpoint worker acceptance",
+            "private_packet_digest": "replaced-by-fixture",
+            "primary_manager": {
+                "session_id": "main-one",
+                "session_incarnation": "main-incarnation-one",
+                "session_created_at": "2030-01-01T00:00:00Z"
+            },
+            "worker": {
+                "session_id": "worker-one",
+                "session_incarnation": "worker-incarnation-one",
+                "session_created_at": "2030-01-01T00:00:00Z"
+            },
+            "collaborators": [],
+            "borrowed_by": [],
+            "repository": "example/repository",
+            "worktree": null,
+            "base_ref": "main",
+            "scopes": ["crates/agent-session"],
+            "durable_refs": [],
+            "checkpoint": null,
+            "result_summary": null,
+            "blocker_summary": null,
+            "created_at": "2030-01-01T00:00:01Z",
+            "updated_at": "2030-01-01T00:00:02Z"
+        }),
+        &private_packet,
+    );
+    let worker_capability = capability(&state_dir, "worker-one");
+    let self_show = run_main_agent(
+        &checkout,
+        &[
+            "--state-dir",
+            state_dir.to_str().expect("state dir"),
+            "self",
+            "show",
+            "--format",
+            "json",
+        ],
+        &[("AGENT_SESSION_CAPABILITY_FILE", &worker_capability)],
+    );
+    assert_eq!(self_show.code, 0, "stderr={}", self_show.stderr_text());
+    assert_eq!(data(&self_show)["role"], "worker");
+    assert_eq!(
+        data(&self_show)["assignment"]["record"]["state"],
+        "starting"
+    );
+    assert!(self_show.stdout_text().contains("worker-private-canary"));
+
+    let collaborated = run_main_agent(
+        &checkout,
+        &[
+            "--state-dir",
+            state_dir.to_str().expect("state dir"),
+            "collaborate",
+            "assignment-one",
+            "--session",
+            "collaborator-one@collaborator-incarnation-one",
+            "--if-revision",
+            "2",
+            "--idempotency-key",
+            "collaborate-lifecycle-0001",
+            "--format",
+            "json",
+        ],
+        &[("AGENT_SESSION_CAPABILITY_FILE", &main_capability)],
+    );
+    assert_eq!(
+        collaborated.code,
+        0,
+        "stderr={}",
+        collaborated.stderr_text()
+    );
+    assert_eq!(
+        data(&collaborated)["assignment"]["collaborators"][0]["session_id"],
+        "collaborator-one"
+    );
+
+    let checkpoint_path = tmp.path().join("worker-checkpoint.json");
+    write_private_json(
+        &checkpoint_path,
+        &json!({
+            "schema_version": "main-agent.checkpoint-input.v1",
+            "summary": "Worker authenticated and working",
+            "next_action": "Implement the bounded assignment",
+            "state": "working",
+            "result_summary": null,
+            "blocker_summary": null
+        }),
+    );
+    let checkpoint_args = [
+        "--state-dir",
+        state_dir.to_str().expect("state dir"),
+        "checkpoint",
+        "--file",
+        checkpoint_path.to_str().expect("checkpoint path"),
+        "--if-revision",
+        "3",
+        "--idempotency-key",
+        "worker-checkpoint-0001",
+        "--format",
+        "json",
+    ];
+    let checkpointed = run_main_agent(
+        &checkout,
+        &checkpoint_args,
+        &[("AGENT_SESSION_CAPABILITY_FILE", &worker_capability)],
+    );
+    assert_eq!(
+        checkpointed.code,
+        0,
+        "stderr={}",
+        checkpointed.stderr_text()
+    );
+    assert_eq!(data(&checkpointed)["assignment"]["state"], "working");
+    assert_eq!(data(&checkpointed)["assignment"]["revision"], 4);
+    assert_eq!(
+        data(&checkpointed)["assignment"]["collaborators"][0]["session_id"],
+        "collaborator-one"
+    );
+    let replay = run_main_agent(
+        &checkout,
+        &checkpoint_args,
+        &[("AGENT_SESSION_CAPABILITY_FILE", &worker_capability)],
+    );
+    assert_eq!(replay.code, 0, "stderr={}", replay.stderr_text());
+    assert_eq!(replay.stdout_text(), checkpointed.stdout_text());
+}
+
+#[test]
+fn main_agent_handoff_requires_operation_quiescence_and_adopt_requires_an_orphan() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let state_dir = tmp.path().join("state");
+    let checkout = tmp.path().join("checkout");
+    fs::create_dir(&state_dir).expect("state");
+    init_checkout(&checkout, "https://example.invalid/example/repository.git");
+    seed_brokers_at(
+        &state_dir,
+        &[
+            (
+                "main-one",
+                "main-incarnation-one",
+                "main-private-capability-material-0000000001",
+                checkout.as_path(),
+                Some("enforce"),
+            ),
+            (
+                "main-two",
+                "main-incarnation-two",
+                "main-private-capability-material-0000000002",
+                checkout.as_path(),
+                Some("enforce"),
+            ),
+        ],
+    );
+    let main_one_capability =
+        init_main_run(tmp.path(), &state_dir, &checkout, "main-one", "run-one");
+    seed_active_claim(
+        &state_dir,
+        "main-two",
+        "main-incarnation-two",
+        "main-two-claim",
+    );
+    let main_two_capability = capability(&state_dir, "main-two");
+    let mut orchestration_registry: serde_json::Value = serde_json::from_slice(
+        &fs::read(state_dir.join("orchestration/registry.json")).expect("registry"),
+    )
+    .expect("registry json");
+    let main_one_controller = orchestration_registry["runs"]["run-one"]["controller"].clone();
+    let mut main_two_controller = main_one_controller.clone();
+    main_two_controller["session_id"] = json!("main-two");
+    main_two_controller["session_incarnation"] = json!("main-incarnation-two");
+    let objective_digest =
+        orchestration_registry["runs"]["run-one"]["objective_packet_digest"].clone();
+    orchestration_registry["runs"]["run-two"] = json!({
+        "schema_version": "agent-session.orchestration-run.v1",
+        "run_id": "run-two",
+        "revision": 1,
+        "state": "active",
+        "tier": "L0",
+        "objective_summary": "Adopt orphaned assignments",
+        "objective_packet_digest": objective_digest,
+        "controller": main_two_controller,
+        "durable_refs": [],
+        "checkpoint": null,
+        "created_at": "2030-01-01T00:00:00Z",
+        "updated_at": "2030-01-01T00:00:00Z"
+    });
+    write_private_json(
+        &state_dir.join("orchestration/registry.json"),
+        &orchestration_registry,
+    );
+    let private_packet = json!({
+        "schema_version": "main-agent.assignment-input.v1",
+        "assignment_id": "fixture",
+        "task_summary": "Exercise relationship lifecycle",
+        "task": {},
+        "launch": {
+            "agent": "codex",
+            "cwd": checkout,
+            "title": null,
+            "session_id": null,
+            "coordination_mode": "enforce",
+            "agent_args": []
+        },
+        "repository": "example/repository",
+        "worktree": null,
+        "base_ref": "main",
+        "scopes": ["crates/agent-session"],
+        "durable_refs": []
+    });
+    for assignment_id in ["handoff-one", "adopt-one"] {
+        insert_orchestration_assignment(
+            &state_dir,
+            assignment_id,
+            json!({
+                "schema_version": "agent-session.orchestration-assignment.v1",
+                "assignment_id": assignment_id,
+                "run_id": "run-one",
+                "revision": 1,
+                "state": "assigned",
+                "task_summary": "Exercise relationship lifecycle",
+                "private_packet_digest": "replaced-by-fixture",
+                "primary_manager": main_one_controller,
+                "worker": null,
+                "collaborators": [],
+                "borrowed_by": [],
+                "repository": "example/repository",
+                "worktree": null,
+                "base_ref": "main",
+                "scopes": ["crates/agent-session"],
+                "durable_refs": [],
+                "checkpoint": null,
+                "result_summary": null,
+                "blocker_summary": null,
+                "created_at": "2030-01-01T00:00:01Z",
+                "updated_at": "2030-01-01T00:00:01Z"
+            }),
+            &private_packet,
+        );
+    }
+    let coordination_registry: serde_json::Value = serde_json::from_slice(
+        &fs::read(state_dir.join("coordination/registry.json")).expect("coordination registry"),
+    )
+    .expect("coordination registry json");
+    let main_one_claim = coordination_registry["claims"]
+        .as_array()
+        .expect("claims")
+        .iter()
+        .find(|claim| claim["session_id"] == "main-one" && claim["state"] == "active")
+        .expect("main one claim");
+    let main_one_claim_id = main_one_claim["claim_id"].as_str().expect("claim id");
+    rewrite_registry(&state_dir, |registry| {
+        registry["operations"]
+            .as_array_mut()
+            .expect("operations")
+            .push(json!({
+                "schema_version": "agent-session.operation-lease.v1",
+                "lease_id": "handoff-operation",
+                "session_id": "main-one",
+                "session_incarnation": "main-incarnation-one",
+                "claim_id": main_one_claim_id,
+                "claim_revision": 1,
+                "operation": "edit",
+                "targets": [],
+                "state": "active",
+                "revision": 1,
+                "started_at": "2030-01-01T00:00:00Z",
+                "expires_at": "9999-12-31T23:59:59Z",
+                "expires_at_epoch": i64::MAX,
+                "execution_token_digest": digest("handoff-operation-token"),
+                "activity_revision": 1,
+                "runtime_identity_digest": "runtime"
+            }));
+    });
+    let blocked = run_main_agent(
+        &checkout,
+        &[
+            "--state-dir",
+            state_dir.to_str().expect("state dir"),
+            "handoff",
+            "handoff-one",
+            "--to",
+            "main-two@main-incarnation-two",
+            "--if-revision",
+            "1",
+            "--idempotency-key",
+            "handoff-blocked-0001",
+            "--format",
+            "json",
+        ],
+        &[("AGENT_SESSION_CAPABILITY_FILE", &main_one_capability)],
+    );
+    assert_eq!(blocked.code, 65);
+    assert_eq!(
+        blocked.stdout_json()["error"]["code"],
+        "handoff-not-quiescent"
+    );
+    rewrite_registry(&state_dir, |registry| {
+        registry["operations"] = json!([]);
+    });
+    let handed_off = run_main_agent(
+        &checkout,
+        &[
+            "--state-dir",
+            state_dir.to_str().expect("state dir"),
+            "handoff",
+            "handoff-one",
+            "--to",
+            "main-two@main-incarnation-two",
+            "--if-revision",
+            "1",
+            "--idempotency-key",
+            "handoff-success-0001",
+            "--format",
+            "json",
+        ],
+        &[("AGENT_SESSION_CAPABILITY_FILE", &main_one_capability)],
+    );
+    assert_eq!(handed_off.code, 0, "stderr={}", handed_off.stderr_text());
+    assert_eq!(
+        data(&handed_off)["assignment"]["primary_manager"]["session_id"],
+        "main-two"
+    );
+
+    fs::rename(
+        state_dir.join("sessions/main-one"),
+        state_dir.join("stale-main-one"),
+    )
+    .expect("make prior manager stale");
+    let adopted = run_main_agent(
+        &checkout,
+        &[
+            "--state-dir",
+            state_dir.to_str().expect("state dir"),
+            "adopt",
+            "adopt-one",
+            "--if-revision",
+            "1",
+            "--idempotency-key",
+            "adopt-orphan-0001",
+            "--format",
+            "json",
+        ],
+        &[("AGENT_SESSION_CAPABILITY_FILE", &main_two_capability)],
+    );
+    assert_eq!(adopted.code, 0, "stderr={}", adopted.stderr_text());
+    assert_eq!(data(&adopted)["assignment"]["run_id"], "run-two");
+    assert_eq!(
+        data(&adopted)["assignment"]["primary_manager"]["session_id"],
+        "main-two"
+    );
 }

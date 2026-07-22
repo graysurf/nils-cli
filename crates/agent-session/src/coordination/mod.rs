@@ -230,6 +230,33 @@ pub(crate) fn run_message(context: &CliContext, args: cli::MessageArgs) -> i32 {
     render_coordination(command, format, result)
 }
 
+pub(crate) fn session_has_active_claim_or_operation(
+    context: &CliContext,
+    session_id: &str,
+    incarnation: &str,
+) -> Result<(bool, bool), CliError> {
+    let locked = lock_registry(context)?;
+    let active_claim_ids = locked
+        .registry
+        .claims
+        .iter()
+        .filter(|claim| {
+            claim.session_id == session_id
+                && claim.session_incarnation == incarnation
+                && claim.state == "active"
+        })
+        .map(|claim| claim.claim_id.as_str())
+        .collect::<std::collections::BTreeSet<_>>();
+    let has_operation = locked.registry.operations.iter().any(|operation| {
+        active_claim_ids.contains(operation.claim_id.as_str())
+            && matches!(
+                operation.state.as_str(),
+                "active" | "completing" | "reconcile_pending"
+            )
+    });
+    Ok((!active_claim_ids.is_empty(), has_operation))
+}
+
 fn render_coordination(
     command: &'static str,
     format: nils_common::cli_contract::OutputFormat,
