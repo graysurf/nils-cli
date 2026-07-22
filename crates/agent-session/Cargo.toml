@@ -15,6 +15,10 @@ path = "src/lib.rs"
 name = "agent-session"
 path = "src/main.rs"
 
+[[bin]]
+name = "main-agent"
+path = "src/main_agent_bin.rs"
+
 [dependencies]
 clap = { workspace = true }
 clap_complete = { workspace = true }

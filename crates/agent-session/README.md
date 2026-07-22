@@ -8,10 +8,10 @@ prompt, then return a short tmux attach command for the user to continue from Te
 
 ## Package vs binary name
 
-| Field        | Value                |
-| ------------ | -------------------- |
-| Package name | `nils-agent-session` |
-| Binary name  | `agent-session`      |
+| Field        | Value                         |
+| ------------ | ----------------------------- |
+| Package name | `nils-agent-session`          |
+| Binary names | `agent-session`, `main-agent` |
 
 ## Documentation map
 
@@ -23,6 +23,7 @@ prompt, then return a short tmux attach command for the user to continue from Te
 - Integrate stable schemas and state machines:
   [Serve API v1](docs/specs/serve-api-v1.md),
   [Session coordination v1](docs/specs/session-coordination-v1.md),
+  [Main Agent orchestration v1](docs/specs/main-agent-orchestration-v1.md),
   [turn-state contract](docs/turn-state-contract.md), and
   [activity stream v1](docs/specs/activity-stream-v1.md).
 - Browse every crate-local document by purpose:
@@ -54,7 +55,14 @@ agent-session command <id>
 agent-session attach <id>
 agent-session logs <id>
 agent-session delete <id>
+main-agent self show --format json
+main-agent rehydrate --format markdown
 ```
+
+`main-agent` is the typed, authenticated facade for durable Main Agent runs and
+managed-worker relationships. Private objective and assignment packets are
+read only through the current session capability; ordinary `agent-session`
+list/serve/activity projections expose bounded relationship metadata only.
 
 `send` pushes input to a live session: literal text (`--text` / `--text-stdin`) and/or repeatable named keys
 (`--key enter|escape|backspace|c-c|up|down|left|right|tab`), so codex/claude approval prompts and terminal editing

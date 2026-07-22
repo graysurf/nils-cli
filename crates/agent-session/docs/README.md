@@ -23,6 +23,9 @@ or integrating a specific subsystem.
   reset, flow control, and privacy contract.
 - [Session maintenance v1](specs/session-maintenance-v1.md): repair and
   maintenance operation contract.
+- [Main Agent orchestration v1](specs/main-agent-orchestration-v1.md): durable
+  run/assignment schemas, authenticated facade, rehydration, and relationship
+  lifecycle.
 
 ## Evidence and migration reports
 

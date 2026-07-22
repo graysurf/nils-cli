@@ -23,7 +23,7 @@ pub fn run(shell: CompletionShell) -> i32 {
     0
 }
 
-fn print_completion(generator: Shell, command: &mut clap::Command, bin_name: &str) {
+pub(crate) fn print_completion(generator: Shell, command: &mut clap::Command, bin_name: &str) {
     if matches!(generator, Shell::Bash) {
         let mut output = Vec::new();
         generate(generator, command, bin_name, &mut output);
