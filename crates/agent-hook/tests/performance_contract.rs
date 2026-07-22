@@ -63,7 +63,7 @@ fn owner_policy_with_rules(cardinality: usize) -> String {
 const TARGET_CARDINALITIES: [usize; 4] = [1, 16, 64, 256];
 
 #[test]
-fn codex_apply_patch_resolves_each_unique_checkout_once_and_reuses_it_for_liveness() {
+fn ordinary_worktree_target_binding_avoids_git_root_processes() {
     let fixture = Fixture::new(&owner_policy());
     init_repository(&fixture.root);
     let shim = fixture.root.join("shim");
@@ -113,8 +113,151 @@ fn codex_apply_patch_resolves_each_unique_checkout_once_and_reuses_it_for_livene
     eprintln!("Codex apply_patch root lookups: {observed:?}");
     assert_eq!(
         observed,
-        vec![(1, 1), (16, 1), (64, 1), (256, 1)],
-        "target binding must perform one root lookup per unique checkout and owner-liveness must reuse it"
+        vec![(1, 0), (16, 0), (64, 0), (256, 0)],
+        "ordinary worktree target binding must not spawn git rev-parse"
+    );
+}
+
+#[test]
+fn linked_worktree_target_binding_avoids_git_root_processes() {
+    let fixture = Fixture::new(ALLOW_POLICY);
+    let primary = fixture.root.join("primary");
+    let linked = fixture.root.join("linked");
+    fs::create_dir(&primary).expect("primary checkout");
+    nils_test_support::git::init_repo_at_with(
+        &primary,
+        nils_test_support::git::InitRepoOptions::new().with_initial_commit(),
+    );
+    nils_test_support::git::worktree_add_branch(&primary, &linked, "linked-test");
+
+    let shim = fixture.root.join("shim");
+    fs::create_dir(&shim).expect("shim dir");
+    let log = fixture.root.join("git-root-lookups.log");
+    fs::write(&log, "").expect("lookup log");
+    let git = shim.join("git");
+    fs::write(
+        &git,
+        b"#!/bin/sh\ncase \"$*\" in\n  *\"rev-parse --show-toplevel\"*) printf 'root\\n' >> \"$AGENT_HOOK_GIT_ROOT_LOG\" ;;\nesac\nexec \"$AGENT_HOOK_REAL_GIT\" \"$@\"\n",
+    )
+    .expect("git shim");
+    fs::set_permissions(&git, fs::Permissions::from_mode(0o755)).expect("git shim mode");
+    let real_git = resolve_program("git");
+    let path = prepend_path(&shim);
+    let log_arg = log.to_string_lossy().into_owned();
+    let real_git_arg = real_git.to_string_lossy().into_owned();
+    let payload = apply_patch_payload(&linked, 1);
+    let output = fixture.run_with_env(
+        &["dispatch", "--product", "codex", "--format", "json"],
+        Some(&payload),
+        &[
+            ("PATH", path.as_str()),
+            ("AGENT_HOOK_REAL_GIT", real_git_arg.as_str()),
+            ("AGENT_HOOK_GIT_ROOT_LOG", log_arg.as_str()),
+        ],
+    );
+
+    assert_eq!(output.code, 0, "stderr={}", output.stderr_text());
+    assert_eq!(
+        fs::read_to_string(&log)
+            .expect("lookup log")
+            .lines()
+            .count(),
+        0,
+        "linked worktree target binding must not spawn git rev-parse"
+    );
+}
+
+#[test]
+fn separate_git_directory_retains_external_git_root_fallback() {
+    let fixture = Fixture::new(ALLOW_POLICY);
+    let checkout = fixture.root.join("separate-checkout");
+    let git_dir = fixture.root.join("separate-git-dir");
+    let status = Command::new(resolve_program("git"))
+        .args(["init", "-q", "--separate-git-dir"])
+        .arg(&git_dir)
+        .arg(&checkout)
+        .status()
+        .expect("git init with separate git dir");
+    assert!(status.success());
+
+    let shim = fixture.root.join("shim");
+    fs::create_dir(&shim).expect("shim dir");
+    let log = fixture.root.join("git-root-lookups.log");
+    fs::write(&log, "").expect("lookup log");
+    let git = shim.join("git");
+    fs::write(
+        &git,
+        b"#!/bin/sh\ncase \"$*\" in\n  *\"rev-parse --show-toplevel\"*) printf 'root\\n' >> \"$AGENT_HOOK_GIT_ROOT_LOG\" ;;\nesac\nexec \"$AGENT_HOOK_REAL_GIT\" \"$@\"\n",
+    )
+    .expect("git shim");
+    fs::set_permissions(&git, fs::Permissions::from_mode(0o755)).expect("git shim mode");
+    let real_git = resolve_program("git");
+    let path = prepend_path(&shim);
+    let log_arg = log.to_string_lossy().into_owned();
+    let real_git_arg = real_git.to_string_lossy().into_owned();
+    let payload = apply_patch_payload(&checkout, 1);
+    let output = fixture.run_with_env(
+        &["dispatch", "--product", "codex", "--format", "json"],
+        Some(&payload),
+        &[
+            ("PATH", path.as_str()),
+            ("AGENT_HOOK_REAL_GIT", real_git_arg.as_str()),
+            ("AGENT_HOOK_GIT_ROOT_LOG", log_arg.as_str()),
+        ],
+    );
+
+    assert_eq!(output.code, 0, "stderr={}", output.stderr_text());
+    assert_eq!(
+        fs::read_to_string(&log)
+            .expect("lookup log")
+            .lines()
+            .count(),
+        1,
+        "ambiguous but valid repository layouts must retain the Git fallback"
+    );
+}
+
+#[test]
+fn invalid_git_directory_retains_external_git_root_fallback() {
+    let fixture = Fixture::new(ALLOW_POLICY);
+    let checkout = fixture.root.join("invalid-checkout");
+    fs::create_dir(&checkout).expect("checkout");
+    fs::create_dir(checkout.join(".git")).expect("invalid .git directory");
+
+    let shim = fixture.root.join("shim");
+    fs::create_dir(&shim).expect("shim dir");
+    let log = fixture.root.join("git-root-lookups.log");
+    fs::write(&log, "").expect("lookup log");
+    let git = shim.join("git");
+    fs::write(
+        &git,
+        b"#!/bin/sh\ncase \"$*\" in\n  *\"rev-parse --show-toplevel\"*) printf 'root\\n' >> \"$AGENT_HOOK_GIT_ROOT_LOG\" ;;\nesac\nexec \"$AGENT_HOOK_REAL_GIT\" \"$@\"\n",
+    )
+    .expect("git shim");
+    fs::set_permissions(&git, fs::Permissions::from_mode(0o755)).expect("git shim mode");
+    let real_git = resolve_program("git");
+    let path = prepend_path(&shim);
+    let log_arg = log.to_string_lossy().into_owned();
+    let real_git_arg = real_git.to_string_lossy().into_owned();
+    let payload = apply_patch_payload(&checkout, 1);
+    let output = fixture.run_with_env(
+        &["dispatch", "--product", "codex", "--format", "json"],
+        Some(&payload),
+        &[
+            ("PATH", path.as_str()),
+            ("AGENT_HOOK_REAL_GIT", real_git_arg.as_str()),
+            ("AGENT_HOOK_GIT_ROOT_LOG", log_arg.as_str()),
+        ],
+    );
+
+    assert_eq!(output.code, 0, "stderr={}", output.stderr_text());
+    assert_eq!(
+        fs::read_to_string(&log)
+            .expect("lookup log")
+            .lines()
+            .count(),
+        2,
+        "an invalid ordinary .git directory must retain Git's uncached not-a-repository decision"
     );
 }
 
