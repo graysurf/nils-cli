@@ -715,6 +715,74 @@ timeout = 5
 }
 
 #[test]
+fn claude_second_setup_preview_preserves_converged_provider_bytes_with_trailing_newline() {
+    let fixture = Fixture::new(POLICY);
+    let applied = fixture.run(
+        &[
+            "setup",
+            "--product",
+            "claude",
+            "--apply",
+            "--format",
+            "json",
+        ],
+        None,
+    );
+    assert_eq!(
+        applied.code,
+        0,
+        "stdout={} stderr={}",
+        applied.stdout_text(),
+        applied.stderr_text()
+    );
+
+    let settings = fixture.home.join(".claude/settings.json");
+    let mut formatted = fs::read(&settings).expect("installed settings");
+    formatted.push(b'\n');
+    fs::write(&settings, &formatted).expect("settings with trailing newline");
+
+    let second_preview = fixture.run(
+        &[
+            "setup",
+            "--product",
+            "claude",
+            "--dry-run",
+            "--format",
+            "json",
+        ],
+        None,
+    );
+    assert_eq!(
+        second_preview.code,
+        0,
+        "stdout={} stderr={}",
+        second_preview.stdout_text(),
+        second_preview.stderr_text()
+    );
+    let result = &second_preview.stdout_json()["data"];
+    assert_eq!(result["status"], "converged");
+    assert_eq!(
+        result["owned_count"].as_u64(),
+        Some(
+            result["owned_groups"]
+                .as_array()
+                .expect("owned groups")
+                .len() as u64
+        )
+    );
+    assert_eq!(result[concat!("leg", "acy_residue_count")], 0);
+    assert_eq!(
+        result["would_change"], false,
+        "formatting-only provider bytes must not trigger a setup rewrite"
+    );
+    assert_eq!(
+        fs::read(&settings).expect("settings after second preview"),
+        formatted,
+        "second setup preview must preserve converged provider bytes"
+    );
+}
+
+#[test]
 fn claude_setup_preserves_unrelated_hooks_and_migrates_grouped_compatibility_handlers() {
     let fixture = Fixture::new(POLICY);
     let claude = fixture.home.join(".claude");
