@@ -887,6 +887,9 @@ fn build_json_plan(
     if action.is_remove() && owned_before == 0 && legacy_before == 0 {
         candidate = original.clone();
     }
+    if !action.is_remove() && owned_before == groups.len() && legacy_before == 0 && !drifted {
+        candidate = original.clone();
+    }
     validate_candidate_size(candidate.as_deref())?;
     let original_mode = file_mode(&path)?;
     Ok(Plan {
