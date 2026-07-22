@@ -4273,6 +4273,315 @@ fn main_agent_worker_self_checkpoint_and_collaborator_visibility_are_durable() {
     );
     assert_eq!(replay.code, 0, "stderr={}", replay.stderr_text());
     assert_eq!(replay.stdout_text(), checkpointed.stdout_text());
+
+    let submitted_checkpoint_path = tmp.path().join("worker-submitted-checkpoint.json");
+    write_private_json(
+        &submitted_checkpoint_path,
+        &json!({
+            "schema_version": "main-agent.checkpoint-input.v1",
+            "summary": "Worker submitted the bounded assignment",
+            "next_action": "Await Main Agent acceptance",
+            "state": "submitted",
+            "result_summary": "Bounded assignment complete",
+            "blocker_summary": null
+        }),
+    );
+    let submitted = run_main_agent(
+        &checkout,
+        &[
+            "--state-dir",
+            state_dir.to_str().expect("state dir"),
+            "checkpoint",
+            "--file",
+            submitted_checkpoint_path
+                .to_str()
+                .expect("submitted checkpoint path"),
+            "--if-revision",
+            "4",
+            "--idempotency-key",
+            "worker-checkpoint-submitted-0001",
+            "--format",
+            "json",
+        ],
+        &[("AGENT_SESSION_CAPABILITY_FILE", &worker_capability)],
+    );
+    assert_eq!(submitted.code, 0, "stderr={}", submitted.stderr_text());
+    assert_eq!(data(&submitted)["assignment"]["state"], "submitted");
+    assert_eq!(data(&submitted)["assignment"]["revision"], 5);
+
+    let resumed_incarnation = "worker-incarnation-two";
+    let resumed_capability = "worker-private-capability-material-0000000002";
+    let worker_session_path = state_dir.join("sessions/worker-one/session.json");
+    let mut worker_session: serde_json::Value =
+        serde_json::from_slice(&fs::read(&worker_session_path).expect("worker session record"))
+            .expect("worker session json");
+    worker_session["runtime"]["launch_id"] = json!(resumed_incarnation);
+    write_private_json(&worker_session_path, &worker_session);
+    let worker_coordination_dir = state_dir.join("sessions/worker-one/coordination");
+    let resumed_capability_file =
+        worker_coordination_dir.join(format!("capability-{}", digest(resumed_incarnation)));
+    fs::write(&resumed_capability_file, resumed_capability).expect("resumed capability");
+    fs::set_permissions(&resumed_capability_file, fs::Permissions::from_mode(0o600))
+        .expect("resumed capability mode");
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_secs();
+    fs::write(
+        worker_coordination_dir.join("heartbeat"),
+        format!("{resumed_incarnation}:{now}\n"),
+    )
+    .expect("resumed heartbeat");
+    rewrite_registry(&state_dir, |registry| {
+        registry["brokers"]["worker-one"]["incarnation"] = json!(resumed_incarnation);
+        registry["brokers"]["worker-one"]["capability_digest"] = json!(digest(resumed_capability));
+        registry["brokers"]["worker-one"]["heartbeat_epoch"] = json!(now);
+        for claim in registry["claims"].as_array_mut().expect("claims") {
+            if claim["session_id"] == "worker-one" {
+                claim["state"] = json!("released");
+            }
+        }
+    });
+    seed_active_claim(
+        &state_dir,
+        "worker-one",
+        resumed_incarnation,
+        "worker-claim-two",
+    );
+    let resumed_capability_arg = resumed_capability_file.to_string_lossy().into_owned();
+
+    let resumed_self = run_main_agent(
+        &checkout,
+        &[
+            "--state-dir",
+            state_dir.to_str().expect("state dir"),
+            "self",
+            "show",
+            "--format",
+            "json",
+        ],
+        &[("AGENT_SESSION_CAPABILITY_FILE", &resumed_capability_arg)],
+    );
+    assert_eq!(
+        resumed_self.code,
+        0,
+        "stderr={}",
+        resumed_self.stderr_text()
+    );
+    assert_eq!(data(&resumed_self)["role"], "worker");
+    assert_eq!(data(&resumed_self)["rebind_required"], true);
+
+    let resumed_list = run(
+        &checkout,
+        &[
+            "--state-dir",
+            state_dir.to_str().expect("state dir"),
+            "list",
+            "--format",
+            "json",
+        ],
+    );
+    assert_eq!(
+        resumed_list.code,
+        0,
+        "stderr={}",
+        resumed_list.stderr_text()
+    );
+    let resumed_sessions = data(&resumed_list);
+    let resumed_worker = resumed_sessions
+        .as_array()
+        .expect("session list")
+        .iter()
+        .find(|session| session["id"] == "worker-one")
+        .expect("resumed worker session");
+    assert_eq!(resumed_worker["orchestration"]["role"], "worker");
+    assert_eq!(
+        resumed_worker["orchestration"]["assignment_id"],
+        "assignment-one"
+    );
+    assert_eq!(
+        resumed_worker["orchestration"]["relationship_state"],
+        "rebind_required"
+    );
+
+    let rebound = run_main_agent(
+        &checkout,
+        &[
+            "--state-dir",
+            state_dir.to_str().expect("state dir"),
+            "checkpoint",
+            "--file",
+            checkpoint_path.to_str().expect("checkpoint path"),
+            "--if-revision",
+            "5",
+            "--idempotency-key",
+            "worker-checkpoint-rebind-0001",
+            "--format",
+            "json",
+        ],
+        &[("AGENT_SESSION_CAPABILITY_FILE", &resumed_capability_arg)],
+    );
+    assert_eq!(rebound.code, 0, "stderr={}", rebound.stderr_text());
+    assert_eq!(data(&rebound)["assignment"]["revision"], 6);
+    assert_eq!(
+        data(&rebound)["assignment"]["state"],
+        "submitted",
+        "continuity rebind must not regress a submitted assignment"
+    );
+    assert_eq!(
+        data(&rebound)["assignment"]["worker"]["session_incarnation"],
+        resumed_incarnation
+    );
+
+    let rebound_self = run_main_agent(
+        &checkout,
+        &[
+            "--state-dir",
+            state_dir.to_str().expect("state dir"),
+            "self",
+            "show",
+            "--format",
+            "json",
+        ],
+        &[("AGENT_SESSION_CAPABILITY_FILE", &resumed_capability_arg)],
+    );
+    assert_eq!(
+        rebound_self.code,
+        0,
+        "stderr={}",
+        rebound_self.stderr_text()
+    );
+    assert_eq!(data(&rebound_self)["rebind_required"], false);
+
+    let rebound_list = run(
+        &checkout,
+        &[
+            "--state-dir",
+            state_dir.to_str().expect("state dir"),
+            "list",
+            "--format",
+            "json",
+        ],
+    );
+    assert_eq!(
+        rebound_list.code,
+        0,
+        "stderr={}",
+        rebound_list.stderr_text()
+    );
+    let rebound_sessions = data(&rebound_list);
+    let rebound_worker = rebound_sessions
+        .as_array()
+        .expect("session list")
+        .iter()
+        .find(|session| session["id"] == "worker-one")
+        .expect("rebound worker session");
+    assert_eq!(rebound_worker["orchestration"]["role"], "worker");
+    assert_eq!(
+        rebound_worker["orchestration"]["relationship_state"],
+        "cross_managed"
+    );
+
+    let accepted = run_main_agent(
+        &checkout,
+        &[
+            "--state-dir",
+            state_dir.to_str().expect("state dir"),
+            "worker",
+            "accept",
+            "assignment-one",
+            "--if-revision",
+            "6",
+            "--idempotency-key",
+            "worker-accept-rebound-0001",
+            "--format",
+            "json",
+        ],
+        &[("AGENT_SESSION_CAPABILITY_FILE", &main_capability)],
+    );
+    assert_eq!(accepted.code, 0, "stderr={}", accepted.stderr_text());
+    assert_eq!(data(&accepted)["assignment"]["state"], "accepted");
+    assert_eq!(data(&accepted)["assignment"]["revision"], 7);
+
+    let released = run_main_agent(
+        &checkout,
+        &[
+            "--state-dir",
+            state_dir.to_str().expect("state dir"),
+            "worker",
+            "release",
+            "assignment-one",
+            "--if-revision",
+            "7",
+            "--idempotency-key",
+            "worker-release-rebound-0001",
+            "--format",
+            "json",
+        ],
+        &[("AGENT_SESSION_CAPABILITY_FILE", &main_capability)],
+    );
+    assert_eq!(released.code, 0, "stderr={}", released.stderr_text());
+    assert_eq!(data(&released)["assignment"]["state"], "released");
+    assert_eq!(data(&released)["assignment"]["revision"], 8);
+    assert_eq!(
+        data(&released)["assignment"]["worker"]["session_incarnation"],
+        resumed_incarnation
+    );
+
+    rewrite_registry(&state_dir, |registry| {
+        for claim in registry["claims"].as_array_mut().expect("claims") {
+            if claim["session_id"] == "worker-one" {
+                claim["state"] = json!("released");
+            }
+        }
+    });
+    let mut deletable_worker: serde_json::Value = serde_json::from_slice(
+        &fs::read(&worker_session_path).expect("rebound worker session record"),
+    )
+    .expect("rebound worker session json");
+    deletable_worker["tmux_runtime_never_launched"] = json!(resumed_incarnation);
+    write_private_json(&worker_session_path, &deletable_worker);
+    let (tmux_bin, tmux_log) = fake_tmux(tmp.path());
+    let tmux_arg = tmux_bin.to_string_lossy().into_owned();
+    let tmux_log_arg = tmux_log.to_string_lossy().into_owned();
+    let deleted = run_main_agent(
+        &checkout,
+        &[
+            "--state-dir",
+            state_dir.to_str().expect("state dir"),
+            "worker",
+            "delete",
+            "assignment-one",
+            "--if-revision",
+            "8",
+            "--idempotency-key",
+            "worker-delete-rebound-0001",
+            "--format",
+            "json",
+        ],
+        &[
+            ("AGENT_SESSION_CAPABILITY_FILE", &main_capability),
+            ("AGENT_SESSION_TMUX_BIN", &tmux_arg),
+            ("AGENT_SESSION_FAKE_TMUX_LOG", &tmux_log_arg),
+            ("AGENT_SESSION_FAKE_TMUX_ABSENT", "1"),
+        ],
+    );
+    assert_eq!(deleted.code, 0, "stderr={}", deleted.stderr_text());
+    assert_eq!(data(&deleted)["assignment"]["revision"], 9);
+    assert_eq!(data(&deleted)["assignment"]["state"], "released");
+    assert_eq!(
+        data(&deleted)["assignment"]["worker"]["session_incarnation"],
+        resumed_incarnation
+    );
+    assert_eq!(data(&deleted)["deleted"], true);
+    assert_eq!(data(&deleted)["cleanup_pending"], false);
+    assert!(!worker_session_path.exists());
+    assert!(
+        tmux_calls(&tmux_log)
+            .iter()
+            .all(|call| call.first().is_none_or(|arg| arg != "kill-session")),
+        "the exact rebound record is proven never launched and needs no tmux kill"
+    );
 }
 
 #[test]

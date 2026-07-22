@@ -44,6 +44,13 @@ references, and worker counts. It never contains packet digests, packet bodies,
 capabilities, prompts, transcripts, mailbox bodies, raw private paths, tokens,
 environment values, tmux IDs, or PIDs.
 
+Current relationships retain their exact incarnation identity. A resumed
+worker with the same session ID and original `created_at` remains visible as
+`role: "worker"` with `relationship_state: "rebind_required"` until its
+authenticated, revision-fenced checkpoint updates the durable worker
+reference. This continuity projection is read-only metadata and grants no
+claim, operation, or repository authority.
+
 An authenticated `main-agent self show` or `rehydrate` may resolve the caller's
 own private objective or assignment packet. A worker cannot resolve sibling
 packets. Rehydration separates deterministic `durable` data from clock/liveness
@@ -77,7 +84,12 @@ Every state mutation requires an active caller-owned claim, an expected
 revision/absence fence, and an idempotency key. Read-only discovery does not.
 Worker launch returns `pending-worker-checkpoint` until authenticated worker
 self-check/checkpoint evidence advances the assignment; transport is never
-reported as acceptance. Accept/release are explicit Main Agent transitions.
+reported as acceptance. After a provider resume, a revision-fenced checkpoint
+from the authenticated worker may atomically rebind the assignment to its new
+incarnation only when the session ID and original `created_at` still match and
+the prior incarnation is no longer live. A worker checkpoint cannot regress a
+`submitted`, `accepted`, `released`, or `cancelled` assignment to a pre-terminal
+worker state. Accept/release are explicit Main Agent transitions.
 
 Collaborators and bounded borrowers are visible routing metadata, not write
 authority. Borrow expiry does not change primary ownership. Handoff requires a
