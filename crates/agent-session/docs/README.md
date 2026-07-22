@@ -8,6 +8,9 @@ or integrating a specific subsystem.
 
 - [Work coordination](runbooks/work-coordination.md): coordination modes,
   declared paths, authority boundaries, advisory flow, and enforce flow.
+- [Main Agent orchestration](runbooks/main-agent-orchestration.md): complete
+  operator lifecycle, input packets, retry fences, interactive worker
+  acceptance, relationship transfer, recovery, and cleanup.
 - [Serve daemon operations](runbooks/serve-daemon.md): safe startup,
   authentication boundaries, HTTP session creation, and restart survival.
 

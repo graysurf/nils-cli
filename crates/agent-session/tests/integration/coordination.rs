@@ -486,6 +486,66 @@ fn coordination_help_exposes_closed_work_context_and_mailbox_command_families() 
 }
 
 #[test]
+fn main_agent_help_documents_safe_lifecycle_revision_fences_and_retry_keys() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+
+    let root = run_main_agent(tmp.path(), &["--help"], &[]);
+    assert_eq!(root.code, 0, "stderr={}", root.stderr_text());
+    let root_help = root.stdout_text();
+    for lifecycle_step in [
+        "SAFE LIFECYCLE",
+        "init -> rehydrate/status -> worker start -> worker self/checkpoint",
+        "accept -> release -> delete -> close",
+    ] {
+        assert!(
+            root_help.contains(lifecycle_step),
+            "main-agent root help omitted {lifecycle_step:?}: {root_help}"
+        );
+    }
+
+    for (args, expected_guidance) in [
+        (
+            &["init", "--help"][..],
+            &[
+                "absence fence",
+                "same idempotency key",
+                "same logical request",
+            ][..],
+        ),
+        (
+            &["checkpoint", "--help"][..],
+            &["expected current revision", "same idempotency key"][..],
+        ),
+        (
+            &["worker", "start", "--help"][..],
+            &["expected current run revision", "same idempotency key"][..],
+        ),
+        (
+            &["worker", "accept", "--help"][..],
+            &[
+                "expected current assignment revision",
+                "same idempotency key",
+            ][..],
+        ),
+    ] {
+        let output = run_main_agent(tmp.path(), args, &[]);
+        assert_eq!(
+            output.code,
+            0,
+            "args={args:?} stderr={}",
+            output.stderr_text()
+        );
+        let help = output.stdout_text().to_ascii_lowercase();
+        for guidance in expected_guidance {
+            assert!(
+                help.contains(guidance),
+                "main-agent {args:?} help omitted {guidance:?}: {help}"
+            );
+        }
+    }
+}
+
+#[test]
 fn advisory_presence_defaults_for_unclaimed_sessions_and_classifies_overlap() {
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let state_dir = tmp.path().join("state");

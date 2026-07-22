@@ -18,6 +18,8 @@ prompt, then return a short tmux attach command for the user to continue from Te
 - Start here for positioning, common commands, and links: this README.
 - Operate collision awareness and work permissions:
   [Work coordination](docs/runbooks/work-coordination.md).
+- Run durable Main Agent and interactive worker lifecycles:
+  [Main Agent orchestration](docs/runbooks/main-agent-orchestration.md).
 - Deploy the HTTP/WebSocket control plane:
   [Serve daemon operations](docs/runbooks/serve-daemon.md).
 - Integrate stable schemas and state machines:
@@ -55,14 +57,24 @@ agent-session command <id>
 agent-session attach <id>
 agent-session logs <id>
 agent-session delete <id>
+main-agent init --packet-file objective.json --if-absent --idempotency-key init-001 --format json
 main-agent self show --format json
 main-agent rehydrate --format markdown
+main-agent status --format json
+main-agent worker start --assignment-file assignment.json --if-run-revision 1 --idempotency-key start-001 --format json
+main-agent worker list --format json
+main-agent checkpoint --file checkpoint.json --if-revision 2 --idempotency-key checkpoint-001 --format json
 ```
 
 `main-agent` is the typed, authenticated facade for durable Main Agent runs and
 managed-worker relationships. Private objective and assignment packets are
 read only through the current session capability; ordinary `agent-session`
 list/serve/activity projections expose bounded relationship metadata only.
+Follow the [Main Agent orchestration runbook](docs/runbooks/main-agent-orchestration.md)
+for packet examples, revision and retry rules, interactive worker acceptance,
+resume/rebind, relationship transfers, and terminal cleanup. In particular,
+`worker start` is transport-only until the interactive worker is visible,
+attachable, authenticated, and checkpointed.
 
 `send` pushes input to a live session: literal text (`--text` / `--text-stdin`) and/or repeatable named keys
 (`--key enter|escape|backspace|c-c|up|down|left|right|tab`), so codex/claude approval prompts and terminal editing
