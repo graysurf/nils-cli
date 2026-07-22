@@ -771,7 +771,7 @@ fn spawn_heartbeat_sidecar(
     generation: u64,
     capability_file: &std::path::Path,
 ) -> Result<(), CliError> {
-    let executable = std::env::current_exe().map_err(|_| unavailable())?;
+    let executable = crate::resolve_agent_session_executable().map_err(|_| unavailable())?;
     let mut command = Command::new(executable);
     command
         .arg("--state-dir")
