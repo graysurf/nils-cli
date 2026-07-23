@@ -4944,12 +4944,26 @@ fn main_agent_worker_wait_transitions_times_out_and_validates_target() {
     let transitioned = run_main_agent(
         &checkout,
         &[
-            "--state-dir", state, "worker", "wait", "assignment-one", "--until", "submitted",
-            "--timeout", "5s", "--format", "json",
+            "--state-dir",
+            state,
+            "worker",
+            "wait",
+            "assignment-one",
+            "--until",
+            "submitted",
+            "--timeout",
+            "5s",
+            "--format",
+            "json",
         ],
         &[("AGENT_SESSION_CAPABILITY_FILE", &main_capability)],
     );
-    assert_eq!(transitioned.code, 0, "stderr={}", transitioned.stderr_text());
+    assert_eq!(
+        transitioned.code,
+        0,
+        "stderr={}",
+        transitioned.stderr_text()
+    );
     assert_eq!(data(&transitioned)["outcome"], "transitioned");
     assert_eq!(data(&transitioned)["until"], "submitted");
     assert_eq!(
@@ -4962,8 +4976,17 @@ fn main_agent_worker_wait_transitions_times_out_and_validates_target() {
     let any = run_main_agent(
         &checkout,
         &[
-            "--state-dir", state, "worker", "wait", "--any", "--until", "submitted", "--timeout",
-            "5s", "--format", "json",
+            "--state-dir",
+            state,
+            "worker",
+            "wait",
+            "--any",
+            "--until",
+            "submitted",
+            "--timeout",
+            "5s",
+            "--format",
+            "json",
         ],
         &[("AGENT_SESSION_CAPABILITY_FILE", &main_capability)],
     );
@@ -4975,8 +4998,17 @@ fn main_agent_worker_wait_transitions_times_out_and_validates_target() {
     let timed_out = run_main_agent(
         &checkout,
         &[
-            "--state-dir", state, "worker", "wait", "assignment-one", "--until", "terminal",
-            "--timeout", "1s", "--format", "json",
+            "--state-dir",
+            state,
+            "worker",
+            "wait",
+            "assignment-one",
+            "--until",
+            "terminal",
+            "--timeout",
+            "1s",
+            "--format",
+            "json",
         ],
         &[("AGENT_SESSION_CAPABILITY_FILE", &main_capability)],
     );
@@ -4988,8 +5020,17 @@ fn main_agent_worker_wait_transitions_times_out_and_validates_target() {
     let missing = run_main_agent(
         &checkout,
         &[
-            "--state-dir", state, "worker", "wait", "missing-assignment", "--until", "submitted",
-            "--timeout", "1s", "--format", "json",
+            "--state-dir",
+            state,
+            "worker",
+            "wait",
+            "missing-assignment",
+            "--until",
+            "submitted",
+            "--timeout",
+            "1s",
+            "--format",
+            "json",
         ],
         &[("AGENT_SESSION_CAPABILITY_FILE", &main_capability)],
     );
@@ -5003,11 +5044,22 @@ fn main_agent_worker_wait_transitions_times_out_and_validates_target() {
     let no_target = run_main_agent(
         &checkout,
         &[
-            "--state-dir", state, "worker", "wait", "--until", "submitted", "--timeout", "1s",
-            "--format", "json",
+            "--state-dir",
+            state,
+            "worker",
+            "wait",
+            "--until",
+            "submitted",
+            "--timeout",
+            "1s",
+            "--format",
+            "json",
         ],
         &[("AGENT_SESSION_CAPABILITY_FILE", &main_capability)],
     );
     assert_ne!(no_target.code, 0);
-    assert_eq!(no_target.stdout_json()["error"]["code"], "worker-wait-target");
+    assert_eq!(
+        no_target.stdout_json()["error"]["code"],
+        "worker-wait-target"
+    );
 }

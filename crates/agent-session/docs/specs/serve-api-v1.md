@@ -263,10 +263,15 @@ is no second state model.
   background projection, and discards message content after in-memory
   reduction. Projection loss disables an existing claim without interrupting
   the TUI transport. Direct TUI thread/turn creation is launch-fenced against
-  auto-resume before forwarding; a busy state lock rejects only that request so
-  the user can retry. Control-plane Enter injection (either a named Enter key
-  or the raw CR/LF frame emitted by an attached terminal) already performs the
-  same cancellation while holding the lifecycle lock. A live proxy advertises
+  auto-resume before forwarding. A direct turn waits up to one second for
+  transient state-lock contention before returning Busy; create-bootstrap and
+  sender-owned manual-input gates remain non-blocking, and persistent
+  contention still rejects only that request. This keeps an immediate
+  post-interrupt turn from receiving a fatal transient RPC error without
+  bypassing lifecycle authorization. Control-plane Enter injection (either a
+  named Enter key or the raw CR/LF frame emitted by an attached terminal)
+  already performs the same cancellation while holding the lifecycle lock. A
+  live proxy advertises
   this coordination capability with a private, launch-bound, file-locked
   marker; older live proxies reject HTTP submission, while attached input
   disconnects without mutating auto-resume and requires session recreation.

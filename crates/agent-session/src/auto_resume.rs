@@ -358,9 +358,42 @@ pub(crate) fn try_cancel_for_manual_input_for_runtime(
     expected_launch_id: &str,
     now: &str,
 ) -> Result<ManualInputCancelOutcome, CliError> {
+    cancel_for_manual_input_for_runtime(context, id, expected_launch_id, now, None)
+}
+
+pub(crate) fn cancel_for_manual_input_for_runtime_with_timeout(
+    context: &CliContext,
+    id: &str,
+    expected_launch_id: &str,
+    now: &str,
+) -> Result<ManualInputCancelOutcome, CliError> {
+    cancel_for_manual_input_for_runtime(
+        context,
+        id,
+        expected_launch_id,
+        now,
+        Some(PROTOCOL_STATE_LOCK_TIMEOUT),
+    )
+}
+
+fn cancel_for_manual_input_for_runtime(
+    context: &CliContext,
+    id: &str,
+    expected_launch_id: &str,
+    now: &str,
+    timeout: Option<Duration>,
+) -> Result<ManualInputCancelOutcome, CliError> {
     let observed = load_session_record(context, id)?;
     let canonical_id = observed.id.clone();
-    let Some(_lock) = try_acquire_session_record_lock(context, &canonical_id)? else {
+    let lock = match timeout {
+        Some(timeout) => match acquire_session_record_lock_timed(context, &canonical_id, timeout) {
+            Ok(lock) => Some(lock),
+            Err(error) if error.code() == "session-record-lock-timeout" => None,
+            Err(error) => return Err(error),
+        },
+        None => try_acquire_session_record_lock(context, &canonical_id)?,
+    };
+    let Some(_lock) = lock else {
         return Ok(ManualInputCancelOutcome::Busy);
     };
     let mut record = load_session_record(context, &canonical_id)?;

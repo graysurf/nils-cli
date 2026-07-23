@@ -3439,13 +3439,24 @@ async fn cancel_before_tui_mutation(
         .runtime
         .as_ref()
         .map(|runtime| runtime.launch_id.clone())?;
+    let wait_for_transient_lock = bootstrap_gate.is_none() && manual_input_gate.is_none();
     let cancellation = tokio::task::spawn_blocking(move || {
-        crate::auto_resume::try_cancel_for_manual_input_for_runtime(
-            &cancellation_context,
-            &id,
-            &launch_id,
-            &Timestamp::now().to_string(),
-        )
+        let now = Timestamp::now().to_string();
+        if wait_for_transient_lock {
+            crate::auto_resume::cancel_for_manual_input_for_runtime_with_timeout(
+                &cancellation_context,
+                &id,
+                &launch_id,
+                &now,
+            )
+        } else {
+            crate::auto_resume::try_cancel_for_manual_input_for_runtime(
+                &cancellation_context,
+                &id,
+                &launch_id,
+                &now,
+            )
+        }
     })
     .await
     .ok()
@@ -8102,6 +8113,86 @@ printf '%s\n' "{\"schema_version\":\"agent-session.codex-auth-broker.v1\",\"acco
         .await
         .unwrap();
         assert_eq!(receive_json(&mut tui).await["id"], 2);
+        server.await.unwrap();
+        proxy.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn transient_busy_manual_cancellation_waits_and_forwards_turn() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let upstream = tmp.path().join("transient-busy.sock");
+        let listener = tokio::net::UnixListener::bind(&upstream).unwrap();
+        let context = CliContext {
+            state_dir: tmp.path().join("state"),
+            host: None,
+        };
+        let record = record_with_runtime("transient-busy-input", &upstream);
+        fs::create_dir_all(crate::session_dir(&context, &record.id)).unwrap();
+        crate::write_session_record(&context, &record).unwrap();
+        bind_thread(&record, "thread-a").unwrap();
+        let proxy_args = crate::cli::CodexAppServerProxyArgs {
+            id: record.id.clone(),
+            upstream: upstream.clone(),
+            listen: upstream.with_extension("proxy"),
+        };
+        let proxy_context = context.clone();
+        let proxy = tokio::spawn(async move { run_proxy_session(proxy_context, proxy_args).await });
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let interrupt = receive_json(&mut socket).await;
+            assert_eq!(interrupt["method"], "turn/interrupt");
+            respond(&mut socket, &interrupt, json!({ "ok": true })).await;
+            let turn = receive_json(&mut socket).await;
+            assert_eq!(turn["method"], "turn/start");
+            respond(
+                &mut socket,
+                &turn,
+                json!({ "turn": { "id": "next-turn", "status": "inProgress" } }),
+            )
+            .await;
+            socket.close(None).await.unwrap();
+        });
+        let proxy_stream = connect_socket(&upstream.with_extension("proxy"))
+            .await
+            .unwrap();
+        let (mut tui, _) = tokio_tungstenite::client_async("ws://localhost", proxy_stream)
+            .await
+            .unwrap();
+        tui.send(Message::Text(
+            json!({
+                "id": 1,
+                "method": "turn/interrupt",
+                "params": { "threadId": "thread-a", "turnId": "current-turn" }
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .unwrap();
+        assert_eq!(receive_json(&mut tui).await["id"], 1);
+
+        let lock = crate::acquire_session_record_lock(&context, &record.id).unwrap();
+        let release_lock = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            drop(lock);
+        });
+        tui.send(Message::Text(
+            json!({
+                "id": 2,
+                "method": "turn/start",
+                "params": { "threadId": "thread-a", "input": [] }
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .unwrap();
+        let response = receive_json(&mut tui).await;
+        assert_eq!(response["id"], 2);
+        assert_eq!(response["result"]["turn"]["id"], "next-turn");
+
+        release_lock.join().unwrap();
         server.await.unwrap();
         proxy.await.unwrap().unwrap();
     }
