@@ -794,17 +794,17 @@ fn send_authenticated(
         body_bytes: body.len(),
         body,
     };
-    let outcome = json_value(metadata(&message))?;
-    let _notification = super::notification::schedule(
+    let mut outcome = json_value(metadata(&message))?;
+    let notification = super::notification::schedule(
         &mut locked.registry,
         &recipient.id,
         &recipient_incarnation,
         now,
     );
-    // Materialize the fixed template here so future delivery code cannot derive
-    // it from the private body. Queue-only is authoritative when no server-side
-    // structured prompt controller is present.
-    let _fixed_prompt = super::notification::fixed_prompt(&message.message_id, &recipient.id);
+    outcome
+        .as_object_mut()
+        .expect("message metadata serializes as an object")
+        .insert("notification".to_string(), json_value(notification)?);
     locked.registry.messages.push(message);
     store_receipt(
         &mut locked.registry,

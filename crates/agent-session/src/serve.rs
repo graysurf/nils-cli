@@ -3309,7 +3309,7 @@ async fn coordination_send_handler(
     {
         Ok(Ok(value)) => {
             state.coordination_notification_wake.notify_one();
-            coordination_ok(&state, value)
+            coordination_ok(&state, notification_controller_available(value))
         }
         Ok(Err(error)) => envelope_err(error),
         Err(_) => join_err(),
@@ -3405,10 +3405,20 @@ async fn coordination_reply_handler(
     })
     .await
     {
-        Ok(Ok(value)) => coordination_ok(&state, value),
+        Ok(Ok(value)) => {
+            state.coordination_notification_wake.notify_one();
+            coordination_ok(&state, notification_controller_available(value))
+        }
         Ok(Err(error)) => envelope_err(error),
         Err(_) => join_err(),
     }
+}
+
+fn notification_controller_available(mut value: Value) -> Value {
+    if let Some(controller_available) = value.pointer_mut("/notification/controller_available") {
+        *controller_available = Value::Bool(true);
+    }
+    value
 }
 
 async fn coordination_wait_handler(
@@ -20295,6 +20305,22 @@ exit 0
         .await;
         assert_eq!(status, StatusCode::OK, "{sent}");
         assert!(!sent.to_string().contains(canary));
+        assert_eq!(
+            sent["data"]["coordination"]["notification"]["state"],
+            "queued"
+        );
+        assert_eq!(
+            sent["data"]["coordination"]["notification"]["generation"],
+            1
+        );
+        assert_eq!(
+            sent["data"]["coordination"]["notification"]["last_reason"],
+            "notification-pending"
+        );
+        assert_eq!(
+            sent["data"]["coordination"]["notification"]["controller_available"],
+            true
+        );
         let message_id = sent["data"]["coordination"]["message_id"]
             .as_str()
             .expect("message id")
@@ -20324,6 +20350,31 @@ exit 0
         .await;
         assert_eq!(status, StatusCode::OK, "{inbox}");
         assert!(!inbox.to_string().contains(canary));
+
+        let reply_canary = "HTTP-PRIVATE-REPLY-CANARY";
+        let (status, reply) = call(
+            router(state.clone()),
+            post_coordination(
+                &format!("/sessions/beta/messages/{message_id}/reply/v1"),
+                beta_capability.trim(),
+                json!({
+                    "body": reply_canary,
+                    "if_revision": 1,
+                    "idempotency_key": "http-message-reply-beta-0001"
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{reply}");
+        assert!(!reply.to_string().contains(reply_canary));
+        assert_eq!(
+            reply["data"]["coordination"]["notification"]["state"],
+            "queued"
+        );
+        assert_eq!(
+            reply["data"]["coordination"]["notification"]["controller_available"],
+            true
+        );
 
         let (status, shown) = call(
             router(state),

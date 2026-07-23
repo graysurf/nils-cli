@@ -2019,6 +2019,15 @@ fn cli_send_and_reply_share_recipient_generation_scheduling() {
     };
     let first = send(&first_body, "generation-send-0001");
     assert_eq!(first.code, 0, "stderr={}", first.stderr_text());
+    assert_eq!(data(&first)["notification"]["state"], "queued");
+    assert_eq!(data(&first)["notification"]["generation"], 1);
+    assert_eq!(data(&first)["notification"]["notified_generation"], 0);
+    assert_eq!(
+        data(&first)["notification"]["last_reason"],
+        "notification-pending"
+    );
+    assert_eq!(data(&first)["notification"]["controller_available"], false);
+    assert!(!first.stdout_text().contains("first private body"));
     let message_id = data(&first)["message_id"]
         .as_str()
         .expect("message id")
@@ -2026,8 +2035,10 @@ fn cli_send_and_reply_share_recipient_generation_scheduling() {
     let replay = send(&first_body, "generation-send-0001");
     assert_eq!(replay.code, 0, "stderr={}", replay.stderr_text());
     assert_eq!(data(&replay)["message_id"], message_id);
+    assert_eq!(data(&replay)["notification"]["generation"], 1);
     let second = send(&second_body, "generation-send-0002");
     assert_eq!(second.code, 0, "stderr={}", second.stderr_text());
+    assert_eq!(data(&second)["notification"]["generation"], 2);
 
     let reply = run(
         tmp.path(),
@@ -2053,6 +2064,10 @@ fn cli_send_and_reply_share_recipient_generation_scheduling() {
         ],
     );
     assert_eq!(reply.code, 0, "stderr={}", reply.stderr_text());
+    assert_eq!(data(&reply)["notification"]["state"], "queued");
+    assert_eq!(data(&reply)["notification"]["generation"], 1);
+    assert_eq!(data(&reply)["notification"]["controller_available"], false);
+    assert!(!reply.stdout_text().contains("private reply"));
 
     let registry: serde_json::Value = serde_json::from_slice(
         &fs::read(state_dir.join("coordination/registry.json")).expect("registry"),
