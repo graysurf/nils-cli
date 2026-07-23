@@ -91,11 +91,32 @@ pub(crate) fn normalize_registry(registry: &mut Registry, now: i64) -> bool {
         });
         normalize_current(&mut receipt, now);
         historical.sort_by(|left, right| {
-            (left.attempted_at_epoch, &left.message_id)
-                .cmp(&(right.attempted_at_epoch, &right.message_id))
+            let left_generation = compatibility_generation(&left.message_id, &key);
+            let right_generation = compatibility_generation(&right.message_id, &key);
+            (
+                left_generation.is_none(),
+                left_generation.unwrap_or_default(),
+                left.attempted_at_epoch,
+                &left.message_id,
+            )
+                .cmp(&(
+                    right_generation.is_none(),
+                    right_generation.unwrap_or_default(),
+                    right.attempted_at_epoch,
+                    &right.message_id,
+                ))
         });
         for historical_receipt in historical {
-            receipt.generation = receipt.generation.saturating_add(1);
+            let restored_generation =
+                compatibility_generation(&historical_receipt.message_id, &key);
+            if let Some(restored_generation) = restored_generation {
+                if restored_generation < receipt.generation {
+                    continue;
+                }
+                receipt.generation = restored_generation;
+            } else {
+                receipt.generation = receipt.generation.saturating_add(1);
+            }
             receipt.queued_at_epoch = if receipt.queued_at_epoch == 0 {
                 historical_receipt.attempted_at_epoch
             } else {
@@ -106,17 +127,41 @@ pub(crate) fn normalize_registry(registry: &mut Registry, now: i64) -> bool {
             receipt.updated_at_epoch = receipt
                 .updated_at_epoch
                 .max(historical_receipt.attempted_at_epoch);
-            if historical_receipt.state == "notification_attempting" {
-                receipt.state = "attempt_unknown".to_string();
-                receipt.attempted_generation = receipt.generation;
-                receipt.attempted_at_epoch = historical_receipt.attempted_at_epoch;
-                receipt.last_reason = Some(REASON_MIGRATED_UNKNOWN.to_string());
-            } else if receipt.state != "attempt_unknown" {
-                receipt.state = "queued".to_string();
-                receipt.last_reason = Some(REASON_PENDING.to_string());
+            match historical_receipt.state.as_str() {
+                "notification_attempting" | "attempting" | "attempt_unknown" => {
+                    receipt.state = "attempt_unknown".to_string();
+                    receipt.attempted_generation = receipt.generation;
+                    receipt.attempted_at_epoch = historical_receipt.attempted_at_epoch;
+                    receipt.last_reason = Some(REASON_MIGRATED_UNKNOWN.to_string());
+                }
+                "prompt_submitted" => {
+                    receipt.state = "prompt_submitted".to_string();
+                    receipt.attempted_generation = receipt.generation;
+                    receipt.notified_generation = receipt.generation;
+                    receipt.attempted_at_epoch = historical_receipt.attempted_at_epoch;
+                    receipt.last_reason = Some("prompt-accepted".to_string());
+                }
+                "queued" => {
+                    receipt.state = "queued".to_string();
+                    receipt.last_reason = Some(REASON_PENDING.to_string());
+                }
+                "undeliverable" => {
+                    receipt.state = "undeliverable".to_string();
+                    receipt.last_reason = Some(
+                        historical_receipt
+                            .last_reason
+                            .as_deref()
+                            .map(safe_reason)
+                            .unwrap_or_else(|| REASON_INVALID_STATE.to_string()),
+                    );
+                }
+                _ => {
+                    receipt.state = "undeliverable".to_string();
+                    receipt.last_reason = Some(REASON_INVALID_STATE.to_string());
+                }
             }
         }
-        receipt.message_id.clear();
+        receipt.message_id = compatibility_message_id(&key, receipt.generation);
         receipt.schema_version = NOTIFICATION_VERSION.to_string();
         registry.notifications.insert(key, receipt);
     }
@@ -134,7 +179,7 @@ pub(crate) fn schedule(
     let key = receipt_key(target_session_id, target_incarnation);
     let receipt = registry
         .notifications
-        .entry(key)
+        .entry(key.clone())
         .or_insert_with(|| NotificationReceipt {
             schema_version: NOTIFICATION_VERSION.to_string(),
             target_session_id: target_session_id.to_string(),
@@ -142,6 +187,7 @@ pub(crate) fn schedule(
             ..NotificationReceipt::default()
         });
     receipt.generation = receipt.generation.saturating_add(1);
+    receipt.message_id = compatibility_message_id(&key, receipt.generation);
     receipt.queued_at_epoch = now;
     receipt.updated_at_epoch = now;
     if !matches!(receipt.state.as_str(), "attempting" | "attempt_unknown") {
@@ -521,7 +567,6 @@ fn merge_current(current: &mut Option<NotificationReceipt>, candidate: Notificat
 
 fn normalize_current(receipt: &mut NotificationReceipt, now: i64) {
     receipt.schema_version = NOTIFICATION_VERSION.to_string();
-    receipt.message_id.clear();
     receipt.notified_generation = receipt.notified_generation.min(receipt.generation);
     if !matches!(
         receipt.state.as_str(),
@@ -582,6 +627,19 @@ fn receipt_key(target_session_id: &str, target_incarnation: &str) -> String {
     hasher.update([0]);
     hasher.update(target_incarnation.as_bytes());
     format!("recipient-{}", hex_bytes(&hasher.finalize()))
+}
+
+fn compatibility_message_id(key: &str, generation: u64) -> String {
+    format!("{key}-generation-{generation}")
+}
+
+fn compatibility_generation(message_id: &str, key: &str) -> Option<u64> {
+    message_id
+        .strip_prefix(key)?
+        .strip_prefix("-generation-")?
+        .parse::<u64>()
+        .ok()
+        .filter(|generation| *generation > 0)
 }
 
 fn hex_bytes(bytes: &[u8]) -> String {
@@ -776,7 +834,101 @@ mod tests {
             receipt.last_reason.as_deref(),
             Some("migrated-attempt-outcome-unknown")
         );
-        assert!(receipt.message_id.is_empty());
+        assert_eq!(
+            compatibility_generation(&receipt.message_id, &receipt_key("target", "incarnation")),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn generation_receipts_survive_a_prior_cli_read_write_cycle_without_duplicate_delivery() {
+        #[derive(Clone, Deserialize, Serialize)]
+        struct PriorNotificationReceipt {
+            message_id: String,
+            target_session_id: String,
+            target_incarnation: String,
+            state: String,
+            attempted_at_epoch: i64,
+        }
+
+        let mut registry = Registry::default();
+        schedule(&mut registry, "target", "incarnation", 100);
+        let scheduled = schedule(&mut registry, "target", "incarnation", 101);
+        let queued = NotificationCandidate {
+            target_session_id: "target".to_string(),
+            target_incarnation: "incarnation".to_string(),
+            generation: scheduled.generation,
+            attempted_at_epoch: 0,
+        };
+        let candidate = transition_attempt(&mut registry, &queued, 102).expect("attempt");
+        assert!(transition_submitted(&mut registry, &candidate, 103));
+
+        let key = registry
+            .notifications
+            .keys()
+            .next()
+            .expect("generation key")
+            .clone();
+        let serialized = serde_json::to_value(&registry).expect("serialize new registry");
+        let prior_receipt: PriorNotificationReceipt =
+            serde_json::from_value(serialized["notifications"][&key].clone())
+                .expect("prior CLI reads generation receipt");
+        assert!(prior_receipt.message_id.starts_with("recipient-"));
+        assert_eq!(prior_receipt.state, "prompt_submitted");
+
+        let mut prior_notifications = BTreeMap::new();
+        prior_notifications.insert(key.clone(), prior_receipt.clone());
+        let mut rewritten: Registry = serde_json::from_value(json!({
+            "notifications": prior_notifications
+        }))
+        .expect("new CLI reads prior CLI rewrite");
+
+        assert!(normalize_registry(&mut rewritten, 104));
+        let receipt = rewritten
+            .notifications
+            .values()
+            .next()
+            .expect("normalized generation");
+        assert_eq!(receipt.generation, 2);
+        assert_eq!(receipt.attempted_generation, 2);
+        assert_eq!(receipt.notified_generation, 2);
+        assert_eq!(receipt.state, "prompt_submitted");
+        assert!(pending_candidates(&mut rewritten, 10_000).is_empty());
+
+        let mut prior_notifications = BTreeMap::new();
+        prior_notifications.insert(key, prior_receipt);
+        prior_notifications.insert(
+            "new-message".to_string(),
+            PriorNotificationReceipt {
+                message_id: "new-message".to_string(),
+                target_session_id: "target".to_string(),
+                target_incarnation: "incarnation".to_string(),
+                state: "queued".to_string(),
+                attempted_at_epoch: 104,
+            },
+        );
+        let mut rewritten_with_new_mail: Registry = serde_json::from_value(json!({
+            "notifications": prior_notifications
+        }))
+        .expect("new CLI reads prior CLI rewrite plus new mail");
+        assert!(normalize_registry(&mut rewritten_with_new_mail, 105));
+        let receipt = rewritten_with_new_mail
+            .notifications
+            .values()
+            .next()
+            .expect("newest generation");
+        assert_eq!(receipt.generation, 3);
+        assert_eq!(receipt.notified_generation, 2);
+        assert_eq!(receipt.state, "queued");
+        assert_eq!(
+            pending_candidates(&mut rewritten_with_new_mail, 105),
+            vec![NotificationCandidate {
+                target_session_id: "target".to_string(),
+                target_incarnation: "incarnation".to_string(),
+                generation: 3,
+                attempted_at_epoch: 102,
+            }]
+        );
     }
 
     #[test]

@@ -436,6 +436,14 @@ while holding the session lifecycle lock. That registry transition is the
 single provider-side-effect owner even when startup, HTTP, activity, and polling
 wakeups race.
 
+The private persisted receipt retains a content-free compatibility
+`message_id` that encodes only its recipient-key digest and generation. This
+keeps the receipt readable by the prior per-message CLI schema. If that CLI
+rewrites the registry and drops additive generation fields, normalization
+restores the encoded generation and state; an acknowledged generation remains
+submitted, while an in-flight generation becomes `attempt_unknown` rather than
+being retried.
+
 Codex uses the existing app-server prompt-v2 control and counts only an
 acknowledged turn submission. Claude uses the controller-owned private-buffer
 paste plus a separate Enter only after a `Stop` hook has survived a
