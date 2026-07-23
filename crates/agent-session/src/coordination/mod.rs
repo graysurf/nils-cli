@@ -6,6 +6,8 @@ pub(crate) mod mailbox;
 mod notification;
 pub(crate) mod server;
 
+pub(crate) use notification::NotificationCandidate;
+
 use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read};
@@ -292,20 +294,59 @@ pub(crate) fn revoke(context: &CliContext, record: &SessionRecord) -> Result<(),
     broker::revoke(context, record)
 }
 
-pub(crate) fn notification_candidate(
+pub(crate) fn pending_notifications(
     context: &CliContext,
-    message_id: &str,
-) -> Result<Option<(String, String)>, CliError> {
-    notification::candidate(context, message_id)
+) -> Result<Vec<NotificationCandidate>, CliError> {
+    notification::pending(context)
 }
 
 pub(crate) fn begin_notification_attempt(
     context: &CliContext,
-    message_id: &str,
-    target_session_id: &str,
-    target_incarnation: &str,
+    candidate: &NotificationCandidate,
 ) -> Result<bool, CliError> {
-    notification::begin_attempt(context, message_id, target_session_id, target_incarnation)
+    notification::begin_attempt(context, candidate)
+}
+
+pub(crate) fn mark_notification_submitted(
+    context: &CliContext,
+    candidate: &NotificationCandidate,
+) -> Result<bool, CliError> {
+    notification::mark_submitted(context, candidate)
+}
+
+#[allow(dead_code)]
+pub(crate) fn mark_notification_known_failure(
+    context: &CliContext,
+    candidate: &NotificationCandidate,
+    reason: &str,
+    retry_after_seconds: i64,
+) -> Result<bool, CliError> {
+    notification::mark_known_failure(context, candidate, reason, retry_after_seconds)
+}
+
+pub(crate) fn mark_notification_unknown(
+    context: &CliContext,
+    candidate: &NotificationCandidate,
+    reason: &str,
+) -> Result<bool, CliError> {
+    notification::mark_unknown(context, candidate, reason)
+}
+
+pub(crate) fn mark_notification_undeliverable(
+    context: &CliContext,
+    candidate: &NotificationCandidate,
+    reason: &str,
+) -> Result<bool, CliError> {
+    notification::mark_undeliverable(context, candidate, reason)
+}
+
+pub(crate) fn defer_notification(
+    context: &CliContext,
+    candidate: &NotificationCandidate,
+    reason: &str,
+    retry_after_seconds: i64,
+) -> Result<bool, CliError> {
+    notification::defer(context, candidate, reason, retry_after_seconds)
 }
 
 pub(crate) fn notification_prompt(message_id: &str, session_id: &str) -> String {

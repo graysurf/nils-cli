@@ -164,7 +164,6 @@ pub(crate) fn projection_for(
         .map(|receipt| projection(receipt, controller_available))
 }
 
-#[allow(dead_code)]
 pub(crate) fn pending_candidates(registry: &mut Registry, now: i64) -> Vec<NotificationCandidate> {
     normalize_registry(registry, now);
     registry
@@ -183,67 +182,42 @@ pub(crate) fn pending_candidates(registry: &mut Registry, now: i64) -> Vec<Notif
         .collect()
 }
 
-pub(crate) fn candidate(
-    context: &CliContext,
-    message_id: &str,
-) -> Result<Option<(String, String)>, CliError> {
+pub(crate) fn pending(context: &CliContext) -> Result<Vec<NotificationCandidate>, CliError> {
+    let now = now_epoch();
     let mut locked = super::lock_registry(context)?;
-    normalize_registry(&mut locked.registry, now_epoch());
-    let Some(message) = locked
-        .registry
-        .messages
-        .iter()
-        .find(|message| message.message_id == message_id)
-    else {
-        return Ok(None);
-    };
-    let target_session_id = message.recipient_session_id.clone();
-    let target_incarnation = message.recipient_incarnation.clone();
-    let Some(receipt) = locked
-        .registry
-        .notifications
-        .get(&receipt_key(&target_session_id, &target_incarnation))
-    else {
-        return Ok(None);
-    };
-    if receipt.state != "queued" || receipt.generation <= receipt.notified_generation {
-        return Ok(None);
+    let changed = normalize_registry(&mut locked.registry, now);
+    let candidates = pending_candidates(&mut locked.registry, now);
+    if changed {
+        locked.save()?;
     }
-    Ok(Some((target_session_id, target_incarnation)))
+    Ok(candidates)
 }
 
 pub(crate) fn begin_attempt(
     context: &CliContext,
-    _message_id: &str,
-    target_session_id: &str,
-    target_incarnation: &str,
+    candidate: &NotificationCandidate,
 ) -> Result<bool, CliError> {
     let now = now_epoch();
     let mut locked = super::lock_registry(context)?;
-    let Some(candidate) = transition_attempt(
-        &mut locked.registry,
-        target_session_id,
-        target_incarnation,
-        now,
-    ) else {
+    let Some(_) = transition_attempt(&mut locked.registry, candidate, now) else {
         return Ok(false);
     };
-    debug_assert_eq!(candidate.target_session_id, target_session_id);
     locked.save()?;
     Ok(true)
 }
 
 fn transition_attempt(
     registry: &mut Registry,
-    target_session_id: &str,
-    target_incarnation: &str,
+    candidate: &NotificationCandidate,
     now: i64,
 ) -> Option<NotificationCandidate> {
     normalize_registry(registry, now);
-    let receipt = registry
-        .notifications
-        .get_mut(&receipt_key(target_session_id, target_incarnation))?;
+    let receipt = registry.notifications.get_mut(&receipt_key(
+        &candidate.target_session_id,
+        &candidate.target_incarnation,
+    ))?;
     if receipt.state != "queued"
+        || receipt.generation != candidate.generation
         || receipt.generation <= receipt.notified_generation
         || receipt.next_attempt_at_epoch > now
     {
@@ -255,13 +229,12 @@ fn transition_attempt(
     receipt.updated_at_epoch = now;
     receipt.last_reason = Some(REASON_ATTEMPTING.to_string());
     Some(NotificationCandidate {
-        target_session_id: target_session_id.to_string(),
-        target_incarnation: target_incarnation.to_string(),
+        target_session_id: candidate.target_session_id.clone(),
+        target_incarnation: candidate.target_incarnation.clone(),
         generation: receipt.attempted_generation,
     })
 }
 
-#[allow(dead_code)]
 fn transition_submitted(
     registry: &mut Registry,
     candidate: &NotificationCandidate,
@@ -295,7 +268,6 @@ fn transition_known_failure(
     true
 }
 
-#[allow(dead_code)]
 fn transition_unknown(
     registry: &mut Registry,
     candidate: &NotificationCandidate,
@@ -311,7 +283,6 @@ fn transition_unknown(
     true
 }
 
-#[allow(dead_code)]
 fn transition_undeliverable(
     registry: &mut Registry,
     target_session_id: &str,
@@ -332,7 +303,6 @@ fn transition_undeliverable(
     true
 }
 
-#[allow(dead_code)]
 fn matching_attempt_mut<'a>(
     registry: &'a mut Registry,
     candidate: &NotificationCandidate,
@@ -343,6 +313,106 @@ fn matching_attempt_mut<'a>(
     ))?;
     (receipt.state == "attempting" && receipt.attempted_generation == candidate.generation)
         .then_some(receipt)
+}
+
+pub(crate) fn mark_submitted(
+    context: &CliContext,
+    candidate: &NotificationCandidate,
+) -> Result<bool, CliError> {
+    update_attempt(context, |registry, now| {
+        transition_submitted(registry, candidate, now)
+    })
+}
+
+#[allow(dead_code)]
+pub(crate) fn mark_known_failure(
+    context: &CliContext,
+    candidate: &NotificationCandidate,
+    reason: &str,
+    retry_after_seconds: i64,
+) -> Result<bool, CliError> {
+    update_attempt(context, |registry, now| {
+        transition_known_failure(
+            registry,
+            candidate,
+            reason,
+            now.saturating_add(retry_after_seconds.max(0)),
+            now,
+        )
+    })
+}
+
+pub(crate) fn mark_unknown(
+    context: &CliContext,
+    candidate: &NotificationCandidate,
+    reason: &str,
+) -> Result<bool, CliError> {
+    update_attempt(context, |registry, now| {
+        transition_unknown(registry, candidate, reason, now)
+    })
+}
+
+pub(crate) fn mark_undeliverable(
+    context: &CliContext,
+    candidate: &NotificationCandidate,
+    reason: &str,
+) -> Result<bool, CliError> {
+    update_attempt(context, |registry, now| {
+        normalize_registry(registry, now);
+        let Some(receipt) = registry.notifications.get(&receipt_key(
+            &candidate.target_session_id,
+            &candidate.target_incarnation,
+        )) else {
+            return false;
+        };
+        if receipt.generation != candidate.generation || receipt.state != "queued" {
+            return false;
+        }
+        transition_undeliverable(
+            registry,
+            &candidate.target_session_id,
+            &candidate.target_incarnation,
+            reason,
+            now,
+        )
+    })
+}
+
+pub(crate) fn defer(
+    context: &CliContext,
+    candidate: &NotificationCandidate,
+    reason: &str,
+    retry_after_seconds: i64,
+) -> Result<bool, CliError> {
+    update_attempt(context, |registry, now| {
+        normalize_registry(registry, now);
+        let Some(receipt) = registry.notifications.get_mut(&receipt_key(
+            &candidate.target_session_id,
+            &candidate.target_incarnation,
+        )) else {
+            return false;
+        };
+        if receipt.generation != candidate.generation || receipt.state != "queued" {
+            return false;
+        }
+        receipt.updated_at_epoch = now;
+        receipt.next_attempt_at_epoch = now.saturating_add(retry_after_seconds.max(0));
+        receipt.last_reason = Some(safe_reason(reason));
+        true
+    })
+}
+
+fn update_attempt(
+    context: &CliContext,
+    update: impl FnOnce(&mut Registry, i64) -> bool,
+) -> Result<bool, CliError> {
+    let now = now_epoch();
+    let mut locked = super::lock_registry(context)?;
+    if !update(&mut locked.registry, now) {
+        return Ok(false);
+    }
+    locked.save()?;
+    Ok(true)
 }
 
 fn projection(receipt: &NotificationReceipt, controller_available: bool) -> NotificationProjection {
@@ -490,11 +560,15 @@ mod tests {
     #[test]
     fn notification_state_machine_uses_generation_cas() {
         let mut registry = Registry::default();
-        schedule(&mut registry, "target", "incarnation", 100);
-        let candidate =
-            transition_attempt(&mut registry, "target", "incarnation", 101).expect("attempt");
+        let scheduled = schedule(&mut registry, "target", "incarnation", 100);
+        let queued = NotificationCandidate {
+            target_session_id: "target".to_string(),
+            target_incarnation: "incarnation".to_string(),
+            generation: scheduled.generation,
+        };
+        let candidate = transition_attempt(&mut registry, &queued, 101).expect("attempt");
         assert!(
-            transition_attempt(&mut registry, "target", "incarnation", 102).is_none(),
+            transition_attempt(&mut registry, &queued, 102).is_none(),
             "only one side-effect owner may hold a generation"
         );
         assert!(transition_submitted(&mut registry, &candidate, 103));
@@ -522,9 +596,13 @@ mod tests {
     #[test]
     fn notification_known_and_unknown_failures_have_distinct_retry_contracts() {
         let mut registry = Registry::default();
-        schedule(&mut registry, "target", "incarnation", 100);
-        let candidate =
-            transition_attempt(&mut registry, "target", "incarnation", 101).expect("attempt");
+        let scheduled = schedule(&mut registry, "target", "incarnation", 100);
+        let queued = NotificationCandidate {
+            target_session_id: "target".to_string(),
+            target_incarnation: "incarnation".to_string(),
+            generation: scheduled.generation,
+        };
+        let candidate = transition_attempt(&mut registry, &queued, 101).expect("attempt");
         assert!(transition_known_failure(
             &mut registry,
             &candidate,
@@ -535,8 +613,7 @@ mod tests {
         assert!(pending_candidates(&mut registry, 119).is_empty());
         assert_eq!(pending_candidates(&mut registry, 120).len(), 1);
 
-        let candidate =
-            transition_attempt(&mut registry, "target", "incarnation", 120).expect("retry");
+        let candidate = transition_attempt(&mut registry, &queued, 120).expect("retry");
         assert!(transition_unknown(
             &mut registry,
             &candidate,

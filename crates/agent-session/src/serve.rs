@@ -159,12 +159,12 @@ struct ServeState {
     session_collector: SessionCollector,
     launch_profiles: AgentLaunchProfiles,
     coordination_wait_workers: Arc<tokio::sync::Semaphore>,
+    coordination_notification_wake: Arc<tokio::sync::Notify>,
 }
 
 #[derive(Clone)]
 struct CoordinationNotificationFence {
-    message_id: String,
-    target_incarnation: String,
+    candidate: crate::coordination::NotificationCandidate,
 }
 
 #[derive(Default)]
@@ -665,6 +665,7 @@ pub fn run_serve(context: &CliContext, args: cli::ServeArgs) -> i32 {
             coordination_wait_workers: Arc::new(tokio::sync::Semaphore::new(
                 COORDINATION_WAIT_WORKER_LIMIT,
             )),
+            coordination_notification_wake: Arc::new(tokio::sync::Notify::new()),
         });
         let listener = match bind_listener_and_start_delete_tombstone_cleanup(context, bind).await {
             Ok(listener) => listener,
@@ -680,11 +681,15 @@ pub fn run_serve(context: &CliContext, args: cli::ServeArgs) -> i32 {
         let app = router(state.clone());
         let codex_control_task = tokio::spawn(codex_control_loop(state.clone()));
         let auto_resume_task = tokio::spawn(auto_resume_loop(state.clone()));
+        let coordination_notification_task =
+            tokio::spawn(coordination_notification_loop(state.clone()));
         let result = axum::serve(listener, app)
             .with_graceful_shutdown(shutdown_signal())
             .await;
         auto_resume_task.abort();
         let _ = auto_resume_task.await;
+        coordination_notification_task.abort();
+        let _ = coordination_notification_task.await;
         codex_control_task.abort();
         let _ = codex_control_task.await;
         state.attach_brokers.shutdown_all().await;
@@ -3293,7 +3298,7 @@ async fn coordination_send_handler(
     .await
     {
         Ok(Ok(value)) => {
-            attempt_coordination_notification(state.clone(), &value).await;
+            state.coordination_notification_wake.notify_one();
             coordination_ok(&state, value)
         }
         Ok(Err(error)) => envelope_err(error),
@@ -3321,33 +3326,6 @@ fn coordination_query<T>(query: Result<Query<T>, QueryRejection>) -> Result<T, R
             None,
         ))
     })
-}
-
-async fn attempt_coordination_notification(state: Arc<ServeState>, sent: &Value) {
-    let Some(message_id) = sent.get("message_id").and_then(Value::as_str) else {
-        return;
-    };
-    let context = state.context.clone();
-    let message_id_owned = message_id.to_string();
-    let candidate = tokio::task::spawn_blocking(move || {
-        crate::coordination::notification_candidate(&context, &message_id_owned)
-    })
-    .await;
-    let Ok(Ok(Some((target_session_id, target_incarnation)))) = candidate else {
-        return;
-    };
-    let prompt = crate::coordination::notification_prompt(message_id, &target_session_id);
-    let _ = submit_structured_prompt_handler_with_fence(
-        state,
-        target_session_id,
-        prompt,
-        Some(target_incarnation.clone()),
-        Some(CoordinationNotificationFence {
-            message_id: message_id.to_string(),
-            target_incarnation,
-        }),
-    )
-    .await;
 }
 
 async fn coordination_message_show_handler(
@@ -3990,16 +3968,14 @@ async fn submit_structured_prompt_locked(
         )?;
         crate::codex_account::ensure_input_allowed(&current)?;
         if let Some(fence) = notification_fence {
-            let eligible = actual_launch_id == fence.target_incarnation
+            let eligible = actual_launch_id == fence.candidate.target_incarnation
                 && codex_app_server::runtime_is_supported(&current)
                 && activity::state_for_view(&lock_context, &current)
                     .is_some_and(|state| state.phase == activity::TurnPhase::Waiting);
             if !eligible
                 || !crate::coordination::begin_notification_attempt(
                     &lock_context,
-                    &fence.message_id,
-                    &current.id,
-                    &fence.target_incarnation,
+                    &fence.candidate,
                 )?
             {
                 return Err(CliError::data(
@@ -4530,6 +4506,152 @@ async fn auto_resume_loop(state: Arc<ServeState>) {
         }
         tokio::time::sleep(POLL_INTERVAL).await;
     }
+}
+
+async fn coordination_notification_loop(state: Arc<ServeState>) {
+    const RECONCILE_INTERVAL: Duration = Duration::from_secs(1);
+    loop {
+        drain_coordination_notifications(state.clone()).await;
+        tokio::select! {
+            () = state.coordination_notification_wake.notified() => {}
+            () = tokio::time::sleep(RECONCILE_INTERVAL) => {}
+        }
+    }
+}
+
+async fn drain_coordination_notifications(state: Arc<ServeState>) {
+    let context = state.context.clone();
+    let candidates = match tokio::task::spawn_blocking(move || {
+        crate::coordination::pending_notifications(&context)
+    })
+    .await
+    {
+        Ok(Ok(candidates)) => candidates,
+        Ok(Err(err)) => {
+            eprintln!(
+                "warning: coordination notification discovery failed: {}",
+                err.code()
+            );
+            return;
+        }
+        Err(_) => {
+            eprintln!("warning: coordination notification discovery worker failed");
+            return;
+        }
+    };
+    for candidate in candidates {
+        dispatch_coordination_notification(state.clone(), candidate).await;
+    }
+}
+
+async fn dispatch_coordination_notification(
+    state: Arc<ServeState>,
+    candidate: crate::coordination::NotificationCandidate,
+) {
+    let context = state.context.clone();
+    let target_session_id = candidate.target_session_id.clone();
+    let record = tokio::task::spawn_blocking(move || {
+        let _record_lock = crate::acquire_session_record_lock(&context, &target_session_id)?;
+        load_session_record(&context, &target_session_id)
+    })
+    .await;
+    let record = match record {
+        Ok(Ok(record)) => record,
+        Ok(Err(_)) | Err(_) => {
+            update_notification_undeliverable(&state, &candidate, "recipient-incarnation-replaced")
+                .await;
+            return;
+        }
+    };
+    if record
+        .runtime
+        .as_ref()
+        .map(|runtime| runtime.launch_id.as_str())
+        != Some(candidate.target_incarnation.as_str())
+    {
+        update_notification_undeliverable(&state, &candidate, "recipient-incarnation-replaced")
+            .await;
+        return;
+    }
+    if record.coordination_mode == cli::CoordinationMode::Off {
+        update_notification_undeliverable(&state, &candidate, "coordination-disabled").await;
+        return;
+    }
+    if record.agent == AgentKind::Hermes.as_str() {
+        update_notification_undeliverable(&state, &candidate, "provider-unsupported").await;
+        return;
+    }
+    if record.agent == AgentKind::Claude.as_str() {
+        update_notification_deferred(&state, &candidate, "provider-not-ready", 1).await;
+        return;
+    }
+    let waiting = activity::state_for_view(&state.context, &record)
+        .is_some_and(|turn| turn.phase == activity::TurnPhase::Waiting);
+    if !waiting {
+        update_notification_deferred(&state, &candidate, "recipient-working", 1).await;
+        return;
+    }
+    if !codex_app_server::runtime_is_supported(&record) {
+        update_notification_undeliverable(&state, &candidate, "provider-unsupported").await;
+        return;
+    }
+
+    let prompt = crate::coordination::notification_prompt("", &candidate.target_session_id);
+    let response = submit_structured_prompt_handler_with_fence(
+        state.clone(),
+        candidate.target_session_id.clone(),
+        prompt,
+        Some(candidate.target_incarnation.clone()),
+        Some(CoordinationNotificationFence {
+            candidate: candidate.clone(),
+        }),
+    )
+    .await;
+    let context = state.context.clone();
+    if response.status().is_success() {
+        let _ = tokio::task::spawn_blocking(move || {
+            crate::coordination::mark_notification_submitted(&context, &candidate)
+        })
+        .await;
+    } else if response.status() == StatusCode::INTERNAL_SERVER_ERROR {
+        let _ = tokio::task::spawn_blocking(move || {
+            crate::coordination::mark_notification_unknown(
+                &context,
+                &candidate,
+                "submission-outcome-unknown",
+            )
+        })
+        .await;
+    } else {
+        update_notification_deferred(&state, &candidate, "provider-not-ready", 1).await;
+    }
+}
+
+async fn update_notification_deferred(
+    state: &ServeState,
+    candidate: &crate::coordination::NotificationCandidate,
+    reason: &'static str,
+    retry_after_seconds: i64,
+) {
+    let context = state.context.clone();
+    let candidate = candidate.clone();
+    let _ = tokio::task::spawn_blocking(move || {
+        crate::coordination::defer_notification(&context, &candidate, reason, retry_after_seconds)
+    })
+    .await;
+}
+
+async fn update_notification_undeliverable(
+    state: &ServeState,
+    candidate: &crate::coordination::NotificationCandidate,
+    reason: &'static str,
+) {
+    let context = state.context.clone();
+    let candidate = candidate.clone();
+    let _ = tokio::task::spawn_blocking(move || {
+        crate::coordination::mark_notification_undeliverable(&context, &candidate, reason)
+    })
+    .await;
 }
 
 #[derive(Clone)]
@@ -9478,6 +9600,7 @@ mod tests {
             coordination_wait_workers: Arc::new(tokio::sync::Semaphore::new(
                 COORDINATION_WAIT_WORKER_LIMIT,
             )),
+            coordination_notification_wake: Arc::new(tokio::sync::Notify::new()),
         })
     }
 
@@ -14246,8 +14369,11 @@ esac
             StructuredPromptGuards {
                 expected_session_incarnation: Some(&launch_id),
                 notification: Some(CoordinationNotificationFence {
-                    message_id: "message".to_string(),
-                    target_incarnation: launch_id.clone(),
+                    candidate: crate::coordination::NotificationCandidate {
+                        target_session_id: "notification-final-fence".to_string(),
+                        target_incarnation: launch_id.clone(),
+                        generation: 1,
+                    },
                 }),
                 ..Default::default()
             },
