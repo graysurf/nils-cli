@@ -12204,7 +12204,7 @@ esac
         fs::create_dir(&cwd).unwrap();
         let codex = executable(
             &tmp.path().join("codex-app-server"),
-            "#!/usr/bin/env sh\nif [ \"$1\" = --version ]; then printf '%s\\n' 'codex-cli 0.144.1'; exit 0; fi\nif [ \"$1\" = app-server ] && [ \"$2\" = --help ]; then printf '%s\\n' '  --listen <URL>  unix://'; exit 0; fi\nexit 1\n",
+            "#!/usr/bin/env sh\nif [ \"$1\" = --version ]; then printf '%s\\n' 'codex-cli 0.145.0'; exit 0; fi\nif [ \"$1\" = app-server ] && [ \"$2\" = --help ]; then printf '%s\\n' '  --listen <URL>  unix://'; exit 0; fi\nexit 1\n",
         );
         let missing_helper = tmp.path().join("token-secret-deleted-agent-session");
         let _codex_bin = EnvGuard::set(&lock, "AGENT_SESSION_CODEX_BIN", codex.to_str().unwrap());
@@ -12432,7 +12432,7 @@ esac
         .unwrap();
         let codex = executable(
             &tmp.path().join("codex-app-server"),
-            "#!/usr/bin/env sh\nif [ \"$1\" = --version ]; then printf '%s\\n' 'codex-cli 0.144.1'; exit 0; fi\nif [ \"$1\" = app-server ] && [ \"$2\" = --help ]; then printf '%s\\n' '  --listen <URL>  unix://'; exit 0; fi\nexit 1\n",
+            "#!/usr/bin/env sh\nif [ \"$1\" = --version ]; then printf '%s\\n' 'codex-cli 0.145.0'; exit 0; fi\nif [ \"$1\" = app-server ] && [ \"$2\" = --help ]; then printf '%s\\n' '  --listen <URL>  unix://'; exit 0; fi\nexit 1\n",
         );
         let _codex_bin = EnvGuard::set(&lock, "AGENT_SESSION_CODEX_BIN", codex.to_str().unwrap());
         let _home = EnvGuard::set(&lock, "HOME", home.to_str().unwrap());
@@ -12487,8 +12487,8 @@ esac
         assert!(calls.contains("agent-session-codex-app-server"));
         assert!(calls.contains("app-server --listen"));
         assert!(
-            calls.contains("AGENT_SESSION_ATTENTION_AUTHORITY=protocol"),
-            "managed exact runtime must inject protocol authority: {calls:?}"
+            calls.contains("AGENT_SESSION_ATTENTION_AUTHORITY=hook"),
+            "Codex 0.145.0 must keep hook attention authority: {calls:?}"
         );
     }
 
@@ -17236,7 +17236,7 @@ esac
         let codex = tmp.path().join("codex");
         fs::write(
             &codex,
-            "#!/bin/sh\nif [ \"$1\" = --version ]; then printf '%s\\n' 'codex-cli 0.144.5'; exit 0; fi\nif [ \"$1\" = app-server ] && [ \"$2\" = --help ]; then printf '%s\\n' '  --listen <URL>  Supported values: stdio://, unix://PATH'; exit 0; fi\nexit 1\n",
+            "#!/bin/sh\nif [ \"$1\" = --version ]; then printf '%s\\n' 'codex-cli 0.145.0'; exit 0; fi\nif [ \"$1\" = app-server ] && [ \"$2\" = --help ]; then printf '%s\\n' '  --listen <URL>  Supported values: stdio://, unix://PATH'; exit 0; fi\nexit 1\n",
         )
         .unwrap();
         fs::set_permissions(&codex, fs::Permissions::from_mode(0o700)).unwrap();
@@ -17268,7 +17268,7 @@ printf '%s\n' '{"schema_version":"agent-session.codex-auth-broker.v1","accounts"
             json!({
                 "schema_version": "agent-session.codex-account-readiness.v1",
                 "supported": true,
-                "provider_version": "0.144.5",
+                "provider_version": "0.145.0",
             })
         );
         let encoded = body.to_string();
