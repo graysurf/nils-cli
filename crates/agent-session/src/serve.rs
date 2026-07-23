@@ -59,7 +59,7 @@ use crate::maintenance::{self, MaintenanceActionRequest, MaintenanceOperation};
 use crate::provider_prompt::{
     LastPrompt, MAX_PROVIDER_PROMPT_BYTES, PROVIDER_PROMPT_CAPABILITY, ProviderKind,
     ProviderLastPromptRefresh, ProviderLastPromptTracker, ProviderPromptEvent,
-    ProviderPromptSource, ProviderPromptTail,
+    ProviderPromptSource, ProviderPromptTail, prompt_observed_after,
 };
 use crate::{
     BINARY, CliContext, CliError, ProviderResumeImportArgs, SessionRecord, SessionRegistryFence,
@@ -4589,27 +4589,20 @@ async fn reconcile_coordination_notifications(state: Arc<ServeState>) {
             {
                 return None;
             }
+            let attempted_at = observed_candidate
+                .attempted_at
+                .as_deref()?
+                .parse::<jiff::Timestamp>()
+                .ok()?;
             let source = ProviderPromptTail::resolve_source(&record)?;
-            let mut tracker = ProviderLastPromptTracker::open_source(source)?;
-            match tracker.refresh() {
-                ProviderLastPromptRefresh::Current(last) => Some(last.is_some_and(|last| {
-                    if last.text
-                        != crate::coordination::notification_prompt(
-                            "",
-                            &observed_candidate.target_session_id,
-                        )
-                    {
-                        return false;
-                    }
-                    last.submitted_at
-                        .as_deref()
-                        .and_then(|value| value.parse::<jiff::Timestamp>().ok())
-                        .is_some_and(|submitted_at| {
-                            submitted_at.as_second() >= observed_candidate.attempted_at_epoch
-                        })
-                })),
-                ProviderLastPromptRefresh::Pending | ProviderLastPromptRefresh::Invalidated => None,
-            }
+            prompt_observed_after(
+                &source,
+                &crate::coordination::notification_prompt(
+                    "",
+                    &observed_candidate.target_session_id,
+                ),
+                &attempted_at,
+            )
         })
         .await
         .ok()
@@ -4870,6 +4863,35 @@ fn start_claude_coordination_notification(
         .map_err(|_| ClaudeNotificationStartError::Known("provider-not-ready"))?
     {
         return Err(ClaudeNotificationStartError::Known("provider-not-ready"));
+    }
+    match tmux_session_attached(tmux_bin, &current.tmux_session) {
+        Ok(false) => {}
+        Ok(true) => {
+            if !crate::coordination::mark_notification_known_failure(
+                context,
+                candidate,
+                "recipient-attached",
+                COORDINATION_NOTIFICATION_RETRY,
+            )
+            .map_err(|_| ClaudeNotificationStartError::Unknown)?
+            {
+                return Err(ClaudeNotificationStartError::Unknown);
+            }
+            return Err(ClaudeNotificationStartError::Known("recipient-attached"));
+        }
+        Err(()) => {
+            if !crate::coordination::mark_notification_known_failure(
+                context,
+                candidate,
+                "provider-not-ready",
+                COORDINATION_NOTIFICATION_RETRY,
+            )
+            .map_err(|_| ClaudeNotificationStartError::Unknown)?
+            {
+                return Err(ClaudeNotificationStartError::Unknown);
+            }
+            return Err(ClaudeNotificationStartError::Known("provider-not-ready"));
+        }
     }
     crate::send_input_unlocked(
         context,
@@ -14666,6 +14688,7 @@ esac
                         target_incarnation: launch_id.clone(),
                         generation: 1,
                         attempted_at_epoch: 0,
+                        attempted_at: None,
                     },
                 }),
                 ..Default::default()
@@ -20490,6 +20513,159 @@ exit 0
     }
 
     #[tokio::test]
+    async fn coordination_notification_reconcile_rejects_stale_same_second_generation() {
+        let lock = GlobalStateLock::new();
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let codex_home = tmp.path().join("codex-home");
+        let transcript = codex_home.join("sessions/2026/07/session.jsonl");
+        fs::create_dir_all(transcript.parent().expect("transcript parent"))
+            .expect("transcript dir");
+        let provider_id = "notification-reconcile-stale";
+        write_codex_notification_transcript(
+            &transcript,
+            provider_id,
+            &[(
+                "2030-01-01T00:01:40.200000000Z",
+                crate::coordination::notification_prompt("", "beta"),
+            )],
+        );
+        let _codex_home = EnvGuard::set(&lock, "CODEX_HOME", codex_home.to_str().unwrap());
+
+        seed_session_with_runtime(tmp.path(), "alpha", "codex", "hs-codex-alpha");
+        seed_fresh_provider_session(
+            tmp.path(),
+            "beta",
+            "codex",
+            "hs-codex-beta",
+            tmp.path(),
+            Some((provider_id, "codex-explicit-session-id")),
+        );
+        let state = state(tmp.path(), Some(TOKEN), minimal_tmux(tmp.path()));
+        let alpha = load_session_record(&state.context, "alpha").expect("alpha");
+        let beta = load_session_record(&state.context, "beta").expect("beta");
+        let alpha_capability = provision_ready_coordination_fixture(&state.context, &alpha);
+        provision_ready_coordination_fixture(&state.context, &beta);
+
+        send_notification_fixture(&state, &alpha_capability, "notification-stale-gen-1").await;
+        let generation_one = crate::coordination::pending_notifications(&state.context)
+            .expect("generation one")
+            .pop()
+            .expect("generation one candidate");
+        assert!(
+            crate::coordination::begin_notification_attempt(&state.context, &generation_one)
+                .expect("begin generation one")
+        );
+        assert!(
+            crate::coordination::mark_notification_submitted(&state.context, &generation_one)
+                .expect("submit generation one")
+        );
+
+        send_notification_fixture(&state, &alpha_capability, "notification-stale-gen-2").await;
+        let generation_two = crate::coordination::pending_notifications(&state.context)
+            .expect("generation two")
+            .pop()
+            .expect("generation two candidate");
+        assert!(
+            crate::coordination::begin_notification_attempt(&state.context, &generation_two)
+                .expect("begin generation two")
+        );
+        assert!(
+            crate::coordination::mark_notification_unknown(
+                &state.context,
+                &generation_two,
+                "submission-outcome-unknown",
+            )
+            .expect("fail generation two")
+        );
+        set_notification_attempted_at(tmp.path(), "2030-01-01T00:01:40.700000000Z");
+
+        reconcile_coordination_notifications(state.clone()).await;
+
+        let notification = notification_fixture(tmp.path());
+        assert_eq!(notification["state"], "queued");
+        assert_eq!(notification["generation"], 2);
+        assert_eq!(notification["notified_generation"], 1);
+        assert_eq!(
+            crate::coordination::pending_notifications(&state.context)
+                .expect("requeued notification")
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn coordination_notification_reconcile_finds_delivered_prompt_before_later_prompt() {
+        let lock = GlobalStateLock::new();
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let codex_home = tmp.path().join("codex-home");
+        let transcript = codex_home.join("sessions/2026/07/session.jsonl");
+        fs::create_dir_all(transcript.parent().expect("transcript parent"))
+            .expect("transcript dir");
+        let provider_id = "notification-reconcile-delivered";
+        write_codex_notification_transcript(
+            &transcript,
+            provider_id,
+            &[
+                (
+                    "2030-01-01T00:01:40.800000000Z",
+                    crate::coordination::notification_prompt("", "beta"),
+                ),
+                (
+                    "2030-01-01T00:01:41.100000000Z",
+                    "later unrelated recipient prompt".to_string(),
+                ),
+            ],
+        );
+        let _codex_home = EnvGuard::set(&lock, "CODEX_HOME", codex_home.to_str().unwrap());
+
+        seed_session_with_runtime(tmp.path(), "alpha", "codex", "hs-codex-alpha");
+        seed_fresh_provider_session(
+            tmp.path(),
+            "beta",
+            "codex",
+            "hs-codex-beta",
+            tmp.path(),
+            Some((provider_id, "codex-explicit-session-id")),
+        );
+        let state = state(tmp.path(), Some(TOKEN), minimal_tmux(tmp.path()));
+        let alpha = load_session_record(&state.context, "alpha").expect("alpha");
+        let beta = load_session_record(&state.context, "beta").expect("beta");
+        let alpha_capability = provision_ready_coordination_fixture(&state.context, &alpha);
+        provision_ready_coordination_fixture(&state.context, &beta);
+
+        send_notification_fixture(&state, &alpha_capability, "notification-delivered-gen").await;
+        let candidate = crate::coordination::pending_notifications(&state.context)
+            .expect("pending notification")
+            .pop()
+            .expect("notification candidate");
+        assert!(
+            crate::coordination::begin_notification_attempt(&state.context, &candidate)
+                .expect("begin notification")
+        );
+        assert!(
+            crate::coordination::mark_notification_unknown(
+                &state.context,
+                &candidate,
+                "submission-outcome-unknown",
+            )
+            .expect("unknown notification")
+        );
+        set_notification_attempted_at(tmp.path(), "2030-01-01T00:01:40.700000000Z");
+
+        reconcile_coordination_notifications(state.clone()).await;
+
+        let notification = notification_fixture(tmp.path());
+        assert_eq!(notification["state"], "prompt_submitted");
+        assert_eq!(notification["notified_generation"], 1);
+        assert!(
+            crate::coordination::pending_notifications(&state.context)
+                .expect("pending notifications")
+                .is_empty(),
+            "the acknowledged generation must not be queued for duplicate delivery"
+        );
+    }
+
+    #[tokio::test]
     async fn claude_notification_requires_detached_stop_and_observes_exact_new_prompt() {
         let tmp = tempfile::TempDir::new().expect("tempdir");
         seed_session_with_runtime(tmp.path(), "alpha", "codex", "hs-codex-alpha");
@@ -20661,6 +20837,211 @@ esac
             .expect("notification");
         assert!(!notification.to_string().contains(canary));
         assert_eq!(notification["state"], "prompt_submitted");
+    }
+
+    #[tokio::test]
+    async fn claude_notification_rechecks_attach_after_attempt_before_paste() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        seed_session_with_runtime(tmp.path(), "alpha", "codex", "hs-codex-alpha");
+        seed_session_with_runtime(tmp.path(), "beta", "claude", "hs-claude-beta");
+        let command_log = tmp.path().join("tmux-commands.log");
+        let captured_prompt = tmp.path().join("captured-prompt");
+        let registry = tmp.path().join("coordination/registry.json");
+        let tmux = tmp.path().join("tmux");
+        fs::write(
+            &tmux,
+            format!(
+                r#"#!/bin/sh
+printf '%s\n' "$*" >> {}
+case "$1" in
+  has-session) exit 0 ;;
+  display-message)
+    if grep -q '"state": "attempting"' {}; then
+      printf '1\n'
+    else
+      printf '0\n'
+    fi
+    exit 0
+    ;;
+  load-buffer)
+    for value in "$@"; do last="$value"; done
+    cp "$last" {}
+    exit 0
+    ;;
+  paste-buffer|send-keys|delete-buffer) exit 0 ;;
+  *) exit 1 ;;
+esac
+"#,
+                shell_words::quote(&command_log.to_string_lossy()),
+                shell_words::quote(&registry.to_string_lossy()),
+                shell_words::quote(&captured_prompt.to_string_lossy())
+            ),
+        )
+        .expect("tmux script");
+        let mut permissions = fs::metadata(&tmux).expect("tmux metadata").permissions();
+        permissions.set_mode(0o700);
+        fs::set_permissions(&tmux, permissions).expect("tmux permissions");
+
+        let state = state(tmp.path(), Some(TOKEN), tmux.clone());
+        let alpha = load_session_record(&state.context, "alpha").expect("alpha");
+        let beta = load_session_record(&state.context, "beta").expect("beta");
+        let alpha_capability = provision_ready_coordination_fixture(&state.context, &alpha);
+        provision_ready_coordination_fixture(&state.context, &beta);
+        crate::activity::activate_runtime(&state.context, &beta).expect("activate beta");
+        let stop = serde_json::from_value(json!({
+            "schema_version": crate::activity::TURN_EVENT_VERSION,
+            "event_id": "claude-notification-attach-race-stop",
+            "runtime_id": beta.runtime.as_ref().expect("beta runtime").launch_id,
+            "provider": "claude",
+            "kind": "stop_observed",
+            "confidence": "observed"
+        }))
+        .expect("stop event");
+        crate::activity::ingest_event(&state.context, &beta.id, stop).expect("ingest stop");
+        let activity_path = session_dir(&state.context, &beta.id).join("activity.json");
+        let mut activity: Value =
+            serde_json::from_slice(&fs::read(&activity_path).expect("activity"))
+                .expect("activity json");
+        activity["last_provider_event_at"] = json!("2000-01-01T00:00:00Z");
+        fs::write(
+            &activity_path,
+            serde_json::to_vec_pretty(&activity).expect("serialize activity"),
+        )
+        .expect("write activity");
+
+        send_notification_fixture(&state, &alpha_capability, "claude-notification-attach-race")
+            .await;
+        let candidate = crate::coordination::pending_notifications(&state.context)
+            .expect("pending notifications")
+            .pop()
+            .expect("candidate");
+        let transcript = tmp.path().join("claude.jsonl");
+        fs::write(&transcript, b"").expect("transcript");
+        let tail = ProviderPromptTail::open_path(
+            ProviderKind::Claude,
+            "provider-beta",
+            transcript,
+            Duration::ZERO,
+        )
+        .expect("tail");
+        let prompt = crate::coordination::notification_prompt("", "beta");
+
+        assert!(matches!(
+            start_claude_coordination_notification(
+                &state.context,
+                &tmux,
+                &candidate,
+                &prompt,
+                tail,
+            ),
+            Err(ClaudeNotificationStartError::Known("recipient-attached"))
+        ));
+        assert!(
+            !captured_prompt.exists(),
+            "the immediate attach fence must run before any buffer load or paste"
+        );
+        let commands = fs::read_to_string(&command_log).expect("command log");
+        assert_eq!(
+            commands
+                .lines()
+                .filter(|line| line.starts_with("display-message "))
+                .count(),
+            2,
+            "attach must be checked once for eligibility and again after attempt persistence"
+        );
+        assert!(!commands.contains("load-buffer"));
+        assert!(!commands.contains("paste-buffer"));
+        assert!(!commands.contains("send-keys"));
+        let notification = notification_fixture(tmp.path());
+        assert_eq!(notification["state"], "queued");
+        assert_eq!(notification["last_reason"], "recipient-attached");
+    }
+
+    fn write_codex_notification_transcript(
+        path: &Path,
+        provider_id: &str,
+        prompts: &[(&str, String)],
+    ) {
+        let mut lines = vec![json!({
+            "type":"session_meta",
+            "payload":{
+                "id":provider_id,
+                "session_id":provider_id,
+                "cwd":"/tmp",
+                "source":"cli",
+                "timestamp":"2030-01-01T00:00:00Z"
+            }
+        })];
+        lines.extend(prompts.iter().map(|(timestamp, prompt)| {
+            json!({
+                "type":"event_msg",
+                "timestamp":timestamp,
+                "payload":{"type":"user_message","message":prompt}
+            })
+        }));
+        let transcript = lines
+            .into_iter()
+            .map(|line| format!("{line}\n"))
+            .collect::<String>();
+        fs::write(path, transcript).expect("provider transcript");
+    }
+
+    async fn send_notification_fixture(
+        state: &Arc<ServeState>,
+        sender_capability: &str,
+        idempotency_key: &str,
+    ) {
+        let (status, body) = call(
+            router(state.clone()),
+            post_coordination(
+                "/sessions/beta/messages/v1",
+                sender_capability.trim(),
+                json!({
+                    "body": "notification reconciliation fixture",
+                    "idempotency_key": idempotency_key,
+                    "reply_to": null,
+                    "expires_in": null
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+
+    fn set_notification_attempted_at(state_dir: &Path, attempted_at: &str) {
+        let path = state_dir.join("coordination/registry.json");
+        let mut registry: Value =
+            serde_json::from_slice(&fs::read(&path).expect("registry")).expect("registry json");
+        let notification = registry["notifications"]
+            .as_object_mut()
+            .expect("notifications")
+            .values_mut()
+            .next()
+            .expect("notification");
+        let timestamp = attempted_at
+            .parse::<jiff::Timestamp>()
+            .expect("attempted timestamp");
+        notification["attempted_at"] = json!(attempted_at);
+        notification["attempted_at_epoch"] = json!(timestamp.as_second());
+        fs::write(
+            path,
+            serde_json::to_vec_pretty(&registry).expect("registry json"),
+        )
+        .expect("registry");
+    }
+
+    fn notification_fixture(state_dir: &Path) -> Value {
+        let registry: Value = serde_json::from_slice(
+            &fs::read(state_dir.join("coordination/registry.json")).expect("registry"),
+        )
+        .expect("registry json");
+        registry["notifications"]
+            .as_object()
+            .expect("notifications")
+            .values()
+            .next()
+            .expect("notification")
+            .clone()
     }
 
     #[tokio::test]

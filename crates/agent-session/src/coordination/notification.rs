@@ -27,6 +27,8 @@ pub(crate) struct NotificationReceipt {
     pub attempted_generation: u64,
     pub queued_at_epoch: i64,
     pub attempted_at_epoch: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub attempted_at: Option<String>,
     pub updated_at_epoch: i64,
     pub next_attempt_at_epoch: i64,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -49,6 +51,7 @@ pub(crate) struct NotificationCandidate {
     pub target_incarnation: String,
     pub generation: u64,
     pub attempted_at_epoch: i64,
+    pub attempted_at: Option<String>,
 }
 
 pub(crate) fn fixed_prompt(_message_id: &str, session_id: &str) -> String {
@@ -226,6 +229,7 @@ pub(crate) fn pending_candidates(registry: &mut Registry, now: i64) -> Vec<Notif
             target_incarnation: receipt.target_incarnation.clone(),
             generation: receipt.generation,
             attempted_at_epoch: receipt.attempted_at_epoch,
+            attempted_at: receipt.attempted_at.clone(),
         })
         .collect()
 }
@@ -247,6 +251,7 @@ pub(crate) fn unresolved_candidates(
             target_incarnation: receipt.target_incarnation.clone(),
             generation: receipt.attempted_generation,
             attempted_at_epoch: receipt.attempted_at_epoch,
+            attempted_at: receipt.attempted_at.clone(),
         })
         .collect()
 }
@@ -277,19 +282,35 @@ pub(crate) fn begin_attempt(
     context: &CliContext,
     candidate: &NotificationCandidate,
 ) -> Result<bool, CliError> {
-    let now = now_epoch();
     let mut locked = super::lock_registry(context)?;
-    let Some(_) = transition_attempt(&mut locked.registry, candidate, now) else {
+    let attempted_at = jiff::Timestamp::now();
+    let Some(_) = transition_attempt_at(
+        &mut locked.registry,
+        candidate,
+        attempted_at.as_second(),
+        attempted_at,
+    ) else {
         return Ok(false);
     };
     locked.save()?;
     Ok(true)
 }
 
+#[cfg(test)]
 fn transition_attempt(
     registry: &mut Registry,
     candidate: &NotificationCandidate,
     now: i64,
+) -> Option<NotificationCandidate> {
+    let attempted_at = jiff::Timestamp::from_second(now).ok()?;
+    transition_attempt_at(registry, candidate, now, attempted_at)
+}
+
+fn transition_attempt_at(
+    registry: &mut Registry,
+    candidate: &NotificationCandidate,
+    now: i64,
+    attempted_at: jiff::Timestamp,
 ) -> Option<NotificationCandidate> {
     normalize_registry(registry, now);
     let receipt = registry.notifications.get_mut(&receipt_key(
@@ -306,6 +327,7 @@ fn transition_attempt(
     receipt.state = "attempting".to_string();
     receipt.attempted_generation = receipt.generation;
     receipt.attempted_at_epoch = now;
+    receipt.attempted_at = Some(attempted_at.to_string());
     receipt.updated_at_epoch = now;
     receipt.last_reason = Some(REASON_ATTEMPTING.to_string());
     Some(NotificationCandidate {
@@ -313,6 +335,7 @@ fn transition_attempt(
         target_incarnation: candidate.target_incarnation.clone(),
         generation: receipt.attempted_generation,
         attempted_at_epoch: receipt.attempted_at_epoch,
+        attempted_at: receipt.attempted_at.clone(),
     })
 }
 
@@ -568,6 +591,12 @@ fn merge_current(current: &mut Option<NotificationReceipt>, candidate: Notificat
 fn normalize_current(receipt: &mut NotificationReceipt, now: i64) {
     receipt.schema_version = NOTIFICATION_VERSION.to_string();
     receipt.notified_generation = receipt.notified_generation.min(receipt.generation);
+    receipt.attempted_at = receipt
+        .attempted_at
+        .as_deref()
+        .and_then(|value| value.parse::<jiff::Timestamp>().ok())
+        .filter(|timestamp| timestamp.as_second() == receipt.attempted_at_epoch)
+        .map(|timestamp| timestamp.to_string());
     if !matches!(
         receipt.state.as_str(),
         "queued" | "attempting" | "prompt_submitted" | "attempt_unknown" | "undeliverable"
@@ -721,6 +750,7 @@ mod tests {
                 target_incarnation: "incarnation".to_string(),
                 generation: 2,
                 attempted_at_epoch: 0,
+                attempted_at: None,
             }]
         );
     }
@@ -734,6 +764,7 @@ mod tests {
             target_incarnation: "incarnation".to_string(),
             generation: scheduled.generation,
             attempted_at_epoch: 0,
+            attempted_at: None,
         };
         let candidate = transition_attempt(&mut registry, &queued, 101).expect("attempt");
         assert!(
@@ -771,6 +802,7 @@ mod tests {
             target_incarnation: "incarnation".to_string(),
             generation: scheduled.generation,
             attempted_at_epoch: 0,
+            attempted_at: None,
         };
         let candidate = transition_attempt(&mut registry, &queued, 101).expect("attempt");
         assert!(transition_known_failure(
@@ -795,6 +827,7 @@ mod tests {
             unresolved_candidates(&mut registry, 121),
             vec![NotificationCandidate {
                 attempted_at_epoch: 120,
+                attempted_at: Some("1970-01-01T00:02:00Z".to_string()),
                 ..candidate.clone()
             }]
         );
@@ -859,6 +892,7 @@ mod tests {
             target_incarnation: "incarnation".to_string(),
             generation: scheduled.generation,
             attempted_at_epoch: 0,
+            attempted_at: None,
         };
         let candidate = transition_attempt(&mut registry, &queued, 102).expect("attempt");
         assert!(transition_submitted(&mut registry, &candidate, 103));
@@ -927,6 +961,7 @@ mod tests {
                 target_incarnation: "incarnation".to_string(),
                 generation: 3,
                 attempted_at_epoch: 102,
+                attempted_at: None,
             }]
         );
     }

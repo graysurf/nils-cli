@@ -664,12 +664,80 @@ fn extract_last_prompt(
 
 /// Read up to `max_bytes` from the tail of a regular transcript file.
 fn read_tail_window(path: &Path, max_bytes: usize) -> io::Result<Vec<u8>> {
+    read_tail_window_with_start(path, max_bytes).map(|(buffer, _)| buffer)
+}
+
+fn read_tail_window_with_start(path: &Path, max_bytes: usize) -> io::Result<(Vec<u8>, u64)> {
     let (mut file, metadata) = open_regular_file(path)?;
     let start = metadata.len().saturating_sub(max_bytes as u64);
     file.seek(SeekFrom::Start(start))?;
     let mut buffer = Vec::new();
     file.take(max_bytes as u64).read_to_end(&mut buffer)?;
-    Ok(buffer)
+    Ok((buffer, start))
+}
+
+/// Scan the bounded provider-prompt history for an exact prompt submitted
+/// strictly after a durable notification attempt boundary.
+///
+/// `None` keeps an uncertain attempt parked when the source changed, a matching
+/// prompt has no reliable timestamp, or the bounded window cannot prove that it
+/// reaches the attempt boundary. This avoids turning incomplete observation
+/// into either a duplicate delivery or a false acknowledgement.
+pub(crate) fn prompt_observed_after(
+    source: &ProviderPromptSource,
+    expected_prompt: &str,
+    attempted_at: &jiff::Timestamp,
+) -> Option<bool> {
+    if !source_still_matches(source) {
+        return None;
+    }
+    let (buffer, start) =
+        read_tail_window_with_start(&source.path, MAX_LAST_PROMPT_RECOVERY_BYTES).ok()?;
+    if !source_still_matches(source) {
+        return None;
+    }
+
+    let mut window_reaches_attempt = start == 0;
+    let mut ambiguous_exact_match = false;
+    for raw_line in buffer.split(|&byte| byte == b'\n') {
+        let raw_line = match raw_line.last() {
+            Some(b'\r') => &raw_line[..raw_line.len() - 1],
+            _ => raw_line,
+        };
+        let Ok(line) = std::str::from_utf8(raw_line) else {
+            continue;
+        };
+        let parsed = match source.provider {
+            ProviderKind::Codex => parse_codex_prompt(line),
+            ProviderKind::Claude => parse_claude_user_prompt(line, &source.session_id),
+        };
+        let Some(parsed) = parsed else {
+            continue;
+        };
+        let submitted_at = parsed
+            .submitted_at
+            .as_deref()
+            .and_then(|value| value.parse::<jiff::Timestamp>().ok());
+        if submitted_at
+            .as_ref()
+            .is_some_and(|submitted_at| submitted_at <= attempted_at)
+        {
+            window_reaches_attempt = true;
+        }
+        if parsed.prompt != expected_prompt {
+            continue;
+        }
+        match submitted_at {
+            Some(submitted_at) if submitted_at > *attempted_at => return Some(true),
+            Some(_) => {}
+            None => ambiguous_exact_match = true,
+        }
+    }
+    if ambiguous_exact_match || !window_reaches_attempt {
+        None
+    } else {
+        Some(false)
+    }
 }
 
 /// Resolve the most recent user prompt for a discovered transcript source by
