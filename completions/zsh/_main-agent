@@ -44,6 +44,18 @@ json\:"Single-record JSON envelope (snake_case)"))' \
 '--help[Print help (see more with '\''--help'\'')]' \
 && ret=0
 ;;
+(rebind)
+_arguments "${_arguments_options[@]}" : \
+'--if-revision=[Expected current run revision; stale values fail closed and report current_revision.]:IF_REVISION:_default' \
+'--idempotency-key=[Retry an ambiguous outcome with the same idempotency key and the same logical request; use a new key for a changed request.]:IDEMPOTENCY_KEY:_default' \
+'--format=[]:FORMAT:((text\:"Human-readable text output (default)"
+json\:"Single-record JSON envelope (snake_case)"))' \
+'--state-dir=[agent-session state directory]:PATH:_files -/' \
+'--host=[Advisory machine label for public projections]:HOST:_default' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+&& ret=0
+;;
 (self)
 _arguments "${_arguments_options[@]}" : \
 '--state-dir=[agent-session state directory]:PATH:_files -/' \
@@ -124,8 +136,10 @@ _arguments "${_arguments_options[@]}" : \
         case $line[1] in
             (start)
 _arguments "${_arguments_options[@]}" : \
-'--assignment-file=[Private assignment packet JSON file]:PATH:_files' \
-'--if-run-revision=[Expected current run revision; stale values fail closed and report current_revision.]:IF_RUN_REVISION:_default' \
+'(--batch)--assignment-file=[Private assignment packet JSON file (single-lane launch)]:PATH:_files' \
+'--batch=[Directory of assignment packet JSON files to launch as one batch. Each lane is fenced independently (T2 decouple), so one lane failing isolates to its own typed result rather than aborting the batch]:DIR:_files -/' \
+'--if-run-revision=[Optional expected run revision. Omit to launch without a run-revision fence\: assignment creation is decoupled from the run revision, so parallel and batch starts no longer collide. When supplied, a stale value fails closed and reports current_revision.]:IF_RUN_REVISION:_default' \
+'--await-ready=[After launch, wait up to this bounded duration (0 = no wait) for the worker'\''s authenticated checkpoint to advance the assignment past \`starting\`. This folds the readiness + newer-turn + identity proof into worker start'\''s typed result. 0-60s (integer with optional s/m/h suffix)]:AWAIT_READY:_default' \
 '--idempotency-key=[Retry an ambiguous outcome with the same idempotency key and the same logical request; use a new key for a changed request.]:IDEMPOTENCY_KEY:_default' \
 '--format=[]:FORMAT:((text\:"Human-readable text output (default)"
 json\:"Single-record JSON envelope (snake_case)"))' \
@@ -154,6 +168,22 @@ json\:"Single-record JSON envelope (snake_case)"))' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
 ':assignment_id:_default' \
+&& ret=0
+;;
+(wait)
+_arguments "${_arguments_options[@]}" : \
+'--until=[Assignment-state milestone to wait for]:UNTIL:((submitted\:"The worker submitted a result for Main Agent review"
+blocked\:"The worker reported itself blocked"
+terminal\:"The assignment reached a terminal state (accepted, released, or cancelled)"))' \
+'--timeout=[Bounded wait duration (1-60s; integer with optional s/m/h/d suffix)]:TIMEOUT:_default' \
+'--format=[]:FORMAT:((text\:"Human-readable text output (default)"
+json\:"Single-record JSON envelope (snake_case)"))' \
+'--state-dir=[agent-session state directory]:PATH:_files -/' \
+'--host=[Advisory machine label for public projections]:HOST:_default' \
+'--any[Watch every assignment in the active run instead of a single id]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+'::assignment_id -- Assignment to watch. Omit and pass --any to watch every assignment:_default' \
 && ret=0
 ;;
 (message)
@@ -196,6 +226,19 @@ json\:"Single-record JSON envelope (snake_case)"))' \
 && ret=0
 ;;
 (delete)
+_arguments "${_arguments_options[@]}" : \
+'--if-revision=[Expected current assignment revision; stale values fail closed and report current_revision.]:IF_REVISION:_default' \
+'--idempotency-key=[Retry an ambiguous outcome with the same idempotency key and the same logical request; use a new key for a changed request.]:IDEMPOTENCY_KEY:_default' \
+'--format=[]:FORMAT:((text\:"Human-readable text output (default)"
+json\:"Single-record JSON envelope (snake_case)"))' \
+'--state-dir=[agent-session state directory]:PATH:_files -/' \
+'--host=[Advisory machine label for public projections]:HOST:_default' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+':assignment_id:_default' \
+&& ret=0
+;;
+(retire)
 _arguments "${_arguments_options[@]}" : \
 '--if-revision=[Expected current assignment revision; stale values fail closed and report current_revision.]:IF_REVISION:_default' \
 '--idempotency-key=[Retry an ambiguous outcome with the same idempotency key and the same logical request; use a new key for a changed request.]:IDEMPOTENCY_KEY:_default' \
@@ -280,6 +323,19 @@ json\:"Single-record JSON envelope (snake_case)"))' \
 '--help[Print help (see more with '\''--help'\'')]' \
 && ret=0
 ;;
+(quick)
+_arguments "${_arguments_options[@]}" : \
+'--assignment-file=[Private assignment packet JSON file]:PATH:_files' \
+'--tier=[Work tier for the synthesized ephemeral run (L0/L1 delegate-all)]:TIER:_default' \
+'--idempotency-key=[Retry an ambiguous outcome with the same idempotency key and the same logical request; use a new key for a changed request.]:IDEMPOTENCY_KEY:_default' \
+'--format=[]:FORMAT:((text\:"Human-readable text output (default)"
+json\:"Single-record JSON envelope (snake_case)"))' \
+'--state-dir=[agent-session state directory]:PATH:_files -/' \
+'--host=[Advisory machine label for public projections]:HOST:_default' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+&& ret=0
+;;
 (completion)
 _arguments "${_arguments_options[@]}" : \
 '--state-dir=[agent-session state directory]:PATH:_files -/' \
@@ -298,6 +354,7 @@ esac
 _main-agent_commands() {
     local commands; commands=(
 'init:Create or continuity-rebind this Main Agent'\''s durable run' \
+'rebind:Re-bind this Main Agent'\''s durable run to the current session incarnation after a resume, reusing the stored objective packet (no packet file)' \
 'self:Inspect the authenticated Main Agent or worker identity' \
 'rehydrate:Recover the authenticated durable objective or assignment capsule' \
 'status:Show a bounded status capsule' \
@@ -308,6 +365,7 @@ _main-agent_commands() {
 'handoff:Transfer primary assignment routing after quiescence checks' \
 'adopt:Adopt an orphaned assignment into this Main Agent'\''s run' \
 'close:Close this run after all assignments are terminal' \
+'quick:Fast-path\: create an ephemeral run, single assignment, and launch in one call. The run auto-closes once the worker is torn down' \
 'completion:Print shell completion script' \
     )
     _describe -t commands 'main-agent commands' commands "$@"
@@ -352,6 +410,16 @@ _main-agent__subcmd__init_commands() {
     local commands; commands=()
     _describe -t commands 'main-agent init commands' commands "$@"
 }
+(( $+functions[_main-agent__subcmd__quick_commands] )) ||
+_main-agent__subcmd__quick_commands() {
+    local commands; commands=()
+    _describe -t commands 'main-agent quick commands' commands "$@"
+}
+(( $+functions[_main-agent__subcmd__rebind_commands] )) ||
+_main-agent__subcmd__rebind_commands() {
+    local commands; commands=()
+    _describe -t commands 'main-agent rebind commands' commands "$@"
+}
 (( $+functions[_main-agent__subcmd__rehydrate_commands] )) ||
 _main-agent__subcmd__rehydrate_commands() {
     local commands; commands=()
@@ -380,10 +448,12 @@ _main-agent__subcmd__worker_commands() {
 'start:Create an assignment and launch its interactive managed worker' \
 'list:List assignments owned by this Main Agent'\''s active run' \
 'show:Show one assignment, including its private packet' \
+'wait:Bounded long-poll until an assignment reaches a target state' \
 'message:Send a private mailbox message to an assignment'\''s worker' \
 'accept:Accept a submitted worker result after Main Agent review' \
 'release:Mark an accepted assignment terminal before worker deletion' \
 'delete:Delete a released worker through guarded agent-session cleanup' \
+'retire:Retire an accepted assignment in one call\: release -> delete -> confirm the worker is absent from a fresh list' \
     )
     _describe -t commands 'main-agent worker commands' commands "$@"
 }
@@ -412,6 +482,11 @@ _main-agent__subcmd__worker__subcmd__release_commands() {
     local commands; commands=()
     _describe -t commands 'main-agent worker release commands' commands "$@"
 }
+(( $+functions[_main-agent__subcmd__worker__subcmd__retire_commands] )) ||
+_main-agent__subcmd__worker__subcmd__retire_commands() {
+    local commands; commands=()
+    _describe -t commands 'main-agent worker retire commands' commands "$@"
+}
 (( $+functions[_main-agent__subcmd__worker__subcmd__show_commands] )) ||
 _main-agent__subcmd__worker__subcmd__show_commands() {
     local commands; commands=()
@@ -421,6 +496,11 @@ _main-agent__subcmd__worker__subcmd__show_commands() {
 _main-agent__subcmd__worker__subcmd__start_commands() {
     local commands; commands=()
     _describe -t commands 'main-agent worker start commands' commands "$@"
+}
+(( $+functions[_main-agent__subcmd__worker__subcmd__wait_commands] )) ||
+_main-agent__subcmd__worker__subcmd__wait_commands() {
+    local commands; commands=()
+    _describe -t commands 'main-agent worker wait commands' commands "$@"
 }
 
 if [ "$funcstack[1]" = "_main-agent" ]; then

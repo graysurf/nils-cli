@@ -60,6 +60,11 @@ pub(crate) struct RunRecord {
     pub controller: SessionRef,
     #[serde(default)]
     pub durable_refs: Vec<String>,
+    /// Ephemeral runs are created by `main-agent quick` and auto-close once
+    /// their last assignment's worker is torn down, so a fast-path caller never
+    /// runs an explicit `close`.
+    #[serde(default)]
+    pub ephemeral: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub checkpoint: Option<RunCheckpoint>,
     pub created_at: String,
@@ -101,6 +106,12 @@ pub(crate) struct AssignmentRecord {
     pub scopes: Vec<String>,
     #[serde(default)]
     pub durable_refs: Vec<String>,
+    /// Assignment ids in the same run this assignment depends on. Advisory
+    /// ordering: `worker start` refuses to launch until every dependency has
+    /// reached a satisfied terminal state (see `dependency_state_satisfies`).
+    /// Stored durably so a launched dependent's ordering survives compaction.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub depends_on: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub checkpoint: Option<RunCheckpoint>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -235,6 +246,24 @@ impl Registry {
             }
             for relationship in &assignment.borrowed_by {
                 validate_session_ref(&relationship.session)?;
+            }
+            // Dependency edges are bounds/format-checked only. Referential
+            // existence is intentionally NOT a registry invariant: a dependency
+            // may be released and deleted after a dependent launches, and that
+            // must not brick registry reads. Existence/satisfaction is enforced
+            // at `worker start` gate time against live state instead.
+            if assignment.depends_on.len() > 64 {
+                return Err(store_invalid(
+                    "orchestration assignment exceeds dependency limit",
+                ));
+            }
+            for dependency in &assignment.depends_on {
+                validate_slug("assignment dependency id", dependency, 128)?;
+                if dependency == &assignment.assignment_id {
+                    return Err(store_invalid(
+                        "orchestration assignment cannot depend on itself",
+                    ));
+                }
             }
         }
         Ok(())
@@ -673,6 +702,7 @@ mod tests {
                     session_created_at: "2030-01-01T00:00:00Z".to_string(),
                 },
                 durable_refs: Vec::new(),
+                ephemeral: false,
                 checkpoint: None,
                 created_at: "2030-01-01T00:00:00Z".to_string(),
                 updated_at: "2030-01-01T00:00:00Z".to_string(),

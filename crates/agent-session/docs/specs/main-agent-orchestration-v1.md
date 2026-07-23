@@ -67,12 +67,15 @@ main-agent self show --format json
 main-agent rehydrate --format json|markdown
 main-agent status --format json
 main-agent checkpoint --file FILE --if-revision N --idempotency-key KEY --format json
-main-agent worker start --assignment-file FILE --if-run-revision N --idempotency-key KEY --format json
+main-agent worker start --assignment-file FILE [--if-run-revision N] [--await-ready D] --idempotency-key KEY --format json
+main-agent worker start --batch DIR --idempotency-key KEY --format json
 main-agent worker list|show ...
 main-agent worker wait [ASSIGNMENT_ID | --any] --until submitted|blocked|terminal [--timeout D] --format json
 main-agent worker message|accept|release|delete ...
+main-agent worker retire ID --if-revision N --idempotency-key KEY --format json
 main-agent collaborate|borrow|handoff|adopt ...
 main-agent close --if-revision N --idempotency-key KEY --format json
+main-agent quick --assignment-file FILE [--tier L0|L1|L2|L3] --idempotency-key KEY --format json
 ```
 
 `init` first confirms or acquires the caller-owned coordination claim, then
@@ -86,6 +89,47 @@ revision/absence fence, and an idempotency key. Read-only discovery does not.
 Worker launch returns `pending-worker-checkpoint` until authenticated worker
 self-check/checkpoint evidence advances the assignment; transport is never
 reported as acceptance.
+
+Assignment creation is fenced by the caller's active claim, the current-main
+check, and assignment-absence — not by the run revision. `--if-run-revision` is
+therefore optional on `worker start`: supply it to assert an expected run
+revision, or omit it so parallel and batch launches do not serialize on a shared
+run revision. An assignment packet may declare `depends_on: [assignment_id]`
+(same-run assignment ids, max 64). `worker start` refuses with
+`dependency-not-satisfied` — listing each unmet dependency and its observed
+state (or null when missing or in another run) — until every dependency has been
+accepted (`accepted`, or the post-accept `released`). The ordering edge is stored
+on the launched assignment and surfaced by `worker list`/`show` and `rehydrate`,
+so it survives compaction. Dependency existence is enforced only at this gate,
+never as a registry invariant, so releasing and deleting a dependency after a
+dependent launches cannot brick registry reads. This is advisory ordering, not an
+access-control boundary.
+
+`worker start --batch DIR` launches every `*.json` assignment packet in `DIR`
+as one call, fencing each lane independently so a failing lane isolates to its
+own typed result (`{assignment_file, ok, result | error}`) instead of aborting
+the batch; the command itself succeeds and the caller branches on each lane's
+`ok`. `main-agent quick --assignment-file FILE` is the L0/L1 fast-path: it
+synthesizes an ephemeral run and work-context claim from the assignment (the
+packet MUST declare a `repository`), launches the single worker in one call, and
+marks the run ephemeral so it auto-closes once that worker is torn down — no
+explicit `close`. A session that already controls a run must use the granular
+`init` + `worker start` path instead.
+
+`worker start --await-ready D` folds the readiness proof into launch: after the
+worker is bound it waits up to a bounded `D` (0-60s; `0` = launch-only) for the
+worker's authenticated, revision-fenced, incarnation-matched checkpoint to
+advance the assignment past `starting`, then returns a typed `readiness`
+(`ready` once it advanced, else `readiness_failed` with a `safe_state`). That
+checkpoint advancing is the readiness + newer-turn + identity proof, so the Main
+Agent branches on one typed result instead of hand-running the verified-startup
+sequence. The wait takes no registry lock, so it never blocks the worker's own
+checkpoint; `--await-ready 0` preserves the launch-only `pending-worker-checkpoint`
+result. `worker retire ID` is the teardown macro: it composes release -> delete
+and reports the worker's absence in one call, replacing the hand-run
+release -> delete -> confirm sequence. An accepted assignment is released first;
+an already-terminal one goes straight to delete. Per-step idempotency keys are
+derived from the retire key so a retry converges through each step's receipt.
 
 `worker wait` is read-only completion-awareness for the orchestrating Main
 Agent — the CLI counterpart to the operator console's sub-second SSE push. It is

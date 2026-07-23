@@ -538,7 +538,9 @@ fn main_agent_help_documents_safe_lifecycle_revision_fences_and_retry_keys() {
         ),
         (
             &["worker", "start", "--help"][..],
-            &["expected current run revision", "same idempotency key"][..],
+            // --if-run-revision is now optional (T2 decouple), so the help reads
+            // "optional expected run revision" rather than "current".
+            &["expected run revision", "same idempotency key"][..],
         ),
         (
             &["worker", "accept", "--help"][..],
@@ -5214,5 +5216,656 @@ fn main_agent_worker_wait_transitions_times_out_and_validates_target() {
     assert_eq!(
         no_target.stdout_json()["error"]["code"],
         "worker-wait-target"
+    );
+}
+
+#[test]
+fn main_agent_worker_start_decouples_run_revision_and_gates_on_dependencies() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let state_dir = tmp.path().join("state");
+    let checkout = tmp.path().join("checkout");
+    fs::create_dir(&state_dir).expect("state");
+    init_checkout(&checkout, "https://example.invalid/example/repository.git");
+    seed_brokers_at(
+        &state_dir,
+        &[(
+            "main-one",
+            "main-incarnation-one",
+            "main-private-capability-material-0000000001",
+            checkout.as_path(),
+            Some("enforce"),
+        )],
+    );
+    let main_capability = init_main_run(tmp.path(), &state_dir, &checkout, "main-one", "run-one");
+
+    // Seed an upstream dependency that has NOT been accepted yet.
+    let dep_packet = json!({
+        "schema_version": "main-agent.assignment-input.v1",
+        "assignment_id": "assignment-dep",
+        "task_summary": "Upstream dependency",
+        "task": {},
+        "launch": {
+            "agent": "codex",
+            "cwd": checkout,
+            "title": null,
+            "session_id": null,
+            "coordination_mode": "enforce",
+            "agent_args": []
+        },
+        "repository": "example/repository",
+        "worktree": null,
+        "base_ref": "main",
+        "scopes": ["crates/agent-session"],
+        "durable_refs": []
+    });
+    insert_orchestration_assignment(
+        &state_dir,
+        "assignment-dep",
+        json!({
+            "schema_version": "agent-session.orchestration-assignment.v1",
+            "assignment_id": "assignment-dep",
+            "run_id": "run-one",
+            "revision": 2,
+            "state": "working",
+            "task_summary": "Upstream dependency",
+            "private_packet_digest": "replaced-by-fixture",
+            "primary_manager": {
+                "session_id": "main-one",
+                "session_incarnation": "main-incarnation-one",
+                "session_created_at": "2030-01-01T00:00:00Z"
+            },
+            "worker": null,
+            "collaborators": [],
+            "borrowed_by": [],
+            "repository": "example/repository",
+            "worktree": null,
+            "base_ref": "main",
+            "scopes": ["crates/agent-session"],
+            "durable_refs": [],
+            "checkpoint": null,
+            "result_summary": null,
+            "blocker_summary": null,
+            "created_at": "2030-01-01T00:00:01Z",
+            "updated_at": "2030-01-01T00:00:02Z"
+        }),
+        &dep_packet,
+    );
+    let state = state_dir.to_str().expect("state dir");
+
+    // A dependent packet naming the not-yet-accepted dependency and a missing one.
+    let dependent_path = tmp.path().join("dependent.json");
+    write_private_json(
+        &dependent_path,
+        &json!({
+            "schema_version": "main-agent.assignment-input.v1",
+            "assignment_id": "assignment-dependent",
+            "task_summary": "Downstream work",
+            "task": {},
+            "launch": {
+                "agent": "codex",
+                "cwd": checkout,
+                "title": null,
+                "session_id": null,
+                "coordination_mode": "enforce",
+                "agent_args": []
+            },
+            "repository": "example/repository",
+            "worktree": null,
+            "base_ref": "main",
+            "scopes": ["crates/agent-session"],
+            "durable_refs": [],
+            "depends_on": ["assignment-dep", "assignment-missing"]
+        }),
+    );
+
+    // T2 decouple + T5 gate: OMITTING --if-run-revision is accepted (no run
+    // fence), and the dependent is refused until its dependencies are accepted.
+    let refused = run_main_agent(
+        &checkout,
+        &[
+            "--state-dir",
+            state,
+            "worker",
+            "start",
+            "--assignment-file",
+            dependent_path.to_str().expect("dependent path"),
+            "--idempotency-key",
+            "start-dependent-0001",
+            "--format",
+            "json",
+        ],
+        &[("AGENT_SESSION_CAPABILITY_FILE", &main_capability)],
+    );
+    assert_ne!(
+        refused.code,
+        0,
+        "dependent must be refused; stdout={}",
+        refused.stdout_text()
+    );
+    assert_eq!(
+        refused.stdout_json()["error"]["code"],
+        "dependency-not-satisfied"
+    );
+    let blocked_on = refused.stdout_json()["error"]["details"]["blocked_on"].clone();
+    let ids: Vec<String> = blocked_on
+        .as_array()
+        .expect("blocked_on array")
+        .iter()
+        .map(|entry| entry["assignment_id"].as_str().expect("id").to_string())
+        .collect();
+    assert!(
+        ids.contains(&"assignment-dep".to_string()),
+        "pre-terminal dependency is reported: {ids:?}"
+    );
+    assert!(
+        ids.contains(&"assignment-missing".to_string()),
+        "missing dependency is reported: {ids:?}"
+    );
+
+    // Refusal must not create the assignment (nothing to clean up).
+    let missing_after = run_main_agent(
+        &checkout,
+        &[
+            "--state-dir",
+            state,
+            "worker",
+            "show",
+            "assignment-dependent",
+            "--format",
+            "json",
+        ],
+        &[("AGENT_SESSION_CAPABILITY_FILE", &main_capability)],
+    );
+    assert_ne!(missing_after.code, 0);
+    assert_eq!(
+        missing_after.stdout_json()["error"]["code"],
+        "assignment-not-found"
+    );
+
+    // A supplied but stale --if-run-revision still fences (honored when present,
+    // and it fires before any launch).
+    let stale = run_main_agent(
+        &checkout,
+        &[
+            "--state-dir",
+            state,
+            "worker",
+            "start",
+            "--assignment-file",
+            dependent_path.to_str().expect("dependent path"),
+            "--if-run-revision",
+            "999",
+            "--idempotency-key",
+            "start-dependent-0002",
+            "--format",
+            "json",
+        ],
+        &[("AGENT_SESSION_CAPABILITY_FILE", &main_capability)],
+    );
+    assert_ne!(stale.code, 0);
+    assert_eq!(
+        stale.stdout_json()["error"]["code"],
+        "orchestration-revision-conflict"
+    );
+}
+
+#[test]
+fn main_agent_worker_start_batch_isolates_per_lane_results() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let state_dir = tmp.path().join("state");
+    let checkout = tmp.path().join("checkout");
+    fs::create_dir(&state_dir).expect("state");
+    init_checkout(&checkout, "https://example.invalid/example/repository.git");
+    seed_brokers_at(
+        &state_dir,
+        &[(
+            "main-one",
+            "main-incarnation-one",
+            "main-private-capability-material-0000000001",
+            checkout.as_path(),
+            Some("enforce"),
+        )],
+    );
+    let main_capability = init_main_run(tmp.path(), &state_dir, &checkout, "main-one", "run-one");
+
+    // An unaccepted dependency so dependent lanes refuse before any launch.
+    let dep_packet = json!({
+        "schema_version": "main-agent.assignment-input.v1",
+        "assignment_id": "assignment-dep",
+        "task_summary": "Batch upstream",
+        "task": {},
+        "launch": {
+            "agent": "codex", "cwd": checkout, "title": null, "session_id": null,
+            "coordination_mode": "enforce", "agent_args": []
+        },
+        "repository": "example/repository", "worktree": null, "base_ref": "main",
+        "scopes": ["crates/agent-session"], "durable_refs": []
+    });
+    insert_orchestration_assignment(
+        &state_dir,
+        "assignment-dep",
+        json!({
+            "schema_version": "agent-session.orchestration-assignment.v1",
+            "assignment_id": "assignment-dep",
+            "run_id": "run-one",
+            "revision": 2,
+            "state": "working",
+            "task_summary": "Batch upstream",
+            "private_packet_digest": "replaced-by-fixture",
+            "primary_manager": {
+                "session_id": "main-one",
+                "session_incarnation": "main-incarnation-one",
+                "session_created_at": "2030-01-01T00:00:00Z"
+            },
+            "worker": null,
+            "collaborators": [],
+            "borrowed_by": [],
+            "repository": "example/repository",
+            "worktree": null,
+            "base_ref": "main",
+            "scopes": ["crates/agent-session"],
+            "durable_refs": [],
+            "checkpoint": null,
+            "result_summary": null,
+            "blocker_summary": null,
+            "created_at": "2030-01-01T00:00:01Z",
+            "updated_at": "2030-01-01T00:00:02Z"
+        }),
+        &dep_packet,
+    );
+    let state = state_dir.to_str().expect("state dir");
+
+    // Batch dir: two lanes depend on the unaccepted dependency (refuse), one
+    // lane is schema-invalid — all fail before launch, exercising per-lane
+    // isolation across distinct error kinds.
+    let batch_dir = tmp.path().join("batch");
+    fs::create_dir(&batch_dir).expect("batch dir");
+    for name in ["lane-a", "lane-b"] {
+        write_private_json(
+            &batch_dir.join(format!("{name}.json")),
+            &json!({
+                "schema_version": "main-agent.assignment-input.v1",
+                "assignment_id": format!("assignment-{name}"),
+                "task_summary": "Batch lane",
+                "task": {},
+                "launch": {
+                    "agent": "codex", "cwd": checkout, "title": null, "session_id": null,
+                    "coordination_mode": "enforce", "agent_args": []
+                },
+                "repository": "example/repository", "worktree": null, "base_ref": "main",
+                "scopes": ["crates/agent-session"], "durable_refs": [],
+                "depends_on": ["assignment-dep"]
+            }),
+        );
+    }
+    write_private_json(
+        &batch_dir.join("lane-bad.json"),
+        &json!({
+            "schema_version": "wrong.schema.v1",
+            "assignment_id": "assignment-bad",
+            "task_summary": "Invalid lane",
+            "task": {},
+            "launch": {
+                "agent": "codex", "cwd": checkout, "title": null, "session_id": null,
+                "coordination_mode": "enforce", "agent_args": []
+            }
+        }),
+    );
+
+    let batch = run_main_agent(
+        &checkout,
+        &[
+            "--state-dir",
+            state,
+            "worker",
+            "start",
+            "--batch",
+            batch_dir.to_str().expect("batch dir"),
+            "--idempotency-key",
+            "batch-0001",
+            "--format",
+            "json",
+        ],
+        &[("AGENT_SESSION_CAPABILITY_FILE", &main_capability)],
+    );
+    assert_eq!(
+        batch.code,
+        0,
+        "batch succeeds; stderr={}",
+        batch.stderr_text()
+    );
+    assert_eq!(
+        data(&batch)["schema_version"],
+        "main-agent.worker-start-batch.v1"
+    );
+    let lanes = data(&batch)["lanes"].as_array().expect("lanes").clone();
+    assert_eq!(lanes.len(), 3, "one lane per packet: {lanes:?}");
+    assert!(
+        lanes.iter().all(|lane| lane["ok"] == json!(false)),
+        "every lane failed before launch: {lanes:?}"
+    );
+    let codes: Vec<String> = lanes
+        .iter()
+        .map(|lane| {
+            lane["error"]["code"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string()
+        })
+        .collect();
+    assert_eq!(
+        codes
+            .iter()
+            .filter(|code| *code == "dependency-not-satisfied")
+            .count(),
+        2,
+        "two dependent lanes refuse: {codes:?}"
+    );
+    assert_eq!(
+        codes
+            .iter()
+            .filter(|code| *code == "invalid-orchestration-input")
+            .count(),
+        1,
+        "one invalid lane: {codes:?}"
+    );
+    let launched = fs::read_dir(state_dir.join("sessions"))
+        .map(|dir| {
+            dir.filter_map(Result::ok)
+                .filter(|entry| entry.file_name().to_string_lossy().starts_with("worker-"))
+                .count()
+        })
+        .unwrap_or(0);
+    assert_eq!(launched, 0, "refused/invalid lanes must not launch workers");
+
+    // Neither source flag is a usage error.
+    let neither = run_main_agent(
+        &checkout,
+        &[
+            "--state-dir",
+            state,
+            "worker",
+            "start",
+            "--idempotency-key",
+            "batch-0002",
+            "--format",
+            "json",
+        ],
+        &[("AGENT_SESSION_CAPABILITY_FILE", &main_capability)],
+    );
+    assert_ne!(neither.code, 0);
+    assert_eq!(
+        neither.stdout_json()["error"]["code"],
+        "worker-start-source"
+    );
+
+    // An empty batch directory is rejected.
+    let empty_dir = tmp.path().join("empty");
+    fs::create_dir(&empty_dir).expect("empty dir");
+    let empty = run_main_agent(
+        &checkout,
+        &[
+            "--state-dir",
+            state,
+            "worker",
+            "start",
+            "--batch",
+            empty_dir.to_str().expect("empty dir"),
+            "--idempotency-key",
+            "batch-0003",
+            "--format",
+            "json",
+        ],
+        &[("AGENT_SESSION_CAPABILITY_FILE", &main_capability)],
+    );
+    assert_ne!(empty.code, 0);
+    assert_eq!(
+        empty.stdout_json()["error"]["code"],
+        "invalid-orchestration-input"
+    );
+}
+
+#[test]
+fn main_agent_quick_validates_before_launch() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let state_dir = tmp.path().join("state");
+    let checkout = tmp.path().join("checkout");
+    fs::create_dir(&state_dir).expect("state");
+    init_checkout(&checkout, "https://example.invalid/example/repository.git");
+    seed_brokers_at(
+        &state_dir,
+        &[(
+            "main-one",
+            "main-incarnation-one",
+            "main-private-capability-material-0000000001",
+            checkout.as_path(),
+            Some("enforce"),
+        )],
+    );
+    let main_capability = capability(&state_dir, "main-one");
+    let state = state_dir.to_str().expect("state dir");
+
+    let with_repo = tmp.path().join("with-repo.json");
+    write_private_json(
+        &with_repo,
+        &json!({
+            "schema_version": "main-agent.assignment-input.v1",
+            "assignment_id": "assignment-quick",
+            "task_summary": "Quick delegate",
+            "task": {},
+            "launch": {
+                "agent": "codex", "cwd": checkout, "title": null, "session_id": null,
+                "coordination_mode": "enforce", "agent_args": []
+            },
+            "repository": "example/repository", "worktree": null, "base_ref": "main",
+            "scopes": ["crates/agent-session"], "durable_refs": []
+        }),
+    );
+
+    // (a) An invalid tier is rejected before any run or claim work.
+    let bad_tier = run_main_agent(
+        &checkout,
+        &[
+            "--state-dir",
+            state,
+            "quick",
+            "--assignment-file",
+            with_repo.to_str().expect("with-repo"),
+            "--tier",
+            "L9",
+            "--idempotency-key",
+            "quick-0001",
+            "--format",
+            "json",
+        ],
+        &[("AGENT_SESSION_CAPABILITY_FILE", &main_capability)],
+    );
+    assert_ne!(bad_tier.code, 0);
+    assert_eq!(
+        bad_tier.stdout_json()["error"]["code"],
+        "invalid-orchestration-input"
+    );
+    assert!(
+        bad_tier.stdout_json()["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("tier")
+    );
+
+    // (b) A packet without a repository cannot synthesize an ephemeral run.
+    let no_repo = tmp.path().join("no-repo.json");
+    write_private_json(
+        &no_repo,
+        &json!({
+            "schema_version": "main-agent.assignment-input.v1",
+            "assignment_id": "assignment-quick",
+            "task_summary": "Quick delegate",
+            "task": {},
+            "launch": {
+                "agent": "codex", "cwd": checkout, "title": null, "session_id": null,
+                "coordination_mode": "enforce", "agent_args": []
+            },
+            "repository": null, "worktree": null, "base_ref": "main",
+            "scopes": ["crates/agent-session"], "durable_refs": []
+        }),
+    );
+    let missing_repo = run_main_agent(
+        &checkout,
+        &[
+            "--state-dir",
+            state,
+            "quick",
+            "--assignment-file",
+            no_repo.to_str().expect("no-repo"),
+            "--idempotency-key",
+            "quick-0002",
+            "--format",
+            "json",
+        ],
+        &[("AGENT_SESSION_CAPABILITY_FILE", &main_capability)],
+    );
+    assert_ne!(missing_repo.code, 0);
+    assert_eq!(
+        missing_repo.stdout_json()["error"]["code"],
+        "invalid-orchestration-input"
+    );
+    assert!(
+        missing_repo.stdout_json()["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("repository")
+    );
+
+    // (c) quick refuses when the session already controls a run.
+    let _ = init_main_run(tmp.path(), &state_dir, &checkout, "main-one", "run-one");
+    let exists = run_main_agent(
+        &checkout,
+        &[
+            "--state-dir",
+            state,
+            "quick",
+            "--assignment-file",
+            with_repo.to_str().expect("with-repo"),
+            "--idempotency-key",
+            "quick-0003",
+            "--format",
+            "json",
+        ],
+        &[("AGENT_SESSION_CAPABILITY_FILE", &main_capability)],
+    );
+    assert_ne!(exists.code, 0);
+    assert_eq!(exists.stdout_json()["error"]["code"], "quick-run-exists");
+}
+
+#[test]
+fn main_agent_worker_retire_rejects_non_terminal_and_missing() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let state_dir = tmp.path().join("state");
+    let checkout = tmp.path().join("checkout");
+    fs::create_dir(&state_dir).expect("state");
+    init_checkout(&checkout, "https://example.invalid/example/repository.git");
+    seed_brokers_at(
+        &state_dir,
+        &[(
+            "main-one",
+            "main-incarnation-one",
+            "main-private-capability-material-0000000001",
+            checkout.as_path(),
+            Some("enforce"),
+        )],
+    );
+    let main_capability = init_main_run(tmp.path(), &state_dir, &checkout, "main-one", "run-one");
+    let private_packet = json!({
+        "schema_version": "main-agent.assignment-input.v1",
+        "assignment_id": "assignment-one",
+        "task_summary": "Retire fixture",
+        "task": {},
+        "launch": {
+            "agent": "codex", "cwd": checkout, "title": null, "session_id": null,
+            "coordination_mode": "enforce", "agent_args": []
+        },
+        "repository": "example/repository", "worktree": null, "base_ref": "main",
+        "scopes": ["crates/agent-session"], "durable_refs": []
+    });
+    insert_orchestration_assignment(
+        &state_dir,
+        "assignment-one",
+        json!({
+            "schema_version": "agent-session.orchestration-assignment.v1",
+            "assignment_id": "assignment-one",
+            "run_id": "run-one",
+            "revision": 2,
+            "state": "working",
+            "task_summary": "Retire fixture",
+            "private_packet_digest": "replaced-by-fixture",
+            "primary_manager": {
+                "session_id": "main-one",
+                "session_incarnation": "main-incarnation-one",
+                "session_created_at": "2030-01-01T00:00:00Z"
+            },
+            "worker": null,
+            "collaborators": [],
+            "borrowed_by": [],
+            "repository": "example/repository",
+            "worktree": null,
+            "base_ref": "main",
+            "scopes": ["crates/agent-session"],
+            "durable_refs": [],
+            "checkpoint": null,
+            "result_summary": null,
+            "blocker_summary": null,
+            "created_at": "2030-01-01T00:00:01Z",
+            "updated_at": "2030-01-01T00:00:02Z"
+        }),
+        &private_packet,
+    );
+    let state = state_dir.to_str().expect("state dir");
+
+    // A still-working assignment cannot be retired (guard fires before teardown).
+    let working = run_main_agent(
+        &checkout,
+        &[
+            "--state-dir",
+            state,
+            "worker",
+            "retire",
+            "assignment-one",
+            "--if-revision",
+            "2",
+            "--idempotency-key",
+            "retire-0001",
+            "--format",
+            "json",
+        ],
+        &[("AGENT_SESSION_CAPABILITY_FILE", &main_capability)],
+    );
+    assert_ne!(working.code, 0);
+    assert_eq!(
+        working.stdout_json()["error"]["code"],
+        "assignment-not-retireable"
+    );
+
+    // A missing assignment is a clean not-found.
+    let missing = run_main_agent(
+        &checkout,
+        &[
+            "--state-dir",
+            state,
+            "worker",
+            "retire",
+            "missing-assignment",
+            "--if-revision",
+            "1",
+            "--idempotency-key",
+            "retire-0002",
+            "--format",
+            "json",
+        ],
+        &[("AGENT_SESSION_CAPABILITY_FILE", &main_capability)],
+    );
+    assert_ne!(missing.code, 0);
+    assert_eq!(
+        missing.stdout_json()["error"]["code"],
+        "assignment-not-found"
     );
 }

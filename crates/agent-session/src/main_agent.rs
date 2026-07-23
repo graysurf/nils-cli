@@ -18,7 +18,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::cli::{self, AgentKind, CoordinationMode};
-use crate::coordination::context::WorkContextInput;
+use crate::coordination::context::{
+    Scope, ScopeKind, WORK_CONTEXT_INPUT_VERSION, WorkContextInput,
+};
 use crate::orchestration::{
     self, ASSIGNMENT_INPUT_SCHEMA, ASSIGNMENT_SCHEMA, AssignmentRecord, CHECKPOINT_INPUT_SCHEMA,
     IdempotencyReceipt, PACKET_SCHEMA, RunCheckpoint, RunRecord, SessionRef, TimedRelationship,
@@ -34,6 +36,7 @@ const ASSIGNMENT_REVISION_HELP: &str =
     "Expected current assignment revision; stale values fail closed and report current_revision.";
 const RUN_REVISION_HELP: &str =
     "Expected current run revision; stale values fail closed and report current_revision.";
+const WORKER_START_RUN_REVISION_HELP: &str = "Optional expected run revision. Omit to launch without a run-revision fence: assignment creation is decoupled from the run revision, so parallel and batch starts no longer collide. When supplied, a stale value fails closed and reports current_revision.";
 const MAIN_AGENT_AFTER_HELP: &str = "SAFE LIFECYCLE:\n  init -> rehydrate/status -> worker start -> worker self/checkpoint\n  accept -> release -> delete -> close\n\nREVISION AND RETRY RULES:\n  Read the current run or assignment revision before each mutation. Retry an\n  ambiguous outcome with the identical request and idempotency key. After a\n  confirmed revision conflict, re-read state and use a new key for the revised\n  request.\n\nEXAMPLES:\n  main-agent init --packet-file objective.json --if-absent --idempotency-key init-001 --format json\n  main-agent rehydrate --format markdown\n  main-agent worker start --assignment-file assignment.json --if-run-revision 1 --idempotency-key start-001 --format json\n  main-agent worker accept ASSIGNMENT_ID --if-revision 4 --idempotency-key accept-001 --format json\n\nOPERATOR RUNBOOK:\n  crates/agent-session/docs/runbooks/main-agent-orchestration.md\n\nEXIT CODES:\n  0   success\n  1   runtime error\n  64  command-line usage error\n  65  invalid or stale data\n  69  temporarily unavailable";
 
 #[derive(Debug, Parser)]
@@ -84,6 +87,9 @@ enum MainAgentCommand {
     Adopt(AssignmentMutationArgs),
     /// Close this run after all assignments are terminal.
     Close(RunMutationArgs),
+    /// Fast-path: create an ephemeral run, single assignment, and launch in one
+    /// call. The run auto-closes once the worker is torn down.
+    Quick(QuickArgs),
     /// Print shell completion script.
     Completion(CompletionArgs),
 }
@@ -175,15 +181,29 @@ enum WorkerCommand {
     Release(AssignmentMutationArgs),
     /// Delete a released worker through guarded agent-session cleanup.
     Delete(AssignmentMutationArgs),
+    /// Retire an accepted assignment in one call: release -> delete -> confirm
+    /// the worker is absent from a fresh list.
+    Retire(AssignmentMutationArgs),
 }
 
 #[derive(Clone, Debug, Args)]
 struct WorkerStartArgs {
-    /// Private assignment packet JSON file.
-    #[arg(long, value_name = "PATH", value_hint = ValueHint::FilePath)]
-    assignment_file: PathBuf,
-    #[arg(long, help = RUN_REVISION_HELP)]
-    if_run_revision: u64,
+    /// Private assignment packet JSON file (single-lane launch).
+    #[arg(long, value_name = "PATH", value_hint = ValueHint::FilePath, conflicts_with = "batch")]
+    assignment_file: Option<PathBuf>,
+    /// Directory of assignment packet JSON files to launch as one batch. Each
+    /// lane is fenced independently (T2 decouple), so one lane failing isolates
+    /// to its own typed result rather than aborting the batch.
+    #[arg(long, value_name = "DIR", value_hint = ValueHint::DirPath)]
+    batch: Option<PathBuf>,
+    #[arg(long, help = WORKER_START_RUN_REVISION_HELP)]
+    if_run_revision: Option<u64>,
+    /// After launch, wait up to this bounded duration (0 = no wait) for the
+    /// worker's authenticated checkpoint to advance the assignment past
+    /// `starting`. This folds the readiness + newer-turn + identity proof into
+    /// worker start's typed result. 0-60s (integer with optional s/m/h suffix).
+    #[arg(long, default_value = "0")]
+    await_ready: String,
     #[arg(long, help = IDEMPOTENCY_KEY_HELP)]
     idempotency_key: String,
     #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
@@ -324,6 +344,20 @@ struct RunMutationArgs {
     format: OutputFormat,
 }
 
+#[derive(Clone, Debug, Args)]
+struct QuickArgs {
+    /// Private assignment packet JSON file.
+    #[arg(long, value_name = "PATH", value_hint = ValueHint::FilePath)]
+    assignment_file: PathBuf,
+    /// Work tier for the synthesized ephemeral run (L0/L1 delegate-all).
+    #[arg(long, default_value = "L0")]
+    tier: String,
+    #[arg(long, help = IDEMPOTENCY_KEY_HELP)]
+    idempotency_key: String,
+    #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
+    format: OutputFormat,
+}
+
 #[derive(Debug, Args)]
 struct CompletionArgs {
     #[arg(value_enum)]
@@ -371,6 +405,11 @@ struct AssignmentInput {
     scopes: Vec<String>,
     #[serde(default)]
     durable_refs: Vec<String>,
+    /// Assignment ids in the same run that must be accepted before this
+    /// assignment's worker may launch. Empty is serialized away so packets that
+    /// omit it keep an identical request digest and stored-packet digest.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    depends_on: Vec<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -492,6 +531,7 @@ fn run_command(context: &CliContext, command: &MainAgentCommand) -> Result<Value
         MainAgentCommand::Handoff(args) => run_handoff(context, args.clone()),
         MainAgentCommand::Adopt(args) => run_adopt(context, args.clone()),
         MainAgentCommand::Close(args) => run_close(context, args.clone()),
+        MainAgentCommand::Quick(args) => run_quick(context, args.clone()),
         MainAgentCommand::Completion(_) => unreachable!(),
     }
 }
@@ -676,6 +716,7 @@ fn run_init(context: &CliContext, args: InitArgs) -> Result<Value, CliError> {
         objective_packet_digest: packet_digest,
         controller: session_ref(context, &record, &incarnation),
         durable_refs: packet.durable_refs.clone(),
+        ephemeral: false,
         checkpoint: packet
             .next_action
             .as_ref()
@@ -1024,13 +1065,37 @@ fn run_worker(context: &CliContext, args: WorkerArgs) -> Result<Value, CliError>
             run_assignment_state(context, args, "accepted", "released", "worker-release")
         }
         WorkerCommand::Delete(args) => run_worker_delete(context, args),
+        WorkerCommand::Retire(args) => run_worker_retire(context, args),
     }
 }
 
+/// Dispatch a single (`--assignment-file`) or batch (`--batch DIR`) launch.
+/// clap's `conflicts_with` rejects supplying both; this rejects supplying
+/// neither.
 fn run_worker_start(context: &CliContext, args: WorkerStartArgs) -> Result<Value, CliError> {
+    match (args.assignment_file.is_some(), args.batch.clone()) {
+        (true, None) => run_worker_start_single(context, args),
+        (false, Some(dir)) => run_worker_start_batch(context, &args, &dir),
+        (true, Some(_)) => Err(invalid_input(
+            "worker start takes either --assignment-file or --batch, not both",
+        )),
+        (false, None) => Err(CliError::usage(
+            "worker-start-source",
+            "worker start requires --assignment-file or --batch",
+            None,
+        )),
+    }
+}
+
+fn run_worker_start_single(context: &CliContext, args: WorkerStartArgs) -> Result<Value, CliError> {
     validate_idempotency_key(&args.idempotency_key)?;
+    let await_ready = parse_await_ready(&args.await_ready)?;
+    let assignment_file = args
+        .assignment_file
+        .as_ref()
+        .ok_or_else(|| invalid_input("worker start requires --assignment-file"))?;
     let input: AssignmentInput = crate::coordination::read_bounded_json(
-        &args.assignment_file,
+        assignment_file,
         256 * 1024,
         "invalid-assignment-packet",
     )?;
@@ -1078,7 +1143,13 @@ fn run_worker_start(context: &CliContext, args: WorkerStartArgs) -> Result<Value
         .unwrap_or_else(|| retry_stable_worker_session_id(&assignment_id, &request_digest));
     crate::validate_id(&worker_session_id)?;
     let run = require_current_main(&locked.registry, &record, &incarnation)?.clone();
-    ensure_revision(args.if_run_revision, run.revision, "run")?;
+    // T2: the run-revision fence is now advisory. Assignment creation is fenced
+    // by the active claim, current-main check, and assignment-absence below, so
+    // parallel/batch starts no longer have to serialize on a shared run
+    // revision. When a caller does supply --if-run-revision, still honor it.
+    if let Some(expected) = args.if_run_revision {
+        ensure_revision(expected, run.revision, "run")?;
+    }
     if pending_start.is_some() {
         let expected_packet_digest = orchestration::packet_digest(&packet_value)?;
         let current = locked
@@ -1107,6 +1178,19 @@ fn run_worker_start(context: &CliContext, args: WorkerStartArgs) -> Result<Value
                 Some(json!({ "assignment_id": assignment_id })),
             ));
         }
+        // T5: advisory dependency ordering. Refuse to launch a dependent until
+        // every declared dependency in this run has been accepted. Evaluated
+        // against live state under the lock; a missing, cross-run, or
+        // pre-terminal dependency blocks the launch with a typed result the
+        // caller can wait on (`worker wait --until terminal`) and retry.
+        let blocked_on = unsatisfied_dependencies(&locked.registry, &run.run_id, &input.depends_on);
+        if !blocked_on.is_empty() {
+            return Err(CliError::data(
+                "dependency-not-satisfied",
+                "assignment dependencies have not been accepted",
+                Some(json!({ "assignment_id": assignment_id, "blocked_on": blocked_on })),
+            ));
+        }
         let packet_digest = orchestration::store_packet(context, &packet_value)?;
         let now = timestamp();
         let assignment = AssignmentRecord {
@@ -1126,6 +1210,7 @@ fn run_worker_start(context: &CliContext, args: WorkerStartArgs) -> Result<Value
             base_ref: input.base_ref.clone(),
             scopes: input.scopes.clone(),
             durable_refs: input.durable_refs.clone(),
+            depends_on: input.depends_on.clone(),
             checkpoint: None,
             result_summary: None,
             blocker_summary: None,
@@ -1244,7 +1329,86 @@ fn run_worker_start(context: &CliContext, args: WorkerStartArgs) -> Result<Value
         outcome.clone(),
     )?;
     locked.save()?;
+    // T1: fold the readiness proof. Drop the write lock first so the wait never
+    // blocks the worker's own checkpoint. The worker's authenticated,
+    // revision-fenced, incarnation-matched checkpoint advancing the assignment
+    // past `starting` is the readiness + newer-turn + identity proof; a bounded
+    // poll classifies it into a typed result. `--await-ready 0` stays launch-only.
+    drop(locked);
+    let mut outcome = outcome;
+    if let Some(timeout) = await_ready {
+        outcome["readiness"] =
+            await_worker_readiness(context, &record, &incarnation, &assignment_id, timeout)?;
+    }
     Ok(outcome)
+}
+
+/// Launch every `*.json` assignment packet in `dir` as one batch. Lanes are
+/// independent (T2 run-revision decouple), so a failing lane isolates to its
+/// own typed result instead of aborting the batch. Per-lane idempotency keys
+/// are derived from the batch key and the sorted lane index, so a re-run over
+/// the same directory converges each lane through its own receipt. The command
+/// itself succeeds; the caller branches on each lane's `ok`.
+fn run_worker_start_batch(
+    context: &CliContext,
+    args: &WorkerStartArgs,
+    dir: &std::path::Path,
+) -> Result<Value, CliError> {
+    validate_idempotency_key(&args.idempotency_key)?;
+    let mut packets = Vec::new();
+    for entry in fs::read_dir(dir).map_err(|_| invalid_input("batch directory is unavailable"))? {
+        let path = entry
+            .map_err(|_| invalid_input("batch directory entry is unavailable"))?
+            .path();
+        if path.is_file() && path.extension().and_then(|ext| ext.to_str()) == Some("json") {
+            packets.push(path);
+        }
+    }
+    packets.sort();
+    if packets.is_empty() {
+        return Err(invalid_input(
+            "batch directory has no .json assignment packets",
+        ));
+    }
+    if packets.len() > 64 {
+        return Err(invalid_input("batch exceeds the 64-lane limit"));
+    }
+    let mut lanes = Vec::with_capacity(packets.len());
+    for (index, path) in packets.iter().enumerate() {
+        let lane_args = WorkerStartArgs {
+            assignment_file: Some(path.clone()),
+            batch: None,
+            if_run_revision: None,
+            idempotency_key: format!("{}-{index}", args.idempotency_key),
+            await_ready: "0".to_string(),
+            format: OutputFormat::Json,
+        };
+        let assignment_file = path.to_string_lossy().into_owned();
+        let lane = match run_worker_start_single(context, lane_args) {
+            Ok(result) => json!({
+                "assignment_file": assignment_file,
+                "ok": true,
+                "result": result,
+            }),
+            Err(error) => {
+                let data = error.into_inner();
+                json!({
+                    "assignment_file": assignment_file,
+                    "ok": false,
+                    "error": {
+                        "code": data.code,
+                        "message": data.message,
+                        "details": data.details,
+                    },
+                })
+            }
+        };
+        lanes.push(lane);
+    }
+    Ok(json!({
+        "schema_version": "main-agent.worker-start-batch.v1",
+        "lanes": lanes,
+    }))
 }
 
 fn worker_start_is_pending(value: &Value) -> bool {
@@ -1296,6 +1460,39 @@ fn ensure_worker_launch_matches(
         ));
     }
     Ok(())
+}
+
+/// A dependency assignment counts as satisfied once its work has been accepted.
+/// `released` (accepted then cleaned up) still counts as done; `cancelled`, any
+/// pre-terminal state, and a missing (never-created or deleted-before-accept)
+/// dependency do not.
+fn dependency_state_satisfies(state: &str) -> bool {
+    matches!(state, "accepted" | "released")
+}
+
+/// Dependency ids that do not yet satisfy a dependent launching in `run_id`,
+/// each annotated with its observed `state` (or JSON null when the dependency
+/// is missing or belongs to another run). An empty result clears the launch.
+fn unsatisfied_dependencies(
+    registry: &orchestration::Registry,
+    run_id: &str,
+    depends_on: &[String],
+) -> Vec<Value> {
+    depends_on
+        .iter()
+        .filter_map(|dependency| match registry.assignments.get(dependency) {
+            Some(assignment)
+                if assignment.run_id == run_id && dependency_state_satisfies(&assignment.state) =>
+            {
+                None
+            }
+            Some(assignment) if assignment.run_id == run_id => Some(json!({
+                "assignment_id": dependency,
+                "state": assignment.state,
+            })),
+            _ => Some(json!({ "assignment_id": dependency, "state": Value::Null })),
+        })
+        .collect()
 }
 
 fn run_worker_list(context: &CliContext) -> Result<Value, CliError> {
@@ -1440,6 +1637,156 @@ fn parse_wait_timeout(value: &str) -> Result<Duration, CliError> {
         ));
     }
     Ok(Duration::from_secs(seconds))
+}
+
+/// Parse the `worker start --await-ready` bound. `0` (with an optional s/m/h
+/// suffix) means launch-only — no readiness wait; any other value is a bounded
+/// 1-60s duration parsed like `worker wait`.
+fn parse_await_ready(value: &str) -> Result<Option<Duration>, CliError> {
+    let trimmed = value.trim();
+    if matches!(trimmed, "0" | "0s" | "0m" | "0h") {
+        return Ok(None);
+    }
+    parse_wait_timeout(trimmed).map(Some)
+}
+
+/// Classify an assignment state as worker readiness. `starting` means the worker
+/// has not yet run its authenticated self-check + checkpoint; any advanced state
+/// proves readiness because that checkpoint is revision-fenced and
+/// incarnation-matched by the worker-checkpoint path.
+fn readiness_from_state(state: &str) -> &'static str {
+    if state == "starting" {
+        "readiness_failed"
+    } else {
+        "ready"
+    }
+}
+
+/// Bounded, read-only wait for a freshly launched worker to advance its
+/// assignment past `starting`, returning the typed readiness projection. Mirrors
+/// the `worker wait` poll (no lock, level-triggered) so it never blocks the
+/// worker's own checkpoint.
+fn await_worker_readiness(
+    context: &CliContext,
+    record: &SessionRecord,
+    incarnation: &str,
+    assignment_id: &str,
+    timeout: Duration,
+) -> Result<Value, CliError> {
+    let started = Instant::now();
+    loop {
+        let registry = orchestration::load_registry_readonly(context)?;
+        let run = require_current_main(&registry, record, incarnation)?;
+        let state = registry
+            .assignments
+            .get(assignment_id)
+            .filter(|assignment| assignment.run_id == run.run_id)
+            .map(|assignment| assignment.state.clone())
+            .ok_or_else(|| not_found("assignment-not-found", "assignment was not found"))?;
+        if state != "starting" {
+            return Ok(json!({
+                "state": readiness_from_state(&state),
+                "assignment_state": state,
+                "worker_launched": true
+            }));
+        }
+        if started.elapsed() >= timeout {
+            return Ok(json!({
+                "state": "readiness_failed",
+                "assignment_state": state,
+                "worker_launched": true,
+                "safe_state": "worker launched and bound; assignment still starting. Retry `worker wait --until submitted` or tear down with `worker retire`."
+            }));
+        }
+        thread::sleep(WORKER_WAIT_POLL_INTERVAL);
+    }
+}
+
+/// T1 teardown macro: retire an accepted (or already terminal) assignment in
+/// one call by composing release -> delete and reporting the worker's absence
+/// from the delete result. Replaces the hand-run release -> delete -> confirm
+/// sequence. Idempotent: it reads current state, skips steps already done, and
+/// derives per-step idempotency keys from the retire key so a retry converges
+/// through each step's own receipt.
+fn run_worker_retire(
+    context: &CliContext,
+    args: AssignmentMutationArgs,
+) -> Result<Value, CliError> {
+    validate_idempotency_key(&args.idempotency_key)?;
+    let (record, incarnation) = authenticated_self(context)?;
+    ensure_active_claim(context, &record)?;
+
+    let (mut revision, state) = {
+        let registry = orchestration::load_registry_readonly(context)?;
+        let run = require_current_main(&registry, &record, &incarnation)?;
+        let assignment = registry
+            .assignments
+            .get(&args.assignment_id)
+            .filter(|assignment| assignment.run_id == run.run_id)
+            .ok_or_else(|| not_found("assignment-not-found", "assignment was not found"))?;
+        ensure_primary_manager(assignment, &record, &incarnation)?;
+        (assignment.revision, assignment.state.clone())
+    };
+
+    if !matches!(state.as_str(), "accepted" | "released" | "cancelled") {
+        return Err(CliError::data(
+            "assignment-not-retireable",
+            "worker retire requires an accepted, released, or cancelled assignment",
+            Some(json!({ "assignment_id": args.assignment_id, "state": state })),
+        ));
+    }
+
+    // Release first only when the assignment is still accepted; a re-run that
+    // already released (or a natively terminal assignment) skips straight to
+    // delete.
+    let released = if state == "accepted" {
+        let release = run_assignment_state(
+            context,
+            AssignmentMutationArgs {
+                assignment_id: args.assignment_id.clone(),
+                if_revision: revision,
+                idempotency_key: format!("{}-release", args.idempotency_key),
+                format: OutputFormat::Json,
+            },
+            "accepted",
+            "released",
+            "worker-release",
+        )?;
+        revision = release["assignment"]["revision"]
+            .as_u64()
+            .unwrap_or(revision.saturating_add(1));
+        true
+    } else {
+        false
+    };
+
+    let delete = run_worker_delete(
+        context,
+        AssignmentMutationArgs {
+            assignment_id: args.assignment_id.clone(),
+            if_revision: revision,
+            idempotency_key: format!("{}-delete", args.idempotency_key),
+            format: OutputFormat::Json,
+        },
+    )?;
+    let deleted = delete
+        .get("deleted")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let cleanup_pending = delete
+        .get("cleanup_pending")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+
+    Ok(json!({
+        "schema_version": "main-agent.worker-retire-result.v1",
+        "assignment_id": args.assignment_id,
+        "released": released,
+        "deleted": deleted,
+        "cleanup_pending": cleanup_pending,
+        "run_closed": delete.get("run_closed").cloned().unwrap_or(Value::Bool(false)),
+        "retired": deleted
+    }))
 }
 
 fn run_worker_message(context: &CliContext, args: WorkerMessageArgs) -> Result<Value, CliError> {
@@ -1748,11 +2095,16 @@ fn finalize_worker_delete(
     ensure_revision(args.if_revision, current.revision, "assignment")?;
     current.revision = current.revision.saturating_add(1);
     current.updated_at = timestamp();
+    let assignment_view = public_assignment_view(current);
+    // T2 fast-path: an ephemeral run (created by `quick`) auto-closes once its
+    // last worker is torn down, so the caller never runs an explicit `close`.
+    let run_closed = maybe_autoclose_ephemeral_run(&mut locked.registry, &run_id);
     let outcome = json!({
         "schema_version": "main-agent.worker-delete-result.v1",
-        "assignment": public_assignment_view(current),
+        "assignment": assignment_view,
         "deleted": deleted,
-        "cleanup_pending": cleanup_pending
+        "cleanup_pending": cleanup_pending,
+        "run_closed": run_closed
     });
     store_receipt(
         &mut locked.registry,
@@ -1998,6 +2350,200 @@ fn run_close(context: &CliContext, args: RunMutationArgs) -> Result<Value, CliEr
     Ok(outcome)
 }
 
+/// Fast-path for L0/L1 delegate-all: acquire the claim, create an ephemeral
+/// run synthesized from the assignment packet, then launch the assignment's
+/// worker — all in one call. The run is marked ephemeral so it auto-closes when
+/// the worker is torn down (see `finalize_worker_delete`), sparing the caller an
+/// explicit `close`. A session that already controls a run must use the
+/// granular `init` + `worker start` path instead.
+fn run_quick(context: &CliContext, args: QuickArgs) -> Result<Value, CliError> {
+    validate_idempotency_key(&args.idempotency_key)?;
+    if !matches!(args.tier.as_str(), "L0" | "L1" | "L2" | "L3") {
+        return Err(invalid_input("quick tier is invalid"));
+    }
+    let input: AssignmentInput = crate::coordination::read_bounded_json(
+        &args.assignment_file,
+        256 * 1024,
+        "invalid-assignment-packet",
+    )?;
+    validate_assignment_input(&input)?;
+    let repository = input.repository.clone().ok_or_else(|| {
+        invalid_input("quick requires the assignment packet to declare a repository")
+    })?;
+    let (record, incarnation) = authenticated_self(context)?;
+
+    // Synthesize the ephemeral run's objective + work-context claim from the
+    // assignment so the fast-path caller supplies only one packet.
+    let work_context = WorkContextInput {
+        schema_version: WORK_CONTEXT_INPUT_VERSION.to_string(),
+        intent: "implementation".to_string(),
+        tier: args.tier.clone(),
+        repositories: vec![repository.clone()],
+        worktrees: input.worktree.clone().into_iter().collect(),
+        provider_refs: Vec::new(),
+        plan_refs: Vec::new(),
+        scopes: input
+            .scopes
+            .iter()
+            .map(|value| Scope {
+                kind: ScopeKind::PathPrefix,
+                repository: repository.clone(),
+                value: value.clone(),
+            })
+            .collect(),
+        summary: input.task_summary.clone(),
+    };
+    ensure_or_acquire_claim(context, &record, &work_context, &args.idempotency_key)?;
+
+    let objective = json!({
+        "schema_version": PACKET_SCHEMA,
+        "tier": args.tier,
+        "objective_summary": input.task_summary,
+        "objective": {},
+        "done_criteria": [],
+        "constraints": [],
+        "durable_refs": input.durable_refs,
+        "work_context": work_context,
+        "next_action": null,
+    });
+    let request_digest = crate::coordination::request_digest(
+        "main-agent-quick",
+        &json!({ "objective": objective, "assignment": input }),
+    );
+
+    let run_id = {
+        let mut locked = orchestration::lock_registry(context)?;
+        match idempotency_replay(
+            &locked.registry,
+            &record,
+            &incarnation,
+            &args.idempotency_key,
+            "quick",
+            &request_digest,
+        )? {
+            Some(value) if value["schema_version"] == "main-agent.quick-result.v1" => {
+                return Ok(value);
+            }
+            Some(value) => value["run"]["run_id"]
+                .as_str()
+                .map(str::to_string)
+                .ok_or_else(|| invalid_input("pending quick receipt is invalid"))?,
+            None => {
+                if locked.registry.runs.values().any(|run| {
+                    run.controller.session_id == record.id
+                        && run.controller.session_created_at == record.created_at
+                }) {
+                    return Err(CliError::data(
+                        "quick-run-exists",
+                        "this session already controls a run; use init and worker start",
+                        None,
+                    ));
+                }
+                let run_id = uuid::Uuid::new_v4().to_string();
+                let packet_digest = orchestration::store_packet(context, &objective)?;
+                let now = timestamp();
+                let run = RunRecord {
+                    schema_version: orchestration::RUN_SCHEMA.to_string(),
+                    run_id: run_id.clone(),
+                    revision: 1,
+                    state: "active".to_string(),
+                    tier: args.tier.clone(),
+                    objective_summary: input.task_summary.clone(),
+                    objective_packet_digest: packet_digest,
+                    controller: session_ref(context, &record, &incarnation),
+                    durable_refs: input.durable_refs.clone(),
+                    ephemeral: true,
+                    checkpoint: None,
+                    created_at: now.clone(),
+                    updated_at: now,
+                };
+                let pending = json!({
+                    "schema_version": "main-agent.quick-pending.v1",
+                    "run": public_run_view(&run),
+                });
+                locked.registry.runs.insert(run_id.clone(), run);
+                store_receipt(
+                    &mut locked.registry,
+                    &record,
+                    &incarnation,
+                    &args.idempotency_key,
+                    "quick",
+                    &request_digest,
+                    pending,
+                )?;
+                locked.save()?;
+                run_id
+            }
+        }
+    };
+
+    // Launch the single assignment on the freshly created ephemeral run.
+    let worker = run_worker_start_single(
+        context,
+        WorkerStartArgs {
+            assignment_file: Some(args.assignment_file.clone()),
+            batch: None,
+            if_run_revision: None,
+            idempotency_key: format!("{}-worker", args.idempotency_key),
+            await_ready: "0".to_string(),
+            format: OutputFormat::Json,
+        },
+    )?;
+
+    let run_view = {
+        let registry = orchestration::load_registry_readonly(context)?;
+        registry
+            .runs
+            .get(&run_id)
+            .map(public_run_view)
+            .ok_or_else(|| not_found("run-not-found", "ephemeral run was not found"))?
+    };
+    let outcome = json!({
+        "schema_version": "main-agent.quick-result.v1",
+        "run": run_view,
+        "worker": worker,
+    });
+    let mut locked = orchestration::lock_registry(context)?;
+    store_receipt(
+        &mut locked.registry,
+        &record,
+        &incarnation,
+        &args.idempotency_key,
+        "quick",
+        &request_digest,
+        outcome.clone(),
+    )?;
+    locked.save()?;
+    Ok(outcome)
+}
+
+/// Close an ephemeral run once none of its assignments remain non-terminal.
+/// Returns whether the run transitioned to closed. Only ephemeral runs (created
+/// by `main-agent quick`) auto-close; this lets the fast-path skip `close`.
+fn maybe_autoclose_ephemeral_run(registry: &mut orchestration::Registry, run_id: &str) -> bool {
+    let eligible = registry
+        .runs
+        .get(run_id)
+        .is_some_and(|run| run.ephemeral && run.state == "active");
+    if !eligible {
+        return false;
+    }
+    let has_nonterminal = registry.assignments.values().any(|assignment| {
+        assignment.run_id == run_id
+            && !matches!(assignment.state.as_str(), "released" | "cancelled")
+    });
+    if has_nonterminal {
+        return false;
+    }
+    if let Some(run) = registry.runs.get_mut(run_id) {
+        run.state = "closed".to_string();
+        run.revision = run.revision.saturating_add(1);
+        run.updated_at = timestamp();
+        return true;
+    }
+    false
+}
+
 fn run_relationship_mutation<F>(
     context: &CliContext,
     assignment_id: String,
@@ -2214,6 +2760,7 @@ fn public_run_view(run: &RunRecord) -> Value {
         "objective_summary": run.objective_summary,
         "controller": run.controller,
         "durable_refs": run.durable_refs,
+        "ephemeral": run.ephemeral,
         "checkpoint": run.checkpoint,
         "created_at": run.created_at,
         "updated_at": run.updated_at
@@ -2252,6 +2799,7 @@ fn public_assignment_view(assignment: &AssignmentRecord) -> Value {
         "base_ref": assignment.base_ref,
         "scopes": assignment.scopes,
         "durable_refs": assignment.durable_refs,
+        "depends_on": assignment.depends_on,
         "checkpoint": assignment.checkpoint,
         "result_summary": assignment.result_summary,
         "blocker_summary": assignment.blocker_summary,
@@ -2368,8 +2916,12 @@ fn validate_assignment_input(input: &AssignmentInput) -> Result<(), CliError> {
     if input.scopes.len() > 32
         || input.durable_refs.len() > 64
         || input.launch.agent_args.len() > 64
+        || input.depends_on.len() > 64
     {
         return Err(invalid_input("assignment packet exceeds collection limits"));
+    }
+    for dependency in &input.depends_on {
+        orchestration::validate_slug("assignment dependency id", dependency, 128)?;
     }
     if AgentKind::from_name(&input.launch.agent).is_none() {
         return Err(invalid_input("assignment launch agent is invalid"));
@@ -2473,12 +3025,14 @@ fn command_name(command: &MainAgentCommand) -> &'static str {
             WorkerCommand::Accept(_) => "worker-accept",
             WorkerCommand::Release(_) => "worker-release",
             WorkerCommand::Delete(_) => "worker-delete",
+            WorkerCommand::Retire(_) => "worker-retire",
         },
         MainAgentCommand::Collaborate(_) => "collaborate",
         MainAgentCommand::Borrow(_) => "borrow",
         MainAgentCommand::Handoff(_) => "handoff",
         MainAgentCommand::Adopt(_) => "adopt",
         MainAgentCommand::Close(_) => "close",
+        MainAgentCommand::Quick(_) => "quick",
         MainAgentCommand::Completion(_) => "completion",
     }
 }
@@ -2504,13 +3058,15 @@ fn command_output_format(command: &MainAgentCommand) -> OutputFormat {
             WorkerCommand::Message(args) => args.format,
             WorkerCommand::Accept(args)
             | WorkerCommand::Release(args)
-            | WorkerCommand::Delete(args) => args.format,
+            | WorkerCommand::Delete(args)
+            | WorkerCommand::Retire(args) => args.format,
         },
         MainAgentCommand::Collaborate(args) => args.format,
         MainAgentCommand::Borrow(args) => args.format,
         MainAgentCommand::Handoff(args) => args.format,
         MainAgentCommand::Adopt(args) => args.format,
         MainAgentCommand::Close(args) => args.format,
+        MainAgentCommand::Quick(args) => args.format,
         MainAgentCommand::Completion(_) => OutputFormat::Text,
     }
 }
@@ -2741,6 +3297,206 @@ mod tests {
         );
         assert_eq!(
             parse_wait_timeout("abc").unwrap_err().code(),
+            "invalid-duration"
+        );
+    }
+
+    #[test]
+    fn dependency_state_satisfies_only_after_acceptance() {
+        for done in ["accepted", "released"] {
+            assert!(
+                dependency_state_satisfies(done),
+                "{done} counts a dependency as satisfied"
+            );
+        }
+        for pending in [
+            "assigned",
+            "starting",
+            "working",
+            "blocked",
+            "submitted",
+            "cancelled",
+        ] {
+            assert!(
+                !dependency_state_satisfies(pending),
+                "{pending} must not satisfy a dependency"
+            );
+        }
+    }
+
+    fn dep_assignment(id: &str, run_id: &str, state: &str) -> AssignmentRecord {
+        AssignmentRecord {
+            schema_version: ASSIGNMENT_SCHEMA.to_string(),
+            assignment_id: id.to_string(),
+            run_id: run_id.to_string(),
+            revision: 1,
+            state: state.to_string(),
+            task_summary: "dependency".to_string(),
+            private_packet_digest: "sha256:0".to_string(),
+            primary_manager: SessionRef {
+                machine: None,
+                session_id: "main".to_string(),
+                session_incarnation: "inc".to_string(),
+                session_created_at: "2030-01-01T00:00:00Z".to_string(),
+            },
+            worker: None,
+            collaborators: Vec::new(),
+            borrowed_by: Vec::new(),
+            repository: None,
+            worktree: None,
+            base_ref: None,
+            scopes: Vec::new(),
+            durable_refs: Vec::new(),
+            depends_on: Vec::new(),
+            checkpoint: None,
+            result_summary: None,
+            blocker_summary: None,
+            created_at: "2030-01-01T00:00:00Z".to_string(),
+            updated_at: "2030-01-01T00:00:00Z".to_string(),
+        }
+    }
+
+    #[test]
+    fn unsatisfied_dependencies_clears_on_accepted_and_flags_the_rest() {
+        let mut registry = orchestration::Registry::default();
+        registry.assignments.insert(
+            "done".to_string(),
+            dep_assignment("done", "run-one", "accepted"),
+        );
+        registry.assignments.insert(
+            "cleaned".to_string(),
+            dep_assignment("cleaned", "run-one", "released"),
+        );
+        registry.assignments.insert(
+            "busy".to_string(),
+            dep_assignment("busy", "run-one", "working"),
+        );
+        registry.assignments.insert(
+            "elsewhere".to_string(),
+            dep_assignment("elsewhere", "other-run", "accepted"),
+        );
+
+        // No dependencies is always cleared.
+        assert!(unsatisfied_dependencies(&registry, "run-one", &[]).is_empty());
+        // Accepted and released dependencies clear the launch.
+        assert!(
+            unsatisfied_dependencies(
+                &registry,
+                "run-one",
+                &["done".to_string(), "cleaned".to_string()]
+            )
+            .is_empty()
+        );
+        // A pre-terminal dependency blocks and reports its observed state.
+        let busy = unsatisfied_dependencies(&registry, "run-one", &["busy".to_string()]);
+        assert_eq!(busy.len(), 1);
+        assert_eq!(busy[0]["assignment_id"], "busy");
+        assert_eq!(busy[0]["state"], "working");
+        // A missing dependency blocks with a null state.
+        let missing = unsatisfied_dependencies(&registry, "run-one", &["ghost".to_string()]);
+        assert_eq!(missing[0]["assignment_id"], "ghost");
+        assert!(missing[0]["state"].is_null());
+        // A same-id dependency in a different run does not count as satisfied.
+        let cross = unsatisfied_dependencies(&registry, "run-one", &["elsewhere".to_string()]);
+        assert_eq!(cross.len(), 1);
+        assert!(cross[0]["state"].is_null());
+    }
+
+    fn run_record(id: &str, ephemeral: bool) -> RunRecord {
+        RunRecord {
+            schema_version: orchestration::RUN_SCHEMA.to_string(),
+            run_id: id.to_string(),
+            revision: 1,
+            state: "active".to_string(),
+            tier: "L0".to_string(),
+            objective_summary: "summary".to_string(),
+            objective_packet_digest: format!("sha256:{}", "a".repeat(64)),
+            controller: SessionRef {
+                machine: None,
+                session_id: "main".to_string(),
+                session_incarnation: "inc".to_string(),
+                session_created_at: "2030-01-01T00:00:00Z".to_string(),
+            },
+            durable_refs: Vec::new(),
+            ephemeral,
+            checkpoint: None,
+            created_at: "2030-01-01T00:00:00Z".to_string(),
+            updated_at: "2030-01-01T00:00:00Z".to_string(),
+        }
+    }
+
+    #[test]
+    fn maybe_autoclose_closes_only_ephemeral_runs_with_terminal_work() {
+        // Ephemeral run, all assignments terminal → closes.
+        let mut registry = orchestration::Registry::default();
+        registry.runs.insert("q".to_string(), run_record("q", true));
+        registry
+            .assignments
+            .insert("a".to_string(), dep_assignment("a", "q", "released"));
+        assert!(maybe_autoclose_ephemeral_run(&mut registry, "q"));
+        assert_eq!(registry.runs["q"].state, "closed");
+
+        // Ephemeral run with a non-terminal assignment → stays open.
+        let mut registry = orchestration::Registry::default();
+        registry.runs.insert("q".to_string(), run_record("q", true));
+        registry
+            .assignments
+            .insert("a".to_string(), dep_assignment("a", "q", "released"));
+        registry
+            .assignments
+            .insert("b".to_string(), dep_assignment("b", "q", "working"));
+        assert!(!maybe_autoclose_ephemeral_run(&mut registry, "q"));
+        assert_eq!(registry.runs["q"].state, "active");
+
+        // A non-ephemeral run never auto-closes.
+        let mut registry = orchestration::Registry::default();
+        registry
+            .runs
+            .insert("r".to_string(), run_record("r", false));
+        registry
+            .assignments
+            .insert("a".to_string(), dep_assignment("a", "r", "released"));
+        assert!(!maybe_autoclose_ephemeral_run(&mut registry, "r"));
+        assert_eq!(registry.runs["r"].state, "active");
+    }
+
+    #[test]
+    fn readiness_from_state_flags_only_starting_as_failed() {
+        assert_eq!(readiness_from_state("starting"), "readiness_failed");
+        for advanced in [
+            "working",
+            "blocked",
+            "submitted",
+            "accepted",
+            "released",
+            "cancelled",
+        ] {
+            assert_eq!(
+                readiness_from_state(advanced),
+                "ready",
+                "{advanced} proves readiness"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_await_ready_treats_zero_as_launch_only() {
+        assert!(parse_await_ready("0").unwrap().is_none());
+        assert!(parse_await_ready("0s").unwrap().is_none());
+        assert_eq!(
+            parse_await_ready("5s").unwrap(),
+            Some(Duration::from_secs(5))
+        );
+        assert_eq!(
+            parse_await_ready("30").unwrap(),
+            Some(Duration::from_secs(30))
+        );
+        assert_eq!(
+            parse_await_ready("61").unwrap_err().code(),
+            "worker-wait-timeout"
+        );
+        assert_eq!(
+            parse_await_ready("abc").unwrap_err().code(),
             "invalid-duration"
         );
     }
