@@ -6816,7 +6816,12 @@ fn provider_prompt_new_runtime_source_authorized(record: &crate::SessionRecord) 
     };
     match AgentKind::from_name(&record.agent) {
         Some(AgentKind::Codex) => {
-            resume.provider == "codex" && resume.capture_method == "codex-user-prompt-submit-hook"
+            resume.provider == "codex"
+                && matches!(
+                    resume.capture_method.as_str(),
+                    "codex-user-prompt-submit-hook"
+                        | crate::codex_app_server::PROVIDER_RESUME_CAPTURE_METHOD
+                )
         }
         Some(AgentKind::Claude) => {
             resume.provider == "claude" && resume.capture_method == "claude-explicit-session-id"
@@ -7863,6 +7868,12 @@ mod tests {
             .as_mut()
             .expect("provider resume")
             .capture_method = "codex-user-prompt-submit-hook".to_string();
+        assert!(provider_prompt_new_runtime_source_authorized(&record));
+        record
+            .provider_resume
+            .as_mut()
+            .expect("provider resume")
+            .capture_method = "codex-app-server-thread-binding".to_string();
         assert!(provider_prompt_new_runtime_source_authorized(&record));
     }
 

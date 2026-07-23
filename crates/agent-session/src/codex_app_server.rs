@@ -30,8 +30,9 @@ use tokio::sync::{mpsc, oneshot};
 use tokio_tungstenite::tungstenite::{Message, protocol::WebSocketConfig};
 
 use crate::{
-    CliContext, CliError, SessionRecord, auto_resume::UsageSnapshot, display_path,
-    write_private_file, write_session_record,
+    AgentKind, CliContext, CliError, ProviderResume, SessionRecord, auto_resume::UsageSnapshot,
+    canonical_provider_resume_args, display_path, mutate_session_record, write_private_file,
+    write_session_record,
 };
 
 pub(crate) const RUNTIME_KIND: &str = "codex_app_server";
@@ -72,6 +73,7 @@ const PROXY_CAPABILITY_FILE: &str = ".codex-app-server-proxy-capability";
 const PROXY_CAPABILITY_VERSION: &str = "agent-session.codex-manual-input-proxy.v1";
 const PROXY_CAPABILITY_TTL: Duration = Duration::from_secs(365 * 24 * 60 * 60);
 const PROXY_CAPABILITY_READY_TIMEOUT: Duration = Duration::from_secs(2);
+pub(crate) const PROVIDER_RESUME_CAPTURE_METHOD: &str = "codex-app-server-thread-binding";
 
 pub(crate) fn attention_authority(record: &SessionRecord) -> &'static str {
     if record.runtime.as_ref().is_some_and(|runtime| {
@@ -2154,7 +2156,7 @@ pub(crate) async fn run_control(
         }
     };
     let reconnecting = thread_attached_path(&record).is_some_and(Path::is_file);
-    bind_thread(&record, &thread_id)?;
+    bind_thread_and_persist_resume(&context, &record, &thread_id).await?;
     let mut thread_resumed = false;
     if reconnecting {
         request_id = request_id.saturating_add(1);
@@ -2389,6 +2391,82 @@ fn bind_thread(record: &SessionRecord, thread_id: &str) -> Result<(), String> {
     }
     write_private_file(attached, projected_thread_binding(thread_id).as_bytes())
         .map_err(|err| format!("Codex thread binding failed: {}", err.code()))
+}
+
+async fn bind_thread_and_persist_resume(
+    context: &CliContext,
+    record: &SessionRecord,
+    thread_id: &str,
+) -> Result<(), String> {
+    let context = context.clone();
+    let record = record.clone();
+    let thread_id = thread_id.to_string();
+    tokio::task::spawn_blocking(move || persist_bound_thread_resume(&context, &record, &thread_id))
+        .await
+        .map_err(|error| format!("Codex provider resume persistence worker failed: {error}"))?
+        .map_err(|error| format!("Codex provider resume persistence failed: {}", error.code()))
+}
+
+fn persist_bound_thread_resume(
+    context: &CliContext,
+    expected: &SessionRecord,
+    thread_id: &str,
+) -> Result<(), CliError> {
+    if !protocol_id_is_valid(thread_id) {
+        return Err(CliError::data(
+            "codex-app-server-resume-identity-invalid",
+            "Codex app-server returned an invalid thread identity",
+            Some(json!({ "id": expected.id })),
+        ));
+    }
+    let resume_args = canonical_provider_resume_args(AgentKind::Codex, &expected.cwd, thread_id)
+        .expect("Codex resume arguments are supported");
+    let captured_at = Timestamp::now().to_string();
+    mutate_session_record(context, &expected.id, |current| {
+        crate::ensure_same_session_identity(expected, current)?;
+        if current.agent != AgentKind::Codex.as_str() || current.cwd != expected.cwd {
+            return Err(CliError::data(
+                "codex-app-server-resume-runtime-conflict",
+                "Codex app-server runtime no longer matches the session",
+                Some(json!({ "id": current.id })),
+            ));
+        }
+        let has_matching_resume = if let Some(existing) = current.provider_resume.as_ref() {
+            if existing.provider != AgentKind::Codex.as_str() || existing.session_id != thread_id {
+                return Err(CliError::data(
+                    "codex-app-server-resume-identity-conflict",
+                    "Codex app-server thread conflicts with durable resume metadata",
+                    Some(json!({
+                        "id": current.id,
+                        "provider": existing.provider,
+                    })),
+                ));
+            }
+            true
+        } else {
+            false
+        };
+        bind_thread(current, thread_id).map_err(|message| {
+            CliError::runtime(
+                "codex-app-server-thread-binding-failed",
+                message,
+                Some(json!({ "id": current.id })),
+            )
+        })?;
+        if has_matching_resume {
+            return Ok(());
+        }
+        current.provider_resume = Some(ProviderResume {
+            provider: AgentKind::Codex.as_str().to_string(),
+            session_id: thread_id.to_string(),
+            captured_at: captured_at.clone(),
+            capture_method: PROVIDER_RESUME_CAPTURE_METHOD.to_string(),
+            resume_args: resume_args.clone(),
+            extra: BTreeMap::new(),
+        });
+        current.updated_at = captured_at.clone();
+        Ok(())
+    })
 }
 
 fn attached_loaded_thread(
@@ -6980,6 +7058,150 @@ printf '%s\n' '{"schema_version":"agent-session.codex-auth-broker.v1","account":
         );
     }
 
+    #[tokio::test]
+    async fn app_server_thread_binding_persists_provider_resume_identity() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let context = CliContext {
+            state_dir: tmp.path().join("state"),
+            host: None,
+        };
+        let socket = tmp.path().join("codex.sock");
+        let record = record_with_runtime("thread-resume-identity", &socket);
+        fs::create_dir_all(crate::session_dir(&context, &record.id)).unwrap();
+        crate::write_session_record(&context, &record).unwrap();
+
+        bind_thread_and_persist_resume(&context, &record, "raw-recoverable-thread")
+            .await
+            .unwrap();
+
+        let persisted = crate::load_session_record(&context, &record.id).unwrap();
+        let resume = persisted
+            .provider_resume
+            .as_ref()
+            .expect("app-server binding must persist provider resume metadata");
+        assert_eq!(resume.provider, "codex");
+        assert_eq!(resume.session_id, "raw-recoverable-thread");
+        assert_eq!(resume.capture_method, "codex-app-server-thread-binding");
+        assert_eq!(
+            resume.resume_args,
+            crate::canonical_provider_resume_args(
+                crate::AgentKind::Codex,
+                &record.cwd,
+                "raw-recoverable-thread",
+            )
+            .unwrap()
+        );
+
+        let sidecar = fs::read_to_string(
+            crate::session_dir(&context, &record.id).join(crate::SESSION_RESUME_FILE),
+        )
+        .unwrap();
+        assert!(sidecar.contains("raw-recoverable-thread"));
+        let attached = fs::read_to_string(socket.with_extension("attached")).unwrap();
+        assert_eq!(attached, projected_thread_binding("raw-recoverable-thread"));
+        assert!(!attached.contains("raw-recoverable-thread"));
+    }
+
+    #[test]
+    fn app_server_thread_binding_preserves_matching_resume_provenance() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let context = CliContext {
+            state_dir: tmp.path().join("state"),
+            host: None,
+        };
+        let socket = tmp.path().join("codex.sock");
+        let expected = record_with_runtime("thread-resume-preserved", &socket);
+        let mut current = expected.clone();
+        current.provider_resume = Some(ProviderResume {
+            provider: "codex".to_string(),
+            session_id: "raw-existing-thread".to_string(),
+            captured_at: "2030-01-01T00:00:01Z".to_string(),
+            capture_method: "codex-user-prompt-submit-hook".to_string(),
+            resume_args: canonical_provider_resume_args(
+                AgentKind::Codex,
+                &current.cwd,
+                "raw-existing-thread",
+            )
+            .unwrap(),
+            extra: BTreeMap::from([("retained".to_string(), json!(true))]),
+        });
+        fs::create_dir_all(crate::session_dir(&context, &current.id)).unwrap();
+        crate::write_session_record(&context, &current).unwrap();
+
+        persist_bound_thread_resume(&context, &expected, "raw-existing-thread").unwrap();
+
+        let persisted = crate::load_session_record(&context, &expected.id).unwrap();
+        let resume = persisted.provider_resume.expect("provider resume");
+        assert_eq!(resume.capture_method, "codex-user-prompt-submit-hook");
+        assert_eq!(resume.extra.get("retained"), Some(&json!(true)));
+        assert!(socket.with_extension("attached").is_file());
+    }
+
+    #[test]
+    fn app_server_thread_binding_rejects_conflicting_resume_without_marker() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let context = CliContext {
+            state_dir: tmp.path().join("state"),
+            host: None,
+        };
+        let socket = tmp.path().join("codex.sock");
+        let expected = record_with_runtime("thread-resume-conflict", &socket);
+        let mut current = expected.clone();
+        current.provider_resume = Some(ProviderResume {
+            provider: "codex".to_string(),
+            session_id: "raw-existing-thread".to_string(),
+            captured_at: "2030-01-01T00:00:01Z".to_string(),
+            capture_method: "codex-user-prompt-submit-hook".to_string(),
+            resume_args: canonical_provider_resume_args(
+                AgentKind::Codex,
+                &current.cwd,
+                "raw-existing-thread",
+            )
+            .unwrap(),
+            extra: BTreeMap::new(),
+        });
+        fs::create_dir_all(crate::session_dir(&context, &current.id)).unwrap();
+        crate::write_session_record(&context, &current).unwrap();
+
+        let error =
+            persist_bound_thread_resume(&context, &expected, "raw-different-thread").unwrap_err();
+
+        assert_eq!(error.code(), "codex-app-server-resume-identity-conflict");
+        assert!(!socket.with_extension("attached").exists());
+        let persisted = crate::load_session_record(&context, &expected.id).unwrap();
+        assert_eq!(
+            persisted
+                .provider_resume
+                .as_ref()
+                .map(|resume| resume.session_id.as_str()),
+            Some("raw-existing-thread")
+        );
+    }
+
+    #[test]
+    fn stale_app_server_runtime_cannot_bind_thread_identity() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let context = CliContext {
+            state_dir: tmp.path().join("state"),
+            host: None,
+        };
+        let socket = tmp.path().join("codex.sock");
+        let expected = record_with_runtime("thread-resume-stale", &socket);
+        let mut replacement = expected.clone();
+        replacement.runtime.as_mut().expect("runtime").launch_id =
+            "replacement-runtime".to_string();
+        fs::create_dir_all(crate::session_dir(&context, &replacement.id)).unwrap();
+        crate::write_session_record(&context, &replacement).unwrap();
+
+        let error =
+            persist_bound_thread_resume(&context, &expected, "raw-stale-thread").unwrap_err();
+
+        assert_eq!(error.code(), "session-runtime-changed");
+        assert!(!socket.with_extension("attached").exists());
+        let persisted = crate::load_session_record(&context, &expected.id).unwrap();
+        assert!(persisted.provider_resume.is_none());
+    }
+
     #[test]
     fn usage_projection_is_authoritative_only_for_well_formed_response() {
         assert!(!usage_snapshot(&json!({})).authoritative);
@@ -7142,12 +7364,24 @@ printf '%s\n' '{"schema_version":"agent-session.codex-auth-broker.v1","account":
             }
         });
         let (handle, commands) = control_channel();
-        let control = tokio::spawn(run_control(context, record, commands));
+        let control = tokio::spawn(run_control(context.clone(), record.clone(), commands));
 
         let usage = handle.usage().await.unwrap();
         assert!(usage.authoritative);
         assert!(usage.has_exhausted_windows);
         server.await.unwrap();
+        let persisted = crate::load_session_record(&context, &record.id).unwrap();
+        let resume = persisted
+            .provider_resume
+            .as_ref()
+            .expect("control reconnect must persist the loaded thread identity");
+        assert_eq!(resume.session_id, "raw-thread-a");
+        assert_eq!(resume.capture_method, PROVIDER_RESUME_CAPTURE_METHOD);
+        assert!(
+            crate::session_dir(&context, &record.id)
+                .join(crate::SESSION_RESUME_FILE)
+                .is_file()
+        );
         drop(handle);
         control.abort();
         let _ = control.await;
@@ -7369,6 +7603,7 @@ printf '%s\n' "{\"schema_version\":\"agent-session.codex-auth-broker.v1\",\"acco
             "event_id": "apply-next-turn-completed",
             "runtime_id": "runtime-apply-next",
             "provider": "codex",
+            "provider_session_id": "raw-thread-apply-next",
             "provider_turn_id": "turn-apply-next",
             "kind": "turn_completed",
             "confidence": "authoritative"
