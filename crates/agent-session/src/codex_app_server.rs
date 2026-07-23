@@ -53,11 +53,11 @@ const MAX_PENDING_ATTENTION_REQUESTS: usize = 64;
 const MAX_PROXY_OBSERVATIONS: usize = 16;
 const MAX_PROXY_OBSERVATION_BYTES: usize = 64 * 1024;
 const MAX_PROXY_MESSAGE_BYTES: usize = 16 * 1024 * 1024;
-const MAX_PROXY_FRAME_BYTES: usize = 4 * 1024 * 1024;
+const MAX_PROXY_FRAME_BYTES: usize = 16 * 1024 * 1024;
 const CONTROL_RESPONSE_TIMEOUT: Duration = Duration::from_secs(10);
 const CONTROL_SUBMISSION_TIMEOUT: Duration = Duration::from_secs(15);
 const CONTROL_SUBMIT_TOTAL_TIMEOUT: Duration = Duration::from_secs(30);
-const MINIMUM_APP_SERVER_VERSION: (u64, u64, u64) = (0, 144, 1);
+const MINIMUM_APP_SERVER_VERSION: (u64, u64, u64) = (0, 145, 0);
 const AUDITED_EXACT_ATTENTION_VERSIONS: &[(u64, u64, u64)] = &[(0, 144, 1), (0, 144, 3)];
 const APP_SERVER_CAPABILITY_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 const APP_SERVER_CAPABILITY_PROBE_MAX_OUTPUT_BYTES: u64 = 64 * 1024;
@@ -4299,7 +4299,7 @@ mod tests {
     }
 
     #[test]
-    fn capability_probe_accepts_newer_versions_with_unix_transport() {
+    fn capability_probe_requires_0_145_or_newer_with_unix_transport() {
         let _probe_guard = capability_probe_test_guard();
         let tmp = tempfile::TempDir::new().unwrap();
         for (name, version, help, expected) in [
@@ -4307,13 +4307,13 @@ mod tests {
                 "supported",
                 "codex-cli 0.144.1",
                 "  --listen <URL>  Supported values: stdio://, unix://PATH",
-                true,
+                false,
             ),
             (
                 "supported-0.144.3",
                 "codex-cli 0.144.3",
                 "  --listen <URL>  Supported values: stdio://, unix://PATH",
-                true,
+                false,
             ),
             (
                 "old",
@@ -4325,7 +4325,7 @@ mod tests {
                 "newer-patch",
                 "codex-cli 0.144.5",
                 "  --listen <URL>  Supported values: stdio://, unix://PATH",
-                true,
+                false,
             ),
             (
                 "newer-minor",
@@ -4407,7 +4407,7 @@ mod tests {
     }
 
     #[test]
-    fn configured_app_server_runtime_selects_protocol_attention_authority() {
+    fn configured_0_145_app_server_runtime_keeps_hook_attention_authority() {
         let _probe_guard = capability_probe_test_guard();
         let lock = GlobalStateLock::new();
         let tmp = tempfile::Builder::new()
@@ -4441,7 +4441,7 @@ mod tests {
         let agent = tmp.path().join("codex");
         fs::write(
             &agent,
-            "#!/bin/sh\nif [ \"$1\" = --version ]; then printf '%s\\n' 'codex-cli 0.144.3'; exit 0; fi\nif [ \"$1\" = app-server ] && [ \"$2\" = --help ]; then printf '%s\\n' '  --listen <URL>  Supported values: stdio://, unix://PATH'; exit 0; fi\nexit 1\n",
+            "#!/bin/sh\nif [ \"$1\" = --version ]; then printf '%s\\n' 'codex-cli 0.145.0'; exit 0; fi\nif [ \"$1\" = app-server ] && [ \"$2\" = --help ]; then printf '%s\\n' '  --listen <URL>  Supported values: stdio://, unix://PATH'; exit 0; fi\nexit 1\n",
         )
         .unwrap();
         fs::set_permissions(&agent, fs::Permissions::from_mode(0o700)).unwrap();
@@ -4460,7 +4460,7 @@ mod tests {
 
         configure_runtime(&context, &agent, &mut record, true).unwrap();
         assert_eq!(record.runtime.as_ref().unwrap().kind, RUNTIME_KIND);
-        assert_eq!(attention_authority(&record), ATTENTION_AUTHORITY_PROTOCOL);
+        assert_eq!(attention_authority(&record), ATTENTION_AUTHORITY_HOOK);
         assert_eq!(
             record
                 .runtime
@@ -4468,12 +4468,12 @@ mod tests {
                 .unwrap()
                 .extra
                 .get(ATTENTION_AUTHORITY_KEY),
-            Some(&json!(ATTENTION_AUTHORITY_PROTOCOL))
+            Some(&json!(ATTENTION_AUTHORITY_HOOK))
         );
     }
 
     #[test]
-    fn unguarded_permission_hook_prevents_protocol_attention_authority() {
+    fn configured_0_145_runtime_stays_hook_authority_with_unguarded_permission_hook() {
         let _probe_guard = capability_probe_test_guard();
         let lock = GlobalStateLock::new();
         let tmp = tempfile::Builder::new()
@@ -4514,7 +4514,7 @@ mod tests {
         let agent = tmp.path().join("codex");
         fs::write(
             &agent,
-            "#!/bin/sh\nif [ \"$1\" = --version ]; then printf '%s\\n' 'codex-cli 0.144.3'; exit 0; fi\nif [ \"$1\" = app-server ] && [ \"$2\" = --help ]; then printf '%s\\n' '  --listen <URL>  Supported values: stdio://, unix://PATH'; exit 0; fi\nexit 1\n",
+            "#!/bin/sh\nif [ \"$1\" = --version ]; then printf '%s\\n' 'codex-cli 0.145.0'; exit 0; fi\nif [ \"$1\" = app-server ] && [ \"$2\" = --help ]; then printf '%s\\n' '  --listen <URL>  Supported values: stdio://, unix://PATH'; exit 0; fi\nexit 1\n",
         )
         .unwrap();
         fs::set_permissions(&agent, fs::Permissions::from_mode(0o700)).unwrap();
@@ -4578,7 +4578,7 @@ mod tests {
             r#"#!/bin/sh
 sleep 0.35
 if [ "$1" = --version ]; then
-  printf '%s\n' 'codex-cli 0.144.1'
+  printf '%s\n' 'codex-cli 0.145.0'
   exit 0
 fi
 if [ "$1" = app-server ] && [ "$2" = --help ]; then
@@ -7548,6 +7548,64 @@ printf '%s\n' "{\"schema_version\":\"agent-session.codex-auth-broker.v1\",\"acco
         server.await.unwrap();
         control.abort();
         let _ = control.await;
+    }
+
+    #[tokio::test]
+    async fn tui_proxy_accepts_the_observed_codex_0_145_frame_size() {
+        const OBSERVED_CODEX_0_145_FRAME_BYTES: usize = 4_260_254;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let upstream = tmp.path().join("large-frame.sock");
+        let listener = tokio::net::UnixListener::bind(&upstream).unwrap();
+        let context = CliContext {
+            state_dir: tmp.path().join("state"),
+            host: None,
+        };
+        let record = record_with_runtime("large-frame", &upstream);
+        fs::create_dir_all(crate::session_dir(&context, &record.id)).unwrap();
+        crate::write_session_record(&context, &record).unwrap();
+        crate::activity::activate_runtime(&context, &record).unwrap();
+        let proxy_args = crate::cli::CodexAppServerProxyArgs {
+            id: record.id.clone(),
+            upstream: upstream.clone(),
+            listen: upstream.with_extension("proxy"),
+        };
+        let proxy_context = context.clone();
+        let proxy = tokio::spawn(async move { run_proxy_session(proxy_context, proxy_args).await });
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let payload =
+                serde_json::to_string(&"x".repeat(OBSERVED_CODEX_0_145_FRAME_BYTES - 2)).unwrap();
+            assert_eq!(payload.len(), OBSERVED_CODEX_0_145_FRAME_BYTES);
+            socket.send(Message::Text(payload.into())).await.unwrap();
+            socket.close(None).await.unwrap();
+        });
+        let proxy_stream = connect_socket(&upstream.with_extension("proxy"))
+            .await
+            .unwrap();
+        let tui_config = WebSocketConfig::default()
+            .max_message_size(Some(MAX_PROXY_MESSAGE_BYTES))
+            .max_frame_size(Some(MAX_PROXY_MESSAGE_BYTES));
+        let (mut tui, _) = tokio_tungstenite::client_async_with_config(
+            "ws://localhost",
+            proxy_stream,
+            Some(tui_config),
+        )
+        .await
+        .unwrap();
+        let message = tokio::time::timeout(Duration::from_secs(10), tui.next())
+            .await
+            .expect("the Codex 0.145.0 frame must arrive before the deadline")
+            .expect("the proxy must keep the TUI connection open")
+            .expect("the proxy must forward the upstream frame");
+        assert_eq!(
+            message.into_text().unwrap().len(),
+            OBSERVED_CODEX_0_145_FRAME_BYTES
+        );
+
+        server.await.unwrap();
+        proxy.await.unwrap().unwrap();
     }
 
     #[tokio::test]
