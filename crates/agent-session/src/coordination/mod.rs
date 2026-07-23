@@ -596,7 +596,7 @@ pub(crate) fn lock_registry(context: &CliContext) -> Result<LockedRegistry, CliE
         Err(_) => return Err(store_unavailable()),
     };
     let now = now_epoch();
-    let mut renewed = false;
+    let mut renewed = notification::normalize_registry(&mut registry, now);
     for claim in &mut registry.claims {
         if claim.state != "active" || claim.expires_at_epoch > now.saturating_add(15 * 60) {
             continue;
