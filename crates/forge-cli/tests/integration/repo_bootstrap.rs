@@ -25,7 +25,7 @@ struct ForgeState {
     patch_calls: usize,
     create_ambiguous: bool,
     signature_verified: bool,
-    legacy_top_level_signature: bool,
+    top_level_only_signature: bool,
     receipt_seen_before_create: bool,
     reported_empty: Option<bool>,
 }
@@ -39,7 +39,7 @@ impl Default for ForgeState {
             patch_calls: 0,
             create_ambiguous: false,
             signature_verified: true,
-            legacy_top_level_signature: false,
+            top_level_only_signature: false,
             receipt_seen_before_create: false,
             reported_empty: None,
         }
@@ -379,7 +379,7 @@ fn handle_forgejo(
             "verified": state.signature_verified,
             "reason": if state.signature_verified {"valid"} else {"unsigned"}
         });
-        let body = if state.legacy_top_level_signature {
+        let body = if state.top_level_only_signature {
             serde_json::json!({"sha": LOCAL_SHA, "verification": verification})
         } else {
             serde_json::json!({
@@ -605,7 +605,7 @@ fn forgejo_bootstrap_org_uses_org_create_endpoint() {
 #[test]
 fn forgejo_bootstrap_rejects_top_level_only_signature_verification() {
     let fixture = Fixture::new("alice");
-    fixture.state.lock().unwrap().legacy_top_level_signature = true;
+    fixture.state.lock().unwrap().top_level_only_signature = true;
     let out = fixture.run("user", false);
     assert_eq!(out.code, 65, "stdout={} stderr={}", out.stdout, out.stderr);
     assert_eq!(
