@@ -44,6 +44,7 @@ _arguments "${_arguments_options[@]}" : \
         case $line[1] in
             (prompt)
 _arguments "${_arguments_options[@]}" : \
+'--runtime=[Child runtime (default\: isolated; inherited loads the full Codex home)]:mode:(isolated inherited)' \
 '--ephemeral[Run without persisting Codex session files to disk]' \
 '-h[Print help]' \
 '--help[Print help]' \
@@ -52,6 +53,7 @@ _arguments "${_arguments_options[@]}" : \
 ;;
 (advice)
 _arguments "${_arguments_options[@]}" : \
+'--runtime=[Child runtime (default\: isolated; inherited loads the full Codex home)]:mode:(isolated inherited)' \
 '--ephemeral[Run without persisting Codex session files to disk]' \
 '-h[Print help]' \
 '--help[Print help]' \
@@ -60,6 +62,7 @@ _arguments "${_arguments_options[@]}" : \
 ;;
 (knowledge)
 _arguments "${_arguments_options[@]}" : \
+'--runtime=[Child runtime (default\: isolated; inherited loads the full Codex home)]:mode:(isolated inherited)' \
 '--ephemeral[Run without persisting Codex session files to disk]' \
 '-h[Print help]' \
 '--help[Print help]' \
@@ -68,6 +71,7 @@ _arguments "${_arguments_options[@]}" : \
 ;;
 (commit)
 _arguments "${_arguments_options[@]}" : \
+'--runtime=[Child runtime (default\: isolated; inherited loads the full Codex home)]:mode:(isolated inherited)' \
 '-p[Push after committing]' \
 '--push[Push after committing]' \
 '-a[Autostage changes before committing]' \
@@ -84,6 +88,14 @@ _arguments "${_arguments_options[@]}" : \
 '-h[Print help]' \
 '--help[Print help]' \
 ':session_id -- Codex session id to resume:_default' \
+&& ret=0
+;;
+(doctor)
+_arguments "${_arguments_options[@]}" : \
+'--format=[Output format (\`text\` or \`json\`)]:format:(text json)' \
+'(--format)--json[Hidden alias for \`--format json\` (kept for backwards compatibility)]' \
+'-h[Print help]' \
+'--help[Print help]' \
 && ret=0
 ;;
 (help)
@@ -115,6 +127,10 @@ _arguments "${_arguments_options[@]}" : \
 && ret=0
 ;;
 (resume)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(doctor)
 _arguments "${_arguments_options[@]}" : \
 && ret=0
 ;;
@@ -617,6 +633,10 @@ _arguments "${_arguments_options[@]}" : \
 _arguments "${_arguments_options[@]}" : \
 && ret=0
 ;;
+(doctor)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
         esac
     ;;
 esac
@@ -803,6 +823,7 @@ _codex-cli__subcmd__agent_commands() {
 'knowledge:Get an explanation for a concept' \
 'commit:Run the semantic-commit workflow' \
 'resume:Resume a Codex session in its recorded working directory' \
+'doctor:Check whether the isolated one-shot runtime is ready' \
 'help:Print this message or the help of the given subcommand(s)' \
     )
     _describe -t commands 'codex-cli agent commands' commands "$@"
@@ -817,6 +838,11 @@ _codex-cli__subcmd__agent__subcmd__commit_commands() {
     local commands; commands=()
     _describe -t commands 'codex-cli agent commit commands' commands "$@"
 }
+(( $+functions[_codex-cli__subcmd__agent__subcmd__doctor_commands] )) ||
+_codex-cli__subcmd__agent__subcmd__doctor_commands() {
+    local commands; commands=()
+    _describe -t commands 'codex-cli agent doctor commands' commands "$@"
+}
 (( $+functions[_codex-cli__subcmd__agent__subcmd__help_commands] )) ||
 _codex-cli__subcmd__agent__subcmd__help_commands() {
     local commands; commands=(
@@ -825,6 +851,7 @@ _codex-cli__subcmd__agent__subcmd__help_commands() {
 'knowledge:Get an explanation for a concept' \
 'commit:Run the semantic-commit workflow' \
 'resume:Resume a Codex session in its recorded working directory' \
+'doctor:Check whether the isolated one-shot runtime is ready' \
 'help:Print this message or the help of the given subcommand(s)' \
     )
     _describe -t commands 'codex-cli agent help commands' commands "$@"
@@ -838,6 +865,11 @@ _codex-cli__subcmd__agent__subcmd__help__subcmd__advice_commands() {
 _codex-cli__subcmd__agent__subcmd__help__subcmd__commit_commands() {
     local commands; commands=()
     _describe -t commands 'codex-cli agent help commit commands' commands "$@"
+}
+(( $+functions[_codex-cli__subcmd__agent__subcmd__help__subcmd__doctor_commands] )) ||
+_codex-cli__subcmd__agent__subcmd__help__subcmd__doctor_commands() {
+    local commands; commands=()
+    _describe -t commands 'codex-cli agent help doctor commands' commands "$@"
 }
 (( $+functions[_codex-cli__subcmd__agent__subcmd__help__subcmd__help_commands] )) ||
 _codex-cli__subcmd__agent__subcmd__help__subcmd__help_commands() {
@@ -1146,6 +1178,7 @@ _codex-cli__subcmd__help__subcmd__agent_commands() {
 'knowledge:Get an explanation for a concept' \
 'commit:Run the semantic-commit workflow' \
 'resume:Resume a Codex session in its recorded working directory' \
+'doctor:Check whether the isolated one-shot runtime is ready' \
     )
     _describe -t commands 'codex-cli help agent commands' commands "$@"
 }
@@ -1158,6 +1191,11 @@ _codex-cli__subcmd__help__subcmd__agent__subcmd__advice_commands() {
 _codex-cli__subcmd__help__subcmd__agent__subcmd__commit_commands() {
     local commands; commands=()
     _describe -t commands 'codex-cli help agent commit commands' commands "$@"
+}
+(( $+functions[_codex-cli__subcmd__help__subcmd__agent__subcmd__doctor_commands] )) ||
+_codex-cli__subcmd__help__subcmd__agent__subcmd__doctor_commands() {
+    local commands; commands=()
+    _describe -t commands 'codex-cli help agent doctor commands' commands "$@"
 }
 (( $+functions[_codex-cli__subcmd__help__subcmd__agent__subcmd__knowledge_commands] )) ||
 _codex-cli__subcmd__help__subcmd__agent__subcmd__knowledge_commands() {
