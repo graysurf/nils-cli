@@ -4,7 +4,7 @@ use std::fs;
 use std::io::{self, Write};
 use std::path::PathBuf;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use clap::error::ErrorKind;
 use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum, ValueHint};
@@ -165,6 +165,8 @@ enum WorkerCommand {
     List(ReadArgs),
     /// Show one assignment, including its private packet.
     Show(WorkerShowArgs),
+    /// Bounded long-poll until an assignment reaches a target state.
+    Wait(WorkerWaitArgs),
     /// Send a private mailbox message to an assignment's worker.
     Message(WorkerMessageArgs),
     /// Accept a submitted worker result after Main Agent review.
@@ -191,6 +193,56 @@ struct WorkerStartArgs {
 #[derive(Clone, Debug, Args)]
 struct WorkerShowArgs {
     assignment_id: String,
+    #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
+    format: OutputFormat,
+}
+
+/// Assignment-state milestone a `worker wait` long-poll watches for.
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum WaitUntil {
+    /// The worker submitted a result for Main Agent review.
+    Submitted,
+    /// The worker reported itself blocked.
+    Blocked,
+    /// The assignment reached a terminal state (accepted, released, or cancelled).
+    Terminal,
+}
+
+impl WaitUntil {
+    /// Whether an assignment `state` string satisfies this wait target. The
+    /// terminal set mirrors the orchestration spec's terminal states so this
+    /// stays aligned with `Registry::validate`'s state allowlist.
+    fn matches(self, state: &str) -> bool {
+        match self {
+            WaitUntil::Submitted => state == "submitted",
+            WaitUntil::Blocked => state == "blocked",
+            WaitUntil::Terminal => matches!(state, "accepted" | "released" | "cancelled"),
+        }
+    }
+
+    /// Stable label echoed back in the wait result payload.
+    fn as_label(self) -> &'static str {
+        match self {
+            WaitUntil::Submitted => "submitted",
+            WaitUntil::Blocked => "blocked",
+            WaitUntil::Terminal => "terminal",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Args)]
+struct WorkerWaitArgs {
+    /// Assignment to watch. Omit and pass --any to watch every assignment.
+    assignment_id: Option<String>,
+    /// Watch every assignment in the active run instead of a single id.
+    #[arg(long)]
+    any: bool,
+    /// Assignment-state milestone to wait for.
+    #[arg(long, value_enum)]
+    until: WaitUntil,
+    /// Bounded wait duration (1-60s; integer with optional s/m/h/d suffix).
+    #[arg(long, default_value = "30s")]
+    timeout: String,
     #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
     format: OutputFormat,
 }
@@ -963,6 +1015,7 @@ fn run_worker(context: &CliContext, args: WorkerArgs) -> Result<Value, CliError>
         WorkerCommand::Start(args) => run_worker_start(context, args),
         WorkerCommand::List(_) => run_worker_list(context),
         WorkerCommand::Show(args) => run_worker_show(context, args),
+        WorkerCommand::Wait(args) => run_worker_wait(context, args),
         WorkerCommand::Message(args) => run_worker_message(context, args),
         WorkerCommand::Accept(args) => {
             run_assignment_state(context, args, "submitted", "accepted", "worker-accept")
@@ -1271,6 +1324,122 @@ fn run_worker_show(context: &CliContext, args: WorkerShowArgs) -> Result<Value, 
         "schema_version": "main-agent.worker-show.v1",
         "assignment": private_assignment_view(context, assignment)?
     }))
+}
+
+/// Upper bound on a single `worker wait` long-poll, matching the mailbox
+/// `message wait` bound so both surfaces cap a blocked call the same way.
+const WORKER_WAIT_MAX_SECS: u64 = 60;
+/// Delay between registry reads while polling; mirrors `mailbox::wait`.
+const WORKER_WAIT_POLL_INTERVAL: Duration = Duration::from_millis(50);
+
+/// Completion-awareness for the orchestrating Main Agent: a bounded, read-only
+/// long-poll that returns once the watched assignment(s) reach the `--until`
+/// milestone, or reports `timeout` when the bound elapses. The operator console
+/// gets sub-second SSE push; this is the equivalent for the CLI consumer.
+///
+/// It is level-triggered — an assignment already in the target state returns
+/// immediately, so "launch N workers, then wait until any submitted" works even
+/// if one finished before the wait began. It takes no registry lock and mutates
+/// nothing (`load_registry_readonly` per poll), so it neither contends with
+/// concurrent worker transitions nor resets its deadline through the facade's
+/// transient-store auto-retry. Like `worker list`/`show`, it requires only the
+/// authenticated live main controller — no work-context claim, revision fence,
+/// or idempotency key. A `--until submitted` result reports a state transition
+/// only; it is never itself acceptance evidence (spec §worker acceptance).
+fn run_worker_wait(context: &CliContext, args: WorkerWaitArgs) -> Result<Value, CliError> {
+    let target_id = match (&args.assignment_id, args.any) {
+        (Some(_), true) => {
+            return Err(CliError::usage(
+                "worker-wait-target",
+                "pass either an assignment id or --any, not both",
+                None,
+            ));
+        }
+        (None, false) => {
+            return Err(CliError::usage(
+                "worker-wait-target",
+                "pass an assignment id or --any",
+                None,
+            ));
+        }
+        (Some(id), false) => Some(id.clone()),
+        (None, true) => None,
+    };
+    let timeout = parse_wait_timeout(&args.timeout)?;
+    let (record, incarnation) = authenticated_self(context)?;
+    let started = Instant::now();
+    loop {
+        let registry = orchestration::load_registry_readonly(context)?;
+        let run = require_current_main(&registry, &record, &incarnation)?;
+        let matched = match target_id.as_deref() {
+            Some(id) => {
+                let assignment = registry
+                    .assignments
+                    .get(id)
+                    .filter(|assignment| assignment.run_id == run.run_id)
+                    .ok_or_else(|| not_found("assignment-not-found", "assignment was not found"))?;
+                args.until.matches(&assignment.state).then_some(assignment)
+            }
+            None => registry
+                .assignments
+                .values()
+                .filter(|assignment| assignment.run_id == run.run_id)
+                .find(|assignment| args.until.matches(&assignment.state)),
+        };
+        if let Some(assignment) = matched {
+            return Ok(json!({
+                "schema_version": "main-agent.worker-wait.v1",
+                "outcome": "transitioned",
+                "until": args.until.as_label(),
+                "assignment": public_assignment_view(assignment)
+            }));
+        }
+        if started.elapsed() >= timeout {
+            return Ok(json!({
+                "schema_version": "main-agent.worker-wait.v1",
+                "outcome": "timeout",
+                "until": args.until.as_label(),
+                "timeout": args.timeout
+            }));
+        }
+        thread::sleep(WORKER_WAIT_POLL_INTERVAL);
+    }
+}
+
+/// Parse and bound a `worker wait` timeout (1-60s; integer with optional
+/// s/m/h/d suffix). Mirrors `mailbox::parse_wait` so the two long-poll surfaces
+/// accept identical duration syntax and bounds.
+fn parse_wait_timeout(value: &str) -> Result<Duration, CliError> {
+    let (number, multiplier) = if let Some(number) = value.strip_suffix('s') {
+        (number, 1)
+    } else if let Some(number) = value.strip_suffix('m') {
+        (number, 60)
+    } else if let Some(number) = value.strip_suffix('h') {
+        (number, 60 * 60)
+    } else if let Some(number) = value.strip_suffix('d') {
+        (number, 24 * 60 * 60)
+    } else {
+        (value, 1)
+    };
+    let seconds = number
+        .parse::<u64>()
+        .ok()
+        .and_then(|seconds| seconds.checked_mul(multiplier))
+        .ok_or_else(|| {
+            CliError::usage(
+                "invalid-duration",
+                "duration must be an integer with optional s, m, h, or d suffix",
+                None,
+            )
+        })?;
+    if seconds == 0 || seconds > WORKER_WAIT_MAX_SECS {
+        return Err(CliError::usage(
+            "worker-wait-timeout",
+            "worker wait must be between 1 and 60 seconds",
+            None,
+        ));
+    }
+    Ok(Duration::from_secs(seconds))
 }
 
 fn run_worker_message(context: &CliContext, args: WorkerMessageArgs) -> Result<Value, CliError> {
@@ -2299,6 +2468,7 @@ fn command_name(command: &MainAgentCommand) -> &'static str {
             WorkerCommand::Start(_) => "worker-start",
             WorkerCommand::List(_) => "worker-list",
             WorkerCommand::Show(_) => "worker-show",
+            WorkerCommand::Wait(_) => "worker-wait",
             WorkerCommand::Message(_) => "worker-message",
             WorkerCommand::Accept(_) => "worker-accept",
             WorkerCommand::Release(_) => "worker-release",
@@ -2330,6 +2500,7 @@ fn command_output_format(command: &MainAgentCommand) -> OutputFormat {
             WorkerCommand::Start(args) => args.format,
             WorkerCommand::List(args) => args.format,
             WorkerCommand::Show(args) => args.format,
+            WorkerCommand::Wait(args) => args.format,
             WorkerCommand::Message(args) => args.format,
             WorkerCommand::Accept(args)
             | WorkerCommand::Release(args)
@@ -2511,5 +2682,66 @@ mod tests {
             "exists",
             None,
         )));
+    }
+
+    #[test]
+    fn wait_until_submitted_and_blocked_match_only_their_state() {
+        assert!(WaitUntil::Submitted.matches("submitted"));
+        assert!(!WaitUntil::Submitted.matches("working"));
+        assert!(!WaitUntil::Submitted.matches("accepted"));
+        assert!(WaitUntil::Blocked.matches("blocked"));
+        assert!(!WaitUntil::Blocked.matches("submitted"));
+    }
+
+    #[test]
+    fn wait_until_terminal_matches_exactly_the_terminal_states() {
+        for terminal in ["accepted", "released", "cancelled"] {
+            assert!(
+                WaitUntil::Terminal.matches(terminal),
+                "{terminal} is terminal"
+            );
+        }
+        for live in ["assigned", "starting", "working", "blocked", "submitted"] {
+            assert!(
+                !WaitUntil::Terminal.matches(live),
+                "{live} must not count as terminal"
+            );
+        }
+    }
+
+    #[test]
+    fn wait_until_label_round_trips() {
+        assert_eq!(WaitUntil::Submitted.as_label(), "submitted");
+        assert_eq!(WaitUntil::Blocked.as_label(), "blocked");
+        assert_eq!(WaitUntil::Terminal.as_label(), "terminal");
+    }
+
+    #[test]
+    fn parse_wait_timeout_accepts_bounds_and_suffixes() {
+        assert_eq!(parse_wait_timeout("1").unwrap(), Duration::from_secs(1));
+        assert_eq!(parse_wait_timeout("30s").unwrap(), Duration::from_secs(30));
+        assert_eq!(parse_wait_timeout("1m").unwrap(), Duration::from_secs(60));
+        assert_eq!(parse_wait_timeout("60").unwrap(), Duration::from_secs(60));
+    }
+
+    #[test]
+    fn parse_wait_timeout_rejects_zero_over_max_and_garbage() {
+        assert_eq!(
+            parse_wait_timeout("0").unwrap_err().code(),
+            "worker-wait-timeout"
+        );
+        assert_eq!(
+            parse_wait_timeout("61").unwrap_err().code(),
+            "worker-wait-timeout"
+        );
+        // 2m == 120s, over the 60s bound.
+        assert_eq!(
+            parse_wait_timeout("2m").unwrap_err().code(),
+            "worker-wait-timeout"
+        );
+        assert_eq!(
+            parse_wait_timeout("abc").unwrap_err().code(),
+            "invalid-duration"
+        );
     }
 }

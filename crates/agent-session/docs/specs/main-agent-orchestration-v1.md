@@ -69,6 +69,7 @@ main-agent status --format json
 main-agent checkpoint --file FILE --if-revision N --idempotency-key KEY --format json
 main-agent worker start --assignment-file FILE --if-run-revision N --idempotency-key KEY --format json
 main-agent worker list|show ...
+main-agent worker wait [ASSIGNMENT_ID | --any] --until submitted|blocked|terminal [--timeout D] --format json
 main-agent worker message|accept|release|delete ...
 main-agent collaborate|borrow|handoff|adopt ...
 main-agent close --if-revision N --idempotency-key KEY --format json
@@ -85,6 +86,18 @@ revision/absence fence, and an idempotency key. Read-only discovery does not.
 Worker launch returns `pending-worker-checkpoint` until authenticated worker
 self-check/checkpoint evidence advances the assignment; transport is never
 reported as acceptance.
+
+`worker wait` is read-only completion-awareness for the orchestrating Main
+Agent — the CLI counterpart to the operator console's sub-second SSE push. It is
+a bounded (1-60s), level-triggered long-poll: given an assignment id or `--any`,
+it returns once a watched assignment is in the `--until` target state
+(`submitted`, `blocked`, or the terminal set `accepted|released|cancelled`), or
+reports `{"outcome":"timeout"}` when the bound elapses. It takes no registry
+lock and requires only the authenticated live main controller — no claim,
+revision fence, or idempotency key. Like `pending-worker-checkpoint`, a
+`--until submitted` result reports a state transition only; it is never itself
+acceptance evidence, and the Main Agent MUST still gather the review evidence
+below before `worker accept`.
 
 ### Interactive worker acceptance
 

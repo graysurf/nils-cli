@@ -4868,3 +4868,146 @@ fn main_agent_handoff_requires_operation_quiescence_and_adopt_requires_an_orphan
         "main-two"
     );
 }
+
+#[test]
+fn main_agent_worker_wait_transitions_times_out_and_validates_target() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let state_dir = tmp.path().join("state");
+    let checkout = tmp.path().join("checkout");
+    fs::create_dir(&state_dir).expect("state");
+    init_checkout(&checkout, "https://example.invalid/example/repository.git");
+    seed_brokers_at(
+        &state_dir,
+        &[(
+            "main-one",
+            "main-incarnation-one",
+            "main-private-capability-material-0000000001",
+            checkout.as_path(),
+            Some("enforce"),
+        )],
+    );
+    let main_capability = init_main_run(tmp.path(), &state_dir, &checkout, "main-one", "run-one");
+    let private_packet = json!({
+        "schema_version": "main-agent.assignment-input.v1",
+        "assignment_id": "assignment-one",
+        "task_summary": "Worker wait fixture",
+        "task": {},
+        "launch": {
+            "agent": "codex",
+            "cwd": checkout,
+            "title": null,
+            "session_id": null,
+            "coordination_mode": "enforce",
+            "agent_args": []
+        },
+        "repository": "example/repository",
+        "worktree": null,
+        "base_ref": "main",
+        "scopes": ["crates/agent-session"],
+        "durable_refs": []
+    });
+    insert_orchestration_assignment(
+        &state_dir,
+        "assignment-one",
+        json!({
+            "schema_version": "agent-session.orchestration-assignment.v1",
+            "assignment_id": "assignment-one",
+            "run_id": "run-one",
+            "revision": 2,
+            "state": "submitted",
+            "task_summary": "Worker wait fixture",
+            "private_packet_digest": "replaced-by-fixture",
+            "primary_manager": {
+                "session_id": "main-one",
+                "session_incarnation": "main-incarnation-one",
+                "session_created_at": "2030-01-01T00:00:00Z"
+            },
+            "worker": null,
+            "collaborators": [],
+            "borrowed_by": [],
+            "repository": "example/repository",
+            "worktree": null,
+            "base_ref": "main",
+            "scopes": ["crates/agent-session"],
+            "durable_refs": [],
+            "checkpoint": null,
+            "result_summary": null,
+            "blocker_summary": null,
+            "created_at": "2030-01-01T00:00:01Z",
+            "updated_at": "2030-01-01T00:00:02Z"
+        }),
+        &private_packet,
+    );
+    let state = state_dir.to_str().expect("state dir");
+
+    // Level-triggered: an already-submitted assignment returns immediately.
+    let transitioned = run_main_agent(
+        &checkout,
+        &[
+            "--state-dir", state, "worker", "wait", "assignment-one", "--until", "submitted",
+            "--timeout", "5s", "--format", "json",
+        ],
+        &[("AGENT_SESSION_CAPABILITY_FILE", &main_capability)],
+    );
+    assert_eq!(transitioned.code, 0, "stderr={}", transitioned.stderr_text());
+    assert_eq!(data(&transitioned)["outcome"], "transitioned");
+    assert_eq!(data(&transitioned)["until"], "submitted");
+    assert_eq!(
+        data(&transitioned)["assignment"]["assignment_id"],
+        "assignment-one"
+    );
+    assert_eq!(data(&transitioned)["assignment"]["state"], "submitted");
+
+    // --any resolves the same assignment without naming it.
+    let any = run_main_agent(
+        &checkout,
+        &[
+            "--state-dir", state, "worker", "wait", "--any", "--until", "submitted", "--timeout",
+            "5s", "--format", "json",
+        ],
+        &[("AGENT_SESSION_CAPABILITY_FILE", &main_capability)],
+    );
+    assert_eq!(any.code, 0, "stderr={}", any.stderr_text());
+    assert_eq!(data(&any)["outcome"], "transitioned");
+    assert_eq!(data(&any)["assignment"]["assignment_id"], "assignment-one");
+
+    // Waiting for a state it will not reach within the bound reports timeout.
+    let timed_out = run_main_agent(
+        &checkout,
+        &[
+            "--state-dir", state, "worker", "wait", "assignment-one", "--until", "terminal",
+            "--timeout", "1s", "--format", "json",
+        ],
+        &[("AGENT_SESSION_CAPABILITY_FILE", &main_capability)],
+    );
+    assert_eq!(timed_out.code, 0, "stderr={}", timed_out.stderr_text());
+    assert_eq!(data(&timed_out)["outcome"], "timeout");
+    assert_eq!(data(&timed_out)["until"], "terminal");
+
+    // An unknown assignment id is an error, not a silent wait.
+    let missing = run_main_agent(
+        &checkout,
+        &[
+            "--state-dir", state, "worker", "wait", "missing-assignment", "--until", "submitted",
+            "--timeout", "1s", "--format", "json",
+        ],
+        &[("AGENT_SESSION_CAPABILITY_FILE", &main_capability)],
+    );
+    assert_ne!(missing.code, 0);
+    assert_eq!(
+        missing.stdout_json()["error"]["code"],
+        "assignment-not-found"
+    );
+
+    // Neither an id nor --any is rejected before any polling begins.
+    let no_target = run_main_agent(
+        &checkout,
+        &[
+            "--state-dir", state, "worker", "wait", "--until", "submitted", "--timeout", "1s",
+            "--format", "json",
+        ],
+        &[("AGENT_SESSION_CAPABILITY_FILE", &main_capability)],
+    );
+    assert_ne!(no_target.code, 0);
+    assert_eq!(no_target.stdout_json()["error"]["code"], "worker-wait-target");
+}
