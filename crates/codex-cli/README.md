@@ -55,9 +55,11 @@ Help:
   launching Codex (`65`) when the id is unknown or matches more than one recorded directory; pass `--cd` to override the resolved directory
   for a repository that moved.
 - `run --capsule <dir> [--allow-host-access] [--format text|json]`: Validate
-  and run a private Execution Capsule through an inherited Codex supervisor.
+  and run a private Execution Capsule through a Codex supervisor.
   Workspace capsules retain `workspace-write`; host capsules require the
-  operator to pass `--allow-host-access` and use `danger-full-access`.
+  operator to pass `--allow-host-access` and use `danger-full-access`. Host
+  receipts are `supervisor-trusted`, not tamper-resistant against a malicious
+  same-UID process.
 
 Agent flag notes:
 

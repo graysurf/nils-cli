@@ -242,6 +242,7 @@
         "manifest_sha256",
         "entrypoint_sha256",
         "access",
+        "evidence_trust",
         "codex_exit_code",
         "script_runs",
         "script_passed",
@@ -268,6 +269,9 @@
         },
         "access": {
           "enum": ["workspace", "host"]
+        },
+        "evidence_trust": {
+          "enum": ["sandbox-attested", "supervisor-trusted"]
         },
         "codex_exit_code": {
           "type": "integer"
@@ -406,6 +410,42 @@
           "format": "date-time"
         }
       },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "access": {
+                "const": "workspace"
+              }
+            },
+            "required": ["access"]
+          },
+          "then": {
+            "properties": {
+              "evidence_trust": {
+                "const": "sandbox-attested"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "access": {
+                "const": "host"
+              }
+            },
+            "required": ["access"]
+          },
+          "then": {
+            "properties": {
+              "evidence_trust": {
+                "const": "supervisor-trusted"
+              }
+            }
+          }
+        }
+      ],
       "additionalProperties": true
     }
   }

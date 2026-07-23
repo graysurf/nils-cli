@@ -133,7 +133,7 @@ codex --ask-for-approval never exec \
   --sandbox workspace-write|danger-full-access \
   --json \
   --output-schema <capsule>/result.schema.json \
-  --output-last-message /dev/fd/<parent-held-final-capture> \
+  --output-last-message /dev/fd/0 \
   -- <supervisor-prompt>
 ```
 
@@ -149,9 +149,21 @@ declares it and the operator supplies `--allow-host-access`. This two-part
 acknowledgement is intended for an operator launching the command outside the
 current agent's constrained environment, including an urgent local hotfix.
 
+Evidence trust differs by access class:
+
+- `workspace` receipts are `sandbox-attested`: the filesystem sandbox keeps
+  the helper and named capsule inputs outside the writable task boundary.
+- `host` receipts are `supervisor-trusted`: they preserve governance,
+  monitoring, validation, and durable reporting, but are not a
+  tamper-resistant security attestation against a malicious same-UID process
+  with `danger-full-access`. Use a distinct OS security principal when
+  adversarial host attestation is required.
+
 The parent never runs `run.sh` or validation directly. It gives Codex exact
-helper commands whose executable is an inherited descriptor pinned to the
-running `codex-cli` inode, rather than a reopenable pathname. Each helper runs
+helper commands whose executable is a private owner-only snapshot of the
+running `codex-cli`, stored outside the declared workspace. The parent keeps
+the helper inode open, verifies its identity, permissions, and digest after
+Codex exits, and removes it before publishing the receipt. Each helper runs
 inside the active Codex sandbox,
 revalidates the capsule, snapshots `run.sh` into memory, checks the snapshot
 digest, and executes those exact bytes. The snapshot preserves `run.sh` as
@@ -168,9 +180,10 @@ contains a completed `command_execution` event for the exact helper command
 and its output contains the matching nonce-bound helper attestation. The
 parent publishes that captured stream as `events.jsonl` only after Codex exits,
 so the supervised process cannot forge evidence through the named artifact.
-Codex also writes its structured final report through a parent-held unlinked
-descriptor; the parent validates the bytes and atomically publishes
-`final.json`. A model-authored final claim alone cannot attest execution.
+Codex also writes its structured final report through standard input,
+which the Node launcher preserves as a parent-held unlinked file created
+inside the declared workspace; the parent validates the bytes and atomically
+publishes `final.json`. A model-authored final claim alone cannot attest execution.
 After Codex exits, the parent verifies the pinned helper plus `manifest.json`
 and `run.sh` retain their original identity, permissions, and digest. Artifact
 publication atomically replaces hostile symlink or hardlink directory entries
@@ -205,6 +218,7 @@ The top-level fields are:
 | `capsule` | string | Canonical capsule path. |
 | `manifest_sha256`, `entrypoint_sha256` | string | Validated `sha256:` digests. |
 | `access` | string | `workspace` or `host`. |
+| `evidence_trust` | string | `sandbox-attested` for `workspace`; `supervisor-trusted` for `host`. |
 | `codex_exit_code` | integer | Codex process exit; `127` when launch failed. |
 | `codex_error` | string | Optional; omitted unless Codex launch failed. |
 | `evidence_error` | string | Optional; omitted unless captured events could not be read or safely published. |

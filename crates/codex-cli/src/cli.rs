@@ -133,7 +133,7 @@ pub enum AgentCommand {
         /// Private capsule directory containing manifest.json and run.sh
         #[arg(long = "capsule", value_name = "dir", value_hint = ValueHint::DirPath)]
         capsule: PathBuf,
-        /// Explicitly acknowledge that a host-access capsule may run without filesystem sandboxing
+        /// Acknowledge unsandboxed host access and supervisor-trusted evidence
         #[arg(long = "allow-host-access")]
         allow_host_access: bool,
         #[command(flatten)]

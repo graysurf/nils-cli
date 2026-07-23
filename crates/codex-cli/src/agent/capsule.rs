@@ -52,6 +52,13 @@ impl Access {
             Self::Host => "danger-full-access",
         }
     }
+
+    fn evidence_trust(self) -> &'static str {
+        match self {
+            Self::Workspace => "sandbox-attested",
+            Self::Host => "supervisor-trusted",
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -144,6 +151,7 @@ struct ReceiptData {
     manifest_sha256: String,
     entrypoint_sha256: String,
     access: &'static str,
+    evidence_trust: &'static str,
     codex_exit_code: i32,
     #[serde(skip_serializing_if = "Option::is_none")]
     codex_error: Option<String>,
@@ -173,7 +181,9 @@ struct HelperCommands {
     nonce: String,
     script: String,
     validation: Vec<String>,
+    executable_name: String,
     executable: File,
+    directory_identity: FileIdentity,
     executable_identity: FileIdentity,
     executable_digest: String,
 }
@@ -298,8 +308,14 @@ fn run_inner(options: &RunOptions) -> Result<i32, CapsuleError> {
     drop(capsule.directory.private_output_file("final.json")?);
     drop(capsule.directory.private_output_file("receipt.json")?);
     let mut helpers = helper_commands(&capsule)?;
-    let mut final_capture = child_output_capture(&capsule.directory)?;
-    let final_capture_path = format!("/dev/fd/{}", final_capture.as_raw_fd());
+    let mut final_capture = child_output_capture(&capsule.cwd)?;
+    let final_capture_stdin = final_capture.try_clone().map_err(|error| {
+        CapsuleError::runtime(
+            "final-capture-unavailable",
+            format!("cannot clone private final capture: {error}"),
+        )
+    })?;
+    let final_capture_path = "/dev/fd/0";
 
     crate::runtime::refresh_remote_auth_before_exec();
     let prompt = supervisor_prompt(&capsule, &helpers);
@@ -316,9 +332,9 @@ fn run_inner(options: &RunOptions) -> Result<i32, CapsuleError> {
         .args(["--output-schema"])
         .arg(&schema_path)
         .args(["--output-last-message"])
-        .arg(&final_capture_path)
+        .arg(final_capture_path)
         .args(["--", &prompt])
-        .stdin(Stdio::null())
+        .stdin(Stdio::from(final_capture_stdin))
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
         .spawn();
@@ -369,6 +385,7 @@ fn run_inner(options: &RunOptions) -> Result<i32, CapsuleError> {
                 "final-report-too-large: Codex final report exceeds 64 KiB",
             )
         };
+    let helper_directory_verification = verify_helper_directory_integrity(&helpers, &capsule);
     if let Err(error) = capsule
         .directory
         .write_private_bytes_replacing("events.jsonl", &events_bytes)
@@ -407,10 +424,24 @@ fn run_inner(options: &RunOptions) -> Result<i32, CapsuleError> {
     };
     let script_passed = script_runs.last().is_some_and(|result| result.passed);
     let validations_passed = validation.iter().all(|result| result.passed);
+    let helper_verification =
+        helper_directory_verification.and_then(|()| verify_helper_integrity(&mut helpers));
+    let helper_cleanup = capsule
+        .directory
+        .remove_private_file(&helpers.executable_name);
     let (helper_integrity_valid, helper_integrity_error) =
-        match verify_helper_integrity(&mut helpers) {
-            Ok(()) => (true, None),
-            Err(error) => (false, Some(format!("{}: {}", error.code, error.message))),
+        match (helper_verification, helper_cleanup) {
+            (Ok(()), Ok(())) => (true, None),
+            (Err(error), Ok(())) | (Ok(()), Err(error)) => {
+                (false, Some(format!("{}: {}", error.code, error.message)))
+            }
+            (Err(verification), Err(cleanup)) => (
+                false,
+                Some(format!(
+                    "{}: {}; {}: {}",
+                    verification.code, verification.message, cleanup.code, cleanup.message
+                )),
+            ),
         };
     let (entrypoint_integrity_valid, entrypoint_integrity_error) =
         match verify_capsule_integrity(&capsule) {
@@ -431,6 +462,7 @@ fn run_inner(options: &RunOptions) -> Result<i32, CapsuleError> {
         manifest_sha256: capsule.manifest_sha256.clone(),
         entrypoint_sha256: capsule.manifest.entrypoint_sha256.clone(),
         access: capsule.manifest.access.as_str(),
+        evidence_trust: capsule.manifest.access.evidence_trust(),
         codex_exit_code,
         codex_error: codex_error.clone(),
         evidence_error: evidence_error.clone(),
@@ -952,6 +984,21 @@ impl CapsuleDirectory {
         Ok(file)
     }
 
+    fn remove_private_file(&self, name: &str) -> Result<(), CapsuleError> {
+        let name = c_name(OsStr::new(name), "helper-integrity-failed")?;
+        if unsafe { libc::unlinkat(self.file.as_raw_fd(), name.as_ptr(), 0) } != 0 {
+            return Err(CapsuleError::runtime(
+                "helper-integrity-failed",
+                format!(
+                    "cannot remove private helper {}: {}",
+                    name.to_string_lossy(),
+                    std::io::Error::last_os_error()
+                ),
+            ));
+        }
+        Ok(())
+    }
+
     fn private_unlinked_output(&self, name: &str) -> Result<File, CapsuleError> {
         let name = c_name(OsStr::new(name), "artifact-path-unsafe")?;
         let descriptor = unsafe {
@@ -1380,28 +1427,13 @@ fn final_report_schema() -> Value {
     })
 }
 
-fn set_descriptor_inheritable(file: &File, code: &'static str) -> Result<(), CapsuleError> {
-    let descriptor = file.as_raw_fd();
-    let flags = unsafe { libc::fcntl(descriptor, libc::F_GETFD) };
-    if flags < 0 || unsafe { libc::fcntl(descriptor, libc::F_SETFD, flags & !libc::FD_CLOEXEC) } < 0
-    {
-        return Err(CapsuleError::runtime(
-            code,
-            format!(
-                "cannot make descriptor {descriptor} inheritable: {}",
-                std::io::Error::last_os_error()
-            ),
-        ));
-    }
-    Ok(())
-}
-
-fn child_output_capture(directory: &CapsuleDirectory) -> Result<File, CapsuleError> {
-    let sequence = TEMP_FILE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-    let name = format!(".final.capture.{}.{}", std::process::id(), sequence);
-    let file = directory.private_unlinked_output(&name)?;
-    set_descriptor_inheritable(&file, "final-capture-unavailable")?;
-    Ok(file)
+fn child_output_capture(cwd: &Path) -> Result<File, CapsuleError> {
+    let directory = CapsuleDirectory::open(cwd)?;
+    let name = format!(
+        ".final.capture.{}",
+        random_artifact_token("final-capture-unavailable")?
+    );
+    directory.private_unlinked_output(&name)
 }
 
 fn read_bounded<R: Read>(
@@ -1421,30 +1453,30 @@ fn read_bounded<R: Read>(
 }
 
 fn helper_commands(capsule: &ValidatedCapsule) -> Result<HelperCommands, CapsuleError> {
-    let executable_path = std::env::current_exe().map_err(|error| {
+    let source_path = std::env::current_exe().map_err(|error| {
         CapsuleError::runtime(
             "helper-unavailable",
             format!("cannot resolve the running codex-cli executable: {error}"),
         )
     })?;
-    let mut executable = OpenOptions::new()
+    let mut source = OpenOptions::new()
         .read(true)
-        .open(&executable_path)
+        .open(&source_path)
         .map_err(|error| {
             CapsuleError::runtime(
                 "helper-unavailable",
                 format!(
                     "cannot pin running codex-cli executable {}: {error}",
-                    executable_path.display()
+                    source_path.display()
                 ),
             )
         })?;
-    let metadata = executable.metadata().map_err(|error| {
+    let metadata = source.metadata().map_err(|error| {
         CapsuleError::runtime(
             "helper-unavailable",
             format!(
                 "cannot inspect running codex-cli executable {}: {error}",
-                executable_path.display()
+                source_path.display()
             ),
         )
     })?;
@@ -1456,20 +1488,82 @@ fn helper_commands(capsule: &ValidatedCapsule) -> Result<HelperCommands, Capsule
             "helper-untrusted",
             format!(
                 "running codex-cli executable {} must be owner-controlled and executable",
-                executable_path.display()
+                source_path.display()
             ),
         ));
     }
-    let executable_identity = FileIdentity::from_metadata(&metadata);
-    let executable_digest = sha256_open_file(&mut executable, &executable_path)?;
-    set_descriptor_inheritable(&executable, "helper-unavailable")?;
-    let executable_command = format!("/dev/fd/{}", executable.as_raw_fd());
-    if !Path::new(&executable_command).exists() {
+    let source_digest = sha256_open_file(&mut source, &source_path)?;
+    source.seek(SeekFrom::Start(0)).map_err(|error| {
+        CapsuleError::runtime(
+            "helper-unavailable",
+            format!("cannot rewind {}: {error}", source_path.display()),
+        )
+    })?;
+    let executable_name = format!(
+        ".execution-capsule-helper.{}",
+        random_artifact_token("helper-unavailable")?
+    );
+    let executable_component = c_name(OsStr::new(&executable_name), "helper-unavailable")?;
+    let mut executable_writer = capsule
+        .directory
+        .create_new_private(&executable_component)?;
+    std::io::copy(&mut source, &mut executable_writer).map_err(|error| {
+        CapsuleError::runtime(
+            "helper-unavailable",
+            format!("cannot snapshot the running codex-cli executable: {error}"),
+        )
+    })?;
+    executable_writer.sync_all().map_err(|error| {
+        CapsuleError::runtime(
+            "helper-unavailable",
+            format!("cannot sync the private codex-cli helper: {error}"),
+        )
+    })?;
+    if unsafe { libc::fchmod(executable_writer.as_raw_fd(), 0o500) } != 0 {
         return Err(CapsuleError::runtime(
             "helper-unavailable",
-            format!("inherited descriptor path {executable_command} is unavailable"),
+            format!(
+                "cannot make the private codex-cli helper executable: {}",
+                std::io::Error::last_os_error()
+            ),
         ));
     }
+    drop(executable_writer);
+    let mut executable = capsule.directory.open_private_regular(
+        OsStr::new(&executable_name),
+        "helper-unavailable",
+        "private codex-cli helper is not a regular file",
+        "helper-untrusted",
+    )?;
+    let executable_metadata = executable.metadata().map_err(|error| {
+        CapsuleError::runtime(
+            "helper-unavailable",
+            format!("cannot inspect the private codex-cli helper: {error}"),
+        )
+    })?;
+    if executable_metadata.mode() & 0o111 == 0 {
+        return Err(CapsuleError::runtime(
+            "helper-untrusted",
+            "private codex-cli helper is not executable",
+        ));
+    }
+    let executable_identity = FileIdentity::from_metadata(&executable_metadata);
+    let directory_identity =
+        FileIdentity::from_metadata(&capsule.directory.file.metadata().map_err(|error| {
+            CapsuleError::runtime(
+                "helper-unavailable",
+                format!("cannot inspect the pinned capsule directory: {error}"),
+            )
+        })?);
+    let executable_path = capsule.root.join(&executable_name);
+    let executable_digest = sha256_open_file(&mut executable, &executable_path)?;
+    if executable_digest != source_digest {
+        return Err(CapsuleError::runtime(
+            "helper-integrity-failed",
+            "private codex-cli helper does not match the running executable",
+        ));
+    }
+    let executable_command = executable_path.display().to_string();
     let nonce_seed = format!(
         "{}:{}:{}:{}",
         capsule.manifest_sha256,
@@ -1506,10 +1600,40 @@ fn helper_commands(capsule: &ValidatedCapsule) -> Result<HelperCommands, Capsule
         nonce,
         script,
         validation,
+        executable_name,
         executable,
+        directory_identity,
         executable_identity,
         executable_digest,
     })
+}
+
+fn verify_helper_directory_integrity(
+    helpers: &HelperCommands,
+    capsule: &ValidatedCapsule,
+) -> Result<(), CapsuleError> {
+    let retained_directory = capsule.directory.file.metadata().map_err(|error| {
+        CapsuleError::runtime(
+            "helper-integrity-failed",
+            format!("cannot inspect retained capsule directory: {error}"),
+        )
+    })?;
+    let live_directory = CapsuleDirectory::open(&capsule.root)?;
+    let live_directory_metadata = live_directory.file.metadata().map_err(|error| {
+        CapsuleError::runtime(
+            "helper-integrity-failed",
+            format!("cannot inspect live capsule directory: {error}"),
+        )
+    })?;
+    if FileIdentity::from_metadata(&retained_directory) != helpers.directory_identity
+        || FileIdentity::from_metadata(&live_directory_metadata) != helpers.directory_identity
+    {
+        return Err(CapsuleError::runtime(
+            "helper-integrity-failed",
+            "capsule directory identity or metadata changed during supervision",
+        ));
+    }
+    Ok(())
 }
 
 fn verify_helper_integrity(helpers: &mut HelperCommands) -> Result<(), CapsuleError> {
@@ -1811,10 +1935,19 @@ fn missing_execution_evidence(
 }
 
 fn event_command_matches(observed: &str, expected: &str) -> bool {
-    observed == expected
-        || observed
-            .split_once(" -lc ")
-            .is_some_and(|(_, command)| command == expected)
+    if observed == expected {
+        return true;
+    }
+    let Some((_, shell_input)) = observed.split_once(" -lc ") else {
+        return false;
+    };
+    if shell_input == expected {
+        return true;
+    }
+    matches!(
+        shell_words::split(shell_input),
+        Ok(words) if words.len() == 1 && words[0] == expected
+    )
 }
 
 fn find_attestation(
@@ -2021,6 +2154,9 @@ fn render_receipt(receipt: &Value, json_output: bool) {
     let data = &receipt["result"];
     let status = if ok { "succeeded" } else { "failed" };
     println!("execution capsule {status}");
+    if let Some(trust) = data["evidence_trust"].as_str() {
+        println!("evidence trust: {trust}");
+    }
     if let Some(summary) = data["final"]["summary"].as_str() {
         println!("summary: {summary}");
     }

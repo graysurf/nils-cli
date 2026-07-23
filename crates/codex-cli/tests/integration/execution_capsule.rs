@@ -174,12 +174,17 @@ json_escape() {
 LAST_STATUS=127
 emit_command_event() {
   local command="$1"
-  local combined command_json output_json
+  local combined command_json observed_command output_json
   set +e
   combined="$(eval "$command" 2>&1)"
   LAST_STATUS=$?
   set -e
-  command_json="$(json_escape "$command")"
+  observed_command="$command"
+  if [ "${CODEX_CAPSULE_QUOTE_EVENT_COMMAND:-0}" = 1 ]; then
+    observed_command="'$command'"
+  fi
+  observed_command="${observed_command}${CODEX_CAPSULE_EVENT_COMMAND_SUFFIX:-}"
+  command_json="$(json_escape "$observed_command")"
   output_json="$(json_escape "$combined")"
   printf '{"type":"item.completed","item":{"id":"item-test","type":"command_execution","command":"/usr/bin/zsh -lc %s","aggregated_output":"%s","exit_code":%d,"status":"completed"}}\n' \
     "$command_json" "$output_json" "$LAST_STATUS"
@@ -187,6 +192,54 @@ emit_command_event() {
 
 script_command="$(printf '%s\n' "$last" | sed -n 's/^Exact script command: //p' | head -1)"
 test -n "$script_command"
+restore_capsule_root=''
+if [ -n "${CODEX_CAPSULE_SWAP_CAPSULE_ROOT:-}" ]; then
+  helper_path="${script_command%% *}"
+  helper_name="${helper_path##*/}"
+  restore_capsule_root="$CODEX_CAPSULE_SWAP_CAPSULE_ROOT.original"
+  mv "$CODEX_CAPSULE_SWAP_CAPSULE_ROOT" "$restore_capsule_root"
+  mkdir -m 700 "$CODEX_CAPSULE_SWAP_CAPSULE_ROOT"
+  cp "$restore_capsule_root/manifest.json" "$CODEX_CAPSULE_SWAP_CAPSULE_ROOT/manifest.json"
+  chmod 600 "$CODEX_CAPSULE_SWAP_CAPSULE_ROOT/manifest.json"
+  cat >"$CODEX_CAPSULE_SWAP_CAPSULE_ROOT/$helper_name" <<'HELPER'
+#!/usr/bin/env bash
+set -euo pipefail
+capsule=''
+nonce=''
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --capsule) capsule="$2"; shift 2 ;;
+    --nonce) nonce="$2"; shift 2 ;;
+    *) shift ;;
+  esac
+done
+digest="$(sed -n 's/.*"entrypoint_sha256": *"\([^"]*\)".*/\1/p' "$capsule/manifest.json")"
+printf '\n{"schema_version":"cli.codex-cli.execution-capsule.attestation.v1","nonce":"%s","kind":"script","validation_index":null,"entrypoint_sha256":"%s","exit_code":0}\n' \
+  "$nonce" "$digest"
+HELPER
+  chmod 500 "$CODEX_CAPSULE_SWAP_CAPSULE_ROOT/$helper_name"
+fi
+if [ "${CODEX_CAPSULE_FORGE_REPLACED_HELPER:-0}" = 1 ]; then
+  helper_path="${script_command%% *}"
+  mv "$helper_path" "$helper_path.original"
+  cat >"$helper_path" <<'HELPER'
+#!/usr/bin/env bash
+set -euo pipefail
+capsule=''
+nonce=''
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --capsule) capsule="$2"; shift 2 ;;
+    --nonce) nonce="$2"; shift 2 ;;
+    *) shift ;;
+  esac
+done
+digest="$(sed -n 's/.*"entrypoint_sha256": *"\([^"]*\)".*/\1/p' "$capsule/manifest.json")"
+printf '\n{"schema_version":"cli.codex-cli.execution-capsule.attestation.v1","nonce":"%s","kind":"script","validation_index":null,"entrypoint_sha256":"%s","exit_code":0}\n' \
+  "$nonce" "$digest"
+HELPER
+  chmod 500 "$helper_path"
+fi
 if [ -n "${CODEX_CAPSULE_REPLACE_HELPER_PATH:-}" ]; then
   mv "$CODEX_CAPSULE_REPLACE_HELPER_PATH" "$CODEX_CAPSULE_REPLACE_HELPER_PATH.original"
   printf '%s\n' '#!/usr/bin/env bash' 'exit 0' > "$CODEX_CAPSULE_REPLACE_HELPER_PATH"
@@ -216,11 +269,21 @@ if [ -n "${CODEX_CAPSULE_TAMPER_SCRIPT:-}" ]; then
   printf '%s\n' '#!/usr/bin/env bash' 'exit 7' > "$CODEX_CAPSULE_TAMPER_SCRIPT"
   chmod 700 "$CODEX_CAPSULE_TAMPER_SCRIPT"
 fi
+if [ -n "$restore_capsule_root" ]; then
+  rm -f "$CODEX_CAPSULE_SWAP_CAPSULE_ROOT"/*
+  rmdir "$CODEX_CAPSULE_SWAP_CAPSULE_ROOT"
+  mv "$restore_capsule_root" "$CODEX_CAPSULE_SWAP_CAPSULE_ROOT"
+fi
 if [ -n "${CODEX_CAPSULE_SWAP_FINAL_PATH:-}" ]; then
   rm -f "$CODEX_CAPSULE_SWAP_FINAL_PATH"
   ln -s "$CODEX_CAPSULE_SENTINEL" "$CODEX_CAPSULE_SWAP_FINAL_PATH"
 fi
 if [ "${CODEX_CAPSULE_SKIP_FINAL:-0}" != 1 ]; then
+  if [ "${CODEX_CAPSULE_CLOSE_EXTRA_FDS:-0}" = 1 ]; then
+    for descriptor in $(seq 3 32); do
+      eval "exec ${descriptor}>&-" 2>/dev/null || true
+    done
+  fi
   if [ -n "${CODEX_CAPSULE_FINAL_JSON:-}" ]; then
     printf '%s\n' "$CODEX_CAPSULE_FINAL_JSON" > "$output"
   else
@@ -271,7 +334,9 @@ fn workspace_capsule_preserves_governance_and_writes_private_artifacts() {
             .with_env(
                 "CODEX_CAPSULE_ARGV_LOG",
                 argv_log.to_str().expect("argv log"),
-            ),
+            )
+            .with_env("CODEX_CAPSULE_QUOTE_EVENT_COMMAND", "1")
+            .with_env("CODEX_CAPSULE_CLOSE_EXTRA_FDS", "1"),
     );
 
     assert_eq!(
@@ -289,6 +354,7 @@ fn workspace_capsule_preserves_governance_and_writes_private_artifacts() {
     );
     assert_eq!(response["ok"], true);
     assert_eq!(response["result"]["access"], "workspace");
+    assert_eq!(response["result"]["evidence_trust"], "sandbox-attested");
     assert_eq!(response["result"]["final"]["status"], "succeeded");
     assert_eq!(response["command"], "agent run");
     assert_eq!(response["result"]["script_runs"][0]["phase"], "attempt-1");
@@ -340,6 +406,9 @@ fn workspace_capsule_preserves_governance_and_writes_private_artifacts() {
     let mut invalid = response.clone();
     invalid["result"]["manifest_sha256"] = json!("not-a-digest");
     assert_receipt_schema_rejects(&invalid, "receipt with malformed manifest digest");
+    let mut invalid = response.clone();
+    invalid["result"]["evidence_trust"] = json!("supervisor-trusted");
+    assert_receipt_schema_rejects(&invalid, "workspace receipt with host evidence trust");
 
     let argv = fs::read_to_string(argv_log)
         .expect("argv log")
@@ -361,6 +430,7 @@ fn workspace_capsule_preserves_governance_and_writes_private_artifacts() {
     assert_eq!(&argv[6..9], &["--sandbox", "workspace-write", "--json"]);
     assert_eq!(argv[9], "--output-schema");
     assert_eq!(argv[11], "--output-last-message");
+    assert_eq!(argv[12], "/dev/fd/0");
     assert_eq!(argv[13], "--");
     let prompt = &argv[14];
     assert!(prompt.contains("Apply the prepared change and verify it."));
@@ -386,6 +456,26 @@ fn workspace_capsule_preserves_governance_and_writes_private_artifacts() {
         let metadata = fs::metadata(capsule.join(artifact)).expect("artifact metadata");
         assert_eq!(metadata.mode() & 0o077, 0, "{artifact} must be owner-only");
     }
+    assert!(
+        fs::read_dir(&capsule)
+            .expect("capsule entries")
+            .all(|entry| !entry
+                .expect("capsule entry")
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".execution-capsule-helper.")),
+        "private helper snapshots must be removed before returning"
+    );
+    assert!(
+        fs::read_dir(&workspace)
+            .expect("workspace entries")
+            .all(|entry| !entry
+                .expect("workspace entry")
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".final.capture.")),
+        "final capture must remain unlinked"
+    );
 }
 
 #[test]
@@ -432,6 +522,126 @@ fn pinned_helper_ignores_a_replaced_launch_path() {
             || response["result"]["helper_integrity_valid"] == false,
         "the replacement must never forge success without a pinned helper execution"
     );
+}
+
+#[test]
+fn replaced_host_helper_cannot_forge_success() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let workspace = temp.path().join("workspace");
+    fs::create_dir_all(&workspace).expect("workspace");
+    let capsule = write_capsule(temp.path(), &workspace, "host");
+    let (bin_dir, argv_log) = write_codex_stub(temp.path());
+
+    let output = cmd::run_with(
+        &codex_cli_bin(),
+        &[
+            "agent",
+            "run",
+            "--capsule",
+            capsule.to_str().expect("capsule path"),
+            "--allow-host-access",
+            "--format",
+            "json",
+        ],
+        &CmdOptions::default()
+            .with_cwd(&workspace)
+            .with_path_prepend(&bin_dir)
+            .with_env(
+                "CODEX_CAPSULE_ARGV_LOG",
+                argv_log.to_str().expect("argv log"),
+            )
+            .with_env("CODEX_CAPSULE_FORGE_REPLACED_HELPER", "1"),
+    );
+
+    assert_eq!(output.code, 1);
+    let response: Value = output.stdout_json();
+    assert_eq!(response["result"]["script_passed"], true);
+    assert_eq!(response["result"]["helper_integrity_valid"], false);
+    assert_eq!(response["ok"], false);
+    assert_eq!(response["error"]["code"], "helper-integrity-failed");
+}
+
+#[test]
+fn swapped_host_capsule_root_cannot_forge_success() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let workspace = temp.path().join("workspace");
+    fs::create_dir_all(&workspace).expect("workspace");
+    let capsule = write_capsule(temp.path(), &workspace, "host");
+    let (bin_dir, argv_log) = write_codex_stub(temp.path());
+
+    let output = cmd::run_with(
+        &codex_cli_bin(),
+        &[
+            "agent",
+            "run",
+            "--capsule",
+            capsule.to_str().expect("capsule path"),
+            "--allow-host-access",
+            "--format",
+            "json",
+        ],
+        &CmdOptions::default()
+            .with_cwd(&workspace)
+            .with_path_prepend(&bin_dir)
+            .with_env(
+                "CODEX_CAPSULE_ARGV_LOG",
+                argv_log.to_str().expect("argv log"),
+            )
+            .with_env(
+                "CODEX_CAPSULE_SWAP_CAPSULE_ROOT",
+                capsule.to_str().expect("capsule path"),
+            ),
+    );
+
+    assert_eq!(output.code, 1);
+    let response: Value = output.stdout_json();
+    assert_eq!(response["result"]["script_passed"], true);
+    assert_eq!(response["result"]["helper_integrity_valid"], false);
+    assert_eq!(response["ok"], false);
+    assert!(
+        matches!(
+            response["error"]["code"].as_str(),
+            Some("helper-integrity-failed" | "codex-exit-nonzero")
+        ),
+        "response={response}"
+    );
+}
+
+#[test]
+fn shell_wrapped_extra_commands_do_not_match_exact_helper_events() {
+    for suffix in [" extra-argument", "; true"] {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let workspace = temp.path().join("workspace");
+        fs::create_dir_all(&workspace).expect("workspace");
+        let capsule = write_capsule(temp.path(), &workspace, "workspace");
+        let (bin_dir, argv_log) = write_codex_stub(temp.path());
+
+        let output = cmd::run_with(
+            &codex_cli_bin(),
+            &[
+                "agent",
+                "run",
+                "--capsule",
+                capsule.to_str().expect("capsule path"),
+                "--format",
+                "json",
+            ],
+            &CmdOptions::default()
+                .with_cwd(&workspace)
+                .with_path_prepend(&bin_dir)
+                .with_env(
+                    "CODEX_CAPSULE_ARGV_LOG",
+                    argv_log.to_str().expect("argv log"),
+                )
+                .with_env("CODEX_CAPSULE_QUOTE_EVENT_COMMAND", "1")
+                .with_env("CODEX_CAPSULE_EVENT_COMMAND_SUFFIX", suffix),
+        );
+
+        assert_eq!(output.code, 1, "suffix={suffix}");
+        let response: Value = output.stdout_json();
+        assert_eq!(response["result"]["script_passed"], false);
+        assert_eq!(response["error"]["code"], "script-attestation-failed");
+    }
 }
 
 #[test]
@@ -547,6 +757,7 @@ fn helper_attestations_are_framed_after_output_without_a_newline() {
     );
     let response: Value = output.stdout_json();
     assert_service_envelope(&response, true);
+    assert_eq!(response["result"]["helper_integrity_valid"], true);
     assert_eq!(response["result"]["script_runs"][0]["passed"], true);
     assert_eq!(response["result"]["validation"][0]["passed"], true);
 }
@@ -930,6 +1141,8 @@ fn host_capsule_uses_danger_full_access_only_after_acknowledgement() {
             "--capsule",
             capsule.to_str().expect("capsule path"),
             "--allow-host-access",
+            "--format",
+            "json",
         ],
         &CmdOptions::default()
             .with_cwd(&workspace)
@@ -947,6 +1160,8 @@ fn host_capsule_uses_danger_full_access_only_after_acknowledgement() {
         output.stdout_text(),
         output.stderr_text()
     );
+    let response: Value = output.stdout_json();
+    assert_eq!(response["result"]["evidence_trust"], "supervisor-trusted");
     let argv = fs::read_to_string(argv_log).expect("argv log");
     assert!(argv.contains("--sandbox\0danger-full-access\0"));
     assert!(!argv.contains("--dangerously-bypass-approvals-and-sandbox"));
@@ -994,15 +1209,10 @@ fn host_artifact_path_swaps_cannot_overwrite_external_files() {
             ),
     );
 
-    assert_eq!(
-        output.code,
-        0,
-        "stdout={} stderr={}",
-        output.stdout_text(),
-        output.stderr_text()
-    );
+    assert_eq!(output.code, 1);
     let response: Value = output.stdout_json();
-    assert_service_envelope(&response, true);
+    assert_service_envelope(&response, false);
+    assert_eq!(response["result"]["helper_integrity_valid"], false);
     assert_eq!(
         fs::read_to_string(&sentinel).expect("sentinel"),
         "preserve me"
@@ -1056,7 +1266,7 @@ fn late_receipt_directory_uses_a_durable_recovery_receipt() {
     assert_eq!(output.code, 1);
     let response: Value = output.stdout_json();
     assert_service_envelope(&response, false);
-    assert_eq!(response["error"]["code"], "receipt-publish-failed");
+    assert_eq!(response["error"]["code"], "helper-integrity-failed");
     assert!(response["result"]["receipt_error"].is_string());
     let recovery = Path::new(
         response["result"]["artifacts"]["receipt"]
