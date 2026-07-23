@@ -2825,11 +2825,11 @@ async fn list_handler(State(state): State<Arc<ServeState>>) -> Response {
 /// Best-effort enrichment: attach each running Codex/Claude session's most recent
 /// user prompt to the list projection.
 ///
-/// Cold recovery and bounded backlog catch-up run in the background. While
-/// either is pending, the list projection omits `last_prompt` rather than
-/// returning a known-stale value. The latest caught-up value remains
-/// process-local and is returned in the response only; it is never persisted by
-/// the daemon.
+/// Cold recovery and bounded backlog catch-up run in the background. Eligible
+/// sessions report `last_prompt_state` so a consumer can distinguish pending
+/// catch-up from an authoritative empty or unavailable projection. The latest
+/// caught-up value remains process-local and is returned in the response only;
+/// it is never persisted by the daemon.
 async fn enrich_last_prompts(state: &Arc<ServeState>, sessions: &mut [SessionView]) {
     for session in sessions.iter_mut() {
         if session.status == "stopped" || !matches!(session.agent.as_str(), "codex" | "claude") {
@@ -2842,7 +2842,15 @@ async fn enrich_last_prompts(state: &Arc<ServeState>, sessions: &mut [SessionVie
         else {
             continue;
         };
-        session.last_prompt = state.provider_prompt_discovery.last_prompt(&record).await;
+        if let Some(projection) = state
+            .provider_prompt_discovery
+            .last_prompt_projection(&record)
+            .await
+        {
+            session.last_prompt_state = Some(projection.state);
+            session.last_prompt_continuity = projection.continuity;
+            session.last_prompt = projection.prompt;
+        }
     }
 }
 
@@ -5547,6 +5555,21 @@ type ProviderPromptSourceResolver =
 type ProviderLastPromptTrackerOpener =
     dyn Fn(ProviderPromptSource) -> Option<ProviderLastPromptTracker> + Send + Sync;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum LastPromptState {
+    Current,
+    Pending,
+    Unavailable,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LastPromptProjection {
+    state: LastPromptState,
+    continuity: Option<String>,
+    prompt: Option<LastPrompt>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct ProviderPromptDiscoveryKey {
     session_id: String,
@@ -5561,6 +5584,8 @@ struct ProviderPromptDiscoverySlot {
     source: Option<ProviderPromptSource>,
     last_prompt_tracker: Arc<StdMutex<Option<ProviderLastPromptTracker>>>,
     last_prompt_in_flight: bool,
+    last_prompt_invalidated: bool,
+    last_prompt_continuity: String,
     in_flight: bool,
     progress: tokio::sync::watch::Sender<u64>,
     next_scan_at: Option<Instant>,
@@ -5631,6 +5656,8 @@ impl Default for ProviderPromptDiscoverySlot {
             source: None,
             last_prompt_tracker: Arc::new(StdMutex::new(None)),
             last_prompt_in_flight: false,
+            last_prompt_invalidated: false,
+            last_prompt_continuity: uuid::Uuid::new_v4().simple().to_string(),
             in_flight: false,
             progress,
             next_scan_at: None,
@@ -5777,17 +5804,44 @@ impl ProviderPromptDiscoveryRegistry {
         }
     }
 
-    async fn last_prompt(&self, record: &crate::SessionRecord) -> Option<LastPrompt> {
+    async fn last_prompt_projection(
+        &self,
+        record: &crate::SessionRecord,
+    ) -> Option<LastPromptProjection> {
         let key = ProviderPromptDiscoveryKey::from_record(record)?;
-        let source = self.resolve_source(record).await?;
-        let slot = self.entries.lock().await.get(&key).cloned()?;
-        let tracker_cell = {
+        let Some(source) = self.resolve_source(record).await else {
+            return Some(LastPromptProjection {
+                state: LastPromptState::Unavailable,
+                continuity: self.continuity_for_key(&key).await,
+                prompt: None,
+            });
+        };
+        let Some(slot) = self.entries.lock().await.get(&key).cloned() else {
+            return Some(LastPromptProjection {
+                state: LastPromptState::Unavailable,
+                continuity: None,
+                prompt: None,
+            });
+        };
+        let (tracker_cell, unavailable_until_current, continuity) = {
             let mut state = slot.lock().await;
             if state.last_prompt_in_flight {
-                return None;
+                return Some(LastPromptProjection {
+                    state: if state.last_prompt_invalidated {
+                        LastPromptState::Unavailable
+                    } else {
+                        LastPromptState::Pending
+                    },
+                    continuity: Some(state.last_prompt_continuity.clone()),
+                    prompt: None,
+                });
             }
             state.last_prompt_in_flight = true;
-            state.last_prompt_tracker.clone()
+            (
+                state.last_prompt_tracker.clone(),
+                state.last_prompt_invalidated,
+                state.last_prompt_continuity.clone(),
+            )
         };
         let task_cell = tracker_cell.clone();
         let cached = tokio::task::spawn_blocking(move || {
@@ -5807,14 +5861,31 @@ impl ProviderPromptDiscoveryRegistry {
                 let mut state = slot.lock().await;
                 if Arc::ptr_eq(&state.last_prompt_tracker, &tracker_cell) {
                     state.last_prompt_in_flight = false;
-                    prompt
+                    state.last_prompt_invalidated = false;
+                    Some(LastPromptProjection {
+                        state: LastPromptState::Current,
+                        continuity: Some(state.last_prompt_continuity.clone()),
+                        prompt,
+                    })
                 } else {
-                    None
+                    Some(LastPromptProjection {
+                        state: LastPromptState::Unavailable,
+                        continuity: Some(state.last_prompt_continuity.clone()),
+                        prompt: None,
+                    })
                 }
             }
             ProviderLastPromptRefresh::Pending => {
                 self.spawn_last_prompt_refresh(slot, tracker_cell, source);
-                None
+                Some(LastPromptProjection {
+                    state: if unavailable_until_current {
+                        LastPromptState::Unavailable
+                    } else {
+                        LastPromptState::Pending
+                    },
+                    continuity: Some(continuity),
+                    prompt: None,
+                })
             }
             ProviderLastPromptRefresh::Invalidated => {
                 let mut state = slot.lock().await;
@@ -5823,9 +5894,20 @@ impl ProviderPromptDiscoveryRegistry {
                 }
                 drop(state);
                 self.invalidate_source(record).await;
-                None
+                Some(LastPromptProjection {
+                    state: LastPromptState::Unavailable,
+                    continuity: self.continuity_for_key(&key).await,
+                    prompt: None,
+                })
             }
         }
+    }
+
+    #[cfg(test)]
+    async fn last_prompt(&self, record: &crate::SessionRecord) -> Option<LastPrompt> {
+        self.last_prompt_projection(record)
+            .await
+            .and_then(|projection| projection.prompt)
     }
 
     fn spawn_last_prompt_refresh(
@@ -5842,6 +5924,8 @@ impl ProviderPromptDiscoveryRegistry {
                     let mut state = slot.lock().await;
                     if Arc::ptr_eq(&state.last_prompt_tracker, &tracker_cell) {
                         state.last_prompt_in_flight = false;
+                        state.last_prompt_invalidated = true;
+                        state.last_prompt_continuity = uuid::Uuid::new_v4().simple().to_string();
                     }
                     return;
                 };
@@ -5881,6 +5965,8 @@ impl ProviderPromptDiscoveryRegistry {
                         state.source = None;
                         state.last_prompt_tracker = Arc::new(StdMutex::new(None));
                         state.last_prompt_in_flight = false;
+                        state.last_prompt_invalidated = true;
+                        state.last_prompt_continuity = uuid::Uuid::new_v4().simple().to_string();
                         state.next_scan_at = None;
                         state.backoff = PROVIDER_PROMPT_PENDING_POLL_INTERVAL;
                         return;
@@ -5900,9 +5986,16 @@ impl ProviderPromptDiscoveryRegistry {
             state.source = None;
             state.last_prompt_tracker = Arc::new(StdMutex::new(None));
             state.last_prompt_in_flight = false;
+            state.last_prompt_invalidated = true;
+            state.last_prompt_continuity = uuid::Uuid::new_v4().simple().to_string();
             state.next_scan_at = None;
             state.backoff = PROVIDER_PROMPT_PENDING_POLL_INTERVAL;
         }
+    }
+
+    async fn continuity_for_key(&self, key: &ProviderPromptDiscoveryKey) -> Option<String> {
+        let slot = self.entries.lock().await.get(key).cloned()?;
+        Some(slot.lock().await.last_prompt_continuity.clone())
     }
 
     async fn evict_session_if_matches(&self, fence: &SessionRegistryFence) {
@@ -12570,7 +12663,7 @@ esac
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn sessions_list_omits_last_prompt_while_background_recovery_is_pending() {
+    async fn sessions_list_reports_explicit_last_prompt_state_during_recovery() {
         let lock = GlobalStateLock::new();
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let state_dir = tmp.path().join("state");
@@ -12598,6 +12691,15 @@ esac
                 json!({
                     "type":"event_msg",
                     "payload":{"type":"user_message","message":text}
+                })
+            )
+        };
+        let assistant_line = |text: &str| {
+            format!(
+                "{}\n",
+                json!({
+                    "type":"event_msg",
+                    "payload":{"type":"agent_message","message":text}
                 })
             )
         };
@@ -12650,10 +12752,22 @@ esac
                 .is_some_and(|session| !session.contains_key("last_prompt")),
             "the first response must not wait for or expose partial cold recovery"
         );
+        assert_eq!(
+            first["data"]["sessions"][0]["last_prompt_state"], "pending",
+            "cold recovery must be distinguishable from an authoritative empty prompt"
+        );
+        let initial_continuity = first["data"]["sessions"][0]["last_prompt_continuity"]
+            .as_str()
+            .expect("eligible prompt state must include an opaque continuity token")
+            .to_string();
         let cold = tokio::time::timeout(Duration::from_secs(5), async {
             loop {
                 let (_, body) = call(router(state.clone()), get("/sessions")).await;
                 if let Some(text) = body["data"]["sessions"][0]["last_prompt"]["text"].as_str() {
+                    assert_eq!(
+                        body["data"]["sessions"][0]["last_prompt_state"], "current",
+                        "a caught-up preview must be marked current"
+                    );
                     break text.to_string();
                 }
                 tokio::task::yield_now().await;
@@ -12662,6 +12776,38 @@ esac
         .await
         .expect("cold prompt warmup");
         assert_eq!(cold, "cold prompt");
+
+        OpenOptions::new()
+            .append(true)
+            .open(&transcript)
+            .expect("append transcript")
+            .write_all(assistant_line("output without a new user prompt").as_bytes())
+            .expect("append output-only record");
+        let (_, output_catching_up) = call(router(state.clone()), get("/sessions")).await;
+        assert_eq!(
+            output_catching_up["data"]["sessions"][0]["last_prompt_state"], "pending",
+            "non-user transcript growth must report pending while catch-up runs"
+        );
+        assert!(
+            output_catching_up["data"]["sessions"][0]
+                .as_object()
+                .is_some_and(|session| !session.contains_key("last_prompt")),
+            "pending output-only catch-up must not expose a stale prompt"
+        );
+        let unchanged = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let (_, body) = call(router(state.clone()), get("/sessions")).await;
+                if body["data"]["sessions"][0]["last_prompt_state"] == "current" {
+                    break body["data"]["sessions"][0]["last_prompt"]["text"]
+                        .as_str()
+                        .map(ToString::to_string);
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("output-only catch-up");
+        assert_eq!(unchanged.as_deref(), Some("cold prompt"));
 
         OpenOptions::new()
             .append(true)
@@ -12683,10 +12829,18 @@ esac
                 .is_some_and(|session| !session.contains_key("last_prompt")),
             "known unread backlog must omit rather than expose the stale cached prompt"
         );
+        assert_eq!(
+            catching_up["data"]["sessions"][0]["last_prompt_state"], "pending",
+            "known append backlog must preserve the explicit pending state"
+        );
         let appended = tokio::time::timeout(Duration::from_secs(5), async {
             loop {
                 let (_, body) = call(router(state.clone()), get("/sessions")).await;
                 if let Some(text) = body["data"]["sessions"][0]["last_prompt"]["text"].as_str() {
+                    assert_eq!(
+                        body["data"]["sessions"][0]["last_prompt_state"], "current",
+                        "the refreshed preview must return to current"
+                    );
                     break text.to_string();
                 }
                 tokio::task::yield_now().await;
@@ -12695,6 +12849,119 @@ esac
         .await
         .expect("append catch-up");
         assert_eq!(appended, "appended prompt");
+
+        let recovery_hold = state
+            .provider_prompt_discovery
+            .recovery_permits
+            .clone()
+            .acquire_many_owned(PROVIDER_PROMPT_RECOVERY_MAX_CONCURRENT_SCANS as u32)
+            .await
+            .expect("hold recovery permits");
+        OpenOptions::new()
+            .append(true)
+            .open(&transcript)
+            .expect("append transcript")
+            .write_all(assistant_line("output before replacement").as_bytes())
+            .expect("append pre-replacement output");
+        let (_, replacement_pending) = call(router(state.clone()), get("/sessions")).await;
+        assert_eq!(
+            replacement_pending["data"]["sessions"][0]["last_prompt_state"], "pending",
+            "the controlled background catch-up must start pending"
+        );
+        std::fs::write(&transcript, &metadata).expect("replace transcript without a prompt");
+        drop(recovery_hold);
+        let key = ProviderPromptDiscoveryKey::from_record(&persisted).expect("discovery key");
+        let slot = state
+            .provider_prompt_discovery
+            .entries
+            .lock()
+            .await
+            .get(&key)
+            .cloned()
+            .expect("discovery slot");
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if slot.lock().await.last_prompt_invalidated {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("background invalidation");
+        let rediscovery_hold = state
+            .provider_prompt_discovery
+            .recovery_permits
+            .clone()
+            .acquire_many_owned(PROVIDER_PROMPT_RECOVERY_MAX_CONCURRENT_SCANS as u32)
+            .await
+            .expect("hold rediscovery permits");
+        let (_, unavailable) = call(router(state.clone()), get("/sessions")).await;
+        assert_eq!(
+            unavailable["data"]["sessions"][0]["last_prompt_state"], "unavailable",
+            "continuity loss must invalidate the old preview before rediscovery"
+        );
+        let invalidated_continuity = unavailable["data"]["sessions"][0]["last_prompt_continuity"]
+            .as_str()
+            .expect("unavailable projection must retain the opaque fence");
+        assert_ne!(
+            invalidated_continuity, initial_continuity,
+            "continuity loss must rotate the consumer retention fence"
+        );
+        assert!(
+            unavailable["data"]["sessions"][0]
+                .as_object()
+                .is_some_and(|session| !session.contains_key("last_prompt")),
+            "an unavailable source must not expose the old prompt"
+        );
+        let (_, still_unavailable) = call(router(state.clone()), get("/sessions")).await;
+        assert_eq!(
+            still_unavailable["data"]["sessions"][0]["last_prompt_state"], "unavailable",
+            "every caller must see unavailable until authoritative recovery completes"
+        );
+        drop(rediscovery_hold);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let state = slot.lock().await;
+                if !state.last_prompt_in_flight && state.last_prompt_invalidated {
+                    break;
+                }
+                drop(state);
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("background recovery before an authoritative response");
+        OpenOptions::new()
+            .append(true)
+            .open(&transcript)
+            .expect("append transcript")
+            .write_all(assistant_line("output after unobserved recovery").as_bytes())
+            .expect("append after unobserved recovery");
+        let (_, appended_before_current_response) =
+            call(router(state.clone()), get("/sessions")).await;
+        assert_eq!(
+            appended_before_current_response["data"]["sessions"][0]["last_prompt_state"],
+            "unavailable",
+            "an unobserved internal recovery must not let a later append downgrade to pending"
+        );
+        let current_empty = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let (_, body) = call(router(state.clone()), get("/sessions")).await;
+                if body["data"]["sessions"][0]["last_prompt_state"] == "current" {
+                    break body;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("empty transcript recovery");
+        assert!(
+            current_empty["data"]["sessions"][0]
+                .as_object()
+                .is_some_and(|session| !session.contains_key("last_prompt")),
+            "current without a prompt authoritatively represents an empty transcript"
+        );
     }
 
     #[tokio::test]

@@ -71,15 +71,33 @@ single-flight per session and daemon-wide concurrency-bounded. Later list
 requests perform only a bounded freshness check; appended chunks are consumed in
 the background instead of repeating the cold scan.
 
-The preview cache is not daemon state: it is never written to the session record,
-logs, or diagnostics, and a daemon restart reconstructs it from the provider
-transcript. Transcript rotation, truncation, replacement, or identity drift
-clears the cached value and requires exact rediscovery. A list response omits the
-preview while cold recovery or known append backlog catch-up is pending, rather
-than returning a known stale cached prompt. Stable admission at the registry
+The preview cache is not daemon state: it is never written to the session
+record, logs, or diagnostics, and a daemon restart reconstructs it from the
+provider transcript. Eligible running sessions report `last_prompt_state`:
+
+- `current` means the exact tracker is caught up. A missing `last_prompt` in
+  this state authoritatively means no eligible user prompt exists.
+- `pending` means exact discovery, cold recovery, or append catch-up is in
+  progress. The preview stays omitted rather than exposing a stale cached
+  prompt.
+- `unavailable` means no exact source can currently be used or continuity was
+  invalidated. The preview stays omitted and the old cached value cannot cross
+  the API boundary. After invalidation it remains visible to every caller until
+  one response can expose an authoritative `current` projection.
+
+Eligible states also carry the opaque response-only
+`last_prompt_continuity` token. It rotates when exact transcript continuity is
+lost and on a daemon restart, so a consumer that missed an intermediate
+`unavailable` response cannot re-display a preview from the prior source. The
+token is 16-128 URL-safe ASCII characters and contains no prompt, path, provider
+session id, or runtime identifier.
+
+Transcript rotation, truncation, replacement, or identity drift clears the
+cached value and requires exact rediscovery. Stable admission at the registry
 bound prevents overflow sessions from repeatedly evicting warm recovery state.
-A missing provider resume identity remains an intentional omission, not
-permission to scan for a likely transcript.
+A missing provider resume identity makes the session ineligible, so both state
+and preview remain intentionally omitted rather than authorizing a likely
+transcript scan.
 
 Because `GET /sessions` is open on the loopback bind, treat prompt previews as
 sensitive local-user data. Aggregate health checks should count preview presence

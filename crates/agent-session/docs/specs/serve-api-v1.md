@@ -59,7 +59,8 @@ is no second state model.
   Sessions report
   `running`, `stopped`, or `unknown` live status plus a boolean `resumable` field and best-effort `repo_name` derived from
   the recorded `cwd`. New interactive records also expose optional
-  `runtime_started_at`, `turn_state`, `last_prompt`, and `startup`; a profiled
+  `runtime_started_at`, `turn_state`, `last_prompt`, `last_prompt_state`,
+  `last_prompt_continuity`, and `startup`; a profiled
   session also
   exposes its safe `agent_profile` id. When a known profile drift would make a
   stopped session fail resume, the daemon sets `resumable: false` plus one
@@ -71,16 +72,28 @@ is no second state model.
   path (web console, SSH/Termius, or raw `tmux attach`). On first discovery the
   daemon opens an append tail and queues one at-most-64-MiB cold recovery outside
   the list-response path. Cold recovery and append catch-up are single-flight per
-  session and share a daemon-wide concurrency bound. A list response omits
-  `last_prompt` while that work is pending or while known unread backlog remains;
-  it never reports the known stale cached preview as current. Later list polls
-  use a bounded metadata/continuity check, retain the newest caught-up preview in
-  process memory, and avoid recurring cold scans when the stable registry is at
-  capacity. Rotation, truncation, or identity drift invalidates that memory and
-  forces exact rediscovery. The text is returned in the response only and is
-  never logged or persisted by the daemon. The field is omitted when the exact
-  provider identity or a prompt inside the cold-recovery bound is unavailable;
-  the daemon never guesses a transcript match.
+  session and share a daemon-wide concurrency bound. Eligible running
+  Codex/Claude sessions add `last_prompt_state` with one of `current`, `pending`,
+  or `unavailable`. `current` may include `last_prompt`; `current` without it
+  authoritatively means the caught-up transcript has no eligible user prompt.
+  `pending` means exact-source discovery, cold recovery, or known append catch-up
+  is in progress and omits the preview rather than reporting a stale cached
+  value. `unavailable` means the exact source cannot currently be used or its
+  continuity was invalidated, and also omits the preview. After continuity
+  invalidation, every caller continues to see `unavailable` until one response
+  can expose an authoritative `current` projection. The response-only opaque
+  `last_prompt_continuity` token is 16-128 URL-safe ASCII characters, is present
+  with eligible states, and rotates whenever exact transcript continuity is
+  lost, including across daemon restarts. Consumers may retain a pending
+  preview only when this token and the runtime identity both match. Sessions
+  without
+  enough runtime/provider identity to be eligible omit both fields. Later list
+  polls use a bounded metadata/continuity check, retain the newest caught-up
+  preview in process memory, and avoid recurring cold scans when the stable
+  registry is at capacity. Rotation, truncation, or identity drift invalidates
+  that memory and forces exact rediscovery. The text is returned in the response
+  only and is never logged or persisted by the daemon; the daemon never guesses
+  a transcript match.
   `startup` is the metadata-only `agent-session.startup.v1` projection shared by
   create, list, and glance responses. Its state is `starting`, `ready`, or
   `failed`; its bounded stage is `record`, `tmux`, `runtime`, `app_server`,

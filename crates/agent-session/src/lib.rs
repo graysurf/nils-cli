@@ -1405,6 +1405,13 @@ struct SessionView {
     /// the `last_prompt` capability and a preview was resolved.
     #[serde(skip_serializing_if = "Option::is_none")]
     last_prompt: Option<provider_prompt::LastPrompt>,
+    /// Freshness/availability of the exact transcript-backed prompt projection.
+    /// Populated only for eligible running Codex/Claude sessions.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_prompt_state: Option<serve::LastPromptState>,
+    /// Opaque process-local fence for exact transcript continuity.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_prompt_continuity: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     startup: Option<StartupProjection>,
     auto_resume: auto_resume::AutoResumeView,
@@ -5703,6 +5710,8 @@ fn session_view_from_parts(
         // Populated on demand by the list handler; never computed in the shared
         // collector so the expensive transcript path stays out of the hot build.
         last_prompt: None,
+        last_prompt_state: None,
+        last_prompt_continuity: None,
         startup: startup_projection_for_view(record),
         auto_resume: auto_resume::view_for_record(context, record),
         codex_account: codex_account::view_for_record(record),
