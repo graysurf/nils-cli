@@ -1,6 +1,8 @@
 use clap::error::ErrorKind;
 use clap::{Args, CommandFactory, Parser, Subcommand};
-use nils_common::cli_contract::exit;
+use nils_common::cli_contract::{
+    Envelope, EnvelopeError, OutputFormat, emit_parse_error, exit, schema_version_for,
+};
 use std::ffi::OsString;
 
 use crate::dates::{
@@ -8,7 +10,9 @@ use crate::dates::{
     yesterday_range,
 };
 use crate::git::require_git;
-use crate::summary::summary;
+use crate::summary::{SummaryFailure, SummaryPayload, collect_summary, render_text};
+
+const BINARY: &str = "git-summary";
 
 #[derive(Debug, Parser)]
 #[command(
@@ -21,6 +25,14 @@ use crate::summary::summary;
     after_help = "Custom date range:\n  <from> <to>       Custom date range (YYYY-MM-DD)"
 )]
 struct Cli {
+    /// Output format
+    #[arg(long, value_enum, global = true, default_value_t = OutputFormat::Text)]
+    format: OutputFormat,
+
+    /// Show raw commit identities instead of canonical mailmap identities
+    #[arg(long, global = true)]
+    no_mailmap: bool,
+
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -57,80 +69,164 @@ struct RawArgs {
 }
 
 pub fn run() -> i32 {
-    run_from(std::env::args())
+    run_from(std::env::args_os())
 }
 
-fn run_from<I, T>(args: I) -> i32
+pub fn run_embedded(args: &[String]) -> i32 {
+    let argv = std::iter::once(OsString::from(BINARY))
+        .chain(args.iter().map(OsString::from))
+        .collect::<Vec<_>>();
+    run_from(argv)
+}
+
+pub fn run_from<I, T>(args: I) -> i32
 where
     I: IntoIterator<Item = T>,
     T: Into<OsString> + Clone,
 {
-    let cli = match Cli::try_parse_from(args) {
+    let argv = args.into_iter().map(Into::into).collect::<Vec<OsString>>();
+    let cli = match Cli::try_parse_from(&argv) {
         Ok(cli) => cli,
-        Err(err) => return print_parse_error(err),
+        Err(err) => return print_parse_error(err, &argv),
     };
+    let format = cli.format;
+    let use_mailmap = !cli.no_mailmap;
 
     match cli.command {
-        Some(Command::All) => run_git_summary_for_label("all commits", None, None),
+        Some(Command::All) => {
+            run_git_summary_for_label("all commits", None, None, format, use_mailmap, true)
+        }
         Some(Command::Today) => {
             let range = today_range();
-            run_git_summary_for_label(&range.label, Some(&range.start), Some(&range.end))
+            run_git_summary_for_label(
+                &range.label,
+                Some(&range.start),
+                Some(&range.end),
+                format,
+                use_mailmap,
+                true,
+            )
         }
         Some(Command::Yesterday) => {
             let range = yesterday_range();
-            run_git_summary_for_label(&range.label, Some(&range.start), Some(&range.end))
+            run_git_summary_for_label(
+                &range.label,
+                Some(&range.start),
+                Some(&range.end),
+                format,
+                use_mailmap,
+                true,
+            )
         }
         Some(Command::ThisMonth) => {
             let range = this_month_range();
-            run_git_summary_for_label(&range.label, Some(&range.start), Some(&range.end))
+            run_git_summary_for_label(
+                &range.label,
+                Some(&range.start),
+                Some(&range.end),
+                format,
+                use_mailmap,
+                true,
+            )
         }
         Some(Command::LastMonth) => {
             let range = last_month_range();
-            run_git_summary_for_label(&range.label, Some(&range.start), Some(&range.end))
+            run_git_summary_for_label(
+                &range.label,
+                Some(&range.start),
+                Some(&range.end),
+                format,
+                use_mailmap,
+                true,
+            )
         }
         Some(Command::ThisWeek) => {
             let range = this_week_range();
-            run_git_summary_for_label(&range.label, Some(&range.start), Some(&range.end))
+            run_git_summary_for_label(
+                &range.label,
+                Some(&range.start),
+                Some(&range.end),
+                format,
+                use_mailmap,
+                true,
+            )
         }
         Some(Command::LastWeek) => {
             let range = last_week_range();
-            run_git_summary_for_label(&range.label, Some(&range.start), Some(&range.end))
+            run_git_summary_for_label(
+                &range.label,
+                Some(&range.start),
+                Some(&range.end),
+                format,
+                use_mailmap,
+                true,
+            )
         }
         Some(Command::Completion(raw)) => crate::completion::run(&raw.args),
         Some(Command::Help) | None => print_help_stdout(),
-        Some(Command::Custom(args)) => run_custom_range(args),
+        Some(Command::Custom(args)) => run_custom_range(args, format, use_mailmap),
     }
 }
 
-fn run_git_summary_for_label(label: &str, from: Option<&str>, to: Option<&str>) -> i32 {
+fn run_git_summary_for_label(
+    label: &str,
+    from: Option<&str>,
+    to: Option<&str>,
+    format: OutputFormat,
+    use_mailmap: bool,
+    show_text_header: bool,
+) -> i32 {
     if let Err(msg) = require_git() {
-        println!("{msg}");
-        return exit::RUNTIME;
+        return emit_error(format, "git-context-unavailable", msg, exit::RUNTIME);
     }
-    print_header(label);
-    summary(from, to)
+    if format.is_text() && show_text_header {
+        print_header(label);
+    }
+    match collect_summary(label, from, to, use_mailmap) {
+        Ok(payload) => emit_success(format, &payload),
+        Err(failure) => emit_summary_failure(format, failure),
+    }
 }
 
-fn run_custom_range(args: Vec<OsString>) -> i32 {
+fn run_custom_range(args: Vec<OsString>, format: OutputFormat, use_mailmap: bool) -> i32 {
     let args: Vec<String> = args
         .into_iter()
         .map(|arg| arg.to_string_lossy().into_owned())
         .collect();
 
     if args.len() >= 2 {
-        if let Err(msg) = require_git() {
-            println!("{msg}");
-            return exit::RUNTIME;
-        }
-        return summary(Some(&args[0]), Some(&args[1]));
+        let label = format!("custom range: {} to {}", args[0], args[1]);
+        return run_git_summary_for_label(
+            &label,
+            Some(&args[0]),
+            Some(&args[1]),
+            format,
+            use_mailmap,
+            false,
+        );
     }
 
-    println!("❌ Invalid usage. Try: git-summary help");
-    exit::USAGE
+    emit_error(
+        format,
+        "invalid-arguments",
+        "❌ Invalid usage. Try: git-summary help",
+        exit::USAGE,
+    )
 }
 
-fn print_parse_error(err: clap::Error) -> i32 {
+fn print_parse_error(err: clap::Error, argv: &[OsString]) -> i32 {
     let kind = err.kind();
+    if !matches!(kind, ErrorKind::DisplayHelp | ErrorKind::DisplayVersion) {
+        let format = detect_format_from_argv(argv);
+        if format.is_json() {
+            let code = if matches!(kind, ErrorKind::InvalidSubcommand) {
+                "unknown-subcommand"
+            } else {
+                "parse-error"
+            };
+            return emit_parse_error(BINARY, format, code, &render_clap_message(&err));
+        }
+    }
     if let Err(print_err) = err.print() {
         eprintln!("{print_err}");
         return exit::RUNTIME;
@@ -141,6 +237,84 @@ fn print_parse_error(err: clap::Error) -> i32 {
     } else {
         exit::USAGE
     }
+}
+
+fn detect_format_from_argv(argv: &[OsString]) -> OutputFormat {
+    let mut iter = argv.iter().map(|arg| arg.to_string_lossy());
+    while let Some(arg) = iter.next() {
+        if arg == "--format" {
+            if let Some(value) = iter.next()
+                && value.eq_ignore_ascii_case("json")
+            {
+                return OutputFormat::Json;
+            }
+        } else if let Some(value) = arg.strip_prefix("--format=")
+            && value.eq_ignore_ascii_case("json")
+        {
+            return OutputFormat::Json;
+        }
+    }
+    OutputFormat::Text
+}
+
+fn render_clap_message(err: &clap::Error) -> String {
+    err.to_string()
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .map(|line| {
+            let line = line.trim();
+            line.strip_prefix("error:")
+                .map(str::trim)
+                .unwrap_or(line)
+                .to_string()
+        })
+        .unwrap_or_else(|| "command-line parse failed".to_string())
+}
+
+fn emit_success(format: OutputFormat, payload: &SummaryPayload) -> i32 {
+    match format {
+        OutputFormat::Text => {
+            render_text(payload);
+            exit::SUCCESS
+        }
+        OutputFormat::Json => {
+            let envelope = Envelope::success(schema_version_for(BINARY, "summary", 1), payload);
+            match serde_json::to_string(&envelope) {
+                Ok(serialized) => {
+                    println!("{serialized}");
+                    exit::SUCCESS
+                }
+                Err(err) => {
+                    eprintln!("git-summary: failed to serialize JSON output: {err}");
+                    exit::SOFTWARE
+                }
+            }
+        }
+    }
+}
+
+fn emit_summary_failure(format: OutputFormat, failure: SummaryFailure) -> i32 {
+    emit_error(format, failure.code, &failure.message, failure.exit_code)
+}
+
+fn emit_error(format: OutputFormat, code: &str, message: &str, exit_code: i32) -> i32 {
+    match format {
+        OutputFormat::Text => println!("{message}"),
+        OutputFormat::Json => {
+            let envelope: Envelope<()> = Envelope::failure(
+                schema_version_for(BINARY, "summary", 1),
+                EnvelopeError::new(code, message),
+            );
+            match serde_json::to_string(&envelope) {
+                Ok(serialized) => println!("{serialized}"),
+                Err(err) => {
+                    eprintln!("git-summary: failed to serialize JSON error: {err}");
+                    return exit::SOFTWARE;
+                }
+            }
+        }
+    }
+    exit_code
 }
 
 fn print_help_stdout() -> i32 {

@@ -12,6 +12,7 @@ nils-term
 nils-markdown
 nils-web-evidence
 nils-agent-workflow-primitives
+nils-git-summary
 nils-git-cli
 nils-forge-cli
 nils-memo
@@ -27,7 +28,6 @@ nils-gemini-cli
 nils-fzf-cli
 nils-git-lock
 nils-git-scope
-nils-git-summary
 nils-image-processing
 nils-zsh-kit
 nils-scrub

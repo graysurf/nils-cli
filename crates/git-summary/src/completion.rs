@@ -1,4 +1,4 @@
-use clap::{Arg, Command};
+use clap::{Arg, ArgAction, Command};
 use clap_complete::{Shell, generate};
 use std::io::{self, Write};
 
@@ -64,6 +64,23 @@ fn build_completion_command() -> Command {
         .long_version(nils_build_info::long_version(env!("CARGO_PKG_VERSION")))
         .about("Git history summary CLI")
         .disable_help_subcommand(true)
+        .arg(
+            Arg::new("format")
+                .long("format")
+                .value_name("FORMAT")
+                .num_args(1)
+                .value_parser(["text", "json"])
+                .default_value("text")
+                .global(true)
+                .help("Output format"),
+        )
+        .arg(
+            Arg::new("no-mailmap")
+                .long("no-mailmap")
+                .action(ArgAction::SetTrue)
+                .global(true)
+                .help("Show raw commit identities instead of canonical mailmap identities"),
+        )
         .arg(
             Arg::new("from")
                 .value_name("from")

@@ -58,6 +58,29 @@ fn invalid_date_value() {
 }
 
 #[test]
+fn invalid_date_json_uses_the_versioned_error_envelope() {
+    let repo = init_repo();
+    let root = repo.path();
+
+    let (code, output) =
+        run_git_summary_allow_fail(root, &["--format", "json", "2024-02-30", "2024-03-01"], &[]);
+
+    assert_eq!(code, 65);
+    assert!(
+        output.contains("\"schema_version\":\"cli.git-summary.summary.v1\""),
+        "missing schema version: {output}"
+    );
+    assert!(
+        output.contains("\"ok\":false"),
+        "missing failure state: {output}"
+    );
+    assert!(
+        output.contains("\"code\":\"invalid-date\""),
+        "missing stable error code: {output}"
+    );
+}
+
+#[test]
 fn start_after_end() {
     let repo = init_repo();
     let root = repo.path();

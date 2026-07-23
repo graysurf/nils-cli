@@ -2337,6 +2337,7 @@ dependencies = [
  "libc",
  "nils-build-info",
  "nils-common",
+ "nils-git-summary",
  "nils-test-support",
  "pretty_assertions",
  "serde",
@@ -2387,9 +2388,10 @@ dependencies = [
  "clap_complete",
  "nils-build-info",
  "nils-common",
- "nils-term",
  "nils-test-support",
  "pretty_assertions",
+ "serde",
+ "serde_json",
  "tempfile",
 ]
 

@@ -2,8 +2,9 @@
 
 ## Overview
 
-git-cli is a Rust CLI that groups Git workflow helpers behind a dispatcher. It exposes eight
-command groups (`utils`, `reset`, `commit`, `branch`, `worktree`, `ci`, `open`, `completion`) with
+git-cli is a Rust CLI that groups Git workflow helpers behind a dispatcher. It exposes nine
+command groups (`utils`, `reset`, `commit`, `branch`, `worktree`, `ci`, `open`, `summary`,
+`completion`) with
 consistent help / version handling: `git-cli help` (or `-h`/`--help`) prints top-level usage,
 `git-cli <group> help` prints group usage, and `git-cli -V`/`--version` prints the binary version.
 
@@ -25,6 +26,9 @@ subcommands (matching the binary's `--help` output):
   `merge-requests`, `mrs`), `issues` (alias `issue`), `actions` (alias `action`),
   `releases` (alias `release`), `tags` (alias `tag`), `commits` (alias `history`),
   `file` (alias `blob`), `blame`.
+- `summary`: `all`, `today`, `yesterday`, `this-month`, `last-month`, `this-week`, `last-week`,
+  or a custom `<from> <to>` range. This delegates to the library behind the standalone
+  `git-summary` binary and supports `--format text|json` plus `--no-mailmap`.
 - `completion`: `bash`, `zsh` (writes the completion registration to stdout). git-cli uses
   `clap_complete` `CompleteEnv` dynamic completion, so this emits a thin registration stub that
   computes candidates (e.g. live worktree names) at TAB time rather than a static script.
@@ -137,6 +141,17 @@ from the primary checkout or from inside any linked worktree.
 - `blame <path> [ref]`: Open blame page.
 - `GIT_OPEN_COLLAB_REMOTE` can override the remote used for collaboration pages
   (`pr`/`pulls`/`issues`/`actions`/`releases`/`tags`).
+
+### summary
+
+- `all|today|yesterday|this-month|last-month|this-week|last-week`: Summarize non-merge code
+  contributions by canonical author.
+- `<from> <to>`: Summarize a custom `YYYY-MM-DD` date range.
+- `--format text|json`: Render the table or the `cli.git-summary.summary.v1` JSON envelope.
+- `--no-mailmap`: Show the raw author identities stored in commit objects.
+
+The same behavior remains directly available through `git-summary`; both entrypoints call the same
+Rust implementation rather than spawning another binary.
 
 ### completion
 

@@ -19,6 +19,7 @@ anyhow = { workspace = true }
 clap = { workspace = true }
 clap_complete = { workspace = true }
 getrandom = { workspace = true }
+git-summary = { version = "1.25.9", path = "../git-summary", package = "nils-git-summary" }
 libc = { workspace = true }
 nils-build-info = { version = "1.25.9", path = "../nils-build-info" }
 nils-common = { version = "1.25.9", path = "../nils-common", package = "nils-common" }

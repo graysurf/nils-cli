@@ -79,6 +79,7 @@ fn build_command_model() -> Command {
         .subcommand(build_worktree_group())
         .subcommand(build_ci_group())
         .subcommand(build_open_group())
+        .subcommand(build_summary_group())
         .subcommand(Command::new("help").about("Display help message for git-cli"))
         .subcommand(
             Command::new("completion")
@@ -90,6 +91,48 @@ fn build_command_model() -> Command {
                         .required(true),
                 ),
         )
+}
+
+fn build_summary_group() -> Command {
+    Command::new("summary")
+        .about("Summarize repository history")
+        .arg(
+            Arg::new("format")
+                .long("format")
+                .value_name("FORMAT")
+                .num_args(1)
+                .value_parser(["text", "json"])
+                .default_value("text")
+                .global(true)
+                .help("Output format"),
+        )
+        .arg(
+            Arg::new("no-mailmap")
+                .long("no-mailmap")
+                .action(ArgAction::SetTrue)
+                .global(true)
+                .help("Show raw commit identities instead of canonical mailmap identities"),
+        )
+        .arg(
+            Arg::new("from")
+                .value_name("from")
+                .help("Custom range start date (YYYY-MM-DD)")
+                .required(false),
+        )
+        .arg(
+            Arg::new("to")
+                .value_name("to")
+                .help("Custom range end date (YYYY-MM-DD)")
+                .required(false),
+        )
+        .subcommand(Command::new("all").about("Entire history"))
+        .subcommand(Command::new("today").about("Today only"))
+        .subcommand(Command::new("yesterday").about("Yesterday only"))
+        .subcommand(Command::new("this-month").about("1st to today"))
+        .subcommand(Command::new("last-month").about("1st to end of last month"))
+        .subcommand(Command::new("this-week").about("This Mon-Sun"))
+        .subcommand(Command::new("last-week").about("Last Mon-Sun"))
+        .subcommand(Command::new("help").about("Display help message for summary"))
 }
 
 fn build_utils_group() -> Command {
@@ -589,6 +632,27 @@ mod tests {
         assert!(
             go.get_arguments().any(|arg| arg.get_id() == "shell"),
             "worktree go should advertise --shell in completion"
+        );
+    }
+
+    #[test]
+    fn summary_group_exposes_periods_and_output_modes() {
+        let cmd = build_command_model();
+        let summary = cmd
+            .find_subcommand("summary")
+            .expect("summary group present");
+        assert!(summary.find_subcommand("this-month").is_some());
+        assert!(summary.find_subcommand("last-week").is_some());
+
+        let format = summary
+            .get_arguments()
+            .find(|argument| argument.get_id() == "format")
+            .expect("summary format argument");
+        assert_single_value_argument(format, false, ValueHint::Unknown, &["text", "json"]);
+        assert!(
+            summary
+                .get_arguments()
+                .any(|argument| argument.get_id() == "no-mailmap")
         );
     }
 

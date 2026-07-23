@@ -35,6 +35,8 @@ enum Group {
     Ci(CiGroup),
     #[command(about = "Open remote pages")]
     Open(OpenGroup),
+    #[command(about = "Summarize repository history")]
+    Summary(RawArgs),
     #[command(about = "Export shell completion script")]
     Completion(RawArgs),
     #[command(about = "Display help message for git-cli")]
@@ -284,6 +286,7 @@ where
         Some(Group::Worktree(group)) => run_worktree(group),
         Some(Group::Ci(group)) => run_ci(group),
         Some(Group::Open(group)) => run_open(group),
+        Some(Group::Summary(raw)) => git_summary::cli::run_embedded(&raw.args),
         Some(Group::Completion(raw)) => run_completion(raw),
         Some(Group::Help) | None => print_root_help(),
     }

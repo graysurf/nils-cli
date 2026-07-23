@@ -15,6 +15,7 @@ fn assert_top_level_help(stdout: &str) {
     assert_contains(stdout, "Usage: git-cli <group> <command> [args]");
     assert_contains(stdout, "Commands:");
     assert_contains(stdout, "utils       Utility helpers");
+    assert_contains(stdout, "summary     Summarize repository history");
     assert_contains(stdout, "completion  Export shell completion script");
     assert_contains(stdout, "-V, --version  Print version");
 }
@@ -117,6 +118,22 @@ fn worktree_group_help_exposes_governed_dirty_commands() {
     assert_contains(&stdout, "dirty-snapshot");
     assert_contains(&stdout, "adopt-dirty");
     assert_contains(&stdout, "revoke-dirty");
+}
+
+#[test]
+fn summary_group_delegates_to_the_standalone_summary_cli() {
+    let harness = GitCliHarness::new();
+    let dir = tempfile::TempDir::new().expect("tempdir");
+
+    let output = harness.run(dir.path(), &["summary", "--help"]);
+
+    assert_eq!(output.code, 0);
+    assert_eq!(output.stderr_text(), "");
+    let stdout = output.stdout_text();
+    assert_contains(&stdout, "Git history summary CLI");
+    assert_contains(&stdout, "this-month");
+    assert_contains(&stdout, "--format <FORMAT>");
+    assert_contains(&stdout, "--no-mailmap");
 }
 
 #[test]

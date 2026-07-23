@@ -1,36 +1,99 @@
 use anyhow::Result;
 use nils_common::git as common_git;
-use nils_term::progress::{Progress, ProgressFinish, ProgressOptions};
+use serde::Serialize;
+use std::collections::BTreeMap;
 
 use crate::dates::{build_range_args, validate_date};
 use crate::git::run_git;
 
 const SEPARATOR: &str = "----------------------------------------------------------------------------------------------------------------------------------------";
+const RECORD_SEPARATOR: char = '\u{1e}';
+const FIELD_SEPARATOR: char = '\u{1f}';
 
-pub fn summary(since: Option<&str>, until: Option<&str>) -> i32 {
+#[derive(Debug, Clone, Serialize)]
+pub struct SummaryPayload {
+    pub range: SummaryRange,
+    pub mailmap: bool,
+    pub authors: Vec<AuthorSummary>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SummaryRange {
+    pub label: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub from: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub to: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct AuthorSummary {
+    pub name: String,
+    pub email: String,
+    pub added: i64,
+    pub deleted: i64,
+    pub net: i64,
+    pub commits: i64,
+    pub first: String,
+    pub last: String,
+}
+
+#[derive(Debug)]
+pub struct SummaryFailure {
+    pub code: &'static str,
+    pub message: String,
+    pub exit_code: i32,
+}
+
+impl SummaryFailure {
+    fn data(code: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            code,
+            message: message.into(),
+            exit_code: nils_common::cli_contract::exit::DATA,
+        }
+    }
+
+    fn runtime(code: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            code,
+            message: message.into(),
+            exit_code: nils_common::cli_contract::exit::RUNTIME,
+        }
+    }
+}
+
+pub fn collect_summary(
+    label: impl Into<String>,
+    since: Option<&str>,
+    until: Option<&str>,
+    use_mailmap: bool,
+) -> std::result::Result<SummaryPayload, SummaryFailure> {
     if (since.is_some() && until.is_none()) || (since.is_none() && until.is_some()) {
-        println!("❌ Please provide both start and end dates (YYYY-MM-DD).");
-        return 1;
+        return Err(SummaryFailure::data(
+            "invalid-range",
+            "❌ Please provide both start and end dates (YYYY-MM-DD).",
+        ));
     }
 
     if let Some(value) = since
         && let Err(msg) = validate_date(value)
     {
-        println!("{msg}");
-        return 1;
+        return Err(SummaryFailure::data("invalid-date", msg));
     }
     if let Some(value) = until
         && let Err(msg) = validate_date(value)
     {
-        println!("{msg}");
-        return 1;
+        return Err(SummaryFailure::data("invalid-date", msg));
     }
 
     if let (Some(start), Some(end)) = (since, until)
         && start > end
     {
-        println!("❌ Start date must be on or before end date.");
-        return 1;
+        return Err(SummaryFailure::data(
+            "invalid-range",
+            "❌ Start date must be on or before end date.",
+        ));
     }
 
     let log_args = match (since, until) {
@@ -38,148 +101,113 @@ pub fn summary(since: Option<&str>, until: Option<&str>) -> i32 {
         _ => vec!["--no-merges".to_string()],
     };
 
-    match render_summary(&log_args) {
-        Ok(()) => 0,
-        Err(err) => {
-            eprintln!("{err:#}");
-            1
-        }
-    }
+    let authors = collect_author_rows(&log_args, use_mailmap)
+        .map_err(|err| SummaryFailure::runtime("git-log-failed", format!("{err:#}")))?;
+
+    Ok(SummaryPayload {
+        range: SummaryRange {
+            label: label.into(),
+            from: since.map(str::to_string),
+            to: until.map(str::to_string),
+        },
+        mailmap: use_mailmap,
+        authors,
+    })
 }
 
-fn render_summary(log_args: &[String]) -> Result<()> {
-    let authors = collect_authors(log_args)?;
-    let progress = if !authors.is_empty() {
-        Some(Progress::new(
-            authors.len() as u64,
-            ProgressOptions::default().with_finish(ProgressFinish::Clear),
-        ))
-    } else {
-        None
-    };
-
-    let mut rows = Vec::new();
-    for (idx, author) in authors.iter().enumerate() {
-        if let Some(p) = &progress {
-            p.set_message(author.to_string());
-        }
-
-        if let Some(row) = collect_author_row(author, log_args)? {
-            rows.push(row);
-        }
-
-        if let Some(p) = &progress {
-            p.set_position((idx + 1) as u64);
-        }
-    }
-
-    rows.sort_by(|a, b| b.net.cmp(&a.net).then_with(|| a.line.cmp(&b.line)));
-
-    if let Some(p) = progress {
-        p.finish_and_clear();
-    }
-
+pub fn render_text(payload: &SummaryPayload) {
     println!(
         "{:<25} {:<40} {:>8} {:>8} {:>8} {:>8} {:>12} {:>12}",
         "Name", "Email", "Added", "Deleted", "Net", "Commits", "First", "Last"
     );
     println!("{SEPARATOR}");
 
-    for row in rows {
-        println!("{}", row.line);
+    for author in &payload.authors {
+        println!(
+            "{:<25} {:<40} {:>8} {:>8} {:>8} {:>8} {:>12} {:>12}",
+            author.name,
+            truncate_email(&author.email),
+            author.added,
+            author.deleted,
+            author.net,
+            author.commits,
+            author.first,
+            author.last
+        );
     }
-
-    Ok(())
 }
 
-fn collect_authors(log_args: &[String]) -> Result<Vec<String>> {
+fn collect_author_rows(log_args: &[String], use_mailmap: bool) -> Result<Vec<AuthorSummary>> {
     let mut args = vec!["log".to_string()];
     args.extend(log_args.iter().cloned());
-    args.push("--pretty=format:%an <%ae>".to_string());
-
-    let output = run_git(&args)?;
-    let mut authors = output
-        .lines()
-        .map(|line| line.trim())
-        .filter(|line| !line.is_empty())
-        .map(|line| line.to_string())
-        .collect::<Vec<_>>();
-    authors.sort();
-    authors.dedup();
-    Ok(authors)
-}
-
-fn collect_author_row(author: &str, log_args: &[String]) -> Result<Option<Row>> {
-    let (name, email) = split_author(author);
-    let short_email = truncate_email(&email);
-
-    let mut args = vec!["log".to_string()];
-    args.extend(log_args.iter().cloned());
-    if !email.is_empty() {
-        args.push(format!("--author={email}"));
-    }
-    args.push("--pretty=format:%cd".to_string());
-    args.push("--date=short".to_string());
+    let (name_placeholder, email_placeholder) = if use_mailmap {
+        ("%aN", "%aE")
+    } else {
+        ("%an", "%ae")
+    };
+    args.push(format!(
+        "--pretty=tformat:%x1e{name_placeholder}%x1f{email_placeholder}%x1f%cs"
+    ));
     args.push("--numstat".to_string());
 
-    let log = run_git(&args)?;
+    let output = run_git(&args)?;
+    let mut aggregates = BTreeMap::<(String, String), AuthorAggregate>::new();
 
-    let (added, deleted) = parse_numstat_totals(&log);
+    for record in output.split(RECORD_SEPARATOR).skip(1) {
+        let record = record.trim_start_matches('\n');
+        let Some((header, numstat)) = record.split_once('\n') else {
+            continue;
+        };
+        let mut fields = header.splitn(3, FIELD_SEPARATOR);
+        let Some(name) = fields.next() else {
+            continue;
+        };
+        let Some(email) = fields.next() else {
+            continue;
+        };
+        let Some(date) = fields.next() else {
+            continue;
+        };
 
-    // Skip authors with no counted code changes (added == 0 && deleted == 0).
-    // This intentionally drops lockfile-only and binary-only authors even when
-    // they have commits in range (lockfiles and binaries count as zero lines),
-    // as well as bots whose commits don't match the `--author` filter. The
-    // report is about code changes, so a non-zero commit count alone is not
-    // enough to be listed. Note this is `added == 0 && deleted == 0`, not
-    // `net == 0`: a deletion-only or add/delete-balanced author still appears.
-    if added == 0 && deleted == 0 {
-        return Ok(None);
+        let (added, deleted) = parse_numstat_totals(numstat);
+        let key = (name.to_string(), email.to_string());
+        let aggregate = aggregates.entry(key).or_default();
+        aggregate.added += added;
+        aggregate.deleted += deleted;
+        aggregate.commits += 1;
+        if aggregate.first.is_empty() || date < aggregate.first.as_str() {
+            aggregate.first = date.to_string();
+        }
+        if aggregate.last.is_empty() || date > aggregate.last.as_str() {
+            aggregate.last = date.to_string();
+        }
     }
 
-    let (commits, first_commit, last_commit) = parse_commit_dates(&log);
-    let net = added - deleted;
-
-    let line = format!(
-        "{:<25} {:<40} {:>8} {:>8} {:>8} {:>8} {:>12} {:>12}",
-        name, short_email, added, deleted, net, commits, first_commit, last_commit
-    );
-
-    Ok(Some(Row { net, line }))
-}
-
-fn split_author(author: &str) -> (String, String) {
-    if let (Some(start), Some(end)) = (author.find('<'), author.rfind('>'))
-        && start < end
-    {
-        let name = author[..start].trim().to_string();
-        let email = author[start + 1..end].trim().to_string();
-        return (name, email);
-    }
-    (author.trim().to_string(), String::new())
+    let mut authors = aggregates
+        .into_iter()
+        .filter(|(_, aggregate)| aggregate.added != 0 || aggregate.deleted != 0)
+        .map(|((name, email), aggregate)| AuthorSummary {
+            name,
+            email,
+            added: aggregate.added,
+            deleted: aggregate.deleted,
+            net: aggregate.added - aggregate.deleted,
+            commits: aggregate.commits,
+            first: aggregate.first,
+            last: aggregate.last,
+        })
+        .collect::<Vec<_>>();
+    authors.sort_by(|a, b| {
+        b.net
+            .cmp(&a.net)
+            .then_with(|| a.name.cmp(&b.name))
+            .then_with(|| a.email.cmp(&b.email))
+    });
+    Ok(authors)
 }
 
 fn truncate_email(email: &str) -> String {
     email.chars().take(40).collect::<String>()
-}
-
-fn parse_commit_dates(log: &str) -> (i64, String, String) {
-    let mut commits = 0i64;
-    let mut first_commit = String::new();
-    let mut last_commit = String::new();
-
-    for line in log.lines() {
-        let parts: Vec<&str> = line.split_whitespace().collect();
-        if parts.len() == 1 {
-            commits += 1;
-            if last_commit.is_empty() {
-                last_commit = parts[0].to_string();
-            }
-            first_commit = parts[0].to_string();
-        }
-    }
-
-    (commits, first_commit, last_commit)
 }
 
 fn parse_numstat_totals(log: &str) -> (i64, i64) {
@@ -224,9 +252,13 @@ fn is_lockfile_line(line: &str) -> bool {
         .unwrap_or(false)
 }
 
-struct Row {
-    net: i64,
-    line: String,
+#[derive(Default)]
+struct AuthorAggregate {
+    added: i64,
+    deleted: i64,
+    commits: i64,
+    first: String,
+    last: String,
 }
 
 #[cfg(test)]
@@ -235,38 +267,10 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     #[test]
-    fn split_author_parses_name_and_email() {
-        let (name, email) = split_author("Jane Doe <jane@example.com>");
-        assert_eq!(name, "Jane Doe");
-        assert_eq!(email, "jane@example.com");
-    }
-
-    #[test]
-    fn split_author_handles_missing_brackets() {
-        let (name, email) = split_author("nobody");
-        assert_eq!(name, "nobody");
-        assert_eq!(email, "");
-    }
-
-    #[test]
     fn truncate_email_limits_length() {
         let email = "a".repeat(45);
         let truncated = truncate_email(&email);
         assert_eq!(truncated.len(), 40);
-    }
-
-    #[test]
-    fn parse_commit_dates_tracks_first_and_last() {
-        let log = "\
-2024-01-05
-1\t2\ta.txt
-2024-01-03
-3\t4\tb.txt
-";
-        let (commits, first_commit, last_commit) = parse_commit_dates(log);
-        assert_eq!(commits, 2);
-        assert_eq!(first_commit, "2024-01-03");
-        assert_eq!(last_commit, "2024-01-05");
     }
 
     #[test]

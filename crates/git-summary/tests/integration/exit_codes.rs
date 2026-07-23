@@ -15,6 +15,14 @@ fn outside_git_repo_exits_runtime() {
 }
 
 #[test]
+fn invalid_date_exits_data() {
+    let repo = common::init_repo();
+    let (code, _) =
+        common::run_git_summary_allow_fail(repo.path(), &["2024-02-30", "2024-03-01"], &[]);
+    assert_eq!(code, 65);
+}
+
+#[test]
 fn help_exits_success() {
     let repo = common::init_repo();
     let (code, _) = common::run_git_summary_allow_fail(repo.path(), &["--help"], &[]);

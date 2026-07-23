@@ -88,6 +88,136 @@ fn summary_counts_and_sorting() {
 }
 
 #[test]
+fn summary_aggregates_mailmap_aliases_into_one_canonical_author() {
+    let repo = init_repo();
+    let root = repo.path();
+
+    commit_with_author(
+        root,
+        "graysurf",
+        "graysurf-github@example.test",
+        "2024-01-05",
+        "github.txt",
+        "one\ntwo\nthree\n",
+    );
+    commit_with_author(
+        root,
+        "graysurf",
+        "graysurf-codeberg@example.test",
+        "2024-01-06",
+        "codeberg.txt",
+        "alpha\nbeta\n",
+    );
+    fs::write(
+        root.join(".mailmap"),
+        "\
+graysurf <commits@id.graysurf.dev> <graysurf-github@example.test>
+graysurf <commits@id.graysurf.dev> <graysurf-codeberg@example.test>
+",
+    )
+    .expect("write mailmap");
+
+    let output = run_git_summary(root, &["2024-01-01", "2024-01-31"], &[]);
+
+    let canonical_line = format!(
+        "{:<25} {:<40} {:>8} {:>8} {:>8} {:>8} {:>12} {:>12}",
+        "graysurf", "commits@id.graysurf.dev", 5, 0, 5, 2, "2024-01-05", "2024-01-06"
+    );
+    assert!(
+        output.contains(&canonical_line),
+        "missing canonical aggregate: {output}"
+    );
+    assert!(
+        !output.contains("graysurf-github@example.test"),
+        "raw GitHub alias should be hidden: {output}"
+    );
+    assert!(
+        !output.contains("graysurf-codeberg@example.test"),
+        "raw Codeberg alias should be hidden: {output}"
+    );
+}
+
+#[test]
+fn no_mailmap_preserves_raw_author_rows() {
+    let repo = init_repo();
+    let root = repo.path();
+
+    commit_with_author(
+        root,
+        "graysurf",
+        "github@example.com",
+        "2024-01-05",
+        "github.txt",
+        "one\n",
+    );
+    commit_with_author(
+        root,
+        "graysurf",
+        "codeberg@example.com",
+        "2024-01-06",
+        "codeberg.txt",
+        "two\n",
+    );
+    fs::write(
+        root.join(".mailmap"),
+        "\
+graysurf <canonical@example.com> <github@example.com>
+graysurf <canonical@example.com> <codeberg@example.com>
+",
+    )
+    .expect("write mailmap");
+
+    let output = run_git_summary(root, &["--no-mailmap", "2024-01-01", "2024-01-31"], &[]);
+
+    assert!(
+        output.contains("github@example.com"),
+        "missing GitHub row: {output}"
+    );
+    assert!(
+        output.contains("codeberg@example.com"),
+        "missing Codeberg row: {output}"
+    );
+    assert!(
+        !output.contains("canonical@example.com"),
+        "canonical identity should be disabled: {output}"
+    );
+}
+
+#[test]
+fn json_output_uses_the_versioned_summary_envelope() {
+    let repo = init_repo();
+    let root = repo.path();
+
+    commit_with_author(
+        root,
+        "Alice",
+        "alice@example.com",
+        "2024-01-05",
+        "a.txt",
+        "one\ntwo\n",
+    );
+
+    let output = run_git_summary(root, &["--format", "json", "2024-01-01", "2024-01-31"], &[]);
+
+    assert!(
+        output.contains("\"schema_version\":\"cli.git-summary.summary.v1\""),
+        "missing schema version: {output}"
+    );
+    assert!(
+        output.contains("\"ok\":true"),
+        "missing success state: {output}"
+    );
+    assert!(
+        output.contains("\"mailmap\":true"),
+        "missing mailmap mode: {output}"
+    );
+    assert!(
+        output.contains("\"authors\":[{\"name\":\"Alice\",\"email\":\"alice@example.com\",\"added\":2,\"deleted\":0,\"net\":2,\"commits\":1,\"first\":\"2024-01-05\",\"last\":\"2024-01-05\"}]"),
+        "unexpected authors payload: {output}"
+    );
+}
+
+#[test]
 fn summary_hides_authors_without_code_changes() {
     let repo = init_repo();
     let root = repo.path();
