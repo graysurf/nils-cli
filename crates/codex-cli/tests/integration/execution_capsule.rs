@@ -348,20 +348,21 @@ fn workspace_capsule_preserves_governance_and_writes_private_artifacts() {
         .map(str::to_string)
         .collect::<Vec<_>>();
     assert_eq!(
-        &argv[..5],
+        &argv[..6],
         &[
             "--ask-for-approval",
             "never",
             "exec",
+            "--skip-git-repo-check",
             "-C",
             workspace.to_str().unwrap()
         ]
     );
-    assert_eq!(&argv[5..8], &["--sandbox", "workspace-write", "--json"]);
-    assert_eq!(argv[8], "--output-schema");
-    assert_eq!(argv[10], "--output-last-message");
-    assert_eq!(argv[12], "--");
-    let prompt = &argv[13];
+    assert_eq!(&argv[6..9], &["--sandbox", "workspace-write", "--json"]);
+    assert_eq!(argv[9], "--output-schema");
+    assert_eq!(argv[11], "--output-last-message");
+    assert_eq!(argv[13], "--");
+    let prompt = &argv[14];
     assert!(prompt.contains("Apply the prepared change and verify it."));
     assert!(prompt.contains(capsule.join("run.sh").to_str().unwrap()));
     assert!(prompt.contains(workspace.to_str().unwrap()));

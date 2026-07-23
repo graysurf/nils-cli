@@ -128,6 +128,7 @@ also live in `run.sh`.
 
 ```text
 codex --ask-for-approval never exec \
+  --skip-git-repo-check \
   -C <cwd> \
   --sandbox workspace-write|danger-full-access \
   --json \
@@ -138,7 +139,10 @@ codex --ask-for-approval never exec \
 
 The command intentionally preserves the active Codex home, user/project
 instructions, config, and hooks. It does not use the isolated prompt runtime,
-ignore rules, or pass the dangerous bypass flag.
+ignore rules, or pass the dangerous bypass flag. The runner skips Codex's Git
+repository precheck because a valid capsule may use a non-Git working
+directory; capsule path, ownership, mode, digest, access, and optional Git
+preconditions remain independently enforced.
 
 `workspace` is the normal path. `host` is accepted only when both the manifest
 declares it and the operator supplies `--allow-host-access`. This two-part

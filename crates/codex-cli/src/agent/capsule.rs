@@ -304,7 +304,13 @@ fn run_inner(options: &RunOptions) -> Result<i32, CapsuleError> {
     crate::runtime::refresh_remote_auth_before_exec();
     let prompt = supervisor_prompt(&capsule, &helpers);
     let codex_spawn = Command::new("codex")
-        .args(["--ask-for-approval", "never", "exec", "-C"])
+        .args([
+            "--ask-for-approval",
+            "never",
+            "exec",
+            "--skip-git-repo-check",
+            "-C",
+        ])
         .arg(&capsule.cwd)
         .args(["--sandbox", capsule.manifest.access.sandbox(), "--json"])
         .args(["--output-schema"])
