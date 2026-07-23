@@ -300,6 +300,12 @@ pub(crate) fn pending_notifications(
     notification::pending(context)
 }
 
+pub(crate) fn unresolved_notifications(
+    context: &CliContext,
+) -> Result<Vec<NotificationCandidate>, CliError> {
+    notification::unresolved(context)
+}
+
 pub(crate) fn begin_notification_attempt(
     context: &CliContext,
     candidate: &NotificationCandidate,
@@ -347,6 +353,20 @@ pub(crate) fn defer_notification(
     retry_after_seconds: i64,
 ) -> Result<bool, CliError> {
     notification::defer(context, candidate, reason, retry_after_seconds)
+}
+
+pub(crate) fn reconcile_notification_submitted(
+    context: &CliContext,
+    candidate: &NotificationCandidate,
+) -> Result<bool, CliError> {
+    notification::reconcile_submitted(context, candidate)
+}
+
+pub(crate) fn reconcile_notification_absent(
+    context: &CliContext,
+    candidate: &NotificationCandidate,
+) -> Result<bool, CliError> {
+    notification::reconcile_absent(context, candidate)
 }
 
 pub(crate) fn notification_prompt(message_id: &str, session_id: &str) -> String {
@@ -894,9 +914,23 @@ pub(crate) fn clean_expired(registry: &mut Registry, now: i64) -> bool {
     registry
         .messages
         .retain(|message| !removed_messages.contains(&message.message_id));
-    registry
-        .notifications
-        .retain(|message_id, _| !removed_messages.contains(message_id));
+    let retained_notification_targets: std::collections::BTreeSet<_> = registry
+        .messages
+        .iter()
+        .map(|message| {
+            (
+                message.recipient_session_id.clone(),
+                message.recipient_incarnation.clone(),
+            )
+        })
+        .collect();
+    registry.notifications.retain(|key, receipt| {
+        !removed_messages.contains(key)
+            && retained_notification_targets.contains(&(
+                receipt.target_session_id.clone(),
+                receipt.target_incarnation.clone(),
+            ))
+    });
     registry.operations.retain(|operation| {
         operation
             .terminal_at_epoch

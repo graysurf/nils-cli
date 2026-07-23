@@ -221,6 +221,12 @@ struct ActivityDocument {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     last_semantic_event_at: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    last_provider_event_kind: Option<TurnEventKind>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    last_provider_event_provider: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    last_provider_event_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     provider_session_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     last_event_at: Option<String>,
@@ -1240,6 +1246,9 @@ pub(crate) fn activate_runtime(
         seen_event_count: 0,
         last_semantic_event: None,
         last_semantic_event_at: None,
+        last_provider_event_kind: None,
+        last_provider_event_provider: None,
+        last_provider_event_at: None,
         provider_session_id: record
             .provider_resume
             .as_ref()
@@ -1496,6 +1505,51 @@ pub(crate) fn state_for_view(context: &CliContext, record: &SessionRecord) -> Op
         }
         Ok(_) | Err(_) => Some(unknown_state(record)),
     }
+}
+
+pub(crate) fn claude_notification_waiting(
+    context: &CliContext,
+    record: &SessionRecord,
+    debounce: std::time::Duration,
+) -> bool {
+    if record.agent != AgentKind::Claude.as_str() {
+        return false;
+    }
+    let Some(runtime) = record.runtime.as_ref() else {
+        return false;
+    };
+    let path = session_dir(context, &record.id).join(ACTIVITY_FILE);
+    let Ok(document) = read_document(&path) else {
+        return false;
+    };
+    if document.runtime_id != runtime.launch_id
+        || document.runtime_generation != runtime.generation
+        || !document.pending_attention.is_empty()
+        || document.overflow_attention.is_some()
+    {
+        return false;
+    }
+    if document.state.phase == TurnPhase::Waiting
+        && document.state.source.confidence == Confidence::Authoritative
+    {
+        return true;
+    }
+    if document.last_provider_event_kind != Some(TurnEventKind::StopObserved)
+        || document.last_provider_event_provider.as_deref() != Some(AgentKind::Claude.as_str())
+    {
+        return false;
+    }
+    let Some(observed_at) = document
+        .last_provider_event_at
+        .as_deref()
+        .and_then(|value| value.parse::<jiff::Timestamp>().ok())
+    else {
+        return false;
+    };
+    let elapsed = jiff::Timestamp::now()
+        .as_second()
+        .saturating_sub(observed_at.as_second());
+    elapsed >= i64::try_from(debounce.as_secs()).unwrap_or(i64::MAX)
 }
 
 pub(crate) fn runtime_is_unhealthy(context: &CliContext, record: &SessionRecord) -> bool {
@@ -1838,6 +1892,9 @@ fn ingest_event_with_lock(
     if matches!(event.source_kind, SourceKind::ProviderHook) {
         document.last_semantic_event = Some(semantic_key);
         document.last_semantic_event_at = Some(received_at.clone());
+        document.last_provider_event_kind = Some(event.kind.clone());
+        document.last_provider_event_provider = Some(event.provider.clone());
+        document.last_provider_event_at = Some(received_at.clone());
     }
     if document.provider_session_id.is_none() {
         document.provider_session_id = event.provider_session_id.clone();
@@ -4050,6 +4107,9 @@ mod tests {
             seen_event_count: 0,
             last_semantic_event: None,
             last_semantic_event_at: None,
+            last_provider_event_kind: None,
+            last_provider_event_provider: None,
+            last_provider_event_at: None,
             provider_session_id: None,
             last_event_at: None,
             pending_journal: None,
@@ -4169,6 +4229,47 @@ mod tests {
 
     fn test_session(tmp: &tempfile::TempDir) -> (CliContext, crate::CreatedRecord) {
         test_session_for_agent(tmp, AgentKind::Codex)
+    }
+
+    #[test]
+    fn claude_notification_waiting_requires_stop_and_no_reactivation() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let (context, created) = test_session_for_agent(&tmp, AgentKind::Claude);
+        activate_runtime(&context, &created.record).expect("activate runtime");
+        let runtime_id = created
+            .record
+            .runtime
+            .as_ref()
+            .expect("runtime")
+            .launch_id
+            .clone();
+        let mut stop = event(TurnEventKind::StopObserved, "claude-stop");
+        stop.runtime_id = runtime_id.clone();
+        stop.provider = AgentKind::Claude.as_str().to_string();
+        stop.provider_turn_id = None;
+        ingest_event(&context, &created.record.id, stop).expect("ingest stop");
+
+        assert!(claude_notification_waiting(
+            &context,
+            &created.record,
+            Duration::ZERO
+        ));
+        assert!(!claude_notification_waiting(
+            &context,
+            &created.record,
+            Duration::from_secs(1)
+        ));
+
+        let mut reactivated = event(TurnEventKind::Progress, "claude-reactivated");
+        reactivated.runtime_id = runtime_id;
+        reactivated.provider = AgentKind::Claude.as_str().to_string();
+        reactivated.provider_turn_id = None;
+        ingest_event(&context, &created.record.id, reactivated).expect("ingest reactivation");
+        assert!(!claude_notification_waiting(
+            &context,
+            &created.record,
+            Duration::ZERO
+        ));
     }
 
     #[test]

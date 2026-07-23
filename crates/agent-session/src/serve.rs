@@ -130,6 +130,10 @@ const ACTIVITY_STREAM_MAX_REFRESH_CADENCE: Duration = Duration::from_millis(250)
 const ACTIVITY_STREAM_OVERSIZED_REASON: &str = "oversized_snapshot";
 const SESSION_DELETE_TOMBSTONE_CLEANUP_LIMIT: usize = 64;
 const COORDINATION_WAIT_WORKER_LIMIT: usize = 16;
+const COORDINATION_NOTIFICATION_RETRY: i64 = 1;
+const CLAUDE_NOTIFICATION_STOP_DEBOUNCE: Duration = Duration::from_secs(1);
+const CLAUDE_NOTIFICATION_OBSERVATION_TIMEOUT: Duration = Duration::from_secs(5);
+const CLAUDE_NOTIFICATION_OBSERVATION_POLL: Duration = Duration::from_millis(100);
 const RESET_AT_KEYS: &[&str] = &["reset_at", "resetAt", "resets_at", "resetsAt"];
 const RESET_AT_EPOCH_KEYS: &[&str] = &[
     "reset_at_epoch",
@@ -165,6 +169,12 @@ struct ServeState {
 #[derive(Clone)]
 struct CoordinationNotificationFence {
     candidate: crate::coordination::NotificationCandidate,
+}
+
+#[derive(Debug)]
+enum ClaudeNotificationStartError {
+    Known(&'static str),
+    Unknown,
 }
 
 #[derive(Default)]
@@ -4520,6 +4530,7 @@ async fn coordination_notification_loop(state: Arc<ServeState>) {
 }
 
 async fn drain_coordination_notifications(state: Arc<ServeState>) {
+    reconcile_coordination_notifications(state.clone()).await;
     let context = state.context.clone();
     let candidates = match tokio::task::spawn_blocking(move || {
         crate::coordination::pending_notifications(&context)
@@ -4541,6 +4552,70 @@ async fn drain_coordination_notifications(state: Arc<ServeState>) {
     };
     for candidate in candidates {
         dispatch_coordination_notification(state.clone(), candidate).await;
+    }
+}
+
+async fn reconcile_coordination_notifications(state: Arc<ServeState>) {
+    let context = state.context.clone();
+    let candidates = match tokio::task::spawn_blocking(move || {
+        crate::coordination::unresolved_notifications(&context)
+    })
+    .await
+    {
+        Ok(Ok(candidates)) => candidates,
+        _ => return,
+    };
+    for candidate in candidates {
+        let context = state.context.clone();
+        let observed_candidate = candidate.clone();
+        let observation = tokio::task::spawn_blocking(move || {
+            let record =
+                load_session_record(&context, &observed_candidate.target_session_id).ok()?;
+            if record
+                .runtime
+                .as_ref()
+                .map(|runtime| runtime.launch_id.as_str())
+                != Some(observed_candidate.target_incarnation.as_str())
+            {
+                return None;
+            }
+            let source = ProviderPromptTail::resolve_source(&record)?;
+            let mut tracker = ProviderLastPromptTracker::open_source(source)?;
+            match tracker.refresh() {
+                ProviderLastPromptRefresh::Current(last) => Some(last.is_some_and(|last| {
+                    if last.text
+                        != crate::coordination::notification_prompt(
+                            "",
+                            &observed_candidate.target_session_id,
+                        )
+                    {
+                        return false;
+                    }
+                    last.submitted_at
+                        .as_deref()
+                        .and_then(|value| value.parse::<jiff::Timestamp>().ok())
+                        .is_some_and(|submitted_at| {
+                            submitted_at.as_second() >= observed_candidate.attempted_at_epoch
+                        })
+                })),
+                ProviderLastPromptRefresh::Pending | ProviderLastPromptRefresh::Invalidated => None,
+            }
+        })
+        .await
+        .ok()
+        .flatten();
+        let Some(observed) = observation else {
+            continue;
+        };
+        let context = state.context.clone();
+        let _ = tokio::task::spawn_blocking(move || {
+            if observed {
+                crate::coordination::reconcile_notification_submitted(&context, &candidate)
+            } else {
+                crate::coordination::reconcile_notification_absent(&context, &candidate)
+            }
+        })
+        .await;
     }
 }
 
@@ -4582,13 +4657,19 @@ async fn dispatch_coordination_notification(
         return;
     }
     if record.agent == AgentKind::Claude.as_str() {
-        update_notification_deferred(&state, &candidate, "provider-not-ready", 1).await;
+        dispatch_claude_coordination_notification(state, record, candidate).await;
         return;
     }
     let waiting = activity::state_for_view(&state.context, &record)
         .is_some_and(|turn| turn.phase == activity::TurnPhase::Waiting);
     if !waiting {
-        update_notification_deferred(&state, &candidate, "recipient-working", 1).await;
+        update_notification_deferred(
+            &state,
+            &candidate,
+            "recipient-working",
+            COORDINATION_NOTIFICATION_RETRY,
+        )
+        .await;
         return;
     }
     if !codex_app_server::runtime_is_supported(&record) {
@@ -4623,7 +4704,208 @@ async fn dispatch_coordination_notification(
         })
         .await;
     } else {
-        update_notification_deferred(&state, &candidate, "provider-not-ready", 1).await;
+        update_notification_deferred(
+            &state,
+            &candidate,
+            "provider-not-ready",
+            COORDINATION_NOTIFICATION_RETRY,
+        )
+        .await;
+    }
+}
+
+async fn dispatch_claude_coordination_notification(
+    state: Arc<ServeState>,
+    record: SessionRecord,
+    candidate: crate::coordination::NotificationCandidate,
+) {
+    let Some(source) = ProviderPromptTail::resolve_source(&record) else {
+        update_notification_deferred(
+            &state,
+            &candidate,
+            "provider-observation-unavailable",
+            COORDINATION_NOTIFICATION_RETRY,
+        )
+        .await;
+        return;
+    };
+    let Some(tail) = ProviderPromptTail::open_source_at_eof(source) else {
+        update_notification_deferred(
+            &state,
+            &candidate,
+            "provider-observation-unavailable",
+            COORDINATION_NOTIFICATION_RETRY,
+        )
+        .await;
+        return;
+    };
+    let prompt = crate::coordination::notification_prompt("", &candidate.target_session_id);
+    let context = state.context.clone();
+    let tmux = state.tmux_bin.clone();
+    let start_candidate = candidate.clone();
+    let start_prompt = prompt.clone();
+    let started = tokio::task::spawn_blocking(move || {
+        start_claude_coordination_notification(
+            &context,
+            &tmux,
+            &start_candidate,
+            &start_prompt,
+            tail,
+        )
+    })
+    .await;
+    let tail = match started {
+        Ok(Ok(tail)) => tail,
+        Ok(Err(ClaudeNotificationStartError::Known(reason))) => {
+            update_notification_deferred(
+                &state,
+                &candidate,
+                reason,
+                COORDINATION_NOTIFICATION_RETRY,
+            )
+            .await;
+            return;
+        }
+        Ok(Err(ClaudeNotificationStartError::Unknown)) | Err(_) => {
+            let context = state.context.clone();
+            let _ = tokio::task::spawn_blocking(move || {
+                crate::coordination::mark_notification_unknown(
+                    &context,
+                    &candidate,
+                    "submission-outcome-unknown",
+                )
+            })
+            .await;
+            return;
+        }
+    };
+
+    let observed_prompt = prompt.clone();
+    let observed =
+        tokio::task::spawn_blocking(move || observe_coordination_prompt(tail, &observed_prompt))
+            .await
+            .unwrap_or(false);
+    let context = state.context.clone();
+    let _ = tokio::task::spawn_blocking(move || {
+        if observed {
+            crate::coordination::mark_notification_submitted(&context, &candidate)
+        } else {
+            crate::coordination::mark_notification_unknown(
+                &context,
+                &candidate,
+                "submission-outcome-unknown",
+            )
+        }
+    })
+    .await;
+}
+
+fn start_claude_coordination_notification(
+    context: &CliContext,
+    tmux_bin: &Path,
+    candidate: &crate::coordination::NotificationCandidate,
+    prompt: &str,
+    tail: ProviderPromptTail,
+) -> Result<ProviderPromptTail, ClaudeNotificationStartError> {
+    let _record_lock = crate::acquire_session_record_lock(context, &candidate.target_session_id)
+        .map_err(|_| ClaudeNotificationStartError::Known("recipient-incarnation-replaced"))?;
+    let current = load_session_record(context, &candidate.target_session_id)
+        .map_err(|_| ClaudeNotificationStartError::Known("recipient-incarnation-replaced"))?;
+    if current.agent != AgentKind::Claude.as_str() {
+        return Err(ClaudeNotificationStartError::Known("provider-unsupported"));
+    }
+    if current.coordination_mode == cli::CoordinationMode::Off {
+        return Err(ClaudeNotificationStartError::Known("coordination-disabled"));
+    }
+    if current
+        .runtime
+        .as_ref()
+        .map(|runtime| runtime.launch_id.as_str())
+        != Some(candidate.target_incarnation.as_str())
+    {
+        return Err(ClaudeNotificationStartError::Known(
+            "recipient-incarnation-replaced",
+        ));
+    }
+    if !activity::claude_notification_waiting(context, &current, CLAUDE_NOTIFICATION_STOP_DEBOUNCE)
+    {
+        return Err(ClaudeNotificationStartError::Known("recipient-working"));
+    }
+    if crate::live_status(tmux_bin, &current.tmux_session) != "running" {
+        return Err(ClaudeNotificationStartError::Known("provider-not-ready"));
+    }
+    match tmux_session_attached(tmux_bin, &current.tmux_session) {
+        Ok(false) => {}
+        Ok(true) => {
+            return Err(ClaudeNotificationStartError::Known("recipient-attached"));
+        }
+        Err(()) => {
+            return Err(ClaudeNotificationStartError::Known("provider-not-ready"));
+        }
+    }
+
+    let current = load_session_record(context, &candidate.target_session_id)
+        .map_err(|_| ClaudeNotificationStartError::Known("recipient-incarnation-replaced"))?;
+    if current
+        .runtime
+        .as_ref()
+        .map(|runtime| runtime.launch_id.as_str())
+        != Some(candidate.target_incarnation.as_str())
+    {
+        return Err(ClaudeNotificationStartError::Known(
+            "recipient-incarnation-replaced",
+        ));
+    }
+    if !crate::coordination::begin_notification_attempt(context, candidate)
+        .map_err(|_| ClaudeNotificationStartError::Known("provider-not-ready"))?
+    {
+        return Err(ClaudeNotificationStartError::Known("provider-not-ready"));
+    }
+    crate::send_input_unlocked(
+        context,
+        &current,
+        Some(prompt),
+        &[SpecialKey::Enter],
+        tmux_bin,
+        None,
+    )
+    .map_err(|_| ClaudeNotificationStartError::Unknown)?;
+    Ok(tail)
+}
+
+fn tmux_session_attached(tmux_bin: &Path, tmux_session: &str) -> Result<bool, ()> {
+    let mut command = ProcessCommand::new(tmux_bin);
+    command
+        .arg("display-message")
+        .arg("-p")
+        .arg("-t")
+        .arg(format!("{tmux_session}:0.0"))
+        .arg("#{session_attached}");
+    let output = run_process_output_with_timeout(&mut command, ATTACH_TMUX_COMMAND_TIMEOUT)
+        .map_err(|_| ())?;
+    if !output.status.success() {
+        return Err(());
+    }
+    let attached = String::from_utf8(output.stdout)
+        .map_err(|_| ())?
+        .trim()
+        .parse::<u64>()
+        .map_err(|_| ())?;
+    Ok(attached != 0)
+}
+
+fn observe_coordination_prompt(mut tail: ProviderPromptTail, prompt: &str) -> bool {
+    let deadline = Instant::now() + CLAUDE_NOTIFICATION_OBSERVATION_TIMEOUT;
+    loop {
+        match tail.poll() {
+            Ok(events) if events.iter().any(|event| event.prompt == prompt) => return true,
+            Ok(_) => {}
+            Err(_) => return false,
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(CLAUDE_NOTIFICATION_OBSERVATION_POLL);
     }
 }
 
@@ -14373,6 +14655,7 @@ esac
                         target_session_id: "notification-final-fence".to_string(),
                         target_incarnation: launch_id.clone(),
                         generation: 1,
+                        attempted_at_epoch: 0,
                     },
                 }),
                 ..Default::default()
@@ -20153,6 +20436,180 @@ exit 0
         assert_eq!(notification["notified_generation"], 1);
         assert_eq!(registry["messages"][0]["state"], "unread");
         assert!(!notification.to_string().contains(canary));
+    }
+
+    #[tokio::test]
+    async fn claude_notification_requires_detached_stop_and_observes_exact_new_prompt() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        seed_session_with_runtime(tmp.path(), "alpha", "codex", "hs-codex-alpha");
+        seed_session_with_runtime(tmp.path(), "beta", "claude", "hs-claude-beta");
+        let command_log = tmp.path().join("tmux-commands.log");
+        let captured_prompt = tmp.path().join("captured-prompt");
+        let attached_state = tmp.path().join("attached-state");
+        fs::write(&attached_state, b"1\n").expect("attached state");
+        let tmux = tmp.path().join("tmux");
+        fs::write(
+            &tmux,
+            format!(
+                r#"#!/bin/sh
+printf '%s\n' "$*" >> {}
+case "$1" in
+  has-session) exit 0 ;;
+  display-message)
+    read value < {}
+    printf '%s\n' "$value"
+    exit 0
+    ;;
+  load-buffer)
+    for value in "$@"; do last="$value"; done
+    cp "$last" {}
+    exit 0
+    ;;
+  paste-buffer|send-keys|delete-buffer) exit 0 ;;
+  *) exit 1 ;;
+esac
+"#,
+                shell_words::quote(&command_log.to_string_lossy()),
+                shell_words::quote(&attached_state.to_string_lossy()),
+                shell_words::quote(&captured_prompt.to_string_lossy())
+            ),
+        )
+        .expect("tmux script");
+        let mut permissions = fs::metadata(&tmux).expect("tmux metadata").permissions();
+        permissions.set_mode(0o700);
+        fs::set_permissions(&tmux, permissions).expect("tmux permissions");
+
+        let state = state(tmp.path(), Some(TOKEN), tmux.clone());
+        let alpha = load_session_record(&state.context, "alpha").expect("alpha");
+        let beta = load_session_record(&state.context, "beta").expect("beta");
+        let alpha_capability = provision_ready_coordination_fixture(&state.context, &alpha);
+        provision_ready_coordination_fixture(&state.context, &beta);
+        crate::activity::activate_runtime(&state.context, &beta).expect("activate beta");
+        let launch_id = beta
+            .runtime
+            .as_ref()
+            .expect("beta runtime")
+            .launch_id
+            .clone();
+        let stop = serde_json::from_value(json!({
+            "schema_version": crate::activity::TURN_EVENT_VERSION,
+            "event_id": "claude-notification-stop",
+            "runtime_id": launch_id,
+            "provider": "claude",
+            "kind": "stop_observed",
+            "confidence": "observed"
+        }))
+        .expect("stop event");
+        crate::activity::ingest_event(&state.context, &beta.id, stop).expect("ingest stop");
+        let activity_path = session_dir(&state.context, &beta.id).join("activity.json");
+        let mut activity: Value =
+            serde_json::from_slice(&fs::read(&activity_path).expect("activity"))
+                .expect("activity json");
+        activity["last_provider_event_at"] = json!("2000-01-01T00:00:00Z");
+        fs::write(
+            &activity_path,
+            serde_json::to_vec_pretty(&activity).expect("serialize activity"),
+        )
+        .expect("write activity");
+
+        let canary = "CLAUDE-MAILBOX-BODY-MUST-NOT-REACH-PROMPT";
+        let (status, sent) = call(
+            router(state.clone()),
+            post_coordination(
+                "/sessions/beta/messages/v1",
+                alpha_capability.trim(),
+                json!({
+                    "body": canary,
+                    "idempotency_key": "claude-notification-0001",
+                    "reply_to": null,
+                    "expires_in": null
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{sent}");
+        let candidate = crate::coordination::pending_notifications(&state.context)
+            .expect("pending notifications")
+            .pop()
+            .expect("candidate");
+
+        let transcript = tmp.path().join("claude.jsonl");
+        fs::write(&transcript, b"").expect("transcript");
+        let attached_tail = ProviderPromptTail::open_path(
+            ProviderKind::Claude,
+            "provider-beta",
+            transcript.clone(),
+            Duration::ZERO,
+        )
+        .expect("tail");
+        let prompt = crate::coordination::notification_prompt("", "beta");
+        assert!(matches!(
+            start_claude_coordination_notification(
+                &state.context,
+                &tmux,
+                &candidate,
+                &prompt,
+                attached_tail,
+            ),
+            Err(ClaudeNotificationStartError::Known("recipient-attached"))
+        ));
+        assert!(!captured_prompt.exists());
+
+        fs::write(&attached_state, b"0\n").expect("detach session");
+        let tail = ProviderPromptTail::open_path(
+            ProviderKind::Claude,
+            "provider-beta",
+            transcript.clone(),
+            Duration::ZERO,
+        )
+        .expect("tail");
+        let tail = start_claude_coordination_notification(
+            &state.context,
+            &tmux,
+            &candidate,
+            &prompt,
+            tail,
+        )
+        .expect("start notification");
+        assert_eq!(
+            fs::read_to_string(&captured_prompt).expect("captured prompt"),
+            prompt
+        );
+        assert!(!prompt.contains(canary));
+        let commands = fs::read_to_string(&command_log).expect("command log");
+        assert!(commands.contains("display-message -p -t hs-claude-beta:0.0"));
+        assert!(commands.contains("paste-buffer"));
+        assert!(!commands.contains("paste-buffer -p"));
+        assert!(commands.contains("send-keys -t hs-claude-beta:0.0 Enter"));
+
+        let observed = format!(
+            "{}\n",
+            json!({
+                "type": "user",
+                "sessionId": "provider-beta",
+                "isSidechain": false,
+                "isMeta": false,
+                "promptSource": "typed",
+                "message": { "role": "user", "content": prompt }
+            })
+        );
+        fs::write(&transcript, observed).expect("append observed prompt");
+        assert!(observe_coordination_prompt(tail, &prompt));
+        crate::coordination::mark_notification_submitted(&state.context, &candidate)
+            .expect("mark submitted");
+
+        let registry: Value = serde_json::from_slice(
+            &fs::read(tmp.path().join("coordination/registry.json")).expect("registry"),
+        )
+        .expect("registry json");
+        let notification = registry["notifications"]
+            .as_object()
+            .expect("notifications")
+            .values()
+            .next()
+            .expect("notification");
+        assert!(!notification.to_string().contains(canary));
+        assert_eq!(notification["state"], "prompt_submitted");
     }
 
     #[tokio::test]

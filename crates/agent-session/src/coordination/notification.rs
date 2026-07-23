@@ -48,6 +48,7 @@ pub(crate) struct NotificationCandidate {
     pub target_session_id: String,
     pub target_incarnation: String,
     pub generation: u64,
+    pub attempted_at_epoch: i64,
 }
 
 pub(crate) fn fixed_prompt(_message_id: &str, session_id: &str) -> String {
@@ -178,6 +179,28 @@ pub(crate) fn pending_candidates(registry: &mut Registry, now: i64) -> Vec<Notif
             target_session_id: receipt.target_session_id.clone(),
             target_incarnation: receipt.target_incarnation.clone(),
             generation: receipt.generation,
+            attempted_at_epoch: receipt.attempted_at_epoch,
+        })
+        .collect()
+}
+
+pub(crate) fn unresolved_candidates(
+    registry: &mut Registry,
+    now: i64,
+) -> Vec<NotificationCandidate> {
+    normalize_registry(registry, now);
+    registry
+        .notifications
+        .values()
+        .filter(|receipt| {
+            matches!(receipt.state.as_str(), "attempting" | "attempt_unknown")
+                && receipt.attempted_generation > receipt.notified_generation
+        })
+        .map(|receipt| NotificationCandidate {
+            target_session_id: receipt.target_session_id.clone(),
+            target_incarnation: receipt.target_incarnation.clone(),
+            generation: receipt.attempted_generation,
+            attempted_at_epoch: receipt.attempted_at_epoch,
         })
         .collect()
 }
@@ -187,6 +210,17 @@ pub(crate) fn pending(context: &CliContext) -> Result<Vec<NotificationCandidate>
     let mut locked = super::lock_registry(context)?;
     let changed = normalize_registry(&mut locked.registry, now);
     let candidates = pending_candidates(&mut locked.registry, now);
+    if changed {
+        locked.save()?;
+    }
+    Ok(candidates)
+}
+
+pub(crate) fn unresolved(context: &CliContext) -> Result<Vec<NotificationCandidate>, CliError> {
+    let now = now_epoch();
+    let mut locked = super::lock_registry(context)?;
+    let changed = normalize_registry(&mut locked.registry, now);
+    let candidates = unresolved_candidates(&mut locked.registry, now);
     if changed {
         locked.save()?;
     }
@@ -232,6 +266,7 @@ fn transition_attempt(
         target_session_id: candidate.target_session_id.clone(),
         target_incarnation: candidate.target_incarnation.clone(),
         generation: receipt.attempted_generation,
+        attempted_at_epoch: receipt.attempted_at_epoch,
     })
 }
 
@@ -243,10 +278,21 @@ fn transition_submitted(
     let Some(receipt) = matching_attempt_mut(registry, candidate) else {
         return false;
     };
-    receipt.notified_generation = receipt.generation;
-    receipt.state = "prompt_submitted".to_string();
+    receipt.notified_generation = receipt.notified_generation.max(candidate.generation);
+    receipt.state = if receipt.generation > candidate.generation {
+        "queued".to_string()
+    } else {
+        "prompt_submitted".to_string()
+    };
     receipt.updated_at_epoch = now;
-    receipt.last_reason = Some("prompt-accepted".to_string());
+    receipt.last_reason = Some(
+        if receipt.state == "queued" {
+            REASON_PENDING
+        } else {
+            "prompt-accepted"
+        }
+        .to_string(),
+    );
     true
 }
 
@@ -311,7 +357,8 @@ fn matching_attempt_mut<'a>(
         &candidate.target_session_id,
         &candidate.target_incarnation,
     ))?;
-    (receipt.state == "attempting" && receipt.attempted_generation == candidate.generation)
+    (matches!(receipt.state.as_str(), "attempting" | "attempt_unknown")
+        && receipt.attempted_generation == candidate.generation)
         .then_some(receipt)
 }
 
@@ -402,6 +449,38 @@ pub(crate) fn defer(
     })
 }
 
+pub(crate) fn reconcile_submitted(
+    context: &CliContext,
+    candidate: &NotificationCandidate,
+) -> Result<bool, CliError> {
+    update_attempt(context, |registry, now| {
+        transition_submitted(registry, candidate, now)
+    })
+}
+
+pub(crate) fn reconcile_absent(
+    context: &CliContext,
+    candidate: &NotificationCandidate,
+) -> Result<bool, CliError> {
+    update_attempt(context, |registry, now| {
+        transition_reconciled_absent(registry, candidate, now)
+    })
+}
+
+fn transition_reconciled_absent(
+    registry: &mut Registry,
+    candidate: &NotificationCandidate,
+    now: i64,
+) -> bool {
+    let Some(receipt) = matching_attempt_mut(registry, candidate) else {
+        return false;
+    };
+    receipt.state = "queued".to_string();
+    receipt.updated_at_epoch = now;
+    receipt.next_attempt_at_epoch = now;
+    receipt.last_reason = Some(REASON_PENDING.to_string());
+    true
+}
 fn update_attempt(
     context: &CliContext,
     update: impl FnOnce(&mut Registry, i64) -> bool,
@@ -553,6 +632,7 @@ mod tests {
                 target_session_id: "target".to_string(),
                 target_incarnation: "incarnation".to_string(),
                 generation: 2,
+                attempted_at_epoch: 0,
             }]
         );
     }
@@ -565,6 +645,7 @@ mod tests {
             target_session_id: "target".to_string(),
             target_incarnation: "incarnation".to_string(),
             generation: scheduled.generation,
+            attempted_at_epoch: 0,
         };
         let candidate = transition_attempt(&mut registry, &queued, 101).expect("attempt");
         assert!(
@@ -601,6 +682,7 @@ mod tests {
             target_session_id: "target".to_string(),
             target_incarnation: "incarnation".to_string(),
             generation: scheduled.generation,
+            attempted_at_epoch: 0,
         };
         let candidate = transition_attempt(&mut registry, &queued, 101).expect("attempt");
         assert!(transition_known_failure(
@@ -621,6 +703,15 @@ mod tests {
             121
         ));
         assert!(pending_candidates(&mut registry, 10_000).is_empty());
+        assert_eq!(
+            unresolved_candidates(&mut registry, 121),
+            vec![NotificationCandidate {
+                attempted_at_epoch: 120,
+                ..candidate.clone()
+            }]
+        );
+        assert!(transition_reconciled_absent(&mut registry, &candidate, 122));
+        assert_eq!(pending_candidates(&mut registry, 122).len(), 1);
     }
 
     #[test]
