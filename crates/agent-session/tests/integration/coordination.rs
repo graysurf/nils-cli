@@ -1965,6 +1965,124 @@ fn mailbox_is_private_bounded_and_recipient_authenticated() {
 }
 
 #[test]
+fn cli_send_and_reply_share_recipient_generation_scheduling() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let state_dir = tmp.path().join("state");
+    fs::create_dir(&state_dir).expect("state");
+    seed_brokers(
+        &state_dir,
+        &[
+            (
+                "alpha",
+                "incarnation-alpha",
+                "alpha-private-capability-material",
+            ),
+            (
+                "beta",
+                "incarnation-beta",
+                "beta-private-capability-material",
+            ),
+        ],
+    );
+    let first_body = tmp.path().join("first.txt");
+    let second_body = tmp.path().join("second.txt");
+    let reply_body = tmp.path().join("reply.txt");
+    fs::write(&first_body, "first private body").expect("first body");
+    fs::write(&second_body, "second private body").expect("second body");
+    fs::write(&reply_body, "private reply").expect("reply body");
+    let state = state_dir.to_string_lossy();
+    let alpha_cap = capability(&state_dir, "alpha");
+    let beta_cap = capability(&state_dir, "beta");
+
+    let send = |body: &Path, key: &str| {
+        run(
+            tmp.path(),
+            &[
+                "--state-dir",
+                &state,
+                "message",
+                "send",
+                "--from",
+                "alpha",
+                "--to",
+                "beta",
+                "--body-file",
+                body.to_str().expect("body"),
+                "--capability-file",
+                &alpha_cap,
+                "--idempotency-key",
+                key,
+                "--format",
+                "json",
+            ],
+        )
+    };
+    let first = send(&first_body, "generation-send-0001");
+    assert_eq!(first.code, 0, "stderr={}", first.stderr_text());
+    let message_id = data(&first)["message_id"]
+        .as_str()
+        .expect("message id")
+        .to_string();
+    let replay = send(&first_body, "generation-send-0001");
+    assert_eq!(replay.code, 0, "stderr={}", replay.stderr_text());
+    assert_eq!(data(&replay)["message_id"], message_id);
+    let second = send(&second_body, "generation-send-0002");
+    assert_eq!(second.code, 0, "stderr={}", second.stderr_text());
+
+    let reply = run(
+        tmp.path(),
+        &[
+            "--state-dir",
+            &state,
+            "message",
+            "reply",
+            "--session",
+            "beta",
+            "--message",
+            &message_id,
+            "--if-revision",
+            "1",
+            "--body-file",
+            reply_body.to_str().expect("reply body"),
+            "--capability-file",
+            &beta_cap,
+            "--idempotency-key",
+            "generation-reply-0001",
+            "--format",
+            "json",
+        ],
+    );
+    assert_eq!(reply.code, 0, "stderr={}", reply.stderr_text());
+
+    let registry: serde_json::Value = serde_json::from_slice(
+        &fs::read(state_dir.join("coordination/registry.json")).expect("registry"),
+    )
+    .expect("registry json");
+    let notifications = registry["notifications"]
+        .as_object()
+        .expect("notifications");
+    assert_eq!(notifications.len(), 2);
+    let beta = notifications
+        .values()
+        .find(|receipt| receipt["target_session_id"] == "beta")
+        .expect("beta generation");
+    assert_eq!(
+        beta["schema_version"],
+        "agent-session.notification-generation.v1"
+    );
+    assert_eq!(beta["target_incarnation"], "incarnation-beta");
+    assert_eq!(beta["generation"], 2);
+    assert_eq!(beta["state"], "queued");
+    let alpha = notifications
+        .values()
+        .find(|receipt| receipt["target_session_id"] == "alpha")
+        .expect("alpha generation");
+    assert_eq!(alpha["target_incarnation"], "incarnation-alpha");
+    assert_eq!(alpha["generation"], 1);
+    assert_eq!(alpha["state"], "queued");
+}
+
+#[test]
 fn coordination_review_envelopes_identify_the_exact_operation() {
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let state_dir = tmp.path().join("state");

@@ -50,15 +50,6 @@ pub(crate) struct NotificationCandidate {
     pub generation: u64,
 }
 
-pub(crate) fn mark_queue_only(
-    registry: &mut Registry,
-    _message_id: &str,
-    target_session_id: &str,
-    target_incarnation: &str,
-) {
-    schedule(registry, target_session_id, target_incarnation, now_epoch());
-}
-
 pub(crate) fn fixed_prompt(_message_id: &str, session_id: &str) -> String {
     prompt_template().replace("<session-id>", session_id)
 }

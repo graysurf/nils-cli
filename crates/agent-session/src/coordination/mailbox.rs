@@ -795,11 +795,11 @@ fn send_authenticated(
         body,
     };
     let outcome = json_value(metadata(&message))?;
-    super::notification::mark_queue_only(
+    let _notification = super::notification::schedule(
         &mut locked.registry,
-        &message.message_id,
         &recipient.id,
         &recipient_incarnation,
+        now,
     );
     // Materialize the fixed template here so future delivery code cannot derive
     // it from the private body. Queue-only is authoritative when no server-side

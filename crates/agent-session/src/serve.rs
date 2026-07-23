@@ -19890,6 +19890,23 @@ exit 0
             .as_str()
             .expect("message id")
             .to_string();
+        let registry: Value = serde_json::from_slice(
+            &fs::read(tmp.path().join("coordination/registry.json")).expect("registry"),
+        )
+        .expect("registry json");
+        let notification = registry["notifications"]
+            .as_object()
+            .expect("notifications")
+            .values()
+            .next()
+            .expect("notification generation");
+        assert_eq!(
+            notification["schema_version"],
+            "agent-session.notification-generation.v1"
+        );
+        assert_eq!(notification["target_session_id"], "beta");
+        assert_eq!(notification["generation"], 1);
+        assert_eq!(notification["state"], "queued");
 
         let (status, inbox) = call(
             router(state.clone()),
