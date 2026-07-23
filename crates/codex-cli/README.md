@@ -15,7 +15,7 @@ Usage:
   codex-cli completion <shell>
 
 Groups:
-  agent           prompt | advice | knowledge | commit | resume | doctor
+  agent           prompt | advice | knowledge | commit | resume | run | doctor
   auth            login | use | save | remove | refresh | auto-refresh | status | current | sync | remote pull
   diag            rate-limits
   config          show | set
@@ -54,6 +54,10 @@ Help:
   `codex resume <SESSION_ID> --cd <cwd> --no-alt-screen` there, propagating Codex's exit status. Run it from any directory. Fails without
   launching Codex (`65`) when the id is unknown or matches more than one recorded directory; pass `--cd` to override the resolved directory
   for a repository that moved.
+- `run --capsule <dir> [--allow-host-access] [--format text|json]`: Validate
+  and run a private Execution Capsule through an inherited Codex supervisor.
+  Workspace capsules retain `workspace-write`; host capsules require the
+  operator to pass `--allow-host-access` and use `danger-full-access`.
 
 Agent flag notes:
 
@@ -70,6 +74,15 @@ Agent flag notes:
   commit exclusively to `semantic-commit`. The inherited path retains its
   compatibility fallback.
 - `resume --cd <dir>`: Bypass automatic cwd resolution and resume in `<dir>` (must be an existing directory).
+- `agent run` is separate from the isolated/inherited one-shot prompt modes. It
+  deliberately retains the current Codex home, project instructions, config,
+  and hooks; it never passes `--ignore-user-config`, `--ignore-rules`, or
+  `--dangerously-bypass-approvals-and-sandbox`.
+- The capsule's `run.sh` remains directly runnable with
+  `bash /absolute/capsule/run.sh`. The supervised route independently checks
+  the manifest, script digest, optional Git preconditions, and declared
+  validation commands, then writes owner-only JSONL/final/receipt artifacts.
+  See the [Execution Capsule v1 specification](docs/specs/execution-capsule-v1.md).
 
 ### auth
 
@@ -144,7 +157,7 @@ Auth examples:
 - Machine-readable JSON mode is explicit: use `--format json` (preferred) or `--json` where supported for compatibility.
 - Contract spec: `docs/specs/codex-cli-diag-rate-limits-and-auth-json-contract-v1.md`
 - Consumer runbook: `docs/runbooks/json-consumers.md`
-- Covered surfaces: `diag rate-limits` (single/all/async),
+- Covered surfaces: `agent run`, `diag rate-limits` (single/all/async),
   `auth login|use|save|remove|refresh|auto-refresh|status|current|sync|remote pull`, and `prompt-segment status`.
 
 ## Environment
@@ -189,7 +202,8 @@ Auth examples:
 
 - `0`: success and help output.
 - `64`: usage or argument errors.
-- `65`: `agent resume` could not resolve the session id (unknown or ambiguous).
+- `65`: invalid input data, including an invalid capsule, missing host-access
+  acknowledgement, or an `agent resume` id that cannot be resolved.
 - `1`: operational errors.
 
 ## Contract sign-off checklist
@@ -201,5 +215,6 @@ Auth examples:
 ## Docs
 
 - [Docs index](docs/README.md)
+- [Execution Capsule v1](docs/specs/execution-capsule-v1.md)
 - [Cross-lane parity contract](../../docs/specs/codex-gemini-cli-parity-contract-v1.md)
 - [JSON consumers runbook](docs/runbooks/json-consumers.md)

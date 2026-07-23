@@ -2,6 +2,7 @@ use std::io::{self, BufRead, Write};
 
 use crate::runtime::{AgentCommandProfile, AgentRuntimeMode, AgentRuntimeOptions, exec_isolated};
 
+pub mod capsule;
 pub mod commit;
 pub mod exec;
 pub mod resume;

@@ -5626,6 +5626,99 @@ fn main_agent_worker_start_batch_isolates_per_lane_results() {
 }
 
 #[test]
+fn main_agent_worker_start_await_ready_folds_timeout_into_readiness_failed() {
+    // T1 readiness fold (Part C acceptance): a bounded `--await-ready` that never
+    // observes the worker's checkpoint advance past `starting` must return a typed
+    // `readiness_failed` carrying the last assignment state and an actionable
+    // `safe_state`, not a bare error. The fake worker never checkpoints, so the
+    // bound always elapses — this deterministically exercises the timeout branch
+    // and verifies the diagnostic payload (Part F / F5).
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let state_dir = tmp.path().join("state");
+    let checkout = tmp.path().join("checkout");
+    fs::create_dir(&state_dir).expect("state");
+    init_checkout(&checkout, "https://example.invalid/example/repository.git");
+    seed_brokers_at(
+        &state_dir,
+        &[(
+            "main-one",
+            "main-incarnation-one",
+            "main-private-capability-material-0000000001",
+            checkout.as_path(),
+            Some("enforce"),
+        )],
+    );
+    let main_capability = init_main_run(tmp.path(), &state_dir, &checkout, "main-one", "run-one");
+    let (tmux_bin, tmux_log) = fake_tmux(tmp.path());
+    let codex_bin = fake_agent(tmp.path(), "codex-worker");
+
+    let assignment_path = tmp.path().join("assignment-await-ready.json");
+    write_private_json(
+        &assignment_path,
+        &json!({
+            "schema_version": "main-agent.assignment-input.v1",
+            "assignment_id": "assignment-await-ready",
+            "task_summary": "Exercise the await-ready readiness fold",
+            "task": {},
+            "launch": {
+                "agent": "codex",
+                "cwd": checkout,
+                "title": null,
+                "session_id": "worker-await-ready",
+                "coordination_mode": "enforce",
+                "agent_args": []
+            },
+            "repository": "example/repository",
+            "worktree": null,
+            "base_ref": "main",
+            "scopes": ["crates/agent-session"],
+            "durable_refs": []
+        }),
+    );
+    let tmux_arg = tmux_bin.to_string_lossy().into_owned();
+    let tmux_log_arg = tmux_log.to_string_lossy().into_owned();
+    let codex_arg = codex_bin.to_string_lossy().into_owned();
+    let started = run_main_agent(
+        &checkout,
+        &[
+            "--state-dir",
+            state_dir.to_str().expect("state dir"),
+            "worker",
+            "start",
+            "--assignment-file",
+            assignment_path.to_str().expect("assignment path"),
+            "--if-run-revision",
+            "1",
+            "--await-ready",
+            "1s",
+            "--idempotency-key",
+            "worker-start-await-ready-0001",
+            "--format",
+            "json",
+        ],
+        &[
+            ("AGENT_SESSION_CAPABILITY_FILE", &main_capability),
+            ("AGENT_SESSION_TMUX_BIN", &tmux_arg),
+            ("AGENT_SESSION_CODEX_BIN", &codex_arg),
+            ("AGENT_SESSION_FAKE_TMUX_LOG", &tmux_log_arg),
+        ],
+    );
+    assert_eq!(started.code, 0, "stderr={}", started.stderr_text());
+    let readiness = data(&started)["readiness"].clone();
+    assert_eq!(readiness["state"], "readiness_failed");
+    assert_eq!(readiness["assignment_state"], "starting");
+    assert_eq!(readiness["worker_launched"], true);
+    assert!(
+        readiness["safe_state"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("worker retire"),
+        "readiness_failed safe_state should guide teardown: {}",
+        readiness["safe_state"]
+    );
+}
+
+#[test]
 fn main_agent_quick_validates_before_launch() {
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let state_dir = tmp.path().join("state");

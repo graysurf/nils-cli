@@ -110,6 +110,15 @@ fn handle_agent(args: &cli::AgentArgs) -> i32 {
                 cwd: cd.clone(),
             })
         }
+        Some(cli::AgentCommand::Run {
+            capsule,
+            allow_host_access,
+            output,
+        }) => agent::capsule::run(&agent::capsule::RunOptions {
+            capsule: capsule.clone(),
+            allow_host_access: *allow_host_access,
+            json: output.is_json(),
+        }),
         Some(cli::AgentCommand::Doctor { output }) => {
             codex_cli::runtime::doctor_isolated(output.is_json())
         }

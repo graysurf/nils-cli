@@ -3480,6 +3480,17 @@ mod tests {
     }
 
     #[test]
+    fn readiness_from_state_maps_starting_to_failed_and_advanced_to_ready() {
+        // T1 readiness fold classification: only `starting` is not-yet-ready; any
+        // advanced state the worker's checkpoint reaches classifies as ready.
+        assert_eq!(readiness_from_state("starting"), "readiness_failed");
+        assert_eq!(readiness_from_state("working"), "ready");
+        assert_eq!(readiness_from_state("submitted"), "ready");
+        assert_eq!(readiness_from_state("accepted"), "ready");
+        assert_eq!(readiness_from_state("released"), "ready");
+    }
+
+    #[test]
     fn parse_await_ready_treats_zero_as_launch_only() {
         assert!(parse_await_ready("0").unwrap().is_none());
         assert!(parse_await_ready("0s").unwrap().is_none());

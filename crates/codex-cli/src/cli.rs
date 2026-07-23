@@ -128,6 +128,17 @@ pub enum AgentCommand {
         #[arg(long = "cd", value_name = "dir", value_hint = ValueHint::DirPath)]
         cd: Option<PathBuf>,
     },
+    /// Run an operator-prepared execution capsule under Codex supervision
+    Run {
+        /// Private capsule directory containing manifest.json and run.sh
+        #[arg(long = "capsule", value_name = "dir", value_hint = ValueHint::DirPath)]
+        capsule: PathBuf,
+        /// Explicitly acknowledge that a host-access capsule may run without filesystem sandboxing
+        #[arg(long = "allow-host-access")]
+        allow_host_access: bool,
+        #[command(flatten)]
+        output: OutputModeArgs,
+    },
     /// Check whether the isolated one-shot runtime is ready
     Doctor {
         #[command(flatten)]
