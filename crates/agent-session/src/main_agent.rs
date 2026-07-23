@@ -3,6 +3,8 @@ use std::ffi::OsString;
 use std::fs;
 use std::io::{self, Write};
 use std::path::PathBuf;
+use std::thread;
+use std::time::Duration;
 
 use clap::error::ErrorKind;
 use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum, ValueHint};
@@ -58,6 +60,9 @@ struct MainAgentCli {
 enum MainAgentCommand {
     /// Create or continuity-rebind this Main Agent's durable run.
     Init(InitArgs),
+    /// Re-bind this Main Agent's durable run to the current session incarnation
+    /// after a resume, reusing the stored objective packet (no packet file).
+    Rebind(RunMutationArgs),
     /// Inspect the authenticated Main Agent or worker identity.
     #[command(name = "self")]
     SelfGroup(SelfGroupArgs),
@@ -83,7 +88,7 @@ enum MainAgentCommand {
     Completion(CompletionArgs),
 }
 
-#[derive(Debug, Args)]
+#[derive(Clone, Debug, Args)]
 struct InitArgs {
     /// Private objective packet JSON file.
     #[arg(long, value_name = "PATH", value_hint = ValueHint::FilePath)]
@@ -112,7 +117,7 @@ enum SelfCommand {
     Show(ReadArgs),
 }
 
-#[derive(Debug, Args)]
+#[derive(Clone, Debug, Args)]
 struct ReadArgs {
     #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
     format: OutputFormat,
@@ -125,14 +130,14 @@ enum RehydrateFormat {
     Markdown,
 }
 
-#[derive(Debug, Args)]
+#[derive(Clone, Debug, Args)]
 struct RehydrateArgs {
     /// Recovery capsule output format.
     #[arg(long, value_enum, default_value_t = RehydrateFormat::Markdown)]
     format: RehydrateFormat,
 }
 
-#[derive(Debug, Args)]
+#[derive(Clone, Debug, Args)]
 struct CheckpointArgs {
     /// Private checkpoint input JSON file.
     #[arg(long, value_name = "PATH", value_hint = ValueHint::FilePath)]
@@ -146,13 +151,13 @@ struct CheckpointArgs {
     format: OutputFormat,
 }
 
-#[derive(Debug, Args)]
+#[derive(Clone, Debug, Args)]
 struct WorkerArgs {
     #[command(subcommand)]
     command: WorkerCommand,
 }
 
-#[derive(Debug, Subcommand)]
+#[derive(Clone, Debug, Subcommand)]
 enum WorkerCommand {
     /// Create an assignment and launch its interactive managed worker.
     Start(WorkerStartArgs),
@@ -170,7 +175,7 @@ enum WorkerCommand {
     Delete(AssignmentMutationArgs),
 }
 
-#[derive(Debug, Args)]
+#[derive(Clone, Debug, Args)]
 struct WorkerStartArgs {
     /// Private assignment packet JSON file.
     #[arg(long, value_name = "PATH", value_hint = ValueHint::FilePath)]
@@ -183,14 +188,14 @@ struct WorkerStartArgs {
     format: OutputFormat,
 }
 
-#[derive(Debug, Args)]
+#[derive(Clone, Debug, Args)]
 struct WorkerShowArgs {
     assignment_id: String,
     #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
     format: OutputFormat,
 }
 
-#[derive(Debug, Args)]
+#[derive(Clone, Debug, Args)]
 struct WorkerMessageArgs {
     assignment_id: String,
     /// Private message body file.
@@ -202,7 +207,7 @@ struct WorkerMessageArgs {
     format: OutputFormat,
 }
 
-#[derive(Debug, Args)]
+#[derive(Clone, Debug, Args)]
 struct AssignmentMutationArgs {
     assignment_id: String,
     #[arg(long, help = ASSIGNMENT_REVISION_HELP)]
@@ -213,7 +218,7 @@ struct AssignmentMutationArgs {
     format: OutputFormat,
 }
 
-#[derive(Debug, Args)]
+#[derive(Clone, Debug, Args)]
 struct RelationshipArgs {
     assignment_id: String,
     /// Exact live session ref, formatted as SESSION_ID@SESSION_INCARNATION.
@@ -227,7 +232,7 @@ struct RelationshipArgs {
     format: OutputFormat,
 }
 
-#[derive(Debug, Args)]
+#[derive(Clone, Debug, Args)]
 struct BorrowArgs {
     assignment_id: String,
     /// Exact live session ref, formatted as SESSION_ID@SESSION_INCARNATION.
@@ -243,7 +248,7 @@ struct BorrowArgs {
     format: OutputFormat,
 }
 
-#[derive(Debug, Args)]
+#[derive(Clone, Debug, Args)]
 struct HandoffArgs {
     assignment_id: String,
     /// Exact live Main Agent ref, formatted as SESSION_ID@SESSION_INCARNATION.
@@ -257,7 +262,7 @@ struct HandoffArgs {
     format: OutputFormat,
 }
 
-#[derive(Debug, Args)]
+#[derive(Clone, Debug, Args)]
 struct RunMutationArgs {
     #[arg(long, help = RUN_REVISION_HELP)]
     if_revision: u64,
@@ -401,22 +406,7 @@ fn dispatch(cli: MainAgentCli) -> i32 {
         Ok(context) => context,
         Err(error) => return render_error(command, format, error),
     };
-    let result = match cli.command {
-        MainAgentCommand::Init(args) => run_init(&context, args),
-        MainAgentCommand::SelfGroup(args) => match args.command {
-            SelfCommand::Show(args) => run_self_show(&context, args),
-        },
-        MainAgentCommand::Rehydrate(args) => run_rehydrate(&context, args),
-        MainAgentCommand::Status(args) => run_status(&context, args),
-        MainAgentCommand::Checkpoint(args) => run_checkpoint(&context, args),
-        MainAgentCommand::Worker(args) => run_worker(&context, args),
-        MainAgentCommand::Collaborate(args) => run_collaborate(&context, args),
-        MainAgentCommand::Borrow(args) => run_borrow(&context, args),
-        MainAgentCommand::Handoff(args) => run_handoff(&context, args),
-        MainAgentCommand::Adopt(args) => run_adopt(&context, args),
-        MainAgentCommand::Close(args) => run_close(&context, args),
-        MainAgentCommand::Completion(_) => unreachable!(),
-    };
+    let result = retry_transient_store(|| run_command(&context, &cli.command));
     match result {
         Ok(value) => {
             if command == "rehydrate" && matches!(format, OutputFormat::Text) {
@@ -426,6 +416,95 @@ fn dispatch(cli: MainAgentCli) -> i32 {
             }
         }
         Err(error) => render_error(command, format, error),
+    }
+}
+
+/// Execute one resolved Main Agent command. Split out from [`dispatch`] so the
+/// facade can re-run it under [`retry_transient_store`] without duplicating the
+/// command match. Each handler still owns its own claim, revision, and
+/// idempotency fences, so a re-run converges through those rather than
+/// duplicating an effect.
+fn run_command(context: &CliContext, command: &MainAgentCommand) -> Result<Value, CliError> {
+    match command {
+        MainAgentCommand::Init(args) => run_init(context, args.clone()),
+        MainAgentCommand::Rebind(args) => run_rebind(context, args.clone()),
+        MainAgentCommand::SelfGroup(args) => match &args.command {
+            SelfCommand::Show(args) => run_self_show(context, args.clone()),
+        },
+        MainAgentCommand::Rehydrate(args) => run_rehydrate(context, args.clone()),
+        MainAgentCommand::Status(args) => run_status(context, args.clone()),
+        MainAgentCommand::Checkpoint(args) => run_checkpoint(context, args.clone()),
+        MainAgentCommand::Worker(args) => run_worker(context, args.clone()),
+        MainAgentCommand::Collaborate(args) => run_collaborate(context, args.clone()),
+        MainAgentCommand::Borrow(args) => run_borrow(context, args.clone()),
+        MainAgentCommand::Handoff(args) => run_handoff(context, args.clone()),
+        MainAgentCommand::Adopt(args) => run_adopt(context, args.clone()),
+        MainAgentCommand::Close(args) => run_close(context, args.clone()),
+        MainAgentCommand::Completion(_) => unreachable!(),
+    }
+}
+
+// ---- T6: bounded auto-retry for transient orchestration-store conditions ----
+
+/// Transient orchestration-store conditions that are safe to auto-retry: the
+/// exclusive registry lock was never acquired (`orchestration-store-busy`) or an
+/// atomic store read/write never landed (`orchestration-store-unavailable`).
+/// Both leave durable state unchanged, so re-running the same command with the
+/// same idempotency key converges through idempotency replay and pending
+/// start/delete receipts rather than duplicating a side effect. Every other
+/// outcome (revision conflicts, usage errors, data errors) is surfaced
+/// unchanged so strict callers still see it immediately.
+const STORE_RETRY_CODES: [&str; 2] = [
+    "orchestration-store-busy",
+    "orchestration-store-unavailable",
+];
+const STORE_RETRY_MAX_ATTEMPTS: u32 = 3;
+const STORE_RETRY_BASE_DELAY: Duration = Duration::from_millis(50);
+
+fn is_store_retryable(error: &CliError) -> bool {
+    STORE_RETRY_CODES.contains(&error.code())
+}
+
+/// Run `attempt`, auto-retrying only the transient store conditions in
+/// [`STORE_RETRY_CODES`] with a bounded, linearly-backing-off delay. This retry
+/// policy lives in the facade layer; the low-level agent-session primitives stay
+/// non-retrying so strict automation still observes transient conditions
+/// directly.
+fn retry_transient_store<F>(attempt: F) -> Result<Value, CliError>
+where
+    F: FnMut() -> Result<Value, CliError>,
+{
+    retry_transient_store_inner(
+        STORE_RETRY_MAX_ATTEMPTS,
+        STORE_RETRY_BASE_DELAY,
+        attempt,
+        thread::sleep,
+    )
+}
+
+fn retry_transient_store_inner<F, S>(
+    max_attempts: u32,
+    base_delay: Duration,
+    mut attempt: F,
+    mut sleep: S,
+) -> Result<Value, CliError>
+where
+    F: FnMut() -> Result<Value, CliError>,
+    S: FnMut(Duration),
+{
+    let mut tries: u32 = 0;
+    loop {
+        tries += 1;
+        match attempt() {
+            Ok(value) => return Ok(value),
+            Err(error) => {
+                if tries >= max_attempts || !is_store_retryable(&error) {
+                    return Err(error);
+                }
+                // Linear backoff proportional to the attempt count.
+                sleep(base_delay.saturating_mul(tries));
+            }
+        }
     }
 }
 
@@ -565,6 +644,101 @@ fn run_init(context: &CliContext, args: InitArgs) -> Result<Value, CliError> {
         &incarnation,
         &args.idempotency_key,
         "init",
+        &request_digest,
+        outcome.clone(),
+    )?;
+    locked.save()?;
+    Ok(outcome)
+}
+
+/// Re-bind an existing run to the caller's current session incarnation after a
+/// resume, using the run's stored objective packet to re-acquire the
+/// work-context claim. Mirrors the continuity-rebind preconditions in
+/// [`run_init`] but requires no packet file: the server already holds the
+/// packet. A same-incarnation caller is a no-op that still confirms the claim.
+fn run_rebind(context: &CliContext, args: RunMutationArgs) -> Result<Value, CliError> {
+    validate_idempotency_key(&args.idempotency_key)?;
+    let (record, incarnation) = authenticated_self(context)?;
+
+    // Recover the run's stored objective packet (read-only) so the work-context
+    // claim can be re-acquired without the caller re-supplying the packet file.
+    let packet_digest = {
+        let registry = orchestration::load_registry_readonly(context)?;
+        let existing = registry
+            .runs
+            .values()
+            .find(|run| {
+                run.controller.session_id == record.id
+                    && run.controller.session_created_at == record.created_at
+            })
+            .ok_or_else(|| {
+                not_found(
+                    "orchestration-self-not-found",
+                    "authenticated session has no orchestration relationship",
+                )
+            })?;
+        existing.objective_packet_digest.clone()
+    };
+    let packet_value = orchestration::read_packet(context, &packet_digest)?;
+    let packet: ObjectivePacket = serde_json::from_value(packet_value)
+        .map_err(|_| invalid_input("stored objective packet is invalid"))?;
+    ensure_or_acquire_claim(
+        context,
+        &record,
+        &packet.work_context,
+        &args.idempotency_key,
+    )?;
+
+    let request_digest = crate::coordination::request_digest(
+        "main-agent-rebind",
+        &json!({ "if_revision": args.if_revision }),
+    );
+    let mut locked = orchestration::lock_registry(context)?;
+    if let Some(value) = idempotency_replay(
+        &locked.registry,
+        &record,
+        &incarnation,
+        &args.idempotency_key,
+        "rebind",
+        &request_digest,
+    )? {
+        return Ok(value);
+    }
+    let existing = locked
+        .registry
+        .runs
+        .values_mut()
+        .find(|run| {
+            run.controller.session_id == record.id
+                && run.controller.session_created_at == record.created_at
+        })
+        .ok_or_else(|| {
+            not_found(
+                "orchestration-self-not-found",
+                "authenticated session has no orchestration relationship",
+            )
+        })?;
+    let rebound = existing.controller.session_incarnation != incarnation;
+    if rebound {
+        ensure_revision(args.if_revision, existing.revision, "run")?;
+        if orchestration::session_ref_is_live(context, &existing.controller) {
+            return Err(CliError::data(
+                "controller-incarnation-still-live",
+                "prior controller incarnation is still live; continuity rebind refused",
+                Some(json!({ "run_id": existing.run_id, "current_revision": existing.revision })),
+            ));
+        }
+        existing.controller = session_ref(context, &record, &incarnation);
+        existing.revision = existing.revision.saturating_add(1);
+        existing.updated_at = timestamp();
+    }
+    let outcome = run_outcome(existing, rebound);
+    store_receipt(
+        &mut locked.registry,
+        &record,
+        &incarnation,
+        &args.idempotency_key,
+        "rebind",
         &request_digest,
         outcome.clone(),
     )?;
@@ -2116,6 +2290,7 @@ fn rebind_required() -> CliError {
 fn command_name(command: &MainAgentCommand) -> &'static str {
     match command {
         MainAgentCommand::Init(_) => "init",
+        MainAgentCommand::Rebind(_) => "rebind",
         MainAgentCommand::SelfGroup(_) => "self-show",
         MainAgentCommand::Rehydrate(_) => "rehydrate",
         MainAgentCommand::Status(_) => "status",
@@ -2141,6 +2316,7 @@ fn command_name(command: &MainAgentCommand) -> &'static str {
 fn command_output_format(command: &MainAgentCommand) -> OutputFormat {
     match command {
         MainAgentCommand::Init(args) => args.format,
+        MainAgentCommand::Rebind(args) => args.format,
         MainAgentCommand::SelfGroup(args) => match &args.command {
             SelfCommand::Show(args) => args.format,
         },
@@ -2250,4 +2426,90 @@ fn run_completion(shell: crate::completion::CompletionShell) -> i32 {
         }
     }
     exit::SUCCESS
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn busy() -> CliError {
+        CliError::unavailable("orchestration-store-busy", "busy", None)
+    }
+
+    #[test]
+    fn retries_transient_then_succeeds() {
+        let mut calls = 0u32;
+        let mut slept: Vec<Duration> = Vec::new();
+        let result = retry_transient_store_inner(
+            3,
+            Duration::from_millis(10),
+            || {
+                calls += 1;
+                if calls < 3 {
+                    Err(busy())
+                } else {
+                    Ok(json!({ "ok": true }))
+                }
+            },
+            |delay| slept.push(delay),
+        );
+        assert!(result.is_ok(), "expected success after transient retries");
+        assert_eq!(calls, 3, "should attempt three times");
+        assert_eq!(
+            slept,
+            vec![Duration::from_millis(10), Duration::from_millis(20)],
+            "linear backoff between the two retries",
+        );
+    }
+
+    #[test]
+    fn does_not_retry_non_retryable() {
+        let mut calls = 0u32;
+        let mut slept = 0u32;
+        let result = retry_transient_store_inner(
+            3,
+            Duration::from_millis(10),
+            || {
+                calls += 1;
+                Err(CliError::data("run-objective-conflict", "conflict", None))
+            },
+            |_| slept += 1,
+        );
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().code(), "run-objective-conflict");
+        assert_eq!(calls, 1, "non-retryable errors must not retry");
+        assert_eq!(slept, 0);
+    }
+
+    #[test]
+    fn exhausts_and_returns_last_error() {
+        let mut calls = 0u32;
+        let result = retry_transient_store_inner(
+            3,
+            Duration::from_millis(1),
+            || {
+                calls += 1;
+                Err(busy())
+            },
+            |_| {},
+        );
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().code(), "orchestration-store-busy");
+        assert_eq!(calls, 3, "should stop after max attempts");
+    }
+
+    #[test]
+    fn is_store_retryable_matches_only_transient_codes() {
+        assert!(is_store_retryable(&busy()));
+        assert!(is_store_retryable(&CliError::unavailable(
+            "orchestration-store-unavailable",
+            "io",
+            None,
+        )));
+        assert!(!is_store_retryable(&CliError::data(
+            "assignment-exists",
+            "exists",
+            None,
+        )));
+    }
 }
