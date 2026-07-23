@@ -20059,6 +20059,103 @@ exit 0
     }
 
     #[tokio::test]
+    async fn coordination_notification_startup_catchup_uses_one_acknowledged_codex_submission() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        seed_session_with_runtime(tmp.path(), "alpha", "codex", "hs-codex-alpha");
+        let launch_id = seed_codex_app_server_session(tmp.path(), "beta");
+        let state = state(tmp.path(), Some(TOKEN), minimal_tmux(tmp.path()));
+        let alpha = load_session_record(&state.context, "alpha").expect("alpha");
+        let beta = load_session_record(&state.context, "beta").expect("beta");
+        let alpha_capability = provision_ready_coordination_fixture(&state.context, &alpha);
+        provision_ready_coordination_fixture(&state.context, &beta);
+        crate::activity::activate_runtime(&state.context, &beta).expect("activate beta");
+        for (event_id, kind) in [
+            ("notification-turn-start", "turn_started"),
+            ("notification-turn-complete", "turn_completed"),
+        ] {
+            let event = serde_json::from_value(json!({
+                "schema_version": crate::activity::TURN_EVENT_VERSION,
+                "event_id": event_id,
+                "runtime_id": launch_id,
+                "provider": "codex",
+                "provider_turn_id": "notification-idle-turn",
+                "kind": kind,
+                "confidence": "authoritative"
+            }))
+            .expect("activity event");
+            crate::activity::ingest_event(&state.context, &beta.id, event).expect("ingest");
+        }
+
+        let canary = "CODEX-MAILBOX-BODY-MUST-NOT-REACH-PROMPT";
+        let (status, sent) = call(
+            router(state.clone()),
+            post_coordination(
+                "/sessions/beta/messages/v1",
+                alpha_capability.trim(),
+                json!({
+                    "body": canary,
+                    "idempotency_key": "notification-catchup-0001",
+                    "reply_to": null,
+                    "expires_in": null
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{sent}");
+
+        let (handle, mut commands) = codex_app_server::control_channel();
+        state.codex_controls.lock().unwrap().insert(
+            beta.id.clone(),
+            CodexControlEntry {
+                launch_id: launch_id.clone(),
+                handle,
+            },
+        );
+        let responder = tokio::spawn(async move {
+            let Some(codex_app_server::ControlCommand::Prompt { message, response }) =
+                commands.recv().await
+            else {
+                panic!("notification did not reach the Codex control plane");
+            };
+            assert_eq!(
+                message,
+                crate::coordination::notification_prompt("", "beta")
+            );
+            assert!(!message.contains(canary));
+            response
+                .send(Ok("turn-notification-catchup".to_string()))
+                .expect("acknowledge prompt");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            assert!(
+                commands.try_recv().is_err(),
+                "racing wakeups must not submit a duplicate generation"
+            );
+        });
+
+        let first = tokio::spawn(drain_coordination_notifications(state.clone()));
+        let second = tokio::spawn(drain_coordination_notifications(state.clone()));
+        first.await.expect("first wakeup");
+        second.await.expect("second wakeup");
+        responder.await.expect("responder");
+
+        let registry: Value = serde_json::from_slice(
+            &fs::read(tmp.path().join("coordination/registry.json")).expect("registry"),
+        )
+        .expect("registry json");
+        let notification = registry["notifications"]
+            .as_object()
+            .expect("notifications")
+            .values()
+            .next()
+            .expect("notification generation");
+        assert_eq!(notification["state"], "prompt_submitted");
+        assert_eq!(notification["generation"], 1);
+        assert_eq!(notification["notified_generation"], 1);
+        assert_eq!(registry["messages"][0]["state"], "unread");
+        assert!(!notification.to_string().contains(canary));
+    }
+
+    #[tokio::test]
     async fn coordination_wait_cancellation_releases_the_bounded_worker() {
         let tmp = tempfile::TempDir::new().expect("tempdir");
         seed_session_with_runtime(tmp.path(), "alpha", "codex", "hs-codex-alpha");
