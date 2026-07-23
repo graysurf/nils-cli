@@ -1049,13 +1049,16 @@ fn ensure_worker_launch_matches(
 ) -> Result<(), CliError> {
     let expected_cwd = fs::canonicalize(&input.launch.cwd)
         .map_err(|_| invalid_input("assignment launch cwd is unavailable"))?;
+    let worker_cwd_matches = fs::canonicalize(&worker.cwd)
+        .ok()
+        .is_some_and(|cwd| cwd == expected_cwd);
     let prompt_matches = worker
         .prompt_file
         .as_deref()
         .and_then(|path| fs::read_to_string(path).ok())
         .is_some_and(|prompt| prompt == expected_prompt);
     if worker.agent != input.launch.agent
-        || std::path::Path::new(&worker.cwd) != expected_cwd
+        || !worker_cwd_matches
         || worker.coordination_mode != input.launch.coordination_mode
         || !prompt_matches
     {
