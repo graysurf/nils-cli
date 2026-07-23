@@ -142,6 +142,17 @@ is no second state model.
 - `GET /sessions/{id}/buffer` — open on loopback. Returns the tmux server's
   latest global clipboard buffer after using `id` only to verify that the
   requested session exists. The buffer is not scoped to that session.
+- `POST /sessions/{id}/messages/v1` and
+  `POST /sessions/{id}/messages/{message_id}/reply/v1` persist unread mail and
+  schedule an eventual body-free mailbox notification. Their coordination
+  result adds `{ state, generation, notified_generation, last_reason?,
+  controller_available }` under `notification`; the active server sets
+  `controller_available: true`. Delivery is controller-owned and may occur
+  later when the exact managed Codex or Claude incarnation reaches its fenced
+  safe-input boundary. The response never implies that the message was read,
+  and it exposes no mailbox body, receipt key, capability, incarnation, or
+  provider turn identifier. The full state, adapter, and privacy contract is in
+  [Session coordination v1](session-coordination-v1.md#notification-ownership).
 - Every session view additively includes `auto_resume` using
   `agent-session.auto-resume.v1`. `GET /sessions/{id}/auto-resume` reads that
   status and is open on loopback; `PUT` with `{ "enabled": true|false }` opts a

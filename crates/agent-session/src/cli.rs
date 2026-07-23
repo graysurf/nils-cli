@@ -596,7 +596,7 @@ pub struct MessageArgs {
 
 #[derive(Debug, Subcommand)]
 pub enum MessageCommand {
-    /// Send one bounded private message as an authenticated session.
+    /// Send one bounded private message and schedule an eventual fixed notification.
     Send(MessageSendArgs),
     /// List bounded private mailbox metadata for the authenticated recipient.
     Inbox(MessageInboxArgs),
@@ -604,7 +604,7 @@ pub enum MessageCommand {
     Show(MessageShowArgs),
     /// Acknowledge one private message using revision compare-and-swap.
     Ack(MessageAckArgs),
-    /// Reply to one private message as its authenticated recipient.
+    /// Reply to one private message and schedule an eventual fixed notification.
     Reply(MessageReplyArgs),
     /// Wait a bounded duration for one message revision change.
     Wait(MessageWaitArgs),
@@ -619,6 +619,7 @@ pub struct MessageSendArgs {
     pub to_session: String,
     #[arg(long, value_name = "PATH", value_hint = ValueHint::FilePath)]
     pub body_file: PathBuf,
+    /// Private capability file; defaults to AGENT_SESSION_CAPABILITY_FILE.
     #[arg(long, value_name = "PATH", value_hint = ValueHint::FilePath)]
     pub capability_file: Option<PathBuf>,
     #[arg(long)]
@@ -636,6 +637,7 @@ pub struct MessageInboxArgs {
     /// Authenticated recipient session id.
     #[arg(long)]
     pub session: String,
+    /// Private capability file; defaults to AGENT_SESSION_CAPABILITY_FILE.
     #[arg(long, value_name = "PATH", value_hint = ValueHint::FilePath)]
     pub capability_file: Option<PathBuf>,
     #[arg(long)]
@@ -689,6 +691,7 @@ pub struct MessageReplyArgs {
     pub if_revision: u64,
     #[arg(long, value_name = "PATH", value_hint = ValueHint::FilePath)]
     pub body_file: PathBuf,
+    /// Private capability file; defaults to AGENT_SESSION_CAPABILITY_FILE.
     #[arg(long, value_name = "PATH", value_hint = ValueHint::FilePath)]
     pub capability_file: Option<PathBuf>,
     #[arg(long)]

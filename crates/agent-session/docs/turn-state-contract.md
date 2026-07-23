@@ -205,6 +205,13 @@ progress because it identifies a completed subagent without correlating that
 callback to active parent work; a late background callback must not resurrect a
 genuinely waiting parent turn. Positive progress never clears pending attention.
 
+Raw Claude `Stop` remains journal evidence and does not change the public
+`TurnPhase` by itself. The coordination notification controller applies a
+narrower input-safety rule: an exact-runtime `Stop` may authorize only the
+fixed body-free mailbox prompt after a short debounce with no later provider
+hook, no pending attention, and no attached tmux client. Any later provider
+event cancels that notification-only waiting signal.
+
 ## Deterministic transition rules
 
 | Input | Rule |

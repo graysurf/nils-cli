@@ -483,6 +483,26 @@ fn coordination_help_exposes_closed_work_context_and_mailbox_command_families() 
             "missing message command {command}: {message_help}"
         );
     }
+
+    let send = run(tmp.path(), &["message", "send", "--help"]);
+    assert_eq!(send.code, 0, "stderr={}", send.stderr_text());
+    assert!(send.stdout_text().contains("eventual fixed notification"));
+    assert!(
+        send.stdout_text()
+            .contains("defaults to AGENT_SESSION_CAPABILITY_FILE")
+    );
+
+    let inbox = run(tmp.path(), &["message", "inbox", "--help"]);
+    assert_eq!(inbox.code, 0, "stderr={}", inbox.stderr_text());
+    assert!(
+        inbox
+            .stdout_text()
+            .contains("defaults to AGENT_SESSION_CAPABILITY_FILE")
+    );
+
+    let reply = run(tmp.path(), &["message", "reply", "--help"]);
+    assert_eq!(reply.code, 0, "stderr={}", reply.stderr_text());
+    assert!(reply.stdout_text().contains("eventual fixed notification"));
 }
 
 #[test]

@@ -618,6 +618,36 @@ mod tests {
     }
 
     #[test]
+    fn mailbox_notification_fixture_matches_prompt_states_and_safe_projection() {
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../tests/fixtures/coordination/mailbox-notification-v1.json"
+        ))
+        .expect("notification fixture");
+        assert_eq!(fixture["prompt_template"], prompt_template());
+        assert_eq!(
+            fixture["states"],
+            json!([
+                "queued",
+                "attempting",
+                "prompt_submitted",
+                "attempt_unknown",
+                "undeliverable"
+            ])
+        );
+        assert_eq!(
+            fixture["projection"],
+            serde_json::to_value(NotificationProjection {
+                state: "queued".to_string(),
+                generation: 2,
+                notified_generation: 1,
+                last_reason: Some(REASON_PENDING.to_string()),
+                controller_available: false,
+            })
+            .expect("projection")
+        );
+    }
+
+    #[test]
     fn notification_generation_coalesces_by_recipient_incarnation() {
         let mut registry = Registry::default();
         let first = schedule(&mut registry, "target", "incarnation", 100);

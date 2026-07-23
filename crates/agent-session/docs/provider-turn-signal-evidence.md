@@ -155,6 +155,12 @@ Raw `Stop` is therefore treated exactly like Codex raw Stop. `idle_prompt` is a
 later provider notification explicitly meaning that Claude is done and waiting
 for another prompt, so it may yield observed Waiting.
 
+Coordination notification delivery uses a narrower `Stop` trust rule without
+changing the public turn-state reducer: the fixed mailbox prompt is eligible
+only after a no-reactivation debounce, exact runtime recheck, and
+`session_attached == 0`. It does not depend on the undocumented
+`stop_hook_active` payload field.
+
 General `PreToolUse` fires before every tool call, so the managed adapter installs
 it as observed progress. It can re-establish Working after an observed
 `idle_prompt`, closing the false-Waiting window before a long tool. `SubagentStop`
