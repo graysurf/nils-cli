@@ -80,8 +80,9 @@ Agent flag notes:
   `--dangerously-bypass-approvals-and-sandbox`.
 - The capsule's `run.sh` remains directly runnable with
   `bash /absolute/capsule/run.sh`. The supervised route independently checks
-  the manifest, script digest, optional Git preconditions, and declared
-  validation commands, then writes owner-only JSONL/final/receipt artifacts.
+  the manifest, script digest, optional Git preconditions, exact script
+  execution, post-supervision integrity, and declared validation commands,
+  then writes owner-only schema/JSONL/final/receipt artifacts.
   See the [Execution Capsule v1 specification](docs/specs/execution-capsule-v1.md).
 
 ### auth

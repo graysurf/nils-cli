@@ -119,6 +119,11 @@ fn handle_agent(args: &cli::AgentArgs) -> i32 {
             allow_host_access: *allow_host_access,
             json: output.is_json(),
         }),
+        Some(cli::AgentCommand::CapsuleExec {
+            capsule,
+            nonce,
+            validation_index,
+        }) => agent::capsule::sandbox_exec(capsule, nonce, *validation_index),
         Some(cli::AgentCommand::Doctor { output }) => {
             codex_cli::runtime::doctor_isolated(output.is_json())
         }

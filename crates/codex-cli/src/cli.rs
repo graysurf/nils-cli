@@ -139,6 +139,16 @@ pub enum AgentCommand {
         #[command(flatten)]
         output: OutputModeArgs,
     },
+    /// Internal sandbox-bound capsule command executor
+    #[command(hide = true)]
+    CapsuleExec {
+        #[arg(long = "capsule", value_name = "dir", value_hint = ValueHint::DirPath)]
+        capsule: PathBuf,
+        #[arg(long = "nonce", hide = true)]
+        nonce: String,
+        #[arg(long = "validation-index", hide = true)]
+        validation_index: Option<usize>,
+    },
     /// Check whether the isolated one-shot runtime is ready
     Doctor {
         #[command(flatten)]

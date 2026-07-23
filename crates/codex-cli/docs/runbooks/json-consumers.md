@@ -7,6 +7,7 @@ This runbook covers service consumption of `codex-cli` JSON output for:
 - `diag rate-limits` (single/all/async)
 - `auth login|use|save|remove|refresh|auto-refresh|status|current|sync|remote pull`
 - `prompt-segment status`
+- `agent run`
 
 Shared baseline guidance:
 
@@ -21,6 +22,10 @@ Codex-specific contract source:
 - `diag rate-limits` => `schema_version=codex-cli.diag.rate-limits.v1`
 - `auth *` => `schema_version=codex-cli.auth.v1`
 - `prompt-segment status` => `schema_version=codex-cli.prompt-segment.v1`
+- `agent run` success/post-preflight result =>
+  `schema_version=cli.codex-cli.execution-capsule.receipt.v1`
+- `agent run` preflight failure =>
+  `schema_version=cli.codex-cli.execution-capsule.error.v1`
 
 ## Codex-specific integration notes
 
@@ -40,6 +45,9 @@ Codex-specific contract source:
   - `secret-dir-not-configured`
   - `secret-dir-not-found`
   - `secret-dir-read-failed`
+- `agent run` keeps its detailed `result` on post-preflight failure and also
+  provides the required top-level `error`; preflight failures provide only
+  `error`.
 
 ## Consumer checklist
 
@@ -63,4 +71,5 @@ codex-cli auth status --format json
 codex-cli auth current --format json
 codex-cli auth remote pull --ssh g14 --name team --access-only --write-active --format json
 codex-cli prompt-segment status --format json
+codex-cli agent run --capsule /absolute/private/capsule --format json
 ```

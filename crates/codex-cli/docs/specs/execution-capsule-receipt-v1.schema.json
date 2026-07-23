@@ -1,0 +1,412 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "cli.codex-cli.execution-capsule.receipt.v1",
+  "type": "object",
+  "required": ["schema_version", "command", "ok", "result"],
+  "properties": {
+    "schema_version": {
+      "const": "cli.codex-cli.execution-capsule.receipt.v1"
+    },
+    "command": {
+      "const": "agent run"
+    },
+    "ok": {
+      "type": "boolean"
+    },
+    "error": {
+      "$ref": "#/$defs/error"
+    },
+    "result": {
+      "$ref": "#/$defs/result"
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "ok": {
+            "const": false
+          }
+        }
+      },
+      "then": {
+        "required": ["error"]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "ok": {
+            "const": true
+          }
+        }
+      },
+      "then": {
+        "not": {
+          "required": ["error"]
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "ok": {
+            "const": true
+          }
+        },
+        "required": ["ok"]
+      },
+      "then": {
+        "properties": {
+          "result": {
+            "type": "object",
+            "properties": {
+              "codex_exit_code": {
+                "const": 0
+              },
+              "script_runs": {
+                "minItems": 1,
+                "contains": {
+                  "type": "object",
+                  "required": ["terminal", "passed"],
+                  "properties": {
+                    "terminal": {
+                      "const": true
+                    },
+                    "passed": {
+                      "const": true
+                    }
+                  }
+                },
+                "minContains": 1,
+                "maxContains": 1
+              },
+              "script_passed": {
+                "const": true
+              },
+              "validation": {
+                "items": {
+                  "type": "object",
+                  "required": ["passed"],
+                  "properties": {
+                    "passed": {
+                      "const": true
+                    }
+                  }
+                }
+              },
+              "validations_passed": {
+                "const": true
+              },
+              "entrypoint_integrity_valid": {
+                "const": true
+              },
+              "helper_integrity_valid": {
+                "const": true
+              },
+              "final_report_valid": {
+                "const": true
+              },
+              "final": {
+                "type": "object",
+                "required": ["status"],
+                "properties": {
+                  "status": {
+                    "const": "succeeded"
+                  }
+                }
+              }
+            },
+            "not": {
+              "anyOf": [
+                {
+                  "required": ["codex_error"]
+                },
+                {
+                  "required": ["evidence_error"]
+                },
+                {
+                  "required": ["entrypoint_integrity_error"]
+                },
+                {
+                  "required": ["helper_integrity_error"]
+                },
+                {
+                  "required": ["final_report_error"]
+                },
+                {
+                  "required": ["receipt_error"]
+                }
+              ]
+            }
+          }
+        }
+      }
+    }
+  ],
+  "additionalProperties": true,
+  "$defs": {
+    "error": {
+      "type": "object",
+      "required": ["code", "message", "details"],
+      "properties": {
+        "code": {
+          "type": "string"
+        },
+        "message": {
+          "type": "string"
+        },
+        "details": {
+          "type": "object",
+          "required": ["receipt"],
+          "properties": {
+            "receipt": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": true
+        }
+      },
+      "additionalProperties": true
+    },
+    "execution_result": {
+      "type": "object",
+      "required": ["exit_code", "passed", "command", "events"],
+      "properties": {
+        "exit_code": {
+          "type": "integer"
+        },
+        "passed": {
+          "type": "boolean"
+        },
+        "command": {
+          "type": "string"
+        },
+        "events": {
+          "type": "string"
+        },
+        "error": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": true
+    },
+    "final_report": {
+      "type": "object",
+      "required": [
+        "status",
+        "summary",
+        "actions",
+        "validation",
+        "errors",
+        "recommendations"
+      ],
+      "properties": {
+        "status": {
+          "enum": ["succeeded", "failed", "blocked"]
+        },
+        "summary": {
+          "type": "string"
+        },
+        "actions": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "validation": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "errors": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "recommendations": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "result": {
+      "type": "object",
+      "required": [
+        "capsule",
+        "manifest_sha256",
+        "entrypoint_sha256",
+        "access",
+        "codex_exit_code",
+        "script_runs",
+        "script_passed",
+        "validation",
+        "validations_passed",
+        "helper_integrity_valid",
+        "entrypoint_integrity_valid",
+        "final_report_valid",
+        "final",
+        "artifacts",
+        "completed_at"
+      ],
+      "properties": {
+        "capsule": {
+          "type": "string"
+        },
+        "manifest_sha256": {
+          "type": "string",
+          "pattern": "^sha256:[0-9a-f]{64}$"
+        },
+        "entrypoint_sha256": {
+          "type": "string",
+          "pattern": "^sha256:[0-9a-f]{64}$"
+        },
+        "access": {
+          "enum": ["workspace", "host"]
+        },
+        "codex_exit_code": {
+          "type": "integer"
+        },
+        "codex_error": {
+          "type": "string"
+        },
+        "evidence_error": {
+          "type": "string"
+        },
+        "receipt_error": {
+          "type": "string"
+        },
+        "script_runs": {
+          "type": "array",
+          "allOf": [
+            {
+              "if": {
+                "minItems": 1
+              },
+              "then": {
+                "contains": {
+                  "type": "object",
+                  "required": ["terminal"],
+                  "properties": {
+                    "terminal": {
+                      "const": true
+                    }
+                  }
+                },
+                "minContains": 1,
+                "maxContains": 1
+              }
+            }
+          ],
+          "items": {
+            "allOf": [
+              {
+                "$ref": "#/$defs/execution_result"
+              },
+              {
+                "type": "object",
+                "required": ["phase", "terminal"],
+                "properties": {
+                  "phase": {
+                    "type": "string"
+                  },
+                  "terminal": {
+                    "type": "boolean"
+                  }
+                }
+              }
+            ]
+          }
+        },
+        "script_passed": {
+          "type": "boolean"
+        },
+        "validation": {
+          "type": "array",
+          "items": {
+            "allOf": [
+              {
+                "$ref": "#/$defs/execution_result"
+              },
+              {
+                "type": "object",
+                "required": ["name", "argv"],
+                "properties": {
+                  "name": {
+                    "type": ["string", "null"]
+                  },
+                  "argv": {
+                    "type": "array",
+                    "items": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            ]
+          }
+        },
+        "validations_passed": {
+          "type": "boolean"
+        },
+        "helper_integrity_valid": {
+          "type": "boolean"
+        },
+        "helper_integrity_error": {
+          "type": "string"
+        },
+        "entrypoint_integrity_valid": {
+          "type": "boolean"
+        },
+        "entrypoint_integrity_error": {
+          "type": "string"
+        },
+        "final_report_valid": {
+          "type": "boolean"
+        },
+        "final_report_error": {
+          "type": "string"
+        },
+        "final": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/final_report"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "artifacts": {
+          "type": "object",
+          "required": ["result_schema", "events", "final_report", "receipt"],
+          "properties": {
+            "result_schema": {
+              "type": "string"
+            },
+            "events": {
+              "type": "string"
+            },
+            "final_report": {
+              "type": "string"
+            },
+            "receipt": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": true
+        },
+        "completed_at": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "additionalProperties": true
+    }
+  }
+}
