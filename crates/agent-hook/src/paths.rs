@@ -36,7 +36,13 @@ pub fn agent_session_state_root() -> Result<PathBuf, HookError> {
 }
 
 pub fn ensure_private_state_dir(path: &Path, role: &str) -> Result<(), HookError> {
-    for ancestor in path.ancestors().collect::<Vec<_>>().into_iter().rev() {
+    let normalized_path = normalize_private_state_path(path);
+    for ancestor in normalized_path
+        .ancestors()
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+    {
         if ancestor.as_os_str().is_empty() {
             continue;
         }
@@ -57,7 +63,7 @@ pub fn ensure_private_state_dir(path: &Path, role: &str) -> Result<(), HookError
             }
         }
     }
-    match fs::symlink_metadata(path) {
+    match fs::symlink_metadata(&normalized_path) {
         Ok(metadata) => {
             if !metadata.is_dir()
                 || metadata.uid() != unsafe { libc::geteuid() }
@@ -70,19 +76,21 @@ pub fn ensure_private_state_dir(path: &Path, role: &str) -> Result<(), HookError
             }
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            fs::create_dir_all(path).map_err(|_| {
+            fs::create_dir_all(&normalized_path).map_err(|_| {
                 HookError::runtime(
                     format!("{role}-create-failed"),
                     format!("{role} directory create failed"),
                 )
             })?;
-            fs::set_permissions(path, fs::Permissions::from_mode(0o700)).map_err(|_| {
-                HookError::runtime(
-                    format!("{role}-mode-failed"),
-                    format!("{role} directory mode failed"),
-                )
-            })?;
-            let metadata = fs::symlink_metadata(path).map_err(|_| {
+            fs::set_permissions(&normalized_path, fs::Permissions::from_mode(0o700)).map_err(
+                |_| {
+                    HookError::runtime(
+                        format!("{role}-mode-failed"),
+                        format!("{role} directory mode failed"),
+                    )
+                },
+            )?;
+            let metadata = fs::symlink_metadata(&normalized_path).map_err(|_| {
                 HookError::runtime(
                     format!("{role}-unavailable"),
                     format!("{role} directory metadata is unavailable"),
@@ -107,6 +115,32 @@ pub fn ensure_private_state_dir(path: &Path, role: &str) -> Result<(), HookError
         }
     }
     Ok(())
+}
+
+fn normalize_private_state_path(path: &Path) -> PathBuf {
+    #[cfg(target_os = "macos")]
+    {
+        normalize_darwin_private_state_path(path)
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        path.to_path_buf()
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn normalize_darwin_private_state_path(path: &Path) -> PathBuf {
+    let Ok(darwin_var) = fs::canonicalize("/var") else {
+        return path.to_path_buf();
+    };
+    if darwin_var != Path::new("/private/var") {
+        return path.to_path_buf();
+    }
+    let Ok(suffix) = path.strip_prefix("/var") else {
+        return path.to_path_buf();
+    };
+    Path::new("/private/var").join(suffix)
 }
 
 fn config_home() -> Result<PathBuf, HookError> {
@@ -140,4 +174,24 @@ fn absolute(label: &str, path: PathBuf) -> Result<PathBuf, HookError> {
         ));
     }
     Ok(path)
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod tests {
+    use super::ensure_private_state_dir;
+
+    #[test]
+    fn ensure_private_state_dir_accepts_lexical_var_tmp_private_state_path() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        assert!(
+            temp.path().starts_with("/var"),
+            "tempdir should be lexically under /var: {}",
+            temp.path().display()
+        );
+        let path = temp.path().join("private-state");
+
+        ensure_private_state_dir(&path, "state-dir").expect("private state dir");
+
+        assert!(path.is_dir(), "state dir should exist");
+    }
 }
