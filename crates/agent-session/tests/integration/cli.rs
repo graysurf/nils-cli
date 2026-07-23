@@ -5956,7 +5956,7 @@ fn parse_context_data_and_session_reference_errors_follow_contract() {
 }
 
 #[test]
-fn list_projects_main_agent_relationship_without_changing_legacy_sessions() {
+fn list_projects_main_agent_relationship_without_changing_existing_sessions() {
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let state_dir = tmp.path().join("state");
     let main_id = "main-agent-session";

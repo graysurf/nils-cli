@@ -95,7 +95,7 @@ fi
 }
 
 #[test]
-fn agent_prompt_inherited_is_explicit_and_preserves_legacy_gate_and_home() {
+fn agent_prompt_inherited_is_explicit_and_preserves_existing_gate_and_home() {
     let _lock = GlobalStateLock::new();
     let temp = tempfile::tempdir().expect("tempdir");
     let stub_dir = temp.path().join("bin");
