@@ -5,14 +5,21 @@ use std::mem::MaybeUninit;
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+use std::os::unix::process::CommandExt;
 use std::path::{Component, Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::process::{Child, ChildStdout, Command, Stdio};
+use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
+use std::sync::mpsc::{Receiver, RecvTimeoutError};
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
 use chrono::Utc;
+use clap::ValueEnum;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
+
+use crate::runtime::{DISABLED_FEATURES, SupervisorError, SupervisorHome};
 
 const MANIFEST_SCHEMA: &str = "execution-capsule.v1";
 const RECEIPT_SCHEMA: &str = "cli.codex-cli.execution-capsule.receipt.v1";
@@ -22,13 +29,54 @@ const MAX_MANIFEST_BYTES: u64 = 64 * 1024;
 const MAX_ENTRYPOINT_BYTES: u64 = 1024 * 1024;
 const MAX_FINAL_BYTES: u64 = 64 * 1024;
 const MAX_EVENTS_BYTES: u64 = 32 * 1024 * 1024;
+/// Deadline for the first newline-terminated Codex JSONL event. It bounds a
+/// dead supervisor startup (for example a hung external tool initialization)
+/// without imposing any total model-execution timeout. Test-only override:
+/// `CODEX_CLI_CAPSULE_FIRST_EVENT_DEADLINE_MS`.
+const FIRST_EVENT_DEADLINE: Duration = Duration::from_secs(60);
+const FIRST_EVENT_DEADLINE_ENV: &str = "CODEX_CLI_CAPSULE_FIRST_EVENT_DEADLINE_MS";
+const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
+const TERMINATE_GRACE: Duration = Duration::from_secs(5);
+const SUPERVISOR_POLL: Duration = Duration::from_millis(50);
 static TEMP_FILE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+static SUPERVISOR_PROCESS_GROUP: AtomicI32 = AtomicI32::new(0);
+
+/// MCP policy for the Codex supervisor.
+///
+/// `disabled` is the default and the only mode a caller gets implicitly.
+/// `inherited` must be selected explicitly on the current invocation; no
+/// environment variable or configuration default can broaden the supervisor's
+/// external tool surface, and `disabled` never falls back to it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, ValueEnum)]
+#[clap(rename_all = "lower")]
+pub enum McpMode {
+    #[default]
+    Disabled,
+    Inherited,
+}
+
+impl McpMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Disabled => "disabled",
+            Self::Inherited => "inherited",
+        }
+    }
+
+    fn supervisor_runtime(self) -> &'static str {
+        match self {
+            Self::Disabled => "governance-projected",
+            Self::Inherited => "inherited",
+        }
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct RunOptions {
     pub capsule: PathBuf,
     pub allow_host_access: bool,
     pub json: bool,
+    pub mcp_mode: McpMode,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -152,6 +200,8 @@ struct ReceiptData {
     entrypoint_sha256: String,
     access: &'static str,
     evidence_trust: &'static str,
+    mcp_mode: &'static str,
+    supervisor_runtime: &'static str,
     codex_exit_code: i32,
     #[serde(skip_serializing_if = "Option::is_none")]
     codex_error: Option<String>,
@@ -206,6 +256,14 @@ struct CapsuleError {
     code: &'static str,
     message: String,
     exit_code: i32,
+    recovery: Option<Recovery>,
+}
+
+/// Typed, bounded recovery guidance. It never carries captured child output.
+#[derive(Clone, Copy, Debug)]
+struct Recovery {
+    retryable: &'static str,
+    next_action: &'static str,
 }
 
 impl CapsuleError {
@@ -214,6 +272,7 @@ impl CapsuleError {
             code,
             message: message.into(),
             exit_code: 65,
+            recovery: None,
         }
     }
 
@@ -222,7 +281,23 @@ impl CapsuleError {
             code,
             message: message.into(),
             exit_code: 1,
+            recovery: None,
         }
+    }
+
+    fn with_recovery(mut self, retryable: &'static str, next_action: &'static str) -> Self {
+        self.recovery = Some(Recovery {
+            retryable,
+            next_action,
+        });
+        self
+    }
+}
+
+impl From<SupervisorError> for CapsuleError {
+    fn from(error: SupervisorError) -> Self {
+        CapsuleError::invalid(error.code, error.message)
+            .with_recovery(error.retryable, error.next_action)
     }
 }
 
@@ -293,6 +368,17 @@ fn run_inner(options: &RunOptions) -> Result<i32, CapsuleError> {
         ));
     }
 
+    crate::runtime::refresh_remote_auth_before_exec();
+    // Preflight the supervisor runtime before any capsule artifact is created,
+    // so a fail-closed MCP policy rejection leaves the capsule untouched.
+    let supervisor = match options.mcp_mode {
+        McpMode::Disabled => Some(SupervisorHome::prepare(&capsule.cwd)?),
+        McpMode::Inherited => {
+            eprintln!("codex-cli agent run: MCP mode inherited; external tools may initialize");
+            None
+        }
+    };
+
     let schema_path = capsule.root.join("result.schema.json");
     let events_path = capsule.root.join("events.jsonl");
     let final_path = capsule.root.join("final.json");
@@ -317,9 +403,9 @@ fn run_inner(options: &RunOptions) -> Result<i32, CapsuleError> {
     })?;
     let final_capture_path = "/dev/fd/0";
 
-    crate::runtime::refresh_remote_auth_before_exec();
     let prompt = supervisor_prompt(&capsule, &helpers);
-    let codex_spawn = Command::new("codex")
+    let mut command = Command::new("codex");
+    command
         .args([
             "--ask-for-approval",
             "never",
@@ -328,7 +414,18 @@ fn run_inner(options: &RunOptions) -> Result<i32, CapsuleError> {
             "-C",
         ])
         .arg(&capsule.cwd)
-        .args(["--sandbox", capsule.manifest.access.sandbox(), "--json"])
+        .args(["--sandbox", capsule.manifest.access.sandbox(), "--json"]);
+    if let Some(supervisor) = &supervisor {
+        // Explicit capability disables plus a projected home that registers no
+        // MCP server: direct, plugin-provided, and app-provided MCP are all
+        // absent rather than merely unconfigured.
+        command.arg("--ephemeral");
+        for feature in DISABLED_FEATURES {
+            command.args(["--disable", feature]);
+        }
+        supervisor.apply(&mut command);
+    }
+    command
         .args(["--output-schema"])
         .arg(&schema_path)
         .args(["--output-last-message"])
@@ -337,38 +434,26 @@ fn run_inner(options: &RunOptions) -> Result<i32, CapsuleError> {
         .stdin(Stdio::from(final_capture_stdin))
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
-        .spawn();
-    let (codex_exit_code, codex_error, events_bytes, mut evidence_error) = match codex_spawn {
-        Ok(mut child) => {
-            let (bytes, read_error) = match child.stdout.take() {
-                Some(stdout) => read_bounded(
-                    stdout,
-                    MAX_EVENTS_BYTES,
-                    "events-unreadable",
-                    "events-too-large: Codex events exceed 32 MiB",
-                ),
-                None => (
-                    Vec::new(),
-                    Some("events-unreadable: Codex stdout pipe was unavailable".to_string()),
-                ),
-            };
-            let status = child.wait().map_err(|error| {
-                CapsuleError::runtime(
-                    "codex-exec-failed",
-                    format!("failed to wait for Codex supervisor: {error}"),
-                )
-            })?;
-            (status.code().unwrap_or(1), None, bytes, read_error)
-        }
-        Err(error) => (
-            127,
-            Some(format!(
-                "codex-exec-failed: failed to start Codex supervisor: {error}"
-            )),
-            Vec::new(),
-            None,
-        ),
-    };
+        .process_group(0);
+
+    if let Some(supervisor) = &supervisor {
+        supervisor.verify_project_configs()?;
+    }
+    eprintln!(
+        "codex-cli agent run: starting supervisor (mcp={})",
+        options.mcp_mode.as_str()
+    );
+    let supervision = supervise_codex(command)?;
+    if let Some(supervisor) = &supervisor {
+        supervisor.warn_if_auth_replaced(&mut std::io::stderr());
+    }
+    let SupervisionOutcome {
+        exit_code: codex_exit_code,
+        launch_error: codex_error,
+        startup_timeout,
+        events: events_bytes,
+        mut evidence_error,
+    } = supervision;
     let (final_bytes, mut final_capture_error) =
         if let Err(error) = final_capture.seek(SeekFrom::Start(0)) {
             (
@@ -450,6 +535,7 @@ fn run_inner(options: &RunOptions) -> Result<i32, CapsuleError> {
         };
     let ok = codex_exit_code == 0
         && codex_error.is_none()
+        && !startup_timeout
         && final_succeeded
         && evidence_error.is_none()
         && helper_integrity_valid
@@ -463,6 +549,8 @@ fn run_inner(options: &RunOptions) -> Result<i32, CapsuleError> {
         entrypoint_sha256: capsule.manifest.entrypoint_sha256.clone(),
         access: capsule.manifest.access.as_str(),
         evidence_trust: capsule.manifest.access.evidence_trust(),
+        mcp_mode: options.mcp_mode.as_str(),
+        supervisor_runtime: options.mcp_mode.supervisor_runtime(),
         codex_exit_code,
         codex_error: codex_error.clone(),
         evidence_error: evidence_error.clone(),
@@ -496,6 +584,7 @@ fn run_inner(options: &RunOptions) -> Result<i32, CapsuleError> {
             "error".to_string(),
             execution_error(
                 codex_exit_code,
+                startup_timeout,
                 codex_error.as_deref(),
                 evidence_error.as_deref(),
                 final_succeeded,
@@ -1452,6 +1541,232 @@ fn read_bounded<R: Read>(
     (bytes, read_error.or(oversized))
 }
 
+struct SupervisionOutcome {
+    exit_code: i32,
+    launch_error: Option<String>,
+    startup_timeout: bool,
+    events: Vec<u8>,
+    evidence_error: Option<String>,
+}
+
+struct EventReader {
+    handle: JoinHandle<(Vec<u8>, Option<String>)>,
+    first_event: Receiver<()>,
+    bytes_read: std::sync::Arc<AtomicU64>,
+}
+
+/// Run the Codex supervisor while observing startup progress.
+///
+/// Codex stdout is drained on a dedicated bounded reader so a full pipe can
+/// never deadlock the parent, and so the parent can detect the first complete
+/// JSONL event while still retaining the whole evidence stream. Progress goes
+/// to stderr only; JSON stdout stays a single documented envelope.
+fn supervise_codex(mut command: Command) -> Result<SupervisionOutcome, CapsuleError> {
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(error) => {
+            return Ok(SupervisionOutcome {
+                exit_code: 127,
+                launch_error: Some(format!(
+                    "codex-exec-failed: failed to start Codex supervisor: {error}"
+                )),
+                startup_timeout: false,
+                events: Vec::new(),
+                evidence_error: None,
+            });
+        }
+    };
+    install_signal_forwarding(child.id() as i32);
+    let reader = child.stdout.take().map(spawn_event_reader);
+    let missing_stdout = reader.is_none();
+
+    let mut startup_timeout = false;
+    let mut first_event_seen = missing_stdout;
+    let mut last_progress = Instant::now();
+    let mut last_bytes = 0;
+    let deadline = Instant::now() + first_event_deadline();
+    let mut status = None;
+    loop {
+        match child.try_wait() {
+            Ok(Some(exited)) => {
+                status = exited.code();
+                break;
+            }
+            Ok(None) => {}
+            Err(error) => {
+                clear_signal_forwarding();
+                return Err(CapsuleError::runtime(
+                    "codex-exec-failed",
+                    format!("failed to wait for Codex supervisor: {error}"),
+                ));
+            }
+        }
+        if let Some(reader) = &reader
+            && !first_event_seen
+        {
+            match reader.first_event.recv_timeout(SUPERVISOR_POLL) {
+                Ok(()) | Err(RecvTimeoutError::Disconnected) => {
+                    first_event_seen = true;
+                    last_progress = Instant::now();
+                }
+                Err(RecvTimeoutError::Timeout) => {
+                    if Instant::now() >= deadline {
+                        startup_timeout = true;
+                        break;
+                    }
+                }
+            }
+            continue;
+        }
+        std::thread::sleep(SUPERVISOR_POLL);
+        if let Some(reader) = &reader {
+            let seen = reader.bytes_read.load(Ordering::Relaxed);
+            if seen != last_bytes {
+                last_bytes = seen;
+                last_progress = Instant::now();
+            } else if last_progress.elapsed() >= HEARTBEAT_INTERVAL {
+                eprintln!("codex-cli agent run: supervisor still running");
+                last_progress = Instant::now();
+            }
+        }
+    }
+    if startup_timeout {
+        status = terminate_process_group(&mut child);
+    }
+    clear_signal_forwarding();
+
+    let (events, mut evidence_error) = match reader {
+        Some(reader) => reader.handle.join().unwrap_or_else(|_| {
+            (
+                Vec::new(),
+                Some("events-unreadable: the Codex event reader failed".to_string()),
+            )
+        }),
+        None => (
+            Vec::new(),
+            Some("events-unreadable: Codex stdout pipe was unavailable".to_string()),
+        ),
+    };
+    let launch_error = startup_timeout.then(|| {
+        evidence_error = None;
+        format!(
+            "codex-supervisor-startup-timeout: no Codex JSONL event within {} seconds",
+            first_event_deadline().as_secs_f32()
+        )
+    });
+    Ok(SupervisionOutcome {
+        exit_code: status.unwrap_or(1),
+        launch_error,
+        startup_timeout,
+        events,
+        evidence_error,
+    })
+}
+
+fn spawn_event_reader(stdout: ChildStdout) -> EventReader {
+    let (sender, first_event) = std::sync::mpsc::channel();
+    let bytes_read = std::sync::Arc::new(AtomicU64::new(0));
+    let counter = std::sync::Arc::clone(&bytes_read);
+    let handle = std::thread::spawn(move || {
+        let mut reader = stdout;
+        let mut bytes = Vec::new();
+        let mut buffer = [0_u8; 16 * 1024];
+        let mut error = None;
+        let mut signalled = false;
+        loop {
+            match reader.read(&mut buffer) {
+                Ok(0) => break,
+                Ok(count) => {
+                    counter.fetch_add(count as u64, Ordering::Relaxed);
+                    // Retain the same bounded evidence window as before, but keep
+                    // draining afterwards so an oversized stream cannot block the
+                    // child on a full pipe.
+                    if (bytes.len() as u64) <= MAX_EVENTS_BYTES {
+                        bytes.extend_from_slice(&buffer[..count]);
+                        if bytes.len() as u64 > MAX_EVENTS_BYTES {
+                            error =
+                                Some("events-too-large: Codex events exceed 32 MiB".to_string());
+                        }
+                    }
+                    if !signalled && buffer[..count].contains(&b'\n') {
+                        let _ = sender.send(());
+                        signalled = true;
+                    }
+                }
+                Err(read_error) => {
+                    if error.is_none() {
+                        error = Some(format!("events-unreadable: {read_error}"));
+                    }
+                    break;
+                }
+            }
+        }
+        (bytes, error)
+    });
+    EventReader {
+        handle,
+        first_event,
+        bytes_read,
+    }
+}
+
+fn first_event_deadline() -> Duration {
+    std::env::var(FIRST_EVENT_DEADLINE_ENV)
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|milliseconds| *milliseconds > 0)
+        .map(Duration::from_millis)
+        .unwrap_or(FIRST_EVENT_DEADLINE)
+}
+
+/// Terminate and reap the supervisor process group, escalating when the child
+/// ignores the first signal, so no orphaned Codex child keeps running.
+fn terminate_process_group(child: &mut Child) -> Option<i32> {
+    let group = child.id() as i32;
+    unsafe { libc::killpg(group, libc::SIGTERM) };
+    let grace = Instant::now() + TERMINATE_GRACE;
+    while Instant::now() < grace {
+        if let Ok(Some(status)) = child.try_wait() {
+            return status.code();
+        }
+        std::thread::sleep(SUPERVISOR_POLL);
+    }
+    unsafe { libc::killpg(group, libc::SIGKILL) };
+    child.wait().ok().and_then(|status| status.code())
+}
+
+extern "C" fn forward_supervisor_signal(signal: i32) {
+    let group = SUPERVISOR_PROCESS_GROUP.load(Ordering::SeqCst);
+    if group > 0 {
+        unsafe { libc::killpg(group, signal) };
+    }
+    unsafe {
+        libc::signal(signal, libc::SIG_DFL);
+        libc::raise(signal);
+    }
+}
+
+/// Keep operator interrupts working after the supervisor is moved into its own
+/// process group for group termination.
+fn install_signal_forwarding(group: i32) {
+    SUPERVISOR_PROCESS_GROUP.store(group, Ordering::SeqCst);
+    for signal in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP] {
+        unsafe {
+            libc::signal(
+                signal,
+                forward_supervisor_signal as *const () as libc::sighandler_t,
+            )
+        };
+    }
+}
+
+fn clear_signal_forwarding() {
+    SUPERVISOR_PROCESS_GROUP.store(0, Ordering::SeqCst);
+    for signal in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP] {
+        unsafe { libc::signal(signal, libc::SIG_DFL) };
+    }
+}
+
 fn helper_commands(capsule: &ValidatedCapsule) -> Result<HelperCommands, CapsuleError> {
     let source_path = std::env::current_exe().map_err(|error| {
         CapsuleError::runtime(
@@ -1934,20 +2249,27 @@ fn missing_execution_evidence(
     (Vec::new(), validation)
 }
 
+/// Accept an event only when the shell was asked to run exactly the expected
+/// helper command and nothing else.
+///
+/// Codex chooses the shell invocation form itself, and the projected supervisor
+/// home does not carry the operator's shell-snapshot feature, so both the login
+/// (`-lc`) and plain (`-c`) forms occur. The form is not the security property:
+/// the single-word check below is.
 fn event_command_matches(observed: &str, expected: &str) -> bool {
     if observed == expected {
         return true;
     }
-    let Some((_, shell_input)) = observed.split_once(" -lc ") else {
-        return false;
-    };
-    if shell_input == expected {
-        return true;
-    }
-    matches!(
-        shell_words::split(shell_input),
-        Ok(words) if words.len() == 1 && words[0] == expected
-    )
+    [" -lc ", " -c "]
+        .iter()
+        .filter_map(|separator| observed.split_once(separator))
+        .any(|(_, shell_input)| {
+            shell_input == expected
+                || matches!(
+                    shell_words::split(shell_input),
+                    Ok(words) if words.len() == 1 && words[0] == expected
+                )
+        })
 }
 
 fn find_attestation(
@@ -2084,6 +2406,7 @@ fn verify_capsule_integrity(capsule: &ValidatedCapsule) -> Result<(), CapsuleErr
 #[allow(clippy::too_many_arguments)]
 fn execution_error(
     codex_exit_code: i32,
+    startup_timeout: bool,
     codex_error: Option<&str>,
     evidence_error: Option<&str>,
     final_succeeded: bool,
@@ -2094,6 +2417,20 @@ fn execution_error(
     validations_passed: bool,
     receipt_path: &Path,
 ) -> Value {
+    if startup_timeout {
+        return json!({
+            "code": "codex-supervisor-startup-timeout",
+            "message": codex_error.unwrap_or(
+                "codex-supervisor-startup-timeout: the Codex supervisor produced no first event",
+            ),
+            "details": {
+                "receipt": receipt_path.display().to_string(),
+                "retryable": "conditional",
+                "next_action":
+                    "inspect local Codex runtime health, then retry or rerun with --mcp-mode inherited",
+            }
+        });
+    }
     let (code, message) = if let Some(error) = codex_error {
         ("codex-exec-failed", error.to_string())
     } else if codex_exit_code != 0 {
@@ -2157,6 +2494,12 @@ fn render_receipt(receipt: &Value, json_output: bool) {
     if let Some(trust) = data["evidence_trust"].as_str() {
         println!("evidence trust: {trust}");
     }
+    if let (Some(mode), Some(runtime)) = (
+        data["mcp_mode"].as_str(),
+        data["supervisor_runtime"].as_str(),
+    ) {
+        println!("mcp mode: {mode} (supervisor runtime: {runtime})");
+    }
     if let Some(summary) = data["final"]["summary"].as_str() {
         println!("summary: {summary}");
     }
@@ -2218,20 +2561,29 @@ fn render_receipt(receipt: &Value, json_output: bool) {
 
 fn render_error(error: &CapsuleError, json_output: bool) {
     if json_output {
+        let mut envelope = json!({
+            "schema_version": ERROR_SCHEMA,
+            "command": "agent run",
+            "ok": false,
+            "error": {
+                "code": error.code,
+                "message": error.message,
+            }
+        });
+        if let Some(recovery) = error.recovery {
+            envelope["error"]["details"] = json!({
+                "retryable": recovery.retryable,
+                "next_action": recovery.next_action,
+            });
+        }
         println!(
             "{}",
-            serde_json::to_string(&json!({
-                "schema_version": ERROR_SCHEMA,
-                "command": "agent run",
-                "ok": false,
-                "error": {
-                    "code": error.code,
-                    "message": error.message,
-                }
-            }))
-            .expect("error serialization")
+            serde_json::to_string(&envelope).expect("error serialization")
         );
     } else {
         eprintln!("codex-cli agent run: {}: {}", error.code, error.message);
+        if let Some(recovery) = error.recovery {
+            eprintln!("codex-cli agent run: next action: {}", recovery.next_action);
+        }
     }
 }

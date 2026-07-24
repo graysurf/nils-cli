@@ -9,12 +9,15 @@ use crate::auth::remote::{ENV_AUTH_REMOTE_NAME, ENV_AUTH_REMOTE_SSH};
 use crate::provider_profile::CODEX_PROVIDER_PROFILE;
 
 mod agent_mode;
+mod child_home;
 mod isolated;
+mod supervisor;
 
 pub use agent_mode::{AgentCommandProfile, AgentRuntimeMode, AgentRuntimeOptions};
 pub use isolated::{
     GeneratedCommitMessage, doctor_isolated, exec_isolated, generate_commit_message,
 };
+pub use supervisor::{DISABLED_FEATURES, SupervisorError, SupervisorHome};
 
 pub use nils_common::provider_runtime::ExecOptions;
 pub use nils_common::provider_runtime::{

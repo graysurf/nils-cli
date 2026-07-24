@@ -40,6 +40,9 @@ _codex-cli() {
             codex__cli__agent,advice)
                 cmd="codex__cli__agent__advice"
                 ;;
+            codex__cli__agent,capsule-exec)
+                cmd="codex__cli__agent__capsule__exec"
+                ;;
             codex__cli__agent,commit)
                 cmd="codex__cli__agent__commit"
                 ;;
@@ -58,8 +61,14 @@ _codex-cli() {
             codex__cli__agent,resume)
                 cmd="codex__cli__agent__resume"
                 ;;
+            codex__cli__agent,run)
+                cmd="codex__cli__agent__run"
+                ;;
             codex__cli__agent__help,advice)
                 cmd="codex__cli__agent__help__advice"
+                ;;
+            codex__cli__agent__help,capsule-exec)
+                cmd="codex__cli__agent__help__capsule__exec"
                 ;;
             codex__cli__agent__help,commit)
                 cmd="codex__cli__agent__help__commit"
@@ -78,6 +87,9 @@ _codex-cli() {
                 ;;
             codex__cli__agent__help,resume)
                 cmd="codex__cli__agent__help__resume"
+                ;;
+            codex__cli__agent__help,run)
+                cmd="codex__cli__agent__help__run"
                 ;;
             codex__cli__auth,auto-refresh)
                 cmd="codex__cli__auth__auto__refresh"
@@ -214,6 +226,9 @@ _codex-cli() {
             codex__cli__help__agent,advice)
                 cmd="codex__cli__help__agent__advice"
                 ;;
+            codex__cli__help__agent,capsule-exec)
+                cmd="codex__cli__help__agent__capsule__exec"
+                ;;
             codex__cli__help__agent,commit)
                 cmd="codex__cli__help__agent__commit"
                 ;;
@@ -228,6 +243,9 @@ _codex-cli() {
                 ;;
             codex__cli__help__agent,resume)
                 cmd="codex__cli__help__agent__resume"
+                ;;
+            codex__cli__help__agent,run)
+                cmd="codex__cli__help__agent__run"
                 ;;
             codex__cli__help__auth,auto-refresh)
                 cmd="codex__cli__help__auth__auto__refresh"
@@ -316,7 +334,7 @@ _codex-cli() {
             return 0
             ;;
         codex__cli__agent)
-            opts="-h --help prompt advice knowledge commit resume doctor help"
+            opts="-h --help prompt advice knowledge commit resume run capsule-exec doctor help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -338,6 +356,35 @@ _codex-cli() {
             case "${prev}" in
                 --runtime)
                     COMPREPLY=($(compgen -W "isolated inherited" -- "${cur}"))
+                    return 0
+                    ;;
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        codex__cli__agent__capsule__exec)
+            opts="-h --capsule --nonce --validation-index --help"
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                --capsule)
+                    COMPREPLY=()
+                    if [[ "${BASH_VERSINFO[0]}" -ge 4 ]]; then
+                        compopt -o plusdirs
+                    fi
+                    return 0
+                    ;;
+                --nonce)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --validation-index)
+                    COMPREPLY=($(compgen -f "${cur}"))
                     return 0
                     ;;
                 *)
@@ -384,7 +431,7 @@ _codex-cli() {
             return 0
             ;;
         codex__cli__agent__help)
-            opts="prompt advice knowledge commit resume doctor help"
+            opts="prompt advice knowledge commit resume run capsule-exec doctor help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -398,6 +445,20 @@ _codex-cli() {
             return 0
             ;;
         codex__cli__agent__help__advice)
+            opts=""
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        codex__cli__agent__help__capsule__exec)
             opts=""
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
@@ -495,6 +556,20 @@ _codex-cli() {
             COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
             return 0
             ;;
+        codex__cli__agent__help__run)
+            opts=""
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
         codex__cli__agent__knowledge)
             opts="-h --runtime --ephemeral --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
@@ -543,6 +618,35 @@ _codex-cli() {
                     if [[ "${BASH_VERSINFO[0]}" -ge 4 ]]; then
                         compopt -o plusdirs
                     fi
+                    return 0
+                    ;;
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        codex__cli__agent__run)
+            opts="-h --capsule --allow-host-access --mcp-mode --format --json --help"
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                --capsule)
+                    COMPREPLY=()
+                    if [[ "${BASH_VERSINFO[0]}" -ge 4 ]]; then
+                        compopt -o plusdirs
+                    fi
+                    return 0
+                    ;;
+                --mcp-mode)
+                    COMPREPLY=($(compgen -W "disabled inherited" -- "${cur}"))
+                    return 0
+                    ;;
+                --format)
+                    COMPREPLY=($(compgen -W "text json" -- "${cur}"))
                     return 0
                     ;;
                 *)
@@ -1197,7 +1301,7 @@ _codex-cli() {
             return 0
             ;;
         codex__cli__help__agent)
-            opts="prompt advice knowledge commit resume doctor"
+            opts="prompt advice knowledge commit resume run capsule-exec doctor"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -1211,6 +1315,20 @@ _codex-cli() {
             return 0
             ;;
         codex__cli__help__agent__advice)
+            opts=""
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        codex__cli__help__agent__capsule__exec)
             opts=""
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
@@ -1281,6 +1399,20 @@ _codex-cli() {
             return 0
             ;;
         codex__cli__help__agent__resume)
+            opts=""
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        codex__cli__help__agent__run)
             opts=""
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 4 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )

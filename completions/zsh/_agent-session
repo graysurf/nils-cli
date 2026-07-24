@@ -566,7 +566,7 @@ _arguments "${_arguments_options[@]}" : \
 '--from=[Authenticated managed session id sending the message]:FROM_SESSION:_default' \
 '--to=[]:TO_SESSION:_default' \
 '--body-file=[]:PATH:_files' \
-'--capability-file=[]:PATH:_files' \
+'--capability-file=[Private capability file; defaults to AGENT_SESSION_CAPABILITY_FILE]:PATH:_files' \
 '--idempotency-key=[]:IDEMPOTENCY_KEY:_default' \
 '--reply-to=[]:REPLY_TO:_default' \
 '--expires-in=[]:DURATION:_default' \
@@ -581,7 +581,7 @@ json\:"Single-record JSON envelope (snake_case)"))' \
 (inbox)
 _arguments "${_arguments_options[@]}" : \
 '--session=[Authenticated recipient session id]:SESSION:_default' \
-'--capability-file=[]:PATH:_files' \
+'--capability-file=[Private capability file; defaults to AGENT_SESSION_CAPABILITY_FILE]:PATH:_files' \
 '--state=[]:STATE:_default' \
 '--cursor=[]:CURSOR:_default' \
 '--limit=[]:LIMIT:_default' \
@@ -627,7 +627,7 @@ _arguments "${_arguments_options[@]}" : \
 '--message=[]:MESSAGE:_default' \
 '--if-revision=[]:IF_REVISION:_default' \
 '--body-file=[]:PATH:_files' \
-'--capability-file=[]:PATH:_files' \
+'--capability-file=[Private capability file; defaults to AGENT_SESSION_CAPABILITY_FILE]:PATH:_files' \
 '--idempotency-key=[]:IDEMPOTENCY_KEY:_default' \
 '--format=[]:FORMAT:((text\:"Human-readable text output (default)"
 json\:"Single-record JSON envelope (snake_case)"))' \
@@ -851,11 +851,11 @@ _agent-session__subcmd__logs_commands() {
 (( $+functions[_agent-session__subcmd__message_commands] )) ||
 _agent-session__subcmd__message_commands() {
     local commands; commands=(
-'send:Send one bounded private message as an authenticated session' \
+'send:Send one bounded private message and schedule an eventual fixed notification' \
 'inbox:List bounded private mailbox metadata for the authenticated recipient' \
 'show:Read one private message body as its authenticated recipient' \
 'ack:Acknowledge one private message using revision compare-and-swap' \
-'reply:Reply to one private message as its authenticated recipient' \
+'reply:Reply to one private message and schedule an eventual fixed notification' \
 'wait:Wait a bounded duration for one message revision change' \
     )
     _describe -t commands 'agent-session message commands' commands "$@"

@@ -48,6 +48,25 @@ Codex-specific contract source:
 - `agent run` keeps its detailed `result` on post-preflight failure and also
   provides the required top-level `error`; preflight failures provide only
   `error`.
+- `agent run` receipts carry the effective supervisor policy in
+  `result.mcp_mode` (`disabled|inherited`) and `result.supervisor_runtime`
+  (`governance-projected|inherited`). `disabled` always pairs with
+  `governance-projected` and `inherited` with `inherited`; branch on
+  `result.mcp_mode` when a consumer needs to know whether external MCP tools
+  could have been available.
+- `agent run` supervisor-policy failure codes, all with
+  `error.details.retryable` and `error.details.next_action`:
+  - `capsule-supervisor-unsupported` (`65`, preflight, not retryable)
+  - `capsule-supervisor-home-failed` (`65`, preflight, usually retryable)
+  - `capsule-supervisor-config-invalid` (`65`, preflight, not retryable)
+  - `capsule-project-mcp-undeclared` (`65`, preflight, not retryable)
+  - `codex-supervisor-startup-timeout` (`1`, post-preflight, conditionally
+    retryable, and always accompanied by a detailed `ok: false` receipt)
+- A consumer must never retry a `disabled`-mode rejection by silently switching
+  to `--mcp-mode inherited`; that widens the supervisor's external tool surface
+  and is an explicit operator decision.
+- `agent run` writes supervisor progress and the inherited-mode notice to
+  stderr only. JSON stdout stays a single envelope; do not parse stderr as JSON.
 
 ## Consumer checklist
 
@@ -72,4 +91,5 @@ codex-cli auth current --format json
 codex-cli auth remote pull --ssh g14 --name team --access-only --write-active --format json
 codex-cli prompt-segment status --format json
 codex-cli agent run --capsule /absolute/private/capsule --format json
+codex-cli agent run --capsule /absolute/private/capsule --mcp-mode inherited --format json
 ```

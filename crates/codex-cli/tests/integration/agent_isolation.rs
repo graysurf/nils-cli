@@ -79,6 +79,10 @@ fi
     assert!(log.contains("AUTH_KIND=symlink"));
     assert!(log.contains("HOME_ENTRY=auth.json"));
     assert!(!log.contains("HOME_ENTRY=AGENTS.md"));
+    // The shared child-home refactor must not give the isolated prompt runtime
+    // the capsule supervisor's governance projection.
+    assert!(!log.contains("HOME_ENTRY=config.toml"));
+    assert!(!log.contains("HOME_ENTRY=hooks.json"));
     assert!(log.contains("ARG_0=--ask-for-approval"));
     assert!(log.contains("--ignore-user-config"));
     assert!(log.contains("--ignore-rules"));

@@ -2343,6 +2343,7 @@ dependencies = [
  "sha2",
  "shell-words",
  "tempfile",
+ "toml",
 ]
 
 [[package]]

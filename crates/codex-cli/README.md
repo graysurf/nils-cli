@@ -54,7 +54,8 @@ Help:
   `codex resume <SESSION_ID> --cd <cwd> --no-alt-screen` there, propagating Codex's exit status. Run it from any directory. Fails without
   launching Codex (`65`) when the id is unknown or matches more than one recorded directory; pass `--cd` to override the resolved directory
   for a repository that moved.
-- `run --capsule <dir> [--allow-host-access] [--format text|json]`: Validate
+- `run --capsule <dir> [--allow-host-access] [--mcp-mode disabled|inherited]
+  [--format text|json]`: Validate
   and run a private Execution Capsule through a Codex supervisor.
   Workspace capsules retain `workspace-write`; host capsules require the
   operator to pass `--allow-host-access` and use `danger-full-access`. Host
@@ -77,9 +78,27 @@ Agent flag notes:
   compatibility fallback.
 - `resume --cd <dir>`: Bypass automatic cwd resolution and resume in `<dir>` (must be an existing directory).
 - `agent run` is separate from the isolated/inherited one-shot prompt modes. It
-  deliberately retains the current Codex home, project instructions, config,
-  and hooks; it never passes `--ignore-user-config`, `--ignore-rules`, or
-  `--dangerously-bypass-approvals-and-sandbox`.
+  deliberately retains project instructions, home instructions, hooks, rules,
+  signing, and sandboxing; it never passes `--ignore-user-config`,
+  `--ignore-rules`, or `--dangerously-bypass-approvals-and-sandbox`.
+- `--mcp-mode disabled` is the default. The supervisor runs in a private
+  governance-projected `CODEX_HOME` that carries home instructions, the hook
+  feature, hook tables, and rekeyed hook trust state, bridges authentication by
+  symlink, and registers no MCP server. Plugin and app discovery is disabled
+  explicitly, so no configured direct, plugin-provided, or app-provided MCP
+  server starts and no external OAuth refresh is attempted.
+- `--mcp-mode inherited` is an explicit per-invocation escape hatch that
+  restores the full active Codex home, including MCP, plugins, apps, and
+  skills. There is no environment variable or configuration default for it, and
+  `disabled` never falls back to it: a supervisor that cannot enforce the
+  no-MCP contract fails closed with `capsule-supervisor-unsupported`.
+- A project `.codex/config.toml` that declares MCP, plugin, app, or connector
+  authority fails closed with `capsule-project-mcp-undeclared` before Codex
+  starts. Use `--mcp-mode inherited` when a capsule genuinely needs it.
+- The runner prints its supervisor phase to stderr and terminates a supervisor
+  that produces no first JSONL event within an internal 60-second deadline with
+  `codex-supervisor-startup-timeout`, instead of appearing hung. The deadline
+  bounds startup only; there is no total model-execution timeout.
 - The capsule's `run.sh` remains directly runnable with
   `bash /absolute/capsule/run.sh`. The supervised route independently checks
   the manifest, script digest, optional Git preconditions, exact script

@@ -66,6 +66,12 @@ pub struct AgentArgs {
     pub command: Option<AgentCommand>,
 }
 
+/// `agent run` MCP policy selector for the Codex supervisor.
+///
+/// `inherited` is reachable only as an explicit flag on the current
+/// invocation; there is deliberately no environment or configuration default.
+pub type CapsuleMcpMode = codex_cli::agent::capsule::McpMode;
+
 #[derive(Subcommand)]
 pub enum AgentCommand {
     /// Run a raw prompt
@@ -136,6 +142,14 @@ pub enum AgentCommand {
         /// Acknowledge unsandboxed host access and supervisor-trusted evidence
         #[arg(long = "allow-host-access")]
         allow_host_access: bool,
+        /// MCP policy for the Codex supervisor
+        #[arg(
+            long = "mcp-mode",
+            value_enum,
+            value_name = "mode",
+            default_value = "disabled"
+        )]
+        mcp_mode: CapsuleMcpMode,
         #[command(flatten)]
         output: OutputModeArgs,
     },

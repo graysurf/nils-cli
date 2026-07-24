@@ -27,6 +27,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
 shell-words = { workspace = true }
+toml = { workspace = true }
 nils-term = { version = "1.25.10", path = "../nils-term", package = "nils-term" }
 nils-common = { version = "1.25.10", path = "../nils-common", package = "nils-common" }
 nils-provider-resume = { version = "1.25.10", path = "../nils-provider-resume", package = "nils-provider-resume" }

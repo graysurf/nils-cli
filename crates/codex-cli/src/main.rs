@@ -113,11 +113,13 @@ fn handle_agent(args: &cli::AgentArgs) -> i32 {
         Some(cli::AgentCommand::Run {
             capsule,
             allow_host_access,
+            mcp_mode,
             output,
         }) => agent::capsule::run(&agent::capsule::RunOptions {
             capsule: capsule.clone(),
             allow_host_access: *allow_host_access,
             json: output.is_json(),
+            mcp_mode: *mcp_mode,
         }),
         Some(cli::AgentCommand::CapsuleExec {
             capsule,

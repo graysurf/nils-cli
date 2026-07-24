@@ -1,15 +1,14 @@
-use std::collections::{BTreeMap, HashSet};
-use std::ffi::OsString;
+use std::collections::BTreeMap;
 use std::fs;
 use std::io::Write;
-use std::os::unix::fs::{PermissionsExt, symlink};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Command, Stdio};
 
 use serde::Deserialize;
 use serde_json::json;
 
 use super::AgentCommandProfile;
+use super::child_home::{self, ChildHome};
 
 const REQUIRED_FLAGS: [&str; 5] = [
     "--ignore-user-config",
@@ -35,7 +34,7 @@ const PROJECT_INSTRUCTION_SENTINEL: &str =
 const DOCTOR_HOOK_FILE_ENV: &str = "CODEX_CLI_DOCTOR_HOOK_FILE";
 
 struct IsolatedHome {
-    directory: tempfile::TempDir,
+    home: ChildHome,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
@@ -56,37 +55,17 @@ impl IsolatedHome {
     }
 
     fn create_without_refresh() -> Result<Self, String> {
-        let original_home = original_codex_home();
-        let auth_source = auth_source(&original_home);
-        let directory = std::env::var_os("XDG_RUNTIME_DIR")
-            .map(PathBuf::from)
-            .filter(|path| path.is_dir())
-            .and_then(|path| {
-                tempfile::Builder::new()
-                    .prefix("codex-cli-agent-")
-                    .tempdir_in(path)
-                    .ok()
-            })
-            .or_else(|| {
-                tempfile::Builder::new()
-                    .prefix("codex-cli-agent-")
-                    .tempdir()
-                    .ok()
-            })
-            .ok_or_else(|| {
-                "isolated-home-create-failed: could not create temporary CODEX_HOME".to_string()
-            })?;
-        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700))
+        let original_home = child_home::original_codex_home();
+        let auth_source = child_home::auth_source(&original_home);
+        let home = ChildHome::create("codex-cli-agent-")
             .map_err(|error| format!("isolated-home-create-failed: {error}"))?;
-        if let Some(source) = auth_source {
-            symlink(&source, directory.path().join("auth.json"))
-                .map_err(|error| format!("isolated-auth-bridge-unavailable: {error}"))?;
-        }
-        Ok(Self { directory })
+        home.bridge_auth(auth_source.as_deref())
+            .map_err(|error| format!("isolated-auth-bridge-unavailable: {error}"))?;
+        Ok(Self { home })
     }
 
     fn path(&self) -> &Path {
-        self.directory.path()
+        self.home.path()
     }
 }
 
@@ -258,29 +237,13 @@ fn probe_capabilities(profile: AgentCommandProfile) -> Result<(), String> {
 }
 
 fn capability_report(profile: AgentCommandProfile) -> CapabilityReport {
-    let help = Command::new("codex").args(["exec", "--help"]).output();
-    let help_words = help
-        .ok()
-        .filter(|output| output.status.success())
-        .map(|output| String::from_utf8_lossy(&output.stdout).into_owned())
-        .unwrap_or_default()
-        .split_whitespace()
-        .map(str::to_string)
-        .collect::<HashSet<_>>();
+    let help_words = child_home::codex_exec_help_words();
     let flags = REQUIRED_FLAGS
         .iter()
         .map(|flag| (*flag, help_words.contains(*flag)))
         .collect::<BTreeMap<_, _>>();
 
-    let features = Command::new("codex").args(["features", "list"]).output();
-    let available_features = features
-        .ok()
-        .filter(|output| output.status.success())
-        .map(|output| String::from_utf8_lossy(&output.stdout).into_owned())
-        .unwrap_or_default()
-        .split_whitespace()
-        .map(str::to_string)
-        .collect::<HashSet<_>>();
+    let available_features = child_home::codex_feature_names();
     let mut required = REQUIRED_FEATURES.to_vec();
     if profile == AgentCommandProfile::Commit {
         required.extend(COMMIT_DISABLED_FEATURES);
@@ -349,7 +312,7 @@ timeout = 5
         .env(DOCTOR_HOOK_FILE_ENV, &hook_file)
         .stdin(Stdio::null())
         .stderr(Stdio::null());
-    remove_control_environment(&mut command);
+    child_home::remove_control_environment(&mut command);
     let Ok(output) = command.output() else {
         return (false, false);
     };
@@ -405,7 +368,7 @@ fn isolated_command(home: &IsolatedHome, profile: AgentCommandProfile) -> Comman
         .args(["-c", &format!("model_reasoning_effort=\"{reasoning}\"")])
         .args(["--sandbox", sandbox])
         .env("CODEX_HOME", home.path());
-    remove_control_environment(&mut command);
+    child_home::remove_control_environment(&mut command);
     command
 }
 
@@ -455,61 +418,5 @@ fn validate_generated_message(message: &GeneratedCommitMessage) -> Result<(), St
 }
 
 fn warn_if_auth_replaced(home: &IsolatedHome, stderr: &mut impl Write) {
-    let auth = home.path().join("auth.json");
-    if auth.exists()
-        && fs::symlink_metadata(&auth)
-            .map(|metadata| !metadata.file_type().is_symlink())
-            .unwrap_or(false)
-    {
-        let _ = writeln!(
-            stderr,
-            "isolated-auth-write-not-propagated: child auth replacement was not copied back"
-        );
-    }
-}
-
-fn original_codex_home() -> PathBuf {
-    std::env::var_os("CODEX_HOME")
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".codex")))
-        .unwrap_or_else(|| PathBuf::from(".codex"))
-}
-
-fn auth_source(original_home: &Path) -> Option<PathBuf> {
-    std::env::var_os("CODEX_AUTH_FILE")
-        .map(PathBuf::from)
-        .filter(|path| path.is_file())
-        .or_else(|| super::resolve_auth_file().filter(|path| path.is_file()))
-        .or_else(|| Some(original_home.join("auth.json")).filter(|path| path.is_file()))
-        .and_then(|path| fs::canonicalize(path).ok())
-}
-
-fn remove_control_environment(command: &mut Command) {
-    let exact = [
-        "CODEX_AUTH_FILE",
-        "CODEX_SECRET_DIR",
-        "CODEX_SECRET_CACHE_DIR",
-        "CODEX_CLI_AGENT_RUNTIME",
-    ];
-    for name in exact {
-        command.env_remove(name);
-    }
-    let prefixes = [
-        "CODEX_AUTH_REMOTE_",
-        "AGENT_DOCS_",
-        "AGENT_SESSION_",
-        "AGENT_HOOK_",
-        "AGENT_EVIDENCE_",
-    ];
-    let names = std::env::vars_os()
-        .map(|(name, _)| name)
-        .filter(|name| {
-            let name = name.to_string_lossy();
-            prefixes.iter().any(|prefix| name.starts_with(prefix))
-        })
-        .collect::<Vec<OsString>>();
-    for name in names {
-        command.env_remove(name);
-    }
+    child_home::warn_if_auth_replaced(home.path(), stderr);
 }

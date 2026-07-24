@@ -243,6 +243,8 @@
         "entrypoint_sha256",
         "access",
         "evidence_trust",
+        "mcp_mode",
+        "supervisor_runtime",
         "codex_exit_code",
         "script_runs",
         "script_passed",
@@ -272,6 +274,12 @@
         },
         "evidence_trust": {
           "enum": ["sandbox-attested", "supervisor-trusted"]
+        },
+        "mcp_mode": {
+          "enum": ["disabled", "inherited"]
+        },
+        "supervisor_runtime": {
+          "enum": ["governance-projected", "inherited"]
         },
         "codex_exit_code": {
           "type": "integer"
@@ -441,6 +449,40 @@
             "properties": {
               "evidence_trust": {
                 "const": "supervisor-trusted"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "mcp_mode": {
+                "const": "disabled"
+              }
+            },
+            "required": ["mcp_mode"]
+          },
+          "then": {
+            "properties": {
+              "supervisor_runtime": {
+                "const": "governance-projected"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "mcp_mode": {
+                "const": "inherited"
+              }
+            },
+            "required": ["mcp_mode"]
+          },
+          "then": {
+            "properties": {
+              "supervisor_runtime": {
+                "const": "inherited"
               }
             }
           }
