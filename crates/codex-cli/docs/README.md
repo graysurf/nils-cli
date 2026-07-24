@@ -14,7 +14,7 @@
 
 ## Reports
 
-- None yet. Add documents under `docs/reports/` and register them here.
+- [Codex CLI `agent run` MCP policy implementation handoff](reports/2026-07-25-agent-run-mcp-policy-implementation-handoff.md)
 
 ## Links
 
