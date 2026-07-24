@@ -82,6 +82,7 @@ edits those literals in this one file.
 
 Launch chain — `launch_script()` (approx. `:552-708`), a POSIX script handed to
 `tmux … sh -c`:
+
 1. `"$agent" app-server --listen "unix://$socket"` (`:590`) — the codex
    app-server; its stderr is teed to `$startup_diagnostic_pipe`.
 2. `"$proxy_bin" --state-dir "$state_dir" codex-app-server-proxy --id
@@ -100,13 +101,15 @@ exit, logs `warning: Codex app-server control ended: {err}` — `serve.rs`
 (approx. `:4772-4798`).
 
 Control WS + handshake — `run_control` (approx. `:2018-2046`):
-```
+
+```text
 let stream = connect_socket(&socket).await?;               // UnixStream::connect
 let (mut websocket, _) = tokio_tungstenite::client_async("ws://localhost", stream) // :2029
 send_json(&mut websocket, initialize_request(request_id)).await?;
 receive_response_with_timeout(… CONTROL_RESPONSE_TIMEOUT).map_err(|e| format!("initialize failed: {e}"))?;
 send_json(&mut websocket, initialized_notification()).await?;
 ```
+
 Proxy — `run_proxy_session` (approx. `:3428-3472`): accepts the codex `--remote`
 client as a WS server (`accept_async_with_config`) and dials upstream to the
 app-server as a WS client (`client_async_with_config("ws://localhost", …)`);
@@ -115,6 +118,7 @@ frame/message caps `MAX_PROXY_MESSAGE_BYTES` 16 MiB / `MAX_PROXY_FRAME_BYTES`
 
 Inline builders (approx. `:1519-1596`) — **current code, note the missing
 `"jsonrpc"` envelope field**:
+
 ```rust
 fn initialize_request(id) -> json!({ "id": id, "method": "initialize", "params": {
     "clientInfo": { "name": "agent-session", "title": "agent-session", "version": env!("CARGO_PKG_VERSION") },
@@ -127,6 +131,7 @@ fn external_auth_login_request(...) -> "account/login/start" { "type":"chatgptAu
 fn external_auth_refresh_response(...) -> { "id", "result": { "accessToken", "chatgptAccountId", "chatgptPlanType" } }
 fn continuation_request(id, thread_id, message) -> "turn/start" { "threadId", "input":[{ "type":"text","text","text_elements":[] }] }
 ```
+
 Inbound handling also references `account/chatgptAuthTokens/refresh`,
 `mcpServer/elicitation/request`, `serverRequest/resolved`, `thread/start`
 (approx. `:2948-3110`).
@@ -137,10 +142,12 @@ Response parsing is **loose** (`serde_json::Value.get(...)`, e.g.
 response fields do NOT break parsing.
 
 Version gate — `codex_app_server.rs:60-61`:
+
 ```rust
 const MINIMUM_APP_SERVER_VERSION: (u64, u64, u64) = (0, 144, 1);
 const AUDITED_EXACT_ATTENTION_VERSIONS: &[(u64,u64,u64)] = &[(0,144,1),(0,144,3)];
 ```
+
 `PROTOCOL_VERSION = "v2"` (`:39`) is only agent-session's own metadata tag stored
 in the session record — it is NOT sent to codex.
 Capability probe `app_server_probe` (approx. `:235-271`) runs
@@ -151,6 +158,7 @@ this gate passes.
 ## 4. Root cause — confirmed vs excluded vs hypotheses
 
 **Confirmed:**
+
 - The break is entirely on the serve→codex-app-server chain; codex TUI is fine.
 - codex 0.145.0 `app-server --listen unix://<sock>` **starts fine standalone,
   creates the socket, and completes the WebSocket upgrade** (a raw
@@ -161,6 +169,7 @@ this gate passes.
   standalone listener does not).
 
 **Excluded (ruled out):**
+
 - Version gate — 0.145.0 ≥ `(0,144,1)` passes; and it is correctly handled as
   hook attention authority (0.145.0 ∉ `AUDITED_EXACT_ATTENTION_VERSIONS`, which
   is the intended fallback; there are already tests feeding `codex-cli 0.145.0`).
@@ -178,6 +187,7 @@ this gate passes.
   cause a connect-time reset.
 
 **Top hypotheses to confirm in §5 (ordered by likelihood):**
+
 1. **JSON-RPC envelope tightening.** agent-session's request builders omit the
    `"jsonrpc": "2.0"` field (see §3). If codex 0.145.0's app-server now enforces
    JSON-RPC 2.0 envelope validation and hangs up on a request without
@@ -203,14 +213,17 @@ Use codex **0.145.0** (the fnm binary) without disturbing production serve
 (which stays on 0.144.6). Two approaches; prefer (A).
 
 **(A) Throwaway serve — faithful, full session context.**
+
 - Start a second serve on a free loopback port with a scratch state dir and the
   0.145.0 codex first on PATH and a self-chosen token:
+
   ```sh
   FNM_DIR=$(dirname "$(ls ~/.local/share/fnm/node-versions/*/installation/bin/codex | head -1)")
   SD=$(mktemp -d); TOK=testtoken
   PATH="$FNM_DIR:$PATH" AGENT_SESSION_TOKEN=$TOK \
     agent-session --state-dir "$SD" serve --bind 127.0.0.1:8799 --machine testrepro &
   ```
+
 - Create + attach a codex session the way the browser does (POST create, then WS
   attach) against `127.0.0.1:8799` with `Authorization: Bearer testtoken`.
   Inspect serve's HTTP surface first (`GET /` routes are token-free on loopback);
@@ -270,6 +283,7 @@ consulted if scope balloons).
 
 Follow the repo's test-first-evidence norm: add/adjust a failing test that
 encodes the 0.145.0 expectation before the production edit.
+
 - In-file `#[cfg(test)]` suite in `codex_app_server.rs` (approx. `:4280-9290`),
   including live proxy round-trip tests — extend these to assert the new
   envelope/handshake and the `(0,145,0)` floor.
@@ -286,6 +300,7 @@ bash scripts/ci/nils-cli-checks-entrypoint.sh --local-fast     # finish-line gat
 # full parity when needed:
 NILS_CLI_TEST_RUNNER=nextest bash scripts/ci/nils-cli-checks-entrypoint.sh
 ```
+
 `AGENT_DOCS.toml` (`[[validation]]`) is the authority; the `--local-fast` gate
 must pass (or an explicit waiver) before declaring the project-dev task done.
 Workspace version lockstep is CI-enforced (`scripts/ci/workspace-version-lockstep.sh --strict`).
@@ -295,6 +310,7 @@ Workspace version lockstep is CI-enforced (`scripts/ci/workspace-version-lockste
 ```sh
 scripts/install-local-release-binaries.sh --bin agent-session   # installs to ~/.local/nils-cli/bin
 ```
+
 Then repeat the §5(A) throwaway serve using the freshly built agent-session with
 codex 0.145.0 on PATH; confirm the codex session's app-server chain stays
 connected and a `turn/start` round-trips (no `server exited unexpectedly`, no WS
@@ -304,6 +320,7 @@ reset in the diagnostics).
 
 Work happens in `sympoies/nils-cli`, which is not the usual cwd. Use the managed
 tooling (direct `git commit` / `git worktree` / `gh pr create` are hook-blocked):
+
 - `git-cli worktree` to create a managed non-default branch.
 - `semantic-commit` (pass a literal `--repo` for the nils-cli path when cwd is
   elsewhere).
