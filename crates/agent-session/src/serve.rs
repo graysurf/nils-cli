@@ -817,6 +817,10 @@ fn router(state: Arc<ServeState>) -> Router {
         )
         .route("/sessions/{id}/attach", get(attach_handler))
         .route(
+            "/sessions/{id}/orchestration/group-cleanup",
+            get(group_cleanup_preview_handler).post(group_cleanup_execute_handler),
+        )
+        .route(
             "/sessions/{id}",
             patch(update_session_handler).delete(delete_handler),
         )
@@ -5842,6 +5846,57 @@ async fn delete_handler(
         Ok(Ok(result)) => {
             cleanup_deleted_session_registries(&state, &result.registry_fence).await;
             envelope_ok(json!({ "machine": state.machine, "deleted": result }))
+        }
+        Ok(Err(err)) => envelope_err(err),
+        Err(_) => join_err(),
+    }
+}
+
+async fn group_cleanup_preview_handler(
+    State(state): State<Arc<ServeState>>,
+    headers: HeaderMap,
+    AxPath(id): AxPath<String>,
+) -> Response {
+    if let Some(resp) = deny_unauthorized(&state, &headers) {
+        return resp;
+    }
+    let context = state.context.clone();
+    match tokio::task::spawn_blocking(move || {
+        crate::main_agent::preview_group_cleanup(&context, &id)
+    })
+    .await
+    {
+        Ok(Ok(cleanup)) => envelope_ok(json!({ "machine": state.machine, "cleanup": cleanup })),
+        Ok(Err(err)) => envelope_err(err),
+        Err(_) => join_err(),
+    }
+}
+
+async fn group_cleanup_execute_handler(
+    State(state): State<Arc<ServeState>>,
+    headers: HeaderMap,
+    AxPath(id): AxPath<String>,
+    body: Result<Json<crate::main_agent::GroupCleanupRequest>, JsonRejection>,
+) -> Response {
+    if let Some(resp) = deny_unauthorized(&state, &headers) {
+        return resp;
+    }
+    let request = match coordination_json(body) {
+        Ok(request) => request,
+        Err(response) => return response,
+    };
+    let context = state.context.clone();
+    let tmux = state.tmux_bin.clone();
+    match tokio::task::spawn_blocking(move || {
+        crate::main_agent::execute_group_cleanup(&context, &id, request, tmux)
+    })
+    .await
+    {
+        Ok(Ok(execution)) => {
+            for fence in &execution.deleted_registry_fences {
+                cleanup_deleted_session_registries(&state, fence).await;
+            }
+            envelope_ok(json!({ "machine": state.machine, "cleanup": execution.value }))
         }
         Ok(Err(err)) => envelope_err(err),
         Err(_) => join_err(),
@@ -17919,6 +17974,33 @@ esac
         let (status, body) = call(
             router(st.clone()),
             patch_json("/sessions/steer", None, json!({ "title": "Nope" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(body["error"]["code"], "unauthorized");
+
+        let (status, body) = call(
+            router(st.clone()),
+            get("/sessions/steer/orchestration/group-cleanup"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(body["error"]["code"], "unauthorized");
+
+        let (status, body) = call(
+            router(st.clone()),
+            post_json(
+                "/sessions/steer/orchestration/group-cleanup",
+                None,
+                json!({
+                    "schema_version": crate::main_agent::GROUP_CLEANUP_REQUEST_SCHEMA,
+                    "expected_main_incarnation": "launch-steer",
+                    "expected_run_revision": 1,
+                    "expected_plan_digest": format!("sha256:{}", "a".repeat(64)),
+                    "mode": "safe",
+                    "idempotency_key": "cleanup-001"
+                }),
+            ),
         )
         .await;
         assert_eq!(status, StatusCode::UNAUTHORIZED);

@@ -26,8 +26,9 @@ use crate::orchestration::{
     IdempotencyReceipt, PACKET_SCHEMA, RunCheckpoint, RunRecord, SessionRef, TimedRelationship,
 };
 use crate::{
-    CliContext, CliError, SessionRecord, StartFailureDisposition, delete_session,
-    load_session_record, resolve_tmux_bin, session_dir, session_status, start_session,
+    CliContext, CliError, SessionRecord, SessionRegistryFence, StartFailureDisposition,
+    delete_session, load_session_record, resolve_tmux_bin, session_dir, session_status,
+    start_session,
 };
 
 const BINARY: &str = "main-agent";
@@ -342,6 +343,55 @@ struct RunMutationArgs {
     idempotency_key: String,
     #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
     format: OutputFormat,
+}
+
+pub(crate) const GROUP_CLEANUP_SCHEMA: &str = "agent-session.main-agent-group-cleanup.v1";
+pub(crate) const GROUP_CLEANUP_REQUEST_SCHEMA: &str =
+    "agent-session.main-agent-group-cleanup-request.v1";
+pub(crate) const GROUP_CLEANUP_RESULT_SCHEMA: &str =
+    "agent-session.main-agent-group-cleanup-result.v1";
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum GroupCleanupMode {
+    Safe,
+    Force,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct GroupCleanupRequest {
+    pub schema_version: String,
+    pub expected_main_incarnation: String,
+    pub expected_run_revision: u64,
+    pub expected_plan_digest: String,
+    pub mode: GroupCleanupMode,
+    pub idempotency_key: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub(crate) struct GroupCleanupWorkerPlan {
+    assignment_id: String,
+    state: String,
+    worker: Option<SessionRef>,
+    force_required: bool,
+    primary_managed: bool,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub(crate) struct GroupCleanupPlan {
+    schema_version: &'static str,
+    main: SessionRef,
+    run_id: String,
+    run_revision: u64,
+    requires_force: bool,
+    workers: Vec<GroupCleanupWorkerPlan>,
+    plan_digest: String,
+}
+
+pub(crate) struct GroupCleanupExecution {
+    pub value: Value,
+    pub deleted_registry_fences: Vec<SessionRegistryFence>,
 }
 
 #[derive(Clone, Debug, Args)]
@@ -2350,6 +2400,597 @@ fn run_close(context: &CliContext, args: RunMutationArgs) -> Result<Value, CliEr
     Ok(outcome)
 }
 
+pub(crate) fn preview_group_cleanup(
+    context: &CliContext,
+    main_session_id: &str,
+) -> Result<Value, CliError> {
+    crate::validate_id(main_session_id)?;
+    let record = load_session_record(context, main_session_id)?;
+    let incarnation = record
+        .runtime
+        .as_ref()
+        .map(|runtime| runtime.launch_id.as_str())
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            CliError::data(
+                "main-session-incarnation-unavailable",
+                "Main Agent session incarnation is unavailable",
+                None,
+            )
+        })?;
+    let main = session_ref(context, &record, incarnation);
+    let registry = orchestration::load_registry_readonly(context)?;
+    let run = registry
+        .runs
+        .values()
+        .find(|run| run.state == "active" && run.controller == main)
+        .ok_or_else(|| {
+            not_found(
+                "main-agent-run-not-found",
+                "session is not the current controller of an active Main Agent run",
+            )
+        })?;
+    serde_json::to_value(build_group_cleanup_plan(&registry, run, &main)?)
+        .map_err(|_| invalid_input("group cleanup preview could not be serialized"))
+}
+
+pub(crate) fn execute_group_cleanup(
+    context: &CliContext,
+    main_session_id: &str,
+    request: GroupCleanupRequest,
+    tmux_bin: PathBuf,
+) -> Result<GroupCleanupExecution, CliError> {
+    validate_group_cleanup_request(main_session_id, &request)?;
+    let request_digest = group_cleanup_request_digest(&request);
+
+    {
+        let locked = orchestration::lock_registry(context)?;
+        if let Some(value) = group_cleanup_replay(
+            &locked.registry,
+            main_session_id,
+            &request.expected_main_incarnation,
+            &request.idempotency_key,
+            &request_digest,
+        )? {
+            return Ok(GroupCleanupExecution {
+                value,
+                deleted_registry_fences: Vec::new(),
+            });
+        }
+    }
+
+    let record = load_session_record(context, main_session_id)?;
+    let incarnation = record
+        .runtime
+        .as_ref()
+        .map(|runtime| runtime.launch_id.as_str())
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            CliError::data(
+                "main-session-incarnation-unavailable",
+                "Main Agent session incarnation is unavailable",
+                None,
+            )
+        })?
+        .to_string();
+    if incarnation != request.expected_main_incarnation {
+        return Err(CliError::data(
+            "main-session-incarnation-conflict",
+            "Main Agent session incarnation changed after preview",
+            Some(json!({
+                "expected_main_incarnation": request.expected_main_incarnation,
+                "actual_main_incarnation": incarnation,
+            })),
+        ));
+    }
+    let main = session_ref(context, &record, &incarnation);
+
+    let plan = {
+        let mut locked = orchestration::lock_registry(context)?;
+        if let Some(value) = group_cleanup_replay(
+            &locked.registry,
+            main_session_id,
+            &incarnation,
+            &request.idempotency_key,
+            &request_digest,
+        )? {
+            return Ok(GroupCleanupExecution {
+                value,
+                deleted_registry_fences: Vec::new(),
+            });
+        }
+        let run = locked
+            .registry
+            .runs
+            .values()
+            .find(|run| run.state == "active" && run.controller == main)
+            .cloned()
+            .ok_or_else(|| {
+                not_found(
+                    "main-agent-run-not-found",
+                    "session is not the current controller of an active Main Agent run",
+                )
+            })?;
+        ensure_revision(request.expected_run_revision, run.revision, "run")?;
+        let plan = build_group_cleanup_plan(&locked.registry, &run, &main)?;
+        if plan.plan_digest != request.expected_plan_digest {
+            return Err(CliError::data(
+                "group-cleanup-plan-conflict",
+                "Main Agent group cleanup plan changed after preview",
+                Some(json!({
+                    "expected_plan_digest": request.expected_plan_digest,
+                    "current_plan_digest": plan.plan_digest,
+                    "current_run_revision": run.revision,
+                })),
+            ));
+        }
+        prepare_group_cleanup_assignments(&mut locked.registry, &run, &main, request.mode)?;
+        locked.save()?;
+        plan
+    };
+
+    let mut deleted_registry_fences = Vec::new();
+    let mut worker_results = Vec::new();
+    for worker_plan in &plan.workers {
+        let Some(worker) = worker_plan.worker.as_ref() else {
+            worker_results.push(json!({
+                "assignment_id": worker_plan.assignment_id,
+                "session_id": null,
+                "outcome": "not_started",
+                "cleanup_pending": false,
+            }));
+            continue;
+        };
+        let worker_path = session_dir(context, &worker.session_id);
+        match fs::symlink_metadata(&worker_path) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                worker_results.push(json!({
+                    "assignment_id": worker_plan.assignment_id,
+                    "session_id": worker.session_id,
+                    "outcome": "absent",
+                    "cleanup_pending": false,
+                }));
+                continue;
+            }
+            Err(_) => {
+                let error = CliError::runtime(
+                    "worker-session-unavailable",
+                    "worker session state is unavailable",
+                    None,
+                );
+                let value = group_cleanup_failure(
+                    &plan,
+                    &worker_results,
+                    Some(worker_plan),
+                    "worker_cleanup",
+                    &error,
+                    false,
+                );
+                store_group_cleanup_receipt(
+                    context,
+                    &record,
+                    &incarnation,
+                    &request,
+                    &request_digest,
+                    value.clone(),
+                )?;
+                return Ok(GroupCleanupExecution {
+                    value,
+                    deleted_registry_fences,
+                });
+            }
+            Ok(_) => {}
+        }
+        let worker_record = match load_session_record(context, &worker.session_id) {
+            Ok(record) => record,
+            Err(error) => {
+                let value = group_cleanup_failure(
+                    &plan,
+                    &worker_results,
+                    Some(worker_plan),
+                    "worker_cleanup",
+                    &error,
+                    false,
+                );
+                store_group_cleanup_receipt(
+                    context,
+                    &record,
+                    &incarnation,
+                    &request,
+                    &request_digest,
+                    value.clone(),
+                )?;
+                return Ok(GroupCleanupExecution {
+                    value,
+                    deleted_registry_fences,
+                });
+            }
+        };
+        let worker_incarnation = worker_record
+            .runtime
+            .as_ref()
+            .map(|runtime| runtime.launch_id.as_str())
+            .unwrap_or_default();
+        if !orchestration::session_ref_matches(worker, &worker_record, worker_incarnation) {
+            let error = CliError::data(
+                "session-incarnation-conflict",
+                "worker session identity changed before group cleanup",
+                Some(json!({ "assignment_id": worker_plan.assignment_id })),
+            );
+            let value = group_cleanup_failure(
+                &plan,
+                &worker_results,
+                Some(worker_plan),
+                "worker_cleanup",
+                &error,
+                false,
+            );
+            store_group_cleanup_receipt(
+                context,
+                &record,
+                &incarnation,
+                &request,
+                &request_digest,
+                value.clone(),
+            )?;
+            return Ok(GroupCleanupExecution {
+                value,
+                deleted_registry_fences,
+            });
+        }
+        match delete_session(context, &worker.session_id, tmux_bin.clone()) {
+            Ok(deleted) => {
+                worker_results.push(json!({
+                    "assignment_id": worker_plan.assignment_id,
+                    "session_id": worker.session_id,
+                    "outcome": "deleted",
+                    "cleanup_pending": deleted.cleanup_pending,
+                }));
+                deleted_registry_fences.push(deleted.registry_fence);
+            }
+            Err(error) => {
+                let value = group_cleanup_failure(
+                    &plan,
+                    &worker_results,
+                    Some(worker_plan),
+                    "worker_cleanup",
+                    &error,
+                    false,
+                );
+                store_group_cleanup_receipt(
+                    context,
+                    &record,
+                    &incarnation,
+                    &request,
+                    &request_digest,
+                    value.clone(),
+                )?;
+                return Ok(GroupCleanupExecution {
+                    value,
+                    deleted_registry_fences,
+                });
+            }
+        }
+    }
+
+    {
+        let mut locked = orchestration::lock_registry(context)?;
+        let run = locked
+            .registry
+            .runs
+            .get_mut(&plan.run_id)
+            .filter(|run| run.state == "active" && run.controller == main)
+            .ok_or_else(|| {
+                CliError::data(
+                    "group-cleanup-run-conflict",
+                    "Main Agent run changed while workers were being cleaned up",
+                    None,
+                )
+            })?;
+        if run.revision != request.expected_run_revision {
+            let error = CliError::data(
+                "group-cleanup-run-conflict",
+                "Main Agent run revision changed while workers were being cleaned up",
+                Some(json!({ "current_run_revision": run.revision })),
+            );
+            let value =
+                group_cleanup_failure(&plan, &worker_results, None, "run_close", &error, false);
+            store_receipt(
+                &mut locked.registry,
+                &record,
+                &incarnation,
+                &request.idempotency_key,
+                "group-cleanup",
+                &request_digest,
+                value.clone(),
+            )?;
+            locked.save()?;
+            return Ok(GroupCleanupExecution {
+                value,
+                deleted_registry_fences,
+            });
+        }
+        run.state = "closed".to_string();
+        run.revision = run.revision.saturating_add(1);
+        run.updated_at = timestamp();
+        locked.save()?;
+    }
+
+    let current_main = load_session_record(context, main_session_id)?;
+    let current_main_incarnation = current_main
+        .runtime
+        .as_ref()
+        .map(|runtime| runtime.launch_id.as_str())
+        .unwrap_or_default();
+    if !orchestration::session_ref_matches(&main, &current_main, current_main_incarnation) {
+        let error = CliError::data(
+            "main-session-incarnation-conflict",
+            "Main Agent session identity changed before final deletion",
+            None,
+        );
+        let value =
+            group_cleanup_failure(&plan, &worker_results, None, "main_delete", &error, true);
+        store_group_cleanup_receipt(
+            context,
+            &record,
+            &incarnation,
+            &request,
+            &request_digest,
+            value.clone(),
+        )?;
+        return Ok(GroupCleanupExecution {
+            value,
+            deleted_registry_fences,
+        });
+    }
+    let main_deleted = match delete_session(context, main_session_id, tmux_bin) {
+        Ok(deleted) => deleted,
+        Err(error) => {
+            let value =
+                group_cleanup_failure(&plan, &worker_results, None, "main_delete", &error, true);
+            store_group_cleanup_receipt(
+                context,
+                &record,
+                &incarnation,
+                &request,
+                &request_digest,
+                value.clone(),
+            )?;
+            return Ok(GroupCleanupExecution {
+                value,
+                deleted_registry_fences,
+            });
+        }
+    };
+    deleted_registry_fences.push(main_deleted.registry_fence);
+    let value = json!({
+        "schema_version": GROUP_CLEANUP_RESULT_SCHEMA,
+        "run_id": plan.run_id,
+        "completed": true,
+        "run_closed": true,
+        "main_deleted": true,
+        "workers": worker_results,
+    });
+    store_group_cleanup_receipt(
+        context,
+        &record,
+        &incarnation,
+        &request,
+        &request_digest,
+        value.clone(),
+    )?;
+    Ok(GroupCleanupExecution {
+        value,
+        deleted_registry_fences,
+    })
+}
+
+fn validate_group_cleanup_request(
+    main_session_id: &str,
+    request: &GroupCleanupRequest,
+) -> Result<(), CliError> {
+    crate::validate_id(main_session_id)?;
+    if request.schema_version != GROUP_CLEANUP_REQUEST_SCHEMA {
+        return Err(invalid_input("group cleanup request schema is unsupported"));
+    }
+    orchestration::validate_slug(
+        "main session incarnation",
+        &request.expected_main_incarnation,
+        128,
+    )?;
+    orchestration::validate_digest(&request.expected_plan_digest)?;
+    validate_idempotency_key(&request.idempotency_key)
+}
+
+fn group_cleanup_request_digest(request: &GroupCleanupRequest) -> String {
+    crate::coordination::request_digest(
+        "main-agent-group-cleanup",
+        &json!({
+            "expected_main_incarnation": request.expected_main_incarnation,
+            "expected_run_revision": request.expected_run_revision,
+            "expected_plan_digest": request.expected_plan_digest,
+            "mode": request.mode,
+        }),
+    )
+}
+
+fn group_cleanup_replay(
+    registry: &orchestration::Registry,
+    main_session_id: &str,
+    incarnation: &str,
+    idempotency_key: &str,
+    request_digest: &str,
+) -> Result<Option<Value>, CliError> {
+    let Some(receipt) =
+        registry
+            .receipts
+            .get(&receipt_key(main_session_id, incarnation, idempotency_key))
+    else {
+        return Ok(None);
+    };
+    if receipt.operation != "group-cleanup" || receipt.request_digest != request_digest {
+        return Err(CliError::data(
+            "idempotency-conflict",
+            "idempotency key was already used for a different request",
+            None,
+        ));
+    }
+    Ok(Some(receipt.outcome.clone()))
+}
+
+fn store_group_cleanup_receipt(
+    context: &CliContext,
+    record: &SessionRecord,
+    incarnation: &str,
+    request: &GroupCleanupRequest,
+    request_digest: &str,
+    value: Value,
+) -> Result<(), CliError> {
+    let mut locked = orchestration::lock_registry(context)?;
+    store_receipt(
+        &mut locked.registry,
+        record,
+        incarnation,
+        &request.idempotency_key,
+        "group-cleanup",
+        request_digest,
+        value,
+    )?;
+    locked.save()
+}
+
+fn group_cleanup_failure(
+    plan: &GroupCleanupPlan,
+    prior_results: &[Value],
+    failed_worker: Option<&GroupCleanupWorkerPlan>,
+    stage: &str,
+    error: &CliError,
+    run_closed: bool,
+) -> Value {
+    let mut workers = prior_results.to_vec();
+    if let Some(worker) = failed_worker {
+        workers.push(json!({
+            "assignment_id": worker.assignment_id,
+            "session_id": worker.worker.as_ref().map(|item| item.session_id.as_str()),
+            "outcome": "failed",
+            "cleanup_pending": false,
+            "error_code": error.code(),
+        }));
+    }
+    json!({
+        "schema_version": GROUP_CLEANUP_RESULT_SCHEMA,
+        "run_id": plan.run_id,
+        "completed": false,
+        "run_closed": run_closed,
+        "main_deleted": false,
+        "workers": workers,
+        "failure": {
+            "stage": stage,
+            "code": error.code(),
+            "message": error.message(),
+        },
+    })
+}
+
+fn build_group_cleanup_plan(
+    registry: &orchestration::Registry,
+    run: &RunRecord,
+    main: &SessionRef,
+) -> Result<GroupCleanupPlan, CliError> {
+    if run.state != "active" || run.controller != *main {
+        return Err(CliError::data(
+            "main-agent-run-conflict",
+            "Main Agent run does not match the requested controller",
+            None,
+        ));
+    }
+    let mut workers = registry
+        .assignments
+        .values()
+        .filter(|assignment| assignment.run_id == run.run_id && assignment.primary_manager == *main)
+        .map(|assignment| GroupCleanupWorkerPlan {
+            assignment_id: assignment.assignment_id.clone(),
+            state: assignment.state.clone(),
+            worker: assignment.worker.clone(),
+            force_required: !matches!(
+                assignment.state.as_str(),
+                "accepted" | "released" | "cancelled"
+            ),
+            primary_managed: true,
+        })
+        .collect::<Vec<_>>();
+    workers.sort_by(|left, right| left.assignment_id.cmp(&right.assignment_id));
+    let requires_force = workers.iter().any(|worker| worker.force_required);
+    let digest = format!(
+        "sha256:{}",
+        crate::coordination::request_digest(
+            "main-agent-group-cleanup-plan",
+            &json!({
+                "schema_version": GROUP_CLEANUP_SCHEMA,
+                "main": main,
+                "run_id": run.run_id,
+                "run_revision": run.revision,
+                "requires_force": requires_force,
+                "workers": workers,
+            }),
+        )
+    );
+    Ok(GroupCleanupPlan {
+        schema_version: GROUP_CLEANUP_SCHEMA,
+        main: main.clone(),
+        run_id: run.run_id.clone(),
+        run_revision: run.revision,
+        requires_force,
+        workers,
+        plan_digest: digest,
+    })
+}
+
+fn prepare_group_cleanup_assignments(
+    registry: &mut orchestration::Registry,
+    run: &RunRecord,
+    main: &SessionRef,
+    mode: GroupCleanupMode,
+) -> Result<(), CliError> {
+    let force_required = registry
+        .assignments
+        .values()
+        .filter(|assignment| assignment.run_id == run.run_id && assignment.primary_manager == *main)
+        .filter(|assignment| {
+            !matches!(
+                assignment.state.as_str(),
+                "accepted" | "released" | "cancelled"
+            )
+        })
+        .map(|assignment| assignment.assignment_id.clone())
+        .collect::<Vec<_>>();
+    if mode == GroupCleanupMode::Safe && !force_required.is_empty() {
+        return Err(CliError::data(
+            "group-cleanup-force-required",
+            "group cleanup includes nonterminal assignments and requires explicit force",
+            Some(json!({ "assignment_ids": force_required })),
+        ));
+    }
+    for assignment in registry
+        .assignments
+        .values_mut()
+        .filter(|assignment| assignment.run_id == run.run_id && assignment.primary_manager == *main)
+    {
+        let next = match assignment.state.as_str() {
+            "accepted" => Some("released"),
+            "released" | "cancelled" => None,
+            _ if mode == GroupCleanupMode::Force => Some("cancelled"),
+            _ => None,
+        };
+        if let Some(next) = next {
+            assignment.state = next.to_string();
+            assignment.revision = assignment.revision.saturating_add(1);
+            assignment.updated_at = timestamp();
+        }
+    }
+    Ok(())
+}
+
 /// Fast-path for L0/L1 delegate-all: acquire the claim, create an ephemeral
 /// run synthesized from the assignment packet, then launch the assignment's
 /// worker — all in one call. The run is marked ephemeral so it auto-closes when
@@ -3332,7 +3973,7 @@ mod tests {
             revision: 1,
             state: state.to_string(),
             task_summary: "dependency".to_string(),
-            private_packet_digest: "sha256:0".to_string(),
+            private_packet_digest: format!("sha256:{}", "0".repeat(64)),
             primary_manager: SessionRef {
                 machine: None,
                 session_id: "main".to_string(),
@@ -3423,6 +4064,273 @@ mod tests {
             created_at: "2030-01-01T00:00:00Z".to_string(),
             updated_at: "2030-01-01T00:00:00Z".to_string(),
         }
+    }
+
+    #[test]
+    fn group_cleanup_plan_is_exactly_scoped_and_requires_force_for_live_work() {
+        let mut registry = orchestration::Registry::default();
+        let run = run_record("run-one", false);
+        let controller = run.controller.clone();
+        registry.runs.insert(run.run_id.clone(), run.clone());
+
+        let mut accepted = dep_assignment("accepted", "run-one", "accepted");
+        accepted.worker = Some(SessionRef {
+            machine: None,
+            session_id: "worker-accepted".to_string(),
+            session_incarnation: "worker-inc-accepted".to_string(),
+            session_created_at: "2030-01-01T00:01:00Z".to_string(),
+        });
+        registry
+            .assignments
+            .insert(accepted.assignment_id.clone(), accepted);
+
+        let mut submitted = dep_assignment("submitted", "run-one", "submitted");
+        submitted.worker = Some(SessionRef {
+            machine: None,
+            session_id: "worker-submitted".to_string(),
+            session_incarnation: "worker-inc-submitted".to_string(),
+            session_created_at: "2030-01-01T00:02:00Z".to_string(),
+        });
+        registry
+            .assignments
+            .insert(submitted.assignment_id.clone(), submitted);
+
+        let mut collaborator_owned = dep_assignment("borrowed", "run-one", "working");
+        collaborator_owned.primary_manager = SessionRef {
+            machine: None,
+            session_id: "other-main".to_string(),
+            session_incarnation: "other-inc".to_string(),
+            session_created_at: "2030-01-01T00:00:00Z".to_string(),
+        };
+        registry
+            .assignments
+            .insert(collaborator_owned.assignment_id.clone(), collaborator_owned);
+
+        let plan = build_group_cleanup_plan(&registry, &run, &controller).unwrap();
+
+        assert!(plan.requires_force);
+        assert_eq!(plan.run_id, "run-one");
+        assert_eq!(plan.run_revision, 1);
+        assert_eq!(
+            plan.workers
+                .iter()
+                .map(|worker| worker.assignment_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["accepted", "submitted"],
+        );
+        assert!(plan.workers.iter().all(|worker| worker.primary_managed),);
+        assert!(plan.plan_digest.starts_with("sha256:"));
+    }
+
+    #[test]
+    fn group_cleanup_force_terminalizes_primary_assignments_before_deletion() {
+        let mut registry = orchestration::Registry::default();
+        let run = run_record("run-one", false);
+        let controller = run.controller.clone();
+        registry.runs.insert(run.run_id.clone(), run.clone());
+        for state in ["working", "submitted", "accepted", "released", "cancelled"] {
+            let id = format!("assignment-{state}");
+            registry
+                .assignments
+                .insert(id.clone(), dep_assignment(&id, "run-one", state));
+        }
+
+        let safe_error = prepare_group_cleanup_assignments(
+            &mut registry,
+            &run,
+            &controller,
+            GroupCleanupMode::Safe,
+        )
+        .unwrap_err();
+        assert_eq!(safe_error.code(), "group-cleanup-force-required");
+        assert_eq!(registry.assignments["assignment-working"].state, "working");
+
+        prepare_group_cleanup_assignments(
+            &mut registry,
+            &run,
+            &controller,
+            GroupCleanupMode::Force,
+        )
+        .unwrap();
+        assert_eq!(
+            registry.assignments["assignment-working"].state,
+            "cancelled"
+        );
+        assert_eq!(
+            registry.assignments["assignment-submitted"].state,
+            "cancelled"
+        );
+        assert_eq!(
+            registry.assignments["assignment-accepted"].state,
+            "released"
+        );
+        assert_eq!(
+            registry.assignments["assignment-released"].state,
+            "released"
+        );
+        assert_eq!(
+            registry.assignments["assignment-cancelled"].state,
+            "cancelled"
+        );
+    }
+
+    fn cleanup_test_session(id: &str, incarnation: &str) -> SessionRecord {
+        SessionRecord {
+            schema_version: crate::SESSION_DOCUMENT_VERSION.to_string(),
+            id: id.to_string(),
+            agent: "codex".to_string(),
+            mode: "interactive".to_string(),
+            coordination_mode: CoordinationMode::Advisory,
+            title: None,
+            title_state: None,
+            title_revision: 0,
+            cwd: "/tmp".to_string(),
+            tmux_session: format!("agent-{id}"),
+            prompt_file: None,
+            log_file: None,
+            created_at: "2030-01-01T00:00:00Z".to_string(),
+            updated_at: "2030-01-01T00:00:00Z".to_string(),
+            provider_resume: None,
+            runtime: Some(crate::RuntimeInfo {
+                kind: "tmux".to_string(),
+                tmux_session: format!("agent-{id}"),
+                generation: 1,
+                started_at: "2030-01-01T00:00:00Z".to_string(),
+                launch_id: incarnation.to_string(),
+                extra: std::collections::BTreeMap::new(),
+            }),
+            agent_args: Vec::new(),
+            agent_bin: None,
+            extra: std::collections::BTreeMap::new(),
+            resume_sidecar_extra: std::collections::BTreeMap::new(),
+        }
+    }
+
+    #[test]
+    fn group_cleanup_worker_failure_preserves_the_main_session() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let context = CliContext {
+            state_dir: tmp.path().to_path_buf(),
+            host: None,
+        };
+        let main = cleanup_test_session("main", "inc");
+        fs::create_dir_all(session_dir(&context, &main.id)).unwrap();
+        crate::write_session_record(&context, &main).unwrap();
+        fs::create_dir_all(session_dir(&context, "worker-broken")).unwrap();
+
+        let mut run = run_record("run-one", false);
+        run.controller = session_ref(&context, &main, "inc");
+        let mut assignment = dep_assignment("assignment-broken", "run-one", "submitted");
+        assignment.primary_manager = run.controller.clone();
+        assignment.worker = Some(SessionRef {
+            machine: None,
+            session_id: "worker-broken".to_string(),
+            session_incarnation: "worker-inc".to_string(),
+            session_created_at: "2030-01-01T00:01:00Z".to_string(),
+        });
+        {
+            let mut locked = orchestration::lock_registry(&context).unwrap();
+            locked.registry.runs.insert(run.run_id.clone(), run);
+            locked
+                .registry
+                .assignments
+                .insert(assignment.assignment_id.clone(), assignment);
+            locked.save().unwrap();
+        }
+
+        let preview = preview_group_cleanup(&context, "main").unwrap();
+        let execution = execute_group_cleanup(
+            &context,
+            "main",
+            GroupCleanupRequest {
+                schema_version: GROUP_CLEANUP_REQUEST_SCHEMA.to_string(),
+                expected_main_incarnation: "inc".to_string(),
+                expected_run_revision: preview["run_revision"].as_u64().unwrap(),
+                expected_plan_digest: preview["plan_digest"].as_str().unwrap().to_string(),
+                mode: GroupCleanupMode::Force,
+                idempotency_key: "cleanup-001".to_string(),
+            },
+            PathBuf::from("/bin/false"),
+        )
+        .unwrap();
+
+        assert_eq!(execution.value["completed"], false);
+        assert_eq!(execution.value["main_deleted"], false);
+        assert_eq!(execution.value["failure"]["stage"], "worker_cleanup");
+        assert!(
+            session_dir(&context, "main").join("session.json").exists(),
+            "worker cleanup failure must preserve the Main Agent record"
+        );
+    }
+
+    #[test]
+    fn group_cleanup_deletes_workers_closes_the_run_and_deletes_main_last() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let context = CliContext {
+            state_dir: tmp.path().to_path_buf(),
+            host: None,
+        };
+        let tmux = tmp.path().join("tmux-missing-session");
+        fs::write(
+            &tmux,
+            "#!/bin/sh\nprintf \"%s\\n\" \"can't find session: test\" >&2\nexit 1\n",
+        )
+        .unwrap();
+        fs::set_permissions(&tmux, fs::Permissions::from_mode(0o700)).unwrap();
+        let mut main = cleanup_test_session("main", "inc");
+        crate::mark_tmux_runtime_never_launched(&mut main);
+        fs::create_dir_all(session_dir(&context, &main.id)).unwrap();
+        crate::write_session_record(&context, &main).unwrap();
+        let mut worker = cleanup_test_session("worker", "worker-inc");
+        crate::mark_tmux_runtime_never_launched(&mut worker);
+        fs::create_dir_all(session_dir(&context, &worker.id)).unwrap();
+        crate::write_session_record(&context, &worker).unwrap();
+
+        let mut run = run_record("run-one", false);
+        run.controller = session_ref(&context, &main, "inc");
+        let mut assignment = dep_assignment("assignment", "run-one", "accepted");
+        assignment.primary_manager = run.controller.clone();
+        assignment.worker = Some(session_ref(&context, &worker, "worker-inc"));
+        {
+            let mut locked = orchestration::lock_registry(&context).unwrap();
+            locked.registry.runs.insert(run.run_id.clone(), run);
+            locked
+                .registry
+                .assignments
+                .insert(assignment.assignment_id.clone(), assignment);
+            locked.save().unwrap();
+        }
+
+        let preview = preview_group_cleanup(&context, "main").unwrap();
+        let execution = execute_group_cleanup(
+            &context,
+            "main",
+            GroupCleanupRequest {
+                schema_version: GROUP_CLEANUP_REQUEST_SCHEMA.to_string(),
+                expected_main_incarnation: "inc".to_string(),
+                expected_run_revision: preview["run_revision"].as_u64().unwrap(),
+                expected_plan_digest: preview["plan_digest"].as_str().unwrap().to_string(),
+                mode: GroupCleanupMode::Safe,
+                idempotency_key: "cleanup-success-001".to_string(),
+            },
+            tmux,
+        )
+        .unwrap();
+
+        assert_eq!(
+            execution.value["completed"], true,
+            "unexpected cleanup result: {}",
+            execution.value
+        );
+        assert_eq!(execution.value["run_closed"], true);
+        assert_eq!(execution.value["main_deleted"], true);
+        assert_eq!(execution.value["workers"][0]["outcome"], "deleted");
+        assert!(!session_dir(&context, "worker").exists());
+        assert!(!session_dir(&context, "main").exists());
+        let registry = orchestration::load_registry_readonly(&context).unwrap();
+        assert_eq!(registry.runs["run-one"].state, "closed");
     }
 
     #[test]

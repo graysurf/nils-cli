@@ -33,6 +33,7 @@ comma-separated route segments below are exact alternatives, not wildcards.
 | `GET /sessions/{id}/buffer` | Open | This specification |
 | `POST /sessions/{id}/{send,prompt,prompt/v2,resume}` | Bearer | This specification |
 | `GET /sessions/{id}/maintenance` and `POST /sessions/{id}/maintenance/actions` | Bearer | [Session maintenance v1](session-maintenance-v1.md#authentication-and-endpoints) |
+| `GET and POST /sessions/{id}/orchestration/group-cleanup` | Bearer | [Main Agent orchestration v1](main-agent-orchestration-v1.md#daemon-owned-group-cleanup) |
 | `PUT /sessions/{id}/account` | Bearer | This specification |
 | `GET /sessions/{id}/auto-resume` | Open | This specification |
 | `PUT and DELETE /sessions/{id}/auto-resume` | Bearer | This specification |
@@ -226,7 +227,22 @@ is no second state model.
   `POST /sessions/{id}/resume`,
   `PUT /sessions/{id}/account`,
   `PUT /sessions/{id}/auto-resume`, `DELETE /sessions/{id}/auto-resume`,
-  `POST /sessions/{id}/attachments?filename=...`, `DELETE /sessions/{id}` — writes, require a bearer token.
+  `POST /sessions/{id}/attachments?filename=...`,
+  `POST /sessions/{id}/orchestration/group-cleanup`,
+  `DELETE /sessions/{id}` — writes, require a bearer token.
+- `GET /sessions/{id}/orchestration/group-cleanup` returns an exact,
+  metadata-only cleanup preview for the session's active Main Agent run. The
+  plan is fenced by the Main Agent incarnation, run revision, and a SHA-256
+  plan digest; it lists only workers whose current primary manager is that
+  exact Main Agent. `POST` requires the preview fences, `mode: "safe"|"force"`,
+  and an idempotency key. Safe mode rejects nonterminal assignments. Force mode
+  records those assignments as cancelled before deleting worker sessions.
+  Execution deletes workers first, closes the run only after worker cleanup
+  succeeds, and deletes the Main Agent last. A partial result always reports
+  `main_deleted: false`; clients must preserve the Main Agent card and surface
+  each reported deleted, absent, not-started, or failed worker outcome. Workers
+  not yet attempted after a failure remain live and are omitted from that
+  partial result.
 - `POST /sessions/{id}/prompt` submits exact prompt text through a supported provider control plane. The compatibility route accepts
   `{ "text": "...", "expected_session_incarnation": "launch-id" }`; the incarnation is optional for older clients, and
   a new daemon validates it against the authoritative runtime under the session-record lock before provider dispatch.

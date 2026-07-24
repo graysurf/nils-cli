@@ -180,6 +180,34 @@ assignment, released worker claim, no active or uncertain operation, and the
 producer's exact logical-delete/tombstone checks. Physical cleanup failure is a
 maintenance record and cannot restore the live session projection.
 
+### Daemon-owned group cleanup
+
+The bearer-protected serve route
+`GET /sessions/{id}/orchestration/group-cleanup` previews deletion of one exact
+Main Agent group. Its `agent-session.main-agent-group-cleanup.v1` response
+contains the exact Main Agent reference, active run ID and revision, a sorted
+list of assignments still primarily managed by that Main Agent, whether each
+requires force, and a digest over the complete plan. Collaborators, borrowers,
+workers handed off to another primary manager, and assignments from another
+run are outside the plan.
+
+`POST` accepts only
+`agent-session.main-agent-group-cleanup-request.v1` with the previewed Main
+Agent incarnation, run revision, plan digest, `safe` or `force` mode, and an
+idempotency key. Any identity, revision, or plan drift fails before cleanup.
+Safe mode rejects a plan containing nonterminal assignments. Force mode
+terminalizes exactly those assignments as `cancelled`; accepted assignments
+advance to `released`.
+
+Execution is deliberately ordered: delete or confirm absence of every planned
+worker, close the run, then delete the Main Agent. Worker identity is checked
+again before deletion. A worker failure returns a typed
+`agent-session.main-agent-group-cleanup-result.v1` partial result and preserves
+both the active run and Main Agent. A failure after worker deletion but before
+or during Main deletion still reports `main_deleted: false`; clients reconcile
+the per-worker outcomes and keep the Main Agent available for recovery. Exact
+idempotent replay returns the original result.
+
 ## Recovery and failure semantics
 
 Revision conflict returns `orchestration-revision-conflict` with
