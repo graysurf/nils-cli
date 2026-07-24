@@ -85,9 +85,15 @@ Agent flag notes:
   compatibility fallback.
 - `resume --cd <dir>`: Bypass automatic cwd resolution and resume in `<dir>` (must be an existing directory).
 - `agent run` is separate from the isolated/inherited one-shot prompt modes. It
-  deliberately retains project instructions, home instructions, hooks, rules,
-  signing, and sandboxing; it never passes `--ignore-user-config`,
-  `--ignore-rules`, or `--dangerously-bypass-approvals-and-sandbox`.
+  deliberately retains project instructions, home instructions, hook
+  configuration and trust state, rules, signing, and sandboxing; it never passes
+  `--ignore-user-config`, `--ignore-rules`, or
+  `--dangerously-bypass-approvals-and-sandbox`. Retaining hook configuration is
+  not a claim that hooks run: on Codex `0.145.0`, `codex exec` executed no
+  config-defined lifecycle hook in either MCP mode, so the configuration is
+  preserved for wherever Codex honors it. Repository Git hooks are unaffected
+  because the capsule script invokes Git directly. See the
+  [Execution Capsule v1 specification](docs/specs/execution-capsule-v1.md).
 - `--mcp-mode disabled` is the default. The supervisor runs in a private
   governance-projected `CODEX_HOME` that carries home instructions, the hook
   feature, hook tables, and rekeyed hook trust state, bridges authentication by

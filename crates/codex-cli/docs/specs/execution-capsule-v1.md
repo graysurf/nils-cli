@@ -145,8 +145,11 @@ codex --ask-for-approval never exec \
 ```
 
 The command intentionally preserves user/project instructions, config
-governance, and hooks. It does not use the isolated prompt runtime, ignore
-rules, or pass the dangerous bypass flag. The runner skips Codex's Git
+governance, and hook configuration and trust state; see the recorded
+observation below that Codex `0.145.0` executed no config-defined lifecycle hook
+under `codex exec`, so preservation is not a claim that hooks run. It does not
+use the isolated prompt runtime, ignore rules, or pass the dangerous bypass
+flag. The runner skips Codex's Git
 repository precheck because a valid capsule may use a non-Git working
 directory; capsule path, ownership, mode, digest, access, and optional Git
 preconditions remain independently enforced.
