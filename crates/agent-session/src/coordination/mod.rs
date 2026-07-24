@@ -1174,6 +1174,9 @@ pub(crate) fn unauthorized() -> CliError {
         "coordination authority could not be verified",
         None,
     )
+    .with_hint(
+        "this session is not a verified coordination broker incarnation; confirm authority with `main-agent self show` and ensure it was launched under enforced coordination before retrying",
+    )
 }
 
 fn store_untrusted() -> CliError {

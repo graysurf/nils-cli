@@ -444,7 +444,14 @@ pub(crate) struct ProviderDoctor {
     pub(crate) version: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) version_error: Option<String>,
+    /// The provider's agent-session lifecycle hook/notification spec is present
+    /// and not drifted. Config presence only — NOT version adequacy (see
+    /// `classification`) and NOT launch-readiness (see `can_launch_worker`).
     pub(crate) configured: bool,
+    /// True only when the provider is both `classification == "supported"` and
+    /// `configured` — i.e. Main Agent Mode may launch a worker for it. Makes the
+    /// launch gate explicit instead of leaving callers to AND the two axes.
+    pub(crate) can_launch_worker: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) configuration_error: Option<String>,
     pub(crate) config_path: String,
@@ -473,6 +480,9 @@ pub(crate) struct ProviderDoctor {
 
 #[derive(Clone, Debug, Serialize)]
 pub(crate) struct DoctorResult {
+    /// The running agent-session binary's own version (git-describe form), so a
+    /// stale or split install is diagnosable against the source it should match.
+    pub(crate) binary_version: String,
     pub(crate) providers: Vec<ProviderDoctor>,
 }
 
@@ -2923,12 +2933,14 @@ pub(crate) fn doctor(
                 " The configured agent-session helper does not resolve to an executable on PATH; install it on the provider hook PATH before relying on activity state.",
             );
         }
+        let can_launch_worker = classification == "supported" && configured;
         providers.push(ProviderDoctor {
             provider: agent.as_str().to_string(),
             classification: classification.to_string(),
             version,
             version_error: version_probe.error,
             configured,
+            can_launch_worker,
             configuration_error,
             config_path: display_path(&reported_config_path),
             hook_representation,
@@ -2947,7 +2959,10 @@ pub(crate) fn doctor(
             helper_executable,
         });
     }
-    Ok(DoctorResult { providers })
+    Ok(DoctorResult {
+        binary_version: nils_build_info::long_version(env!("CARGO_PKG_VERSION")),
+        providers,
+    })
 }
 
 fn command_resolves_on_path(command: &str, path: Option<&std::ffi::OsStr>) -> bool {

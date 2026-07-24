@@ -38,6 +38,7 @@ const ASSIGNMENT_REVISION_HELP: &str =
 const RUN_REVISION_HELP: &str =
     "Expected current run revision; stale values fail closed and report current_revision.";
 const WORKER_START_RUN_REVISION_HELP: &str = "Optional expected run revision. Omit to launch without a run-revision fence: assignment creation is decoupled from the run revision, so parallel and batch starts no longer collide. When supplied, a stale value fails closed and reports current_revision.";
+const QUICK_IDEMPOTENCY_KEY_HELP: &str = "Optional for the fast-path: omit to derive a stable idempotency key from a digest of the assignment packet, or supply one to control replay explicitly. 8-128 printable non-space ASCII bytes.";
 const MAIN_AGENT_AFTER_HELP: &str = "SAFE LIFECYCLE:\n  init -> rehydrate/status -> worker start -> worker self/checkpoint\n  accept -> release -> delete -> close\n\nREVISION AND RETRY RULES:\n  Read the current run or assignment revision before each mutation. Retry an\n  ambiguous outcome with the identical request and idempotency key. After a\n  confirmed revision conflict, re-read state and use a new key for the revised\n  request.\n\nEXAMPLES:\n  main-agent init --packet-file objective.json --if-absent --idempotency-key init-001 --format json\n  main-agent rehydrate --format markdown\n  main-agent worker start --assignment-file assignment.json --if-run-revision 1 --idempotency-key start-001 --format json\n  main-agent worker accept ASSIGNMENT_ID --if-revision 4 --idempotency-key accept-001 --format json\n\nOPERATOR RUNBOOK:\n  crates/agent-session/docs/runbooks/main-agent-orchestration.md\n\nEXIT CODES:\n  0   success\n  1   runtime error\n  64  command-line usage error\n  65  invalid or stale data\n  69  temporarily unavailable";
 
 #[derive(Debug, Parser)]
@@ -91,6 +92,9 @@ enum MainAgentCommand {
     /// Fast-path: create an ephemeral run, single assignment, and launch in one
     /// call. The run auto-closes once the worker is torn down.
     Quick(QuickArgs),
+    /// Print an example objective packet (schema, required fields, and the
+    /// nested work-context) that `init --packet-file` accepts.
+    PacketSchema(PacketSchemaArgs),
     /// Print shell completion script.
     Completion(CompletionArgs),
 }
@@ -402,8 +406,14 @@ struct QuickArgs {
     /// Work tier for the synthesized ephemeral run (L0/L1 delegate-all).
     #[arg(long, default_value = "L0")]
     tier: String,
-    #[arg(long, help = IDEMPOTENCY_KEY_HELP)]
-    idempotency_key: String,
+    #[arg(long, help = QUICK_IDEMPOTENCY_KEY_HELP)]
+    idempotency_key: Option<String>,
+    #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
+    format: OutputFormat,
+}
+
+#[derive(Clone, Debug, Args)]
+struct PacketSchemaArgs {
     #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
     format: OutputFormat,
 }
@@ -582,6 +592,7 @@ fn run_command(context: &CliContext, command: &MainAgentCommand) -> Result<Value
         MainAgentCommand::Adopt(args) => run_adopt(context, args.clone()),
         MainAgentCommand::Close(args) => run_close(context, args.clone()),
         MainAgentCommand::Quick(args) => run_quick(context, args.clone()),
+        MainAgentCommand::PacketSchema(_) => Ok(objective_packet_schema_example()),
         MainAgentCommand::Completion(_) => unreachable!(),
     }
 }
@@ -2998,7 +3009,6 @@ fn prepare_group_cleanup_assignments(
 /// explicit `close`. A session that already controls a run must use the
 /// granular `init` + `worker start` path instead.
 fn run_quick(context: &CliContext, args: QuickArgs) -> Result<Value, CliError> {
-    validate_idempotency_key(&args.idempotency_key)?;
     if !matches!(args.tier.as_str(), "L0" | "L1" | "L2" | "L3") {
         return Err(invalid_input("quick tier is invalid"));
     }
@@ -3008,6 +3018,16 @@ fn run_quick(context: &CliContext, args: QuickArgs) -> Result<Value, CliError> {
         "invalid-assignment-packet",
     )?;
     validate_assignment_input(&input)?;
+    // The fast-path caller supplies only one packet: default the idempotency key
+    // from a digest of that packet when --idempotency-key is omitted. An explicit
+    // key still wins and is validated exactly as before.
+    let idempotency_key = match args.idempotency_key.as_deref() {
+        Some(key) => {
+            validate_idempotency_key(key)?;
+            key.to_string()
+        }
+        None => default_quick_idempotency_key(&input),
+    };
     let repository = input.repository.clone().ok_or_else(|| {
         invalid_input("quick requires the assignment packet to declare a repository")
     })?;
@@ -3034,7 +3054,7 @@ fn run_quick(context: &CliContext, args: QuickArgs) -> Result<Value, CliError> {
             .collect(),
         summary: input.task_summary.clone(),
     };
-    ensure_or_acquire_claim(context, &record, &work_context, &args.idempotency_key)?;
+    ensure_or_acquire_claim(context, &record, &work_context, &idempotency_key)?;
 
     let objective = json!({
         "schema_version": PACKET_SCHEMA,
@@ -3058,7 +3078,7 @@ fn run_quick(context: &CliContext, args: QuickArgs) -> Result<Value, CliError> {
             &locked.registry,
             &record,
             &incarnation,
-            &args.idempotency_key,
+            &idempotency_key,
             "quick",
             &request_digest,
         )? {
@@ -3107,7 +3127,7 @@ fn run_quick(context: &CliContext, args: QuickArgs) -> Result<Value, CliError> {
                     &mut locked.registry,
                     &record,
                     &incarnation,
-                    &args.idempotency_key,
+                    &idempotency_key,
                     "quick",
                     &request_digest,
                     pending,
@@ -3125,7 +3145,7 @@ fn run_quick(context: &CliContext, args: QuickArgs) -> Result<Value, CliError> {
             assignment_file: Some(args.assignment_file.clone()),
             batch: None,
             if_run_revision: None,
-            idempotency_key: format!("{}-worker", args.idempotency_key),
+            idempotency_key: format!("{}-worker", idempotency_key),
             await_ready: "0".to_string(),
             format: OutputFormat::Json,
         },
@@ -3149,7 +3169,7 @@ fn run_quick(context: &CliContext, args: QuickArgs) -> Result<Value, CliError> {
         &mut locked.registry,
         &record,
         &incarnation,
-        &args.idempotency_key,
+        &idempotency_key,
         "quick",
         &request_digest,
         outcome.clone(),
@@ -3528,9 +3548,45 @@ fn store_receipt(
     Ok(())
 }
 
+/// A ready-to-edit example objective packet, printed by `main-agent
+/// packet-schema` so operators can discover the required fields (and the two
+/// nested schema_version constants) without reverse-engineering a validation
+/// error. Illustrative placeholders, not a live packet.
+fn objective_packet_schema_example() -> Value {
+    json!({
+        "schema_version": PACKET_SCHEMA,
+        "tier": "L0",
+        "objective_summary": "<one-line objective summary>",
+        "objective": {},
+        "done_criteria": ["<done criterion>"],
+        "constraints": ["<constraint>"],
+        "durable_refs": [],
+        "next_action": null,
+        "work_context": {
+            "schema_version": WORK_CONTEXT_INPUT_VERSION,
+            "intent": "implementation",
+            "tier": "L0",
+            "repositories": ["owner/name"],
+            "summary": "<work-context summary>"
+        }
+    })
+}
+
+/// Derive a stable, slug-safe idempotency key from the assignment packet so the
+/// `quick` fast-path caller can omit `--idempotency-key`. Identical packets map
+/// to the same key, preserving idempotent replay; the `quick-` prefix plus 32
+/// hex digits satisfies the 8-128 printable-ASCII key rule.
+fn default_quick_idempotency_key(input: &AssignmentInput) -> String {
+    let digest = crate::coordination::request_digest("main-agent-quick-idempotency", input);
+    format!("quick-{}", &digest[..32])
+}
+
 fn validate_objective_packet(packet: &ObjectivePacket) -> Result<(), CliError> {
     if packet.schema_version != PACKET_SCHEMA {
-        return Err(invalid_input("objective packet schema is unsupported"));
+        return Err(invalid_input(&format!(
+            "objective packet schema is unsupported; expected schema_version \"{PACKET_SCHEMA}\""
+        ))
+        .with_hint("run `main-agent packet-schema` for an example objective packet"));
     }
     orchestration::validate_summary("objective summary", &packet.objective_summary)?;
     if !matches!(packet.tier.as_str(), "L0" | "L1" | "L2" | "L3") {
@@ -3551,7 +3607,9 @@ fn validate_objective_packet(packet: &ObjectivePacket) -> Result<(), CliError> {
 
 fn validate_assignment_input(input: &AssignmentInput) -> Result<(), CliError> {
     if input.schema_version != ASSIGNMENT_INPUT_SCHEMA {
-        return Err(invalid_input("assignment packet schema is unsupported"));
+        return Err(invalid_input(&format!(
+            "assignment packet schema is unsupported; expected schema_version \"{ASSIGNMENT_INPUT_SCHEMA}\""
+        )));
     }
     orchestration::validate_summary("task summary", &input.task_summary)?;
     if input.scopes.len() > 32
@@ -3578,7 +3636,9 @@ fn validate_assignment_input(input: &AssignmentInput) -> Result<(), CliError> {
 
 fn validate_checkpoint(input: &CheckpointInput) -> Result<(), CliError> {
     if input.schema_version != CHECKPOINT_INPUT_SCHEMA {
-        return Err(invalid_input("checkpoint schema is unsupported"));
+        return Err(invalid_input(&format!(
+            "checkpoint schema is unsupported; expected schema_version \"{CHECKPOINT_INPUT_SCHEMA}\""
+        )));
     }
     orchestration::validate_summary("checkpoint summary", &input.summary)?;
     orchestration::validate_summary("next action", &input.next_action)?;
@@ -3674,6 +3734,7 @@ fn command_name(command: &MainAgentCommand) -> &'static str {
         MainAgentCommand::Adopt(_) => "adopt",
         MainAgentCommand::Close(_) => "close",
         MainAgentCommand::Quick(_) => "quick",
+        MainAgentCommand::PacketSchema(_) => "packet-schema",
         MainAgentCommand::Completion(_) => "completion",
     }
 }
@@ -3708,6 +3769,7 @@ fn command_output_format(command: &MainAgentCommand) -> OutputFormat {
         MainAgentCommand::Adopt(args) => args.format,
         MainAgentCommand::Close(args) => args.format,
         MainAgentCommand::Quick(args) => args.format,
+        MainAgentCommand::PacketSchema(args) => args.format,
         MainAgentCommand::Completion(_) => OutputFormat::Text,
     }
 }
@@ -3758,12 +3820,18 @@ fn render_error(command: &'static str, format: OutputFormat, error: CliError) ->
             if let Some(details) = error.details {
                 envelope_error = envelope_error.with_details(details);
             }
+            if let Some(hint) = error.hint {
+                envelope_error = envelope_error.with_hint(hint);
+            }
             let envelope: Envelope<()> =
                 Envelope::failure(schema_version_for(BINARY, command, 1), envelope_error);
             print_json(&envelope);
         }
         OutputFormat::Text => {
             let _ = writeln!(io::stderr(), "error: {}", error.message);
+            if let Some(hint) = error.hint.as_deref() {
+                let _ = writeln!(io::stderr(), "hint: {hint}");
+            }
         }
     }
     error.exit_code
@@ -4396,6 +4464,44 @@ mod tests {
         assert_eq!(readiness_from_state("submitted"), "ready");
         assert_eq!(readiness_from_state("accepted"), "ready");
         assert_eq!(readiness_from_state("released"), "ready");
+    }
+
+    #[test]
+    fn default_quick_idempotency_key_is_stable_and_slug_valid() {
+        let input = AssignmentInput {
+            schema_version: ASSIGNMENT_INPUT_SCHEMA.to_string(),
+            assignment_id: None,
+            task_summary: "demo task".to_string(),
+            task: json!({}),
+            launch: WorkerLaunchInput {
+                agent: "codex".to_string(),
+                cwd: "/repo".to_string(),
+                title: None,
+                session_id: None,
+                coordination_mode: CoordinationMode::default(),
+                agent_args: Vec::new(),
+            },
+            repository: Some("owner/name".to_string()),
+            worktree: None,
+            base_ref: None,
+            scopes: Vec::new(),
+            durable_refs: Vec::new(),
+            depends_on: Vec::new(),
+        };
+        let key = default_quick_idempotency_key(&input);
+        assert!(key.starts_with("quick-"), "key = {key}");
+        assert_eq!(key.len(), 38, "quick- prefix plus 32 hex digits");
+        assert!(
+            validate_idempotency_key(&key).is_ok(),
+            "derived key must satisfy the idempotency-key rule: {key}"
+        );
+        // Deterministic: identical packets map to the same key so replay stays
+        // idempotent without a caller-supplied key.
+        assert_eq!(key, default_quick_idempotency_key(&input));
+        // A materially different packet maps to a different key.
+        let mut other = input.clone();
+        other.task_summary = "different task".to_string();
+        assert_ne!(key, default_quick_idempotency_key(&other));
     }
 
     #[test]

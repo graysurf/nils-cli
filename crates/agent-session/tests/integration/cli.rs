@@ -2192,6 +2192,35 @@ fn codex_activity_doctor_surfaces_notification_config_errors() {
     );
 }
 
+// F7/F8: the doctor surfaces the running binary's own version (so a stale/split
+// install is diagnosable) and an explicit `can_launch_worker` signal that is
+// distinct from the config-presence `configured` axis.
+#[test]
+fn activity_doctor_reports_binary_version_and_launch_readiness() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let home = tmp.path().join("home");
+    fs::create_dir_all(home.join(".codex")).expect("codex dir");
+    fs::write(home.join(".codex/hooks.json"), r#"{"hooks":{}}"#).expect("hooks config");
+    let home_arg = home.to_string_lossy().to_string();
+    let doctor = run(
+        tmp.path(),
+        &["activity", "doctor", "--agent", "codex", "--format", "json"],
+        &[("HOME", home_arg.as_str())],
+    );
+    assert_eq!(doctor.code, 0, "stderr={}", doctor.stderr_text());
+    let doctor_json = doctor.stdout_json();
+    assert!(
+        data(&doctor_json)["binary_version"]
+            .as_str()
+            .is_some_and(|version| !version.is_empty()),
+        "binary_version must be a non-empty string: {doctor_json}"
+    );
+    let provider = &data(&doctor_json)["providers"][0];
+    // Unconfigured/unaudited in this hermetic env, so launch is not permitted;
+    // the field is present and boolean regardless of the config axis.
+    assert_eq!(provider["can_launch_worker"], false);
+}
+
 #[test]
 fn codex_activity_doctor_recognizes_audited_computer_use_owned_notify() {
     let tmp = tempfile::TempDir::new().expect("tempdir");

@@ -355,6 +355,20 @@ fn detect_format_from_args(args: &[OsString]) -> OutputFormat {
 }
 
 fn render_clap_message(err: &clap::Error) -> String {
+    // clap prints the missing argument names on indented continuation lines that
+    // the first-non-empty-line collapse below would drop, leaving an unnamed
+    // "the following required arguments were not provided:" message. Pull the
+    // names from the structured error context so the envelope names them.
+    if err.kind() == clap::error::ErrorKind::MissingRequiredArgument
+        && let Some(clap::error::ContextValue::Strings(missing)) =
+            err.get(clap::error::ContextKind::InvalidArg)
+        && !missing.is_empty()
+    {
+        return format!(
+            "the following required arguments were not provided: {}",
+            missing.join(", ")
+        );
+    }
     let rendered = err.to_string();
     rendered
         .lines()
@@ -1564,6 +1578,9 @@ struct CliErrorData {
     code: String,
     message: String,
     details: Option<Value>,
+    /// Optional actionable remedy surfaced as the envelope `hint` (JSON) or a
+    /// `hint:` line (text). None keeps the wire shape identical to before.
+    hint: Option<String>,
     exit_code: i32,
 }
 
@@ -1581,6 +1598,7 @@ impl CliError {
             code: code.into(),
             message: message.into(),
             details,
+            hint: None,
             exit_code: exit::USAGE,
         }))
     }
@@ -1594,6 +1612,7 @@ impl CliError {
             code: code.into(),
             message: message.into(),
             details,
+            hint: None,
             exit_code: exit::RUNTIME,
         }))
     }
@@ -1603,6 +1622,7 @@ impl CliError {
             code: code.into(),
             message: message.into(),
             details,
+            hint: None,
             exit_code: exit::DATA,
         }))
     }
@@ -1625,8 +1645,16 @@ impl CliError {
             code: code.into(),
             message: message.into(),
             details,
+            hint: None,
             exit_code,
         }))
+    }
+
+    /// Attach an actionable remedy hint to this error. Mirrors git-cli's
+    /// `CliError::with_hint`; surfaced by `render_error` in both binaries.
+    fn with_hint(mut self, hint: impl Into<String>) -> Self {
+        self.0.hint = Some(hint.into());
+        self
     }
 
     fn into_inner(self) -> CliErrorData {
@@ -9645,12 +9673,18 @@ fn render_error(command: &'static str, format: OutputFormat, err: CliError) -> i
             if let Some(details) = err.details {
                 envelope_error = envelope_error.with_details(details);
             }
+            if let Some(hint) = err.hint {
+                envelope_error = envelope_error.with_hint(hint);
+            }
             let envelope: Envelope<()> =
                 Envelope::failure(schema_version_for(BINARY, command, 1), envelope_error);
             print_json(&envelope);
         }
         OutputFormat::Text => {
             let _ = writeln!(io::stderr(), "error: {}", err.message);
+            if let Some(hint) = err.hint.as_deref() {
+                let _ = writeln!(io::stderr(), "hint: {hint}");
+            }
         }
     }
     err.exit_code
@@ -9733,12 +9767,14 @@ fn render_activity_text(result: &activity::ActivityResult) -> String {
 
 fn render_doctor_text(result: &activity::DoctorResult) -> String {
     let mut text = String::new();
+    text.push_str(&format!("binary: {}\n", result.binary_version));
     for provider in &result.providers {
         text.push_str(&format!(
-            "{}: {} (configured: {})\n",
+            "{}: {} (configured: {}, can launch worker: {})\n",
             provider.provider,
             provider.classification,
-            if provider.configured { "yes" } else { "no" }
+            if provider.configured { "yes" } else { "no" },
+            if provider.can_launch_worker { "yes" } else { "no" }
         ));
         text.push_str(&format!("  completion: {}\n", provider.completion));
         if let Some(mode) = provider.notification_mode.as_deref() {

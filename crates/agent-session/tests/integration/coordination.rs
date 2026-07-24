@@ -1602,6 +1602,12 @@ fn coordination_public_identifiers_do_not_authorize_a_claim_or_echo_peer_data() 
         output.stdout_json()["error"]["code"],
         "coordination-unauthorized"
     );
+    assert!(
+        output.stdout_json()["error"]["hint"]
+            .as_str()
+            .is_some_and(|hint| hint.contains("self show")),
+        "coordination-unauthorized must carry a remedy hint"
+    );
     let combined = format!("{}{}", output.stdout_text(), output.stderr_text());
     assert!(!combined.contains(private_canary), "{combined}");
     assert!(!combined.contains("incarnation-alpha"), "{combined}");
@@ -5960,5 +5966,175 @@ fn main_agent_worker_retire_rejects_non_terminal_and_missing() {
     assert_eq!(
         missing.stdout_json()["error"]["code"],
         "assignment-not-found"
+    );
+}
+
+// F4: the objective-packet schema is discoverable via `main-agent packet-schema`
+// (an example naming both nested schema_version constants), and a schema
+// mismatch names the expected version and points back at the printer.
+#[test]
+fn main_agent_packet_schema_prints_the_example_packet() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let state_dir = tmp.path().join("state");
+    fs::create_dir(&state_dir).expect("state");
+    let state_arg = state_dir.to_str().expect("state path").to_string();
+    let output = run_main_agent(
+        tmp.path(),
+        &[
+            "--state-dir",
+            &state_arg,
+            "packet-schema",
+            "--format",
+            "json",
+        ],
+        &[],
+    );
+    assert_eq!(output.code, 0, "stderr={}", output.stderr_text());
+    assert_eq!(
+        data(&output)["schema_version"],
+        "main-agent.objective-packet.v1"
+    );
+    assert_eq!(
+        data(&output)["work_context"]["schema_version"],
+        "agent-session.work-context-input.v1"
+    );
+    assert_eq!(
+        data(&output)["work_context"]["repositories"][0],
+        "owner/name"
+    );
+}
+
+#[test]
+fn main_agent_init_unsupported_schema_names_expected_version_and_hints_packet_schema() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let state_dir = tmp.path().join("state");
+    fs::create_dir(&state_dir).expect("state");
+    let state_arg = state_dir.to_str().expect("state path").to_string();
+    let packet = tmp.path().join("objective.json");
+    fs::write(
+        &packet,
+        serde_json::to_vec(&json!({
+            "schema_version": "main-agent.objective-packet.v0",
+            "tier": "L0",
+            "objective_summary": "demo",
+            "work_context": {
+                "schema_version": "agent-session.work-context-input.v1",
+                "intent": "implementation",
+                "tier": "L0",
+                "repositories": ["owner/name"],
+                "summary": "demo"
+            }
+        }))
+        .expect("packet json"),
+    )
+    .expect("write packet");
+    fs::set_permissions(&packet, fs::Permissions::from_mode(0o600)).expect("packet mode");
+    let output = run_main_agent(
+        tmp.path(),
+        &[
+            "--state-dir",
+            &state_arg,
+            "init",
+            "--packet-file",
+            packet.to_str().expect("packet path"),
+            "--if-absent",
+            "--idempotency-key",
+            "init-bad-schema-0001",
+            "--format",
+            "json",
+        ],
+        &[],
+    );
+    assert_ne!(output.code, 0);
+    let error = output.stdout_json();
+    let error = &error["error"];
+    assert_eq!(error["code"], "invalid-orchestration-input");
+    assert!(
+        error["message"]
+            .as_str()
+            .expect("message")
+            .contains("main-agent.objective-packet.v1"),
+        "message must name the expected schema_version: {error}"
+    );
+    assert!(
+        error["hint"]
+            .as_str()
+            .expect("hint")
+            .contains("packet-schema"),
+        "hint must point at packet-schema: {error}"
+    );
+}
+
+// F3: a `worker start` parse error names the actual missing argument instead of
+// collapsing to an unnamed "required arguments were not provided" line.
+#[test]
+fn main_agent_worker_start_parse_error_names_the_missing_idempotency_key() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let state_dir = tmp.path().join("state");
+    fs::create_dir(&state_dir).expect("state");
+    let state_arg = state_dir.to_str().expect("state path").to_string();
+    let output = run_main_agent(
+        tmp.path(),
+        &[
+            "--state-dir",
+            &state_arg,
+            "worker",
+            "start",
+            "--assignment-file",
+            "/nonexistent/assignment.json",
+            "--if-run-revision",
+            "1",
+            "--format",
+            "json",
+        ],
+        &[],
+    );
+    assert_ne!(output.code, 0);
+    let error = output.stdout_json();
+    let error = &error["error"];
+    assert_eq!(error["code"], "parse-error");
+    assert!(
+        error["message"]
+            .as_str()
+            .expect("message")
+            .contains("--idempotency-key"),
+        "parse error must name the missing --idempotency-key: {error}"
+    );
+}
+
+// F1: `quick` no longer requires --idempotency-key (it defaults from a digest of
+// the assignment packet), so clap only reports the still-required
+// --assignment-file when both are omitted.
+#[test]
+fn main_agent_quick_no_longer_requires_an_idempotency_key() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let state_dir = tmp.path().join("state");
+    fs::create_dir(&state_dir).expect("state");
+    let state_arg = state_dir.to_str().expect("state path").to_string();
+    let output = run_main_agent(
+        tmp.path(),
+        &[
+            "--state-dir",
+            &state_arg,
+            "quick",
+            "--tier",
+            "L0",
+            "--format",
+            "json",
+        ],
+        &[],
+    );
+    assert_ne!(output.code, 0);
+    let error = output.stdout_json();
+    let error = &error["error"];
+    assert_eq!(error["code"], "parse-error");
+    let message = error["message"].as_str().expect("message");
+    assert!(
+        message.contains("--assignment-file"),
+        "must still require --assignment-file: {error}"
+    );
+    assert!(
+        !message.contains("--idempotency-key"),
+        "must no longer require --idempotency-key: {error}"
     );
 }
