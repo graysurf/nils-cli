@@ -5862,16 +5862,23 @@ fn main_agent_worker_start_await_ready_folds_timeout_into_readiness_failed() {
     assert_eq!(readiness["delivery"]["state"], "unverified");
     assert_eq!(
         readiness["delivery"]["transport_state"],
-        "submit-command-succeeded"
+        "submit-key-recovery-succeeded"
     );
     assert_eq!(readiness["delivery"]["proof"], "worker-checkpoint-timeout");
+    assert_eq!(readiness["submit_key_recovery"]["eligible"], true);
+    assert_eq!(readiness["submit_key_recovery"]["attempted"], true);
+    assert_eq!(readiness["submit_key_recovery"]["attempt_count"], 1);
+    assert_eq!(
+        readiness["submit_key_recovery"]["result"],
+        "checkpoint-timeout"
+    );
     assert_eq!(readiness["automatic_retry_safe"], false);
     assert!(
         readiness["safe_state"]
             .as_str()
             .unwrap_or_default()
-            .contains("do not resend"),
-        "readiness_failed safe_state should forbid duplicate submission: {}",
+            .contains("single-Enter recovery is exhausted"),
+        "readiness_failed safe_state should bound recovery: {}",
         readiness["safe_state"]
     );
     assert!(
@@ -5881,6 +5888,184 @@ fn main_agent_worker_start_await_ready_folds_timeout_into_readiness_failed() {
             .contains("worker retire"),
         "starting is not a retireable assignment state: {}",
         readiness["safe_state"]
+    );
+    let enter_calls = tmux_calls(&tmux_log)
+        .into_iter()
+        .filter(|call| {
+            call.first().is_some_and(|arg| arg == "send-keys")
+                && call.last().is_some_and(|arg| arg == "Enter")
+        })
+        .count();
+    assert_eq!(
+        enter_calls, 2,
+        "initial submission plus exactly one recovery Enter"
+    );
+}
+
+#[test]
+fn main_agent_worker_start_single_enter_recovery_confirms_checkpoint() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let state_dir = tmp.path().join("state");
+    let checkout = tmp.path().join("checkout");
+    let worker_checkout = tmp.path().join("worker-checkout");
+    fs::create_dir(&state_dir).expect("state");
+    init_checkout(&checkout, "https://example.invalid/example/repository.git");
+    init_checkout(
+        &worker_checkout,
+        "https://example.invalid/example/repository.git",
+    );
+    seed_brokers_at(
+        &state_dir,
+        &[(
+            "main-one",
+            "main-incarnation-one",
+            "main-private-capability-material-0000000001",
+            checkout.as_path(),
+            Some("enforce"),
+        )],
+    );
+    let main_capability = init_main_run(tmp.path(), &state_dir, &checkout, "main-one", "run-one");
+    let (tmux_bin, tmux_log) = fake_tmux(tmp.path());
+    let codex_bin = fake_agent(tmp.path(), "codex-worker");
+    let assignment_id = "assignment-enter-recovery";
+    let worker_id = "worker-enter-recovery";
+    let assignment_path = tmp.path().join("assignment-enter-recovery.json");
+    write_private_json(
+        &assignment_path,
+        &json!({
+            "schema_version": "main-agent.assignment-input.v1",
+            "assignment_id": assignment_id,
+            "task_summary": "Recover one dropped submit key",
+            "task": {},
+            "launch": {
+                "agent": "codex",
+                "cwd": worker_checkout,
+                "title": null,
+                "session_id": worker_id,
+                "coordination_mode": "enforce",
+                "agent_args": []
+            },
+            "repository": "example/repository",
+            "worktree": null,
+            "base_ref": "main",
+            "scopes": ["crates/worker-lane"],
+            "durable_refs": []
+        }),
+    );
+
+    let bootstrap_digest = orchestration_request_digest(
+        "main-agent-worker-bootstrap-idempotency",
+        &json!(assignment_id),
+    );
+    let bootstrap_key = format!("bootstrap-{}", &bootstrap_digest[..32]);
+    let enter_hook = tmp.path().join("bootstrap-on-second-enter");
+    let enter_hook_output = tmp.path().join("bootstrap-on-second-enter.json");
+    fs::write(
+        &enter_hook,
+        format!(
+            r#"#!/usr/bin/env sh
+set -eu
+capability_file=""
+for candidate in {state_dir}/sessions/{worker_id}/coordination/capability-*; do
+  [ -f "$candidate" ] || continue
+  capability_file="$candidate"
+  break
+done
+[ -n "$capability_file" ]
+cd {worker_checkout}
+AGENT_SESSION_CAPABILITY_FILE="$capability_file" \
+  {main_agent} --state-dir {state_dir} bootstrap \
+  --idempotency-key {bootstrap_key} --format json > {output}
+"#,
+            state_dir = state_dir.display(),
+            worker_checkout = worker_checkout.display(),
+            worker_id = worker_id,
+            main_agent = bin::resolve("main-agent").display(),
+            bootstrap_key = bootstrap_key,
+            output = enter_hook_output.display(),
+        ),
+    )
+    .expect("enter hook");
+    fs::set_permissions(&enter_hook, fs::Permissions::from_mode(0o700)).expect("enter hook mode");
+    let enter_count = tmp.path().join("enter-count");
+
+    let tmux_arg = tmux_bin.to_string_lossy().into_owned();
+    let tmux_log_arg = tmux_log.to_string_lossy().into_owned();
+    let codex_arg = codex_bin.to_string_lossy().into_owned();
+    let enter_hook_arg = enter_hook.to_string_lossy().into_owned();
+    let enter_count_arg = enter_count.to_string_lossy().into_owned();
+    let started = run_main_agent(
+        &checkout,
+        &[
+            "--state-dir",
+            state_dir.to_str().expect("state dir"),
+            "worker",
+            "start",
+            "--assignment-file",
+            assignment_path.to_str().expect("assignment path"),
+            "--if-run-revision",
+            "1",
+            "--await-ready",
+            "2s",
+            "--idempotency-key",
+            "worker-start-enter-recovery-0001",
+            "--format",
+            "json",
+        ],
+        &[
+            ("AGENT_SESSION_CAPABILITY_FILE", &main_capability),
+            ("AGENT_SESSION_TMUX_BIN", &tmux_arg),
+            ("AGENT_SESSION_CODEX_BIN", &codex_arg),
+            ("AGENT_SESSION_FAKE_TMUX_LOG", &tmux_log_arg),
+            ("AGENT_SESSION_FAKE_TMUX_ENTER_HOOK", &enter_hook_arg),
+            ("AGENT_SESSION_FAKE_TMUX_ENTER_COUNT_FILE", &enter_count_arg),
+        ],
+    );
+    assert_eq!(started.code, 0, "stderr={}", started.stderr_text());
+    let readiness = data(&started)["readiness"].clone();
+    let enter_hook_result = fs::read_to_string(&enter_hook_output).unwrap_or_else(|error| {
+        format!(
+            "missing hook output ({error}); enter-count={}",
+            fs::read_to_string(&enter_count).unwrap_or_else(|_| "missing".to_string())
+        )
+    });
+    assert!(
+        enter_hook_output.is_file(),
+        "second Enter did not run bootstrap: {enter_hook_result}"
+    );
+    assert_eq!(
+        readiness["state"],
+        "ready",
+        "readiness={readiness} hook={enter_hook_result} stderr={}",
+        started.stderr_text()
+    );
+    assert_eq!(readiness["assignment_state"], "working");
+    assert_eq!(readiness["delivery"]["state"], "confirmed");
+    assert_eq!(
+        readiness["delivery"]["transport_state"],
+        "submit-key-recovery-succeeded"
+    );
+    assert_eq!(
+        readiness["delivery"]["proof"],
+        "authenticated-worker-checkpoint"
+    );
+    assert_eq!(readiness["submit_key_recovery"]["eligible"], true);
+    assert_eq!(readiness["submit_key_recovery"]["attempted"], true);
+    assert_eq!(readiness["submit_key_recovery"]["attempt_count"], 1);
+    assert_eq!(
+        readiness["submit_key_recovery"]["result"],
+        "checkpoint-confirmed"
+    );
+    let enter_calls = tmux_calls(&tmux_log)
+        .into_iter()
+        .filter(|call| {
+            call.first().is_some_and(|arg| arg == "send-keys")
+                && call.last().is_some_and(|arg| arg == "Enter")
+        })
+        .count();
+    assert_eq!(
+        enter_calls, 2,
+        "initial submission plus exactly one recovery Enter"
     );
 }
 

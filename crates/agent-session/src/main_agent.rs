@@ -27,8 +27,8 @@ use crate::orchestration::{
 };
 use crate::{
     CliContext, CliError, SessionRecord, SessionRegistryFence, StartFailureDisposition,
-    delete_session, load_session_record, resolve_tmux_bin, session_dir, session_status,
-    start_session,
+    delete_session, load_session_record, resolve_tmux_bin, send_input_serialized, session_dir,
+    session_status, start_session,
 };
 
 const BINARY: &str = "main-agent";
@@ -216,8 +216,10 @@ struct WorkerStartArgs {
     if_run_revision: Option<u64>,
     /// After launch, wait up to this bounded duration (0 = no wait) for the
     /// worker's authenticated checkpoint to advance the assignment past
-    /// `starting`. This folds the readiness + newer-turn + identity proof into
-    /// worker start's typed result. 0-5m (integer with optional s/m/h suffix).
+    /// `starting`. A fresh Codex or Claude launch that remains `starting`
+    /// receives one runtime-owned recovery Enter before the same deadline.
+    /// This folds the readiness + newer-turn + identity proof into worker
+    /// start's typed result. 0-5m (integer with optional s/m/h suffix).
     #[arg(long, default_value = "0")]
     await_ready: String,
     #[arg(long, help = IDEMPOTENCY_KEY_HELP)]
@@ -1441,6 +1443,7 @@ fn run_worker_start_single(context: &CliContext, args: WorkerStartArgs) -> Resul
         Err(error) if error.code() == "session-not-found" => None,
         Err(error) => return Err(error),
     };
+    let fresh_launch = existing.is_none();
     let (worker_record, worker_status) = if let Some(worker) = existing {
         ensure_worker_launch_matches(context, &worker, &input, &prompt)?;
         let status = session_status(&resolve_tmux_bin(None), &worker);
@@ -1529,8 +1532,15 @@ fn run_worker_start_single(context: &CliContext, args: WorkerStartArgs) -> Resul
     drop(locked);
     let mut outcome = outcome;
     if let Some(timeout) = await_ready {
-        outcome["readiness"] =
-            await_worker_readiness(context, &record, &incarnation, &assignment_id, timeout)?;
+        let submit_key_recovery_eligible = worker_submit_key_recovery_eligible(fresh_launch, agent);
+        outcome["readiness"] = await_worker_readiness(
+            context,
+            &record,
+            &incarnation,
+            &assignment_id,
+            timeout,
+            submit_key_recovery_eligible.then_some((&worker_record, &worker_incarnation)),
+        )?;
     }
     Ok(outcome)
 }
@@ -1734,6 +1744,10 @@ const WORKER_WAIT_MAX_SECS: u64 = 60;
 const WORKER_AWAIT_READY_MAX_SECS: u64 = 5 * 60;
 /// Delay between registry reads while polling; mirrors `mailbox::wait`.
 const WORKER_WAIT_POLL_INTERVAL: Duration = Duration::from_millis(50);
+/// Maximum delay before one runtime-owned submit-key recovery. Shorter
+/// `--await-ready` bounds recover halfway through so the same total deadline
+/// still leaves time for the authenticated checkpoint.
+const WORKER_SUBMIT_KEY_RECOVERY_DELAY: Duration = Duration::from_secs(5);
 
 /// Completion-awareness for the orchestrating Main Agent: a bounded, read-only
 /// long-poll that returns once the watched assignment(s) reach the `--until`
@@ -1881,6 +1895,10 @@ fn readiness_from_state(state: &str) -> &'static str {
     }
 }
 
+fn worker_submit_key_recovery_eligible(fresh_launch: bool, agent: AgentKind) -> bool {
+    fresh_launch && matches!(agent, AgentKind::Codex | AgentKind::Claude)
+}
+
 /// Bounded, read-only wait for a freshly launched worker to advance its
 /// assignment past `starting`, returning the typed readiness projection. Mirrors
 /// the `worker wait` poll (no lock, level-triggered) so it never blocks the
@@ -1891,8 +1909,13 @@ fn await_worker_readiness(
     incarnation: &str,
     assignment_id: &str,
     timeout: Duration,
+    submit_key_recovery: Option<(&SessionRecord, &str)>,
 ) -> Result<Value, CliError> {
     let started = Instant::now();
+    let recovery_after = std::cmp::min(WORKER_SUBMIT_KEY_RECOVERY_DELAY, timeout / 2);
+    let recovery_eligible = submit_key_recovery.is_some();
+    let mut recovery_attempted = false;
+    let mut recovery_transport_state = "submit-command-succeeded";
     loop {
         let registry = orchestration::load_registry_readonly(context)?;
         let run = require_current_main(&registry, record, incarnation)?;
@@ -1909,27 +1932,119 @@ fn await_worker_readiness(
                 "worker_launched": true,
                 "delivery": {
                     "state": "confirmed",
-                    "transport_state": "submit-command-succeeded",
+                    "transport_state": recovery_transport_state,
                     "proof": "authenticated-worker-checkpoint"
+                },
+                "submit_key_recovery": {
+                    "eligible": recovery_eligible,
+                    "attempted": recovery_attempted,
+                    "attempt_count": usize::from(recovery_attempted),
+                    "result": if recovery_attempted {
+                        "checkpoint-confirmed"
+                    } else {
+                        "not-needed"
+                    }
                 }
             }));
         }
-        if started.elapsed() >= timeout {
+        let elapsed = started.elapsed();
+        if !recovery_attempted
+            && elapsed >= recovery_after
+            && elapsed < timeout
+            && let Some((worker, worker_incarnation)) = submit_key_recovery
+        {
+            recovery_attempted = true;
+            match send_worker_submit_key_recovery(context, worker, worker_incarnation) {
+                Ok(()) => {
+                    recovery_transport_state = "submit-key-recovery-succeeded";
+                }
+                Err(result) => {
+                    return Ok(json!({
+                        "state": "readiness_failed",
+                        "assignment_state": state,
+                        "worker_launched": true,
+                        "delivery": {
+                            "state": "unverified",
+                            "transport_state": "submit-key-recovery-failed",
+                            "proof": result
+                        },
+                        "submit_key_recovery": {
+                            "eligible": true,
+                            "attempted": true,
+                            "attempt_count": 1,
+                            "result": result
+                        },
+                        "automatic_retry_safe": false,
+                        "safe_state": "worker remains bound in `starting`; runtime-owned single-Enter recovery failed and no further input is allowed. Keep the worker available for typed session diagnostics."
+                    }));
+                }
+            }
+            continue;
+        }
+        if elapsed >= timeout {
             return Ok(json!({
                 "state": "readiness_failed",
                 "assignment_state": state,
                 "worker_launched": true,
                 "delivery": {
                     "state": "unverified",
-                    "transport_state": "submit-command-succeeded",
+                    "transport_state": recovery_transport_state,
                     "proof": "worker-checkpoint-timeout"
                 },
+                "submit_key_recovery": {
+                    "eligible": recovery_eligible,
+                    "attempted": recovery_attempted,
+                    "attempt_count": usize::from(recovery_attempted),
+                    "result": if recovery_attempted {
+                        "checkpoint-timeout"
+                    } else {
+                        "not-eligible"
+                    }
+                },
                 "automatic_retry_safe": false,
-                "safe_state": "worker remains launched and bound in `starting`; prompt delivery is unverified, so do not resend the prompt or inject another Enter. Keep the worker available for transport diagnostics."
+                "safe_state": if recovery_attempted {
+                    "worker remains launched and bound in `starting`; runtime-owned single-Enter recovery is exhausted, so do not resend the prompt or inject another Enter. Keep the worker available for typed session diagnostics."
+                } else {
+                    "worker remains launched and bound in `starting`; submit-key recovery was not eligible, so do not resend the prompt or inject Enter. Keep the worker available for typed session diagnostics."
+                }
             }));
         }
         thread::sleep(WORKER_WAIT_POLL_INTERVAL);
     }
+}
+
+/// Submit one recovery Enter only for the exact fresh worker session bound by
+/// `worker start`. The caller has already proved that the assignment remains
+/// `starting`; this rechecks the session incarnation and live tmux runtime
+/// immediately before input so an old or replaced worker is never touched.
+fn send_worker_submit_key_recovery(
+    context: &CliContext,
+    expected: &SessionRecord,
+    expected_incarnation: &str,
+) -> Result<(), &'static str> {
+    let current =
+        load_session_record(context, &expected.id).map_err(|_| "worker-session-unavailable")?;
+    let current_incarnation = current
+        .runtime
+        .as_ref()
+        .map(|runtime| runtime.launch_id.as_str())
+        .filter(|value| !value.is_empty())
+        .ok_or("worker-incarnation-unavailable")?;
+    if current_incarnation != expected_incarnation {
+        return Err("worker-incarnation-changed");
+    }
+    let tmux_bin = resolve_tmux_bin(None);
+    if session_status(&tmux_bin, &current) != "running" {
+        return Err("worker-session-not-running");
+    }
+    send_input_serialized(
+        context,
+        expected,
+        None,
+        &[cli::SpecialKey::Enter],
+        &tmux_bin,
+    )
+    .map_err(|_| "submit-key-command-failed")
 }
 
 /// T1 teardown macro: retire an accepted (or already terminal) assignment in
@@ -4635,6 +4750,24 @@ mod tests {
         assert_eq!(readiness_from_state("submitted"), "ready");
         assert_eq!(readiness_from_state("accepted"), "ready");
         assert_eq!(readiness_from_state("released"), "ready");
+    }
+
+    #[test]
+    fn submit_key_recovery_is_only_for_fresh_codex_and_claude_workers() {
+        assert!(worker_submit_key_recovery_eligible(true, AgentKind::Codex));
+        assert!(worker_submit_key_recovery_eligible(true, AgentKind::Claude));
+        assert!(!worker_submit_key_recovery_eligible(
+            true,
+            AgentKind::Hermes
+        ));
+        assert!(!worker_submit_key_recovery_eligible(
+            false,
+            AgentKind::Codex
+        ));
+        assert!(!worker_submit_key_recovery_eligible(
+            false,
+            AgentKind::Claude
+        ));
     }
 
     #[test]

@@ -163,8 +163,17 @@ on the typed `readiness` result:
 - `state: "ready"` plus `delivery.state: "confirmed"` proves a newer,
   authenticated, incarnation-matched worker checkpoint.
 - `state: "readiness_failed"` plus `delivery.state: "unverified"` is a
-  deterministic failure to prove delivery. Do not resend the prompt or inject
-  another Enter; retain the bound worker for session-transport diagnostics.
+  deterministic failure to prove delivery after any eligible recovery is
+  exhausted. Do not resend the prompt or inject another Enter; retain the
+  bound worker for typed session-transport diagnostics.
+
+For a fresh Codex or Claude launch that remains `starting`, the runtime rechecks
+the exact session incarnation and live tmux status, sends one recovery Enter,
+and continues waiting within the original `--await-ready` deadline. This is not
+a Main Agent decision or a prompt retry. The typed `submit_key_recovery`
+projection reports eligibility, whether the single recovery was attempted, and
+whether it produced the authenticated checkpoint. Existing/replayed sessions,
+Hermes, stopped or replaced sessions, and a second keypress are ineligible.
 
 `acceptance.state: "pending-worker-checkpoint"` and `transport_only: true`
 remain the launch-only result when `--await-ready 0` is selected. Launch
@@ -202,8 +211,9 @@ Bootstrap authenticates the current worker, returns only its private assignment
 packet, derives and acquires the declared work-context claim, and records the
 revision-fenced `working` checkpoint. The `worker start --await-ready` caller
 observes that checkpoint as the `authenticated-worker-checkpoint` delivery
-proof. Do not add a second Enter, resend the prompt, or manually repeat
-bootstrap after a typed readiness failure.
+proof. Any eligible single-Enter recovery is already owned and bounded by that
+runtime call. Do not add another Enter, resend the prompt, or manually repeat
+bootstrap after its typed result.
 
 For diagnostics after failure, `main-agent self show --format json` and
 `main-agent rehydrate --format markdown` may be used read-only to distinguish

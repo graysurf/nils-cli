@@ -150,7 +150,7 @@ _arguments "${_arguments_options[@]}" : \
 '(--batch)--assignment-file=[Private assignment packet JSON file (single-lane launch)]:PATH:_files' \
 '--batch=[Directory of assignment packet JSON files to launch as one batch. Each lane is fenced independently (T2 decouple), so one lane failing isolates to its own typed result rather than aborting the batch]:DIR:_files -/' \
 '--if-run-revision=[Optional expected run revision. Omit to launch without a run-revision fence\: assignment creation is decoupled from the run revision, so parallel and batch starts no longer collide. When supplied, a stale value fails closed and reports current_revision.]:IF_RUN_REVISION:_default' \
-'--await-ready=[After launch, wait up to this bounded duration (0 = no wait) for the worker'\''s authenticated checkpoint to advance the assignment past \`starting\`. This folds the readiness + newer-turn + identity proof into worker start'\''s typed result. 0-5m (integer with optional s/m/h suffix)]:AWAIT_READY:_default' \
+'--await-ready=[After launch, wait up to this bounded duration (0 = no wait) for the worker'\''s authenticated checkpoint to advance the assignment past \`starting\`. A fresh Codex or Claude launch that remains \`starting\` receives one runtime-owned recovery Enter before the same deadline. This folds the readiness + newer-turn + identity proof into worker start'\''s typed result. 0-5m (integer with optional s/m/h suffix)]:AWAIT_READY:_default' \
 '--idempotency-key=[Retry an ambiguous outcome with the same idempotency key and the same logical request; use a new key for a changed request.]:IDEMPOTENCY_KEY:_default' \
 '--format=[]:FORMAT:((text\:"Human-readable text output (default)"
 json\:"Single-record JSON envelope (snake_case)"))' \

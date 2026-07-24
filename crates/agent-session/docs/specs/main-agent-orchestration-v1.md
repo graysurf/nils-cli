@@ -125,14 +125,22 @@ advance the assignment past `starting`, then returns a typed `readiness`
 checkpoint advancing is the readiness + newer-turn + identity proof, so the Main
 Agent branches on one typed result instead of hand-running the verified-startup
 sequence. `readiness.delivery.state: confirmed` requires that checkpoint and
-names `authenticated-worker-checkpoint` as its proof. A timeout reports
-`delivery.state: unverified`, `automatic_retry_safe: false`, and explicitly
-forbids duplicate prompt or Enter injection; a successful terminal submit
-command alone is not provider acceptance. The wait takes no registry lock, so it
-never blocks the worker's own checkpoint; `--await-ready 0` preserves the
-launch-only `pending-worker-checkpoint` result. `worker retire ID` is the
-teardown macro: it composes release -> delete and reports the worker's absence
-in one call, replacing the hand-run
+names `authenticated-worker-checkpoint` as its proof. While a fresh Codex or
+Claude launch remains `starting`, the runtime rechecks its exact incarnation
+and live tmux status, sends at most one recovery Enter, and keeps waiting inside
+the original deadline. It never resends the prompt. The additive
+`submit_key_recovery` projection reports eligibility, attempt count, and
+result; a recovered checkpoint uses
+`delivery.transport_state: submit-key-recovery-succeeded`. Existing/replayed
+sessions, Hermes, stopped or replaced sessions, and any second recovery
+keypress are ineligible. A final timeout reports `delivery.state: unverified`,
+`automatic_retry_safe: false`, and explicitly forbids duplicate prompt or
+further Enter injection. A successful terminal submit command alone is not
+provider acceptance. The wait takes no registry lock, so it never blocks the
+worker's own checkpoint; `--await-ready 0` preserves the launch-only
+`pending-worker-checkpoint` result. `worker retire ID` is the teardown macro: it
+composes release -> delete and reports the worker's absence in one call,
+replacing the hand-run
 release -> delete -> confirm sequence. An accepted assignment is released first;
 an already-terminal one goes straight to delete. Per-step idempotency keys are
 derived from the retire key so a retry converges through each step's receipt.

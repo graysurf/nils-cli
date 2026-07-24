@@ -259,6 +259,25 @@ if [ "$1" = "new-session" ]; then
   printf '%s\t%s\t%s\n' "$session_identity" "$pane_identity" "$pane_pid"
 fi
 
+if [ "$1" = "send-keys" ] && [ "${AGENT_SESSION_FAKE_TMUX_ENTER_HOOK+x}" = "x" ]; then
+  last_arg=""
+  for arg in "$@"; do
+    last_arg="$arg"
+  done
+  if [ "$last_arg" = "Enter" ]; then
+    count_file="${AGENT_SESSION_FAKE_TMUX_ENTER_COUNT_FILE:?}"
+    count=0
+    if [ -r "$count_file" ]; then
+      count="$(cat "$count_file")"
+    fi
+    count=$((count + 1))
+    printf '%s\n' "$count" > "$count_file"
+    if [ "$count" -eq "${AGENT_SESSION_FAKE_TMUX_ENTER_HOOK_AT:-2}" ]; then
+      "$AGENT_SESSION_FAKE_TMUX_ENTER_HOOK"
+    fi
+  fi
+fi
+
 exit 0
 "#,
     );
