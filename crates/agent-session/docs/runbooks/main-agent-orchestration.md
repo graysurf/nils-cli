@@ -323,6 +323,22 @@ operator use the normal guarded command:
 agent-session delete MAIN_SESSION_ID
 ```
 
+### Agent Console group cleanup
+
+Agent Console can remove the Main Agent and all workers still primarily managed
+by its active run through the daemon-owned group-cleanup route. Review the
+preview before confirming. If any assignment is nonterminal, the first
+confirmation is review-only and a second explicit force confirmation is
+required; forced cleanup records those assignments as cancelled and may discard
+unaccepted output.
+
+The daemon deletes workers first and the Main Agent last. If any worker fails,
+the Main Agent remains available and the result identifies which workers were
+deleted, absent, or failed. Resolve any reported maintenance cleanup before
+retrying. The separate **Main only** action intentionally bypasses this group
+cleanup and can orphan live workers; use it only when preserving those workers
+for later adoption is the desired recovery path.
+
 ## Revision and idempotency rules
 
 Every state mutation uses an absence or revision fence and an idempotency key.
