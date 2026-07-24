@@ -35,6 +35,16 @@ Environment:
 USAGE
 }
 
+# A rustup toolchain is usually only added to PATH by interactive shell
+# profiles, so a non-interactive runner (for example an agent tool shell or a
+# minimal cron environment) can have a working toolchain that this entrypoint
+# cannot see. Resolve the default rustup bin directory before any cargo use so
+# the declared validation command works without a caller-side PATH prefix.
+if ! command -v cargo >/dev/null 2>&1 && [[ -x "${CARGO_HOME:-$HOME/.cargo}/bin/cargo" ]]; then
+  PATH="${CARGO_HOME:-$HOME/.cargo}/bin:$PATH"
+  export PATH
+fi
+
 use_xvfb=0
 with_coverage=0
 docs_only=0

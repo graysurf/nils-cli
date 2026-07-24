@@ -37,6 +37,14 @@ Environment:
 USAGE
 }
 
+# Mirror the entrypoint's rustup PATH resolution so a direct invocation from a
+# non-interactive shell sees the same toolchain. See the note in
+# scripts/ci/nils-cli-checks-entrypoint.sh.
+if ! command -v cargo >/dev/null 2>&1 && [[ -x "${CARGO_HOME:-$HOME/.cargo}/bin/cargo" ]]; then
+  PATH="${CARGO_HOME:-$HOME/.cargo}/bin:$PATH"
+  export PATH
+fi
+
 base="${NILS_CLI_LOCAL_FAST_BASE:-origin/main}"
 plan_only=0
 declare -a forced_changed_files=()
