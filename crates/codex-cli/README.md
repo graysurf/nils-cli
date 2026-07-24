@@ -48,8 +48,15 @@ Help:
 - `knowledge [--runtime isolated|inherited] [--ephemeral] [CONCEPT...]`: Request a concept explanation.
 - `commit [--runtime isolated|inherited] [--ephemeral] [-p|--push] [-a|--auto-stage] [EXTRA...]`: Run the semantic-commit workflow.
 - `doctor [--format text|json]`: Probe isolated-runtime flags, features,
-  temporary-home/auth bridging, instruction isolation, and hook isolation
-  without an API request.
+  temporary-home/auth bridging, instruction isolation, and the private child
+  home's hook surface without an API request. `hook_isolation` asserts that the
+  child home carries no hook definition or hook trust surface (`config.toml`,
+  `hooks.json`, `hooks/`), checked before and after the probe turn and reported
+  as `hook_isolation_method: child-home-hook-surface`. Hook *execution* is not
+  observable here, because no non-model `codex` subcommand runs config-defined
+  lifecycle hooks and doctor must not spend a model turn; the execution-side
+  guarantee is `--disable hooks`, reported as `features.hooks` in the same
+  payload.
 - `resume <SESSION_ID> [--cd <dir>]`: Resolve the session's recorded working directory from local Codex history and launch
   `codex resume <SESSION_ID> --cd <cwd> --no-alt-screen` there, propagating Codex's exit status. Run it from any directory. Fails without
   launching Codex (`65`) when the id is unknown or matches more than one recorded directory; pass `--cd` to override the resolved directory

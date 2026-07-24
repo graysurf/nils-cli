@@ -31,7 +31,18 @@ const COMMIT_DISABLED_FEATURES: [&str; 2] = ["shell_tool", "unified_exec"];
 const HOME_INSTRUCTION_SENTINEL: &str = "CODEX_CLI_AGENT_DOCTOR_HOME_INSTRUCTION_SENTINEL_7D70B264";
 const PROJECT_INSTRUCTION_SENTINEL: &str =
     "CODEX_CLI_AGENT_DOCTOR_PROJECT_INSTRUCTION_SENTINEL_B28F1E67";
-const DOCTOR_HOOK_FILE_ENV: &str = "CODEX_CLI_DOCTOR_HOOK_FILE";
+/// Entry names inside a Codex home that can define hooks or carry hook trust
+/// state. The isolated runtime writes none of them, so their absence is a
+/// checkable property of the private child home. Hook *execution* is not
+/// observable from `agent doctor`: no non-model `codex` subcommand runs
+/// config-defined lifecycle hooks, and doctor must not spend a model turn. The
+/// execution-side guarantee is `--disable hooks`, reported separately as
+/// `features.hooks` in the same payload.
+const HOOK_SURFACE_ENTRIES: [&str; 3] = ["config.toml", "hooks.json", "hooks"];
+/// Fixed descriptor of what `hook_isolation` actually asserts, so a JSON
+/// consumer cannot read the boolean as proof that a hook was observed to not
+/// run.
+const HOOK_ISOLATION_METHOD: &str = "child-home-hook-surface";
 
 struct IsolatedHome {
     home: ChildHome,
@@ -215,7 +226,8 @@ pub fn doctor_isolated(json_output: bool) -> i32 {
                 "isolated_home": isolated_home,
                 "auth_bridge": auth_bridge,
                 "instruction_isolation": instruction_isolation,
-                "hook_isolation": hook_isolation
+                "hook_isolation": hook_isolation,
+                "hook_isolation_method": HOOK_ISOLATION_METHOD
             }
         });
         println!("{}", serde_json::to_string(&result).expect("doctor JSON"));
@@ -265,7 +277,6 @@ fn doctor_sentinel_probe(home: &IsolatedHome) -> (bool, bool) {
     let ambient_home = probe_root.path().join("ambient-home");
     let ambient_codex_home = ambient_home.join(".codex");
     let project = probe_root.path().join("project");
-    let hook_file = probe_root.path().join("hook-executed");
     if fs::create_dir_all(&ambient_codex_home).is_err()
         || fs::create_dir_all(&project).is_err()
         || fs::write(
@@ -278,17 +289,10 @@ fn doctor_sentinel_probe(home: &IsolatedHome) -> (bool, bool) {
         return (false, false);
     }
 
-    let hook_config = r#"[features]
-hooks = true
-
-[[hooks.SessionStart]]
-
-[[hooks.SessionStart.hooks]]
-type = "command"
-command = "sh -c 'test -n \"$CODEX_CLI_DOCTOR_HOOK_FILE\" && : > \"$CODEX_CLI_DOCTOR_HOOK_FILE\"'"
-timeout = 5
-"#;
-    if fs::write(home.path().join("config.toml"), hook_config).is_err() {
+    // Check the hook surface before the probe turn so a home builder that ever
+    // started projecting ambient hook configuration is caught even if the turn
+    // itself fails.
+    if !hook_surface_absent(home.path()) {
         return (false, false);
     }
 
@@ -309,7 +313,6 @@ timeout = 5
         .current_dir(&project)
         .env("HOME", &ambient_home)
         .env("CODEX_HOME", home.path())
-        .env(DOCTOR_HOOK_FILE_ENV, &hook_file)
         .stdin(Stdio::null())
         .stderr(Stdio::null());
     child_home::remove_control_environment(&mut command);
@@ -327,8 +330,19 @@ timeout = 5
             .stdout
             .windows(PROJECT_INSTRUCTION_SENTINEL.len())
             .any(|window| window == PROJECT_INSTRUCTION_SENTINEL.as_bytes());
-    let hook_isolation = !hook_file.exists();
+    // Re-check after the turn so anything the child materialized in its private
+    // home is caught too, not only what the home builder wrote.
+    let hook_isolation = hook_surface_absent(home.path());
     (instruction_isolation, hook_isolation)
+}
+
+/// Report whether the child home carries no hook definition or hook trust
+/// surface. Uses `symlink_metadata` so a dangling symlink planted at one of
+/// those names counts as present instead of silently passing.
+fn hook_surface_absent(home: &Path) -> bool {
+    HOOK_SURFACE_ENTRIES
+        .iter()
+        .all(|entry| fs::symlink_metadata(home.join(entry)).is_err())
 }
 
 fn isolated_command(home: &IsolatedHome, profile: AgentCommandProfile) -> Command {

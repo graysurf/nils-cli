@@ -155,8 +155,8 @@ case " $* " in
   *" debug prompt-input "*)
     test -f "$HOME/.codex/AGENTS.md"
     test -f "$PWD/AGENTS.md"
-    test -f "$CODEX_HOME/config.toml"
-    test -n "${CODEX_CLI_DOCTOR_HOOK_FILE:-}"
+    test ! -e "$CODEX_HOME/config.toml"
+    test ! -e "$CODEX_HOME/hooks.json"
     printf '%s\n' '[]'
     exit 0
     ;;
@@ -179,11 +179,17 @@ exit 91
     assert_eq!(value["data"]["ready"], true);
     assert_eq!(value["data"]["instruction_isolation"], true);
     assert_eq!(value["data"]["hook_isolation"], true);
+    // The boolean is a child-home surface claim, never an observed-execution
+    // claim, so the method descriptor has to travel with it.
+    assert_eq!(
+        value["data"]["hook_isolation_method"],
+        "child-home-hook-surface"
+    );
     assert!(!output.stdout_text().contains("auth.json"));
 }
 
 #[test]
-fn agent_doctor_fails_closed_on_instruction_or_hook_sentinel_leak() {
+fn agent_doctor_fails_closed_on_instruction_leak_or_child_home_hook_surface() {
     let _lock = GlobalStateLock::new();
     let temp = tempfile::tempdir().expect("tempdir");
     let stub_dir = temp.path().join("bin");
@@ -205,7 +211,7 @@ case " $* " in
     if [ "${CODEX_TEST_LEAK:-}" = instruction ]; then
       cat "$PWD/AGENTS.md"
     else
-      : > "$CODEX_CLI_DOCTOR_HOOK_FILE"
+      printf '[features]\nhooks = true\n' > "$CODEX_HOME/config.toml"
       printf '%s\n' '[]'
     fi
     exit 0
