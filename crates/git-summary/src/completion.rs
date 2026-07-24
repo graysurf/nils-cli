@@ -14,6 +14,11 @@ pub fn run(args: &[String]) -> i32 {
             eprintln!("usage: git-summary completion <bash|zsh>");
             1
         }
+        // `completion` consumes raw trailing args so shell validation stays
+        // CLI-owned, which also turns off clap's built-in `--help` for this
+        // path. Serve help here so `completion` stays introspectable like every
+        // other command, which the completion flag-parity audit relies on.
+        Some("-h" | "--help") if args.len() == 1 => print_completion_help(),
         Some("bash") if args.len() == 1 => run_shell(CompletionShell::Bash),
         Some("zsh") if args.len() == 1 => run_shell(CompletionShell::Zsh),
         Some(shell) if args.len() == 1 => {
@@ -26,6 +31,21 @@ pub fn run(args: &[String]) -> i32 {
             1
         }
     }
+}
+
+fn print_completion_help() -> i32 {
+    let mut command = build_completion_command();
+    command.build();
+    let Some(subcommand) = command.find_subcommand_mut("completion") else {
+        eprintln!("git-summary: error: completion help is unavailable");
+        return 1;
+    };
+    if let Err(err) = subcommand.print_help() {
+        eprintln!("git-summary: failed to print completion help: {err}");
+        return 1;
+    }
+    println!();
+    0
 }
 
 fn run_shell(shell: CompletionShell) -> i32 {
