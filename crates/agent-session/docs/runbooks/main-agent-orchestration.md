@@ -99,8 +99,8 @@ records only the summary and next action.
 The ordinary lifecycle is:
 
 ```text
-init -> rehydrate/status -> worker start -> worker self/checkpoint
-     -> Main Agent acceptance -> release -> delete -> close
+init -> rehydrate/status -> worker start --await-ready -> worker bootstrap
+     -> submit/release claim -> Main Agent acceptance -> retire -> close
 ```
 
 Read the returned `revision` after every mutation. The variable-like names in
@@ -144,16 +144,32 @@ Use the latest run revision returned by `init`, `status`, or `rehydrate`:
 main-agent worker start \
   --assignment-file assignment.json \
   --if-run-revision RUN_REVISION \
+  --await-ready 5m \
   --idempotency-key worker-start-001 \
   --format json
 ```
 
+A mutating worker must use its own managed worktree. Its assignment `scopes`
+must be narrow enough not to overlap the Main Agent claim or another live
+worker. The Main Agent owns orchestration, review, and acceptance; it must not
+claim worker-owned implementation paths. An enforce-mode `claim-conflict`
+therefore means the ownership plan is wrong, not that prompt transport failed.
+
 A successful start creates an `agent-session.session.v1` record in
 `mode: "interactive"`, launches a real tmux-backed provider session, and
-returns the worker session ID and incarnation. The response still reports
-`acceptance.state: "pending-worker-checkpoint"` and
-`transport_only: true`; launch transport is not worker readiness, task
-completion, or Main Agent acceptance.
+returns the worker session ID and incarnation. With `--await-ready`, branch only
+on the typed `readiness` result:
+
+- `state: "ready"` plus `delivery.state: "confirmed"` proves a newer,
+  authenticated, incarnation-matched worker checkpoint.
+- `state: "readiness_failed"` plus `delivery.state: "unverified"` is a
+  deterministic failure to prove delivery. Do not resend the prompt or inject
+  another Enter; retain the bound worker for session-transport diagnostics.
+
+`acceptance.state: "pending-worker-checkpoint"` and `transport_only: true`
+remain the launch-only result when `--await-ready 0` is selected. Launch
+transport alone is not worker readiness, task completion, or Main Agent
+acceptance.
 
 Before accepting any result, verify all of these conditions:
 
@@ -172,52 +188,28 @@ A missing, blank, stopped, or non-attachable worker fails operational
 acceptance. Do not turn `pending-worker-checkpoint` into evidence of readiness
 and do not edit the private registry to bypass the failure.
 
-### 3. Establish worker identity and checkpoint
+### 3. Bootstrap worker identity and claim
 
-Inside the worker's own interactive session, first authenticate its assignment:
-
-```bash
-main-agent self show --format json
-main-agent rehydrate --format markdown
-```
-
-The response must say `role: "worker"` and name the expected assignment. Then
-declare the assignment's repository and path scope so the worker has the active
-claim required by orchestration mutations:
+The generated prompt tells the worker to run one deterministic command first:
 
 ```bash
-agent-session work-context set \
-  --tier L0 \
-  --repository OWNER/REPOSITORY \
-  --path PATH/TO/SCOPE/ \
-  --summary "Implement the assigned worker task"
-```
-
-Use the assignment packet's tier, repository, and scopes. When the checkout
-origin is canonical, `--repository` can be omitted. A trailing slash declares
-a path prefix; without it, `--path` declares one exact path. Resolve any
-enforce-mode conflict before continuing.
-
-Then create a working checkpoint, for example:
-
-```json
-{
-  "schema_version": "main-agent.checkpoint-input.v1",
-  "summary": "Assignment understood; implementation is starting",
-  "next_action": "Implement the scoped change",
-  "state": "working"
-}
-```
-
-Submit it with the latest assignment revision:
-
-```bash
-main-agent checkpoint \
-  --file worker-working.json \
-  --if-revision ASSIGNMENT_REVISION \
-  --idempotency-key worker-working-001 \
+main-agent bootstrap \
+  --idempotency-key BOOTSTRAP_KEY_FROM_PROMPT \
   --format json
 ```
+
+Bootstrap authenticates the current worker, returns only its private assignment
+packet, derives and acquires the declared work-context claim, and records the
+revision-fenced `working` checkpoint. The `worker start --await-ready` caller
+observes that checkpoint as the `authenticated-worker-checkpoint` delivery
+proof. Do not add a second Enter, resend the prompt, or manually repeat
+bootstrap after a typed readiness failure.
+
+For diagnostics after failure, `main-agent self show --format json` and
+`main-agent rehydrate --format markdown` may be used read-only to distinguish
+role/rebind, packet, claim-conflict, and provider-session problems. Fix the
+typed cause and launch a new assignment/session identity when required; do not
+turn pane appearance into delivery evidence.
 
 Use more checkpoints when the durable summary or next action materially
 changes. A blocked worker should set `state: "blocked"` and

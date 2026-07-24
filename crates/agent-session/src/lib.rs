@@ -98,6 +98,7 @@ const CODEX_RESUME_CAPTURE_POLL_MS: u64 = 100;
 const CODEX_RESUME_AMBIGUITY_WINDOW_MS: u64 = 500;
 const CODEX_RESUME_BACKFILL_MAX_AGE_SECS: u64 = 10 * 60;
 const PANE_INPUT_COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
+const POST_PASTE_KEY_SETTLE_DELAY: Duration = Duration::from_millis(500);
 const DELETE_TERMINATION_VERIFY_TIMEOUT: Duration = Duration::from_secs(1);
 const DELETE_TERMINATION_VERIFY_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const DELETE_TERMINATION_PROBE_TIMEOUT: Duration = Duration::from_millis(100);
@@ -3198,7 +3199,11 @@ fn paste_prompt(tmux_bin: &Path, record: &SessionRecord) -> Result<(), CliError>
     load_and_paste_buffer(tmux_bin, &buffer_name, &target, Path::new(prompt_file))?;
 
     // The initial prompt is submitted; `send` deliberately leaves this to
-    // an explicit `--key enter`.
+    // an explicit `--key enter`. Tmux confirms that it wrote the paste bytes,
+    // but provider TUIs can still be processing the bracketed paste when an
+    // immediately adjacent Enter arrives. Keep the key a separate command and
+    // give both Codex and Claude one bounded settle interval first.
+    thread::sleep(POST_PASTE_KEY_SETTLE_DELAY);
     let mut enter = ProcessCommand::new(tmux_bin);
     enter.arg("send-keys").arg("-t").arg(&target).arg("Enter");
     run_status(enter, "tmux send-keys")
@@ -3435,6 +3440,7 @@ fn send_input_unlocked(
     mut manual_input: Option<&mut ManualInputSection>,
 ) -> Result<(), CliError> {
     let target = format!("{}:0.0", record.tmux_session);
+    let mut pasted_literal_text = false;
     if let Some(text) = text {
         if matches!(text, "\r" | "\n" | "\r\n") {
             if let Some(section) = manual_input.as_deref_mut() {
@@ -3455,7 +3461,11 @@ fn send_input_unlocked(
             );
             let _ = fs::remove_file(&temp);
             result?;
+            pasted_literal_text = true;
         }
+    }
+    if let Some(delay) = post_paste_settle_delay(pasted_literal_text, !keys.is_empty()) {
+        thread::sleep(delay);
     }
     for key in keys {
         if *key == SpecialKey::Enter
@@ -3466,6 +3476,10 @@ fn send_input_unlocked(
         send_tmux_key(tmux_bin, &target, *key)?;
     }
     Ok(())
+}
+
+fn post_paste_settle_delay(text_pasted: bool, has_keys: bool) -> Option<Duration> {
+    (text_pasted && has_keys).then_some(POST_PASTE_KEY_SETTLE_DELAY)
 }
 
 fn send_tmux_key(tmux_bin: &Path, target: &str, key: SpecialKey) -> Result<(), CliError> {
@@ -9774,7 +9788,11 @@ fn render_doctor_text(result: &activity::DoctorResult) -> String {
             provider.provider,
             provider.classification,
             if provider.configured { "yes" } else { "no" },
-            if provider.can_launch_worker { "yes" } else { "no" }
+            if provider.can_launch_worker {
+                "yes"
+            } else {
+                "no"
+            }
         ));
         text.push_str(&format!("  completion: {}\n", provider.completion));
         if let Some(mode) = provider.notification_mode.as_deref() {
@@ -13428,5 +13446,16 @@ fi
         for value in ["0", "false", "no", "off", "", "  ", "2", "enabled"] {
             assert!(!is_truthy_flag(value), "expected falsey: {value:?}");
         }
+    }
+
+    #[test]
+    fn post_paste_settle_applies_only_between_literal_paste_and_keys() {
+        assert_eq!(
+            super::post_paste_settle_delay(true, true),
+            Some(std::time::Duration::from_millis(500))
+        );
+        assert_eq!(super::post_paste_settle_delay(true, false), None);
+        assert_eq!(super::post_paste_settle_delay(false, true), None);
+        assert_eq!(super::post_paste_settle_delay(false, false), None);
     }
 }

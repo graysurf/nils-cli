@@ -2,7 +2,7 @@ use std::env;
 use std::ffi::OsString;
 use std::fs;
 use std::io::{self, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -39,7 +39,7 @@ const RUN_REVISION_HELP: &str =
     "Expected current run revision; stale values fail closed and report current_revision.";
 const WORKER_START_RUN_REVISION_HELP: &str = "Optional expected run revision. Omit to launch without a run-revision fence: assignment creation is decoupled from the run revision, so parallel and batch starts no longer collide. When supplied, a stale value fails closed and reports current_revision.";
 const QUICK_IDEMPOTENCY_KEY_HELP: &str = "Optional for the fast-path: omit to derive a stable idempotency key from a digest of the assignment packet, or supply one to control replay explicitly. 8-128 printable non-space ASCII bytes.";
-const MAIN_AGENT_AFTER_HELP: &str = "SAFE LIFECYCLE:\n  init -> rehydrate/status -> worker start -> worker self/checkpoint\n  accept -> release -> delete -> close\n\nREVISION AND RETRY RULES:\n  Read the current run or assignment revision before each mutation. Retry an\n  ambiguous outcome with the identical request and idempotency key. After a\n  confirmed revision conflict, re-read state and use a new key for the revised\n  request.\n\nEXAMPLES:\n  main-agent init --packet-file objective.json --if-absent --idempotency-key init-001 --format json\n  main-agent rehydrate --format markdown\n  main-agent worker start --assignment-file assignment.json --if-run-revision 1 --idempotency-key start-001 --format json\n  main-agent worker accept ASSIGNMENT_ID --if-revision 4 --idempotency-key accept-001 --format json\n\nOPERATOR RUNBOOK:\n  crates/agent-session/docs/runbooks/main-agent-orchestration.md\n\nEXIT CODES:\n  0   success\n  1   runtime error\n  64  command-line usage error\n  65  invalid or stale data\n  69  temporarily unavailable";
+const MAIN_AGENT_AFTER_HELP: &str = "SAFE LIFECYCLE:\n  init -> rehydrate/status -> worker start --await-ready -> worker bootstrap\n  submit/release claim -> accept -> retire -> close\n\nREVISION AND RETRY RULES:\n  Read the current run or assignment revision before each mutation. Retry an\n  ambiguous outcome with the identical request and idempotency key. After a\n  confirmed revision conflict, re-read state and use a new key for the revised\n  request.\n\nEXAMPLES:\n  main-agent init --packet-file objective.json --if-absent --idempotency-key init-001 --format json\n  main-agent rehydrate --format markdown\n  main-agent worker start --assignment-file assignment.json --if-run-revision 1 --await-ready 5m --idempotency-key start-001 --format json\n  main-agent worker accept ASSIGNMENT_ID --if-revision 4 --idempotency-key accept-001 --format json\n\nOPERATOR RUNBOOK:\n  crates/agent-session/docs/runbooks/main-agent-orchestration.md\n\nEXIT CODES:\n  0   success\n  1   runtime error\n  64  command-line usage error\n  65  invalid or stale data\n  69  temporarily unavailable";
 
 #[derive(Debug, Parser)]
 #[command(
@@ -77,6 +77,9 @@ enum MainAgentCommand {
     Status(ReadArgs),
     /// Record a revision-fenced run or worker checkpoint.
     Checkpoint(CheckpointArgs),
+    /// Authenticated worker bootstrap: acquire the assignment-derived claim,
+    /// checkpoint `working`, and return the private assignment packet.
+    Bootstrap(BootstrapArgs),
     /// Launch and manage interactive worker assignments.
     Worker(WorkerArgs),
     /// Add a non-authoritative collaborator relationship.
@@ -163,6 +166,14 @@ struct CheckpointArgs {
 }
 
 #[derive(Clone, Debug, Args)]
+struct BootstrapArgs {
+    #[arg(long, help = IDEMPOTENCY_KEY_HELP)]
+    idempotency_key: String,
+    #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
+    format: OutputFormat,
+}
+
+#[derive(Clone, Debug, Args)]
 struct WorkerArgs {
     #[command(subcommand)]
     command: WorkerCommand,
@@ -206,7 +217,7 @@ struct WorkerStartArgs {
     /// After launch, wait up to this bounded duration (0 = no wait) for the
     /// worker's authenticated checkpoint to advance the assignment past
     /// `starting`. This folds the readiness + newer-turn + identity proof into
-    /// worker start's typed result. 0-60s (integer with optional s/m/h suffix).
+    /// worker start's typed result. 0-5m (integer with optional s/m/h suffix).
     #[arg(long, default_value = "0")]
     await_ready: String,
     #[arg(long, help = IDEMPOTENCY_KEY_HELP)]
@@ -585,6 +596,7 @@ fn run_command(context: &CliContext, command: &MainAgentCommand) -> Result<Value
         MainAgentCommand::Rehydrate(args) => run_rehydrate(context, args.clone()),
         MainAgentCommand::Status(args) => run_status(context, args.clone()),
         MainAgentCommand::Checkpoint(args) => run_checkpoint(context, args.clone()),
+        MainAgentCommand::Bootstrap(args) => run_bootstrap(context, args.clone()),
         MainAgentCommand::Worker(args) => run_worker(context, args.clone()),
         MainAgentCommand::Collaborate(args) => run_collaborate(context, args.clone()),
         MainAgentCommand::Borrow(args) => run_borrow(context, args.clone()),
@@ -1112,6 +1124,118 @@ fn run_checkpoint(context: &CliContext, args: CheckpointArgs) -> Result<Value, C
     Ok(outcome)
 }
 
+fn run_bootstrap(context: &CliContext, args: BootstrapArgs) -> Result<Value, CliError> {
+    validate_idempotency_key(&args.idempotency_key)?;
+    let (record, incarnation) = authenticated_self(context)?;
+    let (assignment, tier) = {
+        let registry = orchestration::load_registry_readonly(context)?;
+        let principal = resolve_principal(&registry, &record, &incarnation)?;
+        let assignment = match principal {
+            Principal::Worker {
+                assignment,
+                rebind_required: false,
+            } => *assignment,
+            Principal::Worker {
+                rebind_required: true,
+                ..
+            } => return Err(rebind_required()),
+            Principal::Main { .. } => {
+                return Err(CliError::data(
+                    "worker-bootstrap-role",
+                    "bootstrap requires an authenticated worker assignment",
+                    None,
+                ));
+            }
+        };
+        let tier = registry
+            .runs
+            .get(&assignment.run_id)
+            .map(|run| run.tier.clone())
+            .ok_or_else(|| not_found("run-not-found", "orchestration run was not found"))?;
+        (assignment, tier)
+    };
+    if !matches!(assignment.state.as_str(), "starting" | "working") {
+        return Err(CliError::data(
+            "worker-bootstrap-state",
+            "worker bootstrap requires a starting or working assignment",
+            Some(json!({
+                "assignment_id": assignment.assignment_id,
+                "current_revision": assignment.revision,
+                "state": assignment.state
+            })),
+        ));
+    }
+    let packet_value = orchestration::read_packet(context, &assignment.private_packet_digest)?;
+    let packet: AssignmentInput = serde_json::from_value(packet_value)
+        .map_err(|_| invalid_input("stored assignment packet is invalid"))?;
+    validate_assignment_input(&packet)?;
+    let repository = packet.repository.clone().ok_or_else(|| {
+        invalid_input("worker bootstrap requires the assignment packet to declare a repository")
+    })?;
+    let work_context = WorkContextInput {
+        schema_version: WORK_CONTEXT_INPUT_VERSION.to_string(),
+        intent: "implementation".to_string(),
+        tier,
+        repositories: vec![repository.clone()],
+        worktrees: packet.worktree.clone().into_iter().collect(),
+        provider_refs: Vec::new(),
+        plan_refs: Vec::new(),
+        scopes: packet
+            .scopes
+            .iter()
+            .map(|value| Scope {
+                kind: ScopeKind::PathPrefix,
+                repository: repository.clone(),
+                value: value.clone(),
+            })
+            .collect(),
+        summary: packet.task_summary.clone(),
+    };
+    ensure_or_acquire_claim(context, &record, &work_context, &args.idempotency_key)?;
+
+    let checkpoint = CheckpointInput {
+        schema_version: CHECKPOINT_INPUT_SCHEMA.to_string(),
+        summary: "Assignment authenticated; worker bootstrap complete".to_string(),
+        next_action: "Execute the private assignment packet".to_string(),
+        state: Some("working".to_string()),
+        result_summary: None,
+        blocker_summary: None,
+    };
+    let directory = session_dir(context, &record.id).join("coordination");
+    fs::create_dir_all(&directory)
+        .map_err(|_| invalid_input("bootstrap checkpoint directory is unavailable"))?;
+    let checkpoint_path = directory.join(format!(
+        "main-agent-bootstrap-{}.json",
+        uuid::Uuid::new_v4()
+    ));
+    let bytes = serde_json::to_vec(&checkpoint)
+        .map_err(|_| invalid_input("bootstrap checkpoint is invalid"))?;
+    write_atomic(&checkpoint_path, &bytes, SECRET_FILE_MODE)
+        .map_err(|_| invalid_input("bootstrap checkpoint could not be prepared"))?;
+    let result = run_checkpoint(
+        context,
+        CheckpointArgs {
+            file: checkpoint_path.clone(),
+            if_revision: assignment.revision,
+            idempotency_key: args.idempotency_key,
+            format: OutputFormat::Json,
+        },
+    );
+    let _ = fs::remove_file(checkpoint_path);
+    result?;
+
+    let registry = orchestration::load_registry_readonly(context)?;
+    let current = registry
+        .assignments
+        .get(&assignment.assignment_id)
+        .ok_or_else(|| not_found("assignment-not-found", "assignment was not found"))?;
+    Ok(json!({
+        "schema_version": "main-agent.bootstrap-result.v1",
+        "claim": "active",
+        "assignment": private_assignment_view(context, current)?
+    }))
+}
+
 fn run_worker(context: &CliContext, args: WorkerArgs) -> Result<Value, CliError> {
     match args.command {
         WorkerCommand::Start(args) => run_worker_start(context, args),
@@ -1304,7 +1428,14 @@ fn run_worker_start_single(context: &CliContext, args: WorkerStartArgs) -> Resul
 
     let agent = AgentKind::from_name(&input.launch.agent)
         .ok_or_else(|| invalid_input("assignment launch agent is invalid"))?;
-    let prompt = worker_start_prompt(&assignment_id);
+    let main_agent_bin = env::current_exe().map_err(|_| {
+        CliError::runtime(
+            "main-agent-executable-unavailable",
+            "the current main-agent executable could not be resolved for worker bootstrap",
+            None,
+        )
+    })?;
+    let prompt = worker_start_prompt(&assignment_id, &main_agent_bin);
     let existing = match load_session_record(context, &worker_session_id) {
         Ok(worker) => Some(worker),
         Err(error) if error.code() == "session-not-found" => None,
@@ -1478,10 +1609,21 @@ fn worker_start_is_pending(value: &Value) -> bool {
         && value["acceptance"] == "pending"
 }
 
-fn worker_start_prompt(assignment_id: &str) -> String {
+fn worker_start_prompt(assignment_id: &str, main_agent_bin: &Path) -> String {
+    let bootstrap_key = worker_bootstrap_idempotency_key(assignment_id);
+    let main_agent_bin = main_agent_bin.to_string_lossy();
+    let main_agent_bin = shell_words::quote(&main_agent_bin);
     format!(
-        "You are a managed worker for assignment {assignment_id}. Run `main-agent self show --format json`, then checkpoint state `working` before mutations."
+        "You are a managed worker for assignment {assignment_id}. First run `{main_agent_bin} bootstrap --idempotency-key {bootstrap_key} --format json`. Use the returned private assignment packet as your task; do not mutate before bootstrap succeeds. After checkpointing the final result, release your work-context claim before reporting completion."
     )
+}
+
+fn worker_bootstrap_idempotency_key(assignment_id: &str) -> String {
+    let digest = crate::coordination::request_digest(
+        "main-agent-worker-bootstrap-idempotency",
+        &assignment_id,
+    );
+    format!("bootstrap-{}", &digest[..32])
 }
 
 fn retry_stable_worker_session_id(assignment_id: &str, request_digest: &str) -> String {
@@ -1587,6 +1729,9 @@ fn run_worker_show(context: &CliContext, args: WorkerShowArgs) -> Result<Value, 
 /// Upper bound on a single `worker wait` long-poll, matching the mailbox
 /// `message wait` bound so both surfaces cap a blocked call the same way.
 const WORKER_WAIT_MAX_SECS: u64 = 60;
+/// Worker bootstrap may include a high-reasoning provider turn before its
+/// authenticated checkpoint, so it has a separate five-minute bound.
+const WORKER_AWAIT_READY_MAX_SECS: u64 = 5 * 60;
 /// Delay between registry reads while polling; mirrors `mailbox::wait`.
 const WORKER_WAIT_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
@@ -1667,7 +1812,7 @@ fn run_worker_wait(context: &CliContext, args: WorkerWaitArgs) -> Result<Value, 
 /// Parse and bound a `worker wait` timeout (1-60s; integer with optional
 /// s/m/h/d suffix). Mirrors `mailbox::parse_wait` so the two long-poll surfaces
 /// accept identical duration syntax and bounds.
-fn parse_wait_timeout(value: &str) -> Result<Duration, CliError> {
+fn parse_duration_seconds(value: &str) -> Result<u64, CliError> {
     let (number, multiplier) = if let Some(number) = value.strip_suffix('s') {
         (number, 1)
     } else if let Some(number) = value.strip_suffix('m') {
@@ -1690,6 +1835,11 @@ fn parse_wait_timeout(value: &str) -> Result<Duration, CliError> {
                 None,
             )
         })?;
+    Ok(seconds)
+}
+
+fn parse_wait_timeout(value: &str) -> Result<Duration, CliError> {
+    let seconds = parse_duration_seconds(value)?;
     if seconds == 0 || seconds > WORKER_WAIT_MAX_SECS {
         return Err(CliError::usage(
             "worker-wait-timeout",
@@ -1701,14 +1851,22 @@ fn parse_wait_timeout(value: &str) -> Result<Duration, CliError> {
 }
 
 /// Parse the `worker start --await-ready` bound. `0` (with an optional s/m/h
-/// suffix) means launch-only — no readiness wait; any other value is a bounded
-/// 1-60s duration parsed like `worker wait`.
+/// suffix) means launch-only — no readiness wait; any other value is bounded
+/// to five minutes.
 fn parse_await_ready(value: &str) -> Result<Option<Duration>, CliError> {
     let trimmed = value.trim();
     if matches!(trimmed, "0" | "0s" | "0m" | "0h") {
         return Ok(None);
     }
-    parse_wait_timeout(trimmed).map(Some)
+    let seconds = parse_duration_seconds(trimmed)?;
+    if seconds == 0 || seconds > WORKER_AWAIT_READY_MAX_SECS {
+        return Err(CliError::usage(
+            "worker-await-ready-timeout",
+            "worker start --await-ready must be between 1 second and 5 minutes",
+            None,
+        ));
+    }
+    Ok(Some(Duration::from_secs(seconds)))
 }
 
 /// Classify an assignment state as worker readiness. `starting` means the worker
@@ -1748,7 +1906,12 @@ fn await_worker_readiness(
             return Ok(json!({
                 "state": readiness_from_state(&state),
                 "assignment_state": state,
-                "worker_launched": true
+                "worker_launched": true,
+                "delivery": {
+                    "state": "confirmed",
+                    "transport_state": "submit-command-succeeded",
+                    "proof": "authenticated-worker-checkpoint"
+                }
             }));
         }
         if started.elapsed() >= timeout {
@@ -1756,7 +1919,13 @@ fn await_worker_readiness(
                 "state": "readiness_failed",
                 "assignment_state": state,
                 "worker_launched": true,
-                "safe_state": "worker launched and bound; assignment still starting. Retry `worker wait --until submitted` or tear down with `worker retire`."
+                "delivery": {
+                    "state": "unverified",
+                    "transport_state": "submit-command-succeeded",
+                    "proof": "worker-checkpoint-timeout"
+                },
+                "automatic_retry_safe": false,
+                "safe_state": "worker remains launched and bound in `starting`; prompt delivery is unverified, so do not resend the prompt or inject another Enter. Keep the worker available for transport diagnostics."
             }));
         }
         thread::sleep(WORKER_WAIT_POLL_INTERVAL);
@@ -3717,6 +3886,7 @@ fn command_name(command: &MainAgentCommand) -> &'static str {
         MainAgentCommand::Rehydrate(_) => "rehydrate",
         MainAgentCommand::Status(_) => "status",
         MainAgentCommand::Checkpoint(_) => "checkpoint",
+        MainAgentCommand::Bootstrap(_) => "bootstrap",
         MainAgentCommand::Worker(args) => match args.command {
             WorkerCommand::Start(_) => "worker-start",
             WorkerCommand::List(_) => "worker-list",
@@ -3752,6 +3922,7 @@ fn command_output_format(command: &MainAgentCommand) -> OutputFormat {
         },
         MainAgentCommand::Status(args) => args.format,
         MainAgentCommand::Checkpoint(args) => args.format,
+        MainAgentCommand::Bootstrap(args) => args.format,
         MainAgentCommand::Worker(args) => match &args.command {
             WorkerCommand::Start(args) => args.format,
             WorkerCommand::List(args) => args.format,
@@ -4513,16 +4684,30 @@ mod tests {
             Some(Duration::from_secs(5))
         );
         assert_eq!(
-            parse_await_ready("30").unwrap(),
-            Some(Duration::from_secs(30))
+            parse_await_ready("5m").unwrap(),
+            Some(Duration::from_secs(300))
         );
         assert_eq!(
-            parse_await_ready("61").unwrap_err().code(),
-            "worker-wait-timeout"
+            parse_await_ready("301").unwrap_err().code(),
+            "worker-await-ready-timeout"
         );
         assert_eq!(
             parse_await_ready("abc").unwrap_err().code(),
             "invalid-duration"
         );
+    }
+
+    #[test]
+    fn worker_start_prompt_requires_deterministic_bootstrap() {
+        let prompt = worker_start_prompt(
+            "assignment-one",
+            std::path::Path::new("/release path/main-agent"),
+        );
+        assert!(prompt.contains("'/release path/main-agent' bootstrap"));
+        assert!(prompt.contains(" bootstrap "));
+        assert!(prompt.contains("--idempotency-key bootstrap-"));
+        assert!(prompt.contains("--format json"));
+        assert!(prompt.contains("release your work-context claim"));
+        assert!(!prompt.contains("then checkpoint"));
     }
 }

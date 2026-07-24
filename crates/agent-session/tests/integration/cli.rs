@@ -453,7 +453,7 @@ exit 1
 "#,
     );
 
-    let (tmux, _tmux_log) = fake_tmux(tmp.path());
+    let (tmux, tmux_log) = fake_tmux(tmp.path());
     let addr = unused_loopback_addr();
     let mut paths = vec![fake_bin];
     if let Some(current_path) = std::env::var_os("PATH") {
@@ -465,6 +465,8 @@ exit 1
         .arg("--bind")
         .arg(addr.to_string())
         .env("AGENT_SESSION_TMUX_BIN", tmux)
+        .env("AGENT_SESSION_FAKE_TMUX_LOG", tmux_log)
+        .env("AGENT_SESSION_FAKE_TMUX_LIST_WINDOWS", "")
         .env("AGENT_SESSION_USAGE_TIMEOUT_MS", "45000")
         .env_remove("CLAUDE_PROMPT_SEGMENT_CLAUDE_TIMEOUT_SECONDS")
         .env("PATH", path)
@@ -531,7 +533,7 @@ JSON
 "#,
     );
 
-    let (tmux, _tmux_log) = fake_tmux(tmp.path());
+    let (tmux, tmux_log) = fake_tmux(tmp.path());
     let addr = unused_loopback_addr();
     let mut paths = vec![fake_bin];
     if let Some(current_path) = std::env::var_os("PATH") {
@@ -543,6 +545,8 @@ JSON
         .arg("--bind")
         .arg(addr.to_string())
         .env("AGENT_SESSION_TMUX_BIN", tmux)
+        .env("AGENT_SESSION_FAKE_TMUX_LOG", tmux_log)
+        .env("AGENT_SESSION_FAKE_TMUX_LIST_WINDOWS", "")
         .env("AGENT_SESSION_USAGE_TIMEOUT_MS", "45000")
         .env("CLAUDE_PROMPT_SEGMENT_CLAUDE_TIMEOUT_SECONDS", "9")
         .env("PATH", path)

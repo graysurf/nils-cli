@@ -118,6 +118,17 @@ json\:"Single-record JSON envelope (snake_case)"))' \
 '--help[Print help (see more with '\''--help'\'')]' \
 && ret=0
 ;;
+(bootstrap)
+_arguments "${_arguments_options[@]}" : \
+'--idempotency-key=[Retry an ambiguous outcome with the same idempotency key and the same logical request; use a new key for a changed request.]:IDEMPOTENCY_KEY:_default' \
+'--format=[]:FORMAT:((text\:"Human-readable text output (default)"
+json\:"Single-record JSON envelope (snake_case)"))' \
+'--state-dir=[agent-session state directory]:PATH:_files -/' \
+'--host=[Advisory machine label for public projections]:HOST:_default' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+&& ret=0
+;;
 (worker)
 _arguments "${_arguments_options[@]}" : \
 '--state-dir=[agent-session state directory]:PATH:_files -/' \
@@ -139,7 +150,7 @@ _arguments "${_arguments_options[@]}" : \
 '(--batch)--assignment-file=[Private assignment packet JSON file (single-lane launch)]:PATH:_files' \
 '--batch=[Directory of assignment packet JSON files to launch as one batch. Each lane is fenced independently (T2 decouple), so one lane failing isolates to its own typed result rather than aborting the batch]:DIR:_files -/' \
 '--if-run-revision=[Optional expected run revision. Omit to launch without a run-revision fence\: assignment creation is decoupled from the run revision, so parallel and batch starts no longer collide. When supplied, a stale value fails closed and reports current_revision.]:IF_RUN_REVISION:_default' \
-'--await-ready=[After launch, wait up to this bounded duration (0 = no wait) for the worker'\''s authenticated checkpoint to advance the assignment past \`starting\`. This folds the readiness + newer-turn + identity proof into worker start'\''s typed result. 0-60s (integer with optional s/m/h suffix)]:AWAIT_READY:_default' \
+'--await-ready=[After launch, wait up to this bounded duration (0 = no wait) for the worker'\''s authenticated checkpoint to advance the assignment past \`starting\`. This folds the readiness + newer-turn + identity proof into worker start'\''s typed result. 0-5m (integer with optional s/m/h suffix)]:AWAIT_READY:_default' \
 '--idempotency-key=[Retry an ambiguous outcome with the same idempotency key and the same logical request; use a new key for a changed request.]:IDEMPOTENCY_KEY:_default' \
 '--format=[]:FORMAT:((text\:"Human-readable text output (default)"
 json\:"Single-record JSON envelope (snake_case)"))' \
@@ -327,7 +338,17 @@ json\:"Single-record JSON envelope (snake_case)"))' \
 _arguments "${_arguments_options[@]}" : \
 '--assignment-file=[Private assignment packet JSON file]:PATH:_files' \
 '--tier=[Work tier for the synthesized ephemeral run (L0/L1 delegate-all)]:TIER:_default' \
-'--idempotency-key=[Retry an ambiguous outcome with the same idempotency key and the same logical request; use a new key for a changed request.]:IDEMPOTENCY_KEY:_default' \
+'--idempotency-key=[Optional for the fast-path\: omit to derive a stable idempotency key from a digest of the assignment packet, or supply one to control replay explicitly. 8-128 printable non-space ASCII bytes.]:IDEMPOTENCY_KEY:_default' \
+'--format=[]:FORMAT:((text\:"Human-readable text output (default)"
+json\:"Single-record JSON envelope (snake_case)"))' \
+'--state-dir=[agent-session state directory]:PATH:_files -/' \
+'--host=[Advisory machine label for public projections]:HOST:_default' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+&& ret=0
+;;
+(packet-schema)
+_arguments "${_arguments_options[@]}" : \
 '--format=[]:FORMAT:((text\:"Human-readable text output (default)"
 json\:"Single-record JSON envelope (snake_case)"))' \
 '--state-dir=[agent-session state directory]:PATH:_files -/' \
@@ -359,6 +380,7 @@ _main-agent_commands() {
 'rehydrate:Recover the authenticated durable objective or assignment capsule' \
 'status:Show a bounded status capsule' \
 'checkpoint:Record a revision-fenced run or worker checkpoint' \
+'bootstrap:Authenticated worker bootstrap\: acquire the assignment-derived claim, checkpoint \`working\`, and return the private assignment packet' \
 'worker:Launch and manage interactive worker assignments' \
 'collaborate:Add a non-authoritative collaborator relationship' \
 'borrow:Add a bounded non-authoritative borrowing relationship' \
@@ -366,6 +388,7 @@ _main-agent_commands() {
 'adopt:Adopt an orphaned assignment into this Main Agent'\''s run' \
 'close:Close this run after all assignments are terminal' \
 'quick:Fast-path\: create an ephemeral run, single assignment, and launch in one call. The run auto-closes once the worker is torn down' \
+'packet-schema:Print an example objective packet (schema, required fields, and the nested work-context) that \`init --packet-file\` accepts' \
 'completion:Print shell completion script' \
     )
     _describe -t commands 'main-agent commands' commands "$@"
@@ -374,6 +397,11 @@ _main-agent_commands() {
 _main-agent__subcmd__adopt_commands() {
     local commands; commands=()
     _describe -t commands 'main-agent adopt commands' commands "$@"
+}
+(( $+functions[_main-agent__subcmd__bootstrap_commands] )) ||
+_main-agent__subcmd__bootstrap_commands() {
+    local commands; commands=()
+    _describe -t commands 'main-agent bootstrap commands' commands "$@"
 }
 (( $+functions[_main-agent__subcmd__borrow_commands] )) ||
 _main-agent__subcmd__borrow_commands() {
@@ -409,6 +437,11 @@ _main-agent__subcmd__handoff_commands() {
 _main-agent__subcmd__init_commands() {
     local commands; commands=()
     _describe -t commands 'main-agent init commands' commands "$@"
+}
+(( $+functions[_main-agent__subcmd__packet-schema_commands] )) ||
+_main-agent__subcmd__packet-schema_commands() {
+    local commands; commands=()
+    _describe -t commands 'main-agent packet-schema commands' commands "$@"
 }
 (( $+functions[_main-agent__subcmd__quick_commands] )) ||
 _main-agent__subcmd__quick_commands() {

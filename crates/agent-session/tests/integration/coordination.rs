@@ -514,8 +514,8 @@ fn main_agent_help_documents_safe_lifecycle_revision_fences_and_retry_keys() {
     let root_help = root.stdout_text();
     for lifecycle_step in [
         "SAFE LIFECYCLE",
-        "init -> rehydrate/status -> worker start -> worker self/checkpoint",
-        "accept -> release -> delete -> close",
+        "init -> rehydrate/status -> worker start --await-ready -> worker bootstrap",
+        "submit/release claim -> accept -> retire -> close",
     ] {
         assert!(
             root_help.contains(lifecycle_step),
@@ -3723,11 +3723,19 @@ fn main_agent_worker_start_replay_converges_a_persisted_start_without_duplicate_
         ],
     );
     let main_capability = init_main_run(tmp.path(), &state_dir, &checkout, "main-one", "run-one");
+    let bootstrap_digest = orchestration_request_digest(
+        "main-agent-worker-bootstrap-idempotency",
+        &json!(assignment_id),
+    );
+    let main_agent_bin = bin::resolve("main-agent");
+    let main_agent_bin = main_agent_bin.to_string_lossy();
+    let main_agent_bin = shell_words::quote(&main_agent_bin);
     let worker_prompt = state_dir.join(format!("sessions/{worker_id}/prompt.md"));
     fs::write(
         &worker_prompt,
         format!(
-            "You are a managed worker for assignment {assignment_id}. Run `main-agent self show --format json`, then checkpoint state `working` before mutations."
+            "You are a managed worker for assignment {assignment_id}. First run `{main_agent_bin} bootstrap --idempotency-key bootstrap-{} --format json`. Use the returned private assignment packet as your task; do not mutate before bootstrap succeeds. After checkpointing the final result, release your work-context claim before reporting completion.",
+            &bootstrap_digest[..32]
         ),
     )
     .expect("worker prompt");
@@ -4806,6 +4814,143 @@ fn main_agent_worker_self_checkpoint_and_collaborator_visibility_are_durable() {
 }
 
 #[test]
+fn main_agent_worker_bootstrap_acquires_claim_and_checkpoints_from_packet() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let state_dir = tmp.path().join("state");
+    let main_checkout = tmp.path().join("main-checkout");
+    let worker_checkout = tmp.path().join("worker-checkout");
+    fs::create_dir(&state_dir).expect("state");
+    init_checkout(
+        &main_checkout,
+        "https://example.invalid/example/repository.git",
+    );
+    init_checkout(
+        &worker_checkout,
+        "https://example.invalid/example/repository.git",
+    );
+    seed_brokers_at(
+        &state_dir,
+        &[
+            (
+                "main-one",
+                "main-incarnation-one",
+                "main-private-capability-material-0000000001",
+                main_checkout.as_path(),
+                Some("enforce"),
+            ),
+            (
+                "worker-one",
+                "worker-incarnation-one",
+                "worker-private-capability-material-0000000001",
+                worker_checkout.as_path(),
+                Some("enforce"),
+            ),
+        ],
+    );
+    let _main_capability = init_main_run(
+        tmp.path(),
+        &state_dir,
+        &main_checkout,
+        "main-one",
+        "run-one",
+    );
+    let private_packet = json!({
+        "schema_version": "main-agent.assignment-input.v1",
+        "assignment_id": "assignment-bootstrap",
+        "task_summary": "Bootstrap worker acceptance",
+        "task": {"private_note": "bootstrap-private-canary"},
+        "launch": {
+            "agent": "codex",
+            "cwd": worker_checkout,
+            "title": null,
+            "session_id": "worker-one",
+            "coordination_mode": "enforce",
+            "agent_args": []
+        },
+        "repository": "example/repository",
+        "worktree": null,
+        "base_ref": "main",
+        "scopes": ["docs/bootstrap-canary"],
+        "durable_refs": []
+    });
+    insert_orchestration_assignment(
+        &state_dir,
+        "assignment-bootstrap",
+        json!({
+            "schema_version": "agent-session.orchestration-assignment.v1",
+            "assignment_id": "assignment-bootstrap",
+            "run_id": "run-one",
+            "revision": 2,
+            "state": "starting",
+            "task_summary": "Bootstrap worker acceptance",
+            "private_packet_digest": "replaced-by-fixture",
+            "primary_manager": {
+                "session_id": "main-one",
+                "session_incarnation": "main-incarnation-one",
+                "session_created_at": "2030-01-01T00:00:00Z"
+            },
+            "worker": {
+                "session_id": "worker-one",
+                "session_incarnation": "worker-incarnation-one",
+                "session_created_at": "2030-01-01T00:00:00Z"
+            },
+            "collaborators": [],
+            "borrowed_by": [],
+            "repository": "example/repository",
+            "worktree": null,
+            "base_ref": "main",
+            "scopes": ["docs/bootstrap-canary"],
+            "durable_refs": [],
+            "checkpoint": null,
+            "result_summary": null,
+            "blocker_summary": null,
+            "created_at": "2030-01-01T00:00:01Z",
+            "updated_at": "2030-01-01T00:00:02Z"
+        }),
+        &private_packet,
+    );
+    let worker_capability = capability(&state_dir, "worker-one");
+    let args = [
+        "--state-dir",
+        state_dir.to_str().expect("state dir"),
+        "bootstrap",
+        "--idempotency-key",
+        "worker-bootstrap-0001",
+        "--format",
+        "json",
+    ];
+    let bootstrapped = run_main_agent(
+        &worker_checkout,
+        &args,
+        &[("AGENT_SESSION_CAPABILITY_FILE", &worker_capability)],
+    );
+    assert_eq!(
+        bootstrapped.code,
+        0,
+        "stdout={} stderr={}",
+        bootstrapped.stdout_text(),
+        bootstrapped.stderr_text()
+    );
+    assert_eq!(
+        data(&bootstrapped)["assignment"]["record"]["state"],
+        "working"
+    );
+    assert_eq!(data(&bootstrapped)["assignment"]["record"]["revision"], 3);
+    assert_eq!(
+        data(&bootstrapped)["assignment"]["assignment_packet"]["task"]["private_note"],
+        "bootstrap-private-canary"
+    );
+
+    let replay = run_main_agent(
+        &worker_checkout,
+        &args,
+        &[("AGENT_SESSION_CAPABILITY_FILE", &worker_capability)],
+    );
+    assert_eq!(replay.code, 0, "stderr={}", replay.stderr_text());
+    assert_eq!(replay.stdout_text(), bootstrapped.stdout_text());
+}
+
+#[test]
 fn main_agent_handoff_requires_operation_quiescence_and_adopt_requires_an_orphan() {
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let state_dir = tmp.path().join("state");
@@ -5714,12 +5859,27 @@ fn main_agent_worker_start_await_ready_folds_timeout_into_readiness_failed() {
     assert_eq!(readiness["state"], "readiness_failed");
     assert_eq!(readiness["assignment_state"], "starting");
     assert_eq!(readiness["worker_launched"], true);
+    assert_eq!(readiness["delivery"]["state"], "unverified");
+    assert_eq!(
+        readiness["delivery"]["transport_state"],
+        "submit-command-succeeded"
+    );
+    assert_eq!(readiness["delivery"]["proof"], "worker-checkpoint-timeout");
+    assert_eq!(readiness["automatic_retry_safe"], false);
     assert!(
         readiness["safe_state"]
             .as_str()
             .unwrap_or_default()
+            .contains("do not resend"),
+        "readiness_failed safe_state should forbid duplicate submission: {}",
+        readiness["safe_state"]
+    );
+    assert!(
+        !readiness["safe_state"]
+            .as_str()
+            .unwrap_or_default()
             .contains("worker retire"),
-        "readiness_failed safe_state should guide teardown: {}",
+        "starting is not a retireable assignment state: {}",
         readiness["safe_state"]
     );
 }

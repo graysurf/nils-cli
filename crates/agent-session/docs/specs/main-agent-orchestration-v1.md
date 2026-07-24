@@ -67,6 +67,7 @@ main-agent self show --format json
 main-agent rehydrate --format json|markdown
 main-agent status --format json
 main-agent checkpoint --file FILE --if-revision N --idempotency-key KEY --format json
+main-agent bootstrap --idempotency-key KEY --format json
 main-agent worker start --assignment-file FILE [--if-run-revision N] [--await-ready D] --idempotency-key KEY --format json
 main-agent worker start --batch DIR --idempotency-key KEY --format json
 main-agent worker list|show ...
@@ -117,19 +118,38 @@ explicit `close`. A session that already controls a run must use the granular
 `init` + `worker start` path instead.
 
 `worker start --await-ready D` folds the readiness proof into launch: after the
-worker is bound it waits up to a bounded `D` (0-60s; `0` = launch-only) for the
+worker is bound it waits up to a bounded `D` (0-5m; `0` = launch-only) for the
 worker's authenticated, revision-fenced, incarnation-matched checkpoint to
 advance the assignment past `starting`, then returns a typed `readiness`
 (`ready` once it advanced, else `readiness_failed` with a `safe_state`). That
 checkpoint advancing is the readiness + newer-turn + identity proof, so the Main
 Agent branches on one typed result instead of hand-running the verified-startup
-sequence. The wait takes no registry lock, so it never blocks the worker's own
-checkpoint; `--await-ready 0` preserves the launch-only `pending-worker-checkpoint`
-result. `worker retire ID` is the teardown macro: it composes release -> delete
-and reports the worker's absence in one call, replacing the hand-run
+sequence. `readiness.delivery.state: confirmed` requires that checkpoint and
+names `authenticated-worker-checkpoint` as its proof. A timeout reports
+`delivery.state: unverified`, `automatic_retry_safe: false`, and explicitly
+forbids duplicate prompt or Enter injection; a successful terminal submit
+command alone is not provider acceptance. The wait takes no registry lock, so it
+never blocks the worker's own checkpoint; `--await-ready 0` preserves the
+launch-only `pending-worker-checkpoint` result. `worker retire ID` is the
+teardown macro: it composes release -> delete and reports the worker's absence
+in one call, replacing the hand-run
 release -> delete -> confirm sequence. An accepted assignment is released first;
 an already-terminal one goes straight to delete. Per-step idempotency keys are
 derived from the retire key so a retry converges through each step's receipt.
+
+The generated worker prompt starts with one deterministic,
+worker-authenticated `main-agent bootstrap` command. The prompt names the exact
+running `main-agent` executable rather than relying on the worker's `PATH`, so
+bootstrap uses the same release that created the assignment. Bootstrap resolves
+only the caller's bound assignment, reads that worker's private assignment
+packet, derives the coordination claim from the packet's
+repository/worktree/scopes, and records the initial `working` checkpoint. Its
+idempotency key is stable for the assignment, so an exact replay converges. A
+claim conflict or stale assignment produces a typed failure before mutation;
+it is not evidence that the prompt was undelivered and MUST NOT trigger prompt
+resend or Enter injection. The Main Agent's claim and each worker assignment
+MUST therefore use non-overlapping scopes, and mutating workers MUST launch in
+their own managed worktrees.
 
 `worker wait` is read-only completion-awareness for the orchestrating Main
 Agent — the CLI counterpart to the operator console's sub-second SSE push. It is
@@ -157,8 +177,10 @@ A metadata-only record, blank placeholder, unrelated/replaced incarnation, or
 non-attachable worker does not satisfy launch acceptance. The Main Agent MUST
 not infer readiness or task completion from
 `pending-worker-checkpoint`; that state proves transport only. It MUST require
-the worker's authenticated `self show`, revision-fenced checkpoint, and the
-task-specific review evidence before `worker accept`.
+the worker's authenticated bootstrap/checkpoint and the task-specific review
+evidence before `worker accept`. `self show` and `rehydrate` remain read-only
+diagnostics for an already typed bootstrap or readiness failure; they are not
+the normal prompt-delivery protocol.
 
 After a provider resume, a revision-fenced checkpoint from the authenticated
 worker may atomically rebind the assignment to its new incarnation only when
