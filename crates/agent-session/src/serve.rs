@@ -6900,6 +6900,45 @@ fn wait_process_with_timeout(
     }
 }
 
+/// Cursor home plus erase-display, so a replayed screen lands at a known origin
+/// instead of continuing from wherever the live cursor happened to be.
+const ATTACH_REPLAY_ORIGIN: &str = "\x1b[H\x1b[2J";
+
+/// Turn a `capture-pane -p` screen into bytes that are safe to inject into the
+/// raw PTY stream an attaching client reads.
+///
+/// `capture-pane -p` joins pane rows with a bare `\n`. In a PTY stream a lone LF
+/// only moves the cursor down one row and keeps its column, so replaying the
+/// capture verbatim staircases every row further right until it wraps at the
+/// edge — the client then repaints the same content correctly underneath, which
+/// is what surfaced as a duplicated, mangled attach screen.
+///
+/// This is provider-agnostic on purpose: Codex, Claude Code, and Hermes all
+/// stream through this one capture path, and each of their TUIs repaints over
+/// this baseline on its next render or on the resize the client sends right
+/// after attach.
+fn pty_ready_attach_replay(capture: &str) -> Option<Vec<u8>> {
+    let mut rows: Vec<&str> = capture
+        .split('\n')
+        .map(|row| row.strip_suffix('\r').unwrap_or(row))
+        .collect();
+    // tmux pads the capture to the pane height; trailing blank rows would only
+    // push the provider's own repaint down the screen.
+    while rows.last().is_some_and(|row| row.trim().is_empty()) {
+        rows.pop();
+    }
+    if rows.is_empty() {
+        return None;
+    }
+    let mut replay = String::with_capacity(ATTACH_REPLAY_ORIGIN.len() + capture.len() + rows.len());
+    replay.push_str(ATTACH_REPLAY_ORIGIN);
+    for row in rows {
+        replay.push_str(row);
+        replay.push_str("\r\n");
+    }
+    Some(replay.into_bytes())
+}
+
 async fn capture_attach_snapshot(
     tmux: &Path,
     record: &crate::SessionRecord,
@@ -7130,9 +7169,12 @@ async fn attach_socket(
                 return;
             }
         };
-    if let Some(text) = handoff.snapshot
+    if let Some(replay) = handoff
+        .snapshot
+        .as_deref()
+        .and_then(pty_ready_attach_replay)
         && terminal_tx
-            .send(Message::Binary(text.into_bytes().into()))
+            .send(Message::Binary(replay.into()))
             .await
             .is_err()
     {
@@ -19442,6 +19484,114 @@ exit 0
             .expect("drop signal");
     }
 
+    #[test]
+    fn attach_replay_normalizes_pane_lines_for_a_raw_pty_stream() {
+        let replay = pty_ready_attach_replay("first\nsecond\n").expect("replay");
+
+        assert_eq!(
+            String::from_utf8(replay).expect("utf8"),
+            "\x1b[H\x1b[2Jfirst\r\nsecond\r\n",
+        );
+    }
+
+    #[test]
+    fn attach_replay_does_not_double_existing_carriage_returns() {
+        let replay = pty_ready_attach_replay("first\r\nsecond\r\n").expect("replay");
+
+        assert_eq!(
+            String::from_utf8(replay).expect("utf8"),
+            "\x1b[H\x1b[2Jfirst\r\nsecond\r\n",
+        );
+    }
+
+    #[test]
+    fn attach_replay_trims_trailing_blank_pane_rows() {
+        let replay = pty_ready_attach_replay("first\n\n   \n\n").expect("replay");
+
+        assert_eq!(
+            String::from_utf8(replay).expect("utf8"),
+            "\x1b[H\x1b[2Jfirst\r\n",
+        );
+    }
+
+    #[test]
+    fn attach_replay_keeps_interior_blank_rows() {
+        let replay = pty_ready_attach_replay("first\n\nthird\n").expect("replay");
+
+        assert_eq!(
+            String::from_utf8(replay).expect("utf8"),
+            "\x1b[H\x1b[2Jfirst\r\n\r\nthird\r\n",
+        );
+    }
+
+    #[test]
+    fn attach_replay_drops_a_blank_capture() {
+        assert!(pty_ready_attach_replay("").is_none());
+        assert!(pty_ready_attach_replay("\n\n").is_none());
+        assert!(pty_ready_attach_replay("   \n").is_none());
+    }
+
+    #[test]
+    fn attach_replay_preserves_styling_and_wide_characters() {
+        let replay = pty_ready_attach_replay("\x1b[32m✔ 測試通過\x1b[0m\n").expect("replay");
+
+        assert_eq!(
+            String::from_utf8(replay).expect("utf8"),
+            "\x1b[H\x1b[2J\x1b[32m✔ 測試通過\x1b[0m\r\n",
+        );
+    }
+
+    #[tokio::test]
+    async fn websocket_attach_replays_a_pty_ready_snapshot_for_every_provider() {
+        // The staircased attach screen was provider-visible but not
+        // provider-specific: the same tmux capture path serves Codex, Claude
+        // Code, and Hermes, so every provider must receive CRLF-terminated
+        // rows from a deterministic origin.
+        for (id, agent, tmux_session) in [
+            ("ws-replay-codex", "codex", "hs-codex-ws-replay"),
+            ("ws-replay-claude", "claude", "hs-claude-ws-replay"),
+            ("ws-replay-hermes", "hermes", "hs-hermes-ws-replay"),
+        ] {
+            let tmp = tempfile::TempDir::new().expect("tempdir");
+            let state_dir = tmp.path().join("state");
+            seed_session(&state_dir, id, agent, tmux_session);
+            let tmux = minimal_tmux(tmp.path());
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("listener");
+            let addr = listener.local_addr().expect("address");
+            let server = tokio::spawn(async move {
+                let _ = axum::serve(listener, router(state(&state_dir, Some(TOKEN), tmux))).await;
+            });
+
+            let mut request = format!("ws://{addr}/sessions/{id}/attach")
+                .into_client_request()
+                .expect("request");
+            request.headers_mut().insert(
+                AUTHORIZATION,
+                format!("Bearer {TOKEN}").parse().expect("authorization"),
+            );
+            let (mut socket, _) = connect_async(request).await.expect("connect");
+            let snapshot = tokio::time::timeout(Duration::from_secs(2), socket.next())
+                .await
+                .expect("snapshot timeout")
+                .expect("snapshot frame")
+                .expect("snapshot message");
+            let ClientMessage::Binary(bytes) = snapshot else {
+                panic!("{agent} attach snapshot must be a binary frame");
+            };
+            assert_eq!(
+                bytes.as_ref(),
+                b"\x1b[H\x1b[2Jpane\r\n",
+                "{agent} attach snapshot must replay CRLF rows from a known origin",
+            );
+
+            let _ = socket.close(None).await;
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            server.abort();
+        }
+    }
+
     #[tokio::test]
     async fn snapshot_handoff_recaptures_after_internal_buffer_overflow() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -19668,8 +19818,14 @@ exit 0
         };
         let mut first = connect().await;
         let mut second = connect().await;
-        assert_eq!(recv_websocket_binary(&mut first).await, b"pane\n");
-        assert_eq!(recv_websocket_binary(&mut second).await, b"pane\n");
+        assert_eq!(
+            recv_websocket_binary(&mut first).await,
+            b"\x1b[H\x1b[2Jpane\r\n"
+        );
+        assert_eq!(
+            recv_websocket_binary(&mut second).await,
+            b"\x1b[H\x1b[2Jpane\r\n"
+        );
         wait_for_subscriber_count(&state.attach_brokers, "socket", 2).await;
 
         let mut source_writer = std::fs::OpenOptions::new()
@@ -19747,7 +19903,10 @@ exit 0
         live_writer.flush().unwrap();
         std::fs::write(&capture_release, b"").unwrap();
 
-        assert_eq!(recv_websocket_binary(&mut socket).await, b"pane\n");
+        assert_eq!(
+            recv_websocket_binary(&mut socket).await,
+            b"\x1b[H\x1b[2Jpane\r\n"
+        );
         assert_eq!(recv_websocket_binary(&mut socket).await, b"during-capture");
         socket.close(None).await.unwrap();
         wait_for_subscriber_count(&state.attach_brokers, "handoff", 0).await;
