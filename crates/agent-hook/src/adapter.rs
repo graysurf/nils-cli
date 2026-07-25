@@ -379,8 +379,17 @@ pub fn normalize_activity_event(
     let provider_session_id = optional_provider_id(object, "session_id")?
         .or(optional_provider_id(object, "session_key")?)
         .map(|value| projected_provider_id(runtime_id, request.product, "session", value));
-    let provider_turn_id = optional_provider_id(object, "turn_id")?
-        .map(|value| projected_provider_id(runtime_id, request.product, "turn", value));
+    let mut turn_id = optional_provider_id(object, "turn_id")?;
+    if turn_id.is_none() && request.product == Product::Claude {
+        // Claude names its per-turn identifier `prompt_id`, not `turn_id`. It is
+        // stable across the turn's own events — the `Stop` and the idle
+        // `Notification` that closes the same turn carry the same value — which
+        // is exactly what turn correlation needs. Without it every Claude event
+        // is uncorrelated and completion has to fall back to loose matching.
+        turn_id = optional_provider_id(object, "prompt_id")?;
+    }
+    let provider_turn_id =
+        turn_id.map(|value| projected_provider_id(runtime_id, request.product, "turn", value));
     let exact_attention = if exact_clarification {
         optional_provider_id(object, "tool_use_id")?
     } else if exact_elicitation {

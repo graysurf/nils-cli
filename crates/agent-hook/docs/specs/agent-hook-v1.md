@@ -113,6 +113,13 @@ normalized only from documented provider fields:
 | Claude `Elicitation`, `ElicitationResult` | `mcp_server_name` |
 | Claude `StopFailure` | `error` |
 
+Correlation identities are read from the provider's own fields and projected
+into opaque local ids; raw provider values never leave the adapter. The session
+identity comes from `session_id`, or `session_key` when that is the provider's
+name for it. The turn identity comes from `turn_id`, falling back to `prompt_id`
+for Claude, which is the field Claude actually emits and which stays stable
+across the turn's own `Stop` and idle `Notification` events.
+
 Path-bearing mutation inputs are normalized before rule evaluation. `Write`,
 `Edit`, and `MultiEdit` require exactly one non-empty `path` or `file_path`;
 `NotebookEdit` requires `notebook_path`; and Codex `apply_patch` requires its

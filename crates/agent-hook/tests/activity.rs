@@ -3,7 +3,7 @@ mod support;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 
-use pretty_assertions::assert_eq;
+use pretty_assertions::{assert_eq, assert_ne};
 
 use support::Fixture;
 
@@ -105,4 +105,88 @@ fn lifecycle_activity_uses_the_typed_cli_with_metadata_only_json() {
     ] {
         assert!(!claude_event.contains(secret), "leaked {secret}");
     }
+}
+
+const STOP_POLICY: &str = r#"schema_version = "agent-hook.policy.v1"
+bundle_id = "runtime-kit"
+version = "2026.07.20.1"
+
+[[rules]]
+id = "session.activity.stop"
+products = ["claude"]
+events = ["Stop"]
+priority = 10
+mode = "enforce"
+failure_posture = "closed"
+override_class = "locked"
+capability = { id = "agent-session.activity.v1", reason_code = "activity-recorded" }
+"#;
+
+#[test]
+fn claude_prompt_id_is_correlated_as_the_provider_turn_id() {
+    let fixture = Fixture::new(STOP_POLICY);
+    let fake = fixture.root.join("agent-session-fake");
+    let args_path = fixture.root.join("activity.args");
+    let input_path = fixture.root.join("activity.json");
+    fs::write(
+        &fake,
+        "#!/bin/sh\nset -eu\nprintf '%s\\n' \"$@\" > \"$CAPTURE_ARGS\"\ndd of=\"$CAPTURE_STDIN\" status=none\n",
+    )
+    .expect("fake agent-session");
+    fs::set_permissions(&fake, fs::Permissions::from_mode(0o700)).expect("fake mode");
+    let envs = [
+        ("AGENT_SESSION_BIN", fake.to_str().expect("fake path")),
+        ("AGENT_SESSION_ID", "managed-session"),
+        ("AGENT_SESSION_RUNTIME_ID", "managed-runtime"),
+        ("CAPTURE_ARGS", args_path.to_str().expect("args path")),
+        ("CAPTURE_STDIN", input_path.to_str().expect("stdin path")),
+    ];
+
+    // Claude's real Stop payload carries `prompt_id`, never `turn_id`, so
+    // correlation has to accept it or every Claude event stays uncorrelated.
+    let stop = fixture.run_with_env(
+        &["dispatch", "--product", "claude", "--format", "json"],
+        Some(
+            r#"{"hook_event_name":"Stop","session_id":"claude-session-secret","prompt_id":"claude-prompt-secret","stop_hook_active":false,"last_assistant_message":"message-secret"}"#,
+        ),
+        &envs,
+    );
+    assert_eq!(stop.code, 0, "stderr={}", stop.stderr_text());
+    let stop_event = fs::read_to_string(&input_path).expect("captured event");
+    let stop_json: serde_json::Value = serde_json::from_str(&stop_event).expect("event JSON");
+    assert_eq!(stop_json["provider"], "claude");
+    assert_eq!(stop_json["kind"], "stop_observed");
+    assert!(
+        stop_json["provider_turn_id"]
+            .as_str()
+            .is_some_and(|value| value.starts_with("local:v1:")),
+        "prompt_id was not correlated: {stop_event}"
+    );
+    for secret in [
+        "claude-prompt-secret",
+        "claude-session-secret",
+        "message-secret",
+        "last_assistant_message",
+        "prompt_id",
+    ] {
+        assert!(!stop_event.contains(secret), "leaked {secret}");
+    }
+
+    // An explicit `turn_id` still wins, so a provider that grows the documented
+    // field keeps its own identity instead of the fallback.
+    let explicit = fixture.run_with_env(
+        &["dispatch", "--product", "claude", "--format", "json"],
+        Some(
+            r#"{"hook_event_name":"Stop","session_id":"claude-session-secret","turn_id":"explicit-turn","prompt_id":"claude-prompt-secret","stop_hook_active":false}"#,
+        ),
+        &envs,
+    );
+    assert_eq!(explicit.code, 0, "stderr={}", explicit.stderr_text());
+    let explicit_event = fs::read_to_string(&input_path).expect("captured event");
+    let explicit_json: serde_json::Value =
+        serde_json::from_str(&explicit_event).expect("event JSON");
+    assert_ne!(
+        explicit_json["provider_turn_id"], stop_json["provider_turn_id"],
+        "turn_id must not be shadowed by prompt_id"
+    );
 }
