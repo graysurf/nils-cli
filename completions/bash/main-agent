@@ -518,7 +518,7 @@ _main-agent() {
             return 0
             ;;
         main__agent__quick)
-            opts="-h --assignment-file --tier --idempotency-key --format --state-dir --host --help"
+            opts="-h --assignment-file --tier --await-ready --idempotency-key --format --state-dir --host --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -540,6 +540,10 @@ _main-agent() {
                     return 0
                     ;;
                 --tier)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --await-ready)
                     COMPREPLY=($(compgen -f "${cur}"))
                     return 0
                     ;;

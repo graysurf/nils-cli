@@ -180,6 +180,13 @@ remain the launch-only result when `--await-ready 0` is selected. Launch
 transport alone is not worker readiness, task completion, or Main Agent
 acceptance.
 
+`main-agent quick` performs the same readiness proof and the same
+runtime-owned single-Enter recovery, and defaults to `--await-ready 5m` rather
+than launch-only. Do not hand-drive a `quick` worker that stays `starting`:
+read its typed `readiness` result instead. If that result is
+`readiness_failed`, the recovery is already exhausted, so treat it as a
+transport defect to report rather than a prompt to resend.
+
 Before accepting any result, verify all of these conditions:
 
 1. `agent-session list --format json` contains the worker with its orchestration

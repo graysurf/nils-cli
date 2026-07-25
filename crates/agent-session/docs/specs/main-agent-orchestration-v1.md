@@ -76,7 +76,7 @@ main-agent worker message|accept|release|delete ...
 main-agent worker retire ID --if-revision N --idempotency-key KEY --format json
 main-agent collaborate|borrow|handoff|adopt ...
 main-agent close --if-revision N --idempotency-key KEY --format json
-main-agent quick --assignment-file FILE [--tier L0|L1|L2|L3] --idempotency-key KEY --format json
+main-agent quick --assignment-file FILE [--tier L0|L1|L2|L3] [--await-ready D] --idempotency-key KEY --format json
 ```
 
 `init` first confirms or acquires the caller-owned coordination claim, then
@@ -115,7 +115,13 @@ synthesizes an ephemeral run and work-context claim from the assignment (the
 packet MUST declare a `repository`), launches the single worker in one call, and
 marks the run ephemeral so it auto-closes once that worker is torn down — no
 explicit `close`. A session that already controls a run must use the granular
-`init` + `worker start` path instead.
+`init` + `worker start` path instead. `quick` runs the same `--await-ready`
+readiness proof and runtime-owned single-Enter recovery described below, but
+defaults to `5m` instead of launch-only: the fast path exists to hand back a
+working worker, so a dropped submit key must be the runtime's problem rather
+than something its caller has to notice and repair by hand. `--await-ready 0`
+selects the old launch-only result. A malformed duration is rejected before the
+ephemeral run is created.
 
 `worker start --await-ready D` folds the readiness proof into launch: after the
 worker is bound it waits up to a bounded `D` (0-5m; `0` = launch-only) for the

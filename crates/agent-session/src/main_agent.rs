@@ -419,6 +419,14 @@ struct QuickArgs {
     /// Work tier for the synthesized ephemeral run (L0/L1 delegate-all).
     #[arg(long, default_value = "L0")]
     tier: String,
+    /// Bounded wait for the worker's authenticated checkpoint, with the same
+    /// runtime-owned single-Enter recovery `worker start --await-ready` performs.
+    /// Unlike `worker start` this defaults to waiting: the fast path exists to
+    /// hand back a working worker, and a launch-only result would leave a
+    /// dropped submit key for the caller to notice and hand-repair. Pass 0 for
+    /// the old launch-only behavior. 0-5m (integer with optional s/m/h suffix).
+    #[arg(long, default_value = "5m")]
+    await_ready: String,
     #[arg(long, help = QUICK_IDEMPOTENCY_KEY_HELP)]
     idempotency_key: Option<String>,
     #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
@@ -3296,6 +3304,9 @@ fn run_quick(context: &CliContext, args: QuickArgs) -> Result<Value, CliError> {
     if !matches!(args.tier.as_str(), "L0" | "L1" | "L2" | "L3") {
         return Err(invalid_input("quick tier is invalid"));
     }
+    // Reject a malformed duration before the ephemeral run exists, so a typo
+    // cannot leave a created run behind for the caller to clean up.
+    parse_await_ready(&args.await_ready)?;
     let input: AssignmentInput = crate::coordination::read_bounded_json(
         &args.assignment_file,
         256 * 1024,
@@ -3430,7 +3441,7 @@ fn run_quick(context: &CliContext, args: QuickArgs) -> Result<Value, CliError> {
             batch: None,
             if_run_revision: None,
             idempotency_key: format!("{}-worker", idempotency_key),
-            await_ready: "0".to_string(),
+            await_ready: args.await_ready.clone(),
             format: OutputFormat::Json,
         },
     )?;
@@ -4827,6 +4838,49 @@ mod tests {
         assert_eq!(
             parse_await_ready("abc").unwrap_err().code(),
             "invalid-duration"
+        );
+    }
+
+    #[test]
+    fn quick_defaults_to_awaiting_worker_readiness() {
+        // The fast path used to hardcode launch-only, so its result could never
+        // carry a readiness proof and the runtime-owned single-Enter recovery
+        // never ran for it. A dropped submit key then became something the
+        // caller had to notice and hand-repair.
+        let cli = MainAgentCli::try_parse_from([
+            "main-agent",
+            "quick",
+            "--assignment-file",
+            "packet.json",
+        ])
+        .expect("quick parses without an explicit await");
+        let MainAgentCommand::Quick(args) = cli.command else {
+            panic!("expected the quick subcommand");
+        };
+        assert_eq!(
+            parse_await_ready(&args.await_ready).expect("default await duration"),
+            Some(Duration::from_secs(300))
+        );
+    }
+
+    #[test]
+    fn quick_still_allows_an_explicit_launch_only_wait() {
+        let cli = MainAgentCli::try_parse_from([
+            "main-agent",
+            "quick",
+            "--assignment-file",
+            "packet.json",
+            "--await-ready",
+            "0",
+        ])
+        .expect("quick parses an explicit zero");
+        let MainAgentCommand::Quick(args) = cli.command else {
+            panic!("expected the quick subcommand");
+        };
+        assert!(
+            parse_await_ready(&args.await_ready)
+                .expect("explicit zero")
+                .is_none()
         );
     }
 

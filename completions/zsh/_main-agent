@@ -338,6 +338,7 @@ json\:"Single-record JSON envelope (snake_case)"))' \
 _arguments "${_arguments_options[@]}" : \
 '--assignment-file=[Private assignment packet JSON file]:PATH:_files' \
 '--tier=[Work tier for the synthesized ephemeral run (L0/L1 delegate-all)]:TIER:_default' \
+'--await-ready=[Bounded wait for the worker'\''s authenticated checkpoint, with the same runtime-owned single-Enter recovery \`worker start --await-ready\` performs. Unlike \`worker start\` this defaults to waiting\: the fast path exists to hand back a working worker, and a launch-only result would leave a dropped submit key for the caller to notice and hand-repair. Pass 0 for the old launch-only behavior. 0-5m (integer with optional s/m/h suffix)]:AWAIT_READY:_default' \
 '--idempotency-key=[Optional for the fast-path\: omit to derive a stable idempotency key from a digest of the assignment packet, or supply one to control replay explicitly. 8-128 printable non-space ASCII bytes.]:IDEMPOTENCY_KEY:_default' \
 '--format=[]:FORMAT:((text\:"Human-readable text output (default)"
 json\:"Single-record JSON envelope (snake_case)"))' \
