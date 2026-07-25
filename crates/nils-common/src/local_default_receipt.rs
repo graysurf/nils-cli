@@ -14,6 +14,10 @@ pub const MAX_RECEIPT_BYTES: u64 = 64 * 1024;
 /// decision belongs to the host guard; the receipt only records the reason as
 /// evidence, so a value that states nothing is not recorded at all.
 pub const DELIVERY_WAIVER_ENV: &str = "AGENT_RUNTIME_DEFAULT_DELIVERY_WAIVER";
+/// A host guard that admits a delivery on a stated reason must measure that
+/// reason exactly as [`normalized_delivery_waiver`] does, against this same
+/// minimum. A guard admitting below it would leave the receipt with no recorded
+/// reason for a delivery it let through.
 pub const MIN_DELIVERY_WAIVER_LENGTH: usize = 12;
 pub const MAX_DELIVERY_WAIVER_LENGTH: usize = 500;
 
