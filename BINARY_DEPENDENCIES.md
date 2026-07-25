@@ -120,20 +120,21 @@ The codex and opencode adapters must not set this var; they continue to rely on 
 
 ## 5. `agent-docs` integration for `project-dev`
 
-Register this file as a required `project-dev` document by declaring a
-`[[document]]` entry in the project `AGENT_DOCS.toml` catalog:
+Register this file as an on-demand `project-dev` reference in the project
+`AGENT_DOCS.toml` catalog. `AGENTS.md` routes dependency and toolchain changes
+here without injecting the full inventory into unrelated edits:
 
 ```toml
 [[document]]
 context  = "project-dev"
 scope    = "project"
 path     = "BINARY_DEPENDENCIES.md"
-required = true
+required = false
 notes    = "External runtime tools required by the repo"
 ```
 
-`agent-docs init --print` emits an annotated stub with this schema. Verify
-resolution includes this document:
+`agent-docs init --print` emits an annotated stub with this schema. Verify the
+catalog remains valid:
 
 ```bash
 cargo run -p agent-docs -- preflight --intent project-dev --format json \

@@ -193,17 +193,20 @@ If crate is non-publishable (`publish = false`), verify it is excluded from publ
 
 ## Agent-Docs Integration
 
-This document should be required in `project-dev` context.
+This document is an on-demand `project-dev` reference for new or substantially
+redesigned CLI crates.
 
-Declare it as a `[[document]]` entry in the project `AGENT_DOCS.toml` catalog
-(see `crates/agent-docs/README.md`):
+Declare it as an optional `[[document]]` entry in the project
+`AGENT_DOCS.toml` catalog (see `crates/agent-docs/README.md`). `AGENTS.md`
+routes applicable work here without forcing the full standard into unrelated
+edits:
 
 ```toml
 [[document]]
 context  = "project-dev"
 scope    = "project"
 path     = "docs/runbooks/new-cli-crate-development-standard.md"
-required = true
+required = false
 notes    = "New CLI crate standard (human output + JSON contract + publish-ready)"
 ```
 

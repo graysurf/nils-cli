@@ -11,6 +11,8 @@
 
 ## Local Source Of Truth
 
+Open only the references relevant to the requested change:
+
 - Development contract: `DEVELOPMENT.md`
 - Runtime dependency and degradation reference: `BINARY_DEPENDENCIES.md`
 - CLI completion policy: `docs/runbooks/cli-completion-development-standard.md`

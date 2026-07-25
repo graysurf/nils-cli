@@ -2,33 +2,33 @@
 context = "project-dev"
 scope = "project"
 path = "BINARY_DEPENDENCIES.md"
-required = true
+required = false
 when = "always"
-notes = "Project-level dependency and toolchain policy for implementation tasks"
+notes = "On-demand runtime dependency and degradation reference; read when a change adds, removes, invokes, installs, or diagnoses an external tool."
 
 [[document]]
 context = "project-dev"
 scope = "project"
 path = "docs/runbooks/cli-completion-development-standard.md"
-required = true
+required = false
 when = "always"
-notes = "CLI completion and alias development standard for project tasks"
+notes = "On-demand completion and alias standard; read for completion assets, aliases, export paths, or shell integration."
 
 [[document]]
 context = "project-dev"
 scope = "project"
 path = "docs/runbooks/new-cli-crate-development-standard.md"
-required = true
+required = false
 when = "always"
-notes = "New CLI crate standard (human output + JSON contract + publish-ready)"
+notes = "On-demand new CLI crate standard; read only when adding or substantially redesigning a user- or service-facing crate."
 
 [[document]]
 context = "project-dev"
 scope = "project"
 path = "docs/specs/crate-docs-placement-policy.md"
-required = true
+required = false
 when = "always"
-notes = "Crate docs placement policy for project development tasks"
+notes = "On-demand crate documentation placement policy; read when adding, moving, or reclassifying documentation."
 
 [[document]]
 context = "session-coordination"
