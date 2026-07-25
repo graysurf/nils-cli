@@ -10,6 +10,12 @@ use serde::{Deserialize, Serialize};
 
 pub const SCHEMA_VERSION: &str = "cli.semantic-commit.local-default.v1";
 pub const MAX_RECEIPT_BYTES: u64 = 64 * 1024;
+/// One-shot delivery waiver stated on the invoking command. The admission
+/// decision belongs to the host guard; the receipt only records the reason as
+/// evidence, so a value that states nothing is not recorded at all.
+pub const DELIVERY_WAIVER_ENV: &str = "AGENT_RUNTIME_DEFAULT_DELIVERY_WAIVER";
+pub const MIN_DELIVERY_WAIVER_LENGTH: usize = 12;
+pub const MAX_DELIVERY_WAIVER_LENGTH: usize = 500;
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -33,6 +39,8 @@ pub struct LocalDefaultData {
     pub staged_file_count: usize,
     pub remote: LocalDefaultRemote,
     pub completion: LocalDefaultCompletion,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivery_waiver: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -80,6 +88,11 @@ impl LocalDefaultReceipt {
         {
             return Err("local-default receipt invariants are invalid".to_string());
         }
+        if let Some(waiver) = data.delivery_waiver.as_deref()
+            && normalized_delivery_waiver(waiver).as_deref() != Some(waiver)
+        {
+            return Err("local-default delivery waiver is not a stated reason".to_string());
+        }
         if data.remote.configured_count == 0 {
             if data.remote.mode != "none"
                 || data.remote.upstream.is_some()
@@ -110,6 +123,29 @@ impl LocalDefaultReceipt {
         }
         Ok(())
     }
+}
+
+/// Return the waiver reason worth recording, or `None` when the value states
+/// nothing. Control characters collapse to spaces so a receipt line cannot be
+/// forged, and runs of whitespace normalize to one space.
+pub fn normalized_delivery_waiver(value: &str) -> Option<String> {
+    let reason = value
+        .chars()
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if reason.chars().count() < MIN_DELIVERY_WAIVER_LENGTH {
+        return None;
+    }
+    Some(reason.chars().take(MAX_DELIVERY_WAIVER_LENGTH).collect())
 }
 
 fn valid_upstream_relation_increment(before: &str, after: &str) -> bool {
@@ -203,9 +239,37 @@ mod tests {
     use std::os::unix::fs::{PermissionsExt, symlink};
 
     use super::{
-        MAX_RECEIPT_BYTES, private_receipt_access, read_strict, valid_object_id,
-        valid_upstream_relation_increment,
+        MAX_DELIVERY_WAIVER_LENGTH, MAX_RECEIPT_BYTES, normalized_delivery_waiver,
+        private_receipt_access, read_strict, valid_object_id, valid_upstream_relation_increment,
     };
+
+    #[test]
+    fn delivery_waivers_record_only_a_stated_reason() {
+        assert_eq!(
+            normalized_delivery_waiver("maintainer authorized this target").as_deref(),
+            Some("maintainer authorized this target")
+        );
+        assert_eq!(
+            normalized_delivery_waiver("  cross-repo\tlocal\ncompletion  ").as_deref(),
+            Some("cross-repo local completion")
+        );
+        assert_eq!(normalized_delivery_waiver(""), None);
+        assert_eq!(normalized_delivery_waiver("1"), None);
+        assert_eq!(normalized_delivery_waiver("           "), None);
+        // A control character cannot smuggle a second line into the receipt.
+        assert_eq!(
+            normalized_delivery_waiver("authorized\r\nprovider_delivered: true").as_deref(),
+            Some("authorized provider_delivered: true")
+        );
+        let long = "reason ".repeat(200);
+        assert_eq!(
+            normalized_delivery_waiver(&long)
+                .expect("bounded reason")
+                .chars()
+                .count(),
+            MAX_DELIVERY_WAIVER_LENGTH
+        );
+    }
 
     #[test]
     fn upstream_relation_pairs_require_canonical_exact_increment() {

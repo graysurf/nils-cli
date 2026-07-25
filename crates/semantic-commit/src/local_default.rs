@@ -6,8 +6,8 @@ use std::process::{Command, Output};
 
 use nils_common::execution_effect::digest_parts;
 use nils_common::local_default_receipt::{
-    LocalDefaultCompletion, LocalDefaultData, LocalDefaultReceipt, LocalDefaultRemote,
-    SCHEMA_VERSION,
+    DELIVERY_WAIVER_ENV, LocalDefaultCompletion, LocalDefaultData, LocalDefaultReceipt,
+    LocalDefaultRemote, SCHEMA_VERSION, normalized_delivery_waiver,
 };
 
 use crate::commit;
@@ -128,6 +128,7 @@ pub fn run(args: &[String]) -> i32 {
                 provider_delivered: false,
                 provider_reconciliation_required: state.remote_count > 0,
             },
+            delivery_waiver: stated_delivery_waiver(),
         },
     };
     let receipt_out = options
@@ -651,8 +652,18 @@ fn receipt_for_read_only(
                 provider_delivered: false,
                 provider_reconciliation_required: state.remote_count > 0,
             },
+            delivery_waiver: stated_delivery_waiver(),
         },
     }
+}
+
+/// Record the one-shot delivery waiver the caller stated on this invocation.
+/// Admission is the host guard's decision; this only preserves the reason.
+fn stated_delivery_waiver() -> Option<String> {
+    std::env::var(DELIVERY_WAIVER_ENV)
+        .ok()
+        .as_deref()
+        .and_then(normalized_delivery_waiver)
 }
 
 fn write_receipt(path: &Path, receipt: &LocalDefaultReceipt) -> Result<(), String> {
@@ -810,7 +821,7 @@ fn partial_failure(new_head: Option<&str>, message: &str) -> i32 {
 }
 
 fn print_usage(stderr: bool) {
-    let usage = "Usage: semantic-commit local-default --expect-head <full-sha> --expected-branch <name> [--receipt-out <path>] [message options] [--remote-mode local-only] [--dry-run|--validate-only] [--format text|json] (receipt-out is required when committing)";
+    let usage = "Usage: semantic-commit local-default --expect-head <full-sha> --expected-branch <name> [--receipt-out <path>] [--repo <path>] [message options] [--remote-mode local-only] [--dry-run|--validate-only] [--format text|json] (receipt-out is required when committing; --repo binds a target outside the current directory)";
     if stderr {
         eprintln!("{usage}");
     } else {

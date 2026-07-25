@@ -318,6 +318,7 @@ fn run_with_local_default_receipt_location(
                 provider_delivered: false,
                 provider_reconciliation_required: true,
             },
+            delivery_waiver: None,
         },
     };
     match mutation {

@@ -672,3 +672,105 @@ fn local_default_signing_failure_leaves_head_unchanged() {
     assert_eq!(git_trim(repo.path(), &["rev-parse", "HEAD"]), old_head);
     assert!(!receipt.exists());
 }
+
+#[test]
+fn local_default_usage_documents_the_cross_repository_target() {
+    // `--repo` is what binds a foreign target without moving the shell, so an
+    // undocumented flag is the same as a missing one for a caller reading help.
+    let repo = init_repo_with_head();
+    let output =
+        common::run_semantic_commit_output(repo.path(), &["local-default", "--help"], &[], None);
+
+    assert_eq!(output.status.code(), Some(0));
+    assert!(
+        as_str(&output.stdout).contains("--repo <path>"),
+        "stdout was: {}",
+        as_str(&output.stdout)
+    );
+}
+
+#[test]
+fn local_default_records_a_stated_delivery_waiver_in_the_receipt() {
+    let repo = init_repo_with_head();
+    let _signing = configure_ssh_signing(repo.path());
+    common::write_file(repo.path(), "change.txt", "change\n");
+    common::git(repo.path(), &["add", "change.txt"]);
+    let old_head = git_trim(repo.path(), &["rev-parse", "HEAD"]);
+    let receipt_dir = tempfile::tempdir().expect("receipt dir");
+    let receipt = receipt_dir.path().join("receipt.json");
+    let reason = "maintainer authorized this cross-repo local completion";
+
+    let output = common::run_semantic_commit_output(
+        repo.path(),
+        &[
+            "local-default",
+            "--message",
+            "docs(policy): update contract",
+            "--expect-head",
+            &old_head,
+            "--expected-branch",
+            "main",
+            "--receipt-out",
+            receipt.to_str().expect("receipt path"),
+            "--automation",
+            "--format",
+            "json",
+        ],
+        &[("AGENT_RUNTIME_DEFAULT_DELIVERY_WAIVER", reason)],
+        None,
+    );
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stderr was: {}",
+        as_str(&output.stderr)
+    );
+    let parsed = read_strict(&receipt).expect("strict receipt");
+    assert_eq!(parsed.data.delivery_waiver.as_deref(), Some(reason));
+}
+
+#[test]
+fn local_default_omits_an_unstated_delivery_waiver() {
+    // A value that states nothing is not evidence, so it is not recorded as if
+    // it were. The receipt keeps the field absent instead.
+    let repo = init_repo_with_head();
+    let _signing = configure_ssh_signing(repo.path());
+    common::write_file(repo.path(), "change.txt", "change\n");
+    common::git(repo.path(), &["add", "change.txt"]);
+    let old_head = git_trim(repo.path(), &["rev-parse", "HEAD"]);
+    let receipt_dir = tempfile::tempdir().expect("receipt dir");
+    let receipt = receipt_dir.path().join("receipt.json");
+
+    let output = common::run_semantic_commit_output(
+        repo.path(),
+        &[
+            "local-default",
+            "--message",
+            "docs(policy): update contract",
+            "--expect-head",
+            &old_head,
+            "--expected-branch",
+            "main",
+            "--receipt-out",
+            receipt.to_str().expect("receipt path"),
+            "--automation",
+            "--format",
+            "json",
+        ],
+        &[("AGENT_RUNTIME_DEFAULT_DELIVERY_WAIVER", "1")],
+        None,
+    );
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stderr was: {}",
+        as_str(&output.stderr)
+    );
+    let parsed = read_strict(&receipt).expect("strict receipt");
+    assert_eq!(parsed.data.delivery_waiver, None);
+    let receipt_json: Value =
+        serde_json::from_slice(&fs::read(&receipt).expect("receipt bytes")).expect("receipt json");
+    assert!(receipt_json["data"].get("delivery_waiver").is_none());
+}

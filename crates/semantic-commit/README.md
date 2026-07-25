@@ -128,6 +128,14 @@ postconditions, then atomically writes a
 `cli.semantic-commit.local-default.v1` receipt. A post-commit receipt failure
 is reported as partial success and never triggers an automatic reset.
 
+Add `--repo <path>` to bind a target outside the current directory, so a
+cross-repository completion never depends on the caller's shell position.
+
+When `AGENT_RUNTIME_DEFAULT_DELIVERY_WAIVER` is set, its normalized reason is
+recorded in the receipt as `data.delivery_waiver`. Admission is the host guard's
+decision; this command only preserves the stated reason as evidence, and a value
+shorter than 12 characters is not recorded at all.
+
 Examples:
 
 ```bash
