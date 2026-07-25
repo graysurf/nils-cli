@@ -726,7 +726,8 @@ fn run_init(context: &CliContext, args: InitArgs) -> Result<Value, CliError> {
     }
 
     if let Some(existing) = locked.registry.runs.values_mut().find(|run| {
-        run.controller.session_id == record.id
+        run_is_live(run)
+            && run.controller.session_id == record.id
             && run.controller.session_created_at == record.created_at
     }) {
         if existing.objective_packet_digest != packet_digest {
@@ -3300,6 +3301,27 @@ fn prepare_group_cleanup_assignments(
 /// the worker is torn down (see `finalize_worker_delete`), sparing the caller an
 /// explicit `close`. A session that already controls a run must use the
 /// granular `init` + `worker start` path instead.
+/// A closed run is history, not control. Treating it as control permanently
+/// locked a session out of delegating again: `quick` refused with
+/// `quick-run-exists`, and its documented fallback was unreachable because the
+/// objective packet `quick` synthesizes is never handed to the caller, so
+/// `init --if-absent` could only report `run-objective-conflict`.
+fn run_is_live(run: &RunRecord) -> bool {
+    run.state == "active"
+}
+
+fn session_controls_live_run(
+    registry: &orchestration::Registry,
+    session_id: &str,
+    session_created_at: &str,
+) -> bool {
+    registry.runs.values().any(|run| {
+        run_is_live(run)
+            && run.controller.session_id == session_id
+            && run.controller.session_created_at == session_created_at
+    })
+}
+
 fn run_quick(context: &CliContext, args: QuickArgs) -> Result<Value, CliError> {
     if !matches!(args.tier.as_str(), "L0" | "L1" | "L2" | "L3") {
         return Err(invalid_input("quick tier is invalid"));
@@ -3385,10 +3407,7 @@ fn run_quick(context: &CliContext, args: QuickArgs) -> Result<Value, CliError> {
                 .map(str::to_string)
                 .ok_or_else(|| invalid_input("pending quick receipt is invalid"))?,
             None => {
-                if locked.registry.runs.values().any(|run| {
-                    run.controller.session_id == record.id
-                        && run.controller.session_created_at == record.created_at
-                }) {
+                if session_controls_live_run(&locked.registry, &record.id, &record.created_at) {
                     return Err(CliError::data(
                         "quick-run-exists",
                         "this session already controls a run; use init and worker start",
@@ -4696,6 +4715,31 @@ mod tests {
         assert!(!session_dir(&context, "main").exists());
         let registry = orchestration::load_registry_readonly(&context).unwrap();
         assert_eq!(registry.runs["run-one"].state, "closed");
+    }
+
+    #[test]
+    fn a_closed_run_no_longer_counts_as_session_control() {
+        let mut registry = orchestration::Registry::default();
+        let (session, created_at) = ("main", "2030-01-01T00:00:00Z");
+
+        registry.runs.insert("q".to_string(), run_record("q", true));
+        assert!(
+            session_controls_live_run(&registry, session, created_at),
+            "an active run must still block a second delegation"
+        );
+
+        // `quick` auto-closes its ephemeral run when the worker is torn down.
+        // That must release the session, or it can never delegate again: the
+        // documented `init` fallback needs the objective packet `quick`
+        // synthesized and never handed back.
+        registry.runs.get_mut("q").expect("run").state = "closed".to_string();
+        assert!(!session_controls_live_run(&registry, session, created_at));
+
+        // A live run owned by a different session is not this session's control.
+        let mut other = run_record("other", false);
+        other.controller.session_id = "someone-else".to_string();
+        registry.runs.insert("other".to_string(), other);
+        assert!(!session_controls_live_run(&registry, session, created_at));
     }
 
     #[test]
