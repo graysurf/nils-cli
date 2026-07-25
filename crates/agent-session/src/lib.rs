@@ -15,6 +15,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::env;
 use std::ffi::OsString;
 use std::fs::{self, OpenOptions};
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::io::{self, Read, Write};
 use std::os::fd::AsRawFd;
 #[cfg(target_os = "linux")]
@@ -3204,6 +3205,14 @@ fn paste_prompt(tmux_bin: &Path, record: &SessionRecord) -> Result<(), CliError>
     // lost, and the single-Enter recovery cannot restore a prompt that never
     // reached the provider's input at all.
     await_pane_drawn_before_paste(tmux_bin, &target);
+
+    // A drawn pane is still not proof that the provider reads stdin yet: Claude
+    // Code parks its cursor on the input line about a second before it accepts
+    // input, and tmux exposes no signal that separates those two moments. So
+    // confirm the pane actually reacted to the paste, and re-deliver when it did
+    // not. This runs strictly before the submit key, so a re-delivery can never
+    // double-submit — nothing has been submitted yet.
+    let before = capture_pane_digest(tmux_bin, &target);
     load_and_paste_buffer(tmux_bin, &buffer_name, &target, Path::new(prompt_file))?;
 
     // The initial prompt is submitted; `send` deliberately leaves this to
@@ -3212,6 +3221,10 @@ fn paste_prompt(tmux_bin: &Path, record: &SessionRecord) -> Result<(), CliError>
     // immediately adjacent Enter arrives. Keep the key a separate command and
     // give both Codex and Claude one bounded settle interval first.
     thread::sleep(POST_PASTE_KEY_SETTLE_DELAY);
+    if pane_ignored_paste(before, capture_pane_digest(tmux_bin, &target)) {
+        load_and_paste_buffer(tmux_bin, &buffer_name, &target, Path::new(prompt_file))?;
+        thread::sleep(POST_PASTE_KEY_SETTLE_DELAY);
+    }
     let mut enter = ProcessCommand::new(tmux_bin);
     enter.arg("send-keys").arg("-t").arg(&target).arg("Enter");
     run_status(enter, "tmux send-keys")
@@ -3260,6 +3273,37 @@ fn await_pane_drawn_before_paste(tmux_bin: &Path, target: &str) {
             Some(cursor) if pane_drawn(cursor) => return,
             Some(_) => thread::sleep(PANE_PASTE_READY_POLL_INTERVAL),
         }
+    }
+}
+
+/// Digest of the pane's visible content, used only to tell whether the pane
+/// reacted to a paste. `None` when tmux cannot answer, which must not be read as
+/// "unchanged".
+fn capture_pane_digest(tmux_bin: &Path, target: &str) -> Option<u64> {
+    let output = ProcessCommand::new(tmux_bin)
+        .arg("capture-pane")
+        .arg("-p")
+        .arg("-t")
+        .arg(target)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let mut hasher = DefaultHasher::new();
+    output.stdout.hash(&mut hasher);
+    Some(hasher.finish())
+}
+
+/// A pane that is byte-identical before and after a paste received nothing: any
+/// accepted paste changes the display, whether the provider echoes the text or
+/// collapses it into a placeholder. Unobservable digests are never treated as
+/// evidence, so a missing signal leaves the single delivery in place instead of
+/// adding a speculative second one.
+fn pane_ignored_paste(before: Option<u64>, after: Option<u64>) -> bool {
+    match (before, after) {
+        (Some(before), Some(after)) => before == after,
+        _ => false,
     }
 }
 
@@ -9978,7 +10022,7 @@ mod tests {
         TmuxProcessIdentity, TmuxRuntimeIdentity, acquire_session_record_lock,
         acquire_session_record_lock_timed, create_record, delete_session_with_timeouts,
         kill_tmux_session_with_timeout, live_status_with_timeout, load_session_record, pane_drawn,
-        parse_pane_cursor, persist_tmux_runtime_identity, render_delete_text,
+        pane_ignored_paste, parse_pane_cursor, persist_tmux_runtime_identity, render_delete_text,
         resolve_agent_session_executable_from, resolve_session_id, session_dir,
         strip_trailing_blank_lines, tmux_launch_may_have_created_runtime,
         try_acquire_session_record_lock, write_session_record,
@@ -9994,6 +10038,18 @@ mod tests {
         }
         assert_eq!(parse_pane_cursor("9|25\n"), Some((9, 25)));
         assert_eq!(parse_pane_cursor(" 0 | 0 "), Some((0, 0)));
+    }
+
+    #[test]
+    fn an_unchanged_pane_is_the_only_evidence_a_paste_was_ignored() {
+        // Identical digests mean the display did not react, so nothing arrived.
+        assert!(pane_ignored_paste(Some(7), Some(7)));
+        assert!(!pane_ignored_paste(Some(7), Some(8)));
+        // An unanswerable capture must never be read as "unchanged", or a
+        // delivered prompt would be pasted a second time.
+        assert!(!pane_ignored_paste(None, Some(7)));
+        assert!(!pane_ignored_paste(Some(7), None));
+        assert!(!pane_ignored_paste(None, None));
     }
 
     #[test]
