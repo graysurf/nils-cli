@@ -99,6 +99,8 @@ const CODEX_RESUME_AMBIGUITY_WINDOW_MS: u64 = 500;
 const CODEX_RESUME_BACKFILL_MAX_AGE_SECS: u64 = 10 * 60;
 const PANE_INPUT_COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
 const POST_PASTE_KEY_SETTLE_DELAY: Duration = Duration::from_millis(500);
+const PANE_PASTE_READY_POLL_INTERVAL: Duration = Duration::from_millis(100);
+const PANE_PASTE_READY_DEADLINE: Duration = Duration::from_secs(15);
 const DELETE_TERMINATION_VERIFY_TIMEOUT: Duration = Duration::from_secs(1);
 const DELETE_TERMINATION_VERIFY_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const DELETE_TERMINATION_PROBE_TIMEOUT: Duration = Duration::from_millis(100);
@@ -3196,6 +3198,12 @@ fn paste_prompt(tmux_bin: &Path, record: &SessionRecord) -> Result<(), CliError>
     let buffer_name = format!("{}-prompt", record.id);
     let target = format!("{}:0.0", record.tmux_session);
 
+    // The caller's fixed pre-paste delay is only a guess at provider startup.
+    // Confirm the pane has actually been drawn before pasting: bytes delivered
+    // while the launch shell still owns the tty are echoed into scrollback and
+    // lost, and the single-Enter recovery cannot restore a prompt that never
+    // reached the provider's input at all.
+    await_pane_drawn_before_paste(tmux_bin, &target);
     load_and_paste_buffer(tmux_bin, &buffer_name, &target, Path::new(prompt_file))?;
 
     // The initial prompt is submitted; `send` deliberately leaves this to
@@ -3207,6 +3215,52 @@ fn paste_prompt(tmux_bin: &Path, record: &SessionRecord) -> Result<(), CliError>
     let mut enter = ProcessCommand::new(tmux_bin);
     enter.arg("send-keys").arg("-t").arg(&target).arg("Enter");
     run_status(enter, "tmux send-keys")
+}
+
+/// Parse `#{cursor_y}|#{cursor_x}` from a tmux `display-message` reply. `None`
+/// means tmux could not answer in the expected shape — an older tmux, a stubbed
+/// binary, or a pane that is already gone — and the caller must then proceed
+/// instead of waiting on a signal that will never arrive.
+fn parse_pane_cursor(display_output: &str) -> Option<(u32, u32)> {
+    let trimmed = display_output.trim();
+    let (row, column) = trimmed.split_once('|')?;
+    Some((row.trim().parse().ok()?, column.trim().parse().ok()?))
+}
+
+/// A pane whose cursor has left the origin has been drawn on, which is the
+/// observable moment the provider TUI owns the terminal. The managed launch
+/// wrapper waits on its gate files without writing anything, so an untouched
+/// pane still reads `(0, 0)`.
+fn pane_drawn(cursor: (u32, u32)) -> bool {
+    cursor != (0, 0)
+}
+
+/// Bounded wait for the pane to be drawn before the initial prompt is pasted.
+/// Never fails a launch: an unanswerable query returns immediately and the
+/// deadline gives up rather than blocking, leaving the existing post-paste
+/// settle and the runtime-owned single-Enter recovery as the later guards.
+fn await_pane_drawn_before_paste(tmux_bin: &Path, target: &str) {
+    let started = Instant::now();
+    while started.elapsed() < PANE_PASTE_READY_DEADLINE {
+        let Ok(output) = ProcessCommand::new(tmux_bin)
+            .arg("display-message")
+            .arg("-p")
+            .arg("-t")
+            .arg(target)
+            .arg("#{cursor_y}|#{cursor_x}")
+            .output()
+        else {
+            return;
+        };
+        if !output.status.success() {
+            return;
+        }
+        match parse_pane_cursor(&String::from_utf8_lossy(&output.stdout)) {
+            None => return,
+            Some(cursor) if pane_drawn(cursor) => return,
+            Some(_) => thread::sleep(PANE_PASTE_READY_POLL_INTERVAL),
+        }
+    }
 }
 
 /// Load `file` into a named tmux buffer and paste it into `target`, deleting the
@@ -9923,12 +9977,33 @@ mod tests {
         AgentKind, CliContext, DeleteResult, RecordRequest, SessionRegistryFence,
         TmuxProcessIdentity, TmuxRuntimeIdentity, acquire_session_record_lock,
         acquire_session_record_lock_timed, create_record, delete_session_with_timeouts,
-        kill_tmux_session_with_timeout, live_status_with_timeout, load_session_record,
-        persist_tmux_runtime_identity, render_delete_text, resolve_agent_session_executable_from,
-        resolve_session_id, session_dir, strip_trailing_blank_lines,
-        tmux_launch_may_have_created_runtime, try_acquire_session_record_lock,
-        write_session_record,
+        kill_tmux_session_with_timeout, live_status_with_timeout, load_session_record, pane_drawn,
+        parse_pane_cursor, persist_tmux_runtime_identity, render_delete_text,
+        resolve_agent_session_executable_from, resolve_session_id, session_dir,
+        strip_trailing_blank_lines, tmux_launch_may_have_created_runtime,
+        try_acquire_session_record_lock, write_session_record,
     };
+
+    #[test]
+    fn pane_readiness_treats_an_unanswerable_tmux_reply_as_unobservable() {
+        // Anything other than the exact `row|column` shape must not be turned
+        // into a readiness decision, or a launch would block on a signal that
+        // is never coming.
+        for reply in ["", "\n", "unknown", "3", "3|", "|4", "a|b", "3|4|5\nextra"] {
+            assert_eq!(parse_pane_cursor(reply), None, "reply={reply:?}");
+        }
+        assert_eq!(parse_pane_cursor("9|25\n"), Some((9, 25)));
+        assert_eq!(parse_pane_cursor(" 0 | 0 "), Some((0, 0)));
+    }
+
+    #[test]
+    fn pane_is_drawn_only_after_the_cursor_leaves_the_origin() {
+        // The managed launch wrapper waits on its gate files silently, so an
+        // untouched pane stays at the origin until the provider TUI draws.
+        assert!(!pane_drawn((0, 0)));
+        assert!(pane_drawn((0, 1)));
+        assert!(pane_drawn((9, 25)));
+    }
 
     #[test]
     fn agent_session_executable_resolves_facade_to_exact_release_sibling() {
