@@ -24,11 +24,12 @@ libc = "0.2"
 nils-build-info = { version = "1.25.10", path = "../nils-build-info" }
 nils-common = { version = "1.25.10", path = "../nils-common", package = "nils-common" }
 nils-provider-resume = { version = "1.25.10", path = "../nils-provider-resume", package = "nils-provider-resume" }
+nils-scrub = { version = "1.25.10", path = "../nils-scrub" }
 reqwest = { version = "0.13", default-features = false, features = ["blocking", "rustls"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
+tempfile = "3"
 
 [dev-dependencies]
 nils-test-support = { version = "1.25.10", path = "../nils-test-support" }
 pretty_assertions = { workspace = true }
-tempfile = "3"

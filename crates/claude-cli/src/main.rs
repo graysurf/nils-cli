@@ -34,6 +34,8 @@ fn run() -> i32 {
 
     match cli.command {
         Some(cli::Command::Agent(args)) => handle_agent(&args),
+        Some(cli::Command::Auth(args)) => handle_auth(&args),
+        Some(cli::Command::Config(args)) => handle_config(&args),
         Some(cli::Command::PromptSegment(args)) => handle_prompt_segment(&args),
         Some(cli::Command::Usage(args)) => handle_usage(&args),
         Some(cli::Command::Completion(args)) => completion::run(args.shell),
@@ -50,6 +52,30 @@ fn run() -> i32 {
 
 fn handle_agent(args: &cli::AgentArgs) -> i32 {
     match &args.command {
+        Some(cli::AgentCommand::Prompt(options)) => claude_cli::agent::oneshot::run(
+            &oneshot_options(claude_cli::agent::oneshot::AgentTask::Prompt, options),
+        ),
+        Some(cli::AgentCommand::Advice(options)) => claude_cli::agent::oneshot::run(
+            &oneshot_options(claude_cli::agent::oneshot::AgentTask::Advice, options),
+        ),
+        Some(cli::AgentCommand::Knowledge(options)) => claude_cli::agent::oneshot::run(
+            &oneshot_options(claude_cli::agent::oneshot::AgentTask::Knowledge, options),
+        ),
+        Some(cli::AgentCommand::Commit(options)) => {
+            claude_cli::agent::commit::run(&claude_cli::agent::commit::CommitOptions {
+                push: options.push,
+                auto_stage: options.auto_stage,
+                model: options.model.clone(),
+                effort: options
+                    .effort
+                    .map(cli::AgentEffort::as_str)
+                    .map(str::to_string),
+                extra: options.extra.clone(),
+            })
+        }
+        Some(cli::AgentCommand::Doctor { output }) => {
+            claude_cli::agent::doctor::run(output.is_json())
+        }
         Some(cli::AgentCommand::Resume { session_id, cd }) => {
             claude_cli::agent::resume::run(&claude_cli::agent::resume::ResumeOptions {
                 session_id: session_id.clone(),
@@ -67,6 +93,64 @@ fn handle_agent(args: &cli::AgentArgs) -> i32 {
             exit::RUNTIME
         }
     }
+}
+
+fn oneshot_options(
+    task: claude_cli::agent::oneshot::AgentTask,
+    options: &cli::AgentOneShotArgs,
+) -> claude_cli::agent::oneshot::OneShotOptions {
+    claude_cli::agent::oneshot::OneShotOptions {
+        task,
+        runtime: options.runtime.map(|runtime| match runtime {
+            cli::AgentRuntimeMode::Safe => claude_cli::agent::oneshot::RuntimeMode::Safe,
+            cli::AgentRuntimeMode::Inherited => claude_cli::agent::oneshot::RuntimeMode::Inherited,
+        }),
+        model: options.model.clone(),
+        effort: options
+            .effort
+            .map(cli::AgentEffort::as_str)
+            .map(str::to_string),
+        ephemeral: options.ephemeral,
+        input: options.input.clone(),
+    }
+}
+
+fn handle_auth(args: &cli::AuthArgs) -> i32 {
+    match &args.command {
+        Some(cli::AuthCommand::Login {
+            console,
+            claudeai,
+            email,
+            sso,
+        }) => claude_cli::auth::login(&claude_cli::auth::LoginOptions {
+            console: *console,
+            claudeai: *claudeai,
+            email: email.clone(),
+            sso: *sso,
+        }),
+        Some(cli::AuthCommand::Status { output }) => claude_cli::auth::status(output.is_json()),
+        Some(cli::AuthCommand::Logout) => claude_cli::auth::logout(),
+        None => print_subcommand_help("auth"),
+    }
+}
+
+fn handle_config(args: &cli::ConfigArgs) -> i32 {
+    match &args.command {
+        Some(cli::ConfigCommand::Show) => claude_cli::config::show(),
+        Some(cli::ConfigCommand::Set { key, value }) => claude_cli::config::set(key, value),
+        None => print_subcommand_help("config"),
+    }
+}
+
+fn print_subcommand_help(name: &str) -> i32 {
+    let mut cmd = cli::Cli::command();
+    if let Some(subcommand) = cmd.find_subcommand_mut(name)
+        && subcommand.print_help().is_ok()
+    {
+        println!();
+        return exit::SUCCESS;
+    }
+    exit::RUNTIME
 }
 
 fn handle_usage(args: &cli::UsageArgs) -> i32 {
@@ -93,8 +177,10 @@ fn handle_prompt_segment(args: &cli::PromptSegmentArgs) -> i32 {
         }
         None => {
             claude_cli::prompt_segment::run(&claude_cli::prompt_segment::PromptSegmentOptions {
+                no_5h: args.no_5h,
                 ttl: args.ttl.clone(),
                 time_format: args.time_format.clone(),
+                show_timezone: args.show_timezone,
                 refresh: args.refresh,
             })
         }

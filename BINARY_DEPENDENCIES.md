@@ -15,12 +15,14 @@ These tools are required for common command paths. Each row is anchored to at le
 `Command::new(...)` (or equivalent `shared_process` / `ProcessRequest`) call site in `crates/*/src`.
 
 | Tool | Used By | Requirement Level | Install (brew/linuxbrew) |
-|---|---|---|---|
-| `git` | `git-scope`, `git-cli`, `git-summary`, `git-lock`, `repo-retro`, `semantic-commit` (via `git-scope`), `agent-session` checkout-origin discovery, `codex-cli`, `gemini-cli`, `opencode-cli`, `fzf-cli git-*`, `zsh-kit setup`, `zsh-kit plugin *`, `heuristic-inbox deliver` | Required | `brew install git` |
+| --- | --- | --- | --- |
+| `git` | `git-scope`, `git-cli`, `git-summary`, `git-lock`, `repo-retro`, `semantic-commit` (via `git-scope`), `agent-session` checkout-origin discovery, `codex-cli`, `claude-cli agent commit`, `gemini-cli`, `opencode-cli`, `fzf-cli git-*`, `zsh-kit setup`, `zsh-kit plugin *`, `heuristic-inbox deliver` | Required | `brew install git` |
 | `fzf` | `fzf-cli` interactive commands | Required (for `fzf-cli`) | `brew install fzf` |
 | `grpcurl` | `api-grpc` unary backend (via `api-testing-core::grpc::runner`); overridable with `GRPCURL_BIN` | Required (for `api-grpc call` / suite gRPC cases) | `brew install grpcurl` |
 | `ffmpeg` | `screen-record` on Linux (X11 + Wayland portal capture, audio mux) | Required on Linux | `brew install ffmpeg` |
 | `codex` | `codex-cli auth login` and `codex-cli agent *` flows | Required for `codex-cli` runtime | Install from official Codex distribution |
+| `claude` | `claude-cli agent *`, `auth *`, `agent resume`, and the native usage fallback | Required for those `claude-cli` flows | Install from official Claude Code distribution |
+| `semantic-commit` | `claude-cli agent commit` and `codex-cli agent commit` safe commit paths | Required for those agent commit flows | Install the matching nils-cli `semantic-commit` binary |
 | `ssh` | `codex-cli auth remote pull`; `macos-agent --host` fixed-command JSON transport | Required for those remote flows | Usually preinstalled (`brew install openssh`) |
 | `gemini` | `gemini-cli auth login` flow | Required for `gemini-cli` login | Install from official Gemini CLI distribution |
 | `opencode` | `opencode-cli agent *` flows | Required for `opencode-cli` runtime | Install from official OpenCode distribution |
@@ -57,7 +59,7 @@ Each row is anchored to at least one `Command::new(...)` / `find_in_path` / `cmd
 in `crates/*/src`.
 
 | Tool | Behavior Impact | Install (brew/linuxbrew) |
-|---|---|---|
+| --- | --- | --- |
 | `file` | MIME-based binary detection in `git-scope` and `git-cli commit context` | Usually preinstalled |
 | `lsof` | Preferred backend for `fzf-cli port` (fallback: `netstat`); required for `fzf-cli kill-port` | `brew install lsof` |
 | `netstat` | Fallback backend for `fzf-cli port` when `lsof` is missing | Usually preinstalled |
@@ -77,7 +79,7 @@ in `crates/*/src`.
 ## 3. Development and Validation Toolchain
 
 | Tool | Purpose | Recommended Install |
-|---|---|---|
+| --- | --- | --- |
 | Rust toolchain (`cargo`, `rustc`, `rustfmt`, `clippy`) | Build/lint/test pipeline | `brew install rustup-init && rustup-init -y && rustup component add rustfmt clippy` |
 | `cargo-nextest` | CI-style test execution | `cargo install cargo-nextest --locked` |
 | `cargo-llvm-cov` | Coverage workflows | `cargo install cargo-llvm-cov --locked` |
@@ -113,10 +115,12 @@ These are repository scripts (not third-party packages):
 `plan-issue` exposes one runtime opt-out env var consumed at command time.
 
 | Env var | Effect | Intended consumer |
-|---|---|---|
+| --- | --- | --- |
 | `PLAN_ISSUE_SKIP_INIT_SNAPSHOT` | When set non-empty, `start-plan` and `start-sprint` skip both the existence check on `<AGENT_HOME>/prompts/plan-issue-delivery-{main,subagent}-init.md` and the matching `.snapshot.md` copy into the per-issue / per-sprint workspace. The result payload sets `init_snapshot_skipped: true` for auditability; every other artifact (plan snapshot, dispatch records, prompt manifest, etc.) is unaffected. | Runtime adapters (such as the Claude Code `plan-issue` plugin) that ship their own role/protocol prompts inline with their adapter agents and do not need the canonical init-prompt snapshots in sprint workspaces. |
 
-The codex and opencode adapters must not set this var; they continue to rely on the canonical init prompts. The env var defaults to unset, so the binary's behaviour is unchanged for every other caller.
+The codex and opencode adapters must not set this var; they continue to rely
+on the canonical init prompts. The env var defaults to unset, so the binary's
+behaviour is unchanged for every other caller.
 
 ## 5. `agent-docs` integration for `project-dev`
 

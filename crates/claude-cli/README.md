@@ -2,134 +2,251 @@
 
 ## Overview
 
-`claude-cli` is a provider-specific Rust CLI for Claude-oriented helpers that should not live in shell glue. The surface owns
-Claude Code prompt-segment rendering, usage source selection, Keychain credential lookup, cache fallback, and completion export.
+`claude-cli` is a provider-specific Rust CLI for Claude-oriented helpers that
+should not live in shell glue. It owns safe one-shot Claude Code execution,
+upstream-owned authentication delegation, wrapper configuration,
+prompt-segment rendering, usage source selection, cache fallback, session
+resume, and completion export.
 
 ## Usage
 
 ```text
-Usage:
-  claude-cli agent resume <SESSION_ID> [--cd <dir>]
-  claude-cli prompt-segment [options]
-  claude-cli prompt-segment check
-  claude-cli prompt-segment status [--format text|json]
-  claude-cli usage [--format text|json] [--source auto|oauth|cli|cache]
-  claude-cli completion <bash|zsh>
-
-Help:
-  claude-cli help
-  claude-cli agent --help
-  claude-cli prompt-segment --help
+claude-cli agent prompt [--runtime safe|inherited] [--model <model>] [--effort <level>] [input...]
+claude-cli agent advice [--runtime safe|inherited] [--model <model>] [--effort <level>] [input...]
+claude-cli agent knowledge [--runtime safe|inherited] [--model <model>] [--effort <level>] [input...]
+claude-cli agent commit [--auto-stage] [--push] [--model <model>] [--effort <level>] [extra...]
+claude-cli agent doctor [--format text|json]
+claude-cli agent resume <SESSION_ID> [--cd <dir>]
+claude-cli auth login [--claudeai|--console] [--email <email>] [--sso]
+claude-cli auth status [--format text|json]
+claude-cli auth logout
+claude-cli config show
+claude-cli config set <key> <value>
+claude-cli prompt-segment [options]
+claude-cli prompt-segment check
+claude-cli prompt-segment status [--format text|json]
+claude-cli usage [--format text|json] [--source auto|oauth|cli|cache]
+claude-cli completion <bash|zsh>
 ```
 
 ## Scope boundary
 
 | Job | Primary owner |
 | --- | --- |
-| Claude prompt-segment auth, usage source selection, cache refresh, usage rendering, completion export | `claude-cli` |
-| Shell aliases, Starship module wiring, PATH/fpath registration, wrapper dispatch | zsh-kit shell glue |
+| Safe one-shot runtime, auth delegation, wrapper config, prompt/usage cache, rendering, completion | `claude-cli` |
+| Credential persistence, OAuth refresh, browser login, managed policy | upstream Claude Code |
+| Shell aliases, Starship wiring, PATH/fpath registration | shell integration |
 
-`claude-cli` owns provider-specific Claude behavior. zsh-kit should keep only the small compatibility wrapper and shell integration.
+The wrapper does not read, copy, export, refresh, or directly delete Claude
+Code credentials.
 
-## Commands
+## Agent commands
 
-### agent
+- `agent prompt [input...]`: Run a raw one-shot prompt. If input arguments are
+  omitted, read the prompt from stdin.
+- `agent advice [input...]`: Run the versioned
+  `nils-claude-cli.agent-advice.v1` engineering-advice template.
+- `agent knowledge [input...]`: Run the versioned
+  `nils-claude-cli.agent-knowledge.v1` explanation template.
+- `agent commit [extra...]`: Generate a bounded structured commit message from
+  staged context and invoke `semantic-commit` as the only commit writer.
+- `agent doctor [--format text|json]`: Check Claude capabilities, the upstream
+  installation doctor, and the `git` / `semantic-commit` dependencies without
+  making a model call.
+- `agent resume <SESSION_ID> [--cd <dir>]`: Resolve the recorded working
+  directory from local Claude project history and launch
+  `claude --resume <SESSION_ID>` there. `--cd` overrides resolution.
 
-- `agent resume <SESSION_ID> [--cd <dir>]`: Resolve the session's recorded working directory from local Claude Code project history and
-  launch `claude --resume <SESSION_ID>` in that directory, propagating Claude's exit status. Claude Code has no `--cd` flag and stores
-  sessions per project, so the recorded directory is applied as the child process working directory. Run it from any directory. Fails
-  without launching Claude (`65`) when the id is unknown or matches more than one recorded directory; pass `--cd` to override the resolved
-  directory for a repository that moved.
+One-shot commands default to `--runtime safe`. Before launch, the wrapper
+probes `claude --help` and fails with exit `69` when a required flag is absent.
+The safe profile uses:
 
-### prompt-segment
+- `--safe-mode` and `--strict-mcp-config`;
+- `--no-session-persistence`;
+- `--permission-mode dontAsk`, disabled slash commands, and disabled Chrome;
+- a `Read,Glob,Grep` allowlist for `prompt` and `advice`;
+- an empty tool allowlist for `knowledge`.
 
-- `prompt-segment [--ttl <duration>] [--time-format <strftime>] [--refresh] [--is-enabled]`: Render Claude 5h / weekly usage.
-- `prompt-segment check`: Exit `0` when a Claude OAuth access token is available, otherwise `1`.
-- `prompt-segment status [--format text|json]`: Report readiness and cache state without exposing token material.
+Prompt input is limited to 1 MiB and delivered to Claude over stdin so it does
+not appear in child-process argv. Templates, models, and flags remain discrete
+argv entries without shell interpolation. `--runtime inherited` is an explicit
+escape hatch that permits upstream customizations while keeping the
+command-specific tool allowlist. Session persistence remains disabled by
+default and can only be enabled for inherited mode with
+`CLAUDE_CLI_NO_SESSION_PERSISTENCE=false`.
 
-The output mirrors the former zsh-kit `claude-prompt-segment` helper:
+Claude `--safe-mode` still permits administrator-managed policy, upstream
+authentication, model selection, and built-in permissions. It is a
+Claude-specific safe boundary, not a claim of Codex-equivalent isolation.
+
+### Agent commit safety contract
+
+`agent commit` has no inherited-runtime fallback. It always:
+
+- reads at most 2 MiB from `semantic-commit staged-context --format bundle`;
+- rejects secret-like staged content with stable `nils-scrub` pattern ids
+  before Claude is launched;
+- sends that bundle and at most 64 KiB of optional guidance over stdin;
+- runs Claude in a temporary working directory with safe mode, strict MCP,
+  no session persistence, disabled slash commands/Chrome, and an empty tool
+  list;
+- validates Claude output against JSON Schema and local Conventional Commit
+  constraints;
+- rechecks both `HEAD` and the staged tree after model generation;
+- invokes `semantic-commit commit --expect-head ... --automation` only when
+  those checks still match;
+- verifies the created commit has the captured parent and tree before reporting
+  success or allowing a push.
+
+`--auto-stage` explicitly runs `git add -A` before the snapshot. `--push`
+requires an attached branch with a configured upstream, captures its effective
+push endpoint before the model call, and revalidates that endpoint before
+pushing only the verified commit through an explicit non-force refspec. The
+push command uses the captured endpoint rather than resolving the mutable
+remote alias again and pins exact-match command-scope URL rewrites so inherited
+`insteadOf` / `pushInsteadOf` chains cannot retarget it. A model, schema, drift,
+or commit failure leaves the index staged when no writer-side mutation is
+observed. If `semantic-commit` times out or fails after changing repository
+state, the wrapper preserves that state, skips push, and requires inspection
+instead of claiming the index is still staged. A post-commit integrity or push
+failure preserves and reports the local commit but never pushes an unverified
+object.
+
+`agent doctor` bounds and discards upstream stdout/stderr, verifies the exact
+`semantic-commit staged-context` and `commit` help surfaces, and never copies
+settings paths or other private diagnostic text into its JSON contract. A
+successful diagnosis emits `claude-cli.agent.doctor.v1`; `ok: true` means the
+checks completed, while `result.ready` and exit `0`/`1` carry readiness.
+`commit_profile` covers the fixed safe commit profile;
+`configured_commit_profile` also requires `--model` or `--effort` when those
+wrapper overrides are configured.
+
+## Authentication commands
+
+- `auth login`: Delegate to `claude auth login`, including `--claudeai`,
+  `--console`, `--email`, and `--sso`.
+- `auth status [--format text|json]`: Call `claude auth status --json`, retain
+  only public status classifications, and preserve upstream exit `0`/`1`
+  authenticated meaning.
+- `auth logout`: Delegate to `claude auth logout`.
+
+Auth status drops email, organization identity, token, credential path, and
+unknown upstream fields.
+
+## Configuration commands
+
+- `config show`: Print the effective wrapper model, effort, runtime, and
+  no-session-persistence values. Invalid configured values fail with exit `64`
+  instead of being silently replaced by defaults.
+- `config set <key> <value>`: Validate a supported key and emit one safely
+  quoted POSIX-shell `export`.
+
+Supported keys are `model`, `effort`, `agent-runtime`, and
+`no-session-persistence`. These commands never modify Claude settings or
+credential files.
+
+## Prompt segment
+
+- `prompt-segment [--no-5h] [--ttl <duration>] [--time-format <strftime>]
+  [--show-timezone] [--refresh]`: Render Claude usage.
+- `prompt-segment check`: Exit `0` when a Claude OAuth token is available,
+  otherwise `1`.
+- `prompt-segment status [--format text|json]`: Report cache readiness without
+  exposing token material.
+
+Output:
 
 ```text
 5h:<remaining>% W:<remaining>% <weekly_reset_time>[<stale_suffix>]
 ```
 
-The cache remains compatible with the former shell script:
+Without `--refresh`, stale or missing cache starts a coalesced detached refresh
+after any eligible cached line is printed. The prompt path does not wait for
+the network request. `--refresh` is the explicit blocking operation.
+`--no-5h` hides the five-hour window. `--show-timezone` adds the local UTC
+offset to the default time format; explicit `--time-format` takes precedence.
 
-```text
-~/Library/Caches/claude-prompt-segment/usage.json
-```
+Cached values are display-eligible while cache mtime is less than 600 seconds
+old. A timestamp up to five seconds in the future is tolerated. Expired files
+are retained but contribute no prompt or usage windows.
 
-Cached quota values are display-eligible only while the cache mtime is less
-than 600 seconds old. A cache mtime up to 5 seconds in the future is tolerated
-for clock skew; a timestamp further ahead fails closed. Expired cache files are
-retained for refresh/retry diagnostics but contribute no percentages or usage
-windows to prompt or `usage` output.
-
-### usage
+## Usage command
 
 - `usage [--format text|json] [--source auto|oauth|cli|cache]`: Read Claude
   usage through a service-consumable contract.
-- `--source auto`: Try OAuth usage refresh, then a bounded Claude CLI `/usage`
-  probe, then last-good cache.
-- `--source oauth`, `--source cli`, and `--source cache`: Run one source only for
-  focused debugging.
+- `auto`: Try OAuth, then a bounded native Claude `/usage` probe, then cache.
+- `oauth`, `cli`, and `cache`: Select one source for focused diagnostics.
 
-JSON output uses `schema_version: "claude-cli.usage.v1"` and never includes
-tokens or credential material. The result includes `provider: "claude"` and a
-`windows` array containing 5h and weekly windows when available, each with
-used/remaining percentages and optional reset timestamps. CLI-derived usage is
-normalized back into the same cache shape used by `prompt-segment`.
-When live usage is unavailable, the result may include additive `reason_code`
-with one of the shared provider-neutral values: `auth_required`, `auth_expired`,
-`billing_past_due`, `subscription_inactive`, `organization_disabled`,
-`permission_denied`, `rate_limited`, `service_unavailable`, `timeout`, or
-`unknown`. Provider response bodies and terminal error text are classified
-locally and are never copied into the JSON envelope.
+JSON uses `claude-cli.usage.v1`. It includes provider, source, stale state,
+normalized windows, and an optional provider-neutral `reason_code`. Provider
+responses, terminal errors, and credentials are classified locally and never
+forwarded.
 
-### completion
+## Completion
 
-- `completion <bash|zsh>`: Export shell completion script to stdout.
+`completion <bash|zsh>` exports clap-generated shell completion to stdout.
 
 ## Environment
 
-- `CLAUDE_PROMPT_TTL` or `CLAUDE_PROMPT_SEGMENT_TTL` overrides the cache TTL. The default is `60` seconds. `0` forces refresh.
-- `CLAUDE_PROMPT_STALE_SUFFIX` or `CLAUDE_PROMPT_SEGMENT_STALE_SUFFIX` controls stale cache suffix text. The default is one leading
-  space followed by `(stale)`.
-- `CLAUDE_PROMPT_SEGMENT_CACHE_DIR` overrides the cache directory.
-- `CLAUDE_PROMPT_SEGMENT_ENDPOINT` overrides the usage endpoint. The default is `https://api.anthropic.com/api/oauth/usage`.
-- `CLAUDE_PROMPT_SEGMENT_ACCESS_TOKEN` or `CLAUDE_PROMPT_SEGMENT_CREDENTIALS_JSON` can supply credentials for automation.
-- `CLAUDE_PROMPT_SEGMENT_CLAUDE_BIN` overrides the Claude CLI binary used by the
-  `usage --source cli` fallback. The default is `claude`.
-- `CLAUDE_PROMPT_SEGMENT_CLAUDE_TIMEOUT_SECONDS` overrides the bounded CLI usage
-  probe timeout. The default is `15` seconds.
-- `CLAUDE_PROMPT_SEGMENT_CLAUDE_PTY_DISABLED=1` disables the Unix PTY wrapper and
-  pipes slash commands directly to the Claude binary.
-- `CLAUDE_PROMPT_SEGMENT_CLAUDE_PTY_STARTUP_DELAY_MS` and
-  `CLAUDE_PROMPT_SEGMENT_CLAUDE_PTY_USAGE_DELAY_MS` tune the startup and
-  post-`/usage` waits for interactive Claude Code. Defaults are `4000` and
-  `3000` milliseconds.
-- `CLAUDE_PROMPT_SEGMENT_KEYCHAIN_DISABLED=1` disables macOS Keychain lookup.
-- `CLAUDE_PROMPT_SEGMENT_KEYCHAIN_SERVICE` overrides the macOS Keychain service name. The default is `Claude Code-credentials`.
-- `NO_COLOR=1` disables ANSI color.
+- `CLAUDE_CLI_BIN`: Claude executable for agent/auth; default `claude`.
+- `CLAUDE_CLI_MODEL`, `CLAUDE_CLI_EFFORT`: one-shot defaults.
+- `CLAUDE_CLI_AGENT_RUNTIME`: `safe` (default) or `inherited`.
+- `CLAUDE_CLI_NO_SESSION_PERSISTENCE`: default `true`; safe mode always
+  disables persistence.
+- One-shot capability probes and auth-status delegation bound captured output
+  while the child is running. They terminate the child process group after
+  five and three seconds, respectively.
+- Commit generation caps captured Claude output at 1 MiB with a five-minute
+  deadline. `agent doctor` caps upstream diagnostic output at 256 KiB with a
+  15-second deadline.
+- Auto-stage has a 60-second deadline. Commit creation and push each have a
+  120-second deadline. All bounded subprocess caps are aggregate across stdout
+  and stderr, and deadline/limit failure terminates the child process group.
+- `CLAUDE_PROMPT_TTL`, `CLAUDE_PROMPT_SEGMENT_TTL`: cache TTL; default `60`
+  seconds. `0` forces blocking refresh.
+- `CLAUDE_PROMPT_STALE_SUFFIX`,
+  `CLAUDE_PROMPT_SEGMENT_STALE_SUFFIX`: stale suffix.
+- `CLAUDE_PROMPT_SEGMENT_CACHE_DIR`: cache-directory override.
+- `CLAUDE_PROMPT_SEGMENT_ENDPOINT`: usage-endpoint override.
+- `CLAUDE_PROMPT_SEGMENT_REFRESH_MIN_SECONDS`: detached refresh cooldown;
+  default `60`.
+- `CLAUDE_PROMPT_SEGMENT_EXE`: detached self-refresh executable override.
+- `CLAUDE_PROMPT_SEGMENT_ZSH_ESCAPE_ENABLED=1`: double percent characters.
+- `CLAUDE_PROMPT_SEGMENT_ACCESS_TOKEN`,
+  `CLAUDE_PROMPT_SEGMENT_CREDENTIALS_JSON`: automation credentials.
+- `CLAUDE_PROMPT_SEGMENT_CLAUDE_BIN`: native CLI usage-probe executable.
+- `CLAUDE_PROMPT_SEGMENT_CLAUDE_TIMEOUT_SECONDS`: bounded CLI usage timeout;
+  default `15`.
+- `CLAUDE_PROMPT_SEGMENT_CLAUDE_PTY_DISABLED=1`: disable Unix PTY probing.
+- `CLAUDE_PROMPT_SEGMENT_CLAUDE_PTY_STARTUP_DELAY_MS`,
+  `CLAUDE_PROMPT_SEGMENT_CLAUDE_PTY_USAGE_DELAY_MS`: PTY timing controls.
+- `CLAUDE_PROMPT_SEGMENT_KEYCHAIN_DISABLED=1`: disable macOS Keychain lookup.
+- `CLAUDE_PROMPT_SEGMENT_KEYCHAIN_SERVICE`: Keychain service override.
+- `NO_COLOR=1`: disable ANSI color.
 
 ## Dependencies
 
-- macOS `security` is used for Keychain credential lookup unless an automation credential override is supplied.
-- Nested CLI probe descendants are enumerated and terminated on timeout using
-  Linux `/proc` or a time-bounded `/bin/ps` snapshot on other Unix platforms.
-  Unix `script` enables the richer PTY probe path.
-- No `curl`, `jq`, or Python runtime is required for prompt-segment rendering.
-- `claude` is required for `agent resume`.
-- `agent resume` reads local Claude Code project history under `$CLAUDE_CONFIG_DIR/projects` (default `~/.claude/projects`); the shared
-  resolver lives in `nils-provider-resume`.
+- `claude` is required for agent, auth, resume, and the optional CLI usage
+  fallback.
+- `git` and `semantic-commit` are required for `agent commit`; doctor reports
+  both dependencies without modifying a repository.
+- macOS `security` is used for prompt-segment Keychain lookup unless an
+  automation credential override is supplied.
+- Unix `script` enables the richer native CLI usage-probe path.
+- Resume reads `$CLAUDE_CONFIG_DIR/projects` (default `~/.claude/projects`)
+  through `nils-provider-resume`.
 
 ## Exit codes
 
-- `0`: success, help output, or no prompt output needed.
-- `1`: operational false/failed state such as `prompt-segment check` without credentials.
-- `64`: usage or argument errors.
-- `65`: `agent resume` could not resolve the session id (unknown or ambiguous).
+- `0`: success, help, or no prompt output needed.
+- `1`: operational false/failed state, including unauthenticated status.
+- `64`: usage or argument error.
+- `65`: invalid input data, invalid structured commit output, or unresolved
+  resume session.
+- `69`: required executable or Claude capability unavailable.
 
 ## Docs
 
 - [Docs index](docs/README.md)
+- [JSON contracts](docs/specs/claude-cli-json-contract-v1.md)
+- [Usage consumer runbook](docs/runbooks/usage-consumer.md)

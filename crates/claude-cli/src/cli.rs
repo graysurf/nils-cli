@@ -4,6 +4,12 @@ use clap::{Args, Parser, Subcommand, ValueEnum, ValueHint};
 
 const ROOT_AFTER_HELP: &str = "\
 EXAMPLES:
+  claude-cli agent prompt 'Summarize this repository'
+  claude-cli agent advice 'How should I split this change?'
+  claude-cli agent commit 'Prefer the smallest accurate scope'
+  claude-cli agent doctor --format json
+  claude-cli auth status --format json
+  claude-cli config show
   claude-cli prompt-segment
   claude-cli prompt-segment --refresh
   claude-cli prompt-segment status --format json
@@ -12,9 +18,13 @@ EXAMPLES:
   claude-cli completion zsh
 
 ENVIRONMENT:
+  CLAUDE_CLI_BIN, CLAUDE_CLI_MODEL, CLAUDE_CLI_EFFORT
+  CLAUDE_CLI_AGENT_RUNTIME, CLAUDE_CLI_NO_SESSION_PERSISTENCE
   CLAUDE_PROMPT_TTL, CLAUDE_PROMPT_STALE_SUFFIX
   CLAUDE_PROMPT_SEGMENT_TTL, CLAUDE_PROMPT_SEGMENT_STALE_SUFFIX
   CLAUDE_PROMPT_SEGMENT_CACHE_DIR, CLAUDE_PROMPT_SEGMENT_ENDPOINT
+  CLAUDE_PROMPT_SEGMENT_REFRESH_MIN_SECONDS, CLAUDE_PROMPT_SEGMENT_LOCK_STALE_SECONDS
+  CLAUDE_PROMPT_SEGMENT_EXE, CLAUDE_PROMPT_SEGMENT_ZSH_ESCAPE_ENABLED
   CLAUDE_PROMPT_SEGMENT_ACCESS_TOKEN, CLAUDE_PROMPT_SEGMENT_CREDENTIALS_JSON
   CLAUDE_PROMPT_SEGMENT_KEYCHAIN_DISABLED, CLAUDE_PROMPT_SEGMENT_KEYCHAIN_SERVICE
   NO_COLOR
@@ -23,7 +33,8 @@ EXIT CODES:
   0   success
   1   runtime false/failed state
   64  command-line usage error
-  65  could not resolve session id (unknown or ambiguous)";
+  65  invalid input data or unresolved session id
+  69  required Claude capability unavailable";
 
 #[derive(Parser)]
 #[command(
@@ -43,6 +54,10 @@ pub struct Cli {
 pub enum Command {
     /// Agent command group
     Agent(AgentArgs),
+    /// Authentication command group
+    Auth(AuthArgs),
+    /// Configuration command group
+    Config(ConfigArgs),
     /// Prompt-segment command group
     PromptSegment(PromptSegmentArgs),
     /// Read Claude usage from OAuth, Claude CLI, or cache
@@ -59,6 +74,19 @@ pub struct AgentArgs {
 
 #[derive(Subcommand)]
 pub enum AgentCommand {
+    /// Run a one-shot prompt through the safe Claude runtime
+    Prompt(AgentOneShotArgs),
+    /// Get actionable engineering advice
+    Advice(AgentOneShotArgs),
+    /// Get an explanation for a concept
+    Knowledge(AgentOneShotArgs),
+    /// Generate and create a semantic commit from staged changes
+    Commit(AgentCommitArgs),
+    /// Check whether the safe agent and commit runtime is ready
+    Doctor {
+        #[command(flatten)]
+        output: OutputModeArgs,
+    },
     /// Resume a Claude session in its recorded working directory
     Resume {
         /// Claude session id to resume
@@ -68,6 +96,117 @@ pub enum AgentCommand {
         #[arg(long = "cd", value_name = "dir", value_hint = ValueHint::DirPath)]
         cd: Option<PathBuf>,
     },
+}
+
+#[derive(Args)]
+pub struct AgentCommitArgs {
+    /// Push after the local commit succeeds
+    #[arg(short = 'p', long = "push")]
+    pub push: bool,
+    /// Stage all tracked and untracked changes before generating the message
+    #[arg(short = 'a', long = "auto-stage")]
+    pub auto_stage: bool,
+    /// Claude model override
+    #[arg(long = "model", value_name = "model")]
+    pub model: Option<String>,
+    /// Claude effort override
+    #[arg(long = "effort", value_enum, value_name = "level")]
+    pub effort: Option<AgentEffort>,
+    /// Additional commit-message guidance
+    #[arg(value_name = "extra", num_args = 0.., allow_hyphen_values = true)]
+    pub extra: Vec<String>,
+}
+
+#[derive(Args)]
+pub struct AgentOneShotArgs {
+    /// Runtime profile (default: safe)
+    #[arg(long = "runtime", value_enum, value_name = "mode")]
+    pub runtime: Option<AgentRuntimeMode>,
+    /// Claude model override
+    #[arg(long = "model", value_name = "model")]
+    pub model: Option<String>,
+    /// Claude effort override
+    #[arg(long = "effort", value_enum, value_name = "level")]
+    pub effort: Option<AgentEffort>,
+    /// Disable session persistence (always enabled by the safe runtime)
+    #[arg(long = "ephemeral")]
+    pub ephemeral: bool,
+    /// Prompt text; reads stdin when omitted
+    #[arg(value_name = "input", num_args = 0.., allow_hyphen_values = true)]
+    pub input: Vec<String>,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
+pub enum AgentRuntimeMode {
+    Safe,
+    Inherited,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
+pub enum AgentEffort {
+    Low,
+    Medium,
+    High,
+    Xhigh,
+    Max,
+}
+
+impl AgentEffort {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+            Self::Xhigh => "xhigh",
+            Self::Max => "max",
+        }
+    }
+}
+
+#[derive(Args)]
+pub struct AuthArgs {
+    #[command(subcommand)]
+    pub command: Option<AuthCommand>,
+}
+
+#[derive(Subcommand)]
+pub enum AuthCommand {
+    /// Sign in through the upstream Claude Code authentication flow
+    Login {
+        /// Use Anthropic Console API billing
+        #[arg(long, conflicts_with = "claudeai")]
+        console: bool,
+        /// Use a Claude subscription
+        #[arg(long, conflicts_with = "console")]
+        claudeai: bool,
+        /// Pre-populate the login email address
+        #[arg(long, value_name = "email")]
+        email: Option<String>,
+        /// Force the SSO login flow
+        #[arg(long)]
+        sso: bool,
+    },
+    /// Show redacted authentication status
+    Status {
+        #[command(flatten)]
+        output: OutputModeArgs,
+    },
+    /// Sign out through the upstream Claude Code authentication flow
+    Logout,
+}
+
+#[derive(Args)]
+pub struct ConfigArgs {
+    #[command(subcommand)]
+    pub command: Option<ConfigCommand>,
+}
+
+#[derive(Subcommand)]
+pub enum ConfigCommand {
+    /// Show effective wrapper configuration
+    Show,
+    /// Emit a validated export for the current shell
+    Set { key: String, value: String },
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
@@ -101,9 +240,15 @@ pub struct PromptSegmentArgs {
     /// Cache TTL
     #[arg(long = "ttl")]
     pub ttl: Option<String>,
+    /// Hide the 5h window output
+    #[arg(long = "no-5h")]
+    pub no_5h: bool,
     /// Reset time format (local time)
     #[arg(long = "time-format")]
     pub time_format: Option<String>,
+    /// Show timezone offset in the default reset time display
+    #[arg(long = "show-timezone")]
+    pub show_timezone: bool,
     /// Force a fetch attempt regardless of TTL
     #[arg(long = "refresh")]
     pub refresh: bool,

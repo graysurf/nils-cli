@@ -22,9 +22,19 @@ pub fn render_usage_json(
     stale: bool,
     stale_suffix: &str,
 ) -> Option<String> {
+    render_usage_json_with_options(raw, time_format, stale, stale_suffix, true)
+}
+
+pub fn render_usage_json_with_options(
+    raw: &str,
+    time_format: &str,
+    stale: bool,
+    stale_suffix: &str,
+    show_five_hour: bool,
+) -> Option<String> {
     let value: Value = serde_json::from_str(raw).ok()?;
     let usage = parse_usage_value(&value)?;
-    render_usage(&usage, time_format, stale, stale_suffix)
+    render_usage(&usage, time_format, stale, stale_suffix, show_five_hour)
 }
 
 pub fn parse_usage_value(value: &Value) -> Option<Usage> {
@@ -60,11 +70,12 @@ fn render_usage(
     time_format: &str,
     stale: bool,
     stale_suffix: &str,
+    show_five_hour: bool,
 ) -> Option<String> {
     let color_enabled = color_enabled();
     let mut parts = Vec::new();
 
-    if let Some(window) = &usage.five_hour {
+    if show_five_hour && let Some(window) = &usage.five_hour {
         parts.push(ansi::format_percent_token(
             &format!("5h:{}%", window.remaining_percent),
             Some(color_enabled),

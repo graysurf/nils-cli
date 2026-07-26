@@ -7,18 +7,22 @@ use std::path::PathBuf;
 mod auth;
 mod cache;
 mod client;
+mod refresh;
 mod render;
 pub mod usage;
 
 #[derive(Clone, Debug, Default)]
 pub struct PromptSegmentOptions {
+    pub no_5h: bool,
     pub ttl: Option<String>,
     pub time_format: Option<String>,
+    pub show_timezone: bool,
     pub refresh: bool,
 }
 
 const DEFAULT_TTL_SECONDS: u64 = 60;
 const DEFAULT_TIME_FORMAT: &str = "%m-%d %H:%M";
+const DEFAULT_TIME_FORMAT_WITH_TIMEZONE: &str = "%m-%d %H:%M %:z";
 const DEFAULT_STALE_SUFFIX: &str = " (stale)";
 const PROMPT_SEGMENT_SCHEMA_VERSION: &str = "claude-cli.prompt-segment.v1";
 
@@ -37,55 +41,49 @@ pub fn run(options: &PromptSegmentOptions) -> i32 {
 
     let force_refresh = options.refresh || ttl_seconds == 0;
     let mut cache_snapshot = cache::snapshot(&cache_file);
-    let display_expired = cache_snapshot.exists() && cache_snapshot.display_expired();
-    let _refresh_guard = if display_expired && !force_refresh {
-        cache::begin_expired_refresh(&cache_file)
-    } else {
-        None
-    };
-    let needs_refresh = force_refresh
-        || if display_expired {
-            _refresh_guard.is_some()
-        } else {
-            !cache_snapshot.exists() || cache_snapshot.stale(ttl_seconds)
-        };
-    let mut stale = false;
+    let needs_refresh = !cache_snapshot.exists()
+        || cache_snapshot.display_expired()
+        || cache_snapshot.stale(ttl_seconds);
 
-    if needs_refresh {
-        match auth::resolve_access_token()
-            .map(|token| client::fetch_usage(&token.value))
-            .transpose()
-        {
-            Ok(Some(body)) => {
-                if cache::write_cache_file(&cache_file, &body).is_err() {
-                    stale = true;
-                } else {
-                    cache_snapshot = cache::snapshot(&cache_file);
-                }
-            }
-            _ => {
-                stale = true;
-            }
+    let refresh_succeeded = if force_refresh {
+        let succeeded = refresh::refresh_blocking(&cache_file);
+        if succeeded {
+            cache_snapshot = cache::snapshot(&cache_file);
         }
-    }
+        succeeded
+    } else {
+        false
+    };
 
     if cache_snapshot.display_expired() {
+        if !force_refresh && needs_refresh {
+            refresh::enqueue_background_refresh(&cache_file);
+        }
         return exit::SUCCESS;
     }
 
     let Some(raw_cache) = cache::read_cache_file(&cache_file) else {
         return exit::SUCCESS;
     };
-
-    let time_format = options
-        .time_format
-        .as_deref()
-        .unwrap_or(DEFAULT_TIME_FORMAT);
+    let time_format = match options.time_format.as_deref() {
+        Some(value) => value,
+        None if options.show_timezone => DEFAULT_TIME_FORMAT_WITH_TIMEZONE,
+        None => DEFAULT_TIME_FORMAT,
+    };
     let stale_suffix = resolve_stale_suffix();
-    if let Some(line) = render::render_usage_json(&raw_cache, time_format, stale, &stale_suffix)
-        && !line.trim().is_empty()
+    let stale = (!force_refresh && needs_refresh) || (force_refresh && !refresh_succeeded);
+    if let Some(line) = render::render_usage_json_with_options(
+        &raw_cache,
+        time_format,
+        stale,
+        &stale_suffix,
+        !options.no_5h,
+    ) && !line.trim().is_empty()
     {
-        println!("{line}");
+        println!("{}", apply_prompt_escape(line));
+    }
+    if !force_refresh && needs_refresh {
+        refresh::enqueue_background_refresh(&cache_file);
     }
 
     exit::SUCCESS
@@ -151,6 +149,14 @@ fn resolve_stale_suffix() -> String {
         .ok()
         .or_else(|| std::env::var("CLAUDE_PROMPT_STALE_SUFFIX").ok())
         .unwrap_or_else(|| DEFAULT_STALE_SUFFIX.to_string())
+}
+
+fn apply_prompt_escape(line: String) -> String {
+    if shared_env::env_truthy("CLAUDE_PROMPT_SEGMENT_ZSH_ESCAPE_ENABLED") {
+        line.replace('%', "%%")
+    } else {
+        line
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]

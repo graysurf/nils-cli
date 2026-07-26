@@ -42,7 +42,61 @@ _arguments "${_arguments_options[@]}" : \
         (( CURRENT += 1 ))
         curcontext="${curcontext%:*:*}:claude-cli-agent-command-$line[1]:"
         case $line[1] in
-            (resume)
+            (prompt)
+_arguments "${_arguments_options[@]}" : \
+'--runtime=[Runtime profile (default\: safe)]:mode:(safe inherited)' \
+'--model=[Claude model override]:model:_default' \
+'--effort=[Claude effort override]:level:(low medium high xhigh max)' \
+'--ephemeral[Disable session persistence (always enabled by the safe runtime)]' \
+'-h[Print help]' \
+'--help[Print help]' \
+'*::input -- Prompt text; reads stdin when omitted:_default' \
+&& ret=0
+;;
+(advice)
+_arguments "${_arguments_options[@]}" : \
+'--runtime=[Runtime profile (default\: safe)]:mode:(safe inherited)' \
+'--model=[Claude model override]:model:_default' \
+'--effort=[Claude effort override]:level:(low medium high xhigh max)' \
+'--ephemeral[Disable session persistence (always enabled by the safe runtime)]' \
+'-h[Print help]' \
+'--help[Print help]' \
+'*::input -- Prompt text; reads stdin when omitted:_default' \
+&& ret=0
+;;
+(knowledge)
+_arguments "${_arguments_options[@]}" : \
+'--runtime=[Runtime profile (default\: safe)]:mode:(safe inherited)' \
+'--model=[Claude model override]:model:_default' \
+'--effort=[Claude effort override]:level:(low medium high xhigh max)' \
+'--ephemeral[Disable session persistence (always enabled by the safe runtime)]' \
+'-h[Print help]' \
+'--help[Print help]' \
+'*::input -- Prompt text; reads stdin when omitted:_default' \
+&& ret=0
+;;
+(commit)
+_arguments "${_arguments_options[@]}" : \
+'--model=[Claude model override]:model:_default' \
+'--effort=[Claude effort override]:level:(low medium high xhigh max)' \
+'-p[Push after the local commit succeeds]' \
+'--push[Push after the local commit succeeds]' \
+'-a[Stage all tracked and untracked changes before generating the message]' \
+'--auto-stage[Stage all tracked and untracked changes before generating the message]' \
+'-h[Print help]' \
+'--help[Print help]' \
+'*::extra -- Additional commit-message guidance:_default' \
+&& ret=0
+;;
+(doctor)
+_arguments "${_arguments_options[@]}" : \
+'--format=[Output format (\`text\` or \`json\`)]:format:(text json)' \
+'(--format)--json[Hidden alias for \`--format json\`]' \
+'-h[Print help]' \
+'--help[Print help]' \
+&& ret=0
+;;
+(resume)
 _arguments "${_arguments_options[@]}" : \
 '--cd=[Override the recorded working directory (for a moved repository)]:dir:_files -/' \
 '-h[Print help]' \
@@ -62,7 +116,161 @@ _arguments "${_arguments_options[@]}" : \
         (( CURRENT += 1 ))
         curcontext="${curcontext%:*:*}:claude-cli-agent-help-command-$line[1]:"
         case $line[1] in
-            (resume)
+            (prompt)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(advice)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(knowledge)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(commit)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(doctor)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(resume)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(help)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+        esac
+    ;;
+esac
+;;
+        esac
+    ;;
+esac
+;;
+(auth)
+_arguments "${_arguments_options[@]}" : \
+'-h[Print help]' \
+'--help[Print help]' \
+":: :_claude-cli__subcmd__auth_commands" \
+"*::: :->auth" \
+&& ret=0
+
+    case $state in
+    (auth)
+        words=($line[1] "${words[@]}")
+        (( CURRENT += 1 ))
+        curcontext="${curcontext%:*:*}:claude-cli-auth-command-$line[1]:"
+        case $line[1] in
+            (login)
+_arguments "${_arguments_options[@]}" : \
+'--email=[Pre-populate the login email address]:email:_default' \
+'(--claudeai)--console[Use Anthropic Console API billing]' \
+'(--console)--claudeai[Use a Claude subscription]' \
+'--sso[Force the SSO login flow]' \
+'-h[Print help]' \
+'--help[Print help]' \
+&& ret=0
+;;
+(status)
+_arguments "${_arguments_options[@]}" : \
+'--format=[Output format (\`text\` or \`json\`)]:format:(text json)' \
+'(--format)--json[Hidden alias for \`--format json\`]' \
+'-h[Print help]' \
+'--help[Print help]' \
+&& ret=0
+;;
+(logout)
+_arguments "${_arguments_options[@]}" : \
+'-h[Print help]' \
+'--help[Print help]' \
+&& ret=0
+;;
+(help)
+_arguments "${_arguments_options[@]}" : \
+":: :_claude-cli__subcmd__auth__subcmd__help_commands" \
+"*::: :->help" \
+&& ret=0
+
+    case $state in
+    (help)
+        words=($line[1] "${words[@]}")
+        (( CURRENT += 1 ))
+        curcontext="${curcontext%:*:*}:claude-cli-auth-help-command-$line[1]:"
+        case $line[1] in
+            (login)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(status)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(logout)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(help)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+        esac
+    ;;
+esac
+;;
+        esac
+    ;;
+esac
+;;
+(config)
+_arguments "${_arguments_options[@]}" : \
+'-h[Print help]' \
+'--help[Print help]' \
+":: :_claude-cli__subcmd__config_commands" \
+"*::: :->config" \
+&& ret=0
+
+    case $state in
+    (config)
+        words=($line[1] "${words[@]}")
+        (( CURRENT += 1 ))
+        curcontext="${curcontext%:*:*}:claude-cli-config-command-$line[1]:"
+        case $line[1] in
+            (show)
+_arguments "${_arguments_options[@]}" : \
+'-h[Print help]' \
+'--help[Print help]' \
+&& ret=0
+;;
+(set)
+_arguments "${_arguments_options[@]}" : \
+'-h[Print help]' \
+'--help[Print help]' \
+':key:_default' \
+':value:_default' \
+&& ret=0
+;;
+(help)
+_arguments "${_arguments_options[@]}" : \
+":: :_claude-cli__subcmd__config__subcmd__help_commands" \
+"*::: :->help" \
+&& ret=0
+
+    case $state in
+    (help)
+        words=($line[1] "${words[@]}")
+        (( CURRENT += 1 ))
+        curcontext="${curcontext%:*:*}:claude-cli-config-help-command-$line[1]:"
+        case $line[1] in
+            (show)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(set)
 _arguments "${_arguments_options[@]}" : \
 && ret=0
 ;;
@@ -82,6 +290,8 @@ esac
 _arguments "${_arguments_options[@]}" : \
 '--ttl=[Cache TTL]:TTL:_default' \
 '--time-format=[Reset time format (local time)]:TIME_FORMAT:_default' \
+'--no-5h[Hide the 5h window output]' \
+'--show-timezone[Show timezone offset in the default reset time display]' \
 '--refresh[Force a fetch attempt regardless of TTL]' \
 '--is-enabled[Exit 0 if Keychain or credential override has a Claude OAuth access token]' \
 '-h[Print help]' \
@@ -182,7 +392,79 @@ _arguments "${_arguments_options[@]}" : \
         (( CURRENT += 1 ))
         curcontext="${curcontext%:*:*}:claude-cli-help-agent-command-$line[1]:"
         case $line[1] in
-            (resume)
+            (prompt)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(advice)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(knowledge)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(commit)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(doctor)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(resume)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+        esac
+    ;;
+esac
+;;
+(auth)
+_arguments "${_arguments_options[@]}" : \
+":: :_claude-cli__subcmd__help__subcmd__auth_commands" \
+"*::: :->auth" \
+&& ret=0
+
+    case $state in
+    (auth)
+        words=($line[1] "${words[@]}")
+        (( CURRENT += 1 ))
+        curcontext="${curcontext%:*:*}:claude-cli-help-auth-command-$line[1]:"
+        case $line[1] in
+            (login)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(status)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(logout)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+        esac
+    ;;
+esac
+;;
+(config)
+_arguments "${_arguments_options[@]}" : \
+":: :_claude-cli__subcmd__help__subcmd__config_commands" \
+"*::: :->config" \
+&& ret=0
+
+    case $state in
+    (config)
+        words=($line[1] "${words[@]}")
+        (( CURRENT += 1 ))
+        curcontext="${curcontext%:*:*}:claude-cli-help-config-command-$line[1]:"
+        case $line[1] in
+            (show)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(set)
 _arguments "${_arguments_options[@]}" : \
 && ret=0
 ;;
@@ -239,6 +521,8 @@ esac
 _claude-cli_commands() {
     local commands; commands=(
 'agent:Agent command group' \
+'auth:Authentication command group' \
+'config:Configuration command group' \
 'prompt-segment:Prompt-segment command group' \
 'usage:Read Claude usage from OAuth, Claude CLI, or cache' \
 'completion:Export shell completion script' \
@@ -249,43 +533,203 @@ _claude-cli_commands() {
 (( $+functions[_claude-cli__subcmd__agent_commands] )) ||
 _claude-cli__subcmd__agent_commands() {
     local commands; commands=(
+'prompt:Run a one-shot prompt through the safe Claude runtime' \
+'advice:Get actionable engineering advice' \
+'knowledge:Get an explanation for a concept' \
+'commit:Generate and create a semantic commit from staged changes' \
+'doctor:Check whether the safe agent and commit runtime is ready' \
 'resume:Resume a Claude session in its recorded working directory' \
 'help:Print this message or the help of the given subcommand(s)' \
     )
     _describe -t commands 'claude-cli agent commands' commands "$@"
 }
+(( $+functions[_claude-cli__subcmd__agent__subcmd__advice_commands] )) ||
+_claude-cli__subcmd__agent__subcmd__advice_commands() {
+    local commands; commands=()
+    _describe -t commands 'claude-cli agent advice commands' commands "$@"
+}
+(( $+functions[_claude-cli__subcmd__agent__subcmd__commit_commands] )) ||
+_claude-cli__subcmd__agent__subcmd__commit_commands() {
+    local commands; commands=()
+    _describe -t commands 'claude-cli agent commit commands' commands "$@"
+}
+(( $+functions[_claude-cli__subcmd__agent__subcmd__doctor_commands] )) ||
+_claude-cli__subcmd__agent__subcmd__doctor_commands() {
+    local commands; commands=()
+    _describe -t commands 'claude-cli agent doctor commands' commands "$@"
+}
 (( $+functions[_claude-cli__subcmd__agent__subcmd__help_commands] )) ||
 _claude-cli__subcmd__agent__subcmd__help_commands() {
     local commands; commands=(
+'prompt:Run a one-shot prompt through the safe Claude runtime' \
+'advice:Get actionable engineering advice' \
+'knowledge:Get an explanation for a concept' \
+'commit:Generate and create a semantic commit from staged changes' \
+'doctor:Check whether the safe agent and commit runtime is ready' \
 'resume:Resume a Claude session in its recorded working directory' \
 'help:Print this message or the help of the given subcommand(s)' \
     )
     _describe -t commands 'claude-cli agent help commands' commands "$@"
+}
+(( $+functions[_claude-cli__subcmd__agent__subcmd__help__subcmd__advice_commands] )) ||
+_claude-cli__subcmd__agent__subcmd__help__subcmd__advice_commands() {
+    local commands; commands=()
+    _describe -t commands 'claude-cli agent help advice commands' commands "$@"
+}
+(( $+functions[_claude-cli__subcmd__agent__subcmd__help__subcmd__commit_commands] )) ||
+_claude-cli__subcmd__agent__subcmd__help__subcmd__commit_commands() {
+    local commands; commands=()
+    _describe -t commands 'claude-cli agent help commit commands' commands "$@"
+}
+(( $+functions[_claude-cli__subcmd__agent__subcmd__help__subcmd__doctor_commands] )) ||
+_claude-cli__subcmd__agent__subcmd__help__subcmd__doctor_commands() {
+    local commands; commands=()
+    _describe -t commands 'claude-cli agent help doctor commands' commands "$@"
 }
 (( $+functions[_claude-cli__subcmd__agent__subcmd__help__subcmd__help_commands] )) ||
 _claude-cli__subcmd__agent__subcmd__help__subcmd__help_commands() {
     local commands; commands=()
     _describe -t commands 'claude-cli agent help help commands' commands "$@"
 }
+(( $+functions[_claude-cli__subcmd__agent__subcmd__help__subcmd__knowledge_commands] )) ||
+_claude-cli__subcmd__agent__subcmd__help__subcmd__knowledge_commands() {
+    local commands; commands=()
+    _describe -t commands 'claude-cli agent help knowledge commands' commands "$@"
+}
+(( $+functions[_claude-cli__subcmd__agent__subcmd__help__subcmd__prompt_commands] )) ||
+_claude-cli__subcmd__agent__subcmd__help__subcmd__prompt_commands() {
+    local commands; commands=()
+    _describe -t commands 'claude-cli agent help prompt commands' commands "$@"
+}
 (( $+functions[_claude-cli__subcmd__agent__subcmd__help__subcmd__resume_commands] )) ||
 _claude-cli__subcmd__agent__subcmd__help__subcmd__resume_commands() {
     local commands; commands=()
     _describe -t commands 'claude-cli agent help resume commands' commands "$@"
+}
+(( $+functions[_claude-cli__subcmd__agent__subcmd__knowledge_commands] )) ||
+_claude-cli__subcmd__agent__subcmd__knowledge_commands() {
+    local commands; commands=()
+    _describe -t commands 'claude-cli agent knowledge commands' commands "$@"
+}
+(( $+functions[_claude-cli__subcmd__agent__subcmd__prompt_commands] )) ||
+_claude-cli__subcmd__agent__subcmd__prompt_commands() {
+    local commands; commands=()
+    _describe -t commands 'claude-cli agent prompt commands' commands "$@"
 }
 (( $+functions[_claude-cli__subcmd__agent__subcmd__resume_commands] )) ||
 _claude-cli__subcmd__agent__subcmd__resume_commands() {
     local commands; commands=()
     _describe -t commands 'claude-cli agent resume commands' commands "$@"
 }
+(( $+functions[_claude-cli__subcmd__auth_commands] )) ||
+_claude-cli__subcmd__auth_commands() {
+    local commands; commands=(
+'login:Sign in through the upstream Claude Code authentication flow' \
+'status:Show redacted authentication status' \
+'logout:Sign out through the upstream Claude Code authentication flow' \
+'help:Print this message or the help of the given subcommand(s)' \
+    )
+    _describe -t commands 'claude-cli auth commands' commands "$@"
+}
+(( $+functions[_claude-cli__subcmd__auth__subcmd__help_commands] )) ||
+_claude-cli__subcmd__auth__subcmd__help_commands() {
+    local commands; commands=(
+'login:Sign in through the upstream Claude Code authentication flow' \
+'status:Show redacted authentication status' \
+'logout:Sign out through the upstream Claude Code authentication flow' \
+'help:Print this message or the help of the given subcommand(s)' \
+    )
+    _describe -t commands 'claude-cli auth help commands' commands "$@"
+}
+(( $+functions[_claude-cli__subcmd__auth__subcmd__help__subcmd__help_commands] )) ||
+_claude-cli__subcmd__auth__subcmd__help__subcmd__help_commands() {
+    local commands; commands=()
+    _describe -t commands 'claude-cli auth help help commands' commands "$@"
+}
+(( $+functions[_claude-cli__subcmd__auth__subcmd__help__subcmd__login_commands] )) ||
+_claude-cli__subcmd__auth__subcmd__help__subcmd__login_commands() {
+    local commands; commands=()
+    _describe -t commands 'claude-cli auth help login commands' commands "$@"
+}
+(( $+functions[_claude-cli__subcmd__auth__subcmd__help__subcmd__logout_commands] )) ||
+_claude-cli__subcmd__auth__subcmd__help__subcmd__logout_commands() {
+    local commands; commands=()
+    _describe -t commands 'claude-cli auth help logout commands' commands "$@"
+}
+(( $+functions[_claude-cli__subcmd__auth__subcmd__help__subcmd__status_commands] )) ||
+_claude-cli__subcmd__auth__subcmd__help__subcmd__status_commands() {
+    local commands; commands=()
+    _describe -t commands 'claude-cli auth help status commands' commands "$@"
+}
+(( $+functions[_claude-cli__subcmd__auth__subcmd__login_commands] )) ||
+_claude-cli__subcmd__auth__subcmd__login_commands() {
+    local commands; commands=()
+    _describe -t commands 'claude-cli auth login commands' commands "$@"
+}
+(( $+functions[_claude-cli__subcmd__auth__subcmd__logout_commands] )) ||
+_claude-cli__subcmd__auth__subcmd__logout_commands() {
+    local commands; commands=()
+    _describe -t commands 'claude-cli auth logout commands' commands "$@"
+}
+(( $+functions[_claude-cli__subcmd__auth__subcmd__status_commands] )) ||
+_claude-cli__subcmd__auth__subcmd__status_commands() {
+    local commands; commands=()
+    _describe -t commands 'claude-cli auth status commands' commands "$@"
+}
 (( $+functions[_claude-cli__subcmd__completion_commands] )) ||
 _claude-cli__subcmd__completion_commands() {
     local commands; commands=()
     _describe -t commands 'claude-cli completion commands' commands "$@"
 }
+(( $+functions[_claude-cli__subcmd__config_commands] )) ||
+_claude-cli__subcmd__config_commands() {
+    local commands; commands=(
+'show:Show effective wrapper configuration' \
+'set:Emit a validated export for the current shell' \
+'help:Print this message or the help of the given subcommand(s)' \
+    )
+    _describe -t commands 'claude-cli config commands' commands "$@"
+}
+(( $+functions[_claude-cli__subcmd__config__subcmd__help_commands] )) ||
+_claude-cli__subcmd__config__subcmd__help_commands() {
+    local commands; commands=(
+'show:Show effective wrapper configuration' \
+'set:Emit a validated export for the current shell' \
+'help:Print this message or the help of the given subcommand(s)' \
+    )
+    _describe -t commands 'claude-cli config help commands' commands "$@"
+}
+(( $+functions[_claude-cli__subcmd__config__subcmd__help__subcmd__help_commands] )) ||
+_claude-cli__subcmd__config__subcmd__help__subcmd__help_commands() {
+    local commands; commands=()
+    _describe -t commands 'claude-cli config help help commands' commands "$@"
+}
+(( $+functions[_claude-cli__subcmd__config__subcmd__help__subcmd__set_commands] )) ||
+_claude-cli__subcmd__config__subcmd__help__subcmd__set_commands() {
+    local commands; commands=()
+    _describe -t commands 'claude-cli config help set commands' commands "$@"
+}
+(( $+functions[_claude-cli__subcmd__config__subcmd__help__subcmd__show_commands] )) ||
+_claude-cli__subcmd__config__subcmd__help__subcmd__show_commands() {
+    local commands; commands=()
+    _describe -t commands 'claude-cli config help show commands' commands "$@"
+}
+(( $+functions[_claude-cli__subcmd__config__subcmd__set_commands] )) ||
+_claude-cli__subcmd__config__subcmd__set_commands() {
+    local commands; commands=()
+    _describe -t commands 'claude-cli config set commands' commands "$@"
+}
+(( $+functions[_claude-cli__subcmd__config__subcmd__show_commands] )) ||
+_claude-cli__subcmd__config__subcmd__show_commands() {
+    local commands; commands=()
+    _describe -t commands 'claude-cli config show commands' commands "$@"
+}
 (( $+functions[_claude-cli__subcmd__help_commands] )) ||
 _claude-cli__subcmd__help_commands() {
     local commands; commands=(
 'agent:Agent command group' \
+'auth:Authentication command group' \
+'config:Configuration command group' \
 'prompt-segment:Prompt-segment command group' \
 'usage:Read Claude usage from OAuth, Claude CLI, or cache' \
 'completion:Export shell completion script' \
@@ -296,19 +740,91 @@ _claude-cli__subcmd__help_commands() {
 (( $+functions[_claude-cli__subcmd__help__subcmd__agent_commands] )) ||
 _claude-cli__subcmd__help__subcmd__agent_commands() {
     local commands; commands=(
+'prompt:Run a one-shot prompt through the safe Claude runtime' \
+'advice:Get actionable engineering advice' \
+'knowledge:Get an explanation for a concept' \
+'commit:Generate and create a semantic commit from staged changes' \
+'doctor:Check whether the safe agent and commit runtime is ready' \
 'resume:Resume a Claude session in its recorded working directory' \
     )
     _describe -t commands 'claude-cli help agent commands' commands "$@"
+}
+(( $+functions[_claude-cli__subcmd__help__subcmd__agent__subcmd__advice_commands] )) ||
+_claude-cli__subcmd__help__subcmd__agent__subcmd__advice_commands() {
+    local commands; commands=()
+    _describe -t commands 'claude-cli help agent advice commands' commands "$@"
+}
+(( $+functions[_claude-cli__subcmd__help__subcmd__agent__subcmd__commit_commands] )) ||
+_claude-cli__subcmd__help__subcmd__agent__subcmd__commit_commands() {
+    local commands; commands=()
+    _describe -t commands 'claude-cli help agent commit commands' commands "$@"
+}
+(( $+functions[_claude-cli__subcmd__help__subcmd__agent__subcmd__doctor_commands] )) ||
+_claude-cli__subcmd__help__subcmd__agent__subcmd__doctor_commands() {
+    local commands; commands=()
+    _describe -t commands 'claude-cli help agent doctor commands' commands "$@"
+}
+(( $+functions[_claude-cli__subcmd__help__subcmd__agent__subcmd__knowledge_commands] )) ||
+_claude-cli__subcmd__help__subcmd__agent__subcmd__knowledge_commands() {
+    local commands; commands=()
+    _describe -t commands 'claude-cli help agent knowledge commands' commands "$@"
+}
+(( $+functions[_claude-cli__subcmd__help__subcmd__agent__subcmd__prompt_commands] )) ||
+_claude-cli__subcmd__help__subcmd__agent__subcmd__prompt_commands() {
+    local commands; commands=()
+    _describe -t commands 'claude-cli help agent prompt commands' commands "$@"
 }
 (( $+functions[_claude-cli__subcmd__help__subcmd__agent__subcmd__resume_commands] )) ||
 _claude-cli__subcmd__help__subcmd__agent__subcmd__resume_commands() {
     local commands; commands=()
     _describe -t commands 'claude-cli help agent resume commands' commands "$@"
 }
+(( $+functions[_claude-cli__subcmd__help__subcmd__auth_commands] )) ||
+_claude-cli__subcmd__help__subcmd__auth_commands() {
+    local commands; commands=(
+'login:Sign in through the upstream Claude Code authentication flow' \
+'status:Show redacted authentication status' \
+'logout:Sign out through the upstream Claude Code authentication flow' \
+    )
+    _describe -t commands 'claude-cli help auth commands' commands "$@"
+}
+(( $+functions[_claude-cli__subcmd__help__subcmd__auth__subcmd__login_commands] )) ||
+_claude-cli__subcmd__help__subcmd__auth__subcmd__login_commands() {
+    local commands; commands=()
+    _describe -t commands 'claude-cli help auth login commands' commands "$@"
+}
+(( $+functions[_claude-cli__subcmd__help__subcmd__auth__subcmd__logout_commands] )) ||
+_claude-cli__subcmd__help__subcmd__auth__subcmd__logout_commands() {
+    local commands; commands=()
+    _describe -t commands 'claude-cli help auth logout commands' commands "$@"
+}
+(( $+functions[_claude-cli__subcmd__help__subcmd__auth__subcmd__status_commands] )) ||
+_claude-cli__subcmd__help__subcmd__auth__subcmd__status_commands() {
+    local commands; commands=()
+    _describe -t commands 'claude-cli help auth status commands' commands "$@"
+}
 (( $+functions[_claude-cli__subcmd__help__subcmd__completion_commands] )) ||
 _claude-cli__subcmd__help__subcmd__completion_commands() {
     local commands; commands=()
     _describe -t commands 'claude-cli help completion commands' commands "$@"
+}
+(( $+functions[_claude-cli__subcmd__help__subcmd__config_commands] )) ||
+_claude-cli__subcmd__help__subcmd__config_commands() {
+    local commands; commands=(
+'show:Show effective wrapper configuration' \
+'set:Emit a validated export for the current shell' \
+    )
+    _describe -t commands 'claude-cli help config commands' commands "$@"
+}
+(( $+functions[_claude-cli__subcmd__help__subcmd__config__subcmd__set_commands] )) ||
+_claude-cli__subcmd__help__subcmd__config__subcmd__set_commands() {
+    local commands; commands=()
+    _describe -t commands 'claude-cli help config set commands' commands "$@"
+}
+(( $+functions[_claude-cli__subcmd__help__subcmd__config__subcmd__show_commands] )) ||
+_claude-cli__subcmd__help__subcmd__config__subcmd__show_commands() {
+    local commands; commands=()
+    _describe -t commands 'claude-cli help config show commands' commands "$@"
 }
 (( $+functions[_claude-cli__subcmd__help__subcmd__help_commands] )) ||
 _claude-cli__subcmd__help__subcmd__help_commands() {

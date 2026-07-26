@@ -6,9 +6,6 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 const CACHE_FILE_NAME: &str = "usage.json";
-const EXPIRED_REFRESH_COOLDOWN_SECONDS: u64 = 60;
-const EXPIRED_REFRESH_LOCK_STALE_SECONDS: u64 = 60;
-
 #[derive(Clone, Copy, Debug)]
 pub struct CacheSnapshot {
     exists: bool,
@@ -44,16 +41,6 @@ impl CacheSnapshot {
             modified,
         ))
         .is_display_eligible()
-    }
-}
-
-pub struct ExpiredRefreshGuard {
-    lock_dir: PathBuf,
-}
-
-impl Drop for ExpiredRefreshGuard {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.lock_dir);
     }
 }
 
@@ -98,86 +85,6 @@ fn cache_display_expired_at(path: &Path, now: SystemTime) -> bool {
     snapshot_at(path, now).display_expired()
 }
 
-pub fn begin_expired_refresh(path: &Path) -> Option<ExpiredRefreshGuard> {
-    let lock_dir = sibling_path(path, "refresh.lock")?;
-    let guard = acquire_refresh_lock(&lock_dir, EXPIRED_REFRESH_LOCK_STALE_SECONDS)?;
-    let attempt_path = sibling_path(path, "refresh.at")?;
-    if refresh_attempt_recent(&attempt_path, EXPIRED_REFRESH_COOLDOWN_SECONDS) {
-        return None;
-    }
-
-    let now_epoch = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .ok()?
-        .as_secs();
-    shared_fs::write_atomic(
-        &attempt_path,
-        now_epoch.to_string().as_bytes(),
-        shared_fs::SECRET_FILE_MODE,
-    )
-    .ok()?;
-    Some(guard)
-}
-
-fn sibling_path(path: &Path, suffix: &str) -> Option<PathBuf> {
-    let stem = path.file_stem()?.to_string_lossy();
-    Some(path.with_file_name(format!("{stem}.{suffix}")))
-}
-
-fn acquire_refresh_lock(path: &Path, stale_seconds: u64) -> Option<ExpiredRefreshGuard> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).ok()?;
-    }
-    match std::fs::create_dir(path) {
-        Ok(()) => {
-            return Some(ExpiredRefreshGuard {
-                lock_dir: path.to_path_buf(),
-            });
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-        Err(_) => return None,
-    }
-
-    if !path_is_stale(path, stale_seconds) {
-        return None;
-    }
-    std::fs::remove_dir_all(path).ok()?;
-    std::fs::create_dir(path).ok()?;
-    Some(ExpiredRefreshGuard {
-        lock_dir: path.to_path_buf(),
-    })
-}
-
-fn path_is_stale(path: &Path, stale_seconds: u64) -> bool {
-    if stale_seconds == 0 {
-        return true;
-    }
-    std::fs::metadata(path)
-        .ok()
-        .and_then(|metadata| metadata.modified().ok())
-        .and_then(|modified| SystemTime::now().duration_since(modified).ok())
-        .map(|age| age.as_secs() >= stale_seconds)
-        .unwrap_or(true)
-}
-
-fn refresh_attempt_recent(path: &Path, cooldown_seconds: u64) -> bool {
-    let Some(attempt_epoch) = std::fs::read_to_string(path)
-        .ok()
-        .and_then(|raw| raw.trim().parse::<u64>().ok())
-    else {
-        return false;
-    };
-    let Some(now_epoch) = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .ok()
-        .map(|duration| duration.as_secs())
-    else {
-        return false;
-    };
-    attempt_epoch <= now_epoch.saturating_add(5)
-        && now_epoch.saturating_sub(attempt_epoch) < cooldown_seconds
-}
-
 fn signed_age_seconds(now: SystemTime, modified: SystemTime) -> Option<i64> {
     match now.duration_since(modified) {
         Ok(age) => i64::try_from(age.as_secs()).ok(),
@@ -211,9 +118,7 @@ fn cache_dir() -> Option<PathBuf> {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        begin_expired_refresh, cache_display_expired_at, signed_age_seconds, snapshot, snapshot_at,
-    };
+    use super::{cache_display_expired_at, signed_age_seconds, snapshot, snapshot_at};
     use pretty_assertions::assert_eq;
     use std::fs::File;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -275,18 +180,6 @@ mod tests {
         let expired = snapshot_at(&path, modified + Duration::from_secs(600));
         assert!(expired.stale(60));
         assert!(expired.display_expired());
-    }
-
-    #[test]
-    fn expired_refresh_gate_coalesces_lock_and_cools_down_after_attempt() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let path = tmp.path().join("usage.json");
-        std::fs::write(&path, "{}").expect("write");
-
-        let guard = begin_expired_refresh(&path).expect("first refresh permit");
-        assert!(begin_expired_refresh(&path).is_none());
-        drop(guard);
-        assert!(begin_expired_refresh(&path).is_none());
     }
 
     #[test]
