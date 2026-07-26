@@ -2740,6 +2740,8 @@ struct AutoResumeBody {
 struct CodexAccountBody {
     account: String,
     expected_session_incarnation: Option<String>,
+    #[serde(default)]
+    supports_unbound_account_queue: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -4117,6 +4119,7 @@ async fn codex_account_handler(
     let begin_id = canonical_id.clone();
     let begin_launch_id = launch_id.clone();
     let begin_account = body.account.clone();
+    let supports_unbound_account_queue = body.supports_unbound_account_queue;
     let revision = match tokio::task::spawn_blocking(move || {
         crate::codex_account::begin_switch_binding(
             &begin_context,
@@ -4131,25 +4134,36 @@ async fn codex_account_handler(
         Ok(Err(err)) if err.code() == "codex-account-session-busy" => {
             // The turn is still working, so an immediate switch is unsafe.
             // Durably queue the account for the next prompt instead; the daemon
-            // applies it at the idle boundary and the applied binding is left
+            // applies it at the idle boundary and any applied binding is left
             // unchanged until then.
             let queue_context = state.context.clone();
             let queue_id = canonical_id.clone();
             let queue_launch_id = launch_id.clone();
             let queue_account = body.account.clone();
             return match tokio::task::spawn_blocking(move || {
-                crate::codex_account::queue_next_account(
-                    &queue_context,
-                    &queue_id,
-                    &queue_launch_id,
-                    &queue_account,
-                )
+                if supports_unbound_account_queue {
+                    crate::codex_account::queue_next_account_with_unbound(
+                        &queue_context,
+                        &queue_id,
+                        &queue_launch_id,
+                        &queue_account,
+                    )
+                } else {
+                    crate::codex_account::queue_next_account(
+                        &queue_context,
+                        &queue_id,
+                        &queue_launch_id,
+                        &queue_account,
+                    )
+                }
             })
             .await
             {
-                Ok(Ok(view)) => {
-                    envelope_ok(json!({ "machine": state.machine, "codex_account": view }))
-                }
+                Ok(Ok(view)) => envelope_ok(json!({
+                    "machine": state.machine,
+                    "session_incarnation": launch_id,
+                    "codex_account": view
+                })),
                 Ok(Err(err)) => envelope_err(err),
                 Err(_) => join_err(),
             };
@@ -4158,7 +4172,11 @@ async fn codex_account_handler(
         Err(_) => return join_err(),
     };
     match handle.bind_account(&body.account, revision).await {
-        Ok(view) => envelope_ok(json!({ "machine": state.machine, "codex_account": view })),
+        Ok(view) => envelope_ok(json!({
+            "machine": state.machine,
+            "session_incarnation": launch_id,
+            "codex_account": view
+        })),
         Err(_) => {
             let finish_context = state.context.clone();
             let finish_id = canonical_id.clone();
@@ -15015,6 +15033,84 @@ esac
         let view = crate::codex_account::view_for_record(&persisted);
         assert_eq!(view.selected_account.as_deref(), Some("gamania"));
         assert_eq!(view.next.unwrap().account.as_deref(), Some("sym"));
+    }
+
+    #[tokio::test]
+    async fn codex_account_switch_queues_an_unbound_session_during_a_working_turn() {
+        let lock = GlobalStateLock::new();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let _broker = EnvGuard::set(
+            &lock,
+            "AGENT_SESSION_CODEX_ACCOUNT_BROKER",
+            r#"["/bin/false"]"#,
+        );
+        let launch_id = seed_codex_app_server_session(tmp.path(), "unbound-account-switch-queued");
+        let st = state(tmp.path(), Some(TOKEN), minimal_tmux(tmp.path()));
+        let record = load_session_record(&st.context, "unbound-account-switch-queued").unwrap();
+        crate::activity::activate_runtime(&st.context, &record).unwrap();
+        let event = serde_json::from_value(json!({
+            "schema_version": crate::activity::TURN_EVENT_VERSION,
+            "event_id": "unbound-turn-start",
+            "runtime_id": launch_id,
+            "provider": "codex",
+            "provider_turn_id": "turn-unbound-account-switch-queued",
+            "kind": "turn_started",
+            "confidence": "authoritative"
+        }))
+        .unwrap();
+        crate::activity::ingest_event(&st.context, &record.id, event).unwrap();
+
+        let (handle, mut commands) = codex_app_server::control_channel();
+        st.codex_controls.lock().unwrap().insert(
+            record.id.clone(),
+            CodexControlEntry {
+                launch_id: launch_id.clone(),
+                handle,
+            },
+        );
+
+        let (status, body) = call(
+            router(st.clone()),
+            put_json(
+                "/sessions/unbound-account-switch-queued/account",
+                Some(TOKEN),
+                json!({ "account": "sym", "expected_session_incarnation": launch_id }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "body={body}");
+        assert_eq!(body["error"]["code"], "codex-account-not-bound");
+        assert!(
+            crate::codex_account::view_for_record(
+                &load_session_record(&st.context, &record.id).unwrap()
+            )
+            .next
+            .is_none()
+        );
+
+        let (status, body) = call(
+            router(st.clone()),
+            put_json(
+                "/sessions/unbound-account-switch-queued/account",
+                Some(TOKEN),
+                json!({
+                    "account": "sym",
+                    "expected_session_incarnation": launch_id,
+                    "supports_unbound_account_queue": true
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "body={body}");
+        assert_eq!(body["data"]["session_incarnation"], launch_id);
+        assert_eq!(body["data"]["codex_account"]["state"], "unbound");
+        assert_eq!(body["data"]["codex_account"]["revision"], 0);
+        assert_eq!(body["data"]["codex_account"]["next"]["account"], "sym");
+        assert_eq!(body["data"]["codex_account"]["next"]["state"], "queued");
+        assert!(matches!(
+            commands.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
     }
 
     #[tokio::test]

@@ -696,17 +696,37 @@ pub(crate) fn pending_next_apply(
     }
 }
 
-/// Queue a durable next-account intent while a turn is working. Selecting the
-/// current applied account cancels any queued intent. A different account
-/// supersedes a prior queued intent and cancels auto-resume so no automatic
-/// prompt races ahead under the current account. `selected_account` is never
-/// changed here; the applied binding stays authoritative until an apply
-/// succeeds.
+/// Queue a durable next-account intent for an already-bound session.
 pub(crate) fn queue_next_account(
     context: &CliContext,
     id: &str,
     expected_launch_id: &str,
     account: &str,
+) -> Result<CodexAccountView, CliError> {
+    queue_next_account_inner(context, id, expected_launch_id, account, false)
+}
+
+/// Queue a durable next-account intent while a turn is working. Selecting the
+/// current applied account cancels any queued intent. A different account, or
+/// the first explicit account for an unbound session, supersedes a prior queued
+/// intent and cancels auto-resume so no automatic prompt races ahead under the
+/// current account. `selected_account` is never changed here; any applied
+/// binding stays authoritative until an apply succeeds.
+pub(crate) fn queue_next_account_with_unbound(
+    context: &CliContext,
+    id: &str,
+    expected_launch_id: &str,
+    account: &str,
+) -> Result<CodexAccountView, CliError> {
+    queue_next_account_inner(context, id, expected_launch_id, account, true)
+}
+
+fn queue_next_account_inner(
+    context: &CliContext,
+    id: &str,
+    expected_launch_id: &str,
+    account: &str,
+    allow_unbound: bool,
 ) -> Result<CodexAccountView, CliError> {
     validate_account(account)?;
     let _lock = acquire_session_record_lock(context, id)?;
@@ -726,12 +746,17 @@ pub(crate) fn queue_next_account(
         ));
     }
     let current = match decode_binding(&record) {
-        DecodedBinding::Valid(binding) if binding.state == "bound" => binding,
-        DecodedBinding::Valid(_) | DecodedBinding::Absent | DecodedBinding::Invalid => {
+        DecodedBinding::Valid(binding) if binding.state == "bound" => Some(binding),
+        DecodedBinding::Absent if allow_unbound => None,
+        DecodedBinding::Absent => return Err(not_bound_error(&record, None)),
+        DecodedBinding::Valid(_) | DecodedBinding::Invalid => {
             return Err(not_bound_error(&record, None));
         }
     };
-    if current.selected_account == account {
+    if current
+        .as_ref()
+        .is_some_and(|current| current.selected_account == account)
+    {
         // Selecting the current account cancels any queued intent.
         clear_next(&mut record);
         record.updated_at = jiff::Timestamp::now().to_string();
@@ -1766,6 +1791,118 @@ wait "$child"
             selected_account(&reload(&context, &record.id)).as_deref(),
             Some("gamania"),
             "the applied account stays authoritative while a next account is queued"
+        );
+    }
+
+    #[test]
+    fn queued_account_can_establish_an_unbound_sessions_initial_binding() {
+        let lock = GlobalStateLock::new();
+        let _broker = EnvGuard::set(&lock, BROKER_ENV, r#"["/configured/broker"]"#);
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (context, mut record) = persisted_bound(&tmp);
+        record.extra.remove(BINDING_KEY);
+        write_session_record(&context, &record).unwrap();
+
+        let queued = queue_next_account_with_unbound(
+            &context,
+            &record.id,
+            "runtime-binding-fixture",
+            "poies",
+        )
+        .unwrap();
+        assert_eq!(queued.state, "unbound");
+        assert!(queued.selected_account.is_none());
+        assert_eq!(
+            queued
+                .next
+                .as_ref()
+                .and_then(|next| next.account.as_deref()),
+            Some("poies")
+        );
+        assert_eq!(queued.next.as_ref().map(|next| next.state), Some("queued"));
+
+        assert_eq!(
+            begin_next_apply(&context, &record.id, "runtime-binding-fixture").unwrap(),
+            Some(("poies".to_string(), 1))
+        );
+        let bound = finish_next_apply(
+            &context,
+            &record.id,
+            "runtime-binding-fixture",
+            "poies",
+            1,
+            Ok(()),
+        )
+        .unwrap();
+        assert_eq!(bound.state, "bound");
+        assert_eq!(bound.selected_account.as_deref(), Some("poies"));
+        assert_eq!(
+            bound.applied_runtime_id.as_deref(),
+            Some("runtime-binding-fixture")
+        );
+        assert!(bound.next.is_none());
+    }
+
+    #[test]
+    fn unbound_queue_opt_in_still_rejects_blocked_binding_states() {
+        let lock = GlobalStateLock::new();
+        let _broker = EnvGuard::set(&lock, BROKER_ENV, r#"["/configured/broker"]"#);
+
+        for (case, binding) in [
+            ("pending", valid_binding("pending")),
+            ("failed", valid_binding("failed")),
+            ("malformed", Value::String("malformed-binding".to_string())),
+        ] {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let (context, record) = persist_record(&tmp, binding.clone());
+            let error = queue_next_account_with_unbound(
+                &context,
+                &record.id,
+                "runtime-binding-fixture",
+                "poies",
+            )
+            .unwrap_err();
+            assert_eq!(error.code(), "codex-account-not-bound", "{case}");
+
+            let current = reload(&context, &record.id);
+            assert_eq!(current.extra.get(BINDING_KEY), Some(&binding), "{case}");
+            assert!(!current.extra.contains_key(NEXT_KEY), "{case}");
+        }
+    }
+
+    #[test]
+    fn failed_unbound_apply_stays_unbound_and_fences_input() {
+        let lock = GlobalStateLock::new();
+        let _broker = EnvGuard::set(&lock, BROKER_ENV, r#"["/configured/broker"]"#);
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (context, mut record) = persisted_bound(&tmp);
+        record.extra.remove(BINDING_KEY);
+        write_session_record(&context, &record).unwrap();
+
+        queue_next_account_with_unbound(&context, &record.id, "runtime-binding-fixture", "poies")
+            .unwrap();
+        begin_next_apply(&context, &record.id, "runtime-binding-fixture").unwrap();
+        let view = finish_next_apply(
+            &context,
+            &record.id,
+            "runtime-binding-fixture",
+            "poies",
+            1,
+            Err("refresh_failed"),
+        )
+        .unwrap();
+
+        assert_eq!(view.state, "unbound");
+        assert!(view.selected_account.is_none());
+        assert!(view.applied_runtime_id.is_none());
+        let next = view.next.expect("failed unbound intent remains visible");
+        assert_eq!(next.state, "failed");
+        assert_eq!(next.failure_reason.as_deref(), Some("refresh_failed"));
+        assert_eq!(
+            ensure_input_allowed(&reload(&context, &record.id))
+                .unwrap_err()
+                .code(),
+            "codex-account-next-pending"
         );
     }
 

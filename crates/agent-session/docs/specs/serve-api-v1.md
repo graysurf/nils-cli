@@ -257,9 +257,16 @@ is no second state model.
   `waiting` boundary, the daemon applies the account immediately without
   recreating tmux or resuming the provider conversation. While a turn is
   `working`, it instead stores an additive durable `next` intent and leaves
-  `selected_account` unchanged until that intent applies successfully. The
-  public `next` projection contains only the desired nickname, revision,
-  `queued` / `applying` / `failed` state, and a safe failure reason.
+  `selected_account` unchanged until that intent applies successfully. This
+  also applies to an unbound runtime that inherited the global default: it may
+  queue its first explicit account when the request includes
+  `supports_unbound_account_queue: true`, without claiming that account is
+  already applied. The opt-in keeps daemon-first and edge-first rolling
+  upgrades fail-closed. The public `next` projection contains only the desired
+  nickname, revision, `queued` / `applying` / `failed` state, and a safe failure
+  reason. A successful mutation response also echoes the current
+  `session_incarnation`, allowing an intermediary to verify an unbound queued
+  outcome against the request fence without exposing credential metadata.
   The control loop drains a queued intent when the turn becomes `waiting`,
   resolves credentials through the host broker, and sends Codex
   `account/login/start` with `chatgptAuthTokens`. Success flips the durable
